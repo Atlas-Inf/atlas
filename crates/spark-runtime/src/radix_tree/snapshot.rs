@@ -122,17 +122,51 @@ impl SsmSnapshotIndex {
         // just-selected snapshot evicted 7s later while ~50
         // never-accessed entries survived → selected=None mid-session
         // → full-conversation SSM recompute on the next warm hit).
-        let mut victim_idx = 0;
+        // Tail-pin (2026-07-02): never evict each session's DEEPEST (max
+        // token_count) snapshot — that frontier tip is the near-match
+        // checkpoint the next warm turn restores from. Without it, the
+        // forecast score above entrenches hot SHALLOW prefixes (high
+        // hit_count) and starves freshly-saved DEEP checkpoints (hit_count=0)
+        // into a 3-of-48-slot rotation, so every deep checkpoint is evicted
+        // before the next turn and the restore point ratchets stuck at a
+        // fixed shallow token (measured on strix: frozen at 20481 while
+        // matched grew to 25376 -> 4895-token SSM recompute tail). Pinning the
+        // per-session tip breaks the ratchet; the pin migrates forward as each
+        // turn saves a deeper leaf. Retention-only: never touches the SSM
+        // forward path, so restores stay byte-exact (tok_agree=1.0).
+        let mut deepest: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+        for e in &self.entries {
+            let d = deepest.entry(e.session_hash).or_insert(0);
+            if e.token_count > *d {
+                *d = e.token_count;
+            }
+        }
+        let mut victim: Option<usize> = None;
         let mut victim_score = u64::MAX;
         for (i, entry) in self.entries.iter().enumerate() {
-            // Saturating math: both factors fit u64 comfortably
-            // (access_counter is monotonic per-process, hit_count u32).
+            // Skip each session's frontier tip.
+            if deepest.get(&entry.session_hash) == Some(&entry.token_count) {
+                continue;
+            }
             let score = entry.last_access.saturating_mul(1 + entry.hit_count as u64);
             if score < victim_score {
                 victim_score = score;
-                victim_idx = i;
+                victim = Some(i);
             }
         }
+        // Fallback: every entry is a per-session tip (many single-snapshot
+        // sessions saturating the pool). Pinning all would deadlock the pool
+        // (save -> reclaim -> None forever, dropping every new checkpoint), so
+        // evict the global forecast-LRU among the tips.
+        let victim_idx = victim.unwrap_or_else(|| {
+            self.entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_access.saturating_mul(1 + e.hit_count as u64))
+                .map(|(i, _)| i)
+                .unwrap()
+        });
         let entry = self.entries.swap_remove(victim_idx);
         Some(entry.snapshot_id)
     }
