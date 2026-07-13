@@ -365,6 +365,7 @@ impl TransformerModel {
             // Marconi warm hit: GDN layers replay from a restored SSM state
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
             gdn_exact_replay: marconi_skip,
+            midchunk_capture: None,
         };
 
         // ── 4. Forward through all layers ──

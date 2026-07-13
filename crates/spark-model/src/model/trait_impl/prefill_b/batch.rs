@@ -326,6 +326,8 @@ impl TransformerModel {
                 pos_stream_bytes,
                 use_mrope,
                 needs_paged,
+                // Batched path does not do mid-chunk tail capture (single-seq only).
+                None,
                 stream,
             )?;
 

@@ -170,6 +170,7 @@ impl TransformerModel {
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
+            midchunk_capture: None,
         };
 
         // Profile mode: use per-layer sync decode for timing breakdown.

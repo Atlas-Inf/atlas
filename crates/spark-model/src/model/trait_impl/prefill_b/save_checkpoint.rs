@@ -23,13 +23,19 @@ impl TransformerModel {
         chunk_len: usize,
         stream: u64,
     ) -> Result<()> {
-        if self.ssm_checkpoint_interval == 0 || !self.ssm_snapshots.is_enabled() {
+        if !self.ssm_snapshots.is_enabled() {
             return Ok(());
         }
         let bs = kv_cache.block_size();
         let end_token = chunk_start + chunk_len;
         let end_block = end_token / bs;
-        if end_block == 0 || !end_block.is_multiple_of(self.ssm_checkpoint_interval) {
+        // The boundary a warm turn will actually match at. Saving here is what
+        // takes the next turn's SSM replay from ~254 tokens to 0.
+        let is_tail = spark_runtime::ssm_tail_ckpt_enabled()
+            && spark_runtime::ssm_tail_boundary(tokens.len(), bs) == Some(end_token);
+        let on_grid = self.ssm_checkpoint_interval > 0
+            && end_block.is_multiple_of(self.ssm_checkpoint_interval);
+        if end_block == 0 || (!on_grid && !is_tail) {
             return Ok(());
         }
         // Stale-V cap (mirrors finalize_last): never checkpoint-cache a block
@@ -115,6 +121,21 @@ impl TransformerModel {
         // prior image's state.
         if self.tokens_have_vision_pad(boundary_tokens) {
             self.ssm_snapshots.free(snap_id);
+            return Ok(());
+        }
+        if is_tail {
+            // Index-only: `finalize_last` inserts [0, total) for this same turn and
+            // owns the ref_count/disk-ref bookkeeping. Re-inserting the whole prefix
+            // here measured ~0.9 s/turn. Superseding the session's previous tail keeps
+            // the cold 512-grid checkpoints alive (they are the fallback restore points).
+            for old in self.prefix_cache.insert_tail_snapshot(
+                boundary_tokens,
+                snap_id,
+                seq.session_hash,
+            ) {
+                self.ssm_snapshots.free(old);
+            }
+            tracing::info!("tail SSM checkpoint saved at token {end_token} (snapshot_id {snap_id})");
             return Ok(());
         }
         let boundary_disk = if seq.disk_block_ids.len() >= end_block {
