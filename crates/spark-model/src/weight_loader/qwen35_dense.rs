@@ -4,7 +4,7 @@ use anyhow::Result;
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
-use spark_runtime::weights::WeightStore;
+use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::{ModelWeightLoader, WeightFormat};
 use crate::layer::TransformerLayer;
@@ -12,6 +12,7 @@ use crate::layers::{DenseFfnLayer, FfnComponent, Qwen3AttentionLayer, Qwen3SsmLa
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, MtpWeights, Nvfp4Variant, SsmWeights, dense, dense_auto,
+    dense_auto_fp8_or_bf16,
     dense_f32_safe, dense_keep_f32, dequant_nvfp4_to_bf16, detect_nvfp4_variant, gpu_concat_rows,
     interleave_ba, load_dense_ffn, load_kv_scales, load_mtp, quantize_to_nvfp4, quantized_auto,
 };
@@ -504,15 +505,25 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         dense(store, &format!("{prefix}.norm.weight"))
     }
 
-    fn load_lm_head(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
-        for pattern in &[
-            "lm_head.weight",
-            "language_model.lm_head.weight",
-            "model.lm_head.weight",
-        ] {
-            if store.contains(pattern) {
-                return dense(store, pattern);
+    fn load_lm_head(&self, store: &WeightStore, config: &ModelConfig, gpu: &dyn GpuBackend) -> Result<DenseWeight> {
+        // unsloth's mixed-precision NVFP4 keeps lm_head as FP8 E4M3 + per-row
+        // scale; a bare `dense()` hands FP8 bytes to a BF16 GEMM (2x over-read →
+        // ILLEGAL_ADDRESS). Intercept FP8 and dequant to BF16; pass BF16 / U8
+        // (standard NVFP4) through unchanged so nvidia checkpoints are untouched.
+        for prefix in &["lm_head", "language_model.lm_head", "model.lm_head"] {
+            let key = format!("{prefix}.weight");
+            if !store.contains(&key) {
+                continue;
             }
+            let is_fp8 = store
+                .get(&key)
+                .map(|w| w.dtype == WeightDtype::FP8E4M3)
+                .unwrap_or(false);
+            return if is_fp8 {
+                dense_auto_fp8_or_bf16(store, prefix, gpu)
+            } else {
+                dense(store, &key)
+            };
         }
         self.load_embedding(store, config)
     }

@@ -53,7 +53,7 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         dense(store, &format!("{prefix}.norm.weight"))
     }
 
-    fn load_lm_head(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
+    fn load_lm_head(&self, store: &WeightStore, config: &ModelConfig, _gpu: &dyn GpuBackend) -> Result<DenseWeight> {
         // lm_head location varies by quantizer:
         //   Sehyo: "lm_head.weight"
         //   Kbenkhaled: "language_model.lm_head.weight"
