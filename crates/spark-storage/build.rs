@@ -27,6 +27,7 @@ const KERNELS: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-env-changed=ATLAS_SKIP_BUILD");
     println!("cargo:rerun-if-env-changed=SKIP_ATLAS_BUILD");
+    println!("cargo:rerun-if-env-changed=ATLAS_TARGET_HW");
 
     // Apple Silicon hosts have no libcuda and no nvcc. Emit the stub and
     // skip the linker hint so `cargo check` works under
@@ -45,7 +46,7 @@ fn main() {
     // symbols resolved at link time even when the kernel registry is
     // an empty stub.
     link_libcuda();
-    if skip_build() {
+    if skip_build() || hip_target() {
         emit_stub();
         println!("cargo:rerun-if-changed=build.rs");
         return;
@@ -62,6 +63,23 @@ fn skip_build() -> bool {
         )
     };
     truthy("ATLAS_SKIP_BUILD") || truthy("SKIP_ATLAS_BUILD")
+}
+
+/// True for native-HIP targets (`ATLAS_TARGET_HW=strix-hip`, ...).
+///
+/// spark-storage compiles its 5 predictor kernels via `find_nvcc()`, which
+/// panics on a pure-ROCm box with no CUDA toolkit (#326): atlas-kernels routes
+/// through `resolve_compute_target()` and builds fine via hipcc, but this crate
+/// never had HIP awareness. The predictors are only reachable through
+/// `--high-speed-swap`, which the documented Strix serve config does not use, so
+/// stub the registry instead of requiring an nvcc shim on PATH.
+///
+/// `ATLAS_SKIP_BUILD=1` is NOT a substitute — it stubs atlas-kernels too, which
+/// kills every compute kernel.
+fn hip_target() -> bool {
+    std::env::var("ATLAS_TARGET_HW")
+        .map(|hw| hw.contains("hip"))
+        .unwrap_or(false)
 }
 
 fn emit_stub() {
