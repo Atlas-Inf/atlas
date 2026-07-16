@@ -55,14 +55,14 @@ pub fn ssm_tail_ckpt_enabled() -> bool {
     matches!(std::env::var("ATLAS_SSM_TAIL_CKPT").as_deref(), Ok("1"))
 }
 
-/// DEFAULT-ON: MID-CHUNK tail SSM capture (opt out with `ATLAS_SSM_TAIL_MIDCHUNK=0`).
+/// OPT-IN switch for MID-CHUNK tail SSM capture (`ATLAS_SSM_TAIL_MIDCHUNK=1`).
 ///
-/// Default ON (byte-exact vs explicit =1; validated deep-TTFT parity). The prefill
+/// Default OFF => byte-identical to current behavior. When set, the prefill
 /// chunk is NOT clamped to `ssm_tail_boundary`; instead each GDN layer's
 /// recurrent (h_state) and conv (conv_state) kernels are split at the block-
 /// floored matched-prefix boundary and the @tb state is copied into a reserved
 /// Marconi snapshot slot in-pass, removing the ~868 ms extra forward pass the
 /// clamp-based `ATLAS_SSM_TAIL_CKPT` path costs.
 pub fn ssm_tail_midchunk_enabled() -> bool {
-    !matches!(std::env::var("ATLAS_SSM_TAIL_MIDCHUNK").as_deref(), Ok("0"))
+    matches!(std::env::var("ATLAS_SSM_TAIL_MIDCHUNK").as_deref(), Ok("1"))
 }
