@@ -11,12 +11,127 @@ use crate::layer::TransformerLayer;
 use crate::layers::{DenseFfnLayer, FfnComponent, Qwen3AttentionLayer, Qwen3SsmLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, MtpWeights, Nvfp4Variant, SsmWeights, dense, dense_auto,
+    AttentionWeights, DenseWeight, Fp8Weight, MtpWeights, Nvfp4Variant, SsmWeights, dense, dense_auto,
     dense_auto_fp8_or_bf16,
     dense_f32_safe, dense_keep_f32, dequant_nvfp4_to_bf16, detect_nvfp4_variant, gpu_concat_rows,
     interleave_ba, load_dense_ffn, load_fp8_block_scaled_as_fp8weight, load_kv_scales, load_mtp,
     quantize_to_nvfp4, quantized_auto,
 };
+
+/// True when `{prefix}.weight` is FP8 E4M3 on disk with a 2D block scale
+/// (`weight_scale_inv` or 2D `weight_scale`) — i.e. a native FP8 checkpoint
+/// projection that should load as `Fp8Weight` rather than be requantized to
+/// NVFP4. Mirrors `qwen35::load_layers::proj_is_native_fp8`.
+fn proj_is_native_fp8(store: &WeightStore, prefix: &str) -> bool {
+    let is_fp8_weight = store
+        .get(&format!("{prefix}.weight"))
+        .map(|w| w.dtype == WeightDtype::FP8E4M3)
+        .unwrap_or(false);
+    let has_block_scale = store.contains(&format!("{prefix}.weight_scale_inv"))
+        || store
+            .get(&format!("{prefix}.weight_scale"))
+            .map(|s| s.shape.len() == 2)
+            .unwrap_or(false);
+    is_fp8_weight && has_block_scale
+}
+
+/// True when `{prefix}.weight` is on-disk FP8 with a scale the native-FP8
+/// `w8a16` path can actually consume — i.e. one that is (or broadcasts to) the
+/// `[ceil(N/128), ceil(K/128)]` FP32 block grid the kernel indexes as
+/// `block_scale[n/128, k/128]`:
+///
+///   * `weight_scale_inv` / 2-D `weight_scale` shaped as that block grid
+///     (DeepSeek-V3 / Qwen-native convention), or
+///   * a per-tensor SCALAR `weight_scale` (ModelOpt; e.g. the nvidia
+///     Qwen3.6-27B-NVFP4 GDN projections) — `load_fp8_block_scaled_as_fp8weight`
+///     broadcasts it into a uniform grid, which is exact.
+///
+/// A **per-row** `weight_scale` (`[N,1]`, e.g. unsloth's re-quantized
+/// Qwen3.6-*-NVFP4, 2026-07-10) is deliberately REJECTED. It is not a block
+/// grid: the kernel would read row `n`'s multiplier from grid cell `n/128`, so
+/// 127 of every 128 rows get some other row's scale. That is in-bounds — the
+/// widened `[N]` buffer is *larger* than the `[N/128, K/128]` grid — so it does
+/// not fault; it silently produces garbage logits. Returning false here drops
+/// the projection to the default `dequant_fp8_blockscaled_to_bf16` →
+/// `quantize_to_nvfp4` path, which reads a `[N,1]` scale correctly
+/// (`block_n = N/N = 1`, i.e. one multiplier per row).
+fn proj_is_fp8_any_scale(store: &WeightStore, prefix: &str) -> bool {
+    let Ok(w) = store.get(&format!("{prefix}.weight")) else {
+        return false;
+    };
+    if w.dtype != WeightDtype::FP8E4M3 || w.shape.len() != 2 {
+        return false;
+    }
+    let (n, k) = (w.shape[0], w.shape[1]);
+
+    for key in [
+        format!("{prefix}.weight_scale_inv"),
+        format!("{prefix}.weight_scale"),
+    ] {
+        let Ok(s) = store.get(&key) else { continue };
+        // Per-tensor scalar → broadcast to a uniform grid: exact.
+        if s.num_elements() == 1 {
+            return true;
+        }
+        // 2-D scale: only a genuine 128×128 block grid is consumable.
+        if s.shape.len() == 2 && s.shape[0] == n.div_ceil(128) && s.shape[1] == k.div_ceil(128) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Concatenate two block-scaled FP8 weights along rows (dim 0):
+/// `[n_a, k] ++ [n_b, k] -> [n_a+n_b, k]`. FP8 bytes (1 B/elem) and the
+/// `[n/128, k/128]` FP32 block-scale grids are contiguous row-major, so each is
+/// a straight device-to-device append. Requires `n_a % 128 == 0` so the
+/// scale-grid rows meet at a block boundary (GDN qkv rows are a multiple of
+/// 128). Produces the `[Q|K|V|Z]` sequential order the SSM layer expects.
+fn concat_fp8_block_scaled(
+    a: &Fp8Weight,
+    b: &Fp8Weight,
+    k: usize,
+    gpu: &dyn GpuBackend,
+) -> Result<Fp8Weight> {
+    let kb = k.div_ceil(128);
+    let a_w = a.n as usize * k;
+    let b_w = b.n as usize * k;
+    let weight = gpu.alloc(a_w + b_w)?;
+    gpu.copy_d2d(a.weight, weight, a_w)?;
+    gpu.copy_d2d(b.weight, weight.offset(a_w), b_w)?;
+    let a_s = (a.n as usize).div_ceil(128) * kb * 4;
+    let b_s = (b.n as usize).div_ceil(128) * kb * 4;
+    let row_scale = gpu.alloc(a_s + b_s)?;
+    gpu.copy_d2d(a.row_scale, row_scale, a_s)?;
+    gpu.copy_d2d(b.row_scale, row_scale.offset(a_s), b_s)?;
+    Ok(Fp8Weight {
+        weight,
+        row_scale,
+        n: a.n + b.n,
+        k: k as u32,
+        scale_format: crate::weight_map::WeightQuantFormat::Fp8BlockScaled,
+    })
+}
+
+/// Opt-in gate for native dense-FP8 attention + FFN dispatch (Qwythos / dense
+/// Ornith-FP8). Default OFF.
+///
+/// VERIFIED 2026-06-29 on Qwythos-9B-FP8 (gb10/ornith-1.0-9b): with the flag
+/// on, the FP8 arms fire for all 32 FFN + 8 full-attn layers and text is
+/// correct (coherence/fib/tools 3/3). BUT it is NOT a perf win — ~30 tok/s vs
+/// ~40 for the NVFP4 fallback — because this target's NVFP4 W4A16 kernels
+/// (fused dual-GEMV decode, transposed m128 prefill) are more optimized than
+/// its FP8 W8A16 kernels (unfused per-projection GEMV, non-transposed
+/// `w8a16_gemm` prefill; the attention FP8 prefill transpose also does not
+/// engage). Vision prefill additionally hits a CUDA-700. Making FP8 pay off
+/// here needs dedicated dense-FP8 kernels (fused FP8 dual-GEMV + fast
+/// transposed FP8 prefill GEMM), not loader wiring. Until then NVFP4 autoquant
+/// is the better dense runtime. `ATLAS_DENSE_FP8=1` opts in for that kernel work.
+fn dense_fp8_enabled() -> bool {
+    std::env::var("ATLAS_DENSE_FP8").as_deref() == Ok("1")
+}
+
+mod loaders_b;
 
 pub struct Qwen35DenseWeightLoader;
 
@@ -74,7 +189,13 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         // Originally env-gated `ATLAS_FP8_SSM_PREFILL=1`; promoted to
         // unconditional 2026-05-20 after live verification (commit
         // dfb4e8a era, tokens_to_first_degeneration 1,196 → 16,968).
-        let fp8_ssm_prefill = matches!(variant, Nvfp4Variant::Fp8Dequanted);
+        // 2026-07-03 precision policy: GDN projections stay ≥FP8 — the
+        // NVFP4 requant of qkvz/out_proj flattens tensors that both
+        // checkpoint toolchains deliberately keep high-precision (modelopt
+        // sensitivity analysis ships them FP8; unsloth ships BF16). Applies
+        // to ALL NVFP4 variants now, not just Fp8Dequanted. Kill-switch
+        // ATLAS_NO_GDN_FP8_PREFILL restores the pre-policy behavior for A/B.
+        let fp8_ssm_prefill = std::env::var_os("ATLAS_NO_GDN_FP8_PREFILL").is_none();
         let bf16_to_fp8_k = if fp8_ssm_prefill {
             tracing::info!(
                 "SSM in_proj_qkv + out_proj via native FP8 prefill GEMM \
@@ -105,11 +226,42 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
             let post_attn_norm = dense(store, &format!("{lp}.post_attention_layernorm.weight"))?;
 
-            // Dense FFN instead of MoE
+            // Dense FFN instead of MoE. Native FP8 checkpoints (single-GPU)
+            // load gate/up/down directly as block-scaled `Fp8Weight` and
+            // dispatch w8a16 — no NVFP4 requant. TP>1 still uses the NVFP4
+            // path (FP8 FFN sharding is a follow-up).
+            let ffn_fp8 = dense_fp8_enabled()
+                && config.tp_world_size.max(1) == 1
+                && matches!(variant, Nvfp4Variant::Fp8Dequanted)
+                && proj_is_native_fp8(store, &format!("{lp}.mlp.gate_proj"));
+            // Always load the NVFP4 weights so every dispatch path (incl. the
+            // batched spec-decode forward_k2/k3 paths that have no FP8 branch)
+            // has a valid weight to fall back to — a null NVFP4 weight under a
+            // w4a16 dispatch is the CUDA-700-at-concurrency bug. When native
+            // FP8 is enabled we overlay the block-scaled FP8 weights on top;
+            // the hot forward / forward_prefill paths then use FP8, the rare
+            // batched paths fall back to real NVFP4.
             let ffn_weights = load_dense_ffn(
                 store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
             )?;
-            let ffn = FfnComponent::Dense(DenseFfnLayer::new(ffn_weights, gpu)?);
+            let mut dffn = DenseFfnLayer::new(ffn_weights, gpu)?;
+            if ffn_fp8 {
+                let load_ffn_fp8 = |name: &str| {
+                    load_fp8_block_scaled_as_fp8weight(store, &format!("{lp}.mlp.{name}"), gpu)
+                };
+                dffn.set_fp8_weights(
+                    load_ffn_fp8("gate_proj")?,
+                    load_ffn_fp8("up_proj")?,
+                    load_ffn_fp8("down_proj")?,
+                );
+            }
+            // ATLAS_FFN_MMQ: eagerly materialize Q4_K + free the dead `_t` copies at load,
+            // BEFORE KV cache sizing, so net FFN footprint == NVFP4 baseline (no decode OOM-throttle).
+            dffn.finalize_q4k_load(gpu, h as u32, config.intermediate_size as u32, stream)?;
+            // ATLAS_FFN_NVFP4_MMQ: same discipline for the W4A4 FP4-MMQ arm — repack
+            // gate/up to block_nvfp4 + free their `_t` copies (net ~0 footprint).
+            dffn.finalize_nvfp4_mmq_load(gpu, h as u32, config.intermediate_size as u32, stream)?;
+            let ffn = FfnComponent::Dense(dffn);
 
             match lt {
                 LayerType::FullAttention => {
@@ -375,10 +527,17 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // (w8a16_gemv) through the fp8w fields — no requant, decode
                     // stays fast (FP8 = half BF16's weight bytes). MUST run
                     // BEFORE `load_ssm_proj` consumes the store tensors.
-                    // Internal opt-out for the FP8-vs-NVFP4 GDN A/B + KL-drift
-                    // gate (not a user choice; mirrors the `ATLAS_NO_*` debug
-                    // levers). Default engages native FP8.
-                    if std::env::var_os("ATLAS_NO_GDN_FP8").is_none()
+                    // STRIX GROUNDWORK SAFETY (2026-07-17): native FP8 GDN routes
+                    // prefill/decode through `w8a16_gemm_pipelined`/`w8a16_gemv`,
+                    // which are NOT wired for gfx1151 HIP — they illegal-address
+                    // (status 700) on the first request. So this path is OPT-IN
+                    // (`ATLAS_GDN_FP8_NATIVE=1`), NOT default: without it strix
+                    // falls through to the working (double-quant) path and serves.
+                    // On GB10 (where the w8a16 GDN kernels exist) set the flag to
+                    // engage native FP8 and eliminate the double-quant (non_live
+                    // +~9pt). Flip to default-on for strix only once the gfx1151
+                    // w8a16 GDN kernels land. See project_strix_accfix2_stale_branch_gdn.
+                    if std::env::var_os("ATLAS_GDN_FP8_NATIVE").is_some()
                         && proj_is_fp8_any_scale(store, &format!("{la}.in_proj_qkv"))
                         && proj_is_fp8_any_scale(store, &format!("{la}.in_proj_z"))
                         && proj_is_fp8_any_scale(store, &format!("{la}.out_proj"))
@@ -753,9 +912,13 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         Ok(layers)
     }
 
-    fn load_embedding(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
-        let prefix = &config.weight_prefix;
-        dense(store, &format!("{prefix}.embed_tokens.weight"))
+    fn load_embedding(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight> {
+        loaders_b::load_embedding(store, config)
     }
 
     fn load_final_norm(
@@ -764,8 +927,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         config: &ModelConfig,
         _gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        let prefix = &config.weight_prefix;
-        dense(store, &format!("{prefix}.norm.weight"))
+        loaders_b::load_final_norm(store, config)
     }
 
     fn load_lm_head(&self, store: &WeightStore, config: &ModelConfig, gpu: &dyn GpuBackend) -> Result<DenseWeight> {
@@ -788,7 +950,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                 dense(store, &key)
             };
         }
-        self.load_embedding(store, config)
+        self.load_embedding(store, config, gpu)
     }
 
     fn load_mtp_weights(
@@ -821,64 +983,19 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         }
         Ok(Some(mtp))
     }
-}
 
-// --- GDN native-FP8 helpers (ported from #229 6d79e14; required by #257 e220d40) ---
-// strix-accfix2 branched pre-#229, so the native-FP8 GDN path added by #257
-// referenced these two file-scope helpers without them being present. Ported
-// verbatim from origin/main:crates/spark-model/src/weight_loader/qwen35_dense.rs.
-
-/// True iff `{prefix}.weight` is FP8 E4M3 with a consumable scale — either a
-/// per-tensor scalar (broadcasts to a uniform grid, exact) or a genuine
-/// 128×128 block grid. Per-row `[N,1]` scales are NOT a block grid → false.
-fn proj_is_fp8_any_scale(store: &WeightStore, prefix: &str) -> bool {
-    let Ok(w) = store.get(&format!("{prefix}.weight")) else {
-        return false;
-    };
-    if w.dtype != WeightDtype::FP8E4M3 || w.shape.len() != 2 {
-        return false;
+    fn load_vision_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::VisionEncoder>> {
+        // Dense Qwen3.5 / Holo VL checkpoints (e.g. Holo-3.1-0.8B, Ornith-1.0-9B)
+        // ship the SAME Qwen3-VL ViT tower as their MoE siblings. The MoE
+        // loader's `load_vision_encoder` reads only `store` + `config.vision`
+        // (no MoE-specific state), so reuse it verbatim. The shared model
+        // forward (`model/trait_impl/*`, gated on `vision_encoder.is_some()`)
+        // then merges image embeddings — no dense-specific forward changes.
+        super::qwen35::Qwen35WeightLoader.load_vision_encoder(store, config, gpu)
     }
-    let (n, k) = (w.shape[0], w.shape[1]);
-
-    for key in [
-        format!("{prefix}.weight_scale_inv"),
-        format!("{prefix}.weight_scale"),
-    ] {
-        let Ok(s) = store.get(&key) else { continue };
-        if s.num_elements() == 1 {
-            return true;
-        }
-        if s.shape.len() == 2 && s.shape[0] == n.div_ceil(128) && s.shape[1] == k.div_ceil(128) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Concatenate two block-scaled FP8 weights along the row (N) dimension into a
-/// single `[Q|K|V|Z]`-ordered tensor on device (weights + row_scale grids).
-fn concat_fp8_block_scaled(
-    a: &crate::weight_map::Fp8Weight,
-    b: &crate::weight_map::Fp8Weight,
-    k: usize,
-    gpu: &dyn GpuBackend,
-) -> Result<crate::weight_map::Fp8Weight> {
-    let kb = k.div_ceil(128);
-    let a_w = a.n as usize * k;
-    let b_w = b.n as usize * k;
-    let weight = gpu.alloc(a_w + b_w)?;
-    gpu.copy_d2d(a.weight, weight, a_w)?;
-    gpu.copy_d2d(b.weight, weight.offset(a_w), b_w)?;
-    let a_s = (a.n as usize).div_ceil(128) * kb * 4;
-    let b_s = (b.n as usize).div_ceil(128) * kb * 4;
-    let row_scale = gpu.alloc(a_s + b_s)?;
-    gpu.copy_d2d(a.row_scale, row_scale, a_s)?;
-    gpu.copy_d2d(b.row_scale, row_scale.offset(a_s), b_s)?;
-    Ok(crate::weight_map::Fp8Weight {
-        weight,
-        row_scale,
-        n: a.n + b.n,
-        k: k as u32,
-        scale_format: crate::weight_map::WeightQuantFormat::Fp8BlockScaled,
-    })
 }

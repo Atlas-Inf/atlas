@@ -47,6 +47,16 @@ pub enum WeightQuantFormat {
     /// NVFP4: packed E2M1 nibbles + per-group FP8 block scales + per-tensor
     /// F32 scale. Consumed by `w4a16_gemv`, `w4a16_gemm`, and variants.
     Nvfp4,
+    /// Native MXFP4 (OCP micro-scaling): packed E2M1 nibbles + per-block
+    /// **E8M0** power-of-2 scales (`GROUP_SIZE=32`), **no** per-tensor global.
+    /// This is DeepSeek-V4-Flash's ORIGINAL on-disk routed-expert format. The
+    /// bytes are landed device-resident UNCHANGED (transcode-free) — the
+    /// scale byte is a biased exponent, effective scale `2^(byte-127)`.
+    /// Consumed by the E8M0 variants of the MoE grouped/decode GEMMs
+    /// (Phase-K lane); feeding these bytes through an `Nvfp4` kernel (which
+    /// reads the scale as FP8-E4M3 per-16 and applies a global) = silent
+    /// garbage — assert with `WeightQuantFormat::expect` at the dispatch site.
+    Mxfp4E8m0,
 }
 
 impl WeightQuantFormat {
@@ -179,7 +189,21 @@ impl QuantizedWeight {
         n: usize,
         k: usize,
     ) -> Result<QuantizedWeight> {
-        const GROUP_SIZE: usize = 16;
+        // NVFP4 default: per-16 block scales. Native MXFP4 (E8M0) is per-32 —
+        // ARM-2 Phase-K callers use `transpose_for_gemm_gs(.., 32)` for routed
+        // experts (the scale tensor is [N, K/32], not [N, K/16]).
+        self.transpose_for_gemm_gs(gpu, n, k, 16)
+    }
+
+    /// `transpose_for_gemm` with an explicit scale block size. Scale tensor is
+    /// `[N, K/group_size]`; the packed-weight transpose is group-size-independent.
+    pub fn transpose_for_gemm_gs(
+        &self,
+        gpu: &dyn GpuBackend,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<QuantizedWeight> {
         let half_k = k / 2;
 
         // Transpose B_packed: [N, K/2] → [K/2, N] into a NEW GPU allocation.
@@ -195,8 +219,8 @@ impl QuantizedWeight {
         let new_weight = gpu.alloc(packed_size)?;
         gpu.copy_h2d(&t_buf, new_weight)?;
 
-        // Transpose B_scale: [N, K/GROUP_SIZE] → [K/GROUP_SIZE, N] into a NEW allocation.
-        let num_groups = k / GROUP_SIZE;
+        // Transpose B_scale: [N, K/group_size] → [K/group_size, N] into a NEW allocation.
+        let num_groups = k / group_size;
         let scale_size = n * num_groups;
         let mut sbuf = vec![0u8; scale_size];
         gpu.copy_d2h(self.weight_scale, &mut sbuf)?;
@@ -252,6 +276,46 @@ impl QuantizedWeight {
 #[derive(Debug, Clone, Copy)]
 pub struct DenseWeight {
     pub weight: DevicePtr,
+}
+
+impl DenseWeight {
+    /// Quantize a BF16 weight `[N, K]` to FP8 E4M3 `[N, K]` with per-row
+    /// f32 scales. Allocates the FP8 buffer + row_scale buffer on the
+    /// GPU, runs the `quantize_bf16_to_fp8` kernel, and returns the
+    /// resulting [`Fp8DenseWeight`].
+    ///
+    /// Called once at model load time. Caller is responsible for any
+    /// stream synchronization needed before the returned weight is
+    /// consumed by `fp8_gemm_n128` or related kernels.
+    ///
+    /// Phase G (DFlash drafter FP8 weights). Mirrors
+    /// [`QuantizedWeight::predequant_to_fp8`] for the BF16 source path.
+    pub fn quantize_to_fp8(
+        &self,
+        gpu: &dyn GpuBackend,
+        quantize_kernel: spark_runtime::gpu::KernelHandle,
+        n: usize,
+        k: usize,
+        stream: u64,
+    ) -> Result<Fp8DenseWeight> {
+        let fp8_buf = gpu.alloc(n * k)?;
+        let row_scale_buf = gpu.alloc(n * std::mem::size_of::<f32>())?;
+        crate::layers::ops::quantize_bf16_to_fp8(
+            gpu,
+            quantize_kernel,
+            self.weight,
+            fp8_buf,
+            row_scale_buf,
+            n as u32,
+            k as u32,
+            stream,
+        )?;
+        gpu.synchronize(stream)?;
+        Ok(Fp8DenseWeight {
+            weight: fp8_buf,
+            row_scale: row_scale_buf,
+        })
+    }
 }
 
 /// FP8 E4M3 dense weight (runtime-quantized from BF16).
