@@ -200,6 +200,12 @@ pub(crate) fn quantized_v2(
         weight: ptr(store, &format!("{prefix}.weight_packed"))?,
         weight_scale: ptr(store, &format!("{prefix}.weight_scale"))?,
         weight_scale_2: 1.0 / raw_global_scale,
-        input_scale: ptr(store, &format!("{prefix}.input_global_scale"))?,
+        // Optional: weight-only NVFP4 (W4A16) checkpoints — e.g. llm-compressor
+        // `nvfp4-pack-quantized` with `input_activations: None` — carry no static
+        // activation scale; the MoE/GEMM compute quantizes activations
+        // dynamically and never reads this field. Absent ⇒ NULL (W4A4/W4A8
+        // checkpoints still load their `input_global_scale` unchanged).
+        input_scale: ptr(store, &format!("{prefix}.input_global_scale")).unwrap_or(DevicePtr::NULL),
+        weight_scale_2_vec: DevicePtr::NULL,
     })
 }
