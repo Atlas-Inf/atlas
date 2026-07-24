@@ -5,6 +5,8 @@
 //! Defines the [`DraftProposer`] trait for speculative decoding strategies.
 //! MTP implements this first; EAGLE-3 can implement later without engine changes.
 
+pub mod tree_shape;
+
 use std::any::Any;
 
 use anyhow::Result;
@@ -41,6 +43,25 @@ pub fn draft_conf_tau() -> f32 {
         .and_then(|v| v.parse::<f32>().ok())
         .map(|t| t.clamp(0.0, 0.99))
         .unwrap_or(0.0)
+}
+
+/// Shadow top-k draft instrumentation (`ATLAS_MTP_SHADOW_TOPK=k`, default
+/// 0 = off, clamp k ≤ 8). Observational only — token selection untouched.
+/// Each drafter `forward_one` D2H's its logits (same ~200 µs the conf path
+/// pays) and logs the top-k candidate ids + softmax probs per position;
+/// the verify steps log the target argmaxes under the same gate. Joining
+/// the two offline yields the per-depth conditional top-k coverage that
+/// gates the tree-speculation build (Phase 0 of the tree-spec plan).
+/// Value-parsed, not presence-checked (`=0` really is off).
+pub fn shadow_topk() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ATLAS_MTP_SHADOW_TOPK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(8)
+    })
 }
 
 /// Drafter catch-up feed on serial->speculative transitions
