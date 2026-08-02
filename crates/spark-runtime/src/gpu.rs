@@ -8,25 +8,27 @@
 
 use anyhow::Result;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Free device memory (bytes) captured once at GPU-context init, BEFORE any
-/// model weights or buffers are allocated. Lets the KV-budget sizing measure
-/// *this process's own* footprint as `baseline_free - free_now`, which excludes
-/// co-tenant memory automatically (vs trusting a hardcoded
-/// `ATLAS_KV_EXTERNAL_RESERVE_GB` that goes stale as co-tenants come and go).
-/// 0 = unset (e.g. under the mock backend in tests) → callers fall back.
-static BASELINE_FREE_BYTES: AtomicUsize = AtomicUsize::new(0);
+use std::sync::atomic::Ordering;
+// The free-memory baseline is a field of the single run mailbox,
+// `crate::run_metrics::RunMetrics`: it is read by the dashboard and by KV
+// sizing from threads with no carrier, and it is cleared at run start so a
+// second model measures against its own baseline rather than the first
+// model's pre-load free memory.
 
 /// Record the free-memory baseline at GPU-context init. Call once, early,
 /// before weight loading. Idempotent-last-write; intended to be set exactly once.
 pub fn set_baseline_free_bytes(bytes: usize) {
-    BASELINE_FREE_BYTES.store(bytes, Ordering::Relaxed);
+    crate::run_metrics::metrics()
+        .baseline_free_bytes
+        .store(bytes, Ordering::Relaxed);
 }
 
 /// The free-memory baseline captured at context init, or `None` if never set.
 pub fn baseline_free_bytes() -> Option<usize> {
-    match BASELINE_FREE_BYTES.load(Ordering::Relaxed) {
+    match crate::run_metrics::metrics()
+        .baseline_free_bytes
+        .load(Ordering::Relaxed)
+    {
         0 => None,
         v => Some(v),
     }
@@ -91,6 +93,21 @@ pub trait GpuBackend: Send + Sync {
 
     /// Free device memory.
     fn free(&self, ptr: DevicePtr) -> Result<()>;
+
+    /// Free every allocation this backend made that nobody released, and
+    /// report how many there were.
+    ///
+    /// The teardown backstop. Enumerating owners does not scale: the loaders
+    /// fuse weights into fresh allocations owned by layer structs, which no
+    /// pool releases — measured at 15.3 GB per cycle on a 27B, linear over six
+    /// cycles. A backend is created per model, so its outstanding set IS that
+    /// model's leak.
+    ///
+    /// Default `0`: a backend that does not track allocations has nothing to
+    /// sweep, which is honest for the mock and for Metal.
+    fn sweep_unreleased(&self) -> usize {
+        0
+    }
 
     /// Copy from host to device.
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()>;
@@ -185,6 +202,30 @@ pub trait GpuBackend: Send + Sync {
 
     /// Look up a kernel function by module and function name.
     fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle>;
+
+    /// This backend's memoized kernel handles and scratch allocations.
+    ///
+    /// Required rather than defaulted: an op that memoizes a `KernelHandle`
+    /// or a `DevicePtr` anywhere else is caching something that belongs to
+    /// this backend's model, and a default would let a new backend forget.
+    fn op_cache(&self) -> &crate::op_cache::OpCache;
+
+    /// Synchronise the stream after every kernel launch, so an asynchronous
+    /// illegal-address fault is reported at the kernel that caused it rather
+    /// than at a later sync. Resolved once when the backend is built; read on
+    /// the launch path, which is why it is not a per-launch `getenv`.
+    fn debug_sync_kernels(&self) -> bool {
+        false
+    }
+
+    /// This backend's model-scoped kernel modules, for the few callers that
+    /// need the registry itself rather than a kernel handle — resolving a
+    /// `__device__` symbol, for instance. `None` on backends that have no such
+    /// concept, which is why it is an accessor rather than a downcast.
+    #[cfg(feature = "cuda")]
+    fn kernel_registry(&self) -> Option<std::sync::Arc<atlas_core::registry::AtlasRegistry>> {
+        None
+    }
 
     /// Async host-to-device copy (no stream synchronization).
     ///

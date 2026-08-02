@@ -411,12 +411,20 @@ impl DenseFfnLayer {
             *wt = None;
         }
         if freed > 0 {
-            static TWIN_LOG: std::sync::Once = std::sync::Once::new();
-            TWIN_LOG.call_once(|| {
-                eprintln!(
+            // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+            // value — the message is rebuilt from the arguments every call — so a
+            // stale entry cannot produce a wrong answer, only a suppressed duplicate
+            // line after a model swap. Scoping it would thread a logging concern
+            // through the call path to prevent one repeated INFO line.
+            // Latched on the BACKEND (`OpCache::once`), which exists by load
+            // time: `finalize_q4k_load` takes the `gpu` it is loading onto. A
+            // static meant only the first model in the process reported the
+            // decision.
+            if gpu.op_cache().once("log:ffn_mmq_freed_twins") {
+                tracing::info!(
                     "[atlas] ATLAS_FFN_MMQ: freed transposed FFN `_t` copies (dead under Q4_K prefill) — Q4_K weights net to ~0 vs NVFP4 baseline"
                 );
-            });
+            }
         }
         Ok(())
     }
@@ -493,12 +501,20 @@ impl DenseFfnLayer {
             *wt = None;
         }
         if freed > 0 {
-            static FP4_TWIN_LOG: std::sync::Once = std::sync::Once::new();
-            FP4_TWIN_LOG.call_once(|| {
-                eprintln!(
+            // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+            // value — the message is rebuilt from the arguments every call — so a
+            // stale entry cannot produce a wrong answer, only a suppressed duplicate
+            // line after a model swap. Scoping it would thread a logging concern
+            // through the call path to prevent one repeated INFO line.
+            // Latched on the BACKEND (`OpCache::once`), which exists by load
+            // time: `finalize_q4k_load` takes the `gpu` it is loading onto. A
+            // static meant only the first model in the process reported the
+            // decision.
+            if gpu.op_cache().once("log:ffn_fp4mmq_freed_twins") {
+                tracing::info!(
                     "[atlas] ATLAS_FFN_NVFP4_MMQ: freed gate/up `_t` copies (dead under FP4-MMQ prefill) — block_nvfp4 copies net to ~0 vs NVFP4 baseline"
                 );
-            });
+            }
         }
         Ok(())
     }
@@ -820,23 +836,28 @@ impl DenseFfnLayer {
         // clamp), so with this arm the whole FFN block is kernel-identical to
         // a verify row. Requires the *_proj_t transposed copies (the NVFP4-MMQ
         // prefill arm FREES them — disable it if the warn below fires).
-        fn decode_ffn_via_gemm() -> bool {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                std::env::var("ATLAS_DECODE_FFN_VIA_GEMM").ok().as_deref() == Some("1")
-            })
-        }
-        if decode_ffn_via_gemm() && self.activation == FfnActivation::SiLU && self.act_mul.0 != 0 {
+        // The `OnceLock<bool>` static that lived here is now a field on
+        // `layers::ops::ModelLevers` — resolved when the model is built and carried
+        // on `ForwardContext`, because a static outlives the model whose flags it
+        // encodes.
+        if ctx.levers.decode_ffn_via_gemm
+            && self.activation == FfnActivation::SiLU
+            && self.act_mul.0 != 0
+        {
             let wt_alive =
                 |w: &Option<QuantizedWeight>| w.as_ref().is_some_and(|w| !w.weight.is_null());
             if wt_alive(&self.weights.gate_proj_t) && wt_alive(&self.weights.up_proj_t) {
-                static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                LOGGED.get_or_init(|| {
+                // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+                // value — the message is rebuilt from the arguments every call — so a
+                // stale entry cannot produce a wrong answer, only a suppressed duplicate
+                // line after a model swap. Scoping it would thread a logging concern
+                // through the call path to prevent one repeated INFO line.
+                if ctx.stats.once("log:decode_ffn_via_gemm") {
                     tracing::info!(
                         "decode FFN via verify GEMM path (ATLAS_DECODE_FFN_VIA_GEMM=1): \
                          gate/up/down through w4a16_prefill_gemm at M=1"
                     );
-                });
+                }
                 self.w4a16_prefill_gemm(
                     ctx,
                     &self.weights.gate_proj,
@@ -882,14 +903,18 @@ impl DenseFfnLayer {
                 )?;
                 return Ok(output);
             }
-            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-            WARNED.get_or_init(|| {
+            // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+            // value — the message is rebuilt from the arguments every call — so a
+            // stale entry cannot produce a wrong answer, only a suppressed duplicate
+            // line after a model swap. Scoping it would thread a logging concern
+            // through the call path to prevent one repeated INFO line.
+            if ctx.stats.once("log:decode_ffn_no_twins") {
                 tracing::warn!(
                     "ATLAS_DECODE_FFN_VIA_GEMM=1 requested but transposed FFN copies \
                      are freed/absent (NVFP4-MMQ prefill arm?) — falling back to GEMV; \
                      the unification experiment is NOT active"
                 );
-            });
+            }
         }
 
         // Fused gate_proj + up_proj: [1, H] → [1, inter] × 2.
@@ -1222,12 +1247,12 @@ impl DenseFfnLayer {
         k: u32,
         stream: u64,
     ) -> Result<()> {
-        fn small_m_enabled() -> bool {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var("ATLAS_FFN_SMALLM").ok().as_deref() != Some("0"))
-        }
+        // The `OnceLock<bool>` static that lived here is now a field on
+        // `layers::ops::ModelLevers` — resolved when the model is built and carried
+        // on `ForwardContext`, because a static outlives the model whose flags it
+        // encodes.
         if let Some(wt) = wt {
-            if m <= 64 && k.is_multiple_of(32) && small_m_enabled() {
+            if m <= 64 && k.is_multiple_of(32) && ctx.levers.ffn_small_m {
                 if k >= 8192 && k.is_multiple_of(64) && self.w4a16_gemm_t_k64_k.0 != 0 {
                     return ops::w4a16_gemm_n128(
                         ctx.gpu,
@@ -1451,12 +1476,16 @@ impl DenseFfnLayer {
         let int8_prefill =
             self.int8_faith2_k.0 != 0 && std::env::var_os("ATLAS_INT8_PREFILL").is_some();
         if int8_prefill {
-            static INT8_LOG: std::sync::Once = std::sync::Once::new();
-            INT8_LOG.call_once(|| {
-                eprintln!(
+            // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+            // value — the message is rebuilt from the arguments every call — so a
+            // stale entry cannot produce a wrong answer, only a suppressed duplicate
+            // line after a model swap. Scoping it would thread a logging concern
+            // through the call path to prevent one repeated INFO line.
+            if ctx.stats.once("log:ffn_int8_prefill") {
+                tracing::info!(
                     "[atlas] ATLAS_INT8_PREFILL=1: dense-FFN prefill via int8_gemm_faith2 (W4A8 requant→int8 MMA, lossy ~0.99998 cosine)"
                 );
-            });
+            }
         }
         // NVFP4 W4A4 MMQ prefill (ATLAS_FFN_NVFP4_MMQ) — vendored llama Blackwell
         // block-scale FP4 MMA, gate/up ONLY (hybrid: down stays on the default t_m128
@@ -1469,12 +1498,16 @@ impl DenseFfnLayer {
             && matches!(self.activation, FfnActivation::SiLU)
             && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_none();
         if fp4mmq_prefill {
-            static FP4MMQ_LOG: std::sync::Once = std::sync::Once::new();
-            FP4MMQ_LOG.call_once(|| {
-                eprintln!(
+            // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+            // value — the message is rebuilt from the arguments every call — so a
+            // stale entry cannot produce a wrong answer, only a suppressed duplicate
+            // line after a model swap. Scoping it would thread a logging concern
+            // through the call path to prevent one repeated INFO line.
+            if ctx.stats.once("log:ffn_fp4_mmq_prefill") {
+                tracing::info!(
                     "[atlas] ATLAS_FFN_NVFP4_MMQ=1: dense-FFN gate/up prefill via vendored llama NVFP4 W4A4 MMQ (block-scale FP4 MMA, ~80 TFLOP/s vs t_m128 ~51)"
                 );
-            });
+            }
         }
         // Down-projection MMQ arm (DEFAULT ON; kill-switch ATLAS_NO_FFN_NVFP4_MMQ_DOWN=1): route down through
         // the same MMQ arm (t_m128 runs the narrow-N down at only ~34 TFLOP/s in-model).
@@ -1518,12 +1551,16 @@ impl DenseFfnLayer {
             && self.quantize_nvfp4_k.0 != 0
             && std::env::var_os("ATLAS_FP4_PREFILL").is_some();
         if fp4_prefill {
-            static FP4_LOG: std::sync::Once = std::sync::Once::new();
-            FP4_LOG.call_once(|| {
-                eprintln!(
+            // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+            // value — the message is rebuilt from the arguments every call — so a
+            // stale entry cannot produce a wrong answer, only a suppressed duplicate
+            // line after a model swap. Scoping it would thread a logging concern
+            // through the call path to prevent one repeated INFO line.
+            if ctx.stats.once("log:ffn_fp4_prefill") {
+                tracing::info!(
                     "[atlas] ATLAS_FP4_PREFILL=1: dense-FFN prefill via w4a4_gemm (native FP4 MMA sm_121a, W4A4)"
                 );
-            });
+            }
         }
         // NVFP4 packed [m,K/2] + scale [m,K/16] both fit within the shared int8
         // buffers (a_i8 [m,K] ⊇ packed; a_scale [m,(K/32)*4] ⊇ scale). FP4-prefill
@@ -1542,12 +1579,16 @@ impl DenseFfnLayer {
             && !fp4mmq_prefill
             && std::env::var_os("ATLAS_FFN_MMQ").is_some();
         if q4k_prefill {
-            static Q4K_LOG: std::sync::Once = std::sync::Once::new();
-            Q4K_LOG.call_once(|| {
-                eprintln!(
+            // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+            // value — the message is rebuilt from the arguments every call — so a
+            // stale entry cannot produce a wrong answer, only a suppressed duplicate
+            // line after a model swap. Scoping it would thread a logging concern
+            // through the call path to prevent one repeated INFO line.
+            if ctx.stats.once("log:ffn_q4k_prefill") {
+                tracing::info!(
                     "[atlas] ATLAS_FFN_MMQ=1: dense-FFN prefill via vendored llama Q4_K MMQ (W4A8, +25%/+10% gate·down vs faith2)"
                 );
-            });
+            }
         }
         let q4k_a = if q4k_prefill {
             ctx.buffers.ffn_act_q8()

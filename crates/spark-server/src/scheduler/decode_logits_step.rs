@@ -4,38 +4,34 @@
 
 use super::*;
 
-thread_local! {
-    /// Reusable host staging buffer for the D2H logits copy on the sampling
-    /// path. Hoisted out of the per-token `vec![0u8; n*vocab*elem]` to avoid an
-    /// mmap/munmap + page-fault cycle every decoded token (the buffer is
-    /// ~0.5-1 MB at a 250k vocab). Fully overwritten by `copy_logits_to_host`,
-    /// so residual contents are irrelevant. Per-thread: the scheduler drives
-    /// decode on one thread.
-    static DECODE_LOGITS_HOST_SCRATCH: std::cell::RefCell<Vec<u8>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+// The reusable host staging buffer for the D2H logits copy is now
+// `SchedCtx::scratch.host_bytes` — same zero-contention single-thread
+// access, with a lifetime that ends when the run does.
 
 /// DIAG (ATLAS_DECODE_TIMING=1): localize the host-path decode cost. Splits the
 /// per-token wall into `copy` (D2H of the full 248k-vocab logits + the GPU
 /// forward-wait absorbed by that sync) vs `sample` (the host scalar loops over
 /// 248k: BF16→FP32 expand + penalties + masks + argmax). Emits a 100-token
 /// running summary. Zero-cost when the env var is unset (OnceLock-gated).
-fn decode_timing_record(copy_us: u64, sample_us: u64) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var("ATLAS_DECODE_TIMING").is_ok()) {
+fn decode_timing_record(
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    copy_us: u64,
+    sample_us: u64,
+) {
+    use std::sync::atomic::Ordering;
+    if !sched.levers.decode_timing {
         return;
     }
-    static COPY: AtomicU64 = AtomicU64::new(0);
-    static SAMPLE: AtomicU64 = AtomicU64::new(0);
-    static CNT: AtomicU64 = AtomicU64::new(0);
-    COPY.fetch_add(copy_us, Ordering::Relaxed);
-    SAMPLE.fetch_add(sample_us, Ordering::Relaxed);
-    let n = CNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let stats = &sched.stats;
+    stats.decode_copy_us.fetch_add(copy_us, Ordering::Relaxed);
+    stats
+        .decode_sample_us
+        .fetch_add(sample_us, Ordering::Relaxed);
+    let n = stats.decode_count.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_multiple_of(100) {
-        let c = COPY.swap(0, Ordering::Relaxed);
-        let s = SAMPLE.swap(0, Ordering::Relaxed);
-        CNT.store(0, Ordering::Relaxed);
+        let c = stats.decode_copy_us.swap(0, Ordering::Relaxed);
+        let s = stats.decode_sample_us.swap(0, Ordering::Relaxed);
+        stats.decode_count.store(0, Ordering::Relaxed);
         tracing::info!(
             "DECODE_TIMING (last 100 host-path tokens): copy+fwd-wait={:.2}ms/tok sample(248k host)={:.2}ms/tok",
             c as f64 / 100_000.0,
@@ -60,6 +56,7 @@ pub fn process_decode_logits(
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
 ) {
     let n = active.len();
 
@@ -111,7 +108,7 @@ pub fn process_decode_logits(
             // Reuse the per-thread staging buffer (restored at the end of this
             // block). `resize` only grows it; `copy_logits_to_host` overwrites
             // every byte so the residual/zero-fill is irrelevant.
-            let mut buf = DECODE_LOGITS_HOST_SCRATCH.with_borrow_mut(std::mem::take);
+            let mut buf = sched.scratch.host_bytes.borrow_mut().split_off(0);
             buf.resize(n * vocab_size * elem_bytes, 0);
             if let Err(e) = model.copy_logits_to_host(logits, &mut buf) {
                 tracing::error!("copy_logits_to_host error: {e:#}");
@@ -132,6 +129,14 @@ pub fn process_decode_logits(
                 think_start_token,
                 tool_call_start_token,
                 tool_call_end_token,
+                watchdog: sched.watchdog,
+                scratch: &sched.scratch,
+                dumps: &sched.dumps,
+                stats: sched.stats.clone(),
+                boundary_mask: sched.masks.boundary.clone(),
+                mid_word_mask: sched.masks.mid_word.clone(),
+                sampling: sched.levers.sampling(),
+                timing: sched.timing.clone(),
             };
             let t_sample = std::time::Instant::now();
             let sampled: Vec<(u32, Option<crate::api::TokenLogprobs>)> = active
@@ -151,11 +156,11 @@ pub fn process_decode_logits(
                     )
                 })
                 .collect();
-            decode_timing_record(copy_us, t_sample.elapsed().as_micros() as u64);
+            decode_timing_record(sched, copy_us, t_sample.elapsed().as_micros() as u64);
             // Return the staging buffer for reuse next token (its capacity is
             // preserved). The error path above intentionally drops it — that is
             // rare and only forfeits the cached capacity.
-            DECODE_LOGITS_HOST_SCRATCH.with_borrow_mut(|slot| *slot = buf);
+            *sched.scratch.host_bytes.borrow_mut() = buf;
             sampled
         };
     let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -181,7 +186,7 @@ pub fn process_decode_logits(
         // must never generate this control token; if it does (post-tool-call
         // runaway), end the turn. Uses `continue` (loop body), not `return`.
         if tool_response_stop_enabled()
-            && let Some(trs) = tool_response_hard_stop()
+            && let Some(trs) = sched.limits.tool_response_hard_stop
             && tok == trs
         {
             a.output_tokens.push(tok);
@@ -305,11 +310,15 @@ pub fn process_decode_logits(
                 // phrase attractor (`Running:\`\`\`bash cmd\`\`\`Executing:…`
                 // cycling) within ~24-60 tokens of the loop starting,
                 // instead of waiting for the 256-token thinking budget.
-                if !crate::scheduler::helpers::disable_watchdogs()
+                if !sched.levers.disable_watchdogs
                     && !a.force_end_thinking
                     && a.thinking_tokens >= THINK_LOOP_MIN_TOKENS
                     && a.thinking_tokens.is_multiple_of(THINK_LOOP_CHECK_STRIDE)
-                    && detect_thinking_token_loop_with(&a.output_tokens, a.repetition_detection)
+                    && detect_thinking_token_loop_with(
+                        &a.output_tokens,
+                        a.repetition_detection,
+                        sched.watchdog,
+                    )
                 {
                     a.force_end_thinking = true;
                     a.sentence_defer_count = 0;
@@ -329,7 +338,7 @@ pub fn process_decode_logits(
             // `decode_logits_content.rs` to keep this file ≤500 LoC.
             // `model` is threaded through so a watchdog rollback can
             // restore SSM recurrent state on hybrid models (Phase-C).
-            handle_content_token(a, model);
+            handle_content_token(a, model, sched);
         }
 
         // Track <tool_call> token: once seen, legacy tool call requirement is satisfied.
@@ -509,7 +518,7 @@ pub fn process_decode_logits(
         // generation cannot overrun. `remaining` already reflects this token's
         // decrement (thinking or content branch above); `a.seq.seq_len` is the
         // current KV position. No-op until a ceiling is actually hit.
-        let hard_ceiling = hard_ceiling_hit(a.remaining, a.seq.seq_len, max_seq_len_ceiling());
+        let hard_ceiling = hard_ceiling_hit(a.remaining, a.seq.seq_len, sched.limits.max_seq_len);
         let thinking_suppresses_eos = eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling);
         // Post-thinking EOS guard. Empirically (dump fix22b 2026-04-25
         // ses_23b4781f7ffebc7UgkKWedTmjd seq=43): when the thinking-loop
@@ -591,7 +600,7 @@ pub fn process_decode_logits(
             // for pure-attention models / disabled rings (see
             // `rollback::snapshot_boundary_if_ssm`).
             if !a.inside_thinking {
-                rollback::snapshot_boundary_if_ssm(a, model);
+                rollback::snapshot_boundary_if_ssm(a, model, sched);
                 // #155 iter3: block-aligned Marconi checkpoint on the
                 // non-MTP decode path (live SSM state is canonical here).
                 model.decode_marconi_checkpoint(&mut a.seq);
@@ -642,10 +651,10 @@ pub fn process_decode_logits(
             // Finishes with no EOS pushed → lifecycle reports finish=length.
             // No-op when `max_seq_len` is unset (0) or not yet reached, so
             // direct-mode short answers are unaffected.
-            if !a.finished && seqlen_force_stop(a.seq.seq_len, max_seq_len_ceiling()) {
+            if !a.finished && seqlen_force_stop(a.seq.seq_len, sched.limits.max_seq_len) {
                 tracing::info!(
                     seq_len = a.seq.seq_len,
-                    max_seq_len = max_seq_len_ceiling(),
+                    max_seq_len = sched.limits.max_seq_len,
                     output_tokens = a.output_tokens.len(),
                     "process_decode_logits: max_seq_len ceiling reached; force-stop (finish=length)"
                 );
@@ -683,11 +692,14 @@ pub fn process_decode_logits(
                 (Some(_), None) => true,
                 _ => false,
             };
-            if enable_loop_watchdog()
+            if sched.levers.loop_watchdog()
                 && !a.finished
                 && !a.inside_thinking
                 && !inside_tool_call
-                && let Some((pattern_len, mis_a, mis_b)) = detect_fuzzy_repetition(&a.output_tokens)
+                && let Some((pattern_len, mis_a, mis_b)) = detect_fuzzy_repetition(
+                    &a.output_tokens,
+                    sched.watchdog.fuzzy_repeat_tolerance_div,
+                )
             {
                 // Phase-C: roll back past the repeated window and
                 // re-steer. `min_keep` = pattern_len * 3 guarantees all
@@ -695,7 +707,7 @@ pub fn process_decode_logits(
                 // so generation cannot resume straight back into the
                 // loop. Falls back to the hard stop when declined.
                 let min_keep = pattern_len * 3;
-                match rollback_to_boundary(a, min_keep, model) {
+                match rollback_to_boundary(a, min_keep, model, sched) {
                     RollbackOutcome::RolledBack { dropped } => {
                         tracing::warn!(
                             pattern_len,

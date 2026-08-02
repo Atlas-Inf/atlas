@@ -9,8 +9,7 @@ use tokio::sync::mpsc;
 use crate::api::InferenceRequest;
 use crate::tokenizer::ChatTokenizer;
 use crate::{
-    auth, conversation_store, rate_limiter, reasoning_parser, request_dumper, response_store,
-    tool_parser,
+    conversation_store, rate_limiter, reasoning_parser, request_dumper, response_store, tool_parser,
 };
 
 /// Resolve a per-request `adapter` name to a LoRA pool slot index for M2
@@ -73,6 +72,9 @@ pub struct AppState {
     /// be cloned into per-request `GrammarSpec::ToolCall { parser, … }`
     /// for symmetric grammar dispatch via the trait.
     pub tool_call_parser: Option<std::sync::Arc<dyn tool_parser::ToolCallParser>>,
+    /// Chat-path levers for this server: prompt rendering (from MODEL.toml
+    /// `[behavior]`) plus the two default-off request diagnostics.
+    pub chat: crate::api::chat::levers::ChatLevers,
     /// Reasoning parser for thinking block detection. None = no thinking support.
     pub reasoning_parser: Option<Box<dyn reasoning_parser::ReasoningParser>>,
     /// Token ID for end-of-thinking — used to split thinking from content in blocking path.
@@ -94,8 +96,6 @@ pub struct AppState {
     pub tool_call_start_token_id: Option<u32>,
     /// Auto-compact threshold (fraction of max_seq_len). None = disabled.
     pub auto_compact_threshold: Option<f32>,
-    /// Readiness flag: true after model is loaded and scheduler is running.
-    pub model_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Default request timeout in seconds. 0 = no timeout.
     pub request_timeout: u32,
     /// Effective context length for agentic tasks (from MODEL.toml).
@@ -129,7 +129,6 @@ pub struct AppState {
     /// Bearer-token auth configuration. `Some` ⇒ `--require-auth` was set
     /// and the middleware enforces `Authorization: Bearer <token>` against
     /// the loaded set. `None` ⇒ auth is disabled (every request passes).
-    pub auth: Option<Arc<auth::AuthConfig>>,
     /// Task #27: STAGEABLE registry — adapters promotable-but-not-resident,
     /// `name -> {peer_stage_id, peft}`, from `--lora-stageable`. Empty ⇒ no
     /// promotion (resident-only serve byte-identical).

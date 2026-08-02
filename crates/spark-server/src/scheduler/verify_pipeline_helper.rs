@@ -55,63 +55,16 @@ mod fast_masked;
 mod scratch;
 
 use crate::scheduler::ActiveSeq;
-use crate::scheduler::decode_logits_seq::force_temp_zero_enabled;
 use crate::scheduler::helpers::bf16_to_f32;
 use crate::scheduler::logit_processors::LogitsContext;
 use spark_model::traits::Model;
 
-/// Kill-switch for the on-GPU greedy-under-grammar verify fast path (#3).
-/// Default ON; set `ATLAS_DISABLE_FAST_GREEDY=1` to force the full host
-/// pipeline on every verify position (the pre-2026-06-02 behaviour).
-pub(crate) fn fast_greedy_grammar_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("ATLAS_DISABLE_FAST_GREEDY").ok().as_deref() != Some("1"))
-}
+// `ATLAS_DISABLE_FAST_GREEDY` is now `SchedLevers::fast_greedy_grammar`,
+// read off `LogitsContext::sampling` at the one site that gated on it.
 
-/// ATLAS_DFLASH_MASKED_VERIFY=1: route DFlash verify PICKS through the
-/// pre-sample pipeline so structural specials (`</think>`, `<think>`,
-/// `<tool_call>`) can never leak unmasked into the output — the T=0
-/// spec-entry derails, root cause 2026-07-08.
-///
-/// ⚠️ PICK-BASIS ONLY. This must never gate `dflash_verify_raw_argmax`
-/// itself: that bool selects the verify architecture at the step level,
-/// this env only chooses the pick basis at the pick sites. Masking picks
-/// is cheap (the chat fast path in this file makes it ≈ free).
-pub(crate) fn dflash_masked_verify_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("ATLAS_DFLASH_MASKED_VERIFY").ok().as_deref() == Some("1"))
-}
-
-/// ATLAS_DFLASH_SEAM_SERIAL=1: take spec ENTRY (bootstrap, no pending
-/// drafts) through the standalone M=1 decode + propose instead of the
-/// fused single-sweep bootstrap. Evidence 2026-07-08: temp-0 derails
-/// concentrate on the serial-to-spec seam; the fused bootstrap chain
-/// diverges on its first step after serial decode, while routing that one
-/// step through plain decode makes the seam numerics identical to
-/// no-spec by construction. Costs one serial step per spec entry.
-pub(crate) fn dflash_seam_serial_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("ATLAS_DFLASH_SEAM_SERIAL").ok().as_deref() == Some("1"))
-}
-
-/// P1-3 (2026-07-09): honor the request temperature on the MTP verify path.
-/// Under MTP + grammar ~97-100% of emitted tokens flow through verify, which
-/// PINNED the pick to a (penalty-aware) argmax regardless of the client's
-/// `temperature` — retries were byte-identical, and low-margin argmax flips
-/// at close boundaries became deterministic attractors (adversarially
-/// verified forensics, 2026-07-09; the failing session requested temp=0.3).
-/// When enabled and the sequence has `temperature > 0.0`, the slow verify
-/// path SAMPLES from the pipeline-processed (grammar-masked + penalised)
-/// logits with the sequence's temperature/top_k/top_p/min_p instead of
-/// taking the argmax — the sampled pick is grammar-mask-allowed by
-/// construction because masked tokens are -inf and excluded from the
-/// candidate set. Acceptance stays `draft == pick`, so the accept rate may
-/// drop at temp>0: that is standard speculative-sampling behaviour. Default
-/// ON; set `ATLAS_NO_MTP_VERIFY_SAMPLE=1` to revert to the pinned argmax.
-pub(crate) fn mtp_verify_sample_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("ATLAS_NO_MTP_VERIFY_SAMPLE").ok().as_deref() != Some("1"))
-}
+// The DFlash verify statics are now `SchedLevers::dflash_*`.
+// The `ATLAS_NO_MTP_VERIFY_SAMPLE` kill switch is now
+// `SchedLevers::mtp_verify_sample`, carried on `LogitsContext`.
 
 /// Per-position verify logits, dequantised + processed through the full
 /// pre-sample pipeline. Returns the chosen token: either the forced
@@ -139,7 +92,7 @@ pub fn verify_pick_with_pipeline(
     ctx: &LogitsContext,
     verify_pos: usize,
 ) -> u32 {
-    use crate::scheduler::mtp_timing::{self, Phase};
+    use crate::scheduler::mtp_timing::Phase;
     // 1. Dequant per the same scheme as `process_seq_logits`, into a REUSED
     //    thread-local buffer rather than a fresh ~1 MB `Vec<f32>` per K position
     //    — see `scratch.rs`. Semantically inert: every `vocab_size` entry is
@@ -165,7 +118,7 @@ pub fn verify_pick_with_pipeline(
             bf16_to_f32(lo, hi)
         }));
     }
-    mtp_timing::record(Phase::Dequant, t_dequant);
+    ctx.timing.record(Phase::Dequant, t_dequant);
     // Hand the allocation back on EVERY exit below (forced-token short circuit,
     // temp>0 sample, argmax), or the next call allocates from scratch again and
     // the reuse is silently lost.
@@ -205,14 +158,14 @@ pub fn verify_pick_with_pipeline(
         &penalties,
         crate::scheduler::sample_step::PositionKind::Verify,
     ) {
-        mtp_timing::record(Phase::PipelineProc, t_proc);
+        ctx.timing.record(Phase::PipelineProc, t_proc);
         return tok;
     }
-    mtp_timing::record(Phase::PipelineProc, t_proc);
+    ctx.timing.record(Phase::PipelineProc, t_proc);
 
     // 4a. P1-3 (2026-07-09): when the request asked for temperature > 0,
     //     SAMPLE from the processed logits instead of taking the argmax.
-    //     The processors (grammar bitmask, think/tool masks, penalties+bias)
+    //     The processors (grammar bitmask, think/tool sched, penalties+bias)
     //     already ran in place above, so masked tokens sit at -inf and the
     //     sampler's candidate filter excludes them — the sampled pick is
     //     grammar-mask-allowed by construction. This mirrors the non-MTP
@@ -228,7 +181,7 @@ pub fn verify_pick_with_pipeline(
     //     `process_position_logits` returns Some(argmax) before this point);
     //     the guard is kept as documentation. Kill-switch:
     //     ATLAS_NO_MTP_VERIFY_SAMPLE=1 reverts to the pinned argmax below.
-    if mtp_verify_sample_enabled() && a.temperature > 0.0 && !force_temp_zero_enabled() {
+    if ctx.sampling.mtp_verify_sample && a.temperature > 0.0 && !ctx.sampling.force_temp_zero {
         let t_sample = std::time::Instant::now();
         let step_seed = a
             .seed
@@ -238,7 +191,7 @@ pub fn verify_pick_with_pipeline(
             top_k: a.top_k,
             top_p: a.top_p,
             top_n_sigma: a.top_n_sigma,
-            min_p: crate::scheduler::sample_step::effective_min_p(a.min_p),
+            min_p: crate::scheduler::sample_step::effective_min_p(a.min_p, &ctx.sampling),
             logit_bias: Vec::new(),
             repetition_penalty: 1.0,
             repetition_penalty_window: 0,
@@ -262,7 +215,7 @@ pub fn verify_pick_with_pipeline(
             spark_runtime::sampler::sample_with_params_history(f32_bytes, &sampler_shape, &[]);
         // Recorded under the Argmax phase: it replaces the argmax pick and
         // keeps the mtp_timing phase set unchanged.
-        mtp_timing::record(Phase::Argmax, t_sample);
+        ctx.timing.record(Phase::Argmax, t_sample);
         return sampled;
     }
 
@@ -270,7 +223,7 @@ pub fn verify_pick_with_pipeline(
     //    sampler's argmax branch behaviour.
     let t_argmax = std::time::Instant::now();
     let best_id = argmax::argmax_first_wins(&f32_logits);
-    mtp_timing::record(Phase::Argmax, t_argmax);
+    ctx.timing.record(Phase::Argmax, t_argmax);
     best_id
 }
 
@@ -289,7 +242,7 @@ pub fn verify_pick_all_with_pipeline(
     a: &mut ActiveSeq,
     ctx: &LogitsContext,
 ) -> Vec<u32> {
-    use crate::scheduler::mtp_timing::{self, Phase};
+    use crate::scheduler::mtp_timing::Phase;
     let k = argmax_ids.len();
     if k == 0 {
         return Vec::new();
@@ -346,10 +299,10 @@ pub fn verify_pick_all_with_pipeline(
     // fire, so every position routes through the slow pipeline below where
     // the temp>0 sampling branch (step 4a in `verify_pick_with_pipeline`)
     // draws from the processed logits. Confirmed and kept as-is.
-    let fast_penalty_gate = if fast_greedy_grammar_enabled()
+    let fast_penalty_gate = if ctx.sampling.fast_greedy_grammar
         && a.grammar_state.is_some()
         && !a.inside_thinking
-        && (a.temperature == 0.0 || force_temp_zero_enabled())
+        && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
     {
         crate::scheduler::fast_greedy::classify_penalties(
             &crate::scheduler::sample_step::penalty_params_for(
@@ -432,7 +385,7 @@ pub fn verify_pick_all_with_pipeline(
                 gs.rollback(adv);
             }
         }
-        mtp_timing::record(Phase::FastGreedy, t_fast);
+        ctx.timing.record(Phase::FastGreedy, t_fast);
         if all_allowed && fast.len() == k {
             return fast; // no D2H, no CPU pipeline — all positions GPU-greedy + grammar-legal
         }
@@ -453,7 +406,7 @@ pub fn verify_pick_all_with_pipeline(
     {
         return argmax_ids.to_vec();
     }
-    mtp_timing::record(Phase::D2h, t_d2h);
+    ctx.timing.record(Phase::D2h, t_d2h);
 
     let mut picks: Vec<u32> = Vec::with_capacity(k);
     // Snapshot the matcher's history depth BEFORE speculative advances so we

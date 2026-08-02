@@ -8,6 +8,7 @@ members = [
     "crates/atlas-embed",
     "crates/atlas-reduce",
     "crates/atlas-kernels",
+    "crates/atlas-plugin",
     "crates/atlas-tier",
     "crates/atlas-rdma",
     "crates/spark-runtime",
@@ -30,7 +31,7 @@ members = [
 cudarc = { path = "vendor/cudarc" }
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0-beta-preview"
 edition = "2024"
 rust-version = "1.85"
 license = "AGPL-3.0-only"
@@ -82,11 +83,6 @@ parking_lot = "0.12"
 # right backend feature explicitly (cuda or metal). Without this, every
 # member would silently pull in cudarc via atlas-core's `cuda` default.
 atlas-core = { path = "crates/atlas-core", default-features = false }
-atlas-quant = { path = "crates/atlas-quant" }
-atlas-norm = { path = "crates/atlas-norm" }
-atlas-activation = { path = "crates/atlas-activation" }
-atlas-embed = { path = "crates/atlas-embed" }
-atlas-reduce = { path = "crates/atlas-reduce" }
 atlas-kernels = { path = "crates/atlas-kernels" }
 atlas-tier = { path = "crates/atlas-tier" }
 atlas-rdma = { path = "crates/atlas-rdma" }

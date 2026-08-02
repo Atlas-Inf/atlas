@@ -28,6 +28,9 @@ mod logit_processors;
 mod logprobs;
 mod mod_helpers;
 pub use mod_helpers::capture_runtime_handle;
+pub mod dumps;
+pub mod levers;
+pub mod limits;
 mod mtp_gate;
 mod mtp_step;
 pub(crate) mod mtp_timing;
@@ -40,7 +43,9 @@ mod prefill_b_step;
 mod repetition;
 mod rollback;
 mod sample_step;
+pub mod sched_ctx;
 pub mod snapshot;
+pub mod spec_stats;
 mod spec_step;
 mod ssm_decode_ring;
 mod types;
@@ -49,6 +54,7 @@ mod verify_k2_step;
 mod verify_k3_step;
 mod verify_k4_step;
 mod verify_pipeline_helper;
+pub mod vocab_masks;
 
 use beam_prefill::resolve_beam_hyp;
 use confidence::*;
@@ -57,17 +63,10 @@ use decode_logits_seq::*;
 use decode_logits_step::*;
 use decode_step::*;
 use emit_step::*;
-pub use helpers::disable_watchdogs;
-pub use helpers::set_boundary_token_mask;
-pub use helpers::set_enable_loop_watchdog;
-pub use helpers::set_im_start_hard_stop;
-pub use helpers::set_max_seq_len;
-pub use helpers::set_mid_word_token_mask;
-pub use helpers::set_numeric_token_mask;
-pub use helpers::set_tool_response_hard_stop;
+pub use helpers::WatchdogParams;
+pub(crate) use helpers::parse_disable_watchdogs;
 use helpers::*;
 pub use helpers::{CONTENT_LOOP_PERIOD_MAX, CONTENT_LOOP_PERIOD_MIN};
-pub use helpers::{WatchdogParams, set_watchdog_params};
 use lifecycle::*;
 use logprobs::*;
 use mod_helpers::*;
@@ -102,7 +101,6 @@ use spark_runtime::sampler::{
     SamplingParams, apply_penalties_and_bias, sample_with_params, sample_with_params_history,
 };
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -194,7 +192,25 @@ pub fn run(
     adaptive_sampling: bool,
     mut session_manager: crate::session_manager::SessionSsmManager,
     spontaneous_think_budget: u32,
+    // Per-token masks for THIS model's vocabulary. Carried rather than read
+    // from a process-wide static: they are indexed by token id and are
+    // meaningless against a different tokenizer.
+    vocab_masks: crate::scheduler::vocab_masks::VocabMasks,
+    // This model's hard stops: two tokenizer-resolved token ids and the
+    // served-context ceiling. Carried for the same reason as `vocab_masks`.
+    limits: crate::scheduler::limits::SchedLimits,
+    // This model's MODEL.toml `[behavior]` watchdog tunables.
+    watchdog: crate::scheduler::helpers::WatchdogParams,
+    // Shared with the dashboard, which toggles the loop watchdog mid-run.
+    levers: std::sync::Arc<crate::scheduler::levers::SchedLevers>,
+    // Shared with the dashboard, which polls it for the queue/KV display.
+    snapshot: std::sync::Arc<crate::scheduler::snapshot::SnapshotCell>,
 ) {
+    // Everything this run needs that is derived from the model rather than the
+    // request. The levers were twenty-odd `ATLAS_*` statics; they are resolved
+    // once here and read through `sched` from every step function.
+    let sched =
+        crate::scheduler::sched_ctx::SchedCtx::new(vocab_masks, levers, snapshot, limits, watchdog);
     model
         .bind_gpu_to_thread()
         .expect("Failed to bind CUDA context to scheduler thread");
@@ -210,10 +226,10 @@ pub fn run(
     // session and auto-disable MTP if it is provably net-negative. Only armed
     // for the pure-MTP path (not ngram/self/dflash, which have their own
     // economics and proposers).
-    let mut mtp_gate = if use_mtp && !mtp_timing::gate_forced() {
+    let mut mtp_gate = if use_mtp && !sched.levers.mtp_gate_force {
         Some(mtp_gate::MtpGate::new(num_drafts))
     } else {
-        if use_mtp && mtp_timing::gate_forced() {
+        if use_mtp && sched.levers.mtp_gate_force {
             tracing::warn!(
                 "ATLAS_MTP_GATE_FORCE=1: MTP throughput gate DISARMED (diagnostic; \
                  verify runs even where the gate would measure it net-negative)"
@@ -293,9 +309,16 @@ pub fn run(
     let mut swapped: Vec<SwappedSeq> = Vec::new();
     let mut spill_manager: Option<KvSpillManager> = if swap_space_gb > 0 {
         let max_bytes = swap_space_gb as u64 * 1024 * 1024 * 1024;
-        match KvSpillManager::new(PathBuf::from("/tmp/atlas-swap"), max_bytes) {
+        // Per-PROCESS directory. `KvSpillManager::new` wipes stale `swap_*` files
+        // on construction, which is correct for a restart and correct across a
+        // hot-swap (the old scheduler is joined before the new one is built, so
+        // they never overlap) — but a SHARED path means two `spark serve`
+        // processes on one box wipe each other's live spill files. That is a
+        // pre-existing hazard this work surfaced rather than introduced.
+        let spill_dir = std::env::temp_dir().join(format!("atlas-swap-{}", std::process::id()));
+        match KvSpillManager::new(spill_dir.clone(), max_bytes) {
             Ok(mgr) => {
-                tracing::info!("Swap space: {swap_space_gb} GB at /tmp/atlas-swap/");
+                tracing::info!("Swap space: {swap_space_gb} GB at {}", spill_dir.display());
                 Some(mgr)
             }
             Err(e) => {
@@ -323,7 +346,7 @@ pub fn run(
                 Some(g) => g.observe(),
                 None => (snapshot::MtpModeSnap::Off, 0.0),
             };
-            snapshot::publish(snapshot::SchedulerSnapshot {
+            sched.snapshot.publish(snapshot::SchedulerSnapshot {
                 active_seqs: active.len() as u32,
                 prefilling_seqs: prefilling.len() as u32,
                 swapped_seqs: swapped.len() as u32,
@@ -445,6 +468,7 @@ pub fn run(
         // ── Start new requests ──
         start_new_requests(
             &*model,
+            &sched,
             new_reqs,
             chunked,
             always_mixed,
@@ -483,6 +507,7 @@ pub fn run(
             tool_call_start_token,
             tool_call_end_token,
             adaptive_sampling,
+            &sched,
         );
 
         if active.is_empty() {
@@ -506,10 +531,18 @@ pub fn run(
             // this context the MTP/spec verify path emits unmasked
             // GPU-argmax tokens (Phase C-2 root cause, 2026-05-24).
             let verify_ctx = crate::scheduler::logit_processors::LogitsContext {
+                watchdog: sched.watchdog,
+                scratch: &sched.scratch,
+                dumps: &sched.dumps,
+                stats: sched.stats.clone(),
                 think_end_token,
                 think_start_token,
                 tool_call_start_token,
                 tool_call_end_token,
+                boundary_mask: sched.masks.boundary.clone(),
+                mid_word_mask: sched.masks.mid_word.clone(),
+                sampling: sched.levers.sampling(),
+                timing: sched.timing.clone(),
             };
             // Spec-resume guard (ATLAS_DFLASH_RESUME_GUARD=N, default 0 = off):
             // keep the first N post-`</think>` tokens on plain serial decode.
@@ -517,13 +550,7 @@ pub fn run(
             // concentrate in the answer's opening tokens; serial-decoding that
             // window sidesteps them while leaving the high-accept answer body
             // speculated. N=0 preserves exact prior behavior.
-            static DFLASH_RESUME_GUARD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-            let dflash_resume_guard = *DFLASH_RESUME_GUARD.get_or_init(|| {
-                std::env::var("ATLAS_DFLASH_RESUME_GUARD")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0)
-            });
+            let dflash_resume_guard = sched.levers.dflash_resume_guard;
             // ATLAS_DFLASH_SPEC_THINK=1: speculate INSIDE think blocks (vLLM
             // semantics — reference measures 45% draft acceptance on thinking,
             // 2026-07-07 calibration). Bypasses the think-gate AND the resume
@@ -531,19 +558,16 @@ pub fn run(
             // batch-K numerics floor can flip a low-margin token mid-think),
             // and thinking-budget forced-end is not enforced on the raw-argmax
             // verify path. Throughput mode; leave OFF for byte-proof runs.
-            static DFLASH_SPEC_THINK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let dflash_spec_think = *DFLASH_SPEC_THINK.get_or_init(|| {
-                std::env::var("ATLAS_DFLASH_SPEC_THINK").ok().as_deref() == Some("1")
-            });
+            let dflash_spec_think = sched.levers.dflash_spec_think;
             if use_ngram_speculative && active.len() == 1 && active[0].grammar_state.is_none() {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
-                    step_ngram(&*model, &mut active, proposer, &verify_ctx);
+                    step_ngram(&*model, &mut active, &sched, proposer, &verify_ctx);
                 }
             } else if use_self_speculative && active.len() == 1 && active[0].grammar_state.is_none()
             {
                 // Self-speculative: draft via layer-skipping, verify with full model.
-                step_self_spec(&*model, &mut active, num_drafts, &verify_ctx);
+                step_self_spec(&*model, &mut active, &sched, num_drafts, &verify_ctx);
             } else if use_mtp
                 && active.len() == 1
                 && (
@@ -585,6 +609,7 @@ pub fn run(
                                 tool_call_start_token,
                                 tool_call_end_token,
                                 adaptive_sampling,
+                                &sched,
                             );
                             gate.record_decode(t0.elapsed());
                             // ATLAS_MTP_CATCHUP: ring the serially decoded
@@ -627,6 +652,7 @@ pub fn run(
                             step_mtp(
                                 &*model,
                                 &mut active,
+                                &sched,
                                 num_drafts,
                                 &verify_ctx,
                                 dflash_verify_raw_argmax,
@@ -653,6 +679,7 @@ pub fn run(
                     step_mtp(
                         &*model,
                         &mut active,
+                        &sched,
                         num_drafts,
                         &verify_ctx,
                         dflash_verify_raw_argmax,
@@ -681,6 +708,7 @@ pub fn run(
                     tool_call_start_token,
                     tool_call_end_token,
                     adaptive_sampling,
+                    &sched,
                 );
             }
         }
@@ -743,5 +771,23 @@ pub fn run(
     }
     // Shutdown applies to every slot the worker has; seq_id is ignored.
     let _ = model.ep_broadcast_cmd_for_seq(0, 0xFFFFFFFF);
+
+    // Release the model's device memory HERE, in order and able to report a
+    // failure, before the `Box` drops.
+    //
+    // This is the point the whole `ModelResource`/`Teardown` mechanism was
+    // built for, and until now nothing called it: `Model::teardown` had no
+    // caller anywhere in production, so the ordered release was dead code and
+    // every allocation fell through to the backend's `Drop` sweep — thousands
+    // of them per swap (3370, then 3973, on two successful swaps). The sweep is
+    // the intended BACKSTOP for what no owner claims, not the mechanism. `Drop`
+    // is neither ordered nor able to fail, which is precisely why `Teardown`
+    // exists.
+    //
+    // Every sequence above has been freed and no request can arrive, so this is
+    // the quiescent point frees require on GB10.
+    if let Err(e) = model.teardown() {
+        tracing::error!("model teardown reported a failure: {e:#}");
+    }
     tracing::info!("Scheduler stopped");
 }

@@ -214,6 +214,23 @@ pub struct ForwardContext<'a> {
     pub gpu: &'a dyn GpuBackend,
     /// Model configuration (dimensions, hyperparameters).
     pub config: &'a ModelConfig,
+    /// Which GEMM implementation each projection takes. Carried rather than
+    /// read from a static so it cannot outlive the model whose flags it
+    /// encodes — see `layers::ops::GemmDispatch`.
+    pub dispatch: &'a crate::layers::ops::GemmDispatch,
+    /// Re-encoded copies of this model's weights, memoized for this model's
+    /// lifetime. Carried rather than kept in a static keyed by device pointer,
+    /// where a recycled address would HIT after a model swap.
+    pub derived: &'a crate::layers::ops::DerivedWeights,
+    /// Kernel-path levers for this model — the SSM/GDN variant, FFN routing,
+    /// MoE quantization, LoRA mode, diagnostics. The non-GEMM half of the
+    /// lever set; `dispatch` is the GEMM half.
+    pub levers: &'a crate::layers::ops::ModelLevers,
+    /// This model's diagnostic counters and one-shot dump latches. Carried
+    /// for the same reason as `levers`: a counter that spans a model swap
+    /// averages two models and describes neither, and a one-shot latch that
+    /// already fired swallows the next model's dump.
+    pub stats: &'a crate::layers::ops::ModelStats,
     /// Pre-uploaded attention metadata (None if no attention layers).
     pub attn_metadata: Option<AttnMetadataDev>,
     /// Profile mode: sync+time per-operation within layers.

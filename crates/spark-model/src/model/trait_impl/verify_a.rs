@@ -79,6 +79,7 @@ impl TransformerModel {
                         self.prefix_cache.as_ref(),
                         self.gpu.as_ref(),
                         stream,
+                        self.levers.kv_poison,
                     )?;
 
                     // Upload per-token attention metadata
@@ -137,6 +138,10 @@ impl TransformerModel {
                         buffers: &self.buffers,
                         gpu: self.gpu.as_ref(),
                         config: &self.config,
+                        dispatch: &self.dispatch,
+                        derived: &self.derived,
+                        levers: &self.levers,
+                        stats: &self.stats,
                         attn_metadata: Some(attn_metadata),
                         profile: false,
                         comm: self.comm_ref(),
@@ -168,6 +173,10 @@ impl TransformerModel {
                     buffers: &self.buffers,
                     gpu: self.gpu.as_ref(),
                     config: &self.config,
+                    dispatch: &self.dispatch,
+                    derived: &self.derived,
+                    levers: &self.levers,
+                    stats: &self.stats,
                     attn_metadata: None,
                     profile: false,
                     comm: self.comm_ref(),

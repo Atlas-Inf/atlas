@@ -192,6 +192,7 @@ impl TransformerModel {
                 self.prefix_cache.as_ref(),
                 self.gpu.as_ref(),
                 stream,
+                self.levers.kv_poison,
             )?;
         }
 
@@ -217,7 +218,7 @@ impl TransformerModel {
         let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
         // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
         // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
-        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
+        let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         let use_graphs = !ms_profile
             && !lora_eager
             && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
@@ -229,6 +230,10 @@ impl TransformerModel {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(metadata),
             profile: false,
             comm: self.comm_ref(),

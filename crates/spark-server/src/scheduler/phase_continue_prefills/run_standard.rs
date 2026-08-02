@@ -33,6 +33,7 @@ pub(super) fn run_standard_chunk_loop(
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
     completed_indices: &mut Vec<(usize, Option<u32>)>,
     did_mixed_step: &mut bool,
 ) {
@@ -40,7 +41,7 @@ pub(super) fn run_standard_chunk_loop(
     // enough K² stats to finalize scales. The driver itself is idempotent
     // (no-op after activation), so calling on every chunk is cheap.
     // Group size = 128 = Qwen3 head_dim (the only currently-supported shape).
-    super::poll_innerq();
+    super::poll_innerq(model);
     // Single chunk per call — the outer scheduler loop re-enters this
     // function on the very next iteration to advance the next stream
     // or the next chunk. This yield keeps fairness across pending
@@ -181,6 +182,7 @@ pub(super) fn run_standard_chunk_loop(
                         p.min_p,
                         &p.eos_tokens,
                         p.grammar_state.as_mut(),
+                        &sched.levers.sampling(),
                     ) {
                         Ok(first) => {
                             tracing::info!("Mixed prefill first token: {first}");
@@ -207,6 +209,7 @@ pub(super) fn run_standard_chunk_loop(
                     tool_call_start_token,
                     tool_call_end_token,
                     adaptive_sampling,
+                    sched,
                 );
                 *did_mixed_step = true;
             }
@@ -270,6 +273,7 @@ pub(super) fn run_standard_chunk_loop(
                     p.min_p,
                     &p.eos_tokens,
                     p.grammar_state.as_mut(),
+                    &sched.levers.sampling(),
                 ) {
                     Ok(first) => {
                         tracing::info!("Prefill first token: {first}");

@@ -46,7 +46,7 @@
 
 use crate::scheduler::ActiveSeq;
 use crate::scheduler::logit_processors::LogitsContext;
-use crate::scheduler::mtp_timing::{self, Phase};
+use crate::scheduler::mtp_timing::Phase;
 use spark_model::traits::Model;
 
 /// Returns `Some(picks)` when the fast path proves masked-greedy ==
@@ -66,18 +66,11 @@ pub(super) fn try_chat_fast_path(
     // vs an unpatched binary (think block identical, answer flips at
     // low-margin tokens). MTP keeps the slow path unconditionally so
     // its behavior is byte-invariant by construction.
-    if !super::dflash_masked_verify_enabled() {
+    if !ctx.sampling.dflash_masked_verify {
         return None;
     }
-    let fast_masked_enabled = {
-        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *CACHED
-            .get_or_init(|| std::env::var("ATLAS_DISABLE_FAST_MASKED").ok().as_deref() != Some("1"))
-    };
-    let adadec_recording = {
-        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *CACHED.get_or_init(|| std::env::var("ATLAS_ADADEC_DIAGNOSTIC").is_ok())
-    };
+    let fast_masked_enabled = ctx.sampling.fast_masked;
+    let adadec_recording = ctx.sampling.adadec_diagnostic;
     if !fast_masked_enabled || a.grammar_state.is_some() || adadec_recording {
         return None;
     }
@@ -86,11 +79,11 @@ pub(super) fn try_chat_fast_path(
     };
     // (b) forced/stateful stage preconditions — mirrored exactly from
     // f2_confidence.rs / forced_think_end.rs / pin_tool_call.rs.
-    let f2_active = !crate::scheduler::helpers::disable_watchdogs()
+    let f2_active = !ctx.sampling.disable_watchdogs
         && a.inside_thinking
         && !a.force_end_thinking
         && a.thinking_tokens >= 400
-        && crate::scheduler::helpers::watchdog_params().confidence_early_stop;
+        && ctx.watchdog.confidence_early_stop;
     let defer_hard_override = match a.thinking_budget {
         Some(b) => a.thinking_tokens >= b.saturating_mul(THINK_DEFER_BUDGET_FACTOR),
         None => a.thinking_tokens >= THINK_DEFER_ABS_CEILING,
@@ -148,15 +141,14 @@ pub(super) fn try_chat_fast_path(
             break;
         }
     }
-    mtp_timing::record(Phase::FastGreedy, t_fast);
+    ctx.timing.record(Phase::FastGreedy, t_fast);
     if all_clear {
-        static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| {
+        if ctx.stats.once("log:verify_chat_fast_path") {
             tracing::info!(
                 "verify chat fast path ACTIVE: masked-greedy == raw argmax, no D2H \
                  (kill-switch: ATLAS_DISABLE_FAST_MASKED=1)"
             );
-        });
+        }
         return Some(argmax_ids.to_vec());
     }
     // Fall through — grammar fast path can't fire (grammar_state is

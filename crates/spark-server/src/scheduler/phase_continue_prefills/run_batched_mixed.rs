@@ -36,10 +36,11 @@ pub(super) fn run_batched_mixed_step(
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
     did_mixed_step: &mut bool,
 ) {
     // Per-chunk InnerQ finalize poll — see `phase_continue_prefills::poll_innerq`.
-    super::poll_innerq();
+    super::poll_innerq(model);
     let n_prefill = prefilling.len();
     let n_decode = active.len();
 
@@ -149,6 +150,7 @@ pub(super) fn run_batched_mixed_step(
             p.min_p,
             &p.eos_tokens,
             p.grammar_state.as_mut(),
+            &sched.levers.sampling(),
         ) {
             Ok(first) => {
                 tracing::info!(
@@ -179,6 +181,7 @@ pub(super) fn run_batched_mixed_step(
             tool_call_start_token,
             tool_call_end_token,
             adaptive_sampling,
+            sched,
         );
     }
     *did_mixed_step = true;

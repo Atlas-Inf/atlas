@@ -148,11 +148,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let block = panel(
         format!(
             "CHAT ─ {} ─{}",
-            app.args
-                .model_name
-                .clone()
-                .or_else(|| app.args.model.clone())
-                .unwrap_or_default(),
+            super::live_model_name(app),
             match (app.chat.streaming, app.chat.scroll) {
                 (_, Some(n)) => format!(" ↑{n} ─ End follows ─"),
                 (true, None) => " streaming ─".to_string(),
@@ -224,6 +220,9 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // following" precisely when a reply got long enough to matter.
     let h = inner.height as usize;
     let max_off = lines.len().saturating_sub(h);
+    // `max_off` is already exactly the ceiling: scrolled back that far, the
+    // OLDEST line is at the top and there is nothing above it.
+    app.chat_scroll_max.set(max_off);
     let off = match app.chat.scroll {
         None => max_off,
         Some(n) => max_off.saturating_sub(n),

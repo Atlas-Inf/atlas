@@ -108,13 +108,7 @@ impl MoeLayer {
             )?;
         }
 
-        super::union_stats::maybe_sample_expert_union(
-            ctx.gpu,
-            indices_dev,
-            3,
-            top_k as usize,
-            stream,
-        );
+        super::union_stats::maybe_sample_expert_union(ctx, indices_dev, 3, top_k as usize, stream);
 
         // 3-5. Fused expert dispatch for 3 tokens
         let expert_gate_out = ctx.buffers.expert_gate_out();

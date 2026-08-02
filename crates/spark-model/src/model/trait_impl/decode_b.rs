@@ -156,6 +156,7 @@ impl TransformerModel {
                 self.prefix_cache.as_ref(),
                 self.gpu.as_ref(),
                 stream,
+                self.levers.kv_poison,
             )?;
         }
 
@@ -169,6 +170,7 @@ impl TransformerModel {
             self.prefix_cache.as_ref(),
             self.gpu.as_ref(),
             stream,
+            self.levers.kv_poison,
         )?;
 
         // ── 3. Upload decode metadata ──
@@ -368,6 +370,10 @@ impl TransformerModel {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(decode_metadata),
             profile: false,
             comm: self.comm_ref(),
@@ -383,6 +389,10 @@ impl TransformerModel {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(prefill_metadata),
             profile: false,
             comm: self.comm_ref(),

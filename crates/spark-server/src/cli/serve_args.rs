@@ -7,12 +7,45 @@ use clap::Parser;
 use std::path::PathBuf;
 
 /// Arguments for the `serve` subcommand.
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, PartialEq)]
 pub struct ServeArgs {
     /// HuggingFace model ID (e.g. "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4")
     /// or a local directory path containing config.json.
-    #[arg(value_name = "MODEL", required_unless_present = "model_from_path")]
+    /// Optional: omit both this and `--model-from-path` to boot into the
+    /// Library and pick a model there. That is a TTY-only affordance — plain
+    /// mode has no Library to fall back to, so `validate_serve_args` rejects
+    /// the combination rather than starting a server that can serve nothing.
+    #[arg(value_name = "MODEL")]
     pub model: Option<String>,
+
+    /// Load a different model when a request names one, ollama-style.
+    ///
+    /// OFF by default, and the default is the point: even narrowed to models
+    /// with a known recipe, one stray request becomes a multi-minute outage for
+    /// every other client on the box, and a benchmark sweep naming a sibling
+    /// checkpoint would swap mid-run. Only a request whose `model` resolves to
+    /// a DIFFERENT known recipe acts — absent, unknown, or already-live names
+    /// are served by the current model exactly as they are today.
+    #[arg(long)]
+    pub auto_swap: bool,
+
+    /// Forbid request-triggered model loading outright.
+    ///
+    /// For deployments where the served model is part of the contract: a
+    /// client must never be able to change what the endpoint is running, no
+    /// matter what else is on the command line.
+    ///
+    /// **This WINS over `--auto-swap`** rather than conflicting with it. A
+    /// conflict error would be the wrong behaviour here: the enabling flag
+    /// typically comes from a shared base config or an image's default command,
+    /// and the operator locking the deployment down appends theirs. Refusing to
+    /// start would punish exactly the person doing the safe thing, and — worse
+    /// — the natural workaround is to delete the deny flag.
+    ///
+    /// Only affects REQUEST-triggered swaps. An operator at the dashboard can
+    /// still change the model; this is about what a client can cause.
+    #[arg(long)]
+    pub no_auto_swap: bool,
 
     /// Load model directly from this filesystem path (skips HF cache resolution).
     #[arg(long, value_name = "PATH")]

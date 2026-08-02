@@ -208,10 +208,11 @@ pub(crate) fn init_gpu_backend(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
 ) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
-    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(
+    let backend =
         spark_runtime::cuda_backend::AtlasCudaBackend::new(args.gpu_ordinal, &ptx_set.modules)
-            .context("Failed to initialize CUDA backend")?,
-    );
+            .context("Failed to initialize CUDA backend")?;
+
+    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(backend);
     let total_mem = gpu.total_memory()?;
     let free_mem = gpu.free_memory()?;
     // Baseline for self-relative KV budgeting: free memory now (post context +

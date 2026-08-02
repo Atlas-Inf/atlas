@@ -80,6 +80,7 @@ impl TransformerModel {
                 self.prefix_cache.as_ref(),
                 self.gpu.as_ref(),
                 stream,
+                self.levers.kv_poison,
             )?;
         }
 
@@ -194,7 +195,7 @@ impl TransformerModel {
         // (mirrors ATLAS_DFLASH_DEBUG_NO_GRAPH for the DFlash verify path).
         let k2_diag_eager = std::env::var("ATLAS_K2_DIAG").ok().as_deref() == Some("1");
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
-        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
+        let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         let use_graphs = self.comm.is_none()
             && !self
                 .suppress_graphs
@@ -218,6 +219,10 @@ impl TransformerModel {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(metadata),
             profile: false,
             comm: self.comm_ref(),

@@ -103,14 +103,15 @@ impl TransformerModel {
         let argmax_logits_kernel = gpu.kernel("argmax", "argmax_fp32")?;
         let batched_embed_kernel = gpu.kernel("embed_from_argmax", "batched_embed")?;
         let fill_slots_kernel = gpu.kernel("metadata_fill", "fill_slots_from_block_table")?;
-        let profile = std::env::var("ATLAS_PROFILE").is_ok();
+        let profile = config.profile;
         let profile_first = std::env::var("ATLAS_PROFILE_FIRST").is_ok();
 
         // Pin the split-K attention split count to the configured max batch so
         // a sequence's attention reduction is invariant to how many other
         // sequences are co-batched (concurrent-decode determinism — see
         // tasks/determinism_investigation.md).
-        crate::layers::qwen3_attention::set_max_decode_seqs(max_batch_size as u32);
+        let mut levers = ops::ModelLevers::from_env();
+        levers.max_decode_seqs = (max_batch_size as u32).max(1);
 
         tracing::info!(
             "TransformerModel: {} layers, vocab={}, hidden={}{}{}",
@@ -234,6 +235,7 @@ impl TransformerModel {
             mtp_quant,
             mtp_vocab_size,
             max_seq_len,
+            &levers,
         );
 
         if self_speculative {
@@ -268,7 +270,7 @@ impl TransformerModel {
         // never write it.
         let mtp_prefill_hidden = if has_mtp
             && mtp_quant.supports_drafter_prefill()
-            && crate::layers::mtp_drafter_prefill_enabled()
+            && crate::layers::mtp_drafter_prefill_enabled(&levers)
         {
             let bytes = max_seq_len * config.hidden_size * 2;
             tracing::info!(
@@ -282,7 +284,7 @@ impl TransformerModel {
         } else {
             if has_mtp
                 && !mtp_quant.supports_drafter_prefill()
-                && crate::layers::mtp_drafter_prefill_enabled()
+                && crate::layers::mtp_drafter_prefill_enabled(&levers)
             {
                 tracing::info!(
                     "MTP drafter context: INACTIVE — the batched drafter prefill \
@@ -495,7 +497,25 @@ impl TransformerModel {
         let has_fp8_calibration = config.fp8_kv_calibration_tokens > 0
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
         Ok(Self {
+            // Installed by the factory after construction: the layers read
+            // from the store during `new`, so it cannot be moved in here.
+            weight_store: None,
             config,
+            dispatch: crate::layers::ops::GemmDispatch::from_env(),
+            derived: crate::layers::ops::DerivedWeights::new(),
+            levers,
+            stats: ops::ModelStats::new(),
+            #[cfg(feature = "cuda")]
+            innerq: gpu.kernel_registry().and_then(|reg| {
+                let driver = crate::layers::qwen3_attention::InnerQDriver::from_env(reg)?;
+                match driver.start() {
+                    Ok(()) => Some(driver),
+                    Err(e) => {
+                        tracing::warn!("InnerQ calibration disabled: start() failed: {e:#}");
+                        None
+                    }
+                }
+            }),
             embed_tokens,
             final_norm,
             lm_head_weight,

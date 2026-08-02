@@ -10,31 +10,39 @@
 //! - `NoPrefixCaching`: no-ops (zero overhead when disabled)
 //! - `RadixTree` (see `crate::radix_tree`): full radix tree with LRU eviction
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
-// ── Global prefix cache counters (one RadixTree per server) ──
-
-static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-static CACHE_HIT_TOKENS: AtomicU64 = AtomicU64::new(0);
+// The three counters that lived here are fields of the single run mailbox,
+// `crate::run_metrics::RunMetrics` — see that module for why one static and
+// not none, and why it is cleared at run start.
 
 pub fn record_cache_hit(matched_tokens: usize) {
-    CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-    CACHE_HIT_TOKENS.fetch_add(matched_tokens as u64, Ordering::Relaxed);
+    let m = crate::run_metrics::metrics();
+    m.cache_hits.fetch_add(1, Ordering::Relaxed);
+    m.cache_hit_tokens
+        .fetch_add(matched_tokens as u64, Ordering::Relaxed);
 }
 
 pub fn record_cache_miss() {
-    CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    crate::run_metrics::metrics()
+        .cache_misses
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn cache_hit_count() -> u64 {
-    CACHE_HITS.load(Ordering::Relaxed)
+    crate::run_metrics::metrics()
+        .cache_hits
+        .load(Ordering::Relaxed)
 }
 pub fn cache_miss_count() -> u64 {
-    CACHE_MISSES.load(Ordering::Relaxed)
+    crate::run_metrics::metrics()
+        .cache_misses
+        .load(Ordering::Relaxed)
 }
 pub fn cache_hit_tokens_total() -> u64 {
-    CACHE_HIT_TOKENS.load(Ordering::Relaxed)
+    crate::run_metrics::metrics()
+        .cache_hit_tokens
+        .load(Ordering::Relaxed)
 }
 
 /// Result of evicting LRU cached blocks (Phase 6.1.e).

@@ -16,14 +16,16 @@
 //!     slower `w8a16_gemm`).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
-/// (module, func, loaded). Appended on every `kernel()` lookup.
-static AUDIT: Mutex<Vec<(String, String, bool)>> = Mutex::new(Vec::new());
+// The audit vector is a field of the single run mailbox,
+// `crate::run_metrics::RunMetrics`. It is per-model in the sharpest way —
+// it lists which of THIS model's registry modules resolved — so without
+// the run-start clear a swap would leave the dashboard's kernel table
+// showing both models' modules with no way to tell them apart.
 
 /// Record one kernel lookup. Cheap; called from `GpuBackend::kernel`.
 pub fn record(module: &str, func: &str, loaded: bool) {
-    if let Ok(mut v) = AUDIT.lock() {
+    if let Ok(mut v) = crate::run_metrics::metrics().kernel_audit.lock() {
         v.push((module.to_string(), func.to_string(), loaded));
     }
 }
@@ -43,7 +45,7 @@ fn ptx_hash(bytes: &[u8]) -> String {
 /// of that (module, func) resolved.
 pub fn audit_rows() -> Vec<(String, String, bool)> {
     let mut resolved: BTreeMap<(String, String), bool> = BTreeMap::new();
-    if let Ok(v) = AUDIT.lock() {
+    if let Ok(v) = crate::run_metrics::metrics().kernel_audit.lock() {
         for (m, f, ok) in v.iter() {
             let e = resolved.entry((m.clone(), f.clone())).or_insert(false);
             *e = *e || *ok;
@@ -61,7 +63,7 @@ pub fn audit_rows() -> Vec<(String, String, bool)> {
 pub fn render_kernel_table(embedded: &[(&str, &[u8])], set_hash: &str) -> String {
     // Dedup resolution audit: (module, func) → loaded (true if ever true).
     let mut resolved: BTreeMap<(String, String), bool> = BTreeMap::new();
-    if let Ok(v) = AUDIT.lock() {
+    if let Ok(v) = crate::run_metrics::metrics().kernel_audit.lock() {
         for (m, f, ok) in v.iter() {
             let e = resolved.entry((m.clone(), f.clone())).or_insert(false);
             *e = *e || *ok;

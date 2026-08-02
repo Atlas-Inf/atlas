@@ -40,6 +40,21 @@ mod verify_d;
 mod verify_fused;
 
 impl Model for TransformerModel {
+    fn teardown(&mut self) -> Result<()> {
+        self.release_pools()
+    }
+
+    /// Poll this model's own InnerQ driver. A miss is logged, never fatal — it
+    /// is a diagnostic lever, not part of serving.
+    #[cfg(feature = "cuda")]
+    fn poll_innerq(&self) {
+        if let Some(driver) = self.innerq.as_ref()
+            && let Err(e) = driver.maybe_finalize(128)
+        {
+            tracing::warn!("InnerQ maybe_finalize failed: {e:#}");
+        }
+    }
+
     fn prepare_vision_embed(&self, images: &[(Vec<f32>, usize, usize)]) -> Result<()> {
         self.prepare_vision_embed_dispatch(images)
     }
@@ -531,9 +546,7 @@ impl Model for TransformerModel {
         d.skip_next_decode_append = true;
 
         // One-shot activation log so A/B runs can confirm the path is live.
-        static UNIFIED_CTX_LOGGED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !UNIFIED_CTX_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if self.stats.once("log:dflash_unified_ctx") {
             tracing::info!(
                 "DFlash UNIFIED_CTX ACTIVE: first commit_ctx rows={} base_pos={} ctx_len={}",
                 num_committed,
@@ -601,9 +614,7 @@ impl Model for TransformerModel {
         let dst = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
         self.gpu.copy_d2d_async(base, dst, ctx_slot_bytes, stream)?;
         // One-shot activation log so A/B runs can confirm the fix is live.
-        static SERIAL_APPEND_LOGGED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !SERIAL_APPEND_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if self.stats.once("log:dflash_serial_append") {
             tracing::info!(
                 "DFlash SERIAL_APPEND ACTIVE: first serial ctx append at ctx_len={} pos={}",
                 d.ctx_len,

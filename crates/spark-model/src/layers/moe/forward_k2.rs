@@ -152,13 +152,7 @@ impl MoeLayer {
                 stream,
             )?;
         }
-        super::union_stats::maybe_sample_expert_union(
-            ctx.gpu,
-            indices_dev,
-            2,
-            top_k as usize,
-            stream,
-        );
+        super::union_stats::maybe_sample_expert_union(ctx, indices_dev, 2, top_k as usize, stream);
 
         if k2_diag {
             ctx.gpu

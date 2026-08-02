@@ -34,6 +34,28 @@ pub(super) const MTP_CATCHUP_RING_ROWS: usize = 512;
 
 pub struct TransformerModel {
     pub(super) config: ModelConfig,
+    /// Which GEMM implementation each projection takes, resolved from the
+    /// environment when this model was built. Owned here and borrowed by every
+    /// `ForwardContext` this model creates, so the choice cannot outlive the
+    /// model — the property nine `OnceLock` statics could not have.
+    pub(super) dispatch: crate::layers::ops::GemmDispatch,
+    /// Weight re-encodings derived on demand and memoized for this model.
+    /// Dropped with the model, so no entry can outlive the allocation it
+    /// describes.
+    pub(super) derived: crate::layers::ops::DerivedWeights,
+    /// The weight ledger this model was built from.
+    ///
+    /// Held for TEARDOWN, not for lookup: the layers already copied the
+    /// pointers they need out of it during construction. It is the only
+    /// structure that knows every weight allocation, and it used to be dropped
+    /// at the end of `startup()` — leaving that memory live with nothing able
+    /// to free it. `None` once released.
+    pub(super) weight_store: Option<spark_runtime::weights::WeightStore>,
+    /// Non-GEMM kernel-path levers, resolved at model construction.
+    pub(super) levers: crate::layers::ops::ModelLevers,
+    /// Diagnostic counters and one-shot dump latches for this model. Sibling
+    /// to `levers`: what the kernels did, rather than what they do.
+    pub(super) stats: crate::layers::ops::ModelStats,
     pub(super) embed_tokens: DenseWeight,
     pub(super) final_norm: DenseWeight,
     pub(super) lm_head_weight: DenseWeight,
@@ -59,6 +81,12 @@ pub struct TransformerModel {
     pub(super) lora_rotatable: bool,
     pub(super) kv_cache: Mutex<PagedKvCache>,
     pub(super) gpu: Box<dyn GpuBackend>,
+    /// TQ+ InnerQ calibration driver, when `TURBO_INNERQ` is set. Owned here
+    /// rather than parked in a static: it writes `__device__` globals in THIS
+    /// model's modules, so it must not outlive the model. Reached from the
+    /// scheduler through `Model::poll_innerq`.
+    #[cfg(feature = "cuda")]
+    pub(super) innerq: Option<crate::layers::qwen3_attention::InnerQDriver>,
     pub(super) rms_norm_kernel: KernelHandle,
     pub(super) dense_gemv_kernel: KernelHandle,
     /// FP32-output variant of dense_gemv_bf16. Used by the LM head when
@@ -348,3 +376,75 @@ pub(crate) struct PinnedMetaStaging {
 unsafe impl Send for TransformerModel {}
 // SAFETY: Model methods are only called from the scheduler thread. No concurrent &self access.
 unsafe impl Sync for TransformerModel {}
+
+/// Release every pool this model owns, newest first.
+///
+/// Construction order is buffers → kv cache → ssm pools → derived, so release
+/// runs the reverse. `Teardown` is used rather than a hand-rolled sequence
+/// because it attempts every resource even after one fails: a half-torn-down
+/// GPU is worse than a reported error.
+///
+/// NOT released here: the weights. `build_model` takes `store: &WeightStore`
+/// and the layers only copy pointers out of it, so this model does not own
+/// them — the host that retained the store releases it after this returns.
+impl TransformerModel {
+    /// Hand the model the ledger of its own weights, for teardown.
+    pub fn adopt_weight_store(&mut self, store: spark_runtime::weights::WeightStore) {
+        self.weight_store = Some(store);
+    }
+
+    pub(super) fn release_pools(&mut self) -> anyhow::Result<()> {
+        use atlas_core::scope::ModelResource;
+
+        let gpu: &dyn GpuBackend = self.gpu.as_ref();
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut attempt = |label: &'static str, r: anyhow::Result<()>| {
+            if let Err(e) = r
+                && first_error.is_none()
+            {
+                first_error = Some(e.context(label));
+            }
+        };
+
+        attempt("derived weights", self.derived.release(gpu));
+        attempt("ssm snapshots", self.ssm_snapshots.release(gpu));
+        // The pool is Arc'd because slots are handed out to sequences. A live
+        // clone here means something still holds a slot, which is a drain bug,
+        // not a teardown one — so it is reported rather than forced.
+        match std::sync::Arc::get_mut(&mut self.ssm_pool) {
+            Some(pool) => attempt("ssm state pool", pool.release(gpu)),
+            None => attempt(
+                "ssm state pool",
+                Err(anyhow::anyhow!(
+                    "{} handle(s) still hold the SSM pool — a sequence was not \
+                     released before teardown",
+                    std::sync::Arc::strong_count(&self.ssm_pool) - 1
+                )),
+            ),
+        }
+        attempt("kv cache", self.kv_cache.lock().release(gpu));
+        attempt("buffer arena", self.buffers.release(gpu));
+        // Weights LAST: the layers hold pointers into them, so they must not be
+        // freed until everything that reads them is gone.
+        if let Some(mut store) = self.weight_store.take() {
+            attempt("weight store", store.release(gpu));
+        }
+        // LAST: whatever the owners above did not cover. Chiefly the loaders'
+        // fused weights, which live in layer structs and belong to no pool.
+        // Every pointer freed above has already left the ledger, so this
+        // cannot double-free — it only ever sees what was missed.
+        let swept = gpu.sweep_unreleased();
+        if swept > 0 {
+            tracing::warn!(
+                "teardown swept {swept} allocation(s) that no ModelResource \
+                 released — they are reclaimed, but each one is memory whose \
+                 owner is unaccounted for"
+            );
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}

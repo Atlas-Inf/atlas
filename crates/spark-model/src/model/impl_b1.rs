@@ -363,6 +363,10 @@ impl TransformerModel {
                 buffers: ctx.buffers,
                 gpu: ctx.gpu,
                 config: ctx.config,
+                dispatch: ctx.dispatch,
+                derived: ctx.derived,
+                levers: ctx.levers,
+                stats: ctx.stats,
                 attn_metadata: ctx.attn_metadata,
                 profile: false,
                 comm: ctx.comm,
@@ -509,6 +513,7 @@ impl TransformerModel {
             self.prefix_cache.as_ref(),
             self.gpu.as_ref(),
             stream,
+            self.levers.kv_poison,
         )?;
 
         let meta_base = self.buffers.scratch().offset(32768);
@@ -559,6 +564,10 @@ impl TransformerModel {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(attn_metadata),
             profile: false,
             comm: self.comm_ref(),

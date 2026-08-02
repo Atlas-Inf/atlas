@@ -16,6 +16,7 @@ use super::*;
 pub fn step_mtp(
     model: &dyn Model,
     active: &mut [ActiveSeq],
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
@@ -54,8 +55,8 @@ pub fn step_mtp(
         // the next step. This replaces the two-sweep sequence (M=1 decode here
         // + M=1+k fused in Phase B) with a single M=1+k fused sweep.
         if dflash_verify_raw_argmax
-            && !crate::scheduler::verify_pipeline_helper::dflash_seam_serial_enabled()
-            && crate::scheduler::adaptive_spec::spec_allowed(a)
+            && !sched.levers.dflash_seam_serial
+            && crate::scheduler::adaptive_spec::spec_allowed(a, sched)
         {
             let eff = if a.grammar_state.is_some() {
                 1
@@ -76,6 +77,7 @@ pub fn step_mtp(
                         step_verify_k4(
                             model,
                             a,
+                            sched,
                             &init,
                             num_drafts,
                             verify_ctx,
@@ -85,6 +87,7 @@ pub fn step_mtp(
                         step_verify_k3(
                             model,
                             a,
+                            sched,
                             &init,
                             num_drafts,
                             verify_ctx,
@@ -94,6 +97,7 @@ pub fn step_mtp(
                         step_verify_k2(
                             model,
                             a,
+                            sched,
                             &init,
                             num_drafts,
                             verify_ctx,
@@ -170,6 +174,7 @@ pub fn step_mtp(
             a.grammar_state.as_mut(),
             &penalties,
             &history,
+            &sched.levers.sampling(),
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -186,13 +191,13 @@ pub fn step_mtp(
             None
         };
 
-        emit_token(a, tok, lp);
+        emit_token(a, tok, lp, sched);
         if a.finished {
             continue;
         }
         a.last_token = tok;
         // Adaptive speculation: count serial tokens toward the re-probe window.
-        crate::scheduler::adaptive_spec::tick_serial(a);
+        crate::scheduler::adaptive_spec::tick_serial(a, sched);
 
         // Ctx-holes fix (ATLAS_DFLASH_SERIAL_APPEND=1), COMPLEMENT-GATED:
         // the serial ctx-append fires iff propose() will NOT run this
@@ -207,10 +212,10 @@ pub fn step_mtp(
         // the propose below skip its decode-append). Append it here; the
         // skip flag this sets is consumed by that propose — one append,
         // no duplicate, seam covered.
-        let was_suspended = crate::scheduler::adaptive_spec::is_suspended(a);
-        let will_propose = crate::scheduler::adaptive_spec::spec_allowed(a);
+        let was_suspended = crate::scheduler::adaptive_spec::is_suspended(a, sched);
+        let will_propose = crate::scheduler::adaptive_spec::spec_allowed(a, sched);
         let reprobe_resume = was_suspended && will_propose;
-        if crate::scheduler::adaptive_spec::unified_ctx_enabled() {
+        if sched.levers.dflash_unified_ctx {
             // Unified ctx commit: same complement-gate as the old serial
             // append — fire iff propose() will NOT run (or re-probe resume),
             // so commit and propose decode-append never both cover a token.
@@ -220,7 +225,7 @@ pub fn step_mtp(
                     tracing::error!("commit_ctx (mtp serial): {e:#}");
                 }
             }
-        } else if crate::scheduler::adaptive_spec::serial_append_enabled()
+        } else if sched.levers.dflash_serial_append
             && (!will_propose || reprobe_resume)
             && let Err(e) = model.dflash_serial_ctx_append(&mut a.seq)
         {
@@ -309,6 +314,7 @@ pub fn step_mtp(
             step_verify_dflash(
                 model,
                 a,
+                sched,
                 &drafts,
                 num_drafts,
                 verify_ctx,
@@ -318,6 +324,7 @@ pub fn step_mtp(
             step_verify_k4(
                 model,
                 a,
+                sched,
                 &drafts,
                 num_drafts,
                 verify_ctx,
@@ -327,6 +334,7 @@ pub fn step_mtp(
             step_verify_k3(
                 model,
                 a,
+                sched,
                 &drafts,
                 num_drafts,
                 verify_ctx,
@@ -336,6 +344,7 @@ pub fn step_mtp(
             step_verify_k2(
                 model,
                 a,
+                sched,
                 &drafts,
                 num_drafts,
                 verify_ctx,

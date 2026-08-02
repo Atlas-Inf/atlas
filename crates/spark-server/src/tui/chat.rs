@@ -11,6 +11,13 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 
+/// Cap on how much of a non-200 body to read before giving up on it.
+///
+/// An error body is a small JSON object; anything larger is a proxy's HTML or a
+/// server that will not stop talking, and neither is worth unbounded memory on
+/// the path where something has already gone wrong.
+const MAX_ERROR_BODY: usize = 64 * 1024;
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Role {
     User,
@@ -137,7 +144,37 @@ impl ChatState {
     /// Drain pending deltas into the transcript (event-loop tick).
     pub fn pump(&mut self) {
         let Some(rx) = &self.rx else { return };
-        let deltas: Vec<ChatDelta> = rx.try_iter().collect();
+        let mut deltas: Vec<ChatDelta> = rx.try_iter().collect();
+        // `try_iter` stops on Empty and Disconnected alike, so a sender that
+        // died without a terminal delta — a panic in the streaming task — is
+        // indistinguishable from "nothing yet". Left undetected it pins
+        // `streaming` true, and `send` refuses while that is set: the chat
+        // pane locks up for the rest of the process with no indication why.
+        // The recipe fetch has handled this case since it was written; this
+        // did not.
+        //
+        // ONE `try_recv`, and its value is kept. A delta can arrive between
+        // `try_iter` ending and this call, and discarding it to learn whether
+        // the channel is alive would drop a token off the reply.
+        let mut disconnected = false;
+        if deltas.is_empty() && self.streaming {
+            match rx.try_recv() {
+                Ok(d) => deltas.push(d),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => disconnected = true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if disconnected {
+            if let Some(m) = self.transcript.last_mut()
+                && m.text.is_empty()
+            {
+                m.text = "(the reply ended without finishing)".into();
+            }
+            self.streaming = false;
+            self.rx = None;
+            self.cancel = None;
+            return;
+        }
         for d in deltas {
             match d {
                 ChatDelta::Token(t) => {
@@ -237,7 +274,24 @@ async fn stream_chat(port: u16, messages: Vec<(String, String)>, tx: Sender<Chat
                 let head = String::from_utf8_lossy(&buf[..pos]).to_string();
                 if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
                     let status = head.lines().next().unwrap_or("?").to_string();
-                    let _ = tx.send(ChatDelta::Error(status));
+                    // Drain the rest of the response before giving up on it.
+                    // Showing only the status line turned every failure into
+                    // "HTTP/1.1 503 Service Unavailable" — the server had
+                    // already explained itself in the body, and the pane threw
+                    // the explanation away. The body is not necessarily in
+                    // `buf` yet: headers can arrive in a read of their own.
+                    while buf.len() < MAX_ERROR_BODY {
+                        match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    // The WHOLE response, headers included: the error body is
+                    // chunked, and de-chunking is the shared reader's job.
+                    let msg = atlas_plugin::http::error_message_from_response(&buf)
+                        .map(|m| format!("{status} — {m}"))
+                        .unwrap_or(status);
+                    let _ = tx.send(ChatDelta::Error(msg));
                     return;
                 }
                 consumed = pos + 4;
@@ -293,4 +347,62 @@ async fn stream_chat(port: u16, messages: Vec<(String, String)>, tx: Sender<Chat
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod pump_tests {
+    use super::*;
+
+    fn streaming_state() -> (ChatState, Sender<ChatDelta>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = ChatState::default();
+        s.transcript.push(ChatMessage {
+            role: Role::Model,
+            text: String::new(),
+            ttft_ms: None,
+            tok_per_s: None,
+            tokens: 0,
+        });
+        s.streaming = true;
+        s.rx = Some(rx);
+        (s, tx)
+    }
+
+    #[test]
+    fn a_sender_that_dies_without_finishing_unsticks_the_pane() {
+        // `send` refuses while `streaming` is set, so a dropped sender used to
+        // lock the chat pane for the rest of the process.
+        let (mut s, tx) = streaming_state();
+        drop(tx);
+        s.pump();
+        assert!(!s.streaming, "the pane is usable again");
+        assert!(s.rx.is_none());
+        assert!(
+            s.transcript
+                .last()
+                .expect("a message")
+                .text
+                .contains("without finishing"),
+            "and says why"
+        );
+    }
+
+    #[test]
+    fn a_delta_racing_the_disconnect_check_is_not_dropped() {
+        // The check calls try_recv once and KEEPS what it gets: a token can
+        // arrive between `try_iter` ending and that call.
+        let (mut s, tx) = streaming_state();
+        tx.send(ChatDelta::Token("hi".into())).expect("send");
+        s.pump();
+        assert!(s.streaming, "still streaming");
+        assert_eq!(s.transcript.last().expect("a message").text, "hi");
+    }
+
+    #[test]
+    fn a_live_channel_with_nothing_pending_is_left_alone() {
+        let (mut s, _tx) = streaming_state();
+        s.pump();
+        assert!(s.streaming, "empty is not dead");
+        assert!(s.rx.is_some());
+    }
 }
