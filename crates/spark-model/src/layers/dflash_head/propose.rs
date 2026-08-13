@@ -471,19 +471,16 @@ impl BlockDiffusionDraftHead {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
                 e
             })?;
-        // Default cap = γ. The nologik spec_ssm merge provides the WY-chunkwise
-        // GDN kernels (gdn_decode_wy17 for K=17, wy2/wy3/wy4 for smaller K)
-        // that snapshot per-position h/conv intermediates into the SSM pool.
-        // commit_verify_state_async (verify_dflash_step.rs) reads those
-        // intermediates to roll back to the accepted prefix on partial reject.
-        // SSM pool is pre-allocated for num_intermediates=17 (impl_a1.rs:129)
-        // and the WY17 strided layout (inter_stride_floats = h_bytes/4) maps
-        // 1:1 to ssm_pool.h_intermediate(layer, slot, i). Override with
-        // ATLAS_DFLASH_DRAFT_CAP=N (N=1 to force K=2 path for ablation).
+        // Verify depth is scheduler K (`_num_drafts` = `--dflash-gamma - 1`).
+        // forward_block returns [mask_1 .. mask_{γ-1}, bonus_0]; the bonus
+        // row is NOT a draft (vLLM sample_off=1). Capping at γ sent that
+        // extra token into M=γ+1 target verify (~11 ms) for no accept gain.
+        // ATLAS_DFLASH_DRAFT_CAP still overrides for ablation.
+        let default_k = _num_drafts.min(self.gamma.saturating_sub(1)).max(1);
         let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(self.gamma);
+            .unwrap_or(default_k);
 
         // ATLAS_DFLASH_VERIFY_TRACE=1: log all γ drafts BEFORE the cap so we
         // can see whether the drafter echoes only at position 0 or across
