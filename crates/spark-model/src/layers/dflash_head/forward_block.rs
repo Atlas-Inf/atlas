@@ -845,18 +845,9 @@ impl BlockDiffusionDraftHead {
                     } else {
                         // Empty-capture sentinel: this slot fell back to
                         // eager at capture time. Replay eager forever.
-                        self.forward_block_layer_pre_attn(layer, &args, ctx)?;
+                        let (k_pool, v_pool) = self.forward_block_layer_pre_attn(layer, &args, ctx)?;
+                        self.forward_block_layer_attention(&args, ctx, k_pool, v_pool)?;
                     }
-
-                    // Attention is always eager — but we need k_pool/v_pool
-                    // for the call. Re-lock the cache here (the captured
-                    // pre_attn already holds the pointers internally; this
-                    // is just for the attention boundary).
-                    let (k_pool, v_pool) = {
-                        let cache = self.kv_cache.lock();
-                        (cache.k_pool_ptr(layer_idx), cache.v_pool_ptr(layer_idx))
-                    };
-                    self.forward_block_layer_attention(&args, ctx, k_pool, v_pool)?;
 
                     let post_handle = graphs[layer_idx * 2 + 1];
                     if post_handle.0 != 0 {
@@ -899,9 +890,12 @@ impl BlockDiffusionDraftHead {
                     for (layer_idx, layer) in self.layers.iter().enumerate() {
                         let args = make_paged_args(layer_idx).expect("option_b args available");
 
-                        // pre_attn subgraph
+                        // pre_attn + paged-indirect attention. kv_len lives in
+                        // option_b_indirect_args_dev (written once per propose,
+                        // outside capture). Pool pointers are stable.
                         gpu.begin_capture(stream)?;
-                        let _captured = self.forward_block_layer_pre_attn(layer, &args, ctx)?;
+                        let (k_pool, v_pool) = self.forward_block_layer_pre_attn(layer, &args, ctx)?;
+                        self.forward_block_layer_attention(&args, ctx, k_pool, v_pool)?;
                         let pre_graph = gpu.end_capture(stream)?;
                         new_graphs.push(pre_graph);
                         if pre_graph.0 != 0 {
@@ -911,15 +905,10 @@ impl BlockDiffusionDraftHead {
                                 "DFlash piecewise: pre_attn layer {} empty capture — eager fallback",
                                 layer_idx
                             );
-                            self.forward_block_layer_pre_attn(layer, &args, ctx)?;
+                            let (k_pool, v_pool) =
+                                self.forward_block_layer_pre_attn(layer, &args, ctx)?;
+                            self.forward_block_layer_attention(&args, ctx, k_pool, v_pool)?;
                         }
-
-                        // attention — eager, never captured
-                        let (k_pool, v_pool) = {
-                            let cache = self.kv_cache.lock();
-                            (cache.k_pool_ptr(layer_idx), cache.v_pool_ptr(layer_idx))
-                        };
-                        self.forward_block_layer_attention(&args, ctx, k_pool, v_pool)?;
 
                         // post_attn subgraph
                         gpu.begin_capture(stream)?;
