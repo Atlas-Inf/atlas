@@ -106,7 +106,17 @@ pub fn step_mtp(
                 _gmask.as_deref(),
             ) {
                 Ok(init) if !init.is_empty() => {
-                    if eff >= 3 && init.len() >= 3 {
+                    if dflash_verify_raw_argmax {
+                        step_verify_dflash(
+                            model,
+                            a,
+                            sched,
+                            &init,
+                            num_drafts,
+                            verify_ctx,
+                            dflash_verify_raw_argmax,
+                        );
+                    } else if eff >= 3 && init.len() >= 3 {
                         step_verify_k4(
                             model,
                             a,

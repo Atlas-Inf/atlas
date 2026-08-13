@@ -206,6 +206,9 @@ impl TransformerLayer for NemotronMamba2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if num_tokens > 1 && std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err() {
+            return self.decode_batched_verify(hidden, residual, num_tokens, state, ctx, stream);
+        }
         let h = ctx.config.hidden_size;
         let h_bytes = ctx.config.ssm_h_state_bytes();
         let conv_bytes = ctx.config.ssm_conv_state_bytes();
