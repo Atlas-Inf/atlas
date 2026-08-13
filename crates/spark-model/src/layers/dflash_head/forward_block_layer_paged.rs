@@ -563,6 +563,12 @@ impl BlockDiffusionDraftHead {
         // 3f. paged attention — q_len=γ, kv_len=ctx_count+γ.
         // Lightning DSpark: causal=true + SWA 1024 (config.json). Qwen-DFlash
         // remains bidirectional (query_causal=false).
+        let sinks = self
+            .layers
+            .get(args.layer_idx)
+            .and_then(|l| l.attention_sink_bias.as_ref())
+            .map(|w| w.weight)
+            .unwrap_or(DevicePtr::NULL);
         ops::prefill_attention_paged_dflash_bf16_indirect(
             gpu,
             self.kernels.prefill_attn_dflash_bf16_indirect,
@@ -580,6 +586,7 @@ impl BlockDiffusionDraftHead {
             self.attn_sliding_window(),
             self.attn_causal(),
             inv_sqrt_d,
+            sinks,
             stream,
         )?;
 

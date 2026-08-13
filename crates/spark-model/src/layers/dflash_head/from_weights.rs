@@ -150,15 +150,11 @@ impl BlockDiffusionDraftHead {
             // module as the target's BF16 prefill (`prefill_paged`); the
             // Rust dispatcher `ops::prefill_attention_paged_dflash` passes
             // `causal_mask_enabled=0` for bidirectional γ-block attention.
-            prefill_attn_dflash_bf16: gpu.kernel("prefill_paged", "inferspark_prefill_paged")?,
-            // Phase 5 (CUDA graph): indirect-args BF16 paged dispatcher. Same
-            // kernel as `prefill_attn_dflash_bf16` except `kv_len` and
-            // `q_offset` are read from device pointers at kernel entry, so the
-            // graph-captured launch can be replayed with new dynamic values
-            // without re-capture. See `inferspark_prefill_paged_indirect.cu`.
+            prefill_attn_dflash_bf16: gpu.kernel("prefill_paged_sink", "inferspark_prefill_paged_sink")?,
+            // Phase 5 (CUDA graph): indirect-args BF16 paged dispatcher + sinks.
             prefill_attn_dflash_bf16_indirect: gpu.kernel(
-                "prefill_paged_indirect",
-                "inferspark_prefill_paged_indirect",
+                "prefill_paged_indirect_sink",
+                "inferspark_prefill_paged_indirect_sink",
             )?,
             silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,

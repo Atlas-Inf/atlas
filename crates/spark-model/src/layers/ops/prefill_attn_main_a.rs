@@ -388,6 +388,7 @@ pub fn prefill_attention_paged_dflash(
     sliding_window: u32,
     causal: bool,
     inv_sqrt_d: f32,
+    sinks: DevicePtr,
     stream: u64,
 ) -> Result<()> {
     let br = 32u32;
@@ -409,8 +410,7 @@ pub fn prefill_attention_paged_dflash(
         .arg_u32(sliding_window)
         .arg_u32(if causal { 1 } else { 0 })
         .arg_f32(inv_sqrt_d)
-        // Non-indirect kernel: q_rope_pos is a local var (= q_offset) in the
-        // .cuh body — no extra kernel arg. Fix applies via indirect path only.
+        .arg_ptr(sinks)
         .launch(stream)
 }
 
@@ -450,6 +450,7 @@ pub fn prefill_attention_paged_dflash_bf16_indirect(
     sliding_window: u32,
     causal: bool,
     inv_sqrt_d: f32,
+    sinks: DevicePtr,
     stream: u64,
 ) -> Result<()> {
     let br = 32u32;
@@ -479,5 +480,6 @@ pub fn prefill_attention_paged_dflash_bf16_indirect(
         .arg_ptr(kv_len_q_offset_dev) // KERNEL_EXTRA_PARAMS: kv_len_ptr
         .arg_ptr(kv_len_q_offset_dev.offset(4)) // KERNEL_EXTRA_PARAMS: q_offset_ptr
         .arg_ptr(kv_len_q_offset_dev.offset(8)) // KERNEL_EXTRA_PARAMS: q_rope_pos_ptr
+        .arg_ptr(sinks)
         .launch(stream)
 }

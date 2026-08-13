@@ -564,6 +564,36 @@ extern "C" __global__ void KERNEL_NAME(
         __syncthreads();
     }
 
+#ifdef ATLAS_ATTN_SINKS
+    if (sinks != nullptr) {
+        float sg = __bfloat162float(sinks[q_head]);
+        unsigned int r0s = pv_warp_m + group_id, r1s = r0s + 8;
+        float eo0, eo1;
+        if (warp_id < 2) {
+            float mn0 = fmaxf(m_r0, sg);
+            eo0 = __expf(m_r0 - mn0);
+            l_r0 = l_r0 * eo0 + __expf(sg - mn0);
+            float mn1 = fmaxf(m_r1, sg);
+            eo1 = __expf(m_r1 - mn1);
+            l_r1 = l_r1 * eo1 + __expf(sg - mn1);
+        } else {
+            float cm0 = smem_ml[r0s][0], cl0 = smem_ml[r0s][1];
+            float mn0 = fmaxf(cm0, sg);
+            eo0 = __expf(cm0 - mn0);
+            smem_ml[r0s][1] = cl0 * eo0 + __expf(sg - mn0);
+            float cm1 = smem_ml[r1s][0], cl1 = smem_ml[r1s][1];
+            float mn1 = fmaxf(cm1, sg);
+            eo1 = __expf(cm1 - mn1);
+            smem_ml[r1s][1] = cl1 * eo1 + __expf(sg - mn1);
+        }
+        #pragma unroll
+        for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
+            acc_o[nt][0] *= eo0; acc_o[nt][1] *= eo0;
+            acc_o[nt][2] *= eo1; acc_o[nt][3] *= eo1;
+        }
+    }
+#endif
+
     // === Final normalization and store ===
     {
         unsigned int r0=pv_warp_m+group_id, r1=r0+8;
