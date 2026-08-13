@@ -240,7 +240,8 @@ impl BlockDiffusionDraftHead {
             dump_bf16("layer0.k_buf[ctx0].post_rope", self.scratch.k_buf, 10)?;
         }
 
-        // 3e. attention — non-causal, q_len = kv_len = n_attn.
+        // 3e. attention — causal/SWA from the drafter config (Lightning:
+        // dflash_config.causal=true, swa_window_size=1024).
         ops::prefill_attention(
             gpu,
             self.kernels.prefill_attn,
@@ -254,8 +255,8 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             inv_sqrt_d,
-            false,
-            0,
+            self.attn_causal(),
+            self.attn_sliding_window(),
             stream,
         )?;
         if layer_idx == 0 {

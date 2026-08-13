@@ -560,16 +560,9 @@ impl BlockDiffusionDraftHead {
         let gpu = ctx.gpu;
         let g = self.gamma as u32;
 
-        // 3f. paged attention — q_len=γ, kv_len=ctx_count+γ, causal=false.
-        // dflash.py:84-97  `attn_output, _ = attn_fn(self, q, k, v, ...)`
-        //   with `self.is_causal = False` (line 39).  Q(γ) attends over
-        //   full K/V(ctx+γ) bidirectionally — identical semantics.
-        //
-        // Phase 5 (CUDA graph): kv_len and q_offset are read from
-        // `option_b_indirect_args_dev` at kernel entry rather than passed
-        // as scalar args, so the captured launch survives per-call value
-        // changes. Host writes the 8-byte pair in forward_block.rs
-        // pre-graph; replays pick up whatever's there.
+        // 3f. paged attention — q_len=γ, kv_len=ctx_count+γ.
+        // Lightning DSpark: causal=true + SWA 1024 (config.json). Qwen-DFlash
+        // remains bidirectional (query_causal=false).
         ops::prefill_attention_paged_dflash_bf16_indirect(
             gpu,
             self.kernels.prefill_attn_dflash_bf16_indirect,
@@ -584,7 +577,8 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             16, // cache_block_size
-            0,  // sliding_window — drafter not windowed for now
+            self.attn_sliding_window(),
+            self.attn_causal(),
             inv_sqrt_d,
             stream,
         )?;
@@ -675,8 +669,8 @@ impl BlockDiffusionDraftHead {
                 self.num_kv_heads as u32,
                 self.head_dim as u32,
                 inv_sqrt_d,
-                false, // is_causal=false  (dflash.py:39)
-                0,
+                self.attn_causal(),
+                self.attn_sliding_window(),
                 stream,
             )?;
             if args.block_dump {
@@ -776,8 +770,8 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             inv_sqrt_d,
-            false, // is_causal=false  (dflash.py:39)
-            0,
+            self.attn_causal(),
+            self.attn_sliding_window(),
             stream,
         )?;
 

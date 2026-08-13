@@ -190,6 +190,9 @@ pub struct DflashLayer {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
+    /// Per-q-head attention sink `[num_q_heads]` BF16. Lightning DSpark ships
+    /// this; Qwen-DFlash does not.
+    pub attention_sink_bias: Option<DenseWeight>,
 
     // Phase G — optional FP8 mirrors of the seven dense-GEMM weights.
     // Populated at load time when `ATLAS_DFLASH_DRAFTER_FP8=1`, consumed
@@ -316,6 +319,9 @@ pub struct BlockDiffusionDraftHead {
     pub gamma: usize,
     pub mask_token_id: u32,
     pub window_size: Option<usize>,
+    /// Causal γ-block attention. `true` for Lightning DSpark
+    /// (`dflash_config.causal`); `false` for Qwen-DFlash bidirectional.
+    pub query_causal: bool,
     /// `target_layer_ids`. Same data as `TransformerModel::dflash_capture_layers`,
     /// repeated here so the loader is the single source of truth; the model
     /// reads these to size its capture buffer.

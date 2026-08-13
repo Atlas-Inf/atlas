@@ -451,12 +451,20 @@ pub fn step_mtp(
             }
         }
 
-        // DFlash γ-block drafters return ≥4 drafts per step (γ=16 typical).
-        // The K=2/3/4 graphed paths are MTP-shaped and don't generalize past
-        // K=4 cleanly, so γ-block verify routes through `step_verify_dflash`.
-        // MTP keeps using the existing graphed paths; this dispatch is purely
-        // additive.
-        if drafts.len() >= 4 {
+        // DFlash/DSpark verify: route by proposer, not draft count.
+        // `--dflash` sets dflash_verify_raw_argmax. The old `drafts.len()>=4`
+        // ladder sent K=3 (`--dflash-gamma 4`) into MTP K=3 verify.
+        if dflash_verify_raw_argmax {
+            step_verify_dflash(
+                model,
+                a,
+                sched,
+                &drafts,
+                num_drafts,
+                verify_ctx,
+                dflash_verify_raw_argmax,
+            );
+        } else if drafts.len() >= 4 {
             step_verify_dflash(
                 model,
                 a,

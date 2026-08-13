@@ -105,6 +105,19 @@ pub struct DflashSubConfig {
     /// `[1, 10, 19, 28, 37]` for Qwen3.6-35B-A3B-DFlash. Order matters:
     /// shallow-to-deep concatenation is what `fc` expects.
     pub target_layer_ids: Vec<usize>,
+    /// When `Some(true)`, every drafter layer uses causal γ-block attention.
+    /// Lightning DSpark sets this; Qwen-DFlash leaves it unset (bidirectional).
+    #[serde(default)]
+    pub causal: Option<bool>,
+    /// Force sliding-window attention on every drafter layer.
+    #[serde(default)]
+    pub use_swa: Option<bool>,
+    /// Sliding-window size when `use_swa` or `layer_types` request SWA.
+    #[serde(default)]
+    pub swa_window_size: Option<usize>,
+    /// When `Some(true)`, each layer must ship `self_attn.attention_sink_bias`.
+    #[serde(default)]
+    pub attention_sink_bias: Option<bool>,
 }
 
 /// Raw weight bundle for the DFlash drafter, post-load.
@@ -155,6 +168,9 @@ pub struct DflashLayerWeights {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
+    /// Per-q-head FlashAttention sink logits `[num_q_heads]` BF16.
+    /// None when the checkpoint has no sink tensor (Qwen-DFlash).
+    pub attention_sink_bias: Option<DenseWeight>,
 }
 
 /// Probe a [`WeightStore`] for the presence of DFlash drafter weights.
@@ -236,10 +252,27 @@ pub fn load_dflash_weights(
     let norm = dense_auto(drafter_store, &format!("{prefix}norm.weight"), gpu)
         .context("DFlash drafter: load norm.weight")?;
 
+    let require_sinks = drafter_config
+        .dflash_config
+        .as_ref()
+        .and_then(|c| c.attention_sink_bias)
+        == Some(true);
     let layer_count = drafter_config.num_hidden_layers;
     let mut layers = Vec::with_capacity(layer_count);
+    let mut sink_layers = 0usize;
     for i in 0..layer_count {
         let lp = format!("{prefix}layers.{i}");
+        let sink_name = format!("{lp}.self_attn.attention_sink_bias");
+        let attention_sink_bias = if drafter_store.contains(&sink_name) {
+            sink_layers += 1;
+            Some(dense_auto(drafter_store, &sink_name, gpu)?)
+        } else if require_sinks {
+            anyhow::bail!(
+                "dflash_config.attention_sink_bias=true but {sink_name} is missing from the checkpoint"
+            );
+        } else {
+            None
+        };
         let layer = DflashLayerWeights {
             input_layernorm: dense_auto(
                 drafter_store,
@@ -260,6 +293,7 @@ pub fn load_dflash_weights(
             gate_proj: dense_auto(drafter_store, &format!("{lp}.mlp.gate_proj.weight"), gpu)?,
             up_proj: dense_auto(drafter_store, &format!("{lp}.mlp.up_proj.weight"), gpu)?,
             down_proj: dense_auto(drafter_store, &format!("{lp}.mlp.down_proj.weight"), gpu)?,
+            attention_sink_bias,
         };
         layers.push(layer);
     }
@@ -297,19 +331,31 @@ pub fn load_dflash_weights(
         None
     };
 
+    let sub = drafter_config.dflash_config.as_ref();
+    if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight")) {
+        if fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8 && fc_meta.shape.len() == 2 {
+            tracing::info!(
+                "DFlash fc NVFP4 unpack: on-disk {:?} U8 → logical [{}, {}] BF16",
+                fc_meta.shape,
+                fc_meta.shape[0],
+                fc_meta.shape[1] * 2
+            );
+        }
+    }
     tracing::info!(
-        "DFlash/DSpark drafter loaded: {} layers, hidden={}, vocab={}, γ={}, markov_rank={}, own_embed={}, target_layers={:?}",
+        "DFlash/DSpark drafter loaded: {} layers, hidden={}, vocab={}, γ={}, markov_rank={}, own_embed={}, causal={:?}, swa={:?}/{:?}, sinks={}/{}, target_layers={:?}",
         layers.len(),
         drafter_config.hidden_size,
         drafter_config.vocab_size,
         drafter_config.block_size,
         markov_rank,
         embed_tokens.is_some(),
-        drafter_config
-            .dflash_config
-            .as_ref()
-            .map(|c| c.target_layer_ids.as_slice())
-            .unwrap_or(&[]),
+        sub.and_then(|c| c.causal),
+        sub.and_then(|c| c.use_swa),
+        sub.and_then(|c| c.swa_window_size),
+        sink_layers,
+        layers.len(),
+        sub.map(|c| c.target_layer_ids.as_slice()).unwrap_or(&[]),
     );
 
     Ok(Some(DflashWeights {
@@ -381,5 +427,9 @@ mod tests {
         let sub = config.dflash_config.expect("dflash_config present");
         assert_eq!(sub.mask_token_id, 990);
         assert_eq!(sub.target_layer_ids, vec![1, 5, 19, 29, 41, 51]);
+        assert_eq!(sub.causal, Some(true));
+        assert_eq!(sub.use_swa, Some(true));
+        assert_eq!(sub.swa_window_size, Some(1024));
+        assert_eq!(sub.attention_sink_bias, Some(true));
     }
 }

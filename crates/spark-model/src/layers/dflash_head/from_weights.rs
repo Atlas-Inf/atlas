@@ -49,6 +49,19 @@ impl BlockDiffusionDraftHead {
             .as_ref()
             .map(|c| c.mask_token_id)
             .unwrap_or(0);
+        let query_causal = weights
+            .config
+            .dflash_config
+            .as_ref()
+            .and_then(|c| c.causal)
+            .unwrap_or(false);
+        let window_size = window_size.or_else(|| {
+            weights
+                .config
+                .dflash_config
+                .as_ref()
+                .and_then(|c| c.swa_window_size)
+        });
 
         if target_layer_ids.is_empty() {
             anyhow::bail!(
@@ -435,6 +448,7 @@ impl BlockDiffusionDraftHead {
             gamma: gamma_val,
             mask_token_id,
             window_size,
+            query_causal,
             target_layer_ids,
             target_hidden_size,
 
@@ -474,6 +488,7 @@ impl BlockDiffusionDraftHead {
                     gate_proj: l.gate_proj,
                     up_proj: l.up_proj,
                     down_proj: l.down_proj,
+                    attention_sink_bias: l.attention_sink_bias,
                     // Phase G — populated below if ATLAS_DFLASH_DRAFTER_FP8=1.
                     q_proj_fp8: None,
                     k_proj_fp8: None,
@@ -507,7 +522,7 @@ impl BlockDiffusionDraftHead {
 
         tracing::info!(
             "BlockDiffusionDraftHead loaded: {} layers, hidden={}, intermediate={}, \
-             GQA {}/{}, head_dim={}, γ={}, vocab={}, mask_token_id={}, target_layers={:?}",
+             GQA {}/{}, head_dim={}, γ={}, vocab={}, mask_token_id={}, causal={}, window={:?}, sinks={}, target_layers={:?}",
             head.num_layers,
             head.hidden_size,
             head.intermediate_size,
@@ -517,6 +532,12 @@ impl BlockDiffusionDraftHead {
             head.gamma,
             head.vocab_size,
             head.mask_token_id,
+            head.query_causal,
+            head.window_size,
+            head.layers
+                .iter()
+                .filter(|l| l.attention_sink_bias.is_some())
+                .count(),
             head.target_layer_ids,
         );
 
@@ -642,5 +663,15 @@ impl BlockDiffusionDraftHead {
             );
         }
         Ok(())
+    }
+
+    /// Lightning DSpark: `dflash_config.causal=true`. Qwen-DFlash: false.
+    pub(super) fn attn_causal(&self) -> bool {
+        self.query_causal
+    }
+
+    /// SWA window in tokens. 0 = no window (full context).
+    pub(super) fn attn_sliding_window(&self) -> u32 {
+        self.window_size.unwrap_or(0) as u32
     }
 }
