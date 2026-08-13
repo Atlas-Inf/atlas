@@ -105,6 +105,16 @@ pub fn step_verify_dflash(
             break;
         }
     }
+    if std::env::var("ATLAS_DFLASH_VERIFY_TRACE").ok().as_deref() == Some("1") {
+        let n = drafts.len().min(verified.len()).min(4);
+        tracing::info!(
+            "DFLASH CMP last={} drafts[0..{n}]={:?} verified[0..{n}]={:?} accepted={}",
+            a.last_token,
+            &drafts[..n],
+            &verified[..n],
+            num_accepted,
+        );
+    }
 
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
     // accept window; may suspend this seq's speculation (see adaptive_spec).

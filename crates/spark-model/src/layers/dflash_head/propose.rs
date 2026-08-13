@@ -490,7 +490,7 @@ impl BlockDiffusionDraftHead {
         // every noise row. Pairs with K2 TRACE in the scheduler.
         if std::env::var("ATLAS_DFLASH_VERIFY_TRACE").ok().as_deref() == Some("1") {
             tracing::info!(
-                "DFLASH TRACE drafts: token_in={} position={} γ={} drafts_pre_cap={:?}",
+                "DFLASH TRACE drafts: token_in={} position={} γ={} drafts={:?}",
                 last_token,
                 position,
                 drafts.len(),
@@ -498,23 +498,10 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        // Block-diffusion drafter convention: noise_row[0]'s input is
-        // `last_token`, and the drafter denoises it trivially back to
-        // itself — that's the "bonus" position. The first USEFUL draft
-        // lives at noise_row[1] (input = mask, predicts position+1).
-        // vLLM ignores row 0 via `token_indices_to_sample`. Atlas was
-        // reading row 0 as draft[0], giving 0% K=2 accept on z-lab
-        // DFlash drafters; dropping it lifts accept to ~80%.
-        //
-        // Gated on `mask_token_id` presence in the drafter config —
-        // that's the diffusion-drafter signal. Autoregressive drafters
-        // (e.g. EAGLE) have no mask token and should keep row 0.
-        let drafts = if self.mask_token_id != 0 && drafts.len() > 1 {
-            drafts[1..].to_vec()
-        } else {
-            drafts
-        };
-
+        // forward_block already returns [mask_row_1 .. mask_row_γ-1, bonus_row_0]
+        // (vLLM sample_off=1). Do not drop drafts[0] — that leftover Qwen-DFlash
+        // slice discarded the first correct mask prediction and forced 0% accept
+        // on Lightning (Hello → '!' was drafted then dropped).
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
         Ok(drafts)
