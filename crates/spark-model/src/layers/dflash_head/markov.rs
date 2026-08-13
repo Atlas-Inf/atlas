@@ -54,8 +54,11 @@ impl BlockDiffusionDraftHead {
         let rank = self.markov_rank;
         // Seed prev = last_token on device. No per-step DtoH — the chain
         // stays on-device so Option B graph capture does not hit CUDA 900.
+        // Pageable 4-byte last_token: copy_h2d_async stages it (no stream
+        // sync). copy_h2d would cuStreamSynchronize and CUDA-900 under
+        // Option B tail capture.
         let last_bytes = last_token.to_le_bytes();
-        gpu.copy_h2d(&last_bytes, self.scratch.slot_mapping_dev)?;
+        gpu.copy_h2d_async(&last_bytes, self.scratch.slot_mapping_dev, stream)?;
         // Row 0 = anchor bonus: plain argmax, never Markov-biased.
         ops::argmax_bf16(
             gpu,
