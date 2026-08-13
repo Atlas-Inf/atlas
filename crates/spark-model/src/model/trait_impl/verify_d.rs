@@ -301,13 +301,16 @@ impl TransformerModel {
                 // the WRONG token's hidden and rows 1.. are stale garbage
                 // (2026-07-09 accept-collapse root cause: EAGLE_FIX=0 under
                 // UNIFIED=1 starved this capture and poisoned drafter ctx).
-                let capture_all = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref()
-                    == Some("1")
-                    || std::env::var("ATLAS_DFLASH_UNIFIED_CTX").ok().as_deref() == Some("1");
-                if capture_all {
-                    self.try_dflash_capture_all(layer_idx, k, stream)?;
-                } else {
+                // Always capture every verify row. commit_ctx copies
+                // 0..=num_accepted; capturing only k-1 poisons the next
+                // propose (2026-07-09 accept-collapse). Opt out with
+                // ATLAS_DFLASH_CAPTURE_LAST_ONLY=1 for ablation.
+                let capture_last_only =
+                    std::env::var("ATLAS_DFLASH_CAPTURE_LAST_ONLY").ok().as_deref() == Some("1");
+                if capture_last_only {
                     self.try_dflash_capture(layer_idx, k - 1, stream)?;
+                } else {
+                    self.try_dflash_capture_all(layer_idx, k, stream)?;
                 }
             }
 
