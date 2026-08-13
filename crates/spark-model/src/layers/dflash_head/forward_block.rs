@@ -1017,9 +1017,17 @@ impl BlockDiffusionDraftHead {
         gpu.copy_d2h_on_stream(self.scratch.draft_tokens_dev, host_buf, stream)?;
         gpu.record_event(self.scratch.draft_tokens_event, stream)?;
         gpu.event_synchronize(self.scratch.draft_tokens_event)?;
-        let drafts: Vec<u32> = host_buf
+        let row_order: Vec<u32> = host_buf
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // 1+N block layout (vLLM `_prepare_dflash_inputs_kernel` sample_off=1):
+        // mask rows 1..γ predict drafts 1..γ−1; the anchor row (0) predicts the
+        // block bonus and goes LAST, so the scheduler's num_drafts truncation
+        // keeps exactly the mask-row drafts in verify order.
+        let drafts: Vec<u32> = (1..self.gamma)
+            .chain(std::iter::once(0))
+            .map(|i| row_order[i])
             .collect();
         // ATLAS_DFLASH_DEBUG_DUMP_FULL=1 (one-shot): log all γ drafts so
         // we can compare against the PyTorch reference run on the same
