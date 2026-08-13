@@ -214,4 +214,20 @@ pub fn sigmoid_blend(
         .launch(stream)
 }
 
+/// In-place ReLU²: `x[i] = relu(x[i])^2`. Nemotron-H / Lightning MoE.
+pub fn relu_squared_inplace(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    data: DevicePtr,
+    num_elements: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(num_elements, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(data)
+        .arg_u32(num_elements)
+        .launch(stream)
+}
+
 // ── SSM Preprocessing ─────────────────────────────────────────────

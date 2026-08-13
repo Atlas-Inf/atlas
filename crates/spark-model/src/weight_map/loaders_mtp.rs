@@ -201,6 +201,8 @@ pub fn load_mtp_lightning(
         experts,
         dense_ffn: None,
         norm: dense(store, "mtp.layers.1.final_layernorm.weight")?,
+        lightning: true,
+        shared_intermediate_size: 3712,
     })
 }
 
