@@ -136,6 +136,7 @@ impl NemotronMoeLayer {
             h,
             top_k,
             0,
+            1,
             stream,
         )?;
 
@@ -307,6 +308,7 @@ impl NemotronMoeLayer {
             latent,
             top_k,
             0,
+            1,
             stream,
         )?;
 

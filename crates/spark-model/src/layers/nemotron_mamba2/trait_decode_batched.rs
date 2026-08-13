@@ -97,6 +97,13 @@ impl NemotronMamba2Layer {
 
         let use_fused = self.mamba2_ssm_verify_k.0 != 0
             && std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err();
+        if std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1") {
+            tracing::info!(
+                "mamba2_ssm_verify handle={} fused={}",
+                self.mamba2_ssm_verify_k.0,
+                use_fused
+            );
+        }
         if use_fused {
             ops::mamba2_ssm_verify(
                 ctx.gpu,

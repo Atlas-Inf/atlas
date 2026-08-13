@@ -220,7 +220,7 @@ impl BufferSizes {
 
         // Batched expert output buffers for MoE (or dense FFN).
         // Sized for max(K=3 verify, prefill chunk) × top_k experts.
-        let k_max = m.max(3); // prefill chunk or K=3 verify, whichever larger
+        let k_max = m.max(4); // prefill chunk or K=4 verify (1+3 drafts)
         let expert_inter = if config.num_experts > 0 {
             let routed = config.num_experts_per_tok * config.moe_intermediate_size;
             k_max * routed.max(config.intermediate_size)

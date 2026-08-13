@@ -36,10 +36,11 @@ pub fn moe_expert_gemv(
     k: u32,
     top_k: u32,
     input_stride: u32,
+    num_tokens: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 4), top_k, 1])
+        .grid([div_ceil(n, 4), top_k, num_tokens.max(1)])
         .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(packed_ptrs)
