@@ -52,10 +52,11 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         let bf16 = 2usize;
         let rank = self.markov_rank;
-        // Row 0 = anchor (input = last target token). vLLM never Markov-biases
-        // the anchor: its logits predict the block BONUS, sampled separately
-        // (dspark/speculator.py `_sample_sequential` runs over the mask rows
-        // only, sample_off=1 in `_prepare_dflash_inputs_kernel`).
+        // Seed prev = last_token on device. No per-step DtoH — the chain
+        // stays on-device so Option B graph capture does not hit CUDA 900.
+        let last_bytes = last_token.to_le_bytes();
+        gpu.copy_h2d(&last_bytes, self.scratch.slot_mapping_dev)?;
+        // Row 0 = anchor bonus: plain argmax, never Markov-biased.
         ops::argmax_bf16(
             gpu,
             self.kernels.argmax,
@@ -64,13 +65,24 @@ impl BlockDiffusionDraftHead {
             self.vocab_size as u32,
             stream,
         )?;
-        // Rows 1..γ = mask rows, sampled left-to-right. prev = last target
-        // token for row 1, then the just-sampled draft (sequential stage).
-        let mut prev = last_token as usize;
-        let mut tok_bytes = [0u8; 4];
+        // Rows 1..γ−1 = mask rows. prev is last_token for row 1, then the
+        // just-written draft_tokens_dev[i-1].
         for i in 1..self.gamma {
-            let src = w1.weight.offset(prev * rank * bf16);
-            gpu.copy_d2d_async(src, self.markov_embed, rank * bf16, stream)?;
+            let prev_dev = if i == 1 {
+                self.scratch.slot_mapping_dev
+            } else {
+                self.scratch.draft_tokens_dev.offset((i - 1) * 4)
+            };
+            ops::batched_embed(
+                gpu,
+                self.kernels.batched_embed,
+                prev_dev,
+                w1.weight,
+                self.markov_embed,
+                1,
+                rank as u32,
+                stream,
+            )?;
             ops::dense_gemv(
                 gpu,
                 self.kernels.dense_gemv,
@@ -99,9 +111,6 @@ impl BlockDiffusionDraftHead {
                 self.vocab_size as u32,
                 stream,
             )?;
-            gpu.copy_d2h_async(token_slot, &mut tok_bytes, stream)?;
-            gpu.synchronize(stream)?;
-            prev = u32::from_le_bytes(tok_bytes) as usize;
         }
         Ok(())
     }
