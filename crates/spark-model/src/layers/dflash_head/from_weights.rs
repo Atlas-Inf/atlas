@@ -28,6 +28,11 @@ impl BlockDiffusionDraftHead {
         gpu: &dyn GpuBackend,
         max_seq_len: usize,
     ) -> Result<Self> {
+        let embed_tokens_shared = weights
+            .embed_tokens
+            .as_ref()
+            .map(|e| e.weight)
+            .unwrap_or(embed_tokens_shared);
         // Drafter's `fc` is `[draft_hidden, len(target_layer_ids) * target_hidden]`.
         // We rely on the drafter config's `hidden_size` and the parsed
         // `target_layer_ids` to derive the expected target_hidden, then
@@ -440,6 +445,19 @@ impl BlockDiffusionDraftHead {
             hidden_norm: weights.hidden_norm,
             norm: weights.norm,
             fc: weights.fc,
+            markov_w1: weights.markov_w1,
+            markov_w2: weights.markov_w2,
+            markov_rank: weights.markov_rank,
+            markov_embed: if weights.markov_rank > 0 {
+                gpu.alloc(weights.markov_rank * 2)?
+            } else {
+                DevicePtr::NULL
+            },
+            markov_bias: if weights.markov_rank > 0 {
+                gpu.alloc(weights.config.vocab_size * 2)?
+            } else {
+                DevicePtr::NULL
+            },
             draft_id_to_target_id: None,
             layers: weights
                 .layers

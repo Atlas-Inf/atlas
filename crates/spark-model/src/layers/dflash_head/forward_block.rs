@@ -595,6 +595,42 @@ impl BlockDiffusionDraftHead {
                         stream,
                     )?;
                 }
+            } else if self.kernels.w4a16_gemm.0 != 0 {
+                match self.lm_head_nvfp4.as_ref() {
+                    // Shared lm_head is NVFP4 (pre-packed like Lightning, or
+                    // runtime-quantized): the DenseWeight pointer holds PACKED
+                    // bytes, so a BF16 dense GEMM would read vocab×hidden BF16
+                    // from a half-size buffer (CUDA-700 ILA crash). Draft from
+                    // the same NVFP4 head the verifier uses.
+                    Some(nvfp4) => {
+                        ops::w4a16_gemm(
+                            gpu,
+                            self.kernels.w4a16_gemm,
+                            norm_noise_local,
+                            nvfp4,
+                            self.scratch.logits,
+                            self.gamma as u32,
+                            self.vocab_size as u32,
+                            h_local,
+                            stream,
+                        )?;
+                    }
+                    None => {
+                        ops::dense_gemm_bf16_pipelined(
+                            gpu,
+                            self.kernels.dense_gemm_pipelined,
+                            norm_noise_local,
+                            &crate::weight_map::DenseWeight {
+                                weight: self.lm_head_shared,
+                            },
+                            self.scratch.logits,
+                            self.gamma as u32,
+                            self.vocab_size as u32,
+                            h_local,
+                            stream,
+                        )?;
+                    }
+                }
             } else {
                 ops::dense_gemm_bf16_pipelined(
                     gpu,
@@ -610,18 +646,7 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )?;
             }
-            for i in 0..self.gamma {
-                let logits_row = self.scratch.logits.offset(i * self.vocab_size * bf16_local);
-                let token_slot = self.scratch.draft_tokens_dev.offset(i * 4);
-                ops::argmax_bf16(
-                    gpu,
-                    self.kernels.argmax,
-                    logits_row,
-                    token_slot,
-                    self.vocab_size as u32,
-                    stream,
-                )?;
-            }
+            self.argmax_block_logits(last_token, gpu, stream)?;
 
             // ── BLOCK-FORWARD PARITY DUMP (Friday 2026-06-11) ──────────────
             // Tests Ronald's theory: is the block-diffusion forward COMPUTING

@@ -358,6 +358,15 @@ pub struct BlockDiffusionDraftHead {
     /// once at model entry. Replaces the earlier (incorrect) "per-layer KV
     /// injection" design.
     pub fc: DenseWeight,
+    /// DSpark Markov `w1` `[vocab, rank]` BF16. None for DFlash-only heads.
+    pub markov_w1: Option<DenseWeight>,
+    /// DSpark Markov `w2` `[vocab, rank]` BF16.
+    pub markov_w2: Option<DenseWeight>,
+    pub markov_rank: usize,
+    /// Scratch `[rank]` BF16 for the previous-token Markov embed.
+    pub markov_embed: DevicePtr,
+    /// Scratch `[vocab]` BF16 Markov bias row.
+    pub markov_bias: DevicePtr,
     /// Optional draft-vocab-id → target-vocab-id remap. `None` when the
     /// drafter shares vocab with the target (Qwen3.6-35B-A3B-DFlash case:
     /// vocab_size == draft_vocab_size == 248320).
@@ -453,6 +462,7 @@ pub struct BlockDiffusionDraftHead {
 
 mod forward_block;
 mod forward_block_layer;
+mod markov;
 mod forward_block_layer_paged;
 mod from_weights;
 mod precompute_ctx_kv;

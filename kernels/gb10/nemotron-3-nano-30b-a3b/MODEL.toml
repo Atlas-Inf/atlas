@@ -126,6 +126,14 @@ M128-mfast FP8 GEMM; nemotron_mamba2/prefill gates the probe
 (handle != 0 && n >= 512) and falls back to the bf16-A FP8 path that
 resolves from common w4a16."""
 fp8_fp8_gemm_t_m128_mfast = "Same family — the pre-cast-A fp8 path falls back to the bf16-A arm that resolves."
+fp8_gemm_t_row_scaled = """
+Phase G FP8-drafter GEMM; shipped only in the qwen3.6-27b / qwen3.6-35b-a3b
+w4a16_gemm.cu shadows. dflash_head::from_weights probes it via try_kernel
+for the ATLAS_DFLASH_DRAFTER_FP8 path; when absent the FP8 drafter arm is
+skipped and the BF16 drafter is used (Lightning DSpark runs BF16)."""
+fp8_gemm_t_row_scaled_m16 = """
+Small-M (M<=16) twin of fp8_gemm_t_row_scaled for the drafter lm_head gamma-loop;
+same probe, same BF16 fallback, same shipping set."""
 
 [expected_absent.w4a4]
 w4a4_gemm_mfast = """
