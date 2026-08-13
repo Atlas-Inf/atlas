@@ -192,6 +192,65 @@ impl TransformerLayer for NemotronMamba2Layer {
         Ok(())
     }
 
+    fn decode_batched(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size;
+        let h_bytes = ctx.config.ssm_h_state_bytes();
+        let conv_bytes = ctx.config.ssm_conv_state_bytes();
+        for t in 0..num_tokens {
+            let offset = t * h * 2;
+            self.decode(
+                hidden.offset(offset),
+                residual.offset(offset),
+                state,
+                kv_cache,
+                seq_len + t,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                ctx,
+                stream,
+            )?;
+            // MTP reject rewinds to intermediate[num_accepted-1]. Qwen GDN
+            // writes those inside the fused kernel; Mamba-2 decode does not.
+            // Snapshot after every token except the last (full-accept keeps
+            // live h_state). Skip when the slot has no MTP intermediates.
+            if t + 1 < num_tokens {
+                let ssm = state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
+                if t < ssm.h_state_intermediates.len() && t < ssm.conv_state_intermediates.len() {
+                    ctx.gpu.copy_d2d_async(
+                        ssm.h_state,
+                        ssm.h_state_intermediates[t],
+                        h_bytes,
+                        stream,
+                    )?;
+                    ctx.gpu.copy_d2d_async(
+                        ssm.conv_state,
+                        ssm.conv_state_intermediates[t],
+                        conv_bytes,
+                        stream,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn prefill(
         &self,
         hidden: DevicePtr,

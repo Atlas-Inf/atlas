@@ -399,4 +399,24 @@ mod tests {
         config.compress_ratios = vec![0; 3];
         assert!(config.kv_only_prefix_cache_is_safe());
     }
+
+    #[test]
+    fn nemotron_mamba2_ssm_bytes_are_not_gdn_zero() {
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        c.mamba_num_heads = 64;
+        c.mamba_head_dim = 64;
+        c.ssm_state_size = 128;
+        c.n_groups = 8;
+        c.linear_conv_kernel_dim = 4;
+        c.linear_num_value_heads = 0;
+        c.linear_value_head_dim = 0;
+        c.linear_num_key_heads = 0;
+        c.linear_key_head_dim = 0;
+        assert_eq!(c.ssm_h_state_bytes(), 64 * 64 * 128 * 4);
+        assert_eq!(
+            c.ssm_conv_state_bytes(),
+            (64 * 64 + 2 * 8 * 128) * 4 * 4
+        );
+        assert_eq!(c.linear_num_value_heads * c.linear_value_head_dim * c.linear_key_head_dim * 4, 0);
+    }
 }
