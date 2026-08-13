@@ -417,11 +417,28 @@ impl ModelWeightLoader for NemotronHWeightLoader {
 
     fn load_mtp_weights(
         &self,
-        _store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
     ) -> Result<Option<MtpWeights>> {
-        Ok(None) // Nemotron-H has no MTP
+        if store.contains("mtp.layers.0.eh_proj.weight") {
+            tracing::info!(
+                "Loading Lightning MTP (eh_proj + layer1 ReLU2 MoE, {} experts)",
+                config.num_experts
+            );
+            let mtp = crate::weight_map::load_mtp_lightning(
+                store,
+                config.num_experts,
+                gpu,
+                config.hidden_size,
+            )?;
+            tracing::info!(
+                "Lightning MTP loaded: eh_proj, {} experts (gate_proj=up_proj stand-in)",
+                mtp.experts.len()
+            );
+            return Ok(Some(mtp));
+        }
+        Ok(None) // Nano / Super have no MTP
     }
 }
 

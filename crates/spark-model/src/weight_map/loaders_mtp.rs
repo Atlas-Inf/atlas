@@ -143,3 +143,64 @@ pub enum Nvfp4Variant {
     /// pre-calibrated NVFP4 release — the user gets a warning at startup.
     Bf16Raw,
 }
+
+/// Lightning MTP: `mtp.layers.0.{enorm,hnorm,eh_proj,mixer.{q,k,v,o}_proj}`
+/// plus `mtp.layers.1` ReLU² MoE (up/down only, 128 experts). No q/k RMSNorm.
+/// Missing norms are filled with BF16 ones so the Qwen MTP head can load.
+/// ReLU² experts reuse `up_proj` as `gate_proj` — SwiGLU is not ReLU²; accept
+/// rate must be measured and this mapping replaced if it stays near zero.
+pub fn load_mtp_lightning(
+    store: &WeightStore,
+    num_experts: usize,
+    gpu: &dyn GpuBackend,
+    hidden: usize,
+) -> Result<MtpWeights> {
+    if !store.contains("mtp.layers.0.eh_proj.weight") {
+        anyhow::bail!("Lightning MTP eh_proj missing");
+    }
+    let ones = |n: usize| -> Result<DenseWeight> {
+        let mut host = vec![0u8; n * 2];
+        for i in 0..n {
+            host[i * 2] = 0x00;
+            host[i * 2 + 1] = 0x3c; // BF16 1.0
+        }
+        let ptr = gpu.alloc(host.len())?;
+        gpu.copy_h2d(&host, ptr)?;
+        Ok(DenseWeight { weight: ptr })
+    };
+    let mut experts = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let up = dense(store, &format!("mtp.layers.1.mixer.experts.{e}.up_proj.weight"))?;
+        let down = dense(store, &format!("mtp.layers.1.mixer.experts.{e}.down_proj.weight"))?;
+        experts.push(DenseExpertWeight {
+            gate_proj: up,
+            up_proj: up,
+            down_proj: down,
+        });
+    }
+    let shared_up = dense(store, "mtp.layers.1.mixer.shared_experts.up_proj.weight")?;
+    Ok(MtpWeights {
+        pre_fc_norm_embedding: dense(store, "mtp.layers.0.enorm.weight")?,
+        pre_fc_norm_hidden: dense(store, "mtp.layers.0.hnorm.weight")?,
+        fc: dense(store, "mtp.layers.0.eh_proj.weight")?,
+        input_layernorm: dense(store, "mtp.layers.0.norm.weight")?,
+        q_proj: dense(store, "mtp.layers.0.mixer.q_proj.weight")?,
+        k_proj: dense(store, "mtp.layers.0.mixer.k_proj.weight")?,
+        v_proj: dense(store, "mtp.layers.0.mixer.v_proj.weight")?,
+        o_proj: dense(store, "mtp.layers.0.mixer.o_proj.weight")?,
+        q_norm: ones(hidden)?,
+        k_norm: ones(hidden)?,
+        post_attn_layernorm: dense(store, "mtp.layers.1.norm.weight")?,
+        moe_gate: dense(store, "mtp.layers.1.mixer.gate.weight")?,
+        shared_expert: DenseExpertWeight {
+            gate_proj: shared_up,
+            up_proj: shared_up,
+            down_proj: dense(store, "mtp.layers.1.mixer.shared_experts.down_proj.weight")?,
+        },
+        shared_expert_gate: ones(hidden)?,
+        experts,
+        dense_ffn: None,
+        norm: dense(store, "mtp.layers.1.final_layernorm.weight")?,
+    })
+}
+

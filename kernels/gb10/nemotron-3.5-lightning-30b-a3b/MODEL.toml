@@ -49,8 +49,12 @@ dry_multiplier = 0.0
 use_sampling_presets_for_core = true
 thinking_in_tools = true
 max_thinking_budget = 8192
-thinking_default = false
+# Official Lightning template defaults enable_thinking=true. Thinking-off
+# emits empty <think></think> and this checkpoint then copies the first
+# operand (7+5 → 7). Thinking-on ChatML math is correct (12).
+thinking_default = true
 cap_thinking_at_max_tokens = false
 default_system_prompt = "You are a helpful assistant."
 jinja_template = "nemotron_lightning.jinja"
+rollback_resteer = false
 default_num_drafts = 1
