@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Batched Mamba-2 verify: prefill GEMMs + the proven n=1 conv/SSM loop.
-//! Fused `mamba2_ssm_verify` is compiled but not dispatched until it is
-//! CUDA-graph safe (ILA 700 on first kgamma capture).
+//! Batched Mamba-2 verify: prefill GEMMs + n=1 conv FIR + fused persistent
+//! scan. Conv stays sequential so FIR intermediates stay lossless. H dumps
+//! go into the contiguous `h_state_intermediates` slab (slot*ni + t).
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -47,15 +47,15 @@ impl NemotronMamba2Layer {
         )?;
 
         let proj = ctx.buffers.ssm_qkvz();
-        let fp8_a = false;
-        let w4a4 = false;
         let pd_fp8_ok = self.fp8_gemm_t_k.0 != 0;
-        self.prefill_in_proj(normed, proj, n, h, fp8_a, w4a4, pd_fp8_ok, ctx, stream)?;
+        self.prefill_in_proj(normed, proj, n, h, false, false, pd_fp8_ok, ctx, stream)?;
 
         let xbc_tmp = ctx.buffers.ssm_deinterleaved();
+        let packed = ctx.buffers.qkv_output();
         let y_out = ctx.buffers.attn_output();
         let h_bytes = ctx.config.ssm_h_state_bytes();
         let conv_bytes = ctx.config.ssm_conv_state_bytes();
+        let row_bytes = self.d_xbc * bf16;
 
         for t in 0..num_tokens {
             let xbc_in = proj.offset(t * self.in_proj_size * bf16 + self.d_inner * bf16);
@@ -69,32 +69,83 @@ impl NemotronMamba2Layer {
                 1,
                 stream,
             )?;
-            let dt = proj.offset(t * self.in_proj_size * bf16 + (self.d_inner + self.d_xbc) * bf16);
-            self.ssm_decode(
+            ctx.gpu
+                .copy_d2d_async(xbc_tmp, packed.offset(t * row_bytes), row_bytes, stream)?;
+            if t + 1 < num_tokens && t < ssm_state.conv_state_intermediates.len() {
+                ctx.gpu.copy_d2d_async(
+                    ssm_state.conv_state,
+                    ssm_state.conv_state_intermediates[t],
+                    conv_bytes,
+                    stream,
+                )?;
+            }
+        }
+
+        let x_ptr = packed;
+        let b_ptr = packed.offset(self.d_inner * bf16);
+        let c_ptr = packed.offset((self.d_inner + gs) * bf16);
+        let dt_ptr = proj.offset((self.d_inner + self.d_xbc) * bf16);
+        let n_inter = ssm_state
+            .h_state_intermediates
+            .len()
+            .min(num_tokens.saturating_sub(1));
+        let (h_inter, inter_stride) = if n_inter > 0 {
+            (ssm_state.h_state_intermediates[0], (h_bytes / 4) as u32)
+        } else {
+            (DevicePtr::NULL, 0u32)
+        };
+
+        let use_fused = self.mamba2_ssm_verify_k.0 != 0
+            && std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err();
+        if use_fused {
+            ops::mamba2_ssm_verify(
                 ctx.gpu,
+                self.mamba2_ssm_verify_k,
                 ssm_state.h_state,
-                xbc_tmp,
-                xbc_tmp.offset(self.d_inner * bf16),
-                xbc_tmp.offset((self.d_inner + gs) * bf16),
-                dt,
-                y_out.offset(t * self.d_inner * bf16),
+                x_ptr,
+                b_ptr,
+                c_ptr,
+                dt_ptr,
+                self.ssm.a_log.weight,
+                self.ssm.d_param.weight,
+                self.ssm.dt_bias.weight,
+                y_out,
+                h_inter,
+                n_inter as u32,
+                inter_stride,
                 1,
+                n,
+                self.num_heads as u32,
+                self.head_dim as u32,
+                self.state_size as u32,
+                self.n_groups as u32,
+                1e-9,
+                1e9,
+                self.d_xbc as u32,
+                self.d_xbc as u32,
+                self.in_proj_size as u32,
+                self.d_inner as u32,
                 stream,
             )?;
-            if t + 1 < num_tokens {
-                if t < ssm_state.h_state_intermediates.len() {
+        } else {
+            for t in 0..num_tokens {
+                let xt = packed.offset(t * row_bytes);
+                self.ssm_decode(
+                    ctx.gpu,
+                    ssm_state.h_state,
+                    xt,
+                    xt.offset(self.d_inner * bf16),
+                    xt.offset((self.d_inner + gs) * bf16),
+                    proj.offset(t * self.in_proj_size * bf16 + (self.d_inner + self.d_xbc) * bf16),
+                    y_out.offset(t * self.d_inner * bf16),
+                    1,
+                    stream,
+                )?;
+                if t + 1 < num_tokens && t < ssm_state.h_state_intermediates.len() {
                     ctx.gpu.copy_d2d_async(
                         ssm_state.h_state,
                         ssm_state.h_state_intermediates[t],
                         h_bytes,
-                        stream,
-                    )?;
-                }
-                if t < ssm_state.conv_state_intermediates.len() {
-                    ctx.gpu.copy_d2d_async(
-                        ssm_state.conv_state,
-                        ssm_state.conv_state_intermediates[t],
-                        conv_bytes,
                         stream,
                     )?;
                 }
@@ -119,7 +170,7 @@ impl NemotronMamba2Layer {
         )?;
 
         let out = ctx.buffers.qkv_output();
-        self.prefill_out_proj(gated_out, out, n, h, fp8_a, w4a4, pd_fp8_ok, ctx, stream)?;
+        self.prefill_out_proj(gated_out, out, n, h, false, false, pd_fp8_ok, ctx, stream)?;
         ops::residual_add(
             ctx.gpu,
             self.residual_add_k,

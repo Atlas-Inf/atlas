@@ -250,6 +250,96 @@ impl TransformerLayer for NemotronMoeLayer {
         self.decode_inner(hidden, residual, ctx, stream)
     }
 
+    fn decode_batched(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        _state: &mut dyn LayerState,
+        _kv_cache: &mut PagedKvCache,
+        _seq_len: usize,
+        _block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if num_tokens <= 1 || self.moe_latent_size > 0 {
+            for t in 0..num_tokens {
+                let off = t * ctx.config.hidden_size * 2;
+                self.decode_inner(hidden.offset(off), residual.offset(off), ctx, stream)?;
+            }
+            return Ok(());
+        }
+        let h = ctx.config.hidden_size;
+        let n = num_tokens as u32;
+        let num_experts = ctx.config.num_experts as u32;
+        let top_k = self.top_k as u32;
+        let inter = self.moe_inter as u32;
+        let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let scale = ctx.config.routed_scaling_factor as f32;
+        let bf16 = 2usize;
+
+        let normed = ctx.buffers.norm_output();
+        ops::rms_norm_residual(
+            ctx.gpu,
+            self.rms_norm_residual_k,
+            hidden,
+            &self.input_norm,
+            normed,
+            residual,
+            n,
+            h as u32,
+            eps,
+            stream,
+        )?;
+        let gate_logits = ctx.buffers.gate_logits();
+        self.dense_gemm_prefill(
+            ctx.gpu,
+            normed,
+            &self.weights.gate,
+            gate_logits,
+            n,
+            num_experts,
+            h as u32,
+            stream,
+        )?;
+        let scratch = ctx.buffers.scratch();
+        for t in 0..num_tokens {
+            let indices = scratch;
+            let weights = scratch.offset(top_k as usize * 4);
+            let gate_t = gate_logits.offset(t * num_experts as usize * bf16);
+            ops::moe_topk_sigmoid(
+                ctx.gpu,
+                self.topk_sigmoid_k,
+                gate_t,
+                self.weights.e_score_correction_bias.weight,
+                indices,
+                weights,
+                num_experts,
+                top_k,
+                ctx.config.norm_topk_prob,
+                scale,
+                stream,
+            )?;
+            let off = t * h * bf16;
+            self.decode_direct_moe(
+                hidden.offset(off),
+                normed.offset(off),
+                indices,
+                weights,
+                ctx,
+                stream,
+                h as u32,
+                inter,
+                shared_inter,
+                top_k,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Batched MoE prefill: uses GEMM for gate/fc1/fc2/shared, per-token for routing + experts.
     ///
     /// For Super 120B with 40 MoE layers, this replaces O(N * 7 kernel_launches) decode calls
