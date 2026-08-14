@@ -97,7 +97,28 @@ impl NemotronMoeLayer {
         }
 
         let expert_up_out = ctx.buffers.expert_up_out();
-        if self.moe_expert_gemv_wide_k.0 != 0
+        let grouped = n >= 2
+            && self.moe_expert_gemv_wide_grouped_k.0 != 0
+            && std::env::var("ATLAS_MOE_EXPERT_GROUPED").is_ok();
+        if grouped {
+            ops::moe_expert_gemv_wide_grouped(
+                ctx.gpu,
+                self.moe_expert_gemv_wide_grouped_k,
+                normed,
+                self.up_ptrs.packed_ptrs,
+                self.up_ptrs.scale_ptrs,
+                self.up_ptrs.scale2_vals,
+                expert_up_out,
+                indices,
+                inter,
+                h as u32,
+                top_k,
+                0,
+                n,
+                num_experts,
+                stream,
+            )?;
+        } else if self.moe_expert_gemv_wide_k.0 != 0
             && std::env::var("ATLAS_NO_MOE_EXPERT_WIDE").is_err()
         {
             ops::moe_expert_gemv_wide(
@@ -140,6 +161,18 @@ impl NemotronMoeLayer {
             ops::w4a16_gemv_batchm(
                 ctx.gpu,
                 self.w4a16_gemv_batch4_k,
+                normed,
+                &self.weights.shared_up,
+                shared_up,
+                n,
+                shared_inter,
+                h as u32,
+                stream,
+            )?;
+        } else if n <= 16 && self.w4a16_gemv_batch16_k.0 != 0 {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                self.w4a16_gemv_batch16_k,
                 normed,
                 &self.weights.shared_up,
                 shared_up,
