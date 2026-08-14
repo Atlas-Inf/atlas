@@ -156,7 +156,9 @@ pub fn marlin_moe_nvfp4(
         .launch(stream)
 }
 
-pub const MARLIN_SLOTS: i32 = 32;
+// AR C=8: n*top_k = 48 unique worst. 32 dropped ~9 experts → garbage.
+// 64 covers default --max-batch-size 8. Must match #define MAX_SLOTS.
+pub const MARLIN_SLOTS: i32 = 64;
 pub const MARLIN_M_TILE: i32 = 8;
 
 #[allow(clippy::too_many_arguments)]

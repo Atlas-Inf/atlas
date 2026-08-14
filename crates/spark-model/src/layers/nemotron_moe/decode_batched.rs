@@ -97,7 +97,7 @@ impl NemotronMoeLayer {
         }
 
         let expert_up_out = ctx.buffers.expert_up_out();
-        if self.marlin.is_some() {
+        if self.marlin.is_some() && num_tokens <= 4 {
             return self.decode_batched_marlin(hidden, residual, num_tokens, ctx, stream);
         }
         let grouped = n >= 2

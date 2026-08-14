@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Graph-safe linear Marlin: device pack unique experts into 32 slots.
+//! Graph-safe linear Marlin: device pack unique experts into MARLIN_SLOTS.
 
 use anyhow::{Result, bail};
 use spark_runtime::gpu::DevicePtr;
@@ -39,6 +39,10 @@ impl NemotronMoeLayer {
         let scale = ctx.config.routed_scaling_factor as f32;
         let bf16 = 2usize;
         let num_experts = ctx.config.num_experts as u32;
+        // KEEP shape is n<=4 (C=4 AR, C=1 DSpark verify). One launch over
+        // n=8 (~41 unique) still garbles with 64 slots + zeroed scatter.
+        // Wave the proven tile; shared expert stays one n-wide GEMM.
+        const WAVE: usize = 4;
 
         let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
@@ -112,98 +116,109 @@ impl NemotronMoeLayer {
             self.prefill_shared_up(normed, shared_up, n, h, shared_inter, ctx, stream)?;
         }
 
-        ctx.gpu.memset_async(
-            m.slot_a,
-            0,
-            (SLOTS * M_TILE) as usize * h * bf16,
-            stream,
-        )?;
-        ops::marlin_pack_slots(
-            ctx.gpu,
-            m.pack_k,
-            indices,
-            normed,
-            m.slot_eids,
-            m.slot_map,
-            m.slot_a,
-            m.n_post,
-            n as i32,
-            top_k as i32,
-            m.e,
-            h as i32,
-            stream,
-        )?;
-
-        let ng_up = m.up_k / GROUP;
-        ctx.gpu
-            .memset_async(m.locks, 0, 32 * 256 * 4, stream)?;
-        ctx.gpu.memset_async(m.slot_bars, 0, 32 * 4, stream)?;
-        ops::marlin_nvfp4_m8_allslots(
-            ctx.gpu,
-            m.slot_up_k,
-            m.slot_a,
-            m.up_w,
-            m.slot_up,
-            m.c_tmp,
-            m.up_s,
-            m.up_gs,
-            m.slot_eids,
-            m.n_post,
-            m.slot_bars,
-            ng_up,
-            M_TILE,
-            m.up_n,
-            m.up_k,
-            m.up_k,
-            m.locks,
-            SMS,
-            SMEM,
-            stream,
-        )?;
-        ops::relu_squared_inplace(
-            ctx.gpu,
-            self.moe_relu2_elementwise_k,
-            m.slot_up,
-            (SLOTS * M_TILE) as u32 * inter,
-            stream,
-        )?;
-        let ng_dn = m.down_k / GROUP;
-        ctx.gpu
-            .memset_async(m.locks, 0, 32 * 256 * 4, stream)?;
-        ctx.gpu.memset_async(m.slot_bars, 0, 32 * 4, stream)?;
-        ops::marlin_nvfp4_m8_allslots(
-            ctx.gpu,
-            m.slot_dn_k,
-            m.slot_up,
-            m.down_w,
-            m.slot_dn,
-            m.c_tmp,
-            m.down_s,
-            m.down_gs,
-            m.slot_eids,
-            m.n_post,
-            m.slot_bars,
-            ng_dn,
-            M_TILE,
-            m.down_n,
-            m.down_k,
-            m.down_k,
-            m.locks,
-            SMS,
-            SMEM,
-            stream,
-        )?;
-
         let expert_down_out = ctx.buffers.expert_down_out();
-        ops::marlin_scatter_slots(
-            ctx.gpu,
-            m.scatter_k,
-            m.slot_dn,
-            m.slot_map,
+        ctx.gpu.memset_async(
             expert_down_out,
-            h as i32,
+            0,
+            num_tokens * top_k as usize * h * bf16,
             stream,
         )?;
+        let ng_up = m.up_k / GROUP;
+        let ng_dn = m.down_k / GROUP;
+        let mut wave_off = 0usize;
+        while wave_off < num_tokens {
+            let cn = (num_tokens - wave_off).min(WAVE);
+            ctx.gpu.memset_async(
+                m.slot_a,
+                0,
+                (SLOTS * M_TILE) as usize * h * bf16,
+                stream,
+            )?;
+            ops::marlin_pack_slots(
+                ctx.gpu,
+                m.pack_k,
+                indices.offset(wave_off * top_k as usize * 4),
+                normed.offset(wave_off * h * bf16),
+                m.slot_eids,
+                m.slot_map,
+                m.slot_a,
+                m.n_post,
+                cn as i32,
+                top_k as i32,
+                m.e,
+                h as i32,
+                stream,
+            )?;
+            ctx.gpu
+                .memset_async(m.locks, 0, (SLOTS as usize) * 256 * 4, stream)?;
+            ctx.gpu
+                .memset_async(m.slot_bars, 0, (SLOTS as usize) * 4, stream)?;
+            ops::marlin_nvfp4_m8_allslots(
+                ctx.gpu,
+                m.slot_up_k,
+                m.slot_a,
+                m.up_w,
+                m.slot_up,
+                m.c_tmp,
+                m.up_s,
+                m.up_gs,
+                m.slot_eids,
+                m.n_post,
+                m.slot_bars,
+                ng_up,
+                M_TILE,
+                m.up_n,
+                m.up_k,
+                m.up_k,
+                m.locks,
+                SMS,
+                SMEM,
+                stream,
+            )?;
+            ops::relu_squared_inplace(
+                ctx.gpu,
+                self.moe_relu2_elementwise_k,
+                m.slot_up,
+                (SLOTS * M_TILE) as u32 * inter,
+                stream,
+            )?;
+            ctx.gpu
+                .memset_async(m.locks, 0, (SLOTS as usize) * 256 * 4, stream)?;
+            ctx.gpu
+                .memset_async(m.slot_bars, 0, (SLOTS as usize) * 4, stream)?;
+            ops::marlin_nvfp4_m8_allslots(
+                ctx.gpu,
+                m.slot_dn_k,
+                m.slot_up,
+                m.down_w,
+                m.slot_dn,
+                m.c_tmp,
+                m.down_s,
+                m.down_gs,
+                m.slot_eids,
+                m.n_post,
+                m.slot_bars,
+                ng_dn,
+                M_TILE,
+                m.down_n,
+                m.down_k,
+                m.down_k,
+                m.locks,
+                SMS,
+                SMEM,
+                stream,
+            )?;
+            ops::marlin_scatter_slots(
+                ctx.gpu,
+                m.scatter_k,
+                m.slot_dn,
+                m.slot_map,
+                expert_down_out.offset(wave_off * top_k as usize * h * bf16),
+                h as i32,
+                stream,
+            )?;
+            wave_off += cn;
+        }
 
         let shared_down = ctx.buffers.ssm_deinterleaved();
         ops::relu_squared_inplace(

@@ -5,7 +5,7 @@
 #include <cstdint>
 
 #ifndef MAX_SLOTS
-#define MAX_SLOTS 32
+#define MAX_SLOTS 64
 #endif
 #ifndef M_TILE
 #define M_TILE 8
