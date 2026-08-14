@@ -159,7 +159,9 @@ fn process_scales(src_e4m3: &[u8], n: usize, k: usize) -> (Vec<u8>, f32) {
 }
 
 fn process_global(gs: f32, sf: f32) -> f32 {
-    gs * 2f32.powi(124 - 7) / sf
+    // vLLM nvfp4_marlin_process_global_scale for BF16:
+    // exponent_bias = 2^(8-1) - 2^(2-1) = 126; then 2^(126-7) = 2^119.
+    gs * 2f32.powi(126 - 7) / sf
 }
 
 fn transpose_u32(src: &[u8], rows: usize, cols_u8: usize) -> Vec<u8> {
