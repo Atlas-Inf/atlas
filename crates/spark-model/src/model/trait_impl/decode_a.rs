@@ -229,6 +229,9 @@ impl TransformerModel {
         // capture-safe (pool weights / arena scratch / f32 scale are all
         // load-time-fixed). Folded in as one more suppressor.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
+        // Diagnostic: force eager single-seq decode (graph-vs-eager A/B,
+        // and to localize 716s inside captured graphs with LAUNCH_BLOCKING).
+        let no_decode_graphs = std::env::var("ATLAS_NO_DECODE_GRAPHS").is_ok_and(|v| v == "1");
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
             && !self.profile
             && !self
@@ -236,7 +239,8 @@ impl TransformerModel {
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
             && !dump_step0
-            && !lora_eager;
+            && !lora_eager
+            && !no_decode_graphs;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
