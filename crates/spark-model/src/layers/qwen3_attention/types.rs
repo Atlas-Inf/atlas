@@ -47,6 +47,9 @@ pub struct Qwen3AttentionLayer {
     /// Per-layer RoPE overrides for heterogeneous models (Gemma-4).
     pub(crate) rope_theta_override: Option<f32>,
     pub(crate) rotary_dim_override: Option<u32>,
+    /// No RoPE at all in this attention layer (Nemotron-H: position lives in
+    /// the Mamba layers; the HF reference applies no rotary embeddings).
+    pub(crate) rope_disabled: bool,
     /// Proportional RoPE (Gemma-4 full-attention).
     pub(crate) rope_proportional: bool,
     /// Per-layer attention scale override (Gemma-4: 1.0 because QK-norm

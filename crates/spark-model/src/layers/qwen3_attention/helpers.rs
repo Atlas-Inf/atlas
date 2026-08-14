@@ -80,10 +80,16 @@ impl Qwen3AttentionLayer {
     }
 
     /// Set per-layer RoPE overrides (theta, rotary_dim) for dual-RoPE
-    /// models (Gemma-4).
+    /// heterogeneous models (Gemma-4).
     pub fn set_rope_overrides(&mut self, theta: f32, rotary_dim: u32) {
         self.rope_theta_override = Some(theta);
         self.rotary_dim_override = Some(rotary_dim);
+    }
+
+    /// Disable RoPE entirely for this layer (Nemotron-H attention: the HF
+    /// reference applies no rotary embeddings — position lives in Mamba).
+    pub fn set_rope_disabled(&mut self, disabled: bool) {
+        self.rope_disabled = disabled;
     }
 
     /// Enable proportional RoPE (Gemma-4 full-attention layers). Must be

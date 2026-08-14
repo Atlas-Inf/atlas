@@ -401,6 +401,8 @@ impl Qwen3AttentionLayer {
         if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block to rope portions only.
             // Skip shared RoPE to avoid double-rotation.
+        } else if self.rope_disabled {
+            // Nemotron-H: no RoPE in attention (position lives in Mamba).
         } else if q_rope_fused {
             ops::rope_mrope_interleaved_k_only(
                 ctx.gpu,

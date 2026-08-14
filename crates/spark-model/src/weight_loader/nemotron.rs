@@ -352,6 +352,11 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                         config.fp8_kv_calibration_tokens,
                         config,
                     )?;
+                    // Nemotron-H attention has NO rotary embeddings in the HF
+                    // reference — position is carried by the Mamba layers.
+                    // Applying Qwen3 RoPE here corrupts long-range attention
+                    // (the G0 distance-decay retrieval bug).
+                    attn_layer.set_rope_disabled(true);
                     if let Some(od) = bf16_o_dense {
                         // Dispatch checks `o_dense_bf16` first (see gemma4 loader).
                         attn_layer.set_o_dense_bf16(od);
