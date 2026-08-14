@@ -22,6 +22,7 @@ extern "C" __global__ void atlas_marlin_align_block8(
   if (E > 128) return;
   for (int e = 0; e < E; e++) counts[e] = 0;
   int n = tokens * top_k;
+  int sentinel = n; // pads must not alias a live slot (0..n-1)
   for (int i = 0; i < n; i++) {
     int e = topk_ids[i];
     if (e >= 0 && e < E) counts[e]++;
@@ -41,7 +42,7 @@ extern "C" __global__ void atlas_marlin_align_block8(
   }
   offsets[E] = cursor;
   if (cursor > sorted_cap) cursor = sorted_cap;
-  for (int i = 0; i < cursor; i++) sorted_token_ids[i] = n; // pad sentinel
+  for (int i = 0; i < cursor; i++) sorted_token_ids[i] = sentinel;
   int filled[128];
   for (int e = 0; e < E; e++) filled[e] = 0;
   for (int i = 0; i < n; i++) {

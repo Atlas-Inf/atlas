@@ -238,8 +238,10 @@ impl MarlinSidecar {
         let repack = crate::layers::try_kernel(gpu, "marlin_repack", "atlas_marlin_repack_w4");
         let align = crate::layers::try_kernel(gpu, "marlin_align", "atlas_marlin_align_block8");
         let repeat = crate::layers::try_kernel(gpu, "marlin_row_repeat", "atlas_row_repeat_bf16");
-        if lin_up.0 == 0 || lin_down.0 == 0 || repack.0 == 0 {
-            tracing::warn!("ATLAS_MOE_MARLIN set but linear kernels missing; leaving GEMV");
+        if lin_up.0 == 0 || lin_down.0 == 0 || moe_up.0 == 0 || moe_down.0 == 0 || repack.0 == 0
+            || align.0 == 0 || repeat.0 == 0
+        {
+            tracing::warn!("ATLAS_MOE_MARLIN set but kernels missing; leaving GEMV");
             return Ok(None);
         }
         let e = experts.len();
@@ -323,8 +325,11 @@ impl NemotronMoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        return self.decode_batched_marlin_linear(hidden, residual, num_tokens, ctx, stream);
-        #[allow(unreachable_code)]
+        // Grouped is graph-safe but NOT KEEP (canary garbage even after sentinel).
+        // Linear is eager KEEP. Default linear; grouped behind ATLAS_MOE_MARLIN_GROUPED=1.
+        if std::env::var_os("ATLAS_MOE_MARLIN_GROUPED").is_none() {
+            return self.decode_batched_marlin_linear(hidden, residual, num_tokens, ctx, stream);
+        }
         let Some(m) = self.marlin.as_ref() else {
             bail!("marlin sidecar missing");
         };
@@ -392,6 +397,7 @@ impl NemotronMoeLayer {
 
         let expert_up_out = ctx.buffers.expert_up_out();
         let ng_up = m.up_k / GROUP as i32;
+        ctx.gpu.memset_async(m.locks, 0, 48 * 16, stream)?;
         ops::marlin_moe_nvfp4(
             ctx.gpu, m.moe_up_k, m.a_exp, m.up_w, expert_up_out, m.c_tmp, m.up_s, m.up_gs,
             m.sorted_ids, m.expert_ids, m.n_post, top_k as i32, ng_up,
@@ -404,6 +410,7 @@ impl NemotronMoeLayer {
 
         let expert_down_out = ctx.buffers.expert_down_out();
         let ng_dn = m.down_k / GROUP as i32;
+        ctx.gpu.memset_async(m.locks, 0, 48 * 16, stream)?;
         ops::marlin_moe_nvfp4(
             ctx.gpu, m.moe_down_k, expert_up_out, m.down_w, expert_down_out, m.c_tmp,
             m.down_s, m.down_gs, m.sorted_ids, m.expert_ids, m.n_post,
