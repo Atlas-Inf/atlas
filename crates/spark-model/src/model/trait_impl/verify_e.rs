@@ -291,7 +291,10 @@ impl TransformerModel {
         // Keyed by the ssm-slot VECTOR (verify_e2.rs): every baked SSM
         // pointer is a function of it; meta/embeds live at fixed addresses
         // refreshed above. can_batch already excludes EP/HSS/LoRA/DFlash.
-        let graphs_on = super::verify_e2::verify_graphs_enabled() && !k4_diag;
+        let time_layers =
+            std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
+        let graphs_on =
+            super::verify_e2::verify_graphs_enabled() && !k4_diag && !time_layers;
         let graph_key = if graphs_on {
             self.verify_batched_graph_key(&*seqs, ks, wy_tables_base.is_null())
         } else {
@@ -315,11 +318,11 @@ impl TransformerModel {
         };
 
         if let Some(graph) = cached {
-            // Replay: kernels read this step's metadata + WY tables from the
-            // fixed addresses refreshed above; the ~4-5k launches of the
-            // layer loop + head + argmax dispatch as one graph.
             if graph.0 != 0 {
                 self.gpu.launch_graph(graph, stream)?;
+            }
+            if time_layers {
+                tracing::info!("DFLASH BATCHED_GRAPH n={n} R={r_total} hit=1");
             }
         } else {
             // First step for this (slot vector, k) key (or graphs off): run
@@ -379,8 +382,15 @@ impl TransformerModel {
 
             let mut attn_idx = 0usize;
             let mut ssm_idx = 0usize;
+            let mut t_attn = 0u128;
+            let mut t_moe = 0u128;
+            let mut t_lin = 0u128;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
+                if time_layers {
+                    let _ = self.gpu.synchronize(stream);
+                }
+                let t0 = std::time::Instant::now();
 
                 if layer_type == LayerType::FullAttention {
                     let mut refs: Vec<&mut (dyn LayerState + 'static)> = attn_dummy_states
@@ -427,12 +437,30 @@ impl TransformerModel {
                 }
 
                 self.try_dflash_capture_batched(layer_idx, ks, &off, stream)?;
+                if time_layers {
+                    let _ = self.gpu.synchronize(stream);
+                    let dt = t0.elapsed().as_micros();
+                    match layer_type {
+                        LayerType::FullAttention | LayerType::SlidingAttention => t_attn += dt,
+                        LayerType::Moe => t_moe += dt,
+                        LayerType::LinearAttention => t_lin += dt,
+                    }
+                }
 
                 if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                     anyhow::bail!(
                         "K4_DIAG(batched): CUDA error after layer {layer_idx} ({layer_type:?}): {e:#}"
                     );
                 }
+            }
+
+            if time_layers {
+                tracing::info!(
+                    "DFLASH BATCHED_GRAPH n={n} R={r_total} hit=0 attn={:.1}ms moe={:.1}ms mamba={:.1}ms",
+                    t_attn as f64 / 1000.0,
+                    t_moe as f64 / 1000.0,
+                    t_lin as f64 / 1000.0
+                );
             }
 
             // ── Phase 4: final norm [R, H] + lm_head + per-row argmax ──

@@ -133,6 +133,7 @@ pub(super) fn step_verify_dflash_batched(
             dflash_verify_raw_argmax,
         );
     }
+    let t_propose = Instant::now();
     let pending: Vec<usize> = (0..n)
         .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty())
         .collect();
@@ -206,6 +207,11 @@ pub(super) fn step_verify_dflash_batched(
             }
         }
     }
+    tracing::info!(
+        "DFLASH BATCHED propose n={n} pending={} {:.1}ms",
+        pending.len(),
+        t_propose.elapsed().as_secs_f64() * 1000.0
+    );
 }
 
 /// Shared DSpark accept / emit / UNIFIED_CTX / re-propose. `seq` has already
