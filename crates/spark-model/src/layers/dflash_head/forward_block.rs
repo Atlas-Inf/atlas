@@ -646,6 +646,13 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )?;
             }
+            if std::env::var("ATLAS_DFLASH_BLOCK_DUMP").ok().as_deref() == Some("1") {
+                let n_logits_bytes = self.gamma * self.vocab_size * 2;
+                let mut pre = vec![0u8; n_logits_bytes];
+                if gpu.copy_d2h(self.scratch.logits, &mut pre).is_ok() {
+                    let _ = std::fs::write("/tmp/atlas_block_logits_pre.bin", &pre);
+                }
+            }
             self.argmax_block_logits(last_token, gpu, stream)?;
 
             // ── BLOCK-FORWARD PARITY DUMP (Friday 2026-06-11) ──────────────
@@ -818,6 +825,10 @@ impl BlockDiffusionDraftHead {
             }
             run_tail()
         };
+
+        // Seed Markov prev from a pinned host word BEFORE any tail
+        // capture/replay. The tail graph must not H2D a stack last_token.
+        self.seed_markov_prev(last_token, gpu, stream)?;
 
         // Phase F.2: piecewise capture/replay path. Only enabled for
         // option_b (paged) — legacy path stays single-shot eager since

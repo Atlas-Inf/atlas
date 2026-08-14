@@ -149,6 +149,15 @@ pub struct DflashScratch {
     pub draft_tokens_event: u64,
     pub logits: DevicePtr,
     pub draft_tokens_dev: DevicePtr,
+    /// 4-byte device slot holding the Markov prev token. Host writes it
+    /// via pinned `markov_prev_host_pinned` BEFORE the captured tail
+    /// graph; the graph only reads this pointer. Do not H2D last_token
+    /// from a stack temporary inside the tail (replay would see garbage).
+    pub markov_prev_dev: DevicePtr,
+    /// Pinned 4-byte host source for `markov_prev_dev`. Stable address
+    /// so a captured H2D (if any) would still be valid; we keep the
+    /// H2D outside the graph anyway.
+    pub markov_prev_host_pinned: std::sync::atomic::AtomicPtr<u8>,
     /// `[ctx_window + γ]` i32 positions. First ctx_window are
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.

@@ -296,6 +296,8 @@ impl BlockDiffusionDraftHead {
             // cw=4096 for rows nothing ever touches (γ rows ≈ 8.4 MB).
             logits: gpu.alloc(g * vocab_size * bf16)?,
             draft_tokens_dev: gpu.alloc(n_attn * 4)?,
+            markov_prev_dev: gpu.alloc(4)?,
+            markov_prev_host_pinned: std::sync::atomic::AtomicPtr::new(gpu.alloc_host_pinned(4)?),
             position_ids: gpu.alloc(n_attn * 4)?,
         };
 

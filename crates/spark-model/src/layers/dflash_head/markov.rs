@@ -57,8 +57,10 @@ impl BlockDiffusionDraftHead {
         // Pageable 4-byte last_token: copy_h2d_async stages it (no stream
         // sync). copy_h2d would cuStreamSynchronize and CUDA-900 under
         // Option B tail capture.
-        let last_bytes = last_token.to_le_bytes();
-        gpu.copy_h2d_async(&last_bytes, self.scratch.slot_mapping_dev, stream)?;
+        // last_token must already live in markov_prev_dev (seeded outside
+        // the captured tail). Do not H2D a stack [u8;4] here — that
+        // pointer dies after capture and every replay uses garbage prev.
+        let _ = last_token;
         // Row 0 = anchor bonus: plain argmax, never Markov-biased.
         ops::argmax_bf16(
             gpu,
@@ -72,7 +74,7 @@ impl BlockDiffusionDraftHead {
         // just-written draft_tokens_dev[i-1].
         for i in 1..self.gamma {
             let prev_dev = if i == 1 {
-                self.scratch.slot_mapping_dev
+                self.scratch.markov_prev_dev
             } else {
                 self.scratch.draft_tokens_dev.offset((i - 1) * 4)
             };
@@ -116,5 +118,25 @@ impl BlockDiffusionDraftHead {
             )?;
         }
         Ok(())
+    }
+
+    /// Write `last_token` into the stable device slot the tail graph reads.
+    /// Must run on `stream` BEFORE begin_capture(tail) / launch_graph(tail).
+    pub(super) fn seed_markov_prev(
+        &self,
+        last_token: u32,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let ptr = self
+            .scratch
+            .markov_prev_host_pinned
+            .load(std::sync::atomic::Ordering::Relaxed);
+        anyhow::ensure!(!ptr.is_null(), "markov_prev_host_pinned is null");
+        unsafe {
+            std::ptr::write(ptr as *mut u32, last_token);
+        }
+        let host = unsafe { std::slice::from_raw_parts(ptr, 4) };
+        gpu.copy_h2d_async(host, self.scratch.markov_prev_dev, stream)
     }
 }
