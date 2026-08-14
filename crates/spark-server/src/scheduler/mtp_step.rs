@@ -74,6 +74,8 @@ pub fn step_mtp(
         step_mtp_bootstrap_batched(model, active, sched, &bootstrap_idxs, ladder_nd, verify_ctx);
         bootstrap_idxs.clear();
     }
+    let mut late_dflash: Vec<usize> = Vec::new();
+    let n_active = active.len();
     for &idx in &bootstrap_idxs {
         let a = &mut active[idx];
 
@@ -106,6 +108,15 @@ pub fn step_mtp(
                 _gmask.as_deref(),
             ) {
                 Ok(init) if !init.is_empty() => {
+                    // n>=2: do not verify here. Stash drafts so Phase B can
+                    // run one decode_verify_batched over every ready seq.
+                    // In-loop step_verify_dflash left only 1 seq with drafts
+                    // (shared propose scratch / graph) and never hit Phase B.
+                    if n_active >= 2 && !dspark_batch_verify_disabled() {
+                        a.pending_drafts = init;
+                        late_dflash.push(idx);
+                        continue;
+                    }
                     if dflash_verify_raw_argmax {
                         step_verify_dflash(
                             model,
@@ -151,7 +162,9 @@ pub fn step_mtp(
                 }
                 Ok(_) => {
                     tracing::warn!(
-                        "DFlash bootstrap propose returned empty; falling back to standalone decode"
+                        "DFlash bootstrap propose returned empty slot={} seq_len={}",
+                        a.seq.slot_idx,
+                        a.seq.seq_len
                     );
                 }
                 Err(e) => {
@@ -323,6 +336,7 @@ pub fn step_mtp(
             tracing::error!("bootstrap start_checkpoint_async: {e:#}");
         }
     }
+    verify_idxs.extend(late_dflash);
 
     // ── Phase B: Verify with pipelined checkpoint ──
     //
@@ -331,18 +345,26 @@ pub fn step_mtp(
     // puts >= 2 verify-ready sequences in one step (`ATLAS_MTP_MAX_SEQS=1`
     // ⇒ this partition is a no-op and every seq takes the per-seq loop
     // below, byte-identical to the pre-batched HEAD). Batchable =
-    // grammarless, non-DFlash, >= ladder_nd pending drafts (surplus from a
-    // ladder step-down is truncated — the same draft-tail truncation the
-    // grammar-boundary path already does; `after_verify`'s
-    // `last_num_drafted` trim contract stays consistent). The model
-    // additionally self-gates (non-EP, non-HSS, no LoRA) via
-    // `can_batch_verify(&ks)`. Kill switch `ATLAS_NO_MTP_BATCH_VERIFY`
-    // (PRESENCE check) forces the serialized loop for A/B.
+    // Batchable = grammarless, >= ladder_nd pending drafts. DSpark is
+    // included unless ATLAS_NO_DFLASH_BATCH_VERIFY (presence). MTP still
+    // uses !dflash via the model self-gate (`dflash_hidden_save`).
     let mut serial_idxs: Vec<usize> = Vec::new();
     let mut batchable_idxs: Vec<usize> = Vec::new();
+    let dspark_batch_ok =
+        !dflash_verify_raw_argmax || !dspark_batch_verify_disabled();
+    if active.len() > 1 {
+        tracing::info!(
+            "DFLASH WIDTH n_active={} verify={} boot={} dspark_batch_ok={} ladder_nd={}",
+            active.len(),
+            verify_idxs.len(),
+            bootstrap_idxs.len(),
+            dspark_batch_ok,
+            ladder_nd
+        );
+    }
     if verify_idxs.len() >= 2
         && spark_model::speculative::mtp_multi_seq_mode()
-        && !dflash_verify_raw_argmax
+        && dspark_batch_ok
         && !batch_verify_disabled()
         && ladder_nd >= 1
     {
@@ -425,7 +447,19 @@ pub fn step_mtp(
             });
             let sorted_ks: Vec<usize> = refs.iter().map(|&(_, k)| k).collect();
             let mut batch: Vec<&mut ActiveSeq> = refs.into_iter().map(|(a, _)| a).collect();
-            step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
+            if dflash_verify_raw_argmax {
+                step_verify_dflash_batched(
+                    model,
+                    &mut batch,
+                    sched,
+                    &sorted_ks,
+                    ladder_nd,
+                    verify_ctx,
+                    dflash_verify_raw_argmax,
+                );
+            } else {
+                step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
+            }
         } else {
             // Model can't batch this width (or a lone leftover): fall back
             // to the existing per-seq dispatch for these sequences.

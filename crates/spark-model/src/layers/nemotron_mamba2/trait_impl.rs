@@ -254,6 +254,21 @@ impl TransformerLayer for NemotronMamba2Layer {
         Ok(())
     }
 
+    fn decode_verify_multi<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        n_seqs: usize,
+        ks: &[usize],
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _wy_tables: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_verify_multi_loop(hidden, residual, n_seqs, ks, states, ctx, stream)
+    }
+
     fn prefill(
         &self,
         hidden: DevicePtr,

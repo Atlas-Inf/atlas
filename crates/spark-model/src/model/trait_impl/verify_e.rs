@@ -55,21 +55,33 @@ impl TransformerModel {
     /// outside falls back to the per-seq loop.
     pub(super) fn can_batch_verify_dispatch(&self, ks: &[usize]) -> bool {
         let n = ks.len();
-        (2..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
+        let ok = (2..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
             && ks.iter().all(|k| (2..=4).contains(k))
             && ks.iter().sum::<usize>() <= super::verify_e2::VERIFY_ROW_CAP
             && self.comm.is_none()
             && self.lora.is_none()
-            && self.dflash_hidden_save.is_none()
+            && (self.dflash_hidden_save.is_none()
+                || std::env::var("ATLAS_NO_DFLASH_BATCH_VERIFY").is_err())
             && !self.verify_hidden_stash.is_null()
-            // HSS: the paged-decode kernel reads HBM only, missing on-disk
-            // history (see verify_c2's HSS fallback) — batched path unsupported.
             && self
                 .kv_cache
                 .lock()
                 .config()
                 .cache_blocks_per_seq
-                .is_none()
+                .is_none();
+        if !ok {
+            tracing::info!(
+                "can_batch_verify n={} ks={:?} stash_null={} dflash_save={} hss={:?} comm={} lora={}",
+                n,
+                ks,
+                self.verify_hidden_stash.is_null(),
+                self.dflash_hidden_save.is_some(),
+                self.kv_cache.lock().config().cache_blocks_per_seq,
+                self.comm.is_some(),
+                self.lora.is_some(),
+            );
+        }
+        ok
     }
 
     /// Batched K-row verify for `n = seqs.len()` sequences (R = Σ ks rows,

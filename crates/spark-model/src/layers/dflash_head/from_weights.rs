@@ -27,6 +27,7 @@ impl BlockDiffusionDraftHead {
         window_size: Option<usize>,
         gpu: &dyn GpuBackend,
         max_seq_len: usize,
+        max_batch_size: usize,
     ) -> Result<Self> {
         let embed_tokens_shared = weights
             .embed_tokens
@@ -102,7 +103,14 @@ impl BlockDiffusionDraftHead {
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         };
-        let num_blocks = (max_seq_len + gamma_val + 1) / block_size + 1;
+        let per_seq_blocks = (window_size.unwrap_or(max_seq_len) + gamma_val + 1) / block_size + 1;
+        let num_blocks = per_seq_blocks * max_batch_size.max(1);
+        tracing::info!(
+            "DFlash KV pool: {} blocks ({} per seq × batch {})",
+            num_blocks,
+            per_seq_blocks,
+            max_batch_size.max(1)
+        );
         let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
 
         // Resolve kernel handles. All BF16 paths since drafter weights are

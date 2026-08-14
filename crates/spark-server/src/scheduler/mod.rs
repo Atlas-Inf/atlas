@@ -63,6 +63,7 @@ mod test_support;
 mod think_skip_tests;
 mod types;
 mod verify_dflash_step;
+mod verify_dflash_batch_step;
 mod verify_k2_step;
 mod verify_k3_step;
 mod verify_k4_batch_step;
@@ -98,6 +99,7 @@ use spec_step::*;
 use ssm_decode_ring::SsmDecodeRing;
 use types::*;
 use verify_dflash_step::*;
+use verify_dflash_batch_step::*;
 use verify_k2_step::*;
 use verify_k3_step::*;
 use verify_k4_batch_step::*;
@@ -706,10 +708,12 @@ pub fn run(
                     // n==1 `all()` over one element is exactly the old
                     // predicate, so the single-sequence path is unchanged.
                     active.iter().all(|a| {
-                        ((dflash_spec_think && a.output_tokens.len() as u32 >= dflash_resume_guard)
-                            || (!a.inside_thinking && a.post_think_emitted >= dflash_resume_guard))
-                            && !a.suppress_tool_call
-                            && !a.disable_mtp
+                        let think_ok = dflash_verify_raw_argmax
+                            || (dflash_spec_think
+                                && a.output_tokens.len() as u32 >= dflash_resume_guard)
+                            || (!a.inside_thinking
+                                && a.post_think_emitted >= dflash_resume_guard);
+                        think_ok && !a.suppress_tool_call && !a.disable_mtp
                     })
                 )
             {

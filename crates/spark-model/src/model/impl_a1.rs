@@ -380,16 +380,13 @@ impl TransformerModel {
         // the K-vs-batch ladder envelope, SSOT in `crate::layer`). Only
         // meaningful with an MTP proposer — NULL otherwise (the batched
         // verify path self-gates on it via can_batch_verify).
-        let verify_hidden_stash = if proposer.is_some() {
-            gpu.alloc(crate::layer::VERIFY_WY_TABLE_SEQS * config.hidden_size * 2)?
-        } else {
-            DevicePtr::NULL
-        };
-        // Batched-verify WY pointer-table staging (fixed address for CUDA
-        // graph stability; contents refreshed pre-graph every batched verify
-        // step). One [h|Hi0|Hi1|Hi2] x 4-entry slice per GDN layer — ~6 KB.
-        // NULL without an MTP proposer or on non-SSM models (path self-gates).
-        let verify_wy_tables = if proposer.is_some() && config.num_ssm_layers() > 0 {
+        // Always allocate: DSpark is attached after construct on Lightning, so
+        // `proposer.is_some()` here is often false and used to leave the stash
+        // NULL — which made can_batch_verify refuse N-seq DSpark. 32×H BF16
+        // is ~168 KB.
+        let verify_hidden_stash =
+            gpu.alloc(crate::layer::VERIFY_WY_TABLE_SEQS * config.hidden_size * 2)?;
+        let verify_wy_tables = if config.num_ssm_layers() > 0 {
             let bytes = config.num_ssm_layers() * crate::layer::VERIFY_WY_LAYER_STRIDE_BYTES;
             let buf = gpu.alloc(bytes)?;
             gpu.memset(buf, 0, bytes)?;

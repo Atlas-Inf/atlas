@@ -282,6 +282,23 @@ impl TransformerLayer for NemotronMoeLayer {
         self.decode_batched_direct(hidden, residual, num_tokens, ctx, stream)
     }
 
+    fn decode_verify_multi<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        n_seqs: usize,
+        ks: &[usize],
+        _states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _wy_tables: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(ks.len() == n_seqs, "decode_verify_multi: ks/n mismatch");
+        let num_tokens: usize = ks.iter().sum();
+        self.decode_batched_direct(hidden, residual, num_tokens, ctx, stream)
+    }
+
     /// Batched MoE prefill: uses GEMM for gate/fc1/fc2/shared, per-token for routing + experts.
     ///
     /// For Super 120B with 40 MoE layers, this replaces O(N * 7 kernel_launches) decode calls
