@@ -34,6 +34,16 @@ pub(super) struct MarlinSidecar {
     pub lin_down_k: KernelHandle,
     pub lin_up_out: DevicePtr,
     pub lin_dn_out: DevicePtr,
+    pub pack_k: KernelHandle,
+    pub scatter_k: KernelHandle,
+    pub slot_up_k: KernelHandle,
+    pub slot_dn_k: KernelHandle,
+    pub slot_eids: DevicePtr,
+    pub slot_map: DevicePtr,
+    pub slot_a: DevicePtr,
+    pub slot_up: DevicePtr,
+    pub slot_dn: DevicePtr,
+    pub slot_bars: DevicePtr,
     pub align_k: KernelHandle,
     pub repeat_k: KernelHandle,
     pub up_n: i32,
@@ -235,6 +245,16 @@ impl MarlinSidecar {
             crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_m8");
         let lin_down =
             crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_m8_k64n128");
+        let slot_up =
+            crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_m8_allslots");
+        let slot_dn = crate::layers::try_kernel(
+            gpu,
+            "marlin_nvfp4_gemm",
+            "atlas_marlin_nvfp4_m8_k64n128_allslots",
+        );
+        let pack = crate::layers::try_kernel(gpu, "marlin_pack_slots", "atlas_marlin_pack_slots");
+        let scatter =
+            crate::layers::try_kernel(gpu, "marlin_scatter_slots", "atlas_marlin_scatter_slots");
         let repack = crate::layers::try_kernel(gpu, "marlin_repack", "atlas_marlin_repack_w4");
         let align = crate::layers::try_kernel(gpu, "marlin_align", "atlas_marlin_align_block8");
         let repeat = crate::layers::try_kernel(gpu, "marlin_row_repeat", "atlas_row_repeat_bf16");
@@ -293,8 +313,8 @@ impl MarlinSidecar {
             down_w,
             down_s,
             down_gs,
-            locks: gpu.alloc(SMS as usize * 4 * 4)?,
-            c_tmp: gpu.alloc(16 * down_n.max(up_n) * 4)?,
+            locks: gpu.alloc(32 * SMS as usize * 4 * 4)?,
+            c_tmp: gpu.alloc(32 * 16 * down_n.max(up_n) * 4)?,
             sorted_ids: gpu.alloc(SORTED_CAP * 4)?,
             expert_ids: gpu.alloc(256 * 4)?,
             n_post: gpu.alloc(4)?,
@@ -305,6 +325,16 @@ impl MarlinSidecar {
             lin_down_k: lin_down,
             lin_up_out: gpu.alloc(8 * up_n * 2)?,
             lin_dn_out: gpu.alloc(8 * down_n * 2)?,
+            pack_k: pack,
+            scatter_k: scatter,
+            slot_up_k: slot_up,
+            slot_dn_k: slot_dn,
+            slot_eids: gpu.alloc(32 * 4)?,
+            slot_map: gpu.alloc(32 * 8 * 4)?,
+            slot_a: gpu.alloc(32 * 8 * up_k * 2)?,
+            slot_up: gpu.alloc(32 * 8 * up_n * 2)?,
+            slot_dn: gpu.alloc(32 * 8 * down_n * 2)?,
+            slot_bars: gpu.alloc(32 * 4)?,
             align_k: align,
             repeat_k: repeat,
             up_n: up_n as i32,
@@ -325,10 +355,11 @@ impl NemotronMoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // Grouped is graph-safe but NOT KEEP (canary garbage even after sentinel).
-        // Linear is eager KEEP. Default linear; grouped behind ATLAS_MOE_MARLIN_GROUPED=1.
-        if std::env::var_os("ATLAS_MOE_MARLIN_GROUPED").is_none() {
+        if std::env::var_os("ATLAS_MOE_MARLIN_LINEAR").is_some() {
             return self.decode_batched_marlin_linear(hidden, residual, num_tokens, ctx, stream);
+        }
+        if std::env::var_os("ATLAS_MOE_MARLIN_GROUPED").is_none() {
+            return self.decode_batched_marlin_slots(hidden, residual, num_tokens, ctx, stream);
         }
         let Some(m) = self.marlin.as_ref() else {
             bail!("marlin sidecar missing");
