@@ -27,7 +27,9 @@ impl NemotronMamba2Layer {
             states.len() == n_seqs && ks.len() == n_seqs,
             "decode_verify_multi: states/ks/n mismatch"
         );
-        if std::env::var("ATLAS_DFLASH_MAMBA_MULTI_LOOP").is_ok() {
+        if std::env::var("ATLAS_DFLASH_MAMBA_MULTI_FUSED").is_ok() {
+            self.decode_verify_multi_fused(hidden, residual, n_seqs, ks, states, ctx, stream)
+        } else {
             let h = ctx.config.hidden_size;
             let bf16 = 2usize;
             let mut off = 0usize;
@@ -44,9 +46,8 @@ impl NemotronMamba2Layer {
                 )?;
                 off += k;
             }
-            return Ok(());
+            Ok(())
         }
-        self.decode_verify_multi_fused(hidden, residual, n_seqs, ks, states, ctx, stream)
     }
 
     fn decode_verify_multi_fused<'a, 'b: 'a>(

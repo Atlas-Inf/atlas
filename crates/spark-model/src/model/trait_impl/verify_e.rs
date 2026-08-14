@@ -426,6 +426,8 @@ impl TransformerModel {
                     )?;
                 }
 
+                self.try_dflash_capture_batched(layer_idx, ks, &off, stream)?;
+
                 if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                     anyhow::bail!(
                         "K4_DIAG(batched): CUDA error after layer {layer_idx} ({layer_type:?}): {e:#}"

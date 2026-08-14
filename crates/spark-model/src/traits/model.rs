@@ -832,6 +832,12 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Compact batched UNIFIED_CTX capture for `seq_i` to the C=1 front
+    /// of `dflash_hidden_save` so `commit_ctx` can run unchanged.
+    fn pack_dflash_save_seq(&self, _seq_i: usize, _k: usize, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Run the MTP proposer for one draft token off the saved hidden state.
     /// `None` when no proposer is wired.
     fn run_mtp_propose(

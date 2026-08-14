@@ -78,6 +78,8 @@ pub(super) fn step_verify_dflash_batched(
         verify_ms
     );
 
+    let mut verifieds: Vec<Vec<u32>> = Vec::with_capacity(n);
+    let mut accepts: Vec<usize> = Vec::with_capacity(n);
     for i in 0..n {
         let a = &mut batch[i];
         let drafts = &drafts_per_seq[i];
@@ -89,15 +91,120 @@ pub(super) fn step_verify_dflash_batched(
                 model, raw, a, verify_ctx, off[i],
             )
         };
+        let mut num_accepted = 0usize;
+        for j in 0..drafts.len() {
+            if j + 1 >= verified.len() {
+                break;
+            }
+            if drafts[j] == verified[j] {
+                num_accepted += 1;
+            } else {
+                break;
+            }
+        }
+        accepts.push(num_accepted);
+        verifieds.push(verified);
+    }
+    tracing::info!(
+        "DFLASH BATCHED verify n={n} R={} {:.1}ms accept={:?}",
+        acc,
+        verify_ms,
+        accepts
+    );
+    let stash_rows: Vec<usize> = accepts
+        .iter()
+        .enumerate()
+        .map(|(i, &acc_n)| off[i] + acc_n)
+        .collect();
+    if let Err(e) = model.stash_verify_hidden_rows(&stash_rows, 0) {
+        tracing::error!("stash_verify_hidden_rows (dflash): {e:#}");
+    }
+    for i in 0..n {
+        if let Err(e) = model.pack_dflash_save_seq(i, ks[i], 0) {
+            tracing::error!("pack_dflash_save_seq({i}): {e:#}");
+        }
         apply_dflash_accept(
             model,
-            a,
+            batch[i],
             sched,
-            drafts,
-            &verified,
+            &drafts_per_seq[i],
+            &verifieds[i],
             propose_nd,
             dflash_verify_raw_argmax,
         );
+    }
+    let pending: Vec<usize> = (0..n)
+        .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty())
+        .collect();
+    if pending.len() >= 2 {
+        let tokens: Vec<u32> = pending.iter().map(|&i| batch[i].last_token).collect();
+        let positions: Vec<usize> = pending.iter().map(|&i| batch[i].seq.seq_len).collect();
+        let stash_idx: Vec<usize> = pending.clone();
+        let result = {
+            let mut seq_refs: Vec<&mut SequenceState> = Vec::with_capacity(pending.len());
+            let mut it = batch.iter_mut();
+            let mut prev = 0usize;
+            for (j, &i) in pending.iter().enumerate() {
+                let step = if j == 0 { i } else { i - prev - 1 };
+                seq_refs.push(&mut it.nth(step).expect("pending in batch").seq);
+                prev = i;
+            }
+            model.run_mtp_propose_batched(
+                &tokens,
+                &positions,
+                &stash_idx,
+                propose_nd,
+                &mut seq_refs,
+                0,
+                None,
+            )
+        };
+        match result {
+            Ok(Some(all)) => {
+                for (j, &i) in pending.iter().enumerate() {
+                    if !all[j].is_empty() {
+                        batch[i].pending_drafts = all[j].clone();
+                    }
+                }
+            }
+            Ok(None) | Err(_) => {
+                for &i in &pending {
+                    if let Err(e) = model.save_hidden_for_mtp_from_stash(i, 0) {
+                        tracing::error!("save_hidden_for_mtp_from_stash({i}): {e:#}");
+                        continue;
+                    }
+                    match model.run_mtp_propose_multi(
+                        batch[i].last_token,
+                        batch[i].seq.seq_len,
+                        propose_nd,
+                        &mut batch[i].seq,
+                        0,
+                        None,
+                    ) {
+                        Ok(d) if !d.is_empty() => batch[i].pending_drafts = d,
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("run_mtp_propose_multi fallback: {e:#}"),
+                    }
+                }
+            }
+        }
+    } else if let Some(&i) = pending.first() {
+        if let Err(e) = model.save_hidden_for_mtp_from_stash(i, 0) {
+            tracing::error!("save_hidden_for_mtp_from_stash({i}): {e:#}");
+        } else {
+            match model.run_mtp_propose_multi(
+                batch[i].last_token,
+                batch[i].seq.seq_len,
+                propose_nd,
+                &mut batch[i].seq,
+                0,
+                None,
+            ) {
+                Ok(d) if !d.is_empty() => batch[i].pending_drafts = d,
+                Ok(_) => {}
+                Err(e) => tracing::error!("run_mtp_propose_multi: {e:#}"),
+            }
+        }
     }
 }
 
@@ -109,7 +216,7 @@ pub(super) fn apply_dflash_accept(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     drafts: &[u32],
     verified: &[u32],
-    num_drafts: usize,
+    _num_drafts: usize,
     _dflash_verify_raw_argmax: bool,
 ) {
     let mut num_accepted = 0usize;
@@ -184,20 +291,6 @@ pub(super) fn apply_dflash_accept(
     if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
         tracing::error!("trim_proposer_state (dflash batched): {e:#}");
     }
-
-    let _gmask = mtp_grammar_mask_for(a);
-    if crate::scheduler::adaptive_spec::spec_allowed(a, sched) {
-        match model.run_mtp_propose_multi(
-            a.last_token,
-            a.seq.seq_len,
-            num_drafts,
-            &mut a.seq,
-            0,
-            _gmask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => tracing::error!("run_mtp_propose_multi (dflash batched): {e:#}"),
-        }
-    }
+    // Propose is deferred to step_verify_dflash_batched so every seq
+    // uses stash hiddens + eager propose_batch (no shared-graph clobber).
 }

@@ -453,15 +453,22 @@ impl TransformerModel {
         } else {
             dflash_kgamma.max(2)
         };
+        let dflash_hidden_save_nseq = if dflash_capture_layers.is_empty() {
+            0
+        } else {
+            max_batch_size.max(1)
+        };
         let dflash_hidden_save = if dflash_capture_layers.is_empty() {
             None
         } else {
             let n = dflash_capture_layers.len();
-            // Row-major K-row buffer: [row0 | row1 | ... | row_{KMAX-1}], each row =
-            // n_capture * hidden_size * bf16. Rows 0/1 keep their legacy offsets
-            // (0 and ctx_slot_bytes) so all K=2 readers (propose row 0,
-            // dflash_accept_append row 1) are unaffected.
-            Some(gpu.alloc(dflash_hidden_save_rows * n * config.hidden_size * 2)?)
+            Some(gpu.alloc(
+                dflash_hidden_save_nseq
+                    * dflash_hidden_save_rows
+                    * n
+                    * config.hidden_size
+                    * 2,
+            )?)
         };
 
         // EP command buffer for token broadcast (4 bytes, u32)
@@ -749,6 +756,7 @@ impl TransformerModel {
             mtp_store_range: parking_lot::Mutex::new((0, 0)),
             dflash_hidden_save,
             dflash_hidden_save_rows,
+            dflash_hidden_save_nseq,
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),

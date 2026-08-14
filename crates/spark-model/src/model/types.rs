@@ -275,6 +275,8 @@ pub struct TransformerModel {
     /// `try_dflash_capture_all` must never write past this many rows. Single
     /// source of truth for the buffer's KMAX; 0 when DFlash is disabled.
     pub(super) dflash_hidden_save_rows: usize,
+    /// How many sequences the capture buffer is strided for (1 = C=1 layout).
+    pub(super) dflash_hidden_save_nseq: usize,
     /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
     /// Same rationale as `decode_graph`: the captured graph has SSM
     /// h_state/conv_state pointers baked in as kernel arguments, so replay for

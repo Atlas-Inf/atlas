@@ -558,6 +558,54 @@ impl DraftProposer for BlockDiffusionDraftHead {
         )
     }
 
+    fn propose_batch(
+        &self,
+        last_tokens: &[u32],
+        target_hiddens: &[spark_runtime::gpu::DevicePtr],
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn crate::speculative::ProposerState],
+        ctx: &crate::layer::ForwardContext,
+        stream: u64,
+        _out_conf: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        let n = last_tokens.len();
+        if n < 2
+            || target_hiddens.len() != n
+            || positions.len() != n
+            || states.len() != n
+        {
+            return Ok(None);
+        }
+        // Shared piecewise propose graphs bake one seq's KV pointers.
+        // Eager per seq until graphs are slot-keyed.
+        let prev = self
+            .suppress_graphs
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        let mut out = Vec::with_capacity(n);
+        let result = (|| -> Result<Vec<Vec<u32>>> {
+            for i in 0..n {
+                let drafts = self.propose_drafts(
+                    last_tokens[i],
+                    target_hiddens[i],
+                    positions[i],
+                    num_drafts,
+                    states[i],
+                    ctx,
+                    stream,
+                    None,
+                    None,
+                    Some(target_hiddens[i]),
+                )?;
+                out.push(drafts);
+            }
+            Ok(out)
+        })();
+        self.suppress_graphs
+            .store(prev, std::sync::atomic::Ordering::Relaxed);
+        result.map(Some)
+    }
+
     fn after_verify(
         &self,
         num_accepted: usize,

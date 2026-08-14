@@ -470,4 +470,73 @@ impl TransformerModel {
         }
         Ok(())
     }
+
+    /// Batched UNIFIED_CTX capture: seq i owns rows
+    /// `[i * kmax, i * kmax + ks[i])` of `dflash_hidden_save`.
+    pub(super) fn try_dflash_capture_batched(
+        &self,
+        layer_idx: usize,
+        ks: &[usize],
+        off: &[usize],
+        stream: u64,
+    ) -> Result<()> {
+        let dst = match self.dflash_hidden_save {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if let Some(ref c) = self.comm
+            && c.rank() != 0
+        {
+            return Ok(());
+        }
+        let slot = match self
+            .dflash_capture_layers
+            .iter()
+            .position(|&l| l == layer_idx)
+        {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let h = self.config.hidden_size;
+        let bf16 = 2usize;
+        let ctx_slot_bytes = self.dflash_capture_layers.len() * h * bf16;
+        let kmax = self.dflash_hidden_save_rows;
+        let nseq = self.dflash_hidden_save_nseq;
+        let hidden = self.buffers.hidden_states();
+        for (i, &k) in ks.iter().enumerate() {
+            if i >= nseq {
+                break;
+            }
+            let seq_base = dst.offset(i * kmax * ctx_slot_bytes);
+            for t in 0..k.min(kmax) {
+                let src = hidden.offset((off[i] + t) * h * bf16);
+                let dst_slot = seq_base.offset(t * ctx_slot_bytes + slot * h * bf16);
+                self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compact seq `i`'s captured rows to the C=1 front of the save buffer
+    /// so existing `commit_ctx` readers stay unchanged.
+    pub(super) fn pack_dflash_save_seq(&self, seq_i: usize, k: usize, stream: u64) -> Result<()> {
+        let dst = match self.dflash_hidden_save {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if seq_i == 0 {
+            return Ok(());
+        }
+        let h = self.config.hidden_size;
+        let ctx_slot_bytes = self.dflash_capture_layers.len() * h * 2;
+        if ctx_slot_bytes == 0 {
+            return Ok(());
+        }
+        let kmax = self.dflash_hidden_save_rows;
+        let n = k.min(kmax);
+        let src = dst.offset(seq_i * kmax * ctx_slot_bytes);
+        self.gpu
+            .copy_d2d_async(src, dst, n * ctx_slot_bytes, stream)?;
+        Ok(())
+    }
 }
