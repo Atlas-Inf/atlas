@@ -452,8 +452,16 @@ impl TransformerLayer for NemotronMoeLayer {
         let weights_dev = scratch.offset(n as usize * top_k as usize * 4);
 
         // Sorted MoE prefill: sort tokens by expert, then grouped GEMM.
-        // This is the proven Qwen pattern — avoids the crashing batched UP/DOWN kernels.
+        // **G0 root cause (2026-08-14): this path produces WRONG expert
+        // outputs** — the model lost prompt context and reasoning (GSM8K
+        // 0/12, NIAH fail at 256, "My name is Nemotron" recall failures).
+        // vLLM (Marlin prefill) on the same checkpoint is correct. The
+        // per-token GEMV fallback restores the reference behavior
+        // (robe=3 bolts, 7394 recall, GSM8K step-by-step) — it is the
+        // DEFAULT. Sorted is opt-in (ATLAS_MOE_SORTED=1) until the
+        // sort/grouped-GEMM/unpermute chain is fixed.
         let use_sorted = use_batched_moe
+            && std::env::var("ATLAS_MOE_SORTED").is_ok()
             && self.moe_sort_k.0 != 0
             && self.moe_grouped_gemm_k.0 != 0
             && self.moe_unpermute_reduce_k.0 != 0;
