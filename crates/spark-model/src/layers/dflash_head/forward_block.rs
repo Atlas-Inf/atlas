@@ -840,13 +840,18 @@ impl BlockDiffusionDraftHead {
             let total_slots = num_layers * 2 + 1;
             let tail_slot = num_layers * 2;
 
-            let mut g = self.propose_graphs.lock();
-            let cached_ready = matches!(*g, Some(ref v) if v.len() == total_slots);
+            let graph_key = option_b_block_table
+                .map(|p| p.0)
+                .filter(|&k| k != 0)
+                .unwrap_or(0);
+            let mut gmap = self.propose_graphs.lock();
+            let cached_ready = gmap
+                .get(&graph_key)
+                .map(|v| graph_key != 0 && v.len() == total_slots)
+                .unwrap_or(false);
 
             if cached_ready {
-                // Hot replay path: launch each cached subgraph in order,
-                // running attention eagerly between pre and post.
-                let graphs = g.as_ref().unwrap();
+                let graphs = gmap.get(&graph_key).unwrap();
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let args = make_paged_args(layer_idx).expect("option_b args available");
 
@@ -890,7 +895,7 @@ impl BlockDiffusionDraftHead {
                     // empty-capture sentinel; we store the zero so the
                     // replay path falls back to eager for that slot.
                     tracing::info!(
-                        "DFlash piecewise capture: starting (warmup_count={}, target={}, slots={})",
+                        "DFlash piecewise capture: starting (key={graph_key:#x} warmup_count={}, target={}, slots={})",
                         warmed,
                         warmup_target,
                         total_slots
@@ -951,11 +956,13 @@ impl BlockDiffusionDraftHead {
 
                     let success_count = new_graphs.iter().filter(|g| g.0 != 0).count();
                     tracing::info!(
-                        "DFlash piecewise capture: complete ({}/{} subgraphs captured)",
+                        "DFlash piecewise capture: complete key={graph_key:#x} ({}/{} subgraphs captured)",
                         success_count,
                         total_slots
                     );
-                    *g = Some(new_graphs);
+                    if graph_key != 0 {
+                        gmap.insert(graph_key, new_graphs);
+                    }
                 }
             }
         } else {

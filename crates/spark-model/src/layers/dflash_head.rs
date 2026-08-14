@@ -17,6 +17,7 @@
 //! degenerates to single-token decode (acceptance ~100% but no speedup).
 
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::any::Any;
 
 use anyhow::Result;
@@ -469,7 +470,11 @@ pub struct BlockDiffusionDraftHead {
     /// with one capture per subgraph. Attention is NEVER captured —
     /// it's the natural sync barrier between captured subgraphs
     /// (vLLM piecewise convention). See design doc §15.
-    pub propose_graphs: Mutex<Option<Vec<spark_runtime::gpu::GraphHandle>>>,
+    /// Piecewise propose graphs, **keyed by this sequence's Option B
+    /// `block_table_dev` address**. A single `Option<Vec<GraphHandle>>`
+    /// baked one seq's KV pointers and made C>1 replay corrupt. `GraphHandle(0)`
+    /// is the empty-capture sentinel (replay eager for that subgraph).
+    pub propose_graphs: Mutex<HashMap<u64, Vec<spark_runtime::gpu::GraphHandle>>>,
     /// When set, all `forward_block` calls run eagerly. Mirrors target-model
     /// `TransformerModel::suppress_graphs` so external code can disable
     /// graphs at runtime (e.g. while calibrating FP8 KV).
@@ -577,33 +582,25 @@ impl DraftProposer for BlockDiffusionDraftHead {
         {
             return Ok(None);
         }
-        // Shared piecewise propose graphs bake one seq's KV pointers.
-        // Eager per seq until graphs are slot-keyed.
-        let prev = self
-            .suppress_graphs
-            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        // Per-seq piecewise graphs (keyed by block_table_dev). Do not
+        // suppress — that was the C>1 eager tax.
         let mut out = Vec::with_capacity(n);
-        let result = (|| -> Result<Vec<Vec<u32>>> {
-            for i in 0..n {
-                let drafts = self.propose_drafts(
-                    last_tokens[i],
-                    target_hiddens[i],
-                    positions[i],
-                    num_drafts,
-                    states[i],
-                    ctx,
-                    stream,
-                    None,
-                    None,
-                    Some(target_hiddens[i]),
-                )?;
-                out.push(drafts);
-            }
-            Ok(out)
-        })();
-        self.suppress_graphs
-            .store(prev, std::sync::atomic::Ordering::Relaxed);
-        result.map(Some)
+        for i in 0..n {
+            let drafts = self.propose_drafts(
+                last_tokens[i],
+                target_hiddens[i],
+                positions[i],
+                num_drafts,
+                states[i],
+                ctx,
+                stream,
+                None,
+                None,
+                Some(target_hiddens[i]),
+            )?;
+            out.push(drafts);
+        }
+        Ok(Some(out))
     }
 
     fn after_verify(
