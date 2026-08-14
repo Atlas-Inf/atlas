@@ -103,3 +103,57 @@ pub fn marlin_align_block8(
         .arg_i32(sorted_cap)
         .launch(stream)
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_moe_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b: DevicePtr,
+    c: DevicePtr,
+    c_tmp: DevicePtr,
+    scales: DevicePtr,
+    global_scale: DevicePtr,
+    sorted_ids: DevicePtr,
+    expert_ids: DevicePtr,
+    n_post: DevicePtr,
+    top_k: i32,
+    num_groups: i32,
+    prob_m: i32,
+    prob_n: i32,
+    prob_k: i32,
+    locks: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([SMS_DEFAULT, 1, 1])
+        .block([128, 1, 1])
+        .shared_mem(96 * 1024)
+        .arg_ptr(a)
+        .arg_ptr(b)
+        .arg_ptr(c)
+        .arg_ptr(c_tmp)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(scales)
+        .arg_ptr(global_scale)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(sorted_ids)
+        .arg_ptr(expert_ids)
+        .arg_ptr(n_post)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_i32(top_k)
+        .arg_i32(0)
+        .arg_i32(num_groups)
+        .arg_i32(prob_m)
+        .arg_i32(prob_n)
+        .arg_i32(prob_k)
+        .arg_ptr(locks)
+        .arg_i32(0)
+        .arg_i32(1)
+        .arg_i32(1)
+        .launch(stream)
+}
+
+const SMS_DEFAULT: u32 = 48;

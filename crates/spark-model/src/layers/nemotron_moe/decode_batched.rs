@@ -97,6 +97,9 @@ impl NemotronMoeLayer {
         }
 
         let expert_up_out = ctx.buffers.expert_up_out();
+        if self.marlin.is_some() {
+            return self.decode_batched_marlin(hidden, residual, num_tokens, ctx, stream);
+        }
         let grouped = n >= 2
             && self.moe_expert_gemv_wide_grouped_k.0 != 0
             && std::env::var("ATLAS_MOE_EXPERT_GROUPED").is_ok();

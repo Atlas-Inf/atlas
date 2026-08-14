@@ -103,6 +103,7 @@ pub struct NemotronMoeLayer {
     fp8_gemm_m128_k: KernelHandle,
     w4a4_gemm_k: KernelHandle,
     quantize_nvfp4_k: KernelHandle,
+    marlin: Option<marlin_sidecar::MarlinSidecar>,
 }
 
 impl NemotronMoeLayer {
@@ -145,6 +146,15 @@ impl NemotronMoeLayer {
             num_experts,
             crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
         );
+
+        let marlin = marlin_sidecar::MarlinSidecar::try_build(
+            gpu,
+            &weights.experts,
+            moe_inter,
+            config.hidden_size,
+            config.hidden_size,
+            moe_inter,
+        )?;
 
         Ok(Self {
             weights,
@@ -241,12 +251,14 @@ impl NemotronMoeLayer {
             fp8_gemm_m128_k: super::try_kernel(gpu, "w4a16", "fp8_gemm_t_m128_mfast"),
             w4a4_gemm_k: super::try_kernel(gpu, "w4a4", "w4a4_gemm_mfast"),
             quantize_nvfp4_k: super::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4"),
+            marlin,
         })
     }
 }
 
 mod decode_helpers;
 mod decode_batched;
+mod marlin_sidecar;
 mod prefill_fallback;
 mod prefill_shared_up;
 mod prefill_sorted;
