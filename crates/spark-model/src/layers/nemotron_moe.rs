@@ -54,6 +54,7 @@ pub struct NemotronMoeLayer {
     w8a16_gemm_k: KernelHandle,
     w8a16_gemm_pipelined_k: KernelHandle,
     relu2_down_shared_k: KernelHandle,
+    relu2_down_wide_k: KernelHandle,
     weighted_sum_scale_k: KernelHandle,
     residual_add_k: KernelHandle,
     // Kernel handles — prefill (batched GEMM)
@@ -168,6 +169,11 @@ impl NemotronMoeLayer {
                 "w8a16_gemm_pipelined",
             ),
             relu2_down_shared_k: gpu.kernel("moe_relu2_fused", "moe_expert_relu2_down_shared")?,
+            relu2_down_wide_k: super::try_kernel(
+                gpu,
+                "moe_expert_relu2_down_wide",
+                "moe_expert_relu2_down_wide",
+            ),
             weighted_sum_scale_k: gpu.kernel("relu2", "moe_weighted_sum_scale")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,

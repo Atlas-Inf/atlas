@@ -155,27 +155,53 @@ impl NemotronMoeLayer {
         let expert_down_out = ctx.buffers.expert_down_out();
         let shared_down = ctx.buffers.ssm_deinterleaved();
         let smem = (shared_inter.max(inter) as usize) * 4;
-        KernelLaunch::new(ctx.gpu, self.relu2_down_shared_k)
-            .grid([div_ceil(h as u32, 8), top_k + 1, n])
-            .block([128, 1, 1])
-            .shared_mem(smem as u32)
-            .arg_ptr(expert_up_out)
-            .arg_ptr(self.down_ptrs.packed_ptrs)
-            .arg_ptr(self.down_ptrs.scale_ptrs)
-            .arg_ptr(self.down_ptrs.scale2_vals)
-            .arg_ptr(expert_down_out)
-            .arg_ptr(indices)
-            .arg_ptr(shared_up)
-            .arg_ptr(self.weights.shared_down.weight)
-            .arg_ptr(self.weights.shared_down.weight_scale)
-            .arg_f32(self.weights.shared_down.weight_scale_2)
-            .arg_ptr(shared_down)
-            .arg_u32(h as u32)
-            .arg_u32(inter)
-            .arg_u32(shared_inter)
-            .arg_u32(h as u32)
-            .arg_u32(top_k)
-            .launch(stream)?;
+        let down_wide = self.relu2_down_wide_k.0 != 0
+            && std::env::var("ATLAS_NO_MOE_DOWN_WIDE").is_err();
+        if down_wide {
+            KernelLaunch::new(ctx.gpu, self.relu2_down_wide_k)
+                .grid([div_ceil(h as u32, 32), top_k + 1, n])
+                .block([256, 1, 1])
+                .shared_mem(smem as u32)
+                .arg_ptr(expert_up_out)
+                .arg_ptr(self.down_ptrs.packed_ptrs)
+                .arg_ptr(self.down_ptrs.scale_ptrs)
+                .arg_ptr(self.down_ptrs.scale2_vals)
+                .arg_ptr(expert_down_out)
+                .arg_ptr(indices)
+                .arg_ptr(shared_up)
+                .arg_ptr(self.weights.shared_down.weight)
+                .arg_ptr(self.weights.shared_down.weight_scale)
+                .arg_f32(self.weights.shared_down.weight_scale_2)
+                .arg_ptr(shared_down)
+                .arg_u32(h as u32)
+                .arg_u32(inter)
+                .arg_u32(shared_inter)
+                .arg_u32(h as u32)
+                .arg_u32(top_k)
+                .launch(stream)?;
+        } else {
+            KernelLaunch::new(ctx.gpu, self.relu2_down_shared_k)
+                .grid([div_ceil(h as u32, 8), top_k + 1, n])
+                .block([128, 1, 1])
+                .shared_mem(smem as u32)
+                .arg_ptr(expert_up_out)
+                .arg_ptr(self.down_ptrs.packed_ptrs)
+                .arg_ptr(self.down_ptrs.scale_ptrs)
+                .arg_ptr(self.down_ptrs.scale2_vals)
+                .arg_ptr(expert_down_out)
+                .arg_ptr(indices)
+                .arg_ptr(shared_up)
+                .arg_ptr(self.weights.shared_down.weight)
+                .arg_ptr(self.weights.shared_down.weight_scale)
+                .arg_f32(self.weights.shared_down.weight_scale_2)
+                .arg_ptr(shared_down)
+                .arg_u32(h as u32)
+                .arg_u32(inter)
+                .arg_u32(shared_inter)
+                .arg_u32(h as u32)
+                .arg_u32(top_k)
+                .launch(stream)?;
+        }
 
         let output = ctx.buffers.moe_output();
         for t in 0..num_tokens {
