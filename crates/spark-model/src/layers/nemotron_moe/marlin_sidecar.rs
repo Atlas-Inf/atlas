@@ -30,6 +30,10 @@ pub(super) struct MarlinSidecar {
     pub a_exp: DevicePtr,
     pub moe_up_k: KernelHandle,
     pub moe_down_k: KernelHandle,
+    pub lin_up_k: KernelHandle,
+    pub lin_down_k: KernelHandle,
+    pub lin_up_out: DevicePtr,
+    pub lin_dn_out: DevicePtr,
     pub align_k: KernelHandle,
     pub repeat_k: KernelHandle,
     pub up_n: i32,
@@ -227,11 +231,15 @@ impl MarlinSidecar {
             crate::layers::try_kernel(gpu, "marlin_moe_nvfp4", "atlas_marlin_moe_nvfp4_m8");
         let moe_down =
             crate::layers::try_kernel(gpu, "marlin_moe_nvfp4", "atlas_marlin_moe_nvfp4_m8_k64n128");
+        let lin_up =
+            crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_m8");
+        let lin_down =
+            crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_m8_k64n128");
         let repack = crate::layers::try_kernel(gpu, "marlin_repack", "atlas_marlin_repack_w4");
         let align = crate::layers::try_kernel(gpu, "marlin_align", "atlas_marlin_align_block8");
         let repeat = crate::layers::try_kernel(gpu, "marlin_row_repeat", "atlas_row_repeat_bf16");
-        if moe_up.0 == 0 || moe_down.0 == 0 || repack.0 == 0 || align.0 == 0 || repeat.0 == 0 {
-            tracing::warn!("ATLAS_MOE_MARLIN set but kernels missing; leaving GEMV");
+        if lin_up.0 == 0 || lin_down.0 == 0 || repack.0 == 0 {
+            tracing::warn!("ATLAS_MOE_MARLIN set but linear kernels missing; leaving GEMV");
             return Ok(None);
         }
         let e = experts.len();
@@ -291,6 +299,10 @@ impl MarlinSidecar {
             a_exp: gpu.alloc(16 * 6 * up_k * 2)?,
             moe_up_k: moe_up,
             moe_down_k: moe_down,
+            lin_up_k: lin_up,
+            lin_down_k: lin_down,
+            lin_up_out: gpu.alloc(8 * up_n * 2)?,
+            lin_dn_out: gpu.alloc(8 * down_n * 2)?,
             align_k: align,
             repeat_k: repeat,
             up_n: up_n as i32,
@@ -311,6 +323,8 @@ impl NemotronMoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        return self.decode_batched_marlin_linear(hidden, residual, num_tokens, ctx, stream);
+        #[allow(unreachable_code)]
         let Some(m) = self.marlin.as_ref() else {
             bail!("marlin sidecar missing");
         };

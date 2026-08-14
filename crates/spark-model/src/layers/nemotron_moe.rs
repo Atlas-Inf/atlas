@@ -259,6 +259,7 @@ impl NemotronMoeLayer {
 mod decode_helpers;
 mod decode_batched;
 mod marlin_sidecar;
+mod marlin_linear;
 mod prefill_fallback;
 mod prefill_shared_up;
 mod prefill_sorted;
