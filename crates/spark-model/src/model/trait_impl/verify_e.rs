@@ -321,15 +321,26 @@ impl TransformerModel {
             if graph.0 != 0 {
                 self.gpu.launch_graph(graph, stream)?;
             }
-            if time_layers {
-                tracing::info!("DFLASH BATCHED_GRAPH n={n} R={r_total} hit=1");
-            }
+            let slots: Vec<u32> = seqs
+                .iter()
+                .filter_map(|s| s.ssm_slot_idx().map(|x| x as u32))
+                .collect();
+            tracing::info!(
+                "DFLASH BATCHED_GRAPH n={n} R={r_total} hit=1 graphs_on={graphs_on} ks={ks:?} slots={slots:?}"
+            );
         } else {
             // First step for this (slot vector, k) key (or graphs off): run
             // the body, capturing. A full cache no longer disables capture —
             // the LRU entry is destroyed at insert time (see below), so
             // slot-vector churn can never push the path permanently eager.
             let capture = graphs.is_some();
+            let slots: Vec<u32> = seqs
+                .iter()
+                .filter_map(|s| s.ssm_slot_idx().map(|x| x as u32))
+                .collect();
+            tracing::info!(
+                "DFLASH BATCHED_GRAPH n={n} R={r_total} hit=0 graphs_on={graphs_on} capture={capture} ks={ks:?} slots={slots:?}"
+            );
 
             let ctx = ForwardContext {
                 buffers: &self.buffers,
