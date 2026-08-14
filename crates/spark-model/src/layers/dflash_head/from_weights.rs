@@ -212,6 +212,7 @@ impl BlockDiffusionDraftHead {
                 "w4a16",
                 "fp8_gemm_t_row_scaled_m16",
             ),
+            w4a16_gemv_batch4: crate::layers::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch4"),
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.
@@ -493,6 +494,13 @@ impl BlockDiffusionDraftHead {
                     gate_proj_fp8: None,
                     up_proj_fp8: None,
                     down_proj_fp8: None,
+                    q_proj_nvfp4: None,
+                    k_proj_nvfp4: None,
+                    v_proj_nvfp4: None,
+                    o_proj_nvfp4: None,
+                    gate_proj_nvfp4: None,
+                    up_proj_nvfp4: None,
+                    down_proj_nvfp4: None,
                 })
                 .collect(),
             // Phase 2 stage 2: fused KV weight built above by copy_d2d
@@ -643,6 +651,7 @@ impl BlockDiffusionDraftHead {
             );
         }
 
+        head.try_install_nvfp4(gpu)?;
         Ok(head)
     }
 

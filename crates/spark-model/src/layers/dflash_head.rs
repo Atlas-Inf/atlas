@@ -93,6 +93,7 @@ pub struct DflashKernels {
     /// for `fp8_gemm_n128_row_scaled` when M=γ=16. Single warp per CTA,
     /// no wasted M_TILE rows. Used by the lm_head GEMM.
     pub fp8_gemm_n128_row_scaled_m16: KernelHandle,
+    pub w4a16_gemv_batch4: KernelHandle,
 }
 
 /// Per-step scratch buffers for the γ-block forward.
@@ -168,6 +169,10 @@ pub enum DflashQuantization {
     /// f32 scales at model load. Activations stay BF16; KV cache stays
     /// BF16. GEMMs use `fp8_gemm_n128` (BF16 × FP8 → BF16).
     Fp8Weights,
+    /// Weight-only NVFP4: same seven GEMMs quantized at load, consumed by
+    /// `w4a16_gemv_batch4` at γ≤4 (small-M, no tile waste). Default on;
+    /// `ATLAS_NO_DFLASH_DRAFTER_NVFP4` to keep BF16 pipelined GEMM.
+    Nvfp4Weights,
 }
 
 /// Per-drafter-layer Qwen3-style weights. Phase 1 is BF16-only; **Phase G**
@@ -205,6 +210,13 @@ pub struct DflashLayer {
     pub gate_proj_fp8: Option<crate::weight_map::Fp8DenseWeight>,
     pub up_proj_fp8: Option<crate::weight_map::Fp8DenseWeight>,
     pub down_proj_fp8: Option<crate::weight_map::Fp8DenseWeight>,
+    pub q_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub k_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub v_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub o_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub gate_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub up_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub down_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
 }
 
 /// Per-sequence DFlash drafter state. One paged KV cache per drafter layer
@@ -471,6 +483,7 @@ mod forward_block_layer;
 mod markov;
 mod forward_block_layer_paged;
 mod from_weights;
+mod nvfp4;
 mod precompute_ctx_kv;
 mod propose;
 

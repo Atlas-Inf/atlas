@@ -212,38 +212,15 @@ impl BlockDiffusionDraftHead {
         // Per-row f32 scales (built at load time by quantize_bf16_to_fp8)
         // are applied inside the GEMM at write-out. Fp8 mirror None →
         // fall back to BF16 (defensive, shouldn't fire if G.2 ran).
-        let use_fp8 = matches!(self.quant, super::DflashQuantization::Fp8Weights);
         let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
                          w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
+                         w_nvfp4: &Option<crate::weight_map::QuantizedWeight>,
                          src: spark_runtime::gpu::DevicePtr,
                          dst: spark_runtime::gpu::DevicePtr,
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            if use_fp8 && let Some(fp8) = w_fp8 {
-                return ops::fp8_gemm_n128_row_scaled(
-                    gpu,
-                    self.kernels.fp8_gemm_n128_row_scaled,
-                    src,
-                    fp8,
-                    dst,
-                    g,
-                    n_out,
-                    k_in,
-                    stream,
-                );
-            }
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.kernels.dense_gemm_pipelined,
-                src,
-                w_bf16,
-                dst,
-                g,
-                n_out,
-                k_in,
-                stream,
-            )
+            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
         };
 
         // 3b-q / 3c-q. Q branch: q_proj then q_norm — faithful to dflash.py:68-70.
@@ -253,6 +230,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.q_proj,
             &layer.q_proj_fp8,
+            &layer.q_proj_nvfp4,
             self.scratch.norm_buf,
             self.scratch.q_buf,
             q_dim,
@@ -302,6 +280,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.k_proj,
             &layer.k_proj_fp8,
+            &layer.k_proj_nvfp4,
             self.scratch.norm_buf,
             self.scratch.k_buf,
             kv_dim,
@@ -347,6 +326,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.v_proj,
             &layer.v_proj_fp8,
+            &layer.v_proj_nvfp4,
             self.scratch.norm_buf,
             self.scratch.v_buf,
             kv_dim,
@@ -841,38 +821,15 @@ impl BlockDiffusionDraftHead {
         // Phase G — same swap helper as pre_attn (q/k/v). Single call
         // site per logical GEMM; the row-scaled FP8 GEMM kernel applies
         // the per-row scale internally at write-out.
-        let use_fp8 = matches!(self.quant, super::DflashQuantization::Fp8Weights);
         let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
                          w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
+                         w_nvfp4: &Option<crate::weight_map::QuantizedWeight>,
                          src: spark_runtime::gpu::DevicePtr,
                          dst: spark_runtime::gpu::DevicePtr,
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            if use_fp8 && let Some(fp8) = w_fp8 {
-                return ops::fp8_gemm_n128_row_scaled(
-                    gpu,
-                    self.kernels.fp8_gemm_n128_row_scaled,
-                    src,
-                    fp8,
-                    dst,
-                    g,
-                    n_out,
-                    k_in,
-                    stream,
-                );
-            }
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.kernels.dense_gemm_pipelined,
-                src,
-                w_bf16,
-                dst,
-                g,
-                n_out,
-                k_in,
-                stream,
-            )
+            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
         };
 
         // 3g. o_proj — γ rows, [q_dim → h].
@@ -884,6 +841,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.o_proj,
             &layer.o_proj_fp8,
+            &layer.o_proj_nvfp4,
             self.scratch.attn_out,
             self.scratch.stream_acc,
             h,
@@ -931,6 +889,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.gate_proj,
             &layer.gate_proj_fp8,
+            &layer.gate_proj_nvfp4,
             self.scratch.norm_buf,
             self.scratch.mlp_intermediate,
             inter,
@@ -939,6 +898,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.up_proj,
             &layer.up_proj_fp8,
+            &layer.up_proj_nvfp4,
             self.scratch.norm_buf,
             self.scratch.mlp_up,
             inter,
@@ -956,6 +916,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.down_proj,
             &layer.down_proj_fp8,
+            &layer.down_proj_nvfp4,
             self.scratch.mlp_intermediate,
             self.scratch.stream_acc,
             h,
