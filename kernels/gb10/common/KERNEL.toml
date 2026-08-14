@@ -1,5 +1,5 @@
 [build]
-extra_nvcc_flags = ["--fmad=false", "-DTQ_PLUS_SIGNS"]
+extra_nvcc_flags = ["--fmad=false", "-DTQ_PLUS_SIGNS", "--expt-relaxed-constexpr"]
 
 # Kernels a model shadow may omit WITHOUT that being shadow drift.
 # Keyed by MODULE name (post-`[modules]` mapping) → list of entry points,
