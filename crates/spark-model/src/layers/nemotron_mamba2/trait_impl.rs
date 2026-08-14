@@ -269,6 +269,23 @@ impl TransformerLayer for NemotronMamba2Layer {
         self.decode_verify_multi_loop(hidden, residual, n_seqs, ks, states, ctx, stream)
     }
 
+    fn decode_multi_seq<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _seq_lens: &[usize],
+        _block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // AR C>1: batched in/out proj (weights once), per-seq conv+scan.
+        // Default trait loops N full decode() GEMVs — no scale.
+        self.decode_multi_seq_ar(hidden, residual, num_seqs, states, ctx, stream)
+    }
+
     fn prefill(
         &self,
         hidden: DevicePtr,

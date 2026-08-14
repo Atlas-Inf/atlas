@@ -304,6 +304,23 @@ impl TransformerLayer for NemotronMoeLayer {
         self.decode_batched_direct(hidden, residual, num_tokens, ctx, stream)
     }
 
+    fn decode_multi_seq<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        _states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _seq_lens: &[usize],
+        _block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // AR C>1: MoE is stateless. One decode_batched over N tokens
+        // (vLLM/SGLang grouped-GEMM). Default trait loops N serial GEMVs.
+        self.decode_batched_direct(hidden, residual, num_seqs, ctx, stream)
+    }
+
     fn decode_verify_multi<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,

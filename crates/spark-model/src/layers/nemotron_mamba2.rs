@@ -23,6 +23,7 @@ mod prefill_proj;
 mod trait_impl;
 mod trait_decode_batched;
 mod trait_decode_verify_multi;
+mod trait_decode_multi_seq;
 
 #[allow(dead_code)]
 pub struct NemotronMamba2Layer {
