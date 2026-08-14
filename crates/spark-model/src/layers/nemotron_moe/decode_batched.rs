@@ -97,6 +97,26 @@ impl NemotronMoeLayer {
         }
 
         let expert_up_out = ctx.buffers.expert_up_out();
+        if self.moe_expert_gemv_wide_k.0 != 0
+            && std::env::var("ATLAS_NO_MOE_EXPERT_WIDE").is_err()
+        {
+            ops::moe_expert_gemv_wide(
+                ctx.gpu,
+                self.moe_expert_gemv_wide_k,
+                normed,
+                self.up_ptrs.packed_ptrs,
+                self.up_ptrs.scale_ptrs,
+                self.up_ptrs.scale2_vals,
+                expert_up_out,
+                indices,
+                inter,
+                h as u32,
+                top_k,
+                0,
+                n,
+                stream,
+            )?;
+        } else {
         ops::moe_expert_gemv(
             ctx.gpu,
             self.moe_expert_gemv_k,
@@ -113,6 +133,7 @@ impl NemotronMoeLayer {
             n,
             stream,
         )?;
+        }
 
         let shared_up = ctx.buffers.ssm_qkvz();
         if n <= 4 && self.w4a16_gemv_batch4_k.0 != 0 {

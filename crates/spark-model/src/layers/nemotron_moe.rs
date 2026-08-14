@@ -44,6 +44,7 @@ pub struct NemotronMoeLayer {
     dense_gemv_k: KernelHandle,
     topk_sigmoid_k: KernelHandle,
     moe_expert_gemv_k: KernelHandle,
+    moe_expert_gemv_wide_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     w4a16_gemv_batch4_k: KernelHandle,
     /// Native-FP8 decode GEMV for the shared-expert up_proj (see
@@ -152,6 +153,11 @@ impl NemotronMoeLayer {
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             topk_sigmoid_k: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid")?,
             moe_expert_gemv_k: gpu.kernel("moe_expert_gemv", "moe_expert_gemv")?,
+            moe_expert_gemv_wide_k: super::try_kernel(
+                gpu,
+                "moe_expert_gemv_wide",
+                "moe_expert_gemv_wide",
+            ),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_batch4_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch4"),
             w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),

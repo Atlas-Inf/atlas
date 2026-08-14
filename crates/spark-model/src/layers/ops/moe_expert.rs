@@ -55,6 +55,40 @@ pub fn moe_expert_gemv(
         .launch(stream)
 }
 
+/// Coarse-N expert GEMV. A staged in smem. Grid (ceil(N/32), top_k, tokens).
+pub fn moe_expert_gemv_wide(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    input_stride: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), top_k, num_tokens.max(1)])
+        .block([256, 1, 1])
+        .shared_mem(64 + k * 2)
+        .arg_ptr(input)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(input_stride)
+        .launch(stream)
+}
+
 /// Fused gate+up expert GEMV: both projections in one kernel launch.
 ///
 /// blockIdx.z selects gate (0) vs up (1). Saves 48 launches per decode step.
