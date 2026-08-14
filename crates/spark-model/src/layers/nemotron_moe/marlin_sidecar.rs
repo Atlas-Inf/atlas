@@ -313,7 +313,7 @@ impl MarlinSidecar {
             down_w,
             down_s,
             down_gs,
-            locks: gpu.alloc(32 * SMS as usize * 4 * 4)?,
+            locks: gpu.alloc(32 * 256 * 4)?,
             c_tmp: gpu.alloc(32 * 16 * down_n.max(up_n) * 4)?,
             sorted_ids: gpu.alloc(SORTED_CAP * 4)?,
             expert_ids: gpu.alloc(256 * 4)?,

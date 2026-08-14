@@ -108,8 +108,7 @@ extern "C" __global__ void atlas_marlin_nvfp4_m8_allslots(
   if (slot >= nlive || slot >= MAX_SLOTS) return;
   const int e = expert_ids[slot];
   if (e < 0) return;
-  const int ncta = (int)gridDim.x;
-  const int lock_stride = ncta * 4;
+  const int lock_stride = 256;
   const size_t ctmp_stride = (size_t)4 * (size_t)prob_n;
   const int4* A = A_base + (size_t)slot * (size_t)prob_m * (size_t)prob_k / 8;
   int4* C = C_base + (size_t)slot * (size_t)prob_m * (size_t)prob_n / 8;
@@ -141,8 +140,7 @@ extern "C" __global__ void atlas_marlin_nvfp4_m8_k64n128_allslots(
   if (slot >= nlive || slot >= MAX_SLOTS) return;
   const int e = expert_ids[slot];
   if (e < 0) return;
-  const int ncta = (int)gridDim.x;
-  const int lock_stride = ncta * 4;
+  const int lock_stride = 256;
   const size_t ctmp_stride = (size_t)4 * (size_t)prob_n;
   const int4* A = A_base + (size_t)slot * (size_t)prob_m * (size_t)prob_k / 8;
   int4* C = C_base + (size_t)slot * (size_t)prob_m * (size_t)prob_n / 8;

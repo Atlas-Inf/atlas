@@ -136,7 +136,7 @@ impl NemotronMoeLayer {
 
         let ng_up = m.up_k / GROUP;
         ctx.gpu
-            .memset_async(m.locks, 0, 32 * SMS as usize * 16, stream)?;
+            .memset_async(m.locks, 0, 32 * 256 * 4, stream)?;
         ctx.gpu.memset_async(m.slot_bars, 0, 32 * 4, stream)?;
         ops::marlin_nvfp4_m8_allslots(
             ctx.gpu,
@@ -169,7 +169,7 @@ impl NemotronMoeLayer {
         )?;
         let ng_dn = m.down_k / GROUP;
         ctx.gpu
-            .memset_async(m.locks, 0, 32 * SMS as usize * 16, stream)?;
+            .memset_async(m.locks, 0, 32 * 256 * 4, stream)?;
         ctx.gpu.memset_async(m.slot_bars, 0, 32 * 4, stream)?;
         ops::marlin_nvfp4_m8_allslots(
             ctx.gpu,

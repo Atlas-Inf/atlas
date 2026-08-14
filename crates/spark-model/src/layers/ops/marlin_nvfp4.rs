@@ -285,7 +285,7 @@ pub fn marlin_nvfp4_m8_allslots(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([8, MARLIN_SLOTS as u32, 1])
+        .grid([16, MARLIN_SLOTS as u32, 1])
         .block([128, 1, 1])
         .shared_mem(smem)
         .arg_ptr(a_base)

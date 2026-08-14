@@ -317,6 +317,24 @@ impl TransformerLayer for NemotronMoeLayer {
         stream: u64,
     ) -> Result<()> {
         anyhow::ensure!(ks.len() == n_seqs, "decode_verify_multi: ks/n mismatch");
+        // DSV4/Lightning: C=1 KEEP is n=k≤4 slot Marlin. One launch over
+        // R=Σks (C=4 R=11) garbles — same class as fused-Mamba over R.
+        // Loop per seq so each call is the proven n≤4 shape.
+        if self.marlin.is_some() {
+            let h = ctx.config.hidden_size;
+            let mut off = 0usize;
+            for &k in ks {
+                self.decode_batched_direct(
+                    hidden.offset(off),
+                    residual.offset(off),
+                    k,
+                    ctx,
+                    stream,
+                )?;
+                off += k * h * 2;
+            }
+            return Ok(());
+        }
         let num_tokens: usize = ks.iter().sum();
         self.decode_batched_direct(hidden, residual, num_tokens, ctx, stream)
     }

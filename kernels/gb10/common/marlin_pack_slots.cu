@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Compact unique experts into fixed slots and gather A[slot, 8, K].
-// Graph-safe. Matches linear KEEP: A row = hidden[token].
+// Overflow rows for the same expert open another slot (C=4).
 
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -26,7 +26,10 @@ extern "C" __global__ void atlas_marlin_pack_slots(
     counts[e] = 0;
     slot_of[e] = -1;
   }
-  for (int s = threadIdx.x; s < MAX_SLOTS; s += blockDim.x) filled[s] = 0;
+  for (int s = threadIdx.x; s < MAX_SLOTS; s += blockDim.x) {
+    filled[s] = 0;
+    slot_eids[s] = -1;
+  }
   for (int s = threadIdx.x; s < MAX_SLOTS * M_TILE; s += blockDim.x) slot_map[s] = -1;
   __syncthreads();
   int n = tokens * top_k;
@@ -42,18 +45,25 @@ extern "C" __global__ void atlas_marlin_pack_slots(
       slot_eids[ns] = e;
       ns++;
     }
-    *n_slots = ns;
-    for (int s = ns; s < MAX_SLOTS; s++) slot_eids[s] = -1;
     for (int i = 0; i < n; i++) {
       int e = topk_ids[i];
       if (e < 0 || e >= E) continue;
       int s = slot_of[e];
       if (s < 0) continue;
       int row = filled[s];
-      if (row >= M_TILE) continue;
+      if (row >= M_TILE) {
+        if (ns >= MAX_SLOTS) continue;
+        slot_of[e] = ns;
+        slot_eids[ns] = e;
+        filled[ns] = 0;
+        s = ns;
+        ns++;
+        row = 0;
+      }
       filled[s] = row + 1;
       slot_map[s * M_TILE + row] = i;
     }
+    *n_slots = ns;
   }
   __syncthreads();
   for (int s = 0; s < MAX_SLOTS; s++) {
