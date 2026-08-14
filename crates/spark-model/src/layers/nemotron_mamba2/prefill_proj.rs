@@ -60,7 +60,20 @@ impl NemotronMamba2Layer {
             .as_ref()
             .filter(|_| self.native_fp8_prefill)
         {
-            if self.w8a16_gemm_pipelined_k.0 != 0 {
+            if n <= 4 && self.w8a16_gemv_batch4_k.0 != 0 {
+                ops::w8a16_gemv_batch4(
+                    ctx.gpu,
+                    self.w8a16_gemv_batch4_k,
+                    normed,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    proj,
+                    n,
+                    self.in_proj_size as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else if self.w8a16_gemm_pipelined_k.0 != 0 {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
                     self.w8a16_gemm_pipelined_k,
@@ -229,7 +242,20 @@ impl NemotronMamba2Layer {
             .as_ref()
             .filter(|_| self.native_fp8_prefill)
         {
-            if self.w8a16_gemm_pipelined_k.0 != 0 {
+            if n <= 4 && self.w8a16_gemv_batch4_k.0 != 0 {
+                ops::w8a16_gemv_batch4(
+                    ctx.gpu,
+                    self.w8a16_gemv_batch4_k,
+                    gated_out,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    out,
+                    n,
+                    h as u32,
+                    self.d_inner as u32,
+                    stream,
+                )?;
+            } else if self.w8a16_gemm_pipelined_k.0 != 0 {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
                     self.w8a16_gemm_pipelined_k,
