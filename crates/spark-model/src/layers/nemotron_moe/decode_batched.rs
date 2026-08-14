@@ -159,7 +159,7 @@ impl NemotronMoeLayer {
             && std::env::var("ATLAS_NO_MOE_DOWN_WIDE").is_err();
         if down_wide {
             KernelLaunch::new(ctx.gpu, self.relu2_down_wide_k)
-                .grid([div_ceil(h as u32, 32), top_k + 1, n])
+                .grid([div_ceil(h as u32, 64), top_k + 1, n])
                 .block([256, 1, 1])
                 .shared_mem(smem as u32)
                 .arg_ptr(expert_up_out)

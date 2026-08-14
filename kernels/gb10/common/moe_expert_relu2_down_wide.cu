@@ -24,8 +24,8 @@ __device__ __forceinline__ float atlas_dec_e4m3_w(unsigned char b) {
 #endif
 
 #define BLOCK_SIZE 256
-#define N_TILE 32
-#define N_PER_WARP 4
+#define N_TILE 64
+#define N_PER_WARP 8
 #define WARP_SIZE 32
 #define GROUP_SIZE 16
 
