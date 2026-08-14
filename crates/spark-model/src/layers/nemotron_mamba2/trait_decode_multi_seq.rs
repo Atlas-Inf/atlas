@@ -9,6 +9,7 @@ use crate::layer::{ForwardContext, LayerState, SsmLayerState};
 use crate::layers::ops;
 
 impl NemotronMamba2Layer {
+    #[allow(dead_code)]
     pub(super) fn decode_multi_seq_ar(
         &self,
         hidden: DevicePtr,
