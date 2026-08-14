@@ -115,7 +115,21 @@ impl NemotronMoeLayer {
         )?;
 
         let shared_up = ctx.buffers.ssm_qkvz();
-        self.prefill_shared_up(normed, shared_up, n, h, shared_inter, ctx, stream)?;
+        if n <= 4 && self.w4a16_gemv_batch4_k.0 != 0 {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                self.w4a16_gemv_batch4_k,
+                normed,
+                &self.weights.shared_up,
+                shared_up,
+                n,
+                shared_inter,
+                h as u32,
+                stream,
+            )?;
+        } else {
+            self.prefill_shared_up(normed, shared_up, n, h, shared_inter, ctx, stream)?;
+        }
 
         let expert_down_out = ctx.buffers.expert_down_out();
         let shared_down = ctx.buffers.ssm_deinterleaved();
