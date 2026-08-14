@@ -9,6 +9,31 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+/// Floor SSM snapshot slots so a 1M prefill does not drop Marconi
+/// checkpoints (`SSM snapshot pool exhausted`). Tokens per snapshot =
+/// `ssm_checkpoint_interval * block_size` (default 256*16=4096).
+/// `--ssm-cache-slots 0` still disables the pool.
+fn resolve_ssm_cache_slots(args: &cli::ServeArgs) -> usize {
+    let requested = args.ssm_cache_slots;
+    if requested == 0 || args.ssm_checkpoint_interval == 0 || args.block_size == 0 {
+        return requested;
+    }
+    let tok_per = args.ssm_checkpoint_interval * args.block_size;
+    let needed = args.max_seq_len.div_ceil(tok_per).saturating_add(8).min(512);
+    if needed > requested {
+        tracing::warn!(
+            "raising --ssm-cache-slots {requested} → {needed} so Marconi \
+             snapshots cover --max-seq-len={} ({} tok/snapshot). \
+             Pass a larger --ssm-cache-slots to override the cap (512).",
+            args.max_seq_len,
+            tok_per
+        );
+        needed
+    } else {
+        requested
+    }
+}
+
 pub(crate) fn build_prefix_cache(
     args: &cli::ServeArgs,
     config: &ModelConfig,
@@ -79,7 +104,7 @@ pub(crate) fn build_model(
         kv_dtype,
         inference_reserve,
         args.gpu_memory_utilization,
-        args.ssm_cache_slots,
+        resolve_ssm_cache_slots(args),
         layer_dtypes,
         args.ssm_checkpoint_interval,
         hss_cache_blocks_per_seq,
