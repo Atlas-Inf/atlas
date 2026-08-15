@@ -54,6 +54,29 @@ pub fn marlin_nvfp4_m8(
         .launch(stream)
 }
 
+/// Sorted-row gather for prefill Marlin: dst[row] = src[sorted_token_ids[row]].
+/// Grid: (te, 1, 1) Block: (256, 1, 1)
+pub fn marlin_pack_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    sorted_token_ids: DevicePtr,
+    src: DevicePtr,
+    dst: DevicePtr,
+    te: i32,
+    hidden_size: i32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([te as u32, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(sorted_token_ids)
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_i32(te)
+        .arg_i32(hidden_size)
+        .launch(stream)
+}
+
 pub fn marlin_repack_w4(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,

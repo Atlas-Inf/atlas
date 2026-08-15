@@ -32,6 +32,9 @@ pub(super) struct MarlinSidecar {
     pub moe_down_k: KernelHandle,
     pub lin_up_k: KernelHandle,
     pub lin_down_k: KernelHandle,
+    pub cfg4_up_k: KernelHandle,
+    pub cfg4_down_k: KernelHandle,
+    pub pack_rows_k: KernelHandle,
     pub lin_up_out: DevicePtr,
     pub lin_dn_out: DevicePtr,
     pub pack_k: KernelHandle,
@@ -241,10 +244,15 @@ impl MarlinSidecar {
             crate::layers::try_kernel(gpu, "marlin_moe_nvfp4", "atlas_marlin_moe_nvfp4_m8");
         let moe_down =
             crate::layers::try_kernel(gpu, "marlin_moe_nvfp4", "atlas_marlin_moe_nvfp4_m8_k64n128");
-        let lin_up =
-            crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_m8");
+        let lin_up = crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_m8");
         let lin_down =
             crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_m8_k64n128");
+        let cfg4_up = crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_cfg4");
+        let cfg4_down = crate::layers::try_kernel(
+            gpu,
+            "marlin_nvfp4_gemm",
+            "atlas_marlin_nvfp4_cfg4_k64n128",
+        );
         let slot_up =
             crate::layers::try_kernel(gpu, "marlin_nvfp4_gemm", "atlas_marlin_nvfp4_m8_allslots");
         let slot_dn = crate::layers::try_kernel(
@@ -258,8 +266,10 @@ impl MarlinSidecar {
         let repack = crate::layers::try_kernel(gpu, "marlin_repack", "atlas_marlin_repack_w4");
         let align = crate::layers::try_kernel(gpu, "marlin_align", "atlas_marlin_align_block8");
         let repeat = crate::layers::try_kernel(gpu, "marlin_row_repeat", "atlas_row_repeat_bf16");
+        let pack_rows =
+            crate::layers::try_kernel(gpu, "marlin_pack_rows", "atlas_marlin_pack_rows");
         if lin_up.0 == 0 || lin_down.0 == 0 || moe_up.0 == 0 || moe_down.0 == 0 || repack.0 == 0
-            || align.0 == 0 || repeat.0 == 0
+            || align.0 == 0 || repeat.0 == 0 || pack_rows.0 == 0
         {
             tracing::warn!("ATLAS_MOE_MARLIN set but kernels missing; leaving GEMV");
             return Ok(None);
@@ -323,6 +333,9 @@ impl MarlinSidecar {
             moe_down_k: moe_down,
             lin_up_k: lin_up,
             lin_down_k: lin_down,
+            cfg4_up_k: cfg4_up,
+            cfg4_down_k: cfg4_down,
+            pack_rows_k: pack_rows,
             lin_up_out: gpu.alloc(8 * up_n * 2)?,
             lin_dn_out: gpu.alloc(8 * down_n * 2)?,
             pack_k: pack,

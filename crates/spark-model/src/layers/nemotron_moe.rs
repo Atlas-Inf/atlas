@@ -262,6 +262,7 @@ mod marlin_sidecar;
 mod marlin_linear;
 mod marlin_slots;
 mod prefill_fallback;
+mod prefill_marlin;
 mod prefill_shared_up;
 mod prefill_sorted;
 mod prefill_weights;
@@ -465,6 +466,16 @@ impl TransformerLayer for NemotronMoeLayer {
             && self.moe_grouped_gemm_k.0 != 0
             && self.moe_unpermute_reduce_k.0 != 0;
 
+        // Marlin MoE prefill (NVIDIA fused_marlin_moe family): sorted layout +
+        // per-expert plain m8 Marlin launches. Opt-in until the full battery
+        // passes; ATLAS_MOE_MARLIN=1 (sidecar) + ATLAS_MOE_MARLIN_PREFILL=1.
+        let use_marlin_prefill = use_sorted
+            && std::env::var("ATLAS_MOE_MARLIN_PREFILL").is_ok()
+            && self
+                .marlin
+                .as_ref()
+                .is_some_and(|m| m.lin_up_k.0 != 0 && m.lin_down_k.0 != 0 && m.pack_rows_k.0 != 0);
+
         let p = SortedPrefillCtx {
             n,
             num_tokens,
@@ -483,7 +494,9 @@ impl TransformerLayer for NemotronMoeLayer {
             latent_base,
             shared_up_out_base,
         };
-        if use_sorted {
+        if use_marlin_prefill {
+            self.prefill_marlin_path(&p, ctx, stream)?;
+        } else if use_sorted {
             self.prefill_sorted_path(&p, ctx, stream)?;
         } else {
             self.prefill_fallback_path(&p, ctx, stream)?;
