@@ -456,11 +456,11 @@ impl TransformerLayer for NemotronMoeLayer {
         // n128 wrapper (grid.x=ceil(N/128)) while the nano/lightning target
         // compiles the COMMON kernel (N_TILE=64) — only ceil(N/128)*64 columns
         // were ever computed. Now uses `moe_w4a16_grouped_gemm_ptrtable_64`.
-        // Gated: GSM8K 12/12, NIAH 2k/12k PASS, prefill ~1.4-1.7k tok/s
-        // (vs 175-184 on the GEMV fallback). Opt-in until the full battery
-        // (44k NIAH + C=1 + dist sweep) is green, then flip the default.
+        // DEFAULT ON after the full battery: GSM8K 12/12, NIAH 2k/12k/44k
+        // PASS, dist sweep 0-256 PASS, canary exact, prefill ~1.7k tok/s
+        // (vs 175-184 on the GEMV fallback). ATLAS_NO_MOE_SORTED=1 reverts.
         let use_sorted = use_batched_moe
-            && std::env::var("ATLAS_MOE_SORTED").is_ok()
+            && std::env::var("ATLAS_NO_MOE_SORTED").is_err()
             && self.moe_sort_k.0 != 0
             && self.moe_grouped_gemm_k.0 != 0
             && self.moe_unpermute_reduce_k.0 != 0;
