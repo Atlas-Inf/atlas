@@ -100,10 +100,11 @@ impl NemotronMoeLayer {
             .collect();
 
         // ── 3. UP per expert ──
-        // cfg4 (M-tile 32) is opt-in and NOT YET KEEP: it compiles but
-        // produces wrong output (canary "后汉书") — needs the harness A/B
-        // vs the proven m8. Default: m8 chunks of 8 (correct, launch-bound).
-        let use_cfg4 = std::env::var("ATLAS_MOE_MARLIN_PREFILL_CFG4").is_ok()
+        // cfg3-style (128 threads, tm=2 → 32-row tiles) is KEEP: harness A/B
+        // exact vs m8 at M=32/64 + offsets. The 256-thread cfg4 in this
+        // vendored template is BROKEN (cols 0-15/32-47 of every tile).
+        // ATLAS_NO_MOE_MARLIN_PREFILL_CFG4=1 reverts to m8 chunks of 8.
+        let use_cfg4 = std::env::var("ATLAS_NO_MOE_MARLIN_PREFILL_CFG4").is_err()
             && m.cfg4_up_k.0 != 0
             && m.cfg4_down_k.0 != 0;
         let up_w_b = (m.up_k as usize / 16) * (m.up_n as usize * 16 / 8) * 4;
@@ -114,23 +115,20 @@ impl NemotronMoeLayer {
             let me_ = off[e + 1] - off[e];
             let mut row = 0;
             while row < me_ {
-                let mm = if use_cfg4 {
-                    if me_ == 0 {
-                        break;
-                    }
-                    row = me_;
-                    (me_ + 31) & !31
+                let (mm, base) = if use_cfg4 {
+                    // one launch per expert, padded to a 32-multiple
+                    (((me_ + 31) & !31), off[e])
                 } else {
-                    (me_ - row).min(8)
+                    ((me_ - row).min(8), off[e] + row)
                 };
                 ctx.gpu
                     .memset_async(m.locks, 0, SMS as usize * 16, stream)?;
                 ops::marlin_nvfp4_m8(
                     ctx.gpu,
                     if use_cfg4 { m.cfg4_up_k } else { m.lin_up_k },
-                    packed_a.offset((off[e] + row) * h * bf16),
+                    packed_a.offset(base * h * bf16),
                     DevicePtr(m.up_w.0 + (e * up_w_b) as u64),
-                    up_out.offset((off[e] + row) * inter * bf16),
+                    up_out.offset(base * inter * bf16),
                     m.c_tmp,
                     DevicePtr(m.up_s.0 + (e * up_s_b) as u64),
                     DevicePtr(m.up_gs.0 + (e * 4) as u64),
@@ -144,7 +142,7 @@ impl NemotronMoeLayer {
                     SMEM,
                     stream,
                 )?;
-                row += if use_cfg4 { me_ } else { 8 };
+                row += mm;
             }
         }
 
@@ -166,14 +164,10 @@ impl NemotronMoeLayer {
             let me_ = off[e + 1] - off[e];
             let mut row = 0;
             while row < me_ {
-                let mm = if use_cfg4 {
-                    if me_ == 0 {
-                        break;
-                    }
-                    row = me_;
-                    (me_ + 31) & !31
+                let (mm, base) = if use_cfg4 {
+                    (((me_ + 31) & !31), off[e])
                 } else {
-                    (me_ - row).min(8)
+                    ((me_ - row).min(8), off[e] + row)
                 };
                 ctx.gpu
                     .memset_async(m.locks, 0, SMS as usize * 16, stream)?;
@@ -184,9 +178,9 @@ impl NemotronMoeLayer {
                     } else {
                         m.lin_down_k
                     },
-                    up_out.offset((off[e] + row) * inter * bf16),
+                    up_out.offset(base * inter * bf16),
                     DevicePtr(m.down_w.0 + (e * down_w_b) as u64),
-                    dn_out.offset((off[e] + row) * h * bf16),
+                    dn_out.offset(base * h * bf16),
                     m.c_tmp,
                     DevicePtr(m.down_s.0 + (e * down_s_b) as u64),
                     DevicePtr(m.down_gs.0 + (e * 4) as u64),
@@ -200,7 +194,7 @@ impl NemotronMoeLayer {
                     SMEM,
                     stream,
                 )?;
-                row += if use_cfg4 { me_ } else { 8 };
+                row += mm;
             }
         }
 
