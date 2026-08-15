@@ -462,13 +462,27 @@ impl TransformerModel {
             None
         } else {
             let n = dflash_capture_layers.len();
-            Some(gpu.alloc(
+            let save = gpu.alloc(
                 dflash_hidden_save_nseq
                     * dflash_hidden_save_rows
                     * n
                     * config.hidden_size
                     * 2,
-            )?)
+            )?;
+            // C1 fix: the batched propose reads each seq's region at the
+            // accepted row. Before a seq's own verify has written its region
+            // (first propose, or batch positions past the previous batch's
+            // width), that memory is allocator garbage — every extra seq's
+            // first ctx append absorbed wild values and its drafts diverged
+            // from the seq-0 region (which held real previous-seq data).
+            // Zero once at construction: a blank first ctx slot is benign
+            // (the C1 path appends a stale-but-real slot and works).
+            gpu.memset(
+                save,
+                0,
+                dflash_hidden_save_nseq * dflash_hidden_save_rows * n * config.hidden_size * 2,
+            )?;
+            Some(save)
         };
 
         // EP command buffer for token broadcast (4 bytes, u32)

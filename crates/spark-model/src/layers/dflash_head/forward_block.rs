@@ -673,8 +673,6 @@ impl BlockDiffusionDraftHead {
                     .unwrap_or(0);
                 if std::env::var("ATLAS_DFLASH_BLOCK_DUMP").ok().as_deref() == Some("1")
                     && position >= block_dump_min_pos
-                    // Per-LANE latch (scratch-keyed): each lane dumps once so
-                    // lane-0 vs lane-1 tensors can be diffed for the same input.
                     && ctx.stats.dumped.keyed(Box::leak(
                         format!("dflash_block_logits_{:x}", scratch.markov_prev_dev.0)
                             .into_boxed_str(),

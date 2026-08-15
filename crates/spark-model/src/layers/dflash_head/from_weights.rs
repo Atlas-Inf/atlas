@@ -267,7 +267,7 @@ impl BlockDiffusionDraftHead {
         // pointers at capture, so each lane needs its own. γ rows only for
         // logits (see the per-field note below).
         let make_scratch = |gpu: &dyn GpuBackend| -> Result<DflashScratch> {
-            Ok(DflashScratch {
+            let s = DflashScratch {
                 stream_buf: gpu.alloc(n_attn * hidden_size * bf16)?,
                 norm_buf: gpu.alloc(n_attn * hidden_size * bf16)?,
                 q_buf: gpu.alloc(n_attn * q_dim * bf16)?,
@@ -315,7 +315,35 @@ impl BlockDiffusionDraftHead {
                     gpu.alloc_host_pinned(4)?,
                 ),
                 position_ids: gpu.alloc(n_attn * 4)?,
-            })
+            };
+            // C1 diagnostic: zero ALL device buffers so any uninitialized
+            // read sees deterministic zeros instead of per-lane garbage.
+            // (Alloc_host_pinned already zeroes; device allocs do not.)
+            for (p, bytes) in [
+                (s.stream_buf, n_attn * hidden_size * bf16),
+                (s.norm_buf, n_attn * hidden_size * bf16),
+                (s.q_buf, n_attn * q_dim * bf16),
+                (s.k_buf, n_attn * kv_dim * bf16),
+                (s.v_buf, n_attn * kv_dim * bf16),
+                (s.attn_out, n_attn * q_dim * bf16),
+                (s.mlp_intermediate, n_attn * intermediate_size * bf16),
+                (s.mlp_up, n_attn * intermediate_size * bf16),
+                (s.stream_acc, n_attn * hidden_size * bf16),
+                (s.fc_proj, ctx_window * hidden_size * bf16),
+                (
+                    s.fused_kv_out,
+                    ctx_window * num_layers * 2 * num_kv_heads * head_dim * bf16,
+                ),
+                (s.slot_mapping_dev, ctx_window * 8),
+                (s.option_b_indirect_args_dev, 12),
+                (s.logits, g * vocab_size * bf16),
+                (s.draft_tokens_dev, n_attn * 4),
+                (s.markov_prev_dev, 4),
+                (s.position_ids, n_attn * 4),
+            ] {
+                gpu.memset(p, 0, bytes)?;
+            }
+            Ok(s)
         };
         let scratch = make_scratch(gpu)?;
 
@@ -331,19 +359,27 @@ impl BlockDiffusionDraftHead {
         let mut extra_lanes = Vec::with_capacity(n_lanes - 1);
         for _ in 1..n_lanes {
             let stream = gpu.create_stream()?;
+            let me = if weights.markov_rank > 0 {
+                gpu.alloc(weights.markov_rank * 2)?
+            } else {
+                DevicePtr::NULL
+            };
+            let mb = if weights.markov_rank > 0 {
+                gpu.alloc(weights.config.vocab_size * 2)?
+            } else {
+                DevicePtr::NULL
+            };
+            // C1 diagnostic: markov scratch zeroed like the rest of the
+            // scratch set (uninitialized-read bisect).
+            if weights.markov_rank > 0 {
+                gpu.memset(me, 0, weights.markov_rank * 2)?;
+                gpu.memset(mb, 0, weights.config.vocab_size * 2)?;
+            }
             extra_lanes.push(DflashLane {
                 stream,
                 scratch: make_scratch(gpu)?,
-                markov_embed: if weights.markov_rank > 0 {
-                    gpu.alloc(weights.markov_rank * 2)?
-                } else {
-                    DevicePtr::NULL
-                },
-                markov_bias: if weights.markov_rank > 0 {
-                    gpu.alloc(weights.config.vocab_size * 2)?
-                } else {
-                    DevicePtr::NULL
-                },
+                markov_embed: me,
+                markov_bias: mb,
                 done_event: gpu.create_event()?,
             });
         }
