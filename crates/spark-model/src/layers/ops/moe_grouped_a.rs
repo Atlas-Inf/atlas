@@ -218,6 +218,47 @@ pub fn moe_w4a16_grouped_gemm_ptrtable_n128(
         .launch(stream)
 }
 
+/// Pointer-table grouped GEMM with N_TILE=64 (the COMMON kernel — nano/lightning
+/// targets compile `kernels/gb10/common/moe_w4a16_grouped_gemm.cu` where N_TILE=64,
+/// NOT the model-specific n128 variants). G9 root cause: the n128 wrapper above
+/// launched grid.x=ceil(n_out/128), so the common 64-tiled kernels only ever
+/// computed ceil(N/128)*64 columns — the rest stayed zero → the sorted-MoE
+/// prefill degraded the model (GSM8K 2/12).
+///
+/// Grid: (ceil(n_out/64), max_m_tiles, num_experts)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_grouped_gemm_ptrtable_64(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 64), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// FP8-A pointer-table grouped GEMM with transposed NVFP4 weights.
 ///
 /// A must already be converted to FP8 E4M3. The launch shape mirrors

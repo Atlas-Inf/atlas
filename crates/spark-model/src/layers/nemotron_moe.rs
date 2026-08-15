@@ -452,14 +452,13 @@ impl TransformerLayer for NemotronMoeLayer {
         let weights_dev = scratch.offset(n as usize * top_k as usize * 4);
 
         // Sorted MoE prefill: sort tokens by expert, then grouped GEMM.
-        // **G0 root cause (2026-08-14): this path produces WRONG expert
-        // outputs** — the model lost prompt context and reasoning (GSM8K
-        // 0/12, NIAH fail at 256, "My name is Nemotron" recall failures).
-        // vLLM (Marlin prefill) on the same checkpoint is correct. The
-        // per-token GEMV fallback restores the reference behavior
-        // (robe=3 bolts, 7394 recall, GSM8K step-by-step) — it is the
-        // DEFAULT. Sorted is opt-in (ATLAS_MOE_SORTED=1) until the
-        // sort/grouped-GEMM/unpermute chain is fixed.
+        // G9 FIXED (2026-08-15): the sorted chain was dispatched through the
+        // n128 wrapper (grid.x=ceil(N/128)) while the nano/lightning target
+        // compiles the COMMON kernel (N_TILE=64) — only ceil(N/128)*64 columns
+        // were ever computed. Now uses `moe_w4a16_grouped_gemm_ptrtable_64`.
+        // Gated: GSM8K 12/12, NIAH 2k/12k PASS, prefill ~1.4-1.7k tok/s
+        // (vs 175-184 on the GEMV fallback). Opt-in until the full battery
+        // (44k NIAH + C=1 + dist sweep) is green, then flip the default.
         let use_sorted = use_batched_moe
             && std::env::var("ATLAS_MOE_SORTED").is_ok()
             && self.moe_sort_k.0 != 0
