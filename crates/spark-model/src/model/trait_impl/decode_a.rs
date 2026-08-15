@@ -232,6 +232,18 @@ impl TransformerModel {
         // Diagnostic: force eager single-seq decode (graph-vs-eager A/B,
         // and to localize 716s inside captured graphs with LAUNCH_BLOCKING).
         let no_decode_graphs = std::env::var("ATLAS_NO_DECODE_GRAPHS").is_ok_and(|v| v == "1");
+        // G1 (2026-08-15): capturing the n=1 decode graph on a step whose
+        // seq_len is an exact multiple of 64 (SSD_L) produces a graph whose
+        // FIRST replay faults with 716/700 (misaligned address). Empirically
+        // cold-capture at 64 / 128 / 2048 faults; 32 / 47 / 52 / 63 / 141 /
+        // 2101 are fine, and a graph captured at a non-multiple replays
+        // cleanly ACROSS later %64==0 steps (e.g. 63-capture replays at 64+).
+        // Deferring capture one step (seq_len%64==0 runs eager) is lossless —
+        // eager and graph produce identical logits — and the next step
+        // captures a graph that replays everywhere. Root cause of the
+        // capture-time fault is still under investigation (suspect: a
+        // 64-periodic buffer offset baked at capture).
+        let seq64_boundary = seq.seq_len % 64 == 0;
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
             && !self.profile
             && !self
@@ -240,7 +252,8 @@ impl TransformerModel {
             && !hss_engaged
             && !dump_step0
             && !lora_eager
-            && !no_decode_graphs;
+            && !no_decode_graphs
+            && !seq64_boundary;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
