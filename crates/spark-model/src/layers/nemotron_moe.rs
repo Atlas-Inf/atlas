@@ -305,6 +305,50 @@ impl TransformerLayer for NemotronMoeLayer {
         self.decode_batched_direct(hidden, residual, num_tokens, ctx, stream)
     }
 
+    fn decode_multi_seq<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        _states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _seq_lens: &[usize],
+        _block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // AR C>1: MoE is stateless. One decode_batched over N tokens
+        // (vLLM/SGLang grouped-GEMM). OPT-IN: G3 A/B on the fixed engine
+        // shows 7/8 prompts bit-exact at 64 tok, but the prime prompt flips
+        // a near-tie at char 33 (wide-kernel accumulation ≠ serial GEMV).
+        // Serial stays the default (bit-exact = the DSpark base).
+        if std::env::var("ATLAS_LIGHTNING_DECODE_MULTI").as_deref() == Ok("1") {
+            // serial fallback = the trait default (per-seq decode())
+            let h = ctx.config.hidden_size;
+            for i in 0..num_seqs {
+                let offset = i * h * 2;
+                let mut bt = _block_tables[i].clone();
+                let mut stub_disk = Vec::<u32>::new();
+                let mut stub_off = Vec::<u32>::new();
+                self.decode(
+                    hidden.offset(offset),
+                    residual.offset(offset),
+                    _states[i],
+                    _kv_cache,
+                    _seq_lens[i],
+                    &mut bt,
+                    &mut stub_disk,
+                    &mut stub_off,
+                    ctx,
+                    stream,
+                )?;
+            }
+            Ok(())
+        } else {
+            self.decode_batched_direct(hidden, residual, num_seqs, ctx, stream)
+        }
+    }
+
     fn decode_verify_multi<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,

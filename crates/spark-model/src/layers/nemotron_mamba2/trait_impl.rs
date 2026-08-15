@@ -269,6 +269,47 @@ impl TransformerLayer for NemotronMamba2Layer {
         self.decode_verify_multi_loop(hidden, residual, n_seqs, ks, states, ctx, stream)
     }
 
+    fn decode_multi_seq<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _seq_lens: &[usize],
+        _block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // AR C>1: batched in/out proj (weights once), per-seq conv+scan.
+        // OPT-IN (see nemotron_moe decode_multi_seq: 1/6 near-tie flip).
+        if std::env::var("ATLAS_LIGHTNING_DECODE_MULTI").as_deref() == Ok("1") {
+            self.decode_multi_seq_ar(hidden, residual, num_seqs, states, ctx, stream)
+        } else {
+            // serial fallback = the trait default (per-seq decode())
+            let h = ctx.config.hidden_size;
+            for i in 0..num_seqs {
+                let offset = i * h * 2;
+                let mut bt = _block_tables[i].clone();
+                let mut stub_disk = Vec::<u32>::new();
+                let mut stub_off = Vec::<u32>::new();
+                self.decode(
+                    hidden.offset(offset),
+                    residual.offset(offset),
+                    states[i],
+                    _kv_cache,
+                    _seq_lens[i],
+                    &mut bt,
+                    &mut stub_disk,
+                    &mut stub_off,
+                    ctx,
+                    stream,
+                )?;
+            }
+            Ok(())
+        }
+    }
+
     fn prefill(
         &self,
         hidden: DevicePtr,

@@ -97,7 +97,13 @@ impl NemotronMoeLayer {
         }
 
         let expert_up_out = ctx.buffers.expert_up_out();
-        if self.marlin.is_some() && num_tokens <= 4 {
+        // Marlin n<=4 slots decode: NOT bit-exact vs serial GEMV on the
+        // fixed engine (G3 A/B: prime prompt diverges). Opt-in until the
+        // slots path re-gates lossless. GEMV batched IS bit-exact.
+        if self.marlin.is_some()
+            && num_tokens <= 4
+            && std::env::var("ATLAS_MOE_MARLIN_DECODE").is_ok()
+        {
             return self.decode_batched_marlin(hidden, residual, num_tokens, ctx, stream);
         }
         let grouped = n >= 2
