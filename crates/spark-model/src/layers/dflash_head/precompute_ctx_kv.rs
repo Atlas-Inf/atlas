@@ -30,7 +30,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::BlockDiffusionDraftHead;
+use super::{BlockDiffusionDraftHead, DflashScratch};
 use crate::layer::ForwardContext;
 use crate::weight_map::DenseWeight;
 
@@ -63,6 +63,7 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         stream: u64,
         commit: bool,
+        scratch: &DflashScratch,
     ) -> Result<()> {
         use crate::layers::ops;
 
@@ -122,7 +123,7 @@ impl BlockDiffusionDraftHead {
             self.kernels.dense_gemm_pipelined,
             src,
             &self.fc,
-            self.scratch.fc_proj,
+            scratch.fc_proj,
             n,
             h,
             target_hidden_dim as u32,
@@ -130,7 +131,7 @@ impl BlockDiffusionDraftHead {
         )?;
         dump_buf(
             "fc_proj",
-            self.scratch.fc_proj,
+            scratch.fc_proj,
             new_ctx_count * self.hidden_size * bf16,
         )?;
 
@@ -140,9 +141,9 @@ impl BlockDiffusionDraftHead {
         ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
-            self.scratch.fc_proj,
+            scratch.fc_proj,
             &self.hidden_norm,
-            self.scratch.fc_proj,
+            scratch.fc_proj,
             n,
             h,
             self.rms_norm_eps,
@@ -150,7 +151,7 @@ impl BlockDiffusionDraftHead {
         )?;
         dump_buf(
             "fc_proj_normed",
-            self.scratch.fc_proj,
+            scratch.fc_proj,
             new_ctx_count * self.hidden_size * bf16,
         )?;
 
@@ -164,9 +165,9 @@ impl BlockDiffusionDraftHead {
         ops::dense_gemm_bf16_pipelined(
             gpu,
             self.kernels.dense_gemm_pipelined,
-            self.scratch.fc_proj,
+            scratch.fc_proj,
             &fused_w,
-            self.scratch.fused_kv_out,
+            scratch.fused_kv_out,
             n,
             fused_n_cols,
             h,
@@ -174,7 +175,7 @@ impl BlockDiffusionDraftHead {
         )?;
         dump_buf(
             "fused_kv_out",
-            self.scratch.fused_kv_out,
+            scratch.fused_kv_out,
             new_ctx_count * l_total * 2 * kv_slab_bytes,
         )?;
 
@@ -193,7 +194,7 @@ impl BlockDiffusionDraftHead {
                 .take(l_total * new_ctx_count)
                 .flat_map(|p: i32| p.to_le_bytes())
                 .collect();
-            gpu.copy_h2d(&repeated_bytes, self.scratch.norm_buf)?;
+            gpu.copy_h2d(&repeated_bytes, scratch.norm_buf)?;
         }
 
         // ── Step 5: compact all L layers' K → all_k_stage ────────────
@@ -203,7 +204,7 @@ impl BlockDiffusionDraftHead {
         // Atlas: copy_d2d row-by-row to build the same [L, n, kv_dim] layout
         // in mlp_intermediate (borrowed; not used until step 3j of the
         // γ-block layer loop). Capacity: n_attn × inter × 2 >> L×n×kv_dim×2.
-        let all_k_stage = self.scratch.mlp_intermediate;
+        let all_k_stage = scratch.mlp_intermediate;
         for l in 0..l_total {
             for row in 0..new_ctx_count {
                 let k_src = self
@@ -249,7 +250,7 @@ impl BlockDiffusionDraftHead {
             self.kernels.rope_qwen3,
             all_k_stage, // Q — unread when num_q_heads=0
             all_k_stage, // K = all_k_flat [L*n, kv_dim]
-            self.scratch.norm_buf,
+            scratch.norm_buf,
             l_total as u32 * n,
             0, // num_q_heads=0 → K-only (rope.cu:46-48)
             self.num_kv_heads as u32,
@@ -272,7 +273,7 @@ impl BlockDiffusionDraftHead {
         // py:420–434  per-layer `attn.impl.do_kv_cache_update(...)`.
         // Compact V_l inline (no norm/RoPE applied to V — oracle matches).
         // K is read from all_k_stage[l*n..]; V from fused_kv_out (GEMM output).
-        let v_stage = self.scratch.v_buf;
+        let v_stage = scratch.v_buf;
         for l in 0..l_total {
             let k_l = all_k_stage.offset(l * new_ctx_count * kv_slab_bytes);
 

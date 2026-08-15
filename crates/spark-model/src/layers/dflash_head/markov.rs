@@ -8,9 +8,10 @@
 
 use anyhow::Result;
 
-use super::BlockDiffusionDraftHead;
+use super::{BlockDiffusionDraftHead, DflashScratch};
 use crate::layers::ops;
 use crate::weight_map::DenseWeight;
+use spark_runtime::gpu::DevicePtr;
 
 impl BlockDiffusionDraftHead {
     /// Argmax each γ row. When Markov weights are bound, add the sequential
@@ -20,16 +21,28 @@ impl BlockDiffusionDraftHead {
         last_token: u32,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         stream: u64,
+        scratch: &DflashScratch,
+        markov_embed: DevicePtr,
+        markov_bias: DevicePtr,
     ) -> Result<()> {
         let bf16 = 2usize;
         if let (Some(w1), Some(w2)) = (self.markov_w1.as_ref(), self.markov_w2.as_ref()) {
-            if self.markov_rank > 0 && !self.markov_embed.is_null() {
-                return self.argmax_with_markov(last_token, w1, w2, gpu, stream);
+            if self.markov_rank > 0 && !markov_embed.is_null() {
+                return self.argmax_with_markov(
+                    last_token,
+                    w1,
+                    w2,
+                    gpu,
+                    stream,
+                    scratch,
+                    markov_embed,
+                    markov_bias,
+                );
             }
         }
         for i in 0..self.gamma {
-            let logits_row = self.scratch.logits.offset(i * self.vocab_size * bf16);
-            let token_slot = self.scratch.draft_tokens_dev.offset(i * 4);
+            let logits_row = scratch.logits.offset(i * self.vocab_size * bf16);
+            let token_slot = scratch.draft_tokens_dev.offset(i * 4);
             ops::argmax_bf16(
                 gpu,
                 self.kernels.argmax,
@@ -49,6 +62,9 @@ impl BlockDiffusionDraftHead {
         w2: &DenseWeight,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         stream: u64,
+        scratch: &DflashScratch,
+        markov_embed: DevicePtr,
+        markov_bias: DevicePtr,
     ) -> Result<()> {
         let bf16 = 2usize;
         let rank = self.markov_rank;
@@ -65,8 +81,8 @@ impl BlockDiffusionDraftHead {
         ops::argmax_bf16(
             gpu,
             self.kernels.argmax,
-            self.scratch.logits,
-            self.scratch.draft_tokens_dev,
+            scratch.logits,
+            scratch.draft_tokens_dev,
             self.vocab_size as u32,
             stream,
         )?;
@@ -74,16 +90,16 @@ impl BlockDiffusionDraftHead {
         // just-written draft_tokens_dev[i-1].
         for i in 1..self.gamma {
             let prev_dev = if i == 1 {
-                self.scratch.markov_prev_dev
+                scratch.markov_prev_dev
             } else {
-                self.scratch.draft_tokens_dev.offset((i - 1) * 4)
+                scratch.draft_tokens_dev.offset((i - 1) * 4)
             };
             ops::batched_embed(
                 gpu,
                 self.kernels.batched_embed,
                 prev_dev,
                 w1.weight,
-                self.markov_embed,
+                markov_embed,
                 1,
                 rank as u32,
                 stream,
@@ -91,23 +107,23 @@ impl BlockDiffusionDraftHead {
             ops::dense_gemv(
                 gpu,
                 self.kernels.dense_gemv,
-                self.markov_embed,
+                markov_embed,
                 w2,
-                self.markov_bias,
+                markov_bias,
                 self.vocab_size as u32,
                 rank as u32,
                 stream,
             )?;
-            let logits_row = self.scratch.logits.offset(i * self.vocab_size * bf16);
+            let logits_row = scratch.logits.offset(i * self.vocab_size * bf16);
             ops::residual_add(
                 gpu,
                 self.kernels.residual_add,
                 logits_row,
-                self.markov_bias,
+                markov_bias,
                 self.vocab_size as u32,
                 stream,
             )?;
-            let token_slot = self.scratch.draft_tokens_dev.offset(i * 4);
+            let token_slot = scratch.draft_tokens_dev.offset(i * 4);
             ops::argmax_bf16(
                 gpu,
                 self.kernels.argmax,
@@ -127,9 +143,9 @@ impl BlockDiffusionDraftHead {
         last_token: u32,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         stream: u64,
+        scratch: &DflashScratch,
     ) -> Result<()> {
-        let ptr = self
-            .scratch
+        let ptr = scratch
             .markov_prev_host_pinned
             .load(std::sync::atomic::Ordering::Relaxed);
         anyhow::ensure!(!ptr.is_null(), "markov_prev_host_pinned is null");
@@ -137,6 +153,6 @@ impl BlockDiffusionDraftHead {
             std::ptr::write(ptr as *mut u32, last_token);
         }
         let host = unsafe { std::slice::from_raw_parts(ptr, 4) };
-        gpu.copy_h2d_async(host, self.scratch.markov_prev_dev, stream)
+        gpu.copy_h2d_async(host, scratch.markov_prev_dev, stream)
     }
 }

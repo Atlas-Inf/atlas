@@ -17,8 +17,8 @@
 //! degenerates to single-token decode (acceptance ~100% but no speedup).
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::any::Any;
+use std::collections::HashMap;
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -95,6 +95,25 @@ pub struct DflashKernels {
     /// no wasted M_TILE rows. Used by the lm_head GEMM.
     pub fp8_gemm_n128_row_scaled_m16: KernelHandle,
     pub w4a16_gemv_batch4: KernelHandle,
+}
+
+/// Per-step scratch buffers for the γ-block forward.
+///
+/// Each propose lane (see [`DflashLane`]) owns one full copy: the piecewise
+/// propose graphs bake these pointers at capture, so a lane must always
+/// replay with the scratch it captured with.
+pub struct DflashLane {
+    /// CUDA stream for this lane (lane 0 = the backend default stream;
+    /// lanes 1.. are non-blocking secondary streams).
+    pub stream: u64,
+    pub scratch: DflashScratch,
+    /// Scratch `[rank]` BF16 for the previous-token Markov embed.
+    pub markov_embed: DevicePtr,
+    /// Scratch `[vocab]` BF16 Markov bias row.
+    pub markov_bias: DevicePtr,
+    /// Event recorded after the lane's propose work; the default stream
+    /// waits on it before verify so cross-lane work is ordered.
+    pub done_event: u64,
 }
 
 /// Per-step scratch buffers for the γ-block forward.
@@ -274,6 +293,13 @@ pub struct DflashProposerState {
     /// Width (bytes) of one `ctx_hidden_acc` slot — `5 * target_hidden * bf16`.
     /// Stored to avoid re-deriving on every append.
     pub ctx_slot_bytes: usize,
+    /// Propose lane this seq is pinned to for its lifetime. Assigned once
+    /// round-robin at `alloc_state` and NEVER derived from the batch
+    /// position: ramp/drain reorders the batch between steps, and a seq's
+    /// captured propose graphs bake their lane's scratch pointers — moving
+    /// lanes would replay against another lane's scratch (silent corruption).
+    /// `usize::MAX` = pre-assignment sentinel (defensive only).
+    pub lane_id: usize,
 
     // ─── Phase 2 Option B fields (paged KV cache for ctx) ───────────────
     /// Device-side block table for the drafter's paged KV cache. Allocated
@@ -391,10 +417,6 @@ pub struct BlockDiffusionDraftHead {
     /// DSpark Markov `w2` `[vocab, rank]` BF16.
     pub markov_w2: Option<DenseWeight>,
     pub markov_rank: usize,
-    /// Scratch `[rank]` BF16 for the previous-token Markov embed.
-    pub markov_embed: DevicePtr,
-    /// Scratch `[vocab]` BF16 Markov bias row.
-    pub markov_bias: DevicePtr,
     /// Optional draft-vocab-id → target-vocab-id remap. `None` when the
     /// drafter shares vocab with the target (Qwen3.6-35B-A3B-DFlash case:
     /// vocab_size == draft_vocab_size == 248320).
@@ -426,6 +448,17 @@ pub struct BlockDiffusionDraftHead {
 
     /// Per-step scratch buffers (allocated once at construction, reused).
     pub scratch: DflashScratch,
+
+    /// Additional propose lanes (lane 0 IS `self.scratch` on the default
+    /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 4 lanes).
+    /// A sequence's lane is fixed for its lifetime (`slot % lanes`) so its
+    /// captured graphs always replay against the scratch they captured with.
+    pub extra_lanes: Vec<DflashLane>,
+
+    /// Lane-0 Markov scratch mirrors (kept on the head for the single-lane
+    /// path; lanes 1.. carry their own copies inside `extra_lanes`).
+    pub lane0_markov_embed: DevicePtr,
+    pub lane0_markov_bias: DevicePtr,
 
     /// All kernel handles needed by `propose()` and the eventual prefill
     /// projection (`precompute_and_store_context_kv`).
@@ -474,7 +507,16 @@ pub struct BlockDiffusionDraftHead {
     /// `block_table_dev` address**. A single `Option<Vec<GraphHandle>>`
     /// baked one seq's KV pointers and made C>1 replay corrupt. `GraphHandle(0)`
     /// is the empty-capture sentinel (replay eager for that subgraph).
-    pub propose_graphs: Mutex<HashMap<u64, Vec<spark_runtime::gpu::GraphHandle>>>,
+    pub propose_graphs: Mutex<HashMap<(u64, u64, u64), Vec<spark_runtime::gpu::GraphHandle>>>,
+    /// Round-robin counter handing out propose lanes at `alloc_state`.
+    /// One extra-lane stream may serve several seqs (n > lanes); the lane
+    /// itself never moves for a seq.
+    pub next_lane: std::sync::atomic::AtomicUsize,
+    /// Entry-ordering event: recorded on the default stream at the top of
+    /// the multi-lane `propose_batch`; every extra lane waits on it so
+    /// drafter-ctx precompute / `after_verify` writes enqueued on the
+    /// default stream are visible before lanes read them.
+    pub lanes_start_event: u64,
     /// When set, all `forward_block` calls run eagerly. Mirrors target-model
     /// `TransformerModel::suppress_graphs` so external code can disable
     /// graphs at runtime (e.g. while calibrating FP8 KV).
@@ -494,12 +536,41 @@ pub struct BlockDiffusionDraftHead {
 
 mod forward_block;
 mod forward_block_layer;
-mod markov;
 mod forward_block_layer_paged;
 mod from_weights;
+mod markov;
 mod nvfp4;
 mod precompute_ctx_kv;
 mod propose;
+
+impl BlockDiffusionDraftHead {
+    /// Total propose lanes (lane 0 = default-stream scratch; the rest live
+    /// in `extra_lanes`). `ATLAS_DFLASH_PROPOSE_LANES` overrides (default 4).
+    pub fn lane_count(&self) -> usize {
+        1 + self.extra_lanes.len()
+    }
+
+    /// Resolve a lane's mutable propose resources: (stream, scratch,
+    /// markov_embed, markov_bias). Lane 0 is the head's own scratch on the
+    /// backend default stream; lanes 1.. are independent copies.
+    pub(super) fn lane(
+        &self,
+        lane: usize,
+        default_stream: u64,
+    ) -> (u64, &DflashScratch, DevicePtr, DevicePtr) {
+        if lane == 0 || self.extra_lanes.is_empty() {
+            (
+                default_stream,
+                &self.scratch,
+                self.lane0_markov_embed,
+                self.lane0_markov_bias,
+            )
+        } else {
+            let l = &self.extra_lanes[(lane - 1).min(self.extra_lanes.len() - 1)];
+            (l.stream, &l.scratch, l.markov_embed, l.markov_bias)
+        }
+    }
+}
 
 impl DraftProposer for BlockDiffusionDraftHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
@@ -523,7 +594,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_len: 0,
             last_num_accepted: 0,
             skip_next_decode_append: false,
-            max_ctx_len: self.window_size.unwrap_or(self.max_seq_len).min(self.max_seq_len),
+            max_ctx_len: self
+                .window_size
+                .unwrap_or(self.max_seq_len)
+                .min(self.max_seq_len),
             ctx_slot_bytes,
             // Phase 2 Option B: lazily allocated on first propose when
             // ATLAS_DFLASH_OPTION_B=1. None until then to keep alloc_state
@@ -533,6 +607,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
             max_ctx_count_drafter: 0,
             ctx_committed: 0,
             ctx_positions: Vec::new(),
+            // Propose lane: fixed for the seq lifetime (batch positions
+            // reorder; captured graphs bake lane scratch pointers). Round-
+            // robin keeps concurrent seqs spread across the lane streams.
+            lane_id: self
+                .next_lane
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % self.lane_count(),
         }))
     }
 
@@ -575,30 +656,143 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _out_conf: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         let n = last_tokens.len();
-        if n < 2
-            || target_hiddens.len() != n
-            || positions.len() != n
-            || states.len() != n
-        {
+        if n < 2 || target_hiddens.len() != n || positions.len() != n || states.len() != n {
             return Ok(None);
         }
-        // Per-seq piecewise graphs (keyed by block_table_dev). Do not
-        // suppress — that was the C>1 eager tax.
-        let mut out = Vec::with_capacity(n);
+        let lanes_n = self.lane_count();
+        if lanes_n == 1 {
+            // Single-lane: the original serial path, unchanged.
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let drafts = self.propose_drafts(
+                    last_tokens[i],
+                    target_hiddens[i],
+                    positions[i],
+                    num_drafts,
+                    states[i],
+                    ctx,
+                    stream,
+                    None,
+                    None,
+                    Some(target_hiddens[i]),
+                )?;
+                out.push(drafts);
+            }
+            return Ok(Some(out));
+        }
+        // Multi-lane: each seq proposes on its pinned lane (assigned once at
+        // alloc_state — batch position `i` is NOT stable across steps, and a
+        // seq's captured graphs bake their lane's scratch pointers, so the
+        // lane must never move). Ordering: (1) one entry event on the
+        // default stream that every extra lane waits on, so default-stream
+        // pre-propose writes (drafter-ctx precompute, after_verify
+        // bookkeeping) are visible before lanes read them; (2) per-lane
+        // done events the default stream waits on before verify.
+        let default_stream = ctx.gpu.default_stream();
+        ctx.gpu
+            .record_event(self.lanes_start_event, default_stream)?;
+        for l in &self.extra_lanes {
+            ctx.gpu
+                .stream_wait_event(l.stream, self.lanes_start_event)?;
+        }
+        // ENQUEUE phase: launch every lane's propose (readback deferred) so
+        // the GPU overlaps N lanes; a per-lane host sync inside the loop
+        // would serialize them into the old single-stream wall. A lane may
+        // be REUSED within one step (n > lanes): its pinned readback buffer
+        // and event are single-slot, so flush the previous user's drafts
+        // before this enqueue overwrites them.
+        let mut used_lanes: Vec<usize> = Vec::with_capacity(lanes_n.min(n));
+        let mut seen = vec![false; lanes_n];
+        let mut lane_last_use: Vec<Option<usize>> = vec![None; lanes_n];
+        let mut out: Vec<Option<Vec<u32>>> = vec![None; n];
+        let mut lane_scratch_list: Vec<&DflashScratch> = Vec::with_capacity(n);
         for i in 0..n {
-            let drafts = self.propose_drafts(
+            let lane = {
+                let dstate = states[i]
+                    .as_any_mut()
+                    .downcast_mut::<DflashProposerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+                // Defensive sentinel: states built before lane assignment
+                // existed run on lane 0 (the pre-refactor serial resources).
+                if dstate.lane_id == usize::MAX {
+                    0
+                } else {
+                    dstate.lane_id
+                }
+            };
+            let (lane_stream, lane_scratch, lane_markov_embed, lane_markov_bias) =
+                self.lane(lane, default_stream);
+            if !seen[lane] {
+                seen[lane] = true;
+                used_lanes.push(lane);
+            }
+            // Flush this lane's previous user BEFORE its single-slot pinned
+            // buffer is overwritten by the enqueue below.
+            if let Some(prev_i) = lane_last_use[lane] {
+                out[prev_i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[prev_i])?);
+            }
+            lane_last_use[lane] = Some(i);
+            lane_scratch_list.push(lane_scratch);
+            self.propose_drafts_on_lane(
+                lane_scratch,
+                lane_markov_embed,
+                lane_markov_bias,
                 last_tokens[i],
                 target_hiddens[i],
                 positions[i],
                 num_drafts,
                 states[i],
                 ctx,
-                stream,
+                lane_stream,
                 None,
                 None,
                 Some(target_hiddens[i]),
+                true,
             )?;
-            out.push(drafts);
+        }
+        // COLLECT phase: each lane's D2H event is now recorded; synchronize
+        // and read in batch order. Lane scratch borrows outlive the loop.
+        for i in 0..n {
+            if out[i].is_none() {
+                out[i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[i])?);
+            }
+        }
+        let out: Vec<Vec<u32>> = out.into_iter().map(|o| o.unwrap_or_default()).collect();
+        if std::env::var("ATLAS_DFLASH_VERIFY_TRACE").ok().as_deref() == Some("1") {
+            for i in 0..n {
+                tracing::info!(
+                    "DFLASH BATCH TRACE collect: i={} lane={} token_in={} position={} drafts={:?}",
+                    i,
+                    {
+                        let dstate = states[i]
+                            .as_any_mut()
+                            .downcast_mut::<DflashProposerState>()
+                            .map(|d| d.lane_id)
+                            .unwrap_or(usize::MAX);
+                        dstate
+                    },
+                    last_tokens[i],
+                    positions[i],
+                    out[i],
+                );
+            }
+        }
+        // Ordering: the verify step runs on the default stream. Record each
+        // lane's done-event on its own stream, then make the default stream
+        // wait on every lane before returning.
+        for lane in used_lanes {
+            let l = if lane == 0 {
+                None
+            } else {
+                Some(&self.extra_lanes[lane - 1])
+            };
+            match l {
+                Some(l) => {
+                    ctx.gpu.record_event(l.done_event, l.stream)?;
+                    ctx.gpu.stream_wait_event(default_stream, l.done_event)?;
+                }
+                None => { /* lane 0 IS the default stream; nothing to hand off */ }
+            }
         }
         Ok(Some(out))
     }
@@ -625,7 +819,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // `dstate.ctx_committed = dstate.ctx_len` so the next propose
         // recomputes the rolled-back tail instead of reading stale K/V.
         // The `.min(ctx_len)` clamp in propose() is the defensive backstop.
-        let _ = num_accepted;
+        // The batched propose dispatcher reads this to select the
+        // just-verified accepted row's 5-layer stack from the seq's
+        // dflash_hidden_save region [i*kmax + acc). Row acc = the last
+        // accepted position (0 = the greedy row when no draft matched).
+        dstate.last_num_accepted = num_accepted;
         dstate.last_num_drafted = 0;
         Ok(())
     }

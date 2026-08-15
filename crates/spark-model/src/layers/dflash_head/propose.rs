@@ -8,13 +8,49 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::{BlockDiffusionDraftHead, DflashProposerState};
+use super::{BlockDiffusionDraftHead, DflashProposerState, DflashScratch};
 use crate::layer::ForwardContext;
 use crate::speculative::ProposerState;
 
 impl BlockDiffusionDraftHead {
     pub(super) fn propose_drafts(
         &self,
+        last_token: u32,
+        target_hidden: DevicePtr,
+        position: usize,
+        num_drafts: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+        draft_embed_target: Option<DevicePtr>,
+        grammar_bitmask: Option<&[i32]>,
+        target_hidden_stack: Option<DevicePtr>,
+    ) -> Result<Vec<u32>> {
+        let default_stream = ctx.gpu.default_stream();
+        let (_, scratch, markov_embed, markov_bias) = self.lane(0, default_stream);
+        self.propose_drafts_on_lane(
+            scratch,
+            markov_embed,
+            markov_bias,
+            last_token,
+            target_hidden,
+            position,
+            num_drafts,
+            state,
+            ctx,
+            stream,
+            draft_embed_target,
+            grammar_bitmask,
+            target_hidden_stack,
+            false,
+        )
+    }
+
+    pub(super) fn propose_drafts_on_lane(
+        &self,
+        scratch: &DflashScratch,
+        markov_embed: DevicePtr,
+        markov_bias: DevicePtr,
         last_token: u32,
         _target_hidden: DevicePtr,
         position: usize,
@@ -25,6 +61,7 @@ impl BlockDiffusionDraftHead {
         _draft_embed_target: Option<DevicePtr>,
         _grammar_bitmask: Option<&[i32]>,
         target_hidden_stack: Option<DevicePtr>,
+        defer_readback: bool,
     ) -> Result<Vec<u32>> {
         let dstate = state
             .as_any_mut()
@@ -358,7 +395,7 @@ impl BlockDiffusionDraftHead {
                      needs precompute — scratch has no capacity",
                     new_count,
                 );
-                let slot_mapping = &self.scratch.slot_mapping_dev;
+                let slot_mapping = &scratch.slot_mapping_dev;
                 let mut chunk_start = committed;
                 while chunk_start < dstate.ctx_len {
                     let chunk_count = (dstate.ctx_len - chunk_start).min(self.ctx_window);
@@ -387,6 +424,7 @@ impl BlockDiffusionDraftHead {
                         ctx,
                         _stream,
                         true, // commit: always write to paged cache on production path
+                        scratch,
                     )?;
                     chunk_start += chunk_count;
                 }
@@ -466,6 +504,10 @@ impl BlockDiffusionDraftHead {
                     None
                 },
                 option_b_arg,
+                scratch,
+                markov_embed,
+                markov_bias,
+                defer_readback,
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
@@ -487,10 +529,16 @@ impl BlockDiffusionDraftHead {
         // every noise row. Pairs with K2 TRACE in the scheduler.
         if std::env::var("ATLAS_DFLASH_VERIFY_TRACE").ok().as_deref() == Some("1") {
             tracing::info!(
-                "DFLASH TRACE drafts: token_in={} position={} γ={} drafts={:?}",
+                "DFLASH TRACE drafts: token_in={} position={} γ={} lane_id={} scratch={:x} mp={:x} me={:x} stream={:x} ctx_len={} drafts={:?}",
                 last_token,
                 position,
                 drafts.len(),
+                dstate.lane_id,
+                scratch as *const DflashScratch as usize,
+                scratch.markov_prev_dev.0,
+                markov_embed.0,
+                _stream,
+                dstate.ctx_len,
                 drafts,
             );
         }

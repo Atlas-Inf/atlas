@@ -479,10 +479,39 @@ impl TransformerModel {
             self.ensure_drafter_context(proposer, seq, &ctx, stream);
         }
         let h = self.config.hidden_size;
-        let hiddens: Vec<spark_runtime::gpu::DevicePtr> = stash_idx
-            .iter()
-            .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
-            .collect();
+        // DFlash drafts from the 5-layer target stack: read the seq's own
+        // region of dflash_hidden_save ([i*kmax .. i*kmax+ks), written by
+        // try_dflash_capture_batched during the batched verify) at the
+        // accepted row. The 1-hidden stash row is NOT the stack — reading
+        // ctx_slot_bytes (5 hiddens) from it let each seq's ctx append
+        // pick up the NEXT seqs' stash slots (garbage ctx → accept 0).
+        // MTP/EAGLE proposers keep the stash path (single hidden).
+        let hiddens: Vec<spark_runtime::gpu::DevicePtr> = match self.dflash_hidden_save {
+            Some(base) if !self.dflash_capture_layers.is_empty() => {
+                let kmax = self.dflash_hidden_save_rows;
+                let slot_bytes = self.dflash_capture_layers.len() * h * 2;
+                seqs.iter()
+                    .enumerate()
+                    .map(|(i, seq)| {
+                        let acc = seq
+                            .proposer_state
+                            .as_ref()
+                            .and_then(|s| {
+                                s.as_any()
+                                    .downcast_ref::<crate::layers::DflashProposerState>()
+                            })
+                            .map(|d| d.last_num_accepted)
+                            .unwrap_or(0)
+                            .min(kmax.saturating_sub(1));
+                        base.offset((i * kmax + acc) * slot_bytes)
+                    })
+                    .collect()
+            }
+            _ => stash_idx
+                .iter()
+                .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
+                .collect(),
+        };
         let mut states: Vec<&mut dyn crate::speculative::ProposerState> = Vec::new();
         for seq in seqs.iter_mut() {
             match seq.proposer_state.as_mut() {

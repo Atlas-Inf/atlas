@@ -9,7 +9,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::BlockDiffusionDraftHead;
+use super::{BlockDiffusionDraftHead, DflashScratch};
 use crate::layer::ForwardContext;
 
 impl BlockDiffusionDraftHead {
@@ -27,6 +27,10 @@ impl BlockDiffusionDraftHead {
         stream: u64,
         ctx_buffer: Option<(DevicePtr, usize)>,
         option_b: Option<(DevicePtr, u32)>,
+        scratch: &DflashScratch,
+        markov_embed: DevicePtr,
+        markov_bias: DevicePtr,
+        defer_readback: bool,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
@@ -135,10 +139,11 @@ impl BlockDiffusionDraftHead {
                 start_slot,
                 eff_ctx,
                 &slot_positions,
-                self.scratch.slot_mapping_dev,
+                scratch.slot_mapping_dev,
                 ctx,
                 stream,
                 dump_commit,
+                scratch,
             )?;
         }
 
@@ -246,7 +251,7 @@ impl BlockDiffusionDraftHead {
             }
             for i in 0..eff_ctx {
                 let src_slot = base.offset((start_slot + i) * ctx_slot_bytes);
-                let dst_slot = self.scratch.fc_proj.offset(i * self.hidden_size * bf16);
+                let dst_slot = scratch.fc_proj.offset(i * self.hidden_size * bf16);
                 ops::dense_gemv(
                     gpu,
                     self.kernels.dense_gemv,
@@ -259,23 +264,19 @@ impl BlockDiffusionDraftHead {
                 )?;
             }
             if eff_ctx > 0 {
-                dump_bf16("step0.fc_proj.pre_norm[0]", self.scratch.fc_proj, 10)?;
+                dump_bf16("step0.fc_proj.pre_norm[0]", scratch.fc_proj, 10)?;
                 ops::rms_norm(
                     gpu,
                     self.kernels.rms_norm,
-                    self.scratch.fc_proj,
+                    scratch.fc_proj,
                     &self.hidden_norm,
-                    self.scratch.fc_proj,
+                    scratch.fc_proj,
                     eff_ctx as u32,
                     h,
                     self.rms_norm_eps,
                     stream,
                 )?;
-                dump_bf16(
-                    "step0.fc_proj.post_hidden_norm[0]",
-                    self.scratch.fc_proj,
-                    10,
-                )?;
+                dump_bf16("step0.fc_proj.post_hidden_norm[0]", scratch.fc_proj, 10)?;
             }
         }
 
@@ -289,7 +290,7 @@ impl BlockDiffusionDraftHead {
             .chain((0..self.gamma).map(|i| (position + i) as i32))
             .collect();
         let pos_bytes: Vec<u8> = pos_host.iter().flat_map(|p| p.to_le_bytes()).collect();
-        gpu.copy_h2d(&pos_bytes, self.scratch.position_ids)?;
+        gpu.copy_h2d(&pos_bytes, scratch.position_ids)?;
         if debug_dump {
             tracing::info!(
                 "DFLASH DUMP positions: eff_ctx={} ctx_total={} position={} pos_ids[0..min(8,n_attn)]={:?}",
@@ -310,11 +311,7 @@ impl BlockDiffusionDraftHead {
         // Legacy path: eff_ctx>0, first eff_ctx rows zeroed (Q ignored,
         //   ctx K/V overridden from fc_proj; discard those outputs at tail).
         if eff_ctx > 0 {
-            gpu.memset(
-                self.scratch.stream_buf,
-                0,
-                eff_ctx * self.hidden_size * bf16,
-            )?;
+            gpu.memset(scratch.stream_buf, 0, eff_ctx * self.hidden_size * bf16)?;
         }
         let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
             .chain(std::iter::once(last_token as i32))
@@ -336,24 +333,20 @@ impl BlockDiffusionDraftHead {
             .iter()
             .flat_map(|t| t.to_le_bytes())
             .collect();
-        gpu.copy_h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
+        gpu.copy_h2d(&tid_bytes, scratch.draft_tokens_dev)?;
         ops::batched_embed(
             gpu,
             self.kernels.batched_embed,
-            self.scratch.draft_tokens_dev,
+            scratch.draft_tokens_dev,
             self.embed_tokens_shared,
-            self.scratch.stream_buf,
+            scratch.stream_buf,
             n_attn,
             h,
             stream,
         )?;
         // Re-zero ctx slots (batched_embed wrote token-0 embedding to them).
         if eff_ctx > 0 {
-            gpu.memset(
-                self.scratch.stream_buf,
-                0,
-                eff_ctx * self.hidden_size * bf16,
-            )?;
+            gpu.memset(scratch.stream_buf, 0, eff_ctx * self.hidden_size * bf16)?;
         }
         // ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN=1: overwrite noise rows
         // [eff_ctx..n_attn) with a deterministic pattern matching the
@@ -375,9 +368,7 @@ impl BlockDiffusionDraftHead {
             }
             gpu.copy_h2d(
                 &bytes,
-                self.scratch
-                    .stream_buf
-                    .offset(eff_ctx * self.hidden_size * bf16),
+                scratch.stream_buf.offset(eff_ctx * self.hidden_size * bf16),
             )?;
         }
 
@@ -399,7 +390,7 @@ impl BlockDiffusionDraftHead {
             ops::fill_slots_from_block_table(
                 gpu,
                 self.kernels.fill_slots,
-                self.scratch.slot_mapping_dev,
+                scratch.slot_mapping_dev,
                 bt,
                 option_b_ctx_count,
                 self.gamma as u32,
@@ -422,8 +413,8 @@ impl BlockDiffusionDraftHead {
                 b[8..12].copy_from_slice(&q_rope_pos.to_ne_bytes());
                 b
             };
-            gpu.copy_h2d(&indirect_bytes, self.scratch.option_b_indirect_args_dev)?;
-            Some(self.scratch.slot_mapping_dev)
+            gpu.copy_h2d(&indirect_bytes, scratch.option_b_indirect_args_dev)?;
+            Some(scratch.slot_mapping_dev)
         } else {
             None
         };
@@ -477,8 +468,8 @@ impl BlockDiffusionDraftHead {
         let inter_local = inter;
         let eff_ctx_local = eff_ctx;
         let noise_byte_offset_local = eff_ctx * self.hidden_size * bf16;
-        let stream_noise_local = self.scratch.stream_buf.offset(noise_byte_offset_local);
-        let norm_noise_local = self.scratch.norm_buf.offset(noise_byte_offset_local);
+        let stream_noise_local = scratch.stream_buf.offset(noise_byte_offset_local);
+        let norm_noise_local = scratch.norm_buf.offset(noise_byte_offset_local);
 
         // Build PagedLayerArgs once per layer — same args for pre_attn,
         // attention, and post_attn (the kernel only reads what it needs).
@@ -540,7 +531,7 @@ impl BlockDiffusionDraftHead {
                 inv_sqrt_d: inv_sqrt_d_local,
                 stream,
             };
-            self.forward_block_layer(layer, &args, ctx, debug_dump)
+            self.forward_block_layer(layer, &args, ctx, debug_dump, scratch)
         };
 
         // Tail: final norm + lm_head + argmax over γ rows.
@@ -574,7 +565,7 @@ impl BlockDiffusionDraftHead {
                         self.kernels.fp8_gemm_n128_row_scaled_m16,
                         norm_noise_local,
                         fp8,
-                        self.scratch.logits,
+                        scratch.logits,
                         self.gamma as u32,
                         self.vocab_size as u32,
                         h_local,
@@ -588,7 +579,7 @@ impl BlockDiffusionDraftHead {
                         &crate::weight_map::DenseWeight {
                             weight: self.lm_head_shared,
                         },
-                        self.scratch.logits,
+                        scratch.logits,
                         self.gamma as u32,
                         self.vocab_size as u32,
                         h_local,
@@ -608,7 +599,7 @@ impl BlockDiffusionDraftHead {
                             self.kernels.w4a16_gemm,
                             norm_noise_local,
                             nvfp4,
-                            self.scratch.logits,
+                            scratch.logits,
                             self.gamma as u32,
                             self.vocab_size as u32,
                             h_local,
@@ -623,7 +614,7 @@ impl BlockDiffusionDraftHead {
                             &crate::weight_map::DenseWeight {
                                 weight: self.lm_head_shared,
                             },
-                            self.scratch.logits,
+                            scratch.logits,
                             self.gamma as u32,
                             self.vocab_size as u32,
                             h_local,
@@ -639,7 +630,7 @@ impl BlockDiffusionDraftHead {
                     &crate::weight_map::DenseWeight {
                         weight: self.lm_head_shared,
                     },
-                    self.scratch.logits,
+                    scratch.logits,
                     self.gamma as u32,
                     self.vocab_size as u32,
                     h_local,
@@ -649,11 +640,11 @@ impl BlockDiffusionDraftHead {
             if std::env::var("ATLAS_DFLASH_BLOCK_DUMP").ok().as_deref() == Some("1") {
                 let n_logits_bytes = self.gamma * self.vocab_size * 2;
                 let mut pre = vec![0u8; n_logits_bytes];
-                if gpu.copy_d2h(self.scratch.logits, &mut pre).is_ok() {
+                if gpu.copy_d2h(scratch.logits, &mut pre).is_ok() {
                     let _ = std::fs::write("/tmp/atlas_block_logits_pre.bin", &pre);
                 }
             }
-            self.argmax_block_logits(last_token, gpu, stream)?;
+            self.argmax_block_logits(last_token, gpu, stream, scratch, markov_embed, markov_bias)?;
 
             // ── BLOCK-FORWARD PARITY DUMP (Friday 2026-06-11) ──────────────
             // Tests Ronald's theory: is the block-diffusion forward COMPUTING
@@ -682,24 +673,28 @@ impl BlockDiffusionDraftHead {
                     .unwrap_or(0);
                 if std::env::var("ATLAS_DFLASH_BLOCK_DUMP").ok().as_deref() == Some("1")
                     && position >= block_dump_min_pos
-                    // Per-model latch (see `ModelStats::dumped`) rather than a
-                    // static, so a swap re-arms the dump the operator asked for.
-                    // Consumed at the check: if the dump errors partway the shot
-                    // is spent rather than retried every propose.
-                    && ctx.stats.dumped.keyed("dflash_block_logits")
+                    // Per-LANE latch (scratch-keyed): each lane dumps once so
+                    // lane-0 vs lane-1 tensors can be diffed for the same input.
+                    && ctx.stats.dumped.keyed(Box::leak(
+                        format!("dflash_block_logits_{:x}", scratch.markov_prev_dev.0)
+                            .into_boxed_str(),
+                    ))
                 {
                     gpu.synchronize(stream)?;
                     // Full γ × vocab logits (BF16).
                     let n_logits_bytes = self.gamma * self.vocab_size * bf16_local;
                     let mut lbuf = vec![0u8; n_logits_bytes];
-                    if let Err(e) = gpu.copy_d2h(self.scratch.logits, &mut lbuf) {
+                    let lane_tag = format!("{:x}", scratch.markov_prev_dev.0);
+                    if let Err(e) = gpu.copy_d2h(scratch.logits, &mut lbuf) {
                         tracing::warn!("DFLASH BLOCK_DUMP: logits copy failed: {e}");
-                    } else if let Err(e) = std::fs::write("/tmp/atlas_block_logits.bin", &lbuf) {
+                    } else if let Err(e) =
+                        std::fs::write(format!("/tmp/atlas_block_logits_{lane_tag}.bin"), &lbuf)
+                    {
                         tracing::warn!("DFLASH BLOCK_DUMP: logits write failed: {e}");
                     } else {
                         // Live argmax drafts (γ × u32).
                         let mut dbuf = vec![0u8; self.gamma * 4];
-                        gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut dbuf)?;
+                        gpu.copy_d2h(scratch.draft_tokens_dev, &mut dbuf)?;
                         let drafts: Vec<u32> = (0..self.gamma)
                             .map(|i| {
                                 u32::from_le_bytes([
@@ -765,9 +760,7 @@ impl BlockDiffusionDraftHead {
                     let noise_off = eff_ctx * self.hidden_size * bf16_local;
                     let n_noise_bytes = self.gamma * self.hidden_size * bf16_local;
                     let mut nbuf = vec![0u8; n_noise_bytes];
-                    if let Err(e) =
-                        gpu.copy_d2h(self.scratch.stream_buf.offset(noise_off), &mut nbuf)
-                    {
+                    if let Err(e) = gpu.copy_d2h(scratch.stream_buf.offset(noise_off), &mut nbuf) {
                         tracing::warn!("DFLASH BLOCK_INPUT: noise embed copy failed: {e}");
                     } else {
                         let _ = std::fs::write("/tmp/atlas_block_noise_embed.bin", &nbuf);
@@ -816,9 +809,10 @@ impl BlockDiffusionDraftHead {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if option_b_on {
                     let args = make_paged_args(layer_idx).expect("option_b args available");
-                    let (k_pool, v_pool) = self.forward_block_layer_pre_attn(layer, &args, ctx)?;
-                    self.forward_block_layer_attention(&args, ctx, k_pool, v_pool)?;
-                    self.forward_block_layer_post_attn(layer, &args, ctx)?;
+                    let (k_pool, v_pool) =
+                        self.forward_block_layer_pre_attn(layer, &args, ctx, scratch)?;
+                    self.forward_block_layer_attention(&args, ctx, k_pool, v_pool, scratch)?;
+                    self.forward_block_layer_post_attn(layer, &args, ctx, scratch)?;
                 } else {
                     run_legacy_layer(layer_idx, layer)?;
                 }
@@ -828,7 +822,7 @@ impl BlockDiffusionDraftHead {
 
         // Seed Markov prev from a pinned host word BEFORE any tail
         // capture/replay. The tail graph must not H2D a stack last_token.
-        self.seed_markov_prev(last_token, gpu, stream)?;
+        self.seed_markov_prev(last_token, gpu, stream, scratch)?;
 
         // Phase F.2: piecewise capture/replay path. Only enabled for
         // option_b (paged) — legacy path stays single-shot eager since
@@ -840,14 +834,25 @@ impl BlockDiffusionDraftHead {
             let total_slots = num_layers * 2 + 1;
             let tail_slot = num_layers * 2;
 
-            let graph_key = option_b_block_table
-                .map(|p| p.0)
-                .filter(|&k| k != 0)
-                .unwrap_or(0);
+            // Graph identity: (block_table_ptr, ctx_accumulator_ptr, lane).
+            // Device addresses are REUSED across seq churn (a finished seq
+            // frees its block table + ctx accumulator; the next seq often
+            // lands on the same addresses), so keying by the block table
+            // alone lets a new seq replay a dead seq's captured graphs —
+            // baked with the dead seq's ctx accumulator and possibly a
+            // different lane's scratch (silent garbage drafts, accept 0).
+            // A triple-collision (same bt, same ctx acc, same lane) is a
+            // semantically correct replay: every baked pointer resolves to
+            // the new seq's live data. Anything else misses and recaptures.
+            let graph_key = (
+                option_b_block_table.map(|p| p.0).unwrap_or(0),
+                ctx_buffer.map(|(p, _)| p.0).unwrap_or(0),
+                scratch.markov_prev_dev.0,
+            );
             let mut gmap = self.propose_graphs.lock();
             let cached_ready = gmap
                 .get(&graph_key)
-                .map(|v| graph_key != 0 && v.len() == total_slots)
+                .map(|v| v.len() == total_slots)
                 .unwrap_or(false);
 
             if cached_ready {
@@ -861,15 +866,16 @@ impl BlockDiffusionDraftHead {
                     } else {
                         // Empty-capture sentinel: this slot fell back to
                         // eager at capture time. Replay eager forever.
-                        let (k_pool, v_pool) = self.forward_block_layer_pre_attn(layer, &args, ctx)?;
-                        self.forward_block_layer_attention(&args, ctx, k_pool, v_pool)?;
+                        let (k_pool, v_pool) =
+                            self.forward_block_layer_pre_attn(layer, &args, ctx, scratch)?;
+                        self.forward_block_layer_attention(&args, ctx, k_pool, v_pool, scratch)?;
                     }
 
                     let post_handle = graphs[layer_idx * 2 + 1];
                     if post_handle.0 != 0 {
                         gpu.launch_graph(post_handle, stream)?;
                     } else {
-                        self.forward_block_layer_post_attn(layer, &args, ctx)?;
+                        self.forward_block_layer_post_attn(layer, &args, ctx, scratch)?;
                     }
                 }
 
@@ -895,7 +901,7 @@ impl BlockDiffusionDraftHead {
                     // empty-capture sentinel; we store the zero so the
                     // replay path falls back to eager for that slot.
                     tracing::info!(
-                        "DFlash piecewise capture: starting (key={graph_key:#x} warmup_count={}, target={}, slots={})",
+                        "DFlash piecewise capture: starting (key={graph_key:?} warmup_count={}, target={}, slots={})",
                         warmed,
                         warmup_target,
                         total_slots
@@ -910,8 +916,9 @@ impl BlockDiffusionDraftHead {
                         // option_b_indirect_args_dev (written once per propose,
                         // outside capture). Pool pointers are stable.
                         gpu.begin_capture(stream)?;
-                        let (k_pool, v_pool) = self.forward_block_layer_pre_attn(layer, &args, ctx)?;
-                        self.forward_block_layer_attention(&args, ctx, k_pool, v_pool)?;
+                        let (k_pool, v_pool) =
+                            self.forward_block_layer_pre_attn(layer, &args, ctx, scratch)?;
+                        self.forward_block_layer_attention(&args, ctx, k_pool, v_pool, scratch)?;
                         let pre_graph = gpu.end_capture(stream)?;
                         new_graphs.push(pre_graph);
                         if pre_graph.0 != 0 {
@@ -922,13 +929,15 @@ impl BlockDiffusionDraftHead {
                                 layer_idx
                             );
                             let (k_pool, v_pool) =
-                                self.forward_block_layer_pre_attn(layer, &args, ctx)?;
-                            self.forward_block_layer_attention(&args, ctx, k_pool, v_pool)?;
+                                self.forward_block_layer_pre_attn(layer, &args, ctx, scratch)?;
+                            self.forward_block_layer_attention(
+                                &args, ctx, k_pool, v_pool, scratch,
+                            )?;
                         }
 
                         // post_attn subgraph
                         gpu.begin_capture(stream)?;
-                        self.forward_block_layer_post_attn(layer, &args, ctx)?;
+                        self.forward_block_layer_post_attn(layer, &args, ctx, scratch)?;
                         let post_graph = gpu.end_capture(stream)?;
                         new_graphs.push(post_graph);
                         if post_graph.0 != 0 {
@@ -938,7 +947,7 @@ impl BlockDiffusionDraftHead {
                                 "DFlash piecewise: post_attn layer {} empty capture — eager fallback",
                                 layer_idx
                             );
-                            self.forward_block_layer_post_attn(layer, &args, ctx)?;
+                            self.forward_block_layer_post_attn(layer, &args, ctx, scratch)?;
                         }
                     }
 
@@ -956,13 +965,11 @@ impl BlockDiffusionDraftHead {
 
                     let success_count = new_graphs.iter().filter(|g| g.0 != 0).count();
                     tracing::info!(
-                        "DFlash piecewise capture: complete key={graph_key:#x} ({}/{} subgraphs captured)",
+                        "DFlash piecewise capture: complete key={graph_key:?} ({}/{} subgraphs captured)",
                         success_count,
                         total_slots
                     );
-                    if graph_key != 0 {
-                        gmap.insert(graph_key, new_graphs);
-                    }
+                    gmap.insert(graph_key, new_graphs);
                 }
             }
         } else {
@@ -987,8 +994,7 @@ impl BlockDiffusionDraftHead {
         // work on the stream; cuEventSynchronize waits only for work
         // recorded up to the event. After Phase E.4 lifts more work
         // into capture, the gap matters.
-        let pinned_ptr = self
-            .scratch
+        let pinned_ptr = scratch
             .draft_tokens_host_pinned
             .load(std::sync::atomic::Ordering::Relaxed);
         // `draft_tokens_host_pinned` is written exactly once, in
@@ -1021,9 +1027,19 @@ impl BlockDiffusionDraftHead {
         // returning, so no DMA is in flight against it when we read below.
         let host_buf: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(pinned_ptr, self.gamma * 4) };
-        gpu.copy_d2h_on_stream(self.scratch.draft_tokens_dev, host_buf, stream)?;
-        gpu.record_event(self.scratch.draft_tokens_event, stream)?;
-        gpu.event_synchronize(self.scratch.draft_tokens_event)?;
+        if defer_readback {
+            // Multi-lane mode: enqueue the async D2H into the pinned buffer
+            // and record the event WITHOUT blocking the host thread. The
+            // caller synchronizes after every lane is enqueued
+            // (read_deferred_drafts), so N lanes overlap on the GPU instead
+            // of serializing on per-lane host syncs.
+            gpu.copy_d2h_async(scratch.draft_tokens_dev, host_buf, stream)?;
+            gpu.record_event(scratch.draft_tokens_event, stream)?;
+            return Ok(Vec::new());
+        }
+        gpu.copy_d2h_on_stream(scratch.draft_tokens_dev, host_buf, stream)?;
+        gpu.record_event(scratch.draft_tokens_event, stream)?;
+        gpu.event_synchronize(scratch.draft_tokens_event)?;
         let row_order: Vec<u32> = host_buf
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1056,6 +1072,30 @@ impl BlockDiffusionDraftHead {
             );
         }
         let _ = g; // suppress unused
+        Ok(drafts)
+    }
+
+    /// Read drafts deferred by `forward_block(defer_readback=true)`.
+    /// Synchronizes this lane's D2H event, then applies the 1+N reorder.
+    pub(super) fn read_deferred_drafts(
+        &self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        scratch: &DflashScratch,
+    ) -> Result<Vec<u32>> {
+        gpu.event_synchronize(scratch.draft_tokens_event)?;
+        let pinned_ptr = scratch
+            .draft_tokens_host_pinned
+            .load(std::sync::atomic::Ordering::Relaxed);
+        anyhow::ensure!(!pinned_ptr.is_null(), "draft_tokens_host_pinned is null");
+        let host_buf: &[u8] = unsafe { std::slice::from_raw_parts(pinned_ptr, self.gamma * 4) };
+        let row_order: Vec<u32> = host_buf
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let drafts: Vec<u32> = (1..self.gamma)
+            .chain(std::iter::once(0))
+            .map(|i| row_order[i])
+            .collect();
         Ok(drafts)
     }
 }

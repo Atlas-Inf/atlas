@@ -12,7 +12,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::{
-    BlockDiffusionDraftHead, DflashKernels, DflashLayer, DflashQuantization, DflashScratch,
+    BlockDiffusionDraftHead, DflashKernels, DflashLane, DflashLayer, DflashQuantization,
+    DflashScratch,
 };
 use crate::weight_loader::DflashWeights;
 
@@ -158,7 +159,8 @@ impl BlockDiffusionDraftHead {
             // module as the target's BF16 prefill (`prefill_paged`); the
             // Rust dispatcher `ops::prefill_attention_paged_dflash` passes
             // `causal_mask_enabled=0` for bidirectional γ-block attention.
-            prefill_attn_dflash_bf16: gpu.kernel("prefill_paged_sink", "inferspark_prefill_paged_sink")?,
+            prefill_attn_dflash_bf16: gpu
+                .kernel("prefill_paged_sink", "inferspark_prefill_paged_sink")?,
             // Phase 5 (CUDA graph): indirect-args BF16 paged dispatcher + sinks.
             prefill_attn_dflash_bf16_indirect: gpu.kernel(
                 "prefill_paged_indirect_sink",
@@ -261,53 +263,94 @@ impl BlockDiffusionDraftHead {
         let n_attn = g + ctx_window; // total attention slots
         let q_dim = num_q_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        let scratch = DflashScratch {
-            stream_buf: gpu.alloc(n_attn * hidden_size * bf16)?,
-            norm_buf: gpu.alloc(n_attn * hidden_size * bf16)?,
-            q_buf: gpu.alloc(n_attn * q_dim * bf16)?,
-            k_buf: gpu.alloc(n_attn * kv_dim * bf16)?,
-            v_buf: gpu.alloc(n_attn * kv_dim * bf16)?,
-            attn_out: gpu.alloc(n_attn * q_dim * bf16)?,
-            mlp_intermediate: gpu.alloc(n_attn * intermediate_size * bf16)?,
-            mlp_up: gpu.alloc(n_attn * intermediate_size * bf16)?,
-            stream_acc: gpu.alloc(n_attn * hidden_size * bf16)?,
-            fc_proj: gpu.alloc(ctx_window * hidden_size * bf16)?,
-            // Phase 2 (Option B) precompute scratch. Worst-case the
-            // first propose runs precompute over the whole captured
-            // prefix up to `ctx_window`, so size for that. Per row:
-            // `L * 2 * kv_dim * bf16` bytes. At L=5, kv_dim=512,
-            // ctx_window=512: 5·2·512·512·2 = 5.24 MB.
-            fused_kv_out: gpu
-                .alloc(ctx_window * num_layers * 2 * num_kv_heads * head_dim * bf16)?,
-            // i64 slot mapping for reshape_and_cache (kernel takes
-            // `long long*`). One entry per new ctx row.
-            slot_mapping_dev: gpu.alloc(ctx_window * 8)?,
-            // 12 bytes of device memory holding the per-call triple
-            // `[u32 kv_len, u32 q_offset, u32 q_rope_pos]` that the indirect
-            // paged-attention kernel reads at entry. Host writes via H2D
-            // BEFORE entering the captured region.
-            option_b_indirect_args_dev: gpu.alloc(12)?,
-            // Phase E.2: pinned host buffer + event for the per-propose
-            // drafter D2H. Pinned memory lets cuMemcpyDtoHAsync issue a
-            // true async DMA on the caller's stream (vs. the synchronous
-            // staging fallback the driver picks for pageable destinations).
-            // The event lets us wait on the *copy*, not the whole stream,
-            // so target-model verify work issued on the same stream can
-            // proceed in parallel.
-            draft_tokens_host_pinned: std::sync::atomic::AtomicPtr::new(
-                gpu.alloc_host_pinned(gamma_val * 4)?,
-            ),
-            draft_tokens_event: gpu.create_event()?,
-            // γ rows only — NOT n_attn. The lm_head GEMM writes M=γ rows,
-            // argmax + BLOCK_DUMP read rows 0..γ, and no path indexes logits
-            // by ctx offset. Sizing at n_attn×vocab would cost 2.04 GB at
-            // cw=4096 for rows nothing ever touches (γ rows ≈ 8.4 MB).
-            logits: gpu.alloc(g * vocab_size * bf16)?,
-            draft_tokens_dev: gpu.alloc(n_attn * 4)?,
-            markov_prev_dev: gpu.alloc(4)?,
-            markov_prev_host_pinned: std::sync::atomic::AtomicPtr::new(gpu.alloc_host_pinned(4)?),
-            position_ids: gpu.alloc(n_attn * 4)?,
+        // One scratch set per propose lane: the piecewise graphs bake these
+        // pointers at capture, so each lane needs its own. γ rows only for
+        // logits (see the per-field note below).
+        let make_scratch = |gpu: &dyn GpuBackend| -> Result<DflashScratch> {
+            Ok(DflashScratch {
+                stream_buf: gpu.alloc(n_attn * hidden_size * bf16)?,
+                norm_buf: gpu.alloc(n_attn * hidden_size * bf16)?,
+                q_buf: gpu.alloc(n_attn * q_dim * bf16)?,
+                k_buf: gpu.alloc(n_attn * kv_dim * bf16)?,
+                v_buf: gpu.alloc(n_attn * kv_dim * bf16)?,
+                attn_out: gpu.alloc(n_attn * q_dim * bf16)?,
+                mlp_intermediate: gpu.alloc(n_attn * intermediate_size * bf16)?,
+                mlp_up: gpu.alloc(n_attn * intermediate_size * bf16)?,
+                stream_acc: gpu.alloc(n_attn * hidden_size * bf16)?,
+                fc_proj: gpu.alloc(ctx_window * hidden_size * bf16)?,
+                // Phase 2 (Option B) precompute scratch. Worst-case the
+                // first propose runs precompute over the whole captured
+                // prefix up to `ctx_window`, so size for that. Per row:
+                // `L * 2 * kv_dim * bf16` bytes. At L=5, kv_dim=512,
+                // ctx_window=512: 5·2·512·512·2 = 5.24 MB.
+                fused_kv_out: gpu
+                    .alloc(ctx_window * num_layers * 2 * num_kv_heads * head_dim * bf16)?,
+                // i64 slot mapping for reshape_and_cache (kernel takes
+                // `long long*`). One entry per new ctx row.
+                slot_mapping_dev: gpu.alloc(ctx_window * 8)?,
+                // 12 bytes of device memory holding the per-call triple
+                // `[u32 kv_len, u32 q_offset, u32 q_rope_pos]` that the indirect
+                // paged-attention kernel reads at entry. Host writes via H2D
+                // BEFORE entering the captured region.
+                option_b_indirect_args_dev: gpu.alloc(12)?,
+                // Phase E.2: pinned host buffer + event for the per-propose
+                // drafter D2H. Pinned memory lets cuMemcpyDtoHAsync issue a
+                // true async DMA on the caller's stream (vs. the synchronous
+                // staging fallback the driver picks for pageable destinations).
+                // The event lets us wait on the *copy*, not the whole stream,
+                // so target-model verify work issued on the same stream can
+                // proceed in parallel.
+                draft_tokens_host_pinned: std::sync::atomic::AtomicPtr::new(
+                    gpu.alloc_host_pinned(gamma_val * 4)?,
+                ),
+                draft_tokens_event: gpu.create_event()?,
+                // γ rows only — NOT n_attn. The lm_head GEMM writes M=γ rows,
+                // argmax + BLOCK_DUMP read rows 0..γ, and no path indexes logits
+                // by ctx offset. Sizing at n_attn×vocab would cost 2.04 GB at
+                // cw=4096 for rows nothing ever touches (γ rows ≈ 8.4 MB).
+                logits: gpu.alloc(g * vocab_size * bf16)?,
+                draft_tokens_dev: gpu.alloc(n_attn * 4)?,
+                markov_prev_dev: gpu.alloc(4)?,
+                markov_prev_host_pinned: std::sync::atomic::AtomicPtr::new(
+                    gpu.alloc_host_pinned(4)?,
+                ),
+                position_ids: gpu.alloc(n_attn * 4)?,
+            })
         };
+        let scratch = make_scratch(gpu)?;
+
+        // Extra propose lanes: `ATLAS_DFLASH_PROPOSE_LANES` total lanes
+        // (default 4). Each extra lane gets its own stream, scratch set,
+        // Markov scratch, and a done-event the default stream waits on
+        // before verify. Lanes >1 only engaged by propose_batch.
+        let n_lanes: usize = std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4)
+            .max(1);
+        let mut extra_lanes = Vec::with_capacity(n_lanes - 1);
+        for _ in 1..n_lanes {
+            let stream = gpu.create_stream()?;
+            extra_lanes.push(DflashLane {
+                stream,
+                scratch: make_scratch(gpu)?,
+                markov_embed: if weights.markov_rank > 0 {
+                    gpu.alloc(weights.markov_rank * 2)?
+                } else {
+                    DevicePtr::NULL
+                },
+                markov_bias: if weights.markov_rank > 0 {
+                    gpu.alloc(weights.config.vocab_size * 2)?
+                } else {
+                    DevicePtr::NULL
+                },
+                done_event: gpu.create_event()?,
+            });
+        }
+        tracing::info!(
+            "DFlash propose lanes: {} (extra scratch + streams)",
+            n_lanes
+        );
 
         // Pre-compute inv_freq table for drafter RoPE.
         //
@@ -469,12 +512,12 @@ impl BlockDiffusionDraftHead {
             markov_w1: weights.markov_w1,
             markov_w2: weights.markov_w2,
             markov_rank: weights.markov_rank,
-            markov_embed: if weights.markov_rank > 0 {
+            lane0_markov_embed: if weights.markov_rank > 0 {
                 gpu.alloc(weights.markov_rank * 2)?
             } else {
                 DevicePtr::NULL
             },
-            markov_bias: if weights.markov_rank > 0 {
+            lane0_markov_bias: if weights.markov_rank > 0 {
                 gpu.alloc(weights.config.vocab_size * 2)?
             } else {
                 DevicePtr::NULL
@@ -519,6 +562,7 @@ impl BlockDiffusionDraftHead {
             fused_kv_weight: Some(fused_kv_weight),
             kv_cache: Mutex::new(kv_cache),
             scratch,
+            extra_lanes,
             kernels,
             max_seq_len,
             yarn_inv_freq,
@@ -529,6 +573,8 @@ impl BlockDiffusionDraftHead {
             // Phase F: per-subgraph graph state — empty until the first
             // capture pass lands. Layout: [pre_0, post_0, ..., tail].
             propose_graphs: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            next_lane: std::sync::atomic::AtomicUsize::new(0),
+            lanes_start_event: gpu.create_event()?,
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),
             propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
             quant: DflashQuantization::Bf16,
