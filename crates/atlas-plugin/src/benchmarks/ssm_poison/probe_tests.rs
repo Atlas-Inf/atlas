@@ -58,6 +58,13 @@ fn request_body_is_greedy_pinned_seed_stream() {
     // The replay invariant only holds when the sampler cannot vary: if the
     // temperature were > 0 the gate would measure sampling noise, not state.
     assert_eq!(body["temperature"].as_f64(), Some(0.0));
+    // Thinking is disabled via the SERVE CONFIG (--serve-override
+    // disable_thinking=true), NOT per request: the per-request
+    // chat_template_kwargs.enable_thinking:false path degenerates to a ~2-token
+    // stop on this qwen3_6_moe checkpoint (measured 2026-08-15). The request
+    // body must therefore carry NO chat_template_kwargs — the serve owns the
+    // thinking mode, matching the working path BFCL uses.
+    assert!(body.get("chat_template_kwargs").is_none());
 }
 
 // ---- reference anchors (B4) ----------------------------------------------

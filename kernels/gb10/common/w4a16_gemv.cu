@@ -50,6 +50,57 @@ __device__ __constant__ float E2M1_LUT[16] = {
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
+// ── Stage the E2M1 table in SHARED memory before any decode inner loop ──
+// The dequant indexes the table with a DATA-DEPENDENT weight nibble. A read of
+// __constant__ memory SERIALIZES across a warp whenever the lanes hit divergent
+// entries: the constant cache is a BROADCAST cache and replays once per distinct
+// address, and 32 lanes drawing NVFP4 nibbles cover 16*(1-(15/16)^32) ~= 14 of
+// the 16 entries, so one LUT read costs ~14 transactions. Shared memory services
+// divergent indices in parallel — the 16 entries sit in 16 distinct banks and
+// same-index lanes multicast, so the read is one conflict-free transaction.
+// Same lever, same reasoning as `w8a16_gemm_pipelined.cu` (measured 5x there).
+//
+// This is NOT a numerical change: `s_lut[i]` is a bit-exact FP32 copy of
+// `E2M1_LUT[i]`, so every fmaf sees the identical operand it saw before.
+//
+// ── HIP / SCALE portability ──────────────────────────────────────────────────
+// This file is SYMLINKED into kernels/strix-hip/common/ and kernels/strix/common/,
+// so hipcc compiles it verbatim. `__syncwarp()` is a CUDA intrinsic that target
+// does not accept: the strix-hip fork of w4a16_gemm.cu contains zero
+// `__syncwarp` and the tree carries no shim. Introducing it unguarded broke the
+// windows-x86_64-amd-hip release build (#519).
+//
+// NOTE the block-wide staging elsewhere in this file (`__shared__ s_lut` +
+// `__syncthreads()`, 9 pre-existing sites) is FINE on HIP and is untouched.
+// Only the WARP-scoped publish is CUDA-only.
+//
+// On AMD the warp-scoped path keeps the PRE-EXISTING behaviour: no staging, the
+// partial indexes `__constant__ E2M1_LUT` directly, exactly as shipped before
+// this change. Provably compilable (it is the shipped code) and provably
+// correct; it forgoes the staging win on a target we cannot measure. Doing
+// better needs a wave-scoped publish (`__builtin_amdgcn_wave_barrier()` plus
+// the right fence) VALIDATED on gfx1151 — no such box exists here, so it is not
+// guessed at, for the same reason the strix-hip batched-prefill argument shift
+// was left to someone with the hardware.
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+#define ATLAS_WARP_LUT_STAGED 0
+#else
+#define ATLAS_WARP_LUT_STAGED 1
+#endif
+
+// WARP-SCOPED variant, for the single-warp kernels: they early-return on a
+// warp-uniform `n >= N`, so a block-wide __syncthreads() here would be a
+// divergent barrier. Lanes 0..15 fill their own warp's copy; __syncwarp()
+// publishes it. The reduction below stays barrier-free, as documented.
+__device__ __forceinline__ void stage_e2m1_lut_warp(float* s_lut, unsigned int lane) {
+#if ATLAS_WARP_LUT_STAGED
+    if (lane < 16u) s_lut[lane] = E2M1_LUT[lane];
+    __syncwarp();
+#else
+    (void)s_lut; (void)lane;   // AMD: nothing staged; callers pass the constant LUT
+#endif
+}
+
 // W4A16 GEMV: C[n] = sum_k A[k] * dequant(B_fp4[n, k])
 //
 // Vectorized: 16 K-values per chunk (2× uint4 activation + uint64 weight),
@@ -73,7 +124,8 @@ __device__ __forceinline__ float w4a16_gemv_partial(
     const unsigned char* __restrict__ B_scale,
     const float scale2,
     unsigned int n, unsigned int half_K, unsigned int num_groups,
-    unsigned int K16, unsigned int orig_lane)
+    unsigned int K16, unsigned int orig_lane,
+    const float* __restrict__ lut)   // shared-staged E2M1_LUT copy; see stage_e2m1_lut_warp
 {
     float acc0 = 0.0f, acc1 = 0.0f;
     const unsigned int stride2 = 128u; // threads_per_out (64) * 2
@@ -102,8 +154,8 @@ __device__ __forceinline__ float w4a16_gemv_partial(
             for (int b = 0; b < 8; b++) {
                 unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
                 float2 af = __bfloat1622float2(*(const __nv_bfloat162*)&a_raw[b]);
-                part = fmaf(af.x, E2M1_LUT[byte_val & 0xF], part);
-                part = fmaf(af.y, E2M1_LUT[byte_val >> 4], part);
+                part = fmaf(af.x, lut[byte_val & 0xF], part);
+                part = fmaf(af.y, lut[byte_val >> 4], part);
             }
             if (c == 0) acc0 = fmaf(scale, part, acc0);
             else        acc1 = fmaf(scale, part, acc1);
@@ -130,12 +182,16 @@ extern "C" __global__ void w4a16_gemv(
     const unsigned int num_groups = K / GROUP_SIZE;
     const unsigned int K16 = K / 16;
 
+    __shared__ float s_lut[16];
     __shared__ float smem[N_PER_BLOCK * 2];  // cross-warp reduction
+    // Block-staged here (all 256 threads reach this barrier — no early return).
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
 
     // Do not return early: N%4!=0 tail warps must still hit the smem barrier.
     float acc = 0.0f;
     if (n < N) {
-        acc = w4a16_gemv_partial(A, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane);
+        acc = w4a16_gemv_partial(A, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane, s_lut);
     }
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
@@ -192,10 +248,20 @@ extern "C" __global__ void w4a16_gemv_sw(
     const unsigned int num_groups = K / GROUP_SIZE;
     const unsigned int K16 = K / 16;
 
+    // One private copy per warp (8 warps x 16 floats = 512 B/block): the block
+    // barrier is unavailable here (warp-uniform early return above).
+    __shared__ float s_lut[N_PER_BLOCK_SW][16];
+    stage_e2m1_lut_warp(s_lut[local_out], lane);
+#if ATLAS_WARP_LUT_STAGED
+    const float* __restrict__ warp_lut = s_lut[local_out];
+#else
+    const float* __restrict__ warp_lut = E2M1_LUT;
+#endif
+
     // acc_a reproduces orig lane `lane` (warp A); acc_b reproduces orig lane
     // `lane+32` (warp B). Same operands, same order as the 64-thread kernel.
-    float acc_a = w4a16_gemv_partial(A, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane);
-    float acc_b = w4a16_gemv_partial(A, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane + 32u);
+    float acc_a = w4a16_gemv_partial(A, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane, warp_lut);
+    float acc_b = w4a16_gemv_partial(A, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane + 32u, warp_lut);
 
     // Reduce each accumulator within the warp in the SAME tree order as orig.
     #pragma unroll

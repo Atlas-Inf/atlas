@@ -351,7 +351,7 @@ const VISION_EXCLUDES: &[Exclusion] = &[
 ];
 
 /// The gates whose records must pass, and what each one ignores.
-pub const REQUIRED: [GateCoverage; 7] = [
+pub const REQUIRED: [GateCoverage; 8] = [
     GateCoverage {
         id: "agentic-webserver",
         excludes: AGENTIC_EXCLUDES,
@@ -370,6 +370,18 @@ pub const REQUIRED: [GateCoverage; 7] = [
     // problem to solve first.
     GateCoverage {
         id: "vision-fidelity",
+        excludes: VISION_EXCLUDES,
+    },
+    // Video models only, and narrower than the vision gate: declared on
+    // qwen3.8-27b alone, the target this workstream validated video against.
+    // The same BENCH.toml mechanism carries the constraint — a target with no
+    // `gate = "video-fidelity"` entry has nothing to run.
+    //
+    // It shares the vision excludes: the question "did the frames reach the
+    // model, in order" is answered by the same preprocessing, encoder and
+    // splice, so the same set of paths can change the answer.
+    GateCoverage {
+        id: "video-fidelity",
         excludes: VISION_EXCLUDES,
     },
     GateCoverage {
@@ -455,7 +467,13 @@ pub const PROMOTION_CANDIDATES: &[GateCoverage] = &[
     },
 ];
 
-pub const NOT_REQUIRED: [(&str, &str); 4] = [
+pub const NOT_REQUIRED: [(&str, &str); 5] = [
+    (
+        "quick-speed-bench",
+        "a single-user speed probe with no thresholds and no baseline — a MEASUREMENT tool, \
+         deliberately never a gate: the seven required gates already cost ~4.5 h per PR, and \
+         its warm-path numbers (primed prefix cache + SSM snapshot) are not regression evidence",
+    ),
     (
         "bfcl-full",
         "the unsampled ~3600-sample draw; the two subset gates cover the same code at a \

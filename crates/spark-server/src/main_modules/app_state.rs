@@ -61,6 +61,12 @@ pub struct AppState {
     /// Default-disabled; see `api::chat::remote_image` for why this one
     /// capability is opt-in rather than default-ON with a kill-switch.
     pub remote_image_policy: crate::api::chat::remote_image::RemoteImagePolicy,
+    /// Subprocess decoding policy for video parts. Disabled by default; see
+    /// `spark_model::video_decode_ffmpeg` for why video needs an external
+    /// decoder for everything except GIF.
+    pub video_ffmpeg: spark_model::video_decode_ffmpeg::FfmpegPolicy,
+    /// Frames per second a video is sampled at.
+    pub video_fps: f32,
     /// Default sampling temperature from generation_config.json.
     pub default_temperature: f32,
     /// Default top-k from generation_config.json.
@@ -118,6 +124,15 @@ pub struct AppState {
     /// body. Wired from `--default-chat-template-kwargs` (parsed at the
     /// CLI edge into the neutral directive).
     pub default_thinking: crate::ir::ThinkingDirective,
+    /// Server-level default `reasoning_effort` (template side), applied
+    /// in `api/chat/prepare.rs` when the request carries no effort and
+    /// thinking is ON. Wired from `--default-chat-template-kwargs`
+    /// `{"reasoning_effort":"..."}`. `None` = the cross-template
+    /// `"medium"` fallback in `tokenizer/chat_render.rs` applies (the
+    /// neutral tier — pre-2026-08 the fallback was `"high"`, which
+    /// Qwen3.8's template escalates to its most expensive `xhigh`
+    /// directive).
+    pub default_reasoning_effort: Option<crate::ir::ReasoningEffort>,
     /// Shared in-memory store for stateful Responses API resume
     /// (`previous_response_id`) and opt-in Chat-Completions storage
     /// (`store: true`). Bounded LRU + TTL; env-configured at startup.
