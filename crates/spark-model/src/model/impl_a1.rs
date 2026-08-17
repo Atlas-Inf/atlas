@@ -171,16 +171,12 @@ impl TransformerModel {
         // Build SSM state pool (with MTP intermediate/checkpoint pools only if speculative decoding enabled)
         // num_intermediates = K (per-token SSM h/conv state snapshots).
         // For MTP K=2/3/4 verify: K = num_drafts + 1.
-        // For DFlash K=γ verify: K = γ + 1 (drafter's γ drafts + 1 verified bonus slot).
-        // Pool size = max of both so DFlash and MTP can coexist on the same model.
-        let dflash_kgamma = if !config.dflash_capture_layers.is_empty() {
-            // Drafter's γ is fixed in dflash config; use the largest known γ
-            // (16 for `Qwen3.6-DFlash`). The +1 is the prefix bonus position
-            // in the verify input `[last_token, draft_0, ..., draft_{γ-1}]`.
-            17
-        } else {
-            0
-        };
+        // For DFlash/DSpark, verify rows are `[last_token, draft_1, ..., draft_K]`:
+        // exactly `num_drafts + 1`. The anchor bonus is not a draft row.
+        let dflash_kgamma = super::dspark_pool::dflash_verify_rows(
+            !config.dflash_capture_layers.is_empty(),
+            num_drafts,
+        )?;
         // DFlash needs the SSM verify pools regardless of MTP weight presence
         // or lm_head quantization — its K=γ verify path checkpoints SSM state
         // for partial-accept rollback. Force `has_mtp` on whenever DFlash is

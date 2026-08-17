@@ -9,6 +9,17 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+pub(crate) fn checked_dflash_num_drafts(gamma: usize) -> Result<usize> {
+    let num_drafts = gamma
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("DFlash/DSpark gamma must be at least 2, found {gamma}"))?;
+    anyhow::ensure!(
+        num_drafts > 0,
+        "DFlash/DSpark gamma must be at least 2, found {gamma}"
+    );
+    Ok(num_drafts)
+}
+
 /// Floor SSM snapshot slots so a 1M prefill does not drop Marconi
 /// checkpoints (`SSM snapshot pool exhausted`). Tokens per snapshot =
 /// `ssm_checkpoint_interval * block_size` (default 256*16=4096).
@@ -97,7 +108,7 @@ pub(crate) fn build_model(
         comm,
         args.self_speculative || args.ngram_speculative,
         if args.dflash {
-            args.dflash_gamma.saturating_sub(1).max(1)
+            checked_dflash_num_drafts(args.dflash_gamma)?
         } else {
             args.num_drafts
         },
@@ -324,5 +335,17 @@ mod prefix_cache_tests {
 
         let cache = build_prefix_cache(&enabled_args(), &config);
         assert!(!cache.is_active());
+    }
+}
+
+#[cfg(test)]
+mod dspark_tests {
+    use super::checked_dflash_num_drafts;
+
+    #[test]
+    fn checked_gamma_derives_k_without_clamping() {
+        assert_eq!(checked_dflash_num_drafts(4).unwrap(), 3);
+        assert!(checked_dflash_num_drafts(0).is_err());
+        assert!(checked_dflash_num_drafts(1).is_err());
     }
 }
