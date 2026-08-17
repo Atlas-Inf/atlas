@@ -30,6 +30,13 @@
   <a href="https://x.com/AIshaqui81766/status/2052121270506930276"><img alt="Launch announcement on X" src="https://img.shields.io/badge/%F0%9D%95%8F%20Launch%20Announcement-000000?style=for-the-badge&logo=x&logoColor=white"></a>
 </p>
 
+> [!WARNING]
+> **Work in progress.** This r0b0tlab fork carries active GB10/SM121 and
+> Nemotron 3.5 Lightning + DSpark development. The current `main` branch is
+> published for source visibility and collaboration; it is **not a qualified
+> Atlas release**, and the open C>1 DSpark correctness/performance work is
+> intentionally retained with explicit `NOT QUALIFIED` history.
+
 ---
 
 ## 📑 Table of Contents
