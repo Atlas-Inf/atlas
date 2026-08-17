@@ -544,6 +544,12 @@ pub use contract::{
 };
 #[cfg(test)]
 mod contract_tests;
+mod row_contract;
+pub use row_contract::{
+    CommitProjection, DsparkProposal, DsparkRowError, LightningRowContract,
+};
+#[cfg(test)]
+mod row_contract_tests;
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
