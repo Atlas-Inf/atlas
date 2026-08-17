@@ -348,13 +348,13 @@ impl BlockDiffusionDraftHead {
         let scratch = make_scratch(gpu)?;
 
         // Extra propose lanes: `ATLAS_DFLASH_PROPOSE_LANES` total lanes
-        // (default 4). Each extra lane gets its own stream, scratch set,
+        // (default 1). Each extra lane gets its own stream, scratch set,
         // Markov scratch, and a done-event the default stream waits on
         // before verify. Lanes >1 only engaged by propose_batch.
         let n_lanes: usize = std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(4)
+            .unwrap_or(1)
             .max(1);
         let mut extra_lanes = Vec::with_capacity(n_lanes - 1);
         for _ in 1..n_lanes {

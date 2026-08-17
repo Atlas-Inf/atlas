@@ -838,6 +838,11 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Restore sequence 0's capture after batched commit packing.
+    fn restore_dflash_save_front(&self, _k: usize, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Run the MTP proposer for one draft token off the saved hidden state.
     /// `None` when no proposer is wired.
     fn run_mtp_propose(

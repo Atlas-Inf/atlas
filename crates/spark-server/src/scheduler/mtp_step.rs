@@ -394,7 +394,16 @@ pub fn step_mtp(
     // the D-Cut-at-depth policy: pruning the 16:2 rung's n=16 measured -9%)
     // ⇒ `ks` is the uniform ladder shape and everything below reduces to the
     // pre-D-Cut path exactly.
-    let ks = mtp_dcut::plan(active, &mut batchable_idxs, ladder_nd, rows);
+    // DSpark's release contract is fixed K=3 at every width. D-Cut changes a
+    // sequence's verifier width from K+1=4 to 2/3 rows, which selects different
+    // native attention/LM dispatch shapes and is not greedy-equivalent to the
+    // C1 K=4 control. Keep DSpark uniform; D-Cut remains available to ordinary
+    // MTP where its width-specific quality/performance evidence applies.
+    let ks = if dflash_verify_raw_argmax {
+        vec![rows; batchable_idxs.len()]
+    } else {
+        mtp_dcut::plan(active, &mut batchable_idxs, ladder_nd, rows)
+    };
 
     // Chunking: the 96-row buffer bound `can_batch_verify` enforces, with the
     // per-chunk sequence cap DERIVED from it (`VERIFY_ROW_BUDGET / widest

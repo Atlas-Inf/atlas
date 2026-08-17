@@ -453,7 +453,7 @@ pub struct BlockDiffusionDraftHead {
     pub scratch: DflashScratch,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
-    /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 4 lanes).
+    /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
     /// A sequence's lane is fixed for its lifetime (`slot % lanes`) so its
     /// captured graphs always replay against the scratch they captured with.
     pub extra_lanes: Vec<DflashLane>,
@@ -570,7 +570,7 @@ mod propose;
 
 impl BlockDiffusionDraftHead {
     /// Total propose lanes (lane 0 = default-stream scratch; the rest live
-    /// in `extra_lanes`). `ATLAS_DFLASH_PROPOSE_LANES` overrides (default 4).
+    /// in `extra_lanes`). `ATLAS_DFLASH_PROPOSE_LANES` overrides (default 1).
     pub fn lane_count(&self) -> usize {
         1 + self.extra_lanes.len()
     }

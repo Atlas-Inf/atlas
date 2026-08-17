@@ -527,9 +527,6 @@ impl TransformerModel {
             Some(p) => p,
             None => return Ok(()),
         };
-        if seq_i == 0 {
-            return Ok(());
-        }
         let h = self.config.hidden_size;
         let ctx_slot_bytes = self.dflash_capture_layers.len() * h * 2;
         if ctx_slot_bytes == 0 {
@@ -537,9 +534,34 @@ impl TransformerModel {
         }
         let kmax = self.dflash_hidden_save_rows;
         let n = k.min(kmax);
+        if seq_i == 0 {
+            let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
+            self.gpu
+                .copy_d2d_async(dst, preserve, n * ctx_slot_bytes, stream)?;
+            return Ok(());
+        }
         let src = dst.offset(seq_i * kmax * ctx_slot_bytes);
         self.gpu
             .copy_d2d_async(src, dst, n * ctx_slot_bytes, stream)?;
         Ok(())
+    }
+
+    /// Restore sequence 0's capture after the batched commit loop packed other
+    /// sequences into the C=1 front. Must run before batched re-propose reads
+    /// the per-sequence capture regions.
+    pub(super) fn restore_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+        let dst = match self.dflash_hidden_save {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let ctx_slot_bytes = self.dflash_capture_layers.len() * self.config.hidden_size * 2;
+        if ctx_slot_bytes == 0 {
+            return Ok(());
+        }
+        let kmax = self.dflash_hidden_save_rows;
+        let n = k.min(kmax);
+        let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
+        self.gpu
+            .copy_d2d_async(preserve, dst, n * ctx_slot_bytes, stream)
     }
 }

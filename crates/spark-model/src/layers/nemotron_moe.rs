@@ -365,26 +365,27 @@ impl TransformerLayer for NemotronMoeLayer {
         stream: u64,
     ) -> Result<()> {
         anyhow::ensure!(ks.len() == n_seqs, "decode_verify_multi: ks/n mismatch");
-        // DSV4/Lightning: C=1 KEEP is n=k≤4 slot Marlin. One launch over
-        // R=Σks (C=4 R=11) garbles — same class as fused-Mamba over R.
-        // Loop per seq so each call is the proven n≤4 shape.
-        if self.marlin.is_some() {
-            let h = ctx.config.hidden_size;
-            let mut off = 0usize;
-            for &k in ks {
-                self.decode_batched_direct(
-                    hidden.offset(off),
-                    residual.offset(off),
-                    k,
-                    ctx,
-                    stream,
-                )?;
-                off += k * h * 2;
-            }
-            return Ok(());
+        // Lightning's verified C=1 contract is one native K-row MoE launch per
+        // sequence. Collapsing unrelated sequences into R=Σks changes the
+        // decode dispatch width (and therefore the reduction order/kernel arm),
+        // which is not greedy-equivalent: distinct C>1 prompts diverge from
+        // their C1 controls even though attention, Mamba, and LM-head are exact.
+        // Keep the weight-preserving batched verifier at the sequence boundary:
+        // each sequence still verifies all of its K rows natively in one call,
+        // but no call may mix another sequence's rows.
+        let h = ctx.config.hidden_size;
+        let mut off_bytes = 0usize;
+        for &k in ks {
+            self.decode_batched_direct(
+                hidden.offset(off_bytes),
+                residual.offset(off_bytes),
+                k,
+                ctx,
+                stream,
+            )?;
+            off_bytes += k * h * 2;
         }
-        let num_tokens: usize = ks.iter().sum();
-        self.decode_batched_direct(hidden, residual, num_tokens, ctx, stream)
+        Ok(())
     }
 
     /// Batched MoE prefill: uses GEMM for gate/fc1/fc2/shared, per-token for routing + experts.

@@ -404,23 +404,66 @@ impl TransformerModel {
                 let t0 = std::time::Instant::now();
 
                 if layer_type == LayerType::FullAttention {
-                    let mut refs: Vec<&mut (dyn LayerState + 'static)> = attn_dummy_states
-                        [attn_idx]
-                        .iter_mut()
-                        .map(|s| s.as_mut())
-                        .collect();
+                    // Preserve the C1 verifier's K-row attention width for
+                    // each sequence. A single R=Σks attention launch mixes
+                    // unrelated sequence rows and is not greedy-equivalent.
+                    let layer_states = &mut attn_dummy_states[attn_idx];
+                    for i in 0..n {
+                        let row0 = off[i];
+                        let k = ks[i];
+                        let seq_slot_i = if seq_slot.is_null() {
+                            DevicePtr::NULL
+                        } else {
+                            seq_slot.offset(row0 * 4)
+                        };
+                        let metadata_i = AttnMetadataDev {
+                            positions: meta_base.offset(row0 * 4),
+                            positions_h: meta_base.offset(row0 * 4),
+                            positions_w: meta_base.offset(row0 * 4),
+                            slot: meta_base.offset(768 + row0 * 8),
+                            seq_len: meta_base.offset(1536 + row0 * 4),
+                            block_table: meta_base.offset(2048 + row0 * mb * 4),
+                            max_blocks_per_seq: max_blocks,
+                            num_seqs: k as u32,
+                            seq_slot: seq_slot_i,
+                            moe_row_adapter: DevicePtr::NULL,
+                        };
+                        let ctx_i = ForwardContext {
+                            buffers: &self.buffers,
+                            gpu: self.gpu.as_ref(),
+                            config: &self.config,
+                            dispatch: &self.dispatch,
+                            moe_lora_route: self.decode_moe_route(),
+                            derived: &self.derived,
+                            levers: &self.levers,
+                            stats: &self.stats,
+                            attn_metadata: Some(metadata_i),
+                            profile: false,
+                            comm: self.comm_ref(),
+                            graph_capture: capture,
+                            gdn_exact_replay: false,
+                            token_ids: None,
+                            routed_lora_layers: None,
+                            midchunk_capture: None,
+                        };
+                        let mut refs: Vec<&mut (dyn LayerState + 'static)> = layer_states
+                            [row0..row0 + k]
+                            .iter_mut()
+                            .map(|s| s.as_mut())
+                            .collect();
+                        layer.decode_multi_seq(
+                            hidden.offset(row0 * h * bf16),
+                            residual.offset(row0 * h * bf16),
+                            k,
+                            &mut refs,
+                            &mut kv_cache,
+                            &seq_lens_vec[row0..row0 + k],
+                            &block_tables_vec[row0..row0 + k],
+                            &ctx_i,
+                            stream,
+                        )?;
+                    }
                     attn_idx += 1;
-                    layer.decode_multi_seq(
-                        hidden,
-                        residual,
-                        r_total,
-                        &mut refs,
-                        &mut kv_cache,
-                        &seq_lens_vec,
-                        &block_tables_vec,
-                        &ctx,
-                        stream,
-                    )?;
                 } else {
                     let mut wy_slice = DevicePtr::NULL;
                     if layer_type == LayerType::LinearAttention {
@@ -493,13 +536,22 @@ impl TransformerModel {
             }
 
             // R ≤ VERIFY_ROW_CAP = the 96-row logits buffer cap (sizes.rs).
-            self.lm_head_batched(normed, r_total as u32, self.buffers.logits(), stream)?;
+            // Keep the LM-head dispatch at each sequence's exact C1-verified
+            // K-row width while preserving the shared seq-major logits layout.
+            let vocab = self.config.vocab_size;
+            for i in 0..n {
+                self.lm_head_batched(
+                    normed.offset(off[i] * h * bf16),
+                    ks[i] as u32,
+                    self.buffers.logits().offset(off[i] * vocab * bf16),
+                    stream,
+                )?;
+            }
 
             if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                 anyhow::bail!("K4_DIAG(batched): CUDA error after lm_head_batched: {e:#}");
             }
 
-            let vocab = self.config.vocab_size;
             // MAPPED-ARGMAX (2026-07-30, the 130 ms stall fix that finally
             // held): the argmax kernel writes its 4 B/row results DIRECTLY to
             // page-locked host-mapped memory (UMA device alias), so the step

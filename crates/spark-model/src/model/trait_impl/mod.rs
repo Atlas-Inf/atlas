@@ -644,6 +644,10 @@ impl Model for TransformerModel {
         TransformerModel::pack_dflash_save_seq(self, seq_i, k, stream)
     }
 
+    fn restore_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+        TransformerModel::restore_dflash_save_front(self, k, stream)
+    }
+
     fn dflash_serial_ctx_append(&self, seq: &mut SequenceState) -> Result<()> {
         // Ctx-holes fix: append the serial-decoded token's captured hidden.
         // The decode layer loop (decode_a.rs try_dflash_capture) already

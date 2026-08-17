@@ -58,7 +58,28 @@ pub(super) fn step_verify_dflash_batched(
     }
 
     let t_verify = Instant::now();
-    let results: Vec<u32> = {
+    let results: Vec<u32> = if std::env::var("ATLAS_DFLASH_VERIFY_COMPUTE_SERIAL").as_deref()
+        == Ok("1")
+    {
+        // Diagnostic boundary: retain the batched scheduler/accept/commit path
+        // while replacing only the target forward with the proven per-sequence
+        // K=4 verifier. This distinguishes compute drift from batched verdict
+        // bookkeeping without changing drafts, row slices, or re-propose.
+        let mut all = Vec::with_capacity(acc);
+        for i in 0..n {
+            match model.decode_verify_dflash(&tokens[off[i]..off[i + 1]], &mut batch[i].seq, 0) {
+                Ok(mut r) => all.append(&mut r),
+                Err(e) => {
+                    tracing::error!("decode_verify_dflash serial diagnostic (i={i}): {e:#}");
+                    for a in batch.iter_mut() {
+                        a.finished = true;
+                    }
+                    return;
+                }
+            }
+        }
+        all
+    } else {
         let mut seq_refs: Vec<&mut SequenceState> = batch.iter_mut().map(|a| &mut a.seq).collect();
         match model.decode_verify_batched(&tokens, ks, &mut seq_refs, 0) {
             Ok(r) => r,
@@ -132,6 +153,13 @@ pub(super) fn step_verify_dflash_batched(
             propose_nd,
             dflash_verify_raw_argmax,
         );
+    }
+    if let Err(e) = model.restore_dflash_save_front(ks[0], 0) {
+        tracing::error!("restore_dflash_save_front: {e:#}");
+        for a in batch.iter_mut() {
+            a.finished = true;
+        }
+        return;
     }
     let t_propose = Instant::now();
     let pending: Vec<usize> = (0..n)

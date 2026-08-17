@@ -458,8 +458,12 @@ impl TransformerModel {
             None
         } else {
             let n = dflash_capture_layers.len();
+            // One extra sequence-sized region is a preservation slot for the
+            // C=1 front while batched commit_ctx temporarily packs seq 1..N
+            // into that front. Without it, the final pack overwrites seq 0's
+            // capture before batched re-propose and poisons the next turn.
             let save = gpu.alloc(
-                dflash_hidden_save_nseq
+                (dflash_hidden_save_nseq + 1)
                     * dflash_hidden_save_rows
                     * n
                     * config.hidden_size
@@ -476,7 +480,11 @@ impl TransformerModel {
             gpu.memset(
                 save,
                 0,
-                dflash_hidden_save_nseq * dflash_hidden_save_rows * n * config.hidden_size * 2,
+                (dflash_hidden_save_nseq + 1)
+                    * dflash_hidden_save_rows
+                    * n
+                    * config.hidden_size
+                    * 2,
             )?;
             Some(save)
         };
