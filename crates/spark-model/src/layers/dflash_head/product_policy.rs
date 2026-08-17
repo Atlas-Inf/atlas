@@ -24,44 +24,86 @@ pub struct LightningDsparkRuntimeToggles {
 
 impl LightningDsparkRuntimeToggles {
     /// Read the startup environment once for product admission.
-    ///
-    /// The value/presence rules mirror the existing DFlash sites: `=1` for
-    /// positive opt-ins, presence for negative kill switches, and parsed
-    /// defaults for lane count and draft-cap overrides.
-    pub fn from_env() -> Self {
-        let proposal_graph_eligible = !present("ATLAS_DFLASH_PROPOSE_NO_GRAPH")
-            && !one("ATLAS_DFLASH_DEBUG_NO_GRAPH")
-            && !one("ATLAS_DEBUG_NO_GRAPH")
-            && !one("ATLAS_DIAG_GEMMA4")
-            && !present_any(&[
-                "ATLAS_DFLASH_DEBUG_DUMP_FULL",
-                "ATLAS_DFLASH_OPTION_B_DIAG",
-                "ATLAS_DFLASH_PRECOMPUTE_DUMP",
-                "ATLAS_DFLASH_VERIFY_TRACE",
-                "ATLAS_DFLASH_LOG_DRAFTS",
-                "ATLAS_DFLASH_DEBUG_FORCE_PATTERN",
-                "ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN",
-                "ATLAS_DFLASH_DEBUG_CTX_OFF",
-                "ATLAS_DFLASH_DEBUG_CTX_USED",
-                "ATLAS_DFLASH_BLOCK_DUMP",
-            ]);
-        let target_verify_graph_eligible = !one("ATLAS_DFLASH_DEBUG_NO_GRAPH")
-            && !one("ATLAS_DEBUG_NO_GRAPH")
-            && !one("ATLAS_DIAG_GEMMA4")
-            && !one("ATLAS_DFLASH_VERIFY_COMPUTE_SERIAL");
-        Self {
-            option_b_enabled: one("ATLAS_DFLASH_OPTION_B"),
-            proposal_lane_count: value("ATLAS_DFLASH_PROPOSE_LANES")
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or(1)
-                .max(1),
+    pub fn from_env() -> Result<Self, LightningDsparkPolicyError> {
+        Self::from_reader(|name| std::env::var(name).ok())
+    }
+
+    /// Parse presence-aware startup inputs without touching process-global env.
+    pub fn from_reader<F>(mut read: F) -> Result<Self, LightningDsparkPolicyError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let proposal_lane_count = match read("ATLAS_DFLASH_PROPOSE_LANES") {
+            None => 1,
+            Some(raw) => {
+                let parsed = raw.parse::<usize>().map_err(|_| {
+                    RuntimeToggleError::new(
+                        "proposal_lane_count",
+                        format!("invalid lane count {raw:?}"),
+                    )
+                })?;
+                if parsed == 0 {
+                    return Err(RuntimeToggleError::new(
+                        "proposal_lane_count",
+                        "lane count must be greater than zero",
+                    ));
+                }
+                parsed
+            }
+        };
+        let draft_cap_override = read("ATLAS_DFLASH_DRAFT_CAP")
+            .map(|raw| {
+                raw.parse::<usize>().map_err(|_| {
+                    RuntimeToggleError::new(
+                        "draft_cap_override",
+                        format!("invalid draft cap {raw:?}"),
+                    )
+                })
+            })
+            .transpose()?;
+
+        if present(&mut read, "ATLAS_DFLASH_OPTION_B_NO_CTX") {
+            return Err(RuntimeToggleError::new(
+                "option_b_no_ctx",
+                "Option B no-context mode is not supported for the product",
+            ));
+        }
+        let gemma4_diag = one_or_true(&mut read, "ATLAS_DIAG_GEMMA4");
+        let proposal_graph_eligible = !present(&mut read, "ATLAS_DFLASH_PROPOSE_NO_GRAPH")
+            && !one(&mut read, "ATLAS_DFLASH_DEBUG_NO_GRAPH")
+            && !one(&mut read, "ATLAS_DEBUG_NO_GRAPH")
+            && !gemma4_diag
+            && !present_any(
+                &mut read,
+                &[
+                    "ATLAS_DFLASH_DEBUG_DUMP_FULL",
+                    "ATLAS_DFLASH_DEBUG_DUMP",
+                    "ATLAS_DFLASH_OPTION_B_DIAG",
+                    "ATLAS_DFLASH_PRECOMPUTE_DUMP",
+                    "ATLAS_DFLASH_VERIFY_TRACE",
+                    "ATLAS_DFLASH_LOG_DRAFTS",
+                    "ATLAS_DFLASH_DEBUG_FORCE_PATTERN",
+                    "ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN",
+                    "ATLAS_DFLASH_DEBUG_CTX_OFF",
+                    "ATLAS_DFLASH_DEBUG_CTX_USED",
+                    "ATLAS_DFLASH_BLOCK_DUMP",
+                ],
+            );
+        let target_verify_graph_eligible = !one(&mut read, "ATLAS_DFLASH_DEBUG_NO_GRAPH")
+            && !one(&mut read, "ATLAS_DEBUG_NO_GRAPH")
+            && !gemma4_diag
+            && !one(&mut read, "ATLAS_DFLASH_VERIFY_COMPUTE_SERIAL");
+
+        Ok(Self {
+            option_b_enabled: one(&mut read, "ATLAS_DFLASH_OPTION_B"),
+            proposal_lane_count,
             proposal_graph_eligible,
             target_verify_graph_eligible,
-            batched_verify_enabled: !present("ATLAS_NO_DFLASH_BATCH_VERIFY"),
-            seam_serial_enabled: one("ATLAS_DFLASH_SEAM_SERIAL"),
-            draft_cap_override: value("ATLAS_DFLASH_DRAFT_CAP").and_then(|raw| raw.parse().ok()),
-            adaptive_enabled: one("ATLAS_DFLASH_ADAPTIVE"),
-        }
+            batched_verify_enabled: !present(&mut read, "ATLAS_NO_DFLASH_BATCH_VERIFY"),
+            seam_serial_enabled: one(&mut read, "ATLAS_DFLASH_SEAM_SERIAL"),
+            draft_cap_override,
+            adaptive_enabled: one(&mut read, "ATLAS_DFLASH_ADAPTIVE"),
+        })
     }
 
     pub fn validate(&self) -> Result<(), LightningDsparkPolicyError> {
@@ -120,20 +162,32 @@ impl LightningDsparkRuntimeToggles {
     }
 }
 
-fn value(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+fn present<F>(read: &mut F, name: &str) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    read(name).is_some()
 }
 
-fn present(name: &str) -> bool {
-    std::env::var_os(name).is_some()
+fn present_any<F>(read: &mut F, names: &[&str]) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    names.iter().any(|name| present(read, name))
 }
 
-fn present_any(names: &[&str]) -> bool {
-    names.iter().any(|name| present(name))
+fn one<F>(read: &mut F, name: &str) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    read(name).as_deref() == Some("1")
 }
 
-fn one(name: &str) -> bool {
-    value(name).as_deref() == Some("1")
+fn one_or_true<F>(read: &mut F, name: &str) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    matches!(read(name).as_deref(), Some("1" | "true"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +217,26 @@ impl LightningDsparkProductPolicy {
 
     pub fn runtime_toggles(&self) -> LightningDsparkRuntimeToggles {
         self.runtime_toggles
+    }
+}
+
+/// Executable model-identity latch shared by TransformerModel setters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LightningDsparkIdentityLatch {
+    policy: Option<LightningDsparkProductPolicy>,
+}
+
+impl LightningDsparkIdentityLatch {
+    pub fn policy(&self) -> Option<&LightningDsparkProductPolicy> {
+        self.policy.as_ref()
+    }
+
+    pub fn install_lightning(&mut self, policy: LightningDsparkProductPolicy) {
+        self.policy = Some(policy);
+    }
+
+    pub fn install_generic(&mut self) {
+        self.policy = None;
     }
 }
 

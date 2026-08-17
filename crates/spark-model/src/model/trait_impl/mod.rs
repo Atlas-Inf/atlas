@@ -51,7 +51,7 @@ impl Model for TransformerModel {
     fn lightning_dspark_product_policy(
         &self,
     ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
-        self.lightning_dspark_policy.as_ref()
+        self.lightning_dspark_identity.policy()
     }
 
     fn teardown(&mut self) -> Result<()> {

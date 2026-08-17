@@ -48,11 +48,11 @@ const OFFICIAL_LIGHTNING_JSON: &str = r#"
 }
 "#;
 
-fn official_value() -> Value {
+pub(super) fn official_value() -> Value {
     serde_json::from_str(OFFICIAL_LIGHTNING_JSON).expect("official inline JSON")
 }
 
-fn parse_value(value: &Value) -> DflashConfig {
+pub(super) fn parse_value(value: &Value) -> DflashConfig {
     parse_dflash_config(&serde_json::to_string(value).unwrap()).expect("DFlash config")
 }
 
@@ -71,7 +71,7 @@ fn runtime() -> LightningRuntimeAdmission {
     }
 }
 
-fn required_store() -> WeightStore {
+pub(super) fn required_store() -> WeightStore {
     let mut weights = HashMap::new();
     for name in [
         "fc.weight",

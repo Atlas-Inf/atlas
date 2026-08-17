@@ -39,7 +39,7 @@ impl TransformerModel {
             tracing::info!("DFlash: replacing existing MTP proposer with BlockDiffusionDraftHead");
         }
         self.proposer = Some(proposer);
-        self.lightning_dspark_policy = None;
+        self.lightning_dspark_identity.install_generic();
     }
 
     /// Atomically install the admitted official Lightning proposer and its
@@ -51,7 +51,7 @@ impl TransformerModel {
         policy: LightningDsparkProductPolicy,
     ) -> anyhow::Result<()> {
         self.proposer = Some(proposer);
-        self.lightning_dspark_policy = Some(policy);
+        self.lightning_dspark_identity.install_lightning(policy);
         Ok(())
     }
 }

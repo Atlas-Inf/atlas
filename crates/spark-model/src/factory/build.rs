@@ -105,7 +105,7 @@ pub fn build_model(
             num_drafts,
             kv_block_size,
             kv_dtype,
-            LightningDsparkRuntimeToggles::from_env(),
+            LightningDsparkRuntimeToggles::from_env()?,
         )?,
         None => None,
     };
