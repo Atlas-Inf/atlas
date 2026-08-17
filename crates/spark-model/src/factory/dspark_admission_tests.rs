@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use serde_json::Value;
-use spark_runtime::kv_cache::KvCacheDtype;
+use std::collections::HashMap;
 
-use super::dspark_admission::{LightningRuntimeAdmission, admit_lightning_dspark};
+use atlas_core::config::ModelConfig;
+use serde_json::Value;
+use spark_runtime::gpu::DevicePtr;
+use spark_runtime::kv_cache::KvCacheDtype;
+use spark_runtime::weights::{WeightDtype, WeightStore, WeightTensor};
+
+use super::DflashBuildArgs;
+use super::dspark_admission::{
+    LightningRuntimeAdmission, admit_lightning_dspark, admit_lightning_dspark_build,
+};
 use crate::weight_loader::DflashConfig;
 use crate::weight_loader::dflash_loader::parse_dflash_config;
 
@@ -56,10 +64,40 @@ fn runtime() -> LightningRuntimeAdmission {
         target_kv_dtype: KvCacheDtype::Fp8,
         tp: 1,
         ep: 1,
+        fc_present: true,
         markov_w1_present: true,
         markov_w2_present: true,
         all_required_sinks_present: true,
     }
+}
+
+fn required_store() -> WeightStore {
+    let mut weights = HashMap::new();
+    for name in [
+        "fc.weight",
+        "markov_head.markov_w1.weight",
+        "markov_head.markov_w2.weight",
+    ] {
+        weights.insert(
+            name.to_owned(),
+            WeightTensor {
+                ptr: DevicePtr::NULL,
+                shape: vec![1],
+                dtype: WeightDtype::BF16,
+            },
+        );
+    }
+    for layer in 0..6 {
+        weights.insert(
+            format!("layers.{layer}.self_attn.attention_sink_bias"),
+            WeightTensor {
+                ptr: DevicePtr::NULL,
+                shape: vec![1],
+                dtype: WeightDtype::BF16,
+            },
+        );
+    }
+    WeightStore::from_map(weights)
 }
 
 fn admit(
@@ -290,6 +328,11 @@ fn explicit_drafter_kv_quantization_is_rejected() {
 
 #[test]
 fn missing_markov_weights_or_sinks_are_rejected() {
+    let mut no_fc = runtime();
+    no_fc.fc_present = false;
+    let error = admit(&official_value(), no_fc).expect_err("missing fc");
+    assert!(format!("{error:#}").contains("fc.weight"), "{error:#}");
+
     let mut no_w1 = runtime();
     no_w1.markov_w1_present = false;
     let error = admit(&official_value(), no_w1).expect_err("missing W1");
@@ -363,5 +406,35 @@ fn optional_confidence_and_adaptive_declarations_must_be_false() {
     assert!(
         format!("{error:#}").contains("confidence.adaptive"),
         "{error:#}"
+    );
+}
+
+#[test]
+fn build_mapper_binds_store_presence_and_requires_explicit_gamma() {
+    let config = parse_dflash_config(OFFICIAL_LIGHTNING_JSON).unwrap();
+    let store = required_store();
+    let args = DflashBuildArgs {
+        drafter_store: &store,
+        drafter_config: config.clone(),
+        gamma: Some(4),
+        window_size: Some(1024),
+    };
+    let mut target = ModelConfig::qwen3_next_80b_nvfp4();
+    target.tp_world_size = 1;
+    target.ep_world_size = 1;
+    assert!(
+        admit_lightning_dspark_build(&args, &target, 3, 16, KvCacheDtype::Fp8)
+            .unwrap()
+            .is_some()
+    );
+
+    let missing_gamma = DflashBuildArgs {
+        drafter_store: &store,
+        drafter_config: config,
+        gamma: None,
+        window_size: Some(1024),
+    };
+    assert!(
+        admit_lightning_dspark_build(&missing_gamma, &target, 3, 16, KvCacheDtype::Fp8).is_err()
     );
 }

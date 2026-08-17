@@ -13,7 +13,7 @@ use spark_runtime::weights::WeightStore;
 
 use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
-use super::{DflashBuildArgs, LoraBuildArgs};
+use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_build};
 use crate::layers::MtpQuantization;
 use crate::model::TransformerModel;
 use crate::traits::Model;
@@ -96,6 +96,18 @@ pub fn build_model(
     }
     #[cfg(not(feature = "cuda"))]
     let _ = (nllb_lang, nllb_lora_dir);
+
+    let lightning_dspark_admitted = match dflash_args.as_ref() {
+        Some(args) => admit_lightning_dspark_build(
+            args,
+            &config,
+            num_drafts,
+            kv_block_size,
+            kv_dtype,
+        )?
+        .is_some(),
+        None => false,
+    };
 
     // ── Step 1: Select weight loader (only model-specific dispatch) ──
     let loader = loader_for_config(&config)?;
@@ -606,26 +618,53 @@ pub fn build_model(
             model.gpu_backend(),
             1, // tp_size for the drafter side: replicated, so always 1
         )?;
-        if let Some(weights) = weights {
-            let head = crate::layers::BlockDiffusionDraftHead::from_weights(
-                weights,
-                target_embed_for_dflash,
-                target_lm_head_for_dflash,
-                target_lm_head_nvfp4_for_dflash,
-                target_hidden_for_dflash,
-                args.gamma,
-                args.window_size,
-                model.gpu_backend(),
-                max_seq_len,
-                max_batch_size,
-            )?;
-            model.set_dflash_proposer(std::sync::Arc::new(head));
-            tracing::info!("DFlash drafter installed as the active proposer");
-        } else {
-            tracing::warn!(
-                "DFlash drafter store had no fc.weight — proposer not installed; \
-                 falling back to whatever proposer (if any) the target's MTP path built"
-            );
+        match weights {
+            Some(weights) => {
+                if lightning_dspark_admitted {
+                    anyhow::ensure!(
+                        weights.markov_w1.is_some() && weights.markov_w2.is_some(),
+                        "Lightning DSpark required Markov weights disappeared after load"
+                    );
+                    anyhow::ensure!(
+                        weights
+                            .layers
+                            .iter()
+                            .all(|layer| layer.attention_sink_bias.is_some()),
+                        "Lightning DSpark required attention sink weights disappeared after load"
+                    );
+                }
+                let head = crate::layers::BlockDiffusionDraftHead::from_weights(
+                    weights,
+                    target_embed_for_dflash,
+                    target_lm_head_for_dflash,
+                    target_lm_head_nvfp4_for_dflash,
+                    target_hidden_for_dflash,
+                    args.gamma,
+                    args.window_size,
+                    model.gpu_backend(),
+                    max_seq_len,
+                    max_batch_size,
+                )?;
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(
+                    "{} drafter installed as the active proposer",
+                    if lightning_dspark_admitted {
+                        "Lightning DSpark"
+                    } else {
+                        "DFlash"
+                    }
+                );
+            }
+            None if lightning_dspark_admitted => {
+                anyhow::bail!(
+                    "Lightning DSpark admission passed but required drafter weights were not loaded"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "Generic DFlash drafter store had no fc.weight — proposer not installed"
+                );
+            }
         }
     }
 
