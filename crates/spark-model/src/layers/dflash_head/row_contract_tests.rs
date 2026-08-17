@@ -63,8 +63,8 @@ fn markov_sampling_is_depth_serial_and_anchor_is_unbiased() {
 #[test]
 fn reorder_keeps_bonus_out_of_verify_drafts() {
     let proposal = contract().reorder_and_split(&[9, 1, 2, 3]).unwrap();
-    assert_eq!(proposal.drafts, vec![1, 2, 3]);
-    assert_eq!(proposal.bonus, 9);
+    assert_eq!(proposal.drafts(), &[1, 2, 3]);
+    assert_eq!(proposal.bonus(), 9);
     assert_eq!(
         contract().verify_input(7, &proposal).unwrap(),
         vec![7, 1, 2, 3]
@@ -73,10 +73,7 @@ fn reorder_keeps_bonus_out_of_verify_drafts() {
 
 #[test]
 fn accepted_prefix_zero_through_three_projects_exact_tokens_and_length() {
-    let proposal = DsparkProposal {
-        drafts: vec![1, 2, 3],
-        bonus: 99,
-    };
+    let proposal = contract().reorder_and_split(&[99, 1, 2, 3]).unwrap();
     let target_rows = [10, 11, 12, 13];
     let expected = [
         (vec![10], 101),
@@ -90,7 +87,7 @@ fn accepted_prefix_zero_through_three_projects_exact_tokens_and_length() {
             .unwrap();
         assert_eq!(projection.committed_tokens, tokens);
         assert_eq!(projection.new_seq_len, len);
-        assert!(!projection.committed_tokens.contains(&proposal.bonus));
+        assert!(!projection.committed_tokens.contains(&proposal.bonus()));
     }
 }
 
@@ -99,23 +96,10 @@ fn malformed_rows_matrices_tokens_and_prefix_are_rejected() {
     let c = contract();
     assert!(c.reorder_and_split(&[1, 2, 3]).is_err());
     assert!(
-        c.verify_input(
-            0,
-            &DsparkProposal {
-                drafts: vec![1, 2],
-                bonus: 3,
-            },
-        )
-        .is_err()
-    );
-    assert!(
         c.project_commit(
             0,
             4,
-            &DsparkProposal {
-                drafts: vec![1, 2, 3],
-                bonus: 4,
-            },
+            &contract().reorder_and_split(&[4, 1, 2, 3]).unwrap(),
             &[5, 6, 7, 8],
         )
         .is_err()
@@ -131,6 +115,11 @@ fn malformed_rows_matrices_tokens_and_prefix_are_rejected() {
 
     let (logits, w1, w2) = synthetic();
     assert!(c.markov_sample(&logits, &w1, &w2, 3).is_err());
+
+    let logits = vec![vec![0.0, 0.0]; 4];
+    let w1 = vec![vec![f32::MAX], vec![f32::MAX]];
+    let w2 = w1.clone();
+    assert!(c.markov_sample(&logits, &w1, &w2, 0).is_err());
 }
 
 #[test]
@@ -146,10 +135,7 @@ fn greedy_ties_choose_the_lowest_token_id() {
 
 #[test]
 fn sequence_length_overflow_is_rejected() {
-    let proposal = DsparkProposal {
-        drafts: vec![1, 2, 3],
-        bonus: 4,
-    };
+    let proposal = contract().reorder_and_split(&[4, 1, 2, 3]).unwrap();
     assert!(
         contract()
             .project_commit(usize::MAX, 0, &proposal, &[5, 6, 7, 8])

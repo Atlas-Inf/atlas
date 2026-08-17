@@ -12,8 +12,8 @@ pub struct LightningRowContract {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DsparkProposal {
-    pub drafts: Vec<u32>,
-    pub bonus: u32,
+    drafts: Vec<u32>,
+    bonus: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +99,16 @@ impl fmt::Display for DsparkRowError {
 
 impl std::error::Error for DsparkRowError {}
 
+impl DsparkProposal {
+    pub fn drafts(&self) -> &[u32] {
+        &self.drafts
+    }
+
+    pub fn bonus(&self) -> u32 {
+        self.bonus
+    }
+}
+
 impl LightningRowContract {
     pub fn new(gamma: usize, num_drafts: usize) -> Result<Self, DsparkRowError> {
         exact("gamma", gamma, LIGHTNING_SERVED_GAMMA)?;
@@ -136,9 +146,32 @@ impl LightningRowContract {
             for candidate in 0..vocab {
                 let mut bias = 0.0f32;
                 for r in 0..rank {
-                    bias += w1[previous][r] * w2[candidate][r];
+                    let product = w1[previous][r] * w2[candidate][r];
+                    if !product.is_finite() {
+                        return Err(DsparkRowError::NonFinite {
+                            field: "markov product",
+                            row,
+                            column: candidate,
+                        });
+                    }
+                    bias += product;
+                    if !bias.is_finite() {
+                        return Err(DsparkRowError::NonFinite {
+                            field: "markov bias",
+                            row,
+                            column: candidate,
+                        });
+                    }
                 }
-                scores.push(logits[row][candidate] + bias);
+                let score = logits[row][candidate] + bias;
+                if !score.is_finite() {
+                    return Err(DsparkRowError::NonFinite {
+                        field: "markov score",
+                        row,
+                        column: candidate,
+                    });
+                }
+                scores.push(score);
             }
             let next = argmax(&scores);
             sampled.push(next as u32);
