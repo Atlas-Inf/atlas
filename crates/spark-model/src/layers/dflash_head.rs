@@ -534,6 +534,16 @@ pub struct BlockDiffusionDraftHead {
     pub quant: DflashQuantization,
 }
 
+mod contract;
+pub use contract::{
+    AttentionLayout, BonusLayout, CheckpointLayout, ConfidenceLayout, KvDtype, KvLayout,
+    LIGHTNING_ALGORITHM, LIGHTNING_CHECKPOINT_BLOCK_SIZE, LIGHTNING_EP, LIGHTNING_MARKOV_RANK,
+    LIGHTNING_MODEL_IDENTITY, LIGHTNING_NUM_DRAFTS, LIGHTNING_PHYSICAL_KV_PAGE_SIZE,
+    LIGHTNING_SERVED_GAMMA, LIGHTNING_SWA_WINDOW, LIGHTNING_TAPS, LIGHTNING_TP,
+    LightningDsparkContractError, LightningDsparkProfile, MarkovLayout, ParallelismLayout,
+};
+#[cfg(test)]
+mod contract_tests;
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
