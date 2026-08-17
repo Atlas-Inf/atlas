@@ -256,10 +256,10 @@ impl NemotronMoeLayer {
     }
 }
 
-mod decode_helpers;
 mod decode_batched;
-mod marlin_sidecar;
+mod decode_helpers;
 mod marlin_linear;
+mod marlin_sidecar;
 mod marlin_slots;
 mod prefill_fallback;
 mod prefill_marlin;
@@ -318,13 +318,13 @@ impl TransformerLayer for NemotronMoeLayer {
         stream: u64,
     ) -> Result<()> {
         // AR C>1: MoE is stateless. Serial decode is the default diagnostic
-        // path. Set ATLAS_LIGHTNING_DECODE_MULTI=1 to opt into one
-        // decode_batched over N tokens (vLLM/SGLang grouped-GEMM). The opt-in
-        // path can differ from serial GEMV on near-ties due to accumulation.
+        // path. ATLAS_LIGHTNING_DECODE_MULTI=1 opts into both hybrid mixers;
+        // ATLAS_LIGHTNING_MOE_MULTI is the component diagnostic override.
         if nemotron_decode_policy::decode_multi_seq_batched(
             std::env::var("ATLAS_LIGHTNING_DECODE_MULTI")
                 .ok()
                 .as_deref(),
+            std::env::var("ATLAS_LIGHTNING_MOE_MULTI").ok().as_deref(),
         ) {
             self.decode_batched_direct(hidden, residual, num_seqs, ctx, stream)
         } else {

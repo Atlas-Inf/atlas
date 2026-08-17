@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-/// Return whether the Lightning AR multi-sequence path should batch.
+/// Return whether one Lightning AR component should use its batched path.
 ///
-/// Only the exact value `"1"` opts into batching. Missing, `"0"`, and every
-/// other value keep the serial diagnostic path selected.
-pub(crate) fn decode_multi_seq_batched(value: Option<&str>) -> bool {
-    matches!(value, Some("1"))
+/// The component override is diagnostic and exact-valued: `"1"` enables,
+/// any other supplied value disables. When absent, the shared policy applies.
+pub(crate) fn decode_multi_seq_batched(
+    shared_value: Option<&str>,
+    component_value: Option<&str>,
+) -> bool {
+    match component_value {
+        Some(value) => value == "1",
+        None => matches!(shared_value, Some("1")),
+    }
 }
 
 #[cfg(test)]
@@ -13,10 +19,18 @@ mod tests {
     use super::decode_multi_seq_batched;
 
     #[test]
-    fn only_exact_one_enables_batched_decode() {
-        assert!(!decode_multi_seq_batched(None));
-        assert!(!decode_multi_seq_batched(Some("0")));
-        assert!(decode_multi_seq_batched(Some("1")));
-        assert!(!decode_multi_seq_batched(Some("true")));
+    fn shared_policy_requires_exact_one() {
+        assert!(!decode_multi_seq_batched(None, None));
+        assert!(!decode_multi_seq_batched(Some("0"), None));
+        assert!(decode_multi_seq_batched(Some("1"), None));
+        assert!(!decode_multi_seq_batched(Some("true"), None));
+    }
+
+    #[test]
+    fn component_override_is_explicit_and_wins() {
+        assert!(decode_multi_seq_batched(None, Some("1")));
+        assert!(decode_multi_seq_batched(Some("0"), Some("1")));
+        assert!(!decode_multi_seq_batched(Some("1"), Some("0")));
+        assert!(!decode_multi_seq_batched(Some("1"), Some("true")));
     }
 }
