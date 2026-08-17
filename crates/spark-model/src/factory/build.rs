@@ -97,17 +97,13 @@ pub fn build_model(
     #[cfg(not(feature = "cuda"))]
     let _ = (nllb_lang, nllb_lora_dir);
 
-    let lightning_dspark_admitted = match dflash_args.as_ref() {
-        Some(args) => admit_lightning_dspark_build(
-            args,
-            &config,
-            num_drafts,
-            kv_block_size,
-            kv_dtype,
-        )?
-        .is_some(),
-        None => false,
+    let lightning_dspark_profile = match dflash_args.as_ref() {
+        Some(args) => {
+            admit_lightning_dspark_build(args, &config, num_drafts, kv_block_size, kv_dtype)?
+        }
+        None => None,
     };
+    let lightning_dspark_admitted = lightning_dspark_profile.is_some();
 
     // ── Step 1: Select weight loader (only model-specific dispatch) ──
     let loader = loader_for_config(&config)?;
@@ -633,6 +629,12 @@ pub fn build_model(
                         "Lightning DSpark required attention sink weights disappeared after load"
                     );
                 }
+                // Lightning admission owns the served SWA window. Generic
+                // DFlash keeps the caller's existing override/default path.
+                let served_window_size = lightning_dspark_profile
+                    .as_ref()
+                    .map(|profile| profile.attention.swa_window)
+                    .or(args.window_size);
                 let head = crate::layers::BlockDiffusionDraftHead::from_weights(
                     weights,
                     target_embed_for_dflash,
@@ -640,7 +642,7 @@ pub fn build_model(
                     target_lm_head_nvfp4_for_dflash,
                     target_hidden_for_dflash,
                     args.gamma,
-                    args.window_size,
+                    served_window_size,
                     model.gpu_backend(),
                     max_seq_len,
                     max_batch_size,

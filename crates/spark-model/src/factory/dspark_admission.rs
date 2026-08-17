@@ -9,7 +9,8 @@ use spark_runtime::kv_cache::KvCacheDtype;
 use super::DflashBuildArgs;
 use crate::layers::dflash_head::{
     AttentionLayout, BonusLayout, CheckpointLayout, ConfidenceLayout, KvDtype, KvLayout,
-    LIGHTNING_MODEL_IDENTITY, LightningDsparkProfile, MarkovLayout, ParallelismLayout,
+    LIGHTNING_MODEL_IDENTITY, LIGHTNING_SWA_WINDOW, LightningDsparkProfile, MarkovLayout,
+    ParallelismLayout,
 };
 use crate::weight_loader::dflash_loader::DflashConfig;
 use crate::weight_loader::store_has_dflash_weights;
@@ -169,6 +170,16 @@ pub(crate) fn admit_lightning_dspark_build(
         None if declares_lightning => bail!("Lightning DSpark requires explicit served gamma"),
         None => args.drafter_config.block_size,
     };
+    if declares_lightning {
+        let window_size = args
+            .window_size
+            .context("Lightning DSpark requires explicit served SWA window")?;
+        if window_size != LIGHTNING_SWA_WINDOW {
+            bail!(
+                "Lightning DSpark served SWA window must be {LIGHTNING_SWA_WINDOW}, found {window_size}"
+            );
+        }
+    }
     let prefix = if args.drafter_store.contains("model.fc.weight") {
         "model."
     } else {
