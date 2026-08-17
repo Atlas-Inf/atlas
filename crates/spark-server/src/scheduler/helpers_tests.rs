@@ -446,3 +446,12 @@ fn forced_token_fastpath_enabled_by_falsy_or_junk() {
     assert!(parse_forced_token_fastpath(Some("")));
     assert!(parse_forced_token_fastpath(Some("yes")));
 }
+
+#[test]
+fn dspark_proposal_failure_fails_closed_only_for_lightning_product() {
+    // The production decision shared by mtp_step bootstrap and
+    // verify_dflash_step re-propose: generic DFlash/MTP keeps the legacy
+    // log-and-fall-through; the Lightning product fails closed.
+    assert!(crate::scheduler::helpers::dspark_proposal_failure_fails_closed(true));
+    assert!(!crate::scheduler::helpers::dspark_proposal_failure_fails_closed(false));
+}

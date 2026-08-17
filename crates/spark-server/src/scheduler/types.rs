@@ -134,6 +134,11 @@ pub(super) const GUARD_STOP_TOOL_RESPONSE: &str = "tool_response_hard_stop";
 /// which IS eos-registered (pushed in `tokenizer_runtime.rs::im_start_id`)
 /// — naming a guard THERE would reintroduce the opposite mislabel.
 pub(super) const GUARD_STOP_THINK_SKIP: &str = "think_skip_watchdog";
+/// Lightning DSpark product fail-closed: the product drafter failed to
+/// propose (empty or error) and the sequence was terminated instead of
+/// silently degrading to no-spec decode. Maps to the server-truncation
+/// wire reason (`"length"` family) — never a natural `"stop"`.
+pub(super) const GUARD_STOP_DSPARK_PRODUCT_FAIL_CLOSED: &str = "dspark_product_fail_closed";
 
 /// An in-flight sequence participating in batched decode.
 pub(super) struct ActiveSeq {

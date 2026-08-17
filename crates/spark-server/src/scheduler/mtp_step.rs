@@ -166,14 +166,35 @@ pub fn step_mtp(
                         a.seq.slot_idx,
                         a.seq.seq_len
                     );
+                    // Lightning product fail-closed boundary: an empty
+                    // product proposal is an admission violation, not a
+                    // silent no-spec fallback. Generic DFlash/MTP keeps the
+                    // legacy fall-through below. The guard marker makes the
+                    // truncation client-visible ("length" family), never a
+                    // natural "stop".
+                    if crate::scheduler::helpers::handle_dspark_bootstrap_proposal_failure(
+                        model,
+                        a,
+                        crate::scheduler::helpers::ProposalOutcome::Empty,
+                    ) {
+                        continue;
+                    }
                 }
                 Err(e) => {
                     tracing::error!("DFlash bootstrap propose: {e:#}");
+                    if crate::scheduler::helpers::handle_dspark_bootstrap_proposal_failure(
+                        model,
+                        a,
+                        crate::scheduler::helpers::ProposalOutcome::Error,
+                    ) {
+                        continue;
+                    }
                 }
             }
             // Rare fallback: propose failed or returned empty (e.g. drafter not
             // yet primed). Fall through to the standalone decode below so the
-            // sequence emits its next token rather than stalling.
+            // sequence emits its next token rather than stalling. Never
+            // reached for the Lightning product (handled above).
         }
 
         // Non-DFlash path (or DFlash-propose fallback): EP broadcast + standalone decode.

@@ -243,8 +243,24 @@ pub fn step_verify_dflash(
             _mtp_grammar_mask.as_deref(),
         ) {
             Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
+            Ok(_) => {
+                // Lightning product fail-closed boundary: an empty
+                // re-propose is an admission violation, not a silent
+                // serial-decode fallback on the next bootstrap.
+                crate::scheduler::helpers::handle_dspark_repropose_failure(
+                    model,
+                    a,
+                    crate::scheduler::helpers::ProposalOutcome::Empty,
+                );
+            }
+            Err(e) => {
+                tracing::error!("run_mtp_propose_multi (dflash): {e:#}");
+                crate::scheduler::helpers::handle_dspark_repropose_failure(
+                    model,
+                    a,
+                    crate::scheduler::helpers::ProposalOutcome::Error,
+                );
+            }
         }
     }
     if step_timing {

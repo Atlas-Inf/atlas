@@ -15,6 +15,19 @@ pub(super) fn dspark_batch_verify_disabled() -> bool {
     *CACHED.get_or_init(|| std::env::var("ATLAS_NO_DFLASH_BATCH_VERIFY").is_ok())
 }
 
+/// Lightning product fail-closed for the batched DSpark propose paths:
+/// an empty or erroneous (batched or per-seq fallback) proposal marks the
+/// sequence with the client-visible truncation guard and finishes it.
+/// Generic DFlash/MTP keeps the legacy log-and-continue behavior.
+fn fail_closed_if_lightning(
+    model: &dyn spark_model::traits::Model,
+    a: &mut super::types::ActiveSeq,
+    site: &'static str,
+    _slot_idx: usize,
+) {
+    crate::scheduler::helpers::handle_dspark_batched_proposal_failure(model, a, site);
+}
+
 /// n>=2 DSpark sequences, each with `ks[i]-1` pending drafts (uniform K=3
 /// → ks=4). Grammarless. Caller sorted / classified.
 pub(super) fn step_verify_dflash_batched(
@@ -189,11 +202,36 @@ pub(super) fn step_verify_dflash_batched(
                 for (j, &i) in pending.iter().enumerate() {
                     if !all[j].is_empty() {
                         batch[i].pending_drafts = all[j].clone();
+                    } else {
+                        let slot = batch[i].seq.slot_idx;
+                        let target = &mut batch[i];
+                        fail_closed_if_lightning(model, target, "returned empty drafts", slot);
                     }
                 }
             }
             Ok(None) | Err(_) => {
+                // Lightning product: the batched proposer declined or
+                // errored. The per-sequence fallback below is a diagnostic
+                // recovery path for generic DFlash; a product serve treats
+                // the batch failure itself as an admission violation and
+                // fails every pending sequence closed rather than
+                // continuing on a degraded path.
+                let product_fail_closed =
+                    crate::scheduler::helpers::dspark_proposal_failure_fails_closed(
+                        model.is_lightning_dspark_product(),
+                    );
                 for &i in &pending {
+                    if product_fail_closed {
+                        let slot = batch[i].seq.slot_idx;
+                        let target = &mut batch[i];
+                        fail_closed_if_lightning(
+                            model,
+                            target,
+                            "batched proposer declined/errored",
+                            slot,
+                        );
+                        continue;
+                    }
                     if let Err(e) = model.save_hidden_for_mtp_from_stash(i, 0) {
                         tracing::error!("save_hidden_for_mtp_from_stash({i}): {e:#}");
                         continue;
@@ -207,8 +245,22 @@ pub(super) fn step_verify_dflash_batched(
                         None,
                     ) {
                         Ok(d) if !d.is_empty() => batch[i].pending_drafts = d,
-                        Ok(_) => {}
-                        Err(e) => tracing::error!("run_mtp_propose_multi fallback: {e:#}"),
+                        Ok(_) => {
+                            let slot = batch[i].seq.slot_idx;
+                            let target = &mut batch[i];
+                            fail_closed_if_lightning(
+                                model,
+                                target,
+                                "fallback returned empty drafts",
+                                slot,
+                            )
+                        }
+                        Err(e) => {
+                            tracing::error!("run_mtp_propose_multi fallback: {e:#}");
+                            let slot = batch[i].seq.slot_idx;
+                            let target = &mut batch[i];
+                            fail_closed_if_lightning(model, target, "fallback errored", slot);
+                        }
                     }
                 }
             }
@@ -216,6 +268,12 @@ pub(super) fn step_verify_dflash_batched(
     } else if let Some(&i) = pending.first() {
         if let Err(e) = model.save_hidden_for_mtp_from_stash(i, 0) {
             tracing::error!("save_hidden_for_mtp_from_stash({i}): {e:#}");
+            // Lightning product: a stash failure means the drafter cannot
+            // propose; fail closed instead of leaving the sequence to a
+            // silent serial bootstrap on the next step.
+            let slot = batch[i].seq.slot_idx;
+            let target = &mut batch[i];
+            fail_closed_if_lightning(model, target, "stash save failed (single)", slot);
         } else {
             match model.run_mtp_propose_multi(
                 batch[i].last_token,
@@ -226,8 +284,17 @@ pub(super) fn step_verify_dflash_batched(
                 None,
             ) {
                 Ok(d) if !d.is_empty() => batch[i].pending_drafts = d,
-                Ok(_) => {}
-                Err(e) => tracing::error!("run_mtp_propose_multi: {e:#}"),
+                Ok(_) => {
+                    let slot = batch[i].seq.slot_idx;
+                    let target = &mut batch[i];
+                    fail_closed_if_lightning(model, target, "single returned empty drafts", slot);
+                }
+                Err(e) => {
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
+                    let slot = batch[i].seq.slot_idx;
+                    let target = &mut batch[i];
+                    fail_closed_if_lightning(model, target, "single errored", slot);
+                }
             }
         }
     }
