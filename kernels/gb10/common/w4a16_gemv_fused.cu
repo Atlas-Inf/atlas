@@ -172,7 +172,7 @@ extern "C" __global__ void w4a16_gemv_silu_input(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
@@ -185,7 +185,8 @@ extern "C" __global__ void w4a16_gemv_silu_input(
 
     float acc = 0.0f;
 
-    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+    if (active) {
+        for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
         const unsigned int base_k = k8 * 8;
 
         uint4 g_data = ((const uint4*)gate_out)[k8];
@@ -231,6 +232,7 @@ extern "C" __global__ void w4a16_gemv_silu_input(
             acc += a_lo * w_lo;
             acc += a_hi * w_hi;
         }
+        }
     }
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
@@ -246,7 +248,7 @@ extern "C" __global__ void w4a16_gemv_silu_input(
     }
     __syncthreads();
 
-    if (lane == 0) {
+    if (lane == 0 && active) {
         float result = smem[local_out * 2] + smem[local_out * 2 + 1];
         C[n] = __float2bfloat16(result);
     }

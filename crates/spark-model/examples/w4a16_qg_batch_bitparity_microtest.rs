@@ -15,7 +15,9 @@
 //! head_dim = N`, which makes its deinterleave the identity map (`idx = n <
 //! head_dim` ⇒ `out_idx = n`) and leaves the arithmetic untouched.
 //!
-//! 3 seeds x 3 shapes x 4 kernels = 36 legs, plus 9 negative controls.
+//! 3 seeds x 4 shapes x 4 kernels = 48 legs, plus 12 negative controls.
+//! The final identity-layout row has odd N and exercises the padded
+//! `ceil(N / 4)` output group in the scalar, QG-batch, and dual-batch kernels.
 //!
 //! Exit: 0 all legs byte-identical, 1 any leg differs,
 //! 2 kernels absent from this target's module set.
@@ -34,13 +36,22 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 const GROUP_SIZE: usize = 16;
 const MAX_M: usize = 3;
 const SCALE2: f32 = 0.0123_f32;
+const TAIL_N: usize = 2051;
+const _: () = assert!(TAIL_N % 4 != 0);
 
 /// `(label, N, K, num_heads, head_dim)` with `N == num_heads * head_dim * 2`,
 /// the Q+Gate widths the SSM path actually dispatches.
-const SHAPES: [(&str, usize, usize, u32, u32); 3] = [
+const SHAPES: [(&str, usize, usize, u32, u32); 4] = [
     ("qg [4096 x 2688] h16 d128", 4096, 2688, 16, 128),
     ("qg [8192 x 4096] h32 d128", 8192, 4096, 32, 128),
     ("qg [2048 x 4096] h8  d128", 2048, 4096, 8, 128),
+    (
+        "tail odd-N identity [2051 x 4096]",
+        TAIL_N,
+        4096,
+        1,
+        TAIL_N as u32,
+    ),
 ];
 
 struct Lcg(u64);

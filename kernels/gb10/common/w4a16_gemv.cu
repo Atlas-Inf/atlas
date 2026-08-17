@@ -73,7 +73,7 @@ extern "C" __global__ void w4a16_gemv(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
@@ -92,7 +92,8 @@ extern "C" __global__ void w4a16_gemv(
     // stalls are long-scoreboard on GB10). The FP8 group scale is factored out of
     // the inner 16-FMA block (exact regroup: sum(s*w*a) == s*sum(w*a)).
     const unsigned int stride2 = threads_per_out * 2u;
-    for (unsigned int k16 = lane * 2u; k16 < K16 + 1u; k16 += stride2) {
+    if (active) {
+        for (unsigned int k16 = lane * 2u; k16 < K16 + 1u; k16 += stride2) {
         #pragma unroll
         for (int c = 0; c < 2; c++) {
             const unsigned int kk = k16 + (unsigned int)c;
@@ -129,6 +130,7 @@ extern "C" __global__ void w4a16_gemv(
             if (c == 0) acc0 = fmaf(scale, part, acc0);
             else        acc1 = fmaf(scale, part, acc1);
         }
+        }
     }
     float acc = acc0 + acc1;
 
@@ -150,7 +152,7 @@ extern "C" __global__ void w4a16_gemv(
     __syncthreads();
 
     // First thread of each output group writes final result
-    if (lane == 0) {
+    if (lane == 0 && active) {
         float result = smem[local_out * 2] + smem[local_out * 2 + 1];
         C[n] = __float2bfloat16(result);
     }
@@ -280,7 +282,7 @@ extern "C" __global__ void w4a16_gemv_logits(
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
@@ -292,7 +294,8 @@ extern "C" __global__ void w4a16_gemv_logits(
     __syncthreads();
 
     float acc = 0.0f;
-    for (unsigned int k16 = lane; k16 < K16; k16 += threads_per_out) {
+    if (active) {
+        for (unsigned int k16 = lane; k16 < K16; k16 += threads_per_out) {
         const unsigned int base_k = k16 * 16;
         uint4 a_lo = ((const uint4*)A)[k16 * 2];
         uint4 a_hi = ((const uint4*)A)[k16 * 2 + 1];
@@ -320,6 +323,7 @@ extern "C" __global__ void w4a16_gemv_logits(
             acc += __bfloat162float(a_hi_bf) * w_hi;
         }
     }
+    }
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
@@ -329,7 +333,7 @@ extern "C" __global__ void w4a16_gemv_logits(
         smem[smem_idx] = acc;
     }
     __syncthreads();
-    if (lane == 0) {
+    if (lane == 0 && active) {
         C[n] = smem[local_out * 2] + smem[local_out * 2 + 1]; // FP32 output!
     }
 }
@@ -460,7 +464,7 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
     if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
     __syncthreads();
 
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
@@ -471,6 +475,10 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
     // for; within a phase the thread runs a single reference accumulator chain.
     float acc[MAX_M];
     __shared__ float s_vl[MAX_M][N_PER_BLOCK][2 * WARP_SIZE];
+    #pragma unroll
+    for (int t = 0; t < MAX_M; t++) {
+        s_vl[t][local_out][lane] = 0.0f;
+    }
 
     #pragma unroll 1
     for (unsigned int phase = 0; phase < 2u; phase++) {
@@ -480,8 +488,9 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
         // Coalesced walk: at every step the 64 lanes read CONSECUTIVE chunks,
         // so a warp's 8-byte weight load covers 256 contiguous bytes and its
         // 16-byte activation loads are 32 B apart — the pre-fix access pattern.
-        for (unsigned int kk = lane + phase * threads_per_out; kk < K16;
-             kk += threads_per_out * 2u) {
+        if (active) {
+            for (unsigned int kk = lane + phase * threads_per_out; kk < K16;
+                 kk += threads_per_out * 2u) {
             // 8 packed weight bytes (16 FP4) + 1 group scale → read and
             // unpacked ONCE for all M rows. This is the weight-DRAM saving
             // the tier exists for; it is independent of the FP order below.
@@ -527,6 +536,7 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
                 acc[t] = fmaf(scale, part, acc[t]);
             }
         }
+        }
 
         // Threads p and p^1 hold accumulator 0 and 1 of the SAME reference lane
         // (p/2 + 32*phase); fold them and land the result in virtual-lane order.
@@ -556,7 +566,7 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
     }
     __syncthreads();
 
-    if (lane == 0) {
+    if (lane == 0 && active) {
         #pragma unroll
         for (int t = 0; t < MAX_M; t++) {
             if ((unsigned int)t >= M) continue;
@@ -703,7 +713,7 @@ extern "C" __global__ void w4a16_gemv_qg(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
@@ -716,7 +726,8 @@ extern "C" __global__ void w4a16_gemv_qg(
 
     float acc = 0.0f;
 
-    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+    if (active) {
+        for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
         const unsigned int base_k = k8 * 8;
         uint4 a_data = ((const uint4*)A)[k8];
         const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
@@ -742,6 +753,7 @@ extern "C" __global__ void w4a16_gemv_qg(
             acc += __bfloat162float(a_lo) * w_lo;
             acc += __bfloat162float(a_hi) * w_hi;
         }
+        }
     }
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
@@ -755,7 +767,7 @@ extern "C" __global__ void w4a16_gemv_qg(
     }
     __syncthreads();
 
-    if (lane == 0) {
+    if (lane == 0 && active) {
         float result = smem[local_out * 2] + smem[local_out * 2 + 1];
 
         // Deinterleave: n indexes interleaved [Q_h0(hd), G_h0(hd), Q_h1(hd), ...]
@@ -806,7 +818,7 @@ extern "C" __global__ void w4a16_gemv_qkvz(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups_k = K / GROUP_SIZE;
@@ -819,7 +831,8 @@ extern "C" __global__ void w4a16_gemv_qkvz(
 
     float acc = 0.0f;
 
-    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+    if (active) {
+        for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
         const unsigned int base_k = k8 * 8;
         uint4 a_data = ((const uint4*)A)[k8];
         const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
@@ -845,6 +858,7 @@ extern "C" __global__ void w4a16_gemv_qkvz(
             acc += __bfloat162float(a_lo) * w_lo;
             acc += __bfloat162float(a_hi) * w_hi;
         }
+        }
     }
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
@@ -858,7 +872,7 @@ extern "C" __global__ void w4a16_gemv_qkvz(
     }
     __syncthreads();
 
-    if (lane == 0) {
+    if (lane == 0 && active) {
         float result = smem[local_out * 2] + smem[local_out * 2 + 1];
 
         // Compute deinterleaved output index
@@ -925,7 +939,7 @@ extern "C" __global__ void w4a16_gemv_qg_batch2(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
@@ -942,7 +956,8 @@ extern "C" __global__ void w4a16_gemv_qg_batch2(
     float acc0 = 0.0f;
     float acc1 = 0.0f;
 
-    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+    if (active) {
+        for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
         const unsigned int base_k = k8 * 8;
 
         uint4 a0_data = ((const uint4*)A)[k8];
@@ -979,6 +994,7 @@ extern "C" __global__ void w4a16_gemv_qg_batch2(
             acc1 += __bfloat162float(a1_lo) * w_lo;
             acc1 += __bfloat162float(a1_hi) * w_hi;
         }
+        }
     }
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
@@ -995,7 +1011,7 @@ extern "C" __global__ void w4a16_gemv_qg_batch2(
     }
     __syncthreads();
 
-    if (lane == 0) {
+    if (lane == 0 && active) {
         float result0 = smem[local_out * 4]     + smem[local_out * 4 + 2];
         float result1 = smem[local_out * 4 + 1] + smem[local_out * 4 + 3];
 
@@ -1050,7 +1066,7 @@ extern "C" __global__ void w4a16_gemv_dual_batch2(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K_in / 2;
     const unsigned int num_groups = K_in / GROUP_SIZE;
@@ -1066,7 +1082,8 @@ extern "C" __global__ void w4a16_gemv_dual_batch2(
 
     float acc0 = 0.0f, acc1 = 0.0f;
 
-    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+    if (active) {
+        for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
         const unsigned int base_k = k8 * 8;
 
         uint4 a0_data = ((const uint4*)A)[k8];
@@ -1102,6 +1119,7 @@ extern "C" __global__ void w4a16_gemv_dual_batch2(
             acc1 += __bfloat162float(a1_lo) * w_lo;
             acc1 += __bfloat162float(a1_hi) * w_hi;
         }
+        }
     }
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
@@ -1118,7 +1136,7 @@ extern "C" __global__ void w4a16_gemv_dual_batch2(
     }
     __syncthreads();
 
-    if (lane == 0) {
+    if (lane == 0 && active) {
         float result0 = smem[local_out * 4]     + smem[local_out * 4 + 2];
         float result1 = smem[local_out * 4 + 1] + smem[local_out * 4 + 3];
         C_out[n]  = __float2bfloat16(result0);
@@ -1172,7 +1190,7 @@ extern "C" __global__ void w4a16_gemv_qg_batch3(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
@@ -1192,7 +1210,8 @@ extern "C" __global__ void w4a16_gemv_qg_batch3(
     float acc1 = 0.0f;
     float acc2 = 0.0f;
 
-    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+    if (active) {
+        for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
         const unsigned int base_k = k8 * 8;
 
         uint4 a0_data = ((const uint4*)A)[k8];
@@ -1237,6 +1256,7 @@ extern "C" __global__ void w4a16_gemv_qg_batch3(
             acc2 += __bfloat162float(a2_lo) * w_lo;
             acc2 += __bfloat162float(a2_hi) * w_hi;
         }
+        }
     }
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
@@ -1255,7 +1275,7 @@ extern "C" __global__ void w4a16_gemv_qg_batch3(
     }
     __syncthreads();
 
-    if (lane == 0) {
+    if (lane == 0 && active) {
         float result0 = smem[local_out * 6]     + smem[local_out * 6 + 3];
         float result1 = smem[local_out * 6 + 1] + smem[local_out * 6 + 4];
         float result2 = smem[local_out * 6 + 2] + smem[local_out * 6 + 5];
@@ -1311,7 +1331,7 @@ extern "C" __global__ void w4a16_gemv_dual_batch3(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool active = n < N;
 
     const unsigned int half_K = K_in / 2;
     const unsigned int num_groups = K_in / GROUP_SIZE;
@@ -1329,7 +1349,8 @@ extern "C" __global__ void w4a16_gemv_dual_batch3(
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
 
-    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+    if (active) {
+        for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
         const unsigned int base_k = k8 * 8;
 
         uint4 a0_data = ((const uint4*)A)[k8];
@@ -1373,6 +1394,7 @@ extern "C" __global__ void w4a16_gemv_dual_batch3(
             acc2 += __bfloat162float(a2_lo) * w_lo;
             acc2 += __bfloat162float(a2_hi) * w_hi;
         }
+        }
     }
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
@@ -1391,7 +1413,7 @@ extern "C" __global__ void w4a16_gemv_dual_batch3(
     }
     __syncthreads();
 
-    if (lane == 0) {
+    if (lane == 0 && active) {
         float result0 = smem[local_out * 6]     + smem[local_out * 6 + 3];
         float result1 = smem[local_out * 6 + 1] + smem[local_out * 6 + 4];
         float result2 = smem[local_out * 6 + 2] + smem[local_out * 6 + 5];
