@@ -51,10 +51,8 @@ impl BlockDiffusionDraftHead {
         // context, distant history adds noise to attention.
         // ATLAS_DFLASH_DEBUG_CTX_OFF=1 disables ctx entirely (eff_ctx=0)
         // for A/B testing whether the drafter actually responds to ctx.
-        let force_no_ctx = std::env::var("ATLAS_DFLASH_DEBUG_CTX_OFF").ok().as_deref() == Some("1");
-        let force_ctx_used: Option<usize> = std::env::var("ATLAS_DFLASH_DEBUG_CTX_USED")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
+        let force_no_ctx = self.startup.diagnostics.debug_ctx_off;
+        let force_ctx_used = self.startup.diagnostics.debug_ctx_used;
         let (ctx_base_ptr, ctx_total, eff_ctx) = match ctx_buffer {
             Some(_) if force_no_ctx => (None, 0, 0),
             Some((p, n)) => {
@@ -118,7 +116,7 @@ impl BlockDiffusionDraftHead {
         // Requires ATLAS_DFLASH_PRECOMPUTE_DUMP=1 to actually emit
         // dump files; otherwise the kernel chain runs and discards
         // intermediates (useful for perf-only A/B).
-        if std::env::var("ATLAS_DFLASH_PRECOMPUTE").ok().as_deref() == Some("1")
+        if self.startup.diagnostics.precompute_probe
             && let Some(base) = ctx_base_ptr
             && eff_ctx > 0
         {
@@ -133,10 +131,7 @@ impl BlockDiffusionDraftHead {
             // write to the paged cache (block_table may not be
             // allocated here — only the Option B propose.rs path
             // guarantees a valid block_table before calling).
-            let dump_commit = std::env::var("ATLAS_DFLASH_PRECOMPUTE_COMMIT")
-                .ok()
-                .as_deref()
-                == Some("1");
+            let dump_commit = self.startup.diagnostics.precompute_commit;
             self.precompute_ctx_kv(
                 base,
                 start_slot,
@@ -164,10 +159,7 @@ impl BlockDiffusionDraftHead {
             // comparable intermediates. Pattern: row i, col j contains
             // `0.01 * (i+1) * (j+1) / target_hidden` BF16. Mirrors
             // `dflash_pytorch_reference.py:make_input_target_hidden_stack`.
-            let force_pattern = std::env::var("ATLAS_DFLASH_DEBUG_FORCE_PATTERN")
-                .ok()
-                .as_deref()
-                == Some("1");
+            let force_pattern = self.startup.diagnostics.force_pattern;
             if force_pattern && eff_ctx > 0 {
                 let n_rows = self.target_layer_ids.len();
                 let n_cols = self.target_hidden_size;
@@ -199,10 +191,7 @@ impl BlockDiffusionDraftHead {
             // bisect script. ONE-SHOT: writes only the first propose() call.
             if eff_ctx > 0
                 && ctx.stats.dumped.keyed("dflash_target_hidden")
-                && std::env::var("ATLAS_DFLASH_DEBUG_DUMP_FULL")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+                && self.startup.diagnostics.dump_full
             {
                 // Dump ALL eff_ctx slots — needed to reproduce the
                 // multi-token ctx in PyTorch reference. Layout:
@@ -355,10 +344,7 @@ impl BlockDiffusionDraftHead {
         // [eff_ctx..n_attn) with a deterministic pattern matching the
         // PyTorch reference. Lets us compare layer-0 q/k/v post-projection
         // when both Atlas and PyTorch see identical input.
-        let force_noise_pattern = std::env::var("ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let force_noise_pattern = self.startup.diagnostics.force_noise_pattern;
         if force_noise_pattern {
             let mut bytes = Vec::with_capacity(self.gamma * self.hidden_size * 2);
             for t in 0..self.gamma {
@@ -443,10 +429,7 @@ impl BlockDiffusionDraftHead {
             && !debug_dump
             && !self.startup.graph_ineligible_diags;
 
-        let warmup_target: usize = std::env::var("ATLAS_DFLASH_PROPOSE_WARMUP_N")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+        let warmup_target: usize = self.startup.diagnostics.propose_warmup_n;
 
         // Helper closures: run each piecewise subgraph eagerly. Phase F.2
         // splits the old monolithic captured region into per-layer halves
@@ -473,13 +456,9 @@ impl BlockDiffusionDraftHead {
         // Without this the per-layer files were overwritten every propose and
         // ended up from a LATER position than the locked logits reference —
         // the diff then compared mismatched proposes (cos≈0 at a plain RMSNorm).
-        let block_dump_arm_pos: usize = std::env::var("ATLAS_DFLASH_BLOCK_DUMP_AT_POS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let block_dump_arm_pos: usize = self.startup.diagnostics.block_dump_at_pos;
         let block_dump_armed = {
-            let want = std::env::var("ATLAS_DFLASH_BLOCK_DUMP").ok().as_deref() == Some("1")
-                && position >= block_dump_arm_pos;
+            let want = self.startup.diagnostics.block_dump && position >= block_dump_arm_pos;
             // The latch is consumed only when `want` (short-circuit) → env-off
             // never burns the shot; the first qualifying propose takes it.
             // Keyed on the model's `ModelStats`, not a static: an operator who
@@ -630,7 +609,7 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )?;
             }
-            if std::env::var("ATLAS_DFLASH_BLOCK_DUMP").ok().as_deref() == Some("1") {
+            if self.startup.diagnostics.block_dump {
                 let n_logits_bytes = self.gamma * self.vocab_size * 2;
                 let mut pre = vec![0u8; n_logits_bytes];
                 if gpu.copy_d2h(scratch.logits, &mut pre).is_ok() {
@@ -660,11 +639,8 @@ impl BlockDiffusionDraftHead {
                 // indices — the regime that exercises the id249 ctx-K RoPE
                 // position mismatch. Unset/0 = dump at the first propose
                 // (positions ≈ slot indices, position bug NOT exercised).
-                let block_dump_min_pos: usize = std::env::var("ATLAS_DFLASH_BLOCK_DUMP_AT_POS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                if std::env::var("ATLAS_DFLASH_BLOCK_DUMP").ok().as_deref() == Some("1")
+                let block_dump_min_pos: usize = self.startup.diagnostics.block_dump_at_pos;
+                if self.startup.diagnostics.block_dump
                     && position >= block_dump_min_pos
                     && ctx.stats.dumped.keyed(Box::leak(
                         format!("dflash_block_logits_{:x}", scratch.markov_prev_dev.0)
@@ -737,11 +713,8 @@ impl BlockDiffusionDraftHead {
             // wrong (position grid / mask embed / fc). Gated ATLAS_DFLASH_BLOCK_DUMP=1
             // (same one-shot gate as the logits dump above, fires same call).
             {
-                let block_dump_min_pos: usize = std::env::var("ATLAS_DFLASH_BLOCK_DUMP_AT_POS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                if std::env::var("ATLAS_DFLASH_BLOCK_DUMP").ok().as_deref() == Some("1")
+                let block_dump_min_pos: usize = self.startup.diagnostics.block_dump_at_pos;
+                if self.startup.diagnostics.block_dump
                     && position >= block_dump_min_pos
                     && ctx.stats.dumped.keyed("dflash_block_inputs")
                 {
@@ -1049,11 +1022,7 @@ impl BlockDiffusionDraftHead {
         // we can compare against the PyTorch reference run on the same
         // captured target_hidden. Static guard mirrors the input dump.
         if ctx.stats.dumped.keyed("dflash_drafts")
-            && (std::env::var("ATLAS_DFLASH_DEBUG_DUMP_FULL")
-                .ok()
-                .as_deref()
-                == Some("1")
-                || std::env::var("ATLAS_DFLASH_LOG_DRAFTS").ok().as_deref() == Some("1"))
+            && (self.startup.diagnostics.dump_full || self.startup.diagnostics.log_drafts)
         {
             tracing::info!(
                 "DFLASH DUMP_FULL drafts (γ={}, last_token={}, position={}, eff_ctx={}): {:?}",

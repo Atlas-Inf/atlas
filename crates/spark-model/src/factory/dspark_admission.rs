@@ -230,6 +230,13 @@ pub(crate) fn admit_lightning_dspark_product_build(
     target_kv_dtype: KvCacheDtype,
     runtime_toggles: LightningDsparkRuntimeToggles,
 ) -> Result<Option<LightningDsparkProductPolicy>> {
+    // Product admission — and therefore strict product toggle parsing —
+    // applies ONLY to a drafter that declares the exact Lightning
+    // architecture. Generic DFlash builds must reach the lenient path
+    // without product-only toggle errors.
+    if !declares_exact_lightning(args) {
+        return Ok(None);
+    }
     Ok(admit_lightning_dspark_build(
         args,
         target,
@@ -239,6 +246,16 @@ pub(crate) fn admit_lightning_dspark_product_build(
     )?
     .map(|profile| LightningDsparkProductPolicy::try_new(profile, runtime_toggles))
     .transpose()?)
+}
+
+/// True only when the drafter's `architectures` is exactly the official
+/// Lightning identity — the single discriminator that entitles product
+/// (fail-closed) toggle parsing. Anything else is generic DFlash.
+pub(crate) fn declares_exact_lightning(args: &DflashBuildArgs<'_>) -> bool {
+    args.drafter_config
+        .architectures
+        .as_ref()
+        .is_some_and(|architectures| architectures.as_slice() == [LIGHTNING_MODEL_IDENTITY])
 }
 
 fn required_bool(value: Option<bool>, field: &str) -> Result<bool> {

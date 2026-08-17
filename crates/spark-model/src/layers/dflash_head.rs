@@ -29,8 +29,9 @@ use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod product_policy;
 pub use product_policy::{
-    DsparkStartupExecution, LightningDsparkIdentityLatch, LightningDsparkPolicyError,
-    LightningDsparkProductPolicy, LightningDsparkRuntimeToggles,
+    DsparkDiagnostics, DsparkStartupExecution, LightningDsparkIdentityLatch,
+    LightningDsparkPolicyError, LightningDsparkProductPolicy, LightningDsparkRuntimeToggles,
+    LightningStructuralGraphState,
 };
 #[cfg(test)]
 mod product_policy_tests;

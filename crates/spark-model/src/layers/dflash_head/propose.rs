@@ -96,10 +96,7 @@ impl BlockDiffusionDraftHead {
             // Per-model latch (see `ModelStats::dumped`) rather than a static: an
             // operator who sets the flag and then swaps models must still get the
             // dump, instead of it being swallowed by the previous model's shot.
-            if std::env::var("ATLAS_DFLASH_CTX_PARITY_DUMP")
-                .ok()
-                .as_deref()
-                == Some("1")
+            if self.startup.diagnostics.ctx_parity_dump
                 && dstate.ctx_len > 0
                 && ctx.stats.dumped.keyed("dflash_ctx_parity")
             {
@@ -294,10 +291,7 @@ impl BlockDiffusionDraftHead {
         // here. K=gamma/K=4 never set it -> their decode-append is unaffected.
         let eagle_skip = dstate.skip_next_decode_append;
         dstate.skip_next_decode_append = false;
-        let skip_decode_append = std::env::var("ATLAS_DFLASH_DEBUG_NO_DECODE_APPEND")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let skip_decode_append = self.startup.diagnostics.no_decode_append;
         if !skip_decode_append
             && !eagle_skip
             && let Some(latest_ctx) = target_hidden_stack
@@ -375,10 +369,7 @@ impl BlockDiffusionDraftHead {
             //
             // Escape hatch: ATLAS_DFLASH_DEBUG_FULL_PRECOMPUTE=1 forces a
             // full recompute (committed=0) for A/B accept-rate parity.
-            let force_full = std::env::var("ATLAS_DFLASH_DEBUG_FULL_PRECOMPUTE")
-                .ok()
-                .as_deref()
-                == Some("1");
+            let force_full = self.startup.diagnostics.full_precompute;
             // Clamp watermark defensively: a rewind should have reset it,
             // but never start past ctx_len.
             let committed = if force_full {
@@ -451,7 +442,7 @@ impl BlockDiffusionDraftHead {
             // The think→spec seam (re-probe after a serial stretch) is
             // where a violation would surface. Host-side Vec scan,
             // probe-gated, zero cost when off.
-            if std::env::var("ATLAS_DFLASH_CTXLEN_PROBE").ok().as_deref() == Some("1")
+            if self.startup.diagnostics.ctxlen_probe
                 && let Some(i) = dstate.ctx_positions.windows(2).position(|w| w[1] <= w[0])
             {
                 tracing::warn!(
@@ -472,9 +463,7 @@ impl BlockDiffusionDraftHead {
             // (the bug — likely thinking-mode tokens not appending to ctx).
             // Gated ATLAS_DFLASH_CTXLEN_PROBE=1, rate-limited to ~1/16 steps
             // to avoid log flood.
-            if std::env::var("ATLAS_DFLASH_CTXLEN_PROBE").ok().as_deref() == Some("1")
-                && position.is_multiple_of(16)
-            {
+            if self.startup.diagnostics.ctxlen_probe && position.is_multiple_of(16) {
                 tracing::info!(
                     "DFLASH CTXLEN_PROBE: position={} ctx_len={} q_offset(=ctx_len)={} GAP={} (position - ctx_len; healthy≈prompt_len, BUG if grows unbounded)",
                     position,
@@ -536,7 +525,7 @@ impl BlockDiffusionDraftHead {
         // ATLAS_DFLASH_VERIFY_TRACE=1: log all γ drafts BEFORE the cap so we
         // can see whether the drafter echoes only at position 0 or across
         // every noise row. Pairs with K2 TRACE in the scheduler.
-        if std::env::var("ATLAS_DFLASH_VERIFY_TRACE").ok().as_deref() == Some("1") {
+        if self.startup.diagnostics.verify_trace {
             tracing::info!(
                 "DFLASH TRACE drafts: token_in={} position={} γ={} lane_id={} scratch={:x} mp={:x} me={:x} stream={:x} ctx_len={} drafts={:?}",
                 last_token,

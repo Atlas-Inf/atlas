@@ -312,3 +312,71 @@ fn exact_product_toggles() -> super::LightningDsparkRuntimeToggles {
         adaptive_enabled: false,
     }
 }
+
+#[test]
+fn raw_reader_treats_present_but_non_one_graph_kills_as_ineligible() {
+    // A present-but-`0` kill switch made the pre-freeze runtime eager;
+    // admission must agree instead of claiming graph eligibility.
+    for name in [
+        "ATLAS_DFLASH_DEBUG_NO_GRAPH",
+        "ATLAS_DEBUG_NO_GRAPH",
+        "ATLAS_DFLASH_PROPOSE_NO_GRAPH",
+    ] {
+        let toggles = read_product(&[("ATLAS_DFLASH_OPTION_B", "1"), (name, "0")])
+            .expect("present-but-non-one kill switch parses");
+        assert!(
+            !toggles.proposal_graph_eligible,
+            "{name}=0 must be graph-ineligible"
+        );
+        let error = toggles
+            .validate()
+            .expect_err("product must reject a present graph kill switch");
+        assert!(
+            error.to_string().contains("proposal_graph_eligible"),
+            "{error}"
+        );
+    }
+    let toggles = read_product(&[
+        ("ATLAS_DFLASH_OPTION_B", "1"),
+        ("ATLAS_DFLASH_VERIFY_COMPUTE_SERIAL", "1"),
+    ])
+    .expect("serial verify probe parses");
+    assert!(!toggles.target_verify_graph_eligible);
+}
+
+#[test]
+fn structural_graph_state_gates_eligibility() {
+    let allowed = super::LightningStructuralGraphState {
+        target_suppress_graphs: false,
+        lora_installed: false,
+        distributed_topology: false,
+    };
+    assert!(allowed.graphs_allowed());
+    let denied_cases: [super::LightningStructuralGraphState; 3] = [
+        super::LightningStructuralGraphState {
+            target_suppress_graphs: true,
+            lora_installed: false,
+            distributed_topology: false,
+        },
+        super::LightningStructuralGraphState {
+            target_suppress_graphs: false,
+            lora_installed: true,
+            distributed_topology: false,
+        },
+        super::LightningStructuralGraphState {
+            target_suppress_graphs: false,
+            lora_installed: false,
+            distributed_topology: true,
+        },
+    ];
+    for denied in denied_cases {
+        assert!(!denied.graphs_allowed());
+    }
+}
+
+#[test]
+fn startup_diagnostics_default_all_off_for_product() {
+    let execution = super::DsparkStartupExecution::from_lightning(exact_product_toggles());
+    assert_eq!(execution.diagnostics, super::DsparkDiagnostics::default());
+    assert_eq!(execution.diagnostics.propose_warmup_n, 2);
+}

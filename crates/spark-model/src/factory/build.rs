@@ -11,6 +11,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use spark_runtime::prefix_cache::PrefixCache;
 use spark_runtime::weights::WeightStore;
 
+use super::dspark_admission;
 use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
 use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_product_build};
@@ -98,16 +99,21 @@ pub fn build_model(
     #[cfg(not(feature = "cuda"))]
     let _ = (nllb_lang, nllb_lora_dir);
 
+    // Strict product toggle parsing runs only when the drafter declares the
+    // exact Lightning architecture; generic DFlash never sees product-only
+    // errors and later takes the lenient one-shot startup parse.
     let lightning_dspark_policy = match dflash_args.as_ref() {
-        Some(args) => admit_lightning_dspark_product_build(
-            args,
-            &config,
-            num_drafts,
-            kv_block_size,
-            kv_dtype,
-            LightningDsparkRuntimeToggles::from_env()?,
-        )?,
-        None => None,
+        Some(args) if dspark_admission::declares_exact_lightning(args) => {
+            admit_lightning_dspark_product_build(
+                args,
+                &config,
+                num_drafts,
+                kv_block_size,
+                kv_dtype,
+                LightningDsparkRuntimeToggles::from_env()?,
+            )?
+        }
+        _ => None,
     };
     let lightning_dspark_admitted = lightning_dspark_policy.is_some();
 
