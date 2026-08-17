@@ -5,8 +5,8 @@ use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SequenceGeneration {
-    pub slot: usize,
-    pub generation: u64,
+    slot: usize,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,11 +27,11 @@ pub struct CaptureDescriptor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DflashGraphIdentity {
-    pub owner: SequenceGeneration,
-    pub block_table_ptr: u64,
-    pub ctx_ptr: u64,
-    pub markov_ptr: u64,
-    pub lane: usize,
+    owner: SequenceGeneration,
+    block_table_ptr: u64,
+    ctx_ptr: u64,
+    markov_ptr: u64,
+    lane: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +41,10 @@ pub enum DsparkLifecycleError {
     },
     ZeroCapacity,
     ZeroStride,
+    StrideMismatch {
+        expected: usize,
+        found: usize,
+    },
     ValidRows {
         valid: usize,
         capacity: usize,
@@ -61,6 +65,12 @@ pub enum DsparkLifecycleError {
         valid_rows: usize,
     },
     OffsetOverflow,
+    ZeroPointer {
+        field: &'static str,
+    },
+    InvalidLane {
+        lane: usize,
+    },
 }
 
 impl fmt::Display for DsparkLifecycleError {
@@ -71,6 +81,10 @@ impl fmt::Display for DsparkLifecycleError {
             }
             Self::ZeroCapacity => f.write_str("DSpark capture row capacity must be nonzero"),
             Self::ZeroStride => f.write_str("DSpark capture row stride must be nonzero"),
+            Self::StrideMismatch { expected, found } => write!(
+                f,
+                "DSpark capture row stride changed from {expected} to {found}"
+            ),
             Self::ValidRows { valid, capacity } => write!(
                 f,
                 "DSpark capture valid_rows={valid} exceeds capacity={capacity}"
@@ -92,6 +106,12 @@ impl fmt::Display for DsparkLifecycleError {
                 write!(f, "DSpark row {row} is outside valid_rows={valid_rows}")
             }
             Self::OffsetOverflow => f.write_str("DSpark capture row offset overflow"),
+            Self::ZeroPointer { field } => {
+                write!(f, "DSpark graph identity requires nonzero {field}")
+            }
+            Self::InvalidLane { lane } => {
+                write!(f, "DSpark graph identity rejected lane {lane}")
+            }
         }
     }
 }
@@ -105,6 +125,14 @@ impl SequenceGeneration {
         } else {
             Ok(Self { slot, generation })
         }
+    }
+
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -198,10 +226,15 @@ impl CaptureDescriptor {
                 proposed: absolute_position,
             });
         }
+        if row_stride_bytes != self.row_stride_bytes {
+            return Err(DsparkLifecycleError::StrideMismatch {
+                expected: self.row_stride_bytes,
+                found: row_stride_bytes,
+            });
+        }
         validate_shape(valid_rows, self.row_capacity, row_stride_bytes)?;
         self.absolute_position = absolute_position;
         self.valid_rows = valid_rows;
-        self.row_stride_bytes = row_stride_bytes;
         Ok(())
     }
 
@@ -222,6 +255,12 @@ impl DflashGraphIdentity {
         lane: usize,
     ) -> Result<Self, DsparkLifecycleError> {
         SequenceGeneration::new(owner.slot, owner.generation)?;
+        nonzero_pointer("block_table_ptr", block_table_ptr)?;
+        nonzero_pointer("ctx_ptr", ctx_ptr)?;
+        nonzero_pointer("markov_ptr", markov_ptr)?;
+        if lane == usize::MAX {
+            return Err(DsparkLifecycleError::InvalidLane { lane });
+        }
         Ok(Self {
             owner,
             block_table_ptr,
@@ -229,6 +268,34 @@ impl DflashGraphIdentity {
             markov_ptr,
             lane,
         })
+    }
+
+    pub fn owner(&self) -> SequenceGeneration {
+        self.owner
+    }
+
+    pub fn block_table_ptr(&self) -> u64 {
+        self.block_table_ptr
+    }
+
+    pub fn ctx_ptr(&self) -> u64 {
+        self.ctx_ptr
+    }
+
+    pub fn markov_ptr(&self) -> u64 {
+        self.markov_ptr
+    }
+
+    pub fn lane(&self) -> usize {
+        self.lane
+    }
+}
+
+fn nonzero_pointer(field: &'static str, pointer: u64) -> Result<(), DsparkLifecycleError> {
+    if pointer == 0 {
+        Err(DsparkLifecycleError::ZeroPointer { field })
+    } else {
+        Ok(())
     }
 }
 

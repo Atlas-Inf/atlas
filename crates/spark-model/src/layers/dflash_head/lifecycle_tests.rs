@@ -21,6 +21,7 @@ fn descriptor_retains_exact_owner_position_rows_stride_and_range() {
     let o = owner(7, 11);
     let d = CaptureDescriptor::bind(o, 123, 3, 4, 64).unwrap();
     assert_eq!(d.owner(), o);
+    assert_eq!((o.slot(), o.generation()), (7, 11));
     assert_eq!(d.absolute_position(), 123);
     assert_eq!(d.valid_rows(), 3);
     assert_eq!(d.row_capacity(), 4);
@@ -56,6 +57,7 @@ fn width_churn_advances_monotonically_without_rebinding_owner() {
         (o, 102, 1)
     );
     assert!(d.advance(o, 101, 1, 128).is_err());
+    assert!(d.advance(o, 103, 1, 64).is_err());
 }
 
 #[test]
@@ -91,6 +93,18 @@ fn pointer_reuse_cannot_reuse_graph_identity_across_generation() {
     set.insert(old);
     set.insert(new);
     assert_eq!(set.len(), 2);
+    assert_eq!(new.owner(), owner(8, 41));
+    assert_eq!(
+        (
+            new.block_table_ptr(),
+            new.ctx_ptr(),
+            new.markov_ptr(),
+            new.lane()
+        ),
+        (0x100, 0x200, 0x300, 2)
+    );
+    assert!(DflashGraphIdentity::new(owner(8, 42), 0, 0x200, 0x300, 2).is_err());
+    assert!(DflashGraphIdentity::new(owner(8, 42), 0x100, 0x200, 0x300, usize::MAX).is_err());
 }
 
 #[test]
