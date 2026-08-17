@@ -20,6 +20,7 @@ impl BlockDiffusionDraftHead {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        expected_owner: Option<super::SequenceGeneration>,
         ctx: &ForwardContext,
         stream: u64,
         draft_embed_target: Option<DevicePtr>,
@@ -38,6 +39,7 @@ impl BlockDiffusionDraftHead {
             position,
             num_drafts,
             state,
+            expected_owner,
             ctx,
             stream,
             draft_embed_target,
@@ -58,6 +60,7 @@ impl BlockDiffusionDraftHead {
         position: usize,
         _num_drafts: usize,
         state: &mut dyn ProposerState,
+        expected_owner: Option<super::SequenceGeneration>,
         ctx: &ForwardContext,
         _stream: u64,
         _draft_embed_target: Option<DevicePtr>,
@@ -69,12 +72,11 @@ impl BlockDiffusionDraftHead {
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        let owner = self.validate_dflash_owner(dstate, expected_owner)?;
         let lifecycle = dstate
             .lifecycle
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("DFlash proposer state has no generation owner"))?;
-        let owner = lifecycle.owner();
-        lifecycle.validate_access(owner)?;
         lifecycle.advance(owner, position, self.gamma, lifecycle.row_stride_bytes())?;
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator at propose entry ──

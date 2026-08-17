@@ -313,10 +313,7 @@ impl TransformerModel {
         }
 
         // Free proposer state (KV cache blocks + per-seq device buffers).
-        let expected_owner = crate::layers::dflash_head::SequenceGeneration::new(
-            seq.slot_idx,
-            seq.dspark_generation,
-        )?;
+        let expected_owner = seq.dspark_owner;
         if let Some(ref proposer) = self.proposer
             && let Some(ref mut pstate) = seq.proposer_state
         {
@@ -330,9 +327,11 @@ impl TransformerModel {
                     .ok_or_else(|| {
                         anyhow::anyhow!("DFlash free sequence has no generation owner")
                     })?
-                    .validate_access(expected_owner)?;
+                    .validate_access(expected_owner.ok_or_else(|| {
+                        anyhow::anyhow!("DFlash free sequence has no allocation owner")
+                    })?)?;
             }
-            proposer.free_state(self.gpu.as_ref(), pstate.as_mut())?;
+            proposer.free_state(self.gpu.as_ref(), expected_owner, pstate.as_mut())?;
         }
 
         self.free_chunked_prefill_meta(seq)?;

@@ -100,18 +100,11 @@ impl TransformerModel {
         // sequence: whole-prompt prefill on a COLD turn, carried rows + a
         // short append on a WARM one. See `ensure_drafter_context`.
         self.ensure_drafter_context(proposer, seq, &ctx, stream);
-        let expected_owner = SequenceGeneration::new(seq.slot_idx, seq.dspark_generation)?;
+        let expected_owner = seq.expected_dspark_owner()?;
         let prop_state = seq
             .proposer_state
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("No proposer state for sequence"))?;
-        if let Some(dstate) = prop_state.as_any_mut().downcast_mut::<DflashProposerState>() {
-            dstate
-                .lifecycle
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("DFlash proposer state has no generation owner"))?
-                .validate_access(expected_owner)?;
-        }
         // ATLAS_MTP_CATCHUP: before proposing, feed pairs the drafter missed
         // during a serial-decode stretch. Coordinates (measured 2026-07-20 on
         // the 27B rig): at propose entry `position == seq.tokens.len()` and
@@ -241,6 +234,7 @@ impl TransformerModel {
             position,
             num_drafts,
             prop_state.as_mut(),
+            Some(expected_owner),
             &ctx,
             stream,
             draft_embed_target,
@@ -264,7 +258,7 @@ impl TransformerModel {
                 "MTP draft skipped: chain confidence {conf:.3} < tau {tau:.3}                  (pos {position}, {} drafts trimmed)",
                 drafts.len(),
             );
-            proposer.after_verify(0, prop_state.as_mut(), stream)?;
+            proposer.after_verify(0, Some(expected_owner), prop_state.as_mut(), stream)?;
             return Ok(Vec::new());
         }
         Ok(drafts)

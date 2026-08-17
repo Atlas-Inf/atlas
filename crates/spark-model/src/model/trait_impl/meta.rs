@@ -319,6 +319,7 @@ impl TransformerModel {
             super::super::dspark_generation::next_dspark_generation(
                 &self.dspark_sequence_generation,
             )?;
+        let dspark_owner = SequenceGeneration::new(slot, dspark_generation)?;
 
         // Allocate proposer state and bind DSpark ownership before it can be used.
         let mut proposer_state = match &self.proposer {
@@ -329,9 +330,8 @@ impl TransformerModel {
             .as_mut()
             .and_then(|state| state.as_any_mut().downcast_mut::<DflashProposerState>())
         {
-            let owner = SequenceGeneration::new(slot, dspark_generation)?;
             dstate.lifecycle = Some(CaptureDescriptor::bind(
-                owner,
+                dspark_owner,
                 0,
                 0,
                 self.dflash_hidden_save_rows,
@@ -368,7 +368,7 @@ impl TransformerModel {
             marconi_exact_snap: None,
             session_hash: 0,
             mtp_capture_gen: 0,
-            dspark_generation,
+            dspark_owner: Some(dspark_owner),
             chunked_prefill_meta: None,
             cached_prefix_tokens: 0,
             cached_prefix_blocks: 0,

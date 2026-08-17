@@ -513,11 +513,9 @@ impl TransformerModel {
                 .collect(),
         };
         let mut states: Vec<&mut dyn crate::speculative::ProposerState> = Vec::new();
+        let mut expected_owners = Vec::with_capacity(seqs.len());
         for seq in seqs.iter_mut() {
-            let expected = crate::layers::dflash_head::SequenceGeneration::new(
-                seq.slot_idx,
-                seq.dspark_generation,
-            )?;
+            let expected = seq.expected_dspark_owner()?;
             match seq.proposer_state.as_mut() {
                 Some(s) => {
                     if let Some(dstate) = s
@@ -534,6 +532,7 @@ impl TransformerModel {
                             })?
                             .validate_access(expected)?;
                     }
+                    expected_owners.push(expected);
                     states.push(s.as_mut());
                 }
                 None => return Ok(None),
@@ -545,6 +544,7 @@ impl TransformerModel {
             positions,
             num_drafts,
             &mut states,
+            Some(&expected_owners),
             &ctx,
             stream,
             out_conf,
@@ -570,10 +570,7 @@ impl TransformerModel {
             None => return Ok(()),
         };
         let stream = self.gpu.default_stream();
-        let expected = crate::layers::dflash_head::SequenceGeneration::new(
-            seq.slot_idx,
-            seq.dspark_generation,
-        )?;
+        let expected = seq.expected_dspark_owner()?;
         if let Some(ref mut state) = seq.proposer_state {
             if let Some(dstate) = state
                 .as_any_mut()
@@ -587,7 +584,7 @@ impl TransformerModel {
                     })?
                     .validate_access(expected)?;
             }
-            proposer.after_verify(num_accepted, state.as_mut(), stream)?;
+            proposer.after_verify(num_accepted, Some(expected), state.as_mut(), stream)?;
         }
         Ok(())
     }
