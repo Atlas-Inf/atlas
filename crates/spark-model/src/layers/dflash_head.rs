@@ -550,6 +550,13 @@ pub use row_contract::{
 };
 #[cfg(test)]
 mod row_contract_tests;
+mod lifecycle;
+pub use lifecycle::{
+    CaptureDescriptor, CaptureStatus, DflashGraphIdentity, DsparkLifecycleError,
+    SequenceGeneration,
+};
+#[cfg(test)]
+mod lifecycle_tests;
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
