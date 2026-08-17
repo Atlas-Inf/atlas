@@ -156,6 +156,12 @@ pub(crate) fn admit_lightning_dspark_build(
     physical_kv_page_size: usize,
     target_kv_dtype: KvCacheDtype,
 ) -> Result<Option<LightningDsparkProfile>> {
+    let has_dspark_markers = args.drafter_config.dspark_bonus_anchor.is_some()
+        || args.drafter_config.markov_rank.is_some()
+        || args.drafter_config.dspark_markov_rank.is_some();
+    if args.drafter_config.architectures.is_none() && !has_dspark_markers {
+        return Ok(None);
+    }
     let declares_lightning =
         args.drafter_config
             .architectures

@@ -112,7 +112,6 @@ fn reject_metadata(mut value: Value, mutate: impl FnOnce(&mut Value), field: &st
     let error = admit(&value, runtime()).expect_err("metadata drift must reject");
     assert!(format!("{error:#}").contains(field), "{error:#}");
 }
-
 #[test]
 fn parses_actual_official_lightning_field_names_and_admits() {
     let config = parse_dflash_config(OFFICIAL_LIGHTNING_JSON).expect("official config");
@@ -154,7 +153,6 @@ fn parses_actual_official_lightning_field_names_and_admits() {
         crate::layers::dflash_head::KvDtype::Bf16
     );
 }
-
 #[test]
 fn generic_non_lightning_architecture_returns_none() {
     let mut value = official_value();
@@ -164,8 +162,29 @@ fn generic_non_lightning_architecture_returns_none() {
             .expect("generic admission")
             .is_none()
     );
-}
 
+    for field in [
+        "architectures",
+        "dspark_bonus_anchor",
+        "dspark_markov_rank",
+        "markov_rank",
+    ] {
+        value.as_object_mut().unwrap().remove(field);
+    }
+    let store = required_store();
+    let args = DflashBuildArgs {
+        drafter_store: &store,
+        drafter_config: parse_value(&value),
+        gamma: None,
+        window_size: Some(4096),
+    };
+    let target = ModelConfig::qwen3_next_80b_nvfp4();
+    assert!(
+        admit_lightning_dspark_build(&args, &target, 7, 16, KvCacheDtype::Fp8)
+            .expect("legacy generic DFlash without architectures")
+            .is_none()
+    );
+}
 #[test]
 fn missing_architecture_is_not_admitted_and_wrong_is_ignored() {
     let mut missing = official_value();
@@ -182,7 +201,6 @@ fn missing_architecture_is_not_admitted_and_wrong_is_ignored() {
     let error = admit(&ambiguous, runtime()).expect_err("ambiguous Lightning identity");
     assert!(format!("{error:#}").contains("exactly"), "{error:#}");
 }
-
 #[test]
 fn rejects_every_metadata_profile_family_when_it_drifts() {
     reject_metadata(
@@ -256,7 +274,6 @@ fn rejects_every_metadata_profile_family_when_it_drifts() {
         "dflash_config.causal",
     );
 }
-
 #[test]
 fn required_presence_is_not_replaced_by_false_defaults() {
     let mut missing_root_bonus = official_value();
@@ -314,7 +331,6 @@ fn required_presence_is_not_replaced_by_false_defaults() {
         "{error:#}"
     );
 }
-
 #[test]
 fn explicit_drafter_kv_quantization_is_rejected() {
     let mut value = official_value();
@@ -325,7 +341,6 @@ fn explicit_drafter_kv_quantization_is_rejected() {
         "{error:#}"
     );
 }
-
 #[test]
 fn missing_markov_weights_or_sinks_are_rejected() {
     let mut no_fc = runtime();
@@ -357,7 +372,6 @@ fn missing_markov_weights_or_sinks_are_rejected() {
         "{error:#}"
     );
 }
-
 #[test]
 fn target_dtype_and_topology_are_exact() {
     let mut bf16 = runtime();
@@ -389,7 +403,6 @@ fn target_dtype_and_topology_are_exact() {
     let error = admit(&official_value(), page).expect_err("physical page size");
     assert!(format!("{error:#}").contains("page_size"), "{error:#}");
 }
-
 #[test]
 fn optional_confidence_and_adaptive_declarations_must_be_false() {
     let mut confidence = official_value();
@@ -408,7 +421,6 @@ fn optional_confidence_and_adaptive_declarations_must_be_false() {
         "{error:#}"
     );
 }
-
 #[test]
 fn build_mapper_accepts_exact_lightning_swa_window() {
     let config = parse_dflash_config(OFFICIAL_LIGHTNING_JSON).unwrap();
@@ -437,7 +449,6 @@ fn build_mapper_accepts_exact_lightning_swa_window() {
         admit_lightning_dspark_build(&missing_gamma, &target, 3, 16, KvCacheDtype::Fp8).is_err()
     );
 }
-
 #[test]
 fn build_mapper_rejects_missing_lightning_swa_window() {
     let config = parse_dflash_config(OFFICIAL_LIGHTNING_JSON).unwrap();
@@ -458,7 +469,6 @@ fn build_mapper_rejects_missing_lightning_swa_window() {
         "{error:#}"
     );
 }
-
 #[test]
 fn build_mapper_rejects_wrong_lightning_swa_window() {
     let config = parse_dflash_config(OFFICIAL_LIGHTNING_JSON).unwrap();
