@@ -8,6 +8,7 @@
 use spark_runtime::gpu::DevicePtr;
 
 use crate::layer::LayerState;
+use crate::layers::dflash_head::SequenceGeneration;
 use crate::speculative::ProposerState;
 
 /// Result of a mixed forward pass (decode + prefill in one pass).
@@ -118,6 +119,10 @@ pub struct SequenceState {
     /// sequence's captured hiddens (poisoned drafter KV; blind is strictly
     /// better than poisoned). 0 = never owned a capture.
     pub mtp_capture_gen: u64,
+    /// Monotonic lifetime identity for DSpark ownership. The allocation slot
+    /// is immutable here; `slot_idx` may migrate or become the reuse sentinel.
+    /// `None` for host-only/non-Transformer states.
+    pub(crate) dspark_owner: Option<SequenceGeneration>,
     /// Per-adapter prefix-cache namespace (adapter-correct KV). Folded into the
     /// prefix hash so two adapters that share a token prefix never reuse each
     /// other's blocks. `0` = base / no adapter (a strict no-op in the fold, so
@@ -282,6 +287,7 @@ impl SequenceState {
             marconi_exact_snap: None,
             session_hash: 0,
             mtp_capture_gen: 0,
+            dspark_owner: None,
             adapter_id: 0,
             chunked_prefill_meta: None,
             cached_prefix_tokens: 0,
@@ -306,6 +312,13 @@ impl SequenceState {
             length_penalty: 1.0,
             early_stopping: false,
         }
+    }
+
+    /// Return the immutable allocation identity used at every DFlash boundary.
+    /// This deliberately ignores the mutable SSM pool slot and its reuse sentinel.
+    pub(crate) fn expected_dspark_owner(&self) -> anyhow::Result<SequenceGeneration> {
+        self.dspark_owner
+            .ok_or_else(|| anyhow::anyhow!("sequence has no DSpark allocation owner"))
     }
 
     /// SSM-pool slot index for this sequence, if it has GDN/SSM (linear-attn)

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 
@@ -329,4 +330,18 @@ fn validate_shape(
         });
     }
     Ok(())
+}
+
+pub(super) fn take_owned_graphs<V>(
+    graphs: &mut HashMap<DflashGraphIdentity, V>,
+    owner: SequenceGeneration,
+) -> Vec<V> {
+    let keys: Vec<_> = graphs
+        .keys()
+        .filter(|key| key.owner() == owner)
+        .copied()
+        .collect();
+    keys.into_iter()
+        .filter_map(|key| graphs.remove(&key))
+        .collect()
 }

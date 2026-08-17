@@ -25,6 +25,9 @@
 
 pub(crate) mod block_mgmt;
 pub(crate) mod drafter_context;
+pub(crate) mod dspark_generation;
+#[cfg(test)]
+mod dspark_generation_tests;
 pub(crate) mod dspark_pool;
 #[cfg(test)]
 mod dspark_pool_tests;

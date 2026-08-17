@@ -20,6 +20,7 @@ impl BlockDiffusionDraftHead {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        expected_owner: Option<super::SequenceGeneration>,
         ctx: &ForwardContext,
         stream: u64,
         draft_embed_target: Option<DevicePtr>,
@@ -32,11 +33,13 @@ impl BlockDiffusionDraftHead {
             scratch,
             markov_embed,
             markov_bias,
+            0,
             last_token,
             target_hidden,
             position,
             num_drafts,
             state,
+            expected_owner,
             ctx,
             stream,
             draft_embed_target,
@@ -51,11 +54,13 @@ impl BlockDiffusionDraftHead {
         scratch: &DflashScratch,
         markov_embed: DevicePtr,
         markov_bias: DevicePtr,
+        lane_id: usize,
         last_token: u32,
         _target_hidden: DevicePtr,
         position: usize,
         _num_drafts: usize,
         state: &mut dyn ProposerState,
+        expected_owner: Option<super::SequenceGeneration>,
         ctx: &ForwardContext,
         _stream: u64,
         _draft_embed_target: Option<DevicePtr>,
@@ -67,6 +72,12 @@ impl BlockDiffusionDraftHead {
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        let owner = self.validate_dflash_owner(dstate, expected_owner)?;
+        let lifecycle = dstate
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DFlash proposer state has no generation owner"))?;
+        lifecycle.advance(owner, position, self.gamma, lifecycle.row_stride_bytes())?;
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator at propose entry ──
         // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
@@ -507,6 +518,8 @@ impl BlockDiffusionDraftHead {
                 scratch,
                 markov_embed,
                 markov_bias,
+                owner,
+                lane_id,
                 defer_readback,
             )
             .map_err(|e| {

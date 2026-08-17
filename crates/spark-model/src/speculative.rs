@@ -380,6 +380,7 @@ pub trait DraftProposer: Send + Sync {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         ctx: &ForwardContext,
         stream: u64,
         draft_embed_target: Option<DevicePtr>,
@@ -410,6 +411,7 @@ pub trait DraftProposer: Send + Sync {
         _positions: &[usize],
         _num_drafts: usize,
         _states: &mut [&mut dyn ProposerState],
+        _expected_owners: Option<&[crate::layers::dflash_head::SequenceGeneration]>,
         _ctx: &ForwardContext,
         _stream: u64,
         _out_conf: Option<&mut Vec<Vec<f32>>>,
@@ -464,6 +466,7 @@ pub trait DraftProposer: Send + Sync {
     fn after_verify(
         &self,
         num_accepted: usize,
+        expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         state: &mut dyn ProposerState,
         stream: u64,
     ) -> Result<()>;
@@ -475,8 +478,13 @@ pub trait DraftProposer: Send + Sync {
     /// can release raw device allocations stored on the state — `DevicePtr`
     /// has no `Drop`, so anything `alloc_state` allocated leaks unless it is
     /// explicitly freed here.
-    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
-        let _ = (gpu, state);
+    fn free_state(
+        &self,
+        gpu: &dyn GpuBackend,
+        expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
+        state: &mut dyn ProposerState,
+    ) -> Result<()> {
+        let _ = (gpu, expected_owner, state);
         Ok(())
     }
 }

@@ -73,6 +73,14 @@ fn stale_generation_cannot_access_advance_or_retire_new_owner() {
 }
 
 #[test]
+fn swapped_sequence_state_owner_is_rejected_even_when_slot_is_live() {
+    let original = owner(4, 20);
+    let swapped = owner(5, 20);
+    let descriptor = CaptureDescriptor::bind(original, 200, 2, 4, 64).unwrap();
+    assert!(descriptor.validate_access(swapped).is_err());
+}
+
+#[test]
 fn retirement_is_same_owner_idempotent_and_blocks_every_access() {
     let o = owner(1, 2);
     let mut d = CaptureDescriptor::bind(o, 30, 2, 4, 16).unwrap();
@@ -124,4 +132,21 @@ fn row_offset_overflow_is_rejected() {
     let o = owner(1, 1);
     let d = CaptureDescriptor::bind(o, 0, 2, 2, usize::MAX).unwrap();
     assert!(d.row_range(o, 1).is_err());
+}
+
+#[test]
+fn graph_retirement_removes_only_the_exact_generation_owner() {
+    let old = owner(2, 10);
+    let new = owner(2, 11);
+    let mut graphs = HashMap::from([
+        (DflashGraphIdentity::new(old, 1, 2, 3, 0).unwrap(), "old-a"),
+        (DflashGraphIdentity::new(old, 4, 5, 6, 1).unwrap(), "old-b"),
+        (DflashGraphIdentity::new(new, 1, 2, 3, 0).unwrap(), "new"),
+    ]);
+    let mut retired = take_owned_graphs(&mut graphs, old);
+    retired.sort_unstable();
+    assert_eq!(retired, vec!["old-a", "old-b"]);
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graphs.values().copied().collect::<Vec<_>>(), vec!["new"]);
+    assert!(take_owned_graphs(&mut graphs, old).is_empty());
 }

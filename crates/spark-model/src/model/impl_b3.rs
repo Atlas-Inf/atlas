@@ -23,6 +23,7 @@ use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
 use crate::layers::ops;
+use crate::layers::dflash_head::{DflashProposerState, SequenceGeneration};
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
@@ -99,6 +100,7 @@ impl TransformerModel {
         // sequence: whole-prompt prefill on a COLD turn, carried rows + a
         // short append on a WARM one. See `ensure_drafter_context`.
         self.ensure_drafter_context(proposer, seq, &ctx, stream);
+        let expected_owner = seq.expected_dspark_owner()?;
         let prop_state = seq
             .proposer_state
             .as_mut()
@@ -232,6 +234,7 @@ impl TransformerModel {
             position,
             num_drafts,
             prop_state.as_mut(),
+            Some(expected_owner),
             &ctx,
             stream,
             draft_embed_target,
@@ -255,7 +258,7 @@ impl TransformerModel {
                 "MTP draft skipped: chain confidence {conf:.3} < tau {tau:.3}                  (pos {position}, {} drafts trimmed)",
                 drafts.len(),
             );
-            proposer.after_verify(0, prop_state.as_mut(), stream)?;
+            proposer.after_verify(0, Some(expected_owner), prop_state.as_mut(), stream)?;
             return Ok(Vec::new());
         }
         Ok(drafts)

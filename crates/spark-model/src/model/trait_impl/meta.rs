@@ -23,6 +23,7 @@ use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
 use crate::layers::ops;
+use crate::layers::dflash_head::{CaptureDescriptor, DflashProposerState, SequenceGeneration};
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
@@ -314,11 +315,29 @@ impl TransformerModel {
         // Double-check: explicit sync to guarantee zero is complete
         self.gpu.synchronize(self.gpu.default_stream())?;
 
-        // Allocate MTP proposer state (owns its own KV cache block table)
-        let proposer_state = match &self.proposer {
+        let dspark_generation =
+            super::super::dspark_generation::next_dspark_generation(
+                &self.dspark_sequence_generation,
+            )?;
+        let dspark_owner = SequenceGeneration::new(slot, dspark_generation)?;
+
+        // Allocate proposer state and bind DSpark ownership before it can be used.
+        let mut proposer_state = match &self.proposer {
             Some(p) => Some(p.alloc_state(self.gpu.as_ref())?),
             None => None,
         };
+        if let Some(dstate) = proposer_state
+            .as_mut()
+            .and_then(|state| state.as_any_mut().downcast_mut::<DflashProposerState>())
+        {
+            dstate.lifecycle = Some(CaptureDescriptor::bind(
+                dspark_owner,
+                0,
+                0,
+                self.dflash_hidden_save_rows,
+                dstate.ctx_slot_bytes,
+            )?);
+        }
 
         // No graph invalidation needed — pool addresses are stable across sequences.
 
@@ -349,6 +368,7 @@ impl TransformerModel {
             marconi_exact_snap: None,
             session_hash: 0,
             mtp_capture_gen: 0,
+            dspark_owner: Some(dspark_owner),
             chunked_prefill_meta: None,
             cached_prefix_tokens: 0,
             cached_prefix_blocks: 0,

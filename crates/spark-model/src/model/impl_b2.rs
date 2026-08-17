@@ -221,6 +221,7 @@ impl TransformerModel {
                 position,
                 num_drafts,
                 prop_state.as_mut(),
+                seq.dspark_owner,
                 &ctx,
                 stream,
                 None,
@@ -284,7 +285,7 @@ impl TransformerModel {
                 self.rollback_ssm_states(seq, num_accepted + 1)?;
             }
 
-            proposer.after_verify(num_accepted, prop_state.as_mut(), stream)?;
+            proposer.after_verify(num_accepted, seq.dspark_owner, prop_state.as_mut(), stream)?;
 
             if let Some(last) = output_tokens.last()
                 && params.stop_token_ids.contains(last)

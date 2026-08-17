@@ -513,9 +513,28 @@ impl TransformerModel {
                 .collect(),
         };
         let mut states: Vec<&mut dyn crate::speculative::ProposerState> = Vec::new();
+        let mut expected_owners = Vec::with_capacity(seqs.len());
         for seq in seqs.iter_mut() {
+            let expected = seq.expected_dspark_owner()?;
             match seq.proposer_state.as_mut() {
-                Some(s) => states.push(s.as_mut()),
+                Some(s) => {
+                    if let Some(dstate) = s
+                        .as_any_mut()
+                        .downcast_mut::<crate::layers::DflashProposerState>()
+                    {
+                        dstate
+                            .lifecycle
+                            .as_ref()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "DFlash batched proposer state has no generation owner"
+                                )
+                            })?
+                            .validate_access(expected)?;
+                    }
+                    expected_owners.push(expected);
+                    states.push(s.as_mut());
+                }
                 None => return Ok(None),
             }
         }
@@ -525,6 +544,7 @@ impl TransformerModel {
             positions,
             num_drafts,
             &mut states,
+            Some(&expected_owners),
             &ctx,
             stream,
             out_conf,
@@ -550,8 +570,21 @@ impl TransformerModel {
             None => return Ok(()),
         };
         let stream = self.gpu.default_stream();
+        let expected = seq.expected_dspark_owner()?;
         if let Some(ref mut state) = seq.proposer_state {
-            proposer.after_verify(num_accepted, state.as_mut(), stream)?;
+            if let Some(dstate) = state
+                .as_any_mut()
+                .downcast_mut::<crate::layers::DflashProposerState>()
+            {
+                dstate
+                    .lifecycle
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("DFlash trim state has no generation owner")
+                    })?
+                    .validate_access(expected)?;
+            }
+            proposer.after_verify(num_accepted, Some(expected), state.as_mut(), stream)?;
         }
         Ok(())
     }

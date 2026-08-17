@@ -300,6 +300,9 @@ pub struct DflashProposerState {
     /// lanes would replay against another lane's scratch (silent corruption).
     /// `usize::MAX` = pre-assignment sentinel (defensive only).
     pub lane_id: usize,
+    /// Generation-stamped ownership descriptor. Bound by model sequence
+    /// allocation before the state can propose or own CUDA graphs.
+    pub(crate) lifecycle: Option<CaptureDescriptor>,
 
     // ─── Phase 2 Option B fields (paged KV cache for ctx) ───────────────
     /// Device-side block table for the drafter's paged KV cache. Allocated
@@ -503,11 +506,10 @@ pub struct BlockDiffusionDraftHead {
     /// with one capture per subgraph. Attention is NEVER captured —
     /// it's the natural sync barrier between captured subgraphs
     /// (vLLM piecewise convention). See design doc §15.
-    /// Piecewise propose graphs, **keyed by this sequence's Option B
-    /// `block_table_dev` address**. A single `Option<Vec<GraphHandle>>`
-    /// baked one seq's KV pointers and made C>1 replay corrupt. `GraphHandle(0)`
-    /// is the empty-capture sentinel (replay eager for that subgraph).
-    pub propose_graphs: Mutex<HashMap<(u64, u64, u64), Vec<spark_runtime::gpu::GraphHandle>>>,
+    /// Piecewise propose graphs keyed by validated sequence generation and
+    /// every captured pointer/lane identity. Pointer reuse cannot cross a
+    /// retired generation. `GraphHandle(0)` remains the eager sentinel.
+    pub propose_graphs: Mutex<HashMap<DflashGraphIdentity, Vec<spark_runtime::gpu::GraphHandle>>>,
     /// Round-robin counter handing out propose lanes at `alloc_state`.
     /// One extra-lane stream may serve several seqs (n > lanes); the lane
     /// itself never moves for a seq.
@@ -593,6 +595,20 @@ impl BlockDiffusionDraftHead {
             (l.stream, &l.scratch, l.markov_embed, l.markov_bias)
         }
     }
+    fn validate_dflash_owner(
+        &self,
+        dstate: &DflashProposerState,
+        expected_owner: Option<SequenceGeneration>,
+    ) -> Result<SequenceGeneration> {
+        let expected_owner = expected_owner
+            .ok_or_else(|| anyhow::anyhow!("DFlash operation requires expected owner"))?;
+        dstate
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash operation has no generation owner"))?
+            .validate_access(expected_owner)?;
+        Ok(expected_owner)
+    }
 }
 
 impl DraftProposer for BlockDiffusionDraftHead {
@@ -637,6 +653,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 .next_lane
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 % self.lane_count(),
+            lifecycle: None,
         }))
     }
 
@@ -647,6 +664,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        expected_owner: Option<SequenceGeneration>,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
         draft_embed_target: Option<spark_runtime::gpu::DevicePtr>,
@@ -659,6 +677,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             position,
             num_drafts,
             state,
+            expected_owner,
             ctx,
             stream,
             draft_embed_target,
@@ -674,12 +693,20 @@ impl DraftProposer for BlockDiffusionDraftHead {
         positions: &[usize],
         num_drafts: usize,
         states: &mut [&mut dyn crate::speculative::ProposerState],
+        expected_owners: Option<&[SequenceGeneration]>,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
         _out_conf: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         let n = last_tokens.len();
-        if n < 2 || target_hiddens.len() != n || positions.len() != n || states.len() != n {
+        let expected_owners = expected_owners
+            .ok_or_else(|| anyhow::anyhow!("DFlash batched propose requires expected owners"))?;
+        if n < 2
+            || target_hiddens.len() != n
+            || positions.len() != n
+            || states.len() != n
+            || expected_owners.len() != n
+        {
             return Ok(None);
         }
         let lanes_n = self.lane_count();
@@ -693,6 +720,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     positions[i],
                     num_drafts,
                     states[i],
+                    Some(expected_owners[i]),
                     ctx,
                     stream,
                     None,
@@ -760,11 +788,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 lane_scratch,
                 lane_markov_embed,
                 lane_markov_bias,
+                lane,
                 last_tokens[i],
                 target_hiddens[i],
                 positions[i],
                 num_drafts,
                 states[i],
+                Some(expected_owners[i]),
                 ctx,
                 lane_stream,
                 None,
@@ -823,9 +853,12 @@ impl DraftProposer for BlockDiffusionDraftHead {
     fn after_verify(
         &self,
         num_accepted: usize,
+        expected_owner: Option<SequenceGeneration>,
         state: &mut dyn ProposerState,
         _stream: u64,
     ) -> Result<()> {
+        let expected_owner = expected_owner
+            .ok_or_else(|| anyhow::anyhow!("DFlash after_verify requires expected owner"))?;
         let dstate = state
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
@@ -846,12 +879,31 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // just-verified accepted row's 5-layer stack from the seq's
         // dflash_hidden_save region [i*kmax + acc). Row acc = the last
         // accepted position (0 = the greedy row when no draft matched).
+        let lifecycle = dstate
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DFlash after_verify: missing generation owner"))?;
+        lifecycle.validate_access(expected_owner)?;
+        let valid_rows = num_accepted
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("DFlash accepted-row count overflow"))?;
+        lifecycle.advance(
+            expected_owner,
+            lifecycle.absolute_position(),
+            valid_rows,
+            lifecycle.row_stride_bytes(),
+        )?;
         dstate.last_num_accepted = num_accepted;
         dstate.last_num_drafted = 0;
         Ok(())
     }
 
-    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+    fn free_state(
+        &self,
+        gpu: &dyn GpuBackend,
+        expected_owner: Option<SequenceGeneration>,
+        state: &mut dyn ProposerState,
+    ) -> Result<()> {
         // Phase 2 (Option B) reclaim: return the drafter's lazily-allocated
         // paged KV blocks to the pool on request completion. Without this the
         // ~257-block Option-B drafter cache (allocated in propose.rs when
@@ -863,6 +915,24 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // Phase 1 / non-DFlash proposer state: nothing allocated, nothing to free.
             None => return Ok(()),
         };
+        let owner = self.validate_dflash_owner(dstate, expected_owner)?;
+        dstate
+            .lifecycle
+            .as_mut()
+            .expect("owner validated above")
+            .retire(owner)?;
+        let retired_graphs = {
+            let mut graphs = self.propose_graphs.lock();
+            lifecycle::take_owned_graphs(&mut graphs, owner)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        for graph in retired_graphs {
+            if graph.0 != 0 {
+                gpu.destroy_graph(graph)?;
+            }
+        }
         if !dstate.block_table.is_empty() {
             self.kv_cache.lock().free_blocks(&dstate.block_table);
             dstate.block_table.clear();
