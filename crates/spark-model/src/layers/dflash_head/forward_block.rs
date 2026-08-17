@@ -9,7 +9,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::{BlockDiffusionDraftHead, DflashScratch};
+use super::{BlockDiffusionDraftHead, DflashGraphIdentity, DflashScratch, SequenceGeneration};
 use crate::layer::ForwardContext;
 
 impl BlockDiffusionDraftHead {
@@ -30,6 +30,8 @@ impl BlockDiffusionDraftHead {
         scratch: &DflashScratch,
         markov_embed: DevicePtr,
         markov_bias: DevicePtr,
+        graph_owner: SequenceGeneration,
+        graph_lane: usize,
         defer_readback: bool,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
@@ -842,11 +844,13 @@ impl BlockDiffusionDraftHead {
             // A triple-collision (same bt, same ctx acc, same lane) is a
             // semantically correct replay: every baked pointer resolves to
             // the new seq's live data. Anything else misses and recaptures.
-            let graph_key = (
+            let graph_key = DflashGraphIdentity::new(
+                graph_owner,
                 option_b_block_table.map(|p| p.0).unwrap_or(0),
                 ctx_buffer.map(|(p, _)| p.0).unwrap_or(0),
                 scratch.markov_prev_dev.0,
-            );
+                graph_lane,
+            )?;
             let mut gmap = self.propose_graphs.lock();
             let cached_ready = gmap
                 .get(&graph_key)

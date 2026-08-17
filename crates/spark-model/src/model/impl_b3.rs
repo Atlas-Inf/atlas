@@ -23,6 +23,7 @@ use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
 use crate::layers::ops;
+use crate::layers::dflash_head::{DflashProposerState, SequenceGeneration};
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
@@ -99,10 +100,18 @@ impl TransformerModel {
         // sequence: whole-prompt prefill on a COLD turn, carried rows + a
         // short append on a WARM one. See `ensure_drafter_context`.
         self.ensure_drafter_context(proposer, seq, &ctx, stream);
+        let expected_owner = SequenceGeneration::new(seq.slot_idx, seq.dspark_generation)?;
         let prop_state = seq
             .proposer_state
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("No proposer state for sequence"))?;
+        if let Some(dstate) = prop_state.as_any_mut().downcast_mut::<DflashProposerState>() {
+            dstate
+                .lifecycle
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("DFlash proposer state has no generation owner"))?
+                .validate_access(expected_owner)?;
+        }
         // ATLAS_MTP_CATCHUP: before proposing, feed pairs the drafter missed
         // during a serial-decode stretch. Coordinates (measured 2026-07-20 on
         // the 27B rig): at propose entry `position == seq.tokens.len()` and

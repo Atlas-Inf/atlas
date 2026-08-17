@@ -118,6 +118,10 @@ pub struct SequenceState {
     /// sequence's captured hiddens (poisoned drafter KV; blind is strictly
     /// better than poisoned). 0 = never owned a capture.
     pub mtp_capture_gen: u64,
+    /// Monotonic lifetime identity for DSpark ownership. Nonzero on every
+    /// `TransformerModel` sequence; the SSM slot may be reused only with a
+    /// different generation. Host-only/non-DSpark states use 0.
+    pub(crate) dspark_generation: u64,
     /// Per-adapter prefix-cache namespace (adapter-correct KV). Folded into the
     /// prefix hash so two adapters that share a token prefix never reuse each
     /// other's blocks. `0` = base / no adapter (a strict no-op in the fold, so
@@ -282,6 +286,7 @@ impl SequenceState {
             marconi_exact_snap: None,
             session_hash: 0,
             mtp_capture_gen: 0,
+            dspark_generation: 0,
             adapter_id: 0,
             chunked_prefill_meta: None,
             cached_prefix_tokens: 0,

@@ -32,6 +32,7 @@ impl BlockDiffusionDraftHead {
             scratch,
             markov_embed,
             markov_bias,
+            0,
             last_token,
             target_hidden,
             position,
@@ -51,6 +52,7 @@ impl BlockDiffusionDraftHead {
         scratch: &DflashScratch,
         markov_embed: DevicePtr,
         markov_bias: DevicePtr,
+        lane_id: usize,
         last_token: u32,
         _target_hidden: DevicePtr,
         position: usize,
@@ -67,6 +69,13 @@ impl BlockDiffusionDraftHead {
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        let lifecycle = dstate
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DFlash proposer state has no generation owner"))?;
+        let owner = lifecycle.owner();
+        lifecycle.validate_access(owner)?;
+        lifecycle.advance(owner, position, self.gamma, lifecycle.row_stride_bytes())?;
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator at propose entry ──
         // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
@@ -507,6 +516,8 @@ impl BlockDiffusionDraftHead {
                 scratch,
                 markov_embed,
                 markov_bias,
+                owner,
+                lane_id,
                 defer_readback,
             )
             .map_err(|e| {

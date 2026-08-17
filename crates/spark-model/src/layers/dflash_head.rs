@@ -300,6 +300,9 @@ pub struct DflashProposerState {
     /// lanes would replay against another lane's scratch (silent corruption).
     /// `usize::MAX` = pre-assignment sentinel (defensive only).
     pub lane_id: usize,
+    /// Generation-stamped ownership descriptor. Bound by model sequence
+    /// allocation before the state can propose or own CUDA graphs.
+    pub(crate) lifecycle: Option<CaptureDescriptor>,
 
     // ─── Phase 2 Option B fields (paged KV cache for ctx) ───────────────
     /// Device-side block table for the drafter's paged KV cache. Allocated
@@ -503,11 +506,10 @@ pub struct BlockDiffusionDraftHead {
     /// with one capture per subgraph. Attention is NEVER captured —
     /// it's the natural sync barrier between captured subgraphs
     /// (vLLM piecewise convention). See design doc §15.
-    /// Piecewise propose graphs, **keyed by this sequence's Option B
-    /// `block_table_dev` address**. A single `Option<Vec<GraphHandle>>`
-    /// baked one seq's KV pointers and made C>1 replay corrupt. `GraphHandle(0)`
-    /// is the empty-capture sentinel (replay eager for that subgraph).
-    pub propose_graphs: Mutex<HashMap<(u64, u64, u64), Vec<spark_runtime::gpu::GraphHandle>>>,
+    /// Piecewise propose graphs keyed by validated sequence generation and
+    /// every captured pointer/lane identity. Pointer reuse cannot cross a
+    /// retired generation. `GraphHandle(0)` remains the eager sentinel.
+    pub propose_graphs: Mutex<HashMap<DflashGraphIdentity, Vec<spark_runtime::gpu::GraphHandle>>>,
     /// Round-robin counter handing out propose lanes at `alloc_state`.
     /// One extra-lane stream may serve several seqs (n > lanes); the lane
     /// itself never moves for a seq.
@@ -637,6 +639,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 .next_lane
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 % self.lane_count(),
+            lifecycle: None,
         }))
     }
 
@@ -760,6 +763,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 lane_scratch,
                 lane_markov_embed,
                 lane_markov_bias,
+                lane,
                 last_tokens[i],
                 target_hiddens[i],
                 positions[i],
@@ -846,6 +850,20 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // just-verified accepted row's 5-layer stack from the seq's
         // dflash_hidden_save region [i*kmax + acc). Row acc = the last
         // accepted position (0 = the greedy row when no draft matched).
+        let lifecycle = dstate
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DFlash after_verify: missing generation owner"))?;
+        let owner = lifecycle.owner();
+        let valid_rows = num_accepted
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("DFlash accepted-row count overflow"))?;
+        lifecycle.advance(
+            owner,
+            lifecycle.absolute_position(),
+            valid_rows,
+            lifecycle.row_stride_bytes(),
+        )?;
         dstate.last_num_accepted = num_accepted;
         dstate.last_num_drafted = 0;
         Ok(())
@@ -863,6 +881,28 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // Phase 1 / non-DFlash proposer state: nothing allocated, nothing to free.
             None => return Ok(()),
         };
+        let owner = dstate
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash free_state: missing generation owner"))?
+            .owner();
+        dstate
+            .lifecycle
+            .as_mut()
+            .expect("owner checked above")
+            .retire(owner)?;
+        let retired_graphs = {
+            let mut graphs = self.propose_graphs.lock();
+            lifecycle::take_owned_graphs(&mut graphs, owner)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        for graph in retired_graphs {
+            if graph.0 != 0 {
+                gpu.destroy_graph(graph)?;
+            }
+        }
         if !dstate.block_table.is_empty() {
             self.kv_cache.lock().free_blocks(&dstate.block_table);
             dstate.block_table.clear();

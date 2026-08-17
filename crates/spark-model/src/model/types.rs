@@ -247,6 +247,9 @@ pub struct TransformerModel {
     /// SSOT). 0 = no capture ever started (matches the fresh-seq stamp 0,
     /// which is harmless: `captured >= prompt_len >= 2` fails at len 0).
     pub(super) mtp_prefill_capture_gen: std::sync::atomic::AtomicU64,
+    /// Monotonic sequence-lifetime generation used by DSpark owner stamps.
+    /// Never emits zero; exhaustion fails sequence allocation.
+    pub(super) dspark_sequence_generation: std::sync::atomic::AtomicU64,
     /// ATLAS_MTP_CARRY_DRAFTER: the previous turn's drafter KV, held so the
     /// next turn of the same session can adopt it instead of rebuilding
     /// (1136 ms at 12k rows) or — as today — silently going without. Single

@@ -514,8 +514,28 @@ impl TransformerModel {
         };
         let mut states: Vec<&mut dyn crate::speculative::ProposerState> = Vec::new();
         for seq in seqs.iter_mut() {
+            let expected = crate::layers::dflash_head::SequenceGeneration::new(
+                seq.slot_idx,
+                seq.dspark_generation,
+            )?;
             match seq.proposer_state.as_mut() {
-                Some(s) => states.push(s.as_mut()),
+                Some(s) => {
+                    if let Some(dstate) = s
+                        .as_any_mut()
+                        .downcast_mut::<crate::layers::DflashProposerState>()
+                    {
+                        dstate
+                            .lifecycle
+                            .as_ref()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "DFlash batched proposer state has no generation owner"
+                                )
+                            })?
+                            .validate_access(expected)?;
+                    }
+                    states.push(s.as_mut());
+                }
                 None => return Ok(None),
             }
         }
@@ -550,7 +570,23 @@ impl TransformerModel {
             None => return Ok(()),
         };
         let stream = self.gpu.default_stream();
+        let expected = crate::layers::dflash_head::SequenceGeneration::new(
+            seq.slot_idx,
+            seq.dspark_generation,
+        )?;
         if let Some(ref mut state) = seq.proposer_state {
+            if let Some(dstate) = state
+                .as_any_mut()
+                .downcast_mut::<crate::layers::DflashProposerState>()
+            {
+                dstate
+                    .lifecycle
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("DFlash trim state has no generation owner")
+                    })?
+                    .validate_access(expected)?;
+            }
             proposer.after_verify(num_accepted, state.as_mut(), stream)?;
         }
         Ok(())

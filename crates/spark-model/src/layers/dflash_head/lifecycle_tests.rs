@@ -125,3 +125,19 @@ fn row_offset_overflow_is_rejected() {
     let d = CaptureDescriptor::bind(o, 0, 2, 2, usize::MAX).unwrap();
     assert!(d.row_range(o, 1).is_err());
 }
+
+#[test]
+fn graph_retirement_removes_only_the_exact_generation_owner() {
+    let old = owner(2, 10);
+    let new = owner(2, 11);
+    let mut graphs = HashMap::from([
+        (DflashGraphIdentity::new(old, 1, 2, 3, 0).unwrap(), "old-a"),
+        (DflashGraphIdentity::new(old, 4, 5, 6, 1).unwrap(), "old-b"),
+        (DflashGraphIdentity::new(new, 1, 2, 3, 0).unwrap(), "new"),
+    ]);
+    let mut retired = take_owned_graphs(&mut graphs, old);
+    retired.sort_unstable();
+    assert_eq!(retired, vec!["old-a", "old-b"]);
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graphs.values().copied().collect::<Vec<_>>(), vec!["new"]);
+}
