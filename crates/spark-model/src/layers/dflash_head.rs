@@ -28,11 +28,13 @@ use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod product_policy;
+mod startup_diagnostics;
 pub use product_policy::{
-    DsparkDiagnostics, DsparkStartupExecution, LightningDsparkIdentityLatch,
-    LightningDsparkPolicyError, LightningDsparkProductPolicy, LightningDsparkRuntimeToggles,
-    LightningStructuralGraphState,
+    DsparkStartupExecution, LightningDsparkIdentityLatch, LightningDsparkPolicyError,
+    LightningDsparkProductPolicy, LightningDsparkRuntimeToggles, LightningStructuralGraphState,
+    enforce_lightning_structural_gate,
 };
+pub use startup_diagnostics::DsparkDiagnostics;
 #[cfg(test)]
 mod product_policy_tests;
 
@@ -624,6 +626,9 @@ impl BlockDiffusionDraftHead {
 }
 
 impl DraftProposer for BlockDiffusionDraftHead {
+    fn startup_diagnostics(&self) -> Option<&DsparkDiagnostics> {
+        Some(&self.startup.diagnostics)
+    }
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`.
         // Sized once, re-used across the seq's lifetime; reset on
@@ -823,7 +828,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             }
         }
         let out: Vec<Vec<u32>> = out.into_iter().map(|o| o.unwrap_or_default()).collect();
-        if std::env::var("ATLAS_DFLASH_VERIFY_TRACE").ok().as_deref() == Some("1") {
+        if self.startup.diagnostics.verify_trace {
             for i in 0..n {
                 tracing::info!(
                     "DFLASH BATCH TRACE collect: i={} lane={} token_in={} position={} drafts={:?}",

@@ -175,7 +175,15 @@ impl TransformerModel {
         // ATLAS_DFLASH_DEBUG_NO_GRAPH=1 forces eager (no graph capture) so
         // CUDA_LAUNCH_BLOCKING=1 reports the exact failing kernel — used
         // to localize K=γ illegal-address crashes downstream of SSM.
-        let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
+        // Product Lightning serves froze this switch at admission: the
+        // admitted policy rejects any presence of the variable, so the
+        // product path never consults the environment here. Generic and
+        // diagnostic serves keep the legacy read.
+        let force_eager = if self.lightning_dspark_identity.policy().is_some() {
+            false
+        } else {
+            std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1")
+        };
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         let use_graphs = self.comm.is_none()
@@ -231,6 +239,9 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // Product Lightning serves carry force_eager=false from the
+            // frozen admission, so this timing hatch only arms on
+            // diagnostic/generic serves (it requires eager anyway).
             let time_layers = force_eager
                 && std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
             let mut t_attn = 0u128;
@@ -316,10 +327,13 @@ impl TransformerModel {
                 // 0..=num_accepted; capturing only k-1 poisons the next
                 // propose (2026-07-09 accept-collapse). Opt out with
                 // ATLAS_DFLASH_CAPTURE_LAST_ONLY=1 for ablation.
-                let capture_last_only = std::env::var("ATLAS_DFLASH_CAPTURE_LAST_ONLY")
-                    .ok()
-                    .as_deref()
-                    == Some("1");
+                // Ablation only: product Lightning serves never arm this
+                // (the admitted policy freezes the diagnostic surface).
+                let capture_last_only = self.lightning_dspark_identity.policy().is_none()
+                    && std::env::var("ATLAS_DFLASH_CAPTURE_LAST_ONLY")
+                        .ok()
+                        .as_deref()
+                        == Some("1");
                 if capture_last_only {
                     self.try_dflash_capture(layer_idx, k - 1, stream)?;
                 } else {

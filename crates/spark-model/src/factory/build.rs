@@ -619,6 +619,15 @@ pub fn build_model(
     // Loaded last because it depends on the target's `embed_tokens` and
     // `lm_head` pointers (the drafter checkpoint omits these — they're
     // shared at runtime, mirroring vLLM PR #40898's `skip_substrs` flow).
+    // ── Step 8: LoRA adapter install (optional, post-construction) ──
+    // The pool/tables were loaded up top (pre-KV-sizing); this walk copies
+    // the per-layer pairs into the layer structs. M0: layers only STORE the
+    // adapter — base output is unchanged until the M1 compute insertions.
+    // MUST run before any Lightning product setter below: the setter's
+    // structural gate rejects LoRA-backed targets, so installing adapters
+    // first makes that precondition observable instead of bypassable.
+    model.set_lora_weights(lora_weights)?;
+
     if let Some(args) = dflash_args {
         let weights = load_dflash_weights(
             args.drafter_store,
@@ -697,12 +706,6 @@ pub fn build_model(
             }
         }
     }
-
-    // ── Step 8: LoRA adapter install (optional, post-construction) ──
-    // The pool/tables were loaded up top (pre-KV-sizing); this walk copies
-    // the per-layer pairs into the layer structs. M0: layers only STORE the
-    // adapter — base output is unchanged until the M1 compute insertions.
-    model.set_lora_weights(lora_weights)?;
 
     // Every layer has taken the pointers it needs; hand the ledger to the model
     // so `teardown` can free the weights. Dropping it here — which is what used

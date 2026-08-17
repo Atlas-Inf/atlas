@@ -380,3 +380,38 @@ fn startup_diagnostics_default_all_off_for_product() {
     assert_eq!(execution.diagnostics, super::DsparkDiagnostics::default());
     assert_eq!(execution.diagnostics.propose_warmup_n, 2);
 }
+
+#[test]
+fn shared_structural_gate_rejects_each_eager_cause() {
+    // This is the exact function the production setter calls; if the
+    // setter stops calling it, setter_rejects_structurally_eager_target
+    // in impl_b3_accessors (which routes through this same function)
+    // loses its enforcement and this pin makes the contract explicit.
+    for state in [
+        super::LightningStructuralGraphState {
+            target_suppress_graphs: true,
+            lora_installed: false,
+            distributed_topology: false,
+        },
+        super::LightningStructuralGraphState {
+            target_suppress_graphs: false,
+            lora_installed: true,
+            distributed_topology: false,
+        },
+        super::LightningStructuralGraphState {
+            target_suppress_graphs: false,
+            lora_installed: false,
+            distributed_topology: true,
+        },
+    ] {
+        let error = super::enforce_lightning_structural_gate(state)
+            .expect_err("structurally eager state must fail the shared gate");
+        assert!(error.to_string().contains("structurally eager"), "{error}");
+    }
+    super::enforce_lightning_structural_gate(super::LightningStructuralGraphState {
+        target_suppress_graphs: false,
+        lora_installed: false,
+        distributed_topology: false,
+    })
+    .expect("clean structural state passes the shared gate");
+}

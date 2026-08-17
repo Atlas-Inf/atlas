@@ -52,7 +52,7 @@ impl BlockDiffusionDraftHead {
         // ATLAS_DFLASH_DEBUG_CTX_OFF=1 disables ctx entirely (eff_ctx=0)
         // for A/B testing whether the drafter actually responds to ctx.
         let force_no_ctx = self.startup.diagnostics.debug_ctx_off;
-        let force_ctx_used = self.startup.diagnostics.debug_ctx_used;
+        let force_ctx_used: Option<usize> = self.startup.diagnostics.debug_ctx_used;
         let (ctx_base_ptr, ctx_total, eff_ctx) = match ctx_buffer {
             Some(_) if force_no_ctx => (None, 0, 0),
             Some((p, n)) => {

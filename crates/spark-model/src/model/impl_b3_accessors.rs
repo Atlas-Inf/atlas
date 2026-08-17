@@ -62,13 +62,8 @@ impl TransformerModel {
             lora_installed: self.lora.is_some(),
             distributed_topology: self.comm.is_some(),
         };
-        anyhow::ensure!(
-            structural.graphs_allowed(),
-            "Lightning DSpark product admission rejected: target is structurally eager              (suppress_graphs={}, lora={}, distributed={})",
-            structural.target_suppress_graphs,
-            structural.lora_installed,
-            structural.distributed_topology
-        );
+        crate::layers::dflash_head::enforce_lightning_structural_gate(structural)
+            .map_err(anyhow::Error::from)?;
         self.proposer = Some(proposer);
         self.lightning_dspark_identity.install_lightning(policy);
         Ok(())
@@ -131,7 +126,8 @@ mod identity_transition_tests {
                 lora_installed: self.lora.is_some(),
                 distributed_topology: self.comm.is_some(),
             };
-            anyhow::ensure!(structural.graphs_allowed(), "structurally eager target");
+            crate::layers::dflash_head::enforce_lightning_structural_gate(structural)
+                .map_err(anyhow::Error::from)?;
             self.lightning_dspark_identity.install_lightning(policy);
             Ok(())
         }

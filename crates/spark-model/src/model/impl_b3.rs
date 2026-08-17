@@ -41,17 +41,22 @@ impl TransformerModel {
             Some(p) => p.as_ref(),
             None => return Ok(Vec::new()),
         };
-        // ATLAS_DFLASH_DEBUG_DUMP_FULL=1: emit the full token sequence
-        // ONCE so a Python reference can run the SAME tokens through HF
+        // ATLAS_DFLASH_DEBUG_DUMP_FULL: emit the full token sequence ONCE
+        // so a Python reference can run the SAME tokens through HF
         // transformers and dump matching hidden-state captures.
         // Per-model latch: a static would let the previous model swallow this
-        // one's dump. Env first, so a disabled dump never burns the shot.
-        if std::env::var("ATLAS_DFLASH_DEBUG_DUMP_FULL")
-            .ok()
-            .as_deref()
-            == Some("1")
-            && self.stats.dumped.keyed("dump:dflash_tokens")
-        {
+        // one's dump. DFlash proposers carry the startup-frozen switch; other
+        // proposers keep the legacy environment read (diagnostic-only).
+        let dump_full = proposer
+            .startup_diagnostics()
+            .map(|diagnostics| diagnostics.dump_full)
+            .unwrap_or_else(|| {
+                std::env::var("ATLAS_DFLASH_DEBUG_DUMP_FULL")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            });
+        if dump_full && self.stats.dumped.keyed("dump:dflash_tokens") {
             let tokens_json = serde_json::json!({
                 "prompt_len": position - seq.tokens.len() + seq.tokens.len(),
                 "position": position,
