@@ -29,8 +29,8 @@ use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod product_policy;
 pub use product_policy::{
-    LightningDsparkIdentityLatch, LightningDsparkPolicyError, LightningDsparkProductPolicy,
-    LightningDsparkRuntimeToggles,
+    DsparkStartupExecution, LightningDsparkIdentityLatch, LightningDsparkPolicyError,
+    LightningDsparkProductPolicy, LightningDsparkRuntimeToggles,
 };
 #[cfg(test)]
 mod product_policy_tests;
@@ -542,6 +542,12 @@ pub struct BlockDiffusionDraftHead {
 
     // Quantization mode (BF16 only for Phase 1).
     pub quant: DflashQuantization,
+
+    /// Startup-static execution values, resolved once at construction.
+    /// `propose`/`forward_block`/lane build read this instead of the
+    /// process environment. Product heads derive it from the validated
+    /// Lightning policy; generic heads keep legacy lenient semantics.
+    pub startup: DsparkStartupExecution,
 }
 
 mod contract;

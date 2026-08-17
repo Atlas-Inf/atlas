@@ -322,11 +322,11 @@ impl BlockDiffusionDraftHead {
         }
 
         // ── Phase 2 Option B: lazy block_table allocation ─────────────
-        // When ATLAS_DFLASH_OPTION_B=1 and the proposer hasn't yet
-        // allocated paged blocks, do it now. We allocate enough blocks
+        // When the startup policy enabled Option B and the proposer hasn't
+        // yet allocated paged blocks, do it now. We allocate enough blocks
         // to cover the full ctx_hidden_acc plus a safety margin for γ.
         // Block_size matches from_weights.rs:68 (=16).
-        let option_b_enabled = std::env::var("ATLAS_DFLASH_OPTION_B").ok().as_deref() == Some("1");
+        let option_b_enabled = self.startup.option_b_enabled;
         let option_b_arg: Option<(DevicePtr, u32)> = if option_b_enabled {
             // Lazy block table init. ctx slots come from precompute over the
             // accumulated target hiddens; γ slots come from the layer body.
@@ -483,14 +483,12 @@ impl BlockDiffusionDraftHead {
                     position.saturating_sub(dstate.ctx_len),
                 );
             }
-            // Ablation: ATLAS_DFLASH_OPTION_B_NO_CTX=1 forces ctx_count=0
-            // in the layer body so paged attention only sees the γ K/V
-            // we write in-layer. If accept rate is bad even here, the
-            // bug is in the cache write/read path, not in precompute.
-            let ablate_no_ctx = std::env::var("ATLAS_DFLASH_OPTION_B_NO_CTX")
-                .ok()
-                .as_deref()
-                == Some("1");
+            // Ablation: startup no-ctx forces ctx_count=0 in the layer
+            // body so paged attention only sees the γ K/V we write
+            // in-layer. If accept rate is bad even here, the bug is in
+            // the cache write/read path, not in precompute. Product heads
+            // always carry `false` here (the policy rejects the override).
+            let ablate_no_ctx = self.startup.option_b_no_ctx;
             let effective_ctx_count = if ablate_no_ctx {
                 0
             } else {
@@ -530,12 +528,10 @@ impl BlockDiffusionDraftHead {
         // forward_block returns [mask_1 .. mask_{γ-1}, bonus_0]; the bonus
         // row is NOT a draft (vLLM sample_off=1). Capping at γ sent that
         // extra token into M=γ+1 target verify (~11 ms) for no accept gain.
-        // ATLAS_DFLASH_DRAFT_CAP still overrides for ablation.
+        // The startup draft-cap override still applies for generic
+        // ablation; the Lightning product policy rejects any override.
         let default_k = _num_drafts.min(self.gamma.saturating_sub(1)).max(1);
-        let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default_k);
+        let cap: usize = self.startup.draft_cap_override.unwrap_or(default_k);
 
         // ATLAS_DFLASH_VERIFY_TRACE=1: log all γ drafts BEFORE the cap so we
         // can see whether the drafter echoes only at position 0 or across

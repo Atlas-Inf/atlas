@@ -254,3 +254,61 @@ fn identity_latch_transitions_between_generic_and_lightning() {
         "generic install clears stale identity"
     );
 }
+
+#[test]
+fn startup_execution_from_lightning_freezes_product_values() {
+    let toggles = exact_product_toggles();
+    let execution = super::DsparkStartupExecution::from_lightning(toggles);
+    assert!(execution.option_b_enabled);
+    assert_eq!(execution.proposal_lane_count, 1);
+    assert_eq!(execution.draft_cap_override, None);
+    assert!(!execution.option_b_no_ctx);
+    assert!(!execution.debug_dump);
+    assert!(!execution.graph_ineligible_diags);
+}
+
+#[test]
+fn startup_execution_from_lightning_marks_ineligible_toggles() {
+    // Toggles that pass raw parsing but fail product validation (lane 2,
+    // draft cap) still freeze deterministically; graph eligibility is
+    // derived so an ineligible toggle is visible on the execution struct.
+    let mut toggles = exact_product_toggles();
+    toggles.proposal_graph_eligible = false;
+    let execution = super::DsparkStartupExecution::from_lightning(toggles);
+    assert!(execution.graph_ineligible_diags);
+}
+
+#[test]
+fn startup_execution_from_env_lenient_defaults() {
+    // Generic DFlash defaults: Option B off, one lane, no cap, no dumps.
+    let execution = super::DsparkStartupExecution::from_env_lenient();
+    assert_eq!(
+        execution.proposal_lane_count.max(1),
+        execution.proposal_lane_count
+    );
+    assert!(!execution.debug_dump);
+}
+
+#[test]
+fn startup_execution_is_frozen_not_env_read() {
+    // Constructing from Lightning toggles must not consult the process
+    // environment at all: identical toggles produce identical execution
+    // regardless of any ambient diagnostic variables.
+    let toggles = exact_product_toggles();
+    let a = super::DsparkStartupExecution::from_lightning(toggles);
+    let b = super::DsparkStartupExecution::from_lightning(toggles);
+    assert_eq!(a, b);
+}
+
+fn exact_product_toggles() -> super::LightningDsparkRuntimeToggles {
+    super::LightningDsparkRuntimeToggles {
+        option_b_enabled: true,
+        proposal_lane_count: 1,
+        proposal_graph_eligible: true,
+        target_verify_graph_eligible: true,
+        batched_verify_enabled: true,
+        seam_serial_enabled: false,
+        draft_cap_override: None,
+        adaptive_enabled: false,
+    }
+}

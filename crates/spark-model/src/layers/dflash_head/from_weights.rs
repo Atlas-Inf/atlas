@@ -13,7 +13,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::{
     BlockDiffusionDraftHead, DflashKernels, DflashLane, DflashLayer, DflashQuantization,
-    DflashScratch,
+    DflashScratch, DsparkStartupExecution,
 };
 use crate::weight_loader::DflashWeights;
 
@@ -29,6 +29,7 @@ impl BlockDiffusionDraftHead {
         gpu: &dyn GpuBackend,
         max_seq_len: usize,
         max_batch_size: usize,
+        startup: DsparkStartupExecution,
     ) -> Result<Self> {
         let embed_tokens_shared = weights
             .embed_tokens
@@ -347,15 +348,12 @@ impl BlockDiffusionDraftHead {
         };
         let scratch = make_scratch(gpu)?;
 
-        // Extra propose lanes: `ATLAS_DFLASH_PROPOSE_LANES` total lanes
+        // Extra propose lanes: `proposal_lane_count` total lanes
         // (default 1). Each extra lane gets its own stream, scratch set,
         // Markov scratch, and a done-event the default stream waits on
-        // before verify. Lanes >1 only engaged by propose_batch.
-        let n_lanes: usize = std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1)
-            .max(1);
+        // before verify. Lanes >1 only engaged by propose_batch. The count
+        // comes from the frozen startup policy, never a per-build env read.
+        let n_lanes: usize = startup.proposal_lane_count;
         let mut extra_lanes = Vec::with_capacity(n_lanes - 1);
         for _ in 1..n_lanes {
             let stream = gpu.create_stream()?;
@@ -614,6 +612,7 @@ impl BlockDiffusionDraftHead {
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),
             propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
             quant: DflashQuantization::Bf16,
+            startup,
         };
 
         tracing::info!(

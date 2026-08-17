@@ -86,8 +86,9 @@ impl BlockDiffusionDraftHead {
 
         // Debug dump gated by env var: prints first 10 BF16 floats of key
         // intermediates so a Python reference run on the same checkpoint
-        // can be compared element-wise. Use ATLAS_DFLASH_DEBUG_DUMP=1.
-        let debug_dump = std::env::var("ATLAS_DFLASH_DEBUG_DUMP").ok().as_deref() == Some("1");
+        // can be compared element-wise. Frozen at startup; the Lightning
+        // product never enables it (the policy rejects the environment).
+        let debug_dump = self.startup.debug_dump;
         let dump_bf16 = |label: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
             if !debug_dump {
                 return Ok(());
@@ -440,17 +441,7 @@ impl BlockDiffusionDraftHead {
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !debug_dump
-            && std::env::var("ATLAS_DFLASH_PROPOSE_NO_GRAPH").is_err()
-            && std::env::var("ATLAS_DFLASH_DEBUG_DUMP_FULL").is_err()
-            && std::env::var("ATLAS_DFLASH_OPTION_B_DIAG").is_err()
-            && std::env::var("ATLAS_DFLASH_PRECOMPUTE_DUMP").is_err()
-            && std::env::var("ATLAS_DFLASH_VERIFY_TRACE").is_err()
-            && std::env::var("ATLAS_DFLASH_LOG_DRAFTS").is_err()
-            && std::env::var("ATLAS_DFLASH_DEBUG_FORCE_PATTERN").is_err()
-            && std::env::var("ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN").is_err()
-            && std::env::var("ATLAS_DFLASH_DEBUG_CTX_OFF").is_err()
-            && std::env::var("ATLAS_DFLASH_DEBUG_CTX_USED").is_err()
-            && std::env::var("ATLAS_DFLASH_BLOCK_DUMP").is_err();
+            && !self.startup.graph_ineligible_diags;
 
         let warmup_target: usize = std::env::var("ATLAS_DFLASH_PROPOSE_WARMUP_N")
             .ok()

@@ -272,3 +272,86 @@ impl fmt::Display for LightningDsparkPolicyError {
 }
 
 impl std::error::Error for LightningDsparkPolicyError {}
+
+/// Startup-static execution values consumed by the draft head hot paths.
+///
+/// Resolved exactly once at head construction and frozen on the head:
+/// `propose`, `forward_block`, and lane construction must read these fields
+/// instead of re-reading the process environment. The official Lightning
+/// product derives every field from the validated policy toggles
+/// ([`DsparkStartupExecution::from_lightning`]); generic DFlash keeps the
+/// legacy lenient environment semantics but still parses them once here
+/// ([`DsparkStartupExecution::from_env_lenient`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsparkStartupExecution {
+    /// Option B paged-context drafter path is active.
+    pub option_b_enabled: bool,
+    /// Number of total propose lanes (lane 0 is the default stream).
+    pub proposal_lane_count: usize,
+    /// Diagnostic draft-depth cap override; `None` keeps scheduler K.
+    pub draft_cap_override: Option<usize>,
+    /// Option B no-context ablation forces zero drafter context.
+    pub option_b_no_ctx: bool,
+    /// Per-forward debug dumps are active (graph-ineligible).
+    pub debug_dump: bool,
+    /// Any graph-ineligible diagnostic environment was set at startup.
+    pub graph_ineligible_diags: bool,
+}
+
+impl DsparkStartupExecution {
+    /// Frozen product execution derived only from validated Lightning
+    /// toggles. `validate()` guarantees Option B on, exactly one lane, no
+    /// draft cap, and no diagnostic suppression, so the product never
+    /// consults the environment again.
+    pub fn from_lightning(toggles: LightningDsparkRuntimeToggles) -> Self {
+        Self {
+            option_b_enabled: toggles.option_b_enabled,
+            proposal_lane_count: toggles.proposal_lane_count,
+            draft_cap_override: toggles.draft_cap_override,
+            option_b_no_ctx: false,
+            debug_dump: false,
+            graph_ineligible_diags: !(toggles.proposal_graph_eligible
+                && toggles.target_verify_graph_eligible),
+        }
+    }
+
+    /// Generic-DFlash execution: legacy lenient semantics (malformed values
+    /// fall back to defaults), parsed exactly once instead of per step.
+    pub fn from_env_lenient() -> Self {
+        fn one(name: &str) -> bool {
+            std::env::var(name).ok().as_deref() == Some("1")
+        }
+        fn present(name: &str) -> bool {
+            std::env::var_os(name).is_some()
+        }
+        let graph_ineligible_diags = [
+            "ATLAS_DFLASH_PROPOSE_NO_GRAPH",
+            "ATLAS_DFLASH_DEBUG_DUMP_FULL",
+            "ATLAS_DFLASH_OPTION_B_DIAG",
+            "ATLAS_DFLASH_PRECOMPUTE_DUMP",
+            "ATLAS_DFLASH_VERIFY_TRACE",
+            "ATLAS_DFLASH_LOG_DRAFTS",
+            "ATLAS_DFLASH_DEBUG_FORCE_PATTERN",
+            "ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN",
+            "ATLAS_DFLASH_DEBUG_CTX_OFF",
+            "ATLAS_DFLASH_DEBUG_CTX_USED",
+            "ATLAS_DFLASH_BLOCK_DUMP",
+        ]
+        .iter()
+        .any(|name| present(name));
+        Self {
+            option_b_enabled: one("ATLAS_DFLASH_OPTION_B"),
+            proposal_lane_count: std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
+                .ok()
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(1)
+                .max(1),
+            draft_cap_override: std::env::var("ATLAS_DFLASH_DRAFT_CAP")
+                .ok()
+                .and_then(|raw| raw.parse().ok()),
+            option_b_no_ctx: one("ATLAS_DFLASH_OPTION_B_NO_CTX"),
+            debug_dump: one("ATLAS_DFLASH_DEBUG_DUMP"),
+            graph_ineligible_diags,
+        }
+    }
+}
