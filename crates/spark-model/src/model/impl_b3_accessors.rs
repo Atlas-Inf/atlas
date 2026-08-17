@@ -10,6 +10,46 @@ use super::types::TransformerModel;
 use crate::layers::dflash_head::{LightningDsparkProductPolicy, LightningStructuralGraphState};
 use crate::speculative::DraftProposer;
 
+/// Immutable view of exactly the structural fields the Lightning product
+/// setter gates on. Production `TransformerModel` implements it by reading
+/// its real fields; the identity-transition tests implement it with the
+/// same three-field harness. The install seam below is shared, so both
+/// run the identical gate-and-install sequence.
+pub(super) trait LightningStructuralView {
+    fn lightning_structural_graph_state(&self) -> LightningStructuralGraphState;
+}
+
+impl LightningStructuralView for TransformerModel {
+    fn lightning_structural_graph_state(&self) -> LightningStructuralGraphState {
+        LightningStructuralGraphState {
+            target_suppress_graphs: self
+                .suppress_graphs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            lora_installed: self.lora.is_some(),
+            distributed_topology: self.comm.is_some(),
+        }
+    }
+}
+
+/// Production-owned Lightning install seam: gate on the structural state,
+/// then install proposer + identity. `TransformerModel::
+/// set_lightning_dspark_proposer` delegates its entire body here, and the
+/// identity-transition tests call this same function — removing the gate
+/// call from the production path fails those tests identically.
+pub(super) fn install_lightning_proposer(
+    structural: LightningStructuralGraphState,
+    proposer_slot: &mut Option<std::sync::Arc<dyn DraftProposer>>,
+    identity: &mut crate::layers::dflash_head::LightningDsparkIdentityLatch,
+    proposer: std::sync::Arc<dyn DraftProposer>,
+    policy: LightningDsparkProductPolicy,
+) -> anyhow::Result<()> {
+    crate::layers::dflash_head::enforce_lightning_structural_gate(structural)
+        .map_err(anyhow::Error::from)?;
+    *proposer_slot = Some(proposer);
+    identity.install_lightning(policy);
+    Ok(())
+}
+
 impl TransformerModel {
     /// Borrow the GPU backend for post-construction wiring (e.g. installing
     /// a DFlash proposer that needs to allocate paged KV caches against the
@@ -55,18 +95,18 @@ impl TransformerModel {
         proposer: std::sync::Arc<dyn DraftProposer>,
         policy: LightningDsparkProductPolicy,
     ) -> anyhow::Result<()> {
-        let structural = LightningStructuralGraphState {
-            target_suppress_graphs: self
-                .suppress_graphs
-                .load(std::sync::atomic::Ordering::Relaxed),
-            lora_installed: self.lora.is_some(),
-            distributed_topology: self.comm.is_some(),
-        };
-        crate::layers::dflash_head::enforce_lightning_structural_gate(structural)
-            .map_err(anyhow::Error::from)?;
-        self.proposer = Some(proposer);
-        self.lightning_dspark_identity.install_lightning(policy);
-        Ok(())
+        // The entire body is one delegation to the production-owned,
+        // directly-tested install seam: deleting the structural gate (or
+        // the gated read) anywhere on this path fails
+        // `identity_transition_tests`.
+        let structural = LightningStructuralView::lightning_structural_graph_state(self);
+        install_lightning_proposer(
+            structural,
+            &mut self.proposer,
+            &mut self.lightning_dspark_identity,
+            proposer,
+            policy,
+        )
     }
 }
 
@@ -94,50 +134,109 @@ mod identity_transition_tests {
         assert!(latch.policy().is_none());
     }
 
-    /// Mirror of the production setter's structural read set. The
-    /// production `set_lightning_dspark_proposer` computes exactly this
-    /// state from the live model and gates on `graphs_allowed()`.
+    /// Harness implementing the SAME `LightningStructuralView` the
+    /// production `TransformerModel` implements, with the three fields
+    /// the view reads. `set_lightning` drives the REAL production install
+    /// seam (`install_lightning_proposer`) that the production setter
+    /// delegates its entire body to.
     struct SetterHarness {
         lightning_dspark_identity: crate::layers::dflash_head::LightningDsparkIdentityLatch,
+        proposer_slot: Option<std::sync::Arc<dyn DraftProposer>>,
         suppress_graphs: std::sync::atomic::AtomicBool,
         lora: Option<()>,
         comm: Option<()>,
+    }
+
+    impl LightningStructuralView for SetterHarness {
+        fn lightning_structural_graph_state(&self) -> LightningStructuralGraphState {
+            LightningStructuralGraphState {
+                target_suppress_graphs: self
+                    .suppress_graphs
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                lora_installed: self.lora.is_some(),
+                distributed_topology: self.comm.is_some(),
+            }
+        }
+    }
+
+    /// Minimal DraftProposer so the real seam's proposer install is
+    /// exercised (alloc_state is never called by these tests).
+    struct NoopProposer;
+
+    impl crate::speculative::DraftProposer for NoopProposer {
+        fn alloc_state(
+            &self,
+            _gpu: &dyn spark_runtime::gpu::GpuBackend,
+        ) -> anyhow::Result<Box<dyn crate::speculative::ProposerState>> {
+            anyhow::bail!("noop proposer: no state")
+        }
+
+        fn propose(
+            &self,
+            _last_token: u32,
+            _target_hidden: spark_runtime::gpu::DevicePtr,
+            _position: usize,
+            _num_drafts: usize,
+            _state: &mut dyn crate::speculative::ProposerState,
+            _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
+            _ctx: &crate::layer::ForwardContext,
+            _stream: u64,
+            _draft_embed_target: Option<spark_runtime::gpu::DevicePtr>,
+            _grammar_bitmask: Option<&[i32]>,
+            _target_hidden_stack: Option<spark_runtime::gpu::DevicePtr>,
+        ) -> anyhow::Result<Vec<u32>> {
+            Ok(Vec::new())
+        }
+
+        fn after_verify(
+            &self,
+            _num_accepted: usize,
+            _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
+            _state: &mut dyn crate::speculative::ProposerState,
+            _stream: u64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     impl SetterHarness {
         fn new() -> Self {
             Self {
                 lightning_dspark_identity: Default::default(),
+                proposer_slot: None,
                 suppress_graphs: std::sync::atomic::AtomicBool::new(false),
                 lora: None,
                 comm: None,
             }
         }
 
-        /// Structurally identical to the production setter body.
+        /// Drives the REAL production install seam
+        /// (`install_lightning_proposer`) — the function
+        /// `TransformerModel::set_lightning_dspark_proposer` delegates its
+        /// entire body to. Deleting the gate inside the seam, or bypassing
+        /// the seam from the production setter, changes this test's
+        /// observable behavior identically.
         fn set_lightning(
             &mut self,
             policy: crate::layers::dflash_head::LightningDsparkProductPolicy,
         ) -> anyhow::Result<()> {
-            let structural = LightningStructuralGraphState {
-                target_suppress_graphs: self
-                    .suppress_graphs
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                lora_installed: self.lora.is_some(),
-                distributed_topology: self.comm.is_some(),
-            };
-            crate::layers::dflash_head::enforce_lightning_structural_gate(structural)
-                .map_err(anyhow::Error::from)?;
-            self.lightning_dspark_identity.install_lightning(policy);
-            Ok(())
+            let structural = LightningStructuralView::lightning_structural_graph_state(self);
+            super::install_lightning_proposer(
+                structural,
+                &mut self.proposer_slot,
+                &mut self.lightning_dspark_identity,
+                std::sync::Arc::new(NoopProposer),
+                policy,
+            )
         }
 
         fn set_generic(&mut self) {
+            self.proposer_slot = None;
             self.lightning_dspark_identity.install_generic();
         }
 
         fn is_product(&self) -> bool {
-            self.lightning_dspark_identity.policy().is_some()
+            self.lightning_dspark_identity.policy().is_some() && self.proposer_slot.is_some()
         }
     }
 
