@@ -1,51 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::{GROUP, SMEM, SMS, SORTED_CAP};
+use super::{GROUP, MarlinSidecar, SMEM, SMS, SORTED_CAP};
 use crate::layers::ops;
 use crate::weight_map::QuantizedWeight;
 use anyhow::Result;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-
-pub(crate) struct MarlinSidecar {
-    pub up_w: DevicePtr,
-    pub up_s: DevicePtr,
-    pub up_gs: DevicePtr,
-    pub down_w: DevicePtr,
-    pub down_s: DevicePtr,
-    pub down_gs: DevicePtr,
-    pub locks: DevicePtr,
-    pub c_tmp: DevicePtr,
-    pub sorted_ids: DevicePtr,
-    pub expert_ids: DevicePtr,
-    pub n_post: DevicePtr,
-    pub a_exp: DevicePtr,
-    pub moe_up_k: KernelHandle,
-    pub moe_down_k: KernelHandle,
-    pub lin_up_k: KernelHandle,
-    pub lin_down_k: KernelHandle,
-    pub cfg4_up_k: KernelHandle,
-    pub cfg4_down_k: KernelHandle,
-    pub pack_rows_k: KernelHandle,
-    pub lin_up_out: DevicePtr,
-    pub lin_dn_out: DevicePtr,
-    pub pack_k: KernelHandle,
-    pub scatter_k: KernelHandle,
-    pub slot_up_k: KernelHandle,
-    pub slot_dn_k: KernelHandle,
-    pub slot_eids: DevicePtr,
-    pub slot_map: DevicePtr,
-    pub slot_a: DevicePtr,
-    pub slot_up: DevicePtr,
-    pub slot_dn: DevicePtr,
-    pub slot_bars: DevicePtr,
-    pub align_k: KernelHandle,
-    pub repeat_k: KernelHandle,
-    pub up_n: i32,
-    pub up_k: i32,
-    pub down_n: i32,
-    pub down_k: i32,
-    pub e: i32,
-}
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 fn e4m3_to_f32(b: u8) -> f32 {
     let s = (b >> 7) & 1;

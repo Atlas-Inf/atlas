@@ -2,7 +2,7 @@
 //! Load-time Marlin sidecar + graph-safe batched decode.
 
 use anyhow::{Result, bail};
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
 use super::NemotronMoeLayer;
@@ -14,8 +14,48 @@ const SMS: u32 = 48;
 const SMEM: u32 = 96 * 1024;
 const SORTED_CAP: usize = 2048;
 
+pub(super) struct MarlinSidecar {
+    pub up_w: DevicePtr,
+    pub up_s: DevicePtr,
+    pub up_gs: DevicePtr,
+    pub down_w: DevicePtr,
+    pub down_s: DevicePtr,
+    pub down_gs: DevicePtr,
+    pub locks: DevicePtr,
+    pub c_tmp: DevicePtr,
+    pub sorted_ids: DevicePtr,
+    pub expert_ids: DevicePtr,
+    pub n_post: DevicePtr,
+    pub a_exp: DevicePtr,
+    pub moe_up_k: KernelHandle,
+    pub moe_down_k: KernelHandle,
+    pub lin_up_k: KernelHandle,
+    pub lin_down_k: KernelHandle,
+    pub cfg4_up_k: KernelHandle,
+    pub cfg4_down_k: KernelHandle,
+    pub pack_rows_k: KernelHandle,
+    pub lin_up_out: DevicePtr,
+    pub lin_dn_out: DevicePtr,
+    pub pack_k: KernelHandle,
+    pub scatter_k: KernelHandle,
+    pub slot_up_k: KernelHandle,
+    pub slot_dn_k: KernelHandle,
+    pub slot_eids: DevicePtr,
+    pub slot_map: DevicePtr,
+    pub slot_a: DevicePtr,
+    pub slot_up: DevicePtr,
+    pub slot_dn: DevicePtr,
+    pub slot_bars: DevicePtr,
+    pub align_k: KernelHandle,
+    pub repeat_k: KernelHandle,
+    pub up_n: i32,
+    pub up_k: i32,
+    pub down_n: i32,
+    pub down_k: i32,
+    pub e: i32,
+}
+
 mod build;
-pub(super) use build::MarlinSidecar;
 
 impl NemotronMoeLayer {
     pub(super) fn decode_batched_marlin(
