@@ -44,10 +44,34 @@ pub struct DflashConfig {
     pub num_key_value_heads: usize,
     pub head_dim: usize,
     pub vocab_size: usize,
+    /// HF architecture identities; absent on older generic DFlash configs.
+    #[serde(default)]
+    pub architectures: Option<Vec<String>>,
     #[serde(default)]
     pub draft_vocab_size: Option<usize>,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    /// Lightning DSpark's required anchor/sampling declarations.
+    #[serde(default)]
+    pub dspark_bonus_anchor: Option<bool>,
+    #[serde(default)]
+    pub sample_from_anchor: Option<bool>,
+    #[serde(default)]
+    pub attention_sink_bias: Option<bool>,
+    #[serde(default)]
+    pub dspark_markov_rank: Option<usize>,
+    #[serde(default)]
+    pub target_layer_ids: Option<Vec<usize>>,
+    #[serde(
+        default,
+        alias = "dspark_confidence_head",
+        alias = "enable_confidence_head"
+    )]
+    pub confidence_head: Option<bool>,
+    #[serde(default, alias = "dspark_adaptive", alias = "adaptive_verification")]
+    pub adaptive: Option<bool>,
+    #[serde(default)]
+    pub quantization_config: Option<DflashQuantizationConfig>,
     /// Block size γ. Qwen3.6-DFlash ships `block_size: 16`.
     #[serde(default = "default_block_size")]
     pub block_size: usize,
@@ -91,6 +115,13 @@ pub struct DflashRopeScaling {
     pub original_max_position_embeddings: Option<f32>,
 }
 
+/// Minimal nested quantization metadata needed for runtime admission.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DflashQuantizationConfig {
+    #[serde(default)]
+    pub kv_cache_quant_algo: Option<String>,
+}
+
 fn default_block_size() -> usize {
     16
 }
@@ -118,6 +149,16 @@ pub struct DflashSubConfig {
     /// When `Some(true)`, each layer must ship `self_attn.attention_sink_bias`.
     #[serde(default)]
     pub attention_sink_bias: Option<bool>,
+    #[serde(default)]
+    pub sample_from_anchor: Option<bool>,
+    #[serde(
+        default,
+        alias = "dspark_confidence_head",
+        alias = "enable_confidence_head"
+    )]
+    pub confidence_head: Option<bool>,
+    #[serde(default, alias = "dspark_adaptive", alias = "adaptive_verification")]
+    pub adaptive: Option<bool>,
 }
 
 /// Raw weight bundle for the DFlash drafter, post-load.
@@ -408,8 +449,7 @@ mod tests {
 
     #[test]
     fn parse_lightning_dspark_config() {
-        const SNAP: &str =
-            "/home/r0b0tdgx/Documents/Nemotron Lightning/Weights-DSpark/config.json";
+        const SNAP: &str = "/home/r0b0tdgx/Documents/Nemotron Lightning/Weights-DSpark/config.json";
         let json = match std::fs::read_to_string(SNAP) {
             Ok(s) => s,
             Err(_) => return,

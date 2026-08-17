@@ -62,8 +62,8 @@ default_num_drafts = 1
 # Official Lightning DSpark (Qwen3DSpark, 6-layer, Markov-only).
 # Weights stay on the host; pass --dflash --draft-model <local-or-hf>.
 [dflash]
-draft_model = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark"
-gamma = 8
+draft_model = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark"
+gamma = 4
 window_size = 1024
 mask_token_id = 990
 target_layer_ids = [1, 5, 19, 29, 41, 51]
