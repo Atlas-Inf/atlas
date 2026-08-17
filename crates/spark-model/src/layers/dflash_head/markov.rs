@@ -26,19 +26,20 @@ impl BlockDiffusionDraftHead {
         markov_bias: DevicePtr,
     ) -> Result<()> {
         let bf16 = 2usize;
-        if let (Some(w1), Some(w2)) = (self.markov_w1.as_ref(), self.markov_w2.as_ref()) {
-            if self.markov_rank > 0 && !markov_embed.is_null() {
-                return self.argmax_with_markov(
-                    last_token,
-                    w1,
-                    w2,
-                    gpu,
-                    stream,
-                    scratch,
-                    markov_embed,
-                    markov_bias,
-                );
-            }
+        if let (Some(w1), Some(w2)) = (self.markov_w1.as_ref(), self.markov_w2.as_ref())
+            && self.markov_rank > 0
+            && !markov_embed.is_null()
+        {
+            return self.argmax_with_markov(
+                last_token,
+                w1,
+                w2,
+                gpu,
+                stream,
+                scratch,
+                markov_embed,
+                markov_bias,
+            );
         }
         for i in 0..self.gamma {
             let logits_row = scratch.logits.offset(i * self.vocab_size * bf16);

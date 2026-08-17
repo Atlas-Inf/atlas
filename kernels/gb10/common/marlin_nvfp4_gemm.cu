@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-License-Identifier: Apache-2.0
 // Vendored Marlin NVFP4 GEMM (vLLM 0.26 libtorch_stable/quantization/marlin).
 // Torch-free. One instantiation: BF16 x NVFP4 -> BF16, group=16, M<=8, N%64==0.

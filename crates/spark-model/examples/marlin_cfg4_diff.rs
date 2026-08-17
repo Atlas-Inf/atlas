@@ -46,9 +46,8 @@ fn fill_sane_bf16(g: &dyn GpuBackend, dst: DevicePtr, n: usize) -> Result<()> {
         let val = ((i % 9) as f32) - 4.0 + 0.5 * (((i / 9) % 2) as f32);
         *w = (val.to_bits() >> 16) as u16;
     }
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 2)
-    };
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 2) };
     g.copy_h2d(bytes, dst)?;
     Ok(())
 }
@@ -142,15 +141,17 @@ fn main() -> Result<()> {
     let mut b_in = vec![0u32; ((K / 8) * N) as usize];
     for k32 in 0..(K / 8) as usize {
         for n in 0..N as usize {
-            b_in[k32 * N as usize + n] =
-                u32::from_le_bytes(raw_host[(n * (K / 2) as usize + k32 * 4)..][..4].try_into().unwrap());
+            b_in[k32 * N as usize + n] = u32::from_le_bytes(
+                raw_host[(n * (K / 2) as usize + k32 * 4)..][..4]
+                    .try_into()
+                    .unwrap(),
+            );
         }
     }
     let b_in_dev = g.alloc(b_in.len() * 4)?;
     {
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(b_in.as_ptr() as *const u8, b_in.len() * 4)
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(b_in.as_ptr() as *const u8, b_in.len() * 4) };
         g.copy_h2d(bytes, b_in_dev)?;
     }
     let b_marlin = g.alloc(b_in.len() * 4)?;

@@ -30,7 +30,11 @@ fn resolve_ssm_cache_slots(args: &cli::ServeArgs) -> usize {
         return requested;
     }
     let tok_per = args.ssm_checkpoint_interval * args.block_size;
-    let needed = args.max_seq_len.div_ceil(tok_per).saturating_add(8).min(512);
+    let needed = args
+        .max_seq_len
+        .div_ceil(tok_per)
+        .saturating_add(8)
+        .min(512);
     if needed > requested {
         tracing::warn!(
             "raising --ssm-cache-slots {requested} → {needed} so Marconi \

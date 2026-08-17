@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 /*
  * Modified by Neural Magic
  * Copyright (C) Marlin.2024 Elias Frantar

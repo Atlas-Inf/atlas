@@ -30,7 +30,7 @@ use serde::Deserialize;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
-use crate::weight_map::{dense_auto, DenseWeight};
+use crate::weight_map::{DenseWeight, dense_auto};
 
 /// Drafter HF `config.json` (subset Atlas consumes). Mirrors
 /// `z-lab/Qwen3.6-35B-A3B-DFlash/config.json` field names verbatim so
@@ -373,15 +373,16 @@ pub fn load_dflash_weights(
     };
 
     let sub = drafter_config.dflash_config.as_ref();
-    if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight")) {
-        if fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8 && fc_meta.shape.len() == 2 {
-            tracing::info!(
-                "DFlash fc NVFP4 unpack: on-disk {:?} U8 → logical [{}, {}] BF16",
-                fc_meta.shape,
-                fc_meta.shape[0],
-                fc_meta.shape[1] * 2
-            );
-        }
+    if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight"))
+        && fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8
+        && fc_meta.shape.len() == 2
+    {
+        tracing::info!(
+            "DFlash fc NVFP4 unpack: on-disk {:?} U8 → logical [{}, {}] BF16",
+            fc_meta.shape,
+            fc_meta.shape[0],
+            fc_meta.shape[1] * 2
+        );
     }
     tracing::info!(
         "DFlash/DSpark drafter loaded: {} layers, hidden={}, vocab={}, γ={}, markov_rank={}, own_embed={}, causal={:?}, swa={:?}/{:?}, sinks={}/{}, target_layers={:?}",

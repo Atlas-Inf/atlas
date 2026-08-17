@@ -170,8 +170,14 @@ pub fn load_mtp_lightning(
     };
     let mut experts = Vec::with_capacity(num_experts);
     for e in 0..num_experts {
-        let up = dense(store, &format!("mtp.layers.1.mixer.experts.{e}.up_proj.weight"))?;
-        let down = dense(store, &format!("mtp.layers.1.mixer.experts.{e}.down_proj.weight"))?;
+        let up = dense(
+            store,
+            &format!("mtp.layers.1.mixer.experts.{e}.up_proj.weight"),
+        )?;
+        let down = dense(
+            store,
+            &format!("mtp.layers.1.mixer.experts.{e}.down_proj.weight"),
+        )?;
         experts.push(DenseExpertWeight {
             gate_proj: up,
             up_proj: up,
@@ -205,4 +211,3 @@ pub fn load_mtp_lightning(
         shared_intermediate_size: 3712,
     })
 }
-

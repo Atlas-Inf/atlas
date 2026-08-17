@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-License-Identifier: Apache-2.0
 // Vendored Marlin MoE NVFP4 (vLLM 0.26 marlin_moe_wna16). Torch-free.
 // Instantiation: BF16 x NVFP4, group=16, M-tile 8, N-tile 64, K-tile 128.

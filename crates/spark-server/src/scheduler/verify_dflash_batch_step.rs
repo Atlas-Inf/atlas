@@ -7,8 +7,8 @@
 //! `ATLAS_NO_DFLASH_BATCH_VERIFY` (presence) keeps the serial loop.
 
 use super::*;
-use std::time::Instant;
 use spark_model::traits::SequenceState;
+use std::time::Instant;
 
 pub(super) fn dspark_batch_verify_disabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -93,11 +93,7 @@ pub(super) fn step_verify_dflash_batched(
         }
     };
     let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
-    tracing::info!(
-        "DFLASH BATCHED verify n={n} R={} {:.1}ms",
-        acc,
-        verify_ms
-    );
+    tracing::info!("DFLASH BATCHED verify n={n} R={} {:.1}ms", acc, verify_ms);
 
     let mut verifieds: Vec<Vec<u32>> = Vec::with_capacity(n);
     let mut accepts: Vec<usize> = Vec::with_capacity(n);
@@ -278,10 +274,10 @@ pub(super) fn apply_dflash_accept(
         }
     }
 
-    if sched.levers.dflash_unified_ctx {
-        if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
-            tracing::error!("commit_ctx (kgamma batched): {e:#}");
-        }
+    if sched.levers.dflash_unified_ctx
+        && let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len)
+    {
+        tracing::error!("commit_ctx (kgamma batched): {e:#}");
     }
 
     for i in 0..num_accepted {

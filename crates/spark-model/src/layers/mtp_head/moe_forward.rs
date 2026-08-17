@@ -184,8 +184,22 @@ impl MtpHead {
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
         if lightning {
-            self.gemv(ctx.gpu, input, sh_up, shared_up_scratch, shared_inter, h, stream)?;
-            ops::relu_squared_inplace(ctx.gpu, self.relu2_k, shared_up_scratch, shared_inter, stream)?;
+            self.gemv(
+                ctx.gpu,
+                input,
+                sh_up,
+                shared_up_scratch,
+                shared_inter,
+                h,
+                stream,
+            )?;
+            ops::relu_squared_inplace(
+                ctx.gpu,
+                self.relu2_k,
+                shared_up_scratch,
+                shared_inter,
+                stream,
+            )?;
             let shared_out = ctx.buffers.attn_output();
             self.gemv(
                 ctx.gpu,

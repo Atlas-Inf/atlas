@@ -147,22 +147,22 @@ impl NemotronMoeLayer {
                 stream,
             )?;
         } else {
-        ops::moe_expert_gemv(
-            ctx.gpu,
-            self.moe_expert_gemv_k,
-            normed,
-            self.up_ptrs.packed_ptrs,
-            self.up_ptrs.scale_ptrs,
-            self.up_ptrs.scale2_vals,
-            expert_up_out,
-            indices,
-            inter,
-            h as u32,
-            top_k,
-            0,
-            n,
-            stream,
-        )?;
+            ops::moe_expert_gemv(
+                ctx.gpu,
+                self.moe_expert_gemv_k,
+                normed,
+                self.up_ptrs.packed_ptrs,
+                self.up_ptrs.scale_ptrs,
+                self.up_ptrs.scale2_vals,
+                expert_up_out,
+                indices,
+                inter,
+                h as u32,
+                top_k,
+                0,
+                n,
+                stream,
+            )?;
         }
 
         let shared_up = ctx.buffers.ssm_qkvz();
@@ -197,8 +197,8 @@ impl NemotronMoeLayer {
         let expert_down_out = ctx.buffers.expert_down_out();
         let shared_down = ctx.buffers.ssm_deinterleaved();
         let smem = (shared_inter.max(inter) as usize) * 4;
-        let down_wide = self.relu2_down_wide_k.0 != 0
-            && std::env::var("ATLAS_NO_MOE_DOWN_WIDE").is_err();
+        let down_wide =
+            self.relu2_down_wide_k.0 != 0 && std::env::var("ATLAS_NO_MOE_DOWN_WIDE").is_err();
         if down_wide {
             KernelLaunch::new(ctx.gpu, self.relu2_down_wide_k)
                 .grid([div_ceil(h as u32, 64), top_k + 1, n])

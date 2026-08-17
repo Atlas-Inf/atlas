@@ -128,12 +128,8 @@ impl NemotronMoeLayer {
         let mut wave_off = 0usize;
         while wave_off < num_tokens {
             let cn = (num_tokens - wave_off).min(WAVE);
-            ctx.gpu.memset_async(
-                m.slot_a,
-                0,
-                (SLOTS * M_TILE) as usize * h * bf16,
-                stream,
-            )?;
+            ctx.gpu
+                .memset_async(m.slot_a, 0, (SLOTS * M_TILE) as usize * h * bf16, stream)?;
             ops::marlin_pack_slots(
                 ctx.gpu,
                 m.pack_k,

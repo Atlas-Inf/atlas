@@ -120,6 +120,7 @@ sxl = "sxl"
 
 [default.extend-identifiers]
 # Pattern compounds the checker doesn't handle via the default list.
+setp = "setp"
 wht_bf16 = "wht_bf16"
 wht_dim = "wht_dim"
 wht_stride = "wht_stride"

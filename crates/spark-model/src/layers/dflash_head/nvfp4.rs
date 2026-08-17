@@ -7,7 +7,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::{BlockDiffusionDraftHead, DflashQuantization};
 use crate::layers::ops;
-use crate::weight_map::{quantize_to_nvfp4, DenseWeight, Fp8DenseWeight, QuantizedWeight};
+use crate::weight_map::{DenseWeight, Fp8DenseWeight, QuantizedWeight, quantize_to_nvfp4};
 
 impl BlockDiffusionDraftHead {
     pub(super) fn try_install_nvfp4(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
@@ -43,25 +43,67 @@ impl BlockDiffusionDraftHead {
         );
         for layer in &mut self.layers {
             layer.q_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.q_proj, q_dim, h, gpu, absmax, quant, stream,
+                &layer.q_proj,
+                q_dim,
+                h,
+                gpu,
+                absmax,
+                quant,
+                stream,
             )?);
             layer.k_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.k_proj, kv_dim, h, gpu, absmax, quant, stream,
+                &layer.k_proj,
+                kv_dim,
+                h,
+                gpu,
+                absmax,
+                quant,
+                stream,
             )?);
             layer.v_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.v_proj, kv_dim, h, gpu, absmax, quant, stream,
+                &layer.v_proj,
+                kv_dim,
+                h,
+                gpu,
+                absmax,
+                quant,
+                stream,
             )?);
             layer.o_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.o_proj, h, q_dim, gpu, absmax, quant, stream,
+                &layer.o_proj,
+                h,
+                q_dim,
+                gpu,
+                absmax,
+                quant,
+                stream,
             )?);
             layer.gate_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.gate_proj, inter, h, gpu, absmax, quant, stream,
+                &layer.gate_proj,
+                inter,
+                h,
+                gpu,
+                absmax,
+                quant,
+                stream,
             )?);
             layer.up_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.up_proj, inter, h, gpu, absmax, quant, stream,
+                &layer.up_proj,
+                inter,
+                h,
+                gpu,
+                absmax,
+                quant,
+                stream,
             )?);
             layer.down_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.down_proj, h, inter, gpu, absmax, quant, stream,
+                &layer.down_proj,
+                h,
+                inter,
+                gpu,
+                absmax,
+                quant,
+                stream,
             )?);
         }
         self.quant = DflashQuantization::Nvfp4Weights;

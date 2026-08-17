@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-License-Identifier: Apache-2.0
 // gptq_marlin_repack, torch-free. Instantiation: 4-bit, no perm, A16.
 #include "marlin_nvfp4/marlin.cuh"

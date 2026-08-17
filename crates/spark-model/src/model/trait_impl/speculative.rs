@@ -579,9 +579,7 @@ impl TransformerModel {
                 dstate
                     .lifecycle
                     .as_ref()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("DFlash trim state has no generation owner")
-                    })?
+                    .ok_or_else(|| anyhow::anyhow!("DFlash trim state has no generation owner"))?
                     .validate_access(expected)?;
             }
             proposer.after_verify(num_accepted, Some(expected), state.as_mut(), stream)?;

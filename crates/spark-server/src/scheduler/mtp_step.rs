@@ -350,8 +350,7 @@ pub fn step_mtp(
     // uses !dflash via the model self-gate (`dflash_hidden_save`).
     let mut serial_idxs: Vec<usize> = Vec::new();
     let mut batchable_idxs: Vec<usize> = Vec::new();
-    let dspark_batch_ok =
-        !dflash_verify_raw_argmax || !dspark_batch_verify_disabled();
+    let dspark_batch_ok = !dflash_verify_raw_argmax || !dspark_batch_verify_disabled();
     if active.len() > 1 {
         tracing::info!(
             "DFLASH WIDTH n_active={} verify={} boot={} dspark_batch_ok={} ladder_nd={}",
@@ -507,17 +506,7 @@ pub fn step_mtp(
         // DFlash/DSpark verify: route by proposer, not draft count.
         // `--dflash` sets dflash_verify_raw_argmax. The old `drafts.len()>=4`
         // ladder sent K=3 (`--dflash-gamma 4`) into MTP K=3 verify.
-        if dflash_verify_raw_argmax {
-            step_verify_dflash(
-                model,
-                a,
-                sched,
-                &drafts,
-                num_drafts,
-                verify_ctx,
-                dflash_verify_raw_argmax,
-            );
-        } else if drafts.len() >= 4 {
+        if dflash_verify_raw_argmax || drafts.len() >= 4 {
             step_verify_dflash(
                 model,
                 a,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-License-Identifier: Apache-2.0
 // Small-batch Marlin moe_align (n*top_k <= 256, E<=128, block=8).
 // Device-only so it can sit inside a CUDA graph.

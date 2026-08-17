@@ -20,10 +20,10 @@ use crate::weight_map::{DenseWeight, Fp8Weight, NemotronSsmWeights, QuantizedWei
 
 mod prefill;
 mod prefill_proj;
-mod trait_impl;
 mod trait_decode_batched;
-mod trait_decode_verify_multi;
 mod trait_decode_multi_seq;
+mod trait_decode_verify_multi;
+mod trait_impl;
 
 #[allow(dead_code)]
 pub struct NemotronMamba2Layer {

@@ -47,7 +47,13 @@ fn main() -> Result<()> {
     // ── synthetic weights: ONE expert's tables sized [n_exp] with expert 0..3
     //    holding distinct random weights; 4..128 alias expert 0 (empty weight
     //    coverage is enough — routing correctness is what this leg tests).
-    let (inter, k, h, n_exp, te) = (INTER as usize, K as usize, H as usize, N_EXP as usize, TE as usize);
+    let (inter, k, h, n_exp, te) = (
+        INTER as usize,
+        K as usize,
+        H as usize,
+        N_EXP as usize,
+        TE as usize,
+    );
     let b_up = g.alloc(inter * k / 2)?;
     let s_up = g.alloc(inter * k / GROUP as usize)?;
     let b_dn = g.alloc(h * inter / 2)?;
@@ -202,7 +208,12 @@ fn main() -> Result<()> {
     dump(g, "/tmp/g9_sorted_c_dn.bin", c_dn, te * h * 2)?;
     dump(g, "/tmp/g9_sorted_out.bin", out, n_toks() * h * 2)?;
     dump(g, "/tmp/g9_sorted_tokens.bin", sorted_tokens, te * 4)?;
-    dump(g, "/tmp/g9_sorted_offsets.bin", expert_offsets, (n_exp + 1) * 4)?;
+    dump(
+        g,
+        "/tmp/g9_sorted_offsets.bin",
+        expert_offsets,
+        (n_exp + 1) * 4,
+    )?;
     dump(g, "/tmp/g9_sorted_perm.bin", token_to_perm, te * 4)?;
     dump(g, "/tmp/g9_sorted_a.bin", a, n_toks() * k * 2)?;
     dump(g, "/tmp/g9_w_up.bin", b_up, inter * k / 2)?;

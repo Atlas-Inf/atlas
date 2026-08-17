@@ -242,7 +242,7 @@ impl TransformerModel {
         // replay of an existing graph stays allowed at boundaries — this is
         // the proven-safe half of the G1 evidence and keeps DSpark C1 from
         // dropping ~12% on the every-64th eager step.
-        let seq64_boundary = seq.seq_len % 64 == 0;
+        let seq64_boundary = seq.seq_len.is_multiple_of(64);
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
             && !self.profile
             && !self

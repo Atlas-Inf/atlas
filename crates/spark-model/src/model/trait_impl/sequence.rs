@@ -324,9 +324,7 @@ impl TransformerModel {
                 dstate
                     .lifecycle
                     .as_ref()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("DFlash free sequence has no generation owner")
-                    })?
+                    .ok_or_else(|| anyhow::anyhow!("DFlash free sequence has no generation owner"))?
                     .validate_access(expected_owner.ok_or_else(|| {
                         anyhow::anyhow!("DFlash free sequence has no allocation owner")
                     })?)?;

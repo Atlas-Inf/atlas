@@ -54,7 +54,7 @@ pub fn marlin_nvfp4_m8(
         .launch(stream)
 }
 
-/// Sorted-row gather for prefill Marlin: dst[row] = src[sorted_token_ids[row]].
+/// Sorted-row gather for prefill Marlin: dst\[row\] = src\[sorted_token_ids\[row\]\].
 /// Grid: (te, 1, 1) Block: (256, 1, 1)
 pub fn marlin_pack_rows(
     gpu: &dyn GpuBackend,

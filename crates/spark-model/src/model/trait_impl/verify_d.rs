@@ -316,8 +316,10 @@ impl TransformerModel {
                 // 0..=num_accepted; capturing only k-1 poisons the next
                 // propose (2026-07-09 accept-collapse). Opt out with
                 // ATLAS_DFLASH_CAPTURE_LAST_ONLY=1 for ablation.
-                let capture_last_only =
-                    std::env::var("ATLAS_DFLASH_CAPTURE_LAST_ONLY").ok().as_deref() == Some("1");
+                let capture_last_only = std::env::var("ATLAS_DFLASH_CAPTURE_LAST_ONLY")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
                 if capture_last_only {
                     self.try_dflash_capture(layer_idx, k - 1, stream)?;
                 } else {

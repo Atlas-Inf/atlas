@@ -1,0 +1,467 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight};
+
+// ── Grouped MoE prefill ops ─────────────────────────────────────
+
+/// Batched top-K softmax: N tokens in parallel.
+///
+/// Grid: (num_tokens, 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_topk_softmax_batched(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_logits: DevicePtr,
+    expert_indices: DevicePtr,
+    expert_weights: DevicePtr,
+    num_experts: u32,
+    top_k: u32,
+    normalize: bool,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_logits)
+        .arg_ptr(expert_indices)
+        .arg_ptr(expert_weights)
+        .arg_u32(num_experts)
+        .arg_u32(top_k)
+        .arg_u32(if normalize { 1 } else { 0 })
+        .launch(stream)
+}
+
+/// Batched sigmoid + correction-bias top-K MoE routing.
+///
+/// Kernel: `moe_topk_sigmoid_batched(gate_logits, bias, expert_indices,
+///         expert_weights, num_experts, top_k, normalize, scaling_factor)`
+/// Grid: (num_tokens, 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_topk_sigmoid_batched(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_logits: DevicePtr,
+    bias: DevicePtr,
+    expert_indices: DevicePtr,
+    expert_weights: DevicePtr,
+    num_experts: u32,
+    top_k: u32,
+    normalize: bool,
+    scaling_factor: f32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_logits)
+        .arg_ptr(bias)
+        .arg_ptr(expert_indices)
+        .arg_ptr(expert_weights)
+        .arg_u32(num_experts)
+        .arg_u32(top_k)
+        .arg_u32(if normalize { 1 } else { 0 })
+        .arg_f32(scaling_factor)
+        .launch(stream)
+}
+
+/// Batched sqrtsoftplus + correction-bias routing (DeepSeek-V4 prefill).
+///
+/// Same I/O as [`moe_topk_sigmoid_batched`] but scores experts with
+/// `sqrt(log(1+exp(logits)))` (matching the single-token decode path), so
+/// V4 prefill and decode route identically. Grid (N) / Block (256).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_topk_sqrtsoftplus_batched(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_logits: DevicePtr,
+    bias: DevicePtr,
+    expert_indices: DevicePtr,
+    expert_weights: DevicePtr,
+    num_experts: u32,
+    top_k: u32,
+    normalize: bool,
+    scaling_factor: f32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_logits)
+        .arg_ptr(bias)
+        .arg_ptr(expert_indices)
+        .arg_ptr(expert_weights)
+        .arg_u32(num_experts)
+        .arg_u32(top_k)
+        .arg_u32(if normalize { 1 } else { 0 })
+        .arg_f32(scaling_factor)
+        .launch(stream)
+}
+
+const PTRTABLE_LEGACY_N_TILE: u32 = 64;
+
+pub(super) fn ptrtable_legacy_grid_x(n_out: u32) -> u32 {
+    div_ceil(n_out, PTRTABLE_LEGACY_N_TILE)
+}
+
+/// Pointer-table grouped GEMM: one launch covers all experts.
+///
+/// Grid: (ceil(n_out/64), max_m_tiles, num_experts)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_grouped_gemm_ptrtable(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([ptrtable_legacy_grid_x(n_out), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Pointer-table grouped GEMM with N_TILE=128 (transposed or wide kernels).
+///
+/// Grid: (ceil(n_out/128), max_m_tiles, num_experts)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_grouped_gemm_ptrtable_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 128), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Pointer-table grouped GEMM with N_TILE=64 (the COMMON kernel — nano/lightning
+/// targets compile `kernels/gb10/common/moe_w4a16_grouped_gemm.cu` where N_TILE=64,
+/// NOT the model-specific n128 variants). G9 root cause: the n128 wrapper above
+/// launched grid.x=ceil(n_out/128), so the common 64-tiled kernels only ever
+/// computed ceil(N/128)*64 columns — the rest stayed zero → the sorted-MoE
+/// prefill degraded the model (GSM8K 2/12).
+///
+/// Grid: (ceil(n_out/64), max_m_tiles, num_experts)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_grouped_gemm_ptrtable_64(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 64), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// FP8-A pointer-table grouped GEMM with transposed NVFP4 weights.
+///
+/// A must already be converted to FP8 E4M3. The launch shape mirrors
+/// `moe_w4a16_grouped_gemm_ptrtable_n128`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp8_grouped_gemm_ptrtable_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_fp8: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 128), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a_fp8)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// K64 down GEMM: K_STEP_T=64 eliminates pipeline stall (compute=128 cycles > load ~100 cycles).
+/// Use when K=inter (512 for 35B) — 8 K-steps vs 16 with K32.
+///
+/// Grid: (ceil(n_out/128), max_m_tiles, num_experts)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_grouped_gemm_ptrtable_k64_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 128), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// K64 fused gate+up GEMM — zero pipeline stall for K=h (2048 for 35B), 32 K-steps vs 64.
+///
+/// Grid: (ceil(2*n_out/128), max_m_tiles, num_experts)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_fused_gate_up_k64_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    gate_packed_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    up_packed_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    c_gate: DevicePtr,
+    c_up: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(2 * n_out, 128), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(gate_packed_ptrs)
+        .arg_ptr(gate_scale_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(up_packed_ptrs)
+        .arg_ptr(up_scale_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(c_gate)
+        .arg_ptr(c_up)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Gather token rows into expert-sorted order: `permuted[i] = hidden[sorted_token_ids[i]]`.
+/// `permuted` is `[total_expanded, hidden]`. One block per output row, threads
+/// stride over `hidden`. Used by the FP4 grouped gate_up path (the CUTLASS
+/// escape-hatch needs contiguous per-expert rows; the FP8 fused kernel gathers
+/// internally so it doesn't need this).
+///
+/// Retained for the legacy FP4 escape-hatch + potential reuse; the live FP4
+/// path now uses the fused kernel (in-kernel gather), so this is currently
+/// uncalled.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub fn moe_permute_tokens(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    hidden_states: DevicePtr,
+    permuted: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    hidden: u32,
+    total_expanded: u32,
+    stream: u64,
+) -> Result<()> {
+    let threads = hidden.clamp(1, 256);
+    KernelLaunch::new(gpu, kernel)
+        .grid([total_expanded, 1, 1])
+        .block([threads, 1, 1])
+        .arg_ptr(hidden_states)
+        .arg_ptr(permuted)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(hidden)
+        .arg_u32(total_expanded)
+        .launch(stream)
+}
+
+/// K64 fused gate+up GEMM — M=128 variant (Block D #3 — Avarok pattern).
+///
+/// Doubles M_TILE from 64 → 128. Caller must compute `max_m_tiles_m128`
+/// using divisor 128 (vs 64 for the M=64 variant). Grid covers the same
+/// total work but with half the blocks (and twice the work per block).
+///
+/// Grid: (ceil(2*n_out/128), max_m_tiles_m128, num_experts)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_fused_gate_up_k64_m128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    gate_packed_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    up_packed_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    c_gate: DevicePtr,
+    c_up: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles_m128: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(2 * n_out, 128), max_m_tiles_m128, num_experts])
+        .block([256, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(gate_packed_ptrs)
+        .arg_ptr(gate_scale_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(up_packed_ptrs)
+        .arg_ptr(up_scale_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(c_gate)
+        .arg_ptr(c_up)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Fused gate+up grouped GEMM — single launch for both projections.
+///
+/// Grid: (ceil(2*n_out/128), max_m_tiles, num_experts)  Block: (128, 1, 1)
+/// First N cols → gate weights/output, last N cols → up weights/output.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_fused_gate_up_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    gate_packed_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    up_packed_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    c_gate: DevicePtr,
+    c_up: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(2 * n_out, 128), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(gate_packed_ptrs)
+        .arg_ptr(gate_scale_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(up_packed_ptrs)
+        .arg_ptr(up_scale_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(c_gate)
+        .arg_ptr(c_up)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}

@@ -1,4 +1,4 @@
-
+// SPDX-License-Identifier: AGPL-3.0-only
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin
 #endif

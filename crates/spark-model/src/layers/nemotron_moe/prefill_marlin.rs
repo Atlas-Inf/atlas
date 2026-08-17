@@ -46,8 +46,9 @@ impl NemotronMoeLayer {
         let sorted_token_ids = p.gate_logits;
         let sorted_expert_ids = p.gate_logits.offset(te * 4);
         let expert_offsets = p.gate_logits.offset(te * 4 * 2);
-        let token_to_perm =
-            p.gate_logits.offset(te * 4 * 2 + (p.num_experts as usize + 1) * 4);
+        let token_to_perm = p
+            .gate_logits
+            .offset(te * 4 * 2 + (p.num_experts as usize + 1) * 4);
 
         // ── 0. Batched routing + sort (the sorted path runs these inside) ──
         KernelLaunch::new(ctx.gpu, self.topk_sigmoid_batched_k)
@@ -200,9 +201,7 @@ impl NemotronMoeLayer {
 
         // ── 6. Unpermute + weighted reduce (sorted layout — proven kernel) ──
         let routed_out = ctx.buffers.moe_output();
-        let token_to_perm = p
-            .gate_logits
-            .offset(te * 4 * 2 + (ne + 1) * 4);
+        let token_to_perm = p.gate_logits.offset(te * 4 * 2 + (ne + 1) * 4);
         ops::moe_unpermute_reduce_indexed(
             ctx.gpu,
             self.moe_unpermute_reduce_k,

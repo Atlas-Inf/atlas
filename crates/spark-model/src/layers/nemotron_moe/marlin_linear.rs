@@ -152,7 +152,8 @@ impl NemotronMoeLayer {
                         stream,
                     )?;
                 }
-                ctx.gpu.memset_async(m.locks, 0, SMS as usize * 16, stream)?;
+                ctx.gpu
+                    .memset_async(m.locks, 0, SMS as usize * 16, stream)?;
                 ops::marlin_nvfp4_m8(
                     ctx.gpu,
                     m.lin_up_k,
@@ -179,7 +180,8 @@ impl NemotronMoeLayer {
                     (mm as u32) * inter,
                     stream,
                 )?;
-                ctx.gpu.memset_async(m.locks, 0, SMS as usize * 16, stream)?;
+                ctx.gpu
+                    .memset_async(m.locks, 0, SMS as usize * 16, stream)?;
                 ops::marlin_nvfp4_m8(
                     ctx.gpu,
                     m.lin_down_k,

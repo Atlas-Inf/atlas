@@ -1,4 +1,4 @@
-
+// SPDX-License-Identifier: AGPL-3.0-only
 #ifndef _data_types_cuh
 #define _data_types_cuh
 #include "marlin.cuh"

@@ -100,9 +100,8 @@ impl NemotronMamba2Layer {
                 .downcast_mut::<SsmLayerState>()
                 .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
             for t in 0..k {
-                let xbc_in = proj.offset(
-                    (off + t) * self.in_proj_size * bf16 + self.d_inner * bf16,
-                );
+                let xbc_in =
+                    proj.offset((off + t) * self.in_proj_size * bf16 + self.d_inner * bf16);
                 self.conv1d_update_biased(
                     ctx.gpu,
                     ssm_state.conv_state,
@@ -132,9 +131,8 @@ impl NemotronMamba2Layer {
             let x_ptr = packed.offset(off * row_bytes);
             let b_ptr = x_ptr.offset(self.d_inner * bf16);
             let c_ptr = x_ptr.offset((self.d_inner + gs) * bf16);
-            let dt_ptr = proj.offset(
-                off * self.in_proj_size * bf16 + (self.d_inner + self.d_xbc) * bf16,
-            );
+            let dt_ptr =
+                proj.offset(off * self.in_proj_size * bf16 + (self.d_inner + self.d_xbc) * bf16);
             let n_inter = ssm_state
                 .h_state_intermediates
                 .len()

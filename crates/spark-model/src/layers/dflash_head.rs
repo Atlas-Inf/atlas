@@ -547,22 +547,19 @@ pub use contract::{
 #[cfg(test)]
 mod contract_tests;
 mod row_contract;
-pub use row_contract::{
-    CommitProjection, DsparkProposal, DsparkRowError, LightningRowContract,
-};
+pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, LightningRowContract};
+mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;
-mod lifecycle;
 pub use lifecycle::{
-    CaptureDescriptor, CaptureStatus, DflashGraphIdentity, DsparkLifecycleError,
-    SequenceGeneration,
+    CaptureDescriptor, CaptureStatus, DflashGraphIdentity, DsparkLifecycleError, SequenceGeneration,
 };
-#[cfg(test)]
-mod lifecycle_tests;
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
 mod from_weights;
+#[cfg(test)]
+mod lifecycle_tests;
 mod markov;
 mod nvfp4;
 mod precompute_ctx_kv;
@@ -817,12 +814,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     "DFLASH BATCH TRACE collect: i={} lane={} token_in={} position={} drafts={:?}",
                     i,
                     {
-                        let dstate = states[i]
+                        states[i]
                             .as_any_mut()
                             .downcast_mut::<DflashProposerState>()
                             .map(|d| d.lane_id)
-                            .unwrap_or(usize::MAX);
-                        dstate
+                            .unwrap_or(usize::MAX)
                     },
                     last_tokens[i],
                     positions[i],

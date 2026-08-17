@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 /*
 Fast Dequantization (Converting INT4/INT8/FP4/FP8 to FP16/BF16)
 

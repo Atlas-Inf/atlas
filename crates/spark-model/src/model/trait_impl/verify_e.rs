@@ -63,12 +63,7 @@ impl TransformerModel {
             && (self.dflash_hidden_save.is_none()
                 || std::env::var("ATLAS_NO_DFLASH_BATCH_VERIFY").is_err())
             && !self.verify_hidden_stash.is_null()
-            && self
-                .kv_cache
-                .lock()
-                .config()
-                .cache_blocks_per_seq
-                .is_none();
+            && self.kv_cache.lock().config().cache_blocks_per_seq.is_none();
         if !ok {
             tracing::info!(
                 "can_batch_verify n={} ks={:?} stash_null={} dflash_save={} hss={:?} comm={} lora={}",
@@ -291,10 +286,8 @@ impl TransformerModel {
         // Keyed by the ssm-slot VECTOR (verify_e2.rs): every baked SSM
         // pointer is a function of it; meta/embeds live at fixed addresses
         // refreshed above. can_batch already excludes EP/HSS/LoRA/DFlash.
-        let time_layers =
-            std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
-        let graphs_on =
-            super::verify_e2::verify_graphs_enabled() && !k4_diag && !time_layers;
+        let time_layers = std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
+        let graphs_on = super::verify_e2::verify_graphs_enabled() && !k4_diag && !time_layers;
         let graph_key = if graphs_on {
             self.verify_batched_graph_key(&*seqs, ks, wy_tables_base.is_null())
         } else {
