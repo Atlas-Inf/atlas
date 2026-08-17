@@ -17,6 +17,7 @@ use super::ssm_snapshot::SsmSnapshotPool;
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
+use crate::layers::dflash_head::LightningDsparkProductPolicy;
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
@@ -201,6 +202,9 @@ pub struct TransformerModel {
     pub(super) suppress_graphs: std::sync::atomic::AtomicBool,
     /// MTP draft proposer (built from mtp_weights at init).
     pub(super) proposer: Option<Arc<dyn DraftProposer>>,
+    /// Immutable typed identity for the admitted official Lightning product.
+    /// `None` for generic DFlash, MTP, and non-speculative models.
+    pub(super) lightning_dspark_policy: Option<LightningDsparkProductPolicy>,
     /// Dedicated buffer for saving hidden state before MTP head runs.
     /// Size: hidden_size * 4 bytes (one FP32 vector). MTP overwrites shared
     /// buffers (norm_output etc.), so the target hidden must be saved here first.

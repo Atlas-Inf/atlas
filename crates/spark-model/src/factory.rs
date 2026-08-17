@@ -19,7 +19,10 @@ use crate::weight_loader::{
 };
 
 mod dspark_admission;
-pub(crate) use dspark_admission::admit_lightning_dspark_build;
+#[allow(unused_imports)]
+pub(crate) use dspark_admission::{
+    admit_lightning_dspark, admit_lightning_dspark_build, admit_lightning_dspark_product_build,
+};
 #[cfg(test)]
 mod dspark_admission_tests;
 

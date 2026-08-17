@@ -9,8 +9,8 @@ use spark_runtime::kv_cache::KvCacheDtype;
 use super::DflashBuildArgs;
 use crate::layers::dflash_head::{
     AttentionLayout, BonusLayout, CheckpointLayout, ConfidenceLayout, KvDtype, KvLayout,
-    LIGHTNING_MODEL_IDENTITY, LIGHTNING_SWA_WINDOW, LightningDsparkProfile, MarkovLayout,
-    ParallelismLayout,
+    LIGHTNING_MODEL_IDENTITY, LIGHTNING_SWA_WINDOW, LightningDsparkProductPolicy,
+    LightningDsparkProfile, LightningDsparkRuntimeToggles, MarkovLayout, ParallelismLayout,
 };
 use crate::weight_loader::dflash_loader::DflashConfig;
 use crate::weight_loader::store_has_dflash_weights;
@@ -220,6 +220,25 @@ pub(crate) fn admit_lightning_dspark_build(
             all_required_sinks_present,
         },
     )
+}
+
+pub(crate) fn admit_lightning_dspark_product_build(
+    args: &DflashBuildArgs<'_>,
+    target: &ModelConfig,
+    num_drafts: usize,
+    physical_kv_page_size: usize,
+    target_kv_dtype: KvCacheDtype,
+    runtime_toggles: LightningDsparkRuntimeToggles,
+) -> Result<Option<LightningDsparkProductPolicy>> {
+    Ok(admit_lightning_dspark_build(
+        args,
+        target,
+        num_drafts,
+        physical_kv_page_size,
+        target_kv_dtype,
+    )?
+    .map(|profile| LightningDsparkProductPolicy::try_new(profile, runtime_toggles))
+    .transpose()?)
 }
 
 fn required_bool(value: Option<bool>, field: &str) -> Result<bool> {

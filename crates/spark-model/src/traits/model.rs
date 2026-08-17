@@ -127,6 +127,19 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Immutable identity for the official Lightning DSpark product.
+    /// Generic DFlash, MTP, and ordinary models return `None` by default.
+    fn lightning_dspark_product_policy(
+        &self,
+    ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
+        None
+    }
+
+    /// Convenience identity check for object-safe scheduler branching.
+    fn is_lightning_dspark_product(&self) -> bool {
+        self.lightning_dspark_product_policy().is_some()
+    }
+
     /// Run beam search to completion for each request, returning each one's
     /// winning hypothesis token ids (EOS-terminated). Called from the prefill
     /// path for `num_beams > 1` requests, bypassing the token-by-token decode

@@ -7,6 +7,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 
 use super::types::TransformerModel;
+use crate::layers::dflash_head::LightningDsparkProductPolicy;
 use crate::speculative::DraftProposer;
 
 impl TransformerModel {
@@ -38,5 +39,19 @@ impl TransformerModel {
             tracing::info!("DFlash: replacing existing MTP proposer with BlockDiffusionDraftHead");
         }
         self.proposer = Some(proposer);
+        self.lightning_dspark_policy = None;
+    }
+
+    /// Atomically install the admitted official Lightning proposer and its
+    /// immutable startup policy. Generic DFlash and MTP must use
+    /// [`Self::set_dflash_proposer`] and therefore remain non-product.
+    pub fn set_lightning_dspark_proposer(
+        &mut self,
+        proposer: std::sync::Arc<dyn DraftProposer>,
+        policy: LightningDsparkProductPolicy,
+    ) -> anyhow::Result<()> {
+        self.proposer = Some(proposer);
+        self.lightning_dspark_policy = Some(policy);
+        Ok(())
     }
 }

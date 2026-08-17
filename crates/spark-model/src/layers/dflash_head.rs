@@ -27,6 +27,13 @@ use spark_runtime::kv_cache::PagedKvCache;
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
+pub mod product_policy;
+pub use product_policy::{
+    LightningDsparkPolicyError, LightningDsparkProductPolicy, LightningDsparkRuntimeToggles,
+};
+#[cfg(test)]
+mod product_policy_tests;
+
 /// Kernel handles for the DFlash γ-block forward chain. All resolved once
 /// at `BlockDiffusionDraftHead::from_weights` against the active GPU backend
 /// (which compiles target-specific PTX at startup); subsequent

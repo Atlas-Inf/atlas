@@ -48,6 +48,12 @@ pub(in crate::model) mod verify_e2;
 mod verify_fused;
 
 impl Model for TransformerModel {
+    fn lightning_dspark_product_policy(
+        &self,
+    ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
+        self.lightning_dspark_policy.as_ref()
+    }
+
     fn teardown(&mut self) -> Result<()> {
         self.release_pools()
     }

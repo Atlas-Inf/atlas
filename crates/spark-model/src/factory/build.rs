@@ -13,8 +13,9 @@ use spark_runtime::weights::WeightStore;
 
 use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
-use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_build};
+use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_product_build};
 use crate::layers::MtpQuantization;
+use crate::layers::dflash_head::LightningDsparkRuntimeToggles;
 use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
@@ -97,13 +98,18 @@ pub fn build_model(
     #[cfg(not(feature = "cuda"))]
     let _ = (nllb_lang, nllb_lora_dir);
 
-    let lightning_dspark_profile = match dflash_args.as_ref() {
-        Some(args) => {
-            admit_lightning_dspark_build(args, &config, num_drafts, kv_block_size, kv_dtype)?
-        }
+    let lightning_dspark_policy = match dflash_args.as_ref() {
+        Some(args) => admit_lightning_dspark_product_build(
+            args,
+            &config,
+            num_drafts,
+            kv_block_size,
+            kv_dtype,
+            LightningDsparkRuntimeToggles::from_env(),
+        )?,
         None => None,
     };
-    let lightning_dspark_admitted = lightning_dspark_profile.is_some();
+    let lightning_dspark_admitted = lightning_dspark_policy.is_some();
 
     // ── Step 1: Select weight loader (only model-specific dispatch) ──
     let loader = loader_for_config(&config)?;
@@ -631,9 +637,9 @@ pub fn build_model(
                 }
                 // Lightning admission owns the served SWA window. Generic
                 // DFlash keeps the caller's existing override/default path.
-                let served_window_size = lightning_dspark_profile
+                let served_window_size = lightning_dspark_policy
                     .as_ref()
-                    .map(|profile| profile.attention.swa_window)
+                    .map(|policy| policy.profile().attention.swa_window)
                     .or(args.window_size);
                 let head = crate::layers::BlockDiffusionDraftHead::from_weights(
                     weights,
@@ -647,7 +653,12 @@ pub fn build_model(
                     max_seq_len,
                     max_batch_size,
                 )?;
-                model.set_dflash_proposer(std::sync::Arc::new(head));
+                match lightning_dspark_policy {
+                    Some(policy) => {
+                        model.set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?
+                    }
+                    None => model.set_dflash_proposer(std::sync::Arc::new(head)),
+                }
                 tracing::info!(
                     "{} drafter installed as the active proposer",
                     if lightning_dspark_admitted {
