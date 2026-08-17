@@ -19,7 +19,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use crate::layer::{EmptyLayerState, ForwardContext, LayerState, TransformerLayer};
-use crate::layers::ops;
+use crate::layers::{nemotron_decode_policy, ops};
 use crate::weight_map::{DenseWeight, NemotronMoeWeights, QuantizedWeight};
 
 /// Device-side pointer table for one projection across all experts.
@@ -317,13 +317,18 @@ impl TransformerLayer for NemotronMoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // AR C>1: MoE is stateless. One decode_batched over N tokens
-        // (vLLM/SGLang grouped-GEMM). OPT-IN: G3 A/B on the fixed engine
-        // shows 7/8 prompts bit-exact at 64 tok, but the prime prompt flips
-        // a near-tie at char 33 (wide-kernel accumulation ≠ serial GEMV).
-        // Serial stays the default (bit-exact = the DSpark base).
-        if std::env::var("ATLAS_LIGHTNING_DECODE_MULTI").as_deref() == Ok("1") {
-            // serial fallback = the trait default (per-seq decode())
+        // AR C>1: MoE is stateless. Serial decode is the default diagnostic
+        // path. Set ATLAS_LIGHTNING_DECODE_MULTI=1 to opt into one
+        // decode_batched over N tokens (vLLM/SGLang grouped-GEMM). The opt-in
+        // path can differ from serial GEMV on near-ties due to accumulation.
+        if nemotron_decode_policy::decode_multi_seq_batched(
+            std::env::var("ATLAS_LIGHTNING_DECODE_MULTI")
+                .ok()
+                .as_deref(),
+        ) {
+            self.decode_batched_direct(hidden, residual, num_seqs, ctx, stream)
+        } else {
+            // Default serial diagnostic path: one per-sequence decode().
             let h = ctx.config.hidden_size;
             for i in 0..num_seqs {
                 let offset = i * h * 2;
@@ -344,8 +349,6 @@ impl TransformerLayer for NemotronMoeLayer {
                 )?;
             }
             Ok(())
-        } else {
-            self.decode_batched_direct(hidden, residual, num_seqs, ctx, stream)
         }
     }
 

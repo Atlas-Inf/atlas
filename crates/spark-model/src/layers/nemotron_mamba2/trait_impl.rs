@@ -8,7 +8,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 
 use super::NemotronMamba2Layer;
 use crate::layer::{ForwardContext, LayerState, SsmLayerState, TransformerLayer};
-use crate::layers::ops;
+use crate::layers::{nemotron_decode_policy, ops};
 
 impl TransformerLayer for NemotronMamba2Layer {
     fn decode(
@@ -281,12 +281,17 @@ impl TransformerLayer for NemotronMamba2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // AR C>1: batched in/out proj (weights once), per-seq conv+scan.
-        // OPT-IN (see nemotron_moe decode_multi_seq: 1/6 near-tie flip).
-        if std::env::var("ATLAS_LIGHTNING_DECODE_MULTI").as_deref() == Ok("1") {
+        // AR C>1: serial decode is the default diagnostic path. Set
+        // ATLAS_LIGHTNING_DECODE_MULTI=1 to opt into batched in/out projection
+        // (weights once), followed by per-seq conv+scan.
+        if nemotron_decode_policy::decode_multi_seq_batched(
+            std::env::var("ATLAS_LIGHTNING_DECODE_MULTI")
+                .ok()
+                .as_deref(),
+        ) {
             self.decode_multi_seq_ar(hidden, residual, num_seqs, states, ctx, stream)
         } else {
-            // serial fallback = the trait default (per-seq decode())
+            // Default serial diagnostic path: one per-sequence decode().
             let h = ctx.config.hidden_size;
             for i in 0..num_seqs {
                 let offset = i * h * 2;
