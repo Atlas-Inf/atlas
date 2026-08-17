@@ -169,7 +169,10 @@ impl TransformerModel {
         seq: &mut SequenceState,
         stream: u64,
     ) -> Result<crate::engine::GenerateResult> {
-        let mut prop_state = proposer.alloc_state(self.gpu.as_ref())?;
+        anyhow::ensure!(
+            seq.proposer_state.is_some(),
+            "generate_speculative requires the owner-bound sequence proposer state"
+        );
 
         let logits_ptr = self.prefill(prompt_tokens, seq, stream)?;
         let first_token = self.argmax_on_device(logits_ptr, stream)?;
@@ -215,19 +218,26 @@ impl TransformerModel {
                 midchunk_capture: None,
                 moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) skips fold, adapter folds (single-seq reject lifted)
             };
-            let drafts = proposer.propose(
-                token_0,
-                target_hidden,
-                position,
-                num_drafts,
-                prop_state.as_mut(),
-                seq.dspark_owner,
-                &ctx,
-                stream,
-                None,
-                None, // grammar_bitmask: internal self-spec callsite, no grammar routing here
-                self.dflash_hidden_save,
-            )?;
+            let expected_owner = seq.dspark_owner;
+            let drafts = {
+                let prop_state = seq
+                    .proposer_state
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("sequence proposer state disappeared"))?;
+                proposer.propose(
+                    token_0,
+                    target_hidden,
+                    position,
+                    num_drafts,
+                    prop_state.as_mut(),
+                    expected_owner,
+                    &ctx,
+                    stream,
+                    None,
+                    None, // grammar_bitmask: internal self-spec callsite, no grammar routing here
+                    self.dflash_hidden_save,
+                )?
+            };
             let n_drafts = drafts.len();
 
             let mut verify_tokens = vec![token_0];
@@ -285,7 +295,12 @@ impl TransformerModel {
                 self.rollback_ssm_states(seq, num_accepted + 1)?;
             }
 
-            proposer.after_verify(num_accepted, seq.dspark_owner, prop_state.as_mut(), stream)?;
+            let expected_owner = seq.dspark_owner;
+            let prop_state = seq
+                .proposer_state
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("sequence proposer state disappeared"))?;
+            proposer.after_verify(num_accepted, expected_owner, prop_state.as_mut(), stream)?;
 
             if let Some(last) = output_tokens.last()
                 && params.stop_token_ids.contains(last)
