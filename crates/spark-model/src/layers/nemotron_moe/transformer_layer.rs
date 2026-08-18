@@ -246,6 +246,7 @@ impl TransformerLayer for NemotronMoeLayer {
                 .is_some_and(|m| m.lin_up_k.0 != 0 && m.lin_down_k.0 != 0 && m.pack_rows_k.0 != 0);
 
         let p = SortedPrefillCtx {
+            decode_exact_shared: false,
             n,
             num_tokens,
             h,

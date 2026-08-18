@@ -140,8 +140,30 @@ impl NemotronMoeLayer {
                 "sorted decode diagnostic supports direct Lightning MoE only"
             );
             let shared_up = ctx.buffers.ssm_qkvz();
-            self.prefill_shared_up(normed, shared_up, n, h, shared_inter, ctx, stream)?;
+            let shared_kernel = if n <= 4 {
+                self.w4a16_gemv_batch4_k
+            } else if n <= 16 {
+                self.w4a16_gemv_batch16_k
+            } else {
+                self.w4a16_gemv_batch32_k
+            };
+            anyhow::ensure!(
+                n <= 32 && shared_kernel.0 != 0,
+                "sorted decode exact shared UP unsupported at M={n}"
+            );
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                shared_kernel,
+                normed,
+                &self.weights.shared_up,
+                shared_up,
+                n,
+                shared_inter,
+                h as u32,
+                stream,
+            )?;
             let sorted = super::prefill_sorted::SortedPrefillCtx {
+                decode_exact_shared: true,
                 n,
                 num_tokens,
                 h,
