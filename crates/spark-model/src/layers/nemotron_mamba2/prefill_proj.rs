@@ -12,7 +12,7 @@ use super::NemotronMamba2Layer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
-fn use_lightning_scalar_in_proj(enabled: bool, rows: u32) -> bool {
+pub(super) fn use_lightning_scalar_in_proj(enabled: bool, rows: u32) -> bool {
     enabled && rows <= 16
 }
 
@@ -484,66 +484,5 @@ impl NemotronMamba2Layer {
             )?;
         }
         Ok(())
-    }
-
-    /// Literal M1 output projection used by the exact batched-topology probe.
-    pub(super) fn decode_out_proj_exact(
-        &self,
-        gated_out: DevicePtr,
-        out: DevicePtr,
-        h: usize,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        if let Some(ref w) = self.out_proj_bf16 {
-            ops::dense_gemv(
-                ctx.gpu,
-                self.dense_gemv_bf16_k,
-                gated_out,
-                w,
-                out,
-                h as u32,
-                self.d_inner as u32,
-                stream,
-            )?;
-        } else if let Some(ref fp8w) = self.out_proj_fp8 {
-            ops::w8a16_gemv(
-                ctx.gpu,
-                self.w8a16_gemv_k,
-                gated_out,
-                fp8w.weight,
-                fp8w.row_scale,
-                out,
-                h as u32,
-                self.d_inner as u32,
-                stream,
-            )?;
-        } else {
-            ops::w4a16_gemv(
-                ctx.gpu,
-                self.w4a16_gemv_k,
-                gated_out,
-                &self.ssm.out_proj,
-                out,
-                h as u32,
-                self.d_inner as u32,
-                stream,
-            )?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::use_lightning_scalar_in_proj;
-
-    #[test]
-    fn lightning_scalar_projection_is_bounded_to_verify_widths() {
-        assert!(use_lightning_scalar_in_proj(true, 1));
-        assert!(use_lightning_scalar_in_proj(true, 4));
-        assert!(use_lightning_scalar_in_proj(true, 16));
-        assert!(!use_lightning_scalar_in_proj(true, 17));
-        assert!(!use_lightning_scalar_in_proj(false, 4));
     }
 }

@@ -20,6 +20,9 @@ use crate::weight_map::{DenseWeight, Fp8Weight, NemotronSsmWeights, QuantizedWei
 
 mod prefill;
 mod prefill_proj;
+mod prefill_proj_exact;
+#[cfg(test)]
+mod prefill_proj_tests;
 mod trait_decode_batched;
 mod trait_decode_multi_seq;
 mod trait_decode_verify_multi;

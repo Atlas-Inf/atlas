@@ -448,7 +448,6 @@ fn build_mapper_accepts_exact_lightning_swa_window() {
         .unwrap()
         .expect("exact Lightning SWA window must pass");
     assert_eq!(profile.attention.swa_window, 1024);
-
     let missing_gamma = DflashBuildArgs {
         drafter_store: &store,
         drafter_config: parse_dflash_config(OFFICIAL_LIGHTNING_JSON).unwrap(),
