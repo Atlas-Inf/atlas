@@ -117,12 +117,12 @@ impl TransformerModel {
             // Marconi warm hit: GDN layers replay from a restored SSM state
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
             gdn_exact_replay: marconi_skip,
-            midchunk_capture,
             // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
             // to the stable buffer, in chunk order matching the MoE loop).
             token_ids: Some(self.buffers.token_ids()),
             // #30: request slot pairs (None unless routing to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
+            midchunk_capture,
             moe_lora_route: self.moe_lora_route(seq.adapter_slot),
         };
 

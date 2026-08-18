@@ -13,9 +13,6 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
-// strix-hip W4A8 integer-DP4A decode GEMV (additive; flag-gated OFF by default).
-#[path = "ops/dp4a.rs"]
-mod dp4a;
 #[path = "ops/derived_weights.rs"]
 mod derived_weights;
 #[path = "ops/dispatch_config.rs"]
@@ -141,7 +138,6 @@ mod ssm_ssd;
 pub mod token_overlay;
 
 pub use activations::*;
-pub use dp4a::*;
 pub use derived_weights::{Derivation, DerivedWeights};
 pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;

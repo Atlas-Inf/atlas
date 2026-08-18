@@ -210,9 +210,9 @@ impl TransformerModel {
                 comm: None,
                 graph_capture: false,
                 gdn_exact_replay: false,
-                midchunk_capture: None,
                 token_ids: None,
                 routed_lora_layers: None, // #30: MTP decode never routes prefill.
+                midchunk_capture: None,
                 moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) skips fold, adapter folds (single-seq reject lifted)
             };
             let drafts = proposer.propose(

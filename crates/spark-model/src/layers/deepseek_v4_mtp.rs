@@ -335,9 +335,9 @@ impl DeepseekV4MtpHead {
             comm: None,
             graph_capture: false,
             gdn_exact_replay: false,
-            midchunk_capture: None,
             token_ids: ctx.token_ids,
             routed_lora_layers: None, // #30: MTP draft body; no prefill LoRA route.
+            midchunk_capture: None,
             moe_lora_route: crate::layer::MoeLoraRoute::Skip, // MTP draft body: no lora installed here; Skip = no fold (safe/inert)
         };
 
