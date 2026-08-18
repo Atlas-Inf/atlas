@@ -126,7 +126,6 @@ fn opt_in_truthy(var: &str) -> bool {
 impl ModelLevers {
     /// Resolve from the environment. Called once, when the model is built.
     pub fn from_env() -> Self {
-        let lightning_lossless_target = opt_in("ATLAS_LIGHTNING_LOSSLESS_TARGET");
         Self {
             max_decode_seqs: 1,
             shadow_topk: crate::speculative::shadow_topk(),
@@ -146,10 +145,9 @@ impl ModelLevers {
             holo_moe_gateup_fp4: opt_in_truthy("ATLAS_HOLO_MOE_GATEUP_FP4"),
             moe_union_stats: opt_in("ATLAS_MOE_UNION_STATS"),
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
-            // Product installation also arms these. The explicit model-load
-            // diagnostic lets a no-spec control use identical target arithmetic.
-            lightning_mamba_exact_recurrence: lightning_lossless_target,
-            lightning_mamba_scalar_in_proj: lightning_lossless_target,
+            // Armed only by the admitted product installer, never environment.
+            lightning_mamba_exact_recurrence: false,
+            lightning_mamba_scalar_in_proj: false,
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),
