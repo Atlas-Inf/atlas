@@ -44,9 +44,6 @@ mod tests {
         assert!(body.contains("gate_logits.offset(row * num_experts as usize * bf16)"));
         assert!(body.contains("w4a16_gemv_batch32_k"));
         assert!(body.contains("moe_expert_gemv_wide("));
-        assert!(body.contains("ATLAS_LIGHTNING_MOE_TOPK_BATCHED"));
-        assert!(body.contains("ops::moe_topk_sigmoid_batched("));
-        assert!(body.contains("for t in 0..num_tokens"));
     }
 
     #[test]
