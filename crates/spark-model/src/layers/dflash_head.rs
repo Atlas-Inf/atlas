@@ -899,6 +899,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         }
         let (parity_oracle, parity_hidden_oracle) = if self.startup.diagnostics.batch_parity {
             let mut oracle = Vec::with_capacity(n);
+            let hidden_bytes = self.gamma * self.hidden_size * 2;
+            let mut hidden = Vec::with_capacity(n * hidden_bytes);
             for i in 0..n {
                 oracle.push(self.propose_drafts(
                     last_tokens[i],
@@ -913,16 +915,12 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     None,
                     Some(target_hiddens[i]),
                 )?);
-            }
-            let hidden = if n == 1 {
                 ctx.gpu.synchronize(stream)?;
-                let mut bytes = vec![0u8; self.gamma * self.hidden_size * 2];
+                let mut bytes = vec![0u8; hidden_bytes];
                 ctx.gpu.copy_d2h(self.scratch.stream_buf, &mut bytes)?;
-                Some(bytes)
-            } else {
-                None
-            };
-            (Some(oracle), hidden)
+                hidden.extend_from_slice(&bytes);
+            }
+            (Some(oracle), Some(hidden))
         } else {
             (None, None)
         };
@@ -1095,9 +1093,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
                         .zip(expected.chunks_exact(2))
                         .position(|(lhs, rhs)| lhs != rhs)
                         .unwrap_or(0);
-                    anyhow::bail!("DFlash B1 backbone parity mismatch at BF16 element {first}");
+                    let per_sequence = self.gamma * self.hidden_size;
+                    let sequence = first / per_sequence;
+                    let local = first % per_sequence;
+                    anyhow::bail!(
+                        "DFlash Bxgamma backbone parity mismatch at sequence {sequence} BF16 element {local}"
+                    );
                 }
-                tracing::info!("DFlash B1 backbone parity PASS");
+                tracing::info!("DFlash Bxgamma backbone parity PASS: batch={n}");
             }
             self.run_batched_tail_base(batch_rows, ctx, stream)?;
             self.run_batched_markov(batch_size, ctx, stream)?;
