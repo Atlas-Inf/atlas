@@ -11,6 +11,18 @@
 
 #include <cuda_bf16.h>
 
+// Global greedy contract: maximize value, then minimize vocabulary index.
+// A tree that merely keeps the lower CUDA lane on equal values is wrong:
+// lane = vocab_id % blockDim, so IDs 1023 and 1024 live in lanes 1023 and 0.
+__device__ __forceinline__ bool argmax_other_better(
+    float other,
+    unsigned int other_idx,
+    float mine,
+    unsigned int mine_idx
+) {
+    return other > mine || (other == mine && other_idx < mine_idx);
+}
+
 extern "C" __global__ void argmax_bf16(
     const __nv_bfloat16* __restrict__ logits,
     unsigned int* __restrict__ out,
@@ -41,7 +53,8 @@ extern "C" __global__ void argmax_bf16(
     // Phase 2: tree reduction in shared memory
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            if (s_val[tid + s] > s_val[tid]) {
+            if (argmax_other_better(
+                    s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
                 s_val[tid] = s_val[tid + s];
                 s_idx[tid] = s_idx[tid + s];
             }
@@ -97,7 +110,8 @@ extern "C" __global__ void argmax_bf16_batch(
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            if (s_val[tid + s] > s_val[tid]) {
+            if (argmax_other_better(
+                    s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
                 s_val[tid] = s_val[tid + s];
                 s_idx[tid] = s_idx[tid + s];
             }
@@ -171,7 +185,7 @@ extern "C" __global__ void argmax_bf16_batch_lp(
         if (tid < s) {
             const float mine = s_val[tid];
             const float other = s_val[tid + s];
-            if (other > mine) {
+            if (argmax_other_better(other, s_idx[tid + s], mine, s_idx[tid])) {
                 s_sum[tid] = s_sum[tid] * __expf(mine - other) + s_sum[tid + s];
                 s_val[tid] = other;
                 s_idx[tid] = s_idx[tid + s];
@@ -213,7 +227,8 @@ extern "C" __global__ void argmax_fp32(
     __syncthreads();
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && s_val[tid + s] > s_val[tid]) {
+        if (tid < s && argmax_other_better(
+                s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
             s_val[tid] = s_val[tid + s];
             s_idx[tid] = s_idx[tid + s];
         }
