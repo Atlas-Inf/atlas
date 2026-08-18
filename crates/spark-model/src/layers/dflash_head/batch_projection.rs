@@ -27,27 +27,14 @@ impl BlockDiffusionDraftHead {
             let kernel = match total_rows {
                 1..=4 => self.kernels.w4a16_gemv_batch4,
                 5..=8 => self.kernels.w4a16_gemv_batch8,
-                9..=32 => self.kernels.w4a16_gemv_batch16,
+                9..=16 => self.kernels.w4a16_gemv_batch16,
+                17..=32 => self.kernels.w4a16_gemv_batch32,
                 _ => spark_runtime::gpu::KernelHandle(0),
             };
             if kernel.0 != 0 {
-                let mut row = 0u32;
-                while row < total_rows {
-                    let rows = (total_rows - row).min(16);
-                    crate::layers::ops::w4a16_gemv_batchm(
-                        ctx.gpu,
-                        kernel,
-                        src.offset(row as usize * k_in as usize * 2),
-                        weight,
-                        dst.offset(row as usize * n_out as usize * 2),
-                        rows,
-                        n_out,
-                        k_in,
-                        stream,
-                    )?;
-                    row += rows;
-                }
-                return Ok(());
+                return crate::layers::ops::w4a16_gemv_batchm(
+                    ctx.gpu, kernel, src, weight, dst, total_rows, n_out, k_in, stream,
+                );
             }
         }
         let rows = self.gamma;
