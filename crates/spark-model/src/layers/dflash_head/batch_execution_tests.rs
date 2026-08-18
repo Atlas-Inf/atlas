@@ -140,6 +140,8 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     assert!(tail.contains("ops::w4a16_gemv_batchm"));
     assert!(tail.contains("self.kernels.w4a16_gemv_batch16"));
     assert!(tail.contains("(batch_rows - row).min(16)"));
+    assert!(tail.contains("self.startup.native_batch_authoritative"));
+    assert!(tail.contains("exact NVFP4 LM-head batch kernel is unresolved"));
     assert!(final_norm < lm_head && lm_head < argmax);
     let markov = &source[source.find("fn run_batched_markov").unwrap()..];
     let depth_loop = markov.find("for depth in 1..self.gamma").unwrap();

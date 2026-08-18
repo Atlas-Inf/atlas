@@ -37,6 +37,11 @@ fn product_build(
         window_size: Some(1024),
     };
     let mut target = ModelConfig::qwen3_next_80b_nvfp4();
+    target.model_type = "nemotron_h".to_owned();
+    target.hidden_size = 2688;
+    target.num_hidden_layers = 52;
+    target.num_experts = 128;
+    target.num_experts_per_tok = 6;
     target.tp_world_size = 1;
     target.ep_world_size = 1;
     admit_lightning_dspark_product_build(&args, &target, 3, 16, KvCacheDtype::Fp8, toggles)
@@ -58,6 +63,34 @@ fn executable_factory_wrapper_returns_none_for_generic_architecture() {
         product_build(&value, exact_product_toggles())
             .expect("generic factory wrapper admission")
             .is_none()
+    );
+}
+
+#[test]
+fn executable_factory_wrapper_rejects_non_lightning_target_identity() {
+    let store = required_store();
+    let value = official_value();
+    let args = DflashBuildArgs {
+        drafter_store: &store,
+        drafter_config: parse_value(&value),
+        gamma: Some(4),
+        window_size: Some(1024),
+    };
+    let mut target = ModelConfig::qwen3_next_80b_nvfp4();
+    target.tp_world_size = 1;
+    target.ep_world_size = 1;
+    let error = admit_lightning_dspark_product_build(
+        &args,
+        &target,
+        3,
+        16,
+        KvCacheDtype::Fp8,
+        exact_product_toggles(),
+    )
+    .expect_err("Qwen3 target must not admit the Lightning product");
+    assert!(
+        error.to_string().contains("target identity mismatch"),
+        "{error:#}"
     );
 }
 

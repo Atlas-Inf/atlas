@@ -331,6 +331,10 @@ impl BlockDiffusionDraftHead {
                     )?;
                     row += rows;
                 }
+            } else if self.startup.native_batch_authoritative {
+                anyhow::bail!(
+                    "Lightning DSpark exact NVFP4 LM-head batch kernel is unresolved for rows={batch_rows}; batch4/8/16 with <=16-row waves is mandatory"
+                );
             } else {
                 anyhow::ensure!(
                     self.kernels.w4a16_gemm.0 != 0,

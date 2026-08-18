@@ -4,6 +4,11 @@ use std::fmt;
 
 pub const LIGHTNING_ALGORITHM: &str = "DSpark";
 pub const LIGHTNING_MODEL_IDENTITY: &str = "Qwen3DSparkModel";
+pub const LIGHTNING_TARGET_MODEL_TYPE: &str = "nemotron_h";
+pub const LIGHTNING_TARGET_HIDDEN_SIZE: usize = 2688;
+pub const LIGHTNING_TARGET_NUM_LAYERS: usize = 52;
+pub const LIGHTNING_TARGET_NUM_EXPERTS: usize = 128;
+pub const LIGHTNING_TARGET_TOP_K: usize = 6;
 pub const LIGHTNING_CHECKPOINT_BLOCK_SIZE: usize = 8;
 pub const LIGHTNING_PHYSICAL_KV_PAGE_SIZE: usize = 16;
 pub const LIGHTNING_SERVED_GAMMA: usize = 4;

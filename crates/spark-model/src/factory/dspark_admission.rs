@@ -9,8 +9,10 @@ use spark_runtime::kv_cache::KvCacheDtype;
 use super::DflashBuildArgs;
 use crate::layers::dflash_head::{
     AttentionLayout, BonusLayout, CheckpointLayout, ConfidenceLayout, KvDtype, KvLayout,
-    LIGHTNING_MODEL_IDENTITY, LIGHTNING_SWA_WINDOW, LightningDsparkProductPolicy,
-    LightningDsparkProfile, LightningDsparkRuntimeToggles, MarkovLayout, ParallelismLayout,
+    LIGHTNING_MODEL_IDENTITY, LIGHTNING_SWA_WINDOW, LIGHTNING_TARGET_HIDDEN_SIZE,
+    LIGHTNING_TARGET_MODEL_TYPE, LIGHTNING_TARGET_NUM_EXPERTS, LIGHTNING_TARGET_NUM_LAYERS,
+    LIGHTNING_TARGET_TOP_K, LightningDsparkProductPolicy, LightningDsparkProfile,
+    LightningDsparkRuntimeToggles, MarkovLayout, ParallelismLayout,
 };
 use crate::weight_loader::dflash_loader::DflashConfig;
 use crate::weight_loader::store_has_dflash_weights;
@@ -28,6 +30,11 @@ pub(crate) struct LightningRuntimeAdmission {
     pub markov_w1_present: bool,
     pub markov_w2_present: bool,
     pub all_required_sinks_present: bool,
+    pub target_model_type_is_lightning: bool,
+    pub target_hidden_size: usize,
+    pub target_num_hidden_layers: usize,
+    pub target_num_experts: usize,
+    pub target_top_k: usize,
 }
 
 /// Admit an exact official Lightning config, or ignore a different architecture.
@@ -73,6 +80,23 @@ pub(crate) fn admit_lightning_dspark(
     }
     if !runtime.fc_present {
         bail!("Lightning DSpark required weight `fc.weight` is missing");
+    }
+    if !runtime.target_model_type_is_lightning
+        || runtime.target_hidden_size != LIGHTNING_TARGET_HIDDEN_SIZE
+        || runtime.target_num_hidden_layers != LIGHTNING_TARGET_NUM_LAYERS
+        || runtime.target_num_experts != LIGHTNING_TARGET_NUM_EXPERTS
+        || runtime.target_top_k != LIGHTNING_TARGET_TOP_K
+    {
+        bail!(
+            "Lightning DSpark target identity mismatch: model_type={:?}, hidden={}, layers={}, experts={}, top_k={}; expected model_type={LIGHTNING_TARGET_MODEL_TYPE:?}, hidden={LIGHTNING_TARGET_HIDDEN_SIZE}, layers={LIGHTNING_TARGET_NUM_LAYERS}, experts={LIGHTNING_TARGET_NUM_EXPERTS}, top_k={LIGHTNING_TARGET_TOP_K}",
+            runtime
+                .target_model_type_is_lightning
+                .then_some(LIGHTNING_TARGET_MODEL_TYPE),
+            runtime.target_hidden_size,
+            runtime.target_num_hidden_layers,
+            runtime.target_num_experts,
+            runtime.target_top_k,
+        );
     }
 
     let root_bonus_anchor = required_bool(config.dspark_bonus_anchor, "dspark_bonus_anchor")?;
@@ -218,6 +242,11 @@ pub(crate) fn admit_lightning_dspark_build(
             markov_w1_present: args.drafter_store.contains(&markov_w1),
             markov_w2_present: args.drafter_store.contains(&markov_w2),
             all_required_sinks_present,
+            target_model_type_is_lightning: target.model_type == LIGHTNING_TARGET_MODEL_TYPE,
+            target_hidden_size: target.hidden_size,
+            target_num_hidden_layers: target.num_hidden_layers,
+            target_num_experts: target.num_experts,
+            target_top_k: target.num_experts_per_tok,
         },
     )
 }

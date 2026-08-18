@@ -13,7 +13,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::{
     BlockDiffusionDraftHead, DflashKernels, DflashLane, DflashLayer, DflashQuantization,
-    DflashScratch, DsparkStartupExecution,
+    DflashScratch, DsparkStartupExecution, LIGHTNING_TARGET_HIDDEN_SIZE,
 };
 use crate::weight_loader::DflashWeights;
 
@@ -73,7 +73,16 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        let _ = target_hidden_size;
+        anyhow::ensure!(
+            target_hidden_size > 0,
+            "DFlash target hidden size must be non-zero"
+        );
+        if startup.native_batch_authoritative {
+            anyhow::ensure!(
+                target_hidden_size == LIGHTNING_TARGET_HIDDEN_SIZE,
+                "Lightning DSpark target hidden size must be {LIGHTNING_TARGET_HIDDEN_SIZE}, found {target_hidden_size}"
+            );
+        }
 
         let num_layers = weights.config.num_hidden_layers;
         let hidden_size = weights.config.hidden_size;

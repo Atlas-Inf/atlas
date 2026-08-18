@@ -68,6 +68,11 @@ fn runtime() -> LightningRuntimeAdmission {
         markov_w1_present: true,
         markov_w2_present: true,
         all_required_sinks_present: true,
+        target_model_type_is_lightning: true,
+        target_hidden_size: 2688,
+        target_num_hidden_layers: 52,
+        target_num_experts: 128,
+        target_top_k: 6,
     }
 }
 
