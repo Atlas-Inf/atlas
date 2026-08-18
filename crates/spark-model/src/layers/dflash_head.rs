@@ -527,6 +527,8 @@ pub struct BlockDiffusionDraftHead {
     pub batch_capacity: usize,
     pub batch_query_ids_dev: DevicePtr,
     pub batch_query_embed: DevicePtr,
+    pub batch_target_hidden: DevicePtr,
+    pub batch_fc_proj: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -887,6 +889,33 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.batch_query_embed,
             batch_inputs.total_rows() as u32,
             self.hidden_size as u32,
+            stream,
+        )?;
+        let target_width = self
+            .target_layer_ids
+            .len()
+            .checked_mul(self.target_hidden_size)
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch target width overflow"))?;
+        let target_row_bytes = target_width
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch target row bytes overflow"))?;
+        for (sequence, source) in target_hiddens.iter().copied().enumerate() {
+            ctx.gpu.copy_d2d_async(
+                source,
+                self.batch_target_hidden.offset(sequence * target_row_bytes),
+                target_row_bytes,
+                stream,
+            )?;
+        }
+        crate::layers::ops::dense_gemm(
+            ctx.gpu,
+            self.kernels.dense_gemm,
+            self.batch_target_hidden,
+            &self.fc,
+            self.batch_fc_proj,
+            n as u32,
+            self.hidden_size as u32,
+            target_width as u32,
             stream,
         )?;
 

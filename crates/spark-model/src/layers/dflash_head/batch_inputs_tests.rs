@@ -430,9 +430,13 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     let plan = source.find("packed_query_tokens").unwrap();
     let upload = source.find("copy_h2d(&query_bytes").unwrap();
     let embed = source.find("ops::batched_embed").unwrap();
+    let gather = source.find("batch_target_hidden.offset").unwrap();
+    let fc = source.find("&self.fc").unwrap();
     let oracle = source.find("let lanes_n = self.lane_count()").unwrap();
-    assert!(plan < upload && upload < embed && embed < oracle);
+    assert!(plan < upload && upload < embed && embed < gather && gather < fc && fc < oracle);
     assert!(source.contains("self.batch_capacity"));
     assert!(source.contains("self.batch_query_ids_dev"));
     assert!(source.contains("self.batch_query_embed"));
+    assert!(source.contains("self.batch_target_hidden"));
+    assert!(source.contains("self.batch_fc_proj"));
 }

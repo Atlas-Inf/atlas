@@ -95,6 +95,8 @@ fn zero_head() -> BlockDiffusionDraftHead {
         batch_capacity: 1,
         batch_query_ids_dev: DevicePtr(0),
         batch_query_embed: DevicePtr(0),
+        batch_target_hidden: DevicePtr(0),
+        batch_fc_proj: DevicePtr(0),
         extra_lanes: Vec::new(),
         lane0_markov_embed: DevicePtr(0),
         lane0_markov_bias: DevicePtr(0),

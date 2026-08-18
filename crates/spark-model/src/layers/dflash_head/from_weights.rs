@@ -353,8 +353,24 @@ impl BlockDiffusionDraftHead {
             .ok_or_else(|| anyhow::anyhow!("DFlash batch row capacity overflow"))?;
         let batch_query_ids_dev = gpu.alloc(batch_rows * 4)?;
         let batch_query_embed = gpu.alloc(batch_rows * hidden_size * bf16)?;
+        let batch_target_width = target_layer_ids
+            .len()
+            .checked_mul(target_hidden_size)
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch target-hidden width overflow"))?;
+        let batch_target_bytes = batch_capacity
+            .checked_mul(batch_target_width)
+            .and_then(|n| n.checked_mul(bf16))
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch target-hidden bytes overflow"))?;
+        let batch_fc_bytes = batch_capacity
+            .checked_mul(hidden_size)
+            .and_then(|n| n.checked_mul(bf16))
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch fc bytes overflow"))?;
+        let batch_target_hidden = gpu.alloc(batch_target_bytes)?;
+        let batch_fc_proj = gpu.alloc(batch_fc_bytes)?;
         gpu.memset(batch_query_ids_dev, 0, batch_rows * 4)?;
         gpu.memset(batch_query_embed, 0, batch_rows * hidden_size * bf16)?;
+        gpu.memset(batch_target_hidden, 0, batch_target_bytes)?;
+        gpu.memset(batch_fc_proj, 0, batch_fc_bytes)?;
 
         // Extra propose lanes: `proposal_lane_count` total lanes
         // (default 1). Each extra lane gets its own stream, scratch set,
@@ -607,6 +623,8 @@ impl BlockDiffusionDraftHead {
             batch_capacity,
             batch_query_ids_dev,
             batch_query_embed,
+            batch_target_hidden,
+            batch_fc_proj,
             extra_lanes,
             kernels,
             max_seq_len,
