@@ -531,6 +531,10 @@ pub struct BlockDiffusionDraftHead {
     pub batch_target_hidden: DevicePtr,
     pub batch_fc_proj: DevicePtr,
     pub batch_fc_norm: DevicePtr,
+    pub batch_norm: DevicePtr,
+    pub batch_q: DevicePtr,
+    pub batch_k: DevicePtr,
+    pub batch_v: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -941,6 +945,51 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.hidden_size as u32,
             stream,
         )?;
+        let layer0 = self
+            .layers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch backbone has no layer 0"))?;
+        let batch_rows = batch_inputs.total_rows() as u32;
+        crate::layers::ops::rms_norm(
+            ctx.gpu,
+            self.kernels.rms_norm,
+            self.batch_query_embed,
+            &layer0.input_layernorm,
+            self.batch_norm,
+            batch_rows,
+            self.hidden_size as u32,
+            self.rms_norm_eps,
+            stream,
+        )?;
+        for (weight, output, width) in [
+            (
+                &layer0.q_proj,
+                self.batch_q,
+                self.num_q_heads * self.head_dim,
+            ),
+            (
+                &layer0.k_proj,
+                self.batch_k,
+                self.num_kv_heads * self.head_dim,
+            ),
+            (
+                &layer0.v_proj,
+                self.batch_v,
+                self.num_kv_heads * self.head_dim,
+            ),
+        ] {
+            crate::layers::ops::dense_gemm(
+                ctx.gpu,
+                self.kernels.dense_gemm,
+                self.batch_norm,
+                weight,
+                output,
+                batch_rows,
+                width as u32,
+                self.hidden_size as u32,
+                stream,
+            )?;
+        }
 
         let lanes_n = self.lane_count();
         if lanes_n == 1 {

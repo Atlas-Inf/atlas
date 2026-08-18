@@ -434,6 +434,8 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     let fc = source.find("&self.fc").unwrap();
     let hidden_norm = source.find("&self.hidden_norm").unwrap();
     let anchor_add = source.find("ops::dflash_batch_anchor_add").unwrap();
+    let layer_norm = source.find("&layer0.input_layernorm").unwrap();
+    let q_proj = source.find("&layer0.q_proj").unwrap();
     let oracle = source.find("let lanes_n = self.lane_count()").unwrap();
     assert!(
         plan < upload
@@ -442,7 +444,9 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
             && gather < fc
             && fc < hidden_norm
             && hidden_norm < anchor_add
-            && anchor_add < oracle
+            && anchor_add < layer_norm
+            && layer_norm < q_proj
+            && q_proj < oracle
     );
     assert!(source.contains("self.batch_capacity"));
     assert!(source.contains("self.batch_query_ids_dev"));
@@ -450,4 +454,8 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("self.batch_target_hidden"));
     assert!(source.contains("self.batch_fc_proj"));
     assert!(source.contains("self.batch_fc_norm"));
+    assert!(source.contains("self.batch_norm"));
+    assert!(source.contains("self.batch_q"));
+    assert!(source.contains("self.batch_k"));
+    assert!(source.contains("self.batch_v"));
 }

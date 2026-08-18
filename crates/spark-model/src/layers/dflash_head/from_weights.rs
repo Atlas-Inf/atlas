@@ -369,11 +369,28 @@ impl BlockDiffusionDraftHead {
         let batch_target_hidden = gpu.alloc(batch_target_bytes)?;
         let batch_fc_proj = gpu.alloc(batch_fc_bytes)?;
         let batch_fc_norm = gpu.alloc(batch_fc_bytes)?;
+        let batch_tensor_bytes = |width: usize, label: &str| -> Result<usize> {
+            batch_rows
+                .checked_mul(width)
+                .and_then(|n| n.checked_mul(bf16))
+                .ok_or_else(|| anyhow::anyhow!("DFlash {label} bytes overflow"))
+        };
+        let batch_norm_bytes = batch_tensor_bytes(hidden_size, "batch norm")?;
+        let batch_q_bytes = batch_tensor_bytes(q_dim, "batch q")?;
+        let batch_kv_bytes = batch_tensor_bytes(kv_dim, "batch kv")?;
+        let batch_norm = gpu.alloc(batch_norm_bytes)?;
+        let batch_q = gpu.alloc(batch_q_bytes)?;
+        let batch_k = gpu.alloc(batch_kv_bytes)?;
+        let batch_v = gpu.alloc(batch_kv_bytes)?;
         gpu.memset(batch_query_ids_dev, 0, batch_rows * 4)?;
         gpu.memset(batch_query_embed, 0, batch_rows * hidden_size * bf16)?;
         gpu.memset(batch_target_hidden, 0, batch_target_bytes)?;
         gpu.memset(batch_fc_proj, 0, batch_fc_bytes)?;
         gpu.memset(batch_fc_norm, 0, batch_fc_bytes)?;
+        gpu.memset(batch_norm, 0, batch_norm_bytes)?;
+        gpu.memset(batch_q, 0, batch_q_bytes)?;
+        gpu.memset(batch_k, 0, batch_kv_bytes)?;
+        gpu.memset(batch_v, 0, batch_kv_bytes)?;
 
         // Extra propose lanes: `proposal_lane_count` total lanes
         // (default 1). Each extra lane gets its own stream, scratch set,
@@ -629,6 +646,10 @@ impl BlockDiffusionDraftHead {
             batch_target_hidden,
             batch_fc_proj,
             batch_fc_norm,
+            batch_norm,
+            batch_q,
+            batch_k,
+            batch_v,
             extra_lanes,
             kernels,
             max_seq_len,
