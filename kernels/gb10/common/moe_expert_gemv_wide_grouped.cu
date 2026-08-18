@@ -26,7 +26,7 @@ __device__ __forceinline__ float scl_fp8_grp(unsigned char b) {
 #define WARP_SIZE 32
 #define GROUP_SIZE 16
 #define BATCH_M 4
-#define MAX_MATCH 16
+#define MAX_MATCH 32
 
 __device__ __constant__ float E2M1_LUT_GRP[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -50,18 +50,24 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
     const unsigned int n_base = blockIdx.x * N_TILE;
     if (n_base >= N) return;
 
-    unsigned int m_tok[MAX_MATCH];
-    unsigned int m_slot[MAX_MATCH];
-    unsigned int nmatch = 0;
-    for (unsigned int tok = 0; tok < num_tokens && nmatch < MAX_MATCH; tok++) {
-        for (unsigned int slot = 0; slot < top_k && nmatch < MAX_MATCH; slot++) {
-            if (expert_indices[(unsigned long long)tok * top_k + slot] == expert_id) {
-                m_tok[nmatch] = tok;
-                m_slot[nmatch] = slot;
-                nmatch++;
+    __shared__ unsigned int s_m_tok[MAX_MATCH];
+    __shared__ unsigned int s_m_slot[MAX_MATCH];
+    __shared__ unsigned int s_nmatch;
+    if (threadIdx.x == 0) {
+        unsigned int count = 0;
+        for (unsigned int tok = 0; tok < num_tokens && count < MAX_MATCH; tok++) {
+            for (unsigned int slot = 0; slot < top_k && count < MAX_MATCH; slot++) {
+                if (expert_indices[(unsigned long long)tok * top_k + slot] == expert_id) {
+                    s_m_tok[count] = tok;
+                    s_m_slot[count] = slot;
+                    count++;
+                }
             }
         }
+        s_nmatch = count;
     }
+    __syncthreads();
+    const unsigned int nmatch = s_nmatch;
     if (nmatch == 0) return;
 
     const unsigned char* B_packed = (const unsigned char*)packed_ptrs[expert_id];
@@ -70,7 +76,7 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
     if (B_packed == 0) {
         for (unsigned int m = 0; m < nmatch; m++) {
             for (unsigned int i = threadIdx.x; i < N_TILE && n_base + i < N; i += BLOCK_SIZE) {
-                C[((unsigned long long)m_tok[m] * top_k + m_slot[m]) * N + n_base + i] =
+                C[((unsigned long long)s_m_tok[m] * top_k + s_m_slot[m]) * N + n_base + i] =
                     __float2bfloat16(0.0f);
             }
         }
@@ -91,11 +97,11 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
     for (unsigned int base = 0; base < nmatch; base += BATCH_M) {
         const unsigned int batch = nmatch - base < BATCH_M ? nmatch - base : BATCH_M;
         for (unsigned int m = 0; m < batch; m++) {
-            const unsigned int tok = m_tok[base + m];
-            const unsigned int slot = m_slot[base + m];
-            const __nv_bfloat16* input = A
-                + (unsigned long long)tok * K
-                + (input_stride > 0 ? (unsigned long long)slot * input_stride : 0);
+            const unsigned int tok = s_m_tok[base + m];
+            const unsigned int slot = s_m_slot[base + m];
+            const __nv_bfloat16* input = input_stride > 0
+                ? A + ((unsigned long long)tok * top_k + slot) * input_stride
+                : A + (unsigned long long)tok * K;
             __nv_bfloat16* dst = s_A + (unsigned long long)m * K;
             for (unsigned int i = threadIdx.x; i < K; i += BLOCK_SIZE) dst[i] = input[i];
         }
@@ -149,8 +155,8 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
                 }
                 if (lane == 0) {
                     for (unsigned int m = 0; m < batch; m++) {
-                        const unsigned int tok = m_tok[base + m];
-                        const unsigned int slot = m_slot[base + m];
+                        const unsigned int tok = s_m_tok[base + m];
+                        const unsigned int slot = s_m_slot[base + m];
                         C[((unsigned long long)tok * top_k + slot) * N + n] =
                             __float2bfloat16(acc[m]);
                     }
