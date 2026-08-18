@@ -666,6 +666,7 @@ mod batch_execution_tests;
 mod batch_forward;
 #[cfg(test)]
 mod batch_inputs_tests;
+mod batch_projection;
 mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;

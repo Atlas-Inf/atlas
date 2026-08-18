@@ -52,20 +52,39 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
-        for (weight, output, width) in [
-            (&layer.q_proj, self.batch_q, q_dim),
-            (&layer.k_proj, self.batch_k, kv_dim),
-            (&layer.v_proj, self.batch_v, kv_dim),
+        for (weight, fp8, nvfp4, output, width) in [
+            (
+                &layer.q_proj,
+                &layer.q_proj_fp8,
+                &layer.q_proj_nvfp4,
+                self.batch_q,
+                q_dim,
+            ),
+            (
+                &layer.k_proj,
+                &layer.k_proj_fp8,
+                &layer.k_proj_nvfp4,
+                self.batch_k,
+                kv_dim,
+            ),
+            (
+                &layer.v_proj,
+                &layer.v_proj_fp8,
+                &layer.v_proj_nvfp4,
+                self.batch_v,
+                kv_dim,
+            ),
         ] {
-            crate::layers::ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.kernels.dense_gemm_pipelined,
+            self.run_staged_projection(
+                batch_size,
                 self.batch_norm,
                 weight,
+                fp8,
+                nvfp4,
                 output,
-                batch_rows,
                 width,
                 hidden,
+                ctx,
                 stream,
             )?;
         }
@@ -183,15 +202,16 @@ impl BlockDiffusionDraftHead {
                 stream,
             )?;
         }
-        crate::layers::ops::dense_gemm_bf16_pipelined(
-            ctx.gpu,
-            self.kernels.dense_gemm_pipelined,
+        self.run_staged_projection(
+            batch_size,
             self.batch_attn_out,
             &layer.o_proj,
+            &layer.o_proj_fp8,
+            &layer.o_proj_nvfp4,
             self.batch_attn_proj,
-            batch_rows,
             hidden,
             q_dim,
+            ctx,
             stream,
         )?;
         crate::layers::ops::residual_add(
@@ -213,19 +233,30 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
-        for (weight, output) in [
-            (&layer.gate_proj, self.batch_mlp_gate),
-            (&layer.up_proj, self.batch_mlp_up),
+        for (weight, fp8, nvfp4, output) in [
+            (
+                &layer.gate_proj,
+                &layer.gate_proj_fp8,
+                &layer.gate_proj_nvfp4,
+                self.batch_mlp_gate,
+            ),
+            (
+                &layer.up_proj,
+                &layer.up_proj_fp8,
+                &layer.up_proj_nvfp4,
+                self.batch_mlp_up,
+            ),
         ] {
-            crate::layers::ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.kernels.dense_gemm_pipelined,
+            self.run_staged_projection(
+                batch_size,
                 self.batch_norm,
                 weight,
+                fp8,
+                nvfp4,
                 output,
-                batch_rows,
                 intermediate,
                 hidden,
+                ctx,
                 stream,
             )?;
         }
@@ -238,15 +269,16 @@ impl BlockDiffusionDraftHead {
             mlp_elements,
             stream,
         )?;
-        crate::layers::ops::dense_gemm_bf16_pipelined(
-            ctx.gpu,
-            self.kernels.dense_gemm_pipelined,
+        self.run_staged_projection(
+            batch_size,
             self.batch_mlp_gate,
             &layer.down_proj,
+            &layer.down_proj_fp8,
+            &layer.down_proj_nvfp4,
             self.batch_mlp_down,
-            batch_rows,
             hidden,
             intermediate,
+            ctx,
             stream,
         )?;
         crate::layers::ops::residual_add(
