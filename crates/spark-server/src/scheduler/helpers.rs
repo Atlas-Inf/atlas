@@ -10,6 +10,37 @@ pub fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
     f32::from_bits(((lo as u32) | ((hi as u32) << 8)) << 16)
 }
 
+/// Whether a verify path may bypass the canonical logits pipeline.
+/// Official Lightning DSpark is always masked: raw argmax can select forbidden
+/// structural tokens such as `</think>` on plain completions, violating AR
+/// equivalence even when target logits are identical.
+#[inline]
+pub fn dflash_verify_uses_raw_argmax(
+    raw_requested: bool,
+    masked_requested: bool,
+    lightning_product: bool,
+) -> bool {
+    raw_requested && !masked_requested && !lightning_product
+}
+
+#[cfg(test)]
+mod dflash_verify_policy_tests {
+    use super::dflash_verify_uses_raw_argmax;
+
+    #[test]
+    fn lightning_product_never_bypasses_logits_pipeline() {
+        assert!(!dflash_verify_uses_raw_argmax(true, false, true));
+        assert!(!dflash_verify_uses_raw_argmax(true, true, true));
+    }
+
+    #[test]
+    fn generic_dflash_preserves_explicit_raw_and_masked_modes() {
+        assert!(dflash_verify_uses_raw_argmax(true, false, false));
+        assert!(!dflash_verify_uses_raw_argmax(true, true, false));
+        assert!(!dflash_verify_uses_raw_argmax(false, false, false));
+    }
+}
+
 // The `<|im_start|>` / `<tool_response>` hard-stop token ids and the
 // served-context ceiling were three atomics here, each installed by a `set_*`
 // call during serve startup. All three are per-model — two are token ids,

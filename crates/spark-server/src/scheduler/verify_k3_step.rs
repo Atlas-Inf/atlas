@@ -195,7 +195,11 @@ pub fn step_verify_k3(
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax, v2_argmax) = (result_vec[0], result_vec[1], result_vec[2]);
 
-    let (v0, v1, v2) = if dflash_verify_raw_argmax && !sched.levers.dflash_masked_verify {
+    let (v0, v1, v2) = if crate::scheduler::helpers::dflash_verify_uses_raw_argmax(
+        dflash_verify_raw_argmax,
+        sched.levers.dflash_masked_verify,
+        model.is_lightning_dspark_product(),
+    ) {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD)
         // basis so verifier/drafter judge identically. No rep_pen/DRY here.
         (v0_argmax, v1_argmax, v2_argmax)
