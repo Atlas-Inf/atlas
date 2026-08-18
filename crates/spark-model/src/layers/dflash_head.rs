@@ -46,6 +46,7 @@ pub struct DflashKernels {
     pub rms_norm: KernelHandle,
     pub residual_rms_norm: KernelHandle,
     pub dense_gemv: KernelHandle,
+    pub dense_gemv_batchm: KernelHandle,
     pub dense_gemm: KernelHandle,
     /// NVFP4 GEMM for the final logits when the shared lm_head is NVFP4
     /// (e.g. Holo): a BF16 `dense_gemm` on NVFP4-packed bytes reads garbage

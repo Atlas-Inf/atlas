@@ -367,15 +367,16 @@ impl BlockDiffusionDraftHead {
                 rank,
                 stream,
             )?;
-            crate::layers::ops::dense_gemm(
+            crate::layers::ops::dense_gemv_batchm(
                 ctx.gpu,
-                self.kernels.dense_gemm,
+                self.kernels.dense_gemv_batchm,
                 self.batch_markov_embed,
                 w2,
                 self.batch_markov_bias,
                 batch_size,
                 vocab,
                 rank,
+                vocab,
                 stream,
             )?;
             crate::layers::ops::dflash_batch_add_depth_bias(

@@ -137,7 +137,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let markov = &source[source.find("fn run_batched_markov").unwrap()..];
     let depth_loop = markov.find("for depth in 1..self.gamma").unwrap();
     let embed = markov.find("ops::batched_embed").unwrap();
-    let project = markov.find("ops::dense_gemm").unwrap();
+    let project = markov.find("ops::dense_gemv_batchm").unwrap();
     let bias = markov.find("ops::dflash_batch_add_depth_bias").unwrap();
     let sample = markov.find("ops::argmax_bf16_batch").unwrap();
     let store = markov.find("ops::dflash_batch_store_depth_tokens").unwrap();
