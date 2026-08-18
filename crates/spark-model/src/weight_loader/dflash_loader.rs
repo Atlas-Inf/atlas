@@ -450,12 +450,39 @@ mod tests {
 
     #[test]
     fn parse_lightning_dspark_config() {
-        const SNAP: &str = "/home/r0b0tdgx/Documents/Nemotron Lightning/Weights-DSpark/config.json";
-        let json = match std::fs::read_to_string(SNAP) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let config = parse_dflash_config(&json).expect("parse Lightning DSpark config");
+        let json = r#"
+        {
+          "architectures": ["Qwen3DSparkModel"],
+          "attention_sink_bias": true,
+          "block_size": 8,
+          "dflash_config": {
+            "attention_sink_bias": true,
+            "causal": true,
+            "mask_token_id": 990,
+            "swa_window_size": 1024,
+            "target_layer_ids": [1, 5, 19, 29, 41, 51],
+            "use_swa": true,
+            "sample_from_anchor": false
+          },
+          "dspark_bonus_anchor": true,
+          "dspark_markov_rank": 512,
+          "markov_rank": 512,
+          "target_layer_ids": [1, 5, 19, 29, 41, 51],
+          "hidden_size": 2688,
+          "num_hidden_layers": 6,
+          "intermediate_size": 6144,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 2,
+          "head_dim": 128,
+          "vocab_size": 131072,
+          "sample_from_anchor": false,
+          "quantization_config": {
+            "quant_algo": "W4A16_NVFP4",
+            "kv_cache_quant_algo": null
+          }
+        }
+        "#;
+        let config = parse_dflash_config(json).expect("parse Lightning DSpark config");
         assert_eq!(config.num_hidden_layers, 6);
         assert_eq!(config.hidden_size, 2688);
         assert_eq!(config.intermediate_size, 6144);

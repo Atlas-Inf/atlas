@@ -34,8 +34,13 @@
 > **Work in progress.** This r0b0tlab fork carries active GB10/SM121 and
 > Nemotron 3.5 Lightning + DSpark development. The current `main` branch is
 > published for source visibility and collaboration; it is **not a qualified
-> Atlas release**, and the open C>1 DSpark correctness/performance work is
-> intentionally retained with explicit `NOT QUALIFIED` history.
+> Atlas release**. The latest reviewed Lightning runtime source is
+> `cd2218ec426a907f681c602feb966611d6db7443`; a filtered diagnostic epoch
+> reached C1/C2/C4/C6 aggregate throughput of 84.18/152.84/168.42/155.84 tok/s
+> and GSM8K 191/200. Because the run selected only latency, concurrency,
+> throughput, and GSM8K, it remains `invalid_for_publish=true` rather than a
+> full public suite claim. Sanitized logs and complete metrics are under
+> [`evidence/nemotron-lightning-cd2218e-20260818/`](evidence/nemotron-lightning-cd2218e-20260818/).
 
 ---
 
