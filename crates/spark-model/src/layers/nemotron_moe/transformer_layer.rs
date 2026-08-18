@@ -103,27 +103,10 @@ impl TransformerLayer for NemotronMoeLayer {
         stream: u64,
     ) -> Result<()> {
         anyhow::ensure!(ks.len() == n_seqs, "decode_verify_multi: ks/n mismatch");
-        // Lightning's verified C=1 contract is one native K-row MoE launch per
-        // sequence. Collapsing unrelated sequences into R=Σks changes the
-        // decode dispatch width (and therefore the reduction order/kernel arm),
-        // which is not greedy-equivalent: distinct C>1 prompts diverge from
-        // their C1 controls even though attention, Mamba, and LM-head are exact.
-        // Keep the weight-preserving batched verifier at the sequence boundary:
-        // each sequence still verifies all of its K rows natively in one call,
-        // but no call may mix another sequence's rows.
-        let h = ctx.config.hidden_size;
-        let mut off_bytes = 0usize;
-        for &k in ks {
-            self.decode_batched_direct(
-                hidden.offset(off_bytes),
-                residual.offset(off_bytes),
-                k,
-                ctx,
-                stream,
-            )?;
-            off_bytes += k * h * 2;
-        }
-        Ok(())
+        // Gate projection stays at each sequence's exact K-row width (the
+        // mixed-prompt parity boundary); row-independent expert/shared kernels
+        // then share their weight read over R=Σks without changing row math.
+        self.decode_verify_multi_shared(hidden, residual, ks, ctx, stream)
     }
 
     /// Batched MoE prefill: uses GEMM for gate/fc1/fc2/shared, per-token for routing + experts.

@@ -33,4 +33,16 @@ mod tests {
         assert!(!decode_multi_seq_batched(Some("1"), Some("0")));
         assert!(!decode_multi_seq_batched(Some("1"), Some("true")));
     }
+
+    #[test]
+    fn verify_moe_preserves_k_width_gate_and_shares_row_independent_weights() {
+        let layer = include_str!("nemotron_moe/transformer_layer.rs");
+        let body = include_str!("nemotron_moe/decode_batched.rs");
+        assert!(layer.contains("decode_verify_multi_shared(hidden, residual, ks"));
+        assert!(body.contains("Some(ks)"));
+        assert!(body.contains("normed.offset(row * h * bf16)"));
+        assert!(body.contains("gate_logits.offset(row * num_experts as usize * bf16)"));
+        assert!(body.contains("w4a16_gemv_batch32_k"));
+        assert!(body.contains("moe_expert_gemv_wide("));
+    }
 }

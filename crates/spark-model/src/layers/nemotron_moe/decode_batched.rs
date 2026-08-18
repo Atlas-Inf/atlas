@@ -21,6 +21,37 @@ impl NemotronMoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.decode_batched_direct_with_gate_chunks(hidden, residual, num_tokens, None, ctx, stream)
+    }
+
+    pub(super) fn decode_verify_multi_shared(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        ks: &[usize],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let num_tokens = ks.iter().sum();
+        self.decode_batched_direct_with_gate_chunks(
+            hidden,
+            residual,
+            num_tokens,
+            Some(ks),
+            ctx,
+            stream,
+        )
+    }
+
+    fn decode_batched_direct_with_gate_chunks(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        gate_chunks: Option<&[usize]>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
         if num_tokens <= 1 || self.moe_latent_size > 0 {
             for t in 0..num_tokens {
                 let off = t * ctx.config.hidden_size * 2;
@@ -66,16 +97,37 @@ impl NemotronMoeLayer {
             stream,
         )?;
         let gate_logits = ctx.buffers.gate_logits();
-        self.dense_gemm_prefill(
-            ctx.gpu,
-            normed,
-            &self.weights.gate,
-            gate_logits,
-            n,
-            num_experts,
-            h as u32,
-            stream,
-        )?;
+        if let Some(chunks) = gate_chunks {
+            anyhow::ensure!(
+                chunks.iter().sum::<usize>() == num_tokens,
+                "MoE verify gate chunks do not cover R={num_tokens}"
+            );
+            let mut row = 0usize;
+            for &k in chunks {
+                self.dense_gemm_prefill(
+                    ctx.gpu,
+                    normed.offset(row * h * bf16),
+                    &self.weights.gate,
+                    gate_logits.offset(row * num_experts as usize * bf16),
+                    k as u32,
+                    num_experts,
+                    h as u32,
+                    stream,
+                )?;
+                row += k;
+            }
+        } else {
+            self.dense_gemm_prefill(
+                ctx.gpu,
+                normed,
+                &self.weights.gate,
+                gate_logits,
+                n,
+                num_experts,
+                h as u32,
+                stream,
+            )?;
+        }
 
         let scratch = ctx.buffers.scratch();
         let indices = scratch;
@@ -182,6 +234,18 @@ impl NemotronMoeLayer {
             ops::w4a16_gemv_batchm(
                 ctx.gpu,
                 self.w4a16_gemv_batch16_k,
+                normed,
+                &self.weights.shared_up,
+                shared_up,
+                n,
+                shared_inter,
+                h as u32,
+                stream,
+            )?;
+        } else if n <= 32 && self.w4a16_gemv_batch32_k.0 != 0 {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                self.w4a16_gemv_batch32_k,
                 normed,
                 &self.weights.shared_up,
                 shared_up,
