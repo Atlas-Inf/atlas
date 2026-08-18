@@ -625,6 +625,10 @@ pub use contract::{
 mod contract_tests;
 mod row_contract;
 pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, LightningRowContract};
+mod batch_inputs;
+pub use batch_inputs::{DsparkBatchInput, DsparkBatchInputError, DsparkBatchSequence};
+#[cfg(test)]
+mod batch_inputs_tests;
 mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;
@@ -811,14 +815,53 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let n = last_tokens.len();
         let expected_owners = expected_owners
             .ok_or_else(|| anyhow::anyhow!("DFlash batched propose requires expected owners"))?;
-        if n < 2
-            || target_hiddens.len() != n
-            || positions.len() != n
-            || states.len() != n
-            || expected_owners.len() != n
-        {
+        // Preserve the historical n<2 fallback, but only after the complete
+        // structural-length seam has run. No GPU work or state downcast occurs
+        // before this check.
+        batch_inputs::validate_batch_input_lengths(
+            n,
+            n,
+            n,
+            target_hiddens.len(),
+            positions.len(),
+            states.len(),
+            expected_owners.len(),
+        )?;
+        if n < 2 {
             return Ok(None);
         }
+
+        // Freeze the explicit sequence identities and lifecycle snapshots before
+        // any stream/event dispatch. The current implementation below remains
+        // serial-per-sequence or pinned-lane compute; this is only its validated
+        // B×gamma input seam. Its capacity is the already-admitted call width,
+        // so this does not widen propose_batch_max or allocate batch scratch.
+        let mut owners = Vec::with_capacity(n);
+        let mut lifecycles = Vec::with_capacity(n);
+        for state in states.iter_mut() {
+            let dstate = state
+                .as_any_mut()
+                .downcast_mut::<DflashProposerState>()
+                .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+            let lifecycle = dstate.lifecycle.clone();
+            let owner = lifecycle
+                .as_ref()
+                .map(CaptureDescriptor::owner)
+                .unwrap_or(expected_owners[owners.len()]);
+            owners.push(owner);
+            lifecycles.push(lifecycle);
+        }
+        let _batch_inputs = DsparkBatchInput::validate(
+            self.gamma,
+            n,
+            &owners,
+            last_tokens,
+            positions,
+            target_hiddens,
+            expected_owners,
+            &lifecycles,
+        )?;
+
         let lanes_n = self.lane_count();
         if lanes_n == 1 {
             // Single-lane: the original serial path, unchanged.

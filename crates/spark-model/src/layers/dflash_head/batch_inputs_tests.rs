@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use spark_runtime::gpu::DevicePtr;
+
+use super::batch_inputs::{DsparkBatchInput, DsparkBatchInputError, validate_batch_input_lengths};
+use super::{
+    CaptureDescriptor, CaptureStatus, LIGHTNING_SERVED_GAMMA, LIGHTNING_TAPS, SequenceGeneration,
+};
+
+fn owner(slot: usize, generation: u64) -> SequenceGeneration {
+    SequenceGeneration::new(slot, generation).unwrap()
+}
+
+fn lifecycle(owner: SequenceGeneration) -> CaptureDescriptor {
+    CaptureDescriptor::bind(owner, 0, 0, LIGHTNING_SERVED_GAMMA, 64).unwrap()
+}
+
+fn valid_parts(
+    batch: usize,
+) -> (
+    Vec<SequenceGeneration>,
+    Vec<u32>,
+    Vec<usize>,
+    Vec<DevicePtr>,
+    Vec<SequenceGeneration>,
+    Vec<Option<CaptureDescriptor>>,
+) {
+    let owners: Vec<_> = (0..batch).map(|i| owner(i, (i + 1) as u64)).collect();
+    let last_tokens: Vec<_> = (0..batch).map(|i| 100 + i as u32).collect();
+    let positions: Vec<_> = (0..batch).map(|i| 1_000 + i * 17).collect();
+    let target_hiddens: Vec<_> = (0..batch)
+        .map(|i| DevicePtr(0x1000 + (i as u64) * 0x100))
+        .collect();
+    let lifecycles = owners.iter().copied().map(lifecycle).map(Some).collect();
+    (
+        owners.clone(),
+        last_tokens,
+        positions,
+        target_hiddens,
+        owners,
+        lifecycles,
+    )
+}
+
+fn valid(batch: usize) -> DsparkBatchInput {
+    let (owners, last_tokens, positions, target_hiddens, expected, lifecycles) = valid_parts(batch);
+    DsparkBatchInput::validate(
+        LIGHTNING_SERVED_GAMMA,
+        batch,
+        &owners,
+        &last_tokens,
+        &positions,
+        &target_hiddens,
+        &expected,
+        &lifecycles,
+    )
+    .unwrap()
+}
+
+#[test]
+fn lightning_contract_consumes_the_existing_gamma_and_tap_ssot() {
+    assert_eq!(LIGHTNING_SERVED_GAMMA, 4);
+    assert_eq!(LIGHTNING_TAPS, [1, 5, 19, 29, 41, 51]);
+    assert!(matches!(
+        DsparkBatchInput::validate(0, 1, &[], &[], &[], &[], &[], &[]),
+        Err(DsparkBatchInputError::GammaZero)
+    ));
+    assert!(matches!(
+        DsparkBatchInput::validate(8, 1, &[], &[], &[], &[], &[], &[]),
+        Err(DsparkBatchInputError::GammaMismatch {
+            expected: LIGHTNING_SERVED_GAMMA,
+            found: 8
+        })
+    ));
+}
+
+#[test]
+fn b1_b2_b4_b8_use_sequence_then_gamma_rows() {
+    for batch in [1, 2, 4, 8] {
+        let input = valid(batch);
+        assert_eq!(input.batch_len(), batch);
+        assert_eq!(input.gamma(), LIGHTNING_SERVED_GAMMA);
+        assert_eq!(input.total_rows(), batch * LIGHTNING_SERVED_GAMMA);
+        for sequence in 0..batch {
+            assert_eq!(
+                input.sequence_row_range(sequence).unwrap(),
+                sequence * LIGHTNING_SERVED_GAMMA..(sequence + 1) * LIGHTNING_SERVED_GAMMA
+            );
+            for query in 0..LIGHTNING_SERVED_GAMMA {
+                assert_eq!(
+                    input.row_index(sequence, query).unwrap(),
+                    sequence * LIGHTNING_SERVED_GAMMA + query
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_absolute_positions_and_owner_identity_survive_batch_reordering() {
+    let (
+        mut owners,
+        mut last_tokens,
+        mut positions,
+        mut target_hiddens,
+        mut expected,
+        mut lifecycles,
+    ) = valid_parts(2);
+    positions[0] = 7;
+    positions[1] = 99_999;
+    last_tokens[0] = 3;
+    last_tokens[1] = 4;
+    target_hiddens[0] = DevicePtr(0xabc0);
+    target_hiddens[1] = DevicePtr(0xdef0);
+    let first = DsparkBatchInput::validate(
+        LIGHTNING_SERVED_GAMMA,
+        2,
+        &owners,
+        &last_tokens,
+        &positions,
+        &target_hiddens,
+        &expected,
+        &lifecycles,
+    )
+    .unwrap();
+
+    owners.swap(0, 1);
+    last_tokens.swap(0, 1);
+    positions.swap(0, 1);
+    target_hiddens.swap(0, 1);
+    expected.swap(0, 1);
+    lifecycles.swap(0, 1);
+    let reordered = DsparkBatchInput::validate(
+        LIGHTNING_SERVED_GAMMA,
+        2,
+        &owners,
+        &last_tokens,
+        &positions,
+        &target_hiddens,
+        &expected,
+        &lifecycles,
+    )
+    .unwrap();
+
+    assert_eq!(first.sequence(0).absolute_position, 7);
+    assert_eq!(first.sequence(1).absolute_position, 99_999);
+    assert_eq!(reordered.sequence(0).owner, first.sequence(1).owner);
+    assert_eq!(reordered.sequence(0).target_hidden, DevicePtr(0xdef0));
+}
+
+#[test]
+fn checked_byte_layout_uses_hidden_width_and_element_bytes() {
+    let input = valid(2);
+    assert_eq!(input.total_bytes(3, 2).unwrap(), 2 * 4 * 3 * 2);
+    assert_eq!(input.row_byte_offset(1, 2, 3, 2).unwrap(), 36);
+    assert_eq!(input.row_byte_range(1, 2, 3, 2).unwrap(), 36..42);
+    assert_eq!(input.sequence_byte_range(1, 3, 2).unwrap(), 24..48);
+    assert!(matches!(
+        input.total_bytes(0, 2),
+        Err(DsparkBatchInputError::ZeroDimension {
+            field: "hidden_width"
+        })
+    ));
+    assert!(matches!(
+        input.total_bytes(3, 0),
+        Err(DsparkBatchInputError::ZeroDimension {
+            field: "element_bytes"
+        })
+    ));
+}
+
+#[test]
+fn all_structural_lengths_must_match_the_batch_width() {
+    let (owners, last_tokens, positions, target_hiddens, expected, lifecycles) = valid_parts(2);
+    assert!(validate_batch_input_lengths(2, 2, 1, 2, 2, 2, 2).is_err());
+    assert!(matches!(
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            2,
+            &owners[..1],
+            &last_tokens,
+            &positions,
+            &target_hiddens,
+            &expected,
+            &lifecycles,
+        ),
+        Err(DsparkBatchInputError::LengthMismatch {
+            field: "owners",
+            expected: 2,
+            found: 1
+        })
+    ));
+    assert!(matches!(
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            2,
+            &owners,
+            &last_tokens[..1],
+            &positions,
+            &target_hiddens,
+            &expected,
+            &lifecycles,
+        ),
+        Err(DsparkBatchInputError::LengthMismatch {
+            field: "last_tokens",
+            expected: 2,
+            found: 1
+        })
+    ));
+}
+
+#[test]
+fn empty_and_capacity_overflow_are_typed_failures() {
+    assert!(matches!(
+        DsparkBatchInput::validate(LIGHTNING_SERVED_GAMMA, 1, &[], &[], &[], &[], &[], &[],),
+        Err(DsparkBatchInputError::EmptyBatch)
+    ));
+    let parts = valid_parts(2);
+    assert!(matches!(
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            1,
+            &parts.0,
+            &parts.1,
+            &parts.2,
+            &parts.3,
+            &parts.4,
+            &parts.5,
+        ),
+        Err(DsparkBatchInputError::CapacityExceeded {
+            capacity: 1,
+            batch: 2
+        })
+    ));
+}
+
+#[test]
+fn duplicate_expected_owners_are_rejected_even_when_rows_are_distinct() {
+    let (mut owners, last_tokens, positions, target_hiddens, mut expected, mut lifecycles) =
+        valid_parts(2);
+    owners[1] = owners[0];
+    expected[1] = expected[0];
+    lifecycles[1] = Some(lifecycle(owners[0]));
+    assert!(matches!(
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            2,
+            &owners,
+            &last_tokens,
+            &positions,
+            &target_hiddens,
+            &expected,
+            &lifecycles,
+        ),
+        Err(DsparkBatchInputError::DuplicateOwner {
+            first: 0,
+            second: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn expected_stale_retired_and_missing_lifecycle_owners_fail_closed() {
+    let (owners, last_tokens, positions, target_hiddens, mut expected, mut lifecycles) =
+        valid_parts(2);
+    expected[1] = owner(1, 999);
+    assert!(matches!(
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            2,
+            &owners,
+            &last_tokens,
+            &positions,
+            &target_hiddens,
+            &expected,
+            &lifecycles,
+        ),
+        Err(DsparkBatchInputError::ExpectedOwnerMismatch { sequence: 1, .. })
+    ));
+
+    expected[1] = owners[1];
+    lifecycles[1] = Some(lifecycle(owner(1, 999)));
+    assert!(matches!(
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            2,
+            &owners,
+            &last_tokens,
+            &positions,
+            &target_hiddens,
+            &expected,
+            &lifecycles,
+        ),
+        Err(DsparkBatchInputError::LifecycleOwnerMismatch { sequence: 1, .. })
+    ));
+
+    let mut retired = lifecycle(owners[1]);
+    retired.retire(owners[1]).unwrap();
+    assert_eq!(retired.status(), CaptureStatus::Retired);
+    lifecycles[1] = Some(retired);
+    assert!(matches!(
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            2,
+            &owners,
+            &last_tokens,
+            &positions,
+            &target_hiddens,
+            &expected,
+            &lifecycles,
+        ),
+        Err(DsparkBatchInputError::LifecycleNotLive { sequence: 1, .. })
+    ));
+
+    lifecycles[1] = None;
+    assert!(matches!(
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            2,
+            &owners,
+            &last_tokens,
+            &positions,
+            &target_hiddens,
+            &expected,
+            &lifecycles,
+        ),
+        Err(DsparkBatchInputError::MissingLifecycle { sequence: 1, .. })
+    ));
+}
+
+#[test]
+fn zero_target_hidden_pointer_is_rejected_with_sequence_index() {
+    let (owners, last_tokens, positions, mut target_hiddens, expected, lifecycles) = valid_parts(2);
+    target_hiddens[1] = DevicePtr(0);
+    assert!(matches!(
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            2,
+            &owners,
+            &last_tokens,
+            &positions,
+            &target_hiddens,
+            &expected,
+            &lifecycles,
+        ),
+        Err(DsparkBatchInputError::ZeroTargetHidden { sequence: 1 })
+    ));
+}
+
+#[test]
+fn checked_arithmetic_rejects_byte_size_and_offset_overflow() {
+    let input = valid(2);
+    assert!(matches!(
+        input.total_bytes(usize::MAX, 2),
+        Err(DsparkBatchInputError::ArithmeticOverflow { .. })
+    ));
+    assert!(matches!(
+        input.row_byte_offset(1, 0, usize::MAX, 2),
+        Err(DsparkBatchInputError::ArithmeticOverflow { .. })
+    ));
+    assert!(matches!(
+        input.sequence_byte_range(1, usize::MAX, 2),
+        Err(DsparkBatchInputError::ArithmeticOverflow { .. })
+    ));
+}
+
+#[test]
+fn row_and_sequence_ranges_reject_out_of_bounds_indices() {
+    let input = valid(1);
+    assert!(matches!(
+        input.row_index(1, 0),
+        Err(DsparkBatchInputError::SequenceOutOfBounds {
+            sequence: 1,
+            batch: 1
+        })
+    ));
+    assert!(matches!(
+        input.row_index(0, LIGHTNING_SERVED_GAMMA),
+        Err(DsparkBatchInputError::QueryOutOfBounds {
+            query: LIGHTNING_SERVED_GAMMA,
+            gamma: LIGHTNING_SERVED_GAMMA
+        })
+    ));
+}
