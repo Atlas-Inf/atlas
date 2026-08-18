@@ -437,6 +437,11 @@ fn build_mapper_accepts_exact_lightning_swa_window() {
         window_size: Some(1024),
     };
     let mut target = ModelConfig::qwen3_next_80b_nvfp4();
+    target.model_type = "nemotron_h".to_owned();
+    target.hidden_size = 2688;
+    target.num_hidden_layers = 52;
+    target.num_experts = 128;
+    target.num_experts_per_tok = 6;
     target.tp_world_size = 1;
     target.ep_world_size = 1;
     let profile = admit_lightning_dspark_build(&args, &target, 3, 16, KvCacheDtype::Fp8)
