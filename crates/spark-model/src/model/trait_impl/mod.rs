@@ -43,6 +43,7 @@ mod verify_b;
 mod verify_c;
 mod verify_c2;
 mod verify_d;
+mod verify_d_serial;
 mod verify_e;
 pub(in crate::model) mod verify_e2;
 mod verify_fused;

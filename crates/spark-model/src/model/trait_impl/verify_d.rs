@@ -48,6 +48,11 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+        if self.lightning_dspark_identity.policy().is_some()
+            && std::env::var("ATLAS_LIGHTNING_VERIFY_SERIAL_M1").as_deref() == Ok("1")
+        {
+            return self.decode_verify_serial_m1_dispatch(tokens, seq, _stream);
+        }
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;
