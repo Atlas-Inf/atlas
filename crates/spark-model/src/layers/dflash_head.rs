@@ -765,6 +765,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
         }
     }
 
+    fn propose_batch_min(&self) -> usize {
+        if self.startup.diagnostics.batch_parity {
+            1
+        } else {
+            2
+        }
+    }
+
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`.
         // Sized once, re-used across the seq's lifetime; reset on

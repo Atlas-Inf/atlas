@@ -431,6 +431,12 @@ impl Model for TransformerModel {
             None => 1,
         }
     }
+    fn mtp_propose_batch_min(&self) -> usize {
+        match &self.proposer {
+            Some(p) => p.propose_batch_min(),
+            None => 2,
+        }
+    }
     fn decode_verify_graphed_kgamma(
         &self,
         tokens: &[u32],

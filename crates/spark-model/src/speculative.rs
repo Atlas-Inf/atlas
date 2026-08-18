@@ -439,6 +439,12 @@ pub trait DraftProposer: Send + Sync {
         1
     }
 
+    /// Minimum group width admitted to [`Self::propose_batch`]. Normal batched
+    /// proposers require two sequences; explicit parity diagnostics may use one.
+    fn propose_batch_min(&self) -> usize {
+        2
+    }
+
     /// Prefill the drafter's own context (KV cache) over the prompt, before
     /// the first `propose()` of a sequence (ATLAS_MTP_DRAFTER_PREFILL).
     ///

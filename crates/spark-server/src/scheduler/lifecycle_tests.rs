@@ -183,6 +183,7 @@ impl Model for StubModel {
                     seam_serial_enabled: false,
                     draft_cap_override: None,
                     adaptive_enabled: false,
+                    batch_parity_enabled: false,
                 },
             )
             .expect("canonical Lightning profile admits")

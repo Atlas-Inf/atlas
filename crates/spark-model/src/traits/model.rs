@@ -714,6 +714,11 @@ pub trait Model: Send + Sync {
         1
     }
 
+    /// Smallest group that should enter the batched proposer.
+    fn mtp_propose_batch_min(&self) -> usize {
+        2
+    }
+
     /// DFlash K=γ graphed verify (γ+1 tokens). Specialization of the K=2/3/4
     /// pattern for arbitrary K. Default impl falls back to eager
     /// `decode_verify`. Models can override for CUDA-graph speedup keyed by
