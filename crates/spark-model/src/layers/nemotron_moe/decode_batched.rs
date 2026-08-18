@@ -12,6 +12,23 @@ use super::NemotronMoeLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateProjection {
+    /// Same per-row K iteration/reduction as serial `dense_gemv` while sharing
+    /// the router weight read across K verify rows.
+    Batchm,
+    /// Existing tiled prefill path for widths outside the exact batchm bound.
+    Tiled,
+}
+
+fn gate_projection(num_tokens: usize, batchm_ready: bool) -> GateProjection {
+    if batchm_ready && (2..=ops::DENSE_GEMV_BATCHM_MAX_M as usize).contains(&num_tokens) {
+        GateProjection::Batchm
+    } else {
+        GateProjection::Tiled
+    }
+}
+
 impl NemotronMoeLayer {
     pub(super) fn decode_batched_direct(
         &self,
@@ -106,29 +123,57 @@ impl NemotronMoeLayer {
             );
             let mut row = 0usize;
             for &k in chunks {
-                self.dense_gemm_prefill(
-                    ctx.gpu,
-                    normed.offset(row * h * bf16),
-                    &self.weights.gate,
-                    gate_logits.offset(row * num_experts as usize * bf16),
-                    k as u32,
-                    num_experts,
-                    h as u32,
-                    stream,
-                )?;
+                match gate_projection(k, self.dense_gemv_batchm_k.0 != 0) {
+                    GateProjection::Batchm => ops::dense_gemv_batchm(
+                        ctx.gpu,
+                        self.dense_gemv_batchm_k,
+                        normed.offset(row * h * bf16),
+                        &self.weights.gate,
+                        gate_logits.offset(row * num_experts as usize * bf16),
+                        k as u32,
+                        num_experts,
+                        h as u32,
+                        num_experts,
+                        stream,
+                    )?,
+                    GateProjection::Tiled => self.dense_gemm_prefill(
+                        ctx.gpu,
+                        normed.offset(row * h * bf16),
+                        &self.weights.gate,
+                        gate_logits.offset(row * num_experts as usize * bf16),
+                        k as u32,
+                        num_experts,
+                        h as u32,
+                        stream,
+                    )?,
+                }
                 row += k;
             }
         } else {
-            self.dense_gemm_prefill(
-                ctx.gpu,
-                normed,
-                &self.weights.gate,
-                gate_logits,
-                n,
-                num_experts,
-                h as u32,
-                stream,
-            )?;
+            match gate_projection(num_tokens, self.dense_gemv_batchm_k.0 != 0) {
+                GateProjection::Batchm => ops::dense_gemv_batchm(
+                    ctx.gpu,
+                    self.dense_gemv_batchm_k,
+                    normed,
+                    &self.weights.gate,
+                    gate_logits,
+                    n,
+                    num_experts,
+                    h as u32,
+                    num_experts,
+                    stream,
+                )?,
+                GateProjection::Tiled => self.dense_gemm_prefill(
+                    ctx.gpu,
+                    normed,
+                    &self.weights.gate,
+                    gate_logits,
+                    n,
+                    num_experts,
+                    h as u32,
+                    stream,
+                )?,
+            }
         }
 
         let scratch = ctx.buffers.scratch();
@@ -335,5 +380,21 @@ impl NemotronMoeLayer {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gate_projection_tests {
+    use super::{GateProjection, gate_projection};
+
+    #[test]
+    fn kverify_uses_bit_exact_batchm_only_inside_its_proven_width() {
+        for n in 2..=8 {
+            assert_eq!(gate_projection(n, true), GateProjection::Batchm);
+        }
+        for n in [0, 1, 9, 16, 32] {
+            assert_eq!(gate_projection(n, true), GateProjection::Tiled);
+        }
+        assert_eq!(gate_projection(4, false), GateProjection::Tiled);
     }
 }

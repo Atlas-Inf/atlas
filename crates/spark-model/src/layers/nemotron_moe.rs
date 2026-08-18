@@ -40,6 +40,10 @@ pub struct NemotronMoeLayer {
     // Kernel handles — decode (single token)
     rms_norm_residual_k: KernelHandle,
     dense_gemv_k: KernelHandle,
+    /// Bit-identical M-row sibling of `dense_gemv_k` (M<=8). K-row verify
+    /// must use this for router logits: the tiled prefill GEMM changes BF16
+    /// rounding and can select different experts than sequential decode.
+    dense_gemv_batchm_k: KernelHandle,
     topk_sigmoid_k: KernelHandle,
     moe_expert_gemv_k: KernelHandle,
     moe_expert_gemv_wide_k: KernelHandle,
@@ -163,6 +167,11 @@ impl NemotronMoeLayer {
             top_k,
             rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv_batchm_k: super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm",
+            ),
             topk_sigmoid_k: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid")?,
             moe_expert_gemv_k: gpu.kernel("moe_expert_gemv", "moe_expert_gemv")?,
             moe_expert_gemv_wide_k: super::try_kernel(
