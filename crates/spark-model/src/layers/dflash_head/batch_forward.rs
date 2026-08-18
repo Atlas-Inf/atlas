@@ -232,4 +232,98 @@ impl BlockDiffusionDraftHead {
             stream,
         )
     }
+
+    /// Stage final norm, shared LM head, and unbiased per-row argmax. The token
+    /// buffer is consumed only by the forthcoming batch-wide Markov stage.
+    pub(super) fn run_batched_tail_base(
+        &self,
+        batch_rows: u32,
+        ctx: &crate::layer::ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let hidden = u32::try_from(self.hidden_size)
+            .map_err(|_| anyhow::anyhow!("DFlash hidden width exceeds u32"))?;
+        let vocab = u32::try_from(self.vocab_size)
+            .map_err(|_| anyhow::anyhow!("DFlash vocab exceeds u32"))?;
+        crate::layers::ops::rms_norm(
+            ctx.gpu,
+            self.kernels.rms_norm,
+            self.batch_query_embed,
+            &self.norm,
+            self.batch_norm,
+            batch_rows,
+            hidden,
+            self.rms_norm_eps,
+            stream,
+        )?;
+        if matches!(self.quant, super::DflashQuantization::Fp8Weights) {
+            if let Some(fp8) = self.lm_head_shared_fp8.as_ref() {
+                crate::layers::ops::fp8_gemm_n128_row_scaled(
+                    ctx.gpu,
+                    self.kernels.fp8_gemm_n128_row_scaled,
+                    self.batch_norm,
+                    fp8,
+                    self.batch_logits,
+                    batch_rows,
+                    vocab,
+                    hidden,
+                    stream,
+                )?;
+            } else {
+                crate::layers::ops::dense_gemm_bf16_pipelined(
+                    ctx.gpu,
+                    self.kernels.dense_gemm_pipelined,
+                    self.batch_norm,
+                    &crate::weight_map::DenseWeight {
+                        weight: self.lm_head_shared,
+                    },
+                    self.batch_logits,
+                    batch_rows,
+                    vocab,
+                    hidden,
+                    stream,
+                )?;
+            }
+        } else if let Some(nvfp4) = self.lm_head_nvfp4.as_ref() {
+            anyhow::ensure!(
+                self.kernels.w4a16_gemm.0 != 0,
+                "DFlash batched NVFP4 LM head kernel is unresolved"
+            );
+            crate::layers::ops::w4a16_gemm(
+                ctx.gpu,
+                self.kernels.w4a16_gemm,
+                self.batch_norm,
+                nvfp4,
+                self.batch_logits,
+                batch_rows,
+                vocab,
+                hidden,
+                stream,
+            )?;
+        } else {
+            crate::layers::ops::dense_gemm_bf16_pipelined(
+                ctx.gpu,
+                self.kernels.dense_gemm_pipelined,
+                self.batch_norm,
+                &crate::weight_map::DenseWeight {
+                    weight: self.lm_head_shared,
+                },
+                self.batch_logits,
+                batch_rows,
+                vocab,
+                hidden,
+                stream,
+            )?;
+        }
+        crate::layers::ops::argmax_bf16_batch(
+            ctx.gpu,
+            self.kernels.argmax_batch,
+            self.batch_logits,
+            self.batch_tokens,
+            vocab,
+            batch_rows,
+            vocab,
+            stream,
+        )
+    }
 }

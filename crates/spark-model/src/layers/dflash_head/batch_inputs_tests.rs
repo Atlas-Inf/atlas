@@ -480,6 +480,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let entry = include_str!("../dflash_head.rs");
     assert!(entry.contains("for layer_idx in 1..self.layers.len()"));
     assert!(entry.contains("self.run_batched_layer_stage("));
+    assert!(entry.contains("self.run_batched_tail_base("));
 
     let source = include_str!("batch_forward.rs");
     let input_norm = source.find("&layer.input_layernorm").unwrap();
@@ -505,6 +506,13 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
             && gate < silu
             && silu < down
     );
+    let tail = &source[source.find("fn run_batched_tail_base").unwrap()..];
+    let final_norm = tail.find("&self.norm").unwrap();
+    let lm_head = tail.find("ops::w4a16_gemm").unwrap();
+    let argmax = tail.find("ops::argmax_bf16_batch").unwrap();
+    assert!(tail.contains("self.batch_logits"));
+    assert!(tail.contains("self.batch_tokens"));
+    assert!(final_norm < lm_head && lm_head < argmax);
 }
 
 #[test]
@@ -567,6 +575,8 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("self.batch_mlp_gate"));
     assert!(source.contains("self.batch_mlp_up"));
     assert!(source.contains("self.batch_mlp_down"));
+    assert!(source.contains("batch_logits"));
+    assert!(source.contains("batch_tokens"));
     assert!(source.contains("batch_slots_ready\n            && self.lane_count() == 1"));
     assert!(source.contains("&& let Some(sinks)"));
     assert!(source.contains("sole source of returned drafts"));

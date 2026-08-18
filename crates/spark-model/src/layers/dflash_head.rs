@@ -77,6 +77,7 @@ pub struct DflashKernels {
     pub silu_mul: KernelHandle,
     pub residual_add: KernelHandle,
     pub argmax: KernelHandle,
+    pub argmax_batch: KernelHandle,
     pub batched_embed: KernelHandle,
     pub batch_anchor_add: KernelHandle,
     /// Phase 2 Option B: builds `[count]` i32 slot indices on-device
@@ -546,6 +547,8 @@ pub struct BlockDiffusionDraftHead {
     pub batch_mlp_gate: DevicePtr,
     pub batch_mlp_up: DevicePtr,
     pub batch_mlp_down: DevicePtr,
+    pub batch_logits: DevicePtr,
+    pub batch_tokens: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -1262,6 +1265,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     layer_idx, batch_rows, batch_size, max_kv_len, ctx, stream,
                 )?;
             }
+            self.run_batched_tail_base(batch_rows, ctx, stream)?;
         }
 
         let lanes_n = self.lane_count();
