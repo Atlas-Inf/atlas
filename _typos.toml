@@ -149,4 +149,8 @@ extend-exclude = [
     # Campaign raw artifacts: verbatim model output (logit dumps whose top-k
     # entries include subword fragments like ` summar`, ` repet`). Data, not prose.
     "docs/campaigns/*/raw/",
+    # Published sanitized server logs contain opaque PTX hashes and verbatim
+    # benchmark/model fragments. They are checksummed data, not prose; changing
+    # those bytes to satisfy a spell checker would corrupt the evidence record.
+    "evidence/**/SERVER-SANITIZED.log",
 ]
