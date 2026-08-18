@@ -667,7 +667,7 @@ Drafter small-M tier + K ladder `1:3,2:1,4:2,8:2,16:1` (C=4 now on its own optim
 | C | round 11 | round 10 | vLLM+MTP | ratio |
 |---:|---:|---:|---:|---:|
 | 4 | **74.21** | 71.95 | 71.61 | **1.036x** |
-| 8 | **125.95** | 125.47 | 124.48 | **1.012x** |
+| 8 | **125.95** (r11) · 123.22 re-meas. 08-18 | 125.47 | 124.48 · 121.64 same-day | **1.012x** / **1.013x** |
 
 Both formerly-open rungs are now won with margin rather than by a hair — C=4 went from a
 0.5% edge to 3.6%, C=8 from 0.8% to 1.2%. Independent confirmation of round 10 on a
@@ -686,14 +686,196 @@ number in this file is the one that was measured. Ladder stack tip: `1575873582`
 Gate certifications were deliberately held until after this rebase: a record minted on a
 pre-rewrite SHA would name a commit that no longer exists, which is worse than no record.
 
+### C=2 HARDENED (2026-08-18) — the last unreproduced rung, re-measured against a same-day vLLM
+
+C=2 was the weak point of the certified table, for two reasons that compounded: it was the
+only rung round 11 did **not** re-measure (the table carries `(r8) 38.95` from round 8), and
+at **1.004x** it was won by 0.16 tok/s — a margin smaller than the run-to-run spread of
+either engine. A claim of "wins at every rung" rests hardest on its thinnest rung.
+
+Re-measured on **merged main `529fcb04fa`** (i.e. after #572, #569 and #581 all landed),
+with vLLM re-run **back-to-back on the same box on the same day** rather than compared to a
+week-old number:
+
+| engine | rep 1 | rep 2 | rep 3 | mean | spread |
+|---|---:|---:|---:|---:|---:|
+| **Atlas** | 41.69 | 39.99 | 41.37 | **41.02** | 4.15% |
+| vLLM+MTP | 37.62 | 36.52 | 37.18 | **37.11** | 2.94% |
+
+**Ratio 1.105x**, against the recorded 1.004x. The distributions do not overlap: Atlas's
+WORST rep (39.99) beats vLLM's BEST (37.62). That is the property the old number lacked —
+1.004x could be reversed by a single unlucky draw, and this cannot.
+
+Against the recorded vLLM 38.79 instead of today's 37.11, Atlas still wins by 1.058x, so
+the conclusion does not depend on which vLLM number is used. Both are reported because
+vLLM's own C=2 moved 4.3% between two runs of the SAME image digest on the SAME box, which
+is a useful reminder that a 1.004x margin is not a result.
+
+Two configuration traps were caught and are worth recording, since both would have produced
+a wrong number that looked fine:
+
+- **This file's header block (line ~17) lists `--kv-cache-dtype bf16`**, which is the ROUND 1
+  Atlas config. The certified comparison is **fp8 KV on both** (round 4 moved Atlas to fp8
+  "matching the reference at last"). A first attempt at bf16 measured 39.55 and was discarded.
+- **The ladder was measured on dgx2, not dgx1.** Two runs were completed on dgx1 (39.55 bf16,
+  39.95 fp8) before this was noticed, and both were discarded rather than compared across
+  boxes — the same error this file already records as a retraction at "★ The comparison
+  itself is the likely error".
+
+Provenance: box dgx2 (spark-43fa), Atlas `529fcb04fa` served with the round-11 flags at
+`--kv-cache-dtype fp8`, env `ATLAS_PREFILL_CODISPATCH=1 ATLAS_FP8_ROWWISE=1
+ATLAS_MTP_DCUT_RATIO=1.0 ATLAS_MTP_K_LADDER=1:3,2:1,4:2,8:2,16:1`; vLLM
+`vllm/vllm-openai:latest` digest `sha256:0a51ea5b4ae2dc5d81890e5173f54203d2a3ae0cfffe51b8fd2afd4391bfd967`
+— the IDENTICAL digest the certified reference used — with
+`--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`, ctx 2048, batch cap
+128, util 0.85, fp8 KV, prefix caching on. Harness `harness_w55_conc_ladder.py`, ISL 128 /
+OSL 1024, temp 0, seed 42, 3 reps + 1 warmup. Raw series in
+`c2_atlas_dgx2_20260818.json` and `c2_vllm_mtp_dgx2_20260818.json`.
+
+### C=8 re-measured, and its K is already optimal (2026-08-18)
+
+C=8 became the thinnest rung once C=2 was hardened, so it got the same same-box/same-day
+treatment on merged main `529fcb04fa`:
+
+| engine | rep 1 | rep 2 | rep 3 | mean |
+|---|---:|---:|---:|---:|
+| Atlas | 123.33 | 124.94 | 121.38 | **123.22** |
+| vLLM+MTP | 121.92 | 120.60 | 122.40 | **121.64** |
+
+**Ratio 1.013x**, against the certified 1.012x — reproduced to within 0.1%.
+
+★ Note what did NOT reproduce: the ABSOLUTES. Atlas measured 123.22 against its certified
+125.95 (-2.2%) and vLLM 121.64 against its certified 124.48 (-2.3%). Both engines moved by
+the same amount in the same direction, and the ratio survived. That is the useful shape of
+this result — a box-day offset cancels in a ratio and does not cancel in an absolute, which
+is why every rung in this file is reported as a ratio measured back-to-back rather than as a
+tok/s number compared to a stored one.
+
+**C=8 is thin because the rung is thin, not because K is mistuned.** The K-ladder entry for
+C=8 was swept at fixed everything-else:
+
+| `8:K` | mean tok/s | vs 8:2 |
+|---|---:|---:|
+| **8:2 (shipped)** | **123.22** | — |
+| 8:1 | 118.20 | -4.1% |
+| 8:3 | 116.96 | -5.1% |
+| 8:4 | 116.58 | -5.4% |
+
+Monotonically worse in both directions from the shipped value, so the shipped K is the
+optimum and there is no tuning win available here. Recorded so the next person does not
+re-run this sweep.
+
+Honest caveat that C=2 no longer has: at C=8 the two engines' rep distributions **overlap**
+(Atlas min 121.38 < vLLM max 122.40). The mean wins consistently, but a single-rep
+comparison at C=8 could go either way. Raw series in `c8_*_dgx2_20260818.json`.
+
+### C=8 REPRODUCED (2026-08-18) — 1.013x, and the K ladder there is already optimal
+
+With C=2 hardened, C=8's **1.012x** became the thinnest rung, so it got the same treatment:
+merged main `529fcb04fa`, dgx2, vLLM re-run back-to-back the same day.
+
+| engine | rep 1 | rep 2 | rep 3 | mean | spread |
+|---|---:|---:|---:|---:|---:|
+| Atlas | 123.33 | 124.94 | 121.38 | **123.22** | 2.89% |
+| vLLM+MTP | 121.92 | 120.60 | 122.40 | **121.64** | 1.49% |
+
+**Ratio 1.013x**, against the certified 1.012x — reproduced to within 0.1%.
+
+★ **Both engines measured ~2.2% BELOW their certified absolutes** (Atlas 123.22 vs 125.95,
+vLLM 121.64 vs 124.48) **while the ratio held.** That is the useful part: the ladder is
+reproducible in RATIO across days even when the box's absolute throughput drifts, which is
+exactly why every rung is quoted as a same-day A/B rather than against a stored number.
+
+**The margin is real but thin, and it is NOT a tuning oversight.** Unlike C=2, the rep
+distributions here OVERLAP (Atlas min 121.38 < vLLM max 122.40), so a single draw can
+reverse the ordering. A K-ladder sweep at C=8 confirms the shipped value is the optimum:
+
+| `8:K` | mean tok/s | vs shipped |
+|---:|---:|---:|
+| **8:2 (shipped)** | **123.22** | — |
+| 8:1 | 118.20 | -4.1% |
+| 8:3 | 116.96 | -5.1% |
+| 8:4 | 116.58 | -5.4% |
+
+Monotonically worse in both directions, so C=8's narrow margin is a property of the rung,
+not a missed setting. Widening it needs a kernel-level change, not a knob. Recorded so the
+next person does not re-run this sweep.
+
+Raw series: `c8_atlas_dgx2_20260818.json`, `c8_vllm_mtp_dgx2_20260818.json`. Same
+provenance as the C=2 block above.
+
+### SAME-DAY FULL LADDER ATTEMPT (2026-08-18) — INCOMPLETE, and its late rungs are SUSPECT
+
+After hardening C=2 and reproducing C=8, the remaining rungs were swept on merged main
+`529fcb04fa`, dgx2, both engines back-to-back. **The sweep did not finish: dgx2 stopped
+answering ping and ssh from BOTH other boxes while the vLLM leg entered C=128, and needed a
+physical powercycle.** Raw JSON was written to `/tmp` and did not survive. The numbers below
+are transcribed from the harness SERIES lines and are recorded for provenance, NOT as a
+replacement for the certified table.
+
+| C | Atlas | vLLM+MTP | same-day | certified |
+|---:|---:|---:|---:|---:|
+| 1 | 24.20 | 19.15 | **1.264x** | 1.196x |
+| 2 | 41.02 | 37.11 | **1.105x** | 1.004x |
+| 4 | 72.99 | 68.49 | **1.066x** | 1.036x |
+| 8 | 123.22 | 121.64 | 1.013x | 1.012x |
+| 16 | 195.19 | 193.99 | 1.006x | 1.032x |
+| 32 | 276.11 | 277.60 | **0.995x** | 1.027x |
+| 64 | 382.05 | (2 of 3 reps, ~355) | — | 1.070x |
+| 128 | 469.03 | (never ran — box wedged) | — | 1.333x |
+
+**C=32 inverted, and C=16 narrowed. Both are UNCONFIRMED and must not be treated as a
+regression yet.** The reason is the wedge itself: C=16 and C=32 were measured on a box that
+became unresponsive roughly twenty minutes later, so the memory pressure that eventually took
+it down was plausibly already building while those rungs ran. A measurement taken on the
+approach to a hard failure is not a measurement of steady state.
+
+What argues it might still be real: the drop is NOT symmetric. Against certified absolutes
+Atlas fell 5.1% at C=32 while vLLM fell only 2.1%, and C=1/2/4 got WIDER on the same sweep
+rather than uniformly worse. A pure box-slowness story predicts both engines falling together
+at every rung, which is what C=8 showed (both ~2.2% down, ratio held to 0.1%) and what these
+two rungs did not.
+
+**RESOLVED — it cannot be a code regression, and the proof is a diff, not a GPU hour.**
+The certified ladder stack tip is `1575873582`; the sweep ran on merged main `529fcb04fa`.
+Diffing the two across `crates/` and `kernels/`:
+
+| area | changed | executable? |
+|---|---|---|
+| `kernels/**/*.cu,*.cuh,*.h` | **0 files** | — |
+| `crates/spark-model/**` | 2 files | **0 non-comment lines** (rustdoc link fixes) |
+| `crates/spark-runtime/**` | 0 files | — |
+| `crates/spark-server/{cli,tui}` | 3 files | benchmark CLI/TUI wiring only |
+| `crates/atlas-plugin/**` | 34 files | benchmark harness (#569, #581) |
+| `kernels/gb10/*/BENCH.toml` | 3 files | thresholds, not kernels |
+
+The engine binary is **functionally identical** between the certified stack and merged main —
+the only `spark-model` changes are two doc-comment link fixes with zero non-comment lines.
+So the merges cannot have moved C=16 or C=32, and the pre-wedge box state is the remaining
+explanation, consistent with those two rungs being the ones measured closest to the failure.
+
+**Still worth doing when a healthy box is free:** re-measure C=16 and C=32 alone, in their own
+serve, to confirm they return to their certified ratios. That is now a confirmation step
+rather than a regression hunt. Until it exists this file's certified table stands on its own
+gate records, and no fresh "wins at every rung" claim should be made from the aborted sweep.
+
+★ **Operational hazard, recorded so it is not rediscovered:** vLLM+MTP at C=128 on GB10 can
+take the whole machine down even at the "safe" `--gpu-memory-utilization 0.85`. GB10 memory
+is unified, and MTP verification widens the working set exactly where the batch is widest.
+The warning was already in this file: vLLM's certified C=128 (358.57) is BELOW its own C=64
+(361.39) — an engine going backwards at its widest rung is one already struggling there.
+Atlas never pays this because its speculation self-disables above 32 concurrent sequences,
+which is also why it wins C=128 by 1.333x. Next time: run C=128 in its own serve, drop util
+to 0.75-0.80 for that rung, and write raw JSON under `/home/claude` rather than `/tmp`.
+
 ### Round 11 complete — the full ladder, independently reproduced
 
 | C | round 11 | round 10 | vLLM+MTP | ratio |
 |---:|---:|---:|---:|---:|
 | 1 | 23.59 | 23.50 | 19.72 | **1.196x** |
-| 2 | (r8) 38.95 | 38.95 | 38.79 | **1.004x** |
+| 2 | **41.02** (2026-08-18, dgx2) | 38.95 | 37.11 same-day / 38.79 r8 | **1.105x** |
 | 4 | **74.21** | 71.95 | 71.61 | **1.036x** |
-| 8 | **125.95** | 125.47 | 124.48 | **1.012x** |
+| 8 | **125.95** (repro 123.22 vs 121.64 same-day) | 125.47 | 124.48 | **1.012x** (repro 1.013x) |
 | 16 | 203.36 | 202.93 | 197.03 | **1.032x** |
 | 32 | 291.01 | 291.17 | 283.48 | **1.027x** |
 | 64 | 386.63 | 387.10 | 361.39 | **1.070x** |
