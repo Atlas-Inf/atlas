@@ -222,7 +222,7 @@ pub fn verify_pick_with_pipeline(
     // 4. Argmax over the (now-masked-and-penalised) vector. Matches the
     //    sampler's argmax branch behaviour.
     let t_argmax = std::time::Instant::now();
-    let best_id = argmax::argmax_first_wins(&f32_logits);
+    let best_id = argmax::argmax_last_wins(&f32_logits);
     ctx.timing.record(Phase::Argmax, t_argmax);
     best_id
 }

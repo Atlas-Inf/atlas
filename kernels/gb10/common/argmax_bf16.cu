@@ -11,16 +11,16 @@
 
 #include <cuda_bf16.h>
 
-// Global greedy contract: maximize value, then minimize vocabulary index.
-// A tree that merely keeps the lower CUDA lane on equal values is wrong:
-// lane = vocab_id % blockDim, so IDs 1023 and 1024 live in lanes 1023 and 0.
+// Global greedy contract: maximize value, then maximize vocabulary index.
+// This matches Rust's historical `Iterator::max_by` behavior, which returns
+// the last element among equal maxima. CUDA lane order is not vocabulary order.
 __device__ __forceinline__ bool argmax_other_better(
     float other,
     unsigned int other_idx,
     float mine,
     unsigned int mine_idx
 ) {
-    return other > mine || (other == mine && other_idx < mine_idx);
+    return other > mine || (other == mine && other_idx > mine_idx);
 }
 
 extern "C" __global__ void argmax_bf16(
@@ -40,7 +40,7 @@ extern "C" __global__ void argmax_bf16(
 
     for (unsigned int i = tid; i < n; i += stride) {
         float v = __bfloat162float(logits[i]);
-        if (v > local_max) {
+        if (argmax_other_better(v, i, local_max, local_idx)) {
             local_max = v;
             local_idx = i;
         }
@@ -75,9 +75,9 @@ extern "C" __global__ void argmax_bf16(
 // and measured 100.6 us to reduce 248320 bf16 = 497 KB (~5 GB/s). At n=16 that is
 // 16 serial launches = 1.6 ms per decode step.
 //
-// Each block here runs the IDENTICAL per-row body: a strided scan keeping the first
-// strict max, then the same tree reduction preferring the lower tid. Ties therefore
-// resolve to the same index as n sequential calls — byte-identical by construction.
+// Each block runs the identical per-row comparator in both the strided scan and
+// tree merge: value descending, vocabulary index descending on ties. This is
+// byte-identical to the host temperature-zero sampler's historical max_by rule.
 extern "C" __global__ void argmax_bf16_batch(
     const __nv_bfloat16* __restrict__ logits,
     unsigned int* __restrict__ out,
@@ -98,7 +98,7 @@ extern "C" __global__ void argmax_bf16_batch(
     unsigned int local_idx = 0;
     for (unsigned int i = tid; i < n; i += stride) {
         float v = __bfloat162float(row_logits[i]);
-        if (v > local_max) {
+        if (argmax_other_better(v, i, local_max, local_idx)) {
             local_max = v;
             local_idx = i;
         }
@@ -126,8 +126,8 @@ extern "C" __global__ void argmax_bf16_batch(
 
 // BATCHED argmax + top-1 LOG-PROBABILITY over BF16 logits — one block per row.
 //
-// Identical index semantics to `argmax_bf16_batch` (same strided first-strict-max
-// scan, same lower-tid-preferring tree reduction), plus `out_logprob[row] =
+// Identical index semantics to `argmax_bf16_batch` (same value-desc/index-desc
+// comparator in local scan and tree merge), plus `out_logprob[row] =
 // log softmax(logits)[argmax]` computed by ONLINE softmax in the SAME pass — no
 // second read of the row, so the kernel costs what the plain batched argmax costs.
 //
@@ -162,7 +162,7 @@ extern "C" __global__ void argmax_bf16_batch_lp(
     float local_sum = 0.0f;
     for (unsigned int i = tid; i < n; i += stride) {
         float v = __bfloat162float(row_logits[i]);
-        if (v > local_max) {
+        if (argmax_other_better(v, i, local_max, local_idx)) {
             // Rescale the running sum to the new max, then add this element.
             local_sum = local_sum * __expf(local_max - v) + 1.0f;
             local_max = v;
@@ -220,7 +220,7 @@ extern "C" __global__ void argmax_fp32(
     unsigned int local_idx = 0;
     for (unsigned int i = tid; i < n; i += stride) {
         float v = logits[i];
-        if (v > local_max) { local_max = v; local_idx = i; }
+        if (argmax_other_better(v, i, local_max, local_idx)) { local_max = v; local_idx = i; }
     }
     s_val[tid] = local_max;
     s_idx[tid] = local_idx;

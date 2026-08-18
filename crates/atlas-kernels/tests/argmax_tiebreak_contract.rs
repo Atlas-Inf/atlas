@@ -10,34 +10,38 @@ fn source() -> String {
 }
 
 #[test]
-fn every_cuda_argmax_reduction_compares_value_then_vocab_index() {
+fn every_cuda_argmax_reduction_matches_last_index_greedy_contract() {
     let src = source();
     assert!(
         src.contains("argmax_other_better"),
-        "CUDA argmax needs one value-desc/index-asc comparator"
+        "CUDA argmax needs one value-desc/index-desc comparator"
     );
     let calls = src.matches("argmax_other_better(").count();
-    // One definition plus BF16 single, BF16 batch, BF16 batch+logprob, FP32.
-    assert_eq!(calls, 5, "all four reductions must use the comparator");
+    // One definition plus local scan and tree merge in each of BF16 single,
+    // BF16 batch, BF16 batch+logprob, and FP32.
+    assert_eq!(
+        calls, 9,
+        "all four scans and reductions must use the comparator"
+    );
     assert!(
-        src.contains("other_idx < mine_idx"),
-        "equal BF16/FP32 maxima must select the lower vocabulary index"
+        src.contains("other_idx > mine_idx"),
+        "equal BF16/FP32 maxima must select the higher vocabulary index"
     );
 }
 
 #[test]
-fn cross_stride_tie_proves_lower_thread_id_is_not_first_vocab_id() {
+fn cross_stride_tie_proves_lane_order_is_not_last_vocab_id() {
     const BLOCK: u32 = 1024;
-    let first_vocab_id = 1023u32;
-    let later_vocab_id = 1024u32;
+    let first_vocab_id = 1024u32;
+    let later_vocab_id = 2047u32;
     assert!(first_vocab_id < later_vocab_id);
     assert!(
-        later_vocab_id % BLOCK < first_vocab_id % BLOCK,
-        "fixture must make the later vocab ID live in the lower CUDA lane"
+        later_vocab_id % BLOCK > first_vocab_id % BLOCK,
+        "fixture must make the later vocab ID live in the higher CUDA lane"
     );
     let better = |other_val: f32, other_idx: u32, mine_val: f32, mine_idx: u32| {
-        other_val > mine_val || (other_val == mine_val && other_idx < mine_idx)
+        other_val > mine_val || (other_val == mine_val && other_idx > mine_idx)
     };
-    assert!(better(7.0, first_vocab_id, 7.0, later_vocab_id));
-    assert!(!better(7.0, later_vocab_id, 7.0, first_vocab_id));
+    assert!(better(7.0, later_vocab_id, 7.0, first_vocab_id));
+    assert!(!better(7.0, first_vocab_id, 7.0, later_vocab_id));
 }

@@ -458,7 +458,9 @@ pub fn apply_penalties_and_bias(
 }
 
 mod sample_impl;
-pub use sample_impl::{sample_with_params_history, sample_with_params_seeded};
+pub use sample_impl::{
+    argmax_last_wins_f32, sample_with_params_history, sample_with_params_seeded,
+};
 
 /// Convenience wrapper: sample without token history (no repetition penalty).
 pub fn sample_with_params(data: &[u8], params: &SamplingParams) -> u32 {
