@@ -66,6 +66,15 @@ export ATLAS_MTP_GATE_REPROBE=64  # re-probe the MTP accept gate every 64 tokens
 GPU_UTIL="${GPU_UTIL:-0.86}"
 SSM_SLOTS="${SSM_SLOTS:-8}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-16384}"
+# The kernel target now ships a vision_encoder, so the ~2.1 GB vision tower is
+# loaded for every serve whether or not you send an image — it is part of the
+# checkpoint. That does not fit alongside the default 8192-token prefill arena
+# (3.63 GB); 2048 brings the arena to ~0.99 GB and buys back more than the
+# tower costs. Measured on a 512-token single-stream run, this costs nothing:
+# TTFT 817-1679 ms / decode 13.3-15.0 tok/s, the same range as the 8192 arena.
+# Long prompts chunk more finely, so raise it if you have headroom and long
+# inputs.
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-2048}"
 # Atlas sizes its KV budget against the 60 GB the driver reports, not the ~55 GB
 # the kernel will actually hand over. This tells it to hold 6 GB back.
 export ATLAS_KV_EXTERNAL_RESERVE_GB="${ATLAS_KV_EXTERNAL_RESERVE_GB:-6}"
@@ -119,6 +128,7 @@ echo "serving $MODEL on $(/opt/rocm/bin/rocminfo 2>/dev/null | grep -m1 -o gfx[0
 exec target/release/spark serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
+  --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --max-batch-size "${MAX_BATCH:-1}" \
   --speculative --num-drafts "${NUM_DRAFTS:-2}" \
