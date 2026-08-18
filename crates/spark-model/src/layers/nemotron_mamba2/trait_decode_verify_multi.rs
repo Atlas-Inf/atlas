@@ -221,9 +221,7 @@ impl NemotronMamba2Layer {
                 (DevicePtr::NULL, 0u32)
             };
             let use_fused = self.mamba2_ssm_verify_k.0 != 0
-                && (!ctx.levers.lightning_mamba_exact_recurrence
-                    || std::env::var("ATLAS_LIGHTNING_MAMBA_FUSED_RECURRENCE").as_deref()
-                        == Ok("1"))
+                && !ctx.levers.lightning_mamba_exact_recurrence
                 && std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err();
             if use_fused {
                 ops::mamba2_ssm_verify(
