@@ -12,6 +12,10 @@ use super::NemotronMamba2Layer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+fn use_lightning_scalar_in_proj(enabled: bool, rows: u32) -> bool {
+    enabled && rows <= 16
+}
+
 impl NemotronMamba2Layer {
     /// in_proj GEMM: `[N, h] × [h, in_proj_size] → [N, in_proj_size]`.
     ///
@@ -60,7 +64,21 @@ impl NemotronMamba2Layer {
             .as_ref()
             .filter(|_| self.native_fp8_prefill)
         {
-            if n <= 16 {
+            if use_lightning_scalar_in_proj(ctx.levers.lightning_mamba_scalar_in_proj, n) {
+                for t in 0..n as usize {
+                    ops::w8a16_gemv(
+                        ctx.gpu,
+                        self.w8a16_gemv_k,
+                        normed.offset(t * h * 2),
+                        fp8w.weight,
+                        fp8w.row_scale,
+                        proj.offset(t * self.in_proj_size * 2),
+                        self.in_proj_size as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                }
+            } else if n <= 16 {
                 let k = if n <= 4 {
                     self.w8a16_gemv_batch4_k
                 } else {
@@ -464,5 +482,19 @@ impl NemotronMamba2Layer {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_lightning_scalar_in_proj;
+
+    #[test]
+    fn lightning_scalar_projection_is_bounded_to_verify_widths() {
+        assert!(use_lightning_scalar_in_proj(true, 1));
+        assert!(use_lightning_scalar_in_proj(true, 4));
+        assert!(use_lightning_scalar_in_proj(true, 16));
+        assert!(!use_lightning_scalar_in_proj(true, 17));
+        assert!(!use_lightning_scalar_in_proj(false, 4));
     }
 }

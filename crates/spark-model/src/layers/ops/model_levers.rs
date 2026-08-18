@@ -58,6 +58,12 @@ pub struct ModelLevers {
     // ── Attention ──
     /// Contiguous-attention path for the DFlash head.
     pub dflash_contig_attn: bool,
+    /// Official Lightning product: preserve sequential Mamba recurrence during
+    /// K-row verify while retaining batched projection staging.
+    pub lightning_mamba_exact_recurrence: bool,
+    /// Official Lightning product: use the scalar W8A16 input projection per
+    /// verify row. The existing batch4 kernel is not byte-identical at K=4.
+    pub lightning_mamba_scalar_in_proj: bool,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -139,6 +145,9 @@ impl ModelLevers {
             holo_moe_gateup_fp4: opt_in_truthy("ATLAS_HOLO_MOE_GATEUP_FP4"),
             moe_union_stats: opt_in("ATLAS_MOE_UNION_STATS"),
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
+            // Armed only by the admitted product installer, never environment.
+            lightning_mamba_exact_recurrence: false,
+            lightning_mamba_scalar_in_proj: false,
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),

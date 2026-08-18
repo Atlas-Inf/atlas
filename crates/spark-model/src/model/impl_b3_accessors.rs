@@ -40,12 +40,15 @@ pub(super) fn install_lightning_proposer(
     structural: LightningStructuralGraphState,
     proposer_slot: &mut Option<std::sync::Arc<dyn DraftProposer>>,
     identity: &mut crate::layers::dflash_head::LightningDsparkIdentityLatch,
+    levers: &mut crate::layers::ops::ModelLevers,
     proposer: std::sync::Arc<dyn DraftProposer>,
     policy: LightningDsparkProductPolicy,
 ) -> anyhow::Result<()> {
     crate::layers::dflash_head::enforce_lightning_structural_gate(structural)
         .map_err(anyhow::Error::from)?;
     *proposer_slot = Some(proposer);
+    levers.lightning_mamba_exact_recurrence = true;
+    levers.lightning_mamba_scalar_in_proj = true;
     identity.install_lightning(policy);
     Ok(())
 }
@@ -79,6 +82,8 @@ impl TransformerModel {
             tracing::info!("DFlash: replacing existing MTP proposer with BlockDiffusionDraftHead");
         }
         self.proposer = Some(proposer);
+        self.levers.lightning_mamba_exact_recurrence = false;
+        self.levers.lightning_mamba_scalar_in_proj = false;
         self.lightning_dspark_identity.install_generic();
     }
 
@@ -104,6 +109,7 @@ impl TransformerModel {
             structural,
             &mut self.proposer,
             &mut self.lightning_dspark_identity,
+            &mut self.levers,
             proposer,
             policy,
         )
@@ -141,6 +147,7 @@ mod identity_transition_tests {
     /// delegates its entire body to.
     struct SetterHarness {
         lightning_dspark_identity: crate::layers::dflash_head::LightningDsparkIdentityLatch,
+        levers: crate::layers::ops::ModelLevers,
         proposer_slot: Option<std::sync::Arc<dyn DraftProposer>>,
         suppress_graphs: std::sync::atomic::AtomicBool,
         lora: Option<()>,
@@ -203,6 +210,7 @@ mod identity_transition_tests {
         fn new() -> Self {
             Self {
                 lightning_dspark_identity: Default::default(),
+                levers: crate::layers::ops::ModelLevers::defaults(),
                 proposer_slot: None,
                 suppress_graphs: std::sync::atomic::AtomicBool::new(false),
                 lora: None,
@@ -225,6 +233,7 @@ mod identity_transition_tests {
                 structural,
                 &mut self.proposer_slot,
                 &mut self.lightning_dspark_identity,
+                &mut self.levers,
                 std::sync::Arc::new(NoopProposer),
                 policy,
             )
@@ -232,6 +241,8 @@ mod identity_transition_tests {
 
         fn set_generic(&mut self) {
             self.proposer_slot = None;
+            self.levers.lightning_mamba_exact_recurrence = false;
+            self.levers.lightning_mamba_scalar_in_proj = false;
             self.lightning_dspark_identity.install_generic();
         }
 
@@ -275,8 +286,12 @@ mod identity_transition_tests {
             .set_lightning(admitted_policy())
             .expect("structural graph state allows product install");
         assert!(harness.is_product(), "Lightning setter installs identity");
+        assert!(harness.levers.lightning_mamba_exact_recurrence);
+        assert!(harness.levers.lightning_mamba_scalar_in_proj);
 
         harness.set_generic();
+        assert!(!harness.levers.lightning_mamba_exact_recurrence);
+        assert!(!harness.levers.lightning_mamba_scalar_in_proj);
         assert!(
             !harness.is_product(),
             "generic setter clears stale Lightning identity"

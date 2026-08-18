@@ -11,6 +11,14 @@ use super::NemotronMamba2Layer;
 use crate::layer::{ForwardContext, LayerState, SsmLayerState};
 use crate::layers::ops;
 
+fn use_fused_mamba_verify(
+    kernel_available: bool,
+    lightning_exact: bool,
+    fused_not_disabled: bool,
+) -> bool {
+    kernel_available && !lightning_exact && fused_not_disabled
+}
+
 impl NemotronMamba2Layer {
     pub(super) fn decode_batched_verify(
         &self,
@@ -95,8 +103,11 @@ impl NemotronMamba2Layer {
             (DevicePtr::NULL, 0u32)
         };
 
-        let use_fused = self.mamba2_ssm_verify_k.0 != 0
-            && std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err();
+        let use_fused = use_fused_mamba_verify(
+            self.mamba2_ssm_verify_k.0 != 0,
+            ctx.levers.lightning_mamba_exact_recurrence,
+            std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err(),
+        );
         if std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1") {
             tracing::info!(
                 "mamba2_ssm_verify handle={} fused={}",
@@ -187,5 +198,18 @@ impl NemotronMamba2Layer {
             stream,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_fused_mamba_verify;
+
+    #[test]
+    fn lightning_product_refuses_fused_recurrence() {
+        assert!(!use_fused_mamba_verify(true, true, true));
+        assert!(use_fused_mamba_verify(true, false, true));
+        assert!(!use_fused_mamba_verify(false, false, true));
+        assert!(!use_fused_mamba_verify(true, false, false));
     }
 }
