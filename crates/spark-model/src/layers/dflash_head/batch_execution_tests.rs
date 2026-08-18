@@ -187,6 +187,8 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
     assert!(source.contains("DFlash Bxgamma parity mismatch"));
     assert!(source.contains("self.startup.native_batch_authoritative"));
     assert!(source.contains("self.prepare_drafts_state"));
+    assert!(source.contains("ATLAS_LIGHTNING_DSPARK_PREP_TIMING"));
+    assert!(source.contains("LIGHTNING DSPARK PREP sequence={i} width={n}"));
     assert!(source.contains("dstate.last_num_drafted = tokens.len()"));
     assert!(source.contains("if self.startup.diagnostics.batch_parity"));
     assert!(source.contains("self.batch_capacity"));

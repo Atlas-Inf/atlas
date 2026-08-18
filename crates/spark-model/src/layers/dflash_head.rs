@@ -928,7 +928,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
             (None, None)
         };
         if native_authoritative && parity_oracle.is_none() {
+            let prep_timing =
+                std::env::var("ATLAS_LIGHTNING_DSPARK_PREP_TIMING").as_deref() == Ok("1");
             for i in 0..n {
+                if prep_timing {
+                    ctx.gpu.synchronize(stream)?;
+                }
+                let prep_started = std::time::Instant::now();
                 self.prepare_drafts_state(
                     last_tokens[i],
                     target_hiddens[i],
@@ -940,6 +946,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     stream,
                     target_hiddens[i],
                 )?;
+                if prep_timing {
+                    ctx.gpu.synchronize(stream)?;
+                    tracing::info!(
+                        "LIGHTNING DSPARK PREP sequence={i} width={n} ms={:.3}",
+                        prep_started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
         }
 
