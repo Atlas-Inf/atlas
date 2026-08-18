@@ -45,4 +45,13 @@ mod tests {
         assert!(body.contains("w4a16_gemv_batch32_k"));
         assert!(body.contains("moe_expert_gemv_wide("));
     }
+
+    #[test]
+    fn marlin_up_only_returns_to_exact_wide_down() {
+        let source = include_str!("nemotron_moe/marlin_slots.rs");
+        assert!(source.contains("ATLAS_MOE_MARLIN_UP_ONLY"));
+        assert!(source.contains("marlin_scatter_slots"));
+        assert!(source.contains("self.down_ptrs.packed_ptrs"));
+        assert!(source.contains("ops::moe_expert_gemv_wide"));
+    }
 }
