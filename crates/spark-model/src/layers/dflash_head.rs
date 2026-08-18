@@ -542,6 +542,10 @@ pub struct BlockDiffusionDraftHead {
     pub batch_kv_lens: DevicePtr,
     pub batch_slot_mapping: DevicePtr,
     pub batch_attn_out: DevicePtr,
+    pub batch_attn_proj: DevicePtr,
+    pub batch_mlp_gate: DevicePtr,
+    pub batch_mlp_up: DevicePtr,
+    pub batch_mlp_down: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -1050,9 +1054,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 self.num_kv_heads * self.head_dim,
             ),
         ] {
-            crate::layers::ops::dense_gemm(
+            crate::layers::ops::dense_gemm_bf16_pipelined(
                 ctx.gpu,
-                self.kernels.dense_gemm,
+                self.kernels.dense_gemm_pipelined,
                 self.batch_norm,
                 weight,
                 output,
@@ -1161,6 +1165,92 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 self.attn_sliding_window(),
                 1.0 / (self.head_dim as f32).sqrt(),
                 sinks.weight,
+                stream,
+            )?;
+            let hidden = u32::try_from(self.hidden_size)
+                .map_err(|_| anyhow::anyhow!("DFlash hidden width exceeds u32"))?;
+            let q_dim = u32::try_from(self.num_q_heads * self.head_dim)
+                .map_err(|_| anyhow::anyhow!("DFlash q width exceeds u32"))?;
+            let intermediate = u32::try_from(self.intermediate_size)
+                .map_err(|_| anyhow::anyhow!("DFlash MLP width exceeds u32"))?;
+            let hidden_elements = batch_rows
+                .checked_mul(hidden)
+                .ok_or_else(|| anyhow::anyhow!("DFlash batch hidden elements overflow"))?;
+            let mlp_elements = batch_rows
+                .checked_mul(intermediate)
+                .ok_or_else(|| anyhow::anyhow!("DFlash batch MLP elements overflow"))?;
+            crate::layers::ops::dense_gemm_bf16_pipelined(
+                ctx.gpu,
+                self.kernels.dense_gemm_pipelined,
+                self.batch_attn_out,
+                &layer0.o_proj,
+                self.batch_attn_proj,
+                batch_rows,
+                hidden,
+                q_dim,
+                stream,
+            )?;
+            crate::layers::ops::residual_add(
+                ctx.gpu,
+                self.kernels.residual_add,
+                self.batch_query_embed,
+                self.batch_attn_proj,
+                hidden_elements,
+                stream,
+            )?;
+            crate::layers::ops::rms_norm(
+                ctx.gpu,
+                self.kernels.rms_norm,
+                self.batch_query_embed,
+                &layer0.post_attention_layernorm,
+                self.batch_norm,
+                batch_rows,
+                hidden,
+                self.rms_norm_eps,
+                stream,
+            )?;
+            for (weight, output) in [
+                (&layer0.gate_proj, self.batch_mlp_gate),
+                (&layer0.up_proj, self.batch_mlp_up),
+            ] {
+                crate::layers::ops::dense_gemm_bf16_pipelined(
+                    ctx.gpu,
+                    self.kernels.dense_gemm_pipelined,
+                    self.batch_norm,
+                    weight,
+                    output,
+                    batch_rows,
+                    intermediate,
+                    hidden,
+                    stream,
+                )?;
+            }
+            crate::layers::ops::silu_mul(
+                ctx.gpu,
+                self.kernels.silu_mul,
+                self.batch_mlp_gate,
+                self.batch_mlp_up,
+                self.batch_mlp_gate,
+                mlp_elements,
+                stream,
+            )?;
+            crate::layers::ops::dense_gemm_bf16_pipelined(
+                ctx.gpu,
+                self.kernels.dense_gemm_pipelined,
+                self.batch_mlp_gate,
+                &layer0.down_proj,
+                self.batch_mlp_down,
+                batch_rows,
+                hidden,
+                intermediate,
+                stream,
+            )?;
+            crate::layers::ops::residual_add(
+                ctx.gpu,
+                self.kernels.residual_add,
+                self.batch_query_embed,
+                self.batch_mlp_down,
+                hidden_elements,
                 stream,
             )?;
         }

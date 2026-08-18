@@ -383,6 +383,7 @@ impl BlockDiffusionDraftHead {
         let batch_norm_bytes = batch_tensor_bytes(hidden_size, "batch norm")?;
         let batch_q_bytes = batch_tensor_bytes(q_dim, "batch q")?;
         let batch_kv_bytes = batch_tensor_bytes(kv_dim, "batch kv")?;
+        let batch_mlp_bytes = batch_tensor_bytes(intermediate_size, "batch mlp")?;
         let batch_norm = gpu.alloc(batch_norm_bytes)?;
         let batch_q = gpu.alloc(batch_q_bytes)?;
         let batch_k = gpu.alloc(batch_kv_bytes)?;
@@ -392,6 +393,10 @@ impl BlockDiffusionDraftHead {
         let batch_kv_lens = gpu.alloc(batch_capacity * 4)?;
         let batch_slot_mapping = gpu.alloc(batch_rows * 8)?;
         let batch_attn_out = gpu.alloc(batch_q_bytes)?;
+        let batch_attn_proj = gpu.alloc(batch_norm_bytes)?;
+        let batch_mlp_gate = gpu.alloc(batch_mlp_bytes)?;
+        let batch_mlp_up = gpu.alloc(batch_mlp_bytes)?;
+        let batch_mlp_down = gpu.alloc(batch_norm_bytes)?;
         gpu.memset(batch_query_ids_dev, 0, batch_rows * 4)?;
         gpu.memset(batch_position_ids, 0, batch_rows * 4)?;
         gpu.memset(batch_query_embed, 0, batch_rows * hidden_size * bf16)?;
@@ -407,6 +412,10 @@ impl BlockDiffusionDraftHead {
         gpu.memset(batch_kv_lens, 0, batch_capacity * 4)?;
         gpu.memset(batch_slot_mapping, 0, batch_rows * 8)?;
         gpu.memset(batch_attn_out, 0, batch_q_bytes)?;
+        gpu.memset(batch_attn_proj, 0, batch_norm_bytes)?;
+        gpu.memset(batch_mlp_gate, 0, batch_mlp_bytes)?;
+        gpu.memset(batch_mlp_up, 0, batch_mlp_bytes)?;
+        gpu.memset(batch_mlp_down, 0, batch_norm_bytes)?;
 
         // Extra propose lanes: `proposal_lane_count` total lanes
         // (default 1). Each extra lane gets its own stream, scratch set,
@@ -672,6 +681,10 @@ impl BlockDiffusionDraftHead {
             batch_kv_lens,
             batch_slot_mapping,
             batch_attn_out,
+            batch_attn_proj,
+            batch_mlp_gate,
+            batch_mlp_up,
+            batch_mlp_down,
             extra_lanes,
             kernels,
             max_seq_len,
