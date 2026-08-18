@@ -262,7 +262,13 @@ pub fn verify_pick_all_with_pipeline(
     // pipeline provably cannot change any pick, so the raw argmax IS the
     // masked pick and the [K, vocab] D2H is skipped entirely. Any
     // ineligible position falls through to the slow path for the call.
-    if let Some(picks) = fast_masked::try_chat_fast_path(model, argmax_ids, a, ctx, row_base) {
+    let masked_verify = fast_masked::masked_verify_required(
+        ctx.sampling.dflash_masked_verify,
+        model.is_lightning_dspark_product(),
+    );
+    if let Some(picks) =
+        fast_masked::try_chat_fast_path(model, argmax_ids, a, ctx, row_base, masked_verify)
+    {
         return picks;
     }
 
@@ -422,7 +428,8 @@ pub fn verify_pick_all_with_pipeline(
     // tie-breaking near equal logits can differ from the host FP32 scan, so
     // emitted tokens are NOT byte-invariant vs the slow path at near-ties.
     // Kill switch: ATLAS_NO_FAST_GREEDY_CHAT=1 restores the slow path.
-    let chat_fast_gate = if ctx.sampling.fast_greedy_chat
+    let chat_fast_gate = if !masked_verify
+        && ctx.sampling.fast_greedy_chat
         && a.grammar_state.is_none()
         && !a.inside_thinking
         && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
