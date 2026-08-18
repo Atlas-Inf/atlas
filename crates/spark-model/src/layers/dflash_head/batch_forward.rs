@@ -311,22 +311,26 @@ impl BlockDiffusionDraftHead {
             let kernel = match batch_rows {
                 1..=4 => self.kernels.w4a16_gemv_batch4,
                 5..=8 => self.kernels.w4a16_gemv_batch8,
-                9..=16 => self.kernels.w4a16_gemv_batch16,
-                17..=32 => self.kernels.w4a16_gemv_batch32,
+                9..=32 => self.kernels.w4a16_gemv_batch16,
                 _ => spark_runtime::gpu::KernelHandle(0),
             };
             if kernel.0 != 0 {
-                crate::layers::ops::w4a16_gemv_batchm(
-                    ctx.gpu,
-                    kernel,
-                    self.batch_norm,
-                    nvfp4,
-                    self.batch_logits,
-                    batch_rows,
-                    vocab,
-                    hidden,
-                    stream,
-                )?;
+                let mut row = 0u32;
+                while row < batch_rows {
+                    let rows = (batch_rows - row).min(16);
+                    crate::layers::ops::w4a16_gemv_batchm(
+                        ctx.gpu,
+                        kernel,
+                        self.batch_norm.offset(row as usize * hidden as usize * 2),
+                        nvfp4,
+                        self.batch_logits.offset(row as usize * vocab as usize * 2),
+                        rows,
+                        vocab,
+                        hidden,
+                        stream,
+                    )?;
+                    row += rows;
+                }
             } else {
                 anyhow::ensure!(
                     self.kernels.w4a16_gemm.0 != 0,
