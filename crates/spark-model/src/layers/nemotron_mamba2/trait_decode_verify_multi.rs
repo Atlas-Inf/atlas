@@ -220,13 +220,20 @@ impl NemotronMamba2Layer {
             } else {
                 (DevicePtr::NULL, 0u32)
             };
+            let use_exact_persistent = self.mamba2_ssm_verify_exact_k.0 != 0
+                && ctx.levers.lightning_mamba_exact_recurrence
+                && std::env::var("ATLAS_LIGHTNING_MAMBA_EXACT_PERSISTENT").as_deref() == Ok("1");
             let use_fused = self.mamba2_ssm_verify_k.0 != 0
                 && !ctx.levers.lightning_mamba_exact_recurrence
                 && std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err();
-            if use_fused {
+            if use_exact_persistent || use_fused {
                 ops::mamba2_ssm_verify(
                     ctx.gpu,
-                    self.mamba2_ssm_verify_k,
+                    if use_exact_persistent {
+                        self.mamba2_ssm_verify_exact_k
+                    } else {
+                        self.mamba2_ssm_verify_k
+                    },
                     ssm_state.h_state,
                     x_ptr,
                     b_ptr,
@@ -251,6 +258,7 @@ impl NemotronMamba2Layer {
                     self.d_xbc as u32,
                     self.in_proj_size as u32,
                     self.d_inner as u32,
+                    use_exact_persistent,
                     stream,
                 )?;
             } else {

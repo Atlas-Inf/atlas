@@ -541,13 +541,26 @@ pub fn mamba2_ssm_verify(
     bc_stride: u32,
     dt_stride: u32,
     y_stride: u32,
+    exact_persistent: bool,
     stream: u64,
 ) -> Result<()> {
-    let smem = head_dim * (state_size + 1) * 4 + head_dim * 4 + state_size * 4 + state_size * 4;
+    let smem = if exact_persistent {
+        head_dim * (state_size + 1) * 4 + head_dim * 4 + 4 * head_dim * 4
+    } else {
+        head_dim * (state_size + 1) * 4 + head_dim * 4 + state_size * 4 + state_size * 4
+    };
     const SUB: u32 = 4;
     KernelLaunch::new(gpu, kernel)
         .grid([num_heads, batch_size, 1])
-        .block([head_dim * SUB, 1, 1])
+        .block([
+            if exact_persistent {
+                state_size
+            } else {
+                head_dim * SUB
+            },
+            1,
+            1,
+        ])
         .shared_mem(smem)
         .arg_ptr(h_state)
         .arg_ptr(x)

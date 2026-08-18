@@ -82,6 +82,7 @@ pub struct NemotronMamba2Layer {
     mamba2_ssm_prefill_k: KernelHandle,
     mamba2_ssm_prefill_persistent_k: KernelHandle,
     mamba2_ssm_verify_k: KernelHandle,
+    mamba2_ssm_verify_exact_k: KernelHandle,
     // SSD chunked prefill scan (tensor-core; ceil(T/64) serial links instead of T).
     ssd_cumsum_k: KernelHandle,
     ssd_bmm_k: KernelHandle,
@@ -165,6 +166,11 @@ impl NemotronMamba2Layer {
                 "mamba2_ssm_prefill_persistent",
             ),
             mamba2_ssm_verify_k: super::try_kernel(gpu, "mamba2_ssm", "mamba2_ssm_verify"),
+            mamba2_ssm_verify_exact_k: super::try_kernel(
+                gpu,
+                "mamba2_ssm",
+                "mamba2_ssm_verify_exact_persistent",
+            ),
             d_inner,
             d_xbc,
             in_proj_size,

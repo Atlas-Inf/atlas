@@ -60,6 +60,7 @@ mod tests {
         assert!(source.contains("if ctx.levers.lightning_mamba_exact_recurrence"));
         assert!(source.contains("ATLAS_LIGHTNING_MAMBA_EXACT_BATCHED"));
         assert!(source.contains("ATLAS_LIGHTNING_MAMBA_BATCH_OUT"));
+        assert!(source.contains("ATLAS_LIGHTNING_MAMBA_EXACT_PERSISTENT"));
         assert!(source.contains("(r_total - row).min(16)"));
         assert!(source.contains("decode_out_proj_exact"));
         assert!(source.contains("self.decode("));

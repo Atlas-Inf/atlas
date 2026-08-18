@@ -143,6 +143,7 @@ impl NemotronMamba2Layer {
                 self.d_xbc as u32,
                 self.in_proj_size as u32,
                 self.d_inner as u32,
+                false,
                 stream,
             )?;
         } else {
