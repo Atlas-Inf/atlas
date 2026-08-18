@@ -47,6 +47,7 @@ impl BlockDiffusionDraftHead {
             target_hidden_stack,
             false,
             false,
+            false,
         )
     }
 
@@ -62,6 +63,7 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         stream: u64,
         target_hidden_stack: DevicePtr,
+        defer_ctx_precompute: bool,
     ) -> Result<()> {
         let default_stream = ctx.gpu.default_stream();
         let (_, scratch, markov_embed, markov_bias) = self.lane(0, default_stream);
@@ -83,6 +85,7 @@ impl BlockDiffusionDraftHead {
             Some(target_hidden_stack),
             false,
             true,
+            defer_ctx_precompute,
         )?;
         Ok(())
     }
@@ -106,6 +109,7 @@ impl BlockDiffusionDraftHead {
         target_hidden_stack: Option<DevicePtr>,
         defer_readback: bool,
         prepare_only: bool,
+        defer_ctx_precompute: bool,
     ) -> Result<Vec<u32>> {
         let dstate = state
             .as_any_mut()
@@ -417,7 +421,7 @@ impl BlockDiffusionDraftHead {
                 dstate.ctx_committed.min(dstate.ctx_len)
             };
             let new_count = dstate.ctx_len - committed;
-            if dstate.ctx_len > 0 && new_count > 0 {
+            if dstate.ctx_len > 0 && new_count > 0 && !defer_ctx_precompute {
                 // Ctx-holes follow-up (2026-07-08): the precompute scratch
                 // (fc_proj / fused_kv_out / slot_mapping_dev) is sized for
                 // ctx_window rows. A serial-append stretch (think-gated /

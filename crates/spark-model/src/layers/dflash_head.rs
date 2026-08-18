@@ -927,6 +927,22 @@ impl DraftProposer for BlockDiffusionDraftHead {
         } else {
             (None, None)
         };
+        let batch_ctx_precompute = native_authoritative
+            && parity_oracle.is_none()
+            && n >= 2
+            && std::env::var("ATLAS_LIGHTNING_DSPARK_BATCH_PRECOMPUTE").as_deref() == Ok("1")
+            && !self.startup.diagnostics.no_decode_append
+            && !self.startup.diagnostics.full_precompute
+            && states.iter_mut().all(|state| {
+                state
+                    .as_any_mut()
+                    .downcast_mut::<DflashProposerState>()
+                    .is_some_and(|dstate| {
+                        !dstate.skip_next_decode_append
+                            && dstate.ctx_len < dstate.max_ctx_len
+                            && dstate.ctx_committed == dstate.ctx_len
+                    })
+            });
         if native_authoritative && parity_oracle.is_none() {
             let prep_timing =
                 std::env::var("ATLAS_LIGHTNING_DSPARK_PREP_TIMING").as_deref() == Ok("1");
@@ -945,6 +961,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     ctx,
                     stream,
                     target_hiddens[i],
+                    batch_ctx_precompute,
                 )?;
                 if prep_timing {
                     ctx.gpu.synchronize(stream)?;
@@ -989,6 +1006,65 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     .checked_add(self.gamma)
                     .ok_or_else(|| anyhow::anyhow!("DFlash batch KV length overflow"))?,
             );
+        }
+        if batch_ctx_precompute {
+            const BLOCK_SIZE: usize = 16;
+            let target_row_bytes = self
+                .target_layer_ids
+                .len()
+                .checked_mul(self.target_hidden_size)
+                .and_then(|elements| elements.checked_mul(2))
+                .ok_or_else(|| anyhow::anyhow!("DFlash batch target-hidden row overflow"))?;
+            let mut ctx_positions = Vec::with_capacity(n);
+            let mut ctx_slots = Vec::with_capacity(n);
+            for i in 0..n {
+                ctx.gpu.copy_d2d_async(
+                    target_hiddens[i],
+                    self.batch_target_hidden.offset(i * target_row_bytes),
+                    target_row_bytes,
+                    stream,
+                )?;
+                let logical = batch_ctx_counts[i]
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow::anyhow!("DFlash batch precompute has empty ctx"))?;
+                let block = *batch_block_tables[i]
+                    .get(logical / BLOCK_SIZE)
+                    .ok_or_else(|| anyhow::anyhow!("DFlash batch precompute block is missing"))?;
+                let slot = (block as usize)
+                    .checked_mul(BLOCK_SIZE)
+                    .and_then(|base| base.checked_add(logical % BLOCK_SIZE))
+                    .and_then(|slot| i32::try_from(slot).ok())
+                    .ok_or_else(|| anyhow::anyhow!("DFlash batch precompute slot overflow"))?;
+                ctx_slots.push(slot);
+                ctx_positions.push(
+                    i32::try_from(positions[i].saturating_sub(1))
+                        .map_err(|_| anyhow::anyhow!("DFlash batch ctx position overflow"))?,
+                );
+            }
+            let slot_bytes: Vec<u8> = ctx_slots
+                .iter()
+                .flat_map(|slot| slot.to_le_bytes())
+                .collect();
+            ctx.gpu
+                .copy_h2d_async(&slot_bytes, self.scratch.slot_mapping_dev, stream)?;
+            self.precompute_ctx_kv(
+                self.batch_target_hidden,
+                0,
+                n,
+                &ctx_positions,
+                self.scratch.slot_mapping_dev,
+                ctx,
+                stream,
+                true,
+                &self.scratch,
+            )?;
+            for state in states.iter_mut() {
+                let dstate = state
+                    .as_any_mut()
+                    .downcast_mut::<DflashProposerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+                dstate.ctx_committed = dstate.ctx_len;
+            }
         }
         let batch_slot_mapping = batch_execution::paged_slot_mapping(
             &batch_block_tables,
@@ -1318,6 +1394,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 None,
                 Some(target_hiddens[i]),
                 true,
+                false,
                 false,
             )?;
         }
