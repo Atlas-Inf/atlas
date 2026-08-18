@@ -55,6 +55,17 @@ mod tests {
     }
 
     #[test]
+    fn layer_trace_covers_literal_m1_and_k4_without_graph_capture() {
+        let trace = include_str!("../model/trait_impl/verify_layer_trace.rs");
+        let m1 = include_str!("../model/trait_impl/decode_a3.rs");
+        let k4 = include_str!("../model/trait_impl/verify_d.rs");
+        assert!(trace.contains("ATLAS_LIGHTNING_VERIFY_LAYER_TRACE"));
+        assert!(m1.contains("trace_lightning_hidden_rows(\"m1\""));
+        assert!(k4.contains("\"k4\""));
+        assert!(k4.contains("!super::verify_layer_trace::enabled()"));
+    }
+
+    #[test]
     fn literal_m1_oracle_preserves_every_logits_row_for_scheduler_processing() {
         let source = include_str!("../model/trait_impl/verify_d_serial.rs");
         assert!(source.contains("logits_base.offset((t + 1) * logits_row_bytes)"));

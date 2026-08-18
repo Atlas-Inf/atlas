@@ -231,7 +231,8 @@ impl TransformerModel {
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         // Diagnostic: force eager single-seq decode (graph-vs-eager A/B,
         // and to localize 716s inside captured graphs with LAUNCH_BLOCKING).
-        let no_decode_graphs = std::env::var("ATLAS_NO_DECODE_GRAPHS").is_ok_and(|v| v == "1");
+        let no_decode_graphs = std::env::var("ATLAS_NO_DECODE_GRAPHS").is_ok_and(|v| v == "1")
+            || super::verify_layer_trace::enabled();
         // G1 (2026-08-15): capturing the n=1 decode graph on a step whose
         // seq_len is an exact multiple of 64 (SSD_L) produces a graph whose
         // FIRST replay faults with 716/700 (misaligned address). Empirically

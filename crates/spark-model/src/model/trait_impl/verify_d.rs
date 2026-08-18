@@ -197,6 +197,7 @@ impl TransformerModel {
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
             && !force_eager
+            && !super::verify_layer_trace::enabled()
             && !lora_eager;
 
         let ctx = ForwardContext {
@@ -313,6 +314,7 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
+                self.trace_lightning_hidden_rows("k4", seq.seq_len, layer_idx, hidden, k, stream)?;
                 // DFlash intermediate hidden capture: snapshot each capture
                 // layer's output at position k-1 (last verify token) into
                 // dflash_hidden_save[slot] while hidden_states still holds
