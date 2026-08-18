@@ -325,6 +325,163 @@ fn test_parse_nemotron_h_config() {
 }
 
 #[test]
+fn test_parse_nemotron_h_lightning_public_layers_block_type() {
+    // Nemotron 3.5 Lightning PUBLIC config shape: no hybrid_override_pattern,
+    // hybrid schedule in layers_block_type. Regression for the 2026-08-17
+    // incident where layer_types came back empty and the model silently
+    // degraded to all-attention + RoPE garbage (degenerate repeated tokens at 602 tok/s).
+    let json = r#"{
+        "model_type": "nemotron_h",
+        "architectures": ["NemotronHForCausalLM"],
+        "hidden_size": 2688,
+        "num_hidden_layers": 52,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 1856,
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 6,
+        "moe_intermediate_size": 1856,
+        "moe_shared_expert_intermediate_size": 3712,
+        "vocab_size": 131072,
+        "layers_block_type": [
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe"
+        ],
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "n_groups": 8,
+        "expand": 2,
+        "conv_kernel": 4,
+        "norm_eps": 1e-5,
+        "rope_theta": 10000
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.layer_types.len(), 52);
+    assert_eq!(cfg.layer_type(0), LayerType::LinearAttention);
+    assert_eq!(cfg.layer_type(1), LayerType::Moe);
+    assert_eq!(cfg.layer_type(5), LayerType::FullAttention);
+    // The schedule must be HYBRID, never the all-attention fallback:
+    // the incident boot showed 52 attention / 0 SSM layers.
+    assert_eq!(cfg.num_ssm_layers(), 23, "SSM layers must be 23, not 0");
+    assert_eq!(cfg.num_moe_layers(), 23);
+    assert_eq!(cfg.num_attention_layers(), 6);
+    assert_eq!(cfg.num_hidden_layers, 52);
+}
+
+#[test]
+fn test_parse_nemotron_h_contradictory_schedules_fails_closed() {
+    // A config shipping both hybrid_override_pattern and layers_block_type
+    // with DIFFERENT lengths is contradictory: dispatch must reject it
+    // rather than silently preferring one schedule.
+    let json = r#"{
+        "model_type": "nemotron_h",
+        "hidden_size": 2688,
+        "num_hidden_layers": 52,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 1856,
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 6,
+        "moe_intermediate_size": 1856,
+        "vocab_size": 131072,
+        "hybrid_override_pattern": "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME",
+        "layers_block_type": ["mamba", "moe", "attention"],
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "n_groups": 8,
+        "expand": 2,
+        "conv_kernel": 4,
+        "norm_eps": 1e-5
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(err.to_string().contains("contradictory schedules"), "{err}");
+}
+
+#[test]
+fn test_parse_nemotron_h_unknown_block_type_fails_closed() {
+    let json = r#"{
+        "model_type": "nemotron_h",
+        "hidden_size": 2688,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 1856,
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 6,
+        "moe_intermediate_size": 1856,
+        "vocab_size": 131072,
+        "layers_block_type": ["mamba", "moe", "attention", "quantum"],
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "n_groups": 8,
+        "expand": 2,
+        "conv_kernel": 4,
+        "norm_eps": 1e-5
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(
+        err.to_string().contains("unknown layers_block_type entry"),
+        "{err}"
+    );
+}
+
+#[test]
 fn test_parse_nemotron_h_puzzle_config() {
     // Minimal Puzzle-shaped schedule: 4 layers with heterogeneous MoE dims.
     // Full checkpoint has 88 layers; this covers dispatch + per-layer lookup.

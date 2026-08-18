@@ -190,6 +190,20 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             // Architecture flags
             config.attn_gated = false;
             config.weight_prefix = "backbone".to_string();
+            // A config shipping BOTH fields with DIFFERENT schedule lengths
+            // is contradictory: fail closed here rather than letting one
+            // silently win the precedence and the other be ignored.
+            if !config.hybrid_override_pattern.is_empty()
+                && let Some(block_types) = raw.get("layers_block_type").and_then(|v| v.as_array())
+                && block_types.len() != config.hybrid_override_pattern.chars().count()
+            {
+                anyhow::bail!(
+                    "nemotron_h config has contradictory schedules: \
+                     hybrid_override_pattern has {} layers but layers_block_type has {}",
+                    config.hybrid_override_pattern.chars().count(),
+                    block_types.len()
+                );
+            }
             // Parse hybrid_override_pattern → layer_types (Nano / Super)
             if !config.hybrid_override_pattern.is_empty() && config.layer_types.is_empty() {
                 config.layer_types = config
@@ -202,6 +216,31 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
                         other => panic!("Unknown hybrid_override_pattern char: '{other}'"),
                     })
                     .collect();
+            }
+            // Nemotron-H variants without the pattern (e.g. Nemotron 3.5
+            // Lightning's public config) ship the hybrid schedule as
+            // `layers_block_type`. Without this, layer_types stays empty and
+            // the model silently degrades to all-attention with RoPE —
+            // coherent-looking garbage (observed 2026-08-17: 52 attention /
+            // 0 SSM layers, degenerate repeated-token output at 602 tok/s).
+            //
+            if config.layer_types.is_empty()
+                && let Some(block_types) = raw.get("layers_block_type").and_then(|v| v.as_array())
+            {
+                config.layer_types = block_types
+                    .iter()
+                    .map(|v| {
+                        let s = v.as_str().unwrap_or("");
+                        Ok(match s {
+                            "mamba" => LayerType::LinearAttention,
+                            "moe" => LayerType::Moe,
+                            "attention" => LayerType::FullAttention,
+                            other => {
+                                anyhow::bail!("unknown layers_block_type entry: '{other}'")
+                            }
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
             }
             // Puzzle: layers_block_type + block_configs → layer_types + per-layer MoE dims
             if top_model_type == "nemotron_h_puzzle" {
