@@ -52,9 +52,7 @@ impl NemotronMoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let sorted_decode =
-            std::env::var("ATLAS_LIGHTNING_MOE_SORTED_DECODE").as_deref() == Ok("1");
-        if (num_tokens <= 1 || self.moe_latent_size > 0) && !sorted_decode {
+        if num_tokens <= 1 || self.moe_latent_size > 0 {
             for t in 0..num_tokens {
                 let off = t * ctx.config.hidden_size * 2;
                 self.decode_inner(hidden.offset(off), residual.offset(off), ctx, stream)?;
@@ -134,33 +132,6 @@ impl NemotronMoeLayer {
         let scratch = ctx.buffers.scratch();
         let indices = scratch;
         let weights = scratch.offset(num_tokens * top_k as usize * 4);
-        if sorted_decode {
-            anyhow::ensure!(
-                self.moe_latent_size == 0,
-                "sorted decode diagnostic supports direct Lightning MoE only"
-            );
-            let shared_up = ctx.buffers.ssm_qkvz();
-            self.prefill_shared_up(normed, shared_up, n, h, shared_inter, ctx, stream)?;
-            let sorted = super::prefill_sorted::SortedPrefillCtx {
-                n,
-                num_tokens,
-                h,
-                inter,
-                shared_inter,
-                num_experts,
-                top_k,
-                scale,
-                latent: 0,
-                gate_logits,
-                indices_dev: indices,
-                weights_dev: weights,
-                normed,
-                hidden,
-                latent_base: None,
-                shared_up_out_base: shared_up,
-            };
-            return self.prefill_sorted_path(&sorted, ctx, stream);
-        }
         for t in 0..num_tokens {
             ops::moe_topk_sigmoid(
                 ctx.gpu,

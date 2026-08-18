@@ -45,12 +45,4 @@ mod tests {
         assert!(body.contains("w4a16_gemv_batch32_k"));
         assert!(body.contains("moe_expert_gemv_wide("));
     }
-
-    #[test]
-    fn sorted_decode_reuses_the_qualified_prefill_path_at_every_width() {
-        let source = include_str!("nemotron_moe/decode_batched.rs");
-        assert!(source.contains("ATLAS_LIGHTNING_MOE_SORTED_DECODE"));
-        assert!(source.contains("prefill_sorted::SortedPrefillCtx"));
-        assert!(source.contains("return self.prefill_sorted_path"));
-    }
 }
