@@ -1070,8 +1070,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
                     .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
             let single_block_table = (batch_size == 1).then(|| DevicePtr(block_table_ptrs[0]));
-            let single_q_offset = u32::try_from(batch_ctx_counts[0])
-                .map_err(|_| anyhow::anyhow!("DFlash B1 q_offset exceeds u32"))?;
+            let single_indirect_args =
+                (batch_size == 1).then_some(self.scratch.option_b_indirect_args_dev);
             for layer_idx in 0..self.layers.len() {
                 self.run_batched_layer_stage(
                     layer_idx,
@@ -1079,7 +1079,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     batch_size,
                     max_kv_len,
                     single_block_table,
-                    single_q_offset,
+                    single_indirect_args,
                     ctx,
                     stream,
                 )?;

@@ -18,7 +18,7 @@ impl BlockDiffusionDraftHead {
         batch_size: u32,
         max_kv_len: u32,
         single_block_table: Option<spark_runtime::gpu::DevicePtr>,
-        single_q_offset: u32,
+        single_indirect_args: Option<spark_runtime::gpu::DevicePtr>,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -136,18 +136,18 @@ impl BlockDiffusionDraftHead {
             0,
             stream,
         )?;
-        if let Some(block_table) = single_block_table {
-            crate::layers::ops::prefill_attention_paged_dflash(
+        if let (Some(block_table), Some(indirect_args)) = (single_block_table, single_indirect_args)
+        {
+            crate::layers::ops::prefill_attention_paged_dflash_bf16_indirect(
                 ctx.gpu,
-                self.kernels.prefill_attn_dflash_bf16,
+                self.kernels.prefill_attn_dflash_bf16_indirect,
                 self.batch_q,
                 k_pool,
                 v_pool,
                 self.batch_attn_out,
                 block_table,
                 self.gamma as u32,
-                max_kv_len,
-                single_q_offset,
+                indirect_args,
                 self.num_q_heads as u32,
                 self.num_kv_heads as u32,
                 self.head_dim as u32,
