@@ -128,12 +128,18 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let attention_source = include_str!("batch_attention.rs");
     assert!(attention_source.contains("prefill_attention_paged_dflash_bf16_indirect"));
     assert!(attention_source.contains("prefill_attention_paged_batched_sink"));
+    let projection_source = include_str!("batch_projection.rs");
+    assert!(projection_source.contains("(total_rows - row).min(16)"));
+    assert!(!projection_source.contains("w4a16_gemv_batch32"));
     let tail = &source[source.find("fn run_batched_tail_base").unwrap()..];
     let final_norm = tail.find("&self.norm").unwrap();
     let lm_head = tail.find("ops::w4a16_gemm").unwrap();
     let argmax = tail.find("ops::argmax_bf16_batch").unwrap();
     assert!(tail.contains("self.batch_logits"));
     assert!(tail.contains("self.batch_tokens"));
+    assert!(tail.contains("ops::w4a16_gemv_batchm"));
+    assert!(tail.contains("self.kernels.w4a16_gemv_batch16"));
+    assert!(tail.contains("(batch_rows - row).min(16)"));
     assert!(final_norm < lm_head && lm_head < argmax);
     let markov = &source[source.find("fn run_batched_markov").unwrap()..];
     let depth_loop = markov.find("for depth in 1..self.gamma").unwrap();

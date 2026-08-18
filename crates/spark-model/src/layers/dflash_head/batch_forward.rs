@@ -308,21 +308,46 @@ impl BlockDiffusionDraftHead {
                 )?;
             }
         } else if let Some(nvfp4) = self.lm_head_nvfp4.as_ref() {
-            anyhow::ensure!(
-                self.kernels.w4a16_gemm.0 != 0,
-                "DFlash batched NVFP4 LM head kernel is unresolved"
-            );
-            crate::layers::ops::w4a16_gemm(
-                ctx.gpu,
-                self.kernels.w4a16_gemm,
-                self.batch_norm,
-                nvfp4,
-                self.batch_logits,
-                batch_rows,
-                vocab,
-                hidden,
-                stream,
-            )?;
+            let kernel = match batch_rows {
+                1..=4 => self.kernels.w4a16_gemv_batch4,
+                5..=8 => self.kernels.w4a16_gemv_batch8,
+                9..=32 => self.kernels.w4a16_gemv_batch16,
+                _ => spark_runtime::gpu::KernelHandle(0),
+            };
+            if kernel.0 != 0 {
+                let mut row = 0u32;
+                while row < batch_rows {
+                    let rows = (batch_rows - row).min(16);
+                    crate::layers::ops::w4a16_gemv_batchm(
+                        ctx.gpu,
+                        kernel,
+                        self.batch_norm.offset(row as usize * hidden as usize * 2),
+                        nvfp4,
+                        self.batch_logits.offset(row as usize * vocab as usize * 2),
+                        rows,
+                        vocab,
+                        hidden,
+                        stream,
+                    )?;
+                    row += rows;
+                }
+            } else {
+                anyhow::ensure!(
+                    self.kernels.w4a16_gemm.0 != 0,
+                    "DFlash batched NVFP4 LM head kernel is unresolved"
+                );
+                crate::layers::ops::w4a16_gemm(
+                    ctx.gpu,
+                    self.kernels.w4a16_gemm,
+                    self.batch_norm,
+                    nvfp4,
+                    self.batch_logits,
+                    batch_rows,
+                    vocab,
+                    hidden,
+                    stream,
+                )?;
+            }
         } else {
             crate::layers::ops::dense_gemm_bf16_pipelined(
                 ctx.gpu,
