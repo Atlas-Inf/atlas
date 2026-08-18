@@ -177,10 +177,10 @@ impl TransformerModel {
         // to localize K=γ illegal-address crashes downstream of SSM.
         // Product Lightning serves froze this switch at admission: the
         // admitted policy rejects any presence of the variable, so the
-        // product path never consults the environment here. Generic and
-        // diagnostic serves keep the legacy read.
+        // Product Lightning serves ignore the generic graph-kill environment;
+        // this dedicated diagnostic alone can force eager target verification.
         let force_eager = if self.lightning_dspark_identity.policy().is_some() {
-            false
+            std::env::var("ATLAS_LIGHTNING_VERIFY_EAGER_DIAG").as_deref() == Ok("1")
         } else {
             std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1")
         };
