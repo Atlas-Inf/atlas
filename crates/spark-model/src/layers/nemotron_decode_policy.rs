@@ -54,4 +54,14 @@ mod tests {
         assert!(source.contains("self.down_ptrs.packed_ptrs"));
         assert!(source.contains("ops::moe_expert_gemv_wide"));
     }
+
+    #[test]
+    fn marlin_down_only_gathers_exact_wide_up() {
+        let source = include_str!("nemotron_moe/marlin_slots.rs");
+        let kernel = include_str!("../../../../kernels/gb10/common/marlin_scatter_slots.cu");
+        assert!(source.contains("ATLAS_MOE_MARLIN_DOWN_ONLY"));
+        assert!(source.contains("self.up_ptrs.packed_ptrs"));
+        assert!(source.contains("ops::marlin_gather_slots"));
+        assert!(kernel.contains("atlas_marlin_gather_slots"));
+    }
 }
