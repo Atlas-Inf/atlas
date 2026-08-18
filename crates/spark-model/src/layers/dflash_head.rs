@@ -896,6 +896,27 @@ impl DraftProposer for BlockDiffusionDraftHead {
         if self.startup.diagnostics.batch_parity {
             tracing::info!("DFlash Bxgamma parity dispatch: batch={n}");
         }
+        let parity_oracle = if self.startup.diagnostics.batch_parity {
+            let mut oracle = Vec::with_capacity(n);
+            for i in 0..n {
+                oracle.push(self.propose_drafts(
+                    last_tokens[i],
+                    target_hiddens[i],
+                    positions[i],
+                    num_drafts,
+                    states[i],
+                    Some(expected_owners[i]),
+                    ctx,
+                    stream,
+                    None,
+                    None,
+                    Some(target_hiddens[i]),
+                )?);
+            }
+            Some(oracle)
+        } else {
+            None
+        };
 
         // Freeze the explicit sequence identities and lifecycle snapshots before
         // any stream/event dispatch. The current implementation below remains
@@ -1278,24 +1299,28 @@ impl DraftProposer for BlockDiffusionDraftHead {
 
         let lanes_n = self.lane_count();
         if lanes_n == 1 {
-            // Single-lane: the original serial path, unchanged.
-            let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                let drafts = self.propose_drafts(
-                    last_tokens[i],
-                    target_hiddens[i],
-                    positions[i],
-                    num_drafts,
-                    states[i],
-                    Some(expected_owners[i]),
-                    ctx,
-                    stream,
-                    None,
-                    None,
-                    Some(target_hiddens[i]),
-                )?;
-                out.push(drafts);
-            }
+            let out = if let Some(oracle) = parity_oracle {
+                oracle
+            } else {
+                // Single-lane product path: the original serial proposer.
+                let mut serial = Vec::with_capacity(n);
+                for i in 0..n {
+                    serial.push(self.propose_drafts(
+                        last_tokens[i],
+                        target_hiddens[i],
+                        positions[i],
+                        num_drafts,
+                        states[i],
+                        Some(expected_owners[i]),
+                        ctx,
+                        stream,
+                        None,
+                        None,
+                        Some(target_hiddens[i]),
+                    )?);
+                }
+                serial
+            };
             if self.startup.diagnostics.batch_parity && batch_slots_ready {
                 ctx.gpu.synchronize(stream)?;
                 let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
