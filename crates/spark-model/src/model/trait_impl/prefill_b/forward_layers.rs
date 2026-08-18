@@ -123,7 +123,6 @@ impl TransformerModel {
             token_ids: Some(self.buffers.token_ids()),
             // #30: request slot pairs (None unless routing to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
-            midchunk_capture,
             moe_lora_route: self.moe_lora_route(seq.adapter_slot),
         };
 

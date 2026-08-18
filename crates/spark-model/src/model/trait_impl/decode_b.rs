@@ -415,6 +415,7 @@ impl TransformerModel {
             comm: self.comm_ref(),
             graph_capture: false,
             gdn_exact_replay: false,
+            midchunk_capture: None,
             token_ids: None,
             // #30: the fused (SLAI) prefill portion routes by the prefilling
             // seq's slot (None unless it routes to a non-active slot).
