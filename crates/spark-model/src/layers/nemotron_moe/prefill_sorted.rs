@@ -16,7 +16,6 @@ use crate::layers::ops;
 
 /// Locals captured from `prefill` and passed to the sorted-MoE branch.
 pub(super) struct SortedPrefillCtx {
-    pub decode_exact_shared: bool,
     pub n: u32,
     pub num_tokens: usize,
     pub h: usize,
@@ -325,31 +324,7 @@ impl NemotronMoeLayer {
             && self.quantize_nvfp4_k.0 != 0
             && ctx.buffers.fp8_act_bytes() >= (p.shared_inter as usize) * (p.n as usize)
             && std::env::var("ATLAS_SHARED_W4A4_DOWN").is_ok();
-        if p.decode_exact_shared {
-            let kernel = if p.n <= 4 {
-                self.w4a16_gemv_batch4_k
-            } else if p.n <= 16 {
-                self.w4a16_gemv_batch16_k
-            } else {
-                self.w4a16_gemv_batch32_k
-            };
-            anyhow::ensure!(
-                p.n <= 32 && kernel.0 != 0,
-                "sorted decode exact shared DOWN unsupported at M={}",
-                p.n
-            );
-            ops::w4a16_gemv_batchm(
-                ctx.gpu,
-                kernel,
-                p.shared_up_out_base,
-                &self.weights.shared_down,
-                shared_down_out,
-                p.n,
-                p.h as u32,
-                p.shared_inter,
-                stream,
-            )?;
-        } else if let Some(fp8w) = native_down {
+        if let Some(fp8w) = native_down {
             let (kern, pipelined) = if self.w8a16_gemm_pipelined_k.0 != 0 {
                 (self.w8a16_gemm_pipelined_k, true)
             } else {
