@@ -171,6 +171,7 @@ impl BlockDiffusionDraftHead {
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             batched_embed: gpu.kernel("embed_from_argmax", "batched_embed")?,
+            batch_anchor_add: gpu.kernel("dflash_batch_anchor_add", "dflash_batch_anchor_add")?,
             // Phase 2 Option B: slot_mapping builder. Same kernel the
             // target model uses for its KV cache writeback (see
             // crates/spark-model/src/model/impl_a1.rs:92).
@@ -367,10 +368,12 @@ impl BlockDiffusionDraftHead {
             .ok_or_else(|| anyhow::anyhow!("DFlash batch fc bytes overflow"))?;
         let batch_target_hidden = gpu.alloc(batch_target_bytes)?;
         let batch_fc_proj = gpu.alloc(batch_fc_bytes)?;
+        let batch_fc_norm = gpu.alloc(batch_fc_bytes)?;
         gpu.memset(batch_query_ids_dev, 0, batch_rows * 4)?;
         gpu.memset(batch_query_embed, 0, batch_rows * hidden_size * bf16)?;
         gpu.memset(batch_target_hidden, 0, batch_target_bytes)?;
         gpu.memset(batch_fc_proj, 0, batch_fc_bytes)?;
+        gpu.memset(batch_fc_norm, 0, batch_fc_bytes)?;
 
         // Extra propose lanes: `proposal_lane_count` total lanes
         // (default 1). Each extra lane gets its own stream, scratch set,
@@ -625,6 +628,7 @@ impl BlockDiffusionDraftHead {
             batch_query_embed,
             batch_target_hidden,
             batch_fc_proj,
+            batch_fc_norm,
             extra_lanes,
             kernels,
             max_seq_len,

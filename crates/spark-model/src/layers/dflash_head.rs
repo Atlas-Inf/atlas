@@ -77,6 +77,7 @@ pub struct DflashKernels {
     pub residual_add: KernelHandle,
     pub argmax: KernelHandle,
     pub batched_embed: KernelHandle,
+    pub batch_anchor_add: KernelHandle,
     /// Phase 2 Option B: builds `[count]` i32 slot indices on-device
     /// from a host-provided block_table. Used by propose.rs to populate
     /// the slot_mapping passed to reshape_and_cache and precompute_ctx_kv.
@@ -529,6 +530,7 @@ pub struct BlockDiffusionDraftHead {
     pub batch_query_embed: DevicePtr,
     pub batch_target_hidden: DevicePtr,
     pub batch_fc_proj: DevicePtr,
+    pub batch_fc_norm: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -916,6 +918,27 @@ impl DraftProposer for BlockDiffusionDraftHead {
             n as u32,
             self.hidden_size as u32,
             target_width as u32,
+            stream,
+        )?;
+        crate::layers::ops::rms_norm(
+            ctx.gpu,
+            self.kernels.rms_norm,
+            self.batch_fc_proj,
+            &self.hidden_norm,
+            self.batch_fc_norm,
+            n as u32,
+            self.hidden_size as u32,
+            self.rms_norm_eps,
+            stream,
+        )?;
+        crate::layers::ops::dflash_batch_anchor_add(
+            ctx.gpu,
+            self.kernels.batch_anchor_add,
+            self.batch_query_embed,
+            self.batch_fc_norm,
+            n as u32,
+            self.gamma as u32,
+            self.hidden_size as u32,
             stream,
         )?;
 

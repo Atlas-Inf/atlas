@@ -168,6 +168,32 @@ pub fn residual_add(
         .launch(stream)
 }
 
+/// Add one normalized FC row to each sequence's anchor query row.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_batch_anchor_add(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    query_rows: DevicePtr,
+    projected: DevicePtr,
+    batch: u32,
+    gamma: u32,
+    hidden: u32,
+    stream: u64,
+) -> Result<()> {
+    let total = batch
+        .checked_mul(hidden)
+        .ok_or_else(|| anyhow::anyhow!("DFlash batch anchor add size overflow"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(query_rows)
+        .arg_ptr(projected)
+        .arg_u32(batch)
+        .arg_u32(gamma)
+        .arg_u32(hidden)
+        .launch(stream)
+}
+
 /// BF16 scaled accumulate: `output[i] += scale * src[i]`.
 ///
 /// Kernel: `bf16_scaled_add(output, src, scale, n)`
