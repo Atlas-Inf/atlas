@@ -26,6 +26,8 @@ pub struct MockGpuBackend {
     d2h_blocking: AtomicUsize,
     d2h_async: AtomicUsize,
     host_pinned_allocs: AtomicUsize,
+    /// One-shot `free` failure injection (see [`Self::fail_next_free`]).
+    fail_free_once: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +54,17 @@ impl MockGpuBackend {
             d2h_blocking: AtomicUsize::new(0),
             d2h_async: AtomicUsize::new(0),
             host_pinned_allocs: AtomicUsize::new(0),
+            fail_free_once: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// One-shot failure injection for the NEXT `free` call: that single
+    /// `free` returns an error and the flag clears. Lets cleanup-path tests
+    /// prove a failed free keeps its resource observable/retryable instead
+    /// of silently leaking.
+    pub fn fail_next_free(&self) {
+        self.fail_free_once
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn alloc_count(&self) -> usize {
@@ -148,6 +160,12 @@ impl GpuBackend for MockGpuBackend {
     }
 
     fn free(&self, ptr: DevicePtr) -> Result<()> {
+        if self
+            .fail_free_once
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            anyhow::bail!("mock free failed (injected): ptr {ptr}");
+        }
         self.allocs.lock().remove(&ptr.0);
         Ok(())
     }

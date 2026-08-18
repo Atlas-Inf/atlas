@@ -192,6 +192,18 @@ impl CaptureDescriptor {
         Ok(())
     }
 
+    /// Terminal-path validation: ownership only. `free_state` and the
+    /// model's free-sequence pre-check use this so a SAME-OWNER second
+    /// cleanup is the documented idempotent success (the resources were
+    /// reclaimed by the first pass; `retire` is already-Retired-tolerant)
+    /// instead of an error. A different owner is still rejected.
+    pub fn validate_ownership(
+        &self,
+        expected: SequenceGeneration,
+    ) -> Result<(), DsparkLifecycleError> {
+        validate_owner(self.owner, expected)
+    }
+
     pub fn row_range(
         &self,
         expected: SequenceGeneration,

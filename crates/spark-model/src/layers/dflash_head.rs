@@ -355,7 +355,13 @@ impl DflashProposerState {
     /// retire the descriptor best-effort, return KV blocks, free the ctx
     /// accumulator and device block table, and reset the lazy-alloc
     /// watermarks — the error still propagates, but nothing owned by this
-    /// state leaks. Production-owned seam: directly unit-tested.
+    /// state leaks.
+    ///
+    /// A backend `free` that itself fails is LOGGED and the pointer is
+    /// RETAINED (not cleared), so a later cleanup retry can still release
+    /// it — a failed free must not silently convert into an unrecoverable
+    /// leak. Production-owned seam: directly unit-tested including the
+    /// free-failure retention behavior.
     pub(crate) fn reclaim_on_owner_failure(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -369,11 +375,24 @@ impl DflashProposerState {
             self.block_table.clear();
         }
         if self.ctx_hidden_acc.0 != 0 {
-            let _ = gpu.free(self.ctx_hidden_acc);
-            self.ctx_hidden_acc = DevicePtr(0);
+            if let Err(error) = gpu.free(self.ctx_hidden_acc) {
+                tracing::error!(
+                    "DSpark reclaim: freeing ctx accumulator {:#x} failed ({error}); \
+                     pointer retained for a later cleanup retry",
+                    self.ctx_hidden_acc.0
+                );
+            } else {
+                self.ctx_hidden_acc = DevicePtr(0);
+            }
         }
-        if let Some(bt) = self.block_table_dev.take() {
-            let _ = gpu.free(bt);
+        if let Some(bt) = self.block_table_dev.take()
+            && let Err(error) = gpu.free(bt)
+        {
+            tracing::error!(
+                "DSpark reclaim: freeing device block table {:#x} failed ({error}); \
+                 allocation leaked — no retained handle is available",
+                bt.0
+            );
         }
         self.max_ctx_count_drafter = 0;
         self.ctx_count_drafter = 0;
@@ -609,6 +628,8 @@ pub use lifecycle::{
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
+#[cfg(test)]
+mod free_state_tests;
 mod from_weights;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -656,6 +677,24 @@ impl BlockDiffusionDraftHead {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("DFlash operation has no generation owner"))?
             .validate_access(expected_owner)?;
+        Ok(expected_owner)
+    }
+
+    /// Terminal-path owner validation for `free_state`: ownership only, so
+    /// a same-owner SECOND cleanup is an idempotent success (everything was
+    /// reclaimed by the first pass) rather than a Retired error.
+    fn validate_dflash_owner_terminal(
+        &self,
+        dstate: &DflashProposerState,
+        expected_owner: Option<SequenceGeneration>,
+    ) -> Result<SequenceGeneration> {
+        let expected_owner =
+            expected_owner.ok_or_else(|| anyhow::anyhow!("DFlash free requires expected owner"))?;
+        dstate
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash free has no generation owner"))?
+            .validate_ownership(expected_owner)?;
         Ok(expected_owner)
     }
 }
@@ -975,7 +1014,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // validation failure still reclaims every resource below before
         // propagating — a mismatched owner must not leak graphs, KV blocks,
         // or the ctx accumulator. (Lifecycle gaps noted 2026-08-17.)
-        let owner = match self.validate_dflash_owner(dstate, expected_owner) {
+        let owner = match self.validate_dflash_owner_terminal(dstate, expected_owner) {
             Ok(owner) => owner,
             Err(error) => {
                 // Transactional cleanup: reclaim everything reclaimable
@@ -1012,10 +1051,19 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // allocation (`max_seq_len × 5 × target_hidden` BF16; ~320 MB at
         // max_seq_len=16384). `DevicePtr` has no Drop, so without this every
         // finished sequence leaks it for the server's lifetime. Guarded on a
-        // non-null pointer so a double free_state is a no-op.
+        // non-null pointer so a double free_state is a no-op. A failed free
+        // is logged and the pointer RETAINED so a cleanup retry can release
+        // it (a silently cleared pointer would leak unrecoverably).
         if dstate.ctx_hidden_acc.0 != 0 {
-            gpu.free(dstate.ctx_hidden_acc)?;
-            dstate.ctx_hidden_acc = DevicePtr(0);
+            if let Err(error) = gpu.free(dstate.ctx_hidden_acc) {
+                tracing::error!(
+                    "DSpark free_state: freeing ctx accumulator {:#x} failed ({error}); \
+                     pointer retained for a later cleanup retry",
+                    dstate.ctx_hidden_acc.0
+                );
+            } else {
+                dstate.ctx_hidden_acc = DevicePtr(0);
+            }
         }
         // Free the device-side block table (lazily allocated in propose.rs).
         if let Some(bt) = dstate.block_table_dev.take() {
