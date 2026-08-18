@@ -1038,18 +1038,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             .iter()
             .flat_map(|token| token.to_le_bytes())
             .collect();
-        let async_batch_uploads =
-            std::env::var("ATLAS_LIGHTNING_DSPARK_ASYNC_UPLOADS").as_deref() == Ok("1");
-        let upload = |bytes: &[u8], dst: spark_runtime::gpu::DevicePtr| -> Result<()> {
-            if async_batch_uploads {
-                ctx.gpu.copy_h2d_async(bytes, dst, stream)
-            } else {
-                ctx.gpu.copy_h2d(bytes, dst)
-            }
-        };
-        upload(&query_bytes, self.batch_query_ids_dev)?;
-        upload(&position_bytes, self.batch_position_ids)?;
-        upload(&last_token_bytes, self.batch_markov_prev)?;
+        ctx.gpu.copy_h2d(&query_bytes, self.batch_query_ids_dev)?;
+        ctx.gpu.copy_h2d(&position_bytes, self.batch_position_ids)?;
+        ctx.gpu
+            .copy_h2d(&last_token_bytes, self.batch_markov_prev)?;
         let ptr_bytes: Vec<u8> = block_table_ptrs
             .iter()
             .flat_map(|pointer| pointer.to_le_bytes())
@@ -1088,16 +1080,17 @@ impl DraftProposer for BlockDiffusionDraftHead {
             attention_args.extend_from_slice(&q_offset.to_le_bytes());
             attention_args.extend_from_slice(&q_rope_pos.to_le_bytes());
         }
-        upload(&ptr_bytes, self.batch_block_table_ptrs)?;
-        upload(&cu_bytes, self.batch_cu_seqlens)?;
-        upload(&kv_bytes, self.batch_kv_lens)?;
-        upload(&attention_args, self.batch_attention_args)?;
+        ctx.gpu.copy_h2d(&ptr_bytes, self.batch_block_table_ptrs)?;
+        ctx.gpu.copy_h2d(&cu_bytes, self.batch_cu_seqlens)?;
+        ctx.gpu.copy_h2d(&kv_bytes, self.batch_kv_lens)?;
+        ctx.gpu
+            .copy_h2d(&attention_args, self.batch_attention_args)?;
         if batch_slots_ready {
             let slot_bytes: Vec<u8> = batch_slot_mapping
                 .iter()
                 .flat_map(|slot| slot.to_le_bytes())
                 .collect();
-            upload(&slot_bytes, self.batch_slot_mapping)?;
+            ctx.gpu.copy_h2d(&slot_bytes, self.batch_slot_mapping)?;
         }
         crate::layers::ops::batched_embed(
             ctx.gpu,
