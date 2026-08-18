@@ -141,7 +141,28 @@ impl NemotronMamba2Layer {
 
         let proj = ctx.buffers.ssm_qkvz();
         let pd_fp8_ok = self.fp8_gemm_t_k.0 != 0;
-        self.prefill_in_proj(normed, proj, n, h, false, false, pd_fp8_ok, ctx, stream)?;
+        if ctx.levers.lightning_mamba_exact_recurrence
+            && std::env::var("ATLAS_LIGHTNING_MAMBA_BATCH_IN").as_deref() == Ok("1")
+        {
+            let mut row = 0usize;
+            while row < r_total {
+                let rows = (r_total - row).min(16);
+                self.prefill_in_proj(
+                    normed.offset(row * h * bf16),
+                    proj.offset(row * self.in_proj_size * bf16),
+                    rows as u32,
+                    h,
+                    false,
+                    false,
+                    pd_fp8_ok,
+                    ctx,
+                    stream,
+                )?;
+                row += rows;
+            }
+        } else {
+            self.prefill_in_proj(normed, proj, n, h, false, false, pd_fp8_ok, ctx, stream)?;
+        }
 
         let xbc_tmp = ctx.buffers.ssm_deinterleaved();
         let packed = ctx.buffers.qkv_output();
@@ -280,8 +301,25 @@ impl NemotronMamba2Layer {
         )?;
         let out = ctx.buffers.qkv_output();
         if ctx.levers.lightning_mamba_exact_recurrence
-            && std::env::var("ATLAS_LIGHTNING_MAMBA_BATCH_OUT").as_deref() != Ok("1")
+            && std::env::var("ATLAS_LIGHTNING_MAMBA_BATCH_OUT").as_deref() == Ok("1")
         {
+            let mut row = 0usize;
+            while row < r_total {
+                let rows = (r_total - row).min(16);
+                self.prefill_out_proj(
+                    gated_out.offset(row * self.d_inner * bf16),
+                    out.offset(row * h * bf16),
+                    rows as u32,
+                    h,
+                    false,
+                    false,
+                    pd_fp8_ok,
+                    ctx,
+                    stream,
+                )?;
+                row += rows;
+            }
+        } else if ctx.levers.lightning_mamba_exact_recurrence {
             for row in 0..r_total {
                 self.decode_out_proj_exact(
                     gated_out.offset(row * self.d_inner * bf16),
