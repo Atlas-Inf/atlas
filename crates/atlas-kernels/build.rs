@@ -23,6 +23,9 @@ struct SamplingCat {
     // over the recent token window. 0.0 = disabled. 0.2 is the SGLang
     // reference value; lossless on AIME/GPQA at that strength.
     lz_penalty: f32,
+    // Model-declared min-p. None = MODEL.toml is silent, so the server's
+    // --default-min-p stands (see SamplingCategory in src/lib.rs).
+    min_p: Option<f32>,
 }
 
 impl Default for SamplingCat {
@@ -38,6 +41,7 @@ impl Default for SamplingCat {
             dry_base: 1.75,
             dry_allowed_length: 2,
             lz_penalty: 0.0,
+            min_p: None,
         }
     }
 }
@@ -61,19 +65,38 @@ struct Target {
     common_kernel_dir: Option<PathBuf>,
     extra_flags: Vec<String>,
     module_overrides: HashMap<String, String>,
+    /// `(module, kernel)` pairs declared in `[shadow_exempt]` — kernels this
+    /// target may drop from `common/` WITHOUT it being drift, each with a
+    /// stated reason in its KERNEL.toml. Merged common-then-model, same as
+    /// `extra_flags`. Filters the build WARNING only: the pairs stay in
+    /// `shadowed_dropped`, so the startup audit still hard-errors if the
+    /// model's dispatch actually resolves one.
+    shadow_exempt: Vec<(String, String)>,
+    /// `(module, kernel)` pairs declared in MODEL.toml `[expected_absent]` —
+    /// lookups this model's dispatch may issue and fail to resolve WITHOUT that
+    /// being an error, each with a mandatory stated reason. Carried onto
+    /// `TargetPtxSet::expected_absent` and read by the boot audit, which fails
+    /// closed on every unresolved lookup that is NOT declared here.
+    expected_absent: Vec<(String, String)>,
     sampling_thinking_text: SamplingCat,
     sampling_thinking_coding: SamplingCat,
     sampling_non_thinking: SamplingCat,
     sampling_tools: SamplingCat,
     behavior_thinking_in_tools: bool,
     behavior_max_thinking_budget: u32,
+    behavior_effort_capped_at_ceiling: bool,
     behavior_thinking_default: bool,
     behavior_fp8_kv_calibration_tokens: usize,
     behavior_default_kv_dtype: String,
     behavior_default_num_drafts: u32,
     behavior_disable_tool_steering: bool,
+    behavior_disable_cwd_hint_injection: bool,
+    behavior_use_sampling_presets_for_core: bool,
     behavior_tool_call_parser: String,
     behavior_enable_loop_watchdog: bool,
+    behavior_enable_think_loop_watchdog: bool,
+    behavior_honor_eos_inside_thinking: bool,
+    behavior_cap_thinking_at_max_tokens: bool,
     behavior_min_p_floor: f32,
     behavior_temperature_max: f32,
     behavior_think_loop_min_repeats: u32,
@@ -88,9 +111,16 @@ struct Target {
     behavior_rollback_resteer: bool,
     behavior_rom_head: String,
     behavior_tool_retry: bool,
+    behavior_preserve_thinking: Option<bool>,
     /// Which `(model_type, hidden_size)` pairs this kernel target supports.
     /// Parsed from `[[model_types]]` in MODEL.toml.
     model_type_matches: Vec<ModelTypeMatch>,
+    /// `[model] match_names` — checkpoint-reference needles that break the
+    /// tie when several targets declare the same `(model_type, hidden_size)`
+    /// (Qwen3.6-27B vs Qwen3.8-27B have bit-identical configs).
+    /// `validate_collision_match_names` panics if a colliding target omits
+    /// them; non-colliding targets leave this empty.
+    match_names: Vec<String>,
     /// `[dflash]` section if present in MODEL.toml — drafter pairing for
     /// block-diffusion speculative decoding. `None` when the model has no
     /// associated DFlash drafter checkpoint.
@@ -147,6 +177,11 @@ fn main() {
             content_hash(stub)
         );
         println!("cargo:rustc-env=ATLAS_PTX_DIR={}", out_dir.display());
+        // No compiler ran, so this binary can attest to nothing. Emitted
+        // explicitly rather than left unset so a reader of lib.rs does not have
+        // to infer it: a record written from a skip build excuses no future
+        // diff, exactly as a record written before attestations existed.
+        println!("cargo:rustc-env=ATLAS_TARGET_CLOSURES={{}}");
         return;
     }
 
@@ -158,7 +193,13 @@ fn main() {
 
     assert!(
         !targets.is_empty(),
-        "No kernel targets resolved. Check ATLAS_TARGET_* env vars."
+        "{}",
+        build_diagnose::no_targets(
+            &workspace_root.join("kernels"),
+            &env::var("ATLAS_TARGET_HW").unwrap_or_else(|_| build_diagnose::DEFAULT_HW.into()),
+            &env::var("ATLAS_TARGET_MODEL").unwrap_or_else(|_| "*".into()),
+            &env::var("ATLAS_TARGET_QUANT").unwrap_or_else(|_| "nvfp4".into()),
+        )
     );
 
     // ── Resolve compute target (compiler) from HARDWARE.toml vendor ──
@@ -166,7 +207,7 @@ fn main() {
     // Apple (xcrun→metallib), Intel (icpx→SPIR-V). Only NVIDIA is implemented.
     let hw_dir = workspace_root
         .join("kernels")
-        .join(env::var("ATLAS_TARGET_HW").unwrap_or_else(|_| "gb10".into()));
+        .join(env::var("ATLAS_TARGET_HW").unwrap_or_else(|_| build_diagnose::DEFAULT_HW.into()));
     let hw_toml_path = hw_dir.join("HARDWARE.toml");
     let hw_toml: toml::Value = {
         let content = std::fs::read_to_string(&hw_toml_path)
@@ -179,24 +220,34 @@ fn main() {
         .get("hardware")
         .and_then(|h| h.get("vendor"))
         .and_then(|v| v.as_str());
-    // Force the BR=32 prefill path (skip the BR64=64 large-chunk kernels)
-    // on targets that can't fit the _64 kernel's LDS (e.g. RDNA3.5's hard
-    // 64 KB/workgroup cap). Only emitted when the HW opts in; absent on
-    // NVIDIA → option_env! None → BR64 dispatch unchanged.
-    if hw_toml
-        .get("hardware")
-        .and_then(|h| h.get("force_br32_prefill"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        println!("cargo:rustc-env=ATLAS_HW_FORCE_BR32=true");
-    }
+    // NOTE: a `force_br32_prefill` HARDWARE.toml key used to be re-emitted here
+    // as `cargo:rustc-env=ATLAS_HW_FORCE_BR32`, for an `option_env!` reader in
+    // spark-model's prefill dispatch. That reader was dropped by the squash
+    // merge that landed Strix support, leaving an emit nothing consumed — and
+    // the contract could not have worked anyway: `cargo:rustc-env` only reaches
+    // the crate whose build script emits it, so it can never reach spark-model.
+    // BR=32 on RDNA3.5 is enforced by two live mechanisms instead, and the key
+    // was redundant even when it had a reader:
+    //   * kernel side  — `#if defined(__SCALE__) #define BR64 32` in
+    //     kernels/gb10/common/prefill_paged_compute.cuh (and an unconditional
+    //     `#define BR64 32` in the strix-hip shadow), which is what keeps the
+    //     _64 kernels inside the 64 KB LDS cap.
+    //   * host side    — `cfg!(atlas_scale)` picks the matching 32-row grid
+    //     stride in ops/prefill_attn_main_a.rs (non-paged) and
+    //     ops/prefill_attn_main_b.rs (paged); the cfg comes from spark-model's
+    //     own build.rs reading ATLAS_TARGET_HW.
+    // Re-adding a HARDWARE.toml key for this would re-create the dead lever.
     let compute_target = resolve_compute_target(vendor_str);
     let output_ext = compute_target.output_extension();
     let uses_cuda_api = compute_target.uses_cuda_module_api();
 
     // Per-target: (target_idx, vec of (stem, module_name))
     let mut all_target_modules: Vec<Vec<(String, String)>> = Vec::new();
+    // Per-target: (module, kernel) pairs this model's files dropped by shadowing
+    // their `common/` namesakes. Baked into the binary so the startup audit can
+    // separate "dropped by a fork" (fatal) from "never built for this target"
+    // (expected). See `shadowed_dropped_pairs`.
+    let mut all_target_drops: Vec<Vec<(String, String)>> = Vec::new();
 
     // 2026-05-24 dedup+parallel: pre-walk every (target, cu_file) pair
     // and split into two queues:
@@ -336,6 +387,45 @@ fn main() {
 
         all_target_modules.push(modules);
 
+        let drops = shadowed_dropped_pairs(
+            target.common_kernel_dir.as_deref(),
+            &target.model_kernel_dir,
+            source_ext,
+            &target.module_overrides,
+        );
+        // Warning-visible subset: everything except the pairs `common/`
+        // declares (with a reason) as superseded in `[shadow_exempt]`. The
+        // FULL `drops` list still goes into `TargetPtxSet::shadowed_dropped`
+        // below, so the startup gate (`kernel_audit::classify_failures`)
+        // remains fail-closed for exempt pairs too — an exemption silences
+        // build-log noise, never a runtime miss.
+        let reportable: Vec<&(String, String)> = drops
+            .iter()
+            .filter(|(m, f)| {
+                !target
+                    .shadow_exempt
+                    .iter()
+                    .any(|(em, ef)| em == m && ef == f)
+            })
+            .collect();
+        if !reportable.is_empty() {
+            println!(
+                "cargo:warning=atlas-kernels: ({}, {}) drops {} kernel(s) by shadowing common/: {}. \
+                 A dropped kernel fails CLOSED (try_kernel -> handle 0). If the model genuinely \
+                 cannot use it this is fine; the startup audit will only hard-error if the model's \
+                 dispatch actually requests it.",
+                target.model,
+                target.quant,
+                reportable.len(),
+                reportable
+                    .iter()
+                    .map(|(m, f)| format!("{m}::{f}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        all_target_drops.push(drops);
+
         println!(
             "cargo:rerun-if-changed={}",
             target.model_kernel_dir.display()
@@ -436,8 +526,13 @@ fn main() {
     }
 
     // ── Generate target_ptx.rs ──
-    let generated =
-        generate_target_ptx_rs(&targets, &all_target_modules, output_ext, uses_cuda_api);
+    let generated = generate_target_ptx_rs(
+        &targets,
+        &all_target_modules,
+        &all_target_drops,
+        output_ext,
+        uses_cuda_api,
+    );
     let gen_path = out_dir.join("target_ptx.rs");
     std::fs::write(&gen_path, &generated)
         .unwrap_or_else(|e| panic!("Failed to write {}: {e}", gen_path.display()));
@@ -453,6 +548,85 @@ fn main() {
         content_hash(&generated)
     );
     println!("cargo:rustc-env=ATLAS_PTX_DIR={}", out_dir.display());
+
+    // ── Bake what each target was compiled from ──
+    // Read back by the benchmark gate so a record can attest to the BINARY's
+    // sources rather than to whatever the tree held when the record was
+    // written — the two differ whenever a build is stale, a tree is dirty, or
+    // an image is carried between boxes, all of which happen during a gate
+    // campaign.
+    println!(
+        "cargo:rustc-env=ATLAS_TARGET_CLOSURES={}",
+        closure_attestation(workspace_root, &targets, compute_target.as_ref())
+    );
+}
+
+/// Per-target closure hashes, as one line of JSON.
+///
+/// Returns `{}` — attesting to nothing — whenever any part cannot be computed:
+/// an unknown compiler, sources that will not resolve, an unresolvable
+/// `#include`. Every such case costs a future re-run, which is the direction a
+/// provenance hash must fail in; a placeholder would let two different builds
+/// compare equal.
+fn closure_attestation(
+    workspace_root: &std::path::Path,
+    targets: &[Target],
+    compute_target: &dyn build_target::ComputeTarget,
+) -> String {
+    let Some(compiler) = compute_target.compiler_id() else {
+        return "{}".into();
+    };
+    let mut map = serde_json::Map::new();
+    for target in targets {
+        let sources = collect_cu_files(
+            target.common_kernel_dir.as_deref(),
+            &target.model_kernel_dir,
+            compute_target.source_extension(),
+        );
+        if sources.is_empty() {
+            continue;
+        }
+        let model_dir = target.model_kernel_dir.parent();
+        let configs = [
+            workspace_root
+                .join("kernels")
+                .join(&target.hw)
+                .join("HARDWARE.toml"),
+            model_dir.map(|d| d.join("MODEL.toml")).unwrap_or_default(),
+            target.model_kernel_dir.join("KERNEL.toml"),
+        ]
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect();
+
+        let inputs = atlas_closure::ClosureInputs {
+            sources,
+            configs,
+            flags: target.extra_flags.clone(),
+            arch: target.arch.clone(),
+            compiler: compiler.clone(),
+        };
+        let Ok(closure) = atlas_closure::hash_with_report(workspace_root, &inputs) else {
+            continue;
+        };
+        // Surfaced, not swallowed. A quoted include naming no file is hashed by
+        // name rather than content, so a NEW one silently widens what the gate
+        // cannot see. There are two in the tree today, both dead `#if` arms of
+        // the 27B's vendored q4k code; a third deserves a look.
+        for entry in &closure.unresolved {
+            println!("cargo:warning=closure: unresolved include ({entry})");
+        }
+        map.insert(
+            format!("{}/{}/{}", target.hw, target.model, target.quant),
+            serde_json::json!({
+                "hash": closure.digest,
+                "arch": target.arch,
+                "compiler": compiler,
+                "flags": target.extra_flags,
+            }),
+        );
+    }
+    serde_json::Value::Object(map).to_string()
 }
 
 /// FNV-1a 64-bit content fingerprint → 12 hex chars. Deterministic, no deps.
@@ -615,51 +789,215 @@ fn widen_warp_masks(src: &str) -> String {
 /// search-path directive. The runtime keeps importing the CUDA driver API;
 /// this `.so` re-exports those symbols mapped onto HIP.
 fn build_hip_shim(manifest_dir: &std::path::Path, out_dir: &std::path::Path) {
-    let shim_src = manifest_dir.join("hip").join("libcuda_hip_shim.cpp");
-    assert!(
-        shim_src.exists(),
-        "libcuda→HIP shim source missing at {}",
-        shim_src.display()
-    );
-    println!("cargo:rerun-if-changed={}", shim_src.display());
-
+    // Windows: build the real cu*/cudart HIP shim as cuda.dll + import libs and
+    // stage the runtime DLLs for packaging (cudarc dlopens the driver at run
+    // time). See build_hip_shim_windows.
+    if cfg!(windows) {
+        build_hip_shim_windows(manifest_dir, out_dir);
+        return;
+    }
     let hipcc = std::env::var("ATLAS_HIPCC").unwrap_or_else(|_| "/opt/rocm/bin/hipcc".into());
-    let shim_out = out_dir.join("libcuda.so");
-    let status = std::process::Command::new(&hipcc)
-        .args([
-            "-shared",
-            "-fPIC",
-            shim_src.to_str().unwrap(),
-            "-o",
-            shim_out.to_str().unwrap(),
-        ])
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run hipcc for libcuda shim ({hipcc}): {e}"));
-    assert!(
-        status.success(),
-        "hipcc failed building libcuda→HIP shim ({})",
-        shim_src.display()
-    );
-    // Put OUT_DIR first on the link search path so `-lcuda` resolves to the shim.
+    // Three HIP shims so the HIP target resolves every CUDA lib spark emits:
+    //   libcuda.so     — cu* driver API, real (libcuda_hip_shim.cpp)
+    //   libcudart.so   — cudart runtime API, real (libcudart_hip_shim.cpp)
+    //   libcublasLt.so — cuBLASLt, stub (opt-in ATLAS_CUBLAS_GEMM path only)
+    // Before this, only libcuda.so existed, so native-HIP never linked (`-lcudart`
+    // / `-lcublasLt` had no provider). hipcc links libamdhip64 into each shim, so
+    // the AMD runtime is pulled via the shim's DT_NEEDED at serve time (needs
+    // /opt/rocm/lib on LD_LIBRARY_PATH alongside this OUT_DIR).
+    for (src_name, so_name) in [
+        ("libcuda_hip_shim.cpp", "libcuda.so"),
+        ("libcudart_hip_shim.cpp", "libcudart.so"),
+        ("libcublaslt_stub.cpp", "libcublasLt.so"),
+    ] {
+        let src = manifest_dir.join("hip").join(src_name);
+        assert!(src.exists(), "HIP shim source missing at {}", src.display());
+        println!("cargo:rerun-if-changed={}", src.display());
+        let out = out_dir.join(so_name);
+        let status = std::process::Command::new(&hipcc)
+            .args([
+                "-shared",
+                "-fPIC",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run hipcc for {so_name} ({hipcc}): {e}"));
+        assert!(
+            status.success(),
+            "hipcc failed building {so_name} from {}",
+            src.display()
+        );
+    }
+    // OUT_DIR first on the link search path so `-lcuda`/`-lcudart`/`-lcublasLt`
+    // resolve to the shims.
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!(
-        "cargo:warning=atlas-kernels: built libcuda→HIP shim at {}",
-        shim_out.display()
+        "cargo:warning=atlas-kernels: built HIP shims (libcuda/libcudart/libcublasLt) in {}",
+        out_dir.display()
+    );
+}
+
+/// Windows native-HIP runtime shim. Builds ONE `cuda.dll` from the real cu*
+/// (libcuda_hip_shim.cpp) and cudart (libcudart_hip_shim.cpp) HIP mappings plus
+/// the cuBLASLt stub, linked against `amdhip64.lib`, and generates its import
+/// library. cudarc dlopens `["cuda","nvcuda"]` at runtime, so the DLL is copied
+/// to `nvcuda.dll`; spark's own FFI links `-lcuda`/`-lcudart`/`-lcublasLt`, so
+/// the import lib is copied to all three names (each carries every export, the
+/// linker binds each symbol once). The runtime DLLs (`nvcuda.dll` +
+/// `amdhip64.dll`) are staged into OUT_DIR for the packaging step to bundle
+/// beside `spark.exe`. Mirrors the Linux `.so` shims — same mappings, proven to
+/// link on gfx1151. (Hosted CI has no AMD GPU, so CI proves compile+link+package,
+/// not execution.)
+fn build_hip_shim_windows(manifest_dir: &std::path::Path, out_dir: &std::path::Path) {
+    let hipcc = std::env::var("ATLAS_HIPCC")
+        .expect("ATLAS_HIPCC must point at the Windows HIP SDK hipcc for the hip target");
+    let hip_path =
+        std::env::var("HIP_PATH").expect("HIP_PATH must be set for the windows hip build");
+    let hip_root = std::path::Path::new(&hip_path);
+
+    // 1. Compile the three shims to objects (host C++ over HIP; no -fPIC on MSVC).
+    let sources = [
+        "libcuda_hip_shim.cpp",
+        "libcudart_hip_shim.cpp",
+        "libcublaslt_stub.cpp",
+    ];
+    let mut objs = Vec::new();
+    for name in sources {
+        let src = manifest_dir.join("hip").join(name);
+        assert!(src.exists(), "HIP shim source missing at {}", src.display());
+        println!("cargo:rerun-if-changed={}", src.display());
+        let obj = out_dir.join(format!("{name}.obj"));
+        let status = std::process::Command::new(&hipcc)
+            .args(["-c", "-O2"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&obj)
+            .status()
+            .unwrap_or_else(|e| panic!("hipcc -c failed for {name} ({e})"));
+        assert!(status.success(), "hipcc failed compiling {name}");
+        objs.push(obj);
+    }
+
+    // 2. Export list: exactly the extern symbols the objects define, read back
+    // with MSVC `dumpbin /SYMBOLS` (on PATH via msvc-dev-cmd, like cl/lib —
+    // the HIP SDK does not ship llvm-nm at a stable path). Reading the objects
+    // means the .def can never drift from the sources. Defined externals are
+    // `SECTn ... External | <name>`; undefined imports (the hip* the shim calls)
+    // are `UNDEF` and start with `hip`, so filtering on `External`, not `UNDEF`,
+    // and a `cu` name prefix keeps exactly cu*/cudart/cublasLt.
+    let mut exports = Vec::new();
+    for obj in &objs {
+        let out = std::process::Command::new("dumpbin")
+            .arg("/SYMBOLS")
+            .arg(obj)
+            .output()
+            .unwrap_or_else(|e| panic!("dumpbin /SYMBOLS failed on {} ({e})", obj.display()));
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.contains("External")
+                && !line.contains("UNDEF")
+                && let Some(name) = line.split_whitespace().last()
+                && name.starts_with("cu")
+            {
+                exports.push(name.to_string());
+            }
+        }
+    }
+    exports.sort();
+    exports.dedup();
+    assert!(
+        !exports.is_empty(),
+        "no cu*/cudart/cublasLt exports found in shim objects"
+    );
+    let def = out_dir.join("atlas_hip_cuda.def");
+    std::fs::write(&def, format!("EXPORTS\n{}\n", exports.join("\n"))).expect("write cuda.def");
+
+    // 3. Link cuda.dll + its import lib against amdhip64 (hipcc -> clang -> lld-link).
+    let dll = out_dir.join("cuda.dll");
+    let implib = out_dir.join("cuda.lib");
+    let amdhip = hip_root.join("lib").join("amdhip64.lib");
+    let mut link = std::process::Command::new(&hipcc);
+    link.arg("-shared");
+    for obj in &objs {
+        link.arg(obj);
+    }
+    let status = link
+        .arg(&amdhip)
+        .arg("-o")
+        .arg(&dll)
+        .arg(format!("-Wl,/DEF:{}", def.display()))
+        .arg(format!("-Wl,/IMPLIB:{}", implib.display()))
+        .status()
+        .unwrap_or_else(|e| panic!("hipcc -shared (cuda.dll) failed ({e})"));
+    assert!(status.success(), "linking cuda.dll failed");
+
+    // 4. cudarc dlopens nvcuda.dll; spark links cuda/cudart/cublasLt.lib. One DLL,
+    // one import lib carrying every export, copied to each needed name.
+    std::fs::copy(&dll, out_dir.join("nvcuda.dll")).expect("copy cuda.dll -> nvcuda.dll");
+    for lib in ["cudart.lib", "cublasLt.lib"] {
+        std::fs::copy(&implib, out_dir.join(lib))
+            .unwrap_or_else(|e| panic!("copy import lib -> {lib}: {e}"));
+    }
+
+    // 5. Stage the HIP runtime DLL for packaging. On Windows it is versioned
+    // (amdhip64_6.dll, not amdhip64.dll), so glob `amdhip64*.dll` under the SDK
+    // bin. If absent (a driverless CI runner may ship only the import lib), it
+    // is not fatal: amdhip64 is an AMD-driver component present on any real AMD
+    // Windows host, so the shipped shim resolves it there. Informational, not a
+    // warning, so a green build is not noisy.
+    let mut staged_runtime = false;
+    if let Ok(entries) = std::fs::read_dir(hip_root.join("bin")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("amdhip64") && name.ends_with(".dll") {
+                std::fs::copy(entry.path(), out_dir.join(&*name))
+                    .unwrap_or_else(|e| panic!("stage {name}: {e}"));
+                staged_runtime = true;
+            }
+        }
+    }
+    if !staged_runtime {
+        println!(
+            "cargo:warning=atlas-kernels: no amdhip64*.dll in {}\\bin to bundle — it is an AMD-driver component, present on real AMD Windows hosts at runtime.",
+            hip_root.display()
+        );
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    // Record the dir holding nvcuda.dll/amdhip64.dll so the packaging step bundles them.
+    println!(
+        "cargo:rustc-env=ATLAS_HIP_RUNTIME_DIR={}",
+        out_dir.display()
+    );
+    println!(
+        "cargo:warning=atlas-kernels: built Windows HIP runtime shim (cuda.dll/nvcuda.dll + import libs, {} exports) at {}",
+        exports.len(),
+        out_dir.display()
     );
 }
 
 /// Resolve all compilation targets from env vars, expanding wildcards.
 fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
-    let hw = env::var("ATLAS_TARGET_HW").unwrap_or_else(|_| "gb10".into());
-    let model_spec = env::var("ATLAS_TARGET_MODEL").unwrap_or_else(|_| "qwen3-next-80b-a3b".into());
+    let kernels_root = workspace_root.join("kernels");
+
+    let hw = env::var("ATLAS_TARGET_HW").unwrap_or_else(|_| build_diagnose::DEFAULT_HW.into());
+    let model_spec = env::var("ATLAS_TARGET_MODEL").unwrap_or_else(|_| "*".into());
     let quant_spec = env::var("ATLAS_TARGET_QUANT").unwrap_or_else(|_| "nvfp4".into());
 
-    let hw_dir = workspace_root.join("kernels").join(&hw);
+    let hw_dir = kernels_root.join(&hw);
     assert!(
         hw_dir.is_dir(),
-        "Hardware kernel directory not found: {}",
-        hw_dir.display()
+        "{}",
+        build_diagnose::unknown_hw(&kernels_root, &hw)
     );
+
+    // Nothing else in the build names the hardware it chose. Say it here,
+    // before any of it can fail somewhere that never mentions the env var —
+    // but AFTER the target is known to exist, so a rejected target is not
+    // also announced as the one being built.
+    build_diagnose::warn_if_defaulted(&kernels_root, &hw, &model_spec, &quant_spec);
 
     // Parse HARDWARE.toml (shared across all models for this hw)
     let hw_toml_path = hw_dir.join("HARDWARE.toml");
@@ -695,18 +1033,46 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
     for model in &models {
         let model_dir = hw_dir.join(model);
         if !model_dir.is_dir() {
-            panic!("Model kernel directory not found: {}", model_dir.display());
+            panic!("{}", build_diagnose::unknown_model(&hw_dir, &hw, model));
         }
 
-        // Expand quant wildcard
+        // `[model] kernel_source` — this target compiles another target's
+        // kernel sources instead of shipping its own copies (SSOT for
+        // architecturally-identical checkpoints: qwen3.8-27b reuses
+        // qwen3.6-27b's .cu files verbatim rather than vendoring 26
+        // duplicates). MODEL.toml (sampling/behavior/model_types/…) still
+        // comes from THIS target's own directory; only the quant kernel
+        // dirs are redirected. Chains are refused — a source must own its
+        // sources.
+        let kernel_src_dir = match parse_kernel_source(&model_dir) {
+            Some(src) => {
+                let src_dir = hw_dir.join(&src);
+                assert!(
+                    src_dir.is_dir() && src_dir.join("MODEL.toml").exists(),
+                    "{model}/MODEL.toml: kernel_source = \"{src}\" does not name a kernel \
+                     target directory under {}",
+                    hw_dir.display()
+                );
+                assert!(
+                    parse_kernel_source(&src_dir).is_none(),
+                    "{model}/MODEL.toml: kernel_source = \"{src}\" itself redirects — \
+                     chains are not allowed; point at the target that owns the sources"
+                );
+                src_dir
+            }
+            None => model_dir.clone(),
+        };
+
+        // Expand quant wildcard (against the source dir, which owns the
+        // per-quant kernel subdirectories).
         let quants: Vec<String> = if quant_spec == "*" {
-            list_subdirs(&model_dir)
+            list_subdirs(&kernel_src_dir)
         } else {
             vec![quant_spec.clone()]
         };
 
         for quant in &quants {
-            let model_kernel_dir = model_dir.join(quant);
+            let model_kernel_dir = kernel_src_dir.join(quant);
             // Shared kernels live in `kernels/<hw>/common/` and apply to
             // every (model, quant) target on this hardware. Most kernels
             // here are dtype-agnostic (BF16 norms/embeds/attn) — the dir
@@ -738,10 +1104,15 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
             // flags (deduped, model last) and wins per-key on [modules].
             let mut extra_flags: Vec<String> = Vec::new();
             let mut module_overrides: HashMap<String, String> = HashMap::new();
+            // Shadow-drop exemptions merge the same way: common/ declares the
+            // repo-wide superseded kernels, a model KERNEL.toml adds the ones
+            // only IT may drop (e.g. mistral's divergent RoPE convention).
+            let mut shadow_exempt: Vec<(String, String)> = Vec::new();
             if has_common_dir && common_kernel_dir.join("KERNEL.toml").exists() {
                 let (f, m) = parse_kernel_toml(&common_kernel_dir, &target_vendor);
                 extra_flags.extend(f);
                 module_overrides.extend(m);
+                shadow_exempt.extend(parse_shadow_exempt(&common_kernel_dir));
             }
             if has_model_dir && model_kernel_dir.join("KERNEL.toml").exists() {
                 let (f, m) = parse_kernel_toml(&model_kernel_dir, &target_vendor);
@@ -751,13 +1122,27 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                     }
                 }
                 module_overrides.extend(m);
+                shadow_exempt.extend(parse_shadow_exempt(&model_kernel_dir));
             }
+            shadow_exempt.sort();
+            shadow_exempt.dedup();
 
-            // Parse sampling presets, behavior, and model_types from MODEL.toml
+            // Parse sampling presets, behavior, and model_types from MODEL.toml.
+            // MODEL.toml is a build INPUT (needles, sampling, behavior are
+            // codegen'd into the binary) but lives one level above the
+            // rerun-tracked quant dir — without this line an edit to it (e.g.
+            // a match_names change that MOVES routing) does not rebuild, and
+            // the binary keeps serving stale routing until an unrelated build.
+            println!(
+                "cargo:rerun-if-changed={}",
+                model_dir.join("MODEL.toml").display()
+            );
             let (s_tt, s_tc, s_nt, s_tools) = parse_sampling_presets(&model_dir);
             let pb = parse_behavior(&model_dir);
             let model_type_matches = parse_model_types(&model_dir);
+            let match_names = parse_match_names(&model_dir);
             let dflash = parse_dflash(&model_dir);
+            let expected_absent = parse_expected_absent(&model_dir);
 
             targets.push(Target {
                 hw: hw.clone(),
@@ -772,19 +1157,27 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 },
                 extra_flags,
                 module_overrides,
+                shadow_exempt,
+                expected_absent,
                 sampling_thinking_text: s_tt,
                 sampling_thinking_coding: s_tc,
                 sampling_non_thinking: s_nt,
                 sampling_tools: s_tools,
                 behavior_thinking_in_tools: pb.thinking_in_tools,
                 behavior_max_thinking_budget: pb.max_thinking_budget,
+                behavior_effort_capped_at_ceiling: pb.effort_capped_at_ceiling,
                 behavior_thinking_default: pb.thinking_default,
                 behavior_fp8_kv_calibration_tokens: pb.fp8_kv_calibration_tokens,
                 behavior_default_kv_dtype: pb.default_kv_dtype,
                 behavior_default_num_drafts: pb.default_num_drafts,
                 behavior_disable_tool_steering: pb.disable_tool_steering,
+                behavior_disable_cwd_hint_injection: pb.disable_cwd_hint_injection,
+                behavior_use_sampling_presets_for_core: pb.use_sampling_presets_for_core,
                 behavior_tool_call_parser: pb.tool_call_parser,
                 behavior_enable_loop_watchdog: pb.enable_loop_watchdog,
+                behavior_enable_think_loop_watchdog: pb.enable_think_loop_watchdog,
+                behavior_honor_eos_inside_thinking: pb.honor_eos_inside_thinking,
+                behavior_cap_thinking_at_max_tokens: pb.cap_thinking_at_max_tokens,
                 behavior_min_p_floor: pb.min_p_floor,
                 behavior_temperature_max: pb.temperature_max,
                 behavior_think_loop_min_repeats: pb.think_loop_min_repeats,
@@ -799,7 +1192,9 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_rollback_resteer: pb.rollback_resteer,
                 behavior_rom_head: pb.rom_head,
                 behavior_tool_retry: pb.tool_retry,
+                behavior_preserve_thinking: pb.preserve_thinking,
                 model_type_matches,
+                match_names,
                 dflash,
             });
         }
@@ -807,7 +1202,93 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
 
     // Sort by (model, quant) for deterministic ordering
     targets.sort_by(|a, b| (&a.model, &a.quant).cmp(&(&b.model, &b.quant)));
+    validate_collision_match_names(&targets);
     targets
+}
+
+/// Fail the BUILD when differently-named targets collide on a
+/// `(model_type, hidden_size)` declaration without every participant
+/// declaring explicit `[model] match_names`.
+///
+/// Runtime resolution (`atlas_kernels::resolve`) breaks such a collision by
+/// matching the needles against the checkpoint reference and hard-errors
+/// when it cannot — but a colliding target with NO needles declared could
+/// never win that tie-break, which is a latent unserveable configuration
+/// nobody would notice until a serve fails. Config shape cannot distinguish
+/// e.g. Qwen3.6-27B from Qwen3.8-27B (bit-identical configs), so the
+/// disambiguation must be declared, and declared at build time.
+fn validate_collision_match_names(targets: &[Target]) {
+    let mut by_pair: HashMap<(&str, Option<usize>), Vec<&Target>> = HashMap::new();
+    for t in targets {
+        for m in &t.model_type_matches {
+            by_pair
+                .entry((m.model_type.as_str(), m.hidden_size))
+                .or_default()
+                .push(t);
+        }
+    }
+    for ((model_type, hidden), group) in by_pair {
+        let mut names: Vec<&str> = group.iter().map(|t| t.model.as_str()).collect();
+        names.sort();
+        names.dedup();
+        if names.len() < 2 {
+            continue; // no collision (multi-quant variants of one target are fine)
+        }
+        for t in &group {
+            assert!(
+                !t.match_names.is_empty(),
+                "kernel targets {names:?} all declare (model_type \"{model_type}\", \
+                 hidden_size {hidden:?}) in [[model_types]], but target \"{}\" has no \
+                 [model] match_names — runtime resolution could never select it \
+                 unambiguously. Add e.g. `match_names = [\"{}\"]` to \
+                 kernels/<hw>/{}/MODEL.toml (needles are case-insensitive substrings \
+                 of the checkpoint's HF id / --model-name / model dir).",
+                t.model,
+                t.model,
+                t.model,
+            );
+        }
+        // Presence is not enough: a target whose every needle is DOMINATED by
+        // a colliding sibling's needle (any reference containing needle X
+        // also contains a substring needle Y of the sibling) can never be the
+        // unique match in this tier — the tier degrades to a guaranteed
+        // Ambiguous startup error for exactly the references it exists to
+        // route. That shape shipped once (qwen3.5-27b's needle set was a
+        // strict subset of qwen3.6-27b's on their shared qwen3_6_moe/5120
+        // entry) and this rejects it at build time.
+        for a in &group {
+            for b in &group {
+                if a.model == b.model {
+                    continue;
+                }
+                let winnable = a.match_names.iter().any(|na| {
+                    let na = na.to_lowercase();
+                    !b.match_names
+                        .iter()
+                        .any(|nb| na.contains(&nb.to_lowercase()))
+                });
+                assert!(
+                    winnable,
+                    "kernel target \"{}\" collides with \"{}\" on (model_type \
+                     \"{model_type}\", hidden_size {hidden:?}), but every one of its \
+                     match_names {:?} contains one of \"{}\"'s needles {:?} — any \
+                     reference matching \"{}\" also matches \"{}\", so \"{}\" can \
+                     never win the tie and the tier always hard-errors Ambiguous. \
+                     Give \"{}\" a needle the sibling does not shadow, or remove \
+                     the colliding [[model_types]] entry.",
+                    a.model,
+                    b.model,
+                    a.match_names,
+                    b.model,
+                    b.match_names,
+                    a.model,
+                    b.model,
+                    a.model,
+                    a.model,
+                );
+            }
+        }
+    }
 }
 
 /// List subdirectory names (not files) in a directory, sorted.
@@ -829,9 +1310,19 @@ fn list_subdirs(dir: &std::path::Path) -> Vec<String> {
 
 #[path = "build_parse.rs"]
 mod build_parse;
+
+// Entry-point resolution for `shadowed_dropped_pairs`. Lives in its own file so
+// `tests/kernel_shadow_detector.rs` can compile the SAME code a build script
+// would otherwise keep untestable — a build script's `#[cfg(test)]` modules are
+// never run by `cargo test`, which is how the previous text-scan shipped a hole
+// with no test that could have noticed.
+#[path = "build_shadow.rs"]
+mod build_shadow;
 use build_parse::{
-    parse_behavior, parse_dflash, parse_kernel_toml, parse_model_types, parse_sampling_presets,
+    parse_behavior, parse_dflash, parse_expected_absent, parse_kernel_source, parse_kernel_toml,
+    parse_match_names, parse_model_types, parse_sampling_presets, parse_shadow_exempt,
 };
+use build_shadow::shadowed_missing_symbols;
 
 /// Collect kernel-source files with shadowing: common dir provides the
 /// base set, model-specific dir can override individual files by matching
@@ -888,4 +1379,58 @@ use build_codegen::generate_target_ptx_rs;
 #[path = "build_target.rs"]
 mod build_target;
 use build_target::resolve_compute_target;
+
+#[path = "build_diagnose.rs"]
+mod build_diagnose;
 // Force recompilation 1775404930
+
+/// Every `(module, kernel)` this target's model-specific files drop relative to
+/// their `common/` namesakes.
+///
+/// SHADOWING DRIFT. Shadowing is whole-file, not per-symbol: a model file
+/// replaces its common namesake entirely. When `common/` later gains a kernel
+/// the fork never picked up, that kernel silently vanishes for this model —
+/// `try_kernel` returns handle 0 and whatever depends on it fails CLOSED. That
+/// is exactly how the 27B lost the four multi-sequence decode kernels
+/// (`gated_delta_rule_decode_f32_{norm,conv_norm,strided,strided_norm}`),
+/// pinning every concurrent decode to the per-sequence fallback until
+/// 2026-07-26.
+///
+/// This list is baked into the binary (`TargetPtxSet::shadowed_dropped`) so the
+/// startup kernel audit can tell the two failure classes apart:
+///
+///   * a lookup that failed AND is in this list — the kernel EXISTS in
+///     `common/`, this model's fork dropped it. A build defect: fatal.
+///   * a lookup that failed and is NOT — the kernel was never compiled for this
+///     target at all (typically another architecture's: MLA, hyper-connection,
+///     CSA). Expected, and merely informational.
+///
+/// Without that split the audit prints ~26 benign entries for a Qwen model and
+/// the one that matters hides among them.
+fn shadowed_dropped_pairs(
+    common_dir: Option<&std::path::Path>,
+    model_dir: &std::path::Path,
+    source_ext: &str,
+    module_overrides: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let Some(common) = common_dir else {
+        return Vec::new();
+    };
+    let common_by_stem: HashMap<String, PathBuf> = find_cu_files(common, source_ext)
+        .into_iter()
+        .map(|f| (f.file_stem().unwrap().to_str().unwrap().to_string(), f))
+        .collect();
+    let mut out = Vec::new();
+    for f in find_cu_files(model_dir, source_ext) {
+        let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
+        let Some(common_f) = common_by_stem.get(&stem) else {
+            continue;
+        };
+        let module = module_overrides.get(&stem).cloned().unwrap_or(stem);
+        for func in shadowed_missing_symbols(common_f, &f) {
+            out.push((module.clone(), func));
+        }
+    }
+    out.sort();
+    out
+}

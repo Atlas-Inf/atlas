@@ -15,6 +15,13 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Feature-1: a resident MoE adapter forces the per-row batched fallback
+        // (folds gate/up/down route-agnostically; base rows no-op; same
+        // moe_output[3,H]), skipping any no-fold fast path. Install-time gate →
+        // graph-safe (graphs drain on rotate/swap). Router adapter refused inside.
+        if self.lora.is_some() {
+            return self.forward_batched(input, 3, ctx, stream);
+        }
         // BF16 (FP8-dequant-on-load) experts have no fused batch3 kernel.
         // The FP8 batch3 branch below would read expert weights that were
         // FREED at dequant-load → garbage MTP-verify logits → degenerate
@@ -22,6 +29,32 @@ impl MoeLayer {
         // batched path, which produces the same moe_output()[3,H]. (SSOT:
         // reuses the decode BF16 kernels via forward_batched.)
         if self.bf16_gate_weight_ptrs.is_some() {
+            return self.forward_batched(input, 3, ctx, stream);
+        }
+        // Mixed NVFP4-routed / BF16-shared (Laguna): batch the routed half
+        // through the _t kernels and run the shared expert as one batched BF16
+        // pass afterwards. See forward_k2 for the rationale.
+        let mixed_bf16_shared = self.has_mixed_bf16_shared_expert();
+        if mixed_bf16_shared
+            && !(self.use_t_layout_for_decode()
+                && self.moe_expert_gate_up_shared_batch3_t_k.0 != 0
+                && self.moe_expert_silu_down_shared_batch3_t_k.0 != 0
+                && !(ctx.comm.is_some() && ctx.config.ep_world_size > 1))
+        {
+            return self.forward_batched(input, 3, ctx, stream);
+        }
+        // E8M0 (native MXFP4, per-32 E8M0 scale) routed experts MUST NOT reach
+        // the unified-T batch3 kernel `moe_expert_gate_up_shared_batch3_t`: like
+        // its K=2 twin it is an NVFP4 kernel that hardcodes GROUP_SIZE=16 and
+        // would read `inter·h/16` scale bytes from the correctly-sized
+        // `inter·h/32` E8M0 scale buffer — a 2× over-read →
+        // CUDA_ERROR_ILLEGAL_ADDRESS (it also E4M3-decodes E8M0 scale bytes →
+        // garbage even in-bounds). No E8M0 batch3 kernel exists, so route all 3
+        // verify tokens through the per-token unified-T path (`forward_batched`),
+        // whose `use_t_layout_for_prefill` branch selects the GS32 `_e8m0`
+        // kernel via `e8m0_or` — the same correct path ordinary decode already
+        // uses. Mirrors the K=2 guard at the top of `forward_k2`.
+        if k3_e8m0_needs_per_token(self.experts_scale_kind) {
             return self.forward_batched(input, 3, ctx, stream);
         }
 
@@ -93,6 +126,8 @@ impl MoeLayer {
                 stream,
             )?;
         }
+
+        super::union_stats::maybe_sample_expert_union(ctx, indices_dev, 3, top_k as usize, stream);
 
         // 3-5. Fused expert dispatch for 3 tokens
         let expert_gate_out = ctx.buffers.expert_gate_out();
@@ -186,9 +221,18 @@ impl MoeLayer {
                 .as_ref()
                 .expect("down_ptrs_t under unified_t");
             let null_qw = QuantizedWeight::null();
-            let sh_gate_t = self.shared_gate_t.as_ref().unwrap_or(&null_qw);
-            let sh_up_t = self.shared_up_t.as_ref().unwrap_or(&null_qw);
-            let sh_down_t = self.shared_down_t.as_ref().unwrap_or(&null_qw);
+            // Mixed config: in-kernel shared expert off (NULL), computed in
+            // BF16 below instead — the NVFP4 shared_*_t tables are load-time
+            // placeholders and numerically wrong for this checkpoint.
+            let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared {
+                (&null_qw, &null_qw, &null_qw)
+            } else {
+                (
+                    self.shared_gate_t.as_ref().unwrap_or(&null_qw),
+                    self.shared_up_t.as_ref().unwrap_or(&null_qw),
+                    self.shared_down_t.as_ref().unwrap_or(&null_qw),
+                )
+            };
             ops::moe_expert_gate_up_shared_batch3_t(
                 ctx.gpu,
                 self.moe_expert_gate_up_shared_batch3_t_k,
@@ -228,6 +272,43 @@ impl MoeLayer {
                 h,
                 inter,
                 top_k,
+                stream,
+            )?;
+            if mixed_bf16_shared {
+                let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
+                self.run_bf16_shared_expert(
+                    input,
+                    3,
+                    h,
+                    shared_inter,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    shared_down_out,
+                    ctx,
+                    stream,
+                )?;
+            }
+            // The _t branch previously returned without writing moe_output at
+            // all — every sibling branch ends in this blend.
+            let shared_for_blend = if is_ep && !shared_down_out.is_null() {
+                ctx.gpu
+                    .memset_async(expert_gate_out, 0, 3 * h as usize * 2, stream)?;
+                expert_gate_out
+            } else {
+                shared_down_out
+            };
+            ops::moe_weighted_sum_blend_batch3(
+                ctx.gpu,
+                self.moe_weighted_sum_blend_batch3,
+                output,
+                expert_down_out,
+                weights_dev,
+                shared_for_blend,
+                input,
+                self.weights.shared_expert_gate.weight,
+                h,
+                top_k,
+                h,
                 stream,
             )?;
         } else {
@@ -336,3 +417,19 @@ impl MoeLayer {
         Ok(())
     }
 }
+
+/// K=3-verify MoE dispatch guard — the K=3 twin of `k2_e8m0_needs_per_token`
+/// (`forward_k2.rs`). E8M0 (native MXFP4, per-32 E8M0 scale) routed experts
+/// MUST take the per-token unified-T path (GS32 `_e8m0` kernel via `e8m0_or`),
+/// NOT the GS16 NVFP4 `moe_expert_gate_up_shared_batch3_t` batch3 kernel: that
+/// kernel reads `inter·h/16` scale bytes from the correctly-sized `inter·h/32`
+/// E8M0 scale buffer — a 2× over-read → CUDA_ERROR_ILLEGAL_ADDRESS.
+/// Pure decision, unit-tested and wired at the top of `forward_k3`.
+pub(crate) fn k3_e8m0_needs_per_token(scale_kind: crate::weight_map::WeightQuantFormat) -> bool {
+    matches!(scale_kind, crate::weight_map::WeightQuantFormat::Mxfp4E8m0)
+}
+
+// Focused dispatch tests live in a sibling file (same pattern as forward_k2).
+#[cfg(test)]
+#[path = "forward_k3_dispatch_tests.rs"]
+mod k3_dispatch_tests;

@@ -20,6 +20,24 @@ use crate::layer::{ForwardContext, LayerState, SsmLayerState};
 use crate::layers::ops;
 use crate::traits::{Model, SequenceState};
 
+/// Route the BF16 lm_head decode through the batched GEMV (dense_gemv_bf16_batchm)
+/// instead of the scalar dense_gemm_bf16. Default ON. Mirrors PR #332's
+/// ATLAS_LMHEAD_BATCH_GEMV for the NVFP4 head; this is the BF16 sibling.
+fn lmhead_batch_gemv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_LMHEAD_BATCH_GEMV").ok().as_deref() != Some("0"))
+}
+
+/// Multi-seq decode CUDA graphs: **ON by default**, disabled by
+/// `ATLAS_NO_DECODE_GRAPHS_MULTISEQ=1`.
+///
+/// Strict `== "1"` on an `ATLAS_NO_*` name rather than a presence check —
+/// presence-checked flags here are ENABLED by `=0`. Read once per process.
+fn multiseq_graphs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_NO_DECODE_GRAPHS_MULTISEQ").as_deref() != Ok("1"))
+}
+
 impl TransformerModel {
     pub(super) fn decode_batch_dispatch(
         &self,
@@ -29,10 +47,16 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         let n = tokens.len();
         assert_eq!(n, seqs.len(), "tokens.len() must equal seqs.len()");
+        // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly
+        // once, HERE — outside the CUDA-graph region. No-op without the flag.
+        for s in seqs.iter_mut() {
+            self.ssm_h_to_f16_dispatch(s)?;
+        }
 
-        // Single-sequence: delegate to decode() which uses CUDA graphs.
-        // decode_batch disables graphs for n≥2 (SSM state pointer staleness),
-        // but n=1 is safe and benefits from graph replay (2x throughput).
+        // Single-sequence: delegate to decode() which uses its own slot-keyed
+        // graph cache. (Stale comment removed: n>=2 is ALSO graphed — see the
+        // slot-vector-keyed `batch_decode_graphs` in decode_batch_compute_main,
+        // default-ON since 2026-07-27.)
         //
         // Broadcast the seq_id preamble + cmd here (rather than in the
         // scheduler) so the EP n>1 branch below can interleave broadcasts
@@ -141,6 +165,24 @@ impl TransformerModel {
         _stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        // SOLID Incr-4 pre-lookup guard (the bail `forward_batched.rs` and
+        // `build_moe_row_adapter_decode` document): a batch with a row routed
+        // to a NON-active adapter cannot be served by the single-active fold —
+        // the per-row map defensively writes such rows as base, so proceeding
+        // would SILENTLY serve base weights for an adapter-routed request.
+        // Bail before ANY per-step work (embed / metadata / row-map upload /
+        // graph lookup), keeping the captured padded_n graphs route-agnostic.
+        // The route is stamped per batch at the `Model` entry
+        // (`stamp_decode_moe_batch`).
+        crate::lora::ensure_decode_route_servable(
+            self.decode_moe_route(),
+            "decode_batch_compute_main",
+        )?;
+        // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly
+        // once, HERE — outside the CUDA-graph region. No-op without the flag.
+        for s in seqs.iter_mut() {
+            self.ssm_h_to_f16_dispatch(s)?;
+        }
         if std::env::var("ATLAS_DECODE_BATCH_LOG").ok().as_deref() == Some("1") {
             let slots: Vec<i64> = seqs
                 .iter()
@@ -164,8 +206,86 @@ impl TransformerModel {
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
-        // Pad to nearest captured graph size [2, 4, 8]
-        let padded_n = [2, 4, 8].iter().copied().find(|&s| s >= n).unwrap_or(n);
+        // Pad to the nearest captured graph size — SSOT ladder in
+        // `traits::padded_batch_n` (now includes 12 and 16 for the C-sweep).
+        let padded_n = crate::traits::padded_batch_n(n);
+
+        // CUDA graphs for multi-sequence decode (ATLAS_DECODE_GRAPHS_MULTISEQ=1).
+        //
+        // SSM h_state/conv_state pointers ARE baked into per-seq kernel args at
+        // capture, so the cache is keyed by the per-row SSM slot VECTOR — see
+        // `decode_graph_key.rs` for why the former `padded_n` key was unsound.
+        // Everything else captured (metadata, block tables, embed, scratch) is
+        // a fixed address refreshed every step BEFORE replay. This is the
+        // dominant lever for n>=2 decode (eliminates ~1500 launches/step).
+        //
+        // DEFAULT-ON since 2026-07-27; disable with
+        // ATLAS_NO_DECODE_GRAPHS_MULTISEQ=1. Measurements + the rewrite this
+        // retired: `decode_graph_key.rs`.
+        let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
+        // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
+        // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
+        let lora_eager = self.lora.is_some() && self.levers.lora_eager;
+        let graph_key = if !ms_profile && !lora_eager && multiseq_graphs_enabled() {
+            self.batch_decode_graph_key(&*seqs, padded_n)
+        } else {
+            None
+        };
+        let use_graphs = graph_key.is_some();
+
+        // Lock order: kv_cache BEFORE the graph cache, matching verify_e.
+        let mut kv_cache = self.kv_cache.lock();
+
+        // ── Phase 2 (decision): exact CUDA-graph hit, or drain-tail borrow ──
+        let mut graphs = if use_graphs {
+            Some(self.batch_decode_graphs.lock())
+        } else {
+            None
+        };
+
+        // Exact hit (LRU-touched), else borrow a WIDER captured graph
+        // (`graph_borrow.rs`): a drain batch's slot vector is a prefix of the
+        // steady-state canonical vector, so the wider graph's active rows are
+        // exactly this batch's rows and its tail rows pad on the dummy slot
+        // or currently-free slots. `dispatch_n` is the width Phase 1 must
+        // prepare (embeds/metadata) — the borrowed graph's captured width on
+        // a borrow, `padded_n` otherwise.
+        let mut replay: Option<spark_runtime::gpu::GraphHandle> = None;
+        let mut dispatch_n = padded_n;
+        if let (Some(g), Some(key)) = (&mut graphs, &graph_key) {
+            g.1 += 1;
+            let tick = g.1;
+            if let Some(e) = g.0.get_mut(key) {
+                e.1 = tick;
+                replay = Some(e.0);
+            } else if super::graph_borrow::graph_borrow_enabled()
+                && self.comm.is_none()
+                && self.config.num_ssm_layers() > 0
+            {
+                let dummy = self.ssm_pool.dummy_slot() as u32;
+                let borrowed =
+                    super::graph_borrow::find_borrowable_decode_key(&key[..n], g.0.keys(), |s| {
+                        s == dummy || self.ssm_pool.slot_is_free(s as usize)
+                    });
+                if let Some(bk) = borrowed {
+                    dispatch_n = bk.len();
+                    let e =
+                        g.0.get_mut(&bk)
+                            .expect("borrowed key comes from this cache");
+                    e.1 = tick;
+                    replay = Some(e.0);
+                    // INFO once per transition (same cardinality as the
+                    // captures this replaces); repeats of the same pair
+                    // stay silent. Provable engagement: grep "graph borrow".
+                    if super::graph_borrow::DECODE_BORROW_LOG.should_log(key, &bk) {
+                        tracing::info!(
+                            "decode graph borrow: n={n} padded_n={padded_n} -> replaying \
+                             captured width {dispatch_n}"
+                        );
+                    }
+                }
+            }
+        }
 
         // ── Phase 1: Pre-graph (runs every step, NOT captured) ──
 
@@ -174,13 +294,12 @@ impl TransformerModel {
             self.embed(tok, hidden.offset(i * h * fp32), stream)?;
         }
 
-        // 1b. Zero padding hidden[n..padded_n)
-        for i in n..padded_n {
+        // 1b. Zero padding hidden[n..dispatch_n)
+        for i in n..dispatch_n {
             self.gpu.memset(hidden.offset(i * h * fp32), 0, h * fp32)?;
         }
 
         // 1c. Allocate KV blocks for active sequences
-        let mut kv_cache = self.kv_cache.lock();
         let bs = kv_cache.block_size();
         for seq in seqs.iter_mut() {
             let blocks_needed = (seq.seq_len / bs) + 1;
@@ -191,40 +310,29 @@ impl TransformerModel {
                 self.prefix_cache.as_ref(),
                 self.gpu.as_ref(),
                 stream,
+                self.levers.kv_poison,
             )?;
         }
 
         // 1d. Upload metadata with fixed stride (active + padding)
-        let metadata = self.upload_batch_metadata_fixed(seqs, padded_n, &mut kv_cache, stream)?;
-
-        // CUDA graphs for multi-sequence decode (ATLAS_DECODE_GRAPHS_MULTISEQ=1).
-        //
-        // The historical concern was that SSM h_state/conv_state pointers get
-        // baked into per-seq kernel args at capture, going stale when batch
-        // composition changes. That does NOT happen here: the scheduler holds
-        // the invariant that active sequences occupy contiguous SSM pool slots
-        // [0..n) in batch order (compact_sequence migrates survivors), verified
-        // empirically (slots always == [0,1,..,n-1]). So position i's state is
-        // ALWAYS at pool_base + i*stride — a fixed address baked correctly at
-        // capture; replay reads whatever sequence currently occupies slot i.
-        // Pad positions use the fixed dummy slot. Attention metadata, KV block
-        // tables, embed, and all scratch buffers are at fixed device addresses
-        // refreshed every step BEFORE replay. So a graph keyed by padded_n is
-        // valid across replays. This is the dominant lever for n>=2 decode
-        // (eliminates ~1500 kernel launches/step). Opt-in until soaked; flip
-        // the default once validated. Verify correctness with the needle test.
-        let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
-        // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
-        let use_graphs = !ms_profile
-            && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
-                .ok()
-                .as_deref()
-                == Some("1");
+        let metadata = self.upload_batch_metadata_fixed(seqs, dispatch_n, &mut kv_cache, stream)?;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            // SOLID Incr-4: batched decode FOLDS. `Refuse` was bailed by the
+            // pre-lookup guard above; the metadata carries the per-row
+            // `moe_row_adapter` map (`upload_batch_metadata_fixed`), and the
+            // MoE decode ladder's token-major arm delegates to
+            // `forward_batched`'s per-row router/gate-up/down folds whenever
+            // an adapter is resident (presence gate, like forward_k2/k3).
+            // Base (Skip) batches still pay nothing.
+            moe_lora_route: self.decode_moe_route(),
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(metadata),
             profile: false,
             comm: self.comm_ref(),
@@ -232,18 +340,11 @@ impl TransformerModel {
             gdn_exact_replay: false,
             midchunk_capture: None,
             token_ids: None,
+            routed_lora_layers: None, // #30: batched decode never routes prefill.
+            midchunk_capture: None,
         };
 
-        // ── Phase 2: CUDA graph lookup / capture ──
-        let mut graphs = if use_graphs {
-            Some(self.batch_decode_graphs.lock())
-        } else {
-            None
-        };
-
-        if let Some(ref graphs) = graphs
-            && let Some(&graph) = graphs.get(&padded_n)
-        {
+        if let Some(graph) = replay {
             // Graph exists — replay (kernels use updated metadata + SSM pool addresses)
             if graph.0 != 0 {
                 self.gpu.launch_graph(graph, stream)?;
@@ -296,6 +397,15 @@ impl TransformerModel {
                             conv_state_checkpoint: None,
                             h_state_intermediates: Vec::new(),
                             conv_state_intermediates: Vec::new(),
+                            // Padding rows point at the write-only dummy slot;
+                            // tag them with the active mode so the decode mixer
+                            // does not re-convert scratch on every single step.
+                            h_is_f16: crate::layers::qwen3_ssm::ssm_h_fp16_enabled(),
+                            // Decode-only rows: never prefilled. Carried
+                            // anyway so the dummy slot's geometry matches a
+                            // real one and a stray prefill over it stages
+                            // rather than overruns.
+                            h_prefill_stage: self.ssm_pool.h_prefill_stage(dummy_ssm_slot),
                         }));
                         ssm_idx += 1;
                     } else {
@@ -405,46 +515,14 @@ impl TransformerModel {
             // ~N×254 MB/step). nvfp4/dense are batched here; FP8 single-scale
             // keeps the per-row path (no batched single-scale FP8 GEMM handle
             // on the model, and Holo's lm_head is NVFP4 anyway).
-            let logits = self.buffers.logits();
-            let v = self.config.vocab_size;
-            if let Some(ref fp8) = self.lm_head_fp8 {
-                for i in 0..padded_n {
-                    ops::dense_gemv_fp8w(
-                        self.gpu.as_ref(),
-                        self.dense_gemv_fp8w_kernel,
-                        normed.offset(i * h * bf16),
-                        fp8,
-                        logits.offset(i * v * bf16),
-                        v as u32,
-                        h as u32,
-                        stream,
-                    )?;
-                }
-            } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
-                ops::w4a16_gemm(
-                    self.gpu.as_ref(),
-                    self.w4a16_gemm_kernel,
-                    normed,
-                    nvfp4,
-                    logits,
-                    padded_n as u32,
-                    v as u32,
-                    h as u32,
-                    stream,
-                )?;
-            } else {
-                ops::dense_gemm(
-                    self.gpu.as_ref(),
-                    self.dense_gemm_kernel,
-                    normed,
-                    &self.lm_head_weight,
-                    logits,
-                    padded_n as u32,
-                    v as u32,
-                    h as u32,
-                    stream,
-                )?;
-            }
+            // The ladder itself lives in `lm_head_batched.rs` — the mixed
+            // co-dispatch head (`decode_b2::mixed_final_norm_lm_head`) calls
+            // the same function, so the two heads cannot pick different
+            // kernels for the same `padded_n`.
+            // The returned pointer is discarded here: this path reports its
+            // logits through `self.decode_logits_ptr()` at the end of the
+            // function, which reads the same buffer.
+            self.lm_head_project_batched(normed, padded_n, h, bf16, stream)?;
             if let Some(t0) = lmhead_t0 {
                 self.gpu.synchronize(stream).ok();
                 let head_us = t0.elapsed().as_micros();
@@ -464,9 +542,11 @@ impl TransformerModel {
             if use_graphs {
                 let graph = self.gpu.end_capture(stream)?;
                 if graph.0 != 0 {
-                    tracing::info!("Captured CUDA graph for batch size {padded_n}");
-                    if let Some(ref mut g) = graphs {
-                        g.insert(padded_n, graph);
+                    tracing::info!(
+                        "Captured CUDA graph for batch size {padded_n} (n={n}, slots={graph_key:?})"
+                    );
+                    if let (Some(g), Some(key)) = (graphs.as_mut(), graph_key.clone()) {
+                        self.insert_batch_decode_graph(g, key, graph);
                     }
                     self.gpu.launch_graph(graph, stream)?;
                 }

@@ -9,6 +9,11 @@
 
 use super::*;
 
+// The `OnceLock<bool>` static that lived here is now a field on
+// `layers::ops::ModelLevers` — resolved when the model is built and carried
+// on `ForwardContext`, because a static outlives the model whose flags it
+// encodes.
+
 impl Qwen3SsmLayer {
     /// GDN prefill recurrence via the WY4-persistent kernel.
     ///
@@ -86,8 +91,12 @@ impl Qwen3SsmLayer {
                     let mut start = 0usize;
                     if let Some(ce) = cap.cap_local_early {
                         seg(0, ce as u32)?;
-                        ctx.gpu
-                            .copy_d2d_async(h_state, cap.h_dsts_early[idx], cap.h_bytes, stream)?;
+                        ctx.gpu.copy_d2d_async(
+                            h_state,
+                            cap.h_dsts_early[idx],
+                            cap.h_bytes,
+                            stream,
+                        )?;
                         start = ce;
                     }
                     // Capture h_state @ the tail boundary tb.
@@ -179,12 +188,16 @@ impl Qwen3SsmLayer {
         {
             // One-time positive signal that the FLA path is live (vs silently
             // falling through to wy4 on a guard miss) — greppable in the server log.
-            static FLA_LOG: std::sync::Once = std::sync::Once::new();
-            FLA_LOG.call_once(|| {
+            // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+            // value — the message is rebuilt from the arguments every call — so a
+            // stale entry cannot produce a wrong answer, only a suppressed duplicate
+            // line after a model swap. Scoping it would thread a logging concern
+            // through the call path to prevent one repeated INFO line.
+            if ctx.stats.once("log:gdn_fla_chunked") {
                 tracing::info!(
                     "GDN prefill: FLA chunked path ACTIVE (baked default: recompute_wu → chunk_delta_h_ksplit → chunk_fwd_o)"
                 );
-            });
+            }
             let num_chunks = k.div_ceil(64);
             let nt = num_chunks as usize;
             let w_out = fla_scratch;
@@ -227,7 +240,7 @@ impl Qwen3SsmLayer {
                 ctx.profile,
                 stream,
             )?;
-        } else if std::env::var_os("ATLAS_GDN_REGRESIDENT").is_some()
+        } else if ctx.levers.gdn_regresident
             && kd == 128
             && vd == 128
             && self.gdn_prefill_regresident_k.0 != 0
@@ -238,13 +251,19 @@ impl Qwen3SsmLayer {
             // registers (one warp per v-column, 4 k-rows/lane) instead of 64KB
             // smem, so >=2 CTA/SM and no per-token barriers. Token-equal to WY4
             // (cosine 1.0, max|dH|~1e-8 — same acceptance class) and ~2.9x faster
-            // in isolation. Gated by ATLAS_GDN_REGRESIDENT until serve-validated.
-            static RR_LOG: std::sync::Once = std::sync::Once::new();
-            RR_LOG.call_once(|| {
+            // in isolation.
+            //
+            // DEFAULT-ON since 2026-07-25 — see `gdn_regresident_enabled`.
+            // Log-once latch (see `atlas_core::scope`). It holds no model-derived
+            // value — the message is rebuilt from the arguments every call — so a
+            // stale entry cannot produce a wrong answer, only a suppressed duplicate
+            // line after a model swap. Scoping it would thread a logging concern
+            // through the call path to prevent one repeated INFO line.
+            if ctx.stats.once("log:gdn_regresident") {
                 tracing::info!(
-                    "GDN prefill: REGISTER-RESIDENT warm-replay path ACTIVE (ATLAS_GDN_REGRESIDENT; H in regs, no smem-H)"
+                    "GDN prefill: REGISTER-RESIDENT warm-replay path ACTIVE (default; H in regs, no smem-H)"
                 );
-            });
+            }
             ops::gdn_prefill_regresident(
                 ctx.gpu,
                 self.gdn_prefill_regresident_k,

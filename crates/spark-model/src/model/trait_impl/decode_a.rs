@@ -28,6 +28,20 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
+    /// Whether the online FP8-KV calibration has frozen its scale, model-wide.
+    ///
+    /// Every calibrating attention layer freezes on ITS first observe within
+    /// the same first forward pass. `true` when NO layer runs online
+    /// calibration — there is nothing to wait for, and the graph-suppression
+    /// gate below is additionally guarded by `fp8_kv_calibration_tokens > 0`.
+    /// Aggregation is all-frozen, not `find_map`: a BF16 boundary layer that
+    /// never observes must not shadow later FP8 layers that already froze.
+    pub(in crate::model) fn fp8_calibration_frozen(&self) -> bool {
+        crate::layers::fp8_calibration::graphs_ready_after_fp8_kv_cal(
+            self.layers.iter().map(|l| l.fp8_calibration_frozen()),
+        )
+    }
+
     pub(super) fn decode_dispatch(
         &self,
         token: u32,
@@ -36,6 +50,9 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         // Use backend's own stream (non-default, required for CUDA graph capture).
         let stream = self.gpu.default_stream();
+        // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly
+        // once, HERE — outside the CUDA-graph region. No-op without the flag.
+        self.ssm_h_to_f16_dispatch(seq)?;
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
@@ -97,6 +114,7 @@ impl TransformerModel {
             self.prefix_cache.as_ref(),
             self.gpu.as_ref(),
             stream,
+            self.levers.kv_poison,
         )?;
 
         let meta_base = self.buffers.scratch().offset(32768);
@@ -118,6 +136,7 @@ impl TransformerModel {
             .copy_h2d_async(&actual_seq_len.to_le_bytes(), meta_base.offset(16), stream)?;
 
         let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
+        // SAFETY: length derived from `bt_i32` itself — `len() * size_of::<i32>()` over the `collect`ed Vec above.
         let bt_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(bt_i32.as_ptr() as *const u8, bt_i32.len() * 4) };
         self.gpu
@@ -129,6 +148,17 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&token.to_le_bytes(), self.buffers.token_ids(), stream)?;
 
+        // ── M2 request-scoped LoRA routing (single-seq decode). Upload this
+        // request's 1-elem adapter-slot buffer to the free +128 gap (positions
+        // @+0..+4, slot @+8..+16, seq_len @+16..+20, block_table @+256 — +128
+        // is clear). Fixed address + per-step contents = graph-safe (same
+        // phasing as positions), uploaded pre-`begin_capture`. `DevicePtr(0)`
+        // when no adapter pool is resident → the K/V/O apply sites take the
+        // byte-identical installed-pair path. `seq.adapter_slot == -1` (no
+        // per-request `adapter` field) resolves to the active slot.
+        let seq_slot =
+            self.upload_seq_slot_uniform(seq.adapter_slot, 1, meta_base.offset(128), stream)?;
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -138,16 +168,22 @@ impl TransformerModel {
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
+            seq_slot,
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         // CUDA graphs cannot capture NCCL all-reduce (it runs on a separate
         // stream) or cuStreamSynchronize calls. Suppress for EP and profile.
-        // Re-enable graphs once FP8 calibration is frozen.
+        // Re-enable graphs once FP8 calibration is frozen — keyed on the
+        // ACTUAL frozen flag, not a token count: the scale freezes on the
+        // first observe, and the old `seq_len > calibration_tokens + 10` gate
+        // kept every process eager for ~266 tokens waiting on a calibration
+        // that had already finished.
         if self.config.fp8_kv_calibration_tokens > 0
             && self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
-            && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
+            && self.fp8_calibration_frozen()
         {
             self.suppress_graphs
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -187,18 +223,29 @@ impl TransformerModel {
         // failure falls back to eager execution (graphs then stay disabled).
         let gdn_graphs =
             std::env::var("ATLAS_GDN_DECODE_GRAPH").is_ok_and(|v| v == "1" || v == "true");
+        // LoRA debugging hatch (ATLAS_LORA_EAGER=1): force eager decode when an
+        // adapter is active so graph-vs-eager delta parity can be compared.
+        // Default (unset) keeps graphs ON — the LoRA delta launches are
+        // capture-safe (pool weights / arena scratch / f32 scale are all
+        // load-time-fixed). Folded in as one more suppressor.
+        let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
             && !self.profile
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
-            && !dump_step0;
+            && !dump_step0
+            && !lora_eager;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(attn_metadata),
             profile: self.profile,
             comm: self.comm_ref(),
@@ -208,6 +255,9 @@ impl TransformerModel {
             // Hash-MoE: the single decode token ID (uploaded above every step
             // before graph replay). MoE reads it at offset 0.
             token_ids: Some(self.buffers.token_ids()),
+            routed_lora_layers: None, // #30: single-seq decode never routes prefill.
+            midchunk_capture: None,
+            moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
         };
 
         // Profile mode: use per-layer sync decode for timing breakdown.
@@ -266,7 +316,7 @@ impl TransformerModel {
         let probe_layers = !use_graphs
             && seq.seq_len == seq.prompt_len
             && std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok();
-        self.decode_forward_body(
+        if let Err(e) = self.decode_forward_body(
             hidden,
             residual,
             seq,
@@ -275,52 +325,23 @@ impl TransformerModel {
             probe_layers,
             use_graphs,
             stream,
-        )?;
-
-        // Decode-step diagnostic for Gemma-4 degeneration analysis. Only fires
-        // when ATLAS_DIAG_GEMMA4=1 (which also disables CUDA graphs upstream,
-        // so the d2h sync below is safe). Reads top-5 tokens by logit so we
-        // can see whether the LM head produced a near-tie or a confident bad
-        // pick. (B4 — Creative haiku degeneration loop diagnostic.)
-        if std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true") {
-            self.gpu.synchronize(stream)?;
-            let n_logits = self.config.vocab_size;
-            // Read the buffer the LM head actually wrote to. With Gemma-4
-            // dense the single-token decode lm_head produces FP32 in
-            // `logits_fp32_buf`; the BF16 buffer would be all zeros there.
-            let logit_vals: Vec<f32> = if self.use_fp32_logits {
-                let mut buf = vec![0u8; n_logits * 4];
-                if let Err(e) = self.gpu.copy_d2h(self.logits_fp32_buf, &mut buf) {
-                    tracing::error!("ATLAS_DIAG_GEMMA4: copy_d2h(logits_fp32_buf): {e:#}");
-                }
-                buf.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect()
-            } else {
-                let mut buf = vec![0u8; n_logits * 2];
-                if let Err(e) = self.gpu.copy_d2h(self.buffers.logits(), &mut buf) {
-                    tracing::error!("ATLAS_DIAG_GEMMA4: copy_d2h(logits BF16): {e:#}");
-                }
-                buf.chunks_exact(2)
-                    .map(|c| {
-                        let bits = u16::from_le_bytes([c[0], c[1]]);
-                        f32::from_bits((bits as u32) << 16)
-                    })
-                    .collect()
-            };
-            let max = logit_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let min = logit_vals.iter().cloned().fold(f32::INFINITY, f32::min);
-            let mut idx: Vec<usize> = (0..logit_vals.len()).collect();
-            idx.sort_by(|&a, &b| {
-                logit_vals[b]
-                    .partial_cmp(&logit_vals[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let top5: Vec<(usize, f32)> = idx.iter().take(5).map(|&i| (i, logit_vals[i])).collect();
-            tracing::warn!(
-                "DIAG decode logits: max={max:.4} min={min:.4} prev_token={token} top5={top5:?}",
-            );
+        ) {
+            // If the body errored WHILE a capture is recording (e.g. a MoE LoRA
+            // refuse — router/non-active adapter/mixed batch — bails out of a
+            // captured decode step), the stream is left in the capturing state.
+            // Left as-is, the caller's cleanup (`free_sequence` → `zero_slot` /
+            // `synchronize`) fails with STREAM_CAPTURE_UNSUPPORTED and every
+            // subsequent op on this stream is poisoned — a single refused request
+            // bricks the whole server. Release the stream (discarding the partial
+            // graph) before propagating; no-op when not capturing. Graphs stay
+            // enabled: the next decode step begins a fresh capture.
+            self.gpu.abort_capture_if_active(stream);
+            return Err(e);
         }
+
+        // Decode-step diagnostic for Gemma-4 degeneration analysis (no-op unless
+        // ATLAS_DIAG_GEMMA4=1). Split into decode_a_diag.rs for the LoC budget.
+        self.diag_gemma4_decode_logits(token, stream)?;
 
         if capture_active {
             match self.gpu.end_capture(stream) {
@@ -369,103 +390,5 @@ impl TransformerModel {
         seq.seq_len += 1;
 
         Ok(self.decode_logits_ptr())
-    }
-
-    /// Single-token decode forward body: per-layer decode + periodic SSM
-    /// state normalization + final RMS norm + LM head.
-    ///
-    /// Runs once per decode step — either eagerly or inside a CUDA graph
-    /// capture region — and a SECOND time as the eager fallback when
-    /// `end_capture` fails (capture records without executing, so a re-run
-    /// performs the step exactly once). Everything here is stream-ordered on
-    /// `stream`; the only host syncs are gated on `!use_graphs` /
-    /// `probe_layers` (both false under capture).
-    fn decode_forward_body(
-        &self,
-        hidden: DevicePtr,
-        residual: DevicePtr,
-        seq: &mut SequenceState,
-        kv_cache: &mut PagedKvCache,
-        ctx: &ForwardContext,
-        probe_layers: bool,
-        use_graphs: bool,
-        stream: u64,
-    ) -> Result<()> {
-        for (i, layer) in self.layers.iter().enumerate() {
-            layer.decode(
-                hidden,
-                residual,
-                seq.layer_states[i].as_mut(),
-                kv_cache,
-                seq.seq_len,
-                &mut seq.block_table,
-                &mut seq.disk_block_ids,
-                &mut seq.disk_last_offloaded_per_layer,
-                ctx,
-                stream,
-            )?;
-            // CBD per-layer hidden fingerprint at decode step 0 (eager only).
-            // Localizes the FIRST layer whose post-layer hidden diverges
-            // cold-vs-ON / ON-vs-ON → pins the bug to that layer's read set.
-            if probe_layers {
-                self.gpu.synchronize(stream).ok();
-                let mut hb = vec![0u8; self.config.hidden_size * 2];
-                if self.gpu.copy_d2h(hidden, &mut hb).is_ok() {
-                    let mut s = 0f64;
-                    for c in hb.chunks_exact(2) {
-                        let bits = u16::from_le_bytes([c[0], c[1]]);
-                        let v = f32::from_bits((bits as u32) << 16) as f64;
-                        if v.is_finite() {
-                            s += v.abs();
-                        }
-                    }
-                    tracing::warn!("ATLAS_LAYER_H[step0] L{i} hidden_sabs={s:.6}");
-                }
-            }
-            // DFlash 5-layer hidden capture (no-op when proposer is not DFlash).
-            // Single-token decode: row 0 of `hidden_states()` holds the post-layer
-            // activation. Cheap d2d when the layer index matches; otherwise a
-            // hashmap-free position() probe over a 5-element vec.
-            self.try_dflash_capture(i, 0, stream)?;
-        }
-        // MLA absorbed attention: defensive sync before final norm in eager
-        // mode. Skipped under graph capture because cuStreamSynchronize is
-        // illegal inside a capture region (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED,
-        // status 900). The sync is redundant when all kernels run on the same
-        // stream — they are already sequenced — so the removal is safe for
-        // both eager (retains sync as paranoia) and graph mode.
-        if self.config.kv_lora_rank > 0 && !use_graphs {
-            self.gpu.synchronize(stream)?;
-        }
-
-        // Periodic SSM state normalization during decode.
-        // Mamba-2 has no per-token gate clamping (unlike GDN), so state can drift
-        // from accumulated BF16 input truncation. Normalize every 64 tokens.
-        if self.config.mamba_num_heads > 0
-            && seq.seq_len > 0
-            && seq.seq_len.is_multiple_of(64)
-            && let Err(e) = self.normalize_ssm_states(seq, stream)
-        {
-            tracing::warn!("Periodic SSM state normalization failed: {e:#}");
-        }
-
-        let normed = self.buffers.norm_output();
-        let h = self.config.hidden_size as u32;
-        let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h,
-            eps,
-            stream,
-        )?;
-
-        // LM head reads from normed directly (no D2D copy needed)
-        self.lm_head(normed, stream)?;
-        Ok(())
     }
 }

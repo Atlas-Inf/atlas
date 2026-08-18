@@ -31,6 +31,25 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        // SOLID Incr-4: a genuine single-token decode (num_seqs == 1) folds the
+        // routed expert down_proj LoRA delta below (before the wsum blend). The
+        // multi-seq per-token reuse of this fn (num_seqs > 1 — decode_batch's
+        // per-token MoE loop, or the attention layers' per-token FFN) shares a
+        // `padded_n` CUDA graph across mixed-batch transitions, so host-gating
+        // the fold there is capture-unsafe (a Fold-captured graph could replay
+        // onto a later base-containing batch): keep the loud refusal until the
+        // device per-row `row_adapter` map is plumbed.
+        let single_seq_decode = ctx.attn_metadata.as_ref().map_or(1, |m| m.num_seqs) <= 1;
+        if !single_seq_decode {
+            // Multi-seq per-token reuse shares a `padded_n` CUDA graph across mixed
+            // base/adapter batches, so host-gating a fold there is capture-unsafe:
+            // keep the loud refusal until the device per-row `row_adapter` map lands.
+            self.reject_decode_lora(ctx, "forward")?;
+        }
+        // Single-seq decode: the router delta folds onto `gate_logits` before top-k
+        // (below), and the routed-expert gate/up/down deltas fold onto their
+        // intermediates — no bail. A `Refuse`/mixed batch still bails inside each
+        // fold's `moe_route_gate`, preserving per-row adapter-identity protection.
         // ── Phase 2.7 Tier C: Frankenstein decode-via-prefill dispatch ──
         // For DFlash capture layers only, when `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1`
         // is set, route this layer's single-token MoE through `forward_prefill(M=1)`,
@@ -49,9 +68,7 @@ impl MoeLayer {
                 == Some("1")
         {
             // One-time per-process log so we can verify the env-gated route is hit.
-            static LOGGED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if ctx.stats.once("log:moe_route") {
                 tracing::info!(
                     "FRANKENSTEIN: routing DFlash capture-layer MoE decode through forward_prefill(M=1) (one-time log)"
                 );
@@ -68,7 +85,7 @@ impl MoeLayer {
 
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
-        let _shared_inter = ctx.config.shared_expert_intermediate_size as u32;
+        let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
         let top_k = ctx.config.num_experts_per_tok as u32;
         let profile = ctx.profile;
@@ -99,9 +116,11 @@ impl MoeLayer {
             let gate_logits = ctx.buffers.gate_logits();
             prof!("gate", {
                 if let Some(ref nvfp4) = self.gate_nvfp4 {
-                    ops::w4a16_gemv(
+                    ops::w4a16_decode_gemv(
                         ctx.gpu,
                         self.w4a16_gemv,
+                        self.w4a16_gemv_sw,
+                        ctx.levers.gemv_sw,
                         router_in,
                         nvfp4,
                         gate_logits,
@@ -122,6 +141,16 @@ impl MoeLayer {
                     )
                 }
             })?;
+
+            // Feature-1: fold the router `mlp.gate` LoRA delta onto `gate_logits`
+            // BEFORE top-k — the exact decode mirror of the prefill router fold
+            // (`apply_router_lora_prefill` is n-generic; here n=1). Device-clean
+            // (no D2H) so it captures cleanly. No-op unless a router delta is
+            // installed; `Refuse` bails inside the hook. Works for both the
+            // NVFP4-gate and dense-gate branches (same `gate_logits` output).
+            if single_seq_decode {
+                self.apply_router_lora_prefill(router_in, gate_logits, 1, ctx, stream)?;
+            }
 
             prof!("topk", {
                 if let Some(tid2eid) = self.tid2eid_dev {
@@ -270,13 +299,11 @@ impl MoeLayer {
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
         let shared_out = ctx.buffers.attn_output();
 
-        if let (Some(gp), Some(up), Some(dp), Some(sg), Some(su), Some(sd)) = (
+        if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
             self.bf16_gate_weight_ptrs,
             self.bf16_up_weight_ptrs,
             self.bf16_down_weight_ptrs,
-            self.bf16_shared_gate,
-            self.bf16_shared_up,
-            self.bf16_shared_down,
+            self.bf16_shared_expert,
         ) {
             // BF16 path: FP8-dequant-on-load. Eliminates the per-layer 0.989
             // FP8 cosine ceiling by serving experts as BF16 end-to-end.
@@ -290,9 +317,9 @@ impl MoeLayer {
                     up,
                     expert_up_out,
                     indices_dev,
-                    sg,
+                    shared.gate_proj.weight,
                     shared_gate_scratch,
-                    su,
+                    shared.up_proj.weight,
                     shared_up_scratch,
                     inter,
                     h,
@@ -300,6 +327,19 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+            if single_seq_decode {
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_input,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    DevicePtr::NULL,
+                    ctx,
+                    stream,
+                )?;
+            }
             prof!("exp_silu_down_bf16", {
                 ops::moe_expert_silu_down_shared_bf16(
                     ctx.gpu,
@@ -311,7 +351,7 @@ impl MoeLayer {
                     indices_dev,
                     shared_gate_scratch,
                     shared_up_scratch,
-                    sd,
+                    shared.down_proj.weight,
                     shared_out,
                     h,
                     inter,
@@ -349,6 +389,19 @@ impl MoeLayer {
                 )
             })?;
 
+            if single_seq_decode {
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_input,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    DevicePtr::NULL,
+                    ctx,
+                    stream,
+                )?;
+            }
             // FP8 path: fused silu+down
             prof!("exp_silu_down_fp8", {
                 ops::moe_expert_silu_down_shared_fp8(
@@ -385,6 +438,7 @@ impl MoeLayer {
                     h,
                     inter,
                     top_k,
+                    single_seq_decode,
                     stream,
                 )
             })?;
@@ -414,6 +468,20 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+
+            if single_seq_decode {
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_input,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    DevicePtr::NULL,
+                    ctx,
+                    stream,
+                )?;
+            }
 
             if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
                 ctx.gpu.synchronize(stream)?;
@@ -479,6 +547,43 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+        }
+
+        // SOLID Incr-4 decode expert down-fold: land the routed-expert down_proj
+        // LoRA delta into `expert_down_out` (slot-major [top_k, hidden]) IN PLACE,
+        // recomputing `x = silu(gate)*up` from the still-materialized
+        // `expert_gate_out`/`expert_up_out`. Must run BEFORE `moe_weighted_sum_blend`
+        // (so the router weight scales base+delta) AND before the EP zero-temp
+        // memset below (which reuses `expert_gate_out` as scratch). NULL
+        // row_adapter: a genuine single-token decode is one homogeneous request —
+        // `moe_route_gate` (Fold/Skip/Refuse) is the per-request opt-out. No-op
+        // when no MoE LoRA / no expert adapter is installed (base byte-identical).
+        if single_seq_decode {
+            self.apply_expert_lora_decode_down(
+                expert_gate_out,
+                expert_up_out,
+                expert_down_out,
+                indices_dev,
+                top_k,
+                top_k,
+                DevicePtr::NULL,
+                ctx,
+                stream,
+            )?;
+        }
+
+        if self.has_mixed_bf16_shared_expert() {
+            self.run_bf16_shared_expert(
+                input,
+                1,
+                h,
+                shared_inter,
+                shared_gate_scratch,
+                shared_up_scratch,
+                shared_out,
+                ctx,
+                stream,
+            )?;
         }
 
         if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {

@@ -61,7 +61,13 @@ pub(super) fn install_high_speed_swap(
 }
 
 /// Co-dispatch admission window: `Some(duration)` when `ATLAS_PREFILL_CODISPATCH=1`,
-/// else `None`. The window length is `ATLAS_PREFILL_CODISPATCH_WINDOW_MS` (default 5).
+/// else `None`. The window length is `ATLAS_PREFILL_CODISPATCH_WINDOW_MS`
+/// (default 100). A burst of concurrent requests arrives over tens of ms
+/// (HTTP accept + tokenize spread); the old 10 ms default admitted only the
+/// first 1-2 arrivals, so the "co"-dispatch cohort was mostly singletons and
+/// the batched path never saw the burst it exists for. 100 ms is one decode
+/// step's worth of TTFT — negligible against the multi-second serialized
+/// alternative. Only in effect when codispatch is explicitly enabled.
 fn codispatch_window() -> Option<std::time::Duration> {
     let on = std::env::var("ATLAS_PREFILL_CODISPATCH")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -72,8 +78,20 @@ fn codispatch_window() -> Option<std::time::Duration> {
     let ms = std::env::var("ATLAS_PREFILL_CODISPATCH_WINDOW_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(10);
+        .unwrap_or(100);
     Some(std::time::Duration::from_millis(ms))
+}
+
+/// Quiet period that ends the co-dispatch window early for a lone request
+/// (`ATLAS_PREFILL_CODISPATCH_SETTLE_MS`, default 10). The window is only
+/// abandoned after this long with NO new arrival, so a burst whose members
+/// are separated by less than this is still collected whole.
+fn codispatch_settle() -> std::time::Duration {
+    let ms = std::env::var("ATLAS_PREFILL_CODISPATCH_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10);
+    std::time::Duration::from_millis(ms)
 }
 
 /// Drain pending request queue and policy-select prefills to start.
@@ -83,39 +101,85 @@ pub(super) fn drain_pending_requests(
     prefilling: &[PrefillInProgress],
     policy: &dyn SchedulingPolicy,
     max_batch_size: usize,
+    // True when spilled/requeued sequences are parked awaiting resume. They
+    // wait on KV BLOCKS, not on the request condvar — blocking here with an
+    // empty active set would strand them (their resume only runs at the end
+    // of a scheduler tick) while their clients hang.
+    have_parked: bool,
 ) -> Vec<InferenceRequest> {
     let (ref mtx, ref cv) = **pending;
     let mut g = mtx.lock();
-    if active.is_empty() && prefilling.is_empty() {
-        // Block until signalled (no busy-wait, no polling).
-        while g.requests.is_empty() && !g.closed {
+    if active.is_empty() && prefilling.is_empty() && have_parked {
+        // Parked-only tick: wait BOUNDED so the scheduler keeps ticking
+        // toward the resume pass (blocks may already be free) without
+        // spinning hot while the pool refills.
+        if g.requests.is_empty() && g.rotations.is_empty() && !g.closed {
+            let _ = cv.wait_for(&mut g, std::time::Duration::from_millis(10));
+        }
+    } else if active.is_empty() && prefilling.is_empty() {
+        // Block until signalled (no busy-wait, no polling). Also wake on a
+        // pending rotation: a quiescence-applied LoraCommand (Rotate / Promote /
+        // PromoteDisk) is pushed onto `g.rotations` by the rotation forwarder and
+        // notified on this same Condvar. Without `rotations.is_empty()` in the
+        // predicate the notify would wake us but the loop would immediately
+        // re-sleep (requests still empty), starving the quiescence-apply block —
+        // an idle-scheduler deadlock for demand-driven promotion.
+        while g.requests.is_empty() && g.rotations.is_empty() && !g.closed {
             cv.wait(&mut g);
         }
         if g.closed && g.requests.is_empty() {
+            return Vec::new();
+        }
+        // Rotation-only wakeup: we exited the wait with no requests but a pending
+        // rotation. Return an empty batch so the caller reaches the
+        // quiescence-apply block (active/prefilling/new_reqs/swapped all empty)
+        // and drains `g.rotations` at true quiescence. Do NOT fall into the
+        // co-dispatch window with zero requests.
+        if g.requests.is_empty() {
             return Vec::new();
         }
         // Co-dispatch micro-batch window (ATLAS_PREFILL_CODISPATCH=1): when idle,
         // gather a whole concurrent BURST into one forward (batched via
         // run_batched_prefill_step) rather than stopping at the 2nd request — a
         // 4-request burst used to split into 2+2 because the loop exited at len==2.
-        // Keep collecting up to `max_batch_size`, bounded by `window`, and dispatch
-        // EARLY once the burst settles (>=2 gathered and no new arrival within
-        // SETTLE) so latency stays low. A lone request pays at most `window` TTFT.
+        // Keep collecting up to `max_batch_size` for the full admission window.
+        // Agentic/RAG clients commonly submit a burst through independently
+        // parsed HTTP tasks; the former 2 ms "settle" shortcut split a C=4
+        // burst into C=3+1 before its last request reached this queue. A lone
+        // request pays at most `window` TTFT, which is the intentional tradeoff
+        // when co-dispatch is explicitly enabled.
         if g.requests.len() < max_batch_size
             && let Some(window) = codispatch_window()
         {
-            const SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
+            // A LONE request used to pay the whole window as TTFT (~100 ms on
+            // every single-stream request, measured: ISL-1K TTFT 1074 -> 971 ms
+            // with the window forced to 0). Burning it is only worthwhile while
+            // a burst is actually still arriving.
+            //
+            // So: wait in `settle`-sized slices and keep the full window alive
+            // as long as the queue KEEPS GROWING; give up once it has been
+            // quiet for one settle. This is deliberately growth-aware rather
+            // than a flat short timeout — an earlier flat 2 ms settle split a
+            // C=4 burst into C=3+1 when its last member had not yet reached
+            // this queue. Here a burst that trickles in with gaps under
+            // `settle` still gets collected in full, up to the same deadline.
             let deadline = std::time::Instant::now() + window;
+            let settle = window.min(codispatch_settle());
+            let mut seen = g.requests.len();
             while g.requests.len() < max_batch_size && !g.closed {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     break;
                 }
-                let wait = (deadline - now).min(SETTLE);
-                let res = cv.wait_for(&mut g, wait);
-                // Timed out with no new arrival in SETTLE → burst drained; dispatch
-                // what we have (if it's batchable). Otherwise keep gathering.
-                if res.timed_out() && g.requests.len() >= 2 {
+                let slice = (deadline - now).min(settle);
+                let res = cv.wait_for(&mut g, slice);
+                if g.requests.len() > seen {
+                    // Burst still landing — reset the quiet timer.
+                    seen = g.requests.len();
+                    continue;
+                }
+                if res.timed_out() {
+                    // Quiet for a full settle and nothing new: stop waiting.
                     break;
                 }
             }
@@ -166,6 +230,59 @@ pub(super) fn drain_pending_requests(
     result
 }
 
+/// Enforce the server-side per-request deadline on every active sequence.
+///
+/// Runs once per scheduler iteration, immediately before retirement, so it
+/// is INDEPENDENT of which decode path produced the step. The check used to
+/// live inside `decode_logits_step::process_decode_logits`, which the MTP /
+/// speculative path never calls — so with `--speculative` (the config of
+/// record) the deadline was simply not enforced at all, and it only ever
+/// fired at the high concurrencies where the spec path is off. Measured on
+/// dgx2 2026-08-01: a `--request-timeout 5` serve ran a single request for
+/// 145 s to a full 4000 tokens without the deadline firing once.
+///
+/// A deadline cut is an ABNORMAL stop: it sets `guard_stop` so
+/// `finish_sequence` reports `finish_reason="timeout"` instead of deriving
+/// "length" from the last token, which is indistinguishable from a
+/// legitimate max_tokens stop. Retirement is unchanged — the sequence goes
+/// through the same `finish_sequence` → `free_sequence` path as any other
+/// stop, so KV blocks and the SSM `SlotGuard` are released identically.
+pub(super) fn enforce_request_deadlines(active: &mut [ActiveSeq]) {
+    // No clock read and no per-sequence work when nothing is deadlined
+    // (`--request-timeout 0`), so the decode loop pays nothing for this.
+    if !active.iter().any(|a| !a.finished && a.timeout_at.is_some()) {
+        return;
+    }
+    let now = Instant::now();
+    for a in active.iter_mut() {
+        if a.finished {
+            continue;
+        }
+        let Some(deadline) = a.timeout_at else {
+            continue;
+        };
+        if now < deadline {
+            continue;
+        }
+        let emitted = a.output_tokens.len();
+        tracing::warn!(
+            slot = a.seq.slot_idx,
+            session_hash = a.session_hash,
+            elapsed_s = a.request_start.elapsed().as_secs_f64(),
+            budget_s = deadline
+                .saturating_duration_since(a.request_start)
+                .as_secs_f64(),
+            emitted_tokens = emitted,
+            requested_tokens = emitted + a.remaining,
+            "Request TIMEOUT: response TRUNCATED by the server deadline \
+             (--request-timeout / per-request `timeout`); \
+             reporting finish_reason=\"timeout\", not \"length\""
+        );
+        a.guard_stop = Some(GUARD_STOP_REQUEST_TIMEOUT);
+        a.finished = true;
+    }
+}
+
 /// Retire finished sequences. After swap_remove, the last element moves to
 /// position i. Compact its SSM states to match its new slot index so CUDA
 /// graph addresses remain valid (active sequences must occupy contiguous
@@ -185,7 +302,11 @@ pub(super) fn drain_pending_requests(
 /// non-contiguous w.r.t. `slot_idx` — pre-allocated slots stay valid
 /// in place across the swap_remove, and the per-slot CUDA graph cache
 /// stays warm because the seq never moved.
-pub(super) fn retire_finished_sequences(model: &dyn Model, active: &mut Vec<ActiveSeq>) {
+pub(super) fn retire_finished_sequences(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    max_seq_len: usize,
+) {
     if model.ep_protocol_v2() {
         // v2 EP: slots are pre-allocated and kept in place (see doc above);
         // just drop finished seqs, no compaction.
@@ -193,7 +314,7 @@ pub(super) fn retire_finished_sequences(model: &dyn Model, active: &mut Vec<Acti
         while i < active.len() {
             if active[i].finished {
                 let mut a = active.swap_remove(i);
-                finish_sequence(model, &mut a);
+                finish_sequence(model, &mut a, max_seq_len);
             } else {
                 i += 1;
             }
@@ -218,7 +339,7 @@ pub(super) fn retire_finished_sequences(model: &dyn Model, active: &mut Vec<Acti
     let mut survivors: Vec<ActiveSeq> = Vec::with_capacity(active.len());
     for mut a in active.drain(..) {
         if a.finished {
-            finish_sequence(model, &mut a); // RAII guard releases a's own slot
+            finish_sequence(model, &mut a, max_seq_len); // RAII guard releases a's own slot
         } else {
             survivors.push(a);
         }
@@ -266,3 +387,6 @@ pub(super) fn compact_survivors_into_range(model: &dyn Model, survivors: &mut [A
         }
     }
 }
+
+mod send;
+pub use send::*;

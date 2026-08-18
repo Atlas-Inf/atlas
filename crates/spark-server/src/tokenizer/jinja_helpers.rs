@@ -11,7 +11,45 @@ pub(super) const TEMPLATE_OVERRIDE_DIR: &str = "jinja-templates";
 /// Build a precompiled minijinja Environment from the chat template.
 /// Leaks the template string to 'static — acceptable since one ChatTokenizer
 /// lives for the entire server lifetime.
+/// How `{{ x | tojson }}` serializes tool JSON.
+///
+/// Passed EXPLICITLY rather than read from the process environment inside the
+/// render path. `build_jinja_env` reads `ATLAS_USE_HF_REF_JSON_DUMPS` once and
+/// forwards the result here; tests that need the spaced form ask for it by
+/// name. That distinction is not cosmetic — see `build_jinja_env`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolJsonStyle {
+    /// serde_json compact, `{"a":1}` — the DEFAULT (ST-995 GDN irrelevance fix).
+    Compact,
+    /// Python `json.dumps` spaced, `{"a": 1}` — transformers/vLLM byte parity.
+    HfSpaced,
+}
+
+/// Production entry point: resolves the serialization style from the
+/// environment, then defers to [`build_jinja_env_with`].
 pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environment<'static>> {
+    let style = if std::env::var("ATLAS_USE_HF_REF_JSON_DUMPS").as_deref() == Ok("1") {
+        ToolJsonStyle::HfSpaced
+    } else {
+        ToolJsonStyle::Compact
+    };
+    build_jinja_env_with(chat_template, style)
+}
+
+/// Build a chat-template environment with an EXPLICIT tool-JSON style.
+///
+/// Tests must use this, never `set_var`. `build_jinja_env` reads the env var on
+/// every call, so a test that mutates `ATLAS_USE_HF_REF_JSON_DUMPS` around its
+/// own render also changes what EVERY concurrently-running test renders — the
+/// harness runs them as threads in one process. That raced for real: with the
+/// spaced filter briefly installed process-wide, `qwen_dense_parity` rendered
+/// one template compact and the next spaced and failed the byte-parity assert,
+/// intermittently and only under some schedulers (green under `cargo test`, red
+/// under `cargo llvm-cov`, same commit).
+pub(crate) fn build_jinja_env_with(
+    chat_template: &str,
+    tool_json_style: ToolJsonStyle,
+) -> Result<minijinja::Environment<'static>> {
     let template_static: &'static str = Box::leak(chat_template.to_string().into_boxed_str());
     let mut env = minijinja::Environment::new();
     env.set_lstrip_blocks(true);
@@ -96,6 +134,11 @@ pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environm
                         let s = value.as_str().unwrap_or_default().trim().to_string();
                         return Ok(minijinja::Value::from(s));
                     }
+                    "rstrip" => {
+                        let _: () = from_args(args)?;
+                        let s = value.as_str().unwrap_or_default().trim_end().to_string();
+                        return Ok(minijinja::Value::from(s));
+                    }
                     _ => {}
                 }
             }
@@ -176,28 +219,9 @@ pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environm
     //   unset / anything else (DEFAULT)  -> compact (fixes ST-995 GDN irrelevance)
     //
     // Key order is preserved via the `preserve_order` feature in BOTH modes.
-    if std::env::var("ATLAS_USE_HF_REF_JSON_DUMPS").as_deref() == Ok("1") {
-        env.add_filter(
-            "tojson",
-            |value: minijinja::Value| -> Result<minijinja::Value, minijinja::Error> {
-                let mut buf = Vec::new();
-                let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonJsonFormatter);
-                serde::Serialize::serialize(&value, &mut ser).map_err(|e| {
-                    minijinja::Error::new(
-                        minijinja::ErrorKind::InvalidOperation,
-                        format!("tojson serialization failed: {e}"),
-                    )
-                })?;
-                // serde_json writes valid UTF-8 (ensure_ascii=False — no \uXXXX).
-                let s = String::from_utf8(buf).map_err(|e| {
-                    minijinja::Error::new(
-                        minijinja::ErrorKind::InvalidOperation,
-                        format!("tojson produced invalid UTF-8: {e}"),
-                    )
-                })?;
-                Ok(minijinja::Value::from_safe_string(s))
-            },
-        );
+    env.add_filter("tojson_hf", python_tojson);
+    if tool_json_style == ToolJsonStyle::HfSpaced {
+        env.add_filter("tojson", python_tojson);
     }
     // else: fall through to minijinja's builtin COMPACT `tojson` (DEFAULT) —
     // the ST-995 fix. (PythonJsonFormatter below is retained for the env path.)
@@ -215,6 +239,24 @@ pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environm
 /// byte-identical to transformers/vLLM.
 #[derive(Clone, Debug)]
 struct PythonJsonFormatter;
+
+fn python_tojson(value: minijinja::Value) -> Result<minijinja::Value, minijinja::Error> {
+    let mut buf = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buf, PythonJsonFormatter);
+    serde::Serialize::serialize(&value, &mut serializer).map_err(|error| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson serialization failed: {error}"),
+        )
+    })?;
+    let json = String::from_utf8(buf).map_err(|error| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson produced invalid UTF-8: {error}"),
+        )
+    })?;
+    Ok(minijinja::Value::from_safe_string(json))
+}
 
 impl serde_json::ser::Formatter for PythonJsonFormatter {
     #[inline]

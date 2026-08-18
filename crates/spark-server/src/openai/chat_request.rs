@@ -3,12 +3,33 @@
 use serde::Deserialize;
 
 use super::*;
+use crate::api::inference_types::RepetitionDetectionParams;
+use crate::ir::ThinkingDirective;
 
 /// Chat completion request (subset of OpenAI spec).
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct ChatCompletionRequest {
     pub model: String,
+    /// M2 per-request LoRA routing: optional resident adapter NAME for THIS
+    /// request (independent of `model`). Unset = installed active adapter;
+    /// unknown = 400. Resolved to a pool slot at request time.
+    #[serde(default)]
+    pub adapter: Option<String>,
+    /// NLLB per-request source/target language names (tokenizer-resolved).
+    #[serde(default)]
+    pub src_lang: Option<String>,
+    #[serde(default)]
+    pub tgt_lang: Option<String>,
+    /// NLLB beam search: beams per request (None/1 = greedy).
+    #[serde(default)]
+    pub num_beams: Option<u32>,
+    /// NLLB beam search: length penalty (None = 1.0).
+    #[serde(default)]
+    pub length_penalty: Option<f32>,
+    /// NLLB beam search: early-stop when enough hypotheses finish (None = false).
+    #[serde(default)]
+    pub early_stopping: Option<bool>,
     pub messages: Vec<IncomingMessage>,
     #[serde(default = "default_max_tokens", alias = "max_completion_tokens")]
     pub max_tokens: usize,
@@ -19,24 +40,19 @@ pub struct ChatCompletionRequest {
     /// Top-p (nucleus): keep smallest set of tokens whose cumulative probability >= p.
     /// None = use server default from generation_config.json.
     pub top_p: Option<f32>,
-    /// Top-n-sigma: filter tokens in logit space before temperature scaling.
-    /// Keep only tokens with logit >= mean - n*sigma. Temperature-invariant.
-    /// None = use server default. 0.0 = disabled.
+    /// Top-n-sigma: keep tokens with logit >= mean - n*sigma (temperature-
+    /// invariant). None = server default. 0.0 = disabled.
     pub top_n_sigma: Option<f32>,
-    /// Min-p: keep tokens with prob >= min_p * max_prob (post-softmax).
-    /// None = use server default. 0.0 = disabled.
+    /// Min-p: keep tokens with prob >= min_p * max_prob. None = server default.
     pub min_p: Option<f32>,
-    /// Repetition penalty: penalize tokens that have already been generated.
-    /// None = use server default. 1.0 = disabled.
+    /// Repetition penalty. None = server default. 1.0 = disabled.
     pub repetition_penalty: Option<f32>,
-    /// Presence penalty (OpenAI-style): flat additive penalty for each token that
-    /// appeared at least once. Range [-2.0, 2.0], default 0.0 (disabled).
-    /// Positive values encourage topic diversity.
+    /// Presence penalty (OpenAI-style): flat additive penalty per token seen at
+    /// least once. Range [-2.0, 2.0], default 0.0 (disabled).
     #[serde(default)]
     pub presence_penalty: Option<f32>,
-    /// Frequency penalty (OpenAI-style): additive penalty proportional to occurrence
-    /// count. Range [-2.0, 2.0], default 0.0 (disabled).
-    /// Positive values discourage token repetition.
+    /// Frequency penalty (OpenAI-style): additive penalty proportional to
+    /// occurrence count. Range [-2.0, 2.0], default 0.0 (disabled).
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     /// Per-token logit bias: {"token_id": bias_value}. Positive boosts, negative suppresses.
@@ -45,20 +61,20 @@ pub struct ChatCompletionRequest {
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     #[serde(default)]
     pub stream: bool,
-    /// Emit the exact sampled token IDs on each streamed chunk's
-    /// `choices[0].token_ids` (vLLM-compatible extension). Lets a
-    /// benchmark harness count `usage.completion_tokens` precisely
-    /// instead of re-tokenizing detokenized text (which over-counts,
-    /// since BPE is not homomorphic over fragment concatenation).
-    /// PCND: defaults false — opt-in only, so the default wire format
-    /// for every existing client stays byte-identical.
+    /// Emit exact sampled token IDs on each streamed chunk's
+    /// `choices[0].token_ids` (vLLM-compatible extension) for precise
+    /// `usage.completion_tokens` counting. Defaults false (opt-in).
     #[serde(default)]
     pub return_token_ids: bool,
     /// Enable chain-of-thought reasoning (Qwen3.5 thinking models).
-    /// false (default): appends `<think></think>` — model answers directly.
-    /// true: appends `<think>\n` — model generates its reasoning first.
+    /// `Some(true)`: model generates its reasoning first. `Some(false)`: model
+    /// answers directly. `None` (field omitted): defer to the model's design
+    /// intent (MODEL.toml `thinking_default`). Must be `Option` so an EXPLICIT
+    /// `false` disables thinking — a bare `bool` cannot tell "false" from
+    /// "absent", which silently ignored `enable_thinking: false`. Mirrors
+    /// `chat_template_kwargs.enable_thinking`.
     #[serde(default)]
-    pub enable_thinking: bool,
+    pub enable_thinking: Option<bool>,
     /// Anthropic-style thinking budget: `{"thinking": {"budget_tokens": N}}`
     /// Hard limit on thinking tokens before forcing `</think>`.
     #[serde(default)]
@@ -67,7 +83,10 @@ pub struct ChatCompletionRequest {
     /// `max_thinking_tokens` is accepted as an alias — it's the intuitive
     /// name several clients send, and silently dropping it left the budget
     /// unenforced (reasoning ran unbounded). See community report 2026-06.
-    #[serde(default, alias = "max_thinking_tokens")]
+    /// `thinking_budget` is the DashScope/Qwen spelling that OpenAI-
+    /// compatible gateways inject top-level; dropping it left gateway-
+    /// injected reasoning caps unenforced on this surface.
+    #[serde(default, alias = "max_thinking_tokens", alias = "thinking_budget")]
     pub thinking_token_budget: Option<u32>,
     /// Per-request override for the vLLM-anchored token-loop detector
     /// (content-loop + thinking-loop). Mirrors vLLM's
@@ -190,31 +209,10 @@ pub struct ChatCompletionRequest {
     pub web_search_options: Option<serde_json::Value>,
     /// Reasoning-effort shorthand (`minimal | low | medium | high`).
     /// 2026 SDKs send this as a top-level field on gpt-5.x chat models;
-    /// Atlas maps it to the existing `reasoning.effort` knob when the
-    /// model's reasoning parser supports it.
+    /// `client_thinking_directive` maps it through the same effort→budget
+    /// ladder as the nested `reasoning.effort` object.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-}
-
-/// Per-request override for the vLLM-anchored token-loop detector.
-///
-/// Mirrors vLLM's `RepetitionDetectionParams`
-/// (`vllm/sampling_params.py:111-144`):
-/// - `min_pattern_size` → smallest pattern length (in tokens) to consider
-/// - `max_pattern_size` → largest pattern length to consider
-/// - `min_count` → number of end-anchored back-to-back repeats that
-///   constitute a "loop"
-///
-/// When attached to a request, these override the boot-global
-/// thresholds (`CONTENT_LOOP_PERIOD_MIN` / `_MAX` /
-/// `CONTENT_LOOP_MIN_REPEATS` and the thinking-loop equivalents) for
-/// that single sequence's content-loop and thinking-loop detectors.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct RepetitionDetectionParams {
-    pub min_pattern_size: u32,
-    pub max_pattern_size: u32,
-    pub min_count: u32,
 }
 
 /// Stream options (OpenAI-compatible).
@@ -281,160 +279,242 @@ pub struct ReasoningConfig {
     pub effort: Option<String>,
 }
 
-/// vLLM-style chat template kwargs.
+/// vLLM-style chat template kwargs (request-body wire field). The
+/// server-level `--default-chat-template-kwargs` CLI flag is parsed at
+/// the CLI edge (`main_modules/serve.rs`), not through this type.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatTemplateKwargs {
     pub enable_thinking: Option<bool>,
     pub thinking_budget: Option<u32>,
+    /// Qwen3.6+ dense-family template flag: keep historical `<think>`
+    /// blocks in re-rendered assistant turns. Absent = defer to the
+    /// MODEL.toml `[behavior].preserve_thinking` override, then to the
+    /// model template's own default.
+    pub preserve_thinking: Option<bool>,
+    /// Qwen3.8 template kwarg (vLLM passes it straight into Jinja).
+    /// Was silently DROPPED by serde before 2026-08-15 — a client
+    /// sending `chat_template_kwargs.reasoning_effort` got the server
+    /// default instead, with no error. Ranks below `reasoning.effort`
+    /// and the top-level `reasoning_effort` shorthand, and below the
+    /// other `chat_template_kwargs` keys in the directive ladder
+    /// (vLLM's template gates the effort block on `enable_thinking`).
+    pub reasoning_effort: Option<String>,
 }
-
-impl ChatTemplateKwargs {
-    /// Parse from a JSON string. Returns `None` if parsing fails or string is empty.
-    pub fn from_json(s: &str) -> Option<Self> {
-        if s.trim().is_empty() {
-            return None;
-        }
-        serde_json::from_str(s).ok()
-    }
-}
-
-/// Default thinking budget when thinking is enabled but no explicit budget set.
-/// 256 tokens is enough for the model to plan without overthinking — longer
-/// budgets waste decode throughput on reasoning that rarely improves output.
-const DEFAULT_THINKING_BUDGET: u32 = 256;
 
 impl ChatCompletionRequest {
-    /// Resolve thinking parameters from all supported request-body formats
-    /// into a single `(enable_thinking: bool, thinking_budget: Option<u32>)`
-    /// pair. The client's per-request choice always wins over the model
-    /// default; the model default (from MODEL.toml `[behavior].thinking_default`)
-    /// is used only when the client sends NO thinking parameter at all.
-    ///
-    /// The `--disable-thinking` CLI flag is a higher-priority kill switch
-    /// applied by the caller (api.rs / anthropic.rs) — this function does
-    /// not know about it.
+    /// The dedicated effort channels: nested `reasoning.effort` wins
+    /// over the top-level `reasoning_effort` shorthand.
+    fn body_reasoning_effort(&self) -> Option<&str> {
+        self.reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref())
+            .or(self.reasoning_effort.as_deref())
+    }
+
+    /// Every channel an effort string can arrive on, in priority order
+    /// (`chat_template_kwargs.reasoning_effort` last). This is the
+    /// string the TEMPLATE side consumes and the one `validate` checks.
+    fn requested_reasoning_effort(&self) -> Option<&str> {
+        self.body_reasoning_effort().or_else(|| {
+            self.chat_template_kwargs
+                .as_ref()
+                .and_then(|kw| kw.reasoning_effort.as_deref())
+        })
+    }
+
+    /// Fail-fast check for the wire-only effort vocabulary, which is
+    /// lowered LOSSILY into the IR (the raw string does not survive
+    /// `From<ChatCompletionRequest>`), so the handler must reject it
+    /// BEFORE lowering. Without this, a typo'd effort (`"hgih"`)
+    /// silently resolved to the template's unset default — on Qwen3.8
+    /// historically the most expensive `xhigh` directive — while the
+    /// budget path resolved a DIFFERENT rung. Covers every channel:
+    /// `reasoning.effort`, the top-level shorthand, and
+    /// `chat_template_kwargs.reasoning_effort`.
+    /// Every present channel is checked — even one shadowed by a
+    /// higher-priority valid value — so a bad string never parses clean.
+    pub fn validate_reasoning_effort(&self) -> Result<(), String> {
+        let channels = [
+            self.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
+            self.reasoning_effort.as_deref(),
+            self.chat_template_kwargs
+                .as_ref()
+                .and_then(|kw| kw.reasoning_effort.as_deref()),
+        ];
+        match channels
+            .into_iter()
+            .flatten()
+            .find(|s| crate::ir::parse_wire_effort(s).is_none())
+        {
+            None => Ok(()),
+            Some(bad) => Err(format!(
+                "invalid reasoning_effort {bad:?}: expected one of \
+                 none, minimal, low, medium, high, xhigh, max"
+            )),
+        }
+    }
+
+    /// The template-facing effort. Unknown spellings resolve to `None`
+    /// (= the unset default) — never to a maximal tier — and are already
+    /// rejected with a 400 by `invalid_reasoning_effort` on the HTTP
+    /// path, so this branch is reachable only from internal callers.
+    pub fn client_reasoning_effort(&self) -> Option<crate::ir::ReasoningEffort> {
+        crate::ir::parse_wire_effort(self.requested_reasoning_effort()?)
+            .and_then(|(template_effort, _)| template_effort)
+    }
+
+    /// Resolve the client's thinking intent from all supported
+    /// request-body formats into the neutral [`ThinkingDirective`].
+    /// This is the OpenAI-edge half of thinking resolution; the model
+    /// default (MODEL.toml `[behavior].thinking_default`), the server
+    /// default directive, and the `--disable-thinking` kill switch are
+    /// folded in later by `api/chat/thinking.rs`, which never sees the
+    /// wire fields.
     ///
     /// Request-body priority (highest to lowest):
     /// 1. `thinking.budget_tokens` (Anthropic) — explicit budget
-    /// 2. `thinking_token_budget` (vLLM PR) — explicit budget
-    /// 3. `reasoning.effort` (OpenAI) — mapped to budget
+    /// 2. `thinking_token_budget` (vLLM PR; aliases `max_thinking_tokens`,
+    ///    `thinking_budget`) — explicit budget
+    /// 3. `reasoning.effort` object / top-level `reasoning_effort`
+    ///    shorthand (OpenAI) — mapped to budget
     /// 4. `chat_template_kwargs` (vLLM stable) — enable/disable + optional budget
-    /// 5. `enable_thinking` (Atlas legacy) — boolean with default budget
-    /// 6. `model_default` argument (from MODEL.toml) — model-specific fallback
+    /// 5. `enable_thinking` (Atlas legacy) — boolean
     ///
-    /// Returns `true` if any of channels 1-5 carried an explicit thinking
-    /// intent from the client (i.e. the resolved value did NOT fall through
-    /// to `model_default`). Callers use this to decide whether a
-    /// server-side policy (e.g. `thinking_in_tools=false`) is allowed to
-    /// override the model default OR must respect the explicit request.
-    /// Per-request override for the vLLM-anchored token-loop detector.
-    /// `None` = use the boot-global watchdog parameters.
-    pub fn repetition_detection(&self) -> Option<RepetitionDetectionParams> {
-        self.repetition_detection
-    }
-
-    pub fn thinking_explicitly_requested(&self) -> bool {
-        if self.thinking.is_some() {
-            return true;
-        }
-        if self.thinking_token_budget.is_some() {
-            return true;
-        }
-        if let Some(ref rc) = self.reasoning
-            && rc.effort.is_some()
-        {
-            return true;
-        }
-        if let Some(ref kw) = self.chat_template_kwargs
-            && (kw.thinking_budget.is_some() || kw.enable_thinking.is_some())
-        {
-            return true;
-        }
-        if self.enable_thinking {
-            return true;
-        }
-        false
-    }
-
-    pub fn resolve_thinking(&self, model_default: bool) -> (bool, Option<u32>) {
-        // 1. Anthropic: thinking.budget_tokens
+    /// No channel present → [`ThinkingDirective::Unspecified`] (the old
+    /// `thinking_explicitly_requested() == false`).
+    pub fn client_thinking_directive(&self) -> ThinkingDirective {
+        // 1. Anthropic: thinking.budget_tokens / thinking.type
         if let Some(ref tc) = self.thinking {
             if let Some(ref t) = tc.thinking_type
                 && t == "disabled"
             {
-                return (false, Some(0));
+                return ThinkingDirective::Off;
             }
             if let Some(budget) = tc.budget_tokens {
-                return (true, Some(budget));
+                return ThinkingDirective::On {
+                    budget: Some(budget),
+                };
             }
             // Anthropic "adaptive" / thinking object with no explicit budget
             // means "think as long as needed" — defer to the per-model
-            // `max_thinking_budget` (None), NOT the conservative 256-token
-            // DEFAULT_THINKING_BUDGET. A hard 256 cut force-injects </think>
-            // mid-reasoning on agentic turns and wrecks tool selection.
-            // Mirrors the step-5 enable_thinking path below.
-            return (true, None);
+            // `max_thinking_budget` (budget: None), NOT a conservative
+            // hardcoded default. A hard 256-class cut force-injects
+            // </think> mid-reasoning on agentic turns and wrecks tool
+            // selection. Mirrors the step-5 enable_thinking path below.
+            return ThinkingDirective::On { budget: None };
         }
 
         // 2. vLLM PR: thinking_token_budget
         if let Some(budget) = self.thinking_token_budget {
-            return (budget > 0, Some(budget));
-        }
-
-        // 3. OpenAI: reasoning.effort
-        if let Some(ref rc) = self.reasoning
-            && let Some(ref effort) = rc.effort
-        {
-            let budget = match effort.as_str() {
-                "none" => 0,
-                "minimal" => 64,
-                "low" => 128,
-                "medium" => 256,
-                "high" => 512,
-                "xhigh" | "max" => 1024,
-                _ => DEFAULT_THINKING_BUDGET,
+            return if budget > 0 {
+                ThinkingDirective::On {
+                    budget: Some(budget),
+                }
+            } else {
+                ThinkingDirective::Off
             };
-            return (budget > 0, Some(budget));
         }
 
-        // 4. vLLM stable: chat_template_kwargs
+        // 3. OpenAI: reasoning.effort object, or the top-level
+        // `reasoning_effort` shorthand the Chat Completions wire (and the
+        // 2026 SDKs) send. Nested object wins when both are present.
+        // Dropping the shorthand silently demoted every effort-level
+        // request to the server/model default — including `"none"`,
+        // which must force thinking OFF.
+        if let Some(effort) = self.body_reasoning_effort() {
+            // DEDICATED channels only (nested reasoning.effort / top-level
+            // shorthand) — the kwargs effort string is deliberately handled in
+            // step 4 AFTER kwargs.enable_thinking, because vLLM's template
+            // gates the effort block on enable_thinking: an explicit
+            // `enable_thinking: false` must beat an effort string in the SAME
+            // kwargs object. (#514-merge note: its parallel `_ => Medium` arm
+            // — which silently forced thinking ON at the Medium budget while
+            // the template rendered the xhigh directive, Trap C — is
+            // superseded by the 400 on the HTTP path.)
+            // Kept SYMBOLIC: the token budget for an effort level is
+            // server policy, resolved in `api/chat/thinking.rs` against
+            // the model's effective `max_thinking_budget` so MODEL.toml
+            // and `--max-thinking-budget` reach it. The old absolute
+            // ladder here (64/128/256/512/1024) silently capped every
+            // effort-sending client at 256-class budgets no matter what
+            // the operator configured.
+            //
+            // SSOT with the template path (`client_reasoning_effort`):
+            // one `parse_wire_effort` match feeds both, so directive
+            // and budget can never disagree. Unknown spellings fall
+            // through as if ABSENT (they 400 earlier on the HTTP path);
+            // the old `_ => Medium` arm silently forced thinking ON at
+            // the Medium budget while the template rendered the xhigh
+            // directive — the two halves of Trap C.
+            if let Some((_, directive)) = crate::ir::parse_wire_effort(effort) {
+                return directive;
+            }
+        }
+
+        // 4. vLLM stable: chat_template_kwargs. Rung order inside the
+        // object: thinking_budget > enable_thinking > reasoning_effort —
+        // vLLM's own template gates the effort block on enable_thinking,
+        // so an explicit `enable_thinking: false` wins over an effort
+        // string in the same object.
         if let Some(ref kwargs) = self.chat_template_kwargs {
             if let Some(budget) = kwargs.thinking_budget {
-                return (budget > 0, Some(budget));
+                return if budget > 0 {
+                    ThinkingDirective::On {
+                        budget: Some(budget),
+                    }
+                } else {
+                    ThinkingDirective::Off
+                };
             }
             if let Some(enabled) = kwargs.enable_thinking {
-                // enable_thinking via chat_template_kwargs (incl. the server's
-                // --default-chat-template-kwargs '{"enable_thinking":true}'):
-                // defer the budget to the per-model max_thinking_budget (None)
-                // rather than the conservative 256-token DEFAULT — same rationale
-                // as the legacy/model-default branches below. Without this, that
-                // server default silently capped EVERY request's thinking at 256.
-                return (enabled, if enabled { None } else { Some(0) });
+                if !enabled {
+                    // An explicit `enable_thinking: false` beats an effort
+                    // string in the same object (vLLM's template gates the
+                    // effort block on enable_thinking).
+                    return ThinkingDirective::Off;
+                }
+                // `enable_thinking: true` is only load-bearing when it is the
+                // ONLY signal. If an effort string rides in the same object,
+                // fall through to the effort rung: previously the redundant
+                // `true` returned `On{budget: None}` here, silently cutting an
+                // `"xhigh"` request's budget 4E -> E while the template still
+                // rendered the xhigh sentence — the tier divergence the
+                // parse_wire_effort SSOT exists to prevent (review finding F1).
+                if kwargs.reasoning_effort.is_none() {
+                    // Defer the budget to the per-model max_thinking_budget
+                    // (None) rather than a conservative hardcoded 256. Without
+                    // this, a server default of '{"enable_thinking":true}'
+                    // silently capped EVERY request's thinking at 256.
+                    return ThinkingDirective::On { budget: None };
+                }
+            }
+            if let Some(effort) = kwargs.reasoning_effort.as_deref()
+                && let Some((_, directive)) = crate::ir::parse_wire_effort(effort)
+            {
+                // Previously this key was silently DROPPED by serde
+                // (Trap B): the request parsed fine and rendered with
+                // the server default instead of the asked-for tier.
+                return directive;
             }
         }
 
-        // 5. Atlas legacy: enable_thinking boolean in the request body.
-        // Only honored when explicitly true — a false value (including the
-        // serde default when the field is absent) falls through to the
-        // MODEL.toml default so clients that don't know about this flag
-        // inherit the model's design intent instead of silently opting out.
-        // Returns `None` for the budget so `api/chat/thinking.rs` falls
-        // back to `state.behavior.max_thinking_budget` (the per-model
-        // MODEL.toml cap) instead of the conservative
-        // DEFAULT_THINKING_BUDGET — opencode-style clients otherwise
-        // hit a 256-token mid-sentence cut on thinking-tier models.
-        if self.enable_thinking {
-            return (true, None);
+        // 5. Atlas legacy: enable_thinking in the request body. Now Option:
+        // Some(true) -> On, Some(false) -> Off (an explicit opt-out is now
+        // honored, previously it was silently ignored), None (field absent) ->
+        // fall through to Unspecified so clients that don't know this flag
+        // inherit the model's design intent. `budget: None` so
+        // `api/chat/thinking.rs` uses the per-model MODEL.toml cap rather than
+        // a conservative hardcoded default (opencode-style clients
+        // otherwise hit a 256-token mid-sentence cut on thinking-tier models).
+        if let Some(enabled) = self.enable_thinking {
+            return if enabled {
+                ThinkingDirective::On { budget: None }
+            } else {
+                ThinkingDirective::Off
+            };
         }
 
-        // 6. Model default from MODEL.toml [behavior].thinking_default.
-        // Same `None` rationale as step 5 — defer to the per-model
-        // `max_thinking_budget` rather than the conservative default.
-        if model_default {
-            (true, None)
-        } else {
-            (false, None)
-        }
+        ThinkingDirective::Unspecified
     }
 }
 

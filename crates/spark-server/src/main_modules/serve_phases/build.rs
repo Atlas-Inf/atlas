@@ -11,7 +11,15 @@ use crate::cli;
 
 pub(crate) fn build_prefix_cache(
     args: &cli::ServeArgs,
+    config: &ModelConfig,
 ) -> Box<dyn spark_runtime::prefix_cache::PrefixCache> {
+    if args.enable_prefix_caching && !config.kv_only_prefix_cache_is_safe() {
+        tracing::warn!(
+            "Prefix caching: DISABLED for compressed DeepSeek V4 because the cache does not yet \
+             preserve the compressor pool/ring state required for exact reuse"
+        );
+        return Box::new(spark_runtime::prefix_cache::NoPrefixCaching);
+    }
     if args.enable_prefix_caching {
         if args.high_speed_swap {
             tracing::info!(
@@ -31,7 +39,7 @@ pub(crate) fn build_prefix_cache(
 pub(crate) fn build_model(
     args: &cli::ServeArgs,
     config: &ModelConfig,
-    store: &spark_runtime::weights::WeightStore,
+    store: spark_runtime::weights::WeightStore,
     gpu: Box<dyn spark_runtime::gpu::GpuBackend>,
     max_batch_tokens: usize,
     kv_dtype: spark_runtime::kv_cache::KvCacheDtype,
@@ -41,6 +49,9 @@ pub(crate) fn build_model(
     prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     comm: Option<std::sync::Arc<dyn spark_comm::CommBackend>>,
     dflash_args: Option<spark_model::factory::DflashBuildArgs<'_>>,
+    lora_args: Option<spark_model::factory::LoraBuildArgs<'_>>,
+    nllb_lang: Option<(u32, u32)>,
+    nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn spark_model::traits::Model>> {
     let mtp_quant: spark_model::layers::MtpQuantization = args
         .mtp_quantization
@@ -63,7 +74,7 @@ pub(crate) fn build_model(
         if args.dflash {
             args.dflash_gamma.saturating_sub(1).max(1)
         } else {
-            args.num_drafts
+            args.resolved_num_drafts()
         },
         kv_dtype,
         inference_reserve,
@@ -73,6 +84,9 @@ pub(crate) fn build_model(
         args.ssm_checkpoint_interval,
         hss_cache_blocks_per_seq,
         dflash_args,
+        lora_args,
+        nllb_lang,
+        nllb_lora_dir,
     )
     .context("Failed to build model")
 }
@@ -257,4 +271,33 @@ pub(crate) fn maybe_run_ep_worker(
     });
     handle.join().expect("EP worker thread panicked");
     Ok(true)
+}
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use atlas_core::config::ModelConfig;
+    use clap::Parser;
+
+    use super::build_prefix_cache;
+    use crate::cli::ServeArgs;
+
+    fn enabled_args() -> ServeArgs {
+        ServeArgs::parse_from(["spark", "--enable-prefix-caching"])
+    }
+
+    #[test]
+    fn safe_model_keeps_requested_prefix_cache() {
+        let cache = build_prefix_cache(&enabled_args(), &ModelConfig::qwen3_next_80b_nvfp4());
+        assert!(cache.is_active());
+    }
+
+    #[test]
+    fn compressed_deepseek_v4_disables_incomplete_prefix_cache() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "deepseek_v4".to_string();
+        config.compress_ratios = vec![0, 4, 128];
+
+        let cache = build_prefix_cache(&enabled_args(), &config);
+        assert!(!cache.is_active());
+    }
 }

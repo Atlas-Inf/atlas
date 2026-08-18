@@ -34,6 +34,9 @@ impl Qwen3AttentionLayer {
         inv_sqrt_d: f32,
         q_stride: u32,
         workspace: DevicePtr,
+        // `ModelLevers::max_decode_seqs` — the determinism pin for the
+        // split-K split count. Passed in so the layer holds no process state.
+        max_decode_seqs: u32,
         stream: u64,
     ) -> Result<()> {
         use atlas_core::device::sm121::NUM_SMS;
@@ -135,7 +138,8 @@ impl Qwen3AttentionLayer {
                 // Split count derived from the configured max batch (constant),
                 // not the runtime co-batched count, so a sequence's reduction
                 // tree is identical alone vs co-batched (determinism fix).
-                let current_ctas = num_q_heads * super::super::split_ref_seqs(num_seqs);
+                let current_ctas =
+                    num_q_heads * super::super::split_ref_seqs(num_seqs, max_decode_seqs);
                 let num_splits = if current_ctas >= NUM_SMS {
                     1u32
                 } else {
@@ -562,7 +566,8 @@ impl Qwen3AttentionLayer {
                 // FP8 paged decode. Split count from configured max batch
                 // (constant), not runtime co-batched count → deterministic
                 // reduction tree alone vs co-batched (determinism fix).
-                let current_ctas = num_q_heads * super::super::split_ref_seqs(num_seqs);
+                let current_ctas =
+                    num_q_heads * super::super::split_ref_seqs(num_seqs, max_decode_seqs);
                 let num_splits = if current_ctas >= NUM_SMS {
                     1u32
                 } else {
@@ -575,13 +580,18 @@ impl Qwen3AttentionLayer {
                 // serial-looking workload ever shares a batch (root-cause probe for
                 // batch>1 temp-0 nondeterminism).
                 if num_seqs != 1 && std::env::var("ATLAS_ATTN_DBG").is_ok() {
-                    eprintln!(
+                    tracing::debug!(
                         "ATTN_DBG L{} num_seqs={} num_splits={} (NUM_SMS={} nq={})",
-                        self.attn_layer_idx, num_seqs, num_splits, NUM_SMS, num_q_heads
+                        self.attn_layer_idx,
+                        num_seqs,
+                        num_splits,
+                        NUM_SMS,
+                        num_q_heads
                     );
                 }
 
                 let (k_scale, v_scale) = self.effective_fp8_scales();
+                let sliding = self.sliding_window.unwrap_or(0);
 
                 if num_splits > 1 {
                     let splitk_k = self
@@ -611,6 +621,7 @@ impl Qwen3AttentionLayer {
                         q_stride,
                         kv_cache.cache_stride() as u64,
                         num_seqs,
+                        sliding,
                         stream,
                     )?;
                     ops::paged_decode_attn_reduce_fp8(
@@ -652,6 +663,7 @@ impl Qwen3AttentionLayer {
                         v_scale,
                         q_stride,
                         kv_cache.cache_stride() as u64,
+                        sliding,
                         stream,
                     )
                 }

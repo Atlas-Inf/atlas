@@ -19,6 +19,9 @@ pub(super) fn promote_completed_prefills(
     think_start_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
+    // Served context ceiling (`sched.limits.max_seq_len`) — finish_sequence
+    // needs it for the budget-derived `finish_reason` decision.
+    max_seq_len: usize,
 ) {
     // Process in reverse order so swap_remove indices stay valid.
     completed_indices.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
@@ -52,8 +55,12 @@ pub(super) fn promote_completed_prefills(
                     top: lp.top,
                 })
                 .collect();
-            if let Err(e) = tx.blocking_send(StreamEvent::PromptLogprobs(lps)) {
-                tracing::warn!("phase_promote_prefills: prompt-logprobs send failed: {e}");
+            if !super::mod_helpers::bounded_stream_send(
+                tx,
+                StreamEvent::PromptLogprobs(lps),
+                "promote prompt-logprobs",
+            ) {
+                tracing::warn!("phase_promote_prefills: prompt-logprobs send failed");
             }
         }
         // Only stream non-EOS tokens (OpenAI: stop seq not in output).
@@ -61,11 +68,13 @@ pub(super) fn promote_completed_prefills(
             && p.max_tokens > 0
             && !p.eos_tokens.contains(&first)
             && let ResponseSink::Streaming(ref tx) = p.sink
-            && let Err(e) = tx.blocking_send(StreamEvent::Token(first))
+            && !super::mod_helpers::bounded_stream_send(
+                tx,
+                StreamEvent::Token(first),
+                "promote first token",
+            )
         {
-            tracing::warn!(
-                "phase_promote_prefills: first-token send failed (receiver dropped): {e}"
-            );
+            tracing::warn!("phase_promote_prefills: first-token send failed (receiver dropped)");
         }
         let use_legacy_tool_call =
             p.require_tool_call && p.grammar_state.is_none() && tool_call_start_token.is_some();
@@ -89,7 +98,7 @@ pub(super) fn promote_completed_prefills(
             model.decode_rollback_ring_slots(),
         );
         if immediate_finish {
-            finish_sequence(model, &mut a);
+            finish_sequence(model, &mut a, max_seq_len);
         } else {
             active.push(a);
         }
@@ -137,6 +146,8 @@ fn build_active_seq_from_prefill(
         min_tokens: p.min_tokens,
         eos_tokens: p.eos_tokens,
         finished: immediate_finish,
+        guard_stop: None,
+        param_close_pending: 0,
         sink: p.sink,
         cancel_flag: p.cancel_flag,
         temperature: p.temperature,
@@ -155,6 +166,7 @@ fn build_active_seq_from_prefill(
         dry_sequence_breakers: Vec::new(),
         logit_bias: p.logit_bias,
         pending_drafts: Vec::new(),
+        pending_draft_conf: Vec::new(),
         inside_thinking: if immediate_finish {
             p.enable_thinking && think_end_token.is_some()
         } else {
@@ -170,7 +182,9 @@ fn build_active_seq_from_prefill(
         spontaneous_think_budget: p.spontaneous_think_budget,
         thinking_tokens: 0,
         cached_prompt_tokens: cached_prompt_tok,
+        preempt_immune_until_tokens: 0,
         force_end_thinking: false,
+        think_force_closed: false,
         sentence_defer_count: 0,
         consecutive_confident: 0,
         in_code_fence: false,
@@ -201,6 +215,7 @@ fn build_active_seq_from_prefill(
         param_body_chars_emitted: 0,
         suppress_tool_call: p.suppress_tool_call,
         disable_mtp: p.disable_mtp,
+        mtp_acct: Default::default(),
         content_started: false,
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,

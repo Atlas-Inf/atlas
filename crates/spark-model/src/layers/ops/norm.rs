@@ -19,6 +19,40 @@ use super::*;
 ///
 /// Kernel: `rms_norm(input, weight, output, hidden_size, eps)`
 /// Grid: (num_tokens, 1, 1)  Block: (min(hidden_size, 1024), 1, 1)
+/// Strided RMS norm: `num_groups` groups of `rows_per_group` rows in ONE launch,
+/// groups `row_stride` ELEMENTS apart, rows packed at `hidden_size` inside a group.
+///
+/// `rms_norm` above assumes one packed [num_tokens, hidden_size] block. The
+/// multi-seq q/k head-norms are packed only WITHIN a sequence — each sequence's
+/// heads sit inside its own interleaved [Q|K|V|gate] block — so that path was
+/// launching the packed kernel once per sequence (516 launches/step, 0.76 ms).
+/// Bit-identical: one block per row either way, same math, same reduction.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_strided(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    rows_per_group: u32,
+    num_groups: u32,
+    hidden_size: u32,
+    eps: f32,
+    row_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows_per_group, num_groups, 1])
+        .block([hidden_size.min(1024), 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(hidden_size)
+        .arg_f32(eps)
+        .arg_u32(row_stride)
+        .launch(stream)
+}
+
 pub fn rms_norm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -39,6 +73,44 @@ pub fn rms_norm(
         .arg_u32(hidden_size)
         .arg_f32(eps)
         .launch(stream)
+}
+
+/// Warp-per-row RMS norm for SHORT rows — one warp per row instead of one
+/// block, so the grid shrinks 8x and the reduction needs no shared memory or
+/// barrier. Profitable exactly for the Qwen3 per-head `q_norm`/`k_norm` during
+/// prefill (`num_rows = heads * seq`, `hidden_size = head_dim`), where the
+/// block-per-row kernel measured ~43x above its bandwidth floor.
+pub fn rms_norm_warp_row(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    num_rows: u32,
+    hidden_size: u32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    const ROWS_PER_BLOCK: u32 = 8;
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_rows.div_ceil(ROWS_PER_BLOCK), 1, 1])
+        .block([32 * ROWS_PER_BLOCK, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(num_rows)
+        .arg_u32(hidden_size)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
+/// Gate for [`rms_norm_warp_row`]: short even rows, many of them.
+/// Disable with `ATLAS_RMS_NORM_WARP_ROW=0`.
+pub fn rms_norm_short_row_eligible(num_rows: u32, hidden_size: u32) -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("ATLAS_RMS_NORM_WARP_ROW").as_deref() != Ok("0"));
+    on && hidden_size <= 256 && hidden_size.is_multiple_of(2) && num_rows >= 1024
 }
 
 /// Fused RMS norm + residual save: normed = rms_norm(input), residual = input.

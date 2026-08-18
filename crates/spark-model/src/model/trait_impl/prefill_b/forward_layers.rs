@@ -55,6 +55,18 @@ impl TransformerModel {
         } else {
             (meta_base, meta_base)
         };
+
+        // Request-scoped LoRA routing (chunked prefill) — dedicated arena buffer
+        // holding `proc_count` uniform slots (see prefill_a.rs). Covers both the
+        // paged-prefill layer path and the warm-prefix `use_decode_path` fork
+        // (proc_count==1): the single-seq decode apply reads slot[0], correct
+        // for the uniform buffer. `DevicePtr(0)` (no pool) → installed-pair path.
+        let seq_slot = self.upload_seq_slot_uniform(
+            seq.adapter_slot,
+            proc_count,
+            self.buffers.lora_seq_slot(),
+            stream,
+        )?;
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: positions_h_dev,
@@ -64,6 +76,8 @@ impl TransformerModel {
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
+            seq_slot,
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         // Consume the one-shot ATLAS_PROFILE_FIRST flag (additive).
@@ -92,6 +106,10 @@ impl TransformerModel {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(attn_metadata),
             profile: profile_now,
             comm: self.comm_ref(),
@@ -103,6 +121,10 @@ impl TransformerModel {
             // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
             // to the stable buffer, in chunk order matching the MoE loop).
             token_ids: Some(self.buffers.token_ids()),
+            // #30: request slot pairs (None unless routing to a non-active slot).
+            routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
+            midchunk_capture,
+            moe_lora_route: self.moe_lora_route(seq.adapter_slot),
         };
 
         // When proc_count == 1 (warm prefix cache hit), use the decode layer path
@@ -132,7 +154,18 @@ impl TransformerModel {
             None
         };
         let mut layer_times: Vec<u128> = Vec::new();
+        // HOST-TIME instrumentation (ATLAS_PREFILL_HOST_TIMING=1). Distinct
+        // from `profile_now`: that path synchronizes per layer, which
+        // serialises host and device and hides the host-side cost this is
+        // meant to expose. Here NOTHING synchronizes — these are pure host
+        // wall-clock spans, to be compared against the GPU-busy time an nsys
+        // trace reports for the same request.
+        let host_timing = std::env::var("ATLAS_PREFILL_HOST_TIMING").as_deref() == Ok("1");
+        let t_loop = host_timing.then(std::time::Instant::now);
+        let mut t_in_prefill = std::time::Duration::ZERO;
+        let mut t_dflash = std::time::Duration::ZERO;
         for (i, layer) in self.layers.iter().enumerate() {
+            let t_pf = host_timing.then(std::time::Instant::now);
             let lt0 = if profile_now {
                 self.gpu.synchronize(stream)?;
                 Some(std::time::Instant::now())
@@ -172,6 +205,10 @@ impl TransformerModel {
                     )
                     .map_err(|e| anyhow::anyhow!("Prefill chunk layer {i} failed: {e}"))?;
             }
+            if let Some(t) = t_pf {
+                t_in_prefill += t.elapsed();
+            }
+            let t_df = host_timing.then(std::time::Instant::now);
             // DFlash chunked-prefill capture.
             self.try_dflash_prefill_capture_layer(
                 seq,
@@ -180,21 +217,31 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            if let Some(t) = t_df {
+                t_dflash += t.elapsed();
+            }
             if let Some(lt0) = lt0 {
                 self.gpu.synchronize(stream)?;
                 layer_times.push(lt0.elapsed().as_micros());
             }
-            // MLA diagnostic: per-layer hidden norm for Mistral (once per session)
-            static CHUNK_DIAG_DONE: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
+            // MLA diagnostic: per-layer hidden norm for Mistral (once per model).
+            // Per-model latch (see `ModelStats::dumped`) rather than a static: an
+            // operator who sets the flag and then swaps models must still get the
+            // dump, instead of it being swallowed by the previous model's shot.
             if profile_now
                 && self.config.model_type == "mistral"
-                && !CHUNK_DIAG_DONE.load(std::sync::atomic::Ordering::Relaxed)
+                && self.stats.dumped.keyed("mla_chunk_norms")
             {
                 self.gpu.synchronize(stream)?;
                 let last_offset = (proc_count - 1) * self.config.hidden_size * 4;
                 let h_sz = self.config.hidden_size;
                 let mut buf = vec![0u16; h_sz];
+                // SAFETY: `buf` is `vec![0u16; h_sz]` on the line above, so it
+                // owns exactly `h_sz * size_of::<u16>()` initialised bytes and
+                // its length equals its capacity. `bytes` is the only live
+                // reference to that allocation for its whole lifetime — last
+                // used on the `copy_d2h` line below, and `buf` is not read again
+                // until after that.
                 let bytes = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, h_sz * 2)
                 };
@@ -208,9 +255,7 @@ impl TransformerModel {
                         "LAYER_NORM L{i}/{}: hidden_norm={norm:.4}",
                         self.layers.len()
                     );
-                    if i == self.layers.len() - 1 {
-                        CHUNK_DIAG_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    if i == self.layers.len() - 1 {}
                 }
             }
             // Diagnostic: dump hidden state norm after first 4 and last 4 layers
@@ -257,6 +302,34 @@ impl TransformerModel {
                 );
             }
         }
+        if let Some(t) = t_loop {
+            let wall = t.elapsed();
+            let ffn_us = crate::layers::qwen3_attention::take_ffn_host_us();
+            let ph = crate::layers::qwen3_attention::take_attn_phase_us();
+            // loop_wall is the host's own elapsed time across the whole layer
+            // dispatch. `in_prefill` is time inside layer.prefill() itself,
+            // `dflash` is the per-layer DFlash capture (expected ~0 for models
+            // with DFlash disabled), and the remainder is other per-layer
+            // bookkeeping. Compare loop_wall against nsys GPU-busy time: the
+            // difference is host work not overlapped with the device.
+            tracing::info!(
+                "PREFILL HOST TIMING layers={} tokens={}: loop_wall={:.1}ms in_prefill={:.1}ms ffn={:.1}ms attn_rest={:.1}ms dflash={:.1}ms | qkv={:.1}ms mid={:.1}ms attn_kernel={:.1}ms",
+                self.layers.len(),
+                proc_count,
+                wall.as_secs_f64() * 1e3,
+                t_in_prefill.as_secs_f64() * 1e3,
+                ffn_us as f64 / 1e3,
+                (t_in_prefill.as_micros() as f64 - ffn_us as f64) / 1e3,
+                t_dflash.as_secs_f64() * 1e3,
+                ph[0] as f64 / 1e3,
+                ph[1] as f64 / 1e3,
+                ph[2] as f64 / 1e3,
+            );
+        }
+
+        // ATLAS_MTP_DRAFTER_PREFILL: capture this chunk's final-layer hidden
+        // rows for the whole-prompt drafter prefill. No-op when disabled.
+        self.try_mtp_prefill_capture(seq, effective_seq_len_start, proc_count, stream)?;
         if let Some(t0) = prefill_t0 {
             self.gpu.synchronize(stream)?;
             let total_us = t0.elapsed().as_micros();
@@ -268,12 +341,36 @@ impl TransformerModel {
                 .map(|(i, us)| format!("L{}={:.2}ms", i, *us as f64 / 1000.0))
                 .collect();
             let path_label = if use_decode_path { "decode" } else { "prefill" };
+            // Aggregate the same per-layer samples by layer type so the profile
+            // attributes cost to mamba / moe / attention instead of bare indices.
+            let mut by_type: std::collections::BTreeMap<String, (u128, usize)> =
+                std::collections::BTreeMap::new();
+            for (i, us) in layer_times.iter().copied().enumerate() {
+                let e = by_type
+                    .entry(format!("{:?}", self.config.layer_type(i)))
+                    .or_insert((0, 0));
+                e.0 += us;
+                e.1 += 1;
+            }
+            let per_type: Vec<String> = by_type
+                .iter()
+                .map(|(k, (us, n))| {
+                    format!(
+                        "{}x{}={:.0}ms(avg {:.1})",
+                        n,
+                        k,
+                        *us as f64 / 1000.0,
+                        *us as f64 / 1000.0 / *n as f64
+                    )
+                })
+                .collect();
             tracing::info!(
-                "Prefill chunk {} tok (proc {}, {}): {:.1}ms total, top5: {}",
+                "Prefill chunk {} tok (proc {}, {}): {:.1}ms total, by_type: {}, top5: {}",
                 chunk_len,
                 proc_count,
                 path_label,
                 total_us as f64 / 1000.0,
+                per_type.join(", "),
                 top5.join(", "),
             );
         }

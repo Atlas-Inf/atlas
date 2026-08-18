@@ -76,10 +76,14 @@ pub struct CompletionTokensDetails {
     pub reasoning_tokens: usize,
     /// Audio-output tokens. Always 0 on Atlas until audio modality lands.
     pub audio_tokens: usize,
-    /// Predicted-output (`prediction`) tokens that matched generation.
-    /// Always 0 on Atlas — we don't implement predicted outputs yet.
+    /// Predicted tokens that matched generation. Atlas has no client-supplied
+    /// `prediction` feature; this reports the SPECULATIVE-DECODE draft tokens
+    /// the MTP verify step accepted for this request — the same "predicted
+    /// tokens that matched generation" meaning, with the server as the
+    /// predictor. 0 when speculation is off or nothing was accepted.
     pub accepted_prediction_tokens: usize,
-    /// Predicted-output tokens that were rejected. Always 0 on Atlas.
+    /// Predicted-output tokens that were rejected. Always 0 on Atlas —
+    /// rejected MTP drafts are not client-billable and are not reported here.
     pub rejected_prediction_tokens: usize,
 }
 
@@ -121,10 +125,46 @@ pub struct ModelInfo {
     pub object: String,
     pub created: u64,
     pub owned_by: String,
+    /// Context window the server will actually accept, in tokens.
+    ///
+    /// Not an OpenAI field — a vLLM extension that clients (LiteLLM, aider,
+    /// Continue, OpenWebUI) probe to size requests without a round trip that
+    /// fails at the scheduler. It is DERIVED from `AppState::max_seq_len`, the
+    /// same value the admission path enforces, so the advertised ceiling and
+    /// the enforced one cannot drift apart.
+    ///
+    /// `None` (omitted from the wire) when no model is loaded: fabricating a 0
+    /// would read as "zero context" rather than "unknown".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<usize>,
+}
+
+impl ModelInfo {
+    /// The ONE place an advertised entry is built.
+    ///
+    /// Both `/v1/models` list sites and the retrieve handler go through here so
+    /// the advertised ceiling is DERIVED from the value admission enforces
+    /// (`AppState::max_seq_len`) rather than restated. A second construction
+    /// site is how the wire and the scheduler drift apart.
+    pub fn advertise(id: String, max_seq_len: usize) -> Self {
+        Self {
+            id,
+            object: "model".to_string(),
+            created: crate::ids::unix_timestamp(),
+            owned_by: "atlas-spark".to_string(),
+            max_model_len: Some(max_seq_len),
+        }
+    }
 }
 
 impl ChatCompletionResponse {
-    pub fn new(model: &str, content: String, usage: Usage, finish_reason: &str) -> Self {
+    pub fn new(
+        model: &str,
+        content: String,
+        reasoning_content: Option<String>,
+        usage: Usage,
+        finish_reason: &str,
+    ) -> Self {
         Self {
             id: format!("chatcmpl-{}", uuid_v4()),
             object: "chat.completion".to_string(),
@@ -135,7 +175,7 @@ impl ChatCompletionResponse {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    reasoning_content: None,
+                    reasoning_content,
                     annotations: extract_url_annotations(&content),
                     refusal: None,
                     content: Some(content),
@@ -153,6 +193,7 @@ impl ChatCompletionResponse {
     pub fn with_tool_calls(
         model: &str,
         content: Option<String>,
+        reasoning_content: Option<String>,
         tool_calls: Vec<crate::tool_parser::ToolCall>,
         usage: Usage,
     ) -> Self {
@@ -166,7 +207,7 @@ impl ChatCompletionResponse {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    reasoning_content: None,
+                    reasoning_content,
                     annotations: content.as_deref().and_then(extract_url_annotations),
                     refusal: None,
                     content,

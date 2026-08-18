@@ -20,10 +20,16 @@ use crate::weight_map::{DenseWeight, MtpWeights};
 mod async_chkpt;
 mod decode_a;
 mod decode_a2;
+mod decode_a3;
+mod decode_a_diag;
 mod decode_b;
 mod decode_b2;
 mod decode_checkpoint;
+mod decode_graph_key;
+mod drafter_prefill;
 mod ep_misc;
+mod graph_borrow;
+mod lm_head_batched;
 mod meta;
 mod prefill_a;
 mod prefill_b;
@@ -31,20 +37,38 @@ mod prefill_c;
 mod prefill_d;
 mod sequence;
 mod speculative;
+pub(in crate::model) mod ssm_fault_in;
 mod verify_a;
 mod verify_b;
 mod verify_c;
 mod verify_c2;
 mod verify_d;
+mod verify_e;
+pub(in crate::model) mod verify_e2;
 mod verify_fused;
 
 impl Model for TransformerModel {
-    fn prepare_vision_embed(&self, images: &[(Vec<f32>, usize, usize)]) -> Result<()> {
+    fn teardown(&mut self) -> Result<()> {
+        self.release_pools()
+    }
+
+    /// Poll this model's own InnerQ driver. A miss is logged, never fatal — it
+    /// is a diagnostic lever, not part of serving.
+    #[cfg(feature = "cuda")]
+    fn poll_innerq(&self) {
+        if let Some(driver) = self.innerq.as_ref()
+            && let Err(e) = driver.maybe_finalize(128)
+        {
+            tracing::warn!("InnerQ maybe_finalize failed: {e:#}");
+        }
+    }
+
+    fn prepare_vision_embed(&self, images: &[crate::VisionItem]) -> Result<()> {
         self.prepare_vision_embed_dispatch(images)
     }
     fn prepare_vision_embed_batched(
         &self,
-        per_request: &[Vec<(Vec<f32>, usize, usize)>],
+        per_request: &[Vec<crate::VisionItem>],
     ) -> Result<Vec<(usize, usize, usize, usize)>> {
         self.prepare_vision_embed_batched_dispatch(per_request)
     }
@@ -53,8 +77,20 @@ impl Model for TransformerModel {
         *self.vision_grid_base.lock() = grid_base;
         *self.vision_owned_images.lock() = owned_images;
     }
+    // The four prefill entry points each end with `try_eager_drafter_prefill`:
+    // the whole-prompt drafter capture is a single shared slot, so it must be
+    // consumed while THIS sequence still owns it — one tick later, at the
+    // first propose, a concurrent sequence's prefill has already restarted it
+    // and every sequence but the last-prefilled drafts blind. See
+    // `drafter_prefill.rs`. Kill switch `ATLAS_NO_MTP_EAGER_DRAFTER`.
+    fn tokens_contain_vision_pad(&self, tokens: &[u32]) -> bool {
+        self.tokens_have_vision_pad(tokens)
+    }
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
-        self.prefill_dispatch(tokens, seq, stream)
+        self.stamp_overlay_route(seq.adapter_slot);
+        let logits = self.prefill_dispatch(tokens, seq, stream)?;
+        self.try_eager_drafter_prefill(seq, true, stream);
+        Ok(logits)
     }
     fn prefill_chunk(
         &self,
@@ -65,7 +101,17 @@ impl Model for TransformerModel {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr> {
-        self.prefill_chunk_dispatch(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream)
+        self.stamp_overlay_route(seq.adapter_slot);
+        let logits = self.prefill_chunk_dispatch(
+            tokens,
+            seq,
+            chunk_start,
+            chunk_len,
+            is_last_chunk,
+            stream,
+        )?;
+        self.try_eager_drafter_prefill(seq, is_last_chunk, stream);
+        Ok(logits)
     }
     fn prefill_twophase(
         &self,
@@ -74,9 +120,14 @@ impl Model for TransformerModel {
         chunk_size: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
-        self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)
+        self.stamp_overlay_route(seq.adapter_slot);
+        let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
+        self.try_eager_drafter_prefill(seq, true, stream);
+        Ok(logits)
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
+        self.stamp_overlay_route(seq.adapter_slot);
+        self.stamp_decode_moe_single(seq.adapter_slot);
         self.decode_dispatch(token, seq, _stream)
     }
     fn decode_batch(
@@ -85,7 +136,19 @@ impl Model for TransformerModel {
         seqs: &mut [&mut SequenceState],
         stream: u64,
     ) -> Result<DevicePtr> {
-        self.decode_batch_dispatch(tokens, seqs, stream)
+        self.stamp_overlay_route_batch(seqs);
+        self.stamp_decode_moe_batch(seqs);
+        let r = self.decode_batch_dispatch(tokens, seqs, stream);
+        if r.is_err() {
+            // A mid-capture refuse (MoE LoRA router/mixed/non-active) in the
+            // batched-decode compute leaves the capture stream recording; release
+            // it so the caller's sequence cleanup doesn't hit
+            // STREAM_CAPTURE_UNSUPPORTED and poison every later op (a single
+            // refused concurrent request would otherwise brick the server). The
+            // batched path captures on the default stream (decode_a2).
+            self.gpu.abort_capture_if_active(self.gpu.default_stream());
+        }
+        r
     }
     fn mixed_forward(
         &self,
@@ -98,7 +161,13 @@ impl Model for TransformerModel {
         prefill_is_last: bool,
         stream: u64,
     ) -> Result<crate::traits::MixedForwardResult> {
-        self.mixed_forward_dispatch(
+        // Mixed decode+prefill batch spans multiple adapters ⇒ mark mixed so the
+        // overlay hooks skip (per-token seq_slot routing is SOLID Incr-4).
+        self.overlay_route_slot
+            .store(i32::MIN, std::sync::atomic::Ordering::Relaxed);
+        // Decode portion: Skip only if every decode seq is base, else refuse.
+        self.stamp_decode_moe_batch(decode_seqs);
+        let r = self.mixed_forward_dispatch(
             decode_tokens,
             decode_seqs,
             prefill_tokens,
@@ -107,51 +176,102 @@ impl Model for TransformerModel {
             prefill_chunk_len,
             prefill_is_last,
             stream,
-        )
+        );
+        if r.is_err() {
+            // Same brick guard as decode_batch: a refuse in the captured decode
+            // portion must not leave the default stream recording.
+            self.gpu.abort_capture_if_active(self.gpu.default_stream());
+        }
+        let out = r?;
+        self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream);
+        Ok(out)
     }
 
-    /// Q12 Phase 4b override: try the model-level batched dispatch
-    /// (`prefill_batch_chunk_dispatch`) first; on the not-yet-implemented
-    /// stub failure, fall back to the trait's default per-stream loop.
-    /// This keeps callers correct while the per-layer-batched body is
-    /// staged in subsequent commits.
+    /// Q12 Phase 4b override. The concrete dispatcher routes ineligible
+    /// batches to its sequential path before state mutation. Errors from an
+    /// admitted kernel batch must propagate: retrying sequentially can
+    /// reapply prefix-cache and KV state.
     fn prefill_batch_chunk(
         &self,
         streams: &mut [PrefillSlice<'_>],
         stream: u64,
     ) -> Result<Vec<DevicePtr>> {
-        // Try the concrete dispatch. The Phase 4b stub returns Err for the
-        // "not-yet-implemented" path so we transparently downgrade to the
-        // single-stream-loop default impl. Once Phase 2b/3 land, the
-        // dispatch returns Ok with logits and this fallback becomes dead
-        // code that we can drop.
-        match self.prefill_batch_chunk_dispatch(streams, stream) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                // Log at debug — under expected for this stub. Promotes to
-                // info if a real error is encountered (future Phase 4b body).
-                tracing::debug!(
-                    "prefill_batch_chunk_dispatch unavailable, falling back to \
-                     per-stream loop: {e}"
-                );
-                let mut out = Vec::with_capacity(streams.len());
-                for slice in streams.iter_mut() {
-                    let logits = self.prefill_chunk(
-                        slice.prompt_tokens,
-                        slice.seq,
-                        slice.chunk_start,
-                        slice.chunk_len,
-                        slice.is_last_chunk,
-                        stream,
-                    )?;
-                    out.push(logits);
-                }
-                Ok(out)
-            }
-        }
+        self.prefill_batch_chunk_rows(streams, stream, 0)
+    }
+    /// Mixed-step variant: shift the finishing streams' logits rows clear of
+    /// the decode lanes. See the trait docs for the aliasing this prevents.
+    fn prefill_batch_chunk_rows(
+        &self,
+        streams: &mut [PrefillSlice<'_>],
+        stream: u64,
+        row_base: usize,
+    ) -> Result<Vec<DevicePtr>> {
+        self.prefill_batch_chunk_dispatch(streams, stream, row_base)
     }
     fn vocab_size(&self) -> usize {
         self.vocab_size_dispatch()
+    }
+    fn set_active_lora(&mut self, name: &str) -> Result<()> {
+        self.rotate_lora_to(name)
+    }
+    fn adapter_id_for(&self, slot: i32) -> u64 {
+        self.adapter_id_for_slot(slot)
+    }
+    fn acquire_adapter_slot(&self, slot: i32) -> i32 {
+        TransformerModel::acquire_adapter_slot(self, slot)
+    }
+    fn release_adapter_slot(&self, resolved: i32) {
+        TransformerModel::release_adapter_slot(self, resolved)
+    }
+    fn swap_lora_from_disk(
+        &mut self,
+        dir: &std::path::Path,
+        name: &str,
+        slot: usize,
+    ) -> Result<()> {
+        // Disk staging is plain file I/O and is portable; only the PEER path
+        // needs RDMA. Still cuda-gated, since it lands into a device pool.
+        #[cfg(feature = "cuda")]
+        {
+            self.swap_lora_slot_from_disk(dir, name, slot)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (dir, name, slot);
+            anyhow::bail!("LoRA disk swap requires the cuda feature")
+        }
+    }
+    fn promote_lora_from_peer(
+        &mut self,
+        peer_addr: &str,
+        adapter_id: &str,
+        name: &str,
+        peft: atlas_core::config::PeftAdapterConfig,
+    ) -> Result<(usize, Option<String>)> {
+        #[cfg(all(feature = "cuda", unix))]
+        {
+            self.promote_lora_slot_from_peer(peer_addr, adapter_id, name, peft)
+        }
+        #[cfg(not(all(feature = "cuda", unix)))]
+        {
+            let _ = (peer_addr, adapter_id, name, peft);
+            anyhow::bail!("LoRA peer promotion stages over RDMA (rdma-core); unix-only")
+        }
+    }
+    fn promote_lora_from_disk(
+        &mut self,
+        dir: &std::path::Path,
+        name: &str,
+    ) -> Result<(usize, Option<String>)> {
+        #[cfg(feature = "cuda")]
+        {
+            self.promote_lora_slot_from_disk(dir, name)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (dir, name);
+            anyhow::bail!("LoRA disk promotion requires the cuda feature")
+        }
     }
     fn high_speed_swap_dims(&self) -> Option<spark_storage::ModelDims> {
         self.high_speed_swap_dims_dispatch()
@@ -189,7 +309,15 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         stream: u64,
     ) -> Result<Vec<u32>> {
-        self.decode_verify_dispatch(tokens, seq, stream)
+        self.ssm_pool.require_verify_rollback_supported()?;
+        let r = self.decode_verify_dispatch(tokens, seq, stream);
+        if r.is_err() {
+            // Same brick guard as decode_batch: a refuse mid-verify-capture
+            // (MTP/spec) must not leave the default stream recording. No-op when
+            // not capturing. Verify captures on default_stream (verify_a/b/…).
+            self.gpu.abort_capture_if_active(self.gpu.default_stream());
+        }
+        r
     }
     fn checkpoint_ssm_states(&self, seq: &mut SequenceState) -> Result<()> {
         self.checkpoint_ssm_states_dispatch(seq)
@@ -199,6 +327,9 @@ impl Model for TransformerModel {
     }
     fn has_ssm_layers(&self) -> bool {
         self.ssm_pool.num_ssm_layers > 0
+    }
+    fn mtp_slot_draft_capacity(&self, slot_idx: usize) -> usize {
+        self.ssm_pool.verify_draft_capacity(slot_idx)
     }
     fn decode_rollback_ring_slots(&self) -> usize {
         if self.ssm_snapshots.decode_rollback_enabled() {
@@ -245,6 +376,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 2]> {
+        self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_graphed_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k3(
@@ -253,6 +385,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 3]> {
+        self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k4(
@@ -261,7 +394,47 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 4]> {
+        self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
+    }
+    fn can_batch_verify(&self, ks: &[usize]) -> bool {
+        self.can_batch_verify_dispatch(ks)
+    }
+    fn decode_verify_batched(
+        &self,
+        tokens: &[u32],
+        ks: &[usize],
+        seqs: &mut [&mut SequenceState],
+        _stream: u64,
+    ) -> Result<Vec<u32>> {
+        self.ssm_pool.require_verify_rollback_supported()?;
+        self.decode_verify_batched_dispatch(tokens, ks, seqs, _stream)
+    }
+    fn stash_verify_hidden_rows(&self, rows: &[usize], _stream: u64) -> Result<()> {
+        self.stash_verify_hidden_rows_dispatch(rows, _stream)
+    }
+    fn save_hidden_for_mtp_from_stash(&self, idx: usize, _stream: u64) -> Result<()> {
+        self.save_hidden_for_mtp_from_stash_dispatch(idx, _stream)
+    }
+    fn run_mtp_propose_batched(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        stash_idx: &[usize],
+        num_drafts: usize,
+        seqs: &mut [&mut SequenceState],
+        _stream: u64,
+        out_conf: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        self.run_mtp_propose_batched_dispatch(
+            tokens, positions, stash_idx, num_drafts, seqs, out_conf,
+        )
+    }
+    fn mtp_propose_batch_max(&self) -> usize {
+        match &self.proposer {
+            Some(p) => p.propose_batch_max(&self.buffers, &self.config),
+            None => 1,
+        }
     }
     fn decode_verify_graphed_kgamma(
         &self,
@@ -269,6 +442,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream)
     }
     fn decode_and_verify_fused(
@@ -277,8 +451,13 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_and_verify_fused_dispatch(tokens, seq, _stream)
     }
+    fn save_hidden_for_catchup(&self, token_idx: usize, pos: usize) -> Result<()> {
+        self.save_hidden_for_catchup_dispatch(token_idx, pos)
+    }
+
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
     }
@@ -464,9 +643,7 @@ impl Model for TransformerModel {
         d.skip_next_decode_append = true;
 
         // One-shot activation log so A/B runs can confirm the path is live.
-        static UNIFIED_CTX_LOGGED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !UNIFIED_CTX_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if self.stats.once("log:dflash_unified_ctx") {
             tracing::info!(
                 "DFlash UNIFIED_CTX ACTIVE: first commit_ctx rows={} base_pos={} ctx_len={}",
                 num_committed,
@@ -534,9 +711,7 @@ impl Model for TransformerModel {
         let dst = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
         self.gpu.copy_d2d_async(base, dst, ctx_slot_bytes, stream)?;
         // One-shot activation log so A/B runs can confirm the fix is live.
-        static SERIAL_APPEND_LOGGED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !SERIAL_APPEND_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if self.stats.once("log:dflash_serial_append") {
             tracing::info!(
                 "DFlash SERIAL_APPEND ACTIVE: first serial ctx append at ctx_len={} pos={}",
                 d.ctx_len,
@@ -616,6 +791,12 @@ impl Model for TransformerModel {
     fn num_free_blocks(&self) -> usize {
         self.num_free_blocks_dispatch()
     }
+    fn num_total_blocks(&self) -> usize {
+        self.num_total_blocks_dispatch()
+    }
+    fn reclaim_prefix_blocks(&self, num_blocks: usize) -> usize {
+        self.reclaim_prefix_blocks_dispatch(num_blocks)
+    }
     fn start_checkpoint_async(&self, seq: &mut SequenceState) -> Result<()> {
         self.start_checkpoint_async_dispatch(seq)
     }
@@ -628,17 +809,6 @@ impl Model for TransformerModel {
     }
     fn sync_secondary(&self) -> Result<()> {
         self.sync_secondary_dispatch()
-    }
-    fn pre_verify_copy_async(&self, seq: &mut SequenceState) -> Result<()> {
-        self.pre_verify_copy_async_dispatch(seq)
-    }
-    fn commit_verify_state_async(
-        &self,
-        seq: &mut SequenceState,
-        num_accepted: usize,
-        k: usize,
-    ) -> Result<()> {
-        self.commit_verify_state_async_dispatch(seq, num_accepted, k)
     }
     fn commit_accepted_prefix(
         &self,

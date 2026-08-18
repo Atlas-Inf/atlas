@@ -8,6 +8,10 @@ use std::collections::HashMap;
 
 use super::{DflashRaw, ModelTypeMatch, SamplingCat};
 
+#[path = "build_parse_behavior.rs"]
+mod behavior;
+pub(super) use behavior::*;
+
 pub(super) fn parse_kernel_toml(
     kernel_dir: &std::path::Path,
     vendor: &str,
@@ -50,6 +54,100 @@ pub(super) fn parse_kernel_toml(
         .unwrap_or_default();
 
     (extra_flags, module_overrides)
+}
+
+/// Parse `[shadow_exempt]` from a KERNEL.toml: `module = ["kernel", ...]`.
+///
+/// Declares `(module, kernel)` pairs a model shadow may omit without that being
+/// drift — superseded entry points `common/` still carries but nothing
+/// dispatches. Each needs a stated reason in the TOML comment.
+///
+/// WARNING-SCOPED ONLY. The caller uses this to filter the build warning; the
+/// pairs stay in `TargetPtxSet::shadowed_dropped`, so the startup audit still
+/// hard-errors if a model's dispatch actually resolves one. An exemption can
+/// never turn a real missing kernel into a silent pass.
+pub(super) fn parse_shadow_exempt(kernel_dir: &std::path::Path) -> Vec<(String, String)> {
+    let path = kernel_dir.join("KERNEL.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let toml: toml::Value =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("Bad TOML in {}: {e}", path.display()));
+    let Some(table) = toml.get("shadow_exempt").and_then(|v| v.as_table()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (module, kernels) in table {
+        let list = kernels.as_array().unwrap_or_else(|| {
+            panic!(
+                "{}: [shadow_exempt] {module} must be an array of kernel names",
+                path.display()
+            )
+        });
+        for k in list {
+            let name = k.as_str().unwrap_or_else(|| {
+                panic!(
+                    "{}: [shadow_exempt] {module} entries must be strings",
+                    path.display()
+                )
+            });
+            out.push((module.clone(), name.to_string()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Parse `[expected_absent]` from a MODEL.toml.
+///
+/// ```toml
+/// [expected_absent.mla_absorbed]
+/// mla_batched_gemv = "no MLA: this checkpoint is standard GQA (kv_lora_rank 0)"
+/// ```
+///
+/// Each entry names a `(module, kernel)` lookup this model's dispatch may issue
+/// and fail to resolve WITHOUT that being an error. The value is a MANDATORY
+/// reason — a bare list would become a place to silence the boot gate, which is
+/// the failure mode the gate exists to remove. TRANSITIONAL: the right fix is
+/// to gate the lookup on config so it is never issued (see
+/// `qwen3_attention::init_arch_gates`). Anything neither gated nor listed here
+/// fails the boot audit.
+pub(super) fn parse_expected_absent(model_dir: &std::path::Path) -> Vec<(String, String)> {
+    let path = model_dir.join("MODEL.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let toml: toml::Value =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("Bad TOML in {}: {e}", path.display()));
+    let Some(table) = toml.get("expected_absent").and_then(|v| v.as_table()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (module, kernels) in table {
+        let entries = kernels.as_table().unwrap_or_else(|| {
+            panic!(
+                "{}: [expected_absent.{module}] must be a table of `kernel = \"reason\"` \
+                 — every entry needs a stated reason",
+                path.display()
+            )
+        });
+        for (kernel, reason) in entries {
+            let reason = reason.as_str().unwrap_or_else(|| {
+                panic!(
+                    "{}: [expected_absent.{module}] {kernel} must be a reason string",
+                    path.display()
+                )
+            });
+            assert!(
+                !reason.trim().is_empty(),
+                "{}: [expected_absent.{module}] {kernel} needs a stated reason",
+                path.display()
+            );
+            out.push((module.clone(), kernel.clone()));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Parse sampling presets from MODEL.toml `[sampling.*]` sections.
@@ -106,6 +204,9 @@ pub(super) fn parse_sampling_presets(
                     .get("lz_penalty")
                     .and_then(|t| t.as_float())
                     .unwrap_or(0.0) as f32,
+                // NO unwrap_or: an absent min_p must stay None so the
+                // server's --default-min-p keeps owning the field.
+                min_p: v.get("min_p").and_then(|t| t.as_float()).map(|p| p as f32),
             },
             None => SamplingCat::default(),
         }
@@ -117,212 +218,6 @@ pub(super) fn parse_sampling_presets(
         parse_cat("non_thinking"),
         parse_cat("tools"),
     )
-}
-
-/// Parsed `[behavior]` table from a model's MODEL.toml. Field defaults
-/// match `ModelBehavior::default()` so an absent table / absent field is
-/// behavior-neutral.
-#[derive(Clone)]
-pub(super) struct ParsedBehavior {
-    pub thinking_in_tools: bool,
-    pub max_thinking_budget: u32,
-    pub thinking_default: bool,
-    pub fp8_kv_calibration_tokens: usize,
-    pub default_kv_dtype: String,
-    pub default_num_drafts: u32,
-    pub disable_tool_steering: bool,
-    pub tool_call_parser: String,
-    pub enable_loop_watchdog: bool,
-    pub min_p_floor: f32,
-    pub temperature_max: f32,
-    pub think_loop_min_repeats: u32,
-    pub think_loop_scan_window: u32,
-    pub confidence_early_stop: bool,
-    pub confidence_run_length: u32,
-    pub fuzzy_repeat_tolerance_div: u32,
-    pub max_inter_tool_prose: u32,
-    pub max_post_think_content_tokens: u32,
-    pub tscg: bool,
-    pub disable_tool_grammar: bool,
-    pub rollback_resteer: bool,
-    pub rom_head: String,
-    pub tool_retry: bool,
-}
-
-impl Default for ParsedBehavior {
-    fn default() -> Self {
-        Self {
-            thinking_in_tools: true,
-            max_thinking_budget: 256,
-            thinking_default: false,
-            fp8_kv_calibration_tokens: 0,
-            default_kv_dtype: String::new(),
-            default_num_drafts: 0,
-            disable_tool_steering: false,
-            tool_call_parser: String::new(),
-            enable_loop_watchdog: false,
-            min_p_floor: 0.0,
-            temperature_max: 0.0,
-            think_loop_min_repeats: 3,
-            think_loop_scan_window: 160,
-            confidence_early_stop: true,
-            confidence_run_length: 30,
-            fuzzy_repeat_tolerance_div: 12,
-            max_inter_tool_prose: 384,
-            max_post_think_content_tokens: 100_000,
-            tscg: false,
-            disable_tool_grammar: false,
-            rollback_resteer: true,
-            rom_head: String::new(),
-            tool_retry: true,
-        }
-    }
-}
-
-/// Parse `[behavior]` from MODEL.toml. Absent table or parse error →
-/// `ParsedBehavior::default()`.
-pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
-    let model_toml_path = model_dir.join("MODEL.toml");
-    if !model_toml_path.exists() {
-        return ParsedBehavior::default();
-    }
-    let content = std::fs::read_to_string(&model_toml_path).unwrap_or_default();
-    let toml: toml::Value = match toml::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return ParsedBehavior::default(),
-    };
-    let b = toml.get("behavior");
-    let thinking_in_tools = b
-        .and_then(|v| v.get("thinking_in_tools"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let max_thinking_budget = b
-        .and_then(|v| v.get("max_thinking_budget"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(256);
-    let thinking_default = b
-        .and_then(|v| v.get("thinking_default"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let fp8_kv_calibration_tokens = b
-        .and_then(|v| v.get("fp8_kv_calibration_tokens"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as usize)
-        .unwrap_or(0);
-    let default_kv_dtype = b
-        .and_then(|v| v.get("default_kv_dtype"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let default_num_drafts = b
-        .and_then(|v| v.get("default_num_drafts"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(0);
-    let disable_tool_steering = b
-        .and_then(|v| v.get("disable_tool_steering"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let tool_call_parser = b
-        .and_then(|v| v.get("tool_call_parser"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let enable_loop_watchdog = b
-        .and_then(|v| v.get("enable_loop_watchdog"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    // Server-side sampling safety floor/ceiling (0.0 = disabled). See
-    // ModelBehavior::{min_p_floor,temperature_max} for rationale.
-    let min_p_floor = b
-        .and_then(|v| v.get("min_p_floor"))
-        .and_then(|v| v.as_float())
-        .unwrap_or(0.0) as f32;
-    let temperature_max = b
-        .and_then(|v| v.get("temperature_max"))
-        .and_then(|v| v.as_float())
-        .unwrap_or(0.0) as f32;
-    let think_loop_min_repeats = b
-        .and_then(|v| v.get("think_loop_min_repeats"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(3);
-    let think_loop_scan_window = b
-        .and_then(|v| v.get("think_loop_scan_window"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(160);
-    let confidence_early_stop = b
-        .and_then(|v| v.get("confidence_early_stop"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let confidence_run_length = b
-        .and_then(|v| v.get("confidence_run_length"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(30);
-    let fuzzy_repeat_tolerance_div = b
-        .and_then(|v| v.get("fuzzy_repeat_tolerance_div"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(12);
-    let max_inter_tool_prose = b
-        .and_then(|v| v.get("max_inter_tool_prose"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(384);
-    let max_post_think_content_tokens = b
-        .and_then(|v| v.get("max_post_think_content_tokens"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(100_000);
-    let tscg = b
-        .and_then(|v| v.get("tscg"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let disable_tool_grammar = b
-        .and_then(|v| v.get("disable_tool_grammar"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let rollback_resteer = b
-        .and_then(|v| v.get("rollback_resteer"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let rom_head = b
-        .and_then(|v| v.get("rom_head"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let tool_retry = b
-        .and_then(|v| v.get("tool_retry"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    ParsedBehavior {
-        thinking_in_tools,
-        max_thinking_budget,
-        thinking_default,
-        fp8_kv_calibration_tokens,
-        default_kv_dtype,
-        default_num_drafts,
-        disable_tool_steering,
-        tool_call_parser,
-        enable_loop_watchdog,
-        min_p_floor,
-        temperature_max,
-        think_loop_min_repeats,
-        think_loop_scan_window,
-        confidence_early_stop,
-        confidence_run_length,
-        fuzzy_repeat_tolerance_div,
-        max_inter_tool_prose,
-        max_post_think_content_tokens,
-        tscg,
-        disable_tool_grammar,
-        rollback_resteer,
-        rom_head,
-        tool_retry,
-    }
 }
 
 /// Parse `[[model_types]]` from MODEL.toml.
@@ -356,6 +251,86 @@ pub(super) fn parse_model_types(model_dir: &std::path::Path) -> Vec<ModelTypeMat
             })
         })
         .collect()
+}
+
+/// Parse `[model] match_names` from MODEL.toml.
+///
+/// Checkpoint-reference needles (case-insensitive substrings of the HF id /
+/// `--model-name` / resolved model dir) that identify checkpoints this
+/// target serves. Consulted at runtime only to break a tie when several
+/// targets declare the same `(model_type, hidden_size)` — see
+/// `src/resolve.rs`. Empty entries are rejected: an empty needle would
+/// match every reference and silently win every tie.
+pub(super) fn parse_match_names(model_dir: &std::path::Path) -> Vec<String> {
+    let path = model_dir.join("MODEL.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let toml: toml::Value =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("Bad TOML in {}: {e}", path.display()));
+    let Some(arr) = toml
+        .get("model")
+        .and_then(|m| m.get("match_names"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|v| {
+            let s = v.as_str().unwrap_or_else(|| {
+                panic!(
+                    "{}: [model] match_names entries must be strings",
+                    path.display()
+                )
+            });
+            assert!(
+                !s.trim().is_empty(),
+                "{}: [model] match_names entries must be non-empty — an empty needle \
+                 would match every checkpoint reference",
+                path.display()
+            );
+            // The needles are emitted into generated Rust as `"{needle}"`
+            // string literals (build_codegen.rs) with no escaping; a quote
+            // or backslash would produce an uncompilable target_ptx.rs with
+            // an error pointing nowhere near this file. Reject here, where
+            // the operator can see which TOML entry to fix. (No legitimate
+            // HF id / model-dir needle contains either character.)
+            assert!(
+                !s.contains('"') && !s.contains('\\'),
+                "{}: [model] match_names entry {s:?} contains a quote or backslash — \
+                 needles are emitted verbatim into generated Rust string literals \
+                 and checkpoint references never contain these characters",
+                path.display()
+            );
+            s.to_string()
+        })
+        .collect()
+}
+
+/// Parse `[model] kernel_source` from MODEL.toml.
+///
+/// Names ANOTHER kernel-target directory whose per-quant kernel sources
+/// this target compiles instead of shipping its own copies (SSOT for
+/// architecturally-identical checkpoints — qwen3.8-27b reuses
+/// qwen3.6-27b's .cu tree verbatim). Everything else in MODEL.toml
+/// (sampling, behavior, model_types, match_names, expected_absent) still
+/// belongs to this target. `build.rs` validates the referent exists and
+/// refuses redirect chains.
+pub(super) fn parse_kernel_source(model_dir: &std::path::Path) -> Option<String> {
+    let path = model_dir.join("MODEL.toml");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let toml: toml::Value =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("Bad TOML in {}: {e}", path.display()));
+    let src = toml.get("model")?.get("kernel_source")?;
+    let s = src
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: [model] kernel_source must be a string", path.display()));
+    assert!(
+        !s.trim().is_empty(),
+        "{}: [model] kernel_source must name a kernel target directory",
+        path.display()
+    );
+    Some(s.to_string())
 }
 
 /// Parse `[dflash]` from MODEL.toml. Returns `None` when the section is

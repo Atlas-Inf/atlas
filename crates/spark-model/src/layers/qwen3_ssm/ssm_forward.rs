@@ -94,10 +94,15 @@ impl Qwen3SsmLayer {
             } else if self.sequential_qkvz {
                 // Qwen3.5: QKVZ weight is pre-concatenated [Q|K|V|Z] sequential.
                 // Plain GEMV writes directly to deinterleaved buffer.
-                if let Some(ref nvfp4) = self.qkvz_nvfp4 {
-                    ops::w4a16_gemv(
+                if let Some(ref q2) = self.qkvz_q2 {
+                    // Tier-1c keep-packed Q2_0: 2-bit fused-qkvz GEMV.
+                    ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, normed, q2, deinterleaved, stream)
+                } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
+                    ops::w4a16_decode_gemv(
                         ctx.gpu,
                         self.w4a16_gemv_k,
+                        self.w4a16_gemv_sw_k,
+                        ctx.levers.gemv_sw,
                         normed,
                         nvfp4,
                         deinterleaved,
@@ -299,11 +304,28 @@ impl Qwen3SsmLayer {
         };
         let fused_gdn_norm = use_f32_gdn
             && self.gdn_f32_norm_k.0 != 0
-            && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() == Some("1");
+            && crate::layers::qwen3_ssm::gdn_fused_norm_enabled();
+        // FP16 h-state (ATLAS_SSM_H_FP16). This is the single-sequence decode
+        // arm, so it must honour the same invariant the batched path does —
+        // otherwise C=1 would read an FP16 pool through an FP32 kernel.
+        let h_f16 = super::ssm_h_fp16_enabled();
+        if h_f16 {
+            super::ssm_h_fp16::require_h_f16(state)?;
+            if !fused_gdn_norm {
+                anyhow::bail!(
+                    "ATLAS_SSM_H_FP16: single-seq decode fell through to the FP32-only                      gated_delta_rule_decode arm (use_f32_gdn={use_f32_gdn},                      gdn_f32_norm={}). Set ATLAS_GDN_FUSED_NORM=1.",
+                    self.gdn_f32_norm_k.0
+                );
+            }
+        }
         if fused_gdn_norm {
             ops::gdn_decode_f32_norm(
                 ctx.gpu,
-                self.gdn_f32_norm_k,
+                if h_f16 {
+                    self.gdn_f16_norm_k
+                } else {
+                    self.gdn_f32_norm_k
+                },
                 state.h_state,
                 q_conv,
                 k_conv,
@@ -419,9 +441,11 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else {
-            ops::w4a16_gemv(
+            ops::w4a16_decode_gemv(
                 ctx.gpu,
                 self.w4a16_gemv_k,
+                self.w4a16_gemv_sw_k,
+                ctx.levers.gemv_sw,
                 normed_out,
                 &self.ssm.out_proj,
                 out,

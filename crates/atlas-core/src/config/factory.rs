@@ -9,11 +9,13 @@ use super::{LayerType, ModelConfig, QuantizationConfig};
 impl ModelConfig {
     pub fn qwen3_next_80b_nvfp4() -> Self {
         Self {
+            profile: false,
             hidden_size: 2048,
             num_hidden_layers: 48,
             intermediate_size: 5120,
             vocab_size: 151936,
             num_attention_heads: 16,
+            num_attention_heads_per_layer: Vec::new(),
             num_key_value_heads: 2,
             head_dim: 256,
             partial_rotary_factor: 0.25,
@@ -51,6 +53,10 @@ impl ModelConfig {
             lm_head_fp8: false,
             model_type: "qwen3_next".to_string(),
             mtp_num_hidden_layers: 1,
+            dspark_block_size: 0,
+            dspark_noise_token_id: 0,
+            dspark_target_layer_ids: Vec::new(),
+            dspark_markov_rank: 0,
             weight_prefix: String::new(),
             ep_rank: 0,
             ep_world_size: 1,
@@ -67,7 +73,10 @@ impl ModelConfig {
             conv_kernel: 0,
             moe_shared_expert_intermediate_size: 0,
             routed_scaling_factor: 1.0,
+            mlp_only_layers: Vec::new(),
             moe_latent_size: 0,
+            moe_intermediate_sizes: Vec::new(),
+            num_experts_per_toks: Vec::new(),
             vision: None,
             quantization_config: None,
             attn_gated: true,
@@ -88,14 +97,19 @@ impl ModelConfig {
             hc_sinkhorn_iters: 0,
             hc_eps: 1e-6,
             compress_ratios: Vec::new(),
+            index_n_heads: 0,
+            index_head_dim: 0,
+            index_topk: 0,
             num_hash_layers: 0,
             yarn_factor: 0.0,
             yarn_beta_slow: 0.0,
             yarn_beta_fast: 0.0,
             yarn_original_max_position_embeddings: 0,
+            yarn_attention_factor: 1.0,
             llama_4_scaling_beta: 0.0,
             llama_4_scaling_original_max_position_embeddings: 0,
             fp8_kv_calibration_tokens: 0,
+            fp8_kv_headroom: 2.0,
             final_logit_softcapping: 0.0,
             embed_scale: 0.0,
             // MiniMax M2 fields — all default to "unused" (empty/0) so the
@@ -107,6 +121,7 @@ impl ModelConfig {
             mtp_transformer_layers: 0,
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
+            adapter_max_rank: 0,
         }
     }
 }

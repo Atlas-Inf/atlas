@@ -11,6 +11,12 @@ use super::*;
 pub struct StreamingToolDetector {
     pub(super) buffer: String,
     pub(super) inside_tag: bool,
+    pub(super) inside_dsml: bool,
+    /// Whether a bare identifier inside `<tool_call>` is a legitimate
+    /// zero-argument call (Poolside v1 only — see
+    /// `ToolCallParser::promotes_bare_call_names`). Default FALSE: every
+    /// other format drops it as malformed, matching the blocking parser.
+    pub(super) promote_bare_names: bool,
     pub(super) call_counter: u32,
     /// Track if any tool calls were emitted during process() to prevent
     /// flush() from re-emitting them (causes duplicate arguments in stream).
@@ -69,6 +75,21 @@ pub enum DetectorOutput {
     ToolCallArgsFragment { fragment: String, idx: usize },
     /// Incremental: tool call complete. `</tool_call>` seen.
     ToolCallEnd { idx: usize },
+}
+
+impl StreamingToolDetector {
+    pub(super) fn has_partial_tool_opener(&self) -> bool {
+        !self.buffer.is_empty()
+            && [
+                "<tool_call>",
+                "<|tool_call>",
+                "<minimax:tool_call>",
+                "<minimax:_call>",
+                DSML_OPEN,
+            ]
+            .iter()
+            .any(|tag| tag.starts_with(&self.buffer))
+    }
 }
 
 /// Extract function name from partial tool call buffer for incremental streaming.
@@ -132,6 +153,12 @@ pub(super) fn extract_streaming_name(buffer: &str) -> Option<String> {
 /// Find where arguments start in the buffer, after the name header.
 /// Returns byte offset into buffer where argument content begins.
 pub(super) fn find_args_start(buffer: &str) -> usize {
+    // Gemma-4: after call:NAME{
+    if let Some(pos) = buffer.find("call:")
+        && let Some(brace) = buffer[pos..].find('{')
+    {
+        return pos + brace + 1;
+    }
     // Qwen3-Coder: after <function=NAME>\n
     if let Some(pos) = buffer.find("<function=")
         && let Some(gt) = buffer[pos..].find('>')

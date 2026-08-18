@@ -4,7 +4,7 @@
 # 1. Assumes image `atlas-gb10:minimax-ep2` exists on head.
 # 2. Distributes image to worker via docker save | ssh | docker load.
 # 3. Starts EP=2 via start-minimax-ep2.sh.
-# 4. Waits up to STARTUP_TIMEOUT (default 900s) for rank 0 "Listening on".
+# 4. Waits up to STARTUP_TIMEOUT (default 900s) for rank 0 readiness ("Server live", or "Listening on" from pre-Aug-2026 images).
 # 5. Runs tests/single_gpu_suite.py against http://localhost:8888/v1.
 # 6. On failure, dumps last 100 log lines from both ranks.
 # 7. Stops containers on both nodes at the end.
@@ -22,12 +22,17 @@ IMAGE="${IMAGE:-atlas-gb10:minimax-ep2}"
 WORKER_IP="${WORKER_IP:-127.0.0.1}"
 HEAD_PORT="${HEAD_PORT:-8888}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-900}"
-RESULT_DIR="/workspace/atlas/tests/all_models_results"
+# Root THIS checkout, the way tests/harness_paths.py does. A baked
+# /workspace/atlas wrote this label's result into whichever checkout happened
+# to live there — so a worktree run graded, and overwrote, another tree's
+# gate output. Deriving from the script's own location keeps a worktree, a
+# clone and a container copy each on their own results.
+ATLAS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STARTUP_SCRIPT="$ATLAS_ROOT/scripts/start-minimax-ep2.sh"
+
+RESULT_DIR="$ATLAS_ROOT/tests/all_models_results"
 LABEL="minimax-m2-ep2"
 mkdir -p "$RESULT_DIR"
-
-ATLAS_ROOT="/workspace/atlas"
-STARTUP_SCRIPT="$ATLAS_ROOT/scripts/start-minimax-ep2.sh"
 
 echo "=== MiniMax EP=2 end-to-end test ==="
 echo "Model: $MODEL"
@@ -65,13 +70,13 @@ RANK0_READY=0
 RANK1_READY=0
 while [[ $(date +%s) -lt $DEADLINE ]]; do
   if [[ $RANK0_READY -eq 0 ]]; then
-    if sudo docker logs atlas-minimax-ep0 2>&1 | grep -q 'Listening on'; then
+    if sudo docker logs atlas-minimax-ep0 2>&1 | grep -qE 'Listening on|Server live'; then
       RANK0_READY=1
       echo "  [rank0] listening"
     fi
   fi
   if [[ $RANK1_READY -eq 0 ]]; then
-    if ssh "$WORKER_IP" "sudo docker logs atlas-minimax-ep1 2>&1 | grep -qE 'EP worker ready|Listening on|worker ready'"; then
+    if ssh "$WORKER_IP" "sudo docker logs atlas-minimax-ep1 2>&1 | grep -qE 'EP worker ready|Listening on|Server live|worker ready'"; then
       RANK1_READY=1
       echo "  [rank1] worker ready"
     fi

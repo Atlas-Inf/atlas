@@ -33,12 +33,19 @@ impl ModelConfig {
         }
     }
 
-    /// Number of full attention layers.
+    /// Number of attention (KV-cache-consuming) layers: full attention plus
+    /// sliding attention. Sliding-attention layers write to the paged KV cache
+    /// exactly like full-attention ones (only their attention window differs),
+    /// so every consumer sized from this count — KV pool `num_layers`,
+    /// `attn_layer_dtypes`, loader `layer_kv_dtypes` indexing — must see them
+    /// all. Step 3.7 is the only model emitting `SlidingAttention` layer types
+    /// (12 full + 33 sliding); counting full-only there undersized the dtype
+    /// vec and panicked the loader at layer 13.
     pub fn num_attention_layers(&self) -> usize {
         if !self.layer_types.is_empty() {
             self.layer_types
                 .iter()
-                .filter(|t| **t == LayerType::FullAttention)
+                .filter(|t| matches!(t, LayerType::FullAttention | LayerType::SlidingAttention))
                 .count()
         } else {
             self.num_hidden_layers
@@ -57,6 +64,23 @@ impl ModelConfig {
         } else {
             self.num_hidden_layers - self.num_attention_layers()
         }
+    }
+
+    /// Whether this model carries recurrent (SSM / linear-attention) state —
+    /// the honest capability signal for the SSM snapshot tiers. Derived from
+    /// [`Self::num_ssm_layers`] so the config-level predicate and the runtime
+    /// pool predicate (`ssm_pool.num_ssm_layers > 0`) agree by construction
+    /// (SSOT). A pure-attention model (dense or MoE) returns `false`:
+    /// requesting an SSM tier for it must fail fast, never silently no-op.
+    pub fn has_recurrent_state(&self) -> bool {
+        self.num_ssm_layers() > 0
+    }
+
+    /// Whether this model has MoE routed experts — the capability signal for
+    /// the expert-streaming tier. Keyed on config, never on observed expert
+    /// tensors (EP ranks legitimately own zero local expert tensors).
+    pub fn has_experts(&self) -> bool {
+        self.num_experts > 0
     }
 
     /// Rotary embedding dimension.
@@ -227,6 +251,9 @@ impl ModelConfig {
         if self.kv_lora_rank > 0 {
             return true;
         }
+        if self.model_type == "laguna" {
+            return true;
+        }
         if self.model_type == "gemma4" && self.num_experts == 0 {
             // Allow rollback via env for A/B testing.
             return std::env::var("ATLAS_GEMMA4_LMHEAD_NVFP4").ok().as_deref() != Some("1");
@@ -303,11 +330,73 @@ impl ModelConfig {
         }
     }
 
+    /// Routed expert intermediate size for layer `i`.
+    ///
+    /// Puzzle checkpoints prune channels non-uniformly across MoE layers;
+    /// look up `moe_intermediate_sizes[i]` when populated, else the scalar.
+    pub fn moe_intermediate_size_for(&self, layer: usize) -> usize {
+        self.moe_intermediate_sizes
+            .get(layer)
+            .copied()
+            .filter(|&s| s > 0)
+            .unwrap_or(self.moe_intermediate_size)
+    }
+
+    /// Top-K experts per token for layer `i` (Puzzle per-block schedule).
+    pub fn num_experts_per_tok_for(&self, layer: usize) -> usize {
+        self.num_experts_per_toks
+            .get(layer)
+            .copied()
+            .filter(|&k| k > 0)
+            .unwrap_or(self.num_experts_per_tok)
+    }
+
+    /// Max routed intermediate across all layers (buffer / scratch sizing).
+    pub fn max_moe_intermediate_size(&self) -> usize {
+        self.moe_intermediate_sizes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(self.moe_intermediate_size)
+    }
+
     /// Number of MoE-only layers (Nemotron-H).
     pub fn num_moe_layers(&self) -> usize {
         self.layer_types
             .iter()
             .filter(|t| **t == LayerType::Moe)
             .count()
+    }
+
+    /// Whether the radix prefix cache captures every state needed to resume
+    /// this model exactly. DeepSeek V4 compression also carries a prompt-built
+    /// pool and ring that are not represented by KV blocks today.
+    pub fn kv_only_prefix_cache_is_safe(&self) -> bool {
+        self.model_type != "deepseek_v4" || self.compress_ratios.iter().all(|&ratio| ratio == 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelConfig;
+
+    #[test]
+    fn compressed_deepseek_v4_requires_auxiliary_prefix_state() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "deepseek_v4".to_string();
+        config.compress_ratios = vec![0, 4, 128];
+
+        assert!(!config.kv_only_prefix_cache_is_safe());
+    }
+
+    #[test]
+    fn kv_complete_models_can_use_the_prefix_cache() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        assert!(config.kv_only_prefix_cache_is_safe());
+
+        config.model_type = "deepseek_v4".to_string();
+        config.compress_ratios = vec![0; 3];
+        assert!(config.kv_only_prefix_cache_is_safe());
     }
 }

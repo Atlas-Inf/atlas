@@ -28,9 +28,9 @@ impl Qwen3AttentionLayer {
         let o_out = ctx.buffers.norm_output();
         if let Some(ref mla) = self.mla {
             if let Some(ref wo_nvfp4) = mla.wo_nvfp4 {
-                ops::w4a16_gemv(
+                self.nvfp4_decode_gemv(
                     ctx.gpu,
-                    self.w4a16_gemv_k,
+                    ctx.levers.gemv_sw,
                     attn_out,
                     wo_nvfp4,
                     o_out,
@@ -61,6 +61,9 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 stream,
             )?;
+        } else if let Some(q2) = self.o_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+            // Keep-packed Q2_0 (Tier-1c): 2-bit o_proj GEMV.
+            ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, attn_out, q2, o_out, stream)?;
         } else if let Some(fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
             ops::w8a16_gemv(
                 ctx.gpu,
@@ -74,9 +77,9 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            ops::w4a16_gemv(
+            self.nvfp4_decode_gemv(
                 ctx.gpu,
-                self.w4a16_gemv_k,
+                ctx.levers.gemv_sw,
                 attn_out,
                 &self.attn.o_proj,
                 o_out,
@@ -84,6 +87,50 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 stream,
             )?;
+        }
+        // ── LoRA delta on o_proj (decode, m=1). attn_out is already
+        // sigmoid-gated by the caller — exactly the tensor HF feeds o_proj.
+        if let Some(ref lw) = self.lora
+            && let Some(ref pair) = lw.o
+        {
+            debug_assert_eq!(pair.k_in, nq * hd);
+            debug_assert_eq!(pair.n_out, h);
+            // Request-scoped routing (see attention_forward.rs). Route this
+            // request's O delta via the bgmv when a per-seq slot + route exist;
+            // else the installed-active-pair path (byte-identical to pre-M2).
+            let seq_slot = ctx
+                .attn_metadata
+                .map(|m| m.seq_slot)
+                .unwrap_or(DevicePtr(0));
+            if seq_slot.0 != 0
+                && let Some(ref route) = lw.o_route
+            {
+                ops::lora_delta::apply_lora_bgmv(
+                    ctx.gpu,
+                    &lw.kernels,
+                    route,
+                    attn_out,
+                    o_out,
+                    seq_slot,
+                    1,
+                    pair.k_in,
+                    pair.n_out,
+                    ctx.buffers.lora_xa(),
+                    stream,
+                )?;
+            } else {
+                ops::lora_delta::apply_lora_delta(
+                    ctx.gpu,
+                    &lw.kernels,
+                    pair,
+                    attn_out,
+                    o_out,
+                    1,
+                    ctx.buffers.lora_xa(),
+                    ctx.buffers.lora_delta(),
+                    stream,
+                )?;
+            }
         }
         Ok(o_out)
     }

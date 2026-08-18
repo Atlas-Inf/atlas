@@ -45,6 +45,11 @@ impl TransformerModel {
         // instead of chunk_len individual D2D copies.
         {
             let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
+            // SAFETY: `chunk_tokens` is sliced on the line above with an END
+            // bound of `chunk_start + chunk_len`, so its length IS `chunk_len`
+            // (an out-of-range chunk panics in that slice index first) and the
+            // byte length is `chunk_tokens.len() * size_of::<u32>()` over a live
+            // `&[u32]`.
             let token_ids_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(chunk_tokens.as_ptr() as *const u8, chunk_len * 4)
             };
@@ -87,6 +92,18 @@ impl TransformerModel {
                     &v[..5]
                 );
             }
+            // Feature-2: overlay overridden vocab rows AFTER the gather, BEFORE
+            // the embed scale (the override row is a raw embed row that must
+            // also be scaled). `token_ids()` holds this chunk's ids (staged
+            // above); uniform-active route (seq_slot NULL). No-op when no
+            // overlay is installed.
+            self.apply_embed_overlay(
+                self.buffers.token_ids(),
+                spark_runtime::gpu::DevicePtr(0),
+                hidden_dst,
+                chunk_len as u32,
+                stream,
+            )?;
             self.scale_embeddings(hidden_dst, chunk_len, stream)?;
             if std::env::var("ATLAS_DUMP_EMBED").ok().as_deref() == Some("1") {
                 self.gpu.synchronize(stream)?;
@@ -118,19 +135,18 @@ impl TransformerModel {
                 && let Some(ve) = &self.vision_encoder
             {
                 let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
-                let pad_id = self
-                    .config
-                    .vision
-                    .as_ref()
-                    .map(|v| v.image_pad_token_id)
-                    .filter(|v| *v != 0)
-                    .unwrap_or(crate::layers::vision_encoder::IMAGE_PAD_TOKEN_ID);
+                // EITHER pad token. Matching only the image one meant a
+                // video's positions were skipped entirely — no encoder row was
+                // copied over them, the hidden state kept the raw token
+                // embedding, and the model described a featureless gray field
+                // while every token count looked correct.
+                let (image_pad, video_pad) = self.vision_pad_ids();
                 // Co-dispatch: this request's slice starts at vision_row_base
                 // in the shared packed buf_out (0 for the legacy single encode).
                 let row_base = *self.vision_row_base.lock();
                 let mut img_idx = 0usize; // pad-token count within the chunk
                 for (i, &tok) in chunk_tokens.iter().enumerate() {
-                    if tok == pad_id {
+                    if tok == image_pad || tok == video_pad {
                         let src = ve
                             .buf_out
                             .offset((row_base + img_idx) * ve.out_hidden_size * 2);

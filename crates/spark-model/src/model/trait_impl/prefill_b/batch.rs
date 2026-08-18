@@ -61,6 +61,7 @@ use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
 use super::super::super::types::TransformerModel;
+use super::batch_kernel::KernelBatchResult;
 use super::proc_range::ProcRange;
 use super::upload_meta::MetaLayout;
 use crate::traits::{Model, PrefillSlice, SequenceState};
@@ -71,12 +72,41 @@ impl TransformerModel {
     /// Returns `Vec<DevicePtr>` parallel to `streams`: each entry is the
     /// last-token logits pointer for that stream when its chunk is the last,
     /// or `DevicePtr::NULL` otherwise. Order matches `streams`.
+    ///
+    /// `row_base` shifts each finishing stream's logits row to `row_base +
+    /// stream_idx`. It is 0 for a prefill-only step and `n_decode` inside a
+    /// mixed step, where row `stream_idx` is already owned by a decode lane
+    /// the caller samples after this returns (see
+    /// `Model::prefill_batch_chunk_rows`).
     pub(in crate::model) fn prefill_batch_chunk_dispatch(
         &self,
         streams: &mut [PrefillSlice<'_>],
         stream: u64,
+        row_base: usize,
     ) -> Result<Vec<DevicePtr>> {
         let n = streams.len();
+        // Never write past the logits arena: it holds `min(m, 32)` rows and
+        // a shifted window needs `row_base + n`. Overflowing would corrupt
+        // whatever follows, which is strictly worse than the aliasing this
+        // shift avoids — so clamp back to the old behavior and say so.
+        // Kill switch for A/B against the pre-fix aliasing behavior. Set
+        // ATLAS_NO_PREFILL_ROW_SHIFT=1 to put prefill back on rows
+        // 0..n (i.e. back on top of the decode lanes).
+        let shift_disabled = std::env::var("ATLAS_NO_PREFILL_ROW_SHIFT")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        let row_base = if shift_disabled { 0 } else { row_base };
+        let logits_rows = self.buffers.sizes().logits / (self.config.vocab_size * 2);
+        let row_base = if row_base + n > logits_rows {
+            tracing::warn!(
+                "Batched prefill: logits arena holds {logits_rows} rows, need \
+                 row_base={row_base}+n={n}; falling back to row_base=0 \
+                 (decode lanes may alias prefill rows this step)"
+            );
+            0
+        } else {
+            row_base
+        };
         // Q12 diagnostic: dispatch entry. Useful to confirm scheduler is
         // funneling concurrent prefills here. Debug-level by default;
         // promote with `RUST_LOG=atlas::q12=debug`.
@@ -88,7 +118,11 @@ impl TransformerModel {
         if n == 0 {
             return Ok(Vec::new());
         }
-        if n == 1 {
+        // `row_base > 0` requires an explicit row, which the single-stream
+        // dispatch below cannot take (it always writes row 0) — fall through
+        // to the per-stream loop, which can. Today a mixed step always has
+        // n >= 2, so this only guards future callers.
+        if n == 1 && row_base == 0 {
             // Fast path: N=1 has no batching to do. Delegate to the
             // single-stream dispatch and skip the per-stream-loop bookkeeping.
             let s = &mut streams[0];
@@ -142,22 +176,30 @@ impl TransformerModel {
                 is_last_chunk = streams[0].is_last_chunk,
                 "Q12 kernel-batched dispatch attempt"
             );
-            match self.prefill_batch_chunk_kernel_batched(streams, stream) {
-                Ok(v) => {
-                    tracing::debug!(target: "atlas::q12", "Q12 kernel-batched succeeded");
-                    return Ok(v);
-                }
-                Err(e) => {
-                    // Structural bails (proc_count/seq_lens_start mismatch,
-                    // unsupported layer feature) are logged at info so the
-                    // first occurrence is visible in production logs without
-                    // requiring debug-level tracing. Subsequent bails are
-                    // still logged but with reduced verbosity in tight loops.
+            match self.prefill_batch_chunk_kernel_batched(streams, stream, row_base) {
+                Ok(KernelBatchResult::Completed(v)) => {
+                    // INFO on purpose: this is THE engagement signal for the
+                    // fused large-M prefill — total is the M every per-layer
+                    // GEMM launched at. One line per admitted wave.
+                    let total: usize = streams.iter().map(|s| s.chunk_len).sum();
                     tracing::info!(
                         target: "atlas::q12",
-                        "Q12 kernel-batched bailed → falling back to per-stream: {e}"
+                        n = n,
+                        total_tokens = total,
+                        "Q12 kernel-batched prefill dispatched (fused large-M)"
+                    );
+                    return Ok(v);
+                }
+                Ok(KernelBatchResult::NotAdmitted) => {
+                    tracing::info!(
+                        target: "atlas::q12",
+                        "Q12 kernel-batched cache plan not admitted → falling back to per-stream"
                     );
                 }
+                // An admitted batch can already own KV/sequence state. Retrying
+                // it sequentially would double-allocate or restore, so errors
+                // must reach the scheduler's normal failure-cleanup path.
+                Err(e) => return Err(e),
             }
         } else if !q12_batched_enabled {
             tracing::trace!(
@@ -166,22 +208,39 @@ impl TransformerModel {
             );
         } else {
             // Observability: eligibility failed. Surface why so operators
-            // can diagnose silent fallback. Logged at debug to avoid log
-            // floods on hot paths.
+            // can diagnose silent fallback. INFO under varlen — an operator
+            // who opted into `--prefill-varlen-batch` needs the serve log to
+            // prove (non-)engagement (the 2026-08-16 stackval diagnosis
+            // stalled on exactly this silence); debug otherwise to avoid
+            // noise on the default path.
             let chunk_lens: Vec<usize> = streams.iter().map(|s| s.chunk_len).collect();
             let chunk_starts: Vec<usize> = streams.iter().map(|s| s.chunk_start).collect();
             let total: usize = chunk_lens.iter().sum();
-            tracing::debug!(
-                target: "atlas::q12",
-                n = n,
-                chunk_lens = ?chunk_lens,
-                chunk_starts = ?chunk_starts,
-                total = total,
-                arena_cap = self.buffers.max_batch_tokens(),
-                head_dim = self.config.head_dim,
-                model_type = self.config.model_type.as_str(),
-                "Q12 kernel-batched ineligible — falling back to per-stream"
-            );
+            if super::batch_kernel::varlen_prefill_enabled() {
+                tracing::info!(
+                    target: "atlas::q12",
+                    n = n,
+                    chunk_lens = ?chunk_lens,
+                    chunk_starts = ?chunk_starts,
+                    total = total,
+                    arena_cap = self.buffers.max_batch_tokens(),
+                    head_dim = self.config.head_dim,
+                    model_type = self.config.model_type.as_str(),
+                    "Q12 kernel-batched ineligible — falling back to per-stream"
+                );
+            } else {
+                tracing::debug!(
+                    target: "atlas::q12",
+                    n = n,
+                    chunk_lens = ?chunk_lens,
+                    chunk_starts = ?chunk_starts,
+                    total = total,
+                    arena_cap = self.buffers.max_batch_tokens(),
+                    head_dim = self.config.head_dim,
+                    model_type = self.config.model_type.as_str(),
+                    "Q12 kernel-batched ineligible — falling back to per-stream"
+                );
+            }
         }
 
         // Multi-rank world (EP or pure TP) → NCCL needs the default stream.
@@ -238,6 +297,7 @@ impl TransformerModel {
                     total,
                     &mut kv_cache,
                     stream,
+                    None,
                 )?;
 
                 // Block allocation through end of chunk.
@@ -251,6 +311,7 @@ impl TransformerModel {
                     self.prefix_cache.as_ref(),
                     self.gpu.as_ref(),
                     stream,
+                    self.levers.kv_poison,
                 )?;
 
                 // Phase 2b: proc range (may early-return on full prefix hit
@@ -362,6 +423,11 @@ impl TransformerModel {
                     // exposed by short prefix-cache-hit prefills bailing here).
                     // hidden offset stays 0 (per-stream hidden is at base in this
                     // loop); only the logits destination is per-stream.
+                    //
+                    // `row_base` additionally lifts the whole window clear of
+                    // the decode lanes in a mixed step — without it, row
+                    // `stream_idx` IS decode lane `stream_idx`, and the caller
+                    // samples that lane after this loop returns.
                     self.prefill_b_finalize_last_at(
                         tokens,
                         seq,
@@ -370,7 +436,7 @@ impl TransformerModel {
                         chunk_len,
                         proc_count,
                         0,
-                        stream_idx,
+                        row_base + stream_idx,
                         stream,
                     )?
                 } else {

@@ -2,25 +2,50 @@
 
 //! `impl ChatTokenizer` body.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-use super::{ChatTokenizer, StreamingDecoder, normalize_tool_call_arguments};
+use super::{
+    ChatEncoding, ChatTokenizer, StreamingDecoder, autoclose_assistant_think,
+    normalize_tool_call_arguments, remap_developer_role, resolve_think_control,
+};
+
+/// Run Atlas's cross-cutting message preprocessing (formerly encoded in
+/// per-model jinja overrides) so it applies to EVERY model's own template:
+///   1. parse stringified `tool_calls[*].function.arguments` (F76),
+///   2. auto-close an unclosed `<think>` before a `<tool_call>` in
+///      assistant history,
+///   3. strip inline `<|think_on|>`/`<|think_off|>` control tokens and
+///      resolve the effective `enable_thinking`.
+///
+/// Returns the rewritten messages plus the thinking flag to render with
+/// (the inline control tokens override the caller's value when present).
+pub(crate) fn preprocess_for_render(
+    messages: &[serde_json::Value],
+    enable_thinking: bool,
+) -> (Vec<serde_json::Value>, bool) {
+    // F76: stringified tool-call args → dicts (see normalize_tool_call_arguments).
+    let prepared = normalize_tool_call_arguments(messages);
+    // Behavior 0: developer→system role remap (model templates reject `developer`;
+    // folds developer+system into one leading system message).
+    let mut prepared = remap_developer_role(prepared);
+    // Behavior 1: auto-close dangling <think> before <tool_call> in history.
+    autoclose_assistant_think(&mut prepared);
+    // Behavior 2: resolve + strip inline think-control tokens.
+    let (prepared, control_override) = resolve_think_control(&prepared);
+    let effective_thinking = control_override.unwrap_or(enable_thinking);
+    (prepared, effective_thinking)
+}
 
 impl ChatTokenizer {
-    /// Override directory for Jinja templates. Drop a `.jinja` file here
-    /// named by model_type (e.g. `qwen3_5_moe.jinja`) to override the
-    /// template from `tokenizer_config.json`. Useful for applying community
-    /// fixes without re-downloading model weights.
-    const TEMPLATE_OVERRIDE_DIR: &'static str = "jinja-templates";
-
     pub fn from_model_dir(
         model_dir: &Path,
         eos_token_id: u32,
         supports_thinking: bool,
         model_type: &str,
         repo_root: Option<&Path>,
+        disable_template_overrides: bool,
     ) -> Result<Self> {
         let tokenizer_path = model_dir.join("tokenizer.json");
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -29,12 +54,43 @@ impl ChatTokenizer {
             .with_truncation(None)
             .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
 
-        // Priority 1: Override template from jinja-templates/{model_type}.jinja
-        // Priority 2: Template from tokenizer_config.json (shipped with model weights)
-        // Priority 3: Default ChatML fallback
-        let chat_template = if let Some(override_tmpl) =
+        // Template-source priority.
+        //
+        // Conceptually the default is now MODEL-FIRST: render off the
+        // model's OWN `chat_template.jinja` / `tokenizer_config.json`.
+        // Atlas's cross-cutting behaviors (autoclose-think,
+        // think-control, F76 arg-parse) are applied in Rust
+        // message-preprocessing (see `preprocess_for_render`), so a model
+        // no longer needs a bespoke `jinja-templates/{model_type}.jinja`
+        // override that is otherwise a byte-copy of its own template.
+        // This is what makes `holo3_1_moe.jinja` REDUNDANT: Holo renders
+        // correctly off its own template + Rust behaviors. (The override
+        // file itself is still present for now only because
+        // `tokenizer/tests.rs::render_holo_template_*` reads it directly;
+        // it goes away together with those tests.)
+        //
+        // A `jinja-templates/{model_type}.jinja` override is OPT-IN by
+        // FILE PRESENCE: dropping the file in is the explicit signal that
+        // this model genuinely needs a template fix the Rust preprocessing
+        // can't express (MiniMax's `_args.items()`, Gemma-4's
+        // `strip_thinking`, etc.). We deliberately do NOT prefer the
+        // model's own template when such a file exists — that would
+        // silently undo those fixes. Instead, the operator opts OUT of all
+        // overrides with `--disable-template-overrides`, which forces
+        // every model onto its own template (relying purely on the Rust
+        // behaviors).
+        //
+        // Priority (high → low):
+        //   1. jinja-templates/{model_type}.jinja override
+        //      (opt-in: file present AND overrides not disabled)
+        //   2. tokenizer_config.json / chat_template.jinja (the MODEL's own)
+        //   3. Default ChatML fallback
+        let override_tmpl = if disable_template_overrides {
+            None
+        } else {
             super::jinja_helpers::load_override_template(model_type, repo_root)
-        {
+        };
+        let chat_template = if let Some(override_tmpl) = override_tmpl {
             override_tmpl
         } else if let Some(config_tmpl) = super::jinja_helpers::load_config_template(model_dir)? {
             config_tmpl
@@ -53,12 +109,19 @@ impl ChatTokenizer {
                 tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
                 super::jinja_helpers::build_jinja_env(&tmpl).ok()
             });
+        let chat_encoding = if model_type == "deepseek_v4" {
+            tracing::info!("Using checkpoint-native DeepSeek-V4 message encoding");
+            ChatEncoding::DeepseekV4
+        } else {
+            ChatEncoding::Jinja
+        };
 
         tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
         Ok(Self {
             tokenizer,
             eos_token_id,
             supports_thinking,
+            chat_encoding,
             chat_template,
             jinja_env,
             openai_jinja_env,
@@ -160,72 +223,47 @@ impl ChatTokenizer {
         enable_thinking: bool,
         disable_tool_steering: bool,
     ) -> Result<Vec<u32>> {
-        let tmpl = self
-            .jinja_env
-            .get_template("chat")
-            .context("Failed to get compiled template")?;
+        self.apply_chat_template_jinja_with_effort(
+            messages,
+            tools,
+            enable_thinking,
+            disable_tool_steering,
+            None,
+            None,
+        )
+    }
 
-        // F76 (2026-04-29): MiniMax's chat template iterates
-        // `tool_call.function.arguments` with `_args.items()`, expecting
-        // a dict. The OpenAI wire format ships `arguments` as a
-        // JSON-encoded *string*, so the template crashes with
-        // "unknown method: map has no method named items" on the
-        // second turn of any tool-use conversation. Pre-parse string
-        // arguments to JSON values before handing to Jinja so the
-        // template's iteration sees a dict. Other templates (Qwen,
-        // Mistral, Hermes) typically wrap with `tojson` and don't
-        // depend on `.items()`, so the parsed dict round-trips fine.
-        let messages_for_render = normalize_tool_call_arguments(messages);
-        let messages_val = minijinja::Value::from_serialize(&messages_for_render);
-        let tools_val = tools.map(minijinja::Value::from_serialize);
-
-        // Diagnostic "continue final message" mode: when the LAST message is an
-        // assistant turn, render WITHOUT a generation prompt and strip the
-        // trailing end-of-turn marker so the assistant content becomes the final
-        // prefill token(s). This lets a prefill-vs-decode A/B place a generated
-        // token at the exact position decode produced it. (Standard
-        // continue_final_message convention.)
-        let continue_final = messages
-            .last()
-            .and_then(|m| m.get("role"))
-            .and_then(|r| r.as_str())
-            == Some("assistant");
-
-        // Pass enable_thinking as-is to the template. The Qwen3.5 template uses it
-        // to emit <think>\n (thinking) or <think>\n\n</think>\n\n (no thinking).
-        // Mistral template uses reasoning_effort instead.
-        // The api.rs layer controls enable_thinking based on thinking_in_tools MODEL.toml.
-        // Mistral's template defaults `reasoning_effort` to "high" when
-        // undefined, so we must explicitly pass "none" to disable thinking.
-        let reasoning_effort: minijinja::Value = if enable_thinking {
-            "high".into()
-        } else {
-            "none".into()
-        };
-        let ctx = minijinja::context! {
-            messages => messages_val,
-            tools => tools_val.unwrap_or(minijinja::Value::UNDEFINED),
-            add_generation_prompt => !continue_final,
-            enable_thinking => enable_thinking,
-            reasoning_effort => reasoning_effort,
-            disable_tool_steering => disable_tool_steering,
-            add_vision_id => false,
-        };
-
-        let mut rendered = tmpl.render(ctx).map_err(|e| {
-            tracing::error!("Jinja template error: {e:#}");
-            anyhow::anyhow!("Failed to render Jinja chat template: {e}")
-        })?;
-
-        if continue_final {
-            // Strip the trailing end-of-turn so the assistant content is the
-            // last prefill token (qwen-style templates close with
-            // `<|im_end|>\n`). Trim trailing whitespace first, then the marker.
-            let trimmed = rendered.trim_end();
-            let stripped = trimmed.strip_suffix("<|im_end|>").unwrap_or(trimmed);
-            rendered = stripped.to_string();
-            tracing::info!("continue_final_message: stripped trailing EOT for prefill A/B");
+    pub fn apply_chat_template_jinja_with_effort(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        disable_tool_steering: bool,
+        reasoning_effort: Option<&str>,
+        preserve_thinking: Option<bool>,
+    ) -> Result<Vec<u32>> {
+        if self.chat_encoding == ChatEncoding::DeepseekV4 {
+            let rendered = super::deepseek_v4::encode_messages(
+                messages,
+                tools,
+                enable_thinking,
+                reasoning_effort,
+            )?;
+            return self.encode(&rendered);
         }
+
+        let rendered = super::chat_render::render_chat(
+            &self.jinja_env,
+            messages,
+            tools,
+            super::chat_render::RenderFlags {
+                enable_thinking,
+                disable_tool_steering,
+                reasoning_effort,
+                preserve_thinking,
+                allow_continue_final: true,
+            },
+        )?;
 
         // Debug: log the tail of the rendered template for the first few requests.
         // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 (e.g. Swedish å ä ö).
@@ -251,36 +289,62 @@ impl ChatTokenizer {
         enable_thinking: bool,
         disable_tool_steering: bool,
     ) -> Result<Vec<u32>> {
+        self.apply_chat_template_openai_with_effort(
+            messages,
+            tools,
+            enable_thinking,
+            disable_tool_steering,
+            None,
+            None,
+        )
+    }
+
+    pub fn apply_chat_template_openai_with_effort(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        disable_tool_steering: bool,
+        reasoning_effort: Option<&str>,
+        preserve_thinking: Option<bool>,
+    ) -> Result<Vec<u32>> {
+        if self.chat_encoding == ChatEncoding::DeepseekV4 {
+            return self.apply_chat_template_jinja_with_effort(
+                messages,
+                tools,
+                enable_thinking,
+                disable_tool_steering,
+                reasoning_effort,
+                preserve_thinking,
+            );
+        }
         if let Some(ref env) = self.openai_jinja_env {
-            let tmpl = env
-                .get_template("chat")
-                .context("Failed to get compiled OpenAI template")?;
-            // F76: pre-parse tool_call argument strings into dicts. See
-            // apply_chat_template_jinja above for the failure mode
-            // (`map has no method named items` on the second turn).
-            let messages_for_render = normalize_tool_call_arguments(messages);
-            let messages_val = minijinja::Value::from_serialize(&messages_for_render);
-            let tools_val = tools.map(minijinja::Value::from_serialize);
-            let reasoning_effort: minijinja::Value = if enable_thinking {
-                "high".into()
-            } else {
-                "none".into()
-            };
-            let ctx = minijinja::context! {
-                messages => messages_val,
-                tools => tools_val.unwrap_or(minijinja::Value::UNDEFINED),
-                add_generation_prompt => true,
-                enable_thinking => enable_thinking,
-                reasoning_effort => reasoning_effort,
-                disable_tool_steering => disable_tool_steering,
-                add_vision_id => false,
-            };
-            let rendered = tmpl
-                .render(ctx)
-                .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
+            // Same render core as apply_chat_template_jinja, minus the
+            // continue-final diagnostic (this path always adds the
+            // generation prompt, preserving historical behavior).
+            let rendered = super::chat_render::render_chat(
+                env,
+                messages,
+                tools,
+                super::chat_render::RenderFlags {
+                    enable_thinking,
+                    disable_tool_steering,
+                    reasoning_effort,
+                    preserve_thinking,
+                    allow_continue_final: false,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
             self.encode(&rendered)
         } else {
-            self.apply_chat_template_jinja(messages, tools, enable_thinking, disable_tool_steering)
+            self.apply_chat_template_jinja_with_effort(
+                messages,
+                tools,
+                enable_thinking,
+                disable_tool_steering,
+                reasoning_effort,
+                preserve_thinking,
+            )
         }
     }
 
@@ -323,12 +387,24 @@ impl ChatTokenizer {
         self.supports_thinking
     }
 
+    pub fn uses_deepseek_v4_encoding(&self) -> bool {
+        self.chat_encoding == ChatEncoding::DeepseekV4
+    }
+
     /// Encode the `<|image_pad|>` placeholder token and return its ID.
     /// Returns `None` when the tokenizer doesn't have this token (text-only
     /// models). Cheap to call repeatedly — the underlying tokenizer caches
     /// single-token encodes.
     pub fn image_pad_token_id(&self) -> Option<u32> {
         self.encode("<|image_pad|>")
+            .ok()
+            .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None })
+    }
+
+    /// `<|video_pad|>`, the temporal sibling. `None` on a tokenizer without
+    /// it — every text-only model, and any VL model that predates video.
+    pub fn video_pad_token_id(&self) -> Option<u32> {
+        self.encode("<|video_pad|>")
             .ok()
             .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None })
     }
@@ -344,18 +420,21 @@ impl ChatTokenizer {
     /// `pad_counts[i]` is the number of patches the i-th image produces.
     /// Extra or missing `<|image_pad|>` occurrences (vs `pad_counts.len()`)
     /// pass through unchanged, matching counts are replicated in place.
-    pub fn expand_image_pads(&self, tokens: Vec<u32>, pad_counts: &[usize]) -> Vec<u32> {
+    pub fn expand_vision_pads(&self, tokens: Vec<u32>, pad_counts: &[usize]) -> Vec<u32> {
         if pad_counts.is_empty() || pad_counts.iter().all(|&c| c <= 1) {
             return tokens;
         }
-        let Some(pad_id) = self.image_pad_token_id() else {
+        let image_pad = self.image_pad_token_id();
+        let video_pad = self.video_pad_token_id();
+        if image_pad.is_none() && video_pad.is_none() {
             return tokens;
-        };
+        }
         let extra: usize = pad_counts.iter().map(|c| c.saturating_sub(1)).sum();
         let mut out = Vec::with_capacity(tokens.len() + extra);
         let mut img_idx = 0usize;
         for t in tokens {
-            if t == pad_id {
+            let pad_id = t;
+            if Some(t) == image_pad || Some(t) == video_pad {
                 let count = pad_counts.get(img_idx).copied().unwrap_or(1).max(1);
                 for _ in 0..count {
                     out.push(pad_id);

@@ -4,35 +4,167 @@
 
 use super::*;
 
+/// THE single mapping from a server-side guard (`ActiveSeq::guard_stop`)
+/// to the wire `finish_reason`. Do not map guard names to wire reasons
+/// anywhere else.
+///
+/// Every non-timeout guard reports `"length"`: the server ended the
+/// response with the model UNFINISHED. Neither enum slot is literally
+/// true — the budget was not hit either — so the choice is decided by
+/// which lie clients handle safely.
+///
+/// `"stop"` asserts "the model said what it wanted". For a mid-sentence
+/// repetition cut that is affirmatively false, and every client behaviour
+/// keyed on `"stop"` is then the WRONG action: accept, validate, commit,
+/// end the agent run. `"length"` asserts only "incomplete, serving side
+/// cut it, do not treat as final" — true in every part clients act on,
+/// and its handlers are all safe: `openai-python` raises
+/// `LengthFinishReasonError` instead of parsing truncated JSON, aider
+/// skips the auto-commit, Instructor raises `IncompleteOutputException`,
+/// pydantic-ai raises rather than accepting a half tool call.
+///
+/// The failure modes are asymmetric. A false `"length"` costs a bounded,
+/// VISIBLE retry (agents cap them). A false `"stop"` is unbounded and
+/// INVISIBLE: degenerate output silently banked as a finished answer.
+/// Measured — relabelling these guards to `"stop"` cost 2/10 then 6/10
+/// episodes of the agentic gate, because the harness stopped recognising
+/// truncation and ended runs at 3-10 turns instead of the 12-22 a
+/// recovery takes.
+///
+/// This also matches the ecosystem. On every engine WITHOUT a
+/// degeneration guard (SGLang, TGI, llama.cpp, vLLM by default) the same
+/// loop simply runs to the budget and reports `"length"`; our guard is an
+/// early, smarter budget, so `"length"` preserves parity. No engine maps a
+/// quality cut to `"stop"` by design — vLLM minted a distinct value
+/// (`"repetition"`) rather than overload it.
+///
+/// ★ And it removes an internal contradiction: `tool_loop_capped` already
+/// ships `"length"` (see `api::chat_stream::handle_done`) on exactly this
+/// reasoning — `"length"` is the OpenAI-spec slot for "forcibly truncated"
+/// and gives agents a clean hook to break their outer loop. The same
+/// argument covers `fuzzy_repetition`, `tool_envelope_stuck`,
+/// `inter_tool_prose_budget` and the simhash trip.
+///
+/// Considered alternative: putting the guard name on the wire the way
+/// vLLM ships "repetition"/"abort". Rejected — typed clients hard-fail on
+/// unknown enum VALUES (Rust `async-openai` fails deserialization
+/// outright; pydantic-ai raised on OpenRouter's non-standard "error"),
+/// and our one deliberate exception, `"timeout"`, already carries that
+/// documented risk (see `ir::FINISH_REASON_TIMEOUT`). The guard's NAME
+/// reaches diagnostics via `StreamEvent::Done.guard_stop` and the --dump
+/// body; the right home for it on the wire is an extension FIELD (unknown
+/// fields are ignored by every SDK, cf. vLLM's `stop_reason`), which is
+/// follow-up work, not a reason to keep lying in the enum.
+fn guard_stop_wire_reason(guard: &'static str) -> &'static str {
+    match guard {
+        // Defensive: the deadline guard is intercepted before the
+        // token-derived checks (see `derive_finish_reason`), so this arm
+        // is normally unreachable — kept so the mapping is total.
+        GUARD_STOP_REQUEST_TIMEOUT => crate::ir::FINISH_REASON_TIMEOUT,
+        _ => "length",
+    }
+}
+
+/// Derive the wire finish reason for a completed sequence.
+///
+/// INVARIANT: `"length"` means "the SERVER ended the response with the
+/// model unfinished" — the token budget was exhausted (`hard_ceiling_hit`:
+/// the `max_tokens` countdown or the served context ceiling) OR a guard
+/// cut it short. `"stop"` means the MODEL finished: it sampled EOS or a
+/// stop sequence. That is the distinction clients act on, and it is the
+/// one worth keeping exact.
+///
+/// It is still NOT a catch-all. The bug this replaced derived `"length"`
+/// from "the last token wasn't EOS", which swept in stop-string matches,
+/// client cancels and early finalizes — none of which are truncations
+/// (observed live: `Done: 573 tokens (length)` under max_new_tokens=1024).
+/// Those now correctly report `"stop"`; only budget exhaustion and guard
+/// cuts report `"length"`.
+///
+/// Precedence:
+///   1. the server-side deadline → `"timeout"` — a truncation must never
+///      be mistaken for a natural stop, even when the last token is EOS;
+///   2. token-derived natural stops (EOS → `"stop"`, tool-call close →
+///      `"tool_calls"`) — what the model actually sampled outranks any
+///      other guard that tripped on the same step;
+///   3. any other guard → `guard_stop_wire_reason` (single mapping above);
+///   4. token budget exhausted → `"length"`;
+///   5. otherwise `"stop"` — an early finalize with budget left and no
+///      guard (client cancel via `cancel_flag`, dropped stream receiver,
+///      server shutdown drain): generation stopped; it did not hit the
+///      budget.
+///
+/// Pure so the precedence is unit-testable without a model or a GPU
+/// (tests in `lifecycle_tests.rs`).
+pub(super) fn derive_finish_reason(
+    guard_stop: Option<&'static str>,
+    last_tok: Option<u32>,
+    eos_tokens: &[u32],
+    tool_call_end_token: Option<u32>,
+    remaining: usize,
+    seq_len: usize,
+    max_seq_len: usize,
+) -> &'static str {
+    if guard_stop == Some(GUARD_STOP_REQUEST_TIMEOUT) {
+        return crate::ir::FINISH_REASON_TIMEOUT;
+    }
+    if let Some(t) = last_tok {
+        if eos_tokens.contains(&t) {
+            return "stop";
+        }
+        // Guarded on `Some(t)` so an EMPTY output (max_tokens==0 scoring
+        // path) on a model with no tool-call end token configured cannot
+        // satisfy `None == None` and misreport "tool_calls".
+        if Some(t) == tool_call_end_token {
+            return "tool_calls";
+        }
+    }
+    if let Some(guard) = guard_stop {
+        return guard_stop_wire_reason(guard);
+    }
+    if hard_ceiling_hit(remaining, seq_len, max_seq_len) {
+        return "length";
+    }
+    "stop"
+}
+
 /// Send final response and free GPU resources for a completed sequence.
-pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
-    let last_tok = a.output_tokens.last().copied();
-    let is_eos = last_tok.is_some_and(|t| a.eos_tokens.contains(&t));
-    let is_tool_call_end = last_tok == a.tool_call_end_token;
-    let reason = if is_eos {
-        "stop"
-    } else if is_tool_call_end {
-        "tool_calls"
-    } else {
-        "length"
-    };
+///
+/// `max_seq_len` is the served context ceiling (`sched.limits.max_seq_len`,
+/// 0 = unlimited) — needed so the `"length"` decision reuses the exact
+/// stop predicate from `emit_step`/`decode_logits_step`.
+pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize) {
+    let reason = derive_finish_reason(
+        a.guard_stop,
+        a.output_tokens.last().copied(),
+        &a.eos_tokens,
+        a.tool_call_end_token,
+        a.remaining,
+        a.seq.seq_len,
+        max_seq_len,
+    );
     match &mut a.sink {
         ResponseSink::Streaming(tx) => {
             let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
             let decode_ms = a.decode_start.elapsed().as_secs_f64() * 1000.0;
-            if let Err(e) = tx.blocking_send(StreamEvent::Done {
-                finish_reason: reason.to_string(),
-                prompt_tokens: 0, // prompt_tokens tracked by API layer
-                completion_tokens: a.output_tokens.len(),
-                time_to_first_token_ms: ttft_ms,
-                decode_time_ms: decode_ms,
-                reasoning_tokens: a.thinking_tokens,
-                cached_prompt_tokens: a.cached_prompt_tokens,
-            }) {
-                tracing::warn!(
-                    "finish_sequence: streaming Done send failed (receiver dropped): {e}"
-                );
-            }
+            // Terminal frame: detached from the scheduler thread — safe
+            // because nothing follows Done on this channel and all earlier
+            // events are already queued (see spawn_terminal_send).
+            super::mod_helpers::spawn_terminal_send(
+                tx,
+                StreamEvent::Done {
+                    finish_reason: reason.to_string(),
+                    prompt_tokens: 0, // prompt_tokens tracked by API layer
+                    completion_tokens: a.output_tokens.len(),
+                    time_to_first_token_ms: ttft_ms,
+                    decode_time_ms: decode_ms,
+                    reasoning_tokens: a.thinking_tokens,
+                    cached_prompt_tokens: a.cached_prompt_tokens,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    guard_stop: a.guard_stop,
+                },
+                "done frame",
+            );
         }
         ResponseSink::Blocking(tx) => {
             if let Some(tx) = tx.take() {
@@ -47,6 +179,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
                         logprobs: std::mem::take(&mut a.logprobs_data),
                         reasoning_tokens: a.thinking_tokens,
                         cached_prompt_tokens: a.cached_prompt_tokens,
+                        accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
                         prompt_logprobs: std::mem::take(&mut a.seq.prompt_logprobs)
                             .into_iter()
                             .map(|p| crate::api::TokenLogprobs {
@@ -73,7 +206,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
         0.0
     };
     let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
-    tracing::info!("Done: {n} tokens ({reason}) {tps:.1} tok/s, TTFT={ttft_ms:.1}ms");
+    super::mtp_accept_debug::RequestAccept::log_done(n, reason, tps, ttft_ms, &a.mtp_acct);
     // Cache the full sequence (prompt + generated) in the prefix cache.
     // Must happen BEFORE free_sequence() so block indices are still valid.
     // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
@@ -91,9 +224,11 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
 pub fn send_error(model: &dyn Model, a: &mut ActiveSeq, msg: &str) {
     match &mut a.sink {
         ResponseSink::Streaming(tx) => {
-            if let Err(e) = tx.blocking_send(StreamEvent::Error(msg.to_string())) {
-                tracing::warn!("send_error: streaming Error send failed (receiver dropped): {e}");
-            }
+            super::mod_helpers::spawn_terminal_send(
+                tx,
+                StreamEvent::Error(msg.to_string()),
+                "error frame",
+            );
         }
         ResponseSink::Blocking(tx) => {
             if let Some(tx) = tx.take()
@@ -119,11 +254,11 @@ pub fn send_error(model: &dyn Model, a: &mut ActiveSeq, msg: &str) {
 pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
     match sink {
         ResponseSink::Streaming(tx) => {
-            if let Err(e) = tx.blocking_send(StreamEvent::Error(msg.to_string())) {
-                tracing::warn!(
-                    "send_error_to_sink: streaming Error send failed (receiver dropped): {e}"
-                );
-            }
+            super::mod_helpers::spawn_terminal_send(
+                tx,
+                StreamEvent::Error(msg.to_string()),
+                "pre-seq error frame",
+            );
         }
         ResponseSink::Blocking(tx) => {
             if let Some(tx) = tx.take()
@@ -157,85 +292,19 @@ pub fn swap_out_sequence(
         model.detach_slot_for_reuse(&mut a.seq);
     }
 
-    let (swap_id, mut writer) = spill.create_file()?;
-    model.save_sequence_state(&a.seq, &mut writer)?;
-    drop(writer);
-    spill.record_usage(swap_id);
-
-    let num_blocks = a.seq.block_table.len();
-    let seq_len = a.seq.seq_len;
-    let tokens = a.seq.tokens.clone();
-
-    // Free GPU resources (KV blocks + SSM slot).
-    let slot_idx = a.seq.slot_idx as u32;
-    model.free_sequence(&mut a.seq)?;
-    let _ = model.ep_broadcast_cmd_for_seq(slot_idx, 0xFFFFFFF1);
-
-    Ok(SwappedSeq {
-        tokens,
-        session_hash: a.session_hash,
-        seq_len,
-        num_blocks,
-        last_token: a.last_token,
-        output_tokens: a.output_tokens,
-        remaining: a.remaining,
-        min_tokens: a.min_tokens,
-        eos_tokens: a.eos_tokens,
-        sink: a.sink,
-        temperature: a.temperature,
-        top_k: a.top_k,
-        top_p: a.top_p,
-        top_n_sigma: a.top_n_sigma,
-        min_p: a.min_p,
-        repetition_penalty: a.repetition_penalty,
-        presence_penalty: a.presence_penalty,
-        frequency_penalty: a.frequency_penalty,
-        repetition_penalty_window: 256,
-        lz_penalty: DEFAULT_LZ_PENALTY,
-        dry_multiplier: a.dry_multiplier,
-        dry_base: a.dry_base,
-        dry_allowed_length: a.dry_allowed_length,
-        dry_sequence_breakers: a.dry_sequence_breakers,
-        logit_bias: a.logit_bias,
-        inside_thinking: a.inside_thinking,
-        enable_thinking: a.enable_thinking,
-        thinking_budget: a.thinking_budget,
-        repetition_detection: a.repetition_detection,
-        spontaneous_think_budget: a.spontaneous_think_budget,
-        thinking_tokens: a.thinking_tokens,
-        force_end_thinking: a.force_end_thinking,
-        sentence_defer_count: a.sentence_defer_count,
-        consecutive_confident: a.consecutive_confident,
-        in_code_fence: a.in_code_fence,
-        think_end_token: a.think_end_token,
-        think_start_token: a.think_start_token,
-        think_ended: a.think_ended,
-        think_just_ended: a.think_just_ended,
-        post_think_emitted: a.post_think_emitted,
-        think_skip_count: a.think_skip_count,
-        require_tool_call: a.require_tool_call,
-        tool_request: a.tool_request,
-        tools_present: a.tools_present,
-        suppress_tool_call: a.suppress_tool_call,
-        disable_mtp: a.disable_mtp,
-        content_started: a.content_started,
-        content_tokens: a.content_tokens,
-        prose_tokens_since_last_tool: a.prose_tokens_since_last_tool,
-        think_watchdog_fires: a.think_watchdog_fires,
-        rollback_count: a.rollback_count,
-        tool_call_start_token: a.tool_call_start_token,
-        tool_call_opened: a.tool_call_opened,
-        tool_call_end_token: a.tool_call_end_token,
-        last_token_time: a.last_token_time,
-        request_start: a.request_start,
-        decode_start: a.decode_start,
-        seed: a.seed,
-        top_logprobs: a.top_logprobs,
-        logprobs_data: a.logprobs_data,
-        timeout_at: a.timeout_at,
-        swap_id,
-        cached_prompt_tokens: a.cached_prompt_tokens,
-    })
+    // Save + free + build moved to `preempt::spill_out_sequence` so the
+    // decode-time preemption path (which must NOT reorder/compact the active
+    // vec mid-step) can share it — SSOT for the spill image. On error the
+    // victim is surfaced to its client and freed here rather than silently
+    // dropped (the old path leaked the GPU blocks AND the client saw only
+    // "Inference cancelled").
+    match super::preempt::spill_out_sequence(model, a, spill) {
+        Ok(s) => Ok(s),
+        Err((mut a, e)) => {
+            send_error(model, &mut a, &format!("swap-out failed: {e:#}"));
+            Err(e)
+        }
+    }
 }
 
 /// Resume a swapped-out sequence by restoring its state from disk.
@@ -246,6 +315,9 @@ pub fn resume_swapped_seq(
     s: SwappedSeq,
     spill: &mut KvSpillManager,
 ) -> Result<ActiveSeq> {
+    // Starvation guard: a just-resumed sequence must not be the next KV
+    // victim before it makes real progress (see `preempt` module docs).
+    let immune_until = s.output_tokens.len() + super::preempt::PREEMPT_IMMUNITY_TOKENS;
     let mut seq = model.alloc_sequence()?;
     let mut reader = spill.open_file(s.swap_id)?;
     model.restore_sequence_state(&mut seq, s.num_blocks, &mut reader)?;
@@ -255,6 +327,14 @@ pub fn resume_swapped_seq(
     // Restore CPU-side metadata.
     seq.tokens = s.tokens;
     seq.seq_len = s.seq_len;
+    seq.adapter_slot = s.adapter_slot;
+    seq.adapter_id = s.adapter_id;
+    // Task #25: swap-out released this seq's slot ref (via free_sequence); a
+    // resumed seq re-enters ACTIVE decode WITHOUT re-running the prefill stamp,
+    // so re-acquire here to balance that release and re-protect the slot for the
+    // remainder of the decode. Stores the freshly resolved index (release keys
+    // off it, so the acquire/release stay balanced regardless of any rotate).
+    seq.acquired_adapter_slot = model.acquire_adapter_slot(s.adapter_slot);
 
     Ok(ActiveSeq {
         seq,
@@ -265,6 +345,8 @@ pub fn resume_swapped_seq(
         min_tokens: s.min_tokens,
         eos_tokens: s.eos_tokens,
         finished: false,
+        guard_stop: None,
+        param_close_pending: 0,
         sink: s.sink,
         // cancel_flag isn't preserved across spill/restore — the
         // original stream is long gone by the time a swapped-out seq
@@ -307,10 +389,12 @@ pub fn resume_swapped_seq(
         tools_present: s.tools_present,
         suppress_tool_call: s.suppress_tool_call,
         disable_mtp: s.disable_mtp,
+        mtp_acct: s.mtp_acct,
         content_started: false,
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: s.think_watchdog_fires,
+        think_force_closed: s.think_force_closed,
         rollback_count: s.rollback_count,
         // Decode-rollback SSM snapshots are GPU-resident and not part of
         // the disk swap image — a resumed sequence starts with an empty
@@ -333,6 +417,7 @@ pub fn resume_swapped_seq(
         // Grammar state is not serializable; resumed sequences use legacy fallback.
         grammar_state: None,
         pending_drafts: Vec::new(),
+        pending_draft_conf: Vec::new(),
         last_token_time: Instant::now(),
         request_start: s.request_start,
         decode_start: s.decode_start,
@@ -342,5 +427,9 @@ pub fn resume_swapped_seq(
         timeout_at: s.timeout_at,
         adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(s.temperature),
         cached_prompt_tokens: s.cached_prompt_tokens,
+        preempt_immune_until_tokens: immune_until,
     })
 }
+
+// Tests live in `lifecycle_tests.rs` (sibling module registered in
+// `scheduler/mod.rs`) to keep this file under the 500-line cap.

@@ -18,6 +18,17 @@
 
 use atlas_core::target::KernelTarget;
 
+pub mod resolve;
+pub use resolve::{ResolveCandidate, TargetResolveError, ptx_for_config, ptx_for_exact_target};
+
+// Build-time/run-time shared `[behavior]` defaults — also `include!`d by
+// `build_parse_behavior.rs` so the build script's parse defaults cannot
+// drift from `ModelBehavior::default()` (the #328 failure mode).
+mod behavior_defaults;
+pub use behavior_defaults::{
+    DEFAULT_EFFORT_CAPPED_AT_CEILING, DEFAULT_MAX_INTER_TOOL_PROSE, DEFAULT_MAX_THINKING_BUDGET,
+};
+
 // Auto-generated: per-target PTX constants, ptx_modules() function,
 // and all_ptx_sets() for multi-target builds.
 // NOTE: cargo does NOT track this build-script-generated include! as a
@@ -32,6 +43,27 @@ include!(concat!(env!("OUT_DIR"), "/target_ptx.rs"));
 /// the kernel set changes — closing the `include!`-not-tracked staleness hole
 /// that silently embedded a stale module list (the 98-vs-99 regression).
 pub const KERNEL_SET_HASH: &str = env!("ATLAS_KERNEL_SET_HASH");
+
+/// What each kernel target in THIS binary was compiled from, as JSON.
+///
+/// A map of `"hardware/model/quant"` to `{hash, arch, compiler, flags}`, baked
+/// by `build.rs` at the moment the kernels were compiled. The benchmark gate
+/// copies it into a record so the record attests to the binary's sources rather
+/// than to whatever the working tree held when the record was written — a
+/// commit sha does not describe a stale `target/`, a dirty tree, or an image
+/// carried between boxes.
+///
+/// `{}` when the build compiled nothing (`ATLAS_SKIP_BUILD=1`) or could not
+/// identify its compiler. That is not an error: an empty attestation excuses no
+/// future diff, so such a binary's records behave exactly as they did before
+/// attestations existed.
+///
+/// `option_env!` rather than `env!` so the crate still builds against an
+/// `OUT_DIR` produced by an older build script.
+pub const TARGET_CLOSURES: &str = match option_env!("ATLAS_TARGET_CLOSURES") {
+    Some(json) => json,
+    None => "{}",
+};
 
 // ═══════════════════════════════════════════════════════════════════
 // Target-aware PTX grouping
@@ -74,6 +106,21 @@ pub struct SamplingCategory {
     /// `presence_penalty` regression. 0.0 = disabled. SGLang reference
     /// strength = 0.2 (lossless on AIME/GPQA).
     pub lz_penalty: f32,
+    /// Model-declared min-p, or `None` when MODEL.toml is silent.
+    ///
+    /// `Option`, not `f32`, because absence and `0.0` mean opposite things
+    /// here. The server ships `--default-min-p 0.08` and every request that
+    /// does not name min_p takes it, so a model whose card specifies
+    /// `min_p = 0` had no way to say so: `[behavior].min_p_floor` only ever
+    /// RAISES min_p (`min_p.max(floor)`), and the preset did not carry the
+    /// value at all. A plain `f32` defaulting to 0.0 would silently strip the
+    /// 0.08 floor from every model that has a `[sampling.*]` table, which is
+    /// the opposite regression.
+    ///
+    /// `Some(x)` outranks the CLI default and is outranked by
+    /// `generation_config.json` — the same precedence temperature/top_k/top_p
+    /// already follow. `None` preserves the CLI-owned behaviour exactly.
+    pub min_p: Option<f32>,
 }
 
 /// Model-specific sampling presets loaded from MODEL.toml `[sampling.*]`.
@@ -102,6 +149,7 @@ impl Default for SamplingPresets {
             dry_base: 1.75,
             dry_allowed_length: 2,
             lz_penalty: 0.0,
+            min_p: None,
         };
         let tools_cat = SamplingCategory {
             temperature: 0.6,
@@ -114,6 +162,7 @@ impl Default for SamplingPresets {
             dry_base: 1.75,
             dry_allowed_length: 2,
             lz_penalty: 0.0,
+            min_p: None,
         };
         Self {
             thinking_text: default_cat,
@@ -129,8 +178,15 @@ impl Default for SamplingPresets {
 pub struct ModelBehavior {
     /// Allow thinking when tools are active. Default: true.
     pub thinking_in_tools: bool,
-    /// Maximum thinking budget (tokens). Default: 256.
+    /// Maximum thinking budget (tokens). Default:
+    /// [`DEFAULT_MAX_THINKING_BUDGET`].
     pub max_thinking_budget: u32,
+    /// Clamp qualitative `reasoning_effort` levels at the model's effective
+    /// ceiling (high/xhigh resolve to `max_thinking_budget` instead of
+    /// 2x/4x it). Default [`DEFAULT_EFFORT_CAPPED_AT_CEILING`] = `false`
+    /// (historical ladder shape). See `behavior_defaults.rs` for when a
+    /// model should set `true` (measured budget non-monotonicity).
+    pub effort_capped_at_ceiling: bool,
     /// Default thinking state for this model when the client request does not
     /// specify a reasoning_effort / thinking parameter. Typical values:
     /// - thinking-first models (Mistral Small 4, Qwen3.5, …): `true`
@@ -156,6 +212,14 @@ pub struct ModelBehavior {
     /// when the prefix forces them into that structure. Default: false
     /// (keep the existing Nemotron-Nano-correct behavior).
     pub disable_tool_steering: bool,
+    /// Do not append Atlas's derived `<environment>working_directory` block to
+    /// a client system prompt. Native agent clients may already provide the
+    /// cwd; duplicating it can become a tool-selection attractor.
+    pub disable_cwd_hint_injection: bool,
+    /// Use the selected MODEL.toml sampling category for default temperature,
+    /// top-k, and top-p instead of generation_config.json. Explicit request
+    /// values still take precedence.
+    pub use_sampling_presets_for_core: bool,
     /// Per-model tool-call parser override. Empty string = use the
     /// `tool_defaults.toml` mapping for this `model_type`. Set in MODEL.toml
     /// `[behavior].tool_call_parser` when one variant of a model_type needs
@@ -174,6 +238,15 @@ pub struct ModelBehavior {
     /// JSON arrays of similar objects, multiplication tables). Enable only
     /// when the model has been observed to need it.
     pub enable_loop_watchdog: bool,
+    /// See build_parse.rs: gate for the THINKING-phase loop watchdog.
+    pub enable_think_loop_watchdog: bool,
+    /// See build_parse_behavior.rs: honor a mid-`<think>` EOS by implicitly
+    /// closing the block. Defaults FALSE (pre-p350 behaviour).
+    pub honor_eos_inside_thinking: bool,
+    /// Cap the thinking budget at 90% of the request's `max_tokens` (true), or
+    /// let `max_thinking_budget` be the sole cap (false = vLLM single-budget:
+    /// reasoning may use the full generation budget). See thinking.rs::resolve.
+    pub cap_thinking_at_max_tokens: bool,
     /// Server-side min-p FLOOR (0.0 = disabled). Applied as `min_p.max(floor)`
     /// AFTER request/preset resolution, so it binds even when a client sends
     /// `min_p = 0` (or omits it on a server without `--default-min-p`). On
@@ -203,7 +276,8 @@ pub struct ModelBehavior {
     /// mismatches. Default 12 (~8%).
     pub fuzzy_repeat_tolerance_div: u32,
     /// Cap on free-text tokens between successive `<tool_call>` opens in
-    /// `tool_choice=auto`. Default 384. Agentic coding may want larger.
+    /// `tool_choice=auto`. Default [`DEFAULT_MAX_INTER_TOOL_PROSE`]
+    /// (see `behavior_defaults.rs` for the tuning history — #328).
     pub max_inter_tool_prose: u32,
     /// Unconditional per-generation cap on post-`</think>` content tokens
     /// for tool-active requests (grammar attached). Bounds a runaway where
@@ -255,6 +329,17 @@ pub struct ModelBehavior {
     /// specific model is known to ALWAYS get tool args right on the
     /// first attempt (extra inference round-trip cost is wasted there).
     pub tool_retry: bool,
+    /// Jinja `preserve_thinking` chat-template flag (Qwen3.6+ dense family):
+    /// keep historical `<think>` blocks in re-rendered assistant turns
+    /// instead of stripping them before the last user query.
+    ///
+    /// Tri-state on purpose (SSOT): `None` = do NOT inject the variable —
+    /// the model's own template default applies (Qwen3.6 strips unless
+    /// `preserve_thinking` is true; Qwen3.8 KEEPS unless it is explicitly
+    /// false). `Some(_)` pins the value for this target, changing
+    /// multi-turn prompt bytes and therefore prefix-cache hit rate.
+    /// Per-request `chat_template_kwargs.preserve_thinking` still wins.
+    pub preserve_thinking: Option<bool>,
 }
 
 /// Phase-C: maximum number of watchdog-triggered rollbacks a single
@@ -276,18 +361,28 @@ pub const ROLLBACK_RESTEER_CAP: u32 = 2;
 /// models ignore this (their ring is 0; they roll back to any boundary).
 pub const DECODE_ROLLBACK_RING_SLOTS: usize = 8;
 
+/// Domain salt folded into every decode cold-tier key so a decode-ring blob can
+/// never collide with a Marconi prefix-hash key on a shared store/peer.
+pub const DECODE_DOMAIN: u64 = 0xD3C0_DE12_A5B6_C7D8;
+
 impl Default for ModelBehavior {
     fn default() -> Self {
         Self {
             thinking_in_tools: true,
-            max_thinking_budget: 256,
+            max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
+            effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: "",
             default_num_drafts: 0,
             disable_tool_steering: false,
+            disable_cwd_hint_injection: false,
+            use_sampling_presets_for_core: false,
             tool_call_parser: "",
             enable_loop_watchdog: false,
+            enable_think_loop_watchdog: true,
+            honor_eos_inside_thinking: false,
+            cap_thinking_at_max_tokens: true,
             min_p_floor: 0.0,
             temperature_max: 0.0,
             think_loop_min_repeats: 3,
@@ -295,13 +390,14 @@ impl Default for ModelBehavior {
             confidence_early_stop: true,
             confidence_run_length: 30,
             fuzzy_repeat_tolerance_div: 12,
-            max_inter_tool_prose: 384,
+            max_inter_tool_prose: DEFAULT_MAX_INTER_TOOL_PROSE,
             max_post_think_content_tokens: 100_000,
             tscg: false,
             disable_tool_grammar: false,
             rollback_resteer: true,
             rom_head: "",
             tool_retry: true,
+            preserve_thinking: None,
         }
     }
 }
@@ -346,125 +442,46 @@ pub struct TargetPtxSet {
     pub sampling: SamplingPresets,
     pub behavior: ModelBehavior,
     pub model_type_matches: Vec<ModelTypeMatch>,
+    /// `[model] match_names` needles from MODEL.toml — case-insensitive
+    /// substrings of the checkpoint reference (HF id / `--model-name` /
+    /// resolved model dir) that identify checkpoints THIS target serves.
+    /// Consulted only to break a tie when several targets declare the same
+    /// `(model_type, hidden_size)` (e.g. qwen3.6-27b vs qwen3.8-27b, whose
+    /// configs are bit-identical); see [`resolve::resolve_target`]. Empty
+    /// for targets that never collide — `build.rs` panics if a colliding
+    /// target omits them.
+    pub match_names: &'static [&'static str],
     /// DFlash drafter pairing for this model. `None` when the MODEL.toml has
     /// no `[dflash]` section. Consumed by spark-server when `--dflash` is
     /// set without an explicit `--draft-model` flag.
     pub dflash: Option<DflashConfig>,
+    /// `(module, kernel)` pairs this model's kernel files DROPPED by shadowing
+    /// their `common/` namesakes — the kernel exists in `common/` but this
+    /// model's fork of the file does not define it, so it is not compiled here.
+    ///
+    /// Shadowing is whole-file, so a fork that predates a kernel added to
+    /// `common/` silently loses it: `try_kernel` returns handle 0 and whatever
+    /// depends on it fails CLOSED. The startup audit joins this against the
+    /// kernels the model actually looked up, which separates the two classes of
+    /// missing kernel — dropped-by-fork (a build defect) from
+    /// never-built-for-this-architecture (expected, e.g. MLA on a Qwen model).
+    pub shadowed_dropped: &'static [(&'static str, &'static str)],
+    /// `(module, kernel)` lookups this model's dispatch may issue and fail to
+    /// resolve WITHOUT that being an error, declared in the model's MODEL.toml
+    /// `[expected_absent]` with a mandatory stated reason per entry.
+    ///
+    /// The boot audit (`kernel_audit::classify_failures`) fails CLOSED on every
+    /// unresolved lookup that is not in this list, so the list is the entire
+    /// difference between "this model is known to run this way" and "nobody has
+    /// looked". It is TRANSITIONAL: the right fix for a lookup that can never
+    /// resolve is to gate it on config so it is never issued (see
+    /// `qwen3_attention::init_arch_gates`), which removes it from here.
+    pub expected_absent: &'static [(&'static str, &'static str)],
 }
 
-/// All compiled kernel targets and their PTX module sets.
-///
-/// Returns one entry per target compiled at build time.
-/// Single-target builds return one entry; wildcard builds return all.
-pub fn available_targets() -> Vec<TargetPtxSet> {
-    all_ptx_sets()
-}
-
-/// Find the PTX module set for a target whose model name contains `needle`.
-///
-/// Returns `None` if no compiled target matches.
-pub fn ptx_for_model(needle: &str) -> Option<TargetPtxSet> {
-    all_ptx_sets()
-        .into_iter()
-        .find(|t| t.target.model.contains(needle))
-}
-
-/// Find the PTX module set matching a `(model_type, hidden_size)` pair.
-///
-/// Matching rules:
-/// 1. Exact match on `(model_type, Some(hidden_size))` wins
-/// 2. Wildcard match `(model_type, None)` is fallback
-/// 3. Returns `None` if no compiled target matches
-pub fn ptx_for_config(model_type: &str, hidden_size: usize) -> Option<TargetPtxSet> {
-    let targets = all_ptx_sets();
-    // Exact match first (specific hidden_size)
-    let exact = targets.iter().position(|t| {
-        t.model_type_matches
-            .iter()
-            .any(|m| m.model_type == model_type && m.hidden_size == Some(hidden_size))
-    });
-    if let Some(idx) = exact {
-        return targets.into_iter().nth(idx);
-    }
-    // Wildcard fallback (hidden_size == None)
-    let wildcard = targets.iter().position(|t| {
-        t.model_type_matches
-            .iter()
-            .any(|m| m.model_type == model_type && m.hidden_size.is_none())
-    });
-    wildcard.and_then(|idx| targets.into_iter().nth(idx))
-}
+mod query;
+pub use query::{available_targets, ptx_for_model};
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn all_ptx_modules_non_empty() {
-        for (name, blob) in ptx_modules() {
-            assert!(
-                !blob.is_empty(),
-                "PTX module '{name}' is empty — nvcc compilation may have failed"
-            );
-            // Blobs are `&[u8]` (uniform across backends). For the NVIDIA
-            // build under test the bytes are ASCII PTX, so decode and check
-            // the `.version` directive; on a non-text backend this lossily
-            // decodes to "" and the assert would (correctly) not apply.
-            let ptx = std::str::from_utf8(blob).unwrap_or("");
-            assert!(
-                ptx.contains(".version"),
-                "PTX module '{name}' doesn't contain .version directive"
-            );
-        }
-    }
-
-    // These tests assert that PTX modules were actually compiled into the
-    // crate at build time. They require nvcc + a real CUDA toolchain — the
-    // CI host runs with `ATLAS_SKIP_BUILD=1`, which emits an empty stub
-    // registry by design (so `cargo check` / `cargo clippy` / `cargo test`
-    // can run on hosts without a GPU). Mark them `#[ignore]` so default
-    // `cargo test` is green; they're still exercised on a developer
-    // machine via `cargo test -p atlas-kernels -- --ignored` after a
-    // real PTX build.
-
-    #[test]
-    #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
-    fn module_count_matches_cu_files() {
-        let count = ptx_modules().len();
-        assert!(count >= 31, "Expected at least 31 PTX modules, got {count}");
-    }
-
-    #[test]
-    #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
-    fn available_targets_non_empty() {
-        let targets = available_targets();
-        assert!(!targets.is_empty(), "No kernel targets available");
-        assert!(
-            targets.iter().any(|t| t.target.quant == "nvfp4"),
-            "Expected at least one NVFP4 target"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
-    fn all_targets_have_modules() {
-        for t in available_targets() {
-            assert!(
-                t.modules.len() >= 31,
-                "Target {} has only {} modules (expected >= 31)",
-                t.target,
-                t.modules.len()
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
-    fn ptx_for_model_lookup() {
-        let found = ptx_for_model("qwen3-next-80b");
-        assert!(
-            found.is_some(),
-            "ptx_for_model('qwen3-next-80b') should find the default target"
-        );
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

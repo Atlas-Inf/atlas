@@ -16,6 +16,7 @@ use super::super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::super::ssm_batched_copy::{StateCopy, run_ssm_state_copies};
 use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
@@ -79,6 +80,7 @@ impl TransformerModel {
                         self.prefix_cache.as_ref(),
                         self.gpu.as_ref(),
                         stream,
+                        self.levers.kv_poison,
                     )?;
 
                     // Upload per-token attention metadata
@@ -103,11 +105,29 @@ impl TransformerModel {
                         stream,
                     )?;
                     let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
+                    // SAFETY: the length is derived from the source itself —
+                    // `bt_i32.len() * 4 == size_of_val(&bt_i32[..])` — and
+                    // `bt_i32` is a fresh `collect()` on the line above, so
+                    // all `len` elements are initialised and nothing past
+                    // `len` (the `Vec`'s spare capacity) is read. `i32` is
+                    // POD, and `bt_i32` outlives the H2D enqueue below.
                     let bt_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(bt_i32.as_ptr() as *const u8, bt_i32.len() * 4)
                     };
                     self.gpu
                         .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
+
+                    // Request-scoped LoRA routing (eager per-token verify). One
+                    // sequence → one adapter for all K tokens; 1-elem buffer at
+                    // the free +128 gap (layout slot@+8/seq_len@+16/bt@+256).
+                    // Eager path, so no capture concern. `DevicePtr(0)` (no
+                    // pool) → installed-pair fallback.
+                    let seq_slot = self.upload_seq_slot_uniform(
+                        seq.adapter_slot,
+                        1,
+                        meta_base.offset(128),
+                        stream,
+                    )?;
 
                     let attn_metadata = AttnMetadataDev {
                         positions: meta_base,
@@ -118,12 +138,18 @@ impl TransformerModel {
                         block_table: meta_base.offset(256),
                         max_blocks_per_seq: max_blocks,
                         num_seqs: 1,
+                        seq_slot,
+                        moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
                     };
 
                     let ctx = ForwardContext {
                         buffers: &self.buffers,
                         gpu: self.gpu.as_ref(),
                         config: &self.config,
+                        dispatch: &self.dispatch,
+                        derived: &self.derived,
+                        levers: &self.levers,
+                        stats: &self.stats,
                         attn_metadata: Some(attn_metadata),
                         profile: false,
                         comm: self.comm_ref(),
@@ -131,6 +157,9 @@ impl TransformerModel {
                         gdn_exact_replay: false,
                         midchunk_capture: None,
                         token_ids: None,
+                        routed_lora_layers: None, // #30: verify decode; no prefill route.
+                        midchunk_capture: None,
+                        moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
                     };
 
                     let h_t = hidden.offset(t * h * fp32);
@@ -154,6 +183,10 @@ impl TransformerModel {
                     buffers: &self.buffers,
                     gpu: self.gpu.as_ref(),
                     config: &self.config,
+                    dispatch: &self.dispatch,
+                    derived: &self.derived,
+                    levers: &self.levers,
+                    stats: &self.stats,
                     attn_metadata: None,
                     profile: false,
                     comm: self.comm_ref(),
@@ -161,6 +194,9 @@ impl TransformerModel {
                     gdn_exact_replay: false,
                     midchunk_capture: None,
                     token_ids: None,
+                    routed_lora_layers: None, // #30: verify decode; no prefill route.
+                    midchunk_capture: None,
+                    moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
                 };
 
                 layer.decode_batched(
@@ -237,6 +273,8 @@ impl TransformerModel {
         use crate::layer::SsmLayerState;
 
         let stream = self.gpu.default_stream();
+        let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
+        let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) == atlas_core::config::LayerType::LinearAttention {
                 let ssm = layer_state
@@ -249,7 +287,11 @@ impl TransformerModel {
                 let vd = self.config.linear_value_head_dim;
                 let nk = self.config.linear_num_key_heads;
                 let kd = self.config.linear_key_head_dim;
-                let h_bytes = nv * vd * kd * 4; // FP32
+                // STORAGE width of pool h regions (SSOT: ssm_pool /
+                // ssm_reserve::ssm_h_stored_bytes) — FP32 today; halves
+                // under the stage-3 f16-sized pool so these copies can
+                // never overrun a narrow slot.
+                let h_bytes = self.ssm_pool.h_stored_bytes;
                 let conv_dim = nk * kd * 2 + nv * vd; // 8192
                 let d_conv = self.config.linear_conv_kernel_dim;
                 let conv_bytes = conv_dim * d_conv * 4; // FP32
@@ -263,20 +305,19 @@ impl TransformerModel {
                 }
 
                 // D2D copy: state → checkpoint
-                self.gpu.copy_d2d_async(
-                    ssm.h_state,
-                    ssm.h_state_checkpoint.unwrap(),
-                    h_bytes,
-                    stream,
-                )?;
-                self.gpu.copy_d2d_async(
-                    ssm.conv_state,
-                    ssm.conv_state_checkpoint.unwrap(),
-                    conv_bytes,
-                    stream,
-                )?;
+                h_plan.push(StateCopy {
+                    src: ssm.h_state,
+                    dst: ssm.h_state_checkpoint.unwrap(),
+                    bytes: h_bytes,
+                });
+                conv_plan.push(StateCopy {
+                    src: ssm.conv_state,
+                    dst: ssm.conv_state_checkpoint.unwrap(),
+                    bytes: conv_bytes,
+                });
             }
         }
+        run_ssm_state_copies(self.gpu.as_ref(), &h_plan, &conv_plan, stream)?;
         self.gpu.synchronize(stream)?;
         Ok(())
     }
@@ -288,7 +329,40 @@ impl TransformerModel {
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        // PRE-VALIDATION PASS — no GPU work is enqueued until every SSM layer
+        // is known to be restorable. Bailing part-way through the copy loop
+        // below would leave the first N layers rewound and the rest advanced
+        // past the accepted boundary: a MIXED state, which is strictly worse
+        // than the uniform corruption it is meant to prevent and much harder
+        // to reason about. Validate first, then copy unconditionally.
+        if num_accepted > 0 {
+            for (i, layer_state) in seq.layer_states.iter().enumerate() {
+                if self.config.layer_type(i) != atlas_core::config::LayerType::LinearAttention {
+                    continue;
+                }
+                let ssm = layer_state
+                    .as_any()
+                    .downcast_ref::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+                if num_accepted > ssm.h_state_intermediates.len() {
+                    anyhow::bail!(
+                        "rollback_ssm_states: cannot restore SSM to N={num_accepted} \
+                         (layer {i}): only {} per-token intermediate(s) available. \
+                         With no intermediates this is the self-speculative / ngram \
+                         path — use --speculative (MTP) or --num-drafts 1 for SSM \
+                         models. With too few, the MTP h-intermediate pool \
+                         (num_drafts per slot, tiered — K-1 snapshots for a \
+                         K-row verify) is smaller than this rollback target. \
+                         No rollback copies were enqueued.",
+                        ssm.h_state_intermediates.len(),
+                    );
+                }
+            }
+        }
+
         let stream = self.gpu.default_stream();
+        let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
+        let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) == atlas_core::config::LayerType::LinearAttention {
                 let ssm = layer_state
@@ -300,7 +374,8 @@ impl TransformerModel {
                 let vd = self.config.linear_value_head_dim;
                 let kd = self.config.linear_key_head_dim;
                 let nk = self.config.linear_num_key_heads;
-                let h_bytes = nv * vd * kd * 4;
+                // Pool h STORAGE width (SSOT: ssm_reserve::ssm_h_stored_bytes).
+                let h_bytes = self.ssm_pool.h_stored_bytes;
                 let conv_dim = nk * kd * 2 + nv * vd; // 8192
                 let d_conv = self.config.linear_conv_kernel_dim;
                 let conv_bytes = conv_dim * d_conv * 4;
@@ -308,47 +383,57 @@ impl TransformerModel {
                 if num_accepted == 0 {
                     // Restore to pre-verification checkpoint
                     if let Some(ckpt) = ssm.h_state_checkpoint {
-                        self.gpu
-                            .copy_d2d_async(ckpt, ssm.h_state, h_bytes, stream)?;
+                        h_plan.push(StateCopy {
+                            src: ckpt,
+                            dst: ssm.h_state,
+                            bytes: h_bytes,
+                        });
                     }
                     if let Some(ckpt) = ssm.conv_state_checkpoint {
-                        self.gpu
-                            .copy_d2d_async(ckpt, ssm.conv_state, conv_bytes, stream)?;
+                        conv_plan.push(StateCopy {
+                            src: ckpt,
+                            dst: ssm.conv_state,
+                            bytes: conv_bytes,
+                        });
                     }
                 } else if num_accepted <= ssm.h_state_intermediates.len() {
                     // Restore to intermediate checkpoint after the last accepted token
                     let idx = num_accepted - 1;
-                    self.gpu.copy_d2d_async(
-                        ssm.h_state_intermediates[idx],
-                        ssm.h_state,
-                        h_bytes,
-                        stream,
-                    )?;
-                    self.gpu.copy_d2d_async(
-                        ssm.conv_state_intermediates[idx],
-                        ssm.conv_state,
-                        conv_bytes,
-                        stream,
-                    )?;
-                } else if ssm.h_state_intermediates.is_empty() {
-                    // No intermediates available (self-spec / ngram path) and
-                    // the caller asked for a partial rollback. Without
-                    // intermediates we cannot reach the post-N-token state
-                    // by replay; silently skipping would leave SSM state
-                    // advanced past the accepted boundary, corrupting
-                    // every subsequent decode. Fail fast so the operator
-                    // sees the misconfiguration instead of silent gibberish.
-                    anyhow::bail!(
-                        "rollback_ssm_states: cannot restore SSM to N={num_accepted} \
-                         without per-token intermediates (layer {i}). \
-                         self-speculative / ngram with SSM models needs MTP \
-                         intermediates support; use --speculative (MTP) or \
-                         --num-drafts 1 for SSM models."
+                    h_plan.push(StateCopy {
+                        src: ssm.h_state_intermediates[idx],
+                        dst: ssm.h_state,
+                        bytes: h_bytes,
+                    });
+                    conv_plan.push(StateCopy {
+                        src: ssm.conv_state_intermediates[idx],
+                        dst: ssm.conv_state,
+                        bytes: conv_bytes,
+                    });
+                } else {
+                    // Unreachable: the pre-validation pass above already
+                    // bailed for every `num_accepted > intermediates.len()`,
+                    // and `num_accepted == 0` took the first branch. Kept as
+                    // a hard error rather than a silent fallthrough — the
+                    // original code returned Ok(()) here, leaving h_state and
+                    // conv_state ADVANCED past the last accepted token with
+                    // no error and no log line, which corrupts every
+                    // subsequent decode and surfaces much later as gibberish.
+                    unreachable!(
+                        "rollback_ssm_states: layer {i} passed pre-validation but \
+                         num_accepted={num_accepted} exceeds {} intermediates",
+                        ssm.h_state_intermediates.len(),
                     );
                 }
-                // If num_accepted == num_tokens, SSM state is already correct
+                // `num_accepted == num_tokens` (full accept) never reaches
+                // here: callers guard it (`seq.seq_len > expected_seq_len`),
+                // and it would otherwise be swallowed by the branch above.
             }
         }
+        // Enqueued only after every layer validated AND planned — the
+        // pre-validation pass above already guarantees no bail can happen
+        // here, and building the plan first makes that structural rather
+        // than argued: a partially-rewound MIXED state is unrepresentable.
+        run_ssm_state_copies(self.gpu.as_ref(), &h_plan, &conv_plan, stream)?;
         // No synchronize needed: rollback copies and subsequent operations
         // are on the same CUDA stream, so ordering is guaranteed.
         Ok(())

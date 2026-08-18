@@ -47,11 +47,23 @@ impl MoeLayer {
         // fp8_gemm_t_blockscaled with both scales in the FP32 epilogue.
         // The shared expert is dense (every token), so we reuse the same
         // dense W8A8 GEMM that attention QKV/O proj already use.
-        let force_w8a8_sh = ops::fp8_blockscaled_prefill_enabled()
+        let force_w8a8_sh = ctx.dispatch.fp8_blockscaled_prefill
             && self.fp8_gemm_t_blockscaled_k.0 != 0
             && self.per_token_group_quant_fp8_k.0 != 0;
         let has_shared = shared_inter > 0;
-        if has_shared && force_w8a8_sh {
+        let bf16_shared = has_shared
+            && self.run_bf16_shared_expert(
+                input,
+                n,
+                h,
+                shared_inter,
+                ctx.buffers.ssm_deinterleaved(),
+                ctx.buffers.ssm_qkvz(),
+                ctx.buffers.attn_output(),
+                ctx,
+                stream,
+            )?;
+        if !bf16_shared && has_shared && force_w8a8_sh {
             let shared_gate_out = ctx.buffers.ssm_deinterleaved();
             let shared_up_out = ctx.buffers.ssm_qkvz();
             let m_us: usize = n as usize;
@@ -139,7 +151,7 @@ impl MoeLayer {
             ctx.gpu.synchronize(stream)?;
             ctx.gpu.free(down_in_fp8)?;
             ctx.gpu.free(down_in_scale)?;
-        } else if has_shared {
+        } else if !bf16_shared && has_shared {
             let shared_gate_out = ctx.buffers.ssm_deinterleaved();
             let shared_up_out = ctx.buffers.ssm_qkvz();
             // Shared-expert dense GEMMs (gate/up/down, every token). The
@@ -240,20 +252,17 @@ impl MoeLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm,
-                router_in,
-                &self.weights.gate,
-                gate_logits,
-                n,
-                num_experts,
-                h,
-                stream,
-            )?;
+            // Selection numerics — see router_gate_gemm_dense for why this
+            // must stay on the scalar kernel (2026-08-12 BFCL regression).
+            self.router_gate_gemm_dense(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
         }
 
         super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+
+        // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
+        // logits BEFORE top-k (device-clean, no capture guard). No-op unless a
+        // router delta is installed.
+        self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
 
         // 2. Batched topK dispatch (sigmoid+bias for MiniMax/DeepSeek-V3,
         //    softmax for everyone else — selection by `correction_bias_dev`).
@@ -363,7 +372,7 @@ impl MoeLayer {
         }
         // ATLAS_FP8_W8A8: pre-quant input/intermediate to FP8 with per-token-
         // per-128 FP32 scale, use new W8A8 grouped GEMM (vLLM-equivalent).
-        let force_w8a8 = ops::fp8_blockscaled_prefill_enabled()
+        let force_w8a8 = ctx.dispatch.fp8_blockscaled_prefill
             && self.moe_w8a8_grouped_gemm_k.0 != 0
             && self.per_token_group_quant_fp8_k.0 != 0;
 
@@ -486,6 +495,24 @@ impl MoeLayer {
             ctx.gpu.free(tt_gu)?;
         }
 
+        // Feature-1: fold gate/up_proj deltas onto the sorted BF16
+        // `expert_gate_out`/`expert_up_out` BEFORE either silu_mul below. ONE point
+        // covers both the W8A8 and worklist fp8 branches (both left sorted BF16
+        // gate/up). x = BF16 `input` (NOT `input_fp8` — mirror the down-fold
+        // precedent of folding BF16 deltas onto the BF16 intermediates).
+        if max_m_tiles > 0 {
+            self.apply_expert_lora_prefill_gateup(
+                expert_gate_out,
+                expert_up_out,
+                input,
+                expert_offsets,
+                sorted_token_ids,
+                total_expanded,
+                ctx,
+                stream,
+            )?;
+        }
+
         // 6. Activation+mul + down GEMM
         let expert_down_out = ctx.buffers.expert_down_out();
         if force_w8a8 && max_m_tiles > 0 {
@@ -585,6 +612,20 @@ impl MoeLayer {
             ctx.gpu.free(wl_dn)?;
             ctx.gpu.free(tt_dn)?;
         }
+
+        // Feature-1: fold the routed-expert down_proj LoRA deltas onto the sorted
+        // BF16 `expert_down_out` BEFORE the unpermute. Covers BOTH the W8A8 and
+        // worklist fp8 branches (both leave sorted-BF16 `expert_down_out` +
+        // post-SiLU BF16 `expert_gate_out`). Same device kernel as nvfp4/bf16.
+        self.apply_expert_lora_prefill_down(
+            expert_gate_out,
+            expert_down_out,
+            expert_offsets,
+            sorted_token_ids,
+            total_expanded,
+            ctx,
+            stream,
+        )?;
 
         // 7. Unpermute + weighted reduce + shared blend
         let output = ctx.buffers.moe_output();

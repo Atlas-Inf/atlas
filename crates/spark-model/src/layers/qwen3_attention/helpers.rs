@@ -3,9 +3,13 @@
 //! `Qwen3AttentionLayer` setters and small per-layer compute helpers
 //! (`apply_layer_scalar`, `effective_attn_scale`).
 
-use super::types::{HcWeights, MlaWeights, Qwen3AttentionLayer};
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+
+use super::types::{HcWeights, HeadGateActivation, MlaWeights, Qwen3AttentionLayer};
 use crate::layers::FfnComponent;
-use crate::weight_map::DenseWeight;
+use crate::layers::ops;
+use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 /// YaRN attention-temperature factor for a single `mscale` value.
 /// Matches HF `yarn_get_mscale`: `0.1 * mscale * ln(scale) + 1.0` for
@@ -68,8 +72,14 @@ impl Qwen3AttentionLayer {
 
     /// Set per-head attention gate weight (Step 3.7 g_proj).
     /// The weight is BF16 shape [num_q_heads, hidden_size].
-    pub fn set_head_gate_weight(&mut self, w: DenseWeight) {
+    pub(crate) fn set_head_gate_weight(&mut self, w: DenseWeight, activation: HeadGateActivation) {
         self.head_gate_weight = Some(w);
+        self.head_gate_activation = activation;
+    }
+
+    pub(crate) fn set_yarn_rope(&mut self, inv_freq: DevicePtr, attention_factor: f32) {
+        self.yarn_inv_freq = inv_freq;
+        self.yarn_attention_factor = attention_factor;
     }
 
     /// Set per-layer RoPE overrides (theta, rotary_dim) for dual-RoPE
@@ -90,6 +100,34 @@ impl Qwen3AttentionLayer {
     /// attention scale should be 1.0 (not 1/sqrt(head_dim)).
     pub fn set_attn_scale_override(&mut self, scale: f32) {
         self.attn_scale_override = Some(scale);
+    }
+
+    /// NVFP4 M=1 decode GEMV. Single-warp when the lever is on and the kernel
+    /// resolved; otherwise the 64-thread kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn nvfp4_decode_gemv(
+        &self,
+        gpu: &dyn GpuBackend,
+        use_sw: bool,
+        input: DevicePtr,
+        weight: &QuantizedWeight,
+        output: DevicePtr,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        ops::w4a16_decode_gemv(
+            gpu,
+            self.w4a16_gemv_k,
+            self.w4a16_gemv_sw_k,
+            use_sw,
+            input,
+            weight,
+            output,
+            n,
+            k,
+            stream,
+        )
     }
 
     /// Set K=V mode (Gemma-4 full-attention layers).
@@ -180,5 +218,49 @@ impl Qwen3AttentionLayer {
     pub(crate) fn effective_attn_scale(&self, head_dim: u32) -> f32 {
         self.attn_scale_override
             .unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt())
+    }
+}
+
+#[cfg(test)]
+mod yarn_mscale_tests {
+    use super::yarn_rope_mscale;
+    use atlas_core::config::ModelConfig;
+
+    // Test 1 + Test 4: with the DS4F-forced config (yarn_mscale ==
+    // yarn_mscale_all_dim == 0.0, factor 16), yarn_rope_mscale returns EXACTLY
+    // 1.0 — the single value fed to all nine DS4F rope call sites, removing the
+    // erroneous 1.2772589 amplitude on CSA/HCA layers.
+    #[test]
+    fn ds4f_forced_config_yields_mscale_one() {
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        c.yarn_factor = 16.0;
+        c.yarn_mscale = 0.0;
+        c.yarn_mscale_all_dim = 0.0;
+        assert_eq!(yarn_rope_mscale(&c), 1.0);
+    }
+
+    // Test 5 (helper side): the helper itself is UNCHANGED. Under the generic
+    // HF-DeepseekV3 default (mscale 1.0, mscale_all_dim 0.0) it still returns the
+    // 1.2772589 ratio, so any legitimate YaRN-mscale caller (a different model
+    // whose config sets these fields) is unaffected. Only the DS4F *config* flips
+    // the result, not this function.
+    #[test]
+    fn generic_yarn_default_unchanged_1277() {
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        c.yarn_factor = 16.0;
+        c.yarn_mscale = 1.0;
+        c.yarn_mscale_all_dim = 0.0;
+        let m = yarn_rope_mscale(&c);
+        assert!((m - 1.2772589).abs() < 1e-5, "expected ~1.2772589, got {m}");
+    }
+
+    // YaRN disabled (factor <= 1) short-circuits to 1.0 (unchanged behavior).
+    #[test]
+    fn yarn_disabled_factor_one_is_mscale_one() {
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        c.yarn_factor = 1.0;
+        c.yarn_mscale = 1.0;
+        c.yarn_mscale_all_dim = 0.0;
+        assert_eq!(yarn_rope_mscale(&c), 1.0);
     }
 }

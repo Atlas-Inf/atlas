@@ -13,6 +13,7 @@ use crate::grammar::GrammarEngine;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_new_requests(
     model: &dyn Model,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
     new_reqs: Vec<InferenceRequest>,
     chunked: bool,
     always_mixed: bool,
@@ -44,6 +45,20 @@ pub(super) fn start_new_requests(
         && prefilling.is_empty()
         && !model.is_ep()
         && !new_reqs.iter().any(|r| r.has_image_pixels());
+    // VARLEN batched prefill (`--prefill-varlen-batch`): defer chunk-0 whenever
+    // there is (or will be) company to batch with — >=2 co-admitted this tick,
+    // OR streams already prefilling that a late arrival can join next wave.
+    // Unlike codispatch it does NOT require equal prompt lengths (ragged
+    // cu_seqlens geometry) and does not require `prefilling` to be empty.
+    // A request admitted alone with nothing in flight keeps the inline
+    // chunk-0 (and its `max_batch_tokens` solo budget) — deferral there
+    // would only shrink its first chunk. Vision excluded per request, same
+    // shared-buffer reason as codispatch; EP excluded like every batched path.
+    let want_varlen_defer = chunked
+        && !model.is_ep()
+        && active.is_empty()
+        && (new_reqs.len() >= 2 || !prefilling.is_empty())
+        && spark_model::layers::ops::prefill_varlen_enabled();
     // Always-mixed chunk-0 fuse: when decodes are active and ATLAS_HOLO_ALWAYS_MIXED
     // is on, DEFER a new request's chunk-0 (admit it to `prefilling` with
     // chunk_offset=0, skip the inline blocking prefill) so it runs this SAME tick
@@ -73,7 +88,7 @@ pub(super) fn start_new_requests(
     let mut vision_slices: Vec<VisionSlice> = vec![VisionSlice::default(); new_reqs.len()];
     if vision_codispatch && chunked {
         let mut batched_idx: Vec<usize> = Vec::new();
-        let mut per_request_imgs: Vec<Vec<(Vec<f32>, usize, usize)>> = Vec::new();
+        let mut per_request_imgs: Vec<Vec<spark_model::VisionItem>> = Vec::new();
         let mut running_patches = 0usize;
         let mut overflow = false;
         for (k, req) in new_reqs.iter().enumerate() {
@@ -89,7 +104,13 @@ pub(super) fn start_new_requests(
                 continue; // self-encodes per-request (legacy single-image path)
             }
             let imgs = req.image_pixels_ref();
-            let req_patches: usize = imgs.iter().map(|(_, gh, gw)| gh * gw).sum();
+            // Patches across every TEMPORAL GROUP: a clip costs its grid once
+            // per group, so counting the grid alone would under-book a video by
+            // a factor of grid_t and overflow the shared encoder buffer.
+            let req_patches: usize = imgs
+                .iter()
+                .map(|it| it.t_len() * it.grid_h * it.grid_w)
+                .sum();
             if running_patches + req_patches > VISION_P_MAX {
                 overflow = true;
                 break;
@@ -145,9 +166,76 @@ pub(super) fn start_new_requests(
         }
     }
 
+    // ── Beam co-dispatch pre-pass (ATLAS_BEAM_CODISPATCH, default on) ──
+    // Fuse this tick's beam requests (num_beams>1) into ONE generate_beam_batch
+    // call so their Σ beams decode as a single batched forward per step — beam
+    // aggregate throughput then scales with concurrency instead of serializing
+    // per request. Requests are grouped by adapter (the model's single global
+    // LoRA gate forces one adapter per fused batch) and packed up to BEAM_C_CAP
+    // total beams. Each winning hypothesis is stashed in `beam_hyps[req_idx]`,
+    // which the per-request beam branch consumes instead of re-running the search.
+    // Non-beam requests are untouched; a single beam request (group of 1) falls
+    // through to the identical per-request path. Blocking-only: streaming + beam
+    // is rejected upstream, so every beam request here is Blocking.
+    let mut beam_hyps: Vec<Option<Vec<u32>>> = (0..new_reqs.len()).map(|_| None).collect();
+    let beam_codispatch = model.supports_beam()
+        && std::env::var("ATLAS_BEAM_CODISPATCH")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+    if beam_codispatch {
+        const BEAM_C_CAP: usize = 320; // Σ beams per fused batch (d≤2048 self-KV cap)
+        let items: Vec<(usize, i32, usize)> = new_reqs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.num_beams() > 1 && matches!(r, InferenceRequest::Blocking { .. }))
+            .map(|(idx, r)| (idx, r.adapter_slot(), r.num_beams() as usize))
+            .collect();
+        for chunk in pack_beam_chunks(&items, BEAM_C_CAP) {
+            if chunk.len() < 2 {
+                continue; // single beam request → identical per-request path
+            }
+            let reqs: Vec<spark_model::traits::BeamReq> = chunk
+                .iter()
+                .map(|&i| {
+                    let r = &new_reqs[i];
+                    spark_model::traits::BeamReq {
+                        prompt_tokens: r.prompt_tokens_arc().as_ref().clone(),
+                        src_lang_id: r.src_lang_id(),
+                        tgt_lang_id: r.tgt_lang_id(),
+                        adapter_slot: r.adapter_slot(),
+                        num_beams: r.num_beams() as usize,
+                        max_new: r.max_tokens(),
+                        length_penalty: r.length_penalty(),
+                        early_stopping: r.early_stopping(),
+                    }
+                })
+                .collect();
+            let total_beams: usize = reqs.iter().map(|r| r.num_beams).sum();
+            match model.generate_beam_batch(&reqs) {
+                Ok(hyps) if hyps.len() == chunk.len() => {
+                    for (&i, h) in chunk.iter().zip(hyps.into_iter()) {
+                        beam_hyps[i] = Some(h);
+                    }
+                    tracing::info!(
+                        "Beam co-dispatch: fused {} requests ({total_beams} beams) this tick",
+                        chunk.len(),
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!("beam co-dispatch count mismatch; per-request fallback")
+                }
+                Err(e) => {
+                    tracing::warn!("beam co-dispatch failed: {e:#}; per-request fallback")
+                }
+            }
+        }
+    }
+
     for (req_idx, req) in new_reqs.into_iter().enumerate() {
+        let precomputed_beam_hyp = beam_hyps[req_idx].take();
         if chunked {
-            let defer = want_codispatch || (mixed_defer && !req.has_image_pixels());
+            let defer =
+                want_codispatch || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels());
             // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
             let slice = vision_slices[req_idx];
             let vision_slice = if slice.num_images > 0 {
@@ -164,6 +252,7 @@ pub(super) fn start_new_requests(
                 max_prefill_tokens
             };
             match start_chunked_prefill(
+                sched,
                 think_end_token,
                 think_start_token,
                 tool_call_start_token,
@@ -178,6 +267,7 @@ pub(super) fn start_new_requests(
                 spontaneous_think_budget,
                 defer,
                 vision_slice,
+                precomputed_beam_hyp,
             ) {
                 Ok(StartPrefillResult::Active(a)) => {
                     tracing::info!(
@@ -204,6 +294,7 @@ pub(super) fn start_new_requests(
         } else {
             // Legacy non-chunked path.
             match prefill_request(
+                sched,
                 think_end_token,
                 think_start_token,
                 tool_call_start_token,
@@ -213,6 +304,7 @@ pub(super) fn start_new_requests(
                 eos_tokens,
                 grammar_engine,
                 spontaneous_think_budget,
+                precomputed_beam_hyp,
             ) {
                 Ok(Some(a)) => {
                     tracing::info!(
@@ -231,6 +323,34 @@ pub(super) fn start_new_requests(
     }
 }
 
+/// Group beam requests by adapter — the model's single global LoRA gate forces
+/// one adapter per fused batch — then pack each group into chunks whose summed
+/// beam count does not exceed `cap`. `items` is `(req_idx, adapter_slot,
+/// num_beams)`; returns chunks of `req_idx` (adapter order is deterministic).
+fn pack_beam_chunks(items: &[(usize, i32, usize)], cap: usize) -> Vec<Vec<usize>> {
+    let mut groups: std::collections::BTreeMap<i32, Vec<(usize, usize)>> =
+        std::collections::BTreeMap::new();
+    for &(idx, adapter, nb) in items {
+        groups.entry(adapter).or_default().push((idx, nb));
+    }
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    for reqs in groups.into_values() {
+        let (mut chunk, mut beams) = (Vec::new(), 0usize);
+        for (idx, nb) in reqs {
+            if !chunk.is_empty() && beams + nb > cap {
+                chunks.push(std::mem::take(&mut chunk));
+                beams = 0;
+            }
+            chunk.push(idx);
+            beams += nb;
+        }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+    }
+    chunks
+}
+
 /// SSM-pool-full preemption: free oldest active sequence and surface a
 /// 503-equivalent error to the preempted request. Mirrors vLLM's
 /// preemption strategy — never return HTTP 500 for resource exhaustion.
@@ -247,5 +367,51 @@ fn handle_prefill_start_error(model: &dyn Model, e: &anyhow::Error, active: &mut
         send_error(model, &mut victim, "Preempted: server resource pressure");
     } else {
         tracing::error!("Prefill start error: {err_msg}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pack_beam_chunks;
+
+    #[test]
+    fn groups_by_adapter_then_packs_by_cap() {
+        // Two adapters (-1, 7), five beams each request. cap=15 ⇒ ≤3 per chunk.
+        let items = [
+            (0, -1, 5),
+            (1, 7, 5),
+            (2, -1, 5),
+            (3, 7, 5),
+            (4, -1, 5),
+            (5, 7, 5),
+            (6, -1, 5),
+            (7, 7, 5),
+        ];
+        let chunks = pack_beam_chunks(&items, 15);
+        // adapter -1: idx 0,2,4,6 → [0,2,4] + [6]; adapter 7: 1,3,5,7 → [1,3,5] + [7].
+        assert_eq!(chunks, vec![vec![0, 2, 4], vec![6], vec![1, 3, 5], vec![7]]);
+        // No chunk exceeds the cap.
+        for c in &chunks {
+            let beams: usize = c.iter().map(|&i| items[i].2).sum();
+            assert!(beams <= 15, "chunk {c:?} exceeds cap");
+        }
+    }
+
+    #[test]
+    fn single_adapter_all_fit_one_chunk() {
+        let items = [(0, -1, 5), (1, -1, 5), (2, -1, 5)];
+        assert_eq!(pack_beam_chunks(&items, 320), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn heterogeneous_beam_counts_respect_cap() {
+        // 8+8+4 with cap 16 ⇒ [8,8] then [4] (adding the 4 would hit 20>16).
+        let items = [(0, -1, 8), (1, -1, 8), (2, -1, 4)];
+        assert_eq!(pack_beam_chunks(&items, 16), vec![vec![0, 1], vec![2]]);
+    }
+
+    #[test]
+    fn empty_items_no_chunks() {
+        assert!(pack_beam_chunks(&[], 320).is_empty());
     }
 }

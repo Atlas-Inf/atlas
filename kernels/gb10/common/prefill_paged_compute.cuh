@@ -119,9 +119,26 @@ __device__ __forceinline__ float sw_exp(float x) {
 #ifndef HDIM
 #define HDIM 256
 #endif
+// PAD_KV may be overridden by a kernel before including this header (e.g. the
+// FP8-smem cp.async path needs a 16-aligned row stride for 16-byte cp.async /
+// uint4 stores; FP8 elements are 1 byte so PAD_KV=8 → 264 = only 8-aligned,
+// whereas PAD_KV=16 → 272 = 16-aligned). Default 8 keeps the BF16 row stride
+// (256+8)*2 = 528 bytes 16-aligned, as before.
+#ifndef PAD_KV
 #define PAD_KV 8
+#endif
 #define HDIM_PAD (HDIM + PAD_KV)
 #define PAD_P 8
+
+// ATLAS_ATTN_LDMATRIX: use ldmatrix.x4 for the A-operand (Q for QK^T, P for PV)
+// smem loads instead of 4 scalar unsigned-int loads. One PTX instruction
+// replaces 4 manual loads, shortening the load→MMA dependency chain this
+// latency-bound prefill kernel is gated on. PROVEN on GB10/SM121 (ldmatrix_probe.cu
+// cosine 1.0; commit 7dbdfe41 "bit-identical, +2%"). Default ON — opt OUT with
+// -DATLAS_DISABLE_ATTN_LDMATRIX (the prior default-off) if a regression appears.
+#ifndef ATLAS_DISABLE_ATTN_LDMATRIX
+#define ATLAS_ATTN_LDMATRIX
+#endif
 #define N_TILES_PER_WARP ((HDIM / 8) / 2)
 #define TILE_CHUNKS (BR * (HDIM / 8))
 
@@ -150,13 +167,19 @@ extern "C" __global__ void KERNEL_NAME(
 #ifdef PREFILL_BATCHED
     // Q12 Phase 3: batched paged prefill.
     // - block_table_ptrs[b] is the per-stream paged-KV block table.
-    // - Q and O are stacked: [batch, q_len, num_q_heads, head_dim] flattened
-    //   contiguously. Each stream's Q/O lands at `b * q_len * q_seq_stride`.
-    // - All other parameters are SHARED across streams (same q_len, kv_len,
-    //   q_offset etc.). The scheduler enforces same-chunk-len batching.
-    // - Grid extended to (num_q_heads, q_chunks, batch_size); blockIdx.z = b.
+    // - Q and O are stacked contiguously.
+    //   UNIFORM (cu_seqlens == nullptr): every stream has the same length and
+    //   stream b lands at `b * q_len * q_seq_stride`.
+    //   VARLEN (cu_seqlens != nullptr): the buffer is PACKED by the prefix sum,
+    //   stream b lands at `cu_seqlens[b] * q_seq_stride` with its own length
+    //   `cu_seqlens[b+1] - cu_seqlens[b]`, and its own `kv_lens[b]`. Using the
+    //   uniform stride under ragged input reads the wrong rows and can walk
+    //   `batch * max_len` rows when only `sum(len)` exist.
+    // - Grid extended to (num_q_heads, ceil(max_len/BR), batch_size); z = b.
     const int* const* __restrict__ block_table_ptrs,
     const unsigned int batch_size,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ kv_lens,
 #else
     const int* __restrict__ block_table,
 #endif
@@ -177,6 +200,21 @@ extern "C" __global__ void KERNEL_NAME(
     const unsigned int b = blockIdx.z;
     if (b >= batch_size) return;
     const int* const __restrict__ block_table = block_table_ptrs[b];
+    // Per-stream geometry. VARLEN reads it from the staged arrays; UNIFORM
+    // keeps the legacy scalars so that path stays byte-identical.
+    unsigned int q_base_b = 0;
+    unsigned int q_len_eff = q_len;
+    if (cu_seqlens != nullptr) {
+        q_base_b = (unsigned int)cu_seqlens[b];
+        q_len_eff = (unsigned int)(cu_seqlens[b + 1] - cu_seqlens[b]);
+    } else {
+        q_base_b = b * q_len;
+    }
+    if (kv_lens != nullptr) {
+        kv_len = (unsigned int)kv_lens[b];
+    }
+#else
+    const unsigned int q_len_eff = q_len;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -184,14 +222,14 @@ extern "C" __global__ void KERNEL_NAME(
 
     if (q_head >= num_q_heads) return;
     const unsigned int q_start = q_block * BR;
-    if (q_start >= q_len) return;
-    const unsigned int q_tile_end = min(q_start + BR, q_len);
+    if (q_start >= q_len_eff) return;
+    const unsigned int q_tile_end = min(q_start + BR, q_len_eff);
     const unsigned int q_tile_len = q_tile_end - q_start;
     const unsigned int q_seq_stride = num_q_heads * head_dim;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 #ifdef PREFILL_BATCHED
-    // Per-batch Q/O offsets — stacked [batch, q_len, num_q_heads, head_dim].
-    const unsigned long long q_batch_off = (unsigned long long)b * q_len * q_seq_stride;
+    // Packed (VARLEN) or strided (uniform) base row for this stream.
+    const unsigned long long q_batch_off = (unsigned long long)q_base_b * q_seq_stride;
 #endif
 
     __shared__ __nv_bfloat16 smem_Q[BR][HDIM_PAD];
@@ -246,6 +284,24 @@ extern "C" __global__ void KERNEL_NAME(
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
     { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
       num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    // Sliding-window lower bound. The mask below drops any key with
+    // (q_abs - k) >= sliding_window, so every KV block strictly below the
+    // first in-window key is fully masked — start there instead of scoring
+    // and discarding. Uses q_rope_pos (the same absolute position the mask
+    // uses) so the DFlash Q_ROPE_POS_OVERRIDE variant stays correct.
+    unsigned int kv_block_lo = 0;
+    if (causal_mask_enabled && sliding_window > 0) {
+        unsigned int q_abs_lo = q_rope_pos + q_start;
+        if (q_abs_lo + 1 > sliding_window) {
+            kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
+        }
+    }
+    // Never skip past the end: the epilogue must still write O. If every key
+    // were out of window the row sum stays 0 and the store emits zeros, which
+    // is the correct result; an early return would leave O stale instead.
+    if (kv_block_lo >= num_kv_blocks && num_kv_blocks > 0) {
+        kv_block_lo = num_kv_blocks - 1;
+    }
 
     // === Merged Q + K[0] load (single commit group) ===
     // Q via cp.async, K[0] via LOAD_KV_TILE (cp.async for BF16, sync for FP8/NVFP4).
@@ -254,7 +310,7 @@ extern "C" __global__ void KERNEL_NAME(
         const unsigned int cpr = HDIM / 8;
         for (unsigned int idx = tid; idx < TILE_CHUNKS; idx += blockDim.x) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
-            if (q_start + row < q_len) {
+            if (q_start + row < q_len_eff) {
 #ifdef PREFILL_BATCHED
                 const void* gm = (const void*)&Q[q_batch_off + (q_start+row)*q_seq_stride + q_head*head_dim + col];
 #else
@@ -264,18 +320,18 @@ extern "C" __global__ void KERNEL_NAME(
             } else { *((uint4*)&smem_Q[row][col]) = make_uint4(0,0,0,0); }
         }
         if (num_kv_blocks > 0) {
-            LOAD_KV_TILE(K_cache, block_table, smem_K[0], 0, kv_len, kv_head, tid, blockDim.x);
+            LOAD_KV_TILE(K_cache, block_table, smem_K[0], kv_block_lo * BC, kv_len, kv_head, tid, blockDim.x);
         }
         atlas_cp_commit();
         atlas_cp_wait();
     }
     __syncthreads();
 
-    for (unsigned int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+    for (unsigned int kv_block = kv_block_lo; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
-        unsigned int buf = kv_block & 1;
+        unsigned int buf = (kv_block - kv_block_lo) & 1;
 
         // === Start V load (overlaps with QK^T for BF16 cp.async) ===
         LOAD_KV_TILE(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, blockDim.x);
@@ -297,8 +353,6 @@ extern "C" __global__ void KERNEL_NAME(
             #pragma unroll
             for (unsigned int ks = 0; ks < (HDIM/16); ks++) {
                 unsigned int kb = ks*16;
-                unsigned int ar0=qk_warp_m+group_id, ar1=ar0+8;
-                unsigned int ac0=kb+tid_in_group*2, ac1=ac0+8;
                 unsigned int a0,a1,a2,a3;
 #ifdef ATLAS_ATTN_LDMATRIX
                 // SM121 ldmatrix.x4 NON-trans for the Q A-fragment (v47-proven on
@@ -308,8 +362,9 @@ extern "C" __global__ void KERNEL_NAME(
                 { unsigned int qb=__cvta_generic_to_shared(&sQ[(qk_warp_m+(lane_id&15))*HDIM_PAD+(lane_id>>4)*8+kb]);
                   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];"
                     :"=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3):"r"(qb)); }
-                (void)ar0;(void)ar1;(void)ac0;(void)ac1;
 #else
+                unsigned int ar0=qk_warp_m+group_id, ar1=ar0+8;
+                unsigned int ac0=kb+tid_in_group*2, ac1=ac0+8;
                 a0=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac0];
                 a1=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac0];
                 a2=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac1];
@@ -456,16 +511,15 @@ extern "C" __global__ void KERNEL_NAME(
             #pragma unroll
             for(unsigned int ks=0;ks<2;ks++){
                 unsigned int ko=ks*16;
-                unsigned int ar0=pv_warp_m+group_id, ar1=ar0+8;
-                unsigned int ac0=ko+tid_in_group*2, ac1=ac0+8;
                 unsigned int a0,a1,a2,a3;
 #ifdef ATLAS_ATTN_LDMATRIX
                 // ldmatrix.x4 for the P (softmax-prob) A-fragment — same lever as QK.
                 { unsigned int pb=__cvta_generic_to_shared(&sP[(pv_warp_m+(lane_id&15))*p_smem_stride+(lane_id>>4)*8+ko]);
                   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];"
                     :"=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3):"r"(pb)); }
-                (void)ar0;(void)ar1;(void)ac0;(void)ac1;
 #else
+                unsigned int ar0=pv_warp_m+group_id, ar1=ar0+8;
+                unsigned int ac0=ko+tid_in_group*2, ac1=ac0+8;
                 a0=*(const unsigned int*)&sP[ar0*p_smem_stride+ac0];
                 a1=*(const unsigned int*)&sP[ar1*p_smem_stride+ac0];
                 a2=*(const unsigned int*)&sP[ar0*p_smem_stride+ac1];
@@ -532,12 +586,12 @@ extern "C" __global__ void KERNEL_NAME(
         for(int nt=0;nt<N_TILES_PER_WARP;nt++){
             unsigned int c0=(pv_n_start+nt)*8+tid_in_group*2;
             unsigned int gr0=q_start+r0, gr1=q_start+r1;
-            if(gr0<q_len&&r0<q_tile_len&&c0<head_dim){
+            if(gr0<q_len_eff&&r0<q_tile_len&&c0<head_dim){
                 unsigned int lo=(unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][0]*il0));
                 unsigned int hi=(unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][1]*il0));
                 *(unsigned int*)&ob[gr0*q_seq_stride+c0]=lo|(hi<<16);
             }
-            if(gr1<q_len&&r1<q_tile_len&&c0<head_dim){
+            if(gr1<q_len_eff&&r1<q_tile_len&&c0<head_dim){
                 unsigned int lo=(unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][2]*il1));
                 unsigned int hi=(unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][3]*il1));
                 *(unsigned int*)&ob[gr1*q_seq_stride+c0]=lo|(hi<<16);
@@ -567,12 +621,16 @@ extern "C" __global__ void KERNEL_NAME(
 //   m/l: [64][2]   =  0.5 KB
 // ============================================================================
 
-// Under SCALE/gfx1151 the BR64=64 large-chunk prefill kernels are
-// COMPILE-ONLY (force_br32_prefill routes all dispatch to the BR=32
-// kernel — see HARDWARE.toml / paged_attn.rs). BR64=32 here only needs
-// to make them fit RDNA3.5's 64 KB LDS so the binary builds; they are
-// never launched on AMD, so the host grid (still BR64=64) is irrelevant.
-// NVIDIA keeps BR64=64 verbatim.
+// Under SCALE/gfx1151 the _64 large-chunk prefill kernels ARE still
+// dispatched (paged_attn.rs picks them on chunk length alone); clamping
+// BR64 to 32 is what makes them fit RDNA3.5's 64 KB LDS. The host grid
+// is clamped to match by cfg!(atlas_scale) in ops/prefill_attn_main_a.rs
+// and ops/prefill_attn_main_b.rs — the two MUST agree, or CTAs are spaced
+// 64 rows apart while each writes 32 and half of every band is left
+// unwritten. NVIDIA keeps BR64=64 verbatim.
+// (An earlier comment here claimed a `force_br32_prefill` HARDWARE.toml
+// key routed dispatch away from these kernels. No such routing ever
+// existed at this tip; the key had no reader and has been removed.)
 #if defined(__SCALE__)
 #define BR64 32
 #else
@@ -591,6 +649,8 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 #ifdef PREFILL_BATCHED
     const int* const* __restrict__ block_table_ptrs,
     const unsigned int batch_size,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ kv_lens,
 #else
     const int* __restrict__ block_table,
 #endif
@@ -611,6 +671,20 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const unsigned int b = blockIdx.z;
     if (b >= batch_size) return;
     const int* const __restrict__ block_table = block_table_ptrs[b];
+    // Per-stream geometry — see the BR=32 variant for the layout contract.
+    unsigned int q_base_b = 0;
+    unsigned int q_len_eff = q_len;
+    if (cu_seqlens != nullptr) {
+        q_base_b = (unsigned int)cu_seqlens[b];
+        q_len_eff = (unsigned int)(cu_seqlens[b + 1] - cu_seqlens[b]);
+    } else {
+        q_base_b = b * q_len;
+    }
+    if (kv_lens != nullptr) {
+        kv_len = (unsigned int)kv_lens[b];
+    }
+#else
+    const unsigned int q_len_eff = q_len;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -618,13 +692,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
     if (q_head >= num_q_heads) return;
     const unsigned int q_start = q_block * BR64;
-    if (q_start >= q_len) return;
-    const unsigned int q_tile_end = min(q_start + BR64, q_len);
+    if (q_start >= q_len_eff) return;
+    const unsigned int q_tile_end = min(q_start + BR64, q_len_eff);
     const unsigned int q_tile_len = q_tile_end - q_start;
     const unsigned int q_seq_stride = num_q_heads * head_dim;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 #ifdef PREFILL_BATCHED
-    const unsigned long long q_batch_off = (unsigned long long)b * q_len * q_seq_stride;
+    const unsigned long long q_batch_off = (unsigned long long)q_base_b * q_seq_stride;
 #endif
 
     __shared__ __nv_bfloat16 smem_Q64[BR64][HDIM_PAD];
@@ -672,13 +746,37 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
     { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
       num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    // Sliding-window lower bound. The mask below drops any key with
+    // (q_abs - k) >= sliding_window, so every KV block strictly below the
+    // first in-window key is fully masked — start there instead of scoring
+    // and discarding. Uses q_rope_pos (the same absolute position the mask
+    // uses) so the DFlash Q_ROPE_POS_OVERRIDE variant stays correct.
+    unsigned int kv_block_lo = 0;
+    if (causal_mask_enabled && sliding_window > 0) {
+        unsigned int q_abs_lo = q_rope_pos + q_start;
+        if (q_abs_lo + 1 > sliding_window) {
+            kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
+        }
+    }
+    // Never skip past the end: the epilogue must still write O. If every key
+    // were out of window the row sum stays 0 and the store emits zeros, which
+    // is the correct result; an early return would leave O stale instead.
+    if (kv_block_lo >= num_kv_blocks && num_kv_blocks > 0) {
+        kv_block_lo = num_kv_blocks - 1;
+    }
 
     // === Merged Q(64 rows) + K[0](32 rows) load ===
     {
         const unsigned int cpr = HDIM / 8;
         for (unsigned int idx = tid; idx < TILE_CHUNKS_Q64; idx += 256) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
-            if (q_start + row < q_len) {
+            // q_len_eff, NOT q_len: under VARLEN `q_len` is the batch MAXIMUM,
+            // so bounding by it makes a short stream cp.async-load the NEXT
+            // stream's rows -- and for the LAST stream, read past the end of
+            // the packed Q buffer. The BR=32 variant above was converted; this
+            // one was missed. Stores are masked by q_tile_len so the numerics
+            // survived, but the OOB read is real.
+            if (q_start + row < q_len_eff) {
 #ifdef PREFILL_BATCHED
                 const void* gm = (const void*)&Q[q_batch_off + (q_start+row)*q_seq_stride + q_head*head_dim + col];
 #else
@@ -688,18 +786,18 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             } else { *((uint4*)&smem_Q64[row][col]) = make_uint4(0,0,0,0); }
         }
         if (num_kv_blocks > 0) {
-            LOAD_KV_TILE(K_cache, block_table, smem_K64[0], 0, kv_len, kv_head, tid, blockDim.x);
+            LOAD_KV_TILE(K_cache, block_table, smem_K64[0], kv_block_lo * BC, kv_len, kv_head, tid, blockDim.x);
         }
         atlas_cp_commit();
         atlas_cp_wait();
     }
     __syncthreads();
 
-    for (unsigned int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+    for (unsigned int kv_block = kv_block_lo; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
-        unsigned int buf = kv_block & 1;
+        unsigned int buf = (kv_block - kv_block_lo) & 1;
 
         // === Warp-specialized: QK^T (warps 0-3) || V load (warps 4-7) ===
         // Warps 4-7 load V tile with 128 threads while warps 0-3 compute QK^T.
@@ -720,8 +818,6 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             #pragma unroll
             for (unsigned int ks = 0; ks < (HDIM/16); ks++) {
                 unsigned int kb = ks*16;
-                unsigned int ar0=qk_warp_m+group_id, ar1=ar0+8;
-                unsigned int ac0=kb+tid_in_group*2, ac1=ac0+8;
                 unsigned int a0,a1,a2,a3;
 #ifdef ATLAS_ATTN_LDMATRIX
                 // SM121 ldmatrix.x4 NON-trans for the Q A-fragment (v47-proven on
@@ -731,8 +827,9 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 { unsigned int qb=__cvta_generic_to_shared(&sQ[(qk_warp_m+(lane_id&15))*HDIM_PAD+(lane_id>>4)*8+kb]);
                   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];"
                     :"=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3):"r"(qb)); }
-                (void)ar0;(void)ar1;(void)ac0;(void)ac1;
 #else
+                unsigned int ar0=qk_warp_m+group_id, ar1=ar0+8;
+                unsigned int ac0=kb+tid_in_group*2, ac1=ac0+8;
                 a0=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac0];
                 a1=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac0];
                 a2=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac1];
@@ -876,16 +973,15 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             #pragma unroll
             for(unsigned int ks=0;ks<2;ks++){
                 unsigned int ko=ks*16;
-                unsigned int ar0=pv_warp_m+group_id, ar1=ar0+8;
-                unsigned int ac0=ko+tid_in_group*2, ac1=ac0+8;
                 unsigned int a0,a1,a2,a3;
 #ifdef ATLAS_ATTN_LDMATRIX
                 // ldmatrix.x4 for the P (softmax-prob) A-fragment — same lever as QK.
                 { unsigned int pb=__cvta_generic_to_shared(&sP[(pv_warp_m+(lane_id&15))*p_smem_stride64+(lane_id>>4)*8+ko]);
                   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];"
                     :"=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3):"r"(pb)); }
-                (void)ar0;(void)ar1;(void)ac0;(void)ac1;
 #else
+                unsigned int ar0=pv_warp_m+group_id, ar1=ar0+8;
+                unsigned int ac0=ko+tid_in_group*2, ac1=ac0+8;
                 a0=*(const unsigned int*)&sP[ar0*p_smem_stride64+ac0];
                 a1=*(const unsigned int*)&sP[ar1*p_smem_stride64+ac0];
                 a2=*(const unsigned int*)&sP[ar0*p_smem_stride64+ac1];

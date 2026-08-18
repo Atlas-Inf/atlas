@@ -75,24 +75,9 @@ pub enum KvCacheDtype {
 
 impl std::fmt::Display for KvCacheDtype {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KvCacheDtype::Bf16 => write!(f, "bf16"),
-            KvCacheDtype::Fp8 => write!(f, "fp8"),
-            KvCacheDtype::Nvfp4 => write!(f, "nvfp4"),
-            KvCacheDtype::Turbo4 => write!(f, "turbo4"),
-            KvCacheDtype::Turbo3 => write!(f, "turbo3"),
-            KvCacheDtype::Turbo2 => write!(f, "turbo2"),
-            KvCacheDtype::Turbo8 => write!(f, "turbo8"),
-            KvCacheDtype::Turbo4KTurbo3V => write!(f, "turbo4k_turbo3v"),
-            KvCacheDtype::Turbo4KTurbo8V => write!(f, "turbo4k_turbo8v"),
-            KvCacheDtype::Turbo3KTurbo8V => write!(f, "turbo3k_turbo8v"),
-            KvCacheDtype::Bf16KTurbo4V => write!(f, "bf16k_turbo4v"),
-            KvCacheDtype::Bf16KTurbo3V => write!(f, "bf16k_turbo3v"),
-            KvCacheDtype::Fp8KTurbo4V => write!(f, "fp8k_turbo4v"),
-            KvCacheDtype::Fp8KTurbo3V => write!(f, "fp8k_turbo3v"),
-            KvCacheDtype::Bf16KTurbo2V => write!(f, "bf16k_turbo2v"),
-            KvCacheDtype::Fp8KTurbo2V => write!(f, "fp8k_turbo2v"),
-        }
+        // Delegates to the catalogue so the canonical spelling exists in ONE
+        // match — see `catalog::name` for why that match must stay exhaustive.
+        f.write_str(self.name())
     }
 }
 
@@ -437,9 +422,45 @@ pub struct PagedKvCache {
     /// Default: 1 on alloc, freed when decremented to 0.
     block_ref_counts: Vec<u32>,
     config: KvCacheConfig,
+    /// Per-block refcount event history (`ATLAS_KV_TRACE=1`; inert otherwise).
+    trace: block_trace::BlockTrace,
 }
 
+mod block_trace;
+mod catalog;
 mod paged_impl;
+/// Release both pools of every layer.
+///
+/// Each layer allocates its K and V pools separately, so freeing per layer is
+/// correct. The block bookkeeping (`free_blocks`, `block_ref_counts`) is host
+/// state indexing into those pools — cleared with them so a released cache
+/// cannot hand out a block into freed memory.
+impl atlas_core::scope::ModelResource<dyn crate::gpu::GpuBackend> for PagedKvCache {
+    fn label(&self) -> &'static str {
+        "kv cache"
+    }
+
+    fn release(&mut self, gpu: &dyn crate::gpu::GpuBackend) -> anyhow::Result<()> {
+        let mut first_error = None;
+        for layer in self.layers.drain(..) {
+            for ptr in [layer.k_pool, layer.v_pool] {
+                if let Err(e) = gpu.free(ptr)
+                    && first_error.is_none()
+                {
+                    first_error = Some(e);
+                }
+            }
+        }
+        self.free_blocks.clear();
+        self.block_ref_counts.clear();
+        self.num_blocks = 0;
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 

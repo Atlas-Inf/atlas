@@ -4,13 +4,11 @@
 // streaming `flat_map` closure (originally ~672 LoC at the top of the
 // `chat_stream::chat_completions_stream` body).
 //
-// Returns the SSE events produced for this single token. Callers
-// invoke `futures::stream::iter(...)` on the result to feed the
-// `flat_map` output stream.
+// Returns the neutral stream deltas produced for this single token.
+// The caller encodes them into wire SSE events at the surface seam
+// (`openai::delta_to_chunk_events`).
 
-use axum::response::sse::Event;
-
-use crate::openai::ChatCompletionChunk;
+use crate::ir::StreamDelta;
 use crate::tool_parser;
 
 use super::super::sanitizer::sanitize_content_chunk;
@@ -25,7 +23,7 @@ use super::tool_handlers::{
     handle_tool_call_end, handle_tool_call_start,
 };
 
-type SseVec = Vec<Result<Event, std::convert::Infallible>>;
+type DeltaVec = Vec<StreamDelta>;
 
 /// Maximum consecutive tokens the stream may spend with
 /// `state.suppressing_param_leak == true` (sanitizer holding content
@@ -67,7 +65,7 @@ pub(super) fn strip_bare_role_literal(delta: &mut String, inside_tool_call: bool
     }
 }
 
-/// Process one token. Returns the SSE events to forward to the
+/// Process one token. Returns the stream deltas to forward to the
 /// client (empty `Vec` is valid).
 ///
 /// Thin wrapper around [`handle_token_inner`] that runs the
@@ -78,7 +76,7 @@ pub(super) fn strip_bare_role_literal(delta: &mut String, inside_tool_call: bool
 /// at the end of the body would only fire when the natural fall-
 /// through is taken, leaving the doom-loop case (long suppressed
 /// stream of orphan `<tool_call>` openers) uncaught.
-pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> SseVec {
+pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
     let result = handle_token_inner(state, ctx, tok);
 
     // Orphan-suppression streak watchdog. The sanitizer flips
@@ -96,6 +94,23 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
             );
             state.loop_watchdog_triggered = true;
             state.stop_string_triggered = true;
+            // ★ Name the guard so the wire reason comes out "length".
+            // Without this the scheduler sees a bare `cancel_flag` with
+            // budget left, falls to its early-finalize rule and reports
+            // "stop" — telling the client the model finished, when in
+            // fact we truncated it mid-doom-loop.
+            //
+            // This was the THIRD such path. The scheduler guards and the
+            // simhash/token-loop watchdogs were fixed first; this one
+            // survived both and cost the agentic gate runs 0 and 7 on
+            // three consecutive shas, because the harness's
+            // `was_cut_off()` only nudges on "length".
+            //
+            // ★ Note the harness's OTHER recovery route cannot cover it:
+            // `emitted_unparsed_call` scans the text for `<tool_call>` /
+            // `<function=`, and the sanitizer has already suppressed
+            // exactly those bytes — which is why this streak fired at all.
+            state.guard_stop = Some("suppress_streak");
             state
                 .cancel_flag
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -107,8 +122,8 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
     result
 }
 
-fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> SseVec {
-    let mut sse_events: SseVec = Vec::new();
+fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
+    let mut deltas: DeltaVec = Vec::new();
     state.all_toks.push(tok);
     // One push per call == one sampled token == one increment of
     // `usage.completion_tokens`. Drained onto the next client-visible
@@ -142,14 +157,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
                     // are legitimate `\n   ` indents that the model emitted;
                     // dropping them would lose chars permanently.
                     if !residual.is_empty() {
-                        let chunk = ChatCompletionChunk::reasoning_chunk(
-                            &ctx.model,
-                            &ctx.id,
-                            residual.to_string(),
-                        )
-                        .with_token_ids(state.take_ids_if(ctx.req_return_token_ids));
-                        let json = serde_json::to_string(&chunk).unwrap_or_default();
-                        sse_events.push(Ok(Event::default().data(json)));
+                        deltas.push(StreamDelta::Reasoning {
+                            text: residual.to_string(),
+                            token_ids: state.take_ids_if(ctx.req_return_token_ids),
+                        });
                     }
                 }
             }
@@ -163,9 +174,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
                 // Whitespace-only tail can be a real trailing `\n   ` indent
                 // — emit anything non-empty so byte boundaries align.
                 if !tail.is_empty() {
-                    let chunk = ChatCompletionChunk::reasoning_chunk(&ctx.model, &ctx.id, tail);
-                    let json = serde_json::to_string(&chunk).unwrap_or_default();
-                    sse_events.push(Ok(axum::response::sse::Event::default().data(json)));
+                    deltas.push(StreamDelta::Reasoning {
+                        text: tail,
+                        token_ids: Vec::new(),
+                    });
                 }
             }
             // Reset tool detector to clear any thinking-era tag fragments.
@@ -177,7 +189,7 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
             state.content_decoded.clear();
             state.detok_prefix_offset = 0;
             state.detok_read_offset = 0;
-            return sse_events;
+            return deltas;
         }
         // Still in thinking — accumulate but don't emit as content
         if ctx.enable_thinking {
@@ -189,7 +201,7 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
             // guard catches the in-flight token race so the next
             // opener never reaches the client.
             if state.reasoning_xml_leak_detected {
-                return sse_events;
+                return deltas;
             }
             // Open thinking: emit as reasoning_content. Incrementally extend
             // the stable decoded text instead of re-decoding all_toks (O(n²)).
@@ -279,14 +291,11 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
                     let opener = ["<tool_call>", "<function=", "<parameter=", "<invoke "]
                         .iter()
                         .copied()
-                        .find(|m| state.reasoning_xml_scan_buf.contains(m));
-                    if let Some(op) = opener {
-                        state.reasoning_xml_leak_detected = true;
-                        state.tool_loop_capped = true;
-                        state.stop_string_triggered = true;
-                        state
-                            .cancel_flag
-                            .store(true, std::sync::atomic::Ordering::Release);
+                        .filter_map(|m| state.reasoning_xml_scan_buf.find(m).map(|at| (at, m)))
+                        .min_by_key(|&(at, _)| at);
+                    if let Some((at, op)) = opener {
+                        // Snapshot the log tail BEFORE consuming the match,
+                        // so the WARN still shows the opener in context.
                         let tail_start = state
                             .reasoning_xml_scan_buf
                             .char_indices()
@@ -294,15 +303,56 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
                             .nth(63)
                             .map(|(i, _)| i)
                             .unwrap_or(0);
-                        let tail = &state.reasoning_xml_scan_buf[tail_start..];
+                        let tail = state.reasoning_xml_scan_buf[tail_start..].to_string();
+                        // Consume the buffer through this opener so ONE
+                        // occurrence is counted once, not on every
+                        // subsequent delta the rolling tail still contains
+                        // it in.
+                        state.reasoning_xml_scan_buf.drain(..at + op.len());
+                        state.reasoning_xml_opener_hits =
+                            state.reasoning_xml_opener_hits.saturating_add(1);
+                        let threshold = ctx.state.chat.in_think_leak_openers;
+                        if threshold != 0 && state.reasoning_xml_opener_hits >= threshold {
+                            state.reasoning_xml_leak_detected = true;
+                            // Name the cut for the --dump body / Done event;
+                            // `tool_loop_capped` wires finish_reason
+                            // "length" (the shipped doom-loop contract).
+                            state.guard_stop = Some("in_think_tool_leak");
+                            state.tool_loop_capped = true;
+                            state.stop_string_triggered = true;
+                            state
+                                .cancel_flag
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            tracing::warn!(
+                                model = %ctx.model,
+                                request_id = %ctx.id,
+                                opener = op,
+                                hits = state.reasoning_xml_opener_hits,
+                                threshold,
+                                tail = %tail,
+                                "in-think tool-call leak: opener threshold reached; cancelling \
+                                 sequence (finish_reason \"length\", guard in_think_tool_leak). \
+                                 Raise/disable via ATLAS_INTHINK_TOOL_LEAK_OPENERS (0 = strip-only)"
+                            );
+                            return deltas;
+                        }
+                        // Below threshold: keep streaming. A model whose
+                        // native tool syntax surfaces in legitimate
+                        // reasoning (qwen3_coder family) lands here instead
+                        // of losing the whole turn. Same-delta openers were
+                        // stripped by the cleanups above; an opener SPLIT
+                        // across deltas may have partially reached the
+                        // client's reasoning channel — cosmetic, and true
+                        // of the pre-knob code's one free delta too.
                         tracing::warn!(
                             model = %ctx.model,
                             request_id = %ctx.id,
                             opener = op,
-                            tail = %tail,
-                            "in-think tool-call leak detected; cancelling sequence (finish_reason will be \"length\")"
+                            hits = state.reasoning_xml_opener_hits,
+                            threshold,
+                            "in-think tool-call opener observed in reasoning; below \
+                             ATLAS_INTHINK_TOOL_LEAK_OPENERS threshold, not cancelling"
                         );
-                        return sse_events;
                     }
                 }
                 // F19: final structured sanitisation pass catches
@@ -325,14 +375,14 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
                 // non-streaming response on temp=0 seed=42 (live A/B
                 // 2026-05-25). Drop only TRULY empty chunks.
                 if !cleaned.is_empty() {
-                    let chunk = ChatCompletionChunk::reasoning_chunk(&ctx.model, &ctx.id, cleaned)
-                        .with_token_ids(state.take_ids_if(ctx.req_return_token_ids));
-                    let json = serde_json::to_string(&chunk).unwrap_or_default();
-                    sse_events.push(Ok(Event::default().data(json)));
+                    deltas.push(StreamDelta::Reasoning {
+                        text: cleaned,
+                        token_ids: state.take_ids_if(ctx.req_return_token_ids),
+                    });
                 }
             }
         }
-        return sse_events;
+        return deltas;
     }
 
     // ── Content phase: full-decode + slice (matches reasoning path) ──
@@ -373,7 +423,7 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
         state.emitted = stable_end;
         raw
     } else {
-        return sse_events;
+        return deltas;
     };
     // Retire the lazy `content_decoder` field — kept in StreamState
     // only to avoid a wider state-struct migration. The HF decoder is
@@ -382,17 +432,9 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
 
     // Strip residual think tags from content after thinking is done.
     if state.thinking_done {
-        for tag in &[
-            "</think>",
-            "</thinking>",
-            "<thinking>",
-            "</analysis>",
-            "<analysis>",
-        ] {
-            while let Some(pos) = delta.find(tag) {
-                delta = format!("{}{}", &delta[..pos], delta[pos + tag.len()..].trim_start());
-            }
-        }
+        // SSOT with the blocking path (api/chat_blocking.rs), which had no
+        // equivalent scrub and therefore leaked '</think>' into content.
+        delta = crate::api::strip::scrub_think_markers(&delta);
         // If model re-opens <think>, suppress content from <think> onward.
         if let Some(pos) = delta.find("<think>") {
             delta = delta[..pos].to_string();
@@ -402,6 +444,16 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
             state.content_decoded.clear();
             state.detok_prefix_offset = 0;
             state.detok_read_offset = 0;
+        }
+        // Orphan tool-call markup in content when NO tools are defined: the
+        // model emits a spurious `<tool_call>…` block after a normal answer and
+        // the tool detector (which would strip it) is not running. Cut content
+        // at the opener — SSOT with the blocking path's strip_orphan_tool_markup.
+        // When tools ARE active the detector owns tool markup, so leave it.
+        let tools_active_request =
+            !ctx.tool_defs_for_backfill.is_empty() || state.detector.is_some();
+        if !tools_active_request {
+            delta = crate::api::strip::strip_orphan_tool_markup(&delta);
         }
     }
 
@@ -418,7 +470,7 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
     }
 
     if delta.is_empty() {
-        return sse_events;
+        return deltas;
     }
 
     // Multi-token stop sequences via string matching, with a vLLM-style
@@ -435,22 +487,51 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
             &mut state.stop_string_emitted_len,
             &mut state.stop_string_triggered,
         );
+        // Entry was gated on `!triggered`, so a flip here is a GENUINE
+        // client stop-sequence match (the watchdog paths set the flag
+        // elsewhere): record it for the wire finish_reason ("stop", per
+        // OpenAI) and cancel generation.
+        if state.stop_string_triggered {
+            state.note_stop_string_match();
+        }
         if delta.is_empty() {
             // Either everything is sitting in the hold-back window
             // (waiting for the next chunk / stream close) or a match
             // already truncated the emittable bytes to nothing.
-            return sse_events;
+            return deltas;
         }
     }
 
     if state.stop_string_triggered {
+        // The tool guards (F11 within-response dedup, hard-validation
+        // reject, loop cap) reuse `stop_string_triggered` as a generic
+        // "end this response" flag. But the scheduler keeps generating for
+        // a few tokens after the flag is set (cancel latency), and on a
+        // tool-call *runaway* those tokens are raw markup —
+        // `<tool_call><function=…><parameter=…>…</tool_call></_call>` —
+        // re-emitted here. A raw passthrough (the old behaviour) leaked
+        // that markup into `content` because this branch returns BEFORE the
+        // detector/sanitizer fork below. Route the delta through the
+        // buffered `sanitize_content_chunk` so multi-token markers that
+        // straddle deltas (`</_call>` = `</` `_` `call` `>`) are reassembled
+        // and scrubbed. For a genuine stop string, legitimate trailing
+        // content is untouched — the sanitizer only removes tool markup.
         if !delta.is_empty() {
-            let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, delta)
-                .with_token_ids(state.take_ids_if(ctx.req_return_token_ids));
-            let json = serde_json::to_string(&chunk).unwrap_or_default();
-            sse_events.push(Ok(Event::default().data(json)));
+            let cleaned = sanitize_content_chunk(
+                &delta,
+                &mut state.tag_scan_buf,
+                &mut state.suppressing_param_leak,
+                &mut state.inside_envelope,
+                &ctx.leak_markers,
+            );
+            if !cleaned.is_empty() {
+                deltas.push(StreamDelta::Content {
+                    text: cleaned,
+                    token_ids: state.take_ids_if(ctx.req_return_token_ids),
+                });
+            }
         }
-        return sse_events;
+        return deltas;
     }
 
     // Fork: detector-active vs pure-content path.
@@ -466,25 +547,25 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
             match output {
                 tool_parser::DetectorOutput::Content(text) => {
                     if let Some(events_out) = detector_content_arm(state, ctx, &text) {
-                        sse_events.extend(events_out);
-                        return sse_events;
+                        deltas.extend(events_out);
+                        return deltas;
                     }
                 }
                 tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
-                    handle_complete_tool_call(state, ctx, &mut tc, tc_idx, &mut sse_events);
+                    handle_complete_tool_call(state, ctx, &mut tc, tc_idx, &mut deltas);
                 }
                 tool_parser::DetectorOutput::ToolCallStart {
                     id: tc_id,
                     name,
                     idx,
                 } => {
-                    handle_tool_call_start(state, ctx, tc_id, name, idx, &mut sse_events);
+                    handle_tool_call_start(state, ctx, tc_id, name, idx, &mut deltas);
                 }
                 tool_parser::DetectorOutput::ToolCallDelta { args, idx } => {
-                    handle_tool_call_delta(state, ctx, args, idx, &mut sse_events);
+                    handle_tool_call_delta(state, ctx, args, idx, &mut deltas);
                 }
                 tool_parser::DetectorOutput::ToolCallArgsFragment { fragment, idx } => {
-                    handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut sse_events);
+                    handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
                 }
                 tool_parser::DetectorOutput::ToolCallEnd { idx } => {
                     handle_tool_call_end(state, ctx, idx);
@@ -500,20 +581,20 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
             &ctx.leak_markers,
         );
         if let Some(events_out) = process_detector_content(state, ctx, &sanitized) {
-            sse_events.extend(events_out);
-            return sse_events;
+            deltas.extend(events_out);
+            return deltas;
         }
         // process_detector_content does NOT pre-sanitize when called
         // from the no-detector branch — but the sanitizer was already
         // run above, so the helper's branch handling matches.
     }
 
-    sse_events
+    deltas
 }
 
 /// Common processing for a sanitized content chunk: SimHash semantic
 /// guard, token-level loop watchdog, salvage on trip, otherwise
-/// emit a `content_chunk`. Returns `Some(events)` when the watchdog
+/// emit a `Content` delta. Returns `Some(deltas)` when the watchdog
 /// fired (caller must short-circuit), else `None` (caller continues).
 ///
 /// Note: when called from the detector-active branch, `sanitized`
@@ -524,7 +605,7 @@ fn process_detector_content(
     state: &mut StreamState,
     ctx: &StreamCtx,
     sanitized_or_raw: &str,
-) -> Option<SseVec> {
+) -> Option<DeltaVec> {
     // From the detector-active branch the input is the Content(text)
     // payload that still needs sanitization. From the no-detector
     // branch the input is already sanitized. Distinguish via a thin
@@ -573,6 +654,11 @@ fn process_detector_content(
         }
         state.loop_watchdog_triggered = true;
         state.stop_string_triggered = true;
+        state.guard_stop = Some(if semantic_trip {
+            "simhash_semantic_loop"
+        } else {
+            "token_loop_watchdog"
+        });
         state
             .cancel_flag
             .store(true, std::sync::atomic::Ordering::Release);
@@ -580,25 +666,25 @@ fn process_detector_content(
         // Watchdog fired: short-circuit the stream with no further
         // content. The model emitted a degenerate loop; we end the
         // response here rather than salvaging a synthetic tool call.
-        return Some(SseVec::new());
+        return Some(DeltaVec::new());
     }
 
     if !sanitized.is_empty() {
         if state.refusal_scan_buf.len() < 16_384 {
             state.refusal_scan_buf.push_str(sanitized);
         }
-        let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, sanitized.to_string())
-            .with_token_ids(state.take_ids_if(ctx.req_return_token_ids));
-        let json = serde_json::to_string(&chunk).unwrap_or_default();
-        let events: SseVec = vec![Ok(Event::default().data(json))];
-        return Some(events);
+        let out: DeltaVec = vec![StreamDelta::Content {
+            text: sanitized.to_string(),
+            token_ids: state.take_ids_if(ctx.req_return_token_ids),
+        }];
+        return Some(out);
     }
     None
 }
 
 /// Detector-active branch's `Content(text)` arm: sanitize first,
 /// then run the shared semantic/token watchdog + emit pipeline.
-fn detector_content_arm(state: &mut StreamState, ctx: &StreamCtx, text: &str) -> Option<SseVec> {
+fn detector_content_arm(state: &mut StreamState, ctx: &StreamCtx, text: &str) -> Option<DeltaVec> {
     let sanitized = sanitize_content_chunk(
         text,
         &mut state.tag_scan_buf,
@@ -936,6 +1022,45 @@ mod role_literal_strip_tests {
             strip_bare_role_literal(&mut d, true);
             assert_eq!(d, lit, "fragment {lit:?} must survive inside a tool call");
         }
+    }
+
+    #[test]
+    fn dsml_split_opener_preserves_tool_fragment_and_streams_call() {
+        let mut det = StreamingToolDetector::new();
+        let chunks = [
+            "\n\n",
+            "<｜DSM",
+            "L",
+            "｜",
+            "tool",
+            "_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+            "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+        ];
+        let mut outputs = Vec::new();
+        for chunk in chunks {
+            let mut delta = chunk.to_string();
+            strip_bare_role_literal(&mut delta, det.inside_tool_call());
+            if !delta.is_empty() {
+                outputs.extend(det.process(&delta));
+            }
+        }
+        outputs.extend(det.flush());
+
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        for output in outputs {
+            match output {
+                DetectorOutput::Content(text) => content.push_str(&text),
+                DetectorOutput::ToolCall(call, index) => calls.push((index, call)),
+                _ => {}
+            }
+        }
+        assert!(content.is_empty(), "DSML envelope leaked: {content:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 0);
+        assert_eq!(calls[0].1.function.name, "get_weather");
+        assert_eq!(calls[0].1.function.arguments, r#"{"city":"Paris"}"#);
     }
 
     /// Ordinary content (not a bare role literal) is never touched, in or out

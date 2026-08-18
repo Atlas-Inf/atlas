@@ -14,7 +14,10 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 mod transformer_layer;
-pub use transformer_layer::TransformerLayer;
+pub use transformer_layer::{
+    TransformerLayer, VERIFY_WY_LAYER_STRIDE_BYTES, VERIFY_WY_TABLE_SEQS,
+    VERIFY_WY_TABLE_STRIDE_BYTES, VERIFY_WY_TABLES_PER_LAYER,
+};
 
 /// Per-layer persistent state tracked across decode steps.
 ///
@@ -57,6 +60,35 @@ pub struct SsmLayerState {
     pub h_state_intermediates: Vec<DevicePtr>,
     /// Intermediate conv_state snapshots during batched verification.
     pub conv_state_intermediates: Vec<DevicePtr>,
+    /// Storage dtype of `h_state`: `false` = FP32, `true` = FP16
+    /// (`--ssm-h-dtype f16`).
+    ///
+    /// This is the single source of truth for the h-state format. Which edge
+    /// sets it depends on the POOL width:
+    ///
+    /// * FP32-sized pool (stage 1/2, `h_prefill_stage == None`): prefill is
+    ///   the only FP32 writer and writes the slot in place, so the flag
+    ///   starts `false` and the decode mixer
+    ///   (`TransformerModel::ssm_h_to_f16_dispatch`) flips it exactly once
+    ///   per sequence, on the first decode step. No caller has to know where
+    ///   the prefill->decode edge is.
+    /// * f16-SIZED pool (stage 3, `h_prefill_stage == Some`): the slot is
+    ///   physically 2 bytes/element and can NEVER hold FP32, so the flag is
+    ///   `true` from allocation onwards and the decode mixer is a no-op.
+    ///   Prefill's FP32 kernels run over [`Self::h_prefill_stage`] instead.
+    ///
+    /// It rides through swap-out/swap-in because `state_io` mutates these
+    /// states in place rather than rebuilding them.
+    pub h_is_f16: bool,
+    /// Stage-3 f16-SIZED pool ONLY (`--ssm-h-dtype f16-pool`): the FP32
+    /// staging blob for THIS sequence's slot, which the GDN prefill widens
+    /// `h_state` into before its FP32 kernels run and narrows back after.
+    ///
+    /// `None` — every configuration before stage 3 — means "the slot IS
+    /// FP32-wide": prefill writes `h_state` in place exactly as it always
+    /// has, and not one byte moves. The same blob is shared by every layer
+    /// of the sequence (see `SsmStatePool::h_prefill_stage`).
+    pub h_prefill_stage: Option<DevicePtr>,
 }
 
 impl LayerState for SsmLayerState {
@@ -102,6 +134,28 @@ pub struct AttnMetadataDev {
     pub max_blocks_per_seq: u32,
     /// Number of sequences in this batch (1 for single-sequence decode).
     pub num_seqs: u32,
+    /// M2 per-request LoRA routing: `[num_seqs]` i32 at this device address,
+    /// one adapter SLOT index per row (`< 0` = base / no delta; pad rows are
+    /// `-1`). Uploaded each decode step to a stable address (like positions /
+    /// block_table), so the batched bgmv stays inside the captured decode
+    /// graph. `DevicePtr(0)` on every non-routed path (single-seq decode,
+    /// prefill, verify, MLA, MTP) — the bgmv apply sites no-op when it is null.
+    pub seq_slot: DevicePtr,
+    /// SOLID Incr-4 (batched decode MoE fold): `[num_seqs]` i32 per-row adapter
+    /// map for the MoE expert gather-BGMV fold, at this device address. MoE
+    /// semantics (distinct from `seq_slot`): `< 0` = base / no fold (device
+    /// kernel skips the row); `>= 0` = fold the installed active adapter's
+    /// per-expert delta on that row. Built by
+    /// [`crate::lora::build_moe_row_adapter_decode`] and uploaded each decode
+    /// step to a stable address (a dedicated fixed-address buffer,
+    /// `TransformerModel::moe_row_adapter_buf`, alloc'd once at init), so the
+    /// batched fold stays inside the captured decode graph and is route-agnostic across
+    /// replays (base rows no-op individually). `DevicePtr(0)` when no adapter is
+    /// resident and on every non-batched path (the fold hooks then fall back to
+    /// the request-granularity `moe_route_gate`). NOT the `seq_slot` buffer —
+    /// that resolves `-1 → active` (attention defer-to-active), which would fold
+    /// the adapter onto base rows here.
+    pub moe_row_adapter: DevicePtr,
 }
 
 /// Q12 batched-prefill device-side metadata.
@@ -158,6 +212,15 @@ pub struct BatchedAttnMetadata {
     /// dereferences the indptr on the CPU, and per-request slice offsets are
     /// computed host-side. Empty in the legacy path.
     pub cu_seqlens_host: Vec<i32>,
+    /// VARLEN geometry: per-stream KV length `[batch_size]` i32 on device,
+    /// `kv_lens[b] = chunk_start + per-stream token count`. The batched paged
+    /// attention kernels need this per stream: a single scalar at the MAX
+    /// makes short streams index their block_table past the blocks they
+    /// actually own, and applies the wrong causal bound. `DevicePtr::NULL` in
+    /// the legacy same-length path (kernels fall back to the scalar `kv_len`).
+    pub kv_lens: DevicePtr,
+    /// Host copy of `kv_lens`. Empty in the legacy path.
+    pub kv_lens_host: Vec<i32>,
     /// Maximum block_table length across the batch (kernel uses for
     /// bounds checking; per-stream block_table reads via the pointer
     /// array dereference).
@@ -207,6 +270,23 @@ pub struct ForwardContext<'a> {
     pub gpu: &'a dyn GpuBackend,
     /// Model configuration (dimensions, hyperparameters).
     pub config: &'a ModelConfig,
+    /// Which GEMM implementation each projection takes. Carried rather than
+    /// read from a static so it cannot outlive the model whose flags it
+    /// encodes — see `layers::ops::GemmDispatch`.
+    pub dispatch: &'a crate::layers::ops::GemmDispatch,
+    /// Re-encoded copies of this model's weights, memoized for this model's
+    /// lifetime. Carried rather than kept in a static keyed by device pointer,
+    /// where a recycled address would HIT after a model swap.
+    pub derived: &'a crate::layers::ops::DerivedWeights,
+    /// Kernel-path levers for this model — the SSM/GDN variant, FFN routing,
+    /// MoE quantization, LoRA mode, diagnostics. The non-GEMM half of the
+    /// lever set; `dispatch` is the GEMM half.
+    pub levers: &'a crate::layers::ops::ModelLevers,
+    /// This model's diagnostic counters and one-shot dump latches. Carried
+    /// for the same reason as `levers`: a counter that spans a model swap
+    /// averages two models and describes neither, and a one-shot latch that
+    /// already fired swallows the next model's dump.
+    pub stats: &'a crate::layers::ops::ModelStats,
     /// Pre-uploaded attention metadata (None if no attention layers).
     pub attn_metadata: Option<AttnMetadataDev>,
     /// Profile mode: sync+time per-operation within layers.
@@ -238,6 +318,95 @@ pub struct ForwardContext<'a> {
     /// for models without hash routing. Must be a STABLE address across the
     /// layer loop (and, under CUDA-graph decode, uploaded before each replay).
     pub token_ids: Option<DevicePtr>,
+    /// #30 (routed-prefill precision): the REQUEST slot's per-layer LoRA pairs,
+    /// GLOBAL-layer-indexed (`len == num_hidden_layers`), set ONLY at the prefill
+    /// entries and ONLY when the request routes to a NON-active slot. `Some` makes
+    /// the K/V/O prefill apply sites select the request slot's pair and fold it
+    /// through the SAME dense `apply_lora_delta` (dense_gemm_tc) the ACTIVE adapter
+    /// uses — numerically identical to serving that adapter active, instead of the
+    /// per-row bgmv (whose fp accumulation order tips razor-margin tokens). `None`
+    /// (active/base request, no LoRA, and every decode/verify/mtp/moe pass) leaves
+    /// the installed-active-pair path byte-identical. Prefill runs eager
+    /// (`graph_capture: false`) so this per-pass CPU borrow is safe.
+    pub routed_lora_layers: Option<&'a [Option<crate::lora::LoraLayerWeights>]>,
+    /// Default-ON mid-chunk SSM tail capture (opt-out `ATLAS_SSM_TAIL_MIDCHUNK=0`).
+    ///
+    /// `Some` only on the single prefill pass whose local token range spans
+    /// the block-floored matched-prefix boundary `tb`. GDN/SSM layers then
+    /// split their recurrent (h_state) and conv (conv_state) kernels at
+    /// `cap_local` and copy the @tb state into the reserved snapshot slot.
+    /// `None` (default) => no split, byte-identical to prior behavior.
+    pub midchunk_capture: Option<MidchunkCapture<'a>>,
+    /// Feature-1 MoE-LoRA per-request fold decision for this forward pass,
+    /// resolved by `TransformerModel::moe_lora_route` from the owning request's
+    /// `adapter_slot`. Governs the prefill router/expert fold hooks
+    /// (`layers/moe/lora.rs`). Ignored when no MoE adapter is installed
+    /// (`self.lora == None` short-circuits first — byte-identical off). Default
+    /// `Fold` keeps legacy single-request call sites unchanged.
+    pub moe_lora_route: MoeLoraRoute,
+}
+
+/// Per-pass descriptor for mid-chunk SSM tail capture. Points at the reserved
+/// Marconi snapshot slot's per-SSM-layer destination buffers (already offset to
+/// the slot) plus the split point in local (chunk) token coordinates.
+///
+/// `ssm_layer_counter` is a fresh per-pass counter: each SSM layer's prefill
+/// increments it once, in model order, so the value indexes `h_dsts`/`conv_dsts`
+/// (which are in the same SSM-layer order as the snapshot pool).
+pub struct MidchunkCapture<'a> {
+    /// Split point in local token coordinates: capture state AFTER this many
+    /// tokens (== `tb - proc_start`).
+    pub cap_local: usize,
+    /// Per-SSM-layer h_state snapshot destination (offset to the reserved slot).
+    pub h_dsts: &'a [DevicePtr],
+    /// Per-SSM-layer conv_state snapshot destination (offset to the reserved slot).
+    pub conv_dsts: &'a [DevicePtr],
+    /// Bytes per layer of h_state.
+    pub h_bytes: usize,
+    /// Bytes per layer of conv_state.
+    pub conv_bytes: usize,
+    /// Fresh per-pass SSM-layer ordinal counter (model order == pool order).
+    pub ssm_layer_counter: &'a std::sync::atomic::AtomicUsize,
+    /// Optional SECOND capture one KV block earlier, at `tb - block_size`
+    /// (local split point `cap_local - block_size`). `Some` only when the pass
+    /// also covers that point. On ~5/19 warm turns the next turn's block-floored
+    /// `matched_tokens` lands exactly `tb - block_size` (generation-suffix /
+    /// retokenize divergence), one block short of the tail; registering this
+    /// earlier restore point makes those turns zero-replay too.
+    pub cap_local_early: Option<usize>,
+    /// Per-SSM-layer h_state dst for the `tb - block_size` slot (offset applied).
+    pub h_dsts_early: &'a [DevicePtr],
+    /// Per-SSM-layer conv_state dst for the `tb - block_size` slot.
+    pub conv_dsts_early: &'a [DevicePtr],
+}
+
+/// Feature-1 MoE-LoRA fold decision for a single forward pass.
+///
+/// The MoE router/expert delta is a SINGLE globally-installed adapter (phase 1):
+/// this gate makes the prefill fold per-request without a device kernel, exactly
+/// mirroring the attention BGMV `seq_slot < 0` skip but at request granularity.
+/// A base request pays nothing; a packed/mixed batch refuses loudly rather than
+/// fold one adapter onto every row (the device-side per-row fold that would let
+/// a mixed batch skip base rows individually is the documented follow-up —
+/// `docs/design/lora-solid.md` Incr 1/3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MoeLoraRoute {
+    /// Single-request pass whose request owns the installed active MoE adapter:
+    /// FOLD. Genuine single-seq decode now folds the router + expert gate/up/down
+    /// deltas at this altitude (mirroring prefill); the remaining back-compat
+    /// paths (multi-seq / verify) still bail via `reject_decode_lora` before the
+    /// fold, so their `Fold` value is inert there. Also the default.
+    #[default]
+    Fold,
+    /// Single-request pass that is base (`adapter_slot < 0`, no adapter) or
+    /// routes to a different, non-installed adapter: SKIP the fold entirely.
+    /// Base tokens pay nothing (request-granularity mirror of the attention
+    /// BGMV `seq_slot < 0` early-return).
+    Skip,
+    /// Multi-request / packed / codispatch batch whose per-row adapter identity
+    /// cannot be honored without the device-side per-row fold (follow-up): the
+    /// fold REFUSES loudly rather than mis-apply one adapter to every row.
+    Refuse,
 }
 
 /// Per-pass descriptor for mid-chunk SSM tail capture. Points at the reserved

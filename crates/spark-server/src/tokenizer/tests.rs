@@ -3,7 +3,14 @@
 //! Extracted piecewise from `tokenizer.rs` (500-LoC cap).
 
 use super::*;
+
+mod deepseek_v4;
 use serde_json::json;
+
+mod laguna;
+mod mistral_effort;
+mod qwen_dense;
+mod qwen_dense_parity;
 
 fn render_minimax_openai_template(
     messages: &[serde_json::Value],
@@ -328,6 +335,91 @@ fn render_gemma4_template_with_assistant_and_null_tool_content() {
     );
 }
 
+/// DS4F reasoning-mode primer (2026-07-21): the generation prompt appends the
+/// real `<think>` primer (official DS4F thinking suffix
+/// `<｜Assistant｜><think>`) ONLY on explicit `enable_thinking == true`.
+/// Default (undefined) and `enable_thinking == false` emit NO primer —
+/// byte-identical to the verified 35/40 direct-mode baseline (which appended
+/// the blanked think tokens = empty string). Before this fix the template
+/// blanked BOTH think tokens, so `enable_thinking` was a silent no-op and the
+/// model never reasoned (§B thinking-state verdict).
+#[test]
+fn deepseek_v4_reasoning_primer_is_opt_in() {
+    let template_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../jinja-templates/deepseek_v4.jinja"
+    );
+    let raw = std::fs::read_to_string(template_path)
+        .expect("bundled deepseek_v4.jinja must be present in the repo");
+    let converted = super::jinja_helpers::convert_python_jinja_to_minijinja(&raw);
+    let env = super::jinja_helpers::build_jinja_env(&converted).expect("template compiles");
+    let tmpl = env.get_template("chat").unwrap();
+
+    let messages = vec![json!({"role": "user", "content": "2+2?"})];
+    let mv = minijinja::Value::from_serialize(&messages);
+    let render = |et: minijinja::Value| {
+        tmpl.render(minijinja::context! {
+            messages => mv.clone(),
+            tools => minijinja::Value::UNDEFINED,
+            add_generation_prompt => true,
+            enable_thinking => et,
+        })
+        .expect("deepseek_v4 template must render")
+    };
+
+    // Reasoning mode (enable_thinking==true): suffix ends <｜Assistant｜><think>
+    // (official DS4F thinking contract, encoding_dsv4.py:388).
+    let thinking = render(minijinja::Value::from(true));
+    assert!(
+        thinking.ends_with("<｜Assistant｜><think>"),
+        "reasoning mode must prime <think>: {thinking:?}"
+    );
+
+    // Direct mode (explicit false): suffix ends <｜Assistant｜></think> — the
+    // official direct contract (thinking pre-closed; model answers directly).
+    let direct = render(minijinja::Value::from(false));
+    assert!(
+        direct.ends_with("<｜Assistant｜></think>"),
+        "direct suffix must be the official <｜Assistant｜></think>: {direct:?}"
+    );
+    assert!(
+        !direct.contains("<think>"),
+        "direct mode must NOT open a <think> block: {direct:?}"
+    );
+
+    // Default (enable_thinking undefined) resolves to direct at the API edge
+    // (thinking_default=false), so the template's else-branch must also produce
+    // the official direct suffix — identical to explicit-false.
+    let default = render(minijinja::Value::UNDEFINED);
+    assert_eq!(
+        default, direct,
+        "default (unspecified) must render the official direct suffix"
+    );
+}
+
+/// The DS4F reasoning parser must be wired via `tool_defaults.toml` because
+/// `supports_thinking = has_ssm || has_mamba2` is FALSE for this pure-attention
+/// MLA model — without this entry `think_end_token` never resolves and
+/// `inside_thinking` can never engage. Guards the `[reasoning]` entry + that it
+/// maps to the `<think>`/`</think>` (DeepSeek-R1) contract.
+#[test]
+fn deepseek_v4_reasoning_parser_is_registered() {
+    use crate::reasoning_parser::ReasoningFormat;
+    let defaults_toml = include_str!("../../tool_defaults.toml");
+    let defaults: toml::Value = toml::from_str(defaults_toml).expect("tool_defaults parses");
+    let fmt_str = defaults
+        .get("reasoning")
+        .and_then(|t| t.get("deepseek_v4"))
+        .and_then(|s| s.as_str())
+        .expect("tool_defaults [reasoning] must register deepseek_v4");
+    let fmt: ReasoningFormat = fmt_str
+        .parse()
+        .expect("deepseek_v4 reasoning format parses");
+    let p = fmt.into_parser();
+    assert_eq!(p.start_tag(), "<think>", "DS4F reasoning start tag");
+    assert_eq!(p.end_tag(), "</think>", "DS4F reasoning end tag");
+}
+
 /// Byte-match guard: the `{{ tool | tojson }}` filter used by the
 /// `<tools>` block in jinja-templates/openai/qwen3_5_moe.jinja must
 /// produce EXACTLY what transformers' jinja2 `tojson` does, which is
@@ -379,18 +471,22 @@ fn tojson_filter_default_compact_hf_ref_opt_in() {
         "default tojson must be COMPACT (ST-995 GDN irrelevance fix)\ngot:\n{got_default}\n"
     );
 
-    // OPT-IN (ATLAS_USE_HF_REF_JSON_DUMPS=1): spaced, byte-parity with Python
-    // `json.dumps(..., ensure_ascii=False, sort_keys=False)` — the #90 / HF
-    // reference serialization (len 234). SAFETY: this is the only test that
-    // reads this env var; it is set and cleared within this scope.
-    unsafe {
-        std::env::set_var("ATLAS_USE_HF_REF_JSON_DUMPS", "1");
-    }
-    let env_hf = super::jinja_helpers::build_jinja_env("{{ tool | tojson }}")
-        .expect("inline template compiles");
-    unsafe {
-        std::env::remove_var("ATLAS_USE_HF_REF_JSON_DUMPS");
-    }
+    // OPT-IN (ATLAS_USE_HF_REF_JSON_DUMPS=1 in production): spaced, byte-parity
+    // with Python `json.dumps(..., ensure_ascii=False, sort_keys=False)` — the
+    // #90 / HF reference serialization (len 234).
+    //
+    // Requested EXPLICITLY, not via `set_var`. The earlier version of this test
+    // set the env var around this render and claimed in a SAFETY note that it
+    // was "the only test that reads this env var". That was false: every
+    // `build_jinja_env` call reads it, 13 of them from tests, and the harness
+    // runs tests as threads in ONE process — so this window silently flipped
+    // other tests' renders to spaced. It broke `qwen_dense_parity` under
+    // `cargo llvm-cov` while `cargo test` stayed green on the same commit.
+    let env_hf = super::jinja_helpers::build_jinja_env_with(
+        "{{ tool | tojson }}",
+        super::jinja_helpers::ToolJsonStyle::HfSpaced,
+    )
+    .expect("inline template compiles");
     let spaced = "{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": \"Execute a bash command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command to run\"}}, \"required\": [\"command\"]}}}";
     let got_hf = env_hf
         .get_template("chat")

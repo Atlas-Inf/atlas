@@ -6,13 +6,14 @@ use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
+mod ssm_layer;
+
 use super::ModelWeightLoader;
 use crate::layer::TransformerLayer;
-use crate::layers::{FfnComponent, NemotronMamba2Layer, NemotronMoeLayer, Qwen3AttentionLayer};
+use crate::layers::{FfnComponent, NemotronMoeLayer, Qwen3AttentionLayer};
 use crate::tp_shard::{TpAttentionDims, TpShardKind, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
-    DenseWeight, MtpWeights, NemotronSsmQuant, dense, dequant_fp8_to_bf16_into,
-    load_nemotron_attention, load_nemotron_moe, load_nemotron_ssm, quantize_to_nvfp4,
+    DenseWeight, MtpWeights, dense, load_nemotron_attention, load_nemotron_moe, quantize_to_nvfp4,
 };
 
 pub struct NemotronHWeightLoader;
@@ -50,12 +51,14 @@ impl ModelWeightLoader for NemotronHWeightLoader {
         // nearby allocations (BUG #29). Using a scratch buffer avoids all frees
         // during loading. Size = max(in_proj, out_proj, shared_up, shared_down) in BF16 bytes.
         let moe_input = config.moe_input_size();
+        // Puzzle: intermediate size varies per MoE layer — size scratch to max.
+        let max_moe_inter = config.max_moe_intermediate_size();
         let scratch_elems = (config.mamba2_in_proj_size() * h)
             .max(h * config.mamba2_d_inner())
             .max(config.shared_expert_intermediate_size * h)
             .max(h * config.shared_expert_intermediate_size)
-            .max(config.moe_intermediate_size * moe_input)
-            .max(moe_input * config.moe_intermediate_size);
+            .max(max_moe_inter * moe_input)
+            .max(moe_input * max_moe_inter);
         let scratch_bytes = scratch_elems * 2; // BF16 = 2 bytes
         let scratch = gpu.alloc(scratch_bytes)?;
 
@@ -65,57 +68,18 @@ impl ModelWeightLoader for NemotronHWeightLoader {
 
             match lt {
                 atlas_core::config::LayerType::LinearAttention => {
-                    // Mamba-2 SSM layer (mixed quant: NVFP4, FP8, or BF16)
-                    let (mut ssm, quant_kind) = load_nemotron_ssm(store, i, gpu, &lp)?;
-                    tracing::info!(
-                        "L{i} SSM quant={quant_kind:?} in_proj_size={} d_inner={} h={h}",
-                        config.mamba2_in_proj_size(),
-                        config.mamba2_d_inner(),
-                    );
-                    // TODO: Fix 3 — FP8 direct load causes CUDA 700 (illegal address).
-                    // The WeightStore mmap pointers may be invalidated after loading.
-                    // For now, keep the double-quant path (FP8→BF16→NVFP4).
-                    if quant_kind != NemotronSsmQuant::Nvfp4 {
-                        let p = format!("{lp}.mixer");
-                        let in_proj_dense = if quant_kind == NemotronSsmQuant::Fp8 {
-                            dequant_fp8_to_bf16_into(store, &format!("{p}.in_proj"), gpu, scratch)?
-                        } else {
-                            dense(store, &format!("{p}.in_proj.weight"))?
-                        };
-                        ssm.in_proj = quantize_to_nvfp4(
-                            &in_proj_dense,
-                            config.mamba2_in_proj_size(),
-                            h,
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                        let out_fp8 = store.contains(&format!("{p}.out_proj.weight_scale"));
-                        let out_proj_dense = if out_fp8 {
-                            dequant_fp8_to_bf16_into(store, &format!("{p}.out_proj"), gpu, scratch)?
-                        } else {
-                            dense(store, &format!("{p}.out_proj.weight"))?
-                        };
-                        ssm.out_proj = quantize_to_nvfp4(
-                            &out_proj_dense,
-                            h,
-                            config.mamba2_d_inner(),
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                    }
-                    layers.push(Box::new(NemotronMamba2Layer::new(
-                        norm, ssm, config, gpu, i,
-                    )?));
+                    let layer = Self::build_ssm_layer(
+                        gpu, store, config, i, h, &lp, norm, quantize_k, absmax_k, scratch, stream,
+                    )?;
+                    layers.push(Box::new(layer));
                 }
                 atlas_core::config::LayerType::SlidingAttention => {
                     unreachable!("unexpected SlidingAttention in this loader")
                 }
                 atlas_core::config::LayerType::Moe => {
-                    // Standalone MoE FFN layer
+                    // Standalone MoE FFN layer (uniform Super/Nano or Puzzle per-block)
+                    let moe_inter = config.moe_intermediate_size_for(i);
+                    let top_k = config.num_experts_per_tok_for(i);
                     let moe = load_nemotron_moe(
                         store,
                         i,
@@ -128,21 +92,27 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                         Some(scratch),
                         &lp,
                     )?;
-                    if i < 4 {
+                    if i < 4 || moe_inter != config.moe_intermediate_size {
                         tracing::info!(
-                            "L{i} MoE: latent={} has_fc1={} has_fc2={} shared_up_s2={:.6e} shared_down_s2={:.6e} experts[0].up_s2={:.6e}",
+                            "L{i} MoE: inter={moe_inter} top_k={top_k} latent={} has_fc1={} has_fc2={} shared_up_s2={:.6e} experts[0].up_s2={:.6e}",
                             config.moe_latent_size,
                             moe.fc1_latent_proj.is_some(),
                             moe.fc2_latent_proj.is_some(),
                             moe.shared_up.weight_scale_2,
-                            moe.shared_down.weight_scale_2,
                             moe.experts
                                 .first()
                                 .map(|e| e.up_proj.weight_scale_2)
                                 .unwrap_or(0.0),
                         );
                     }
-                    layers.push(Box::new(NemotronMoeLayer::new(moe, norm, config, gpu)?));
+                    let mut moe_layer =
+                        NemotronMoeLayer::new(moe, norm, config, gpu, moe_inter, top_k)?;
+                    // Builds the transposed shared-expert weights (2 small matrices
+                    // per layer) so prefill can use `w4a16_gemm_t` instead of the base
+                    // `w4a16_gemm`. Routed-expert transposition stays disabled inside
+                    // for LatentMoE — 512 experts x 40 layers would not fit.
+                    moe_layer.prepare_prefill_weights(gpu, config);
+                    layers.push(Box::new(moe_layer));
                 }
                 atlas_core::config::LayerType::FullAttention => {
                     // Attention layer — quantize BF16 Q/K/V/O directly from
@@ -216,6 +186,7 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                         gpu.free(o_old.weight_scale)?;
                         attn.o_proj = o_sharded;
                     }
+                    let mut bf16_o_dense: Option<DenseWeight> = None;
                     let (q_nv, k_nv, v_nv) = if is_nvfp4 {
                         (q_nvfp4, k_nvfp4, v_nvfp4)
                     } else {
@@ -279,46 +250,93 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                             }
                             o_dense.weight = op;
                         }
-                        let q = quantize_to_nvfp4(
-                            &attn.q_proj,
-                            num_heads * hd,
-                            h,
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                        let k = quantize_to_nvfp4(
-                            &attn.k_proj,
-                            kv_heads * hd,
-                            h,
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                        let v = quantize_to_nvfp4(
-                            &attn.v_proj,
-                            kv_heads * hd,
-                            h,
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                        let o = quantize_to_nvfp4(
-                            &o_dense,
-                            h,
-                            num_heads * hd,
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                        attn.o_proj = o;
-                        (Some(q), Some(k), Some(v))
+                        // Keep attention in BF16 when the checkpoint ships it that
+                        // way. ModelOpt left Q/K/V/O unquantized ON PURPOSE here:
+                        // Puzzle is Mamba-dominant with only 9 full-attention
+                        // layers, so those layers carry the long-range retrieval
+                        // and are the last place to spend precision — and at
+                        // ~1.2 GB BF16 they are cheap to keep. Crushing them
+                        // 16-bit -> 4-bit saved ~0.9 GB and degraded exactly what
+                        // they exist for. `ATLAS_NEMOTRON_BF16_ATTN=0` restores
+                        // the old quantize-everything behaviour for an A/B.
+                        let keep_bf16_attn =
+                            std::env::var("ATLAS_NEMOTRON_BF16_ATTN").as_deref() != Ok("0");
+                        if keep_bf16_attn {
+                            tracing::info!(
+                                "L{i} attention: keeping checkpoint BF16 Q/K/V/O (no NVFP4 requant)"
+                            );
+                            bf16_o_dense = Some(o_dense);
+                            (None, None, None)
+                        } else {
+                            let q = quantize_to_nvfp4(
+                                &attn.q_proj,
+                                num_heads * hd,
+                                h,
+                                gpu,
+                                absmax_k,
+                                quantize_k,
+                                stream,
+                            )?;
+                            let k = quantize_to_nvfp4(
+                                &attn.k_proj,
+                                kv_heads * hd,
+                                h,
+                                gpu,
+                                absmax_k,
+                                quantize_k,
+                                stream,
+                            )?;
+                            let v = quantize_to_nvfp4(
+                                &attn.v_proj,
+                                kv_heads * hd,
+                                h,
+                                gpu,
+                                absmax_k,
+                                quantize_k,
+                                stream,
+                            )?;
+                            let o = quantize_to_nvfp4(
+                                &o_dense,
+                                h,
+                                num_heads * hd,
+                                gpu,
+                                absmax_k,
+                                quantize_k,
+                                stream,
+                            )?;
+                            attn.o_proj = o;
+                            (Some(q), Some(k), Some(v))
+                        }
                     };
-                    layers.push(Box::new(Qwen3AttentionLayer::new_ungated(
+                    // Transposed Q/K/V/O so prefill uses `w4a16_gemm_t` (FP8 MMA,
+                    // N128/K32, cp.async) instead of the base `w4a16_gemm`. Same
+                    // gap as the SSM/MoE layers: the setter existed but was never
+                    // called for Nemotron. Q/K/V/O are small (h=4096, kv=2 heads),
+                    // so the extra copies cost ~0.3 GB.
+                    let q_dim = config.num_attention_heads * config.head_dim;
+                    let kv_dim = config.num_key_value_heads * config.head_dim;
+                    let qt = q_nv
+                        .as_ref()
+                        .and_then(|w| w.transpose_for_gemm(gpu, q_dim, h).ok());
+                    let kt = k_nv
+                        .as_ref()
+                        .and_then(|w| w.transpose_for_gemm(gpu, kv_dim, h).ok());
+                    let vt = v_nv
+                        .as_ref()
+                        .and_then(|w| w.transpose_for_gemm(gpu, kv_dim, h).ok());
+                    // Keep-BF16 attention leaves `attn.o_proj` as the NULL
+                    // placeholder (`load_nemotron_attention` returns the real
+                    // weight via `o_dense`); transposing it would launch
+                    // `transpose_u8` on a NULL pointer, and the swallowed `.ok()`
+                    // error left the CUDA context poisoned (700 at the next
+                    // module load). Only transpose a real quantized o_proj.
+                    let ot = if attn.o_proj.is_null() {
+                        None
+                    } else {
+                        attn.o_proj.transpose_for_gemm(gpu, h, q_dim).ok()
+                    };
+
+                    let mut attn_layer = Qwen3AttentionLayer::new_ungated(
                         norm,
                         attn,
                         DenseWeight {
@@ -333,7 +351,13 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                         layer_kv_dtypes[attn_idx],
                         config.fp8_kv_calibration_tokens,
                         config,
-                    )?));
+                    )?;
+                    if let Some(od) = bf16_o_dense {
+                        // Dispatch checks `o_dense_bf16` first (see gemma4 loader).
+                        attn_layer.set_o_dense_bf16(od);
+                    }
+                    attn_layer.set_prefill_weights(qt, kt, vt, ot);
+                    layers.push(Box::new(attn_layer));
                     attn_idx += 1;
                 }
             }

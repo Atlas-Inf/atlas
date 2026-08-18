@@ -20,11 +20,6 @@ ignore = [
     # but its maintainer stepped away; replacements (e.g. `pastey`)
     # exist but the deps that use it haven't migrated yet.
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; proc-macro is feature-complete and pulled in by transitive deps we don't control" },
-    # NOTE: RUSTSEC-2024-0375 (`atty`) and RUSTSEC-2024-0370
-    # (`proc-macro-error` 1.x) were removed once those crates dropped out
-    # of the tree — keeping them produced cargo-deny `advisory-not-detected`
-    # warnings ("no crate matched advisory criteria"). Re-add only if a dep
-    # pulls them back in.
 ]
 
 [licenses]
@@ -76,4 +71,16 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# ★ One entry, and `unknown-git` stays "deny".
+#
+# `atlas-governance` depends on LatticeDB for the PR journey ledger's
+# materialised graph. It is a first-party Avarok repository, and the dependency
+# is pinned to an exact `rev` in that crate's manifest — a git source without a
+# pin is a moving target that can change under a committed Cargo.lock, which is
+# the actual hazard this check exists to catch.
+#
+# The version it needs (`interchange`, the logical JSONL dump) is not on
+# crates.io yet. When it is published, this entry should be REMOVED and the
+# dependency switched to a registry version — an allow-list that outlives its
+# reason is how the next git dependency slips in unnoticed.
+allow-git = ["https://github.com/Avarok-Cybersecurity/lattice-db"]

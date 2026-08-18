@@ -110,6 +110,9 @@ impl TransformerModel {
 
         // ── 1. Embed ALL tokens → [total_len, H] contiguous ──
         {
+            // SAFETY: `total_len` is `tokens.len()` (bound at fn entry and never
+            // reassigned), so the byte length is exactly
+            // `tokens.len() * size_of::<u32>()` over a live `&[u32]`.
             let token_ids_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, total_len * 4) };
             let token_ids_dev = self.buffers.scratch();
@@ -134,16 +137,10 @@ impl TransformerModel {
             if pending > 0
                 && let Some(ve) = &self.vision_encoder
             {
-                let pad_id = self
-                    .config
-                    .vision
-                    .as_ref()
-                    .map(|v| v.image_pad_token_id)
-                    .filter(|v| *v != 0)
-                    .unwrap_or(crate::layers::vision_encoder::IMAGE_PAD_TOKEN_ID);
+                let (image_pad, video_pad) = self.vision_pad_ids();
                 let mut img_idx = 0usize;
                 for (i, &tok) in tokens.iter().enumerate() {
-                    if tok == pad_id {
+                    if tok == image_pad || tok == video_pad {
                         let src = ve.buf_out.offset(img_idx * ve.out_hidden_size * 2);
                         let dst = hidden.offset(i * h * fp32);
                         self.gpu
@@ -159,10 +156,12 @@ impl TransformerModel {
         let prefix_match = if self.tokens_have_vision_pad(tokens) {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
-            self.prefix_cache.lookup(tokens, bs, seq.session_hash)
+            self.prefix_cache
+                .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
         };
         let matched = prefix_match.matched_tokens;
         seq.cached_prefix_tokens = matched;
+        seq.cached_prefix_blocks = prefix_match.matched_blocks.len();
         // Record the original prompt length for cache_sequence bookkeeping.
         seq.prompt_len = tokens.len();
         for &block_idx in &prefix_match.matched_blocks {
@@ -175,8 +174,12 @@ impl TransformerModel {
         );
 
         // Marconi: restore SSM snapshot if available (session-gated).
-        let (kv_write_start, marconi_skip) = if let Some(snap_id) = prefix_match.ssm_snapshot {
-            let snap_tok = prefix_match.ssm_snapshot_tokens;
+        // Phase 1b spill-tier fault-in (#6): fold a resident hit with a
+        // faulted-back spilled anchor; see `ssm_fault_in::eff_ssm_snapshot`.
+        let (eff_snapshot, eff_snapshot_tokens) =
+            self.eff_ssm_snapshot(&prefix_match, seq.session_hash, stream);
+        let (kv_write_start, marconi_skip) = if let Some(snap_id) = eff_snapshot {
+            let snap_tok = eff_snapshot_tokens;
             if snap_tok > 0
                 && matched <= total_len
                 && self
@@ -237,6 +240,7 @@ impl TransformerModel {
             self.prefix_cache.as_ref(),
             self.gpu.as_ref(),
             stream,
+            self.levers.kv_poison,
         )?;
 
         // Determine effective processing range (skip Marconi-cached tokens).
@@ -255,6 +259,13 @@ impl TransformerModel {
         // Re-embed only the uncached portion at hidden[0..proc_count].
         if proc_start > 0 {
             let uncached_tokens = &tokens[proc_start..];
+            // SAFETY: this arm runs only when `proc_start > 0`, which the
+            // `(proc_start, proc_count)` binding above reaches only via
+            // `(kv_write_start, total_len - kv_write_start)` — so
+            // `proc_count == total_len - proc_start == uncached_tokens.len()`
+            // and the byte length is `uncached_tokens.len() * size_of::<u32>()`
+            // over a live `&[u32]`. (A `kv_write_start > total_len` would panic
+            // in the slice index on the line above, before this runs.)
             let token_ids_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(uncached_tokens.as_ptr() as *const u8, proc_count * 4)
             };
@@ -292,17 +303,6 @@ impl TransformerModel {
             stg.positions
                 .extend(proc_start as u32..(proc_start + proc_count) as u32);
 
-            let pinned = stg.ptr;
-            let mut cursor = proc_count * 4;
-
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    stg.positions.as_ptr() as *const u8,
-                    pinned,
-                    proc_count * 4,
-                );
-            }
-
             if !needs_paged {
                 stg.slots.clear();
                 stg.slots
@@ -312,24 +312,18 @@ impl TransformerModel {
                             .unwrap_or(self.dummy_kv_block);
                         (block_idx as i64) * (bs as i64) + ((i % bs) as i64)
                     }));
-                cursor = slot_offset;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        stg.slots.as_ptr() as *const u8,
-                        pinned.add(cursor),
-                        proc_count * 8,
-                    );
-                }
-                cursor += proc_count * 8;
             }
 
-            assert!(
-                cursor <= stg.bytes,
-                "prefill_twophase metadata overflow: {cursor} > {}",
-                stg.bytes
-            );
-            let pinned_slice = unsafe { std::slice::from_raw_parts(pinned, cursor) };
-            self.gpu.copy_h2d_async(pinned_slice, meta_base, stream)?;
+            // Rounding `slot_offset` up to 8 leaves up to 4 pad bytes after the
+            // positions array that no copy writes; they are still initialised
+            // (see the `pinned_pack` module docs).
+            let mut pack = stg.packer_for(self.buffers.scratch_bytes().saturating_sub(meta_offset));
+            pack.put_prefix_at("positions", 0, &stg.positions, proc_count)?;
+            if !needs_paged {
+                pack.put_prefix_at("slots", slot_offset, &stg.slots, proc_count)?;
+            }
+            self.gpu
+                .copy_h2d_async_retained(pack.packed(), meta_base, stream)?;
         }
 
         if needs_paged {
@@ -343,6 +337,9 @@ impl TransformerModel {
             // reads this metadata, so skip the upload entirely in HSS mode.
             if upload_start < current_blocks && seq.hss_window_start() == 0 {
                 let new_blocks = &seq.block_table[upload_start..];
+                // SAFETY: the length is `size_of_val(new_blocks)` — derived from
+                // the slice itself, so it can never exceed it — over a live
+                // `&[u32]` sub-slice of `seq.block_table`.
                 let bt_bytes = unsafe {
                     std::slice::from_raw_parts(
                         new_blocks.as_ptr() as *const u8,
@@ -359,6 +356,8 @@ impl TransformerModel {
             }
 
             let seq_len_val = (proc_start + proc_count) as u32;
+            // SAFETY: exactly `size_of::<u32>()` bytes over the live, fully
+            // initialised `seq_len_val` local on the line above.
             let seq_len_bytes = unsafe {
                 std::slice::from_raw_parts(
                     &seq_len_val as *const u32 as *const u8,
@@ -392,6 +391,17 @@ impl TransformerModel {
             (DevicePtr::NULL, DevicePtr::NULL)
         };
 
+        // Request-scoped LoRA routing (two-phase prefill) — same dedicated
+        // arena buffer + m-element uniform slot array as prefill_a. See
+        // prefill_a.rs for the placement rationale. `DevicePtr(0)` (no pool)
+        // → installed-pair fallback; `-1` resolves to active.
+        let seq_slot = self.upload_seq_slot_uniform(
+            seq.adapter_slot,
+            proc_count,
+            self.buffers.lora_seq_slot(),
+            stream,
+        )?;
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -401,12 +411,18 @@ impl TransformerModel {
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
+            seq_slot,
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(attn_metadata),
             profile: self.profile,
             comm: self.comm_ref(),
@@ -416,6 +432,10 @@ impl TransformerModel {
             gdn_exact_replay: marconi_skip,
             midchunk_capture: None,
             token_ids: None,
+            // #30: request slot pairs (None unless routing to a non-active slot).
+            routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
+            midchunk_capture: None,
+            moe_lora_route: self.moe_lora_route(seq.adapter_slot),
         };
 
         // ── 4. Per-layer forward: SSM uses three-phase, attention uses standard ──

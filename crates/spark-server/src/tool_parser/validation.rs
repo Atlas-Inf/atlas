@@ -71,6 +71,56 @@ pub(crate) fn normalize_param_name(tools: &[ToolDefinition], call_name: &str, ke
         .unwrap_or_else(|| key.to_string())
 }
 
+/// Echo-attractor salvage (2026-07-09): at long context the model can emit
+/// the XML wire format shifted by one structural token —
+/// `<parameter=parameter>filePath>\n/tmp/x</parameter>` or
+/// `<parameter=write>content>…</parameter>` — so the REAL key lands as the
+/// leading `IDENT>` of the value while the key slot holds an echoed
+/// structural word (`parameter`, the function name, …). The grammar's
+/// key-slot masking makes this shape sticky once entered (`=` is masked, so
+/// the echo closes early), and the real path/content are fully present in
+/// the value. Recover them: when `key` is NOT a schema property and the
+/// value begins with `PROP>` for a schema property `PROP`, re-split into
+/// `(PROP, rest)`.
+///
+/// SSOT — used by both the buffered pipeline (`backfill_required_params`
+/// step 2.5) and live argument streaming (`streaming_emit::coerce_kv`), the
+/// same dual-wiring as [`normalize_param_name`]. Deliberately conservative:
+/// never fires when the emitted key is itself a schema property (a legit
+/// value could start with `IDENT>`), and requires the exact `PROP>` prefix.
+pub(crate) fn salvage_echoed_param(
+    tools: &[ToolDefinition],
+    call_name: &str,
+    key: &str,
+    value: &str,
+) -> Option<(String, String)> {
+    let props = tools
+        .iter()
+        .find(|t| t.function.name == call_name)?
+        .function
+        .parameters
+        .as_ref()?
+        .get("properties")?
+        .as_object()?;
+    if props.is_empty() || props.contains_key(key) {
+        return None;
+    }
+    // Longest property first so e.g. `filePath>` wins over a hypothetical
+    // `file>` prefix.
+    let mut names: Vec<&String> = props.keys().collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    for prop in names {
+        if let Some(rest) = value
+            .strip_prefix(prop.as_str())
+            .and_then(|r| r.strip_prefix('>'))
+        {
+            // Both parse paths `.trim()` parameter values; stay consistent.
+            return Some((prop.clone(), rest.trim().to_string()));
+        }
+    }
+    None
+}
+
 /// Extract agent-type names from a delegation tool's prose description.
 ///
 /// Matches lines shaped like `- <name>: …` — the convention both opencode
@@ -203,6 +253,37 @@ pub fn backfill_required_params(calls: &mut [ToolCall], tools: &[ToolDefinition]
             }
         }
 
+        // 2.5. Echo-attractor salvage: re-split `{"parameter": "filePath>…"}`
+        // shapes where the real key leaked into the value (see
+        // `salvage_echoed_param`). Runs BEFORE the missing-required backfill
+        // so the recovered key satisfies `required` instead of being
+        // synthesized as "" (which clients reject with errors the degraded
+        // model then retries verbatim — the 42.5k opencode doom loop).
+        if properties.is_some() {
+            let salvageable: Vec<(String, String, String)> = args
+                .iter()
+                .filter_map(|(k, v)| {
+                    let s = v.as_str()?;
+                    salvage_echoed_param(tools, &call.function.name, k, s)
+                        .map(|(real_key, real_val)| (k.clone(), real_key, real_val))
+                })
+                .collect();
+            for (echoed_key, real_key, real_val) in salvageable {
+                let target_empty = matches!(
+                    args.get(&real_key),
+                    None | Some(serde_json::Value::String(_))
+                ) && args
+                    .get(&real_key)
+                    .and_then(|v| v.as_str())
+                    .is_none_or(|s| s.trim().is_empty());
+                if target_empty {
+                    args.remove(&echoed_key);
+                    args.insert(real_key, serde_json::Value::String(real_val));
+                    changed = true;
+                }
+            }
+        }
+
         // 3. Backfill missing required string parameters.
         for key in &required {
             if !args.contains_key(*key) {
@@ -324,7 +405,7 @@ pub fn find_empty_required_params(call: &ToolCall, tools: &[ToolDefinition]) -> 
 /// - Already relative paths → unchanged
 pub fn normalize_paths(calls: &mut [ToolCall], cwd: &str) {
     // Common parameter names that contain file paths
-    const PATH_KEYS: &[&str] = &["file_path", "filePath", "path", "file"];
+    const PATH_KEYS: &[&str] = &["file_path", "filePath", "path", "file", "workdir"];
     let cwd_slash = if cwd.ends_with('/') {
         cwd.to_string()
     } else {
@@ -338,6 +419,13 @@ pub fn normalize_paths(calls: &mut [ToolCall], cwd: &str) {
             continue;
         };
         let mut changed = false;
+        if call.function.name.eq_ignore_ascii_case("bash")
+            && let Some(serde_json::Value::String(command)) = args.get("command")
+            && let Some(repaired) = repair_punctuation_drifted_cwd_in_command(command, cwd)
+        {
+            args.insert("command".to_string(), serde_json::Value::String(repaired));
+            changed = true;
+        }
         for key in PATH_KEYS {
             if let Some(serde_json::Value::String(path)) = args.get(*key) {
                 // Long-context FP8 drift mode (2026-05-28): the model
@@ -374,6 +462,18 @@ pub fn normalize_paths(calls: &mut [ToolCall], cwd: &str) {
                 let Some(serde_json::Value::String(path)) = args.get(*key) else {
                     continue;
                 };
+                // Agentic path drift can preserve every basename character but
+                // swap separators (`laguna_s21` → `laguna-s21`). For a bash
+                // workdir only, repair that punctuation-equivalent spelling to
+                // the authoritative cwd supplied by the client. Genuinely
+                // different paths still pass through unchanged.
+                if *key == "workdir" && punctuation_equivalent_basename(path, cwd) {
+                    if path != cwd {
+                        args.insert(key.to_string(), serde_json::Value::String(cwd.to_string()));
+                        changed = true;
+                    }
+                    continue;
+                }
                 if !path.starts_with('/') {
                     continue; // Already relative — leave it
                 }
@@ -395,6 +495,69 @@ pub fn normalize_paths(calls: &mut [ToolCall], cwd: &str) {
             call.function.arguments = new_args;
         }
     }
+}
+
+fn fold_path_component(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn punctuation_equivalent_basename(candidate: &str, cwd: &str) -> bool {
+    let candidate = std::path::Path::new(candidate);
+    let cwd = std::path::Path::new(cwd);
+    if candidate.parent() != cwd.parent() {
+        return false;
+    }
+    match (candidate.file_name(), cwd.file_name()) {
+        (Some(candidate), Some(cwd)) => {
+            fold_path_component(&candidate.to_string_lossy())
+                == fold_path_component(&cwd.to_string_lossy())
+        }
+        _ => false,
+    }
+}
+
+fn repair_punctuation_drifted_cwd_in_command(command: &str, cwd: &str) -> Option<String> {
+    let cwd = std::path::Path::new(cwd);
+    let parent = cwd.parent()?.to_str()?;
+    let basename = cwd.file_name()?.to_str()?;
+    let parent_prefix = if parent == "/" {
+        "/".to_string()
+    } else {
+        format!("{parent}/")
+    };
+    let canonical_fold = fold_path_component(basename);
+    let mut repaired = String::with_capacity(command.len());
+    let mut cursor = 0;
+    let mut changed = false;
+
+    while let Some(offset) = command[cursor..].find(&parent_prefix) {
+        let component_start = cursor + offset + parent_prefix.len();
+        let component_end = command[component_start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+            .map_or(command.len(), |end| component_start + end);
+        let candidate = &command[component_start..component_end];
+
+        repaired.push_str(&command[cursor..component_start]);
+        if candidate != basename
+            && !candidate.is_empty()
+            && fold_path_component(candidate) == canonical_fold
+        {
+            repaired.push_str(basename);
+            changed = true;
+        } else {
+            repaired.push_str(candidate);
+        }
+        cursor = component_end;
+    }
+
+    if !changed {
+        return None;
+    }
+    repaired.push_str(&command[cursor..]);
+    Some(repaired)
 }
 
 // ── Tool call validation ──
@@ -572,6 +735,8 @@ pub fn assess_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> Result<(),
         "MultiEdit",
         "multiEdit",
         "multi_edit",
+        "write_file",
+        "writeFile",
     ];
     if WRITE_FAMILY.contains(&name.as_str()) {
         for key in PATH_KEYS {
@@ -703,27 +868,71 @@ pub fn assess_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> Result<(),
 
 #[cfg(test)]
 mod path_sanitizer_tests {
+    use crate::tool_parser::{FunctionCall, ToolCall};
+
+    fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "x".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
     #[test]
     fn malformed_quoted_comma_filepath_sanitized() {
         // FP8 drift: filePath value leaked as a JSON fragment `"…/Cargo.toml",`
         // (surrounding quotes + trailing comma). The unconditional path
         // sanitizer must clean it to a cwd-relative `Cargo.toml` so the file
         // lands with a usable name.
-        use crate::tool_parser::{FunctionCall, ToolCall};
-        let mut calls = vec![ToolCall {
-            id: "x".into(),
-            call_type: "function".into(),
-            function: FunctionCall {
-                name: "write".into(),
-                arguments: serde_json::json!({
-                    "filePath": "\"/tmp/proj/Cargo.toml\",",
-                    "content": "[package]\nname = \"x\"\n"
-                })
-                .to_string(),
-            },
-        }];
+        let mut calls = vec![call(
+            "write",
+            serde_json::json!({
+                "filePath": "\"/tmp/proj/Cargo.toml\",",
+                "content": "[package]\nname = \"x\"\n"
+            }),
+        )];
         super::normalize_paths(&mut calls, "/tmp/proj");
         let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["filePath"], "Cargo.toml");
+    }
+
+    #[test]
+    fn punctuation_drifted_workdir_is_repaired_to_cwd() {
+        let cwd = "/tmp/harness-laguna_s21-carddefaults-r1";
+        let mut calls = vec![call(
+            "bash",
+            serde_json::json!({
+                "command": "cargo test",
+                "workdir": "/tmp/harness-laguna-s21-carddefaults-r1"
+            }),
+        )];
+
+        super::normalize_paths(&mut calls, cwd);
+
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["workdir"], cwd);
+    }
+
+    #[test]
+    fn punctuation_drifted_cwd_inside_bash_command_is_repaired() {
+        let cwd = "/tmp/harness-laguna_s21-agentfix-r1";
+        let mut calls = vec![call(
+            "bash",
+            serde_json::json!({
+                "command": "ls /tmp/harness-laguna-s21-agentfix-r1/opencode && pwd",
+                "workdir": cwd
+            }),
+        )];
+
+        super::normalize_paths(&mut calls, cwd);
+
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args["command"],
+            "ls /tmp/harness-laguna_s21-agentfix-r1/opencode && pwd"
+        );
     }
 }

@@ -13,14 +13,18 @@ use std::time::Instant;
 use anyhow::Result;
 use spark_model::traits::SequenceState;
 
+use crate::api::inference_types::RepetitionDetectionParams;
 use crate::api::{InferenceRequest, InferenceResponse, StreamEvent};
 use crate::grammar::GrammarState;
-use crate::openai::RepetitionDetectionParams;
 
 /// Shared queue between receiver thread and scheduler.
 pub(super) struct PendingQueue {
     pub requests: Vec<InferenceRequest>,
     pub closed: bool,
+    /// Pending LoRA adapter-rotation control requests, applied by the scheduler
+    /// at a quiescent point (see [`super::LoraRotation`]). Kept OUT of
+    /// `requests` so the sequence machinery never sees a control message.
+    pub rotations: Vec<super::LoraRotation>,
 }
 
 /// Per-request slice of a co-dispatched batched-ViT encode. When >=2 image
@@ -104,6 +108,51 @@ pub(super) struct PrefillInProgress {
     pub timeout_at: Option<Instant>,
 }
 
+/// `ActiveSeq::guard_stop` marker for the server-side request deadline
+/// (`--request-timeout`). `finish_sequence` keys off this exact value to
+/// emit `finish_reason="timeout"` instead of deriving "length" from the
+/// last token — see `derive_finish_reason`.
+pub(super) const GUARD_STOP_REQUEST_TIMEOUT: &str = "request_timeout";
+
+/// The `<tool_response>` hard stop fired: the model emitted a control token
+/// it must never generate (post-tool-call runaway). Ending the turn is
+/// correct; naming it is what makes the wire reason `"length"` instead of
+/// `"stop"`, so the client knows the server cut the response short.
+pub(super) const GUARD_STOP_TOOL_RESPONSE: &str = "tool_response_hard_stop";
+
+/// The stray-`</think>` watchdog fired: 50 CONSECUTIVE `</think>` outside a
+/// thinking span (the documented long-context degeneration) forced the turn
+/// closed. Same class as `GUARD_STOP_TOOL_RESPONSE` above: `</think>` is NOT
+/// eos-registered for any served model (measured 2026-08-10 across the HF
+/// cache: Qwen3.6 family eos = {248046 `<|im_end|>`, 248044}, `</think>` =
+/// 248069; Nemotron eos = {2, 11}, `</think>` = 13; Qwen3-VL/Coder eos =
+/// {151645, 151643}, `</think>` = 151668), and the site skips the token
+/// rather than pushing it, so without a name this SERVER cut fell through
+/// every rung of `derive_finish_reason` and wired `"stop"`. The agentic
+/// harness's `was_cut_off()` grants a recovery turn only on `"length"`, so
+/// the mislabel silently ended the whole run. Contrast `<|im_start|>`,
+/// which IS eos-registered (pushed in `tokenizer_runtime.rs::im_start_id`)
+/// — naming a guard THERE would reintroduce the opposite mislabel.
+pub(super) const GUARD_STOP_THINK_SKIP: &str = "think_skip_watchdog";
+
+/// The inter-tool prose budget ended the turn (#328). Both decode paths
+/// (non-MTP `decode_logits_content` fallback and MTP `emit_step`) must
+/// stamp this: unnamed, the non-MTP cut fell through every rung of
+/// `derive_finish_reason` and wired `"stop"` — the client banked a
+/// mid-sentence truncation as a finished answer, while its only clue was
+/// a server-side WARN line. Named, the wire reason is `"length"` and the
+/// guard name reaches `StreamEvent::Done.guard_stop` and the --dump body.
+pub(super) const GUARD_STOP_INTER_TOOL_PROSE: &str = "inter_tool_prose_budget";
+
+/// The content-loop watchdog hard-stopped (rollback declined or the MTP
+/// mirror, which cannot roll back). Same honesty contract as above: a
+/// degeneration cut is a SERVER truncation and must say so.
+pub(super) const GUARD_STOP_CONTENT_LOOP: &str = "content_loop_watchdog";
+
+/// The F1 post-`</think>` content cap ended a tool-active response.
+/// It is an early, smarter `max_tokens` — report it as one (`"length"`).
+pub(super) const GUARD_STOP_POST_THINK_CAP: &str = "post_think_content_cap";
+
 /// An in-flight sequence participating in batched decode.
 pub(super) struct ActiveSeq {
     pub seq: SequenceState,
@@ -114,6 +163,19 @@ pub(super) struct ActiveSeq {
     pub min_tokens: usize,
     pub eos_tokens: Vec<u32>,
     pub finished: bool,
+    /// Which server-side guard force-finished this sequence (e.g.
+    /// "fuzzy_repetition"), if any. Surfaced in the synthesized --dump body
+    /// so a guard-cut turn is attributable without log archaeology (the
+    /// 2026-07-09 fuzzy cuts reported bare finish=length with every dump
+    /// flag false). Not part of the OpenAI wire format.
+    pub guard_stop: Option<&'static str>,
+    /// P0-1: provisional `</parameter>` close progress inside a parameter
+    /// VALUE body (0 = none, 1 = saw `</`, 2 = saw `</` `parameter`). The
+    /// body-exit commits only on the confirmed full close; HTML/Svelte
+    /// close tags in value content no longer exit the body (which
+    /// reclassified file content as envelope tokens and tripped the
+    /// stuck-envelope cap mid-write).
+    pub param_close_pending: u8,
     pub sink: ResponseSink,
     /// Cooperative cancellation flag from the streaming pipeline.
     /// `Some` for streaming requests with the flag wired through;
@@ -157,6 +219,13 @@ pub(super) struct ActiveSeq {
     pub thinking_tokens: u32,
     /// When true, the next decode step must produce the `</think>` token.
     pub force_end_thinking: bool,
+    /// Whether the `</think>` that closed the current thinking span was
+    /// FORCE-INJECTED (budget exhaustion or thinking-loop watchdog) rather
+    /// than emitted by the model. Captured at the `</think>` commit; read
+    /// by the post-think EOS guard, which must only fire on watchdog
+    /// recoveries — a naturally closed think followed by a short answer
+    /// ends the turn like vLLM does.
+    pub think_force_closed: bool,
     /// Decode-step counter incremented while `force_end_thinking` is
     /// armed but the injection is deferred (waiting for a sentence-
     /// boundary token or fence close). Reset to 0 on the false→true
@@ -276,6 +345,9 @@ pub(super) struct ActiveSeq {
     pub suppress_tool_call: bool,
     /// F60 (2026-04-27): when true, MTP speculative decoding is bypassed.
     pub disable_mtp: bool,
+    /// Per-request MTP accept / serial-vs-MTP counters for the Done-line
+    /// ([`super::mtp_accept_debug::RequestAccept`]).
+    pub mtp_acct: super::mtp_accept_debug::RequestAccept,
     /// True after the first non-thinking content token has been generated.
     pub content_started: bool,
     /// Number of content tokens emitted post-`</think>`.
@@ -302,6 +374,13 @@ pub(super) struct ActiveSeq {
     pub grammar_state: Option<GrammarState>,
     /// MTP draft tokens awaiting verification.
     pub pending_drafts: Vec<u32>,
+    /// Top-1 LOG-probability the drafter reported for each entry of
+    /// [`Self::pending_drafts`], in the same order (D-Cut's ranking key —
+    /// `mtp_dcut`). EMPTY whenever the drafts came from a path that cannot
+    /// measure confidence (per-sequence propose, N-gram/DFlash drafters), in
+    /// which case D-Cut leaves the sequence at full depth. Truncated in
+    /// lock-step with `pending_drafts` so index `j` always describes draft `j`.
+    pub pending_draft_conf: Vec<f32>,
     /// Timestamp of the last token emission (for TBT deadline tracking).
     pub last_token_time: Instant,
     /// Timestamp when the request entered prefill (for TTFT).
@@ -320,6 +399,14 @@ pub(super) struct ActiveSeq {
     pub adaptive: crate::adaptive_sampler::AdaptiveSamplingState,
     /// Number of prompt tokens served by the prefix cache (no prefill cost).
     pub cached_prompt_tokens: u32,
+    /// Decode-preemption starvation guard: this sequence must not be chosen
+    /// as a KV-preemption victim again until `output_tokens.len()` reaches
+    /// this threshold. Set on every resume (requeue re-prefill AND swap-in)
+    /// to `output_tokens.len() + preempt::PREEMPT_IMMUNITY_TOKENS`; 0 (the
+    /// default for fresh sequences) means "no immunity". Compared against
+    /// output length rather than decremented per step so it costs nothing
+    /// on the decode hot path and is deterministic to test.
+    pub preempt_immune_until_tokens: usize,
 }
 
 impl ActiveSeq {
@@ -363,6 +450,16 @@ pub(super) fn consume_budget(remaining: &mut usize) -> bool {
 pub(super) struct SwappedSeq {
     pub tokens: Vec<u32>,
     pub session_hash: u64,
+    /// M2 per-request LoRA routing: preserved across spill/restore so a
+    /// swapped-then-resumed sequence keeps its adapter (unlike `cancel_flag`,
+    /// which is intentionally dropped). CPU metadata, restored like `tokens`.
+    pub adapter_slot: i32,
+    /// Task #24: STABLE adapter_id preserved across spill/restore. Stored (not
+    /// recomputed) because a swapped `-1` (defer-to-active) seq's KV was computed
+    /// under the adapter that was active AT PREFILL — recomputing from
+    /// `adapter_slot == -1` after a rotation would re-bind it to a different
+    /// active id and mis-key its own already-written blocks.
+    pub adapter_id: u64,
     pub seq_len: usize,
     pub num_blocks: usize,
     pub last_token: u32,
@@ -395,6 +492,7 @@ pub(super) struct SwappedSeq {
     pub spontaneous_think_budget: u32,
     pub thinking_tokens: u32,
     pub force_end_thinking: bool,
+    pub think_force_closed: bool,
     pub sentence_defer_count: u32,
     pub consecutive_confident: u32,
     pub in_code_fence: bool,
@@ -415,6 +513,8 @@ pub(super) struct SwappedSeq {
     pub suppress_tool_call: bool,
     /// F60 (2026-04-27): MTP-disable flag preserved across snapshot/restore.
     pub disable_mtp: bool,
+    /// Per-request MTP accept counters, preserved across spill/restore.
+    pub mtp_acct: super::mtp_accept_debug::RequestAccept,
     pub content_started: bool,
     pub content_tokens: u32,
     pub prose_tokens_since_last_tool: u32,
@@ -434,6 +534,28 @@ pub(super) struct SwappedSeq {
     pub cached_prompt_tokens: u32,
     pub timeout_at: Option<Instant>,
     pub swap_id: u64,
+}
+
+/// A sequence preempted out of decode when the KV pool ran dry, awaiting a
+/// requeue-resume (the no-`--swap-space` counterpart of [`SwappedSeq`]).
+///
+/// Unlike a disk spill nothing is serialized: the victim's GPU resources are
+/// freed (its computed KV is offered to the prefix cache first, exactly like
+/// `finish_sequence`) and the WHOLE `ActiveSeq` — sink, sampling params,
+/// guard/think/tool state, output already streamed — is retained on the CPU.
+/// Resume re-prefills `tokens` to rebuild KV + SSM state and transplants the
+/// fresh `SequenceState` back into `a`, so the client's stream continues
+/// where it paused: nothing already streamed is invalidated or re-emitted.
+pub(super) struct PreemptedSeq {
+    /// Retained request state. `a.seq` holds NO GPU resources (freed at
+    /// preemption); everything CPU-side stays live, including `cancel_flag`
+    /// (requeue is same-process and short-lived, unlike a disk swap).
+    pub a: ActiveSeq,
+    /// Token history to re-prefill on resume: prompt + every PROCESSED
+    /// output token. Excludes `a.last_token`, which is the pending decode
+    /// input (already streamed) — resume feeds it to the first decode step,
+    /// so no token is re-sampled or re-emitted.
+    pub tokens: Vec<u32>,
 }
 
 #[cfg(test)]

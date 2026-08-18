@@ -19,6 +19,7 @@ impl Qwen3AttentionLayer {
     pub(crate) fn w4a16_gemm_m128_dispatch(
         &self,
         gpu: &dyn GpuBackend,
+        dispatch: &crate::layers::ops::GemmDispatch,
         input: DevicePtr,
         weight: &crate::weight_map::QuantizedWeight,
         output: DevicePtr,
@@ -27,26 +28,20 @@ impl Qwen3AttentionLayer {
         k: u32,
         stream: u64,
     ) -> anyhow::Result<()> {
-        // ATLAS_W4A16_VARIANT env: "v1", "v2", "v3" — overrides auto.
-        // Default: v2 (3 CTAs/SM, 8 warps). v3 (K_STEP=64, 1 CTA/SM) is
-        // slower in practice; keep it available for A/B but don't default.
-        static VARIANT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let v =
-            *VARIANT.get_or_init(
-                || match std::env::var("ATLAS_W4A16_VARIANT").ok().as_deref() {
-                    Some("v1") => 1,
-                    Some("v2") => 2,
-                    Some("v3") => 3,
-                    _ => 0, // auto (prefer v2)
-                },
-            );
+        // ATLAS_W4A16_VARIANT: "v1"/"v2"/"v3" pin a kernel; 0 = auto (v2 — 3
+        // CTAs/SM, 8 warps; v3 with K_STEP=64 is slower in practice, kept for
+        // A/B). Resolved once per model into `GemmDispatch`, which the forward
+        // pass already carries.
+        let v = dispatch.w4a16_variant;
         // LOSSLESS opt-in: route QKV/o projection prefill through the BF16-TC
         // kernel (FP4→BF16 dequant + BF16 MMA, bit-identical to base w4a16_gemm)
         // instead of the default t_m128 which crushes activations to FP8 E4M3.
         // Gated by ATLAS_BF16_TC_PROJ (default off → unchanged). Removes the
         // FP8 prefill perturbation on the attention projections.
-        static BF16_PROJ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let bf16_proj = *BF16_PROJ.get_or_init(|| std::env::var_os("ATLAS_BF16_TC_PROJ").is_some());
+        // Load-time weight prep runs before any `TransformerModel` exists to
+        // carry the levers, so this resolves at the point of use. The
+        // interpretation stays SSOT in `ModelLevers`.
+        let bf16_proj = crate::layers::ops::ModelLevers::from_env().bf16_tc_proj;
         if bf16_proj && self.w4a16_gemm_t_m128_bf16_k.0 != 0 {
             return crate::layers::ops::w4a16_gemm_n128_m128_bf16(
                 gpu,
@@ -114,6 +109,161 @@ impl Qwen3AttentionLayer {
         self.o_nvfp4_t = o_nvfp4_t;
     }
 
+    /// Install keep-packed ternary Q2_0 q/k/v/o weights (Tier-1c,
+    /// `ATLAS_GGUF_NATIVE_Q2=1`). Decode dispatches `q2_0_gemv_vec` (2-bit
+    /// resident, no NVFP4); prefill transient-dequants each to BF16 via
+    /// `Self::q2_prefill_gemm`. Replaces the NVFP4 decode weights (which are
+    /// NULL on this path — no NVFP4 was allocated).
+    pub fn set_packed_q2_weights(
+        &mut self,
+        q: crate::weight_map::PackedQ2Weight,
+        k: crate::weight_map::PackedQ2Weight,
+        v: crate::weight_map::PackedQ2Weight,
+        o: crate::weight_map::PackedQ2Weight,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+    ) {
+        self.q_weight = Some(QuantWeight::PackedQ2(q));
+        self.k_weight = Some(QuantWeight::PackedQ2(k));
+        self.v_weight = Some(QuantWeight::PackedQ2(v));
+        self.o_weight = Some(QuantWeight::PackedQ2(o));
+        // Resolved here, not in the constructor: these ship only in
+        // GGUF-serving targets and the boot audit fails closed on an
+        // unconditional probe everywhere else.
+        self.q2_0_mmq_nc_k = crate::layers::try_kernel(gpu, "q2_0_mmq", "atlas_q2_0_mmq128_nc");
+        self.q2_0_mmq_wc_k = crate::layers::try_kernel(gpu, "q2_0_mmq", "atlas_q2_0_mmq128_wc");
+        self.q4k_quant_act_k =
+            crate::layers::try_kernel(gpu, "q4k_mmq", "atlas_q8_1_quantize_ds4_bf16");
+    }
+
+    /// Transient-dequant prefill GEMM for a keep-packed Q2_0 projection: dequant
+    /// the 2-bit weight `[n, k]` into the caller-provided PERSISTENT BF16
+    /// `scratch` (the arena `q2_dequant_scratch`, sized to the largest packed
+    /// projection), run the BF16 `dense_gemm` (`out[m,n] = in[m,k] @ w^T`).
+    /// Mirrors `DenseFfnLayer`'s FFN prefill — the resident weight stays 2-bit.
+    /// No per-matmul alloc/sync/free: the dequant is ordered before the GEMM on
+    /// the same `stream`, and consecutive projections reuse `scratch` because
+    /// each GEMM consumes it before the next dequant overwrites it. Returns an
+    /// error if the dequant kernel is absent in this build.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn q2_prefill_gemm(
+        &self,
+        gpu: &dyn GpuBackend,
+        w: &crate::weight_map::PackedQ2Weight,
+        input: DevicePtr,
+        out: DevicePtr,
+        scratch: DevicePtr,
+        act_q8: DevicePtr,
+        m: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let (n, k) = (w.n, w.k);
+
+        // Tier-2 native MMQ (ATLAS_GGUF_NATIVE_Q2_MMQ=1): quantize `input` to q8_1
+        // then run the packed 2-bit MMQ GEMM — no BF16 weight dequant, no shared
+        // `q2_dequant_scratch` race. Group-128 only (else fall through).
+        if self.q2_0_mmq_nc_k.0 != 0
+            && self.q4k_quant_act_k.0 != 0
+            && crate::layers::ops::native_q2_mmq_enabled()
+            && w.group == 128
+        {
+            crate::layers::ops::quantize_act_q8_1(
+                gpu,
+                self.q4k_quant_act_k,
+                input,
+                act_q8,
+                m,
+                k,
+                stream,
+            )?;
+            return crate::layers::ops::q2_0_mmq_gemm(
+                gpu,
+                self.q2_0_mmq_nc_k,
+                self.q2_0_mmq_wc_k,
+                act_q8,
+                w.weight,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            );
+        }
+
+        if self.dequant_q2_0_gn_k.0 == 0 {
+            anyhow::bail!(
+                "dequant_q2_0_gn_to_bf16 kernel missing — packed-Q2 attention prefill unavailable"
+            );
+        }
+        crate::layers::ops::dequant_q2_0_gn_to_bf16(
+            gpu,
+            self.dequant_q2_0_gn_k,
+            w.weight,
+            scratch,
+            n,
+            k,
+            w.group as u32,
+            stream,
+        )?;
+        let dw = crate::weight_map::DenseWeight { weight: scratch };
+        if self.dense_gemm_pipelined_k.0 != 0 {
+            crate::layers::ops::dense_gemm_bf16_pipelined(
+                gpu,
+                self.dense_gemm_pipelined_k,
+                input,
+                &dw,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            )?;
+        } else {
+            crate::layers::ops::dense_gemm(
+                gpu,
+                self.dense_gemm_k,
+                input,
+                &dw,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Keep-packed Q2_0 (Tier-1c) prefill dispatch guard, shared by the QKV
+    /// (`paged_qkv` / `cache_skip_qkv`) and o_proj call sites: when `weight`
+    /// is the keep-packed variant, run [`Self::q2_prefill_gemm`] with the
+    /// arena scratch buffers and return `Some(result)`. `None` = not packed
+    /// Q2_0 — callers fall through to their NVFP4/FP8/dense arms. Must be
+    /// checked FIRST: those fallbacks all read NULL pointers on this path.
+    pub(crate) fn try_q2_prefill(
+        &self,
+        ctx: &crate::layer::ForwardContext,
+        weight: Option<&QuantWeight>,
+        input: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        stream: u64,
+    ) -> Option<Result<()>> {
+        let q2 = weight.and_then(|w| w.as_packed_q2())?;
+        debug_assert!(
+            (q2.n as usize) * (q2.k as usize) * 2 <= ctx.buffers.q2_dequant_scratch_bytes(),
+            "packed-Q2 prefill dequant scratch too small"
+        );
+        let scratch = ctx.buffers.q2_dequant_scratch();
+        let act_q8 = ctx.buffers.q2_act_q8();
+        Some(self.q2_prefill_gemm(ctx.gpu, q2, input, out, scratch, act_q8, m, stream))
+    }
+
+    /// Install the fused [q|k|v] transposed twin. Separate from
+    /// `set_prefill_weights` so the fused path is opt-in per loader and the
+    /// separate twins stay available as the fallback.
+    pub fn set_fused_qkv_prefill_weight(&mut self, qkv_nvfp4_t: Option<QuantizedWeight>) {
+        self.qkv_nvfp4_t = qkv_nvfp4_t;
+    }
     /// Set native FP8 checkpoint weights for the `w8a16_gemv` decode path.
     ///
     /// The block-scaled FP8 weights stored here (weight + per-128 `row_scale`)
@@ -147,6 +297,47 @@ impl Qwen3AttentionLayer {
         }
     }
 
+    /// Install the startup-static LoRA adapter overlay (post-construction,
+    /// mirroring [`Self::set_fp8_weights`]). `attn` carries the K/V/O pairs;
+    /// `ffn` (when Some) is routed into this layer's dense FFN component —
+    /// it lives here rather than on the model because `self.ffn` is
+    /// `pub(super)`. M0: weights are stored only; compute reads land in M1.
+    pub fn set_lora_weights(
+        &mut self,
+        attn: crate::layers::ops::lora_delta::LoraAttnWeights,
+        ffn: Option<crate::layers::ops::lora_delta::LoraFfnWeights>,
+    ) -> Result<()> {
+        self.lora = Some(attn);
+        if let Some(f) = ffn {
+            match &mut self.ffn {
+                crate::layers::FfnComponent::Dense(d) => d.set_lora_weights(f)?,
+                _ => anyhow::bail!("LoRA: FFN targets on a non-dense FFN layer"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Feature-1: install this layer's MoE router + routed-expert LoRA onto its
+    /// `FfnComponent::Moe`. The MoE FFN lives in `self.ffn` or (some loaders)
+    /// `self.moe_ffn` — try both, else the adapter targeted experts on a layer
+    /// with no MoE FFN (hard reject). Scratch is allocated inside
+    /// `crate::layers::MoeLayer::set_lora_weights`.
+    pub fn set_moe_lora_weights(
+        &mut self,
+        router: Option<crate::layers::ops::lora_delta::LoraPair>,
+        experts: crate::lora::ExpertLoraLayer,
+        kernels: crate::layers::ops::lora_delta::LoraKernels,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        if let crate::layers::FfnComponent::Moe(m) = &mut self.ffn {
+            return m.set_lora_weights(router, experts, kernels, gpu);
+        }
+        if let Some(crate::layers::FfnComponent::Moe(m)) = &mut self.moe_ffn {
+            return m.set_lora_weights(router, experts, kernels, gpu);
+        }
+        anyhow::bail!("LoRA: router/expert deltas installed on a layer with no MoE FFN component")
+    }
+
     /// Transpose FP8 weights for fast prefill (`w8a16_gemm_t`: coalesced
     /// reads). Must be called after [`Self::set_fp8_weights`]. Allocates
     /// new GPU buffers.
@@ -155,7 +346,11 @@ impl Qwen3AttentionLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> anyhow::Result<()> {
-        if crate::layers::ops::cutlass_nvfp4_gemm_enabled() {
+        // Load-time decision, taken in the weight loader before any
+        // `TransformerModel` exists to carry the config. Resolved at the point
+        // of use rather than cached in a static: the resolution logic stays
+        // SSOT in `GemmDispatch`, and one getenv per layer at load is free.
+        if crate::layers::ops::GemmDispatch::from_env().cutlass_nvfp4_gemm {
             tracing::info!(
                 "Skipping attention FP8 prefill transposes because ATLAS_CUTLASS_NVFP4_GEMM=1"
             );
@@ -199,7 +394,11 @@ impl Qwen3AttentionLayer {
         // them (decode attention uses its own weights), so they'd be allocated
         // at load and never used. Skip them — saves ~260MB and a wasted per-
         // prefill BF16->FP8 activation conversion. Mirrors transpose_fp8_for_prefill.
-        if crate::layers::ops::cutlass_nvfp4_gemm_enabled() {
+        // Load-time decision, taken in the weight loader before any
+        // `TransformerModel` exists to carry the config. Resolved at the point
+        // of use rather than cached in a static: the resolution logic stays
+        // SSOT in `GemmDispatch`, and one getenv per layer at load is free.
+        if crate::layers::ops::GemmDispatch::from_env().cutlass_nvfp4_gemm {
             tracing::info!(
                 "Skipping attention FP8 prefill predequant because ATLAS_CUTLASS_NVFP4_GEMM=1"
             );

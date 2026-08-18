@@ -12,13 +12,18 @@ use super::*;
 ///
 /// When `logprobs` is Some, the logprobs data is accumulated for blocking
 /// responses and sent via `StreamEvent::TokenWithLogprobs` for streaming.
-pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::TokenLogprobs>) {
+pub fn emit_token(
+    a: &mut ActiveSeq,
+    tok: u32,
+    logprobs: Option<crate::api::TokenLogprobs>,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+) {
     // Cooperative cancellation from the streaming pipeline. The
-    // stream-side loop guards (Bug-2 name-run cap, F11 within-dedup,
-    // F44 perm-fail, loop-watchdog) flip this flag when they decide
-    // the response should end. Treat it like an EOS: finalise now so
-    // `handle_done` runs with the proper `tool_loop_capped` /
-    // `finish_reason="length"` machinery, instead of letting the
+    // stream-side guards (Bug-2 name-run cap, F11 within-dedup, F44
+    // perm-fail, loop-watchdog, client stop-sequence match) flip this
+    // flag when they decide the response should end. Treat it like an
+    // EOS: finalise now (lifecycle derives "stop" — budget not hit —
+    // and `handle_done`'s overrides refine it) instead of letting the
     // model keep emitting tokens that just get suppressed.
     if let Some(ref f) = a.cancel_flag
         && f.load(std::sync::atomic::Ordering::Acquire)
@@ -38,7 +43,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // (`user` / `assistant` — regular tokens) would stream to the client,
     // poisoning its context and causing the observed multi-turn drift /
     // "file was corrupted" hallucinations in opencode.
-    if let Some(ims) = im_start_hard_stop()
+    if let Some(ims) = sched.limits.im_start_hard_stop
         && tok == ims
     {
         // Push the hard-stop token to output_tokens so lifecycle.rs reports
@@ -64,11 +69,13 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // never generate this control token; if it does (post-tool-call runaway), end
     // the turn. Mirrors the <|im_start|> hard stop above.
     if tool_response_stop_enabled()
-        && let Some(trs) = tool_response_hard_stop()
+        && let Some(trs) = sched.limits.tool_response_hard_stop
         && tok == trs
     {
         a.output_tokens.push(tok);
         a.finished = true;
+        // Name the cut -- MTP twin of the decode_logits_step site.
+        a.guard_stop = Some(GUARD_STOP_TOOL_RESPONSE);
         tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
         return;
     }
@@ -92,8 +99,27 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         a.think_skip_count += 1;
         if a.think_skip_count >= 50 {
             a.finished = true;
+            // Name the cut -- MTP twin of the decode_logits_step site; see
+            // `GUARD_STOP_THINK_SKIP` for why an unnamed skip-site finish
+            // wires "stop" and silently ends an agentic run.
+            a.guard_stop = Some(GUARD_STOP_THINK_SKIP);
+            tracing::debug!(
+                "</think> think-skip watchdog hard-stop fired (50 consecutive strays); \
+                 ending turn"
+            );
         }
         return;
+    }
+    // Reset skip counter when a real content token is generated — parity with
+    // `decode_logits_step.rs`. Without this the counter is CUMULATIVE on the MTP
+    // path while the non-MTP path counts CONSECUTIVE strays, so a generation
+    // that emits 50 scattered `</think>` across otherwise healthy content is
+    // force-stopped here and not there. The watchdog exists for the degenerate
+    // `</think>` REPETITION seen at long context, which is consecutive by
+    // definition; counting non-adjacent strays is a different, stricter policy
+    // that was never intended.
+    if a.think_ended {
+        a.think_skip_count = 0;
     }
 
     // Track <tool_call> token: once seen, legacy tool call requirement is satisfied.
@@ -186,11 +212,21 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         a.post_think_emitted += 1;
     }
 
-    // Thinking tokens are "free" (don't decrement remaining).
+    // §C-1 (DS4F hard-limit lane, 2026-07-21): thinking tokens draw down the
+    // SAME completion budget (`remaining`) as content tokens on the MTP/emit
+    // path too — twin of the non-MTP fix in `decode_logits_step`. A long
+    // `<think>` block can no longer run past `max_tokens`; `thinking_budget`
+    // stays the separate per-block cap (armed below). The `remaining == 0`
+    // force-stop at function end then finishes the sequence even while inside
+    // thinking. No-op for direct-mode (thinking-OFF) turns.
     // Detect </think> transition. Track thinking token count for budget enforcement.
     if a.inside_thinking {
+        a.consume_generation_budget();
         if a.think_end_token == Some(tok) {
             a.inside_thinking = false;
+            // Sticky twin of the decode-path capture — see
+            // decode_logits_step (post-think EOS guard).
+            a.think_force_closed = a.force_end_thinking;
             a.force_end_thinking = false;
             a.sentence_defer_count = 0;
             a.think_ended = true;
@@ -210,7 +246,14 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
             {
                 a.force_end_thinking = true;
                 a.sentence_defer_count = 0;
+                // Twin of the decode_logits_step site: name the source so a
+                // low client budget is distinguishable from a server cap.
                 tracing::info!(
+                    source = if a.enable_thinking {
+                        "request (client budget/effort; scaled by --max-thinking-budget)"
+                    } else {
+                        "spontaneous <think> (--max-thinking-budget / MODEL.toml)"
+                    },
                     "Thinking budget exhausted ({budget} tokens), arming </think>; \
                      deferring to next sentence boundary"
                 );
@@ -254,8 +297,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         use crate::scheduler::helpers::{
             CONTENT_LOOP_CHECK_STRIDE, CONTENT_LOOP_MIN_TOKENS, CONTENT_LOOP_PERIOD_MAX,
             CONTENT_LOOP_PERIOD_MIN, detect_content_token_loop_normalized_with,
-            detect_content_token_loop_with, disable_watchdogs, enable_loop_watchdog,
-            numeric_token_mask,
+            detect_content_token_loop_with,
         };
         a.content_tokens = a.content_tokens.saturating_add(1);
         // F1 (2026-06-02): unconditional per-generation post-think content
@@ -265,38 +307,44 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         // requests are ever capped (plain chat attaches no grammar and is
         // never truncated). Default 100_000 (`MAX_POST_THINK_CONTENT_TOKENS`)
         // = no-op; Qwen3.6-35B-A3B-FP8 sets 1536 in MODEL.toml.
-        if !disable_watchdogs()
+        if !sched.levers.disable_watchdogs
             && a.grammar_state.is_some()
-            && a.content_tokens > watchdog_params().max_post_think_content_tokens
+            && a.content_tokens > sched.watchdog.max_post_think_content_tokens
         {
             tracing::warn!(
                 content_tokens = a.content_tokens,
-                max = watchdog_params().max_post_think_content_tokens,
+                max = sched.watchdog.max_post_think_content_tokens,
                 "post-think content cap exceeded in MTP/emit path; ending response (tool-active request would otherwise burn to max_tokens)"
             );
+            a.guard_stop = Some(GUARD_STOP_POST_THINK_CAP);
             a.finished = true;
         }
-        if !disable_watchdogs()
-            && enable_loop_watchdog()
+        // Same precedence as the non-MTP twin (decode_logits_content.rs):
+        // request `repetition_detection` → operator min-repeats override →
+        // built-in constants.
+        let loop_params = sched.watchdog.content_loop_params(a.repetition_detection);
+        if !sched.levers.disable_watchdogs
+            && sched.levers.loop_watchdog()
             && !a.inside_tool_body
             && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
             && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
-            && (detect_content_token_loop_with(&a.output_tokens, a.repetition_detection)
-                || numeric_token_mask().as_deref().is_some_and(|m| {
-                    detect_content_token_loop_normalized_with(
-                        &a.output_tokens,
-                        m,
-                        a.repetition_detection,
-                    )
+            && (detect_content_token_loop_with(&a.output_tokens, loop_params)
+                || sched.masks.numeric.as_deref().is_some_and(|m| {
+                    detect_content_token_loop_normalized_with(&a.output_tokens, m, loop_params)
                 }))
         {
             tracing::warn!(
                 content_tokens = a.content_tokens,
                 output_len = a.output_tokens.len(),
-                "Content-loop watchdog fired in MTP/emit path (period-{}…{} repeat); ending response",
+                "Content-loop watchdog fired in MTP/emit path (period-{}…{} repeat); ending response. \
+                 Tune via --content-loop-min-repeats / ATLAS_CONTENT_LOOP_MIN_REPEATS, per-request \
+                 repetition_detection, or disarm via --content-loop-watchdog false / \
+                 ATLAS_CONTENT_LOOP_WATCHDOG=0",
                 CONTENT_LOOP_PERIOD_MIN,
                 CONTENT_LOOP_PERIOD_MAX,
             );
+            // #328 class: name the cut or it wires "stop" (see types.rs).
+            a.guard_stop = Some(GUARD_STOP_CONTENT_LOOP);
             a.finished = true;
         }
 
@@ -321,17 +369,20 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         // prefill, survives a graceful grammar disengage) instead of
         // `grammar_state.is_some()` — otherwise a disengaged tool turn on
         // the MTP path wanders to `max_tokens` with the budget inert.
-        if !disable_watchdogs() && !a.inside_tool_body && a.tool_request {
+        if !sched.levers.disable_watchdogs && !a.inside_tool_body && a.tool_request {
             a.prose_tokens_since_last_tool = a.prose_tokens_since_last_tool.saturating_add(1);
-            let max_prose = watchdog_params().max_inter_tool_prose;
+            let max_prose = sched.watchdog.max_inter_tool_prose;
             if a.prose_tokens_since_last_tool > max_prose {
                 tracing::warn!(
                     prose_tokens = a.prose_tokens_since_last_tool,
                     max = max_prose,
                     output_len = a.output_tokens.len(),
                     "Inter-tool prose budget exhausted in MTP/emit path; ending response \
-                     (no tool call after budget — would otherwise burn to max_tokens)."
+                     (no tool call after budget — would otherwise burn to max_tokens); \
+                     raise via --max-inter-tool-prose / ATLAS_MAX_INTER_TOOL_PROSE / \
+                     MODEL.toml [behavior].max_inter_tool_prose (0 disables)"
                 );
+                a.guard_stop = Some(GUARD_STOP_INTER_TOOL_PROSE);
                 a.finished = true;
             }
         }
@@ -402,14 +453,22 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
             return;
         }
     }
-    if a.remaining == 0 {
+    // §C-3 (DS4F hard-limit lane, 2026-07-21): the `remaining == 0` completion
+    // stop is now joined by the per-step served-`max_seq_len` ceiling stop
+    // (twin of the non-MTP guard in `decode_logits_step`), so the MTP/emit path
+    // also cannot run KV past the context ceiling. No-op when `max_seq_len` is
+    // unset (0) or not yet reached.
+    if a.remaining == 0 || seqlen_force_stop(a.seq.seq_len, sched.limits.max_seq_len) {
         // #144: before the hard length-stop, if a grammar is active and the
         // stop token is not legal at the current position (e.g. mid JSON
         // string), emit the shortest grammar-legal close so the truncated
         // `finish_reason="length"` output is still parseable.
         emit_grammar_close(a);
         tracing::info!(
-            "emit_token: remaining=0, output_tokens={}, thinking_tokens={}",
+            "emit_token: remaining={}, seq_len={}, max_seq_len={}, output_tokens={}, thinking_tokens={}",
+            a.remaining,
+            a.seq.seq_len,
+            sched.limits.max_seq_len,
             a.output_tokens.len(),
             a.thinking_tokens
         );
@@ -434,20 +493,7 @@ fn send_stream_event(a: &ActiveSeq, event: StreamEvent) -> bool {
     let ResponseSink::Streaming(ref tx) = a.sink else {
         return true;
     };
-    match tx.try_send(event) {
-        Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            tracing::debug!("Streaming receiver dropped, finishing seq");
-            false
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => match tx.blocking_send(event) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::error!("Streaming send failed during backpressure: {e}");
-                false
-            }
-        },
-    }
+    super::mod_helpers::bounded_stream_send(tx, event, "token stream")
 }
 
 /// #144 budget-aware graceful close. At budget exhaustion, if a grammar is
@@ -663,6 +709,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
             streak = a.tool_body_streak_tokens,
             "Stuck in tool-call ENVELOPE for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call> (excludes parameter-value content); ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
         );
+        a.guard_stop = Some("tool_envelope_stuck");
         a.finished = true;
     }
 
@@ -673,16 +720,58 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     const TOK_LT_SLASH: u32 = 510;
 
     if a.inside_parameter_body {
-        if tok == TOK_LT_SLASH {
-            // Start of `</parameter>` close-tag — exit body.
-            a.inside_parameter_body = false;
-            a.param_body_chars_emitted = 0;
-        } else {
-            // Any non-close body token advances the counter. The
-            // position-0 mask in `decode_logits_seq.rs` (close-tag +
-            // AM1 attractor) fires only while this counter is 0, so it
-            // deactivates after the first emitted body token.
-            a.param_body_chars_emitted = a.param_body_chars_emitted.saturating_add(1);
+        // P0-1 (2026-07-09): PROVISIONAL close detection. The old code
+        // exited the body on ANY `</` token (510) — but since the
+        // `<`-initial-value fix, parameter VALUES legitimately contain
+        // HTML/Svelte close tags (`</script>`, `</div>`, …), every one of
+        // which starts with token 510. Each false exit reclassified the
+        // rest of the file content as ENVELOPE tokens, walked the streak
+        // to MAX_TOOL_BODY_TOKENS, and force-killed legitimate writes
+        // mid-file (8 kills in the 2026-07-09 45k session). Now the exit
+        // COMMITS only on the full confirmed `</` `parameter` `>` token
+        // sequence; any other continuation re-enters the value body and
+        // back-counts the provisionally-held tokens as body chars. A
+        // merged/nonstandard tokenization of the close falls back to
+        // "stay inside" — safe: value tokens are streak-exempt, and the
+        // next exact close still exits.
+        match a.param_close_pending {
+            0 => {
+                if tok == TOK_LT_SLASH {
+                    a.param_close_pending = 1;
+                } else {
+                    // Any non-close body token advances the counter. The
+                    // position-0 mask in `decode_logits_seq.rs` (close-tag +
+                    // AM1 attractor) fires only while this counter is 0, so it
+                    // deactivates after the first emitted body token.
+                    a.param_body_chars_emitted = a.param_body_chars_emitted.saturating_add(1);
+                }
+            }
+            1 => {
+                if tok == TOK_PARAMETER {
+                    a.param_close_pending = 2;
+                } else {
+                    // `</` was value content (e.g. `</div>`), not a close.
+                    a.param_close_pending = 0;
+                    a.param_body_chars_emitted = a.param_body_chars_emitted.saturating_add(2);
+                }
+            }
+            _ => {
+                a.param_close_pending = 0;
+                if tok == TOK_GT {
+                    // Confirmed `</parameter>` — exit body. Also reset the
+                    // envelope streak: a confirmed close IS forward progress
+                    // (the doc comment above always claimed this reset; the
+                    // code never performed it).
+                    a.inside_parameter_body = false;
+                    a.param_body_chars_emitted = 0;
+                    a.tool_body_streak_tokens = 0;
+                } else {
+                    // `</parameter` NOT followed by `>` (e.g. the garbled
+                    // `</parameter<parameter=` reopen, or `</parameters`) —
+                    // grammar-legal value content; stay inside the body.
+                    a.param_body_chars_emitted = a.param_body_chars_emitted.saturating_add(3);
+                }
+            }
         }
         return;
     }

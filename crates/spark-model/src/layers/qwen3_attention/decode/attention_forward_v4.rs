@@ -177,7 +177,7 @@ impl Qwen3AttentionLayer {
                         let block = compressed.offset(tgt as usize * hd_mla as usize * 2);
                         ops::rms_norm(
                             ctx.gpu,
-                            self.rms_norm_k,
+                            self.rms_norm_w_k,
                             block,
                             &comp.norm,
                             block,
@@ -268,9 +268,9 @@ impl Qwen3AttentionLayer {
         let q_latent = ctx.buffers.ssm_ba();
         prof!("wq_a", {
             if let Some(ref wqa_nvfp4) = mla.wq_a_nvfp4 {
-                ops::w4a16_gemv(
+                self.nvfp4_decode_gemv(
                     ctx.gpu,
-                    self.w4a16_gemv_k,
+                    ctx.levers.gemv_sw,
                     normed,
                     wqa_nvfp4,
                     q_latent,
@@ -308,7 +308,7 @@ impl Qwen3AttentionLayer {
         prof!("q_norm", {
             ops::rms_norm(
                 ctx.gpu,
-                self.rms_norm_k,
+                self.rms_norm_w_k,
                 q_latent,
                 &mla.q_a_norm,
                 q_latent,
@@ -320,9 +320,9 @@ impl Qwen3AttentionLayer {
         })?;
         prof!("wq_b", {
             if let Some(ref wqb_nvfp4) = mla.wq_b_nvfp4 {
-                ops::w4a16_gemv(
+                self.nvfp4_decode_gemv(
                     ctx.gpu,
-                    self.w4a16_gemv_k,
+                    ctx.levers.gemv_sw,
                     q_latent,
                     wqb_nvfp4,
                     q_out,
@@ -386,9 +386,9 @@ impl Qwen3AttentionLayer {
         let kv_dim = nkv * hd;
         prof!("wkv", {
             if let Some(ref wkva_nvfp4) = mla.wkv_a_nvfp4 {
-                ops::w4a16_gemv(
+                self.nvfp4_decode_gemv(
                     ctx.gpu,
-                    self.w4a16_gemv_k,
+                    ctx.levers.gemv_sw,
                     normed,
                     wkva_nvfp4,
                     k_out,
@@ -426,7 +426,7 @@ impl Qwen3AttentionLayer {
         // → attention score overflow → NaN. nkv heads × (kv_dim/nkv) each.
         ops::rms_norm(
             ctx.gpu,
-            self.rms_norm_k,
+            self.rms_norm_w_k,
             k_out,
             &mla.kv_a_norm,
             k_out,
@@ -642,6 +642,7 @@ impl Qwen3AttentionLayer {
                 inv_sqrt_d,
                 nq * hd,
                 ctx.buffers.splitk_workspace(),
+                ctx.levers.max_decode_seqs,
                 stream,
             )
         })?;

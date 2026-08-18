@@ -36,6 +36,22 @@ impl MoeLayer {
             config.num_experts_per_tok,
             num_experts,
         );
+        // The check above bounds top-k by the expert count, which is the OOB
+        // the topk kernel can READ. It says nothing about the OOB the kernel
+        // can WRITE: the sigmoid routing kernels stage their top-K in a
+        // fixed-size shared array, and `top_k` was passed to them unbounded.
+        anyhow::ensure!(
+            config.num_experts_per_tok <= crate::layers::ops::MOE_TOPK_SIGMOID_MAX_TOP_K
+                && num_experts <= crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
+            "MoE config exceeds the routing kernels' fixed shared-memory bounds: \
+             num_experts_per_tok={} (max {}), num_experts={} (max {}). Raise \
+             MAX_TOP_K / MAX_EXPERTS in kernels/gb10/common/moe_topk_sigmoid.cu \
+             and their mirrors in layers::ops together.",
+            config.num_experts_per_tok,
+            crate::layers::ops::MOE_TOPK_SIGMOID_MAX_TOP_K,
+            num_experts,
+            crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
+        );
         let gate_ptrs = build_ptr_table(&weights.experts, |e| &e.gate_proj, gpu)?;
         let up_ptrs = build_ptr_table(&weights.experts, |e| &e.up_proj, gpu)?;
         let down_ptrs = build_ptr_table(&weights.experts, |e| &e.down_proj, gpu)?;
@@ -61,8 +77,14 @@ impl MoeLayer {
             pre_expert_norm_k: rms_norm_k,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
+            dense_gemm_pipelined: super::super::try_kernel(
+                gpu,
+                "gemm",
+                "dense_gemm_bf16_pipelined",
+            ),
             // FP32 gate path (ATLAS_FP32_GATE) — optional; KernelHandle(0) if the
             // target's kernel set predates these symbols, dispatch then stays BF16.
             dense_gemm_f32out: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_f32out"),
@@ -239,9 +261,7 @@ impl MoeLayer {
             gate_ptrs_t: None,
             up_ptrs_t: None,
             down_ptrs_t: None,
-            gate_sfb_cutlass: None,
-            up_sfb_cutlass: None,
-            down_sfb_cutlass: None,
+            cutlass_grouped_host: None,
             _cutlass_sfb_owned: Vec::new(),
             down_t_scratch_packed: None,
             down_t_scratch_scale: None,
@@ -393,9 +413,7 @@ impl MoeLayer {
             bf16_gate_weight_ptrs: None,
             bf16_up_weight_ptrs: None,
             bf16_down_weight_ptrs: None,
-            bf16_shared_gate: None,
-            bf16_shared_up: None,
-            bf16_shared_down: None,
+            bf16_shared_expert: None,
             fp8_shared_expert: None,
             moe_down_t_k64_fp4: super::super::try_kernel(
                 gpu,
@@ -405,6 +423,7 @@ impl MoeLayer {
             moe_permute_tokens_k: super::super::try_kernel(gpu, "moe", "moe_permute_tokens"),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,
+            lora: None,
             correction_bias_dev: weights_correction_bias,
             // `moe_topk_sig` is only registered for sigmoid-gated MoE models
             // (MiniMax-M2, Nemotron-Nano, Nemotron-Super). Softmax-gated MoEs

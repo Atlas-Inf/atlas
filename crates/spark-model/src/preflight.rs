@@ -22,6 +22,8 @@ use anyhow::{Result, bail};
 use atlas_core::config::ModelConfig;
 use spark_runtime::weights::WeightStore;
 
+mod deepseek_v4;
+
 /// Run all model-agnostic + model-type-specific pre-flight checks.
 ///
 /// Called by `spark-server/src/main.rs` immediately after the
@@ -33,9 +35,21 @@ use spark_runtime::weights::WeightStore;
 /// if the user didn't ask for speculative decoding, MTP tensors in the
 /// checkpoint are harmless dead weight and do not warrant a bail.
 pub fn preflight(store: &WeightStore, config: &ModelConfig, use_speculative: bool) -> Result<()> {
+    // NLLB / M2M-100 is an encoder-decoder checkpoint: the tied embedding is
+    // `model.shared.weight`, layers span separate encoder + decoder stacks, and
+    // there is cross-attention — none of which fit these decoder-only checks.
+    // `NllbGpuModel::new` validates its own weights (presence + bf16 dtype).
+    if matches!(config.model_type.as_str(), "m2m_100" | "nllb") {
+        tracing::info!(
+            "Pre-flight: NLLB/M2M-100 encoder-decoder — generic checks skipped \
+             (weights validated in NllbGpuModel::new)"
+        );
+        return Ok(());
+    }
     // Model-agnostic checks — driven purely by `store.names()` and
     // `config` (which already carries the parsed `config.json` values).
     check_quant_method(config)?;
+    deepseek_v4::check_native_dspark_checkpoint(store, config, use_speculative)?;
     check_embedding_and_head(store)?;
     let max_layer_idx = check_layer_count(store, config)?;
     check_expert_count(store, config)?;

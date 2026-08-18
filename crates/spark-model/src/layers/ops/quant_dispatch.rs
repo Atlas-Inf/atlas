@@ -45,6 +45,12 @@ pub fn quant_gemv(
             stream,
         ),
         QuantWeight::Dense(w) => dense_gemv(gpu, gemv_dense, input, w, output, n, k, stream),
+        // PackedQ2 has no companion kernel handle here (its GEMV is
+        // `q2_0_gemv_vec`, dispatched at the layer's own sites, not via this
+        // generic 3-kernel helper). Bail rather than misdispatch.
+        QuantWeight::PackedQ2(_) => anyhow::bail!(
+            "quant_gemv: PackedQ2 not routed through the generic dispatcher; use q2_0_gemv_vec"
+        ),
     }
 }
 
@@ -81,6 +87,10 @@ pub fn quant_gemm(
             stream,
         ),
         QuantWeight::Dense(w) => dense_gemm(gpu, gemm_dense, input, w, output, m, n, k, stream),
+        QuantWeight::PackedQ2(_) => anyhow::bail!(
+            "quant_gemm: PackedQ2 not routed through the generic dispatcher; \
+             use the layer's transient-dequant prefill path"
+        ),
     }
 }
 
@@ -102,7 +112,7 @@ pub fn w4a16_gemv(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 4), 1, 1])
+        .grid([w4a16_gemv_grid_x(n), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
@@ -178,9 +188,10 @@ pub fn w4a16_gemv_batch3(
 ///
 /// Reads the NVFP4 weight matrix ONCE and computes `m` outputs (one per seq),
 /// amortizing the weight read across the batch. `kernel` is `w4a16_gemv_batch4`
-/// (M<=4) or `w4a16_gemv_batch16` (M<=16). A:`[m,K]` BF16, C:`[m,N]` BF16.
+/// (M<=4), `w4a16_gemv_batch8` (M<=8, chain verify) or `w4a16_gemv_batch16`
+/// (M<=16). A:`[m,K]` BF16, C:`[m,N]` BF16.
 ///
-/// Kernel: `w4a16_gemv_batch4/16(A, B_packed, B_scale, scale2, C, M, N, K)`
+/// Kernel: `w4a16_gemv_batch4/8/16(A, B_packed, B_scale, scale2, C, M, N, K)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 pub fn w4a16_gemv_batchm(
     gpu: &dyn GpuBackend,
@@ -193,6 +204,10 @@ pub fn w4a16_gemv_batchm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // Largest template is w4a16_gemv_batch16 (MAX_M=16). Above that the
+    // kernel SILENTLY truncates: rows 0..15 computed, rows 16.. never
+    // written — garbage output, not a crash.
+    debug_assert!(m <= 16, "w4a16_gemv_batchm caps at M=16 (m={m})");
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])

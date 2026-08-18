@@ -39,6 +39,33 @@ pub(crate) struct Fp8ExpertPtrTable {
     pub(crate) scale_ptrs: DevicePtr,
 }
 
+/// Checkpoint-native BF16 weights for a shared expert.
+///
+/// This is intentionally independent of routed-expert precision. Models such
+/// as Laguna ship NVFP4 routed experts but explicitly exempt the shared expert
+/// from quantization, so coupling these pointers to the all-BF16 routed path
+/// silently changes model numerics.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bf16SharedExpert {
+    gate_proj: DenseWeight,
+    up_proj: DenseWeight,
+    down_proj: DenseWeight,
+}
+
+impl Bf16SharedExpert {
+    fn new(gate_proj: DenseWeight, up_proj: DenseWeight, down_proj: DenseWeight) -> Result<Self> {
+        anyhow::ensure!(
+            !gate_proj.weight.is_null() && !up_proj.weight.is_null() && !down_proj.weight.is_null(),
+            "BF16 shared expert requires non-null gate/up/down weights"
+        );
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+}
+
 /// Unified expert pointer table for any quantization format.
 ///
 /// Replaces the separate `ExpertPtrTable` (NVFP4) and `Fp8ExpertPtrTable` (FP8)
@@ -91,8 +118,11 @@ pub struct MoeLayer {
     pre_expert_norm_k: spark_runtime::gpu::KernelHandle,
     dense_gemv: KernelHandle,
     w4a16_gemv: KernelHandle,
+    /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
+    w4a16_gemv_sw: KernelHandle,
     w4a16_gemm: KernelHandle,
     dense_gemm: KernelHandle,
+    dense_gemm_pipelined: KernelHandle,
     /// FP32-output router GEMM + FP32-input top-K for the ATLAS_FP32_GATE path.
     /// Zero (unresolved) when the kernels are absent; dispatch falls back to BF16.
     dense_gemm_f32out: KernelHandle,
@@ -143,16 +173,16 @@ pub struct MoeLayer {
     gate_ptrs_t: Option<ExpertPtrTable>,
     up_ptrs_t: Option<ExpertPtrTable>,
     down_ptrs_t: Option<ExpertPtrTable>,
-    /// CUTLASS grouped-NVFP4 swizzled SFB weight-scale tables
-    /// (`ATLAS_HOLO_MOE_GROUPED_CUTLASS`). Device `[num_experts]` u64 arrays of
-    /// per-expert SFB pointers, built at load by `build_cutlass_grouped_sfb` from
-    /// the `gate_ptrs_t`/`up_ptrs_t` `[K/16,N]` scales (`pack_weight_sfb` swizzle).
-    /// The grouped kernel reads `gate_ptrs.packed` (`[N,K/2]`) + these SFB + the
-    /// real per-expert `scale2`. `None` => the CUTLASS grouped path is unavailable.
-    gate_sfb_cutlass: Option<DevicePtr>,
-    up_sfb_cutlass: Option<DevicePtr>,
-    down_sfb_cutlass: Option<DevicePtr>,
-    /// Keeps the per-expert SFB buffers + the two pointer arrays alive.
+    /// CUTLASS grouped-NVFP4 host tables (`ATLAS_HOLO_MOE_GROUPED_CUTLASS`).
+    /// Per-expert packed/SFB pointer values + scale2, snapshotted ONCE at load
+    /// by `build_cutlass_grouped_sfb` (the SFB swizzle is built there from the
+    /// `gate_ptrs_t`/`up_ptrs_t` `[K/16,N]` scales via `pack_weight_sfb`). The
+    /// grouped C entry consumes these host-side, so the snapshot lives here —
+    /// owned by the layer, dying with the model — rather than in any global
+    /// cache keyed on device addresses, which a model swap's free/realloc
+    /// would turn stale. `None` => the CUTLASS grouped path is unavailable.
+    cutlass_grouped_host: Option<ops::MoeCutlassHostTables>,
+    /// Keeps the per-expert SFB buffers alive.
     _cutlass_sfb_owned: Vec<DevicePtr>,
     /// Lazy down_proj transpose scratch — populated at the start of each
     /// prefill call when the persistent transpose pass couldn't fit
@@ -343,12 +373,9 @@ pub struct MoeLayer {
     bf16_gate_weight_ptrs: Option<DevicePtr>,
     bf16_up_weight_ptrs: Option<DevicePtr>,
     bf16_down_weight_ptrs: Option<DevicePtr>,
-    // BF16 shared expert weights — direct device pointers for the
-    // fused-decode dispatch. Mirrors `fp8_shared_expert` but with raw
-    // BF16 pointers (no scale).
-    bf16_shared_gate: Option<DevicePtr>,
-    bf16_shared_up: Option<DevicePtr>,
-    bf16_shared_down: Option<DevicePtr>,
+    // Checkpoint-native BF16 shared expert. Independent of routed-expert
+    // precision so mixed NVFP4-routed/BF16-shared checkpoints stay faithful.
+    bf16_shared_expert: Option<Bf16SharedExpert>,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     fp8_shared_expert: Option<Fp8ExpertWeight>,
     /// FP4 down kernel handle (`moe_w4a16_down_t_k64_fp4`). `try_kernel` =>
@@ -371,6 +398,13 @@ pub struct MoeLayer {
     // path. Used to test whether the kernel choice is the dominant cause
     // of low DFlash drafter acceptance on FP4/FP8 targets.
     pub is_dflash_capture_layer: bool,
+    /// Feature-1 (MoE expert + router LoRA): this layer's installed router +
+    /// routed-expert deltas + apply scratch. `None` = no adapter / feature off
+    /// → the base MoE path is byte-identical. Set by
+    /// [`MoeLayer::set_lora_weights`] (`moe/lora.rs`); applied in the prefill
+    /// forward. Decode/verify paths are a phase-1 followup (they REFUSE rather
+    /// than silently drop the delta — see `reject_decode_lora`).
+    pub(crate) lora: Option<MoeLoraWeights>,
 }
 
 impl MoeLayer {
@@ -403,8 +437,13 @@ impl MoeLayer {
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod dump;
 mod forward;
+mod lora;
+mod lora_gateup;
+mod lora_router;
+pub(crate) use lora::MoeLoraWeights;
 mod forward_atomic_c4;
 mod forward_batched;
+mod forward_batched_gate;
 mod forward_ep;
 mod forward_k2;
 mod forward_k3;
@@ -422,4 +461,5 @@ mod init;
 #[cfg(test)]
 mod mod_tests;
 mod ptr_table_build;
+mod union_stats;
 pub(crate) use ptr_table_build::*;

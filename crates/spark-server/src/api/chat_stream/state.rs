@@ -49,6 +49,15 @@ pub(super) struct StreamState {
     /// Flips true on first stop-string match or on watchdog/dedup
     /// trip; suppresses further content emissions.
     pub(super) stop_string_triggered: bool,
+    /// True only when a CLIENT `stop` sequence actually matched
+    /// (`apply_stop_string_holdback` hit) — distinct from
+    /// `stop_string_triggered`, which the watchdog/leak guards also
+    /// set as an output-suppression device. Read by `handle_done`: a
+    /// matched stop sequence is wire `finish_reason="stop"` per the
+    /// OpenAI contract, never "length" (the scheduler can still say
+    /// "length" when the cancel landed a step late and the budget ran
+    /// out first). Set via [`StreamState::note_stop_string_match`].
+    pub(super) stop_string_matched: bool,
     /// Sanitiser state: suppressing content while waiting for a
     /// matching `</parameter>` close after an orphan `<parameter=`.
     pub(super) suppressing_param_leak: bool,
@@ -121,6 +130,12 @@ pub(super) struct StreamState {
     /// "response was forcibly truncated" and gives every agent a
     /// clean hook to break its outer retry loop.
     pub(super) tool_loop_capped: bool,
+    /// Scheduler-side guard that force-finished the sequence (from
+    /// `StreamEvent::Done.guard_stop`, e.g. "fuzzy_repetition") — surfaced
+    /// in the synthesized --dump body only.
+    pub(super) guard_stop: Option<&'static str>,
+    /// P0-3: one corrective empty-required-args content chunk per response.
+    pub(super) corrective_hint_sent: bool,
     /// Cooperative cancellation flag shared with the scheduler. Flipped
     /// true on any forced-stop condition (`tool_loop_capped`, loop-
     /// watchdog fire, …); the scheduler reads it in
@@ -140,16 +155,21 @@ pub(super) struct StreamState {
     /// thinking-phase tokens short-circuit with empty SSE output until
     /// the scheduler picks up the cancel_flag and finalises.
     pub(super) reasoning_xml_leak_detected: bool,
+    /// How many distinct tool-call openers the scanner has seen in this
+    /// stream's reasoning. Compared against
+    /// `ChatLevers::in_think_leak_openers` to decide when stripping
+    /// escalates to cancellation.
+    pub(super) reasoning_xml_opener_hits: u32,
     /// Streaming tool-call detector (`Some` iff `tools_active`).
     pub(super) detector: Option<tool_parser::StreamingToolDetector>,
     /// True iff the reasoning/`<think>` phase has finished. Starts
     /// `true` when the request did not enable thinking.
     pub(super) thinking_done: bool,
     /// Dead after the tool-call retry stack was removed (`tool_retry_enabled`
-    /// is now constant `false`, so chunks are always streamed in real time
+    /// is now constant `false`, so deltas are always streamed in real time
     /// and this map stays empty). Retained so the buffering helpers in
     /// `tool_handlers.rs` still type-check.
-    pub(super) buffered_tool_chunks: std::collections::HashMap<usize, Vec<String>>,
+    pub(super) buffered_tool_chunks: std::collections::HashMap<usize, Vec<crate::ir::StreamDelta>>,
     /// Dead after the tool-call retry stack was removed; never set now that
     /// `tool_retry_enabled` is constant `false`.
     pub(super) pending_retry: Option<PendingRetry>,
@@ -188,6 +208,7 @@ impl StreamState {
             stop_string_emitted_len: 0,
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,
+            stop_string_matched: false,
             suppressing_param_leak: false,
             suppress_streak_tokens: 0,
             inside_envelope: false,
@@ -206,9 +227,12 @@ impl StreamState {
             tool_calls_emitted_count: 0,
             name_run: None,
             tool_loop_capped: false,
+            guard_stop: None,
+            corrective_hint_sent: false,
             cancel_flag,
             reasoning_xml_scan_buf: String::new(),
             reasoning_xml_leak_detected: false,
+            reasoning_xml_opener_hits: 0,
             detector: if tools_active {
                 Some(tool_parser::StreamingToolDetector::new_with_tools(
                     tool_defs,
@@ -221,5 +245,42 @@ impl StreamState {
             pending_retry: None,
             pending_token_ids: Vec::new(),
         }
+    }
+
+    /// A client `stop` sequence matched in the emitted text. Records
+    /// the match for `handle_done` (wire `finish_reason="stop"` — see
+    /// `stop_string_matched`) and flips the scheduler's cancel flag so
+    /// generation actually ends at the next decode boundary instead of
+    /// burning suppressed tokens until natural EOS / max_tokens (the
+    /// exact hazard the `cancel_flag` doc in `inference_types.rs`
+    /// describes).
+    pub(super) fn note_stop_string_match(&mut self) {
+        self.stop_string_matched = true;
+        self.cancel_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod stop_string_match_tests {
+    use super::StreamState;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn note_stop_string_match_records_and_cancels() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut s = StreamState::new(false, false, flag.clone(), Vec::new());
+        assert!(!s.stop_string_matched, "fresh stream: no match yet");
+        assert!(!flag.load(Ordering::Acquire));
+        s.note_stop_string_match();
+        assert!(
+            s.stop_string_matched,
+            "match must be recorded for handle_done"
+        );
+        assert!(
+            flag.load(Ordering::Acquire),
+            "scheduler cancel flag must flip so generation stops"
+        );
     }
 }

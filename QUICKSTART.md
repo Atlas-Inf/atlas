@@ -23,8 +23,9 @@ Run state-of-the-art language models on a single NVIDIA DGX Spark (GB10).
 sudo apt-get update && sudo apt-get install -y \
     build-essential pkg-config git cmake clang libclang-dev
 # CUDA 13.0 toolkit must already be installed; `nvcc --version` should report 13.0.
-# The vendored xgrammar-rs build fetches https://github.com/mlc-ai/xgrammar.git
-# at build time — set `XGRAMMAR_SRC_DIR=/path/to/local/clone` for air-gapped builds.
+# Nothing is fetched from the network at build time: `crates/xgrammar` is a
+# pure-Rust in-tree port (ADR 0010) with no build.rs, so the old
+# `XGRAMMAR_SRC_DIR` air-gap escape hatch no longer exists and is not read.
 ```
 
 The first `cargo build --release -p spark-server` takes ~15-30 minutes (PTX
@@ -153,6 +154,64 @@ curl -s http://localhost:8888/v1/chat/completions \
     "max_tokens": 512
   }'
 ```
+
+> **EXIF orientation is applied automatically.** Cameras usually store a photo
+> the way the sensor read it and record which way is up in an EXIF tag, so a
+> phone picture is often held sideways in the file. Atlas rotates on decode, so
+> the model sees the image the same way your phone, browser and file manager
+> show it. Images without the tag — and every PNG — are untouched.
+
+**Send a video:**
+
+> ### ⚠️ VIDEO REQUIRES `ffmpeg` ON THE HOST
+>
+> Atlas does **not** bundle a video decoder. Animated **GIF** decodes
+> in-process (pure Rust, no dependency). **Every other container — MP4/MOV,
+> WebM/Matroska, AVI, i.e. H.264, H.265, VP9, AV1 — is decoded by running
+> `ffmpeg`**, which must be installed on the host and enabled with
+> `--video-allow-ffmpeg`.
+>
+> ```bash
+> sudo apt install ffmpeg      # Debian / Ubuntu
+> sudo dnf install ffmpeg      # Fedora / RHEL
+> ```
+>
+> Without the flag, a video part is refused with a 400 naming the flag.
+> With the flag but no `ffmpeg` on `PATH`, the server **warns loudly at
+> startup** and every video request fails naming the binary. The official
+> container image ships `ffmpeg`.
+
+Start the server with video decoding enabled:
+
+```bash
+    ... \
+    --video-allow-ffmpeg \
+    --video-fps 2 \
+    --video-max-frames 768
+```
+
+Then send a clip as a base64 `data:` URI:
+
+```bash
+curl -s http://localhost:8888/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What happens in this clip?"},
+        {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,<BASE64_DATA>"}}
+      ]
+    }],
+    "max_tokens": 512
+  }'
+```
+
+A video is sampled at `--video-fps` (default 2, matching the checkpoints'
+own `video_processor` block) and costs vision tokens per sampled frame, so
+a long clip at a high rate can dominate the context budget. `--video-fps`
+and `--video-max-frames` are the two levers.
 
 ---
 

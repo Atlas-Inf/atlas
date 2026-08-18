@@ -24,67 +24,27 @@ impl MoeLayer {
         let total_expanded = n * top_k;
         let ne = num_experts as usize;
 
-        let (gp, up, dp, sg, su, sd) = match (
+        let (gp, up, dp) = match (
             self.bf16_gate_weight_ptrs,
             self.bf16_up_weight_ptrs,
             self.bf16_down_weight_ptrs,
-            self.bf16_shared_gate,
-            self.bf16_shared_up,
-            self.bf16_shared_down,
         ) {
-            (Some(g), Some(u), Some(d), Some(sg), Some(su), Some(sd)) => (g, u, d, sg, su, sd),
+            (Some(g), Some(u), Some(d)) => (g, u, d),
             _ => anyhow::bail!("BF16 expert pointer tables not set"),
         };
 
         // ── Shared expert (BF16 dense GEMM) ──
-        let has_shared = shared_inter > 0 && !sg.is_null();
+        let has_shared = shared_inter > 0 && self.bf16_shared_expert.is_some();
         if has_shared {
-            let shared_gate_out = ctx.buffers.ssm_deinterleaved();
-            let shared_up_out = ctx.buffers.ssm_qkvz();
-            let sh_gate_w = DenseWeight { weight: sg };
-            let sh_up_w = DenseWeight { weight: su };
-            let sh_down_w = DenseWeight { weight: sd };
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm,
+            self.run_bf16_shared_expert(
                 input,
-                &sh_gate_w,
-                shared_gate_out,
-                n,
-                shared_inter,
-                h,
-                stream,
-            )?;
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm,
-                input,
-                &sh_up_w,
-                shared_up_out,
-                n,
-                shared_inter,
-                h,
-                stream,
-            )?;
-            ops::silu_mul(
-                ctx.gpu,
-                self.moe_act_mul,
-                shared_gate_out,
-                shared_up_out,
-                shared_gate_out,
-                n * shared_inter,
-                stream,
-            )?;
-            let shared_down_out = ctx.buffers.attn_output();
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm,
-                shared_gate_out,
-                &sh_down_w,
-                shared_down_out,
                 n,
                 h,
                 shared_inter,
+                ctx.buffers.ssm_deinterleaved(),
+                ctx.buffers.ssm_qkvz(),
+                ctx.buffers.attn_output(),
+                ctx,
                 stream,
             )?;
         }
@@ -107,20 +67,17 @@ impl MoeLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm,
-                router_in,
-                &self.weights.gate,
-                gate_logits,
-                n,
-                num_experts,
-                h,
-                stream,
-            )?;
+            // Selection numerics — see router_gate_gemm_dense for why this
+            // must stay on the scalar kernel (2026-08-12 BFCL regression).
+            self.router_gate_gemm_dense(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
         }
 
         super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+
+        // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
+        // logits BEFORE top-k (device-clean, no capture guard). No-op unless a
+        // router delta is installed.
+        self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
 
         let scratch = ctx.buffers.scratch();
         let indices_dev = scratch;
@@ -217,6 +174,19 @@ impl MoeLayer {
                 max_m_tiles,
                 stream,
             )?;
+            // Feature-1: fold gate/up_proj deltas onto the sorted BF16
+            // `expert_gate_out`/`expert_up_out` BEFORE `silu_mul` (x = token-major
+            // `input`). Same device kernel + sorted layout as the nvfp4 path.
+            self.apply_expert_lora_prefill_gateup(
+                expert_gate_out,
+                expert_up_out,
+                input,
+                expert_offsets,
+                sorted_token_ids,
+                total_expanded,
+                ctx,
+                stream,
+            )?;
             ops::silu_mul(
                 ctx.gpu,
                 self.moe_act_mul,
@@ -241,6 +211,20 @@ impl MoeLayer {
                 stream,
             )?;
         }
+
+        // Feature-1: fold the routed-expert down_proj LoRA deltas onto the sorted
+        // BF16 `expert_down_out` BEFORE the unpermute + weighted reduce (same
+        // device kernel + sorted layout as the nvfp4 path). No-op unless deltas
+        // are installed.
+        self.apply_expert_lora_prefill_down(
+            expert_gate_out,
+            expert_down_out,
+            expert_offsets,
+            sorted_token_ids,
+            total_expanded,
+            ctx,
+            stream,
+        )?;
 
         let output = ctx.buffers.moe_output();
         ops::moe_unpermute_reduce_indexed(

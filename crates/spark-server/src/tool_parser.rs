@@ -14,6 +14,11 @@ use crate::grammar::{GrammarEngine, GrammarError};
 use xgrammar::CompiledGrammar;
 
 /// Global counter for unique tool call IDs across all requests.
+/// STATIC, DELIBERATELY — process lifecycle. It generates the `call_*` ids
+/// Atlas hands to clients, and uniqueness must hold across EVERY call the
+/// process emits: an agent holds tool-call ids across turns, and a model
+/// swap mid-session must not restart the sequence and collide with an id the
+/// client is still tracking. It is an id source, not a measurement.
 static TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a globally unique tool call ID.
@@ -246,12 +251,23 @@ impl LeakMarkers {
     };
 }
 
+pub use prompt_levers::PromptLevers;
+
 pub trait ToolCallParser: Send + Sync {
     /// Parser name for logging (e.g. "hermes", "qwen3_coder").
     fn name(&self) -> &str;
 
     /// Generate the system prompt that teaches the model how to make tool calls.
-    fn system_prompt(&self, tools: &[ToolDefinition], tool_choice: &ToolChoice) -> String;
+    ///
+    /// `levers` carries the model's `[behavior]` prompt-rendering decisions
+    /// (currently TSCG). Passed in rather than read from a global so a
+    /// parser renders under the levers of the model it was loaded for.
+    fn system_prompt(
+        &self,
+        tools: &[ToolDefinition],
+        tool_choice: &ToolChoice,
+        levers: &PromptLevers,
+    ) -> String;
 
     /// Format assistant tool_calls as text for multi-turn chat template injection.
     fn format_tool_calls(&self, calls: &[IncomingToolCall]) -> String;
@@ -343,6 +359,20 @@ pub trait ToolCallParser: Send + Sync {
     fn wants_typed_arguments(&self) -> bool {
         false
     }
+
+    /// Whether this format encodes a ZERO-ARGUMENT call as a bare tool name
+    /// inside the `<tool_call>` envelope (Poolside v1 only). Every other
+    /// format has a well-formed zero-argument encoding (`{"name":"f",
+    /// "arguments":{}}`, `<function=f></function>`, …), so for them a bare
+    /// identifier is malformed output and promoting it FABRICATES a call the
+    /// model never made. Measured: the un-gated promotion that shipped with
+    /// the 2026-08-12 batch4 stack surfaced phantom calls on the Qwen3.6-35B
+    /// FP8 BFCL leg — irrelevance-class samples score "did it call at all",
+    /// so each phantom flips a correct sample to wrong (bfcl-subset-echolp
+    /// residual after the router-GEMM pin: 86.95 → 86.32 normalized).
+    fn promotes_bare_call_names(&self) -> bool {
+        false
+    }
 }
 
 impl std::fmt::Display for dyn ToolCallParser {
@@ -362,7 +392,9 @@ pub enum ToolCallFormat {
     Gemma4,
     Mistral,
     MinimaxXml,
+    DeepseekV4,
     BareJson,
+    PoolsideV1,
 }
 
 impl std::str::FromStr for ToolCallFormat {
@@ -375,9 +407,11 @@ impl std::str::FromStr for ToolCallFormat {
             "gemma4" => Ok(Self::Gemma4),
             "mistral" => Ok(Self::Mistral),
             "minimax_xml" => Ok(Self::MinimaxXml),
+            "deepseek_v4" | "dsml" => Ok(Self::DeepseekV4),
             "bare_json" => Ok(Self::BareJson),
+            "poolside_v1" => Ok(Self::PoolsideV1),
             other => Err(format!(
-                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, bare_json",
+                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, deepseek_v4, bare_json, poolside_v1",
             )),
         }
     }
@@ -393,7 +427,9 @@ impl ToolCallFormat {
             Self::Gemma4 => Box::new(Gemma4Parser),
             Self::Mistral => Box::new(MistralNativeParser),
             Self::MinimaxXml => Box::new(MinimaxXmlParser),
+            Self::DeepseekV4 => Box::new(DeepseekV4DsmlParser),
             Self::BareJson => Box::new(BareJsonParser),
+            Self::PoolsideV1 => Box::new(PoolsideV1Parser),
         }
     }
 
@@ -419,7 +455,9 @@ impl ToolCallFormat {
             Self::Gemma4 => "gemma4",
             Self::Mistral => "mistral",
             Self::MinimaxXml => "minimax_xml",
+            Self::DeepseekV4 => "deepseek_v4",
             Self::BareJson => "bare_json",
+            Self::PoolsideV1 => "poolside_v1",
         }
     }
 }
@@ -428,6 +466,7 @@ impl ToolCallFormat {
 
 // ── Sub-modules (split from monolithic file) ──
 mod bare_json;
+mod deepseek_v4_dsml;
 mod fuzzy_match;
 mod gemma4;
 mod helpers_a;
@@ -441,15 +480,19 @@ mod parse_single_b;
 mod parse_tools_tag;
 mod pipeline;
 mod pipeline_helpers;
+mod poolside_v1;
+mod prompt_levers;
 mod qwen3_coder;
 mod qwen3_xml;
 mod streaming;
 mod streaming_emit;
+mod streaming_flush;
 mod streaming_impl;
 mod type_coerce;
 pub(crate) mod validation;
 
 pub use bare_json::*;
+pub use deepseek_v4_dsml::*;
 pub use gemma4::*;
 use helpers_a::*;
 use helpers_b::*;
@@ -462,6 +505,7 @@ use parse_single_b::*;
 use parse_tools_tag::*;
 pub use pipeline::*;
 use pipeline_helpers::*;
+pub use poolside_v1::*;
 pub use qwen3_coder::*;
 pub use qwen3_xml::*;
 pub use streaming::*;

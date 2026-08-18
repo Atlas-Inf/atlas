@@ -35,6 +35,16 @@ impl Qwen3SsmLayer {
         } else {
             ctx.buffers.ssm_qkvz()
         };
+        // Tier-1c keep-packed Q2_0: transient-dequant the fused qkvz then dense
+        // GEMM. Bonsai is `sequential_qkvz`, so `proj_dst == deinterleaved` and
+        // no post-deinterleave is needed. Highest priority (all other weight
+        // slots are NULL on this path).
+        if self.qkvz_q2.is_some() {
+            let scratch = ctx.buffers.q2_dequant_scratch();
+            let act_q8 = ctx.buffers.q2_act_q8();
+            self.qkvz_q2_prefill_gemm(ctx.gpu, normed, proj_dst, scratch, act_q8, k, stream)?;
+            return Ok(());
+        }
         // Env override: ATLAS_GDN_BF16_WEIGHTS=1 forces the BF16 dense
         // GEMM path for QKVZ — bypassing both FP8 and NVFP4 weight-quant
         // paths. Tests whether weight-quantization noise on qkvz (esp.
@@ -44,18 +54,67 @@ impl Qwen3SsmLayer {
             std::env::var("ATLAS_GDN_BF16_WEIGHTS").ok().as_deref(),
             Some("1")
         );
-        let force_w8a8 = ops::fp8_blockscaled_prefill_enabled();
+        // PER-ROW FP8 straight from a mixed-precision checkpoint
+        // (`ATLAS_FP8_ROWWISE=1`), dequantised ONCE to BF16 and multiplied by
+        // cuBLASLt. Ahead of every arm below because it is the only one that
+        // never re-quantises: FP8 E4M3 is exactly representable in BF16, so
+        // the checkpoint's precision survives, where the default path
+        // dequantises to BF16 and then throws half of it away again by
+        // quantising to NVFP4.
+        //
+        // NOT the row-wise FP8 GEMM this was first written against —
+        // `cublaslt::fp8_gemm_act_weight_t_rowwise` returns NOT_SUPPORTED on
+        // sm_121 (measured 2026-08-15, and reproduced through the
+        // block-scaled path with `ATLAS_CUBLAS_FP8=1`, so it is the GEMM and
+        // not the weights). Keeping FP8 all the way needs a kernel that works
+        // on this hardware; until then BF16 is what buys the precision back.
+        //
+        // `force_bf16` still wins, so the `ATLAS_GDN_BF16_WEIGHTS` A/B lever
+        // keeps working.
+        if !force_bf16 && let Some(ref fp8w) = self.qkvz_fp8w_rowwise {
+            // This arm returns EARLY, so it shadows the CUTLASS / cuBLAS arms
+            // below. That is deliberate — its whole point is precision, and
+            // every arm it shadows consumes the NVFP4 copy, i.e. the
+            // double-quantised weights this exists to avoid — but an operator
+            // who set a CUTLASS flag and silently did not get it would have no
+            // way to tell. Say so, once.
+            if ctx.dispatch.cutlass_nvfp4_qkvz || ctx.dispatch.cutlass_gemm {
+                static SHADOW_WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SHADOW_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "ATLAS_FP8_ROWWISE is shadowing an enabled CUTLASS/cuBLAS QKVZ \
+                         prefill arm: the row-wise arm keeps the checkpoint's precision, \
+                         the shadowed arms would consume the re-quantised NVFP4 copy. \
+                         Unset ATLAS_FP8_ROWWISE to get the CUTLASS path back."
+                    );
+                }
+            }
+            ops::cublas_bf16_proj(
+                ctx.gpu,
+                ctx.derived,
+                normed,
+                fp8w,
+                proj_dst,
+                k,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
+            return Ok(());
+        }
+        let force_w8a8 = ctx.dispatch.fp8_blockscaled_prefill;
         // High-efficiency cuBLASLt BF16 GEMM path (ATLAS_CUBLAS_GEMM=1). The
         // hand-written blockscaled mma.sync GEMM hits only ~30% of the cuBLAS
         // ceiling on GB10 (32 vs 85 TFLOPS bf16 on this shape). Dequant the FP8
         // weight to BF16 once (cached), then route the projection through
         // cuBLASLt. W16A16 here is strictly more accurate than the W8A8 path.
-        if ops::cutlass_nvfp4_qkvz_enabled()
+        if ctx.dispatch.cutlass_nvfp4_qkvz
             && let Some(ref nvfp4_t) = self.qkvz_nvfp4_t
         {
-            ops::log_cutlass_nvfp4_route("ssm_qkvz_nvfp4", k, qkvz_size as u32, h as u32);
+            ops::log_cutlass_nvfp4_route(ctx.gpu, "ssm_qkvz_nvfp4", k, qkvz_size as u32, h as u32);
             ops::cutlass_nvfp4_proj(
-                ctx.gpu,
+                ctx,
                 normed,
                 nvfp4_t,
                 proj_dst,
@@ -64,12 +123,18 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
-        } else if ops::cutlass_nvfp4_qkvz_enabled()
+        } else if ctx.dispatch.cutlass_nvfp4_qkvz
             && let Some(ref fp8w) = self.qkvz_fp8w
         {
-            ops::log_cutlass_nvfp4_route("ssm_qkvz_fp8pack", k, qkvz_size as u32, h as u32);
-            ops::cutlass_nvfp4_proj_from_fp8(
+            ops::log_cutlass_nvfp4_route(
                 ctx.gpu,
+                "ssm_qkvz_fp8pack",
+                k,
+                qkvz_size as u32,
+                h as u32,
+            );
+            ops::cutlass_nvfp4_proj_from_fp8(
+                ctx,
                 normed,
                 fp8w,
                 proj_dst,
@@ -78,11 +143,12 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
-        } else if ops::cutlass_gemm_enabled()
+        } else if ctx.dispatch.cutlass_gemm
             && let Some(ref fp8w) = self.qkvz_fp8w
         {
             ops::cutlass_bf16_proj(
                 ctx.gpu,
+                ctx.derived,
                 normed,
                 fp8w,
                 proj_dst,
@@ -91,11 +157,12 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
-        } else if ops::cublas_fp8_enabled()
+        } else if ctx.dispatch.cublas_fp8
             && let Some(ref fp8w) = self.qkvz_fp8w
         {
             ops::cublas_fp8_rowwise_proj(
                 ctx.gpu,
+                ctx.derived,
                 normed,
                 ctx.buffers.fp8_act(),
                 ctx.buffers.fp8_act_scale(),
@@ -106,11 +173,12 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
-        } else if ops::cublas_gemm_enabled()
+        } else if ctx.dispatch.cublas_gemm
             && let Some(ref fp8w) = self.qkvz_fp8w
         {
             ops::cublas_bf16_proj(
                 ctx.gpu,
+                ctx.derived,
                 normed,
                 fp8w,
                 proj_dst,
@@ -120,11 +188,19 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if force_bf16 {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
+            // cuBLASLt, NOT the hand-written `dense_gemm`. The weights are
+            // already BF16 [N,K] on this path, so there is no dequant step and
+            // nothing to cache — `cublas_bf16_proj_dense` exists for exactly
+            // this shape.
+            //
+            // MEASURED 2026-08-15 on unsloth/Qwen3.8-27B-NVFP4: this lever
+            // through `dense_gemm` cost 72.9% of prefill (507 -> 137 tok/s),
+            // which is what made "keep the GDN weights BF16" look like a
+            // quality-for-speed trade. It was never the precision — it was
+            // the GEMM.
+            ops::cublas_bf16_proj_dense(
                 normed,
-                &self.ssm.in_proj_qkvz,
+                self.ssm.in_proj_qkvz.weight,
                 proj_dst,
                 k,
                 qkvz_size as u32,
@@ -133,7 +209,7 @@ impl Qwen3SsmLayer {
             )
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "ssm prefill: QKVZ BF16 dense GEMM failed (M={k}, N={qkvz_size}): {e}"
+                    "ssm prefill: QKVZ BF16 cuBLASLt GEMM failed (M={k}, N={qkvz_size}): {e}"
                 )
             })?;
         } else if force_w8a8

@@ -299,8 +299,8 @@ impl Qwen3SsmLayer {
 
         // Recurrence kernel dispatch hoisted to trait_prefill_recur.rs to
         // keep this file under the 500 LoC cap; behavior identical.
-        self.prefill_gdn_recurrence(
-            ssm_state.h_state,
+        self.prefill_gdn_recurrence_staged(
+            ssm_state,
             q_ptr,
             k_ptr,
             v_ptr,
@@ -405,11 +405,7 @@ impl Qwen3SsmLayer {
             None
         };
 
-        // ATLAS_DUMP_EXPERT_IDS=1 also dumps the residual_add_rms_norm
-        // INPUTS (hidden + out_proj_buf separately) for last token.
-        // This isolates whether the gate-input direction-divergence vs HF
-        // comes from (a) hidden being corrupted, (b) out_proj_buf differing,
-        // or (c) the residual_add_rms_norm kernel itself computing differently.
+        // ATLAS_DUMP_EXPERT_IDS=1: also dumps residual_add_rms_norm INPUTS (hidden + out_proj_buf) for drift attribution.
         if std::env::var("ATLAS_DUMP_EXPERT_IDS").ok().as_deref() == Some("1") {
             ctx.gpu.synchronize(stream)?;
             let offset = (num_tokens - 1) * h * 2;

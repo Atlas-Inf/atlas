@@ -38,6 +38,21 @@ impl TransformerModel {
         kv_cache: &mut PagedKvCache,
         stream: u64,
     ) -> Result<AttnMetadataDev> {
+        // Fixed-stride metadata gaps, DERIVED from the serve max_batch_size
+        // (`buffers.decode_meta()`, rows = max(32, bs)): positions u32
+        // [0,4R), LoRA seq_slot [4R,8R), slots i64 [8R,16R), seq_lens
+        // [16R,20R), block table at +24R with R rows. At R=32 this is the
+        // legacy 0/128/256/512/768 layout byte-for-byte, so every bs<=32
+        // boot is byte-identical. padded_n above R would silently corrupt
+        // the slots region — the derived ceiling check keeps aacd29cb's
+        // safety intent.
+        let lay = self.buffers.decode_meta();
+        anyhow::ensure!(
+            padded_n <= lay.rows(),
+            "upload_batch_metadata_fixed: padded_n={padded_n} exceeds the {}-row \
+             derived metadata layout (rows = max(32, --max-batch-size))",
+            lay.rows()
+        );
         let n = seqs.len();
         let block_size = kv_cache.block_size();
         let max_blocks = self.max_blocks_per_seq;
@@ -106,29 +121,176 @@ impl TransformerModel {
 
         self.gpu.copy_h2d_async(&pos_bytes, meta_base, stream)?;
         self.gpu
-            .copy_h2d_async(&slot_bytes, meta_base.offset(256), stream)?;
+            .copy_h2d_async(&slot_bytes, meta_base.offset(lay.slots_off()), stream)?;
         self.gpu
-            .copy_h2d_async(&sl_bytes, meta_base.offset(512), stream)?;
+            .copy_h2d_async(&sl_bytes, meta_base.offset(lay.seq_lens_off()), stream)?;
         self.gpu
-            .copy_h2d_async(&bt_bytes, meta_base.offset(768), stream)?;
+            .copy_h2d_async(&bt_bytes, meta_base.offset(lay.block_table_off()), stream)?;
+
+        // M2 per-request LoRA routing: upload the per-seq adapter-slot buffer
+        // to the dedicated gap at meta_base+seq_slot_off (positions occupy
+        // [0,4R) exactly; slots begin at 8R — never overlaps by construction).
+        // Fixed address, per-step contents → graph-safe. `DevicePtr(0)` when
+        // no adapter is resident (the bgmv apply sites then no-op).
+        let seq_slot =
+            self.upload_seq_slots(seqs, padded_n, meta_base.offset(lay.seq_slot_off()), stream)?;
+        // SOLID Incr-4: the batched-decode MoE per-row fold map, in its own
+        // dedicated persistent buffer `self.moe_row_adapter_buf` (alloc'd once
+        // at init — NOT a metadata gap, so it composes with the derived
+        // MetaLayout untouched). Fixed address, per-step contents → graph-safe
+        // + route-agnostic. `DevicePtr(0)` when no adapter is resident (the MoE
+        // fold hooks then take the request-granularity gate).
+        let moe_row_adapter =
+            self.upload_moe_row_adapter(seqs, padded_n, self.moe_row_adapter_buf, stream)?;
 
         Ok(AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
             positions_w: meta_base,
-            slot: meta_base.offset(256),
-            seq_len: meta_base.offset(512),
-            block_table: meta_base.offset(768),
+            slot: meta_base.offset(lay.slots_off()),
+            seq_len: meta_base.offset(lay.seq_lens_off()),
+            block_table: meta_base.offset(lay.block_table_off()),
             max_blocks_per_seq: max_blocks,
             num_seqs: padded_n as u32,
+            seq_slot,
+            moe_row_adapter,
         })
+    }
+
+    /// Build + upload the `[padded_n]` i32 adapter-slot buffer for per-request
+    /// LoRA routing, at `dst`. Returns `dst` when an adapter pool is resident
+    /// (so the batched bgmv reads it), or `DevicePtr(0)` when there is no LoRA
+    /// (apply sites skip). Resolution + pad handling live in the pure
+    /// [`crate::lora::build_seq_slot_host`] (unit-tested).
+    fn upload_seq_slots(
+        &self,
+        seqs: &[&mut SequenceState],
+        padded_n: usize,
+        dst: DevicePtr,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let active = match self.lora.as_ref() {
+            Some(lw) => lw.active as i32,
+            None => return Ok(DevicePtr(0)),
+        };
+        let adapter_slots: Vec<i32> = seqs.iter().map(|s| s.adapter_slot).collect();
+        let host = crate::lora::build_seq_slot_host(&adapter_slots, padded_n, active);
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.copy_h2d_async(&bytes, dst, stream)?;
+        Ok(dst)
+    }
+
+    /// SOLID Incr-4: build + upload the `[padded_n]` i32 per-row MoE adapter map
+    /// (MoE semantics: `< 0` = base skip, `>= 0` = fold the active adapter) to
+    /// `dst`, the batched-decode fold's fixed-address kernel arg. Returns `dst`
+    /// when an adapter pool is resident (so the gather-BGMV fold reads it) or
+    /// `DevicePtr(0)` when there is no LoRA (the fold hooks then take the
+    /// installed-request gate — byte-identical base decode). A `Refuse` batch is
+    /// rejected BEFORE this is called (`decode_batch_compute_main` pre-lookup
+    /// guard), so every row here is Fold (active) or Skip (base). Resolution +
+    /// pad handling live in the unit-tested pure
+    /// [`crate::lora::build_moe_row_adapter_decode`].
+    fn upload_moe_row_adapter(
+        &self,
+        seqs: &[&mut SequenceState],
+        padded_n: usize,
+        dst: DevicePtr,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let active = match self.lora.as_ref() {
+            Some(lw) => lw.active as i32,
+            None => return Ok(DevicePtr(0)),
+        };
+        // Metadata-layout constraint (post-relocation): moe_row_adapter now has
+        // its OWN dedicated buffer (self.moe_row_adapter_buf), so the old +160 gap
+        // is freed and seq_slot@+128 reclaims its full +128..+256 i32 range. The
+        // binding cap is now the shared decode-metadata layout itself:
+        // positions@+0..+128 (32 u32), seq_slot@+128..+256 (32 i32),
+        // slot@+256..+512 (32 i64) all saturate at padded_n=32 (see the algebraic
+        // proof in slot_math_tests.rs + the K/m<=32 guards in verify_*.rs). Refuse
+        // LOUDLY beyond that rather than clobber attention routing / metadata.
+        anyhow::ensure!(
+            padded_n <= 32,
+            "concurrent LoRA decode is limited to batch<=32 (shared decode \
+             metadata layout: positions/seq_slot/slot each hold 32 rows); got \
+             padded_n={padded_n}. Use --max-num-seqs <=32 with a resident MoE \
+             adapter."
+        );
+        let adapter_slots: Vec<i32> = seqs.iter().map(|s| s.adapter_slot).collect();
+        let host =
+            crate::lora::build_moe_row_adapter_decode(&adapter_slots, padded_n, active, true);
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.copy_h2d_async(&bytes, dst, stream)?;
+        Ok(dst)
+    }
+
+    /// Upload a UNIFORM `[count]` i32 adapter-slot buffer where every row =
+    /// `resolve(adapter_slot, active)` (`-1` → active). Used by the
+    /// single-request paths (single-seq decode, one-request prefill, and
+    /// spec-verify of one sequence): those all carry a single `adapter_slot`,
+    /// applied to `count` rows (`count == 1` for decode/verify, `count == m`
+    /// for prefill). Returns `dst` when an adapter pool is resident (so the
+    /// routed bgmv reads it) or `DevicePtr(0)` when there is no LoRA (apply
+    /// sites then take the byte-identical installed-pair fallback). Resolution
+    /// \+ `count`-fill go through the unit-tested
+    /// [`crate::lora::build_seq_slot_host`].
+    pub(crate) fn upload_seq_slot_uniform(
+        &self,
+        adapter_slot: i32,
+        count: usize,
+        dst: DevicePtr,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let active = match self.lora.as_ref() {
+            Some(lw) => lw.active as i32,
+            None => return Ok(DevicePtr(0)),
+        };
+        // Byte-identity guard: a request whose EFFECTIVE adapter is the active one
+        // (no per-request `adapter` field -> adapter_slot=-1 -> active, OR it named
+        // the active adapter) must keep the INSTALLED-pair path (apply_lora_delta:
+        // dense_gemm_tc for prefill, gemv for m=1 decode) — NOT the bgmv, whose
+        // per-row gemv would perturb prefill numerics vs today. Return the null
+        // buffer so the apply site is untouched. ONLY a request routing to a
+        // DIFFERENT (non-active) adapter uploads a slot buffer and takes the bgmv
+        // (a NEW routed path — no prior byte-identity baseline to preserve).
+        let resolved = if adapter_slot >= 0 {
+            adapter_slot
+        } else {
+            active
+        };
+        if resolved == active {
+            return Ok(DevicePtr(0));
+        }
+        let slots = vec![adapter_slot; count];
+        let host = crate::lora::build_seq_slot_host(&slots, count, active);
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.copy_h2d_async(&bytes, dst, stream)?;
+        Ok(dst)
+    }
+
+    /// #30 (routed-prefill precision): the request slot's GLOBAL-layer-indexed
+    /// LoRA pairs for a prefill's `ForwardContext.routed_lora_layers`, borrowed
+    /// from the pool. `Some` ONLY when `adapter_slot` routes to a NON-active,
+    /// in-range slot (see [`crate::lora::LoraWeights::routed_prefill_slot`], the
+    /// same predicate `upload_seq_slot_uniform` uses to decide bgmv-vs-installed);
+    /// `None` for active/base requests and no-LoRA runs (installed-pair path,
+    /// byte-identical). A shared `&self.lora` borrow living exactly as long as the
+    /// prefill `ForwardContext`.
+    pub(crate) fn routed_slot_layers(
+        &self,
+        adapter_slot: i32,
+    ) -> Option<&[Option<crate::lora::LoraLayerWeights>]> {
+        let lw = self.lora.as_ref()?;
+        let resolved = lw.routed_prefill_slot(adapter_slot)?;
+        Some(lw.slots[resolved].layers.as_slice())
     }
 
     /// Upload batch metadata to a caller-specified device address.
     ///
-    /// Same layout as `upload_batch_metadata_fixed` (positions at +0, slots
-    /// at +256, seq_lens at +512, block_table at +768) but writes to
-    /// `meta_base` instead of the hardcoded `scratch+32768`. Used by the
+    /// Same DERIVED layout as `upload_batch_metadata_fixed` (positions at +0,
+    /// slots at +8R, seq_lens at +16R, block_table at +24R; R = decode-meta
+    /// rows) but writes to `meta_base` instead of the hardcoded
+    /// `scratch+32768`. Used by the
     /// fused `mixed_forward` to place decode metadata at a non-conflicting
     /// offset within the scratch buffer.
     pub(super) fn upload_batch_metadata_at(
@@ -142,6 +304,15 @@ impl TransformerModel {
         let n = seqs.len();
         let block_size = kv_cache.block_size();
         let max_blocks = self.max_blocks_per_seq;
+
+        // Same derived layout + ceiling as upload_batch_metadata_fixed.
+        let lay = self.buffers.decode_meta();
+        anyhow::ensure!(
+            padded_n <= lay.rows(),
+            "upload_batch_metadata_at: padded_n={padded_n} exceeds the {}-row \
+             derived metadata layout (rows = max(32, --max-batch-size))",
+            lay.rows()
+        );
 
         let mut positions = Vec::with_capacity(padded_n);
         let mut slots = Vec::with_capacity(padded_n);
@@ -190,21 +361,32 @@ impl TransformerModel {
 
         self.gpu.copy_h2d_async(&pos_bytes, meta_base, stream)?;
         self.gpu
-            .copy_h2d_async(&slot_bytes, meta_base.offset(256), stream)?;
+            .copy_h2d_async(&slot_bytes, meta_base.offset(lay.slots_off()), stream)?;
         self.gpu
-            .copy_h2d_async(&sl_bytes, meta_base.offset(512), stream)?;
+            .copy_h2d_async(&sl_bytes, meta_base.offset(lay.seq_lens_off()), stream)?;
         self.gpu
-            .copy_h2d_async(&bt_bytes, meta_base.offset(768), stream)?;
+            .copy_h2d_async(&bt_bytes, meta_base.offset(lay.block_table_off()), stream)?;
+
+        // Per-request routing slots at the derived seq_slot gap (see
+        // upload_batch_metadata_fixed).
+        let seq_slot =
+            self.upload_seq_slots(seqs, padded_n, meta_base.offset(lay.seq_slot_off()), stream)?;
+        // SOLID Incr-4 batched-decode MoE per-row fold map in the dedicated
+        // moe_row_adapter_buf (fixed address, not a metadata gap).
+        let moe_row_adapter =
+            self.upload_moe_row_adapter(seqs, padded_n, self.moe_row_adapter_buf, stream)?;
 
         Ok(AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
             positions_w: meta_base,
-            slot: meta_base.offset(256),
-            seq_len: meta_base.offset(512),
-            block_table: meta_base.offset(768),
+            slot: meta_base.offset(lay.slots_off()),
+            seq_len: meta_base.offset(lay.seq_lens_off()),
+            block_table: meta_base.offset(lay.block_table_off()),
             max_blocks_per_seq: max_blocks,
             num_seqs: padded_n as u32,
+            seq_slot,
+            moe_row_adapter,
         })
     }
 
@@ -267,6 +449,10 @@ impl TransformerModel {
                 buffers: ctx.buffers,
                 gpu: ctx.gpu,
                 config: ctx.config,
+                dispatch: ctx.dispatch,
+                derived: ctx.derived,
+                levers: ctx.levers,
+                stats: ctx.stats,
                 attn_metadata: ctx.attn_metadata,
                 profile: false,
                 comm: ctx.comm,
@@ -274,6 +460,11 @@ impl TransformerModel {
                 gdn_exact_replay: false,
                 midchunk_capture: None,
                 token_ids: None,
+                // #30: forward the parent's routing (None on this decode-profiling
+                // path, but never silently drop it if a prefill ever re-wraps).
+                routed_lora_layers: ctx.routed_lora_layers,
+                midchunk_capture: None,
+                moe_lora_route: ctx.moe_lora_route,
             }
         };
 
@@ -410,6 +601,7 @@ impl TransformerModel {
             self.prefix_cache.as_ref(),
             self.gpu.as_ref(),
             stream,
+            self.levers.kv_poison,
         )?;
 
         let meta_base = self.buffers.scratch().offset(32768);
@@ -431,10 +623,23 @@ impl TransformerModel {
             .copy_h2d_async(&actual_seq_len.to_le_bytes(), meta_base.offset(16), stream)?;
 
         let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
+        // SAFETY: the length is read back off `bt_i32` itself, so the span is
+        // exactly `bt_i32.len() * size_of::<i32>()` bytes. `collect()` on the line
+        // above initialises every one of those elements (a `collect` Vec has
+        // len == the number of items yielded, never a with_capacity gap), and
+        // `bt_i32` is only ever shared-borrowed here.
         let bt_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(bt_i32.as_ptr() as *const u8, bt_i32.len() * 4) };
         self.gpu
             .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
+
+        // Request-scoped LoRA routing for the draft pass (same 1-elem +128-gap
+        // layout as decode_a). Without it, self-speculative drafts would be
+        // proposed with the global active adapter and mostly rejected by a
+        // correctly-routed verify — a pure acceptance-rate loss, not a
+        // correctness one, but cheap to avoid.
+        let seq_slot =
+            self.upload_seq_slot_uniform(seq.adapter_slot, 1, meta_base.offset(128), stream)?;
 
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
@@ -445,12 +650,19 @@ impl TransformerModel {
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
+            seq_slot,
+            // Single-seq draft: the fold hooks use the request gate (NULL map).
+            moe_row_adapter: DevicePtr::NULL,
         };
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(attn_metadata),
             profile: false,
             comm: self.comm_ref(),
@@ -458,6 +670,9 @@ impl TransformerModel {
             gdn_exact_replay: false,
             midchunk_capture: None,
             token_ids: None,
+            routed_lora_layers: None, // #30: offline single-seq decode; no prefill route.
+            midchunk_capture: None,
+            moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) skips fold, adapter folds (single-seq reject lifted)
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only
