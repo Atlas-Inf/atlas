@@ -107,13 +107,12 @@ pub fn moe_expert_gemv_wide_grouped(
     num_tokens: u32,
     num_experts: u32,
     relu2_input: bool,
-    batch_m: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 32), num_experts.max(1), 1])
         .block([256, 1, 1])
-        .shared_mem(64 + batch_m * k * 2)
+        .shared_mem(64 + 4 * k * 2)
         .arg_ptr(input)
         .arg_ptr(packed_ptrs)
         .arg_ptr(scale_ptrs)
