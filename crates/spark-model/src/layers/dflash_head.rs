@@ -652,6 +652,7 @@ pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, Lightni
 mod batch_inputs;
 pub use batch_inputs::{DsparkBatchInput, DsparkBatchInputError, DsparkBatchSequence};
 mod batch_execution;
+mod batch_forward;
 #[cfg(test)]
 mod batch_inputs_tests;
 mod lifecycle;
@@ -1025,7 +1026,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             .layers
             .first()
             .ok_or_else(|| anyhow::anyhow!("DFlash batch backbone has no layer 0"))?;
-        let batch_rows = batch_inputs.total_rows() as u32;
+        let batch_rows = u32::try_from(batch_inputs.total_rows())
+            .map_err(|_| anyhow::anyhow!("DFlash batch row count exceeds u32"))?;
+        let batch_size =
+            u32::try_from(n).map_err(|_| anyhow::anyhow!("DFlash batch width exceeds u32"))?;
         crate::layers::ops::rms_norm(
             ctx.gpu,
             self.kernels.rms_norm,
@@ -1152,7 +1156,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 v_pool,
                 self.batch_attn_out,
                 self.batch_block_table_ptrs,
-                n as u32,
+                batch_size,
                 self.batch_cu_seqlens,
                 self.batch_kv_lens,
                 self.gamma as u32,
@@ -1253,6 +1257,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 hidden_elements,
                 stream,
             )?;
+            for layer_idx in 1..self.layers.len() {
+                self.run_batched_layer_stage(
+                    layer_idx, batch_rows, batch_size, max_kv_len, ctx, stream,
+                )?;
+            }
         }
 
         let lanes_n = self.lane_count();

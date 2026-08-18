@@ -476,6 +476,38 @@ fn sequence_accessor_is_not_public_api() {
 }
 
 #[test]
+fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
+    let entry = include_str!("../dflash_head.rs");
+    assert!(entry.contains("for layer_idx in 1..self.layers.len()"));
+    assert!(entry.contains("self.run_batched_layer_stage("));
+
+    let source = include_str!("batch_forward.rs");
+    let input_norm = source.find("&layer.input_layernorm").unwrap();
+    let q_proj = source.find("&layer.q_proj").unwrap();
+    let q_norm = source.find("&layer.q_norm").unwrap();
+    let rope = source.find("ops::rope_yarn").unwrap();
+    let attention = source
+        .find("ops::prefill_attention_paged_batched_sink")
+        .unwrap();
+    let o_proj = source.find("&layer.o_proj").unwrap();
+    let post_norm = source.find("&layer.post_attention_layernorm").unwrap();
+    let gate = source.find("&layer.gate_proj").unwrap();
+    let silu = source.find("ops::silu_mul").unwrap();
+    let down = source.find("&layer.down_proj").unwrap();
+    assert!(
+        input_norm < q_proj
+            && q_proj < q_norm
+            && q_norm < rope
+            && rope < attention
+            && attention < o_proj
+            && o_proj < post_norm
+            && post_norm < gate
+            && gate < silu
+            && silu < down
+    );
+}
+
+#[test]
 fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     let source = include_str!("../dflash_head.rs");
     let plan = source.find("packed_query_tokens").unwrap();
