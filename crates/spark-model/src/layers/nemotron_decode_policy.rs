@@ -44,6 +44,14 @@ mod tests {
         assert!(body.contains("gate_logits.offset(row * num_experts as usize * bf16)"));
         assert!(body.contains("w4a16_gemv_batch32_k"));
         assert!(body.contains("moe_expert_gemv_wide("));
+        assert!(body.contains("n.saturating_mul(top_k) <= 192"));
+        assert!(body.contains("moe_expert_build_large_list("));
+        assert!(body.contains("moe_expert_gemv_wide_grouped_large("));
+        let kernel =
+            include_str!("../../../../kernels/gb10/common/moe_expert_gemv_wide_grouped.cu");
+        assert!(kernel.contains("MAX_LARGE_EXPERTS 40"));
+        assert!(kernel.contains("count > 4"));
+        assert!(kernel.contains("moe_expert_gemv_wide_grouped_impl<8, 2>"));
     }
 
     #[test]

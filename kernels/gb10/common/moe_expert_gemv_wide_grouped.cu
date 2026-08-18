@@ -25,21 +25,25 @@ __device__ __forceinline__ float scl_fp8_grp(unsigned char b) {
 #define N_PER_WARP 4
 #define WARP_SIZE 32
 #define GROUP_SIZE 16
-#define BATCH_M 4
 #define MAX_MATCH 32
+#define MAX_EXPERTS 128
+#define MAX_LARGE_EXPERTS 40
+#define EXPERT_SENTINEL 0xFFFFFFFFu
 
 __device__ __constant__ float E2M1_LUT_GRP[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
-extern "C" __global__ void moe_expert_gemv_wide_grouped(
+template <int BM, int FILTER>
+__device__ __forceinline__ void moe_expert_gemv_wide_grouped_impl(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ packed_ptrs,
     const unsigned long long* __restrict__ scale_ptrs,
     const float* __restrict__ scale2_vals,
     __nv_bfloat16* __restrict__ C,
     const unsigned int* __restrict__ expert_indices,
+    const unsigned int* __restrict__ expert_list,
     unsigned int N,
     unsigned int K,
     unsigned int top_k,
@@ -47,7 +51,8 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
     unsigned int num_tokens,
     unsigned int relu2_input
 ) {
-    const unsigned int expert_id = blockIdx.y;
+    const unsigned int expert_id = FILTER == 2 ? expert_list[blockIdx.y] : blockIdx.y;
+    if (expert_id == EXPERT_SENTINEL) return;
     const unsigned int n_base = blockIdx.x * N_TILE;
     if (n_base >= N) return;
 
@@ -70,6 +75,8 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
     __syncthreads();
     const unsigned int nmatch = s_nmatch;
     if (nmatch == 0) return;
+    if (FILTER == 1 && nmatch > 4) return;
+    if (FILTER == 2 && nmatch <= 4) return;
 
     const unsigned char* B_packed = (const unsigned char*)packed_ptrs[expert_id];
     const unsigned char* B_scale = (const unsigned char*)scale_ptrs[expert_id];
@@ -95,8 +102,8 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
     const unsigned int num_groups = K / GROUP_SIZE;
     const unsigned int K8 = K / 8;
 
-    for (unsigned int base = 0; base < nmatch; base += BATCH_M) {
-        const unsigned int batch = nmatch - base < BATCH_M ? nmatch - base : BATCH_M;
+    for (unsigned int base = 0; base < nmatch; base += BM) {
+        const unsigned int batch = nmatch - base < BM ? nmatch - base : BM;
         for (unsigned int m = 0; m < batch; m++) {
             const unsigned int tok = s_m_tok[base + m];
             const unsigned int slot = s_m_slot[base + m];
@@ -112,9 +119,9 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
         for (unsigned int t = 0; t < N_PER_WARP; t++) {
             const unsigned int n = n_base + warp * N_PER_WARP + t;
             if (n < N) {
-                float acc[BATCH_M];
+                float acc[BM];
                 #pragma unroll
-                for (int m = 0; m < BATCH_M; m++) acc[m] = 0.0f;
+                for (int m = 0; m < BM; m++) acc[m] = 0.0f;
 
                 for (unsigned int k8 = lane; k8 < K8; k8 += WARP_SIZE) {
                     const unsigned int base_k = k8 * 8;
@@ -161,7 +168,7 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
                 #pragma unroll
                 for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
                     #pragma unroll
-                    for (int m = 0; m < BATCH_M; m++)
+                    for (int m = 0; m < BM; m++)
                         acc[m] += __shfl_down_sync(0xFFFFFFFF, acc[m], off);
                 }
                 if (lane == 0) {
@@ -176,4 +183,61 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
         }
         __syncthreads();
     }
+}
+
+#define GROUPED_WRAPPER(NAME, BM_VALUE, FILTER_VALUE) \
+extern "C" __global__ void NAME( \
+    const __nv_bfloat16* A, const unsigned long long* packed_ptrs, \
+    const unsigned long long* scale_ptrs, const float* scale2_vals, \
+    __nv_bfloat16* C, const unsigned int* expert_indices, \
+    unsigned int N, unsigned int K, unsigned int top_k, \
+    unsigned int input_stride, unsigned int num_tokens, unsigned int relu2_input) { \
+    moe_expert_gemv_wide_grouped_impl<BM_VALUE, FILTER_VALUE>( \
+        A, packed_ptrs, scale_ptrs, scale2_vals, C, expert_indices, nullptr, \
+        N, K, top_k, input_stride, num_tokens, relu2_input); \
+}
+
+GROUPED_WRAPPER(moe_expert_gemv_wide_grouped, 4, 0)
+GROUPED_WRAPPER(moe_expert_gemv_wide_grouped_small, 4, 1)
+
+extern "C" __global__ void moe_expert_build_large_list(
+    const unsigned int* __restrict__ expert_indices,
+    unsigned int* __restrict__ large_experts,
+    unsigned int num_experts,
+    unsigned int top_k,
+    unsigned int num_tokens
+) {
+    __shared__ unsigned int s_large[MAX_EXPERTS];
+    const unsigned int expert = threadIdx.x;
+    if (expert < MAX_EXPERTS) {
+        unsigned int count = 0;
+        if (expert < num_experts) {
+            for (unsigned int tok = 0; tok < num_tokens; tok++) {
+                for (unsigned int slot = 0; slot < top_k; slot++) {
+                    count += expert_indices[(unsigned long long)tok * top_k + slot] == expert;
+                }
+            }
+        }
+        s_large[expert] = count > 4;
+    }
+    __syncthreads();
+    if (expert == 0) {
+        unsigned int out = 0;
+        for (unsigned int e = 0; e < num_experts; e++) {
+            if (s_large[e]) large_experts[out++] = e;
+        }
+        for (; out < MAX_LARGE_EXPERTS; out++) large_experts[out] = EXPERT_SENTINEL;
+    }
+}
+
+extern "C" __global__ void moe_expert_gemv_wide_grouped_large(
+    const __nv_bfloat16* A, const unsigned long long* packed_ptrs,
+    const unsigned long long* scale_ptrs, const float* scale2_vals,
+    __nv_bfloat16* C, const unsigned int* expert_indices,
+    const unsigned int* large_experts,
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int input_stride, unsigned int num_tokens, unsigned int relu2_input) {
+    moe_expert_gemv_wide_grouped_impl<8, 2>(
+        A, packed_ptrs, scale_ptrs, scale2_vals, C, expert_indices, large_experts,
+        N, K, top_k, input_stride, num_tokens, relu2_input);
 }
