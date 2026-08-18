@@ -212,6 +212,11 @@ extern "C" __global__ void KERNEL_NAME(
     }
     if (kv_lens != nullptr) {
         kv_len = (unsigned int)kv_lens[b];
+        // Under VARLEN the query block is the suffix of this stream's KV
+        // extent; derive its causal/cache offset per stream.
+        if (cu_seqlens != nullptr && kv_len >= q_len_eff) {
+            q_offset = kv_len - q_len_eff;
+        }
     }
 #else
     const unsigned int q_len_eff = q_len;
@@ -712,6 +717,11 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     }
     if (kv_lens != nullptr) {
         kv_len = (unsigned int)kv_lens[b];
+        // Under VARLEN the query block is the suffix of this stream's KV
+        // extent; derive its causal/cache offset per stream.
+        if (cu_seqlens != nullptr && kv_len >= q_len_eff) {
+            q_offset = kv_len - q_len_eff;
+        }
     }
 #else
     const unsigned int q_len_eff = q_len;
