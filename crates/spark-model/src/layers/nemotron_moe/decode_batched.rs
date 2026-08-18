@@ -179,20 +179,39 @@ impl NemotronMoeLayer {
         let scratch = ctx.buffers.scratch();
         let indices = scratch;
         let weights = scratch.offset(num_tokens * top_k as usize * 4);
-        for t in 0..num_tokens {
-            ops::moe_topk_sigmoid(
+        let batched_topk = self.topk_sigmoid_batched_k.0 != 0
+            && std::env::var("ATLAS_LIGHTNING_MOE_TOPK_BATCHED").as_deref() == Ok("1");
+        if batched_topk {
+            ops::moe_topk_sigmoid_batched(
                 ctx.gpu,
-                self.topk_sigmoid_k,
-                gate_logits.offset(t * num_experts as usize * bf16),
+                self.topk_sigmoid_batched_k,
+                gate_logits,
                 self.weights.e_score_correction_bias.weight,
-                indices.offset(t * top_k as usize * 4),
-                weights.offset(t * top_k as usize * 4),
+                indices,
+                weights,
                 num_experts,
                 top_k,
                 ctx.config.norm_topk_prob,
                 scale,
+                n,
                 stream,
             )?;
+        } else {
+            for t in 0..num_tokens {
+                ops::moe_topk_sigmoid(
+                    ctx.gpu,
+                    self.topk_sigmoid_k,
+                    gate_logits.offset(t * num_experts as usize * bf16),
+                    self.weights.e_score_correction_bias.weight,
+                    indices.offset(t * top_k as usize * 4),
+                    weights.offset(t * top_k as usize * 4),
+                    num_experts,
+                    top_k,
+                    ctx.config.norm_topk_prob,
+                    scale,
+                    stream,
+                )?;
+            }
         }
         if !ctx.graph_capture
             && std::env::var("ATLAS_LIGHTNING_MOE_UNION_DUMP").as_deref() == Ok("1")
