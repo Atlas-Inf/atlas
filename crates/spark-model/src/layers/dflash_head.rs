@@ -527,6 +527,7 @@ pub struct BlockDiffusionDraftHead {
     /// model's admitted max batch; rows are `[sequence][gamma]`.
     pub batch_capacity: usize,
     pub batch_query_ids_dev: DevicePtr,
+    pub batch_position_ids: DevicePtr,
     pub batch_query_embed: DevicePtr,
     pub batch_target_hidden: DevicePtr,
     pub batch_fc_proj: DevicePtr,
@@ -886,7 +887,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
             .iter()
             .flat_map(|token| token.to_le_bytes())
             .collect();
+        let packed_positions = batch_inputs.packed_positions()?;
+        let position_bytes: Vec<u8> = packed_positions
+            .iter()
+            .flat_map(|position| position.to_le_bytes())
+            .collect();
         ctx.gpu.copy_h2d(&query_bytes, self.batch_query_ids_dev)?;
+        ctx.gpu.copy_h2d(&position_bytes, self.batch_position_ids)?;
         crate::layers::ops::batched_embed(
             ctx.gpu,
             self.kernels.batched_embed,
@@ -990,6 +997,49 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 stream,
             )?;
         }
+        let q_rows = batch_rows
+            .checked_mul(self.num_q_heads as u32)
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch q-norm rows overflow"))?;
+        let k_rows = batch_rows
+            .checked_mul(self.num_kv_heads as u32)
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch k-norm rows overflow"))?;
+        crate::layers::ops::rms_norm(
+            ctx.gpu,
+            self.kernels.rms_norm,
+            self.batch_q,
+            &layer0.q_norm,
+            self.batch_q,
+            q_rows,
+            self.head_dim as u32,
+            self.rms_norm_eps,
+            stream,
+        )?;
+        crate::layers::ops::rms_norm(
+            ctx.gpu,
+            self.kernels.rms_norm,
+            self.batch_k,
+            &layer0.k_norm,
+            self.batch_k,
+            k_rows,
+            self.head_dim as u32,
+            self.rms_norm_eps,
+            stream,
+        )?;
+        crate::layers::ops::rope_yarn(
+            ctx.gpu,
+            self.kernels.rope_qwen3,
+            self.batch_q,
+            self.batch_k,
+            self.batch_position_ids,
+            batch_rows,
+            self.num_q_heads as u32,
+            self.num_kv_heads as u32,
+            self.head_dim as u32,
+            self.rotary_dim as u32,
+            self.yarn_inv_freq,
+            self.rope_theta,
+            stream,
+        )?;
 
         let lanes_n = self.lane_count();
         if lanes_n == 1 {

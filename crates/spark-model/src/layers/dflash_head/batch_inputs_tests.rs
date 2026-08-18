@@ -399,6 +399,15 @@ fn packed_queries_are_sequence_major_anchor_then_masks() {
 }
 
 #[test]
+fn packed_positions_preserve_each_sequence_absolute_base() {
+    let input = valid(2);
+    assert_eq!(
+        input.packed_positions().unwrap(),
+        vec![1000, 1001, 1002, 1003, 1017, 1018, 1019, 1020]
+    );
+}
+
+#[test]
 fn markov_depth_rows_are_batch_wide_and_sequence_major() {
     let input = valid(4);
     assert_eq!(input.rows_at_query(0).unwrap(), vec![0, 4, 8, 12]);
@@ -436,6 +445,8 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     let anchor_add = source.find("ops::dflash_batch_anchor_add").unwrap();
     let layer_norm = source.find("&layer0.input_layernorm").unwrap();
     let q_proj = source.find("&layer0.q_proj").unwrap();
+    let q_norm = source.find("&layer0.q_norm").unwrap();
+    let rope = source.find("ops::rope_yarn").unwrap();
     let oracle = source.find("let lanes_n = self.lane_count()").unwrap();
     assert!(
         plan < upload
@@ -446,10 +457,13 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
             && hidden_norm < anchor_add
             && anchor_add < layer_norm
             && layer_norm < q_proj
-            && q_proj < oracle
+            && q_proj < q_norm
+            && q_norm < rope
+            && rope < oracle
     );
     assert!(source.contains("self.batch_capacity"));
     assert!(source.contains("self.batch_query_ids_dev"));
+    assert!(source.contains("self.batch_position_ids"));
     assert!(source.contains("self.batch_query_embed"));
     assert!(source.contains("self.batch_target_hidden"));
     assert!(source.contains("self.batch_fc_proj"));

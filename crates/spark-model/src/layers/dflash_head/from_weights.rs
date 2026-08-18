@@ -353,6 +353,7 @@ impl BlockDiffusionDraftHead {
             .checked_mul(gamma_val)
             .ok_or_else(|| anyhow::anyhow!("DFlash batch row capacity overflow"))?;
         let batch_query_ids_dev = gpu.alloc(batch_rows * 4)?;
+        let batch_position_ids = gpu.alloc(batch_rows * 4)?;
         let batch_query_embed = gpu.alloc(batch_rows * hidden_size * bf16)?;
         let batch_target_width = target_layer_ids
             .len()
@@ -383,6 +384,7 @@ impl BlockDiffusionDraftHead {
         let batch_k = gpu.alloc(batch_kv_bytes)?;
         let batch_v = gpu.alloc(batch_kv_bytes)?;
         gpu.memset(batch_query_ids_dev, 0, batch_rows * 4)?;
+        gpu.memset(batch_position_ids, 0, batch_rows * 4)?;
         gpu.memset(batch_query_embed, 0, batch_rows * hidden_size * bf16)?;
         gpu.memset(batch_target_hidden, 0, batch_target_bytes)?;
         gpu.memset(batch_fc_proj, 0, batch_fc_bytes)?;
@@ -642,6 +644,7 @@ impl BlockDiffusionDraftHead {
             scratch,
             batch_capacity,
             batch_query_ids_dev,
+            batch_position_ids,
             batch_query_embed,
             batch_target_hidden,
             batch_fc_proj,

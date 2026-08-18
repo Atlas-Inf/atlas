@@ -15,6 +15,31 @@ impl DsparkBatchInput {
         packed
     }
 
+    /// Pack absolute query positions in the same `[sequence][gamma]` order.
+    pub fn packed_positions(&self) -> Result<Vec<u32>, DsparkBatchInputError> {
+        let mut positions = Vec::with_capacity(self.total_rows());
+        for sequence in 0..self.batch_len() {
+            let base = self.sequence(sequence).absolute_position;
+            for query in 0..self.gamma() {
+                let position =
+                    base.checked_add(query)
+                        .ok_or(DsparkBatchInputError::ArithmeticOverflow {
+                            operation: "packed position",
+                            lhs: base,
+                            rhs: query,
+                        })?;
+                positions.push(u32::try_from(position).map_err(|_| {
+                    DsparkBatchInputError::ArithmeticOverflow {
+                        operation: "packed position u32",
+                        lhs: position,
+                        rhs: u32::MAX as usize,
+                    }
+                })?);
+            }
+        }
+        Ok(positions)
+    }
+
     /// Rows for one query depth across every sequence. This is the batch-wide
     /// execution order for a depth-serial Markov step.
     pub fn rows_at_query(&self, query: usize) -> Result<Vec<usize>, DsparkBatchInputError> {
