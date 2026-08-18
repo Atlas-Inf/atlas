@@ -66,7 +66,15 @@ export ATLAS_KV_EXTERNAL_RESERVE_GB="${ATLAS_KV_EXTERNAL_RESERVE_GB:-6}"
 # to NVFP4. It is a memory-for-accuracy trade, and it is REQUIRED for 3.8 here.
 # A pure-NVFP4 checkpoint (nvidia/Qwen3.6-27B-NVFP4) has no FP8 tensors and does
 # not need it — leave it unset for those.
-export ATLAS_NO_GDN_FP8_PREFILL="${ATLAS_NO_GDN_FP8_PREFILL:-1}"
+# NOTE this flag is read by PRESENCE, not value
+# (weight_map/nvfp4_detect.rs: `env::var_os(...).is_none()`), so exporting it as
+# 0 would still turn it ON. Set ATLAS_NO_GDN_FP8_PREFILL=0 to genuinely disable
+# it — this branch unsets the variable rather than passing a falsy value:
+if [ "${ATLAS_NO_GDN_FP8_PREFILL:-1}" = "0" ]; then
+  unset ATLAS_NO_GDN_FP8_PREFILL
+else
+  export ATLAS_NO_GDN_FP8_PREFILL=1
+fi
 
 if [ "$HW" = "strix-hip" ]; then
   # The HIP shims (libcuda/libcudart/libcublasLt) are built into atlas-kernels'
