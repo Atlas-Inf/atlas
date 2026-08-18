@@ -472,4 +472,8 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("self.batch_q"));
     assert!(source.contains("self.batch_k"));
     assert!(source.contains("self.batch_v"));
+    assert!(source.contains("self.batch_block_table_ptrs"));
+    assert!(source.contains("self.batch_cu_seqlens"));
+    assert!(source.contains("self.batch_kv_lens"));
+    assert!(source.contains("batch_attn_out"));
 }

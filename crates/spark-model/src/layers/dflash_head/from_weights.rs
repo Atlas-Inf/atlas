@@ -383,6 +383,10 @@ impl BlockDiffusionDraftHead {
         let batch_q = gpu.alloc(batch_q_bytes)?;
         let batch_k = gpu.alloc(batch_kv_bytes)?;
         let batch_v = gpu.alloc(batch_kv_bytes)?;
+        let batch_block_table_ptrs = gpu.alloc(batch_capacity * 8)?;
+        let batch_cu_seqlens = gpu.alloc((batch_capacity + 1) * 4)?;
+        let batch_kv_lens = gpu.alloc(batch_capacity * 4)?;
+        let batch_attn_out = gpu.alloc(batch_q_bytes)?;
         gpu.memset(batch_query_ids_dev, 0, batch_rows * 4)?;
         gpu.memset(batch_position_ids, 0, batch_rows * 4)?;
         gpu.memset(batch_query_embed, 0, batch_rows * hidden_size * bf16)?;
@@ -393,6 +397,10 @@ impl BlockDiffusionDraftHead {
         gpu.memset(batch_q, 0, batch_q_bytes)?;
         gpu.memset(batch_k, 0, batch_kv_bytes)?;
         gpu.memset(batch_v, 0, batch_kv_bytes)?;
+        gpu.memset(batch_block_table_ptrs, 0, batch_capacity * 8)?;
+        gpu.memset(batch_cu_seqlens, 0, (batch_capacity + 1) * 4)?;
+        gpu.memset(batch_kv_lens, 0, batch_capacity * 4)?;
+        gpu.memset(batch_attn_out, 0, batch_q_bytes)?;
 
         // Extra propose lanes: `proposal_lane_count` total lanes
         // (default 1). Each extra lane gets its own stream, scratch set,
@@ -653,6 +661,10 @@ impl BlockDiffusionDraftHead {
             batch_q,
             batch_k,
             batch_v,
+            batch_block_table_ptrs,
+            batch_cu_seqlens,
+            batch_kv_lens,
+            batch_attn_out,
             extra_lanes,
             kernels,
             max_seq_len,

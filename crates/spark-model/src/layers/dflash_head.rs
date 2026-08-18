@@ -536,6 +536,10 @@ pub struct BlockDiffusionDraftHead {
     pub batch_q: DevicePtr,
     pub batch_k: DevicePtr,
     pub batch_v: DevicePtr,
+    pub batch_block_table_ptrs: DevicePtr,
+    pub batch_cu_seqlens: DevicePtr,
+    pub batch_kv_lens: DevicePtr,
+    pub batch_attn_out: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -853,6 +857,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // so this does not widen propose_batch_max or allocate batch scratch.
         let mut owners = Vec::with_capacity(n);
         let mut lifecycles = Vec::with_capacity(n);
+        let mut block_table_ptrs = Vec::with_capacity(n);
+        let mut batch_kv_lens = Vec::with_capacity(n);
         for state in states.iter_mut() {
             let dstate = state
                 .as_any_mut()
@@ -865,6 +871,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 .unwrap_or(expected_owners[owners.len()]);
             owners.push(owner);
             lifecycles.push(lifecycle);
+            block_table_ptrs.push(dstate.block_table_dev.unwrap_or(DevicePtr::NULL).0);
+            batch_kv_lens.push(
+                dstate
+                    .ctx_len
+                    .checked_add(self.gamma)
+                    .ok_or_else(|| anyhow::anyhow!("DFlash batch KV length overflow"))?,
+            );
         }
         let batch_inputs = DsparkBatchInput::validate(
             self.gamma,
@@ -894,6 +907,35 @@ impl DraftProposer for BlockDiffusionDraftHead {
             .collect();
         ctx.gpu.copy_h2d(&query_bytes, self.batch_query_ids_dev)?;
         ctx.gpu.copy_h2d(&position_bytes, self.batch_position_ids)?;
+        let ptr_bytes: Vec<u8> = block_table_ptrs
+            .iter()
+            .flat_map(|pointer| pointer.to_le_bytes())
+            .collect();
+        let cu_seqlens: Vec<i32> = (0..=n)
+            .map(|sequence| {
+                i32::try_from(sequence * self.gamma)
+                    .map_err(|_| anyhow::anyhow!("DFlash batch cu_seqlens overflow"))
+            })
+            .collect::<Result<_>>()?;
+        let cu_bytes: Vec<u8> = cu_seqlens
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let kv_lens_i32: Vec<i32> = batch_kv_lens
+            .iter()
+            .copied()
+            .map(|value| {
+                i32::try_from(value)
+                    .map_err(|_| anyhow::anyhow!("DFlash batch KV length i32 overflow"))
+            })
+            .collect::<Result<_>>()?;
+        let kv_bytes: Vec<u8> = kv_lens_i32
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        ctx.gpu.copy_h2d(&ptr_bytes, self.batch_block_table_ptrs)?;
+        ctx.gpu.copy_h2d(&cu_bytes, self.batch_cu_seqlens)?;
+        ctx.gpu.copy_h2d(&kv_bytes, self.batch_kv_lens)?;
         crate::layers::ops::batched_embed(
             ctx.gpu,
             self.kernels.batched_embed,
