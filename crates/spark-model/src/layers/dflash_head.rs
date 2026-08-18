@@ -1300,6 +1300,30 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 )?;
                 out.push(drafts);
             }
+            if self.startup.diagnostics.verify_trace && batch_slots_ready {
+                ctx.gpu.synchronize(stream)?;
+                let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
+                ctx.gpu.copy_d2h(self.batch_tokens, &mut raw)?;
+                let row_tokens: Vec<u32> = raw
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect();
+                let native = batch_inputs.reorder_sampled_rows(&row_tokens)?;
+                for (sequence, (native_tokens, oracle_tokens)) in
+                    native.iter().zip(out.iter()).enumerate()
+                {
+                    anyhow::ensure!(
+                        native_tokens.get(..oracle_tokens.len()) == Some(oracle_tokens.as_slice()),
+                        "DFlash Bxgamma parity mismatch at sequence {sequence}: native={native_tokens:?} oracle={oracle_tokens:?}"
+                    );
+                }
+                tracing::info!(
+                    "DFlash Bxgamma staged parity PASS: batch={} gamma={} rows={}",
+                    n,
+                    self.gamma,
+                    batch_inputs.total_rows()
+                );
+            }
             return Ok(Some(out));
         }
         // Multi-lane: each seq proposes on its pinned lane (assigned once at
