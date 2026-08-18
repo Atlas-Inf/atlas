@@ -1084,26 +1084,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             let max_kv_len =
                 u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
                     .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
-            let serial_block_tables = self
-                .startup
-                .diagnostics
-                .batch_parity
-                .then_some(block_table_ptrs.as_slice());
-            let serial_attention_args = self
-                .startup
-                .diagnostics
-                .batch_parity
-                .then_some(self.batch_attention_args);
             for layer_idx in 0..self.layers.len() {
                 self.run_batched_layer_stage(
-                    layer_idx,
-                    batch_rows,
-                    batch_size,
-                    max_kv_len,
-                    serial_block_tables,
-                    serial_attention_args,
-                    ctx,
-                    stream,
+                    layer_idx, batch_rows, batch_size, max_kv_len, None, None, ctx, stream,
                 )?;
             }
             if let Some(expected) = parity_hidden_oracle.as_ref() {
