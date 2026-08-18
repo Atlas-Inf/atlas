@@ -152,10 +152,7 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     let plan = source.find("packed_query_tokens").unwrap();
     let upload = source.find("copy_h2d(&query_bytes").unwrap();
     let embed = source.find("ops::batched_embed").unwrap();
-    let gather = source.find("batch_target_hidden.offset").unwrap();
-    let fc = source.find("&self.fc").unwrap();
-    let hidden_norm = source.find("&self.hidden_norm").unwrap();
-    let anchor_add = source.find("ops::dflash_batch_anchor_add").unwrap();
+
     let layer_norm = source.find("&layer0.input_layernorm").unwrap();
     let q_proj = source.find("&layer0.q_proj").unwrap();
     let q_norm = source.find("&layer0.q_norm").unwrap();
@@ -170,11 +167,7 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(
         plan < upload
             && upload < embed
-            && embed < gather
-            && gather < fc
-            && fc < hidden_norm
-            && hidden_norm < anchor_add
-            && anchor_add < layer_norm
+            && embed < layer_norm
             && layer_norm < q_proj
             && q_proj < q_norm
             && q_norm < rope
@@ -188,9 +181,7 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("self.batch_query_ids_dev"));
     assert!(source.contains("self.batch_position_ids"));
     assert!(source.contains("self.batch_query_embed"));
-    assert!(source.contains("self.batch_target_hidden"));
-    assert!(source.contains("self.batch_fc_proj"));
-    assert!(source.contains("self.batch_fc_norm"));
+    assert!(!source.contains("ops::dflash_batch_anchor_add"));
     assert!(source.contains("self.batch_norm"));
     assert!(source.contains("self.batch_q"));
     assert!(source.contains("self.batch_k"));

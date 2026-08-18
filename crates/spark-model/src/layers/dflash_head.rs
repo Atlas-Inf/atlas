@@ -1032,54 +1032,6 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.hidden_size as u32,
             stream,
         )?;
-        let target_width = self
-            .target_layer_ids
-            .len()
-            .checked_mul(self.target_hidden_size)
-            .ok_or_else(|| anyhow::anyhow!("DFlash batch target width overflow"))?;
-        let target_row_bytes = target_width
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("DFlash batch target row bytes overflow"))?;
-        for (sequence, source) in target_hiddens.iter().copied().enumerate() {
-            ctx.gpu.copy_d2d_async(
-                source,
-                self.batch_target_hidden.offset(sequence * target_row_bytes),
-                target_row_bytes,
-                stream,
-            )?;
-        }
-        crate::layers::ops::dense_gemm(
-            ctx.gpu,
-            self.kernels.dense_gemm,
-            self.batch_target_hidden,
-            &self.fc,
-            self.batch_fc_proj,
-            n as u32,
-            self.hidden_size as u32,
-            target_width as u32,
-            stream,
-        )?;
-        crate::layers::ops::rms_norm(
-            ctx.gpu,
-            self.kernels.rms_norm,
-            self.batch_fc_proj,
-            &self.hidden_norm,
-            self.batch_fc_norm,
-            n as u32,
-            self.hidden_size as u32,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        crate::layers::ops::dflash_batch_anchor_add(
-            ctx.gpu,
-            self.kernels.batch_anchor_add,
-            self.batch_query_embed,
-            self.batch_fc_norm,
-            n as u32,
-            self.gamma as u32,
-            self.hidden_size as u32,
-            stream,
-        )?;
         let layer0 = self
             .layers
             .first()
