@@ -52,7 +52,9 @@ impl NemotronMoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if num_tokens <= 1 || self.moe_latent_size > 0 {
+        let marlin_all_widths =
+            std::env::var("ATLAS_LIGHTNING_MOE_MARLIN_ALL_WIDTHS").as_deref() == Ok("1");
+        if (num_tokens <= 1 || self.moe_latent_size > 0) && !marlin_all_widths {
             for t in 0..num_tokens {
                 let off = t * ctx.config.hidden_size * 2;
                 self.decode_inner(hidden.offset(off), residual.offset(off), ctx, stream)?;
@@ -65,7 +67,7 @@ impl NemotronMoeLayer {
             .as_ref()
             .filter(|_| self.w8a16_gemv_k.0 != 0 && self.moe_relu2_elementwise_k.0 != 0)
             .is_some();
-        if native_fp8 {
+        if native_fp8 && !marlin_all_widths {
             for t in 0..num_tokens {
                 let off = t * ctx.config.hidden_size * 2;
                 self.decode_inner(hidden.offset(off), residual.offset(off), ctx, stream)?;
@@ -153,7 +155,7 @@ impl NemotronMoeLayer {
         // fixed engine (G3 A/B: prime prompt diverges). Opt-in until the
         // slots path re-gates lossless. GEMV batched IS bit-exact.
         if self.marlin.is_some()
-            && num_tokens <= 4
+            && (num_tokens <= 4 || marlin_all_widths)
             && std::env::var("ATLAS_MOE_MARLIN_DECODE").is_ok()
         {
             return self.decode_batched_marlin(hidden, residual, num_tokens, ctx, stream);

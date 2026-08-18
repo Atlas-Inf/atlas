@@ -45,4 +45,12 @@ mod tests {
         assert!(body.contains("w4a16_gemv_batch32_k"));
         assert!(body.contains("moe_expert_gemv_wide("));
     }
+
+    #[test]
+    fn marlin_all_widths_can_replace_single_token_and_packed_verify() {
+        let source = include_str!("nemotron_moe/decode_batched.rs");
+        assert!(source.contains("ATLAS_LIGHTNING_MOE_MARLIN_ALL_WIDTHS"));
+        assert!(source.contains("num_tokens <= 4 || marlin_all_widths"));
+        assert!(source.contains("native_fp8 && !marlin_all_widths"));
+    }
 }
