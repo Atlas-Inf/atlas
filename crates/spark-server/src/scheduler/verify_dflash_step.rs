@@ -66,6 +66,11 @@ pub fn step_verify_dflash(
         0.0
     };
     a.last_token_time = Instant::now();
+    let raw_trace = if std::env::var("ATLAS_LIGHTNING_VERIFY_TOKEN_TRACE").as_deref() == Ok("1") {
+        Some(verified_argmax.clone())
+    } else {
+        None
+    };
 
     // DFlash drafter proposes on raw argmax; when dflash_verify_raw_argmax is set
     // (process-wide DFlash mode), skip the rep_pen/DRY pipeline so verifier and
@@ -108,6 +113,16 @@ pub fn step_verify_dflash(
         } else {
             break;
         }
+    }
+    if let Some(raw) = raw_trace {
+        tracing::info!(
+            "LIGHTNING VERIFY TOKEN TRACE last={} drafts={:?} raw={:?} processed={:?} accepted={}",
+            a.last_token,
+            drafts,
+            raw,
+            verified,
+            num_accepted
+        );
     }
     if std::env::var("ATLAS_DFLASH_VERIFY_TRACE").ok().as_deref() == Some("1") {
         let n = drafts.len().min(verified.len()).min(4);
