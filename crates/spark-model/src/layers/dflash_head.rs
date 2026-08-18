@@ -874,7 +874,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             block_table_ptrs.push(dstate.block_table_dev.unwrap_or(DevicePtr::NULL).0);
             batch_kv_lens.push(
                 dstate
-                    .ctx_len
+                    .ctx_count_drafter
                     .checked_add(self.gamma)
                     .ok_or_else(|| anyhow::anyhow!("DFlash batch KV length overflow"))?,
             );
