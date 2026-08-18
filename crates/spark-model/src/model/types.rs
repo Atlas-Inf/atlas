@@ -132,7 +132,6 @@ pub struct TransformerModel {
     /// removes the M>4 tile-GEMM cliff). 0-handle when absent.
     pub(super) w4a16_gemv_batch8_kernel: KernelHandle,
     pub(super) w4a16_gemv_batch16_kernel: KernelHandle,
-    pub(super) w4a16_gemv_batch32_kernel: KernelHandle,
     /// FP8 E4M3 LUT GEMV (M=1) for the FP8 LM head. Only used when
     /// `lm_head_fp8.is_some()`; loaded unconditionally (cheap handle) so the
     /// dispatch in `lm_head` / batched-decode / verify can reference it.

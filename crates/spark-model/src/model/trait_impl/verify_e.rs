@@ -528,20 +528,17 @@ impl TransformerModel {
                 anyhow::bail!("K4_DIAG(batched): CUDA error after final norm: {e:#}");
             }
 
-            // Exact batchm diagnostic: one full-vocab weight pass over R rows.
-            // Default retains the per-sequence K-width dispatch.
+            // R ≤ VERIFY_ROW_CAP = the 96-row logits buffer cap (sizes.rs).
+            // Keep the LM-head dispatch at each sequence's exact C1-verified
+            // K-row width while preserving the shared seq-major logits layout.
             let vocab = self.config.vocab_size;
-            if std::env::var("ATLAS_LIGHTNING_VERIFY_LMHEAD_SHARED").as_deref() == Ok("1") {
-                self.lm_head_batched(normed, r_total as u32, self.buffers.logits(), stream)?;
-            } else {
-                for i in 0..n {
-                    self.lm_head_batched(
-                        normed.offset(off[i] * h * bf16),
-                        ks[i] as u32,
-                        self.buffers.logits().offset(off[i] * vocab * bf16),
-                        stream,
-                    )?;
-                }
+            for i in 0..n {
+                self.lm_head_batched(
+                    normed.offset(off[i] * h * bf16),
+                    ks[i] as u32,
+                    self.buffers.logits().offset(off[i] * vocab * bf16),
+                    stream,
+                )?;
             }
 
             if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
