@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Same FMA as moe_expert_gemv_wide, but grid is (ceil(N/32), num_experts).
+// Same FMA as moe_expert_gemv_wide, but grid is (ceil(N/64), num_experts).
 // One CTA owns one expert N-tile and applies it to every token that routed
 // here. B is streamed once per match-batch of 4 (not once per token).
 // Empty experts exit after a cheap index scan.
@@ -21,8 +21,8 @@ __device__ __forceinline__ float scl_fp8_grp(unsigned char b) {
 #endif
 
 #define BLOCK_SIZE 256
-#define N_TILE 32
-#define N_PER_WARP 4
+#define N_TILE 64
+#define N_PER_WARP 8
 #define WARP_SIZE 32
 #define GROUP_SIZE 16
 #define BATCH_M 4
