@@ -151,7 +151,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
 fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispatch() {
     let source = include_str!("../dflash_head.rs");
     let plan = source.find("packed_query_tokens").unwrap();
-    let upload = source.find("copy_h2d(&query_bytes").unwrap();
+    let upload = source.find("upload(&query_bytes").unwrap();
     let embed = source.find("ops::batched_embed").unwrap();
 
     let stage = source.find("self.run_batched_layer_stage").unwrap();
@@ -178,6 +178,9 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
     assert!(source.contains("self.batch_cu_seqlens"));
     assert!(source.contains("self.batch_kv_lens"));
     assert!(source.contains("self.batch_slot_mapping"));
+    assert!(source.contains("ATLAS_LIGHTNING_DSPARK_ASYNC_UPLOADS"));
+    assert!(source.contains("ctx.gpu.copy_h2d_async(bytes, dst, stream)"));
+    assert!(source.contains("ctx.gpu.copy_h2d(bytes, dst)"));
     assert!(source.contains("ctx_count_drafter"));
     assert!(!source.contains(".ctx_len\n                    .checked_add(self.gamma)"));
 
