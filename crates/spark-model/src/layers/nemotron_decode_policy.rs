@@ -58,6 +58,9 @@ mod tests {
     fn lightning_multi_verify_keeps_full_mamba_stages_on_literal_m1() {
         let source = include_str!("nemotron_mamba2/trait_decode_verify_multi.rs");
         assert!(source.contains("if ctx.levers.lightning_mamba_exact_recurrence"));
+        assert!(source.contains("ATLAS_LIGHTNING_MAMBA_EXACT_BATCHED"));
+        assert!(source.contains("ATLAS_LIGHTNING_MAMBA_BATCH_OUT"));
+        assert!(source.contains("decode_out_proj_exact"));
         assert!(source.contains("self.decode("));
         assert!(source.contains("h_state_intermediates[t]"));
         assert!(source.contains("conv_state_intermediates[t]"));

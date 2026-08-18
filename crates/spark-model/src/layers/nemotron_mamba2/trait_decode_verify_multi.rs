@@ -29,7 +29,11 @@ impl NemotronMamba2Layer {
             states.len() == n_seqs && ks.len() == n_seqs,
             "decode_verify_multi: states/ks/n mismatch"
         );
-        if ctx.levers.lightning_mamba_exact_recurrence {
+        let exact_batched = ctx.levers.lightning_mamba_exact_recurrence
+            && std::env::var("ATLAS_LIGHTNING_MAMBA_EXACT_BATCHED").as_deref() == Ok("1");
+        if exact_batched {
+            self.decode_verify_multi_fused(hidden, residual, n_seqs, ks, states, ctx, stream)
+        } else if ctx.levers.lightning_mamba_exact_recurrence {
             let h = ctx.config.hidden_size;
             let h_bytes = ctx.config.ssm_h_state_bytes();
             let conv_bytes = ctx.config.ssm_conv_state_bytes();
@@ -196,6 +200,7 @@ impl NemotronMamba2Layer {
                 (DevicePtr::NULL, 0u32)
             };
             let use_fused = self.mamba2_ssm_verify_k.0 != 0
+                && !ctx.levers.lightning_mamba_exact_recurrence
                 && std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err();
             if use_fused {
                 ops::mamba2_ssm_verify(
@@ -274,7 +279,21 @@ impl NemotronMamba2Layer {
             stream,
         )?;
         let out = ctx.buffers.qkv_output();
-        self.prefill_out_proj(gated_out, out, n, h, false, false, pd_fp8_ok, ctx, stream)?;
+        if ctx.levers.lightning_mamba_exact_recurrence
+            && std::env::var("ATLAS_LIGHTNING_MAMBA_BATCH_OUT").as_deref() != Ok("1")
+        {
+            for row in 0..r_total {
+                self.decode_out_proj_exact(
+                    gated_out.offset(row * self.d_inner * bf16),
+                    out.offset(row * h * bf16),
+                    h,
+                    ctx,
+                    stream,
+                )?;
+            }
+        } else {
+            self.prefill_out_proj(gated_out, out, n, h, false, false, pd_fp8_ok, ctx, stream)?;
+        }
         ops::residual_add(
             ctx.gpu,
             self.residual_add_k,
