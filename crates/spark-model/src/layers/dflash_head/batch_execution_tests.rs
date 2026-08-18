@@ -134,6 +134,8 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let argmax = tail.find("ops::argmax_bf16_batch").unwrap();
     assert!(tail.contains("self.batch_logits"));
     assert!(tail.contains("self.batch_tokens"));
+    assert!(tail.contains("ops::w4a16_gemv_batchm"));
+    assert!(tail.contains("self.kernels.w4a16_gemv_batch32"));
     assert!(final_norm < lm_head && lm_head < argmax);
     let markov = &source[source.find("fn run_batched_markov").unwrap()..];
     let depth_loop = markov.find("for depth in 1..self.gamma").unwrap();
