@@ -194,22 +194,6 @@ impl NemotronMoeLayer {
                 stream,
             )?;
         }
-        if !ctx.graph_capture
-            && std::env::var("ATLAS_LIGHTNING_MOE_UNION_DUMP").as_deref() == Ok("1")
-        {
-            ctx.gpu.synchronize(stream)?;
-            let mut raw = vec![0u8; num_tokens * top_k as usize * 4];
-            ctx.gpu.copy_d2h(indices, &mut raw)?;
-            let mut seen = vec![false; num_experts as usize];
-            for bytes in raw.chunks_exact(4) {
-                let expert = u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
-                if expert < seen.len() {
-                    seen[expert] = true;
-                }
-            }
-            let union = seen.into_iter().filter(|x| *x).count();
-            tracing::info!("LIGHTNING MOE UNION rows={num_tokens} top_k={top_k} union={union}");
-        }
 
         let expert_up_out = ctx.buffers.expert_up_out();
         // Marlin n<=4 slots decode: NOT bit-exact vs serial GEMV on the

@@ -928,13 +928,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             (None, None)
         };
         if native_authoritative && parity_oracle.is_none() {
-            let prep_timing =
-                std::env::var("ATLAS_LIGHTNING_DSPARK_PREP_TIMING").as_deref() == Ok("1");
             for i in 0..n {
-                if prep_timing {
-                    ctx.gpu.synchronize(stream)?;
-                }
-                let prep_started = std::time::Instant::now();
                 self.prepare_drafts_state(
                     last_tokens[i],
                     target_hiddens[i],
@@ -946,13 +940,6 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     stream,
                     target_hiddens[i],
                 )?;
-                if prep_timing {
-                    ctx.gpu.synchronize(stream)?;
-                    tracing::info!(
-                        "LIGHTNING DSPARK PREP sequence={i} width={n} ms={:.3}",
-                        prep_started.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
             }
         }
 
@@ -1121,26 +1108,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
             u32::try_from(n).map_err(|_| anyhow::anyhow!("DFlash batch width exceeds u32"))?;
         let native_staged = batch_slots_ready && self.lane_count() == 1;
         if native_staged {
-            let stage_timing =
-                std::env::var("ATLAS_LIGHTNING_DSPARK_STAGE_TIMING").as_deref() == Ok("1");
             let max_kv_len =
                 u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
                     .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
             for layer_idx in 0..self.layers.len() {
-                if stage_timing {
-                    ctx.gpu.synchronize(stream)?;
-                }
-                let stage_started = std::time::Instant::now();
                 self.run_batched_layer_stage(
                     layer_idx, batch_rows, batch_size, max_kv_len, None, None, ctx, stream,
                 )?;
-                if stage_timing {
-                    ctx.gpu.synchronize(stream)?;
-                    tracing::info!(
-                        "LIGHTNING DSPARK STAGE layer={layer_idx} width={batch_size} rows={batch_rows} ms={:.3}",
-                        stage_started.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
             }
             if let Some(expected) = parity_hidden_oracle.as_ref() {
                 ctx.gpu.synchronize(stream)?;
@@ -1161,27 +1135,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 }
                 tracing::info!("DFlash Bxgamma backbone parity PASS: batch={n}");
             }
-            if stage_timing {
-                ctx.gpu.synchronize(stream)?;
-            }
-            let tail_started = std::time::Instant::now();
             self.run_batched_tail_base(batch_rows, ctx, stream)?;
-            if stage_timing {
-                ctx.gpu.synchronize(stream)?;
-                tracing::info!(
-                    "LIGHTNING DSPARK STAGE tail width={batch_size} rows={batch_rows} ms={:.3}",
-                    tail_started.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            let markov_started = std::time::Instant::now();
             self.run_batched_markov(batch_size, ctx, stream)?;
-            if stage_timing {
-                ctx.gpu.synchronize(stream)?;
-                tracing::info!(
-                    "LIGHTNING DSPARK STAGE markov width={batch_size} rows={batch_rows} ms={:.3}",
-                    markov_started.elapsed().as_secs_f64() * 1000.0
-                );
-            }
         }
 
         let native =
