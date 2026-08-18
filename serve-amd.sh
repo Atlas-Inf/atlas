@@ -9,9 +9,15 @@
 # A binary built with ATLAS_TARGET_MODEL='*' (build-amd.sh's default) carries
 # every strix kernel target, and resolution picks the right one from the
 # checkpoint reference — so the same binary serves 3.6 and 3.8.
+#
+# Every flag and variable below is the one the measured configuration in
+# ../40-bench/RESULTS.md and ../40-bench/BFCL.md actually ran with. If you
+# change one, you are no longer running the configuration those numbers
+# describe.
 set -euo pipefail
 cd "$(dirname "$0")"
 MODEL="${1:-unsloth/Qwen3.8-27B-NVFP4}"
+[ $# -gt 0 ] && shift            # anything left in "$@" is passed through to spark
 HW="${ATLAS_TARGET_HW:-strix-hip}"
 
 # ── gfx1151 runtime shims (each explained in docs §4) ────────────────────────
@@ -27,6 +33,16 @@ export ATLAS_W4A16_DP4A=1         # int8-DP4A decode GEMV
 # request, not a silent fallback. 0 takes the documented scalar path.
 export ATLAS_FP8_LDMAB=0
 
+# ── SSM / MTP levers, unchanged from the certified Qwen3.6 recipe ────────────
+# Carried forward verbatim: these are what the 3.6 submission was measured
+# under, and keeping them identical is what makes the 3.6-vs-3.8 comparison in
+# ../40-bench/RESULTS.md apples-to-apples.
+export ATLAS_SSM_TAIL_MIDCHUNK=1  # capture the mid-chunk SSM tail state
+export ATLAS_SSM_TAIL_PROTECT=1   # guard it against overwrite on the next chunk
+export ATLAS_MTP_GATE_REPROBE=64  # re-probe the MTP accept gate every 64 tokens
+export ATLAS_MTP_DRAFTER_PREFILL=1
+export ATLAS_MTP_CARRY_DRAFTER=1
+
 # ── memory: Strix Halo is a unified-memory part ──────────────────────────────
 # The GPU allocates from the same RAM the OS uses. GTT reports 60 GB but the
 # kernel will not hand over the last few — the measured allocatable ceiling is
@@ -36,6 +52,9 @@ export ATLAS_FP8_LDMAB=0
 GPU_UTIL="${GPU_UTIL:-0.86}"
 SSM_SLOTS="${SSM_SLOTS:-8}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-16384}"
+# Atlas sizes its KV budget against the 60 GB the driver reports, not the ~55 GB
+# the kernel will actually hand over. This tells it to hold 6 GB back.
+export ATLAS_KV_EXTERNAL_RESERVE_GB="${ATLAS_KV_EXTERNAL_RESERVE_GB:-6}"
 
 # Mixed-precision NVFP4 checkpoints (unsloth Qwen3.8-27B-NVFP4) keep 11.56 GB of
 # tensors as FP8 inside an NVFP4 net. The loader requantises them and, with this
@@ -62,14 +81,28 @@ else
   export PATH="$SCALE_HOME/targets/gfx1151/bin:$PATH"
 fi
 
+# The gfx1151 kernel set is 94 modules where gb10's is 167, so 92 dispatch sites
+# resolve to a fallback and main's kernel audit (#388) refuses to serve without
+# this flag. Those fallbacks are PRE-EXISTING — the audit landed on main after
+# the Strix branch forked, so the certified 3.6 submission was produced under
+# exactly the same ones. See ../30-verify/KERNEL_AUDIT.md before quoting any
+# Strix perf number as final.
+ALLOW_FALLBACKS="--dangerously-allow-unresolved-kernel-lookups"
+
+# --model-name only matters when MODEL is a local snapshot path and you want the
+# API to report the canonical repo id (as the benchmark configs expect).
+NAME_ARG=(); [ -n "${MODEL_NAME:-}" ] && NAME_ARG=(--model-name "$MODEL_NAME")
+
 echo "serving $MODEL on $(/opt/rocm/bin/rocminfo 2>/dev/null | grep -m1 -o gfx[0-9]* || echo AMD) via $HW"
-exec target/release/spark serve "$MODEL" \
+exec target/release/spark serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --max-batch-size "${MAX_BATCH:-1}" \
   --speculative --num-drafts "${NUM_DRAFTS:-2}" \
   --mtp-quantization bf16 --mtp-vocab 100000 \
-  --enable-prefix-caching \
+  --disable-tool-grammar true --enable-prefix-caching \
   --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval 16 \
+  $ALLOW_FALLBACKS \
+  --disable-thinking \
   "$@"
