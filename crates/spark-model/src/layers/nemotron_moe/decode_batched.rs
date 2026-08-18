@@ -224,6 +224,7 @@ impl NemotronMoeLayer {
                 0,
                 n,
                 num_experts,
+                false,
                 stream,
             )?;
         } else if self.moe_expert_gemv_wide_k.0 != 0
@@ -310,7 +311,60 @@ impl NemotronMoeLayer {
         let smem = (shared_inter.max(inter) as usize) * 4;
         let down_wide =
             self.relu2_down_wide_k.0 != 0 && std::env::var("ATLAS_NO_MOE_DOWN_WIDE").is_err();
-        if down_wide {
+        if grouped {
+            // Routed DOWN: consume route-major UP rows, apply relu² in
+            // registers, and share each expert's DOWN weight stream across all
+            // matching routes without an intermediate BF16 activation store.
+            ops::moe_expert_gemv_wide_grouped(
+                ctx.gpu,
+                self.moe_expert_gemv_wide_grouped_k,
+                expert_up_out,
+                self.down_ptrs.packed_ptrs,
+                self.down_ptrs.scale_ptrs,
+                self.down_ptrs.scale2_vals,
+                expert_down_out,
+                indices,
+                h as u32,
+                inter,
+                top_k,
+                inter,
+                n,
+                num_experts,
+                true,
+                stream,
+            )?;
+
+            // Shared expert only: the existing fused kernel selects shared
+            // when blockIdx.y == top_k. Launch with top_k=0 and grid.y=1 so it
+            // computes no routed rows and preserves the scalar relu²+DOWN
+            // arithmetic exactly.
+            let (shared_kernel, shared_tile, shared_block) = if down_wide {
+                (self.relu2_down_wide_k, 64u32, 256u32)
+            } else {
+                (self.relu2_down_shared_k, 8u32, 128u32)
+            };
+            KernelLaunch::new(ctx.gpu, shared_kernel)
+                .grid([div_ceil(h as u32, shared_tile), 1, n])
+                .block([shared_block, 1, 1])
+                .shared_mem(smem as u32)
+                .arg_ptr(expert_up_out)
+                .arg_ptr(self.down_ptrs.packed_ptrs)
+                .arg_ptr(self.down_ptrs.scale_ptrs)
+                .arg_ptr(self.down_ptrs.scale2_vals)
+                .arg_ptr(expert_down_out)
+                .arg_ptr(indices)
+                .arg_ptr(shared_up)
+                .arg_ptr(self.weights.shared_down.weight)
+                .arg_ptr(self.weights.shared_down.weight_scale)
+                .arg_f32(self.weights.shared_down.weight_scale_2)
+                .arg_ptr(shared_down)
+                .arg_u32(h as u32)
+                .arg_u32(inter)
+                .arg_u32(shared_inter)
+                .arg_u32(h as u32)
+                .arg_u32(0)
+                .launch(stream)?;
+        } else if down_wide {
             KernelLaunch::new(ctx.gpu, self.relu2_down_wide_k)
                 .grid([div_ceil(h as u32, 64), top_k + 1, n])
                 .block([256, 1, 1])

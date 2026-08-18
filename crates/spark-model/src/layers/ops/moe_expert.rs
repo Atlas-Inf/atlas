@@ -106,6 +106,7 @@ pub fn moe_expert_gemv_wide_grouped(
     input_stride: u32,
     num_tokens: u32,
     num_experts: u32,
+    relu2_input: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -123,6 +124,7 @@ pub fn moe_expert_gemv_wide_grouped(
         .arg_u32(top_k)
         .arg_u32(input_stride)
         .arg_u32(num_tokens)
+        .arg_u32(relu2_input as u32)
         .launch(stream)
 }
 

@@ -44,7 +44,8 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
     unsigned int K,
     unsigned int top_k,
     unsigned int input_stride,
-    unsigned int num_tokens
+    unsigned int num_tokens,
+    unsigned int relu2_input
 ) {
     const unsigned int expert_id = blockIdx.y;
     const unsigned int n_base = blockIdx.x * N_TILE;
@@ -142,8 +143,18 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
                             __nv_bfloat16 a_lo, a_hi;
                             *(unsigned short*)&a_lo = (unsigned short)(a_raw[b] & 0xFFFF);
                             *(unsigned short*)&a_hi = (unsigned short)(a_raw[b] >> 16);
-                            acc[m] += __bfloat162float(a_lo) * w_lo[b];
-                            acc[m] += __bfloat162float(a_hi) * w_hi[b];
+                            float al = __bfloat162float(a_lo);
+                            float ah = __bfloat162float(a_hi);
+                            if (relu2_input) {
+                                al = fmaxf(al, 0.0f); al *= al;
+                                ah = fmaxf(ah, 0.0f); ah *= ah;
+                                // Match moe_expert_relu2_down_wide exactly:
+                                // one paired RHS before accumulation.
+                                acc[m] += al * w_lo[b] + ah * w_hi[b];
+                            } else {
+                                acc[m] += al * w_lo[b];
+                                acc[m] += ah * w_hi[b];
+                            }
                         }
                     }
                 }
