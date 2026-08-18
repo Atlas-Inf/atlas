@@ -234,14 +234,40 @@ pub fn step_verify_dflash(
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
     let t_propose = std::time::Instant::now();
     if crate::scheduler::adaptive_spec::spec_allowed(a, sched) {
-        match model.run_mtp_propose_multi(
-            a.last_token,
-            a.seq.seq_len,
-            num_drafts,
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
+        let proposal: anyhow::Result<Vec<u32>> =
+            if model.mtp_propose_batch_min() == 1 && _mtp_grammar_mask.is_none() {
+                let one_token = [a.last_token];
+                let one_position = [a.seq.seq_len];
+                let one_stash = [bonus_token_idx];
+                let mut one_seq = [&mut a.seq];
+                match model.run_mtp_propose_batched(
+                    &one_token,
+                    &one_position,
+                    &one_stash,
+                    num_drafts,
+                    &mut one_seq,
+                    0,
+                    None,
+                ) {
+                    Ok(Some(mut all)) if all.len() == 1 => Ok(all.remove(0)),
+                    Ok(Some(all)) => Err(anyhow::anyhow!(
+                        "DFlash B1 parity proposer returned {} sequence rows",
+                        all.len()
+                    )),
+                    Ok(None) => Err(anyhow::anyhow!("DFlash B1 parity proposer declined")),
+                    Err(error) => Err(error),
+                }
+            } else {
+                model.run_mtp_propose_multi(
+                    a.last_token,
+                    a.seq.seq_len,
+                    num_drafts,
+                    &mut a.seq,
+                    0,
+                    _mtp_grammar_mask.as_deref(),
+                )
+            };
+        match proposal {
             Ok(d) if !d.is_empty() => a.pending_drafts = d,
             Ok(_) => {
                 // Lightning product fail-closed boundary: an empty
