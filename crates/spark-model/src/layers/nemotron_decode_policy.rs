@@ -55,6 +55,14 @@ mod tests {
     }
 
     #[test]
+    fn literal_m1_oracle_preserves_every_logits_row_for_scheduler_processing() {
+        let source = include_str!("../model/trait_impl/verify_d_serial.rs");
+        assert!(source.contains("logits_base.offset((t + 1) * logits_row_bytes)"));
+        assert!(source.contains("logits_base.offset(t * logits_row_bytes)"));
+        assert!(source.contains("for t in 0..tokens.len()"));
+    }
+
+    #[test]
     fn marlin_one_wave_uses_fixed_m8_with_full_product_slot_capacity() {
         let source = include_str!("nemotron_moe/marlin_slots.rs");
         let ops = include_str!("ops/marlin_nvfp4.rs");

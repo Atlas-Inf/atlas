@@ -20,12 +20,24 @@ impl TransformerModel {
         let h_bytes = self.config.ssm_h_state_bytes();
         let conv_bytes = self.config.ssm_conv_state_bytes();
         let capture_row_bytes = self.dflash_capture_layers.len() * self.config.hidden_size * 2;
+        let logits_row_bytes = self.config.vocab_size * 2;
+        let logits_base = self.buffers.logits();
         let mut capture_rows: Vec<Vec<u8>> = Vec::with_capacity(tokens.len());
         let mut out = Vec::with_capacity(tokens.len());
 
         for (t, &token) in tokens.iter().enumerate() {
             let logits = self.decode_dispatch(token, seq, stream)?;
             out.push(<Self as Model>::argmax_on_device(self, logits, stream)?);
+            // Every literal M1 decode writes logits row 0. Preserve it above
+            // the active row before the next token overwrites row 0. The
+            // scheduler applies its canonical pipeline only after this method
+            // returns and expects a contiguous [K,vocab] buffer.
+            self.gpu.copy_d2d_async(
+                logits,
+                logits_base.offset((t + 1) * logits_row_bytes),
+                logits_row_bytes,
+                stream,
+            )?;
 
             if t + 1 < tokens.len() {
                 for (layer_idx, layer_state) in seq.layer_states.iter_mut().enumerate() {
@@ -66,6 +78,18 @@ impl TransformerModel {
                 self.gpu.copy_d2h(capture, &mut row)?;
                 capture_rows.push(row);
             }
+        }
+
+        // Compact staged rows 1..=K into the canonical rows 0..K. Copies are
+        // ordered on one stream and move downward, so no unread source row is
+        // overwritten by an earlier copy.
+        for t in 0..tokens.len() {
+            self.gpu.copy_d2d_async(
+                logits_base.offset((t + 1) * logits_row_bytes),
+                logits_base.offset(t * logits_row_bytes),
+                logits_row_bytes,
+                stream,
+            )?;
         }
 
         if let Some(capture) = self.dflash_hidden_save {
