@@ -660,6 +660,8 @@ pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, Lightni
 mod batch_inputs;
 pub use batch_inputs::{DsparkBatchInput, DsparkBatchInputError, DsparkBatchSequence};
 mod batch_execution;
+#[cfg(test)]
+mod batch_execution_tests;
 mod batch_forward;
 #[cfg(test)]
 mod batch_inputs_tests;

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Pure host-side identity, ownership, and checked `[sequence][gamma]` layout
-//! contract for Lightning DSpark batch inputs.
+//! Checked host-side identity, ownership, and `[sequence][gamma]` layout.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -11,7 +10,6 @@ use spark_runtime::gpu::DevicePtr;
 
 use super::{CaptureDescriptor, CaptureStatus, LIGHTNING_SERVED_GAMMA, SequenceGeneration};
 
-/// One immutable sequence identity entering a Lightning DSpark batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DsparkBatchSequence {
     pub owner: SequenceGeneration,
@@ -20,7 +18,6 @@ pub struct DsparkBatchSequence {
     pub target_hidden: DevicePtr,
 }
 
-/// Validated `[sequence][gamma]` input layout for one DSpark propose batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DsparkBatchInput {
     gamma: usize,
@@ -29,7 +26,6 @@ pub struct DsparkBatchInput {
     sequences: Vec<DsparkBatchSequence>,
 }
 
-/// Typed failures at the DSpark batch-input boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DsparkBatchInputError {
     GammaZero,
@@ -202,7 +198,6 @@ impl fmt::Display for DsparkBatchInputError {
 
 impl std::error::Error for DsparkBatchInputError {}
 
-/// Validate structural lengths before fallback or state downcast.
 pub(crate) fn validate_batch_input_lengths(
     batch_len: usize,
     owners_len: usize,
@@ -221,7 +216,6 @@ pub(crate) fn validate_batch_input_lengths(
 }
 
 impl DsparkBatchInput {
-    /// Validate explicit identity, ownership, lifecycle, and `[B, gamma]` layout.
     #[allow(clippy::too_many_arguments)]
     pub fn validate(
         gamma: usize,
@@ -347,7 +341,6 @@ impl DsparkBatchInput {
         &self.sequences[sequence]
     }
 
-    /// Return `sequence * gamma + query`, with both indices checked.
     pub fn row_index(&self, sequence: usize, query: usize) -> Result<usize, DsparkBatchInputError> {
         self.check_sequence(sequence)?;
         if query >= self.gamma {
@@ -365,7 +358,6 @@ impl DsparkBatchInput {
             })
     }
 
-    /// Return the contiguous row range for one sequence.
     pub fn sequence_row_range(
         &self,
         sequence: usize,
@@ -383,7 +375,6 @@ impl DsparkBatchInput {
         Ok(start..end)
     }
 
-    /// Return total bytes for `[batch, gamma, hidden_width]` rows.
     pub fn total_bytes(
         &self,
         hidden_width: usize,
