@@ -383,3 +383,43 @@ fn row_and_sequence_ranges_reject_out_of_bounds_indices() {
         })
     ));
 }
+
+#[test]
+fn packed_queries_are_sequence_major_anchor_then_masks() {
+    for batch in [1, 2, 4, 8] {
+        let input = valid(batch);
+        let packed = input.packed_query_tokens(990);
+        assert_eq!(packed.len(), batch * LIGHTNING_SERVED_GAMMA);
+        for sequence in 0..batch {
+            let range = input.sequence_row_range(sequence).unwrap();
+            assert_eq!(packed[range.start], 100 + sequence as u32);
+            assert!(packed[range.start + 1..range.end].iter().all(|&t| t == 990));
+        }
+    }
+}
+
+#[test]
+fn markov_depth_rows_are_batch_wide_and_sequence_major() {
+    let input = valid(4);
+    assert_eq!(input.rows_at_query(0).unwrap(), vec![0, 4, 8, 12]);
+    assert_eq!(input.rows_at_query(1).unwrap(), vec![1, 5, 9, 13]);
+    assert_eq!(input.rows_at_query(3).unwrap(), vec![3, 7, 11, 15]);
+}
+
+#[test]
+fn sampled_rows_reorder_masks_before_unbiased_anchor() {
+    let input = valid(2);
+    let sampled = vec![10, 11, 12, 13, 20, 21, 22, 23];
+    assert_eq!(
+        input.reorder_sampled_rows(&sampled).unwrap(),
+        vec![vec![11, 12, 13, 10], vec![21, 22, 23, 20]]
+    );
+    assert!(matches!(
+        input.reorder_sampled_rows(&sampled[..7]),
+        Err(DsparkBatchInputError::LengthMismatch {
+            field: "sampled_rows",
+            expected: 8,
+            found: 7
+        })
+    ));
+}

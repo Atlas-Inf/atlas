@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Pure host-side input and ownership contract for Lightning DSpark B×γ rows.
-//!
-//! The contract freezes only the input identity and layout. It does not allocate
-//! batch scratch or dispatch a kernel; the current proposer remains the existing
-//! serial/lane implementation until a later phase replaces its compute body.
+//! Pure host-side identity, ownership, and checked `[sequence][gamma]` layout
+//! contract for Lightning DSpark batch inputs.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -197,11 +194,7 @@ impl fmt::Display for DsparkBatchInputError {
 
 impl std::error::Error for DsparkBatchInputError {}
 
-/// Validate the length-only portion of the production seam.
-///
-/// This intentionally does not reject an empty batch: the existing `n < 2`
-/// proposer behavior may return `Ok(None)` after this structural check. The
-/// full contract rejects empty batches when a native-width input is requested.
+/// Validate structural lengths before fallback or state downcast.
 pub(crate) fn validate_batch_input_lengths(
     batch_len: usize,
     owners_len: usize,
@@ -220,9 +213,7 @@ pub(crate) fn validate_batch_input_lengths(
 }
 
 impl DsparkBatchInput {
-    /// Validate explicit per-sequence identity, ownership, and the `[B, γ]`
-    /// row layout. Lifecycle descriptors are copied only for validation; the
-    /// resulting contract owns no mutable state or borrowed batch index.
+    /// Validate explicit identity, ownership, lifecycle, and `[B, gamma]` layout.
     #[allow(clippy::too_many_arguments)]
     pub fn validate(
         gamma: usize,

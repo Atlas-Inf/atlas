@@ -627,6 +627,7 @@ mod row_contract;
 pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, LightningRowContract};
 mod batch_inputs;
 pub use batch_inputs::{DsparkBatchInput, DsparkBatchInputError, DsparkBatchSequence};
+mod batch_execution;
 #[cfg(test)]
 mod batch_inputs_tests;
 mod lifecycle;
@@ -851,7 +852,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             owners.push(owner);
             lifecycles.push(lifecycle);
         }
-        let _batch_inputs = DsparkBatchInput::validate(
+        let batch_inputs = DsparkBatchInput::validate(
             self.gamma,
             n,
             &owners,
@@ -861,6 +862,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
             expected_owners,
             &lifecycles,
         )?;
+        // Materialize the exact host execution plan now. The next native slice
+        // uploads these packed queries and depth rows into batch scratch; the
+        // current serial/lane compute below remains the output oracle.
+        let _packed_query_tokens = batch_inputs.packed_query_tokens(self.mask_token_id);
+        let _markov_depth_rows: Vec<Vec<usize>> = (1..batch_inputs.gamma())
+            .map(|query| batch_inputs.rows_at_query(query))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let lanes_n = self.lane_count();
         if lanes_n == 1 {
