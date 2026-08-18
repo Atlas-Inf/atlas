@@ -179,9 +179,10 @@ pub fn marlin_moe_nvfp4(
         .launch(stream)
 }
 
-// AR C=8: n*top_k = 48 unique worst. 32 dropped ~9 experts → garbage.
-// 64 covers default --max-batch-size 8. Must match #define MAX_SLOTS.
-pub const MARLIN_SLOTS: i32 = 64;
+// Native DSpark B8 verifies up to 32 rows × top_k=6. One fixed-M8 slot can
+// hold eight hits for an expert; 128 slots cover all 128 experts plus every
+// possible overflow chunk in the R<=32 product envelope. Must match CUDA.
+pub const MARLIN_SLOTS: i32 = 128;
 pub const MARLIN_M_TILE: i32 = 8;
 
 #[allow(clippy::too_many_arguments)]

@@ -39,10 +39,12 @@ impl NemotronMoeLayer {
         let scale = ctx.config.routed_scaling_factor as f32;
         let bf16 = 2usize;
         let num_experts = ctx.config.num_experts as u32;
-        // KEEP shape is n<=4 (C=4 AR, C=1 DSpark verify). One launch over
-        // n=8 (~41 unique) still garbles with 64 slots + zeroed scatter.
-        // Wave the proven tile; shared expert stays one n-wide GEMM.
-        const WAVE: usize = 4;
+        let one_wave = std::env::var("ATLAS_LIGHTNING_MOE_MARLIN_ONE_WAVE").as_deref() == Ok("1");
+        anyhow::ensure!(
+            !one_wave || num_tokens <= 32,
+            "Marlin one-wave decode exceeds R=32: {num_tokens}"
+        );
+        let wave = if one_wave { num_tokens } else { 4 };
 
         let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
@@ -112,6 +114,18 @@ impl NemotronMoeLayer {
                 h as u32,
                 stream,
             )?;
+        } else if n <= 32 && self.w4a16_gemv_batch32_k.0 != 0 {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                self.w4a16_gemv_batch32_k,
+                normed,
+                &self.weights.shared_up,
+                shared_up,
+                n,
+                shared_inter,
+                h as u32,
+                stream,
+            )?;
         } else {
             self.prefill_shared_up(normed, shared_up, n, h, shared_inter, ctx, stream)?;
         }
@@ -127,7 +141,7 @@ impl NemotronMoeLayer {
         let ng_dn = m.down_k / GROUP;
         let mut wave_off = 0usize;
         while wave_off < num_tokens {
-            let cn = (num_tokens - wave_off).min(WAVE);
+            let cn = (num_tokens - wave_off).min(wave);
             ctx.gpu
                 .memset_async(m.slot_a, 0, (SLOTS * M_TILE) as usize * h * bf16, stream)?;
             ops::marlin_pack_slots(
@@ -228,6 +242,30 @@ impl NemotronMoeLayer {
             ops::w4a16_gemv_batchm(
                 ctx.gpu,
                 self.w4a16_gemv_batch4_k,
+                shared_up,
+                &self.weights.shared_down,
+                shared_down,
+                n,
+                h as u32,
+                shared_inter,
+                stream,
+            )?;
+        } else if n <= 16 && self.w4a16_gemv_batch16_k.0 != 0 {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                self.w4a16_gemv_batch16_k,
+                shared_up,
+                &self.weights.shared_down,
+                shared_down,
+                n,
+                h as u32,
+                shared_inter,
+                stream,
+            )?;
+        } else if n <= 32 && self.w4a16_gemv_batch32_k.0 != 0 {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                self.w4a16_gemv_batch32_k,
                 shared_up,
                 &self.weights.shared_down,
                 shared_down,

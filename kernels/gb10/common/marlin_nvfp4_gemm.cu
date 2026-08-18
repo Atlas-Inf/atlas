@@ -122,7 +122,7 @@ extern "C" __global__ void atlas_marlin_nvfp4_m8_k64n128_slot(
 }
 
 #ifndef MAX_SLOTS
-#define MAX_SLOTS 64
+#define MAX_SLOTS 128
 #endif
 
 // Parallel slots: grid.x = CTAs per expert (Marlin persistent), grid.y = slot.

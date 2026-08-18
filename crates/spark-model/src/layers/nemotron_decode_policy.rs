@@ -53,4 +53,14 @@ mod tests {
         assert!(source.contains("num_tokens <= 4 || marlin_all_widths"));
         assert!(source.contains("native_fp8 && !marlin_all_widths"));
     }
+
+    #[test]
+    fn marlin_one_wave_uses_fixed_m8_with_full_product_slot_capacity() {
+        let source = include_str!("nemotron_moe/marlin_slots.rs");
+        let ops = include_str!("ops/marlin_nvfp4.rs");
+        assert!(source.contains("ATLAS_LIGHTNING_MOE_MARLIN_ONE_WAVE"));
+        assert!(source.contains("let wave = if one_wave { num_tokens } else { 4 }"));
+        assert!(source.contains("w4a16_gemv_batch32_k"));
+        assert!(ops.contains("pub const MARLIN_SLOTS: i32 = 128"));
+    }
 }
