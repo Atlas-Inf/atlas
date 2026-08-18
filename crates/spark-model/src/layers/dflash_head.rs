@@ -747,6 +747,22 @@ impl DraftProposer for BlockDiffusionDraftHead {
     fn startup_diagnostics(&self) -> Option<&DsparkDiagnostics> {
         Some(&self.startup.diagnostics)
     }
+
+    fn propose_batch_max(
+        &self,
+        _buffers: &spark_runtime::buffers::BufferArena,
+        _config: &atlas_core::config::ModelConfig,
+    ) -> usize {
+        // Product policy remains serial until native parity is proven. The
+        // existing verify-trace diagnostic alone admits widths through the
+        // explicit allocation capacity and fails closed on output drift.
+        if self.startup.diagnostics.verify_trace {
+            self.batch_capacity
+        } else {
+            1
+        }
+    }
+
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`.
         // Sized once, re-used across the seq's lifetime; reset on
@@ -861,7 +877,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             states.len(),
             expected_owners.len(),
         )?;
-        if n < 2 {
+        // Product keeps the historical n<2 fallback. Verify-trace may admit a
+        // single sequence solely to exercise the exact same staged parity gate.
+        if n == 0 || (n == 1 && !self.startup.diagnostics.verify_trace) {
             return Ok(None);
         }
 

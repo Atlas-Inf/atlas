@@ -597,4 +597,7 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("diagnostics.verify_trace && batch_slots_ready"));
     assert!(source.contains("batch_inputs.reorder_sampled_rows"));
     assert!(source.contains("DFlash Bxgamma parity mismatch"));
+    assert!(source.contains("if self.startup.diagnostics.verify_trace"));
+    assert!(source.contains("self.batch_capacity"));
+    assert!(source.contains("n == 1 && !self.startup.diagnostics.verify_trace"));
 }
