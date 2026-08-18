@@ -10,6 +10,7 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 
 const GROUP: i32 = 16;
+const SMS: u32 = 48;
 const SMEM: u32 = 96 * 1024;
 const SLOTS: i32 = ops::MARLIN_SLOTS;
 const M_TILE: i32 = ops::MARLIN_M_TILE;
@@ -44,11 +45,6 @@ impl NemotronMoeLayer {
             "Marlin one-wave decode exceeds R=32: {num_tokens}"
         );
         let wave = if one_wave { num_tokens } else { 4 };
-        let slot_ctas = std::env::var("ATLAS_LIGHTNING_MARLIN_SLOT_CTAS")
-            .ok()
-            .and_then(|raw| raw.parse::<u32>().ok())
-            .unwrap_or(16)
-            .clamp(1, 48);
 
         let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
@@ -185,7 +181,7 @@ impl NemotronMoeLayer {
                 m.up_k,
                 m.up_k,
                 m.locks,
-                slot_ctas,
+                SMS,
                 SMEM,
                 stream,
             )?;
@@ -218,7 +214,7 @@ impl NemotronMoeLayer {
                 m.down_k,
                 m.down_k,
                 m.locks,
-                slot_ctas,
+                SMS,
                 SMEM,
                 stream,
             )?;

@@ -61,8 +61,6 @@ mod tests {
         assert!(source.contains("ATLAS_LIGHTNING_MOE_MARLIN_ONE_WAVE"));
         assert!(source.contains("let wave = if one_wave { num_tokens } else { 4 }"));
         assert!(source.contains("w4a16_gemv_batch32_k"));
-        assert!(source.contains("ATLAS_LIGHTNING_MARLIN_SLOT_CTAS"));
         assert!(ops.contains("pub const MARLIN_SLOTS: i32 = 128"));
-        assert!(ops.contains("sms.clamp(1, 48)"));
     }
 }
