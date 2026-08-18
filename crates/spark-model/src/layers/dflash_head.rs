@@ -762,10 +762,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _buffers: &spark_runtime::buffers::BufferArena,
         _config: &atlas_core::config::ModelConfig,
     ) -> usize {
-        // Product policy remains serial until native parity is proven. The
-        // explicit batch-parity diagnostic alone admits widths through the
-        // explicit allocation capacity and fails closed on output drift.
-        if self.startup.diagnostics.batch_parity {
+        if self.startup.native_batch_authoritative || self.startup.diagnostics.batch_parity {
             self.batch_capacity
         } else {
             1
@@ -773,7 +770,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
     }
 
     fn propose_batch_min(&self) -> usize {
-        if self.startup.diagnostics.batch_parity {
+        if self.startup.native_batch_authoritative || self.startup.diagnostics.batch_parity {
             1
         } else {
             2
@@ -894,9 +891,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             states.len(),
             expected_owners.len(),
         )?;
-        // Product keeps the historical n<2 fallback. Batch parity may admit a
-        // single sequence solely to exercise the exact same staged parity gate.
-        if n == 0 || (n == 1 && !self.startup.diagnostics.batch_parity) {
+        let native_authoritative = self.startup.native_batch_authoritative;
+        // Generic DFlash keeps the historical n<2 fallback. The official
+        // Lightning product and explicit parity both enter the native B1 path.
+        if n == 0 || (n == 1 && !(native_authoritative || self.startup.diagnostics.batch_parity)) {
             return Ok(None);
         }
         if self.startup.diagnostics.batch_parity {
@@ -929,6 +927,21 @@ impl DraftProposer for BlockDiffusionDraftHead {
         } else {
             (None, None)
         };
+        if native_authoritative && parity_oracle.is_none() {
+            for i in 0..n {
+                self.prepare_drafts_state(
+                    last_tokens[i],
+                    target_hiddens[i],
+                    positions[i],
+                    num_drafts,
+                    states[i],
+                    expected_owners[i],
+                    ctx,
+                    stream,
+                    target_hiddens[i],
+                )?;
+            }
+        }
 
         // Freeze the explicit sequence identities and lifecycle snapshots before
         // any stream/event dispatch. The current implementation below remains
@@ -982,6 +995,16 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     .filter(|&&pointer| pointer != 0)
                     .count(),
                 n
+            );
+        }
+        if native_authoritative {
+            anyhow::ensure!(
+                batch_slots_ready,
+                "Lightning DSpark native batch cache slots are not ready"
+            );
+            anyhow::ensure!(
+                self.lane_count() == 1,
+                "Lightning DSpark native batch requires exactly one proposal lane"
             );
         }
         let batch_slot_mapping = batch_slot_mapping.unwrap_or_default();
@@ -1083,7 +1106,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
             .map_err(|_| anyhow::anyhow!("DFlash batch row count exceeds u32"))?;
         let batch_size =
             u32::try_from(n).map_err(|_| anyhow::anyhow!("DFlash batch width exceeds u32"))?;
-        if batch_slots_ready && self.lane_count() == 1 {
+        let native_staged = batch_slots_ready && self.lane_count() == 1;
+        if native_staged {
             let max_kv_len =
                 u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
                     .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
@@ -1115,31 +1139,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.run_batched_markov(batch_size, ctx, stream)?;
         }
 
-        let lanes_n = self.lane_count();
-        if lanes_n == 1 {
-            let out = if let Some(oracle) = parity_oracle {
-                oracle
-            } else {
-                // Single-lane product path: the original serial proposer.
-                let mut serial = Vec::with_capacity(n);
-                for i in 0..n {
-                    serial.push(self.propose_drafts(
-                        last_tokens[i],
-                        target_hiddens[i],
-                        positions[i],
-                        num_drafts,
-                        states[i],
-                        Some(expected_owners[i]),
-                        ctx,
-                        stream,
-                        None,
-                        None,
-                        Some(target_hiddens[i]),
-                    )?);
-                }
-                serial
-            };
-            if self.startup.diagnostics.batch_parity && batch_slots_ready {
+        let native =
+            if native_staged && (native_authoritative || self.startup.diagnostics.batch_parity) {
                 ctx.gpu.synchronize(stream)?;
                 let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
                 ctx.gpu.copy_d2h(self.batch_tokens, &mut raw)?;
@@ -1147,9 +1148,19 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     .chunks_exact(4)
                     .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                     .collect();
-                let native = batch_inputs.reorder_sampled_rows(&row_tokens)?;
+                Some(batch_inputs.reorder_sampled_rows(&row_tokens)?)
+            } else {
+                None
+            };
+
+        let lanes_n = self.lane_count();
+        if lanes_n == 1 {
+            if let Some(oracle) = parity_oracle {
+                let native = native.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("DFlash Bxgamma parity did not stage native tokens")
+                })?;
                 for (sequence, (native_tokens, oracle_tokens)) in
-                    native.iter().zip(out.iter()).enumerate()
+                    native.iter().zip(oracle.iter()).enumerate()
                 {
                     anyhow::ensure!(
                         native_tokens.get(..oracle_tokens.len()) == Some(oracle_tokens.as_slice()),
@@ -1162,8 +1173,41 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     self.gamma,
                     batch_inputs.total_rows()
                 );
+                return Ok(Some(oracle));
             }
-            return Ok(Some(out));
+            if native_authoritative {
+                let mut out = native.ok_or_else(|| {
+                    anyhow::anyhow!("Lightning DSpark native batch returned no staged tokens")
+                })?;
+                let cap = num_drafts.min(self.gamma.saturating_sub(1)).max(1);
+                for (i, tokens) in out.iter_mut().enumerate() {
+                    tokens.truncate(cap);
+                    let dstate = states[i]
+                        .as_any_mut()
+                        .downcast_mut::<DflashProposerState>()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+                    dstate.last_num_drafted = tokens.len();
+                }
+                return Ok(Some(out));
+            }
+            // Generic single-lane path retains the historical serial proposer.
+            let mut serial = Vec::with_capacity(n);
+            for i in 0..n {
+                serial.push(self.propose_drafts(
+                    last_tokens[i],
+                    target_hiddens[i],
+                    positions[i],
+                    num_drafts,
+                    states[i],
+                    Some(expected_owners[i]),
+                    ctx,
+                    stream,
+                    None,
+                    None,
+                    Some(target_hiddens[i]),
+                )?);
+            }
+            return Ok(Some(serial));
         }
         // Multi-lane: each seq proposes on its pinned lane (assigned once at
         // alloc_state — batch position `i` is NOT stable across steps, and a
@@ -1229,6 +1273,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 None,
                 Some(target_hiddens[i]),
                 true,
+                false,
             )?;
         }
         // COLLECT phase: each lane's D2H event is now recorded; synchronize

@@ -174,7 +174,8 @@ pub(super) fn step_verify_dflash_batched(
     let pending: Vec<usize> = (0..n)
         .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty())
         .collect();
-    if pending.len() >= 2 {
+    let batch_min = model.mtp_propose_batch_min().max(1);
+    if pending.len() >= batch_min {
         let tokens: Vec<u32> = pending.iter().map(|&i| batch[i].last_token).collect();
         let positions: Vec<usize> = pending.iter().map(|&i| batch[i].seq.seq_len).collect();
         let stash_idx: Vec<usize> = pending.clone();

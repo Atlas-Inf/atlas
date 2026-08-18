@@ -275,6 +275,7 @@ fn identity_latch_transitions_between_generic_and_lightning() {
 fn startup_execution_from_lightning_freezes_product_values() {
     let toggles = exact_product_toggles();
     let execution = super::DsparkStartupExecution::from_lightning(toggles);
+    assert!(execution.native_batch_authoritative);
     assert!(execution.option_b_enabled);
     assert_eq!(execution.proposal_lane_count, 1);
     assert_eq!(execution.draft_cap_override, None);
@@ -298,6 +299,7 @@ fn startup_execution_from_lightning_marks_ineligible_toggles() {
 fn startup_execution_from_env_lenient_defaults() {
     // Generic DFlash defaults: Option B off, one lane, no cap, no dumps.
     let execution = super::DsparkStartupExecution::from_env_lenient();
+    assert!(!execution.native_batch_authoritative);
     assert_eq!(
         execution.proposal_lane_count.max(1),
         execution.proposal_lane_count

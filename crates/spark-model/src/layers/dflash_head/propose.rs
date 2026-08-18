@@ -46,7 +46,45 @@ impl BlockDiffusionDraftHead {
             grammar_bitmask,
             target_hidden_stack,
             false,
+            false,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_drafts_state(
+        &self,
+        last_token: u32,
+        target_hidden: DevicePtr,
+        position: usize,
+        num_drafts: usize,
+        state: &mut dyn ProposerState,
+        expected_owner: super::SequenceGeneration,
+        ctx: &ForwardContext,
+        stream: u64,
+        target_hidden_stack: DevicePtr,
+    ) -> Result<()> {
+        let default_stream = ctx.gpu.default_stream();
+        let (_, scratch, markov_embed, markov_bias) = self.lane(0, default_stream);
+        self.propose_drafts_on_lane(
+            scratch,
+            markov_embed,
+            markov_bias,
+            0,
+            last_token,
+            target_hidden,
+            position,
+            num_drafts,
+            state,
+            Some(expected_owner),
+            ctx,
+            stream,
+            None,
+            None,
+            Some(target_hidden_stack),
+            false,
+            true,
+        )?;
+        Ok(())
     }
 
     pub(super) fn propose_drafts_on_lane(
@@ -67,6 +105,7 @@ impl BlockDiffusionDraftHead {
         _grammar_bitmask: Option<&[i32]>,
         target_hidden_stack: Option<DevicePtr>,
         defer_readback: bool,
+        prepare_only: bool,
     ) -> Result<Vec<u32>> {
         let dstate = state
             .as_any_mut()
@@ -487,6 +526,14 @@ impl BlockDiffusionDraftHead {
         } else {
             None
         };
+
+        if prepare_only {
+            anyhow::ensure!(
+                option_b_arg.is_some(),
+                "DFlash native batch preparation requires Option B"
+            );
+            return Ok(Vec::new());
+        }
 
         let drafts = self
             .forward_block(

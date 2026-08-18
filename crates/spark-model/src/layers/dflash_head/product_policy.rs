@@ -292,6 +292,9 @@ impl std::error::Error for LightningDsparkPolicyError {}
 /// ([`DsparkStartupExecution::from_env_lenient`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DsparkStartupExecution {
+    /// Official Lightning returns the native B×gamma proposal. Generic
+    /// DFlash remains on its historical proposer unless parity is explicit.
+    pub native_batch_authoritative: bool,
     /// Option B paged-context drafter path is active.
     pub option_b_enabled: bool,
     /// Number of total propose lanes (lane 0 is the default stream).
@@ -317,6 +320,7 @@ impl DsparkStartupExecution {
     /// consults the environment again.
     pub fn from_lightning(toggles: LightningDsparkRuntimeToggles) -> Self {
         Self {
+            native_batch_authoritative: true,
             option_b_enabled: toggles.option_b_enabled,
             proposal_lane_count: toggles.proposal_lane_count,
             draft_cap_override: toggles.draft_cap_override,
@@ -356,6 +360,7 @@ impl DsparkStartupExecution {
         .iter()
         .any(|name| present(name));
         Self {
+            native_batch_authoritative: false,
             option_b_enabled: one("ATLAS_DFLASH_OPTION_B"),
             proposal_lane_count: std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
                 .ok()

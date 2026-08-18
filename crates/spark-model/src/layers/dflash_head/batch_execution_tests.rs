@@ -148,7 +148,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
 }
 
 #[test]
-fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
+fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispatch() {
     let source = include_str!("../dflash_head.rs");
     let plan = source.find("packed_query_tokens").unwrap();
     let upload = source.find("copy_h2d(&query_bytes").unwrap();
@@ -156,8 +156,18 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
 
     let stage = source.find("self.run_batched_layer_stage").unwrap();
     let tail = source.find("self.run_batched_tail_base").unwrap();
-    let oracle = source.find("let lanes_n = self.lane_count()").unwrap();
-    assert!(plan < upload && upload < embed && embed < stage && stage < tail && tail < oracle);
+    let native_readback = source.find("let native =\n").unwrap();
+    let generic_serial = source
+        .find("Generic single-lane path retains the historical serial proposer")
+        .unwrap();
+    assert!(
+        plan < upload
+            && upload < embed
+            && embed < stage
+            && stage < tail
+            && tail < native_readback
+            && native_readback < generic_serial
+    );
     assert!(source.contains("self.batch_capacity"));
     assert!(source.contains("self.batch_query_ids_dev"));
     assert!(source.contains("self.batch_position_ids"));
@@ -171,14 +181,26 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("ctx_count_drafter"));
     assert!(!source.contains(".ctx_len\n                    .checked_add(self.gamma)"));
 
-    assert!(source.contains("if batch_slots_ready && self.lane_count() == 1"));
+    assert!(source.contains("let native_staged = batch_slots_ready && self.lane_count() == 1"));
 
-    assert!(source.contains("diagnostics.batch_parity && batch_slots_ready"));
     assert!(source.contains("batch_inputs.reorder_sampled_rows"));
     assert!(source.contains("DFlash Bxgamma parity mismatch"));
+    assert!(source.contains("self.startup.native_batch_authoritative"));
+    assert!(source.contains("self.prepare_drafts_state"));
+    assert!(source.contains("dstate.last_num_drafted = tokens.len()"));
     assert!(source.contains("if self.startup.diagnostics.batch_parity"));
     assert!(source.contains("self.batch_capacity"));
-    assert!(source.contains("n == 1 && !self.startup.diagnostics.batch_parity"));
+    assert!(source.contains("n == 1 && !(native_authoritative"));
     assert!(source.contains("DFlash Bxgamma parity dispatch"));
     assert!(source.contains("DFlash Bxgamma parity cache gate"));
+
+    let prepare_source = include_str!("propose.rs");
+    assert!(prepare_source.contains("fn prepare_drafts_state"));
+    assert!(prepare_source.contains("if prepare_only"));
+    assert!(prepare_source.contains("native batch preparation requires Option B"));
+
+    let projection_source = include_str!("batch_projection.rs");
+    for tier in ["batch4", "batch8", "batch16", "batch32"] {
+        assert!(projection_source.contains(tier));
+    }
 }
