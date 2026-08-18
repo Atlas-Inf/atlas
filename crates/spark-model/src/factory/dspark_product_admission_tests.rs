@@ -21,6 +21,7 @@ fn exact_product_toggles() -> LightningDsparkRuntimeToggles {
         seam_serial_enabled: false,
         draft_cap_override: None,
         adaptive_enabled: false,
+        batch_parity_enabled: false,
     }
 }
 

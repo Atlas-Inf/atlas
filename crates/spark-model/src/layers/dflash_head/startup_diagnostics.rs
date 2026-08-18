@@ -43,6 +43,8 @@ pub struct DsparkDiagnostics {
     pub ctxlen_probe: bool,
     /// `ATLAS_DFLASH_VERIFY_TRACE=1`.
     pub verify_trace: bool,
+    /// `ATLAS_DFLASH_BATCH_PARITY=1` — native-vs-serial fail-closed gate.
+    pub batch_parity: bool,
     /// `ATLAS_DFLASH_PRECOMPUTE_DUMP=1`.
     pub precompute_dump: bool,
     /// `ATLAS_DFLASH_OPTION_B_DIAG=1`.
@@ -68,6 +70,7 @@ impl Default for DsparkDiagnostics {
             full_precompute: false,
             ctxlen_probe: false,
             verify_trace: false,
+            batch_parity: false,
             precompute_dump: false,
             option_b_diag: false,
         }
@@ -106,6 +109,7 @@ impl DsparkDiagnostics {
             full_precompute: one("ATLAS_DFLASH_DEBUG_FULL_PRECOMPUTE"),
             ctxlen_probe: one("ATLAS_DFLASH_CTXLEN_PROBE"),
             verify_trace: one("ATLAS_DFLASH_VERIFY_TRACE"),
+            batch_parity: one("ATLAS_DFLASH_BATCH_PARITY"),
             precompute_dump: one("ATLAS_DFLASH_PRECOMPUTE_DUMP"),
             option_b_diag: one("ATLAS_DFLASH_OPTION_B_DIAG"),
         }

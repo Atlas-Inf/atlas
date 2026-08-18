@@ -21,6 +21,8 @@ pub struct LightningDsparkRuntimeToggles {
     pub seam_serial_enabled: bool,
     pub draft_cap_override: Option<usize>,
     pub adaptive_enabled: bool,
+    /// Explicit diagnostic admission for staged native batch parity only.
+    pub batch_parity_enabled: bool,
 }
 
 impl LightningDsparkRuntimeToggles {
@@ -108,6 +110,7 @@ impl LightningDsparkRuntimeToggles {
             seam_serial_enabled: one(&mut read, "ATLAS_DFLASH_SEAM_SERIAL"),
             draft_cap_override,
             adaptive_enabled: one(&mut read, "ATLAS_DFLASH_ADAPTIVE"),
+            batch_parity_enabled: one(&mut read, "ATLAS_DFLASH_BATCH_PARITY"),
         })
     }
 
@@ -321,7 +324,10 @@ impl DsparkStartupExecution {
             debug_dump: false,
             graph_ineligible_diags: !(toggles.proposal_graph_eligible
                 && toggles.target_verify_graph_eligible),
-            diagnostics: DsparkDiagnostics::default(),
+            diagnostics: DsparkDiagnostics {
+                batch_parity: toggles.batch_parity_enabled,
+                ..DsparkDiagnostics::default()
+            },
         }
     }
 

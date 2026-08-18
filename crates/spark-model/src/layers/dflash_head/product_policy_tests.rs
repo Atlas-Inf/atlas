@@ -17,6 +17,7 @@ fn product_toggles() -> LightningDsparkRuntimeToggles {
         seam_serial_enabled: false,
         draft_cap_override: None,
         adaptive_enabled: false,
+        batch_parity_enabled: false,
     }
 }
 
@@ -140,6 +141,21 @@ fn read_product(
     values: &[(&str, &str)],
 ) -> Result<LightningDsparkRuntimeToggles, super::product_policy::LightningDsparkPolicyError> {
     LightningDsparkRuntimeToggles::from_reader(reader(values))
+}
+
+#[test]
+fn explicit_batch_parity_is_admitted_and_frozen_without_other_diagnostics() {
+    let toggles = read_product(&[
+        ("ATLAS_DFLASH_OPTION_B", "1"),
+        ("ATLAS_DFLASH_BATCH_PARITY", "1"),
+    ])
+    .unwrap();
+    assert!(toggles.batch_parity_enabled);
+    toggles.validate().unwrap();
+    let execution = super::DsparkStartupExecution::from_lightning(toggles);
+    assert!(execution.diagnostics.batch_parity);
+    assert!(!execution.diagnostics.verify_trace);
+    assert!(!execution.graph_ineligible_diags);
 }
 
 #[test]
@@ -310,6 +326,7 @@ fn exact_product_toggles() -> super::LightningDsparkRuntimeToggles {
         seam_serial_enabled: false,
         draft_cap_override: None,
         adaptive_enabled: false,
+        batch_parity_enabled: false,
     }
 }
 

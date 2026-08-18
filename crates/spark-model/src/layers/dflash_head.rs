@@ -756,9 +756,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _config: &atlas_core::config::ModelConfig,
     ) -> usize {
         // Product policy remains serial until native parity is proven. The
-        // existing verify-trace diagnostic alone admits widths through the
+        // explicit batch-parity diagnostic alone admits widths through the
         // explicit allocation capacity and fails closed on output drift.
-        if self.startup.diagnostics.verify_trace {
+        if self.startup.diagnostics.batch_parity {
             self.batch_capacity
         } else {
             1
@@ -879,9 +879,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             states.len(),
             expected_owners.len(),
         )?;
-        // Product keeps the historical n<2 fallback. Verify-trace may admit a
+        // Product keeps the historical n<2 fallback. Batch parity may admit a
         // single sequence solely to exercise the exact same staged parity gate.
-        if n == 0 || (n == 1 && !self.startup.diagnostics.verify_trace) {
+        if n == 0 || (n == 1 && !self.startup.diagnostics.batch_parity) {
             return Ok(None);
         }
 
@@ -1320,7 +1320,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 )?;
                 out.push(drafts);
             }
-            if self.startup.diagnostics.verify_trace && batch_slots_ready {
+            if self.startup.diagnostics.batch_parity && batch_slots_ready {
                 ctx.gpu.synchronize(stream)?;
                 let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
                 ctx.gpu.copy_d2h(self.batch_tokens, &mut raw)?;
