@@ -338,7 +338,7 @@ impl NemotronMoeLayer {
                 KernelLaunch::new(ctx.gpu, self.shared_relu2_down_grouped_k)
                     .grid([div_ceil(h as u32, 32), 1, 1])
                     .block([256, 1, 1])
-                    .shared_mem((64 + 8 * shared_inter as usize * bf16) as u32)
+                    .shared_mem((64 + 4 * shared_inter as usize * bf16) as u32)
                     .arg_ptr(shared_up)
                     .arg_ptr(self.weights.shared_down.weight)
                     .arg_ptr(self.weights.shared_down.weight_scale)

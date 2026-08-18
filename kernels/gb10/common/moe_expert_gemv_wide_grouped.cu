@@ -179,10 +179,10 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
 }
 
 // Exact shared-expert relu²+DOWN over contiguous rows. One CTA owns an N tile
-// and reuses each weight chunk across up to eight activation rows. Arithmetic
+// and reuses each weight chunk across up to four activation rows. Arithmetic
 // matches moe_expert_relu2_down_wide: BF16 input -> fmax -> square, paired RHS
 // accumulation, identical warp reduction. Grid: (ceil(N/32),1,1), block 256.
-#define SHARED_BATCH_M 8
+#define SHARED_BATCH_M 4
 extern "C" __global__ void w4a16_relu2_gemv_batch32(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B_packed,
