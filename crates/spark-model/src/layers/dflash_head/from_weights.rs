@@ -167,6 +167,10 @@ impl BlockDiffusionDraftHead {
                 "prefill_paged_indirect_sink",
                 "inferspark_prefill_paged_indirect_sink",
             )?,
+            prefill_attn_dflash_bf16_batched_sink: gpu.kernel(
+                "inferspark_prefill_paged_batched_sink",
+                "inferspark_prefill_paged_batched_sink",
+            )?,
             silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,

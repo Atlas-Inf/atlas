@@ -73,6 +73,7 @@ pub struct DflashKernels {
     /// dynamic values written to the indirect-args buffer pre-launch.
     /// Resolves to kernel `inferspark_prefill_paged_indirect`.
     pub prefill_attn_dflash_bf16_indirect: KernelHandle,
+    pub prefill_attn_dflash_bf16_batched_sink: KernelHandle,
     pub silu_mul: KernelHandle,
     pub residual_add: KernelHandle,
     pub argmax: KernelHandle,
@@ -1104,6 +1105,65 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.rope_theta,
             stream,
         )?;
+
+        // Warm-only, behavior-neutral layer-0 attention exercise. The staged
+        // K/V occupies the current noise rows only; the unchanged serial oracle
+        // below runs on the same stream, overwrites those rows, and remains the
+        // sole source of returned drafts. Lazy/missing blocks skip this stage.
+        if batch_slots_ready
+            && self.lane_count() == 1
+            && let Some(sinks) = layer0.attention_sink_bias.as_ref()
+        {
+            let (k_pool, v_pool) = {
+                let cache = self.kv_cache.lock();
+                (cache.k_pool_ptr(0), cache.v_pool_ptr(0))
+            };
+            let kv_dim = u32::try_from(self.num_kv_heads * self.head_dim)
+                .map_err(|_| anyhow::anyhow!("DFlash batched KV width exceeds u32"))?;
+            crate::layers::ops::reshape_and_cache(
+                ctx.gpu,
+                self.kernels.reshape_cache_bf16,
+                self.batch_k,
+                self.batch_v,
+                k_pool,
+                v_pool,
+                self.batch_slot_mapping,
+                batch_rows,
+                self.num_kv_heads as u32,
+                self.head_dim as u32,
+                16,
+                kv_dim,
+                kv_dim,
+                0,
+                stream,
+            )?;
+            let max_kv_len =
+                u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
+                    .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
+            crate::layers::ops::prefill_attention_paged_batched_sink(
+                ctx.gpu,
+                self.kernels.prefill_attn_dflash_bf16_batched_sink,
+                self.batch_q,
+                k_pool,
+                v_pool,
+                self.batch_attn_out,
+                self.batch_block_table_ptrs,
+                n as u32,
+                self.batch_cu_seqlens,
+                self.batch_kv_lens,
+                self.gamma as u32,
+                max_kv_len,
+                0,
+                self.num_q_heads as u32,
+                self.num_kv_heads as u32,
+                self.head_dim as u32,
+                16,
+                self.attn_sliding_window(),
+                1.0 / (self.head_dim as f32).sqrt(),
+                sinks.weight,
+                stream,
+            )?;
+        }
 
         let lanes_n = self.lane_count();
         if lanes_n == 1 {

@@ -489,6 +489,9 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     let q_proj = source.find("&layer0.q_proj").unwrap();
     let q_norm = source.find("&layer0.q_norm").unwrap();
     let rope = source.find("ops::rope_yarn").unwrap();
+    let attention = source
+        .find("ops::prefill_attention_paged_batched_sink")
+        .unwrap();
     let oracle = source.find("let lanes_n = self.lane_count()").unwrap();
     assert!(
         plan < upload
@@ -501,7 +504,8 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
             && layer_norm < q_proj
             && q_proj < q_norm
             && q_norm < rope
-            && rope < oracle
+            && rope < attention
+            && attention < oracle
     );
     assert!(source.contains("self.batch_capacity"));
     assert!(source.contains("self.batch_query_ids_dev"));
@@ -521,4 +525,7 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("ctx_count_drafter"));
     assert!(!source.contains(".ctx_len\n                    .checked_add(self.gamma)"));
     assert!(source.contains("batch_attn_out"));
+    assert!(source.contains("batch_slots_ready\n            && self.lane_count() == 1"));
+    assert!(source.contains("&& let Some(sinks)"));
+    assert!(source.contains("sole source of returned drafts"));
 }

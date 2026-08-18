@@ -143,6 +143,7 @@ fn zero_kernels() -> DflashKernels {
         prefill_attn_dflash_fp8: zero,
         prefill_attn_dflash_bf16: zero,
         prefill_attn_dflash_bf16_indirect: zero,
+        prefill_attn_dflash_bf16_batched_sink: zero,
         silu_mul: zero,
         residual_add: zero,
         argmax: zero,
