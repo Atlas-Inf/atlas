@@ -235,25 +235,6 @@ pub fn marlin_scatter_slots(
         .launch(stream)
 }
 
-pub fn marlin_gather_slots(
-    gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
-    route_in: DevicePtr,
-    slot_map: DevicePtr,
-    slot_a: DevicePtr,
-    hidden_size: i32,
-    stream: u64,
-) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([MARLIN_SLOTS as u32, MARLIN_M_TILE as u32, 1])
-        .block([256, 1, 1])
-        .arg_ptr(route_in)
-        .arg_ptr(slot_map)
-        .arg_ptr(slot_a)
-        .arg_i32(hidden_size)
-        .launch(stream)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn marlin_nvfp4_m8_slot(
     gpu: &dyn GpuBackend,

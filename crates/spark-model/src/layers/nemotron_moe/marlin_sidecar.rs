@@ -38,7 +38,6 @@ pub(super) struct MarlinSidecar {
     pub lin_dn_out: DevicePtr,
     pub pack_k: KernelHandle,
     pub scatter_k: KernelHandle,
-    pub gather_k: KernelHandle,
     pub slot_up_k: KernelHandle,
     pub slot_dn_k: KernelHandle,
     pub slot_eids: DevicePtr,

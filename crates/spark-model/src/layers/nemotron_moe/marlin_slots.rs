@@ -40,14 +40,6 @@ impl NemotronMoeLayer {
         let bf16 = 2usize;
         let num_experts = ctx.config.num_experts as u32;
         let up_only = std::env::var("ATLAS_MOE_MARLIN_UP_ONLY").as_deref() == Ok("1");
-        let down_only = std::env::var("ATLAS_MOE_MARLIN_DOWN_ONLY").as_deref() == Ok("1");
-        anyhow::ensure!(
-            !(up_only && down_only),
-            "Marlin UP-only and DOWN-only are mutually exclusive"
-        );
-        if down_only {
-            anyhow::ensure!(m.gather_k.0 != 0, "Marlin DOWN-only gather kernel missing");
-        }
         // KEEP shape is n<=4 (C=4 AR, C=1 DSpark verify). One launch over
         // n=8 (~41 unique) still garbles with 64 slots + zeroed scatter.
         // Wave the proven tile; shared expert stays one n-wide GEMM.
@@ -154,77 +146,39 @@ impl NemotronMoeLayer {
                 h as i32,
                 stream,
             )?;
-            if down_only {
-                let expert_up_out = ctx.buffers.expert_up_out();
-                let wave_up =
-                    expert_up_out.offset(wave_off * top_k as usize * inter as usize * bf16);
-                ops::moe_expert_gemv_wide(
-                    ctx.gpu,
-                    self.moe_expert_gemv_wide_k,
-                    normed.offset(wave_off * h * bf16),
-                    self.up_ptrs.packed_ptrs,
-                    self.up_ptrs.scale_ptrs,
-                    self.up_ptrs.scale2_vals,
-                    wave_up,
-                    indices.offset(wave_off * top_k as usize * 4),
-                    inter,
-                    h as u32,
-                    top_k,
-                    0,
-                    cn as u32,
-                    stream,
-                )?;
-                ops::relu_squared_inplace(
-                    ctx.gpu,
-                    self.moe_relu2_elementwise_k,
-                    wave_up,
-                    (cn as u32) * top_k * inter,
-                    stream,
-                )?;
-                ops::marlin_gather_slots(
-                    ctx.gpu,
-                    m.gather_k,
-                    wave_up,
-                    m.slot_map,
-                    m.slot_up,
-                    inter as i32,
-                    stream,
-                )?;
-            } else {
-                ctx.gpu
-                    .memset_async(m.locks, 0, (SLOTS as usize) * 256 * 4, stream)?;
-                ctx.gpu
-                    .memset_async(m.slot_bars, 0, (SLOTS as usize) * 4, stream)?;
-                ops::marlin_nvfp4_m8_allslots(
-                    ctx.gpu,
-                    m.slot_up_k,
-                    m.slot_a,
-                    m.up_w,
-                    m.slot_up,
-                    m.c_tmp,
-                    m.up_s,
-                    m.up_gs,
-                    m.slot_eids,
-                    m.n_post,
-                    m.slot_bars,
-                    ng_up,
-                    M_TILE,
-                    m.up_n,
-                    m.up_k,
-                    m.up_k,
-                    m.locks,
-                    SMS,
-                    SMEM,
-                    stream,
-                )?;
-                ops::relu_squared_inplace(
-                    ctx.gpu,
-                    self.moe_relu2_elementwise_k,
-                    m.slot_up,
-                    (SLOTS * M_TILE) as u32 * inter,
-                    stream,
-                )?;
-            }
+            ctx.gpu
+                .memset_async(m.locks, 0, (SLOTS as usize) * 256 * 4, stream)?;
+            ctx.gpu
+                .memset_async(m.slot_bars, 0, (SLOTS as usize) * 4, stream)?;
+            ops::marlin_nvfp4_m8_allslots(
+                ctx.gpu,
+                m.slot_up_k,
+                m.slot_a,
+                m.up_w,
+                m.slot_up,
+                m.c_tmp,
+                m.up_s,
+                m.up_gs,
+                m.slot_eids,
+                m.n_post,
+                m.slot_bars,
+                ng_up,
+                M_TILE,
+                m.up_n,
+                m.up_k,
+                m.up_k,
+                m.locks,
+                SMS,
+                SMEM,
+                stream,
+            )?;
+            ops::relu_squared_inplace(
+                ctx.gpu,
+                self.moe_relu2_elementwise_k,
+                m.slot_up,
+                (SLOTS * M_TILE) as u32 * inter,
+                stream,
+            )?;
             if up_only {
                 let expert_up_out = ctx.buffers.expert_up_out();
                 let wave_up =

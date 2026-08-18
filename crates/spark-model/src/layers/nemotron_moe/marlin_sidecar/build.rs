@@ -207,8 +207,6 @@ impl MarlinSidecar {
         let pack = crate::layers::try_kernel(gpu, "marlin_pack_slots", "atlas_marlin_pack_slots");
         let scatter =
             crate::layers::try_kernel(gpu, "marlin_scatter_slots", "atlas_marlin_scatter_slots");
-        let gather =
-            crate::layers::try_kernel(gpu, "marlin_scatter_slots", "atlas_marlin_gather_slots");
         let repack = crate::layers::try_kernel(gpu, "marlin_repack", "atlas_marlin_repack_w4");
         let align = crate::layers::try_kernel(gpu, "marlin_align", "atlas_marlin_align_block8");
         let repeat = crate::layers::try_kernel(gpu, "marlin_row_repeat", "atlas_row_repeat_bf16");
@@ -292,7 +290,6 @@ impl MarlinSidecar {
             lin_dn_out: gpu.alloc(8 * down_n * 2)?,
             pack_k: pack,
             scatter_k: scatter,
-            gather_k: gather,
             slot_up_k: slot_up,
             slot_dn_k: slot_dn,
             slot_eids: gpu.alloc(ops::MARLIN_SLOTS as usize * 4)?,
