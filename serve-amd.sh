@@ -21,9 +21,15 @@ MODEL="${1:-unsloth/Qwen3.8-27B-NVFP4}"
 HW="${ATLAS_TARGET_HW:-strix-hip}"
 
 # ── gfx1151 runtime shims (each explained in docs §4) ────────────────────────
-export ATLAS_FORCE_GLOBAL_GDN=1   # GDN prefill -> global-mem kernel (RDNA3.5 64KB LDS cap)
 export ATLAS_W4A16_VARIANT=v1     # BF16-MMA NVFP4 GEMM (SCALE device FP8 encode is broken on gfx1151)
 export ATLAS_W4A16_DP4A=1         # int8-DP4A decode GEMV
+#
+# NOT set, though every earlier Strix doc lists it: ATLAS_FORCE_GLOBAL_GDN=1.
+# It has ZERO readers in crates/ on current main (only docs/ still mention it).
+# It is unnecessary now because the strix kernel tree ships its own
+# kernels/strix-hip/qwen3.6-27b/nvfp4/gated_delta_rule.cu as a model-specific
+# override, already written for RDNA3.5's 64 KB LDS budget — the thing the
+# lever used to force at dispatch time is now the only kernel there is.
 
 # The GDN-projection prefill fast path (fp8_fp8_gemm_ldmab) is DEFAULT-ON on
 # main and is NVIDIA-only: kernels/gb10/common/w4a16_fp8_ldmab.cu is built from
@@ -38,10 +44,18 @@ export ATLAS_FP8_LDMAB=0
 # under, and keeping them identical is what makes the 3.6-vs-3.8 comparison in
 # ../40-bench/RESULTS.md apples-to-apples.
 export ATLAS_SSM_TAIL_MIDCHUNK=1  # capture the mid-chunk SSM tail state
-export ATLAS_SSM_TAIL_PROTECT=1   # guard it against overwrite on the next chunk
 export ATLAS_MTP_GATE_REPROBE=64  # re-probe the MTP accept gate every 64 tokens
-export ATLAS_MTP_DRAFTER_PREFILL=1
-export ATLAS_MTP_CARRY_DRAFTER=1
+#
+# Three more from the 3.6 recipe are deliberately dropped — all three are
+# no-ops on current main, and two of them make the server print a warning:
+#   ATLAS_SSM_TAIL_PROTECT=1   renamed 2026-08-05 to the opt-OUT
+#                              ATLAS_DISABLE_SSM_TAIL_PROTECT; the lease is now
+#                              on by default, so setting the old name does
+#                              nothing and the behaviour is unchanged.
+#   ATLAS_MTP_DRAFTER_PREFILL=1 } "OBSOLETE and IGNORED — MTP drafter prefill
+#   ATLAS_MTP_CARRY_DRAFTER=1   } and cross-turn carry are ON by default"
+#                              (spark_model::model::drafter_context). To turn
+#                              them off you now set ATLAS_NO_MTP_DRAFTER_CONTEXT=1.
 
 # ── memory: Strix Halo is a unified-memory part ──────────────────────────────
 # The GPU allocates from the same RAM the OS uses. GTT reports 60 GB but the
