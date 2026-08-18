@@ -39,7 +39,6 @@ impl NemotronMoeLayer {
         let scale = ctx.config.routed_scaling_factor as f32;
         let bf16 = 2usize;
         let num_experts = ctx.config.num_experts as u32;
-        let up_only = std::env::var("ATLAS_MOE_MARLIN_UP_ONLY").as_deref() == Ok("1");
         // KEEP shape is n<=4 (C=4 AR, C=1 DSpark verify). One launch over
         // n=8 (~41 unique) still garbles with 64 slots + zeroed scatter.
         // Wave the proven tile; shared expert stays one n-wide GEMM.
@@ -179,72 +178,41 @@ impl NemotronMoeLayer {
                 (SLOTS * M_TILE) as u32 * inter,
                 stream,
             )?;
-            if up_only {
-                let expert_up_out = ctx.buffers.expert_up_out();
-                let wave_up =
-                    expert_up_out.offset(wave_off * top_k as usize * inter as usize * bf16);
-                ops::marlin_scatter_slots(
-                    ctx.gpu,
-                    m.scatter_k,
-                    m.slot_up,
-                    m.slot_map,
-                    wave_up,
-                    inter as i32,
-                    stream,
-                )?;
-                ops::moe_expert_gemv_wide(
-                    ctx.gpu,
-                    self.moe_expert_gemv_wide_k,
-                    wave_up,
-                    self.down_ptrs.packed_ptrs,
-                    self.down_ptrs.scale_ptrs,
-                    self.down_ptrs.scale2_vals,
-                    expert_down_out.offset(wave_off * top_k as usize * h * bf16),
-                    indices.offset(wave_off * top_k as usize * 4),
-                    h as u32,
-                    inter,
-                    top_k,
-                    inter,
-                    cn as u32,
-                    stream,
-                )?;
-            } else {
-                ctx.gpu
-                    .memset_async(m.locks, 0, (SLOTS as usize) * 256 * 4, stream)?;
-                ctx.gpu
-                    .memset_async(m.slot_bars, 0, (SLOTS as usize) * 4, stream)?;
-                ops::marlin_nvfp4_m8_allslots(
-                    ctx.gpu,
-                    m.slot_dn_k,
-                    m.slot_up,
-                    m.down_w,
-                    m.slot_dn,
-                    m.c_tmp,
-                    m.down_s,
-                    m.down_gs,
-                    m.slot_eids,
-                    m.n_post,
-                    m.slot_bars,
-                    ng_dn,
-                    M_TILE,
-                    m.down_n,
-                    m.down_k,
-                    m.down_k,
-                    m.locks,
-                    SMS,
-                    SMEM,
-                    stream,
-                )?;
-                ops::marlin_scatter_slots(
-                    ctx.gpu,
-                    m.scatter_k,
-                    m.slot_dn,
-                    m.slot_map,
-                    expert_down_out.offset(wave_off * top_k as usize * h * bf16),
-                    h as i32,
-                    stream,
-                )?;
-            }
+            ctx.gpu
+                .memset_async(m.locks, 0, (SLOTS as usize) * 256 * 4, stream)?;
+            ctx.gpu
+                .memset_async(m.slot_bars, 0, (SLOTS as usize) * 4, stream)?;
+            ops::marlin_nvfp4_m8_allslots(
+                ctx.gpu,
+                m.slot_dn_k,
+                m.slot_up,
+                m.down_w,
+                m.slot_dn,
+                m.c_tmp,
+                m.down_s,
+                m.down_gs,
+                m.slot_eids,
+                m.n_post,
+                m.slot_bars,
+                ng_dn,
+                M_TILE,
+                m.down_n,
+                m.down_k,
+                m.down_k,
+                m.locks,
+                SMS,
+                SMEM,
+                stream,
+            )?;
+            ops::marlin_scatter_slots(
+                ctx.gpu,
+                m.scatter_k,
+                m.slot_dn,
+                m.slot_map,
+                expert_down_out.offset(wave_off * top_k as usize * h * bf16),
+                h as i32,
+                stream,
+            )?;
             wave_off += cn;
         }
 
