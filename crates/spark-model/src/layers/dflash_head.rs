@@ -892,6 +892,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
         if n == 0 || (n == 1 && !self.startup.diagnostics.batch_parity) {
             return Ok(None);
         }
+        if self.startup.diagnostics.batch_parity {
+            tracing::info!("DFlash Bxgamma parity dispatch: batch={n}");
+        }
 
         // Freeze the explicit sequence identities and lifecycle snapshots before
         // any stream/event dispatch. The current implementation below remains
@@ -935,6 +938,18 @@ impl DraftProposer for BlockDiffusionDraftHead {
         )?;
         let batch_slots_ready =
             block_table_ptrs.iter().all(|&pointer| pointer != 0) && batch_slot_mapping.is_some();
+        if self.startup.diagnostics.batch_parity {
+            tracing::info!(
+                "DFlash Bxgamma parity cache gate: batch={} slots_ready={} device_tables={}/{}",
+                n,
+                batch_slots_ready,
+                block_table_ptrs
+                    .iter()
+                    .filter(|&&pointer| pointer != 0)
+                    .count(),
+                n
+            );
+        }
         let batch_slot_mapping = batch_slot_mapping.unwrap_or_default();
         let batch_inputs = DsparkBatchInput::validate(
             self.gamma,

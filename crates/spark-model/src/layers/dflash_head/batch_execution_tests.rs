@@ -220,4 +220,6 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("if self.startup.diagnostics.batch_parity"));
     assert!(source.contains("self.batch_capacity"));
     assert!(source.contains("n == 1 && !self.startup.diagnostics.batch_parity"));
+    assert!(source.contains("DFlash Bxgamma parity dispatch"));
+    assert!(source.contains("DFlash Bxgamma parity cache gate"));
 }
