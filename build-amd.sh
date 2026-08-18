@@ -51,5 +51,10 @@ case "$ATLAS_TARGET_HW" in
   *) echo "ATLAS_TARGET_HW must be strix-hip or strix (got: $ATLAS_TARGET_HW)" >&2; exit 2 ;;
 esac
 
+# rustup installs cargo to ~/.cargo/bin, which a non-interactive shell (ssh
+# "cmd", CI, systemd) does not get from the login profile.
+command -v cargo >/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
+command -v cargo >/dev/null || { echo "cargo not found; install Rust (rustup) first" >&2; exit 2; }
+
 rm -rf target/release/build/atlas-kernels-* target/release/build/spark-storage-*
 cargo build --release -p spark-server --no-default-features --features cuda
