@@ -26,8 +26,10 @@ pub struct MockGpuBackend {
     d2h_blocking: AtomicUsize,
     d2h_async: AtomicUsize,
     host_pinned_allocs: AtomicUsize,
-    /// One-shot `free` failure injection (see [`Self::fail_next_free`]).
-    fail_free_once: std::sync::atomic::AtomicBool,
+    /// Pending `free` failure injections (see [`Self::fail_next_free`]).
+    pending_free_failures: AtomicUsize,
+    /// `destroy_graph` call counter (see [`Self::destroy_graph_count`]).
+    destroyed_graphs: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -54,17 +56,24 @@ impl MockGpuBackend {
             d2h_blocking: AtomicUsize::new(0),
             d2h_async: AtomicUsize::new(0),
             host_pinned_allocs: AtomicUsize::new(0),
-            fail_free_once: std::sync::atomic::AtomicBool::new(false),
+            pending_free_failures: AtomicUsize::new(0),
+            destroyed_graphs: AtomicUsize::new(0),
         }
     }
 
-    /// One-shot failure injection for the NEXT `free` call: that single
-    /// `free` returns an error and the flag clears. Lets cleanup-path tests
-    /// prove a failed free keeps its resource observable/retryable instead
-    /// of silently leaking.
+    /// Queue one `free` failure: the next `free` call returns an error and
+    /// consumes one queued failure. Lets cleanup-path tests prove a failed
+    /// free keeps its resource observable/retryable instead of silently
+    /// leaking (queue N to fail N consecutive frees).
     pub fn fail_next_free(&self) {
-        self.fail_free_once
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.pending_free_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `destroy_graph` calls so far — the tripwire proving a cleanup error
+    /// path does NOT destroy pooled graphs.
+    pub fn destroy_graph_count(&self) -> usize {
+        self.destroyed_graphs
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn alloc_count(&self) -> usize {
@@ -161,8 +170,9 @@ impl GpuBackend for MockGpuBackend {
 
     fn free(&self, ptr: DevicePtr) -> Result<()> {
         if self
-            .fail_free_once
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
+            .pending_free_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
         {
             anyhow::bail!("mock free failed (injected): ptr {ptr}");
         }
@@ -275,5 +285,10 @@ impl GpuBackend for MockGpuBackend {
 
     fn free_memory(&self) -> Result<usize> {
         Ok(120 * 1024 * 1024 * 1024) // 120 GB
+    }
+
+    fn destroy_graph(&self, _graph: GraphHandle) -> Result<()> {
+        self.destroyed_graphs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }

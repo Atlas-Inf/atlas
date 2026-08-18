@@ -248,9 +248,17 @@ fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
     let own = owner(3, 77);
     let stale = owner(3, 76);
 
+    // A pooled graph for THIS owner must remain in the pool: the error arm
+    // reclaims state resources but must NOT destroy owner-keyed graphs.
+    head.propose_graphs.lock().insert(
+        DflashGraphIdentity::new(own, 0x10, 0x20, 0x30, 0).unwrap(),
+        vec![spark_runtime::gpu::GraphHandle(0xAA)],
+    );
+
     let mut boxed = live_state(&gpu, own);
     hold_two_blocks(boxed.as_mut(), &head.kv_cache);
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 6);
+    let allocs_before = gpu.alloc_count();
 
     let err = head
         .free_state(&gpu, Some(stale), boxed.as_mut())
@@ -263,10 +271,15 @@ fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
     assert!(boxed.block_table.is_empty());
     assert_eq!(boxed.ctx_hidden_acc.0, 0);
     assert!(boxed.block_table_dev.is_none());
+    assert_eq!(gpu.alloc_count(), allocs_before - 2);
     assert_eq!(
         boxed.lifecycle.as_ref().unwrap().status(),
         CaptureStatus::Retired
     );
+    // Graph pool untouched in the error arm: entry still present, zero
+    // destroy_graph calls.
+    assert_eq!(head.propose_graphs.lock().len(), 1);
+    assert_eq!(gpu.destroy_graph_count(), 0);
 }
 
 #[test]
@@ -278,6 +291,7 @@ fn real_free_state_different_live_owner_is_rejected_and_reclaimed() {
 
     let mut boxed = live_state(&gpu, own);
     hold_two_blocks(boxed.as_mut(), &head.kv_cache);
+    let allocs_before = gpu.alloc_count();
 
     let err = head
         .free_state(&gpu, Some(other), boxed.as_mut())
@@ -285,6 +299,13 @@ fn real_free_state_different_live_owner_is_rejected_and_reclaimed() {
     assert!(err.to_string().contains("stale owner"));
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 8);
     assert_eq!(boxed.ctx_hidden_acc.0, 0);
+    assert!(boxed.block_table_dev.is_none());
+    assert_eq!(gpu.alloc_count(), allocs_before - 2);
+    assert_eq!(
+        boxed.lifecycle.as_ref().unwrap().status(),
+        CaptureStatus::Retired
+    );
+    assert_eq!(gpu.destroy_graph_count(), 0);
 }
 
 #[test]
@@ -295,12 +316,21 @@ fn real_free_state_missing_owner_is_rejected_and_reclaimed() {
 
     let mut boxed = live_state(&gpu, own);
     hold_two_blocks(boxed.as_mut(), &head.kv_cache);
+    let allocs_before = gpu.alloc_count();
 
     let err = head
         .free_state(&gpu, None, boxed.as_mut())
         .expect_err("missing expected owner must be rejected");
     assert!(err.to_string().contains("expected owner"));
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 8);
+    assert_eq!(boxed.ctx_hidden_acc.0, 0);
+    assert!(boxed.block_table_dev.is_none());
+    assert_eq!(gpu.alloc_count(), allocs_before - 2);
+    assert_eq!(
+        boxed.lifecycle.as_ref().unwrap().status(),
+        CaptureStatus::Retired
+    );
+    assert_eq!(gpu.destroy_graph_count(), 0);
 }
 
 #[test]
@@ -328,7 +358,35 @@ fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
 }
 
 #[test]
-fn reclaim_seam_free_failure_retains_pointer() {
+fn real_free_state_block_table_free_failure_restores_handle_for_retry() {
+    let gpu = MockGpuBackend::new();
+    let head = zero_head();
+    let own = owner(3, 77);
+
+    let mut boxed = live_state(&gpu, own);
+
+    // Fail BOTH success-path frees: the ctx accumulator first, then the
+    // device block table. Each failed free must retain/restore its handle.
+    gpu.fail_next_free();
+    gpu.fail_next_free();
+    head.free_state(&gpu, Some(own), boxed.as_mut())
+        .expect("free_state succeeds despite the backend free failures");
+    assert!(
+        boxed.block_table_dev.is_some(),
+        "handle restored, retryable"
+    );
+    assert_ne!(boxed.ctx_hidden_acc.0, 0);
+
+    // Retry with no further injections releases both.
+    head.free_state(&gpu, Some(own), boxed.as_mut())
+        .expect("second free retries both failed frees");
+    assert_eq!(boxed.ctx_hidden_acc.0, 0);
+    assert!(boxed.block_table_dev.is_none());
+    assert_eq!(gpu.alloc_count(), 0);
+}
+
+#[test]
+fn reclaim_seam_free_failure_retains_pointers() {
     let gpu = MockGpuBackend::new();
     let own = owner(3, 77);
     let mut dstate = live_state(&gpu, own);
@@ -355,12 +413,16 @@ fn reclaim_seam_free_failure_retains_pointer() {
     }
 
     gpu.fail_next_free();
+    gpu.fail_next_free();
     dstate.reclaim_on_owner_failure(&gpu, &kv_cache);
 
-    // The failed accumulator free keeps the pointer (retryable)…
+    // Both failed frees keep their handles (retryable)…
     assert_ne!(dstate.ctx_hidden_acc.0, 0);
-    // …blocks are still returned, and a plain second reclaim retries the free.
+    assert!(dstate.block_table_dev.is_some());
+    // …blocks are still returned, and a plain second reclaim retries both
+    // frees (injections are one-shot).
     assert!(dstate.block_table.is_empty());
     dstate.reclaim_on_owner_failure(&gpu, &kv_cache);
     assert_eq!(dstate.ctx_hidden_acc.0, 0);
+    assert!(dstate.block_table_dev.is_none());
 }

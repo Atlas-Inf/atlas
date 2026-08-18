@@ -385,14 +385,20 @@ impl DflashProposerState {
                 self.ctx_hidden_acc = DevicePtr(0);
             }
         }
-        if let Some(bt) = self.block_table_dev.take()
-            && let Err(error) = gpu.free(bt)
-        {
-            tracing::error!(
-                "DSpark reclaim: freeing device block table {:#x} failed ({error}); \
-                 allocation leaked — no retained handle is available",
-                bt.0
-            );
+        if let Some(bt) = self.block_table_dev.take() {
+            match gpu.free(bt) {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::error!(
+                        "DSpark reclaim: freeing device block table {:#x} failed ({error}); \
+                         handle restored for a later cleanup retry",
+                        bt.0
+                    );
+                    // Restore the handle so a later cleanup retry can free it
+                    // (a taken-and-dropped handle is an unrecoverable leak).
+                    self.block_table_dev = Some(bt);
+                }
+            }
         }
         self.max_ctx_count_drafter = 0;
         self.ctx_count_drafter = 0;
@@ -715,9 +721,17 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let ctx_hidden_acc = gpu.alloc(total)?;
         // Initialize to zero so stale data doesn't leak between sequences.
         // Transactional: a failed memset frees the accumulator instead of
-        // leaking it for the server's lifetime.
+        // leaking it for the server's lifetime; a failed FREE during that
+        // cleanup is logged (the allocation is then backend-orphaned — the
+        // pointer is already unreachable from any live state).
         if let Err(error) = gpu.memset(ctx_hidden_acc, 0, total) {
-            let _ = gpu.free(ctx_hidden_acc);
+            if let Err(free_error) = gpu.free(ctx_hidden_acc) {
+                tracing::error!(
+                    "DSpark alloc_state: freeing failed-memset accumulator {:#x} failed \
+                     ({free_error}); allocation orphaned on the backend",
+                    ctx_hidden_acc.0
+                );
+            }
             return Err(error);
         }
         Ok(Box::new(DflashProposerState {
@@ -1066,8 +1080,18 @@ impl DraftProposer for BlockDiffusionDraftHead {
             }
         }
         // Free the device-side block table (lazily allocated in propose.rs).
-        if let Some(bt) = dstate.block_table_dev.take() {
-            gpu.free(bt)?;
+        // A failed free logs and RESTORES the handle so a later cleanup retry
+        // can release it (propose gates re-alloc on block_table_dev.is_none(),
+        // so a restored handle is retried, never re-allocated around).
+        if let Some(bt) = dstate.block_table_dev.take()
+            && let Err(error) = gpu.free(bt)
+        {
+            tracing::error!(
+                "DSpark free_state: freeing device block table {:#x} failed ({error}); \
+                 handle restored for a later cleanup retry",
+                bt.0
+            );
+            dstate.block_table_dev = Some(bt);
         }
         // Reset the lazy-alloc guard + watermarks so the NEXT request's first
         // propose re-allocates fresh blocks and re-precomputes ctx from a clean
