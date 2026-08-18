@@ -278,7 +278,7 @@ impl TransformerLayer for NemotronMamba2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.decode_verify_multi_loop(hidden, residual, n_seqs, ks, states, ctx, stream)
+        self.decode_verify_multi_loop(hidden, residual, n_seqs, ks, states, _kv_cache, ctx, stream)
     }
 
     fn decode_multi_seq<'a, 'b: 'a>(

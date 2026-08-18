@@ -7,9 +7,10 @@
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
+use spark_runtime::kv_cache::PagedKvCache;
 
 use super::NemotronMamba2Layer;
-use crate::layer::{ForwardContext, LayerState, SsmLayerState};
+use crate::layer::{ForwardContext, LayerState, SsmLayerState, TransformerLayer};
 use crate::layers::ops;
 
 impl NemotronMamba2Layer {
@@ -20,6 +21,7 @@ impl NemotronMamba2Layer {
         n_seqs: usize,
         ks: &[usize],
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -27,7 +29,58 @@ impl NemotronMamba2Layer {
             states.len() == n_seqs && ks.len() == n_seqs,
             "decode_verify_multi: states/ks/n mismatch"
         );
-        if std::env::var("ATLAS_DFLASH_MAMBA_MULTI_FUSED").is_ok() {
+        if ctx.levers.lightning_mamba_exact_recurrence {
+            let h = ctx.config.hidden_size;
+            let h_bytes = ctx.config.ssm_h_state_bytes();
+            let conv_bytes = ctx.config.ssm_conv_state_bytes();
+            let mut off = 0usize;
+            for i in 0..n_seqs {
+                let k = ks[i];
+                for t in 0..k {
+                    let row = (off + t) * h * 2;
+                    let mut stub_blocks = Vec::<u32>::new();
+                    let mut stub_disk = Vec::<u32>::new();
+                    let mut stub_off = Vec::<u32>::new();
+                    self.decode(
+                        hidden.offset(row),
+                        residual.offset(row),
+                        states[i],
+                        kv_cache,
+                        0,
+                        &mut stub_blocks,
+                        &mut stub_disk,
+                        &mut stub_off,
+                        ctx,
+                        stream,
+                    )?;
+                    if t + 1 < k {
+                        let ssm = states[i]
+                            .as_any_mut()
+                            .downcast_mut::<SsmLayerState>()
+                            .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
+                        anyhow::ensure!(
+                            t < ssm.h_state_intermediates.len()
+                                && t < ssm.conv_state_intermediates.len(),
+                            "multi M1 verify intermediate {t} missing for sequence {i}"
+                        );
+                        ctx.gpu.copy_d2d_async(
+                            ssm.h_state,
+                            ssm.h_state_intermediates[t],
+                            h_bytes,
+                            stream,
+                        )?;
+                        ctx.gpu.copy_d2d_async(
+                            ssm.conv_state,
+                            ssm.conv_state_intermediates[t],
+                            conv_bytes,
+                            stream,
+                        )?;
+                    }
+                }
+                off += k;
+            }
+            Ok(())
+        } else if std::env::var("ATLAS_DFLASH_MAMBA_MULTI_FUSED").is_ok() {
             self.decode_verify_multi_fused(hidden, residual, n_seqs, ks, states, ctx, stream)
         } else {
             let h = ctx.config.hidden_size;

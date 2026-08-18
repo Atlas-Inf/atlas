@@ -55,6 +55,15 @@ mod tests {
     }
 
     #[test]
+    fn lightning_multi_verify_keeps_full_mamba_stages_on_literal_m1() {
+        let source = include_str!("nemotron_mamba2/trait_decode_verify_multi.rs");
+        assert!(source.contains("if ctx.levers.lightning_mamba_exact_recurrence"));
+        assert!(source.contains("self.decode("));
+        assert!(source.contains("h_state_intermediates[t]"));
+        assert!(source.contains("conv_state_intermediates[t]"));
+    }
+
+    #[test]
     fn layer_trace_covers_literal_m1_and_k4_without_graph_capture() {
         let trace = include_str!("../model/trait_impl/verify_layer_trace.rs");
         let m1 = include_str!("../model/trait_impl/decode_a3.rs");
