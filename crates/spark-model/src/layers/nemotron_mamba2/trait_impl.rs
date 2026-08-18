@@ -10,6 +10,14 @@ use super::NemotronMamba2Layer;
 use crate::layer::{ForwardContext, LayerState, SsmLayerState, TransformerLayer};
 use crate::layers::{nemotron_decode_policy, ops};
 
+fn use_batched_mamba_verify(
+    num_tokens: usize,
+    lightning_exact: bool,
+    fused_not_disabled: bool,
+) -> bool {
+    num_tokens > 1 && !lightning_exact && fused_not_disabled
+}
+
 impl TransformerLayer for NemotronMamba2Layer {
     fn decode(
         &self,
@@ -206,7 +214,11 @@ impl TransformerLayer for NemotronMamba2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if num_tokens > 1 && std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err() {
+        if use_batched_mamba_verify(
+            num_tokens,
+            ctx.levers.lightning_mamba_exact_recurrence,
+            std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err(),
+        ) {
             return self.decode_batched_verify(hidden, residual, num_tokens, state, ctx, stream);
         }
         let h = ctx.config.hidden_size;
@@ -348,5 +360,18 @@ impl TransformerLayer for NemotronMamba2Layer {
             conv_state_intermediates: Vec::new(),
             h_is_f16: false,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_batched_mamba_verify;
+
+    #[test]
+    fn lightning_exact_routes_every_mamba_stage_through_literal_m1_decode() {
+        assert!(!use_batched_mamba_verify(4, true, true));
+        assert!(use_batched_mamba_verify(4, false, true));
+        assert!(!use_batched_mamba_verify(1, false, true));
+        assert!(!use_batched_mamba_verify(4, false, false));
     }
 }
