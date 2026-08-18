@@ -197,6 +197,9 @@ pub(super) fn step_verify_dflash_batched(
                 None,
             )
         };
+        if let Err(error) = &result {
+            tracing::error!("DFlash batched proposer exact error: {error:#}");
+        }
         match result {
             Ok(Some(all)) => {
                 for (j, &i) in pending.iter().enumerate() {
