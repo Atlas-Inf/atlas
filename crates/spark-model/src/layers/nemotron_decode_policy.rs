@@ -63,4 +63,14 @@ mod tests {
         assert!(source.contains("w4a16_gemv_batch32_k"));
         assert!(ops.contains("pub const MARLIN_SLOTS: i32 = 128"));
     }
+
+    #[test]
+    fn verify_lm_head_can_share_one_exact_batchm_weight_pass() {
+        let verify = include_str!("../model/trait_impl/verify_e.rs");
+        let head = include_str!("../model/impl_a3.rs");
+        assert!(verify.contains("ATLAS_LIGHTNING_VERIFY_LMHEAD_SHARED"));
+        assert!(verify.contains("r_total as u32"));
+        assert!(head.contains("ATLAS_LIGHTNING_LMHEAD_EXACT_BATCHM"));
+        assert!(head.contains("w4a16_gemv_batch32_kernel"));
+    }
 }

@@ -109,6 +109,29 @@ impl TransformerModel {
         let Some(ref nvfp4) = self.lm_head_nvfp4 else {
             return Ok(false);
         };
+        if std::env::var("ATLAS_LIGHTNING_LMHEAD_EXACT_BATCHM").as_deref() == Ok("1")
+            && num_tokens <= 32
+        {
+            let kernel = if num_tokens <= 16 {
+                self.w4a16_gemv_batch16_kernel
+            } else {
+                self.w4a16_gemv_batch32_kernel
+            };
+            if kernel.0 != 0 {
+                ops::w4a16_gemv_batchm(
+                    self.gpu.as_ref(),
+                    kernel,
+                    hidden,
+                    nvfp4,
+                    logits,
+                    num_tokens,
+                    v,
+                    h,
+                    stream,
+                )?;
+                return Ok(true);
+            }
+        }
         if let Some((ref nvfp4_t, ldb)) = self.lm_head_nvfp4_t {
             // LOSSLESS path (ATLAS_LMHEAD_LOSSLESS): BF16 MMA, no activation
             // downcast. Mirrors decode_a2 so the two heads never disagree.
