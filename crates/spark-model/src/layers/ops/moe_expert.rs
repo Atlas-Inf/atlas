@@ -107,84 +107,18 @@ pub fn moe_expert_gemv_wide_grouped(
     num_tokens: u32,
     num_experts: u32,
     relu2_input: bool,
-    batch_m: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 32), num_experts.max(1), 1])
         .block([256, 1, 1])
-        .shared_mem(64 + batch_m * k * 2)
+        .shared_mem(64 + 4 * k * 2)
         .arg_ptr(input)
         .arg_ptr(packed_ptrs)
         .arg_ptr(scale_ptrs)
         .arg_ptr(scale2_vals)
         .arg_ptr(output)
         .arg_ptr(expert_indices)
-        .arg_u32(n)
-        .arg_u32(k)
-        .arg_u32(top_k)
-        .arg_u32(input_stride)
-        .arg_u32(num_tokens)
-        .arg_u32(relu2_input as u32)
-        .launch(stream)
-}
-
-pub const MOE_GROUPED_MAX_LARGE_EXPERTS: u32 = 40;
-
-/// Build a deterministic expert-id list for experts with more than four routes.
-/// Under Lightning's R<=32/top-k=6 envelope at most floor(192/5)=38 entries exist.
-pub fn moe_expert_build_large_list(
-    gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
-    expert_indices: DevicePtr,
-    large_experts: DevicePtr,
-    num_experts: u32,
-    top_k: u32,
-    num_tokens: u32,
-    stream: u64,
-) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([1, 1, 1])
-        .block([128, 1, 1])
-        .arg_ptr(expert_indices)
-        .arg_ptr(large_experts)
-        .arg_u32(num_experts)
-        .arg_u32(top_k)
-        .arg_u32(num_tokens)
-        .launch(stream)
-}
-
-/// BATCH8 grouped expert GEMV over a compact, sentinel-padded 40-expert list.
-#[allow(clippy::too_many_arguments)]
-pub fn moe_expert_gemv_wide_grouped_large(
-    gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
-    input: DevicePtr,
-    packed_ptrs: DevicePtr,
-    scale_ptrs: DevicePtr,
-    scale2_vals: DevicePtr,
-    output: DevicePtr,
-    expert_indices: DevicePtr,
-    large_experts: DevicePtr,
-    n: u32,
-    k: u32,
-    top_k: u32,
-    input_stride: u32,
-    num_tokens: u32,
-    relu2_input: bool,
-    stream: u64,
-) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 32), MOE_GROUPED_MAX_LARGE_EXPERTS, 1])
-        .block([256, 1, 1])
-        .shared_mem(64 + 8 * k * 2)
-        .arg_ptr(input)
-        .arg_ptr(packed_ptrs)
-        .arg_ptr(scale_ptrs)
-        .arg_ptr(scale2_vals)
-        .arg_ptr(output)
-        .arg_ptr(expert_indices)
-        .arg_ptr(large_experts)
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
