@@ -25,7 +25,7 @@ __device__ __forceinline__ float scl_fp8_grp(unsigned char b) {
 #define N_PER_WARP 4
 #define WARP_SIZE 32
 #define GROUP_SIZE 16
-#define BATCH_M 8
+#define BATCH_M 4
 #define MAX_MATCH 32
 
 __device__ __constant__ float E2M1_LUT_GRP[16] = {
