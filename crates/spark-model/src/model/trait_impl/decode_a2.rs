@@ -341,7 +341,6 @@ impl TransformerModel {
             midchunk_capture: None,
             token_ids: None,
             routed_lora_layers: None, // #30: batched decode never routes prefill.
-            midchunk_capture: None,
         };
 
         if let Some(graph) = replay {

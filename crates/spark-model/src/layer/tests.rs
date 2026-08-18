@@ -73,7 +73,6 @@ fn test_forward_context_lifetime() {
         midchunk_capture: None,
         token_ids: None,
         routed_lora_layers: None,
-        midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
     };
 

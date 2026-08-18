@@ -306,14 +306,6 @@ pub struct ForwardContext<'a> {
     /// into SHARED prefix-cache blocks — non-exact recompute poisons them
     /// and the drift ratchets across turns (2026-06-10 warm-hit stutter).
     pub gdn_exact_replay: bool,
-    /// OPT-IN mid-chunk SSM tail capture (`ATLAS_SSM_TAIL_MIDCHUNK=1`).
-    ///
-    /// `Some` only on the single prefill pass whose local token range spans
-    /// the block-floored matched-prefix boundary `tb`. GDN/SSM layers then
-    /// split their recurrent (h_state) and conv (conv_state) kernels at
-    /// `cap_local` and copy the @tb state into the reserved snapshot slot.
-    /// `None` (default) => no split, byte-identical to prior behavior.
-    pub midchunk_capture: Option<MidchunkCapture<'a>>,
     /// DeepSeek-V4 hash-MoE layers (static `tid2eid[token_id]` routing); `None`
     /// for models without hash routing. Must be a STABLE address across the
     /// layer loop (and, under CUDA-graph decode, uploaded before each replay).
@@ -344,40 +336,6 @@ pub struct ForwardContext<'a> {
     /// (`self.lora == None` short-circuits first — byte-identical off). Default
     /// `Fold` keeps legacy single-request call sites unchanged.
     pub moe_lora_route: MoeLoraRoute,
-}
-
-/// Per-pass descriptor for mid-chunk SSM tail capture. Points at the reserved
-/// Marconi snapshot slot's per-SSM-layer destination buffers (already offset to
-/// the slot) plus the split point in local (chunk) token coordinates.
-///
-/// `ssm_layer_counter` is a fresh per-pass counter: each SSM layer's prefill
-/// increments it once, in model order, so the value indexes `h_dsts`/`conv_dsts`
-/// (which are in the same SSM-layer order as the snapshot pool).
-pub struct MidchunkCapture<'a> {
-    /// Split point in local token coordinates: capture state AFTER this many
-    /// tokens (== `tb - proc_start`).
-    pub cap_local: usize,
-    /// Per-SSM-layer h_state snapshot destination (offset to the reserved slot).
-    pub h_dsts: &'a [DevicePtr],
-    /// Per-SSM-layer conv_state snapshot destination (offset to the reserved slot).
-    pub conv_dsts: &'a [DevicePtr],
-    /// Bytes per layer of h_state.
-    pub h_bytes: usize,
-    /// Bytes per layer of conv_state.
-    pub conv_bytes: usize,
-    /// Fresh per-pass SSM-layer ordinal counter (model order == pool order).
-    pub ssm_layer_counter: &'a std::sync::atomic::AtomicUsize,
-    /// Optional SECOND capture one KV block earlier, at `tb - block_size`
-    /// (local split point `cap_local - block_size`). `Some` only when the pass
-    /// also covers that point. On ~5/19 warm turns the next turn's block-floored
-    /// `matched_tokens` lands exactly `tb - block_size` (generation-suffix /
-    /// retokenize divergence), one block short of the tail; registering this
-    /// earlier restore point makes those turns zero-replay too.
-    pub cap_local_early: Option<usize>,
-    /// Per-SSM-layer h_state dst for the `tb - block_size` slot (offset applied).
-    pub h_dsts_early: &'a [DevicePtr],
-    /// Per-SSM-layer conv_state dst for the `tb - block_size` slot.
-    pub conv_dsts_early: &'a [DevicePtr],
 }
 
 /// Feature-1 MoE-LoRA fold decision for a single forward pass.

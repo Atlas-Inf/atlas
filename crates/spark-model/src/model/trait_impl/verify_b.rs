@@ -256,7 +256,6 @@ impl TransformerModel {
             midchunk_capture: None,
             token_ids: Some(self.buffers.token_ids()),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
-            midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
         };
 
