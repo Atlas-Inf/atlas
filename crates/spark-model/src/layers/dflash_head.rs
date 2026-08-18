@@ -1053,244 +1053,27 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.hidden_size as u32,
             stream,
         )?;
-        let layer0 = self
-            .layers
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("DFlash batch backbone has no layer 0"))?;
         let batch_rows = u32::try_from(batch_inputs.total_rows())
             .map_err(|_| anyhow::anyhow!("DFlash batch row count exceeds u32"))?;
         let batch_size =
             u32::try_from(n).map_err(|_| anyhow::anyhow!("DFlash batch width exceeds u32"))?;
-        crate::layers::ops::rms_norm(
-            ctx.gpu,
-            self.kernels.rms_norm,
-            self.batch_query_embed,
-            &layer0.input_layernorm,
-            self.batch_norm,
-            batch_rows,
-            self.hidden_size as u32,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        for (weight, output, width) in [
-            (
-                &layer0.q_proj,
-                self.batch_q,
-                self.num_q_heads * self.head_dim,
-            ),
-            (
-                &layer0.k_proj,
-                self.batch_k,
-                self.num_kv_heads * self.head_dim,
-            ),
-            (
-                &layer0.v_proj,
-                self.batch_v,
-                self.num_kv_heads * self.head_dim,
-            ),
-        ] {
-            crate::layers::ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.kernels.dense_gemm_pipelined,
-                self.batch_norm,
-                weight,
-                output,
-                batch_rows,
-                width as u32,
-                self.hidden_size as u32,
-                stream,
-            )?;
-        }
-        let q_rows = batch_rows
-            .checked_mul(self.num_q_heads as u32)
-            .ok_or_else(|| anyhow::anyhow!("DFlash batch q-norm rows overflow"))?;
-        let k_rows = batch_rows
-            .checked_mul(self.num_kv_heads as u32)
-            .ok_or_else(|| anyhow::anyhow!("DFlash batch k-norm rows overflow"))?;
-        crate::layers::ops::rms_norm(
-            ctx.gpu,
-            self.kernels.rms_norm,
-            self.batch_q,
-            &layer0.q_norm,
-            self.batch_q,
-            q_rows,
-            self.head_dim as u32,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        crate::layers::ops::rms_norm(
-            ctx.gpu,
-            self.kernels.rms_norm,
-            self.batch_k,
-            &layer0.k_norm,
-            self.batch_k,
-            k_rows,
-            self.head_dim as u32,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        crate::layers::ops::rope_yarn(
-            ctx.gpu,
-            self.kernels.rope_qwen3,
-            self.batch_q,
-            self.batch_k,
-            self.batch_position_ids,
-            batch_rows,
-            self.num_q_heads as u32,
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
-            stream,
-        )?;
-
-        // Warm-only, behavior-neutral layer-0 attention exercise. The staged
-        // K/V occupies the current noise rows only; the unchanged serial oracle
-        // below runs on the same stream, overwrites those rows, and remains the
-        // sole source of returned drafts. Lazy/missing blocks skip this stage.
-        if batch_slots_ready
-            && self.lane_count() == 1
-            && let Some(sinks) = layer0.attention_sink_bias.as_ref()
-        {
-            let (k_pool, v_pool) = {
-                let cache = self.kv_cache.lock();
-                (cache.k_pool_ptr(0), cache.v_pool_ptr(0))
-            };
-            let kv_dim = u32::try_from(self.num_kv_heads * self.head_dim)
-                .map_err(|_| anyhow::anyhow!("DFlash batched KV width exceeds u32"))?;
-            crate::layers::ops::reshape_and_cache(
-                ctx.gpu,
-                self.kernels.reshape_cache_bf16,
-                self.batch_k,
-                self.batch_v,
-                k_pool,
-                v_pool,
-                self.batch_slot_mapping,
-                batch_rows,
-                self.num_kv_heads as u32,
-                self.head_dim as u32,
-                16,
-                kv_dim,
-                kv_dim,
-                0,
-                stream,
-            )?;
+        if batch_slots_ready && self.lane_count() == 1 {
             let max_kv_len =
                 u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
                     .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
-            crate::layers::ops::prefill_attention_paged_batched_sink(
-                ctx.gpu,
-                self.kernels.prefill_attn_dflash_bf16_batched_sink,
-                self.batch_q,
-                k_pool,
-                v_pool,
-                self.batch_attn_out,
-                self.batch_block_table_ptrs,
-                batch_size,
-                self.batch_cu_seqlens,
-                self.batch_kv_lens,
-                self.gamma as u32,
-                max_kv_len,
-                0,
-                self.num_q_heads as u32,
-                self.num_kv_heads as u32,
-                self.head_dim as u32,
-                16,
-                self.attn_sliding_window(),
-                1.0 / (self.head_dim as f32).sqrt(),
-                sinks.weight,
-                stream,
-            )?;
-            let hidden = u32::try_from(self.hidden_size)
-                .map_err(|_| anyhow::anyhow!("DFlash hidden width exceeds u32"))?;
-            let q_dim = u32::try_from(self.num_q_heads * self.head_dim)
-                .map_err(|_| anyhow::anyhow!("DFlash q width exceeds u32"))?;
-            let intermediate = u32::try_from(self.intermediate_size)
-                .map_err(|_| anyhow::anyhow!("DFlash MLP width exceeds u32"))?;
-            let hidden_elements = batch_rows
-                .checked_mul(hidden)
-                .ok_or_else(|| anyhow::anyhow!("DFlash batch hidden elements overflow"))?;
-            let mlp_elements = batch_rows
-                .checked_mul(intermediate)
-                .ok_or_else(|| anyhow::anyhow!("DFlash batch MLP elements overflow"))?;
-            crate::layers::ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.kernels.dense_gemm_pipelined,
-                self.batch_attn_out,
-                &layer0.o_proj,
-                self.batch_attn_proj,
-                batch_rows,
-                hidden,
-                q_dim,
-                stream,
-            )?;
-            crate::layers::ops::residual_add(
-                ctx.gpu,
-                self.kernels.residual_add,
-                self.batch_query_embed,
-                self.batch_attn_proj,
-                hidden_elements,
-                stream,
-            )?;
-            crate::layers::ops::rms_norm(
-                ctx.gpu,
-                self.kernels.rms_norm,
-                self.batch_query_embed,
-                &layer0.post_attention_layernorm,
-                self.batch_norm,
-                batch_rows,
-                hidden,
-                self.rms_norm_eps,
-                stream,
-            )?;
-            for (weight, output) in [
-                (&layer0.gate_proj, self.batch_mlp_gate),
-                (&layer0.up_proj, self.batch_mlp_up),
-            ] {
-                crate::layers::ops::dense_gemm_bf16_pipelined(
-                    ctx.gpu,
-                    self.kernels.dense_gemm_pipelined,
-                    self.batch_norm,
-                    weight,
-                    output,
-                    batch_rows,
-                    intermediate,
-                    hidden,
-                    stream,
-                )?;
-            }
-            crate::layers::ops::silu_mul(
-                ctx.gpu,
-                self.kernels.silu_mul,
-                self.batch_mlp_gate,
-                self.batch_mlp_up,
-                self.batch_mlp_gate,
-                mlp_elements,
-                stream,
-            )?;
-            crate::layers::ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.kernels.dense_gemm_pipelined,
-                self.batch_mlp_gate,
-                &layer0.down_proj,
-                self.batch_mlp_down,
-                batch_rows,
-                hidden,
-                intermediate,
-                stream,
-            )?;
-            crate::layers::ops::residual_add(
-                ctx.gpu,
-                self.kernels.residual_add,
-                self.batch_query_embed,
-                self.batch_mlp_down,
-                hidden_elements,
-                stream,
-            )?;
-            for layer_idx in 1..self.layers.len() {
+            let single_block_table = (batch_size == 1).then(|| DevicePtr(block_table_ptrs[0]));
+            let single_q_offset = u32::try_from(batch_ctx_counts[0])
+                .map_err(|_| anyhow::anyhow!("DFlash B1 q_offset exceeds u32"))?;
+            for layer_idx in 0..self.layers.len() {
                 self.run_batched_layer_stage(
-                    layer_idx, batch_rows, batch_size, max_kv_len, ctx, stream,
+                    layer_idx,
+                    batch_rows,
+                    batch_size,
+                    max_kv_len,
+                    single_block_table,
+                    single_q_offset,
+                    ctx,
+                    stream,
                 )?;
             }
             self.run_batched_tail_base(batch_rows, ctx, stream)?;

@@ -98,7 +98,7 @@ fn sequence_accessor_is_not_public_api() {
 #[test]
 fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let entry = include_str!("../dflash_head.rs");
-    assert!(entry.contains("for layer_idx in 1..self.layers.len()"));
+    assert!(entry.contains("for layer_idx in 0..self.layers.len()"));
     assert!(entry.contains("self.run_batched_layer_stage("));
     assert!(entry.contains("self.run_batched_tail_base("));
     assert!(entry.contains("self.run_batched_markov("));
@@ -153,58 +153,25 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     let upload = source.find("copy_h2d(&query_bytes").unwrap();
     let embed = source.find("ops::batched_embed").unwrap();
 
-    let layer_norm = source.find("&layer0.input_layernorm").unwrap();
-    let q_proj = source.find("&layer0.q_proj").unwrap();
-    let q_norm = source.find("&layer0.q_norm").unwrap();
-    let rope = source.find("ops::rope_yarn").unwrap();
-    let attention = source
-        .find("ops::prefill_attention_paged_batched_sink")
-        .unwrap();
-    let o_proj = source.find("&layer0.o_proj").unwrap();
-    let post_norm = source.find("&layer0.post_attention_layernorm").unwrap();
-    let down_proj = source.find("&layer0.down_proj").unwrap();
+    let stage = source.find("self.run_batched_layer_stage").unwrap();
+    let tail = source.find("self.run_batched_tail_base").unwrap();
     let oracle = source.find("let lanes_n = self.lane_count()").unwrap();
-    assert!(
-        plan < upload
-            && upload < embed
-            && embed < layer_norm
-            && layer_norm < q_proj
-            && q_proj < q_norm
-            && q_norm < rope
-            && rope < attention
-            && attention < o_proj
-            && o_proj < post_norm
-            && post_norm < down_proj
-            && down_proj < oracle
-    );
+    assert!(plan < upload && upload < embed && embed < stage && stage < tail && tail < oracle);
     assert!(source.contains("self.batch_capacity"));
     assert!(source.contains("self.batch_query_ids_dev"));
     assert!(source.contains("self.batch_position_ids"));
     assert!(source.contains("self.batch_query_embed"));
     assert!(!source.contains("ops::dflash_batch_anchor_add"));
-    assert!(source.contains("self.batch_norm"));
-    assert!(source.contains("self.batch_q"));
-    assert!(source.contains("self.batch_k"));
-    assert!(source.contains("self.batch_v"));
+
     assert!(source.contains("self.batch_block_table_ptrs"));
     assert!(source.contains("self.batch_cu_seqlens"));
     assert!(source.contains("self.batch_kv_lens"));
     assert!(source.contains("self.batch_slot_mapping"));
     assert!(source.contains("ctx_count_drafter"));
     assert!(!source.contains(".ctx_len\n                    .checked_add(self.gamma)"));
-    assert!(source.contains("batch_attn_out"));
-    assert!(source.contains("self.batch_attn_proj"));
-    assert!(source.contains("self.batch_mlp_gate"));
-    assert!(source.contains("self.batch_mlp_up"));
-    assert!(source.contains("self.batch_mlp_down"));
-    assert!(source.contains("batch_logits"));
-    assert!(source.contains("batch_tokens"));
-    assert!(source.contains("self.batch_markov_prev"));
-    assert!(source.contains("batch_markov_embed"));
-    assert!(source.contains("batch_markov_bias"));
-    assert!(source.contains("batch_slots_ready\n            && self.lane_count() == 1"));
-    assert!(source.contains("&& let Some(sinks)"));
-    assert!(source.contains("sole source of returned drafts"));
+
+    assert!(source.contains("if batch_slots_ready && self.lane_count() == 1"));
+
     assert!(source.contains("diagnostics.batch_parity && batch_slots_ready"));
     assert!(source.contains("batch_inputs.reorder_sampled_rows"));
     assert!(source.contains("DFlash Bxgamma parity mismatch"));
