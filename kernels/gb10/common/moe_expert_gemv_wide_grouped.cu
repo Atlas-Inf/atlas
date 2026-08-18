@@ -86,8 +86,7 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
 
     extern __shared__ char smem_raw[];
     float* s_lut = (float*)smem_raw;
-    __nv_bfloat16* s_A_bf16 = (__nv_bfloat16*)(smem_raw + 64);
-    float* s_A_relu2 = (float*)(smem_raw + 64);
+    __nv_bfloat16* s_A = (__nv_bfloat16*)(smem_raw + 64);
     if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_GRP[threadIdx.x];
 
     const unsigned int warp = threadIdx.x / WARP_SIZE;
@@ -104,16 +103,8 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
             const __nv_bfloat16* input = input_stride > 0
                 ? A + ((unsigned long long)tok * top_k + slot) * input_stride
                 : A + (unsigned long long)tok * K;
-            if (relu2_input) {
-                float* dst = s_A_relu2 + (unsigned long long)m * K;
-                for (unsigned int i = threadIdx.x; i < K; i += BLOCK_SIZE) {
-                    float v = fmaxf(__bfloat162float(input[i]), 0.0f);
-                    dst[i] = v * v;
-                }
-            } else {
-                __nv_bfloat16* dst = s_A_bf16 + (unsigned long long)m * K;
-                for (unsigned int i = threadIdx.x; i < K; i += BLOCK_SIZE) dst[i] = input[i];
-            }
+            __nv_bfloat16* dst = s_A + (unsigned long long)m * K;
+            for (unsigned int i = threadIdx.x; i < K; i += BLOCK_SIZE) dst[i] = input[i];
         }
         __syncthreads();
 
@@ -145,19 +136,22 @@ extern "C" __global__ void moe_expert_gemv_wide_grouped(
                         w_hi[b] = s_lut[byte_val >> 4] * scale;
                     }
                     for (unsigned int m = 0; m < batch; m++) {
+                        uint4 a_data = ((const uint4*)(s_A + (unsigned long long)m * K))[k8];
+                        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
                         #pragma unroll
                         for (int b = 0; b < 4; b++) {
+                            __nv_bfloat16 a_lo, a_hi;
+                            *(unsigned short*)&a_lo = (unsigned short)(a_raw[b] & 0xFFFF);
+                            *(unsigned short*)&a_hi = (unsigned short)(a_raw[b] >> 16);
+                            float al = __bfloat162float(a_lo);
+                            float ah = __bfloat162float(a_hi);
                             if (relu2_input) {
-                                const float* act = s_A_relu2 + (unsigned long long)m * K + base_k;
-                                float al = act[b * 2];
-                                float ah = act[b * 2 + 1];
+                                al = fmaxf(al, 0.0f); al *= al;
+                                ah = fmaxf(ah, 0.0f); ah *= ah;
                                 // Match moe_expert_relu2_down_wide exactly:
                                 // one paired RHS before accumulation.
                                 acc[m] += al * w_lo[b] + ah * w_hi[b];
                             } else {
-                                const __nv_bfloat16* act = s_A_bf16 + (unsigned long long)m * K + base_k;
-                                float al = __bfloat162float(act[b * 2]);
-                                float ah = __bfloat162float(act[b * 2 + 1]);
                                 acc[m] += al * w_lo[b];
                                 acc[m] += ah * w_hi[b];
                             }
