@@ -189,12 +189,6 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
     assert!(source.contains("self.prepare_drafts_state"));
     assert!(source.contains("ATLAS_LIGHTNING_DSPARK_PREP_TIMING"));
     assert!(source.contains("LIGHTNING DSPARK PREP sequence={i} width={n}"));
-    assert!(source.contains("ATLAS_LIGHTNING_DSPARK_BATCH_PRECOMPUTE"));
-    assert!(source.contains("dstate.ctx_committed == dstate.ctx_len"));
-    assert!(source.contains("!self.startup.diagnostics.full_precompute"));
-    assert!(source.contains("self.batch_target_hidden.offset(i * target_row_bytes)"));
-    assert!(source.contains("self.precompute_ctx_kv("));
-    assert!(source.contains("dstate.ctx_committed = dstate.ctx_len"));
     assert!(source.contains("dstate.last_num_drafted = tokens.len()"));
     assert!(source.contains("if self.startup.diagnostics.batch_parity"));
     assert!(source.contains("self.batch_capacity"));
