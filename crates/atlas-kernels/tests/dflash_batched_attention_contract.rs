@@ -25,3 +25,14 @@ fn dspark_batched_attention_requires_sink_aware_kernel() {
     assert!(src.contains("#define KERNEL_NAME inferspark_prefill_paged_batched_sink"));
     assert!(src.contains("const __nv_bfloat16* __restrict__ sinks"));
 }
+
+#[test]
+fn dspark_markov_kernels_are_batch_wide_and_depth_indexed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let src =
+        std::fs::read_to_string(root.join("kernels/gb10/common/dflash_batch_markov.cu")).unwrap();
+    assert!(src.contains("dflash_batch_add_depth_bias"));
+    assert!(src.contains("sequence * gamma + depth"));
+    assert!(src.contains("dflash_batch_store_depth_tokens"));
+    assert!(src.contains("tokens[sequence * gamma + depth]"));
+}

@@ -80,6 +80,8 @@ pub struct DflashKernels {
     pub argmax_batch: KernelHandle,
     pub batched_embed: KernelHandle,
     pub batch_anchor_add: KernelHandle,
+    pub batch_markov_add_bias: KernelHandle,
+    pub batch_markov_store_tokens: KernelHandle,
     /// Phase 2 Option B: builds `[count]` i32 slot indices on-device
     /// from a host-provided block_table. Used by propose.rs to populate
     /// the slot_mapping passed to reshape_and_cache and precompute_ctx_kv.
@@ -549,6 +551,9 @@ pub struct BlockDiffusionDraftHead {
     pub batch_mlp_down: DevicePtr,
     pub batch_logits: DevicePtr,
     pub batch_tokens: DevicePtr,
+    pub batch_markov_prev: DevicePtr,
+    pub batch_markov_embed: DevicePtr,
+    pub batch_markov_bias: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -929,8 +934,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
             .iter()
             .flat_map(|position| position.to_le_bytes())
             .collect();
+        let last_token_bytes: Vec<u8> = last_tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect();
         ctx.gpu.copy_h2d(&query_bytes, self.batch_query_ids_dev)?;
         ctx.gpu.copy_h2d(&position_bytes, self.batch_position_ids)?;
+        ctx.gpu
+            .copy_h2d(&last_token_bytes, self.batch_markov_prev)?;
         let ptr_bytes: Vec<u8> = block_table_ptrs
             .iter()
             .flat_map(|pointer| pointer.to_le_bytes())
@@ -1266,6 +1277,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 )?;
             }
             self.run_batched_tail_base(batch_rows, ctx, stream)?;
+            self.run_batched_markov(batch_size, ctx, stream)?;
         }
 
         let lanes_n = self.lane_count();

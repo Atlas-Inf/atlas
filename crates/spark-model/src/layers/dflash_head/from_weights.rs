@@ -177,6 +177,10 @@ impl BlockDiffusionDraftHead {
             argmax_batch: gpu.kernel("argmax", "argmax_bf16_batch")?,
             batched_embed: gpu.kernel("embed_from_argmax", "batched_embed")?,
             batch_anchor_add: gpu.kernel("dflash_batch_anchor_add", "dflash_batch_anchor_add")?,
+            batch_markov_add_bias: gpu
+                .kernel("dflash_batch_markov", "dflash_batch_add_depth_bias")?,
+            batch_markov_store_tokens: gpu
+                .kernel("dflash_batch_markov", "dflash_batch_store_depth_tokens")?,
             // Phase 2 Option B: slot_mapping builder. Same kernel the
             // target model uses for its KV cache writeback (see
             // crates/spark-model/src/model/impl_a1.rs:92).
@@ -401,6 +405,25 @@ impl BlockDiffusionDraftHead {
         let batch_mlp_down = gpu.alloc(batch_norm_bytes)?;
         let batch_logits = gpu.alloc(batch_logits_bytes)?;
         let batch_tokens = gpu.alloc(batch_rows * 4)?;
+        let batch_markov_prev = gpu.alloc(batch_capacity * 4)?;
+        let batch_markov_embed_bytes = batch_capacity
+            .checked_mul(weights.markov_rank)
+            .and_then(|n| n.checked_mul(bf16))
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch Markov embed bytes overflow"))?;
+        let batch_markov_bias_bytes = batch_capacity
+            .checked_mul(vocab_size)
+            .and_then(|n| n.checked_mul(bf16))
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch Markov bias bytes overflow"))?;
+        let batch_markov_embed = if weights.markov_rank > 0 {
+            gpu.alloc(batch_markov_embed_bytes)?
+        } else {
+            DevicePtr::NULL
+        };
+        let batch_markov_bias = if weights.markov_rank > 0 {
+            gpu.alloc(batch_markov_bias_bytes)?
+        } else {
+            DevicePtr::NULL
+        };
         gpu.memset(batch_query_ids_dev, 0, batch_rows * 4)?;
         gpu.memset(batch_position_ids, 0, batch_rows * 4)?;
         gpu.memset(batch_query_embed, 0, batch_rows * hidden_size * bf16)?;
@@ -422,6 +445,11 @@ impl BlockDiffusionDraftHead {
         gpu.memset(batch_mlp_down, 0, batch_norm_bytes)?;
         gpu.memset(batch_logits, 0, batch_logits_bytes)?;
         gpu.memset(batch_tokens, 0, batch_rows * 4)?;
+        gpu.memset(batch_markov_prev, 0, batch_capacity * 4)?;
+        if weights.markov_rank > 0 {
+            gpu.memset(batch_markov_embed, 0, batch_markov_embed_bytes)?;
+            gpu.memset(batch_markov_bias, 0, batch_markov_bias_bytes)?;
+        }
 
         // Extra propose lanes: `proposal_lane_count` total lanes
         // (default 1). Each extra lane gets its own stream, scratch set,
@@ -693,6 +721,9 @@ impl BlockDiffusionDraftHead {
             batch_mlp_down,
             batch_logits,
             batch_tokens,
+            batch_markov_prev,
+            batch_markov_embed,
+            batch_markov_bias,
             extra_lanes,
             kernels,
             max_seq_len,

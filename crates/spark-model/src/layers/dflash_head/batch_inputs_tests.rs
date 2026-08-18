@@ -481,6 +481,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     assert!(entry.contains("for layer_idx in 1..self.layers.len()"));
     assert!(entry.contains("self.run_batched_layer_stage("));
     assert!(entry.contains("self.run_batched_tail_base("));
+    assert!(entry.contains("self.run_batched_markov("));
 
     let source = include_str!("batch_forward.rs");
     let input_norm = source.find("&layer.input_layernorm").unwrap();
@@ -513,6 +514,16 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     assert!(tail.contains("self.batch_logits"));
     assert!(tail.contains("self.batch_tokens"));
     assert!(final_norm < lm_head && lm_head < argmax);
+    let markov = &source[source.find("fn run_batched_markov").unwrap()..];
+    let depth_loop = markov.find("for depth in 1..self.gamma").unwrap();
+    let embed = markov.find("ops::batched_embed").unwrap();
+    let project = markov.find("ops::dense_gemm").unwrap();
+    let bias = markov.find("ops::dflash_batch_add_depth_bias").unwrap();
+    let sample = markov.find("ops::argmax_bf16_batch").unwrap();
+    let store = markov.find("ops::dflash_batch_store_depth_tokens").unwrap();
+    assert!(
+        depth_loop < embed && embed < project && project < bias && bias < sample && sample < store
+    );
 }
 
 #[test]
@@ -577,6 +588,9 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("self.batch_mlp_down"));
     assert!(source.contains("batch_logits"));
     assert!(source.contains("batch_tokens"));
+    assert!(source.contains("self.batch_markov_prev"));
+    assert!(source.contains("batch_markov_embed"));
+    assert!(source.contains("batch_markov_bias"));
     assert!(source.contains("batch_slots_ready\n            && self.lane_count() == 1"));
     assert!(source.contains("&& let Some(sinks)"));
     assert!(source.contains("sole source of returned drafts"));

@@ -326,4 +326,94 @@ impl BlockDiffusionDraftHead {
             stream,
         )
     }
+
+    /// Apply DSpark Markov bias depth-serial and batch-wide. Row 0 remains the
+    /// unbiased anchor; rows 1..gamma are overwritten in `batch_tokens`.
+    pub(super) fn run_batched_markov(
+        &self,
+        batch_size: u32,
+        ctx: &crate::layer::ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if self.markov_rank == 0 {
+            return Ok(());
+        }
+        let (w1, w2) = self
+            .markov_w1
+            .as_ref()
+            .zip(self.markov_w2.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("DFlash batched Markov weights are missing"))?;
+        anyhow::ensure!(
+            !self.batch_markov_embed.is_null() && !self.batch_markov_bias.is_null(),
+            "DFlash batched Markov scratch is null"
+        );
+        let rank = u32::try_from(self.markov_rank)
+            .map_err(|_| anyhow::anyhow!("DFlash Markov rank exceeds u32"))?;
+        let vocab = u32::try_from(self.vocab_size)
+            .map_err(|_| anyhow::anyhow!("DFlash vocab exceeds u32"))?;
+        let gamma =
+            u32::try_from(self.gamma).map_err(|_| anyhow::anyhow!("DFlash gamma exceeds u32"))?;
+        let row_stride = gamma
+            .checked_mul(vocab)
+            .ok_or_else(|| anyhow::anyhow!("DFlash Markov row stride overflow"))?;
+        for depth in 1..self.gamma {
+            crate::layers::ops::batched_embed(
+                ctx.gpu,
+                self.kernels.batched_embed,
+                self.batch_markov_prev,
+                w1.weight,
+                self.batch_markov_embed,
+                batch_size,
+                rank,
+                stream,
+            )?;
+            crate::layers::ops::dense_gemm(
+                ctx.gpu,
+                self.kernels.dense_gemm,
+                self.batch_markov_embed,
+                w2,
+                self.batch_markov_bias,
+                batch_size,
+                vocab,
+                rank,
+                stream,
+            )?;
+            crate::layers::ops::dflash_batch_add_depth_bias(
+                ctx.gpu,
+                self.kernels.batch_markov_add_bias,
+                self.batch_logits,
+                self.batch_markov_bias,
+                batch_size,
+                gamma,
+                vocab,
+                depth as u32,
+                stream,
+            )?;
+            let logits_offset = depth
+                .checked_mul(self.vocab_size)
+                .and_then(|elements| elements.checked_mul(2))
+                .ok_or_else(|| anyhow::anyhow!("DFlash Markov logits offset overflow"))?;
+            crate::layers::ops::argmax_bf16_batch(
+                ctx.gpu,
+                self.kernels.argmax_batch,
+                self.batch_logits.offset(logits_offset),
+                self.batch_markov_prev,
+                vocab,
+                batch_size,
+                row_stride,
+                stream,
+            )?;
+            crate::layers::ops::dflash_batch_store_depth_tokens(
+                ctx.gpu,
+                self.kernels.batch_markov_store_tokens,
+                self.batch_tokens,
+                self.batch_markov_prev,
+                batch_size,
+                gamma,
+                depth as u32,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
 }
