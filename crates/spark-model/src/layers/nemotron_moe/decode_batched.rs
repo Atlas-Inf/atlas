@@ -224,7 +224,36 @@ impl NemotronMoeLayer {
         let grouped = n >= 2
             && self.moe_expert_gemv_wide_grouped_k.0 != 0
             && std::env::var("ATLAS_MOE_EXPERT_GROUPED").is_ok();
-        if grouped {
+        let hybrid_grouped = grouped
+            && std::env::var("ATLAS_LIGHTNING_MOE_EXPERT_HYBRID").as_deref() == Ok("1")
+            && self.moe_expert_gemv_wide_grouped_small_k.0 != 0
+            && self.moe_expert_gemv_wide_grouped_large_k.0 != 0;
+        if hybrid_grouped {
+            for (kernel, batch_m) in [
+                (self.moe_expert_gemv_wide_grouped_small_k, 4u32),
+                (self.moe_expert_gemv_wide_grouped_large_k, 8u32),
+            ] {
+                ops::moe_expert_gemv_wide_grouped(
+                    ctx.gpu,
+                    kernel,
+                    normed,
+                    self.up_ptrs.packed_ptrs,
+                    self.up_ptrs.scale_ptrs,
+                    self.up_ptrs.scale2_vals,
+                    expert_up_out,
+                    indices,
+                    inter,
+                    h as u32,
+                    top_k,
+                    0,
+                    n,
+                    num_experts,
+                    false,
+                    batch_m,
+                    stream,
+                )?;
+            }
+        } else if grouped {
             ops::moe_expert_gemv_wide_grouped(
                 ctx.gpu,
                 self.moe_expert_gemv_wide_grouped_k,
@@ -241,6 +270,7 @@ impl NemotronMoeLayer {
                 n,
                 num_experts,
                 false,
+                4,
                 stream,
             )?;
         } else if self.moe_expert_gemv_wide_k.0 != 0
@@ -327,7 +357,59 @@ impl NemotronMoeLayer {
         let smem = (shared_inter.max(inter) as usize) * 4;
         let down_wide =
             self.relu2_down_wide_k.0 != 0 && std::env::var("ATLAS_NO_MOE_DOWN_WIDE").is_err();
-        if grouped {
+        if hybrid_grouped {
+            for (kernel, batch_m) in [
+                (self.moe_expert_gemv_wide_grouped_small_k, 4u32),
+                (self.moe_expert_gemv_wide_grouped_large_k, 8u32),
+            ] {
+                ops::moe_expert_gemv_wide_grouped(
+                    ctx.gpu,
+                    kernel,
+                    expert_up_out,
+                    self.down_ptrs.packed_ptrs,
+                    self.down_ptrs.scale_ptrs,
+                    self.down_ptrs.scale2_vals,
+                    expert_down_out,
+                    indices,
+                    h as u32,
+                    inter,
+                    top_k,
+                    inter,
+                    n,
+                    num_experts,
+                    true,
+                    batch_m,
+                    stream,
+                )?;
+            }
+
+            let (shared_kernel, shared_tile, shared_block) = if down_wide {
+                (self.relu2_down_wide_k, 64u32, 256u32)
+            } else {
+                (self.relu2_down_shared_k, 8u32, 128u32)
+            };
+            KernelLaunch::new(ctx.gpu, shared_kernel)
+                .grid([div_ceil(h as u32, shared_tile), 1, n])
+                .block([shared_block, 1, 1])
+                .shared_mem(smem as u32)
+                .arg_ptr(expert_up_out)
+                .arg_ptr(self.down_ptrs.packed_ptrs)
+                .arg_ptr(self.down_ptrs.scale_ptrs)
+                .arg_ptr(self.down_ptrs.scale2_vals)
+                .arg_ptr(expert_down_out)
+                .arg_ptr(indices)
+                .arg_ptr(shared_up)
+                .arg_ptr(self.weights.shared_down.weight)
+                .arg_ptr(self.weights.shared_down.weight_scale)
+                .arg_f32(self.weights.shared_down.weight_scale_2)
+                .arg_ptr(shared_down)
+                .arg_u32(h as u32)
+                .arg_u32(inter)
+                .arg_u32(shared_inter)
+                .arg_u32(h as u32)
+                .arg_u32(0)
+                .launch(stream)?;
+        } else if grouped {
             // Routed DOWN: consume route-major UP rows, apply relu² in
             // registers, and share each expert's DOWN weight stream across all
             // matching routes without an intermediate BF16 activation store.
@@ -347,6 +429,7 @@ impl NemotronMoeLayer {
                 n,
                 num_experts,
                 true,
+                4,
                 stream,
             )?;
 
