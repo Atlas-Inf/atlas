@@ -206,7 +206,9 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
     assert!(prepare_source.contains("native batch preparation requires Option B"));
 
     let projection_source = include_str!("batch_projection.rs");
-    for tier in ["batch4", "batch8", "batch16", "batch32"] {
+    for tier in ["batch4", "batch8", "batch16"] {
         assert!(projection_source.contains(tier));
     }
+    assert!(projection_source.contains("(total_rows - row).min(16)"));
+    assert!(!projection_source.contains("w4a16_gemv_batch32"));
 }
