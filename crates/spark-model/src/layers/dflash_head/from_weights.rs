@@ -398,6 +398,7 @@ impl BlockDiffusionDraftHead {
         let batch_block_table_ptrs = gpu.alloc(batch_capacity * 8)?;
         let batch_cu_seqlens = gpu.alloc((batch_capacity + 1) * 4)?;
         let batch_kv_lens = gpu.alloc(batch_capacity * 4)?;
+        let batch_attention_args = gpu.alloc(batch_capacity * 12)?;
         let batch_slot_mapping = gpu.alloc(batch_rows * 8)?;
         let batch_attn_out = gpu.alloc(batch_q_bytes)?;
         let batch_attn_proj = gpu.alloc(batch_norm_bytes)?;
@@ -438,6 +439,7 @@ impl BlockDiffusionDraftHead {
         gpu.memset(batch_block_table_ptrs, 0, batch_capacity * 8)?;
         gpu.memset(batch_cu_seqlens, 0, (batch_capacity + 1) * 4)?;
         gpu.memset(batch_kv_lens, 0, batch_capacity * 4)?;
+        gpu.memset(batch_attention_args, 0, batch_capacity * 12)?;
         gpu.memset(batch_slot_mapping, 0, batch_rows * 8)?;
         gpu.memset(batch_attn_out, 0, batch_q_bytes)?;
         gpu.memset(batch_attn_proj, 0, batch_norm_bytes)?;
@@ -714,6 +716,7 @@ impl BlockDiffusionDraftHead {
             batch_block_table_ptrs,
             batch_cu_seqlens,
             batch_kv_lens,
+            batch_attention_args,
             batch_slot_mapping,
             batch_attn_out,
             batch_attn_proj,

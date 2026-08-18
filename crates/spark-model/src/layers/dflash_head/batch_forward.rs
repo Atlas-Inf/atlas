@@ -17,8 +17,8 @@ impl BlockDiffusionDraftHead {
         batch_rows: u32,
         batch_size: u32,
         max_kv_len: u32,
-        single_block_table: Option<spark_runtime::gpu::DevicePtr>,
-        single_indirect_args: Option<spark_runtime::gpu::DevicePtr>,
+        serial_block_tables: Option<&[u64]>,
+        serial_attention_args: Option<spark_runtime::gpu::DevicePtr>,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -155,53 +155,18 @@ impl BlockDiffusionDraftHead {
             0,
             stream,
         )?;
-        if let (Some(block_table), Some(indirect_args)) = (single_block_table, single_indirect_args)
-        {
-            crate::layers::ops::prefill_attention_paged_dflash_bf16_indirect(
-                ctx.gpu,
-                self.kernels.prefill_attn_dflash_bf16_indirect,
-                self.batch_q,
-                k_pool,
-                v_pool,
-                self.batch_attn_out,
-                block_table,
-                self.gamma as u32,
-                indirect_args,
-                self.num_q_heads as u32,
-                self.num_kv_heads as u32,
-                self.head_dim as u32,
-                16,
-                self.attn_sliding_window(),
-                self.attn_causal(),
-                1.0 / (self.head_dim as f32).sqrt(),
-                sinks.weight,
-                stream,
-            )?;
-        } else {
-            crate::layers::ops::prefill_attention_paged_batched_sink(
-                ctx.gpu,
-                self.kernels.prefill_attn_dflash_bf16_batched_sink,
-                self.batch_q,
-                k_pool,
-                v_pool,
-                self.batch_attn_out,
-                self.batch_block_table_ptrs,
-                batch_size,
-                self.batch_cu_seqlens,
-                self.batch_kv_lens,
-                self.gamma as u32,
-                max_kv_len,
-                0,
-                self.num_q_heads as u32,
-                self.num_kv_heads as u32,
-                self.head_dim as u32,
-                16,
-                self.attn_sliding_window(),
-                1.0 / (self.head_dim as f32).sqrt(),
-                sinks.weight,
-                stream,
-            )?;
-        }
+        self.run_staged_attention(
+            layer_idx,
+            batch_size,
+            max_kv_len,
+            serial_block_tables,
+            serial_attention_args,
+            sinks.weight,
+            k_pool,
+            v_pool,
+            ctx,
+            stream,
+        )?;
         self.run_staged_projection(
             batch_size,
             self.batch_attn_out,

@@ -544,6 +544,7 @@ pub struct BlockDiffusionDraftHead {
     pub batch_block_table_ptrs: DevicePtr,
     pub batch_cu_seqlens: DevicePtr,
     pub batch_kv_lens: DevicePtr,
+    pub batch_attention_args: DevicePtr,
     pub batch_slot_mapping: DevicePtr,
     pub batch_attn_out: DevicePtr,
     pub batch_attn_proj: DevicePtr,
@@ -660,6 +661,7 @@ mod row_contract;
 pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, LightningRowContract};
 mod batch_inputs;
 pub use batch_inputs::{DsparkBatchInput, DsparkBatchInputError, DsparkBatchSequence};
+mod batch_attention;
 mod batch_execution;
 #[cfg(test)]
 mod batch_execution_tests;
@@ -1040,9 +1042,23 @@ impl DraftProposer for BlockDiffusionDraftHead {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
+        let mut attention_args = Vec::with_capacity(n * 12);
+        for sequence in 0..n {
+            let kv_len = u32::try_from(batch_kv_lens[sequence])
+                .map_err(|_| anyhow::anyhow!("DFlash attention kv_len exceeds u32"))?;
+            let q_offset = u32::try_from(batch_ctx_counts[sequence])
+                .map_err(|_| anyhow::anyhow!("DFlash attention q_offset exceeds u32"))?;
+            let q_rope_pos = u32::try_from(positions[sequence])
+                .map_err(|_| anyhow::anyhow!("DFlash attention q_rope_pos exceeds u32"))?;
+            attention_args.extend_from_slice(&kv_len.to_le_bytes());
+            attention_args.extend_from_slice(&q_offset.to_le_bytes());
+            attention_args.extend_from_slice(&q_rope_pos.to_le_bytes());
+        }
         ctx.gpu.copy_h2d(&ptr_bytes, self.batch_block_table_ptrs)?;
         ctx.gpu.copy_h2d(&cu_bytes, self.batch_cu_seqlens)?;
         ctx.gpu.copy_h2d(&kv_bytes, self.batch_kv_lens)?;
+        ctx.gpu
+            .copy_h2d(&attention_args, self.batch_attention_args)?;
         if batch_slots_ready {
             let slot_bytes: Vec<u8> = batch_slot_mapping
                 .iter()
@@ -1068,17 +1084,24 @@ impl DraftProposer for BlockDiffusionDraftHead {
             let max_kv_len =
                 u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
                     .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
-            let single_block_table = (batch_size == 1).then(|| DevicePtr(block_table_ptrs[0]));
-            let single_indirect_args =
-                (batch_size == 1).then_some(self.scratch.option_b_indirect_args_dev);
+            let serial_block_tables = self
+                .startup
+                .diagnostics
+                .batch_parity
+                .then_some(block_table_ptrs.as_slice());
+            let serial_attention_args = self
+                .startup
+                .diagnostics
+                .batch_parity
+                .then_some(self.batch_attention_args);
             for layer_idx in 0..self.layers.len() {
                 self.run_batched_layer_stage(
                     layer_idx,
                     batch_rows,
                     batch_size,
                     max_kv_len,
-                    single_block_table,
-                    single_indirect_args,
+                    serial_block_tables,
+                    serial_attention_args,
                     ctx,
                     stream,
                 )?;

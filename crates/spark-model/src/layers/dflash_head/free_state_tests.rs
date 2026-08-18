@@ -106,6 +106,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         batch_block_table_ptrs: DevicePtr(0),
         batch_cu_seqlens: DevicePtr(0),
         batch_kv_lens: DevicePtr(0),
+        batch_attention_args: DevicePtr(0),
         batch_slot_mapping: DevicePtr(0),
         batch_attn_out: DevicePtr(0),
         batch_attn_proj: DevicePtr(0),
