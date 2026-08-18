@@ -539,6 +539,7 @@ pub struct BlockDiffusionDraftHead {
     pub batch_block_table_ptrs: DevicePtr,
     pub batch_cu_seqlens: DevicePtr,
     pub batch_kv_lens: DevicePtr,
+    pub batch_slot_mapping: DevicePtr,
     pub batch_attn_out: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
@@ -859,6 +860,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let mut lifecycles = Vec::with_capacity(n);
         let mut block_table_ptrs = Vec::with_capacity(n);
         let mut batch_kv_lens = Vec::with_capacity(n);
+        let mut batch_block_tables = Vec::with_capacity(n);
+        let mut batch_ctx_counts = Vec::with_capacity(n);
         for state in states.iter_mut() {
             let dstate = state
                 .as_any_mut()
@@ -871,7 +874,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 .unwrap_or(expected_owners[owners.len()]);
             owners.push(owner);
             lifecycles.push(lifecycle);
-            block_table_ptrs.push(dstate.block_table_dev.unwrap_or(DevicePtr::NULL).0);
+            let block_table_dev = dstate.block_table_dev.unwrap_or(DevicePtr::NULL);
+            block_table_ptrs.push(block_table_dev.0);
+            batch_ctx_counts.push(dstate.ctx_count_drafter);
+            batch_block_tables.push(dstate.block_table.clone());
             batch_kv_lens.push(
                 dstate
                     .ctx_count_drafter
@@ -879,6 +885,15 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     .ok_or_else(|| anyhow::anyhow!("DFlash batch KV length overflow"))?,
             );
         }
+        let batch_slot_mapping = batch_execution::paged_slot_mapping(
+            &batch_block_tables,
+            &batch_ctx_counts,
+            self.gamma,
+            16,
+        )?;
+        let batch_slots_ready =
+            block_table_ptrs.iter().all(|&pointer| pointer != 0) && batch_slot_mapping.is_some();
+        let batch_slot_mapping = batch_slot_mapping.unwrap_or_default();
         let batch_inputs = DsparkBatchInput::validate(
             self.gamma,
             self.batch_capacity,
@@ -936,6 +951,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
         ctx.gpu.copy_h2d(&ptr_bytes, self.batch_block_table_ptrs)?;
         ctx.gpu.copy_h2d(&cu_bytes, self.batch_cu_seqlens)?;
         ctx.gpu.copy_h2d(&kv_bytes, self.batch_kv_lens)?;
+        if batch_slots_ready {
+            let slot_bytes: Vec<u8> = batch_slot_mapping
+                .iter()
+                .flat_map(|slot| slot.to_le_bytes())
+                .collect();
+            ctx.gpu.copy_h2d(&slot_bytes, self.batch_slot_mapping)?;
+        }
         crate::layers::ops::batched_embed(
             ctx.gpu,
             self.kernels.batched_embed,

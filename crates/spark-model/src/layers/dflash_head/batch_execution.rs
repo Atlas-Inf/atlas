@@ -4,6 +4,58 @@
 
 use super::batch_inputs::{DsparkBatchInput, DsparkBatchInputError};
 
+/// Build `[sequence][gamma]` physical cache slots from owner-local block tables.
+/// `None` means lazy block allocation is not ready yet; callers must not launch.
+pub(crate) fn paged_slot_mapping(
+    block_tables: &[Vec<u32>],
+    ctx_counts: &[usize],
+    gamma: usize,
+    block_size: usize,
+) -> Result<Option<Vec<i64>>, DsparkBatchInputError> {
+    if block_tables.len() != ctx_counts.len() {
+        return Err(DsparkBatchInputError::LengthMismatch {
+            field: "ctx_counts",
+            expected: block_tables.len(),
+            found: ctx_counts.len(),
+        });
+    }
+    let mut slots = Vec::with_capacity(block_tables.len().saturating_mul(gamma));
+    for (table, &ctx_count) in block_tables.iter().zip(ctx_counts.iter()) {
+        for query in 0..gamma {
+            let logical =
+                ctx_count
+                    .checked_add(query)
+                    .ok_or(DsparkBatchInputError::ArithmeticOverflow {
+                        operation: "paged slot position",
+                        lhs: ctx_count,
+                        rhs: query,
+                    })?;
+            let logical_block = logical / block_size;
+            let offset = logical % block_size;
+            let Some(&physical_block) = table.get(logical_block) else {
+                return Ok(None);
+            };
+            let slot = usize::try_from(physical_block)
+                .ok()
+                .and_then(|block| block.checked_mul(block_size))
+                .and_then(|base| base.checked_add(offset))
+                .ok_or(DsparkBatchInputError::ArithmeticOverflow {
+                    operation: "physical paged slot",
+                    lhs: physical_block as usize,
+                    rhs: block_size,
+                })?;
+            slots.push(i64::try_from(slot).map_err(|_| {
+                DsparkBatchInputError::ArithmeticOverflow {
+                    operation: "physical paged slot i64",
+                    lhs: slot,
+                    rhs: i64::MAX as usize,
+                }
+            })?);
+        }
+    }
+    Ok(Some(slots))
+}
+
 impl DsparkBatchInput {
     /// Pack query IDs as `[sequence][gamma]`: anchor followed by mask rows.
     pub fn packed_query_tokens(&self, mask_token: u32) -> Vec<u32> {

@@ -2,6 +2,7 @@
 
 use spark_runtime::gpu::DevicePtr;
 
+use super::batch_execution::paged_slot_mapping;
 use super::batch_inputs::{DsparkBatchInput, DsparkBatchInputError, validate_batch_input_lengths};
 use super::{
     CaptureDescriptor, CaptureStatus, LIGHTNING_SERVED_GAMMA, LIGHTNING_TAPS, SequenceGeneration,
@@ -434,6 +435,20 @@ fn sampled_rows_reorder_masks_before_unbiased_anchor() {
 }
 
 #[test]
+fn paged_slots_are_sequence_major_and_cross_blocks_exactly() {
+    let tables = vec![vec![5, 6], vec![8, 9, 10]];
+    let slots = paged_slot_mapping(&tables, &[14, 31], 4, 16)
+        .unwrap()
+        .unwrap();
+    assert_eq!(slots, vec![94, 95, 96, 97, 159, 160, 161, 162]);
+    assert!(
+        paged_slot_mapping(&[vec![5]], &[15], 4, 16)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     let source = include_str!("../dflash_head.rs");
     let plan = source.find("packed_query_tokens").unwrap();
@@ -475,6 +490,7 @@ fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
     assert!(source.contains("self.batch_block_table_ptrs"));
     assert!(source.contains("self.batch_cu_seqlens"));
     assert!(source.contains("self.batch_kv_lens"));
+    assert!(source.contains("self.batch_slot_mapping"));
     assert!(source.contains("ctx_count_drafter"));
     assert!(!source.contains(".ctx_len\n                    .checked_add(self.gamma)"));
     assert!(source.contains("batch_attn_out"));
