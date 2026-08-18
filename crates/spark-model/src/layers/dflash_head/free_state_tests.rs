@@ -170,6 +170,9 @@ fn zero_kernels() -> DflashKernels {
         dense_gemv_fp8w: zero,
         fp8_gemm_n128_row_scaled_m16: zero,
         w4a16_gemv_batch4: zero,
+        w4a16_gemv_batch8: zero,
+        w4a16_gemv_batch16: zero,
+        w4a16_gemv_batch32: zero,
     }
 }
 

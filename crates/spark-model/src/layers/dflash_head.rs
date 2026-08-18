@@ -112,6 +112,9 @@ pub struct DflashKernels {
     /// no wasted M_TILE rows. Used by the lm_head GEMM.
     pub fp8_gemm_n128_row_scaled_m16: KernelHandle,
     pub w4a16_gemv_batch4: KernelHandle,
+    pub w4a16_gemv_batch8: KernelHandle,
+    pub w4a16_gemv_batch16: KernelHandle,
+    pub w4a16_gemv_batch32: KernelHandle,
 }
 
 /// Per-step scratch buffers for the γ-block forward.

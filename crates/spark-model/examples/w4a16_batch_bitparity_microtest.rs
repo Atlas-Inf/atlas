@@ -7,7 +7,7 @@
 //! `qkv`/`o_proj`/`ffn` paths, the MTP head, and Nemotron-H's SSM
 //! `in_proj`/`out_proj` (whose batched-projection rung is only sound if this
 //! gate passes). All of that is legitimate only if
-//! `w4a16_gemv_batch2/3/4/8/16` is byte-identical to M separate `w4a16_gemv`
+//! `w4a16_gemv_batch2/3/4/8/16/32` is byte-identical to M separate `w4a16_gemv`
 //! calls. The kernel header claimed exactly that ("Per-row accumulation
 //! order is IDENTICAL to `w4a16_gemv`") — this test is what decides it.
 //!
@@ -16,7 +16,7 @@
 //! each tier can serve. A cosine gate is exactly what hid the
 //! `w8a16_gemv_batch4` fused-add defect.
 //!
-//! 3 seeds x 5 shapes x (15 templated M + 2 fixed-M kernels) = 255 legs,
+//! 3 seeds x 5 shapes x (31 templated M + 2 fixed-M kernels) = 495 legs,
 //! plus 15 negative controls. The final bounded-memory tail shape has odd N
 //! and therefore exercises the padded `ceil(N / 4)` output group.
 //!
@@ -35,10 +35,10 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 const GROUP_SIZE: usize = 16;
-const MAX_M: usize = 16;
+const MAX_M: usize = 32;
 const SCALE2: f32 = 0.0123_f32;
 const TAIL_N: usize = 10_307;
-const _: () = assert!(TAIL_N % 4 != 0);
+const _: () = assert!(!TAIL_N.is_multiple_of(4));
 
 /// The two `nano` rows are the EXACT shapes Nano-30B-A3B / Lightning-30B-A3B
 /// dispatch (hidden 2688, d_inner 4096, in_proj_size 10304). The two `super`
@@ -176,14 +176,15 @@ fn main() -> Result<()> {
     let g: &dyn GpuBackend = &backend;
 
     let m1_k = g.kernel("w4a16_gemv", "w4a16_gemv");
-    let tiers: Vec<(&str, KernelHandle, Vec<usize>)> = ["batch4", "batch8", "batch16"]
+    let tiers: Vec<(&str, KernelHandle, Vec<usize>)> = ["batch4", "batch8", "batch16", "batch32"]
         .iter()
         .filter_map(|t| {
             let kh = g.kernel("w4a16_gemv", &format!("w4a16_gemv_{t}")).ok()?;
             let ms = match *t {
                 "batch4" => (2..=4).collect(),
                 "batch8" => (5..=8).collect(),
-                _ => (9..=16).collect(),
+                "batch16" => (9..=16).collect(),
+                _ => (17..=32).collect(),
             };
             Some((*t, kh, ms))
         })
@@ -201,7 +202,7 @@ fn main() -> Result<()> {
         })
         .collect();
     let m1_k = match m1_k {
-        Ok(kh) if tiers.len() == 3 && fixed_tiers.len() == 2 => kh,
+        Ok(kh) if tiers.len() == 4 && fixed_tiers.len() == 2 => kh,
         _ => {
             println!("w4a16 GEMV kernels absent from this target set — SKIP");
             std::process::exit(2);
@@ -307,7 +308,7 @@ fn main() -> Result<()> {
     }
     if clean {
         println!(
-            "PASS — the w4a16 batched GEMV tiers (batch2/3/4/8/16) are byte-identical to \
+            "PASS — the w4a16 batched GEMV tiers (batch2/3/4/8/16/32) are byte-identical to \
              M x w4a16_gemv at every projection shape and every M they serve."
         );
         Ok(())

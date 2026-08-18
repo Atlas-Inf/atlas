@@ -234,7 +234,10 @@ impl BlockDiffusionDraftHead {
                 "w4a16",
                 "fp8_gemm_t_row_scaled_m16",
             ),
-            w4a16_gemv_batch4: crate::layers::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch4"),
+            w4a16_gemv_batch4: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch4")?,
+            w4a16_gemv_batch8: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
+            w4a16_gemv_batch16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
+            w4a16_gemv_batch32: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch32")?,
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.

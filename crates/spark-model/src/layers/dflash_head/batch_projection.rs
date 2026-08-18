@@ -18,6 +18,25 @@ impl BlockDiffusionDraftHead {
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let total_rows = batch_size
+            .checked_mul(self.gamma as u32)
+            .ok_or_else(|| anyhow::anyhow!("DFlash staged projection row overflow"))?;
+        if matches!(self.quant, super::DflashQuantization::Nvfp4Weights)
+            && let Some(weight) = weight_nvfp4
+        {
+            let kernel = match total_rows {
+                1..=4 => self.kernels.w4a16_gemv_batch4,
+                5..=8 => self.kernels.w4a16_gemv_batch8,
+                9..=16 => self.kernels.w4a16_gemv_batch16,
+                17..=32 => self.kernels.w4a16_gemv_batch32,
+                _ => spark_runtime::gpu::KernelHandle(0),
+            };
+            if kernel.0 != 0 {
+                return crate::layers::ops::w4a16_gemv_batchm(
+                    ctx.gpu, kernel, src, weight, dst, total_rows, n_out, k_in, stream,
+                );
+            }
+        }
         let rows = self.gamma;
         let src_row_bytes = rows
             .checked_mul(k_in as usize)
