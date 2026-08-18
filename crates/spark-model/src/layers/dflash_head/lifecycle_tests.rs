@@ -150,3 +150,79 @@ fn graph_retirement_removes_only_the_exact_generation_owner() {
     assert_eq!(graphs.values().copied().collect::<Vec<_>>(), vec!["new"]);
     assert!(take_owned_graphs(&mut graphs, old).is_empty());
 }
+
+// ─── Transactional cleanup (owner-failure reclaim seam) ────────────────
+
+#[test]
+fn owner_failure_reclaim_frees_state_resources_without_leaking() {
+    use spark_runtime::gpu::GpuBackend;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+    use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+
+    let gpu = MockGpuBackend::new();
+    let owner_now = owner(3, 77);
+    let mut dstate = super::DflashProposerState {
+        block_table: Vec::new(),
+        seq_len: 12,
+        last_num_drafted: 3,
+        prefill_done: true,
+        ctx_hidden_acc: gpu.alloc(4096).unwrap(),
+        ctx_len: 12,
+        last_num_accepted: 1,
+        skip_next_decode_append: false,
+        max_ctx_len: 1024,
+        ctx_slot_bytes: 64,
+        block_table_dev: Some(gpu.alloc(256).unwrap()),
+        ctx_count_drafter: 12,
+        max_ctx_count_drafter: 1024,
+        ctx_committed: 12,
+        ctx_positions: vec![1, 2, 3],
+        lane_id: 0,
+        lifecycle: Some(CaptureDescriptor::bind(owner_now, 40, 4, 4, 16).unwrap()),
+    };
+    let kv_cache = parking_lot::Mutex::new(
+        PagedKvCache::new(
+            KvCacheConfig {
+                block_size: 16,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 8,
+                dtype: KvCacheDtype::Bf16,
+                layer_dtypes: vec![],
+                layer_dims: vec![],
+                cache_blocks_per_seq: None,
+            },
+            8,
+            &gpu,
+        )
+        .unwrap(),
+    );
+    for _ in 0..2 {
+        let block = kv_cache.lock().try_alloc_block().expect("block available");
+        dstate.block_table.push(block);
+    }
+    let free_with_held = kv_cache.lock().num_free_blocks();
+    assert_eq!(free_with_held, 6);
+
+    // Reclaim runs WITHOUT an owner match (this is the failure path).
+    dstate.reclaim_on_owner_failure(&gpu, &kv_cache);
+
+    // KV blocks returned.
+    assert!(dstate.block_table.is_empty());
+    assert_eq!(kv_cache.lock().num_free_blocks(), 8);
+    // Accumulator + device block table freed (mock frees remove the alloc).
+    assert_eq!(dstate.ctx_hidden_acc.0, 0);
+    assert!(dstate.block_table_dev.is_none());
+    // Watermarks reset for any future reuse.
+    assert_eq!(
+        (dstate.seq_len, dstate.ctx_len, dstate.ctx_committed),
+        (0, 0, 0)
+    );
+    assert!(dstate.ctx_positions.is_empty());
+    assert!(!dstate.prefill_done);
+    // Descriptor retired.
+    assert_eq!(
+        dstate.lifecycle.as_ref().unwrap().status(),
+        CaptureStatus::Retired
+    );
+}

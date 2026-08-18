@@ -241,6 +241,14 @@ impl CaptureDescriptor {
 
     pub fn retire(&mut self, expected: SequenceGeneration) -> Result<(), DsparkLifecycleError> {
         validate_owner(self.owner, expected)?;
+        // Idempotent terminal: retiring an already-retired descriptor with
+        // the SAME owner is the documented second-free_state success (the
+        // resources are already reclaimed); a different owner is still an
+        // error. Without this, the scheduler's cleanup-retry path treated a
+        // completed cleanup as a failure.
+        if self.status == CaptureStatus::Retired {
+            return Ok(());
+        }
         self.status = CaptureStatus::Retired;
         self.valid_rows = 0;
         Ok(())

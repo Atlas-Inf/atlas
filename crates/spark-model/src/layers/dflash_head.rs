@@ -350,6 +350,41 @@ pub struct DflashProposerState {
     pub ctx_positions: Vec<i32>,
 }
 
+impl DflashProposerState {
+    /// Transactional reclaim when owner validation fails in `free_state`:
+    /// retire the descriptor best-effort, return KV blocks, free the ctx
+    /// accumulator and device block table, and reset the lazy-alloc
+    /// watermarks — the error still propagates, but nothing owned by this
+    /// state leaks. Production-owned seam: directly unit-tested.
+    pub(crate) fn reclaim_on_owner_failure(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        kv_cache: &parking_lot::Mutex<spark_runtime::kv_cache::PagedKvCache>,
+    ) {
+        if let Some(lifecycle) = self.lifecycle.as_mut() {
+            let _ = lifecycle.retire(lifecycle.owner());
+        }
+        if !self.block_table.is_empty() {
+            kv_cache.lock().free_blocks(&self.block_table);
+            self.block_table.clear();
+        }
+        if self.ctx_hidden_acc.0 != 0 {
+            let _ = gpu.free(self.ctx_hidden_acc);
+            self.ctx_hidden_acc = DevicePtr(0);
+        }
+        if let Some(bt) = self.block_table_dev.take() {
+            let _ = gpu.free(bt);
+        }
+        self.max_ctx_count_drafter = 0;
+        self.ctx_count_drafter = 0;
+        self.ctx_committed = 0;
+        self.ctx_positions.clear();
+        self.seq_len = 0;
+        self.ctx_len = 0;
+        self.prefill_done = false;
+    }
+}
+
 impl ProposerState for DflashProposerState {
     fn as_any(&self) -> &dyn Any {
         self
@@ -640,7 +675,12 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let total = self.max_seq_len * ctx_slot_bytes;
         let ctx_hidden_acc = gpu.alloc(total)?;
         // Initialize to zero so stale data doesn't leak between sequences.
-        gpu.memset(ctx_hidden_acc, 0, total)?;
+        // Transactional: a failed memset frees the accumulator instead of
+        // leaking it for the server's lifetime.
+        if let Err(error) = gpu.memset(ctx_hidden_acc, 0, total) {
+            let _ = gpu.free(ctx_hidden_acc);
+            return Err(error);
+        }
         Ok(Box::new(DflashProposerState {
             block_table: Vec::with_capacity(64),
             seq_len: 0,
@@ -931,7 +971,22 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // Phase 1 / non-DFlash proposer state: nothing allocated, nothing to free.
             None => return Ok(()),
         };
-        let owner = self.validate_dflash_owner(dstate, expected_owner)?;
+        // Transactional cleanup: owner validation runs FIRST, but a
+        // validation failure still reclaims every resource below before
+        // propagating — a mismatched owner must not leak graphs, KV blocks,
+        // or the ctx accumulator. (Lifecycle gaps noted 2026-08-17.)
+        let owner = match self.validate_dflash_owner(dstate, expected_owner) {
+            Ok(owner) => owner,
+            Err(error) => {
+                // Transactional cleanup: reclaim everything reclaimable
+                // before propagating the validation failure. Graphs are
+                // owner-keyed and stay pooled (reclaimed on generation
+                // turnover); blocks, accumulator, and the device block
+                // table belong to THIS state and must not leak.
+                dstate.reclaim_on_owner_failure(gpu, &self.kv_cache);
+                return Err(error);
+            }
+        };
         dstate
             .lifecycle
             .as_mut()
