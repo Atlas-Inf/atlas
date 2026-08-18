@@ -166,7 +166,7 @@ impl WeightTensor {
 pub struct WeightStore {
     weights: HashMap<String, WeightTensor>,
     /// Pointers freed early by [`WeightStore::reclaim`], recorded so
-    /// [`release`] does not free them a second time.
+    /// `release` does not free them a second time.
     ///
     /// `Mutex` because the loaders hold `&WeightStore` (not `&mut`) all the way
     /// down the weight-map call chain; making the map itself interior-mutable
@@ -216,7 +216,7 @@ impl WeightStore {
     /// allocates out of the same pool as the OS and the practical ceiling is
     /// ~55 GB, it is the difference between serving and `cuMemAlloc failed`.
     ///
-    /// The pointer is recorded so [`release`] skips it — the map keeps its
+    /// The pointer is recorded so `release` skips it — the map keeps its
     /// entry (callers may still read `shape`/`dtype`), but the memory is gone,
     /// so **the caller must be certain nothing will read the data again**.
     pub fn reclaim(&self, gpu: &dyn GpuBackend, name: &str) -> Result<()> {
@@ -233,7 +233,7 @@ impl WeightStore {
         gpu.free(t.ptr)
     }
 
-    /// Bytes released so far by [`reclaim`] — for the load-time memory trace.
+    /// Bytes released so far by [`Self::reclaim`] — for the load-time memory trace.
     pub fn reclaimed_count(&self) -> usize {
         self.reclaimed.lock().map(|s| s.len()).unwrap_or(0)
     }
@@ -456,11 +456,8 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for WeightStore {
         let mut first_error = None;
         // `drain` rather than iterate: the map must not be left holding
         // pointers to memory that is gone, and it makes this idempotent.
-        let reclaimed: std::collections::HashSet<u64> = self
-            .reclaimed
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default();
+        let reclaimed: std::collections::HashSet<u64> =
+            self.reclaimed.lock().map(|s| s.clone()).unwrap_or_default();
         for (name, tensor) in self.weights.drain() {
             // Already freed early by `reclaim` — freeing again is a double free.
             if reclaimed.contains(&tensor.ptr.0) {
