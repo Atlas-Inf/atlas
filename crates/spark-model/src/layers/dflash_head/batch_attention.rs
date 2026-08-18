@@ -67,6 +67,7 @@ impl BlockDiffusionDraftHead {
             batch_size,
             self.batch_cu_seqlens,
             self.batch_kv_lens,
+            self.batch_attention_args,
             self.gamma as u32,
             max_kv_len,
             0,

@@ -11,6 +11,8 @@ fn varlen_batched_attention_derives_q_offset_per_stream() {
         .unwrap();
     assert!(src.contains("q_offset = kv_len - q_len_eff;"));
     assert!(src.contains("if (cu_seqlens != nullptr && kv_len >= q_len_eff)"));
+    assert!(src.contains("q_offset = batch_indirect_args[b * 3 + 1]"));
+    assert!(src.contains("q_rope_pos = batch_indirect_args[b * 3 + 2]"));
 }
 
 #[test]
@@ -21,6 +23,7 @@ fn dspark_batched_attention_requires_sink_aware_kernel() {
     )
     .unwrap();
     assert!(src.contains("#define PREFILL_BATCHED"));
+    assert!(src.contains("#define PREFILL_BATCHED_INDIRECT_ARGS"));
     assert!(src.contains("#define ATLAS_ATTN_SINKS"));
     assert!(src.contains("#define KERNEL_NAME inferspark_prefill_paged_batched_sink"));
     assert!(src.contains("const __nv_bfloat16* __restrict__ sinks"));

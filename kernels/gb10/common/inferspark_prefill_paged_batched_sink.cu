@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 
 #define PREFILL_BATCHED
+#define PREFILL_BATCHED_INDIRECT_ARGS
 
 #define LOAD_KV_TILE(cache, bt, smem, kv_s, kv_l, kvh, t, stride) \
     do { \

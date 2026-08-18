@@ -180,6 +180,9 @@ extern "C" __global__ void KERNEL_NAME(
     const unsigned int batch_size,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ kv_lens,
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    const unsigned int* __restrict__ batch_indirect_args,
+#endif
 #else
     const int* __restrict__ block_table,
 #endif
@@ -218,6 +221,10 @@ extern "C" __global__ void KERNEL_NAME(
             q_offset = kv_len - q_len_eff;
         }
     }
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    kv_len = batch_indirect_args[b * 3];
+    q_offset = batch_indirect_args[b * 3 + 1];
+#endif
 #else
     const unsigned int q_len_eff = q_len;
 #endif
@@ -265,7 +272,9 @@ extern "C" __global__ void KERNEL_NAME(
     // (DFlash) declares it in KERNEL_PREAMBLE from a device u32 (= true decode
     // position, decoupled from cache-slot base). All other variants: equals
     // q_offset (correct for causal attention where RoPE pos == cache base).
-#ifndef Q_ROPE_POS_OVERRIDE
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+#elif !defined(Q_ROPE_POS_OVERRIDE)
     unsigned int q_rope_pos = q_offset;
 #endif
 
@@ -686,6 +695,9 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const unsigned int batch_size,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ kv_lens,
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    const unsigned int* __restrict__ batch_indirect_args,
+#endif
 #else
     const int* __restrict__ block_table,
 #endif
@@ -723,6 +735,10 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             q_offset = kv_len - q_len_eff;
         }
     }
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    kv_len = batch_indirect_args[b * 3];
+    q_offset = batch_indirect_args[b * 3 + 1];
+#endif
 #else
     const unsigned int q_len_eff = q_len;
 #endif
@@ -763,7 +779,9 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     // (DFlash) declares it in KERNEL_PREAMBLE from a device u32 (= true decode
     // position, decoupled from cache-slot base). All other variants: equals
     // q_offset (correct for causal attention where RoPE pos == cache base).
-#ifndef Q_ROPE_POS_OVERRIDE
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+#elif !defined(Q_ROPE_POS_OVERRIDE)
     unsigned int q_rope_pos = q_offset;
 #endif
 

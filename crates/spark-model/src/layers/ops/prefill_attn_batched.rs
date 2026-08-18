@@ -89,6 +89,7 @@ pub fn prefill_attention_paged_batched_sink(
     batch_size: u32,
     cu_seqlens: DevicePtr,
     kv_lens: DevicePtr,
+    batch_indirect_args: DevicePtr,
     q_len: u32,
     kv_len: u32,
     q_offset: u32,
@@ -112,6 +113,7 @@ pub fn prefill_attention_paged_batched_sink(
         .arg_u32(batch_size)
         .arg_ptr(cu_seqlens)
         .arg_ptr(kv_lens)
+        .arg_ptr(batch_indirect_args)
         .arg_u32(q_len)
         .arg_u32(kv_len)
         .arg_u32(q_offset)
