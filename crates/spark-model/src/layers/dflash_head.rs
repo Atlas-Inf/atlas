@@ -896,7 +896,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         if self.startup.diagnostics.batch_parity {
             tracing::info!("DFlash Bxgamma parity dispatch: batch={n}");
         }
-        let parity_oracle = if self.startup.diagnostics.batch_parity {
+        let (parity_oracle, parity_hidden_oracle) = if self.startup.diagnostics.batch_parity {
             let mut oracle = Vec::with_capacity(n);
             for i in 0..n {
                 oracle.push(self.propose_drafts(
@@ -913,9 +913,17 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     Some(target_hiddens[i]),
                 )?);
             }
-            Some(oracle)
+            let hidden = if n == 1 {
+                ctx.gpu.synchronize(stream)?;
+                let mut bytes = vec![0u8; self.gamma * self.hidden_size * 2];
+                ctx.gpu.copy_d2h(self.scratch.stream_buf, &mut bytes)?;
+                Some(bytes)
+            } else {
+                None
+            };
+            (Some(oracle), hidden)
         } else {
-            None
+            (None, None)
         };
 
         // Freeze the explicit sequence identities and lifecycle snapshots before
@@ -1075,6 +1083,20 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     ctx,
                     stream,
                 )?;
+            }
+            if let Some(expected) = parity_hidden_oracle.as_ref() {
+                ctx.gpu.synchronize(stream)?;
+                let mut actual = vec![0u8; expected.len()];
+                ctx.gpu.copy_d2h(self.batch_query_embed, &mut actual)?;
+                if actual != *expected {
+                    let first = actual
+                        .chunks_exact(2)
+                        .zip(expected.chunks_exact(2))
+                        .position(|(lhs, rhs)| lhs != rhs)
+                        .unwrap_or(0);
+                    anyhow::bail!("DFlash B1 backbone parity mismatch at BF16 element {first}");
+                }
+                tracing::info!("DFlash B1 backbone parity PASS");
             }
             self.run_batched_tail_base(batch_rows, ctx, stream)?;
             self.run_batched_markov(batch_size, ctx, stream)?;
