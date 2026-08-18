@@ -522,6 +522,11 @@ pub struct BlockDiffusionDraftHead {
 
     /// Per-step scratch buffers (allocated once at construction, reused).
     pub scratch: DflashScratch,
+    /// Stable staging for the first native B×gamma operation. Capacity is the
+    /// model's admitted max batch; rows are `[sequence][gamma]`.
+    pub batch_capacity: usize,
+    pub batch_query_ids_dev: DevicePtr,
+    pub batch_query_embed: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -854,7 +859,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         }
         let batch_inputs = DsparkBatchInput::validate(
             self.gamma,
-            n,
+            self.batch_capacity,
             &owners,
             last_tokens,
             positions,
@@ -865,10 +870,25 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // Materialize the exact host execution plan now. The next native slice
         // uploads these packed queries and depth rows into batch scratch; the
         // current serial/lane compute below remains the output oracle.
-        let _packed_query_tokens = batch_inputs.packed_query_tokens(self.mask_token_id);
+        let packed_query_tokens = batch_inputs.packed_query_tokens(self.mask_token_id);
         let _markov_depth_rows: Vec<Vec<usize>> = (1..batch_inputs.gamma())
             .map(|query| batch_inputs.rows_at_query(query))
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let query_bytes: Vec<u8> = packed_query_tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect();
+        ctx.gpu.copy_h2d(&query_bytes, self.batch_query_ids_dev)?;
+        crate::layers::ops::batched_embed(
+            ctx.gpu,
+            self.kernels.batched_embed,
+            self.batch_query_ids_dev,
+            self.embed_tokens_shared,
+            self.batch_query_embed,
+            batch_inputs.total_rows() as u32,
+            self.hidden_size as u32,
+            stream,
+        )?;
 
         let lanes_n = self.lane_count();
         if lanes_n == 1 {

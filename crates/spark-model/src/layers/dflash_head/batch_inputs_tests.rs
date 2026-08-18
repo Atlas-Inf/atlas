@@ -423,3 +423,16 @@ fn sampled_rows_reorder_masks_before_unbiased_anchor() {
         })
     ));
 }
+
+#[test]
+fn production_seam_uploads_and_embeds_packed_queries_before_oracle_dispatch() {
+    let source = include_str!("../dflash_head.rs");
+    let plan = source.find("packed_query_tokens").unwrap();
+    let upload = source.find("copy_h2d(&query_bytes").unwrap();
+    let embed = source.find("ops::batched_embed").unwrap();
+    let oracle = source.find("let lanes_n = self.lane_count()").unwrap();
+    assert!(plan < upload && upload < embed && embed < oracle);
+    assert!(source.contains("self.batch_capacity"));
+    assert!(source.contains("self.batch_query_ids_dev"));
+    assert!(source.contains("self.batch_query_embed"));
+}

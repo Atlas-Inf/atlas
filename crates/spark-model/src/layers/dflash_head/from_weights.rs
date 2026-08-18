@@ -347,6 +347,14 @@ impl BlockDiffusionDraftHead {
             Ok(s)
         };
         let scratch = make_scratch(gpu)?;
+        let batch_capacity = max_batch_size.max(1);
+        let batch_rows = batch_capacity
+            .checked_mul(gamma_val)
+            .ok_or_else(|| anyhow::anyhow!("DFlash batch row capacity overflow"))?;
+        let batch_query_ids_dev = gpu.alloc(batch_rows * 4)?;
+        let batch_query_embed = gpu.alloc(batch_rows * hidden_size * bf16)?;
+        gpu.memset(batch_query_ids_dev, 0, batch_rows * 4)?;
+        gpu.memset(batch_query_embed, 0, batch_rows * hidden_size * bf16)?;
 
         // Extra propose lanes: `proposal_lane_count` total lanes
         // (default 1). Each extra lane gets its own stream, scratch set,
@@ -596,6 +604,9 @@ impl BlockDiffusionDraftHead {
             fused_kv_weight: Some(fused_kv_weight),
             kv_cache: Mutex::new(kv_cache),
             scratch,
+            batch_capacity,
+            batch_query_ids_dev,
+            batch_query_embed,
             extra_lanes,
             kernels,
             max_seq_len,
