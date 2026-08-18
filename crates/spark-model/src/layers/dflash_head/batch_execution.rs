@@ -56,6 +56,19 @@ pub(crate) fn paged_slot_mapping(
     Ok(Some(slots))
 }
 
+/// Resolve the legacy sentinel to lane 0 and reject every other invalid lane
+/// before any lane-indexed vector or scratch access.
+pub(crate) fn resolve_lane_id(
+    lane_id: usize,
+    lane_count: usize,
+) -> Result<usize, DsparkBatchInputError> {
+    let lane = if lane_id == usize::MAX { 0 } else { lane_id };
+    if lane >= lane_count {
+        return Err(DsparkBatchInputError::LaneOutOfBounds { lane, lane_count });
+    }
+    Ok(lane)
+}
+
 impl DsparkBatchInput {
     /// Pack query IDs as `[sequence][gamma]`: anchor followed by mask rows.
     pub fn packed_query_tokens(&self, mask_token: u32) -> Vec<u32> {

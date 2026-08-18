@@ -2,7 +2,7 @@
 
 use spark_runtime::gpu::DevicePtr;
 
-use super::batch_execution::paged_slot_mapping;
+use super::batch_execution::{paged_slot_mapping, resolve_lane_id};
 use super::batch_inputs::{DsparkBatchInput, DsparkBatchInputError, validate_batch_input_lengths};
 use super::{
     CaptureDescriptor, CaptureStatus, LIGHTNING_SERVED_GAMMA, LIGHTNING_TAPS, SequenceGeneration,
@@ -446,6 +446,33 @@ fn paged_slots_are_sequence_major_and_cross_blocks_exactly() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn proposal_lane_resolution_rejects_invalid_indices_before_vector_access() {
+    assert_eq!(resolve_lane_id(usize::MAX, 3).unwrap(), 0);
+    assert_eq!(resolve_lane_id(2, 3).unwrap(), 2);
+    assert!(matches!(
+        resolve_lane_id(3, 3),
+        Err(DsparkBatchInputError::LaneOutOfBounds {
+            lane: 3,
+            lane_count: 3
+        })
+    ));
+    assert!(matches!(
+        resolve_lane_id(usize::MAX, 0),
+        Err(DsparkBatchInputError::LaneOutOfBounds {
+            lane: 0,
+            lane_count: 0
+        })
+    ));
+}
+
+#[test]
+fn sequence_accessor_is_not_public_api() {
+    let source = include_str!("batch_inputs.rs");
+    assert!(source.contains("pub(super) fn sequence"));
+    assert!(!source.contains("pub fn sequence(&self"));
 }
 
 #[test]

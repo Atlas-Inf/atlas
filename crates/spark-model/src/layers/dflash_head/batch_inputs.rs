@@ -90,6 +90,10 @@ pub enum DsparkBatchInputError {
         query: usize,
         gamma: usize,
     },
+    LaneOutOfBounds {
+        lane: usize,
+        lane_count: usize,
+    },
     ZeroDimension {
         field: &'static str,
     },
@@ -176,6 +180,10 @@ impl fmt::Display for DsparkBatchInputError {
             Self::QueryOutOfBounds { query, gamma } => write!(
                 formatter,
                 "Lightning DSpark gamma row {query} is outside gamma {gamma}"
+            ),
+            Self::LaneOutOfBounds { lane, lane_count } => write!(
+                formatter,
+                "Lightning DSpark proposal lane {lane} is outside lane count {lane_count}"
             ),
             Self::ZeroDimension { field } => {
                 write!(formatter, "Lightning DSpark {field} must be nonzero")
@@ -335,7 +343,7 @@ impl DsparkBatchInput {
         self.total_rows
     }
 
-    pub fn sequence(&self, sequence: usize) -> &DsparkBatchSequence {
+    pub(super) fn sequence(&self, sequence: usize) -> &DsparkBatchSequence {
         &self.sequences[sequence]
     }
 

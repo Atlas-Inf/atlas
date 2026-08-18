@@ -1159,13 +1159,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     .as_any_mut()
                     .downcast_mut::<DflashProposerState>()
                     .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
-                // Defensive sentinel: states built before lane assignment
-                // existed run on lane 0 (the pre-refactor serial resources).
-                if dstate.lane_id == usize::MAX {
-                    0
-                } else {
-                    dstate.lane_id
-                }
+                batch_execution::resolve_lane_id(dstate.lane_id, lanes_n)?
             };
             let (lane_stream, lane_scratch, lane_markov_embed, lane_markov_bias) =
                 self.lane(lane, default_stream);
