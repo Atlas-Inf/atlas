@@ -491,8 +491,7 @@ impl TransformerModel {
                 let kmax = self.dflash_hidden_save_rows;
                 let slot_bytes = self.dflash_capture_layers.len() * h * 2;
                 seqs.iter()
-                    .enumerate()
-                    .map(|(i, seq)| {
+                    .map(|seq| {
                         let acc = seq
                             .proposer_state
                             .as_ref()
@@ -503,7 +502,11 @@ impl TransformerModel {
                             .map(|d| d.last_num_accepted)
                             .unwrap_or(0)
                             .min(kmax.saturating_sub(1));
-                        base.offset((i * kmax + acc) * slot_bytes)
+                        // Slot-indexed region: the capture writes at
+                        // slot_idx*kmax (try_dflash_capture_batched_at), so a
+                        // pending-set reorder after mid-batch finishes reads
+                        // THIS sequence's rows, not a dead neighbor's.
+                        base.offset((seq.slot_idx * kmax + acc) * slot_bytes)
                     })
                     .collect()
             }

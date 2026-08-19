@@ -222,6 +222,25 @@ impl TransformerModel {
         off: &[usize],
         stream: u64,
     ) -> Result<()> {
+        Self::try_dflash_capture_batched_at(self, layer_idx, ks, off, None, stream)
+    }
+
+    /// Slot-indexed variant: `slots[i]` is sequence i's STABLE SSM slot. The
+    /// capture region is `slots[i] * kmax`, not the batch position — after
+    /// any mid-batch finish (churn/EOS/max_tokens) the pending set reorders,
+    /// and a batch-position region would hand the re-propose another (or a
+    /// dead) sequence's hiddens, poisoning the drafter ctx accumulator (the
+    /// release-binary churn ILA; see the wave-12 session evidence). `None`
+    /// keeps the historical batch-position layout for the single-seq path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_dflash_capture_batched_at(
+        &self,
+        layer_idx: usize,
+        ks: &[usize],
+        off: &[usize],
+        slots: Option<&[usize]>,
+        stream: u64,
+    ) -> Result<()> {
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
             None => return Ok(()),
@@ -246,10 +265,11 @@ impl TransformerModel {
         let nseq = self.dflash_hidden_save_nseq;
         let hidden = self.buffers.hidden_states();
         for (i, &k) in ks.iter().enumerate() {
-            if i >= nseq {
+            let region = slots.map(|s| s[i]).unwrap_or(i);
+            if region >= nseq {
                 break;
             }
-            let seq_base = dst.offset(i * kmax * ctx_slot_bytes);
+            let seq_base = dst.offset(region * kmax * ctx_slot_bytes);
             for t in 0..k.min(kmax) {
                 let src = hidden.offset((off[i] + t) * h * bf16);
                 let dst_slot = seq_base.offset(t * ctx_slot_bytes + slot * h * bf16);
@@ -261,7 +281,14 @@ impl TransformerModel {
 
     /// Compact seq `i`'s captured rows to the C=1 front of the save buffer
     /// so existing `commit_ctx` readers stay unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn pack_dflash_save_seq(&self, seq_i: usize, k: usize, stream: u64) -> Result<()> {
+        Self::pack_dflash_save_region(self, seq_i, k, stream)
+    }
+
+    /// Slot-addressed pack: copies the sequence's slot-indexed capture
+    /// region to the front for the commit_ctx reader.
+    pub(super) fn pack_dflash_save_region(&self, slot: usize, k: usize, stream: u64) -> Result<()> {
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
             None => return Ok(()),
@@ -273,13 +300,16 @@ impl TransformerModel {
         }
         let kmax = self.dflash_hidden_save_rows;
         let n = k.min(kmax);
-        if seq_i == 0 {
+        if slot == 0 {
+            // Slot 0's rows already live at the front — preserve them so the
+            // post-loop restore can put them back after later slots pack over
+            // the front region.
             let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
             self.gpu
                 .copy_d2d_async(dst, preserve, n * ctx_slot_bytes, stream)?;
             return Ok(());
         }
-        let src = dst.offset(seq_i * kmax * ctx_slot_bytes);
+        let src = dst.offset(slot * kmax * ctx_slot_bytes);
         self.gpu
             .copy_d2d_async(src, dst, n * ctx_slot_bytes, stream)?;
         Ok(())

@@ -483,7 +483,8 @@ impl TransformerModel {
                     )?;
                 }
 
-                self.try_dflash_capture_batched(layer_idx, ks, &off, stream)?;
+                let cap_slots: Vec<usize> = seqs.iter().map(|s| s.slot_idx).collect();
+                self.try_dflash_capture_batched_at(layer_idx, ks, &off, Some(&cap_slots), stream)?;
                 if time_layers {
                     let _ = self.gpu.synchronize(stream);
                     let dt = t0.elapsed().as_micros();

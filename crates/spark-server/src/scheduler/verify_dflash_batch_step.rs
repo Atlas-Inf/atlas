@@ -154,8 +154,9 @@ pub(super) fn step_verify_dflash_batched(
         tracing::error!("stash_verify_hidden_rows (dflash): {e:#}");
     }
     for i in 0..n {
-        if let Err(e) = model.pack_dflash_save_seq(i, ks[i], 0) {
-            tracing::error!("pack_dflash_save_seq({i}): {e:#}");
+        let slot = batch[i].seq.slot_idx;
+        if let Err(e) = model.pack_dflash_save_seq(slot, ks[i], 0) {
+            tracing::error!("pack_dflash_save_seq(slot={slot}): {e:#}");
         }
         apply_dflash_accept(
             model,
