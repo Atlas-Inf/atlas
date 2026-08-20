@@ -28,6 +28,16 @@ fn fail_closed_if_lightning(
     crate::scheduler::helpers::handle_dspark_batched_proposal_failure(model, a, site);
 }
 
+/// Return the capture width that must be preserved when owner slot 0 is part
+/// of an owner-addressed batch. No slot 0 means no front restore is valid: an
+/// unconditional restore would copy stale preservation bytes over the front.
+fn dflash_front_restore_width(owner_slots: &[usize], ks: &[usize]) -> Option<usize> {
+    owner_slots
+        .iter()
+        .zip(ks.iter())
+        .find_map(|(&slot, &k)| (slot == 0).then_some(k))
+}
+
 /// n>=2 DSpark sequences, each with `ks[i]-1` pending drafts (uniform K=3
 /// → ks=4). Grammarless. Caller sorted / classified.
 pub(super) fn step_verify_dflash_batched(
@@ -153,17 +163,32 @@ pub(super) fn step_verify_dflash_batched(
     if let Err(e) = model.stash_verify_hidden_rows(&stash_rows, 0) {
         tracing::error!("stash_verify_hidden_rows (dflash): {e:#}");
     }
-    for i in 0..n {
-        let slot = match batch[i].seq.dflash_hidden_save_slot() {
-            Ok(slot) => slot,
-            Err(error) => {
-                tracing::error!("dflash hidden-save owner lookup failed: {error:#}");
-                for a in batch.iter_mut() {
-                    a.finished = true;
-                }
-                return;
+    let owner_slots: Vec<usize> = match batch
+        .iter()
+        .map(|a| a.seq.dflash_hidden_save_slot())
+        .collect()
+    {
+        Ok(slots) => slots,
+        Err(error) => {
+            tracing::error!("dflash hidden-save owner lookup failed: {error:#}");
+            for a in batch.iter_mut() {
+                a.finished = true;
             }
-        };
+            return;
+        }
+    };
+    let restore_front_k = dflash_front_restore_width(&owner_slots, ks);
+    if let Some(k0) = restore_front_k
+        && let Err(e) = model.preserve_dflash_save_front(k0, 0)
+    {
+        tracing::error!("preserve_dflash_save_front: {e:#}");
+        for a in batch.iter_mut() {
+            a.finished = true;
+        }
+        return;
+    }
+    for i in 0..n {
+        let slot = owner_slots[i];
         if let Err(e) = model.pack_dflash_save_seq(slot, ks[i], 0) {
             tracing::error!("pack_dflash_save_seq(owner_slot={slot}): {e:#}");
             for a in batch.iter_mut() {
@@ -181,7 +206,9 @@ pub(super) fn step_verify_dflash_batched(
             dflash_verify_raw_argmax,
         );
     }
-    if let Err(e) = model.restore_dflash_save_front(ks[0], 0) {
+    if let Some(k0) = restore_front_k
+        && let Err(e) = model.restore_dflash_save_front(k0, 0)
+    {
         tracing::error!("restore_dflash_save_front: {e:#}");
         for a in batch.iter_mut() {
             a.finished = true;
@@ -412,4 +439,15 @@ pub(super) fn apply_dflash_accept(
     }
     // Propose is deferred to step_verify_dflash_batched so every seq
     // uses stash hiddens + eager propose_batch (no shared-graph clobber).
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dflash_front_restore_width;
+
+    #[test]
+    fn front_restore_requires_owner_slot_zero() {
+        assert_eq!(dflash_front_restore_width(&[2, 4], &[4, 4]), None);
+        assert_eq!(dflash_front_restore_width(&[3, 0, 4], &[4, 3, 2]), Some(3));
+    }
 }
