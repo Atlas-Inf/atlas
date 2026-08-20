@@ -850,6 +850,11 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Preserve the current C=1 front before batched slot-addressed packing.
+    fn preserve_dflash_save_front(&self, _k: usize, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Compact batched UNIFIED_CTX capture for `seq_i` to the C=1 front
     /// of `dflash_hidden_save` so `commit_ctx` can run unchanged.
     fn pack_dflash_save_seq(&self, _seq_i: usize, _k: usize, _stream: u64) -> Result<()> {

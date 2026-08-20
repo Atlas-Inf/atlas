@@ -491,8 +491,7 @@ impl TransformerModel {
                 let kmax = self.dflash_hidden_save_rows;
                 let slot_bytes = self.dflash_capture_layers.len() * h * 2;
                 seqs.iter()
-                    .enumerate()
-                    .map(|(i, seq)| {
+                    .map(|seq| -> Result<spark_runtime::gpu::DevicePtr> {
                         let acc = seq
                             .proposer_state
                             .as_ref()
@@ -503,9 +502,18 @@ impl TransformerModel {
                             .map(|d| d.last_num_accepted)
                             .unwrap_or(0)
                             .min(kmax.saturating_sub(1));
-                        base.offset((i * kmax + acc) * slot_bytes)
+                        // Stable owner slot: `slot_idx` may migrate after
+                        // compaction or become the detach sentinel, but the
+                        // hidden-save arena is allocated per DSpark owner.
+                        let slot = seq.dflash_hidden_save_slot()?;
+                        anyhow::ensure!(
+                            slot < self.dflash_hidden_save_nseq,
+                            "DFlash re-propose owner slot {slot} exceeds capacity {}",
+                            self.dflash_hidden_save_nseq
+                        );
+                        Ok(base.offset((slot * kmax + acc) * slot_bytes))
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()?
             }
             _ => stash_idx
                 .iter()

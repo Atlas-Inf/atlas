@@ -33,6 +33,18 @@ fn stable_owner_survives_compaction_and_detach_sentinel() {
 }
 
 #[test]
+fn dflash_hidden_save_slot_follows_immutable_owner_after_slot_migration() {
+    let owner = SequenceGeneration::new(7, 11).unwrap();
+    let mut seq = SequenceState::host_only(7);
+    seq.dspark_owner = Some(owner);
+
+    seq.slot_idx = 3;
+    assert_eq!(seq.dflash_hidden_save_slot().unwrap(), owner.slot());
+    seq.slot_idx = usize::MAX;
+    assert_eq!(seq.dflash_hidden_save_slot().unwrap(), owner.slot());
+}
+
+#[test]
 fn direct_serial_boundary_rejects_a_state_without_caller_owner() {
     let seq = SequenceState::host_only(0);
     assert!(seq.expected_dspark_owner().is_err());

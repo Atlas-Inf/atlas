@@ -655,6 +655,10 @@ impl Model for TransformerModel {
         Ok(())
     }
 
+    fn preserve_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+        TransformerModel::preserve_dflash_save_front(self, k, stream)
+    }
+
     fn pack_dflash_save_seq(&self, seq_i: usize, k: usize, stream: u64) -> Result<()> {
         TransformerModel::pack_dflash_save_seq(self, seq_i, k, stream)
     }

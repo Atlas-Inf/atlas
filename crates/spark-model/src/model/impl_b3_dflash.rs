@@ -222,6 +222,25 @@ impl TransformerModel {
         off: &[usize],
         stream: u64,
     ) -> Result<()> {
+        Self::try_dflash_capture_batched_at(self, layer_idx, ks, off, None, stream)
+    }
+
+    /// Slot-indexed variant: `slots[i]` is sequence i's STABLE SSM slot. The
+    /// capture region is `slots[i] * kmax`, not the batch position — after
+    /// any mid-batch finish (churn/EOS/max_tokens) the pending set reorders,
+    /// and a batch-position region would hand the re-propose another (or a
+    /// dead) sequence's hiddens, poisoning the drafter ctx accumulator (the
+    /// release-binary churn ILA; see the wave-12 session evidence). `None`
+    /// keeps the historical batch-position layout for the single-seq path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_dflash_capture_batched_at(
+        &self,
+        layer_idx: usize,
+        ks: &[usize],
+        off: &[usize],
+        slots: Option<&[usize]>,
+        stream: u64,
+    ) -> Result<()> {
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
             None => return Ok(()),
@@ -244,12 +263,22 @@ impl TransformerModel {
         let ctx_slot_bytes = self.dflash_capture_layers.len() * h * bf16;
         let kmax = self.dflash_hidden_save_rows;
         let nseq = self.dflash_hidden_save_nseq;
+        if let Some(slots) = slots {
+            anyhow::ensure!(
+                slots.len() == ks.len(),
+                "DFlash batched capture owner-slot width {} != batch width {}",
+                slots.len(),
+                ks.len()
+            );
+        }
         let hidden = self.buffers.hidden_states();
         for (i, &k) in ks.iter().enumerate() {
-            if i >= nseq {
-                break;
-            }
-            let seq_base = dst.offset(i * kmax * ctx_slot_bytes);
+            let region = slots.map(|s| s[i]).unwrap_or(i);
+            anyhow::ensure!(
+                region < nseq,
+                "DFlash batched capture owner slot {region} exceeds capacity {nseq}"
+            );
+            let seq_base = dst.offset(region * kmax * ctx_slot_bytes);
             for t in 0..k.min(kmax) {
                 let src = hidden.offset((off[i] + t) * h * bf16);
                 let dst_slot = seq_base.offset(t * ctx_slot_bytes + slot * h * bf16);
@@ -259,9 +288,38 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// Compact seq `i`'s captured rows to the C=1 front of the save buffer
-    /// so existing `commit_ctx` readers stay unchanged.
+    /// Preserve the current C=1 front before any slot-addressed batch region is
+    /// packed over it. The preserve area is the extra sequence-sized region
+    /// allocated after all owner slots.
+    pub(super) fn preserve_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+        let dst = match self.dflash_hidden_save {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let ctx_slot_bytes = self.dflash_capture_layers.len() * self.config.hidden_size * 2;
+        if ctx_slot_bytes == 0 {
+            return Ok(());
+        }
+        let kmax = self.dflash_hidden_save_rows;
+        let n = k.min(kmax);
+        if n == 0 {
+            return Ok(());
+        }
+        let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
+        self.gpu
+            .copy_d2d_async(dst, preserve, n * ctx_slot_bytes, stream)
+    }
+
+    /// Compact a slot-addressed capture region to the C=1 front for the
+    /// commit_ctx reader. The slot-0 region already is the front; its original
+    /// rows are preserved once before the batch and restored after the loop.
     pub(super) fn pack_dflash_save_seq(&self, seq_i: usize, k: usize, stream: u64) -> Result<()> {
+        Self::pack_dflash_save_region(self, seq_i, k, stream)
+    }
+
+    /// Slot-addressed pack: copies the sequence's slot-indexed capture
+    /// region to the front for the commit_ctx reader.
+    pub(super) fn pack_dflash_save_region(&self, slot: usize, k: usize, stream: u64) -> Result<()> {
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
             None => return Ok(()),
@@ -272,22 +330,23 @@ impl TransformerModel {
             return Ok(());
         }
         let kmax = self.dflash_hidden_save_rows;
+        anyhow::ensure!(
+            slot < self.dflash_hidden_save_nseq,
+            "DFlash hidden-save owner slot {slot} exceeds capacity {}",
+            self.dflash_hidden_save_nseq
+        );
         let n = k.min(kmax);
-        if seq_i == 0 {
-            let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
-            self.gpu
-                .copy_d2d_async(dst, preserve, n * ctx_slot_bytes, stream)?;
+        if slot == 0 || n == 0 {
             return Ok(());
         }
-        let src = dst.offset(seq_i * kmax * ctx_slot_bytes);
+        let src = dst.offset(slot * kmax * ctx_slot_bytes);
         self.gpu
-            .copy_d2d_async(src, dst, n * ctx_slot_bytes, stream)?;
-        Ok(())
+            .copy_d2d_async(src, dst, n * ctx_slot_bytes, stream)
     }
 
-    /// Restore sequence 0's capture after the batched commit loop packed other
-    /// sequences into the C=1 front. Must run before batched re-propose reads
-    /// the per-sequence capture regions.
+    /// Restore the original C=1 front after the batched commit loop packed
+    /// owner regions over it. The scheduler calls this only when owner slot 0
+    /// was present and therefore was explicitly preserved before the loop.
     pub(super) fn restore_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
@@ -299,6 +358,9 @@ impl TransformerModel {
         }
         let kmax = self.dflash_hidden_save_rows;
         let n = k.min(kmax);
+        if n == 0 {
+            return Ok(());
+        }
         let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
         self.gpu
             .copy_d2d_async(preserve, dst, n * ctx_slot_bytes, stream)

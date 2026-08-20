@@ -321,7 +321,17 @@ impl SequenceState {
             .ok_or_else(|| anyhow::anyhow!("sequence has no DSpark allocation owner"))
     }
 
-    /// SSM-pool slot index for this sequence, if it has GDN/SSM (linear-attn)
+    /// Stable hidden-save region for DSpark batched verify/capture.
+    ///
+    /// `slot_idx` is a mutable runtime SSM slot: compaction may migrate it and
+    /// detaching sets it to the reuse sentinel. The hidden-save arena is keyed
+    /// by the immutable allocation owner instead, so capture and re-propose
+    /// continue to address the same region across churn.
+    pub fn dflash_hidden_save_slot(&self) -> anyhow::Result<usize> {
+        Ok(self.expected_dspark_owner()?.slot())
+    }
+
+    /// SSM-pool slot index for this sequence, if it has GDN/SSM (linear-attn).
     /// layers. Used by the scheduler to order the decode batch by slot so the
     /// batched-recurrent SSM + CUDA-graph contiguity invariant holds
     /// (position i ↔ pool_base + i*stride). `None` for pure-attention models.

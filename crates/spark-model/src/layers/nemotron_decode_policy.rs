@@ -2,15 +2,23 @@
 
 /// Return whether one Lightning AR component should use its batched path.
 ///
-/// The component override is diagnostic and exact-valued: `"1"` enables,
-/// any other supplied value disables. When absent, the shared policy applies.
+/// Batched AR is the production default: Nemotron's Mamba and MoE layers both
+/// have exact mixed-prompt gates on the native multi-sequence path. The
+/// environment variables are diagnostic opt-outs/overrides only:
+/// `ATLAS_LIGHTNING_DECODE_MULTI=0` disables the shared path, while an explicit
+/// component value (`ATLAS_LIGHTNING_MAMBA_MULTI` or
+/// `ATLAS_LIGHTNING_MOE_MULTI`) wins for that component. Invalid explicit
+/// values fail closed to the serial diagnostic path.
 pub(crate) fn decode_multi_seq_batched(
     shared_value: Option<&str>,
     component_value: Option<&str>,
 ) -> bool {
     match component_value {
         Some(value) => value == "1",
-        None => matches!(shared_value, Some("1")),
+        None => match shared_value {
+            Some(value) => value == "1",
+            None => true,
+        },
     }
 }
 
@@ -19,8 +27,8 @@ mod tests {
     use super::decode_multi_seq_batched;
 
     #[test]
-    fn shared_policy_requires_exact_one() {
-        assert!(!decode_multi_seq_batched(None, None));
+    fn shared_policy_defaults_to_batched_and_accepts_only_explicit_opt_out() {
+        assert!(decode_multi_seq_batched(None, None));
         assert!(!decode_multi_seq_batched(Some("0"), None));
         assert!(decode_multi_seq_batched(Some("1"), None));
         assert!(!decode_multi_seq_batched(Some("true"), None));
@@ -31,7 +39,7 @@ mod tests {
         assert!(decode_multi_seq_batched(None, Some("1")));
         assert!(decode_multi_seq_batched(Some("0"), Some("1")));
         assert!(!decode_multi_seq_batched(Some("1"), Some("0")));
-        assert!(!decode_multi_seq_batched(Some("1"), Some("true")));
+        assert!(!decode_multi_seq_batched(None, Some("true")));
     }
 
     #[test]
