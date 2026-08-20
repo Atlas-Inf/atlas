@@ -55,9 +55,9 @@ impl TransformerLayer for NemotronMoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // AR C>1: MoE is stateless. Serial decode is the default diagnostic
-        // path. ATLAS_LIGHTNING_DECODE_MULTI=1 opts into both hybrid mixers;
-        // ATLAS_LIGHTNING_MOE_MULTI is the component diagnostic override.
+        // AR C>1: MoE is stateless and batched by default. Set
+        // ATLAS_LIGHTNING_DECODE_MULTI=0 for the serial diagnostic fallback;
+        // ATLAS_LIGHTNING_MOE_MULTI remains a component override.
         if nemotron_decode_policy::decode_multi_seq_batched(
             std::env::var("ATLAS_LIGHTNING_DECODE_MULTI")
                 .ok()

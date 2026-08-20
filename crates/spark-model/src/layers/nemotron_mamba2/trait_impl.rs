@@ -293,9 +293,9 @@ impl TransformerLayer for NemotronMamba2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // AR C>1: serial decode is the default diagnostic path. Set
-        // ATLAS_LIGHTNING_DECODE_MULTI=1 opts into both hybrid mixers;
-        // ATLAS_LIGHTNING_MAMBA_MULTI is the component diagnostic override.
+        // AR C>1: batched in/out projection is the production default for
+        // both hybrid mixers. Set ATLAS_LIGHTNING_DECODE_MULTI=0 for the
+        // serial diagnostic fallback; component values are narrow overrides.
         if nemotron_decode_policy::decode_multi_seq_batched(
             std::env::var("ATLAS_LIGHTNING_DECODE_MULTI")
                 .ok()
