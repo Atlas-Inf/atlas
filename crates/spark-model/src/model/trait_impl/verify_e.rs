@@ -483,7 +483,10 @@ impl TransformerModel {
                     )?;
                 }
 
-                let cap_slots: Vec<usize> = seqs.iter().map(|s| s.slot_idx).collect();
+                let cap_slots: Vec<usize> = seqs
+                    .iter()
+                    .map(|seq| seq.dflash_hidden_save_slot())
+                    .collect::<Result<_>>()?;
                 self.try_dflash_capture_batched_at(layer_idx, ks, &off, Some(&cap_slots), stream)?;
                 if time_layers {
                     let _ = self.gpu.synchronize(stream);

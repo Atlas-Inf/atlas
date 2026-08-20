@@ -491,7 +491,7 @@ impl TransformerModel {
                 let kmax = self.dflash_hidden_save_rows;
                 let slot_bytes = self.dflash_capture_layers.len() * h * 2;
                 seqs.iter()
-                    .map(|seq| {
+                    .map(|seq| -> Result<spark_runtime::gpu::DevicePtr> {
                         let acc = seq
                             .proposer_state
                             .as_ref()
@@ -502,13 +502,13 @@ impl TransformerModel {
                             .map(|d| d.last_num_accepted)
                             .unwrap_or(0)
                             .min(kmax.saturating_sub(1));
-                        // Slot-indexed region: the capture writes at
-                        // slot_idx*kmax (try_dflash_capture_batched_at), so a
-                        // pending-set reorder after mid-batch finishes reads
-                        // THIS sequence's rows, not a dead neighbor's.
-                        base.offset((seq.slot_idx * kmax + acc) * slot_bytes)
+                        // Stable owner slot: `slot_idx` may migrate after
+                        // compaction or become the detach sentinel, but the
+                        // hidden-save arena is allocated per DSpark owner.
+                        let slot = seq.dflash_hidden_save_slot()?;
+                        Ok(base.offset((slot * kmax + acc) * slot_bytes))
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()?
             }
             _ => stash_idx
                 .iter()

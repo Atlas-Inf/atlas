@@ -263,12 +263,21 @@ impl TransformerModel {
         let ctx_slot_bytes = self.dflash_capture_layers.len() * h * bf16;
         let kmax = self.dflash_hidden_save_rows;
         let nseq = self.dflash_hidden_save_nseq;
+        if let Some(slots) = slots {
+            anyhow::ensure!(
+                slots.len() == ks.len(),
+                "DFlash batched capture owner-slot width {} != batch width {}",
+                slots.len(),
+                ks.len()
+            );
+        }
         let hidden = self.buffers.hidden_states();
         for (i, &k) in ks.iter().enumerate() {
             let region = slots.map(|s| s[i]).unwrap_or(i);
-            if region >= nseq {
-                break;
-            }
+            anyhow::ensure!(
+                region < nseq,
+                "DFlash batched capture owner slot {region} exceeds capacity {nseq}"
+            );
             let seq_base = dst.offset(region * kmax * ctx_slot_bytes);
             for t in 0..k.min(kmax) {
                 let src = hidden.offset((off[i] + t) * h * bf16);
@@ -299,6 +308,11 @@ impl TransformerModel {
             return Ok(());
         }
         let kmax = self.dflash_hidden_save_rows;
+        anyhow::ensure!(
+            slot < self.dflash_hidden_save_nseq,
+            "DFlash hidden-save owner slot {slot} exceeds capacity {}",
+            self.dflash_hidden_save_nseq
+        );
         let n = k.min(kmax);
         if slot == 0 {
             // Slot 0's rows already live at the front — preserve them so the
