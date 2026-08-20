@@ -506,6 +506,11 @@ impl TransformerModel {
                         // compaction or become the detach sentinel, but the
                         // hidden-save arena is allocated per DSpark owner.
                         let slot = seq.dflash_hidden_save_slot()?;
+                        anyhow::ensure!(
+                            slot < self.dflash_hidden_save_nseq,
+                            "DFlash re-propose owner slot {slot} exceeds capacity {}",
+                            self.dflash_hidden_save_nseq
+                        );
                         Ok(base.offset((slot * kmax + acc) * slot_bytes))
                     })
                     .collect::<Result<Vec<_>>>()?

@@ -166,6 +166,10 @@ pub(super) fn step_verify_dflash_batched(
         };
         if let Err(e) = model.pack_dflash_save_seq(slot, ks[i], 0) {
             tracing::error!("pack_dflash_save_seq(owner_slot={slot}): {e:#}");
+            for a in batch.iter_mut() {
+                a.finished = true;
+            }
+            return;
         }
         apply_dflash_accept(
             model,
