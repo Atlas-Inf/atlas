@@ -189,7 +189,22 @@ pub(super) fn step_verify_dflash_batched(
     }
     for i in 0..n {
         let slot = owner_slots[i];
-        if let Err(e) = model.pack_dflash_save_seq(slot, ks[i], 0) {
+        if slot == 0 {
+            let Some(k0) = restore_front_k else {
+                tracing::error!("DFlash owner slot 0 appeared without a preserved front");
+                for a in batch.iter_mut() {
+                    a.finished = true;
+                }
+                return;
+            };
+            if let Err(e) = model.restore_dflash_save_front(k0, 0) {
+                tracing::error!("restore_dflash_save_front before owner-slot-0 commit: {e:#}");
+                for a in batch.iter_mut() {
+                    a.finished = true;
+                }
+                return;
+            }
+        } else if let Err(e) = model.pack_dflash_save_seq(slot, ks[i], 0) {
             tracing::error!("pack_dflash_save_seq(owner_slot={slot}): {e:#}");
             for a in batch.iter_mut() {
                 a.finished = true;
@@ -448,6 +463,7 @@ mod tests {
     #[test]
     fn front_restore_requires_owner_slot_zero() {
         assert_eq!(dflash_front_restore_width(&[2, 4], &[4, 4]), None);
+        assert_eq!(dflash_front_restore_width(&[2, 0], &[4, 4]), Some(4));
         assert_eq!(dflash_front_restore_width(&[3, 0, 4], &[4, 3, 2]), Some(3));
     }
 }
