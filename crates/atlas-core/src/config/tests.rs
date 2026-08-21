@@ -128,7 +128,7 @@ fn qwen35_moe_nested_config_maps_attention_ssm_and_layout_controls() {
 }
 
 #[test]
-fn test_parse_qwen3_vl_config() {
+fn qwen3_vl_moe_config_maps_attention_and_routing_controls() {
     let json = r#"{
         "model_type": "qwen3_vl_moe",
         "text_config": {
@@ -156,7 +156,10 @@ fn test_parse_qwen3_vl_config() {
     assert_eq!(cfg.num_attention_heads, 32);
     assert_eq!(cfg.num_key_value_heads, 4);
     assert_eq!(cfg.num_experts, 128);
+    assert_eq!(cfg.num_experts_per_tok, 8);
+    assert_eq!(cfg.moe_intermediate_size, 768);
     assert_eq!(cfg.num_hidden_layers, 48);
+    assert!(!cfg.attn_gated);
     // Pure attention: all layers are FullAttention (full_attention_interval defaults to 1)
     assert_eq!(cfg.num_attention_layers(), 48);
     assert_eq!(cfg.num_ssm_layers(), 0);
