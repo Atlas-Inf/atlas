@@ -432,6 +432,30 @@ function Phase-Serve {
     $env:ATLAS_SSM_TAIL_LEASE_TTL = '128'
     $env:ATLAS_MTP_GATE_REPROBE   = '64'
 
+    # Enables the FP8-source reclaim, and Qwen3.8-27B does not fit without it.
+    # quantized_from_fp8 frees the BF16 intermediate but keeps the FP8 SOURCE
+    # unless BOTH downstream readers are known to be off -- the GDN native-FP8
+    # prefill policy (this var) and the dense FP8 attention overlay
+    # (ATLAS_DENSE_FP8, unset here). serve-amd.sh has defaulted this to 1 since
+    # the reclaim landed; this recipe predates it and never picked it up, so on
+    # Windows the 11.56 GB of FP8 sources in unsloth/Qwen3.8-27B-NVFP4 stayed
+    # resident beside their NVFP4 copies:
+    #
+    #   Weights: 21.81 GB, estimated free: 54.9 GB, actual free: 33.1 GB
+    #   KV budget (auto): baseline-free 76.7 GB - free-now 18.9 GB = 57.8 GB
+    #   No memory left for KV cache: budget 61.5 GB, but 57.8 GB consumed
+    #     + 14.4 GB inference reserve = 72.2 GB committed
+    #
+    # Raising --gpu-memory-utilization instead does not work: at 0.95 the
+    # allocation is genuinely attempted and the HIP context hard-faults with
+    # status 719. The memory is really in use; it has to be given back.
+    # Set ATLAS_NO_GDN_FP8_PREFILL=0 to genuinely disable, matching serve-amd.sh.
+    if ($env:ATLAS_NO_GDN_FP8_PREFILL -eq '0') {
+        Remove-Item Env:\ATLAS_NO_GDN_FP8_PREFILL -ErrorAction SilentlyContinue
+    } else {
+        $env:ATLAS_NO_GDN_FP8_PREFILL = '1'
+    }
+
     # 0, NOT the 6 this doc carried before runtime. cuMemGetInfo_v2 now synthesises
     # a truthful free figure from tracked allocations, and that tracker reports
     # Atlas-own bytes only -- so build.rs's co-tenant discount double-counts and
