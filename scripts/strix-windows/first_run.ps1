@@ -38,6 +38,9 @@
 #   ATLAS_BIN        prebuilt spark.exe. Set it to skip straight to serving.
 #   ATLAS_REPO       repo root.        Default: the checkout this script lives in.
 #   ATLAS_MODEL_DIR  weights snapshot. Default: $env:USERPROFILE\models\Qwen3.6-27B-NVFP4
+#   ATLAS_MODEL_NAME served model id. Default: derived from ATLAS_MODEL_DIR
+#                    (a Qwen3.8-27B directory serves unsloth/Qwen3.8-27B-NVFP4).
+#                    This drives kernel-target resolution -- see $ModelName below.
 #   HIP_PATH         HIP SDK root.     Default: newest under C:\Program Files\AMD\ROCm
 #   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.80. Read the note in Serve
 #                    before raising it; it is a fraction of a total the driver
@@ -68,6 +71,17 @@ $ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
 $GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.80' }
 $Port     = if ($env:ATLAS_PORT) { $env:ATLAS_PORT } else { '8081' }
 $BindHost = if ($env:ATLAS_BIND) { $env:ATLAS_BIND } else { '127.0.0.1' }
+
+# The served model NAME is not cosmetic. Kernel-target resolution breaks the
+# exact (qwen3_5, 5120) tie between qwen3.6-27b and qwen3.8-27b by matching each
+# target's MODEL.toml `match_names` needles against the checkpoint reference --
+# the HF id, --model-name, and the model dir. Hardcoding the 3.6 name while
+# ATLAS_MODEL_DIR points at 3.8 weights resolves the 3.6 target and serves with
+# that target's MTP depth and sampling defaults, with nothing in the log saying
+# so. Default it from the weights directory; ATLAS_MODEL_NAME overrides.
+$ModelName = if ($env:ATLAS_MODEL_NAME) { $env:ATLAS_MODEL_NAME }
+             elseif ((Split-Path $ModelDir -Leaf) -match 'Qwen3\.8-27B') { 'unsloth/Qwen3.8-27B-NVFP4' }
+             else { 'nvidia/Qwen3.6-27B-NVFP4' }
 
 # ATLAS_BIN points at a prebuilt spark.exe (the CI zip). When it is set there is
 # nothing to build, so the binary's own directory takes the place of target/ and
@@ -392,7 +406,7 @@ function Phase-Serve {
     $exe = if ($Prebuilt) { (Resolve-Path $env:ATLAS_BIN).Path } else { Join-Path $ReleaseDir 'spark.exe' }
     if (-not (Test-Path $exe)) { throw "spark.exe not found -- run -Phase build first, or set ATLAS_BIN to a prebuilt one" }
     if (-not (Test-Path $ModelDir)) {
-        throw "no weights at $ModelDir. Fetch with: hf download nvidia/Qwen3.6-27B-NVFP4 --local-dir `"$ModelDir`""
+        throw "no weights at $ModelDir. Fetch with: hf download $ModelName --local-dir `"$ModelDir`""
     }
 
     # cudarc dlopens nvcuda.dll from the EXE's directory, and that DLL imports
@@ -444,7 +458,7 @@ while ((Get-Date) -lt `$dl) {
     try { Invoke-WebRequest -Uri "`$u/v1/models" -TimeoutSec 3 -UseBasicParsing | Out-Null; break }
     catch { Start-Sleep -Seconds 5 }
 }
-`$b = @{ model='nvidia/Qwen3.6-27B-NVFP4'
+`$b = @{ model='$ModelName'
         prompt="<|im_start|>user``nName three primary colors.<|im_end|>``n<|im_start|>assistant``n"
         max_tokens=64; temperature=0.001 } | ConvertTo-Json -Compress
 try {
@@ -472,7 +486,7 @@ try {
     # and falls back instead of hard-erroring); passing it just silences the warning.
     & $exe serve $ModelDir `
         --no-fast-load `
-        --model-name nvidia/Qwen3.6-27B-NVFP4 --host $BindHost --port $Port `
+        --model-name $ModelName --host $BindHost --port $Port `
         --max-seq-len 65536 --gpu-memory-utilization $GpuUtil --kv-cache-dtype bf16 `
         --max-batch-size 1 --speculative --num-drafts 2 --mtp-quantization bf16 `
         --mtp-vocab 100000 --disable-tool-grammar true --enable-prefix-caching `
