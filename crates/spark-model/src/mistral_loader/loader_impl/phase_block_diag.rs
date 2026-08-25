@@ -9,7 +9,7 @@ use super::super::gpu_alloc_or_managed;
 use super::ctx::MistralLayerCtx;
 use crate::weight_map::DenseWeight;
 
-pub(super) fn build_block_diagonals(ctx: &mut MistralLayerCtx<'_>) -> Result<()> {
+pub(crate) fn build_block_diagonals(ctx: &mut MistralLayerCtx<'_>) -> Result<()> {
     let n_kv = ctx.n_kv;
     let kv_lora = ctx.kv_lora;
     let nope = ctx.nope;

@@ -9,7 +9,7 @@ use super::super::gpu_alloc_or_managed;
 use super::ctx::MistralLayerCtx;
 use crate::weight_map::DenseWeight;
 
-pub(super) fn build_w_qk_absorbed(ctx: &mut MistralLayerCtx<'_>) -> Result<()> {
+pub(crate) fn build_w_qk_absorbed(ctx: &mut MistralLayerCtx<'_>) -> Result<()> {
     let n_kv = ctx.n_kv;
     let n_heads = ctx.n_heads;
     let kv_lora = ctx.kv_lora;

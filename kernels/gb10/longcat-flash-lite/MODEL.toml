@@ -1,0 +1,51 @@
+[model]
+name = "longcat-flash-lite"
+hf_id = "meituan-longcat/LongCat-Flash-Lite"
+model_type = "longcat_flash_ngram"
+architecture = "mla_dual_sublayer_moe_ngram"
+parameters = "27B"
+active_parameters = "3B"
+
+# 14 checkpoint layers x 2 sublayers = 28 engine layers, all MLA attention.
+layers_total = 28
+layers_full_attention = 28
+
+hidden_dim = 3072
+head_dim = 192
+q_heads = 32
+kv_heads = 32
+intermediate_size = 6144
+
+vocab_size = 131072
+max_position_embeddings = 327680
+rope_theta = 5000000
+
+# MLA
+kv_lora_rank = 512
+q_lora_rank = 1536
+v_head_dim = 128
+qk_rope_head_dim = 64
+qk_nope_head_dim = 128
+
+# MoE: 256 routed + 128 zero-computation (identity) experts; softmax router
+# with e_score_correction_bias SELECTION and routed_scaling_factor 6.0.
+num_experts = 256
+zero_expert_num = 128
+moe_intermediate_size = 1024
+top_k = 12
+
+# N-gram input embeddings (arxiv 2601.21204): 12 tables of ~10.2M rows at
+# dim 256, hashed on token ids only.
+ngram_tables = 12
+ngram_vocab_size_ratio = 78
+
+[[model_types]]
+model_type = "longcat_flash_ngram"
+
+[[model_types]]
+model_type = "longcat_flash"
+
+[behavior]
+# MLA latent values exceed FP8 E4M3 range — same rule as the other MLA
+# targets (Mistral-Small-4, DeepSeek-V4-Flash).
+default_kv_dtype = "bf16"

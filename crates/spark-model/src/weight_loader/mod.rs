@@ -18,6 +18,7 @@ pub(crate) mod deepseek_v4;
 pub mod dflash_loader;
 mod gemma4;
 mod laguna;
+mod longcat;
 mod minimax;
 mod nemotron;
 mod nllb;
@@ -34,6 +35,7 @@ pub use dflash_loader::{
 };
 pub use gemma4::Gemma4WeightLoader;
 pub use laguna::LagunaWeightLoader;
+pub use longcat::LongcatWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
 pub use nemotron::NemotronHWeightLoader;
 pub use nllb::NllbWeightLoader;
