@@ -1,6 +1,6 @@
 # Release Notes
 
-Atlas's release notes are per-version markdown files in [`docs/releases/`](https://github.com/Avarok-Cybersecurity/atlas/tree/main/docs/releases). This chapter links to them and summarises the big themes across recent alphas. For the latest release, check the repo — this page is a stable pointer, not a ticker.
+Atlas's release notes are per-version markdown files in [`docs/releases/`](https://github.com/Atlas-Inf/atlas/tree/main/docs/releases). This chapter links to them and summarises the big themes across recent alphas. For the latest release, check the repo — this page is a stable pointer, not a ticker.
 
 ## Release naming
 
@@ -12,11 +12,11 @@ Since Atlas is pre-1.0 and under aggressive development, semantic versioning doe
 
 | Source | URL |
 |---|---|
-| Release notes folder | [`docs/releases/`](https://github.com/Avarok-Cybersecurity/atlas/tree/main/docs/releases) |
-| GitHub Releases | `https://github.com/Avarok-Cybersecurity/atlas/releases` (if tagged) |
-| Docker Hub | `https://hub.docker.com/r/avarok/atlas-gb10/tags` |
+| Release notes folder | [`docs/releases/`](https://github.com/Atlas-Inf/atlas/tree/main/docs/releases) |
+| GitHub Releases | `https://github.com/Atlas-Inf/atlas/releases` (if tagged) |
+| Docker Hub | `https://hub.docker.com/r/azeezish/atlas-gb10:latest/tags` |
 
-The multi-model Docker image always tracks the latest alpha at `avarok/atlas-gb10:latest`. Specific versions are tagged as `avarok/atlas-gb10:alpha-2.44` etc.
+The multi-model Docker image always tracks the latest alpha at `azeezish/atlas-gb10:latest`. Specific versions are tagged as `azeezish/atlas-gb10:latest` etc.
 
 ## Recent themes
 
@@ -75,4 +75,4 @@ Alongside the bug sweeps, "Pass-N" work is the systematic model-matrix regressio
 
 OSS release prep (alpha-2.43-share) was the major non-code milestone: archive tags, docs cleanup, `atlas-internal/` separation for proprietary artefacts.
 
-For the current roadmap, check the repo's pinned issues and the authoritative decision records at [`docs/adr/`](https://github.com/Avarok-Cybersecurity/atlas/tree/main/docs/adr).
+For the current roadmap, check the repo's pinned issues and the authoritative decision records at [`docs/adr/`](https://github.com/Atlas-Inf/atlas/tree/main/docs/adr).

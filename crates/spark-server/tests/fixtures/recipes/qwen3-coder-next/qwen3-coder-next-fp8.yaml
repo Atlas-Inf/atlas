@@ -1,7 +1,7 @@
 recipe_version: "2"
 model: Qwen/Qwen3-Coder-Next-FP8
 runtime: atlas
-container: avarok/atlas-gb10:latest
+container: azeezish/atlas-gb10:latest
 max_nodes: 1
 
 metadata:
@@ -22,7 +22,7 @@ metadata:
     Known limitation: agentic quality degrades after ~5–8 tool-use
     turns (model emits malformed XML, loops). Document but accept —
     this is a model issue, not an Atlas one.
-  maintainer: avarok
+  maintainer: atlas-inf
   category: agent
   model_params: 80B
   model_dtype: fp8

@@ -50,7 +50,7 @@ jobs:
       - name: Checkout atlas-recipes (model SSOT)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: Avarok-Cybersecurity/atlas-recipes
+          repository: Atlas-Inf/sparkrun-recipes
           path: atlas-recipes-src
 
       - name: Build
@@ -69,13 +69,13 @@ jobs:
           if-no-files-found: error
 
   deploy:
-    name: Deploy to avarok via rsync
+    name: Deploy via rsync
     needs: build
     if: (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
     environment:
       name: production-site
-      url: https://atlasinference.io/
+      url: https://atlasinference.dev/
     steps:
       - name: Check deploy secret presence
         # Skip deploy entirely when DEPLOY_SSH_PRIVATE_KEY isn't

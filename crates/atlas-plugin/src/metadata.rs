@@ -44,12 +44,12 @@ impl PluginMetadata {
         Self {
             description,
             version: env!("CARGO_PKG_VERSION"),
-            author: "Avarok Cybersecurity",
-            author_url: "https://atlasinference.io",
-            email: "support@avarok.net",
-            repository: "https://github.com/Avarok-Cybersecurity/atlas",
-            help_url: "https://docs.atlasinference.io/benchmarks",
-            bug_report_url: "https://github.com/Avarok-Cybersecurity/atlas/issues/new",
+            author: "Atlas Inference",
+            author_url: "https://atlasinference.dev",
+            email: "debaterishaqui@gmail.com",
+            repository: "https://github.com/Atlas-Inf/atlas",
+            help_url: "https://docs.atlasinference.dev/benchmarks",
+            bug_report_url: "https://github.com/Atlas-Inf/atlas/issues/new",
             license: "AGPL-3.0-only",
             official: true,
         }

@@ -2,7 +2,7 @@
 // =============================================================================
 // gen-models.mjs — generate src/lib/models.generated.json from the recipe SSOT
 // -----------------------------------------------------------------------------
-// SSOT: https://github.com/Avarok-Cybersecurity/atlas-recipes
+// SSOT: https://github.com/Atlas-Inf/sparkrun-recipes
 //   (read-only mirror expected at /workspace/atlas-recipes/recipes on the host
 //    that runs this script — that public repo is the single source of truth for
 //    every supported model + its canonical `sparkrun run` command).
@@ -27,7 +27,7 @@ import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const RECIPES_ROOT = process.env.ATLAS_RECIPES_ROOT || '/workspace/atlas-recipes/recipes';
-const SSOT_URL = 'https://github.com/Avarok-Cybersecurity/atlas-recipes';
+const SSOT_URL = 'https://github.com/Atlas-Inf/sparkrun-recipes';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const OUT = resolve(here, '..', 'src', 'lib', 'models.generated.json');

@@ -115,7 +115,7 @@ attributing them to code. Scratch script: combo_conc_canonical4k.sh.
 ### 3b. Holo-3.1-35B-A3B-NVFP4
 
 Full flag set + rationale is in the recipe PR
-(`Avarok-Cybersecurity/atlas-recipes#13`). Two things that silently degrade it:
+(`Atlas-Inf/sparkrun-recipes#13`). Two things that silently degrade it:
 `ATLAS_HOLO_LOW_MEMORY_MOE=1` is the unlock (verify `CUTLASS grouped SFB: built
 256 experts` ×40), and **KV must be `bf16`** — paged FlashInfer requires it.
 
@@ -582,7 +582,7 @@ Two side findings:
 
 ### 6.6b Second wave of picks (2026-07-30, late session)
 
-Prompted by a survey of `wip-laguna-lora` / `port/lora-moe-avarok` for
+Prompted by a survey of `wip-laguna-lora` / `port/lora-moe` for
 transferable work (user-directed):
 
 * `a1d889f2` (= 4046dcad, LoRA-branch peel-off): **rayon host sampling**
@@ -1087,7 +1087,7 @@ ordinal 1..128).
 
 ## 8. State at handoff (2026-07-29)
 
-**Branch** `perf/enterprise-concurrency-v3` on `avarok`, all commits signed:
+**Branch** `perf/enterprise-concurrency-v3` on `origin`, all commits signed:
 
 ```
 30839cb7  test(bench): agentic + correctness harnesses

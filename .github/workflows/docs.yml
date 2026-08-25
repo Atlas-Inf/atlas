@@ -90,13 +90,13 @@ jobs:
           if-no-files-found: error
 
   deploy:
-    name: Deploy to avarok via rsync
+    name: Deploy via rsync
     needs: build
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
     environment:
       name: production-docs
-      url: https://docs.atlasinference.io/
+      url: https://docs.atlasinference.dev/
     steps:
       - name: Check deploy secret presence
         # Skip deploy entirely when DEPLOY_SSH_PRIVATE_KEY is not

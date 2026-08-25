@@ -41,7 +41,7 @@ inputs:
 
       This exists because a title alone is not evidence. The caller should
       pass the CHANGED PATHS, and may pass CROSS-REPO context: the serve
-      recipes live in `Avarok-Cybersecurity/atlas-recipes`, and which recipe a
+      recipes live in `Atlas-Inf/sparkrun-recipes`, and which recipe a
       change affects is often only visible there.
     required: false
     default: ""

@@ -416,7 +416,7 @@ function finishReady(header, repo, sha, meta) {
     chunks: header.points ?? chat.progress.indexed,
     dim: header.dim,
     generatedAt: meta?.generated_at ?? null,
-    repo: repo ?? 'Avarok-Cybersecurity/atlas'
+    repo: repo ?? 'Atlas-Inf/atlas'
   };
   chat.status = 'ready';
 }

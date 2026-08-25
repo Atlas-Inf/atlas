@@ -1,7 +1,7 @@
 recipe_version: "2"
 model: Qwen/Qwen3.6-35B-A3B-FP8
 runtime: atlas
-container: avarok/atlas-gb10:latest
+container: azeezish/atlas-gb10:latest
 max_nodes: 1
 
 metadata:
@@ -18,7 +18,7 @@ metadata:
         at agentic lengths; fp8 KV is a memory-only lever for ~128K.
       - Re-verified post --lm-head-dtype merge 2026-06-09: 10/10 ws_ok,
         10/10 followed_directions.
-  maintainer: avarok
+  maintainer: atlas-inf
   category: agent
   model_params: 35B
   model_dtype: fp8
@@ -31,7 +31,7 @@ defaults:
   # 64K with bf16 KV fits next to the FP8 weights on one GB10 (~109/119.7
   # GB, live-validated 2026-06-09 incl. streaming tool calls).
   max_model_len: 65536
-  # max_batch_size 2: REQUIRED until Avarok-Cybersecurity/atlas#110 lands —
+  # max_batch_size 2: REQUIRED until Atlas-Inf/atlas#110 lands —
   # an uncapped batch hits the concurrency>=4 + deep-context CUDA-700 crash
   # (re-confirmed live 2026-06-11 at n_decode=2 + n_prefill=2, ~8.5K ctx).
   # The old warning here against capping (SSM slot-leak on aborted deep

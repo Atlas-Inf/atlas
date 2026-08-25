@@ -1,6 +1,6 @@
 # TurboQuant+ — KV-cache compression beyond the Google baseline
 
-Tracking issue: [#91](https://github.com/Avarok-Cybersecurity/atlas/issues/91)
+Tracking issue: [#91](https://github.com/Atlas-Inf/atlas/issues/91)
 (proposal + planned scope).
 
 This document describes the TurboQuant+ (TQ+) integration in Atlas: what

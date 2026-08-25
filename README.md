@@ -15,8 +15,9 @@
   <p align="center">
     <a href="LICENSE"><img alt="License: AGPLv3" src="https://img.shields.io/badge/license-AGPLv3-yellow?style=flat-square"></a>
     <a href="#quick-start"><img alt="Pure Rust" src="https://img.shields.io/badge/runtime-pure%20Rust-orange?style=flat-square"></a>
-    <a href="https://hub.docker.com/r/avarok/atlas-gb10"><img alt="Docker Hub" src="https://img.shields.io/badge/Docker%20Hub-avarok%2Fatlas--gb10-2496ED?style=flat-square&logo=docker&logoColor=white"></a>
-    <a href="https://discord.gg/RQcGakU2jW"><img alt="Discord" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fdiscord.com%2Fapi%2Fv10%2Finvites%2FRQcGakU2jW%3Fwith_counts%3Dtrue&query=%24.approximate_member_count&label=discord&suffix=%20members&style=flat-square&logo=discord&logoColor=white&color=5865F2"></a>
+    <a href="https://hub.docker.com/r/azeezish/atlas-gb10:latest"><img alt="Docker Hub" src="https://img.shields.io/badge/Docker%20Hub-azeezish%2Fatlas--gb10-2496ED?style=flat-square&logo=docker&logoColor=white"></a>
+    <a href="https://discord.com/invite/6vDbKaKrKD"><img alt="Discord" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fdiscord.com%2Fapi%2Fv10%2Finvites%2F6vDbKaKrKD%3Fwith_counts%3Dtrue&query=%24.approximate_member_count&label=discord&suffix=%20members&style=flat-square&logo=discord&logoColor=white&color=5865F2"></a>
+    <a href="https://x.com/AtlasInference"><img alt="X / Twitter" src="https://img.shields.io/badge/X-%40AtlasInference-000000?style=flat-square&logo=x&logoColor=white"></a>
   </p>
 </p>
 
@@ -26,7 +27,7 @@
 
 <p align="center">
   <a href="#quick-start"><img alt="Quick Start — under 2 minutes" src="https://img.shields.io/badge/%E2%9A%A1%20Quick%20Start%20%E2%80%94%20%3C%202%20min-2EA44F?style=for-the-badge&logo=docker&logoColor=white"></a>
-  <a href="https://atlasinference.io"><img alt="atlasinference.io" src="https://img.shields.io/badge/%F0%9F%8C%90%20atlasinference.io-F48C06?style=for-the-badge"></a>
+  <a href="https://atlasinference.dev"><img alt="atlasinference.dev" src="https://img.shields.io/badge/%F0%9F%8C%90%20atlasinference.dev-F48C06?style=for-the-badge"></a>
 </p>
 
 ---
@@ -339,7 +340,7 @@ The whole supported model matrix lives in one Docker image. Pull it, mount your 
 Omit the model ID and `serve` boots into the Library — pick a model and recipe interactively (TTY only):
 
 ```bash
-docker run -it --rm --network host --gpus all --ipc=host -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" -v "${HOME}/.atlas:/root/.atlas" avarok/atlas-gb10:latest serve
+docker run -it --rm --network host --gpus all --ipc=host -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" -v "${HOME}/.atlas:/root/.atlas" azeezish/atlas-gb10:latest serve
 ```
 
 - `-it` — the TUI needs a real terminal to render (and Esc to quit).
@@ -357,12 +358,12 @@ docker run -it --rm --network host --gpus all --ipc=host -v "${HOME}/.cache/hugg
 The default daily driver — 35 B params, 3 B active, GDN + attention + 256-expert MoE, MRoPE-positioned vision tower (text-only here).
 
 ```bash
-docker pull avarok/atlas-gb10:latest
+docker pull azeezish/atlas-gb10:latest
 
 sudo docker run -d --name atlas \
   --network host --gpus all --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  avarok/atlas-gb10:latest \
+  azeezish/atlas-gb10:latest \
   serve Qwen/Qwen3.6-35B-A3B-FP8 \
     --port 8888 \
     --max-seq-len 65536 \
@@ -393,7 +394,7 @@ The fastest model in the matrix on a single Spark.
 sudo docker run -d --name atlas \
   --network host --gpus all --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  avarok/atlas-gb10:latest \
+  azeezish/atlas-gb10:latest \
   serve Sehyo/Qwen3.5-35B-A3B-NVFP4 \
     --port 8888 \
     --max-seq-len 65536 \
@@ -416,7 +417,7 @@ The 122B NVFP4 weights + Atlas runtime overhead leave only ~2 GB for KV cache on
 sudo docker run -d --name atlas \
   --network host --gpus all --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  avarok/atlas-gb10:latest \
+  azeezish/atlas-gb10:latest \
   serve Sehyo/Qwen3.5-122B-A10B-NVFP4 \
     --port 8888 \
     --max-seq-len 16384 \
@@ -545,3 +546,7 @@ Atlas operates under a **dual-license** model. Both are real, both are intention
 2. **Enterprise Edition — commercial license.** If you need to ship Atlas inside a closed-source product, run it as a SaaS backend without inheriting the AGPLv3 source-disclosure obligation, or simply want a support relationship with the people who wrote the kernels, contact sales. Enterprise customers also receive prioritized model and hardware ports.
 
 This split exists for a single reason: a permissive license keeps us building Atlas full-time, and the AGPL community license keeps the project honest. What is in this repository is what we run.
+
+---
+
+<sub><b>Continuity notice.</b> Atlas is continuing. This repository, the <a href="https://github.com/Atlas-Inf">Atlas-Inf</a> GitHub organization, and <a href="https://atlasinference.dev">atlasinference.dev</a> are the replacement official Atlas channels. The existing website and GitHub repository remain disputed Atlas assets that have not been relinquished.</sub>

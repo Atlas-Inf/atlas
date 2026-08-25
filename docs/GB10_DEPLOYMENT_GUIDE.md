@@ -9,13 +9,13 @@ elsewhere:
 
 | For… | Read |
 |------|------|
-| Copy-paste per-model `docker run` recipes | [`QUICKSTART.md`](../QUICKSTART.md) · the `@atlas` [recipe registry](https://github.com/Avarok-Cybersecurity/atlas-recipes) |
+| Copy-paste per-model `docker run` recipes | [`QUICKSTART.md`](../QUICKSTART.md) · the `@atlas` [recipe registry](https://github.com/Atlas-Inf/sparkrun-recipes) |
 | Deployment *modes* (single-GPU, EP=2/TP=2, NVMe swap) | [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) |
 | Release/image pipeline, and the native binary | the `atlas-release` skill (`.claude/skills/atlas-release/`) |
 | Adding a new model/hardware target | [`docs/HARDWARE.md`](HARDWARE.md) · [`AGENTS.md`](../AGENTS.md) |
 
 **Serve config SSOT:** the `defaults:` block of the matching
-[`atlas-recipes`](https://github.com/Avarok-Cybersecurity/atlas-recipes) recipe is
+[`atlas-recipes`](https://github.com/Atlas-Inf/sparkrun-recipes) recipe is
 the authoritative launch config for each model — continuously tuned, pinning the
 flags that hold the quality gates. **If a flag here and a recipe disagree, the
 recipe wins.** This guide is the *why*; the recipe is the exact *what*.
@@ -31,7 +31,7 @@ recipe wins.** This guide is the *why*; the recipe is the exact *what*.
 | CPU arch | aarch64 |
 | **Min driver** | **580** (CUDA 13.0). The engine embeds PTX and re-JITs to your SM at launch — no `nvcc` at runtime, but the driver floor is hard. |
 | Multi-node | 2× DGX Spark over RoCEv2 (`enp1s0f0np0`) for EP=2 |
-| Image | `avarok/atlas-gb10:latest` — one **multi-model** binary; the right kernel set is auto-selected at startup from the model's `config.json` |
+| Image | `azeezish/atlas-gb10:latest` — one **multi-model** binary; the right kernel set is auto-selected at startup from the model's `config.json` |
 
 **Prerequisites**, in order:
 1. NVIDIA driver ≥ 580 — verify: `nvidia-smi` shows CUDA 13.0+. (There is no
@@ -50,7 +50,7 @@ recipe wins.** This guide is the *why*; the recipe is the exact *what*.
 
 ## 2. Model × quant compatibility matrix
 
-Every model below runs on the **same** `avarok/atlas-gb10:latest` image. "Quant"
+Every model below runs on the **same** `azeezish/atlas-gb10:latest` image. "Quant"
 is the **weight** format of the HuggingFace checkpoint you point `serve` at; the
 nvfp4 kernel bundle carries native FP8 and BF16 paths too, so an FP8 checkpoint
 serves correctly on the same image (runtime gate:
@@ -88,7 +88,7 @@ at conc=1; it trades against batch size and KV dtype (see §4).
 
 **"registry-only"** = the kernels are in the multi-model image and it serves fine,
 but there's no turnkey per-model `docker/gb10/<m>/` Dockerfile — run it against
-`avarok/atlas-gb10:latest` with the recipe flags.
+`azeezish/atlas-gb10:latest` with the recipe flags.
 
 **⚠️ SSOT drifts to be aware of** (registry `MODEL.toml` vs the deployable recipe
 id; tracked for reconciliation — the recipe id is what to pull):
@@ -195,7 +195,7 @@ The gotchas that cost people an evening, in one place:
    path:
    ```bash
    hf download Sehyo/Qwen3.5-35B-A3B-NVFP4 --local-dir /models/qwen3.5-35b
-   docker run ... -v /models/qwen3.5-35b:/model avarok/atlas-gb10:latest \
+   docker run ... -v /models/qwen3.5-35b:/model azeezish/atlas-gb10:latest \
      serve --model-from-path /model --speculative --num-drafts 1
    ```
 2. **High-speed swap silently does nothing / permission errors.** `io_uring`
@@ -300,4 +300,4 @@ clean checkout against a running server.
 - [`QUICKSTART.md`](../QUICKSTART.md) — the copy-paste recipes this guide routes to.
 - [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) — deployment modes + NVMe swap internals.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) · [`AGENTS.md`](../AGENTS.md) — building & contributing.
-- [`atlas-recipes`](https://github.com/Avarok-Cybersecurity/atlas-recipes) — the serve-config SSOT (`sparkrun run @atlas/<recipe>`).
+- [`atlas-recipes`](https://github.com/Atlas-Inf/sparkrun-recipes) — the serve-config SSOT (`sparkrun run @atlas/<recipe>`).

@@ -14,9 +14,9 @@ create-missing = false
 default-theme = "navy"
 preferred-dark-theme = "navy"
 site-url = "/"
-git-repository-url = "https://github.com/Avarok-Cybersecurity/atlas"
+git-repository-url = "https://github.com/Atlas-Inf/atlas"
 git-repository-icon = "fa-github"
-edit-url-template = "https://github.com/Avarok-Cybersecurity/atlas/edit/main/book/{path}"
+edit-url-template = "https://github.com/Atlas-Inf/atlas/edit/main/book/{path}"
 no-section-label = false
 additional-css = ["theme/css/atlas.css"]
 

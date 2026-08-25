@@ -105,7 +105,7 @@ targeting NVIDIA GB10 (DGX Spark, SM121) with twelve hand-tuned
   Qwen3.6 / Qwen3-Next / Qwen3-VL / Gemma-4 / Mistral-Small-4 /
   MiniMax-M2.7 / Nemotron-H families.
 - mdBook documentation at `book/src/`, rustdoc at `target/doc/`,
-  Docker image `avarok/atlas-gb10:latest`.
+  Docker image `azeezish/atlas-gb10:latest`.
 
 ### Engineering notes
 
@@ -115,5 +115,5 @@ multi-stage scheduler refactor — see
 [`docs/ATLAS_SPARK_JOURNEY.md`](docs/ATLAS_SPARK_JOURNEY.md) and the
 [`book/`](book/) chapters under `deep-dives/`.
 
-[Unreleased]: https://github.com/Avarok-Cybersecurity/atlas/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Avarok-Cybersecurity/atlas/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Atlas-Inf/atlas/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Atlas-Inf/atlas/releases/tag/v0.1.0

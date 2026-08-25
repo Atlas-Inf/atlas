@@ -57,7 +57,7 @@ Curated references that informed Atlas's design. Not exhaustive — just the pap
 
 ## Atlas-internal references
 
-Inside the repo, the canonical long-form references are the architecture decision records in [`docs/adr/`](https://github.com/Avarok-Cybersecurity/atlas/tree/main/docs/adr), plus the top-level notes alongside them. Notable:
+Inside the repo, the canonical long-form references are the architecture decision records in [`docs/adr/`](https://github.com/Atlas-Inf/atlas/tree/main/docs/adr), plus the top-level notes alongside them. Notable:
 
 - `docs/adr/0004-nvfp4-fp8-quantization.md` — NVFP4/FP8 quantization, including why `--kv-high-precision-layers` exists.
 - `docs/adr/0003-hybrid-ssm-attention.md` — hybrid SSM/attention design and chunked SSM prefill.

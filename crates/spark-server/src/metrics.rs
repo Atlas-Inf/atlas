@@ -101,7 +101,7 @@ lazy_static! {
 /// on disconnect, so no `dec()` in the body ever runs) — pinned the gauge
 /// forever. Orphans then accumulate monotonically and can exhaust the scheduler's
 /// admission accounting while `/health` still reports ready.
-/// See Avarok-Cybersecurity/atlas#368.
+/// See Atlas-Inf/atlas#368.
 ///
 /// For streaming the guard is moved into `StreamCtx`, which the SSE `flat_map`
 /// closure owns — so it also drops when the client hangs up mid-stream.

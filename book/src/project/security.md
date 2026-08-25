@@ -1,12 +1,12 @@
 # Security Policy
 
-Canonical: [`SECURITY.md`](https://github.com/Avarok-Cybersecurity/atlas/blob/main/SECURITY.md). This chapter summarises the policy and the threat model.
+Canonical: [`SECURITY.md`](https://github.com/Atlas-Inf/atlas/blob/main/SECURITY.md). This chapter summarises the policy and the threat model.
 
 ## Reporting a vulnerability
 
 **Do not open a public issue for security vulnerabilities.**
 
-Email **security@avarok.net** with:
+Email **debaterishaqui@gmail.com** with:
 
 1. **Description** — what the vulnerability is and its potential impact.
 2. **Reproduction steps** — minimal.
@@ -96,4 +96,4 @@ Some things are *not* a security concern under this policy — they're bugs, but
 
 ## If you found something
 
-Email security@avarok.net. Include what you need, keep the repro minimal, and do not exploit the vulnerability against production deployments you do not own. The team has fixed every credibly-reported issue within the 7-day initial-assessment window; known-good practice gets a prompt response.
+Email debaterishaqui@gmail.com. Include what you need, keep the repro minimal, and do not exploit the vulnerability against production deployments you do not own. The team has fixed every credibly-reported issue within the 7-day initial-assessment window; known-good practice gets a prompt response.

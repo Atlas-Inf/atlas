@@ -4,7 +4,7 @@
 
 ## 1. What changed (all folded, pushed, gated)
 
-Branch `perf/decode-fold-2026-07-24` == `feat/tree-spec-decode` == **`1dcf2755`** on `avarok`
+Branch `perf/decode-fold-2026-07-24` == `feat/tree-spec-decode` == **`1dcf2755`** on `origin`
 (fast-forward of `origin/main 011bee65` + this work — no rebase, no force-push).
 
 | # | change | file(s) | why it matters |
@@ -72,7 +72,7 @@ the baseline and vLLM. Perf-phase duration 4104.0 s; BFCL-phase duration 4781.5 
 
 ```bash
 # 1. code
-git fetch avarok && git checkout 1dcf2755        # perf/decode-fold-2026-07-24
+git fetch origin && git checkout 1dcf2755        # perf/decode-fold-2026-07-24
 
 # 2. build (the ATLAS_TARGET_MODEL is load-bearing — without it you get a wrong binary)
 PATH=/usr/local/cuda/bin:$PATH ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=qwen3.6-27b \

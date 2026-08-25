@@ -1,7 +1,7 @@
 recipe_version: "2"
 model: Kbenkhaled/Qwen3.5-27B-NVFP4
 runtime: atlas
-container: avarok/atlas-gb10:latest
+container: azeezish/atlas-gb10:latest
 max_nodes: 1
 
 metadata:
@@ -17,7 +17,7 @@ metadata:
     repetition detector in the scheduler catches it and ends generation
     cleanly. If you see `finish_reason: "length"` at low token counts on
     a repetitive output, that's the watchdog firing.
-  maintainer: avarok
+  maintainer: atlas-inf
   category: agent
   model_params: 27B
   model_dtype: nvfp4

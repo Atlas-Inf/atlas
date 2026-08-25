@@ -81,7 +81,7 @@
       Atlas is open source under the AGPL-3.0 and ships hardware- and model-specific kernels behind
       swappable backend traits — the property that makes a WebGPU backend a port rather than a
       rewrite. Read the engine at
-      <a href={LINKS.atlasRepo} rel="noopener noreferrer">github.com/Avarok-Cybersecurity/atlas</a>.
+      <a href={LINKS.atlasRepo} rel="noopener noreferrer">github.com/Atlas-Inf/atlas</a>.
     </p>
   </div>
 </section>

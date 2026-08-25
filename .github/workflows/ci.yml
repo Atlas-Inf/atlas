@@ -340,7 +340,7 @@ jobs:
           REPO_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          API='https://api.github.com/repos/Avarok-Cybersecurity/atlas-recipes/git/trees/main?recursive=1'
+          API='https://api.github.com/repos/Atlas-Inf/sparkrun-recipes/git/trees/main?recursive=1'
           out=$(mktemp)
           fetch() {  # extra curl args; body on stdout iff the answer was 200
             local code
@@ -505,7 +505,7 @@ jobs:
             Changed paths (${{ steps.diff.outputs.count }} total, sorted):
             ${{ steps.diff.outputs.paths }}
 
-            Serve recipes available in Avarok-Cybersecurity/atlas-recipes
+            Serve recipes available in Atlas-Inf/sparkrun-recipes
             (${{ steps.recipes.outputs.count }}):
             ${{ steps.recipes.outputs.names }}
           taxonomy: .github/pr-taxonomy.json

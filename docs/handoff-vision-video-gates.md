@@ -6,9 +6,9 @@ Written 2026-08-14, updated 2026-08-15 (ordering fix landed; a new video bug on 
 
 | | |
 |---|---|
-| Branch | `feat/video-support`, pushed to `avarok` |
+| Branch | `feat/video-support`, pushed to `origin` |
 | PR | #516, **draft**, based on `feat/qwen3.8-27b-support` (#513) |
-| Base sync | merged `avarok/feat/qwen3.8-27b-support` at 2026-08-14; **0 behind** as of the last push |
+| Base sync | merged `origin/feat/qwen3.8-27b-support` at 2026-08-14; **0 behind** as of the last push |
 | Workspace | 4026 tests pass, clippy 0, fmt clean, typos clean |
 
 Retarget #516 to `main` once #513 lands.
@@ -118,7 +118,7 @@ Two things to know before producing more:
     --serve-override video_allow_ffmpeg=true
   ```
 
-* **`video-fidelity` needs that `--serve-override`.** No serve recipe enables ffmpeg, so the gate's own server refuses every MP4, the run ends Failed and **no record is written at all**. The override is recorded in the record's provenance, which is honest but means these records do not measure the recipe as pinned. The real fix is `video_allow_ffmpeg: true` in the three vision recipes upstream in `Avarok-Cybersecurity/atlas-recipes` — that is a different repo, so it was not done here.
+* **`video-fidelity` needs that `--serve-override`.** No serve recipe enables ffmpeg, so the gate's own server refuses every MP4, the run ends Failed and **no record is written at all**. The override is recorded in the record's provenance, which is honest but means these records do not measure the recipe as pinned. The real fix is `video_allow_ffmpeg: true` in the three vision recipes upstream in `Atlas-Inf/sparkrun-recipes` — that is a different repo, so it was not done here.
 * The qwen3.8 recipe was missing from the local recipe index (`~/.atlas/atlas-recipes/index.json`, 26 cached vs 28 upstream) and a refresh is only reachable through the interactive TUI Library. Rebuilt by hand from the tree sha; a backup of the old index is not in the repo.
 * Checkpoints on the NFS mount need `HF_HUB_CACHE=/mnt/gx10-hf-hub` — the gate self-serve resolves by HF id, not by path, and qwen3.8-27b is not in `~/.cache`.
 

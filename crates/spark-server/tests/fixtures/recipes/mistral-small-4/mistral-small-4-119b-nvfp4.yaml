@@ -1,7 +1,7 @@
 recipe_version: "2"
 model: mistralai/Mistral-Small-4-119B-2603-NVFP4
 runtime: atlas
-container: avarok/atlas-gb10:latest
+container: azeezish/atlas-gb10:latest
 max_nodes: 1
 
 metadata:
@@ -23,7 +23,7 @@ metadata:
 
     Known limitation: symbolic math ("2+2") less reliable than word
     math ("two plus two") — model quirk.
-  maintainer: avarok
+  maintainer: atlas-inf
   category: agent
   model_params: 119B
   model_dtype: nvfp4

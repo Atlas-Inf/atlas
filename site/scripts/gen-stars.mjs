@@ -2,7 +2,7 @@
 // =============================================================================
 // gen-stars.mjs — generate src/lib/stars.generated.json from the GitHub API
 // -----------------------------------------------------------------------------
-// SSOT: the live GitHub star count + star history for Avarok-Cybersecurity/atlas
+// SSOT: the live GitHub star count + star history for Atlas-Inf/atlas
 //   fetched via the `gh` CLI (uses ambient auth — GH_TOKEN in CI, the logged-in
 //   user locally). This script is BEST-EFFORT: it MUST NEVER fail the build.
 //   On any error it re-emits the existing generated file unchanged, or writes a
@@ -25,8 +25,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(here, '..', '..');
 const OUT = resolve(here, '..', 'src', 'lib', 'stars.generated.json');
 
-const REPO = 'Avarok-Cybersecurity/atlas';
-const URL = 'https://github.com/Avarok-Cybersecurity/atlas';
+const REPO = 'Atlas-Inf/atlas';
+const URL = 'https://github.com/Atlas-Inf/atlas';
 const FALLBACK_COUNT = 546;
 
 function gh(args) {
@@ -127,6 +127,27 @@ try {
   const count = parseInt(gh(['api', `repos/${REPO}`, '--jq', '.stargazers_count']), 10);
   if (!Number.isFinite(count)) throw new Error('non-numeric star count');
   const generatedDate = git(['log', '-1', '--format=%cs']);
+
+  // A private repo — or one freshly migrated — reports stargazers_count 0 and
+  // rejects the stargazers endpoint outright. That is ABSENCE of data, not a
+  // measurement of zero. Writing it through would clobber the accumulated
+  // curve and redraw it falling off a cliff to a "0 star" terminal label.
+  // Keep the committed figure and curve until a real count comes back.
+  if (count === 0 && existsSync(OUT)) {
+    try {
+      const prev = JSON.parse(readFileSync(OUT, 'utf8'));
+      if (Array.isArray(prev.history) && prev.history.length > 0) {
+        writeFileSync(OUT, JSON.stringify({ ...prev, url: URL }, null, 2) + '\n');
+        console.log(
+          `gen-stars: live count is 0 (private or fresh repo) — preserving ` +
+            `${prev.history.length} committed points at count=${prev.count}`
+        );
+        process.exit(0);
+      }
+    } catch {
+      /* unreadable committed file — fall through to the normal path */
+    }
+  }
 
   let history = [];
   try {

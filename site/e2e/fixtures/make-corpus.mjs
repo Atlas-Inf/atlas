@@ -20,7 +20,7 @@ import { embedText } from './embed.mjs';
 
 const OUT_DIR = dirname(fileURLToPath(import.meta.url));
 const DIM = 8;
-const REPO = 'Avarok-Cybersecurity/atlas';
+const REPO = 'Atlas-Inf/atlas';
 const COMMIT = 'a3f9c1e7b2d84056917e2c3a4b5d6f7089abcde1';
 const GENERATED_AT = '2026-08-16T00:00:00Z';
 const MODEL = 'nvidia/llama-nemotron-embed-vl-1b-v2:free';

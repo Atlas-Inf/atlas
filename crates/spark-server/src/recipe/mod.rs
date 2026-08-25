@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Serving recipes from `Avarok-Cybersecurity/atlas-recipes`.
+//! Serving recipes from `Atlas-Inf/sparkrun-recipes`.
 //!
 //! A recipe is a validated `spark serve` configuration for one checkpoint: the
 //! model id, the flags, and the measured rationale for them. This module reads

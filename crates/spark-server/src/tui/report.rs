@@ -28,7 +28,7 @@ use std::time::Duration;
 /// `ATLAS_REPORT_CLIENT_ID` / `ATLAS_REPORT_REPO` rather than shipping issues
 /// into the upstream tracker.
 pub const OFFICIAL_CLIENT_ID: &str = "Iv23liAv6nlb4RaYaJSp";
-pub const OFFICIAL_REPO: &str = "Avarok-Cybersecurity/atlas";
+pub const OFFICIAL_REPO: &str = "Atlas-Inf/atlas";
 
 /// Hidden marker a repo Action keys the `tui-report` label on. The API
 /// silently DROPS `labels` sent by users without push access, so the app

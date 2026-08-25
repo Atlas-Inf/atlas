@@ -7,7 +7,7 @@
 import gates from '$lib/gates.generated.json';
 
 export const gateData = gates;
-export const GH_COMMIT = 'https://github.com/Avarok-Cybersecurity/atlas/commit/';
+export const GH_COMMIT = 'https://github.com/Atlas-Inf/atlas/commit/';
 
 // Series color follows the MODEL (the entity), never the tab or verdict.
 // Pair validated for CVD + contrast on the paper surfaces (#f4f0e8/#fbf9f3):

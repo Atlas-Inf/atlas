@@ -5,9 +5,9 @@
 
 // --- corpus (published by the AutoRepoRAG workflow to gh-pages) --------------
 export const CORPUS_GZ_URL =
-  'https://avarok-cybersecurity.github.io/atlas/coderag/atlas-coderag.jsonl.gz';
+  'https://atlas-inf.github.io/atlas/coderag/atlas-coderag.jsonl.gz';
 export const CORPUS_META_URL =
-  'https://avarok-cybersecurity.github.io/atlas/coderag/atlas-coderag.jsonl.meta.json';
+  'https://atlas-inf.github.io/atlas/coderag/atlas-coderag.jsonl.meta.json';
 
 // --- OpenRouter --------------------------------------------------------------
 export const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1';
@@ -17,7 +17,7 @@ export const RERANK_MODEL = 'nvidia/llama-nemotron-rerank-vl-1b-v2:free';
 export const CHAT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
 // Attribution headers OpenRouter asks apps to send.
 export const APP_TITLE = 'Atlas Ask the Codebase';
-export const SITE_ORIGIN = 'https://atlasinference.io';
+export const SITE_ORIGIN = 'https://atlasinference.dev';
 // Retry policy for the shared free-tier capacity (ResourceExhausted bursts).
 export const OR_MAX_ATTEMPTS = 3;
 export const OR_RETRY_BASE_MS = 700;

@@ -16,7 +16,7 @@
 
 <svelte:head>
   <title>Atlas, pure Rust inference for DGX Spark</title>
-  <link rel="canonical" href="https://atlasinference.io/" />
+  <link rel="canonical" href="https://atlasinference.dev/" />
   {@html `<script type="application/ld+json">${JSON.stringify({
     '@context': 'https://schema.org',
     '@type': 'SoftwareApplication',
@@ -24,7 +24,7 @@
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Linux',
     description: tagline,
-    url: 'https://atlasinference.io/',
+    url: 'https://atlasinference.dev/',
     license: 'https://spdx.org/licenses/AGPL-3.0-only.html',
     sameAs: [githubUrl, recipesUrl, discordUrl, xUrl]
   })}<\/script>`}

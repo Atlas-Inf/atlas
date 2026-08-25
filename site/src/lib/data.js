@@ -12,32 +12,32 @@
 // =============================================================================
 
 // --- canonical links ---------------------------------------------------------
-export const githubUrl = 'https://github.com/Avarok-Cybersecurity/atlas';
-export const discordUrl = 'https://discord.gg/RQcGakU2jW';
-export const xUrl = 'https://x.com/AtlasInferenceX';
-export const xHandle = '@AtlasInferenceX';
+export const githubUrl = 'https://github.com/Atlas-Inf/atlas';
+export const discordUrl = 'https://discord.com/invite/6vDbKaKrKD';
+export const xUrl = 'https://x.com/AtlasInference';
+export const xHandle = '@AtlasInference';
 export const redditUrl = 'https://www.reddit.com/r/LocalLLaMA/comments/1rmvxo3/';
 export const firstPostUrl =
   'https://www.reddit.com/r/LocalLLaMA/comments/1rkefjw/solved_the_dgx_spark_102_stable_toks_qwen3535ba3b/';
-export const recipesUrl = 'https://github.com/Avarok-Cybersecurity/atlas-recipes';
+export const recipesUrl = 'https://github.com/Atlas-Inf/sparkrun-recipes';
 export const guideUrl =
-  'https://github.com/Avarok-Cybersecurity/atlas/blob/main/docs/GB10_DEPLOYMENT_GUIDE.md';
+  'https://github.com/Atlas-Inf/atlas/blob/main/docs/GB10_DEPLOYMENT_GUIDE.md';
 export const verifiedAnchor =
-  'https://github.com/Avarok-Cybersecurity/atlas/blob/main/docs/GB10_DEPLOYMENT_GUIDE.md#8-what-verified-means-so-you-can-trust-an-image';
+  'https://github.com/Atlas-Inf/atlas/blob/main/docs/GB10_DEPLOYMENT_GUIDE.md#8-what-verified-means-so-you-can-trust-an-image';
 export const gateSrcUrl =
-  'https://github.com/Avarok-Cybersecurity/atlas/blob/main/tests/gate_results.py';
-export const discussionsUrl = 'https://github.com/Avarok-Cybersecurity/atlas/discussions';
+  'https://github.com/Atlas-Inf/atlas/blob/main/tests/gate_results.py';
+export const discussionsUrl = 'https://github.com/Atlas-Inf/atlas/discussions';
 export const goodFirstIssuesUrl =
-  'https://github.com/Avarok-Cybersecurity/atlas/labels/good%20first%20issue';
+  'https://github.com/Atlas-Inf/atlas/labels/good%20first%20issue';
 // Single source of truth for contact addresses (footer + reach-out section).
-export const contactEmails = ['thomas@atlasinference.io'];
+export const contactEmails = ['debaterishaqui@gmail.com'];
 
 // third-party artifacts (link-or-cut, each verified live July 2026)
 export const transformersPrUrl = 'https://github.com/huggingface/transformers/pull/46423';
 export const hubKernelUrl = 'https://huggingface.co/kernels/Atlas-Inference/gdn';
 export const scaleUrl = 'https://docs.scale-lang.com/stable/';
 export const qwenAmbassadorUrl = 'https://qwen.ai/ambassador';
-export const strixPrUrl = 'https://github.com/Avarok-Cybersecurity/atlas/pull/187';
+export const strixPrUrl = 'https://github.com/Atlas-Inf/atlas/pull/187';
 export const mlperfResultsUrl = 'https://mlcommons.org/benchmarks/inference-datacenter/';
 export const mlcommonsEndpointsPrUrl = 'https://github.com/mlcommons/endpoints/pull/346';
 export const mlcommonsArticleUrl =
@@ -50,7 +50,7 @@ export const tagline = 'Pure Rust inference, tuned for the machine on your desk.
 // --- commands (one flagship recipe, kept in lockstep with static/quickstart.sh)
 export const flagshipRecipe = 'qwen3.6-35b-a3b-fp8-mtp';
 export const quickInstall = 'uvx sparkrun setup install';
-export const runCommand = 'curl -fsSL https://atlasinference.io/quickstart.sh | sh';
+export const runCommand = 'curl -fsSL https://atlasinference.dev/quickstart.sh | sh';
 export const runCommandRaw =
   'uvx sparkrun setup install && sparkrun run @atlas/qwen3.6-35b-a3b-fp8-mtp --hosts localhost';
 
@@ -217,6 +217,12 @@ export const mlcommons = {
   url: mlcommonsArticleUrl
 };
 
+// Continuity notice — rendered small in the footer legal strip.
+export const continuityNotice =
+  'Atlas is continuing. This website and the Atlas-Inf GitHub organization are the ' +
+  'replacement official Atlas channels. The existing website and GitHub repository ' +
+  'remain disputed Atlas assets that have not been relinquished.';
+
 export const mlperfTrademark =
   'The MLPerf name and logo are registered and unregistered trademarks of MLCommons Association in the United States and other countries. All rights reserved. Unauthorized use strictly prohibited. See mlcommons.org for more information.';
 
@@ -371,7 +377,7 @@ export const roadmap = {
       status: 'Tracking',
       body: 'Large MoE NVFP4 ports across EP topologies, DeepSeek and Kimi class, tracked in the open.',
       cta: 'Open issues',
-      url: 'https://github.com/Avarok-Cybersecurity/atlas/issues'
+      url: 'https://github.com/Atlas-Inf/atlas/issues'
     }
   ]
 };

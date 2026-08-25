@@ -52,7 +52,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::Recipe;
 use super::fetch_github::{self, try_refresh};
 
-pub(super) const REPO: &str = "Avarok-Cybersecurity/atlas-recipes";
+pub(super) const REPO: &str = "Atlas-Inf/sparkrun-recipes";
 pub(super) const CACHE: &str = "atlas-recipes";
 pub(super) const INDEX: &str = "index.json";
 /// GitHub rejects a request with no User-Agent.

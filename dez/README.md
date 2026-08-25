@@ -5,7 +5,7 @@
 > **Dez: The free and open-source IDE for the local inference-first paradigm**
 
 This directory holds the public placeholder site for **Dez**, an IDE built on the
-[Atlas Inference Engine](https://github.com/Avarok-Cybersecurity/atlas), WebGPU, Rust and 100%
+[Atlas Inference Engine](https://github.com/Atlas-Inf/atlas), WebGPU, Rust and 100%
 WebAssembly. Models run locally in the browser — no server round-trip, no API key, and neither
 your code nor your weights leave your machine.
 

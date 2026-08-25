@@ -6,10 +6,10 @@ On an NVIDIA GB10 Grace-Blackwell Superchip, Atlas reaches **131 tok/s on Qwen3.
 
 This book is the canonical long-form documentation for Atlas. It complements — rather than replaces — the source-of-truth material already in the repository:
 
-- [`README.md`](https://github.com/Avarok-Cybersecurity/atlas/blob/main/README.md) — headline performance claims, model matrix, porting guides.
-- [`QUICKSTART.md`](https://github.com/Avarok-Cybersecurity/atlas/blob/main/QUICKSTART.md) — Docker recipes for every supported model.
-- [`AGENTS.md`](https://github.com/Avarok-Cybersecurity/atlas/blob/main/AGENTS.md) / [`CONTRIBUTING.md`](https://github.com/Avarok-Cybersecurity/atlas/blob/main/CONTRIBUTING.md) — contributor workflow.
-- [`docs/`](https://github.com/Avarok-Cybersecurity/atlas/tree/main/docs) — design notes, release history, benchmark journeys.
+- [`README.md`](https://github.com/Atlas-Inf/atlas/blob/main/README.md) — headline performance claims, model matrix, porting guides.
+- [`QUICKSTART.md`](https://github.com/Atlas-Inf/atlas/blob/main/QUICKSTART.md) — Docker recipes for every supported model.
+- [`AGENTS.md`](https://github.com/Atlas-Inf/atlas/blob/main/AGENTS.md) / [`CONTRIBUTING.md`](https://github.com/Atlas-Inf/atlas/blob/main/CONTRIBUTING.md) — contributor workflow.
+- [`docs/`](https://github.com/Atlas-Inf/atlas/tree/main/docs) — design notes, release history, benchmark journeys.
 
 ## Who this book is for
 
@@ -27,7 +27,7 @@ Three audiences, one narrative arc:
 
 ## What you get
 
-A single multi-model Docker image (`avarok/atlas-gb10:latest`), an OpenAI-compatible HTTP server, and the machinery to port Atlas to fresh `(H, M_q)` targets. The model matrix spans Qwen3 through Qwen3.6, Qwen3-VL, Gemma-4, Mistral-Small-4, MiniMax-M2.7, Nemotron-3 Nano and Super, and DeepSeek-V4-Flash — covering dense, hybrid SSM/attention, MoE, vision, MLA, and 256-expert routing. The engine ships with MTP speculative decoding, RadixAttention prefix caching with SSM snapshots, FP8 and NVFP4 KV caches, per-batch CUDA graphs, chunked prefill, tool calling in three formats, and RoCEv2-backed expert parallelism for models beyond a single GB10.
+A single multi-model Docker image (`azeezish/atlas-gb10:latest`), an OpenAI-compatible HTTP server, and the machinery to port Atlas to fresh `(H, M_q)` targets. The model matrix spans Qwen3 through Qwen3.6, Qwen3-VL, Gemma-4, Mistral-Small-4, MiniMax-M2.7, Nemotron-3 Nano and Super, and DeepSeek-V4-Flash — covering dense, hybrid SSM/attention, MoE, vision, MLA, and 256-expert routing. The engine ships with MTP speculative decoding, RadixAttention prefix caching with SSM snapshots, FP8 and NVFP4 KV caches, per-batch CUDA graphs, chunked prefill, tool calling in three formats, and RoCEv2-backed expert parallelism for models beyond a single GB10.
 
 ## How to read this book
 

@@ -3,7 +3,7 @@
 **Date**: 2026-06-03 → 2026-06-05 (3-day integration sprint)
 **Node**: DGX Spark (GB10, 121.7 GB unified memory)
 **Checkpoint**: `stepfun-ai/Step-3.7-Flash-NVFP4` (121 GB, 14 safetensors)
-**PR**: [#119](https://github.com/Avarok-Cybersecurity/atlas/pull/119)
+**PR**: [#119](https://github.com/Atlas-Inf/atlas/pull/119)
 **Branch**: `feat/step3p7-flash`
 
 ---

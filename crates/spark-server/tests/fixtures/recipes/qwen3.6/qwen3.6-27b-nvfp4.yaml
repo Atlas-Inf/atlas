@@ -1,7 +1,7 @@
 recipe_version: "2"
 model: nvidia/Qwen3.6-27B-NVFP4
 runtime: atlas
-container: avarok/atlas-gb10:dev
+container: azeezish/atlas-gb10:latest
 max_nodes: 1
 
 metadata:
@@ -45,12 +45,12 @@ metadata:
       85.8 ms, 1.38x end-to-end wall. Those numbers belong to the unsloth
       checkpoint, not this one — see qwen3.6-27b-nvfp4-unsloth.
 
-    REQUIRES avarok/atlas-gb10:dev (>= 2026-07-10T19:18Z), which carries
+    REQUIRES azeezish/atlas-gb10:latest (>= 2026-07-10T19:18Z), which carries
     the SSM snapshot-eviction fix (atlas#287). Before it, deep
     conversations froze the warm-restore anchor and replayed up to 18.6k
     tokens/turn through the GDN layers (TTFT tail to 40 s). :latest lags —
     check the tag date before substituting.
-  maintainer: avarok
+  maintainer: atlas-inf
   category: agent
   model_params: 27B
   model_dtype: nvfp4

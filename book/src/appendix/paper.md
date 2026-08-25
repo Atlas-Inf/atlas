@@ -26,7 +26,7 @@ Both share kernel benchmark numbers, the supported-model matrix, and the archite
 
 ## References
 
-- **Paper source**: [`paper/atlas.tex`](https://github.com/Avarok-Cybersecurity/atlas/blob/main/paper/atlas.tex) (build with `pdflatex`).
+- **Paper source**: [`paper/atlas.tex`](https://github.com/Atlas-Inf/atlas/blob/main/paper/atlas.tex) (build with `pdflatex`).
 - **Citations the paper relies on** (also in the README's Citations section):
   - FlashAttention-2 (ICLR 2024) — tiled online softmax
   - FlashAttention-4 (2025) — software polynomial exp, conditional softmax rescaling

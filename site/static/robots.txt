@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://atlasinference.io/sitemap.xml
+Sitemap: https://atlasinference.dev/sitemap.xml

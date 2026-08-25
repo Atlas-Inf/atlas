@@ -1,5 +1,5 @@
 <script>
-  import { footer, contactEmails, discordUrl, mlperfTrademark, nvidiaInceptionUrl } from '$lib/data.js';
+  import { footer, contactEmails, discordUrl, mlperfTrademark, nvidiaInceptionUrl, continuityNotice } from '$lib/data.js';
 </script>
 
 <footer>
@@ -36,6 +36,7 @@
 
   <div class="footer-legal">
     <div>© Atlas Inference · Pure Rust + CUDA · Community Edition AGPLv3.</div>
+    <div class="tm notice">{continuityNotice}</div>
     <div class="tm">{mlperfTrademark}</div>
   </div>
 </footer>

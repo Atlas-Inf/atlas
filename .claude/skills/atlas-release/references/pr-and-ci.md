@@ -2,11 +2,11 @@
 
 ## Remotes (know which is which)
 ```
-origin      https://github.com/Avarok-Cybersecurity/atlas.git   # the fork we ship (maintainer pushes here)
+origin      https://github.com/Atlas-Inf/atlas.git   # the fork we ship (maintainer pushes here)
 monumental  https://github.com/MonumentalSystems/atlas.git       # upstream
 ```
 Sync direction: **upstream `monumental/main` → fork `origin/main`.** Never the
-reverse without intent. `sparkrun` recipes and `avarok/atlas-gb10` are built from
+reverse without intent. `sparkrun` recipes and `azeezish/atlas-gb10:latest` are built from
 `origin`.
 
 ## `/atlas-release sync-pr` — the loop

@@ -97,7 +97,7 @@ const obj = {
     'boots, stays coherent (greedy determinism, no token leakage, tool ' +
     'reliability), and holds throughput within 10% of its committed baseline.',
   gate_doc:
-    'https://github.com/Avarok-Cybersecurity/atlas/blob/main/docs/GB10_DEPLOYMENT_GUIDE.md#8-what-verified-means-so-you-can-trust-an-image',
+    'https://github.com/Atlas-Inf/atlas/blob/main/docs/GB10_DEPLOYMENT_GUIDE.md#8-what-verified-means-so-you-can-trust-an-image',
   repro_cmd:
     'python3 tests/run_all_models.py && python3 tests/gate_results.py --update-baselines',
   entries

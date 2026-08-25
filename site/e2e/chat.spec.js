@@ -392,7 +392,7 @@ test('mocked round-trip prints prompt, receipt, markdown, and real source links'
   const sources = card.locator('.cm-src');
   await expect(sources).toHaveCount(3);
   const hrefPattern = new RegExp(
-    `^https://github\\.com/Avarok-Cybersecurity/atlas/blob/${COMMIT}/.+#L\\d+-L\\d+$`
+    `^https://github\\.com/Atlas-Inf/atlas/blob/${COMMIT}/.+#L\\d+-L\\d+$`
   );
   for (const src of await sources.all()) {
     expect(await src.getAttribute('href')).toMatch(hrefPattern);

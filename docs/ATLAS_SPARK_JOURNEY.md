@@ -315,7 +315,7 @@ Phase 4: Performance Optimization (3.6 → 99.1 tok/s)
 ```bash
 # Start build container
 sudo docker run -d --name atlas-build --gpus all --ipc=host --entrypoint bash \
-  -v /workspace/atlas:/workspace/atlas avarok/dgx-vllm-nvfp4-kernel:v22 -c "sleep 86400"
+  -v /workspace/atlas:/workspace/atlas azeezish/atlas-gb10:latest -c "sleep 86400"
 sudo docker exec atlas-build bash -c \
   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
 

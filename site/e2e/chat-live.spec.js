@@ -45,7 +45,7 @@ test.describe('@live real corpus', () => {
     // Free-tier models can rate-limit; sources are the part the site controls.
     await expect(card.locator('.cm-src').first()).toBeVisible({ timeout: 120_000 });
     expect(await card.locator('.cm-src').first().getAttribute('href')).toMatch(
-      /^https:\/\/github\.com\/Avarok-Cybersecurity\/atlas\/blob\/[0-9a-f]{40}\/.+#L\d+-L\d+$/
+      /^https:\/\/github\.com\/Atlas-Inf\/atlas\/blob\/[0-9a-f]{40}\/.+#L\d+-L\d+$/
     );
   });
 });

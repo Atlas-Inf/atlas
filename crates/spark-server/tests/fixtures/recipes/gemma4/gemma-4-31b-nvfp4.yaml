@@ -1,7 +1,7 @@
 recipe_version: "2"
 model: nvidia/Gemma-4-31B-IT-NVFP4
 runtime: atlas
-container: avarok/atlas-gb10:latest
+container: azeezish/atlas-gb10:latest
 max_nodes: 1
 
 metadata:
@@ -20,7 +20,7 @@ metadata:
     `repetition_penalty: 1.1` for creative workloads. The native
     Gemma-4 tool-call format (`<|tool_call>call:fn{...}<tool_call|>`)
     is parsed when `tool_call_parser: gemma4` is set.
-  maintainer: avarok
+  maintainer: atlas-inf
   category: agent
   model_params: 31B
   model_dtype: nvfp4

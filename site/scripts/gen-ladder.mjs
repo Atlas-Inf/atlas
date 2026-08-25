@@ -137,7 +137,7 @@ const out = {
   subtitle: manifest.subtitle,
   aggregate: manifest.aggregate,
   results_doc: manifest.results_doc,
-  results_doc_url: `https://github.com/Avarok-Cybersecurity/atlas/blob/main/${manifest.results_doc}`,
+  results_doc_url: `https://github.com/Atlas-Inf/atlas/blob/main/${manifest.results_doc}`,
   workload: manifest.workload,
   box: manifest.box,
   harness_shas: manifest.harness_shas,

@@ -1,5 +1,5 @@
 <script>
-  // Data is SSOT-derived from github.com/Avarok-Cybersecurity/atlas-recipes
+  // Data is SSOT-derived from github.com/Atlas-Inf/sparkrun-recipes
   // via site/scripts/gen-models.mjs -> models.generated.json.
   // 3-level tree: vendor (brand) -> subfamily (recipe dir) -> recipes.
   import vendorsRaw from '$lib/models.generated.json';

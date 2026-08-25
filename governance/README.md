@@ -84,8 +84,8 @@ normally. Configure the App once and the loop is unattended.
 3. **Install App**, scoped to the `atlas` repository only.
 4. Register it with the repository:
    ```bash
-   gh variable set GOVERNANCE_APP_CLIENT_ID --repo Avarok-Cybersecurity/atlas --body '<client id>'
-   gh secret set GOVERNANCE_APP_PRIVATE_KEY --repo Avarok-Cybersecurity/atlas < path/to/key.pem
+   gh variable set GOVERNANCE_APP_CLIENT_ID --repo Atlas-Inf/atlas --body '<client id>'
+   gh secret set GOVERNANCE_APP_PRIVATE_KEY --repo Atlas-Inf/atlas < path/to/key.pem
    ```
 
 `governance-harvest.yml` mints an installation token when

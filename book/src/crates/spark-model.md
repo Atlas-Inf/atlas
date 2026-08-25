@@ -111,7 +111,7 @@ fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoader>>
 }
 ```
 
-This is the **single code site where `model_type` strings are matched**. Everything downstream of `factory::build` holds `Box<dyn Model>` and is model-agnostic. See the top-level repo [Adding a new model](https://github.com/Avarok-Cybersecurity/atlas/blob/main/README.md#adding-a-new-model) guide.
+This is the **single code site where `model_type` strings are matched**. Everything downstream of `factory::build` holds `Box<dyn Model>` and is model-agnostic. See the top-level repo [Adding a new model](https://github.com/Atlas-Inf/atlas/blob/main/README.md#adding-a-new-model) guide.
 
 ## The engine (`engine.rs`)
 

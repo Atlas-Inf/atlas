@@ -15,7 +15,7 @@ docker run -d \
   --name atlas \
   --gpus all --ipc=host -p 8888:8888 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  avarok/atlas-gb10:latest \
+  azeezish/atlas-gb10:latest \
   serve <hf-model-id> \
     --max-seq-len 16384 \
     --max-batch-size 1 \
@@ -106,7 +106,7 @@ docker run -d --gpus all --ipc=host -p 8888:8888 \
   --security-opt seccomp=unconfined --ulimit memlock=-1 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v /mnt/fast-nvme/atlas-kv:/mnt/fast-nvme/atlas-kv \
-  avarok/atlas-gb10:latest \
+  azeezish/atlas-gb10:latest \
   serve <model> \
     --max-seq-len 65536 \
     --high-speed-swap \

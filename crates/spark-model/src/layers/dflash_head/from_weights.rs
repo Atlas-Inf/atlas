@@ -291,7 +291,7 @@ impl BlockDiffusionDraftHead {
         //     v2 2026-04-27 Qwen3.6-DFlash drafter ships `rope_scaling: null`.
         //   * `Some(yarn)` ⇒ YaRN-scaled table (Mistral-Small-4 lineage).
         //
-        // Historical bug (Friday/Avarok 2026-05): this loader unconditionally
+        // Historical bug (2026-05): this loader unconditionally
         // applied YaRN with factor=64 / orig_max_pos=4096 hardcoded, which
         // mis-scaled every low-frequency RoPE pair (pairs 0..11 divided by
         // 64, pairs 11..26 ramped). Result: drafter Q/K rotations landed in

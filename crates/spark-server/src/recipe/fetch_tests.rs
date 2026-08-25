@@ -27,7 +27,7 @@ impl Drop for Dir {
 
 fn a_recipe() -> String {
     "recipe_version: \"2\"\nmodel: Qwen/Qwen3.6-27B\nruntime: atlas\ncontainer: c\n\
-     metadata:\n  description: test\n  maintainer: avarok\ndefaults:\n  port: 8888\n"
+     metadata:\n  description: test\n  maintainer: atlas-inf\ndefaults:\n  port: 8888\n"
         .to_string()
 }
 

@@ -12,7 +12,7 @@ fn recipe(id: &str, model: &str, runtime: &str) -> Recipe {
         container: "c".into(),
         min_nodes: 1,
         description: "d".into(),
-        maintainer: "avarok".into(),
+        maintainer: "atlas-inf".into(),
         category: "agent".into(),
         model_params: "27B".into(),
         quantization: "nvfp4".into(),

@@ -9,7 +9,7 @@ sudo docker run -d \
   --name atlas-35b \
   --network host --gpus all --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  avarok/atlas-gb10:latest \
+  azeezish/atlas-gb10:latest \
   serve Sehyo/Qwen3.5-35B-A3B-NVFP4 \
     --port 8888 \
     --max-seq-len 8192 \
@@ -103,7 +103,7 @@ sudo docker stop atlas-35b && sudo docker rm atlas-35b
 
 - **`error: out of memory`** during start-up — drop `--gpu-memory-utilization` to `0.85`, or `--max-seq-len` to `4096`. 35B has the headroom; it's usually leaked GPU state from a previous container. `nvidia-smi` should show ~0 MB used before starting.
 - **Server logs `loaded 0 tensors`** — your HF cache is empty or the path is wrong. Verify with `ls ~/.cache/huggingface/hub/models--Sehyo--Qwen3.5-35B-A3B-NVFP4`.
-- **Connection refused on port 8888** — the server hasn't finished initialising. Watch the log; `Listening on <bind>:<port>` is the readiness marker. If it *has* printed and you're still refused from another machine, that's the `--bind 127.0.0.1` default, not a start-up problem — see [Quickstart §Network exposure](https://github.com/Avarok-Cybersecurity/atlas/blob/main/QUICKSTART.md#network-exposure).
+- **Connection refused on port 8888** — the server hasn't finished initialising. Watch the log; `Listening on <bind>:<port>` is the readiness marker. If it *has* printed and you're still refused from another machine, that's the `--bind 127.0.0.1` default, not a start-up problem — see [Quickstart §Network exposure](https://github.com/Atlas-Inf/atlas/blob/main/QUICKSTART.md#network-exposure).
 - **Tokens are gibberish** — almost always a model/loader mismatch. Check that the HF model id in the command line matches the cached directory. If the kernel target the binary picked is wrong (unlikely — Atlas logs it on startup), open an issue; Atlas's house rule is *never blame the model, always find the Atlas bug*.
 
 Next: pick a different model from [Supported Models](./models.md), or dive into the [Architecture](../architecture/philosophy.md).

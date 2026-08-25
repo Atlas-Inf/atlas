@@ -4,9 +4,9 @@ Pure Rust + CUDA LLM inference engine, hand-tuned for prosumer AI machines (NVID
 
 ## Links
 
-- Repo: https://github.com/Avarok-Cybersecurity/atlas
+- Repo: https://github.com/Atlas-Inf/atlas
 - MLPerf Edge Agentic benchmark (Atlas Inference named as a contributor): https://mlcommons.org/2026/07/mlperf-inference-v61-edge-agentic/
-- Deployment guide: https://github.com/Avarok-Cybersecurity/atlas/blob/main/docs/GB10_DEPLOYMENT_GUIDE.md
-- Recipes (model SSOT): https://github.com/Avarok-Cybersecurity/atlas-recipes
-- Discord: https://discord.gg/RQcGakU2jW
-- Site: https://atlasinference.io
+- Deployment guide: https://github.com/Atlas-Inf/atlas/blob/main/docs/GB10_DEPLOYMENT_GUIDE.md
+- Recipes (model SSOT): https://github.com/Atlas-Inf/sparkrun-recipes
+- Discord: https://discord.com/invite/6vDbKaKrKD
+- Site: https://atlasinference.dev

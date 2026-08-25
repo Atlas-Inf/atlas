@@ -66,7 +66,7 @@
       <a class="nav-icon-link" href={discordUrl} aria-label="Discord" target="_blank" rel="noopener"><DiscordIcon size={18} /></a>
       <a class="nav-icon-link" href={xUrl} aria-label="X / Twitter" target="_blank" rel="noopener"><XIcon size={16} /></a>
       <a class="nav-star-btn" href={githubUrl} target="_blank" rel="noopener">
-        <GithubIcon size={15} /> Star <span class="nav-star-count">{stars.count}</span>
+        <GithubIcon size={15} /> Star {#if stars.count > 0}<span class="nav-star-count">{stars.count}</span>{/if}
       </a>
       <button
         type="button"
@@ -100,7 +100,7 @@
     {/each}
     <div class="nav-drawer-foot">
       <a class="nav-star-btn" href={githubUrl} target="_blank" rel="noopener" tabindex={open ? 0 : -1}>
-        <GithubIcon size={15} /> Star <span class="nav-star-count">{stars.count}</span>
+        <GithubIcon size={15} /> Star {#if stars.count > 0}<span class="nav-star-count">{stars.count}</span>{/if}
       </a>
       <a class="nav-icon-link" href={discordUrl} aria-label="Discord" target="_blank" rel="noopener" tabindex={open ? 0 : -1}><DiscordIcon size={22} /></a>
       <a class="nav-icon-link" href={xUrl} aria-label="X / Twitter" target="_blank" rel="noopener" tabindex={open ? 0 : -1}><XIcon size={19} /></a>
