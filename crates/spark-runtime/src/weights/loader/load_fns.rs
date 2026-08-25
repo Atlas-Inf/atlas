@@ -18,6 +18,7 @@ pub(super) fn load_sharded(
     oom_reserve_bytes: usize,
     skip_fn: &dyn Fn(&str) -> bool,
     peak_multiplier_override: Option<f64>,
+    deferred: &mut HashMap<String, crate::weights::DeferredTensor>,
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
@@ -95,6 +96,24 @@ pub(super) fn load_sharded(
 
         for name in tensor_names {
             if skip_fn(name) {
+                skipped += 1;
+                continue;
+            }
+            // n-gram TABLES are deferred, not uploaded (see `is_ngram_table`).
+            // The absolute file offset comes from the pointer delta into the
+            // mmap, which is exact and needs no header re-parse.
+            if crate::weights::is_ngram_table(name) {
+                let view = tensors.tensor(name)?;
+                let off = view.data().as_ptr() as usize - mmap.as_ptr() as usize;
+                deferred.insert(
+                    name.to_string(),
+                    crate::weights::DeferredTensor {
+                        path: shard_path.clone(),
+                        offset: off as u64,
+                        shape: view.shape().to_vec(),
+                        dtype: WeightDtype::from_safetensors(view.dtype())?,
+                    },
+                );
                 skipped += 1;
                 continue;
             }

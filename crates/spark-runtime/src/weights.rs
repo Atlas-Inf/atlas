@@ -165,6 +165,29 @@ impl WeightTensor {
 /// All model weights loaded onto the GPU, keyed by HuggingFace name.
 pub struct WeightStore {
     weights: HashMap<String, WeightTensor>,
+    /// Tensors deliberately NOT uploaded, with where they live on disk.
+    ///
+    /// The n-gram embedding tables of the LongCat / Qwen3.8-Flash-Next family
+    /// are 63 GB (LongCat-Lite) to ~102 GB (Flash-Next) of BF16. Uploading
+    /// them through the generic path would exhaust a 121 GB unified box
+    /// before any quantization could run — and on GB10 the fallback is
+    /// `alloc_managed`, i.e. Linux swap, i.e. the documented kernel freeze.
+    /// They are skipped at load and served either by streaming per-table
+    /// quantize-on-load or straight off NVMe by `NgramRowCache`, both of
+    /// which need only this (path, offset) locator.
+    deferred: HashMap<String, DeferredTensor>,
+}
+
+/// Where a skipped tensor lives, so a consumer can read it in place.
+#[derive(Clone, Debug)]
+pub struct DeferredTensor {
+    /// Shard file containing the tensor.
+    pub path: std::path::PathBuf,
+    /// ABSOLUTE byte offset of the tensor's first element in that file
+    /// (safetensors header length + the tensor's `data_offsets[0]`).
+    pub offset: u64,
+    pub shape: Vec<usize>,
+    pub dtype: WeightDtype,
 }
 
 impl WeightStore {
@@ -172,14 +195,38 @@ impl WeightStore {
     pub fn empty() -> Self {
         Self {
             weights: HashMap::new(),
+            deferred: HashMap::new(),
         }
+    }
+
+    /// Record a tensor that was skipped at load, with its on-disk location.
+    pub fn defer(&mut self, name: String, t: DeferredTensor) {
+        self.deferred.insert(name, t);
+    }
+
+    /// Look up a deferred (not-uploaded) tensor's on-disk location.
+    pub fn deferred(&self, name: &str) -> Option<&DeferredTensor> {
+        self.deferred.get(name)
+    }
+
+    /// Every deferred tensor, name-sorted (NUMERIC on a trailing index, so
+    /// `embedders.10` sorts after `embedders.2` — a lexicographic sort here
+    /// silently mis-maps the n-gram tables, which cost a real debugging
+    /// session the first time).
+    pub fn deferred_sorted(&self) -> Vec<(&String, &DeferredTensor)> {
+        let mut v: Vec<_> = self.deferred.iter().collect();
+        v.sort_by_key(|(n, _)| split_trailing_index(n));
+        v
     }
 
     /// Wrap a pre-built map. Used by alternate loaders (e.g.
     /// `fast_weights::FastSafetensorsLoader`, and the RDMA weight loader in
     /// `spark-storage`, which lives in a different crate and so needs this pub).
     pub fn from_map(weights: HashMap<String, WeightTensor>) -> Self {
-        Self { weights }
+        Self {
+            weights,
+            deferred: HashMap::new(),
+        }
     }
 
     /// Get a weight tensor by name. Fails fast if not found.
@@ -306,6 +353,66 @@ impl SafetensorsLoader {
         } else {
             false // Non-expert tensors are always loaded (replicated)
         }
+    }
+}
+
+/// Split a tensor name into (everything but its last numeric path segment,
+/// that segment as a number) so names sort NUMERICALLY on the index.
+/// `embedders.2` must precede `embedders.10`; a plain lexicographic sort puts
+/// `10` first and silently mis-maps every table after the ninth.
+fn split_trailing_index(name: &str) -> (String, u64) {
+    let mut segs: Vec<&str> = name.split('.').collect();
+    for i in (0..segs.len()).rev() {
+        if let Ok(n) = segs[i].parse::<u64>() {
+            segs.remove(i);
+            return (segs.join("."), n);
+        }
+    }
+    (name.to_string(), u64::MAX)
+}
+
+/// Whether a tensor is an n-gram embedding TABLE — the huge
+/// `*.ngram_embeddings.embedders.{i}.weight` blobs (~5.2 GB each on
+/// LongCat-Flash-Lite, 12 of them).
+///
+/// These are deliberately not uploaded with the rest of the checkpoint: they
+/// are served either by streaming per-table quantize-on-load or straight off
+/// NVMe by the row cache, both of which read them in place. The small
+/// `post_projs` are NOT matched — those are ordinary tensors.
+pub fn is_ngram_table(name: &str) -> bool {
+    name.contains("ngram_embeddings.embedders.") && name.ends_with(".weight")
+}
+
+#[cfg(test)]
+mod ngram_defer_tests {
+    use super::*;
+
+    #[test]
+    fn ngram_table_predicate_matches_only_the_big_tables() {
+        assert!(is_ngram_table("model.ngram_embeddings.embedders.0.weight"));
+        assert!(is_ngram_table("model.ngram_embeddings.embedders.11.weight"));
+        // The small projections are ordinary tensors and must still load.
+        assert!(!is_ngram_table("model.ngram_embeddings.post_projs.0.weight"));
+        assert!(!is_ngram_table("model.embed_tokens.weight"));
+        assert!(!is_ngram_table("model.layers.0.mlp.experts.3.gate_proj.weight"));
+    }
+
+    #[test]
+    fn deferred_sorts_numerically_not_lexicographically() {
+        let mut st = WeightStore::empty();
+        for i in [0usize, 2, 10, 11, 9] {
+            st.defer(
+                format!("model.ngram_embeddings.embedders.{i}.weight"),
+                DeferredTensor {
+                    path: std::path::PathBuf::from("x"),
+                    offset: i as u64,
+                    shape: vec![1, 1],
+                    dtype: WeightDtype::BF16,
+                },
+            );
+        }
+        let got: Vec<u64> = st.deferred_sorted().iter().map(|(_, d)| d.offset).collect();
+        assert_eq!(got, vec![0, 2, 9, 10, 11], "table order must be numeric");
     }
 }
 

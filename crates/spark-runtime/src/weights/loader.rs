@@ -116,6 +116,8 @@ impl WeightLoader for SafetensorsLoader {
             }
         }
 
+        // Locations of tensors deliberately NOT uploaded (the n-gram tables).
+        let mut deferred: HashMap<String, crate::weights::DeferredTensor> = HashMap::new();
         let mut weight_map = if use_index {
             load_sharded(
                 model_dir,
@@ -124,6 +126,7 @@ impl WeightLoader for SafetensorsLoader {
                 oom_reserve_bytes,
                 &skip_fn,
                 self.peak_memory_multiplier,
+                &mut deferred,
             )?
         } else if shard_files.len() == 1 {
             load_single(&shard_files[0], gpu, oom_reserve_bytes, &skip_fn)?
@@ -165,9 +168,11 @@ impl WeightLoader for SafetensorsLoader {
             weight_map.extend(extra_weights);
         }
 
-        Ok(WeightStore {
-            weights: weight_map,
-        })
+        let mut store = WeightStore::from_map(weight_map);
+        for (name, d) in deferred {
+            store.defer(name, d);
+        }
+        Ok(store)
     }
 }
 
