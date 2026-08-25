@@ -526,14 +526,34 @@ try {
     #
     # --no-fast-load is no longer required (the Unix-only O_DIRECT loader now warns
     # and falls back instead of hard-erroring); passing it just silences the warning.
-    & $exe serve $ModelDir `
-        --no-fast-load `
-        --model-name $ModelName --host $BindHost --port $Port `
-        --max-seq-len $MaxSeqLen --max-prefill-tokens $MaxPrefill `
-        --gpu-memory-utilization $GpuUtil --kv-cache-dtype bf16 `
-        --max-batch-size 1 --speculative --num-drafts 2 --mtp-quantization bf16 `
-        --mtp-vocab 100000 --disable-tool-grammar true --enable-prefix-caching `
-        --ssm-cache-slots 64 --ssm-checkpoint-interval 16 --disable-thinking
+    # The gfx1151 kernel set is far smaller than gb10's, so a large number of
+    # dispatch sites resolve to a fallback and main's kernel audit refuses to
+    # serve without this flag -- 94 unresolved lookups for qwen3.8-27b here,
+    # against the 92 serve-amd.sh documents for qwen3.6-27b on the same tree
+    # (3.8 reuses 3.6's kernels via kernel_source, so the set is identical).
+    # These fallbacks are PRE-EXISTING and the certified 3.6 Strix submission was
+    # produced under them; serve-amd.sh has passed this since the audit landed.
+    # Windows simply never picked it up, so a source build stopped dead here.
+    # Do not quote a Strix perf number as final without reading the kernel audit.
+    # Built as one array and splatted in a single position. Splatting mid-way
+    # through a backtick-continued native call emits a stray bare '-' argument
+    # and spark rejects the whole command line.
+    $serveArgs = @('serve', $ModelDir)
+    if ($env:ATLAS_NO_KERNEL_FALLBACKS -ne '1') {
+        $serveArgs += '--dangerously-allow-unresolved-kernel-lookups'
+    }
+    $serveArgs += @(
+        '--no-fast-load'
+        '--model-name', $ModelName, '--host', $BindHost, '--port', $Port
+        '--max-seq-len', $MaxSeqLen, '--max-prefill-tokens', $MaxPrefill
+        '--gpu-memory-utilization', $GpuUtil, '--kv-cache-dtype', 'bf16'
+        '--max-batch-size', '1', '--speculative', '--num-drafts', '2'
+        '--mtp-quantization', 'bf16', '--mtp-vocab', '100000'
+        '--disable-tool-grammar', 'true', '--enable-prefix-caching'
+        '--ssm-cache-slots', '64', '--ssm-checkpoint-interval', '16'
+        '--disable-thinking'
+    )
+    & $exe @serveArgs
 }
 
 switch ($Phase) {
