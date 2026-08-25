@@ -352,6 +352,33 @@ function Phase-Build {
         Ok ("staged {0} ({1:N1} MB)" -f $f.Name, ($f.Length / 1MB))
     }
     if (-not $wanted) { Warn "no HIP runtime DLLs found under $hipBin -- serve may bind a stale system copy" }
+
+    # The HIP shim itself (cuda.dll, and its nvcuda.dll copy) is built into
+    # atlas-kernels' OUT_DIR and recorded in ATLAS_HIP_RUNTIME_DIR *for the
+    # release PACKAGING step to bundle*. Nothing puts it beside spark.exe, so a
+    # source build produces an exe that cannot start: it links cuda.lib and
+    # cudarc dlopens nvcuda.dll, and neither is on the loader's search path.
+    # The failure is silent and very hard to read -- the process fail-fasts with
+    # 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) before writing a single byte to
+    # stdout or stderr, and logs no WER entry, so it looks like a corrupt build
+    # rather than a missing DLL. Stage them exactly like the SDK runtime DLLs.
+    $shimOut = Get-ChildItem (Join-Path $RepoRoot 'target\x86_64-pc-windows-msvc\release\build') `
+                   -Directory -Filter 'atlas-kernels-*' -EA SilentlyContinue |
+               ForEach-Object { Join-Path $_.FullName 'out' } |
+               Where-Object { Test-Path (Join-Path $_ 'cuda.dll') } |
+               Sort-Object { (Get-Item (Join-Path $_ 'cuda.dll')).LastWriteTime } -Descending |
+               Select-Object -First 1
+    if ($shimOut) {
+        foreach ($n in @('cuda.dll', 'nvcuda.dll')) {
+            $src = Join-Path $shimOut $n
+            if (Test-Path $src) {
+                Copy-Item $src $ReleaseDir -Force
+                Ok ("staged {0} (HIP shim, {1:N2} MB)" -f $n, ((Get-Item $src).Length / 1MB))
+            } else { Bad "shim $n missing from $shimOut" }
+        }
+    } else {
+        Bad 'no atlas-kernels OUT_DIR contains cuda.dll -- spark.exe will fail-fast at startup'
+    }
     # Remove runtime DLLs from a DIFFERENT SDK version left over by an earlier build.
     Get-ChildItem $ReleaseDir -Filter *.dll -EA SilentlyContinue |
         Where-Object { $_.Name -match '^(amdhip64_\d+|amd_comgr_\d+|hiprtc.*)\.dll$' -and
