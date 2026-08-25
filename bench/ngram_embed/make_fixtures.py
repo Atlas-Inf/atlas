@@ -82,6 +82,17 @@ def main():
     # to keep the index math from being overfit to N=4, K=4.
     cases.append(id_case("synth_n3_k2", NgramDims(64, 24, 3, 3, 2, 2), [5, 9, 2, 31, 17, 0, 63, 8]))
     cases.append(id_case("synth_n2_k1", NgramDims(32, 8, 2, 2, 1, 2), [5, 9, 2, 31, 17, 0, 3, 8]))
+    # A PRIME vocab with K=2. Every other case here uses a power-of-two vocab,
+    # which can hide a modulus bug: with V a power of two, V^d mod T shares
+    # structure across tables that a prime V does not, so a wrong power or a
+    # wrong table modulus is likelier to coincide with the right answer.
+    cases.append(
+        id_case(
+            "synth_prime_vocab_k2",
+            NgramDims(997, 48, 5, 4, 2, 2),
+            [17, 996, 2, 5, 400, 2, 2, 61, 883, 0, 1, 512, 2, 77],
+        )
+    )
 
     fuse_cases = []
     fd = NgramDims(32, 24, 2, 4, 4, 2)
