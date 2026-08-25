@@ -104,17 +104,13 @@ fn shift_right_ignore_eos(ctx: &[u32], n: usize, eos: u32) -> Vec<u32> {
         if tok == eos {
             let end = pos + 1;
             if end - prev > n {
-                for t in prev + n..end {
-                    out[t] = ctx[t - n];
-                }
+                out[prev + n..end].copy_from_slice(&ctx[prev..end - n]);
             }
             prev = end;
         }
     }
     if prev < len && len - prev > n {
-        for t in prev + n..len {
-            out[t] = ctx[t - n];
-        }
+        out[prev + n..len].copy_from_slice(&ctx[prev..len - n]);
     }
     out
 }
@@ -269,7 +265,10 @@ impl NgramEmbedding {
         stream: u64,
     ) -> Result<()> {
         use crate::layers::ops;
-        anyhow::ensure!(seq_len <= self.max_tokens, "ngram embed: seq_len over staging");
+        anyhow::ensure!(
+            seq_len <= self.max_tokens,
+            "ngram embed: seq_len over staging"
+        );
         anyhow::ensure!(seq_len <= ctx_tokens.len(), "ngram embed: seq_len over ctx");
         let h = self.dims.hidden_size;
         let td = self.dims.table_dim();
@@ -321,8 +320,7 @@ impl NgramEmbedding {
             if let NgramTable::Cached(cache) = &mut self.tables[index] {
                 let mut slots = Vec::with_capacity(seq_len);
                 cache.resolve(tail, &mut slots)?;
-                let slot_bytes: Vec<u8> =
-                    slots.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let slot_bytes: Vec<u8> = slots.iter().flat_map(|v| v.to_le_bytes()).collect();
                 gpu.copy_h2d_async(&slot_bytes, self.ids_dev, stream)?;
                 let table = DevicePtr(cache.table_dev_va()?);
                 match cache.scale_dev_va()? {
@@ -443,11 +441,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../bench/ngram_ref/ngram_id_fixtures.json"
         );
-        let fixtures: Vec<Fixture> =
-            serde_json::from_str(&std::fs::read_to_string(path).expect(
-                "run bench/ngram_ref/make_fixtures.py to generate fixtures",
-            ))
-            .unwrap();
+        let fixtures: Vec<Fixture> = serde_json::from_str(
+            &std::fs::read_to_string(path)
+                .expect("run bench/ngram_ref/make_fixtures.py to generate fixtures"),
+        )
+        .unwrap();
         assert!(!fixtures.is_empty());
         for f in fixtures {
             let dims = NgramDims {
@@ -479,15 +477,12 @@ mod tests {
     fn ngram_gpu_matches_golden() {
         let dir = std::env::var("ATLAS_NGRAM_TEST_DATA")
             .expect("set ATLAS_NGRAM_TEST_DATA (see make_gpu_testdata.py)");
-        let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(format!("{dir}/meta.json")).unwrap(),
-        )
-        .unwrap();
-        let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(
-            0,
-            &atlas_kernels::ptx_modules(),
-        )
-        .expect("CUDA backend");
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/meta.json")).unwrap())
+                .unwrap();
+        let gpu =
+            spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+                .expect("CUDA backend");
         let g: &dyn GpuBackend = &gpu;
 
         let toks: Vec<u32> = meta["tokens"]
@@ -523,14 +518,15 @@ mod tests {
         let word = DenseWeight {
             weight: upload(&load(format!("{dir}/word_rows.bin"))),
         };
-        let remap =
-            |ids: &[u64], all: &[u64]| -> Vec<u32> {
-                ids.iter()
-                    .map(|id| all.binary_search(id).unwrap() as u32)
-                    .collect()
-            };
-        let compact_toks =
-            remap(&toks.iter().map(|&t| t as u64).collect::<Vec<_>>(), &word_ids);
+        let remap = |ids: &[u64], all: &[u64]| -> Vec<u32> {
+            ids.iter()
+                .map(|id| all.binary_search(id).unwrap() as u32)
+                .collect()
+        };
+        let compact_toks = remap(
+            &toks.iter().map(|&t| t as u64).collect::<Vec<_>>(),
+            &word_ids,
+        );
 
         // Compacted per-table rows + full projections; the test computes
         // the SAME hash ids the module will and remaps them to the compact
@@ -578,44 +574,77 @@ mod tests {
             g.memset(out, 0, m * hidden * 2).unwrap();
             put_ids(&compact_toks);
             crate::layers::ops::batched_embed(
-                g, ng.batched_embed_k, ng.ids_dev, ng.word.weight,
-                ng.proj_buf, m as u32, hidden as u32, stream,
+                g,
+                ng.batched_embed_k,
+                ng.ids_dev,
+                ng.word.weight,
+                ng.proj_buf,
+                m as u32,
+                hidden as u32,
+                stream,
             )
             .unwrap();
             crate::layers::ops::scaled_add(
-                g, ng.scaled_add_k, out, ng.proj_buf, inv,
-                (m * hidden) as u32, stream,
+                g,
+                ng.scaled_add_k,
+                out,
+                ng.proj_buf,
+                inv,
+                (m * hidden) as u32,
+                stream,
             )
             .unwrap();
             for index in 0..ng.dims.num_tables() {
                 put_ids(&compact_ids[index]);
                 match &tables[index] {
                     NgramTable::Bf16(w) => crate::layers::ops::batched_embed(
-                        g, ng.batched_embed_k, ng.ids_dev, w.weight,
-                        ng.gather_buf, m as u32, td as u32, stream,
+                        g,
+                        ng.batched_embed_k,
+                        ng.ids_dev,
+                        w.weight,
+                        ng.gather_buf,
+                        m as u32,
+                        td as u32,
+                        stream,
                     )
                     .unwrap(),
-                    NgramTable::Fp8(w) => {
-                        crate::layers::ops::batched_embed_fp8(
-                            g, ng.batched_embed_fp8_k, ng.ids_dev, w.weight,
-                            w.row_scale, ng.gather_buf, m as u32, td as u32,
-                            stream,
-                        )
-                        .unwrap()
-                    }
+                    NgramTable::Fp8(w) => crate::layers::ops::batched_embed_fp8(
+                        g,
+                        ng.batched_embed_fp8_k,
+                        ng.ids_dev,
+                        w.weight,
+                        w.row_scale,
+                        ng.gather_buf,
+                        m as u32,
+                        td as u32,
+                        stream,
+                    )
+                    .unwrap(),
                     // The NVMe-backed variant has its own parity test
                     // (`cached_table_matches_resident_table`); this manual
                     // op-sequence harness drives resident tables only.
                     NgramTable::Cached(_) => unreachable!("test builds resident tables"),
                 }
                 crate::layers::ops::dense_gemm_bf16_pipelined(
-                    g, ng.gemm_k, ng.gather_buf, &ng.projs[index],
-                    ng.proj_buf, m as u32, hidden as u32, td as u32, stream,
+                    g,
+                    ng.gemm_k,
+                    ng.gather_buf,
+                    &ng.projs[index],
+                    ng.proj_buf,
+                    m as u32,
+                    hidden as u32,
+                    td as u32,
+                    stream,
                 )
                 .unwrap();
                 crate::layers::ops::scaled_add(
-                    g, ng.scaled_add_k, out, ng.proj_buf, inv,
-                    (m * hidden) as u32, stream,
+                    g,
+                    ng.scaled_add_k,
+                    out,
+                    ng.proj_buf,
+                    inv,
+                    (m * hidden) as u32,
+                    stream,
                 )
                 .unwrap();
             }
@@ -642,10 +671,7 @@ mod tests {
                 let mut ref2 = 0f64;
                 for c in 0..hidden {
                     let i = r * hidden + c;
-                    let bits = u16::from_le_bytes([
-                        got_bf16[i * 2],
-                        got_bf16[i * 2 + 1],
-                    ]);
+                    let bits = u16::from_le_bytes([got_bf16[i * 2], got_bf16[i * 2 + 1]]);
                     let got = f32::from_bits((bits as u32) << 16) as f64;
                     let want = f32::from_le_bytes([
                         golden[i * 4],
@@ -667,9 +693,7 @@ mod tests {
             "BF16 fused embedding diverges from golden: worst row Frobenius \
              rel = {bf16_worst}"
         );
-        println!(
-            "ngram GPU parity (BF16 tables): worst row Frobenius rel = {bf16_worst:.4}"
-        );
+        println!("ngram GPU parity (BF16 tables): worst row Frobenius rel = {bf16_worst:.4}");
 
         // FP8 leg: quantize the compacted tables on the GPU (the
         // quantize-on-load path) and rerun. E4M3 per-row-scaled rounding
@@ -684,8 +708,7 @@ mod tests {
                 let NgramTable::Bf16(w) = t else {
                     panic!("test built BF16 tables")
                 };
-                NgramTable::quantize_bf16(w, table_rows_n[index], td, g, stream)
-                    .unwrap()
+                NgramTable::quantize_bf16(w, table_rows_n[index], td, g, stream).unwrap()
             })
             .collect();
         let fp8_worst = worst_row(&run(&fp8_tables));
@@ -694,9 +717,7 @@ mod tests {
             "FP8-quantized fused embedding diverges from golden: worst row \
              Frobenius rel = {fp8_worst}"
         );
-        println!(
-            "ngram GPU parity (FP8 tables): worst row Frobenius rel = {fp8_worst:.4}"
-        );
+        println!("ngram GPU parity (FP8 tables): worst row Frobenius rel = {fp8_worst:.4}");
     }
 
     /// The NVMe-backed cache must be INVISIBLE: gathering through a bounded
@@ -712,15 +733,12 @@ mod tests {
     fn cached_table_matches_resident_table() {
         let dir = std::env::var("ATLAS_NGRAM_TEST_DATA")
             .expect("set ATLAS_NGRAM_TEST_DATA (see make_gpu_testdata.py)");
-        let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(format!("{dir}/meta.json")).unwrap(),
-        )
-        .unwrap();
-        let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(
-            0,
-            &atlas_kernels::ptx_modules(),
-        )
-        .expect("CUDA backend");
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/meta.json")).unwrap())
+                .unwrap();
+        let gpu =
+            spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+                .expect("CUDA backend");
         let g: &dyn GpuBackend = &gpu;
         let stream = g.default_stream();
 
@@ -737,15 +755,15 @@ mod tests {
         g.copy_h2d_async(&bytes, resident, stream).unwrap();
 
         // Backing file for the cached copy.
-        let tmp = std::env::temp_dir().join(format!("atlas_ngram_cache_{}.bin", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("atlas_ngram_cache_{}.bin", std::process::id()));
         std::fs::write(&tmp, &bytes).unwrap();
 
         // Deliberately fewer slots than rows -> eviction + re-fault.
         let slots = (n_rows / 3).max(4);
-        let mut cache = spark_storage::NgramRowCache::open(
-            &tmp, None, n_rows as u64, row_stride, slots,
-        )
-        .expect("open cache");
+        let mut cache =
+            spark_storage::NgramRowCache::open(&tmp, None, n_rows as u64, row_stride, slots)
+                .expect("open cache");
 
         // Walk every row twice (second pass exercises re-faulting), in
         // BATCHES — a slot is pinned for the batch in flight, so the cache
@@ -778,7 +796,13 @@ mod tests {
             g.copy_h2d_async(&sb, ids_dev, stream).unwrap();
             let dst = out_cache.offset(bi * batch * dim * 2);
             crate::layers::ops::batched_embed(
-                g, embed_k, ids_dev, table, dst, chunk.len() as u32, dim as u32,
+                g,
+                embed_k,
+                ids_dev,
+                table,
+                dst,
+                chunk.len() as u32,
+                dim as u32,
                 stream,
             )
             .unwrap();

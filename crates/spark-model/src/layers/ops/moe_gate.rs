@@ -72,7 +72,6 @@ pub fn moe_topk_softmax(
 /// Kernel: `moe_topk_sigmoid(gate_logits, bias, expert_indices, expert_weights,
 ///          num_experts, top_k, normalize, scaling_factor)`
 /// Grid: (1, 1, 1)  Block: (256, 1, 1)
-#[allow(clippy::too_many_arguments)]
 /// LongCat softmax + e_score_correction_bias router with the zero-expert
 /// fold (single token). `zero_accum` receives the token's summed
 /// zero-expert weight; folded slots are rewritten (expert 0, weight 0).

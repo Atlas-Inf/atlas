@@ -248,18 +248,34 @@ pub(crate) fn quantize_to_nvfp4(
     T_SYNC2.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     let c = N_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-    if c % 512 == 0 {
+    if c.is_multiple_of(512) {
         let ms = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1.0e6;
         tracing::info!(
             "quantize_to_nvfp4 PROFILE after {c} calls (ms total): alloc_max={:.1} launch1={:.1} \
              sync1={:.1} d2h={:.1} alloc_out={:.1} launch2={:.1} sync2={:.1} | sum={:.1} \
              per_call={:.3}ms",
-            ms(&T_ALLOC_MAX), ms(&T_LAUNCH1), ms(&T_SYNC1), ms(&T_D2H),
-            ms(&T_ALLOC_OUT), ms(&T_LAUNCH2), ms(&T_SYNC2),
-            ms(&T_ALLOC_MAX) + ms(&T_LAUNCH1) + ms(&T_SYNC1) + ms(&T_D2H)
-                + ms(&T_ALLOC_OUT) + ms(&T_LAUNCH2) + ms(&T_SYNC2),
-            (ms(&T_ALLOC_MAX) + ms(&T_LAUNCH1) + ms(&T_SYNC1) + ms(&T_D2H)
-                + ms(&T_ALLOC_OUT) + ms(&T_LAUNCH2) + ms(&T_SYNC2)) / c as f64,
+            ms(&T_ALLOC_MAX),
+            ms(&T_LAUNCH1),
+            ms(&T_SYNC1),
+            ms(&T_D2H),
+            ms(&T_ALLOC_OUT),
+            ms(&T_LAUNCH2),
+            ms(&T_SYNC2),
+            ms(&T_ALLOC_MAX)
+                + ms(&T_LAUNCH1)
+                + ms(&T_SYNC1)
+                + ms(&T_D2H)
+                + ms(&T_ALLOC_OUT)
+                + ms(&T_LAUNCH2)
+                + ms(&T_SYNC2),
+            (ms(&T_ALLOC_MAX)
+                + ms(&T_LAUNCH1)
+                + ms(&T_SYNC1)
+                + ms(&T_D2H)
+                + ms(&T_ALLOC_OUT)
+                + ms(&T_LAUNCH2)
+                + ms(&T_SYNC2))
+                / c as f64,
         );
     }
 

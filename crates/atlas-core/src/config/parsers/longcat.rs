@@ -75,7 +75,10 @@ pub(crate) fn parse_longcat_ngram(raw: &Value) -> Result<ModelConfig> {
     let mut config: ModelConfig =
         serde_json::from_value(normalized).context("Failed to parse longcat config.json")?;
 
-    ensure!(config.hidden_size > 0, "longcat hidden_size must be non-zero");
+    ensure!(
+        config.hidden_size > 0,
+        "longcat hidden_size must be non-zero"
+    );
     ensure!(
         config.num_hidden_layers > 0,
         "longcat num_layers must be non-zero"
@@ -244,7 +247,11 @@ mod tests {
     #[test]
     fn non_ngram_longcat_parses() {
         let mut v = lite_config();
-        for k in ["ngram_vocab_size_ratio", "emb_neighbor_num", "emb_split_num"] {
+        for k in [
+            "ngram_vocab_size_ratio",
+            "emb_neighbor_num",
+            "emb_split_num",
+        ] {
             v.as_object_mut().unwrap().remove(k);
         }
         let c = parse_longcat_ngram(&v).unwrap();

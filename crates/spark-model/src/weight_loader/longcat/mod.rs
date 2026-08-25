@@ -39,7 +39,9 @@ use crate::layer::TransformerLayer;
 use crate::layers::qwen3_attention::MlaWeights;
 use crate::layers::vision_encoder::VisionEncoder;
 use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer};
-use crate::mistral_loader::loader_impl::{ctx as mctx, phase_block_diag, phase_per_head, phase_qk_absorbed};
+use crate::mistral_loader::loader_impl::{
+    ctx as mctx, phase_block_diag, phase_per_head, phase_qk_absorbed,
+};
 use crate::weight_loader::ModelWeightLoader;
 use crate::weight_map::{
     AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, MtpWeights, QuantizedWeight, dense,
@@ -242,13 +244,25 @@ impl ModelWeightLoader for LongcatWeightLoader {
                 let mla = MlaWeights {
                     wq_a,
                     wq_a_fp8: None,
-                    wq_a_nvfp4: if disable_nvfp4_mla { None } else { c.wq_a_nvfp4 },
+                    wq_a_nvfp4: if disable_nvfp4_mla {
+                        None
+                    } else {
+                        c.wq_a_nvfp4
+                    },
                     wq_b,
                     wq_b_fp8: None,
-                    wq_b_nvfp4: if disable_nvfp4_mla { None } else { c.wq_b_nvfp4 },
+                    wq_b_nvfp4: if disable_nvfp4_mla {
+                        None
+                    } else {
+                        c.wq_b_nvfp4
+                    },
                     q_a_norm,
                     wkv_a,
-                    wkv_a_nvfp4: if disable_nvfp4_mla { None } else { c.wkv_a_nvfp4 },
+                    wkv_a_nvfp4: if disable_nvfp4_mla {
+                        None
+                    } else {
+                        c.wkv_a_nvfp4
+                    },
                     wkv_b,
                     kv_a_norm,
                     wkv_a_rope: c.wkv_a_rope_dense.expect("set above"),
@@ -256,7 +270,11 @@ impl ModelWeightLoader for LongcatWeightLoader {
                         weight: wkv_a.weight,
                     },
                     wo,
-                    wo_nvfp4: if disable_nvfp4_mla { None } else { Some(o_nvfp4) },
+                    wo_nvfp4: if disable_nvfp4_mla {
+                        None
+                    } else {
+                        Some(o_nvfp4)
+                    },
                     wo_a: null,
                     wo_a_nvfp4: None,
                     wo_b: null,
@@ -306,16 +324,15 @@ impl ModelWeightLoader for LongcatWeightLoader {
                 // ── dense SwiGLU FFN for this sublayer ──
                 let ffn = build_dense_ffn(store, &format!("{lp}.mlps.{s}"), config, gpu)?;
                 let input_norm = dense(store, &format!("{lp}.input_layernorm.{s}.weight"))?;
-                let post_norm =
-                    dense(store, &format!("{lp}.post_attention_layernorm.{s}.weight"))?;
+                let post_norm = dense(store, &format!("{lp}.post_attention_layernorm.{s}.weight"))?;
                 let kv_dtype = layer_kv_dtypes
                     .get(global_idx)
                     .copied()
                     .unwrap_or(KvCacheDtype::Bf16);
 
                 let mut layer = Qwen3AttentionLayer::new_ungated(
-                    input_norm, attn, post_norm, ffn, global_idx, None, None, None, gpu,
-                    kv_dtype, 0, config,
+                    input_norm, attn, post_norm, ffn, global_idx, None, None, None, gpu, kv_dtype,
+                    0, config,
                 )?;
                 layer.set_mla_weights(mla);
                 // Padding widened the head to 256; the scale must remain
@@ -500,13 +517,31 @@ fn build_shortcut_moe(
         let ep = format!("{p}.experts.{e}");
         experts.push(ExpertWeight {
             gate_proj: quantized_any(
-                store, &format!("{ep}.gate_proj"), inter, h, gpu, variant, qctx,
+                store,
+                &format!("{ep}.gate_proj"),
+                inter,
+                h,
+                gpu,
+                variant,
+                qctx,
             )?,
             up_proj: quantized_any(
-                store, &format!("{ep}.up_proj"), inter, h, gpu, variant, qctx,
+                store,
+                &format!("{ep}.up_proj"),
+                inter,
+                h,
+                gpu,
+                variant,
+                qctx,
             )?,
             down_proj: quantized_any(
-                store, &format!("{ep}.down_proj"), h, inter, gpu, variant, qctx,
+                store,
+                &format!("{ep}.down_proj"),
+                h,
+                inter,
+                gpu,
+                variant,
+                qctx,
             )?,
         });
     }

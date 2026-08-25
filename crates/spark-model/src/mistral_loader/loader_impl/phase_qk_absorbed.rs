@@ -469,7 +469,10 @@ mod tests {
             dst.copy_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
         }
 
-        assert_eq!(got, want, "bf16 truncation bytes diverged from the old form");
+        assert_eq!(
+            got, want,
+            "bf16 truncation bytes diverged from the old form"
+        );
     }
 
     /// The BF16 widen is the exact high-half reinterpretation the loader's

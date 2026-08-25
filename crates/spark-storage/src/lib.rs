@@ -143,8 +143,6 @@ pub use expert::{
 };
 #[cfg(feature = "cuda")]
 pub use expert_arena::ExpertArena;
-#[cfg(feature = "cuda")]
-pub use ngram_cache::NgramRowCache;
 pub use expert_pack::{ExpertFileReader, ExpertFileWriter};
 pub use expert_pack::{ExpertIndex, ProjData, ProjView, pack_record, unpack_record};
 #[cfg(feature = "cuda")]
@@ -157,6 +155,8 @@ pub use expert_tier_rdma::RdmaTier;
 pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub use kv_paging::KvPagingBackend;
+#[cfg(feature = "cuda")]
+pub use ngram_cache::NgramRowCache;
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub use rdma_kv_backend::RdmaKvBackend;
 pub use rdma_snapshot::RdmaSnapshotArena;

@@ -343,9 +343,7 @@ impl Qwen3AttentionLayer {
             // as the dense FFN, fold the zero-expert identity contribution,
             // stash into the carry buffer BEFORE the dense FFN overwrites
             // moe_output. Added by the NEXT sublayer.
-            if let (Some(moe_ffn), Some((carry, cap))) =
-                (&self.moe_ffn, self.shortcut_carry_out)
-            {
+            if let (Some(moe_ffn), Some((carry, cap))) = (&self.moe_ffn, self.shortcut_carry_out) {
                 anyhow::ensure!(1 <= cap, "shortcut carry capacity");
                 let moe_out = moe_ffn.forward(normed2, ctx, stream)?;
                 if let crate::layers::FfnComponent::Moe(m) = moe_ffn {

@@ -146,8 +146,8 @@ impl NgramRowCache {
         // arena's 4 KiB stride requirement.
         let bytes = slots * row_stride;
         let blocks = bytes.div_ceil(BLOCK);
-        let arena = ExpertArena::new(1, blocks as u32, BLOCK)
-            .context("NgramRowCache: pinned arena")?;
+        let arena =
+            ExpertArena::new(1, blocks as u32, BLOCK).context("NgramRowCache: pinned arena")?;
         let file = open_direct(path)?;
         let scales = match scale_path {
             Some(sp) => {
@@ -276,16 +276,16 @@ impl NgramRowCache {
         // One block unless the row crosses the boundary (possible whenever the
         // table's base offset is not 4 KiB-aligned, i.e. reading in place from
         // a safetensors shard).
-        let nblocks = if within + self.row_stride > BLOCK { 2 } else { 1 };
-        atlas_tier::pio::read_exact_at(
-            &self.file,
-            self.bounce.blocks(nblocks),
-            block_off,
-        )
-        .with_context(|| format!("NgramRowCache: read row {id}"))?;
+        let nblocks = if within + self.row_stride > BLOCK {
+            2
+        } else {
+            1
+        };
+        atlas_tier::pio::read_exact_at(&self.file, self.bounce.blocks(nblocks), block_off)
+            .with_context(|| format!("NgramRowCache: read row {id}"))?;
         // SAFETY: slot < self.slots and the arena holds slots*row_stride bytes.
         let dst = unsafe {
-            let base = self.arena.slot_host_ptr(0, 0)? as *mut u8;
+            let base = self.arena.slot_host_ptr(0, 0)?;
             std::slice::from_raw_parts_mut(
                 base.add(slot as usize * self.row_stride),
                 self.row_stride,
@@ -301,7 +301,7 @@ impl NgramRowCache {
                 .with_context(|| format!("NgramRowCache: read scale {id}"))?;
             // SAFETY: slot < slots, scale arena holds slots*4 bytes.
             let sdst = unsafe {
-                let base = sc.arena.slot_host_ptr(0, 0)? as *mut u8;
+                let base = sc.arena.slot_host_ptr(0, 0)?;
                 std::slice::from_raw_parts_mut(base.add(slot as usize * 4), 4)
             };
             sdst.copy_from_slice(&self.bounce.blocks(1)[swithin..swithin + 4]);
@@ -345,8 +345,7 @@ mod tests {
     #[test]
     fn row_wider_than_a_block_is_refused() {
         // A row larger than one block could span three with an unaligned base.
-        let msg = match NgramRowCache::open(Path::new("/nonexistent"), None, 10, BLOCK + 8, 4)
-        {
+        let msg = match NgramRowCache::open(Path::new("/nonexistent"), None, 10, BLOCK + 8, 4) {
             Ok(_) => panic!("expected refusal for oversize row_stride"),
             Err(e) => format!("{e:#}"),
         };

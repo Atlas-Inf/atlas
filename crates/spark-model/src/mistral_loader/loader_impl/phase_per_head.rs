@@ -139,9 +139,11 @@ mod tests {
     fn per_head_runs_cover_the_same_bytes() {
         // (n_kv, kv_lora, nope, rope, v_dim, hd, q_lora, bf16)
         for &(n_kv, kv_lora, nope, rope, v_dim, hd, q_lora) in &[
-            (32usize, 512usize, 192usize, 64usize, 256usize, 256usize, 1536usize), // LongCat
-            (8, 256, 128, 64, 128, 192, 1024),                                     // Mistral-ish
-            (3, 5, 7, 2, 11, 9, 13),                                               // ragged
+            (
+                32usize, 512usize, 192usize, 64usize, 256usize, 256usize, 1536usize,
+            ), // LongCat
+            (8, 256, 128, 64, 128, 192, 1024), // Mistral-ish
+            (3, 5, 7, 2, 11, 9, 13),           // ragged
         ] {
             let bf16 = 2usize;
             let stride = nope + v_dim;
@@ -162,10 +164,17 @@ mod tests {
                 let dst = head * uv_run;
                 // Expand the run back into rows to compare like for like.
                 for v in 0..v_dim {
-                    got.push((src + v * kv_lora * bf16, dst + v * kv_lora * bf16, kv_lora * bf16));
+                    got.push((
+                        src + v * kv_lora * bf16,
+                        dst + v * kv_lora * bf16,
+                        kv_lora * bf16,
+                    ));
                 }
             }
-            assert_eq!(got, want, "w_uv run/row mismatch (n_kv={n_kv} v_dim={v_dim})");
+            assert_eq!(
+                got, want,
+                "w_uv run/row mismatch (n_kv={n_kv} v_dim={v_dim})"
+            );
 
             // wq_b_rope: same check.
             let mut want: Vec<(usize, usize, usize)> = Vec::new();
@@ -182,10 +191,17 @@ mod tests {
                 let src = (head * hd + nope) * q_lora * bf16;
                 let dst = head * rope_run;
                 for r in 0..rope {
-                    got.push((src + r * q_lora * bf16, dst + r * q_lora * bf16, q_lora * bf16));
+                    got.push((
+                        src + r * q_lora * bf16,
+                        dst + r * q_lora * bf16,
+                        q_lora * bf16,
+                    ));
                 }
             }
-            assert_eq!(got, want, "wq_b_rope run/row mismatch (n_kv={n_kv} rope={rope})");
+            assert_eq!(
+                got, want,
+                "wq_b_rope run/row mismatch (n_kv={n_kv} rope={rope})"
+            );
         }
     }
 }

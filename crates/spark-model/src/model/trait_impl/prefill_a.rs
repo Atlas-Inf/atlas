@@ -271,7 +271,12 @@ impl TransformerModel {
             // models without one, making `ctx` just the processed tokens.
             let start = tokens.len() - proc_count;
             let ctx_start = start.saturating_sub(self.ngram_lookbehind());
-            self.embed_tokens_fused(&tokens[ctx_start..start + proc_count], proc_count, hidden, stream)?;
+            self.embed_tokens_fused(
+                &tokens[ctx_start..start + proc_count],
+                proc_count,
+                hidden,
+                stream,
+            )?;
             self.scale_embeddings(hidden, proc_count, stream)?;
         }
 

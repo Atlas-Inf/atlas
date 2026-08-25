@@ -35,9 +35,11 @@
 //!    vectorize (4 or 8 BF16 per lane; 192/32 = 6).
 //!
 //!    So both are padded to 256, the stock HDIM, entirely in the weights:
-//!      q_b_proj  per head [nope 128 | rope 64]      -> [nope 128 | 0 x64 | rope 64]
-//!      kv_b_proj per head [nope 128 | v 128]        -> [nope 128 | 0 x64 | v 128 | 0 x128]
-//!      o_proj    per head reads v 128               -> reads 256, pad columns ZERO
+//!    ```text
+//!    q_b_proj  per head [nope 128 | rope 64]  -> [nope 128 | 0 x64 | rope 64]
+//!    kv_b_proj per head [nope 128 | v 128]    -> [nope 128 | 0 x64 | v 128 | 0 x128]
+//!    o_proj    per head reads v 128           -> reads 256, pad columns ZERO
+//!    ```
 //!    The zero pad in `o_proj` is what makes this exact: whatever lands in
 //!    the padded V lanes is multiplied by zero. The padded Q lanes are zero
 //!    too, so the padded K lanes cannot affect any score either.
@@ -111,7 +113,10 @@ pub(super) fn prep_q_b(
 ) -> Result<DenseWeight> {
     let w = dense(store, name)?;
     let hd = nope + rope;
-    anyhow::ensure!(padded_hd >= hd, "longcat prep: padded_hd {padded_hd} < {hd}");
+    anyhow::ensure!(
+        padded_hd >= hd,
+        "longcat prep: padded_hd {padded_hd} < {hd}"
+    );
     let bytes = n_heads * hd * q_lora * BF16;
     let mut host = vec![0u8; bytes];
     gpu.copy_d2h(w.weight, &mut host)

@@ -321,12 +321,15 @@ pub(crate) fn quantized_any(
             gpu.free(w.ptr)?;
             T_FREE.fetch_add(_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let c = N.fetch_add(1, Ordering::Relaxed) + 1;
-            if c % 512 == 0 {
+            if c.is_multiple_of(512) {
                 let ms = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1.0e6;
                 tracing::info!(
                     "quantized_any(Bf16Raw) PROFILE after {c} calls (ms total): detect={:.1} \
                      store_get={:.1} quantize={:.1} free={:.1} | sum={:.1} per_call={:.3}ms",
-                    ms(&T_DETECT), ms(&T_GET), ms(&T_QUANT), ms(&T_FREE),
+                    ms(&T_DETECT),
+                    ms(&T_GET),
+                    ms(&T_QUANT),
+                    ms(&T_FREE),
                     ms(&T_DETECT) + ms(&T_GET) + ms(&T_QUANT) + ms(&T_FREE),
                     (ms(&T_DETECT) + ms(&T_GET) + ms(&T_QUANT) + ms(&T_FREE)) / c as f64,
                 );

@@ -392,9 +392,13 @@ mod ngram_defer_tests {
         assert!(is_ngram_table("model.ngram_embeddings.embedders.0.weight"));
         assert!(is_ngram_table("model.ngram_embeddings.embedders.11.weight"));
         // The small projections are ordinary tensors and must still load.
-        assert!(!is_ngram_table("model.ngram_embeddings.post_projs.0.weight"));
+        assert!(!is_ngram_table(
+            "model.ngram_embeddings.post_projs.0.weight"
+        ));
         assert!(!is_ngram_table("model.embed_tokens.weight"));
-        assert!(!is_ngram_table("model.layers.0.mlp.experts.3.gate_proj.weight"));
+        assert!(!is_ngram_table(
+            "model.layers.0.mlp.experts.3.gate_proj.weight"
+        ));
     }
 
     #[test]

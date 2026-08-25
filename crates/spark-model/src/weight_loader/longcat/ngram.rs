@@ -92,12 +92,7 @@ pub(super) fn build(
         // BF16 rows, no per-row scale file.
         let row_stride = d.shape[1] * 2;
         let cache = spark_storage::NgramRowCache::open_at(
-            &d.path,
-            d.offset,
-            None,
-            rows_total,
-            row_stride,
-            slots,
+            &d.path, d.offset, None, rows_total, row_stride, slots,
         )
         .with_context(|| format!("ngram: row cache for table {i}"))?;
         tables.push(NgramTable::Cached(Box::new(cache)));
