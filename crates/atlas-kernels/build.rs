@@ -454,9 +454,20 @@ fn main() {
     let cache_hits = copy_jobs.len();
     let total = nvcc_invocations + cache_hits;
 
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
+    // One hipcc/nvcc process per core is fine on a discrete-GPU host with real
+    // RAM headroom, but Strix Halo is a 64 GB APU whose weights already live in
+    // system memory: 32 concurrent hipcc processes wedge the box in the OOM
+    // killer before the kernel set finishes. ATLAS_HIPCC_WORKERS caps the pool
+    // without capping cargo itself, so a loaded machine can still build.
+    let n_threads = std::env::var("ATLAS_HIPCC_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+        })
         .min(nvcc_invocations.max(1));
 
     if nvcc_invocations > 0 {
