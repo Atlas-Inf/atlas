@@ -130,9 +130,15 @@ impl WeightLoader for FastSafetensorsLoader {
             resolve_shards(model_dir)?;
 
         // Pre-flight OOM estimate (identical to SafetensorsLoader).
+        //
+        // The n-gram tables are DEFERRED further down — they are never
+        // uploaded, so counting them here refuses a model that fits. On
+        // LongCat-Flash-Lite they are 62.8 of the checkpoint's 138 GB, which
+        // is the difference between a 167 GB "peak" and a 98 GB one.
+        let preflight_skip = |name: &str| skip_fn(name) || crate::weights::is_ngram_table(name);
         {
-            let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
-            let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
+            let estimated = estimate_load_bytes(&shard_files, &preflight_skip)?;
+            let has_fp8 = estimate_has_fp8(&shard_files, &preflight_skip)?;
             let mult = self
                 .peak_memory_multiplier
                 .unwrap_or(if has_fp8 { 1.5 } else { 1.3 });

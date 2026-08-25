@@ -38,8 +38,11 @@ pub(super) fn load_sharded(
     // Pre-flight: estimate bytes from index with model-building overhead.
     let shard_files: Vec<std::path::PathBuf> =
         shard_to_tensors.keys().map(|s| model_dir.join(s)).collect();
-    let estimated = estimate_load_bytes(&shard_files, skip_fn)?;
-    let has_fp8 = estimate_has_fp8(&shard_files, skip_fn)?;
+    // The n-gram tables are deferred below, never uploaded, so they must not
+    // count toward the peak — see the note in `fast_weights`.
+    let preflight_skip = |name: &str| skip_fn(name) || crate::weights::is_ngram_table(name);
+    let estimated = estimate_load_bytes(&shard_files, &preflight_skip)?;
+    let has_fp8 = estimate_has_fp8(&shard_files, &preflight_skip)?;
     let overhead_multiplier: f64 =
         peak_multiplier_override.unwrap_or(if has_fp8 { 1.5 } else { 1.3 });
     let peak_estimated = (estimated as f64 * overhead_multiplier) as usize;

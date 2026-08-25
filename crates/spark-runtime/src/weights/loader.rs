@@ -77,9 +77,12 @@ impl WeightLoader for SafetensorsLoader {
         // Empirical overhead multipliers (peak memory / on-disk weight bytes):
         //   NVFP4 (Sehyo): ~2.0x  (store aliased + transposed/predequant copies)
         //   FP8 native:    ~1.5x  (store stays FP8, only attention prefill gets NVFP4 copies)
+        // The n-gram tables are deferred, never uploaded, so they must not
+        // count toward the peak — see the note in `fast_weights`.
+        let preflight_skip = |name: &str| skip_fn(name) || super::is_ngram_table(name);
         {
-            let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
-            let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
+            let estimated = estimate_load_bytes(&shard_files, &preflight_skip)?;
+            let has_fp8 = estimate_has_fp8(&shard_files, &preflight_skip)?;
             let overhead_multiplier: f64 =
                 self.peak_memory_multiplier
                     .unwrap_or(if has_fp8 { 1.5 } else { 1.3 });

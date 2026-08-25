@@ -39,4 +39,17 @@ impl TransformerModel {
         }
         self.proposer = Some(proposer);
     }
+
+    /// Install the fused n-gram input embedding (LongCat family). Once set,
+    /// every embedding site routes through it instead of the plain
+    /// `embed_tokens` gather.
+    pub fn set_ngram_embedding(&mut self, ngram: crate::layers::ngram_embed::NgramEmbedding) {
+        tracing::info!("set_ngram_embedding: installed on the served model");
+        self.ngram_embed = Some(std::sync::Mutex::new(ngram));
+    }
+
+    /// True when this model fuses n-gram lookups into its input embedding.
+    pub fn has_ngram_embedding(&self) -> bool {
+        self.ngram_embed.is_some()
+    }
 }

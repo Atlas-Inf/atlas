@@ -26,6 +26,7 @@
 //!   `mlp.router.{classifier.weight,e_score_correction_bias}`,
 //!   `mlp.experts.{e}.{gate,up,down}_proj`.
 
+mod ngram;
 mod prep;
 
 use anyhow::{Context, Result};
@@ -355,6 +356,16 @@ impl ModelWeightLoader for LongcatWeightLoader {
         _gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
         dense(store, "model.embed_tokens.weight").context("longcat: embedding")
+    }
+
+    fn load_ngram_embedding(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+        max_tokens: usize,
+    ) -> Result<Option<crate::layers::ngram_embed::NgramEmbedding>> {
+        ngram::build(store, config, gpu, max_tokens)
     }
 
     fn load_final_norm(

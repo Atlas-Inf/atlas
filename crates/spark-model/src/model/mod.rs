@@ -27,6 +27,7 @@ pub(crate) mod block_mgmt;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub(crate) mod impl_a1;
+mod impl_ngram;
 pub(crate) mod impl_a1_init;
 pub(crate) mod impl_a2;
 pub(crate) mod impl_a3;
