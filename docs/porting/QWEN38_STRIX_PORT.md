@@ -154,6 +154,29 @@ that `first_run.ps1` documents. Two hypotheses tested and **rejected**:
 Because it reproduces identically on both platforms, it is in the shared port —
 the kernel set or the model config — not in either platform recipe.
 
+### It is pre-existing, and this port does not introduce it
+
+The decisive test. The pre-restoration Avarok worktree on the same box
+(`/workspace/.wt-38trial`, the build that had been serving Qwen3.8-27B
+continuously for six days) was sent the identical two requests:
+
+| request | pre-restoration Avarok build | this port (Linux) | this port (Windows) |
+|---|---|---|---|
+| plain chat | coherent | coherent | coherent |
+| same prompt + `tools` | `!!!!!!` | `!!!!!!` | `!!!!!!` |
+
+Byte-identical prose on the plain request, byte-identical degeneration on the
+tool request, across three builds and two operating systems. **The tool path was
+already broken in the source tree this port comes from.** Nothing here regresses
+it, and there is no version of this port that would have shipped it working —
+the behaviour is a property of the checkpoint against the strix-hip kernel set,
+not of the merge.
+
+That is what makes these legs validated: the port reproduces its origin exactly,
+on both toolchains and both operating systems. It is also why the BFCL leg
+cannot yield an accuracy number until the kernel-set gap below is closed — on
+any tree, old or new.
+
 ### The strix-hip kernel set is incomplete, and it is not benign
 
 The A/B that makes this concrete: `unsloth/Qwen3.6-27B-NVFP4`, the *certified*
