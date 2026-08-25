@@ -439,6 +439,22 @@ function Phase-Serve {
     $env:ATLAS_SSM_TAIL_LEASE_TTL = '128'
     $env:ATLAS_MTP_GATE_REPROBE   = '64'
 
+    # The GDN-projection prefill fast path (fp8_fp8_gemm_ldmab) is default-ON on
+    # main and is NVIDIA-only: kernels/gb10/common/w4a16_fp8_ldmab.cu is built
+    # from mma.sync...e4m3.e4m3 + ldmatrix.x4, which have no RDNA3.5 equivalent.
+    # The module is simply absent from the strix kernel set, and this lookup is
+    # NOT one of the soft fallbacks -- it is a hard runtime failure on the FIRST
+    # request, after a completely healthy boot:
+    #
+    #   Prefill chunk layer 0 failed: ssm prefill: out_proj GEMM failed:
+    #   Kernel lookup w4a16_fp8_ldmab::fp8_fp8_gemm_ldmab:
+    #   Module 'w4a16_fp8_ldmab' not loaded
+    #
+    # which surfaces to the client as a bare HTTP 500. serve-amd.sh has set this
+    # to 0 since the port; first_run.ps1 never did, so on Windows the server came
+    # up, reported ready, and then failed every single request.
+    $env:ATLAS_FP8_LDMAB          = '0'
+
     # Enables the FP8-source reclaim, and Qwen3.8-27B does not fit without it.
     # quantized_from_fp8 frees the BF16 intermediate but keeps the FP8 SOURCE
     # unless BOTH downstream readers are known to be off -- the GDN native-FP8
