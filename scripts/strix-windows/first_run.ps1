@@ -42,6 +42,9 @@
 #                    (a Qwen3.8-27B directory serves unsloth/Qwen3.8-27B-NVFP4).
 #                    This drives kernel-target resolution -- see $ModelName below.
 #   HIP_PATH         HIP SDK root.     Default: newest under C:\Program Files\AMD\ROCm
+#   ATLAS_MAX_SEQ_LEN --max-seq-len. Default 65536. Lower it (16384 matches the
+#                    certified Linux recipe) if KV sizing fails -- it sets the
+#                    inference reserve and buffer arena, not just the context.
 #   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.80. Read the note in Serve
 #                    before raising it; it is a fraction of a total the driver
 #                    reports but will not honour.
@@ -69,6 +72,14 @@ $RepoRoot = if ($env:ATLAS_REPO) { $env:ATLAS_REPO }
 $ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
             else { "$env:USERPROFILE\models\Qwen3.6-27B-NVFP4" }
 $GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.80' }
+# --max-seq-len drives the inference reserve and the buffer arena, so it is a
+# memory knob, not just a capability one. 65536 is affordable for the 3.6
+# text-only recipe this script was written against; a vision-enabled 27B such as
+# Qwen3.8-27B additionally holds a ViT scratch and loads its FP8 sources
+# alongside the requantised NVFP4 weights, and the reserve 65536 implies then
+# leaves no room for a KV pool at all. 16384 is what the certified Linux recipe
+# (serve-amd.sh) uses.
+$MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '65536' }
 $Port     = if ($env:ATLAS_PORT) { $env:ATLAS_PORT } else { '8081' }
 $BindHost = if ($env:ATLAS_BIND) { $env:ATLAS_BIND } else { '127.0.0.1' }
 
@@ -487,7 +498,7 @@ try {
     & $exe serve $ModelDir `
         --no-fast-load `
         --model-name $ModelName --host $BindHost --port $Port `
-        --max-seq-len 65536 --gpu-memory-utilization $GpuUtil --kv-cache-dtype bf16 `
+        --max-seq-len $MaxSeqLen --gpu-memory-utilization $GpuUtil --kv-cache-dtype bf16 `
         --max-batch-size 1 --speculative --num-drafts 2 --mtp-quantization bf16 `
         --mtp-vocab 100000 --disable-tool-grammar true --enable-prefix-caching `
         --ssm-cache-slots 64 --ssm-checkpoint-interval 16 --disable-thinking
