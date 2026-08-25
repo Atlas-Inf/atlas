@@ -88,6 +88,33 @@ Framework Desktop, gfx1151, Windows 11 (10.0.26200), 127.3 GB, from
 | MTP | `Dense MTP head ready`; gate throughput-arbitrated at K=2 — confirms `mtp_layers = 1` |
 | serve + completion | coherent, 63 tok in 9.7 s |
 | `quick-speed-bench` | decode **17.9 tok/s** (server), TTFT **7170 ms**, TPOT 55.73 ms, n=5 (17.6-18.6) |
+| `bfcl-subset` | **not run** — blocked on the box's Python, see below |
+
+#### BFCL needs a Python that is not the newest one
+
+`bfcl-subset` provisions a venv from `ATLAS_PYTHON` and installs `bfcl-eval`,
+which pins `faiss-cpu==1.11.0`. That pin has no wheel for Python 3.14 — PyPI
+offers 1.12.0+ only — so the install fails and the benchmark never reaches the
+model:
+
+```
+ERROR: Could not find a version that satisfies the requirement faiss-cpu==1.11.0
+       (from bfcl-eval) (from versions: 1.12.0, 1.13.0, ...)
+```
+
+This box has 3.14.7 as its only interpreter (scoop's `main` bucket carries
+nothing older, and the pre-existing `code\bfcl\.venv` is 3.14.7 too), so the
+leg could not run. It is an environment prerequisite, **not** a port defect —
+nothing here reaches Atlas. Install a 3.12 interpreter and point `ATLAS_PYTHON`
+at it. Do not relax the pin to make it install: the pinned set is what every
+recorded BFCL score was produced against, and changing it silently changes what
+the number means.
+
+Two smaller traps on the same path, both from scoop's shims failing under a
+non-interactive SSH session: `python3`/`git` resolve to shims that cannot spawn
+their target, so pass real interpreter paths; and a process created via
+`Win32_Process.Create` does not inherit the interactive profile, so `HOME` must
+be set explicitly or spark cannot place `~/.atlas`.
 
 Run on ROCm **6.4**. ROCm 7.2 reproduced the status-719 hard fault from the table
 above during model build, so it was not used for measurement. The perf figures
