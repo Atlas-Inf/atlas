@@ -112,6 +112,20 @@ fn record_still_stands(
     }
 }
 
+/// Whether `sha` names a commit object this clone actually holds. Split out so
+/// a failed diff can say WHICH operand is missing: a shallow clone and a
+/// deleted branch both surface as "git diff failed" and have opposite fixes —
+/// deepen the fetch, versus restore a ref.
+pub fn commit_is_present(root: &Path, sha: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 /// The changed paths that invalidate `gate` between two commits.
 ///
 /// `None` means the question could not be answered — git failed, or one of the
@@ -345,15 +359,27 @@ fn check_one(root: &Path, benchmark_id: &str, sha: &str) -> GateStatus {
                 }
                 let newest = newest_record.git_sha.clone();
                 let Some(why) = invalidating_paths(root, sha, &newest, gate) else {
-                    return GateStatus::Missing(format!(
-                        "latest record is for {newest} ({}) — git cannot diff that commit \
-                         against this one; is it in this clone? (the gate job needs \
-                         `fetch-depth: 0`)",
-                        paths[0]
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default()
-                    ));
+                    let file = paths[0]
+                        .file_name()
+                        .map(|n| n.to_string_lossy())
+                        .unwrap_or_default();
+                    // ★ Name the ACTUAL fault: these two read identically at the
+                    // git level, have opposite remedies, and "needs
+                    // fetch-depth: 0" on a job that already sets it costs the
+                    // reader the investigation.
+                    return GateStatus::Missing(if commit_is_present(root, &newest) {
+                        format!(
+                            "latest record is for {newest} ({file}) — git refused to diff it \
+                             against this commit, though both objects are present"
+                        )
+                    } else {
+                        format!(
+                            "latest record is for {newest} ({file}) — that commit is not in \
+                             this repository, and no fetch depth recovers it: the branch it \
+                             was measured on is gone from the remote. Restore the ref, or \
+                             re-measure on a reachable commit."
+                        )
+                    });
                 };
                 let because = if why.is_empty() {
                     // Reachable only if a record was skipped for a reason other
