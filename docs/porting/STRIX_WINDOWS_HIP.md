@@ -93,7 +93,10 @@ Framework Desktop, gfx1151, Windows 11 (10.0.26200), 127.3 GB, from
 #### BFCL ran, and produced no usable score on either platform
 
 All 70 samples of the reduced draw completed here (2528 s) — and emitted **zero
-tool calls**, matching Linux exactly, subset for subset. Plain chat is coherent;
+tool calls**, matching Linux exactly, subset for subset. The same failure
+reproduces on the pre-restoration Avarok build on the Linux box, so it is
+pre-existing in the source tree and **not** something this port introduces; the
+three-way comparison is in [`QWEN38_STRIX_PORT.md`](QWEN38_STRIX_PORT.md). Plain chat is coherent;
 the same prompt with `tools` returns `!!!!!!`. It reproduces identically on both
 platforms, so it is in the shared port rather than this recipe, and it is
 documented with its A/B evidence in
