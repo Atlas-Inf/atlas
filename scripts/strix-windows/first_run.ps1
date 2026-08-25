@@ -42,10 +42,11 @@
 #                    (a Qwen3.8-27B directory serves unsloth/Qwen3.8-27B-NVFP4).
 #                    This drives kernel-target resolution -- see $ModelName below.
 #   HIP_PATH         HIP SDK root.     Default: newest under C:\Program Files\AMD\ROCm
-#   ATLAS_MAX_SEQ_LEN --max-seq-len. Default 65536. Lower it (16384 matches the
-#                    certified Linux recipe) if KV sizing fails -- it sets the
-#                    inference reserve and buffer arena, not just the context.
-#   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.80. Read the note in Serve
+#   ATLAS_MAX_SEQ_LEN --max-seq-len. Default 16384, matching serve-amd.sh.
+#   ATLAS_MAX_PREFILL_TOKENS --max-prefill-tokens. Default 2048, matching
+#                    serve-amd.sh. This is the knob that sizes the buffer arena.
+#   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.86, matching serve-amd.sh.
+#                    Read the note in Serve
 #                    before raising it; it is a fraction of a total the driver
 #                    reports but will not honour.
 #   ATLAS_PORT       serve port.       Default 8081.
@@ -71,7 +72,7 @@ $RepoRoot = if ($env:ATLAS_REPO) { $env:ATLAS_REPO }
             else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
 $ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
             else { "$env:USERPROFILE\models\Qwen3.6-27B-NVFP4" }
-$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.80' }
+$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.86' }
 # --max-seq-len drives the inference reserve and the buffer arena, so it is a
 # memory knob, not just a capability one. 65536 is affordable for the 3.6
 # text-only recipe this script was written against; a vision-enabled 27B such as
@@ -79,7 +80,13 @@ $GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.80' }
 # alongside the requantised NVFP4 weights, and the reserve 65536 implies then
 # leaves no room for a KV pool at all. 16384 is what the certified Linux recipe
 # (serve-amd.sh) uses.
-$MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '65536' }
+$MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '16384' }
+# The buffer arena is sized by max_prefill_tokens, NOT max_seq_len: 8193 tokens
+# cost 3632.9 MB of arena plus the inference reserve computed from it. serve-amd.sh
+# has used 2048 on this same silicon since the certified run; this recipe never
+# passed the flag at all and inherited the 8192 default, which is what kept
+# Qwen3.8-27B from fitting even after the FP8 reclaim.
+$MaxPrefill = if ($env:ATLAS_MAX_PREFILL_TOKENS) { $env:ATLAS_MAX_PREFILL_TOKENS } else { '2048' }
 $Port     = if ($env:ATLAS_PORT) { $env:ATLAS_PORT } else { '8081' }
 $BindHost = if ($env:ATLAS_BIND) { $env:ATLAS_BIND } else { '127.0.0.1' }
 
@@ -522,7 +529,8 @@ try {
     & $exe serve $ModelDir `
         --no-fast-load `
         --model-name $ModelName --host $BindHost --port $Port `
-        --max-seq-len $MaxSeqLen --gpu-memory-utilization $GpuUtil --kv-cache-dtype bf16 `
+        --max-seq-len $MaxSeqLen --max-prefill-tokens $MaxPrefill `
+        --gpu-memory-utilization $GpuUtil --kv-cache-dtype bf16 `
         --max-batch-size 1 --speculative --num-drafts 2 --mtp-quantization bf16 `
         --mtp-vocab 100000 --disable-tool-grammar true --enable-prefix-caching `
         --ssm-cache-slots 64 --ssm-checkpoint-interval 16 --disable-thinking
