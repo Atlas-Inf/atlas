@@ -115,6 +115,78 @@ reproduce". Both are **measurements, not gates**: Qwen3.8-27B carries no
 committed `BENCH.toml` thresholds, so a run on it baselines rather than gates,
 and inherits neither 3.6's floors nor the MLPerf floor.
 
+### BFCL: the leg ran, and it found a correctness bug rather than a score
+
+`bfcl-subset` at a reduced draw (`non_live_pct=4 live_pct=1 hallucination_pct=1
+subset_floor=2`, n=70 across 12 subsets) completed all 70 samples on **both**
+platforms — 1020 s on Linux, 2528 s on Windows. The harness itself flags the
+draw: *"n=70, not the pinned 995 — this run is NOT comparable to this draw's
+baseline"*.
+
+**No accuracy number should be taken from it, because the model emitted zero
+tool calls.**
+
+```
+Linux   : 70 responses, 0 with tool calls
+Windows : 70 responses, 0 with tool calls
+```
+
+Identical, subset for subset. The nominal Linux score — `overall_accuracy 14.29`,
+`non_live 0.0`, `live 0.0`, `hallucination 100.0` — is an artefact: the two
+irrelevance subsets score 100 precisely *because* no call is made, and every
+category that requires one scores 0.
+
+Reduced to a single request, plain chat is fine and the tool path is not:
+
+```
+no tools : "I do not have access to real-time data, so I cannot provide the
+            current weather conditions in Paris right now. ..."
++ tools  : "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"   tool_calls: null
+```
+
+Degenerate on the FIRST request, so it is not the cross-request SSM prefix reuse
+that `first_run.ps1` documents. Two hypotheses tested and **rejected**:
+
+* `ATLAS_SSM_TAIL_MIDCHUNK=0` — no change (this is the lever the Windows recipe
+  sets for a similar-looking symptom; it is not this one).
+* tool grammar enabled instead of `--disable-tool-grammar true` — no change.
+
+Because it reproduces identically on both platforms, it is in the shared port —
+the kernel set or the model config — not in either platform recipe.
+
+### The strix-hip kernel set is incomplete, and it is not benign
+
+The A/B that makes this concrete: `unsloth/Qwen3.6-27B-NVFP4`, the *certified*
+checkpoint, on this same tree and the same kernel set, **cannot serve at all**:
+
+```
+Selected kernel target: (gfx1151, qwen3.6-27b, nvfp4) (95 modules)
+Error: Failed to build model
+Caused by: Kernel lookup dequant_nvfp4_bf16::dequant_nvfp4_to_bf16:
+           Module load failed: Module 'dequant_nvfp4_bf16' not loaded
+```
+
+(Resolution picked 3.6 correctly, which is the tie-break working in both
+directions.)
+
+So the 94 unresolved lookups are not the harmless bookkeeping the
+`--dangerously-allow-unresolved-kernel-lookups` comment implies. On this tree
+they are a hard failure for 3.6 and, for 3.8, a silent wrong answer on the tool
+path. **Closing the kernel-set gap is a prerequisite for any BFCL number on
+Strix**, and it is kernel work, not port work.
+
+### Scoring has its own prerequisites
+
+Both platforms completed inference and then failed to *score*, differently:
+
+* Linux — `ModuleNotFoundError: No module named 'soundfile'`, a transitive
+  import of `qwen_agent` missing from `bfcl-eval`'s dependency set. Fixed by
+  installing it into the provisioned venv; `responses.jsonl` is kept, so the run
+  rescored without re-running inference.
+* Windows — `ImportError: DLL load failed while importing _tiktoken: An
+  Application Control policy has blocked this file.` A machine security policy,
+  deliberately not worked around.
+
 ### The fallback caveat applies to every Strix number
 
 The gfx1151 kernel set is much smaller than gb10's, so a large number of
