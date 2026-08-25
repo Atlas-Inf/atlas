@@ -1,0 +1,110 @@
+# Qwen3.8-27B on Strix Halo (gfx1151)
+
+How the Qwen3.8-27B target reaches AMD Strix Halo, on both of Atlas's AMD
+toolchains, and what has and has not been measured on it.
+
+The Windows half of this port has its own document —
+[`STRIX_WINDOWS_HIP.md`](STRIX_WINDOWS_HIP.md) — because its failure modes are
+entirely different. This one covers the target itself and the Linux legs.
+
+## The target compiles no kernels of its own
+
+Two definitions, byte-identical to each other:
+
+```
+kernels/strix/qwen3.8-27b/MODEL.toml       SCALE toolchain (Linux only)
+kernels/strix-hip/qwen3.8-27b/MODEL.toml   native HIP  (Linux and Windows)
+```
+
+Both set `kernel_source = "qwen3.6-27b"`. Verified against the checkpoint on
+disk (`unsloth/Qwen3.8-27B-NVFP4`, snapshot `7d6f8d4d`): every field of
+`text_config` is identical to `unsloth/Qwen3.6-27B-NVFP4`'s — layer counts and
+types, hidden/head/kv dims, vocab, rope parameters, `attn_output_gate`,
+`mtp_num_hidden_layers`. The two checkpoints differ only in weights and in
+`quantization_config`. There is no 3.8-specific kernel work on either backend,
+exactly as on gb10.
+
+### `match_names` is load-bearing
+
+Because `config.json` cannot tell 3.8 from 3.6 — same `model_type` `qwen3_5`,
+same `hidden_size` 5120, same every numeric field — kernel-target resolution
+hits an **exact** tie and breaks it by matching `match_names` needles against
+the checkpoint reference: the HF id, `--model-name`, and the model directory.
+
+An unbroken tie is a hard startup error, never a build-order pick. The practical
+consequence is that **the served model name selects the kernel target**. Serving
+3.8 weights under the 3.6 name resolves `qwen3.6-27b`, whose MODEL.toml carries
+a different MTP depth and different sampling defaults — and because 3.8
+legitimately reuses 3.6's kernels, nothing fails loudly. It just serves wrong.
+This is exactly the bug the Windows recipe had; see that document.
+
+### MTP is 1 here, and 0 on gb10
+
+`kernels/gb10/qwen3.8-27b` sets `mtp_layers = 0`. That is wrong for this
+checkpoint and matters more on Strix, whose serve recipe passes
+`--speculative --num-drafts N` — dead weight without an MTP head. The head
+ships (`text_config.mtp_num_hidden_layers = 1`, and `model_mtp.safetensors`
+carries 15 `mtp.*` tensors). A 0 here produces no error and no warning, just a
+serve that quietly ignores `--speculative` and decodes at 1x.
+
+## Building
+
+`./build-amd.sh` — `ATLAS_TARGET_HW` selects `strix-hip` (default, native HIP,
+needs only ROCm and cargo) or `strix` (SCALE, needs `$SCALE_HOME`).
+`ATLAS_TARGET_MODEL` defaults to `*`, which builds every target under
+`kernels/$ATLAS_TARGET_HW/` into one binary. That default is worth keeping:
+3.8 reuses 3.6's tree, so the marginal cost is small, and it is the only
+configuration that actually exercises the `match_names` tie-break at serve time.
+
+### `ATLAS_HIPCC_WORKERS`
+
+The kernel-compile pool is sized from `available_parallelism()`, which is 32 on
+the Strix box. Strix is a 64 GB APU with no discrete VRAM, so 32 concurrent
+`hipcc` processes exhaust system memory and wedge the machine in the OOM killer
+before the kernel set finishes. `ATLAS_HIPCC_WORKERS` caps the pool without
+capping cargo.
+
+This override existed in the pre-restoration history and was never carried onto
+main; it is restored here. Unset, behaviour is unchanged.
+
+## Validated
+
+### Build — Linux, native HIP, 2026-08-25
+
+`AzeezStrix`, gfx1151, Ubuntu 24.04, ROCm/HIP 7.13, 61 GB.
+
+```
+ATLAS_HIPCC_WORKERS=3 CARGO_BUILD_JOBS=3 ./build-amd.sh
+  Finished `release` profile [optimized] target(s) in 2m 37s   exit 0
+```
+
+Built **while a 56 GB serve was resident on the same box**, with available
+memory never dropping below 4 GB. That is the `ATLAS_HIPCC_WORKERS` cap doing
+its job, and it is the practical difference between being able to build on this
+hardware and not.
+
+### Not yet measured on Linux
+
+The BFCL and performance legs need the GPU, and the box's memory was held by an
+unrelated long-running serve for the duration of this work. The binary is built
+and the target resolves; **no Linux accuracy or throughput number is recorded
+here**, and none should be quoted until those legs run.
+
+The Windows leg was taken end to end and is recorded in
+[`STRIX_WINDOWS_HIP.md`](STRIX_WINDOWS_HIP.md). Its numbers are a baseline, not
+a gate: Qwen3.8-27B carries no committed thresholds in `BENCH.toml`, so a run on
+it baselines rather than gates, and inherits neither 3.6's floors nor the MLPerf
+floor.
+
+### The fallback caveat applies to every Strix number
+
+The gfx1151 kernel set is much smaller than gb10's, so a large number of
+dispatch sites resolve to a fallback — 94 unresolved lookups for qwen3.8-27b,
+against the 92 `serve-amd.sh` documents for 3.6 on the same tree. These are
+pre-existing: the kernel audit landed on main after the Strix branch forked, and
+the certified 3.6 submission was produced under exactly the same ones. Both
+serve recipes pass `--dangerously-allow-unresolved-kernel-lookups`.
+
+Closing that gap — compiling the missing kernels, or declaring them in
+`MODEL.toml` `[expected_absent]` with stated reasons — is follow-up work, and no
+Strix performance number is final until it is done.
