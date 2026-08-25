@@ -165,6 +165,17 @@ use crate::weight_map::{DenseWeight, Fp8DenseWeight};
 pub enum NgramTable {
     Bf16(DenseWeight),
     Fp8(Fp8DenseWeight),
+    /// NVMe-backed: only a bounded set of ROWS is resident, in a pinned
+    /// GPU-addressable arena. The host resolves `row_id -> slot` (the ids are
+    /// a pure function of token ids, so this is host-side anyway) and the
+    /// SAME gather kernels then read the arena by slot index — no kernel
+    /// change, no `cuMemcpyHtoD` on the fault path.
+    ///
+    /// This is what makes a 51 B-parameter embedding table serveable on a
+    /// 121 GB box: the tables are the model's largest tensors and its least
+    /// bandwidth-hungry (12 rows ~ 3 KB per token), so demoting them buys
+    /// back tens of GB for KV.
+    Cached(Box<spark_storage::NgramRowCache>),
 }
 
 impl NgramTable {
@@ -250,7 +261,7 @@ impl NgramEmbedding {
     /// exactly the reference NgramCache contract). Writes
     /// `[seq_len, hidden]` BF16 to `out`.
     pub fn embed(
-        &self,
+        &mut self,
         ctx_tokens: &[u32],
         seq_len: usize,
         out: DevicePtr,
@@ -304,6 +315,62 @@ impl NgramEmbedding {
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
             gpu.copy_h2d_async(&id_bytes, self.ids_dev, stream)?;
+            // NVMe-backed table: fault the rows in and REPLACE the ids with
+            // their slot indices, then gather from the arena exactly as if it
+            // were a small resident table.
+            if let NgramTable::Cached(cache) = &mut self.tables[index] {
+                let mut slots = Vec::with_capacity(seq_len);
+                cache.resolve(tail, &mut slots)?;
+                let slot_bytes: Vec<u8> =
+                    slots.iter().flat_map(|v| v.to_le_bytes()).collect();
+                gpu.copy_h2d_async(&slot_bytes, self.ids_dev, stream)?;
+                let table = DevicePtr(cache.table_dev_va()?);
+                match cache.scale_dev_va()? {
+                    Some(sc) => ops::batched_embed_fp8(
+                        gpu,
+                        self.batched_embed_fp8_k,
+                        self.ids_dev,
+                        table,
+                        DevicePtr(sc),
+                        self.gather_buf,
+                        seq_len as u32,
+                        td as u32,
+                        stream,
+                    )?,
+                    None => ops::batched_embed(
+                        gpu,
+                        self.batched_embed_k,
+                        self.ids_dev,
+                        table,
+                        self.gather_buf,
+                        seq_len as u32,
+                        td as u32,
+                        stream,
+                    )?,
+                }
+                cache.end_batch();
+                ops::dense_gemm_bf16_pipelined(
+                    gpu,
+                    self.gemm_k,
+                    self.gather_buf,
+                    &self.projs[index],
+                    self.proj_buf,
+                    seq_len as u32,
+                    h as u32,
+                    td as u32,
+                    stream,
+                )?;
+                ops::scaled_add(
+                    gpu,
+                    self.scaled_add_k,
+                    out,
+                    self.proj_buf,
+                    inv_scale,
+                    (seq_len * h) as u32,
+                    stream,
+                )?;
+                continue;
+            }
             match &self.tables[index] {
                 NgramTable::Bf16(w) => ops::batched_embed(
                     gpu,
@@ -326,6 +393,7 @@ impl NgramEmbedding {
                     td as u32,
                     stream,
                 )?,
+                NgramTable::Cached(_) => unreachable!("resolved above"),
             }
             ops::dense_gemm_bf16_pipelined(
                 gpu,
@@ -535,6 +603,10 @@ mod tests {
                         )
                         .unwrap()
                     }
+                    // The NVMe-backed variant has its own parity test
+                    // (`cached_table_matches_resident_table`); this manual
+                    // op-sequence harness drives resident tables only.
+                    NgramTable::Cached(_) => unreachable!("test builds resident tables"),
                 }
                 crate::layers::ops::dense_gemm_bf16_pipelined(
                     g, ng.gemm_k, ng.gather_buf, &ng.projs[index],
@@ -624,6 +696,118 @@ mod tests {
         );
         println!(
             "ngram GPU parity (FP8 tables): worst row Frobenius rel = {fp8_worst:.4}"
+        );
+    }
+
+    /// The NVMe-backed cache must be INVISIBLE: gathering through a bounded
+    /// row cache has to produce byte-identical output to the fully-resident
+    /// table it replaces, including under real pressure (fewer slots than
+    /// distinct rows, so rows are evicted and re-faulted mid-sequence).
+    ///
+    /// Uses the same compacted real-checkpoint data as the resident parity
+    /// test; the table file is written row-major so the cache's
+    /// `row_id -> byte offset` contract is exercised for real.
+    #[test]
+    #[ignore] // GPU + filesystem
+    fn cached_table_matches_resident_table() {
+        let dir = std::env::var("ATLAS_NGRAM_TEST_DATA")
+            .expect("set ATLAS_NGRAM_TEST_DATA (see make_gpu_testdata.py)");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/meta.json")).unwrap(),
+        )
+        .unwrap();
+        let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(
+            0,
+            &atlas_kernels::ptx_modules(),
+        )
+        .expect("CUDA backend");
+        let g: &dyn GpuBackend = &gpu;
+        let stream = g.default_stream();
+
+        // Table 0's compacted rows: [n_rows, 256] BF16, row id == compact index.
+        let t0 = &meta["tables"].as_array().unwrap()[0];
+        let n_rows = t0["ids"].as_array().unwrap().len();
+        let dim = t0["dim"].as_u64().unwrap() as usize;
+        let bytes = std::fs::read(format!("{dir}/table0_rows.bin")).unwrap();
+        assert_eq!(bytes.len(), n_rows * dim * 2);
+        let row_stride = dim * 2; // 512 B — divides the 4 KiB O_DIRECT block
+
+        // Resident copy.
+        let resident = g.alloc(bytes.len()).unwrap();
+        g.copy_h2d_async(&bytes, resident, stream).unwrap();
+
+        // Backing file for the cached copy.
+        let tmp = std::env::temp_dir().join(format!("atlas_ngram_cache_{}.bin", std::process::id()));
+        std::fs::write(&tmp, &bytes).unwrap();
+
+        // Deliberately fewer slots than rows -> eviction + re-fault.
+        let slots = (n_rows / 3).max(4);
+        let mut cache = spark_storage::NgramRowCache::open(
+            &tmp, None, n_rows as u64, row_stride, slots,
+        )
+        .expect("open cache");
+
+        // Walk every row twice (second pass exercises re-faulting), in
+        // BATCHES — a slot is pinned for the batch in flight, so the cache
+        // must hold at least one forward's worth of rows per table (the
+        // serving constraint: slots >= max tokens per forward).
+        let ids: Vec<u64> = (0..n_rows as u64).chain(0..n_rows as u64).collect();
+        let m = ids.len();
+        let batch = slots / 2;
+        let ids_dev = g.alloc(m * 4).unwrap();
+        let out_res = g.alloc(m * dim * 2).unwrap();
+        let out_cache = g.alloc(m * dim * 2).unwrap();
+
+        let embed_k = g.kernel("embed_from_argmax", "batched_embed").unwrap();
+        // Resident: gather by ROW id.
+        let idb: Vec<u8> = ids.iter().flat_map(|v| (*v as u32).to_le_bytes()).collect();
+        g.copy_h2d_async(&idb, ids_dev, stream).unwrap();
+        crate::layers::ops::batched_embed(
+            g, embed_k, ids_dev, resident, out_res, m as u32, dim as u32, stream,
+        )
+        .unwrap();
+
+        // Cached: per batch, resolve to SLOTS then gather from the pinned
+        // arena into that batch's slice of the output.
+        let table = DevicePtr(cache.table_dev_va().unwrap());
+        let mut slot_ids = Vec::new();
+        for (bi, chunk) in ids.chunks(batch).enumerate() {
+            cache.resolve(chunk, &mut slot_ids).unwrap();
+            assert_eq!(slot_ids.len(), chunk.len());
+            let sb: Vec<u8> = slot_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+            g.copy_h2d_async(&sb, ids_dev, stream).unwrap();
+            let dst = out_cache.offset(bi * batch * dim * 2);
+            crate::layers::ops::batched_embed(
+                g, embed_k, ids_dev, table, dst, chunk.len() as u32, dim as u32,
+                stream,
+            )
+            .unwrap();
+            // The gather is issued; the batch's pins can be released. Sync
+            // first so a later fault cannot overwrite a slot this gather is
+            // still reading (the serving path issues on one stream in order).
+            g.synchronize(stream).unwrap();
+            cache.end_batch();
+        }
+
+        let mut a = vec![0u8; m * dim * 2];
+        let mut b = vec![0u8; m * dim * 2];
+        g.copy_d2h(out_res, &mut a).unwrap();
+        g.copy_d2h(out_cache, &mut b).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let (hits, misses, evictions) = cache.stats();
+        assert!(
+            evictions > 0,
+            "test must exercise eviction (slots={slots}, rows={n_rows}); \
+             hits={hits} misses={misses} evictions={evictions}"
+        );
+        assert_eq!(
+            a, b,
+            "cached gather diverged from the resident table \
+             (hits={hits} misses={misses} evictions={evictions})"
+        );
+        println!(
+            "ngram row cache: BYTE-IDENTICAL over {m} lookups with {slots}/{n_rows} slots \
+             (hits={hits} misses={misses} evictions={evictions})"
         );
     }
 
