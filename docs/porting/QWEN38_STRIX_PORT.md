@@ -83,18 +83,37 @@ memory never dropping below 4 GB. That is the `ATLAS_HIPCC_WORKERS` cap doing
 its job, and it is the practical difference between being able to build on this
 hardware and not.
 
-### Not yet measured on Linux
+### Serve and resolution — Linux, 2026-08-25
 
-The BFCL and performance legs need the GPU, and the box's memory was held by an
-unrelated long-running serve for the duration of this work. The binary is built
-and the target resolves; **no Linux accuracy or throughput number is recorded
-here**, and none should be quoted until those legs run.
+`./serve-amd.sh` with its defaults (the checkpoint default is Qwen3.8-27B-NVFP4):
 
-The Windows leg was taken end to end and is recorded in
-[`STRIX_WINDOWS_HIP.md`](STRIX_WINDOWS_HIP.md). Its numbers are a baseline, not
-a gate: Qwen3.8-27B carries no committed thresholds in `BENCH.toml`, so a run on
-it baselines rather than gates, and inherits neither 3.6's floors nor the MLPerf
-floor.
+```
+Selected kernel target: (gfx1151, qwen3.8-27b, nvfp4) (95 modules)
+  — quant compat: kernel=nvfp4 model=fp8 OK
+Dense MTP head ready (FP8 e4m3 projections + dense gate/up/down MLP)
+Qwen3.6 vision encoder loaded: depth=27, hidden=1152, heads=16
+KV cache: 60.0 GB total x 86% util = 51.6 GB budget; 44.4 GB pre-KV
+  + 5.9 GB reserve -> 1.4 GB for KV -> 22384 max KV tokens
+Server live and ready at 127.0.0.1:8081 running unsloth/Qwen3.8-27B-NVFP4
+```
+
+The binary carries **every** strix-hip target (`ATLAS_TARGET_MODEL=*`), so 3.6
+and 3.8 are both embedded and resolution had to break the tie on `match_names`.
+It picked 3.8. That is the assertion this port rests on.
+
+### Performance — `quick-speed-bench`, Linux
+
+| | decode (server) | TTFT | TPOT |
+|---|---|---|---|
+| **Linux, ROCm 7.13** | **22.0 tok/s** | **1452 ms** | 45.45 ms |
+| Windows, ROCm 6.4 | 17.9 tok/s | 7170 ms | 55.73 ms |
+
+n=5 each, isl 60 / osl 128, single stream. The Linux spread is 22.0-22.1.
+Linux is ~23% faster on decode and ~5x on TTFT — consistent with
+[`STRIX_WINDOWS_HIP.md`](STRIX_WINDOWS_HIP.md)'s "why the Linux numbers won't
+reproduce". Both are **measurements, not gates**: Qwen3.8-27B carries no
+committed `BENCH.toml` thresholds, so a run on it baselines rather than gates,
+and inherits neither 3.6's floors nor the MLPerf floor.
 
 ### The fallback caveat applies to every Strix number
 
