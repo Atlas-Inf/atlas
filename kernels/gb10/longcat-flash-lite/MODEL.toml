@@ -45,10 +45,48 @@ model_type = "longcat_flash_ngram"
 [[model_types]]
 model_type = "longcat_flash"
 
+# ── Sampling: the model card's own numbers ──
+# Straight from the checkpoint's generation_config.json (repetition_penalty
+# 1.06 / temperature 0.7 / top_p 0.95 / top_k 4). LongCat ships ONE recipe
+# rather than per-mode ones, so all four presets carry it — a request that
+# names no sampler gets what Meituan tuned, not Atlas's generic defaults.
+#
+# top_k = 4 is unusually tight and it is deliberate: this model is a
+# 256-expert MoE with zero-computation experts and it degenerates when given
+# a wide tail. Do not "helpfully" widen it.
+[sampling.thinking_text]
+temperature = 0.7
+top_p = 0.95
+top_k = 4
+repetition_penalty = 1.06
+
+[sampling.thinking_coding]
+temperature = 0.7
+top_p = 0.95
+top_k = 4
+repetition_penalty = 1.06
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.95
+top_k = 4
+repetition_penalty = 1.06
+
+[sampling.tools]
+temperature = 0.7
+top_p = 0.95
+top_k = 4
+repetition_penalty = 1.06
+
 [behavior]
 # MLA latent values exceed FP8 E4M3 range — same rule as the other MLA
 # targets (Mistral-Small-4, DeepSeek-V4-Flash).
 default_kv_dtype = "bf16"
+# Without this the [sampling.*] presets above apply only to non-core paths and
+# a plain /v1/completions or /v1/chat/completions still gets Atlas's generic
+# defaults — the presets look wired and are not. (Same trap that left every
+# qwen target on generic sampling.)
+use_sampling_presets_for_core = true
 
 # ── Kernel lookups this target may legitimately fail to resolve ──
 # Harvested from the startup audit on the 1-layer validation slice. LongCat

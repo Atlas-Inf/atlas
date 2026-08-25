@@ -42,6 +42,16 @@ pub(super) fn build(
     gpu: &dyn GpuBackend,
     max_tokens: usize,
 ) -> Result<Option<NgramEmbedding>> {
+    // Bisection lever: ATLAS_NGRAM_DISABLE=1 serves the plain `embed_tokens`
+    // gather instead of the fused embedding. Output is WRONG (12/13 of the
+    // signal is missing) but deterministic, which is exactly what is needed to
+    // ask "is this concurrency bug mine, or does it predate the n-gram path?"
+    if std::env::var("ATLAS_NGRAM_DISABLE").is_ok() {
+        tracing::warn!(
+            "ATLAS_NGRAM_DISABLE set — n-gram embedding NOT installed;              output will be incorrect. Diagnostic use only."
+        );
+        return Ok(None);
+    }
     let Some(dims) = NgramDims::from_config(config) else {
         return Ok(None);
     };

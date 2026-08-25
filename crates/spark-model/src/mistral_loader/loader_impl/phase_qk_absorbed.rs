@@ -168,20 +168,24 @@ pub(crate) fn build_w_qk_absorbed(ctx: &mut MistralLayerCtx<'_>) -> Result<()> {
         let wqk_f32 = absorb_qk(&wqb_f32, &wuk_f32, n_kv, kv_lora, q_lora, nope, hd);
         let t_gemm = t.elapsed();
 
+        // Truncate FP32 → BF16 into one preallocated buffer. The `flat_map`
+        // + `to_le_bytes().to_vec()` this replaces heap-allocated a 2-byte
+        // `Vec` PER ELEMENT — 25.2M mallocs per LongCat sublayer, which cost
+        // ~177 ms against ~14 ms of actual upload. Same bytes: still the high
+        // half of the FP32, little-endian.
         let t = std::time::Instant::now();
-        let wqk_bf16: Vec<u8> = wqk_f32
-            .iter()
-            .flat_map(|&v| {
-                let bits = (v.to_bits() >> 16) as u16;
-                bits.to_le_bytes().to_vec()
-            })
-            .collect();
+        let mut wqk_bf16 = vec![0u8; wqk_f32.len() * 2];
+        for (dst, &v) in wqk_bf16.chunks_exact_mut(2).zip(wqk_f32.iter()) {
+            dst.copy_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        let t_convert = t.elapsed();
+        let t = std::time::Instant::now();
         gpu.copy_h2d(&wqk_bf16, wqk_ptr)?;
-        let t_convert_h2d = t.elapsed();
+        let t_h2d = t.elapsed();
         tracing::info!(
             "MLA phase C (W_QK_absorbed) L{}: total={:.1}ms | d2h ({:.1} MB)={:.1}ms, \
              bf16-widen={:.1}ms, cpu-gemm ({:.2}e9 fp32 MACs, {threads} threads)={:.1}ms, \
-             bf16-convert+h2d={:.1}ms",
+             bf16-convert={:.1}ms, h2d ({:.1} MB)={:.1}ms",
             ctx.layer_idx,
             t_phase.elapsed().as_secs_f64() * 1e3,
             (wqb_bytes + wuk_bytes) as f64 / 1e6,
@@ -189,7 +193,9 @@ pub(crate) fn build_w_qk_absorbed(ctx: &mut MistralLayerCtx<'_>) -> Result<()> {
             t_widen.as_secs_f64() * 1e3,
             (n_kv * kv_lora * q_lora * nope) as f64 / 1e9,
             t_gemm.as_secs_f64() * 1e3,
-            t_convert_h2d.as_secs_f64() * 1e3,
+            t_convert.as_secs_f64() * 1e3,
+            wqk_size as f64 / 1e6,
+            t_h2d.as_secs_f64() * 1e3,
         );
         if ctx.layer_idx == 0 {
             tracing::info!(
@@ -392,7 +398,78 @@ mod tests {
             t_ref.as_secs_f64() / t_new.as_secs_f64(),
             t_ref.as_secs_f64() / (t_new + t_widen).as_secs_f64(),
         );
+        // The FP32→BF16 pack was, after the GEMM fix, the biggest remaining
+        // item in this phase. A/B it here too.
+        let t = std::time::Instant::now();
+        let old_pack: Vec<u8> = got
+            .iter()
+            .flat_map(|&v| {
+                let bits = (v.to_bits() >> 16) as u16;
+                bits.to_le_bytes().to_vec()
+            })
+            .collect();
+        let t_pack_old = t.elapsed();
+        let t = std::time::Instant::now();
+        let mut new_pack = vec![0u8; got.len() * 2];
+        for (dst, &v) in new_pack.chunks_exact_mut(2).zip(got.iter()) {
+            dst.copy_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        let t_pack_new = t.elapsed();
+        println!(
+            "  bf16 pack ({} elems): flat_map+to_vec {t_pack_old:?} -> preallocated \
+             {t_pack_new:?} ({:.1}x), bytes equal: {}",
+            got.len(),
+            t_pack_old.as_secs_f64() / t_pack_new.as_secs_f64(),
+            old_pack == new_pack,
+        );
+        assert_eq!(old_pack, new_pack, "bf16 pack must stay byte-identical");
+
         assert_eq!(diffs, 0, "benchmark output must stay bit-exact");
+    }
+
+    /// The FP32→BF16 truncation must produce the exact bytes the old
+    /// `flat_map(|v| ...to_le_bytes().to_vec())` produced — the rewrite was
+    /// purely about removing 25.2M per-element heap allocations, not about
+    /// changing a single output byte.
+    #[test]
+    fn bf16_truncate_matches_old_flat_map() {
+        // Include the awkward cases the truncation has to round-trip:
+        // signed zeros, denormals, infinities, NaN, and the exact halfway
+        // patterns where a *rounding* implementation would differ from this
+        // truncating one.
+        let mut vals: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0x3f80_8000),
+            f32::from_bits(0x3f80_7fff),
+            f32::from_bits(0x0000_0001),
+        ];
+        let mut state = 0xdead_beefu64;
+        for _ in 0..4096 {
+            vals.push(f32::from_bits(rng(&mut state) as u32));
+        }
+
+        let want: Vec<u8> = vals
+            .iter()
+            .flat_map(|&v| {
+                let bits = (v.to_bits() >> 16) as u16;
+                bits.to_le_bytes().to_vec()
+            })
+            .collect();
+
+        let mut got = vec![0u8; vals.len() * 2];
+        for (dst, &v) in got.chunks_exact_mut(2).zip(vals.iter()) {
+            dst.copy_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+        }
+
+        assert_eq!(got, want, "bf16 truncation bytes diverged from the old form");
     }
 
     /// The BF16 widen is the exact high-half reinterpretation the loader's
