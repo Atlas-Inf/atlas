@@ -88,7 +88,29 @@ Framework Desktop, gfx1151, Windows 11 (10.0.26200), 127.3 GB, from
 | MTP | `Dense MTP head ready`; gate throughput-arbitrated at K=2 — confirms `mtp_layers = 1` |
 | serve + completion | coherent, 63 tok in 9.7 s |
 | `quick-speed-bench` | decode **17.9 tok/s** (server), TTFT **7170 ms**, TPOT 55.73 ms, n=5 (17.6-18.6) |
-| `bfcl-subset` | **not run** — blocked on the box's Python, see below |
+| `bfcl-subset` | ran 70/70, **zero tool calls** — a correctness bug, not a score; see `QWEN38_STRIX_PORT.md` |
+
+#### BFCL ran, and produced no usable score on either platform
+
+All 70 samples of the reduced draw completed here (2528 s) — and emitted **zero
+tool calls**, matching Linux exactly, subset for subset. Plain chat is coherent;
+the same prompt with `tools` returns `!!!!!!`. It reproduces identically on both
+platforms, so it is in the shared port rather than this recipe, and it is
+documented with its A/B evidence in
+[`QWEN38_STRIX_PORT.md`](QWEN38_STRIX_PORT.md). **No Windows BFCL accuracy
+number is publishable from this run**, which is consistent with what the status
+section above already said for different reasons.
+
+Scoring then failed separately, on a machine policy rather than anything in
+Atlas:
+
+```
+ImportError: DLL load failed while importing _tiktoken:
+             An Application Control policy has blocked this file.
+```
+
+`responses.jsonl` is kept and can be rescored elsewhere; the inference half does
+not need repeating.
 
 #### BFCL needs a Python that is not the newest one
 
@@ -102,13 +124,11 @@ ERROR: Could not find a version that satisfies the requirement faiss-cpu==1.11.0
        (from bfcl-eval) (from versions: 1.12.0, 1.13.0, ...)
 ```
 
-This box has 3.14.7 as its only interpreter (scoop's `main` bucket carries
-nothing older, and the pre-existing `code\bfcl\.venv` is 3.14.7 too), so the
-leg could not run. It is an environment prerequisite, **not** a port defect —
-nothing here reaches Atlas. Install a 3.12 interpreter and point `ATLAS_PYTHON`
-at it. Do not relax the pin to make it install: the pinned set is what every
-recorded BFCL score was produced against, and changing it silently changes what
-the number means.
+This box had 3.14.7 as its only interpreter. Resolved by installing 3.12
+(`winget install Python.Python.3.12`) and pointing `ATLAS_PYTHON` at it, which
+is what let the run above happen. Do not relax the pin instead: the pinned set
+is what every recorded BFCL score was produced against, and changing it silently
+changes what the number means.
 
 Two smaller traps on the same path, both from scoop's shims failing under a
 non-interactive SSH session: `python3`/`git` resolve to shims that cannot spawn
