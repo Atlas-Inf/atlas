@@ -102,6 +102,18 @@ impl ModelWeightLoader for LongcatWeightLoader {
             config.zero_expert_num,
         );
 
+        // Same measurement lever the Mistral MLA loader has: ATLAS_NVFP4_MLA=0
+        // keeps the MLA projections in BF16, which separates "the port's math
+        // is wrong" from "4-bit quantization of these projections is lossy".
+        let disable_nvfp4_mla = std::env::var("ATLAS_NVFP4_MLA")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "0" | "false" | "no" | "off")
+            })
+            .unwrap_or(false);
+        if disable_nvfp4_mla {
+            tracing::info!("LongCat: ATLAS_NVFP4_MLA=0 — MLA projections stay BF16");
+        }
         let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
         let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
         let stream = gpu.default_stream();
@@ -229,13 +241,13 @@ impl ModelWeightLoader for LongcatWeightLoader {
                 let mla = MlaWeights {
                     wq_a,
                     wq_a_fp8: None,
-                    wq_a_nvfp4: c.wq_a_nvfp4,
+                    wq_a_nvfp4: if disable_nvfp4_mla { None } else { c.wq_a_nvfp4 },
                     wq_b,
                     wq_b_fp8: None,
-                    wq_b_nvfp4: c.wq_b_nvfp4,
+                    wq_b_nvfp4: if disable_nvfp4_mla { None } else { c.wq_b_nvfp4 },
                     q_a_norm,
                     wkv_a,
-                    wkv_a_nvfp4: c.wkv_a_nvfp4,
+                    wkv_a_nvfp4: if disable_nvfp4_mla { None } else { c.wkv_a_nvfp4 },
                     wkv_b,
                     kv_a_norm,
                     wkv_a_rope: c.wkv_a_rope_dense.expect("set above"),
@@ -243,7 +255,7 @@ impl ModelWeightLoader for LongcatWeightLoader {
                         weight: wkv_a.weight,
                     },
                     wo,
-                    wo_nvfp4: Some(o_nvfp4),
+                    wo_nvfp4: if disable_nvfp4_mla { None } else { Some(o_nvfp4) },
                     wo_a: null,
                     wo_a_nvfp4: None,
                     wo_b: null,
@@ -308,6 +320,10 @@ impl ModelWeightLoader for LongcatWeightLoader {
                 // Padding widened the head to 256; the scale must remain
                 // 1/sqrt(192), the TRUE qk head width.
                 layer.set_attn_scale_override(attn_scale);
+                // The attention chain strides Q/K/V by `head_dim_override`,
+                // which must be the PADDED width the weights now emit — the
+                // config's 192 would slice every head short.
+                layer.set_dimension_overrides(padded_hd, n_heads, n_heads);
 
                 if s == 0 {
                     // Sublayer 0 owns the block's shortcut MoE; its output is

@@ -333,6 +333,20 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
+            // ATLAS_OP_DUMP hook: the SHORTCUT MoE output (zero-experts already
+            // folded in), captured before the dense FFN reuses this buffer.
+            // Distinct from "moe_out" below, which is the dense FFN delta.
+            if num_tokens > 0 {
+                super::super::op_dump::dump_bf16(
+                    ctx.gpu,
+                    moe_out,
+                    (num_tokens - 1) * h * bf16,
+                    h,
+                    self.attn_layer_idx,
+                    "shortcut_moe_out",
+                    stream,
+                )?;
+            }
             ctx.gpu
                 .copy_d2d_async(moe_out, carry, num_tokens * h * 2, stream)?;
         }

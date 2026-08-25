@@ -150,16 +150,20 @@ for s in range(2):
     h = h + mla(x, f'{lp}.self_attn.{s}', cos, sin)
     x = rms_norm(h, tensor(f'{lp}.post_attention_layernorm.{s}.weight'))
     dump[f'sub{s}_post_attn_norm_out'] = x[-1].copy()
+    # The engine dumps the DENSE FFN delta as "moe_out" and the shortcut MoE
+    # separately as "shortcut_moe_out", so record both here under matching
+    # names rather than one conflated stage.
+    dense = mlp(x, tensor(f'{lp}.mlps.{s}.gate_proj.weight'),
+                tensor(f'{lp}.mlps.{s}.up_proj.weight'),
+                tensor(f'{lp}.mlps.{s}.down_proj.weight'))
+    dump[f'sub{s}_dense_ffn'] = dense[-1].copy()
     if s == 0:
         shortcut = moe(x, lp)
-        dump['sub0_moe_out'] = shortcut[-1].copy()
-        h = h + mlp(x, tensor(f'{lp}.mlps.0.gate_proj.weight'),
-                    tensor(f'{lp}.mlps.0.up_proj.weight'),
-                    tensor(f'{lp}.mlps.0.down_proj.weight'))
+        dump['sub0_shortcut_moe'] = shortcut[-1].copy()
+        dump['sub0_moe_out'] = shortcut[-1].copy()  # back-compat alias
+        h = h + dense
     else:
-        h = h + mlp(x, tensor(f'{lp}.mlps.1.gate_proj.weight'),
-                    tensor(f'{lp}.mlps.1.up_proj.weight'),
-                    tensor(f'{lp}.mlps.1.down_proj.weight')) + shortcut
+        h = h + dense + shortcut
     dump[f'sub{s}_out'] = h[-1].copy()
 
 assert np.allclose(h, gold['layer0_out'], atol=1e-3), 'stage ref drifted from golden'
