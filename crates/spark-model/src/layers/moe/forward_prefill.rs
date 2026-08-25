@@ -277,22 +277,15 @@ impl MoeLayer {
                     stream,
                 )?;
             } else if ctx.config.scoring_func == "softmax" {
-                // LongCat-Flash softmax+bias routing with zero-expert fold
-                // (see forward.rs decode twin).
-                ops::moe_topk_softmax_bias_batched(
-                    ctx.gpu,
-                    self.moe_topk_softmax_bias_batched_k,
+                self.router_softmax_bias_batched(
                     gate_logits,
                     bias,
                     indices_dev,
                     weights_dev,
-                    self.zero_accum_dev,
-                    self.router_logits_n,
                     num_experts,
                     top_k,
-                    ctx.config.norm_topk_prob,
-                    ctx.config.routed_scaling_factor as f32,
                     n,
+                    ctx,
                     stream,
                 )?;
             } else {
