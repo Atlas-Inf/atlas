@@ -3,13 +3,6 @@ name = "longcat-flash-lite"
 hf_id = "meituan-longcat/LongCat-Flash-Lite"
 model_type = "longcat_flash_ngram"
 architecture = "mla_dual_sublayer_moe_ngram"
-# Compile Mistral-Small-4's kernel tree: both are MLA + MoE with the same
-# INTERLEAVED rope convention on disk, and LongCat's rope de-interleave is
-# folded into the WEIGHTS at load (weight_loader/longcat/prep.rs) so the
-# rotate_half arm is the one that must run — SSOT rather than vendoring a
-# second copy of the MLA .cu files. LongCat's own MODEL.toml (below) still
-# supplies model_types / behavior.
-kernel_source = "mistral-small-4"
 parameters = "27B"
 active_parameters = "3B"
 
@@ -59,7 +52,7 @@ default_kv_dtype = "bf16"
 
 # ── Kernel lookups this target may legitimately fail to resolve ──
 # Harvested from the startup audit on the 1-layer validation slice. LongCat
-# compiles Mistral-Small-4's kernel tree (`kernel_source` above), so it
+# vendors ONLY the MLA kernels (nvfp4/), taking everything else from common/, so it
 # inherits Mistral's absences plus the families neither MLA target ships.
 # Every entry's dispatch site is gated on `handle != 0` and falls back to a
 # kernel that DOES resolve — the audit exists so a silent fallback is a
@@ -146,3 +139,7 @@ rope_forward_proportional = "Gemma-4-only arm; the rope_proportional flag is nev
 rope_forward_yarn_interleaved = "DeepSeek-V4 interleaved-YaRN arm; LongCat's interleave is folded into weights at load, so the rotate_half arm is correct here."
 rope_forward_yarn_interleaved_inv = "Same V4 interleaved-YaRN family."
 rope_forward_yarn_scaled = "Laguna-S 2.1 rotate_half YaRN variant; resolved via try_kernel elsewhere, absent from this shadow."
+
+
+[expected_absent.moe_silu_mul]
+silu_mul_quant_fp8 = "This target's vendored moe_silu_mul.cu is the swiglu_limit shadow, which deliberately omits the fused FP8 SiLU+quant entry point; the launch site checks the handle and falls back to the unfused silu_mul -> per_token_group_quant_fp8 pair. LongCat's experts are runtime-quantized NVFP4 (the checkpoint ships plain BF16), so the FP8 MoE arm is not on a served path anyway."
