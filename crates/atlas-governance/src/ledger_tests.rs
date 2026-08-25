@@ -2,12 +2,11 @@
 
 //! Tests for the journey ledger.
 //!
-//! No mocking: `lattice_core`'s storage is an injected trait and the engine runs
 //! fully in memory, so these exercise the real materialisation path rather than
 //! a stand-in for it. The filesystem cases use a real temporary directory.
 
 use super::event::{Event, EventKind, Verdict};
-use super::ledger::{self, Journey, append, materialize, path_for, read_all};
+use super::ledger::{self, Journey, append, path_for, read_all};
 
 fn ev(sha: &str, attempt: u32, kind: EventKind) -> Event {
     Event {
@@ -225,60 +224,6 @@ fn missing_and_fail_are_distinct_on_the_wire() {
     assert!(m.contains("\"missing\""), "{m}");
     assert!(f.contains("\"fail\""), "{f}");
     assert_ne!(m, f);
-}
-
-/// The materialised graph holds one node per commit plus one per event, with
-/// an edge from each commit to what was observed at it.
-#[test]
-fn materialize_builds_commit_and_event_nodes() {
-    let journey = Journey {
-        events: vec![
-            ev("aaa", 0, gate("bfcl-subset", Verdict::Missing)),
-            ev("aaa", 0, gate("ttft-warm-gate", Verdict::Pass)),
-            ev("bbb", 0, gate("bfcl-subset", Verdict::Pass)),
-        ],
-    };
-    let engine = materialize(&journey).unwrap();
-    // 2 commits + 3 events
-    assert_eq!(engine.point_ids().unwrap().len(), 5);
-
-    // Commit `aaa` sorts first, so it is node 0 and observed two events.
-    let edges = engine.get_edges(0).unwrap();
-    assert_eq!(edges.len(), 2, "commit aaa observed two events");
-    assert!(edges.iter().all(|e| e.relation == "observed"));
-}
-
-/// ★ Commit node ids must not shift as events are appended.
-///
-/// Ids are assigned commits-first precisely so that materialising again after
-/// more events arrive leaves each commit where it was. If they moved, an edge
-/// recorded by an earlier materialisation would point at a different node.
-#[test]
-fn commit_ids_are_stable_as_events_are_appended() {
-    let first = Journey {
-        events: vec![ev("aaa", 0, gate("bfcl-subset", Verdict::Missing))],
-    };
-    let engine_a = materialize(&first).unwrap();
-    let sha_before = engine_a.get_point(0).unwrap().unwrap();
-
-    let mut later = first.clone();
-    later
-        .events
-        .push(ev("aaa", 1, gate("bfcl-subset", Verdict::Pass)));
-    let engine_b = materialize(&later).unwrap();
-    let sha_after = engine_b.get_point(0).unwrap().unwrap();
-
-    assert_eq!(
-        sha_before.payload.get("sha"),
-        sha_after.payload.get("sha"),
-        "commit node 0 moved when an event was appended"
-    );
-}
-
-#[test]
-fn an_empty_journey_materializes_to_an_empty_graph() {
-    let engine = materialize(&Journey::default()).unwrap();
-    assert!(engine.point_ids().unwrap().is_empty());
 }
 
 /// The traversal the graph exists for: a gate's history at one glance.

@@ -7,7 +7,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use lattice_core::{CollectionConfig, CollectionEngine, Distance, HnswConfig, Point, VectorConfig};
 
 use crate::event::Event;
 
@@ -77,85 +76,6 @@ pub fn read_all(path: &Path) -> Result<Journey> {
         );
     }
     Ok(Journey { events })
-}
-
-/// Vector width of the materialised collection.
-///
-/// ★ One, and the vectors are not embeddings. This build materialises the
-/// GRAPH only; the vector field exists because the engine requires one, and is
-/// filled with a constant. When the embedder is wired in, this becomes the
-/// embedding dimension **read from the first live response** — never a
-/// hardcoded constant, because a model swap silently changing the width would
-/// leave the index returning confident nonsense. Keeping the placeholder
-/// obviously degenerate is what stops it being mistaken for a real dimension
-/// later.
-const PLACEHOLDER_DIM: usize = 1;
-
-/// Build the in-memory graph from a journey.
-///
-/// Returns an engine holding one node per event plus one per commit, with
-/// `observed` edges from commit to event. Nothing is written to disk: the graph
-/// is derived data, rebuilt on demand, and committing it would put an
-/// unmergeable binary in the merge path.
-pub fn materialize(journey: &Journey) -> Result<CollectionEngine> {
-    let config = CollectionConfig::new(
-        "journey",
-        VectorConfig::new(PLACEHOLDER_DIM, Distance::Cosine),
-        HnswConfig {
-            m: 16,
-            m0: 32,
-            ml: HnswConfig::recommended_ml(16),
-            ef: 100,
-            ef_construction: 200,
-        },
-    )
-    .with_relation("observed", 0)
-    .with_relation("precedes", 1);
-
-    let mut engine =
-        CollectionEngine::new(config).map_err(|e| anyhow::anyhow!("creating collection: {e}"))?;
-
-    // Commits get the low ids so an id is stable as events are appended: a
-    // commit's node must not move when a later run adds events, or edges
-    // recorded by an earlier materialisation would point somewhere else.
-    let mut commits: Vec<&str> = journey.events.iter().map(|e| e.head_sha.as_str()).collect();
-    commits.sort_unstable();
-    commits.dedup();
-
-    let mut points = Vec::new();
-    for (i, sha) in commits.iter().enumerate() {
-        points.push(
-            Point::new_vector(i as u64, vec![1.0; PLACEHOLDER_DIM])
-                .with_field("label", br#""commit""#.to_vec())
-                .with_field("sha", serde_json::to_vec(sha).unwrap_or_default()),
-        );
-    }
-    let commit_base = commits.len() as u64;
-    for (i, event) in journey.events.iter().enumerate() {
-        points.push(
-            Point::new_vector(commit_base + i as u64, vec![1.0; PLACEHOLDER_DIM])
-                .with_field(
-                    "label",
-                    serde_json::to_vec(event.node_label()).unwrap_or_default(),
-                )
-                .with_field("at", serde_json::to_vec(&event.at).unwrap_or_default())
-                .with_field("kind", serde_json::to_vec(&event.kind).unwrap_or_default()),
-        );
-    }
-    engine
-        .upsert_points(points)
-        .map_err(|e| anyhow::anyhow!("upserting journey points: {e}"))?;
-
-    for (i, event) in journey.events.iter().enumerate() {
-        let Ok(commit_idx) = commits.binary_search(&event.head_sha.as_str()) else {
-            continue;
-        };
-        engine
-            .add_edge(commit_idx as u64, commit_base + i as u64, "observed", 1.0)
-            .map_err(|e| anyhow::anyhow!("adding observed edge: {e}"))?;
-    }
-
-    Ok(engine)
 }
 
 /// The conventional path for a pull request's journey.

@@ -11,11 +11,7 @@
 //!
 //! ```text
 //!   CANONICAL  ── governance/pr-<n>.jsonl ──  text, append-only, in git
-//!        │                                    reviewable in a diff
-//!        │ materialize()
-//!        ▼
-//!   DERIVED    ── lattice-db graph        ──  binary, local, disposable
-//!                                            traversals and similarity
+//!                                             reviewable in a diff
 //! ```
 //!
 //! The JSONL is the system of record and the only thing committed. The graph is
@@ -52,4 +48,4 @@ pub mod ledger;
 mod ledger_tests;
 
 pub use event::{Event, EventKind, Verdict};
-pub use ledger::{Journey, append, materialize, read_all};
+pub use ledger::{Journey, append, read_all};

@@ -71,16 +71,7 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# ★ One entry, and `unknown-git` stays "deny".
-#
-# `atlas-governance` depends on LatticeDB for the PR journey ledger's
-# materialised graph. It is an external upstream repository, and the dependency
-# is pinned to an exact `rev` in that crate's manifest — a git source without a
-# pin is a moving target that can change under a committed Cargo.lock, which is
-# the actual hazard this check exists to catch.
-#
-# The version it needs (`interchange`, the logical JSONL dump) is not on
-# crates.io yet. When it is published, this entry should be REMOVED and the
-# dependency switched to a registry version — an allow-list that outlives its
-# reason is how the next git dependency slips in unnoticed.
-allow-git = ["https://github.com/Avarok-Cybersecurity/lattice-db"]
+# No git sources. `unknown-git` stays "deny": a git dependency without a
+# pinned rev is a moving target under a committed Cargo.lock, which is the
+# hazard this check exists to catch.
+allow-git = []
