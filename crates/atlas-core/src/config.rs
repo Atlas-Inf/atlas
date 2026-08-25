@@ -452,6 +452,21 @@ pub struct ModelConfig {
     /// `*lora_rank` collision (`config.rs:182-207`).
     #[serde(default)]
     pub adapter_max_rank: usize,
+
+    // ── N-gram scaled embeddings (arXiv:2601.21204) ──
+    // The trio travels together: all three present enables the path, all three
+    // absent disables it, and any partial subset is a malformed checkpoint that
+    // `validate_ngram_trio` refuses rather than half-configuring.
+    /// Table row count is `ngram_vocab_size_ratio * vocab_size + 2*index + 1`.
+    /// `0` means the checkpoint declares no n-gram embeddings.
+    #[serde(default)]
+    pub ngram_vocab_size_ratio: usize,
+    /// Largest n-gram size N; shifts of 1..N-1 tokens feed the hash.
+    #[serde(default)]
+    pub emb_neighbor_num: usize,
+    /// Hash splits K per n-gram size, giving `K * (N-1)` tables in total.
+    #[serde(default)]
+    pub emb_split_num: usize,
 }
 
 /// Advertised weight-quantization layout, as declared in the HF
@@ -577,12 +592,14 @@ mod dispatch;
 mod factory;
 mod gguf;
 mod methods;
+mod ngram;
 mod parsers;
 #[cfg(test)]
 mod tests;
 
 pub use dispatch::parse_config;
 pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
+pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos};
 pub use parsers::{
     PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
     parse_peft_adapter_config, parse_quantization_config,

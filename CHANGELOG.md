@@ -17,6 +17,15 @@ behind specific subsystems — see the
   failed gate (2).
 - `--version`, sourced from the packaged version so a build cannot report a
   version it was not packaged as.
+- **N-gram scaled embeddings: id core and validity envelope** (`NgramDims`,
+  `ngram_ids`), the groundwork for the LongCat / Qwen3.8-Flash-Next family whose
+  embedding tables are far larger than their backbones. Row ids are a polynomial
+  rolling hash over token ids only, with document-boundary resets, checked
+  bit-exact against a dependency-free reference (`bench/ngram_embed/`) at real
+  LongCat-Flash-Lite dimensions. A config declaring the trio is validated, not
+  assumed: table counts that would exceed the u32 the gather kernels index with,
+  a `hidden_size` that does not divide by the table count, an accumulator that
+  would wrap u64, and partially-declared trios are all refused at parse.
 
 ### Fixed
 - **Benchmark runs no longer overwrite each other.** History files were named by

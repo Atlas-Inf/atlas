@@ -122,6 +122,10 @@ impl ModelConfig {
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
             adapter_max_rank: 0,
+            // No n-gram embeddings: the trio is opt-in per checkpoint.
+            ngram_vocab_size_ratio: 0,
+            emb_neighbor_num: 0,
+            emb_split_num: 0,
         }
     }
 }
