@@ -221,6 +221,16 @@ pub struct MoeLayer {
     // ── hash routing (DeepSeek-V4 first `num_hash_layers` MoE layers) ──
     moe_hash_route_k: KernelHandle,
     moe_hash_route_batched_k: KernelHandle,
+    // ── LongCat softmax+bias routing with zero-computation experts ──
+    /// Router logit width = num_experts + zero_expert_num. Equal to
+    /// num_experts on every non-LongCat model (behavior-neutral).
+    pub(crate) router_logits_n: u32,
+    moe_topk_softmax_bias_k: KernelHandle,
+    moe_topk_softmax_bias_batched_k: KernelHandle,
+    moe_zero_expert_add_k: KernelHandle,
+    /// Per-token folded zero-expert weight (f32, written by the softmax+bias
+    /// router kernels). Fixed-size allocation (16K tokens) — graph-safe.
+    zero_accum_dev: DevicePtr,
     /// Static `tid2eid` table [vocab_size, top_k] i64 — present ONLY for the
     /// hash-routed layers (the loader supplies it only for those). `Some`
     /// here is the SSOT that this layer routes via the static hash table

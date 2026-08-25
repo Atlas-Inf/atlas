@@ -16,6 +16,14 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // LongCat zero-experts are wired only on the single-token decode
+        // + prefill paths (v1); this variant would silently mis-route the
+        // 384-wide router. Named refusal, not silent wrongness.
+        anyhow::ensure!(
+            self.router_logits_n as usize == ctx.config.num_experts,
+            "zero-expert MoE routing is not wired on this dispatch variant yet"
+        );
+
         // SOLID Incr-4: batched decode folds the routed-expert gate/up + down
         // LoRA delta per token (below) AND the router (mlp.gate) delta on the
         // whole-batch gate_logits before top-k (`apply_router_lora_batched`,

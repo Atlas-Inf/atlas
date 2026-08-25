@@ -84,6 +84,7 @@ impl ModelConfig {
             mrope_section: [0, 0, 0],
             mrope_interleaved: false,
             kv_lora_rank: 0,
+            zero_expert_num: 0,
             ngram_vocab_size_ratio: 0,
             emb_neighbor_num: 0,
             emb_split_num: 0,

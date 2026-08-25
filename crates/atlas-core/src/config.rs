@@ -70,6 +70,12 @@ pub struct ModelConfig {
     // ── MoE ──
     #[serde(default)]
     pub num_experts: usize,
+    /// LongCat-Flash zero-computation "identity" experts: the router scores
+    /// `num_experts + zero_expert_num` logits, and a token routed to an
+    /// expert id `>= num_experts` receives the INPUT itself scaled by the
+    /// routing weight instead of an expert FFN. 0 = no zero-experts.
+    #[serde(default)]
+    pub zero_expert_num: usize,
     /// Top-K experts activated per token (the "A" in 35B-A3B = 3B
     /// active params).
     #[serde(default = "default_one")]

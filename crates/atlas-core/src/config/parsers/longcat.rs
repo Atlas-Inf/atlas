@@ -8,11 +8,14 @@
 //! 2601.21204). Its config uses several non-HF-standard key names, mapped
 //! here onto `ModelConfig`'s existing fields:
 //!
-//!   num_layers            → num_hidden_layers   (NOTE: the HF modeling file
-//!                            sets `num_hidden_layers = 2 * num_layers` for
-//!                            its dual-sublayer "shortcut" blocks; Atlas
-//!                            records the CHECKPOINT layer count and the
-//!                            future backbone port owns the 2x expansion)
+//!   num_layers            → num_hidden_layers = 2 * num_layers (the HF
+//!                            modeling file makes the same 2x expansion: each
+//!                            checkpoint layer is a dual-sublayer "shortcut"
+//!                            block = 2 MLA attention + 2 dense MLP + one
+//!                            shortcut MoE. Atlas serves each SUBLAYER as one
+//!                            engine layer, so the engine layer count, the KV
+//!                            sizing and `layer_types` all use 2x; the loader
+//!                            iterates checkpoint layers `num_hidden_layers/2`)
 //!   n_routed_experts      → num_experts
 //!   moe_topk              → num_experts_per_tok
 //!   expert_ffn_hidden_size→ moe_intermediate_size
@@ -49,6 +52,13 @@ pub(crate) fn parse_longcat_ngram(raw: &Value) -> Result<ModelConfig> {
         {
             object.insert(to.into(), v);
         }
+    }
+
+    // The HF modeling file's own quirk, mirrored: each checkpoint layer is
+    // TWO engine sublayers (2x MLA + 2x dense MLP + shortcut MoE), so every
+    // engine-facing layer count is 2x the checkpoint `num_layers`.
+    if let Some(n) = object.get("num_hidden_layers").and_then(Value::as_u64) {
+        object.insert("num_hidden_layers".into(), Value::from(n * 2));
     }
 
     // eos_token_id may be an array (like laguna); take the primary.
@@ -107,6 +117,27 @@ pub(crate) fn parse_longcat_ngram(raw: &Value) -> Result<ModelConfig> {
         );
     }
 
+    // MLA attention geometry the shared MLA loader pipeline expects:
+    // head_dim = the FULL qk head width (nope + rope), one KV "head" per
+    // attention head (MLA has a single shared latent; the per-head fields
+    // exist for the wq_b/wkv_b splits).
+    if config.head_dim == 0 {
+        config.head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim;
+    }
+    if config.num_key_value_heads == 0 {
+        config.num_key_value_heads = config.num_attention_heads;
+    }
+    // Every sublayer is MLA full attention (the model has no GDN/SSM mix).
+    if config.layer_types.is_empty() {
+        config.layer_types = vec![super::super::LayerType::FullAttention; config.num_hidden_layers];
+    }
+    // Router: fp32 softmax over num_experts + zero_expert_num logits, top-k
+    // SELECTED with e_score_correction_bias but WEIGHTED by the unbiased
+    // softmax scores * routed_scaling_factor, never renormalized among the
+    // selected k.
+    config.scoring_func = "softmax".to_string();
+    config.norm_topk_prob = false;
+
     config.model_type = "longcat_flash_ngram".to_string();
     finalize_config(&mut config, raw)?;
     Ok(config)
@@ -135,6 +166,7 @@ mod tests {
             "v_head_dim": 128,
             "n_routed_experts": 256,
             "moe_topk": 12,
+            "routed_scaling_factor": 6.0,
             "zero_expert_num": 128,
             "ngram_vocab_size_ratio": 78,
             "emb_neighbor_num": 4,
@@ -150,7 +182,15 @@ mod tests {
     #[test]
     fn parses_lite_config() {
         let c = parse_longcat_ngram(&lite_config()).unwrap();
-        assert_eq!(c.num_hidden_layers, 14);
+        // 14 checkpoint layers → 28 engine sublayers (dual-sublayer blocks).
+        assert_eq!(c.num_hidden_layers, 28);
+        assert_eq!(c.layer_types.len(), 28);
+        assert_eq!(c.head_dim, 192);
+        assert_eq!(c.num_key_value_heads, 32);
+        assert_eq!(c.zero_expert_num, 128);
+        assert_eq!(c.scoring_func, "softmax");
+        assert!(!c.norm_topk_prob);
+        assert_eq!(c.routed_scaling_factor, 6.0);
         assert_eq!(c.num_experts, 256);
         assert_eq!(c.num_experts_per_tok, 12);
         assert_eq!(c.moe_intermediate_size, 1024);
