@@ -50,6 +50,51 @@ No Windows accuracy number for 3.8 is publishable yet; a clean fault-free full
 run does not exist on either ROCm. Accuracy measured so far also sits below the
 Qwen3.6 baseline, most sharply on the `live_*` families.
 
+### Building from source: six things that were broken, and are not any more
+
+Everything above was produced from a **packaged** binary. Driving
+`first_run.ps1` from a clean source checkout on 2026-08-25 found six separate
+faults between `cargo build` and a server that answers a request. None of them
+are Windows-specific bugs in Atlas; five are places where this recipe had drifted
+from `serve-amd.sh`, which had already solved the same problem on Linux.
+
+| # | Symptom | Cause |
+|---|---|---|
+| 1 | `spark.exe` exits `0xC0000409`, prints nothing, no WER entry | the HIP shim `cuda.dll`/`nvcuda.dll` are built into `atlas-kernels`' `OUT_DIR` for the *packaging* step and were never staged beside the exe |
+| 2 | 3.8 weights served under the 3.6 name | `--model-name` was hardcoded; it is the needle `match_names` uses to break the 3.6/3.8 tie |
+| 3 | `No memory left for KV cache` — 57.8 GB used for a 21.8 GB model | `ATLAS_NO_GDN_FP8_PREFILL` unset, so the FP8-source reclaim refused and 11.56 GB of sources stayed resident |
+| 4 | still 3.6 GB short after (3) | `--max-prefill-tokens` never passed; the 8192 default sizes a 3.6 GB buffer arena |
+| 5 | boot refused: 94 unresolved kernel lookups | the gfx1151 kernel set is smaller than gb10's; `serve-amd.sh` has passed `--dangerously-allow-unresolved-kernel-lookups` since the audit landed |
+| 6 | boots clean, then HTTP 500 on every request | `ATLAS_FP8_LDMAB` unset; `fp8_fp8_gemm_ldmab` is NVIDIA-only and its lookup is a hard failure, not a soft fallback |
+
+Fault 6 is the nastiest to read: the server logs `Server live and ready`, binds
+the port, answers `/v1/models`, and then fails **every** completion, because the
+lookup is issued lazily after the boot audit has already sealed.
+
+The defaults now match `serve-amd.sh` (`0.86` utilisation, `16384` max-seq-len,
+`2048` max-prefill-tokens). All remain overridable — see the header.
+
+### Source-build validation, 2026-08-25
+
+Framework Desktop, gfx1151, Windows 11 (10.0.26200), 127.3 GB, from
+`port/qwen3.8-windows` at the head of this branch:
+
+| Leg | Result |
+|---|---|
+| build, HIP SDK 7.2 | **green** — 99/285 unique nvcc invocations (186 cache hits, 2.9x dedup) |
+| build, HIP SDK 6.4 | **green** — same counts; stages the 6.x DLL names (`amdhip64_6`, `amd_comgr_2`, `hiprtc0604`) |
+| kernel symlinks | 262/262 materialised from the object store |
+| target resolution | `(gfx1151, qwen3.8-27b, nvfp4)`, 95 modules, with **both** 3.6 and 3.8 embedded (`ATLAS_TARGET_MODEL=*`) — the `match_names` tie-break works |
+| MTP | `Dense MTP head ready`; gate throughput-arbitrated at K=2 — confirms `mtp_layers = 1` |
+| serve + completion | coherent, 63 tok in 9.7 s |
+| `quick-speed-bench` | decode **17.9 tok/s** (server), TTFT **7170 ms**, TPOT 55.73 ms, n=5 (17.6-18.6) |
+
+Run on ROCm **6.4**. ROCm 7.2 reproduced the status-719 hard fault from the table
+above during model build, so it was not used for measurement. The perf figures
+are a **baseline, not a gate** — Qwen3.8-27B carries no committed thresholds, and
+the 94 fallback dispatch sites mean no Strix number is final. See
+`--dangerously-allow-unresolved-kernel-lookups` above.
+
 ## OK, how do I test it?
 
 **You do not need to build anything.** Grab the prebuilt zip CI already publishes,
