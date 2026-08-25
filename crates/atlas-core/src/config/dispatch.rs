@@ -44,9 +44,28 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
     let raw: serde_json::Value =
         serde_json::from_str(json).context("Invalid JSON in config.json")?;
 
+    // A remote-code checkpoint may declare ONLY `architectures` + `auto_map`
+    // and no `model_type` at all — LongCat-Flash-Lite ships exactly that
+    // (`architectures: ["LongcatFlashNgramForCausalLM"]`). Without this
+    // fallback such a config silently falls through to the generic parse and
+    // loses its family, so map the known architecture names onto their
+    // model_type. Only consulted when `model_type` is absent/empty, so no
+    // existing checkpoint changes behaviour.
     let top_model_type = raw
         .get("model_type")
         .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            raw.get("architectures")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(serde_json::Value::as_str)
+                .and_then(|arch| match arch {
+                    "LongcatFlashNgramForCausalLM" => Some("longcat_flash_ngram"),
+                    "LongcatFlashForCausalLM" => Some("longcat_flash"),
+                    _ => None,
+                })
+        })
         .unwrap_or("");
 
     match top_model_type {

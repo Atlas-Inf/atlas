@@ -131,6 +131,18 @@ pub(crate) fn parse_longcat_ngram(raw: &Value) -> Result<ModelConfig> {
     if config.layer_types.is_empty() {
         config.layer_types = vec![super::super::LayerType::FullAttention; config.num_hidden_layers];
     }
+    // PLAIN rope, explicitly. LongCat declares no rope scaling (the HF
+    // reference takes its `rope_type == "default"` branch: no YaRN, no
+    // mscale), but the shared MLA loader ALWAYS builds a YaRN inv_freq table
+    // and its `compute_yarn_inv_freq` defaults to factor=128 when a config is
+    // silent — which would silently YaRN-scale every rope frequency. At
+    // factor 1.0 the interpolation and extrapolation terms are identical, so
+    // the table reduces to the plain 1/theta^(2j/dim) rope, and
+    // `yarn_rope_mscale` short-circuits to 1.0 (its `factor <= 1.0` gate).
+    if config.yarn_factor == 0.0 {
+        config.yarn_factor = 1.0;
+    }
+
     // Router: fp32 softmax over num_experts + zero_expert_num logits, top-k
     // SELECTED with e_score_correction_bias but WEIGHTED by the unbiased
     // softmax scores * routed_scaling_factor, never renormalized among the
@@ -191,6 +203,8 @@ mod tests {
         assert_eq!(c.scoring_func, "softmax");
         assert!(!c.norm_topk_prob);
         assert_eq!(c.routed_scaling_factor, 6.0);
+        // Plain rope: factor 1.0 makes the shared YaRN table reduce to it.
+        assert_eq!(c.yarn_factor, 1.0);
         assert_eq!(c.num_experts, 256);
         assert_eq!(c.num_experts_per_tok, 12);
         assert_eq!(c.moe_intermediate_size, 1024);
@@ -204,6 +218,20 @@ mod tests {
         let tables = c.emb_split_num * (c.emb_neighbor_num - 1);
         assert_eq!(tables, 12);
         assert_eq!(c.hidden_size / tables, 256);
+    }
+
+    /// The REAL checkpoint declares no `model_type` — only `architectures`
+    /// — so dispatch must route it by architecture name or the family is
+    /// silently lost to the generic parse.
+    #[test]
+    fn architectures_only_config_routes_to_longcat() {
+        let mut v = lite_config();
+        v.as_object_mut().unwrap().remove("model_type");
+        let json = serde_json::to_string(&v).unwrap();
+        let c = crate::config::parse_config(&json).unwrap();
+        assert_eq!(c.model_type, "longcat_flash_ngram");
+        assert_eq!(c.num_hidden_layers, 28);
+        assert_eq!(c.zero_expert_num, 128);
     }
 
     #[test]

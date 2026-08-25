@@ -42,7 +42,7 @@ use crate::mistral_loader::loader_impl::{ctx as mctx, phase_block_diag, phase_pe
 use crate::weight_loader::ModelWeightLoader;
 use crate::weight_map::{
     AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, MtpWeights, QuantizedWeight, dense,
-    dense_f32_as_bf16, quantize_to_nvfp4, quantized_auto,
+    dense_f32_as_bf16, quantize_to_nvfp4, quantized_any,
 };
 
 pub struct LongcatWeightLoader;
@@ -426,14 +426,27 @@ fn build_shortcut_moe(
         weight: alloc_zero(h * 2)?,
     };
 
-    let variant = crate::weight_map::Nvfp4Variant::Standard;
+    // LongCat ships PLAIN BF16 experts (torch_dtype bfloat16, no NVFP4/FP8
+    // metadata), so they are runtime-quantized at load — the Bf16Raw variant.
+    let variant = crate::weight_map::detect_nvfp4_variant(store, config);
+    let qctx = crate::weight_map::QuantizeCtx {
+        absmax_k: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
+        quantize_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+        stream: gpu.default_stream(),
+    };
     let mut experts = Vec::with_capacity(config.num_experts);
     for e in 0..config.num_experts {
         let ep = format!("{p}.experts.{e}");
         experts.push(ExpertWeight {
-            gate_proj: quantized_auto(store, &format!("{ep}.gate_proj"), gpu, variant)?,
-            up_proj: quantized_auto(store, &format!("{ep}.up_proj"), gpu, variant)?,
-            down_proj: quantized_auto(store, &format!("{ep}.down_proj"), gpu, variant)?,
+            gate_proj: quantized_any(
+                store, &format!("{ep}.gate_proj"), inter, h, gpu, variant, qctx,
+            )?,
+            up_proj: quantized_any(
+                store, &format!("{ep}.up_proj"), inter, h, gpu, variant, qctx,
+            )?,
+            down_proj: quantized_any(
+                store, &format!("{ep}.down_proj"), h, inter, gpu, variant, qctx,
+            )?,
         });
     }
 
