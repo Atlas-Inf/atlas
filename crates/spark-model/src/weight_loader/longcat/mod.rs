@@ -83,6 +83,14 @@ impl ModelWeightLoader for LongcatWeightLoader {
         // The reference's mla_scale_{q,kv}_lora flags (both true on Lite).
         let scale_q = (h as f32 / q_lora as f32).sqrt();
         let scale_kv = (h as f32 / kv_lora as f32).sqrt();
+        // Head-width padding (see prep.rs §3): LongCat's qk head is 192 and its
+        // v head is 128 — the first MLA model where they differ, and 192 does
+        // not compile. Both are padded to the stock 256 in the WEIGHTS.
+        let true_qk_hd = nope + rope;
+        let padded_hd = 256usize;
+        let padded_nope = padded_hd - rope;
+        // The softmax scale must stay 1/sqrt(TRUE qk head width).
+        let attn_scale = 1.0f32 / (true_qk_hd as f32).sqrt();
 
         tracing::info!(
             "LongCat: {ckpt_layers} checkpoint layers → {} engine sublayers \
@@ -122,6 +130,7 @@ impl ModelWeightLoader for LongcatWeightLoader {
                     rope,
                     q_lora,
                     scale_q,
+                    padded_hd,
                     gpu,
                 )?;
                 let q_a_norm = dense(store, &format!("{ap}.q_a_layernorm.weight"))?;
@@ -140,14 +149,36 @@ impl ModelWeightLoader for LongcatWeightLoader {
                     scale_kv,
                     gpu,
                 )?;
-                let wkv_b = dense(store, &format!("{ap}.kv_b_proj.weight"))?;
-                let wo = dense(store, &format!("{ap}.o_proj.weight"))?;
+                let wkv_b = prep::prep_kv_b(
+                    store,
+                    &format!("{ap}.kv_b_proj.weight"),
+                    n_heads,
+                    nope,
+                    config.v_head_dim,
+                    rope,
+                    kv_lora,
+                    padded_hd,
+                    gpu,
+                )?;
+                let wo = prep::prep_o_proj(
+                    store,
+                    &format!("{ap}.o_proj.weight"),
+                    h,
+                    n_heads,
+                    config.v_head_dim,
+                    padded_hd,
+                    gpu,
+                )?;
 
                 // ── shared MLA precompute (per-head transpose → absorbed QK
                 //    → block-diagonals), reusing the Mistral phases ──
                 let mut c = mctx::MistralLayerCtx::new(
                     store, config, gpu, absmax_k, quantize_k, stream, global_idx,
                 );
+                // Everything downstream indexes the PADDED weights.
+                c.hd = padded_hd;
+                c.nope = padded_nope;
+                c.v_dim = padded_hd;
                 c.wq_a_dense = Some(wq_a);
                 c.wq_b = Some(wq_b);
                 c.q_a_norm = Some(q_a_norm);
@@ -162,7 +193,7 @@ impl ModelWeightLoader for LongcatWeightLoader {
                 )?);
                 c.wq_b_nvfp4 = Some(quantize_to_nvfp4(
                     &wq_b,
-                    n_heads * (nope + rope),
+                    n_heads * padded_hd,
                     q_lora,
                     gpu,
                     absmax_k,
@@ -184,7 +215,7 @@ impl ModelWeightLoader for LongcatWeightLoader {
                 let o_nvfp4 = quantize_to_nvfp4(
                     &wo,
                     h,
-                    n_heads * config.v_head_dim,
+                    n_heads * padded_hd,
                     gpu,
                     absmax_k,
                     quantize_k,
@@ -231,9 +262,9 @@ impl ModelWeightLoader for LongcatWeightLoader {
                     q_lora_rank: q_lora,
                     kv_lora_rank: kv_lora,
                     o_lora_rank: 0,
-                    nope,
+                    nope: padded_nope,
                     rope,
-                    v_dim: config.v_head_dim,
+                    v_dim: padded_hd,
                     compressor: None,
                     attn_sink: DevicePtr::NULL,
                 };
@@ -274,6 +305,9 @@ impl ModelWeightLoader for LongcatWeightLoader {
                     kv_dtype, 0, config,
                 )?;
                 layer.set_mla_weights(mla);
+                // Padding widened the head to 256; the scale must remain
+                // 1/sqrt(192), the TRUE qk head width.
+                layer.set_attn_scale_override(attn_scale);
 
                 if s == 0 {
                     // Sublayer 0 owns the block's shortcut MoE; its output is
