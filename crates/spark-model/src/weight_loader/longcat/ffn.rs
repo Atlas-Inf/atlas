@@ -117,9 +117,62 @@ pub(super) fn build_shortcut_moe(
         quantize_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
         stream: gpu.default_stream(),
     };
+    // The experts are 63.0 of the 70.2 GB resident, and after the MLA and
+    // dense-FFN levers they are the ONLY component still quantized — so they
+    // are the whole remaining gap against the reference logits. FP8 is the
+    // upgrade that fits: BF16 would add ~47 GB against a 97.3 GB budget,
+    // FP8 adds ~15.75 GB. Because routing reads only top-12 of 256 per token
+    // it is also the CHEAPEST lever at decode (+0.74 GB/token, less than
+    // either dense BF16 arm).
+    let fp8 = fp8_experts();
     let mut experts = Vec::with_capacity(config.num_experts);
+    let mut fp8_experts_vec = Vec::with_capacity(if fp8 { config.num_experts } else { 0 });
+    let fp8_quant_k = if fp8 {
+        gpu.kernel(
+            "quantize_bf16_to_fp8_blockscaled",
+            "quantize_bf16_to_fp8_blockscaled",
+        )?
+    } else {
+        spark_runtime::gpu::KernelHandle(0)
+    };
     for e in 0..config.num_experts {
         let ep = format!("{p}.experts.{e}");
+        if fp8 {
+            // NVFP4 slot stays NULL so both copies are never resident at
+            // once; dispatch takes the FP8 tables, which are installed below
+            // and gate every arm that would otherwise read these pointers.
+            experts.push(ExpertWeight::null());
+            fp8_experts_vec.push(crate::weight_map::Fp8ExpertWeight {
+                gate_proj: quant_expert_fp8(
+                    store,
+                    &format!("{ep}.gate_proj"),
+                    inter,
+                    h,
+                    gpu,
+                    fp8_quant_k,
+                    qctx.stream,
+                )?,
+                up_proj: quant_expert_fp8(
+                    store,
+                    &format!("{ep}.up_proj"),
+                    inter,
+                    h,
+                    gpu,
+                    fp8_quant_k,
+                    qctx.stream,
+                )?,
+                down_proj: quant_expert_fp8(
+                    store,
+                    &format!("{ep}.down_proj"),
+                    h,
+                    inter,
+                    gpu,
+                    fp8_quant_k,
+                    qctx.stream,
+                )?,
+            });
+            continue;
+        }
         experts.push(ExpertWeight {
             gate_proj: quantized_any(
                 store,
@@ -159,11 +212,62 @@ pub(super) fn build_shortcut_moe(
         router_pre_norm: None,
         correction_bias: Some(correction_bias),
     };
-    Ok(FfnComponent::Moe(MoeLayer::new(
-        weights,
-        config.num_experts,
-        None,
-        gpu,
-        config,
-    )?))
+    let mut moe = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
+    if fp8 {
+        // Fails LOUD. A silent fall-through here would leave the NULL NVFP4
+        // experts installed above as the only expert weights, and every token
+        // would route into zeroed matrices — fluent, confident, wrong output
+        // with nothing in the log.
+        // Zero-filled shared slot, NOT nulls: LongCat has no shared expert
+        // (the identity experts play that role), but the fused kernels read
+        // the slot unconditionally — same reason `mk_zero` exists above for
+        // the NVFP4 twin. A null here is a device-side deref, not a no-op.
+        let mk_zero_fp8 = |n: usize, k: usize| -> Result<crate::weight_map::Fp8Weight> {
+            Ok(crate::weight_map::Fp8Weight {
+                weight: alloc_zero(n * k)?,
+                row_scale: alloc_zero(n.div_ceil(128) * k.div_ceil(128) * 4)?,
+                n: n as u32,
+                k: k as u32,
+                scale_format: crate::weight_map::WeightQuantFormat::Fp8BlockScaled,
+            })
+        };
+        moe.set_fp8_experts(
+            &fp8_experts_vec,
+            crate::weight_map::Fp8ExpertWeight {
+                gate_proj: mk_zero_fp8(inter, h)?,
+                up_proj: mk_zero_fp8(inter, h)?,
+                down_proj: mk_zero_fp8(h, inter)?,
+            },
+            gpu,
+        )
+        .context("longcat: installing FP8 expert pointer tables")?;
+    }
+    Ok(FfnComponent::Moe(moe))
+}
+
+/// `ATLAS_LONGCAT_FP8_EXPERTS=1` runtime-quantizes the routed experts to
+/// block-scaled FP8 instead of NVFP4.
+pub(super) fn fp8_experts() -> bool {
+    std::env::var("ATLAS_LONGCAT_FP8_EXPERTS").as_deref() == Ok("1")
+}
+
+/// One expert projection: BF16 from the store → block-scaled FP8, then free
+/// the BF16 source. Mirrors the `Bf16Raw` NVFP4 arm's free — without it the
+/// 63 GB of BF16 experts stay resident alongside their 31.5 GB FP8 copies.
+fn quant_expert_fp8(
+    store: &WeightStore,
+    prefix: &str,
+    n: usize,
+    k: usize,
+    gpu: &dyn GpuBackend,
+    quantize_k: spark_runtime::gpu::KernelHandle,
+    stream: u64,
+) -> Result<crate::weight_map::Fp8Weight> {
+    let w = store.get(&format!("{prefix}.weight"))?;
+    let bf16 = DenseWeight { weight: w.ptr };
+    let q = crate::weight_map::quantize_to_fp8_blockscaled(&bf16, n, k, gpu, quantize_k, stream)?;
+    // The kernel reads the BF16 source on `stream`; the free must not race it.
+    gpu.synchronize(stream)?;
+    gpu.free(w.ptr)?;
+    Ok(q)
 }

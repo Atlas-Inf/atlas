@@ -28,7 +28,7 @@ impl MoeLayer {
         // 384-wide router. Named refusal, not silent wrongness.
         anyhow::ensure!(
             self.router_logits_n as usize == ctx.config.num_experts,
-            "zero-expert MoE routing is not wired on this dispatch variant yet"
+            "zero-expert MoE routing is not wired on this dispatch variant yet (forward_token_major)"
         );
 
         // SOLID Incr-4: the token-major fast path has no fold hooks. When a

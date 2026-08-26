@@ -24,27 +24,43 @@
 # fraction of the box up front, so a second server will fail its OOM
 # pre-flight. Kill the running one by PID first.
 #
-# ── PRECISION LEVERS (both default OFF; measured 2026-08-26) ──
+# ── PRECISION LEVERS (all default OFF; measured 2026-08-26) ──
 #
 # LongCat ships plain BF16 with no NVFP4/FP8 calibration metadata, so Atlas
-# runtime-quantizes to NVFP4 at load. That is lossy, and these two env flags
-# buy it back. Quality is measured against the reference logits in
+# runtime-quantizes everything to NVFP4 at load. That is lossy. Three env
+# flags buy it back, measured against the reference logits in
 # bench/ngram_ref/longcat_forward_golden.npz via bench/ngram_ref/logit_quality.py
-# (full 131072-vocab KL, not a top-20 sample):
+# (full 131072-vocab KL, not a top-20 sample; deterministic on repeat):
 #
-#   arm                                    KL vs ref   logit cos   tok/s
-#   (default)                                 0.0464    0.998250   24.31
-#   ATLAS_NVFP4_MLA=0                         0.0382    0.998567   20.18
-#   + ATLAS_LONGCAT_BF16_FFN=1                0.0240    0.999033   16.67
+#   arm                              KL vs ref  logit cos  top-5  tok/s
+#   (default, all NVFP4)                0.0464   0.998250    3/5  24.31
+#   FP8_EXPERTS                         0.0344   0.998588    4/5  22.69   <= best value
+#   NVFP4_MLA=0                         0.0382   0.998567    3/5  20.18
+#   NVFP4_MLA=0 + FP8_EXPERTS           0.0301   0.998799    4/5  ~19.2
+#   NVFP4_MLA=0 + BF16_FFN              0.0240   0.999033    3/5  16.67   <= best quality
 #
-# Decode here is weight-bandwidth bound (~185 GB/s effective, calibrated from
-# those pairs), so each lever costs throughput in proportion to the extra
-# weight bytes it reads per token: MLA +1.28 GB/tok, dense FFN +2.21 GB/tok.
-# Both are read EVERY token, which is why they are expensive.
+# ★ ATLAS_LONGCAT_FP8_EXPERTS=1 is the one to reach for first: -26% KL for
+#   -6.7% decode, and it is the only arm that fixes the top-5 shortlist the
+#   model card's `top_k: 4` actually samples from. It strictly dominates
+#   ATLAS_NVFP4_MLA=0 — better quality AND faster.
 #
-# They are off by default because -31% decode is not a trade to make silently.
-# Turn them on for quality-sensitive work:
-#   ATLAS_NVFP4_MLA=0 ATLAS_LONGCAT_BF16_FFN=1 ./serve_longcat_tui.sh
+# WHY the ordering is not intuitive: decode is weight-bandwidth bound (~185
+# GB/s effective, calibrated from the measured pairs), so each lever costs in
+# proportion to the extra weight bytes it reads PER TOKEN:
+#
+#   experts -> FP8       +0.74 GB/tok   sparse: top-12 of 256 fire per token
+#   MLA -> BF16          +1.28 GB/tok   dense: read every token
+#   dense FFN -> BF16    +2.21 GB/tok   dense: read every token
+#
+# The routed experts are 63.0 of the 70.2 GB resident and carry almost all of
+# the quantization error, yet they are the CHEAPEST group to upgrade, because
+# routing only ever touches 12/256 of them. The little dense FFN is the most
+# expensive, because every token reads all of it.
+#
+# Off by default because none of this is free. Pick by what you are doing:
+#   ATLAS_LONGCAT_FP8_EXPERTS=1 ./serve_longcat_tui.sh                    # recommended
+#   ATLAS_NVFP4_MLA=0 ATLAS_LONGCAT_BF16_FFN=1 \
+#     ATLAS_LONGCAT_FP8_EXPERTS=1 ./serve_longcat_tui.sh                  # max quality
 set -euo pipefail
 cd "$(dirname "$0")"
 

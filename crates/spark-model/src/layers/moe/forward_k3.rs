@@ -20,7 +20,7 @@ impl MoeLayer {
         // 384-wide router. Named refusal, not silent wrongness.
         anyhow::ensure!(
             self.router_logits_n as usize == ctx.config.num_experts,
-            "zero-expert MoE routing is not wired on this dispatch variant yet"
+            "zero-expert MoE routing is not wired on this dispatch variant yet (forward_k3)"
         );
 
         // Feature-1: a resident MoE adapter forces the per-row batched fallback

@@ -26,7 +26,7 @@ impl MoeLayer {
         // 384-wide router. Named refusal, not silent wrongness.
         anyhow::ensure!(
             self.router_logits_n as usize == ctx.config.num_experts,
-            "zero-expert MoE routing is not wired on this dispatch variant yet"
+            "zero-expert MoE routing is not wired on this dispatch variant yet (forward_k2)"
         );
 
         // Feature-1: the fused batch2 fast path has no fold hook. When a MoE

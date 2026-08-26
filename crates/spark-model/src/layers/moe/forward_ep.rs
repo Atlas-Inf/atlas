@@ -24,7 +24,7 @@ impl MoeLayer {
         // 384-wide router. Named refusal, not silent wrongness.
         anyhow::ensure!(
             self.router_logits_n as usize == ctx.config.num_experts,
-            "zero-expert MoE routing is not wired on this dispatch variant yet"
+            "zero-expert MoE routing is not wired on this dispatch variant yet (forward_ep)"
         );
 
         use super::super::ep_dispatch::build_ep_routing_table;
