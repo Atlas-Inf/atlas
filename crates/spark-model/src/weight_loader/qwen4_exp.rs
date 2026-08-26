@@ -49,6 +49,7 @@ use crate::weight_loader::ModelWeightLoader;
 use crate::weight_map::{DenseWeight, MtpWeights, dense};
 
 mod ffn;
+mod hc;
 mod probe;
 
 pub use probe::audit_namespace;
@@ -103,6 +104,15 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             variant,
         );
 
+        // The model-level mixer collapses the streams before `lm_head` and
+        // carries the FINAL NORM (this checkpoint has no `model.norm.weight`).
+        // Replicated onto every layer; only the last one consumes it.
+        let hc_head = if config.hc_mult > 0 {
+            Some(hc::load_head(store, config)?)
+        } else {
+            None
+        };
+
         let mut layers: Vec<Box<dyn TransformerLayer>> =
             Vec::with_capacity(config.num_hidden_layers);
         let mut attn_idx = 0usize;
@@ -146,7 +156,17 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                      only linear_attention / full_attention"
                 ),
             };
-            layers.push(layer);
+            // mHC: two sites per layer wrapping attention and the MoE. The
+            // residual this model carries is `hc_mult * hidden` wide, so
+            // without these the layer would run on a stream it never mixed.
+            if config.hc_mult > 0 {
+                let (attn, ffn) = hc::load_layer_sites(store, &lp, config)?;
+                let mut layer = layer;
+                attach_hc(&mut layer, i, attn, ffn, hc_head.clone(), config)?;
+                layers.push(layer);
+            } else {
+                layers.push(layer);
+            }
         }
 
         tracing::warn!(
@@ -260,4 +280,52 @@ fn embed_prefix(config: &ModelConfig) -> String {
 /// The model-level hyper-connection mixer that collapses the residual streams.
 fn mixer_prefix(config: &ModelConfig) -> String {
     format!("{}.hyper_connection_mixer", embed_prefix(config))
+}
+
+/// Attach both hyper-connection sites to a freshly built layer.
+///
+/// `set_hc_weights` lives on `Qwen3AttentionLayer`, but `load_layers` hands
+/// back `Box<dyn TransformerLayer>`, so the concrete type has to be recovered.
+/// A failure here is a hard error rather than a skip: a layer that silently
+/// keeps no mHC weights would run attention on an unmixed stream and produce
+/// plausible, wrong activations.
+fn attach_hc(
+    layer: &mut Box<dyn TransformerLayer>,
+    idx: usize,
+    attn: crate::layers::qwen3_attention::HcSiteWeights,
+    ffn: crate::layers::qwen3_attention::HcSiteWeights,
+    head: Option<crate::layers::qwen3_attention::HcHeadWeights>,
+    config: &ModelConfig,
+) -> Result<()> {
+    use crate::layers::qwen3_attention::HcWeights;
+    // Hard error, never a skip. A layer that quietly kept no mHC weights
+    // would run attention on a stream it never mixed and emit plausible,
+    // wrong activations — with nothing in the log.
+    let any = layer.as_any_mut().ok_or_else(|| {
+        anyhow::anyhow!("qwen4_exp layer {idx}: no as_any_mut, cannot attach mHC weights")
+    })?;
+    let l = any
+        .downcast_mut::<crate::layers::Qwen3AttentionLayer>()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "qwen4_exp layer {idx}: mHC weights have nowhere to go. Only \
+                 `Qwen3AttentionLayer` implements `set_hc_weights` — \
+                 DeepSeek-V4, the model mHC was built for, is all-attention. \
+                 This model puts mHC on ALL 48 layers, so the 36 GDN layers \
+                 (`Qwen3SsmLayer`) need the same treatment: an `HcWeights` \
+                 field plus hc_pre/hc_post around the SSM block in both its \
+                 prefill and decode paths. Tracked as #753 item B."
+            )
+        })?;
+    {
+        l.set_hc_weights(HcWeights {
+            attn,
+            ffn,
+            head,
+            hc_mult: config.hc_mult,
+            sinkhorn_iters: 0,
+            hc_eps: config.rms_norm_eps as f32,
+        });
+    }
+    Ok(())
 }
