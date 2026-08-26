@@ -14,8 +14,8 @@ use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::{
     DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, LagunaWeightLoader,
     MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
-    Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen35DenseWeightLoader, Qwen35WeightLoader,
-    Step3p7WeightLoader,
+    Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen4ExpWeightLoader, Qwen35DenseWeightLoader,
+    Qwen35WeightLoader, Step3p7WeightLoader,
 };
 
 /// DFlash speculative-decoding build arguments. `None` for non-DFlash runs;
@@ -90,6 +90,12 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         // full-attention layers — both handled at forward-pass layer time,
         // not during weight loading.
         "qwen3_6_moe" | "holo3_1_moe" => Ok(Box::new(Qwen35WeightLoader)),
+        // Qwen3.8-Flash-Next: hybrid linear/full attention, 512-expert MoE,
+        // low-rank hyper-connections, a sparse-attention indexer and a PLE
+        // n-gram tower. Weight loading works; the forward pass does not exist
+        // yet, and the loader says so by name rather than failing as an
+        // unsupported model type. See docs/porting/QWEN4_EXP.md.
+        "qwen4_exp" => Ok(Box::new(Qwen4ExpWeightLoader)),
         // Nemotron-H family (Mamba-2 + MoE + Attention), including Puzzle
         // (heterogeneous per-block MoE intermediate / top-k).
         "nemotron_h" | "nemotron_h_puzzle" => Ok(Box::new(NemotronHWeightLoader)),
@@ -110,7 +116,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "deepseek_v4" => Ok(Box::new(DeepSeekV4WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
-             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, nemotron_h, nemotron_h_puzzle, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
+             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
             config.model_type,
             normalized,
         ),
