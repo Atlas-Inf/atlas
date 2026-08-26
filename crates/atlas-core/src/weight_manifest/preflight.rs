@@ -21,6 +21,104 @@ use std::path::Path;
 /// third-party data, and an unbounded length prefix is an allocation primitive.
 const MAX_HEADER_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Where a tensor's bytes live: which file, and the validated span inside it.
+#[derive(Debug, Clone)]
+pub struct TensorLocation {
+    pub path: std::path::PathBuf,
+    pub span: crate::safetensors::TensorSpan,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+}
+
+/// Locate every tensor across a checkpoint's shards.
+///
+/// Unlike [`read_checkpoint`], this keeps the byte spans, so a caller can read
+/// individual rows out of a tensor far too large to hold — which is the whole
+/// point for the n-gram table.
+pub fn locate_checkpoint(dir: &Path) -> Result<BTreeMap<String, TensorLocation>> {
+    let mut shards: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
+        .collect();
+    shards.sort();
+
+    let mut out = BTreeMap::new();
+    for path in shards {
+        let file = std::fs::File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        let (header, data_start) = read_header_json(&path)?;
+        for (name, meta) in header {
+            if name == "__metadata__" {
+                continue;
+            }
+            let offsets = meta.get("data_offsets").with_context(|| {
+                format!("{}: tensor {name} has no data_offsets", path.display())
+            })?;
+            let span = crate::safetensors::tensor_span(&name, offsets, data_start, file_len)?;
+            let shape = shape_of(&path, &name, &meta)?;
+            let dtype = meta
+                .get("dtype")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            out.insert(
+                name,
+                TensorLocation {
+                    path: path.clone(),
+                    span,
+                    shape,
+                    dtype,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn shape_of(path: &Path, name: &str, meta: &serde_json::Value) -> Result<Vec<usize>> {
+    meta.get("shape")
+        .and_then(|s| s.as_array())
+        .with_context(|| format!("{}: tensor {name} has no shape", path.display()))?
+        .iter()
+        .map(|v| {
+            v.as_u64()
+                .map(|n| n as usize)
+                .with_context(|| format!("tensor {name}: non-integer dimension"))
+        })
+        .collect()
+}
+
+/// Parse a shard's header, returning its entries and where the data begins.
+fn read_header_json(path: &Path) -> Result<(serde_json::Map<String, serde_json::Value>, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file_len = file.metadata()?.len();
+
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
+        .with_context(|| format!("{}: too short for a safetensors header", path.display()))?;
+    let header_len = u64::from_le_bytes(prefix);
+    if header_len > MAX_HEADER_BYTES || header_len.saturating_add(8) > file_len {
+        bail!(
+            "{}: header length {header_len} is implausible for a {file_len}-byte file",
+            path.display()
+        );
+    }
+    let mut raw = vec![0u8; header_len as usize];
+    file.seek(SeekFrom::Start(8))?;
+    file.read_exact(&mut raw)
+        .with_context(|| format!("{}: truncated header", path.display()))?;
+    let header: serde_json::Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("{}: header is not JSON", path.display()))?;
+    let entries = header
+        .as_object()
+        .with_context(|| format!("{}: header is not an object", path.display()))?
+        .clone();
+    Ok((entries, 8 + header_len))
+}
+
 /// Tensor names and shapes read from one shard's header.
 pub fn read_shard_header(path: &Path) -> Result<BTreeMap<String, Vec<usize>>> {
     use std::io::{Read, Seek, SeekFrom};
