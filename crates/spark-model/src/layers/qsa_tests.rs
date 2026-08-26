@@ -323,13 +323,14 @@ fn qsa_prefill_select_sets_match_reference() {
         .alloc(ROWS * qkw * 2 + ROWS * n_heads * hd * 4 + ROWS * stride * 4 + ROWS * topk * 4)
         .unwrap();
 
-    qsa.prefill_select_chunk0(
+    qsa.prefill_select(
         hidden_dev,
         q_roped,
         attn_ctx,
         kpool,
         vpool,
         &host_table,
+        0,
         t_all,
         nq,
         bs as u32,

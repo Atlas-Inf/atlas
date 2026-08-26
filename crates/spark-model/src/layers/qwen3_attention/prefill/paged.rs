@@ -686,6 +686,38 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
+        // ── 8b. QSA stage-2: per-query prefill selection for CHUNKED
+        // prefills (>8K prompts). Same overwrite-the-context hook as the
+        // chunk-0 cache-skip path; the paged cache already holds every
+        // prior chunk plus this one, and this path's host block table is
+        // the real physical mapping. Pre-gate so q_contiguous is intact
+        // and the gates/o_proj apply uniformly afterwards.
+        if let Some(ref qsa) = self.qsa
+            && seq_len_start + num_tokens > qsa.inert_bound()
+        {
+            anyhow::ensure!(
+                batched_meta.is_none(),
+                "QSA prefill selection is single-stream (batched paged \
+                 prefill is refused upstream for this model)"
+            );
+            qsa.prefill_select(
+                normed,
+                q_contiguous,
+                attn_out,
+                kv_cache.k_pool_ptr(self.attn_layer_idx),
+                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                block_table,
+                seq_len_start,
+                num_tokens,
+                nq,
+                bs as u32,
+                inv_sqrt_d,
+                ctx.buffers.qsa_select_scratch(),
+                ctx.gpu,
+                stream,
+            )?;
+        }
+
         // ── 9. Sigmoid gate × attn_out (gated only) — single batched kernel ──
         if self.gated {
             // Gate data is in qg_out at offset q_dim (after deinterleave_qg_split),

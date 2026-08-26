@@ -742,13 +742,14 @@ impl Qwen3AttentionLayer {
         if let Some(ref qsa) = self.qsa
             && num_tokens > qsa.inert_bound()
         {
-            qsa.prefill_select_chunk0(
+            qsa.prefill_select(
                 normed,
                 q_contiguous,
                 attn_out,
                 kv_cache.k_pool_ptr(self.attn_layer_idx),
                 kv_cache.v_pool_ptr(self.attn_layer_idx),
                 seq_block_table,
+                0,
                 num_tokens,
                 nq,
                 bs as u32,

@@ -51,7 +51,6 @@ struct QsaState {
     pooled: usize,
     /// Identity block table upload done (needs block_size, known lazily).
     table_len: usize,
-    warned_prefill_dense: bool,
 }
 
 pub struct QsaIndexer {
@@ -168,7 +167,6 @@ impl QsaIndexer {
                 ingested: 0,
                 pooled: 0,
                 table_len: 0,
-                warned_prefill_dense: false,
             }),
         })
     }
@@ -270,16 +268,17 @@ impl QsaIndexer {
         Ok(())
     }
 
-    /// Stage 2: per-query prefill selection for chunk-0 prefills
-    /// (`seq_len_start == 0`, i.e. global pos == chunk row). Overwrites the
-    /// ATTENTION CONTEXT rows (pre-gate, pre-o_proj) of every selective
-    /// query — pos >= the inert bound — with attention over exactly its
-    /// reference-selected set, read straight from the paged KV cache. Rows
-    /// below the bound keep the dense flash output, which is provably
-    /// identical there. Requires `prefill_ingest` to have run for this chunk
-    /// (it does — the ingest hook precedes the attention call).
+    /// Stage 2: per-query prefill selection for ANY prefill chunk. Chunk
+    /// rows whose GLOBAL position (`seq_start + row`) is at or past the
+    /// inert bound get their ATTENTION CONTEXT rows (pre-gate, pre-o_proj)
+    /// overwritten with attention over exactly their reference-selected
+    /// set, read straight from the paged KV cache — which at this point
+    /// holds every prior chunk plus this one (section-7 writes precede
+    /// attention). Rows below the bound keep the dense output, which is
+    /// provably identical there. Requires `prefill_ingest` to have run for
+    /// this chunk (the ingest hook precedes the attention call).
     #[allow(clippy::too_many_arguments)]
-    pub fn prefill_select_chunk0(
+    pub fn prefill_select(
         &self,
         normed: DevicePtr,
         q_roped: DevicePtr,
@@ -287,6 +286,7 @@ impl QsaIndexer {
         k_pool: DevicePtr,
         v_pool: DevicePtr,
         seq_block_table: &[u32],
+        seq_start: usize,
         num_tokens: usize,
         nq: u32,
         block_size: u32,
@@ -295,8 +295,9 @@ impl QsaIndexer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        let bound = self.inert_bound(); // first selective position
-        if num_tokens <= bound {
+        let bound = self.inert_bound(); // first selective GLOBAL position
+        let total = seq_start + num_tokens;
+        if total <= bound {
             return Ok(());
         }
         // Kill switch: ATLAS_QSA_NO_PREFILL_SELECT=1 keeps stage-1 behavior
@@ -372,8 +373,9 @@ impl QsaIndexer {
             tracing::warn!("QSA S2 DIAG ctx rows:{ctx_line}");
             tracing::warn!("QSA S2 DIAG   q rows:{q_line}");
         }
-        // Upload the real physical block table for the token range.
-        let pages_needed = num_tokens.div_ceil(block_size as usize);
+        // Upload the real physical block table for the FULL context (a
+        // selective query attends blocks from every prior chunk).
+        let pages_needed = total.div_ceil(block_size as usize);
         anyhow::ensure!(
             seq_block_table.len() >= pages_needed,
             "QSA: block table has {} pages for {} tokens",
@@ -396,21 +398,24 @@ impl QsaIndexer {
         let q_row = nq as usize * hd_attn;
 
         // Scratch layout (per-call score stride; always <= the sizes.rs
-        // allowance because a chunk never exceeds max_seq_len).
-        let stride = num_tokens.div_ceil(ratio);
+        // allowance because total context never exceeds max_seq_len).
+        let stride = total.div_ceil(ratio);
         let qk_buf = scratch;
         let qpost = scratch.offset(ROWS * qkw * 2);
         let scores = qpost.offset(ROWS * heads * hd * 4);
         let lists = scores.offset(ROWS * stride * 4);
 
-        let n_sel_total = num_tokens - bound;
+        // First selective GLOBAL position, and its chunk-local row.
+        let first_sel_pos = bound.max(seq_start);
+        let n_sel_total = total - first_sel_pos;
         let mut slab = 0usize;
         while slab < n_sel_total {
             let rows = ROWS.min(n_sel_total - slab);
-            let first_pos = bound + slab;
+            let first_pos = first_sel_pos + slab; // GLOBAL position
+            let first_row = first_pos - seq_start; // chunk-local buffer row
 
             ops::cublas_bf16_proj_dense(
-                normed.offset(first_pos * self.hidden as usize * 2),
+                normed.offset(first_row * self.hidden as usize * 2),
                 self.qk_proj_w,
                 qk_buf,
                 rows as u32,
@@ -481,12 +486,12 @@ impl QsaIndexer {
             ops::qsa_prefill_attn(
                 gpu,
                 self.k_prefill_attn_k,
-                q_roped.offset(first_pos * q_row * 2),
+                q_roped.offset(first_row * q_row * 2),
                 k_pool,
                 v_pool,
                 block_table_dev,
                 lists,
-                attn_ctx.offset(first_pos * q_row * 2),
+                attn_ctx.offset(first_row * q_row * 2),
                 rows as u32,
                 first_pos as u32,
                 topk as u32,
@@ -530,25 +535,6 @@ impl QsaIndexer {
         );
         Ok(())
     }
-    /// One-time WARN when a prefill query range extends past the inert
-    /// bound: those queries run DENSE until stage 2 (per-query prefill
-    /// selection) lands.
-    pub fn warn_if_prefill_diverges(&self, seq_start: usize, num_tokens: usize) {
-        if seq_start + num_tokens > self.inert_bound() + 1
-            && let Ok(mut st) = self.state.lock()
-            && !st.warned_prefill_dense
-        {
-            st.warned_prefill_dense = true;
-            tracing::warn!(
-                "QSA: prefill extends to {} tokens (> inert bound {}) — \
-                 prefill queries beyond the bound run DENSE attention until \
-                 per-query prefill selection lands; decode steps DO select.",
-                seq_start + num_tokens,
-                self.inert_bound()
-            );
-        }
-    }
-
     /// Decode-step ingest + selection for the token at `pos` (0-based;
     /// `pos + 1` tokens are visible including this one). Returns `None`
     /// while the visible prefix is within the inert bound (dense path is
