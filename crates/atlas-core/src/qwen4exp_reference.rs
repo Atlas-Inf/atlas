@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! CPU reference for the `qwen4_exp` PLE tower.
+//! CPU references for the `qwen4_exp` layers that Atlas does not have yet.
 //!
-//! Not the serving path — this is the thing a GPU implementation gets checked
-//! against. The PLE tower is the most novel of the layers this model needs, and
-//! several steps in it are easy to get plausibly wrong:
+//! Not the serving path — these are what a GPU implementation gets checked
+//! against. Each is checked here against HuggingFace's own module at real
+//! weights, because each has steps that are easy to get plausibly wrong, and
+//! "plausibly wrong" in a language model means fluent output that is subtly
+//! not the model you loaded.
+//!
+//! In the PLE tower:
 //!
 //! * its RMSNorm is **grouped** (each of `hc_count` streams normalises over its
 //!   own `hidden_size` slice) and its weight is an **offset from 1**
@@ -13,7 +17,14 @@
 //! * the depthwise conv is **dilated by `ngram_size`**, so its state is
 //!   `(kernel - 1) * ngram_size` wide rather than `kernel - 1`.
 //!
-//! Checked against HuggingFace's own `Qwen4ExpTextPLELayer` at real weights.
+//! In the hyper-connection block:
+//!
+//! * the mixing gate divides by `hc_count` BEFORE its activation, twice — once
+//!   into the low-rank SiLU and again into the injection sigmoid;
+//! * the block output is a **mean** across streams, not a sum or a concat, so
+//!   it comes back `hidden` wide from a `hc_count * hidden` input;
+//! * the injection weights are `2 * sigmoid(...)`, centred on 1 rather than
+//!   0.5.
 
 /// Grouped RMS norm. `weight` is an offset from 1, applied across the full row.
 pub fn grouped_rms_norm(x: &[f32], group: usize, weight: &[f32], eps: f32) -> Vec<f32> {
@@ -160,4 +171,78 @@ pub fn ple_forward(
         }
     }
     out
+}
+
+/// One hyper-connection block's weights. Widths are `hc_count * hidden` — the
+/// residual is that many streams concatenated, not `hidden` with a gate.
+pub struct HyperConnectionWeights<'a> {
+    /// `[hc_count * hidden]`, an offset from 1
+    pub hc_norm: &'a [f32],
+    /// `[hc_lowrank, hc_count * hidden]`
+    pub mix_down: &'a [f32],
+    /// `[hc_count * hidden, hc_lowrank]`
+    pub mix_up: &'a [f32],
+    /// `[hc_count, hc_count * hidden]`. `None` on the trunk and MTP mixers,
+    /// which mix without injecting.
+    pub block_inject: Option<&'a [f32]>,
+}
+
+/// What a hyper-connection block hands the layer that follows it.
+pub struct HyperConnectionOut {
+    /// `[hidden]` — the mixed input the block actually computes on.
+    pub mixed: Vec<f32>,
+    /// `[hc_count]` — per-stream injection gains, centred on 1. Empty when the
+    /// block has no `block_inject_weight`.
+    pub injection: Vec<f32>,
+}
+
+/// One position through a hyper-connection block.
+pub fn hyper_connection_forward(
+    dims: &PleDims,
+    w: &HyperConnectionWeights<'_>,
+    lowrank: usize,
+    hyper_input: &[f32],
+) -> HyperConnectionOut {
+    let (wide, hidden, hc) = (dims.wide(), dims.hidden, dims.hc_count);
+    assert_eq!(
+        hyper_input.len(),
+        wide,
+        "hyper input must be hc_count * hidden"
+    );
+
+    let normed = grouped_rms_norm(hyper_input, hidden, w.hc_norm, dims.eps);
+    // Divided by hc_count BEFORE the activation, not after.
+    let down: Vec<f32> = linear(&normed, w.mix_down, lowrank, wide)
+        .into_iter()
+        .map(|v| {
+            let scaled = v / hc as f32;
+            scaled * sigmoid(scaled)
+        })
+        .collect();
+    let gate: Vec<f32> = linear(&down, w.mix_up, wide, lowrank)
+        .into_iter()
+        .map(sigmoid)
+        .collect();
+
+    // Mean across streams: `hc_count * hidden` in, `hidden` out.
+    let mut mixed = vec![0f32; hidden];
+    for stream in 0..hc {
+        for h in 0..hidden {
+            let index = stream * hidden + h;
+            mixed[h] += gate[index] * normed[index];
+        }
+    }
+    for value in &mut mixed {
+        *value /= hc as f32;
+    }
+
+    let injection = match w.block_inject {
+        None => Vec::new(),
+        // Centred on 1, not 0.5.
+        Some(inject) => linear(&normed, inject, hc, wide)
+            .into_iter()
+            .map(|v| 2.0 * sigmoid(v / hc as f32))
+            .collect(),
+    };
+    HyperConnectionOut { mixed, injection }
 }
