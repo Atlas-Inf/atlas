@@ -52,8 +52,8 @@ exec target/release/spark serve \
   --bind "${BIND:-127.0.0.1}" \
   --port "${PORT:-8888}" \
   --max-seq-len "${MAX_SEQ_LEN:-32768}" \
-  --max-num-seqs "${MAX_NUM_SEQS:-8}" \
-  --max-batch-size "${MAX_BATCH_SIZE:-8}" \
+  --max-num-seqs "${MAX_NUM_SEQS:-16}" \
+  --max-batch-size "${MAX_BATCH_SIZE:-16}" \
   --gpu-memory-utilization "${GPU_UTIL:-0.80}" \
   --disable-thinking \
   "$@"
