@@ -26,12 +26,37 @@ Where the bytes are, from the index:
 | MTP block's own 512 experts | ~2.5 GB | |
 | backbone, vision tower, norms, scales | remainder | |
 
-The n-gram table is the cheapest 51 GB to move off-device: it is gathered by
-row, and the reference already excludes it from placement
-(`_no_placement_params = ["ple.ple_embedding.ngram_embedding.weight"]`). Host
-residency plus a row gather is the intended deployment, not a workaround. Doing
-that leaves ~134 GB device-resident — still over a GB10, so routed-expert
-offload or expert parallelism across boxes is required on top.
+### There is no host/device split to offload across
+
+**Corrected 2026-08-26.** An earlier version of this file said host-resident PLE
+would leave ~83 GB "on device", which would fit. That is wrong on this hardware,
+and it pointed the plan at the wrong first feature.
+
+The GB10 is fully coherent unified memory — `nvidia-smi -q` reports
+`Addressing Mode: ATS` and `memory.total [N/A]`, because there is no separate
+GPU pool. `MemTotal` is 125,418,660 kB (~119.6 GiB) and that single pool is what
+both the CPU and the GPU allocate from; a serving process showing 100 GB of
+"Used GPU Memory" is holding 100 GB of the same RAM the OS sees. Moving a tensor
+"to host" therefore frees nothing.
+
+What works is not residency but **demand paging**. The n-gram table is a pure
+row gather: one token touches at most `K*(N-1)` = 16 rows of 160 bytes, about
+2.5 KB. `mmap` the `model-plefp8-*` shards and let the page cache hold the hot
+rows; cold rows come off NVMe. The reference points the same way — it excludes
+that tensor from placement entirely
+(`_no_placement_params = ["ple.ple_embedding.ngram_embedding.weight"]`).
+
+That gives a workable budget on one GB10:
+
+| | |
+|---|---|
+| resident weights (everything but the n-gram table) | ~83 GB |
+| n-gram table, mmap'd, only hot rows in page cache | ~52 GB on disk |
+| left for KV cache, activations, page cache | ~36 GB |
+
+So the first loader feature is **mmap-backed n-gram gather**, not offload. Full
+residency of all 135.3 GB is not reachable on this box by any placement
+strategy.
 
 ## What is implemented
 
@@ -219,10 +244,10 @@ That is the whole offload boundary, pre-separated:
 | PLE / n-gram table | FP8 | ~52 GB | **host** (HF does this already) |
 | backbone, vision, MTP, norms | BF16 | ~23 GB | device |
 
-Device-resident would be **~83 GB**, which fits a GB10's ~119 GB. The full
-135.3 GB does not. So host-resident embedding gather is not an optimisation
-here — it is the thing that decides whether the model runs at all, and it is
-the first item worth building after the weight loader.
+~83 GB of that has to be resident. The remaining ~52 GB is the n-gram table,
+which must be **mmap'd and demand-paged rather than placed anywhere** — see
+"There is no host/device split to offload across" above. Full residency of
+135.3 GB is not reachable on a 119 GB box by any placement strategy.
 
 ## How to work on this without the checkpoint
 
@@ -261,9 +286,10 @@ a different box, or a repack that does not exist today.
 1. **Weight loader** (`Qwen4ExpWeightLoader` + a `factory.rs` arm). Comparable
    loaders in this tree run 1000–1900 lines. Develop against the tiny
    checkpoint.
-2. **Host-resident n-gram gather.** Out of order on purpose: it is what decides
-   whether the model runs on a GB10 at all, and `RadixArk`'s `model-plefp8-*`
-   shards mean the boundary needs no repacking.
+2. **mmap-backed n-gram gather.** Out of order on purpose: it is what decides
+   whether the model runs on a GB10 at all. `RadixArk`'s `model-plefp8-*`
+   shards mean the boundary needs no repacking — the table is already its own
+   set of files.
 3. **Layers, cheapest first** — the 512-expert MoE and the linear-attention
    pathway are adaptations of the Qwen3.5 / Qwen3-Next paths; the low-rank
    hyper-connections, the PLE tower (including the third conv-state slot that
