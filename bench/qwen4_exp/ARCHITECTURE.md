@@ -128,3 +128,52 @@ prefill_attn_compressed::prefill_attn_compressed           -> section 3
 Neither `--dangerously-allow-unresolved-kernel-lookups` nor symlinking
 DeepSeek's kernels is a route to serving: the first dispatches handle 0, the
 second dispatches the wrong math. Both produce output that looks fine.
+
+---
+
+## 4. Correction: the n-gram HASH does not transfer from #746
+
+`ARCHITECTURE.md` §2 and Avarok #753 both said the n-gram machinery from
+PR #746 (LongCat) was reusable for PLE. That is **half right, and the wrong
+half is the one that would fail silently.**
+
+- **Transfers:** the NVMe row cache, the pinned GPU-addressable arena, the
+  deferred-tensor load path, and the OOM pre-flight exclusion. All of that is
+  about *serving 300M+ rows off disk* and is checkpoint-agnostic.
+- **Does NOT transfer: the ID computation.** LongCat uses a polynomial rolling
+  hash over token ids. Qwen derives its multipliers with **SplitMix64**
+  (`modeling_qwen4_exp.py` L970–L993):
+
+```python
+_SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+_SPLITMIX_M1    = 0xBF58476D1CE4E5B9
+_SPLITMIX_M2    = 0x94D049BB133111EB
+_PRIME_1        = 10007
+
+def _splitmix64(value):
+    value = (value + _SPLITMIX_GAMMA) & _MASK64
+    value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
+    value = ((value ^ (value >> 27)) * _SPLITMIX_M2) & _MASK64
+    return (value ^ (value >> 31)) & _MASK64
+
+def _build_layer_multipliers(unigram_vocab_size, ngram_size, ple_layer_index, seed):
+    multiplier_max = ((1 << 63) - 1) // max(unigram_vocab_size, 1)
+    half_bound     = max(1, multiplier_max // 2)
+    base_seed      = seed + _PRIME_1 * ple_layer_index
+    return [2 * (_splitmix64((base_seed + _SPLITMIX_GAMMA * (i + 1)) & _MASK64)
+                 % half_bound) + 1
+            for i in range(ngram_size)]
+```
+
+The multipliers are **always odd** (`2*x+1`) and **per-PLE-layer** (seeded by
+`ple_layer_index`). The checkpoint ships them as
+`ple.ple_embedding.layer_multipliers` `[ngram_size]` I64 — so the loader
+should READ them rather than re-derive, and use `_build_layer_multipliers`
+only as a cross-check.
+
+Why this matters: a wrong hash produces valid row indices into a 320M-row
+table. Every lookup succeeds, every shape checks out, and the embeddings are
+simply the wrong rows — fluent, confident, wrong, with nothing in the log.
+This is the same failure class flagged for the additive-vs-cross-attention
+reading, and it is why #746's `ngram_parity.py`-style bit-exactness harness
+has to be rebuilt for Qwen's scheme before PLE is wired.
