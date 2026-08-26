@@ -66,6 +66,13 @@ fn main() -> Result<()> {
         .collect();
     let weight: Vec<f32> = (0..wide).map(|_| next() * 0.1).collect();
 
+    // The kernel reads BF16. Round the oracle's inputs the same way, so the
+    // comparison measures the kernel rather than the upload -- otherwise BF16's
+    // ~2^-8 input rounding dominates and the test says nothing.
+    let round = |v: &f32| bf16::from_f32(*v).to_f32();
+    let input_bf16: Vec<f32> = input.iter().map(round).collect();
+    let weight_bf16: Vec<f32> = weight.iter().map(round).collect();
+
     let d_in = up_bf16(g, &input)?;
     let d_w = up_bf16(g, &weight)?;
     let d_out = g.alloc(TOKENS * wide * 2)?;
@@ -88,9 +95,9 @@ fn main() -> Result<()> {
     let mut want = Vec::with_capacity(TOKENS * wide);
     for t in 0..TOKENS {
         want.extend(grouped_rms_norm(
-            &input[t * wide..(t + 1) * wide],
+            &input_bf16[t * wide..(t + 1) * wide],
             HIDDEN,
-            &weight,
+            &weight_bf16,
             EPS,
         ));
     }
@@ -112,9 +119,9 @@ fn main() -> Result<()> {
     let mut ungrouped = Vec::with_capacity(TOKENS * wide);
     for t in 0..TOKENS {
         ungrouped.extend(grouped_rms_norm(
-            &input[t * wide..(t + 1) * wide],
+            &input_bf16[t * wide..(t + 1) * wide],
             wide,
-            &weight,
+            &weight_bf16,
             EPS,
         ));
     }
@@ -125,7 +132,8 @@ fn main() -> Result<()> {
         .fold(0f32, f32::max);
     println!("ungrouped control: max|diff| {ungrouped_gap:.3e} (must be large)");
 
-    // BF16 round-trip dominates: ~2^-8 relative.
+    // Inputs now match; only the BF16 OUTPUT store separates the two, so this
+    // should sit near a single ulp (~2^-8 relative) rather than a few.
     anyhow::ensure!(
         worst / scale.max(1e-9) < 5e-3,
         "rms_norm_grouped disagrees with the oracle"
