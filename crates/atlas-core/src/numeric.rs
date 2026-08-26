@@ -154,19 +154,46 @@ pub fn nvfp4_dequant(
     }
 
     let mut out = vec![0f32; rows * cols];
-    for row in 0..rows {
+    let decode_row = |row_index: usize, dst: &mut [f32]| {
         for col in 0..cols {
-            let byte = packed[row * packed_cols + col / 2];
+            let byte = packed[row_index * packed_cols + col / 2];
             // Low nibble is the even column.
             let nibble = if col.is_multiple_of(2) {
                 byte & 0x0F
             } else {
                 byte >> 4
             };
-            let block = fp8_e4m3_to_f32(scale[row * scale_cols + col / group]);
-            out[row * cols + col] = FP4_E2M1[nibble as usize] * block * global;
+            let block = fp8_e4m3_to_f32(scale[row_index * scale_cols + col / group]);
+            dst[col] = FP4_E2M1[nibble as usize] * block * global;
         }
+    };
+
+    // Rows are independent, and this dominates a CPU forward on a MoE model:
+    // one token routes to ~10 experts per layer, each a pair of 1.6 M-element
+    // projections, so a 48-layer pass decodes billions of nibbles.
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(rows.max(1));
+    if threads <= 1 || rows < 64 {
+        for (row_index, dst) in out.chunks_mut(cols).enumerate() {
+            decode_row(row_index, dst);
+        }
+        return Ok(out);
     }
+
+    let chunk_rows = rows.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (index, block) in out.chunks_mut(chunk_rows * cols).enumerate() {
+            let base = index * chunk_rows;
+            let decode_row = &decode_row;
+            scope.spawn(move || {
+                for (offset, dst) in block.chunks_mut(cols).enumerate() {
+                    decode_row(base + offset, dst);
+                }
+            });
+        }
+    });
     Ok(out)
 }
 
