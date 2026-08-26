@@ -312,6 +312,12 @@ pub struct ForwardContext<'a> {
     /// for models without hash routing. Must be a STABLE address across the
     /// layer loop (and, under CUDA-graph decode, uploaded before each replay).
     pub token_ids: Option<DevicePtr>,
+    /// HOST copy of the same token ids, when the caller had them in hand
+    /// (decode always does — it uploads `token_ids` FROM this value; chunked
+    /// prefill likewise). PLE computes its n-gram ids on the host, and
+    /// reading them back off the device costs a synchronous D2H per decode
+    /// step — pure overhead, and capture-unsupported inside a CUDA graph.
+    pub host_token_ids: Option<&'a [u32]>,
     /// #30 (routed-prefill precision): the REQUEST slot's per-layer LoRA pairs,
     /// GLOBAL-layer-indexed (`len == num_hidden_layers`), set ONLY at the prefill
     /// entries and ONLY when the request routes to a NON-active slot. `Some` makes

@@ -256,6 +256,9 @@ impl TransformerModel {
             // Hash-MoE: the single decode token ID (uploaded above every step
             // before graph replay). MoE reads it at offset 0.
             token_ids: Some(self.buffers.token_ids()),
+            // The very value uploaded into `token_ids` above — PLE hashes on
+            // the host and must not round-trip it back off the device.
+            host_token_ids: Some(std::slice::from_ref(&token)),
             routed_lora_layers: None, // #30: single-seq decode never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses

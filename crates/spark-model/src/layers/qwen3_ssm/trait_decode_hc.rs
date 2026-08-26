@@ -52,6 +52,30 @@ impl Qwen3SsmLayer {
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
 
+        // ATLAS_QWEN4EXP_DECODE_PROF=1: per-stage wall clock, first tokens
+        // only (the counter caps the log volume). Each probe syncs, so the
+        // numbers are honest and the mode is not for serving.
+        static PROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static PROF_LEFT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(150);
+        let prof = *PROF
+            .get_or_init(|| std::env::var("ATLAS_QWEN4EXP_DECODE_PROF").as_deref() == Ok("1"))
+            && PROF_LEFT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0;
+        let mut t = if prof {
+            ctx.gpu.synchronize(stream).ok();
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        macro_rules! stage {
+            ($name:expr) => {
+                if let Some(t0) = t.as_mut() {
+                    ctx.gpu.synchronize(stream).ok();
+                    tracing::info!("hc-decode [{}]: {}us", $name, t0.elapsed().as_micros());
+                    *t0 = std::time::Instant::now();
+                }
+            };
+        }
+
         if hc.is_first_model_layer {
             ops::hc_expand(
                 ctx.gpu,
@@ -70,6 +94,7 @@ impl Qwen3SsmLayer {
         if let Some(ple) = self.ple.as_ref() {
             ple.forward(streams, 1, false, ctx, stream)?;
         }
+        stage!("ple");
 
         // ── GDN sublayer. `hidden` is scratch; the highway carries state. ──
         ops::hc_pre_site(
@@ -86,10 +111,12 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        stage!("hc_pre_attn");
         // No `input_norm`: `hc_norm` inside `hc_pre` is this layer's norm.
         // The checkpoint carries no per-layer norms and the loader's
         // ones-placeholder would NOT make a second RMS pass an identity.
         let ssm_out = self.ssm_forward(hidden, ssm_state, ctx, stream, false)?;
+        stage!("ssm_forward");
         ops::hc_post_site(
             ctx.gpu,
             self.hc_post_k,
@@ -119,7 +146,9 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        stage!("hc_post+hc_pre_ffn");
         let moe_out = self.ffn.forward(hidden, ctx, stream)?;
+        stage!("moe");
         ops::hc_post_site(
             ctx.gpu,
             self.hc_post_k,

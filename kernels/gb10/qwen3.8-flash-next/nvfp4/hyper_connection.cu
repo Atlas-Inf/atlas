@@ -114,6 +114,31 @@ extern "C" __global__ void hc_expand(
 // collapse; `hc_head` is the model-level mixer built with `use_combine=False`,
 // so it simply has no `block_inject_weight` and emits no injection vector.
 // Passing `inject_w == nullptr` selects that form.
+//
+// PERFORMANCE SHAPE (this core was the entire decode budget — 4.5 ms per
+// call, x96 calls/token ~= 435 ms of a 455 ms token). Three rules:
+//
+//  1. The normed vector is staged ONCE in shared memory (hc*H floats = 40 KB
+//     at 4x2560). The first cut recomputed `x * rms * (1 + w)` — three loads
+//     and two multiplies — at every one of its ~6.6M uses.
+//  2. The down projection runs one WARP per rank row: lanes stride the
+//     10240-wide row (coalesced), then warp-reduce. The first cut gave each
+//     THREAD a serial row: uncoalesced and 32x less parallel.
+//  3. The up projection runs one warp per 32 output elements, each lane
+//     owning one element's rank-320 loop per stream; `up_w` rows for
+//     adjacent outputs are adjacent, so the lane-parallel reads stay warm in
+//     L2.
+//
+// The launcher passes block=1024 (32 warps). Grid stays [num_tokens]: at
+// prefill that is thousands of independent blocks; at decode it is one block,
+// which rule 2 finally keeps busy.
+//
+// The `1.0f +` in the norm is NOT optional — see the offset-from-1 note in
+// the header. The parity probe (`hyper_connection_lowrank_tests.rs`) holds
+// this core to the reference at every entry point.
+#define QHC_WBLOCK 1024
+#define QHC_SMEM_NORMED (QHC_MAX_MULT * 2560)
+
 __device__ __forceinline__ void qhc_collapse(
     const float* __restrict__ streams,
     const __nv_bfloat16* __restrict__ hc_norm_w,
@@ -129,75 +154,96 @@ __device__ __forceinline__ void qhc_collapse(
 ) {
     const unsigned int t = blockIdx.x;
     const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int warps = blockDim.x >> 5;
     const unsigned int hc_dim = hc * H;
     const float* x = streams + (size_t)t * hc_dim;
 
+    extern __shared__ float smem[];
+    float* smem_normed = smem;                 // [hc*H]
+    float* smem_low = smem + hc_dim;           // [rank]
     __shared__ float smem_rms[QHC_MAX_MULT];
-    __shared__ float smem_red[QHC_BLOCK / 32];
-    __shared__ float smem_low[QHC_MAX_RANK];
+    __shared__ float smem_red[QHC_WBLOCK / 32];
 
-    qhc_stream_rms(x, H, hc, eps, smem_rms, smem_red);
-
-    // normed(i) for i in [0, hc*H): x[i] * rms_inv[i / H] * (1 + hc_norm_w[i]).
-    //
-    // The `1.0f +` is NOT optional and NOT the usual Qwen convention.
-    // `Qwen4ExpTextRMSNorm.forward` is `normed * (1.0 + weight)` with the
-    // parameter initialised to ZEROS — Gemma's offset-from-1 form — while the
-    // GDN block's `Qwen4ExpTextRMSNormGated` beside it is the ordinary
-    // `weight * normed` initialised to ones. The checkpoint settles it: every
-    // plain-RMSNorm tensor in this model centres near 0 (`hc_norm` -0.06,
-    // `q_norm` 0.28, `ple.norm_key` -0.11) and the gated GDN norm centres at
-    // 0.97. Dropping the offset scales each stream by `w` instead of `1 + w`,
-    // which for w~0 is a near-null mix — plausible activations, wrong model.
-    //
-    // Atlas dispatches this globally via `ships_vanilla_norm_weights`, which
-    // correctly leaves `qwen4_exp` on the offset-from-1 path; this kernel
-    // hand-rolls its own grouped norm and has to match it by hand.
-    #define QHC_NORMED(i) \
-        ((x)[(i)] * smem_rms[(i) / H] * (1.0f + (float)hc_norm_w[(i)]))
-
-    // ── down: [rank, hc*H] @ normed -> [rank], then silu(v / hc) ──
-    for (unsigned int r = tid; r < rank; r += QHC_BLOCK) {
-        const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
+    // ── per-stream RMS ──
+    for (unsigned int s2 = 0; s2 < hc; ++s2) {
+        const float* xs = x + (size_t)s2 * H;
         float acc = 0.0f;
-        for (unsigned int i = 0; i < hc_dim; ++i) {
-            acc += (float)row[i] * QHC_NORMED(i);
+        for (unsigned int d = tid; d < H; d += blockDim.x) {
+            float v = xs[d];
+            acc += v * v;
         }
-        smem_low[r] = qhc_silu(acc / (float)hc);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) smem_red[warp] = acc;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = 0.0f;
+            for (unsigned int w2 = 0; w2 < warps; ++w2) tot += smem_red[w2];
+            smem_rms[s2] = rsqrtf(tot / (float)H + eps);
+        }
+        __syncthreads();
+    }
+
+    // ── stage normed = x * rms * (1 + w) once ──
+    for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
+        smem_normed[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
     }
     __syncthreads();
 
-    // ── up: [hc*H, rank] @ low -> sigmoid, gate the matching normed stream,
-    //    and MEAN over streams. Fused so the hc*H intermediate never lands.
-    __nv_bfloat16* y = y_out + (size_t)t * H;
+    // ── down: warp per rank row, lanes stride the row ──
     const float inv_hc = 1.0f / (float)hc;
-    for (unsigned int d = tid; d < H; d += QHC_BLOCK) {
+    for (unsigned int r = warp; r < rank; r += warps) {
+        const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
+        float acc = 0.0f;
+        for (unsigned int i = lane; i < hc_dim; i += 32) {
+            acc += (float)row[i] * smem_normed[i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) smem_low[r] = qhc_silu(acc * inv_hc);
+    }
+    __syncthreads();
+
+    // ── up + gate + mean over streams: lane owns one output element ──
+    __nv_bfloat16* y = y_out + (size_t)t * H;
+    for (unsigned int d = tid; d < H; d += blockDim.x) {
         float mixed = 0.0f;
-        for (unsigned int s = 0; s < hc; ++s) {
-            const unsigned int i = s * H + d;
+        for (unsigned int s2 = 0; s2 < hc; ++s2) {
+            const unsigned int i = s2 * H + d;
             const __nv_bfloat16* urow = up_w + (size_t)i * rank;
             float acc = 0.0f;
             for (unsigned int r = 0; r < rank; ++r) {
                 acc += (float)urow[r] * smem_low[r];
             }
-            mixed += qhc_sigmoid(acc) * QHC_NORMED(i);
+            mixed += qhc_sigmoid(acc) * smem_normed[i];
         }
         y[d] = __float2bfloat16(mixed * inv_hc);
     }
 
-    // ── injection weights: 2 * sigmoid(block_inject(normed) / hc) ──
+    // ── injection weights: warp per stream ──
     if (inject_w != nullptr) {
         __syncthreads();
-        for (unsigned int s = tid; s < hc; s += QHC_BLOCK) {
-            const __nv_bfloat16* row = inject_w + (size_t)s * hc_dim;
+        for (unsigned int s2 = warp; s2 < hc; s2 += warps) {
+            const __nv_bfloat16* row = inject_w + (size_t)s2 * hc_dim;
             float acc = 0.0f;
-            for (unsigned int i = 0; i < hc_dim; ++i) {
-                acc += (float)row[i] * QHC_NORMED(i);
+            for (unsigned int i = lane; i < hc_dim; i += 32) {
+                acc += (float)row[i] * smem_normed[i];
             }
-            inj_out[(size_t)t * hc + s] = 2.0f * qhc_sigmoid(acc / (float)hc);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+            }
+            if (lane == 0) {
+                inj_out[(size_t)t * hc + s2] = 2.0f * qhc_sigmoid(acc * inv_hc);
+            }
         }
     }
-    #undef QHC_NORMED
 }
 
 // ── hc_pre ──

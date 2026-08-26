@@ -156,6 +156,7 @@ impl TransformerModel {
                         graph_capture: false,
                         gdn_exact_replay: false,
                         token_ids: None,
+                        host_token_ids: None,
                         routed_lora_layers: None, // #30: verify decode; no prefill route.
                         midchunk_capture: None,
                         moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
@@ -192,6 +193,7 @@ impl TransformerModel {
                     graph_capture: false,
                     gdn_exact_replay: false,
                     token_ids: None,
+                    host_token_ids: None,
                     routed_lora_layers: None, // #30: verify decode; no prefill route.
                     midchunk_capture: None,
                     moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses

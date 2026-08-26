@@ -45,9 +45,15 @@ pub fn hc_pre_lowrank(
         "hc_pre_lowrank needs block_inject_weight; a site loaded without one \
          is the model-level mixer and must use hc_head_lowrank"
     );
+    // Block 1024 + dynamic shared for the staged normed vector [hc*H] and
+    // the rank vector — the warp-cooperative core. This launch WAS the whole
+    // decode budget at block 256 with per-thread serial rows (4.5 ms/call,
+    // x96 calls/token); see the kernel's PERFORMANCE SHAPE note.
+    let smem = (hc_mult * hidden_size + w.rank as u32) * 4;
     KernelLaunch::new(gpu, kernel)
         .grid([num_tokens, 1, 1])
-        .block([256, 1, 1])
+        .block([1024, 1, 1])
+        .shared_mem(smem)
         .arg_ptr(streams)
         .arg_ptr(w.norm_w)
         .arg_ptr(w.down_w)
@@ -80,9 +86,11 @@ pub fn hc_head_lowrank(
     norm_eps: f32,
     stream: u64,
 ) -> Result<()> {
+    let smem = (hc_mult * hidden_size + w.rank as u32) * 4;
     KernelLaunch::new(gpu, kernel)
         .grid([num_tokens, 1, 1])
-        .block([256, 1, 1])
+        .block([1024, 1, 1])
+        .shared_mem(smem)
         .arg_ptr(streams)
         .arg_ptr(w.norm_w)
         .arg_ptr(w.down_w)

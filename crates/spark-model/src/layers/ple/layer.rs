@@ -164,26 +164,39 @@ impl PleLayer {
         let heads = self.dims.ngram_heads();
         let gpu = ctx.gpu;
 
-        // The ids are a pure function of TOKEN IDS, so they are computed on
-        // the host. `ctx.token_ids` is the device copy this pass already
-        // staged, in the same order the layer loop sees; read it back rather
-        // than threading a host slice through 26 ForwardContext sites.
-        //
-        // PERF: this is a synchronous D2H on the critical path (T*4 bytes —
-        // 8 KB at 2048 tokens). Negligible next to the NVMe gather below, but
-        // it is also why this layer cannot run under CUDA-graph capture.
-        let tok_dev = ctx.token_ids.ok_or_else(|| {
-            anyhow::anyhow!(
-                "PLE needs ctx.token_ids; this pass did not stage them, so the \
-                 n-gram ids cannot be computed"
-            )
-        })?;
-        let mut raw = vec![0u8; num_tokens * 4];
-        gpu.copy_d2h(tok_dev, &mut raw)?;
-        let tokens: Vec<u32> = raw
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
+        // The ids are a pure function of TOKEN IDS, computed on the host.
+        // Prefer `ctx.host_token_ids` — the very slice the caller uploaded
+        // into the device buffer — over reading the device copy back: the D2H
+        // was a synchronous round trip per DECODE STEP for bytes the caller
+        // had in hand, and inside a CUDA-graph capture region it is a
+        // capture-unsupported op (STREAM_CAPTURE_INVALIDATED, 901).
+        let tokens: Vec<u32> = if let Some(host) = ctx.host_token_ids {
+            anyhow::ensure!(
+                host.len() >= num_tokens,
+                "PLE: host_token_ids has {} ids for {num_tokens} tokens",
+                host.len()
+            );
+            host[..num_tokens].to_vec()
+        } else {
+            // Fallback for passes that did not thread the host slice. Never
+            // legal under capture — refuse rather than invalidate the graph.
+            anyhow::ensure!(
+                !ctx.graph_capture,
+                "PLE: no host_token_ids and a D2H readback is \
+                 capture-unsupported; thread the host ids through this pass"
+            );
+            let tok_dev = ctx.token_ids.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PLE needs token ids (host or device); this pass staged \
+                     neither"
+                )
+            })?;
+            let mut raw = vec![0u8; num_tokens * 4];
+            gpu.copy_d2h(tok_dev, &mut raw)?;
+            raw.chunks_exact(4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        };
 
         let mut st = self
             .state

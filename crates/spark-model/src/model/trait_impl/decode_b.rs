@@ -415,6 +415,7 @@ impl TransformerModel {
             graph_capture: false,
             gdn_exact_replay: false,
             token_ids: None,
+            host_token_ids: None,
             // #30: decode never routes prefill — installed-pair/bgmv path only.
             routed_lora_layers: None,
             midchunk_capture: None,
@@ -435,6 +436,7 @@ impl TransformerModel {
             graph_capture: false,
             gdn_exact_replay: false,
             token_ids: None,
+            host_token_ids: None,
             // #30: the fused (SLAI) prefill portion routes by the prefilling
             // seq's slot (None unless it routes to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(prefill_seq.adapter_slot),
