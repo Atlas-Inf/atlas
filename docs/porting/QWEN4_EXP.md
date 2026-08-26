@@ -54,9 +54,27 @@ That gives a workable budget on one GB10:
 | n-gram table, mmap'd, only hot rows in page cache | ~52 GB on disk |
 | left for KV cache, activations, page cache | ~36 GB |
 
-So the first loader feature is **mmap-backed n-gram gather**, not offload. Full
+So the first loader feature is **demand-paged n-gram gather**, not offload. Full
 residency of all 135.3 GB is not reachable on this box by any placement
 strategy.
+
+**Measured, and it is comfortably viable.** `NgramTable` (`pread`, not `mmap` —
+same page cache, no SIGBUS and no invisible page-fault stall in a CUDA-adjacent
+thread) against the real 51.2 GB table on a GB10:
+
+| | per token (16 rows) | ceiling |
+|---|---|---|
+| cold, every row off NVMe | 820 µs | 1,219 tok/s |
+| warm, page-cached | 8.85 µs | 112,994 tok/s |
+
+Opening the table — validating that 128 shards tile it — takes 443 ms. Even the
+fully-cold figure is an order of magnitude above the decode rate this class of
+model runs at, so the gather is not the bottleneck; at ~100 tok/s it costs under
+a tenth of a decode step, and that is the worst case where no row is resident.
+Resident memory did not move during the run.
+
+That settles the memory plan: ~83 GB of resident weights, the 52 GB table read
+on demand, and ~36 GB left for KV cache and activations.
 
 ## What is implemented
 
