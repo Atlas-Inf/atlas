@@ -171,6 +171,53 @@ Device-resident would be **~83 GB**, which fits a GB10's ~119 GB. The full
 here — it is the thing that decides whether the model runs at all, and it is
 the first item worth building after the weight loader.
 
+## How to work on this without the checkpoint
+
+`scripts/dev/make_tiny_qwen4_exp.py` emits an 8.7 MB / 2.17M-param checkpoint
+carrying every tensor name at the same nesting, the same hybrid schedule, PLE
+on a one-indexed linear-attention layer, and real n-gram head geometry. Both
+Atlas and HF's own `Qwen4ExpTextConfig` accept it.
+
+```
+python scripts/dev/make_tiny_qwen4_exp.py /tmp/tiny-qwen4-exp
+python bench/ngram_embed/qwen4exp_xcheck.py /tmp/tiny-qwen4-exp/config.json
+```
+
+Develop the loader against that. It checks plumbing, not numerics — dimensions
+and values are not faithful — but it is the only way to iterate at all, given
+the arithmetic below.
+
+## Why the real checkpoint is not an option yet
+
+On the GB10 available (`reiner`, 119 GB unified):
+
+| | |
+|---|---|
+| smallest published repack (RadixArk NVFP4) | 135.3 GB |
+| free disk | ~72 GB |
+| free disk after deleting everything of ours | ~95 GB |
+| total system memory | 119 GB |
+
+It fits neither the disk nor the memory. Host-resident PLE would bring the
+device-resident set to ~83 GB, which *would* fit — but the download still needs
+~40 GB more disk than exists. Serving this on that box needs either more disk,
+a different box, or a repack that does not exist today.
+
+## Suggested order
+
+1. **Weight loader** (`Qwen4ExpWeightLoader` + a `factory.rs` arm). Comparable
+   loaders in this tree run 1000–1900 lines. Develop against the tiny
+   checkpoint.
+2. **Host-resident n-gram gather.** Out of order on purpose: it is what decides
+   whether the model runs on a GB10 at all, and `RadixArk`'s `model-plefp8-*`
+   shards mean the boundary needs no repacking.
+3. **Layers, cheapest first** — the 512-expert MoE and the linear-attention
+   pathway are adaptations of the Qwen3.5 / Qwen3-Next paths; the low-rank
+   hyper-connections, the PLE tower (including the third conv-state slot that
+   carries token ids) and the sparse-attention indexer are new work.
+4. **MTP head**, then **vision**, both of which the model runs without.
+5. **SM121 kernels** at these dimensions.
+
 ## Provenance
 
 `crates/atlas-core/src/config/ngram_qwen4exp.rs` is an independent derivation of
