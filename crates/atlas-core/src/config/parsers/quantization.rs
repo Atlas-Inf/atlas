@@ -124,6 +124,22 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
         })
         .unwrap_or_default();
 
+    // NVFP4 scales along the INPUT dim in groups (ModelOpt writes
+    // `group_size`, typically 16) rather than over a 2-D tile.
+    // Top level for a flattened ModelOpt payload; nested under
+    // `config_groups.*.weights` for compressed-tensors, which is how the
+    // NVFP4 repacks of Qwen3.8-Flash-Next declare it.
+    let group_size = qc
+        .get("group_size")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            qc.get("config_groups")?
+                .as_object()?
+                .values()
+                .find_map(|g| g.get("weights")?.get("group_size")?.as_u64())
+        })
+        .unwrap_or(0) as usize;
+
     // An empty quant_method with empty ignore list is not a real quant
     // config — skip so callers can fall through to heuristic detection.
     if quant_method.is_empty() && quant_algo.is_empty() && ignore_modules.is_empty() {
@@ -136,6 +152,7 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
         format,
         ignore_modules,
         weight_block_size,
+        group_size,
     })
 }
 

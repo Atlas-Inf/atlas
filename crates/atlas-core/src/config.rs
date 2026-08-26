@@ -590,6 +590,9 @@ pub struct QuantizationConfig {
     /// scale per tensor or per row. When present, a quantized `[rows, cols]`
     /// weight carries a `[ceil(rows/b0), ceil(cols/b1)]` scale sibling.
     pub weight_block_size: Vec<usize>,
+    /// NVFP4 scaling group along the input dimension (ModelOpt `group_size`,
+    /// typically 16). `0` when the scheme does not group.
+    pub group_size: usize,
 }
 
 /// Vision encoder configuration for Qwen3-VL models.

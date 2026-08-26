@@ -67,14 +67,19 @@ behind specific subsystems — see the
   `hidden`; `q_proj` is 2x for the gate; the indexer's `index_qk_proj` is
   `(n_heads + kv_heads) * head_dim`).
 
-  Quantization siblings are derived too, from the checkpoint's declared
-  `weight_block_size` and `modules_to_not_convert` (the latter previously went
-  unparsed — HF's FP8 spelling, 943 literal entries). Manifest plus siblings is
-  **151,756 tensors, the whole published checkpoint bar its 333 vision tensors,
-  with zero missing and zero unexpected** and 3,189 shapes matching real
-  headers. Per-tensor groups are excluded from block scaling: the 128 n-gram
-  shards are FP8 behind a single shared `weight_scale`, and are absent from the
-  ignore list precisely because they *are* converted.
+  Quantization is described too, and **both published releases now match
+  exactly**: `Qwen/…-FP8` at 151,756 tensors and `RadixArk/…-NVFP4` at 296,142,
+  each with zero missing and zero unexpected against their published indexes.
+  NVFP4 repacks the weight as well as adding siblings — `[2560, 640]` is stored
+  U8 `[2560, 320]`, two FP4 values per byte.
+
+  Three things had to be handled that the tensor names do not reveal:
+  `modules_to_not_convert` was going unparsed (HF's FP8 spelling, 943 literal
+  entries); ModelOpt's ignore globs need `*` to span dots while HF's list has no
+  globs at all; and the 128 n-gram shards are FP8 behind a single shared
+  `weight_scale`, so they take no per-block sibling despite being absent from
+  the ignore list. Expert layout is a fourth: HF stores `gate_up_proj` stacked,
+  quantizers split it per `nn.Linear`, and `Qwen4ExpLayout` expresses both.
 - **`qwen4_exp` config parsing.** The published `Qwen3.8-Flash-Next-FP8`
   `config.json` now parses (vendored whole into `test_data/`). Two of its
   defaults are absent rather than stated and both fail silently: `norm_topk_prob`

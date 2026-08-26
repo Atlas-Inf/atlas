@@ -87,6 +87,40 @@ pub fn diff<'a>(
     out
 }
 
+/// Does an HF-style module glob match a module path?
+///
+/// ModelOpt writes patterns like `*.self_attn.*`, `mtp.*` and `*hyper_connection*`,
+/// where `*` spans dots — `*.self_attn.*` is meant to match
+/// `model.language_model.layers.3.self_attn.q_proj`. HF's own native-FP8 lists
+/// carry no globs at all (Qwen3.8-Flash-Next-FP8 spells out all 943 modules),
+/// so both forms have to work.
+pub fn module_glob_matches(pattern: &str, module: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return pattern == module;
+    };
+    if !module.starts_with(first) {
+        return false;
+    }
+    if !pattern.contains('*') {
+        return pattern == module;
+    }
+    let mut rest = &module[first.len()..];
+    let mut trailing = "";
+    for part in parts {
+        trailing = part;
+        if part.is_empty() {
+            continue;
+        }
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    // A pattern not ending in `*` must consume to the end.
+    trailing.is_empty() || rest.is_empty()
+}
+
 /// Scale siblings a quantized checkpoint carries alongside the logical weights.
 ///
 /// Separate from the base manifest on purpose: the same architecture ships in
@@ -110,8 +144,12 @@ pub fn quantization_siblings(
     let (br, bc) = (quant.weight_block_size[0], quant.weight_block_size[1]);
     anyhow::ensure!(br > 0 && bc > 0, "weight_block_size must be positive");
 
-    let ignored: std::collections::HashSet<&str> =
-        quant.ignore_modules.iter().map(String::as_str).collect();
+    let is_ignored = |module: &str| {
+        quant
+            .ignore_modules
+            .iter()
+            .any(|p| module_glob_matches(p, module))
+    };
     // A group carrying its own `weight_scale` is quantized PER TENSOR, not per
     // block, and takes no `weight_scale_inv`. The n-gram embedding is the case
     // that matters: its 128 shards are FP8 but share one BF16 scale, and they
@@ -132,7 +170,7 @@ pub fn quantization_siblings(
                 // them appear in the ignore list either -- which is why the
                 // rank check has to be here and not left to the list.
                 let module = tensor.name.strip_suffix(".weight")?;
-                if tensor.shape.len() != 2 || ignored.contains(module) {
+                if tensor.shape.len() != 2 || is_ignored(module) {
                     return None;
                 }
                 // `a.b.shard_0` -> `a.b`; skip when that group scales per tensor.
@@ -150,8 +188,88 @@ pub fn quantization_siblings(
     ))
 }
 
+/// The full on-disk tensor set for a quantized release: logical weights with
+/// their storage shapes, plus every scale sibling.
+///
+/// Distinct from [`quantization_siblings`], which only adds. NVFP4 also
+/// *rewrites* the weight it quantizes — a `[2560, 640]` projection is stored as
+/// U8 `[2560, 320]`, two FP4 values per byte — so a caller that only appended
+/// siblings would still expect the wrong shape for the weight itself.
+///
+/// `Ok(None)` for an unquantized checkpoint or a scheme not described here.
+pub fn quantized_manifest(
+    config: &ModelConfig,
+    base: &[ExpectedTensor],
+) -> Result<Option<Vec<ExpectedTensor>>> {
+    let Some(quant) = config.quantization_config.as_ref() else {
+        return Ok(None);
+    };
+
+    // FP8 block-scaled: weights keep their shape, one scale per tile.
+    if quant.quant_method == "fp8" && quant.weight_block_size.len() == 2 {
+        let Some(siblings) = quantization_siblings(config, base)? else {
+            return Ok(None);
+        };
+        let mut out = base.to_vec();
+        out.extend(siblings);
+        return Ok(Some(out));
+    }
+
+    // ModelOpt NVFP4: packed weights plus a three-tensor scale set.
+    if quant.quant_algo == "NVFP4" {
+        let group = quant.group_size;
+        anyhow::ensure!(group > 0, "NVFP4 requires a non-zero group_size");
+        let is_ignored = |module: &str| {
+            quant
+                .ignore_modules
+                .iter()
+                .any(|p| module_glob_matches(p, module))
+        };
+        let per_tensor: std::collections::HashSet<&str> = base
+            .iter()
+            .filter_map(|t| t.name.strip_suffix(".weight_scale"))
+            .collect();
+
+        let mut out = Vec::with_capacity(base.len() * 2);
+        for tensor in base {
+            let quantizable = tensor
+                .name
+                .strip_suffix(".weight")
+                .filter(|module| tensor.shape.len() == 2 && !is_ignored(module))
+                .filter(|module| {
+                    !module
+                        .rsplit_once('.')
+                        .is_some_and(|(group, _)| per_tensor.contains(group))
+                });
+            let Some(module) = quantizable else {
+                out.push(tensor.clone());
+                continue;
+            };
+            let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+            anyhow::ensure!(
+                cols.is_multiple_of(2) && cols.is_multiple_of(group),
+                "NVFP4 needs an even, group-aligned input dim; {} has {cols}",
+                tensor.name
+            );
+            // Two FP4 values per byte along the input dim.
+            out.push(ExpectedTensor::new(tensor.name.clone(), [rows, cols / 2]));
+            out.push(ExpectedTensor::new(
+                format!("{module}.weight_scale"),
+                [rows, cols / group],
+            ));
+            // Both are scalars: a per-tensor second-level scale and the
+            // activation scale.
+            out.push(ExpectedTensor::new(format!("{module}.weight_scale_2"), []));
+            out.push(ExpectedTensor::new(format!("{module}.input_scale"), []));
+        }
+        return Ok(Some(out));
+    }
+
+    Ok(None)
+}
+
 mod qwen4_exp;
-pub use qwen4_exp::qwen4_exp_manifest;
+pub use qwen4_exp::{ExpertLayout, Qwen4ExpLayout, qwen4_exp_manifest, qwen4_exp_manifest_with};
 
 /// The manifest for a config, dispatched on `model_type`.
 ///
@@ -159,8 +277,16 @@ pub use qwen4_exp::qwen4_exp_manifest;
 /// case, since this exists to support new ports rather than to re-describe
 /// loaders that already work.
 pub fn manifest_for(config: &ModelConfig) -> Result<Option<Vec<ExpectedTensor>>> {
+    manifest_for_with(config, Qwen4ExpLayout::default())
+}
+
+/// [`manifest_for`] with per-release layout overrides.
+pub fn manifest_for_with(
+    config: &ModelConfig,
+    layout: Qwen4ExpLayout,
+) -> Result<Option<Vec<ExpectedTensor>>> {
     match config.model_type.as_str() {
-        "qwen4_exp" => Ok(Some(qwen4_exp_manifest(config)?)),
+        "qwen4_exp" => Ok(Some(qwen4_exp_manifest_with(config, layout)?)),
         _ => Ok(None),
     }
 }

@@ -92,10 +92,31 @@ Two rules that are not guessable from the tensor names:
   just by another scheme. Treating them as block-quantized over-generates by
   exactly 128.
 
-ModelOpt NVFP4 (what the RadixArk repack uses) has a different sibling set —
-`weight_scale`, `weight_scale_2`, `input_scale` — and returns `None` rather than
-a wrong guess. That is the next piece if we serve a repack rather than the FP8
-release.
+**Both published releases are now described exactly**, weights and scales:
+
+| release | tensors (ex-vision) | manifest | discrepancies |
+|---|---|---|---|
+| `Qwen/…-FP8` (block FP8) | 151,756 | 151,756 | **0** |
+| `RadixArk/…-NVFP4` (ModelOpt) | 296,142 | 296,142 | **0** |
+
+NVFP4 does more than add siblings — it **repacks the weight**: a `[2560, 640]`
+projection is stored U8 `[2560, 320]`, two FP4 values per byte, with
+`weight_scale [2560, 40]` (one per group of 16 along the input dim) and scalar
+`weight_scale_2` / `input_scale`.
+
+Two packaging differences that are NOT architectural, and that a loader must
+handle rather than assume:
+
+* **Expert layout.** HF's native `Qwen4ExpTextExperts` stores `gate_up_proj` as
+  one `[experts, 2*moe_intermediate, hidden]` tensor and chunks it at use.
+  ModelOpt works per `nn.Linear`, so quantizing splits the stack into
+  `experts.{i}.{gate,up,down}_proj`. The FP8 release is split throughout;
+  RadixArk is split for the quantized routed experts and **stacked for the MTP
+  block**, which it excludes from quantization entirely (`mtp.*`). Both are
+  expressible via `Qwen4ExpLayout`.
+* **Ignore-list syntax.** ModelOpt globs (`*.self_attn.*`, `mtp.*`) and `*`
+  spans dots; HF's native FP8 list carries no globs at all and spells out all
+  943 modules. Both forms are matched.
 
 ### Dispatch
 `qwen4_exp` is in neither `config/dispatch.rs::parse_config` nor

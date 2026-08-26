@@ -20,11 +20,12 @@ import json, pathlib, struct, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
-def manifest_for(config_path):
+def manifest_for(config_path, stacked_mtp=False):
     base = ["cargo", "run", "-q", "--release", "-p", "atlas-core",
             "--example", "qwen4exp_manifest"]
+    tail = ["--", str(config_path)] + (["--stacked-mtp"] if stacked_mtp else [])
     for extra in ([], ["--no-default-features", "--features", "metal"]):
-        done = subprocess.run(base + extra + ["--", str(config_path)],
+        done = subprocess.run(base + extra + tail,
                               cwd=ROOT, capture_output=True, text=True)
         if done.returncode == 0:
             return {t["name"]: tuple(t["shape"]) for t in json.loads(done.stdout)}
@@ -42,7 +43,10 @@ def safetensors_header(path):
 
 def main():
     ckpt = pathlib.Path(sys.argv[1])
+    # Expert layout is a per-release packaging choice, not an architectural one,
+    # so try both rather than making the caller know which this checkpoint used.
     manifest = manifest_for(ckpt / "config.json")
+    stacked = manifest_for(ckpt / "config.json", stacked_mtp=True)
 
     actual = {}
     index = ckpt / "model.safetensors.index.json"
@@ -54,6 +58,9 @@ def main():
 
     visual = {n for n in names if n.startswith("model.visual.")}
     core = names - visual
+    if len(core - set(stacked)) < len(core - set(manifest)):
+        manifest = stacked
+        print("  (MTP experts are stored stacked in this release)")
     scales = {n for n in names if n.endswith(".weight_scale_inv")}
 
     missing = sorted(core - set(manifest))

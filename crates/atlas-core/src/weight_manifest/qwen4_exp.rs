@@ -125,22 +125,61 @@ fn linear_attention(prefix: &str, cfg: &ModelConfig, out: &mut Vec<ExpectedTenso
     ));
 }
 
-fn moe(prefix: &str, cfg: &ModelConfig, out: &mut Vec<ExpectedTensor>) {
+/// How a block's routed experts are stored.
+///
+/// `Stacked` is HuggingFace's NATIVE layout — `Qwen4ExpTextExperts` holds
+/// `gate_up_proj` as one `[experts, 2*moe_intermediate, hidden]` tensor and
+/// chunks it at use. `PerExpert` is what appears once a quantizer has been
+/// through: ModelOpt works per `nn.Linear`, so it splits the stack.
+///
+/// Both are published. Qwen3.8-Flash-Next-FP8 is `PerExpert` throughout;
+/// RadixArk's NVFP4 repack is `PerExpert` for the quantized routed experts and
+/// `Stacked` for the MTP block, which it leaves in BF16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpertLayout {
+    #[default]
+    PerExpert,
+    Stacked,
+}
+
+/// Knobs a release can differ on without differing architecturally.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Qwen4ExpLayout {
+    pub trunk_experts: ExpertLayout,
+    pub mtp_experts: ExpertLayout,
+}
+
+fn moe(prefix: &str, cfg: &ModelConfig, layout: ExpertLayout, out: &mut Vec<ExpectedTensor>) {
     let (h, mi) = (cfg.hidden_size, cfg.moe_intermediate_size);
     out.push(ExpectedTensor::new(
         format!("{prefix}.gate.weight"),
         [cfg.num_experts, h],
     ));
-    for expert in 0..cfg.num_experts {
-        for (proj, shape) in [
-            ("gate_proj", [mi, h]),
-            ("up_proj", [mi, h]),
-            ("down_proj", [h, mi]),
-        ] {
+    match layout {
+        ExpertLayout::Stacked => {
+            // gate and up fused along the intermediate dim, experts stacked.
             out.push(ExpectedTensor::new(
-                format!("{prefix}.experts.{expert}.{proj}.weight"),
-                shape,
+                format!("{prefix}.experts.gate_up_proj"),
+                [cfg.num_experts, mi * 2, h],
             ));
+            out.push(ExpectedTensor::new(
+                format!("{prefix}.experts.down_proj"),
+                [cfg.num_experts, h, mi],
+            ));
+        }
+        ExpertLayout::PerExpert => {
+            for expert in 0..cfg.num_experts {
+                for (proj, shape) in [
+                    ("gate_proj", [mi, h]),
+                    ("up_proj", [mi, h]),
+                    ("down_proj", [h, mi]),
+                ] {
+                    out.push(ExpectedTensor::new(
+                        format!("{prefix}.experts.{expert}.{proj}.weight"),
+                        shape,
+                    ));
+                }
+            }
         }
     }
     let si = cfg.shared_expert_intermediate_size;
@@ -223,6 +262,14 @@ fn ple(
 ///
 /// Excludes `model.visual.*`; see the module docs.
 pub fn qwen4_exp_manifest(cfg: &ModelConfig) -> Result<Vec<ExpectedTensor>> {
+    qwen4_exp_manifest_with(cfg, Qwen4ExpLayout::default())
+}
+
+/// [`qwen4_exp_manifest`] for a release that stores its experts differently.
+pub fn qwen4_exp_manifest_with(
+    cfg: &ModelConfig,
+    layout: Qwen4ExpLayout,
+) -> Result<Vec<ExpectedTensor>> {
     ensure!(
         cfg.hc_count > 0 && cfg.hc_lowrank > 0,
         "qwen4_exp requires hc_count and hc_lowrank; got {} / {}",
@@ -267,7 +314,7 @@ pub fn qwen4_exp_manifest(cfg: &ModelConfig) -> Result<Vec<ExpectedTensor>> {
             }
             other => anyhow::bail!("qwen4_exp does not use layer type {other:?}"),
         }
-        moe(&format!("{base}.mlp"), cfg, &mut out);
+        moe(&format!("{base}.mlp"), cfg, layout.trunk_experts, &mut out);
         // ple_layer_ids is ONE-indexed.
         if let Some(index) = cfg.ple_layer_ids.iter().position(|id| *id == layer + 1) {
             ple(&format!("{base}.ple"), cfg, index, &mut out)?;
@@ -286,7 +333,7 @@ pub fn qwen4_exp_manifest(cfg: &ModelConfig) -> Result<Vec<ExpectedTensor>> {
         // The MTP block is declared `full_attention` regardless of the trunk's
         // schedule, and carries its own indexer and its own expert stack.
         full_attention(&format!("{base}.self_attn"), cfg, &mut out);
-        moe(&format!("{base}.mlp"), cfg, &mut out);
+        moe(&format!("{base}.mlp"), cfg, layout.mtp_experts, &mut out);
     }
     if cfg.mtp_num_hidden_layers > 0 {
         hyper_connection("mtp.hyper_connection_mixer", cfg, false, &mut out);
@@ -524,6 +571,92 @@ mod tests {
             !scales.iter().any(|t| t.name.contains("ngram_embedding")),
             "n-gram shards must not get weight_scale_inv"
         );
+    }
+
+    fn radixark() -> ModelConfig {
+        parse_config(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/qwen4_exp_flash_next_nvfp4_config.json"
+        )))
+        .expect("RadixArk NVFP4 config parses")
+    }
+
+    /// The other published release, and it differs in two ways that are
+    /// packaging rather than architecture: NVFP4 instead of block FP8, and the
+    /// MTP block left in HF's native stacked-expert form because it is not
+    /// quantized at all. Its index holds 296_475 tensors, 333 of them vision.
+    #[test]
+    fn the_nvfp4_repack_is_covered_exactly() {
+        let cfg = radixark();
+        let layout = Qwen4ExpLayout {
+            mtp_experts: ExpertLayout::Stacked,
+            ..Default::default()
+        };
+        let base = qwen4_exp_manifest_with(&cfg, layout).unwrap();
+        let full = crate::weight_manifest::quantized_manifest(&cfg, &base)
+            .unwrap()
+            .expect("NVFP4 is described");
+        assert_eq!(full.len(), 296_142);
+
+        // NVFP4 repacks the weight itself: [2560, 640] is stored U8
+        // [2560, 320], two FP4 values per byte.
+        let expert = "model.language_model.layers.0.mlp.experts.0.down_proj";
+        assert_eq!(shape_of(&full, &format!("{expert}.weight")), [2560, 320]);
+        // One scale per group of 16 along the input dim.
+        assert_eq!(
+            shape_of(&full, &format!("{expert}.weight_scale")),
+            [2560, 40]
+        );
+        // Both second-level scales are scalars.
+        assert!(shape_of(&full, &format!("{expert}.weight_scale_2")).is_empty());
+        assert!(shape_of(&full, &format!("{expert}.input_scale")).is_empty());
+
+        // `mtp.*` is in the exclude list, so the MTP experts stay BF16 and
+        // keep the stacked shapes: gate and up fused along the intermediate.
+        assert_eq!(
+            shape_of(&full, "mtp.layers.0.mlp.experts.gate_up_proj"),
+            [512, 1280, 2560]
+        );
+        assert_eq!(
+            shape_of(&full, "mtp.layers.0.mlp.experts.down_proj"),
+            [512, 2560, 640]
+        );
+        assert!(
+            !full
+                .iter()
+                .any(|t| t.name.starts_with("mtp.") && t.name.ends_with(".weight_scale")),
+            "mtp.* is excluded from quantization"
+        );
+    }
+
+    /// ModelOpt's ignore list is globbed (`*.self_attn.*`, `mtp.*`) while HF's
+    /// native FP8 list is 943 literal paths. Both have to work, and a `*` has
+    /// to span dots or `*.self_attn.*` never matches a real module path.
+    #[test]
+    fn module_globs_span_dots_and_literals_still_match() {
+        use crate::weight_manifest::module_glob_matches as m;
+        let q = "model.language_model.layers.3.self_attn.q_proj";
+        assert!(m("*.self_attn.*", q));
+        assert!(m(
+            "*hyper_connection*",
+            "model.language_model.layers.0.attn_hyper_connection.hc_norm"
+        ));
+        assert!(m("mtp.*", "mtp.layers.0.mlp.experts.0.down_proj"));
+        assert!(!m(
+            "mtp.*",
+            "model.language_model.layers.0.mlp.experts.0.down_proj"
+        ));
+        // Literal, no glob.
+        assert!(m("lm_head", "lm_head"));
+        assert!(!m("lm_head", "lm_head.something"));
+        assert!(m(
+            "model.language_model.layers.1.ple.conv1d",
+            "model.language_model.layers.1.ple.conv1d"
+        ));
+        assert!(!m(
+            "*.self_attn.*",
+            "model.language_model.layers.0.linear_attn.out_proj"
+        ));
     }
 
     /// The hyper-connection widths are the whole reason this manifest exists,
