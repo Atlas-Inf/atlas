@@ -33,14 +33,14 @@ fn up_bf16(g: &dyn GpuBackend, values: &[f32]) -> Result<DevicePtr> {
         .iter()
         .flat_map(|v| bf16::from_f32(*v).to_bits().to_le_bytes())
         .collect();
-    let ptr = g.alloc(bytes.len())?;
-    g.upload(ptr, &bytes)?;
+    let ptr = g.alloc(bytes.len().max(1))?;
+    g.copy_h2d(&bytes, ptr)?;
     Ok(ptr)
 }
 
 fn down_bf16(g: &dyn GpuBackend, ptr: DevicePtr, len: usize) -> Result<Vec<f32>> {
     let mut raw = vec![0u8; len * 2];
-    g.download(&mut raw, ptr)?;
+    g.copy_d2h(ptr, &mut raw)?;
     Ok(raw
         .chunks_exact(2)
         .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
