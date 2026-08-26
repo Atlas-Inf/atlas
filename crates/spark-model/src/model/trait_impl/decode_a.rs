@@ -150,6 +150,14 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&token.to_le_bytes(), self.buffers.token_ids(), stream)?;
 
+        // Hoisted host-side per-step layer work (PLE n-gram hash + NVMe
+        // fault-in + slot upload into its stable slots buffer) — BEFORE any
+        // graph replay/capture, same phasing as the token_ids upload above.
+        // A replayed graph then only reads buffers this call refreshed.
+        for l in self.layers.iter() {
+            l.decode_prestage(token, self.gpu.as_ref(), stream)?;
+        }
+
         // ── M2 request-scoped LoRA routing (single-seq decode). Upload this
         // request's 1-elem adapter-slot buffer to the free +128 gap (positions
         // @+0..+4, slot @+8..+16, seq_len @+16..+20, block_table @+256 — +128

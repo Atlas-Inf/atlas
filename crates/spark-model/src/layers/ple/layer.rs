@@ -29,6 +29,10 @@ struct PleState {
     conv: DevicePtr,
     /// The last `context_len` token ids, EOS-filled at a sequence start.
     history: Vec<u32>,
+    /// Set by `prestage`: the n-gram table's device VA, recorded when the
+    /// step's host work (hash + fault-in + slot upload) already ran BEFORE
+    /// graph replay/capture. `forward` consumes it and enqueues kernels only.
+    prestaged_va: Option<u64>,
 }
 
 pub struct PleLayer {
@@ -130,6 +134,7 @@ impl PleLayer {
             state: std::sync::Mutex::new(PleState {
                 conv: gpu.alloc(state_len * c * 4)?,
                 history: Vec::new(),
+                prestaged_va: None,
             }),
         })
     }
@@ -137,8 +142,39 @@ impl PleLayer {
     /// Fresh sequence: EOS-filled history and a zeroed conv state.
     fn reset(&self, st: &mut PleState, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
         st.history = vec![self.dims.eos_token_id; self.dims.context_len()];
+        st.prestaged_va = None;
         let zeros = vec![0u8; self.state_len * self.hc_mult * self.hidden * 4];
         gpu.copy_h2d_async(&zeros, st.conv, stream)?;
+        Ok(())
+    }
+
+    /// Hoisted per-step HOST work for decode under CUDA graphs: the n-gram
+    /// hash, the NVMe fault-in and the slot upload into the stable
+    /// `slots_dev` buffer. All three are capture-illegal (the upload reads
+    /// pageable memory, which invalidates a recording graph with status
+    /// 901), so the scheduler calls this BEFORE graph replay/capture — the
+    /// same phasing decode_a already gives the `token_ids` upload. `forward`
+    /// then consumes `prestaged_va` and enqueues only stable-buffer kernels.
+    ///
+    /// History advances HERE; the prestaged `forward` must not advance it
+    /// again.
+    pub fn prestage(&self, tokens: &[u32], gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PLE state mutex poisoned"))?;
+        if st.history.len() != self.dims.context_len() {
+            self.reset(&mut st, gpu, stream)?;
+        }
+        let mut window = st.history.clone();
+        window.extend_from_slice(tokens);
+        let all = ple_ngram_ids(&self.dims, &window);
+        let rows = &all[all.len() - tokens.len()..];
+        let flat: Vec<u64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        let va = self.gather_host(&flat, gpu, stream)?;
+        let keep = self.dims.context_len();
+        st.history = window[window.len() - keep..].to_vec();
+        st.prestaged_va = Some(va);
         Ok(())
     }
 
@@ -202,19 +238,42 @@ impl PleLayer {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("PLE state mutex poisoned"))?;
+        let prestaged = st.prestaged_va.take();
         if fresh || st.history.len() != self.dims.context_len() {
             self.reset(&mut st, gpu, stream)?;
         }
 
-        // history ++ tokens, hashed together, then keep the new tokens' rows —
-        // the same slice the reference takes with `[:, -input_ids.shape[1]:]`.
-        let mut window = st.history.clone();
-        window.extend_from_slice(&tokens);
-        let all = ple_ngram_ids(&self.dims, &window);
-        let rows = &all[all.len() - num_tokens..];
-        let flat: Vec<u64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        if let Some(table_va) = prestaged {
+            // The host half already ran from `decode_prestage`, before graph
+            // replay/capture: slots sit in `slots_dev`, history has advanced.
+            // Only the capture-safe kernel half remains.
+            anyhow::ensure!(
+                num_tokens == 1 && !fresh,
+                "PLE: prestage is a single-token decode path (got T={num_tokens}, fresh={fresh})"
+            );
+            self.gather_embed(table_va, num_tokens, heads, gpu, stream)?;
+        } else {
+            anyhow::ensure!(
+                !ctx.graph_capture,
+                "PLE: un-prestaged forward inside CUDA graph capture — the \
+                 pageable slot upload would invalidate the recording (901); \
+                 the scheduler must call decode_prestage every step"
+            );
+            // history ++ tokens, hashed together, then keep the new tokens'
+            // rows — the same slice the reference takes with
+            // `[:, -input_ids.shape[1]:]`.
+            let mut window = st.history.clone();
+            window.extend_from_slice(&tokens);
+            let all = ple_ngram_ids(&self.dims, &window);
+            let rows = &all[all.len() - num_tokens..];
+            let flat: Vec<u64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
 
-        self.gather(&flat, num_tokens, heads, gpu, stream)?;
+            self.gather(&flat, num_tokens, heads, gpu, stream)?;
+
+            // Carry the last `context_len` tokens for the next step.
+            let keep = self.dims.context_len();
+            st.history = window[window.len() - keep..].to_vec();
+        }
 
         // Projections off the concatenated n-gram embedding.
         //
@@ -289,9 +348,6 @@ impl PleLayer {
             stream,
         )?;
 
-        // Carry the last `context_len` tokens for the next step.
-        let keep = self.dims.context_len();
-        st.history = window[window.len() - keep..].to_vec();
         Ok(())
     }
 
@@ -308,6 +364,15 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
+        let table_va = self.gather_host(ids, gpu, stream)?;
+        self.gather_embed(table_va, num_tokens, heads, gpu, stream)
+    }
+
+    /// The HOST half of `gather`: NVMe fault-in + slot upload into the
+    /// stable `slots_dev` buffer. Capture-illegal (pageable H2D), so under
+    /// CUDA graphs it runs from `prestage` BEFORE replay/capture. Returns
+    /// the table's device VA for the kernel half.
+    fn gather_host(&self, ids: &[u64], gpu: &dyn GpuBackend, stream: u64) -> Result<u64> {
         let mut table = self
             .table
             .lock()
@@ -339,11 +404,24 @@ impl PleLayer {
                  measured 0.0050 error vs FP8's 0.0247)."
             ),
         };
+        Ok(table_va.0)
+    }
+
+    /// The KERNEL half of `gather`: reads `slots_dev` and the table arena —
+    /// both stable device addresses — so it is graph-capture-safe.
+    fn gather_embed(
+        &self,
+        table_va: u64,
+        num_tokens: usize,
+        heads: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
         ops::batched_embed(
             gpu,
             self.embed_k,
             self.slots_dev,
-            table_va,
+            DevicePtr(table_va),
             self.emb,
             (num_tokens * heads) as u32,
             self.head_dim as u32,

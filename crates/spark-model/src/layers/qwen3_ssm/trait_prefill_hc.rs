@@ -65,6 +65,36 @@ impl Qwen3SsmLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let n = num_tokens as u32;
 
+        // Stage profiler, the prefill twin of ATLAS_QWEN4EXP_DECODE_PROF:
+        // serialize at stage seams and log per-stage µs for the first ~8
+        // chunks (48 layer calls each). Prefill sits at ~110-130 tok/s vs a
+        // 300-600 llama.cpp reference; the ranked suspects (GDN chunk path,
+        // MoE grouped GEMM, PLE host work) live at different seams here.
+        static PROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static PROF_LEFT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(400);
+        let prof = *PROF
+            .get_or_init(|| std::env::var("ATLAS_QWEN4EXP_PREFILL_PROF").as_deref() == Ok("1"))
+            && PROF_LEFT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0;
+        let mut t = if prof {
+            ctx.gpu.synchronize(stream).ok();
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        macro_rules! stage {
+            ($name:expr) => {
+                if let Some(t0) = t.as_mut() {
+                    ctx.gpu.synchronize(stream).ok();
+                    tracing::info!(
+                        "hc-prefill L{ssm_layer_idx} T={num_tokens} [{}]: {}us",
+                        $name,
+                        t0.elapsed().as_micros()
+                    );
+                    *t0 = std::time::Instant::now();
+                }
+            };
+        }
+
         // Same counter the non-HC path bumps: one increment per SSM layer per
         // prefill, so `ATLAS_GDN_DUMP` still attributes an intermediate to the
         // right layer.

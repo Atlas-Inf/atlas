@@ -18,6 +18,15 @@ impl TransformerLayer for Qwen3SsmLayer {
         Some(self)
     }
 
+    /// PLE's host half (hash + NVMe fault-in + slot upload), hoisted before
+    /// graph replay/capture. No-op on the 47 layers without a PLE site.
+    fn decode_prestage(&self, token: u32, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        if let Some(ple) = self.ple.as_ref() {
+            ple.prestage(&[token], gpu, stream)?;
+        }
+        Ok(())
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,

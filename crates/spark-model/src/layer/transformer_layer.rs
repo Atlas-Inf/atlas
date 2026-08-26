@@ -67,6 +67,16 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// Hoisted per-step HOST work for layers that do host-side computation
+    /// at decode (PLE: n-gram hash + NVMe fault-in + slot upload). The
+    /// scheduler calls this every single-token decode step BEFORE any CUDA
+    /// graph replay/capture — the same phasing as the `token_ids` upload —
+    /// so the captured graph contains only kernels over stable device
+    /// buffers. Layers with no host-side decode work keep the no-op default.
+    fn decode_prestage(&self, _token: u32, _gpu: &dyn GpuBackend, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Decode one token through this layer, modifying `hidden` in-place.
     ///
     /// # Arguments
