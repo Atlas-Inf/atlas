@@ -30,17 +30,51 @@ struct Store {
 }
 
 impl Store {
-    fn get(&self, name: &str) -> Result<std::rc::Rc<Vec<f32>>> {
-        if let Some(hit) = self.cache.borrow().get(name) {
-            return Ok(hit.clone());
-        }
+    fn raw(&self, name: &str) -> Result<(Vec<u8>, &TensorLocation)> {
         let loc = self
             .located
             .get(name)
             .with_context(|| format!("missing {name}"))?;
         let file = std::fs::File::open(&loc.path)?;
-        let mut raw = vec![0u8; loc.span.len as usize];
-        file.read_exact_at(&mut raw, loc.span.abs_offset)?;
+        let mut bytes = vec![0u8; loc.span.len as usize];
+        file.read_exact_at(&mut bytes, loc.span.abs_offset)?;
+        Ok((bytes, loc))
+    }
+
+    /// Experts are the bulk of the model and are read once per token; caching
+    /// the dequantized form would need hundreds of GB.
+    fn cacheable(name: &str) -> bool {
+        !name.contains(".experts.")
+    }
+
+    fn get(&self, name: &str) -> Result<std::rc::Rc<Vec<f32>>> {
+        if let Some(hit) = self.cache.borrow().get(name) {
+            return Ok(hit.clone());
+        }
+        let (raw, loc) = self.raw(name)?;
+
+        // NVFP4: nibbles packed two per byte, an FP8 block scale along the
+        // input dim, and a per-tensor f32 on top of that.
+        if loc.dtype == "U8" && self.located.contains_key(&format!("{name}_scale")) {
+            let rows = loc.shape[0];
+            let cols = loc.shape[1] * 2;
+            let scale_loc = &self.located[&format!("{name}_scale")];
+            let group = cols / scale_loc.shape[1];
+            let (scale, _) = self.raw(&format!("{name}_scale"))?;
+            let (g2, _) = self.raw(&format!("{name}_scale_2"))?;
+            let global = f32::from_le_bytes([g2[0], g2[1], g2[2], g2[3]]);
+            let values =
+                atlas_core::numeric::nvfp4_dequant(&raw, &scale, global, rows, cols, group)
+                    .map_err(anyhow::Error::msg)?;
+            let shared = std::rc::Rc::new(values);
+            if Self::cacheable(name) {
+                self.cache
+                    .borrow_mut()
+                    .insert(name.to_string(), shared.clone());
+            }
+            return Ok(shared);
+        }
+
         let values: Vec<f32> = match loc.dtype.as_str() {
             "F32" => raw
                 .chunks_exact(4)
@@ -57,9 +91,11 @@ impl Store {
             other => anyhow::bail!("{name}: no f32 path for dtype {other}"),
         };
         let shared = std::rc::Rc::new(values);
-        self.cache
-            .borrow_mut()
-            .insert(name.to_string(), shared.clone());
+        if Self::cacheable(name) {
+            self.cache
+                .borrow_mut()
+                .insert(name.to_string(), shared.clone());
+        }
         Ok(shared)
     }
 }
