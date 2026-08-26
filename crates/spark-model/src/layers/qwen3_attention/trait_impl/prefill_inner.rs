@@ -655,6 +655,15 @@ impl Qwen3AttentionLayer {
                 .copy_d2d_async(hidden, normed, num_tokens * h * 2, stream)?;
         }
 
+        // QSA indexer ingest: park this chunk's raw indexer keys (the
+        // indexer consumes the same block input the attention does). Decode
+        // steps select against these; prefill queries beyond the inert bound
+        // still run dense (one-time WARN inside).
+        if let Some(ref qsa) = self.qsa {
+            qsa.prefill_ingest(normed, num_tokens, seq_len_start, ctx.gpu, stream)?;
+            qsa.warn_if_prefill_diverges(seq_len_start, num_tokens);
+        }
+
         if batched_meta.is_some() && seq_len_start == 0 {
             anyhow::bail!(
                 "prefill_inner_hc: batched mode requires seq_len_start > 0; \

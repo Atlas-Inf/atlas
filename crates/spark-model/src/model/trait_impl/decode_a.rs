@@ -239,6 +239,10 @@ impl TransformerModel {
         // capture-safe (pool weights / arena scratch / f32 scale are all
         // load-time-fixed). Folded in as one more suppressor.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
+        // A layer that can never be captured (QSA's host top-k) vetoes
+        // graphs for the whole model — a graph captured on the dense path
+        // would silently replay WRONG attention once selection activates.
+        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
             && !self.profile
             && !self
@@ -246,7 +250,8 @@ impl TransformerModel {
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
             && !dump_step0
-            && !lora_eager;
+            && !lora_eager
+            && !layer_veto;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,

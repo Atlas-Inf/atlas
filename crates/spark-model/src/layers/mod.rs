@@ -14,6 +14,7 @@ pub mod nemotron_moe;
 pub mod ngram_embed;
 pub mod ops;
 pub mod ple;
+pub mod qsa;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
 pub mod vision_encoder;

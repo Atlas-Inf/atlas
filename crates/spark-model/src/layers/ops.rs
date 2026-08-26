@@ -127,6 +127,8 @@ mod prefill_attn_main_b;
 mod prefill_attn_turbok;
 mod q2_0_mmq;
 mod q4k_mmq;
+#[path = "ops/qsa.rs"]
+mod qsa;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 #[path = "ops/sampling.rs"]
@@ -202,6 +204,7 @@ pub use prefill_attn_main_b::*;
 pub use prefill_attn_turbok::*;
 pub use q2_0_mmq::*;
 pub use q4k_mmq::*;
+pub use qsa::*;
 pub use quant_dispatch::*;
 pub use sampling::*;
 pub use ssm_gdn_a::*;

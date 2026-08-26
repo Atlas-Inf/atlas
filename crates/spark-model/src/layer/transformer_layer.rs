@@ -82,6 +82,15 @@ pub trait TransformerLayer: Send + Sync {
     /// recompute (PLE's history already advanced in `decode_prestage`).
     fn decode_prestage_rearm(&self) {}
 
+    /// True when this layer's decode can NEVER be captured into a CUDA
+    /// graph — e.g. the QSA indexer's host top-k round trip, whose captured
+    /// dense fallback would silently replay WRONG attention once selection
+    /// activates. The scheduler ORs this across layers once and keeps the
+    /// whole model eager.
+    fn decode_graph_unsupported(&self) -> bool {
+        false
+    }
+
     /// Decode one token through this layer, modifying `hidden` in-place.
     ///
     /// # Arguments

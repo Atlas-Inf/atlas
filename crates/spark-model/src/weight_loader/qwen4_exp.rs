@@ -315,6 +315,49 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                 let (attn, ffn) = hc::load_layer_sites(store, &lp, config)?;
                 attach_hc(&mut layer, i, attn, ffn, hc_head.clone(), config)?;
             }
+            // QSA indexer on the 12 full-attention layers (#753 phase G).
+            // Decode-side selection; inert below the budget by arithmetic.
+            // ATLAS_QSA_DISABLE=1 skips the attach for A/B — decode then runs
+            // DENSE past the budget, which is NOT the reference model.
+            if config.index_topk > 0
+                && std::env::var("ATLAS_QSA_DISABLE").as_deref() != Ok("1")
+                && store.contains(&format!("{lp}.self_attn.indexer.index_qk_proj.weight"))
+            {
+                // Already device-resident in the store; the indexer holds the
+                // pointers (the store keeps the weights alive for the model's
+                // lifetime, same as every other layer weight).
+                let up = |name: &str| -> Result<spark_runtime::gpu::DevicePtr> {
+                    Ok(store
+                        .get(&format!("{lp}.self_attn.indexer.{name}"))
+                        .with_context(|| format!("qwen4_exp layer {i}: indexer {name}"))?
+                        .ptr)
+                };
+                let qsa = crate::layers::qsa::QsaIndexer::new(
+                    up("index_qk_proj.weight")?,
+                    up("q_layernorm.weight")?,
+                    up("k_layernorm.weight")?,
+                    config.index_n_heads,
+                    config.index_head_dim,
+                    config.index_compress_ratio,
+                    config.index_topk,
+                    (config.head_dim as f64 * config.partial_rotary_factor) as usize,
+                    config.rope_theta as f32,
+                    config.rms_norm_eps as f32,
+                    config.hidden_size,
+                    config.num_key_value_heads,
+                    config.head_dim,
+                    gpu,
+                )
+                .with_context(|| format!("qwen4_exp layer {i}: QSA indexer"))?;
+                let any = layer
+                    .as_any_mut()
+                    .ok_or_else(|| anyhow::anyhow!("qwen4_exp layer {i}: no as_any_mut for QSA"))?;
+                any.downcast_mut::<crate::layers::Qwen3AttentionLayer>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("qwen4_exp layer {i}: indexer on a non-attention layer")
+                    })?
+                    .set_qsa(qsa);
+            }
             // PLE lands on exactly one layer, which on this checkpoint is a
             // GDN one. `load` returns None for every other layer.
             let ple_layer = if ple_off {

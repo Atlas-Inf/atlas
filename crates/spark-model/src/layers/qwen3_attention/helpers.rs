@@ -49,6 +49,11 @@ impl Qwen3AttentionLayer {
         self.hc = Some(hc);
     }
 
+    /// Attach the QSA indexer (Qwen3.8-Flash-Next full-attention layers).
+    pub fn set_qsa(&mut self, qsa: crate::layers::qsa::QsaIndexer) {
+        self.qsa = Some(qsa);
+    }
+
     /// Set per-layer dimension overrides for heterogeneous models (Gemma-4).
     /// Full-attention layers have different Q/KV head counts and head_dim
     /// than sliding layers.

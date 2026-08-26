@@ -104,6 +104,13 @@ impl TransformerLayer for Qwen3AttentionLayer {
             .map(|cal| !cal.is_calibrating())
     }
 
+    /// QSA selection does a host top-k per step — never capturable, and a
+    /// graph captured on the dense path would replay wrong attention once
+    /// selection activates.
+    fn decode_graph_unsupported(&self) -> bool {
+        self.qsa.is_some()
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,
