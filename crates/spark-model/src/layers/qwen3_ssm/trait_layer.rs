@@ -31,7 +31,9 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.ensure_no_unwired_hc()?;
+        if self.hc.is_some() {
+            return self.decode_inner_hc(hidden, state, ctx, stream);
+        }
         self.decode_inner(
             hidden,
             residual,
@@ -60,6 +62,11 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // v1 is C=1 only under an mHC highway: these paths keep their own
+        // residual bookkeeping, which the highway replaces. Refusing is the
+        // point — a batched GDN step running on an unmixed stream produces
+        // plausible, wrong activations. Avarok #753.
+        self.refuse_batched_under_hc("decode_batched")?;
         self.decode_batched_inner(
             hidden,
             residual,
@@ -82,6 +89,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.refuse_batched_under_hc("decode_verify_multi")?;
         anyhow::ensure!(
             states.len() == n_seqs && ks.len() == n_seqs,
             "decode_verify_multi: states/ks/n mismatch"
@@ -113,6 +121,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.refuse_batched_under_hc("decode_multi_seq")?;
         self.decode_multi_seq_inner(
             hidden,
             residual,
@@ -141,7 +150,12 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.ensure_no_unwired_hc()?;
+        // Under an mHC highway the residual bookkeeping is completely
+        // different — the highway IS the residual — so this is a second entry
+        // path, not a flag on the first. See `trait_prefill_hc.rs`.
+        if self.hc.is_some() {
+            return self.prefill_inner_hc(hidden, num_tokens, state, ctx, stream);
+        }
         self.prefill_inner(
             hidden,
             residual,

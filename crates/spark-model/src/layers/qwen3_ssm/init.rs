@@ -4,6 +4,23 @@
 
 use super::*;
 
+/// Resolve one `hyper_connection` entry point, but ONLY for a model that
+/// carries the highway. Skipping the lookup rather than discarding its result
+/// is the point: an un-issued lookup leaves no failed row in the fail-closed
+/// startup audit, so what remains there is what someone has to act on.
+#[track_caller]
+fn hc_kernel(
+    config: &atlas_core::config::ModelConfig,
+    gpu: &dyn GpuBackend,
+    func: &str,
+) -> KernelHandle {
+    if config.hc_mult > 0 {
+        crate::layers::try_kernel(gpu, "hyper_connection", func)
+    } else {
+        KernelHandle(0)
+    }
+}
+
 impl Qwen3SsmLayer {
     pub fn new(
         input_norm: DenseWeight,
@@ -25,8 +42,13 @@ impl Qwen3SsmLayer {
 
         Ok(Self {
             // mHC is attached later by the loader, and only for models that
-            // carry a hc_mult-wide residual highway.
+            // carry a hc_mult-wide residual highway. The handles are gated on
+            // the same condition `ArchProbes` uses, so a plain GDN model
+            // never issues the lookup.
             hc: None,
+            hc_pre_k: hc_kernel(config, gpu, "hc_pre"),
+            hc_post_k: hc_kernel(config, gpu, "hc_post"),
+            hc_expand_k: hc_kernel(config, gpu, "hc_expand"),
             input_norm,
             ssm,
             post_attn_norm,

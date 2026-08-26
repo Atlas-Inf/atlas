@@ -33,6 +33,15 @@ use crate::weight_map::{DenseWeight, Fp8Weight, QuantizedWeight, SsmWeights};
 pub struct Qwen3SsmLayer {
     /// mHC weights when the model carries a `hc_mult`-wide highway; see `hc`.
     pub(crate) hc: Option<crate::layers::qwen3_attention::HcWeights>,
+    /// mHC kernel handles. Resolved only when `config.hc_mult > 0`, so a
+    /// plain GDN model issues no lookup and leaves no row in the startup
+    /// audit. See `qwen3_attention::init_arch_gates`.
+    pub(super) hc_pre_k: KernelHandle,
+    pub(super) hc_post_k: KernelHandle,
+    /// Seeds the highway on MODEL layer 0 — which on a 3:1 GDN:attention
+    /// interleave is a GDN layer, so this side owns the expand that the
+    /// attention side used to do.
+    pub(super) hc_expand_k: KernelHandle,
     input_norm: DenseWeight,
     ssm: SsmWeights,
     post_attn_norm: DenseWeight,
@@ -460,10 +469,13 @@ mod trait_decode_batched_conv_gdn_exact;
 mod trait_decode_batched_conv_gdn_multi;
 mod trait_decode_batched_conv_gdn_multi_exact;
 mod trait_decode_batched_conv_gdn_wyn;
+mod trait_decode_hc;
 mod trait_decode_multi_seq;
 mod trait_layer;
 mod trait_prefill;
+mod trait_prefill_block;
 mod trait_prefill_gdn;
+mod trait_prefill_hc;
 mod trait_prefill_helper;
 mod trait_prefill_phase1;
 mod trait_prefill_phase3;

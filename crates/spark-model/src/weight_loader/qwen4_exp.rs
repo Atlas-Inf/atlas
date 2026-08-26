@@ -3,14 +3,18 @@
 //! `Qwen3.8-Flash-Next` (`qwen4_exp`) weight loader. Port tracked in Avarok
 //! #753.
 //!
-//! **This loader LOADS; it does not yet let the model SERVE.** Three pieces of
-//! the forward path are unimplemented — the multi-hyperconnection residual,
-//! the QSA indexer, and the PLE n-gram injection — and each refuses BY NAME
-//! at the forward boundary rather than at load. The split is deliberate:
-//! `hc_mult` streams touch every layer, so refusing at load would mean
-//! nothing loads and we learn nothing about the real footprint; refusing at
-//! first inference lets `spark serve` complete and print an honest alloc
-//! ledger while making it impossible to emit fluent-but-wrong text.
+//! **The mHC highway runs; PLE does not.** The low-rank multi-hyperconnection
+//! residual is wired on all 48 layers and validated against the reference
+//! (`ops/hyper_connection_lowrank_tests.rs`, PLAN.md phases A-C). What is
+//! still missing:
+//!
+//! * **PLE n-gram injection** — refused at LOAD unless
+//!   `ATLAS_QWEN4EXP_NO_PLE=1`, because skipping it does not crash and does
+//!   not look wrong. It produces fluent text from a model missing an input.
+//! * **The QSA indexer** — provably inert at or below `indexer_budget`, which
+//!   is the context this fits today; required above it, and refused there.
+//!   See PLAN.md §1.5.
+//! * **Batched / multi-sequence decode** — refused by name; v1 is C=1.
 //!
 //! WHY THIS IS MOSTLY qwen35's LOADER. Qwen3.8-Flash-Next and Qwen3.6-35B-A3B
 //! share far more than the version numbers suggest: 3:1 GDN/full-attention
@@ -169,12 +173,52 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             }
         }
 
-        tracing::warn!(
-            "Qwen3.8-Flash-Next loaded {} layers, but SERVING IS NOT WIRED: the \
-             hyper-connection residual, the QSA indexer and the PLE n-gram \
-             injection all refuse at the forward boundary. Weights are resident \
-             so the alloc ledger below is real; inference will error by name.",
+        // The mHC highway now RUNS (PLAN.md phases B and C, validated against
+        // the reference in `hyper_connection_lowrank_tests.rs`). PLE does not.
+        //
+        // PLE injects hashed n-gram features into the 10240-wide highway at
+        // model layer 1, and the reference adds its output to the residual
+        // before that layer's attention hyper-connection. Skipping it does
+        // not crash and does not look wrong — it produces fluent text from a
+        // model missing one of its inputs. So it is refused by default, and
+        // the escape hatch is explicit, loud, and named after what it does.
+        if !config.ple_layer_ids.is_empty() {
+            anyhow::ensure!(
+                std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1"),
+                "qwen4_exp: PLE n-gram injection is unimplemented (Avarok #753 \
+                 item C). The checkpoint carries `ple_layer_ids = {:?}`, which \
+                 is 1-indexed and so means MODEL LAYER {}; its embedding table, \
+                 key/value projections, gate and dilated conv are not wired. \
+                 Serving without it yields fluent, confident output from a model \
+                 that is missing an input, with nothing in the log. Set \
+                 ATLAS_QWEN4EXP_NO_PLE=1 to serve anyway — that is a DIAGNOSTIC \
+                 for the mHC spine, not a usable model.",
+                config.ple_layer_ids,
+                config.ple_layer_ids[0].saturating_sub(1),
+            );
+            tracing::warn!(
+                "ATLAS_QWEN4EXP_NO_PLE=1: serving WITHOUT PLE n-gram injection \
+                 at model layer {}. Output is WRONG BY CONSTRUCTION — this arm \
+                 exists to exercise the mHC highway end to end, nothing else. \
+                 Avarok #753 item C.",
+                config.ple_layer_ids[0].saturating_sub(1),
+            );
+        }
+        tracing::info!(
+            "Qwen3.8-Flash-Next loaded {} layers with the mHC highway live on \
+             all of them ({} GDN + {} full-attention).",
             layers.len(),
+            layers.len()
+                - config
+                    .layer_types
+                    .iter()
+                    .filter(|t| **t == LayerType::FullAttention)
+                    .count(),
+            config
+                .layer_types
+                .iter()
+                .filter(|t| **t == LayerType::FullAttention)
+                .count(),
         );
         Ok(layers)
     }

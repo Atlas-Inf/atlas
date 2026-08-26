@@ -26,7 +26,7 @@ budget the model currently fits in (see `ARCHITECTURE.md` §3).
 only because it cannot be exercised before then — see §1.5. Everything that
 would otherwise have to be redone for it is threaded in now.
 
-### Four defects found while sizing this — all silent, all live today
+### Five defects, all silent, all live before this branch
 
 `attn_layer_idx` counts **attention layers only** (0..11), not model layers.
 The mHC path in `qwen3_attention` was written for DeepSeek-V4, where every
@@ -79,6 +79,25 @@ Neither throws. Both are on the list below as part of phase B.
    offset-from-1 path — so `q_norm`/`k_norm` were never affected. Only the
    hand-rolled norm inside this kernel was. **The same offset applies to
    PLE's `norm_key` / `norm_query` / `norm_conv` in phase D.**
+
+### A fifth, found during bring-up: the mHC diagnostic lies
+
+`diag_norm` decodes its buffer as **BF16** (`vec![0u16; n]`). The mHC highway
+is **FP32** — `hc_streams` is sized `m * hc_mult * h * 4` precisely because
+BF16 storage collapses generation at scale. Every diag pointed at
+`hc_streams` was therefore reading an f32 buffer as u16 pairs, which prints
+alternating plausible/garbage values and a `norm=NaN`:
+
+```
+DIAG V4-prefill L0 hc_post-ffn: norm=NaN max=1.9e38
+  first4=[450560.0000, 0.0583, -1.18e36, -0.0074]
+```
+
+The alternation is the tell — high half of each f32 decodes to something
+plausible, low half to noise. On a **healthy** highway. This is pre-existing
+on the DeepSeek-V4 path, and it cost a bring-up cycle chasing a NaN that was
+never there. The twelve `hc_streams` diags now use `diag_norm_f32`, which
+already existed beside it for `post`.
 
 ---
 
@@ -228,16 +247,24 @@ layer has `prefill_inner_hc` beside `prefill_inner`.
 Do it by **extraction, not duplication**: steps 2-10 are ~270 lines that
 already read `normed` and write `out_proj_buf` and touch the residual nowhere.
 
-- [ ] Extract steps 2-10 verbatim into `prefill_block(normed_in, out_proj_buf)`
-- [ ] Re-point existing `prefill_inner` at it — **pure code motion, A/B a
-      Holo GDN smoke before anything else lands on top**
-- [ ] `prefill_inner_hc`: `hc_expand` if model layer 0 -> `hc_pre` ->
-      `prefill_block` -> `hc_post` -> `hc_pre` -> `ffn` -> `hc_post`.
-      No `input_norm`, no `post_attn_norm`, no `residual_add`
-- [ ] Decode twin in `trait_decode.rs` (single sequence)
-- [ ] `decode_batched` / `decode_multi_seq` / `decode_verify_multi`: **refuse
-      under LowRank** for v1 rather than run unmixed — C=1 only, stated
-- [ ] Retire `ensure_no_unwired_hc`
+- [x] Extract steps 2-10 verbatim into `prefill_block(normed_in)` ->
+      `trait_prefill_block.rs`. **Verified BYTE-IDENTICAL** by diffing the
+      moved span against `git show HEAD:` — the only lines dropped are a dead
+      `t0` reassignment clippy flagged as never read. Pure code motion, so a
+      GDN regression on any existing model could only be a transcription error
+- [x] `prefill_inner_hc` (`trait_prefill_hc.rs`): `hc_expand` if model layer 0
+      -> `hc_pre` -> `prefill_block` -> `hc_post` -> `hc_pre` -> `ffn` ->
+      `hc_post`. No `input_norm`, no `post_attn_norm`, no `residual_add`
+- [x] Decode twin (`trait_decode_hc.rs`) — simpler, because `ssm_forward` was
+      already a residual-free function of `normed`
+- [x] `hc_expand` ownership moved here, and the SSM layer grew the three
+      kernel handles, gated on `config.hc_mult > 0` so a plain GDN model
+      issues no lookup and leaves no row in the startup audit
+- [x] `decode_batched` / `decode_multi_seq` / `decode_verify_multi` refuse via
+      `refuse_batched_under_hc` — C=1 only, stated
+- [x] `ensure_no_unwired_hc` retired; what is left is the batched refusal
+- [x] **PLE refused at LOAD** unless `ATLAS_QWEN4EXP_NO_PLE=1`, with the
+      warning naming what is wrong and why
 
 **Milestone: greedy generation with PLE stubbed.** Output is *wrong* — model
 layer 1's injection is missing — so it stays behind an explicit

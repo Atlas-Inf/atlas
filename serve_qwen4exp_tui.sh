@@ -34,7 +34,8 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/home/ms/nccl/build
 # ledger are all visible — the whole point of a load-only run.
 export RUST_LOG="${RUST_LOG:-info}"
 
-echo "Qwen3.8-Flash-Next  ->  port ${PORT:-8889}   (LOAD ONLY — inference refuses)"
+echo "Qwen3.8-Flash-Next  ->  port ${PORT:-8889}"
+echo "  mHC highway LIVE; PLE unbuilt (ATLAS_QWEN4EXP_NO_PLE=1 to serve without it — output is WRONG BY CONSTRUCTION)"
 echo "  checkpoint: $SNAP"
 exec target/release/spark serve \
   --model-from-path "$SNAP" \

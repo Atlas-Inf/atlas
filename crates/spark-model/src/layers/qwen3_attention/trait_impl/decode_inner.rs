@@ -621,14 +621,14 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         if diag_this {
-            super::diag_norm(
+            super::diag_norm_f32(
                 ctx.gpu,
                 hc_streams,
                 h,
                 stream,
                 &format!("V4-decode L{} hc_post-attn", self.attn_layer_idx),
             );
-            super::diag_norm(
+            super::diag_norm_f32(
                 ctx.gpu,
                 hc_streams,
                 (hc_mult as usize) * (h),
@@ -726,14 +726,14 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         if diag_this {
-            super::diag_norm(
+            super::diag_norm_f32(
                 ctx.gpu,
                 hc_streams,
                 h,
                 stream,
                 &format!("V4-decode L{} hc_post-ffn", self.attn_layer_idx),
             );
-            super::diag_norm(
+            super::diag_norm_f32(
                 ctx.gpu,
                 hc_streams,
                 (hc_mult as usize) * (h),
