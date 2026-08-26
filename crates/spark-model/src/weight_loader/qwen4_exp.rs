@@ -202,9 +202,19 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             Vec::with_capacity(config.num_hidden_layers);
         let mut attn_idx = 0usize;
 
+        // Per-arm memory attribution. Layer construction costs 7.41 GB on this
+        // model (154.5 MB/layer, measured) on top of the 85.2 GB of uploaded
+        // shards, and nothing said which arm spent it. Summed here and logged
+        // once, so the answer is read rather than guessed.
+        let (mut moe_bytes, mut arm_bytes, mut hc_bytes) = (0u64, 0u64, 0u64);
+        let free_now = |g: &dyn GpuBackend| g.free_memory().unwrap_or(0) as u64;
+
         for i in 0..config.num_hidden_layers {
             let lp = config.layer_prefix(i);
+            let f0 = free_now(gpu);
             let ffn = ffn::build_moe(store, &lp, config, gpu, variant)?;
+            let f1 = free_now(gpu);
+            moe_bytes += f0.saturating_sub(f1);
 
             // Norm placeholders — see module docs. This model keeps its
             // normalization inside the hyper-connection blocks, so there is
@@ -241,6 +251,9 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                      only linear_attention / full_attention"
                 ),
             };
+            let f2 = free_now(gpu);
+            arm_bytes += f1.saturating_sub(f2);
+
             // mHC: two sites per layer wrapping attention and the MoE. The
             // residual this model carries is `hc_mult * hidden` wide, so
             // without these the layer would run on a stream it never mixed.
@@ -270,7 +283,17 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                 l.set_ple(p);
             }
             layers.push(layer);
+            hc_bytes += f2.saturating_sub(free_now(gpu));
         }
+        tracing::info!(
+            "qwen4_exp layer construction: MoE {:.2} GB ({:.1} MB/layer), \
+             attn/GDN arms {:.2} GB ({:.1} MB/layer), mHC+PLE {:.2} GB",
+            moe_bytes as f64 / 1e9,
+            moe_bytes as f64 / 1e6 / config.num_hidden_layers as f64,
+            arm_bytes as f64 / 1e9,
+            arm_bytes as f64 / 1e6 / config.num_hidden_layers as f64,
+            hc_bytes as f64 / 1e9,
+        );
 
         // PLE is wired (PLAN.md phase D) and validated against the reference
         // in `ops/ple_tests.rs`. The escape hatch stays, inverted: it now
