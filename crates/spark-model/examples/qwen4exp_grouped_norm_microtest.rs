@@ -381,7 +381,7 @@ fn ple_block(g: &dyn GpuBackend) -> Result<()> {
         ops::dense_gemv(g, gemv, emb, &d_val_w, val, HIDDEN as u32, HIDDEN as u32, 0)?;
     }
 
-    let mut norm = |input: DevicePtr, weight: DevicePtr, out: DevicePtr| -> Result<()> {
+    let norm = |input: DevicePtr, weight: DevicePtr, out: DevicePtr| -> Result<()> {
         KernelLaunch::new(g, norm_k)
             .grid([SEQ as u32, GROUPS as u32, 1])
             .block([1024, 1, 1])
