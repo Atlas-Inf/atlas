@@ -1,6 +1,12 @@
 """Diff Atlas's qwen4_exp n-gram ids against HuggingFace's own module.
 
-Run:  python bench/ngram_embed/qwen4exp_xcheck.py
+Run:  python bench/ngram_embed/qwen4exp_xcheck.py [config.json]
+
+With no argument it checks the published Qwen3.8-Flash-Next-FP8 config vendored
+in test_data/. Pass the config.json emitted by
+scripts/dev/make_tiny_qwen4_exp.py to check a different (N, K, base, embed_dim)
+-- worth doing, because agreeing at one set of dimensions can hide an index bug
+that only bites at another.
 Needs Python >= 3.10, `torch` (CPU is fine) and `transformers` >= 5.8.0.dev0.
 No GPU and no model weights.
 
@@ -21,14 +27,15 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEm
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-CFG = ROOT / "test_data" / "qwen4_exp_flash_next_config.json"
+CFG = (pathlib.Path(sys.argv[1]) if len(sys.argv) > 1
+       else ROOT / "test_data" / "qwen4_exp_flash_next_config.json")
 TMP = tempfile.mkdtemp(prefix="qwen4exp-xcheck-")
 
 raw = json.loads(CFG.read_text())
 tc = {k: v for k, v in raw["text_config"].items() if k != "model_type"}
 config = Qwen4ExpTextConfig(**tc)
 EOS = config.eos_token_id[0] if isinstance(config.eos_token_id, list) else config.eos_token_id
-print(f"eos={EOS} ngram_size={config.ngram_size} heads_per_ngram={config.heads_per_ngram} "
+print(f"config={CFG.name} eos={EOS} ngram_size={config.ngram_size} heads_per_ngram={config.heads_per_ngram} "
       f"seed={config.seed} base={config.ngram_vocab_size_base}")
 
 class StubEmbedding(torch.nn.Module):
@@ -51,20 +58,27 @@ print("HF ngram_heads            :", mod.ngram_heads)
 
 # Fixed edge cases plus random streams; seeded so a failure is reproducible.
 random.seed(20260826)
+# Edge cases are built FROM the config under test. Hardcoding ids from the big
+# model breaks against a small vocab, and not harmlessly: `layer_multipliers`
+# are bounded by (2^63-1)/vocab_size, so a token past vocab_size overflows the
+# `token * multiplier` product -- which torch wraps as i64 and Rust as u64, and
+# the two disagree. `validate()` guarantees no overflow for token < vocab_size,
+# so out-of-vocab ids are outside the contract, not a case to compare.
+V = config.vocab_size
+hi = V - 1 if V - 1 != EOS else V - 2
 streams = [
-    [11, 523, 9001, 44, 130000, 7, 88, 4, 1, 2, 3],
+    [11 % V, 523 % V, hi, 44 % V, 7, 88, 4, 1, 2, 3],
     [EOS, 5, EOS, EOS, 9, 13, 21, EOS],
-    [0, 1, 248319, EOS, 77, 12345, 99, 248318],
+    [0, 1, hi, EOS, 77 % V, 99 % V, hi - 1],
     [EOS],
     [7] * 12,
-    [100, 200, 300, EOS, 400, 500, EOS, 600, 700, 800, 900, 1000],
-    [248319, 248318, 248317, 1, 0, EOS, 2, 3],
+    [100 % V, 200 % V, EOS, 300 % V, EOS, 400 % V, 500 % V],
+    [hi, hi - 1, hi - 2, 1, 0, EOS, 2, 3],
 ]
 for _ in range(25):
-    n = random.randint(1, 24)
-    streams.append([random.choice([EOS, EOS] + list(range(config.vocab_size)))
-                    if random.random() < 0.15 else random.randrange(config.vocab_size)
-                    for _ in range(n)])
+    streams.append([EOS if random.random() < 0.15 else random.randrange(V)
+                    for _ in range(random.randint(1, 24))])
+assert all(0 <= t < V for s in streams for t in s), "streams must stay in vocab"
 
 ctx_len = config.ngram_size - 1
 extended = [[EOS] * ctx_len + s for s in streams]
@@ -77,7 +91,7 @@ def dump_atlas_ids(streams_file):
     base = ["cargo", "run", "-q", "--release", "-p", "atlas-core",
             "--example", "qwen4exp_ngram_ids"]
     for extra in ([], ["--no-default-features", "--features", "metal"]):
-        done = subprocess.run(base + extra + ["--", str(streams_file)],
+        done = subprocess.run(base + extra + ["--", str(streams_file), str(CFG)],
                               cwd=ROOT, capture_output=True, text=True)
         if done.returncode == 0:
             return json.loads(done.stdout)

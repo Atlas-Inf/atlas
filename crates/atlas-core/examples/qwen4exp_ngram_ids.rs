@@ -7,7 +7,7 @@
 //! comparison exists at all.
 //!
 //! ```text
-//! cargo run -p atlas-core --example qwen4exp_ngram_ids -- streams.json
+//! cargo run -p atlas-core --example qwen4exp_ngram_ids -- streams.json [config.json]
 //! ```
 //!
 //! `streams.json` is a JSON array of token-id arrays. Output is
@@ -20,11 +20,32 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("usage: qwen4exp_ngram_ids <streams.json>"))?;
 
-    let config_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../test_data/qwen4_exp_flash_next_config.json"
+    // Optional second argument: a different config.json (e.g. the tiny
+    // checkpoint from scripts/dev/make_tiny_qwen4_exp.py).
+    let config_path = std::env::args().nth(2).unwrap_or_else(|| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/qwen4_exp_flash_next_config.json"
+        )
+        .to_string()
+    });
+    let config = parse_config(&std::fs::read_to_string(&config_path)?)?;
+    eprintln!(
+        "parsed {}: {} layers ({} full / {} linear), {} experts top-{}, \
+         ngram {} heads x {} wide, ple decoder layer {:?}",
+        config.model_type,
+        config.num_hidden_layers,
+        config.num_attention_layers(),
+        config.num_ssm_layers(),
+        config.num_experts,
+        config.num_experts_per_tok,
+        config
+            .qwen4exp_ngram(0)?
+            .map(|n| n.num_heads())
+            .unwrap_or(0),
+        config.qwen4exp_ngram(0)?.map(|n| n.head_dim()).unwrap_or(0),
+        config.ple_decoder_layer(0),
     );
-    let config = parse_config(&std::fs::read_to_string(config_path)?)?;
     let ngram = config
         .qwen4exp_ngram(0)?
         .ok_or_else(|| anyhow::anyhow!("fixture declares no PLE tower"))?;

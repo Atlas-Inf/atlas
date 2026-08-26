@@ -222,8 +222,13 @@ impl Qwen4ExpNgram {
     /// (`(ngram-2)*K + head`). Ids are GLOBAL — already offset into the
     /// concatenated table — so a caller gathers from one tensor, not `K*(N-1)`.
     ///
-    /// `self` must have passed [`Self::validate`]; the arithmetic below is only
-    /// sound inside that envelope.
+    /// `self` must have passed [`Self::validate`], and **every token in `ctx`
+    /// must be `< unigram_vocab_size`**. Both are load-bearing: the multipliers
+    /// are bounded by `(2^63-1)/vocab_size`, so `validate` can only promise the
+    /// `token * multiplier` product stays in range for in-vocab tokens. Feed it
+    /// a larger id and the product wraps — and it wraps differently here (u64)
+    /// than in the reference (i64), so the two silently disagree rather than
+    /// both being wrong the same way.
     pub fn ngram_ids(&self, base: u64, ctx: &[u32]) -> Vec<Vec<u32>> {
         let multipliers = self.layer_multipliers();
         let sizes = self.head_vocab_sizes(base);
