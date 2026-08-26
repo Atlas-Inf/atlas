@@ -242,3 +242,32 @@ fn parses_the_real_config_json_when_present() {
     assert_eq!(c.ple_layer_ids, vec![2]);
     assert!(c.vision.is_some());
 }
+
+/// Qwen3.8-Flash-Next shipped under `qwen3_8_flash_next` and was later
+/// renamed `qwen4_exp`. Quantizers pinned to different transformers
+/// revisions emit different names — RadixArk says `qwen4_exp`, Inferact says
+/// `qwen3_8_flash_next` — but the two `text_config`s are otherwise identical
+/// field-for-field. `parse_config` must route both to this parser.
+#[test]
+fn both_naming_revisions_route_to_this_parser() {
+    for (model_type, arch) in [
+        ("qwen4_exp", "Qwen4ExpForConditionalGeneration"),
+        (
+            "qwen3_8_flash_next",
+            "Qwen3_8FlashNextForConditionalGeneration",
+        ),
+    ] {
+        let mut raw = raw_config();
+        raw["model_type"] = Value::from(model_type);
+        raw["architectures"] = Value::from(vec![arch]);
+        raw["text_config"]["model_type"] = Value::from(format!("{model_type}_text"));
+
+        let c = crate::config::parse_config(&raw.to_string())
+            .unwrap_or_else(|e| panic!("{model_type} must parse: {e:#}"));
+        // Normalized to the canonical name so kernel-target resolution and
+        // every downstream `model_type ==` check sees ONE family.
+        assert_eq!(c.model_type, "qwen4_exp", "{model_type} normalizes");
+        assert_eq!(c.hc_mult, 4);
+        assert_eq!(c.num_experts, 512);
+    }
+}
