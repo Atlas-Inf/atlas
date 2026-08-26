@@ -51,6 +51,9 @@ pub mod ids;
 #[path = "ple/tests.rs"]
 mod tests;
 
+#[path = "ple/dump.rs"]
+pub mod dump;
+
 #[path = "ple/layer.rs"]
 mod layer;
 

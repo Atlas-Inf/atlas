@@ -128,6 +128,16 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        let hc_dim = hc.hc_mult * h;
+        crate::layers::ple::dump::tap_highway(
+            ctx.gpu,
+            streams,
+            ssm_layer_idx,
+            "in",
+            num_tokens,
+            hc_dim,
+            stream,
+        );
         let out_proj_buf =
             self.prefill_block(hidden, num_tokens, state, ssm_layer_idx, ctx, stream)?;
         ops::hc_post_site(
@@ -143,6 +153,18 @@ impl Qwen3SsmLayer {
             h as u32,
             stream,
         )?;
+
+        // Tapped BEFORE the MoE on purpose: reproducing this point in the
+        // reference needs only the GDN projections, not 512 experts.
+        crate::layers::ple::dump::tap_highway(
+            ctx.gpu,
+            streams,
+            ssm_layer_idx,
+            "post_gdn",
+            num_tokens,
+            hc_dim,
+            stream,
+        );
 
         // ── MoE sublayer ──
         // `prefill_block` returned `ctx.buffers.moe_output()`, which the FFN
@@ -176,6 +198,15 @@ impl Qwen3SsmLayer {
             h as u32,
             stream,
         )?;
+        crate::layers::ple::dump::tap_highway(
+            ctx.gpu,
+            streams,
+            ssm_layer_idx,
+            "post_moe",
+            num_tokens,
+            hc_dim,
+            stream,
+        );
 
         Ok(())
     }
