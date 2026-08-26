@@ -117,7 +117,18 @@ Two rules that are not guessable from the tensor names:
   just by another scheme. Treating them as block-quantized over-generates by
   exactly 128.
 
-**Both published releases are now described exactly**, weights and scales:
+**Verified against the real weights.** `cargo run -p atlas-core --example
+qwen4exp_preflight -- <dir>` against the downloaded 126 GiB RadixArk checkpoint:
+296,142 tensors, **0 missing, 0 unexpected, 0 mismatched**, in 2.81 s and 372 MB
+RSS — it reads headers, not weights, so it is cheap enough to run at load time.
+It auto-detected the stacked-MTP layout and the NVFP4 config from the checkpoint
+itself.
+
+That run is also what caught the last width bug (`mtp.pre_fc_norm_hidden` is
+`hc_count * hidden`, not `hidden`) — an index-only check could never have seen
+it, having no shapes.
+
+**Both published releases are described exactly**, weights and scales:
 
 | release | tensors (ex-vision) | manifest | discrepancies |
 |---|---|---|---|
