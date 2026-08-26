@@ -142,6 +142,7 @@ impl Qwen3AttentionLayer {
                 normed,
                 num_tokens,
                 kv_write_start,
+                block_table,
                 kv_cache,
                 None,
                 ctx,
@@ -661,7 +662,12 @@ impl Qwen3AttentionLayer {
         // still run dense (one-time WARN inside).
         if let Some(ref qsa) = self.qsa {
             qsa.prefill_ingest(normed, num_tokens, seq_len_start, ctx.gpu, stream)?;
-            qsa.warn_if_prefill_diverges(seq_len_start, num_tokens);
+            // Chunk-0 selective rows are handled exactly by the stage-2 hook
+            // inside prefill_attention_with_cache_skip; only the CHUNKED
+            // (seq_len_start > 0) path still runs dense past the bound.
+            if seq_len_start > 0 {
+                qsa.warn_if_prefill_diverges(seq_len_start, num_tokens);
+            }
         }
 
         if batched_meta.is_some() && seq_len_start == 0 {
@@ -675,6 +681,7 @@ impl Qwen3AttentionLayer {
                 normed,
                 num_tokens,
                 kv_write_start,
+                block_table,
                 kv_cache,
                 None, // batched_meta: single-stream (seq_len_start == 0)
                 ctx,

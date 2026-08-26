@@ -134,3 +134,115 @@ pub fn qsa_gather(
         .arg_u32(hd)
         .launch(stream)
 }
+
+/// Stage 2: per-row q prep for a contiguous selective row range.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_qprep_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    qk: DevicePtr,
+    q_norm_w: DevicePtr,
+    q_out: DevicePtr,
+    rows: u32,
+    first_pos: u32,
+    qkw: u32,
+    n_heads: u32,
+    hd: u32,
+    rot: u32,
+    theta: f32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, n_heads, 1])
+        .block([hd, 1, 1])
+        .shared_mem((hd + 32) * 4)
+        .arg_ptr(qk)
+        .arg_ptr(q_norm_w)
+        .arg_ptr(q_out)
+        .arg_u32(first_pos)
+        .arg_u32(qkw)
+        .arg_u32(n_heads)
+        .arg_u32(hd)
+        .arg_u32(rot)
+        .arg_f32(theta)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
+/// Stage 2: per-row block scores, -inf beyond each row's complete count.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_score_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    block_keys: DevicePtr,
+    scores: DevicePtr,
+    rows: u32,
+    n_blocks_max: u32,
+    first_pos: u32,
+    score_stride: u32,
+    ratio: u32,
+    n_heads: u32,
+    hd: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, n_blocks_max, 1])
+        .block([hd, 1, 1])
+        .shared_mem(32 * 4)
+        .arg_ptr(q)
+        .arg_ptr(block_keys)
+        .arg_ptr(scores)
+        .arg_u32(first_pos)
+        .arg_u32(score_stride)
+        .arg_u32(ratio)
+        .arg_u32(n_heads)
+        .arg_u32(hd)
+        .launch(stream)
+}
+
+/// Stage 2: per-row selected-set attention, overwriting the context rows.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_prefill_attn(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    block_table: DevicePtr,
+    lists: DevicePtr,
+    attn_out: DevicePtr,
+    rows: u32,
+    first_pos: u32,
+    topk: u32,
+    ratio: u32,
+    block_size: u32,
+    nq: u32,
+    nkv: u32,
+    hd: u32,
+    inv_sqrt_d: f32,
+    stream: u64,
+) -> Result<()> {
+    // 8 warps x [hd] acc partials + m/l per warp.
+    let smem = (8 * hd + 16) * 4;
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, nq, 1])
+        .block([256, 1, 1])
+        .shared_mem(smem)
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(block_table)
+        .arg_ptr(lists)
+        .arg_ptr(attn_out)
+        .arg_u32(first_pos)
+        .arg_u32(topk)
+        .arg_u32(ratio)
+        .arg_u32(block_size)
+        .arg_u32(nq)
+        .arg_u32(nkv)
+        .arg_u32(hd)
+        .arg_f32(inv_sqrt_d)
+        .launch(stream)
+}

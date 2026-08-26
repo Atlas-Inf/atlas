@@ -156,6 +156,11 @@ impl BufferArena {
     pub fn hc_lowrank_scratch(&self) -> DevicePtr {
         self.hc_lowrank_scratch
     }
+    /// QSA stage-2 prefill-selection scratch, shared by the indexer layers
+    /// (serial). Layout managed by `layers::qsa`; see `sizes.rs`.
+    pub fn qsa_select_scratch(&self) -> DevicePtr {
+        self.qsa_select_scratch
+    }
     /// HC `post` mixing weights [M, hc_mult] F32.
     pub fn hc_post(&self) -> DevicePtr {
         self.hc_post

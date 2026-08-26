@@ -192,6 +192,12 @@ def main() -> None:
     last_sel = torch.nonzero(selected[T - 1], as_tuple=False).flatten().to(torch.int32)
     open(os.path.join(bin_dir, 'selected_last.bin'), 'wb').write(
         last_sel.numpy().tobytes())
+    # Stage 2: the FULL mask for every selective row (pos >= budget+ratio-1),
+    # row-major u8 [n_sel_rows, T] — the prefill-selection set contract.
+    bound = mod.token_budget + mod.compress_ratio - 1
+    sel_rows = selected[bound:].to(torch.uint8)
+    open(os.path.join(bin_dir, 'mask_sel_rows.bin'), 'wb').write(
+        sel_rows.numpy().tobytes())
     json.dump(
         {
             'num_tokens': T, 'n_blocks': n_blocks,

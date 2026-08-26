@@ -76,6 +76,9 @@ pub struct QsaIndexer {
     k_qprep_k: KernelHandle,
     k_score_k: KernelHandle,
     k_gather_k: KernelHandle,
+    k_qprep_rows_k: KernelHandle,
+    k_score_rows_k: KernelHandle,
+    k_prefill_attn_k: KernelHandle,
 
     raw_keys: DevicePtr,   // [max_tokens, hd] BF16
     block_keys: DevicePtr, // [max_tokens/ratio, hd] BF16
@@ -87,6 +90,10 @@ pub struct QsaIndexer {
     v_scratch: DevicePtr,
     table_dev: DevicePtr,   // [ceil((budget+ratio)/8)] i32 (any block_size >= 8)
     seq_len_dev: DevicePtr, // [1] i32
+    /// The sequence's REAL block table, uploaded per prefill-select call —
+    /// chunk-0 metadata carries no device table (cache-skip attention is
+    /// contiguous), so the host Vec is the source of truth.
+    prefill_table_dev: DevicePtr, // [ceil(max_tokens/8)] i32
 
     state: std::sync::Mutex<QsaState>,
 }
@@ -143,6 +150,9 @@ impl QsaIndexer {
             k_qprep_k: gpu.kernel("qsa_indexer", "qsa_qprep")?,
             k_score_k: gpu.kernel("qsa_indexer", "qsa_score")?,
             k_gather_k: gpu.kernel("qsa_indexer", "qsa_gather")?,
+            k_qprep_rows_k: gpu.kernel("qsa_indexer", "qsa_qprep_rows")?,
+            k_score_rows_k: gpu.kernel("qsa_indexer", "qsa_score_rows")?,
+            k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
             raw_keys: gpu.alloc(max_tokens * hd * 2)?,
             block_keys: gpu.alloc(max_tokens / ratio * hd * 2)?,
             qk_scratch: gpu.alloc(INGEST_SLAB * qk_width * 2)?,
@@ -153,6 +163,7 @@ impl QsaIndexer {
             v_scratch: gpu.alloc(sel_cap * nkv_attn * hd_attn * 2)?,
             table_dev: gpu.alloc(sel_cap.div_ceil(8) * 4)?,
             seq_len_dev: gpu.alloc(4)?,
+            prefill_table_dev: gpu.alloc(max_tokens.div_ceil(8) * 4)?,
             state: std::sync::Mutex::new(QsaState {
                 ingested: 0,
                 pooled: 0,
@@ -259,6 +270,266 @@ impl QsaIndexer {
         Ok(())
     }
 
+    /// Stage 2: per-query prefill selection for chunk-0 prefills
+    /// (`seq_len_start == 0`, i.e. global pos == chunk row). Overwrites the
+    /// ATTENTION CONTEXT rows (pre-gate, pre-o_proj) of every selective
+    /// query — pos >= the inert bound — with attention over exactly its
+    /// reference-selected set, read straight from the paged KV cache. Rows
+    /// below the bound keep the dense flash output, which is provably
+    /// identical there. Requires `prefill_ingest` to have run for this chunk
+    /// (it does — the ingest hook precedes the attention call).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_select_chunk0(
+        &self,
+        normed: DevicePtr,
+        q_roped: DevicePtr,
+        attn_ctx: DevicePtr,
+        k_pool: DevicePtr,
+        v_pool: DevicePtr,
+        seq_block_table: &[u32],
+        num_tokens: usize,
+        nq: u32,
+        block_size: u32,
+        inv_sqrt_d: f32,
+        scratch: DevicePtr,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let bound = self.inert_bound(); // first selective position
+        if num_tokens <= bound {
+            return Ok(());
+        }
+        // Kill switch: ATLAS_QSA_NO_PREFILL_SELECT=1 keeps stage-1 behavior
+        // (dense prefill past the bound; decode still selects).
+        static S2_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *S2_OFF
+            .get_or_init(|| std::env::var("ATLAS_QSA_NO_PREFILL_SELECT").as_deref() == Ok("1"))
+        {
+            return Ok(());
+        }
+        let diag = {
+            static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *D.get_or_init(|| std::env::var("ATLAS_QSA_S2_DIAG").as_deref() == Ok("1"))
+        };
+        // Diagnostic: park the DENSE context of the LAST row before the
+        // overwrite; log cosine(dense, selected) after. Selected attends
+        // 2048 of the visible tokens, so a healthy overwrite is close to
+        // dense (cos ~0.9+); garbage means a layout/addressing defect.
+        let q_row = nq as usize * self.hd_attn as usize;
+        let mut dense_last = Vec::new();
+        if diag {
+            dense_last = vec![0u8; q_row * 2];
+            gpu.copy_d2h_on_stream(
+                attn_ctx.offset((num_tokens - 1) * q_row * 2),
+                &mut dense_last,
+                stream,
+            )?;
+            // Norm probes: an INERT row (dense output must be real there no
+            // matter what), the first selective row, and the last row —
+            // separates wrong-buffer from wrong-offset in one run.
+            let probe = |row: usize| -> Result<f64> {
+                let mut b = vec![0u8; q_row * 2];
+                gpu.copy_d2h_on_stream(attn_ctx.offset(row * q_row * 2), &mut b, stream)?;
+                Ok(b.chunks_exact(2)
+                    .map(|c| {
+                        let v =
+                            f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                        v * v
+                    })
+                    .sum::<f64>()
+                    .sqrt())
+            };
+            tracing::warn!(
+                "QSA S2 DIAG norms: row100={:.3} first_sel(row {bound})={:.3} last={:.3} q_row={q_row}",
+                probe(100)?,
+                probe(bound)?,
+                probe(num_tokens - 1)?
+            );
+            // Boundary bisect: dense-ctx and roped-q norms across 2040..2056.
+            let probe_at = |base: DevicePtr, row: usize| -> Result<f64> {
+                let mut b = vec![0u8; q_row * 2];
+                gpu.copy_d2h_on_stream(base.offset(row * q_row * 2), &mut b, stream)?;
+                Ok(b.chunks_exact(2)
+                    .map(|c| {
+                        let v =
+                            f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                        v * v
+                    })
+                    .sum::<f64>()
+                    .sqrt())
+            };
+            let mut ctx_line = String::new();
+            let mut q_line = String::new();
+            for row in [128usize, 256, 512, 768, 1024, 1280, 1536, 1792, 1900, 2000] {
+                ctx_line += &format!(" {row}:{:.2}", probe_at(attn_ctx, row)?);
+            }
+            tracing::warn!("QSA S2 DIAG wide:{ctx_line}");
+            ctx_line = String::new();
+            for row in (2040..2056).step_by(2) {
+                ctx_line += &format!(" {row}:{:.2}", probe_at(attn_ctx, row)?);
+                q_line += &format!(" {row}:{:.2}", probe_at(q_roped, row)?);
+            }
+            tracing::warn!("QSA S2 DIAG ctx rows:{ctx_line}");
+            tracing::warn!("QSA S2 DIAG   q rows:{q_line}");
+        }
+        // Upload the real physical block table for the token range.
+        let pages_needed = num_tokens.div_ceil(block_size as usize);
+        anyhow::ensure!(
+            seq_block_table.len() >= pages_needed,
+            "QSA: block table has {} pages for {} tokens",
+            seq_block_table.len(),
+            pages_needed
+        );
+        let tbytes: Vec<u8> = seq_block_table[..pages_needed]
+            .iter()
+            .flat_map(|b| (*b as i32).to_le_bytes())
+            .collect();
+        gpu.copy_h2d_async(&tbytes, self.prefill_table_dev, stream)?;
+        let block_table_dev = self.prefill_table_dev;
+        const ROWS: usize = 2048; // must match sizes.rs qsa_select_scratch
+        let ratio = self.ratio as usize;
+        let topk = self.block_topk as usize;
+        let heads = self.n_heads as usize;
+        let hd = self.hd as usize;
+        let hd_attn = self.hd_attn as usize;
+        let qkw = self.qk_width();
+        let q_row = nq as usize * hd_attn;
+
+        // Scratch layout (per-call score stride; always <= the sizes.rs
+        // allowance because a chunk never exceeds max_seq_len).
+        let stride = num_tokens.div_ceil(ratio);
+        let qk_buf = scratch;
+        let qpost = scratch.offset(ROWS * qkw * 2);
+        let scores = qpost.offset(ROWS * heads * hd * 4);
+        let lists = scores.offset(ROWS * stride * 4);
+
+        let n_sel_total = num_tokens - bound;
+        let mut slab = 0usize;
+        while slab < n_sel_total {
+            let rows = ROWS.min(n_sel_total - slab);
+            let first_pos = bound + slab;
+
+            ops::cublas_bf16_proj_dense(
+                normed.offset(first_pos * self.hidden as usize * 2),
+                self.qk_proj_w,
+                qk_buf,
+                rows as u32,
+                qkw as u32,
+                self.hidden,
+                stream,
+            )
+            .context("QSA qk projection (prefill select)")?;
+            ops::qsa_qprep_rows(
+                gpu,
+                self.k_qprep_rows_k,
+                qk_buf,
+                self.q_norm_w,
+                qpost,
+                rows as u32,
+                first_pos as u32,
+                qkw as u32,
+                self.n_heads,
+                self.hd,
+                self.rot,
+                self.theta,
+                self.eps,
+                stream,
+            )?;
+            let n_blocks_max = (first_pos + rows) / ratio; // last row's complete
+            ops::qsa_score_rows(
+                gpu,
+                self.k_score_rows_k,
+                qpost,
+                self.block_keys,
+                scores,
+                rows as u32,
+                n_blocks_max as u32,
+                first_pos as u32,
+                stride as u32,
+                self.ratio,
+                self.n_heads,
+                self.hd,
+                stream,
+            )?;
+
+            // Host top-k per row (sync D2H drains the stream first). Torch
+            // tie-break: larger score first, lower index on ties.
+            let mut raw = vec![0u8; rows * stride * 4];
+            gpu.copy_d2h_on_stream(scores, &mut raw, stream)?;
+            let sc: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let mut host_lists = vec![0u8; rows * topk * 4];
+            for r in 0..rows {
+                let complete = (first_pos + r + 1) / ratio;
+                let row_sc = &sc[r * stride..r * stride + complete];
+                let mut order: Vec<u32> = (0..complete as u32).collect();
+                order.sort_by(|&a, &b| {
+                    row_sc[b as usize]
+                        .partial_cmp(&row_sc[a as usize])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.cmp(&b))
+                });
+                for (i, b) in order[..topk].iter().enumerate() {
+                    host_lists[(r * topk + i) * 4..(r * topk + i) * 4 + 4]
+                        .copy_from_slice(&(*b as i32).to_le_bytes());
+                }
+            }
+            gpu.copy_h2d_async(&host_lists, lists, stream)?;
+
+            ops::qsa_prefill_attn(
+                gpu,
+                self.k_prefill_attn_k,
+                q_roped.offset(first_pos * q_row * 2),
+                k_pool,
+                v_pool,
+                block_table_dev,
+                lists,
+                attn_ctx.offset(first_pos * q_row * 2),
+                rows as u32,
+                first_pos as u32,
+                topk as u32,
+                self.ratio,
+                block_size,
+                nq,
+                self.nkv_attn,
+                self.hd_attn,
+                inv_sqrt_d,
+                stream,
+            )?;
+            slab += rows;
+        }
+        if diag {
+            let mut sel_last = vec![0u8; q_row * 2];
+            gpu.copy_d2h_on_stream(
+                attn_ctx.offset((num_tokens - 1) * q_row * 2),
+                &mut sel_last,
+                stream,
+            )?;
+            let f = |b: &[u8]| -> Vec<f32> {
+                b.chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                    .collect()
+            };
+            let (a, b) = (f(&dense_last), f(&sel_last));
+            let dot: f64 = a.iter().zip(&b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            tracing::warn!(
+                "QSA S2 DIAG: last-row ctx dense-vs-selected cos={:.6} |dense|={:.3} |sel|={:.3}",
+                dot / (na * nb).max(1e-30),
+                na,
+                nb
+            );
+        }
+        tracing::debug!(
+            "QSA prefill select: {} selective rows over {} tokens",
+            n_sel_total,
+            num_tokens
+        );
+        Ok(())
+    }
     /// One-time WARN when a prefill query range extends past the inert
     /// bound: those queries run DENSE until stage 2 (per-query prefill
     /// selection) lands.
@@ -367,7 +638,7 @@ impl QsaIndexer {
         // Host top-k over the block scores (D2H — decode graphs are vetoed
         // whenever an indexer is present, so this is never inside a capture).
         let mut raw = vec![0u8; complete * 4];
-        gpu.copy_d2h(self.scores_dev, &mut raw)?;
+        gpu.copy_d2h_on_stream(self.scores_dev, &mut raw, stream)?;
         let scores: Vec<f32> = raw
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

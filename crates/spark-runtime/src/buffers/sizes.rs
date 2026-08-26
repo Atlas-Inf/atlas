@@ -62,6 +62,12 @@ pub struct BufferSizes {
     /// (measured 2.0 ms/call, one SM's bandwidth). Sized for 64 tokens; the
     /// dispatcher falls back to the fused kernel above that.
     pub hc_lowrank_scratch: usize,
+    /// QSA stage-2 prefill-selection scratch (Qwen3.8-Flash-Next), SHARED
+    /// across the 12 indexer layers (they run serially). Layout, slabbed at
+    /// 2048 selective rows: qk [2048, (n_heads+1)*hd] BF16, q_post
+    /// [2048, n_heads, hd] F32, scores [2048, max_seq/ratio] F32, lists
+    /// [2048, topk] i32. 256 (placeholder) when no indexer.
+    pub qsa_select_scratch: usize,
     /// Token IDs `[M]` u32 for the current pass — stable across the layer loop
     /// so DeepSeek-V4 hash-MoE layers can read `tid2eid[token_id]`. Always
     /// allocated (small); unused by models without hash routing.
@@ -490,6 +496,18 @@ impl BufferSizes {
             } else {
                 256
             },
+            qsa_select_scratch: if config.index_topk > 0 && config.index_compress_ratio > 0 {
+                const ROWS: usize = 2048;
+                let qkw = (config.index_n_heads + 1) * config.index_head_dim;
+                let n_blocks = max_seq_len.div_ceil(config.index_compress_ratio);
+                let topk = config.index_topk / config.index_compress_ratio;
+                ROWS * qkw * 2
+                    + ROWS * config.index_n_heads * config.index_head_dim * 4
+                    + ROWS * n_blocks * 4
+                    + ROWS * topk * 4
+            } else {
+                256
+            },
             // Token IDs [M] u32 (stable across the layer loop for hash-MoE).
             token_ids: (m * 4).max(256),
             ffn_act_q8,
@@ -527,6 +545,7 @@ impl BufferSizes {
             + self.expert_gate_out
             + self.expert_up_out
             + self.hc_lowrank_scratch
+            + self.qsa_select_scratch
             + self.expert_down_out
             + self.splitk_workspace
             + self.gdn_fla_scratch
