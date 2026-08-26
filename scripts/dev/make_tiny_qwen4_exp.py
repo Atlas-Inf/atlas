@@ -44,6 +44,30 @@ NGRAM_HEADS = (NGRAM_SIZE - 1) * HEADS_PER_NGRAM
 NGRAM_HEAD_DIM = H // NGRAM_HEADS
 
 
+MASK64 = (1 << 64) - 1
+SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+SPLITMIX_M1 = 0xBF58476D1CE4E5B9
+SPLITMIX_M2 = 0x94D049BB133111EB
+SEED_STRIDE = 10007
+SEED = 1234
+
+
+def splitmix64(value):
+    value = (value + SPLITMIX_GAMMA) & MASK64
+    value = ((value ^ (value >> 30)) * SPLITMIX_M1) & MASK64
+    value = ((value ^ (value >> 27)) * SPLITMIX_M2) & MASK64
+    return (value ^ (value >> 31)) & MASK64
+
+
+def layer_multipliers(unigram_vocab, ngram_size, ple_layer_index, seed):
+    """The odd multipliers the reference draws in __init__."""
+    multiplier_max = ((1 << 63) - 1) // max(unigram_vocab, 1)
+    half = max(1, multiplier_max // 2)
+    base = (seed + SEED_STRIDE * ple_layer_index) & MASK64
+    return [2 * (splitmix64((base + SPLITMIX_GAMMA * (i + 1)) & MASK64) % half) + 1
+            for i in range(ngram_size)]
+
+
 def is_prime(n):
     if n < 2:
         return False
@@ -98,6 +122,7 @@ def config():
         "make_ngram_vocab_size_divisible_by": NGRAM_DIVISOR,
         "split_ngram_parts": NGRAM_SHARDS,
         # `norm_topk_prob` and `seed` are DELIBERATELY absent -- see docstring.
+        # (seed defaults to 1234, which is what layer_multipliers() uses.)
         "vocab_size": VOCAB, "bos_token_id": EOS, "eos_token_id": EOS,
         "max_position_embeddings": 4096, "rms_norm_eps": 1e-6,
         "tie_word_embeddings": False, "partial_rotary_factor": 0.25,
@@ -197,7 +222,13 @@ def ple(prefix, tensors, ple_layer_index):
     tensors[f"{emb}.ngram_embedding.weight_scale"] = torch.ones(1)
     tensors[f"{emb}.ngram_heads_vocab_sizes"] = torch.tensor(sizes, dtype=torch.long)
     tensors[f"{emb}.ngram_heads_offsets"] = torch.tensor(offsets, dtype=torch.long)
-    tensors[f"{emb}.layer_multipliers"] = torch.zeros(NGRAM_SIZE, dtype=torch.long)
+    # DERIVED, not zeroed. These are the SplitMix64 draws the reference builds
+    # in __init__; a checkpoint carrying zeros overwrites them on load, every
+    # mixed id collapses to 0, and every token hashes to its head's first row.
+    # That looks like a working model right up until you check the output.
+    tensors[f"{emb}.layer_multipliers"] = torch.tensor(
+        layer_multipliers(VOCAB, NGRAM_SIZE, ple_layer_index, SEED), dtype=torch.long
+    )
     tensors[f"{prefix}.conv1d.weight"] = torch.randn(HC_COUNT * H, 1, CONV_K) * 0.02
     tensors[f"{prefix}.key_proj.weight"] = torch.randn(HC_COUNT * H, H) * 0.02
     tensors[f"{prefix}.value_proj.weight"] = torch.randn(H, H) * 0.02
