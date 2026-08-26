@@ -582,10 +582,15 @@ fn gdn_decode_step(g: &dyn GpuBackend) -> Result<()> {
             }
         }
     }
+    // The 1/sqrt(key_head_dim) scale is applied ONCE, and the two sides do it
+    // in different places: HF scales the QUERY before the recurrence, Atlas's
+    // kernel scales the OUTPUT after it. Algebraically the same -- the output
+    // is linear in q, and neither placement touches the state -- but doing
+    // both is an 11x error, which is exactly what this harness did first.
+    //
+    // So: the kernel gets q UNSCALED, the oracle gets it scaled.
     let scale = 1.0 / (KD as f32).sqrt();
-    for v in q.iter_mut() {
-        *v *= scale;
-    }
+    let q_scaled: Vec<f32> = q.iter().map(|v| v * scale).collect();
     let v: Vec<f32> = (0..NUM_V_HEADS * VD).map(|_| next()).collect();
     // Decay in (0,1), beta in (0,1) -- the ranges exp(-softplus) and sigmoid
     // actually produce.
@@ -630,7 +635,7 @@ fn gdn_decode_step(g: &dyn GpuBackend) -> Result<()> {
 
     // Oracle, per value head, on the same BF16-rounded inputs.
     let (qr, kr, vr) = (
-        q.iter().map(round).collect::<Vec<_>>(),
+        q_scaled.iter().map(round).collect::<Vec<_>>(),
         k.iter().map(round).collect::<Vec<_>>(),
         v.iter().map(round).collect::<Vec<_>>(),
     );
