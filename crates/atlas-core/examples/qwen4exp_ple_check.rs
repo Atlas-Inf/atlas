@@ -10,17 +10,14 @@
 use anyhow::{Context, Result};
 use atlas_core::config::parse_config;
 use atlas_core::ngram_table::NgramTable;
-use atlas_core::ple_reference::{PleDims, PleWeights, ple_forward};
-use atlas_core::weight_manifest::locate_checkpoint;
+use atlas_core::qwen4exp_reference::{PleDims, PleWeights, ple_forward};
+use atlas_core::weight_manifest::{TensorLocation, locate_checkpoint};
 use std::collections::BTreeMap;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 /// Read a tensor out of a checkpoint as f32, whatever it is stored as.
-fn tensor_f32(
-    located: &BTreeMap<String, atlas_core::weight_manifest::TensorLocation>,
-    name: &str,
-) -> Result<Vec<f32>> {
+fn tensor_f32(located: &BTreeMap<String, TensorLocation>, name: &str) -> Result<Vec<f32>> {
     let loc = located
         .get(name)
         .with_context(|| format!("missing {name}"))?;
