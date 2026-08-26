@@ -9,14 +9,11 @@ make_tiny_qwen4_exp.py) or on one holding only `model.safetensors.index.json`
 alone carries every tensor NAME, so name coverage is checkable for free;
 shapes are only checked for shards actually present).
 
-Two prefixes are excluded by design:
+Only `model.visual.*` is excluded, by design: the vision tower is independent
+of the language model and its dimensions live in a separate config block.
 
-  * `model.visual.*` -- the vision tower is independent of the language model
-    and its dimensions live in a separate config block.
-  * `*.weight_scale_inv` -- FP8 block-quantization siblings. The manifest
-    describes logical weights; every scale is verified to attach to a routed
-    expert weight the manifest DOES expect, which is the invariant that
-    matters. Making the manifest itself quantization-aware is future work.
+Quantization scale siblings ARE covered -- the manifest emits them from the
+checkpoint's declared `weight_block_size` and `modules_to_not_convert`.
 """
 import json, pathlib, struct, subprocess, sys
 
@@ -56,26 +53,25 @@ def main():
     names |= set(actual)
 
     visual = {n for n in names if n.startswith("model.visual.")}
+    core = names - visual
     scales = {n for n in names if n.endswith(".weight_scale_inv")}
-    core = names - visual - scales
 
     missing = sorted(core - set(manifest))
     unexpected = sorted(set(manifest) - core)
     orphan = [s for s in scales if s[: -len("_scale_inv")] not in manifest]
-    nonexpert = [s for s in scales if ".mlp.experts." not in s]
+    nonexpert = []
     mismatched = [(n, manifest[n], actual[n])
                   for n in sorted(set(actual) & set(manifest))
                   if actual[n] != manifest[n]]
 
     print(f"checkpoint      : {ckpt}")
     print(f"  names         : {len(names)} ({len(visual)} visual, {len(scales)} fp8 scales)")
-    print(f"  core          : {len(core)}")
+    print(f"  core          : {len(core)}  (scales included)")
     print(f"manifest        : {len(manifest)}")
     print(f"shapes present  : {len(set(actual) & set(manifest))}")
     for label, rows in (("missing from manifest", missing),
                         ("unexpected in manifest", unexpected),
-                        ("scales with no base weight", orphan),
-                        ("scales outside routed experts", nonexpert)):
+                        ("scales with no base weight", orphan)):
         print(f"  {label:30s}: {len(rows)}")
         for row in rows[:6]:
             print(f"      {row}")
@@ -83,7 +79,7 @@ def main():
     for n, want, got in mismatched[:6]:
         print(f"      {n}: manifest {list(want)} vs checkpoint {list(got)}")
 
-    bad = len(missing) + len(unexpected) + len(orphan) + len(nonexpert) + len(mismatched)
+    bad = len(missing) + len(unexpected) + len(orphan) + len(mismatched)
     print("\n" + ("MANIFEST MATCHES THE CHECKPOINT" if not bad else f"{bad} DISCREPANCIES"))
     return 1 if bad else 0
 

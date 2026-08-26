@@ -93,6 +93,37 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
         }
     }
 
+    // HF's native FP8 block-quant spells the ignore list
+    // `modules_to_not_convert`, and lists every excluded module LITERALLY
+    // rather than as a glob — Qwen3.8-Flash-Next-FP8 ships 943 of them.
+    // Missing this reads as "nothing is excluded", which would have the
+    // loader expect a scale sibling next to every norm and embedding.
+    if let Some(arr) = qc
+        .get("modules_to_not_convert")
+        .and_then(serde_json::Value::as_array)
+    {
+        for v in arr {
+            if let Some(s) = v.as_str()
+                && !ignore_modules.iter().any(|m| m == s)
+            {
+                ignore_modules.push(s.to_string());
+            }
+        }
+    }
+
+    // Block-scaled FP8 carries a 2-D block grid; a `[128, 128]` weight_block_size
+    // means one scale per 128x128 tile, so the sibling is
+    // [ceil(rows/128), ceil(cols/128)] rather than per-tensor or per-row.
+    let weight_block_size: Vec<usize> = qc
+        .get("weight_block_size")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // An empty quant_method with empty ignore list is not a real quant
     // config — skip so callers can fall through to heuristic detection.
     if quant_method.is_empty() && quant_algo.is_empty() && ignore_modules.is_empty() {
@@ -104,6 +135,7 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
         quant_algo,
         format,
         ignore_modules,
+        weight_block_size,
     })
 }
 

@@ -586,6 +586,10 @@ pub struct QuantizationConfig {
     /// tensors). Example entries: `"lm_head"`,
     /// `"model.layers.*.self_attn*"`.
     pub ignore_modules: Vec<String>,
+    /// Block-quantization tile, e.g. `[128, 128]`. Empty for schemes that
+    /// scale per tensor or per row. When present, a quantized `[rows, cols]`
+    /// weight carries a `[ceil(rows/b0), ceil(cols/b1)]` scale sibling.
+    pub weight_block_size: Vec<usize>,
 }
 
 /// Vision encoder configuration for Qwen3-VL models.

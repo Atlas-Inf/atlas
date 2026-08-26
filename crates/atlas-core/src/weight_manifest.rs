@@ -87,6 +87,69 @@ pub fn diff<'a>(
     out
 }
 
+/// Scale siblings a quantized checkpoint carries alongside the logical weights.
+///
+/// Separate from the base manifest on purpose: the same architecture ships in
+/// several quantizations (Qwen3.8-Flash-Next has an FP8 release and at least two
+/// NVFP4 repacks) and they differ only here. Keeping the split means a repack
+/// does not fork the architecture description.
+///
+/// Only block-scaled FP8 (`weight_scale_inv`) is implemented. ModelOpt NVFP4
+/// uses a different sibling set (`weight_scale`, `weight_scale_2`,
+/// `input_scale`) and returns `Ok(None)` rather than a wrong guess.
+pub fn quantization_siblings(
+    config: &ModelConfig,
+    manifest: &[ExpectedTensor],
+) -> Result<Option<Vec<ExpectedTensor>>> {
+    let Some(quant) = config.quantization_config.as_ref() else {
+        return Ok(None);
+    };
+    if quant.quant_method != "fp8" || quant.weight_block_size.len() != 2 {
+        return Ok(None);
+    }
+    let (br, bc) = (quant.weight_block_size[0], quant.weight_block_size[1]);
+    anyhow::ensure!(br > 0 && bc > 0, "weight_block_size must be positive");
+
+    let ignored: std::collections::HashSet<&str> =
+        quant.ignore_modules.iter().map(String::as_str).collect();
+    // A group carrying its own `weight_scale` is quantized PER TENSOR, not per
+    // block, and takes no `weight_scale_inv`. The n-gram embedding is the case
+    // that matters: its 128 shards are FP8 but share one BF16 scale, and they
+    // are absent from `modules_to_not_convert` because they are converted --
+    // just by a different scheme. Keyed off the manifest rather than off the
+    // name, so any future per-tensor group is handled for free.
+    let per_tensor: std::collections::HashSet<&str> = manifest
+        .iter()
+        .filter_map(|t| t.name.strip_suffix(".weight_scale"))
+        .collect();
+
+    Ok(Some(
+        manifest
+            .iter()
+            .filter_map(|tensor| {
+                // Only 2-D linear weights are block-quantized. Norms, biases,
+                // integer buffers and the 3-D conv kernels are not, and none of
+                // them appear in the ignore list either -- which is why the
+                // rank check has to be here and not left to the list.
+                let module = tensor.name.strip_suffix(".weight")?;
+                if tensor.shape.len() != 2 || ignored.contains(module) {
+                    return None;
+                }
+                // `a.b.shard_0` -> `a.b`; skip when that group scales per tensor.
+                if let Some((group, _)) = module.rsplit_once('.')
+                    && per_tensor.contains(group)
+                {
+                    return None;
+                }
+                Some(ExpectedTensor::new(
+                    format!("{module}.weight_scale_inv"),
+                    [tensor.shape[0].div_ceil(br), tensor.shape[1].div_ceil(bc)],
+                ))
+            })
+            .collect(),
+    ))
+}
+
 mod qwen4_exp;
 pub use qwen4_exp::qwen4_exp_manifest;
 

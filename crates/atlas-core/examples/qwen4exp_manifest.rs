@@ -19,11 +19,20 @@ fn main() -> anyhow::Result<()> {
         .to_string()
     });
     let config = parse_config(&std::fs::read_to_string(&path)?)?;
-    let manifest = atlas_core::weight_manifest::manifest_for(&config)?
+    let mut manifest = atlas_core::weight_manifest::manifest_for(&config)?
         .ok_or_else(|| anyhow::anyhow!("no manifest for model_type {}", config.model_type))?;
 
+    // Scale siblings, when the checkpoint declares a quantization this
+    // manifest knows how to describe.
+    let base = manifest.len();
+    let mut scales = 0;
+    if let Some(siblings) = atlas_core::weight_manifest::quantization_siblings(&config, &manifest)?
+    {
+        scales = siblings.len();
+        manifest.extend(siblings);
+    }
     eprintln!(
-        "{} tensors expected (excludes model.visual.*)",
+        "{} tensors expected ({base} weights + {scales} quantization scales; excludes model.visual.*)",
         manifest.len()
     );
     let rows: Vec<_> = manifest

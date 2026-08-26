@@ -74,9 +74,28 @@ shapes cross-checked against real headers). Use
 while building the loader — it catches a wrong width the moment it appears,
 which it already did three times.
 
-Not yet quantization-aware: it describes logical weights, and the FP8
-`weight_scale_inv` siblings are verified to attach only to routed experts rather
-than being enumerated.
+Quantization-aware as of the FP8 release: `quantization_siblings` derives the
+`weight_scale_inv` set from the checkpoint's declared `weight_block_size` and
+`modules_to_not_convert`. Manifest plus siblings is **151,756 tensors — the
+entire published checkpoint except its 333 vision tensors — with zero missing
+and zero unexpected**, and 3,189 shapes cross-checked against real headers.
+
+Two rules that are not guessable from the tensor names:
+
+* Only 2-D linear weights take a block scale. Norms, biases, integer buffers
+  and the 3-D conv kernels do not, and none of them appear in
+  `modules_to_not_convert` either — so the rank check cannot be left to the
+  ignore list.
+* A group carrying its own `weight_scale` is quantized PER TENSOR and takes no
+  `weight_scale_inv`. The 128 n-gram shards are the case: FP8, sharing one BF16
+  scale, and absent from `modules_to_not_convert` because they *are* converted,
+  just by another scheme. Treating them as block-quantized over-generates by
+  exactly 128.
+
+ModelOpt NVFP4 (what the RadixArk repack uses) has a different sibling set —
+`weight_scale`, `weight_scale_2`, `input_scale` — and returns `None` rather than
+a wrong guess. That is the next piece if we serve a repack rather than the FP8
+release.
 
 ### Dispatch
 `qwen4_exp` is in neither `config/dispatch.rs::parse_config` nor

@@ -66,6 +66,15 @@ behind specific subsystems — see the
   development checkpoint (hyper-connections are `hc_count * hidden` wide, not
   `hidden`; `q_proj` is 2x for the gate; the indexer's `index_qk_proj` is
   `(n_heads + kv_heads) * head_dim`).
+
+  Quantization siblings are derived too, from the checkpoint's declared
+  `weight_block_size` and `modules_to_not_convert` (the latter previously went
+  unparsed — HF's FP8 spelling, 943 literal entries). Manifest plus siblings is
+  **151,756 tensors, the whole published checkpoint bar its 333 vision tensors,
+  with zero missing and zero unexpected** and 3,189 shapes matching real
+  headers. Per-tensor groups are excluded from block scaling: the 128 n-gram
+  shards are FP8 behind a single shared `weight_scale`, and are absent from the
+  ignore list precisely because they *are* converted.
 - **`qwen4_exp` config parsing.** The published `Qwen3.8-Flash-Next-FP8`
   `config.json` now parses (vendored whole into `test_data/`). Two of its
   defaults are absent rather than stated and both fail silently: `norm_topk_prob`

@@ -474,6 +474,58 @@ mod tests {
         assert_eq!(d.mismatched[0].2, vec![9, 9]);
     }
 
+    /// The FP8 release's scale siblings, exactly. The published index holds
+    /// 152_089 tensors; 333 are `model.visual.*`, and the manifest plus its
+    /// siblings account for the remaining 151_756 with nothing missing and
+    /// nothing extra.
+    #[test]
+    fn the_fp8_scale_siblings_are_derived_exactly() {
+        let cfg = published();
+        let manifest = qwen4_exp_manifest(&cfg).unwrap();
+        let scales = crate::weight_manifest::quantization_siblings(&cfg, &manifest)
+            .unwrap()
+            .expect("fp8 block-quant is described");
+        assert_eq!(scales.len(), 75_264);
+        assert_eq!(manifest.len() + scales.len(), 151_756);
+
+        // Only routed experts are block-quantized in this release.
+        assert!(
+            scales.iter().all(|t| t.name.contains(".mlp.experts.")),
+            "a non-expert module picked up a block scale"
+        );
+        // [2560, 640] tiled by [128, 128] -> [20, 5].
+        let down = scales
+            .iter()
+            .find(|t| {
+                t.name == "model.language_model.layers.3.mlp.experts.0.down_proj.weight_scale_inv"
+            })
+            .expect("expert down_proj scale");
+        assert_eq!(down.shape, vec![20, 5]);
+    }
+
+    /// The n-gram shards are FP8 but scale PER TENSOR -- 128 shards behind one
+    /// `weight_scale` -- and they are absent from `modules_to_not_convert`
+    /// because they are converted, just by another scheme. Treating them as
+    /// block-quantized over-generates by exactly 128 tensors.
+    #[test]
+    fn per_tensor_groups_take_no_block_scale() {
+        let cfg = published();
+        let manifest = qwen4_exp_manifest(&cfg).unwrap();
+        let scales = crate::weight_manifest::quantization_siblings(&cfg, &manifest)
+            .unwrap()
+            .unwrap();
+        assert!(
+            manifest
+                .iter()
+                .any(|t| t.name.ends_with("ngram_embedding.shard_0.weight")),
+            "the shards must be in the base manifest"
+        );
+        assert!(
+            !scales.iter().any(|t| t.name.contains("ngram_embedding")),
+            "n-gram shards must not get weight_scale_inv"
+        );
+    }
+
     /// The hyper-connection widths are the whole reason this manifest exists,
     /// so a config that does not declare them must not silently produce a
     /// manifest full of zero-width tensors.
