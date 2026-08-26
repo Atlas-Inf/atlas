@@ -1,0 +1,108 @@
+# Qwen3.8-Flash-Next — hybrid GDN + QSA sparse attention, multi-hyperconnection
+# streams, PLE n-gram injection, 512-expert MoE, ViT tower, 1 MTP layer.
+#
+# Port tracked in Avarok #753. Serving is NOT complete: this target exists so
+# the model can RESOLVE and LOAD. The hyper-connection mixer, the QSA indexer
+# and the PLE n-gram injection are not wired yet and refuse by name.
+#
+# TWO MODEL_TYPE NAMES, ONE ARCHITECTURE. The model shipped as
+# `qwen3_8_flash_next` and was renamed `qwen4_exp`; quantizers pinned to
+# different transformers revisions emit different names (RadixArk ->
+# qwen4_exp, Inferact -> qwen3_8_flash_next). `dispatch.rs` normalizes both to
+# `qwen4_exp`, so only that one is bound below.
+[model]
+name = "qwen3.8-flash-next"
+hf_id = "Qwen/Qwen3.8-Flash-Next"
+architecture = "GDN + QSA sparse attention + mHC + PLE n-gram + MoE"
+params = "180B"
+active_params = "10B"
+
+# 3 linear : 1 full, 48 layers. Only the 12 full-attention layers hold KV;
+# the 36 GDN layers hold recurrent state instead, which is why a ~19-24 GB KV
+# budget goes further here than the layer count suggests.
+layers_total = 48
+layers_linear_attention = 36
+layers_full_attention = 12
+layer_pattern = "3:1 (linear, linear, linear, full)"
+
+moe_experts = 512
+moe_topk = 10
+moe_intermediate = 640
+shared_expert_intermediate = 640
+
+hidden_dim = 2560
+head_dim = 256
+q_heads = 24
+kv_heads = 2
+
+linear_attn_key_heads = 16
+linear_attn_key_dim = 128
+linear_attn_value_heads = 48
+linear_attn_value_dim = 128
+linear_conv_kernel = 4
+
+vocab_size = 248320
+max_position_embeddings = 262144
+rope_theta = 10000000
+partial_rotary_factor = 0.25
+attn_output_gate = true
+mrope_interleaved = true
+mrope_section = [11, 11, 10]
+
+# Multi-hyperconnection: the residual is 4 parallel streams of hidden_dim
+# (4 x 2560 = 10240), mixed through a low-rank pair of rank 320. Atlas's mHC
+# plumbing comes from DeepSeek-V4, whose mixer is Sinkhorn-normalized instead
+# — same stream layout, different mixing math.
+hc_count = 4
+hc_lowrank = 320
+
+# QSA indexer, on the full-attention layers only.
+indexer_n_heads = 4
+indexer_head_dim = 128
+indexer_budget = 2048
+indexer_compress_ratio = 4
+
+# PLE n-gram injection at ONE layer. 16 heads x 160 dims = 2560 = hidden, so
+# the per-head slices are CONCATENATED, not projected-and-summed the way
+# LongCat's are. One logical table of ~320M rows stored as 128 shards; served
+# off NVMe via the row cache rather than resident (47.7 GB FP8 in the RadixArk
+# release, 95.4 GB BF16 in Inferact's).
+ngram_size = 3
+ngram_heads = 16
+ngram_dim = 160
+ngram_split_parts = 128
+ple_layer_ids = [2]
+ple_conv_kernel_size = 4
+
+mtp_layers = 1
+mtp_type = "full_attention"
+vision = true
+
+# Sampling: from generation_config.json in the released checkpoints
+# (do_sample, temperature 1.0, top_k 20, top_p 0.95). No per-category card
+# guidance has been published for this model yet, so all three categories
+# carry the same vendor defaults rather than values invented here. Revisit
+# once agentic runs give evidence.
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+
+[sampling.tools]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+
+[[model_types]]
+model_type = "qwen4_exp"
+hidden_size = 2560
