@@ -224,7 +224,7 @@ fn forward(
             // The reference seeds ngram_size-1 EOS tokens of carried context.
             let carry = config.ngram_size - 1;
             let mut stream: Vec<u32> = vec![config.eos_token_id; carry];
-            stream.extend_from_slice(&ids);
+            stream.extend_from_slice(ids);
             let row_ids = ngram.ngram_ids(config.ngram_vocab_size_base, &stream);
             let heads = row_ids.len();
             let mut embeddings = vec![0f32; seq * heads * table.head_dim()];
@@ -263,7 +263,7 @@ fn forward(
             ("attn_hyper_connection", true),
             ("mlp_hyper_connection", false),
         ] {
-            let held = load_hc(&store, &format!("{base}.{which}"), true)?;
+            let held = load_hc(store, &format!("{base}.{which}"), true)?;
             let hcw = hc_weights(&held, true);
 
             // Collapse every position, run the block, broadcast back.
@@ -417,7 +417,7 @@ fn forward(
     }
 
     // No final norm: the trunk mixer is what normalises before the LM head.
-    let held = load_hc(&store, &format!("{lm}.hyper_connection_mixer"), false)?;
+    let held = load_hc(store, &format!("{lm}.hyper_connection_mixer"), false)?;
     let mixer = hc_weights(&held, false);
     let lm_head = store.get("lm_head.weight")?;
     let mut logits = vec![0f32; seq * config.vocab_size];

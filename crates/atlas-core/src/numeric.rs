@@ -107,6 +107,69 @@ pub fn bf16_bytes_to_f32(bytes: [u8; 2]) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+/// The 16 values of FP4 E2M1, indexed by nibble.
+///
+/// One sign bit, two exponent bits, one mantissa bit, and no NaN or infinity —
+/// every bit pattern is a finite number, which is why NVFP4 can pack two per
+/// byte with no escape codes.
+pub const FP4_E2M1: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Dequantize a ModelOpt NVFP4 weight into f32.
+///
+/// `packed` is `[rows, cols/2]` — two FP4 values per byte, low nibble first.
+/// `scale` is `[rows, cols/group]` in FP8 E4M3, one per group along the INPUT
+/// dimension. `global` is the per-tensor `weight_scale_2`.
+///
+/// Two levels of scale, not one: the FP8 block scale is itself scaled by a
+/// tensor-wide f32. Dropping `global` leaves the weights off by a constant
+/// factor per tensor, which looks like a temperature change rather than a bug.
+pub fn nvfp4_dequant(
+    packed: &[u8],
+    scale: &[u8],
+    global: f32,
+    rows: usize,
+    cols: usize,
+    group: usize,
+) -> Result<Vec<f32>, String> {
+    if !cols.is_multiple_of(2) || !cols.is_multiple_of(group) {
+        return Err(format!("NVFP4 needs an even, group-aligned {cols}"));
+    }
+    let packed_cols = cols / 2;
+    let scale_cols = cols / group;
+    if packed.len() != rows * packed_cols {
+        return Err(format!(
+            "packed is {} bytes, expected {}",
+            packed.len(),
+            rows * packed_cols
+        ));
+    }
+    if scale.len() != rows * scale_cols {
+        return Err(format!(
+            "scale is {} bytes, expected {}",
+            scale.len(),
+            rows * scale_cols
+        ));
+    }
+
+    let mut out = vec![0f32; rows * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            let byte = packed[row * packed_cols + col / 2];
+            // Low nibble is the even column.
+            let nibble = if col.is_multiple_of(2) {
+                byte & 0x0F
+            } else {
+                byte >> 4
+            };
+            let block = fp8_e4m3_to_f32(scale[row * scale_cols + col / group]);
+            out[row * cols + col] = FP4_E2M1[nibble as usize] * block * global;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,63 +365,4 @@ mod tests {
             );
         }
     }
-}
-
-/// The 16 values of FP4 E2M1, indexed by nibble.
-///
-/// One sign bit, two exponent bits, one mantissa bit, and no NaN or infinity —
-/// every bit pattern is a finite number, which is why NVFP4 can pack two per
-/// byte with no escape codes.
-pub const FP4_E2M1: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-];
-
-/// Dequantize a ModelOpt NVFP4 weight into f32.
-///
-/// `packed` is `[rows, cols/2]` — two FP4 values per byte, low nibble first.
-/// `scale` is `[rows, cols/group]` in FP8 E4M3, one per group along the INPUT
-/// dimension. `global` is the per-tensor `weight_scale_2`.
-///
-/// Two levels of scale, not one: the FP8 block scale is itself scaled by a
-/// tensor-wide f32. Dropping `global` leaves the weights off by a constant
-/// factor per tensor, which looks like a temperature change rather than a bug.
-pub fn nvfp4_dequant(
-    packed: &[u8],
-    scale: &[u8],
-    global: f32,
-    rows: usize,
-    cols: usize,
-    group: usize,
-) -> Result<Vec<f32>, String> {
-    if !cols.is_multiple_of(2) || !cols.is_multiple_of(group) {
-        return Err(format!("NVFP4 needs an even, group-aligned {cols}"));
-    }
-    let packed_cols = cols / 2;
-    let scale_cols = cols / group;
-    if packed.len() != rows * packed_cols {
-        return Err(format!(
-            "packed is {} bytes, expected {}",
-            packed.len(),
-            rows * packed_cols
-        ));
-    }
-    if scale.len() != rows * scale_cols {
-        return Err(format!(
-            "scale is {} bytes, expected {}",
-            scale.len(),
-            rows * scale_cols
-        ));
-    }
-
-    let mut out = vec![0f32; rows * cols];
-    for row in 0..rows {
-        for col in 0..cols {
-            let byte = packed[row * packed_cols + col / 2];
-            // Low nibble is the even column.
-            let nibble = if col.is_multiple_of(2) { byte & 0x0F } else { byte >> 4 };
-            let block = fp8_e4m3_to_f32(scale[row * scale_cols + col / group]);
-            out[row * cols + col] = FP4_E2M1[nibble as usize] * block * global;
-        }
-    }
-    Ok(out)
 }
