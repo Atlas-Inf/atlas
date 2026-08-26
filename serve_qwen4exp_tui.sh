@@ -48,4 +48,5 @@ exec target/release/spark serve \
   --max-batch-size "${MAX_BATCH_SIZE:-4}" \
   --gpu-memory-utilization "${GPU_UTIL:-0.80}" \
   --fast-load-prefetch-shards \
+  --default-chat-template-kwargs "${REASONING_KWARGS:-{\"reasoning_effort\":\"low\"}}" \
   "$@"
