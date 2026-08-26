@@ -12,17 +12,25 @@
 //
 // Reference: Qwen4ExpTextGatedResidual in modeling_qwen4_exp.py, and the CPU
 // oracle in atlas_core::qwen4exp_reference (checked against it at 1.6e-7).
+//
+// NAMED `qwen4exp_hc`, NOT `hyper_connection`. That module already exists --
+// kernels/gb10/deepseek-v4-flash/nvfp4/hyper_connection.cu, carrying hc_expand
+// / hc_pre / hc_post / hc_head -- and it is DeepSeek-V4's Sinkhorn-normalised
+// mHC, a DIFFERENT formulation from this low-rank sigmoid gate. Sharing the
+// module name let the model shadow win and the lookup fail with "named symbol
+// not found"; sharing it the other way would have been worse, since one
+// model's weights would have gone through the other's mixing.
 
 #include <cuda_bf16.h>
 
-__device__ __forceinline__ float hc_sigmoid(float x) {
+__device__ __forceinline__ float q4e_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
 // silu(x / hc_count), in place, on the low-rank projection output.
 //
 // Grid: (num_tokens, 1, 1)  Block: (min(lowrank, 1024), 1, 1)
-extern "C" __global__ void hc_lowrank_act(
+extern "C" __global__ void q4e_hc_lowrank_act(
     __nv_bfloat16* __restrict__ values,   // [num_tokens, lowrank]
     unsigned int lowrank,
     unsigned int hc_count
@@ -31,7 +39,7 @@ extern "C" __global__ void hc_lowrank_act(
     float inv = 1.0f / (float)hc_count;
     for (unsigned int i = threadIdx.x; i < lowrank; i += blockDim.x) {
         float v = __bfloat162float(values[base + i]) * inv;
-        values[base + i] = __float2bfloat16(v * hc_sigmoid(v));
+        values[base + i] = __float2bfloat16(v * q4e_sigmoid(v));
     }
 }
 
@@ -41,7 +49,7 @@ extern "C" __global__ void hc_lowrank_act(
 // like a temperature change rather than a bug.
 //
 // Grid: (num_tokens, 1, 1)  Block: (min(hidden_size, 1024), 1, 1)
-extern "C" __global__ void hc_stream_mix(
+extern "C" __global__ void q4e_hc_stream_mix(
     const __nv_bfloat16* __restrict__ gate,    // [num_tokens, hc_count * hidden] pre-sigmoid
     const __nv_bfloat16* __restrict__ normed,  // [num_tokens, hc_count * hidden]
     __nv_bfloat16* __restrict__ out,            // [num_tokens, hidden]
@@ -58,7 +66,7 @@ extern "C" __global__ void hc_stream_mix(
         float acc = 0.0f;
         for (unsigned int s = 0; s < hc_count; ++s) {
             unsigned long long i = (unsigned long long)s * hidden + h;
-            acc += hc_sigmoid(__bfloat162float(g[i])) * __bfloat162float(n[i]);
+            acc += q4e_sigmoid(__bfloat162float(g[i])) * __bfloat162float(n[i]);
         }
         o[h] = __float2bfloat16(acc * inv);
     }
@@ -70,7 +78,7 @@ extern "C" __global__ void hc_stream_mix(
 // the identity rather than a halving.
 //
 // Grid: (num_tokens, 1, 1)  Block: (hc_count, 1, 1)
-extern "C" __global__ void hc_injection(
+extern "C" __global__ void q4e_hc_injection(
     const __nv_bfloat16* __restrict__ raw,  // [num_tokens, hc_count]
     __nv_bfloat16* __restrict__ out,         // [num_tokens, hc_count]
     unsigned int hc_count
@@ -78,7 +86,7 @@ extern "C" __global__ void hc_injection(
     unsigned long long base = (unsigned long long)blockIdx.x * hc_count;
     for (unsigned int s = threadIdx.x; s < hc_count; s += blockDim.x) {
         float v = __bfloat162float(raw[base + s]) / (float)hc_count;
-        out[base + s] = __float2bfloat16(2.0f * hc_sigmoid(v));
+        out[base + s] = __float2bfloat16(2.0f * q4e_sigmoid(v));
     }
 }
 
@@ -88,7 +96,7 @@ extern "C" __global__ void hc_injection(
 // hyper input, which is what the residual actually carries.
 //
 // Grid: (num_tokens, hc_count, 1)  Block: (min(hidden, 1024), 1, 1)
-extern "C" __global__ void hc_scatter_add(
+extern "C" __global__ void q4e_hc_scatter_add(
     const __nv_bfloat16* __restrict__ mixed,      // [num_tokens, hidden]
     const __nv_bfloat16* __restrict__ injection,  // [num_tokens, hc_count]
     __nv_bfloat16* __restrict__ residual,          // [num_tokens, hc_count * hidden]

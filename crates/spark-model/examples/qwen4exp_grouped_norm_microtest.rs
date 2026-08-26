@@ -192,9 +192,9 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
 
     let gemv = g.kernel("gemv", "dense_gemv_bf16")?;
     let norm_k = g.kernel("norm", "rms_norm_grouped")?;
-    let act_k = g.kernel("hyper_connection", "hc_lowrank_act")?;
-    let mix_k = g.kernel("hyper_connection", "hc_stream_mix")?;
-    let inj_k = g.kernel("hyper_connection", "hc_injection")?;
+    let act_k = g.kernel("qwen4exp_hc", "q4e_hc_lowrank_act")?;
+    let mix_k = g.kernel("qwen4exp_hc", "q4e_hc_stream_mix")?;
+    let inj_k = g.kernel("qwen4exp_hc", "q4e_hc_injection")?;
 
     KernelLaunch::new(g, norm_k)
         .grid([1, GROUPS as u32, 1])
