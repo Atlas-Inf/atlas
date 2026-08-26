@@ -91,8 +91,65 @@ def build(config: Qwen4ExpTextConfig, w: dict[str, torch.Tensor]):
     return mod, use_combine
 
 
+def bf16_bytes(a: np.ndarray) -> bytes:
+    """BF16 the way the kernel reads it: raw u16, round-to-nearest-even."""
+    t = torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))
+    return t.to(torch.bfloat16).view(torch.uint16).numpy().tobytes()
+
+
+def write_bins(out_dir: str, dump: dict, weights: dict) -> None:
+    """Raw sidecar for the Rust probe.
+
+    The npz is the human-readable artifact; Rust reads flat little-endian
+    buffers instead, in exactly the dtypes the kernel's parameters declare.
+    Getting a dtype wrong here would show up as a parity failure blamed on
+    the kernel, so each file's dtype is spelled out in `meta.json`.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    files: dict[str, str] = {}
+
+    def put(name: str, data: bytes, dtype: str) -> None:
+        with open(os.path.join(out_dir, name + '.bin'), 'wb') as fh:
+            fh.write(data)
+        files[name] = dtype
+
+    # FP32 highway, FP32 expectations — `streams` is the model's residual.
+    put('streams', dump['hyper_input'].astype(np.float32).tobytes(), 'f32')
+    put('post_expected', dump['post_expected'].astype(np.float32).tobytes(),
+        'f32')
+    # BF16: everything the kernel's signature declares as __nv_bfloat16.
+    put('post_block_out', bf16_bytes(dump['post_block_out']), 'bf16')
+    for site in SITES:
+        if f'{site}_mixed_input' not in dump:
+            continue
+        put(f'{site}_mixed', dump[f'{site}_mixed_input'].astype(np.float32)
+            .tobytes(), 'f32')
+        if f'{site}_injection_weights' in dump:
+            put(f'{site}_inj', dump[f'{site}_injection_weights']
+                .astype(np.float32).tobytes(), 'f32')
+        for short in ('hc_norm', 'down', 'up', 'inject'):
+            key = f'{site}_w_{short}'
+            if key in weights:
+                put(f'{site}_w_{short}', bf16_bytes(weights[key]), 'bf16')
+
+    meta = {
+        'hc_count': int(dump['hc_count']),
+        'hidden_size': int(dump['hidden_size']),
+        'hc_lowrank': int(dump['hc_lowrank']),
+        'rms_norm_eps': float(dump['rms_norm_eps']),
+        'num_tokens': int(dump['num_tokens']),
+        'norm_convention': dump['norm_convention'].decode(),
+        'files': files,
+    }
+    with open(os.path.join(out_dir, 'meta.json'), 'w') as fh:
+        json.dump(meta, fh, indent=2, sort_keys=True)
+    print(f'wrote {out_dir}/ ({len(files)} bins + meta.json) for the Rust probe')
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument('--bin-dir', default=os.environ.get('ATLAS_HC_TEST_DATA'),
+                    help='also emit raw .bin + meta.json for the Rust probe')
     ap.add_argument('--snapshot', default=os.environ.get('QWEN4EXP_PATH',
                                                          DEFAULT_SNAP))
     ap.add_argument('--out', default=os.path.join(os.path.dirname(__file__),
@@ -193,9 +250,26 @@ def main() -> int:
                   f'{(wrong_offset - ref_normed).abs().max():.3e}')
             dump['attn_hc_normed'] = ref_normed.detach().numpy()
 
+    # hc_post: inject a block output back into every stream.
+    #   out[t, s*H + d] = residual[t, s*H + d] + block_out[t, d] * inj[t, s]
+    # The kernel reads `block_out` as BF16, so round first and compute the
+    # expectation from the rounded values — otherwise the tolerance is
+    # measuring the fixture's dtype rather than the kernel.
+    g2 = torch.Generator().manual_seed(0xBEEF)
+    block_out = torch.randn(args.tokens, h, generator=g2, dtype=torch.float32)
+    block_out = block_out.to(torch.bfloat16).float()
+    inj = torch.from_numpy(dump['attn_injection_weights'])
+    post = (hyper[0].unflatten(-1, (hc, h))
+            + block_out.unsqueeze(-2) * inj.unsqueeze(-1)).flatten(-2)
+    dump['post_block_out'] = block_out.numpy()
+    dump['post_expected'] = post.numpy()
+    print(f' post: |x|={post.norm():.4f} (block_out rounded to BF16 first)')
+
     np.savez(args.out, **dump)
     w_out = args.out.replace('.npz', '_weights.npz')
     np.savez(w_out, **weights)
+    if args.bin_dir:
+        write_bins(args.bin_dir, dump, weights)
     print(f'\nwrote {args.out} '
           f'({os.path.getsize(args.out) / 1e6:.2f} MB, {len(dump)} arrays)')
     print(f'wrote {w_out} '
