@@ -274,6 +274,17 @@ impl TransformerModel {
                         tokens.len(),
                         seq.block_table.len(),
                     );
+                    // See finalize_last: aux layer state rides the snapshot.
+                    // This fn is infallible; an aux collection failure just
+                    // leaves the slot aux-less (aux-carrying models then
+                    // decline it on restore — a slower miss, never stale).
+                    match self.collect_aux_states(stream) {
+                        Ok(aux) if !aux.is_empty() => {
+                            self.ssm_snapshots.set_aux(snap_id, aux);
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("aux snapshot skipped: {e:#}"),
+                    }
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
                         tokens,
                         &seq.block_table,

@@ -27,6 +27,24 @@ impl TransformerLayer for Qwen3SsmLayer {
         Ok(())
     }
 
+    fn has_aux_state(&self) -> bool {
+        self.ple.is_some()
+    }
+
+    fn snapshot_aux(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<Option<Vec<u8>>> {
+        match self.ple.as_ref() {
+            Some(ple) => Ok(Some(ple.snapshot_aux(gpu, stream)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn restore_aux(&self, blob: &[u8], gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        self.ple
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("restore_aux: no PLE on this layer"))?
+            .restore_aux(blob, gpu, stream)
+    }
+
     fn decode_prestage_rearm(&self) {
         if let Some(ple) = self.ple.as_ref() {
             ple.rearm();

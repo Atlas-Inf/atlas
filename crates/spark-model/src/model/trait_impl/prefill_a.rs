@@ -149,6 +149,10 @@ impl TransformerModel {
                 && self
                     .ssm_snapshots
                     .session_matches(snap_id, seq.session_hash)
+                // Aux-carrying models (PLE/QSA) decline aux-less slots — a
+                // mid-chunk tail capture, or a snapshot from before this
+                // feature — rather than restore a stale lexical state.
+                && (!self.requires_aux_state() || self.ssm_snapshots.aux(snap_id).is_some())
             {
                 self.ssm_snapshots.restore(
                     snap_id,
@@ -157,6 +161,9 @@ impl TransformerModel {
                     self.gpu.as_ref(),
                     stream,
                 )?;
+                if let Some(aux) = self.ssm_snapshots.aux(snap_id) {
+                    self.apply_aux_states(&aux, stream)?;
+                }
                 if snap_tok < kv_write_start {
                     tracing::info!(
                         "Marconi intermediate hit: restored from checkpoint at token {} \

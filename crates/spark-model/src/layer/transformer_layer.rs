@@ -91,6 +91,29 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// Marconi aux state: host-serialized per-layer SEQUENCE state that must
+    /// travel with an SSM snapshot for a prefix-cache hit to be complete —
+    /// PLE's n-gram history + conv state, QSA's ingested indexer keys.
+    /// Without these a restored prefix would silently serve the PREVIOUS
+    /// request's lexical state. Called at chunk-boundary snapshot saves;
+    /// any D2H inside must be stream-ordered (`copy_d2h_on_stream`).
+    /// Default: the layer carries no aux sequence state.
+    fn snapshot_aux(&self, _gpu: &dyn GpuBackend, _stream: u64) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// True when this layer WOULD produce aux state — restore sites use it
+    /// to decline snapshots that lack aux rather than restore a stale mix.
+    fn has_aux_state(&self) -> bool {
+        false
+    }
+
+    /// Restore the aux state captured by [`Self::snapshot_aux`] on a
+    /// prefix-cache hit, BEFORE the resumed prefill runs.
+    fn restore_aux(&self, _blob: &[u8], _gpu: &dyn GpuBackend, _stream: u64) -> Result<()> {
+        anyhow::bail!("restore_aux on a layer with no aux state")
+    }
+
     /// Decode one token through this layer, modifying `hidden` in-place.
     ///
     /// # Arguments

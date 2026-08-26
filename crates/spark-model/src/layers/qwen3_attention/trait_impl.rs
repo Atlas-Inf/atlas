@@ -111,6 +111,24 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.qsa.is_some()
     }
 
+    fn has_aux_state(&self) -> bool {
+        self.qsa.is_some()
+    }
+
+    fn snapshot_aux(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<Option<Vec<u8>>> {
+        match self.qsa.as_ref() {
+            Some(qsa) => Ok(Some(qsa.snapshot_aux(gpu, stream)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn restore_aux(&self, blob: &[u8], gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        self.qsa
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("restore_aux: no QSA on this layer"))?
+            .restore_aux(blob, gpu, stream)
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,
