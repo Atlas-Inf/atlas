@@ -95,10 +95,6 @@ fn main() -> Result<()> {
         located: locate_checkpoint(&dir)?,
         cache: std::cell::RefCell::new(BTreeMap::new()),
     };
-    let lm = "model.language_model";
-    let (h, hc) = (config.hidden_size, config.hc_count);
-    let wide = h * hc;
-
     let ids: Vec<u32> = match &fixture_path {
         Some(path) => {
             let f: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -111,8 +107,84 @@ fn main() -> Result<()> {
         }
         None => vec![11, 42, 7, 300, 5],
     };
+    let generate: usize = std::env::args()
+        .position(|a| a == "--generate")
+        .and_then(|_| {
+            let all: Vec<String> = std::env::args().collect();
+            all.iter()
+                .position(|a| a == "--generate")
+                .and_then(|i| all.get(i + 1).cloned())
+        })
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let mut ids = ids;
+    let started = std::time::Instant::now();
+    for step in 0..=generate {
+        eprintln!(
+            "forward: {} tokens, {} layers  (step {step}/{generate}, {:.1?} elapsed)",
+            ids.len(),
+            config.num_hidden_layers,
+            started.elapsed()
+        );
+        let logits = forward(&dir, &config, &store, &ids)?;
+        let vocab = config.vocab_size;
+        let argmax: Vec<usize> = (0..ids.len())
+            .map(|t| {
+                let row = &logits[t * vocab..(t + 1) * vocab];
+                row.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            })
+            .collect();
+
+        if generate == 0 {
+            println!("argmax per position: {argmax:?}");
+            if let Some(path) = &fixture_path {
+                let f: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+                let want: Vec<f32> = f["logits"]
+                    .as_array()
+                    .context("fixture logits")?
+                    .iter()
+                    .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                    .collect();
+                let worst = logits
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+                println!("HF argmax          : {:?}", f["argmax"]);
+                println!(
+                    "max|diff| {worst:.3e}  (logits up to {scale:.3e})  relative {:.3e}",
+                    worst / scale.max(1e-9)
+                );
+            }
+            return Ok(());
+        }
+
+        let next = *argmax.last().context("no logits")? as u32;
+        eprintln!("  -> {next}");
+        ids.push(next);
+        // Emit after every step so a long run is watchable.
+        println!("{}", serde_json::json!({ "ids": ids }));
+    }
+    Ok(())
+}
+
+/// One full forward. Returns logits `[seq, vocab]`.
+fn forward(
+    dir: &std::path::Path,
+    config: &ModelConfig,
+    store: &Store,
+    ids: &[u32],
+) -> Result<Vec<f32>> {
+    let (h, hc) = (config.hidden_size, config.hc_count);
+    let wide = h * hc;
+    let lm = "model.language_model";
     let seq = ids.len();
-    eprintln!("forward: {seq} tokens, {} layers", config.num_hidden_layers);
 
     // Embedding, tiled across the hyper-connection streams.
     let embed = store.get(&format!("{lm}.embed_tokens.weight"))?;
@@ -142,7 +214,7 @@ fn main() -> Result<()> {
         // PLE, where the (one-indexed) ple_layer_ids puts it.
         if let Some(index) = config.ple_layer_ids.iter().position(|id| *id == layer + 1) {
             let ngram = config.qwen4exp_ngram(index)?.context("ngram geometry")?;
-            let table = NgramTable::open(&dir, &config, index)?;
+            let table = NgramTable::open(dir, config, index)?;
             let scale = store
                 .get(&format!(
                     "{base}.ple.ple_embedding.ngram_embedding.weight_scale"
@@ -364,37 +436,5 @@ fn main() -> Result<()> {
         ));
     }
 
-    let argmax: Vec<usize> = (0..seq)
-        .map(|t| {
-            let row = &logits[t * config.vocab_size..(t + 1) * config.vocab_size];
-            row.iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        })
-        .collect();
-    println!("argmax per position: {argmax:?}");
-
-    if let Some(path) = fixture_path {
-        let f: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-        let want: Vec<f32> = f["logits"]
-            .as_array()
-            .context("fixture logits")?
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect();
-        let worst = logits
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
-        println!("HF argmax          : {:?}", f["argmax"]);
-        println!(
-            "max|diff| {worst:.3e}  (logits up to {scale:.3e})  relative {:.3e}",
-            worst / scale.max(1e-9)
-        );
-    }
-    Ok(())
+    Ok(logits)
 }
