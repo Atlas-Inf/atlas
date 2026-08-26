@@ -241,10 +241,25 @@ jobs:
   # What it is for right now is evidence. Before any category is allowed to add
   # verification, the log has to show what it would have said, on real pull
   # requests, including the ones where it abstained.
+  # PARKED 2026-08-26, together with governance-harvest.yml, which is the ONLY
+  # consumer of the artifact this job uploads. That workflow has never
+  # succeeded on this repo — it dies at `createPullRequest` because "Allow
+  # GitHub Actions to create and approve pull requests" is off and staying off
+  # — and `governance/` is currently mixing ~95 Avarok-upstream-numbered
+  # ledgers with this repo's own pr-1..pr-13, which has to be untangled before
+  # any of it means anything. With the consumer parked, this job would upload
+  # artifacts nobody reads and spend a model call per push doing it.
+  #
+  # It stays dispatch-reachable so the categoriser can still be exercised
+  # deliberately. Turn it back on in the same commit as governance-harvest.
+  #
+  # Everything below is unchanged and still true when it runs — most
+  # importantly that it is OBSERVE-ONLY and structurally incapable of being
+  # anything else. Re-read the block above the job before re-enabling.
   pr-categorize:
     name: PR categorize (advisory)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'workflow_dispatch'
     # One live run per PR. The workflow-level group keys on `github.ref`,
     # which serializes compile jobs fine, but a rapid re-push sequence still
     # queued duplicate MODEL CALLS here — and the free tier rate-limits per
