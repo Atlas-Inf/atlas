@@ -805,7 +805,7 @@ pub(crate) fn load_model(
     // proposer for γ tokens (DraftProposer::propose semantics: "up to
     // num_drafts" → drafts.len() = γ → routes to step_verify_dflash).
     let num_drafts = if args.dflash {
-        args.dflash_gamma.saturating_sub(1).max(1)
+        serve_phases::checked_dflash_num_drafts(args.dflash_gamma)?
     } else {
         args.resolved_num_drafts()
     };

@@ -188,7 +188,11 @@ impl TransformerModel {
         // currently free (pad writes land on unowned pool state, zeroed
         // again at the next claim) and its tiered intermediate pool covers
         // the baked depth.
-        let graphs_on = super::verify_e2::verify_graphs_enabled() && !k4_diag;
+        // Per-layer DFlash timing must see real launches, not one replayed
+        // graph, so it disables capture the same way k4 diag does.
+        let time_layers = std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
+        let graphs_on =
+            super::verify_e2::verify_graphs_enabled() && !k4_diag && !time_layers;
         let graph_key = if graphs_on {
             self.verify_batched_graph_key(&*seqs, ks, wy_tables_base.is_null())
         } else {

@@ -134,71 +134,114 @@ impl MtpHead {
         let expert_up_out = ctx.buffers.expert_up_out();
         let expert_down_out = ctx.buffers.expert_down_out();
 
-        // 4. Per-expert gate + up GEMVs
+        // 4. Per-expert FFN
+        let lightning = self.lightning;
         for (slot, &eid) in expert_ids.iter().enumerate() {
             let (ref gate_w, ref up_w, _) = experts[eid as usize];
             let g_out = expert_gate_out.offset(slot * inter as usize * 2);
             let u_out = expert_up_out.offset(slot * inter as usize * 2);
-            self.gemv(ctx.gpu, input, gate_w, g_out, inter, h, stream)?;
-            self.gemv(ctx.gpu, input, up_w, u_out, inter, h, stream)?;
+            if lightning {
+                self.gemv(ctx.gpu, input, up_w, u_out, inter, h, stream)?;
+                ops::relu_squared_inplace(ctx.gpu, self.relu2_k, u_out, inter, stream)?;
+            } else {
+                self.gemv(ctx.gpu, input, gate_w, g_out, inter, h, stream)?;
+                self.gemv(ctx.gpu, input, up_w, u_out, inter, h, stream)?;
+            }
         }
 
-        // 5. SiLU: gate_out = silu(gate_out) * up_out per expert slot
-        for slot in 0..top_k as usize {
-            let g = expert_gate_out.offset(slot * inter as usize * 2);
-            let u = expert_up_out.offset(slot * inter as usize * 2);
-            ops::moe_silu_mul(
-                ctx.gpu,
-                self.moe_silu_mul_k.unwrap(),
-                g,
-                u,
-                g,
-                inter,
-                stream,
-            )?;
+        if !lightning {
+            // 5. SiLU: gate_out = silu(gate_out) * up_out per expert slot
+            for slot in 0..top_k as usize {
+                let g = expert_gate_out.offset(slot * inter as usize * 2);
+                let u = expert_up_out.offset(slot * inter as usize * 2);
+                ops::moe_silu_mul(
+                    ctx.gpu,
+                    self.moe_silu_mul_k.unwrap(),
+                    g,
+                    u,
+                    g,
+                    inter,
+                    stream,
+                )?;
+            }
         }
 
         // 6. Per-expert down GEMVs
         for (slot, &eid) in expert_ids.iter().enumerate() {
             let (_, _, ref down_w) = experts[eid as usize];
-            let silu_out = expert_gate_out.offset(slot * inter as usize * 2);
+            let ffn_out = if lightning {
+                expert_up_out.offset(slot * inter as usize * 2)
+            } else {
+                expert_gate_out.offset(slot * inter as usize * 2)
+            };
             let d_out = expert_down_out.offset(slot * h as usize * 2);
-            self.gemv(ctx.gpu, silu_out, down_w, d_out, h, inter, stream)?;
+            self.gemv(ctx.gpu, ffn_out, down_w, d_out, h, inter, stream)?;
         }
 
         // 7. Shared expert
         let (sh_gate, sh_up, sh_down) = self.moe_shared_generic.as_ref().unwrap();
+        let shared_inter = if lightning { self.shared_inter } else { inter };
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
-        self.gemv(
-            ctx.gpu,
-            input,
-            sh_gate,
-            shared_gate_scratch,
-            inter,
-            h,
-            stream,
-        )?;
-        self.gemv(ctx.gpu, input, sh_up, shared_up_scratch, inter, h, stream)?;
-        ops::moe_silu_mul(
-            ctx.gpu,
-            self.moe_silu_mul_k.unwrap(),
-            shared_gate_scratch,
-            shared_up_scratch,
-            shared_gate_scratch,
-            inter,
-            stream,
-        )?;
+        if lightning {
+            self.gemv(
+                ctx.gpu,
+                input,
+                sh_up,
+                shared_up_scratch,
+                shared_inter,
+                h,
+                stream,
+            )?;
+            ops::relu_squared_inplace(
+                ctx.gpu,
+                self.relu2_k,
+                shared_up_scratch,
+                shared_inter,
+                stream,
+            )?;
+            let shared_out = ctx.buffers.attn_output();
+            self.gemv(
+                ctx.gpu,
+                shared_up_scratch,
+                sh_down,
+                shared_out,
+                h,
+                shared_inter,
+                stream,
+            )?;
+        } else {
+            self.gemv(
+                ctx.gpu,
+                input,
+                sh_gate,
+                shared_gate_scratch,
+                inter,
+                h,
+                stream,
+            )?;
+            self.gemv(ctx.gpu, input, sh_up, shared_up_scratch, inter, h, stream)?;
+            ops::moe_silu_mul(
+                ctx.gpu,
+                self.moe_silu_mul_k.unwrap(),
+                shared_gate_scratch,
+                shared_up_scratch,
+                shared_gate_scratch,
+                inter,
+                stream,
+            )?;
+            let shared_out = ctx.buffers.attn_output();
+            self.gemv(
+                ctx.gpu,
+                shared_gate_scratch,
+                sh_down,
+                shared_out,
+                h,
+                inter,
+                stream,
+            )?;
+        }
         let shared_out = ctx.buffers.attn_output();
-        self.gemv(
-            ctx.gpu,
-            shared_gate_scratch,
-            sh_down,
-            shared_out,
-            h,
-            inter,
-            stream,
-        )?;
 
         // 8. Weighted sum + blend
         let output = ctx.buffers.moe_output();

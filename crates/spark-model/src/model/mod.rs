@@ -26,6 +26,12 @@
 pub(crate) mod block_mgmt;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
+pub(crate) mod dspark_generation;
+#[cfg(test)]
+mod dspark_generation_tests;
+pub(crate) mod dspark_pool;
+#[cfg(test)]
+mod dspark_pool_tests;
 pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;
 pub(crate) mod impl_a2;
@@ -34,6 +40,7 @@ pub(crate) mod impl_b1;
 pub(crate) mod impl_b2;
 pub(crate) mod impl_b3;
 pub(crate) mod impl_b3_accessors;
+pub(crate) mod impl_b3_dflash;
 pub(crate) mod impl_lora;
 pub(crate) mod impl_lora_swap;
 pub(crate) mod mtp_carry;

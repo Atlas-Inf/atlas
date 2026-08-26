@@ -10,6 +10,37 @@ pub fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
     f32::from_bits(((lo as u32) | ((hi as u32) << 8)) << 16)
 }
 
+/// Whether a verify path may bypass the canonical logits pipeline.
+/// Official Lightning DSpark is always masked: raw argmax can select forbidden
+/// structural tokens such as `</think>` on plain completions, violating AR
+/// equivalence even when target logits are identical.
+#[inline]
+pub fn dflash_verify_uses_raw_argmax(
+    raw_requested: bool,
+    masked_requested: bool,
+    lightning_product: bool,
+) -> bool {
+    raw_requested && !masked_requested && !lightning_product
+}
+
+#[cfg(test)]
+mod dflash_verify_policy_tests {
+    use super::dflash_verify_uses_raw_argmax;
+
+    #[test]
+    fn lightning_product_never_bypasses_logits_pipeline() {
+        assert!(!dflash_verify_uses_raw_argmax(true, false, true));
+        assert!(!dflash_verify_uses_raw_argmax(true, true, true));
+    }
+
+    #[test]
+    fn generic_dflash_preserves_explicit_raw_and_masked_modes() {
+        assert!(dflash_verify_uses_raw_argmax(true, false, false));
+        assert!(!dflash_verify_uses_raw_argmax(true, true, false));
+        assert!(!dflash_verify_uses_raw_argmax(false, false, false));
+    }
+}
+
 // The `<|im_start|>` / `<tool_response>` hard-stop token ids and the
 // served-context ceiling were three atomics here, each installed by a `set_*`
 // call during serve startup. All three are per-model — two are token ids,
@@ -1071,4 +1102,104 @@ mod hard_limit_tests {
             "outside thinking → never suppressed"
         );
     }
+}
+
+/// Lightning-product fail-closed policy for draft-proposal failures.
+///
+/// Generic DFlash/MTP keeps the legacy behavior (log + fall through to
+/// standalone serial decode so the sequence keeps emitting). An admitted
+/// Lightning DSpark product must NEVER silently degrade to no-spec: an
+/// empty or erroneous proposal fails the sequence closed instead.
+/// Shared by the bootstrap (mtp_step) and re-propose (verify_dflash_step)
+/// call sites so tests exercise the production decision directly.
+pub(super) fn dspark_proposal_failure_fails_closed(is_lightning_product: bool) -> bool {
+    is_lightning_product
+}
+
+/// The single production action every DSpark proposal-failure call site
+/// (serial bootstrap, serial re-propose, batched propose arms) routes
+/// through: for a Lightning product, mark the sequence with the
+/// client-visible truncation guard and finish it; generic DFlash/MTP is
+/// untouched (returns false). Executable regression tests drive THIS
+/// function, so a call site that stops routing here loses its pin.
+pub(super) fn fail_dspark_product_sequence_closed(
+    model: &dyn spark_model::traits::Model,
+    seq_slot: usize,
+    guard_stop: &mut Option<&'static str>,
+    finished: &mut bool,
+    site: &str,
+) -> bool {
+    if !dspark_proposal_failure_fails_closed(model.is_lightning_dspark_product()) {
+        return false;
+    }
+    tracing::error!("Lightning DSpark proposal failure ({site}) slot={seq_slot}");
+    *guard_stop = Some(crate::scheduler::types::GUARD_STOP_DSPARK_PRODUCT_FAIL_CLOSED);
+    *finished = true;
+    true
+}
+
+/// Production branch handler for the serial-bootstrap proposal outcomes
+/// (`mtp_step`): the Ok(empty) and Err arms route here. Returns true when
+/// the sequence was fail-closed (caller must `continue`); generic models
+/// return false and keep the legacy fall-through to standalone decode.
+pub(super) fn handle_dspark_bootstrap_proposal_failure(
+    model: &dyn spark_model::traits::Model,
+    a: &mut super::types::ActiveSeq,
+    outcome: ProposalOutcome,
+) -> bool {
+    let site = match outcome {
+        ProposalOutcome::Empty => "bootstrap propose returned empty",
+        ProposalOutcome::Error => "bootstrap propose errored",
+    };
+    fail_dspark_product_sequence_closed(
+        model,
+        a.seq.slot_idx,
+        &mut a.guard_stop,
+        &mut a.finished,
+        site,
+    )
+}
+
+/// Production branch handler for the serial re-propose outcomes
+/// (`verify_dflash_step`).
+pub(super) fn handle_dspark_repropose_failure(
+    model: &dyn spark_model::traits::Model,
+    a: &mut super::types::ActiveSeq,
+    outcome: ProposalOutcome,
+) -> bool {
+    let site = match outcome {
+        ProposalOutcome::Empty => "re-propose returned empty",
+        ProposalOutcome::Error => "re-propose errored",
+    };
+    fail_dspark_product_sequence_closed(
+        model,
+        a.seq.slot_idx,
+        &mut a.guard_stop,
+        &mut a.finished,
+        site,
+    )
+}
+
+/// Production branch handler for the batched proposal outcomes
+/// (`verify_dflash_batch_step`): per-slot empty results, batched
+/// Ok(None)/Err, fallback empty/error, and single-pending outcomes.
+pub(super) fn handle_dspark_batched_proposal_failure(
+    model: &dyn spark_model::traits::Model,
+    a: &mut super::types::ActiveSeq,
+    site: &'static str,
+) -> bool {
+    fail_dspark_product_sequence_closed(
+        model,
+        a.seq.slot_idx,
+        &mut a.guard_stop,
+        &mut a.finished,
+        site,
+    )
+}
+
+/// The two proposal-failure outcome shapes every call site distinguishes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ProposalOutcome {
+    Empty,
+    Error,
 }

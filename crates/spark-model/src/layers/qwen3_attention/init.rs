@@ -118,6 +118,7 @@ impl Qwen3AttentionLayer {
             sliding_window: None,
             rope_theta_override: None,
             rotary_dim_override: None,
+            rope_disabled: false,
             rope_proportional: false,
             attn_scale_override: None,
             k_eq_v: false,

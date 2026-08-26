@@ -22,6 +22,7 @@ use super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
+use crate::layers::dflash_head::{DflashProposerState, SequenceGeneration};
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
@@ -40,17 +41,22 @@ impl TransformerModel {
             Some(p) => p.as_ref(),
             None => return Ok(Vec::new()),
         };
-        // ATLAS_DFLASH_DEBUG_DUMP_FULL=1: emit the full token sequence
-        // ONCE so a Python reference can run the SAME tokens through HF
+        // ATLAS_DFLASH_DEBUG_DUMP_FULL: emit the full token sequence ONCE
+        // so a Python reference can run the SAME tokens through HF
         // transformers and dump matching hidden-state captures.
         // Per-model latch: a static would let the previous model swallow this
-        // one's dump. Env first, so a disabled dump never burns the shot.
-        if std::env::var("ATLAS_DFLASH_DEBUG_DUMP_FULL")
-            .ok()
-            .as_deref()
-            == Some("1")
-            && self.stats.dumped.keyed("dump:dflash_tokens")
-        {
+        // one's dump. DFlash proposers carry the startup-frozen switch; other
+        // proposers keep the legacy environment read (diagnostic-only).
+        let dump_full = proposer
+            .startup_diagnostics()
+            .map(|diagnostics| diagnostics.dump_full)
+            .unwrap_or_else(|| {
+                std::env::var("ATLAS_DFLASH_DEBUG_DUMP_FULL")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            });
+        if dump_full && self.stats.dumped.keyed("dump:dflash_tokens") {
             let tokens_json = serde_json::json!({
                 "prompt_len": position - seq.tokens.len() + seq.tokens.len(),
                 "position": position,
@@ -99,6 +105,7 @@ impl TransformerModel {
         // sequence: whole-prompt prefill on a COLD turn, carried rows + a
         // short append on a WARM one. See `ensure_drafter_context`.
         self.ensure_drafter_context(proposer, seq, &ctx, stream);
+        let expected_owner = seq.expected_dspark_owner()?;
         let prop_state = seq
             .proposer_state
             .as_mut()
@@ -232,6 +239,7 @@ impl TransformerModel {
             position,
             num_drafts,
             prop_state.as_mut(),
+            Some(expected_owner),
             &ctx,
             stream,
             draft_embed_target,
@@ -255,219 +263,11 @@ impl TransformerModel {
                 "MTP draft skipped: chain confidence {conf:.3} < tau {tau:.3}                  (pos {position}, {} drafts trimmed)",
                 drafts.len(),
             );
-            proposer.after_verify(0, prop_state.as_mut(), stream)?;
+            proposer.after_verify(0, Some(expected_owner), prop_state.as_mut(), stream)?;
             return Ok(Vec::new());
         }
         Ok(drafts)
     }
 
     // Proposer-wiring accessors live in impl_b3_accessors.rs (500-LoC cap).
-
-    /// DFlash prefill capture: copy `proc_count` tokens × hidden_size BF16
-    /// from `self.buffers.hidden_states()` (filled by the just-completed
-    /// prefill layer) into the per-sequence DFlash accumulator. Called
-    /// inside the prefill layer loop after each layer. No-op when:
-    ///   - DFlash is disabled (capture_layers empty)
-    ///   - `layer_idx` is not in `dflash_capture_layers`
-    ///   - The seq has no `DflashProposerState`
-    ///   - Rank > 0 under EP/TP (drafter is rank-0 only)
-    ///
-    /// Layout: writes `hidden[t]` BF16 into
-    /// `acc[(chunk_start + t) * 5 * h + slot_idx * h]` for each t.
-    /// Per-layer call performs `proc_count` strided d2d_async copies —
-    /// at typical prefill of 128–4096 tokens × 5 capture layers, total
-    /// 640–20480 launches per prefill. Acceptable launch overhead for
-    /// first land; replace with a strided-scatter kernel if profiling
-    /// shows it's a bottleneck.
-    pub(super) fn try_dflash_prefill_capture_layer(
-        &self,
-        seq: &mut crate::traits::SequenceState,
-        layer_idx: usize,
-        chunk_start: usize,
-        proc_count: usize,
-        stream: u64,
-    ) -> Result<()> {
-        if self.dflash_capture_layers.is_empty() {
-            return Ok(());
-        }
-        let slot_idx = match self
-            .dflash_capture_layers
-            .iter()
-            .position(|&l| l == layer_idx)
-        {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        if let Some(ref c) = self.comm
-            && c.rank() != 0
-        {
-            return Ok(());
-        }
-        let dstate = match seq.proposer_state.as_mut() {
-            Some(ps) => match ps
-                .as_any_mut()
-                .downcast_mut::<crate::layers::DflashProposerState>()
-            {
-                Some(s) => s,
-                None => return Ok(()),
-            },
-            None => return Ok(()),
-        };
-        let h = self.config.hidden_size;
-        let bf16 = 2usize;
-        let n_capture = self.dflash_capture_layers.len();
-        let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
-        let src_base = self.buffers.hidden_states();
-        for t in 0..proc_count {
-            let abs_pos = chunk_start + t;
-            if abs_pos >= max_ctx {
-                break; // accumulator full; drop later positions
-            }
-            let src = src_base.offset(t * h * bf16);
-            let dst_offset = abs_pos * n_capture * h * bf16 + slot_idx * h * bf16;
-            self.gpu
-                .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
-        }
-        Ok(())
-    }
-
-    /// After prefill completes, advance the seq's DFlash `ctx_len` to
-    /// `chunk_start + proc_count` so the drafter sees all captured prompt
-    /// positions on the first propose() call.
-    pub(super) fn update_dflash_ctx_len_after_prefill(
-        &self,
-        seq: &mut crate::traits::SequenceState,
-        chunk_start: usize,
-        proc_count: usize,
-    ) -> Result<()> {
-        if self.dflash_capture_layers.is_empty() {
-            return Ok(());
-        }
-        if let Some(ref c) = self.comm
-            && c.rank() != 0
-        {
-            return Ok(());
-        }
-        if let Some(ps) = seq.proposer_state.as_mut()
-            && let Some(dstate) = ps
-                .as_any_mut()
-                .downcast_mut::<crate::layers::DflashProposerState>()
-        {
-            let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
-            dstate.ctx_len = new_len;
-            // Phase I (v2): seed per-slot fixed positions for the prompt
-            // captures. Prefill slot i holds prompt position i, so the
-            // fixed rope position is simply its index. Keep parallel to
-            // ctx_len. Re-seed idempotently across prefill chunks.
-            dstate.ctx_positions = (0..new_len).map(|i| i as i32).collect();
-        }
-        Ok(())
-    }
-
-    /// DFlash 5-layer hidden capture. Called inside each per-layer loop after
-    /// `layer.decode(...)` returns. No-op when DFlash is disabled (the buffer
-    /// is `None`) or when `layer_idx` is not in `dflash_capture_layers`.
-    ///
-    /// Captures only the latest-decoded-token's hidden, matching the
-    /// `save_hidden_for_mtp` semantics. The `token_idx` argument selects
-    /// which row of `self.buffers.hidden_states()` to read — pass 0 for the
-    /// single-token decode path.
-    ///
-    /// Under EP/TP world > 1: only rank 0 owns the drafter (replicated, not
-    /// sharded — same pattern as MTP under EP — see model.rs:7232 comment),
-    /// so non-rank-0 ranks skip the capture. The captured hiddens are
-    /// post-TP-allreduce so semantically correct on rank 0.
-    pub(super) fn try_dflash_capture(
-        &self,
-        layer_idx: usize,
-        token_idx: usize,
-        stream: u64,
-    ) -> Result<()> {
-        let dst = match self.dflash_hidden_save {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        // Rank-0 gate (mirrors save_hidden_for_mtp's effective behavior).
-        if let Some(ref c) = self.comm
-            && c.rank() != 0
-        {
-            return Ok(());
-        }
-        let slot = match self
-            .dflash_capture_layers
-            .iter()
-            .position(|&l| l == layer_idx)
-        {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        let h = self.config.hidden_size;
-        let bf16 = 2usize;
-        // The residual stream is always BF16, so DFlash hidden capture
-        // copies BF16 bytes directly with no downcast.
-        let src = self.buffers.hidden_states().offset(token_idx * h * bf16);
-        let dst_slot = dst.offset(slot * h * bf16);
-        self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
-        Ok(())
-    }
-
-    /// Capture `hidden_states[token_idx]` for every DFlash capture layer into
-    /// `dflash_hidden_save`. Called from `verify_dflash_step` after the Phase 3
-    /// D2H sync, so `token_idx` is the confirmed bonus position. Runs outside
-    /// the CUDA graph so the correct accept-prefix position can be used.
-    pub(super) fn save_dflash_hidden_dispatch(&self, token_idx: usize, stream: u64) -> Result<()> {
-        for &layer_idx in &self.dflash_capture_layers {
-            self.try_dflash_capture(layer_idx, token_idx, stream)?;
-        }
-        Ok(())
-    }
-
-    /// K=gamma EAGLE capture: copy the per-layer hidden of ALL `k` verify rows into
-    /// the row-major `dflash_hidden_save` ([row0 | row1 | ... ], each row =
-    /// n_capture * hidden_size * bf16). Called once per capture layer inside the
-    /// verify graph (k is fixed per captured graph). After verify, the scheduler
-    /// appends rows 0..=num_accepted to ctx so every committed position gets its
-    /// target hidden (fixes the ctx-undercount) and the bonus generator (row
-    /// num_accepted) is the freshest slot (EAGLE). No-op unless DFlash is on,
-    /// this layer is a capture layer, and rank 0.
-    pub(super) fn try_dflash_capture_all(
-        &self,
-        layer_idx: usize,
-        k: usize,
-        stream: u64,
-    ) -> Result<()> {
-        let dst = match self.dflash_hidden_save {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        if let Some(ref c) = self.comm
-            && c.rank() != 0
-        {
-            return Ok(());
-        }
-        let slot = match self
-            .dflash_capture_layers
-            .iter()
-            .position(|&l| l == layer_idx)
-        {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        let h = self.config.hidden_size;
-        let bf16 = 2usize;
-        let ctx_slot_bytes = self.dflash_capture_layers.len() * h * bf16;
-        let kmax = self.dflash_hidden_save_rows;
-        debug_assert!(
-            k <= kmax,
-            "try_dflash_capture_all: k={k} exceeds dflash_hidden_save_rows={kmax}"
-        );
-        let k_capped = k.min(kmax);
-        for t in 0..k_capped {
-            let src = self.buffers.hidden_states().offset(t * h * bf16);
-            let dst_slot = dst.offset(t * ctx_slot_bytes + slot * h * bf16);
-            self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
-        }
-        Ok(())
-    }
 }

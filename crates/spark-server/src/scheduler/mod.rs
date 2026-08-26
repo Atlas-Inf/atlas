@@ -25,6 +25,8 @@ mod emit_step;
 mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;
+#[cfg(test)]
+mod dspark_fail_closed_tests;
 mod helpers;
 mod lifecycle;
 #[cfg(test)]
@@ -67,6 +69,7 @@ mod test_support;
 #[cfg(test)]
 mod think_skip_tests;
 mod types;
+mod verify_dflash_batch_step;
 mod verify_dflash_step;
 mod verify_k2_step;
 mod verify_k3_step;
@@ -103,6 +106,7 @@ use sample_step::*;
 use spec_step::*;
 use ssm_decode_ring::SsmDecodeRing;
 use types::*;
+use verify_dflash_batch_step::*;
 use verify_dflash_step::*;
 use verify_k2_step::*;
 use verify_k3_step::*;

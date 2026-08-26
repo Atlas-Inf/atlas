@@ -87,6 +87,8 @@ pub fn step_mtp(
         step_mtp_bootstrap_batched(model, active, sched, &bootstrap_idxs, ladder_nd, verify_ctx);
         bootstrap_idxs.clear();
     }
+    let mut late_dflash: Vec<usize> = Vec::new();
+    let n_active = active.len();
     for &idx in &bootstrap_idxs {
         let a = &mut active[idx];
 
@@ -119,7 +121,26 @@ pub fn step_mtp(
                 _gmask.as_deref(),
             ) {
                 Ok(init) if !init.is_empty() => {
-                    if eff >= 3 && init.len() >= 3 {
+                    // n>=2: do not verify here. Stash drafts so Phase B can
+                    // run one decode_verify_batched over every ready seq.
+                    // In-loop step_verify_dflash left only 1 seq with drafts
+                    // (shared propose scratch / graph) and never hit Phase B.
+                    if n_active >= 2 && !dspark_batch_verify_disabled() {
+                        a.pending_drafts = init;
+                        late_dflash.push(idx);
+                        continue;
+                    }
+                    if dflash_verify_raw_argmax {
+                        step_verify_dflash(
+                            model,
+                            a,
+                            sched,
+                            &init,
+                            num_drafts,
+                            verify_ctx,
+                            dflash_verify_raw_argmax,
+                        );
+                    } else if eff >= 3 && init.len() >= 3 {
                         step_verify_k4(
                             model,
                             a,
@@ -154,16 +175,39 @@ pub fn step_mtp(
                 }
                 Ok(_) => {
                     tracing::warn!(
-                        "DFlash bootstrap propose returned empty; falling back to standalone decode"
+                        "DFlash bootstrap propose returned empty slot={} seq_len={}",
+                        a.seq.slot_idx,
+                        a.seq.seq_len
                     );
+                    // Lightning product fail-closed boundary: an empty
+                    // product proposal is an admission violation, not a
+                    // silent no-spec fallback. Generic DFlash/MTP keeps the
+                    // legacy fall-through below. The guard marker makes the
+                    // truncation client-visible ("length" family), never a
+                    // natural "stop".
+                    if crate::scheduler::helpers::handle_dspark_bootstrap_proposal_failure(
+                        model,
+                        a,
+                        crate::scheduler::helpers::ProposalOutcome::Empty,
+                    ) {
+                        continue;
+                    }
                 }
                 Err(e) => {
                     tracing::error!("DFlash bootstrap propose: {e:#}");
+                    if crate::scheduler::helpers::handle_dspark_bootstrap_proposal_failure(
+                        model,
+                        a,
+                        crate::scheduler::helpers::ProposalOutcome::Error,
+                    ) {
+                        continue;
+                    }
                 }
             }
             // Rare fallback: propose failed or returned empty (e.g. drafter not
             // yet primed). Fall through to the standalone decode below so the
-            // sequence emits its next token rather than stalling.
+            // sequence emits its next token rather than stalling. Never
+            // reached for the Lightning product (handled above).
         }
 
         // Non-DFlash path (or DFlash-propose fallback): EP broadcast + standalone decode.
@@ -326,6 +370,7 @@ pub fn step_mtp(
             tracing::error!("bootstrap start_checkpoint_async: {e:#}");
         }
     }
+    verify_idxs.extend(late_dflash);
 
     // ── Phase B: Verify with pipelined checkpoint ──
     //
@@ -334,18 +379,25 @@ pub fn step_mtp(
     // puts >= 2 verify-ready sequences in one step (`ATLAS_MTP_MAX_SEQS=1`
     // ⇒ this partition is a no-op and every seq takes the per-seq loop
     // below, byte-identical to the pre-batched HEAD). Batchable =
-    // grammarless, non-DFlash, >= ladder_nd pending drafts (surplus from a
-    // ladder step-down is truncated — the same draft-tail truncation the
-    // grammar-boundary path already does; `after_verify`'s
-    // `last_num_drafted` trim contract stays consistent). The model
-    // additionally self-gates (non-EP, non-HSS, no LoRA) via
-    // `can_batch_verify(&ks)`. Kill switch `ATLAS_NO_MTP_BATCH_VERIFY`
-    // (PRESENCE check) forces the serialized loop for A/B.
+    // Batchable = grammarless, >= ladder_nd pending drafts. DSpark is
+    // included unless ATLAS_NO_DFLASH_BATCH_VERIFY (presence). MTP still
+    // uses !dflash via the model self-gate (`dflash_hidden_save`).
     let mut serial_idxs: Vec<usize> = Vec::new();
     let mut batchable_idxs: Vec<usize> = Vec::new();
+    let dspark_batch_ok = !dflash_verify_raw_argmax || !dspark_batch_verify_disabled();
+    if active.len() > 1 {
+        tracing::info!(
+            "DFLASH WIDTH n_active={} verify={} boot={} dspark_batch_ok={} ladder_nd={}",
+            active.len(),
+            verify_idxs.len(),
+            bootstrap_idxs.len(),
+            dspark_batch_ok,
+            ladder_nd
+        );
+    }
     if verify_idxs.len() >= 2
         && spark_model::speculative::mtp_multi_seq_mode()
-        && !dflash_verify_raw_argmax
+        && dspark_batch_ok
         && !batch_verify_disabled()
         && ladder_nd >= 1
     {
@@ -375,7 +427,16 @@ pub fn step_mtp(
     // the D-Cut-at-depth policy: pruning the 16:2 rung's n=16 measured -9%)
     // ⇒ `ks` is the uniform ladder shape and everything below reduces to the
     // pre-D-Cut path exactly.
-    let ks = mtp_dcut::plan(active, &mut batchable_idxs, ladder_nd, rows);
+    // DSpark's release contract is fixed K=3 at every width. D-Cut changes a
+    // sequence's verifier width from K+1=4 to 2/3 rows, which selects different
+    // native attention/LM dispatch shapes and is not greedy-equivalent to the
+    // C1 K=4 control. Keep DSpark uniform; D-Cut remains available to ordinary
+    // MTP where its width-specific quality/performance evidence applies.
+    let ks = if dflash_verify_raw_argmax {
+        vec![rows; batchable_idxs.len()]
+    } else {
+        mtp_dcut::plan(active, &mut batchable_idxs, ladder_nd, rows)
+    };
     // The width the ASSIGNMENT was gated on (`plan` reorders `batchable_idxs`,
     // never resizes it): the per-chunk re-ordering below must ask the gate with
     // THIS width, never the chunk's, or a chunked batch could take the opposite
@@ -456,7 +517,19 @@ pub fn step_mtp(
                         .expect("verify_batch_permutation is a permutation")
                 })
                 .collect();
-            step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
+            if dflash_verify_raw_argmax {
+                step_verify_dflash_batched(
+                    model,
+                    &mut batch,
+                    sched,
+                    &sorted_ks,
+                    ladder_nd,
+                    verify_ctx,
+                    dflash_verify_raw_argmax,
+                );
+            } else {
+    step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
+            }
         } else {
             // Model can't batch this width (or a lone leftover): fall back
             // to the existing per-seq dispatch for these sequences.
@@ -492,12 +565,10 @@ pub fn step_mtp(
             }
         }
 
-        // DFlash γ-block drafters return ≥4 drafts per step (γ=16 typical).
-        // The K=2/3/4 graphed paths are MTP-shaped and don't generalize past
-        // K=4 cleanly, so γ-block verify routes through `step_verify_dflash`.
-        // MTP keeps using the existing graphed paths; this dispatch is purely
-        // additive.
-        if drafts.len() >= 4 {
+        // DFlash/DSpark verify: route by proposer, not draft count.
+        // `--dflash` sets dflash_verify_raw_argmax. The old `drafts.len()>=4`
+        // ladder sent K=3 (`--dflash-gamma 4`) into MTP K=3 verify.
+        if dflash_verify_raw_argmax || drafts.len() >= 4 {
             step_verify_dflash(
                 model,
                 a,

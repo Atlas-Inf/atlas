@@ -8,7 +8,15 @@ use spark_runtime::kv_cache::PagedKvCache;
 
 use super::NemotronMamba2Layer;
 use crate::layer::{ForwardContext, LayerState, SsmLayerState, TransformerLayer};
-use crate::layers::ops;
+use crate::layers::{nemotron_decode_policy, ops};
+
+fn use_batched_mamba_verify(
+    num_tokens: usize,
+    lightning_exact: bool,
+    fused_not_disabled: bool,
+) -> bool {
+    num_tokens > 1 && !lightning_exact && fused_not_disabled
+}
 
 impl TransformerLayer for NemotronMamba2Layer {
     fn decode(
@@ -196,6 +204,134 @@ impl TransformerLayer for NemotronMamba2Layer {
         Ok(())
     }
 
+    fn decode_batched(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if use_batched_mamba_verify(
+            num_tokens,
+            ctx.levers.lightning_mamba_exact_recurrence,
+            std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err(),
+        ) {
+            return self.decode_batched_verify(hidden, residual, num_tokens, state, ctx, stream);
+        }
+        let h = ctx.config.hidden_size;
+        let h_bytes = ctx.config.ssm_h_state_bytes();
+        let conv_bytes = ctx.config.ssm_conv_state_bytes();
+        for t in 0..num_tokens {
+            let offset = t * h * 2;
+            self.decode(
+                hidden.offset(offset),
+                residual.offset(offset),
+                state,
+                kv_cache,
+                seq_len + t,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                ctx,
+                stream,
+            )?;
+            // MTP reject rewinds to intermediate[num_accepted-1]. Qwen GDN
+            // writes those inside the fused kernel; Mamba-2 decode does not.
+            // Snapshot after every token except the last (full-accept keeps
+            // live h_state). Skip when the slot has no MTP intermediates.
+            if t + 1 < num_tokens {
+                let ssm = state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
+                if t < ssm.h_state_intermediates.len() && t < ssm.conv_state_intermediates.len() {
+                    ctx.gpu.copy_d2d_async(
+                        ssm.h_state,
+                        ssm.h_state_intermediates[t],
+                        h_bytes,
+                        stream,
+                    )?;
+                    ctx.gpu.copy_d2d_async(
+                        ssm.conv_state,
+                        ssm.conv_state_intermediates[t],
+                        conv_bytes,
+                        stream,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_verify_multi<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        n_seqs: usize,
+        ks: &[usize],
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _wy_tables: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_verify_multi_loop(hidden, residual, n_seqs, ks, states, _kv_cache, ctx, stream)
+    }
+
+    fn decode_multi_seq<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _seq_lens: &[usize],
+        _block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // AR C>1: batched in/out projection is the production default for
+        // both hybrid mixers. Set ATLAS_LIGHTNING_DECODE_MULTI=0 for the
+        // serial diagnostic fallback; component values are narrow overrides.
+        if nemotron_decode_policy::decode_multi_seq_batched(
+            std::env::var("ATLAS_LIGHTNING_DECODE_MULTI")
+                .ok()
+                .as_deref(),
+            std::env::var("ATLAS_LIGHTNING_MAMBA_MULTI").ok().as_deref(),
+        ) {
+            self.decode_multi_seq_ar(hidden, residual, num_seqs, states, ctx, stream)
+        } else {
+            // Default serial diagnostic path: one per-sequence decode().
+            let h = ctx.config.hidden_size;
+            for i in 0..num_seqs {
+                let offset = i * h * 2;
+                let mut bt = _block_tables[i].clone();
+                let mut stub_disk = Vec::<u32>::new();
+                let mut stub_off = Vec::<u32>::new();
+                self.decode(
+                    hidden.offset(offset),
+                    residual.offset(offset),
+                    states[i],
+                    _kv_cache,
+                    _seq_lens[i],
+                    &mut bt,
+                    &mut stub_disk,
+                    &mut stub_off,
+                    ctx,
+                    stream,
+                )?;
+            }
+            Ok(())
+        }
+    }
+
     fn prefill(
         &self,
         hidden: DevicePtr,
@@ -231,5 +367,18 @@ impl TransformerLayer for NemotronMamba2Layer {
             // refuses a non-GDN SSM stack), so this state is always FP32-wide.
             h_prefill_stage: None,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_batched_mamba_verify;
+
+    #[test]
+    fn lightning_exact_routes_every_mamba_stage_through_literal_m1_decode() {
+        assert!(!use_batched_mamba_verify(4, true, true));
+        assert!(use_batched_mamba_verify(4, false, true));
+        assert!(!use_batched_mamba_verify(1, false, true));
+        assert!(!use_batched_mamba_verify(4, false, false));
     }
 }

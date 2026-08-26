@@ -17,7 +17,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::Qwen3AttentionLayer;
-use crate::layer::{ForwardContext, LayerState};
+use crate::layer::{ForwardContext, LayerState, TransformerLayer};
 use crate::layers::ops;
 
 mod attn;
@@ -41,7 +41,35 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let _ = states; // Attention layers use EmptyLayerState — no per-seq state.
+        // Nemotron-H attention is RoPE-disabled and uses BF16 projections. The
+        // diagnostic serial arm localizes C>1 tensor-core accumulation drift
+        // without changing Qwen/MLA paths.
+        if nemotron_attention_serial(
+            self.rope_disabled,
+            std::env::var("ATLAS_LIGHTNING_ATTN_SERIAL").ok().as_deref(),
+        ) {
+            let h = ctx.config.hidden_size;
+            let bf16 = 2usize;
+            for i in 0..num_seqs {
+                let mut block_table = _block_tables[i].clone();
+                let mut disk_blocks = Vec::new();
+                let mut disk_offsets = Vec::new();
+                self.decode(
+                    hidden.offset(i * h * bf16),
+                    residual.offset(i * h * bf16),
+                    states[i],
+                    kv_cache,
+                    _seq_lens[i],
+                    &mut block_table,
+                    &mut disk_blocks,
+                    &mut disk_offsets,
+                    ctx,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        let _ = states; // Batched attention uses no per-seq layer state.
         let bs = kv_cache.block_size() as u32;
         let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
         // Per-request LoRA routing slot buffer for this step (from metadata).
@@ -426,5 +454,24 @@ impl Qwen3AttentionLayer {
         }
 
         Ok(())
+    }
+}
+
+fn nemotron_attention_serial(rope_disabled: bool, value: Option<&str>) -> bool {
+    rope_disabled && matches!(value, Some("1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nemotron_attention_serial;
+
+    #[test]
+    fn serial_attention_is_exact_opt_in_for_rope_disabled_layers() {
+        assert!(!nemotron_attention_serial(false, None));
+        assert!(!nemotron_attention_serial(false, Some("1")));
+        assert!(!nemotron_attention_serial(true, None));
+        assert!(!nemotron_attention_serial(true, Some("0")));
+        assert!(!nemotron_attention_serial(true, Some("true")));
+        assert!(nemotron_attention_serial(true, Some("1")));
     }
 }

@@ -180,6 +180,9 @@ extern "C" __global__ void KERNEL_NAME(
     const unsigned int batch_size,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ kv_lens,
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    const unsigned int* __restrict__ batch_indirect_args,
+#endif
 #else
     const int* __restrict__ block_table,
 #endif
@@ -212,7 +215,16 @@ extern "C" __global__ void KERNEL_NAME(
     }
     if (kv_lens != nullptr) {
         kv_len = (unsigned int)kv_lens[b];
+        // Under VARLEN the query block is the suffix of this stream's KV
+        // extent; derive its causal/cache offset per stream.
+        if (cu_seqlens != nullptr && kv_len >= q_len_eff) {
+            q_offset = kv_len - q_len_eff;
+        }
     }
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    kv_len = batch_indirect_args[b * 3];
+    q_offset = batch_indirect_args[b * 3 + 1];
+#endif
 #else
     const unsigned int q_len_eff = q_len;
 #endif
@@ -260,7 +272,9 @@ extern "C" __global__ void KERNEL_NAME(
     // (DFlash) declares it in KERNEL_PREAMBLE from a device u32 (= true decode
     // position, decoupled from cache-slot base). All other variants: equals
     // q_offset (correct for causal attention where RoPE pos == cache base).
-#ifndef Q_ROPE_POS_OVERRIDE
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+#elif !defined(Q_ROPE_POS_OVERRIDE)
     unsigned int q_rope_pos = q_offset;
 #endif
 
@@ -564,6 +578,36 @@ extern "C" __global__ void KERNEL_NAME(
         __syncthreads();
     }
 
+#ifdef ATLAS_ATTN_SINKS
+    if (sinks != nullptr) {
+        float sg = __bfloat162float(sinks[q_head]);
+        unsigned int r0s = pv_warp_m + group_id, r1s = r0s + 8;
+        float eo0, eo1;
+        if (warp_id < 2) {
+            float mn0 = fmaxf(m_r0, sg);
+            eo0 = __expf(m_r0 - mn0);
+            l_r0 = l_r0 * eo0 + __expf(sg - mn0);
+            float mn1 = fmaxf(m_r1, sg);
+            eo1 = __expf(m_r1 - mn1);
+            l_r1 = l_r1 * eo1 + __expf(sg - mn1);
+        } else {
+            float cm0 = smem_ml[r0s][0], cl0 = smem_ml[r0s][1];
+            float mn0 = fmaxf(cm0, sg);
+            eo0 = __expf(cm0 - mn0);
+            smem_ml[r0s][1] = cl0 * eo0 + __expf(sg - mn0);
+            float cm1 = smem_ml[r1s][0], cl1 = smem_ml[r1s][1];
+            float mn1 = fmaxf(cm1, sg);
+            eo1 = __expf(cm1 - mn1);
+            smem_ml[r1s][1] = cl1 * eo1 + __expf(sg - mn1);
+        }
+        #pragma unroll
+        for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
+            acc_o[nt][0] *= eo0; acc_o[nt][1] *= eo0;
+            acc_o[nt][2] *= eo1; acc_o[nt][3] *= eo1;
+        }
+    }
+#endif
+
     // === Final normalization and store ===
     {
         unsigned int r0=pv_warp_m+group_id, r1=r0+8;
@@ -651,6 +695,9 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const unsigned int batch_size,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ kv_lens,
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    const unsigned int* __restrict__ batch_indirect_args,
+#endif
 #else
     const int* __restrict__ block_table,
 #endif
@@ -682,7 +729,16 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     }
     if (kv_lens != nullptr) {
         kv_len = (unsigned int)kv_lens[b];
+        // Under VARLEN the query block is the suffix of this stream's KV
+        // extent; derive its causal/cache offset per stream.
+        if (cu_seqlens != nullptr && kv_len >= q_len_eff) {
+            q_offset = kv_len - q_len_eff;
+        }
     }
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    kv_len = batch_indirect_args[b * 3];
+    q_offset = batch_indirect_args[b * 3 + 1];
+#endif
 #else
     const unsigned int q_len_eff = q_len;
 #endif
@@ -723,7 +779,9 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     // (DFlash) declares it in KERNEL_PREAMBLE from a device u32 (= true decode
     // position, decoupled from cache-slot base). All other variants: equals
     // q_offset (correct for causal attention where RoPE pos == cache base).
-#ifndef Q_ROPE_POS_OVERRIDE
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+#elif !defined(Q_ROPE_POS_OVERRIDE)
     unsigned int q_rope_pos = q_offset;
 #endif
 

@@ -169,16 +169,12 @@ impl TransformerModel {
         // allocate K snapshots per slot; the H pools allocate K-1 (index
         // K-1 is never written or read — see ssm_reserve) and tier by slot.
         // For MTP K=2/3/4 verify: K = num_drafts + 1.
-        // For DFlash K=γ verify: K = γ + 1 (drafter's γ drafts + 1 verified bonus slot).
-        // Pool size = max of both so DFlash and MTP can coexist on the same model.
-        let dflash_kgamma = if !config.dflash_capture_layers.is_empty() {
-            // Drafter's γ is fixed in dflash config; use the largest known γ
-            // (16 for `Qwen3.6-DFlash`). The +1 is the prefix bonus position
-            // in the verify input `[last_token, draft_0, ..., draft_{γ-1}]`.
-            17
-        } else {
-            0
-        };
+        // For DFlash/DSpark, verify rows are `[last_token, draft_1, ..., draft_K]`:
+        // exactly `num_drafts + 1`. The anchor bonus is not a draft row.
+        let dflash_kgamma = super::dspark_pool::dflash_verify_rows(
+            !config.dflash_capture_layers.is_empty(),
+            num_drafts,
+        )?;
         // DFlash needs the SSM verify pools regardless of MTP weight presence
         // or lm_head quantization — its K=γ verify path checkpoints SSM state
         // for partial-accept rollback. Force `has_mtp` on whenever DFlash is
@@ -386,16 +382,13 @@ impl TransformerModel {
         // the K-vs-batch ladder envelope, SSOT in `crate::layer`). Only
         // meaningful with an MTP proposer — NULL otherwise (the batched
         // verify path self-gates on it via can_batch_verify).
-        let verify_hidden_stash = if proposer.is_some() {
-            gpu.alloc(crate::layer::VERIFY_WY_TABLE_SEQS * config.hidden_size * 2)?
-        } else {
-            DevicePtr::NULL
-        };
-        // Batched-verify WY pointer-table staging (fixed address for CUDA
-        // graph stability; contents refreshed pre-graph every batched verify
-        // step). One [h|Hi0|Hi1|Hi2] x 4-entry slice per GDN layer — ~6 KB.
-        // NULL without an MTP proposer or on non-SSM models (path self-gates).
-        let verify_wy_tables = if proposer.is_some() && config.num_ssm_layers() > 0 {
+        // Always allocate: DSpark is attached after construct on Lightning, so
+        // `proposer.is_some()` here is often false and used to leave the stash
+        // NULL — which made can_batch_verify refuse N-seq DSpark. 32×H BF16
+        // is ~168 KB.
+        let verify_hidden_stash =
+            gpu.alloc(crate::layer::VERIFY_WY_TABLE_SEQS * config.hidden_size * 2)?;
+        let verify_wy_tables = if config.num_ssm_layers() > 0 {
             let bytes = config.num_ssm_layers() * crate::layer::VERIFY_WY_LAYER_STRIDE_BYTES;
             let buf = gpu.alloc(bytes)?;
             gpu.memset(buf, 0, bytes)?;
@@ -462,15 +455,44 @@ impl TransformerModel {
         } else {
             dflash_kgamma.max(2)
         };
+        let dflash_hidden_save_nseq = if dflash_capture_layers.is_empty() {
+            0
+        } else {
+            max_batch_size.max(1)
+        };
         let dflash_hidden_save = if dflash_capture_layers.is_empty() {
             None
         } else {
             let n = dflash_capture_layers.len();
-            // Row-major K-row buffer: [row0 | row1 | ... | row_{KMAX-1}], each row =
-            // n_capture * hidden_size * bf16. Rows 0/1 keep their legacy offsets
-            // (0 and ctx_slot_bytes) so all K=2 readers (propose row 0,
-            // dflash_accept_append row 1) are unaffected.
-            Some(gpu.alloc(dflash_hidden_save_rows * n * config.hidden_size * 2)?)
+            // One extra sequence-sized region is a preservation slot for the
+            // C=1 front while batched commit_ctx temporarily packs seq 1..N
+            // into that front. Without it, the final pack overwrites seq 0's
+            // capture before batched re-propose and poisons the next turn.
+            let save = gpu.alloc(
+                (dflash_hidden_save_nseq + 1)
+                    * dflash_hidden_save_rows
+                    * n
+                    * config.hidden_size
+                    * 2,
+            )?;
+            // C1 fix: the batched propose reads each seq's region at the
+            // accepted row. Before a seq's own verify has written its region
+            // (first propose, or batch positions past the previous batch's
+            // width), that memory is allocator garbage — every extra seq's
+            // first ctx append absorbed wild values and its drafts diverged
+            // from the seq-0 region (which held real previous-seq data).
+            // Zero once at construction: a blank first ctx slot is benign
+            // (the C1 path appends a stale-but-real slot and works).
+            gpu.memset(
+                save,
+                0,
+                (dflash_hidden_save_nseq + 1)
+                    * dflash_hidden_save_rows
+                    * n
+                    * config.hidden_size
+                    * 2,
+            )?;
+            Some(save)
         };
 
         // EP command buffer for token broadcast (4 bytes, u32)
@@ -743,6 +765,7 @@ impl TransformerModel {
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,
+            lightning_dspark_identity: Default::default(),
             mtp_hidden_save,
             verify_hidden_stash,
             mtp_catchup_ring,
@@ -755,10 +778,12 @@ impl TransformerModel {
             },
             mtp_prefill_capture_len: std::sync::atomic::AtomicUsize::new(0),
             mtp_prefill_capture_gen: std::sync::atomic::AtomicU64::new(0),
+            dspark_sequence_generation: std::sync::atomic::AtomicU64::new(0),
             mtp_carry: parking_lot::Mutex::new(None),
             mtp_store_range: parking_lot::Mutex::new((0, 0)),
             dflash_hidden_save,
             dflash_hidden_save_rows,
+            dflash_hidden_save_nseq,
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),

@@ -537,6 +537,84 @@ pub fn mamba2_ssm_prefill_persistent(
         .launch(stream)
 }
 
+/// Fused Mamba-2 verify scan: persistent H + per-token intermediate dumps.
+/// `h_inter` may be NULL (`n_inter=0`) — then this matches persistent prefill.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_ssm_verify(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    x: DevicePtr,
+    b_proj: DevicePtr,
+    c_proj: DevicePtr,
+    dt_raw: DevicePtr,
+    a_log: DevicePtr,
+    d_param: DevicePtr,
+    dt_bias: DevicePtr,
+    output: DevicePtr,
+    h_inter: DevicePtr,
+    n_inter: u32,
+    inter_stride: u32,
+    batch_size: u32,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    state_size: u32,
+    n_groups: u32,
+    dt_min: f32,
+    dt_max: f32,
+    x_stride: u32,
+    bc_stride: u32,
+    dt_stride: u32,
+    y_stride: u32,
+    exact_persistent: bool,
+    stream: u64,
+) -> Result<()> {
+    let smem = if exact_persistent {
+        head_dim * (state_size + 1) * 4 + head_dim * 4 + 4 * head_dim * 4
+    } else {
+        head_dim * (state_size + 1) * 4 + head_dim * 4 + state_size * 4 + state_size * 4
+    };
+    const SUB: u32 = 4;
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_heads, batch_size, 1])
+        .block([
+            if exact_persistent {
+                state_size
+            } else {
+                head_dim * SUB
+            },
+            1,
+            1,
+        ])
+        .shared_mem(smem)
+        .arg_ptr(h_state)
+        .arg_ptr(x)
+        .arg_ptr(b_proj)
+        .arg_ptr(c_proj)
+        .arg_ptr(dt_raw)
+        .arg_ptr(a_log)
+        .arg_ptr(d_param)
+        .arg_ptr(dt_bias)
+        .arg_ptr(output)
+        .arg_ptr(h_inter)
+        .arg_u32(n_inter)
+        .arg_u32(inter_stride)
+        .arg_u32(batch_size)
+        .arg_u32(seq_len)
+        .arg_u32(num_heads)
+        .arg_u32(head_dim)
+        .arg_u32(state_size)
+        .arg_u32(n_groups)
+        .arg_f32(dt_min)
+        .arg_f32(dt_max)
+        .arg_u32(x_stride)
+        .arg_u32(bc_stride)
+        .arg_u32(dt_stride)
+        .arg_u32(y_stride)
+        .launch(stream)
+}
+
 // ── Mamba-2 SSD chunked prefill scan ──────────────────────────────────────────
 //
 // Replaces the token-sequential recurrence with the chunked (state-space duality)

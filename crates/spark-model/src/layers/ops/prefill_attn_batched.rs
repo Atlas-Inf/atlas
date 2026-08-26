@@ -77,6 +77,57 @@ pub fn prefill_attention_paged_batched(
         .launch(stream)
 }
 
+/// Batched BF16 paged attention with per-head sink logits (DSpark).
+pub fn prefill_attention_paged_batched_sink(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_table_ptrs: DevicePtr,
+    batch_size: u32,
+    cu_seqlens: DevicePtr,
+    kv_lens: DevicePtr,
+    batch_indirect_args: DevicePtr,
+    q_len: u32,
+    kv_len: u32,
+    q_offset: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_block_size: u32,
+    sliding_window: u32,
+    inv_sqrt_d: f32,
+    sinks: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, div_ceil(q_len, 32), batch_size])
+        .block([128, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_table_ptrs)
+        .arg_u32(batch_size)
+        .arg_ptr(cu_seqlens)
+        .arg_ptr(kv_lens)
+        .arg_ptr(batch_indirect_args)
+        .arg_u32(q_len)
+        .arg_u32(kv_len)
+        .arg_u32(q_offset)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(cache_block_size)
+        .arg_u32(sliding_window)
+        .arg_u32(1)
+        .arg_f32(inv_sqrt_d)
+        .arg_ptr(sinks)
+        .launch(stream)
+}
+
 /// Batched BF16-KV paged prefill attention (BR=64, 256-thread variant).
 pub fn prefill_attention_paged_batched_64(
     gpu: &dyn GpuBackend,

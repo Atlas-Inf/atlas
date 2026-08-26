@@ -288,6 +288,14 @@ pub trait DraftProposer: Send + Sync {
     /// Allocate per-sequence proposer state.
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>>;
 
+    /// Startup-frozen diagnostic switches for the drafter, when the
+    /// proposer carries them (`BlockDiffusionDraftHead`). Model-side
+    /// diagnostic decisions must consult this instead of rereading the
+    /// environment, so post-startup mutation cannot change behavior.
+    fn startup_diagnostics(&self) -> Option<&crate::layers::dflash_head::DsparkDiagnostics> {
+        None
+    }
+
     /// Chain confidence of the most recent `propose` (min top-1 softmax prob
     /// across its drafts), when the proposer computes it (`draft_conf_tau` >
     /// 0). `None` = not computed; callers must not gate on it then.
@@ -381,6 +389,7 @@ pub trait DraftProposer: Send + Sync {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         ctx: &ForwardContext,
         stream: u64,
         draft_embed_target: Option<DevicePtr>,
@@ -411,6 +420,7 @@ pub trait DraftProposer: Send + Sync {
         _positions: &[usize],
         _num_drafts: usize,
         _states: &mut [&mut dyn ProposerState],
+        _expected_owners: Option<&[crate::layers::dflash_head::SequenceGeneration]>,
         _ctx: &ForwardContext,
         _stream: u64,
         _out_conf: Option<&mut Vec<Vec<f32>>>,
@@ -428,6 +438,12 @@ pub trait DraftProposer: Send + Sync {
     /// re-introduced by its caller.
     fn propose_batch_max(&self, _buffers: &BufferArena, _config: &ModelConfig) -> usize {
         1
+    }
+
+    /// Minimum group width admitted to [`Self::propose_batch`]. Normal batched
+    /// proposers require two sequences; explicit parity diagnostics may use one.
+    fn propose_batch_min(&self) -> usize {
+        2
     }
 
     /// Prefill the drafter's own context (KV cache) over the prompt, before
@@ -465,6 +481,7 @@ pub trait DraftProposer: Send + Sync {
     fn after_verify(
         &self,
         num_accepted: usize,
+        expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         state: &mut dyn ProposerState,
         stream: u64,
     ) -> Result<()>;
@@ -476,8 +493,13 @@ pub trait DraftProposer: Send + Sync {
     /// can release raw device allocations stored on the state — `DevicePtr`
     /// has no `Drop`, so anything `alloc_state` allocated leaks unless it is
     /// explicitly freed here.
-    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
-        let _ = (gpu, state);
+    fn free_state(
+        &self,
+        gpu: &dyn GpuBackend,
+        expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
+        state: &mut dyn ProposerState,
+    ) -> Result<()> {
+        let _ = (gpu, expected_owner, state);
         Ok(())
     }
 }

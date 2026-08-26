@@ -1,0 +1,465 @@
+{
+  "base_url": "<LOCAL_ENDPOINT>/v1",
+  "elapsed_s": 997.9620305119897,
+  "infra_errors_total": 0,
+  "invalid_for_publish": true,
+  "lanes": [
+    {
+      "artifacts": {
+        "summary.json": "r0b0bench/requested-metrics-20260818T210217Z/lanes/latency/summary.json"
+      },
+      "elapsed_s": 14.732961709989468,
+      "imported": false,
+      "infra_errors": 0,
+      "lane_id": "latency",
+      "status": "PASS",
+      "summary": {
+        "drop_first_rep": true,
+        "failed": 0,
+        "method": "openai_chat_stream_c1_latency",
+        "nonstream": {
+          "e2el_ms_mean": 1650.3733370045666,
+          "n_stable": 2,
+          "rows": [
+            {
+              "completion_tokens": 72,
+              "e2el_ms": 1537.020001997007,
+              "elapsed_s": 1.537020001997007,
+              "http_status": 200,
+              "ok": true,
+              "prompt_tokens": 49,
+              "rep": 1
+            },
+            {
+              "completion_tokens": 75,
+              "e2el_ms": 1626.8992609984707,
+              "elapsed_s": 1.6268992609984707,
+              "http_status": 200,
+              "ok": true,
+              "prompt_tokens": 49,
+              "rep": 2
+            },
+            {
+              "completion_tokens": 71,
+              "e2el_ms": 1673.8474130106624,
+              "elapsed_s": 1.6738474130106624,
+              "http_status": 200,
+              "ok": true,
+              "prompt_tokens": 49,
+              "rep": 3
+            }
+          ]
+        },
+        "output_tokens": 128,
+        "reps": 5,
+        "stream": {
+          "e2el_ms_mean": 1867.9154787459993,
+          "itl_ms_mean": 19.492085967085806,
+          "itl_ms_p50_mean": 0.0215559994103387,
+          "itl_ms_p95_mean": 46.26411120516423,
+          "n_stable": 4,
+          "rows": [
+            {
+              "e2el_ms": 2420.6036920077167,
+              "elapsed_s": 2.4206036920077167,
+              "finish_reason": "stop",
+              "http_status": 200,
+              "itl_ms_mean": 22.215904890250027,
+              "itl_ms_p50": 0.02977598342113197,
+              "itl_ms_p95": 53.9273519825656,
+              "ok": true,
+              "rep": 1,
+              "stream_completion_chunks": 92,
+              "text": "Copper is the standard reference material for electrical conductivity due to its exceptional electron mobility. At20°C, its conductivity is approximately5.96 ×10⁷ S/m, defined as100% IACS (International Annealed Copper Standard). Its face-centered cubic crystal structure facilitates efficient electron flow, making it ideal for wiring and printed circuit boards. While silver exhibits higher conductivity, copper offers the optimal balance of performance, cost, and abundance for most industrial applications.",
+              "ttft_ms": 382.37282299087383,
+              "usage": {
+                "completion_tokens": 102,
+                "completion_tokens_details": {
+                  "accepted_prediction_tokens": 0,
+                  "audio_tokens": 0,
+                  "reasoning_tokens": 0,
+                  "rejected_prediction_tokens": 0
+                },
+                "prompt_tokens": 46,
+                "prompt_tokens_details": {
+                  "audio_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "response_token/s": 48.49449032440954,
+                "time_to_first_token_ms": 317.791546,
+                "total_tokens": 148
+              }
+            },
+            {
+              "e2el_ms": 2116.2237459793687,
+              "elapsed_s": 2.1162237459793687,
+              "finish_reason": "stop",
+              "http_status": 200,
+              "itl_ms_mean": 19.154019910880987,
+              "itl_ms_p50": 0.019279992557130754,
+              "itl_ms_p95": 46.15010220295517,
+              "ok": true,
+              "rep": 2,
+              "stream_completion_chunks": 91,
+              "text": "Copper is the standard reference material for electrical conductivity due to its exceptional electron mobility. At20°C, its conductivity is approximately5.96 ×10⁷ S/m, defined as100% IACS (International Annealed Copper Standard). Its face-centered cubic crystal structure facilitates efficient electron flow, making it ideal for wiring and electronics. While silver technically possesses higher conductivity, copper offers the optimal balance of performance, cost, and abundance for most industrial applications.",
+              "ttft_ms": 375.99593499908224,
+              "usage": {
+                "completion_tokens": 101,
+                "completion_tokens_details": {
+                  "accepted_prediction_tokens": 0,
+                  "audio_tokens": 0,
+                  "reasoning_tokens": 0,
+                  "rejected_prediction_tokens": 0
+                },
+                "prompt_tokens": 46,
+                "prompt_tokens_details": {
+                  "audio_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "response_token/s": 56.12345643285955,
+                "time_to_first_token_ms": 315.166486,
+                "total_tokens": 147
+              }
+            },
+            {
+              "e2el_ms": 2017.356700001983,
+              "elapsed_s": 2.017356700001983,
+              "finish_reason": "stop",
+              "http_status": 200,
+              "itl_ms_mean": 18.920512511570895,
+              "itl_ms_p50": 0.01849599357228726,
+              "itl_ms_p95": 45.893930742749944,
+              "ok": true,
+              "rep": 3,
+              "stream_completion_chunks": 87,
+              "text": "Copper is the standard reference material for electrical conductivity due to its exceptional electron mobility. At20°C, its conductivity is approximately5.96 ×10⁷ siemens per meter, making it the second most conductive element after silver. Its atomic structure allows free electrons to move with minimal resistance, which is why copper is the primary choice for electrical wiring, printed circuit boards, and various electronic components where efficiency and cost-effectiveness are critical.",
+              "ttft_ms": 373.7882520072162,
+              "usage": {
+                "completion_tokens": 95,
+                "completion_tokens_details": {
+                  "accepted_prediction_tokens": 0,
+                  "audio_tokens": 0,
+                  "reasoning_tokens": 0,
+                  "rejected_prediction_tokens": 0
+                },
+                "prompt_tokens": 46,
+                "prompt_tokens_details": {
+                  "audio_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "response_token/s": 55.78027695071286,
+                "time_to_first_token_ms": 314.01430899999997,
+                "total_tokens": 141
+              }
+            },
+            {
+              "e2el_ms": 1716.478054993786,
+              "elapsed_s": 1.716478054993786,
+              "finish_reason": "stop",
+              "http_status": 200,
+              "itl_ms_mean": 20.37845644607352,
+              "itl_ms_p50": 0.029727991204708815,
+              "itl_ms_p95": 47.77742598089389,
+              "ok": true,
+              "rep": 4,
+              "stream_completion_chunks": 66,
+              "text": "Copper is the standard reference material for electrical conductivity due to its exceptional electron mobility. At20°C, its conductivity is approximately5.96 ×10⁷ siemens per meter, making it ideal for wiring and electronics. Its face-centered cubic crystal structure facilitates efficient electron flow, though impurities and temperature variations can slightly reduce performance.",
+              "ttft_ms": 375.8880630193744,
+              "usage": {
+                "completion_tokens": 74,
+                "completion_tokens_details": {
+                  "accepted_prediction_tokens": 0,
+                  "audio_tokens": 0,
+                  "reasoning_tokens": 0,
+                  "rejected_prediction_tokens": 0
+                },
+                "prompt_tokens": 46,
+                "prompt_tokens_details": {
+                  "audio_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "response_token/s": 52.872058604977376,
+                "time_to_first_token_ms": 317.496089,
+                "total_tokens": 120
+              }
+            },
+            {
+              "e2el_ms": 1621.6034140088595,
+              "elapsed_s": 1.6216034140088595,
+              "finish_reason": "stop",
+              "http_status": 200,
+              "itl_ms_mean": 19.51535499981782,
+              "itl_ms_p50": 0.01872002030722797,
+              "itl_ms_p95": 45.2349858940579,
+              "ok": true,
+              "rep": 5,
+              "stream_completion_chunks": 64,
+              "text": "Copper is the standard reference material for electrical conductivity due to its exceptional electron mobility. Its atomic structure allows electrons to flow with minimal resistance, making it ideal for wiring and circuitry. While silver technically conducts electricity slightly better, copper offers the best balance of performance, cost, and abundance, solidifying its dominance in modern electrical infrastructure.",
+              "ttft_ms": 374.48940399917774,
+              "usage": {
+                "completion_tokens": 68,
+                "completion_tokens_details": {
+                  "accepted_prediction_tokens": 0,
+                  "audio_tokens": 0,
+                  "reasoning_tokens": 0,
+                  "rejected_prediction_tokens": 0
+                },
+                "prompt_tokens": 46,
+                "prompt_tokens_details": {
+                  "audio_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "response_token/s": 52.052791446972456,
+                "time_to_first_token_ms": 315.25352699999996,
+                "total_tokens": 114
+              }
+            }
+          ],
+          "ttft_ms_mean": 375.04041350621264
+        }
+      }
+    },
+    {
+      "artifacts": {
+        "summary.json": "r0b0bench/requested-metrics-20260818T210217Z/lanes/concurrency/summary.json"
+      },
+      "elapsed_s": 270.1282951690082,
+      "imported": false,
+      "infra_errors": 0,
+      "lane_id": "concurrency",
+      "status": "PASS",
+      "summary": {
+        "backend": "openai_portable",
+        "drop_first_rep": true,
+        "levels": [
+          1,
+          2,
+          4,
+          6
+        ],
+        "method": "openai_portable_concurrency_ladder",
+        "output_tokens": 512,
+        "reps": 3,
+        "rows": [
+          {
+            "aggregate_output_tok_s": 84.17928882101506,
+            "completed": 4,
+            "concurrency": 1,
+            "failed": 0,
+            "mean_e2el_ms": 6081.7662762638065,
+            "median_client_output_tok_s": 84.18937030214093,
+            "output_tokens": 512,
+            "repetitions_present": 3,
+            "warmup_rep_dropped": 1
+          },
+          {
+            "aggregate_output_tok_s": 152.83695566773957,
+            "completed": 8,
+            "concurrency": 2,
+            "failed": 0,
+            "mean_e2el_ms": 6695.1982426217,
+            "median_client_output_tok_s": 76.47667173399799,
+            "output_tokens": 512,
+            "repetitions_present": 3,
+            "warmup_rep_dropped": 1
+          },
+          {
+            "aggregate_output_tok_s": 168.41681015699214,
+            "completed": 16,
+            "concurrency": 4,
+            "failed": 0,
+            "mean_e2el_ms": 12143.606819121487,
+            "median_client_output_tok_s": 42.12939765872669,
+            "output_tokens": 512,
+            "repetitions_present": 3,
+            "warmup_rep_dropped": 1
+          },
+          {
+            "aggregate_output_tok_s": 155.8388534629171,
+            "completed": 24,
+            "concurrency": 6,
+            "failed": 0,
+            "mean_e2el_ms": 19687.845513544744,
+            "median_client_output_tok_s": 26.01998137884494,
+            "output_tokens": 512,
+            "repetitions_present": 3,
+            "warmup_rep_dropped": 1
+          }
+        ],
+        "total_failed": 0
+      }
+    },
+    {
+      "artifacts": {
+        "summary.json": "r0b0bench/requested-metrics-20260818T210217Z/lanes/throughput/summary.json"
+      },
+      "elapsed_s": 199.95319538601325,
+      "imported": false,
+      "infra_errors": 0,
+      "lane_id": "throughput",
+      "status": "PASS",
+      "summary": {
+        "backend": "openai_portable",
+        "decode": {
+          "mean_client_output_tok_s": 67.89454057706939,
+          "median_client_output_tok_s": 67.77880080802296,
+          "n_stable": 4,
+          "output_tokens_requested": 2048,
+          "reps": 5,
+          "rows": [
+            {
+              "client_output_tokens_per_second": 57.57963005338357,
+              "completion_tokens": 2048,
+              "elapsed_s": 35.56813404499553,
+              "finish_reason": "length",
+              "http_status": 200,
+              "kind": "decode",
+              "ok": true,
+              "prompt_tokens": 60,
+              "rep": 1,
+              "server_prompt_tokens_per_second": 1.6869032242202218
+            },
+            {
+              "client_output_tokens_per_second": 67.69552811357921,
+              "completion_tokens": 2048,
+              "elapsed_s": 30.253106181015028,
+              "finish_reason": "length",
+              "http_status": 200,
+              "kind": "decode",
+              "ok": true,
+              "prompt_tokens": 60,
+              "rep": 2,
+              "server_prompt_tokens_per_second": 1.9832674252025162
+            },
+            {
+              "client_output_tokens_per_second": 68.5442333592103,
+              "completion_tokens": 2048,
+              "elapsed_s": 29.878516391996527,
+              "finish_reason": "length",
+              "http_status": 200,
+              "kind": "decode",
+              "ok": true,
+              "prompt_tokens": 60,
+              "rep": 3,
+              "server_prompt_tokens_per_second": 2.0081318366956142
+            },
+            {
+              "client_output_tokens_per_second": 67.86207350246671,
+              "completion_tokens": 2048,
+              "elapsed_s": 30.178859770996496,
+              "finish_reason": "length",
+              "http_status": 200,
+              "kind": "decode",
+              "ok": true,
+              "prompt_tokens": 60,
+              "rep": 4,
+              "server_prompt_tokens_per_second": 1.9881466846425795
+            },
+            {
+              "client_output_tokens_per_second": 67.47632733302132,
+              "completion_tokens": 2048,
+              "elapsed_s": 30.351385159010533,
+              "finish_reason": "length",
+              "http_status": 200,
+              "kind": "decode",
+              "ok": true,
+              "prompt_tokens": 60,
+              "rep": 5,
+              "server_prompt_tokens_per_second": 1.9768455273346088
+            }
+          ]
+        },
+        "drop_first_rep": true,
+        "failed": 0,
+        "method": "openai_portable_c1_throughput",
+        "prefill": {
+          "mean_server_prompt_tok_s": 1697.1016573988845,
+          "median_prompt_tokens": 24541.0,
+          "median_server_prompt_tok_s": 1697.1016573988845,
+          "n_stable": 2,
+          "note": "prompt tok/s is e2e wall proxy (includes short decode); not pure prefill kernel metric",
+          "output_tokens": 16,
+          "prompt_tokens_target": 14000,
+          "reps": 3,
+          "rows": [
+            {
+              "client_output_tokens_per_second": 1.0812279233014863,
+              "completion_tokens": 16,
+              "elapsed_s": 14.79799000301864,
+              "finish_reason": "length",
+              "http_status": 200,
+              "kind": "prefill",
+              "ok": true,
+              "prompt_tokens": 24541,
+              "rep": 1,
+              "server_prompt_tokens_per_second": 1658.4009041088611
+            },
+            {
+              "client_output_tokens_per_second": 1.0979816040104116,
+              "completion_tokens": 16,
+              "elapsed_s": 14.572193141997559,
+              "finish_reason": "length",
+              "http_status": 200,
+              "kind": "prefill",
+              "ok": true,
+              "prompt_tokens": 24541,
+              "rep": 2,
+              "server_prompt_tokens_per_second": 1684.0979090012195
+            },
+            {
+              "client_output_tokens_per_second": 1.1149377161788354,
+              "completion_tokens": 16,
+              "elapsed_s": 14.35057740699267,
+              "finish_reason": "length",
+              "http_status": 200,
+              "kind": "prefill",
+              "ok": true,
+              "prompt_tokens": 24541,
+              "rep": 3,
+              "server_prompt_tokens_per_second": 1710.1054057965498
+            }
+          ]
+        }
+      }
+    },
+    {
+      "artifacts": {
+        "gsm8k.json": "r0b0bench/requested-metrics-20260818T210217Z/lanes/gsm8k/gsm8k.json"
+      },
+      "elapsed_s": 513.1367484130024,
+      "imported": false,
+      "infra_errors": 0,
+      "lane_id": "gsm8k",
+      "status": "PASS",
+      "summary": {
+        "accuracy": 0.955,
+        "concurrency": 2,
+        "correct": 191,
+        "data_path": "<LOCAL_GSM8K_DATASET>",
+        "infra_http_errors": 0,
+        "method": "gsm8k_0shot_flexible_extract",
+        "n": 200,
+        "seed": 0,
+        "wilson95": {
+          "high": 0.9761477282752958,
+          "low": 0.9167024063390322
+        }
+      }
+    }
+  ],
+  "model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "profile": "core-subset",
+  "r0b0bench_version": "1.0.0rc2",
+  "run_id": "requested-metrics-20260818T210217Z",
+  "schema_version": 2,
+  "started_utc": "2026-08-18T21:21:45.139295+00:00",
+  "systems_lanes": [
+    "canary",
+    "bfcl_mt",
+    "bfcl_ast",
+    "latency",
+    "concurrency",
+    "throughput",
+    "niah"
+  ]
+}

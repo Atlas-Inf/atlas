@@ -12,7 +12,13 @@ fn mixed_dense_moe_sizes_for_widest_ffn() {
 
     let sizes = BufferSizes::from_config(&cfg, 4, 4096, 16, 32);
     assert_eq!(sizes.expert_gate_out, 4 * 12_288 * 2);
-    assert_eq!(sizes.expert_up_out, 4 * 12_288 * 2);
+    // The Marlin cfg4 prefill path pads each expert's M dimension by 32 rows
+    // (tm=2). The gate output is the unpadded logical extent; the up output
+    // must include that extra extent because the activation kernel consumes
+    // the padded expert rows in place.
+    let marlin_padding = 32 * cfg.moe_intermediate_size * 2;
+    assert_eq!(sizes.expert_up_out, sizes.expert_gate_out + marlin_padding);
+    assert_eq!(sizes.expert_up_out, 163_840);
 }
 use crate::gpu::mock::MockGpuBackend;
 

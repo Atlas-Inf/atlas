@@ -23,7 +23,7 @@
 //! spec-OFF or on reversed-order pairs (a single spec-ON pair drifts +/-2%).
 
 use anyhow::Result;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::super::types::TransformerModel;
 use crate::layers::ops;
@@ -37,6 +37,33 @@ use crate::layers::ops;
 pub(super) fn lm_head_batch_gemv_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_NO_LM_HEAD_BATCH_GEMV").as_deref() != Ok("1"))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LmHeadNvfp4Route {
+    BatchGemv(KernelHandle),
+    TransposedBf16,
+    TransposedOther,
+    PlainGemm,
+}
+
+fn select_lm_head_nvfp4_route(
+    padded_n: usize,
+    batch_gemv_enabled: bool,
+    batch: KernelHandle,
+    has_transposed_bf16: bool,
+    has_transposed_other: bool,
+) -> LmHeadNvfp4Route {
+    if batch_gemv_enabled && batch.0 != 0 {
+        return LmHeadNvfp4Route::BatchGemv(batch);
+    }
+    if padded_n >= 5 && has_transposed_bf16 {
+        LmHeadNvfp4Route::TransposedBf16
+    } else if padded_n >= 5 && has_transposed_other {
+        LmHeadNvfp4Route::TransposedOther
+    } else {
+        LmHeadNvfp4Route::PlainGemm
+    }
 }
 
 impl TransformerModel {
@@ -69,89 +96,87 @@ impl TransformerModel {
                 )?;
             }
         } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
-            // Batched GEMV for the decode head. The base M64-tile
-            // `w4a16_gemm` below wastes most of its MMA tile here: at
-            // padded_n=16 only 16 of 64 tile-rows carry data, and the same
-            // nsys note the verify path records (impl_a3.rs) measured it at
-            // 19.3 ms on this [248320, 5120] NVFP4 head vs ~2.5 ms for the
-            // batched GEMV streaming the same 636 MB once. That cost is
-            // FLAT in n, so it sits in the fixed term at every batch size.
-            //
-            // Tier by padded_n exactly as the SSM mixer does: batch4 (M<=4)
-            // / batch8 (M<=8) / batch16 (M<=16). A 0-handle on any tier
-            // falls through to the GEMM, so targets lacking the kernel are
-            // unaffected.
-            // Tile GEMM at padded_n >= 5 over the PADDED transposed twin.
-            // padded_n <= 4 stays on the GEMV, which measures 3174 us =
-            // 226 GB/s = 98.3% of the memory roofline on this shape and is
-            // therefore unimprovable; the tile GEMM LOSES there.
-            if padded_n >= 5
-                && self.w4a16_gemm_t_bf16_kernel.0 != 0
-                && let Some((ref nvfp4_t, ldb)) = self.lm_head_nvfp4_t
-            {
-                // LOSSLESS path: BF16 MMA, no activation downcast.
-                ops::w4a16_gemm_n128_m128_bf16_ldb(
-                    self.gpu.as_ref(),
-                    self.w4a16_gemm_t_bf16_kernel,
-                    normed,
-                    nvfp4_t,
-                    logits,
-                    padded_n as u32,
-                    v as u32,
-                    h as u32,
-                    ldb,
-                    stream,
-                )?;
-            } else if padded_n >= 5
-                && self.w4a16_gemm_t_kernel.0 != 0
-                && let Some((ref nvfp4_t, ldb)) = self.lm_head_nvfp4_t
-            {
-                ops::w4a16_gemm_n128_ldb(
-                    self.gpu.as_ref(),
-                    self.w4a16_gemm_t_kernel,
-                    normed,
-                    nvfp4_t,
-                    logits,
-                    padded_n as u32,
-                    v as u32,
-                    h as u32,
-                    ldb,
-                    stream,
-                )?;
+            // The batch4/8/16 GEMV tiers are byte-identical to M independent
+            // scalar GEMVs and therefore own every admitted decode width through
+            // 16. Tensor-core/transposed GEMM changes the FP32 reduction order;
+            // it is a capability fallback when an exact tier is unavailable or
+            // explicitly disabled, not a lossless substitute.
+            // Exact-M tier first (batch2..8/16/32 incl. the 5/6/7 tiers);
+            // batch16 stays the capability fallback when no exact tier resolved.
+            let narrow = self.w4a16_batchm.kernel(padded_n as u32);
+            let batch_k = if narrow.0 != 0 {
+                narrow
+            } else if padded_n <= 16 {
+                self.w4a16_gemv_batch16_kernel
             } else {
-                let narrow = self.w4a16_batchm.kernel(padded_n as u32);
-                let gemv_k = if narrow.0 != 0 {
-                    narrow
-                } else if padded_n <= 16 {
-                    self.w4a16_gemv_batch16_kernel
-                } else {
-                    spark_runtime::gpu::KernelHandle(0)
-                };
-                if gemv_k.0 != 0 && lm_head_batch_gemv_enabled() {
-                    ops::w4a16_gemv_batchm(
+                KernelHandle(0)
+            };
+            let route = select_lm_head_nvfp4_route(
+                padded_n,
+                lm_head_batch_gemv_enabled(),
+                batch_k,
+                self.w4a16_gemm_t_bf16_kernel.0 != 0 && self.lm_head_nvfp4_t.is_some(),
+                self.w4a16_gemm_t_kernel.0 != 0 && self.lm_head_nvfp4_t.is_some(),
+            );
+            match route {
+                LmHeadNvfp4Route::BatchGemv(gemv_k) => ops::w4a16_gemv_batchm(
+                    self.gpu.as_ref(),
+                    gemv_k,
+                    normed,
+                    nvfp4,
+                    logits,
+                    padded_n as u32,
+                    v as u32,
+                    h as u32,
+                    stream,
+                )?,
+                LmHeadNvfp4Route::TransposedBf16 => {
+                    let (nvfp4_t, ldb) = self
+                        .lm_head_nvfp4_t
+                        .as_ref()
+                        .expect("route requires transposed LM-head weights");
+                    ops::w4a16_gemm_n128_m128_bf16_ldb(
                         self.gpu.as_ref(),
-                        gemv_k,
+                        self.w4a16_gemm_t_bf16_kernel,
                         normed,
-                        nvfp4,
+                        nvfp4_t,
                         logits,
                         padded_n as u32,
                         v as u32,
                         h as u32,
-                        stream,
-                    )?;
-                } else {
-                    ops::w4a16_gemm(
-                        self.gpu.as_ref(),
-                        self.w4a16_gemm_kernel,
-                        normed,
-                        nvfp4,
-                        logits,
-                        padded_n as u32,
-                        v as u32,
-                        h as u32,
+                        *ldb,
                         stream,
                     )?;
                 }
+                LmHeadNvfp4Route::TransposedOther => {
+                    let (nvfp4_t, ldb) = self
+                        .lm_head_nvfp4_t
+                        .as_ref()
+                        .expect("route requires transposed LM-head weights");
+                    ops::w4a16_gemm_n128_ldb(
+                        self.gpu.as_ref(),
+                        self.w4a16_gemm_t_kernel,
+                        normed,
+                        nvfp4_t,
+                        logits,
+                        padded_n as u32,
+                        v as u32,
+                        h as u32,
+                        *ldb,
+                        stream,
+                    )?;
+                }
+                LmHeadNvfp4Route::PlainGemm => ops::w4a16_gemm(
+                    self.gpu.as_ref(),
+                    self.w4a16_gemm_kernel,
+                    normed,
+                    nvfp4,
+                    logits,
+                    padded_n as u32,
+                    v as u32,
+                    h as u32,
+                    stream,
+                )?,
             }
         } else {
             ops::dense_gemm(
@@ -167,5 +192,98 @@ impl TransformerModel {
             )?;
         }
         Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LmHeadNvfp4Route, select_lm_head_nvfp4_route};
+    use spark_runtime::gpu::KernelHandle;
+
+    #[test]
+    fn exact_batch_gemv_tiers_win_over_transposed_fallbacks() {
+        let cases = [(2, 41), (4, 41), (8, 81), (16, 161)];
+        for (padded_n, expected_handle) in cases {
+            let route = select_lm_head_nvfp4_route(
+                padded_n,
+                true,
+                KernelHandle(41),
+                KernelHandle(81),
+                KernelHandle(161),
+                true,
+                true,
+            );
+            assert!(matches!(
+                route,
+                LmHeadNvfp4Route::BatchGemv(KernelHandle(handle))
+                    if handle == expected_handle
+            ));
+        }
+    }
+
+    #[test]
+    fn disabled_or_missing_batch_gemv_uses_transposed_fallback() {
+        let disabled = select_lm_head_nvfp4_route(
+            8,
+            false,
+            KernelHandle(82),
+            true,
+            true,
+        );
+        assert!(matches!(disabled, LmHeadNvfp4Route::TransposedBf16));
+
+        let missing_handle = select_lm_head_nvfp4_route(
+            8,
+            true,
+            KernelHandle(0),
+            true,
+            true,
+        );
+        assert!(matches!(missing_handle, LmHeadNvfp4Route::TransposedBf16));
+    }
+
+    #[test]
+    fn transposed_fallback_prefers_bf16_then_other_for_wide_batches() {
+        let bf16 = select_lm_head_nvfp4_route(
+            17,
+            true,
+            KernelHandle(0),
+            true,
+            true,
+        );
+        assert!(matches!(bf16, LmHeadNvfp4Route::TransposedBf16));
+
+        let other = select_lm_head_nvfp4_route(
+            17,
+            true,
+            KernelHandle(0),
+            false,
+            true,
+        );
+        assert!(matches!(other, LmHeadNvfp4Route::TransposedOther));
+    }
+
+    #[test]
+    fn missing_transposed_fallback_uses_plain_gemm() {
+        let route = select_lm_head_nvfp4_route(
+            17,
+            true,
+            KernelHandle(0),
+            false,
+            false,
+        );
+        assert!(matches!(route, LmHeadNvfp4Route::PlainGemm));
+    }
+
+    #[test]
+    fn small_batch_without_exact_gemv_keeps_plain_gemm_fallback() {
+        let route = select_lm_head_nvfp4_route(
+            4,
+            false,
+            KernelHandle(0),
+            true,
+            true,
+        );
+        assert!(matches!(route, LmHeadNvfp4Route::PlainGemm));
     }
 }

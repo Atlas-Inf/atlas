@@ -66,13 +66,22 @@ pub fn step_verify_dflash(
         0.0
     };
     a.last_token_time = Instant::now();
+    let raw_trace = if std::env::var("ATLAS_LIGHTNING_VERIFY_TOKEN_TRACE").as_deref() == Ok("1") {
+        Some(verified_argmax.clone())
+    } else {
+        None
+    };
 
     // DFlash drafter proposes on raw argmax; when dflash_verify_raw_argmax is set
     // (process-wide DFlash mode), skip the rep_pen/DRY pipeline so verifier and
     // drafter judge on the SAME (GOLD) basis. For non-DFlash callers (unreachable
     // today since step_verify_dflash is only dispatched at drafts.len()>=4 which
     // only DFlash produces), apply the full pre-sample pipeline as in K=2/3/4.
-    let verified = if dflash_verify_raw_argmax && !sched.levers.dflash_masked_verify {
+    let verified = if crate::scheduler::helpers::dflash_verify_uses_raw_argmax(
+        dflash_verify_raw_argmax,
+        sched.levers.dflash_masked_verify,
+        model.is_lightning_dspark_product(),
+    ) {
         verified_argmax
     } else {
         crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
@@ -104,6 +113,26 @@ pub fn step_verify_dflash(
         } else {
             break;
         }
+    }
+    if let Some(raw) = raw_trace {
+        tracing::info!(
+            "LIGHTNING VERIFY TOKEN TRACE last={} drafts={:?} raw={:?} processed={:?} accepted={}",
+            a.last_token,
+            drafts,
+            raw,
+            verified,
+            num_accepted
+        );
+    }
+    if std::env::var("ATLAS_DFLASH_VERIFY_TRACE").ok().as_deref() == Some("1") {
+        let n = drafts.len().min(verified.len()).min(4);
+        tracing::info!(
+            "DFLASH CMP last={} drafts[0..{n}]={:?} verified[0..{n}]={:?} accepted={}",
+            a.last_token,
+            &drafts[..n],
+            &verified[..n],
+            num_accepted,
+        );
     }
 
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
@@ -224,17 +253,59 @@ pub fn step_verify_dflash(
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
     let t_propose = std::time::Instant::now();
     if crate::scheduler::adaptive_spec::spec_allowed(a, sched) {
-        match model.run_mtp_propose_multi(
-            a.last_token,
-            a.seq.seq_len,
-            num_drafts,
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
+        let proposal: anyhow::Result<Vec<u32>> =
+            if model.mtp_propose_batch_min() == 1 && _mtp_grammar_mask.is_none() {
+                let one_token = [a.last_token];
+                let one_position = [a.seq.seq_len];
+                let one_stash = [bonus_token_idx];
+                let mut one_seq = [&mut a.seq];
+                match model.run_mtp_propose_batched(
+                    &one_token,
+                    &one_position,
+                    &one_stash,
+                    num_drafts,
+                    &mut one_seq,
+                    0,
+                    None,
+                ) {
+                    Ok(Some(mut all)) if all.len() == 1 => Ok(all.remove(0)),
+                    Ok(Some(all)) => Err(anyhow::anyhow!(
+                        "DFlash B1 parity proposer returned {} sequence rows",
+                        all.len()
+                    )),
+                    Ok(None) => Err(anyhow::anyhow!("DFlash B1 parity proposer declined")),
+                    Err(error) => Err(error),
+                }
+            } else {
+                model.run_mtp_propose_multi(
+                    a.last_token,
+                    a.seq.seq_len,
+                    num_drafts,
+                    &mut a.seq,
+                    0,
+                    _mtp_grammar_mask.as_deref(),
+                )
+            };
+        match proposal {
             Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
+            Ok(_) => {
+                // Lightning product fail-closed boundary: an empty
+                // re-propose is an admission violation, not a silent
+                // serial-decode fallback on the next bootstrap.
+                crate::scheduler::helpers::handle_dspark_repropose_failure(
+                    model,
+                    a,
+                    crate::scheduler::helpers::ProposalOutcome::Empty,
+                );
+            }
+            Err(e) => {
+                tracing::error!("run_mtp_propose_multi (dflash): {e:#}");
+                crate::scheduler::helpers::handle_dspark_repropose_failure(
+                    model,
+                    a,
+                    crate::scheduler::helpers::ProposalOutcome::Error,
+                );
+            }
         }
     }
     if step_timing {
