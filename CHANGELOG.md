@@ -45,10 +45,23 @@ behind specific subsystems — see the
   zero; a zero seed draws the wrong multipliers and hashes every token to an
   unrelated row without failing.
 
-  Config only. The rest of `qwen4_exp` — the `qwen4_exp` parser and weight
-  loader, low-rank hyper-connections, the sparse-attention indexer, the PLE
-  tower, the 512-expert MoE, the vision tower and the hybrid MTP head — is not
-  implemented; see `docs/porting/QWEN4_EXP.md` for the gap list.
+  Cross-checked against the reference rather than only against ourselves:
+  `bench/ngram_embed/qwen4exp_xcheck.py` runs the real
+  `Qwen4ExpTextNGramEmbedding.forward` and diffs its row ids against
+  `cargo run -p atlas-core --example qwen4exp_ngram_ids`. 5408/5408 ids match
+  over 32 streams. No GPU and no weights needed — the 51 GB embedding tensor is
+  stubbed, every buffer that feeds the ids is not.
+- **`qwen4_exp` config parsing.** The published `Qwen3.8-Flash-Next-FP8`
+  `config.json` now parses (vendored whole into `test_data/`). Two of its
+  defaults are absent rather than stated and both fail silently: `norm_topk_prob`
+  (HF true, serde false — skips top-K renormalisation) and `seed` (HF 1234, a
+  zero would hash every n-gram token to an unrelated row).
+
+  Parsing is not serving. There is still no `qwen4_exp` weight loader, and the
+  low-rank hyper-connections, sparse-attention indexer, PLE tower, 512-expert
+  MoE, vision tower and hybrid MTP head are all unimplemented; see
+  `docs/porting/QWEN4_EXP.md` for the gap list and for why host-resident
+  embedding gather is what decides whether this model runs on a GB10 at all.
 
 ### Fixed
 - **Benchmark runs no longer overwrite each other.** History files were named by

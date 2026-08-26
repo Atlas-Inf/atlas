@@ -135,6 +135,42 @@ MRoPE interleaved, `mrope_section = [11, 11, 10]`, `partial_rotary_factor =
 0.25`, `rope_theta = 1e7`, `max_position_embeddings = 262144`. This part maps
 cleanly onto the existing Qwen3.6 MRoPE support.
 
+## Cross-checked against the reference, not just against ourselves
+
+`bench/ngram_embed/qwen4exp_xcheck.py` runs the real
+`Qwen4ExpTextNGramEmbedding.forward` from Transformers and diffs the row ids it
+would gather with against `cargo run -p atlas-core --example
+qwen4exp_ngram_ids`. This matters because the Rust was written by reading HF's
+algorithm — a transcription error in the XOR mix or the shift semantics would
+not be caught by any test Atlas writes about itself.
+
+It needs no GPU and no weights: the embedding tensor is `320_001_536 x 160`
+(~51 GB), so `nn.Embedding` is stubbed during construction. Every buffer that
+actually feeds the ids is built by the real `__init__`, untouched.
+
+As of 2026-08-26, over 32 token streams — the EOS edge cases plus 25 seeded
+random ones — **5408 / 5408 ids match**.
+
+## The offload boundary is already packaged for us
+
+`RadixArk/Qwen3.8-Flash-Next-NVFP4` (135.3 GB, the smallest repack published)
+quantizes only the routed experts. Its `hf_quant_config.json` excludes
+`*.ple.*`, so the n-gram tower stays FP8 **in its own `model-plefp8-*`
+shards** — 10 files, ~52 GB.
+
+That is the whole offload boundary, pre-separated:
+
+| block | precision | size | placement |
+|---|---|---|---|
+| routed experts | NVFP4 | ~60 GB | device |
+| PLE / n-gram table | FP8 | ~52 GB | **host** (HF does this already) |
+| backbone, vision, MTP, norms | BF16 | ~23 GB | device |
+
+Device-resident would be **~83 GB**, which fits a GB10's ~119 GB. The full
+135.3 GB does not. So host-resident embedding gather is not an optimisation
+here — it is the thing that decides whether the model runs at all, and it is
+the first item worth building after the weight loader.
+
 ## Provenance
 
 `crates/atlas-core/src/config/ngram_qwen4exp.rs` is an independent derivation of
