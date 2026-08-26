@@ -180,6 +180,58 @@ impl NgramTable {
         Ok(())
     }
 
+    /// Gather `ids` and dequantize into `out` (`ids.len() * head_dim` floats).
+    ///
+    /// This is the PLE tower's actual input: the per-head slices of one token's
+    /// n-gram embedding, concatenated in head order and scaled.
+    ///
+    /// `weight_scale` is the single BF16 scalar the checkpoint ships next to
+    /// the shards — the table is quantized PER TENSOR, not per block, which is
+    /// why the 128 shards share one scale and take no `weight_scale_inv`.
+    pub fn gather_dequant(&self, ids: &[u32], weight_scale: f32, out: &mut [f32]) -> Result<()> {
+        let head_dim = self.head_dim();
+        ensure!(
+            out.len() == ids.len() * head_dim,
+            "gather buffer holds {} floats, expected {}",
+            out.len(),
+            ids.len() * head_dim
+        );
+        let mut raw = vec![0u8; self.row_bytes];
+        for (id, slot) in ids.iter().zip(out.chunks_exact_mut(head_dim)) {
+            self.read_row(*id as u64, &mut raw)?;
+            match self.dtype.as_str() {
+                "F8_E4M3" => {
+                    for (byte, value) in raw.iter().zip(slot.iter_mut()) {
+                        *value = crate::numeric::fp8_e4m3_to_f32(*byte) * weight_scale;
+                    }
+                }
+                "BF16" => {
+                    for (pair, value) in raw.chunks_exact(2).zip(slot.iter_mut()) {
+                        let bits = u16::from_le_bytes([pair[0], pair[1]]);
+                        *value = f32::from_bits((bits as u32) << 16) * weight_scale;
+                    }
+                }
+                "F32" => {
+                    for (quad, value) in raw.chunks_exact(4).zip(slot.iter_mut()) {
+                        *value =
+                            f32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]) * weight_scale;
+                    }
+                }
+                other => bail!("n-gram table dtype {other} has no dequant path"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Elements per row, as opposed to [`Self::row_bytes`].
+    pub fn head_dim(&self) -> usize {
+        match self.dtype.as_str() {
+            "BF16" | "F16" => self.row_bytes / 2,
+            "F32" | "I32" => self.row_bytes / 4,
+            _ => self.row_bytes,
+        }
+    }
+
     /// Gather `ids` into `out`, laid out row-major (`ids.len() * row_bytes`).
     ///
     /// This is the shape the PLE tower wants: the per-head slices of one
