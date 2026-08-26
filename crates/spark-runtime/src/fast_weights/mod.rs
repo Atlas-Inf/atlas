@@ -56,6 +56,22 @@ pub struct FastSafetensorsLoader {
     /// sequentially before the per-tensor copy loop starts. This helps NFS
     /// mounts where many small tensor reads defeat normal readahead.
     pub prefetch_shards: bool,
+    /// Name substrings marking tensors that are **read from disk at use time
+    /// and never made resident**. They are excluded from the load AND from the
+    /// pre-flight estimate, since counting bytes we will not allocate refuses
+    /// models that would in fact fit.
+    ///
+    /// This exists for embedding tables that are gathered by row rather than
+    /// multiplied. Qwen3.8-Flash-Next's n-gram table is 51.2 B parameters —
+    /// 41% of that checkpoint — and one token touches ~2.5 KB of it. Loading
+    /// it puts the pre-flight at 163 GB on a 119 GB box; skipping it puts the
+    /// same model at ~96 GB.
+    ///
+    /// A tensor named here MUST have a reader that goes to disk
+    /// (`atlas_core::ngram_table` is the one that does). Nothing checks that
+    /// from here — a name listed without a reader is simply absent from the
+    /// store, and the model loader will fail on it by name.
+    pub demand_paged_patterns: Vec<String>,
 }
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
@@ -79,6 +95,7 @@ impl FastSafetensorsLoader {
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
+            demand_paged_patterns: Vec::new(),
         }
     }
 
@@ -91,10 +108,20 @@ impl FastSafetensorsLoader {
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
+            demand_paged_patterns: Vec::new(),
         }
     }
 
     fn should_skip_tensor(&self, name: &str) -> bool {
+        // Demand-paged first: this is independent of expert parallelism, and
+        // applies on a single rank where the EP check below returns early.
+        if self
+            .demand_paged_patterns
+            .iter()
+            .any(|pattern| name.contains(pattern.as_str()))
+        {
+            return true;
+        }
         if self.ep_world_size <= 1 {
             return false;
         }

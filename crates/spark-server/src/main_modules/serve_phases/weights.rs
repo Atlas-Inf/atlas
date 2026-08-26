@@ -53,6 +53,22 @@ pub(crate) fn load_weight_store(
         return Ok(store);
     }
 
+/// Tensors this model reads from disk at use time rather than holding.
+///
+/// Only the `qwen4_exp` PLE n-gram table so far. It is 51.2 B parameters —
+/// 41% of that checkpoint — and is gathered by row (~2.5 KB per token), so
+/// making it resident is both unnecessary and, on a 119 GB GB10, impossible:
+/// the pre-flight lands at 163 GB with it and ~96 GB without.
+///
+/// Keyed on `ple_layer_ids` rather than on `model_type`, because it is the
+/// presence of the tower that decides this, not the family name.
+fn demand_paged_patterns(config: &ModelConfig) -> Vec<String> {
+    if config.ple_layer_ids.is_empty() {
+        return Vec::new();
+    }
+    vec![".ple.ple_embedding.ngram_embedding.shard_".to_string()]
+}
+
     let use_fast_load =
         !args.no_fast_load && std::env::var("ATLAS_FAST_LOAD").ok().as_deref() != Some("0");
     let store = if use_fast_load {
@@ -69,6 +85,13 @@ pub(crate) fn load_weight_store(
                 spark_runtime::fast_weights::FastSafetensorsLoader::new()
             };
             loader.peak_memory_multiplier = mult;
+            loader.demand_paged_patterns = demand_paged_patterns(config);
+            if !loader.demand_paged_patterns.is_empty() {
+                tracing::info!(
+                    "Demand-paged (never resident, read by row at use time): {:?}",
+                    loader.demand_paged_patterns
+                );
+            }
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
