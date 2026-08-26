@@ -141,3 +141,7 @@ adapters35/
 # #531 (since excised from history). Never track them.
 .buncache/
 .buntmp/
+
+# Golden WEIGHT dumps (regenerable from the checkpoint, ~80 MB each).
+# The expected-output goldens beside them are small and DO stay tracked.
+bench/**/*_weights.npz

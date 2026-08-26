@@ -138,8 +138,23 @@ __device__ __forceinline__ void qhc_collapse(
 
     qhc_stream_rms(x, H, hc, eps, smem_rms, smem_red);
 
-    // normed(i) for i in [0, hc*H): x[i] * rms_inv[i / H] * hc_norm_w[i].
-    #define QHC_NORMED(i) ((x)[(i)] * smem_rms[(i) / H] * (float)hc_norm_w[(i)])
+    // normed(i) for i in [0, hc*H): x[i] * rms_inv[i / H] * (1 + hc_norm_w[i]).
+    //
+    // The `1.0f +` is NOT optional and NOT the usual Qwen convention.
+    // `Qwen4ExpTextRMSNorm.forward` is `normed * (1.0 + weight)` with the
+    // parameter initialised to ZEROS — Gemma's offset-from-1 form — while the
+    // GDN block's `Qwen4ExpTextRMSNormGated` beside it is the ordinary
+    // `weight * normed` initialised to ones. The checkpoint settles it: every
+    // plain-RMSNorm tensor in this model centres near 0 (`hc_norm` -0.06,
+    // `q_norm` 0.28, `ple.norm_key` -0.11) and the gated GDN norm centres at
+    // 0.97. Dropping the offset scales each stream by `w` instead of `1 + w`,
+    // which for w~0 is a near-null mix — plausible activations, wrong model.
+    //
+    // Atlas dispatches this globally via `ships_vanilla_norm_weights`, which
+    // correctly leaves `qwen4_exp` on the offset-from-1 path; this kernel
+    // hand-rolls its own grouped norm and has to match it by hand.
+    #define QHC_NORMED(i) \
+        ((x)[(i)] * smem_rms[(i) / H] * (1.0f + (float)hc_norm_w[(i)]))
 
     // ── down: [rank, hc*H] @ normed -> [rank], then silu(v / hc) ──
     for (unsigned int r = tid; r < rank; r += QHC_BLOCK) {

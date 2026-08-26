@@ -177,3 +177,53 @@ simply the wrong rows — fluent, confident, wrong, with nothing in the log.
 This is the same failure class flagged for the additive-vs-cross-attention
 reading, and it is why #746's `ngram_parity.py`-style bit-exactness harness
 has to be rebuilt for Qwen's scheme before PLE is wired.
+
+---
+
+## 5. Correction: PLE runs on model layer 1, not layer 2
+
+§2 above and Avarok #753 both read `ple_layer_ids: [2]` as "model layer 2".
+`ple_layer_ids` is **1-indexed**. From the decoder layer's constructor
+(L1202):
+
+```python
+ple_layer_index = config.ple_layer_ids.index(layer_idx + 1) if layer_idx + 1 in config.ple_layer_ids else None
+```
+
+so `[2]` selects `layer_idx == 1`, and the checkpoint agrees — the tensors
+are at `model.language_model.layers.1.ple.*`, with nothing under `layers.2`.
+
+`ple_layer_index` (the POSITION within `ple_layer_ids`, `0` here) is also
+what seeds `_build_layer_multipliers`, not the layer id. Getting either
+wrong gives valid rows from the wrong table region: fluent, confident, wrong.
+
+## 6. Correction: the plain RMSNorm is offset-from-1
+
+The model uses **two** norm classes with **different conventions**, side by
+side in the same block:
+
+| class | forward | init | used by |
+|---|---|---|---|
+| `Qwen4ExpTextRMSNorm` | `normed * (1.0 + weight)` | **zeros** | `q_norm`, `k_norm`, indexer `q/k_layernorm`, `hc_norm`, PLE `norm_key`/`norm_query`/`norm_conv` |
+| `Qwen4ExpTextRMSNormGated` | `weight * normed` | ones | the GDN block's `norm` |
+
+The checkpoint confirms it — plain-RMSNorm tensors centre near 0
+(`hc_norm` −0.06, `q_norm` 0.28, `ple.norm_key` −0.11) and the gated GDN norm
+centres at 0.97.
+
+Atlas already dispatches this globally via `ships_vanilla_norm_weights`
+(`crates/spark-model/src/lib.rs`), which lists only `deepseek_v4` and
+`laguna` as vanilla and therefore leaves `qwen4_exp` on the offset-from-1
+kernel. That is correct and needs no change.
+
+What it does NOT cover is any kernel that hand-rolls its own norm.
+`hyper_connection.cu` did, and dropped the offset; `bench/qwen4_exp/hc_golden.py`
+measured the error at `max|diff| = 4.65` against the reference. **PLE's three
+norms are the same class and carry the same offset** — phase D must not
+repeat it.
+
+This is the mirror image of the LongCat trap in `681d4b61`: there,
+`common/rms_norm.cu`'s `(1 + w)` was wrong for a model needing plain `w`.
+Here the common kernel is right and the vendored one was wrong. The lesson is
+the same either way — the convention is a property of the model, and a norm
+with the wrong one looks plausible and is wrong.

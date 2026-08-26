@@ -16,13 +16,13 @@ Three forward mechanisms are unported. From `ARCHITECTURE.md`:
 | | mechanism | where | state |
 |---|---|---|---|
 | B | mHC low-rank residual | all 48 layers | kernel written, **never validated**, wired nowhere |
-| C | PLE n-gram injection | model layer 2 | unbuilt |
+| C | PLE n-gram injection | model layer **1** | unbuilt |
 | D | QSA indexer | 12 full-attn layers | **provably inert at <=2048** — deferred, not skipped |
 
 Only B and C stand between here and a token. D is arithmetic-exempt inside the
 budget the model currently fits in (see `ARCHITECTURE.md` §3) and is v2 work.
 
-### Two defects found while sizing this — both silent, both live today
+### Four defects found while sizing this — all silent, all live today
 
 `attn_layer_idx` counts **attention layers only** (0..11), not model layers.
 The mHC path in `qwen3_attention` was written for DeepSeek-V4, where every
@@ -40,14 +40,41 @@ layer is attention and the two indices coincide. On this model they do not:
 
 Neither throws. Both are on the list below as part of phase B.
 
-### One more, in the same family
+### Two more, in the same family
 
-The attention mHC path runs `rms_norm(hidden, input_norm)` on `hc_pre`'s
-output before the block (`prefill_inner.rs:614`). Qwen has **no per-layer
-input_layernorm** — `hc_norm` inside `hc_pre` occupies that role, and the
-loader supplies ones-filled placeholders. A second RMS pass over an already
-mixed-and-normed vector is a different function, and ones-weights do not make
-it identity. The low-rank path must skip it.
+3. **A second RMS pass on the mHC output.** The attention mHC path runs
+   `rms_norm(hidden, input_norm)` after `hc_pre` (`prefill_inner.rs:614`).
+   Qwen has **no per-layer input_layernorm** — `hc_norm` inside `hc_pre`
+   occupies that role, and the loader supplies ones-filled placeholders. A
+   second RMS pass over an already mixed-and-normed vector is a different
+   function, and ones-weights do not make it identity. The low-rank path must
+   skip it.
+
+4. **`hc_norm` dropped the offset-from-1.** *(Found and fixed in phase A —
+   the gate earning its keep before a single golden was compared.)*
+   `hyper_connection.cu` hand-rolled its grouped norm as `x * rms * w`.
+   `Qwen4ExpTextRMSNorm.forward` is `normed * (1.0 + weight)` with the
+   parameter initialised to **zeros** — Gemma's convention — while the
+   `Qwen4ExpTextRMSNormGated` used by the GDN block beside it is the ordinary
+   `weight * normed` initialised to ones. The checkpoint settles it: every
+   plain-RMSNorm tensor centres near 0 and the gated GDN norm centres at 0.97.
+
+   | tensor | mean | std |
+   |---|---|---|
+   | `layers.3.self_attn.q_norm` | 0.2833 | 0.0610 |
+   | `layers.3.self_attn.indexer.q_layernorm` | −0.0372 | 0.0651 |
+   | `layers.0.attn_hyper_connection.hc_norm` | −0.0635 | 0.4729 |
+   | `layers.1.ple.norm_key` | −0.1067 | 0.0841 |
+   | `layers.0.linear_attn.norm` *(gated)* | **0.9668** | 0.0326 |
+
+   For `w ≈ 0` the missing offset is a near-null mix: finite, plausible,
+   wrong. Measured against the reference it is `max|diff| = 4.65`.
+
+   Atlas already dispatches this globally through
+   `ships_vanilla_norm_weights`, which correctly leaves `qwen4_exp` on the
+   offset-from-1 path — so `q_norm`/`k_norm` were never affected. Only the
+   hand-rolled norm inside this kernel was. **The same offset applies to
+   PLE's `norm_key` / `norm_query` / `norm_conv` in phase D.**
 
 ---
 
@@ -85,12 +112,17 @@ the Rust work without contending for anything.
 to nothing. Validate before wiring, not after — otherwise every phase-B and
 phase-C bug is debugged against an unproven kernel.
 
-- [ ] `slice_ckpt.py` — pull layer-0 `attn_hyper_connection` + layer-2 `ple.*`
-      weights out of the checkpoint into a small `.npz` (mirrors
-      `bench/ngram_ref/make_slice_ckpt.py`)
-- [ ] `hc_ref.py` — run `Qwen4ExpTextGatedResidual` on fixed inputs, dump
-      `mixed_input`, `hyper_input`, `injection_weights`
-- [ ] `ple_ref.py` — same for `Qwen4ExpTextPLELayer`: gate pre/post signed
+- [x] `hc_golden.py` — runs the real `Qwen4ExpTextGatedResidual` on real
+      checkpoint weights at all **three** sites (`layers.0.attn_`,
+      `layers.0.mlp_`, and the model-level `hyper_connection_mixer`, which is
+      `use_combine=False` and has no `block_inject_weight`). Dumps
+      `mixed_input` / `hyper_input` / `injection_weights`
+- [x] **The reference is the shipped one.** `transformers` 5.16.1 carries
+      `qwen4_exp` natively and is **byte-identical** to
+      `ref/modeling_qwen4_exp.py`, so the golden runs against the real module,
+      not a vendored transcription
+- [x] Defect 4 above, caught here
+- [ ] `ple_golden.py` — same for `Qwen4ExpTextPLELayer`: gate pre/post signed
       sqrt, `gated_value`, conv output
 - [ ] Rust probe (`#[ignore]` GPU test) loading the `.npz`, launching the four
       entry points, reporting max-abs and cosine per output
@@ -98,8 +130,16 @@ phase-C bug is debugged against an unproven kernel.
       or the kernel is wrong and phase B does not start**
 
 The grouped-RMSNorm detail (`group_size = hidden`, four independent 2560-wide
-norms inside the 10240 vector) is the single most likely kernel error and the
-one this catches.
+norms inside the 10240 vector) is the single most likely kernel error, so the
+golden's fixed input deliberately gives the four streams **unequal** scales
+(0.25 / 1 / 4 / 16). With equal scales a global RMS agrees with the grouped
+one and the bug hides; with these, the wrong reading is `max|diff| = 15.2`.
+
+`hc_golden.npz` (0.9 MB — inputs and expected outputs) is tracked;
+`hc_golden_weights.npz` (79 MB, pulled verbatim from the checkpoint) is
+gitignored and regenerated by the same script.
+
+    /path/to/venv/bin/python -u bench/qwen4_exp/hc_golden.py
 
 ### B — mHC on the attention layers · medium
 
@@ -150,7 +190,7 @@ already read `normed` and write `out_proj_buf` and touch the residual nowhere.
 - [ ] Retire `ensure_no_unwired_hc`
 
 **Milestone: greedy generation with PLE stubbed.** Output is *wrong* — model
-layer 2's injection is missing — so it stays behind an explicit
+layer 1's injection is missing — so it stays behind an explicit
 `ATLAS_QWEN4EXP_NO_PLE=1` that logs a loud warning and is refused by default.
 It is a diagnostic that proves the mHC spine end to end, not a result.
 
@@ -172,7 +212,7 @@ does not** — LongCat is a polynomial rolling hash, Qwen is SplitMix64.
       9-step state; SiLU; add
 - [ ] Per-sequence conv state for decode (9 steps x 10240) — new state, sized
       into the KV/state budget
-- [ ] Inject into the 10240 highway **before** layer 2's attn hyper-connection
+- [ ] Inject into the 10240 highway **before** model layer **1**'s attn hyper-connection — `ple_layer_ids` is 1-INDEXED (`ple_layer_ids.index(layer_idx + 1)`), so `[2]` means `layer_idx == 1`, and the checkpoint confirms it: the tensors are at `layers.1.ple.*`
 - [ ] Bit-exactness harness for the IDs, in the shape of #746's
       `ngram_parity.py` — a wrong hash returns valid rows from a 320M-row
       table and nothing in the log ever says so
