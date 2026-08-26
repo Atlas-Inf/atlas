@@ -34,6 +34,7 @@ pub fn hc_pre_lowrank(
     w: &HcLowRank,
     y_out: DevicePtr,
     inj_out: DevicePtr,
+    scratch: DevicePtr,
     num_tokens: u32,
     hidden_size: u32,
     hc_mult: u32,
@@ -45,6 +46,27 @@ pub fn hc_pre_lowrank(
         "hc_pre_lowrank needs block_inject_weight; a site loaded without one \
          is the model-level mixer and must use hc_head_lowrank"
     );
+    // SMALL T (decode): three multi-block launches instead of the fused
+    // kernel, whose grid=[T] means grid=[1] at decode — one block, one SM,
+    // ~13 MB of weights per call (measured 2.0 ms; the whole token was
+    // 96 x that). The fused kernel stays for prefill, where grid=[T]
+    // already fills the machine and skips the global round trip.
+    if num_tokens <= 64 && !scratch.is_null() {
+        return hc_pre_split(
+            gpu,
+            streams,
+            w,
+            y_out,
+            inj_out,
+            scratch,
+            num_tokens,
+            hidden_size,
+            hc_mult,
+            norm_eps,
+            /* inject */ true,
+            stream,
+        );
+    }
     // Block 1024 + dynamic shared for the staged normed vector [hc*H] and
     // the rank vector — the warp-cooperative core. This launch WAS the whole
     // decode budget at block 256 with per-thread serial rows (4.5 ms/call,
@@ -80,12 +102,29 @@ pub fn hc_head_lowrank(
     streams: DevicePtr,
     w: &HcLowRank,
     y_out: DevicePtr,
+    scratch: DevicePtr,
     num_tokens: u32,
     hidden_size: u32,
     hc_mult: u32,
     norm_eps: f32,
     stream: u64,
 ) -> Result<()> {
+    if num_tokens <= 64 && !scratch.is_null() {
+        return hc_pre_split(
+            gpu,
+            streams,
+            w,
+            y_out,
+            DevicePtr::NULL,
+            scratch,
+            num_tokens,
+            hidden_size,
+            hc_mult,
+            norm_eps,
+            /* inject */ false,
+            stream,
+        );
+    }
     let smem = (hc_mult * hidden_size + w.rank as u32) * 4;
     KernelLaunch::new(gpu, kernel)
         .grid([num_tokens, 1, 1])
@@ -132,5 +171,72 @@ pub fn hc_post_lowrank(
         .arg_ptr(out)
         .arg_u32(hidden_size)
         .arg_u32(hc_mult)
+        .launch(stream)
+}
+
+/// The three-launch collapse for small T. Same math as the fused kernel;
+/// the parity probe's T=8 fixture runs THIS path.
+#[allow(clippy::too_many_arguments)]
+fn hc_pre_split(
+    gpu: &dyn GpuBackend,
+    streams: DevicePtr,
+    w: &HcLowRank,
+    y_out: DevicePtr,
+    inj_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    norm_eps: f32,
+    inject: bool,
+    stream: u64,
+) -> Result<()> {
+    let hc_dim = hc_mult * hidden_size;
+    // Scratch layout: normed [T<=64, hc_dim] then low [T<=64, rank], F32.
+    let normed = scratch;
+    let low = scratch.offset(64 * hc_dim as usize * 4);
+
+    let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage")?;
+    let k_down = gpu.kernel("hyper_connection", "hc_pre_down")?;
+    let k_fin = gpu.kernel("hyper_connection", "hc_pre_finish")?;
+
+    KernelLaunch::new(gpu, k_stage)
+        .grid([num_tokens, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(w.norm_w)
+        .arg_ptr(normed)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .arg_f32(norm_eps)
+        .launch(stream)?;
+
+    // Spread rank rows over enough blocks to occupy the part even at T=1.
+    let dsplit = (48 / num_tokens.max(1)).clamp(1, 10);
+    KernelLaunch::new(gpu, k_down)
+        .grid([num_tokens, dsplit, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(normed)
+        .arg_ptr(w.down_w)
+        .arg_ptr(low)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .arg_u32(w.rank as u32)
+        .launch(stream)?;
+
+    let fsplit = (48 / num_tokens.max(1)).clamp(1, 10);
+    KernelLaunch::new(gpu, k_fin)
+        .grid([num_tokens, fsplit, 1])
+        .block([256, 1, 1])
+        .shared_mem(w.rank as u32 * 4)
+        .arg_ptr(normed)
+        .arg_ptr(low)
+        .arg_ptr(w.up_w)
+        .arg_ptr(if inject { w.inject_w } else { DevicePtr::NULL })
+        .arg_ptr(y_out)
+        .arg_ptr(inj_out)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .arg_u32(w.rank as u32)
         .launch(stream)
 }

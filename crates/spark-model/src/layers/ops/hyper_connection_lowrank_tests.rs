@@ -195,12 +195,18 @@ fn hc_lowrank_matches_reference() {
     let streams = upload(g, &f.bytes("streams"));
     let y_out = g.alloc(t * h * 2).unwrap();
     let inj_out = g.alloc(t * hc * 4).unwrap();
+    // Sized as the BufferArena sizes it (64-token ceiling). With the T=8
+    // fixture this routes hc_pre/hc_head through the SPLIT collapse — the
+    // three-launch decode path — so the parity gate covers the fast path,
+    // not just the fused prefill kernel.
+    let scratch = g.alloc(64 * (hc * h + f.rank) * 4).unwrap();
 
     // ── hc_pre: the per-layer collapse, both sites ──
     for site in ["attn", "mlp"] {
         let w = site_weights(g, &f, site, true);
         ops::hc_pre_lowrank(
-            g, k_pre, streams, &w, y_out, inj_out, t as u32, h as u32, hc as u32, f.eps, stream,
+            g, k_pre, streams, &w, y_out, inj_out, scratch, t as u32, h as u32, hc as u32, f.eps,
+            stream,
         )
         .unwrap();
         g.synchronize(stream).unwrap();
@@ -226,7 +232,7 @@ fn hc_lowrank_matches_reference() {
     //    model's final norm — the checkpoint ships no `model.norm.weight`.
     let w_head = site_weights(g, &f, "head", false);
     ops::hc_head_lowrank(
-        g, k_head, streams, &w_head, y_out, t as u32, h as u32, hc as u32, f.eps, stream,
+        g, k_head, streams, &w_head, y_out, scratch, t as u32, h as u32, hc as u32, f.eps, stream,
     )
     .unwrap();
     g.synchronize(stream).unwrap();

@@ -87,6 +87,7 @@ pub struct BufferArena {
     hc_post: DevicePtr,
     /// HC `comb` Sinkhorn matrix: [M, hc_mult, hc_mult] F32.
     hc_comb: DevicePtr,
+    hc_lowrank_scratch: DevicePtr,
     /// GDN FLA chunked-prefill scratch (W|U|S|uc sub-divided). NULL unless the
     /// model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
     gdn_fla_scratch: DevicePtr,
@@ -185,6 +186,7 @@ impl BufferArena {
         let hc_streams = gpu.alloc(sizes.hc_streams)?;
         let hc_post = gpu.alloc(sizes.hc_post)?;
         let hc_comb = gpu.alloc(sizes.hc_comb)?;
+        let hc_lowrank_scratch = gpu.alloc(sizes.hc_lowrank_scratch)?;
         // GDN FLA scratch: only allocate for the 128-dim-linear-head GDN path
         // (size 0 → NULL → ATLAS_GDN_FLA dispatch stays disabled).
         let ssd_scratch = if sizes.ssd_scratch > 0 {
@@ -287,6 +289,7 @@ impl BufferArena {
             hc_streams,
             hc_post,
             hc_comb,
+            hc_lowrank_scratch,
             gdn_fla_scratch,
             ssd_scratch,
             token_ids,
@@ -353,6 +356,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             hc_streams,
             hc_post,
             hc_comb,
+            hc_lowrank_scratch,
             gdn_fla_scratch,
             ssd_scratch,
             token_ids,
@@ -394,6 +398,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             *o_latent,
             *norm_unit_w,
             *hc_streams,
+            *hc_lowrank_scratch,
             *hc_post,
             *hc_comb,
             *gdn_fla_scratch,
@@ -442,6 +447,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
         *o_latent = DevicePtr::NULL;
         *norm_unit_w = DevicePtr::NULL;
         *hc_streams = DevicePtr::NULL;
+        *hc_lowrank_scratch = DevicePtr::NULL;
         *hc_post = DevicePtr::NULL;
         *hc_comb = DevicePtr::NULL;
         *gdn_fla_scratch = DevicePtr::NULL;

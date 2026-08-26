@@ -318,3 +318,157 @@ extern "C" __global__ void hc_post(
         }
     }
 }
+
+// ── Split collapse, for SMALL T (decode) ─────────────────────────────────
+// grid=[1] starves the fused kernel at decode: one block, one SM, ~13 MB of
+// weights per call (measured 2.0 ms). These three launches spread the same
+// math across the whole GPU; the Rust dispatcher picks them when
+// `num_tokens` is small and keeps the fused kernel for prefill.
+
+// Stage 1: normed = x * rms * (1 + w) -> global scratch [T, hc*H].
+extern "C" __global__ void hc_pre_stage(
+    const float* __restrict__ streams,
+    const __nv_bfloat16* __restrict__ hc_norm_w,
+    float* __restrict__ normed_out,            // [T, hc*H]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const float eps
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const float* x = streams + (size_t)t * hc_dim;
+    float* out = normed_out + (size_t)t * hc_dim;
+
+    __shared__ float smem_rms[QHC_MAX_MULT];
+    __shared__ float smem_red[QHC_WBLOCK / 32];
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int warps = blockDim.x >> 5;
+
+    for (unsigned int s2 = 0; s2 < hc; ++s2) {
+        const float* xs = x + (size_t)s2 * H;
+        float acc = 0.0f;
+        for (unsigned int d = tid; d < H; d += blockDim.x) {
+            float v = xs[d];
+            acc += v * v;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) smem_red[warp] = acc;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = 0.0f;
+            for (unsigned int w2 = 0; w2 < warps; ++w2) tot += smem_red[w2];
+            smem_rms[s2] = rsqrtf(tot / (float)H + eps);
+        }
+        __syncthreads();
+    }
+    for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
+        out[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
+    }
+}
+
+// Stage 2: low[r] = silu(down[r] . normed / hc), rank rows split over
+// blockIdx.y. Warp per row, coalesced lane strides.
+extern "C" __global__ void hc_pre_down(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const __nv_bfloat16* __restrict__ down_w,  // [rank, hc*H]
+    float* __restrict__ low_out,               // [T, rank]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int warps = blockDim.x >> 5;
+    const unsigned int hc_dim = hc * hidden_size;
+    const float* nx = normed + (size_t)t * hc_dim;
+    const float inv_hc = 1.0f / (float)hc;
+
+    // Rows split first across grid.y, then across warps in the block.
+    const unsigned int rows_per_split = (rank + gridDim.y - 1) / gridDim.y;
+    const unsigned int r0 = blockIdx.y * rows_per_split;
+    const unsigned int r1 = min(r0 + rows_per_split, rank);
+    for (unsigned int r = r0 + warp; r < r1; r += warps) {
+        const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
+        float acc = 0.0f;
+        for (unsigned int i = lane; i < hc_dim; i += 32) {
+            acc += (float)row[i] * nx[i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) low_out[(size_t)t * rank + r] = qhc_silu(acc * inv_hc);
+    }
+}
+
+// Stage 3: y[d] = mean_s sigmoid(up[s*H+d] . low) * normed[s*H+d], the
+// d-range split over blockIdx.y; block y==0 also emits the injection vector.
+extern "C" __global__ void hc_pre_finish(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const float* __restrict__ low,             // [T, rank]
+    const __nv_bfloat16* __restrict__ up_w,    // [hc*H, rank]
+    const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
+    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    float* __restrict__ inj_out,               // [T, hc] (unused if null inject)
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const float* nx = normed + (size_t)t * hc_dim;
+    const float inv_hc = 1.0f / (float)hc;
+
+    extern __shared__ float smem_lo[];         // [rank]
+    for (unsigned int r = tid; r < rank; r += blockDim.x) {
+        smem_lo[r] = low[(size_t)t * rank + r];
+    }
+    __syncthreads();
+
+    const unsigned int d_per_split = (H + gridDim.y - 1) / gridDim.y;
+    const unsigned int d0 = blockIdx.y * d_per_split;
+    const unsigned int d1 = min(d0 + d_per_split, H);
+    __nv_bfloat16* y = y_out + (size_t)t * H;
+    for (unsigned int d = d0 + tid; d < d1; d += blockDim.x) {
+        float mixed = 0.0f;
+        for (unsigned int s2 = 0; s2 < hc; ++s2) {
+            const unsigned int i = s2 * H + d;
+            const __nv_bfloat16* urow = up_w + (size_t)i * rank;
+            float acc = 0.0f;
+            for (unsigned int r = 0; r < rank; ++r) {
+                acc += (float)urow[r] * smem_lo[r];
+            }
+            mixed += qhc_sigmoid(acc) * nx[i];
+        }
+        y[d] = __float2bfloat16(mixed * inv_hc);
+    }
+
+    if (inject_w != nullptr && blockIdx.y == 0) {
+        const unsigned int lane = tid & 31u;
+        const unsigned int warp = tid >> 5;
+        const unsigned int warps = blockDim.x >> 5;
+        for (unsigned int s2 = warp; s2 < hc; s2 += warps) {
+            const __nv_bfloat16* row = inject_w + (size_t)s2 * hc_dim;
+            float acc = 0.0f;
+            for (unsigned int i = lane; i < hc_dim; i += 32) {
+                acc += (float)row[i] * nx[i];
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+            }
+            if (lane == 0) {
+                inj_out[(size_t)t * hc + s2] = 2.0f * qhc_sigmoid(acc * inv_hc);
+            }
+        }
+    }
+}

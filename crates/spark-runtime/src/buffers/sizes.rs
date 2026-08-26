@@ -55,6 +55,13 @@ pub struct BufferSizes {
     pub hc_post: usize,
     /// HC `comb` Sinkhorn matrix: `[M, hc_mult, hc_mult]` F32.
     pub hc_comb: usize,
+    /// Low-rank mHC split-collapse scratch (Qwen3.8-Flash-Next): the staged
+    /// normed vector `[T, hc_mult*hidden]` F32 plus the rank vector
+    /// `[T, hc_lowrank]` F32, for SMALL T only — decode runs the collapse as
+    /// three multi-block launches because grid=[1] starves the fused kernel
+    /// (measured 2.0 ms/call, one SM's bandwidth). Sized for 64 tokens; the
+    /// dispatcher falls back to the fused kernel above that.
+    pub hc_lowrank_scratch: usize,
     /// Token IDs `[M]` u32 for the current pass — stable across the layer loop
     /// so DeepSeek-V4 hash-MoE layers can read `tid2eid[token_id]`. Always
     /// allocated (small); unused by models without hash routing.
@@ -468,6 +475,12 @@ impl BufferSizes {
             } else {
                 256
             },
+            hc_lowrank_scratch: if config.hc_mult > 0 && config.hc_lowrank > 0 {
+                let t = m.min(64);
+                t * (config.hc_mult * h + config.hc_lowrank) * 4
+            } else {
+                256
+            },
             // Token IDs [M] u32 (stable across the layer loop for hash-MoE).
             token_ids: (m * 4).max(256),
             ffn_act_q8,
@@ -504,6 +517,7 @@ impl BufferSizes {
             + self.scratch
             + self.expert_gate_out
             + self.expert_up_out
+            + self.hc_lowrank_scratch
             + self.expert_down_out
             + self.splitk_workspace
             + self.gdn_fla_scratch
