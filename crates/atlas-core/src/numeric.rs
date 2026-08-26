@@ -330,7 +330,7 @@ pub fn nvfp4_dequant(
     cols: usize,
     group: usize,
 ) -> Result<Vec<f32>, String> {
-    if cols % 2 != 0 || !cols.is_multiple_of(group) {
+    if !cols.is_multiple_of(2) || !cols.is_multiple_of(group) {
         return Err(format!("NVFP4 needs an even, group-aligned {cols}"));
     }
     let packed_cols = cols / 2;
@@ -355,7 +355,7 @@ pub fn nvfp4_dequant(
         for col in 0..cols {
             let byte = packed[row * packed_cols + col / 2];
             // Low nibble is the even column.
-            let nibble = if col % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            let nibble = if col.is_multiple_of(2) { byte & 0x0F } else { byte >> 4 };
             let block = fp8_e4m3_to_f32(scale[row * scale_cols + col / group]);
             out[row * cols + col] = FP4_E2M1[nibble as usize] * block * global;
         }
