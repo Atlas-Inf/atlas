@@ -8,9 +8,11 @@ name: Coverage
 #
 # Cost note: this is a second full instrumented compile of the workspace, on
 # top of ci.yml's `test` job (they cannot share artifacts — `-C
-# instrument-coverage` is a different profile). Runner capacity DID become the
-# constraint; the `pull_request` trigger is gone as of 2026-08-26 and the job
-# now runs on main and weekly. See the trigger block below.
+# instrument-coverage` is a different profile). Capacity did become the
+# constraint, and this note's own advice was taken: as of 2026-08-26 the
+# `pull_request` trigger sits behind a path filter on `crates/**` rather than
+# being deleted, and main + a weekly cron carry the trend. See the trigger
+# block below.
 
 on:
   # Manually runnable. During the 2026-08-06 Actions incident, webhook triggers
@@ -19,24 +21,30 @@ on:
   # can only be started by an event you do not control is a check you cannot
   # get a verdict from when you most need it.
   workflow_dispatch:
-  # NO `pull_request` trigger as of 2026-08-26.
+  # PATH-FILTERED on PRs, as this file's own cost note asked for.
   #
-  # This job is a SECOND full instrumented compile of the workspace, on top of
-  # ci.yml's `test` job — they cannot share artifacts, because
-  # `-C instrument-coverage` is a different profile. It was 108 runner-minutes
-  # a week, all of it duplicating a compile that had already happened in the
-  # same PR.
+  # This is a second full instrumented compile of the workspace on top of
+  # ci.yml's `test` job — they cannot share artifacts, `-C instrument-coverage`
+  # is a different profile. An earlier revision of this branch deleted the
+  # `pull_request` trigger outright. That was the wrong lever: the argument for
+  # it was runner cost, and this repository is PUBLIC on standard hosted
+  # runners, where Actions minutes are free. The 2x/10x multipliers are
+  # private-repo billing and do not apply. The real constraint is concurrent-job
+  # capacity, and this is one ubuntu job — it does not compete for the scarce
+  # macOS pool.
   #
-  # Neither Codecov status is a required check (this repo's only ruleset,
-  # `main-protect`, is enforcement `disabled` and carries just deletion +
-  # non_fast_forward), so nothing was ever gated on the per-PR number — it was
-  # a graph nobody was blocked by. The trend is what the graph is for, and a
-  # trend does not need a point per push: main after every merge, plus a
-  # weekly floor so a quiet week still plots.
-  #
-  # The cost of this: a coverage regression is now visible after merge rather
-  # than during review. If you want the number on a specific PR, dispatch this
-  # workflow against its branch.
+  # So the filter, not the axe. Honest about what it buys: `crates/**` is where
+  # essentially all the code lives, so 11 of the last 14 PRs still match it.
+  # It skips docs-only, CI-only and workflow-only PRs — worth having, not a
+  # large cut. Keep `cargo llvm-cov --workspace` and this filter in sync; a
+  # workspace-wide command behind a narrower filter reports stale coverage.
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/coverage.yml'
+      - 'codecov.yml'
   push:
     branches: [main, master]
   schedule:

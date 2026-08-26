@@ -7,21 +7,14 @@ on:
   # can only be started by an event you do not control is a check you cannot
   # get a verdict from when you most need it.
   workflow_dispatch:
-    inputs:
-      build_distros:
-        description: "Also run the 9-platform release build matrix"
-        type: boolean
-        required: false
-        default: false
-  # `labeled` is added to the DEFAULT set (opened/synchronize/reopened) so that
-  # applying `build:distros` to an open PR actually starts a run — without it
-  # the label would only take effect on the next push. Every other label change
-  # also re-runs the cheap gates; that is the price of the opt-in and it is a
-  # few runner-minutes. It cannot recurse through `pr-conflict-label`, which
-  # writes `needs-rebase` with the default GITHUB_TOKEN, and GitHub does not
-  # start workflows from that token's writes.
+  # Default types (opened/synchronize/reopened). `labeled` is deliberately NOT
+  # here: this workflow's concurrency group is `cancel-in-progress`, so a run
+  # started by a label would CANCEL the in-flight run for the same ref. Any
+  # label change at all — not just `build:distros` — would kill a CI run that
+  # was most of the way through and restart it from scratch. The opt-in
+  # experimental matrix listens for the label in distros.yml instead, which has
+  # its own concurrency group and cannot disturb this one.
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main, master]
   # Merge queue: entries are validated on a temporary `gh-readonly-queue/**`
@@ -158,10 +151,28 @@ jobs:
 
   # `test-macos-metal` was REMOVED on 2026-08-26.
   #
-  # It was a ~2.7-minute job, but macOS runners weigh 10x, and at 32 runs a
-  # week it was 867 weighted runner-minutes — the single most expensive thing
-  # in CI once the release matrix went opt-in, and more than every other
-  # non-matrix job in this file combined.
+  # Read the reason carefully, because the obvious one is WRONG. This job was
+  # first cut on a runner-cost argument — ~2.7 minutes at a 10x macOS
+  # multiplier, 32 runs a week. That argument does not hold: this repository is
+  # PUBLIC and every runner in the tree is standard GitHub-hosted, where Actions
+  # minutes are free. The 2x/10x multipliers are private-repo billing.
+  #
+  # What is real is CONCURRENCY. Public repos still sit under a concurrent-job
+  # cap, and the macOS pool is by far the tightest. Before this change each push
+  # asked for THREE macOS jobs at once — this one plus the two `macos-*-metal`
+  # matrix entries — and nine workflows were observed simultaneously queued on
+  # 2026-08-26. Removing this frees the scarcest pool for the two matrix entries
+  # that still want it on a release.
+  #
+  # The second reason is a product call, recorded so it is not mistaken for an
+  # oversight: macOS/Metal is not a priority for this project right now.
+  #
+  # A REJECTED ALTERNATIVE, kept because it is the right fix if metal comes
+  # back: the job ran FOUR compiles of the same code — `cargo check` twice,
+  # then `cargo test`, then `cargo build` — and the two `check`s are subsumed by
+  # the later `build`, buying only a nicer failure message for most of the
+  # job's ~4m41s. Collapsing four compiles into one preserves every assertion
+  # at a fraction of the runtime. Do that rather than restoring it verbatim.
   #
   # What it checked, so that restoring it is a copy from git history rather
   # than a rewrite (`git show <this-commit>^:.github/workflows/ci.yml`):
@@ -181,66 +192,46 @@ jobs:
   # cargo-deny runs in security.yml with path filters on Cargo.toml / Cargo.lock /
   # deny.toml plus a weekly cron. Not duplicated here.
 
-  # OPT-IN. This matrix is nine (OS, arch, GPU) builds — Windows CUDA alone
-  # takes ~34 minutes, and macOS runners bill at 10x — so on 2026-08-26 it was
-  # measured at ~89 of the ~101 runner-minutes a single PR push spent in CI,
-  # roughly 190 BILLABLE minutes once the runner multipliers are applied. It
-  # ran on every push to every PR, which is what made Actions unusable here.
+  # The two builds that can actually fail a PR — and only those two.
   #
-  # Distributables are a RELEASE artifact, so they are now built when someone
-  # asks for them, by one of three routes:
+  # `release-build.yml` sets each build's `continue-on-error` from the entry's
+  # `experimental` flag. Seven of the nine entries in release-matrix.json are
+  # `experimental: true`, which makes them STRUCTURALLY INCAPABLE of turning a
+  # PR red — including `windows-x86_64-nvidia-cuda`, at ~34 minutes the longest
+  # job in this repository. Running them per-push bought latency and queue
+  # pressure in exchange for no verdict at all.
   #
-  #   1. `release.yml` (workflow_dispatch) — the real thing. Takes any `ref`
-  #      and defaults `dry_run: true`, so pointing it at a PR branch builds
-  #      and uploads the full matrix without tagging or publishing anything.
-  #      This is the escape hatch for "does my branch still package?" and it
-  #      needed no new machinery.
-  #   2. `dev-release.yml` — rolling `bNNNN` prereleases off green main.
-  #   3. This job, for when the answer has to appear in the PR's own checks
-  #      table: apply the `build:distros` label, or dispatch CI with
-  #      `build_distros: true`.
+  # The two that DO gate are `linux-x86_64-nvidia-cuda` and
+  # `linux-aarch64-nvidia-cuda`, and they are also the two cheapest: both are
+  # native builds on free hosted runners (`ubuntu-24.04`, `ubuntu-24.04-arm`),
+  # ~8 and ~5 minutes. `linux-aarch64` in particular is the PRIMARY TARGET —
+  # GB10 / DGX Spark is arm64 Grace — so dropping it from PRs would remove
+  # per-PR verification of the one platform this project exists to serve. They
+  # stay, unconditionally, on every PR.
   #
-  # Deliberately NOT gated on merge_group any more. Nothing in this repo's
-  # ruleset (`main-protect`, enforcement `disabled`, rules: deletion +
-  # non_fast_forward) makes this a required check, and there is no merge queue
-  # for it to report into. If a queue is ever turned on and this becomes
-  # required, restore `github.event_name == 'merge_group'` to the condition
-  # below — a required check that never reports hangs every queue entry.
+  # The other seven are opt-in through `distros.yml` (label `build:distros`),
+  # or via `release.yml`'s dispatch with `dry_run: true`, which takes any ref
+  # and needed no new machinery. `dev-release.yml` still cuts rolling `bNNNN`
+  # prereleases off green main.
+  #
+  # Not gated on merge_group: this repo's only ruleset (`main-protect`) is
+  # enforcement `disabled` with just deletion + non_fast_forward, so nothing
+  # here is a required check and there is no queue to report into. If a queue
+  # is ever enabled and this becomes required, restore
+  # `github.event_name == 'merge_group'` below — a required check that never
+  # reports hangs every queue entry.
   release-matrix:
     name: release matrix
-    # github.event.number is empty on workflow_dispatch, so the version string
-    # falls back to the literal `0.0.0-prdispatch`. It only ever names a
-    # throwaway artifact (retention 1 day) and is never tagged.
-    if: >-
-      (github.event_name == 'pull_request'
-       && contains(github.event.pull_request.labels.*.name, 'build:distros'))
-      || (github.event_name == 'workflow_dispatch' && inputs.build_distros)
+    if: github.event_name == 'pull_request'
     needs: [fmt, clippy, license-headers, typos, kernel-structure, test]
     uses: ./.github/workflows/release-build.yml
     with:
-      version: 0.0.0-pr${{ github.event.number || 'dispatch' }}
+      version: 0.0.0-pr${{ github.event.number }}
       pr_mode: true
+      # The whole point: gating entries only.
+      include_experimental: false
       retention_days: 1
 
-  # OBSERVE-ONLY, and structurally incapable of being anything else.
-  #
-  # This job asks a language model what the pull request is *for*, and records
-  # the answer. It does not gate. `pr-benchmark-gate` below neither `needs:`
-  # this job nor reads its outputs — the `--pr` flag that job now passes keys
-  # a lookup of the COMMITTED governance ledger in the checked-out tree, which
-  # only a default-branch harvester can write, so nothing this job emits can
-  # reach that gate inside the same run. There is no path — not a slow one,
-  # not a subtle one — by which this reaches a verdict. That separation is the
-  # design, not a rollout stage: the inputs are attacker-controlled (a PR's
-  # title and body are written by whoever opened it), and arranging for that
-  # text to be UNABLE to affect verification is stronger than hoping a model
-  # resists it. The one input that is NOT attacker-controlled on a fork —
-  # labels, which need triage permission — is exactly the one allowed to
-  # short-circuit the model. See the override step.
-  #
-  # What it is for right now is evidence. Before any category is allowed to add
-  # verification, the log has to show what it would have said, on real pull
-  # requests, including the ones where it abstained.
   # PARKED 2026-08-26, together with governance-harvest.yml, which is the ONLY
   # consumer of the artifact this job uploads. That workflow has never
   # succeeded on this repo — it dies at `createPullRequest` because "Allow
