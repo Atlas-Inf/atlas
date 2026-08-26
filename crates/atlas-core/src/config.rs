@@ -255,6 +255,36 @@ pub struct ModelConfig {
     /// Independent hash splits K per n-gram size (LongCat-Lite: 4).
     #[serde(default)]
     pub emb_split_num: usize,
+    /// Rows per n-gram HEAD, absolute (`ngram_vocab_size_base`).
+    ///
+    /// The Qwen4-Exp form of the same idea LongCat expresses as a ratio:
+    /// LongCat says "ratio x vocab_size rows per table", Qwen says
+    /// "20,000,000 rows per head" outright. Mutually exclusive with
+    /// `ngram_vocab_size_ratio` — whichever the checkpoint declares wins,
+    /// and the authoritative per-head sizes/offsets ship as I64 tensors
+    /// (`ngram_heads_vocab_sizes` / `ngram_heads_offsets`) which the loader
+    /// reads rather than re-deriving. 0 = not a base-form checkpoint.
+    #[serde(default)]
+    pub ngram_vocab_size_base: usize,
+    /// Physical shard count of the n-gram table (`split_ngram_parts`).
+    ///
+    /// PURELY a file-layout fact, NOT an architectural one: Qwen4-Exp stores
+    /// one logical `[sum(head_vocabs), ngram_dim]` table as 128 equal
+    /// `shard_N.weight` tensors. The head ranges are independent of the
+    /// shard boundaries and a head can straddle several shards, so the row
+    /// cache must address the logical table and translate. 0 = unsharded.
+    #[serde(default)]
+    pub ngram_split_parts: usize,
+    /// Decoder layers that carry a PLE (per-layer-embedding) n-gram
+    /// injection (`ple_layer_ids`). Qwen4-Exp injects at ONE layer, not at
+    /// the token embedding the way LongCat does — which is why this is a
+    /// layer list and not a flag. Empty = no PLE.
+    #[serde(default)]
+    pub ple_layer_ids: Vec<usize>,
+    /// Depthwise conv width inside the PLE block (`ple_conv_kernel_size`).
+    /// 0 = no conv.
+    #[serde(default)]
+    pub ple_conv_kernel_size: usize,
 
     // ── DeepSeek-V4 low-rank / grouped output projection + mHC ──
     /// Output projection latent dimension for low-rank O projection.
@@ -290,6 +320,16 @@ pub struct ModelConfig {
     /// DeepSeek-V4 default is 1e-6.
     #[serde(default)]
     pub hc_eps: f32,
+    /// Rank of the hyper-connection input mixer (`hc_lowrank`).
+    ///
+    /// Qwen4-Exp mixes the `hc_mult` residual streams through a LOW-RANK
+    /// pair — `input_mix_weight_down [r, hc_mult*hidden]` then
+    /// `input_mix_weight_up [hc_mult*hidden, r]` — where DeepSeek-V4 uses a
+    /// Sinkhorn-normalized square matrix. The two share `hc_mult` and the
+    /// stream-major layout but NOT the mixing math, so a non-zero value here
+    /// selects the low-rank variant. 0 = DeepSeek-V4's Sinkhorn form.
+    #[serde(default)]
+    pub hc_lowrank: usize,
     /// Per-layer compression ratios for hybrid attention (CSA/HCA).
     /// 0 = full attention, >0 = compressed attention with that ratio.
     /// Length equals num_hidden_layers. Empty = all layers full attention.
@@ -615,7 +655,7 @@ pub use parsers::{
 };
 pub(crate) use parsers::{
     parse_deepseek_v4, parse_gemma4_params, parse_laguna, parse_longcat_ngram, parse_minimax_m2,
-    parse_step3p7, parse_vision_config,
+    parse_qwen4_exp, parse_step3p7, parse_vision_config,
 };
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
