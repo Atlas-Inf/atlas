@@ -147,17 +147,32 @@ pub(super) fn build_sampling(
             state.default_top_p
         })
     };
+    // min_p / top_n_sigma precedence: explicit request > MODEL.toml preset >
+    // CLI default. The preset arm was declared but never consulted, so
+    // `--default-min-p 0.08` and `--default-top-n-sigma 1.0` reached every
+    // request no matter what the model card said — and stacked on top of a
+    // tight top_k they can gut the distribution. `Some(0.0)` is how a model
+    // says "no filter"; `None` leaves the CLI default owning the field, which
+    // is what every model without a `[sampling.*]` entry still gets.
     let top_n_sigma = if force_temp_zero {
         0.0
     } else {
         req.sampling
             .top_n_sigma
+            .or(if core_preset {
+                preset.top_n_sigma
+            } else {
+                None
+            })
             .unwrap_or(state.default_top_n_sigma)
     };
     let min_p = if force_temp_zero {
         0.0
     } else {
-        req.sampling.min_p.unwrap_or(state.default_min_p)
+        req.sampling
+            .min_p
+            .or(if core_preset { preset.min_p } else { None })
+            .unwrap_or(state.default_min_p)
     };
     let repetition_penalty = if force_temp_zero {
         1.0
@@ -197,6 +212,21 @@ pub(super) fn build_sampling(
     } else {
         temperature
     };
+    // One line, once per process: what the sampler ACTUALLY runs with after
+    // request > preset > CLI-default resolution. Sampling bugs are otherwise
+    // invisible — the values live in three places and only their resolution
+    // matters.
+    {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                "sampling resolved (first request): temp={temperature:.3} top_p={top_p:.3} \
+                 top_k={top_k} min_p={min_p:.4} top_n_sigma={top_n_sigma:.4} \
+                 rep_pen={repetition_penalty:.3} (core_preset={core_preset})"
+            );
+        });
+    }
     let dry_multiplier = if force_temp_zero {
         0.0
     } else {

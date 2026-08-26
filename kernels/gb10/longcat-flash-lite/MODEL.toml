@@ -59,24 +59,44 @@ temperature = 0.7
 top_p = 0.95
 top_k = 4
 repetition_penalty = 1.06
+# The card asks for NO min-p and NO sigma filter. Declaring 0 explicitly is
+# how a model overrides Atlas's --default-min-p 0.08 / --default-top-n-sigma
+# 1.0, which would otherwise stack on top of an already-tight top_k = 4.
+min_p = 0.0
+top_n_sigma = 0.0
 
 [sampling.thinking_coding]
 temperature = 0.7
 top_p = 0.95
 top_k = 4
 repetition_penalty = 1.06
+# The card asks for NO min-p and NO sigma filter. Declaring 0 explicitly is
+# how a model overrides Atlas's --default-min-p 0.08 / --default-top-n-sigma
+# 1.0, which would otherwise stack on top of an already-tight top_k = 4.
+min_p = 0.0
+top_n_sigma = 0.0
 
 [sampling.non_thinking]
 temperature = 0.7
 top_p = 0.95
 top_k = 4
 repetition_penalty = 1.06
+# The card asks for NO min-p and NO sigma filter. Declaring 0 explicitly is
+# how a model overrides Atlas's --default-min-p 0.08 / --default-top-n-sigma
+# 1.0, which would otherwise stack on top of an already-tight top_k = 4.
+min_p = 0.0
+top_n_sigma = 0.0
 
 [sampling.tools]
 temperature = 0.7
 top_p = 0.95
 top_k = 4
 repetition_penalty = 1.06
+# The card asks for NO min-p and NO sigma filter. Declaring 0 explicitly is
+# how a model overrides Atlas's --default-min-p 0.08 / --default-top-n-sigma
+# 1.0, which would otherwise stack on top of an already-tight top_k = 4.
+min_p = 0.0
+top_n_sigma = 0.0
 
 [behavior]
 # MLA latent values exceed FP8 E4M3 range — same rule as the other MLA
