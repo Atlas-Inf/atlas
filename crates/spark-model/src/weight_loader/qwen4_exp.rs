@@ -487,6 +487,21 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         dense(store, &format!("{pfx}.embed_tokens.weight")).context("qwen4_exp: tied lm_head")
     }
 
+    fn load_vision_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::VisionEncoder>> {
+        // The ViT tower IS the Qwen3-VL family shape the qwen35 loader
+        // already reads: 27 blocks under `model.visual.*`, patch 16,
+        // spatial-merge 2, plain BF16 weights (no quant tensors under
+        // `visual` in this checkpoint), empty deepstack list. The
+        // qwen3.8-flash-next kernel target ships its own vision_encoder.cu
+        // shadow, so kernels resolve per-target as usual.
+        crate::weight_loader::qwen35::Qwen35WeightLoader.load_vision_encoder(store, config, gpu)
+    }
+
     fn load_mtp_weights(
         &self,
         _store: &WeightStore,
