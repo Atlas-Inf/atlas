@@ -997,9 +997,19 @@ fn qwen4_exp_fixture_parses_the_hybrid_moe_layout() {
     assert_eq!(cfg.num_key_value_heads, 2);
     assert_eq!(cfg.head_dim, 256);
     assert_eq!(cfg.gqa_ratio(), 12);
-    assert!(
-        !cfg.attn_gated,
-        "q/k/v/o + q_norm/k_norm, no interleaved gate"
+    // Gated Q. The published q_proj is [12288, 2560]; 24 heads x head_dim 256
+    // is 6144, so the projection is 2x wide and carries an interleaved gate.
+    // Getting this wrong halves the Q the model actually attends with.
+    assert!(cfg.attn_gated, "q_proj is 2x q_dim: Q and gate interleaved");
+    assert_eq!(
+        cfg.num_attention_heads * cfg.head_dim * 2,
+        12288,
+        "must match the checkpoint's q_proj rows"
+    );
+    assert_eq!(
+        cfg.num_attention_heads * cfg.head_dim,
+        6144,
+        "must match the checkpoint's o_proj columns"
     );
 
     // Linear attention. `output_gate_type = "sigmoid"` is this pathway's gate

@@ -258,11 +258,18 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             // skip the top-K renormalisation. Same trap the qwen3_5 arm above
             // handles, for the same reason.
             config.norm_topk_prob = true;
-            // Ungated Q: the full-attention layers carry q/k/v/o plus q_norm and
-            // k_norm, with no interleaved gate. (`output_gate_type = "sigmoid"`
-            // describes the LINEAR-attention gate, which is its own tensor,
-            // `linear_attn.in_proj_z`.)
-            config.attn_gated = false;
+            // Q IS gated, and the checkpoint is the only place that says so:
+            // `q_proj` is `[12288, 2560]` where 24 heads x head_dim 256 is only
+            // 6144. The reference builds it as `num_attention_heads * head_dim
+            // * 2` and splits per head -- `chunk(view(..., -1, head_dim * 2),
+            // 2, dim=-1)` -- which is exactly the interleaved Q+gate layout
+            // `attn_gated` means. `o_proj` is `[2560, 6144]`, confirming the
+            // gate is consumed rather than projected out.
+            //
+            // Note this is a SEPARATE gate from `output_gate_type = "sigmoid"`,
+            // which belongs to the linear-attention pathway and has its own
+            // tensor (`linear_attn.in_proj_z`).
+            config.attn_gated = true;
             config.nested_config = true;
             if raw.get("vision_config").is_some() {
                 config.vision = parse_vision_config(&raw);
