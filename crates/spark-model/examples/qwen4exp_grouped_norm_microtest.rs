@@ -59,7 +59,7 @@ fn main() -> Result<()> {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        (state >> 40) as f32 / 8192.0 - 1.0
+        (state >> 40) as f32 / 16_777_216.0 * 2.0 - 1.0
     };
     let input: Vec<f32> = (0..TOKENS * wide)
         .map(|i| next() * (1.0 + (i / HIDDEN % GROUPS) as f32))
@@ -167,7 +167,7 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        (state >> 40) as f32 / 16384.0 - 0.5
+        (state >> 40) as f32 / 16_777_216.0 - 0.5
     };
     let round = |v: &f32| bf16::from_f32(*v).to_f32();
 
