@@ -66,6 +66,8 @@ mod gemv_q2_vec;
 mod gemv_sw;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
+#[path = "ops/hyper_connection_dispatch.rs"]
+mod hyper_connection_dispatch;
 #[path = "ops/hyper_connection_lowrank.rs"]
 mod hyper_connection_lowrank;
 #[cfg(test)]
@@ -166,6 +168,7 @@ pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
 pub use hyper_connection::*;
+pub use hyper_connection_dispatch::*;
 pub use hyper_connection_lowrank::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;

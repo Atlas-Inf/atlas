@@ -315,6 +315,13 @@ fn attach_hc(
         hc_mult: config.hc_mult,
         sinkhorn_iters: 0,
         hc_eps: config.rms_norm_eps as f32,
+        // MODEL layer indices, not attention-layer ones. With a 3:1
+        // GDN:attention interleave, model layer 0 is GDN and the last model
+        // layer (47) is attention — so the layer that seeds the highway and
+        // the layer that collapses it are DIFFERENT concrete types, and
+        // neither is identified by `attn_layer_idx`.
+        is_first_model_layer: idx == 0,
+        is_last_model_layer: idx + 1 == config.num_hidden_layers,
     };
     if let Some(l) = any.downcast_mut::<crate::layers::Qwen3AttentionLayer>() {
         l.set_hc_weights(w);

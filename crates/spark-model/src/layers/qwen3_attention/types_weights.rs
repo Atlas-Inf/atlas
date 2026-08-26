@@ -207,4 +207,22 @@ pub struct HcWeights {
     pub hc_mult: usize,
     pub sinkhorn_iters: usize,
     pub hc_eps: f32,
+    /// Whether this is model layer 0 — the layer that seeds the highway with
+    /// `hc_expand`.
+    ///
+    /// Carried here rather than derived from `attn_layer_idx`, which counts
+    /// ATTENTION layers. On DeepSeek-V4 every layer is attention and the two
+    /// indices coincide; on a 3:1 GDN:attention interleave they do not, and
+    /// `attn_layer_idx == 0` is model layer 3 — three layers after the
+    /// highway needed seeding.
+    pub is_first_model_layer: bool,
+    /// Whether this is the LAST model layer — the one that collapses the
+    /// highway with `hc_head`.
+    ///
+    /// Same reason. The old guard was `attn_layer_idx + 1 ==
+    /// num_hidden_layers`, i.e. `12 == 48` on this model: never true, so the
+    /// LM head would have read an uncollapsed stream. On Qwen that also means
+    /// an UNNORMALIZED one, since `hyper_connection_mixer` is the model's
+    /// final norm and the checkpoint ships no `model.norm.weight`.
+    pub is_last_model_layer: bool,
 }

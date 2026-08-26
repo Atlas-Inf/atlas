@@ -368,6 +368,18 @@ impl DeepseekV4MtpHead {
         // ── 5. mHC head: collapse hc_mult streams → single h_out (is_last) ──
         let h_out = ctx.buffers.hidden_states();
         if let Some(ref head) = self.module.hc_head {
+            // This path stays on DeepSeek's Sinkhorn launch. `hc_head`'s
+            // low-rank twin takes a different argument list behind the same
+            // kernel name, so a low-rank head arriving here would be
+            // dispatched as Sinkhorn and read `hc_fn`/`hc_scale`/`hc_base`,
+            // which are NULL on that variant. Qwen's MTP is dropped for v1
+            // (Avarok #753 item I); if it is ever revived this becomes a
+            // dispatch, not an assert.
+            anyhow::ensure!(
+                head.lowrank.is_none(),
+                "deepseek_v4_mtp: low-rank mHC head reached the Sinkhorn MTP \
+                 path; this module has no low-rank dispatch"
+            );
             ops::hc_head(
                 ctx.gpu,
                 self.hc_head_k,
