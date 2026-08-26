@@ -19,7 +19,7 @@
 use crate::gpu::GpuBackend;
 use crate::weights::{
     WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
-    estimate_load_bytes, evict_page_cache, f16_to_bf16_bytes, parse_expert_index,
+    estimate_load_bytes, evict_page_cache, f16_to_bf16_bytes,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -90,6 +90,9 @@ impl Default for FastSafetensorsLoader {
     }
 }
 
+#[path = "skip.rs"]
+mod skip;
+
 impl FastSafetensorsLoader {
     pub fn new() -> Self {
         Self {
@@ -116,37 +119,6 @@ impl FastSafetensorsLoader {
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
-        }
-    }
-
-    fn should_skip_tensor(&self, name: &str) -> bool {
-        // MTP head weights for a model whose loader does not build one.
-        if self.skip_mtp && name.starts_with("mtp.") {
-            return true;
-        }
-        // W4A4 activation scales: never read on the w4a16 path (the NVFP4
-        // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
-        // almost pure granule padding at expert scale.
-        if self.skip_activation_scales && name.ends_with(".input_scale") {
-            return true;
-        }
-        if self.ep_world_size <= 1 {
-            return false;
-        }
-        if name.starts_with("mtp.") {
-            return false;
-        }
-        if let Some(idx) = parse_expert_index(name) {
-            let per_rank = self.num_experts / self.ep_world_size;
-            let local_start = self.ep_rank * per_rank;
-            let local_end = if self.ep_rank == self.ep_world_size - 1 {
-                self.num_experts
-            } else {
-                local_start + per_rank
-            };
-            idx < local_start || idx >= local_end
-        } else {
-            false
         }
     }
 }

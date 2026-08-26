@@ -617,6 +617,8 @@ fn load_hc_site(
         hc_fn,
         hc_base,
         hc_scale,
+        // DeepSeek-V4 keeps the Sinkhorn mixer; None selects it.
+        lowrank: None,
     })
 }
 

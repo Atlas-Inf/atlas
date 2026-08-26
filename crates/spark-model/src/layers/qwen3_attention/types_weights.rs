@@ -139,6 +139,32 @@ pub struct CompressorWeights {
     pub stage: spark_runtime::gpu::DevicePtr,
 }
 
+/// Qwen3.8-Flash-Next's LOW-RANK hyper-connection parameters for one site.
+///
+/// Present instead of — never alongside — the Sinkhorn `hc_fn`/`hc_base`/
+/// `hc_scale` triple above. DeepSeek-V4 mixes the `hc_mult` streams with a
+/// Sinkhorn-normalized matrix; Qwen mixes them through a rank-`rank` pair.
+/// Both share the `[T, hc_mult, H]` highway and `hc_mult`, so the presence of
+/// this struct — not the model name — is what selects the kernel.
+///
+/// All BF16, matching the checkpoint. See `bench/qwen4_exp/ARCHITECTURE.md` §1.
+#[derive(Clone, Copy)]
+pub struct HcLowRank {
+    /// `hc_norm` `[hc_mult*hidden]`. A GROUPED RMSNorm scale: the streams
+    /// normalize independently inside the vector, `group_size = hidden`.
+    pub norm_w: DevicePtr,
+    /// `input_mix_weight_down` `[rank, hc_mult*hidden]`.
+    pub down_w: DevicePtr,
+    /// `input_mix_weight_up` `[hc_mult*hidden, rank]`.
+    pub up_w: DevicePtr,
+    /// `block_inject_weight` `[hc_mult, hc_mult*hidden]`. NULL on the
+    /// model-level mixer, which is built `use_combine=False` and emits no
+    /// injection vector.
+    pub inject_w: DevicePtr,
+    /// `hc_lowrank` (320 on this checkpoint).
+    pub rank: usize,
+}
+
 /// Per-block Manifold-Constrained Hyper-Connection (mHC) parameters for one
 /// site (attention or FFN). All buffers are float32 device pointers, matching
 /// the checkpoint dtype. See `ops::hc_pre` / `ops::hc_post`.
@@ -150,6 +176,9 @@ pub struct HcSiteWeights {
     pub hc_base: DevicePtr,
     /// Mix scale: `[3]` f32 (pre / post / comb scalars).
     pub hc_scale: DevicePtr,
+    /// Qwen low-rank variant. `Some` => dispatch the low-rank kernels and
+    /// IGNORE `hc_fn`/`hc_base`/`hc_scale` (which are NULL in that case).
+    pub lowrank: Option<HcLowRank>,
 }
 
 /// Both HC sites for a DeepSeek-V4 block: the attention site runs before/after
@@ -164,6 +193,9 @@ pub struct HcHeadWeights {
     pub hc_base: DevicePtr,
     /// Mix scale: `[1]` f32.
     pub hc_scale: DevicePtr,
+    /// Qwen low-rank variant of the model-level mixer. `Some` => low-rank
+    /// kernels; its `inject_w` is NULL (`use_combine=False`).
+    pub lowrank: Option<HcLowRank>,
 }
 
 pub struct HcWeights {
