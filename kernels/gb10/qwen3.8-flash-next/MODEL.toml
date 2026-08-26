@@ -103,6 +103,11 @@ temperature = 1.0
 top_p = 0.95
 top_k = 20
 
+# Without this the [sampling.*] presets above apply only to non-core paths and
+# a plain /v1/completions or /v1/chat/completions still gets Atlas's generic
+# defaults (greedy) — and greedy + thinking degenerates on short prompts.
+use_sampling_presets_for_core = true
+
 [[model_types]]
 model_type = "qwen4_exp"
 hidden_size = 2560
