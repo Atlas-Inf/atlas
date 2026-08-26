@@ -31,6 +31,8 @@ use crate::weight_map::{DenseWeight, Fp8Weight, QuantizedWeight, SsmWeights};
 /// - **Sequential** (3.5-35B): plain GEMV → `[Q|K|V|Z]` already in order
 #[allow(dead_code)]
 pub struct Qwen3SsmLayer {
+    /// mHC weights when the model carries a `hc_mult`-wide highway; see `hc`.
+    pub(crate) hc: Option<crate::layers::qwen3_attention::HcWeights>,
     input_norm: DenseWeight,
     ssm: SsmWeights,
     post_attn_norm: DenseWeight,
@@ -387,7 +389,7 @@ impl Qwen3SsmLayer {
     /// At grid.x=40 the m64 tile's second CTA row is what fills the last 8 SMs
     /// (80 CTAs = 1.67 waves); the m128 tile leaves 40 CTAs = 0.83 of a wave.
     ///
-    /// ADDITIVE: below `ssm_m128_min_m()`, and at any N that does not fill the
+    /// ADDITIVE: below `gdn_flags::ssm_m128_min_m()`, and at any N that does not fill the
     /// machine on its own, this is the identical `deep_k_gemm` launch the path
     /// has always made.
     #[allow(clippy::too_many_arguments)]
@@ -402,7 +404,7 @@ impl Qwen3SsmLayer {
         k: u32,
         stream: u64,
     ) -> Result<()> {
-        if let Some(min_m) = ssm_m128_min_m()
+        if let Some(min_m) = gdn_flags::ssm_m128_min_m()
             && m >= min_m
             && n.div_ceil(128) >= self.sm_count
             && self.w4a16_gemm_t_m128_k.0 != 0
@@ -442,25 +444,6 @@ impl Qwen3SsmLayer {
     }
 }
 
-/// Batch width at which the multi-seq decode projections switch to the
-/// 128-row M-tile. `None` (kill switch `ATLAS_NO_SSM_M128`, PRESENCE check —
-/// `=0` is NOT "off") keeps the 64-row twin at every width.
-///
-/// 65 is the DERIVED crossover, not a tuned constant: `ceil(m/64) >
-/// ceil(m/128)` first holds at m=65, so m<=64 gains no weight-read reduction
-/// from the wider tile and would only pad MMA rows. Identical rule to the
-/// dense-FFN prefill macro's `m <= 64` small-M arm.
-fn ssm_m128_min_m() -> Option<u32> {
-    static M: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *M.get_or_init(|| {
-        if std::env::var("ATLAS_NO_SSM_M128").is_ok() {
-            None
-        } else {
-            Some(65)
-        }
-    })
-}
-
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
 pub mod gdn_flags;
@@ -496,3 +479,6 @@ pub use gdn_flags::{
 
 #[cfg(test)]
 mod tests;
+
+#[path = "hc.rs"]
+mod hc;

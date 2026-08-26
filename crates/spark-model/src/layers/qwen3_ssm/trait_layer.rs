@@ -31,6 +31,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.ensure_no_unwired_hc()?;
         self.decode_inner(
             hidden,
             residual,
@@ -140,6 +141,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.ensure_no_unwired_hc()?;
         self.prefill_inner(
             hidden,
             residual,

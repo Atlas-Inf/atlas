@@ -24,6 +24,9 @@ impl Qwen3SsmLayer {
         let conv_dim = nk * kd * 2 + nv * vd;
 
         Ok(Self {
+            // mHC is attached later by the loader, and only for models that
+            // carry a hc_mult-wide residual highway.
+            hc: None,
             input_norm,
             ssm,
             post_attn_norm,

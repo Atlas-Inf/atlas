@@ -344,6 +344,18 @@ pub struct ModelConfig {
     /// Maximum compressed-history rows selected per query by the semantic indexer.
     #[serde(default)]
     pub index_topk: usize,
+    /// Indexer compression ratio, recorded WITHOUT populating
+    /// `compress_ratios`.
+    ///
+    /// Qwen3.8-Flash-Next's QSA indexer is inert below its budget — selection
+    /// is `topk(min(budget/ratio, complete_blocks))`, so at
+    /// `seq_len <= index_topk` every block is chosen and dense attention is
+    /// exact. Keeping `compress_ratios` empty stops DeepSeek-V4's compressor
+    /// being dispatched in its place; keeping the ratio here lets a loader
+    /// refuse above the budget instead of silently attending densely.
+    /// 0 = no indexer.
+    #[serde(default)]
+    pub index_compress_ratio: usize,
     /// Number of hash-based attention layers (DeepSeek-V4 HCA). 0 = none.
     #[serde(default)]
     pub num_hash_layers: usize,

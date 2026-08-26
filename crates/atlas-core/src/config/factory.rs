@@ -106,6 +106,7 @@ impl ModelConfig {
             hc_lowrank: 0,
             hc_eps: 1e-6,
             compress_ratios: Vec::new(),
+            index_compress_ratio: 0,
             index_n_heads: 0,
             index_head_dim: 0,
             index_topk: 0,

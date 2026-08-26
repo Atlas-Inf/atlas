@@ -4,6 +4,9 @@
 //! `RadixArk/Qwen3.8-Flash-Next-NVFP4` config.json values.
 
 use super::*;
+// `LayerType` is only needed by these assertions — the parser itself no
+// longer references it, and `deny(warnings)` makes an unused import fatal.
+use crate::config::LayerType;
 
 /// A trimmed copy of the shipped config — every key the parser reads, with
 /// the checkpoint's actual values, so a rename upstream fails here first.
@@ -114,8 +117,17 @@ fn indexer_maps_onto_index_fields_and_only_full_attention_layers() {
     assert_eq!(c.index_n_heads, 4);
     assert_eq!(c.index_head_dim, 128);
     assert_eq!(c.index_topk, 2048, "indexer_budget -> index_topk");
-    // GDN layers have no KV to select over, so they get ratio 0.
-    assert_eq!(c.compress_ratios, vec![0, 0, 0, 4]);
+    assert_eq!(c.index_compress_ratio, 4);
+    // `compress_ratios` stays EMPTY on purpose: a non-empty value turns on
+    // `probes.compressed_attn` and dispatches DeepSeek-V4's compressor, which
+    // is a different mechanism from Qwen's QSA indexer. Below the budget the
+    // indexer is inert anyway — selection is
+    // topk(min(budget/ratio, complete_blocks)), so at seq_len <= 2048 every
+    // block is chosen and dense attention is EXACT.
+    assert!(
+        c.compress_ratios.is_empty(),
+        "must not dispatch the V4 compressor for Qwen's indexer"
+    );
 }
 
 #[test]

@@ -304,28 +304,28 @@ fn attach_hc(
     let any = layer.as_any_mut().ok_or_else(|| {
         anyhow::anyhow!("qwen4_exp layer {idx}: no as_any_mut, cannot attach mHC weights")
     })?;
-    let l = any
-        .downcast_mut::<crate::layers::Qwen3AttentionLayer>()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "qwen4_exp layer {idx}: mHC weights have nowhere to go. Only \
-                 `Qwen3AttentionLayer` implements `set_hc_weights` — \
-                 DeepSeek-V4, the model mHC was built for, is all-attention. \
-                 This model puts mHC on ALL 48 layers, so the 36 GDN layers \
-                 (`Qwen3SsmLayer`) need the same treatment: an `HcWeights` \
-                 field plus hc_pre/hc_post around the SSM block in both its \
-                 prefill and decode paths. Tracked as #753 item B."
-            )
-        })?;
-    {
-        l.set_hc_weights(HcWeights {
-            attn,
-            ffn,
-            head,
-            hc_mult: config.hc_mult,
-            sinkhorn_iters: 0,
-            hc_eps: config.rms_norm_eps as f32,
-        });
+    // TWO concrete layer types carry mHC here: the 12 full-attention layers
+    // are `Qwen3AttentionLayer`, the 36 GDN layers are `Qwen3SsmLayer`.
+    // DeepSeek-V4 only ever needed the first, which is why the second had to
+    // learn `set_hc_weights`.
+    let w = HcWeights {
+        attn,
+        ffn,
+        head,
+        hc_mult: config.hc_mult,
+        sinkhorn_iters: 0,
+        hc_eps: config.rms_norm_eps as f32,
+    };
+    if let Some(l) = any.downcast_mut::<crate::layers::Qwen3AttentionLayer>() {
+        l.set_hc_weights(w);
+        return Ok(());
     }
-    Ok(())
+    if let Some(l) = any.downcast_mut::<crate::layers::Qwen3SsmLayer>() {
+        l.set_hc_weights(w);
+        return Ok(());
+    }
+    anyhow::bail!(
+        "qwen4_exp layer {idx}: mHC weights have nowhere to go — the layer is \
+         neither Qwen3AttentionLayer nor Qwen3SsmLayer"
+    )
 }

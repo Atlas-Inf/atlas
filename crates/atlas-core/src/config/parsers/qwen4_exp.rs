@@ -27,7 +27,7 @@
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
-use super::super::{LayerType, ModelConfig};
+use super::super::ModelConfig;
 use super::vision::parse_vision_config;
 
 /// Rows-per-head that `ngram_vocab_size_base` is rounded UP to a multiple of
@@ -176,22 +176,22 @@ fn parse_indexer(text: &Value, config: &mut ModelConfig) -> Result<()> {
         config.index_topk,
     );
 
-    // Only the full-attention layers carry an indexer; the GDN layers have
-    // no KV to select over. Encoding that here means the attention path can
-    // ask `compress_ratios[l]` without re-deriving the interleave.
-    if ratio > 0 && !config.layer_types.is_empty() {
-        config.compress_ratios = config
-            .layer_types
-            .iter()
-            .map(|t| {
-                if *t == LayerType::FullAttention {
-                    ratio
-                } else {
-                    0
-                }
-            })
-            .collect();
-    }
+    // `compress_ratios` is deliberately LEFT EMPTY while the QSA indexer is
+    // unwired, because a non-empty value turns on `probes.compressed_attn`
+    // and dispatches DeepSeek-V4's compressor — a different mechanism.
+    //
+    // Below the budget that costs nothing, and not as an approximation we are
+    // choosing to tolerate: the reference selects
+    // `topk(min(block_topk, num_complete_blocks))` with
+    // `block_topk = indexer_budget / compress_ratio` (512 here). At
+    // `seq_len <= indexer_budget` there are at most `block_topk` complete
+    // blocks, so `min()` takes ALL of them and every token stays visible.
+    // Dense attention is EXACT in that range.
+    //
+    // ABOVE it the indexer becomes load-bearing, so the ratio is recorded on
+    // `index_compress_ratio` for the loader to refuse against rather than
+    // quietly attending densely. See bench/qwen4_exp/ARCHITECTURE.md §3.
+    config.index_compress_ratio = ratio;
     Ok(())
 }
 
