@@ -227,9 +227,9 @@ pub fn hyper_connection_forward(
     // Mean across streams: `hc_count * hidden` in, `hidden` out.
     let mut mixed = vec![0f32; hidden];
     for stream in 0..hc {
-        for h in 0..hidden {
-            let index = stream * hidden + h;
-            mixed[h] += gate[index] * normed[index];
+        let span = stream * hidden..(stream + 1) * hidden;
+        for ((slot, g), n) in mixed.iter_mut().zip(&gate[span.clone()]).zip(&normed[span]) {
+            *slot += g * n;
         }
     }
     for value in &mut mixed {
