@@ -5,6 +5,9 @@ pub mod dense_ffn;
 pub mod dflash_head;
 pub mod ep_dispatch;
 pub mod fp8_calibration;
+pub mod gemma4_ple;
+pub mod gemma_audio_encoder;
+pub mod gemma_vision_encoder;
 pub mod moe;
 pub mod mtp_head;
 pub(crate) mod mtp_meta;
@@ -56,6 +59,14 @@ pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
 pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
+};
+pub use gemma_audio_encoder::{
+    GemmaAudioAttnWeights, GemmaAudioEncoder, GemmaAudioFfnWeights, GemmaAudioLayerWeights,
+    GemmaAudioLightConvWeights, GemmaAudioOutputProj, GemmaAudioSubsampleWeights,
+    GemmaAudioWeights, OUT_HIDDEN_SIZE,
+};
+pub use gemma_vision_encoder::{
+    ClipLinearWeights, GemmaVisionEncoder, GemmaVisionLayerWeights, GemmaVisionWeights,
 };
 pub use moe::MoeLayer;
 pub use mtp_head::{MtpHead, MtpQuantization, mtp_drafter_prefill_enabled};

@@ -55,6 +55,14 @@ pub struct AppState {
     pub rotation_tx: Option<mpsc::Sender<crate::scheduler::LoraRotation>>,
     /// Vision config for VL models — None for text-only models.
     pub vision_config: Option<atlas_core::config::VisionConfig>,
+    /// Gemma-4 E2B vision tower config (`vision_config`) — None for text-only
+    /// 26B/31B variants and for targets without a `gemma_vision_encoder` PTX
+    /// module (text-only fallback drops it at load).
+    pub gemma_vision_config: Option<atlas_core::config::GemmaVisionConfig>,
+    /// Gemma-4 E2B audio tower config (`audio_config`) — None for text-only
+    /// 26B/31B variants and for targets without a `gemma_audio_encoder` PTX
+    /// module (text-only fallback drops it at load).
+    pub gemma_audio_config: Option<atlas_core::config::GemmaAudioConfig>,
     /// Optional vLLM-style image area cap applied before vision patching.
     pub vision_max_pixels: Option<usize>,
     /// Whether (and how) to fetch `image_url` parts carrying an http(s) URL.

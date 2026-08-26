@@ -159,6 +159,18 @@ impl TransformerModel {
             }
         }
 
+        // ── 1c. Gemma-4 E2B: splice gemma image/video/audio slot tokens
+        // (258880 / 258884 / 258881) with the towers' buf_out rows (straight
+        // copy — embed_vision/embed_audio live inside the encoders). Runs
+        // only when a gemma encode is pending; the Qwen block above is
+        // untouched and the two never coexist.
+        self.splice_gemma_media_rows(
+            &tokens[chunk_start..chunk_start + chunk_len],
+            hidden_dst,
+            h * elem_bytes,
+            stream,
+        )?;
+
         Ok(())
     }
 }

@@ -119,7 +119,10 @@ impl TransformerModel {
                 // `hidden`, whose row 0 is the BOS token) and report its norm.
                 let mut buf = vec![0u8; v_row_bytes];
                 let _ = self.gpu.copy_d2h(
-                    gve.as_ref().unwrap().buf_out().offset(v_row_base * v_row_bytes),
+                    gve.as_ref()
+                        .unwrap()
+                        .buf_out()
+                        .offset(v_row_base * v_row_bytes),
                     &mut buf,
                 );
                 let v: Vec<f32> = buf

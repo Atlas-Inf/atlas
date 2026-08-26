@@ -38,6 +38,21 @@ impl TransformerModel {
         use_graphs: bool,
         stream: u64,
     ) -> Result<()> {
+        // Gemma-4 E2B per-layer-embedding (PLE): recompute the combined
+        // per-layer input vectors for this step's token EVERY step (never
+        // cached), then arm every layer's slice. Reads token_ids() (uploaded
+        // every step before graph replay) and hidden; writes the fixed
+        // ple_combined scratch — stable addresses, CUDA-graph-capture safe.
+        if self.ple_tables.is_some() {
+            self.compute_ple(
+                self.buffers.token_ids(),
+                hidden,
+                1,
+                self.ple_combined,
+                stream,
+            )?;
+            self.ple_arm_layers(self.ple_combined);
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             layer.decode(
                 hidden,

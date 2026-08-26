@@ -55,6 +55,7 @@ pub struct Gemma4PleTables {
 /// `num_kv_shared_layers` layers — double-wide: gate/up/down project to
 /// `2 * intermediate_size`. Layers outside the band (and all non-E2B
 /// variants, where `use_double_wide_mlp` is false) keep `intermediate_size`.
+#[allow(dead_code)]
 pub(super) fn layer_intermediate_size(config: &ModelConfig, i: usize) -> usize {
     let band_start = config
         .num_hidden_layers

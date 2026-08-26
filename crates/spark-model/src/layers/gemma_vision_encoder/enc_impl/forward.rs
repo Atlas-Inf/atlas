@@ -95,10 +95,7 @@ impl GemmaVisionEncoder {
             if std::env::var("ATLAS_VISION_TIMING").is_ok() && i == 0 {
                 gpu.synchronize(stream).ok();
                 let mut buf = vec![0u8; self.head_dim * 2];
-                let _ = gpu.copy_d2h(
-                    self.buf_rope_cos.offset(1 * self.head_dim * 2),
-                    &mut buf,
-                );
+                let _ = gpu.copy_d2h(self.buf_rope_cos.offset(self.head_dim * 2), &mut buf);
                 let v: Vec<f32> = buf
                     .chunks_exact(2)
                     .map(|c| {

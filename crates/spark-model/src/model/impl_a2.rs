@@ -68,8 +68,28 @@ impl TransformerModel {
     }
 
     pub(super) fn tokens_have_vision_pad(&self, tokens: &[u32]) -> bool {
-        let (image, video) = self.vision_pad_ids();
-        tokens.iter().any(|&t| t == image || t == video)
+        let pad_id = match self.config.vision.as_ref().map(|v| v.image_pad_token_id) {
+            Some(id) if id != 0 => id,
+            _ => crate::layers::vision_encoder::IMAGE_PAD_TOKEN_ID,
+        };
+        if tokens.contains(&pad_id) {
+            return true;
+        }
+        // Gemma-4 E2B: image/video/audio slot tokens splice encoder output
+        // into the same placeholder positions, so the hashed token-ID stream
+        // is equally ambiguous across distinct media — keep the prefix cache
+        // disabled for gemma media prompts too.
+        if let Some(gv) = &self.config.gemma_vision
+            && (tokens.contains(&gv.image_token_id) || tokens.contains(&gv.video_token_id))
+        {
+            return true;
+        }
+        if let Some(ga) = &self.config.gemma_audio
+            && tokens.contains(&ga.audio_token_id)
+        {
+            return true;
+        }
+        false
     }
 
     /// Whether `--high-speed-swap` has slid this sequence's rolling window, so

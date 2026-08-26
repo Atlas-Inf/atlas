@@ -575,6 +575,285 @@ fn gemma4_legacy_config_maps_attention_and_embedding_controls() {
     assert_eq!(cfg.gqa_ratio(), 2); // 32/16
     // Rotary dim
     assert_eq!(cfg.rotary_dim(), 64); // 0.25 * 256
+    // No E2B `layer_types` → attention_types stays empty and all E2B fields
+    // fall back to defaults; behavior is byte-identical to before Wave 1.1.
+    assert!(cfg.attention_types.is_empty());
+    assert_eq!(cfg.num_kv_shared_layers, 0);
+    assert_eq!(cfg.hidden_size_per_layer_input, 0);
+    assert_eq!(cfg.vocab_size_per_layer_input, 0);
+    assert!(!cfg.use_double_wide_mlp);
+    assert_eq!(cfg.global_head_dim, 0);
+    assert!(cfg.gemma_vision.is_none());
+    assert!(cfg.gemma_audio.is_none());
+}
+
+#[test]
+fn test_parse_gemma4_e2b_config() {
+    let json = r#"{
+        "model_type": "gemma4",
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "tie_word_embeddings": true,
+        "image_token_id": 258880,
+        "audio_token_id": 258881,
+        "video_token_id": 258884,
+        "boi_token_id": 255999,
+        "eoi_token_id": 258882,
+        "boa_token_id": 256000,
+        "eoa_token_id": 258883,
+        "eos_token_id": [1, 106],
+        "text_config": {
+            "hidden_size": 1536,
+            "num_hidden_layers": 35,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "num_global_key_value_heads": null,
+            "attention_k_eq_v": false,
+            "sliding_window": 512,
+            "vocab_size": 262144,
+            "vocab_size_per_layer_input": 262144,
+            "hidden_size_per_layer_input": 256,
+            "num_kv_shared_layers": 20,
+            "use_double_wide_mlp": true,
+            "intermediate_size": 6144,
+            "max_position_embeddings": 131072,
+            "rms_norm_eps": 1e-6,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "final_logit_softcapping": 30.0,
+            "pad_token_id": 0,
+            "bos_token_id": 2,
+            "eos_token_id": 1,
+            "layer_types": [
+                "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"
+            ],
+            "rope_parameters": {
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional"
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "default"
+                }
+            }
+        },
+        "vision_config": {
+            "model_type": "gemma4_vision",
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 12,
+            "num_key_value_heads": 12,
+            "head_dim": 64,
+            "global_head_dim": 64,
+            "patch_size": 16,
+            "pooling_kernel_size": 3,
+            "position_embedding_size": 10240,
+            "use_clipped_linears": true,
+            "standardize": false,
+            "position_table_shape": [2, 10240, 768],
+            "max_soft_tokens": 280,
+            "num_frames": 32,
+            "video_soft_tokens_per_frame": 70,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "rope_theta": 100.0
+            }
+        },
+        "audio_config": {
+            "model_type": "gemma4_audio",
+            "hidden_size": 1024,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 8,
+            "subsampling_conv_channels": [128, 32],
+            "conv_kernel_size": 5,
+            "attention_chunk_size": 12,
+            "attention_context_left": 13,
+            "attention_context_right": 0,
+            "output_proj_dims": 1536,
+            "residual_weight": 0.5,
+            "use_clipped_linears": true,
+            "mel_bins": 128,
+            "frame_length": 320,
+            "hop_length": 160,
+            "fft_size": 512,
+            "mel_floor": 0.001,
+            "mel_scale": "htk",
+            "audio_seq_length": 750,
+            "rms_norm_eps": 1e-6,
+            "activation": "silu"
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    // Core text dims (asserted via the new E2B fields below where relevant).
+    assert_eq!(cfg.model_type, "gemma4");
+    assert_eq!(cfg.hidden_size, 1536);
+    assert_eq!(cfg.num_hidden_layers, 35);
+    assert_eq!(cfg.num_attention_heads, 8);
+    assert_eq!(cfg.num_key_value_heads, 1);
+    assert_eq!(cfg.head_dim, 512); // global_head_dim wins for buffer sizing
+    assert_eq!(cfg.intermediate_size, 6144);
+    assert_eq!(cfg.vocab_size, 262144);
+    assert_eq!(cfg.sliding_window, 512);
+    assert_eq!(cfg.max_position_embeddings, 131072);
+    assert_eq!(cfg.rms_norm_eps, 1e-6);
+    assert_eq!(cfg.rope_theta, 10000.0); // sliding theta
+    assert_eq!(cfg.partial_rotary_factor, 0.25);
+    assert!(cfg.tie_word_embeddings);
+    assert_eq!(cfg.final_logit_softcapping, 30.0);
+    assert_eq!(cfg.embed_scale, (1536.0_f32).sqrt());
+    assert!(cfg.nested_config);
+
+    // New E2B text-config fields.
+    assert_eq!(cfg.num_kv_shared_layers, 20);
+    assert_eq!(cfg.hidden_size_per_layer_input, 256);
+    assert_eq!(cfg.vocab_size_per_layer_input, 262144);
+    assert!(cfg.use_double_wide_mlp);
+    assert_eq!(cfg.global_head_dim, 512);
+
+    // layer_types → attention_types: full at {4,9,14,19,24,29,34}, else sliding.
+    let full_indices = [4, 9, 14, 19, 24, 29, 34];
+    assert_eq!(cfg.attention_types.len(), 35);
+    for (i, kind) in cfg.attention_types.iter().enumerate() {
+        let expected = if full_indices.contains(&i) {
+            AttentionKind::Full
+        } else {
+            AttentionKind::Sliding
+        };
+        assert_eq!(*kind, expected, "layer {i}");
+    }
+
+    // CRITICAL: layer_types stays ALL FullAttention so the SSM/hybrid paths
+    // never engage — num_attention_layers() must return all 35.
+    assert_eq!(cfg.layer_types.len(), 35);
+    assert!(
+        cfg.layer_types
+            .iter()
+            .all(|t| *t == LayerType::FullAttention)
+    );
+    assert_eq!(cfg.num_attention_layers(), 35);
+    assert_eq!(cfg.num_ssm_layers(), 0);
+
+    // Vision tower.
+    let vision = cfg
+        .gemma_vision
+        .as_ref()
+        .expect("E2B vision_config present");
+    assert_eq!(vision.hidden_size, 768);
+    assert_eq!(vision.intermediate_size, 3072);
+    assert_eq!(vision.num_hidden_layers, 16);
+    assert_eq!(vision.num_attention_heads, 12);
+    assert_eq!(vision.head_dim, 64);
+    assert_eq!(vision.patch_size, 16);
+    assert_eq!(vision.pooling_kernel_size, 3);
+    assert_eq!(vision.position_embedding_size, 10240);
+    assert!(vision.use_clipped_linears);
+    assert_eq!(vision.image_token_id, 258880);
+    // Encoder geometry / processor budget.
+    assert_eq!(vision.rope_theta, 100.0);
+    assert_eq!(vision.max_soft_tokens, 280);
+    assert_eq!(vision.max_patches, 2520); // 280 soft × 3² pooling
+    assert_eq!(vision.position_table_shape, (2, 10240, 768));
+    assert_eq!(vision.norm_eps, 1e-6);
+    assert_eq!(vision.video_frames, 32);
+    assert_eq!(vision.video_soft_tokens_per_frame, 70);
+    assert_eq!(vision.video_token_id, 258884);
+    assert_eq!(vision.boi_token_id, 255999);
+    assert_eq!(vision.eoi_token_id, 258882);
+
+    // Audio tower.
+    let audio = cfg.gemma_audio.as_ref().expect("E2B audio_config present");
+    assert_eq!(audio.hidden_size, 1024);
+    assert_eq!(audio.num_hidden_layers, 12);
+    assert_eq!(audio.num_attention_heads, 8);
+    assert_eq!(audio.subsampling_conv_channels, vec![128, 32]);
+    assert_eq!(audio.conv_kernel_size, 5);
+    assert_eq!(audio.attention_chunk_size, 12);
+    assert_eq!(audio.attention_context_left, 13);
+    assert_eq!(audio.attention_context_right, 0);
+    assert_eq!(audio.output_proj_dims, 1536);
+    assert_eq!(audio.residual_weight, 0.5);
+    assert!(audio.use_clipped_linears);
+    assert_eq!(audio.audio_token_id, 258881);
+    // Front-end / tokenizer constants.
+    assert_eq!(audio.mel_bins, 128);
+    assert_eq!(audio.frame_length, 320);
+    assert_eq!(audio.hop_length, 160);
+    assert_eq!(audio.fft_size, 512);
+    assert_eq!(audio.mel_floor, 0.001);
+    assert_eq!(audio.mel_scale, "htk");
+    assert_eq!(audio.token_cap, 750);
+    assert_eq!(audio.norm_eps, 1e-6);
+    assert_eq!(audio.activation, "silu");
+    assert_eq!(audio.boa_token_id, 256000);
+    assert_eq!(audio.eoa_token_id, 258883);
+
+    // Capabilities: E2B towers advertise vision + audio + video.
+    let caps = cfg.capabilities();
+    assert!(caps.supports_vision);
+    assert!(caps.supports_audio);
+    assert!(caps.supports_video);
+}
+
+/// Fail fast when the E2B vision_config declares zero-valued critical
+/// geometry — a 0 patch/pooling size would produce degenerate patch counts.
+#[test]
+fn test_parse_gemma4_e2b_vision_geometry_required() {
+    let json = r#"{
+        "model_type": "gemma4",
+        "text_config": {
+            "hidden_size": 1536,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 8,
+            "head_dim": 256,
+            "intermediate_size": 6144,
+            "vocab_size": 262144
+        },
+        "vision_config": {
+            "hidden_size": 768,
+            "patch_size": 0,
+            "pooling_kernel_size": 3
+        }
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(
+        err.to_string().contains("patch_size"),
+        "expected geometry error, got: {err}"
+    );
+}
+
+/// Text-only Gemma-4 variants keep the E2B towers None and advertise no
+/// vision/audio/video capability.
+#[test]
+fn test_gemma4_text_only_capabilities() {
+    let json = r#"{
+        "model_type": "gemma4",
+        "text_config": {
+            "hidden_size": 5376,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 16,
+            "head_dim": 256,
+            "intermediate_size": 21504,
+            "vocab_size": 262144,
+            "attention_pattern": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"]
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert!(cfg.gemma_vision.is_none());
+    assert!(cfg.gemma_audio.is_none());
+    let caps = cfg.capabilities();
+    assert!(!caps.supports_vision);
+    assert!(!caps.supports_audio);
+    assert!(!caps.supports_video);
 }
 
 #[test]

@@ -48,6 +48,11 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// Gemma-4 E2B per-layer-embedding (PLE): arm this layer's PLE input
+    /// gate from base. Default no-op; only the Gemma-4 attention layer
+    /// overrides it.
+    fn set_ple_base(&self, _base: DevicePtr) {}
+
     /// Whether this layer's ONLINE FP8-KV calibration has frozen its scale.
     /// `None` = this layer runs no online calibration (non-attention layer,
     /// static checkpoint scales, or a non-FP8 KV dtype). The scheduler's

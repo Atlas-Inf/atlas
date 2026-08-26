@@ -269,7 +269,6 @@ pub(crate) fn build_model(
         dtype: KvCacheDtype::Fp8,
         layer_dtypes: vec![],
         layer_dims: vec![],
-        layer_to_pool: vec![],
         cache_blocks_per_seq: None,
     };
     let kv_cache = PagedKvCache::new(kv_config, 4, &gpu).unwrap();

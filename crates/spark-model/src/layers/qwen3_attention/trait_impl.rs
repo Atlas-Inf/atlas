@@ -94,6 +94,10 @@ impl TransformerLayer for Qwen3AttentionLayer {
         Some(self)
     }
 
+    fn set_ple_base(&self, base: DevicePtr) {
+        self.set_ple_slice(base);
+    }
+
     fn fp8_calibration_frozen(&self) -> Option<bool> {
         self.fp8_calibration
             .as_ref()

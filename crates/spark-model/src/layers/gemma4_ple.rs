@@ -346,6 +346,7 @@ mod tests {
             token_ids: None,
             routed_lora_layers: None,
             midchunk_capture: None,
+            moe_lora_route: crate::layer::MoeLoraRoute::Fold,
         };
         // No launches before the call (kernels don't run on mock, but a
         // `launch` call would still be recorded)...

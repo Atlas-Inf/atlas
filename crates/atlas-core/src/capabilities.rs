@@ -45,6 +45,10 @@ pub struct ModelCapabilities {
     pub supports_thinking: bool,
     /// Model has vision encoder (multimodal).
     pub supports_vision: bool,
+    /// Model has audio encoder (multimodal).
+    pub supports_audio: bool,
+    /// Model accepts video input (video rides the vision tower).
+    pub supports_video: bool,
     /// Model has MTP (Multi-Token Prediction) draft head.
     pub has_mtp: bool,
     /// SSM architecture family (determines state layout).
@@ -74,7 +78,9 @@ impl ModelCapabilities {
             .iter()
             .any(|t| matches!(t, LayerType::FullAttention));
         let has_moe = config.num_experts > 0;
-        let has_vision = config.vision.is_some();
+        let has_vision = config.vision.is_some() || config.gemma_vision.is_some();
+        let has_audio = config.gemma_audio.is_some();
+        let has_video = config.gemma_vision.is_some();
         let has_mtp = config.mtp_num_hidden_layers > 0;
         let has_nested = config.nested_config;
 
@@ -94,6 +100,8 @@ impl ModelCapabilities {
             // be derived from tokenizer vocabulary, not architecture.
             supports_thinking: has_ssm || has_mamba2,
             supports_vision: has_vision,
+            supports_audio: has_audio,
+            supports_video: has_video,
             has_mtp,
             ssm_architecture: ssm_arch,
             has_nested_config: has_nested,

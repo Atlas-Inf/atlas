@@ -56,7 +56,7 @@ impl TransformerModel {
         // `lm_head_nvfp4`. Drafts are always verified by the main BF16 head,
         // so this approximate head never affects an accepted token.
         mtp_lm_head_nvfp4: Option<QuantizedWeight>,
-        layers: Vec<Box<dyn TransformerLayer>>,
+        mut layers: Vec<Box<dyn TransformerLayer>>,
         buffers: BufferArena,
         kv_cache: PagedKvCache,
         mtp_weights: Vec<MtpWeights>,
@@ -71,8 +71,19 @@ impl TransformerModel {
         self_speculative: bool,
         num_drafts: usize,
         vision_encoder: Option<crate::layers::VisionEncoder>,
+        // Gemma-4 E2B vision tower (Wave 2C). The gemma4 weight loader
+        // (`weight_loader/gemma4/loader_d.rs`) builds it; `None` for every
+        // other family and for text-only gemma serves.
+        gemma_vision_encoder: Option<crate::layers::GemmaVisionEncoder>,
+        // Gemma-4 E2B audio tower (Wave 4B). The gemma4 weight loader
+        // (`weight_loader/gemma4/loader_e.rs`) builds it; `None` for every
+        // other family and for text-only gemma serves.
+        gemma_audio_encoder: Option<crate::layers::GemmaAudioEncoder>,
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
+        // Gemma-4 E2B per-layer-embedding (PLE) tables — `None` for all
+        // non-E2B models (default loader impl). Loading-only for now.
+        ple_tables: Option<crate::weight_loader::Gemma4PleTables>,
     ) -> Result<Self> {
         // `rms_norm_kernel` normalizes exactly one weight: `final_norm` (a
         // checkpoint tensor). Models that ship HF-vanilla norm weights load it
@@ -647,6 +658,19 @@ impl TransformerModel {
             DevicePtr::NULL
         };
 
+        // ── Gemma-4 E2B per-layer-embedding (PLE): scratch + layer install ──
+        // Three row-major [max_batch_tokens, num_layers*256] BF16 buffers +
+        // the per-layer PLE weights / KV-shared flag install walk. All no-ops
+        // when PLE is disabled (non-E2B). Body in `impl_ple.rs`.
+        let (ple_combined, ple_combined_b, ple_identity, ple_scratch_tokens, ple_residual_add_k) =
+            super::impl_ple::allocate_ple_scratch(
+                &mut layers,
+                ple_tables.as_ref(),
+                &config,
+                buffers.max_batch_tokens(),
+                gpu.as_ref(),
+            )?;
+
         // GDN prefill buffers: sized for max_batch_tokens (the prefill chunk size),
         // NOT max_seq_len. For prompts longer than this, prefill_twophase falls back
         // to standard chunked prefill which carries h_state/conv_state between chunks.
@@ -693,6 +717,7 @@ impl TransformerModel {
             lm_head_nvfp4,
             lm_head_nvfp4_t,
             lm_head_fp8,
+            ple_tables,
             layers,
             buffers,
             lora: None,
@@ -785,6 +810,14 @@ impl TransformerModel {
             vision_row_base: Mutex::new(0),
             vision_grid_base: Mutex::new(0),
             vision_owned_images: Mutex::new(0),
+            gemma_vision_encoder,
+            gemma_vision_embed_patches: Mutex::new(0),
+            gemma_vision_soft_counts: Mutex::new(Vec::new()),
+            gemma_vision_row_base: Mutex::new(0),
+            gemma_audio_encoder,
+            gemma_audio_embed_patches: Mutex::new(0),
+            gemma_audio_soft_counts: Mutex::new(Vec::new()),
+            gemma_audio_row_base: Mutex::new(0),
             pinned_staging,
             ssm_checkpoint_interval,
             ssm_state_norm_kernel: ssm_norm_k,
@@ -808,6 +841,11 @@ impl TransformerModel {
             overlay_kernels,
             overlay_route_slot: std::sync::atomic::AtomicI32::new(-1),
             decode_moe_route: std::sync::atomic::AtomicI32::new(1), // Fold (safe default)
+            ple_combined,
+            ple_combined_b,
+            ple_identity,
+            ple_scratch_tokens,
+            ple_residual_add_k,
         })
     }
 }
