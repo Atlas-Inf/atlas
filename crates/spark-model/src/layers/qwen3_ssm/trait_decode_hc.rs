@@ -65,6 +65,12 @@ impl Qwen3SsmLayer {
             )?;
         }
 
+        // Decode never starts a sequence — prefill did — so `fresh` is false
+        // and the conv state plus the 2-token history carry from the last step.
+        if let Some(ple) = self.ple.as_ref() {
+            ple.forward(streams, 1, false, ctx, stream)?;
+        }
+
         // ── GDN sublayer. `hidden` is scratch; the highway carries state. ──
         ops::hc_pre_site(
             ctx.gpu,

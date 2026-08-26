@@ -56,6 +56,15 @@ pub struct NgramRowCache {
     /// row may straddle a 4 KiB O_DIRECT block; `fetch_into` handles the seam.
     file: File,
     base_offset: u64,
+    /// SEGMENTED tables: one base offset per equal-sized shard.
+    ///
+    /// LongCat ships each n-gram table as ONE contiguous safetensors tensor,
+    /// so `base_offset` alone locates every row. Qwen3.8-Flash-Next splits its
+    /// single 320M-row table across 128 shard tensors which are NOT laid out
+    /// consecutively in the file — the shards interleave with other weights,
+    /// so a global row id needs its shard's own base. `None` keeps the
+    /// original single-offset behaviour byte for byte.
+    segments: Option<Segments>,
     /// Per-row scale file mirror (FP8 tables), `None` for BF16 tables.
     scales: Option<ScaleCache>,
     row_stride: usize,
@@ -74,6 +83,16 @@ pub struct NgramRowCache {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+}
+
+/// A table split across equal-sized shards at scattered file offsets.
+struct Segments {
+    /// Byte offset of each shard's first row, indexed by shard.
+    bases: Vec<u64>,
+    /// Rows per shard. Every shard but conceivably the last holds exactly
+    /// this many; `open_segmented` requires them all equal so the mapping is
+    /// a divide rather than a search.
+    rows_per: u64,
 }
 
 /// Per-row f32 scales for an FP8 table, mirrored into a device-visible
@@ -165,6 +184,7 @@ impl NgramRowCache {
             arena,
             file,
             base_offset,
+            segments: None,
             scales,
             row_stride,
             slots,
@@ -179,6 +199,36 @@ impl NgramRowCache {
             misses: 0,
             evictions: 0,
         })
+    }
+
+    /// As [`Self::open_at`], but for a table split across equal-sized shards
+    /// at SCATTERED file offsets — Qwen3.8-Flash-Next's PLE table, whose 128
+    /// shard tensors are not laid out consecutively inside the safetensors
+    /// file. `bases[i]` is shard `i`'s first row; every shard holds
+    /// `rows_per_shard` rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_segmented(
+        path: &Path,
+        bases: Vec<u64>,
+        rows_per_shard: u64,
+        scale_path: Option<&Path>,
+        row_stride: usize,
+        slots: usize,
+    ) -> Result<Self> {
+        if bases.is_empty() || rows_per_shard == 0 {
+            bail!(
+                "NgramRowCache: segmented table needs shards and rows \
+                 (shards={}, rows_per_shard={rows_per_shard})",
+                bases.len()
+            );
+        }
+        let rows_total = bases.len() as u64 * rows_per_shard;
+        let mut c = Self::open_at(path, 0, scale_path, rows_total, row_stride, slots)?;
+        c.segments = Some(Segments {
+            bases,
+            rows_per: rows_per_shard,
+        });
+        Ok(c)
     }
 
     /// Device VA of the cache's row table — the `embed_table` argument of the
@@ -267,10 +317,22 @@ impl NgramRowCache {
         )
     }
 
+    /// Byte offset of row `id` in the backing file.
+    fn row_byte(&self, id: u64) -> u64 {
+        match &self.segments {
+            None => self.base_offset + id * self.row_stride as u64,
+            Some(seg) => {
+                let shard = (id / seg.rows_per) as usize;
+                let local = id % seg.rows_per;
+                seg.bases[shard] + local * self.row_stride as u64
+            }
+        }
+    }
+
     /// Read row `id` off NVMe straight into `slot`'s pinned (GPU-addressable)
     /// bytes, via the containing 4 KiB block.
     fn fetch_into(&mut self, id: u64, slot: u32) -> Result<()> {
-        let byte = self.base_offset + id * self.row_stride as u64;
+        let byte = self.row_byte(id);
         let block_off = byte - (byte % BLOCK as u64);
         let within = (byte - block_off) as usize;
         // One block unless the row crosses the boundary (possible whenever the

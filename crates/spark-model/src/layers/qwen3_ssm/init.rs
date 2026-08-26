@@ -46,6 +46,7 @@ impl Qwen3SsmLayer {
             // the same condition `ArchProbes` uses, so a plain GDN model
             // never issues the lookup.
             hc: None,
+            ple: None,
             hc_pre_k: hc_kernel(config, gpu, "hc_pre"),
             hc_post_k: hc_kernel(config, gpu, "hc_post"),
             hc_expand_k: hc_kernel(config, gpu, "hc_expand"),

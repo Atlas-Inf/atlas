@@ -51,4 +51,8 @@ pub mod ids;
 #[path = "ple/tests.rs"]
 mod tests;
 
+#[path = "ple/layer.rs"]
+mod layer;
+
 pub use ids::{PleIdDims, ple_ngram_ids};
+pub use layer::{PleLayer, PleWeights};

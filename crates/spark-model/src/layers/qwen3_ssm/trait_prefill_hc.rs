@@ -53,6 +53,7 @@ impl Qwen3SsmLayer {
         hidden: DevicePtr,
         num_tokens: usize,
         state: &mut dyn LayerState,
+        seq_len_start: usize,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -98,6 +99,16 @@ impl Qwen3SsmLayer {
                 hc.hc_mult as u32,
                 stream,
             )?;
+        }
+
+        // PLE injects into the highway BEFORE this layer's own
+        // hyper-connection — the reference's
+        // `hidden_states = hidden_states + self.ple(...)` sits above
+        // `attn_hyper_connection` in `Qwen4ExpTextDecoderLayer.forward`.
+        // `fresh` is a prefill starting at position 0: a new sequence, so the
+        // conv state and the token history both reset.
+        if let Some(ple) = self.ple.as_ref() {
+            ple.forward(streams, num_tokens, seq_len_start == 0, ctx, stream)?;
         }
 
         // ── GDN sublayer ──

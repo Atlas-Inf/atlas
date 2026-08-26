@@ -138,6 +138,10 @@ def write_bins(out_dir: str, dump: dict) -> None:
     for n in ('gated', 'gated_normed', 'output'):
         put(n, dump[n].astype(np.float32).tobytes(), 'f32')
     put('gate_sigmoid', dump['gate_sigmoid'].astype(np.float32).tobytes(), 'f32')
+    # Ids + the rows they name, so the Rust side can test the SEGMENTED row
+    # cache and the gather in isolation from everything downstream.
+    put('ids', dump['ids'].astype(np.uint64).tobytes(), 'u64')
+    put('embeddings', dump['embeddings'].astype(np.float32).tobytes(), 'f32')
     # FP32 copy of the value projection, for the probe's bisect arithmetic.
     put('value_proj_out_f32',
         dump['value_proj_out'].astype(np.float32).tobytes(), 'f32')

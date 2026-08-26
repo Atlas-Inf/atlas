@@ -819,17 +819,25 @@ impl Qwen3AttentionLayer {
         }
 
         let normed2 = ctx.buffers.norm_output();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            hidden,
-            &self.post_attn_norm,
-            normed2,
-            n,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if ops::HcVariant::of(hc).applies_block_input_norm() {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.post_attn_norm,
+                normed2,
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        } else {
+            // Qwen: the FFN site's own `hc_pre` already normed this, exactly
+            // as the attention site's did. There is no
+            // `post_attention_layernorm` in the checkpoint.
+            ctx.gpu
+                .copy_d2d_async(hidden, normed2, num_tokens * h * 2, stream)?;
+        }
 
         self.ffn
             .forward_prefill(normed2, num_tokens, ctx, stream)

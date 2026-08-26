@@ -269,3 +269,99 @@ fn ple_kernels_match_reference() {
          taps this test claims it is"
     );
 }
+
+/// The SEGMENTED row cache and the gather, isolated from everything else.
+///
+/// This is the arm that separates "PLE's math is wrong" from "PLE is reading
+/// the wrong rows" — and the second failure is invisible downstream, because
+/// every row in a 320M-row embedding table is a plausible embedding.
+///
+/// Needs the checkpoint (it reads real rows off NVMe):
+/// ```text
+/// ATLAS_PLE_TEST_DATA=/tank/atlas-testdata/qwen4exp_ple \
+/// ATLAS_PLE_CKPT=/path/to/snapshot \
+///   cargo test -p spark-model --release ple_gather -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn ple_gather_reads_the_right_rows() {
+    let f = Fx::load();
+    let snap = match std::env::var("ATLAS_PLE_CKPT") {
+        Ok(s) => s,
+        Err(_) => {
+            println!("ATLAS_PLE_CKPT unset — skipping");
+            return;
+        }
+    };
+    let head_dim = 160usize;
+    let ids: Vec<u64> = f
+        .bytes("ids")
+        .chunks_exact(8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let want = f.f32s("embeddings");
+    println!("ids={} want={} floats", ids.len(), want.len());
+
+    // Rebuild the segmented cache exactly as the loader does, straight from
+    // the safetensors header — no model load.
+    let (path, bases, rows_per) =
+        crate::weight_loader::qwen4_exp::ple_shard_layout(&snap).expect("PLE shard layout");
+    println!(
+        "shards={} rows_per={rows_per} file={}",
+        bases.len(),
+        path.display()
+    );
+    // CUDA FIRST: the cache's arena is pinned, GPU-addressable memory, so it
+    // needs a live context. The loader gets one for free; a bare test does not.
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4").unwrap();
+    let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).unwrap();
+    let g: &dyn GpuBackend = &gpu;
+    let stream = g.default_stream();
+    let k = g.kernel("embed_from_argmax", "batched_embed").unwrap();
+
+    let mut cache = spark_storage::NgramRowCache::open_segmented(
+        &path,
+        bases,
+        rows_per,
+        None,
+        head_dim * 2,
+        ids.len().next_power_of_two(),
+    )
+    .expect("segmented cache");
+
+    let mut slots = Vec::new();
+    cache.resolve(&ids, &mut slots).expect("resolve");
+    assert_eq!(slots.len(), ids.len());
+
+    let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let slots_dev = upload(g, &slot_bytes);
+    let out = g.alloc(ids.len() * head_dim * 2).unwrap();
+    ops::batched_embed(
+        g,
+        k,
+        slots_dev,
+        DevicePtr(cache.table_dev_va().unwrap()),
+        out,
+        ids.len() as u32,
+        head_dim as u32,
+        stream,
+    )
+    .unwrap();
+    g.synchronize(stream).unwrap();
+    cache.end_batch();
+
+    let got = dl_bf16_local(g, out, ids.len() * head_dim);
+    let (hits, misses, evictions) = cache.stats();
+    println!("cache: {hits} hits, {misses} misses, {evictions} evictions");
+    let nan = got.iter().filter(|v| !v.is_finite()).count();
+    println!("non-finite gathered values: {nan} / {}", got.len());
+    compare("embeddings", &got, &want);
+}
+
+fn dl_bf16_local(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Vec<f32> {
+    let mut raw = vec![0u8; n * 2];
+    g.copy_d2h(p, &mut raw).unwrap();
+    raw.chunks_exact(2)
+        .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+        .collect()
+}

@@ -33,6 +33,11 @@ use crate::weight_map::{DenseWeight, Fp8Weight, QuantizedWeight, SsmWeights};
 pub struct Qwen3SsmLayer {
     /// mHC weights when the model carries a `hc_mult`-wide highway; see `hc`.
     pub(crate) hc: Option<crate::layers::qwen3_attention::HcWeights>,
+    /// PLE n-gram injection. `Some` on exactly ONE model layer (layer 1 on
+    /// this checkpoint); it runs at the TOP of the mHC forward, before this
+    /// layer's own hyper-connection, matching the reference's
+    /// `hidden_states = hidden_states + self.ple(...)`.
+    pub(crate) ple: Option<crate::layers::ple::PleLayer>,
     /// mHC kernel handles. Resolved only when `config.hc_mult > 0`, so a
     /// plain GDN model issues no lookup and leaves no row in the startup
     /// audit. See `qwen3_attention::init_arch_gates`.

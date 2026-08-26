@@ -54,9 +54,69 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 
 mod ffn;
 mod hc;
+mod ple;
 mod probe;
 
 pub use probe::audit_namespace;
+
+/// The PLE table's shard layout, read straight from a checkpoint's
+/// safetensors header.
+///
+/// Exists so a test can rebuild the segmented row cache WITHOUT loading a
+/// 75 GB model — the gather is the one part of PLE whose failure is invisible
+/// downstream, so it needs a cheap isolated arm.
+#[cfg(test)]
+pub fn ple_shard_layout(snapshot: &str) -> Result<(std::path::PathBuf, Vec<u64>, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        std::path::Path::new(snapshot).join("model.safetensors.index.json"),
+    )?)?;
+    let map = idx["weight_map"].as_object().context("weight_map")?;
+    let mut names: Vec<(usize, &String)> = map
+        .keys()
+        .filter(|k| k.contains(".ngram_embedding.shard_"))
+        .map(|k| {
+            let n = k
+                .rsplit("shard_")
+                .next()
+                .and_then(|r| r.split('.').next())
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(usize::MAX);
+            (n, k)
+        })
+        .collect();
+    names.sort();
+    anyhow::ensure!(!names.is_empty(), "no PLE shards in {snapshot}");
+    let file = map[names[0].1].as_str().context("shard file")?;
+    let path = std::path::Path::new(snapshot).join(file);
+
+    let mut fh = std::fs::File::open(&path)?;
+    let mut len = [0u8; 8];
+    fh.read_exact(&mut len)?;
+    let hlen = u64::from_le_bytes(len);
+    let mut hdr = vec![0u8; hlen as usize];
+    fh.seek(SeekFrom::Start(8))?;
+    fh.read_exact(&mut hdr)?;
+    let hdr: serde_json::Value = serde_json::from_slice(&hdr)?;
+    let data_start = 8 + hlen;
+
+    let mut bases = Vec::with_capacity(names.len());
+    let mut rows_per = 0u64;
+    for (i, name) in &names {
+        let e = &hdr[name.as_str()];
+        let off = e["data_offsets"][0].as_u64().context("data_offsets")?;
+        let rows = e["shape"][0].as_u64().context("shape")?;
+        if *i == 0 {
+            rows_per = rows;
+        }
+        anyhow::ensure!(
+            rows == rows_per,
+            "shard {i} has {rows} rows, not {rows_per}"
+        );
+        bases.push(data_start + off);
+    }
+    Ok((path, bases, rows_per))
+}
 
 pub struct Qwen4ExpWeightLoader;
 
@@ -117,6 +177,18 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             None
         };
 
+        // PLE scratch is sized once, for the largest prefill chunk this run
+        // can present. Overridable because the ceiling is a serve flag, not a
+        // model property; the layer refuses rather than overruns if a pass
+        // exceeds it.
+        let max_ple_tokens: usize = std::env::var("ATLAS_PLE_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| config.max_position_embeddings.clamp(512, 8192));
+        // With PLE disabled for bisection, skip the 21 MB arena and the
+        // 128-shard open entirely rather than building what we will not run.
+        let ple_off = std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1");
+
         let mut layers: Vec<Box<dyn TransformerLayer>> =
             Vec::with_capacity(config.num_hidden_layers);
         let mut attn_idx = 0usize;
@@ -163,44 +235,44 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             // mHC: two sites per layer wrapping attention and the MoE. The
             // residual this model carries is `hc_mult * hidden` wide, so
             // without these the layer would run on a stream it never mixed.
+            let mut layer = layer;
             if config.hc_mult > 0 {
                 let (attn, ffn) = hc::load_layer_sites(store, &lp, config)?;
-                let mut layer = layer;
                 attach_hc(&mut layer, i, attn, ffn, hc_head.clone(), config)?;
-                layers.push(layer);
-            } else {
-                layers.push(layer);
             }
+            // PLE lands on exactly one layer, which on this checkpoint is a
+            // GDN one. `load` returns None for every other layer.
+            let ple_layer = if ple_off {
+                None
+            } else {
+                ple::load(store, config, i, max_ple_tokens, gpu)?
+            };
+            if let Some(p) = ple_layer {
+                let any = layer
+                    .as_any_mut()
+                    .ok_or_else(|| anyhow::anyhow!("qwen4_exp layer {i}: no as_any_mut for PLE"))?;
+                let l = any
+                    .downcast_mut::<crate::layers::Qwen3SsmLayer>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "qwen4_exp layer {i} carries PLE but is not a GDN layer;                              the injection has nowhere to go"
+                        )
+                    })?;
+                l.set_ple(p);
+            }
+            layers.push(layer);
         }
 
-        // The mHC highway now RUNS (PLAN.md phases B and C, validated against
-        // the reference in `hyper_connection_lowrank_tests.rs`). PLE does not.
-        //
-        // PLE injects hashed n-gram features into the 10240-wide highway at
-        // model layer 1, and the reference adds its output to the residual
-        // before that layer's attention hyper-connection. Skipping it does
-        // not crash and does not look wrong — it produces fluent text from a
-        // model missing one of its inputs. So it is refused by default, and
-        // the escape hatch is explicit, loud, and named after what it does.
-        if !config.ple_layer_ids.is_empty() {
-            anyhow::ensure!(
-                std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1"),
-                "qwen4_exp: PLE n-gram injection is unimplemented (Avarok #753 \
-                 item C). The checkpoint carries `ple_layer_ids = {:?}`, which \
-                 is 1-indexed and so means MODEL LAYER {}; its embedding table, \
-                 key/value projections, gate and dilated conv are not wired. \
-                 Serving without it yields fluent, confident output from a model \
-                 that is missing an input, with nothing in the log. Set \
-                 ATLAS_QWEN4EXP_NO_PLE=1 to serve anyway — that is a DIAGNOSTIC \
-                 for the mHC spine, not a usable model.",
-                config.ple_layer_ids,
-                config.ple_layer_ids[0].saturating_sub(1),
-            );
+        // PLE is wired (PLAN.md phase D) and validated against the reference
+        // in `ops/ple_tests.rs`. The escape hatch stays, inverted: it now
+        // DISABLES a mechanism that is present, for bisecting, and says so.
+        if !config.ple_layer_ids.is_empty()
+            && std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1")
+        {
             tracing::warn!(
-                "ATLAS_QWEN4EXP_NO_PLE=1: serving WITHOUT PLE n-gram injection \
-                 at model layer {}. Output is WRONG BY CONSTRUCTION — this arm \
-                 exists to exercise the mHC highway end to end, nothing else. \
-                 Avarok #753 item C.",
+                "ATLAS_QWEN4EXP_NO_PLE=1: PLE n-gram injection at model layer {} \
+                 is DISABLED. Output is wrong by construction — this arm exists \
+                 to bisect the mHC spine, nothing else.",
                 config.ple_layer_ids[0].saturating_sub(1),
             );
         }

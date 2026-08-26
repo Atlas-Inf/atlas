@@ -680,17 +680,21 @@ impl Qwen3AttentionLayer {
         }
 
         let normed2 = ctx.buffers.norm_output();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            hidden,
-            &self.post_attn_norm,
-            normed2,
-            1,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if ops::HcVariant::of(hc).applies_block_input_norm() {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.post_attn_norm,
+                normed2,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        } else {
+            ctx.gpu.copy_d2d_async(hidden, normed2, h * 2, stream)?;
+        }
 
         let ffn_out = self.ffn.forward(normed2, ctx, stream)?;
 

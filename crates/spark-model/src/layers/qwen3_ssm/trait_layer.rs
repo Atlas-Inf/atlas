@@ -154,7 +154,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         // different — the highway IS the residual — so this is a second entry
         // path, not a flag on the first. See `trait_prefill_hc.rs`.
         if self.hc.is_some() {
-            return self.prefill_inner_hc(hidden, num_tokens, state, ctx, stream);
+            return self.prefill_inner_hc(hidden, num_tokens, state, seq_len_start, ctx, stream);
         }
         self.prefill_inner(
             hidden,

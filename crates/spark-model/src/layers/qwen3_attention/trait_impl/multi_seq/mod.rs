@@ -335,17 +335,22 @@ impl Qwen3AttentionLayer {
                 &format!("V4-msdecode L{} comb-ffn", self.attn_layer_idx),
             );
         }
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            c.hidden,
-            &self.post_attn_norm,
-            c.normed,
-            n as u32,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if ops::HcVariant::of(hc).applies_block_input_norm() {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                c.hidden,
+                &self.post_attn_norm,
+                c.normed,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        } else {
+            ctx.gpu
+                .copy_d2d_async(c.hidden, c.normed, n * h * 2, stream)?;
+        }
 
         // Per-token sequential FFN (MLA models always take this path).
         for i in 0..n {

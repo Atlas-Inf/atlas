@@ -19,6 +19,12 @@ impl Qwen3SsmLayer {
         self.hc = Some(hc);
     }
 
+    /// Attach the PLE n-gram injection to this layer. Exactly one model layer
+    /// carries it.
+    pub fn set_ple(&mut self, ple: crate::layers::ple::PleLayer) {
+        self.ple = Some(ple);
+    }
+
     /// Refuse the batched and multi-sequence decode paths while the highway
     /// is live.
     ///

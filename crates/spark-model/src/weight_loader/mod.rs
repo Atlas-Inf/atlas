@@ -26,7 +26,8 @@ mod qwen3;
 mod qwen35;
 mod qwen35_dense;
 mod qwen3_vl;
-mod qwen4_exp;
+#[cfg_attr(test, allow(unreachable_pub))]
+pub(crate) mod qwen4_exp;
 mod step3p7;
 
 pub use deepseek_v4::DeepSeekV4WeightLoader;
