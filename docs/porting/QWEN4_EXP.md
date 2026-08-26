@@ -445,6 +445,51 @@ Three things worth stating because they are not obvious from the shapes:
 | layer wiring above | not written |
 | MTP | not written; `load_mtp_weights` returns None so `--speculative` is refused |
 
+## What the layer implementation actually needs
+
+Smaller than it looks. `TransformerLayer` has ~25 methods but only **two are
+required**: `decode` and `alloc_state`. `prefill` defaults to
+`default_loops::prefill_default`, which loops `decode` per token — correct, if
+not fast, and enough to serve.
+
+The pieces are in place:
+
+| need | state |
+|---|---|
+| grouped RMS norm | kernel ✅ verified vs oracle |
+| hyper-connection collapse / scatter | kernels ✅ verified vs oracle |
+| PLE gate + dilated conv | kernels ✅ verified vs oracle |
+| GDN with a sigmoid output gate | kernels ✅, selected from `output_gate_type` |
+| n-gram rows | `atlas_core::ngram_table`, disk-backed ✅ |
+| token ids inside a layer | `ForwardContext::token_ids` — **already exists** |
+
+That last one was the only architectural hole, and it turned out to be already
+filled: `token_ids` is a device `[num_tokens]` u32 buffer added for
+DeepSeek-V4's hash-MoE routing, carrying exactly the ids the PLE tower needs.
+
+### The PLE gather is a host round-trip, deliberately
+
+The n-gram table is on NVMe, so layer 1 has to: read the ids, hash them
+(`Qwen4ExpNgram::ngram_ids`), `pread` the rows, upload ~2.5 KB, then run the two
+PLE kernels. That serialises with the GPU stream, which sounds bad and is not:
+measured at 820 µs/token fully cold and 8.85 µs warm, against a decode step two
+orders of magnitude slower. Making it a device-side gather would require the
+51.2 GB table to be resident, which is the thing that does not fit.
+
+### Remaining work
+
+1. `Qwen4ExpLayer::alloc_state` — GDN recurrent + conv state for linear layers,
+   the PLE short-conv state (dilated, so `(kernel-1)*ngram_size` = 9 wide) for
+   layer 1, KV for the 12 attention layers.
+2. `Qwen4ExpLayer::decode` — sequence the kernels in the order under
+   "The forward pass, end to end" above.
+3. Adapt the 512-expert MoE and gated-Q attention paths.
+
+Every block in step 2 has an oracle. The CPU forward
+(`cargo run -p atlas-core --example qwen4exp_forward`) is the end-to-end check:
+it is token-identical to HuggingFace on a reduced checkpoint and produces
+coherent text on the real one.
+
 ## Provenance
 
 `crates/atlas-core/src/config/ngram_qwen4exp.rs` is an independent derivation of
