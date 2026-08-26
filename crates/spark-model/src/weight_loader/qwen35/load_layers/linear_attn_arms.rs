@@ -337,7 +337,7 @@ pub(super) fn build_linear_attention_dense_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_linear_attention_nvfp4(
+pub(crate) fn build_linear_attention_nvfp4(
     store: &WeightStore,
     lp: &str,
     gpu: &dyn GpuBackend,

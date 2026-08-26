@@ -47,6 +47,11 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
     // kernel-target resolution off the TOP-level name.
     config.model_type = "qwen4_exp".to_string();
     config.nested_config = true;
+    // Multimodal wrapper: every decoder tensor is under
+    // `model.language_model.`, and the ViT under `model.visual.`. Setting the
+    // prefix here means `config.layer_prefix(i)` yields the real key, so the
+    // shared loader helpers need no qwen4_exp-specific naming.
+    config.weight_prefix = "model.language_model".to_string();
 
     ensure!(
         config.hidden_size > 0,
