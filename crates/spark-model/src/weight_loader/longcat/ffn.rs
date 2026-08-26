@@ -38,7 +38,30 @@ pub(super) fn build_dense_ffn(
         up_proj_t: None,
         down_proj_t: None,
     };
-    Ok(FfnComponent::Dense(DenseFfnLayer::new(weights, gpu)?))
+    let mut layer = DenseFfnLayer::new(weights, gpu)?;
+
+    // Precision lever, mirroring `ATLAS_NVFP4_MLA=0` on the attention side.
+    // LongCat ships plain BF16 with no calibration metadata, so these three
+    // projections are runtime-quantized above and lose whatever 4 bits cost.
+    // The per-sublayer dense FFN is 2.94 GB of the checkpoint across all 28
+    // sublayers, so holding it in BF16 costs ~2.2 GB over NVFP4 — cheap next
+    // to the 63 GB of routed experts, which is why it is a separate switch.
+    //
+    // Both copies stay resident: `set_bf16_weights` only redirects dispatch,
+    // and the NVFP4 copy is the fallback for any arm that has no BF16 kernel.
+    if bf16_dense_ffn() {
+        layer.set_bf16_weights(
+            dense(store, &format!("{prefix}.gate_proj.weight"))?,
+            dense(store, &format!("{prefix}.up_proj.weight"))?,
+            dense(store, &format!("{prefix}.down_proj.weight"))?,
+        );
+    }
+    Ok(FfnComponent::Dense(layer))
+}
+
+/// `ATLAS_LONGCAT_BF16_FFN=1` keeps the per-sublayer dense FFN in BF16.
+pub(super) fn bf16_dense_ffn() -> bool {
+    std::env::var("ATLAS_LONGCAT_BF16_FFN").as_deref() == Ok("1")
 }
 
 /// The block's shortcut MoE: `mlp.router.*` + `mlp.experts.{e}.*`. LongCat has

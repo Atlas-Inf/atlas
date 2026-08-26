@@ -116,6 +116,9 @@ impl ModelWeightLoader for LongcatWeightLoader {
         if disable_nvfp4_mla {
             tracing::info!("LongCat: ATLAS_NVFP4_MLA=0 — MLA projections stay BF16");
         }
+        if super::longcat::ffn::bf16_dense_ffn() {
+            tracing::info!("LongCat: ATLAS_LONGCAT_BF16_FFN=1 — per-sublayer dense FFN stays BF16");
+        }
         let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
         let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
         let stream = gpu.default_stream();
