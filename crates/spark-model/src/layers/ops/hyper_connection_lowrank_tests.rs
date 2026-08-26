@@ -269,3 +269,122 @@ fn hc_lowrank_matches_reference() {
         tol_for(&want_post),
     );
 }
+
+/// The GEMM-path collapse (T > 64) against the SAME reference goldens: hc_pre
+/// is per-token independent (per-stream RMS, rank projection, gates — no
+/// cross-token term), so tiling the T=8 fixture 12x to T=96 is an EXACT
+/// large-T golden: every replica must reproduce the reference outputs. This
+/// routes through `hc_pre_gemm` (stage_bf16 + dense_gemm x3 + mix), which
+/// rounds `normed` to BF16 — covered by the same rms-relative tolerances.
+#[test]
+#[ignore]
+fn hc_pre_gemm_matches_reference() {
+    const TILE: usize = 12;
+    let f = Fixture::load();
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4").expect(
+        "qwen3.8-flash-next/nvfp4 is not in this build — \
+         build with ATLAS_TARGET_MODEL='*' or =qwen3.8-flash-next",
+    );
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let stream = g.default_stream();
+    let (t, h, hc) = (f.tokens, f.h, f.hc);
+    let big_t = t * TILE;
+    assert!(
+        big_t > 64,
+        "tiled fixture must exceed the split-path ceiling"
+    );
+
+    let k_pre = g.kernel("hyper_connection", "hc_pre").unwrap();
+    for name in ["hc_pre_stage_bf16", "hc_silu_scale", "hc_pre_mix"] {
+        let k = g.kernel("hyper_connection", name).unwrap();
+        assert!(k.0 != 0, "{name} resolved to handle 0");
+    }
+
+    let stream_bytes = f.bytes("streams");
+    let tiled: Vec<u8> = stream_bytes
+        .iter()
+        .copied()
+        .cycle()
+        .take(stream_bytes.len() * TILE)
+        .collect();
+    let streams = upload(g, &tiled);
+    let y_out = g.alloc(big_t * h * 2).unwrap();
+    let inj_out = g.alloc(big_t * hc * 4).unwrap();
+    // Sized exactly as sizes.rs sizes it for m = big_t (< 2048): the GEMM
+    // layout L = min(T, 2048) = big_t.
+    let scratch = g.alloc(big_t * (2 * hc * h + f.rank + hc) * 2).unwrap();
+
+    for site in ["attn", "mlp"] {
+        let w = site_weights(g, &f, site, true);
+        ops::hc_pre_lowrank(
+            g,
+            k_pre,
+            streams,
+            &w,
+            y_out,
+            inj_out,
+            scratch,
+            big_t as u32,
+            h as u32,
+            hc as u32,
+            f.eps,
+            stream,
+        )
+        .unwrap();
+        g.synchronize(stream).unwrap();
+
+        let want_mixed: Vec<f32> = {
+            let one = f.f32s(&format!("{site}_mixed"));
+            one.iter().copied().cycle().take(one.len() * TILE).collect()
+        };
+        let want_inj: Vec<f32> = {
+            let one = f.f32s(&format!("{site}_inj"));
+            one.iter().copied().cycle().take(one.len() * TILE).collect()
+        };
+        println!("{site}_hyper_connection (GEMM path, T={big_t}):");
+        compare(
+            "mixed_input",
+            &download_bf16(g, y_out, big_t * h),
+            &want_mixed,
+            tol_for(&want_mixed),
+        );
+        compare(
+            "injection_weights",
+            &download_f32(g, inj_out, big_t * hc),
+            &want_inj,
+            tol_for(&want_inj),
+        );
+    }
+
+    // The model-level mixer takes the same GEMM path with inject=false.
+    let k_head = g.kernel("hyper_connection", "hc_head").unwrap();
+    let w_head = site_weights(g, &f, "head", false);
+    ops::hc_head_lowrank(
+        g,
+        k_head,
+        streams,
+        &w_head,
+        y_out,
+        scratch,
+        big_t as u32,
+        h as u32,
+        hc as u32,
+        f.eps,
+        stream,
+    )
+    .unwrap();
+    g.synchronize(stream).unwrap();
+    let want_head: Vec<f32> = {
+        let one = f.f32s("head_mixed");
+        one.iter().copied().cycle().take(one.len() * TILE).collect()
+    };
+    println!("hyper_connection_mixer (GEMM path, T={big_t}):");
+    compare(
+        "mixed_input",
+        &download_bf16(g, y_out, big_t * h),
+        &want_head,
+        tol_for(&want_head),
+    );
+}

@@ -472,3 +472,120 @@ extern "C" __global__ void hc_pre_finish(
         }
     }
 }
+
+// ───────────────────────── GEMM-path collapse (large T) ─────────────────────
+//
+// PERFORMANCE SHAPE: at prefill the fused kernel measured ~45 ms per call —
+// 47% of the whole prefill (two calls per layer x 48 layers). Its down/up
+// projections are GEMM-shaped ([T,hc*H]x[hc*H,rank] and back), but ran as
+// hand-rolled FP32 warp loops at ~4% of the machine. For T > 64 the collapse
+// instead stages `normed` in BF16 and hands both projections to
+// `dense_gemm_bf16_pipelined` (tensor cores), keeping only the cheap
+// elementwise seams as custom kernels:
+//
+//   hc_pre_stage_bf16   grid=[T]    rms + (1+w) scale -> normed  [T, hc*H] BF16
+//   dense_gemm          low_pre  = normed x down_w^T             [T, rank]
+//   hc_silu_scale       low      = silu(low_pre / hc)            in place
+//   dense_gemm          up_pre   = low x up_w^T                  [T, hc*H]
+//   dense_gemm          inj_pre  = normed x inject_w^T           [T, hc]
+//   hc_pre_mix          grid=[T]    y = mean_s sigmoid(up_pre)*normed;
+//                                   inj = 2*sigmoid(inj_pre / hc)
+//
+// Numerics: normed is rounded to BF16 before the GEMMs (the fused kernel kept
+// it FP32 in smem). The checkpoint's hyper-connection weights are BF16 and the
+// reference module computes in BF16, so this is parity-gated the same way as
+// every other collapse variant (probe cosine vs the FP32 fused path).
+
+extern "C" __global__ void hc_pre_stage_bf16(
+    const float* __restrict__ streams,
+    const __nv_bfloat16* __restrict__ hc_norm_w,
+    __nv_bfloat16* __restrict__ normed_out,    // [T, hc*H] BF16
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const float eps
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const float* x = streams + (size_t)t * hc_dim;
+    __nv_bfloat16* out = normed_out + (size_t)t * hc_dim;
+
+    __shared__ float smem_rms[QHC_MAX_MULT];
+    __shared__ float smem_red[QHC_WBLOCK / 32];
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int warps = blockDim.x >> 5;
+
+    for (unsigned int s2 = 0; s2 < hc; ++s2) {
+        const float* xs = x + (size_t)s2 * H;
+        float acc = 0.0f;
+        for (unsigned int d = tid; d < H; d += blockDim.x) {
+            float v = xs[d];
+            acc += v * v;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) smem_red[warp] = acc;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = 0.0f;
+            for (unsigned int w2 = 0; w2 < warps; ++w2) tot += smem_red[w2];
+            smem_rms[s2] = rsqrtf(tot / (float)H + eps);
+        }
+        __syncthreads();
+    }
+    for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
+        out[i] = __float2bfloat16(
+            x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]));
+    }
+}
+
+// low = silu(low_pre * inv_hc), elementwise in place over n = T*rank.
+extern "C" __global__ void hc_silu_scale(
+    __nv_bfloat16* __restrict__ low,
+    const unsigned int n,
+    const float inv_hc
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = (float)low[i] * inv_hc;
+        low[i] = __float2bfloat16(qhc_silu(v));
+    }
+}
+
+// y[d] = mean_s sigmoid(up_pre[s*H+d]) * normed[s*H+d];
+// inj[s] = 2*sigmoid(inj_pre[s] * inv_hc) (skipped when inj_pre is null).
+extern "C" __global__ void hc_pre_mix(
+    const __nv_bfloat16* __restrict__ normed,  // [T, hc*H]
+    const __nv_bfloat16* __restrict__ up_pre,  // [T, hc*H]
+    const __nv_bfloat16* __restrict__ inj_pre, // [T, hc] or null
+    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    float* __restrict__ inj_out,               // [T, hc]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const float inv_hc
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const __nv_bfloat16* nx = normed + (size_t)t * hc_dim;
+    const __nv_bfloat16* ux = up_pre + (size_t)t * hc_dim;
+    __nv_bfloat16* y = y_out + (size_t)t * H;
+
+    for (unsigned int d = tid; d < H; d += blockDim.x) {
+        float mixed = 0.0f;
+        for (unsigned int s2 = 0; s2 < hc; ++s2) {
+            const unsigned int i = s2 * H + d;
+            mixed += qhc_sigmoid((float)ux[i]) * (float)nx[i];
+        }
+        y[d] = __float2bfloat16(mixed * inv_hc);
+    }
+    if (inj_pre != nullptr && tid < hc) {
+        inj_out[(size_t)t * hc + tid] =
+            2.0f * qhc_sigmoid((float)inj_pre[(size_t)t * hc + tid] * inv_hc);
+    }
+}

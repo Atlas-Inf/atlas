@@ -476,8 +476,17 @@ impl BufferSizes {
                 256
             },
             hc_lowrank_scratch: if config.hc_mult > 0 && config.hc_lowrank > 0 {
+                // Two exclusive layouts share this region:
+                // - decode split path (T <= 64): normed FP32 [64, hc*H] then
+                //   low FP32 [64, rank];
+                // - prefill GEMM path (T > 64, slabbed at <= 2048 tokens):
+                //   normed BF16 [Ts, hc*H], up_pre BF16 [Ts, hc*H],
+                //   low BF16 [Ts, rank], inj_pre BF16 [Ts, hc].
                 let t = m.min(64);
-                t * (config.hc_mult * h + config.hc_lowrank) * 4
+                let split = t * (config.hc_mult * h + config.hc_lowrank) * 4;
+                let ts = m.min(2048);
+                let gemm = ts * (2 * config.hc_mult * h + config.hc_lowrank + config.hc_mult) * 2;
+                split.max(gemm)
             } else {
                 256
             },
