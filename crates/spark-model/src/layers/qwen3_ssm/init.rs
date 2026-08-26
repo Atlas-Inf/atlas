@@ -18,9 +18,7 @@ fn gated_norm_kernel(config: &atlas_core::config::ModelConfig, base: &str) -> Re
     match config.output_gate_type.as_str() {
         "" | "silu" => Ok(base.to_string()),
         "sigmoid" => Ok(format!("{base}_sigmoid")),
-        other => anyhow::bail!(
-            "output_gate_type must be \"silu\" or \"sigmoid\", got {other:?}"
-        ),
+        other => anyhow::bail!("output_gate_type must be \"silu\" or \"sigmoid\", got {other:?}"),
     }
 }
 
@@ -186,8 +184,10 @@ impl Qwen3SsmLayer {
                 "norm",
                 "residual_add_rms_norm_gatef32",
             ),
-            gated_rms_norm_prefill_k: gpu
-                .kernel("norm", &gated_norm_kernel(config, "gated_rms_norm_prefill")?)?,
+            gated_rms_norm_prefill_k: gpu.kernel(
+                "norm",
+                &gated_norm_kernel(config, "gated_rms_norm_prefill")?,
+            )?,
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: crate::layers::tgemm_kernel(gpu),
             w4a16_gemm_t_k64_k: crate::layers::k64_kernel(gpu)?,
