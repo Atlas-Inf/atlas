@@ -43,6 +43,21 @@ fn dump_dir() -> Option<&'static str> {
     .as_deref()
 }
 
+/// One-shot: refuse to overwrite a tap that already exists.
+///
+/// `SSM_LAYER_CALL_COUNTER` is a global that never resets, so the second
+/// request of a run labels its taps L36+, the third L72+, and so on. Left
+/// alone, that means a second request silently leaves the FIRST request's
+/// L00 files in place while adding mislabelled ones — and a bisect then
+/// compares a stale tap against a fresh reference and calls it a divergence.
+///
+/// So the first prefill after startup wins and everything later is ignored.
+/// The intended use is exactly that: start the server, send one request,
+/// read the taps.
+fn claim(path: &str) -> bool {
+    !std::path::Path::new(path).exists()
+}
+
 /// Tap the FP32 highway. No-op unless the dump directory is set.
 ///
 /// Synchronizes before reading, so it must never run inside CUDA-graph
@@ -59,6 +74,10 @@ pub fn tap_highway(
     let Some(dir) = dump_dir() else {
         return;
     };
+    let path = format!("{dir}/L{layer:02}_{tag}.bin");
+    if !claim(&path) {
+        return;
+    }
     if gpu.synchronize(stream).is_err() {
         return;
     }
@@ -84,6 +103,10 @@ pub fn tap_bf16(
     let Some(dir) = dump_dir() else {
         return;
     };
+    let path = format!("{dir}/L{layer:02}_{tag}.bf16.bin");
+    if !claim(&path) {
+        return;
+    }
     if gpu.synchronize(stream).is_err() {
         return;
     }
@@ -91,7 +114,34 @@ pub fn tap_bf16(
     if gpu.copy_d2h(ptr, &mut raw).is_err() {
         return;
     }
-    let path = format!("{dir}/L{layer:02}_{tag}.bf16.bin");
+    if let Err(e) = std::fs::write(&path, &raw) {
+        tracing::warn!("highway tap {path}: {e}");
+    }
+}
+
+/// Tap an FP32 buffer of `n_elements` (the injection vector, a gate).
+pub fn tap_f32(
+    gpu: &dyn GpuBackend,
+    ptr: DevicePtr,
+    layer: usize,
+    tag: &str,
+    n_elements: usize,
+    stream: u64,
+) {
+    let Some(dir) = dump_dir() else {
+        return;
+    };
+    let path = format!("{dir}/L{layer:02}_{tag}.bin");
+    if !claim(&path) {
+        return;
+    }
+    if gpu.synchronize(stream).is_err() {
+        return;
+    }
+    let mut raw = vec![0u8; n_elements * 4];
+    if gpu.copy_d2h(ptr, &mut raw).is_err() {
+        return;
+    }
     if let Err(e) = std::fs::write(&path, &raw) {
         tracing::warn!("highway tap {path}: {e}");
     }

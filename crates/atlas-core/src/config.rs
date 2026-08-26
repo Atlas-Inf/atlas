@@ -409,6 +409,17 @@ pub struct ModelConfig {
     /// False for Qwen3-VL, Nemotron-H, Mistral (ungated Q).
     #[serde(skip)]
     pub attn_gated: bool,
+    /// The GDN gated-norm's gate activation is SIGMOID rather than SiLU.
+    ///
+    /// The reference constructs its `RMSNormGated` with
+    /// `activation = output_gate_type or hidden_act`, so on a checkpoint
+    /// with `output_gate_type: "sigmoid"` (Qwen3.8-Flash-Next) BOTH the
+    /// attention output gate and the GDN norm gate are sigmoid. Every other
+    /// Qwen-family GDN model gates with SiLU. Found by the qwen4_exp phase-E
+    /// bisect: recurrence proven correct, norm stage off at cos 0.81, and
+    /// sigmoid closed it to 0.0.
+    #[serde(default)]
+    pub gdn_norm_sigmoid: bool,
     /// Whether config.json wraps the LLM config in a nested field (e.g., `text_config`).
     /// Determines weight prefix auto-detection behavior.
     #[serde(skip)]

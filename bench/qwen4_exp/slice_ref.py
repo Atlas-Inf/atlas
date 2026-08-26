@@ -143,6 +143,19 @@ def main() -> int:
     inj = 2 * torch.sigmoid(normed @ inject.T / hc)              # [T, hc]
     print(f'L00 hc_pre mixed |x|={mixed.norm():.4f}  inj=[{inj.min():.4f},{inj.max():.4f}]')
 
+    # Split the sublayer three ways: hc_pre's two outputs, then the block.
+    # `L00_post_gdn` diverges at cosine 0.80 with 2.6x the reference
+    # magnitude, and that combination — right direction, wrong scale —
+    # points at the injection vector rather than the block math.
+    got = tap('L00_hc_pre_mixed.bf16.bin')
+    if got is not None:
+        compare('L00 hc_pre mixed', got, mixed.numpy())
+    got = tap('L00_hc_pre_inj.bin')
+    if got is not None:
+        print(f'    atlas inj = {np.round(got[:hc], 6).tolist()}')
+        print(f'    ref   inj = {np.round(inj[0].numpy(), 6).tolist()}  (token 0)')
+        compare('L00 hc_pre inj', got, inj.numpy())
+
     # GDN block on `mixed` — run the REFERENCE MODULE, not a transcription.
     # Same principle as the PLE golden: the thing under test is our port, so
     # the other side of the comparison has to be `modeling_qwen4_exp.py`
@@ -175,11 +188,84 @@ def main() -> int:
         gdn.dt_bias.copy_(load(snap, index, f'{lp}.linear_attn.dt_bias').float())
         gdn.norm.weight.copy_(
             load(snap, index, f'{lp}.linear_attn.norm.weight').float())
+        # Record the reference's pre-out_proj value (the gated RMSNorm's
+        # output) by wrapping the module rather than reimplementing the
+        # recurrence. That splits the block one more time:
+        #   projection [OK] -> conv/gates/recurrence -> gated norm -> out_proj
+        captured = {}
+        _real_norm_fwd = gdn.norm.forward
+
+        def _rec(hidden_states, gate=None):
+            out = _real_norm_fwd(hidden_states, gate)
+            captured['pre_out_proj'] = out.detach().clone()
+            return out
+
+        gdn.norm.forward = _rec
         block_out = gdn(mixed.unsqueeze(0))
+        gdn.norm.forward = _real_norm_fwd
     if isinstance(block_out, tuple):
         block_out = block_out[0]
     block_out = block_out[0]
+    # Split the block. The projection is a pure GEMM; reproducing it needs
+    # only in_proj_qkv and in_proj_z, so if it matches the fault is downstream
+    # in conv / recurrence / gated-norm / out_proj.
+    got = tap('L00_qkvz_preconv.bf16.bin')
+    if got is not None:
+        qkv_w = load(snap, index, f'{lp}.linear_attn.in_proj_qkv.weight').float()
+        z_w = load(snap, index, f'{lp}.linear_attn.in_proj_z.weight').float()
+        # Atlas stores the concat as sequential [Q|K|V|Z].
+        want_qkvz = torch.cat([mixed @ qkv_w.T, mixed @ z_w.T], dim=-1)
+        compare('L00 qkvz preconv', got, want_qkvz.detach().numpy())
+
+    # Conv alone: pad, depthwise k=4 dilation=1, SiLU (the reference applies
+    # the activation inside `causal_conv1d_fn`). Covers the first conv_dim
+    # channels only — `z` is NOT convolved.
+    got = tap('L00_post_conv.bf16.bin')
+    if got is not None:
+        qkv_w = load(snap, index, f'{lp}.linear_attn.in_proj_qkv.weight').float()
+        conv_w = load(snap, index, f'{lp}.linear_attn.conv1d.weight').float()
+        mq = (mixed @ qkv_w.T)
+        k_size = conv_w.shape[-1]
+        xx = torch.nn.functional.pad(mq.T.unsqueeze(0), (k_size - 1, 0))
+        cc = torch.nn.functional.conv1d(
+            xx, conv_w.squeeze(1).unsqueeze(1), groups=mq.shape[-1])
+        want_conv = torch.nn.functional.silu(cc).squeeze(0).T[:t]
+        ok = compare('L00 post_conv', got, want_conv.detach().numpy())
+        print('    -> conv1d is the fault' if not ok
+              else '    -> conv is RIGHT; fault is gates / recurrence / gated-norm')
+
+    # Gates: [g(nv), beta(nv)] FP32 per token, as the recurrence reads them.
+    #   beta = sigmoid(b)          g = exp(-exp(A_log) * softplus(a + dt_bias))
+    got = tap('L00_gates.bin')
+    if got is not None:
+        a_w = load(snap, index, f'{lp}.linear_attn.in_proj_a.weight').float()
+        b_w = load(snap, index, f'{lp}.linear_attn.in_proj_b.weight').float()
+        a_log = load(snap, index, f'{lp}.linear_attn.A_log').float()
+        dt_b = load(snap, index, f'{lp}.linear_attn.dt_bias').float()
+        a_raw = mixed @ a_w.T                       # [T, nv]
+        b_raw = mixed @ b_w.T
+        beta_ref = torch.sigmoid(b_raw)
+        g_ref = torch.exp(-a_log.exp() * torch.nn.functional.softplus(a_raw + dt_b))
+        want_gates = torch.cat([g_ref, beta_ref], dim=-1)   # [T, 2*nv]
+        ok = compare('L00 gates', got, want_gates.detach().numpy())
+        print('    -> BA GEMM / gate transforms are the fault' if not ok
+              else '    -> gates RIGHT; the delta-rule recurrence kernel is the fault')
+
+    got = tap('L00_pre_out_proj.bf16.bin')
+    if got is not None and 'pre_out_proj' in captured:
+        ref_pre = captured['pre_out_proj'].reshape(-1)
+        print(f'    ref pre_out_proj shape={tuple(captured["pre_out_proj"].shape)} '
+              f'|x|={ref_pre.norm():.4f}')
+        ok = compare('L00 pre_out_proj', got, ref_pre.numpy())
+        if not ok:
+            print('    -> conv1d / gates / delta-rule recurrence / gated norm')
+        else:
+            print('    -> everything up to the gated norm is RIGHT; out_proj is wrong')
+
     print(f'L00 GDN block_out |x|={block_out.norm():.4f}')
+    got = tap('L00_block_out.bf16.bin')
+    if got is not None:
+        compare('L00 block_out', got, block_out.detach().numpy())
 
     # hc_post: residual[t, s*H+d] += block_out[t,d] * inj[t,s]
     post = (highway.unflatten(-1, (hc, h))

@@ -122,6 +122,19 @@ impl Qwen3SsmLayer {
             stream,
         )?;
 
+        // Bisect taps. `L00_block_out` diverges at cosine 0.845 while hc_pre's
+        // outputs are bit-exact, so the fault is inside this block. These
+        // split it: the projection is a pure GEMM (cheap to reproduce), the
+        // pre-out_proj buffer is everything after it.
+        crate::layers::ple::dump::tap_bf16(
+            ctx.gpu,
+            deinterleaved,
+            ssm_layer_idx,
+            "qkvz_preconv",
+            num_tokens * qkvz_size,
+            stream,
+        );
+
         prof!("qkvz_gemm", t0);
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
@@ -154,6 +167,19 @@ impl Qwen3SsmLayer {
             vpg as u32,
             stream,
         )?;
+        // Bisect tap: the gates as the recurrence will read them,
+        // [g(nv), beta(nv)] FP32 per token. Everything upstream of the
+        // recurrence except these is already verified, so this is the last
+        // split: gates wrong => the BA GEMM/transforms; gates right => the
+        // recurrence kernel itself.
+        crate::layers::ple::dump::tap_f32(
+            ctx.gpu,
+            gates_buf,
+            ssm_layer_idx,
+            "gates",
+            num_tokens * gate_stride,
+            stream,
+        );
         prof!("ba+gates", t0);
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
@@ -189,6 +215,19 @@ impl Qwen3SsmLayer {
             midcap_idx,
             stream,
         )?;
+        // Bisect tap. The projection matches (cos 0.999998) and
+        // `pre_out_proj` does not (cos 0.801), so the fault is conv / gates /
+        // recurrence / gated-norm. The gates are COMPUTED above but not
+        // CONSUMED until the recurrence, so this tap isolates the conv alone.
+        crate::layers::ple::dump::tap_bf16(
+            ctx.gpu,
+            conv_out_buf,
+            ssm_layer_idx,
+            "post_conv",
+            num_tokens * conv_dim,
+            stream,
+        );
+
         // ATLAS_GDN_DUMP hook #1: post-conv1d (post-silu, applied inside
         // the kernel). Last-token slice, flat [conv_dim] bf16. Layer
         // index from SSM_LAYER_CALL_COUNTER; latched by per-layer
@@ -276,6 +315,24 @@ impl Qwen3SsmLayer {
             stream,
         )?;
 
+        // Bisect tap: the RAW recurrence output, before the gated norm.
+        //
+        // At token 0 the recurrent state is zero, so the raw output must be
+        // beta * (q . k) * v — EXACTLY parallel to that head's v — in any
+        // correct implementation. The post-norm taps show per-head cosines of
+        // 0.63-0.98 against the reference, which parallel vectors cannot
+        // produce (RMS-norm of parallel vectors matches to +-1). Either the
+        // state is NOT zero at prefill start, or the recurrence reads
+        // something it should not. This tap decides which stage lies.
+        crate::layers::ple::dump::tap_bf16(
+            ctx.gpu,
+            gdn_out_buf,
+            ssm_layer_idx,
+            "raw_recur",
+            num_tokens * value_dim,
+            stream,
+        );
+
         // ATLAS_GDN_DUMP hook #3: post-GDN recurrence (pre-gnorm,
         // value-space). gdn_out_buf is [num_tokens, value_dim] bf16
         // row-major; dump the last token's value_dim slice.
@@ -337,6 +394,15 @@ impl Qwen3SsmLayer {
         } else {
             None
         };
+
+        crate::layers::ple::dump::tap_bf16(
+            ctx.gpu,
+            normed_out_buf,
+            ssm_layer_idx,
+            "pre_out_proj",
+            num_tokens * value_dim,
+            stream,
+        );
 
         // ── 10. Output projection GEMM: [N, 4096] × [4096, 2048] → [N, 2048] ──
         let out_proj_buf = ctx.buffers.moe_output();

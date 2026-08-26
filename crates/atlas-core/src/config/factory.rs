@@ -80,6 +80,7 @@ impl ModelConfig {
             vision: None,
             quantization_config: None,
             attn_gated: true,
+            gdn_norm_sigmoid: false,
             nested_config: false,
             mrope_section: [0, 0, 0],
             mrope_interleaved: false,

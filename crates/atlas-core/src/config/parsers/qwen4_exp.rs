@@ -90,6 +90,15 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
         .and_then(Value::as_str)
         .is_some_and(|s| !s.is_empty() && s != "none");
 
+    // ...and the SAME field drives the GDN gated-norm's activation: the
+    // reference passes `output_gate_type or hidden_act` into `RMSNormGated`.
+    // SiLU is the family default Atlas's kernels hardcode; "sigmoid" here
+    // selects the sigmoid twins at layer init.
+    config.gdn_norm_sigmoid = text
+        .get("output_gate_type")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s == "sigmoid");
+
     // The ViT tower lives at the TOP level, not inside text_config.
     if raw.get("vision_config").is_some() {
         config.vision = parse_vision_config(raw);

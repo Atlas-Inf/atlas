@@ -82,8 +82,23 @@ impl Qwen3SsmLayer {
             // machine?" and that question has no portable answer.
             sm_count: gpu.sm_count()?,
             rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
-            gated_rms_norm_k: gpu.kernel("norm", "gated_rms_norm")?,
-            gated_rms_norm_f32_k: super::super::try_kernel(gpu, "norm", "gated_rms_norm_f32_input"),
+            // `output_gate_type: "sigmoid"` (qwen4_exp) swaps the gated-norm
+            // handles for the sigmoid twins ONCE, here, so no forward call
+            // site branches on it. Every other model keeps the SiLU originals.
+            gated_rms_norm_k: if config.gdn_norm_sigmoid {
+                gpu.kernel("gated_norm_sigmoid", "gated_rms_norm_sigmoid")?
+            } else {
+                gpu.kernel("norm", "gated_rms_norm")?
+            },
+            gated_rms_norm_f32_k: if config.gdn_norm_sigmoid {
+                super::super::try_kernel(
+                    gpu,
+                    "gated_norm_sigmoid",
+                    "gated_rms_norm_f32_input_sigmoid",
+                )
+            } else {
+                super::super::try_kernel(gpu, "norm", "gated_rms_norm_f32_input")
+            },
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batch2_k: gpu.kernel("dense_gemv_bf16_batch2", "dense_gemv_bf16_batch2")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
@@ -188,7 +203,11 @@ impl Qwen3SsmLayer {
                 "norm",
                 "residual_add_rms_norm_gatef32",
             ),
-            gated_rms_norm_prefill_k: gpu.kernel("norm", "gated_rms_norm_prefill")?,
+            gated_rms_norm_prefill_k: if config.gdn_norm_sigmoid {
+                gpu.kernel("gated_norm_sigmoid", "gated_rms_norm_prefill_sigmoid")?
+            } else {
+                gpu.kernel("norm", "gated_rms_norm_prefill")?
+            },
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: crate::layers::tgemm_kernel(gpu),
             w4a16_gemm_t_k64_k: crate::layers::k64_kernel(gpu)?,

@@ -138,8 +138,36 @@ impl Qwen3SsmLayer {
             hc_dim,
             stream,
         );
+        // Tap hc_pre's BOTH outputs. `L00_post_gdn` diverges at cosine 0.80
+        // with 2.6x the reference magnitude, and the sublayer is exactly
+        // hc_pre -> block -> hc_post, so splitting it three ways is the whole
+        // remaining search.
+        crate::layers::ple::dump::tap_bf16(
+            ctx.gpu,
+            hidden,
+            ssm_layer_idx,
+            "hc_pre_mixed",
+            num_tokens * h,
+            stream,
+        );
+        crate::layers::ple::dump::tap_f32(
+            ctx.gpu,
+            post,
+            ssm_layer_idx,
+            "hc_pre_inj",
+            num_tokens * hc.hc_mult,
+            stream,
+        );
         let out_proj_buf =
             self.prefill_block(hidden, num_tokens, state, ssm_layer_idx, ctx, stream)?;
+        crate::layers::ple::dump::tap_bf16(
+            ctx.gpu,
+            out_proj_buf,
+            ssm_layer_idx,
+            "block_out",
+            num_tokens * h,
+            stream,
+        );
         ops::hc_post_site(
             ctx.gpu,
             self.hc_post_k,
