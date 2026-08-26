@@ -210,6 +210,66 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             finalize_config(&mut config, &raw_mut)?;
             Ok(config)
         }
+        // Qwen3.8-Flash-Next. Nested under `text_config` like the Qwen3.5/VL
+        // families, but it shares no weight layout with them: hybrid
+        // linear/full attention, 512-expert MoE, low-rank hyper-connections, a
+        // sparse-attention indexer, a PLE n-gram tower and a hybrid MTP block.
+        //
+        // Parsing it is NOT the same as being able to serve it -- there is no
+        // `qwen4_exp` weight loader. See docs/porting/QWEN4_EXP.md.
+        "qwen4_exp" => {
+            let text_config = raw
+                .get("text_config")
+                .context("qwen4_exp config missing text_config")?;
+            let mut config: ModelConfig = serde_json::from_value(text_config.clone())
+                .context("Failed to parse qwen4_exp text_config")?;
+            // text_config declares "qwen4_exp_text"; the family name is the
+            // top-level one, and kernel-target resolution matches on it.
+            config.model_type = top_model_type.to_string();
+            if config.eos_token_id == 0 {
+                config.eos_token_id = text_config
+                    .get("eos_token_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32;
+            }
+            // RoPE lives in a nested block, as it does for Qwen3.6.
+            if let Some(rope) = text_config.get("rope_parameters") {
+                if let Some(theta) = rope.get("rope_theta").and_then(serde_json::Value::as_f64) {
+                    config.rope_theta = theta;
+                }
+                if let Some(prf) = rope
+                    .get("partial_rotary_factor")
+                    .and_then(serde_json::Value::as_f64)
+                {
+                    config.partial_rotary_factor = prf;
+                }
+                config.mrope_interleaved = rope
+                    .get("mrope_interleaved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if let Some(section) = rope.get("mrope_section").and_then(|v| v.as_array()) {
+                    for (slot, value) in config.mrope_section.iter_mut().zip(section) {
+                        *slot = value.as_u64().unwrap_or(0) as usize;
+                    }
+                }
+            }
+            // HF's Qwen4ExpTextConfig defaults `norm_topk_prob` to True and the
+            // published config.json OMITS it, so serde's `false` would silently
+            // skip the top-K renormalisation. Same trap the qwen3_5 arm above
+            // handles, for the same reason.
+            config.norm_topk_prob = true;
+            // Ungated Q: the full-attention layers carry q/k/v/o plus q_norm and
+            // k_norm, with no interleaved gate. (`output_gate_type = "sigmoid"`
+            // describes the LINEAR-attention gate, which is its own tensor,
+            // `linear_attn.in_proj_z`.)
+            config.attn_gated = false;
+            config.nested_config = true;
+            if raw.get("vision_config").is_some() {
+                config.vision = parse_vision_config(&raw);
+            }
+            finalize_config(&mut config, &raw)?;
+            Ok(config)
+        }
         "gemma4" => parse_gemma4_params(&raw),
         "laguna" => parse_laguna(&raw),
         "m2m_100" | "nllb" => {
