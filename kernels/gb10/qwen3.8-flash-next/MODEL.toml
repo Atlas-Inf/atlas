@@ -1,0 +1,137 @@
+[model]
+name = "qwen3.8-flash-next"
+hf_id = "RadixArk/Qwen3.8-Flash-Next-NVFP4"
+params = "180B"
+active_params = "3B"
+architecture = "Hybrid Linear Attention + Full Attention + 512-expert MoE + hyper-connections + PLE n-gram"
+
+# ── Why the parameter count looks wrong, and does not ─────────────────────
+# 179.6 B total, but 51.2 B of it is the PLE n-gram embedding table -- a
+# lookup, not a matmul. Counting from the weight manifest:
+#
+#   routed experts (trunk)  120.8 B
+#   n-gram table             51.2 B   <- read by row, never resident
+#   MTP experts               2.5 B
+#   everything else           5.0 B
+#
+# Active per token is ~2.4 B of experts (top-10 of 512) plus the backbone,
+# hence active_params = 3B.
+#
+# ── Memory, on a GB10 ─────────────────────────────────────────────────────
+# The box is coherent unified memory (Addressing Mode: ATS, ~119.6 GiB), so
+# there is no host/device split to offload across. At NVFP4 the resident set
+# is ~83 GB (68 experts + 5 MTP + 10 backbone) and the n-gram table is read
+# on demand through atlas_core::ngram_table -- measured at 820 us/token fully
+# cold and 8.85 us warm, against decode rates two orders of magnitude slower.
+#
+# The FP8 release does NOT fit: its experts alone are 123.3 GB resident.
+# NVFP4 is not the smaller option here, it is the only workable one.
+
+layers_total = 48
+layers_attention = 12
+layers_ssm = 36
+moe_experts = 512
+moe_topk = 10
+moe_intermediate = 640
+shared_expert_intermediate = 640
+
+hidden_dim = 2560
+head_dim = 256
+q_heads = 24
+kv_heads = 2
+partial_rotary_factor = 0.25
+
+# Linear attention (gated delta net): q and k share 16 heads of 128, v has 48.
+linear_num_key_heads = 16
+linear_key_head_dim = 128
+linear_num_value_heads = 48
+linear_value_head_dim = 128
+linear_conv_kernel_dim = 4
+
+vocab_size = 248320
+max_position_embeddings = 262144
+rope_theta = 10000000
+mrope_interleaved = true
+mrope_section = [11, 11, 10]
+
+# Q IS gated: q_proj is [12288, 2560] against 24 heads x 256 = 6144, so the
+# projection carries an interleaved per-head gate that o_proj does not consume.
+attn_output_gate = true
+
+# Hyper-connections: 4 residual streams, low-rank sigmoid mixing gate. NOT
+# DeepSeek-V4's Sinkhorn mHC -- same concept, different formulation.
+hc_count = 4
+hc_lowrank = 320
+
+# Sparse-attention indexer, on the 12 full-attention layers only.
+indexer_n_heads = 4
+indexer_kv_heads = 1
+indexer_head_dim = 128
+indexer_budget = 2048
+
+# PLE n-gram tower. `ple_layer_ids` is ONE-indexed in config.json: [2] means
+# decoder layer 1, which is where the weights actually are.
+ple_layer_ids = [2]
+ple_embed_dim = 2560
+ngram_size = 3
+heads_per_ngram = 8
+ngram_vocab_size_base = 20000000
+
+# MTP: one hybrid block, with its own indexer and its own 512-expert stack.
+# Not the MtpWeights shape any other family uses, so `--speculative` is
+# refused at pre-flight until it is built.
+mtp_layers = 1
+
+# ── Kernels ───────────────────────────────────────────────────────────────
+# No .cu tree of its own yet. qwen3-next-80b-a3b is the nearest relative --
+# the same 48-layer hybrid schedule (12 full / 36 linear), the same 512-expert
+# top-10 MoE, the same head_dim 256 and partial rotary 0.25 -- and differs in
+# hidden (2560 vs 2048), q_heads (24 vs 16), and the three mechanisms it has
+# that Qwen3-Next does not: hyper-connections, the indexer and the PLE tower.
+#
+# UNVERIFIED. This reuse makes the target resolvable so the loader can be
+# exercised end to end; it does not mean these kernels are correct for this
+# model. Nothing here has run a forward pass.
+kernel_source = "qwen3-next-80b-a3b"
+
+# `qwen4_exp` is unique across the registry, so resolution cannot tie and
+# match_names is not load-bearing. Listed anyway so a future Flash-Next
+# variant sharing (qwen4_exp, 2560) has something to disambiguate against.
+match_names = ["qwen3.8-flash-next", "flash-next"]
+
+[[model_types]]
+model_type = "qwen4_exp"
+
+[sampling.thinking_text]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[behavior]
+# Conservative until a forward pass exists to measure against: thinking off by
+# default, so a first bring-up run is not spending its budget inside a
+# reasoning block (the trap Nemotron-3.5-Lightning walked into).
+thinking_default = false
+thinking_in_tools = true
+max_thinking_budget = 8192
+cap_thinking_at_max_tokens = true
+enable_loop_watchdog = true
