@@ -167,10 +167,8 @@ mod tests {
     fn gdn_state_is_sized_by_value_heads() {
         let cfg = published();
         let sizes = Qwen4ExpStateSizes::new(&cfg, true, false);
-        let expect = cfg.linear_num_value_heads
-            * cfg.linear_key_head_dim
-            * cfg.linear_value_head_dim
-            * 4;
+        let expect =
+            cfg.linear_num_value_heads * cfg.linear_key_head_dim * cfg.linear_value_head_dim * 4;
         assert_eq!(sizes.h_state_bytes, expect);
         assert_eq!(cfg.linear_num_value_heads / cfg.linear_num_key_heads, 3);
 

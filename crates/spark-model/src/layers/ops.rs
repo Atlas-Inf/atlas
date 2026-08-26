@@ -60,7 +60,6 @@ mod gemm_fp8_prefill;
 mod gemm_quant;
 #[path = "ops/gemv_q2.rs"]
 mod gemv_q2;
-pub mod qwen4exp;
 #[path = "ops/gemv_q2_vec.rs"]
 mod gemv_q2_vec;
 #[path = "ops/gemv_sw.rs"]
@@ -118,6 +117,7 @@ mod q2_0_mmq;
 mod q4k_mmq;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
+pub mod qwen4exp;
 #[path = "ops/sampling.rs"]
 mod sampling;
 #[path = "ops/ssm_gdn_a.rs"]

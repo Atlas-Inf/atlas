@@ -42,19 +42,55 @@ pub fn grouped_rms_norm(x: &[f32], group: usize, weight: &[f32], eps: f32) -> Ve
     out
 }
 
+/// Rows below which threading costs more than it saves.
+const PARALLEL_ROW_THRESHOLD: usize = 512;
+
 /// `y = W x` for a row-major `[out_dim, in_dim]` weight.
+///
+/// Parallel over output rows above a threshold. This is a reference, not a
+/// kernel — the point is that a 180 B-parameter model can be checked end to end
+/// in minutes rather than an hour, not that it competes with a GPU.
 pub fn linear(x: &[f32], weight: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     assert_eq!(x.len(), in_dim);
     assert_eq!(weight.len(), out_dim * in_dim);
-    (0..out_dim)
-        .map(|row| {
-            weight[row * in_dim..(row + 1) * in_dim]
-                .iter()
-                .zip(x)
-                .map(|(w, v)| w * v)
-                .sum()
-        })
-        .collect()
+
+    let row = |r: usize| -> f32 {
+        weight[r * in_dim..(r + 1) * in_dim]
+            .iter()
+            .zip(x)
+            .map(|(w, v)| w * v)
+            .sum()
+    };
+
+    if out_dim < PARALLEL_ROW_THRESHOLD {
+        return (0..out_dim).map(row).collect();
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(out_dim);
+    if threads <= 1 {
+        return (0..out_dim).map(row).collect();
+    }
+
+    let mut out = vec![0f32; out_dim];
+    let chunk = out_dim.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (index, slice) in out.chunks_mut(chunk).enumerate() {
+            let base = index * chunk;
+            scope.spawn(move || {
+                for (offset, slot) in slice.iter_mut().enumerate() {
+                    *slot = weight[(base + offset) * in_dim..(base + offset + 1) * in_dim]
+                        .iter()
+                        .zip(x)
+                        .map(|(w, v)| w * v)
+                        .sum();
+                }
+            });
+        }
+    });
+    out
 }
 
 fn sigmoid(x: f32) -> f32 {

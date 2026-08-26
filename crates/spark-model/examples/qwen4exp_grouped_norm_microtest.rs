@@ -147,7 +147,6 @@ fn main() -> Result<()> {
     hyper_connection_block(g)
 }
 
-
 // ── The whole hyper-connection block on GPU ─────────────────────────────────
 
 /// Run Qwen4ExpTextGatedResidual end to end on the device and diff it against
@@ -184,9 +183,15 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
 
     let d_hyper = up_bf16(g, &hyper)?;
     let d_norm_w = up_bf16(g, &hc_norm)?;
-    let d_down = DenseWeight { weight: up_bf16(g, &mix_down)? };
-    let d_up = DenseWeight { weight: up_bf16(g, &mix_up)? };
-    let d_inject = DenseWeight { weight: up_bf16(g, &inject_w)? };
+    let d_down = DenseWeight {
+        weight: up_bf16(g, &mix_down)?,
+    };
+    let d_up = DenseWeight {
+        weight: up_bf16(g, &mix_up)?,
+    };
+    let d_inject = DenseWeight {
+        weight: up_bf16(g, &inject_w)?,
+    };
 
     let d_normed = g.alloc(wide * 2)?;
     let d_lowrank = g.alloc(LOWRANK * 2)?;
@@ -212,7 +217,16 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
         .arg_f32(EPS)
         .launch(0)?;
 
-    ops::dense_gemv(g, gemv, d_normed, &d_down, d_lowrank, LOWRANK as u32, wide as u32, 0)?;
+    ops::dense_gemv(
+        g,
+        gemv,
+        d_normed,
+        &d_down,
+        d_lowrank,
+        LOWRANK as u32,
+        wide as u32,
+        0,
+    )?;
     KernelLaunch::new(g, act_k)
         .grid([1, 1, 1])
         .block([LOWRANK.min(1024) as u32, 1, 1])
@@ -220,7 +234,16 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
         .arg_u32(LOWRANK as u32)
         .arg_u32(GROUPS as u32)
         .launch(0)?;
-    ops::dense_gemv(g, gemv, d_lowrank, &d_up, d_gate, wide as u32, LOWRANK as u32, 0)?;
+    ops::dense_gemv(
+        g,
+        gemv,
+        d_lowrank,
+        &d_up,
+        d_gate,
+        wide as u32,
+        LOWRANK as u32,
+        0,
+    )?;
 
     KernelLaunch::new(g, mix_k)
         .grid([1, 1, 1])
@@ -232,7 +255,16 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
         .arg_u32(GROUPS as u32)
         .launch(0)?;
 
-    ops::dense_gemv(g, gemv, d_normed, &d_inject, d_raw_inject, GROUPS as u32, wide as u32, 0)?;
+    ops::dense_gemv(
+        g,
+        gemv,
+        d_normed,
+        &d_inject,
+        d_raw_inject,
+        GROUPS as u32,
+        wide as u32,
+        0,
+    )?;
     KernelLaunch::new(g, inj_k)
         .grid([1, 1, 1])
         .block([GROUPS as u32, 1, 1])
@@ -305,10 +337,15 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
         mixed_gap / mixed_scale.max(1e-9) < 2e-2,
         "hyper-connection mixed output disagrees with the oracle"
     );
-    anyhow::ensure!(inject_gap < 2e-2, "injection gains disagree with the oracle");
+    anyhow::ensure!(
+        inject_gap < 2e-2,
+        "injection gains disagree with the oracle"
+    );
     // Guard against agreeing only because the sigmoid saturated.
     anyhow::ensure!(
-        want.injection.iter().any(|v| (*v - 2.0).abs() > 0.05 && *v > 0.05),
+        want.injection
+            .iter()
+            .any(|v| (*v - 2.0).abs() > 0.05 && *v > 0.05),
         "injection gains are saturated -- this test would pass with the wrong sign"
     );
     println!("HYPER-CONNECTION BLOCK MATCHES THE ORACLE\n");
@@ -353,8 +390,12 @@ fn ple_block(g: &dyn GpuBackend) -> Result<()> {
 
     let d_emb = up_bf16(g, &embeddings)?;
     let d_hidden = up_bf16(g, &hidden_states)?;
-    let d_key_w = DenseWeight { weight: up_bf16(g, &key_proj)? };
-    let d_val_w = DenseWeight { weight: up_bf16(g, &value_proj)? };
+    let d_key_w = DenseWeight {
+        weight: up_bf16(g, &key_proj)?,
+    };
+    let d_val_w = DenseWeight {
+        weight: up_bf16(g, &value_proj)?,
+    };
     let d_nk = up_bf16(g, &norm_key)?;
     let d_nq = up_bf16(g, &norm_query)?;
     let d_nc = up_bf16(g, &norm_conv)?;
@@ -433,7 +474,12 @@ fn ple_block(g: &dyn GpuBackend) -> Result<()> {
     };
     let r = |v: &Vec<f32>| v.iter().map(round).collect::<Vec<_>>();
     let (kp, vp, nk, nq, nc, cv) = (
-        r(&key_proj), r(&value_proj), r(&norm_key), r(&norm_query), r(&norm_conv), r(&conv1d),
+        r(&key_proj),
+        r(&value_proj),
+        r(&norm_key),
+        r(&norm_query),
+        r(&norm_conv),
+        r(&conv1d),
     );
     let want = atlas_core::qwen4exp_reference::ple_forward(
         &dims,
@@ -449,7 +495,11 @@ fn ple_block(g: &dyn GpuBackend) -> Result<()> {
         &r(&hidden_states),
     );
 
-    let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let worst = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
     let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
     println!(
         "PLE tower: max|diff| {worst:.3e} over {} values (up to {scale:.3e}), relative {:.3e}",

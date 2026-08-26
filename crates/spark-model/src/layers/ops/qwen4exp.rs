@@ -124,12 +124,25 @@ pub fn hyper_connection_collapse(
 ) -> Result<()> {
     let wide = dims.wide();
     rms_norm_grouped(
-        gpu, k.rms_norm_grouped, residual, w.hc_norm, scratch.normed, dims, 1, stream,
+        gpu,
+        k.rms_norm_grouped,
+        residual,
+        w.hc_norm,
+        scratch.normed,
+        dims,
+        1,
+        stream,
     )?;
 
     super::dense_gemv(
-        gpu, k.gemv, scratch.normed, w.mix_down, scratch.lowrank,
-        dims.hc_lowrank as u32, wide as u32, stream,
+        gpu,
+        k.gemv,
+        scratch.normed,
+        w.mix_down,
+        scratch.lowrank,
+        dims.hc_lowrank as u32,
+        wide as u32,
+        stream,
     )?;
     // silu(x / hc_count) — divided BEFORE the activation.
     KernelLaunch::new(gpu, k.hc_lowrank_act)
@@ -140,8 +153,14 @@ pub fn hyper_connection_collapse(
         .arg_u32(dims.hc_count as u32)
         .launch(stream)?;
     super::dense_gemv(
-        gpu, k.gemv, scratch.lowrank, w.mix_up, scratch.gate,
-        wide as u32, dims.hc_lowrank as u32, stream,
+        gpu,
+        k.gemv,
+        scratch.lowrank,
+        w.mix_up,
+        scratch.gate,
+        wide as u32,
+        dims.hc_lowrank as u32,
+        stream,
     )?;
 
     // MEAN across streams, not a sum.
@@ -157,8 +176,14 @@ pub fn hyper_connection_collapse(
 
     if let Some(inject) = w.block_inject {
         super::dense_gemv(
-            gpu, k.gemv, scratch.normed, inject, scratch.raw_injection,
-            dims.hc_count as u32, wide as u32, stream,
+            gpu,
+            k.gemv,
+            scratch.normed,
+            inject,
+            scratch.raw_injection,
+            dims.hc_count as u32,
+            wide as u32,
+            stream,
         )?;
         // 2 * sigmoid(x / hc_count) — centred on 1.
         KernelLaunch::new(gpu, k.hc_injection)
