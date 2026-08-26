@@ -76,6 +76,28 @@ Resident memory did not move during the run.
 That settles the memory plan: ~83 GB of resident weights, the 52 GB table read
 on demand, and ~36 GB left for KV cache and activations.
 
+### Confirmed on the box, end to end
+
+`spark serve` against the real RadixArk checkpoint on a GB10, 2026-08-26:
+
+```
+Selected kernel target: (sm_121, qwen3.8-flash-next, nvfp4) (167 modules)
+Model config: 48 layers, 12 attention, 36 SSM, 512 experts, head_dim=256
+Quantization config: method="modelopt", algo="NVFP4"
+Demand-paged (never resident): [".ple.ple_embedding.ngram_embedding.shard_"]
+Fast-load pre-flight: 78.19 GB on-disk, 1.3x = 101.65 GB peak, 114.25 GB free
+Loaded 296347 weight tensors
+qwen4_exp weights load (48 layers, 1 PLE towers), but the forward pass is not
+implemented ...
+```
+
+Every tensor the loader asks for is present and loads. 69 s, peak ~88 GB used
+with ~26 GB spare. Without the demand-paged exclusion the same run refuses at
+163.64 GB — so that one change is the difference between "does not fit" and
+"loads with headroom".
+
+What remains is the forward pass, and only the forward pass.
+
 ## What is implemented
 
 `crates/atlas-core/src/config/ngram_qwen4exp.rs` — the n-gram hashed-embedding
