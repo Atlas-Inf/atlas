@@ -74,12 +74,12 @@ mod ngram_defer_tests {
         // resident — the row cache needs it to dequantize.
         assert!(!is_ngram_table(&format!("{base}.weight_scale")));
         // The head range tables are 16 I64 values the loader reads directly.
-        assert!(!is_ngram_table(&format!(
+        assert!(!is_ngram_table(
             "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets"
-        )));
-        assert!(!is_ngram_table(&format!(
+        ));
+        assert!(!is_ngram_table(
             "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes"
-        )));
+        ));
         // The PLE block's own projections are ordinary tensors.
         assert!(!is_ngram_table(
             "model.language_model.layers.1.ple.key_proj.weight"

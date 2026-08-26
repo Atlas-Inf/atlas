@@ -65,6 +65,12 @@ impl Qwen3SsmLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let n = num_tokens as u32;
 
+        // Same counter the non-HC path bumps: one increment per SSM layer per
+        // prefill, so `ATLAS_GDN_DUMP` still attributes an intermediate to the
+        // right layer.
+        let ssm_layer_idx =
+            super::debug::SSM_LAYER_CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         // Stage profiler, the prefill twin of ATLAS_QWEN4EXP_DECODE_PROF:
         // serialize at stage seams and log per-stage µs for the first ~8
         // chunks (48 layer calls each). Prefill sits at ~110-130 tok/s vs a
@@ -94,12 +100,6 @@ impl Qwen3SsmLayer {
                 }
             };
         }
-
-        // Same counter the non-HC path bumps: one increment per SSM layer per
-        // prefill, so `ATLAS_GDN_DUMP` still attributes an intermediate to the
-        // right layer.
-        let ssm_layer_idx =
-            super::debug::SSM_LAYER_CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // ATLAS_FP32_ROUTING has the SSM's fused `residual_add_rms_norm_gatef32`
         // populate `moe_router_in_f32` for the gate GEMM to read at full
@@ -140,6 +140,7 @@ impl Qwen3SsmLayer {
         if let Some(ple) = self.ple.as_ref() {
             ple.forward(streams, num_tokens, seq_len_start == 0, ctx, stream)?;
         }
+        stage!("ple");
 
         // ── GDN sublayer ──
         // `hidden` is scratch from here on: the highway carries the state
@@ -159,6 +160,7 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        stage!("hc_pre_attn");
         let hc_dim = hc.hc_mult * h;
         crate::layers::ple::dump::tap_highway(
             ctx.gpu,
@@ -191,6 +193,7 @@ impl Qwen3SsmLayer {
         );
         let out_proj_buf =
             self.prefill_block(hidden, num_tokens, state, ssm_layer_idx, ctx, stream)?;
+        stage!("gdn_block");
         crate::layers::ple::dump::tap_bf16(
             ctx.gpu,
             out_proj_buf,
@@ -213,6 +216,7 @@ impl Qwen3SsmLayer {
             stream,
         )?;
 
+        stage!("hc_post_attn");
         // Tapped BEFORE the MoE on purpose: reproducing this point in the
         // reference needs only the GDN projections, not 512 experts.
         crate::layers::ple::dump::tap_highway(
@@ -244,7 +248,9 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        stage!("hc_pre_ffn");
         self.ffn.forward_prefill(hidden, num_tokens, ctx, stream)?;
+        stage!("moe");
         ops::hc_post_site(
             ctx.gpu,
             self.hc_post_k,
@@ -267,6 +273,7 @@ impl Qwen3SsmLayer {
             hc_dim,
             stream,
         );
+        stage!("hc_post_ffn");
 
         Ok(())
     }

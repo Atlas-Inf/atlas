@@ -33,6 +33,11 @@ struct PleState {
     /// step's host work (hash + fault-in + slot upload) already ran BEFORE
     /// graph replay/capture. `forward` consumes it and enqueues kernels only.
     prestaged_va: Option<u64>,
+    /// The last VA `prestage` staged, never cleared. `rearm` restores it when
+    /// a failed capture attempt re-runs the step eagerly: the slots are still
+    /// in `slots_dev` and history has already advanced, so re-hashing would
+    /// double-count the token — re-arming is the only correct recovery.
+    last_staged_va: u64,
 }
 
 pub struct PleLayer {
@@ -135,6 +140,7 @@ impl PleLayer {
                 conv: gpu.alloc(state_len * c * 4)?,
                 history: Vec::new(),
                 prestaged_va: None,
+                last_staged_va: 0,
             }),
         })
     }
@@ -175,7 +181,20 @@ impl PleLayer {
         let keep = self.dims.context_len();
         st.history = window[window.len() - keep..].to_vec();
         st.prestaged_va = Some(va);
+        st.last_staged_va = va;
         Ok(())
+    }
+
+    /// Restore the prestaged state after a failed CUDA-graph capture attempt
+    /// consumed it: `slots_dev` still holds this step's slots and history has
+    /// already advanced, so the eager re-run only needs the VA back. No-op if
+    /// nothing was ever staged (idempotent if the forward never consumed it).
+    pub fn rearm(&self) {
+        if let Ok(mut st) = self.state.lock()
+            && st.last_staged_va != 0
+        {
+            st.prestaged_va = Some(st.last_staged_va);
+        }
     }
 
     /// Inject into `highway` `[T, hc_mult*hidden]` FP32, in place.
@@ -238,7 +257,12 @@ impl PleLayer {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("PLE state mutex poisoned"))?;
-        let prestaged = st.prestaged_va.take();
+        // A prestage staged for a REPLAYED decode step is consumed by the
+        // graph, not by this forward (which never runs on replay) — so a
+        // `Some` here on a prefill call is ordinary leftover from the
+        // previous request's last replayed step, not an error. Only a
+        // single-token, non-fresh decode may consume it.
+        let prestaged = st.prestaged_va.take().filter(|_| num_tokens == 1 && !fresh);
         if fresh || st.history.len() != self.dims.context_len() {
             self.reset(&mut st, gpu, stream)?;
         }
@@ -247,10 +271,6 @@ impl PleLayer {
             // The host half already ran from `decode_prestage`, before graph
             // replay/capture: slots sit in `slots_dev`, history has advanced.
             // Only the capture-safe kernel half remains.
-            anyhow::ensure!(
-                num_tokens == 1 && !fresh,
-                "PLE: prestage is a single-token decode path (got T={num_tokens}, fresh={fresh})"
-            );
             self.gather_embed(table_va, num_tokens, heads, gpu, stream)?;
         } else {
             anyhow::ensure!(
@@ -384,7 +404,27 @@ impl PleLayer {
                 // faults missing rows off NVMe into the pinned, GPU-addressable
                 // arena. The gather kernel then reads the arena BY SLOT.
                 let mut slots = Vec::with_capacity(ids.len());
+                let (h0, m0, _) = cache.stats();
+                let t0 = std::time::Instant::now();
                 cache.resolve(ids, &mut slots)?;
+                // Prefill-scale gathers log the fault profile at info: the
+                // misses are SERIAL blocking preads today (QD=1 under this
+                // mutex), so miss-count x latency IS the prefill stall.
+                // Decode-scale (16 ids) stays at debug.
+                let (h1, m1, _) = cache.stats();
+                let (dh, dm) = (h1 - h0, m1 - m0);
+                let us = t0.elapsed().as_micros();
+                if ids.len() > 64 {
+                    tracing::info!(
+                        "PLE gather: {} ids, {dh} hits / {dm} misses, resolve {us}us",
+                        ids.len()
+                    );
+                } else {
+                    tracing::debug!(
+                        "PLE gather: {} ids, {dh} hits / {dm} misses, resolve {us}us",
+                        ids.len()
+                    );
+                }
                 let bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
                 gpu.copy_h2d_async(&bytes, self.slots_dev, stream)?;
                 let va = cache.table_dev_va()?;

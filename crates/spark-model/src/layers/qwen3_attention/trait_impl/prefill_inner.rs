@@ -558,9 +558,13 @@ impl Qwen3AttentionLayer {
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
+        // Opt-in ONLY: each diag is a full-stream synchronize + D2H, and the
+        // old `attn_layer_idx == 0 ||` paid that on EVERY prefill chunk (and
+        // on decode it silently invalidated CUDA graph capture — see
+        // decode_inner.rs).
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
-        let diag_this = self.attn_layer_idx == 0 || diag_all;
+        let diag_this = diag_all;
 
         if is_first_layer {
             ops::hc_expand(

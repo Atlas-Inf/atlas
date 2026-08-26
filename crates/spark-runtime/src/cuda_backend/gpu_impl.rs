@@ -333,7 +333,13 @@ impl GpuBackend for AtlasCudaBackend {
     ) -> Result<()> {
         let status = unsafe { cuMemcpyDtoDAsync_v2(dst.0, src.0, bytes, stream) };
         if status != 0 {
-            bail!("cuMemcpyDtoDAsync_v2 failed: status {status}");
+            // See copy_d2d_impl: on 901 the backtrace names the reporter,
+            // which bounds where the capture-poisoning op ran.
+            tracing::error!(
+                "copy_d2d_async failed (status {status}) at:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+            bail!("cuMemcpyDtoDAsync_v2 (copy_d2d_async) failed: status {status}");
         }
         Ok(())
     }

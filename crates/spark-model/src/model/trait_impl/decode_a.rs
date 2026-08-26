@@ -348,7 +348,43 @@ impl TransformerModel {
             // graph) before propagating; no-op when not capturing. Graphs stay
             // enabled: the next decode step begins a fresh capture.
             self.gpu.abort_capture_if_active(stream);
-            return Err(e);
+            // A capture-poison error (900 CAPTURE_UNSUPPORTED / 901
+            // CAPTURE_INVALIDATED) is a property of the graph attempt, not of
+            // the request: capture RECORDS without executing, so nothing has
+            // run for this token — re-run the step eagerly and disable graphs,
+            // mirroring the end_capture-failure arm below, instead of failing
+            // the request outright. Other errors (LoRA refusals, OOM) would
+            // fail eagerly too, so they still propagate.
+            let msg = format!("{e:#}");
+            let capture_poison = capture_active
+                && (msg.contains("status 901")
+                    || msg.contains("status 900")
+                    || msg.contains("STREAM_CAPTURE"));
+            if !capture_poison {
+                return Err(e);
+            }
+            tracing::warn!(
+                "decode body failed under CUDA graph capture ({msg}) — \
+                 re-running eagerly and disabling graph capture"
+            );
+            self.suppress_graphs
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            capture_active = false;
+            // The recorded attempt consumed per-step prestaged state (PLE's
+            // parked table VA); restore it without recomputing.
+            for l in self.layers.iter() {
+                l.decode_prestage_rearm();
+            }
+            self.decode_forward_body(
+                hidden,
+                residual,
+                seq,
+                &mut kv_cache,
+                &ctx,
+                false,
+                false,
+                stream,
+            )?;
         }
 
         // Decode-step diagnostic for Gemma-4 degeneration analysis (no-op unless
@@ -384,6 +420,11 @@ impl TransformerModel {
                     );
                     self.suppress_graphs
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Restore per-step prestaged state the recorded attempt
+                    // consumed (see the mid-body arm above).
+                    for l in self.layers.iter() {
+                        l.decode_prestage_rearm();
+                    }
                     self.decode_forward_body(
                         hidden,
                         residual,

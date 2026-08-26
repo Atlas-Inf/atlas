@@ -77,6 +77,11 @@ pub trait TransformerLayer: Send + Sync {
         Ok(())
     }
 
+    /// Re-arm consumed prestage state so a failed CUDA-graph capture attempt
+    /// can re-run the SAME step eagerly. Must be idempotent, and must not
+    /// recompute (PLE's history already advanced in `decode_prestage`).
+    fn decode_prestage_rearm(&self) {}
+
     /// Decode one token through this layer, modifying `hidden` in-place.
     ///
     /// # Arguments

@@ -27,6 +27,12 @@ impl TransformerLayer for Qwen3SsmLayer {
         Ok(())
     }
 
+    fn decode_prestage_rearm(&self) {
+        if let Some(ple) = self.ple.as_ref() {
+            ple.rearm();
+        }
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,

@@ -467,9 +467,16 @@ impl Qwen3AttentionLayer {
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
+        // Opt-in ONLY (and never under graph capture): `diag_norm` does a
+        // synchronize + copy_d2h per call and SWALLOWS the errors — inside a
+        // recording CUDA graph the sync silently invalidates the capture and
+        // the next checked stream op reports 901 with no pointer back here.
+        // The old `attn_layer_idx == 0 ||` made that happen on EVERY decode
+        // step of the first attention layer (and cost a hidden round-trip per
+        // step even in eager mode).
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
-        let diag_this = self.attn_layer_idx == 0 || diag_all;
+        let diag_this = diag_all && !ctx.graph_capture;
 
         // 1. Expand single-stream embedding into hc_mult copies on first layer.
         if is_first_layer {
