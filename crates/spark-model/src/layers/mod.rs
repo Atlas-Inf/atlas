@@ -14,6 +14,7 @@ pub mod nemotron_moe;
 pub mod ops;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod qwen4exp_layer;
 pub mod vision_encoder;
 pub mod w4a16_gemv_tiers;
 
