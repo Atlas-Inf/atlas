@@ -355,9 +355,16 @@ pub fn qwen4_exp_manifest_with(
         for fc in ["fc_embedding", "fc_hidden"] {
             out.push(ExpectedTensor::new(format!("mtp.{fc}.weight"), [h, h]));
         }
-        for norm in ["pre_fc_norm_embedding", "pre_fc_norm_hidden"] {
-            out.push(ExpectedTensor::new(format!("mtp.{norm}.weight"), [h]));
-        }
+        // The two MTP inputs are NOT the same width, and the checkpoint is the
+        // only place that says so. `pre_fc_norm_embedding` normalises a plain
+        // token embedding (hidden); `pre_fc_norm_hidden` normalises the trunk's
+        // hyper-connection state, which is hc_count streams wide (10240 on the
+        // published model, against a hidden of 2560). Both releases agree.
+        out.push(ExpectedTensor::new("mtp.pre_fc_norm_embedding.weight", [h]));
+        out.push(ExpectedTensor::new(
+            "mtp.pre_fc_norm_hidden.weight",
+            [cfg.hc_count * h],
+        ));
     }
     Ok(out)
 }
@@ -482,8 +489,12 @@ mod tests {
             [10240, 2560]
         );
 
-        // MTP carries its own indexer and its own 512 experts.
+        // MTP carries its own indexer and its own 512 experts. Its two input
+        // norms differ in width: the embedding side is hidden, the hidden side
+        // is the trunk's hc_count-wide hyper-connection state.
         assert_eq!(shape_of(&m, "mtp.fc_embedding.weight"), [2560, 2560]);
+        assert_eq!(shape_of(&m, "mtp.pre_fc_norm_embedding.weight"), [2560]);
+        assert_eq!(shape_of(&m, "mtp.pre_fc_norm_hidden.weight"), [10240]);
         assert_eq!(
             shape_of(&m, "mtp.layers.0.mlp.experts.511.down_proj.weight"),
             [2560, 640]

@@ -234,8 +234,11 @@ def build():
     hyper_connection("mtp.hyper_connection_mixer", tensors, inject=False)
     tensors["mtp.fc_embedding.weight"] = torch.randn(H, H) * 0.02
     tensors["mtp.fc_hidden.weight"] = torch.randn(H, H) * 0.02
+    # Different widths: the embedding side normalises a token embedding (H),
+    # the hidden side normalises the trunk's hc_count-wide hyper-connection
+    # state. The published checkpoints are [2560] and [10240].
     tensors["mtp.pre_fc_norm_embedding.weight"] = torch.ones(H)
-    tensors["mtp.pre_fc_norm_hidden.weight"] = torch.ones(H)
+    tensors["mtp.pre_fc_norm_hidden.weight"] = torch.ones(HC_COUNT * H)
 
     vis = "model.visual"
     tensors[f"{vis}.patch_embed.proj.weight"] = torch.randn(64, 3, 2, 16, 16) * 0.02
