@@ -7,7 +7,21 @@ on:
   # can only be started by an event you do not control is a check you cannot
   # get a verdict from when you most need it.
   workflow_dispatch:
+    inputs:
+      build_distros:
+        description: "Also run the 9-platform release build matrix"
+        type: boolean
+        required: false
+        default: false
+  # `labeled` is added to the DEFAULT set (opened/synchronize/reopened) so that
+  # applying `build:distros` to an open PR actually starts a run — without it
+  # the label would only take effect on the next push. Every other label change
+  # also re-runs the cheap gates; that is the price of the opt-in and it is a
+  # few runner-minutes. It cannot recurse through `pr-conflict-label`, which
+  # writes `needs-rebase` with the default GITHUB_TOKEN, and GitHub does not
+  # start workflows from that token's writes.
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main, master]
   # Merge queue: entries are validated on a temporary `gh-readonly-queue/**`
@@ -17,8 +31,9 @@ on:
   # Every job that is (or becomes) a required check must stay event-agnostic
   # or run here too. Jobs that are event-gated to `pull_request` and NOT
   # required (pr-categorize) are advisory only and need not report on queue
-  # commits. release-matrix and pr-benchmark-gate both run under merge_group
-  # deliberately — see their own comments for why.
+  # commits. pr-benchmark-gate runs under merge_group deliberately — see its
+  # own comment for why. release-matrix no longer does: it is opt-in now, and
+  # nothing in this repo's ruleset makes it required.
   merge_group:
   # Reusable: release.yml gates its (expensive) build matrix on CI passing, so
   # a fmt or clippy failure costs one cheap runner instead of eight toolchain
@@ -193,21 +208,44 @@ jobs:
   # cargo-deny runs in security.yml with path filters on Cargo.toml / Cargo.lock /
   # deny.toml plus a weekly cron. Not duplicated here.
 
-  # The release build matrix runs only after every gate above is green, in
-  # this same CI run — so a PR's checks table shows base CI then the matrix,
-  # and CI is never executed twice for one commit. Guarded to pull_request:
-  # release.yml calls this workflow for its own gate, and must not trigger a
-  # second matrix build there.
+  # OPT-IN. This matrix is nine (OS, arch, GPU) builds — Windows CUDA alone
+  # takes ~34 minutes, and macOS runners bill at 10x — so on 2026-08-26 it was
+  # measured at ~89 of the ~101 runner-minutes a single PR push spent in CI,
+  # roughly 190 BILLABLE minutes once the runner multipliers are applied. It
+  # ran on every push to every PR, which is what made Actions unusable here.
+  #
+  # Distributables are a RELEASE artifact, so they are now built when someone
+  # asks for them, by one of three routes:
+  #
+  #   1. `release.yml` (workflow_dispatch) — the real thing. Takes any `ref`
+  #      and defaults `dry_run: true`, so pointing it at a PR branch builds
+  #      and uploads the full matrix without tagging or publishing anything.
+  #      This is the escape hatch for "does my branch still package?" and it
+  #      needed no new machinery.
+  #   2. `dev-release.yml` — rolling `bNNNN` prereleases off green main.
+  #   3. This job, for when the answer has to appear in the PR's own checks
+  #      table: apply the `build:distros` label, or dispatch CI with
+  #      `build_distros: true`.
+  #
+  # Deliberately NOT gated on merge_group any more. Nothing in this repo's
+  # ruleset (`main-protect`, enforcement `disabled`, rules: deletion +
+  # non_fast_forward) makes this a required check, and there is no merge queue
+  # for it to report into. If a queue is ever turned on and this becomes
+  # required, restore `github.event_name == 'merge_group'` to the condition
+  # below — a required check that never reports hangs every queue entry.
   release-matrix:
     name: release matrix
-    # Runs for pull_request AND merge_group (queue entry validation on the
-    # temporary gh-readonly-queue/** commit). github.event.number is empty
-    # under merge_group, so the version string falls back to "queue".
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    # github.event.number is empty on workflow_dispatch, so the version string
+    # falls back to the literal `0.0.0-prdispatch`. It only ever names a
+    # throwaway artifact (retention 1 day) and is never tagged.
+    if: >-
+      (github.event_name == 'pull_request'
+       && contains(github.event.pull_request.labels.*.name, 'build:distros'))
+      || (github.event_name == 'workflow_dispatch' && inputs.build_distros)
     needs: [fmt, clippy, license-headers, typos, kernel-structure, test, test-macos-metal]
     uses: ./.github/workflows/release-build.yml
     with:
-      version: 0.0.0-pr${{ github.event.number || 'queue' }}
+      version: 0.0.0-pr${{ github.event.number || 'dispatch' }}
       pr_mode: true
       retention_days: 1
 
