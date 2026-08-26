@@ -126,6 +126,15 @@ impl ModelConfig {
             ngram_vocab_size_ratio: 0,
             emb_neighbor_num: 0,
             emb_split_num: 0,
+            // No PLE tower: `ple_layer_ids` empty is the gate.
+            ple_layer_ids: Vec::new(),
+            ple_embed_dim: 0,
+            ngram_size: 0,
+            heads_per_ngram: 0,
+            ngram_vocab_size_base: 0,
+            make_ngram_vocab_size_divisible_by: 0,
+            split_ngram_parts: 0,
+            ngram_seed: super::default_ngram_seed(),
         }
     }
 }

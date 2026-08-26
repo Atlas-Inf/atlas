@@ -467,6 +467,49 @@ pub struct ModelConfig {
     /// Hash splits K per n-gram size, giving `K * (N-1)` tables in total.
     #[serde(default)]
     pub emb_split_num: usize,
+
+    // ── N-gram hashed embeddings, `qwen4_exp` flavour ──
+    // A DIFFERENT mechanism from the LongCat trio above, not a re-spelling of
+    // it (see `config/ngram_qwen4exp.rs`). `ple_layer_ids` is the gate: empty
+    // means the checkpoint declares no PLE / n-gram path, which is every other
+    // family. Ids here are ONE-INDEXED decoder layers, as HF writes them --
+    // `[2]` is decoder layer 1, and the published Qwen3.8-Flash-Next-FP8
+    // checkpoint stores that tower under `layers.1.ple.*`.
+    #[serde(default)]
+    pub ple_layer_ids: Vec<usize>,
+    /// Width of the concatenated n-gram embedding a PLE layer injects.
+    #[serde(default)]
+    pub ple_embed_dim: usize,
+    /// Largest n-gram size N; shifts of `0..N` tokens feed the XOR mix.
+    #[serde(default)]
+    pub ngram_size: usize,
+    /// Hash heads K per n-gram size, giving `K * (N-1)` heads in total.
+    #[serde(default)]
+    pub heads_per_ngram: usize,
+    /// Each head's table holds the next consecutive PRIME above this base.
+    #[serde(default)]
+    pub ngram_vocab_size_base: u64,
+    /// The concatenated table is padded up to a multiple of this so the
+    /// checkpoint's `split_ngram_parts` shards divide it evenly.
+    #[serde(default)]
+    pub make_ngram_vocab_size_divisible_by: u64,
+    /// Number of tensors the concatenated table is sharded across on disk.
+    /// Storage layout only -- it does not enter the id arithmetic.
+    #[serde(default)]
+    pub split_ngram_parts: usize,
+    /// Seed for the SplitMix64 multiplier draw.
+    ///
+    /// Defaulted rather than zero-defaulted, and this is load-bearing: the
+    /// published Qwen3.8-Flash-Next-FP8 `config.json` OMITS `seed`, so a
+    /// zero default would silently draw the wrong multipliers and hash every
+    /// token to an unrelated row. 1234 is HF's documented default.
+    #[serde(default = "default_ngram_seed", rename = "seed")]
+    pub ngram_seed: u64,
+}
+
+/// HF `Qwen4ExpTextConfig.seed` default. See [`ModelConfig::ngram_seed`].
+fn default_ngram_seed() -> u64 {
+    1234
 }
 
 /// Advertised weight-quantization layout, as declared in the HF
@@ -593,13 +636,15 @@ mod factory;
 mod gguf;
 mod methods;
 mod ngram;
+mod ngram_qwen4exp;
 mod parsers;
 #[cfg(test)]
 mod tests;
 
 pub use dispatch::parse_config;
 pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
-pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos};
+pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos, shift_right_ignore_eos_fill};
+pub use ngram_qwen4exp::Qwen4ExpNgram;
 pub use parsers::{
     PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
     parse_peft_adapter_config, parse_quantization_config,

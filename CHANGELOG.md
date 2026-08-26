@@ -17,15 +17,38 @@ behind specific subsystems — see the
   failed gate (2).
 - `--version`, sourced from the packaged version so a build cannot report a
   version it was not packaged as.
-- **N-gram scaled embeddings: id core and validity envelope** (`NgramDims`,
-  `ngram_ids`), the groundwork for the LongCat / Qwen3.8-Flash-Next family whose
-  embedding tables are far larger than their backbones. Row ids are a polynomial
-  rolling hash over token ids only, with document-boundary resets, checked
-  bit-exact against a dependency-free reference (`bench/ngram_embed/`) at real
-  LongCat-Flash-Lite dimensions. A config declaring the trio is validated, not
-  assumed: table counts that would exceed the u32 the gather kernels index with,
-  a `hidden_size` that does not divide by the table count, an accumulator that
+- **N-gram scaled embeddings, LongCat flavour: id core and validity envelope**
+  (`NgramDims`, `ngram_ids`) — groundwork for the family whose embedding tables
+  are far larger than their backbones. Row ids are a polynomial rolling hash
+  over token ids only, with document-boundary resets, checked bit-exact against
+  a dependency-free reference (`bench/ngram_embed/`) at real LongCat-Flash-Lite
+  dimensions. A config declaring the trio is validated, not assumed: table
+  counts that would exceed the u32 the gather kernels index with, a
+  `hidden_size` that does not divide by the table count, an accumulator that
   would wrap u64, and partially-declared trios are all refused at parse.
+- **N-gram hashed embeddings, `qwen4_exp` flavour** (`Qwen4ExpNgram`) — the
+  mechanism Qwen3.8-Flash-Next actually uses, which is a **different algorithm**
+  from the LongCat one above rather than a parameterisation of it. It mixes by
+  XOR of `shift_d · m_d` where the multipliers are seeded SplitMix64 draws, its
+  per-head table sizes are consecutive PRIMES above a base, and its heads share
+  one concatenated table addressed through per-head offsets. Feeding a LongCat
+  id into a `qwen4_exp` table reads an unrelated row, so the two are separate
+  types and a test asserts they do not coincide.
+
+  Every derived quantity is reproduced bit-exact from `config.json` alone and
+  pinned against the published `Qwen/Qwen3.8-Flash-Next-FP8` checkpoint: the
+  `layer_multipliers`, `ngram_heads_vocab_sizes` and `ngram_heads_offsets`
+  buffers, and the `[2_500_012, 160] x 128` shard geometry. Two traps are
+  encoded rather than commented — `ple_layer_ids` is ONE-indexed (`[2]` is
+  decoder layer 1, which is where the checkpoint stores `layers.1.ple.*`), and
+  `seed` is ABSENT from that `config.json`, so it defaults to 1234 instead of
+  zero; a zero seed draws the wrong multipliers and hashes every token to an
+  unrelated row without failing.
+
+  Config only. The rest of `qwen4_exp` — the `qwen4_exp` parser and weight
+  loader, low-rank hyper-connections, the sparse-attention indexer, the PLE
+  tower, the 512-expert MoE, the vision tower and the hybrid MTP head — is not
+  implemented; see `docs/porting/QWEN4_EXP.md` for the gap list.
 
 ### Fixed
 - **Benchmark runs no longer overwrite each other.** History files were named by

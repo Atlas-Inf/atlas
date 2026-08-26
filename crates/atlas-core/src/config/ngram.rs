@@ -163,7 +163,22 @@ impl NgramDims {
 /// boundary. Segments end AT an EOS (inclusive); a segment no longer than `n`
 /// contributes nothing, having no position far enough from its start.
 pub fn shift_right_ignore_eos(ctx: &[u32], n: usize, eos: u32) -> Vec<u32> {
-    let mut out = vec![0u32; ctx.len()];
+    shift_right_ignore_eos_fill(ctx, n, eos, 0)
+}
+
+/// [`shift_right_ignore_eos`] with the out-of-segment value spelled out.
+///
+/// The segmentation is the whole of what the two n-gram families share; they
+/// disagree only on what a position too close to a segment start contributes.
+/// LongCat writes `0`, which drops the term out of its polynomial sum;
+/// `qwen4_exp` writes the EOS id, which is a real operand in its XOR mix. That
+/// is a one-word difference and two separate walks would drift apart, so it is
+/// a parameter rather than a copy.
+pub fn shift_right_ignore_eos_fill(ctx: &[u32], n: usize, eos: u32, fill: u32) -> Vec<u32> {
+    if n == 0 {
+        return ctx.to_vec();
+    }
+    let mut out = vec![fill; ctx.len()];
     let mut prev = 0usize;
     for (pos, &tok) in ctx.iter().enumerate() {
         if tok == eos {
