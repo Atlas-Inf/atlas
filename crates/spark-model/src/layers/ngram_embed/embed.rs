@@ -133,10 +133,12 @@ impl NgramEmbedding {
             // NVMe-backed table: fault the rows in and REPLACE the ids with
             // their slot indices, then gather from the arena exactly as if it
             // were a small resident table.
+            #[cfg(feature = "cuda")]
             if let NgramTable::Cached(cache) = &mut self.tables[index] {
-                let mut slots = Vec::with_capacity(seq_len);
+                let mut slots: Vec<u32> = Vec::with_capacity(seq_len);
                 cache.resolve(tail, &mut slots)?;
-                let slot_bytes: Vec<u8> = slots.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let slot_bytes: Vec<u8> =
+                    slots.iter().flat_map(|v: &u32| v.to_le_bytes()).collect();
                 gpu.copy_h2d_async(&slot_bytes, self.ids_dev, stream)?;
                 let table = DevicePtr(cache.table_dev_va()?);
                 match cache.scale_dev_va()? {
@@ -207,6 +209,7 @@ impl NgramEmbedding {
                     td as u32,
                     stream,
                 )?,
+                #[cfg(feature = "cuda")]
                 NgramTable::Cached(_) => unreachable!("resolved above"),
             }
             ops::dense_gemm_bf16_pipelined(

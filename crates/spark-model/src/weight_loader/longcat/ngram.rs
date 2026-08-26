@@ -14,18 +14,25 @@
 //! bounded slot window costs a few hundred MB instead of 62.8 GB (BF16) or
 //! 31.4 GB (FP8) — and that memory goes to KV instead.
 
-use anyhow::{Context, Result};
+#[cfg(feature = "cuda")]
+use anyhow::Context;
+use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
-use crate::layers::ngram_embed::{NgramDims, NgramEmbedding, NgramTable};
+#[cfg(feature = "cuda")]
+use crate::layers::ngram_embed::NgramTable;
+use crate::layers::ngram_embed::{NgramDims, NgramEmbedding};
+#[cfg(feature = "cuda")]
 use crate::weight_map::dense;
 
 /// Resident rows per table. 65536 slots x 512 B = 33.5 MB per table, so all
 /// 12 cost ~402 MB — against 62.8 GB for the same tables held BF16-resident.
+#[cfg(feature = "cuda")]
 const DEFAULT_SLOTS: usize = 65536;
 
+#[cfg(feature = "cuda")]
 fn slots_from_env() -> usize {
     std::env::var("ATLAS_NGRAM_CACHE_SLOTS")
         .ok()
@@ -36,6 +43,7 @@ fn slots_from_env() -> usize {
 
 /// Build the n-gram embedding, or `None` when this checkpoint has no n-gram
 /// trio in its config (every non-LongCat model).
+#[cfg(feature = "cuda")]
 pub(super) fn build(
     store: &WeightStore,
     config: &ModelConfig,
@@ -115,4 +123,26 @@ pub(super) fn build(
     Ok(Some(NgramEmbedding::new(
         dims, word, tables, projs, max_tokens, gpu,
     )?))
+}
+
+/// Non-CUDA builds have no row cache — it serves rows out of a pinned,
+/// GPU-addressable arena — so an n-gram model cannot be served at all here.
+/// REFUSE rather than return `None`: `None` means "this architecture has no
+/// n-gram embedding", and quietly answering that for a model that does have
+/// one is how you end up serving a plain gather and wondering why the output
+/// is fluent nonsense.
+#[cfg(not(feature = "cuda"))]
+pub(super) fn build(
+    _store: &WeightStore,
+    config: &ModelConfig,
+    _gpu: &dyn GpuBackend,
+    _max_tokens: usize,
+) -> Result<Option<NgramEmbedding>> {
+    if NgramDims::from_config(config).is_none() {
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "ngram: this checkpoint has n-gram embeddings, but the row cache that \
+         serves them needs the `cuda` feature; this build cannot serve it"
+    )
 }
