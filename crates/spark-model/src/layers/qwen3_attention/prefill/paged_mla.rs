@@ -39,6 +39,25 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         args: &MlaPrefillArgs,
     ) -> Result<DevicePtr> {
+        // PADDED-HEAD MLA IS NOT VALIDATED ON THIS PATH.
+        //
+        // LongCat is the first MLA model whose qk head (192) and v head (128)
+        // differ, so its weights are padded to a 256-wide head and the softmax
+        // scale is pinned to 1/sqrt(192) via `set_attn_scale_override`. The
+        // UNABSORBED path (`cache_skip_mla`) was fixed and validated against
+        // the golden at that geometry; THIS path was not, and measurably
+        // disagrees with it — same prompt, same weights, post_attn_norm_out
+        // cos 0.9891 and shortcut_moe cos 0.9704 against the validated arm.
+        //
+        // That gap only opens when a request takes this route instead, which
+        // is what a prefix-cache hit does. Refuse rather than serve subtly
+        // wrong attention: a request that errors gets investigated, one that
+        // quietly answers a different question does not.
+        anyhow::ensure!(
+            self.attn_scale_override.is_none(),
+            "paged MLA prefill does not support this model's padded head              geometry (qk {} != v head width). The unabsorbed cache-skip path              is the validated one; this route is reached via a prefix-cache              hit, so serve with prefix caching DISABLED until paged_mla is              fixed for padded heads.",
+            self.head_dim_override.unwrap_or(0)
+        );
         let MlaPrefillArgs {
             normed,
             num_tokens,
