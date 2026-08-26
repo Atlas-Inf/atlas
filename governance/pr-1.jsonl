@@ -1,0 +1,2 @@
+{"pr":1,"head_sha":"888b9cb229ecc35929ee4075e217aaecd674c8cc","run_id":"32798337585","attempt":1,"at":1787621945,"kind":"category","value":"unknown","status":"abstain"}
+{"pr":1,"head_sha":"888b9cb229ecc35929ee4075e217aaecd674c8cc","run_id":"32798337585","attempt":1,"at":1787621979,"kind":"category","value":"infrastructure/build-system","status":"ok"}
