@@ -112,6 +112,47 @@ def gather_rows(snap: str, index: dict, ids: np.ndarray, dim: int) -> np.ndarray
     return out
 
 
+def bf16_bytes(a: np.ndarray) -> bytes:
+    t = torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))
+    return t.to(torch.bfloat16).view(torch.uint16).numpy().tobytes()
+
+
+def write_bins(out_dir: str, dump: dict) -> None:
+    """Raw sidecar for the Rust probe, in the dtypes the kernel declares.
+
+    `hidden` stays FP32 because it IS the mHC highway; everything else is the
+    BF16 the projections and norms actually ship.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    files: dict[str, str] = {}
+
+    def put(name: str, data: bytes, dtype: str) -> None:
+        with open(os.path.join(out_dir, name + '.bin'), 'wb') as fh:
+            fh.write(data)
+        files[name] = dtype
+
+    put('hidden', dump['hidden'].astype(np.float32).tobytes(), 'f32')
+    for n in ('key_proj_out', 'value_proj_out', 'w_norm_key', 'w_norm_query',
+              'w_norm_conv', 'w_conv1d'):
+        put(n, bf16_bytes(dump[n]), 'bf16')
+    for n in ('gated', 'gated_normed', 'output'):
+        put(n, dump[n].astype(np.float32).tobytes(), 'f32')
+    put('gate_sigmoid', dump['gate_sigmoid'].astype(np.float32).tobytes(), 'f32')
+    # FP32 copy of the value projection, for the probe's bisect arithmetic.
+    put('value_proj_out_f32',
+        dump['value_proj_out'].astype(np.float32).tobytes(), 'f32')
+
+    meta = {k: (int(dump[k]) if dump[k].dtype.kind in 'iu' else float(dump[k]))
+            for k in ('hc_count', 'hidden_size', 'head_dim', 'ngram_heads',
+                      'conv_kernel_size', 'conv_dilation', 'rms_norm_eps')}
+    meta['num_tokens'] = int(dump['hidden'].shape[0])
+    meta['norm_convention'] = dump['norm_convention'].decode()
+    meta['files'] = files
+    with open(os.path.join(out_dir, 'meta.json'), 'w') as fh:
+        json.dump(meta, fh, indent=2, sort_keys=True)
+    print(f'wrote {out_dir}/ ({len(files)} bins + meta.json) for the Rust probe')
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--snapshot', default=os.environ.get('QWEN4EXP_PATH',
@@ -206,7 +247,12 @@ def main() -> int:
     flat = ids.reshape(-1)
     rows = gather_rows(snap, index, flat, head_dim)
     print(f'  gathered {len(flat)} rows from the 128-shard table')
-    rec.rows = torch.from_numpy(rows.reshape(t, n_heads, head_dim))
+    # Keep the BATCH dim. Without it `ng.forward` returns [T, 2560] instead
+    # of [1, T, 2560], and `value_proj(emb)[0]` then dumps ONE TOKEN while the
+    # expected tensors — which broadcast back to [1,T,...] — stay correct. The
+    # probe then matches on token 0 and diverges everywhere else, which reads
+    # exactly like a time-dependence bug in the kernel. It was the fixture.
+    rec.rows = torch.from_numpy(rows.reshape(1, t, n_heads, head_dim))
 
     # ── the full layer ──
     # Same stub: `Qwen4ExpTextPLELayer` builds its own NGramEmbedding, and so
@@ -262,7 +308,35 @@ def main() -> int:
         'rms_norm_eps': np.float32(config.rms_norm_eps),
         'norm_convention': np.bytes_(b'normed * (1.0 + weight)'),
     }
+    # Intermediates for the Rust kernel probe. Produced by the reference's OWN
+    # submodules on the reference's own weights — this is not a second
+    # implementation, it is the same one, observed one stage earlier.
+    with torch.no_grad():
+        key_out = ple.key_proj(embeddings)                       # [1,T,hc*H]
+        value_out = ple.value_proj(embeddings)                   # [1,T,H]
+        key_n = ple.norm_key(key_out).unflatten(-1, (hc, h))
+        query_n = ple.norm_query(hidden).unflatten(-1, (hc, h))
+        gate = (key_n * query_n).sum(-1, keepdim=True) / (h ** 0.5)
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gated = torch.sigmoid(gate) * value_out.unsqueeze(-2)
+        gated_flat = gated.flatten(-2)
+        gated_normed = ple.norm_conv(gated_flat)
+    dump['key_proj_out'] = key_out[0].numpy()
+    dump['value_proj_out'] = value_out[0].numpy()
+    dump['gate_sigmoid'] = torch.sigmoid(gate)[0, :, :, 0].numpy()
+    dump['gated'] = gated_flat[0].numpy()
+    dump['gated_normed'] = gated_normed[0].numpy()
+    dump['w_norm_key'] = get('norm_key.weight').float().numpy()
+    dump['w_norm_query'] = get('norm_query.weight').float().numpy()
+    dump['w_norm_conv'] = get('norm_conv.weight').float().numpy()
+    dump['w_conv1d'] = get('conv1d.weight').float().numpy()
+    print(f'  key_proj |x|={key_out.norm():.4f}  value_proj |x|={value_out.norm():.4f}')
+    print(f'  gate sigmoid range [{torch.sigmoid(gate).min():.4f}, '
+          f'{torch.sigmoid(gate).max():.4f}]  gated |x|={gated_flat.norm():.4f}')
+
     np.savez(args.out, **dump)
+    if args.bin_dir:
+        write_bins(args.bin_dir, dump)
     print(f'\nwrote {args.out} '
           f'({os.path.getsize(args.out) / 1e6:.2f} MB, {len(dump)} arrays)')
 

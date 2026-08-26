@@ -106,6 +106,11 @@ mod moe_prefill;
 #[path = "ops/norm.rs"]
 mod norm;
 mod nvfp4_mmq;
+#[path = "ops/ple.rs"]
+mod ple;
+#[cfg(test)]
+#[path = "ops/ple_tests.rs"]
+mod ple_tests;
 #[path = "ops/prefill_attn_a.rs"]
 mod prefill_attn_a;
 #[path = "ops/prefill_attn_b.rs"]
@@ -187,6 +192,7 @@ pub use moe_lora_grouped::*;
 pub use moe_prefill::*;
 pub use norm::*;
 pub use nvfp4_mmq::*;
+pub use ple::*;
 pub use prefill_attn_a::*;
 pub use prefill_attn_b::*;
 pub use prefill_attn_batched::*;
