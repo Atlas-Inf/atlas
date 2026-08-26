@@ -197,3 +197,18 @@ gdn_verify_fused_conv_kn_f32 = """
 FP32 fused verify conv for the exact-verify chain (#435), shipped only
 in qwen3.6-27b/nvfp4. Probed handle != 0; absent, the exact chain keeps
 its per-token conv launches (same bits, more launches)."""
+
+[behavior]
+# Qwen3.8-Flash-Next is a THINKING model whose chat template gates
+# EVERYTHING on `enable_thinking is undefined or true`: the default render
+# carries a reasoning-effort system preamble ("Reasoning effort is set to
+# xhigh...") and opens the assistant turn with `<think>\n`. Atlas always
+# passes enable_thinking as a DEFINED boolean, and with thinking_default
+# unset (= false) it rendered a bare 13-token prompt the model was never
+# trained on — which collapsed chat to a 2-token EOS while raw completions
+# were fine. Measured 2026-08-26: the checkpoint's own render answers
+# "12 x 8" with a correct reasoned 96; the bare render emits "**<eos>".
+# Same setting as qwen3.8-27b / qwen3.6-35b: reasoning by default.
+thinking_default = true
+thinking_in_tools = true
+max_thinking_budget = 2048

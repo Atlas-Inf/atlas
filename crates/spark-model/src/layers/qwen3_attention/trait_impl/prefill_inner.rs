@@ -575,6 +575,20 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
+        // Bisect taps (ATLAS_QWEN4EXP_DUMP): the GDN ladder verifies clean,
+        // so the attention layers are the remaining unverified compute. On
+        // the 3:1 interleave attention layer k is MODEL layer 4k+3.
+        let model_layer = self.attn_layer_idx * 4 + 3;
+        crate::layers::ple::dump::tap_highway(
+            ctx.gpu,
+            hc_streams,
+            model_layer,
+            "attn_in",
+            num_tokens,
+            (hc_mult as usize) * h,
+            stream,
+        );
+
         // ── Attention sublayer ──
         ops::hc_pre_site(
             ctx.gpu,
@@ -778,6 +792,16 @@ impl Qwen3AttentionLayer {
                 ),
             );
         }
+
+        crate::layers::ple::dump::tap_highway(
+            ctx.gpu,
+            hc_streams,
+            model_layer,
+            "post_attn",
+            num_tokens,
+            (hc_mult as usize) * h,
+            stream,
+        );
 
         // ── FFN sublayer ──
         ops::hc_pre_site(
