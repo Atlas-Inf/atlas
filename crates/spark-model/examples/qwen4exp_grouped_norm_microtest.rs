@@ -207,7 +207,7 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
         .arg_f32(EPS)
         .launch(0)?;
 
-    ops::dense_gemv(g, gemv, d_normed, &d_down, d_lowrank, LOWRANK, wide, 0)?;
+    ops::dense_gemv(g, gemv, d_normed, &d_down, d_lowrank, LOWRANK as u32, wide as u32, 0)?;
     KernelLaunch::new(g, act_k)
         .grid([1, 1, 1])
         .block([LOWRANK.min(1024) as u32, 1, 1])
@@ -215,7 +215,7 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
         .arg_u32(LOWRANK as u32)
         .arg_u32(GROUPS as u32)
         .launch(0)?;
-    ops::dense_gemv(g, gemv, d_lowrank, &d_up, d_gate, wide, LOWRANK, 0)?;
+    ops::dense_gemv(g, gemv, d_lowrank, &d_up, d_gate, wide as u32, LOWRANK as u32, 0)?;
 
     KernelLaunch::new(g, mix_k)
         .grid([1, 1, 1])
@@ -227,7 +227,7 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
         .arg_u32(GROUPS as u32)
         .launch(0)?;
 
-    ops::dense_gemv(g, gemv, d_normed, &d_inject, d_raw_inject, GROUPS, wide, 0)?;
+    ops::dense_gemv(g, gemv, d_normed, &d_inject, d_raw_inject, GROUPS as u32, wide as u32, 0)?;
     KernelLaunch::new(g, inj_k)
         .grid([1, 1, 1])
         .block([GROUPS as u32, 1, 1])
