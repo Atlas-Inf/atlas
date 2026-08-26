@@ -638,3 +638,40 @@ pub fn gdn_forward(dims: &GdnDims, w: &GdnWeights<'_>, hidden: &[f32]) -> Vec<f3
     }
     out
 }
+
+/// Standard RoPE tables, `[seq, rotary_dim]` each.
+///
+/// MRoPE collapses to this for text: the three grids carry identical position
+/// ids, so `apply_interleaved_mrope` copies each section onto itself. Only a
+/// multimodal prompt makes the grids differ.
+pub fn rope_tables(seq: usize, rotary_dim: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
+    let half = rotary_dim / 2;
+    let mut cos = vec![0f32; seq * rotary_dim];
+    let mut sin = vec![0f32; seq * rotary_dim];
+    for t in 0..seq {
+        for i in 0..half {
+            let freq = t as f32 / theta.powf(2.0 * i as f32 / rotary_dim as f32);
+            // emb = cat(freqs, freqs), so each frequency appears twice.
+            for slot in [i, i + half] {
+                cos[t * rotary_dim + slot] = freq.cos();
+                sin[t * rotary_dim + slot] = freq.sin();
+            }
+        }
+    }
+    (cos, sin)
+}
+
+/// Scatter a block's `hidden`-wide output back across the `hc_count` residual
+/// streams, scaled per stream.
+pub fn broadcast_inject(mixed: &[f32], injection: &[f32], hidden: usize) -> Vec<f32> {
+    let mut out = vec![0f32; injection.len() * hidden];
+    for (stream, gain) in injection.iter().enumerate() {
+        for (slot, value) in out[stream * hidden..(stream + 1) * hidden]
+            .iter_mut()
+            .zip(mixed)
+        {
+            *slot = value * gain;
+        }
+    }
+    out
+}
