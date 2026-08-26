@@ -619,33 +619,8 @@ pub fn gdn_forward(dims: &GdnDims, w: &GdnWeights<'_>, hidden: &[f32]) -> Vec<f3
             let decay = (-w.a_log[head].exp() * softplus(a[head] + w.dt_bias[head])).exp();
             let beta = sigmoid(b[head]);
             let state = &mut recurrent[head * kd * vd..(head + 1) * kd * vd];
-
-            for value in state.iter_mut() {
-                *value *= decay;
-            }
-            // delta rule: correct the state by how wrong its recall of v is.
-            let mut recall = vec![0f32; vd];
-            for (ki, kv) in k.iter().enumerate() {
-                for (vi, slot) in recall.iter_mut().enumerate() {
-                    *slot += state[ki * vd + vi] * kv;
-                }
-            }
-            let delta: Vec<f32> = v
-                .iter()
-                .zip(&recall)
-                .map(|(target, got)| (target - got) * beta)
-                .collect();
-            for (ki, kv) in k.iter().enumerate() {
-                for (vi, d) in delta.iter().enumerate() {
-                    state[ki * vd + vi] += kv * d;
-                }
-            }
             let out = &mut context[t * value_dim + head * vd..t * value_dim + (head + 1) * vd];
-            for (ki, qv) in q.iter().enumerate() {
-                for (vi, slot) in out.iter_mut().enumerate() {
-                    *slot += state[ki * vd + vi] * qv;
-                }
-            }
+            out.copy_from_slice(&gdn_delta_step(state, &q, &k, v, decay, beta, kd, vd));
         }
     }
 
@@ -707,6 +682,56 @@ pub fn broadcast_inject(mixed: &[f32], injection: &[f32], hidden: usize) -> Vec<
             .zip(mixed)
         {
             *slot = value * gain;
+        }
+    }
+    out
+}
+
+/// One gated-delta-net recurrence step for one head.
+///
+/// `q` must already be L2-normalised AND scaled by `1/sqrt(key_head_dim)`;
+/// `k` L2-normalised. `decay` is `exp(g_t)`, `beta` is `sigmoid(b_t)`. The
+/// state is `[key_head_dim, value_head_dim]` with the value dim contiguous,
+/// which is the layout Atlas's `gated_delta_rule_decode` kernel expects.
+///
+/// The order matters and is not the obvious one: decay the state FIRST, then
+/// measure how wrong its recall of `v` is, then correct by that error scaled by
+/// beta. Accumulating `k v^T` instead -- the natural reading of "linear
+/// attention" -- gives a model that still produces text.
+pub fn gdn_delta_step(
+    state: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    decay: f32,
+    beta: f32,
+    key_dim: usize,
+    value_dim: usize,
+) -> Vec<f32> {
+    assert_eq!(state.len(), key_dim * value_dim);
+    for value in state.iter_mut() {
+        *value *= decay;
+    }
+    let mut recall = vec![0f32; value_dim];
+    for (ki, kv) in k.iter().enumerate() {
+        for (vi, slot) in recall.iter_mut().enumerate() {
+            *slot += state[ki * value_dim + vi] * kv;
+        }
+    }
+    let delta: Vec<f32> = v
+        .iter()
+        .zip(&recall)
+        .map(|(target, got)| (target - got) * beta)
+        .collect();
+    for (ki, kv) in k.iter().enumerate() {
+        for (vi, d) in delta.iter().enumerate() {
+            state[ki * value_dim + vi] += kv * d;
+        }
+    }
+    let mut out = vec![0f32; value_dim];
+    for (ki, qv) in q.iter().enumerate() {
+        for (vi, slot) in out.iter_mut().enumerate() {
+            *slot += state[ki * value_dim + vi] * qv;
         }
     }
     out
