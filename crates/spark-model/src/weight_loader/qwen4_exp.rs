@@ -177,14 +177,23 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             None
         };
 
-        // PLE scratch is sized once, for the largest prefill chunk this run
-        // can present. Overridable because the ceiling is a serve flag, not a
-        // model property; the layer refuses rather than overruns if a pass
-        // exceeds it.
+        // PLE scratch is sized once, for the largest prefill CHUNK a pass can
+        // present — not the model's context.
+        //
+        // Deliberately NOT `config.max_position_embeddings`: `--max-seq-len`
+        // is never written back into it, so on this model that field is the
+        // architectural 262144 and any clamp of it over-allocates. The six
+        // buffers total `tokens * 10240 * 14` bytes, which at 8192 is 1.26 GB
+        // — enough to push a 94.6 GB resident model past the util pledge on a
+        // box with 2.7 GB of headroom, which is exactly what it did.
+        //
+        // 2048 covers the chunk sizes this model runs at; a larger chunk gets
+        // the layer's refusal, which names this variable, rather than a
+        // silent overrun.
         let max_ple_tokens: usize = std::env::var("ATLAS_PLE_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| config.max_position_embeddings.clamp(512, 8192));
+            .unwrap_or(2048);
         // With PLE disabled for bisection, skip the 21 MB arena and the
         // 128-shard open entirely rather than building what we will not run.
         let ple_off = std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1");
