@@ -490,6 +490,45 @@ Every block in step 2 has an oracle. The CPU forward
 it is token-identical to HuggingFace on a reduced checkpoint and produces
 coherent text on the real one.
 
+## GPU kernels: what exists and what it is checked against
+
+Each block is checked against a CPU oracle that is itself checked against
+HuggingFace at real weights, so agreement chains to the reference rather than
+to another guess. Every check carries a **control that must fail** — otherwise
+a kernel that ignored the thing being tested would pass.
+
+| block | layers | vs oracle | control |
+|---|---|---|---|
+| `rms_norm_grouped` | all | 2.0e-3 | ungrouped norm, 300x larger |
+| hyper-connection collapse | all (x2) | 3.9e-3 | injection must not saturate |
+| PLE tower | 1 | 5.2e-3 | zeroed conv taps must change the answer |
+| `gated_delta_rule_decode` | 36 | 3.3e-3 | shared-head mapping exercised |
+
+All at BF16-ulp level. Run them with
+`cargo run --release -p spark-model --example qwen4exp_grouped_norm_microtest`.
+
+### The GDN kernel is reusable, with one interface trap
+
+Atlas's `gated_delta_rule_decode` computes exactly this model's recurrence —
+`hk_dot` on the undecayed state, then `(v - g*hk_dot)*beta`, which is
+algebraically the decay-first form the reference uses.
+
+But **it scales the OUTPUT by `1/sqrt(key_head_dim)`, where HuggingFace scales
+the QUERY.** Same result — the output is linear in `q` and neither placement
+touches the state — so a layer must pass `q` **unscaled** and let the kernel do
+it. Passing the HF-shaped pre-scaled query applies the factor twice and shrinks
+every linear-attention layer's contribution by 11x, across 36 of 48 layers,
+while still producing text.
+
+### Module names collide across model shadows
+
+The qwen4_exp kernels are `qwen4exp_hc` and `qwen4exp_ple`, not
+`hyper_connection` and `ple`. `hyper_connection` already belongs to
+DeepSeek-V4's Sinkhorn mHC, and its model shadow beats `common/` — the lookup
+failed with "named symbol not found" while the PTX held someone else's kernels.
+That failure was loud. The reverse collision would have been silent, running one
+model's weights through the other's mixing.
+
 ## Provenance
 
 `crates/atlas-core/src/config/ngram_qwen4exp.rs` is an independent derivation of
