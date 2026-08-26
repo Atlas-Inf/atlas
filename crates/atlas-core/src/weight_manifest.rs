@@ -47,6 +47,11 @@ impl ManifestDiff {
     pub fn is_clean(&self) -> bool {
         self.missing.is_empty() && self.unexpected.is_empty() && self.mismatched.is_empty()
     }
+
+    /// Total discrepancies, for picking the closer of two candidate layouts.
+    pub fn count(&self) -> usize {
+        self.missing.len() + self.unexpected.len() + self.mismatched.len()
+    }
 }
 
 /// Diff a manifest against what a checkpoint actually holds.
@@ -268,7 +273,9 @@ pub fn quantized_manifest(
     Ok(None)
 }
 
+mod preflight;
 mod qwen4_exp;
+pub use preflight::{read_checkpoint, read_shard_header, verify_checkpoint};
 pub use qwen4_exp::{ExpertLayout, Qwen4ExpLayout, qwen4_exp_manifest, qwen4_exp_manifest_with};
 
 /// The manifest for a config, dispatched on `model_type`.

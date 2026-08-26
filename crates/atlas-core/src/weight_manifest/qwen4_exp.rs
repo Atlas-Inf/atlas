@@ -143,10 +143,25 @@ pub enum ExpertLayout {
 }
 
 /// Knobs a release can differ on without differing architecturally.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Qwen4ExpLayout {
     pub trunk_experts: ExpertLayout,
     pub mtp_experts: ExpertLayout,
+}
+
+impl Qwen4ExpLayout {
+    /// The layouts seen in published releases, cheapest guess first: both
+    /// published checkpoints split their trunk experts, and differ only on the
+    /// MTP block, which a quantizer leaves alone when it excludes `mtp.*`.
+    pub fn candidates() -> [Self; 2] {
+        [
+            Self::default(),
+            Self {
+                mtp_experts: ExpertLayout::Stacked,
+                ..Self::default()
+            },
+        ]
+    }
 }
 
 fn moe(prefix: &str, cfg: &ModelConfig, layout: ExpertLayout, out: &mut Vec<ExpectedTensor>) {
