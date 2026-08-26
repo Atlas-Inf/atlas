@@ -197,6 +197,39 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // With PLE disabled for bisection, skip the 21 MB arena and the
         // 128-shard open entirely rather than building what we will not run.
         let ple_off = std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1");
+        // GDN projections stay BF16 by DEFAULT on this checkpoint. Measured,
+        // both arms, same prompt, util 0.85 / 16K / bf16 KV:
+        //
+        //                      requantized NVFP4      BF16 (default)
+        //   layer construction   7.43 GB / 154.8 MB/L   1.39 GB / 28.9 MB/L
+        //   attn/GDN arms        7.34 GB                1.32 GB
+        //   pre-KV               95.8 GB                90.0 GB
+        //   KV budget            3.9 GB / 172144 tok    9.7 GB / 424464 tok
+        //   decode               2.207 tok/s            2.188 tok/s
+        //
+        // 6.04 GB back for ~1% of decode. GDN weight bandwidth is simply not
+        // what bounds decode here at C=1 — something else dominates — so the
+        // usual w4a16-is-faster argument does not apply yet. Revisit if that
+        // changes.
+        //
+        // And it is not only a memory lever: ONLY the routed experts are
+        // quantized in this checkpoint. The GDN projections ship BF16, so
+        // requantizing them was a lossy round trip we chose, on 36 of 48
+        // layers. `=0` opts back into it for A/B.
+        let bf16_gdn = std::env::var("ATLAS_QWEN4EXP_BF16_GDN").as_deref() != Ok("0");
+        tracing::info!(
+            "GDN projections: {} on the {} linear-attention layers",
+            if bf16_gdn {
+                "BF16 as shipped (no runtime NVFP4 requantization)"
+            } else {
+                "requantized to NVFP4 (ATLAS_QWEN4EXP_BF16_GDN=0)"
+            },
+            config
+                .layer_types
+                .iter()
+                .filter(|t| **t == LayerType::LinearAttention)
+                .count(),
+        );
 
         let mut layers: Vec<Box<dyn TransformerLayer>> =
             Vec::with_capacity(config.num_hidden_layers);
@@ -226,6 +259,26 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             let post_attn_norm = ones_norm(h, gpu)?;
 
             let layer = match config.layer_types[i] {
+                LayerType::LinearAttention if bf16_gdn => {
+                    // Keep the GDN projections BF16 instead of requantizing
+                    // them to NVFP4 at load.
+                    //
+                    // Two reasons, and the second is the interesting one.
+                    // (1) MEMORY: the requantization is where this model's
+                    // build spends its 7.34 GB (152.8 MB/layer, measured —
+                    // the MoE costs zero because its experts ship NVFP4 and
+                    // upload straight through).
+                    // (2) PRECISION: these tensors ship as BF16 in this
+                    // checkpoint. Only the routed experts are quantized. So
+                    // BF16 -> NVFP4 here is a lossy round trip we chose, not
+                    // one the checkpoint forced, and it lands on the GDN
+                    // projections of 36 of 48 layers.
+                    crate::weight_loader::qwen35::load_layers::linear_attn_arms::build_linear_attention_dense_bf16(
+                        i, store, &lp, gpu, variant, config, h,
+                        input_norm, post_attn_norm, ffn,
+                    )
+                    .with_context(|| format!("qwen4_exp: GDN layer {i} (BF16)"))?
+                }
                 LayerType::LinearAttention => {
                     crate::weight_loader::qwen35::load_layers::linear_attn_arms::build_linear_attention_nvfp4(
                         store, &lp, gpu, variant, config, h, absmax_k, quantize_k, stream,
