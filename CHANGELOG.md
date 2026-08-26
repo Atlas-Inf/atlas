@@ -51,6 +51,21 @@ behind specific subsystems — see the
   `cargo run -p atlas-core --example qwen4exp_ngram_ids`. 5408/5408 ids match
   over 32 streams. No GPU and no weights needed — the 51 GB embedding tensor is
   stubbed, every buffer that feeds the ids is not.
+- **`qwen4_exp` weight manifest** (`atlas_core::weight_manifest`) — what a
+  checkpoint must contain, derived from its config, so a loader's first job is
+  written down separately from the loading and can be checked without the
+  weights. Diffed against the published `Qwen3.8-Flash-Next-FP8`
+  `model.safetensors.index.json`: of its 152,089 tensors, 333 are
+  `model.visual.*` and 75,264 are FP8 `weight_scale_inv` siblings; the manifest
+  covers the remaining **76,492 with zero missing and zero unexpected**, every
+  scale attaches to a routed-expert weight it expects, and 1,653 shapes read
+  from real safetensors headers match. `scripts/dev/verify_qwen4_exp_manifest.py`
+  reproduces this against a checkpoint directory or a bare index.
+
+  It earned its keep immediately, catching three wrong widths in the tiny
+  development checkpoint (hyper-connections are `hc_count * hidden` wide, not
+  `hidden`; `q_proj` is 2x for the gate; the indexer's `index_qk_proj` is
+  `(n_heads + kv_heads) * head_dim`).
 - **`qwen4_exp` config parsing.** The published `Qwen3.8-Flash-Next-FP8`
   `config.json` now parses (vendored whole into `test_data/`). Two of its
   defaults are absent rather than stated and both fail silently: `norm_topk_prob`

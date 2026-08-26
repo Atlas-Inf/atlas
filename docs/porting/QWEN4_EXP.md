@@ -65,6 +65,19 @@ Two traps are encoded as tests rather than left as comments:
 
 ## What is missing
 
+### Weight manifest — done
+`atlas_core::weight_manifest::qwen4_exp_manifest` enumerates every
+language-model and MTP tensor with its shape, and matches the published
+checkpoint's index exactly (76,492 names, zero missing, zero unexpected; 1,653
+shapes cross-checked against real headers). Use
+`scripts/dev/verify_qwen4_exp_manifest.py <dir>` against the tiny checkpoint
+while building the loader — it catches a wrong width the moment it appears,
+which it already did three times.
+
+Not yet quantization-aware: it describes logical weights, and the FP8
+`weight_scale_inv` siblings are verified to attach only to routed experts rather
+than being enumerated.
+
 ### Dispatch
 `qwen4_exp` is in neither `config/dispatch.rs::parse_config` nor
 `spark-model/src/factory.rs::loader_for_config`. Both currently reject it by

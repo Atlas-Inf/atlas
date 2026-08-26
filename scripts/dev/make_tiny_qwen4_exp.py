@@ -127,11 +127,15 @@ def config():
 
 
 def hyper_connection(prefix, tensors, inject=True):
-    tensors[f"{prefix}.hc_norm.weight"] = torch.ones(H)
-    tensors[f"{prefix}.input_mix_weight_down.weight"] = torch.randn(HC_LOWRANK, H) * 0.02
-    tensors[f"{prefix}.input_mix_weight_up.weight"] = torch.randn(HC_COUNT * H, HC_LOWRANK) * 0.02
+    # These operate on the CONCATENATED residual: hc_count streams of `hidden`,
+    # so every width here is hc_count * H, not H. The published checkpoint's
+    # hc_norm is [10240] = 4 x 2560, not [2560].
+    wide = HC_COUNT * H
+    tensors[f"{prefix}.hc_norm.weight"] = torch.ones(wide)
+    tensors[f"{prefix}.input_mix_weight_down.weight"] = torch.randn(HC_LOWRANK, wide) * 0.02
+    tensors[f"{prefix}.input_mix_weight_up.weight"] = torch.randn(wide, HC_LOWRANK) * 0.02
     if inject:
-        tensors[f"{prefix}.block_inject_weight.weight"] = torch.randn(HC_COUNT, H) * 0.02
+        tensors[f"{prefix}.block_inject_weight.weight"] = torch.randn(HC_COUNT, wide) * 0.02
 
 
 def moe(prefix, tensors):
@@ -147,13 +151,17 @@ def moe(prefix, tensors):
 
 
 def full_attention(prefix, tensors):
-    tensors[f"{prefix}.q_proj.weight"] = torch.randn(Q_HEADS * HEAD_DIM, H) * 0.02
+    # 2x: Q and its gate, interleaved per head. The real q_proj is
+    # [12288, 2560] against 24 heads x head_dim 256 = 6144.
+    tensors[f"{prefix}.q_proj.weight"] = torch.randn(Q_HEADS * HEAD_DIM * 2, H) * 0.02
     tensors[f"{prefix}.k_proj.weight"] = torch.randn(KV_HEADS * HEAD_DIM, H) * 0.02
     tensors[f"{prefix}.v_proj.weight"] = torch.randn(KV_HEADS * HEAD_DIM, H) * 0.02
     tensors[f"{prefix}.o_proj.weight"] = torch.randn(H, Q_HEADS * HEAD_DIM) * 0.02
     tensors[f"{prefix}.q_norm.weight"] = torch.ones(HEAD_DIM)
     tensors[f"{prefix}.k_norm.weight"] = torch.ones(HEAD_DIM)
-    tensors[f"{prefix}.indexer.index_qk_proj.weight"] = torch.randn(2 * 16, H) * 0.02
+    # Fused indexer q and k: (n_heads + kv_heads) * head_dim. Real is
+    # (4 + 1) * 128 = 640.
+    tensors[f"{prefix}.indexer.index_qk_proj.weight"] = torch.randn((2 + 1) * 16, H) * 0.02
     tensors[f"{prefix}.indexer.q_layernorm.weight"] = torch.ones(16)
     tensors[f"{prefix}.indexer.k_layernorm.weight"] = torch.ones(16)
 

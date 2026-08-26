@@ -497,6 +497,43 @@ pub struct ModelConfig {
     /// Storage layout only -- it does not enter the id arithmetic.
     #[serde(default)]
     pub split_ngram_parts: usize,
+    /// Number of hyper-connection residual streams (`hc_count`). The block
+    /// input is `hc_count * hidden_size` wide -- the published checkpoint's
+    /// hyper-connection tensors are all 10240 = 4 x 2560.
+    ///
+    /// DISTINCT from `hc_mult`, which is DeepSeek-V4's Sinkhorn-normalised mHC.
+    /// Same idea, different formulation: this one is a low-rank sigmoid gate.
+    /// Sharing the field would silently route one model's weights through the
+    /// other's mixing.
+    #[serde(default)]
+    pub hc_count: usize,
+    /// Bottleneck width of the hyper-connection mixing gate (`hc_lowrank`).
+    /// `input_mix_weight_down` is `[hc_lowrank, hc_count*hidden]` and
+    /// `input_mix_weight_up` is its transpose-shaped partner.
+    #[serde(default)]
+    pub hc_lowrank: usize,
+
+    // ── qwen4_exp sparse-attention indexer ──
+    // Distinct from the DeepSeek-V4 `index_*` fields above for the same reason
+    // hc_count is distinct from hc_mult: related concept, unestablished mapping.
+    /// Indexer query heads (`indexer_n_heads`).
+    #[serde(default)]
+    pub indexer_n_heads: usize,
+    /// Indexer key/value heads (`indexer_kv_heads`).
+    #[serde(default)]
+    pub indexer_kv_heads: usize,
+    /// Per-head indexer dimension (`indexer_head_dim`).
+    #[serde(default)]
+    pub indexer_head_dim: usize,
+    /// Maximum history positions the indexer keeps per query (`indexer_budget`).
+    #[serde(default)]
+    pub indexer_budget: usize,
+    /// History compression stride for the indexer (`indexer_compress_ratio`).
+    #[serde(default)]
+    pub indexer_compress_ratio: usize,
+    /// PLE causal-conv kernel width (`ple_conv_kernel_size`).
+    #[serde(default)]
+    pub ple_conv_kernel_size: usize,
     /// Seed for the SplitMix64 multiplier draw.
     ///
     /// Defaulted rather than zero-defaulted, and this is load-bearing: the

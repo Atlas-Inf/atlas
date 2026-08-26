@@ -134,6 +134,14 @@ impl ModelConfig {
             ngram_vocab_size_base: 0,
             make_ngram_vocab_size_divisible_by: 0,
             split_ngram_parts: 0,
+            hc_count: 0,
+            hc_lowrank: 0,
+            indexer_n_heads: 0,
+            indexer_kv_heads: 0,
+            indexer_head_dim: 0,
+            indexer_budget: 0,
+            indexer_compress_ratio: 0,
+            ple_conv_kernel_size: 0,
             ngram_seed: super::default_ngram_seed(),
         }
     }
