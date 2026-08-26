@@ -393,6 +393,58 @@ a different box, or a repack that does not exist today.
 4. **MTP head**, then **vision**, both of which the model runs without.
 5. **SM121 kernels** at these dimensions.
 
+## The forward pass, end to end
+
+Read off `modeling_qwen4_exp.py` and confirmed by running the full model on the
+tiny checkpoint (zero missing keys). This is the wiring the GPU layers have to
+reproduce; the two novel blocks in it already have oracles in
+`atlas_core::qwen4exp_reference`.
+
+```
+embeds  = embed_tokens[ids]                      # [S, hidden]
+hidden  = tile(embeds, hc_count)                 # [S, hc*hidden]  <- literally repeated
+for layer in 0..48:
+    if layer hosts PLE:                          # layer 1 only (ple_layer_ids is 1-indexed)
+        hidden += ple(hidden, ids)               # [S, hc*hidden], see PLE oracle
+
+    mixed, inject = attn_hyper_connection(hidden) # [S, hidden], [S, hc]
+    hyper = hidden                                # kept UN-normalised for the residual
+    mixed = linear_attn(mixed)  or  self_attn(mixed)
+    hidden = hyper + broadcast(mixed, inject)     # mixed[:,None,:] * inject[:,:,None], flattened
+
+    mixed, inject = mlp_hyper_connection(hidden)
+    hyper = hidden
+    mixed = moe(mixed)
+    hidden = hyper + broadcast(mixed, inject)
+
+hidden = hyper_connection_mixer(hidden)          # [S, hidden]; no injection on this one
+logits = lm_head(hidden)
+```
+
+Three things worth stating because they are not obvious from the shapes:
+
+* The residual stream is `hc_count * hidden` wide for the **whole** trunk. Each
+  block collapses it to `hidden`, computes, and broadcasts back with per-stream
+  injection gains. There is no point at which the model is `hidden`-wide except
+  inside a block.
+* The initial state is the token embedding **tiled** `hc_count` times, not
+  projected or zero-padded.
+* There is **no final norm** — `hyper_connection_mixer` is what normalises
+  before the LM head, and it is the `use_combine=False` variant, so it returns
+  only the mixed value and no injection.
+
+### What is left to write
+
+| piece | state |
+|---|---|
+| PLE tower | oracle ✅ 5.1e-7 — needs a GPU layer |
+| hyper-connections | oracle ✅ 1.6e-7 — needs a GPU layer |
+| linear attention (36 layers) | Atlas's GDN + `output_gate_type` — **done** |
+| gated-Q full attention (12 layers) | adapt; indexer is a no-op ≤2048 ctx |
+| 512-expert MoE | adapt Qwen3.5's path |
+| layer wiring above | not written |
+| MTP | not written; `load_mtp_weights` returns None so `--speculative` is refused |
+
 ## Provenance
 
 `crates/atlas-core/src/config/ngram_qwen4exp.rs` is an independent derivation of
