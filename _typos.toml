@@ -1,0 +1,161 @@
+# typos (https://github.com/crate-ci/typos) config for Atlas.
+#
+# Ignore directories that mirror upstream content we don't control —
+# `test_data/` holds verbatim HuggingFace `config.json` snapshots whose
+# tensor field names (e.g. `in_proj_ba`, `in_proj_qkvz`) read like typos
+# but are the canonical upstream identifiers.
+#
+# `vendor/` is third-party source (xgrammar-rs) imported in-tree; we
+# don't ship typo fixes upstream from here.
+#
+# Generated build output (`target/`, `book/output/`) is excluded too.
+
+[default]
+extend-ignore-identifiers-re = [
+    # `in_proj_ba` is the bias projection in NVIDIA's NV-FP4 Mamba/SSM
+    # checkpoints (`in_proj_ba` = b + a parameters); not a typo of `by`/`be`.
+    "in_proj_ba",
+    # `iy_base`, `iy` etc. — CUDA kernel variable name for "index Y";
+    # the typos checker mistakes it for `it`. Common in our 2D launch
+    # configs (`ix`, `iy` for column/row).
+    "iy.*",
+    # `BA_GEMM` — A+B linear-attention GEMM in the design docs. Not a
+    # typo of `BY`/`BE`.
+    "BA_GEMM",
+]
+
+[default.extend-words]
+# `RETUNED` — past tense of "retune", used in the MODEL.toml sampling-default
+# changelogs (`presence_penalty RETUNED 1.5 -> 1.0`). A real word; the checker
+# reads it as a misspelling of `RETURNED`, which it is not.
+RETUNED = "RETUNED"
+retuned = "retuned"
+# `unauthenticate` — used as a verb ("would silently unauthenticate the
+# endpoint") in the model-swap test commentary (#385). Intentional coinage,
+# not a typo of "unauthenticated".
+unauthenticate = "unauthenticate"
+# `nd` — the num-drafts speculative-decode notation (`nd=2`, `nd=3`) used
+# throughout the MTP verify code and docs. Not a typo of "and".
+nd = "nd"
+# `deint` — short form of "deinterleaved" used as the Q|K|V|Z input
+# pointer name in the fused K=2 GDN verify kernel/ops. Not a typo.
+deint = "deint"
+# `ue` — the NVFP4/MX scale-factor formats `ue4m3`/`ue8m0` (cutlass
+# `float_ue4m3_t`, helpers like `mt_float_to_ue4m3`) split on the digit, so
+# the checker reads the leading `ue` as a typo for "use"/"due". Not a typo.
+ue = "ue"
+# "subtiles" = sub-tiles: WMMA n-sub-tile partitioning in the strix-hip
+# MoE/dense GEMM kernels (PM4_SUBTILES_PER_WARP). Not a typo of "subtitles".
+subtiles = "subtiles"
+# CUDA device-attribute constant token. Not a typo of `OPTION`.
+OPTIN = "OPTIN"
+# `image_grid_thw` is the HuggingFace tensor name for vision-input
+# (Time, Height, Width) shape. Not a typo of `the`/`thaw`.
+thw = "thw"
+# `Tooks Court, Chancery Lane, London` — verbatim Dickens text from
+# Bleak House, used as a benchmark prompt fixture. Not a typo.
+TOOKS = "TOOKS"
+# Walsh-Hadamard Transform — appears as `WHT` / `wht_bf16` / `wht` in
+# kernel names, file names, and TurboQuant documentation. Not a typo of `WHAT`.
+WHT = "WHT"
+wht = "wht"
+# `BA`/`ba` literal kernel-name token (e.g. `BA_GEMM`, `in_proj_ba`,
+# `wkv_a_ba`). Domain abbreviation, not the English preposition.
+BA = "BA"
+ba = "ba"
+# `HSA` / `hsa` — AMD ROCm Heterogeneous System Architecture runtime
+# (`libhsa-runtime64`, `hsa_queue_create`, `rocr::HSA`). Appears throughout
+# the SCALE/HIP Strix-Halo porting docs. Not a typo of `HAS`/`has`.
+HSA = "HSA"
+hsa = "hsa"
+# Output-tokens loop variable in Python benchmark scripts (`for ot in ...`).
+ot = "ot"
+# Steps-per-second shorthand in concurrency benchmark output.
+stps = "stps"
+# `mis-` is a legitimate English prefix (`mis-set`, `mis-interpreted`,
+# `mis-aligned`); the default checker flags it as a substring of `miss`.
+mis = "mis"
+# `abd` — a test-pattern token in the xgrammar FSM tests (`"abc|abd"`,
+# upstream test_fsm.cc FunctionTest7 alternation). Not a typo.
+abd = "abd"
+# `fo` — "forward-output" kernel-handle abbreviation in the GDN FLA example
+# (`k_fo` = gated_delta_rule_chunk_fwd_o handle). Not a typo of `for`/`of`.
+fo = "fo"
+# `tpe` — "tokens per expert" loop variable in the MoE microtest example.
+# Not a typo of `type`.
+tpe = "tpe"
+# `thr` — "threads" abbreviation in CUDA kernel launch-config docs
+# (e.g. `grid [..], 128 thr`). Not a typo of `the`.
+thr = "thr"
+# `RECAL` — "recalibration" log/state token in fp8_calibration. Not `RECALL`.
+RECAL = "RECAL"
+# `unparseable` — valid English spelling variant used in the tool-call parser
+# (the typos default prefers `unparsable`). Keep the existing spelling.
+unparseable = "unparseable"
+# `paramete` / `parame` etc. — deliberate close-tag ladder prefixes of
+# "</parameter>" asserted verbatim in the tool-grammar EBNF tests
+# (param_key_constraint.rs: `"</paramete" [^r]`). Not typos of "parameter".
+paramete = "paramete"
+parame = "parame"
+paramet = "paramet"
+para = "para"
+param = "param"
+# `ratatui` — the Rust TUI crate (`ratatui = "0.29"` in spark-server), named in
+# the campaign notes as "the ratatui TUI". Not a typo of "ratatouille".
+ratatui = "ratatui"
+# `oints` — the tail of "endpoints", left dangling by a real degeneration and
+# asserted VERBATIM in the agentic-gate turn-classification test
+# (agent_tests.rs). Gate run 7 at 66b20718 repeated "Now let me test the other
+# endpoints:" until the repeats overlapped, emitted a tool call inside the
+# message body, and stopped — the fixture reproduces that byte for byte,
+# `</tool_call>oints:` included, because the point of the test is what the
+# server actually returned. Sanitizing it to spell `points` would make the
+# fixture a paraphrase of the bug instead of the bug. Same rationale as the
+# `paramete`/`parame` close-tag ladder above.
+oints = "oints"
+# `numer` — the `image` crate's own API spelling: `Delay::from_numer_denom_ms`
+# and `Delay::numer_denom_ms`, its numerator/denominator frame-delay pair. A
+# third-party identifier we call, not prose we wrote, so it is spelled the way
+# the crate spells it.
+numer = "numer"
+# `sxl` — "sum of x*l" accumulator in the GPU Q4_K weight quantizer
+# (q4k_quantize.cu), a faithful port of llama.cpp's make_qkx3_quants
+# least-squares fit (sl/sl2/sxl naming kept 1:1 with upstream). Not `xsl`.
+sxl = "sxl"
+
+[default.extend-identifiers]
+# `PNGs` — the plural of PNG, in the vision-fixture provisioning commentary.
+# The checker splits an uppercase run followed by a lowercase tail, so it sees
+# `PN` + `Gs` and reports `PN` as a typo of `ON`. The word is correct English
+# and the alternative is writing "PNG files" everywhere to appease a splitter.
+PNGs = "PNGs"
+# Pattern compounds the checker doesn't handle via the default list.
+wht_bf16 = "wht_bf16"
+wht_dim = "wht_dim"
+wht_stride = "wht_stride"
+# CUTLASS FP8 unsigned-E4M3 scale-factor type (float_ue4m3_t) — "ue" is not a typo.
+float_ue4m3_t = "float_ue4m3_t"
+ue4m3 = "ue4m3"
+
+[files]
+extend-exclude = [
+    "test_data/",
+    "vendor/",
+    "target/",
+    "book/output/",
+    "tests/all_models_results*/",
+    # Local dev/benchmark scripts (not shipped); abbreviated local var names
+    # like `ND` (numdrift path) read as typos but aren't user-facing.
+    "bench/",
+    # FlashInfer GDN AOT bridge — vendored export patch + C++/CUDA harness
+    # (`dout` = gradient-w.r.t.-output, standard kernel naming). Third-party
+    # derived material, like `vendor/`.
+    "3rdparty_patches/",
+    # Vendored llama.cpp/ggml CUDA MMQ sources (MIT). Upstream identifiers
+    # (`n_leafs`, `GGML_OP_CPY`, `ggml_arange`, ...) read as typos but are
+    # canonical; we don't ship typo fixes upstream from here, like `vendor/`.
+    "kernels/gb10/qwen3.6-27b/nvfp4/q4k_vendor/",
+    # Campaign raw artifacts: verbatim model output (logit dumps whose top-k
+    # entries include subword fragments like ` summar`, ` repet`). Data, not prose.
+    "docs/campaigns/*/raw/",
+]

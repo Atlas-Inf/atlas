@@ -1,0 +1,338 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Weight loading traits and per-model loader implementations.
+//!
+//! Translates flat [`WeightStore`] into typed [`TransformerLayer`] objects.
+//! Each model architecture has its own [`ModelWeightLoader`] implementation
+//! that knows the HuggingFace weight name patterns.
+//!
+//! Submodules contain per-family loaders:
+//!   - `qwen3`: Qwen3-Next (NVFP4, hybrid SSM+Attention+MoE)
+//!   - `qwen35`: Qwen3.5 MoE (35B, 122B)
+//!   - `qwen35_dense`: Qwen3.5 Dense (27B)
+//!   - `qwen3_vl`: Qwen3-VL (vision-language)
+//!   - `nemotron`: Nemotron-H (Mamba-2 + MoE + Attention)
+//!   - `gemma4`: Gemma-4 (pure attention, GeGLU, sliding + full attention)
+
+pub(crate) mod deepseek_v4;
+pub mod dflash_loader;
+mod gemma4;
+mod laguna;
+mod minimax;
+mod nemotron;
+mod nllb;
+mod qwen3;
+mod qwen35;
+mod qwen35_dense;
+mod qwen3_vl;
+mod step3p7;
+
+pub use deepseek_v4::DeepSeekV4WeightLoader;
+pub use dflash_loader::{
+    DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,
+    store_has_dflash_weights,
+};
+pub use gemma4::Gemma4WeightLoader;
+pub use laguna::LagunaWeightLoader;
+pub use minimax::MinimaxM2WeightLoader;
+pub use nemotron::NemotronHWeightLoader;
+pub use nllb::NllbWeightLoader;
+pub use qwen3::Qwen3WeightLoader;
+pub use qwen3_vl::Qwen3VLWeightLoader;
+pub use qwen35::Qwen35WeightLoader;
+pub use qwen35_dense::Qwen35DenseWeightLoader;
+pub use step3p7::Step3p7WeightLoader;
+
+use anyhow::Result;
+use atlas_core::config::ModelConfig;
+use spark_runtime::gpu::GpuBackend;
+use spark_runtime::kv_cache::KvCacheDtype;
+use spark_runtime::weights::WeightStore;
+
+use crate::layer::TransformerLayer;
+use crate::layers::VisionEncoder;
+use crate::weight_map::{DenseWeight, MtpWeights, Nvfp4Variant, detect_nvfp4_variant};
+
+/// Can this box hold the transposed `[K/2, N]` MoE prefill copies for EVERY
+/// layer, and does the operator want them?
+///
+/// The MoE prefill GEMMs read weights K-major; the checkpoint stores them
+/// N-major. Without the transposed copies prefill falls back to the plain
+/// `moe_w4a16_grouped_gemm` path, which on Qwen3-VL-30B measured **695 ms in
+/// `grouped_gate_up` + 351 ms in `grouped_silu_down`** — 59 % of a 1798 ms cold
+/// TTFT — versus 98.9 / 69.5 ms for the same phases on a model that does build
+/// them. So this is not a micro-optimization; skipping it is the slow path.
+///
+/// SSOT: the budget arithmetic used to live inline in `qwen3.rs` only, so every
+/// other MoE loader either hard-coded its own copy or (qwen3_vl, gemma4,
+/// step3p7) silently never transposed at all. One reader, one lever.
+///
+/// `ATLAS_MOE_PREFILL_COPIES=0` forces the fallback — an A/B lever and an
+/// escape hatch for a box under external memory pressure that the free-memory
+/// probe cannot see. Any other value (or unset) means "build them if they fit":
+/// PCND-wise the decision is *derived* from measured free memory, never a
+/// silent constant.
+pub(crate) fn moe_prefill_copies_fit(config: &ModelConfig, gpu: &dyn GpuBackend) -> bool {
+    if std::env::var("ATLAS_MOE_PREFILL_COPIES").ok().as_deref() == Some("0") {
+        tracing::info!("ATLAS_MOE_PREFILL_COPIES=0: MoE prefill uses the fallback grouped GEMM");
+        return false;
+    }
+    let inter = config.moe_intermediate_size;
+    let h = config.hidden_size;
+    // NVFP4 group_size — one ue4m3 scale per 16 elements, alongside the packed
+    // e2m1 pairs. Matches `shard_quantized_nvfp4`'s group_size for this family.
+    let group_size = 16usize;
+    let gu_bytes = inter * h / 2 + inter * h / group_size;
+    let d_bytes = h * inter / 2 + h * inter / group_size;
+    let per_layer = config.num_experts * (2 * gu_bytes + d_bytes);
+    let total = per_layer * config.num_hidden_layers;
+    let available = gpu.free_memory().unwrap_or(0);
+    let headroom = 2 * 1024 * 1024 * 1024;
+    let fits = total <= available.saturating_sub(headroom);
+    if !fits {
+        tracing::warn!(
+            "Skipping MoE weight transposition ({:.1} GB needed, {:.1} GB available). \
+             Prefill will use fallback grouped GEMM.",
+            total as f64 / (1024.0 * 1024.0 * 1024.0),
+            available as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+    }
+    fits
+}
+
+/// Runtime quantization format for weight dispatch.
+///
+/// Determines which GEMV/GEMM kernels are used for decode, prefill, and
+/// MTP verify. Adding a new quant format requires:
+/// 1. Add variant here
+/// 2. Add kernel dispatch in the layer forward paths
+/// 3. Add weight loading logic in load_moe_qwen35 / attention loader
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantFormat {
+    /// NVFP4 E2M1 — default, highest throughput. Uses w4a16 kernels.
+    Nvfp4,
+    /// FP8 E4M3 block-scaled — native FP8 serving. Uses w8a16 kernels.
+    Fp8,
+    // Future: Int4, AWQ, GPTQ, etc.
+}
+
+impl QuantFormat {
+    /// Peak GPU memory multiplier for OOM pre-flight estimation.
+    ///
+    /// Accounts for model-building overhead on top of raw weight bytes:
+    /// - NVFP4: 1.3x (weight pointers aliased, transposed copies + predequant)
+    /// - FP8: 1.5x (zero-copy weights, transposed attention copies, FP8 pointer tables)
+    ///
+    /// Adding a new format: set the multiplier based on empirical peak/on-disk ratio.
+    pub fn peak_memory_multiplier(&self) -> f64 {
+        match self {
+            // NVFP4: weights are mmap'd (zero-copy), temporary buffers for
+            // runtime quantization (FP8→BF16→NVFP4) are freed after each layer.
+            // Empirical peak/on-disk ratio on GB10: ~1.15x.
+            Self::Nvfp4 => 1.15,
+            Self::Fp8 => 1.5,
+        }
+    }
+}
+
+/// Checkpoint weight format, detected from safetensors metadata.
+///
+/// Determines how raw weight bytes are interpreted and transformed into
+/// the runtime NVFP4 format used by Atlas GEMM kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightFormat {
+    /// NVFP4 E2M1 on disk (nvidia ModelOpt or compressed-tensors).
+    /// Weights load directly into `QuantizedWeight` with no conversion.
+    Nvfp4,
+    /// FP8 E4M3 block-scaled on disk (e.g. `quant_method: "fp8"` with `weight_block_size`).
+    /// Each weight tensor has a `weight_scale_inv` (BF16 per-block) companion.
+    /// At load time: FP8 -> BF16 -> NVFP4 (runtime quantization).
+    Fp8BlockScaled,
+    /// BF16 dense on disk (unquantized, e.g. attention Q/K/V in Standard NVFP4 models).
+    /// At load time: BF16 -> NVFP4 (runtime quantization).
+    Bf16Dense,
+}
+
+impl WeightFormat {
+    /// Detect the weight format from a [`WeightStore`] by probing key names.
+    pub fn detect(store: &WeightStore, config: &ModelConfig) -> Self {
+        match detect_nvfp4_variant(store, config) {
+            Nvfp4Variant::Fp8Dequanted => Self::Fp8BlockScaled,
+            Nvfp4Variant::CompressedTensors | Nvfp4Variant::Standard => Self::Nvfp4,
+            // Bf16Raw fine-tunes get runtime-quantized to NVFP4 inside the
+            // weight loader, so the downstream pipeline sees Nvfp4.
+            Nvfp4Variant::Bf16Raw => Self::Nvfp4,
+        }
+    }
+
+    /// Whether this format requires FP8 -> BF16 dequantization at load time.
+    pub fn is_fp8(&self) -> bool {
+        matches!(self, Self::Fp8BlockScaled)
+    }
+}
+
+/// Loads weights from a [`WeightStore`] into typed layer objects.
+pub trait ModelWeightLoader {
+    /// Whether this loader's weight slicing is TP-aware. **No default** —
+    /// every loader MUST declare this explicitly so adding a new model
+    /// architecture cannot accidentally inherit a `false` and silently
+    /// regress users who pass `--tp-size > 1`.
+    ///
+    /// Loaders that honour `config.tp_world_size` / `config.tp_rank` when
+    /// loading attention Q/K/V/O, MoE gate/up/down, head-parallel SSM
+    /// components, and lm_head return `true`. Loaders that always load
+    /// full replicated weights return `false`.
+    ///
+    /// The startup path in `spark-server/src/main.rs` consults this method
+    /// to fail-fast at load time when `--tp-size > 1` is requested against
+    /// a TP-unaware loader. Extending TP to a new architecture requires:
+    ///   1. Wire `slice_for_rank` (in `crate::tp_shard`) per Q/K/V/O,
+    ///      gate/up/down, and any head-parallel SSM tensors.
+    ///   2. Divide `num_attention_heads` / `num_key_value_heads` per the
+    ///      same axis when constructing layer state.
+    ///   3. Return `true` from this method.
+    ///
+    /// See `weight_loader/minimax.rs` for the reference implementation.
+    fn supports_tp(&self) -> bool;
+
+    /// Load all transformer layers from the weight store.
+    ///
+    /// `layer_kv_dtypes` is indexed by attention layer index (0-based sequential
+    /// counter over full-attention layers only). Each attention layer receives its
+    /// own KV cache dtype, enabling mixed-precision KV caching where boundary
+    /// layers use higher precision.
+    fn load_layers(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+        layer_kv_dtypes: &[KvCacheDtype],
+    ) -> Result<Vec<Box<dyn TransformerLayer>>>;
+
+    /// Per-(layer, role) weight precision schedule (C.3, 2026-04-25).
+    /// Default impl returns the empty schedule (every lookup yields
+    /// `Dtype::Inherit`), preserving the existing per-checkpoint
+    /// dtype logic byte-for-byte. Loader-specific implementations
+    /// can override to honour MODEL.toml's `[precision]` block.
+    fn precision_schedule(
+        &self,
+        _config: &ModelConfig,
+    ) -> crate::precision_schedule::PrecisionSchedule {
+        crate::precision_schedule::PrecisionSchedule::default()
+    }
+
+    fn load_embedding(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight>;
+    /// Load the final RMSNorm weight used before the LM head.
+    ///
+    /// `gpu` is passed so model-specific loaders can do on-device weight
+    /// transforms at load time (e.g. Gemma-4 shifts the learned absolute-
+    /// scale weight by -1 into the offset-from-1 convention expected by
+    /// Atlas's rms_norm kernel). Loaders that don't need it should ignore
+    /// the argument.
+    fn load_final_norm(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight>;
+    fn load_lm_head(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight>;
+
+    /// Load MTP head weights (returns None if no MTP weights in store).
+    fn load_mtp_weights(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<MtpWeights>>;
+
+    /// Load MTP weights for multi-module MTP (DeepSeek-V3 / MiniMax-M2
+    /// style: N independent transformer modules, each with its own
+    /// attention + MoE + KV cache). Returns an empty `Vec` when the
+    /// checkpoint has no MTP modules, a 1-element Vec for single-module
+    /// MTP (Qwen3.5 family), or N elements for multi-module.
+    ///
+    /// Default impl adapts `load_mtp_weights` so existing single-module
+    /// loaders don't need to change. MiniMax overrides this directly.
+    fn load_mtp_weights_multi(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Vec<MtpWeights>> {
+        Ok(self
+            .load_mtp_weights(store, config, gpu)?
+            .into_iter()
+            .collect())
+    }
+
+    /// Per-layer (num_kv_heads, head_dim) overrides for heterogeneous
+    /// attention models (e.g. Gemma-4 with sliding 16×256 and full 4×512).
+    /// Default empty — homogeneous models skip per-layer dims and the KV
+    /// cache allocator uses the global (num_kv_heads, head_dim). Populated
+    /// by loaders whose models have different attention geometries per
+    /// layer. Indexed by attention layer index (same as layer_kv_dtypes).
+    fn kv_layer_dims(&self, _config: &ModelConfig) -> Vec<(usize, usize)> {
+        Vec::new()
+    }
+
+    /// Load DFlash drafter weights from a separate `WeightStore` pointing
+    /// at the drafter checkpoint (`z-lab/Qwen3.6-{27B,35B-A3B}-DFlash`).
+    /// Default impl returns `None` so loaders that don't yet support
+    /// DFlash silently fall through to the existing MTP path. Override in
+    /// loaders whose target models pair with a DFlash drafter (Qwen3.5/3.6
+    /// family). The same drafter format works across both 27B-dense and
+    /// 35B-A3B-MoE targets — only the `target_hidden_size` validated
+    /// against the drafter's `fc` input dimension differs.
+    fn load_dflash_weights(
+        &self,
+        _drafter_store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+        _tp_size: usize,
+    ) -> Result<Option<DflashWeights>> {
+        Ok(None)
+    }
+
+    /// Load one or more startup-static PEFT LoRA adapters from their own
+    /// [`WeightStore`]s (the `adapter_model.safetensors` tensors, already
+    /// on-device BF16) into the fixed-address rank-padded pool (one slot each).
+    ///
+    /// Unlike `load_dflash_weights`' vestigial `Ok(None)` default, the
+    /// default here is a WORKING model-agnostic implementation (the remap
+    /// needs only `ModelConfig::layer_type` + projection dims); families
+    /// needing a bespoke key remap override it. Called from
+    /// `factory::build_model` BEFORE the buffer arena + KV sizing so the
+    /// pool bytes are budgeted against the KV cache. A single-element slice is
+    /// byte-identical to the pre-multi-adapter single-adapter path.
+    fn load_lora_adapters(
+        &self,
+        adapters: &[crate::lora::LoraAdapterInput<'_>],
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+        max_loras: usize,
+        max_lora_rank: usize,
+    ) -> Result<Option<crate::lora::LoraWeights>> {
+        crate::lora::load_lora_adapters_multi(adapters, config, gpu, max_loras, max_lora_rank)
+            .map(Some)
+    }
+
+    /// Load vision encoder weights (returns None for text-only models).
+    fn load_vision_encoder(
+        &self,
+        _store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Option<VisionEncoder>> {
+        Ok(None)
+    }
+}

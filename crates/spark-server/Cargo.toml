@@ -1,0 +1,106 @@
+[package]
+name = "spark-server"
+version = "1.0.0-beta-preview"
+edition = "2024"
+license.workspace = true
+description = "Atlas Spark — pure Rust LLM inference server"
+
+[features]
+default = ["cuda", "nccl"]
+# Forwards through to atlas-core/spark-runtime/spark-model so the default
+# Linux build still activates the cuda backend after atlas-core became
+# default-features = false at the workspace level.
+cuda = [
+    "atlas-core/cuda",
+    "spark-runtime/cuda",
+    "spark-model/cuda",
+    "spark-storage/cuda",
+    "spark-comm/cuda",
+]
+# `nccl` adds the NCCL multi-GPU collective backend (EP/TP) on top of
+# `cuda`. NVIDIA builds get it via `default`; SCALE/AMD (gfx1151)
+# single-GPU builds use `--no-default-features --features cuda` to skip
+# linking libnccl.
+nccl = ["cuda", "spark-comm/nccl"]
+metal = [
+    "atlas-core/metal",
+    "spark-runtime/metal",
+    "spark-model/metal",
+    "spark-storage/metal",
+    "spark-comm/metal",
+]
+
+[[bin]]
+name = "spark"
+path = "src/main.rs"
+
+[dependencies]
+atlas-core = { workspace = true }
+atlas-kernels = { workspace = true }
+# `default-features = false` on path-deps so the metal feature actually
+# disables the cuda default that each downstream crate inherits.
+spark-runtime = { path = "../spark-runtime", default-features = false }
+spark-model = { path = "../spark-model", default-features = false }
+spark-comm = { path = "../spark-comm", default-features = false }
+spark-storage = { path = "../spark-storage", default-features = false }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Blocking HTTP for the recipe fetch, which runs on its own std::thread and
+# never touches the async runtime. Already in the lock via atlas-spark-bench.
+ureq = { version = "3", features = ["json"] }
+thiserror = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["json"] }
+# Direct hyper/hyper-util/tower access for the manual accept loop in
+# `serve_router.rs` — `axum::serve` does not expose hyper's connection-layer
+# `header_read_timeout`, which is what bounds a slowloris (slow-header) client.
+http-body = "1"
+hyper = { version = "1", features = ["server", "http1", "http2", "client"] }
+hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "http1", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["full", "parking_lot"] }
+# ── Atlas TUI (crates/spark-server/src/tui/) ──
+# The benchmark suite the Benchmarks section drives. GPU-free and
+# server-independent by design, so it stays unit-testable on any box.
+atlas-plugin = { path = "../atlas-plugin" }
+# Recomputes the closure hash in `tests/closure_attestation.rs` to prove the
+# build-side and gate-side source resolvers still agree.
+atlas-closure = { path = "../atlas-closure" }
+# ratatui pins its own crossterm; the version here MUST match ratatui 0.29's
+# (crossterm 0.28) or two raw-mode stacks fight over the terminal.
+ratatui = "0.29"
+crossterm = "0.28"
+# Single/multi-line inputs (log filter, library search, REPL, chat). MIT.
+tui-textarea = "0.7"
+unicode-width = "0.2"
+# stderr redirection while the TUI owns the screen (terminal_guard).
+libc = "0.2"
+tokio-stream = "0.1"
+futures = "0.3"
+rayon = "1.12"
+parking_lot = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+toml = "0.8"
+# `preserve_order`: minijinja stores `Value` maps as IndexMap (insertion
+# order) instead of BTreeMap (sorted). Without this, `Value::from_serialize`
+# re-sorts tool-schema keys before the custom `tojson` filter renders them,
+# defeating the transformers key-order match in the `<tools>` block.
+minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "preserve_order"] }
+# Pure-Rust grammar-constrained decoding (W7: was the C++-backed
+# `xgrammar-rs = "0.1"` patched to `vendor/xgrammar-rs`; now the
+# from-scratch Rust port at `crates/xgrammar`). The crate's lib is
+# named `xgrammar`, so `use xgrammar::` resolves unchanged.
+xgrammar = { path = "../xgrammar" }
+prometheus = { version = "0.14", default-features = false }
+lazy_static = "1"
+tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,103 @@
+[build]
+# Mistral Small 4: head_dim=128, MLA attention.
+# Same HDIM as Nemotron Nano; required for paged_decode kernel tile sizing.
+extra_nvcc_flags = ["--fmad=false", "-DHDIM=128"]
+
+# Kernels this target may drop from common/ without it being shadow drift.
+# Merged on top of common/KERNEL.toml's repo-wide list. WARNING-SCOPED ONLY:
+# these stay in `shadowed_dropped`, so if Mistral's dispatch ever does resolve
+# one the startup audit still hard-errors rather than running a wrong kernel.
+#
+#   rope::rope_forward_{proportional,strided,yarn_scaled,yarn_interleaved,yarn_interleaved_inv}
+#       common/rope.cu is built around the rotate_half convention: it pairs
+#       element i with i + rotary_dim/2. Mistral sets `rope_interleave=True`,
+#       so its weights are stored as adjacent pairs and this target's
+#       `rope_forward` pairs 2i with 2i+1 instead — and takes a precomputed
+#       `inv_freq` argument common's does not have. The variants above are
+#       therefore not "missing" here; they are the OTHER convention, and
+#       copying them in would silently rotate every query/key the wrong way.
+#       (`rope_forward_yarn_scaled` is the Laguna-S 2.1 rotate_half YaRN
+#       variant, resolved via `try_kernel` — same convention mismatch.)
+#       Porting them properly means reimplementing each against the interleaved
+#       layout, which is a Mistral kernel change, not a shadow-sync.
+[shadow_exempt]
+rope = [
+    "rope_forward_proportional",
+    "rope_forward_strided",
+    "rope_forward_yarn_interleaved",
+    "rope_forward_yarn_interleaved_inv",
+    "rope_forward_yarn_scaled",
+]
+
+# Module name overrides — matching Qwen3.5 35B (both use HDIM=128 attention kernels).
+# Unlisted .cu files use their file stem as the module name.
+[modules]
+e2m1_branchless = "e2m1"
+moe_permute = "moe"
+dense_gemm_bf16 = "gemm"
+rms_norm = "norm"
+argmax_bf16 = "argmax"
+dense_gemv_bf16 = "gemv"
+dense_gemv_fp8w = "gemv_fp8w"
+moe_shared_expert_fused_batch2 = "moe_fused_batch2"
+moe_shared_expert_fused_batch3 = "moe_fused_batch3"
+quantize_bf16_to_nvfp4 = "quantize_nvfp4"
+paged_decode_attn = "paged_decode"
+paged_decode_attn_mla = "paged_decode_mla"
+mla_absorbed = "mla_absorbed"
+paged_decode_attn_fp8 = "paged_decode_fp8"
+paged_decode_attn_nvfp4 = "paged_decode_nvfp4"
+w4a16_gemm = "w4a16"
+kv_cache_append = "kv_cache"
+moe_w4a16_grouped_gemm = "moe_w4a16"
+moe_sorted_prefill = "moe_sorted"
+inferspark_prefill_paged = "prefill_paged"
+inferspark_prefill_paged_fp8 = "prefill_paged_fp8"
+inferspark_prefill_paged_nvfp4 = "prefill_paged_nvfp4"
+inferspark_prefill_paged_turbo2 = "prefill_paged_turbo2"
+inferspark_prefill_paged_turbo3 = "prefill_paged_turbo3"
+inferspark_prefill_paged_turbo4 = "prefill_paged_turbo4"
+inferspark_prefill_paged_turbo8 = "prefill_paged_turbo8"
+paged_decode_attn_bf16k_turbo4v = "paged_decode_bf16k_turbo4v"
+paged_decode_attn_bf16k_turbo3v = "paged_decode_bf16k_turbo3v"
+paged_decode_attn_bf16k_turbo2v = "paged_decode_bf16k_turbo2v"
+paged_decode_attn_turbo4k_turbo3v = "paged_decode_turbo4k_turbo3v"
+paged_decode_attn_turbo4k_turbo8v = "paged_decode_turbo4k_turbo8v"
+paged_decode_attn_turbo3k_turbo8v = "paged_decode_turbo3k_turbo8v"
+paged_decode_attn_turbo2 = "paged_decode_turbo2"
+inferspark_prefill_paged_bf16k_turbo3v = "prefill_paged_bf16k_turbo3v"
+paged_decode_attn_bf16k_turbo3v_128 = "paged_decode_bf16k_turbo3v_128"
+inferspark_prefill_paged_bf16k_turbo4v = "prefill_paged_bf16k_turbo4v"
+paged_decode_attn_bf16k_turbo4v_128 = "paged_decode_bf16k_turbo4v_128"
+inferspark_prefill_paged_bf16k_turbo2v = "prefill_paged_bf16k_turbo2v"
+paged_decode_attn_bf16k_turbo2v_128 = "paged_decode_bf16k_turbo2v_128"
+mla_prefill_attn = "mla_prefill_attn"
+grouped_gemm_mla = "grouped_gemm_mla"
+mla_fused_prefill = "mla_fused_prefill"
+reshape_and_cache_turbo = "reshape_and_cache_turbo"
+paged_decode_attn_turbo4 = "paged_decode_turbo4"
+wht_bf16 = "wht_bf16"
+tq_plus_innerq_apply = "tq_plus_innerq_apply"
+paged_decode_attn_turbo8 = "paged_decode_turbo8"
+paged_decode_attn_turbo4_512 = "paged_decode_turbo4_512"
+paged_decode_attn_turbo8_512 = "paged_decode_turbo8_512"
+paged_decode_attn_turbo3 = "paged_decode_turbo3"
+paged_decode_attn_turbo3_128 = "paged_decode_turbo3_128"
+paged_decode_attn_turbo2_128 = "paged_decode_turbo2_128"
+paged_decode_attn_turbo4_128 = "paged_decode_turbo4_128"
+paged_decode_attn_turbo8_128 = "paged_decode_turbo8_128"
+inferspark_prefill_paged_fp8k_turbo3v = "prefill_paged_fp8k_turbo3v"
+paged_decode_attn_fp8k_turbo3v_128 = "paged_decode_fp8k_turbo3v_128"
+inferspark_prefill_paged_fp8k_turbo4v = "prefill_paged_fp8k_turbo4v"
+paged_decode_attn_fp8k_turbo4v_128 = "paged_decode_fp8k_turbo4v_128"
+inferspark_prefill_paged_fp8k_turbo2v = "prefill_paged_fp8k_turbo2v"
+paged_decode_attn_fp8k_turbo2v_128 = "paged_decode_fp8k_turbo2v_128"
+inferspark_prefill_paged_turbo4k_turbo3v = "prefill_paged_turbo4k_turbo3v"
+paged_decode_attn_turbo4k_turbo3v_128 = "paged_decode_turbo4k_turbo3v_128"
+inferspark_prefill_paged_turbo4k_turbo8v = "prefill_paged_turbo4k_turbo8v"
+paged_decode_attn_turbo4k_turbo8v_128 = "paged_decode_turbo4k_turbo8v_128"
+inferspark_prefill_paged_turbo3k_turbo8v = "prefill_paged_turbo3k_turbo8v"
+paged_decode_attn_turbo3k_turbo8v_128 = "paged_decode_turbo3k_turbo8v_128"
+paged_decode_attn_fp8k_turbo3v = "paged_decode_fp8k_turbo3v"
+paged_decode_attn_fp8k_turbo4v = "paged_decode_fp8k_turbo4v"
+paged_decode_attn_fp8k_turbo2v = "paged_decode_fp8k_turbo2v"

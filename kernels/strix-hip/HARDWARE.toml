@@ -1,0 +1,24 @@
+[hardware]
+name = "strix"
+vendor = "hip"
+# AMD Strix Halo / Ryzen AI Max+ 395 — RDNA 3.5 iGPU (Radeon 8060S).
+# Compiled via SCALE (scale-lang.com): the unmodified CUDA .cu sources
+# are recompiled for this AMD target. `arch` selects the per-arch SCALE
+# toolchain dir (targets/gfx1151/bin/nvcc).
+arch = "gfx1151"
+compute_capability = "11.5.1"
+# LPDDR5X-8000, 256-bit unified bus → ~256 GB/s theoretical (APU,
+# bandwidth-limited like GB10 — keep BF16 residual for 2x effective BW).
+memory_bandwidth_gbps = 256
+memory_type = "LPDDR5X"
+# Physical unified RAM on the 64 GB SKU. NOTE: under ROCm-on-WSL the
+# GPU-visible pool is the dedicated-VRAM carveout (<<64 GB) — model
+# sizing for the WSL bring-up must account for that, not this number.
+memory_gb = 64
+# NOTE — `force_br32_prefill` was removed from here: atlas-kernels/build.rs
+# re-emitted it as ATLAS_HW_FORCE_BR32 and nothing consumed that (the reader
+# was lost in the Strix squash merge, and cargo:rustc-env cannot cross crates
+# to spark-model in any case). RDNA3.5's 64 KB/workgroup LDS cap is handled by
+# the unconditional `#define BR64 32` in common/prefill_paged_compute.cuh, with
+# the matching 32-row host grid stride selected by cfg!(atlas_scale) in
+# ops/prefill_attn_main_{a,b}.rs. Do not re-add the key without a reader.

@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Phase 9-11 of `serve()`: build the axum router with CORS +
+//! middleware, mark ready, bind the listener, and start the HTTP
+//! server. Extracted (refactor wave-4e) for the ≤500 LoC cap.
+
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result};
+use axum::Router;
+use axum::routing::{get, post};
+
+use crate::anthropic;
+use crate::api;
+use crate::main_modules::middleware::{
+    gpu_fault_middleware, openai_observability_middleware, rate_limit_middleware,
+    require_auth_middleware,
+};
+
+pub(crate) async fn build_and_serve(
+    host: Arc<crate::main_modules::model_host::ModelHost>,
+    bind: &str,
+    port: u16,
+) -> Result<()> {
+    spark_runtime::progress::phase(10, "router");
+    host.set_bound(bind.to_string(), port);
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers(tower_http::cors::Any);
+
+    // Catch any panic in a handler and convert it to a 500 instead of
+    // hanging the connection. With ~500 production unwraps still in the
+    // codebase post-audit, this is cheap insurance — the panicking task
+    // dies cleanly and the client sees a JSON error rather than a hung
+    // socket. Default `tower_http::catch_panic` body is a plain text
+    // "Service Internal Server Error"; we don't override the body so as
+    // to avoid leaking backtrace contents to the client.
+    let catch_panic = tower_http::catch_panic::CatchPanicLayer::new();
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(api::chat_completions))
+        .route("/v1/chat/completions/{id}", get(api::get_stored_completion))
+        .route("/v1/completions", post(api::completions))
+        .route("/v1/responses", post(api::responses_endpoint))
+        .route(
+            "/v1/responses/{id}",
+            get(api::get_stored_response).delete(api::delete_stored_response),
+        )
+        .route(
+            "/v1/responses/{id}/input_items",
+            get(api::list_response_input_items),
+        )
+        .route("/v1/responses/{id}/cancel", post(api::cancel_response))
+        .route("/v1/conversations", post(api::create_conversation))
+        .route(
+            "/v1/conversations/{id}",
+            get(api::get_conversation)
+                .post(api::update_conversation)
+                .delete(api::delete_conversation),
+        )
+        .route(
+            "/v1/conversations/{id}/items",
+            post(api::add_conversation_items).get(api::list_conversation_items),
+        )
+        .route(
+            "/v1/conversations/{id}/items/{item_id}",
+            get(api::get_conversation_item).delete(api::delete_conversation_item),
+        )
+        .route("/v1/messages", post(anthropic::messages))
+        .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
+        .route("/v1/lora/active", post(api::set_active_lora))
+        .route("/v1/lora/load", post(api::load_lora_into_slot))
+        .route("/v1/models", get(api::list_models))
+        .route("/v1/models/{*model_id}", get(api::get_model))
+        .route("/v1/embeddings", post(api::embeddings_stub))
+        // 501 stubs: return an OpenAI-shaped error body so auto-probe
+        // clients (Helicone, LangChain, Vercel AI SDK) fall back instead
+        // of hanging on a silent 404.
+        .route(
+            "/v1/batches",
+            post(api::batches_stub).get(api::batch_list_stub),
+        )
+        .route(
+            "/v1/batches/{id}",
+            get(api::batch_get_stub).delete(api::batch_get_stub),
+        )
+        .route("/v1/batches/{id}/cancel", post(api::batch_get_stub))
+        .route("/v1/files", post(api::files_stub).get(api::files_stub))
+        .route(
+            "/v1/files/{id}",
+            get(api::files_stub).delete(api::files_stub),
+        )
+        .route("/v1/files/{id}/content", get(api::files_stub))
+        .route("/v1/audio/transcriptions", post(api::audio_stub))
+        .route("/v1/audio/translations", post(api::audio_stub))
+        .route("/v1/audio/speech", post(api::audio_stub))
+        .route("/v1/images/generations", post(api::images_stub))
+        .route("/v1/images/edits", post(api::images_stub))
+        .route("/v1/images/variations", post(api::images_stub))
+        .route("/v1/moderations", post(api::moderations_stub))
+        .route("/tokenize", post(api::tokenize))
+        .route("/detokenize", post(api::detokenize))
+        .route("/hardware", get(api::hardware))
+        .route("/health", get(api::health))
+        .route("/health/live", get(api::health_live))
+        .route("/metrics", get(api::metrics_handler))
+        // Body size limit. Default 32 MB covers typical multi-image and
+        // long-prompt requests; raise via `ATLAS_MAX_BODY_BYTES` (in
+        // bytes) for unusual deployments. Lowering it protects against
+        // DoS attempts that send oversized payloads to burn CPU on JSON
+        // parsing + tokenization before the model even sees them.
+        .layer(axum::extract::DefaultBodyLimit::max(
+            std::env::var("ATLAS_MAX_BODY_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(32 * 1024 * 1024),
+        ))
+        // The HOST, not a bound AppState. Binding one here is what deadlocked
+        // the first live swap: the clone kept `request_tx` open, the scheduler
+        // never drained, and the join never returned.
+        // Outside the limiter and auth: once the GPU is dead the answer is the
+        // same for every caller, authenticated or not, and there is no reason
+        // to spend a rate-limit reservation on a request that cannot run.
+        .layer(axum::middleware::from_fn(gpu_fault_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            host.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            host.clone(),
+            require_auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn(openai_observability_middleware))
+        .layer(axum::middleware::from_fn(
+            crate::main_modules::byte_count::byte_count_middleware,
+        ))
+        .layer(cors)
+        .layer(catch_panic)
+        .with_state(host.clone());
+
+    // Model loaded, scheduler running — mark as ready.
+
+    let addr = format!("{bind}:{port}");
+    if bind == "0.0.0.0" {
+        tracing::warn!(
+            "Atlas is listening on {addr} — reachable from any host on the network. \
+             If this machine is on a shared LAN or has a public IP, pass \
+             --bind 127.0.0.1 (or set --require-auth and a real firewall) before \
+             accepting traffic."
+        );
+    } else if bind == "127.0.0.1" || bind == "localhost" || bind == "::1" {
+        // m00ch13 (Discord 2026-05-07): combined `--network host` with `-p 8000`
+        // expecting LAN reachability and got refused from another machine. The
+        // default loopback bind is correct for security, but the failure mode
+        // ("connection refused from $LAN_IP") is opaque without this hint.
+        tracing::info!(
+            "API reachable only from this machine (loopback). To expose on the \
+             LAN pass --bind 0.0.0.0; combine with --require-auth and \
+             --auth-tokens-file for non-trusted networks."
+        );
+    }
+    let listener = bind_and_announce(&host, bind, port).await?;
+    serve_with_header_timeout(listener, app).await
+}
+
+/// Bind the listener, then — and only then — say the server is up.
+///
+/// BIND FIRST. Announcing the address and marking the phase before the bind
+/// meant a port conflict — the most common startup failure, and likelier now
+/// that a previous server may still hold the socket — printed "Listening on
+/// 127.0.0.1:8888" immediately above "Address already in use", with the
+/// dashboard's checklist showing that phase complete. A step of its own so the
+/// ordering is testable without entering the accept loop, which disarms the
+/// process-wide startup escape and cannot be un-disarmed by a test.
+async fn bind_and_announce(
+    host: &crate::main_modules::model_host::ModelHost,
+    bind: &str,
+    port: u16,
+) -> Result<tokio::net::TcpListener> {
+    let addr = format!("{bind}:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    // One readiness line, not a "Listening on" beside a "ready" — two
+    // near-duplicates would make a reader wonder which one is the promise.
+    // This is the last line of a successful boot, so it carries everything a
+    // user needs to act on it: a pasteable address and the model it serves.
+    tracing::info!("{}", ready_line(bind, port, host.live_model().as_deref()));
+    spark_runtime::progress::phase(11, "listening");
+    spark_runtime::progress::ready(port);
+    Ok(listener)
+}
+
+/// The line that closes a successful startup or swap. Emitted only AFTER the
+/// listener is bound (boot) or the new model is published onto a listener that
+/// is already serving (swap) — printed any earlier it is a promise a curl can
+/// catch being false.
+///
+/// The address is rendered as something a user can paste into a client:
+/// `0.0.0.0`/`::` accept on every interface but are not destinations, so they
+/// are shown as `127.0.0.1` — the one address guaranteed to reach this process
+/// from this machine (the wildcard-bind exposure warning above already covers
+/// the LAN story). An IPv6 literal is bracketed, because `::1:8888` parses as
+/// an address, not an address and a port.
+pub(crate) fn ready_line(bind: &str, port: u16, model: Option<&str>) -> String {
+    let host = match bind {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        v6 if v6.contains(':') => format!("[{v6}]"),
+        other => other.to_string(),
+    };
+    match model {
+        Some(model) => format!("Server live and ready at {host}:{port} running {model}"),
+        // The modelless boot: live is true, "ready to serve a model" is not,
+        // and the line must not claim it.
+        None => format!(
+            "Server live at {host}:{port} — no model loaded yet, requests get 503 until one \
+             is started from the Library"
+        ),
+    }
+}
+
+/// Serve `app` with a hyper connection-layer **header-read timeout** so a
+/// slowloris client (one that opens a connection and dribbles request headers
+/// forever) cannot pin an accept slot indefinitely.
+///
+/// `axum::serve` uses hyper's defaults, which impose NO timeout on the
+/// header-read phase (the per-request scheduler `timeout_at` only engages
+/// AFTER the request is fully parsed and admitted, so it does not protect this
+/// phase). A blanket `tower_http::TimeoutLayer` is the wrong tool — it would
+/// also abort legitimate long generations. So we drop to hyper's
+/// `hyper_util::server::conn::auto::Builder` and set `header_read_timeout`
+/// directly. `into_make_service_with_connect_info` is preserved (per-connection
+/// `make_service.call(peer)`), so `ConnectInfo<SocketAddr>` — which
+/// `rate_limit_middleware` reads — keeps working.
+async fn serve_with_header_timeout(
+    listener: tokio::net::TcpListener,
+    app: Router,
+) -> anyhow::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder;
+    use tower::{Service, ServiceExt};
+
+    /// Slow-header cutoff. Matches hyper's own historical default; long enough
+    /// for any legitimate client to finish sending headers, short enough that a
+    /// trickle connection is reaped quickly.
+    const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let mut make_service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    // Startup is over: shutdown now means "stop accepting and drain in-flight
+    // requests", so main's startup escape must no longer short-circuit it.
+    crate::tui::shutdown::disarm_startup_escape();
+
+    loop {
+        let accepted = tokio::select! {
+            conn = listener.accept() => conn,
+            _ = crate::tui::shutdown::wait() => {
+                // Clean shutdown: stop accepting, give in-flight requests a
+                // bounded grace to finish, then return so `serve()` unwinds
+                // normally (Drop impls: terminal restore, tee flush).
+                crate::tui::shutdown::drain_in_flight(std::time::Duration::from_secs(15)).await;
+                crate::tui::init::flush_tee();
+                tracing::info!("Shutdown complete");
+                return Ok(());
+            }
+        };
+        let (socket, peer_addr) = match accepted {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Transient accept errors (fd exhaustion, RST races) must not
+                // kill the server — log and keep accepting.
+                tracing::warn!("accept error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+
+        // Build the per-connection tower service, wiring the peer address into
+        // `ConnectInfo`. `IntoMakeServiceWithConnectInfo` is always ready and
+        // infallible.
+        let tower_service = match make_service.call(peer_addr).await {
+            Ok(svc) => svc,
+            Err(infallible) => match infallible {},
+        };
+
+        tokio::spawn(async move {
+            let socket = TokioIo::new(socket);
+            let hyper_service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    tower_service.clone().oneshot(request)
+                },
+            );
+
+            let mut builder = Builder::new(TokioExecutor::new());
+            // A timer must be installed for the header-read timeout to fire.
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT);
+            builder.http2().timer(TokioTimer::new());
+
+            if let Err(err) = builder
+                .serve_connection_with_upgrades(socket, hyper_service)
+                .await
+            {
+                // Client-side disconnects / slow-header timeouts are expected
+                // and noisy — keep them at debug.
+                tracing::debug!("connection closed: {err}");
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+#[path = "serve_router_tests.rs"]
+mod tests;

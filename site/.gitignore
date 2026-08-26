@@ -1,0 +1,5 @@
+# Generator download cache (offline-capable rebuilds; never tracked)
+scripts/.cache/
+# Playwright output
+playwright-report/
+test-results/

@@ -1,0 +1,245 @@
+[package]
+name = "spark-model"
+version = "1.0.0-beta-preview"
+edition = "2024"
+license.workspace = true
+description = "Atlas Spark model — Qwen3 forward pass orchestration"
+
+[features]
+default = ["cuda"]
+# spark-model has no Metal port yet (Phases 4–7 add it). The cuda feature
+# forwards atlas-core/cuda + spark-runtime/cuda so the default Linux build
+# remains unchanged after the workspace-level default-features = false on
+# atlas-core.
+cuda = [
+    "atlas-core/cuda",
+    "spark-runtime/cuda",
+    "spark-storage/cuda",
+    "spark-comm/cuda",
+]
+metal = [
+    "atlas-core/metal",
+    "spark-runtime/metal",
+    "spark-storage/metal",
+    "spark-comm/metal",
+]
+# Pulls in the host-side example deps (tokenizers, memmap2, safetensors).
+# Kept off the bare `metal` feature so a metal-feature library build
+# doesn't drag in the tokenizer crate.
+metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
+# Opt-in gate for the GPU kernel microtest examples. NOT in `default`, so the
+# no-GPU CI `cargo test --workspace` skips building them (they link CUDA
+# driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
+# CI runner). Build on a real GPU host with `--features gpu-examples`.
+gpu-examples = []
+
+[dependencies]
+atlas-core = { workspace = true }
+atlas-kernels = { workspace = true }
+atlas-tier = { workspace = true }
+# `default-features = false` so the metal feature can opt out of
+# spark-runtime's `cuda` default — otherwise the dep line silently
+# re-enables cudarc on every build.
+spark-runtime = { path = "../spark-runtime", default-features = false }
+spark-comm = { path = "../spark-comm", default-features = false }
+# Same opt-out pattern as spark-runtime above — keeps metal builds
+# from silently re-enabling spark-storage's cuda default.
+spark-storage = { path = "../spark-storage", default-features = false }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = "0.1"
+half = "2"
+base64 = "0.22"
+# `gif` carries the video path: it is the one genuinely multi-frame container
+# decodable in pure Rust with no system dependency, so the whole temporal
+# pipeline can be proven before committing to an H.264 decoder.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
+parking_lot = { workspace = true }
+
+# Used by the `metal_qwen35_inference` example only — gated by
+# `required-features = ["metal-example"]` on the `[[example]]` block
+# below so default Linux builds don't pull these in.
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
+memmap2 = { version = "0.9", optional = true }
+safetensors = { version = "0.8", optional = true }
+
+# End-to-end Qwen3.5-4B-MLX-8bit decode driver. Loads weights via
+# `MlxInt8Weight`, kernel handles via `Qwen35Kernels::resolve`, and
+# routes every per-layer kernel-launch sequence through
+# `spark_model::forward::qwen3_5::forward_*`. The same forward path
+# is what a future CUDA / ROCm / WebGPU end-to-end driver would
+# call — the example just owns the per-backend weight type and
+# kernel directory.
+[[example]]
+name = "metal_qwen35_inference"
+path = "examples/metal_qwen35_inference/main.rs"
+required-features = ["metal-example"]
+
+[dev-dependencies]
+# `default-features = false` so a metal-feature build of spark-model doesn't
+# inadvertently pull cudarc back in via the dev-dep chain.
+spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
+
+[lints]
+workspace = true
+
+# GPU kernel microtest examples — gated on the non-default `gpu-examples`
+# feature so no-GPU CI skips building them (they link CUDA driver symbols).
+# NOTE: the ARM-2 Leg-2 native-MXFP4 (E8M0) numeric gate lives as a real
+# `#[ignore]`d integration test — see crates/spark-model/tests/arm2_leg2_*.rs.
+[[example]]
+name = "gdn_cdh_vblock_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w4a16_lmhead_716_repro"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gemv_fp4_vs_fp8_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w8a16_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w8a16t_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "dense_gemm_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "lora_apply_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "fp8gemm_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "inferspark_attn_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "inferspark_attn_fp8_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_shared_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_silu_down_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w8a16_gemv_batch4_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "q2_0_gemv_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_blend_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_topk_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_split4_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_wy_verify_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_wy_f16_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_wyn_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_verify_fused_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_strided_norm_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_wy4_batched_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "verify_exact_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_conv_kn_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w4a16_m17_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "batchm_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w4a16_parity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "rope_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "kernel_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_chunk_delta_h_gateb"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_chunk_shapetest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_recompute_wu_gateb"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_batched_repro"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w4a16_bf16_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w4a16_batch_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "bf16_batch_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w4a16_qg_batch_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]

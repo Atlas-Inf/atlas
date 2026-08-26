@@ -1,0 +1,112 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/atlas-core",
+    "crates/atlas-kernels",
+    "crates/atlas-plugin",
+    "crates/atlas-tier",
+    "crates/atlas-rdma",
+    "crates/spark-runtime",
+    "crates/spark-comm",
+    "crates/spark-model",
+    "crates/spark-nllb",
+    "crates/spark-server",
+    "crates/atlas-spark-bench",
+    "crates/cufile-sys",
+    "crates/spark-storage",
+    "crates/xgrammar",
+    "crates/atlas-governance",
+    "crates/atlas-closure",
+]
+
+# AMD/SCALE + native-HIP: the vendored cudarc 0.19.2 is byte-identical to
+# crates.io except its driver `Lib` loader resolves CUDA-driver symbols that
+# don't exist on SCALE/gfx1151 (e.g. cuArrayGetMemoryRequirements) to a
+# `__atlas_missing_cuda_sym` stub instead of panicking at init. On NVIDIA all
+# symbols resolve normally, so the patch is a no-op there (same version).
+[patch.crates-io]
+cudarc = { path = "vendor/cudarc" }
+
+[workspace.package]
+version = "1.0.0-beta-preview"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+authors = ["Atlas Contributors"]
+repository = "https://github.com/Atlas-Inf/atlas"
+homepage = "https://atlasinference.dev"
+documentation = "https://docs.atlasinference.dev"
+readme = "README.md"
+keywords = ["llm", "inference", "cuda", "blackwell", "gpu"]
+categories = ["science", "command-line-utilities"]
+
+[workspace.dependencies]
+# CUDA FFI.
+# Atlas only ever touches the `driver` + `nvrtc` backends (the vendored crate
+# also keeps `runtime` available for completeness). default-features=false drops
+# cudarc's default cublas/cublaslt/curand/runtime/etc. so the never-compiled
+# backends carry no weight; their generated `sys/mod.rs` FFI bindings have been
+# removed from `vendor/cudarc` entirely. `fallback-dynamic-loading` is required:
+# cudarc's build.rs derives the `dynamic-loading` cfg from it.
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "fallback-dynamic-loading",
+    "cuda-version-from-build-system",
+] }
+
+# Serialization (HF config.json)
+serde = { version = "1", features = ["derive"] }
+# `preserve_order`: keep JSON object keys in insertion/declaration order
+# (IndexMap, not BTreeMap). Required so `serde_json::to_value(ToolDefinition)`
+# and the nested `parameters` JSON-schema Value match transformers'
+# `tojson` (= `json.dumps(sort_keys=False)`) key order in the `<tools>`
+# prompt block. See crates/spark-server/src/tokenizer/jinja_helpers.rs.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+# Stable content hashing for kernel-closure provenance. `DefaultHasher` is
+# explicitly NOT stable across Rust releases, and this hash is persisted in
+# committed gate records — it has to mean the same thing next year.
+sha2 = "0.10"
+
+# Synchronization — parking_lot Mutex/RwLock are faster than std::sync,
+# don't poison, and `.lock()` returns the guard directly (no Result).
+# Already a transitive dep of several crates so this adds no binary
+# overhead — just standardizes the API across the workspace.
+parking_lot = "0.12"
+
+# Workspace crates
+# atlas-core: `default-features = false` so each consumer crate forwards the
+# right backend feature explicitly (cuda or metal). Without this, every
+# member would silently pull in cudarc via atlas-core's `cuda` default.
+atlas-core = { path = "crates/atlas-core", default-features = false }
+atlas-kernels = { path = "crates/atlas-kernels" }
+atlas-tier = { path = "crates/atlas-tier" }
+atlas-rdma = { path = "crates/atlas-rdma" }
+
+# W7: the `[patch.crates-io] xgrammar-rs` entry was removed — Atlas now
+# depends on the pure-Rust `crates/xgrammar` crate directly (no FFI,
+# no C++ toolchain). The vendored C++ `vendor/xgrammar-rs/` tree has
+# been deleted; the grammar stack is 100% Rust.
+
+# Workspace-wide lint policy. Each crate also adds `#![deny(warnings)]` /
+# `#![deny(clippy::all)]` to its `lib.rs`/`main.rs`; this section extends
+# the same policy to integration tests, benches, and examples (which are
+# compiled as separate targets and would otherwise inherit nothing).
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+large_enum_variant = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+type_complexity = "allow"
+ptr_arg = "allow"
+if_same_then_else = "allow"

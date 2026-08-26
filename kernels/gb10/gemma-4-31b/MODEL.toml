@@ -1,0 +1,154 @@
+[model]
+name = "gemma-4-31b"
+hf_id = "nvidia/Gemma-4-31B-IT-NVFP4"
+model_type = "gemma4"
+architecture = "dense_attention"
+parameters = "31B"
+active_parameters = "31B"
+
+layers_total = 60
+layers_sliding_attention = 50
+layers_full_attention = 10
+layer_pattern = "5:1 (sliding, sliding, sliding, sliding, sliding, full)"
+
+hidden_dim = 5376
+head_dim = 256
+global_head_dim = 512
+q_heads = 32
+kv_heads = 16
+num_global_kv_heads = 4
+
+intermediate_size = 21504
+vocab_size = 262144
+max_position_embeddings = 262144
+sliding_window = 1024
+
+# RoPE: different theta for sliding vs full attention layers
+rope_theta_sliding = 10000.0
+rope_theta_full = 1000000.0
+partial_rotary_factor = 0.25
+
+rms_norm_eps = 1e-6
+hidden_activation = "gelu_pytorch_tanh"
+tie_word_embeddings = true
+final_logit_softcapping = 30.0
+
+vision = true
+
+# Gemma-4 is a dense model (no MoE, no MTP).
+moe_experts = 0
+mtp_layers = 0
+
+# Effective context for agentic tasks (tokens). Gemma-4 has 256K positional
+# budget but sliding window of 1024 on 50/60 layers constrains effective
+# context for tool calling.
+effective_context = 16384
+
+# Conservative sampling defaults. Gemma-4 has no official recommendations yet.
+# 2026-05-24 empirical band-aid. Google's temp=1.0 across-the-board
+# recipe risked max_tokens wandering on agentic clients (lesson from
+# Qwen3.6). Lowered to temp=0.6 thinking/coding, 0.7 non-thinking,
+# 0.6 tools. Kept Google's top_k=64. rep_pen=1.1 + dry=0.5 added.
+[sampling.thinking_text]
+temperature = 0.6
+top_p = 0.95
+top_k = 64
+presence_penalty = 0.0
+repetition_penalty = 1.0  # 2026-06-06: 1.1->1.0; Google ships penalty-free (temp=1.0/top_k=64) — band-aid removed
+dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; targeted dry on tools only if loop reappears
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 64
+presence_penalty = 0.0
+repetition_penalty = 1.0  # 2026-06-06: 1.1->1.0; Google ships penalty-free (temp=1.0/top_k=64) — band-aid removed
+dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; targeted dry on tools only if loop reappears
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.95
+top_k = 64
+presence_penalty = 0.0
+repetition_penalty = 1.0  # 2026-06-06: 1.1->1.0; Google ships penalty-free (temp=1.0/top_k=64) — band-aid removed
+dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; targeted dry on tools only if loop reappears
+
+[sampling.tools]
+temperature = 0.6
+top_p = 0.95
+top_k = 64
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0  # 2026-06-06: 1.1->1.0; Google ships penalty-free (temp=1.0/top_k=64) — band-aid removed
+dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; targeted dry on tools only if loop reappears
+
+[behavior]
+# Gemma-4 uses <|channel>thought\n...<channel|> for thinking, which is
+# structurally separate from tool calls. Enable thinking with tools.
+thinking_in_tools = true
+# 2026-05-23 sweep: 512 → 2048 (project-wide reasoning headroom bump).
+max_thinking_budget = 2048
+# BF16 KV cache — Gemma-4's large final norm weights (mean=29, max=588)
+# exceed FP8 E4M3 range (±448), causing attention corruption with FP8/NVFP4 KV.
+default_kv_dtype = "bf16"
+
+[[model_types]]
+model_type = "gemma4"
+hidden_size = 5376
+
+[kernel]
+# No MoE gate shared memory needed (dense model).
+
+# ── Kernel lookups this model may legitimately fail to resolve ──
+# Harvested 2026-08-03 from `spark serve --check-kernels`. This target
+# runs BF16 weights; every entry below is a quantized-family or
+# shadow-only try_kernel() probe whose fallback resolves. EXCEPT the
+# four [expected_absent.gated_delta_rule] f16 arms — see honesty note.
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = "Deep-K p3 twin shipped only in qwen3.6-27b's shadow; layers::tgemm_kernel falls back to w4a16_gemm_t (resolves: common). Unmeasured for BF16-serving targets."
+w4a16_gemm_t_k64_p3 = "Same family; k64_kernel falls back to required w4a16_gemm_t_k64 (resolves)."
+w4a16_gemm_t_k64_n64_p3 = "Narrow-N twin; 0-handle gated at dispatch (K64_N64_MAX_WIDE_CTAS)."
+w4a16_gemm_t_m128_bf16 = "BF16-projection prefill twin; dispatch gated on handle != 0, falls back to resolved w4a16 m128 path."
+w4a16_gemm_t_m128_bf16_v2 = "Pipelined v2 of the above; same gating. Unmeasured."
+int8_gemm_faith2 = """
+INT8-prefill twin (faith2). Only materialized when finalize_int8_load
+finds int8 weights AND the resolved handles — this BF16 checkpoint has
+no int8 path; dispatch gated by handle != 0."""
+int8_gemm_i32acc = "Same int8 family — BF16 checkpoint never materializes it."
+requant_w_nvfp4_int8 = "Int8 weight requant from NVFP4 weights; this checkpoint is BF16, no NVFP4 source weights exist."
+requant_a_bf16_int8 = "Same int8 family — activation requant; gated by the same weight-presence condition."
+
+[expected_absent.w4a4]
+w4a4_gemm = "NVFP4 W4A4 GEMM; BF16 checkpoint has no NVFP4 weights. Fallback resolves through w4a16."
+w4a4_gemm_mfast = "mfast twin shipped only in nemotron-labs-3-puzzle's shadow; same NVFP4-weight gating applies here."
+
+[expected_absent.q4k_mmq]
+atlas_q4k_mmq128_nc = """
+Q4_K FFN MMQ family — finalize_q4k_load requires ALL handles non-zero
+AND ATLAS_FFN_MMQ presence, then requantizes NVFP4 weights to Q4_K.
+This BF16-target's KERNEL set does not ship the module; gate fails on
+handle == 0 and stays on the resolved bf16/dense path."""
+atlas_q4k_mmq128_wc = "Same Q4_K family — gated off for this target (see atlas_q4k_mmq128_nc)."
+atlas_q8_1_quantize_ds4_bf16 = "Same Q4_K family — activation quantizer; gated off."
+
+[expected_absent.q4k_quantize]
+q4k_quantize = "Q4_K weight quantizer for the MMQ family; gated off with the family (see q4k_mmq::atlas_q4k_mmq128_nc)."
+
+[expected_absent.nvfp4_mmq]
+atlas_nvfp4_mmq128_nc = """
+NVFP4 MMQ FFN family. finalize_nvfp4_mmq_load requantizes NVFP4 weights;
+this target runs BF16 so the family is never materialized, and the
+KERNEL set ships no nvfp4_mmq module. Probe is gated by handle != 0."""
+atlas_nvfp4_mmq128_wc = "Same NVFP4 MMQ family — gated off for BF16 target."
+atlas_nvfp4_mmq16_nc = "Same NVFP4 MMQ family — gated off for BF16 target."
+atlas_nvfp4_mmq16_wc = "Same NVFP4 MMQ family — gated off for BF16 target."
+atlas_nvfp4_mmq32_nc = "Same NVFP4 MMQ family — gated off for BF16 target."
+atlas_nvfp4_mmq32_wc = "Same NVFP4 MMQ family — gated off for BF16 target."
+atlas_nvfp4_mmq64_nc = "Same NVFP4 MMQ family — gated off for BF16 target."
+atlas_nvfp4_mmq64_wc = "Same NVFP4 MMQ family — gated off for BF16 target."
+atlas_nvfp4_quantize_bf16 = "NVFP4 activation quantizer; gated off with the family."
+atlas_nvfp4_repack = "NVFP4 weight repacker; gated off with the family."
+atlas_nvfp4_silu_mul_scaled = "NVFP4 SiLU epilogue; gated off with the family."
+atlas_nvfp4_silu_mul_quant = "NVFP4 SiLU epilogue (quantized); gated off with the family."
+atlas_nvfp4_scale_bf16 = "NVFP4 scale handler; gated off with the family."
+

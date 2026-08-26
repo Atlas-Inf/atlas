@@ -1,0 +1,16 @@
+header:
+  license:
+    spdx-id: AGPL-3.0-only
+    content: |
+      SPDX-License-Identifier: AGPL-3.0-only
+  paths:
+    - 'crates/**/*.rs'
+    - 'kernels/**/*.{cu,cuh,h,hpp,cpp}'
+    - 'cuda_kernels/**/*.{cu,cuh,h,hpp,cpp}'
+  paths-ignore:
+    - 'target/**'
+    - 'vendor/**'
+    # Vendored llama.cpp/ggml CUDA MMQ sources (MIT-licensed upstream);
+    # third-party material keeps its original license — never stamp AGPL here.
+    - 'kernels/gb10/qwen3.6-27b/nvfp4/q4k_vendor/**'
+  comment: on-failure

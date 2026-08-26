@@ -1,0 +1,325 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! `VisionEncoder::new` constructor.
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+
+use super::super::{MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder};
+
+/// Encoder capacity, in patches, when nothing bounds the image.
+///
+/// 6400 = 80×80, i.e. 1280×1280 at patch 16 — the value this was hard-coded to
+/// until 2026-08-14, kept as the fallback so a checkpoint that declares no
+/// bound behaves exactly as before.
+pub const FALLBACK_MAX_PATCHES: usize = 6400;
+
+/// Ceiling on the derived capacity, in patches. 16384 = 128×128 = 2048×2048.
+///
+/// A ceiling exists because the ViT attention materialises a full `[seq, seq]`
+/// score matrix, so allocation is **O(patches²)**. Measured on GB10 at
+/// Qwen3.8's vision geometry:
+///
+/// | patches | image  | encoder alloc | pre-KV  | max KV tokens |
+/// |---------|--------|---------------|---------|---------------|
+/// |  6 400  | 1280²  |    502 MB     | 57.3 GB |   457 328     |
+/// | 16 384  | 2048²  |   2 221 MB    | 59.8 GB |   375 184     |
+/// | 65 536  | 4096²  |  26 680 MB    |    —    |      —        |
+///
+/// 16384 is the last rung that is affordable: it costs +2.5 GB and ~18% of KV
+/// capacity at util 0.70. Qwen3.8-27B *declares* 4096² (`size.longest_edge =
+/// 16777216`), which would need 26.7 GB of scratch — 69% of it in those two
+/// quadratic buffers — so honouring it needs tiled/flash attention in the ViT,
+/// not a bigger number here. Raising this without that work will OOM the box.
+pub const CEILING_MAX_PATCHES: usize = 16384;
+
+/// Patches the encoder must hold to serve an area bound, clamped to what is
+/// affordable.
+///
+/// `max_pixels` is an AREA, so patches = area / patch². Returns the clamp
+/// decision alongside the value so the caller can say out loud when a
+/// checkpoint asked for more than it got — silently ignoring the checkpoint is
+/// the failure mode this whole change exists to remove.
+pub fn derive_max_patches(max_pixels: Option<usize>, patch_size: usize) -> (usize, Option<usize>) {
+    let Some(area) = max_pixels.filter(|&a| a > 0) else {
+        return (FALLBACK_MAX_PATCHES, None);
+    };
+    let per_patch = patch_size.max(1) * patch_size.max(1);
+    let wanted = (area / per_patch).max(1);
+    if wanted > CEILING_MAX_PATCHES {
+        (CEILING_MAX_PATCHES, Some(wanted))
+    } else {
+        (wanted.max(FALLBACK_MAX_PATCHES.min(wanted)), None)
+    }
+}
+
+impl VisionEncoder {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        patch_embed_w: DevicePtr,
+        patch_embed_b: DevicePtr,
+        pos_embed: DevicePtr,
+        num_position_embeddings: usize,
+        blocks: Vec<ViTBlock>,
+        deepstack: Vec<MergerLayer>,
+        deepstack_indexes: Vec<usize>,
+        merger: MergerLayer,
+        hidden_size: usize,
+        num_heads: usize,
+        spatial_merge_size: usize,
+        out_hidden_size: usize,
+        intermediate_size: usize,
+        patch_size: usize,
+        max_pixels: Option<usize>,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        let head_dim = hidden_size / num_heads;
+        // Derived from the SAME resolved bound the CPU preprocessor uses, so
+        // the two can no longer disagree. See `derive_max_patches`.
+        let (p_max, asked_for) = derive_max_patches(max_pixels, patch_size);
+        match asked_for {
+            Some(wanted) => tracing::warn!(
+                "Vision encoder capacity {p_max} patches ({}x{} px) — the resolved area bound \
+                 wanted {wanted} patches, clamped: the ViT score matrix is O(patches^2) and \
+                 {wanted} would need ~{:.1} GB of scratch. Lower --vision-max-pixels to reclaim \
+                 memory, or raise CEILING_MAX_PATCHES only alongside tiled ViT attention.",
+                (p_max as f64).sqrt() as usize * patch_size,
+                (p_max as f64).sqrt() as usize * patch_size,
+                ((wanted * wanted * 6) as f64) / (1024.0 * 1024.0 * 1024.0),
+            ),
+            None => tracing::info!(
+                "Vision encoder capacity {p_max} patches ({}x{} px){}",
+                (p_max as f64).sqrt() as usize * patch_size,
+                (p_max as f64).sqrt() as usize * patch_size,
+                if max_pixels.is_some() {
+                    " from the resolved area bound"
+                } else {
+                    " (no bound declared — historical fallback)"
+                }
+            ),
+        }
+        let merger_in_dim = spatial_merge_size * spatial_merge_size * hidden_size; // 4608
+
+        // num_grid_per_side is the side length of the square pos_embed grid
+        // (e.g. 48 for Qwen3-VL with 2304 position embeddings). Non-square
+        // layouts are not seen in the wild for this family.
+        let num_grid_per_side = (num_position_embeddings as f64).sqrt().round() as usize;
+        anyhow::ensure!(
+            num_grid_per_side * num_grid_per_side == num_position_embeddings,
+            "non-square pos_embed: {num_position_embeddings} is not a perfect square"
+        );
+
+        let buf_f32 = gpu.alloc(p_max * PATCH_DIM * 4)?;
+        let buf_h1 = gpu.alloc(p_max * hidden_size * 2)?;
+        let buf_h2 = gpu.alloc(p_max * hidden_size * 2)?;
+        let buf_wide = gpu.alloc(p_max * intermediate_size * 2)?;
+        let buf_merge_in = gpu.alloc((p_max / 4) * merger_in_dim * 2)?;
+        let buf_merge_fc1 = gpu.alloc((p_max / 4) * merger_in_dim * 2)?;
+        let buf_out = gpu.alloc(p_max * out_hidden_size * 2)?;
+        let buf_pos_resampled = gpu.alloc(p_max * hidden_size * 2)?;
+        let buf_rope_cos = gpu.alloc(p_max * head_dim * 2)?;
+        let buf_rope_sin = gpu.alloc(p_max * head_dim * 2)?;
+
+        // GEMM-based ViT SDPA scratch. Q/K/V head-contiguous copies sized to
+        // p_max (~44 MB total). scores/probs are the [seq,seq] score matrix,
+        // reused across the 16-head loop.
+        //
+        // BUG FIX (2026-06-29): attn_max was hardcoded to 1024, but a single
+        // image's ViT sequence can be up to p_max (6400 patches = 1280×1280).
+        // The mona_lisa fixture produces seq=4096 → the GEMM1 launch
+        // grid=[ceil(4096/16),...] writes a [4096,4096] score matrix into a
+        // [1024,1024] buffer → CUDA-700 illegal access. (In release builds the
+        // debug_assert guard is compiled out, so smaller-than-fault overflows
+        // silently corrupted adjacent GPU memory instead of crashing — which is
+        // why it "passed" on some weight layouts.) Size to the real per-image
+        // cap p_max so any admissible image fits: 6400²·4 ≈ 164 MB scores +
+        // 6400²·2 ≈ 82 MB probs. One-time scratch, fine on GB10.
+        let attn_max = p_max;
+        let qkv_head_elems = p_max * num_heads * head_dim;
+        let buf_qr = gpu.alloc(qkv_head_elems * 2)?; // [H, p_max, D] bf16
+        let buf_kr = gpu.alloc(qkv_head_elems * 2)?; // [H, p_max, D] bf16
+        let buf_vt = gpu.alloc(qkv_head_elems * 2)?; // [H, D, p_max] bf16
+        let buf_scores = gpu.alloc(attn_max * attn_max * 4)?; // [seq, seq] f32
+        let buf_probs = gpu.alloc(attn_max * attn_max * 2)?; // [seq, seq] bf16
+        let buf_o_stage = gpu.alloc(p_max * head_dim * 2)?; // [seq, D] bf16
+
+        // Download pos_embed weight to host as f32 so we can bilinear-
+        // interpolate it per image (HF: `fast_pos_embed_interpolate`).
+        let pos_n = num_position_embeddings * hidden_size;
+        let mut pe_bytes = vec![0u8; pos_n * 2];
+        gpu.copy_d2h(pos_embed, &mut pe_bytes)?;
+        let pos_embed_host_f32: Vec<f32> = pe_bytes
+            .chunks_exact(2)
+            .map(|c| {
+                let bits = u16::from_le_bytes([c[0], c[1]]);
+                f32::from_bits((bits as u32) << 16)
+            })
+            .collect();
+
+        // RoPE inverse-frequency table. Qwen3-VL/3.6 vision RoPE uses
+        // `rotary_dim = head_dim / 2`, with `inv_freq[k] = theta^(-2k/dim)`
+        // for k in [0, dim/2). theta is fixed at 10000 for vision.
+        let rope_dim = head_dim / 2; // e.g. 36
+        let rope_half = rope_dim / 2; // e.g. 18
+        let theta: f32 = 10_000.0;
+        let rope_inv_freq: Vec<f32> = (0..rope_half)
+            .map(|k| 1.0 / theta.powf(2.0 * k as f32 / rope_dim as f32))
+            .collect();
+
+        Ok(Self {
+            patch_embed_w,
+            patch_embed_b,
+            pos_embed,
+            blocks,
+            deepstack,
+            deepstack_indexes,
+            merger,
+            k_gemm: gpu.kernel("vision_encoder", "vision_gemm_bias")?,
+            // Tensor-core pipelined matmul (~40× the scalar vision_gemm_bias on
+            // the ViT's large-M GEMMs) + a row-broadcast bias add. Both gated to
+            // 0 → fall back to vision_gemm_bias. The ViT GEMMs dominate image prefill.
+            k_gemm_pipelined: crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined"),
+            k_add_bias: crate::layers::try_kernel(gpu, "vision_encoder", "vision_add_bias"),
+            k_norm: gpu.kernel("vision_encoder", "vision_layer_norm")?,
+            k_add: gpu.kernel("vision_encoder", "vision_add_inplace")?,
+            k_gelu: gpu.kernel("vision_encoder", "vision_gelu")?,
+            // Legacy warp-per-query ViT attention — present in EVERY vision
+            // kernel tree, the universal fallback (hard-required).
+            k_attn: gpu.kernel("vision_encoder", "vision_attention_rope")?,
+            // GEMM-based ViT SDPA kernels (the ~2× image-TTFT path). SOFT: only
+            // the qwen3.6 / Holo vision tree ships them. Vision models on an
+            // older tree (qwen3-vl-30b, gemma-4) leave these null and
+            // `vit_block` auto-falls back to `k_attn` — see `vit_attention_gemm`
+            // gate. Hard-requiring them here would break every such model at
+            // init with `vit_rope_deinterleave: named symbol not found`.
+            k_rope_deint: crate::layers::try_kernel(gpu, "vision_encoder", "vit_rope_deinterleave"),
+            k_softmax: crate::layers::try_kernel(gpu, "vision_encoder", "vit_softmax_rows"),
+            k_scatter_head: crate::layers::try_kernel(gpu, "vision_encoder", "vit_scatter_head"),
+            // f32-out dense GEMM for raw QKᵀ scores (GEMM-ViT path only). SOFT,
+            // paired with the kernels above.
+            k_gemm_f32: crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_f32out"),
+            k_merge: gpu.kernel("vision_encoder", "vision_spatial_merge")?,
+            k_f32_bf16: gpu.kernel("vision_encoder", "vision_f32_to_bf16")?,
+            k_copy: gpu.kernel("vision_encoder", "vision_bf16_copy")?,
+            hidden_size,
+            num_heads,
+            head_dim,
+            spatial_merge_size,
+            out_hidden_size,
+            intermediate_size,
+            p_max,
+            num_grid_per_side,
+            buf_f32,
+            buf_h1,
+            buf_h2,
+            buf_wide,
+            buf_merge_in,
+            buf_merge_fc1,
+            buf_out,
+            buf_pos_resampled,
+            buf_rope_cos,
+            buf_rope_sin,
+            buf_qr,
+            buf_kr,
+            buf_vt,
+            buf_scores,
+            buf_probs,
+            buf_o_stage,
+            pos_embed_host_f32,
+            rope_inv_freq,
+        })
+    }
+}
+
+#[cfg(test)]
+mod derive_tests {
+    use super::*;
+
+    /// Qwen3.8-27B: `size.longest_edge = 16777216` (4096²) at patch 16.
+    const Q38_BOUND: usize = 16_777_216;
+
+    #[test]
+    fn no_bound_keeps_the_historical_capacity() {
+        // A checkpoint shipping no preprocessor_config.json must allocate
+        // exactly what it always did — this change is not allowed to move
+        // memory for models that declare nothing.
+        assert_eq!(derive_max_patches(None, 16), (FALLBACK_MAX_PATCHES, None));
+        assert_eq!(
+            derive_max_patches(Some(0), 16),
+            (FALLBACK_MAX_PATCHES, None)
+        );
+    }
+
+    #[test]
+    fn a_declared_bound_over_the_ceiling_is_clamped_and_reported() {
+        // THE case that motivated the ceiling. Qwen3.8 asks for 65536 patches
+        // (26.7 GB of scratch, 69% of it in the O(p^2) score matrix); it gets
+        // the ceiling, and the amount it asked for comes back so the caller
+        // can say so out loud rather than silently ignoring the checkpoint.
+        let (got, asked) = derive_max_patches(Some(Q38_BOUND), 16);
+        assert_eq!(got, CEILING_MAX_PATCHES);
+        assert_eq!(
+            asked,
+            Some(65_536),
+            "the caller must be able to report the ask"
+        );
+    }
+
+    #[test]
+    fn a_low_operator_bound_shrinks_the_allocation() {
+        // The direction that did not exist before: --vision-max-pixels used to
+        // be a quality knob only, because p_max was a literal. A deployment
+        // serving thumbnails should not pay for 1280x1280 buffers.
+        let (got, asked) = derive_max_patches(Some(512 * 512), 16);
+        assert_eq!(asked, None, "under the ceiling, nothing was clamped");
+        assert_eq!(got, 1024, "512x512 at patch 16 is 32x32 = 1024 patches");
+        assert!(
+            got < FALLBACK_MAX_PATCHES,
+            "a low bound must allocate LESS than the historical default"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_is_never_exceeded_whatever_is_declared() {
+        for area in [Q38_BOUND, 100_000_000, usize::MAX / 4] {
+            let (got, _) = derive_max_patches(Some(area), 16);
+            assert!(
+                got <= CEILING_MAX_PATCHES,
+                "area {area} produced {got} patches, past the ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_tracks_patch_size() {
+        // patches = area / patch^2, so a finer grid needs MORE rows for the
+        // same pixel area. A checkpoint at patch 14 must not silently get a
+        // patch-16 allocation.
+        let (at16, _) = derive_max_patches(Some(1024 * 1024), 16);
+        let (at14, _) = derive_max_patches(Some(1024 * 1024), 14);
+        assert!(
+            at14 > at16,
+            "finer patches need more rows: {at14} vs {at16}"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_matches_the_measured_affordable_rung() {
+        // 16384 patches = 2048x2048, measured on GB10 at +2.5 GB pre-KV and
+        // -18% KV tokens. Pinned so raising it is a deliberate act with a
+        // measurement behind it, not a passing edit.
+        assert_eq!(CEILING_MAX_PATCHES, 16_384);
+        let side = (CEILING_MAX_PATCHES as f64).sqrt() as usize * 16;
+        assert_eq!(side, 2048, "the ceiling should be a clean square image");
+    }
+
+    #[test]
+    fn degenerate_inputs_do_not_produce_a_zero_allocation() {
+        // A zero-row allocation would make every buffer empty and turn the
+        // first upload into the same opaque CUDA error this work removed.
+        let (got, _) = derive_max_patches(Some(1), 16);
+        assert!(got >= 1, "derived capacity must never be zero");
+        let (got0, _) = derive_max_patches(Some(1024), 0);
+        assert!(got0 >= 1, "patch_size 0 must not divide by zero");
+    }
+}

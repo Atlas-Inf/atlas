@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Shared kernel dispatch operations.
+//!
+//! Freestanding functions wrapping CUDA kernel launches via `KernelLaunch`.
+//! Layer implementations compose these to build forward passes.
+//!
+//! Each function's parameters exactly match the corresponding CUDA kernel
+//! signature. Grid/block dimensions are computed from the problem size.
+//!
+//! Refactor wave 4a (2026-05-03): split into `ops/` sub-modules with thematic
+//! groupings. All public functions remain available at this path via re-export.
+
+#[path = "ops/activations.rs"]
+mod activations;
+#[path = "ops/derived_weights.rs"]
+mod derived_weights;
+#[path = "ops/dispatch_config.rs"]
+mod dispatch_config;
+#[path = "ops/dispatch_helpers.rs"]
+mod dispatch_helpers;
+#[path = "ops/dispatch_proj.rs"]
+mod dispatch_proj;
+// Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
+#[path = "ops/dispatch_proj_rowwise.rs"]
+mod dispatch_proj_rowwise;
+#[path = "ops/embeddings.rs"]
+mod embeddings;
+#[path = "ops/fp8_gemv_batch.rs"]
+mod fp8_gemv_batch;
+#[path = "ops/fp8_moe.rs"]
+mod fp8_moe;
+#[path = "ops/fp8_moe_batch_a.rs"]
+mod fp8_moe_batch_a;
+#[path = "ops/fp8_moe_batch_b.rs"]
+mod fp8_moe_batch_b;
+#[path = "ops/gdn_flashinfer.rs"]
+// The FlashInfer GDN bridge uses dlopen/dlsym, which do not exist on Windows.
+// The absent variant is mounted at the SAME module path so both call sites
+// (trait_prefill_recur, trait_prefill_gdn) need no cfg — they already gate on
+// `available()`, which is simply always false there.
+#[cfg(unix)]
+pub mod gdn_flashinfer;
+#[cfg(not(unix))]
+#[path = "ops/gdn_flashinfer_absent.rs"]
+pub mod gdn_flashinfer;
+#[path = "ops/gemm_dense.rs"]
+mod gemm_dense;
+#[path = "ops/gemm_dense_int8.rs"]
+mod gemm_dense_int8;
+#[path = "ops/gemm_fp4.rs"]
+mod gemm_fp4;
+#[path = "ops/model_stats.rs"]
+pub mod model_stats;
+pub use model_stats::ModelStats;
+
+#[path = "ops/gemm_fp8_prefill.rs"]
+mod gemm_fp8_prefill;
+#[path = "ops/gemm_quant.rs"]
+mod gemm_quant;
+#[path = "ops/gemv_q2.rs"]
+mod gemv_q2;
+#[path = "ops/gemv_q2_vec.rs"]
+mod gemv_q2_vec;
+#[path = "ops/gemv_sw.rs"]
+mod gemv_sw;
+#[path = "ops/hyper_connection.rs"]
+mod hyper_connection;
+#[path = "ops/kv_cache.rs"]
+mod kv_cache;
+#[path = "ops/kv_cache_fp8k.rs"]
+mod kv_cache_fp8k;
+#[path = "ops/kv_cache_turbok.rs"]
+mod kv_cache_turbok;
+#[path = "ops/lora_delta.rs"]
+pub mod lora_delta;
+#[path = "ops/model_levers.rs"]
+mod model_levers;
+#[path = "ops/moe_atomic_c4.rs"]
+mod moe_atomic_c4;
+#[path = "ops/moe_expert.rs"]
+mod moe_expert;
+#[path = "ops/moe_expert_more.rs"]
+mod moe_expert_more;
+#[path = "ops/moe_gate.rs"]
+mod moe_gate;
+#[path = "ops/moe_grouped_a.rs"]
+mod moe_grouped_a;
+#[path = "ops/moe_grouped_a2.rs"]
+mod moe_grouped_a2;
+#[path = "ops/moe_grouped_b.rs"]
+mod moe_grouped_b;
+#[path = "ops/moe_grouped_fp4.rs"]
+mod moe_grouped_fp4;
+#[path = "ops/moe_lora_grouped.rs"]
+pub mod moe_lora_grouped;
+#[path = "ops/moe_prefill.rs"]
+mod moe_prefill;
+#[path = "ops/norm.rs"]
+mod norm;
+mod nvfp4_mmq;
+#[path = "ops/prefill_attn_a.rs"]
+mod prefill_attn_a;
+#[path = "ops/prefill_attn_b.rs"]
+mod prefill_attn_b;
+#[path = "ops/prefill_attn_batched.rs"]
+mod prefill_attn_batched;
+#[path = "ops/prefill_attn_fp8k.rs"]
+mod prefill_attn_fp8k;
+#[path = "ops/prefill_attn_main_a.rs"]
+mod prefill_attn_main_a;
+#[path = "ops/prefill_attn_main_b.rs"]
+mod prefill_attn_main_b;
+#[path = "ops/prefill_attn_turbok.rs"]
+mod prefill_attn_turbok;
+mod q2_0_mmq;
+mod q4k_mmq;
+#[path = "ops/quant_dispatch.rs"]
+mod quant_dispatch;
+#[path = "ops/sampling.rs"]
+mod sampling;
+#[path = "ops/ssm_gdn_a.rs"]
+mod ssm_gdn_a;
+#[path = "ops/ssm_gdn_a2.rs"]
+mod ssm_gdn_a2;
+#[path = "ops/ssm_gdn_a3.rs"]
+mod ssm_gdn_a3;
+#[path = "ops/ssm_gdn_b.rs"]
+mod ssm_gdn_b;
+#[path = "ops/ssm_gdn_batched.rs"]
+mod ssm_gdn_batched;
+#[path = "ops/ssm_gdn_snap.rs"]
+mod ssm_gdn_snap;
+#[path = "ops/ssm_mamba.rs"]
+mod ssm_mamba;
+#[path = "ops/ssm_preproc.rs"]
+mod ssm_preproc;
+#[path = "ops/ssm_ssd.rs"]
+mod ssm_ssd;
+pub mod token_overlay;
+#[path = "ops/wide_prefill.rs"]
+mod wide_prefill;
+
+pub use activations::*;
+pub use derived_weights::{Derivation, DerivedWeights};
+pub use dispatch_config::GemmDispatch;
+pub use dispatch_helpers::*;
+pub use dispatch_proj::*;
+pub use dispatch_proj_rowwise::*;
+pub use embeddings::*;
+pub use fp8_gemv_batch::*;
+pub use fp8_moe::*;
+pub use fp8_moe_batch_a::*;
+pub use fp8_moe_batch_b::*;
+pub use gemm_dense::*;
+pub use gemm_dense_int8::*;
+pub use gemm_fp4::*;
+pub use gemm_fp8_prefill::*;
+pub use gemm_quant::*;
+pub use gemv_q2::*;
+pub use gemv_q2_vec::*;
+pub use gemv_sw::*;
+pub use hyper_connection::*;
+pub use kv_cache::*;
+pub use kv_cache_fp8k::*;
+pub use kv_cache_turbok::*;
+pub use model_levers::ModelLevers;
+pub use moe_atomic_c4::*;
+pub use moe_expert::*;
+pub use moe_expert_more::*;
+pub use moe_gate::*;
+pub use moe_grouped_a::*;
+pub use moe_grouped_a2::*;
+#[allow(unused_imports)]
+pub(crate) use moe_grouped_b::*;
+pub use moe_grouped_fp4::*;
+pub use moe_lora_grouped::*;
+pub use moe_prefill::*;
+pub use norm::*;
+pub use nvfp4_mmq::*;
+pub use prefill_attn_a::*;
+pub use prefill_attn_b::*;
+pub use prefill_attn_batched::*;
+pub use prefill_attn_fp8k::*;
+pub use prefill_attn_main_a::*;
+pub use prefill_attn_main_b::*;
+pub use prefill_attn_turbok::*;
+pub use q2_0_mmq::*;
+pub use q4k_mmq::*;
+pub use quant_dispatch::*;
+pub use sampling::*;
+pub use ssm_gdn_a::*;
+pub use ssm_gdn_a2::*;
+pub use ssm_gdn_a3::*;
+pub use ssm_gdn_b::*;
+pub use ssm_gdn_batched::*;
+pub use ssm_gdn_snap::*;
+pub use ssm_mamba::*;
+pub use ssm_preproc::*;
+pub use ssm_ssd::*;
+pub use wide_prefill::*;

@@ -1,0 +1,117 @@
+[package]
+name = "spark-runtime"
+version = "1.0.0-beta-preview"
+edition = "2024"
+license.workspace = true
+description = "Atlas Spark runtime — GPU backend, weight loading, KV cache, scheduler"
+autobenches = false
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc", "atlas-core/cuda"]
+metal = [
+    "dep:objc2",
+    "dep:objc2-metal",
+    "dep:objc2-foundation",
+    "dep:dispatch2",
+    "atlas-core/metal",
+]
+test-utils = []
+
+[[bin]]
+name = "bench_fast_weights"
+path = "benches/bench_fast_weights.rs"
+required-features = ["test-utils"]
+
+# Standalone smoke binary for the metal backend. Loads layer 3 of
+# `mlx-community/Qwen3.5-4B-MLX-8bit` from `~/models/...` (override
+# via `$ATLAS_MLX_MODEL_DIR`) and runs a single full-attention
+# block forward pass. Prints output statistics so users can verify
+# their Apple Silicon build runs real kernels on real weights.
+[[example]]
+name = "metal_layer3_attention"
+path = "examples/metal_layer3_attention.rs"
+required-features = ["metal"]
+
+# Parallel demo for the ViT vision tower: loads
+# `vision_tower.blocks.0` (real BF16 weights, no MLX quantization)
+# and runs a single non-causal attention + GeLU MLP block forward.
+[[example]]
+name = "metal_vision_block_forward"
+path = "examples/metal_vision_block_forward.rs"
+required-features = ["metal"]
+
+# Throughput benchmark for the metal backend: runs the layer-3
+# attention block N times and reports min / p50 / p99 / mean
+# latency + decode-equivalent tokens/sec. Useful for regression
+# tracking and for users to confirm their hardware matches the
+# expected envelope (~10 ms/forward on M2, scaling with bandwidth).
+[[example]]
+name = "metal_layer3_bench"
+path = "examples/metal_layer3_bench.rs"
+required-features = ["metal"]
+
+# Note: the end-to-end Qwen3.5-4B-MLX-8bit inference demo lives in
+# `crates/spark-model/examples/metal_qwen35_inference/` because the
+# per-layer forward path it drives lives in `spark_model::forward`,
+# and `spark-runtime` cannot depend on `spark-model` (`spark-model`
+# already depends on `spark-runtime`). Run it via:
+#   cargo run --release --no-default-features --features metal \
+#       -p spark-model --example metal_qwen35_inference
+
+# Integration test gated by `test-utils` because it depends on the
+# `gpu::mock` module, which is itself `cfg(any(test, feature = "test-utils"))`.
+# Without this gate, default `cargo test --workspace` would attempt to compile
+# this test against the lib (no cfg(test)), fail to find `gpu::mock`, and
+# block CI. With the gate, `cargo test --workspace` cleanly skips it; run it
+# explicitly via `cargo test -p spark-runtime --features test-utils`.
+[[test]]
+name = "fast_weights_parity"
+path = "tests/fast_weights_parity.rs"
+required-features = ["test-utils"]
+
+[dependencies]
+atlas-core = { workspace = true }
+atlas-kernels = { workspace = true }
+cudarc = { workspace = true, optional = true }
+
+# Apple Metal backend deps. Activated only by `--features metal`.
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true, features = [
+    "MTLDevice",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLLibrary",
+    "MTLBlitCommandEncoder",
+    "MTLEvent",
+    "block2",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSData",
+    "NSString",
+    "NSError",
+] }
+# `MTLDevice::newLibraryWithData_error` takes a `DispatchData` (libdispatch
+# byte container), not an `NSData`. dispatch2 ships the wrapper.
+dispatch2 = { version = "0.3", optional = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = "0.8"
+memmap2 = "0.9"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time", "parking_lot"] }
+rand = "0.8"
+half = "2"
+parking_lot = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

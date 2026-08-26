@@ -1,0 +1,27 @@
+[package]
+name = "spark-comm"
+version = "1.0.0-beta-preview"
+edition = "2024"
+license.workspace = true
+description = "Atlas Spark communication backend — collective operations abstraction"
+
+[features]
+default = ["cuda", "nccl"]
+# `cuda` marks the CUDA-API compute backend. It does NOT pull in NCCL:
+# SCALE/AMD (gfx1151) builds use the CUDA API without an NCCL library.
+# `nccl` gates the raw NCCL FFI bindings (`nccl.rs`, `nccl_backend.rs`)
+# which `#[link(name = "nccl")]`; it implies `cuda`. NVIDIA builds get
+# both via `default`. Under `metal`, only `CommBackend` +
+# `SingleGpuBackend` are exposed — multi-GPU EP/TP isn't reachable on a
+# single Apple Silicon device anyway.
+cuda = []
+nccl = ["cuda"]
+metal = []
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = "0.1"
+parking_lot = { workspace = true }
+
+[lints]
+workspace = true

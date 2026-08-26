@@ -1,0 +1,372 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Auto-extracted from `weight_map.rs` during refactor wave 4a.
+
+#![allow(unused_imports)]
+
+use anyhow::{Context, Result, bail, ensure};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::weights::{WeightDtype, WeightStore};
+
+use super::*;
+
+/// Load an FP8 E4M3 block-scaled checkpoint weight as a native [`Fp8Weight`].
+///
+/// The FP8 checkpoint stores:
+///   - `{prefix}.weight`: FP8E4M3 tensor [N, K]
+///   - `{prefix}.weight_scale_inv`: BF16 (Qwen/DeepSeek) or FP32 (MiniMax)
+///     tensor [N/block, K/block]
+///
+/// The `w8a16_gemv` kernel uses 2D block scales directly:
+///   `dequant[i,j] = E4M3_LUT[fp8[i,j]] * block_scale[i/BS, j/BS]`
+/// No per-row max reduction needed — the kernel loads the correct block
+/// scale for each 128-element K chunk.
+///
+/// **Scale precision (block-FP8 numerics):** the block scale is *widened to a
+/// genuine FP32 device buffer here, once*, so it is applied in full FP32 in the
+/// W8A8/W8A16 GEMM epilogues — matching vLLM / DeepGEMM / HF block-FP8 (which
+/// also accumulate the scale in FP32). The checkpoint may store the scale as
+/// BF16 (lossless widen), FP32 (straight copy), or F8_E8M0 (exact power-of-two
+/// widen); in every case `row_scale` ends up an FP32 `[N/BS, K/BS]` buffer.
+/// Every FP8 block-scale kernel reads
+/// `const float*` — see `kernels/gb10/common/w8a16_gemv.cu` et al.
+pub fn load_fp8_block_scaled_as_fp8weight(
+    store: &WeightStore,
+    prefix: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<Fp8Weight> {
+    let w = store.get(&format!("{prefix}.weight"))?;
+    ensure!(
+        w.dtype == WeightDtype::FP8E4M3,
+        "Expected FP8E4M3 for {prefix}.weight, got {:?}",
+        w.dtype,
+    );
+    ensure!(
+        w.shape.len() == 2,
+        "Expected 2D weight for {prefix}, got {:?}",
+        w.shape
+    );
+    let n = w.shape[0];
+    let k = w.shape[1];
+    let weight_ptr = w.ptr;
+
+    // Load block scale [N/BS, K/BS] — already on GPU from safetensors. The
+    // tensor name varies by producer: DeepSeek/Qwen-native FP8 ships
+    // `weight_scale_inv` (2D); compressed-tensors `float-quantized` (e.g.
+    // Hcompany/Holo-3.1-*-FP8) ships a 2D `weight_scale`; DeepSeek-V4 ships
+    // a 2D F8_E8M0 `.scale`; ModelOpt
+    // MIXED_PRECISION ships a *scalar* `weight_scale` (expanded to the block
+    // matrix shape below). All three are the per-block FP8 dequant multiplier
+    // the W8A16 kernels apply in FP32. Prefer whichever 2D block scale exists.
+    let scale_inv_key = format!("{prefix}.weight_scale_inv");
+    let plain_scale_key = format!("{prefix}.weight_scale");
+    let e8m0_scale_key = format!("{prefix}.scale");
+    let block_scale_key = if store.contains(&scale_inv_key) {
+        Some(scale_inv_key.clone())
+    } else if store
+        .get(&plain_scale_key)
+        .map(|s| s.shape.len() == 2)
+        .unwrap_or(false)
+    {
+        Some(plain_scale_key.clone())
+    } else if store
+        .get(&e8m0_scale_key)
+        .map(|s| s.shape.len() == 2 && s.dtype == WeightDtype::FP8E8M0)
+        .unwrap_or(false)
+    {
+        Some(e8m0_scale_key.clone())
+    } else {
+        None
+    };
+    let row_scale = if let Some(scale_key) = block_scale_key {
+        let s = store.get(&scale_key)?;
+        ensure!(
+            s.shape.len() == 2,
+            "Expected 2D shape for {scale_key}, got {:?}",
+            s.shape,
+        );
+        ensure!(
+            matches!(
+                s.dtype,
+                WeightDtype::BF16 | WeightDtype::FP32 | WeightDtype::FP8E8M0
+            ),
+            "Expected BF16, FP32, or F8_E8M0 for {scale_key}, got {:?}",
+            s.dtype,
+        );
+
+        tracing::debug!(
+            "FP8 block scales: {prefix} [{n},{k}] scale=[{},{}] dtype={:?} -> FP32",
+            s.shape[0],
+            s.shape[1],
+            s.dtype,
+        );
+
+        // Widen the block scale to a genuine FP32 device buffer (lossless from
+        // BF16, straight copy from FP32). The W8A8/W8A16 kernels apply this scale
+        // in FP32; reading the checkpoint BF16 directly would clamp it to BF16
+        // precision (and an FP32-scale checkpoint would be misread as BF16).
+        let scale_total = s.shape[0] * s.shape[1];
+        let row_scale = gpu.alloc(scale_total * 4)?;
+        let kernel = gpu.kernel("widen_block_scale_f32", "widen_block_scale_f32")?;
+        let stream = gpu.default_stream();
+        let input_dtype = match s.dtype {
+            WeightDtype::BF16 => 0,
+            WeightDtype::FP32 => 1,
+            WeightDtype::FP8E8M0 => 2,
+            _ => unreachable!("validated block-scale dtype"),
+        };
+        crate::layers::ops::widen_block_scale_f32(
+            gpu,
+            kernel,
+            s.ptr,
+            row_scale,
+            scale_total as u32,
+            input_dtype,
+            stream,
+        )?;
+        gpu.synchronize(stream)?;
+        row_scale
+    } else {
+        let scalar_key = plain_scale_key;
+        let scale = scalar_f32(store, &scalar_key, gpu)
+            .with_context(|| format!("Missing {scale_inv_key} or scalar {scalar_key}"))?;
+        let n_blocks = n.div_ceil(128);
+        let k_blocks = k.div_ceil(128);
+        let scale_total = n_blocks * k_blocks;
+        tracing::debug!(
+            "FP8 scalar scale: {prefix} [{n},{k}] scale={scale:.8} -> [{n_blocks},{k_blocks}] FP32"
+        );
+        let mut scale_buf = Vec::with_capacity(scale_total * 4);
+        for _ in 0..scale_total {
+            scale_buf.extend_from_slice(&scale.to_le_bytes());
+        }
+        let ptr = gpu.alloc(scale_buf.len())?;
+        gpu.copy_h2d(&scale_buf, ptr)?;
+        ptr
+    };
+
+    Ok(Fp8Weight {
+        weight: weight_ptr,
+        row_scale, // FP32 [N/BS, K/BS] block scales on GPU
+        n: n as u32,
+        k: k as u32,
+        scale_format: WeightQuantFormat::Fp8BlockScaled,
+    })
+}
+
+/// Quantize a BF16 dense weight to NVFP4 on GPU.
+///
+/// Two-phase: (1) find global max, (2) per-group E2M1 quantization.
+/// Halves weight bandwidth vs FP8 (0.5 bytes/weight + group scales vs 1 byte/weight).
+/// Called once at model load time (not on the hot path).
+pub(crate) fn quantize_to_nvfp4(
+    bf16_weight: &DenseWeight,
+    n: usize,
+    k: usize,
+    gpu: &dyn GpuBackend,
+    absmax_kernel: spark_runtime::gpu::KernelHandle,
+    quantize_kernel: spark_runtime::gpu::KernelHandle,
+    stream: u64,
+) -> Result<QuantizedWeight> {
+    use spark_runtime::kernel_args::KernelLaunch;
+
+    let total = n * k;
+
+    // Phase 1: Find global absolute max
+    let max_buf = gpu.alloc(4)?;
+    gpu.memset(max_buf, 0, 4)?;
+
+    let grid1 = (total / 256).clamp(1, 1024) as u32;
+    KernelLaunch::new(gpu, absmax_kernel)
+        .grid([grid1, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(bf16_weight.weight)
+        .arg_ptr(max_buf)
+        .arg_u32(total as u32)
+        .launch(stream)?;
+
+    gpu.synchronize(stream)?;
+    let mut max_bytes = [0u8; 4];
+    gpu.copy_d2h(max_buf, &mut max_bytes)?;
+    let global_max = f32::from_le_bytes(max_bytes);
+
+    // scale2 = global_max / (6.0 * 448.0)  [FP8 E4M3 max = 448]
+    let scale2 = if global_max > 0.0 {
+        global_max / (6.0 * 448.0)
+    } else {
+        1.0
+    };
+
+    // Diagnostic: the first few quantizations report their absmax. Counted on
+    // the BACKEND, so a second model loaded into the process reports its own
+    // instead of inheriting a spent counter.
+    if gpu.op_cache().first_n("diag:quantize_nvfp4_absmax", 5) {
+        tracing::info!(
+            "quantize_to_nvfp4: n={n} k={k} total={total} global_max={global_max:.6} scale2={scale2:.8} grid1={grid1}",
+        );
+    }
+
+    // Phase 2: Quantize
+    let packed_buf = gpu.alloc(n * k / 2)?;
+    let scale_buf = gpu.alloc(n * k / 16)?;
+
+    KernelLaunch::new(gpu, quantize_kernel)
+        .grid([n as u32, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(bf16_weight.weight)
+        .arg_ptr(packed_buf)
+        .arg_ptr(scale_buf)
+        .arg_f32(scale2)
+        .arg_u32(n as u32)
+        .arg_u32(k as u32)
+        .launch(stream)?;
+
+    gpu.synchronize(stream)?;
+
+    Ok(QuantizedWeight {
+        weight: packed_buf,
+        weight_scale: scale_buf,
+        weight_scale_2: scale2,
+        input_scale: DevicePtr::NULL,
+        weight_scale_2_vec: DevicePtr::NULL,
+    })
+}
+
+/// Load attention weights for a full_attention layer.
+pub(crate) fn load_attention(
+    store: &WeightStore,
+    layer_prefix: &str,
+    gpu: &dyn GpuBackend,
+    variant: Nvfp4Variant,
+    qctx: QuantizeCtx,
+    config: &atlas_core::config::ModelConfig,
+) -> Result<AttentionWeights> {
+    let p = format!("{layer_prefix}.self_attn");
+    let (k_scale, v_scale) = load_kv_scales(store, &p, gpu);
+    let h = config.hidden_size;
+    let qkv_out = config.num_attention_heads * config.head_dim;
+    // q/k/v may ship either as dense BF16/FP8 (`.weight`, kept in the quant
+    // ignore list) OR as compressed-tensors NVFP4 (`.weight_packed`) — e.g.
+    // RedHatAI/Qwen3-Coder-Next-NVFP4, which quantizes the attention
+    // projections too. This attention path consumes q/k/v as dense BF16
+    // (`AttentionWeights.{q,k,v}_proj: DenseWeight`), so dequant the NVFP4
+    // case to BF16 at load, mirroring the gemma4 loader; the dense case is
+    // untouched. Dims come from the packed tensor itself, not config: under
+    // `attn_output_gate` q_proj's row count is 2×(heads·head_dim), so a
+    // config-derived `n` would run the dequant kernel off the end. weight_packed
+    // is [out_features, in_features/2] (2 fp4 nibbles per byte). Without this,
+    // packed-q/k/v checkpoints die on `self_attn.q_proj.weight not found` at the
+    // first full_attention layer (issue #299 follow-on — the reported
+    // shared_expert half already loads).
+    let load_qkv = |name: &str| -> Result<DenseWeight> {
+        match store.get(&format!("{p}.{name}.weight_packed")) {
+            Ok(w) => crate::weight_map::dequant_nvfp4_to_bf16(
+                store,
+                &format!("{p}.{name}"),
+                w.shape[0],
+                w.shape[1] * 2,
+                gpu,
+            ),
+            Err(_) => dense_auto(store, &format!("{p}.{name}.weight"), gpu),
+        }
+    };
+    Ok(AttentionWeights {
+        q_proj: load_qkv("q_proj")?,
+        k_proj: load_qkv("k_proj")?,
+        v_proj: load_qkv("v_proj")?,
+        o_proj: quantized_any(
+            store,
+            &format!("{p}.o_proj"),
+            h,
+            qkv_out,
+            gpu,
+            variant,
+            qctx,
+        )?,
+        q_norm: dense(store, &format!("{p}.q_norm.weight"))?,
+        k_norm: dense(store, &format!("{p}.k_norm.weight"))?,
+        q_norm_full: None,
+        k_norm_full: None,
+        k_scale,
+        v_scale,
+    })
+}
+
+/// Load SSM weights for a linear_attention layer.
+pub(crate) fn load_ssm(
+    store: &WeightStore,
+    layer_prefix: &str,
+    gpu: &dyn GpuBackend,
+    variant: Nvfp4Variant,
+    qctx: QuantizeCtx,
+    config: &atlas_core::config::ModelConfig,
+) -> Result<SsmWeights> {
+    let p = format!("{layer_prefix}.linear_attn");
+    let h = config.hidden_size;
+    // out_proj is [hidden_size, d_inner] where d_inner = linear_value_head_dim * linear_num_value_heads
+    let d_inner = config.linear_value_head_dim * config.linear_num_value_heads;
+    Ok(SsmWeights {
+        in_proj_qkvz: dense_auto(store, &format!("{p}.in_proj_qkvz.weight"), gpu)?,
+        in_proj_ba: dense_auto(store, &format!("{p}.in_proj_ba.weight"), gpu)?,
+        conv1d: dense(store, &format!("{p}.conv1d.weight"))?,
+        a_log: dense_keep_f32(store, &format!("{p}.A_log"), gpu)?,
+        dt_bias: dense_keep_f32(store, &format!("{p}.dt_bias"), gpu)?,
+        norm: dense(store, &format!("{p}.norm.weight"))?,
+        out_proj: quantized_any(
+            store,
+            &format!("{p}.out_proj"),
+            h,
+            d_inner,
+            gpu,
+            variant,
+            qctx,
+        )?,
+    })
+}
+
+/// Load MoE weights for a layer.
+///
+/// Under EP (ep_world_size > 1), only local experts are loaded from the store.
+/// Remote experts get NULL pointers — kernels detect NULL and write zero output.
+pub(crate) fn load_moe(
+    store: &WeightStore,
+    layer_prefix: &str,
+    num_experts: usize,
+    gpu: &dyn GpuBackend,
+    config: &atlas_core::config::ModelConfig,
+    variant: Nvfp4Variant,
+    qctx: QuantizeCtx,
+) -> Result<MoeWeights> {
+    load_moe_inner(
+        store,
+        layer_prefix,
+        num_experts,
+        gpu,
+        config,
+        variant,
+        qctx,
+        false,
+    )
+}
+
+/// Load MoE with option to skip routed experts (native FP8 loads them separately).
+pub(crate) fn load_moe_skip_experts(
+    store: &WeightStore,
+    layer_prefix: &str,
+    num_experts: usize,
+    gpu: &dyn GpuBackend,
+    config: &atlas_core::config::ModelConfig,
+    variant: Nvfp4Variant,
+    qctx: QuantizeCtx,
+) -> Result<MoeWeights> {
+    load_moe_inner(
+        store,
+        layer_prefix,
+        num_experts,
+        gpu,
+        config,
+        variant,
+        qctx,
+        true,
+    )
+}

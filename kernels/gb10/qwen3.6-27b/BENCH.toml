@@ -1,0 +1,325 @@
+# Benchmarks for this model, and the thresholds its gate records must meet.
+#
+# Sibling of MODEL.toml so the numbers sit beside the thing they describe;
+# hardware and model are implied by the path and cannot disagree with the
+# contents. Read by `atlas_plugin::gate::bench`.
+#
+# Thresholds are per CHECKPOINT, not per model: two checkpoints of one model
+# can differ by several BFCL points, so they cannot share a bar.
+#
+# This file is deliberately OUTSIDE the closure hash (`taxon::configs` does not
+# list it), so ratcheting a threshold does not invalidate the record that
+# justified the ratchet.
+#
+# `status = "unmeasured"` entries carry NO [benchmarks.metrics] table. Absence
+# is the TODO -- a guessed threshold a run could clear would report PASS for
+# something nobody measured.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "unsloth/Qwen3.6-27B-NVFP4"
+gate = "bfcl-subset"
+recipe = "qwen3.6/qwen3.6-27b-nvfp4-unsloth"
+# NO LONGER THE REQUIRED bfcl-subset SUBJECT (flipped 2026-08-15). The required
+# gate model is now unsloth/Qwen3.8-27B-NVFP4 (kernels/gb10/qwen3.8-27b/BENCH.toml).
+# Retained as a non-default measured entry for historical provenance and so the
+# 3.6 leg can still be run on demand with `--checkpoint unsloth/Qwen3.6-27B-NVFP4`.
+# ★ CONSEQUENCE: the MLPerf-edge submission rides on THIS checkpoint, and with it
+# out of the required set nothing guards the submitted config on every PR — re-run
+# this leg by hand before any MLPerf-facing claim (accepted trade, 2026-08-15).
+default = false
+status = "measured"
+note = """\
+Gate D. Golden ST-995 draw (62/10/10, floor 25, n=995, seed 42, temp 0) on the DENSE 27B — \
+the MLPerf-edge submission model, which is the model these numbers are defined for. \
+THRESHOLDS ARE THE HIGH-WATER RATCHET, NOT THE FLOOR: 87.44 overall is the best \
+like-for-like value ever recorded under these serve flags (2026-07-13 prestack b45af988); \
+88.59 normalized is the best (2026-07-26 pr369 de6153f3). Ratcheting to best-ever rather \
+than to a survivable floor is deliberate — it catches regression from our best instead of \
+only catching catastrophe, and it stops repeated sub-noise dips silently walking the gate \
+down over successive PRs. `noise` is the MEASURED +/-0.4 MTP-greedy-nondeterminism band on \
+this model: a bit-identical change has swung overall by 0.40, so a dip inside it is not \
+signal. The MLPerf-edge floor (83.64 / 85.32, = llama.cpp Q4_K_M golden 86.23/87.96 x 0.97) \
+is NOT repeated as a field here because this schema enforces only `metrics` and an extra key \
+would be silently ignored — it is subsumed, since 87.44 > 83.64 and 88.59 > 85.32. If these \
+mins are ever lowered, re-check them against that floor by hand: dropping below it is an \
+outright MLPerf submission failure, not a regression. Do NOT score the echolp n=1004 draw \
+against these numbers — see bfcl-subset-echolp. History: 2026-07-13 prestack b45af988 \
+87.44/88.53 (overall high-water); 2026-07-13 main d77bdf84 87.24/88.40; 2026-07-26 pr369 \
+de6153f3 87.34/88.59 (normalized high-water); 2026-08-03 PR #388 Gate D 87.74/89.43 n=995. \
+The draw is PINNED at n=995: a score from a different draw is not comparable to these \
+thresholds, and the sample count is the only thing that reveals it after the fact, so it is \
+gated exactly rather than merely recorded."""
+
+[benchmarks.metrics.normalized_single_turn_score]
+min = 88.59
+noise = 0.4
+
+[benchmarks.metrics.overall_accuracy]
+min = 87.44
+noise = 0.4
+
+[benchmarks.metrics.samples]
+min = 995
+max = 995
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "unsloth/Qwen3.6-27B-NVFP4"
+gate = "concurrency-sweep"
+recipe = "qwen3.6/qwen3.6-27b-nvfp4-unsloth"
+default = true
+status = "unmeasured"
+note = """\
+The DENSE half of the concurrency curve. Declared here so the intent is on \
+record for both architectures: the C=1..32 latency/throughput ladder is \
+measured on dense AND MoE, because they do not share a decode path — the \
+dense FFN batches over all rows via forward_prefill while a 256-expert MoE \
+takes the grouped-GEMM arm, and a regression can hit one without touching \
+the other. A curve measured on one model cannot speak for the other.
+
+NO [benchmarks.metrics] TABLE ON PURPOSE. concurrency-sweep is a promotion \
+candidate HISTORICALLY; since 2026-08-15 concurrency-sweep IS REQUIRED, with \
+its measured subject on qwen3.8-27b — this 3.6 entry stays an unmeasured \
+declaration. It has never been run on main at C=32. \
+A guessed threshold a run could clear would report PASS for something nobody \
+measured — the exact failure this file's header warns about. Thresholds land \
+here after the first measured run, and that run is what promotes the bench \
+from PROMOTION_CANDIDATES to REQUIRED.\
+"""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "unsloth/Qwen3.6-27B-NVFP4"
+gate = "agentic-webserver"
+recipe = "qwen3.6/qwen3.6-27b-nvfp4-unsloth"
+default = false
+status = "unmeasured"
+note = """\
+The DENSE agentic leg — REGISTERED 2026-08-14 SO THE 27B CAN BE BASELINED, NEVER YET \
+MEASURED. No agentic-webserver number has ever been recorded on this checkpoint, and it \
+cannot inherit the 35B's ceiling: the 35B is A3B (~3B active parameters per token) while \
+the dense 27B activates all 27B on every token, so on a memory-bound GB10 its per-token \
+decode is several times heavier and its agentic Σwall will land substantially higher — \
+expected above the 35B's entire ceiling (>1200 s per the owner's estimate; the 35B's bound \
+in ITS entry is 1800 s: it was 1000, and was raised on 2026-08-18 once five \
+10/10 tiers measured 774-1039 s and showed 1000 sat inside the healthy band. \
+Speed there is bounded by a measured `s_per_turn` metric instead; this entry \
+has no such measurement, so it is NOT speed-gated. Per this file's header, \
+thresholds are per CHECKPOINT — the 35B's bounds simply do not apply here. || NO \
+[benchmarks.metrics] TABLE ON PURPOSE, and in particular NO Σwall floor or ceiling: this \
+repo's recurring failure mode is a plausible-looking number written down before anyone \
+measured it (the 384 inter-tool prose budget, the hardcoded 256 effort rung, the P2-1 \
+default), and a guessed ceiling either passes vacuously or fails honest PRs. `default = \
+false` — the 35B owns this gate's default serve — and `baseline_for` drops unmeasured \
+entries anyway, so `--pull-request-gate` cannot serve this leg and a record against this \
+checkpoint fails `check_record` loudly with "no baseline for model" rather than reading as \
+PASS. Until floors land here, every dense run is informational. || ★ WHOEVER WRITES THE \
+DENSE CEILING MUST FIRST DECIDE WHAT IT IS. The 35B's Σwall is documented in its entry as \
+a BLOWUP DETECTOR with generous headroom, NOT a perf bound — it cannot see a 5-10% TTFT \
+regression, which is what the two TTFT gates are for. A tight ceiling here silently \
+converts the blowup detector into a perf gate that every unrelated PR then pays for. \
+Whichever is chosen, state it in this note beside the number. || CALIBRATION PROTOCOL, in \
+order, before any floors: (1) serve this entry's recipe on an IDLE box — walls are \
+box-specific and Σwall carries ±200-300 s of outlier noise on the 35B; a co-tenant makes \
+the number meaningless; (2) drive it manually, since the gate cannot serve an unmeasured \
+entry: `spark benchmark run agentic-webserver --yes --url <serve> --model \
+unsloth/Qwen3.6-27B-NVFP4 --param wall_budget_s=100000` — the wall_budget_s override \
+neutralizes the leg's 35B-tuned 1000 s default so the run verdict does not encode another \
+checkpoint's ceiling; iterations stays at the pinned 10; (3) ≥3 repeats, so the spread is \
+MEASURED rather than assumed — the dense band is unknown; (4) ratchet from the measurement \
+with the run's sha, date and box recorded beside the numbers, the way bfcl-subset-echolp's \
+floors are; (5) only then flip status = "measured". || RE-POINTING AT QWEN3.8-27B (owned \
+by a separate workstream) is a checkpoint/recipe swap, not a rewrite: change `checkpoint` \
+and `recipe` here (or add the sibling entry under kernels/gb10/qwen3.8-27b once that \
+target exists) and add its family to the agentic descriptor's `intended_for` list in \
+crates/atlas-plugin/src/benchmarks/agentic/descriptors.rs. Thresholds are per checkpoint: \
+nothing measured on Qwen3.6 transfers, and the calibration protocol runs again from (1).\
+"""
+
+# --- vision-fidelity -------------------------------------------------------
+# Vision models only. This gate is declared on the three targets that ship a
+# vision tower and have a BENCH.toml; a text-only target has no entry and the
+# gate simply does not apply to it.
+#
+# The bounds are ABSOLUTE and take no noise term, like the cross-contamination
+# gate's. Vision-token count is arithmetic over the patch grid -- there is no
+# run-to-run variance for a tolerance to absorb, so any movement is a real
+# change in preprocessing. That is the property that makes this gate worth
+# requiring: the 2026-08-14 resolution-cap defect silently reduced every image
+# above 1280px to about a tenth of its permitted area, and every capability
+# check passed throughout, because a downscaled picture is still recognisably
+# what it is.
+#
+#   integrity_passed  = 10  the INTEGRITY floor, and the legs a single
+#                           well-formed request cannot reach. Every one of
+#                           them fails as a FLUENT ANSWER TO THE WRONG INPUT
+#                           rather than an error, which is the class this
+#                           repo keeps rediscovering:
+#                             heterogeneous-concurrency  four DIFFERENT
+#                               requests in flight (one text-only), each
+#                               scored against its own input. Identical
+#                               requests cannot test the per-request offsets
+#                               into the shared ViT output buffer, because
+#                               every offset is then interchangeable.
+#                             prefix-cache-isolation     same prompt text,
+#                               different image, back to back. Guards the
+#                               predicate that keeps vision prompts out of
+#                               the prefix cache — it silently missed the
+#                               VIDEO pad token until 2026-08-14.
+#                             long-prompt-splice         a prompt past the
+#                               single-chunk budget, which leaves the batched
+#                               co-dispatch encode for a second splice in a
+#                               different file. Measured 81 vs 7082 prompt
+#                               tokens, so it really does cross over.
+#                             media-in-history           the image in an
+#                               earlier turn, not in the message asking the
+#                               question. The #165 path.
+#                             exif-orientation-pinned    PINS current
+#                               behaviour rather than judging it: EXIF
+#                               orientation is IGNORED, measured 2026-08-14.
+#                               A rotated phone photo reaches the model
+#                               sideways. Whether to honour the tag is a
+#                               product decision; that it must not change by
+#                               accident is not.
+#                             stream-blocking-parity     the SAME request
+#                               streamed and not. Every other leg sets
+#                               stream:true, so the blocking path — which
+#                               assembles its own response — was never run.
+#                               Both must answer correctly AND agree on
+#                               prompt_tokens; a difference means the two
+#                               paths built different prompts from identical
+#                               bytes.
+#                             multi-choice-image         n=2 with an image.
+#                               The blocking path gives only choice 0 the
+#                               pixels (the encode is shared), which is
+#                               correct and is also index-conditional code
+#                               nothing ran.
+#                             image-on-tool-result       the image arriving
+#                               on a role:"tool" message — the OTHER call
+#                               site of collect_message_images, and the case
+#                               #165 exists for.
+#                             thinking-on-vision         the DEFAULT config
+#                               for these checkpoints, which every other leg
+#                               turns off. Thinking lengthens the prompt and
+#                               so moves which prefill chunk the pad run lands
+#                               in. Asserted as a DIFFERENCE between two
+#                               images so the unknown <think> cost cancels.
+#   integrity_measured = 10 a skipped integrity leg is not a passed one.
+#   geometry_matched  = 14  the CORRECTNESS floor, and the one that moves when
+#                           preprocessing changes. Rung 09 (1600x900) is the
+#                           ONLY rung above the retired 1280px clamp: under the
+#                           clamp it is 920 tokens, un-downscaled it is 1400.
+#                           The other eight fit under either regime and so
+#                           cannot tell the two apart -- without rung 09 this
+#                           gate could not fail on the defect it exists for.
+#   geometry_asserted = 14  the MEASUREMENT floor, which is a DIFFERENT failure.
+#                           A cell the server cannot serve reports UNMEASURED,
+#                           which is not a mismatch -- so without this floor an
+#                           encoder-capacity regression would turn every cell
+#                           UNMEASURED and still read as PASS. Both are kept
+#                           because neither implies the other.
+#   probes_passed     = 3   capability, all three.
+#   control_held      = 1   the no-image control MUST hold. The non-vacuity
+#                           requirement expressed as a threshold: if the control
+#                           answers as though it saw a picture, the probes are
+#                           not evidence and the run is VACUOUS.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "unsloth/Qwen3.6-27B-NVFP4"
+gate = "vision-fidelity"
+recipe = "qwen3.6/qwen3.6-27b-nvfp4-unsloth"
+label = "Qwen3.6-27B dense (NVFP4, unsloth)"
+default = false
+status = "measured"
+note = """\
+REFERENCE RUN 2026-08-14, dgx-00, binary feat/video-support @ 5a22d7ce: PASS, 14/14 geometry \
+cells matched, 3/3 probes, 10/10 integrity legs, control held, 29.3 s. Geometry was IDENTICAL across all \
+three vision targets (49/121/192/220/576/576/920/405/1400/1/128/49/49/49 merged \
+tokens) -- token \
+count is a property of the preprocessor rather than the checkpoint, so agreement \
+across a dense NVFP4, an unsloth NVFP4 and an FP8 MoE is evidence the arithmetic is \
+right rather than a coincidence. * THIS is the checkpoint that exposed the resolver \
+defect. It ships processor_config.json and NO preprocessor_config.json, and Atlas read \
+only the latter -- so it declared 16777216 px under image_processor.size and was \
+served at the 1280px fallback with a 6400-patch encoder anyway. An earlier record here \
+said this checkpoint declared no bound; that was the missing reader, not the \
+checkpoint. With the fix it resolves 16.7M px, capacity clamps to 16384, and rung 09 \
+reports 1400 where the fallback produced 920 -- the gate catching exactly the class of \
+defect it was built for, on a real model rather than in a unit test."""
+
+[benchmarks.metrics.geometry_matched]
+min = 14.0
+
+[benchmarks.metrics.geometry_asserted]
+min = 14.0
+
+[benchmarks.metrics.integrity_passed]
+min = 10.0
+
+[benchmarks.metrics.integrity_measured]
+min = 10.0
+
+[benchmarks.metrics.probes_passed]
+min = 3.0
+
+[benchmarks.metrics.control_held]
+min = 1.0
+
+# --- video-fidelity --------------------------------------------------------
+# The second video target, added after a measured run rather than by analogy
+# with qwen3.8-27b. See that target's entry for what each leg asserts and why
+# the reversed clip is the one that matters.
+#
+# ★ REQUIRES FFMPEG ON THE SERVER for every container except GIF — and the
+# serve must be started with `--video-allow-ffmpeg`, which the subprocess
+# decoder is gated behind. The recipe above pins `video_allow_ffmpeg: true`
+# (added 2026-08-15) so the certified self-start gets it; without that pin
+# every MP4 leg 400'd and the gate went red, and `--serve-override` could not
+# rescue it because it refuses keys absent from the recipe's defaults.
+# Without the flag the MP4 legs SKIP at the benchmark level (never fail), but
+# a skip can only degrade a MANUAL run gracefully — this GATE still goes red,
+# because the thresholds below demand all 13 legs and 0 skips. That is
+# deliberate: a certified record must exercise the MP4 path.
+#
+# RESOLVED 2026-08-15, and the answer was the second one. On 2026-08-14 the
+# 35B scored 12/13, failing `video-before-image` with [yellow, green, blue]
+# where [red, green, blue, yellow] was expected, while reading the clip
+# correctly in every other arrangement — and the open question was whether
+# that was a model-capacity limit on the A3B MoE or an ordering defect that
+# only surfaces there. It was an ORDERING DEFECT, present on all three
+# targets: media travelled as one list per modality, so a video sent before an
+# image was rendered after it. The dense targets recovered from the
+# contradiction and the A3B did not, which is the only reason it looked
+# checkpoint-specific. Fixed, and the 35B now declares this gate itself.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "unsloth/Qwen3.6-27B-NVFP4"
+gate = "video-fidelity"
+recipe = "qwen3.6/qwen3.6-27b-nvfp4-unsloth"
+label = "Qwen3.6-27B dense (NVFP4, unsloth)"
+# `default = true` since 2026-08-15 — this target is now the gate's required
+# subject, taking it from qwen3.8-27b. Reason in full in that target's entry:
+# its `video-before-image` result moves with serve config (13/13 manual,
+# 12/13 under its own recipe) while this target passes 13/13 solidly, so it
+# is the instrument that measures the video pipeline rather than a model's
+# edge. Thresholds on both entries are unchanged.
+default = true
+status = "measured"
+note = """\
+REFERENCE RUN 2026-08-14, dgx-00, binary feat/video-support: PASS, 13/13 legs, 0 \
+skipped, control held. Confirms video is not specific to the Qwen3.8 checkpoint — all \
+three vision targets declare <|video_pad|> 248057 and share the Qwen3-VL temporal \
+geometry, and this one decodes, groups and orders a clip identically. `default = \
+false`: qwen3.8-27b owns this gate's default serve."""
+
+[benchmarks.metrics.legs_passed]
+min = 13.0
+
+[benchmarks.metrics.legs_skipped]
+max = 0.0
+
+[benchmarks.metrics.control_held]
+min = 1.0

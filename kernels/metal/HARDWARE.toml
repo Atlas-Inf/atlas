@@ -1,0 +1,13 @@
+[hardware]
+name = "metal"
+vendor = "apple"
+# `arch` is forwarded to xcrun via `-std=metal3.1`. Apple Silicon M2+
+# fully supports Metal 3.1 including bfloat and simdgroup_matrix<bfloat>.
+arch = "metal3.1"
+device_family = "apple7"
+# Tuning hint, not authoritative — actual bandwidth probed at runtime.
+# M2 Pro reference; M3/M4 are higher.
+memory_bandwidth_gbps = 200
+memory_type = "LPDDR5"
+# Apple Silicon UMA — the OOM watchdog reads true free memory at runtime.
+memory_gb = 16

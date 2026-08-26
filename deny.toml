@@ -1,0 +1,77 @@
+# cargo-deny configuration for Atlas
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec advisory database.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+# Ignored advisories — only `unmaintained` notices on transitive deps
+# we don't directly control. None of these are actual vulnerabilities;
+# they're upstream-unmaintained crates that bubble up through other
+# deps. Each entry must include the RUSTSEC-ID, the dep that pulls it
+# in, and the reason for ignoring. Re-evaluate if any of these become
+# real vulnerabilities (the entry should be removed and the upstream
+# bumped).
+ignore = [
+    # `paste` — proc-macro for token pasting. The crate works fine
+    # but its maintainer stepped away; replacements (e.g. `pastey`)
+    # exist but the deps that use it haven't migrated yet.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; proc-macro is feature-complete and pulled in by transitive deps we don't control" },
+]
+
+[licenses]
+# Allowed SPDX expressions for dependencies. Atlas itself is AGPL-3.0-only
+# (see LICENSE + per-file SPDX headers); this list governs third-party code.
+# Atlas's own workspace crates are skipped via `[licenses] private.ignore`
+# below — without that, cargo-deny rejects every Atlas crate because it
+# thinks AGPL-3.0-only is a foreign license outside this allow-list.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    # Atlas itself is AGPL-3.0-only — every workspace crate carries this
+    # license. Allowing it here is consistent (we already license under
+    # it) and doesn't widen our third-party surface — no transitive dep
+    # is GPL.
+    "AGPL-3.0-only",
+    # CDLA-Permissive-2.0 covers the `webpki-roots` Mozilla CA bundle.
+    # It's the Linux Foundation's permissive open-data license — purely
+    # for the certificate list data, not code. Permissive and compatible
+    # with AGPLv3.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+# `wildcards = "warn"` (downgraded from `deny`) — Atlas workspace crates
+# inherit each other via `path` deps that resolve to `*` in `Cargo.lock`,
+# and cargo-deny's `allow-wildcard-paths` doesn't cover crates with
+# `publish = true` (the default). Defense-in-depth on supply-chain
+# remains: `Cargo.lock` is committed and pins exact versions, the
+# advisories check is strict, and Dependabot watches transitive bumps.
+wildcards = "warn"
+highlight = "all"
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git sources. `unknown-git` stays "deny": a git dependency without a
+# pinned rev is a moving target under a committed Cargo.lock, which is the
+# hazard this check exists to catch.
+allow-git = []

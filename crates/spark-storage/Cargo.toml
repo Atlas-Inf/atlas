@@ -1,0 +1,68 @@
+[package]
+name = "spark-storage"
+version = "1.0.0-beta-preview"
+edition = "2024"
+license.workspace = true
+description = "Atlas: high-speed NVMe-backed KV cache offload (cuFile/GDS + io_uring)"
+
+[features]
+default = ["cuda"]
+# `cuda` gates the cuda_min/module/graph + high-speed-swap stack. It also pulls
+# in spark-runtime for the RDMA weight loader (`weight_tier_rdma`), which builds
+# a `spark_runtime::weights::WeightStore` — the only reason spark-storage touches
+# spark-runtime (acyclic: spark-runtime does not depend on spark-storage). The
+# `metal` arm stays empty: spark-storage's job (NVMe → HBM via cuFile/GDS) isn't
+# reachable on Apple Silicon UMA, so under metal the crate compiles down to the
+# pure-config / type modules only (the weight_peer WIRE types included).
+cuda = ["dep:spark-runtime", "spark-runtime/cuda"]
+metal = []
+
+[dependencies]
+cufile-sys = { path = "../cufile-sys" }
+# Only for `atlas_core::safetensors` — the shared `data_offsets` validation the
+# weight-peer manifest builder and `spark_runtime::fast_weights` must agree on.
+# `default-features = false` drops atlas-core's cuda default so a lean
+# (non-CUDA) peer build doesn't pull cudarc in through this edge.
+atlas-core = { workspace = true, default-features = false }
+atlas-tier = { workspace = true }
+atlas-rdma = { workspace = true }
+# Only for the cuda-gated RDMA weight loader (see the `cuda` feature note). The
+# non-cuda peer server + wire types never touch it, so it stays optional and a
+# lean peer build (default-features = false) doesn't pull it.
+spark-runtime = { path = "../spark-runtime", optional = true, default-features = false }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = "0.1"
+half = "2"
+rand = "0.8"
+rand_chacha = "0.3"
+rand_distr = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# io-uring is Linux-only — macOS is `cfg(unix)` but lacks the syscall layer
+# (uses kqueue instead). Gating on `target_os = "linux"` lets the rest of
+# spark-storage compile-check on Apple Silicon, even though the NVMe-swap
+# code paths that actually need io-uring won't be reachable there.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[[example]]
+name = "gds-probe"
+path = "examples/gds_probe.rs"
+
+[[example]]
+name = "iouring-bench"
+path = "examples/iouring_bench.rs"
+
+[[example]]
+name = "long-context-bench"
+path = "examples/long_context_bench.rs"
+
+[lints]
+workspace = true

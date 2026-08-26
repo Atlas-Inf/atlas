@@ -1,0 +1,30 @@
+*.webm filter=lfs diff=lfs merge=lfs -text
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.mov filter=lfs diff=lfs merge=lfs -text
+
+# ...EXCEPT the video-benchmark fixtures, which are 2-4 KB each and are
+# `include_bytes!`d into the binary. Under the blanket rule above, a checkout
+# without git-lfs compiled the 130-byte POINTER TEXT into the binary as though
+# it were an MP4: the video gate then failed or SKIPPED every MP4 leg — and a
+# skipped leg reads far less alarming than a broken one. That made the build
+# depend on LFS being installed and pulled, which for four kilobytes buys
+# nothing. `provision_tests::each_clip_really_is_the_container_it_claims`
+# checks the magic bytes and is what catches a regression here.
+#
+# The 6 MB assets/atlas-demo.mp4 is deliberately NOT exempted — it is what the
+# blanket rule is for.
+crates/atlas-plugin/assets/video/*.mp4 -filter -diff -merge -text
+tests/fixtures/videos/*.mp4 -filter -diff -merge -text
+
+# Append-style files that every feature PR touches (changelog entry, model-support
+# row). Without this, each merge to main conflicts the other open PRs on these files.
+# `merge=union` keeps both sides' added lines instead of emitting a conflict.
+# (Union may duplicate a line if two PRs edit the exact same one — harmless, de-dup at release.)
+CHANGELOG.md merge=union
+README.md merge=union
+
+# `ledger.rs` documents this and nothing declared it: two PR branches that each
+# carry a harvested ledger line would otherwise CONFLICT on append-only files.
+# Union keeps both sides' lines, and `Journey::deduplicated` collapses any
+# duplicate on read — identity excludes `at`, so a replay converges.
+governance/*.jsonl merge=union

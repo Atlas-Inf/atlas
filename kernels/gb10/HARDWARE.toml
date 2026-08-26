@@ -1,0 +1,8 @@
+[hardware]
+name = "gb10"
+vendor = "nvidia"
+arch = "sm_121f"
+compute_capability = "12.1"
+memory_bandwidth_gbps = 273
+memory_type = "LPDDR5X"
+memory_gb = 120

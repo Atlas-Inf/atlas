@@ -1,0 +1,201 @@
+# ⚠ LEGACY TARGET (accepted 2026-08-04): this kernel set is unreachable in
+# the standard multi-target build. The only checkpoint in the fleet
+# (Sehyo/Qwen3.5-35B-A3B-NVFP4, this MODEL.toml's own hf_id) enables MRoPE,
+# which dispatch.rs rewrites to model_type "qwen3_6_moe" — matching
+# qwen3.6-35b-a3b's exact `(qwen3_6_moe, 2048)` entry, not this target's
+# `(qwen3_5_moe, None)` wildcard. Its KERNEL.toml module map is identical to
+# qwen3.6-35b-a3b's (diff-empty), and its three .cu files are a strict
+# subset of that target's four. It is retained for historical/recipe
+# reference; no `[expected_absent]` harvest applies because no checkpoint
+# can route here.
+[model]
+name = "qwen3.5-35b-a3b"
+hf_id = "Sehyo/Qwen3.5-35B-A3B-NVFP4"
+params = "35B"
+active_params = "3B"
+architecture = "Gated DeltaNet + Full Attention + MoE"
+
+layers_total = 40
+layers_linear_attention = 30
+layers_full_attention = 10
+layer_pattern = "3:1 (linear, linear, linear, full)"
+
+moe_experts = 256
+moe_topk = 8
+moe_intermediate = 512
+shared_expert_intermediate = 512
+
+hidden_dim = 2048
+head_dim = 256
+q_heads = 16
+kv_heads = 2
+
+linear_attn_key_heads = 16
+linear_attn_key_dim = 128
+linear_attn_value_heads = 32
+linear_attn_value_dim = 128
+linear_conv_kernel = 4
+
+vocab_size = 248320
+max_position_embeddings = 262144
+rope_theta = 10000000
+partial_rotary_factor = 0.25
+attn_output_gate = true
+
+mtp_layers = 1
+mtp_type = "full_attention"
+vision = true
+
+# Effective context for agentic tasks (tokens). Server-side compaction
+# triggers when prompt exceeds 50% of this value. The 35B hybrid SSM
+# (30 GDN + 10 attention layers) has ~16-24K effective context for tool
+# calling despite 256K positional budget.
+effective_context = 24576
+
+# Recommended sampling defaults per category.
+#
+# 2026-05-24 EMPIRICAL REVERT: same lesson as Qwen3.6-35B-A3B —
+# Qwen card's pres=1.5 / temp=1.0 caused max_tokens-overrun wandering
+# and tool-call regressions on agentic clients. Reverted to the
+# band-aid pattern that produced a clean opencode session. The
+# elaborate `[sampling.tools]` LZ+DRY stack below was already
+# well-tuned by Atlas team prior — kept verbatim.
+[sampling.thinking_text]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0  # 2026-06-06: 1.1->1.0 — matches this file's own L100 principle + qwen3.6-35b campaign
+dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0 — campaign temp=0 finding (DRY+rep_pen mangled output)
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0  # 2026-06-06: 1.1->1.0 — matches this file's own L100 principle + qwen3.6-35b campaign
+dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0 — campaign temp=0 finding (DRY+rep_pen mangled output)
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0  # 2026-06-06: 1.1->1.0 — matches this file's own L100 principle + qwen3.6-35b campaign
+dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0 — campaign temp=0 finding (DRY+rep_pen mangled output)
+
+# Tool-calling preset. Sourced from the Qwen/Qwen3.5-35B-A3B HF model
+# card. (temperature, top_p, top_k) track the Thinking/Coding row
+# because opencode-style agentic coding matches that distribution
+# closer than Instruct/General.
+#
+# `presence_penalty = 1.5` is Qwen's OFFICIAL remediation for the
+# "endless repetitions" failure mode — direct quote from the card:
+#   "you can adjust the presence_penalty parameter between 0 and 2 to
+#    reduce endless repetitions. However, using a higher value may
+#    occasionally result in language mixing and a slight decrease in
+#    model performance."
+#
+# Without it, on the A3B hybrid (30 GDN SSM + 10 full-attention)
+# the model falls into `\`\`\`bash cmd \`\`\`` markdown-fence narration
+# loops at turn ~7-8 of opencode agentic sessions, even though
+# temperature > 0 prevents strictly-greedy loops. Observed in dump
+# seq=19 (2026-04-24); tracked upstream in QwenLM/Qwen3.5#115,
+# Qwen3.6#88, qwen-code#1403, vllm#27157. The repetition suppressor
+# on the tools preset (`presence_penalty` below) is the mitigation.
+#
+# We do NOT raise `repetition_penalty` above 1.0 — Qwen deprecates it
+# for this SKU (Qwen3-VL#1611: "breaks the transcription of naturally
+# repetitive text" — e.g. legitimate variable names in code).
+[sampling.tools]
+# Anti-repetition stack (2026-04-25, A.1 from fuzzy-imagining-lemur plan).
+#
+# Combined: LZ penalty (information-theoretic, scales with match
+# length × frequency) + DRY (fixed-length n-gram suppression with
+# breakers). Both target n-gram repeats but at different scales:
+# - LZ: 3/4/5-gram windows over last 256 tokens, frequency-weighted
+# - DRY: longest-match exponential, sequence-break aware
+#
+# Lowered `presence_penalty` 1.5 → 0.6 (vendor-recommended floor): the
+# 2025-12 production-repetition survey (arXiv:2512.04419) finds 1.5
+# hurts long agentic responses by suppressing legitimate token reuse
+# in code/JSON. LZ penalty (arXiv:2504.20131) replaces the heavy work
+# of presence_penalty — it's a per-extension penalty, not flat-per-
+# unique-token, so it correctly distinguishes "phrase loop" from
+# "legitimate vocabulary reuse" without the 1.5-presence regression.
+# Active when `lz_penalty > 0`. SGLang ships a vectorized reference
+# at strength=0.2, lossless on AIME/GPQA.
+#
+# DRY remains: `allowed_length=4` lets short legit repeats through
+# (variable names, identifiers) but catches the bash-fence narration
+# attractor at ≥5-token matches.
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.6
+frequency_penalty = 0.0
+lz_penalty = 0.2
+dry_multiplier = 0.8
+dry_base = 1.75
+dry_allowed_length = 4
+
+# Model-specific behavior overrides. These control server-side hacks that
+# compensate for model quirks. Defaults are sane for most models; override
+# here when a model family has known failure modes.
+[behavior]
+# Content-loop watchdog disabled: 2026-05-05 chess-game stress
+# sweep showed this MoE A3B variant finishes cleanly on long-code
+# prompts (no period-N repetition observed). The watchdog also
+# false-positives on legitimate `[null × 8]` chess-board init rows.
+# Only the dense Qwen 27B variants need it.
+enable_loop_watchdog = false
+# Thinking on by default for all Qwen reasoning-tier models (sweep 2026-05-20).
+thinking_default = true
+# 2026-05-23 sweep: false → true. Project-wide default flipped after F1
+# reflection-penalty removal (the documented cause of the Qwen3.6-35B
+# <tool_call>-inside-<think> attractor that motivated the original
+# "Think-Satisfy" disablement). Qwen3.5-35B-A3B shares the same family
+# distribution so the fix likely transfers; revert here per-model if
+# Think-Satisfy re-emerges in practice.
+thinking_in_tools = true
+# 2026-05-23 sweep: 256 → 2048. F54 lowered to 256 to avoid the long-
+# thinking BPE state corruption observed in opencode-fix36; that
+# corruption was traced to the same XML-leak path F1 was masking, now
+# fixed by the F1 deletion in Qwen3.6 work. Raise back to the project-
+# wide reasoning headroom default.
+max_thinking_budget = 2048
+# Default num_drafts for speculative decoding (K = num_drafts + 1).
+# Benchmarked 2026-04-10 on GB10: K=2 (1 draft) yields 117.8 tok/s vs
+# K=3 (2 drafts) at 82.4 tok/s — 43% faster. The MoE verify overhead
+# dominates any acceptance-rate gain at K=3 for this 35B-A3B model.
+default_num_drafts = 1
+
+[[model_types]]
+model_type = "qwen3_5_moe"
+
+# ── Mixed-precision dtype schedule (C.3, 2026-04-25, pending impl) ──
+#
+# Per EAQuant + NVIDIA Transformer Engine 2.14 guidance: in MoE
+# models, sensitivity to quantization is concentrated in (1) the
+# router layer, (2) the LM head, and (3) the first 1-2 transformer
+# blocks + the last 2-3 blocks. Keeping these in BF16 / FP8 while
+# remaining experts run in NVFP4 closes >50% of the quantization gap
+# at minimal memory cost (router is hidden×n_experts ≈ 2048×128 ≈
+# 524KB BF16; LM head is hidden×vocab ≈ 2048×152K ≈ 597MB BF16).
+#
+# Activation requires `weight_loader` to honour per-layer dtype
+# overrides. Pre-stage configuration (commented out until loader
+# wiring lands):
+#
+#   [precision]
+#   router_dtype = "bf16"          # MoE gate weights
+#   lm_head_dtype = "bf16"         # final unembedding
+#   sensitive_block_dtype = "fp8"  # blocks 0,1 and N-2,N-1
+#   sensitive_block_indices = [0, 1, 38, 39]  # for 40-layer model
+#   default_dtype = "nvfp4"        # everything else
+
+[kernel]
+moe_gate_shmem_bytes = 4096   # hidden_dim(2048) * sizeof(bf16)

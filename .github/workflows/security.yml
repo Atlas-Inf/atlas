@@ -1,0 +1,55 @@
+name: Security Audit
+
+# Read-only by default; jobs needing more grant it themselves.
+permissions:
+  contents: read
+
+on:
+  # Manually runnable. During the 2026-08-06 Actions incident, webhook triggers
+  # were throttled to aid recovery, so pushes stopped creating runs at all --
+  # and with no dispatch trigger there was no way to ask for one. A check that
+  # can only be started by an event you do not control is a check you cannot
+  # get a verdict from when you most need it.
+  workflow_dispatch:
+  # No path filter on pull_request: cargo deny is a required check, and a
+  # path-filtered required check never reports on PRs outside its paths
+  # (kernel-only diffs), leaving them permanently "expected" and unmergeable.
+  # The job itself takes well under a minute.
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+  # Merge queue: `cargo deny` is in the required set the queue waits on, and
+  # queue commits (temporary gh-readonly-queue/** merge-commits) fire none of
+  # the events above. Unfiltered, same as pull_request — a path-filtered
+  # required check never reports on entries outside its paths, and the entry
+  # would hang until the queue's check timeout ejects it.
+  merge_group:
+  schedule:
+    # Weekly on Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: security-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # `rust-version` pins the action's in-container toolchain to our
+      # rust-toolchain.toml channel. Without it, the action's bundled Rust
+      # can't honor the repo pin and rustup errors ("override toolchain
+      # '1.93.1' is not installed") before cargo-deny runs. Keep this in sync
+      # with rust-toolchain.toml. (cargo-deny is metadata-only — it audits the
+      # pinned Cargo.lock and does not compile the workspace — so the toolchain
+      # is about consistency with the repo pin, not the audit result.)
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          rust-version: "1.93.1"
+          command: check advisories licenses sources bans

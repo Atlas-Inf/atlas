@@ -1,0 +1,437 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! K=2 verify path.
+//!
+//! ## Safety
+//!
+//! `unsafe { from_raw_parts(...) }` blocks reinterpret stack arrays
+//! / `Vec`s of POD integers as byte slices for H2D upload.
+//! See `verify_c.rs` module docs for the full safety contract.
+
+#![allow(unused_imports, dead_code, clippy::too_many_arguments)]
+
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::{Result, bail};
+use atlas_core::config::{LayerType, ModelConfig};
+use spark_runtime::buffers::BufferArena;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::kv_cache::PagedKvCache;
+
+use super::super::block_mgmt::{
+    apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
+    extract_layer_refs, reuse_prefix_match_disk_ids,
+};
+use super::super::ssm_pool::SsmStatePool;
+use super::super::ssm_snapshot::SsmSnapshotPool;
+use super::super::types::{PinnedMetaStaging, TransformerModel};
+use crate::layer::{
+    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
+};
+use crate::layers::ops;
+use crate::speculative::DraftProposer;
+use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
+use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
+
+impl TransformerModel {
+    pub(super) fn decode_verify_graphed_dispatch(
+        &self,
+        tokens: &[u32; 2],
+        seq: &mut SequenceState,
+        _stream: u64,
+    ) -> Result<[u32; 2]> {
+        let stream = self.gpu.default_stream();
+        let h = self.config.hidden_size;
+        let bf16 = 2usize;
+        let fp32 = 2usize;
+        let k = 2usize;
+
+        // Item #2 (STree-style in-place K=2 verify): `h_state` IS canonical
+        // — the verify kernel reads/writes it directly and the commit
+        // (`commit_accepted_prefix`) rewinds it in place on reject. There is
+        // no scratch/canonical split to seed, so the legacy SpecMamba
+        // dual-buffer pre-verify copy (~60 MB h_state + conv D2D per K=2
+        // step) is gone. The CUDA-graph capture below is unaffected: the
+        // captured nodes take the same `h_state` pointer, which never moves.
+        // (K=3/K=4/DFlash verify share the same in-place convention.)
+
+        let hidden = self.buffers.hidden_states();
+        let residual = self.buffers.residual();
+
+        let mut kv_cache = self.kv_cache.lock();
+
+        // ── Phase 1: Pre-graph (varies per step, NOT captured) ──
+
+        // 1a. Embed 2 tokens
+        self.embed(tokens[0], hidden, stream)?;
+        self.embed(tokens[1], hidden.offset(h * fp32), stream)?;
+
+        // 1b. Allocate KV blocks for both positions
+        let bs = kv_cache.block_size();
+        for t in 0..k {
+            let pos = seq.seq_len + t;
+            let blocks_needed = (pos / bs) + 1;
+            ensure_blocks_through_decode(
+                seq,
+                blocks_needed - 1,
+                &mut kv_cache,
+                self.prefix_cache.as_ref(),
+                self.gpu.as_ref(),
+                stream,
+                self.levers.kv_poison,
+            )?;
+        }
+
+        // 1c. Upload 2-entry attention metadata (same layout as batch decode)
+        let meta_base = self.buffers.scratch().offset(32768);
+        let max_blocks = self.max_blocks_per_seq;
+
+        // Zero-alloc metadata upload: cast stack arrays to byte slices directly.
+        let positions = [seq.seq_len as u32, (seq.seq_len + 1) as u32];
+        // SAFETY: `positions` is the `[u32; 2]` literal on the line above —
+        // a fully-initialised local whose size is 2 * 4 = 8, exactly the byte
+        // length requested. `u32` is POD (no padding, every bit pattern
+        // valid), so the `&[u8]` view is sound, and `positions` is live for
+        // the whole function so the borrow outlives the H2D enqueue below.
+        let pos_bytes = unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, 8) };
+        self.gpu.copy_h2d_async(pos_bytes, meta_base, stream)?;
+
+        let mut slots = [0i64; 2];
+        for t in 0..k {
+            let pos = seq.seq_len + t;
+            let block_idx = pos / bs;
+            let block_offset = pos % bs;
+            // Fall back to the dummy scratch block, NOT block 0: physical
+            // block 0 is a live (likely shared prefix-cache) block, and a
+            // silent write there corrupts cached KV for every reader.
+            let physical_block = seq.physical_block_for(block_idx).unwrap_or_else(|| {
+                tracing::error!(
+                    "verify_k2: no physical block for pos {pos} (block_table len {}); \
+                     writing KV to dummy block",
+                    seq.block_table.len(),
+                );
+                self.dummy_kv_block
+            });
+            slots[t] = (physical_block as i64) * (bs as i64) + (block_offset as i64);
+        }
+        // SAFETY: `slots` is the `[0i64; 2]` declared above and zero-init at
+        // declaration (the `for t in 0..k` loop with `k == 2` then overwrites
+        // both elements, so no element is even logically stale). Its size is
+        // 2 * 8 = 16, exactly the byte length requested; `i64` is POD.
+        let slot_bytes = unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, 16) };
+        self.gpu
+            .copy_h2d_async(slot_bytes, meta_base.offset(256), stream)?;
+
+        let seq_lens = [(seq.seq_len + 1) as i32, (seq.seq_len + 2) as i32];
+        // SAFETY: `seq_lens` is the `[i32; 2]` literal on the line above, so
+        // its size is 2 * 4 = 8 — exactly the byte length requested. `i32` is
+        // POD and the local outlives this borrow.
+        let sl_bytes = unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, 8) };
+        self.gpu
+            .copy_h2d_async(sl_bytes, meta_base.offset(512), stream)?;
+
+        // Block table: K rows with same content (same physical sequence).
+        let mb = max_blocks as usize;
+        let needed = k * mb;
+        let mut bt_buf_vec;
+        let mut bt_buf_stack = [0i32; 1024];
+        let bt_buf: &mut [i32] = if needed <= 1024 {
+            &mut bt_buf_stack[..needed]
+        } else {
+            bt_buf_vec = vec![0i32; needed];
+            &mut bt_buf_vec
+        };
+        for row in 0..k {
+            for (j, &block) in seq.block_table.iter().enumerate().take(mb) {
+                bt_buf[row * mb + j] = block as i32;
+            }
+        }
+        // SAFETY: `bt_buf.len() == needed` in BOTH arms of the `if needed <=
+        // 1024` above — the stack arm slices `bt_buf_stack[..needed]` and the
+        // heap arm is `vec![0i32; needed]`, whose LEN (not just capacity) is
+        // `needed`. So `needed * 4 == size_of_val(bt_buf)`, never past the
+        // end and never over a `Vec`'s uninitialised spare capacity. Both
+        // arms are zero-initialised before the `for row in 0..k` fill, so
+        // every byte read is initialised even when `block_table.len() < mb`.
+        let bt_bytes =
+            unsafe { std::slice::from_raw_parts(bt_buf.as_ptr() as *const u8, needed * 4) };
+        self.gpu
+            .copy_h2d_async(bt_bytes, meta_base.offset(768), stream)?;
+
+        // Request-scoped LoRA routing (graphed verify). One sequence → one
+        // adapter for all K tokens: a [K]-all-equal buffer at the free +128 gap
+        // (multi-seq layout slot@+256/seq_len@+512/bt@+768, so +128+K*4 ≤ +256
+        // needs K ≤ 32). Uploaded pre-`begin_capture` (same phasing as
+        // positions), so the captured verify graph reads a stable address whose
+        // contents refresh each step. The non-HSS `decode_multi_seq` routes off
+        // this [K] buffer; the HSS `decode_batched` single-token loop reads
+        // index 0 (correct for the uniform buffer). `DevicePtr(0)` (no pool) →
+        // installed-pair fallback.
+        debug_assert!(k <= 32, "verify seq_slot +128 gap holds K ≤ 32");
+        let seq_slot =
+            self.upload_seq_slot_uniform(seq.adapter_slot, k, meta_base.offset(128), stream)?;
+
+        let metadata = AttnMetadataDev {
+            positions: meta_base,
+            positions_h: meta_base,
+            positions_w: meta_base,
+            slot: meta_base.offset(256),
+            seq_len: meta_base.offset(512),
+            block_table: meta_base.offset(768),
+            max_blocks_per_seq: max_blocks,
+            num_seqs: k as u32,
+            seq_slot,
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
+        };
+
+        // CUDA graphs cannot capture NCCL all-reduce (disabled for EP).
+        // Also disable for FP8 native: w8a16_gemv kernel's __shared__ LUT load
+        // has CUDA graph capture compatibility issues.
+        //
+        // Honor `suppress_graphs` so FP8 KV calibration runs eagerly during
+        // warmup (its observe() does host syncs that are illegal inside CUDA
+        // graph capture — CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, status 900).
+        // With MTP, every decode step lands here (regular `decode` is never
+        // called), so we also drive the same auto-unsuppress trigger that
+        // `decode` uses, keyed on the ACTUAL frozen flag. Also now guarded by
+        // `fp8_kv_calibration_tokens > 0`, matching `decode_dispatch`: without
+        // that guard, a process whose graphs were suppressed for a DIFFERENT
+        // reason (EP, profile — calibration_tokens == 0, so the old
+        // `seq_len > 0 + 10` was true almost immediately) had its suppression
+        // silently undone here after ten tokens.
+        if self.config.fp8_kv_calibration_tokens > 0
+            && self
+                .suppress_graphs
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && self.fp8_calibration_frozen()
+        {
+            self.suppress_graphs
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("FP8 calibration frozen — re-enabling CUDA graphs (MTP verify)");
+        }
+        let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
+        // ATLAS_K2_DIAG=1 arms per-stage synchronize checkpoints inside
+        // forward_k2 to localize any illegal access on the batch2 verify path.
+        // Those host syncs are illegal under CUDA-graph capture
+        // (STREAM_CAPTURE_UNSUPPORTED, status 900), so the diagnostic must run
+        // the verify eagerly. Zero production impact — only when K2_DIAG is set
+        // (mirrors ATLAS_DFLASH_DEBUG_NO_GRAPH for the DFlash verify path).
+        let k2_diag_eager = std::env::var("ATLAS_K2_DIAG").ok().as_deref() == Some("1");
+        // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
+        let lora_eager = self.lora.is_some() && self.levers.lora_eager;
+        let use_graphs = self.comm.is_none()
+            && !self
+                .suppress_graphs
+                .load(std::sync::atomic::Ordering::Relaxed)
+            // Phase 6.2.c — see decode() for rationale: HSS path's host I/O is
+            // illegal under CUDA graph capture.
+            && !hss_engaged
+            && !k2_diag_eager
+            && !lora_eager;
+
+        // DeepSeek-V4 hash-MoE (first `num_hash_layers`) routes experts by token
+        // id via the static tid2eid table, so the verify forward needs the 2
+        // verify tokens in the stable `token_ids` device buffer. Uploaded
+        // pre-graph (host→device is illegal under CUDA-graph capture); the graph
+        // then reads the stable device buffer. Mirrors `decode()`'s token_ids.
+        let tid_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.gpu
+            .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), stream)?;
+
+        let ctx = ForwardContext {
+            buffers: &self.buffers,
+            gpu: self.gpu.as_ref(),
+            config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
+            attn_metadata: Some(metadata),
+            profile: false,
+            comm: self.comm_ref(),
+            graph_capture: use_graphs,
+            gdn_exact_replay: false,
+            token_ids: Some(self.buffers.token_ids()),
+            routed_lora_layers: None, // #30: decode/verify never routes prefill.
+            midchunk_capture: None,
+            moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
+        };
+
+        // ── Phase 2: CUDA graph capture / replay ──
+
+        let mut graph_cache = if use_graphs {
+            Some(self.verify2_graph.lock())
+        } else {
+            None
+        };
+
+        // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
+        let cached_for_slot = graph_cache
+            .as_ref()
+            .and_then(|c| c.get(&seq.slot_idx).copied());
+        if let Some(graph) = cached_for_slot
+            && graph.0 != 0
+        {
+            self.gpu.launch_graph(graph, stream)?;
+        }
+        let need_run = cached_for_slot.is_none();
+        if need_run {
+            let seq_lens_vec: Vec<usize> = (0..k).map(|t| seq.seq_len + t).collect();
+            let block_tables_vec: Vec<Vec<u32>> = vec![seq.block_table.clone(); k];
+
+            // Extract layer states. Attention layers use EmptyLayerState (no actual
+            // state), so sharing the same alloc is safe. For SSM layers, only one
+            // sequence's state exists — pass it to decode_batched directly.
+            if use_graphs {
+                self.gpu.begin_capture(stream)?;
+            }
+
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let layer_type = self.config.layer_type(layer_idx);
+
+                if layer_type == LayerType::FullAttention {
+                    if hss_engaged {
+                        // HSS path: `decode_multi_seq` calls the production
+                        // paged-decode kernel which reads K/V from HBM only
+                        // (`meta.block_table`). Under HSS, HBM is capped to
+                        // `cache_blocks_per_seq` blocks, so older context
+                        // lives only on disk and is unreachable from the
+                        // multi-Q kernel — Q/V attends only over the recent
+                        // ~cap×bs tokens, missing the long-context history.
+                        // The single-token `decode` path routes through the
+                        // HSS orchestrator (`attend_layer_on_stream`) which
+                        // reads the full history from disk. Fall back to
+                        // `decode_batched` (N sequential single-token
+                        // decodes via the orchestrator) at the cost of
+                        // ~k× attention launches per verify step. Mirrors
+                        // the SSM branch below which already uses
+                        // decode_batched for the same correctness reason.
+                        layer.decode_batched(
+                            hidden,
+                            residual,
+                            k,
+                            seq.layer_states[layer_idx].as_mut(),
+                            &mut kv_cache,
+                            seq.seq_len,
+                            &mut seq.block_table,
+                            &mut seq.disk_block_ids,
+                            &mut seq.disk_last_offloaded_per_layer,
+                            &ctx,
+                            stream,
+                        )?;
+                    } else {
+                        // Attention: treat 2 tokens as 2 virtual sequences via
+                        // decode_multi_seq. EmptyLayerState has no actual state.
+                        let mut dummy_states: Vec<Box<dyn LayerState>> = (0..k)
+                            .map(|_| layer.alloc_state(self.gpu.as_ref()))
+                            .collect::<Result<_>>()?;
+                        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
+                            dummy_states.iter_mut().map(|s| s.as_mut()).collect();
+                        layer.decode_multi_seq(
+                            hidden,
+                            residual,
+                            k,
+                            &mut refs,
+                            &mut kv_cache,
+                            &seq_lens_vec,
+                            &block_tables_vec,
+                            &ctx,
+                            stream,
+                        )?;
+                    }
+                } else {
+                    // SSM: process K=2 tokens for one sequence via decode_batched.
+                    layer.decode_batched(
+                        hidden,
+                        residual,
+                        k,
+                        seq.layer_states[layer_idx].as_mut(),
+                        &mut kv_cache,
+                        seq.seq_len,
+                        &mut seq.block_table,
+                        &mut seq.disk_block_ids,
+                        &mut seq.disk_last_offloaded_per_layer,
+                        &ctx,
+                        stream,
+                    )?;
+                }
+                // DFlash hidden capture for ctx conditioning. Capture from
+                // the LAST verified position (K-1) — the bonus token in
+                // K=2. This populates `dflash_hidden_save` so the next
+                // `propose()` has fresh target hiddens. No-op when DFlash
+                // is disabled.
+                self.try_dflash_capture(layer_idx, k - 1, stream)?;
+            }
+
+            // Final norm [2, H]
+            let normed = self.buffers.norm_output();
+            ops::rms_norm(
+                self.gpu.as_ref(),
+                self.rms_norm_kernel,
+                hidden,
+                &self.final_norm,
+                normed,
+                k as u32,
+                h as u32,
+                self.config.rms_norm_eps as f32,
+                stream,
+            )?;
+
+            // LM head for 2 tokens (GEMM: weights loaded once)
+            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+
+            // Argmax inside graph (fixed scratch addresses — graph-safe)
+            let vocab = self.config.vocab_size;
+            let argmax_out = self.buffers.scratch();
+            for t in 0..k {
+                let logits_t = self.buffers.logits().offset(t * vocab * bf16);
+                let out_t = argmax_out.offset(t * 4);
+                ops::argmax_bf16(
+                    self.gpu.as_ref(),
+                    self.argmax_kernel,
+                    logits_t,
+                    out_t,
+                    vocab as u32,
+                    stream,
+                )?;
+            }
+
+            if use_graphs {
+                let graph = self.gpu.end_capture(stream)?;
+                if graph.0 != 0 {
+                    tracing::info!("Captured CUDA graph for K=2 verify (slot={})", seq.slot_idx);
+                    if let Some(ref mut cache) = graph_cache {
+                        cache.insert(seq.slot_idx, graph);
+                    }
+                    self.gpu.launch_graph(graph, stream)?;
+                }
+            }
+        }
+
+        // ── Phase 3: Post-graph (D2H copy only) ──
+
+        let out_ptr = self.buffers.scratch();
+        let mut buf = [0u8; 8];
+        self.gpu.copy_d2h(out_ptr, &mut buf)?;
+        let tok0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let tok1 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+        // EXPERIMENTAL: push ALL tokens (including tokens[0]) and advance
+        // seq_len by K. Prior logic (`seq_len += k-1`, push only tokens[1..])
+        // assumed tokens[0] was ALREADY in seq.tokens from a prior decode,
+        // but that precondition is VIOLATED in the MTP flow: scheduler's
+        // step_verify_k2 calls decode_verify_graphed([a.last_token, draft])
+        // where a.last_token = sampled-but-not-pushed token from prior
+        // bootstrap. Off-by-one accumulates across iterations and likely
+        // underlies 80B-nvfp4-mtp fib drift (positions misaligned → wrong
+        // RoPE → different logits → argmax flip on edge-case tokens).
+        for &t in tokens {
+            seq.tokens.push(t);
+        }
+        seq.seq_len += k;
+
+        Ok([tok0, tok1])
+    }
+}

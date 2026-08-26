@@ -1,0 +1,580 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Token sampling strategies.
+//!
+//! Phase 1: Greedy argmax (CPU-side D2H + argmax).
+//! Future: temperature, top-k, top-p, min-p, repetition penalty.
+
+use std::sync::atomic::Ordering;
+
+use crate::gpu::{DevicePtr, GpuBackend};
+use anyhow::Result;
+
+// The entropy gauges are fields of the single run mailbox,
+// `crate::run_metrics::RunMetrics` — see that module for why one static and
+// not none, and why it is cleared at run start.
+
+/// Read the most recent per-token entropy (nats).
+pub fn last_entropy() -> f32 {
+    f32::from_bits(
+        crate::run_metrics::metrics()
+            .last_entropy
+            .load(Ordering::Relaxed),
+    )
+}
+
+/// Total tokens with entropy < 0.3 (potential degeneration).
+pub fn low_entropy_token_count() -> u64 {
+    crate::run_metrics::metrics()
+        .low_entropy_tokens
+        .load(Ordering::Relaxed)
+}
+
+/// Total tokens sampled (for computing low-entropy ratio).
+pub fn total_sampled_token_count() -> u64 {
+    crate::run_metrics::metrics()
+        .total_sampled_tokens
+        .load(Ordering::Relaxed)
+}
+
+pub(super) fn record_entropy(entropy: f32) {
+    let m = crate::run_metrics::metrics();
+    m.last_entropy.store(entropy.to_bits(), Ordering::Relaxed);
+    m.total_sampled_tokens.fetch_add(1, Ordering::Relaxed);
+    if entropy < 0.3 {
+        m.low_entropy_tokens.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Sampling parameters for a request.
+#[derive(Debug, Clone)]
+pub struct SamplingParams {
+    /// Temperature (0.0 = greedy).
+    pub temperature: f32,
+    /// Top-k: keep only the k highest-probability tokens before sampling.
+    /// 0 = disabled (use all tokens).
+    pub top_k: u32,
+    /// Top-p (nucleus): keep smallest set of tokens whose cumulative probability >= p.
+    /// 1.0 = disabled.
+    pub top_p: f32,
+    /// Top-n-sigma: filter tokens in logit space before temperature scaling.
+    /// Keep only tokens with logit >= mean - n*sigma. Temperature-invariant.
+    /// 0.0 = disabled. Recommended: 1.0 for NVFP4 models.
+    pub top_n_sigma: f32,
+    /// Min-p: keep tokens with prob >= min_p * max_prob (post-softmax).
+    /// 0.0 = disabled. Recommended: 0.05-0.1.
+    pub min_p: f32,
+    /// Per-token logit bias: (token_id, bias_value) pairs.
+    /// Applied additively to raw logits before any filtering.
+    pub logit_bias: Vec<(u32, f32)>,
+    /// Repetition penalty: multiply logits of previously-seen tokens.
+    /// 1.0 = disabled. Recommended: 1.05-1.1.
+    pub repetition_penalty: f32,
+    /// Repetition penalty window: only consider the last N tokens.
+    /// 0 = full history (default). Recommended: 64 for long-form generation.
+    pub repetition_penalty_window: u32,
+    /// Presence penalty (OpenAI-style): flat additive penalty for each token that
+    /// appeared at least once. Range [-2.0, 2.0], 0.0 = disabled.
+    pub presence_penalty: f32,
+    /// Frequency penalty (OpenAI-style): additive penalty proportional to occurrence
+    /// count. Range [-2.0, 2.0], 0.0 = disabled.
+    pub frequency_penalty: f32,
+    /// LZ penalty: penalize tokens that extend repeated n-gram patterns.
+    /// 0.0 = disabled. 1.0 = moderate (default). Based on arXiv:2504.20131.
+    pub lz_penalty: f32,
+    /// DRY (Don't Repeat Yourself) penalty multiplier. From llama.cpp.
+    /// Uses Z-algorithm O(n) sequence matching with exponential penalty.
+    /// 0.0 = disabled. Recommended: 0.8.
+    pub dry_multiplier: f32,
+    /// DRY penalty base for exponential scaling. penalty = multiplier * base^(match_len - allowed_len).
+    /// Recommended: 1.75.
+    pub dry_base: f32,
+    /// DRY minimum match length before penalty applies. Sequences shorter than this are ignored.
+    /// Recommended: 2.
+    pub dry_allowed_length: u32,
+    /// DRY sequence breaker token IDs. Delimiters (newlines, colons, quotes, braces) that
+    /// reset sequence tracking. Critical for JSON/tool call output where structural tokens repeat.
+    pub dry_sequence_breakers: Vec<u32>,
+    /// Maximum tokens to generate.
+    pub max_tokens: usize,
+    /// Stop token IDs.
+    pub stop_token_ids: Vec<u32>,
+    /// Seed for deterministic sampling. When Some, the RNG is seeded with this
+    /// value for reproducible output. None = non-deterministic (thread_rng).
+    pub seed: Option<u64>,
+}
+
+impl SamplingParams {
+    /// Greedy sampling with a max token limit.
+    pub fn greedy(max_tokens: usize) -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            top_n_sigma: 0.0,
+            min_p: 0.0,
+            logit_bias: Vec::new(),
+            repetition_penalty: 1.0,
+            repetition_penalty_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            lz_penalty: 0.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_sequence_breakers: Vec::new(),
+            max_tokens,
+            stop_token_ids: Vec::new(),
+            seed: None,
+        }
+    }
+
+    pub fn is_greedy(&self) -> bool {
+        self.temperature == 0.0
+    }
+}
+
+/// Sampler that picks tokens from logits.
+pub struct Sampler {
+    /// Reusable host buffer for BF16 logits D2H copy.
+    logits_host: Vec<u8>,
+    /// FP32 expanded logits for accurate sampling.
+    logits_f32: Vec<f32>,
+    /// Vocab size.
+    vocab_size: usize,
+}
+
+impl Sampler {
+    pub fn new(vocab_size: usize) -> Self {
+        let logits_host = vec![0u8; vocab_size * 2]; // BF16 from GPU
+        let logits_f32 = vec![0.0f32; vocab_size]; // FP32 for sampling
+        Self {
+            logits_host,
+            logits_f32,
+            vocab_size,
+        }
+    }
+
+    /// Copy BF16 logits from GPU, expand to FP32, return FP32 slice.
+    fn fetch_logits_f32(&mut self, logits_ptr: DevicePtr, gpu: &dyn GpuBackend) -> Result<&[f32]> {
+        let byte_len = self.vocab_size * 2;
+        gpu.copy_d2h(logits_ptr, &mut self.logits_host[..byte_len])?;
+        // BF16 → FP32 expansion: full precision for sampling
+        for i in 0..self.vocab_size {
+            self.logits_f32[i] = bf16_to_f32(self.logits_host[i * 2], self.logits_host[i * 2 + 1]);
+        }
+        Ok(&self.logits_f32[..self.vocab_size])
+    }
+
+    /// Sample a token from logits on the GPU.
+    ///
+    /// `logits_ptr` points to `[vocab_size]` BF16 values on device.
+    /// Reads BF16, expands to FP32, then samples with full precision.
+    pub fn sample(
+        &mut self,
+        logits_ptr: DevicePtr,
+        params: &SamplingParams,
+        gpu: &dyn GpuBackend,
+    ) -> Result<u32> {
+        if params.is_greedy() {
+            // Greedy: BF16 argmax is fine (argmax is robust to BF16 quantization)
+            let byte_len = self.vocab_size * 2;
+            gpu.copy_d2h(logits_ptr, &mut self.logits_host[..byte_len])?;
+            return Ok(argmax_bf16(&self.logits_host[..byte_len]));
+        }
+        // Stochastic: expand to FP32 for accurate sampling
+        let f32_logits = self.fetch_logits_f32(logits_ptr, gpu)?;
+        let f32_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, f32_logits.len() * 4)
+        };
+        Ok(sample_with_params(f32_bytes, params))
+    }
+
+    /// Sample a batch of tokens (one per sequence in the batch).
+    ///
+    /// `logits_ptr` points to [batch_size, vocab_size] BF16 values.
+    pub fn sample_batch(
+        &mut self,
+        logits_ptr: DevicePtr,
+        batch_size: usize,
+        params: &[&SamplingParams],
+        gpu: &dyn GpuBackend,
+    ) -> Result<Vec<u32>> {
+        let total_bytes = batch_size * self.vocab_size * 2; // BF16
+        if self.logits_host.len() < total_bytes {
+            self.logits_host.resize(total_bytes, 0);
+        }
+        gpu.copy_d2h(logits_ptr, &mut self.logits_host[..total_bytes])?;
+
+        let stride_bf16 = self.vocab_size * 2;
+        let mut tokens = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let start = i * stride_bf16;
+            let end = start + stride_bf16;
+            let p = params.get(i).copied().unwrap_or(params[0]);
+            tokens.push(if p.is_greedy() {
+                argmax_bf16(&self.logits_host[start..end])
+            } else {
+                // Expand BF16 → FP32 for accurate stochastic sampling
+                if self.logits_f32.len() < self.vocab_size {
+                    self.logits_f32.resize(self.vocab_size, 0.0);
+                }
+                for j in 0..self.vocab_size {
+                    self.logits_f32[j] = bf16_to_f32(
+                        self.logits_host[start + j * 2],
+                        self.logits_host[start + j * 2 + 1],
+                    );
+                }
+                let f32_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        self.logits_f32.as_ptr() as *const u8,
+                        self.vocab_size * 4,
+                    )
+                };
+                sample_with_params(f32_bytes, p)
+            });
+        }
+        Ok(tokens)
+    }
+}
+
+/// Sampling pipeline: repetition_penalty → top-n-sigma → temperature → top-k → softmax → min-p → top-p → sample.
+///
+/// `data` contains FP32 logits (4 bytes per element, little-endian).
+/// `token_history`: previous token IDs for repetition penalty (empty = no penalty).
+/// LZ penalty: penalize tokens that would extend repeated n-gram patterns
+/// in the recent token history. Based on arXiv:2504.20131.
+///
+/// For each candidate token that appears in the history, check if appending it
+/// creates a repeated 3/4/5-gram. Penalize proportional to n-gram length and
+/// frequency: `logit -= penalty * (ngram_len - 2) * count`.
+pub fn apply_lz_penalty(logits: &mut [f32], history: &[u32], penalty: f32) {
+    use std::collections::HashSet;
+    // Window the history to last 256 tokens to avoid penalizing
+    // cross-turn structural repetition (e.g., JSON keys in tool calls).
+    const LZ_WINDOW: usize = 256;
+    let history = if history.len() > LZ_WINDOW {
+        &history[history.len() - LZ_WINDOW..]
+    } else {
+        history
+    };
+    let n = logits.len();
+    // Only check tokens that appear in history (others can't form repeats)
+    let token_set: HashSet<u32> = history.iter().copied().collect();
+    for &candidate in &token_set {
+        if (candidate as usize) >= n {
+            continue;
+        }
+        for ngram_len in 3..=5usize {
+            if history.len() < ngram_len {
+                continue;
+            }
+            // The n-gram that would form: history[-(ngram_len-1)..] ++ [candidate]
+            let suffix = &history[history.len() - (ngram_len - 1)..];
+            let count = history
+                .windows(ngram_len)
+                .filter(|w| w[..ngram_len - 1] == *suffix && w[ngram_len - 1] == candidate)
+                .count();
+            if count > 0 {
+                logits[candidate as usize] -= penalty * (ngram_len as f32 - 2.0) * count as f32;
+            }
+        }
+    }
+}
+
+/// DRY (Don't Repeat Yourself) penalty. Ported from llama.cpp PR #9702.
+///
+/// Uses suffix matching to find the longest repeated sequence ending at the current
+/// position in the token history. For each candidate token, checks if appending it
+/// would extend a previously-seen sequence. Applies exponential penalty:
+///   `penalty = multiplier * base^(match_length - allowed_length)`
+///
+/// Sequence breakers (e.g., newlines, quotes, braces) reset tracking, preventing
+/// false positives in structured output like JSON tool calls.
+pub fn apply_dry_penalty(
+    logits: &mut [f32],
+    history: &[u32],
+    multiplier: f32,
+    base: f32,
+    allowed_length: u32,
+    breakers: &[u32],
+) {
+    if history.is_empty() || multiplier == 0.0 {
+        return;
+    }
+    let n = logits.len();
+    let hist_len = history.len();
+    let allowed = allowed_length as usize;
+
+    // Build suffix match table: for each position i in history, find the length
+    // of the longest suffix of history[..hist_len] that matches starting at i.
+    // This is a simplified Z-function approach.
+    let mut match_lengths = vec![0usize; hist_len];
+    for i in (0..hist_len.saturating_sub(1)).rev() {
+        // Check if history[i] is a sequence breaker — reset match length
+        if breakers.contains(&history[i]) {
+            match_lengths[i] = 0;
+            continue;
+        }
+        // Match history[i..] against history[hist_len - 1 - k..] for increasing k
+        let mut len = 0;
+        let mut j = i;
+        let mut k = hist_len - 1;
+        while j < k && history[j] == history[k] {
+            len += 1;
+            if breakers.contains(&history[j]) {
+                break;
+            }
+            if j == 0 {
+                break;
+            }
+            j -= 1;
+            k -= 1;
+        }
+        // Correction: we want the match starting at position (i) comparing with the suffix
+        // This gives us: if we see history[i..i+len] == history[hist_len-len..hist_len],
+        // then the token at history[i+len] (if it existed) would extend the repeat.
+        match_lengths[i] = len;
+    }
+
+    // For each position where a match of length > allowed was found, the token
+    // that FOLLOWS the match in history (history[i - 1] looking backward from the match start)
+    // would extend a repeat if generated next. Penalize it.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..hist_len.saturating_sub(1) {
+        let len = match_lengths[i];
+        if len > allowed {
+            // The token at history[i + len] (one past the match) would extend the repeat
+            let extend_pos = i + len;
+            if extend_pos < hist_len {
+                let token = history[extend_pos] as usize;
+                if token < n {
+                    let penalty = multiplier * base.powi((len - allowed) as i32);
+                    logits[token] -= penalty;
+                }
+            }
+        }
+    }
+}
+
+/// Apply repetition / presence / frequency / LZ / DRY penalties and
+/// per-token logit bias to `logits` IN PLACE, using `token_history`.
+///
+/// SSOT for the pre-filter logit-modification block. Extracted verbatim
+/// from `sample_with_params_seeded` (the non-MTP sampling path) so the
+/// MTP verify path (`verify_pick_with_pipeline`) and bootstrap path
+/// (`sample_token_with_grammar`) apply the *same* penalties+bias the
+/// non-MTP path does — previously those two paths emitted tokens with no
+/// penalties (hardcoded `repetition_penalty=1.0`, empty history), so the
+/// configured `repetition_penalty`/`dry_multiplier` from MODEL.toml never
+/// reached MTP-emitted tokens and the model degenerated into repeated
+/// tool-call argument junk.
+///
+/// BACKWARD-COMPATIBLE / ADDITIVE: a mathematical no-op when
+/// `repetition_penalty == 1.0`, `presence_penalty == 0.0`,
+/// `frequency_penalty == 0.0`, `lz_penalty <= 0.0`, `dry_multiplier <= 0.0`
+/// and `logit_bias` is empty — every branch below is individually gated on
+/// its parameter being non-neutral, so the NVFP4 / Gemma / Mistral presets
+/// (which use those neutral values) are byte-for-byte unchanged.
+pub fn apply_penalties_and_bias(
+    logits: &mut [f32],
+    params: &SamplingParams,
+    token_history: &[u32],
+) {
+    let n = logits.len();
+
+    // ── 0. Windowed repetition penalty: penalize recently seen tokens ──
+    // Window=0 uses full history; window>0 uses only the last N tokens.
+    // Skip when rep_penalty <= 0.0 — the divide at the next branch would
+    // produce inf for positive logits and 0 for negative, poisoning the
+    // distribution. (Caller intent for 0.0 is unclear; treat as no-op.)
+    let rep_penalty = params.repetition_penalty;
+    if rep_penalty != 1.0 && rep_penalty > 0.0 && !token_history.is_empty() {
+        let window = params.repetition_penalty_window as usize;
+        let effective = if window > 0 && window < token_history.len() {
+            &token_history[token_history.len() - window..]
+        } else {
+            token_history
+        };
+        for &tid in effective {
+            if (tid as usize) < n {
+                let logit = &mut logits[tid as usize];
+                if *logit > 0.0 {
+                    *logit /= rep_penalty;
+                } else {
+                    *logit *= rep_penalty;
+                }
+            }
+        }
+    }
+
+    // ── 0b. OpenAI-style additive penalties (presence + frequency) ──
+    // Presence: z'ⱼ = zⱼ − β (flat, if token appeared at all)
+    // Frequency: z'ⱼ = zⱼ − α · cⱼ (proportional to occurrence count)
+    let freq_pen = params.frequency_penalty;
+    let pres_pen = params.presence_penalty;
+    if (freq_pen != 0.0 || pres_pen != 0.0) && !token_history.is_empty() {
+        let window = params.repetition_penalty_window as usize;
+        let effective = if window > 0 && window < token_history.len() {
+            &token_history[token_history.len() - window..]
+        } else {
+            token_history
+        };
+        // Count occurrences per token
+        let mut counts = std::collections::HashMap::<u32, u32>::new();
+        for &tid in effective {
+            *counts.entry(tid).or_insert(0) += 1;
+        }
+        for (&tid, &count) in &counts {
+            if (tid as usize) < n {
+                logits[tid as usize] -= freq_pen * count as f32 + pres_pen;
+            }
+        }
+    }
+
+    // ── 0c. LZ penalty: penalize tokens that extend repeated n-gram patterns ──
+    if params.lz_penalty > 0.0 && token_history.len() >= 4 {
+        apply_lz_penalty(logits, token_history, params.lz_penalty);
+    }
+
+    // ── 0d. DRY penalty: exponential penalty for extending repeated sequences ──
+    if params.dry_multiplier > 0.0 && token_history.len() >= 3 {
+        apply_dry_penalty(
+            logits,
+            token_history,
+            params.dry_multiplier,
+            params.dry_base,
+            params.dry_allowed_length,
+            &params.dry_sequence_breakers,
+        );
+    }
+
+    // ── 0e. Logit bias: additive per-token bias ──
+    for &(tid, bias) in &params.logit_bias {
+        if (tid as usize) < n {
+            logits[tid as usize] += bias;
+        }
+    }
+}
+
+mod sample_impl;
+pub use sample_impl::{sample_with_params_history, sample_with_params_seeded};
+
+/// Convenience wrapper: sample without token history (no repetition penalty).
+pub fn sample_with_params(data: &[u8], params: &SamplingParams) -> u32 {
+    sample_with_params_history(data, params, &[])
+}
+
+/// Argmax over an f32 slice with the strict-`>` FIRST-index-wins tie-break.
+///
+/// SSOT for this pick: the verify path (`spark-server`'s
+/// `verify_pipeline_helper/argmax.rs`) calls here too. The naive
+/// `if v > best { best = v; idx = i }` loop carries a dependency through BOTH
+/// the running value and the index, which blocks vectorisation — measured
+/// 1.19 ms for 4x248k on the verify path before the two-pass rewrite (5.95x).
+///
+/// Equivalence to that loop, including the awkward cases: `>` is false for
+/// NaN in both passes so NaN never wins (all-NaN => -inf max, pass 2 finds no
+/// equal, falls back to 0 — same as the loop); IEEE -0.0 == +0.0 so neither
+/// `>` nor `==` separates them and the first zero encountered is returned
+/// either way. `f32::max` is deliberately avoided (it returns the non-NaN
+/// operand, which would let a NaN-adjacent value win where `>` ignored it).
+pub fn argmax_first_wins_f32(v: &[f32]) -> u32 {
+    const LANES: usize = 8;
+    let mut acc = [f32::NEG_INFINITY; LANES];
+    let mut chunks = v.chunks_exact(LANES);
+    for c in &mut chunks {
+        for (a, &x) in acc.iter_mut().zip(c) {
+            if x > *a {
+                *a = x;
+            }
+        }
+    }
+    let mut best = f32::NEG_INFINITY;
+    for &a in acc.iter() {
+        if a > best {
+            best = a;
+        }
+    }
+    for &x in chunks.remainder() {
+        if x > best {
+            best = x;
+        }
+    }
+    v.iter()
+        .position(|&x| x == best)
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(0)
+}
+
+/// Argmax over FP32 values stored as raw bytes (4 bytes per element, little-endian).
+/// First-index-wins, identical to [`argmax_first_wins_f32`] — same two-pass
+/// shape, iterating the byte chunks directly so no `Vec<f32>` is materialised.
+pub fn argmax_f32(data: &[u8]) -> u32 {
+    debug_assert!(data.len().is_multiple_of(4));
+    let vals = || {
+        data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    };
+    // Lane-based pass 1 for the same reason as `argmax_first_wins_f32`: a
+    // serial float-max fold is a strict-IEEE dependency chain the compiler
+    // will not vectorise.
+    const LANES: usize = 8;
+    let mut acc = [f32::NEG_INFINITY; LANES];
+    let mut it = data.chunks_exact(4 * LANES);
+    for block in &mut it {
+        for (a, c) in acc.iter_mut().zip(block.chunks_exact(4)) {
+            let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            if x > *a {
+                *a = x;
+            }
+        }
+    }
+    let mut best = f32::NEG_INFINITY;
+    for &a in acc.iter() {
+        if a > best {
+            best = a;
+        }
+    }
+    for c in it.remainder().chunks_exact(4) {
+        let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        if x > best {
+            best = x;
+        }
+    }
+    vals()
+        .position(|x| x == best)
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(0)
+}
+
+/// Legacy: argmax over BF16 values (still used by argmax_on_device fallback).
+pub fn argmax_bf16(data: &[u8]) -> u32 {
+    debug_assert!(data.len().is_multiple_of(2));
+    let n = data.len() / 2;
+    if n == 0 {
+        return 0;
+    }
+    let mut best_idx: u32 = 0;
+    let mut best_val = bf16_to_f32(data[0], data[1]);
+    for i in 1..n {
+        let val = bf16_to_f32(data[i * 2], data[i * 2 + 1]);
+        if val > best_val {
+            best_val = val;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
+}
+
+/// Convert BF16 (2 bytes, little-endian) to f32.
+#[inline]
+fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
+    let bits = (lo as u32) | ((hi as u32) << 8);
+    f32::from_bits(bits << 16)
+}
+
+#[cfg(test)]
+mod tests;
