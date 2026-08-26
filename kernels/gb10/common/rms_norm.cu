@@ -112,6 +112,61 @@ extern "C" __global__ void rms_norm(
     }
 }
 
+// Grouped RMS norm: each contiguous `group_size` slice normalises over itself,
+// then the whole row is scaled by the full-length offset weight.
+//
+// qwen4_exp's residual stream is `hc_count` streams of `hidden_size`
+// concatenated, and its hyper-connections and PLE tower normalise each stream
+// SEPARATELY -- a single reduction over the 10240-wide row is a different
+// function, and one that still produces fluent output.
+//
+// Grid: (num_tokens, num_groups, 1)  Block: (min(group_size, 1024), 1, 1)
+extern "C" __global__ void rms_norm_grouped(
+    const __nv_bfloat16* __restrict__ input,   // [num_tokens, num_groups * group_size]
+    const __nv_bfloat16* __restrict__ weight,  // [num_groups * group_size], offset from 1
+    __nv_bfloat16* __restrict__ output,
+    unsigned int group_size,
+    unsigned int num_groups,
+    float eps
+) {
+    unsigned int token = blockIdx.x;
+    unsigned int group = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+    unsigned long long base =
+        (unsigned long long)token * num_groups * group_size + (unsigned long long)group * group_size;
+
+    const __nv_bfloat16* x = input + base;
+    const __nv_bfloat16* w = weight + (unsigned long long)group * group_size;
+    __nv_bfloat16* out = output + base;
+
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < group_size; i += blockDim.x) {
+        float v = __bfloat162float(x[i]);
+        sum_sq += v * v;
+    }
+
+    sum_sq = warp_reduce_sum(sum_sq);
+    __shared__ float warp_sums[32];
+    unsigned int lane_id = tid & 31;
+    unsigned int warp_id = tid >> 5;
+    if (lane_id == 0) warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane_id < (blockDim.x + 31) / 32) ? warp_sums[lane_id] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane_id == 0) warp_sums[0] = val;
+    }
+    __syncthreads();
+
+    float rms = rsqrtf(warp_sums[0] / (float)group_size + eps);
+    for (unsigned int i = tid; i < group_size; i += blockDim.x) {
+        // Offset from 1, as in rms_norm above.
+        float v = __bfloat162float(x[i]) * rms * (1.0f + __bfloat162float(w[i]));
+        out[i] = __float2bfloat16(v);
+    }
+}
+
+
 // RMS Norm with FP32 input: for final norm before LM head when residual stream is FP32.
 // Same as rms_norm but reads float* instead of __nv_bfloat16*.
 // Strided sibling of `rms_norm`: normalizes `gridDim.y` GROUPS of
