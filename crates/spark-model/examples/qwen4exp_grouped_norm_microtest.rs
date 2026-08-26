@@ -175,7 +175,12 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
     let hc_norm: Vec<f32> = (0..wide).map(|_| next() * 0.1).collect();
     let mix_down: Vec<f32> = (0..LOWRANK * wide).map(|_| next() * 0.05).collect();
     let mix_up: Vec<f32> = (0..wide * LOWRANK).map(|_| next() * 0.05).collect();
-    let inject_w: Vec<f32> = (0..GROUPS * wide).map(|_| next() * 0.05).collect();
+    // Scaled by 1/sqrt(wide): a dot product over 10240 normalised terms
+    // otherwise saturates the injection sigmoid at 2.0 on both sides, and a
+    // saturated sigmoid agrees no matter what the sign or the /hc_count
+    // divisor did.
+    let inject_scale = 0.5 / (wide as f32).sqrt();
+    let inject_w: Vec<f32> = (0..GROUPS * wide).map(|_| next() * inject_scale).collect();
 
     let d_hyper = up_bf16(g, &hyper)?;
     let d_norm_w = up_bf16(g, &hc_norm)?;
@@ -301,6 +306,11 @@ fn hyper_connection_block(g: &dyn GpuBackend) -> Result<()> {
         "hyper-connection mixed output disagrees with the oracle"
     );
     anyhow::ensure!(inject_gap < 2e-2, "injection gains disagree with the oracle");
+    // Guard against agreeing only because the sigmoid saturated.
+    anyhow::ensure!(
+        want.injection.iter().any(|v| (*v - 2.0).abs() > 0.05 && *v > 0.05),
+        "injection gains are saturated -- this test would pass with the wrong sign"
+    );
     println!("HYPER-CONNECTION BLOCK MATCHES THE ORACLE");
     Ok(())
 }
