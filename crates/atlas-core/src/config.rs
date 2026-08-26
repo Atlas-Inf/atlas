@@ -534,6 +534,15 @@ pub struct ModelConfig {
     /// PLE causal-conv kernel width (`ple_conv_kernel_size`).
     #[serde(default)]
     pub ple_conv_kernel_size: usize,
+    /// Activation on the gated-delta-net output gate: `"silu"` or `"sigmoid"`.
+    ///
+    /// Empty means the family default. Atlas's existing GDN hardcodes SiLU,
+    /// which is right for Qwen3.5/3.6; `qwen4_exp` declares **sigmoid**, and
+    /// the two differ most exactly where the gate is doing its job. HF refuses
+    /// anything but these two, so a value outside them is a malformed config
+    /// rather than a knob.
+    #[serde(default)]
+    pub output_gate_type: String,
     /// Seed for the SplitMix64 multiplier draw.
     ///
     /// Defaulted rather than zero-defaulted, and this is load-bearing: the

@@ -254,11 +254,29 @@ in **conv-state slot 2** of the cache; the reference sets
 conv-state plumbing would have to carry a third slot holding token ids rather
 than activations.
 
-### Linear attention
+### Linear attention — mostly REUSE, not adaptation
 36 of 48 layers. `in_proj_qkv` / `in_proj_a` / `in_proj_b` / `in_proj_z`,
 `conv1d`, `A_log`, `dt_bias`, `norm`, `out_proj`; 16 key heads x 128, 48 value
-heads x 128, conv kernel 4, `output_gate_type = "sigmoid"`, SSM state in fp32.
-Related to the Qwen3-Next GDN path but not tensor-name compatible.
+heads x 128, conv kernel 4, SSM state in fp32.
+
+**Atlas's `SsmWeightsQwen35` is already a structural match** — the same nine
+tensors under the same `{layer}.linear_attn` prefix, with the separate
+`in_proj_qkv`/`in_proj_z` split rather than the older fused `in_proj_qkvz`. The
+dimensions differ but are config-driven.
+
+The real delta is one flag. `qwen4_exp` declares **`output_gate_type =
+"sigmoid"`**; Atlas's GDN hardcodes SiLU on the gated output norm, which is
+correct for Qwen3.5/3.6 and wrong here. That field is now parsed
+(`ModelConfig::output_gate_type`) and pinned by a test; making the gated norm
+select on it is the adaptation.
+
+Worth noting the two norm conventions this model uses, because they are not the
+same and sit a few lines apart in the reference:
+
+* `Qwen4ExpTextRMSNorm` — weight is an **offset from 1** (`x * (1 + w)`), and
+  optionally **grouped**. Used by the PLE tower and hyper-connections.
+* `Qwen4ExpTextRMSNormGated` — weight is a **plain multiplier** (`w * x`), then
+  multiplied by `activation(gate)`. Used by the GDN output.
 
 ### MoE
 512 experts, top-10, `moe_intermediate_size = 640`, a shared expert of the same

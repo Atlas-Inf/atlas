@@ -1019,6 +1019,9 @@ fn qwen4_exp_fixture_parses_the_hybrid_moe_layout() {
     assert_eq!(cfg.linear_num_value_heads, 48);
     assert_eq!(cfg.linear_value_head_dim, 128);
     assert_eq!(cfg.linear_conv_kernel_dim, 4);
+    // The gate activation is SIGMOID here. Atlas's existing GDN hardcodes SiLU,
+    // which is correct for Qwen3.5/3.6 and wrong for this model.
+    assert_eq!(cfg.output_gate_type, "sigmoid");
 
     // MoE.
     assert_eq!(cfg.num_experts, 512);

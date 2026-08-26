@@ -142,6 +142,7 @@ impl ModelConfig {
             indexer_budget: 0,
             indexer_compress_ratio: 0,
             ple_conv_kernel_size: 0,
+            output_gate_type: String::new(),
             ngram_seed: super::default_ngram_seed(),
         }
     }
