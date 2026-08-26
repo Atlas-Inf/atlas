@@ -212,7 +212,31 @@ DeepSeek-V4's mHC. **That is a different formulation** — Sinkhorn-normalised
 mixing, not a low-rank gate — so those fields describe the concept but not this
 model, and reusing them without a distinct path would be wrong.
 
-### Sparse-attention indexer
+### Sparse-attention indexer — NOT on the critical path for a first deployment
+
+`block_topk = indexer_budget / indexer_compress_ratio = 2048 / 4 = 512`, and the
+selection takes `min(block_topk, num_complete_blocks)`. A sequence with no more
+complete blocks than that has **every** block selected, so the mask cannot mask
+anything: the indexer is exactly a no-op and dense attention is numerically
+identical.
+
+Measured against HF's own module (`scripts/dev/probe_indexer_threshold.py`),
+counting causally-visible tokens the indexer removes:
+
+| kv length | tokens masked |
+|---|---|
+| 16 | 0 — no-op |
+| 512 | 0 — no-op |
+| 2048 | 0 — no-op |
+| 2052 | 4 — restricts |
+| 2064 | 112 — restricts |
+
+So a first bring-up capped at **2048 context needs no indexer at all** and is
+exact, not approximate. That takes one of the three new layers off the critical
+path and leaves two new (PLE tower, hyper-connections — both with oracles) plus
+three adaptations.
+
+### Sparse-attention indexer — what it does past the budget
 `indexer_n_heads = 4`, `indexer_head_dim = 128`, `indexer_kv_heads = 1`,
 `indexer_budget = 2048`, `indexer_compress_ratio = 4`; tensors
 `self_attn.indexer.{index_qk_proj, q_layernorm, k_layernorm}` on the 12
@@ -341,10 +365,13 @@ a different box, or a repack that does not exist today.
    whether the model runs on a GB10 at all. `RadixArk`'s `model-plefp8-*`
    shards mean the boundary needs no repacking — the table is already its own
    set of files.
-3. **Layers, cheapest first** — the 512-expert MoE and the linear-attention
-   pathway are adaptations of the Qwen3.5 / Qwen3-Next paths; the low-rank
-   hyper-connections, the PLE tower (including the third conv-state slot that
-   carries token ids) and the sparse-attention indexer are new work.
+3. **Layers, cheapest first** — the 512-expert MoE, the linear-attention
+   pathway and gated-Q full attention are adaptations of the Qwen3.5 /
+   Qwen3-Next paths; the low-rank hyper-connections and the PLE tower
+   (including the third conv-state slot that carries token ids) are new work,
+   and both already have CPU oracles checked against HF at real weights
+   (`atlas_core::qwen4exp_reference`, 1.6e-7 and 5.1e-7).
+   The indexer can be skipped entirely while `max_seq_len <= 2048` — see above.
 4. **MTP head**, then **vision**, both of which the model runs without.
 5. **SM121 kernels** at these dimensions.
 
