@@ -182,3 +182,139 @@ mod tests {
         assert_eq!(key_dim * 2 + value_dim, 10_240);
     }
 }
+
+// ── The decoder layer ──────────────────────────────────────────────────────
+
+use crate::layer::ForwardContext;
+use crate::layers::moe::MoeLayer;
+use crate::layers::ops::qwen4exp as q4e;
+use crate::weight_map::DenseWeight;
+
+/// Device-side weights for one hyper-connection block.
+///
+/// Owned rather than borrowed because the layer outlives the loader's
+/// `Qwen4ExpWeights`, and the collapse needs all four together.
+pub struct HcBlock {
+    pub hc_norm: DevicePtr,
+    pub mix_down: DenseWeight,
+    pub mix_up: DenseWeight,
+    pub block_inject: Option<DenseWeight>,
+}
+
+impl HcBlock {
+    fn as_ops(&self) -> q4e::HyperConnectionWeights<'_> {
+        q4e::HyperConnectionWeights {
+            hc_norm: self.hc_norm,
+            mix_down: &self.mix_down,
+            mix_up: &self.mix_up,
+            block_inject: self.block_inject.as_ref(),
+        }
+    }
+}
+
+/// Scratch one layer needs for the two hyper-connection collapses.
+///
+/// Allocated per layer rather than taken from the shared arena: `norm_output`
+/// is `hidden`-wide, and every buffer here except `mixed` is `hc_count *
+/// hidden`. Borrowing a narrower buffer would overrun it silently.
+pub struct HcScratch {
+    inner: q4e::HyperConnectionScratch,
+}
+
+impl HcScratch {
+    pub fn alloc(gpu: &dyn GpuBackend, config: &ModelConfig) -> Result<Self> {
+        let wide = config.hc_count * config.hidden_size;
+        let bf16 = 2;
+        Ok(Self {
+            inner: q4e::HyperConnectionScratch {
+                normed: gpu.alloc(wide * bf16)?,
+                lowrank: gpu.alloc(config.hc_lowrank * bf16)?,
+                gate: gpu.alloc(wide * bf16)?,
+                mixed: gpu.alloc(config.hidden_size * bf16)?,
+                raw_injection: gpu.alloc(config.hc_count * bf16)?,
+                injection: gpu.alloc(config.hc_count * bf16)?,
+            },
+        })
+    }
+}
+
+/// One `qwen4_exp` decoder layer.
+///
+/// The shape that matters: this layer does NOT read or write the `hidden`
+/// pointer the trait hands it. The trunk state is the `hc_count`-stream
+/// residual in `ctx.buffers.hc_streams()`, which is `hc_count * hidden` wide
+/// and lives for the whole depth. `hidden` is `hidden_size`, so writing the
+/// residual through it would overrun by 4x on the published config.
+///
+/// DeepSeek-V4's mHC layers take the same shape, for the same reason.
+pub struct Qwen4ExpLayer {
+    pub kernels: q4e::Qwen4ExpKernels,
+    pub dims: q4e::Qwen4ExpDims,
+    /// Collapse before the mixer (attention or gated-delta-net).
+    pub attn_hc: HcBlock,
+    /// Collapse before the MoE.
+    pub mlp_hc: HcBlock,
+    /// The 512-expert MoE, loaded through the SHARED path — this model's
+    /// tensor naming is what `load_moe_inner` already expects.
+    pub ffn: MoeLayer,
+    pub scratch: HcScratch,
+}
+
+impl Qwen4ExpLayer {
+    /// Collapse the residual, run `block` on the `hidden`-wide result, and
+    /// scatter its output back per stream.
+    ///
+    /// This is the whole layer's shape, twice: once around the mixer and once
+    /// around the MoE. Checked end-to-end against the oracle in
+    /// `qwen4exp_grouped_norm_microtest` (`hc_sandwich_roundtrip`) — the
+    /// per-kernel checks cannot see an error BETWEEN the two steps.
+    ///
+    /// `block` receives the collapsed input and returns the block output; it
+    /// must not write `residual`, which is still live.
+    fn sandwich<F>(
+        &self,
+        residual: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+        hc: &HcBlock,
+        block: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(DevicePtr, &ForwardContext, u64) -> Result<DevicePtr>,
+    {
+        q4e::hyper_connection_collapse(
+            ctx.gpu,
+            &self.kernels,
+            &self.dims,
+            &hc.as_ops(),
+            residual,
+            &self.scratch.inner,
+            stream,
+        )?;
+        let out = block(self.scratch.inner.mixed, ctx, stream)?;
+        q4e::scatter_add(
+            ctx.gpu,
+            &self.kernels,
+            &self.dims,
+            out,
+            self.scratch.inner.injection,
+            residual,
+            1,
+            stream,
+        )
+    }
+
+    /// The MoE half. Identical on all 48 layers, and built entirely from
+    /// pieces that are already checked: the sandwich against the oracle, and
+    /// `MoeLayer::forward` as the shared 512-expert path.
+    pub fn mlp_block(
+        &self,
+        residual: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.sandwich(residual, ctx, stream, &self.mlp_hc, |input, ctx, stream| {
+            self.ffn.forward(input, ctx, stream)
+        })
+    }
+}
