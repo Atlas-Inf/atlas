@@ -513,7 +513,11 @@ pub fn attention_decode_step(
     let past = keys.len() / kv_dim;
     assert_eq!(query.len(), q_dim, "query is num_heads * head_dim");
     assert_eq!(gate.len(), q_dim, "gate is num_heads * head_dim");
-    assert_eq!(values.len(), past * kv_dim, "keys and values agree on length");
+    assert_eq!(
+        values.len(),
+        past * kv_dim,
+        "keys and values agree on length"
+    );
     assert!(past > 0, "a query attends to at least its own position");
 
     let mut context = vec![0f32; q_dim];

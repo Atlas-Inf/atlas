@@ -863,7 +863,10 @@ fn hc_expand_entry(g: &dyn GpuBackend) -> Result<()> {
     let round = |v: &f32| bf16::from_f32(*v).to_f32();
     let want: Vec<f32> = (0..TOKENS)
         .flat_map(|t| {
-            let row: Vec<f32> = hidden[t * HIDDEN..(t + 1) * HIDDEN].iter().map(round).collect();
+            let row: Vec<f32> = hidden[t * HIDDEN..(t + 1) * HIDDEN]
+                .iter()
+                .map(round)
+                .collect();
             std::iter::repeat_n(row, HC).flatten()
         })
         .collect();
