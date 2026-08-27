@@ -775,3 +775,69 @@ So the residual is distributed NVFP4/BF16-vs-f32 accumulation with no single
 mechanism responsible, which is the expected cost of quantized inference
 rather than a port defect — held against coherence 7/7, tools 6/6, and an
 identical argmax.
+
+## MLPerf edge-agentic bring-up: two engine characteristics found the hard way
+
+Running the MLCommons Edge Agentic harness (`mlcommons/endpoints`,
+`examples/11_Edge_Agentic_Example`) against this target took four attempts.
+Three died, and two of the causes are properties of the port worth recording
+rather than operator error.
+
+### Shrinking the batch makes it LESS stable
+
+The reference config is single-slot (`parallel slots 1`), so the obvious move is
+`--max-num-seqs 1 --max-batch-size 1`. That is what broke it:
+
+| setting | inference reserve | KV | outcome |
+|---|---|---|---|
+| `--max-batch-size 4` | 6775 MB | 7.5-11.8 GB | stable (coherence 7/7, tools 6/6) |
+| `--max-batch-size 1` | **3.6 GB** | 11.8 GB / 32263 blocks | `cuMemAlloc_v2 failed: status 2, requested 8388608 bytes` |
+
+The reserve is computed from batch size. At batch 1 it drops by ~3 GB, KV sizes
+itself into the slack — it fills whatever the budget leaves — and prefill then
+OOMs on an 8 MB allocation. So the reserve heuristic under-provisions this
+architecture's prefill (PLE scratch + GDN chunk + MoE) at batch 1 while KV
+happily consumes the difference.
+
+That is arguably an engine defect and not just a footgun, but the sizing
+formula is shared across every model, so it wants a maintainer's call rather
+than a unilateral change from this branch. Recorded here and on the PR.
+
+### The PLE gather dominates fresh-prompt latency
+
+    PLE gather: 20768 ids, 19769 hits / 999 misses, resolve 3007516us
+
+Three seconds for one gather — ~3 ms per miss, 999 misses out of 20768 ids
+(1298 tokens x 16 heads). This is the NVMe demand-paging cost of the 51.2 GB
+table, and it is why a cold BFCL sample takes ~13 s while a warm short prompt
+takes ~3 s. Two consequences:
+
+  * the row cache's HIT RATE is a first-order latency term, so
+    `--enable-prefix-caching` is not incidental on this model;
+  * the misses are serial blocking preads under the table mutex (the loader
+    already says so), so this is the obvious place to look for prefill wins —
+    queue depth, not bandwidth.
+
+### The 32K context is not viable on this config
+
+The agentic-coding performance replay sends turns up to ~25.5K tokens. At
+`--max-seq-len 32768 --gpu-memory-utilization 0.92` the server was
+OOM-KILLED mid-prefill of a 25,516-token turn — the log ends mid-line with no
+panic, no CUDA error and no abort, which is the kernel taking the process
+rather than an allocation failing gracefully. GB10 is unified memory, so there
+is no device-side failure to catch.
+
+Before it died it recorded `TTFT=112748.5ms` on such a turn, then hit the
+request deadline and truncated. So the performance leg needs either a smaller
+served context or work on long-prefill throughput; it is not a config tweak.
+
+### A harness-side incompatibility
+
+    apply_chat_template failed for <ckpt> (UndefinedError);
+    falling back to whitespace tokenization
+    jinja2.exceptions.UndefinedError: 'dict object' has no attribute 'name'
+
+The harness applies this checkpoint's chat template client-side to count
+ISL/OSL/TPOT, and the template cannot render the harness's tool-definition
+shape. Non-fatal — it degrades only the token metrics — but it would hit
+anyone using this checkpoint as a client-side tokenizer with tools.
