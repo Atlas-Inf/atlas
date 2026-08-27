@@ -437,13 +437,43 @@ Three things worth stating because they are not obvious from the shapes:
 
 | piece | state |
 |---|---|
-| PLE tower | oracle ✅ 5.1e-7 — needs a GPU layer |
-| hyper-connections | oracle ✅ 1.6e-7 — needs a GPU layer |
+| PLE tower | oracle ✅ 5.1e-7, GPU kernels ✅ 5.2e-3 — needs a GPU layer |
+| hyper-connections | oracle ✅ 1.6e-7, GPU kernels ✅ 3.9e-3 — needs a GPU layer |
+| trunk entry (`q4e_hc_expand`) | ✅ exact — **done** |
 | linear attention (36 layers) | Atlas's GDN + `output_gate_type` — **done** |
-| gated-Q full attention (12 layers) | adapt; indexer is a no-op ≤2048 ctx |
-| 512-expert MoE | adapt Qwen3.5's path |
+| gated-Q full attention (12 layers) | kernel ✅ 3.4e-3, on a FLAT K/V buffer; still needs paging |
+| 512-expert MoE | **reuse, not adaptation** — see below |
 | layer wiring above | not written |
 | MTP | not written; `load_mtp_weights` returns None so `--speculative` is refused |
+
+### The 512-expert MoE is REUSE, like the linear attention was
+
+This was listed as "adapt Qwen3.5's path". It needs no adaptation at all.
+
+`load_moe_inner` (`weight_map/loaders_moe.rs`) expects exactly the names this
+model uses:
+
+    {layer}.mlp.gate.weight
+    {layer}.mlp.shared_expert_gate.weight
+    {layer}.mlp.shared_expert.{gate,up,down}_proj.weight
+    {layer}.mlp.experts.{e}.{gate,up,down}_proj.weight
+
+and the target checkpoint's trunk experts are `PerExpert`, which is that
+function's default arm. Passing the bare layer prefix is enough; `Layer.moe` is
+a plain `MoeWeights`.
+
+Two caveats worth keeping visible:
+
+* The `Stacked` layout (HuggingFace-native — `experts.gate_up_proj` as one
+  `[experts, 2*inter, hidden]` tensor, chunked at use) is NOT handled by that
+  path. Both published releases split their trunk experts, so it is unreached
+  today. `weight_manifest::qwen4_exp` still describes it, so preflight would
+  name the missing tensors rather than failing inside a kernel.
+* Reuse of the LOADER is not reuse of the dispatch. `MoeLayer`'s routing has to
+  agree with this model's rule -- softmax over ALL experts first, then top-K,
+  with `norm_topk_prob` forced true because the published config.json omits it
+  and HF's default is true. Top-K then softmax silently renormalises away the
+  router's confidence.
 
 ## What the layer implementation actually needs
 
