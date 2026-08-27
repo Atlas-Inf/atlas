@@ -259,8 +259,25 @@ grep the surface, do not recall it.
 
 ## First run on the box, when it is back
 
-In order, cheapest first — each one closes a class of risk the local gate
-cannot touch.
+**One command:**
+
+```sh
+./scripts/dev/qwen4exp_first_run.sh                       # steps 1-3, no checkpoint
+./scripts/dev/qwen4exp_first_run.sh --ckpt /path/to/snap  # steps 1-5
+```
+
+Ordered cheapest first, stops at the first real failure, logs each step to
+`qwen4exp-first-run/<n>.log`, and prints a summary to paste into the PR. Steps
+1-3 need NO checkpoint, which is the point: the 126 GiB download is the slowest
+part of a fresh box and three quarters of what can be wrong is provable before
+it finishes. It deliberately does not start a server — that wants a human
+watching — and prints the command plus the bisect order instead.
+
+"Everything skipped" reports as NOTHING ATTEMPTED rather than as a pass,
+because reading the former as the latter is how a plan gets marked done
+without evidence.
+
+The same steps, by hand:
 
 ```sh
 # 0. is it reachable at all
