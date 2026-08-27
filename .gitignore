@@ -148,3 +148,4 @@ bench/**/*_weights.npz
 bench/*.npz
 bench/qwen4_exp/qsa_golden.npz
 bench/ngram_ref/ngram_golden.npz
+*.swp

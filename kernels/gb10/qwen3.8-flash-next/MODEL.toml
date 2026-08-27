@@ -78,35 +78,57 @@ mtp_layers = 1
 mtp_type = "full_attention"
 vision = true
 
-# Sampling: from generation_config.json in the released checkpoints
-# (do_sample, temperature 1.0, top_k 20, top_p 0.95). No per-category card
-# guidance has been published for this model yet, so all three categories
-# carry the same vendor defaults rather than values invented here. Revisit
-# once agentic runs give evidence.
+# Sampling: model-card recommendations (2026-08, relayed from the vendor
+# card): thinking temperature=1.0 top_p=0.95 top_k=20 min_p=0
+# presence_penalty=0 repetition_penalty=1.0; instruct/non-thinking
+# temperature=0.7 top_p=0.80 top_k=20 min_p=0 presence_penalty=1.5
+# repetition_penalty=1.0. Tools follows the instruct row (the card has no
+# tools-specific set).
 [sampling.thinking_text]
 temperature = 1.0
 top_p = 0.95
 top_k = 20
+# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
+# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
+# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
+# the greedy-thinking loop this model exhibits on short prompts.
+min_p = 0.0
+top_n_sigma = 0.0
 
 [sampling.thinking_coding]
 temperature = 1.0
 top_p = 0.95
 top_k = 20
+# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
+# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
+# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
+# the greedy-thinking loop this model exhibits on short prompts.
+min_p = 0.0
+top_n_sigma = 0.0
 
 [sampling.non_thinking]
-temperature = 1.0
-top_p = 0.95
+temperature = 0.7
+top_p = 0.8
 top_k = 20
+presence_penalty = 1.5
+# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
+# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
+# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
+# the greedy-thinking loop this model exhibits on short prompts.
+min_p = 0.0
+top_n_sigma = 0.0
 
 [sampling.tools]
-temperature = 1.0
-top_p = 0.95
+temperature = 0.7
+top_p = 0.8
 top_k = 20
-
-# Without this the [sampling.*] presets above apply only to non-core paths and
-# a plain /v1/completions or /v1/chat/completions still gets Atlas's generic
-# defaults (greedy) — and greedy + thinking degenerates on short prompts.
-use_sampling_presets_for_core = true
+presence_penalty = 1.5
+# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
+# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
+# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
+# the greedy-thinking loop this model exhibits on short prompts.
+min_p = 0.0
+top_n_sigma = 0.0
 
 [[model_types]]
 model_type = "qwen4_exp"
@@ -216,4 +238,25 @@ its per-token conv launches (same bits, more launches)."""
 # Same setting as qwen3.8-27b / qwen3.6-35b: reasoning by default.
 thinking_default = true
 thinking_in_tools = true
+# Card sampling presets ([sampling.*] above) apply to core chat/completions
+# requests too — without this a plain request gets Atlas's generic CLI
+# defaults (incl. min_p 0.08 + top_n_sigma 1.0, which gut the card's
+# temp-1.0 thinking distribution). NOTE this key lives in [behavior]; placed
+# after a [sampling.*] header it silently becomes a preset key and does
+# nothing — the exact trap that shipped 2026-08-26.
+use_sampling_presets_for_core = true
+# The A4 POST_THINK_MIN_REASONING floor (-8 on `</think>` for the first 16
+# think tokens) collides with this model's card-native brief thinking:
+# under `reasoning_effort: low` the model closes its think at ~10 tokens,
+# and with `</think>` suppressed the turn-ending mass reroutes to
+# <|im_end|>/<|im_start|> — sampled runs EOS inside think (empty body) or
+# simulate new template turns (word salad). Measured 2026-08-26 via
+# ATLAS_LOGIT_DUMP: steps 11-13 topped by im_end/im_start while </think>
+# reappears at logit ~6 the moment the floor expires. 0 disables the floor.
+min_reasoning_floor_tokens = 0
+# When the model does sample an EOS inside <think> (temp 1.0 makes this
+# reachable), honor it by closing the block instead of swallowing the token
+# and forcing continued reasoning — the swallow path is what turned early
+# closes into <|im_start|>user template simulation.
+honor_eos_inside_thinking = true
 max_thinking_budget = 2048
