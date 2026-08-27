@@ -344,6 +344,23 @@ If step 7 misbehaves, the kill switches are the bisect: `ATLAS_QSA_DISABLE=1`,
 `ATLAS_DEBUG_NO_GRAPH=1`, `ATLAS_QWEN4EXP_NO_PLE=1` (output is wrong by
 construction under that last one — it exists to bisect the mHC spine).
 
+## Audit round 2: the claims that exist only in COMMIT MESSAGES
+
+The table above covers the 16 defects reported in #754's PR comments. Three of
+his last commits describe further bugs only in their commit message bodies, and
+they are the concurrency ones — i.e. exactly the "does it SCALE" half. Audited
+the same way:
+
+| claim (commit) | verified in |
+|---|---|
+| **The C=2 row swap** (`a2c960b2`): the scheduler passes stream 0 to `decode_batch` but `decode()`'s kernels run on the BACKEND default stream, so staging the logits rows on the caller's stream ordered the copies against NOTHING — all n copies could execute after the last decode and read the same final row. Measured as a clean two-way swap: stream A emitting stream B's token and vice versa. | `decode_a2.rs:154` — `copy_stream = self.gpu.default_stream()`, with the whole rationale in place, feeding `copy_d2h_on_stream` |
+| **The batched graph gate never consulted the per-layer veto** (`08b885fc`): single decode did, the batched path did not, so capture hit PLE's host hash on the first joint step | `decode_graph_unsupported()` — defaulted on `transformer_layer.rs:96`, implemented by the SSM layer (PLE) and the attention layer (QSA), and consulted at BOTH `decode_a.rs:250` (single) and `decode_a2.rs:265` (batched) |
+| **QSA ingest continuity** (`08b885fc`): the batched multi-seq path skipped the indexer, so the contiguity guard fired the moment a batch shrank back to one sequence | `multi_seq/mod.rs:246` runs `qsa.decode_select` per sequence, ingest-only below the inert bound |
+| **Both batched dense arms must go through cuBLASLt** (`8da3fb22`): the BF16-kept GDN build routed the batched projections onto the terminal scalar `dense_gemm` — the same kernel the prefill saga hit | `ssm_batched.rs:324` (QKVZ) and `:414` (out_proj), both `ops::cublas_bf16_proj_dense`, and the comments carry his measured 381 us / 194 us |
+
+That closes the audit: every defect and fix rsafier reported, in comments or in
+commit messages, is present here and pointed at its site.
+
 ## The one design claim I re-verified rather than quoted
 
 #754's phase-C comment says the SSM prefill's steps 2-10 "moved verbatim into
