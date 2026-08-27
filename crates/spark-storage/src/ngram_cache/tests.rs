@@ -143,7 +143,7 @@ fn multi_file_rows_are_byte_identical() {
     for file in [&path_a, &path_b] {
         let mut fh = std::fs::File::create(file).expect("create");
         // A non-4KiB-aligned base, which is what a safetensors data offset is.
-        fh.write_all(&vec![0u8; 8]).expect("lead");
+        fh.write_all(&[0u8; 8]).expect("lead");
         let mut at = 8u64;
         for (shard, f) in layout.iter() {
             if *f != file {
@@ -155,7 +155,7 @@ fn multi_file_rows_are_byte_identical() {
             }
             at += ROWS_PER * STRIDE as u64;
         }
-        fh.write_all(&vec![0u8; PAD]).expect("pad");
+        fh.write_all(&[0u8; PAD]).expect("pad");
     }
     // `offsets` was filled per file, so put it back in SHARD order — the order
     // `open_segmented` indexes by.
