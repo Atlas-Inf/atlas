@@ -484,3 +484,5 @@ fn qwen4exp_oracle_hc_matches_the_cpu_reference() {
 // the private helpers above, which a sibling `#[path]` module would not.
 #[path = "qwen4exp_oracle_ple_tests.rs"]
 mod ple;
+#[path = "qwen4exp_oracle_qsa_tests.rs"]
+mod qsa;

@@ -207,6 +207,8 @@ mod hc;
 mod moe;
 #[path = "qwen4exp_reference/ple.rs"]
 mod ple;
+#[path = "qwen4exp_reference/qsa.rs"]
+mod qsa;
 
 // Re-exported flat, so `atlas_core::qwen4exp_reference::ple_forward` still
 // resolves for every caller — the examples, the microtest and the GPU parity
@@ -216,3 +218,4 @@ pub use gdn::*;
 pub use hc::*;
 pub use moe::*;
 pub use ple::*;
+pub use qsa::*;

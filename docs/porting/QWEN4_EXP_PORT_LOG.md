@@ -16,7 +16,7 @@ source, or (b) verified by the local gate below.
 
 ```
 compile   libs+bins cuda · touched crates all-targets cuda · metal build
-tests     atlas-core 158 · spark-server 2306 · spark-model 645
+tests     atlas-core 164 · spark-server 2307 · spark-model 645
           spark-storage 87 · spark-runtime 272
 repo CI   SPDX headers · kernel shadow structure · qwen4_exp kernel NAMES
           500-LoC cap
@@ -64,6 +64,7 @@ test is `#[ignore]`d and unexecuted.
 | 4. clippy + fmt + SPDX | **DONE** — clean |
 | 5. oracle gate on the SERVING kernels | **DONE** — mHC (4 entry points, 3 dispatch arms) and the whole PLE chain, no checkpoint needed |
 | 5b. kernel NAME resolution checked statically | **DONE** — 37/37 resolve; both failure modes have negative controls |
+| 5c. QSA oracle + parity gate | **DONE** — the last block with no committed golden now has a CPU oracle |
 | 6. recipe + serve wiring | **DONE** — vendored recipe (census tests validate it produces a valid serve config), serve script hardened for >8K |
 | 7. `--generate N` off-by-one | **DONE** |
 | 8. docs + CHANGELOG | **DONE** |
@@ -245,9 +246,20 @@ construction under that last one — it exists to bisect the mHC spine).
   and 645 tests now run locally. The `tests/` integration targets
   (`arm2_leg2_decode`, `moe_lora_delta_parity`) still need cuda to link; that
   is pre-existing and outside this port.
-* `qsa_golden.npz` is gitignored, so the QSA parity tests need regenerating
-  from the checkpoint before they can run. The new oracle gate covers mHC and
-  PLE but not QSA — there is no CPU oracle for the indexer yet, and writing one
-  is the obvious next contribution to this harness.
+* ~~no CPU oracle for QSA~~ — WRITTEN. `qwen4exp_reference::qsa` is
+  transcribed from the vendored reference module (not from the kernel) and
+  exposes the three per-stage helpers `qsa_select` itself uses, so
+  `qwen4exp_oracle_qsa_tests.rs` compares the kernels against the oracle rather
+  than a second copy of the formula. Six CPU tests pin the mechanism with no
+  GPU at all, including the inertness threshold and the per-head relu.
+  `qsa_golden.npz` is still gitignored, so the checkpoint-backed QSA parity
+  test needs regenerating on the box; the oracle gate no longer depends on it.
+* **A behavioural fact the QSA oracle surfaced**, worth knowing before it looks
+  like a bug: when the visible count is a multiple of `compress_ratio` the tail
+  is EMPTY, so the current token sits inside a complete block and can be masked
+  out if that block loses the ranking. The reference force-includes nothing.
+  Pinned by `the_tail_is_visible_and_the_current_token_is_not_force_included`,
+  which also asserts the case actually occurs, so a future "helpful" fix cannot
+  quietly diverge from the reference on 1 in `ratio` positions.
 * MTP, the stacked expert layout, QSA prefix-cache re-ingest, and thinking-body
   quality at temperature 1.0 are open in both branches.
