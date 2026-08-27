@@ -71,6 +71,45 @@ test is `#[ignore]`d and unexecuted.
 | 9. 500-LoC cap | **DONE** — four pre-existing breaches on this branch fixed |
 | 10. run it on the box | **BLOCKED** — `reiner` is off the tailnet |
 
+### What CI caught that no local gate could
+
+The PR (Atlas-Inf #16) runs the real matrix, and it found four things in three
+rounds that a mac and a Linux box both miss:
+
+1. **`no_model_shadow_drops_a_common_kernel`** — a repo invariant asserting no
+   model shadow drops a kernel its `common/` namesake declares. #13 added four
+   kernels to `common/rms_norm.cu`; ten targets carry their own `rms_norm.cu`,
+   so all ten "dropped" all four (40 findings). Fixed with a common-level
+   `[shadow_exempt]` entry, following the precedent directly above it. **My gate
+   missed it because it ran `--lib` everywhere and these invariants live in
+   `atlas-kernels`' TEST TARGETS.** That row is now in the gate.
+2. **`aux.rs` cannot exist on Windows.** `aux` is a reserved DEVICE name (with
+   con, prn, nul, com1-9, lpt1-9) and the reservation holds even with an
+   extension, so `git checkout` itself failed — `error: invalid path`, exit 128,
+   14 seconds in, before any compiler. Came in with #754. Renamed to
+   `attach.rs`; the whole tree swept for the other twelve stems as files AND
+   directories; a guard added to the gate.
+3. **`ngram_table.rs` had no Windows arm** for its positional read — OUR file.
+   `read_exact_at` is Unix-only; `seek_read` is the Windows equivalent and needs
+   a short-read loop. Now behind one helper, and `rustup target add
+   x86_64-pc-windows-msvc` makes this checkable from a mac, so it is a gate row.
+4. **`-INFINITY` in `qwen4exp_attn.cu`** — a `double`, and narrowing it to
+   `float` is nvcc diagnostic #221-D, which is an ERROR on the MSVC host and a
+   pass on the Linux host. The Linux `nvcc -> PTX` job compiled the file green
+   while Windows could not. `-1e30f` is what `argmax_bf16.cu` and
+   `inferspark_prefill.cu` already use for a softmax running max.
+
+And one in the gate itself: run without a PATH export, its toolchain fallback
+set `CARGO` to an absolute path without putting that bin dir on PATH, so cargo
+could not find `rustc` — twelve rows red on a clean tree. A gate that fails for
+the wrong reason is the worst kind, so the toolchain is now proved usable before
+any row runs, and the fallback exports PATH.
+
+**What CI verified that the local gate cannot:** `nvcc -> PTX (all gb10
+targets)` PASSES — every merged `.cu` compiles for every gb10 target. That was
+the largest open risk on this branch. `cargo test --workspace` on Linux passes
+too.
+
 ### Bugs this port work found and fixed
 
 1. **The mHC highway element size.** `hc_streams` was sized per family — f32
