@@ -12,42 +12,80 @@ source, or (b) verified by the local gate below.
 
 ## The local gate (no GPU, no nvcc)
 
-The whole CUDA code path type-checks on an Apple-silicon box:
+`scripts/dev/qwen4exp_local_gate.sh` — 13 gates, ~2,800 tests, no CUDA:
 
-```sh
-export CUDARC_CUDA_VERSION=13000   # stops cudarc's build.rs probing nvcc
-export ATLAS_SKIP_BUILD=1          # build.rs writes a type-checkable PTX stub
-
-cargo check --workspace --lib --bins           --no-default-features --features cuda
-cargo check -p atlas-core -p spark-model -p spark-runtime -p spark-server \
-            --all-targets                       --no-default-features --features cuda
-cargo check -p atlas-core -p spark-model       --no-default-features --features metal
-cargo test  -p atlas-core --lib                --no-default-features --features cuda
-cargo fmt --all -- --check
-cargo clippy -p atlas-core -p spark-model -p spark-runtime -p spark-server \
-            --all-targets                       --no-default-features --features cuda
+```
+compile   libs+bins cuda · touched crates all-targets cuda · metal build
+tests     atlas-core 158 · spark-server 2306 · spark-storage 87 · spark-runtime 272
+repo CI   SPDX headers · kernel shadow structure · 500-LoC cap
+lint      fmt · clippy
 ```
 
-`spark-storage`'s io_uring / GDS examples and integration tests are Linux-only
-and are outside the gate; that is pre-existing and unrelated to this port.
+Two env vars are the whole trick: `ATLAS_SKIP_BUILD=1` makes atlas-kernels'
+`build.rs` emit a type-checkable stub instead of invoking nvcc, and
+`CUDARC_CUDA_VERSION=13000` stops cudarc probing for a toolkit. Nearly all of
+this port sits behind `#[cfg(feature = "cuda")]`, so without those the only
+thing a laptop can check is the one configuration the code is absent from.
 
-Three darwin arms were added to make this possible (commit `6d3c6a1d` +
-follow-up): `posix_fallocate`, `posix_fadvise` and `O_DIRECT` have no macOS
-equivalent. Production NVMe tiers stay Linux-only; no Linux behaviour changes.
+The find worth reusing: test binaries that link `-lcuda` cannot be built on
+macOS, but the TESTS are backend-agnostic — only the linking is. Run under
+`metal`, 2,665 of them execute here.
+
+Three darwin arms were needed (commit `6d3c6a1d` + follow-ups):
+`posix_fallocate`, `posix_fadvise` and `O_DIRECT` have no macOS equivalent.
+Production NVMe tiers stay Linux-only; no Linux behaviour changes.
+
+**What the gate cannot say anything about**, printed by the script itself: no
+`.cu` is compiled (nvcc is never invoked) and no kernel is run. Every parity
+test is `#[ignore]`d and unexecuted.
 
 ## Status
 
 | stage | state |
 |---|---|
-| 0. local gate established | DONE — 5/5 pass at `d75075f7` |
-| 1. merge #754 + #746 | DONE — 7 conflicts resolved by inspection, 265 files |
-| 2. kernel tree integrity | DONE — 5 symlinks resolve, no module collision |
-| 3. config surface reconciled | DONE — one parser, both field families, 158 tests pass |
-| 4. clippy clean | in progress |
-| 5. microtest extended to the SERVING kernels | TODO — highest-value next item |
-| 6. recipe + serve wiring reviewed | TODO |
-| 7. `--generate N` off-by-one | TODO (reviewer-reported on #13) |
-| 8. docs/CHANGELOG | TODO |
+| 0. local gate | **DONE** — 13/13 pass, ~2,800 tests run |
+| 1. merge #754 + #746 | **DONE** — 7 conflicts resolved by inspection, 265 files |
+| 2. kernel tree integrity | **DONE** — 5 symlinks resolve, no module collision, shadow-structure check green |
+| 3. config surface reconciled | **DONE** — one parser, both field families, 158 tests pass |
+| 4. clippy + fmt + SPDX | **DONE** — clean |
+| 5. oracle gate on the SERVING kernels | **DONE** — mHC (4 entry points, 3 dispatch arms) and the whole PLE chain, no checkpoint needed |
+| 6. recipe + serve wiring | **DONE** — vendored recipe (census tests validate it produces a valid serve config), serve script hardened for >8K |
+| 7. `--generate N` off-by-one | **DONE** |
+| 8. docs + CHANGELOG | **DONE** |
+| 9. 500-LoC cap | **DONE** — four pre-existing breaches on this branch fixed |
+| 10. run it on the box | **BLOCKED** — `reiner` is off the tailnet |
+
+### Bugs this port work found and fixed
+
+1. **The mHC highway element size.** `hc_streams` was sized per family — f32
+   for `hc_mult`, bf16 for `hc_count`. Correct while our own bf16 kernels read
+   it; wrong for the kernels that now serve, all of which declare the buffer
+   `float*`. Safe today only because the merged parser sets both fields, so the
+   f32 arm wins by accident. Read as written the code told the next person to
+   restore a branch that would read the wrong half of every value on 48 layers.
+2. **The parser skipped `finalize_config`** — an NVFP4 checkpoint parsed as
+   unquantized, because ModelOpt writes `quantization_config` beside
+   `text_config` and serde on `text_config` alone never sees it.
+3. **`ple_layer_ids` accepted 0**, which is not "layer 0" but a malformed
+   one-indexed id.
+4. **`ngram_dims()` refused the merged config** as a partial LongCat trio. A
+   base-form checkpoint now declines that accessor instead, and declaring both
+   table sizings is refused.
+5. **`--generate N` appended N+1 tokens** (reviewer-reported, reproduced twice
+   on a GB10).
+6. **Four files over the CI LoC cap**, pre-existing on this branch — #13 is red
+   on a gate that runs as its own job.
+
+### Two overlapping mechanisms, checked and documented rather than merged
+
+Our `demand_paged_patterns` SKIPS tensors; #746's deferral skips them AND
+records each one's file offset, which is what `NgramRowCache` reads rows
+through. The shard loop checks `is_ngram_table` first, so the PLE shards take
+the deferred path and our rule never sees them — but if that predicate ever
+stopped matching, our rule would quietly take over and the PLE loader would
+fail its own "no shard was deferred" check at load. The precedence is now
+commented at both ends and pinned by
+`name_utils::ngram_table_predicate_matches_the_qwen_ple_shards`.
 
 ## Decisions taken (and why)
 
@@ -143,12 +181,56 @@ equivalent. Production NVMe tiers stay Linux-only; no Linux behaviour changes.
 
 ## First run on the box, when it is back
 
+In order, cheapest first — each one closes a class of risk the local gate
+cannot touch.
+
 ```sh
-# 1. the gate that needs no checkpoint
+# 0. is it reachable at all
+netbird status -d | grep -A6 gx10        # want Connected + a recent handshake
+ssh reiner 'nvidia-smi -q | grep -i addressing'   # want ATS
+
+# 1. do the kernels COMPILE (nvcc was never invoked locally)
+cargo build --release -p spark-model --no-default-features --features cuda
+
+# 2. the serving kernels vs the CPU oracle — no checkpoint, no Python
+cargo test --release -p spark-model qwen4exp_oracle -- --ignored --nocapture
+
+# 3. the same kernels vs the real reference module, if the fixture bins exist
+#    (hc_golden.npz / ple_golden.npz are committed; qsa_golden.npz is not and
+#    must be regenerated from the checkpoint)
+ATLAS_HC_TEST_DATA=<dir> cargo test --release -p spark-model hc_lowrank -- --ignored
+
+# 4. the five block microtests (independently reproduced on a second GB10)
 cargo run --release -p spark-model --example qwen4exp_grouped_norm_microtest \
       --no-default-features --features cuda
-# 2. the checkpoint is described exactly
+
+# 5. the checkpoint is described exactly: want 296,142 / 0 / 0 / 0
 cargo run --release -p atlas-core --example qwen4exp_preflight -- <ckpt>
-# 3. serve
-./serve_qwen4exp_tui.sh    # ATLAS_PLE_MAX_TOKENS >= 9500 for >8K prompts
+
+# 6. the CPU forward still generates "Paris." from the real weights
+cargo run --release -p atlas-core --example qwen4exp_forward -- <ckpt> /fx/prompt.json --generate 8
+#    ^ and confirm it now appends 8, not 9
+
+# 7. serve
+./serve_qwen4exp_tui.sh                  # raises ATLAS_PLE_MAX_TOKENS itself above 8K
 ```
+
+If step 7 misbehaves, the kill switches are the bisect: `ATLAS_QSA_DISABLE=1`,
+`ATLAS_QSA_NO_PREFILL_SELECT=1`, `ATLAS_QWEN4EXP_NO_HC_GEMM=1`,
+`ATLAS_DEBUG_NO_GRAPH=1`, `ATLAS_QWEN4EXP_NO_PLE=1` (output is wrong by
+construction under that last one — it exists to bisect the mHC spine).
+
+## Still open, and honest about it
+
+* Nothing here has run on hardware. Every number in this log is either quoted
+  from #754/#13 with its source, or produced by the local gate.
+* `spark-model`'s lib tests do not COMPILE under `metal` (17 pre-existing
+  errors in test code that assumes the cuda backend), so that crate's unit
+  tests are type-checked under cuda here but only RUN on the box. Worth fixing
+  to widen the gate; out of scope for this port.
+* `qsa_golden.npz` is gitignored, so the QSA parity tests need regenerating
+  from the checkpoint before they can run. The new oracle gate covers mHC and
+  PLE but not QSA — there is no CPU oracle for the indexer yet, and writing one
+  is the obvious next contribution to this harness.
+* MTP, the stacked expert layout, QSA prefix-cache re-ingest, and thinking-body
+  quality at temperature 1.0 are open in both branches.
