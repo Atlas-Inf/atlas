@@ -39,8 +39,8 @@ fn all() -> Vec<Recipe> {
 #[test]
 fn the_whole_corpus_reads() {
     let all = all();
-    assert_eq!(all.len(), 25);
-    assert_eq!(all.iter().filter(|r| r.is_atlas()).count(), 23);
+    assert_eq!(all.len(), 26);
+    assert_eq!(all.iter().filter(|r| r.is_atlas()).count(), 24);
     assert_eq!(
         all.iter().filter(|r| r.version == "1").count(),
         2,
@@ -82,7 +82,7 @@ fn every_atlas_recipe_produces_a_valid_serve_config() {
             .unwrap_or_else(|e| panic!("{}: {e:#}", r.id));
         checked += 1;
     }
-    assert_eq!(checked, 23);
+    assert_eq!(checked, 24);
 }
 
 #[test]

@@ -1,0 +1,88 @@
+recipe_version: "2"
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+runtime: atlas
+container: azeezish/atlas-gb10:latest
+max_nodes: 1
+
+metadata:
+  description: |
+    Qwen3.8-Flash-Next (`model_type: qwen4_exp`) — a ~180B hybrid multimodal
+    MoE on ONE GB10. 48 layers interleaving gated-delta-net and full
+    attention 3:1, 512 experts top-10 plus a shared expert, a 4-stream
+    low-rank hyper-connection residual, a QSA sparse-attention indexer on the
+    12 full-attention layers, PLE n-gram injection at model layer 1, and a
+    ViT tower.
+
+    CHECKPOINT CHOICE IS NOT A PREFERENCE. The FP8 release does not fit: its
+    routed experts alone are 123.3 GB resident against a GB10's ~119.6 GiB.
+    NVFP4 is the only workable release, and its 47.7 GiB n-gram table is
+    never made resident — it is read by ROW off NVMe. Measured on a GB10:
+
+      pre-flight     78.19 GB on-disk, 1.3x = 101.65 GB projected peak
+      actual peak    ~90.4 GB, ~27.8 GB free, 8 GiB guard held
+      load           206/206 shards, 296,347 tensors, ~139 s
+
+    Without that exclusion the same run refuses at 163.64 GB. Verified
+    independently on two GB10s.
+
+    Throughput, measured (Avarok #754): decode 16.5 tok/s, prefill 747 tok/s
+    at a 2191-token prompt, C=2 aggregate 20.5 tok/s.
+
+    KV IS BF16, DELIBERATELY. This checkpoint ships no `k_scale`/`v_scale`,
+    so bare fp8 KV clips to E4M3 [-448, 448] and Atlas warns; calibration is
+    the alternative and has not been validated for this model. Only 12 of 48
+    layers hold KV (2 KV heads), so bf16 goes further here than the layer
+    count suggests — at 8K context it is a small fraction of the ~27 GB spare.
+
+    CONTEXT ABOVE 8192 NEEDS `ATLAS_PLE_MAX_TOKENS` RAISED. The engine's
+    prefill chunk is 8193, not 8192, and the PLE scratch is sized from that
+    env var (default 2048 — a 2191-token prompt already fails layer 1 without
+    it). Set it to >= 9500 when serving prompts over 8K; the cap error names
+    itself when hit. `serve_qwen4exp_tui.sh` does this automatically.
+
+    SPECULATIVE IS OFF AND CANNOT BE TURNED ON. The MTP block is not the
+    `MtpWeights` shape any other family uses — its own 512-expert stack, its
+    own indexer, two input norms of different widths — so
+    `load_mtp_weights` returns None and `--speculative` is refused at
+    pre-flight rather than half-wired.
+
+    Sampling and the thinking scaffold come from
+    `kernels/gb10/qwen3.8-flash-next/MODEL.toml`, not from here: the vendor
+    card's presets (thinking 1.0/0.95/20, instruct 0.7/0.80/20 + presence
+    1.5, min_p and top_n_sigma pinned 0) plus three behaviour knobs that were
+    each a measured defect — `use_sampling_presets_for_core`,
+    `min_reasoning_floor_tokens = 0` and `honor_eos_inside_thinking`. The
+    `reasoning_effort: low` default below renders the full reasoning
+    preamble and `<think>` scaffold on a cheap budget, which is what this
+    model's chat template gates everything on.
+
+    Prefix caching is ON: the PLE n-gram history and conv state and the QSA
+    ingested indexer keys ride the SSM snapshots as host aux blobs, so a
+    prefix hit cannot inherit the previous request's n-gram history. Measured
+    3.9x warm TTFT on a 3-turn 2.6K needle.
+  maintainer: atlas-inf
+  category: general
+  model_params: 180B
+  model_dtype: nvfp4
+  quantization: nvfp4
+  kv_dtype: bf16
+
+defaults:
+  port: 8889
+  host: 0.0.0.0
+  kernel_target: qwen3.8-flash-next
+  max_seq_len: 8192
+  # bf16, not fp8 — this checkpoint ships no k/v scales. See the description.
+  kv_cache_dtype: bf16
+  gpu_memory_utilization: 0.85
+  max_num_seqs: 4
+  max_batch_size: 4
+  # Correct since the PLE/QSA aux state rides the snapshots, and faster since
+  # the aux was attached to the snapshots warm turns actually hit.
+  enable_prefix_caching: true
+  # NFS-mounted checkpoints benefit; harmless on local NVMe.
+  fast_load_prefetch_shards: true
+  # The chat template gates its whole scaffold on enable_thinking, and a bare
+  # render collapses chat to a 2-token EOS. `low` keeps the budget cheap while
+  # still rendering the full preamble.
+  default_chat_template_kwargs: '{"reasoning_effort":"low"}'
