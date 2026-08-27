@@ -1,17 +1,25 @@
 # `qwen4_exp` — Qwen3.8-Flash-Next: what is in Atlas, and what is not
 
-Status as of 2026-08-26. Read against the published
+Status as of 2026-08-27. Read against the published
 [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
 `config.json` and `model.safetensors.index.json`, plus the reference
 implementation in HuggingFace Transformers (Apache-2.0),
 `src/transformers/models/qwen4_exp/`.
 
-**Atlas cannot serve this checkpoint today.** One piece of it — the n-gram id
-core — is implemented and pinned against the real weights. Everything else in
-the list below is absent. This file is the gap list, so that "drop it in" is a
-plan rather than a surprise.
+**Atlas serves this checkpoint.** As of the #754 merge
+(`feat/qwen4exp-serve`), the mHC highway runs on all 48 layers, the PLE tower
+runs at model layer 1 off an NVMe row cache, the QSA indexer selects on both
+decode and prefill, the vision tower loads, CUDA graphs capture, prefix caching
+carries the PLE and QSA state, and concurrency is honoured. What is still
+refused — by name, at pre-flight — is MTP and the stacked expert layout.
 
-## The headline constraint: it does not fit on a GB10
+Read the rest of this file as two things layered: the ARCHITECTURAL notes are
+still current and are the reason each piece is shaped the way it is; the
+STATUS lines have been updated in place, and every section that used to say
+"missing" now says what it is checked against instead. `QWEN4_EXP_PORT_LOG.md`
+carries the merge decisions and the traps that came across with the port.
+
+## The headline constraint: the WEIGHTS do not fit on a GB10, the model does
 
 `model.safetensors.index.json` declares **185.5 GB** of FP8 weights. A DGX Spark
 GB10 has ~119 GB of usable unified memory. Single-box serving is not a matter of
@@ -128,7 +136,7 @@ Two traps are encoded as tests rather than left as comments:
   1234. A zero default draws different multipliers and hashes every token to an
   unrelated row — degraded output, no error.
 
-## What is missing
+## Component notes — what each piece is, and what it is checked against
 
 ### Weight manifest — done
 `atlas_core::weight_manifest::qwen4_exp_manifest` enumerates every
@@ -194,11 +202,28 @@ handle rather than assume:
   spans dots; HF's native FP8 list carries no globs at all and spells out all
   943 modules. Both forms are matched.
 
-### Dispatch
-`qwen4_exp` is in neither `config/dispatch.rs::parse_config` nor
-`spark-model/src/factory.rs::loader_for_config`. Both currently reject it by
-name. The config is nested under `text_config` like the Qwen3.5/VL families, but
-does not otherwise share their shape.
+### Dispatch — done
+`config/parsers/qwen4_exp.rs` is the single parser, reached from
+`dispatch.rs::parse_config` under both `qwen4_exp` and `qwen3_8_flash_next`,
+and `factory.rs::loader_for_config` binds `Qwen4ExpWeightLoader`. The config is
+nested under `text_config` like the Qwen3.5/VL families but shares nothing else
+with them.
+
+Two things that parser does which are easy to omit: it sets
+`weight_prefix = "model.language_model"`, so `config.layer_prefix(i)` yields
+real checkpoint keys and the shared loader helpers need no qwen4_exp-specific
+naming; and it calls `finalize_config`, which is where `quantization_config` is
+read off the TOP level — ModelOpt writes it beside `text_config`, so serde on
+`text_config` alone never sees it, and without that call an NVFP4 checkpoint
+parses as unquantized.
+
+It populates BOTH field spellings on purpose: `hc_mult` / `index_*` /
+`emb_*` because that is what the engine dispatches on, and `hc_count` /
+`indexer_*` / `ngram_size` / `heads_per_ngram` because the weight manifest, the
+CPU reference and `Qwen4ExpNgram` read the checkpoint in its own vocabulary.
+`Qwen4ExpNgram` DERIVES the multipliers, per-head primes and offsets and
+asserts they equal the buffers the checkpoint ships, so the derivation and the
+shipped values check each other.
 
 ### Hyper-connections (`hc_count = 4`, `hc_lowrank = 320`)
 Four residual streams, with `attn_hyper_connection` and `mlp_hyper_connection`
@@ -358,40 +383,32 @@ Develop the loader against that. It checks plumbing, not numerics — dimensions
 and values are not faithful — but it is the only way to iterate at all, given
 the arithmetic below.
 
-## Why the real checkpoint is not an option yet
+## The real checkpoint — loaded, measured, twice
 
-On the GB10 available (`reiner`, 119 GB unified):
+Superseding an earlier section that said the checkpoint fit neither the disk
+nor the memory of `reiner`. It fits both, once the n-gram table is
+demand-paged, and it has been loaded independently by two people on two GB10s:
 
 | | |
 |---|---|
-| smallest published repack (RadixArk NVFP4) | 135.3 GB |
-| free disk | ~72 GB |
-| free disk after deleting everything of ours | ~95 GB |
-| total system memory | 119 GB |
+| pre-flight | 78.19 GB on-disk, 1.3x = 101.65 GB projected peak |
+| measured peak | ~90.4 GB, ~27.8 GB free, 8 GiB guard held throughout |
+| load | 206/206 shards, 296,347 tensors, ~139 s |
+| without the demand-paged exclusion | refuses at 163.64 GB |
 
-It fits neither the disk nor the memory. Host-resident PLE would bring the
-device-resident set to ~83 GB, which *would* fit — but the download still needs
-~40 GB more disk than exists. Serving this on that box needs either more disk,
-a different box, or a repack that does not exist today.
+That last line is the whole point: one exclusion is the difference between
+"does not fit" and "loads with headroom".
 
-## Suggested order
+The FP8 release still does not fit — its routed experts alone are 123.3 GB
+resident — so NVFP4 is not the smaller option here, it is the only workable
+one.
 
-1. **Weight loader** (`Qwen4ExpWeightLoader` + a `factory.rs` arm). Comparable
-   loaders in this tree run 1000–1900 lines. Develop against the tiny
-   checkpoint.
-2. **mmap-backed n-gram gather.** Out of order on purpose: it is what decides
-   whether the model runs on a GB10 at all. `RadixArk`'s `model-plefp8-*`
-   shards mean the boundary needs no repacking — the table is already its own
-   set of files.
-3. **Layers, cheapest first** — the 512-expert MoE, the linear-attention
-   pathway and gated-Q full attention are adaptations of the Qwen3.5 /
-   Qwen3-Next paths; the low-rank hyper-connections and the PLE tower
-   (including the third conv-state slot that carries token ids) are new work,
-   and both already have CPU oracles checked against HF at real weights
-   (`atlas_core::qwen4exp_reference`, 1.6e-7 and 5.1e-7).
-   The indexer can be skipped entirely while `max_seq_len <= 2048` — see above.
-4. **MTP head**, then **vision**, both of which the model runs without.
-5. **SM121 kernels** at these dimensions.
+## Suggested order — spent
+
+This section used to sequence the port. Every step of it has landed; the
+history is in `QWEN4_EXP_PORT_LOG.md` and in #754's comment thread, which
+records each defect in the order it was found. Kept as a heading so links to it
+do not dangle.
 
 ## The forward pass, end to end
 
@@ -437,14 +454,23 @@ Three things worth stating because they are not obvious from the shapes:
 
 | piece | state |
 |---|---|
-| PLE tower | oracle ✅ 5.1e-7, GPU kernels ✅ 5.2e-3 — needs a GPU layer |
-| hyper-connections | oracle ✅ 1.6e-7, GPU kernels ✅ 3.9e-3 — needs a GPU layer |
-| trunk entry (`q4e_hc_expand`) | ✅ exact — **done** |
-| linear attention (36 layers) | Atlas's GDN + `output_gate_type` — **done** |
-| gated-Q full attention (12 layers) | kernel ✅ 3.4e-3, on a FLAT K/V buffer; still needs paging |
-| 512-expert MoE | **reuse, not adaptation** — see below |
-| layer wiring above | not written |
-| MTP | not written; `load_mtp_weights` returns None so `--speculative` is refused |
+| PLE tower | **SERVES** at model layer 1. CPU oracle 5.1e-7; GPU vs the real reference module cos 0.999998, max_rel 0.40–1.24%; GPU vs the CPU oracle in `ops/qwen4exp_oracle_tests.rs` |
+| hyper-connections | **SERVES** on all 48 layers. Oracle 1.6e-7; GPU vs the reference golden cos 0.999998 with `hc_post` bit-exact; also gated against the CPU oracle at T=1/64/96, which is what selects the split / GEMM collapse |
+| trunk entry (`hc_expand`) | **SERVES**. Exact, sentinel-checked |
+| linear attention (36 layers) | **SERVES**. Atlas's GDN + the sigmoid output gate selected from `output_gate_type` |
+| gated-Q full attention (12 layers) | **SERVES** on the production PAGED path. Our flat-buffer `q4e_attn_decode` stays as the microtest oracle |
+| 512-expert MoE | **SERVES** — reuse, with `norm_topk_prob` pinned true |
+| QSA indexer | **SERVES**: decode-side and per-query prefill selection, parity-gated at T=2200 where selection actively prunes |
+| layer wiring | **SERVES**, as hc arms on `qwen3_ssm` / `qwen3_attention` rather than a standalone layer — which is what carries paging, graphs and prefix caching |
+| vision tower | **LOADS AND RUNS** via the qwen35 ViT loader |
+| CUDA graphs | capture + replay clean; correct but roughly neutral on speed at C=1 |
+| prefix caching | correct AND faster — PLE/QSA aux rides the snapshots warm turns hit (3.9x warm TTFT) |
+| concurrency | C>1 honoured; C=2 measured at 20.5 tok/s aggregate |
+| MTP | **not implemented**. `load_mtp_weights` returns `None`, so `--speculative` is refused at pre-flight rather than half-wired |
+| stacked expert layout | **unreached** — both published releases split their trunk experts. The manifest describes it, so pre-flight would name the missing tensors rather than failing inside a kernel |
+
+Measured on a GB10 (rsafier, #754): decode 16.5 tok/s, prefill 747 tok/s at a
+2191-token prompt.
 
 ### The 512-expert MoE is REUSE, like the linear attention was
 
@@ -475,27 +501,38 @@ Two caveats worth keeping visible:
   and HF's default is true. Top-K then softmax silently renormalises away the
   router's confidence.
 
-## What the layer implementation actually needs
+## Where the layer implementation actually went
 
-Smaller than it looks. `TransformerLayer` has ~25 methods but only **two are
-required**: `decode` and `alloc_state`. `prefill` defaults to
-`default_loops::prefill_default`, which loops `decode` per token — correct, if
-not fast, and enough to serve.
+This section planned a standalone `Qwen4ExpLayer` implementing
+`TransformerLayer::{decode, alloc_state}` and inheriting
+`default_loops::prefill_default`, which loops `decode` per token — correct, and
+enough to serve. The #754 merge chose the other road, and it is the better one:
+mHC, PLE and QSA hang off the EXISTING `qwen3_ssm` and `qwen3_attention` layers
+as hc arms (`trait_decode_hc.rs`, `trait_prefill_hc.rs`,
+`trait_prefill_block.rs`). A per-token prefill loop cannot scale, and hanging
+off the existing layers is what carries the paged attention path, CUDA graphs,
+prefix caching and C>1 for free.
 
-The pieces are in place:
+The extraction is worth knowing about because it is the delicate part: the SSM
+prefill fuses its residual adds into its norms (steps 1/11/13), so under a
+highway they double-count. Steps 2–10 are residual-free, so they moved verbatim
+into `prefill_block` — verified byte-identical against the pre-move source —
+with `prefill_inner_hc` / `decode_inner_hc` as a second entry path.
 
-| need | state |
+The scaffold layer is retired. What survives from it, and is still load-bearing:
+
+| piece | where it went |
 |---|---|
-| grouped RMS norm | kernel ✅ verified vs oracle |
-| hyper-connection collapse / scatter | kernels ✅ verified vs oracle |
-| PLE gate + dilated conv | kernels ✅ verified vs oracle |
-| GDN with a sigmoid output gate | kernels ✅, selected from `output_gate_type` |
-| n-gram rows | `atlas_core::ngram_table`, disk-backed ✅ |
-| token ids inside a layer | `ForwardContext::token_ids` — **already exists** |
+| grouped RMS norm | `common/rms_norm.cu`, verified vs oracle |
+| the three sigmoid gated-norm twins | `common/rms_norm.cu`, selected at layer init from `output_gate_type` |
+| `q4e_hc_*` / `q4e_ple_*` / `q4e_attn_decode` | microtest oracles, independently reproduced on a second GB10 |
+| `atlas_core::ngram_table` | the CPU forward and the `qwen4exp_*_check` examples |
+| `ForwardContext::token_ids` | what the PLE tower reads — a device `[num_tokens]` u32 buffer added for DeepSeek-V4's hash-MoE routing, already there |
 
-That last one was the only architectural hole, and it turned out to be already
-filled: `token_ids` is a device `[num_tokens]` u32 buffer added for
-DeepSeek-V4's hash-MoE routing, carrying exactly the ids the PLE tower needs.
+The serving n-gram rows come from `spark_storage::NgramRowCache` instead, whose
+`open_segmented` handles the fact that the 128 PLE shards are NOT contiguous
+(they span 26.4 GB of a 102.4 GB table), so a single base offset would read
+wrong-but-valid rows silently.
 
 ### The PLE gather is a host round-trip, deliberately
 
@@ -508,17 +545,21 @@ orders of magnitude slower. Making it a device-side gather would require the
 
 ### Remaining work
 
-1. `Qwen4ExpLayer::alloc_state` — GDN recurrent + conv state for linear layers,
-   the PLE short-conv state (dilated, so `(kernel-1)*ngram_size` = 9 wide) for
-   layer 1, KV for the 12 attention layers.
-2. `Qwen4ExpLayer::decode` — sequence the kernels in the order under
-   "The forward pass, end to end" above.
-3. Adapt the 512-expert MoE and gated-Q attention paths.
-
-Every block in step 2 has an oracle. The CPU forward
-(`cargo run -p atlas-core --example qwen4exp_forward`) is the end-to-end check:
-it is token-identical to HuggingFace on a reduced checkpoint and produces
-coherent text on the real one.
+1. **MTP.** Its shape is not the `MtpWeights` any other family uses — its own
+   512-expert stack, its own indexer, two input norms of *different* widths.
+   When revisited, note the trap #746 documents for LongCat: the `verify_*`
+   paths call bare `embed()`, which an n-gram guard refuses.
+2. **The stacked expert layout**, if a release ever ships one.
+3. **Thinking-body quality at the card's temperature 1.0.** With
+   `norm_topk_prob` fixed the control flow is clean and greedy is coherent;
+   whether the residual weakness is distribution quality is the open thread on
+   #754, and `bench/qwen4_exp/{forward_ref,logit_quality_aligned}.py` plus
+   `ATLAS_DUMP_LOGITS_PATH` are the harness for it.
+4. **QSA prefix-cache re-ingest** needs the raw indexer keys in the radix
+   payload; the guard errors loudly rather than serving stale keys.
+5. **Chunk-1+ QSA prefill above 8193 tokens** is wired and correct by
+   construction; the >8K envelope was validated end to end at 10,749 tokens
+   through the chat template.
 
 ## GPU kernels: what exists and what it is checked against
 
@@ -552,34 +593,51 @@ ignored `gate` entirely would still produce well-formed attention output. The
 check recomputes with every gate forced to +8 (sigmoid ~ 1) and requires the
 answer to move; it moves by 300x the error.
 
-### The trunk entry is q4e_hc_expand, not DeepSeek-V4's hc_expand
+### The trunk entry: `hc_expand`, from this target's own shadow
 
-The two do the same job, but V4's lives in that model's shadow rather than in
-`common/`, so it does not resolve for this target. Same module-scoping rule
-that forced the `q4e_` prefix (below).
+Corrected after the #754 merge. This tree briefly carried
+`q4e_hc_expand` in `common/` because DeepSeek-V4's `hc_expand` lives in THAT
+model's shadow and so does not resolve here. The merge brought a
+`hyper_connection.cu` shadow for `qwen3.8-flash-next` itself, which supplies
+`hc_expand` / `hc_pre` / `hc_post` / `hc_head` under the names Atlas's mHC
+dispatch already looks up — so the engine uses those, and `q4e_hc_expand`
+remains only as a microtest oracle.
+
+Both forms have the same load-bearing property, below.
 
 The streams must start IDENTICAL — a copy of the embedding into all `hc_count`
 slots. Zero-initialising them instead makes the first hyper-connection collapse
 read a zero mean, and the model does not recover, while still emitting tokens.
 
-### hc_streams: the element size is per-family
+### hc_streams: FP32 for both families, and why the per-family branch went
 
-`hc_streams` was gated on `hc_mult > 0`, DeepSeek-V4's spelling. `qwen4_exp`
-says `hc_count`, so it silently received the 256-byte placeholder and the first
-write past it would have been another buffer.
+`hc_streams` was once gated on `hc_mult > 0`, DeepSeek-V4's spelling.
+`qwen4_exp` says `hc_count`, so it silently received the 256-byte placeholder
+and the first write past it would have been another buffer. Fixing that
+introduced a second, subtler version of the same hazard: the element size was
+branched per family, f32 for `hc_mult` and bf16 for `hc_count`.
+
+That was right while this tree's own `q4e_hc_stream_mix` /
+`q4e_hc_scatter_add` read the buffer — they stride by `__nv_bfloat16`. It is
+wrong for the kernels that now serve: every entry point in
+`hyper_connection.cu` declares this buffer `float*`. So it is unconditionally
+f32, and the branch was REMOVED rather than left in place, because reading the
+code as written would lead the next person to restore it.
 
 | family | field | element | why |
 |---|---|---|---|
 | DeepSeek-V4 | `hc_mult` | f32 | manifold mixing is norm-preserving; bf16 swamps the per-layer signal and collapses generation |
-| qwen4_exp | `hc_count` | bf16 | `q4e_hc_stream_mix` / `q4e_hc_scatter_add` stride by `__nv_bfloat16` |
+| qwen4_exp | `hc_count` | f32 | `hyper_connection.cu` declares `const float* streams` / `float* out` on every entry point |
 
-Sizing the qwen4_exp arm f32 would NOT have failed — it would have read the
-wrong half of every value.
+Getting it wrong does not fail: it reads the wrong half of every value, on all
+48 layers. `buffers/sizes.rs` pins all three fillings — `hc_mult` only,
+`hc_count` only, and both, which is what the parser actually produces — to the
+same size.
 
-**OPEN:** qwen4_exp's mixer is contractive (it divides by `hc_count`) rather
-than norm-preserving, so V4's drift argument does not obviously transfer.
-Whether 48 layers x 2 blocks of bf16 accumulation drifts is UNMEASURED. If it
-does, the kernels and the sizing move together.
+**CLOSED** (was open): qwen4_exp's mixer is contractive, dividing by
+`hc_count`, rather than norm-preserving, so V4's drift argument does not
+transfer. The port keeps the FP32 highway regardless and generates coherently
+across all 48 layers, so there is nothing to trade and nothing left to measure.
 
 ### The GDN kernel is reusable, with one interface trap
 
