@@ -270,6 +270,23 @@ its per-token conv launches (same bits, more launches)."""
 # Same setting as qwen3.8-27b / qwen3.6-35b: reasoning by default.
 thinking_default = true
 thinking_in_tools = true
+# WITHOUT THIS, TOOL CALLING IS SILENTLY OFF. `tools_active` in
+# `api/chat/prepare.rs` requires `state.tool_call_parser.is_some()`, and with
+# no parser configured the tool definitions are never passed to Jinja at all —
+# so the template's `{%- if tools ... %}` branch falls through, the model is
+# told nothing about any function, and it answers from its own knowledge.
+# Measured 2026-08-27 on a BFCL-style subset: 1/6, and the one pass was the
+# irrelevance case (declining to call is trivially correct when you have not
+# been given tools). The model's reasoning said so outright — "I don't have
+# access to ... any tools that would let me check current conditions."
+#
+# qwen3_coder, not hermes: this checkpoint's own template instructs the XML
+# call syntax, not hermes JSON —
+#   <tool_call><function=NAME><parameter=K>v</parameter></function></tool_call>
+# which is what `qwen3_coder` parses (`<function=X>` / `<parameter=K>`, Qwen's
+# `=` syntax). Same parser the qwen3.6-35b-a3b target documents as its proven
+# path after qwen3_xml garbled arguments there.
+tool_call_parser = "qwen3_coder"
 # Card sampling presets ([sampling.*] above) apply to core chat/completions
 # requests too — without this a plain request gets Atlas's generic CLI
 # defaults (incl. min_p 0.08 + top_n_sigma 1.0, which gut the card's
