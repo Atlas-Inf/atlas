@@ -23,8 +23,37 @@ repo CI   SPDX headers · kernel shadow structure · qwen4_exp kernel NAMES
 lint      fmt · clippy
 ```
 
-`check_qwen4exp_kernel_names.py` is new and is the one class of startup failure
-a laptop can rule out: kernel lookups are two STRING literals, so `cargo check`
+`check_qwen4exp_kernel_names.py` is the one class of startup failure a laptop can
+rule out — and worth reading for how wrong it was at first. Pointing it at the
+wider dispatch surface exposed three bugs IN THE CHECKER, all of which made it
+UNDER-report the available kernels, i.e. produce a false MISSING for a kernel
+that is right there:
+
+1. the name is not always adjacent to `void` —
+   `extern "C" __global__ void __launch_bounds__(128, 1)\ngated_delta_rule_decode(`
+   and `extern "C" __global__\n__launch_bounds__(128, 3)\nvoid w4a16_gemm_t_m128(`
+   both defeat a `void (\w+)\(` regex. The prologue is now scanned. 437 -> 476
+   entry points;
+2. 21 files name their kernel with `#define KERNEL_NAME x` and `#include` a
+   template, so the name never appears in an `extern "C"` line — and the
+   template declares both `KERNEL_NAME` and `PAGED_CONCAT(KERNEL_NAME, _64)`.
+   476 -> 518;
+3. a kernel can be declared through an alias (`#define ATLAS_PREFILL_ENTRY
+   inferspark_prefill`), so names resolve through the file's object-like macros.
+
+Only with the available set complete was it worth widening the scope from the
+qwen4_exp files to every fail-closed lookup in the init paths of the layers this
+model builds. `gpu.kernel` (fail-closed, a miss means the server refuses to
+boot) is distinguished from `try_kernel` (0-handle, caller gates, absences are
+documented fallbacks in other models' shadows) — conflating them would flag 34
+legitimate fallbacks.
+
+This mattered because rsafier took HIS tree from "6 unresolved kernels to 0",
+and the merge changed which kernels resolve here: his per-target
+`gated_norm_sigmoid.cu` shadow was dropped in favour of ours in `common/`. So
+inheriting that result was not safe.
+
+What it does: kernel lookups are two STRING literals, so `cargo check`
 cannot see a typo — and a name that resolves in ANOTHER model's shadow is worse
 than one that does not resolve at all (`hyper_connection` belongs to
 DeepSeek-V4's Sinkhorn mHC as well as to this target's low-rank one; the same
@@ -63,7 +92,7 @@ test is `#[ignore]`d and unexecuted.
 | 3. config surface reconciled | **DONE** — one parser, both field families, 158 tests pass |
 | 4. clippy + fmt + SPDX | **DONE** — clean |
 | 5. oracle gate on the SERVING kernels | **DONE** — mHC (4 entry points, 3 dispatch arms) and the whole PLE chain, no checkpoint needed |
-| 5b. kernel NAME resolution checked statically | **DONE** — 37/37 resolve; both failure modes have negative controls |
+| 5b. kernel NAME resolution checked statically | **DONE** — all **160 fail-closed lookups** on the layers a qwen4_exp model builds resolve against 518 entry points; 34 `try_kernel` fallbacks correctly not required; both failure modes have negative controls |
 | 5c. QSA oracle + parity gate | **DONE** — the last block with no committed golden now has a CPU oracle |
 | 6. recipe + serve wiring | **DONE** — vendored recipe (census tests validate it produces a valid serve config), serve script hardened for >8K |
 | 7. `--generate N` off-by-one | **DONE** |
