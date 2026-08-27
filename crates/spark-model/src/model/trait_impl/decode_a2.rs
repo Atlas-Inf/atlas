@@ -117,7 +117,23 @@ impl TransformerModel {
         // runs the proven single-row highway decode against its own per-seq
         // PLE/QSA state, and the host staging below isolates the logits rows.
         // Batched-highway kernels are the perf follow-up.
-        let hc_perseq = self.config.hc_mult > 0;
+        // Highway models: the BATCHED multi-seq path (per-layer hc-bracketed
+        // decode, weight reads amortized at the GEMM level next increment)
+        // is the default. Fall back to the per-seq staging loop when
+        //   * ATLAS_HC_PERSEQ_DECODE=1 (A/B escape hatch), or
+        //   * QSA would be ACTIVE for any sequence (the ms attention path has
+        //     no per-seq indexer hook yet — dense past the budget is NOT the
+        //     reference model, so keep those batches on the proven loop).
+        let qsa_active = self.config.index_topk > 0 && {
+            // Mirrors QsaIndexer::inert_bound: index_topk IS the selection
+            // budget in tokens (2048 on this card); at or below
+            // budget + ratio - 1 visible tokens every block is selected and
+            // selection is inert.
+            let bound = self.config.index_topk + self.config.index_compress_ratio - 1;
+            seqs.iter().any(|s| s.seq_len >= bound)
+        };
+        let hc_perseq = self.config.hc_mult > 0
+            && (qsa_active || std::env::var("ATLAS_HC_PERSEQ_DECODE").as_deref() == Ok("1"));
         if mla_perseq_fallback || hc_perseq {
             use std::sync::atomic::Ordering;
             let logits = self.decode_logits_ptr();
@@ -241,7 +257,13 @@ impl TransformerModel {
         // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
         // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        let graph_key = if !ms_profile && !lora_eager && multiseq_graphs_enabled() {
+        // Per-layer graph veto (QSA's mid-decode top-k D2H, PLE's per-seq
+        // host hash on the hc multi-seq path) — the single-decode path
+        // consults it (decode_a `layer_veto`); the batched path must too, or
+        // capture hits 'PLE: un-prestaged forward inside CUDA graph capture'
+        // on the first joint hc step.
+        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        let graph_key = if !ms_profile && !lora_eager && !layer_veto && multiseq_graphs_enabled() {
             self.batch_decode_graph_key(&*seqs, padded_n)
         } else {
             None
@@ -356,7 +378,9 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: None,
-            host_token_ids: None,
+            // The batch's token ids: the hc multi-seq PLE rows read their
+            // per-seq id from this slice.
+            host_token_ids: Some(tokens),
             routed_lora_layers: None, // #30: batched decode never routes prefill.
             midchunk_capture: None,
         };

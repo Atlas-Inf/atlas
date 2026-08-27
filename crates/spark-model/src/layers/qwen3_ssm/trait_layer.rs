@@ -38,6 +38,13 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.ple.is_some()
     }
 
+    /// PLE's per-seq host hash on the hc multi-seq decode path is
+    /// capture-illegal (pageable reads); the single-decode path prestages
+    /// around it, the batched path does not — veto batched graphs.
+    fn decode_graph_unsupported(&self) -> bool {
+        self.ple.is_some()
+    }
+
     fn snapshot_aux(
         &self,
         state: &dyn LayerState,
@@ -188,7 +195,12 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.refuse_batched_under_hc("decode_multi_seq")?;
+        if self.hc.is_some() {
+            // #753 item B milestone 2: the highway replaces the residual the
+            // non-hc path folds into its fused norm kernels; run the
+            // hc-bracketed variant instead of refusing.
+            return self.decode_multi_seq_inner_hc(hidden, num_seqs, states, ctx, stream);
+        }
         self.decode_multi_seq_inner(
             hidden,
             residual,

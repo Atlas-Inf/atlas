@@ -41,7 +41,6 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let _ = states; // Attention layers use EmptyLayerState — no per-seq state.
         let bs = kv_cache.block_size() as u32;
         let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
         // Per-request LoRA routing slot buffer for this step (from metadata).
@@ -49,10 +48,11 @@ impl Qwen3AttentionLayer {
             c.seq_slot = m.seq_slot;
         }
 
-        // DeepSeek-V4: Manifold-Constrained Hyper-Connections (mHC).
+        // DeepSeek-V4 / Qwen4-exp: Manifold-Constrained Hyper-Connections.
         if self.hc.is_some() {
-            return self.decode_multi_seq_inner_hc(c, kv_cache, ctx, stream);
+            return self.decode_multi_seq_inner_hc(c, states, _seq_lens, kv_cache, ctx, stream);
         }
+        let _ = states; // Non-hc attention keeps no per-seq state.
 
         // ── Phase 1: RMS norm + residual for N tokens ──
         ops::rms_norm_residual(
@@ -118,9 +118,11 @@ impl Qwen3AttentionLayer {
     /// HC-enabled batched multi-sequence decode.  Only the sequential
     /// per-token FFN branch is implemented (DeepSeek-V4 MLA always
     /// takes this path).
-    fn decode_multi_seq_inner_hc(
+    fn decode_multi_seq_inner_hc<'a, 'b: 'a>(
         &self,
         c: ctx::MultiSeqCtx<'_>,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        seq_lens: &[usize],
         kv_cache: &mut PagedKvCache,
         ctx: &ForwardContext,
         stream: u64,
@@ -229,6 +231,36 @@ impl Qwen3AttentionLayer {
         {
             let bytes = c.n * c.h * c.bf16;
             comm.all_reduce_async(o_out.0, bytes, c.stream)?;
+        }
+
+        // ── QSA ingest continuity (per-seq) ──
+        // Below the inert bound `decode_select` is ingest-only and returns
+        // `None`; the dispatch gate (decode_a2) routes any batch with an
+        // ACTIVE-selection sequence to the per-seq loop, so a `Some` here
+        // means the gate and this path disagree — refuse loudly rather than
+        // serve dense-past-budget (not the reference model).
+        if let Some(qsa) = self.qsa.as_ref() {
+            for (i, state) in states.iter_mut().enumerate().take(n) {
+                let st =
+                    crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, *state, ctx.gpu)?;
+                let sel = qsa.decode_select(
+                    st,
+                    c.normed.offset(i * h * c.bf16),
+                    seq_lens[i],
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    meta.block_table
+                        .offset(i * meta.max_blocks_per_seq as usize * 4),
+                    c.bs,
+                    ctx.gpu,
+                    stream,
+                )?;
+                anyhow::ensure!(
+                    sel.is_none(),
+                    "QSA selection active for seq {i} on the batched ms path; \
+                     the dispatch gate should have routed this batch per-seq"
+                );
+            }
         }
 
         // Expand attention output back into multi-stream state.

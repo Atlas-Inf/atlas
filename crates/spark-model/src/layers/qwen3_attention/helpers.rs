@@ -311,4 +311,3 @@ mod yarn_mscale_tests {
         assert_eq!(yarn_rope_mscale(&c), 1.0);
     }
 }
-

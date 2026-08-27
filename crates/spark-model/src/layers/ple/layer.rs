@@ -145,47 +145,7 @@ impl PleLayer {
         })
     }
 
-    /// Fresh sequence: EOS-filled history and a zeroed conv state.
-    fn reset(&self, st: &mut PleSeqState, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
-        st.history = vec![self.dims.eos_token_id; self.dims.context_len()];
-        st.prestaged_va = None;
-        let zeros = vec![0u8; self.state_len * self.hc_mult * self.hidden * 4];
-        gpu.copy_h2d_async(&zeros, st.conv, stream)?;
-        Ok(())
-    }
-
-    /// Hoisted per-step HOST work for decode under CUDA graphs: the n-gram
-    /// hash, the NVMe fault-in and the slot upload into the stable
-    /// `slots_dev` buffer. All three are capture-illegal (the upload reads
-    /// pageable memory, which invalidates a recording graph with status
-    /// 901), so the scheduler calls this BEFORE graph replay/capture — the
-    /// same phasing decode_a already gives the `token_ids` upload. `forward`
-    /// then consumes `prestaged_va` and enqueues only stable-buffer kernels.
-    ///
-    /// History advances HERE; the prestaged `forward` must not advance it
-    /// again.
-    pub fn prestage(
-        &self,
-        st: &mut PleSeqState,
-        tokens: &[u32],
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Result<()> {
-        if st.history.len() != self.dims.context_len() {
-            self.reset(st, gpu, stream)?;
-        }
-        let mut window = st.history.clone();
-        window.extend_from_slice(tokens);
-        let all = ple_ngram_ids(&self.dims, &window);
-        let rows = &all[all.len() - tokens.len()..];
-        let flat: Vec<u64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
-        let va = self.gather_host(&flat, gpu, stream)?;
-        let keep = self.dims.context_len();
-        st.history = window[window.len() - keep..].to_vec();
-        st.prestaged_va = Some(va);
-        st.last_staged_va = va;
-        Ok(())
-    }
+    // `reset` + `prestage` live in `aux_state.rs` (≤500 LoC split).
 
     // Marconi aux-state (snapshot_aux / restore_aux) moved to
     // `aux_state.rs` (≤500 LoC split).
@@ -201,12 +161,39 @@ impl PleLayer {
     /// Inject into `highway` `[T, hc_mult*hidden]` FP32, in place.
     ///
     /// `fresh` starts a new sequence (prefill from position 0).
+    /// One highway ROW with an explicit id — the multi-seq decode entry
+    /// (`ctx.host_token_ids` holds the whole batch; the caller slices).
+    pub fn forward_row(
+        &self,
+        st: &mut PleSeqState,
+        highway_row: DevicePtr,
+        ids: &[u32],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.forward_with_ids(st, highway_row, 1, false, Some(ids), ctx, stream)
+    }
+
     pub fn forward(
         &self,
         st: &mut PleSeqState,
         highway: DevicePtr,
         num_tokens: usize,
         fresh: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.forward_with_ids(st, highway, num_tokens, fresh, None, ctx, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_ids(
+        &self,
+        st: &mut PleSeqState,
+        highway: DevicePtr,
+        num_tokens: usize,
+        fresh: bool,
+        ids_override: Option<&[u32]>,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -227,7 +214,10 @@ impl PleLayer {
         // was a synchronous round trip per DECODE STEP for bytes the caller
         // had in hand, and inside a CUDA-graph capture region it is a
         // capture-unsupported op (STREAM_CAPTURE_INVALIDATED, 901).
-        let tokens: Vec<u32> = if let Some(host) = ctx.host_token_ids {
+        let tokens: Vec<u32> = if let Some(ov) = ids_override {
+            anyhow::ensure!(ov.len() == num_tokens, "PLE: ids_override length");
+            ov.to_vec()
+        } else if let Some(host) = ctx.host_token_ids {
             anyhow::ensure!(
                 host.len() >= num_tokens,
                 "PLE: host_token_ids has {} ids for {num_tokens} tokens",

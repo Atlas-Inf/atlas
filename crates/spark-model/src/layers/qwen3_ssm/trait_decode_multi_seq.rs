@@ -4,6 +4,7 @@
 
 use super::*;
 
+mod hc;
 mod ssm_batched;
 mod ssm_batched_recurrent;
 
