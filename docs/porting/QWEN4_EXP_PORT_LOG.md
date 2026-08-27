@@ -463,3 +463,121 @@ This does not need to block the PR either way.
   quietly diverge from the reference on 1 in `ratio` positions.
 * MTP, the stacked expert layout, QSA prefix-cache re-ingest, and thinking-body
   quality at temperature 1.0 are open in both branches.
+
+## First run on real hardware (2026-08-27, GB10 `gx10-e3a3`)
+
+The port had a 20/20 static gate, ~3,500 tests, 27 green CI legs and two
+completed audit rounds before anything executed. Running it found four
+defects in the first ten minutes. Recording them here because the split
+between what the gate could and could not reach is the useful part.
+
+Environment: GB10, `sm_121`, CUDA 13.0, 119.6 GB unified
+(`memory.total [N/A]`, `Addressing Mode: ATS` — the coherent-memory tell),
+`RadixArk/Qwen3.8-Flash-Next-NVFP4` resident at `~/code/radixark-nvfp4`.
+
+### What the static gate DID reach, and got right
+
+| step | result |
+|---|---|
+| kernels compile (nvcc) | 502/4564 unique invocations, 9.1x dedup, 177 kernels for `qwen3.8-flash-next` |
+| kernels vs CPU oracle | **3/3** — mHC highway, PLE tower, QSA indexer, each with its control |
+| five block microtests | **5/5** — GDN decode, attention decode, hc expand, hc sandwich, grouped norm |
+| checkpoint preflight | **0 missing / 0 unexpected / 0 mismatched** |
+
+So every kernel this model builds is numerically right on the real device,
+and every tensor the loader wants exists at the right shape. The defects
+were all in COMPOSITION and in reading the checkpoint's own layout.
+
+### Defect 1 — the PLE shards span ten files
+
+    PLE: shard 2 lives in a different file from shard 0; the row cache
+    opens ONE backing file
+
+128 shards over 10 `model-plefp8-*.safetensors`, interleaved (0,1 in the
+first file; 2 in the fourth). Fixed in `5189a851`: `open_segmented` takes
+`(path, offset)` per shard, `row_byte` became `row_loc` returning both.
+
+Unreachable statically: it needs a checkpoint whose converter chose that
+layout. Pinned now by `shards_may_span_several_files`.
+
+### Defect 2 — the PLE table is FP8, not BF16
+
+    Prefill chunk layer 1 failed: NgramRowCache: read row 249579227
+
+`row_stride = head_dim * 2` against a `F8_E4M3` table: every row read 320
+bytes wide at twice its true offset from the shard base, and off the end
+of the file once the local index got large enough.
+
+**This one WAS reachable statically and I missed it.** The loader's own log
+line printed `102.4 GB BF16` for a table living inside a 126 GB checkpoint
+that also holds 73 GB of other weights. At 1 byte/element it is 51.2 GB =
+47.7 GiB, which is the figure this table has been described by throughout.
+The arithmetic was on screen and nothing checked it.
+
+Fixed in `884b298f`: stride comes from the shard's dtype, all shards must
+agree, BF16 and F8_E4M3 accepted and anything else refused by name.
+
+### Defect 3 — the FP8 dequant scale was never applied
+
+The table ships ONE BF16 scalar (`ngram_embedding.weight_scale`, shape
+`[1]`), not the per-row scale file `ScaleCache` was built for.
+`set_constant_scale` fills the per-slot array with it so
+`batched_embed_fp8` computes `fp8 * scale` per row — correct dequant, no
+kernel change, no extra I/O on the fault path.
+
+Worth naming the failure mode: without it the gather returns raw E4M3
+magnitudes, the n-gram contribution is off by a constant factor, and the
+output stays fluent. Nothing crashes and no log says so. The scale is now
+logged at load (`per-tensor scale 0.000199`).
+
+### Defect 4 — the serve script contradicted its own recipe
+
+The vendored recipe has said `kv_cache_dtype: bf16` since it was added and
+`the_qwen4_exp_recipe_lands_the_settings_it_documents` asserts it, but
+`serve_qwen4exp_tui.sh` never passed the flag. A run started from the
+script therefore got the FP8 default, and with it:
+
+    FP8 KV cache selected but the checkpoint ships NO k_scale/v_scale
+    ... silently clips BF16 into E4M3 range [-448, 448]
+
+Fixed in `f715376d`. BF16 KV then needs `--gpu-memory-utilization 0.90`
+(7.5 GB KV: 20512 blocks x 12 layers — correctly only the 12
+full-attention layers, since the 36 GDN layers hold no KV).
+
+### The model answers
+
+Coherence, fresh server, default config: **5/7**. `Paris`; `408`;
+`15:40` for "14:05 plus 95 minutes"; recalled `axolotl` across turns;
+answered the negation. Decode ~15.4 tok/s, TTFT ~780 ms.
+
+### Open defect — generation degrades within a response
+
+Correct answer first, then repetition (`408 408 408`, `Paris. The capital
+of France is Paris.`) or runs of `!`. `!` is token id 0, which is what
+argmax returns on a degenerate or unwritten logits row.
+
+Ruled out, each by experiment rather than by reading:
+
+| suspect | evidence against |
+|---|---|
+| prefix caching | identical with `--enable-prefix-caching` off |
+| CUDA graphs | `ATLAS_DEBUG_NO_GRAPH=1` made it WORSE (0/7) |
+| QSA indexer | `ATLAS_QSA_DISABLE=1` made it worse; 4/7 |
+| `w4a16_gemm_t` padded stride (the load-time warning) | the kernel does take and use `ldb` |
+| n-gram row cache bookkeeping | suspected and WRONG — `fetch_into` records map/slot_row/refbit/pinned correctly |
+
+Default config is the best of every variant tried, so flag-bisecting was
+walking away from the answer.
+
+Two readings of mine that were wrong and changed the diagnosis:
+the repetition is WITHIN one response, not across requests; and the
+"first request is already broken" probes were not first — the smoke suite
+had already run against that server, so the real pattern is cumulative
+within a session.
+
+Next, and set up rather than guessed: `PromptInput::TokenIds` feeds the
+CPU reference's exact greedy chain (`[11,42,7,300,5] -> 5013, 26, 15, 8,
+283`) to the GPU two ways — one token per request (prefill only, decode
+never runs) versus all of them in one request (decode). Prefill tracking
+the reference while decode diverges localizes the fault to decode without
+touching a flag.
