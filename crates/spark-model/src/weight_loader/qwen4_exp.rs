@@ -98,15 +98,23 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
     ) -> Result<Vec<Box<dyn TransformerLayer>>> {
         // Load what exists, so a checkpoint problem surfaces as a named tensor
         // rather than hiding behind the unimplemented forward pass.
-        let loaded = Qwen4ExpWeights::load(store, config, gpu)?;
+        let qctx = crate::weight_map::QuantizeCtx {
+            absmax_k: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
+            quantize_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+            stream: gpu.default_stream(),
+        };
+        let variant = crate::weight_map::detect_nvfp4_variant(store, config);
+        let loaded = Qwen4ExpWeights::load(store, config, gpu, variant, qctx)?;
         anyhow::bail!(
-            "qwen4_exp weights load ({} layers, {} PLE towers), but the forward pass is not \
-             implemented: low-rank hyper-connections, the PLE tower and the sparse-attention \
-             indexer are unbuilt, and the linear-attention and {}-expert MoE paths are unadapted. \
+            "qwen4_exp weights load ({} layers, {} PLE towers, {} routed experts/layer), but the \
+             forward pass is not implemented: no Qwen4ExpLayer sequences the verified blocks \
+             against Atlas's KV paging and buffer arena yet. The per-block kernels DO exist and \
+             are checked against the CPU oracles (grouped norm, hyper-connections, PLE tower, \
+             gated-delta-net, gated-Q attention, trunk expand). \
              See docs/porting/QWEN4_EXP.md.",
             loaded.layers.len(),
             loaded.layers.iter().filter(|l| l.ple.is_some()).count(),
-            config.num_experts,
+            loaded.layers.first().map_or(0, |l| l.moe.experts.len()),
         )
     }
 }

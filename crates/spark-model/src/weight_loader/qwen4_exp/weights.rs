@@ -16,7 +16,9 @@ use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
-use crate::weight_map::{DenseWeight, dense_auto};
+use crate::weight_map::{
+    DenseWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, dense_auto, load_moe,
+};
 
 /// Language-model weight prefix in every published `qwen4_exp` checkpoint.
 pub const LM: &str = "model.language_model";
@@ -155,11 +157,22 @@ pub struct Layer {
     pub attn_hc: HyperConnection,
     pub mlp_hc: HyperConnection,
     pub mixer: Mixer,
-    /// Router weight. Expert bodies are loaded separately by the MoE path,
-    /// which has to cope with both the split and stacked layouts.
-    pub router: DenseWeight,
-    pub shared_gate: DenseWeight,
-    pub shared_expert: [DenseWeight; 3],
+    /// Router, shared expert and all 512 routed experts.
+    ///
+    /// This is the SHARED `load_moe` path, not a qwen4_exp-specific one. The
+    /// naming this model uses -- `{layer}.mlp.gate.weight`,
+    /// `{layer}.mlp.shared_expert.{gate,up,down}_proj.weight`, and
+    /// `{layer}.mlp.experts.{e}.{proj}.weight` -- is byte-for-byte what
+    /// `load_moe_inner` already expects, and the target checkpoint's trunk
+    /// experts are `PerExpert`, which is that function's default arm. The MoE
+    /// here is reuse, the same way the linear attention turned out to be.
+    ///
+    /// The `Stacked` layout (HuggingFace-native, `experts.gate_up_proj` as one
+    /// `[experts, 2*inter, hidden]` tensor) is NOT handled by this path. Both
+    /// published releases split their trunk experts, so it is unreached today;
+    /// `weight_manifest::qwen4_exp` still describes it, and preflight would
+    /// name the missing tensors rather than failing in a kernel.
+    pub moe: MoeWeights,
     pub ple: Option<Ple>,
 }
 
@@ -171,34 +184,17 @@ pub struct Qwen4ExpWeights {
     pub layers: Vec<Layer>,
 }
 
-fn load_shared_expert(
-    store: &WeightStore,
-    prefix: &str,
-    gpu: &dyn GpuBackend,
-) -> Result<[DenseWeight; 3]> {
-    Ok([
-        dense_auto(
-            store,
-            &format!("{prefix}.shared_expert.gate_proj.weight"),
-            gpu,
-        )?,
-        dense_auto(
-            store,
-            &format!("{prefix}.shared_expert.up_proj.weight"),
-            gpu,
-        )?,
-        dense_auto(
-            store,
-            &format!("{prefix}.shared_expert.down_proj.weight"),
-            gpu,
-        )?,
-    ])
-}
 
 impl Qwen4ExpWeights {
     /// Load everything the forward pass needs that is not an expert body or an
     /// n-gram row.
-    pub fn load(store: &WeightStore, config: &ModelConfig, gpu: &dyn GpuBackend) -> Result<Self> {
+    pub fn load(
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+        variant: Nvfp4Variant,
+        qctx: QuantizeCtx,
+    ) -> Result<Self> {
         anyhow::ensure!(
             config.layer_types.len() == config.num_hidden_layers,
             "layer_types must cover every layer"
@@ -250,13 +246,8 @@ impl Qwen4ExpWeights {
                     true,
                 )?,
                 mixer,
-                router: dense_auto(store, &format!("{base}.mlp.gate.weight"), gpu)?,
-                shared_gate: dense_auto(
-                    store,
-                    &format!("{base}.mlp.shared_expert_gate.weight"),
-                    gpu,
-                )?,
-                shared_expert: load_shared_expert(store, &format!("{base}.mlp"), gpu)?,
+                moe: load_moe(store, &base, config.num_experts, gpu, config, variant, qctx)
+                    .with_context(|| format!("layer {index}: MoE"))?,
                 ple,
             });
         }
