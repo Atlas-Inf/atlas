@@ -104,11 +104,19 @@ struct Segments {
     shard_file: Vec<u32>,
 }
 
-/// Per-row f32 scales for an FP8 table, mirrored into a device-visible
-/// `[slots]` array indexed by SLOT (parallel to the arena).
+/// Dequant scales for an FP8 table, mirrored into a device-visible `[slots]`
+/// f32 array indexed by SLOT (parallel to the arena), which is what
+/// `batched_embed_fp8` reads.
+///
+/// `file` is `Some` for a PER-ROW scale file, whose entry for a row is
+/// refreshed into the row's slot on every fault. It is `None` for a single
+/// PER-TENSOR scale: RadixArk's NVFP4 conversion of Qwen3.8-Flash-Next stores
+/// its FP8 PLE table's scale as one BF16 scalar
+/// (`ngram_embedding.weight_scale`, shape `[1]`), so every slot holds the same
+/// value, written once at open and never touched again.
 struct ScaleCache {
     arena: ExpertArena,
-    file: File,
+    file: Option<File>,
 }
 
 /// A 4 KiB-aligned host buffer for O_DIRECT reads.
@@ -184,7 +192,7 @@ impl NgramRowCache {
                 Some(ScaleCache {
                     arena: ExpertArena::new(1, sblocks as u32, BLOCK)
                         .context("NgramRowCache: scale arena")?,
-                    file: open_direct(sp)?,
+                    file: Some(open_direct(sp)?),
                 })
             }
             None => None,
@@ -208,50 +216,6 @@ impl NgramRowCache {
             misses: 0,
             evictions: 0,
         })
-    }
-
-    /// As [`Self::open_at`], but for a table split across equal-sized shards
-    /// at SCATTERED offsets, in one or MORE files — Qwen3.8-Flash-Next's PLE
-    /// table, whose 128 shard tensors are neither consecutive nor confined to
-    /// a single safetensors file. `shards[i]` is shard `i`'s backing file and
-    /// the byte offset of its first row; every shard holds `rows_per_shard`
-    /// rows.
-    ///
-    /// Each DISTINCT path is opened once, so a 128-shard table over 10 files
-    /// costs 10 descriptors rather than 128.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_segmented(
-        shards: &[(std::path::PathBuf, u64)],
-        rows_per_shard: u64,
-        scale_path: Option<&Path>,
-        row_stride: usize,
-        slots: usize,
-    ) -> Result<Self> {
-        if shards.is_empty() || rows_per_shard == 0 {
-            bail!(
-                "NgramRowCache: segmented table needs shards and rows \
-                 (shards={}, rows_per_shard={rows_per_shard})",
-                shards.len()
-            );
-        }
-        let (paths, shard_file) = plan_shard_files(shards);
-        let mut files = Vec::with_capacity(paths.len());
-        for path in &paths {
-            files.push(open_direct(path)?);
-        }
-        let rows_total = shards.len() as u64 * rows_per_shard;
-        // `open_at` opens shard 0's file for the unsegmented `self.file`
-        // field, which a segmented cache never reads — `row_loc` always
-        // resolves through `segments.files`. Kept so the single-offset path
-        // stays byte for byte what it was.
-        let mut c = Self::open_at(paths[0], 0, scale_path, rows_total, row_stride, slots)?;
-        c.segments = Some(Segments {
-            bases: shards.iter().map(|(_, off)| *off).collect(),
-            rows_per: rows_per_shard,
-            files,
-            shard_file,
-        });
-        Ok(c)
     }
 
     /// Device VA of the cache's row table — the `embed_table` argument of the
@@ -390,11 +354,14 @@ impl NgramRowCache {
         };
         dst.copy_from_slice(&self.bounce.blocks(nblocks)[within..within + self.row_stride]);
 
-        if let Some(sc) = &self.scales {
+        // A constant per-tensor scale needs no per-row refresh: every slot
+        // already holds it (see `set_constant_scale`).
+        if let Some(sc) = self.scales.as_ref().filter(|sc| sc.file.is_some()) {
             let sbyte = id * 4;
             let sblock = sbyte - (sbyte % BLOCK as u64);
             let swithin = (sbyte - sblock) as usize;
-            atlas_tier::pio::read_exact_at(&sc.file, self.bounce.blocks(1), sblock)
+            let sfile = sc.file.as_ref().expect("filtered on is_some");
+            atlas_tier::pio::read_exact_at(sfile, self.bounce.blocks(1), sblock)
                 .with_context(|| format!("NgramRowCache: read scale {id}"))?;
             // SAFETY: slot < slots, scale arena holds slots*4 bytes.
             let sdst = unsafe {
@@ -441,27 +408,8 @@ fn open_direct(path: &Path) -> Result<File> {
     File::open(path).with_context(|| format!("NgramRowCache: open {}", path.display()))
 }
 
+/// Segmented (multi-shard, multi-file) tables and per-tensor FP8 scales.
+mod segmented;
+
 #[cfg(test)]
 mod tests;
-
-/// Distinct backing paths in first-use order, and `shard -> path index`.
-///
-/// Split out of [`NgramRowCache::open_segmented`] and kept free of any CUDA so
-/// it is directly testable: a segmented table's shards may live in several
-/// files, and assuming otherwise silently loses every shard outside the first
-/// one. Dedupes so a 128-shard table over 10 files costs 10 descriptors.
-fn plan_shard_files(shards: &[(std::path::PathBuf, u64)]) -> (Vec<&Path>, Vec<u32>) {
-    let mut paths: Vec<&Path> = Vec::new();
-    let mut shard_file = Vec::with_capacity(shards.len());
-    for (path, _) in shards {
-        let idx = match paths.iter().position(|p| *p == path.as_path()) {
-            Some(i) => i,
-            None => {
-                paths.push(path.as_path());
-                paths.len() - 1
-            }
-        };
-        shard_file.push(idx as u32);
-    }
-    (paths, shard_file)
-}

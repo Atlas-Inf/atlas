@@ -3,6 +3,7 @@
 //! Tests for the NVMe-backed n-gram row cache. Split out of
 //! `ngram_cache.rs` to keep that file under the 500-LoC cap.
 
+use super::segmented::plan_shard_files;
 use super::*;
 
 #[test]
