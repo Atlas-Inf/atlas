@@ -88,3 +88,128 @@ fn one_file_stays_one_descriptor() {
     assert!(shard_file.iter().all(|f| *f == 0));
     assert_eq!(shard_file.len(), 128);
 }
+
+/// **Byte-identical rows across a MULTI-FILE table, read through the real
+/// O_DIRECT path.**
+///
+/// `shards_may_span_several_files` pins the shard -> file MAPPING and needs no
+/// GPU. This pins the thing the mapping exists for: that a resolved slot holds
+/// the bytes of the row it claims, when those rows come from DIFFERENT backing
+/// files and the read crosses shard and file boundaries.
+///
+/// Adopted from @maplepaladin73's independent GB10 bring-up on PR #16, whose
+/// local patch carried this coverage and mine did not. The two of us fixed the
+/// same multi-file defect the same way; this is the arm that would have caught
+/// a per-shard file index that was merely PLAUSIBLE — off by one, or correct
+/// for shard 0 and silently wrong for the rest.
+///
+/// Ignored by default: the arena is pinned, GPU-addressable memory, so it
+/// needs a live CUDA context.
+///
+///     cargo test -p spark-storage --features cuda multi_file_rows -- --ignored
+#[test]
+#[ignore]
+fn multi_file_rows_are_byte_identical() {
+    use std::io::Write;
+
+    const STRIDE: usize = 160; // FP8 row: head_dim 160 x 1 byte
+    const ROWS_PER: u64 = 64;
+    const PAD: usize = 8192; // keep every row's 4 KiB block inside the file
+
+    // Byte pattern for (shard, local row) — distinct per row AND per offset
+    // within the row, so a read that lands on the right row but the wrong
+    // offset still fails.
+    fn pattern(shard: usize, local: u64) -> Vec<u8> {
+        (0..STRIDE)
+            .map(|i| {
+                (shard as u8)
+                    .wrapping_mul(37)
+                    .wrapping_add((local as u8).wrapping_mul(11))
+                    .wrapping_add(i as u8)
+            })
+            .collect()
+    }
+
+    let dir = std::env::temp_dir().join(format!("ngram_mf_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let path_a = dir.join("shards_a.bin");
+    let path_b = dir.join("shards_b.bin");
+
+    // The REAL interleave RadixArk produces: shards 0,1,3 in one file and
+    // shard 2 in another, so shard index and file index disagree.
+    let layout = [(0usize, &path_a), (1, &path_a), (2, &path_b), (3, &path_a)];
+
+    let mut offsets: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    for file in [&path_a, &path_b] {
+        let mut fh = std::fs::File::create(file).expect("create");
+        // A non-4KiB-aligned base, which is what a safetensors data offset is.
+        fh.write_all(&vec![0u8; 8]).expect("lead");
+        let mut at = 8u64;
+        for (shard, f) in layout.iter() {
+            if *f != file {
+                continue;
+            }
+            offsets.push(((*file).clone(), at));
+            for local in 0..ROWS_PER {
+                fh.write_all(&pattern(*shard, local)).expect("row");
+            }
+            at += ROWS_PER * STRIDE as u64;
+        }
+        fh.write_all(&vec![0u8; PAD]).expect("pad");
+    }
+    // `offsets` was filled per file, so put it back in SHARD order — the order
+    // `open_segmented` indexes by.
+    let mut shards: Vec<(std::path::PathBuf, u64)> = vec![Default::default(); layout.len()];
+    let mut k = 0;
+    for file in [&path_a, &path_b] {
+        for (shard, f) in layout.iter() {
+            if *f == file {
+                shards[*shard] = offsets[k].clone();
+                k += 1;
+            }
+        }
+    }
+
+    let mut cache = NgramRowCache::open_segmented(&shards, ROWS_PER, None, STRIDE, 256)
+        .expect("segmented cache over two files");
+
+    // Walk rows that cross both shard and FILE boundaries: the last row of
+    // shard 1 (file A), the first and last of shard 2 (file B), the first of
+    // shard 3 (file A again).
+    let probes: Vec<u64> = vec![
+        0,
+        ROWS_PER - 1,
+        ROWS_PER,
+        2 * ROWS_PER - 1,
+        2 * ROWS_PER,
+        3 * ROWS_PER - 1,
+        3 * ROWS_PER,
+        4 * ROWS_PER - 1,
+    ];
+    let mut slots = Vec::new();
+    cache.resolve(&probes, &mut slots).expect("resolve");
+    assert_eq!(slots.len(), probes.len());
+
+    for (probe, slot) in probes.iter().zip(&slots) {
+        let shard = (*probe / ROWS_PER) as usize;
+        let local = *probe % ROWS_PER;
+        let got = cache.slot_bytes(*slot).expect("slot bytes");
+        assert_eq!(
+            got,
+            &pattern(shard, local)[..],
+            "row {probe} (shard {shard} local {local}, file {}) came back with \
+             the wrong bytes — the shard -> file mapping or the offset is wrong",
+            shards[shard].0.display()
+        );
+    }
+
+    // Every distinct file opened once, not one descriptor per shard.
+    let (_, shard_file) = super::segmented::plan_shard_files(&shards);
+    assert_eq!(
+        shard_file,
+        vec![0, 0, 1, 0],
+        "shard 2 must be the second file"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

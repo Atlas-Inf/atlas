@@ -230,6 +230,23 @@ impl NgramRowCache {
         self.row_stride
     }
 
+    /// A resident slot's raw bytes, for tests that verify the gather returned
+    /// the row it claimed. The arena is pinned host memory that is ALSO
+    /// GPU-addressable, so a host read here sees exactly what the kernel does.
+    #[cfg(test)]
+    pub(crate) fn slot_bytes(&self, slot: u32) -> Result<&[u8]> {
+        // SAFETY: slot < self.slots (checked) and the arena holds
+        // slots * row_stride bytes.
+        unsafe {
+            let base = self.arena.slot_host_ptr(0, 0)?;
+            anyhow::ensure!((slot as usize) < self.slots, "slot {slot} out of range");
+            Ok(std::slice::from_raw_parts(
+                base.add(slot as usize * self.row_stride),
+                self.row_stride,
+            ))
+        }
+    }
+
     pub fn table_dev_va(&self) -> Result<u64> {
         self.arena.slot_dev_va(0, 0)
     }
