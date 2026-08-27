@@ -106,13 +106,15 @@ impl Qwen3SsmLayer {
         }
 
         // ── GDN sublayer ──
+        // hc_pre writes the mixed+normed rows straight into norm_output —
+        // both the batched-GEMM core and the per-seq fallback read there.
         ops::hc_pre_site(
             ctx.gpu,
             self.hc_pre_k,
             streams,
             &hc.attn,
             hc,
-            hidden,
+            normed,
             post,
             comb,
             ctx.buffers.hc_lowrank_scratch(),
@@ -121,23 +123,40 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
-        // Recurrence per seq; stage each output row (ssm_forward reuses
-        // moe_output[0] every call) into norm_output[0..n).
-        for (i, state) in states.iter_mut().enumerate().take(n) {
-            let ssm_state = state
-                .as_any_mut()
-                .downcast_mut::<SsmLayerState>()
-                .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
-            let ssm_out =
-                self.ssm_forward(hidden.offset(i * h * bf16), ssm_state, ctx, stream, false)?;
-            ctx.gpu
-                .copy_d2d_async(ssm_out, normed.offset(i * h * bf16), h * bf16, stream)?;
-        }
+        // Batched-GEMM core (QKVZ/out_proj weights read ONCE for all n rows —
+        // the C=N scaling lever on bandwidth-bound LPDDR5X); out rows land in
+        // moe_output[0..n). `hidden`/`residual` are unused in hc mode.
+        let gdn_rows = if self.try_decode_multi_seq_ssm_batched(
+            hidden,
+            DevicePtr::NULL,
+            n,
+            states,
+            true,
+            ctx,
+            stream,
+        )? {
+            moe_out
+        } else {
+            // Fallback: per-seq recurrence reading the mixed rows; each
+            // output (ssm_forward reuses moe_output[0]) staged into `hidden`
+            // rows, which are dead in hc mode.
+            for (i, state) in states.iter_mut().enumerate().take(n) {
+                let ssm_state = state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
+                let ssm_out =
+                    self.ssm_forward(normed.offset(i * h * bf16), ssm_state, ctx, stream, false)?;
+                ctx.gpu
+                    .copy_d2d_async(ssm_out, hidden.offset(i * h * bf16), h * bf16, stream)?;
+            }
+            hidden
+        };
         ops::hc_post_site(
             ctx.gpu,
             self.hc_post_k,
             hc,
-            normed,
+            gdn_rows,
             streams,
             post,
             comb,
