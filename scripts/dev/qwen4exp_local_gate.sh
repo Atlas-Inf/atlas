@@ -72,6 +72,20 @@ run "touched crates, all targets, cuda" \
     "$CARGO" check -p atlas-core -p spark-model -p spark-runtime -p spark-server \
                    --all-targets "${CUDA[@]}"
 run "non-cuda (metal) build" "$CARGO" check -p atlas-core -p spark-model "${METAL[@]}"
+# WINDOWS, if its std is installed (`rustup target add x86_64-pc-windows-msvc`).
+# Worth a row: the release matrix builds Windows, and a missing `cfg(unix)` arm
+# is invisible on both platforms anyone develops on — one reached CI from this
+# branch. `spark-server` is excluded because `ring`'s build script needs a
+# Windows C toolchain to cross-compile, which macOS does not have; the three
+# crates below are where the qwen4_exp port actually lives.
+if $CARGO check -p atlas-core --target x86_64-pc-windows-msvc "${CUDA[@]}" \
+      >/dev/null 2>&1; then
+  run "windows cross-check" "$CARGO" check -p atlas-core -p spark-storage \
+      -p spark-runtime -p spark-model --lib \
+      --target x86_64-pc-windows-msvc "${CUDA[@]}"
+else
+  printf '%-46s %s\n' "windows cross-check" "SKIP (no x86_64-pc-windows-msvc std)"
+fi
 
 echo "── tests that actually run here ─────────────────────────────"
 # atlas-core links no CUDA libraries, so its tests run under the cuda feature —
@@ -145,8 +159,10 @@ echo
 if (( FAILED == 0 )); then
   echo "all gates PASS — logs in $LOGDIR"
   echo
-  echo "Still unverified by this gate, and only a GB10 can close it:"
-  echo "  * the .cu files compile (nvcc was never invoked)"
+  echo "Still unverified by this gate:"
+  echo "  * the .cu files compile — nvcc is never invoked here, but the PR's"
+  echo "    'nvcc -> PTX (all gb10 targets)' CI job does compile them all"
+  echo "  Only a GB10 can close the rest:"
   echo "  * cargo test -p spark-model --release qwen4exp_oracle -- --ignored"
   echo "  * cargo test -p spark-model --release hc_lowrank      -- --ignored"
   echo "  * cargo run --release -p spark-model --example qwen4exp_grouped_norm_microtest"

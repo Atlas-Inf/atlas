@@ -22,8 +22,40 @@ use crate::config::ModelConfig;
 use crate::weight_manifest::locate_checkpoint;
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
+
+/// Positional read at an absolute offset, without moving the file cursor —
+/// `pread(2)`. The whole point is that concurrent readers do not serialise on a
+/// shared cursor, which is what lets the PLE gather run without a mutex around
+/// the file.
+///
+/// Unix spells it `FileExt::read_exact_at`; Windows spells it
+/// `seek_read`, which is `OVERLAPPED` underneath and also does not move the
+/// cursor — but it is a SHORT read like `read`, so it needs the loop. The
+/// NVMe tiers are Linux-only in production; this arm exists so the workspace
+/// builds on the Windows release leg, which a missing `cfg` broke.
+#[cfg(unix)]
+fn read_exact_at(file: &File, out: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(out, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, out: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < out.len() {
+        let n = file.seek_read(&mut out[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short read from the n-gram table",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
 
 /// One shard of the concatenated table: a file, the byte span its rows occupy,
 /// and the global row it starts at.
@@ -173,10 +205,7 @@ impl NgramTable {
             .min(self.shards.len() - 1);
         let shard = &self.shards[index];
         let offset = shard.base + (row - shard.first_row) * self.row_bytes as u64;
-        shard
-            .file
-            .read_exact_at(out, offset)
-            .with_context(|| format!("reading row {row}"))?;
+        read_exact_at(&shard.file, out, offset).with_context(|| format!("reading row {row}"))?;
         Ok(())
     }
 
