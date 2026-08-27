@@ -440,8 +440,6 @@ pub fn attention_forward(
     let seq = hidden.len() / h;
     let q_dim = dims.num_heads * hd;
     let kv_dim = dims.num_kv_heads * hd;
-    let group = dims.num_heads / dims.num_kv_heads;
-    let scale = 1.0 / (hd as f32).sqrt();
 
     let mut queries = vec![0f32; seq * q_dim];
     let mut gates = vec![0f32; seq * q_dim];
@@ -476,38 +474,77 @@ pub fn attention_forward(
 
     let mut out = vec![0f32; seq * h];
     for t in 0..seq {
-        // Attention output, then the gate, then o_proj.
-        let mut context = vec![0f32; q_dim];
-        for head in 0..dims.num_heads {
-            let kv_head = head / group;
-            let q = &queries[t * q_dim + head * hd..t * q_dim + (head + 1) * hd];
-
-            let mut scores = Vec::with_capacity(t + 1);
-            for past in 0..=t {
-                let k = &keys[past * kv_dim + kv_head * hd..past * kv_dim + (kv_head + 1) * hd];
-                scores.push(q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale);
-            }
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut total = 0f32;
-            for score in &mut scores {
-                *score = (*score - max).exp();
-                total += *score;
-            }
-            for (past, weight) in scores.iter().enumerate() {
-                let v = &values[past * kv_dim + kv_head * hd..past * kv_dim + (kv_head + 1) * hd];
-                let slot = &mut context[head * hd..(head + 1) * hd];
-                for (c, value) in slot.iter_mut().zip(v) {
-                    *c += weight / total * value;
-                }
-            }
-        }
-        // Elementwise sigmoid gate, applied before the output projection.
-        for (c, g) in context.iter_mut().zip(&gates[t * q_dim..(t + 1) * q_dim]) {
-            *c *= sigmoid(*g);
-        }
+        let context = attention_decode_step(
+            dims,
+            &queries[t * q_dim..(t + 1) * q_dim],
+            &gates[t * q_dim..(t + 1) * q_dim],
+            &keys[..(t + 1) * kv_dim],
+            &values[..(t + 1) * kv_dim],
+        );
         out[t * h..(t + 1) * h].copy_from_slice(&linear(&context, w.o_proj, h, q_dim));
     }
     out
+}
+
+/// The attention arithmetic for ONE query position, up to but not including
+/// `o_proj`: causal softmax over the K/V written so far, then the elementwise
+/// sigmoid gate.
+///
+/// Split out of `attention_forward` so the GPU decode kernel is checked against
+/// the same code that matches HuggingFace at 8.0e-7, rather than against a
+/// second transcription of the same equations. `keys`/`values` are
+/// `[past_len, num_kv_heads * head_dim]` and their length is what sets the
+/// causal window -- the caller passes exactly the positions this query may see.
+///
+/// `query` must already be normed and rotated; `gate` is the raw pre-sigmoid
+/// half of `q_proj`'s per-head `[query | gate]` pair.
+pub fn attention_decode_step(
+    dims: &AttnDims,
+    query: &[f32],
+    gate: &[f32],
+    keys: &[f32],
+    values: &[f32],
+) -> Vec<f32> {
+    let hd = dims.head_dim;
+    let q_dim = dims.num_heads * hd;
+    let kv_dim = dims.num_kv_heads * hd;
+    let group = dims.num_heads / dims.num_kv_heads;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let past = keys.len() / kv_dim;
+    assert_eq!(query.len(), q_dim, "query is num_heads * head_dim");
+    assert_eq!(gate.len(), q_dim, "gate is num_heads * head_dim");
+    assert_eq!(values.len(), past * kv_dim, "keys and values agree on length");
+    assert!(past > 0, "a query attends to at least its own position");
+
+    let mut context = vec![0f32; q_dim];
+    for head in 0..dims.num_heads {
+        let kv_head = head / group;
+        let q = &query[head * hd..(head + 1) * hd];
+
+        let mut scores = Vec::with_capacity(past);
+        for p in 0..past {
+            let k = &keys[p * kv_dim + kv_head * hd..p * kv_dim + (kv_head + 1) * hd];
+            scores.push(q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale);
+        }
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut total = 0f32;
+        for score in &mut scores {
+            *score = (*score - max).exp();
+            total += *score;
+        }
+        for (p, weight) in scores.iter().enumerate() {
+            let v = &values[p * kv_dim + kv_head * hd..p * kv_dim + (kv_head + 1) * hd];
+            let slot = &mut context[head * hd..(head + 1) * hd];
+            for (c, value) in slot.iter_mut().zip(v) {
+                *c += weight / total * value;
+            }
+        }
+    }
+    // Elementwise sigmoid gate, applied before the output projection.
+    for (c, g) in context.iter_mut().zip(gate) {
+        *c *= sigmoid(*g);
+    }
+    context
 }
 
 /// Gated-delta-net weights for one linear-attention layer.
