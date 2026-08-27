@@ -439,5 +439,6 @@ fn forward(
         ));
     }
 
+    tap::tap_logits(&logits, config.vocab_size);
     Ok(logits)
 }

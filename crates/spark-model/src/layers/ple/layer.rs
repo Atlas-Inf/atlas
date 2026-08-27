@@ -107,6 +107,18 @@ impl PleLayer {
         );
         let c = hc_mult * hidden;
         let state_len = (k_size - 1) * dilation;
+
+        // Fail closed if the element type and the gather disagree: the cache
+        // knows a row's byte width, the gather picks a kernel from whether a
+        // scale exists, and those being independent is what let an F8_E4M3
+        // table reach the BF16 kernel with no error at all. See
+        // `gather_guard`.
+        #[cfg(feature = "cuda")]
+        if let NgramTable::Cached(cache) = &table {
+            let stride = cache.row_stride();
+            let scaled = cache.scale_dev_va()?.is_some();
+            gather_matches_element_size(stride, head_dim, scaled)?;
+        }
         Ok(Self {
             dims,
             head_dim,
@@ -487,3 +499,8 @@ pub struct PleWeights {
 // qsa.rs uses for its tests.
 #[path = "aux_state.rs"]
 mod aux_state;
+
+#[path = "gather_guard.rs"]
+mod gather_guard;
+#[cfg(feature = "cuda")]
+use gather_guard::gather_matches_element_size;

@@ -220,6 +220,16 @@ impl NgramRowCache {
 
     /// Device VA of the cache's row table — the `embed_table` argument of the
     /// gather kernels, which then index it by SLOT.
+    /// Bytes per row, i.e. `head_dim * element_size`.
+    ///
+    /// Exposed so a caller can CHECK that the gather kernel it is about to
+    /// pick matches the element type the cache was opened for. Those two
+    /// facts living apart is what let an F8_E4M3 table be gathered by the
+    /// BF16 kernel: silently wrong rows, no error anywhere.
+    pub fn row_stride(&self) -> usize {
+        self.row_stride
+    }
+
     pub fn table_dev_va(&self) -> Result<u64> {
         self.arena.slot_dev_va(0, 0)
     }
