@@ -281,6 +281,16 @@ thinking_in_tools = true
 # Same reason gemma-4-31b and longcat-flash-lite set it. Precedence is
 # CLI > MODEL.toml > engine default, so `--kv-cache-dtype` still overrides for
 # anyone deliberately measuring FP8.
+#
+# THIS FILE IS A BUILD-TIME INPUT. `atlas-kernels`' build script bakes these
+# keys into the binary, so pulling this change and running an EXISTING binary
+# still gets the FP8 default — silently, since the only signal is one warning
+# in a 200-line load log. Rebuild, or pass `--kv-cache-dtype bf16` until you
+# do. Cost me an aborted benchmark run: the tell was the KV block size, 16384
+# bytes instead of the 32768 that BF16 gives.
+#
+# Anything that builds from source is immune, which is both runners here
+# (`scripts/dev/qwen4exp_quickstart.sh` and the Dockerfile).
 default_kv_dtype = "bf16"
 # WITHOUT THIS, TOOL CALLING IS SILENTLY OFF. `tools_active` in
 # `api/chat/prepare.rs` requires `state.tool_call_parser.is_some()`, and with
