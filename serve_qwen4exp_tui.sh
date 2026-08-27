@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Serve Qwen3.8-Flash-Next (model_type qwen4_exp) — port tracked in Avarok #753.
 #
-# ⚠ SERVING IS NOT WIRED YET. This currently gets as far as LOADING: the
-# hyper-connection residual, the QSA indexer and the PLE n-gram injection are
-# unimplemented and refuse by name at the forward boundary. Use this to
-# exercise the loader and read the alloc ledger, not to generate text.
+# This serves: mHC highway on all 48 layers, PLE at model layer 1, QSA decode
+# and prefill selection, vision, CUDA graphs, prefix caching, C>1.
+#
+# CONTEXT ABOVE 8192 NEEDS ATLAS_PLE_MAX_TOKENS RAISED. The engine's prefill
+# chunk is 8193 (not 8192), and the PLE scratch is sized from
+# ATLAS_PLE_MAX_TOKENS, which defaults to 2048 — a 2191-token prompt already
+# fails layer 1 without it. Anything chunked needs >= 8193; this script sets
+# 9500 whenever MAX_SEQ_LEN is above 8192, and the cap error message says so
+# explicitly when it is hit.
 #
 # PRIMARY CHECKPOINT is the Inferact NVFP4 release. Against RadixArk's it has
 # the same architecture and the same per-expert ModelOpt NVFP4 layout, but
@@ -33,6 +38,14 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/home/ms/nccl/build
 # INFO so the namespace audit, the placeholder-norm warning and the alloc
 # ledger are all visible — the whole point of a load-only run.
 export RUST_LOG="${RUST_LOG:-info}"
+# PLE scratch is sized from this, not from max_position_embeddings.
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-8192}"
+if (( MAX_SEQ_LEN > 8192 )); then
+  export ATLAS_PLE_MAX_TOKENS="${ATLAS_PLE_MAX_TOKENS:-9500}"
+  echo "  chunked prefill possible (max-seq-len $MAX_SEQ_LEN) -> ATLAS_PLE_MAX_TOKENS=$ATLAS_PLE_MAX_TOKENS"
+else
+  export ATLAS_PLE_MAX_TOKENS="${ATLAS_PLE_MAX_TOKENS:-$MAX_SEQ_LEN}"
+fi
 
 echo "Qwen3.8-Flash-Next  ->  port ${PORT:-8889}"
 echo "  mHC highway + PLE n-gram LIVE (NFS shard prefetch on: /tank is NFS-mounted)"
@@ -43,7 +56,7 @@ exec target/release/spark serve \
   --kernel-target qwen3.8-flash-next \
   --bind "${BIND:-127.0.0.1}" \
   --port "${PORT:-8889}" \
-  --max-seq-len "${MAX_SEQ_LEN:-8192}" \
+  --max-seq-len "$MAX_SEQ_LEN" \
   --max-num-seqs "${MAX_NUM_SEQS:-4}" \
   --max-batch-size "${MAX_BATCH_SIZE:-4}" \
   --gpu-memory-utilization "${GPU_UTIL:-0.80}" \

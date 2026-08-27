@@ -3,18 +3,31 @@
 //! `Qwen3.8-Flash-Next` (`qwen4_exp`) weight loader. Port tracked in Avarok
 //! #753.
 //!
-//! **The mHC highway runs; PLE does not.** The low-rank multi-hyperconnection
-//! residual is wired on all 48 layers and validated against the reference
-//! (`ops/hyper_connection_lowrank_tests.rs`, PLAN.md phases A-C). What is
-//! still missing:
+//! **This serves.** Every mechanism the module doc below once listed as
+//! missing has shipped; the file is annotated with what each one is validated
+//! against, because the failure mode for all of them is fluent-and-wrong.
 //!
-//! * **PLE n-gram injection** — refused at LOAD unless
-//!   `ATLAS_QWEN4EXP_NO_PLE=1`, because skipping it does not crash and does
-//!   not look wrong. It produces fluent text from a model missing an input.
-//! * **The QSA indexer** — provably inert at or below `indexer_budget`, which
-//!   is the context this fits today; required above it, and refused there.
-//!   See PLAN.md §1.5.
-//! * **Batched / multi-sequence decode** — refused by name; v1 is C=1.
+//! * **mHC low-rank highway** — all 48 layers.
+//!   `ops/hyper_connection_lowrank_tests.rs` runs the four entry points on the
+//!   GPU against a golden taken from the real `Qwen4ExpTextGatedResidual` on
+//!   real checkpoint weights: cos 0.999998, `hc_post` bit-exact, and the two
+//!   defects the harness exists to catch (a global instead of grouped RMS, and
+//!   the dropped offset-from-1) fail it by three orders of magnitude.
+//! * **PLE n-gram injection** at model layer 1 — wired, with the ~320M-row
+//!   table read by row off NVMe (`NgramRowCache::open_segmented`; the 128
+//!   shards are NOT contiguous, so one base offset would read wrong-but-valid
+//!   rows silently). `ATLAS_QWEN4EXP_NO_PLE=1` now DISABLES a mechanism that
+//!   is present, for bisecting the mHC spine, and says so loudly.
+//! * **The QSA indexer** — decode-side selection plus per-query prefill
+//!   selection, both parity-gated at T=2200 where selection actively prunes.
+//!   Provably inert at or below `indexer_budget`, so short contexts are exact
+//!   rather than approximate.
+//! * **Batched / multi-sequence decode** — honoured. Per-sequence PLE and QSA
+//!   state ride the layer states, and the earlier clamp-to-1 is lifted.
+//!
+//! Still refused, by name and at pre-flight rather than silently: **MTP**
+//! (`load_mtp_weights` returns `None`, so `--speculative` cannot half-wire)
+//! and the **stacked expert layout**, which neither published release uses.
 //!
 //! WHY THIS IS MOSTLY qwen35's LOADER. Qwen3.8-Flash-Next and Qwen3.6-35B-A3B
 //! share far more than the version numbers suggest: 3:1 GDN/full-attention

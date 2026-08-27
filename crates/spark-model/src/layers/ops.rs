@@ -73,6 +73,9 @@ mod hyper_connection_lowrank;
 #[cfg(test)]
 #[path = "ops/hyper_connection_lowrank_tests.rs"]
 mod hyper_connection_lowrank_tests;
+// The same kernels against the in-process CPU oracle instead of a
+// checkpoint-backed fixture: weaker evidence (both sides read the same source
+// document) but it runs from a clean checkout with no 126 GiB download.
 #[path = "ops/kv_cache.rs"]
 mod kv_cache;
 #[path = "ops/kv_cache_fp8k.rs"]
@@ -132,6 +135,9 @@ mod qsa;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 pub mod qwen4exp;
+#[cfg(test)]
+#[path = "ops/qwen4exp_oracle_tests.rs"]
+mod qwen4exp_oracle_tests;
 #[path = "ops/sampling.rs"]
 mod sampling;
 #[path = "ops/ssm_gdn_a.rs"]
