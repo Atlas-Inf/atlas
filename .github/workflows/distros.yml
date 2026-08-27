@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The full 9-platform distributable matrix, on request.
+#
+# WHY THIS IS A SEPARATE FILE, and not a label-gated job inside ci.yml.
+#
+# ci.yml's concurrency group is `${{ github.workflow }}-${{ github.ref }}` with
+# `cancel-in-progress: true`. If ci.yml subscribed to `pull_request: [labeled]`
+# so that a label could start the matrix, then EVERY label change on a PR —
+# `bug`, `area:kernels`, anything — would land in that group and cancel the
+# in-flight CI run for the same ref, restarting fmt/clippy/tests from scratch.
+# The trigger cannot be narrowed to one label name; `types:` filters on the
+# event, not on which label was applied.
+#
+# So the opt-in lives here, under its own concurrency group, where starting it
+# cannot disturb a running CI. The label check happens at the job level, where
+# `github.event.label.name` IS available.
+#
+# What ci.yml still runs on every PR is the two entries that can actually fail
+# a run (`experimental: false`): linux-x86_64-nvidia-cuda and
+# linux-aarch64-nvidia-cuda. This workflow adds the seven that cannot — they
+# carry `continue-on-error`, so they report but never gate.
+name: Distros (opt-in)
+
+on:
+  # Applying the label starts a run immediately. Removing it does nothing:
+  # `labeled` fires only on add, and a build already in flight is not something
+  # un-labelling should kill.
+  pull_request:
+    types: [labeled]
+  # Any branch, no label needed. Use this when you want the packages without
+  # opening or touching a PR.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to build (default: this workflow's ref)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # Deliberately NOT the same group as ci.yml — see the header. Superseding an
+  # earlier request for the same ref is still right: only the newest tree is
+  # worth packaging, and these are the longest jobs in the repo.
+  group: distros-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: distros
+    # On `labeled`, build only when it is OUR label. Every other label change
+    # starts a run that resolves to this `if` and stops, costing nothing.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.label.name == 'build:distros'
+    uses: ./.github/workflows/release-build.yml
+    with:
+      version: 0.0.0-pr${{ github.event.pull_request.number || 'dispatch' }}
+      ref: ${{ inputs.ref || '' }}
+      pr_mode: true
+      # The reason this workflow exists: everything, experimental included.
+      include_experimental: true
+      # Same as ci.yml's. These are throwaway artifacts for eyeballing a
+      # package; a real release publishes through release.yml.
+      retention_days: 1

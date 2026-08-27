@@ -6,11 +6,13 @@ name: Coverage
 # without wedging the merge button. This comment said `informational: true` for
 # as long as they were, and it outlived them by one commit.
 #
-# Cost note: this is a second full instrumented compile of the workspace on
-# every PR, on top of ci.yml's `test` job (they cannot share artifacts —
-# `-C instrument-coverage` is a different profile). If runner capacity ever
-# becomes the constraint, move the `pull_request` trigger behind a path filter
-# on `crates/**` rather than deleting the job.
+# Cost note: this is a second full instrumented compile of the workspace, on
+# top of ci.yml's `test` job (they cannot share artifacts — `-C
+# instrument-coverage` is a different profile). Capacity did become the
+# constraint, and this note's own advice was taken: as of 2026-08-26 the
+# `pull_request` trigger sits behind a path filter on `crates/**` rather than
+# being deleted, and main + a weekly cron carry the trend. See the trigger
+# block below.
 
 on:
   # Manually runnable. During the 2026-08-06 Actions incident, webhook triggers
@@ -19,16 +21,38 @@ on:
   # can only be started by an event you do not control is a check you cannot
   # get a verdict from when you most need it.
   workflow_dispatch:
+  # PATH-FILTERED on PRs, as this file's own cost note asked for.
+  #
+  # This is a second full instrumented compile of the workspace on top of
+  # ci.yml's `test` job — they cannot share artifacts, `-C instrument-coverage`
+  # is a different profile. An earlier revision of this branch deleted the
+  # `pull_request` trigger outright. That was the wrong lever: the argument for
+  # it was runner cost, and this repository is PUBLIC on standard hosted
+  # runners, where Actions minutes are free. The 2x/10x multipliers are
+  # private-repo billing and do not apply. The real constraint is concurrent-job
+  # capacity, and this is one ubuntu job — it does not compete for the scarce
+  # macOS pool.
+  #
+  # So the filter, not the axe. Honest about what it buys: `crates/**` is where
+  # essentially all the code lives, so 11 of the last 14 PRs still match it.
+  # It skips docs-only, CI-only and workflow-only PRs — worth having, not a
+  # large cut. Keep `cargo llvm-cov --workspace` and this filter in sync; a
+  # workspace-wide command behind a narrower filter reports stale coverage.
   pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/coverage.yml'
+      - 'codecov.yml'
   push:
     branches: [main, master]
-  # Merge queue: entries are validated on a temporary gh-readonly-queue/**
-  # merge-commit that fires none of the events above, and this job is in the
-  # required set the queue waits on — without this trigger it is never
-  # reported and every entry times out. The Codecov upload stays advisory
-  # here exactly as on PRs (continue-on-error + a loud warning): a queue
-  # entry must never hang on Codecov availability.
-  merge_group:
+  schedule:
+    # Sunday 06:23 UTC. Offset off the hour for the usual reason — cron at
+    # :00 contends with everyone else's cron on shared runners.
+    - cron: '23 6 * * 0'
+  # No `merge_group` either: it was here only because this was believed to be
+  # in the required set the queue waits on. It is not, and there is no queue.
 
 # Least privilege, same as ci.yml: this workflow only reads the repo. The
 # Codecov upload authenticates with a repository upload token (see the upload
