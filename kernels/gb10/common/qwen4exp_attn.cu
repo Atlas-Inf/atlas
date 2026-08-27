@@ -80,7 +80,12 @@ extern "C" __global__ void q4e_attn_decode(
     // of the result reads the already-shifted `scores` and their sum.
     __shared__ float soft_sum;
     if (tid == 0) {
-        float m = -INFINITY;
+        // -1e30f, not -INFINITY: `INFINITY` is a double, and narrowing it to
+        // float is diagnostic #221-D, which nvcc treats as an ERROR on the
+        // MSVC host (the Linux host accepts it, so this only broke the Windows
+        // release leg). -1e30f is what `argmax_bf16.cu` and
+        // `inferspark_prefill.cu` already use for a softmax running max.
+        float m = -1e30f;
         for (unsigned int t = 0; t < seq_len; ++t) m = fmaxf(m, scores[t]);
         float s = 0.0f;
         for (unsigned int t = 0; t < seq_len; ++t) {
