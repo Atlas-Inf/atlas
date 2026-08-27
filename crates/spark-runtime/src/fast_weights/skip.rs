@@ -26,6 +26,18 @@ impl FastSafetensorsLoader {
         // Demand-paged first: the model has declared it reads these by row at
         // use time, which is independent of expert parallelism and must hold
         // on a single rank where the EP check below returns early.
+        //
+        // NOTE this rule is NOT what withholds the qwen4_exp n-gram table, and
+        // must not become it. The shard loop checks `is_ngram_table` BEFORE it
+        // consults this function and takes those tensors down the DEFERRED
+        // path, which records each one's file and offset — which is what
+        // `NgramRowCache` reads rows through. A plain skip records nothing, so
+        // if that predicate ever stopped matching the PLE shards this rule
+        // would quietly take over and the PLE loader would fail its own
+        // "no shard was deferred" check at load. The overlap is deliberate
+        // (this rule is the general mechanism, the deferral is the one with
+        // offsets) and `name_utils::ngram_table_predicate_matches_the_qwen_ple_shards`
+        // is what keeps the precedence honest.
         if self
             .demand_paged_patterns
             .iter()

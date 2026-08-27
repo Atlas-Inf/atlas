@@ -174,11 +174,22 @@ fn main() -> Result<()> {
 
     let mut ids = ids;
     let started = std::time::Instant::now();
-    for step in 0..=generate {
+    // `--generate N` appends EXACTLY N tokens. This was `0..=generate`, which
+    // ran N+1 passes and appended N+1 tokens — reproduced twice on a GB10
+    // during independent validation of #13 (`--generate 4` -> 5 ids,
+    // `--generate 8` -> 9). Every pass after the first appends one token, and
+    // so does the first, so the count IS the pass count.
+    //
+    // `--generate 0` keeps its own meaning: one pass, print the per-position
+    // argmax and diff against the fixture, append nothing. That is the parity
+    // mode, so it needs a pass but not an iteration budget.
+    let passes = generate.max(1);
+    for step in 0..passes {
         eprintln!(
-            "forward: {} tokens, {} layers  (step {step}/{generate}, {:.1?} elapsed)",
+            "forward: {} tokens, {} layers  (pass {}/{passes}, {:.1?} elapsed)",
             ids.len(),
             config.num_hidden_layers,
+            step + 1,
             started.elapsed()
         );
         let logits = forward(&dir, &config, &store, &ids)?;
