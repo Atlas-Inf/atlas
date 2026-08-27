@@ -4,41 +4,6 @@
 
 use super::*;
 
-/// Kernel name for the GDN output gate this model asks for.
-///
-/// Atlas's gated RMS norm gates with SiLU, which is what Qwen3.5 and 3.6 want.
-/// `qwen4_exp` declares `output_gate_type = "sigmoid"` and gates with a plain
-/// sigmoid; running the wrong one gives a fluent model that is not the one on
-/// disk, so this is a correctness switch rather than a tuning knob.
-///
-/// An empty `output_gate_type` means the family default, which is SiLU. HF
-/// refuses anything but these two, so an unknown value is a malformed config
-/// and is treated as such rather than silently defaulted.
-fn gated_norm_kernel(config: &atlas_core::config::ModelConfig, base: &str) -> Result<String> {
-    match config.output_gate_type.as_str() {
-        "" | "silu" => Ok(base.to_string()),
-        "sigmoid" => Ok(format!("{base}_sigmoid")),
-        other => anyhow::bail!("output_gate_type must be \"silu\" or \"sigmoid\", got {other:?}"),
-    }
-}
-
-/// Resolve one `hyper_connection` entry point, but ONLY for a model that
-/// carries the highway. Skipping the lookup rather than discarding its result
-/// is the point: an un-issued lookup leaves no failed row in the fail-closed
-/// startup audit, so what remains there is what someone has to act on.
-#[track_caller]
-fn hc_kernel(
-    config: &atlas_core::config::ModelConfig,
-    gpu: &dyn GpuBackend,
-    func: &str,
-) -> KernelHandle {
-    if config.hc_mult > 0 {
-        crate::layers::try_kernel(gpu, "hyper_connection", func)
-    } else {
-        KernelHandle(0)
-    }
-}
-
 impl Qwen3SsmLayer {
     pub fn new(
         input_norm: DenseWeight,
@@ -65,9 +30,9 @@ impl Qwen3SsmLayer {
             // never issues the lookup.
             hc: None,
             ple: None,
-            hc_pre_k: hc_kernel(config, gpu, "hc_pre"),
-            hc_post_k: hc_kernel(config, gpu, "hc_post"),
-            hc_expand_k: hc_kernel(config, gpu, "hc_expand"),
+            hc_pre_k: super::kernel_select::hc_kernel(config, gpu, "hc_pre"),
+            hc_post_k: super::kernel_select::hc_kernel(config, gpu, "hc_post"),
+            hc_expand_k: super::kernel_select::hc_kernel(config, gpu, "hc_expand"),
             input_norm,
             ssm,
             post_attn_norm,
@@ -100,11 +65,14 @@ impl Qwen3SsmLayer {
             // machine?" and that question has no portable answer.
             sm_count: gpu.sm_count()?,
             rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
-            gated_rms_norm_k: gpu.kernel("norm", &gated_norm_kernel(config, "gated_rms_norm")?)?,
+            gated_rms_norm_k: gpu.kernel(
+                "norm",
+                &super::kernel_select::gated_norm_kernel(config, "gated_rms_norm")?,
+            )?,
             gated_rms_norm_f32_k: super::super::try_kernel(
                 gpu,
                 "norm",
-                &gated_norm_kernel(config, "gated_rms_norm_f32_input")?,
+                &super::kernel_select::gated_norm_kernel(config, "gated_rms_norm_f32_input")?,
             ),
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batch2_k: gpu.kernel("dense_gemv_bf16_batch2", "dense_gemv_bf16_batch2")?,
@@ -212,7 +180,7 @@ impl Qwen3SsmLayer {
             ),
             gated_rms_norm_prefill_k: gpu.kernel(
                 "norm",
-                &gated_norm_kernel(config, "gated_rms_norm_prefill")?,
+                &super::kernel_select::gated_norm_kernel(config, "gated_rms_norm_prefill")?,
             )?,
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: crate::layers::tgemm_kernel(gpu),

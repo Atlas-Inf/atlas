@@ -87,6 +87,24 @@ run "spark-storage lib tests" "$CARGO" test -q -p spark-storage --lib "${METAL[@
 run "spark-runtime lib tests" "$CARGO" test -q -p spark-runtime --lib "${METAL[@]}" \
     -- --skip metal_backend
 
+echo "── repo CI gates that need no toolchain ─────────────────────"
+# These three run in CI as separate jobs, and none of them needs cargo — so
+# there is no excuse for finding out from a red PR. The LoC cap in particular
+# is easy to breach by adding a comment.
+run "SPDX headers"           python3 scripts/check_spdx.py
+run "kernel shadow structure" python3 scripts/check_kernel_shadows.py
+loc_cap() {
+  local over=0
+  while IFS= read -r f; do
+    local n; n=$(wc -l < "$f")
+    if (( n > 500 )) && ! grep -q "\"$f\"" .github/workflows/file-size-cap.yml; then
+      echo "OVER $n $f"; over=$((over + 1))
+    fi
+  done < <(find crates -name '*.rs' -not -name '*.bak' -not -path '*/target/*')
+  (( over == 0 ))
+}
+run "500-LoC cap per .rs"    loc_cap
+
 echo "── lint ─────────────────────────────────────────────────────"
 run "fmt"                    "$CARGO" fmt --all -- --check
 run "clippy, cuda"           "$CARGO" clippy -p atlas-core -p spark-model -p spark-runtime \

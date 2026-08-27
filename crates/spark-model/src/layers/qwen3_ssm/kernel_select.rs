@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Kernel-selection helpers for [`Qwen3SsmLayer`]: W4A16 batch-m GEMV tier
-//! pick, deep-K transposed-tile GEMM pick, and the multi-seq decode GEMM
-//! dispatch. Split from `mod.rs` for the ≤500 LoC cap; the selection rules
-//! are shared by the decode/prefill sub-modules.
+//! pick, deep-K transposed-tile GEMM pick, the multi-seq decode GEMM dispatch,
+//! and the two config-driven NAME choices below. Split from `mod.rs` and
+//! `init.rs` for the ≤500 LoC cap; the selection rules are shared by the
+//! decode/prefill sub-modules.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -110,5 +111,41 @@ impl Qwen3SsmLayer {
             );
         }
         ops::w4a16_gemm_n128(gpu, wide, input, weight, output, m, n, k, stream)
+    }
+}
+
+/// Kernel name for the GDN output gate this model asks for.
+///
+/// Atlas's gated RMS norm gates with SiLU (Qwen3.5/3.6). `qwen4_exp` declares
+/// `output_gate_type = "sigmoid"`, and the wrong one gives a fluent model that
+/// is not the one on disk — a correctness switch, not a tuning knob. Empty
+/// means the family default; HF refuses anything but these two, so an unknown
+/// value is a malformed config rather than something to default silently.
+/// The twins live in `common/rms_norm.cu`, so every target inherits them.
+pub(super) fn gated_norm_kernel(
+    config: &atlas_core::config::ModelConfig,
+    base: &str,
+) -> Result<String> {
+    match config.output_gate_type.as_str() {
+        "" | "silu" => Ok(base.to_string()),
+        "sigmoid" => Ok(format!("{base}_sigmoid")),
+        other => anyhow::bail!("output_gate_type must be \"silu\" or \"sigmoid\", got {other:?}"),
+    }
+}
+
+/// Resolve one `hyper_connection` entry point, but ONLY for a model that
+/// carries the highway. Skipping the lookup rather than discarding its result
+/// is the point: an un-issued lookup leaves no failed row in the fail-closed
+/// startup audit, so what remains there is what someone has to act on.
+#[track_caller]
+pub(super) fn hc_kernel(
+    config: &atlas_core::config::ModelConfig,
+    gpu: &dyn GpuBackend,
+    func: &str,
+) -> KernelHandle {
+    if config.hc_mult > 0 {
+        crate::layers::try_kernel(gpu, "hyper_connection", func)
+    } else {
+        KernelHandle(0)
     }
 }
