@@ -283,6 +283,25 @@ impl TransformerLayer for Qwen3AttentionLayer {
         Ok(Box::new(crate::layer::AttnLayerState::default()))
     }
 
+    /// Release the QSA indexer carry: ~2.5 MB per sequence on each of the 12
+    /// full-attention layers, which is the bulk of the ~30 MB per request that
+    /// used to leak (see `TransformerLayer::free_state`).
+    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn LayerState) -> Result<()> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(());
+        };
+        let Some(attn) = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::AttnLayerState>()
+        else {
+            return Ok(());
+        };
+        if let Some(st) = attn.qsa.as_mut() {
+            qsa.free_seq_state(st, gpu)?;
+        }
+        Ok(())
+    }
+
     fn transpose_moe_for_prefill(
         &mut self,
         gpu: &dyn GpuBackend,

@@ -409,6 +409,25 @@ impl TransformerLayer for Qwen3SsmLayer {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         self.alloc_state_inner(gpu)
     }
+
+    /// Release the PLE carry. The h/conv states are pool slots that
+    /// `free_sequence` releases separately; this is only the `gpu.alloc` the
+    /// carry owns.
+    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn LayerState) -> Result<()> {
+        if self.ple.is_none() {
+            return Ok(());
+        }
+        let Some(ssm) = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::SsmLayerState>()
+        else {
+            return Ok(());
+        };
+        if let Some(st) = ssm.ple.as_mut() {
+            crate::layers::ple::PleLayer::free_seq_state(st, gpu)?;
+        }
+        Ok(())
+    }
 }
 
 /// The PLE per-seq carry from a sequence's [`SsmLayerState`], lazily created

@@ -29,6 +29,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layers::ops;
 
+#[path = "qsa_free.rs"]
+mod qsa_free;
 #[path = "qsa_select.rs"]
 mod qsa_select;
 #[cfg(all(test, feature = "cuda"))]
@@ -168,18 +170,6 @@ impl QsaIndexer {
     /// The largest visible prefix whose selection is provably all-visible.
     /// One sequence's indexer carry: counters + raw/pooled key buffers
     /// (per-seq CONTENT; launch scratch stays layer-owned — steps serialize).
-    pub fn new_seq_state(&self, gpu: &dyn GpuBackend) -> Result<QsaSeqState> {
-        let hd = self.hd as usize;
-        let ratio = self.ratio as usize;
-        Ok(QsaSeqState {
-            ingested: 0,
-            pooled: 0,
-            table_len: 0,
-            raw_keys: gpu.alloc(self.max_tokens * hd * 2)?,
-            block_keys: gpu.alloc(self.max_tokens / ratio * hd * 2)?,
-        })
-    }
-
     pub fn inert_bound(&self) -> usize {
         (self.budget + self.ratio - 1) as usize
     }
@@ -278,7 +268,7 @@ impl QsaIndexer {
         Ok(())
     }
 
-    // `prefill_select`: see `qsa_select.rs` (#[path] child, ≤500 LoC split).
+    // `prefill_select`: see `qsa_select.rs`; teardown: `qsa_free.rs`.
 
     /// Marconi aux blob: `[ingested u64][pooled u64][raw_keys bf16 bytes]`.
     /// Raw keys are a deterministic function of the token prefix, so the

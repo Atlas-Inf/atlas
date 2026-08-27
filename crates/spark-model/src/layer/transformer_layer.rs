@@ -643,4 +643,34 @@ pub trait TransformerLayer: Send + Sync {
     /// - `EmptyLayerState` for pure attention layers
     /// - `SsmLayerState` for SSM/recurrent layers
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>>;
+
+    /// Release whatever `alloc_state` allocated for ONE finished sequence.
+    ///
+    /// Default no-op, because most layers keep no per-sequence device memory:
+    /// attention lives in the paged KV cache and the SSM h/conv states are
+    /// slots in a pool that `free_sequence` already releases.
+    ///
+    /// It exists for the states that DO own raw allocations, which had no way
+    /// to give them back. `DevicePtr` is a bare handle with no `Drop`, and the
+    /// backend only reclaims at process exit — its own log says so ("backend
+    /// drop reclaimed N allocation(s) that no owner released"). So a state
+    /// holding `gpu.alloc` memory leaked it for the process's life, once per
+    /// sequence:
+    ///
+    ///   * `PleSeqState::conv` — (k-1)*dilation * hc*hidden * 4 = ~360 KB
+    ///   * `QsaSeqState::{raw_keys, block_keys}` — [max_tokens, hd] +
+    ///     [max_tokens/ratio, hd] BF16, ~2.5 MB, on each of the 12
+    ///     full-attention layers
+    ///
+    /// ~25-30 MB per request on qwen4_exp, against the ~2 GB of slack left
+    /// after a 117 GB resident load at util 0.90 — which is why the server was
+    /// OOM-KILLED at request 80 of a 225-request run while surviving a
+    /// 13-request smoke suite indefinitely.
+    ///
+    /// Symmetric with `alloc_state` on purpose, and mirrors the Proposer
+    /// trait's existing `free_state`. Errors are reported by the caller rather
+    /// than propagated: teardown must not be able to strand a sequence.
+    fn free_state(&self, _gpu: &dyn GpuBackend, _state: &mut dyn LayerState) -> Result<()> {
+        Ok(())
+    }
 }

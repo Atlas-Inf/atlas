@@ -187,4 +187,15 @@ impl PleLayer {
             .context("PLE row gather"),
         }
     }
+
+    /// Return a sequence's PLE carry to the allocator (see
+    /// `TransformerLayer::free_state`). ~360 KB per sequence, unreclaimed for
+    /// the process's life before this existed. Idempotent.
+    pub(crate) fn free_seq_state(st: &mut PleSeqState, gpu: &dyn GpuBackend) -> Result<()> {
+        if st.conv.0 != 0 {
+            gpu.free(st.conv)?;
+            st.conv = spark_runtime::gpu::DevicePtr(0);
+        }
+        Ok(())
+    }
 }
