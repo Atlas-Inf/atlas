@@ -426,6 +426,7 @@ impl TransformerModel {
                 graph_capture: capture,
                 gdn_exact_replay: false,
                 token_ids: None,
+                host_token_ids: None,
                 routed_lora_layers: None,
                 midchunk_capture: None,
             };

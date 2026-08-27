@@ -11,6 +11,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::weights::WeightStore;
 
 use crate::mistral_loader::MistralWeightLoader;
+use crate::weight_loader::LongcatWeightLoader;
 use crate::weight_loader::{
     DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, LagunaWeightLoader,
     MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
@@ -90,12 +91,6 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         // full-attention layers — both handled at forward-pass layer time,
         // not during weight loading.
         "qwen3_6_moe" | "holo3_1_moe" => Ok(Box::new(Qwen35WeightLoader)),
-        // Qwen3.8-Flash-Next: hybrid linear/full attention, 512-expert MoE,
-        // low-rank hyper-connections, a sparse-attention indexer and a PLE
-        // n-gram tower. Weight loading works; the forward pass does not exist
-        // yet, and the loader says so by name rather than failing as an
-        // unsupported model type. See docs/porting/QWEN4_EXP.md.
-        "qwen4_exp" => Ok(Box::new(Qwen4ExpWeightLoader)),
         // Nemotron-H family (Mamba-2 + MoE + Attention), including Puzzle
         // (heterogeneous per-block MoE intermediate / top-k).
         "nemotron_h" | "nemotron_h_puzzle" => Ok(Box::new(NemotronHWeightLoader)),
@@ -105,6 +100,13 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "gemma4" | "gemma_4" => Ok(Box::new(Gemma4WeightLoader)),
         // Mistral family (MLA + MoE, GQA fallback for initial bring-up)
         "mistral" => Ok(Box::new(MistralWeightLoader)),
+        // LongCat-Flash(-Lite): MLA dual-sublayer blocks + shortcut MoE with
+        // zero-computation experts (+ n-gram input embeddings).
+        "longcat_flash_ngram" | "longcat_flash" => Ok(Box::new(LongcatWeightLoader)),
+        // Qwen3.8-Flash-Next. `dispatch.rs` normalizes the older
+        // `qwen3_8_flash_next` naming onto `qwen4_exp`, so one arm covers both
+        // published quantizations.
+        "qwen4_exp" => Ok(Box::new(Qwen4ExpWeightLoader)),
         // MiniMax M2 family (M2.1 / M2.7) — full attention + 256-expert
         // sigmoid-routed MoE + 3-module MTP.
         "minimax_m2" => Ok(Box::new(MinimaxM2WeightLoader)),

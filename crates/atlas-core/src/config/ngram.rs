@@ -238,6 +238,25 @@ impl super::ModelConfig {
     /// travels together, and a checkpoint naming two thirds of it is one whose
     /// remaining third we would otherwise have to invent.
     pub fn ngram_dims(&self) -> Result<Option<NgramDims>> {
+        // A BASE-FORM checkpoint (`qwen4_exp`) legitimately sets two thirds of
+        // the trio: the parser maps its `ngram_size` / `heads_per_ngram` onto
+        // `emb_neighbor_num` / `emb_split_num` because the head-count
+        // arithmetic really is the same (`K * (N-1)` heads). What differs is
+        // the table SIZING -- absolute rows per head, not a multiple of
+        // vocab_size -- and the hash itself, so this is not a partial trio to
+        // refuse but a different surface to decline. `qwen4exp_ngram()` is its
+        // accessor.
+        ensure!(
+            !(self.ngram_vocab_size_ratio > 0 && self.ngram_vocab_size_base > 0),
+            "n-gram config declares BOTH ngram_vocab_size_ratio ({}) and \
+             ngram_vocab_size_base ({}) — mutually exclusive table sizings \
+             whose hashes differ, so honouring either would be a guess",
+            self.ngram_vocab_size_ratio,
+            self.ngram_vocab_size_base,
+        );
+        if self.ngram_vocab_size_base > 0 {
+            return Ok(None);
+        }
         let present = [
             ("ngram_vocab_size_ratio", self.ngram_vocab_size_ratio),
             ("emb_neighbor_num", self.emb_neighbor_num),

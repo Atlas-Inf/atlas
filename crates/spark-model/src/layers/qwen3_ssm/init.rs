@@ -22,6 +22,23 @@ fn gated_norm_kernel(config: &atlas_core::config::ModelConfig, base: &str) -> Re
     }
 }
 
+/// Resolve one `hyper_connection` entry point, but ONLY for a model that
+/// carries the highway. Skipping the lookup rather than discarding its result
+/// is the point: an un-issued lookup leaves no failed row in the fail-closed
+/// startup audit, so what remains there is what someone has to act on.
+#[track_caller]
+fn hc_kernel(
+    config: &atlas_core::config::ModelConfig,
+    gpu: &dyn GpuBackend,
+    func: &str,
+) -> KernelHandle {
+    if config.hc_mult > 0 {
+        crate::layers::try_kernel(gpu, "hyper_connection", func)
+    } else {
+        KernelHandle(0)
+    }
+}
+
 impl Qwen3SsmLayer {
     pub fn new(
         input_norm: DenseWeight,
@@ -42,6 +59,15 @@ impl Qwen3SsmLayer {
         let conv_dim = nk * kd * 2 + nv * vd;
 
         Ok(Self {
+            // mHC is attached later by the loader, and only for models that
+            // carry a hc_mult-wide residual highway. The handles are gated on
+            // the same condition `ArchProbes` uses, so a plain GDN model
+            // never issues the lookup.
+            hc: None,
+            ple: None,
+            hc_pre_k: hc_kernel(config, gpu, "hc_pre"),
+            hc_post_k: hc_kernel(config, gpu, "hc_post"),
+            hc_expand_k: hc_kernel(config, gpu, "hc_expand"),
             input_norm,
             ssm,
             post_attn_norm,
@@ -473,34 +499,8 @@ impl Qwen3SsmLayer {
         })
     }
 
-    /// Construct an SSM layer where QKVZ projection output is already sequential.
-    ///
-    /// Used by Qwen3.5 where separate QKV and Z weights are concatenated at load
-    /// time into `[Q|K|V|Z]` row order. The `deinterleave_qkvz` kernel is skipped
-    /// and plain `w4a16_gemv` writes directly to the deinterleaved buffer.
-    pub fn new_sequential(
-        input_norm: DenseWeight,
-        ssm: SsmWeights,
-        post_attn_norm: DenseWeight,
-        ffn: FfnComponent,
-        qkvz_nvfp4: Option<QuantizedWeight>,
-        qkvz_nvfp4_t: Option<QuantizedWeight>,
-        out_proj_nvfp4_t: Option<QuantizedWeight>,
-        config: &atlas_core::config::ModelConfig,
-        gpu: &dyn GpuBackend,
-    ) -> Result<Self> {
-        let mut layer = Self::new(
-            input_norm,
-            ssm,
-            post_attn_norm,
-            ffn,
-            qkvz_nvfp4,
-            config,
-            gpu,
-        )?;
-        layer.sequential_qkvz = true;
-        layer.qkvz_nvfp4_t = qkvz_nvfp4_t;
-        layer.out_proj_nvfp4_t = out_proj_nvfp4_t;
-        Ok(layer)
-    }
+    // `new_sequential` moved to `init_sequential.rs` (≤500 LoC split).
 }
+
+#[path = "init_sequential.rs"]
+mod init_sequential;

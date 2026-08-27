@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use super::{
     LayerType, ModelConfig, default_conv_kernel, default_partial_rotary, default_rms_eps,
     default_rope_theta, finalize_config, parse_deepseek_v4, parse_gemma4_params, parse_laguna,
-    parse_minimax_m2, parse_mistral_params, parse_quantization_config, parse_step3p7,
-    parse_vision_config, validate_config,
+    parse_longcat_ngram, parse_minimax_m2, parse_mistral_params, parse_quantization_config,
+    parse_qwen4_exp, parse_step3p7, parse_vision_config, validate_config,
 };
 
 fn required_u64(raw: &serde_json::Value, key: &str, model_type: &str) -> Result<u64> {
@@ -43,9 +43,30 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
     let raw: serde_json::Value =
         serde_json::from_str(json).context("Invalid JSON in config.json")?;
 
+    // A remote-code checkpoint may declare ONLY `architectures` + `auto_map`
+    // and no `model_type` at all — LongCat-Flash-Lite ships exactly that
+    // (`architectures: ["LongcatFlashNgramForCausalLM"]`). Without this
+    // fallback such a config silently falls through to the generic parse and
+    // loses its family, so map the known architecture names onto their
+    // model_type. Only consulted when `model_type` is absent/empty, so no
+    // existing checkpoint changes behaviour.
     let top_model_type = raw
         .get("model_type")
         .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            raw.get("architectures")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(serde_json::Value::as_str)
+                .and_then(|arch| match arch {
+                    "LongcatFlashNgramForCausalLM" => Some("longcat_flash_ngram"),
+                    "LongcatFlashForCausalLM" => Some("longcat_flash"),
+                    "Qwen4ExpForConditionalGeneration"
+                    | "Qwen3_8FlashNextForConditionalGeneration" => Some("qwen4_exp"),
+                    _ => None,
+                })
+        })
         .unwrap_or("");
 
     match top_model_type {
@@ -210,75 +231,19 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             finalize_config(&mut config, &raw_mut)?;
             Ok(config)
         }
-        // Qwen3.8-Flash-Next. Nested under `text_config` like the Qwen3.5/VL
-        // families, but it shares no weight layout with them: hybrid
-        // linear/full attention, 512-expert MoE, low-rank hyper-connections, a
-        // sparse-attention indexer, a PLE n-gram tower and a hybrid MTP block.
-        //
-        // Parsing it is NOT the same as being able to serve it -- there is no
-        // `qwen4_exp` weight loader. See docs/porting/QWEN4_EXP.md.
-        "qwen4_exp" => {
-            let text_config = raw
-                .get("text_config")
-                .context("qwen4_exp config missing text_config")?;
-            let mut config: ModelConfig = serde_json::from_value(text_config.clone())
-                .context("Failed to parse qwen4_exp text_config")?;
-            // text_config declares "qwen4_exp_text"; the family name is the
-            // top-level one, and kernel-target resolution matches on it.
-            config.model_type = top_model_type.to_string();
-            if config.eos_token_id == 0 {
-                config.eos_token_id = text_config
-                    .get("eos_token_id")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as u32;
-            }
-            // RoPE lives in a nested block, as it does for Qwen3.6.
-            if let Some(rope) = text_config.get("rope_parameters") {
-                if let Some(theta) = rope.get("rope_theta").and_then(serde_json::Value::as_f64) {
-                    config.rope_theta = theta;
-                }
-                if let Some(prf) = rope
-                    .get("partial_rotary_factor")
-                    .and_then(serde_json::Value::as_f64)
-                {
-                    config.partial_rotary_factor = prf;
-                }
-                config.mrope_interleaved = rope
-                    .get("mrope_interleaved")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                if let Some(section) = rope.get("mrope_section").and_then(|v| v.as_array()) {
-                    for (slot, value) in config.mrope_section.iter_mut().zip(section) {
-                        *slot = value.as_u64().unwrap_or(0) as usize;
-                    }
-                }
-            }
-            // HF's Qwen4ExpTextConfig defaults `norm_topk_prob` to True and the
-            // published config.json OMITS it, so serde's `false` would silently
-            // skip the top-K renormalisation. Same trap the qwen3_5 arm above
-            // handles, for the same reason.
-            config.norm_topk_prob = true;
-            // Q IS gated, and the checkpoint is the only place that says so:
-            // `q_proj` is `[12288, 2560]` where 24 heads x head_dim 256 is only
-            // 6144. The reference builds it as `num_attention_heads * head_dim
-            // * 2` and splits per head -- `chunk(view(..., -1, head_dim * 2),
-            // 2, dim=-1)` -- which is exactly the interleaved Q+gate layout
-            // `attn_gated` means. `o_proj` is `[2560, 6144]`, confirming the
-            // gate is consumed rather than projected out.
-            //
-            // Note this is a SEPARATE gate from `output_gate_type = "sigmoid"`,
-            // which belongs to the linear-attention pathway and has its own
-            // tensor (`linear_attn.in_proj_z`).
-            config.attn_gated = true;
-            config.nested_config = true;
-            if raw.get("vision_config").is_some() {
-                config.vision = parse_vision_config(&raw);
-            }
-            finalize_config(&mut config, &raw)?;
-            Ok(config)
-        }
         "gemma4" => parse_gemma4_params(&raw),
         "laguna" => parse_laguna(&raw),
+        "longcat_flash_ngram" | "longcat_flash" => parse_longcat_ngram(&raw),
+        // Nested text_config like qwen3_5_moe, but hyper-connections, the QSA
+        // indexer and PLE n-gram injection put it outside that arm.
+        //
+        // TWO NAMES, ONE ARCHITECTURE. Qwen3.8-Flash-Next shipped under
+        // `qwen3_8_flash_next` and was later renamed `qwen4_exp`; quantizers
+        // pinned to different transformers revisions emit different names
+        // (RadixArk -> qwen4_exp, Inferact -> qwen3_8_flash_next). Their
+        // `text_config`s are otherwise IDENTICAL field-for-field, so the
+        // alias is the whole difference at the config layer.
+        "qwen4_exp" | "qwen3_8_flash_next" => parse_qwen4_exp(&raw),
         "m2m_100" | "nllb" => {
             let mut config = ModelConfig::qwen3_next_80b_nvfp4();
             config.model_type = "m2m_100".to_string();
