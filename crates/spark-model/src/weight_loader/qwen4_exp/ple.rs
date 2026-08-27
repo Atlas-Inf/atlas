@@ -59,6 +59,7 @@ fn i64_host(store: &WeightStore, name: &str, gpu: &dyn GpuBackend) -> Result<Vec
 }
 
 /// Build the PLE layer for `layer_idx`, or `None` if this model has none.
+#[cfg(feature = "cuda")]
 pub(super) fn load(
     store: &WeightStore,
     config: &ModelConfig,
@@ -190,4 +191,27 @@ pub(super) fn load(
     )
     .map(Some)
     .context("PLE: layer construction")
+}
+
+/// Non-CUDA builds have no NVMe row cache — it serves rows out of a pinned,
+/// GPU-addressable arena — so a PLE model cannot be served here. REFUSE
+/// rather than return `None` (same rationale as `longcat/ngram.rs`): `None`
+/// means "this model has no PLE", and quietly answering that for a model
+/// that does have one silently drops the n-gram injection.
+#[cfg(not(feature = "cuda"))]
+pub(super) fn load(
+    _store: &WeightStore,
+    config: &ModelConfig,
+    _layer_idx: usize,
+    _max_tokens: usize,
+    _gpu: &dyn GpuBackend,
+) -> Result<Option<PleLayer>> {
+    if config.ple_layer_ids.is_empty() {
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "qwen4_exp PLE: this checkpoint has n-gram embeddings, but the row \
+         cache that serves them needs the `cuda` feature; this build cannot \
+         serve it"
+    )
 }

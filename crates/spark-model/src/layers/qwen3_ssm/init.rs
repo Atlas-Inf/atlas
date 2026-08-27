@@ -493,34 +493,8 @@ impl Qwen3SsmLayer {
         })
     }
 
-    /// Construct an SSM layer where QKVZ projection output is already sequential.
-    ///
-    /// Used by Qwen3.5 where separate QKV and Z weights are concatenated at load
-    /// time into `[Q|K|V|Z]` row order. The `deinterleave_qkvz` kernel is skipped
-    /// and plain `w4a16_gemv` writes directly to the deinterleaved buffer.
-    pub fn new_sequential(
-        input_norm: DenseWeight,
-        ssm: SsmWeights,
-        post_attn_norm: DenseWeight,
-        ffn: FfnComponent,
-        qkvz_nvfp4: Option<QuantizedWeight>,
-        qkvz_nvfp4_t: Option<QuantizedWeight>,
-        out_proj_nvfp4_t: Option<QuantizedWeight>,
-        config: &atlas_core::config::ModelConfig,
-        gpu: &dyn GpuBackend,
-    ) -> Result<Self> {
-        let mut layer = Self::new(
-            input_norm,
-            ssm,
-            post_attn_norm,
-            ffn,
-            qkvz_nvfp4,
-            config,
-            gpu,
-        )?;
-        layer.sequential_qkvz = true;
-        layer.qkvz_nvfp4_t = qkvz_nvfp4_t;
-        layer.out_proj_nvfp4_t = out_proj_nvfp4_t;
-        Ok(layer)
-    }
+    // `new_sequential` moved to `init_sequential.rs` (≤500 LoC split).
 }
+
+#[path = "init_sequential.rs"]
+mod init_sequential;
