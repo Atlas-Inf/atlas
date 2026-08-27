@@ -19,86 +19,10 @@
 use anyhow::{Context, Result};
 use atlas_core::config::{LayerType, ModelConfig, parse_config};
 use atlas_core::ngram_table::NgramTable;
+use atlas_core::qwen4exp_reference::tap;
 use atlas_core::qwen4exp_reference::*;
-use atlas_core::weight_manifest::{TensorLocation, locate_checkpoint};
+use atlas_core::weight_manifest::locate_checkpoint;
 use std::collections::BTreeMap;
-use std::os::unix::fs::FileExt;
-
-struct Store {
-    located: BTreeMap<String, TensorLocation>,
-    cache: std::cell::RefCell<BTreeMap<String, std::rc::Rc<Vec<f32>>>>,
-}
-
-impl Store {
-    fn raw(&self, name: &str) -> Result<(Vec<u8>, &TensorLocation)> {
-        let loc = self
-            .located
-            .get(name)
-            .with_context(|| format!("missing {name}"))?;
-        let file = std::fs::File::open(&loc.path)?;
-        let mut bytes = vec![0u8; loc.span.len as usize];
-        file.read_exact_at(&mut bytes, loc.span.abs_offset)?;
-        Ok((bytes, loc))
-    }
-
-    /// Experts are the bulk of the model and are read once per token; caching
-    /// the dequantized form would need hundreds of GB.
-    fn cacheable(name: &str) -> bool {
-        !name.contains(".experts.")
-    }
-
-    fn get(&self, name: &str) -> Result<std::rc::Rc<Vec<f32>>> {
-        if let Some(hit) = self.cache.borrow().get(name) {
-            return Ok(hit.clone());
-        }
-        let (raw, loc) = self.raw(name)?;
-
-        // NVFP4: nibbles packed two per byte, an FP8 block scale along the
-        // input dim, and a per-tensor f32 on top of that.
-        if loc.dtype == "U8" && self.located.contains_key(&format!("{name}_scale")) {
-            let rows = loc.shape[0];
-            let cols = loc.shape[1] * 2;
-            let scale_loc = &self.located[&format!("{name}_scale")];
-            let group = cols / scale_loc.shape[1];
-            let (scale, _) = self.raw(&format!("{name}_scale"))?;
-            let (g2, _) = self.raw(&format!("{name}_scale_2"))?;
-            let global = f32::from_le_bytes([g2[0], g2[1], g2[2], g2[3]]);
-            let values =
-                atlas_core::numeric::nvfp4_dequant(&raw, &scale, global, rows, cols, group)
-                    .map_err(anyhow::Error::msg)?;
-            let shared = std::rc::Rc::new(values);
-            if Self::cacheable(name) {
-                self.cache
-                    .borrow_mut()
-                    .insert(name.to_string(), shared.clone());
-            }
-            return Ok(shared);
-        }
-
-        let values: Vec<f32> = match loc.dtype.as_str() {
-            "F32" => raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            "BF16" => raw
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect(),
-            "F8_E4M3" => raw
-                .iter()
-                .map(|b| atlas_core::numeric::fp8_e4m3_to_f32(*b))
-                .collect(),
-            other => anyhow::bail!("{name}: no f32 path for dtype {other}"),
-        };
-        let shared = std::rc::Rc::new(values);
-        if Self::cacheable(name) {
-            self.cache
-                .borrow_mut()
-                .insert(name.to_string(), shared.clone());
-        }
-        Ok(shared)
-    }
-}
 
 fn hc_weights<'a>(held: &'a [std::rc::Rc<Vec<f32>>], inject: bool) -> HyperConnectionWeights<'a> {
     HyperConnectionWeights {
@@ -109,7 +33,7 @@ fn hc_weights<'a>(held: &'a [std::rc::Rc<Vec<f32>>], inject: bool) -> HyperConne
     }
 }
 
-fn load_hc(store: &Store, prefix: &str, inject: bool) -> Result<Vec<std::rc::Rc<Vec<f32>>>> {
+fn load_hc(store: &RefStore, prefix: &str, inject: bool) -> Result<Vec<std::rc::Rc<Vec<f32>>>> {
     let mut held = vec![
         store.get(&format!("{prefix}.hc_norm.weight"))?,
         store.get(&format!("{prefix}.input_mix_weight_down.weight"))?,
@@ -149,10 +73,7 @@ fn main() -> Result<()> {
     let fixture_path = positional.next();
 
     let config: ModelConfig = parse_config(&std::fs::read_to_string(dir.join("config.json"))?)?;
-    let store = Store {
-        located: locate_checkpoint(&dir)?,
-        cache: std::cell::RefCell::new(BTreeMap::new()),
-    };
+    let store = RefStore::new(locate_checkpoint(&dir)?);
     let ids: Vec<u32> = match &fixture_path {
         Some(path) => {
             let f: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -238,7 +159,7 @@ fn main() -> Result<()> {
 fn forward(
     dir: &std::path::Path,
     config: &ModelConfig,
-    store: &Store,
+    store: &RefStore,
     ids: &[u32],
 ) -> Result<Vec<f32>> {
     let (h, hc) = (config.hidden_size, config.hc_count);
@@ -319,10 +240,19 @@ fn forward(
             }
         }
 
+        // The GPU taps the SSM sublayer's hc pass (`trait_prefill_hc`), labelled
+        // by its LINEAR-ATTENTION index, so only GDN layers have a counterpart
+        // and the index is not `layer`. `None` for a full-attention layer.
+        let ssm_idx = tap::ssm_index_of(&config.layer_types, layer);
+
         for (which, is_attn) in [
             ("attn_hyper_connection", true),
             ("mlp_hyper_connection", false),
         ] {
+            // `in`: the highway entering the sublayer, before hc_pre.
+            if let (Some(n), true) = (ssm_idx, is_attn) {
+                tap::tap(n, "in", &hidden);
+            }
             let held = load_hc(store, &format!("{base}.{which}"), true)?;
             let hcw = hc_weights(&held, true);
 
@@ -338,6 +268,10 @@ fn forward(
                 );
                 mixed_all[t * h..(t + 1) * h].copy_from_slice(&out.mixed);
                 injects[t * hc..(t + 1) * hc].copy_from_slice(&out.injection);
+            }
+            if let (Some(n), true) = (ssm_idx, is_attn) {
+                tap::tap(n, "hc_pre_mixed", &mixed_all);
+                tap::tap(n, "hc_pre_inj", &injects);
             }
 
             let block_out = if is_attn {
@@ -463,6 +397,9 @@ fn forward(
                 out
             };
 
+            if let (Some(n), true) = (ssm_idx, is_attn) {
+                tap::tap(n, "block_out", &block_out);
+            }
             for t in 0..seq {
                 let scattered = broadcast_inject(
                     &block_out[t * h..(t + 1) * h],
@@ -472,6 +409,12 @@ fn forward(
                 for (slot, value) in hidden[t * wide..(t + 1) * wide].iter_mut().zip(scattered) {
                     *slot += value;
                 }
+            }
+            // `post_gdn`: the highway after hc_post, tapped BEFORE the MoE on
+            // the GPU side too, so reproducing it needs the GDN projections
+            // only and not 512 experts.
+            if let (Some(n), true) = (ssm_idx, is_attn) {
+                tap::tap(n, "post_gdn", &hidden);
             }
         }
     }

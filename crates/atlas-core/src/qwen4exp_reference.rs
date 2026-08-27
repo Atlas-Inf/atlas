@@ -209,6 +209,10 @@ mod moe;
 mod ple;
 #[path = "qwen4exp_reference/qsa.rs"]
 mod qsa;
+/// Checkpoint reader for the reference forward.
+pub mod store;
+/// Reference-side highway taps, for diffing against the GPU dump.
+pub mod tap;
 
 // Re-exported flat, so `atlas_core::qwen4exp_reference::ple_forward` still
 // resolves for every caller — the examples, the microtest and the GPU parity
@@ -219,3 +223,4 @@ pub use hc::*;
 pub use moe::*;
 pub use ple::*;
 pub use qsa::*;
+pub use store::RefStore;
