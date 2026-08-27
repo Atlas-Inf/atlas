@@ -503,9 +503,53 @@ a kernel that ignored the thing being tested would pass.
 | hyper-connection collapse | all (x2) | 3.9e-3 | injection must not saturate |
 | PLE tower | 1 | 5.2e-3 | zeroed conv taps must change the answer |
 | `gated_delta_rule_decode` | 36 | 3.3e-3 | shared-head mapping exercised |
+| `q4e_attn_decode` | 12 | 3.4e-3 | ungated recompute must move the answer |
+| `q4e_hc_expand` | trunk entry | exact | sentinel must be fully overwritten |
 
-All at BF16-ulp level. Run them with
+All five block types, at BF16-ulp level. Run them with
 `cargo run --release -p spark-model --example qwen4exp_grouped_norm_microtest`.
+
+### The attention oracle is extracted, not re-written
+
+`attention_decode_step` was split OUT of `attention_forward`, which now calls
+it. A second transcription of the same equations would have been free to be
+wrong in the same direction as the kernel; this way agreement chains to the
+code that matches HuggingFace at 8.0e-7.
+
+Its gate control matters more than it looks. `q_proj` emits `[query | gate]`
+per head and the gate is applied ELEMENTWISE before `o_proj` — so a kernel that
+ignored `gate` entirely would still produce well-formed attention output. The
+check recomputes with every gate forced to +8 (sigmoid ~ 1) and requires the
+answer to move; it moves by 300x the error.
+
+### The trunk entry is q4e_hc_expand, not DeepSeek-V4's hc_expand
+
+The two do the same job, but V4's lives in that model's shadow rather than in
+`common/`, so it does not resolve for this target. Same module-scoping rule
+that forced the `q4e_` prefix (below).
+
+The streams must start IDENTICAL — a copy of the embedding into all `hc_count`
+slots. Zero-initialising them instead makes the first hyper-connection collapse
+read a zero mean, and the model does not recover, while still emitting tokens.
+
+### hc_streams: the element size is per-family
+
+`hc_streams` was gated on `hc_mult > 0`, DeepSeek-V4's spelling. `qwen4_exp`
+says `hc_count`, so it silently received the 256-byte placeholder and the first
+write past it would have been another buffer.
+
+| family | field | element | why |
+|---|---|---|---|
+| DeepSeek-V4 | `hc_mult` | f32 | manifold mixing is norm-preserving; bf16 swamps the per-layer signal and collapses generation |
+| qwen4_exp | `hc_count` | bf16 | `q4e_hc_stream_mix` / `q4e_hc_scatter_add` stride by `__nv_bfloat16` |
+
+Sizing the qwen4_exp arm f32 would NOT have failed — it would have read the
+wrong half of every value.
+
+**OPEN:** qwen4_exp's mixer is contractive (it divides by `hc_count`) rather
+than norm-preserving, so V4's drift argument does not obviously transfer.
+Whether 48 layers x 2 blocks of bf16 accumulation drifts is UNMEASURED. If it
+does, the kernels and the sizing move together.
 
 ### The GDN kernel is reusable, with one interface trap
 
