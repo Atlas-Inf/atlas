@@ -33,7 +33,8 @@ import sys
 # The order within one layer, matching the GPU's call order in
 # `trait_prefill_hc.rs`: highway in -> hc_pre's two outputs -> block output ->
 # highway after hc_post.
-TAG_ORDER = ["in", "hc_pre_mixed", "hc_pre_inj", "block_out", "post_gdn"]
+TAG_ORDER = ["in", "hc_pre_mixed", "hc_pre_inj", "block_out", "post_gdn",
+             "post_moe"]
 
 
 def read_f32(path: str) -> list[float]:

@@ -410,11 +410,16 @@ fn forward(
                     *slot += value;
                 }
             }
-            // `post_gdn`: the highway after hc_post, tapped BEFORE the MoE on
-            // the GPU side too, so reproducing it needs the GDN projections
-            // only and not 512 experts.
-            if let (Some(n), true) = (ssm_idx, is_attn) {
-                tap::tap(n, "post_gdn", &hidden);
+            // `post_gdn` is tapped after the GDN sublayer's hc_post and
+            // BEFORE the MoE; `post_moe` after the MoE sublayer's. Both
+            // exist on the GPU side, and the PAIR is what separates
+            // arithmetic drift from MoE ROUTING divergence: top-10-of-512 is
+            // a discrete function of a drifting router logit, so one
+            // different expert changes the output materially while leaving it
+            // coherent. If the jump is across the MoE and not the GDN, that
+            // is the mechanism.
+            if let Some(n) = ssm_idx {
+                tap::tap(n, if is_attn { "post_gdn" } else { "post_moe" }, &hidden);
             }
         }
     }
