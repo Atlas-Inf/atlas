@@ -380,6 +380,17 @@ impl TransformerModel {
             token_ids: None,
             // The batch's token ids: the hc multi-seq PLE rows read their
             // per-seq id from this slice.
+            //
+            // NOTE: this is the ONE per-seq input at ACTIVE length. Its
+            // siblings are all padded to `padded_n` — `seq_lens` and
+            // `block_tables` above, `all_layer_states` (dummy states for the
+            // padding rows), and the fixed-stride attention metadata. A
+            // consumer that bounds a per-seq loop by the `padded_n` it is
+            // handed and then indexes THIS slice will run off the end, which
+            // is what broke every concurrent request whose live count was not
+            // already a padding boundary ("3 host ids for 4 seqs"). Padding
+            // rows carry no PLE state, so the fix is to skip them, not to
+            // fabricate token ids for rows whose output is discarded.
             host_token_ids: Some(tokens),
             routed_lora_layers: None, // #30: batched decode never routes prefill.
             midchunk_capture: None,
