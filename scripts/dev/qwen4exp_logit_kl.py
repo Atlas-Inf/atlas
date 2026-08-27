@@ -80,23 +80,51 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("gpu_dir")
     ap.add_argument("ref_dir")
-    ap.add_argument("--vocab", type=int, required=True)
+    ap.add_argument("--vocab", type=int, required=True,
+                    help="GPU row width; the server CAPS vocab to the "
+                         "tokenizer's size (248077 here)")
+    ap.add_argument("--ref-vocab", type=int, default=None,
+                    help="reference row width if it differs — the CPU forward "
+                         "uses config.vocab_size (248320), which the server "
+                         "caps. Compared over the common prefix.")
     ap.add_argument("--temp", type=float, default=1.0,
                     help="card sampling temperature (Qwen3.8-Flash-Next: 1.0)")
     ap.add_argument("--kl-warn", type=float, default=0.05,
                     help="KL(ref||gpu) in nats above which to flag a position")
     args = ap.parse_args()
 
-    gpu_path = os.path.join(args.gpu_dir, "logits_fetch.bin")
+    # Two sites append under ATLAS_DUMP_LOGITS_PATH and which one fires
+    # depends on the sampling path taken: `spark_runtime::sampler` writes
+    # `logits_fetch.bin`, `scheduler::sample_step` writes `logits_stok.bin`.
+    # Accept either rather than silently reporting "missing" for the one that
+    # actually ran.
+    gpu_path = next(
+        (p for p in (os.path.join(args.gpu_dir, n)
+                     for n in ("logits_stok.bin", "logits_fetch.bin"))
+         if os.path.exists(p)),
+        os.path.join(args.gpu_dir, "logits_stok.bin"),
+    )
     ref_path = os.path.join(args.ref_dir, "ref_logits.bin")
     for p in (gpu_path, ref_path):
         if not os.path.exists(p):
             print(f"missing {p}", file=sys.stderr)
             return 2
 
+    ref_vocab = args.ref_vocab or args.vocab
     gpu = rows(gpu_path, args.vocab)
-    ref = rows(ref_path, args.vocab)
-    print(f"gpu rows: {len(gpu)}   ref rows: {len(ref)}   vocab: {args.vocab}")
+    ref = rows(ref_path, ref_vocab)
+    print(f"gpu file: {os.path.basename(gpu_path)}")
+    print(f"gpu rows: {len(gpu)} x {args.vocab}   "
+          f"ref rows: {len(ref)} x {ref_vocab}")
+    # The tail the server trimmed is unreachable ids; comparing the common
+    # prefix is the only apples-to-apples window. Truncating rather than
+    # padding matters: a zero-padded tail would look like agreed-upon mass.
+    common = min(args.vocab, ref_vocab)
+    if args.vocab != ref_vocab:
+        print(f"widths differ — comparing the common prefix of {common} "
+              f"(the server caps vocab to the tokenizer's size)")
+        gpu = [r[:common] for r in gpu]
+        ref = [r[:common] for r in ref]
 
     # The GPU dump holds the sampled step(s) only; the reference holds every
     # prompt position. Compare the LAST row of each, which is the position both
@@ -104,6 +132,18 @@ def main() -> int:
     pairs = [(len(gpu) - 1, len(ref) - 1)]
     print(f"comparing gpu row {pairs[0][0]} against ref row {pairs[0][1]} "
           f"(the position both predicted from)\n")
+
+    # ── CONTROL 1: the GPU against itself. ──
+    # Identical prompts should give identical logits; whatever KL this shows
+    # is the measurement's own noise floor, and the GPU-vs-reference number
+    # means nothing without it.
+    if len(gpu) > 1:
+        selfk = max(kl(softmax(gpu[0], 1.0), softmax(gpu[i], 1.0))
+                    for i in range(1, len(gpu)))
+        ident = all(gpu[0] == gpu[i] for i in range(1, len(gpu)))
+        print(f"  control: gpu vs gpu over {len(gpu)} identical prompts — "
+              f"KL {selfk:.9f}, bitwise identical: {ident}")
+        print()
 
     worst = 0.0
     for gi, ri in pairs:
@@ -123,6 +163,19 @@ def main() -> int:
                   f"rank_of_ref1 {rank}   top20_overlap {overlap}/20")
         print(f"             logit range: gpu [{min(g):.3f}, {max(g):.3f}]  "
               f"ref [{min(r):.3f}, {max(r):.3f}]")
+
+        # ── CONTROL 2: KL over what sampling can actually REACH. ──
+        # The card samples top_k=20, so every token outside the top 20 is
+        # truncated before a draw happens. Full-vocab KL therefore charges the
+        # port for disagreement over ~248k tokens that can never be emitted.
+        # Restrict to the union of the two top-20 sets and renormalize: this
+        # is the distribution a user is actually exposed to.
+        for k in (20, 100):
+            keep = sorted(set(topk(g, k)) | set(topk(r, k)))
+            gk = softmax([g[i] for i in keep], temp)
+            rk = softmax([r[i] for i in keep], temp)
+            print(f"             top-{k} union ({len(keep)} ids), renormalized: "
+                  f"KL(ref||gpu) {kl(rk, gk):.6f}")
 
     print()
     if worst <= args.kl_warn:
