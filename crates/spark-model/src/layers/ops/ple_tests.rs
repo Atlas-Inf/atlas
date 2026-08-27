@@ -304,8 +304,15 @@ fn ple_gather_reads_the_right_rows() {
 
     // Rebuild the segmented cache exactly as the loader does, straight from
     // the safetensors header — no model load.
-    let (shards, rows_per) =
+    let (shards, rows_per, dtype) =
         crate::weight_loader::qwen4_exp::ple_shard_layout(&snap).expect("PLE shard layout");
+    // 1 byte per element for F8_E4M3, 2 for BF16. Hardcoding 2 read every row
+    // at twice its true offset — the bug this arm exists to catch.
+    let elem = match dtype.as_str() {
+        "BF16" => 2,
+        "F8_E4M3" => 1,
+        other => panic!("PLE table dtype {other} is neither BF16 nor F8_E4M3"),
+    };
     let files = {
         let mut seen: Vec<&std::path::Path> = Vec::new();
         for (p, _) in &shards {
@@ -316,7 +323,7 @@ fn ple_gather_reads_the_right_rows() {
         seen.len()
     };
     println!(
-        "shards={} rows_per={rows_per} over {files} file(s)",
+        "shards={} rows_per={rows_per} over {files} file(s), dtype {dtype} ({elem} B/elem)",
         shards.len()
     );
     // CUDA FIRST: the cache's arena is pinned, GPU-addressable memory, so it
@@ -331,7 +338,7 @@ fn ple_gather_reads_the_right_rows() {
         &shards,
         rows_per,
         None,
-        head_dim * 2,
+        head_dim * elem,
         ids.len().next_power_of_two(),
     )
     .expect("segmented cache");

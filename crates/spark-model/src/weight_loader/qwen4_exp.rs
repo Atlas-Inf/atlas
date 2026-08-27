@@ -81,7 +81,9 @@ pub use probe::audit_namespace;
 
 /// The PLE table's shard layout, read straight from a checkpoint's
 /// safetensors header: `(backing file, byte offset of first row)` per shard,
-/// plus the rows each shard holds.
+/// the rows each shard holds, and the shards' safetensors dtype string
+/// (`"BF16"` / `"F8_E4M3"`) — which decides the row stride, and is 1 byte per
+/// element on the RadixArk NVFP4 conversion.
 ///
 /// Exists so a test can rebuild the segmented row cache WITHOUT loading a
 /// 75 GB model — the gather is the one part of PLE whose failure is invisible
@@ -97,7 +99,7 @@ pub use probe::audit_namespace;
 /// gated on the cuda feature — so this must be too, or a metal test build
 /// trips `deny(dead_code)`.
 #[cfg(all(test, feature = "cuda"))]
-pub fn ple_shard_layout(snapshot: &str) -> Result<(Vec<(std::path::PathBuf, u64)>, u64)> {
+pub fn ple_shard_layout(snapshot: &str) -> Result<(Vec<(std::path::PathBuf, u64)>, u64, String)> {
     use std::collections::HashMap;
     use std::io::{Read, Seek, SeekFrom};
     let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
@@ -124,6 +126,7 @@ pub fn ple_shard_layout(snapshot: &str) -> Result<(Vec<(std::path::PathBuf, u64)
     let mut headers: HashMap<String, (serde_json::Value, u64)> = HashMap::new();
     let mut shards = Vec::with_capacity(names.len());
     let mut rows_per = 0u64;
+    let mut dtype = String::new();
     for (i, name) in &names {
         let file = map[name.as_str()].as_str().context("shard file")?;
         let path = std::path::Path::new(snapshot).join(file);
@@ -143,16 +146,19 @@ pub fn ple_shard_layout(snapshot: &str) -> Result<(Vec<(std::path::PathBuf, u64)
             .as_u64()
             .with_context(|| format!("data_offsets for shard {i} in {file}"))?;
         let rows = e["shape"][0].as_u64().context("shape")?;
+        let dt = e["dtype"].as_str().context("dtype")?.to_string();
         if *i == 0 {
             rows_per = rows;
+            dtype = dt.clone();
         }
+        anyhow::ensure!(dt == dtype, "shard {i} is {dt}, not {dtype}");
         anyhow::ensure!(
             rows == rows_per,
             "shard {i} has {rows} rows, not {rows_per}"
         );
         shards.push((path, data_start + off));
     }
-    Ok((shards, rows_per))
+    Ok((shards, rows_per, dtype))
 }
 
 pub struct Qwen4ExpWeightLoader;
