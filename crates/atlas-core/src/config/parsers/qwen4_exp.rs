@@ -47,6 +47,17 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
     // kernel-target resolution off the TOP-level name.
     config.model_type = "qwen4_exp".to_string();
     config.nested_config = true;
+    // The reference `Qwen4ExpTextTopKRouter` renormalizes the top-k probs
+    // (`Qwen4ExpTextConfig.norm_topk_prob` defaults TRUE and the checkpoint
+    // json OMITS the key). Serde's bool default is false, so without this the
+    // MoE weighted sum runs on RAW top-10 softmax probs — each token's expert
+    // contribution scaled by its top-10 mass (measured 0.56-0.93, mean 0.84
+    // on the 55-token bisect fixture), compounding over 48 layers into a ~5x
+    // highway deficit and temperature-1.0 sampling salad while argmax stays
+    // coherent. Same trap minimax.rs documents; found via
+    // bench/qwen4_exp/{forward_ref,slice_ref}.py: GDN sublayer cos 0.99999,
+    // MoE-delta cos 0.93 ratio 0.84.
+    config.norm_topk_prob = true;
     // Multimodal wrapper: every decoder tensor is under
     // `model.language_model.`, and the ViT under `model.visual.`. Setting the
     // prefix here means `config.layer_prefix(i)` yields the real key, so the

@@ -251,6 +251,7 @@ def main():
 
     n_layers = LAYER_LIMIT or tc.num_hidden_layers
     layer_rms = []
+    saved_highway = {}
 
     # The PLE layer's CONSTRUCTOR materializes the full n-gram nn.Embedding
     # (billions of rows, ~90 GB) before any swap can happen — earlyoom killed
@@ -302,6 +303,13 @@ def main():
         rms = hidden.pow(2).mean().sqrt().item()
         layer_rms.append(rms)
         print(f'layer {i:2d}: hyper rms {rms:.4f}', flush=True)
+        # QWEN4EXP_SAVE_HIGHWAY=n: keep the full post-layer highway tensors
+        # for the first n layers (diffable against the engine's
+        # ATLAS_QWEN4EXP_DUMP taps: post-layer-i == L{i}_post_moe ==
+        # L{i+1}_in).
+        if i < int(os.environ.get('QWEN4EXP_SAVE_HIGHWAY', '0')):
+            saved_highway[f'highway_L{i:02d}'] = (
+                hidden[0].float().numpy().astype(np.float32))
         del layer, sd
         gc.collect()
         ctypes.CDLL('libc.so.6').malloc_trim(0)
@@ -326,6 +334,7 @@ def main():
         logits=logits.numpy().astype(np.float32),
         layer_rms=np.array(layer_rms, dtype=np.float32),
         n_layers=np.array([n_layers]),
+        **saved_highway,
     )
     print(f'wrote {OUT}', flush=True)
     return 0

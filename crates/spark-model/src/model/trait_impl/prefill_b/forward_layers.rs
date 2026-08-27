@@ -224,6 +224,28 @@ impl TransformerModel {
                 self.gpu.synchronize(stream)?;
                 layer_times.push(lt0.elapsed().as_micros());
             }
+            // Hyper-stream RMS trail (`ATLAS_DUMP_HYPER_RMS=1`): after each
+            // layer, RMS over the FP32 mHC highway [proc_count, hc_mult, H]
+            // — directly comparable to the reference golden's `layer_rms`
+            // (bench/qwen4_exp/forward_ref.py) since both sides keep the
+            // highway in f32. Localizes which layer the engine's logit
+            // dilution (KL 0.3-1.6 nats/token vs reference) first appears
+            // in. Debug-only: syncs + D2H per layer.
+            if std::env::var("ATLAS_DUMP_HYPER_RMS").as_deref() == Ok("1")
+                && self.config.hc_mult > 0
+            {
+                let n = proc_count * self.config.hc_mult * self.config.hidden_size;
+                let mut buf = vec![0u8; n * 4];
+                self.gpu
+                    .copy_d2h_on_stream(ctx.buffers.hc_streams(), &mut buf, stream)?;
+                let vals: &[f32] =
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, n) };
+                let ssq: f64 = vals.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                tracing::info!(
+                    "HYPER_RMS layer {i} tokens {proc_count} rms {:.6}",
+                    (ssq / n as f64).sqrt()
+                );
+            }
             // MLA diagnostic: per-layer hidden norm for Mistral (once per model).
             // Per-model latch (see `ModelStats::dumped`) rather than a static: an
             // operator who sets the flag and then swaps models must still get the
