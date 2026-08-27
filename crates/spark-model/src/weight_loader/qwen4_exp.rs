@@ -65,7 +65,13 @@ use crate::layer::TransformerLayer;
 use crate::weight_loader::ModelWeightLoader;
 use crate::weight_map::{DenseWeight, MtpWeights, dense};
 
-mod aux;
+// `attach`, not `aux`: `aux` is a RESERVED DEVICE NAME on Windows (with con,
+// prn, nul, com1-9, lpt1-9), and the reservation applies even with an
+// extension — so `aux.rs` cannot be checked out at all there. The Windows
+// release build failed with `error: invalid path` from git itself, before any
+// compiler ran. `attach` is also the better name: the module is the three
+// per-layer attach helpers.
+mod attach;
 mod ffn;
 mod hc;
 mod ple;
@@ -331,9 +337,9 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             let mut layer = layer;
             if config.hc_mult > 0 {
                 let (attn, ffn) = hc::load_layer_sites(store, &lp, config)?;
-                aux::attach_hc(&mut layer, i, attn, ffn, hc_head.clone(), config)?;
+                attach::attach_hc(&mut layer, i, attn, ffn, hc_head.clone(), config)?;
             }
-            aux::attach_qsa(&mut layer, i, &lp, store, config, gpu)?;
+            attach::attach_qsa(&mut layer, i, &lp, store, config, gpu)?;
             // PLE lands on exactly one layer, which on this checkpoint is a
             // GDN one. `load` returns None for every other layer.
             let ple_layer = if ple_off {
@@ -342,7 +348,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                 ple::load(store, config, i, max_ple_tokens, gpu)?
             };
             if let Some(p) = ple_layer {
-                aux::attach_ple(&mut layer, i, p)?;
+                attach::attach_ple(&mut layer, i, p)?;
             }
             layers.push(layer);
             hc_bytes += f2.saturating_sub(free_now(gpu));
@@ -419,7 +425,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        aux::final_norm_placeholder(store, config, gpu)
+        attach::final_norm_placeholder(store, config, gpu)
     }
 
     fn load_lm_head(

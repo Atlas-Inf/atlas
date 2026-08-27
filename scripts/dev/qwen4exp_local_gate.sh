@@ -120,6 +120,21 @@ loc_cap() {
   (( over == 0 ))
 }
 run "500-LoC cap per .rs"    loc_cap
+# Windows reserves con/prn/aux/nul/com1-9/lpt1-9 as DEVICE names, and the
+# reservation holds even with an extension — `aux.rs` cannot be checked out on
+# Windows at all. `git checkout` fails with "invalid path" before any compiler
+# runs, so the whole Windows release build dies on a filename. Neither macOS nor
+# Linux can see it; the merge brought one in.
+reserved_names() {
+  local hits
+  hits=$(find . -path ./target -prune -o -path ./.git -prune -o -print 2>/dev/null \
+         | grep -iE '/(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.[^/]*)?$')
+  if [[ -n "$hits" ]]; then
+    echo "Windows-reserved device name(s):"; echo "$hits"; return 1
+  fi
+  return 0
+}
+run "no Windows-reserved filenames" reserved_names
 
 echo "── lint ─────────────────────────────────────────────────────"
 run "fmt"                    "$CARGO" fmt --all -- --check
