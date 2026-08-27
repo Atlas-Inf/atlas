@@ -136,6 +136,38 @@ struct DflashRaw {
     target_layer_ids: Vec<usize>,
 }
 
+/// `cargo:rerun-if-changed` for a path that is not guaranteed to exist.
+///
+/// Cargo treats a watched path that is MISSING as permanently stale. Emitting
+/// one therefore re-runs this build script on every single build — and with it
+/// every nvcc invocation it makes — no matter that nothing changed.
+///
+/// That was happening. Not every (model, quant) pair has a kernel directory:
+/// `kernels/gb10/nllb-200-3.3b` ships `bf16` only, so resolving it for `nvfp4`
+/// yields a path that does not exist, and watching it pinned the whole crate
+/// dirty forever. Cargo reported it as
+/// `StaleItem(MissingFile { path: ".../kernels/gb10/nllb-200-3.3b/nvfp4" })`.
+///
+/// Watch the nearest ancestor that DOES exist instead. Creating the missing
+/// directory necessarily mutates that ancestor, so a real change still
+/// triggers the rebuild it should — the watch stays honest, it just stops
+/// firing on nothing.
+fn rerun_if_changed(path: &std::path::Path) {
+    let mut p = path;
+    loop {
+        if p.exists() {
+            println!("cargo:rerun-if-changed={}", p.display());
+            return;
+        }
+        match p.parent() {
+            Some(parent) => p = parent,
+            // Walked off the top without finding anything real: emit nothing
+            // rather than re-introduce the always-dirty watch.
+            None => return,
+        }
+    }
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -426,12 +458,12 @@ fn main() {
         }
         all_target_drops.push(drops);
 
-        println!(
-            "cargo:rerun-if-changed={}",
-            target.model_kernel_dir.display()
-        );
+        // Via the helper: a (model, quant) pair with no override directory
+        // resolves to a path that does not exist, and watching it directly
+        // makes this build script always-dirty. See `rerun_if_changed`.
+        rerun_if_changed(&target.model_kernel_dir);
         if let Some(ref common) = target.common_kernel_dir {
-            println!("cargo:rerun-if-changed={}", common.display());
+            rerun_if_changed(common);
         }
         let n_overrides = find_cu_files(&target.model_kernel_dir, source_ext).len();
         println!(

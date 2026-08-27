@@ -93,37 +93,39 @@ jobs:
       # ONE cargo invocation builds what BOTH remaining steps need.
       #
       # This was `cargo build -p atlas-kernels`, and the job then paid for the
-      # kernel build twice. Measured on run 33017672173:
+      # whole kernel build twice. Measured on run 33017672173:
       #
       #     dev  profile  475/4303 unique nvcc invocations   2m 27s
       #     test profile  475/4303 unique nvcc invocations   2m 18s   <- identical
       #     the tests themselves                             ~2s
       #
-      # Reproduced on a GB10 with ATLAS_SKIP_BUILD=1, which isolates the cargo
-      # graph from nvcc: `cargo build` then `cargo test` leaves TWO build-script
-      # output directories with different metadata hashes
-      # (atlas-kernels-71f8870684ff01d3, atlas-kernels-b03f426489938d35), so
-      # build.rs — and every nvcc call it makes — runs once per directory.
+      # There were TWO independent causes, and fixing only one changed nothing
+      # (run 33031063485 was still 219s + 197s).
       #
-      # The cause is in `crates/atlas-kernels/Cargo.toml`: `toml` is declared in
-      # BOTH `[build-dependencies]` and `[dev-dependencies]`. `cargo build`
-      # resolves the graph without dev-dependencies; `cargo test` pulls them in,
-      # which re-fingerprints the build script and forces a second run. Fixing
-      # it in Cargo.toml would mean restructuring a dependency that the tests
-      # legitimately need, so it is fixed here instead: compile through the
-      # TEST graph up front, and the `--ignored` step below reuses it.
+      #   1. Two different cargo graphs. `toml` is declared in BOTH
+      #      `[build-dependencies]` and `[dev-dependencies]` of atlas-kernels.
+      #      `cargo build` resolves without dev-dependencies and `cargo test`
+      #      pulls them in, so the build script was fingerprinted twice and got
+      #      two output directories (atlas-kernels-71f8870684ff01d3 and
+      #      -b03f426489938d35), running nvcc once per directory. Fixed here, by
+      #      compiling through the TEST graph up front so the `--ignored` step
+      #      below reuses it rather than resolving its own.
       #
-      # Same graph twice = a cache hit, verified on the GB10: the second
-      # invocation recompiled nothing and returned in 0.05s.
+      #   2. The build script was ALWAYS dirty, which no arrangement of two
+      #      cargo invocations could have helped. Fixed in
+      #      `crates/atlas-kernels/build.rs` — see `rerun_if_changed` there.
       #
-      # Deliberately NOT cached with Swatinem/rust-cache. That was the first
-      # plan and the measurement killed it: the whole dependency tree is seven
-      # small crates (winnow, toml_write, toml_datetime, serde_spanned,
-      # toml_edit, toml, atlas-closure) totalling ~3s of compilation. There is
-      # nothing to cache — the job's time is nvcc, which is the point of the
-      # job — and a restored `target/` would additionally make the assertion in
-      # the next step vacuous by leaving a previous run's real `target_ptx.rs`
-      # on disk.
+      # Verified on a GB10 against real nvcc: with both fixes, a second
+      # identical invocation recompiles nothing and returns in 0.05s.
+      #
+      # Deliberately NOT cached with Swatinem/rust-cache. That was the original
+      # plan and the measurement ruled it out: atlas-kernels' entire dependency
+      # tree is seven small crates (winnow, toml_write, toml_datetime,
+      # serde_spanned, toml_edit, toml, atlas-closure) totalling ~3s of
+      # compilation. There is nothing to cache — the job's time is nvcc, which
+      # is the job's purpose — and a restored `target/` would additionally make
+      # the assertion in the next step vacuous by leaving a previous run's real
+      # `target_ptx.rs` on disk.
       - name: Compile every gb10 kernel target
         env:
           # ★ NOT set to 1. That is the whole point of this job.
