@@ -550,7 +550,7 @@ Coherence, fresh server, default config: **5/7**. `Paris`; `408`;
 `15:40` for "14:05 plus 95 minutes"; recalled `axolotl` across turns;
 answered the negation. Decode ~15.4 tok/s, TTFT ~780 ms.
 
-### Open defect — GPU prefill disagrees with the CPU reference
+### RESOLVED — GPU prefill disagreed with the CPU reference
 
 **Minimal reproduction, and it is small.** The CPU reference forward
 (`examples/qwen4exp_forward`, no GPU kernels at all) is greedy-deterministic
@@ -664,3 +664,114 @@ And one clearance stated more broadly than the evidence supported: I checked
 that the row cache's INSERT path records its bookkeeping and concluded the
 cache was fine, without checking the pin LIFETIME — which was a real bug in
 the same file.
+
+
+## RESOLUTION: the PLE gathered its FP8 table with the BF16 kernel
+
+The bisect that the Rust-vs-Rust taps made possible, on a 5-token prompt:
+
+    L00_in            cosine 1.000000   ratio 1.0000
+    L00_post_gdn      cosine 0.999989   ratio 1.0003
+    L01_in            cosine 0.000062   ratio 1.25e31   <-- DIVERGES
+
+Layer 0 correct end to end; layer 1's input at 1.25e31. Narrowing with the
+GPU's own finer taps put it between `post_moe` (max 0.1985, sane) and the next
+layer's input (max 2.18e30), which leaves only the PLE injection — and this
+checkpoint puts PLE at model layer 1.
+
+`PleLayer::gather_embed` called `ops::batched_embed` unconditionally: the BF16
+gather, two bytes per element, no scale, against an F8_E4M3 table. Every row
+came back garbage read a row and a half wide. `batched_embed_fp8` existed and
+was wired on the LongCat path in `ngram_embed/embed.rs`; the PLE path never
+dispatched to it.
+
+**Why the earlier FP8 work was necessary but not sufficient.** The row stride
+(`884b298f`) and the per-tensor scale were both right. The stride fix turned an
+OUT-OF-BOUNDS read into an IN-BOUNDS wrong one, which is exactly why the
+symptom moved from a hard `NgramRowCache: read row 249579227` to fluent-but-
+wrong output. I stopped at the loader instead of following the dtype through to
+the kernel choice.
+
+Fixed in `67da29b7`, and made structurally impossible in `f3c2d068`:
+`PleLayer::new` now refuses to start when a table's element width and its
+gather disagree (`gather_guard::gather_matches_element_size`, pure and
+CUDA-free, so the bug that needed a 126 GB checkpoint and a GB10 to reveal is
+caught by a test that needs neither).
+
+## Verified on hardware, after the fix
+
+| leg | result |
+|---|---|
+| coherence | **7/7** — Paris; 408; 15:40 for "14:05 + 95 min"; exact JSON; axolotl recalled; `needle_in_context` 94 (the ~2000-token retrieval that failed every earlier run) |
+| BFCL-style tools | **6/6** — native `tool_calls`, enum honoured, numerics typed, parallel calls, irrelevance still declines |
+| decode, 1 stream | 14.48 tok/s, TTFT ~780 ms |
+| decode, 4 streams | **28.63 tok/s aggregate, 512 tok, zero errors** (~1.98x) |
+| trunk vs CPU ref | 36/36 GDN layers; `L01_in` cosine 6.2e-5 -> 0.999527 |
+| lib tests | 900 (atlas-core 167, spark-storage 87, spark-model 646) |
+
+## Two more defects the validation legs found
+
+**Tool calling was silently off** (`the BFCL leg`). `tools_active` requires
+`state.tool_call_parser.is_some()`, this target set none, so the tool
+definitions never reached Jinja and the rendered prompt had no `# Tools` block.
+The model said so itself — "I don't have access to ... any tools". Note the
+1/6 was a trap: the single pass was the IRRELEVANCE case, where declining is
+trivially correct if you were never given a tool. Fixed by
+`[behavior] tool_call_parser = "qwen3_coder"`, chosen because this checkpoint's
+template instructs the XML syntax
+(`<tool_call><function=N><parameter=K>v</parameter></function></tool_call>`),
+not hermes JSON.
+
+**Batched decode rejected any batch off a padding boundary** (`the perf leg`).
+`decode_batch` rounds the width up with `padded_batch_n` so one captured graph
+serves several batch sizes, and pushes dummy states (`ple: None`) for the
+padding rows — but the layer got `padded_n` while `host_token_ids` held only
+the active tokens, so the PLE loop asserted `host.len() >= padded_n`. Three
+live sequences padded to four failed outright: `3 host ids for 4 seqs`, HTTP
+500 on every concurrent request. Padding rows now skip the injection; a row
+with a LIVE PLE state and no token id still errors, which is the case worth
+being loud about.
+
+## KL logit drift, with controls
+
+    control: gpu vs gpu, 3 identical prompts — KL 0.000000000, bitwise identical
+    temp 1.0  KL(ref||gpu) 0.621798   top1 AGREE (5013)  rank_of_ref1 1
+              top20_overlap 13/20
+              top-20 union renormalized:  0.370020
+              top-100 union renormalized: 0.326119
+
+The GPU is bitwise deterministic, so the drift is systematic, not jitter. The
+card samples `top_k=20`, so full-vocab KL charges the port for ~248k ids that
+can never be emitted; restricted to the reachable distribution it is 0.37.
+
+**Not softcapping.** The mechanism exists (`cap * tanh(logits/cap)`) but this
+checkpoint sets neither `final_logit_softcapping` nor
+`attn_logit_softcapping`, and the reference applies none. The gpu max of
+exactly 10.000 is BF16 spacing near 10 (0.0625), not a cap.
+
+**Not MoE routing either** — the hypothesis I expected to confirm. Per-layer
+mean cosine change over all 36 GDN layers:
+
+| transition | mean dcos | worst |
+|---|---|---|
+| `in -> hc_pre_mixed` | -0.003518 | -0.012295 |
+| `hc_pre_mixed -> block_out` | +0.001897 | -0.012803 |
+| `block_out -> post_gdn` | +0.002447 | -0.018211 |
+| `post_gdn -> post_moe` | -0.001313 | -0.005422 |
+| `post_moe -> next in` | -0.000758 | -0.005990 |
+
+Net ~-0.00125/layer, which reproduces 0.9994 (L00) to 0.9559 (L35). Flipping
+an expert in a top-10-of-512 selection is DISCRETE, so it would show as large
+sporadic drops at `post_gdn -> post_moe`; instead that term is a steady
+-0.0013, about a third of the mHC collapse term. Expert selection is largely
+agreeing.
+
+Caveat worth stating: `hc_pre_mixed` and `block_out` are BF16 taps compared
+against an f32 reference, so part of the largest term is the TAP's own
+quantization — BF16 relative epsilon is ~0.4%, and 0.0035 of cosine on a
+12800-dim vector sits right at that scale.
+
+So the residual is distributed NVFP4/BF16-vs-f32 accumulation with no single
+mechanism responsible, which is the expected cost of quantized inference
+rather than a port defect — held against coherence 7/7, tools 6/6, and an
+identical argmax.
