@@ -70,13 +70,13 @@ impl NgramRowCache {
     /// per-row scale file, since silently ignoring one would dequantize an
     /// entire table with the wrong number.
     pub fn set_constant_scale(&mut self, scale: f32) -> Result<()> {
-        if let Some(sc) = &self.scales {
-            if sc.file.is_some() {
-                bail!(
-                    "NgramRowCache: a per-row scale file is already installed; \
-                     a constant per-tensor scale would silently override it"
-                );
-            }
+        if let Some(sc) = &self.scales
+            && sc.file.is_some()
+        {
+            bail!(
+                "NgramRowCache: a per-row scale file is already installed; \
+                 a constant per-tensor scale would silently override it"
+            );
         }
         let sbytes = self.slots * 4;
         let sblocks = sbytes.div_ceil(BLOCK);
