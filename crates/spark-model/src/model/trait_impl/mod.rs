@@ -824,6 +824,10 @@ impl Model for TransformerModel {
     fn is_ep(&self) -> bool {
         self.is_ep_dispatch()
     }
+    fn hc_mult(&self) -> usize {
+        self.config.hc_mult
+    }
+
     fn is_mla(&self) -> bool {
         self.is_mla_dispatch()
     }

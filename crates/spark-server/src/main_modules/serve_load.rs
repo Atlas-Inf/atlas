@@ -782,6 +782,22 @@ pub(crate) fn load_model(
     } else {
         args.max_batch_size
     };
+    // mHC gate (Avarok #753 item B): the highway models refuse the batched
+    // GDN decode paths (they maintain their own residual, which the highway
+    // replaces), so a second in-flight request makes EVERY stream fail with
+    // an inference error — the TUI recipe's default max_num_seqs=4 turned
+    // one extra click into a fully broken server (reported live 2026-08-27).
+    // Clamp to 1 so requests QUEUE instead. Lift when the batched highway +
+    // per-slot PLE/QSA state land.
+    let max_batch_size = if scheduler_model.hc_mult() > 0 && max_batch_size > 1 {
+        tracing::warn!(
+            "mHC highway model: clamping max_batch_size {max_batch_size} -> 1 \
+             (batched highway decode not wired yet; requests queue)"
+        );
+        1
+    } else {
+        max_batch_size
+    };
     // Derived ceiling (wave-14a): the decode-metadata layout, logits rows and
     // scratch block-table envelope are all DERIVED from max_batch_size
     // (`spark_runtime::buffers::DecodeMetaLayout`, rows = max(32, bs) —
