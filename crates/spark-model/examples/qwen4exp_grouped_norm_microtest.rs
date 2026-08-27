@@ -929,10 +929,20 @@ fn hc_sandwich_roundtrip(g: &dyn GpuBackend) -> Result<()> {
     let hc_norm: Vec<f32> = (0..wide).map(|_| next() * 0.1).collect();
     let mix_down: Vec<f32> = (0..LOWRANK * wide).map(|_| next() * 0.05).collect();
     let mix_up: Vec<f32> = (0..wide * LOWRANK).map(|_| next() * 0.05).collect();
-    // Scaled by 1/sqrt(wide) so the injection sigmoid does not saturate at 2.0
-    // -- a saturated gain agrees regardless of sign or the /hc_count divisor,
-    // and would make the per-stream control below vacuous.
-    let inject_scale = 0.5 / (wide as f32).sqrt();
+    // The injection scale has to thread a needle, and the first attempt here
+    // failed the control rather than the kernel.
+    //
+    // Too large and the sigmoid saturates at 2.0, where a gain agrees
+    // regardless of sign or the /hc_count divisor. Too small -- 0.5/sqrt(wide),
+    // which is what the STANDALONE check uses -- and every gain sits at
+    // 2*sigmoid(0) = 1.0, the four streams receive near-identical updates, and
+    // the per-stream control below cannot distinguish a correct scatter from
+    // one that broadcast a single gain. That is the failure this value fixes:
+    // agreement was 4.5e-3, but the spread was only 5x the error.
+    //
+    // 5/sqrt(wide) puts the gains in roughly 0.85..1.15 -- off both rails. The
+    // assertion below pins that rather than trusting the constant.
+    let inject_scale = 5.0 / (wide as f32).sqrt();
     let inject_w: Vec<f32> = (0..HC * wide).map(|_| next() * inject_scale).collect();
     // A distinctive block output: if the scatter ever dropped it or scaled it
     // uniformly, the per-stream differences would vanish.
@@ -1050,6 +1060,24 @@ fn hc_sandwich_roundtrip(g: &dyn GpuBackend) -> Result<()> {
         .zip(&d1)
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
+    println!(
+        "injection gains {:?} (must differ, and be off 0 and 2)",
+        out.injection
+            .iter()
+            .map(|v| (v * 1e3).round() / 1e3)
+            .collect::<Vec<_>>()
+    );
+    // The control is only meaningful if the gains actually differ. Pin that
+    // here rather than trusting the scale constant above: a degenerate set
+    // would make the spread assertion vacuous instead of failing loudly.
+    let gmin = out.injection.iter().copied().fold(f32::MAX, f32::min);
+    let gmax = out.injection.iter().copied().fold(f32::MIN, f32::max);
+    anyhow::ensure!(
+        gmax - gmin > 0.05 && gmin > 0.05 && gmax < 1.95,
+        "injection gains are degenerate or saturated (min {gmin}, max {gmax}) -- \
+         the per-stream control below would pass on a broadcast scatter"
+    );
+
     println!("per-stream delta spread: {spread:.3e} (must be large)");
     anyhow::ensure!(
         spread > worst * 10.0,
