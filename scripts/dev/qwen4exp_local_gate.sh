@@ -173,6 +173,33 @@ reserved_names() {
   return 0
 }
 run "no Windows-reserved filenames" reserved_names
+# nvcc's #221-D (narrowing a double literal to float) is an ERROR on the MSVC
+# host and a PASS on the Linux host, so the Linux `nvcc -> PTX` job compiles a
+# file green that the Windows leg cannot. `INFINITY` and `HUGE_VAL` are doubles;
+# this repo's kernels use `-1e30f` for a softmax running max
+# (`argmax_bf16.cu`, `inferspark_prefill.cu`). Grep is all a laptop can do here
+# — there is no nvcc, let alone an MSVC host.
+# Scope, and why it is narrow rather than "all of kernels/":
+#   * COMMENT lines are skipped — the fix in qwen4exp_attn.cu explains itself by
+#     naming `-INFINITY`, and a guard that flags its own rationale is noise.
+#   * `*_vendor/` is skipped: `qwen3.6-27b/nvfp4/q4k_vendor/common.cuh` uses
+#     `-INFINITY` and the windows-x86_64-nvidia-cuda leg compiles it GREEN
+#     today, so flagging it would be a false red — the diagnostic is
+#     context-sensitive and vendored code is not ours to restyle.
+double_literals() {
+  local hits
+  hits=$(grep -rn 'INFINITY\|HUGE_VAL' kernels/ --include='*.cu' --include='*.cuh' 2>/dev/null \
+         | grep -v '_vendor/' \
+         | grep -vE ':[0-9]+: *(//|\*|/\*)')
+  if [[ -n "$hits" ]]; then
+    echo "double literal in a float context — nvcc #221-D is an ERROR on the"
+    echo "MSVC host even though the Linux host accepts it. Use -1e30f."
+    echo "$hits"
+    return 1
+  fi
+  return 0
+}
+run "no double literals in kernels" double_literals
 
 echo "── lint ─────────────────────────────────────────────────────"
 run "fmt"                    "$CARGO" fmt --all -- --check
