@@ -104,5 +104,8 @@ pub use embed::NgramEmbedding;
 pub use ids::ngram_ids;
 pub use table::NgramTable;
 
-#[cfg(test)]
+// GPU parity tests (LongCat n-gram embedding vs real-checkpoint goldens), so
+// they need the cuda backend to compile. Gated on the feature as well as
+// `test`, so a metal build can still run this crate's ordinary unit tests.
+#[cfg(all(test, feature = "cuda"))]
 mod tests;

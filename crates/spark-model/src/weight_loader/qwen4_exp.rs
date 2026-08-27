@@ -79,7 +79,11 @@ pub use probe::audit_namespace;
 /// Exists so a test can rebuild the segmented row cache WITHOUT loading a
 /// 75 GB model — the gather is the one part of PLE whose failure is invisible
 /// downstream, so it needs a cheap isolated arm.
-#[cfg(test)]
+///
+/// Its only caller is `ops/ple_tests.rs`, which is a GPU test and therefore
+/// gated on the cuda feature — so this must be too, or a metal test build
+/// trips `deny(dead_code)`.
+#[cfg(all(test, feature = "cuda"))]
 pub fn ple_shard_layout(snapshot: &str) -> Result<(std::path::PathBuf, Vec<u64>, u64)> {
     use std::io::{Read, Seek, SeekFrom};
     let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(

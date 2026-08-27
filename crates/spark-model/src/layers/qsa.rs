@@ -31,7 +31,7 @@ use crate::layers::ops;
 
 #[path = "qsa_select.rs"]
 mod qsa_select;
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[path = "qsa_tests.rs"]
 mod tests;
 

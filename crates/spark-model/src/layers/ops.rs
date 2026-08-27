@@ -70,7 +70,12 @@ mod hyper_connection;
 mod hyper_connection_dispatch;
 #[path = "ops/hyper_connection_lowrank.rs"]
 mod hyper_connection_lowrank;
-#[cfg(test)]
+// GPU parity test, so it needs the cuda backend to compile at all. Gated on
+// the feature and not just `test`, so `--features metal` can still build and
+// RUN this crate's ordinary unit tests — which is the only way they get
+// exercised on a machine without a GB10. The idiom is spark-runtime's
+// (`weights/adapter.rs`).
+#[cfg(all(test, feature = "cuda"))]
 #[path = "ops/hyper_connection_lowrank_tests.rs"]
 mod hyper_connection_lowrank_tests;
 // The same kernels against the in-process CPU oracle instead of a
@@ -111,7 +116,7 @@ mod norm;
 mod nvfp4_mmq;
 #[path = "ops/ple.rs"]
 mod ple;
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[path = "ops/ple_tests.rs"]
 mod ple_tests;
 #[path = "ops/prefill_attn_a.rs"]
@@ -135,7 +140,7 @@ mod qsa;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 pub mod qwen4exp;
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[path = "ops/qwen4exp_oracle_tests.rs"]
 mod qwen4exp_oracle_tests;
 #[path = "ops/sampling.rs"]

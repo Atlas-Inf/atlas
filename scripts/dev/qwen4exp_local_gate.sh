@@ -81,6 +81,10 @@ run "atlas-core lib tests"   "$CARGO" test -q -p atlas-core --lib "${CUDA[@]}"
 # The rest link `-lcuda` under the cuda feature and cannot produce a test
 # binary on macOS. The tests are backend-agnostic; only the linking is not.
 run "spark-server bin tests" "$CARGO" test -q -p spark-server --bins "${METAL[@]}"
+# spark-model's own unit tests — the PLE id core, the layer plumbing, the
+# weight-map helpers. Its GPU parity modules are gated on the cuda feature
+# precisely so this row can exist.
+run "spark-model lib tests"  "$CARGO" test -q -p spark-model --lib "${METAL[@]}"
 run "spark-storage lib tests" "$CARGO" test -q -p spark-storage --lib "${METAL[@]}"
 # `metal_backend::tests::parity_*` needs Metal shaders that ATLAS_SKIP_BUILD did
 # not build. Skipped by name rather than by ignoring the whole crate.
