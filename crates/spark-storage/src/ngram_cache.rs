@@ -85,7 +85,8 @@ pub struct NgramRowCache {
     pub evictions: u64,
 }
 
-/// A table split across equal-sized shards at scattered file offsets.
+/// A table split across equal-sized shards at scattered file offsets, which
+/// may live in DIFFERENT files.
 struct Segments {
     /// Byte offset of each shard's first row, indexed by shard.
     bases: Vec<u64>,
@@ -93,6 +94,14 @@ struct Segments {
     /// this many; `open_segmented` requires them all equal so the mapping is
     /// a divide rather than a search.
     rows_per: u64,
+    /// The distinct backing files, in first-use order. A sharded table is NOT
+    /// necessarily confined to one file: the RadixArk NVFP4 conversion of
+    /// Qwen3.8-Flash-Next spreads its 128 PLE shards over 10
+    /// `model-plefp8-*.safetensors` files, and interleaved rather than in
+    /// order (shards 0 and 1 in the first file, shard 2 in the fourth).
+    files: Vec<File>,
+    /// `shard_file[i]` indexes `files` for shard `i`.
+    shard_file: Vec<u32>,
 }
 
 /// Per-row f32 scales for an FP8 table, mirrored into a device-visible
@@ -202,31 +211,45 @@ impl NgramRowCache {
     }
 
     /// As [`Self::open_at`], but for a table split across equal-sized shards
-    /// at SCATTERED file offsets — Qwen3.8-Flash-Next's PLE table, whose 128
-    /// shard tensors are not laid out consecutively inside the safetensors
-    /// file. `bases[i]` is shard `i`'s first row; every shard holds
-    /// `rows_per_shard` rows.
+    /// at SCATTERED offsets, in one or MORE files — Qwen3.8-Flash-Next's PLE
+    /// table, whose 128 shard tensors are neither consecutive nor confined to
+    /// a single safetensors file. `shards[i]` is shard `i`'s backing file and
+    /// the byte offset of its first row; every shard holds `rows_per_shard`
+    /// rows.
+    ///
+    /// Each DISTINCT path is opened once, so a 128-shard table over 10 files
+    /// costs 10 descriptors rather than 128.
     #[allow(clippy::too_many_arguments)]
     pub fn open_segmented(
-        path: &Path,
-        bases: Vec<u64>,
+        shards: &[(std::path::PathBuf, u64)],
         rows_per_shard: u64,
         scale_path: Option<&Path>,
         row_stride: usize,
         slots: usize,
     ) -> Result<Self> {
-        if bases.is_empty() || rows_per_shard == 0 {
+        if shards.is_empty() || rows_per_shard == 0 {
             bail!(
                 "NgramRowCache: segmented table needs shards and rows \
                  (shards={}, rows_per_shard={rows_per_shard})",
-                bases.len()
+                shards.len()
             );
         }
-        let rows_total = bases.len() as u64 * rows_per_shard;
-        let mut c = Self::open_at(path, 0, scale_path, rows_total, row_stride, slots)?;
+        let (paths, shard_file) = plan_shard_files(shards);
+        let mut files = Vec::with_capacity(paths.len());
+        for path in &paths {
+            files.push(open_direct(path)?);
+        }
+        let rows_total = shards.len() as u64 * rows_per_shard;
+        // `open_at` opens shard 0's file for the unsegmented `self.file`
+        // field, which a segmented cache never reads — `row_loc` always
+        // resolves through `segments.files`. Kept so the single-offset path
+        // stays byte for byte what it was.
+        let mut c = Self::open_at(paths[0], 0, scale_path, rows_total, row_stride, slots)?;
         c.segments = Some(Segments {
-            bases,
+            bases: shards.iter().map(|(_, off)| *off).collect(),
             rows_per: rows_per_shard,
+            files,
+            shard_file,
         });
         Ok(c)
     }
@@ -317,14 +340,20 @@ impl NgramRowCache {
         )
     }
 
-    /// Byte offset of row `id` in the backing file.
-    fn row_byte(&self, id: u64) -> u64 {
+    /// The file holding row `id`, and the row's byte offset within it.
+    ///
+    /// Returned together because for a segmented table the two are decided by
+    /// the SAME divide: a shard carries its own base offset *and* its own
+    /// backing file, so resolving the offset without the file was the bug this
+    /// signature exists to prevent.
+    fn row_loc(&self, id: u64) -> (&File, u64) {
         match &self.segments {
-            None => self.base_offset + id * self.row_stride as u64,
+            None => (&self.file, self.base_offset + id * self.row_stride as u64),
             Some(seg) => {
                 let shard = (id / seg.rows_per) as usize;
                 let local = id % seg.rows_per;
-                seg.bases[shard] + local * self.row_stride as u64
+                let file = &seg.files[seg.shard_file[shard] as usize];
+                (file, seg.bases[shard] + local * self.row_stride as u64)
             }
         }
     }
@@ -332,7 +361,7 @@ impl NgramRowCache {
     /// Read row `id` off NVMe straight into `slot`'s pinned (GPU-addressable)
     /// bytes, via the containing 4 KiB block.
     fn fetch_into(&mut self, id: u64, slot: u32) -> Result<()> {
-        let byte = self.row_byte(id);
+        let byte = self.row_loc(id).1;
         let block_off = byte - (byte % BLOCK as u64);
         let within = (byte - block_off) as usize;
         // One block unless the row crosses the boundary (possible whenever the
@@ -343,7 +372,13 @@ impl NgramRowCache {
         } else {
             1
         };
-        atlas_tier::pio::read_exact_at(&self.file, self.bounce.blocks(nblocks), block_off)
+        // Resolved by DIRECT FIELD BORROW rather than through `row_loc`, so
+        // that `self.bounce` stays independently borrowable as `&mut`.
+        let file = match &self.segments {
+            None => &self.file,
+            Some(seg) => &seg.files[seg.shard_file[(id / seg.rows_per) as usize] as usize],
+        };
+        atlas_tier::pio::read_exact_at(file, self.bounce.blocks(nblocks), block_off)
             .with_context(|| format!("NgramRowCache: read row {id}"))?;
         // SAFETY: slot < self.slots and the arena holds slots*row_stride bytes.
         let dst = unsafe {
@@ -407,45 +442,26 @@ fn open_direct(path: &Path) -> Result<File> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn aligned_scratch_is_4k_aligned_and_two_blocks() {
-        let mut b = AlignedBlock::new();
-        let s = b.blocks(2);
-        assert_eq!(s.len(), BLOCK * 2);
-        assert_eq!(s.as_ptr() as usize % BLOCK, 0);
-    }
-
-    #[test]
-    fn row_wider_than_a_block_is_refused() {
-        // A row larger than one block could span three with an unaligned base.
-        let msg = match NgramRowCache::open(Path::new("/nonexistent"), None, 10, BLOCK + 8, 4) {
-            Ok(_) => panic!("expected refusal for oversize row_stride"),
-            Err(e) => format!("{e:#}"),
-        };
-        assert!(msg.contains("O_DIRECT block"), "{msg}");
-    }
-
-    /// The seam arithmetic: with a base offset that is only 8-byte aligned
-    /// (what a safetensors shard gives), rows land at every phase relative to
-    /// the 4 KiB block, and the covering span must stay within two blocks.
-    #[test]
-    fn straddling_rows_are_covered_by_two_blocks() {
-        for base in [0u64, 8, 1234568, 4095, 4097] {
-            for stride in [256usize, 512, 4096] {
-                for id in [0u64, 1, 7, 8, 1023] {
-                    let byte = base + id * stride as u64;
-                    let block_off = byte - (byte % BLOCK as u64);
-                    let within = (byte - block_off) as usize;
-                    let n = if within + stride > BLOCK { 2 } else { 1 };
-                    assert!(
-                        within + stride <= n * BLOCK,
-                        "base={base} stride={stride} id={id} within={within} n={n}"
-                    );
-                }
+/// Distinct backing paths in first-use order, and `shard -> path index`.
+///
+/// Split out of [`NgramRowCache::open_segmented`] and kept free of any CUDA so
+/// it is directly testable: a segmented table's shards may live in several
+/// files, and assuming otherwise silently loses every shard outside the first
+/// one. Dedupes so a 128-shard table over 10 files costs 10 descriptors.
+fn plan_shard_files(shards: &[(std::path::PathBuf, u64)]) -> (Vec<&Path>, Vec<u32>) {
+    let mut paths: Vec<&Path> = Vec::new();
+    let mut shard_file = Vec::with_capacity(shards.len());
+    for (path, _) in shards {
+        let idx = match paths.iter().position(|p| *p == path.as_path()) {
+            Some(i) => i,
+            None => {
+                paths.push(path.as_path());
+                paths.len() - 1
             }
-        }
+        };
+        shard_file.push(idx as u32);
     }
+    (paths, shard_file)
 }

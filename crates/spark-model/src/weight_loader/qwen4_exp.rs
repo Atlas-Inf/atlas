@@ -80,17 +80,25 @@ mod probe;
 pub use probe::audit_namespace;
 
 /// The PLE table's shard layout, read straight from a checkpoint's
-/// safetensors header.
+/// safetensors header: `(backing file, byte offset of first row)` per shard,
+/// plus the rows each shard holds.
 ///
 /// Exists so a test can rebuild the segmented row cache WITHOUT loading a
 /// 75 GB model — the gather is the one part of PLE whose failure is invisible
 /// downstream, so it needs a cheap isolated arm.
 ///
+/// Returns a path PER SHARD because the shards are not confined to one file:
+/// the RadixArk NVFP4 conversion spreads 128 shards over 10
+/// `model-plefp8-*.safetensors`. An earlier version read shard 0's header and
+/// looked every shard up inside it, which found nothing for the 118 shards
+/// living elsewhere.
+///
 /// Its only caller is `ops/ple_tests.rs`, which is a GPU test and therefore
 /// gated on the cuda feature — so this must be too, or a metal test build
 /// trips `deny(dead_code)`.
 #[cfg(all(test, feature = "cuda"))]
-pub fn ple_shard_layout(snapshot: &str) -> Result<(std::path::PathBuf, Vec<u64>, u64)> {
+pub fn ple_shard_layout(snapshot: &str) -> Result<(Vec<(std::path::PathBuf, u64)>, u64)> {
+    use std::collections::HashMap;
     use std::io::{Read, Seek, SeekFrom};
     let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         std::path::Path::new(snapshot).join("model.safetensors.index.json"),
@@ -111,24 +119,29 @@ pub fn ple_shard_layout(snapshot: &str) -> Result<(std::path::PathBuf, Vec<u64>,
         .collect();
     names.sort();
     anyhow::ensure!(!names.is_empty(), "no PLE shards in {snapshot}");
-    let file = map[names[0].1].as_str().context("shard file")?;
-    let path = std::path::Path::new(snapshot).join(file);
 
-    let mut fh = std::fs::File::open(&path)?;
-    let mut len = [0u8; 8];
-    fh.read_exact(&mut len)?;
-    let hlen = u64::from_le_bytes(len);
-    let mut hdr = vec![0u8; hlen as usize];
-    fh.seek(SeekFrom::Start(8))?;
-    fh.read_exact(&mut hdr)?;
-    let hdr: serde_json::Value = serde_json::from_slice(&hdr)?;
-    let data_start = 8 + hlen;
-
-    let mut bases = Vec::with_capacity(names.len());
+    // One header read per DISTINCT file, cached — 10 reads, not 128.
+    let mut headers: HashMap<String, (serde_json::Value, u64)> = HashMap::new();
+    let mut shards = Vec::with_capacity(names.len());
     let mut rows_per = 0u64;
     for (i, name) in &names {
+        let file = map[name.as_str()].as_str().context("shard file")?;
+        let path = std::path::Path::new(snapshot).join(file);
+        if !headers.contains_key(file) {
+            let mut fh = std::fs::File::open(&path)?;
+            let mut len = [0u8; 8];
+            fh.read_exact(&mut len)?;
+            let hlen = u64::from_le_bytes(len);
+            let mut hdr = vec![0u8; hlen as usize];
+            fh.seek(SeekFrom::Start(8))?;
+            fh.read_exact(&mut hdr)?;
+            headers.insert(file.to_string(), (serde_json::from_slice(&hdr)?, 8 + hlen));
+        }
+        let (hdr, data_start) = &headers[file];
         let e = &hdr[name.as_str()];
-        let off = e["data_offsets"][0].as_u64().context("data_offsets")?;
+        let off = e["data_offsets"][0]
+            .as_u64()
+            .with_context(|| format!("data_offsets for shard {i} in {file}"))?;
         let rows = e["shape"][0].as_u64().context("shape")?;
         if *i == 0 {
             rows_per = rows;
@@ -137,9 +150,9 @@ pub fn ple_shard_layout(snapshot: &str) -> Result<(std::path::PathBuf, Vec<u64>,
             rows == rows_per,
             "shard {i} has {rows} rows, not {rows_per}"
         );
-        bases.push(data_start + off);
+        shards.push((path, data_start + off));
     }
-    Ok((path, bases, rows_per))
+    Ok((shards, rows_per))
 }
 
 pub struct Qwen4ExpWeightLoader;

@@ -108,10 +108,14 @@ pub(super) fn load(
     let heads = dims.ngram_heads();
 
     // ── the segmented table ──
-    let mut bases = Vec::new();
+    // (backing file, byte offset) per shard. The shards are NOT confined to
+    // one file: the RadixArk NVFP4 conversion spreads its 128 shards over 10
+    // `model-plefp8-*.safetensors`, interleaved (shards 0 and 1 in the first,
+    // shard 2 in the fourth), so the cache opens one descriptor per distinct
+    // file and resolves a row's file from its shard.
+    let mut shards: Vec<(std::path::PathBuf, u64)> = Vec::new();
     let mut rows_per = 0usize;
     let mut head_dim = 0usize;
-    let mut path = None;
     for i in 0.. {
         let name = format!("{lp}.ple_embedding.ngram_embedding.shard_{i}.weight");
         let Some(d) = store.deferred(&name) else {
@@ -125,7 +129,6 @@ pub(super) fn load(
         if i == 0 {
             rows_per = d.shape[0];
             head_dim = d.shape[1];
-            path = Some(d.path.clone());
         } else {
             anyhow::ensure!(
                 d.shape[0] == rows_per && d.shape[1] == head_dim,
@@ -134,25 +137,27 @@ pub(super) fn load(
                  requires every shard to hold the same number of rows.",
                 d.shape
             );
-            anyhow::ensure!(
-                Some(&d.path) == path.as_ref(),
-                "PLE: shard {i} lives in a different file from shard 0; the row \
-                 cache opens ONE backing file"
-            );
         }
-        bases.push(d.offset);
+        shards.push((d.path.clone(), d.offset));
     }
     anyhow::ensure!(
-        !bases.is_empty(),
+        !shards.is_empty(),
         "PLE: no `{lp}.ple_embedding.ngram_embedding.shard_*` was deferred. Either \
          the checkpoint has none, or they were UPLOADED whole — which for this \
          table is 102 GB of BF16 and would not have fit."
     );
-    let path = path.expect("checked non-empty");
+    let distinct_files = {
+        let mut seen: Vec<&std::path::Path> = Vec::new();
+        for (path, _) in &shards {
+            if !seen.contains(&path.as_path()) {
+                seen.push(path.as_path());
+            }
+        }
+        seen.len()
+    };
     let slots = slots_from_env();
     let cache = spark_storage::NgramRowCache::open_segmented(
-        &path,
-        bases.clone(),
+        &shards,
         rows_per as u64,
         None, // BF16 rows, no per-row scale file
         head_dim * 2,
@@ -172,13 +177,15 @@ pub(super) fn load(
     let dilation = config.emb_neighbor_num; // conv dilation IS ngram_size
     tracing::info!(
         "PLE at MODEL LAYER {layer_idx} (ple_layer_ids={:?}, 1-indexed): \
-         {} shards x {rows_per} rows x {head_dim} dims = {} rows ({:.1} GB BF16) \
+         {} shards over {} file(s) x {rows_per} rows x {head_dim} dims = {} rows \
+         ({:.1} GB BF16) \
          served off NVMe with {slots} cached slots ({:.1} MB); {heads} heads, \
          conv k={} dilation={dilation} (state {} steps)",
         config.ple_layer_ids,
-        bases.len(),
-        bases.len() * rows_per,
-        (bases.len() * rows_per * head_dim * 2) as f64 / 1e9,
+        shards.len(),
+        distinct_files,
+        shards.len() * rows_per,
+        (shards.len() * rows_per * head_dim * 2) as f64 / 1e9,
         (slots * head_dim * 2) as f64 / 1e6,
         config.ple_conv_kernel_size,
         (config.ple_conv_kernel_size - 1) * dilation,
