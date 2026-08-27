@@ -30,16 +30,40 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
-# Prefer an explicit toolchain if the caller has one; otherwise trust PATH.
+# Toolchain resolution. `cargo` locates `rustc`, `cargo-fmt` and `cargo-clippy`
+# through PATH, so pointing at an absolute cargo binary WITHOUT putting its bin
+# dir on PATH gives a cargo that cannot run anything:
+#
+#   error: could not execute process `rustc -vV` (never executed)
+#   error: no such command: `fmt`
+#
+# which reads as 12 failing gates instead of one broken environment. A gate that
+# goes red for the wrong reason is worse than no gate, so the bin dir goes on
+# PATH and the result is proved before any row runs.
 if [[ -n "${ATLAS_CARGO:-}" ]]; then
   CARGO="$ATLAS_CARGO"
-elif command -v cargo >/dev/null 2>&1; then
+  PATH="$(dirname "$ATLAS_CARGO"):$PATH"
+elif command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
   CARGO=cargo
 else
-  TC="$HOME/.rustup/toolchains/1.93.1-aarch64-apple-darwin/bin/cargo"
-  [[ -x "$TC" ]] || { echo "no cargo on PATH and no pinned toolchain at $TC" >&2; exit 127; }
-  CARGO="$TC"
+  TC="$HOME/.rustup/toolchains/1.93.1-aarch64-apple-darwin/bin"
+  [[ -x "$TC/cargo" ]] || {
+    echo "no usable cargo+rustc on PATH and no pinned toolchain at $TC" >&2
+    exit 127
+  }
+  PATH="$TC:$PATH"
+  CARGO="$TC/cargo"
 fi
+export PATH
+"$CARGO" --version >/dev/null 2>&1 || {
+  echo "'$CARGO --version' failed — the toolchain is not usable, so no gate below" >&2
+  echo "would mean anything. Set ATLAS_CARGO to a cargo whose bin dir has rustc." >&2
+  exit 127
+}
+"$CARGO" fmt --version >/dev/null 2>&1 || {
+  echo "'$CARGO fmt' is unavailable (rustfmt missing from this toolchain)." >&2
+  exit 127
+}
 
 export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-13000}"
 export ATLAS_SKIP_BUILD="${ATLAS_SKIP_BUILD:-1}"
