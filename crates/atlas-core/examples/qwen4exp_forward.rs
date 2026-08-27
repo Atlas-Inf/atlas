@@ -122,9 +122,31 @@ fn load_hc(store: &Store, prefix: &str, inject: bool) -> Result<Vec<std::rc::Rc<
 }
 
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let dir = std::path::PathBuf::from(args.next().context("usage: <ckpt> [fixture.json]")?);
-    let fixture_path = args.next();
+    // Positional args are the ones that are not flags, and not a flag's value.
+    // Taking them with a plain `args.next()` made `<ckpt> --generate 4` read a
+    // fixture named "--generate" and fail on open.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--generate" {
+            i += 2;
+            continue;
+        }
+        if argv[i].starts_with("--") {
+            i += 1;
+            continue;
+        }
+        positional.push(argv[i].clone());
+        i += 1;
+    }
+    let mut positional = positional.into_iter();
+    let dir = std::path::PathBuf::from(
+        positional
+            .next()
+            .context("usage: <ckpt> [fixture.json] [--generate N]")?,
+    );
+    let fixture_path = positional.next();
 
     let config: ModelConfig = parse_config(&std::fs::read_to_string(dir.join("config.json"))?)?;
     let store = Store {
@@ -143,14 +165,10 @@ fn main() -> Result<()> {
         }
         None => vec![11, 42, 7, 300, 5],
     };
-    let generate: usize = std::env::args()
+    let generate: usize = argv
+        .iter()
         .position(|a| a == "--generate")
-        .and_then(|_| {
-            let all: Vec<String> = std::env::args().collect();
-            all.iter()
-                .position(|a| a == "--generate")
-                .and_then(|i| all.get(i + 1).cloned())
-        })
+        .and_then(|i| argv.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
