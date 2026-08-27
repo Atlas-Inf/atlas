@@ -550,7 +550,71 @@ Coherence, fresh server, default config: **5/7**. `Paris`; `408`;
 `15:40` for "14:05 plus 95 minutes"; recalled `axolotl` across turns;
 answered the negation. Decode ~15.4 tok/s, TTFT ~780 ms.
 
-### Open defect — generation degrades within a response
+### Open defect — GPU prefill disagrees with the CPU reference
+
+**Minimal reproduction, and it is small.** The CPU reference forward
+(`examples/qwen4exp_forward`, no GPU kernels at all) is greedy-deterministic
+on the real weights:
+
+    [11, 42, 7, 300, 5] -> 5013 ('gt'), 26 (';'), 15 ('0'), 8 (')'), 283 (' =')
+
+Feeding the SAME ids to the served model through `PromptInput::TokenIds`
+(`/v1/completions`, `max_tokens: 1`, `temperature: 0`) returns a different top
+token, stably (6/6 identical). That is:
+
+  * 5 tokens of prompt, so no chunking,
+  * `0 misses` on the PLE row cache, so no NVMe faults and no eviction,
+  * prefix caching OFF and `cached_tokens: 0`,
+  * ONE token generated, so no decode step at all.
+
+Prefill's first logits row is wrong. Everything below is downstream of that.
+
+In served chat the symptom is that the model reasons COHERENTLY ABOUT AN
+INPUT NOBODY SENT: asked for the capital of France it wrote
+`'The user has simply sent "FDFDFDFFDFD"'`, and other draws produced Python
+source, `责任追究`, `'total_global_expert_capacity'`, Chinese lecture notes on
+DNN training. Fluent text from a hidden state unrelated to the prompt.
+
+### Ruled out, each by experiment
+
+| suspect | evidence |
+|---|---|
+| prefix caching | `Prefix caching: disabled`, `cached 0`, still 0/8 coherent |
+| CUDA graphs | `ATLAS_DEBUG_NO_GRAPH=1` is WORSE, not better |
+| QSA indexer | `ATLAS_QSA_DISABLE=1` no better; and corruption appears at 60-token prompts, far below the 2048 budget |
+| `w4a16_gemm_t` padded stride (the load-time warning) | the kernel does take and use `ldb` |
+| row-cache insert bookkeeping | `fetch_into` sets map/slot_row/refbit/pinned correctly |
+| FP8 dequant convention | kernel `ngram_fp8_decode(b) * row_scale[slot]` == CPU `fp8_e4m3_to_f32(b) * weight_scale`; `ngram_table.rs:217` already documented the single shared scalar |
+| GDN gated norm gate | checkpoint says `output_gate_type: sigmoid`, parser reads it from `text_config`, sigmoid twins resolve |
+| `norm_topk_prob` | defaults `true` (`factory.rs:31`), matching the reference, and the checkpoint omits the key |
+| PLE row-cache pin lifetime | a REAL bug, fixed (`78976723`) — but the failing runs report `0 misses`, so it was not the active cause here |
+
+### A structural fact that matters
+
+rsafier's fixtures and measurements target the **Inferact** NVFP4 conversion
+(`bench/qwen4_exp/hc_golden.py` `DEFAULT_SNAP`). This box has **RadixArk**.
+They are different conversions of the same model: RadixArk ships the PLE table
+as F8_E4M3 across 10 files with one shared scalar scale, where the code
+expected BF16 in one file. Defects 1-3 above are all that difference. So
+"coherent output on his branch" is not evidence about this checkpoint — his
+branch cannot even load it without the three fixes above.
+
+Whether the residual divergence is also RadixArk-specific is open and is the
+first thing worth settling.
+
+### The next instrument, not another hypothesis
+
+`ATLAS_QWEN4EXP_DUMP=<dir>` already taps the `hc_mult`-wide residual highway
+per sublayer and writes `L{layer}_{tag}.bin` as raw FP32 — it is how
+`83830fe3` localized the previous fault to "layer 0's GDN sublayer". Its
+reference side normally comes from Python, and this box has no torch.
+
+The cheap way through: give `examples/qwen4exp_forward` the SAME taps, so the
+CPU reference and the GPU write the same files and the diff is Rust vs Rust
+with no torch and no fixtures. The prompt is 5 tokens, so every tap is small.
+The first tap that disagrees names the sublayer.
+
+### Earlier reading of the same defect (superseded, kept for the record)
 
 Correct answer first, then repetition (`408 408 408`, `Paris. The capital
 of France is Paris.`) or runs of `!`. `!` is token id 0, which is what
@@ -581,3 +645,22 @@ CPU reference's exact greedy chain (`[11,42,7,300,5] -> 5013, 26, 15, 8,
 never runs) versus all of them in one request (decode). Prefill tracking
 the reference while decode diverges localizes the fault to decode without
 touching a flag.
+
+### My own measurement errors this session
+
+Two symptoms I reported as engine defects were the harness:
+
+  * **`temperature: 0`.** Pinned for reproducibility. This model's card
+    declares thinking `temperature=1.0 top_p=0.95 top_k=20` and MODEL.toml
+    sets `use_sampling_presets_for_core = true` precisely so a plain request
+    gets those. Greedy decode on a thinking MoE loops on itself, and
+    `"408 408 408"` / `"The capital of France is Paris."` repeated are that,
+    not a port bug. Fixed: sampling is opt-in via `--temperature`.
+  * **`max_tokens: 64`** on a reasoning model, where the think block consumes
+    the budget and `content` comes back empty. The needle sweep read as a
+    length-dependent failure because of it.
+
+And one clearance stated more broadly than the evidence supported: I checked
+that the row cache's INSERT path records its bookkeeping and concluded the
+cache was fine, without checking the pin LIFETIME — which was a real bug in
+the same file.
