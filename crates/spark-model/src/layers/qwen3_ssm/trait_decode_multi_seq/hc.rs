@@ -82,23 +82,38 @@ impl Qwen3SsmLayer {
             let host = ctx.host_token_ids.ok_or_else(|| {
                 anyhow::anyhow!("hc multi-seq decode: PLE needs host_token_ids threaded")
             })?;
-            anyhow::ensure!(
-                host.len() >= n,
-                "hc multi-seq decode: {} host ids for {n} seqs",
-                host.len()
-            );
+            // `n` is the PADDED batch width (`padded_batch_n`), not the
+            // active count: `decode_batch` rounds up so one captured CUDA
+            // graph serves several batch sizes, zeroes `hidden[active..n)`,
+            // and pushes dummy layer states for the padding rows — which
+            // carry `ple: None` by construction and have no token id.
+            //
+            // So a padding row gets NO injection, and requiring
+            // `host.len() >= n` was wrong: it rejected every batch whose
+            // size was not already a padding boundary. Concurrency 4 with
+            // 3 live sequences failed outright with "3 host ids for 4 seqs".
+            //
+            // A row with a LIVE ple state and no token id is a real defect
+            // and still errors — that is the case worth being loud about.
             for (i, state) in states.iter_mut().enumerate().take(n) {
                 let ssm = state
                     .as_any_mut()
                     .downcast_mut::<SsmLayerState>()
                     .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
-                let st = ssm.ple.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!("PLE multi-seq decode before prefill: no seq state {i}")
+                let Some(st) = ssm.ple.as_mut() else {
+                    continue; // padding row
+                };
+                let token = host.get(i..i + 1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "hc multi-seq decode: seq {i} has a live PLE state but \
+                         only {} host token id(s) were threaded",
+                        host.len()
+                    )
                 })?;
                 ple.forward_row(
                     st,
                     streams.offset(i * (hc_mult as usize) * h * 4),
-                    &host[i..i + 1],
+                    token,
                     ctx,
                     stream,
                 )?;

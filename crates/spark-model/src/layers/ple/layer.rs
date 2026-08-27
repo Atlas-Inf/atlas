@@ -108,11 +108,8 @@ impl PleLayer {
         let c = hc_mult * hidden;
         let state_len = (k_size - 1) * dilation;
 
-        // Fail closed if the element type and the gather disagree: the cache
-        // knows a row's byte width, the gather picks a kernel from whether a
-        // scale exists, and those being independent is what let an F8_E4M3
-        // table reach the BF16 kernel with no error at all. See
-        // `gather_guard`.
+        // Fail closed when element width and gather disagree — see
+        // `gather_guard`, and the bug it exists for.
         #[cfg(feature = "cuda")]
         if let NgramTable::Cached(cache) = &table {
             let stride = cache.row_stride();
@@ -134,12 +131,9 @@ impl PleLayer {
             norm_query: weights.norm_query,
             norm_conv: weights.norm_conv,
             conv1d: weights.conv1d,
-            // Resolved here because the scale arena is allocated once at load
-            // and its VA never moves, so the gather need not reach back
-            // through the table mutex. Without it the F8_E4M3 table was
-            // gathered by `batched_embed`, the BF16 kernel — 2 bytes read per
-            // 1-byte element and no scale — which put 1e30 into the highway
-            // at the PLE layer while every other layer stayed correct.
+            // The scale arena is allocated once at load and its VA never
+            // moves, so resolve it here rather than reaching back through the
+            // table mutex on every gather.
             scale_va: match &table {
                 #[cfg(feature = "cuda")]
                 NgramTable::Cached(c) => c.scale_dev_va()?,
