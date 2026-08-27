@@ -28,6 +28,7 @@ mod decode_checkpoint;
 mod decode_graph_key;
 mod drafter_prefill;
 mod ep_misc;
+mod gemma_splice;
 mod graph_borrow;
 mod lm_head_batched;
 mod meta;
@@ -76,6 +77,18 @@ impl Model for TransformerModel {
         *self.vision_row_base.lock() = row_base;
         *self.vision_grid_base.lock() = grid_base;
         *self.vision_owned_images.lock() = owned_images;
+    }
+    fn prepare_gemma_media_embed(
+        &self,
+        images: &[crate::media::gemma_vision::GemmaImageInput],
+    ) -> Result<()> {
+        self.prepare_gemma_media_embed_dispatch(images)
+    }
+    fn prepare_gemma_audio_embed(
+        &self,
+        audios: &[crate::media::gemma_audio::GemmaAudioInput],
+    ) -> Result<()> {
+        self.prepare_gemma_audio_embed_dispatch(audios)
     }
     // The four prefill entry points each end with `try_eager_drafter_prefill`:
     // the whole-prompt drafter capture is a single shared slot, so it must be

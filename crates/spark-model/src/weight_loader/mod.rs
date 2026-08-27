@@ -32,7 +32,7 @@ pub use dflash_loader::{
     DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,
     store_has_dflash_weights,
 };
-pub use gemma4::Gemma4WeightLoader;
+pub use gemma4::{Gemma4PerLayerPleWeights, Gemma4PleTables, Gemma4WeightLoader};
 pub use laguna::LagunaWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
 pub use nemotron::NemotronHWeightLoader;
@@ -333,6 +333,53 @@ pub trait ModelWeightLoader {
         _config: &ModelConfig,
         _gpu: &dyn GpuBackend,
     ) -> Result<Option<VisionEncoder>> {
+        Ok(None)
+    }
+
+    /// Load the Gemma-4 E2B vision tower (`model.vision_tower.*` +
+    /// `model.embed_vision.*`) into a [`GemmaVisionEncoder`]. Default
+    /// returns `None`; the Gemma-4 loader overrides it.
+    ///
+    /// Kept separate from `load_vision_encoder` (which is typed to Qwen3-VL's
+    /// `VisionEncoder`): the Gemma tower is a different concrete type, so a
+    /// type-compatible override of the existing method is impossible.
+    /// Mirror of the `load_ple_tables` pattern — a model-specific trait
+    /// method with a `Ok(None)` default.
+    fn load_gemma_vision_encoder(
+        &self,
+        _store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::GemmaVisionEncoder>> {
+        Ok(None)
+    }
+
+    /// Load the Gemma-4 E2B audio tower (`model.audio_tower.*` +
+    /// `model.embed_audio.*`) into a [`GemmaAudioEncoder`]. Default returns
+    /// `None`; the Gemma-4 loader overrides it. Mirror of
+    /// `load_gemma_vision_encoder` — a model-specific trait method with a
+    /// `Ok(None)` default, kept separate because the audio tower is a
+    /// distinct concrete type.
+    fn load_audio_encoder(
+        &self,
+        _store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::GemmaAudioEncoder>> {
+        Ok(None)
+    }
+
+    /// Load Gemma-4 E2B per-layer-embedding (PLE) tables (model-level +
+    /// per-layer input gates/projections/norms). Default impl returns `None`;
+    /// the Gemma-4 loader overrides it when the checkpoint enables PLE
+    /// (`hidden_size_per_layer_input > 0`). Loading-only — wiring the tables
+    /// into the layer forward is a later wave.
+    fn load_ple_tables(
+        &self,
+        _store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Option<Gemma4PleTables>> {
         Ok(None)
     }
 }

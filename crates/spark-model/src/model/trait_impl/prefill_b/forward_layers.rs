@@ -163,6 +163,12 @@ impl TransformerModel {
         let t_loop = host_timing.then(std::time::Instant::now);
         let mut t_in_prefill = std::time::Duration::ZERO;
         let mut t_dflash = std::time::Duration::ZERO;
+        // Gemma-4 E2B per-layer-embedding (PLE): arm every layer's PLE slice
+        // from the combined buffer the dispatcher computed for this chunk's
+        // processed tokens (Phase 3c). No-op for non-E2B.
+        if self.ple_tables.is_some() {
+            self.ple_arm_layers(self.ple_combined);
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             let t_pf = host_timing.then(std::time::Instant::now);
             let lt0 = if profile_now {

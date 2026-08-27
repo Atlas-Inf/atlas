@@ -1,0 +1,40 @@
+recipe_version: "2"
+model: google/gemma-4-E2B-it
+runtime: atlas
+container: avarok/atlas-gb10:latest
+max_nodes: 1
+
+metadata:
+  description: |
+    Gemma-4-E2B — Google's small dense Gemma-4 (5.1B total / 2.3B
+    effective) with per-layer embeddings (PLE), cross-layer KV sharing
+    (num_kv_shared_layers=20), a 4:1 sliding+full attention pattern
+    (7 full layers) and a double-wide MLP band (intermediate 12288 on
+    L15-34). The checkpoint ships native BF16 MLP weights on disk and
+    real vision (~150M) + audio (~300M) encoder towers plus video
+    tokens — multimodal bring-up is complete, so image/audio/video
+    inputs are served end-to-end.
+
+    BF16 KV cache (MODEL.toml default): the large final-norm weights
+    exceed FP8 E4M3 range — same rationale as Gemma-4 31B; vLLM also
+    uses BF16 for Gemma 4. Google-recommended sampling recipe
+    (temp 1.0, top_p 0.95, top_k 64), penalty-free. The native
+    Gemma-4 tool-call format (`<|tool_call>call:fn{...}<tool_call|>`)
+    is parsed when `tool_call_parser: gemma4` is set; thinking-in-tools
+    is enabled. Throughput: ~tbd (measured on the single-GPU suite).
+  maintainer: avarok
+  category: multimodal
+  model_params: 5.1B
+  model_dtype: bf16
+  quantization: bf16
+  kv_dtype: bf16
+  vision: true
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  max_model_len: 16384
+  kv_cache_dtype: bf16
+  gpu_memory_utilization: 0.90
+  scheduling_policy: slai
+  tool_call_parser: gemma4

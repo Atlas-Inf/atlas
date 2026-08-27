@@ -36,6 +36,7 @@ pub(crate) mod impl_b3;
 pub(crate) mod impl_b3_accessors;
 pub(crate) mod impl_lora;
 pub(crate) mod impl_lora_swap;
+pub(crate) mod impl_ple;
 pub(crate) mod mtp_carry;
 pub(crate) mod pinned_pack;
 pub(crate) mod ssm_batched_copy;
@@ -50,6 +51,18 @@ pub(crate) mod ssm_tier;
 pub(crate) mod token_overlay;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
+
+#[cfg(test)]
+#[path = "gemma_media_fixtures.rs"]
+pub(crate) mod gemma_media_fixtures;
+
+#[cfg(test)]
+#[path = "gemma_media_tests.rs"]
+mod gemma_media_tests;
+
+#[cfg(test)]
+#[path = "gemma_audio_tests.rs"]
+mod gemma_audio_tests;
 
 // Served NLLB-200 / M2M-100 encoder-decoder model (CUDA/GB10 serving path).
 #[cfg(feature = "cuda")]

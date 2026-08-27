@@ -22,10 +22,16 @@ use spark_runtime::weights::WeightStore;
 
 use super::ModelWeightLoader;
 use crate::layer::TransformerLayer;
+use crate::layers::{GemmaAudioEncoder, GemmaVisionEncoder};
 use crate::weight_map::{DenseWeight, MtpWeights};
 
 mod loader_a;
 mod loader_b;
+mod loader_c;
+mod loader_d;
+mod loader_e;
+
+pub use loader_c::{Gemma4PerLayerPleWeights, Gemma4PleTables};
 
 pub struct Gemma4WeightLoader;
 
@@ -95,5 +101,32 @@ impl ModelWeightLoader for Gemma4WeightLoader {
 
     fn kv_layer_dims(&self, config: &ModelConfig) -> Vec<(usize, usize)> {
         loader_b::kv_layer_dims_impl(config)
+    }
+
+    fn load_ple_tables(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<Gemma4PleTables>> {
+        loader_c::load_ple_tables_impl(store, config, gpu)
+    }
+
+    fn load_gemma_vision_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<GemmaVisionEncoder>> {
+        loader_d::load_gemma_vision_encoder_impl(store, config, gpu)
+    }
+
+    fn load_audio_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<GemmaAudioEncoder>> {
+        loader_e::load_gemma_audio_encoder_impl(store, config, gpu)
     }
 }

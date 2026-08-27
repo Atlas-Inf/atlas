@@ -80,6 +80,48 @@ impl Carried {
     }
 }
 
+/// Media-encoder fallback: honor the TARGET spec and serve text-only rather
+/// than failing the build at `*_encoder module not loaded`. Some checkpoints
+/// declare media towers (Qwen3-VL `vision_config`, Gemma-4 E2B
+/// `vision_config`/`audio_config`) whose PTX module a text-only kernel target
+/// does not ship — e.g. Kbenkhaled/Qwen3.5-27B-NVFP4 declares a vision tower
+/// but the qwen3.5-27b target ships no `vision_encoder`. Drop the config with
+/// a warning so media inputs are rejected cleanly instead of dying at the
+/// first encoder lookup. One arm per tower; each is independent (a
+/// vision_encoder-only target keeps Qwen vision and drops gemma towers).
+fn demote_unsupported_media_towers(
+    vision: &mut Option<atlas_core::config::VisionConfig>,
+    gemma_vision: &mut Option<atlas_core::config::GemmaVisionConfig>,
+    gemma_audio: &mut Option<atlas_core::config::GemmaAudioConfig>,
+    modules: &[(&'static str, &'static [u8])],
+    target: &str,
+) {
+    if vision.is_some() && !modules.iter().any(|(name, _)| *name == "vision_encoder") {
+        tracing::warn!(
+            "Checkpoint declares a vision tower but kernel target {target} ships no \
+             vision_encoder module — serving TEXT-ONLY (image inputs ignored). \
+             Rebuild the target with vision to enable images.",
+        );
+        *vision = None;
+    }
+    if gemma_vision.is_some() && !modules.iter().any(|(name, _)| *name == "gemma_vision") {
+        tracing::warn!(
+            "Checkpoint declares a gemma vision tower but kernel target {target} ships no \
+             gemma_vision module — serving TEXT-ONLY (image inputs ignored). \
+             Rebuild the target with gemma vision to enable images.",
+        );
+        *gemma_vision = None;
+    }
+    if gemma_audio.is_some() && !modules.iter().any(|(name, _)| *name == "gemma_audio") {
+        tracing::warn!(
+            "Checkpoint declares a gemma audio tower but kernel target {target} ships no \
+             gemma_audio module — serving TEXT-ONLY (audio inputs ignored). \
+             Rebuild the target with gemma audio to enable audio.",
+        );
+        *gemma_audio = None;
+    }
+}
+
 /// `Ok(None)` means this rank is an EP worker: it ran its command loop and has
 /// nothing for the async tail to serve.
 pub(crate) fn load_model(
@@ -339,27 +381,18 @@ pub(crate) fn load_model(
         ptx_set.modules.len(),
     );
 
-    // Text-only kernel target + a checkpoint that ships a vision tower: honor the
-    // TARGET spec and serve text-only rather than failing the build at
-    // `vision_encoder module not loaded`. Some VL checkpoints (e.g.
-    // Kbenkhaled/Qwen3.5-27B-NVFP4) carry a `vision_config`, but their Atlas
-    // kernel target (qwen3.5-27b) ships no `vision_encoder` PTX module. Drop the
-    // vision tower to text-only; image inputs are unsupported until the target
-    // is rebuilt with vision.
-    if config.vision.is_some()
-        && !ptx_set
-            .modules
-            .iter()
-            .any(|(name, _)| *name == "vision_encoder")
-    {
-        tracing::warn!(
-            "Checkpoint declares a vision tower but kernel target {} ships no \
-             vision_encoder module — serving TEXT-ONLY (image inputs ignored). \
-             Rebuild the target with vision to enable images.",
-            ptx_set.target,
-        );
-        config.vision = None;
-    }
+    // Text-only kernel target + a checkpoint that ships media towers: honor
+    // the TARGET spec and serve text-only rather than failing the build at
+    // `*_encoder module not loaded`. Covers Qwen3-VL (`vision_config`) and
+    // Gemma-4 E2B (`gemma_vision`/`gemma_audio`) — see
+    // `demote_unsupported_media_towers`.
+    demote_unsupported_media_towers(
+        &mut config.vision,
+        &mut config.gemma_vision,
+        &mut config.gemma_audio,
+        &ptx_set.modules,
+        &ptx_set.target.to_string(),
+    );
 
     // Resolve num_drafts: explicit --num-drafts (any value) → MODEL.toml
     // [behavior].default_num_drafts → engine default. After this call
@@ -1129,6 +1162,8 @@ pub(crate) fn load_model(
             ptx_set.behavior.disable_cwd_hint_injection,
         ),
         vision_config: config.vision.clone(),
+        gemma_vision_config: config.gemma_vision.clone(),
+        gemma_audio_config: config.gemma_audio.clone(),
         vision_max_pixels,
         remote_image_policy,
         video_ffmpeg,

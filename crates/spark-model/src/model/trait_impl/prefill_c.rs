@@ -151,6 +151,11 @@ impl TransformerModel {
             }
         }
 
+        // ── 1c. Gemma-4 E2B splice (whole-sequence path) — see
+        // `splice_gemma_media_rows`; image/video slots draw vision buf_out
+        // rows, audio slots draw the audio tower's own buf_out rows.
+        self.splice_gemma_media_rows(tokens, hidden, h * fp32, stream)?;
+
         // ── 2. Prefix cache lookup + block allocation for full sequence ──
         let bs = kv_cache.block_size();
         let prefix_match = if self.tokens_have_vision_pad(tokens) {

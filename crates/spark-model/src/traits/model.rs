@@ -908,6 +908,36 @@ pub trait Model: Send + Sync {
     /// (0,0,0) to reset to the legacy single-request behaviour. Default: no-op.
     fn set_vision_slice_base(&self, _row_base: usize, _grid_base: usize, _owned_images: usize) {}
 
+    /// Encode gemma-4 E2B images through the gemma vision tower and stage the
+    /// packed `[Σsoft, 1536]` BF16 features + per-image soft-token counts for
+    /// the next prefill's embed splice. Each [`GemmaImageInput`] is one
+    /// preprocessed image (see `crate::media::gemma_vision`). Must be called
+    /// before `prefill_chunk` when the prompt contains gemma image/video slot
+    /// tokens (258880 / 258884). Default: no-op (non-gemma models).
+    fn prepare_gemma_media_embed(
+        &self,
+        _images: &[crate::media::gemma_vision::GemmaImageInput],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Encode gemma-4 E2B audio clips through the gemma audio tower and stage
+    /// the packed `[Σvalid, 1536]` BF16 features + per-clip valid-token
+    /// counts for the next prefill's embed splice. Each [`GemmaAudioInput`]
+    /// is one mel-frontended clip (see `crate::media::gemma_audio`). Must be
+    /// called before `prefill_chunk` when the prompt contains gemma audio
+    /// slot tokens (258881). Default: no-op (non-gemma models).
+    ///
+    /// Kept as a separate method (not a widened `prepare_gemma_media_embed`):
+    /// the audio input type and pipeline differ from the image path, and the
+    /// Wave-2C image signature + its scheduler call site stay untouched.
+    fn prepare_gemma_audio_embed(
+        &self,
+        _audios: &[crate::media::gemma_audio::GemmaAudioInput],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// EP worker step: receive a (seq_id, cmd) preamble from rank 0 and
     /// execute the command in the addressed slot.
     ///

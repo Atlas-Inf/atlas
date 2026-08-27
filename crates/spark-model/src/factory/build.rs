@@ -158,6 +158,10 @@ pub fn build_model(
     let final_norm = loader.load_final_norm(&store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(&store, &config, gpu.as_ref())?;
     let mtp_weights = loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?;
+    // Gemma-4 E2B per-layer-embedding (PLE) tables — `None` for every
+    // non-E2B model (default trait impl). Loading-only; the forward pass
+    // consumes them in a later wave.
+    let ple_tables = loader.load_ple_tables(&store, &config, gpu.as_ref())?;
 
     // DeepSeek-V4 ships an architecturally distinct MTP module (MLA + mHC), not
     // the Qwen-shaped `MtpWeights`. Load it via the V4-specific path and keep it
@@ -207,6 +211,14 @@ pub fn build_model(
         );
     }
     let vision_encoder = loader.load_vision_encoder(&store, &config, gpu.as_ref())?;
+    // Gemma-4 E2B vision tower (Wave 2C). The gemma4 loader's dedicated
+    // `load_gemma_vision_encoder` builds it (type-incompatible with the Qwen
+    // `VisionEncoder` above); `None` for every other family.
+    let gemma_vision_encoder = loader.load_gemma_vision_encoder(&store, &config, gpu.as_ref())?;
+    // Gemma-4 E2B audio tower (Wave 4B). The gemma4 loader's dedicated
+    // `load_audio_encoder` builds it; `None` for text-only checkpoints and
+    // every other family.
+    let gemma_audio_encoder = loader.load_audio_encoder(&store, &config, gpu.as_ref())?;
 
     // If the checkpoint's `quantization_config.ignore_modules` lists MTP
     // (e.g. Sehyo/Qwen3.5-35B-A3B-NVFP4 ignores `mtp.*`), the MTP weights
@@ -563,8 +575,11 @@ pub fn build_model(
         self_speculative,
         num_drafts,
         vision_encoder,
+        gemma_vision_encoder,
+        gemma_audio_encoder,
         ssm_cache_slots,
         ssm_checkpoint_interval,
+        ple_tables,
     )?;
 
     // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──

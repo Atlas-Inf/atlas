@@ -8,9 +8,10 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use super::super::{
-    LayerType, ModelConfig, QuantizationConfig, VisionConfig, default_conv_kernel, default_one,
-    default_one_f64, default_partial_rotary, default_rms_eps, default_rope_theta, finalize_config,
-    parse_quantization_config, parse_vision_config, validate_config,
+    AttentionKind, GemmaAudioConfig, GemmaVisionConfig, LayerType, ModelConfig, QuantizationConfig,
+    VisionConfig, default_conv_kernel, default_one, default_one_f64, default_partial_rotary,
+    default_rms_eps, default_rope_theta, finalize_config, parse_quantization_config,
+    parse_vision_config, validate_config,
 };
 
 pub(crate) fn parse_gemma4_params(raw: &serde_json::Value) -> Result<ModelConfig> {
@@ -139,8 +140,37 @@ pub(crate) fn parse_gemma4_params(raw: &serde_json::Value) -> Result<ModelConfig
     } else {
         head_dim
     }; // 512 for buffers
+    // Raw text_config head_dim (sliding/base dim) BEFORE the max-for-buffers
+    // override above. Used for per-layer KV dims when attention_types is
+    // non-empty (E2B). Records 256 for 26B/31B too — harmless, unused there.
+    config.base_head_dim = head_dim;
+    config.global_head_dim = global_head_dim;
     config.partial_rotary_factor = partial_rotary_factor;
     config.layer_types = layer_types;
+    // E2B `layer_types` → attention_types (Sliding/Full). Only the E2B
+    // variant ships this array; 26B/31B (`attention_pattern` style) keep it
+    // empty. `layer_types` stays all-FullAttention above so the SSM/hybrid
+    // layer-counting paths never engage.
+    config.attention_types = tc
+        .get("layer_types")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|v| match v.as_str() {
+                    Some("sliding_attention") => AttentionKind::Sliding,
+                    _ => AttentionKind::Full,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Remaining E2B text-config fields (all default to "unused" when absent).
+    config.num_kv_shared_layers = get_usize("num_kv_shared_layers");
+    config.hidden_size_per_layer_input = get_usize("hidden_size_per_layer_input");
+    config.vocab_size_per_layer_input = get_usize("vocab_size_per_layer_input");
+    config.use_double_wide_mlp = tc
+        .get("use_double_wide_mlp")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     // Sliding-window size for hybrid attention. Gemma-4 config.json has
     // `sliding_window: 1024`. Only sliding layers use it; full layers ignore.
     config.sliding_window = tc
@@ -191,6 +221,168 @@ pub(crate) fn parse_gemma4_params(raw: &serde_json::Value) -> Result<ModelConfig
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(30.0) as f32;
 
+    // Gemma-4 E2B multimodal towers (absent for text-only 26B/31B variants).
+    config.gemma_vision = parse_gemma_vision(raw)?;
+    config.gemma_audio = parse_gemma_audio(raw)?;
+
     finalize_config(&mut config, raw)?;
     Ok(config)
+}
+
+fn get_u64(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0)
+}
+
+/// Parse the E2B `vision_config` tower. None for text-only 26B/31B variants.
+/// Geometry fields (`patch_size`, `pooling_kernel_size`) are required: a
+/// zero value would produce degenerate patch counts, so fail fast.
+fn parse_gemma_vision(raw: &Value) -> Result<Option<GemmaVisionConfig>> {
+    let Some(vc) = raw.get("vision_config") else {
+        return Ok(None);
+    };
+    let hidden_size = get_u64(vc, "hidden_size") as usize;
+    let position_embedding_size = get_u64(vc, "position_embedding_size") as usize;
+    let patch_size = get_u64(vc, "patch_size") as usize;
+    let pooling_kernel_size = get_u64(vc, "pooling_kernel_size") as usize;
+    if patch_size == 0 || pooling_kernel_size == 0 {
+        anyhow::bail!(
+            "gemma4 vision_config missing critical geometry: patch_size={patch_size}, \
+             pooling_kernel_size={pooling_kernel_size}"
+        );
+    }
+    let max_soft_tokens = vc
+        .get("max_soft_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(280) as usize;
+    // Position table: (image/frame slots, position slots, hidden). Derived
+    // from position_embedding_size × hidden_size when not declared.
+    let pos_shape = vc
+        .get("position_table_shape")
+        .and_then(serde_json::Value::as_array);
+    let num_pos_x = pos_shape
+        .and_then(|a| a.first())
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(2) as usize;
+    let num_pos_y = pos_shape
+        .and_then(|a| a.get(1))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(position_embedding_size as u64) as usize;
+    let num_pos_z = pos_shape
+        .and_then(|a| a.get(2))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(hidden_size as u64) as usize;
+    Ok(Some(GemmaVisionConfig {
+        hidden_size,
+        intermediate_size: get_u64(vc, "intermediate_size") as usize,
+        num_hidden_layers: get_u64(vc, "num_hidden_layers") as usize,
+        num_attention_heads: get_u64(vc, "num_attention_heads") as usize,
+        head_dim: get_u64(vc, "head_dim") as usize,
+        patch_size,
+        pooling_kernel_size,
+        position_embedding_size,
+        use_clipped_linears: vc
+            .get("use_clipped_linears")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        image_token_id: get_u64(raw, "image_token_id") as u32,
+        rope_theta: vc
+            .get("rope_parameters")
+            .and_then(|r| r.get("rope_theta"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(100.0) as f32,
+        max_patches: max_soft_tokens * pooling_kernel_size * pooling_kernel_size,
+        max_soft_tokens,
+        position_table_shape: (num_pos_x, num_pos_y, num_pos_z),
+        norm_eps: vc
+            .get("rms_norm_eps")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(1e-6) as f32,
+        video_frames: vc
+            .get("num_frames")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(32) as usize,
+        video_soft_tokens_per_frame: vc
+            .get("video_soft_tokens_per_frame")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(70) as usize,
+        video_token_id: get_u64(raw, "video_token_id") as u32,
+        boi_token_id: get_u64(raw, "boi_token_id") as u32,
+        eoi_token_id: get_u64(raw, "eoi_token_id") as u32,
+    }))
+}
+
+/// Parse the E2B `audio_config` tower. None for text-only 26B/31B variants.
+fn parse_gemma_audio(raw: &Value) -> Result<Option<GemmaAudioConfig>> {
+    let Some(ac) = raw.get("audio_config") else {
+        return Ok(None);
+    };
+    Ok(Some(GemmaAudioConfig {
+        hidden_size: get_u64(ac, "hidden_size") as usize,
+        num_hidden_layers: get_u64(ac, "num_hidden_layers") as usize,
+        num_attention_heads: get_u64(ac, "num_attention_heads") as usize,
+        subsampling_conv_channels: ac
+            .get("subsampling_conv_channels")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|v| v as usize)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        conv_kernel_size: get_u64(ac, "conv_kernel_size") as usize,
+        attention_chunk_size: get_u64(ac, "attention_chunk_size") as usize,
+        attention_context_left: get_u64(ac, "attention_context_left") as usize,
+        attention_context_right: get_u64(ac, "attention_context_right") as usize,
+        output_proj_dims: get_u64(ac, "output_proj_dims") as usize,
+        residual_weight: ac
+            .get("residual_weight")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0),
+        use_clipped_linears: ac
+            .get("use_clipped_linears")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        audio_token_id: get_u64(raw, "audio_token_id") as u32,
+        mel_bins: ac
+            .get("mel_bins")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(128) as usize,
+        frame_length: ac
+            .get("frame_length")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(320) as usize,
+        hop_length: ac
+            .get("hop_length")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(160) as usize,
+        fft_size: ac
+            .get("fft_size")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(512) as usize,
+        mel_floor: ac
+            .get("mel_floor")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(1e-3),
+        mel_scale: ac
+            .get("mel_scale")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("htk")
+            .to_string(),
+        token_cap: ac
+            .get("audio_seq_length")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(750) as usize,
+        norm_eps: ac
+            .get("rms_norm_eps")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(1e-6) as f32,
+        activation: ac
+            .get("activation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("silu")
+            .to_string(),
+        boa_token_id: get_u64(raw, "boa_token_id") as u32,
+        eoa_token_id: get_u64(raw, "eoa_token_id") as u32,
+    }))
 }

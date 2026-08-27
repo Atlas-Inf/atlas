@@ -23,6 +23,7 @@ pub mod forward;
 pub mod layer;
 pub mod layers;
 pub mod lora;
+pub mod media;
 pub mod mistral_loader;
 pub mod model;
 pub mod precision_schedule;

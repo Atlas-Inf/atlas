@@ -59,6 +59,26 @@ pub struct TransformerModel {
     pub(super) embed_tokens: DenseWeight,
     pub(super) final_norm: DenseWeight,
     pub(super) lm_head_weight: DenseWeight,
+    /// Gemma-4 E2B per-layer-embedding (PLE) tables. `None` for every
+    /// non-E2B model. Loaded by W1.2.2-4; the forward pass consumes them
+    /// in a later wave.
+    pub(super) ple_tables: Option<crate::weight_loader::Gemma4PleTables>,
+    /// PLE combined-buffer scratch A: `[max_batch_tokens, num_layers*256]`
+    /// BF16 per-pass per-layer vectors (see `impl_ple.rs::compute_ple`).
+    /// NULL when PLE is disabled.
+    pub(super) ple_combined: DevicePtr,
+    /// PLE combined-buffer scratch B: second base for the fused mixed path
+    /// (decode-side + prefill-side vectors are both resident). NULL when
+    /// PLE is disabled.
+    pub(super) ple_combined_b: DevicePtr,
+    /// PLE identity scratch: `[max_batch_tokens, num_layers*256]` BF16
+    /// token-identity table gather (reused as the projection scratch too).
+    pub(super) ple_identity: DevicePtr,
+    /// Row capacity (tokens) of the PLE scratch buffers.
+    pub(super) ple_scratch_tokens: usize,
+    /// `residual_add::bf16_residual_add` — the PLE combine step
+    /// `combined = context + identity`.
+    pub(super) ple_residual_add_k: KernelHandle,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// TRANSPOSED `[K/2, ldb]` twin of `lm_head_nvfp4` + its PADDED row stride.
     ///
@@ -388,6 +408,45 @@ pub struct TransformerModel {
     pub(super) vision_row_base: Mutex<usize>,
     pub(super) vision_grid_base: Mutex<usize>,
     pub(super) vision_owned_images: Mutex<usize>,
+    /// Optional Gemma-4 E2B vision tower (Wave 2C). `None` until the gemma4
+    /// weight loader builds it (`weight_loader/gemma4/loader_d.rs`); the
+    /// dispatch + splice are wired against `Option` so text-only gemma serves
+    /// stay byte-identical.
+    pub(super) gemma_vision_encoder: Option<crate::layers::GemmaVisionEncoder>,
+    /// Soft-token rows pending from the last `prepare_gemma_media_embed`
+    /// call — the gate that arms the gemma splice. 0 = no gemma patches
+    /// pending. Mirror of `vision_embed_patches` for the Qwen path.
+    pub(super) gemma_vision_embed_patches: Mutex<usize>,
+    /// Per-image soft-token counts from the last `prepare_gemma_media_embed`
+    /// call (image order). The splice consumes buf_out rows in encounter
+    /// order without needing per-image data; the counts are staged for
+    /// diagnostics and the Wave-4 co-dispatch follow-up.
+    pub(super) gemma_vision_soft_counts: Mutex<Vec<usize>>,
+    /// Co-dispatched batched-encode slice base for the NEXT prefill chunk:
+    /// row offset into the gemma encoder's packed `buf_out`. 0 = legacy
+    /// (read from row 0). The splice honors it exactly like `vision_row_base`
+    /// does for Qwen; gemma co-dispatch is a follow-up, so this stays 0.
+    pub(super) gemma_vision_row_base: Mutex<usize>,
+    /// Gemma-4 E2B audio tower (Wave 4B). `None` until the gemma4 weight
+    /// loader builds it (`weight_loader/gemma4/loader_e.rs`); the splice
+    /// treats audio slot tokens as a hard error while this is `None` (the
+    /// Wave-1 server gate already 501s gemma audio before it can reach the
+    /// model).
+    pub(super) gemma_audio_encoder: Option<crate::layers::GemmaAudioEncoder>,
+    /// Valid-token rows pending from the last `prepare_gemma_audio_embed`
+    /// call — the gate that arms the audio splice. 0 = no audio patches
+    /// pending. Mirror of `gemma_vision_embed_patches`.
+    pub(super) gemma_audio_embed_patches: Mutex<usize>,
+    /// Per-clip valid-token counts from the last `prepare_gemma_audio_embed`
+    /// call (clip order). The splice consumes `buf_out` rows in encounter
+    /// order without needing per-clip data; the counts are staged for
+    /// diagnostics and the Wave-4 co-dispatch follow-up. Mirror of
+    /// `gemma_vision_soft_counts`.
+    pub(super) gemma_audio_soft_counts: Mutex<Vec<usize>>,
+    /// Co-dispatched batched-encode slice base for the NEXT prefill chunk:
+    /// row offset into the audio encoder's packed `buf_out`. 0 = legacy
+    /// (read from row 0). Mirror of `gemma_vision_row_base`.
+    pub(super) gemma_audio_row_base: Mutex<usize>,
     /// Page-locked host staging for batched metadata H2D transfers.
     /// Allocated once at init via cuMemAllocHost, freed in Drop.
     ///

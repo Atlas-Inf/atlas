@@ -19,6 +19,19 @@ pub enum LayerType {
     Moe,
 }
 
+/// Per-layer attention kind in Gemma-4 E2B (parsed from `layer_types`).
+///
+/// Kept distinct from [`LayerType`]: every Gemma-4 layer is an attention
+/// layer, so `layer_types` stays all-[`LayerType::FullAttention`] and the
+/// SSM/hybrid layer-counting paths never engage. `attention_types` is the
+/// source of truth for sliding-vs-full at load/runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    Sliding,
+    Full,
+}
+
 /// Model configuration parsed from HuggingFace config.json.
 ///
 /// Single source of truth for model dimensions. All kernel launch
@@ -399,6 +412,48 @@ pub struct ModelConfig {
     #[serde(skip)]
     pub embed_scale: f32,
 
+    // ── Gemma-4 E2B (text_config + vision_config + audio_config) ──
+    /// Number of KV layers shared across the whole network
+    /// (`num_kv_shared_layers`). 0 = no shared KV layers (all other Gemma-4
+    /// variants).
+    #[serde(skip)]
+    pub num_kv_shared_layers: usize,
+    /// Hidden size per layer input (per-layer embeddings, PLE). 0 = PLE
+    /// disabled.
+    #[serde(skip)]
+    pub hidden_size_per_layer_input: usize,
+    /// Vocab size per layer input. 0 = fall back to `vocab_size`.
+    #[serde(skip)]
+    pub vocab_size_per_layer_input: usize,
+    /// Double-wide MLP (`use_double_wide_mlp`): the FFN projects to
+    /// `2 * intermediate_size` before gating down.
+    #[serde(skip)]
+    pub use_double_wide_mlp: bool,
+    /// Full-attention layer head dim (`global_head_dim`). 0 = fall back to
+    /// `head_dim`.
+    #[serde(skip)]
+    pub global_head_dim: usize,
+    /// Raw text_config `head_dim` — the sliding/base head dim, BEFORE the
+    /// max-for-buffer-sizing override that folds `global_head_dim` into
+    /// `head_dim`. 0 = fall back to `head_dim`. Used for per-layer KV dims
+    /// when `attention_types` is non-empty (E2B).
+    #[serde(skip)]
+    pub base_head_dim: usize,
+    /// Per-layer attention kind (Sliding/Full), parsed from the E2B
+    /// `layer_types` array. Empty for 26B/31B (`attention_pattern` style).
+    /// Source of truth for sliding-vs-full at load/runtime; `layer_types`
+    /// itself stays all-`FullAttention` so the SSM/hybrid paths never engage.
+    #[serde(default, skip_deserializing, skip_serializing)]
+    pub attention_types: Vec<AttentionKind>,
+    /// Vision encoder config for Gemma-4 E2B (`vision_config`). None for
+    /// text-only 26B/31B variants.
+    #[serde(skip)]
+    pub gemma_vision: Option<GemmaVisionConfig>,
+    /// Audio encoder config for Gemma-4 E2B (`audio_config`). None for
+    /// text-only 26B/31B variants.
+    #[serde(skip)]
+    pub gemma_audio: Option<GemmaAudioConfig>,
+
     // ── MiniMax M2 specific ──
     /// MoE routing activation. "" = default softmax. "sigmoid" = DeepSeek-V3
     /// / MiniMax-M2 style: raw gate logits pass through sigmoid to produce
@@ -544,6 +599,11 @@ pub struct VisionConfig {
     pub max_pixels: Option<usize>,
 }
 
+/// Gemma-4 E2B vision/audio tower configurations.
+///
+/// Defined in [`gemma_media`] (split for file-size budget).
+pub use gemma_media::{GemmaAudioConfig, GemmaVisionConfig};
+
 impl VisionConfig {
     /// Dimension of the merger input (spatial_merge_size² × hidden_size).
     pub fn merger_input_size(&self) -> usize {
@@ -575,6 +635,7 @@ pub(crate) fn default_conv_kernel() -> usize {
 
 mod dispatch;
 mod factory;
+mod gemma_media;
 mod gguf;
 mod methods;
 mod parsers;

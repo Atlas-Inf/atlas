@@ -150,4 +150,42 @@ impl TransformerModel {
         );
         Ok(out)
     }
+
+    /// Gemma-4 E2B: encode every image in ONE `forward_batched` call and stage
+    /// the packed `[Σsoft, OUT_HIDDEN_SIZE]` BF16 features (image-order in the
+    /// encoder's `buf_out`) + the per-image soft-token counts for the splice.
+    ///
+    /// Mirrors [`Self::prepare_vision_embed_dispatch`] with one key difference:
+    /// the gemma tower's `embed_vision` projection lives INSIDE the encoder, so
+    /// the downstream splice is a straight per-row `buf_out` copy — no per-image
+    /// grids are staged (gemma positions are applied inside the tower; there is
+    /// no MRoPE to feed). The Qwen path's `vision_image_grids` therefore has no
+    /// gemma equivalent; only the row count and per-image counts are staged.
+    pub(in crate::model) fn prepare_gemma_media_embed_dispatch(
+        &self,
+        images: &[crate::media::gemma_vision::GemmaImageInput],
+    ) -> Result<()> {
+        let gve = match &self.gemma_vision_encoder {
+            Some(gve) => gve,
+            None => return Ok(()),
+        };
+        // Empty media list: nothing to encode. forward_batched with zero
+        // images would launch GEMMs on a 0-row grid (CUDA INVALID_VALUE) —
+        // the scheduler calls this with &[] whenever a request carries no
+        // image/video (e.g. an audio-only gemma request), so short-circuit.
+        if images.is_empty() {
+            return Ok(());
+        }
+        let stream = self.gpu.default_stream();
+        let per_image = gve.forward_batched(images, self.gpu.as_ref(), stream)?;
+        let total: usize = per_image.iter().sum();
+        *self.gemma_vision_embed_patches.lock() = total;
+        *self.gemma_vision_soft_counts.lock() = per_image.clone();
+        tracing::info!(
+            "Gemma vision encoder: {} images, {} soft tokens encoded",
+            images.len(),
+            total
+        );
+        Ok(())
+    }
 }
