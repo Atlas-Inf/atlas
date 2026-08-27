@@ -78,6 +78,13 @@ echo "── tests that actually run here ────────────�
 # which matters, because the qwen4_exp parser, manifest and n-gram id core all
 # live here.
 run "atlas-core lib tests"   "$CARGO" test -q -p atlas-core --lib "${CUDA[@]}"
+# atlas-kernels' TEST TARGETS, not its lib: this is where the kernel-shadow
+# invariants live, and they are pure CPU (they parse .cu files and KERNEL.tomls).
+# Missing this row is how a shadow-drift failure reached CI — `cargo test
+# --workspace` catches it, and a gate that only ran `--lib` never did.
+# No feature flags: atlas-kernels has no `cuda` feature (the backend choice is
+# a build.rs concern there, not a Cargo one).
+run "atlas-kernels tests"    "$CARGO" test -q -p atlas-kernels --tests
 # The rest link `-lcuda` under the cuda feature and cannot produce a test
 # binary on macOS. The tests are backend-agnostic; only the linking is not.
 run "spark-server bin tests" "$CARGO" test -q -p spark-server --bins "${METAL[@]}"
