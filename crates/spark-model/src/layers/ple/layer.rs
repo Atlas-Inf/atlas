@@ -59,6 +59,11 @@ pub struct PleLayer {
     table: std::sync::Mutex<NgramTable>,
 
     embed_k: KernelHandle,
+    /// The dequant gather, used when `scale_va` is `Some`.
+    embed_fp8_k: KernelHandle,
+    /// Device VA of the table's per-slot f32 dequant scale array, `None` for a
+    /// BF16 table. Its presence is what selects the FP8 gather.
+    scale_va: Option<u64>,
     gemm_k: KernelHandle,
     gate_k: KernelHandle,
     conv_k: KernelHandle,
@@ -117,6 +122,18 @@ impl PleLayer {
             norm_query: weights.norm_query,
             norm_conv: weights.norm_conv,
             conv1d: weights.conv1d,
+            // Resolved here because the scale arena is allocated once at load
+            // and its VA never moves, so the gather need not reach back
+            // through the table mutex. Without it the F8_E4M3 table was
+            // gathered by `batched_embed`, the BF16 kernel — 2 bytes read per
+            // 1-byte element and no scale — which put 1e30 into the highway
+            // at the PLE layer while every other layer stayed correct.
+            scale_va: match &table {
+                #[cfg(feature = "cuda")]
+                NgramTable::Cached(c) => c.scale_dev_va()?,
+                _ => None,
+            },
+            embed_fp8_k: gpu.kernel("embed_from_argmax", "batched_embed_fp8")?,
             table: std::sync::Mutex::new(table),
             embed_k: gpu.kernel("embed_from_argmax", "batched_embed")?,
             gemm_k: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
@@ -451,17 +468,7 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        ops::batched_embed(
-            gpu,
-            self.embed_k,
-            self.slots_dev,
-            DevicePtr(table_va),
-            self.emb,
-            (num_tokens * heads) as u32,
-            self.head_dim as u32,
-            stream,
-        )
-        .context("PLE row gather")
+        self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)
     }
 }
 

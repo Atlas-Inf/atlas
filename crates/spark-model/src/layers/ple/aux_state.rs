@@ -4,8 +4,10 @@
 //! carry (token history + conv state) that rides the SSM snapshots.
 //! Split from `layer.rs` for the ≤500 LoC cap.
 
-use anyhow::Result;
-use spark_runtime::gpu::GpuBackend;
+use anyhow::{Context, Result};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+
+use crate::layers::ops;
 
 use super::{PleLayer, PleSeqState};
 use crate::layers::ngram_embed::NgramTable;
@@ -142,5 +144,47 @@ impl PleLayer {
         }
         let _ = table;
         Ok(())
+    }
+
+    /// The row gather, dispatched on element type.
+    ///
+    /// FP8 rows carry a per-slot scale; BF16 rows do not. Split out of
+    /// `layer.rs` for the 500-LoC cap.
+    pub(super) fn gather_embed_dispatch(
+        &self,
+        table_va: u64,
+        num_tokens: usize,
+        heads: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        // Dispatch on the PRESENCE OF THE SCALE, not a dtype flag: it keeps
+        // "the bytes are E4M3" and "there is something to multiply by" from
+        // being able to disagree.
+        match self.scale_va {
+            Some(scale) => ops::batched_embed_fp8(
+                gpu,
+                self.embed_fp8_k,
+                self.slots_dev,
+                DevicePtr(table_va),
+                DevicePtr(scale),
+                self.emb,
+                (num_tokens * heads) as u32,
+                self.head_dim as u32,
+                stream,
+            )
+            .context("PLE row gather (fp8)"),
+            None => ops::batched_embed(
+                gpu,
+                self.embed_k,
+                self.slots_dev,
+                DevicePtr(table_va),
+                self.emb,
+                (num_tokens * heads) as u32,
+                self.head_dim as u32,
+                stream,
+            )
+            .context("PLE row gather"),
+        }
     }
 }
