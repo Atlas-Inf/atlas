@@ -94,7 +94,7 @@ impl PosixBackend {
     /// tier deliberately does not use. A no-op there means a Windows run of
     /// the timing tests may read from RAM -- which is why this is a test
     /// helper and not a correctness primitive.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn drop_pagecache(&self) {
         for layer in 0..self.layout.spec.num_layers {
             let fd = self.layout.fd(layer);
@@ -102,7 +102,9 @@ impl PosixBackend {
         }
     }
 
-    #[cfg(not(unix))]
+    // macOS joins the no-op arm: it has no `posix_fadvise`, and `F_NOCACHE`
+    // changes future reads rather than evicting what is already cached.
+    #[cfg(any(not(unix), target_os = "macos"))]
     pub fn drop_pagecache(&self) {}
 }
 
