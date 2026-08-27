@@ -551,3 +551,50 @@ impl BufferSizes {
             + self.q2_act_q8
     }
 }
+
+#[cfg(test)]
+mod qwen4exp_hc_tests {
+    use super::*;
+
+    /// A model that spells its stream count `hc_count` must still get a real
+    /// highway. Before this, `hc_streams` was gated on `hc_mult > 0` — the
+    /// DeepSeek-V4 spelling — so qwen4_exp silently received the 256-byte
+    /// placeholder and the first write past it would have been someone else's
+    /// buffer.
+    #[test]
+    fn hc_count_allocates_the_stream_highway() {
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        cfg.hc_mult = 0;
+        cfg.hc_count = 4;
+        cfg.hidden_size = 2560;
+        let sizes = BufferSizes::new(&cfg, 128, 2048, 16, 1);
+        // bf16, because `q4e_hc_stream_mix` and `q4e_hc_scatter_add` stride by
+        // __nv_bfloat16. f32 here would not fail — it would read the wrong half
+        // of every value.
+        assert_eq!(sizes.hc_streams, 128 * 4 * 2560 * 2);
+    }
+
+    /// DeepSeek-V4 keeps f32 deliberately: its manifold mixing is
+    /// norm-preserving, so bf16 storage swamps the per-layer signal and
+    /// collapses generation. Widening qwen4_exp must not have narrowed V4.
+    #[test]
+    fn hc_mult_keeps_its_f32_highway() {
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        cfg.hc_mult = 4;
+        cfg.hc_count = 0;
+        cfg.hidden_size = 2560;
+        let sizes = BufferSizes::new(&cfg, 128, 2048, 16, 1);
+        assert_eq!(sizes.hc_streams, 128 * 4 * 2560 * 4);
+    }
+
+    /// Neither set is the overwhelmingly common case and must stay a
+    /// placeholder rather than a hidden-size allocation on every model.
+    #[test]
+    fn no_streams_stays_a_placeholder() {
+        let cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        assert_eq!(cfg.hc_mult, 0);
+        assert_eq!(cfg.hc_count, 0);
+        let sizes = BufferSizes::new(&cfg, 128, 2048, 16, 1);
+        assert_eq!(sizes.hc_streams, 256);
+    }
+}
