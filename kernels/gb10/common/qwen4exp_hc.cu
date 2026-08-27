@@ -27,6 +27,38 @@ __device__ __forceinline__ float q4e_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
+// Trunk entry: tile one hidden state across all hc_count residual streams.
+//
+//   streams[t, s, d] = hidden[t, d]     for every s
+//
+// The reference does exactly this after the embedding lookup -- the streams
+// start identical and only diverge once the first block's injection lands.
+// Starting them at zero instead (the obvious alternative) makes the first
+// hyper-connection collapse read a zero mean and the model never recovers.
+//
+// DeepSeek-V4's hc_expand does the same job but lives in that model's shadow,
+// not in common/, so it does not resolve for this target. See the module-name
+// note above: a shadow beats common/, which is why these are q4e_-prefixed.
+//
+// Grid: (num_tokens, hc_count, 1)  Block: (min(hidden, 1024), 1, 1)
+extern "C" __global__ void q4e_hc_expand(
+    const __nv_bfloat16* __restrict__ hidden,  // [num_tokens, hidden]
+    __nv_bfloat16* __restrict__ streams,        // [num_tokens, hc_count * hidden]
+    unsigned int hidden_size,
+    unsigned int hc_count
+) {
+    unsigned int token = blockIdx.x;
+    unsigned int stream = blockIdx.y;
+    const __nv_bfloat16* src = hidden + (unsigned long long)token * hidden_size;
+    __nv_bfloat16* dst = streams
+        + (unsigned long long)token * hc_count * hidden_size
+        + (unsigned long long)stream * hidden_size;
+
+    for (unsigned int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        dst[d] = src[d];
+    }
+}
+
 // silu(x / hc_count), in place, on the low-rank projection output.
 //
 // Grid: (num_tokens, 1, 1)  Block: (min(lowrank, 1024), 1, 1)

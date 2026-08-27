@@ -24,12 +24,16 @@ use crate::weight_map::DenseWeight;
 pub struct Qwen4ExpKernels {
     pub gemv: KernelHandle,
     pub rms_norm_grouped: KernelHandle,
+    pub hc_expand: KernelHandle,
     pub hc_lowrank_act: KernelHandle,
     pub hc_stream_mix: KernelHandle,
     pub hc_injection: KernelHandle,
     pub hc_scatter_add: KernelHandle,
     pub ple_gate: KernelHandle,
     pub ple_conv_add: KernelHandle,
+    /// The 12 full-attention layers' decode step: causal softmax over a
+    /// contiguous K/V buffer, then the per-head `[query | gate]` sigmoid gate.
+    pub attn_decode: KernelHandle,
 }
 
 impl Qwen4ExpKernels {
@@ -39,14 +43,42 @@ impl Qwen4ExpKernels {
             rms_norm_grouped: gpu.kernel("norm", "rms_norm_grouped")?,
             // `qwen4exp_hc`, NOT `hyper_connection` — that module belongs to
             // DeepSeek-V4's Sinkhorn mHC, which is a different formulation.
+            hc_expand: gpu.kernel("qwen4exp_hc", "q4e_hc_expand")?,
             hc_lowrank_act: gpu.kernel("qwen4exp_hc", "q4e_hc_lowrank_act")?,
             hc_stream_mix: gpu.kernel("qwen4exp_hc", "q4e_hc_stream_mix")?,
             hc_injection: gpu.kernel("qwen4exp_hc", "q4e_hc_injection")?,
             hc_scatter_add: gpu.kernel("qwen4exp_hc", "q4e_hc_scatter_add")?,
             ple_gate: gpu.kernel("qwen4exp_ple", "q4e_ple_gate")?,
             ple_conv_add: gpu.kernel("qwen4exp_ple", "q4e_ple_conv_add")?,
+            attn_decode: gpu.kernel("qwen4exp_attn", "q4e_attn_decode")?,
         })
     }
+}
+
+/// Tile one hidden state across all `hc_count` residual streams — the trunk
+/// entry, run once after the embedding lookup rather than per layer.
+///
+/// The streams start IDENTICAL and diverge only once the first block's
+/// injection lands. Zero-initialising them instead makes the first collapse
+/// read a zero mean, and the model does not recover from it.
+pub fn hc_expand(
+    gpu: &dyn GpuBackend,
+    k: KernelHandle,
+    hidden: DevicePtr,
+    streams: DevicePtr,
+    num_tokens: usize,
+    hidden_size: usize,
+    hc_count: usize,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, k)
+        .grid([num_tokens as u32, hc_count as u32, 1])
+        .block([hidden_size.min(1024) as u32, 1, 1])
+        .arg_ptr(hidden)
+        .arg_ptr(streams)
+        .arg_u32(hidden_size as u32)
+        .arg_u32(hc_count as u32)
+        .launch(stream)
 }
 
 /// Geometry shared by both blocks.

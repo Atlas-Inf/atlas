@@ -48,8 +48,9 @@ pub struct BufferSizes {
     /// Zero-filled BF16 weight (length max_dim) for unweighted RMSNorm under the
     /// offset-from-1 kernel convention (scale = 1+weight → 1.0). DeepSeek-V4 q_b_norm.
     pub norm_unit_w: usize,
-    /// HC residual streams: `[M, hc_mult, hidden]` BF16 (DeepSeek-V4 mHC).
-    /// 256 (placeholder) when `hc_mult == 0`.
+    /// HC residual streams: `[M, streams, hidden]` F32, where `streams` is
+    /// `hc_mult` (DeepSeek-V4 mHC) or `hc_count` (qwen4_exp), whichever the
+    /// model sets. 256 (placeholder) when neither is set.
     pub hc_streams: usize,
     /// HC `post` mixing weights: `[M, hc_mult]` F32.
     pub hc_post: usize,
@@ -133,6 +134,9 @@ impl BufferSizes {
         let bf16 = 2;
         let m = max_batch_tokens;
         let h = config.hidden_size;
+        // Residual streams on the trunk: DeepSeek-V4 states it as `hc_mult`,
+        // qwen4_exp as `hc_count`. A model sets one or the other, never both.
+        let hc_streams_count = config.hc_mult.max(config.hc_count);
 
         // Q projection output: gated models produce [Q, gate] (2× nq*hd),
         // ungated models (VL) produce only [Q] (nq*hd).
@@ -446,13 +450,37 @@ impl BufferSizes {
             o_latent: (m * config.o_groups * config.o_lora_rank * bf16).max(256),
             // Zero-filled weight for unweighted RMSNorm (q_b_norm).
             norm_unit_w: max_dim * bf16,
-            // HC buffers: only allocated for DeepSeek-V4 (hc_mult > 0).
-            hc_streams: if config.hc_mult > 0 {
-                // FP32 mHC highway: the residual streams grow large across the
-                // blocks (the manifold-mixing is norm-preserving, eigenvalue 1),
-                // so BF16 storage swamps the small per-layer signal at scale and
-                // collapses generation. Store the streams in FP32 (4 bytes).
-                m * config.hc_mult * h * 4
+            // HC buffers. Two unrelated architectures carry a multi-stream
+            // residual and both need this highway:
+            //
+            //   DeepSeek-V4  `hc_mult`   Sinkhorn-mixed mHC (hc_post/hc_comb)
+            //   qwen4_exp    `hc_count`  low-rank sigmoid-gated (no Sinkhorn)
+            //
+            // Only the STREAM COUNT matters for sizing, so they share the
+            // buffer; `hc_post`/`hc_comb` below stay V4-only because the
+            // Sinkhorn intermediates have no qwen4_exp counterpart.
+            hc_streams: if hc_streams_count > 0 {
+                // ELEMENT SIZE IS PER-FAMILY, because the kernels that read this
+                // buffer differ:
+                //
+                //   V4 (hc_mult)      f32. The mHC residual streams grow large
+                //                     across blocks (manifold-mixing is
+                //                     norm-preserving, eigenvalue 1), so BF16
+                //                     swamps the small per-layer signal at scale
+                //                     and collapses generation.
+                //   qwen4_exp         bf16, because `q4e_hc_stream_mix` /
+                //   (hc_count)        `q4e_hc_scatter_add` read and write
+                //                     __nv_bfloat16. Sizing this f32 while the
+                //                     kernels stride by 2 would not fail -- it
+                //                     would read the wrong half of every value.
+                //
+                // OPEN: qwen4_exp's mixer is contractive (it divides by
+                // hc_count) rather than norm-preserving, so the V4 drift
+                // argument does not obviously transfer. Whether 48 layers x 2
+                // blocks of bf16 accumulation drifts is UNMEASURED; if it does,
+                // both the kernels and this line move together.
+                let elem = if config.hc_mult > 0 { 4 } else { bf16 };
+                m * hc_streams_count * h * elem
             } else {
                 256
             },
