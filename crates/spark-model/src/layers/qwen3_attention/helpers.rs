@@ -251,6 +251,23 @@ impl Qwen3AttentionLayer {
     }
 }
 
+/// The QSA per-seq carry from a sequence's [`crate::layer::AttnLayerState`],
+/// lazily created on first use (Avarok #753 item B).
+pub(in crate::layers::qwen3_attention) fn qsa_seq_state<'a>(
+    qsa: &crate::layers::qsa::QsaIndexer,
+    state: &'a mut dyn crate::layer::LayerState,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+) -> anyhow::Result<&'a mut crate::layers::qsa::QsaSeqState> {
+    let attn = state
+        .as_any_mut()
+        .downcast_mut::<crate::layer::AttnLayerState>()
+        .ok_or_else(|| anyhow::anyhow!("QSA host layer state is not AttnLayerState"))?;
+    if attn.qsa.is_none() {
+        attn.qsa = Some(qsa.new_seq_state(gpu)?);
+    }
+    Ok(attn.qsa.as_mut().expect("just created"))
+}
+
 #[cfg(test)]
 mod yarn_mscale_tests {
     use super::yarn_rope_mscale;
@@ -294,3 +311,4 @@ mod yarn_mscale_tests {
         assert_eq!(yarn_rope_mscale(&c), 1.0);
     }
 }
+

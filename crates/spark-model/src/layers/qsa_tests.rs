@@ -143,16 +143,18 @@ fn qsa_matches_reference() {
     .unwrap();
 
     let hidden_dev = upload(g, &bin("hidden"));
+    let mut qst = qsa.new_seq_state(g).unwrap();
 
     // ── Prefill ingest of T-1 tokens (the last token arrives at decode). ──
     let t_pre = t_all - 1;
-    qsa.prefill_ingest(hidden_dev, t_pre, 0, g, stream).unwrap();
+    qsa.prefill_ingest(&mut qst, hidden_dev, t_pre, 0, g, stream)
+        .unwrap();
     g.synchronize(stream).unwrap();
 
     let want_raw = f32s("raw_keys");
     compare(
         "raw_keys",
-        &dl_bf16(g, qsa.raw_keys, t_pre * hd),
+        &dl_bf16(g, qst.raw_keys, t_pre * hd),
         &want_raw[..t_pre * hd],
         0.05,
     );
@@ -160,7 +162,7 @@ fn qsa_matches_reference() {
     let want_bk = f32s("block_keys");
     compare(
         "block_keys",
-        &dl_bf16(g, qsa.block_keys, n_blocks_pre * hd),
+        &dl_bf16(g, qst.block_keys, n_blocks_pre * hd),
         &want_bk[..n_blocks_pre * hd],
         0.05,
     );
@@ -179,6 +181,7 @@ fn qsa_matches_reference() {
     let last_row = hidden_dev.offset((t_all - 1) * hidden * 2);
     let sel = qsa
         .decode_select(
+            &mut qst,
             last_row,
             t_all - 1,
             kpool,

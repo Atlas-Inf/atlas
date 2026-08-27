@@ -121,6 +121,7 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
             .collect(),
         h_is_f16: false,
         h_prefill_stage: None,
+        ple: None,
     }
 }
 

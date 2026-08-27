@@ -19,6 +19,7 @@ use crate::layers::ops;
 impl Qwen3AttentionLayer {
     pub(in super::super) fn attention_forward(
         &self,
+        state: &mut dyn crate::layer::LayerState,
         normed: DevicePtr,
         seq_len: usize,
         block_table: &mut Vec<u32>,
@@ -619,7 +620,10 @@ impl Qwen3AttentionLayer {
             // sits at position `seq_len` — verified live: a 35-token
             // prompt's first decode arrives with seq_len=35 and 35 raw
             // keys already ingested by prefill.
+            let qsa_st =
+                crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
             qsa.decode_select(
+                qsa_st,
                 normed,
                 seq_len,
                 kv_cache.k_pool_ptr(self.attn_layer_idx),

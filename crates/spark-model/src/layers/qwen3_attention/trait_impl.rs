@@ -115,18 +115,45 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.qsa.is_some()
     }
 
-    fn snapshot_aux(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<Option<Vec<u8>>> {
-        match self.qsa.as_ref() {
-            Some(qsa) => Ok(Some(qsa.snapshot_aux(gpu, stream)?)),
+    fn snapshot_aux(
+        &self,
+        state: &dyn LayerState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(None);
+        };
+        let attn = state
+            .as_any()
+            .downcast_ref::<crate::layer::AttnLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("QSA host layer state is not AttnLayerState"))?;
+        match attn.qsa.as_ref() {
+            Some(st) => Ok(Some(qsa.snapshot_aux(st, gpu, stream)?)),
+            // Sequence never reached this layer's ingest: nothing to carry.
             None => Ok(None),
         }
     }
 
-    fn restore_aux(&self, blob: &[u8], gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
-        self.qsa
+    fn restore_aux(
+        &self,
+        state: &mut dyn LayerState,
+        blob: &[u8],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let qsa = self
+            .qsa
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("restore_aux: no QSA on this layer"))?
-            .restore_aux(blob, gpu, stream)
+            .ok_or_else(|| anyhow::anyhow!("restore_aux: no QSA on this layer"))?;
+        let attn = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::AttnLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("QSA host layer state is not AttnLayerState"))?;
+        if attn.qsa.is_none() {
+            attn.qsa = Some(qsa.new_seq_state(gpu)?);
+        }
+        qsa.restore_aux(attn.qsa.as_mut().expect("just created"), blob, gpu, stream)
     }
 
     fn decode(
@@ -253,7 +280,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
     }
 
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
-        Ok(Box::new(EmptyLayerState))
+        Ok(Box::new(crate::layer::AttnLayerState::default()))
     }
 
     fn transpose_moe_for_prefill(

@@ -201,7 +201,7 @@ impl TransformerModel {
                     stream,
                 )?;
                 if let Some(aux) = self.ssm_snapshots.aux(snap_id) {
-                    self.apply_aux_states(&aux, stream)?;
+                    self.apply_aux_states(seq, &aux, stream)?;
                 }
                 tracing::info!(
                     "Marconi two-phase: restored SSM snapshot at token {snap_tok} \

@@ -879,10 +879,16 @@ impl TransformerModel {
     /// Collect chunk-boundary aux layer state (PLE, QSA) for a Marconi
     /// snapshot. Returns the blobs to attach; empty when no layer carries
     /// aux state.
-    pub(in crate::model) fn collect_aux_states(&self, stream: u64) -> Result<Vec<(u32, Vec<u8>)>> {
+    pub(in crate::model) fn collect_aux_states(
+        &self,
+        seq: &SequenceState,
+        stream: u64,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
         let mut out = Vec::new();
         for (i, l) in self.layers.iter().enumerate() {
-            if let Some(blob) = l.snapshot_aux(self.gpu.as_ref(), stream)? {
+            if let Some(blob) =
+                l.snapshot_aux(seq.layer_states[i].as_ref(), self.gpu.as_ref(), stream)?
+            {
                 out.push((i as u32, blob));
             }
         }
@@ -898,11 +904,17 @@ impl TransformerModel {
     /// Apply a snapshot's aux blobs to the owning layers.
     pub(in crate::model) fn apply_aux_states(
         &self,
+        seq: &mut SequenceState,
         blobs: &[(u32, Vec<u8>)],
         stream: u64,
     ) -> Result<()> {
         for (i, blob) in blobs {
-            self.layers[*i as usize].restore_aux(blob, self.gpu.as_ref(), stream)?;
+            self.layers[*i as usize].restore_aux(
+                seq.layer_states[*i as usize].as_mut(),
+                blob,
+                self.gpu.as_ref(),
+                stream,
+            )?;
         }
         Ok(())
     }

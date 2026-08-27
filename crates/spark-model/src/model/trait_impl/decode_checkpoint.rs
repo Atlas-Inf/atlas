@@ -133,7 +133,7 @@ impl TransformerModel {
         // matching the snap_tokens registration below. A collection failure
         // leaves the snapshot aux-less: the restore gate then declines it —
         // slower, never stale.
-        match self.collect_aux_states(stream) {
+        match self.collect_aux_states(seq, stream) {
             Ok(aux) => {
                 if !aux.is_empty() {
                     self.ssm_snapshots.set_aux(snap_id, aux);
@@ -254,7 +254,7 @@ impl TransformerModel {
             // Aux (PLE + QSA lexical state) at retire covers prompt +
             // generated tokens — the deepest anchor a chat continuation can
             // match. Failure => aux-less snapshot, declined on restore.
-            match self.collect_aux_states(stream) {
+            match self.collect_aux_states(seq, stream) {
                 Ok(aux) => {
                     if !aux.is_empty() {
                         self.ssm_snapshots.set_aux(id, aux);

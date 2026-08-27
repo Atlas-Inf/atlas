@@ -35,8 +35,7 @@ mod qsa_select;
 #[path = "qsa_tests.rs"]
 mod tests;
 
-/// One decode step's selection, ready for the paged decode attention:
-/// `k/v` are contiguous NHD scratch and `table` is the identity mapping.
+/// One decode step's selection: contiguous NHD `k/v` scratch + identity table.
 pub struct QsaSelection {
     pub k_scratch: DevicePtr,
     pub v_scratch: DevicePtr,
@@ -46,13 +45,17 @@ pub struct QsaSelection {
     pub max_blocks: u32,
 }
 
-struct QsaState {
+pub struct QsaSeqState {
     /// Tokens whose raw keys are in `raw_keys` (contiguous from 0).
     ingested: usize,
     /// Complete 4-token blocks pooled into `block_keys`.
     pooled: usize,
     /// Identity block table upload done (needs block_size, known lazily).
     table_len: usize,
+    /// [max_tokens, hd] BF16 — this sequence's raw indexer keys.
+    raw_keys: DevicePtr,
+    /// [max_tokens/ratio, hd] BF16 — this sequence's pooled block keys.
+    block_keys: DevicePtr,
 }
 
 pub struct QsaIndexer {
@@ -81,8 +84,6 @@ pub struct QsaIndexer {
     k_score_rows_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
 
-    raw_keys: DevicePtr,   // [max_tokens, hd] BF16
-    block_keys: DevicePtr, // [max_tokens/ratio, hd] BF16
     qk_scratch: DevicePtr, // [INGEST_SLAB, (n_heads+1)*hd] BF16
     q_post: DevicePtr,     // [n_heads, hd] F32
     scores_dev: DevicePtr, // [max_tokens/ratio] F32
@@ -95,8 +96,6 @@ pub struct QsaIndexer {
     /// chunk-0 metadata carries no device table (cache-skip attention is
     /// contiguous), so the host Vec is the source of truth.
     prefill_table_dev: DevicePtr, // [ceil(max_tokens/8)] i32
-
-    state: std::sync::Mutex<QsaState>,
 }
 
 /// Prefill ingest GEMM slab (rows), bounding `qk_scratch`.
@@ -154,8 +153,6 @@ impl QsaIndexer {
             k_qprep_rows_k: gpu.kernel("qsa_indexer", "qsa_qprep_rows")?,
             k_score_rows_k: gpu.kernel("qsa_indexer", "qsa_score_rows")?,
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
-            raw_keys: gpu.alloc(max_tokens * hd * 2)?,
-            block_keys: gpu.alloc(max_tokens / ratio * hd * 2)?,
             qk_scratch: gpu.alloc(INGEST_SLAB * qk_width * 2)?,
             q_post: gpu.alloc(n_heads * hd * 4)?,
             scores_dev: gpu.alloc(max_tokens / ratio * 4)?,
@@ -165,15 +162,24 @@ impl QsaIndexer {
             table_dev: gpu.alloc(sel_cap.div_ceil(8) * 4)?,
             seq_len_dev: gpu.alloc(4)?,
             prefill_table_dev: gpu.alloc(max_tokens.div_ceil(8) * 4)?,
-            state: std::sync::Mutex::new(QsaState {
-                ingested: 0,
-                pooled: 0,
-                table_len: 0,
-            }),
         })
     }
 
     /// The largest visible prefix whose selection is provably all-visible.
+    /// One sequence's indexer carry: counters + raw/pooled key buffers
+    /// (per-seq CONTENT; launch scratch stays layer-owned — steps serialize).
+    pub fn new_seq_state(&self, gpu: &dyn GpuBackend) -> Result<QsaSeqState> {
+        let hd = self.hd as usize;
+        let ratio = self.ratio as usize;
+        Ok(QsaSeqState {
+            ingested: 0,
+            pooled: 0,
+            table_len: 0,
+            raw_keys: gpu.alloc(self.max_tokens * hd * 2)?,
+            block_keys: gpu.alloc(self.max_tokens / ratio * hd * 2)?,
+        })
+    }
+
     pub fn inert_bound(&self) -> usize {
         (self.budget + self.ratio - 1) as usize
     }
@@ -187,16 +193,13 @@ impl QsaIndexer {
     /// resets the sequence (single-seq v1, PLE-style).
     pub fn prefill_ingest(
         &self,
+        st: &mut QsaSeqState,
         hidden: DevicePtr,
         num_tokens: usize,
         seq_start: usize,
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("QSA state mutex poisoned"))?;
         if seq_start == 0 {
             st.ingested = 0;
             st.pooled = 0;
@@ -235,7 +238,7 @@ impl QsaIndexer {
             gpu.copy_d2d_2d_async(
                 self.qk_scratch.offset(self.n_heads as usize * hd * 2),
                 qkw * 2,
-                self.raw_keys.offset((seq_start + off) * hd * 2),
+                st.raw_keys.offset((seq_start + off) * hd * 2),
                 hd * 2,
                 hd * 2,
                 ts,
@@ -244,18 +247,23 @@ impl QsaIndexer {
             off += ts;
         }
         st.ingested = seq_start + num_tokens;
-        self.pool_new_blocks(&mut st, gpu, stream)
+        self.pool_new_blocks(st, gpu, stream)
     }
 
-    fn pool_new_blocks(&self, st: &mut QsaState, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+    fn pool_new_blocks(
+        &self,
+        st: &mut QsaSeqState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
         let complete = st.ingested / self.ratio as usize;
         if complete > st.pooled {
             ops::qsa_block_pool(
                 gpu,
                 self.k_pool_k,
-                self.raw_keys,
+                st.raw_keys,
                 self.k_norm_w,
-                self.block_keys,
+                st.block_keys,
                 st.pooled as u32,
                 (complete - st.pooled) as u32,
                 self.ratio,
@@ -270,18 +278,18 @@ impl QsaIndexer {
         Ok(())
     }
 
-    // `prefill_select` lives in `qsa_select.rs` (≤500 LoC split;
-    // child module via #[path] so private fields stay reachable).
+    // `prefill_select`: see `qsa_select.rs` (#[path] child, ≤500 LoC split).
 
     /// Marconi aux blob: `[ingested u64][pooled u64][raw_keys bf16 bytes]`.
     /// Raw keys are a deterministic function of the token prefix, so the
     /// snapshot IS the indexer state; block keys are re-pooled on restore
     /// (one kernel) rather than serialized.
-    pub fn snapshot_aux(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<Vec<u8>> {
-        let st = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("QSA state mutex poisoned"))?;
+    pub fn snapshot_aux(
+        &self,
+        st: &QsaSeqState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Vec<u8>> {
         let hd = self.hd as usize;
         let key_bytes = st.ingested * hd * 2;
         let mut blob = Vec::with_capacity(16 + key_bytes);
@@ -290,14 +298,20 @@ impl QsaIndexer {
         let off = blob.len();
         blob.resize(off + key_bytes, 0);
         if key_bytes > 0 {
-            gpu.copy_d2h_on_stream(self.raw_keys, &mut blob[off..], stream)?;
+            gpu.copy_d2h_on_stream(st.raw_keys, &mut blob[off..], stream)?;
         }
         Ok(blob)
     }
 
     /// Restore the blob from [`Self::snapshot_aux`] on a prefix-cache hit:
     /// upload the raw keys, reset the counters, re-pool the block keys.
-    pub fn restore_aux(&self, blob: &[u8], gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+    pub fn restore_aux(
+        &self,
+        st: &mut QsaSeqState,
+        blob: &[u8],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
         anyhow::ensure!(blob.len() >= 16, "QSA aux blob truncated");
         let ingested = u64::from_le_bytes(blob[..8].try_into().unwrap()) as usize;
         let pooled = u64::from_le_bytes(blob[8..16].try_into().unwrap()) as usize;
@@ -307,12 +321,8 @@ impl QsaIndexer {
             "QSA aux blob size mismatch"
         );
         anyhow::ensure!(ingested <= self.max_tokens, "QSA aux exceeds key cache");
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("QSA state mutex poisoned"))?;
         if ingested > 0 {
-            gpu.copy_h2d_async(&blob[16..], self.raw_keys, stream)?;
+            gpu.copy_h2d_async(&blob[16..], st.raw_keys, stream)?;
         }
         st.ingested = ingested;
         st.pooled = 0;
@@ -320,9 +330,9 @@ impl QsaIndexer {
             ops::qsa_block_pool(
                 gpu,
                 self.k_pool_k,
-                self.raw_keys,
+                st.raw_keys,
                 self.k_norm_w,
-                self.block_keys,
+                st.block_keys,
                 0,
                 pooled as u32,
                 self.ratio,
@@ -338,12 +348,11 @@ impl QsaIndexer {
     }
 
     /// Decode-step ingest + selection for the token at `pos` (0-based;
-    /// `pos + 1` tokens are visible including this one). Returns `None`
-    /// while the visible prefix is within the inert bound (dense path is
-    /// exact there).
+    /// `pos + 1` visible). `None` inside the inert bound (dense is exact).
     #[allow(clippy::too_many_arguments)]
     pub fn decode_select(
         &self,
+        st: &mut QsaSeqState,
         normed: DevicePtr,
         pos: usize,
         k_pool: DevicePtr,
@@ -353,10 +362,6 @@ impl QsaIndexer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Option<QsaSelection>> {
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("QSA state mutex poisoned"))?;
         anyhow::ensure!(
             pos == st.ingested,
             "QSA: decode at pos {pos} but {} tokens ingested — the indexer \
@@ -383,12 +388,12 @@ impl QsaIndexer {
         .context("QSA qk projection (decode)")?;
         gpu.copy_d2d_async(
             self.qk_scratch.offset(self.n_heads as usize * hd * 2),
-            self.raw_keys.offset(pos * hd * 2),
+            st.raw_keys.offset(pos * hd * 2),
             hd * 2,
             stream,
         )?;
         st.ingested = pos + 1;
-        self.pool_new_blocks(&mut st, gpu, stream)?;
+        self.pool_new_blocks(st, gpu, stream)?;
 
         let visible = pos + 1;
         let complete = visible / self.ratio as usize;
@@ -415,7 +420,7 @@ impl QsaIndexer {
             gpu,
             self.k_score_k,
             self.q_post,
-            self.block_keys,
+            st.block_keys,
             self.scores_dev,
             complete as u32,
             self.n_heads,

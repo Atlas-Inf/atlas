@@ -138,7 +138,15 @@ impl Qwen3SsmLayer {
         // `fresh` is a prefill starting at position 0: a new sequence, so the
         // conv state and the token history both reset.
         if let Some(ple) = self.ple.as_ref() {
-            ple.forward(streams, num_tokens, seq_len_start == 0, ctx, stream)?;
+            let ssm = state
+                .as_any_mut()
+                .downcast_mut::<crate::layer::SsmLayerState>()
+                .ok_or_else(|| anyhow::anyhow!("PLE host layer state is not SsmLayerState"))?;
+            if ssm.ple.is_none() {
+                ssm.ple = Some(ple.new_seq_state(ctx.gpu)?);
+            }
+            let st = ssm.ple.as_mut().expect("just created");
+            ple.forward(st, streams, num_tokens, seq_len_start == 0, ctx, stream)?;
         }
         stage!("ple");
 

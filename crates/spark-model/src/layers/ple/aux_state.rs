@@ -7,17 +7,18 @@
 use anyhow::Result;
 use spark_runtime::gpu::GpuBackend;
 
-use super::PleLayer;
+use super::{PleLayer, PleSeqState};
 
 impl PleLayer {
     /// Marconi aux blob: `[hist_len u32][history u32s][conv f32 bytes]`.
     /// The whole per-sequence carry — a prefix hit restoring KV+SSM without
     /// this would run the n-gram hash on the PREVIOUS request's history.
-    pub fn snapshot_aux(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<Vec<u8>> {
-        let st = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("PLE state mutex poisoned"))?;
+    pub fn snapshot_aux(
+        &self,
+        st: &PleSeqState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Vec<u8>> {
         let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
         let mut blob = Vec::with_capacity(4 + st.history.len() * 4 + conv_bytes);
         blob.extend_from_slice(&(st.history.len() as u32).to_le_bytes());
@@ -31,11 +32,13 @@ impl PleLayer {
     }
 
     /// Restore the blob from [`Self::snapshot_aux`] on a prefix-cache hit.
-    pub fn restore_aux(&self, blob: &[u8], gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("PLE state mutex poisoned"))?;
+    pub fn restore_aux(
+        &self,
+        st: &mut PleSeqState,
+        blob: &[u8],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
         anyhow::ensure!(blob.len() >= 4, "PLE aux blob truncated");
         let n = u32::from_le_bytes(blob[..4].try_into().unwrap()) as usize;
         let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;

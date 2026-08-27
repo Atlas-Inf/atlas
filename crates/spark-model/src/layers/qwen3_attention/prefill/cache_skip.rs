@@ -18,6 +18,7 @@ impl Qwen3AttentionLayer {
     #[allow(unreachable_code, unused_variables, unused_assignments)]
     pub(in crate::layers::qwen3_attention) fn prefill_attention_with_cache_skip(
         &self,
+        state: &mut dyn crate::layer::LayerState,
         normed: DevicePtr,
         num_tokens: usize,
         kv_write_start: usize,
@@ -742,7 +743,10 @@ impl Qwen3AttentionLayer {
         if let Some(ref qsa) = self.qsa
             && num_tokens > qsa.inert_bound()
         {
+            let qsa_st =
+                crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
             qsa.prefill_select(
+                qsa_st,
                 normed,
                 q_contiguous,
                 attn_out,

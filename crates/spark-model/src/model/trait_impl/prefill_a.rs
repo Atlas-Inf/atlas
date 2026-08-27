@@ -162,7 +162,7 @@ impl TransformerModel {
                     stream,
                 )?;
                 if let Some(aux) = self.ssm_snapshots.aux(snap_id) {
-                    self.apply_aux_states(&aux, stream)?;
+                    self.apply_aux_states(seq, &aux, stream)?;
                 }
                 if snap_tok < kv_write_start {
                     tracing::info!(

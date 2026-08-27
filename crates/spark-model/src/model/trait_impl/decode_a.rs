@@ -154,8 +154,13 @@ impl TransformerModel {
         // fault-in + slot upload into its stable slots buffer) — BEFORE any
         // graph replay/capture, same phasing as the token_ids upload above.
         // A replayed graph then only reads buffers this call refreshed.
-        for l in self.layers.iter() {
-            l.decode_prestage(token, self.gpu.as_ref(), stream)?;
+        for (li, l) in self.layers.iter().enumerate() {
+            l.decode_prestage(
+                token,
+                seq.layer_states[li].as_mut(),
+                self.gpu.as_ref(),
+                stream,
+            )?;
         }
 
         // ── M2 request-scoped LoRA routing (single-seq decode). Upload this
@@ -377,8 +382,8 @@ impl TransformerModel {
             capture_active = false;
             // The recorded attempt consumed per-step prestaged state (PLE's
             // parked table VA); restore it without recomputing.
-            for l in self.layers.iter() {
-                l.decode_prestage_rearm();
+            for (li, l) in self.layers.iter().enumerate() {
+                l.decode_prestage_rearm(seq.layer_states[li].as_mut());
             }
             self.decode_forward_body(
                 hidden,
@@ -427,8 +432,8 @@ impl TransformerModel {
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     // Restore per-step prestaged state the recorded attempt
                     // consumed (see the mid-body arm above).
-                    for l in self.layers.iter() {
-                        l.decode_prestage_rearm();
+                    for (li, l) in self.layers.iter().enumerate() {
+                        l.decode_prestage_rearm(seq.layer_states[li].as_mut());
                     }
                     self.decode_forward_body(
                         hidden,

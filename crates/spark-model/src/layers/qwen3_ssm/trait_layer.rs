@@ -20,9 +20,16 @@ impl TransformerLayer for Qwen3SsmLayer {
 
     /// PLE's host half (hash + NVMe fault-in + slot upload), hoisted before
     /// graph replay/capture. No-op on the 47 layers without a PLE site.
-    fn decode_prestage(&self, token: u32, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+    fn decode_prestage(
+        &self,
+        token: u32,
+        state: &mut dyn LayerState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
         if let Some(ple) = self.ple.as_ref() {
-            ple.prestage(&[token], gpu, stream)?;
+            let st = ple_seq_state(ple, state, gpu)?;
+            ple.prestage(st, &[token], gpu, stream)?;
         }
         Ok(())
     }
@@ -31,23 +38,50 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.ple.is_some()
     }
 
-    fn snapshot_aux(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<Option<Vec<u8>>> {
-        match self.ple.as_ref() {
-            Some(ple) => Ok(Some(ple.snapshot_aux(gpu, stream)?)),
+    fn snapshot_aux(
+        &self,
+        state: &dyn LayerState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(ple) = self.ple.as_ref() else {
+            return Ok(None);
+        };
+        let ssm = state
+            .as_any()
+            .downcast_ref::<crate::layer::SsmLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("PLE host layer state is not SsmLayerState"))?;
+        match ssm.ple.as_ref() {
+            Some(st) => Ok(Some(ple.snapshot_aux(st, gpu, stream)?)),
+            // Sequence never ran this layer (snapshot before first pass):
+            // nothing to carry, and restore-side declines aux-less slots.
             None => Ok(None),
         }
     }
 
-    fn restore_aux(&self, blob: &[u8], gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
-        self.ple
+    fn restore_aux(
+        &self,
+        state: &mut dyn LayerState,
+        blob: &[u8],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let ple = self
+            .ple
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("restore_aux: no PLE on this layer"))?
-            .restore_aux(blob, gpu, stream)
+            .ok_or_else(|| anyhow::anyhow!("restore_aux: no PLE on this layer"))?;
+        let st = ple_seq_state(ple, state, gpu)?;
+        ple.restore_aux(st, blob, gpu, stream)
     }
 
-    fn decode_prestage_rearm(&self) {
-        if let Some(ple) = self.ple.as_ref() {
-            ple.rearm();
+    fn decode_prestage_rearm(&self, state: &mut dyn LayerState) {
+        if let Some(ple) = self.ple.as_ref()
+            && let Some(ssm) = state
+                .as_any_mut()
+                .downcast_mut::<crate::layer::SsmLayerState>()
+            && let Some(st) = ssm.ple.as_mut()
+        {
+            ple.rearm(st);
         }
     }
 
@@ -363,4 +397,21 @@ impl TransformerLayer for Qwen3SsmLayer {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         self.alloc_state_inner(gpu)
     }
+}
+
+/// The PLE per-seq carry from a sequence's [`SsmLayerState`], lazily created
+/// on first use. Errors if the state is not an `SsmLayerState`.
+fn ple_seq_state<'a>(
+    ple: &crate::layers::ple::PleLayer,
+    state: &'a mut dyn LayerState,
+    gpu: &dyn GpuBackend,
+) -> Result<&'a mut crate::layers::ple::PleSeqState> {
+    let ssm = state
+        .as_any_mut()
+        .downcast_mut::<crate::layer::SsmLayerState>()
+        .ok_or_else(|| anyhow::anyhow!("PLE host layer state is not SsmLayerState"))?;
+    if ssm.ple.is_none() {
+        ssm.ple = Some(ple.new_seq_state(gpu)?);
+    }
+    Ok(ssm.ple.as_mut().expect("just created"))
 }

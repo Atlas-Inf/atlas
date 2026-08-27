@@ -111,7 +111,14 @@ impl TransformerModel {
         // not the default.
         let mla_perseq_fallback = self.is_mla_dispatch()
             && std::env::var("ATLAS_MLA_PERSEQ_FALLBACK").is_ok_and(|v| v == "1" || v == "true");
-        if mla_perseq_fallback {
+        // mHC highway models (#753 item B): the batched GDN paths are UNWIRED
+        // (they carry their own residual, which the highway replaces), so the
+        // per-seq loop is the DEFAULT here, not a fallback — each sequence
+        // runs the proven single-row highway decode against its own per-seq
+        // PLE/QSA state, and the host staging below isolates the logits rows.
+        // Batched-highway kernels are the perf follow-up.
+        let hc_perseq = self.config.hc_mult > 0;
+        if mla_perseq_fallback || hc_perseq {
             use std::sync::atomic::Ordering;
             let logits = self.decode_logits_ptr();
             let v = self.config.vocab_size;
@@ -121,6 +128,14 @@ impl TransformerModel {
             // slot-keyed; capturing a graph for one slot inside the same
             // stream-capture window as another slot's replay corrupts both.
             let prev_suppress = self.suppress_graphs.swap(true, Ordering::Relaxed);
+            // The scheduler passes stream 0 (legacy) here, but `decode()`
+            // runs its kernels on the BACKEND default stream — staging the
+            // rows on the caller's stream orders the copies against nothing:
+            // all n copies can execute after the LAST decode and read the
+            // same final row 0 (measured: a clean two-way row swap at every
+            // joint C=2 step, '#753 item B' bring-up). Stage on the stream
+            // the kernels actually use.
+            let copy_stream = self.gpu.default_stream();
             let result = (|| -> Result<()> {
                 let mut staged = vec![0u8; n * row_bytes];
                 for i in 0..n {
@@ -128,17 +143,17 @@ impl TransformerModel {
                     // `decode()` wrote this sequence's logits to row 0.
                     // Pull them to the host before the next `decode()`'s
                     // `zero_all` wipes the buffer. `copy_d2h_on_stream`
-                    // syncs `stream` first, so the eager lm_head GEMV has
-                    // fully landed before the copy reads it.
+                    // syncs `copy_stream` first, so the eager lm_head GEMV
+                    // has fully landed before the copy reads it.
                     self.gpu.copy_d2h_on_stream(
                         logits,
                         &mut staged[i * row_bytes..(i + 1) * row_bytes],
-                        stream,
+                        copy_stream,
                     )?;
                 }
                 // Upload the assembled [n, vocab] batch back to the device.
-                self.gpu.copy_h2d_async(&staged, logits, stream)?;
-                self.gpu.synchronize(stream)?;
+                self.gpu.copy_h2d_async(&staged, logits, copy_stream)?;
+                self.gpu.synchronize(copy_stream)?;
                 Ok(())
             })();
             self.suppress_graphs.store(prev_suppress, Ordering::Relaxed);
@@ -408,6 +423,7 @@ impl TransformerModel {
                             // real one and a stray prefill over it stages
                             // rather than overruns.
                             h_prefill_stage: self.ssm_pool.h_prefill_stage(dummy_ssm_slot),
+                            ple: None,
                         }));
                         ssm_idx += 1;
                     } else {

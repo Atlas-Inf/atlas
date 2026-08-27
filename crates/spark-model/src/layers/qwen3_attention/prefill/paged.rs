@@ -13,6 +13,7 @@ use crate::layers::ops;
 impl Qwen3AttentionLayer {
     pub(in crate::layers::qwen3_attention) fn prefill_attention_paged(
         &self,
+        state: &mut dyn crate::layer::LayerState,
         normed: DevicePtr,
         num_tokens: usize,
         seq_len_start: usize,
@@ -700,7 +701,10 @@ impl Qwen3AttentionLayer {
                 "QSA prefill selection is single-stream (batched paged \
                  prefill is refused upstream for this model)"
             );
+            let qsa_st =
+                crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
             qsa.prefill_select(
+                qsa_st,
                 normed,
                 q_contiguous,
                 attn_out,

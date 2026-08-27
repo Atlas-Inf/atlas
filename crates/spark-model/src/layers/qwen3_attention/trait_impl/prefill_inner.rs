@@ -20,7 +20,7 @@ impl Qwen3AttentionLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_tokens: usize,
-        _state: &mut dyn LayerState,
+        state: &mut dyn LayerState,
         kv_cache: &mut PagedKvCache,
         seq_len_start: usize,
         block_table: &mut Vec<u32>,
@@ -42,7 +42,7 @@ impl Qwen3AttentionLayer {
                 hidden,
                 residual,
                 num_tokens,
-                _state,
+                state,
                 kv_cache,
                 seq_len_start,
                 block_table,
@@ -139,6 +139,7 @@ impl Qwen3AttentionLayer {
         let attn_out = if seq_len_start == 0 && !allow_batched_first_chunk {
             // Chunk 0 (or non-chunked): Flash Attention on contiguous Q/K/V.
             self.prefill_attention_with_cache_skip(
+                state,
                 normed,
                 num_tokens,
                 kv_write_start,
@@ -153,6 +154,7 @@ impl Qwen3AttentionLayer {
             // batched_meta is threaded so prefill_attention_paged uses the
             // batched kernel + block_table_ptrs when set.
             self.prefill_attention_paged(
+                state,
                 normed,
                 num_tokens,
                 seq_len_start,
@@ -531,7 +533,7 @@ impl Qwen3AttentionLayer {
         hidden: DevicePtr,
         _residual: DevicePtr,
         num_tokens: usize,
-        _state: &mut dyn LayerState,
+        state: &mut dyn LayerState,
         kv_cache: &mut PagedKvCache,
         seq_len_start: usize,
         block_table: &mut Vec<u32>,
@@ -661,7 +663,8 @@ impl Qwen3AttentionLayer {
         // steps select against these; prefill queries beyond the inert bound
         // still run dense (one-time WARN inside).
         if let Some(ref qsa) = self.qsa {
-            qsa.prefill_ingest(normed, num_tokens, seq_len_start, ctx.gpu, stream)?;
+            let st = crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
+            qsa.prefill_ingest(st, normed, num_tokens, seq_len_start, ctx.gpu, stream)?;
         }
 
         if batched_meta.is_some() && seq_len_start == 0 {
@@ -672,6 +675,7 @@ impl Qwen3AttentionLayer {
         }
         let attn_out = if seq_len_start == 0 {
             self.prefill_attention_with_cache_skip(
+                state,
                 normed,
                 num_tokens,
                 kv_write_start,
@@ -683,6 +687,7 @@ impl Qwen3AttentionLayer {
             )?
         } else {
             self.prefill_attention_paged(
+                state,
                 normed,
                 num_tokens,
                 seq_len_start,

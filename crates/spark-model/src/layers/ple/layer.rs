@@ -17,14 +17,11 @@ use crate::layers::ngram_embed::NgramTable;
 use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
-/// Per-sequence carry: the dilated conv's 9 steps and the token history the
-/// id hash needs.
-///
-/// **One sequence at a time.** v1 refuses the batched and multi-sequence
-/// decode paths (`refuse_batched_under_hc`), so a single state here is
-/// correct rather than merely convenient — and `reset` at every prefill start
-/// is what keeps one request's lexical context out of the next one's.
-struct PleState {
+/// Per-SEQUENCE carry: the dilated conv's 9 steps and the token history the
+/// id hash needs. Owned by the sequence's [`crate::layer::SsmLayerState`]
+/// (Avarok #753 item B: concurrency needs one of these per in-flight
+/// sequence, not a layer singleton).
+pub struct PleSeqState {
     /// `[(k-1)*dilation, channels]` FP32, device.
     conv: DevicePtr,
     /// The last `context_len` token ids, EOS-filled at a sequence start.
@@ -76,8 +73,6 @@ pub struct PleLayer {
     out: DevicePtr,
     slots_dev: DevicePtr,
     max_tokens: usize,
-
-    state: std::sync::Mutex<PleState>,
 }
 
 impl PleLayer {
@@ -136,17 +131,22 @@ impl PleLayer {
             out: gpu.alloc(max_tokens * c * 4)?,
             slots_dev: gpu.alloc(max_tokens * heads * 4)?,
             max_tokens,
-            state: std::sync::Mutex::new(PleState {
-                conv: gpu.alloc(state_len * c * 4)?,
-                history: Vec::new(),
-                prestaged_va: None,
-                last_staged_va: 0,
-            }),
+        })
+    }
+
+    /// Allocate one sequence's PLE carry (conv buffer + empty history).
+    /// `reset` runs on first use (`fresh`), so contents start undefined.
+    pub fn new_seq_state(&self, gpu: &dyn GpuBackend) -> Result<PleSeqState> {
+        Ok(PleSeqState {
+            conv: gpu.alloc(self.state_len * self.hc_mult * self.hidden * 4)?,
+            history: Vec::new(),
+            prestaged_va: None,
+            last_staged_va: 0,
         })
     }
 
     /// Fresh sequence: EOS-filled history and a zeroed conv state.
-    fn reset(&self, st: &mut PleState, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+    fn reset(&self, st: &mut PleSeqState, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
         st.history = vec![self.dims.eos_token_id; self.dims.context_len()];
         st.prestaged_va = None;
         let zeros = vec![0u8; self.state_len * self.hc_mult * self.hidden * 4];
@@ -164,13 +164,15 @@ impl PleLayer {
     ///
     /// History advances HERE; the prestaged `forward` must not advance it
     /// again.
-    pub fn prestage(&self, tokens: &[u32], gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("PLE state mutex poisoned"))?;
+    pub fn prestage(
+        &self,
+        st: &mut PleSeqState,
+        tokens: &[u32],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
         if st.history.len() != self.dims.context_len() {
-            self.reset(&mut st, gpu, stream)?;
+            self.reset(st, gpu, stream)?;
         }
         let mut window = st.history.clone();
         window.extend_from_slice(tokens);
@@ -190,10 +192,8 @@ impl PleLayer {
 
     /// Restore the prestaged state after a failed CUDA-graph capture attempt
     /// (the eager replay re-runs `forward`, which consumed `prestaged_va`).
-    pub fn rearm(&self) {
-        if let Ok(mut st) = self.state.lock()
-            && st.last_staged_va != 0
-        {
+    pub fn rearm(&self, st: &mut PleSeqState) {
+        if st.last_staged_va != 0 {
             st.prestaged_va = Some(st.last_staged_va);
         }
     }
@@ -203,6 +203,7 @@ impl PleLayer {
     /// `fresh` starts a new sequence (prefill from position 0).
     pub fn forward(
         &self,
+        st: &mut PleSeqState,
         highway: DevicePtr,
         num_tokens: usize,
         fresh: bool,
@@ -254,10 +255,6 @@ impl PleLayer {
                 .collect()
         };
 
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("PLE state mutex poisoned"))?;
         // A prestage staged for a REPLAYED decode step is consumed by the
         // graph, not by this forward (which never runs on replay) — so a
         // `Some` here on a prefill call is ordinary leftover from the
@@ -265,7 +262,7 @@ impl PleLayer {
         // single-token, non-fresh decode may consume it.
         let prestaged = st.prestaged_va.take().filter(|_| num_tokens == 1 && !fresh);
         if fresh || st.history.len() != self.dims.context_len() {
-            self.reset(&mut st, gpu, stream)?;
+            self.reset(st, gpu, stream)?;
         }
 
         if let Some(table_va) = prestaged {

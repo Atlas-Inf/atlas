@@ -18,7 +18,7 @@ impl Qwen3AttentionLayer {
         &self,
         hidden: DevicePtr,
         residual: DevicePtr,
-        _state: &mut dyn LayerState,
+        state: &mut dyn LayerState,
         kv_cache: &mut PagedKvCache,
         seq_len: usize,
         block_table: &mut Vec<u32>,
@@ -34,7 +34,7 @@ impl Qwen3AttentionLayer {
             return self.decode_inner_hc(
                 hidden,
                 residual,
-                _state,
+                state,
                 kv_cache,
                 seq_len,
                 block_table,
@@ -90,6 +90,7 @@ impl Qwen3AttentionLayer {
         }
 
         let attn_out = self.attention_forward(
+            state,
             normed,
             seq_len,
             block_table,
@@ -442,7 +443,7 @@ impl Qwen3AttentionLayer {
         &self,
         hidden: DevicePtr,
         _residual: DevicePtr,
-        _state: &mut dyn LayerState,
+        state: &mut dyn LayerState,
         kv_cache: &mut PagedKvCache,
         seq_len: usize,
         block_table: &mut Vec<u32>,
@@ -551,6 +552,7 @@ impl Qwen3AttentionLayer {
         }
 
         let attn_out = self.attention_forward(
+            state,
             normed,
             seq_len,
             block_table,

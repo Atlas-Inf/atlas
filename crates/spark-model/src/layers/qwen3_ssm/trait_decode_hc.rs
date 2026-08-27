@@ -92,7 +92,11 @@ impl Qwen3SsmLayer {
         // Decode never starts a sequence — prefill did — so `fresh` is false
         // and the conv state plus the 2-token history carry from the last step.
         if let Some(ple) = self.ple.as_ref() {
-            ple.forward(streams, 1, false, ctx, stream)?;
+            let st = ssm_state
+                .ple
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("PLE decode before prefill: no seq state"))?;
+            ple.forward(st, streams, 1, false, ctx, stream)?;
         }
         stage!("ple");
 

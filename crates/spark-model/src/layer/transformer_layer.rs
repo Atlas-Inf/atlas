@@ -73,14 +73,20 @@ pub trait TransformerLayer: Send + Sync {
     /// graph replay/capture — the same phasing as the `token_ids` upload —
     /// so the captured graph contains only kernels over stable device
     /// buffers. Layers with no host-side decode work keep the no-op default.
-    fn decode_prestage(&self, _token: u32, _gpu: &dyn GpuBackend, _stream: u64) -> Result<()> {
+    fn decode_prestage(
+        &self,
+        _token: u32,
+        _state: &mut dyn LayerState,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
         Ok(())
     }
 
     /// Re-arm consumed prestage state so a failed CUDA-graph capture attempt
     /// can re-run the SAME step eagerly. Must be idempotent, and must not
     /// recompute (PLE's history already advanced in `decode_prestage`).
-    fn decode_prestage_rearm(&self) {}
+    fn decode_prestage_rearm(&self, _state: &mut dyn LayerState) {}
 
     /// True when this layer's decode can NEVER be captured into a CUDA
     /// graph — e.g. the QSA indexer's host top-k round trip, whose captured
@@ -98,7 +104,12 @@ pub trait TransformerLayer: Send + Sync {
     /// request's lexical state. Called at chunk-boundary snapshot saves;
     /// any D2H inside must be stream-ordered (`copy_d2h_on_stream`).
     /// Default: the layer carries no aux sequence state.
-    fn snapshot_aux(&self, _gpu: &dyn GpuBackend, _stream: u64) -> Result<Option<Vec<u8>>> {
+    fn snapshot_aux(
+        &self,
+        _state: &dyn LayerState,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
 
@@ -110,7 +121,13 @@ pub trait TransformerLayer: Send + Sync {
 
     /// Restore the aux state captured by [`Self::snapshot_aux`] on a
     /// prefix-cache hit, BEFORE the resumed prefill runs.
-    fn restore_aux(&self, _blob: &[u8], _gpu: &dyn GpuBackend, _stream: u64) -> Result<()> {
+    fn restore_aux(
+        &self,
+        _state: &mut dyn LayerState,
+        _blob: &[u8],
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
         anyhow::bail!("restore_aux on a layer with no aux state")
     }
 

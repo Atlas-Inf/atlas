@@ -227,7 +227,7 @@ impl TransformerModel {
                         stream,
                     )?;
                     if let Some(aux) = self.ssm_snapshots.aux(snap_id) {
-                        self.apply_aux_states(&aux, stream)?;
+                        self.apply_aux_states(seq, &aux, stream)?;
                     }
                     if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
                         self.ssm_pool.debug_state_checksum(

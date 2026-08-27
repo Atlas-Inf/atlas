@@ -58,4 +58,4 @@ pub mod dump;
 mod layer;
 
 pub use ids::{PleIdDims, ple_ngram_ids};
-pub use layer::{PleLayer, PleWeights};
+pub use layer::{PleLayer, PleSeqState, PleWeights};

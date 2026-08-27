@@ -33,6 +33,23 @@ pub trait LayerState: Send + Sync {
 /// (e.g., attention layers where KV is in `PagedKvCache`).
 pub struct EmptyLayerState;
 
+/// Attention-layer per-sequence state. KV lives in `PagedKvCache`; the only
+/// resident piece is the QSA indexer carry on the 12 qwen4_exp
+/// full-attention layers (Avarok #753 item B).
+#[derive(Default)]
+pub struct AttnLayerState {
+    pub qsa: Option<crate::layers::qsa::QsaSeqState>,
+}
+
+impl LayerState for AttnLayerState {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 impl LayerState for EmptyLayerState {
     fn as_any(&self) -> &dyn Any {
         self
@@ -89,6 +106,10 @@ pub struct SsmLayerState {
     /// has, and not one byte moves. The same blob is shared by every layer
     /// of the sequence (see `SsmStatePool::h_prefill_stage`).
     pub h_prefill_stage: Option<DevicePtr>,
+    /// PLE per-sequence carry (n-gram history + dilated-conv state), present
+    /// only on the layer that hosts a `PleLayer` (Avarok #753 item B: one per
+    /// in-flight sequence, lazily created on the sequence's first pass).
+    pub ple: Option<crate::layers::ple::PleSeqState>,
 }
 
 impl LayerState for SsmLayerState {

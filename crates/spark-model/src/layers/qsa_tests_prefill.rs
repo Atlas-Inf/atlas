@@ -56,7 +56,9 @@ fn qsa_prefill_select_sets_match_reference() {
     )
     .unwrap();
     let hidden_dev = upload(g, &bin("hidden"));
-    qsa.prefill_ingest(hidden_dev, t_all, 0, g, stream).unwrap();
+    let mut qst = qsa.new_seq_state(g).unwrap();
+    qsa.prefill_ingest(&mut qst, hidden_dev, t_all, 0, g, stream)
+        .unwrap();
 
     let q_row = nq as usize * hd_attn;
     let q_roped = g.alloc(t_all * q_row * 2).unwrap();
@@ -74,6 +76,7 @@ fn qsa_prefill_select_sets_match_reference() {
         .unwrap();
 
     qsa.prefill_select(
+        &mut qst,
         hidden_dev,
         q_roped,
         attn_ctx,

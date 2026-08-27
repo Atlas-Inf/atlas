@@ -278,7 +278,7 @@ impl TransformerModel {
                     // This fn is infallible; an aux collection failure just
                     // leaves the slot aux-less (aux-carrying models then
                     // decline it on restore — a slower miss, never stale).
-                    match self.collect_aux_states(stream) {
+                    match self.collect_aux_states(seq, stream) {
                         Ok(aux) if !aux.is_empty() => {
                             self.ssm_snapshots.set_aux(snap_id, aux);
                         }

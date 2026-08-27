@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-use super::QsaIndexer;
+use super::{QsaIndexer, QsaSeqState};
 use crate::layers::ops;
 
 impl QsaIndexer {
@@ -24,6 +24,7 @@ impl QsaIndexer {
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_select(
         &self,
+        st: &mut QsaSeqState,
         normed: DevicePtr,
         q_roped: DevicePtr,
         attn_ctx: DevicePtr,
@@ -189,7 +190,7 @@ impl QsaIndexer {
                 gpu,
                 self.k_score_rows_k,
                 qpost,
-                self.block_keys,
+                st.block_keys,
                 scores,
                 rows as u32,
                 n_blocks_max as u32,
