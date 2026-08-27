@@ -12,14 +12,28 @@ source, or (b) verified by the local gate below.
 
 ## The local gate (no GPU, no nvcc)
 
-`scripts/dev/qwen4exp_local_gate.sh` — 13 gates, ~2,800 tests, no CUDA:
+`scripts/dev/qwen4exp_local_gate.sh` — 16 gates, 3,468 tests, no CUDA:
 
 ```
 compile   libs+bins cuda · touched crates all-targets cuda · metal build
-tests     atlas-core 158 · spark-server 2306 · spark-storage 87 · spark-runtime 272
-repo CI   SPDX headers · kernel shadow structure · 500-LoC cap
+tests     atlas-core 158 · spark-server 2306 · spark-model 645
+          spark-storage 87 · spark-runtime 272
+repo CI   SPDX headers · kernel shadow structure · qwen4_exp kernel NAMES
+          500-LoC cap
 lint      fmt · clippy
 ```
+
+`check_qwen4exp_kernel_names.py` is new and is the one class of startup failure
+a laptop can rule out: kernel lookups are two STRING literals, so `cargo check`
+cannot see a typo — and a name that resolves in ANOTHER model's shadow is worse
+than one that does not resolve at all (`hyper_connection` belongs to
+DeepSeek-V4's Sinkhorn mHC as well as to this target's low-rank one; the same
+name over a different argument list is a segfault or, worse, plausible
+numbers). It walks the target's real `.cu` files — through the symlinks into
+`qwen3.6-35b-a3b`, plus everything inherited from `common/` — and checks all 37
+names the qwen4_exp path asks for, including the three sigmoid twins that are
+built by name construction and so are invisible to a grep. Both failure modes
+have a proven negative control.
 
 Two env vars are the whole trick: `ATLAS_SKIP_BUILD=1` makes atlas-kernels'
 `build.rs` emit a type-checkable stub instead of invoking nvcc, and
@@ -49,6 +63,7 @@ test is `#[ignore]`d and unexecuted.
 | 3. config surface reconciled | **DONE** — one parser, both field families, 158 tests pass |
 | 4. clippy + fmt + SPDX | **DONE** — clean |
 | 5. oracle gate on the SERVING kernels | **DONE** — mHC (4 entry points, 3 dispatch arms) and the whole PLE chain, no checkpoint needed |
+| 5b. kernel NAME resolution checked statically | **DONE** — 37/37 resolve; both failure modes have negative controls |
 | 6. recipe + serve wiring | **DONE** — vendored recipe (census tests validate it produces a valid serve config), serve script hardened for >8K |
 | 7. `--generate N` off-by-one | **DONE** |
 | 8. docs + CHANGELOG | **DONE** |
@@ -224,10 +239,12 @@ construction under that last one — it exists to bisect the mHC spine).
 
 * Nothing here has run on hardware. Every number in this log is either quoted
   from #754/#13 with its source, or produced by the local gate.
-* `spark-model`'s lib tests do not COMPILE under `metal` (17 pre-existing
-  errors in test code that assumes the cuda backend), so that crate's unit
-  tests are type-checked under cuda here but only RUN on the box. Worth fixing
-  to widen the gate; out of scope for this port.
+* ~~`spark-model`'s lib tests do not compile under `metal`~~ — FIXED. Five GPU
+  parity modules were gated on `test` alone, so one unavailable backend took
+  the whole crate's unit suite with it. Gated on `all(test, feature = "cuda")`
+  and 645 tests now run locally. The `tests/` integration targets
+  (`arm2_leg2_decode`, `moe_lora_delta_parity`) still need cuda to link; that
+  is pre-existing and outside this port.
 * `qsa_golden.npz` is gitignored, so the QSA parity tests need regenerating
   from the checkpoint before they can run. The new oracle gate covers mHC and
   PLE but not QSA — there is no CPU oracle for the indexer yet, and writing one

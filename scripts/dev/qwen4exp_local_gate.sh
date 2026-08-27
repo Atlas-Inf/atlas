@@ -97,6 +97,11 @@ echo "── repo CI gates that need no toolchain ──────────
 # is easy to breach by adding a comment.
 run "SPDX headers"           python3 scripts/check_spdx.py
 run "kernel shadow structure" python3 scripts/check_kernel_shadows.py
+# Kernel names are STRING literals, so `cargo check` cannot see a typo — and a
+# name that resolves in another model's shadow is worse than one that does not
+# resolve at all. Milliseconds, and it rules out a whole class of startup
+# failure a laptop otherwise cannot touch.
+run "qwen4_exp kernel names"  python3 scripts/dev/check_qwen4exp_kernel_names.py
 loc_cap() {
   local over=0
   while IFS= read -r f; do
