@@ -567,7 +567,7 @@ mod qwen4exp_hc_tests {
         cfg.hc_mult = 0;
         cfg.hc_count = 4;
         cfg.hidden_size = 2560;
-        let sizes = BufferSizes::new(&cfg, 128, 2048, 16, 1);
+        let sizes = BufferSizes::from_config(&cfg, 128, 2048, 16, 1);
         // bf16, because `q4e_hc_stream_mix` and `q4e_hc_scatter_add` stride by
         // __nv_bfloat16. f32 here would not fail — it would read the wrong half
         // of every value.
@@ -583,7 +583,7 @@ mod qwen4exp_hc_tests {
         cfg.hc_mult = 4;
         cfg.hc_count = 0;
         cfg.hidden_size = 2560;
-        let sizes = BufferSizes::new(&cfg, 128, 2048, 16, 1);
+        let sizes = BufferSizes::from_config(&cfg, 128, 2048, 16, 1);
         assert_eq!(sizes.hc_streams, 128 * 4 * 2560 * 4);
     }
 
@@ -594,7 +594,7 @@ mod qwen4exp_hc_tests {
         let cfg = ModelConfig::qwen3_next_80b_nvfp4();
         assert_eq!(cfg.hc_mult, 0);
         assert_eq!(cfg.hc_count, 0);
-        let sizes = BufferSizes::new(&cfg, 128, 2048, 16, 1);
+        let sizes = BufferSizes::from_config(&cfg, 128, 2048, 16, 1);
         assert_eq!(sizes.hc_streams, 256);
     }
 }
