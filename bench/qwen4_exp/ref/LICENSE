@@ -1,0 +1,65 @@
+The two files in this directory are VENDORED VERBATIM from HuggingFace
+Transformers and are licensed Apache-2.0, not AGPL-3.0. Their original
+copyright headers are intact and must stay that way.
+
+    modeling_qwen4_exp.py
+    configuration_qwen4_exp.py
+
+    from: https://github.com/huggingface/transformers
+          src/transformers/models/qwen4_exp/
+    at:   transformers 5.8.0.dev0 (the revision the Qwen3.8-Flash-Next
+          transcriptions in this repo were read against)
+
+WHY A COPY EXISTS, given that nothing imports it.
+
+Every golden generator here — `hc_golden.py`, `ple_golden.py`, `qsa_golden.py`,
+`forward_ref.py`, `slice_ref.py` — imports from the INSTALLED `transformers`
+package, so this directory could be deleted without breaking a test or a
+generator. It is kept for two reasons:
+
+  1. The transcriptions cite it by LINE NUMBER (for example
+     `kernels/gb10/qwen3.8-flash-next/nvfp4/ple.cu` cites
+     `modeling_qwen4_exp.py L1168` for the PLE forward). A citation into a
+     moving upstream file stops resolving; a citation into a pinned copy does
+     not.
+  2. The generators now run against `transformers` 5.16.1 while the
+     transcriptions were made against 5.8.0.dev0. This copy is the only record
+     of the text that was actually transcribed, which is what an argument about
+     a numerical disagreement would need.
+
+So the copy is documentation of provenance, not a dependency. If it is ever
+dropped, the line-number citations should become revision-pinned URLs in the
+same change.
+
+HOW THIS DIFFERS FROM `bench/ngram_embed/LICENSE`. That notice covers an
+INDEPENDENT DERIVATION — no upstream file vendored, the MIT notice travelling
+with the derivation because it is close enough to the published implementation.
+This one covers actual vendored files, so Apache-2.0 applies to them directly.
+
+The Rust in `crates/` is not a transliteration of these files and remains
+AGPL-3.0-only; `docs/porting/QWEN4_EXP.md` carries the attribution for the
+mechanisms derived from them.
+
+Note on scope: `.licenserc.yaml` checks `crates/**/*.rs` and `kernels/**` only,
+so nothing here is stamped with an Atlas SPDX header, and nothing should be.
+
+--------------------------------------------------------------------------------
+
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+   The full text of the Apache License 2.0 is available at the URL above and
+   in the headers of both files in this directory.

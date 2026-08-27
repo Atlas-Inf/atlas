@@ -315,6 +315,37 @@ If step 7 misbehaves, the kill switches are the bisect: `ATLAS_QSA_DISABLE=1`,
 `ATLAS_DEBUG_NO_GRAPH=1`, `ATLAS_QWEN4EXP_NO_PLE=1` (output is wrong by
 construction under that last one — it exists to bisect the mHC spine).
 
+## The vendored-reference question, resolved with evidence
+
+I flagged this as "needs a maintainer call" and then went and got the facts, so
+the call is now cheap:
+
+* **Nothing imports it.** All five golden generators (`hc_golden.py`,
+  `ple_golden.py`, `qsa_golden.py`, `forward_ref.py`, `slice_ref.py`) import
+  from the INSTALLED `transformers`. `bench/qwen4_exp/ref/` could be deleted
+  without breaking a test or a generator. Every other reference to it is a
+  comment or a doc.
+* **But one citation is by line number.** `ple.cu:7` cites
+  `modeling_qwen4_exp.py L1168` for the PLE forward, and that only resolves
+  against a pinned copy.
+* **And the revision moved under us.** The transcriptions were read against
+  transformers 5.8.0.dev0; the generators now run 5.16.1. The copy is the only
+  record of the text actually transcribed — which is what an argument about a
+  numerical disagreement would need.
+* **It is outside the SPDX check.** `.licenserc.yaml` covers `crates/**/*.rs`
+  and `kernels/**` only, so nothing there is stamped AGPL and nothing should be.
+  No compliance failure; the Apache-2.0 headers are intact.
+
+**Recommendation: keep it, and carry the notice properly** — which is what
+`bench/qwen4_exp/ref/LICENSE` now does, following the `bench/ngram_embed/LICENSE`
+precedent. Ours is the stronger case: that one covers an independent derivation
+with no vendored file, this one covers actual vendored files, so Apache-2.0
+applies to them directly. If the directory is ever dropped, the line-number
+citations should become revision-pinned URLs in the same change — the notice
+says so.
+
+This does not need to block the PR either way.
+
 ## Still open, and honest about it
 
 * Nothing here has run on hardware. Every number in this log is either quoted
