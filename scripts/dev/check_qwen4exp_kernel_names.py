@@ -144,6 +144,29 @@ def main() -> int:
                 bad += 1
                 print(f"MISSING {module}::{name} (built by name construction)")
 
+    # `[expected_absent]` documents the probe-and-fall-back twins this target
+    # deliberately does not ship, and is what takes the fail-closed startup
+    # audit from 6 unresolved kernels to 0. A STALE entry — a name listed as
+    # absent that is in fact present — is the mirror-image hazard: it tells the
+    # audit to stop looking at something that changed.
+    absent_stale = 0
+    absent_total = 0
+    toml_path = os.path.join(os.path.dirname(TARGET), "MODEL.toml")
+    if os.path.exists(toml_path):
+        toml = open(toml_path, encoding="utf-8").read()
+        for module, body in re.findall(
+            r"\[expected_absent\.([\w]+)\]\n(.*?)(?=\n\[|\Z)", toml, flags=re.S
+        ):
+            for name in re.findall(r"^([A-Za-z0-9_]+)\s*=", body, flags=re.M):
+                absent_total += 1
+                if name in available.get(module, set()):
+                    absent_stale += 1
+                    print(
+                        f"STALE expected_absent.{module}::{name}: listed as absent "
+                        "but this target ships it"
+                    )
+    bad += absent_stale
+
     checked = len(requested) + sum(len(v) for v in CONSTRUCTED.values())
     if bad:
         print(f"\nqwen4_exp kernel names: {bad} of {checked} unresolvable")
@@ -151,7 +174,8 @@ def main() -> int:
     print(
         f"qwen4_exp kernel names: OK "
         f"({checked} checked against {total} entry points in "
-        f"{len(available)} modules)"
+        f"{len(available)} modules; {absent_total} expected_absent entries, "
+        "none stale)"
     )
     return 0
 
