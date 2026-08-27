@@ -34,6 +34,17 @@ import urllib.request
 
 TIMEOUT = 600
 
+# Sampling is DELIBERATELY not pinned. Qwen3.8-Flash-Next's card declares
+# thinking temperature=1.0 top_p=0.95 top_k=20, and
+# `kernels/gb10/qwen3.8-flash-next/MODEL.toml` sets
+# `use_sampling_presets_for_core = true` so a plain request gets those rather
+# than Atlas's generic CLI defaults. Sending `temperature: 0` overrides the
+# lot and puts a thinking MoE into greedy decode, which loops on its own
+# ("408 408 408", "The capital of France is Paris." repeated) — a decoding
+# artefact that reads exactly like a broken port. Pass --temperature only to
+# investigate; the default is to test the model as it is meant to be served.
+SAMPLING: dict = {}
+
 
 def post(base: str, path: str, body: dict, timeout: int = TIMEOUT) -> dict:
     data = json.dumps(body).encode()
@@ -182,7 +193,7 @@ def run_coherence(base: str, model: str, verbose: bool) -> list:
     for name, msgs, check in COHERENCE:
         t0 = time.time()
         try:
-            r = chat(base, msgs, model=model, max_tokens=768, temperature=0.0)
+            r = chat(base, msgs, model=model, max_tokens=768, **SAMPLING)
             txt = text_of(r)
             ok = bool(check(norm(txt)))
             note = txt.replace('\n', ' ')[:90]
@@ -202,7 +213,7 @@ def run_tools(base: str, model: str, verbose: bool) -> list:
         try:
             r = chat(base, [{'role': 'user', 'content': prompt}], model=model,
                      tools=TOOLS, tool_choice='auto', max_tokens=768,
-                     temperature=0.0)
+                     **SAMPLING)
             got = calls_of(r)
             names = [g[0] for g in got]
             mode = got[0][2] if got else 'none'
@@ -228,7 +239,7 @@ def one_stream(base: str, model: str, max_tokens: int, out: list, idx: int) -> N
     t0 = time.time()
     try:
         r = chat(base, [{'role': 'user', 'content': PERF_PROMPT}], model=model,
-                 max_tokens=max_tokens, temperature=0.0)
+                 max_tokens=max_tokens, **SAMPLING)
         u = r.get('usage') or {}
         out[idx] = (time.time() - t0, u.get('completion_tokens'),
                     u.get('prompt_tokens'), None)
@@ -286,8 +297,14 @@ def main() -> int:
     ap.add_argument('--max-tokens', type=int, default=128)
     ap.add_argument('--wait', type=int, default=0,
                     help='minutes to wait for the server to come up first')
+    ap.add_argument('--temperature', type=float, default=None,
+                    help='override sampling; omit to use the model card presets')
     ap.add_argument('--verbose', action='store_true')
     args = ap.parse_args()
+    if args.temperature is not None:
+        SAMPLING['temperature'] = args.temperature
+        print(f'temperature pinned to {args.temperature} — card presets '
+              f'OVERRIDDEN (greedy loops are expected at 0.0)')
 
     if args.wait and not wait_healthy(args.base, args.wait):
         return 2

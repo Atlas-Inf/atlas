@@ -8,6 +8,7 @@ use anyhow::Result;
 use spark_runtime::gpu::GpuBackend;
 
 use super::{PleLayer, PleSeqState};
+use crate::layers::ngram_embed::NgramTable;
 use crate::layers::ple::ids::ple_ngram_ids;
 
 impl PleLayer {
@@ -102,6 +103,44 @@ impl PleLayer {
         st.history = window[window.len() - keep..].to_vec();
         st.prestaged_va = Some(va);
         st.last_staged_va = va;
+        Ok(())
+    }
+
+    /// Release the pins taken by the PREVIOUS gather, after a stream sync.
+    ///
+    /// A pin marks a slot the batch in flight may still read, and `victim`
+    /// refuses to evict one — but only while the pin OUTLIVES the gather
+    /// kernel. It used to be dropped at the bottom of `gather_host`, i.e.
+    /// before `gather_embed` had even LAUNCHED the kernel (and on the
+    /// prestage path, a whole graph replay before it). A later `resolve`
+    /// could then take the slot as a victim and `fetch_into` would rewrite
+    /// it FROM THE HOST under the pending kernel. The arena is coherent
+    /// unified memory on GB10, so that write is visible to the GPU at
+    /// once: the gather returned other tokens' rows, the model got a
+    /// corrupted input embedding, and it reasoned coherently about text
+    /// nobody sent it ("the user has simply sent FDFDFDFFDFD"). It grew
+    /// worse as the cache filled and evictions began.
+    ///
+    /// Called from the TOP of the next `gather_host`, which makes the pin
+    /// cover the kernel: the sync guarantees every previously issued gather —
+    /// a replayed graph's included — has completed, so nothing can still be
+    /// reading the slots being freed. Legal there because `gather_host` is
+    /// already capture-illegal (its pageable H2D is why `prestage` exists),
+    /// so it never runs inside a capture region.
+    ///
+    /// Costs one stream sync per forward. An event recorded after
+    /// `gather_embed` would avoid the full barrier; correctness first.
+    pub(super) fn release_prev_pins(
+        table: &mut NgramTable,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        gpu.synchronize(stream)?;
+        #[cfg(feature = "cuda")]
+        if let NgramTable::Cached(cache) = table {
+            cache.end_batch();
+        }
+        let _ = table;
         Ok(())
     }
 }

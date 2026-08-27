@@ -385,6 +385,9 @@ impl PleLayer {
             .table
             .lock()
             .map_err(|_| anyhow::anyhow!("PLE table mutex poisoned"))?;
+
+        // Release the PREVIOUS batch's pins. See `release_prev_pins`.
+        Self::release_prev_pins(&mut table, gpu, stream)?;
         let table_va = match &mut *table {
             #[cfg(feature = "cuda")]
             NgramTable::Cached(cache) => {
@@ -416,7 +419,10 @@ impl PleLayer {
                 let bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
                 gpu.copy_h2d_async(&bytes, self.slots_dev, stream)?;
                 let va = cache.table_dev_va()?;
-                cache.end_batch();
+                // NOTE: the pins are NOT released here. They are released at
+                // the TOP of the next `gather_host`, after a stream sync — see
+                // the comment there. Releasing them at this point is what
+                // produced garbage input embeddings.
                 DevicePtr(va)
             }
             NgramTable::Bf16(w) => {
