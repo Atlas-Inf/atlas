@@ -620,7 +620,7 @@ pub fn gdn_forward(dims: &GdnDims, w: &GdnWeights<'_>, hidden: &[f32]) -> Vec<f3
             let beta = sigmoid(b[head]);
             let state = &mut recurrent[head * kd * vd..(head + 1) * kd * vd];
             let out = &mut context[t * value_dim + head * vd..t * value_dim + (head + 1) * vd];
-            out.copy_from_slice(&gdn_delta_step(state, &q, &k, v, decay, beta, kd, vd));
+            out.copy_from_slice(&gdn_delta_step(state, &q, &k, v, decay, beta));
         }
     }
 
@@ -692,7 +692,8 @@ pub fn broadcast_inject(mixed: &[f32], injection: &[f32], hidden: usize) -> Vec<
 /// `q` must already be L2-normalised AND scaled by `1/sqrt(key_head_dim)`;
 /// `k` L2-normalised. `decay` is `exp(g_t)`, `beta` is `sigmoid(b_t)`. The
 /// state is `[key_head_dim, value_head_dim]` with the value dim contiguous,
-/// which is the layout Atlas's `gated_delta_rule_decode` kernel expects.
+/// which is the layout Atlas's `gated_delta_rule_decode` kernel expects. Both
+/// dims are read off `k` and `v` rather than passed in.
 ///
 /// The order matters and is not the obvious one: decay the state FIRST, then
 /// measure how wrong its recall of `v` is, then correct by that error scaled by
@@ -705,9 +706,12 @@ pub fn gdn_delta_step(
     v: &[f32],
     decay: f32,
     beta: f32,
-    key_dim: usize,
-    value_dim: usize,
 ) -> Vec<f32> {
+    // Both dims are already pinned by the slices, so taking them as parameters
+    // only creates a way for a caller to disagree with its own data.
+    let key_dim = k.len();
+    let value_dim = v.len();
+    assert_eq!(q.len(), key_dim, "q and k are both key_head_dim");
     assert_eq!(state.len(), key_dim * value_dim);
     for value in state.iter_mut() {
         *value *= decay;

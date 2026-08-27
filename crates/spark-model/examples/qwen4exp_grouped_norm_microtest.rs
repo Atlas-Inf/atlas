@@ -655,8 +655,6 @@ fn gdn_decode_step(g: &dyn GpuBackend) -> Result<()> {
             &vr[head * VD..(head + 1) * VD],
             decay[head],
             beta[head],
-            KD,
-            VD,
         ));
     }
 
