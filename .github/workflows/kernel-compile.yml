@@ -90,6 +90,40 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # ONE cargo invocation builds what BOTH remaining steps need.
+      #
+      # This was `cargo build -p atlas-kernels`, and the job then paid for the
+      # kernel build twice. Measured on run 33017672173:
+      #
+      #     dev  profile  475/4303 unique nvcc invocations   2m 27s
+      #     test profile  475/4303 unique nvcc invocations   2m 18s   <- identical
+      #     the tests themselves                             ~2s
+      #
+      # Reproduced on a GB10 with ATLAS_SKIP_BUILD=1, which isolates the cargo
+      # graph from nvcc: `cargo build` then `cargo test` leaves TWO build-script
+      # output directories with different metadata hashes
+      # (atlas-kernels-71f8870684ff01d3, atlas-kernels-b03f426489938d35), so
+      # build.rs — and every nvcc call it makes — runs once per directory.
+      #
+      # The cause is in `crates/atlas-kernels/Cargo.toml`: `toml` is declared in
+      # BOTH `[build-dependencies]` and `[dev-dependencies]`. `cargo build`
+      # resolves the graph without dev-dependencies; `cargo test` pulls them in,
+      # which re-fingerprints the build script and forces a second run. Fixing
+      # it in Cargo.toml would mean restructuring a dependency that the tests
+      # legitimately need, so it is fixed here instead: compile through the
+      # TEST graph up front, and the `--ignored` step below reuses it.
+      #
+      # Same graph twice = a cache hit, verified on the GB10: the second
+      # invocation recompiled nothing and returned in 0.05s.
+      #
+      # Deliberately NOT cached with Swatinem/rust-cache. That was the first
+      # plan and the measurement killed it: the whole dependency tree is seven
+      # small crates (winnow, toml_write, toml_datetime, serde_spanned,
+      # toml_edit, toml, atlas-closure) totalling ~3s of compilation. There is
+      # nothing to cache — the job's time is nvcc, which is the point of the
+      # job — and a restored `target/` would additionally make the assertion in
+      # the next step vacuous by leaving a previous run's real `target_ptx.rs`
+      # on disk.
       - name: Compile every gb10 kernel target
         env:
           # ★ NOT set to 1. That is the whole point of this job.
@@ -107,7 +141,9 @@ jobs:
           # promotion ("clippy for kernels"). Reimplementing any of that here
           # would create a second source of truth that drifts silently — and
           # would be a weaker check than the one it imitates.
-          cargo build -p atlas-kernels 2>&1 | tail -40
+          # `--no-run` builds the lib AND the test harnesses without running
+          # them; the run happens in the last step, off these same artifacts.
+          cargo test -p atlas-kernels --no-run 2>&1 | tail -40
 
       - name: Confirm kernels were actually compiled
         run: |
@@ -153,6 +189,9 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$PATH_CUDA:$PATH"
+          # Recompiles nothing: the step above already built this exact
+          # graph, so this is a cache hit and goes straight to running.
+          #
           # Run every registry test marked "requires nvcc and ATLAS_SKIP_BUILD
           # unset". They assert more than the file count above: every module
           # is non-empty, every module carries a `.version` directive, each

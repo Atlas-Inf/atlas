@@ -1,0 +1,185 @@
+name: Image (gb10)
+
+# Publishes the GB10 runtime image for every commit that lands on main.
+#
+# Until now nothing built `docker/gb10/Dockerfile` outside a human's shell, so
+# the only images that existed were whatever someone last pushed by hand. This
+# gives every main commit an immutable, addressable image and a provenance
+# label pointing back at the source commit.
+#
+# GHCR, not Docker Hub, is canonical. The image then lives under the
+# `atlas-inf` org rather than a personal namespace, and `GITHUB_TOKEN`
+# authenticates to it with no secret to store or rotate. Mirroring to Docker
+# Hub stays a manual pull-and-push, which is why this workflow needs no
+# secrets at all.
+#
+# It does NOT tag `:latest`. `:latest` should mean the newest VERIFIED image,
+# and nothing here runs a kernel — that needs a GB10. Promotion is a separate
+# manual step:
+#
+#     docker buildx imagetools create -t ghcr.io/atlas-inf/atlas-gb10:latest \
+#                                        ghcr.io/atlas-inf/atlas-gb10:sha-<7>
+#
+# which re-points the tag registry-side without rebuilding or re-uploading.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'kernels/**'
+      - 'vendor/**'
+      - 'jinja-templates/**'
+      - 'docker/gb10/Dockerfile'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/image.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to build (default: this workflow's ref)"
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+# NOT cancel-in-progress, unlike the PR workflows. Those produce a verdict on a
+# tip and an older one is worthless; this produces an immutable `:sha-<7>`
+# artifact per commit, and cancelling would leave holes that the promotion
+# command above cannot then point at.
+concurrency:
+  group: image-gb10-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build and push gb10 image
+    # Native arm64, because the GB10 is arm64 (Grace) — no QEMU emulation,
+    # which would turn a long build into an unusable one. Both base images in
+    # the Dockerfile are digest-pinned, and both digests were checked to be
+    # multi-arch manifest lists carrying linux/arm64, so the pins resolve
+    # natively here.
+    #
+    # Free: this repo is public, and public repos get standard GitHub-hosted
+    # runners at no cost, arm64 included.
+    runs-on: ubuntu-24.04-arm
+    # A full `cargo build --release -p spark-server` with ATLAS_TARGET_MODEL=*
+    # compiles every kernel AND the whole server in release mode. This is by
+    # far the longest job in the repo; the ceiling is set high deliberately so
+    # a slow-but-working build is not reported as a failure. Tighten it once
+    # the first runs have established a real number.
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE: ghcr.io/atlas-inf/atlas-gb10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Resolve tags
+        id: meta
+        run: |
+          set -euo pipefail
+          # The SHA of what was actually checked out, which for a
+          # workflow_dispatch on some other ref is not github.sha.
+          sha=$(git rev-parse --short=7 HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "building $sha"
+
+      - name: Report disk before build
+        run: |
+          set -euo pipefail
+          # A CUDA devel image plus a full release target/ is the one resource
+          # a hosted runner plausibly runs out of. Recorded on both sides so
+          # the first failure is diagnosable rather than mysterious.
+          df -h / | tail -1
+
+      - name: Log in to GHCR
+        env:
+          # GITHUB_TOKEN, not a PAT: `packages: write` above scopes it to this
+          # repository's own packages for the life of the job.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the environment rather than `${{ }}` inside the script.
+          # Neither value is attacker-controlled here, but this repo's rule is
+          # that no `github.*` field is ever expanded into a `run:` body (see
+          # cla.yml), and a login line is the wrong place to make an exception.
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          docker login "$REGISTRY" -u "$ACTOR" --password-stdin <<<"$GH_TOKEN"
+
+      - name: Build
+        env:
+          SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Plain `docker build`, no buildx cache backend and no third-party
+          # build action. Registry-backed layer cache was considered and
+          # deferred: the Dockerfile copies all of crates/ in one layer, so any
+          # source change invalidates the cargo layer and the cache would only
+          # ever save the apt+rustup prologue. Revisit with a number from a
+          # real run rather than on principle.
+          #
+          # ATLAS_GIT_SHA becomes org.opencontainers.image.revision, so
+          #   docker inspect --format \
+          #     '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+          # answers "what source is this image?" for any tag, including a
+          # :latest that was promoted months later.
+          docker build \
+            -f docker/gb10/Dockerfile \
+            --build-arg "ATLAS_GIT_SHA=$SHA" \
+            -t "$IMAGE:sha-$SHA" \
+            -t "$IMAGE:main" \
+            .
+
+      - name: Report disk after build
+        if: always()
+        run: df -h / | tail -1
+
+      - name: Push
+        env:
+          SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # `:sha-<7>` is immutable and is what promotion points at.
+          # `:main` is a moving convenience tag for "tip of main, unverified".
+          docker push "$IMAGE:sha-$SHA"
+          docker push "$IMAGE:main"
+
+      - name: Summary
+        if: success()
+        env:
+          SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### gb10 image published"
+            echo
+            echo '```'
+            echo "docker pull $IMAGE:sha-$SHA"
+            echo '```'
+            echo
+            echo "Mirror to Docker Hub:"
+            echo
+            echo '```'
+            echo "docker pull $IMAGE:sha-$SHA"
+            echo "docker tag  $IMAGE:sha-$SHA <dockerhub-user>/atlas-gb10:sha-$SHA"
+            echo "docker push <dockerhub-user>/atlas-gb10:sha-$SHA"
+            echo '```'
+            echo
+            echo "Promote to \`:latest\` once verified on real hardware:"
+            echo
+            echo '```'
+            echo "docker buildx imagetools create -t $IMAGE:latest $IMAGE:sha-$SHA"
+            echo '```'
+            echo
+            echo "> First publish creates a **private** package. Make it public once at"
+            echo "> https://github.com/orgs/Atlas-Inf/packages — GHCR does not inherit"
+            echo "> repository visibility."
+          } >> "$GITHUB_STEP_SUMMARY"
