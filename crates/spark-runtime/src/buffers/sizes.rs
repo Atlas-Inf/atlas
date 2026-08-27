@@ -475,27 +475,33 @@ impl BufferSizes {
             // buffer; `hc_post`/`hc_comb` below stay V4-only because the
             // Sinkhorn intermediates have no qwen4_exp counterpart.
             hc_streams: if hc_streams_count > 0 {
-                // ELEMENT SIZE IS PER-FAMILY, because the kernels that read this
-                // buffer differ:
+                // F32 FOR BOTH FAMILIES, and this line is load-bearing: the
+                // kernels that read this buffer declare `const float*`
+                // (`hyper_connection.cu` — `streams`, `residual` and `out` are
+                // all float on hc_expand / hc_pre / hc_post / hc_head). Sizing
+                // it bf16 under those kernels does not fail; it reads the wrong
+                // half of every value.
                 //
-                //   V4 (hc_mult)      f32. The mHC residual streams grow large
-                //                     across blocks (manifold-mixing is
-                //                     norm-preserving, eigenvalue 1), so BF16
-                //                     swamps the small per-layer signal at scale
-                //                     and collapses generation.
-                //   qwen4_exp         bf16, because `q4e_hc_stream_mix` /
-                //   (hc_count)        `q4e_hc_scatter_add` read and write
-                //                     __nv_bfloat16. Sizing this f32 while the
-                //                     kernels stride by 2 would not fail -- it
-                //                     would read the wrong half of every value.
+                //   V4 (hc_mult)      f32 deliberately: manifold mixing is
+                //                     norm-preserving (eigenvalue 1), so bf16
+                //                     storage swamps the small per-layer signal
+                //                     at scale and collapses generation.
+                //   qwen4_exp         f32 because the serving kernels are the
+                //   (hc_count)        ones above. This CLOSES the drift question
+                //                     that used to sit here open: its mixer is
+                //                     contractive rather than norm-preserving,
+                //                     so V4's argument does not transfer — but
+                //                     the port keeps the FP32 highway anyway
+                //                     and generates coherently across all 48
+                //                     layers, so there is nothing to trade.
                 //
-                // OPEN: qwen4_exp's mixer is contractive (it divides by
-                // hc_count) rather than norm-preserving, so the V4 drift
-                // argument does not obviously transfer. Whether 48 layers x 2
-                // blocks of bf16 accumulation drifts is UNMEASURED; if it does,
-                // both the kernels and this line move together.
-                let elem = if config.hc_mult > 0 { 4 } else { bf16 };
-                m * hc_streams_count * h * elem
+                // The bf16 arm this line used to carry belonged to the
+                // `q4e_hc_stream_mix` / `q4e_hc_scatter_add` kernels, which
+                // stride by __nv_bfloat16. Those are now the microtest oracles
+                // (`ops::qwen4exp`) and never read this arena buffer, so the
+                // per-family branch was removed rather than left as a trap for
+                // whoever reads it next.
+                m * hc_streams_count * h * 4
             } else {
                 256
             },
@@ -612,10 +618,31 @@ mod qwen4exp_hc_tests {
         cfg.hc_count = 4;
         cfg.hidden_size = 2560;
         let sizes = BufferSizes::from_config(&cfg, 128, 2048, 16, 1);
-        // bf16, because `q4e_hc_stream_mix` and `q4e_hc_scatter_add` stride by
-        // __nv_bfloat16. f32 here would not fail — it would read the wrong half
-        // of every value.
-        assert_eq!(sizes.hc_streams, 128 * 4 * 2560 * 2);
+        // F32, because `hyper_connection.cu` declares this buffer `float*` on
+        // every entry point. bf16 here would not fail — it would read the
+        // wrong half of every value.
+        assert_eq!(sizes.hc_streams, 128 * 4 * 2560 * 4);
+    }
+
+    /// A real `qwen4_exp` config sets BOTH spellings — the parser maps
+    /// `hc_count` onto `hc_mult` because the engine dispatches on the latter,
+    /// and keeps the former because the manifest and the reference read the
+    /// checkpoint's own field names. So the two must size identically, or the
+    /// arena would depend on which name a future caller happened to fill in.
+    #[test]
+    fn both_spellings_size_the_same_highway() {
+        let base = ModelConfig::qwen3_next_80b_nvfp4();
+        let sized = |mult: usize, count: usize| {
+            let mut cfg = base.clone();
+            cfg.hc_mult = mult;
+            cfg.hc_count = count;
+            cfg.hidden_size = 2560;
+            BufferSizes::from_config(&cfg, 128, 2048, 16, 1).hc_streams
+        };
+        let expected = 128 * 4 * 2560 * 4;
+        assert_eq!(sized(4, 0), expected, "hc_mult only");
+        assert_eq!(sized(0, 4), expected, "hc_count only");
+        assert_eq!(sized(4, 4), expected, "both, as the parser sets them");
     }
 
     /// DeepSeek-V4 keeps f32 deliberately: its manifold mixing is
