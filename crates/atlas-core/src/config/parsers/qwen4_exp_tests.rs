@@ -295,3 +295,77 @@ fn both_naming_revisions_route_to_this_parser() {
         assert_eq!(c.num_experts, 512);
     }
 }
+
+/// **`quantization_config` lives at the TOP level, and this parser used to
+/// return before reading it.**
+///
+/// ModelOpt writes it beside `text_config`, not inside — verified against both
+/// vendored configs, whose `text_config` carries no `quant*` key at all. So
+/// `serde_json::from_value(text_config)` cannot see it, and without the
+/// `finalize_config` call at the end of `parse_qwen4_exp` an NVFP4 checkpoint
+/// parses as UNQUANTIZED: 120.8 B of routed experts would be read as BF16.
+///
+/// This is the regression guard for that call. It runs against the real
+/// published `config.json`, vendored whole, rather than a hand-written fixture
+/// that could be written to agree with the bug.
+#[test]
+fn the_nvfp4_quantization_config_is_read_from_the_top_level() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_nvfp4_config.json"
+    ));
+    // The premise: it is NOT inside text_config, so serde alone cannot find it.
+    let raw: Value = serde_json::from_str(json).expect("valid json");
+    assert!(
+        raw["text_config"]
+            .as_object()
+            .expect("text_config")
+            .keys()
+            .all(|k| !k.contains("quant")),
+        "text_config gained a quant key — this test's premise needs rechecking"
+    );
+    assert!(
+        raw.get("quantization_config").is_some(),
+        "top-level, as ModelOpt writes it"
+    );
+
+    let cfg = crate::config::parse_config(json).expect("parses");
+    let q = cfg
+        .quantization_config
+        .as_ref()
+        .expect("quantization_config must survive the nested-config parse");
+    assert_eq!(q.quant_method, "modelopt");
+    assert_eq!(q.quant_algo, "NVFP4");
+    // group 16 along the input dim is what makes a [640, 1280] expert weight
+    // carry a [640, 160] E4M3 scale; a 0 here would mis-size every scale.
+    assert_eq!(q.group_size, 16);
+    // The ignore list is what keeps attention, GDN, mHC, PLE and the shared
+    // experts in BF16 — only the routed experts are quantized.
+    assert!(
+        q.ignore_modules
+            .iter()
+            .any(|m| m.contains("hyper_connection")),
+        "the mHC weights must be on the ignore list: {:?}",
+        q.ignore_modules
+    );
+    assert!(q.ignore_modules.iter().any(|m| m.contains(".ple.")));
+}
+
+/// The FP8 release of the same model, for the same reason: its
+/// `quantization_config` is also top-level, and its `weight_block_size` is what
+/// tells the loader a quantized `[rows, cols]` weight carries a
+/// `[ceil(rows/128), ceil(cols/128)]` scale sibling.
+#[test]
+fn the_fp8_release_carries_its_block_size_through_too() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_config.json"
+    ));
+    let cfg = crate::config::parse_config(json).expect("parses");
+    let q = cfg
+        .quantization_config
+        .as_ref()
+        .expect("quantization_config");
+    assert_eq!(q.quant_method, "fp8");
+    assert_eq!(q.weight_block_size, vec![128, 128]);
+}
