@@ -594,8 +594,12 @@ fn gdn_decode_step(g: &dyn GpuBackend) -> Result<()> {
     let v: Vec<f32> = (0..NUM_V_HEADS * VD).map(|_| next()).collect();
     // Decay in (0,1), beta in (0,1) -- the ranges exp(-softplus) and sigmoid
     // actually produce.
-    let decay: Vec<f32> = (0..NUM_V_HEADS).map(|_| next().abs() * 0.9 + 0.05).collect();
-    let beta: Vec<f32> = (0..NUM_V_HEADS).map(|_| next().abs() * 0.9 + 0.05).collect();
+    let decay: Vec<f32> = (0..NUM_V_HEADS)
+        .map(|_| next().abs() * 0.9 + 0.05)
+        .collect();
+    let beta: Vec<f32> = (0..NUM_V_HEADS)
+        .map(|_| next().abs() * 0.9 + 0.05)
+        .collect();
     let h0: Vec<f32> = (0..NUM_V_HEADS * KD * VD).map(|_| next() * 0.1).collect();
 
     let up_f32 = |d: &[f32]| -> Result<DevicePtr> {
@@ -656,7 +660,11 @@ fn gdn_decode_step(g: &dyn GpuBackend) -> Result<()> {
         ));
     }
 
-    let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let worst = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
     let scale_out = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
     println!(
         "GDN decode step: max|diff| {worst:.3e} over {} values (up to {scale_out:.3e}), relative {:.3e}",

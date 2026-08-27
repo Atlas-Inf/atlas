@@ -75,8 +75,9 @@ extern "C" __global__ void q4e_attn_decode(
         __syncthreads();
     }
 
-    // Softmax over the causal window, computed once per block.
-    __shared__ float soft_max;
+    // Softmax over the causal window, computed once per block. The running max
+    // is a local: it is only needed to shift the exponents, and every consumer
+    // of the result reads the already-shifted `scores` and their sum.
     __shared__ float soft_sum;
     if (tid == 0) {
         float m = -INFINITY;
@@ -86,11 +87,9 @@ extern "C" __global__ void q4e_attn_decode(
             scores[t] = expf(scores[t] - m);
             s += scores[t];
         }
-        soft_max = m;
         soft_sum = s;
     }
     __syncthreads();
-    (void)soft_max;
 
     float acc = 0.0f;
     for (unsigned int t = 0; t < seq_len; ++t) {
