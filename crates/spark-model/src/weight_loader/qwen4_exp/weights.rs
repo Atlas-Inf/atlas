@@ -188,7 +188,9 @@ pub struct Qwen4ExpWeights {
 impl Qwen4ExpWeights {
     /// Load everything the forward pass needs that is not an expert body or an
     /// n-gram row.
-    pub fn load(
+    /// `pub(crate)` rather than `pub`: `QuantizeCtx` is a crate-internal type,
+    /// and the only caller is this crate's loader.
+    pub(crate) fn load(
         store: &WeightStore,
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
