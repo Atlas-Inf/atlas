@@ -47,6 +47,13 @@ else
   export ATLAS_PLE_MAX_TOKENS="${ATLAS_PLE_MAX_TOKENS:-$MAX_SEQ_LEN}"
 fi
 
+# BF16 KV, matching the vendored recipe
+# (`tests/fixtures/recipes/qwen3.8-flash-next/qwen3.8-flash-next-nvfp4.yaml`,
+# `kv_cache_dtype: bf16`). Left unset, the server picks FP8 and then warns
+# that this checkpoint ships NO k_scale/v_scale, so the scales default to 1.0
+# and silently clip BF16 into E4M3's [-448, 448] — which costs coherence on an
+# NVFP4 model exactly where it is hardest to notice, at long context. The
+# recipe already said bf16; this script simply was not passing it.
 echo "Qwen3.8-Flash-Next  ->  port ${PORT:-8889}"
 echo "  mHC highway + PLE n-gram LIVE (NFS shard prefetch on: /tank is NFS-mounted)"
 echo "  checkpoint: $SNAP"
@@ -57,6 +64,7 @@ exec target/release/spark serve \
   --bind "${BIND:-127.0.0.1}" \
   --port "${PORT:-8889}" \
   --max-seq-len "$MAX_SEQ_LEN" \
+  --kv-cache-dtype "${KV_CACHE_DTYPE:-bf16}" \
   --max-num-seqs "${MAX_NUM_SEQS:-4}" \
   --max-batch-size "${MAX_BATCH_SIZE:-4}" \
   --gpu-memory-utilization "${GPU_UTIL:-0.80}" \
