@@ -315,6 +315,50 @@ If step 7 misbehaves, the kill switches are the bisect: `ATLAS_QSA_DISABLE=1`,
 `ATLAS_DEBUG_NO_GRAPH=1`, `ATLAS_QWEN4EXP_NO_PLE=1` (output is wrong by
 construction under that last one — it exists to bisect the mHC spine).
 
+## The one design claim I re-verified rather than quoted
+
+#754's phase-C comment says the SSM prefill's steps 2-10 "moved verbatim into
+`prefill_block` — **verified byte-identical** against `git show HEAD:`". That
+claim is load-bearing twice over: if the body drifted, prefill is subtly wrong
+on 36 of 48 layers of THIS model, and — because the same body serves every
+existing GDN family — on qwen3.5, qwen3.6 and qwen3-next too. Five of the
+seven merge conflicts were in these files, so quoting his verification was not
+enough.
+
+Checked, on this branch, after the merge:
+
+| | |
+|---|---|
+| extracted body, code lines (comments/blanks/indent stripped) | 296 |
+| appearing VERBATIM in `pr754base`'s `trait_prefill.rs` | **269** |
+| not appearing | 27 |
+
+All 27 account for themselves:
+
+* **6** are the new signature — `pub(super) fn prefill_block(`,
+  `normed: DevicePtr`, `ssm_layer_idx: usize`, the return type, `Ok(out_proj_buf)`,
+  and an `#[allow(unused_variables)]`;
+* **4** are locals that used to be in scope from the caller and are now
+  re-derived inside. These were the actual risk, and all four are
+  CHARACTER-IDENTICAL to the base: `key_dim = nk * kd`,
+  `value_dim = nv * vd`, `conv_dim = key_dim * 2 + value_dim`,
+  `qkvz_size = ctx.config.ssm_qkvz_size()`;
+* the rest are the additive `ATLAS_QWEN4EXP_DUMP` taps (`tap_bf16` / `tap_f32`
+  plus their five labels and sizes) and one reworded stage-timer line.
+
+And both entry paths really do share the one body, which is what makes the
+"extraction, not duplication" argument hold:
+
+* `trait_prefill.rs:123` — step 1 `rms_norm_residual` → `prefill_block` →
+  step 11 `residual_add_rms_norm` → step 12 `forward_prefill` → step 13
+  `residual_add`. Unchanged bracketing, so no existing GDN model is on a new
+  path.
+* `trait_prefill_hc.rs:203` — `prefill_block(hidden, …)`, with steps 1/11/13
+  REPLACED by `hc_pre`/`hc_post` rather than wrapped, because under a highway
+  the highway is the residual and those three double-count.
+
+So the claim stands, and it stood through the merge.
+
 ## The vendored-reference question, resolved with evidence
 
 I flagged this as "needs a maintainer call" and then went and got the facts, so
