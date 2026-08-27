@@ -12,14 +12,13 @@
 #   docker run --gpus all --ipc=host -p 8889:8889 -v /path/to/ckpt:/ckpt:ro \
 #     atlas-q4e serve --model-from-path /ckpt --model-name qwen4exp \
 #       --kernel-target qwen3.8-flash-next --bind 0.0.0.0 --port 8889 \
-#       --max-seq-len 8192 --kv-cache-dtype bf16 \
+#       --max-seq-len 8192 \
 #       --gpu-memory-utilization 0.90 --fast-load-prefetch-shards
 #
 # WHY EACH NON-OBVIOUS FLAG IS THERE — all four were learned the hard way on
 # the first real run, and three of them fail SILENTLY if omitted:
 #
-#   --kv-cache-dtype bf16      the checkpoint ships no k_scale/v_scale, so the
-#                              FP8 default clips BF16 into E4M3 [-448, 448]
+#   (KV dtype is no longer a flag — MODEL.toml owns it via default_kv_dtype)
 #   --gpu-memory-utilization   BF16 KV needs 0.90; at 0.80 the model loads and
 #                              then dies with "No memory left for KV cache"
 #   ATLAS_PLE_MAX_TOKENS       defaults to 2048; a 2191-token prompt exceeds it
@@ -53,7 +52,6 @@ target/release/spark serve \
   --kernel-target qwen3.8-flash-next \
   --bind 127.0.0.1 --port "$PORT" \
   --max-seq-len "$MAX_SEQ_LEN" \
-  --kv-cache-dtype bf16 \
   --max-num-seqs "${MAX_NUM_SEQS:-4}" \
   --max-batch-size "${MAX_BATCH_SIZE:-4}" \
   --gpu-memory-utilization "${GPU_UTIL:-0.90}" \

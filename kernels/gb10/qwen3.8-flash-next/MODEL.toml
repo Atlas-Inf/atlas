@@ -270,6 +270,18 @@ its per-token conv launches (same bits, more launches)."""
 # Same setting as qwen3.8-27b / qwen3.6-35b: reasoning by default.
 thinking_default = true
 thinking_in_tools = true
+# BF16 KV IS THE DEFAULT FOR THIS TARGET, not a flag the operator must know.
+#
+# The checkpoint ships NO k_scale/v_scale, so the engine's FP8 KV default falls
+# back to scale 1.0 and silently clips BF16 into E4M3's [-448, 448]. That costs
+# coherence at long context — precisely where it is hardest to attribute to the
+# KV dtype rather than to the model. It warns, but a warning in a 200-line load
+# log is not a control.
+#
+# Same reason gemma-4-31b and longcat-flash-lite set it. Precedence is
+# CLI > MODEL.toml > engine default, so `--kv-cache-dtype` still overrides for
+# anyone deliberately measuring FP8.
+default_kv_dtype = "bf16"
 # WITHOUT THIS, TOOL CALLING IS SILENTLY OFF. `tools_active` in
 # `api/chat/prepare.rs` requires `state.tool_call_parser.is_some()`, and with
 # no parser configured the tool definitions are never passed to Jinja at all —

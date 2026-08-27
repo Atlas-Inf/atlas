@@ -12,8 +12,7 @@
 #       --kernel-target qwen3.8-flash-next \
 #       --bind 0.0.0.0 --port 8889 \
 #       --max-seq-len 8192 \
-#       --kv-cache-dtype bf16 \
-#       --gpu-memory-utilization 0.90 \
+#     #       --gpu-memory-utilization 0.90 \
 #       --fast-load-prefetch-shards \
 #       --enable-prefix-caching
 #
@@ -24,11 +23,9 @@
 #     QSA indexer, the sigmoid GDN gated-norm twins). Without it the startup
 #     kernel audit fails closed rather than serving something wrong.
 #
-# --kv-cache-dtype bf16
-#     The checkpoint ships NO k_scale/v_scale, so the FP8 KV default falls back
-#     to scale 1.0 and silently clips BF16 into E4M3's [-448, 448]. That costs
-#     coherence at long context, where it is hardest to attribute. Matches
-#     `kv_cache_dtype: bf16` in the vendored recipe.
+# (KV dtype needs no flag: MODEL.toml sets `default_kv_dtype = "bf16"` for this
+#  target, because the checkpoint ships no k_scale/v_scale and the FP8 default
+#  would silently clip BF16 into E4M3's range.)
 #
 # --gpu-memory-utilization 0.90
 #     BF16 KV needs the headroom. At 0.80 the model loads and then fails with

@@ -64,7 +64,6 @@ exec target/release/spark serve \
   --bind "${BIND:-127.0.0.1}" \
   --port "${PORT:-8889}" \
   --max-seq-len "$MAX_SEQ_LEN" \
-  --kv-cache-dtype "${KV_CACHE_DTYPE:-bf16}" \
   --max-num-seqs "${MAX_NUM_SEQS:-4}" \
   --max-batch-size "${MAX_BATCH_SIZE:-4}" \
   --gpu-memory-utilization "${GPU_UTIL:-0.80}" \
