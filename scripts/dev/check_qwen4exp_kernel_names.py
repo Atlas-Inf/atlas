@@ -37,11 +37,20 @@ COMMON = "kernels/gb10/common"
 # The Rust that resolves kernels for this model. Kept explicit rather than
 # globbed over the crate: the point is to check THIS port's names, and a
 # wildcard would quietly start covering (or stop covering) other families.
+# The qwen4_exp-specific code, PLUS the init paths of every layer a qwen4_exp
+# model builds: 36 Qwen3SsmLayer, 12 Qwen3AttentionLayer, the MoE. Those inits
+# are where the fail-closed startup audit's lookups happen, so a name that does
+# not resolve there is a server that refuses to boot.
 RUST_PATHS = [
     "crates/spark-model/src/layers/ple/*.rs",
     "crates/spark-model/src/layers/qsa*.rs",
     "crates/spark-model/src/layers/ops/qwen4exp*.rs",
+    "crates/spark-model/src/layers/qwen3_ssm/init*.rs",
     "crates/spark-model/src/layers/qwen3_ssm/kernel_select.rs",
+    "crates/spark-model/src/layers/qwen3_attention/init*.rs",
+    "crates/spark-model/src/layers/moe/init*.rs",
+    "crates/spark-model/src/layers/moe.rs",
+    "crates/spark-model/src/layers.rs",
 ]
 
 # Resolved by name CONSTRUCTION rather than a literal (`format!("{base}_sigmoid")`),
@@ -94,26 +103,170 @@ def entry_points(target: str) -> dict[str, set[str]]:
             seen_stems.add(stem)
             module = mods.get(stem, stem)
             src = open(os.path.realpath(shown), encoding="utf-8").read()
-            for m in re.finditer(
-                r'extern\s+"C"\s+__global__\s+void\s+(\w+)\s*\(', src
-            ):
-                found[module].add(m.group(1))
+            found[module].update(declared_kernels(src))
+            found[module].update(macro_kernels(src))
     return found
 
 
-def asks() -> list[tuple[str, str, str]]:
-    """(module, entry, file) for every kernel lookup in the qwen4_exp path."""
-    out = []
+def _paged_concat_suffixes() -> set[str]:
+    """Suffixes the `.cuh` templates append to `KERNEL_NAME`.
+
+    `prefill_paged_compute.cuh` declares BOTH
+    `extern "C" __global__ void KERNEL_NAME(...)` and
+    `... PAGED_CONCAT(KERNEL_NAME, _64)(...)`, so one `#define` yields two
+    entry points. Read the suffixes out of the templates rather than hardcoding
+    `_64`, so a new variant does not silently become a false MISSING.
+    """
+    suffixes = {""}
+    for path in glob.glob(os.path.join(COMMON, "*.cuh")) + glob.glob(
+        os.path.join(TARGET, "*.cuh")
+    ):
+        try:
+            text = open(os.path.realpath(path), encoding="utf-8").read()
+        except OSError:
+            continue
+        for m in re.finditer(r"PAGED_CONCAT\(\s*KERNEL_NAME\s*,\s*(_\w+)\s*\)", text):
+            suffixes.add(m.group(1))
+    return suffixes
+
+
+_SUFFIXES = None
+
+
+def macro_kernels(src: str) -> set[str]:
+    """Entry points generated through `#define KERNEL_NAME` + an included template.
+
+    21 files in this tree name their kernel with a macro and `#include` a `.cuh`
+    that declares it, so the name never appears in an `extern "C"` line and no
+    scan of declarations alone can see it. Without this, every one of them reads
+    as MISSING — 7 of them are on the qwen4_exp path.
+    """
+    global _SUFFIXES
+    if _SUFFIXES is None:
+        _SUFFIXES = _paged_concat_suffixes()
+    names: set[str] = set()
+    for m in re.finditer(r"#define\s+KERNEL_NAME\s+(\w+)", src):
+        for suffix in _SUFFIXES:
+            names.add(m.group(1) + suffix)
+    return names
+
+
+# Attributes and keywords that can sit between `extern "C" __global__` and the
+# entry point's NAME. A regex demanding `void <name>(` contiguously misses every
+# kernel that carries a launch bound or wraps the line, and this tree is full of
+# both:
+#
+#     extern "C" __global__ void __launch_bounds__(128, 1)
+#     gated_delta_rule_decode(
+#
+#     extern "C" __global__
+#     __launch_bounds__(128, 3)
+#     void w4a16_gemm_t_m128(
+#
+# Under-reporting the available set is the dangerous direction: it makes this
+# script emit a false MISSING for a kernel that is right there, which is the
+# failure mode that wastes an afternoon. So the prologue is SCANNED rather than
+# matched: skip keywords, skip balanced attribute arguments, and the last
+# identifier before the parameter list is the name.
+_SKIP = {"void", "__global__", "static", "inline", "__inline__", "extern"}
+
+
+def _object_macros(src: str) -> dict[str, str]:
+    """`#define NAME other_identifier` in one file.
+
+    A kernel may be declared through an ALIAS rather than its own name:
+
+        #ifndef ATLAS_PREFILL_ENTRY
+        #define ATLAS_PREFILL_ENTRY inferspark_prefill
+        #endif
+        extern "C" __global__ void ATLAS_PREFILL_ENTRY(
+
+    so the scanner below has to resolve the alias or it reports the macro's
+    name, which resolves against nothing and reads as a MISSING kernel.
+    """
+    return {
+        m.group(1): m.group(2)
+        for m in re.finditer(r"^\s*#define\s+([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*$", src, re.M)
+    }
+
+
+def declared_kernels(src: str) -> set[str]:
+    """Every `extern "C" __global__` entry point name in one translation unit."""
+    macros = _object_macros(src)
+
+    def resolve(name: str) -> str:
+        # Bounded, so a `#define A B` / `#define B A` pair cannot spin.
+        for _ in range(4):
+            nxt = macros.get(name)
+            if nxt is None or nxt == name:
+                break
+            name = nxt
+        return name
+
+    names: set[str] = set()
+    for m in re.finditer(r'extern\s+"C"\s+__global__', src):
+        i = m.end()
+        name = None
+        # Bounded scan: a prologue longer than this is not a declaration.
+        limit = min(len(src), i + 400)
+        while i < limit:
+            ch = src[i]
+            if ch.isspace():
+                i += 1
+                continue
+            if src.startswith("__launch_bounds__", i):
+                i += len("__launch_bounds__")
+                # Skip its balanced argument list.
+                while i < limit and src[i].isspace():
+                    i += 1
+                if i < limit and src[i] == "(":
+                    depth = 0
+                    while i < limit:
+                        if src[i] == "(":
+                            depth += 1
+                        elif src[i] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                i += 1
+                                break
+                        i += 1
+                continue
+            token = re.match(r"[A-Za-z_]\w*", src[i:])
+            if token:
+                word = token.group(0)
+                i += len(word)
+                if word not in _SKIP:
+                    name = word
+                continue
+            if ch == "(":
+                break
+            # Anything else (a `*`, a stray token) means this is not a shape we
+            # understand; stop rather than guess a name.
+            break
+        if name:
+            names.add(resolve(name))
+    return names
+
+
+# `gpu.kernel(...)` is FAIL-CLOSED: absent means the server refuses to boot.
+# `try_kernel(...)` returns a 0-handle the caller gates on, so an absence there
+# is a documented fallback, not a defect — probe-and-fall-back twins live in
+# other models' shadows on purpose. Conflating the two would make this script
+# flag ~28 legitimate fallbacks.
+_HARD = re.compile(r'(?<!try_)\bkernel\(\s*"([\w.]+)"\s*,\s*"(\w+)"\s*\)')
+_SOFT = re.compile(r'try_kernel\(\s*[\w.]+\s*,\s*"([\w.]+)"\s*,\s*"(\w+)"\s*\)')
+
+
+def asks() -> tuple[list[tuple[str, str, str]], int]:
+    """(hard lookups, soft-lookup count) across the swept paths."""
+    hard, soft = [], 0
     for pattern in RUST_PATHS:
         for path in sorted(glob.glob(pattern)):
             src = open(path, encoding="utf-8").read()
-            for m in re.finditer(r'kernel\(\s*"([\w.]+)"\s*,\s*"(\w+)"\s*\)', src):
-                out.append((m.group(1), m.group(2), path))
-            for m in re.finditer(
-                r'try_kernel\(\s*\w+\s*,\s*"([\w.]+)"\s*,\s*"(\w+)"\s*\)', src
-            ):
-                out.append((m.group(1), m.group(2), path))
-    return out
+            for m in _HARD.finditer(src):
+                hard.append((m.group(1), m.group(2), path))
+            soft += len(_SOFT.findall(src))
+    return hard, soft
 
 
 def main() -> int:
@@ -122,7 +275,8 @@ def main() -> int:
         return 2
     available = entry_points(TARGET)
     total = sum(len(v) for v in available.values())
-    requested = sorted(set(asks()))
+    hard_asks, soft_count = asks()
+    requested = sorted(set(hard_asks))
     bad = 0
 
     for module, name, path in requested:
@@ -173,9 +327,9 @@ def main() -> int:
         return 1
     print(
         f"qwen4_exp kernel names: OK "
-        f"({checked} checked against {total} entry points in "
-        f"{len(available)} modules; {absent_total} expected_absent entries, "
-        "none stale)"
+        f"({checked} fail-closed lookups checked against {total} entry points "
+        f"in {len(available)} modules; {soft_count} try_kernel fallbacks not "
+        f"required; {absent_total} expected_absent entries, none stale)"
     )
     return 0
 
