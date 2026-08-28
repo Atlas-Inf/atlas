@@ -115,6 +115,10 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.qsa.is_some()
     }
 
+    fn verify_context_limit(&self) -> Option<usize> {
+        self.qsa.as_ref().map(|q| q.inert_bound())
+    }
+
     fn rollback_aux_verify(
         &self,
         state: &mut dyn LayerState,

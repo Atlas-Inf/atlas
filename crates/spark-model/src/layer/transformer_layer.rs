@@ -133,6 +133,20 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// Longest visible context at which this layer can serve a BATCHED
+    /// (K-token) verify, if it is bounded at all.
+    ///
+    /// The QSA indexer is bounded: below its inert bound the selection is
+    /// provably all-visible and `decode_select` returns `None`, so the
+    /// batched multi-row attention path is exact. Above it selection goes
+    /// ACTIVE and that path refuses — correctly, it cannot serve a per-row
+    /// selection — but the refusal reaches the scheduler as a verify error,
+    /// and a verify error finishes the request. So eligibility has to be
+    /// decided BEFORE the step is dispatched, not discovered inside it.
+    fn verify_context_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Rewind that aux state to the `num_kept` verify tokens that were
     /// accepted. A layer whose aux state advances per token MUST implement
     /// this: the verify scanned K tokens, and the rejected tail would
