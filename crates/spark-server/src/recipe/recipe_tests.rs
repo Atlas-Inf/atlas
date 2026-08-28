@@ -97,7 +97,10 @@ fn every_atlas_recipe_produces_a_valid_serve_config() {
 /// * `enable_prefix_caching` — correct only because the PLE/QSA aux rides the
 ///   SSM snapshots; a prefix hit would otherwise hash the PREVIOUS request's
 ///   n-gram history into the highway.
-/// * `speculative` off — MTP is refused at pre-flight, so it cannot be set.
+/// * `speculative` off — MTP WORKS on this target and at `--num-drafts 1` is a
+///   measured +18% at C=1 (2026-08-28), but −21% at C=2, and a recipe carries
+///   one setting for every concurrency. Operators wanting the C=1 win pass
+///   `--speculative --num-drafts 1` and leave the throughput gate armed.
 #[test]
 fn the_qwen4_exp_recipe_lands_the_settings_it_documents() {
     let all = all();
@@ -116,7 +119,10 @@ fn the_qwen4_exp_recipe_lands_the_settings_it_documents() {
     );
     assert_eq!(args.max_seq_len, 8192);
     assert!(args.enable_prefix_caching);
-    assert!(!args.speculative, "MTP is refused at pre-flight");
+    assert!(
+        !args.speculative,
+        "MTP wins at C=1 and loses at C=2; a one-setting recipe ships it off"
+    );
     assert_eq!(
         args.kernel_target.as_deref(),
         Some("qwen3.8-flash-next"),

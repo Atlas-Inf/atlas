@@ -40,11 +40,32 @@ metadata:
     it). Set it to >= 9500 when serving prompts over 8K; the cap error names
     itself when hit. `serve_qwen4exp_tui.sh` does this automatically.
 
-    SPECULATIVE IS OFF AND CANNOT BE TURNED ON. The MTP block is not the
-    `MtpWeights` shape any other family uses — its own 512-expert stack, its
-    own indexer, two input norms of different widths — so
-    `load_mtp_weights` returns None and `--speculative` is refused at
-    pre-flight rather than half-wired.
+    SPECULATIVE IS OFF BY MEASUREMENT, NOT BY REFUSAL — AND ONE DRAFT WINS.
+    It used to be a refusal: the MTP block is not the `MtpWeights` shape any
+    other family uses — its own 512-expert stack, its own indexer, two input
+    norms of different widths — so the family `load_mtp_weights` still
+    declines it. It now loads through its own path instead, and
+    `--speculative` works. Measured 2026-08-28 on one GB10, 256-token
+    completions, against a same-binary non-speculative control:
+
+      arm                            C=1 agg tok/s   C=2 agg tok/s
+      base (no speculation)                  16.14           24.74
+      --num-drafts 1, gate ARMED             19.11 (+18.4%)  23.19  (-6.3%)
+      --num-drafts 1, gate forced            19.06 (+18.1%)  19.58 (-20.9%)
+      --num-drafts 2, gate forced            15.76  (-2.4%)  16.61 (-32.9%)
+
+    So the depth matters more than the feature: ONE draft is a real 18% win
+    at C=1, and the default K ladder's 3 drafts is a 2% loss at the same
+    width. Each verify row routes to its own top-10 of 512 experts, so
+    expert weight traffic scales with rows (~0.4 of a decode step per extra
+    row) while acceptance only buys ~0.6 tokens; and at C>1 batched decode
+    is already amortizing the weight reads speculation exists to amortize,
+    which is why the sign flips with width.
+
+    This recipe still ships it OFF because the recipe has one setting for
+    every concurrency and the win is C=1-only. To take the C=1 win, serve
+    with `--speculative --num-drafts 1` and leave the throughput gate armed:
+    it measures both modes per serve and parks in Serial once width rises.
 
     Sampling and the thinking scaffold come from
     `kernels/gb10/qwen3.8-flash-next/MODEL.toml`, not from here: the vendor

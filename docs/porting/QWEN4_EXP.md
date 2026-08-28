@@ -10,8 +10,12 @@ implementation in HuggingFace Transformers (Apache-2.0),
 (`feat/qwen4exp-serve`), the mHC highway runs on all 48 layers, the PLE tower
 runs at model layer 1 off an NVMe row cache, the QSA indexer selects on both
 decode and prefill, the vision tower loads, CUDA graphs capture, prefix caching
-carries the PLE and QSA state, and concurrency is honoured. What is still
-refused — by name, at pre-flight — is MTP and the stacked expert layout.
+carries the PLE and QSA state, and concurrency is honoured. MTP now runs too
+(#753 item I), through its own loader rather than the family `MtpWeights`
+path — it proposes, verifies on the mHC highway and accepts, at C=1 and C=2
+alike; it is simply SLOWER than plain decode here, so it ships off by default.
+See "MTP" below for the numbers. What is still refused — by name, at
+pre-flight — is the stacked expert layout.
 
 Read the rest of this file as two things layered: the ARCHITECTURAL notes are
 still current and are the reason each piece is shaped the way it is; the
@@ -312,7 +316,69 @@ outside what the existing Qwen3.5 MoE kernels were sized for.
 One hybrid block with `fc_embedding` / `fc_hidden` /
 `pre_fc_norm_embedding` / `pre_fc_norm_hidden`, its own full-attention layer,
 its own indexer and its own 512 experts. `mtp_use_dedicated_embeddings = false`.
-Not the Qwen3.5/Nemotron MTP head shape.
+Not the Qwen3.5/Nemotron MTP head shape — which is why the family
+`load_mtp_weights` still declines it and `load_qwen4exp_mtp_module` serves it
+instead.
+
+**Status: works, and pays at one draft.** Measured 2026-08-28 on one GB10,
+256-token completions, against a same-binary non-speculative control:
+
+| arm | C=1 agg tok/s | C=2 agg tok/s |
+|---|---|---|
+| base (no speculation) | 16.14 | 24.74 |
+| `--num-drafts 1`, **gate armed** | **19.11 (+18.4%)** | 23.19 (−6.3%) |
+| `--num-drafts 1` (K=2), gate forced | 19.06 (+18.1%) | 19.58 (−20.9%) |
+| `--num-drafts 2` (K=3), gate forced | 15.76 (−2.4%) | 16.61 (−32.9%) |
+
+Leave the throughput gate **armed** and one serve covers the ladder: it holds
+Mtp at C=1 for the full win, then logs a single `Mtp -> Serial` switch at C=2
+(19.8 vs 27.0 tok/s) after which accepted drafts fall from 94 per request to
+~23 — recovering C=2 from −20.9% to −6.3%. The residual is the gate's
+periodic re-probe (`ATLAS_MTP_GATE_REPROBE`, default 256 tokens).
+
+**The draft depth is the whole result**, and the default ladder gets it
+wrong here: `4:3,8:3,16:1,32:1` asks for 3 drafts at these widths, which is
+the losing depth. `--num-drafts 1` clamps it, and on this target that is not
+optional.
+
+Acceptance was never the problem — 94 of 256 tokens came from accepted
+drafts at K=2 (1.58 tokens/step), 107 at K=3 (1.72 tokens/step). The cost
+side is what moves: each verify row routes to its own top-10 of 512 experts,
+so expert weight traffic scales with the row count while the backbone does
+not. Marginal cost measures **~0.34–0.50 of a decode step per extra verify
+row**, so break-even needs `tokens/step > 1 + ~0.4*(K-1)`. K=2 clears it
+(1.58 vs 1.34); K=3 does not (1.72 vs 1.76).
+
+Why it inverts at C>1: batched decode is already amortizing exactly the
+weight reads speculation exists to amortize, so a draft's marginal value
+falls as width rises. The throughput gate measures this per serve and parks
+in Serial on its own.
+
+**MTP is not corrupting the output, and the obvious test says it is.** At
+T=0 the speculative build's text diverges from the non-speculative one on 7
+of 8 prompts, which reads as a broken verify — speculative decoding is
+supposed to be lossless. It is the engine's batch-numerics floor, not MTP.
+The control that separates them:
+
+| comparison | identical | reading |
+|---|---|---|
+| base C=1 vs base C=1 | 8/8 | harness sound, engine deterministic |
+| base C=1 vs **base C=2** | 3/8 | plain batched decode already flips tokens |
+| base C=1 vs MTP C=1 | 1/8 | same phenomenon, same magnitude |
+
+A batched reduction rounds differently and a near-tie argmax flips; the K-row
+verify sits on that same floor. Corroborated independently — `suite_base_c2`
+reproduces the *exact* MTP wording that `suite_base_c1` does not. Judge MTP
+against batched decode, not against C=1 serial, or you will chase a bug that
+belongs to the batch width.
+
+Two hard bounds also apply. The batched verify serves **K<=3** (two drafts):
+the mHC highway has MoE arms for `forward_k2`/`forward_k3` only, and
+`forward_km` (K=4..8) is dense-FFN-only. `Model::verify_max_drafts` reports
+this and the scheduler clamps to it — before that clamp, `--num-drafts 3`
+asked for K=4, the highway refused mid-step, and a verify error finishes the
+request, so every request died after one token. Second, speculation is
+declined entirely above the QSA indexer's inert bound of 2051 visible tokens.
 
 ### Vision
 27 blocks, hidden 1152, 16 heads, intermediate 4304, patch 16, spatial merge 2,

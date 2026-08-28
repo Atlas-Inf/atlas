@@ -25,9 +25,14 @@
 //! * **Batched / multi-sequence decode** — honoured. Per-sequence PLE and QSA
 //!   state ride the layer states, and the earlier clamp-to-1 is lifted.
 //!
-//! Still refused, by name and at pre-flight rather than silently: **MTP**
-//! (`load_mtp_weights` returns `None`, so `--speculative` cannot half-wire)
-//! and the **stacked expert layout**, which neither published release uses.
+//! * **MTP** — honoured, through `mtp::load_qwen4exp_mtp_module` rather than
+//!   the family `load_mtp_weights` below, which still returns `None` because
+//!   this block is not the `MtpWeights` shape. It loads, proposes and verifies
+//!   on the mHC highway; it is simply slower than plain decode on this model
+//!   (see `kernels/gb10/qwen3.8-flash-next/MODEL.toml` for the numbers).
+//!
+//! Still refused: the **stacked expert layout**, which neither published
+//! release uses.
 //!
 //! WHY THIS IS MOSTLY qwen35's LOADER. Qwen3.8-Flash-Next and Qwen3.6-35B-A3B
 //! share far more than the version numbers suggest: 3:1 GDN/full-attention
@@ -410,11 +415,13 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         _config: &ModelConfig,
         _gpu: &dyn GpuBackend,
     ) -> Result<Option<MtpWeights>> {
-        // Dropped for v1 (#753 item I). The MTP block is effectively a second
-        // model: its own 512-expert MoE, its own hyper-connection mixer, its
-        // own QSA indexer, and `fc_embedding`/`fc_hidden` where Atlas's
-        // `MtpWeights` wants a fused `eh_proj`. Wiring it before the main
-        // forward path works would be building on sand.
+        // Still `None`, and no longer because MTP is unsupported. The MTP
+        // block is effectively a second model: its own 512-expert MoE, its
+        // own hyper-connection mixer, its own QSA indexer, and
+        // `fc_embedding`/`fc_hidden` where Atlas's `MtpWeights` wants a fused
+        // `eh_proj`. It never fit this return type, so #753 item I gave it
+        // its own loader — `mtp::load_qwen4exp_mtp_module`, called from
+        // `factory::build` — and declining here is what routes callers to it.
         Ok(None)
     }
 }

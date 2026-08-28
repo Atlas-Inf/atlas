@@ -3,9 +3,53 @@
 #
 # Ported from Avarok #753/#754 (rsafier) onto the Atlas-Inf n-gram branch.
 # SERVES: mHC highway on all 48 layers, PLE at model layer 1, QSA decode and
-# prefill selection, vision tower, CUDA graphs, prefix caching, C>1. MTP is
-# refused at pre-flight (issue #753 item I) and the stacked expert layout is
-# unreached by both published releases.
+# prefill selection, vision tower, CUDA graphs, prefix caching, C>1, and MTP.
+# The stacked expert layout is unreached by both published releases.
+#
+# MTP WORKS, AND IT PAYS ONLY AT ONE DRAFT. #753 item I is done: the draft
+# module loads through its own loader (NOT the family `load_mtp_weights`,
+# which still declines this shape), proposes, and verifies on the mHC
+# highway, at C=1 and C=2 alike.
+#
+# THE DRAFT DEPTH IS THE WHOLE RESULT. Measured 2026-08-28 on one GB10,
+# 256-token completions, against a same-binary non-speculative control:
+#
+#   arm                            C=1 agg tok/s   C=2 agg tok/s
+#   base (no speculation)                  16.14           24.74
+#   --num-drafts 1, gate ARMED             19.11 (+18.4%)  23.19  (-6.3%)
+#   --num-drafts 1, gate forced            19.06 (+18.1%)  19.58 (-20.9%)
+#   --num-drafts 2, gate forced            15.76  (-2.4%)  16.61 (-32.9%)
+#
+# So: ONE draft. The default K ladder (`4:3,8:3,...`) asks for 3 drafts at
+# these widths, which is exactly the losing depth here -- `--num-drafts 1`
+# is what clamps it, and it is not optional on this target.
+#
+# LEAVE THE GATE ARMED and one serve covers the ladder. Measured doing its
+# job: at C=1 it holds Mtp for the full +18.4%; at C=2 it logs one
+# Mtp -> Serial switch (19.8 vs 27.0 tok/s) and accepted drafts fall from 94
+# per request to ~23, which recovers C=2 from -20.9% to -6.3%. That residual
+# is its periodic re-probe; `ATLAS_MTP_GATE_REPROBE` (default 256 tokens)
+# trades probe frequency against it.
+#
+# Why depth costs so much: each verify row routes to its own top-10 of 512
+# experts, so expert weight traffic scales with the row count while the
+# backbone does not. The measured marginal cost is ~0.34-0.50 of a full
+# decode step per extra verify row. Break-even needs tokens/step > 1 +
+# ~0.4*(K-1); at K=2 acceptance delivers 1.58 tokens/step against a 1.34
+# cost, and at K=3 it delivers 1.72 against 1.76.
+#
+# Why it inverts at C>1: batched decode is ALREADY amortizing exactly the
+# weight reads speculation exists to amortize, so the marginal value of a
+# draft falls as width rises. The throughput gate measures this per serve
+# and parks in Serial on its own, which is why `--speculative` is safe to
+# leave on -- it costs a short probe to rediscover.
+#
+# Two hard bounds also apply: the batched verify serves K<=3 (two drafts --
+# `Model::verify_max_drafts`, which the scheduler clamps to; before that
+# clamp `--num-drafts 3` asked for K=4, the highway refused mid-step, and a
+# verify error finishes the request, so every request died after one token),
+# and speculation is declined entirely above the QSA inert bound of 2051
+# visible tokens.
 #
 # TWO MODEL_TYPE NAMES, ONE ARCHITECTURE. The model shipped as
 # `qwen3_8_flash_next` and was renamed `qwen4_exp`; quantizers pinned to
@@ -292,6 +336,22 @@ thinking_in_tools = true
 # Anything that builds from source is immune, which is both runners here
 # (`scripts/dev/qwen4exp_quickstart.sh` and the Dockerfile).
 default_kv_dtype = "bf16"
+# ONE DRAFT, FOR THE SAME REASON BF16 KV IS THE DEFAULT: the right value is a
+# property of this target, not something the operator should have to know.
+#
+# K = num_drafts + 1, and the engine's K ladder (`4:3,8:3,16:1,32:1`) would
+# otherwise ask for 3 drafts at every width this box can serve -- which is the
+# one depth that LOSES here (-2.4% at C=1). At 1 draft MTP is +18.4%. The
+# measured break-even is `tokens/step > 1 + ~0.4*(K-1)`: each verify row routes
+# to its own top-10 of 512 experts, so expert weight traffic scales with rows
+# (~0.4 of a decode step per extra row) while acceptance only buys ~0.6 tokens.
+# K=2 clears it (1.58 delivered vs 1.34 cost); K=3 does not (1.72 vs 1.76).
+#
+# Precedence is CLI > MODEL.toml > engine default, so `--num-drafts` still
+# overrides for anyone deliberately measuring a deeper K. Like every key in
+# this file it is a BUILD-TIME input: an existing binary keeps the ladder's
+# depth until it is rebuilt.
+default_num_drafts = 1
 # WITHOUT THIS, TOOL CALLING IS SILENTLY OFF. `tools_active` in
 # `api/chat/prepare.rs` requires `state.tool_call_parser.is_some()`, and with
 # no parser configured the tool definitions are never passed to Jinja at all —
