@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 pub mod deepseek_v4_mtp;
+pub mod qwen4exp_mtp;
 pub mod dense_ffn;
 pub mod dflash_head;
 pub mod ep_dispatch;
@@ -56,6 +57,8 @@ pub(crate) fn w4a16_k64_min_k() -> u32 {
 }
 
 pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
+pub(crate) use deepseek_v4_mtp::argmax_grammar_masked;
+pub use qwen4exp_mtp::{Qwen4ExpMtpHead, Qwen4ExpMtpProposerState};
 pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,

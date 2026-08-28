@@ -74,9 +74,11 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 mod attach;
 mod ffn;
 mod hc;
+mod mtp;
 mod ple;
 mod probe;
 
+pub use mtp::{Qwen4ExpMtpModule, load_qwen4exp_mtp_module};
 pub use probe::audit_namespace;
 
 #[cfg(all(test, feature = "cuda"))]
