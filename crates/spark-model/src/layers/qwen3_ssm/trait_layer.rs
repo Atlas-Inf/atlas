@@ -34,8 +34,45 @@ impl TransformerLayer for Qwen3SsmLayer {
         Ok(())
     }
 
+    fn verify_prestage(
+        &self,
+        tokens: &[u32],
+        state: &mut dyn LayerState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        if let Some(ple) = self.ple.as_ref() {
+            let st = ple_seq_state(ple, state, gpu)?;
+            ple.prestage(st, tokens, gpu, stream)?;
+        }
+        Ok(())
+    }
+
     fn has_aux_state(&self) -> bool {
         self.ple.is_some()
+    }
+
+    fn rollback_aux_verify(
+        &self,
+        state: &mut dyn LayerState,
+        num_accepted: usize,
+        k: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(ple) = self.ple.as_ref() else {
+            return Ok(());
+        };
+        let Some(ssm) = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::SsmLayerState>()
+        else {
+            return Ok(());
+        };
+        if let Some(st) = ssm.ple.as_mut() {
+            ple.rollback_verify(st, num_accepted, k, gpu, stream)?;
+        }
+        Ok(())
     }
 
     /// PLE's per-seq host hash on the hc multi-seq decode path is
@@ -136,11 +173,9 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // v1 is C=1 only under an mHC highway: these paths keep their own
-        // residual bookkeeping, which the highway replaces. Refusing is the
-        // point — a batched GDN step running on an unmixed stream produces
-        // plausible, wrong activations. Avarok #753.
-        self.refuse_batched_under_hc("decode_batched")?;
+        // Under an mHC highway `decode_batched_inner` brackets the shared
+        // conv/GDN body with hc_pre/hc_post instead of its own residual
+        // bookkeeping (#753 item B) — no refusal needed.
         self.decode_batched_inner(
             hidden,
             residual,
@@ -163,7 +198,6 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.refuse_batched_under_hc("decode_verify_multi")?;
         anyhow::ensure!(
             states.len() == n_seqs && ks.len() == n_seqs,
             "decode_verify_multi: states/ks/n mismatch"

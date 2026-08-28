@@ -83,6 +83,20 @@ pub trait TransformerLayer: Send + Sync {
         Ok(())
     }
 
+    /// The K-token form, for a speculative VERIFY step: the whole draft
+    /// window is staged in one call, before capture/replay, exactly as
+    /// `decode_prestage` stages the single decode token. Layers with no
+    /// host-side decode work keep the no-op default.
+    fn verify_prestage(
+        &self,
+        _tokens: &[u32],
+        _state: &mut dyn LayerState,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Re-arm consumed prestage state so a failed CUDA-graph capture attempt
     /// can re-run the SAME step eagerly. Must be idempotent, and must not
     /// recompute (PLE's history already advanced in `decode_prestage`).
@@ -117,6 +131,22 @@ pub trait TransformerLayer: Send + Sync {
     /// to decline snapshots that lack aux rather than restore a stale mix.
     fn has_aux_state(&self) -> bool {
         false
+    }
+
+    /// Rewind that aux state to the `num_kept` verify tokens that were
+    /// accepted. A layer whose aux state advances per token MUST implement
+    /// this: the verify scanned K tokens, and the rejected tail would
+    /// otherwise stay in the committed state — the exact silent divergence
+    /// speculative decoding is supposed to be free of.
+    fn rollback_aux_verify(
+        &self,
+        _state: &mut dyn LayerState,
+        _num_accepted: usize,
+        _k: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Restore the aux state captured by [`Self::snapshot_aux`] on a
@@ -559,6 +589,49 @@ pub trait TransformerLayer: Send + Sync {
             block_table,
             disk_block_ids,
             disk_last_offloaded_per_layer,
+            ctx,
+            stream,
+        )
+    }
+
+    /// Decode `num_rows` rows that are NOT independent sequences: row `i`
+    /// belongs to sequence `row_owner[i]`, and `seq_states` is indexed by
+    /// sequence. This is the speculative-verify shape — K consecutive tokens
+    /// of one sequence, or a ragged batch of them.
+    ///
+    /// The default forwards to `decode_multi_seq` with throwaway per-row
+    /// states, which is exactly right for a layer that keeps no per-sequence
+    /// state at the sublayer. A layer that DOES keep some (qwen4_exp's QSA
+    /// indexer, whose `ingested` counter must advance once per row in order)
+    /// must override this — handing it a fresh state per row silently gives
+    /// the indexer an empty history.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_rows<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_rows: usize,
+        _seq_states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _row_owner: &[usize],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let mut owned: Vec<Box<dyn LayerState>> = (0..num_rows)
+            .map(|_| self.alloc_state(ctx.gpu))
+            .collect::<Result<_>>()?;
+        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
+            owned.iter_mut().map(|s| s.as_mut()).collect();
+        self.decode_multi_seq(
+            hidden,
+            residual,
+            num_rows,
+            &mut refs,
+            kv_cache,
+            seq_lens,
+            block_tables,
             ctx,
             stream,
         )

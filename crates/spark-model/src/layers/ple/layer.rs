@@ -30,11 +30,43 @@ pub struct PleSeqState {
     /// step's host work (hash + fault-in + slot upload) already ran BEFORE
     /// graph replay/capture. `forward` consumes it and enqueues kernels only.
     prestaged_va: Option<u64>,
+    /// How many token rows `prestaged_va` was staged for. A verify step
+    /// stages K of them; a decode step stages 1. `forward` consumes the
+    /// staging only when this matches its own `num_tokens` — a K=1 staging
+    /// consumed by a K=2 forward would gather one row and read the second
+    /// from whatever followed it.
+    prestaged_n: usize,
+    /// Per-row conv snapshots for the speculative verify in flight, slot `t`
+    /// holding the state after `t` rows (slot 0 = before the window). The
+    /// conv carry advances once per token and is NOT part of the SSM
+    /// checkpoint set, so a partially accepted verify would otherwise leave
+    /// it conditioned on rejected drafts — the n-gram injection for every
+    /// later token then reads a history that never happened.
+    verify_snaps: DevicePtr,
+    /// Rows with a valid snapshot. 0 = none (a prefill-width forward skips
+    /// the per-row split), so a rollback then has nothing to restore.
+    verify_snap_rows: usize,
+    /// `history` as it stood before the window, plus the window's ids —
+    /// together these rebuild the history for any accepted prefix.
+    history_ckpt: Vec<u32>,
+    verify_tokens: Vec<u32>,
     /// The last VA `prestage` staged, never cleared. `rearm` restores it when
     /// a failed capture attempt re-runs the step eagerly: the slots are still
     /// in `slots_dev` and history has already advanced, so re-hashing would
     /// double-count the token — re-arming is the only correct recovery.
     last_staged_va: u64,
+}
+
+/// Verify windows this layer can roll back: slot `t` = state after `t` rows,
+/// so K rows need K+1 slots. K is `num_drafts + 1` and the batched MoE arms
+/// stop at 8, which is the bound this matches.
+const VERIFY_SNAP_SLOTS: usize = 9;
+
+/// Bisection hatch: `ATLAS_PLE_VERIFY_SNAPSHOTS=0` restores the single batched
+/// conv launch, which leaves nothing for `rollback_verify` to restore — the
+/// PLE carry then keeps rejected drafts. Debug only.
+fn verify_snapshots_enabled() -> bool {
+    std::env::var("ATLAS_PLE_VERIFY_SNAPSHOTS").ok().as_deref() != Some("0")
 }
 
 pub struct PleLayer {
@@ -162,8 +194,13 @@ impl PleLayer {
     pub fn new_seq_state(&self, gpu: &dyn GpuBackend) -> Result<PleSeqState> {
         Ok(PleSeqState {
             conv: gpu.alloc(self.state_len * self.hc_mult * self.hidden * 4)?,
+            verify_snaps: gpu.alloc(VERIFY_SNAP_SLOTS * self.conv_bytes())?,
+            verify_snap_rows: 0,
+            history_ckpt: Vec::new(),
+            verify_tokens: Vec::new(),
             history: Vec::new(),
             prestaged_va: None,
+            prestaged_n: 0,
             last_staged_va: 0,
         })
     }
@@ -175,6 +212,83 @@ impl PleLayer {
 
     /// Restore the prestaged state after a failed CUDA-graph capture attempt
     /// (the eager replay re-runs `forward`, which consumed `prestaged_va`).
+    /// Bytes in one conv carry — `[(k-1)*dilation, channels]` FP32.
+    fn conv_bytes(&self) -> usize {
+        self.state_len * self.hc_mult * self.hidden * 4
+    }
+
+    /// Rewind this sequence's PLE carry to the `num_kept` verify tokens that
+    /// were accepted (the bonus token included).
+    ///
+    /// Both halves of the carry move: the device conv window comes back from
+    /// the per-row snapshot taken during the forward, and the host n-gram
+    /// history is rebuilt from the pre-window copy plus the accepted ids.
+    /// Rebuilt rather than truncated because `history` is a FIXED-WIDTH
+    /// window — tokens fall off the front as it advances, so the dropped ones
+    /// have to come back too.
+    pub fn rollback_verify(
+        &self,
+        st: &mut PleSeqState,
+        num_accepted: usize,
+        k: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            num_accepted <= k,
+            "PLE rollback: {num_accepted} accepted of a {k}-row verify"
+        );
+        if num_accepted == k {
+            // Full accept: the live carry IS the committed one. Still finalize
+            // the window so a later rollback cannot restore against it.
+            st.verify_snap_rows = 0;
+            st.verify_tokens.clear();
+            return Ok(());
+        }
+        // Reaching here means rows were REJECTED, so the carry has advanced
+        // past the committed prefix and must come back. If the forward took
+        // the batched conv (no per-row carry) there is nothing to come back
+        // to — failing loudly beats leaving the carry conditioned on drafts
+        // that were thrown away, which is invisible until the n-gram
+        // injections have drifted for hundreds of tokens.
+        anyhow::ensure!(
+            st.verify_snap_rows == k,
+            "PLE rollback for a {k}-row verify but {} row(s) were snapshotted \
+             — the carry advanced past the accepted prefix with nothing to \
+             restore from. K must stay under VERIFY_SNAP_SLOTS ({}) and \
+             ATLAS_PLE_VERIFY_SNAPSHOTS must not be 0 when MTP is on.",
+            st.verify_snap_rows,
+            VERIFY_SNAP_SLOTS
+        );
+        anyhow::ensure!(
+            st.verify_tokens.len() == k,
+            "PLE rollback: {} staged id(s) for a {k}-row verify — the history \
+             rebuild would be short and silently wrong.",
+            st.verify_tokens.len()
+        );
+        let num_kept = num_accepted;
+        let cb = self.conv_bytes();
+        gpu.copy_d2d_async(st.verify_snaps.offset(num_kept * cb), st.conv, cb, stream)?;
+
+        let keep = self.dims.context_len();
+        let mut window = st.history_ckpt.clone();
+        window.extend_from_slice(&st.verify_tokens[..num_kept]);
+        if window.len() >= keep {
+            st.history = window[window.len() - keep..].to_vec();
+        } else {
+            // Shorter than one window only before the first reset; leave the
+            // history invalid-length so `forward` re-seeds it via `reset`.
+            st.history = window;
+        }
+        // A staging built for the rejected window must not be consumed by the
+        // next step: it hashed ids that are no longer the sequence's history.
+        st.prestaged_va = None;
+        st.prestaged_n = 0;
+        st.verify_snap_rows = 0;
+        st.verify_tokens.clear();
+        Ok(())
+    }
+
     pub fn rearm(&self, st: &mut PleSeqState) {
         if st.last_staged_va != 0 {
             st.prestaged_va = Some(st.last_staged_va);
@@ -195,6 +309,21 @@ impl PleLayer {
         stream: u64,
     ) -> Result<()> {
         self.forward_with_ids(st, highway_row, 1, false, Some(ids), ctx, stream)
+    }
+
+    /// Multi-token forward against an EXPLICIT id slice — the batched verify
+    /// path, where the rows of one sequence are a sub-slice of the batch's
+    /// host ids rather than its prefix. `fresh` is false: a verify step never
+    /// starts a sequence.
+    pub fn forward_rows(
+        &self,
+        st: &mut PleSeqState,
+        highway: DevicePtr,
+        ids: &[u32],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.forward_with_ids(st, highway, ids.len(), false, Some(ids), ctx, stream)
     }
 
     pub fn forward(
@@ -273,7 +402,14 @@ impl PleLayer {
         // `Some` here on a prefill call is ordinary leftover from the
         // previous request's last replayed step, not an error. Only a
         // single-token, non-fresh decode may consume it.
-        let prestaged = st.prestaged_va.take().filter(|_| num_tokens == 1 && !fresh);
+        // The staging must have been built for exactly this many rows: see
+        // `prestaged_n`. A verify step (K rows) and a decode step (1 row) both
+        // qualify — what does not is consuming one for the other.
+        let staged_n = st.prestaged_n;
+        let prestaged = st
+            .prestaged_va
+            .take()
+            .filter(|_| !fresh && staged_n == num_tokens);
         if fresh || st.history.len() != self.dims.context_len() {
             self.reset(st, gpu, stream)?;
         }
@@ -293,6 +429,9 @@ impl PleLayer {
             // history ++ tokens, hashed together, then keep the new tokens'
             // rows — the same slice the reference takes with
             // `[:, -input_ids.shape[1]:]`.
+            // Same bookkeeping as `prestage` — see `rollback_verify`.
+            st.history_ckpt = st.history.clone();
+            st.verify_tokens = tokens.clone();
             let mut window = st.history.clone();
             window.extend_from_slice(&tokens);
             let all = ple_ngram_ids(&self.dims, &window);
@@ -356,20 +495,50 @@ impl PleLayer {
             self.eps,
             stream,
         )?;
-        ops::ple_conv(
-            gpu,
-            self.conv_k,
-            self.gated_normed,
-            self.gated,
-            self.conv1d.weight,
-            st.conv,
-            self.out,
-            num_tokens as u32,
-            c as u32,
-            self.k_size as u32,
-            self.dilation as u32,
-            stream,
-        )?;
+        // The conv carry is the one piece of PLE state a speculative verify
+        // has to be able to rewind, so at verify widths the launch is split
+        // per row and each row's resulting carry is parked. At prefill widths
+        // that would be thousands of launches for a carry nothing rolls back,
+        // so the batched form stays and `verify_snap_rows` says "no snapshots".
+        let cb = self.conv_bytes();
+        if num_tokens < VERIFY_SNAP_SLOTS && verify_snapshots_enabled() {
+            gpu.copy_d2d_async(st.conv, st.verify_snaps, cb, stream)?;
+            for t in 0..num_tokens {
+                let row = t * c * 4; // [T, c] FP32
+                ops::ple_conv(
+                    gpu,
+                    self.conv_k,
+                    self.gated_normed.offset(row),
+                    self.gated.offset(row),
+                    self.conv1d.weight,
+                    st.conv,
+                    self.out.offset(row),
+                    1,
+                    c as u32,
+                    self.k_size as u32,
+                    self.dilation as u32,
+                    stream,
+                )?;
+                gpu.copy_d2d_async(st.conv, st.verify_snaps.offset((t + 1) * cb), cb, stream)?;
+            }
+            st.verify_snap_rows = num_tokens;
+        } else {
+            ops::ple_conv(
+                gpu,
+                self.conv_k,
+                self.gated_normed,
+                self.gated,
+                self.conv1d.weight,
+                st.conv,
+                self.out,
+                num_tokens as u32,
+                c as u32,
+                self.k_size as u32,
+                self.dilation as u32,
+                stream,
+            )?;
+            st.verify_snap_rows = 0;
+        }
         ops::ple_add_highway(
             gpu,
             self.add_k,

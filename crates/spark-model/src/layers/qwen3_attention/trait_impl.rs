@@ -115,6 +115,33 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.qsa.is_some()
     }
 
+    fn rollback_aux_verify(
+        &self,
+        state: &mut dyn LayerState,
+        num_accepted: usize,
+        k: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(());
+        };
+        let Some(attn) = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::AttnLayerState>()
+        else {
+            return Ok(());
+        };
+        if let Some(st) = attn.qsa.as_mut() {
+            anyhow::ensure!(
+                num_accepted <= k,
+                "QSA rollback: {num_accepted} accepted of a {k}-row verify"
+            );
+            qsa.rewind_verify(st, k - num_accepted)?;
+        }
+        Ok(())
+    }
+
     fn snapshot_aux(
         &self,
         state: &dyn LayerState,
@@ -271,6 +298,34 @@ impl TransformerLayer for Qwen3AttentionLayer {
             residual,
             num_seqs,
             states,
+            None,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+        )
+    }
+
+    fn decode_multi_seq_rows<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_rows: usize,
+        seq_states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        row_owner: &[usize],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_multi_seq_inner(
+            hidden,
+            residual,
+            num_rows,
+            seq_states,
+            Some(row_owner),
             kv_cache,
             seq_lens,
             block_tables,

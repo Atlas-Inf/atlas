@@ -337,6 +337,41 @@ impl QsaIndexer {
         Ok(())
     }
 
+    /// Rewind the indexer by the `rejected` tail of a speculative verify.
+    ///
+    /// Stated as a DELTA against what the verify just ingested, not as a
+    /// target derived from a pre-verify watermark: the watermark only works
+    /// if every verify path pairs a checkpoint with its rollback, and the MTP
+    /// path commits through `commit_accepted_prefix` while only the
+    /// self-speculative path goes through `checkpoint_ssm_states`. The delta
+    /// needs no pairing — the verify scanned `k` rows and kept `num_accepted`,
+    /// so exactly `k - num_accepted` ingests have to come back off.
+    ///
+    /// Raw keys past the new end stay in `raw_keys` but are dead: the next
+    /// ingest overwrites them before anything reads them. A pooled block
+    /// strictly below `ingested / ratio` lies wholly inside the accepted
+    /// prefix, so keeping those is exact; anything above is dropped and
+    /// re-pooled from corrected keys.
+    pub fn rewind_verify(&self, st: &mut QsaSeqState, rejected: usize) -> Result<()> {
+        if rejected == 0 {
+            return Ok(());
+        }
+        // Not `saturating_sub`: rewinding more than was ingested means the
+        // caller's `k` and the rows actually scanned disagree, and clamping to
+        // zero would turn that dispatcher bug into a sequence that silently
+        // re-ingests from the start.
+        anyhow::ensure!(
+            st.ingested >= rejected,
+            "QSA rewind of {rejected} row(s) with only {} ingested — the \
+             verify width and the rows actually scanned disagree.",
+            st.ingested
+        );
+        anyhow::ensure!(self.ratio > 0, "QSA ratio is 0");
+        st.ingested -= rejected;
+        st.pooled = st.pooled.min(st.ingested / self.ratio as usize);
+        Ok(())
+    }
+
     /// Decode-step ingest + selection for the token at `pos` (0-based;
     /// `pos + 1` visible). `None` inside the inert bound (dense is exact).
     #[allow(clippy::too_many_arguments)]
