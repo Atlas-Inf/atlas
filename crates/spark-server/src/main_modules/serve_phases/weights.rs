@@ -93,7 +93,7 @@ pub(crate) fn load_weight_store(
                 );
             }
             loader.skip_activation_scales = skip_activation_scales(config);
-            loader.skip_mtp = skip_mtp(config);
+            loader.skip_mtp = skip_mtp(config, args);
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
@@ -117,7 +117,7 @@ pub(crate) fn load_weight_store(
         };
         loader.peak_memory_multiplier = mult;
         loader.skip_activation_scales = skip_activation_scales(config);
-        loader.skip_mtp = skip_mtp(config);
+        loader.skip_mtp = skip_mtp(config, args);
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?
@@ -271,10 +271,15 @@ fn skip_activation_scales(config: &ModelConfig) -> bool {
 /// Whether this model's loader builds no MTP head, so `mtp.*` need not be
 /// uploaded at all.
 ///
-/// `Qwen4ExpWeightLoader::load_mtp_weights` returns `None` (#753 item I: the
-/// MTP block is effectively a second model — its own 512-expert MoE, its own
-/// hyper-connection mixer, its own indexer). Uploading ~1.5 GB of weights
-/// that are then discarded is memory the KV cache needs.
-fn skip_mtp(config: &ModelConfig) -> bool {
-    matches!(config.model_type.as_str(), "qwen4_exp")
+/// Measured, not estimated: `mtp.*` on this checkpoint is 5.21 GB (31 tensors,
+/// 5.03 GB of which is the stacked BF16 expert pair) — not the ~1.5 GB an
+/// earlier note claimed. That is 3.5x the figure the original drop was argued
+/// against, and on a box where 0.90 utilization is already near the boot floor
+/// it is the difference between a usable KV cache and none.
+fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
+    // qwen4_exp now BUILDS an MTP head, but only under `--speculative`
+    // (`weight_loader/qwen4_exp/mtp.rs`). Without the flag the `mtp.*` upload is
+    // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
+    // comes straight out of the KV cache. With the flag it is the drafter.
+    matches!(config.model_type.as_str(), "qwen4_exp") && !args.speculative
 }

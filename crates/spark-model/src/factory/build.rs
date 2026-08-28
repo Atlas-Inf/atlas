@@ -223,10 +223,35 @@ pub fn build_model(
             None
         };
 
+    // Qwen3.8-Flash-Next ships an MTP block that is architecturally a full
+    // layer (gated attention + QSA indexer + mHC + 512-expert MoE), not the
+    // Qwen-shaped `MtpWeights`, so it loads through its own path exactly like
+    // DeepSeek-V4's. Rank 0 only: no other rank ever drafts.
+    let q4e_mtp_module =
+        if config.model_type == "qwen4_exp" && use_speculative && config.ep_rank == 0 {
+            match crate::weight_loader::qwen4_exp::load_qwen4exp_mtp_module(
+                &store,
+                &config,
+                gpu.as_ref(),
+                &attn_layer_dtypes,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("qwen4_exp MTP module load FAILED: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let q4e_mtp_loaded = q4e_mtp_module.is_some();
+    let q4e_mtp_embed = embed;
+    let q4e_mtp_lm_head = lm_head;
+
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
     // this loudly so the user knows the flag was inert.
-    if use_speculative && mtp_weights.is_empty() {
+    if use_speculative && mtp_weights.is_empty() && !q4e_mtp_loaded {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
              model — speculative decoding will be disabled. Either drop `--speculative` \
@@ -617,6 +642,34 @@ pub fn build_model(
             }
             Err(e) => tracing::warn!(
                 "Failed to build DeepSeek-V4 MTP proposer: {e:#}. Speculative decoding disabled."
+            ),
+        }
+    }
+
+    // ── Step 6c: Qwen3.8-Flash-Next MTP proposer (optional) ──
+    //
+    // Same shape as 6b: the module holds a reused trunk layer, and the
+    // proposer supplies the MTP-specific ends (the per-stream combiner in
+    // front, the head mixer behind).
+    if let Some(q4e_module) = q4e_mtp_module {
+        match crate::layers::Qwen4ExpMtpHead::new(
+            q4e_module,
+            q4e_mtp_embed,
+            q4e_mtp_lm_head,
+            model.config_ref(),
+            model.gpu_backend(),
+            mtp_vocab_size,
+            max_seq_len,
+        ) {
+            Ok(head) => {
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(
+                    "qwen4_exp MTP speculative decoding: ENABLED (single module, \
+                     reused full-attention body)"
+                );
+            }
+            Err(e) => tracing::warn!(
+                "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
             ),
         }
     }

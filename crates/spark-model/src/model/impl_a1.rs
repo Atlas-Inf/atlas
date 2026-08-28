@@ -187,8 +187,18 @@ impl TransformerModel {
         // main head (NVFP4 default) or the draft-only head built when the main
         // head is BF16. `draft_lm_head_nvfp4` resolves to whichever is present.
         let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
+        // qwen4_exp installs its MTP proposer AFTER construction (its module is
+        // a reused trunk layer, not the Qwen-shaped `MtpWeights`), so
+        // `mtp_weights` is empty here even though drafting WILL run. Its 36 GDN
+        // layers still need the verify/checkpoint pools: without them the very
+        // first draft indexes `conv_intermediate_pools[0]` on a zero-length
+        // Vec and panics. DeepSeek-V4 reaches the proposer the same way but has
+        // no SSM layers, so it never exercised this. Its draft head is BF16
+        // dense, hence no `draft_lm_head_nvfp4` requirement.
+        let external_mtp_module = use_speculative && config.model_type == "qwen4_exp";
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights.is_empty() && draft_lm_head_nvfp4.is_some())
+            || external_mtp_module
             || dflash_kgamma > 0;
         let num_intermediates = if has_mtp {
             (num_drafts + 1).max(dflash_kgamma)

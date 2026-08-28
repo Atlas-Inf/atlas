@@ -453,7 +453,7 @@ impl DeepseekV4MtpHead {
 /// logit vector, mask off (→ -inf) tokens the grammar rejects, argmax on CPU.
 /// Returns `0` (pad) when the matcher's allowed set is empty so the draft is
 /// rejected at verify rather than emitting a possibly-special token.
-fn argmax_grammar_masked(
+pub(crate) fn argmax_grammar_masked(
     gpu: &dyn GpuBackend,
     logits: DevicePtr,
     vocab: usize,
