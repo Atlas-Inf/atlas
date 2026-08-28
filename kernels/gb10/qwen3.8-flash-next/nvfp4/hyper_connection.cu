@@ -408,6 +408,102 @@ extern "C" __global__ void hc_pre_down(
     }
 }
 
+// Stage 3, COALESCED twin of `hc_pre_finish` below — same math, same
+// arguments, warp-per-output-dim instead of thread-per-output-dim.
+//
+// WHY. The parent assigns one output dim `d` to one THREAD, and that thread
+// walks a contiguous rank-320 row of `up_w` on its own. Consecutive threads
+// therefore touch rows 640 B apart, so every load in the warp lands on a
+// different sector: nsys measured the parent at a flat ~173 us regardless of
+// T, ~38 GB/s against the part's ~273, and 23% of ALL decode GPU time
+// (11.86 s of 51.47 s) — the single largest kernel in the profile. It is
+// occupancy-starved too: grid (T, 10) x 256 threads is 5,120 threads.
+//
+// Its own sibling `hc_pre_down` already does this correctly — warp per row,
+// lanes striding the contraction — and runs the SAME grid in 43 us with 4x
+// the threads. This is that pattern applied to stage 3: lane `l` reads
+// `urow[l], urow[l+32], ...`, so a warp's 32 lanes read 32 CONSECUTIVE bf16
+// (64 B, two sectors) instead of 32 scattered lines, and the d-range is
+// spread over warps*gridDim.y rather than blockDim.x*gridDim.y.
+//
+// The contraction is reassociated (lane-strided partials + a shfl tree rather
+// than one sequential accumulation), so results are not bit-identical to the
+// parent. That is the same class of reordering the batched decode paths
+// already sit on; `ATLAS_NO_HC_FINISH_WC=1` selects the parent for A/B.
+extern "C" __global__ void hc_pre_finish_wc(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const float* __restrict__ low,             // [T, rank]
+    const __nv_bfloat16* __restrict__ up_w,    // [hc*H, rank]
+    const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
+    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    float* __restrict__ inj_out,               // [T, hc] (unused if null inject)
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const float* nx = normed + (size_t)t * hc_dim;
+    const float inv_hc = 1.0f / (float)hc;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int warps = blockDim.x >> 5;
+
+    extern __shared__ float smem_lo[];         // [rank]
+    for (unsigned int r = tid; r < rank; r += blockDim.x) {
+        smem_lo[r] = low[(size_t)t * rank + r];
+    }
+    __syncthreads();
+
+    // One warp per output dim. Dims are split over gridDim.y first, then over
+    // the warps of this block — so total parallelism is warps*gridDim.y*T,
+    // not blockDim.x*gridDim.y*T with each thread serialised over `rank`.
+    const unsigned int dims_per_split = (H + gridDim.y - 1) / gridDim.y;
+    const unsigned int d0 = blockIdx.y * dims_per_split;
+    const unsigned int d1 = min(d0 + dims_per_split, H);
+    __nv_bfloat16* y = y_out + (size_t)t * H;
+    for (unsigned int d = d0 + warp; d < d1; d += warps) {
+        float mixed = 0.0f;
+        for (unsigned int s2 = 0; s2 < hc; ++s2) {
+            const unsigned int i = s2 * H + d;
+            const __nv_bfloat16* urow = up_w + (size_t)i * rank;
+            float acc = 0.0f;
+            for (unsigned int r = lane; r < rank; r += 32) {
+                acc += (float)urow[r] * smem_lo[r];
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+            }
+            // Every lane needs the gate to keep the accumulation in lane 0's
+            // register set only; broadcast rather than re-reduce.
+            acc = __shfl_sync(0xFFFFFFFFu, acc, 0);
+            mixed += qhc_sigmoid(acc) * nx[i];
+        }
+        if (lane == 0) y[d] = __float2bfloat16(mixed * inv_hc);
+    }
+
+    // Injection vector: unchanged from the parent, still once per t.
+    if (inject_w != nullptr && blockIdx.y == 0) {
+        for (unsigned int s2 = warp; s2 < hc; s2 += warps) {
+            const __nv_bfloat16* row = inject_w + (size_t)s2 * hc_dim;
+            float acc = 0.0f;
+            for (unsigned int i = lane; i < hc_dim; i += 32) {
+                acc += (float)row[i] * nx[i];
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+            }
+            if (lane == 0) {
+                inj_out[(size_t)t * hc + s2] = 2.0f * qhc_sigmoid(acc * inv_hc);
+            }
+        }
+    }
+}
+
 // Stage 3: y[d] = mean_s sigmoid(up[s*H+d] . low) * normed[s*H+d], the
 // d-range split over blockIdx.y; block y==0 also emits the injection vector.
 extern "C" __global__ void hc_pre_finish(

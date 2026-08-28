@@ -421,6 +421,94 @@ fn hc_pre_split(
         .arg_u32(w.rank as u32)
         .launch(stream)?;
 
+    // Stage 3 is the largest kernel in the decode profile: 23% of all GPU
+    // time (11.86 s of 51.47 s, nsys 2026-08-28), a flat ~173 us regardless of
+    // T, ~38 GB/s against the part's ~273. Each output dim gets its own THREAD
+    // and that thread walks a contiguous rank-320 row of `up_w` out of global,
+    // so consecutive threads touch rows 640 B apart and every warp load
+    // scatters over 32 sectors.
+    //
+    // `hc_pre_finish_wc` fixes the access pattern (warp per output dim, lanes
+    // striding the contraction — the shape `hc_pre_down` already uses) and is
+    // worth a lot end-to-end. One GB10, 256-token completions, agg tok/s:
+    //
+    //   arm                C=1 base    C=1 MTP     C=2 base
+    //   parent                16.14      20.11        24.74
+    //   _wc                   19.46      23.63        29.47
+    //                       (+20.6%)   (+17.5%)     (+19.1%)
+    //
+    // It is OPT-IN anyway. It reassociates the rank contraction (lane-strided
+    // partials + a shuffle tree instead of one sequential accumulation) and
+    // runs on all 48 layers, so the served logits MOVE: greedy text matched
+    // the parent on 2 of 8 prompts, the same rate as the engine's existing
+    // batch-width floor. That is not evidence of safety here — this
+    // checkpoint has been measured flipping `live_irrelevance` from a decline
+    // into a fabricated tool call on decode-path numerics alone. Default
+    // stays the parent until an accuracy leg clears the twin.
+    //
+    // A BIT-EXACT coalesced variant was built and measured, and does not
+    // work. Staging `up_w` through shared memory preserves the FMA order
+    // (verified: identical text hash, zero differing bytes across the dumped
+    // FP32 logit prefix) but costs 44% — 9.06 vs 16.10 tok/s. Thread-per-dim
+    // already caps parallelism at H threads per token, and a tile large
+    // enough to matter is ~42 KB, which caps occupancy near one block per SM.
+    // A 5-pass and a 1-pass staging measured the same (9.40 / 9.06), so the
+    // __syncthreads were not the cost — the smem budget was.
+    //
+    // The route to BOTH is a layout change, not a kernel change: store `up_w`
+    // transposed as `[rank, hc*H]`, so thread d reads `up_w_t[r*hc_dim + i]`
+    // — coalesced by construction, no smem, no syncs, per-thread accumulation
+    // order untouched. That touches the other three `up_w` readers (the fused
+    // hc_pre, the split stage, and the `low x up_w^T` GEMM), so it is its own
+    // change rather than a rider on this one.
+    if hc_finish_wc()
+        && let Some(k) = gpu
+            .kernel("hyper_connection", "hc_pre_finish_wc")
+            .ok()
+            .filter(|k| k.0 != 0)
+    {
+        // gridDim.y splits H over WARPS here, not over threads.
+        const WC_BLOCK: u32 = 256;
+        let ysplit = hidden_size.div_ceil(WC_BLOCK / 32).max(1);
+        return KernelLaunch::new(gpu, k)
+            .grid([num_tokens, ysplit, 1])
+            .block([WC_BLOCK, 1, 1])
+            .shared_mem(w.rank as u32 * 4)
+            .arg_ptr(normed)
+            .arg_ptr(low)
+            .arg_ptr(w.up_w)
+            .arg_ptr(if inject { w.inject_w } else { DevicePtr::NULL })
+            .arg_ptr(y_out)
+            .arg_ptr(inj_out)
+            .arg_u32(hidden_size)
+            .arg_u32(hc_mult)
+            .arg_u32(w.rank as u32)
+            .launch(stream);
+    }
+
+    finish_parent(
+        gpu, k_fin, normed, low, w, y_out, inj_out, num_tokens, hidden_size,
+        hc_mult, inject, stream,
+    )
+}
+
+/// The original thread-per-dim stage 3. Also the fallback when a twin cannot
+/// serve the shape (rank wider than the staging tile).
+#[allow(clippy::too_many_arguments)]
+fn finish_parent(
+    gpu: &dyn GpuBackend,
+    k_fin: KernelHandle,
+    normed: DevicePtr,
+    low: DevicePtr,
+    w: &HcLowRank,
+    y_out: DevicePtr,
+    inj_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    inject: bool,
+    stream: u64,
+) -> Result<()> {
     let fsplit = (48 / num_tokens.max(1)).clamp(1, 10);
     KernelLaunch::new(gpu, k_fin)
         .grid([num_tokens, fsplit, 1])
@@ -436,4 +524,12 @@ fn hc_pre_split(
         .arg_u32(hc_mult)
         .arg_u32(w.rank as u32)
         .launch(stream)
+}
+
+/// Opt in to the coalesced stage-3 twin (`ATLAS_HC_FINISH=wc`). Off by
+/// default: it is ~+20% end-to-end but reassociates the rank contraction, so
+/// the served logits move on all 48 layers. See the dispatch comment.
+fn hc_finish_wc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_HC_FINISH").ok().as_deref() == Some("wc"))
 }
