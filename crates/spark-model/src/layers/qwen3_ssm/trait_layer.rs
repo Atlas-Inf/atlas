@@ -52,6 +52,24 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.ple.is_some()
     }
 
+    /// K=2 and K=3 are the verify widths this layer's mHC batched decode
+    /// actually has MoE arms for (`forward_k2`/`forward_k3`); K=4..8 goes
+    /// through `try_forward_km`, which is dense-only, and a dense FFN can
+    /// also fall back to `forward_prefill` at any K. So a 512-expert MoE
+    /// under the highway tops out at K=3 — two drafts. Off the highway the
+    /// batched path stages per row and nothing here bounds it.
+    ///
+    /// Reported rather than discovered: `trait_decode_batched_hc` bails on
+    /// an unservable K, and that bail reaches the scheduler as a verify
+    /// error, which finishes the request. `--num-drafts 3` on this model
+    /// used to kill every request after one token that way.
+    fn verify_max_drafts(&self) -> Option<usize> {
+        if self.hc.is_none() || self.ffn.is_dense() {
+            return None;
+        }
+        Some(2)
+    }
+
     fn rollback_aux_verify(
         &self,
         state: &mut dyn LayerState,

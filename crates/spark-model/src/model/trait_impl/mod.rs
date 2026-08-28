@@ -358,6 +358,12 @@ impl Model for TransformerModel {
             .filter_map(|l| l.verify_context_limit())
             .min()
     }
+    fn verify_max_drafts(&self) -> Option<usize> {
+        self.layers
+            .iter()
+            .filter_map(|l| l.verify_max_drafts())
+            .min()
+    }
     fn has_proposer(&self) -> bool {
         self.has_proposer_dispatch()
     }

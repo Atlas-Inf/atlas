@@ -838,7 +838,19 @@ pub(crate) fn load_model(
             "Self-speculative decoding: ENABLED ({num_drafts} drafts/step, layer-skipping)"
         );
     } else if use_speculative {
-        tracing::info!("Speculative decoding: ENABLED ({num_drafts} drafts/step)");
+        // A model can cap the verify width below what was asked for (the mHC
+        // highway has MoE arms for K=2/3 only). The scheduler clamps every
+        // step to it; say so here, or the operator reads back a depth the
+        // serve will never dispatch.
+        match scheduler_model.verify_max_drafts() {
+            Some(max_nd) if max_nd < num_drafts => tracing::warn!(
+                "Speculative decoding: ENABLED ({max_nd} drafts/step) — \
+                 --num-drafts {num_drafts} CLAMPED to {max_nd}: this model's batched \
+                 verify serves at most K={} rows.",
+                max_nd + 1
+            ),
+            _ => tracing::info!("Speculative decoding: ENABLED ({num_drafts} drafts/step)"),
+        }
     } else if scheduler_model.has_proposer() {
         tracing::info!(
             "MTP proposer available but speculative decoding disabled (use --speculative to enable)"

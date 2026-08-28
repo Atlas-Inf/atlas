@@ -147,6 +147,21 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// Deepest `num_drafts` this layer can serve in a BATCHED verify, if it
+    /// is bounded at all. The verify runs `K = num_drafts + 1` rows.
+    ///
+    /// The width half of the same story `verify_context_limit` tells about
+    /// depth: the mHC highway's batched decode has a FIXED set of K-shaped
+    /// MoE arms (`forward_k2`/`forward_k3`, and `forward_km` for K=4..8 on
+    /// dense FFNs only). Ask a 512-expert MoE under the highway for K=4 and
+    /// it refuses — correctly, it has no per-row staging — but the refusal
+    /// arrives as a verify error, and a verify error finishes the request.
+    /// A `--num-drafts` the model cannot serve must therefore be clamped
+    /// BEFORE dispatch, not discovered inside the step.
+    fn verify_max_drafts(&self) -> Option<usize> {
+        None
+    }
+
     /// Rewind that aux state to the `num_kept` verify tokens that were
     /// accepted. A layer whose aux state advances per token MUST implement
     /// this: the verify scanned K tokens, and the rejected tail would

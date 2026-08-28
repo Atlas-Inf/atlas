@@ -552,6 +552,15 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Deepest `num_drafts` a batched verify may dispatch, or `None` when
+    /// nothing bounds it. The tightest bound across the layers; the
+    /// scheduler clamps every speculative step's draft count to it, because
+    /// a layer that cannot serve the width answers with a verify error and
+    /// a verify error finishes the request.
+    fn verify_max_drafts(&self) -> Option<usize> {
+        None
+    }
+
     /// Check if speculative decoding is available (MTP or self-speculative).
     fn has_proposer(&self) -> bool;
 
