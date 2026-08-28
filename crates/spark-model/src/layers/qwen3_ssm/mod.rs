@@ -376,6 +376,7 @@ mod trait_decode_batched_conv_gdn_exact;
 mod trait_decode_batched_conv_gdn_multi;
 mod trait_decode_batched_conv_gdn_multi_exact;
 mod trait_decode_batched_conv_gdn_wyn;
+mod trait_decode_batched_hc;
 mod trait_decode_hc;
 mod trait_decode_multi_seq;
 mod trait_layer;

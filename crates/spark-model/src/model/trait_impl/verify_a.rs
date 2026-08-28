@@ -156,7 +156,7 @@ impl TransformerModel {
                         graph_capture: false,
                         gdn_exact_replay: false,
                         token_ids: None,
-                        host_token_ids: None,
+                        host_token_ids: Some(&tokens[t..t + 1]),
                         routed_lora_layers: None, // #30: verify decode; no prefill route.
                         midchunk_capture: None,
                         moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
@@ -193,7 +193,10 @@ impl TransformerModel {
                     graph_capture: false,
                     gdn_exact_replay: false,
                     token_ids: None,
-                    host_token_ids: None,
+                    // The K-token window `decode_batched` scans. Eager path, so
+                    // PLE may do its own host hash — but it still needs the ids,
+                    // and reading them back from the device is what this avoids.
+                    host_token_ids: Some(&tokens[..k]),
                     routed_lora_layers: None, // #30: verify decode; no prefill route.
                     midchunk_capture: None,
                     moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
@@ -359,6 +362,7 @@ impl TransformerModel {
                 }
             }
         }
+
 
         let stream = self.gpu.default_stream();
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);

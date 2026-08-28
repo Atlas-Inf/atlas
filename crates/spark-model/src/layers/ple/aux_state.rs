@@ -55,6 +55,10 @@ impl PleLayer {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         st.prestaged_va = None;
+        st.prestaged_n = 0;
+        st.verify_snap_rows = 0;
+        st.verify_tokens.clear();
+        st.history_ckpt.clear();
         gpu.copy_h2d_async(&blob[4 + n * 4..], st.conv, stream)?;
         Ok(())
     }
@@ -70,6 +74,13 @@ impl PleLayer {
     ) -> Result<()> {
         st.history = vec![self.dims.eos_token_id; self.dims.context_len()];
         st.prestaged_va = None;
+        st.prestaged_n = 0;
+        // A reused sequence must not inherit the previous one's verify window:
+        // a stale `verify_snap_rows` would let a rollback restore a carry that
+        // belongs to a different request.
+        st.verify_snap_rows = 0;
+        st.verify_tokens.clear();
+        st.history_ckpt.clear();
         let zeros = vec![0u8; self.state_len * self.hc_mult * self.hidden * 4];
         gpu.copy_h2d_async(&zeros, st.conv, stream)?;
         Ok(())
@@ -95,6 +106,12 @@ impl PleLayer {
         if st.history.len() != self.dims.context_len() {
             self.reset(st, gpu, stream)?;
         }
+        // Keep what the history was BEFORE this window, and the window's own
+        // ids: `rollback_verify` rebuilds the history for whatever prefix the
+        // target ends up accepting. History is a fixed-width window, so it
+        // cannot simply be truncated back.
+        st.history_ckpt = st.history.clone();
+        st.verify_tokens = tokens.to_vec();
         let mut window = st.history.clone();
         window.extend_from_slice(tokens);
         let all = ple_ngram_ids(&self.dims, &window);
@@ -104,6 +121,7 @@ impl PleLayer {
         let keep = self.dims.context_len();
         st.history = window[window.len() - keep..].to_vec();
         st.prestaged_va = Some(va);
+        st.prestaged_n = tokens.len();
         st.last_staged_va = va;
         Ok(())
     }
@@ -195,6 +213,10 @@ impl PleLayer {
         if st.conv.0 != 0 {
             gpu.free(st.conv)?;
             st.conv = spark_runtime::gpu::DevicePtr(0);
+        }
+        if st.verify_snaps.0 != 0 {
+            gpu.free(st.verify_snaps)?;
+            st.verify_snaps = spark_runtime::gpu::DevicePtr(0);
         }
         Ok(())
     }

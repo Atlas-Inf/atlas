@@ -29,12 +29,21 @@ mod qkv;
 
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
+    /// `row_owner`: when `Some`, the N rows are not N independent sequences —
+    /// row `i` belongs to sequence `row_owner[i]`, and `states` is indexed by
+    /// SEQUENCE (so it is shorter than N, and several rows share one entry).
+    /// That is the speculative-verify shape: K consecutive tokens of one
+    /// sequence, or a ragged batch of them. It matters only for per-sequence
+    /// aux state — the QSA indexer — which must advance ONCE PER ROW IN ORDER
+    /// against its owning sequence's state rather than against a private one.
+    /// `None` keeps the plain one-row-per-sequence decode meaning.
     pub(in crate::layers::qwen3_attention) fn decode_multi_seq_inner<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        row_owner: Option<&[usize]>,
         kv_cache: &mut PagedKvCache,
         _seq_lens: &[usize],
         _block_tables: &[Vec<u32>],
@@ -50,9 +59,10 @@ impl Qwen3AttentionLayer {
 
         // DeepSeek-V4 / Qwen4-exp: Manifold-Constrained Hyper-Connections.
         if self.hc.is_some() {
-            return self.decode_multi_seq_inner_hc(c, states, _seq_lens, kv_cache, ctx, stream);
+            return self
+                .decode_multi_seq_inner_hc(c, states, row_owner, _seq_lens, kv_cache, ctx, stream);
         }
-        let _ = states; // Non-hc attention keeps no per-seq state.
+        let _ = (states, row_owner); // Non-hc attention keeps no per-seq state.
 
         // ── Phase 1: RMS norm + residual for N tokens ──
         ops::rms_norm_residual(
@@ -122,6 +132,7 @@ impl Qwen3AttentionLayer {
         &self,
         c: ctx::MultiSeqCtx<'_>,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        row_owner: Option<&[usize]>,
         seq_lens: &[usize],
         kv_cache: &mut PagedKvCache,
         ctx: &ForwardContext,
@@ -240,7 +251,21 @@ impl Qwen3AttentionLayer {
         // means the gate and this path disagree — refuse loudly rather than
         // serve dense-past-budget (not the reference model).
         if let Some(qsa) = self.qsa.as_ref() {
-            for (i, state) in states.iter_mut().enumerate().take(n) {
+            for i in 0..n {
+                // Row i's indexer state. Without `row_owner` the rows ARE the
+                // sequences (plain concurrent decode). With it, several rows
+                // share one sequence's state and advance it in row order —
+                // `decode_select` asserts `pos == ingested`, so the ordering
+                // here is the invariant, not an optimization.
+                let owner = match row_owner {
+                    Some(map) => *map.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("QSA row_owner has no entry for row {i}")
+                    })?,
+                    None => i,
+                };
+                let state = states.get_mut(owner).ok_or_else(|| {
+                    anyhow::anyhow!("QSA row {i} owned by seq {owner}, which has no state")
+                })?;
                 let st =
                     crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, *state, ctx.gpu)?;
                 let sel = qsa.decode_select(
@@ -257,7 +282,7 @@ impl Qwen3AttentionLayer {
                 )?;
                 anyhow::ensure!(
                     sel.is_none(),
-                    "QSA selection active for seq {i} on the batched ms path; \
+                    "QSA selection active for row {i} on the batched ms path; \
                      the dispatch gate should have routed this batch per-seq"
                 );
             }
