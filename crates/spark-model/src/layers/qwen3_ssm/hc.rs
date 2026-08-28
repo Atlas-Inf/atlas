@@ -24,5 +24,4 @@ impl Qwen3SsmLayer {
     pub fn set_ple(&mut self, ple: crate::layers::ple::PleLayer) {
         self.ple = Some(ple);
     }
-
 }

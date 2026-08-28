@@ -198,8 +198,7 @@ impl TransformerModel {
         // and `decode_a2` already apply this veto; the verify paths never did,
         // because on this model they used to refuse before reaching a graph.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
-        let graphs_on =
-            super::verify_e2::verify_graphs_enabled() && !k4_diag && !layer_veto;
+        let graphs_on = super::verify_e2::verify_graphs_enabled() && !k4_diag && !layer_veto;
         let graph_key = if graphs_on {
             self.verify_batched_graph_key(&*seqs, ks, wy_tables_base.is_null())
         } else {
@@ -477,7 +476,8 @@ impl TransformerModel {
             // state (the QSA indexer) advances once per row against its
             // owner's state, so the map is what keeps `pos == ingested` true
             // for every sequence in the batch.
-            let row_owner: Vec<usize> = (0..n).flat_map(|i| std::iter::repeat_n(i, ks[i])).collect();
+            let row_owner: Vec<usize> =
+                (0..n).flat_map(|i| std::iter::repeat_n(i, ks[i])).collect();
             debug_assert_eq!(row_owner.len(), r_total);
 
             if capture {

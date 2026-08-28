@@ -194,8 +194,7 @@ impl TransformerModel {
         // and `decode_a2` already apply this veto; the verify paths never did,
         // because on this model they used to refuse before reaching a graph.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
-        let use_graphs =
-            self.comm.is_none() && !hss_engaged && !lora_eager && !layer_veto;
+        let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager && !layer_veto;
 
         // PLE's host half (n-gram hash + NVMe fault-in + slot upload) for the
         // WHOLE draft window, hoisted before capture/replay exactly as

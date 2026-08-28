@@ -258,9 +258,9 @@ impl Qwen3AttentionLayer {
                 // `decode_select` asserts `pos == ingested`, so the ordering
                 // here is the invariant, not an optimization.
                 let owner = match row_owner {
-                    Some(map) => *map.get(i).ok_or_else(|| {
-                        anyhow::anyhow!("QSA row_owner has no entry for row {i}")
-                    })?,
+                    Some(map) => *map
+                        .get(i)
+                        .ok_or_else(|| anyhow::anyhow!("QSA row_owner has no entry for row {i}"))?,
                     None => i,
                 };
                 let state = states.get_mut(owner).ok_or_else(|| {
