@@ -216,6 +216,10 @@ pub struct TransformerModel {
     /// hidden here FIRST (`stash_verify_hidden_rows`), then feeds the drafter
     /// from the stash (`save_hidden_for_mtp_from_stash`). NULL without MTP.
     pub(super) verify_hidden_stash: DevicePtr,
+    /// Per-sequence stash of the mHC stream rows that accompany
+    /// `verify_hidden_stash`, for drafters consuming the PRE-mixer
+    /// highway. NULL without a proposer or without a highway.
+    pub(super) verify_stream_stash: DevicePtr,
     /// ATLAS_MTP_CATCHUP: circular per-position final-hidden ring captured
     /// during serial-decode stretches (BF16 rows, slot = position % ring
     /// len). Feeds the drafter catch-up on the next propose. NULL when the

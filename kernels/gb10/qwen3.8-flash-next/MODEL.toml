@@ -14,11 +14,16 @@
 # THE DRAFT DEPTH IS THE WHOLE RESULT. Measured 2026-08-28 on one GB10,
 # 256-token completions, against a same-binary non-speculative control:
 #
-#   arm                            C=1 agg tok/s   C=2 agg tok/s
-#   base (no speculation)                  16.14           24.74
-#   --num-drafts 1, gate ARMED             19.11 (+18.4%)  23.19  (-6.3%)
-#   --num-drafts 1, gate forced            19.06 (+18.1%)  19.58 (-20.9%)
-#   --num-drafts 2, gate forced            15.76  (-2.4%)  16.61 (-32.9%)
+#   arm (gate forced unless noted)   C=1 agg tok/s   C=2 agg tok/s   p1
+#   base (no speculation)                    16.14           24.74    --
+#   --num-drafts 1                           20.14 (+24.8%)  21.13 (-14.6%)  0.83
+#   --num-drafts 2                           19.00 (+17.7%)  20.52 (-17.1%)  0.84
+#   (pre stream-row fix, --num-drafts 1)     19.10 (+18.3%)  19.61 (-20.7%)  0.69
+#
+# K=3 accepts MORE (2.56 tokens/step vs 1.83) and is still SLOWER: the third
+# verify row costs 0.71 of a decode step and buys only 0.73 tokens. Marginal
+# row cost grows with K (0.47 for row 2, 0.71 for row 3), so one draft stays
+# the optimum even at the post-fix acceptance.
 #
 # So: ONE draft. The default K ladder (`4:3,8:3,...`) asks for 3 drafts at
 # these widths, which is exactly the losing depth here -- `--num-drafts 1`
@@ -345,7 +350,8 @@ default_kv_dtype = "bf16"
 # measured break-even is `tokens/step > 1 + ~0.4*(K-1)`: each verify row routes
 # to its own top-10 of 512 experts, so expert weight traffic scales with rows
 # (~0.4 of a decode step per extra row) while acceptance only buys ~0.6 tokens.
-# K=2 clears it (1.58 delivered vs 1.34 cost); K=3 does not (1.72 vs 1.76).
+# K=2 clears it best (1.83 delivered vs 1.47 cost = 1.25x); K=3 delivers more
+# but costs more still (2.56 vs 2.17 = 1.18x).
 #
 # Precedence is CLI > MODEL.toml > engine default, so `--num-drafts` still
 # overrides for anyone deliberately measuring a deeper K. Like every key in

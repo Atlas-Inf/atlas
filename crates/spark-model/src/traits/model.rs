@@ -785,6 +785,29 @@ pub trait Model: Send + Sync {
     /// overwrites shared buffers including `norm_output`.
     fn save_hidden_for_mtp(&self, token_idx: usize, stream: u64) -> Result<()>;
 
+    /// Move verify row `row` of the mHC stream highway into row 0, so a
+    /// drafter that consumes the PRE-mixer residual reads the accepted
+    /// position rather than the first verify row.
+    ///
+    /// The companion to [`Self::save_hidden_for_mtp`], for the other input
+    /// shape. That one stages `hidden_states[row]` — the post-mixer,
+    /// `hidden`-wide state — into `mtp_hidden_save`, which reaches the
+    /// proposer as `target_hidden`. A drafter whose `pre_fc_norm_hidden` is
+    /// `[hc_mult * hidden]` (qwen4_exp) cannot use that: it needs the
+    /// residual BEFORE the model-level mixer collapses it, and so reads
+    /// `buffers.hc_streams()` directly. Nothing was selecting a row there,
+    /// and `hc_streams` is `[M, hc_mult, hidden]` — so it always read row 0
+    /// while the scheduler was staging row `num_accepted` next door. On
+    /// every ACCEPT the drafter proposed from the position BEFORE the one it
+    /// should, which is invisible in the output (verify rejects the bad
+    /// drafts) and shows up only as depressed acceptance.
+    ///
+    /// Call beside `save_hidden_for_mtp` with the same row. No-op for models
+    /// with no highway, and for row 0 (already correct).
+    fn select_mtp_stream_row(&self, _row: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// ATLAS_MTP_CATCHUP: ring-capture a serially decoded token's final
     /// hidden at `pos` for the drafter catch-up feed. Default no-op.
     fn save_hidden_for_catchup(&self, _token_idx: usize, _pos: usize) -> Result<()> {

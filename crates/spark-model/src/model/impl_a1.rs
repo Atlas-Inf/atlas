@@ -401,6 +401,17 @@ impl TransformerModel {
         } else {
             DevicePtr::NULL
         };
+        // Stream-highway twin of the stash above, for a drafter whose input
+        // is the pre-mixer residual rather than the collapsed hidden
+        // (qwen4_exp). `hc_streams` is [M, hc, H] FP32, so one slot is hc*H*4.
+        let hc_for_stash = config.hc_mult.max(config.hc_count);
+        // `has_mtp`, not `proposer.is_some()`: qwen4_exp's proposer is installed
+        // after construction, so the latter is false exactly where this matters.
+        let verify_stream_stash = if has_mtp && hc_for_stash > 0 {
+            gpu.alloc(crate::layer::VERIFY_WY_TABLE_SEQS * hc_for_stash * config.hidden_size * 4)?
+        } else {
+            DevicePtr::NULL
+        };
         // Batched-verify WY pointer-table staging (fixed address for CUDA
         // graph stability; contents refreshed pre-graph every batched verify
         // step). One [h|Hi0|Hi1|Hi2] x 4-entry slice per GDN layer — ~6 KB.
@@ -756,6 +767,7 @@ impl TransformerModel {
             proposer,
             mtp_hidden_save,
             verify_hidden_stash,
+            verify_stream_stash,
             mtp_catchup_ring,
             mtp_catchup_meta: parking_lot::Mutex::new((0, 0)),
             mtp_prefill_hidden,

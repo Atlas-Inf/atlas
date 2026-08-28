@@ -470,6 +470,9 @@ impl Model for TransformerModel {
         self.save_hidden_for_catchup_dispatch(token_idx, pos)
     }
 
+    fn select_mtp_stream_row(&self, row: usize) -> Result<()> {
+        self.select_mtp_stream_row_dispatch(row)
+    }
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
     }

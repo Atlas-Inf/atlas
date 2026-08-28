@@ -323,12 +323,18 @@ instead.
 **Status: works, and pays at one draft.** Measured 2026-08-28 on one GB10,
 256-token completions, against a same-binary non-speculative control:
 
-| arm | C=1 agg tok/s | C=2 agg tok/s |
-|---|---|---|
-| base (no speculation) | 16.14 | 24.74 |
-| `--num-drafts 1`, **gate armed** | **19.11 (+18.4%)** | 23.19 (−6.3%) |
-| `--num-drafts 1` (K=2), gate forced | 19.06 (+18.1%) | 19.58 (−20.9%) |
-| `--num-drafts 2` (K=3), gate forced | 15.76 (−2.4%) | 16.61 (−32.9%) |
+| arm (gate forced unless noted) | C=1 agg tok/s | C=2 agg tok/s | p1 | tok/step |
+|---|---|---|---|---|
+| base (no speculation) | 16.14 | 24.74 | — | 1.00 |
+| `--num-drafts 1` (K=2) | **20.14 (+24.8%)** | 21.13 (−14.6%) | 0.83 | 1.83 |
+| `--num-drafts 2` (K=3) | 19.00 (+17.7%) | 20.52 (−17.1%) | 0.84 | 2.56 |
+| `--num-drafts 1`, *before* the stream-row fix | 19.10 (+18.3%) | 19.61 (−20.7%) | 0.69 | 1.69 |
+
+K=3 accepts substantially MORE per step (2.56 tokens vs 1.83) and is still
+slower: the third verify row costs 0.71 of a decode step and buys 0.73 tokens.
+Marginal row cost GROWS with K — 0.47 for row 2, 0.71 for row 3 — so one draft
+is the optimum even at post-fix acceptance. That is why `default_num_drafts`
+is 1 and not 2.
 
 Leave the throughput gate **armed** and one serve covers the ladder: it holds
 Mtp at C=1 for the full win, then logs a single `Mtp -> Serial` switch at C=2
@@ -353,6 +359,35 @@ Why it inverts at C>1: batched decode is already amortizing exactly the
 weight reads speculation exists to amortize, so a draft's marginal value
 falls as width rises. The throughput gate measures this per serve and parks
 in Serial on its own.
+
+**The drafter was reading the wrong row of the stream highway.** Acceptance
+sat at p1 ≈ 0.69 — low for a native MTP head — and the positional telemetry
+carried a tell that cannot happen in a healthy drafter: `p2_cond` (0.695)
+ABOVE `p1` (0.590). Draft depth must degrade monotonically, so the FIRST draft
+was being handicapped relative to the second.
+
+It was: `save_hidden_for_mtp(num_accepted)` stages the accepted row into
+`mtp_hidden_save`, which reaches the proposer as `target_hidden`. qwen4_exp
+correctly ignores that argument — it needs the pre-mixer 4-stream residual,
+not the collapsed hidden — and reads `buffers.hc_streams()` instead. Nothing
+selected a row there, and `hc_streams` is `[M, hc_mult, hidden]`, so it always
+read **row 0** while the scheduler staged row `num_accepted` next door. On
+every ACCEPT the drafter proposed from the position BEFORE the one it should;
+only on a full reject (row 0) was it right. Verify rejects the resulting bad
+drafts, so nothing was ever wrong in the OUTPUT — it cost acceptance only,
+which is why it survived every correctness check.
+
+`Model::select_mtp_stream_row(row)` now stages that row into row 0 beside
+every `save_hidden_for_mtp`. Measured effect: p1 0.69 → 0.83 (per prompt
+0.614 → 0.715 and 0.770 → 0.946), C=1 +18.3% → +24.8%, and at K=3 the
+inversion disappears — p1 0.860 now sits above p2_cond 0.837, monotone as it
+should be. `ATLAS_MTP_STREAM_ROW_FIX=0` restores the old read for A/B.
+
+Note it is scoped to this model: DeepSeek-V4's proposer takes `target_hidden`
+and calls `hc_expand` to build its OWN streams, so it never reads the
+target's. qwen4_exp is the only drafter consuming the highway directly,
+because its `pre_fc_norm_hidden` is `[hc_mult * hidden]` and the checkpoint
+ships no MTP expand weights.
 
 **MTP is not corrupting the output, and the obvious test says it is.** At
 T=0 the speculative build's text diverges from the non-speculative one on 7

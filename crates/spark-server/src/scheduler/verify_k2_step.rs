@@ -226,6 +226,12 @@ pub fn step_verify_k2(
             tracing::error!("dflash_eagle_accept_append: {e:#}");
         }
         let t_save = Instant::now();
+        // Same row, the other input shape: a drafter reading the PRE-mixer
+        // stream highway needs row 1 staged into row 0, or it proposes from
+        // the first verify row instead of the accepted one.
+        if let Err(e) = model.select_mtp_stream_row(1) {
+            tracing::error!("select_mtp_stream_row(1): {e:#}");
+        }
         if let Err(e) = model.save_hidden_for_mtp(1, 0) {
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
             return;
@@ -301,6 +307,12 @@ pub fn step_verify_k2(
         a.last_token = v0;
 
         let t_save = Instant::now();
+        // Same row, the other input shape: a drafter reading the PRE-mixer
+        // stream highway needs row 0 staged into row 0, or it proposes from
+        // the first verify row instead of the accepted one.
+        if let Err(e) = model.select_mtp_stream_row(0) {
+            tracing::error!("select_mtp_stream_row(0): {e:#}");
+        }
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp(0): {e:#}");
             return;
