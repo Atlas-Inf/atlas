@@ -64,8 +64,7 @@ use crate::layer::TransformerLayer;
 use crate::layers::qwen3_attention::HcHeadWeights;
 use crate::layers::{FfnComponent, MoeLayer};
 use crate::weight_map::{
-    DenseWeight, ExpertWeight, MoeWeights, dense_auto, load_mtp_experts_stacked,
-    quantize_to_nvfp4,
+    DenseWeight, ExpertWeight, MoeWeights, dense_auto, load_mtp_experts_stacked, quantize_to_nvfp4,
 };
 
 /// The `mtp.layers.0` prefix — this checkpoint has `mtp_num_hidden_layers = 1`.
@@ -150,9 +149,21 @@ fn build_mtp_moe(
     // the ordinary named path rather than the stacked slicer.
     let se = format!("{mlp}.shared_expert");
     let shared_expert = ExpertWeight {
-        gate_proj: q(&dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?, inter, h)?,
-        up_proj: q(&dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?, inter, h)?,
-        down_proj: q(&dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?, h, inter)?,
+        gate_proj: q(
+            &dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?,
+            inter,
+            h,
+        )?,
+        up_proj: q(
+            &dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?,
+            inter,
+            h,
+        )?,
+        down_proj: q(
+            &dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?,
+            h,
+            inter,
+        )?,
     };
 
     let gate = dense_auto(store, &format!("{mlp}.gate.weight"), gpu)?;
@@ -219,26 +230,30 @@ pub fn load_qwen4exp_mtp_module(
         .iter()
         .filter(|t| matches!(t, atlas_core::config::LayerType::FullAttention))
         .count();
-    let kv_dtype = layer_kv_dtypes.first().copied().unwrap_or(KvCacheDtype::Bf16);
+    let kv_dtype = layer_kv_dtypes
+        .first()
+        .copied()
+        .unwrap_or(KvCacheDtype::Bf16);
 
-    let mut body = crate::weight_loader::qwen35::load_layers::attention_arms::build_full_attention_nvfp4(
-        config.num_hidden_layers,
-        store,
-        MTP_LAYER_PREFIX,
-        gpu,
-        variant,
-        config,
-        h,
-        absmax_k,
-        quantize_k,
-        stream,
-        kv_dtype,
-        attn_idx,
-        input_norm,
-        post_attn_norm,
-        ffn,
-    )
-    .context("qwen4_exp MTP: full-attention body")?;
+    let mut body =
+        crate::weight_loader::qwen35::load_layers::attention_arms::build_full_attention_nvfp4(
+            config.num_hidden_layers,
+            store,
+            MTP_LAYER_PREFIX,
+            gpu,
+            variant,
+            config,
+            h,
+            absmax_k,
+            quantize_k,
+            stream,
+            kv_dtype,
+            attn_idx,
+            input_norm,
+            post_attn_norm,
+            ffn,
+        )
+        .context("qwen4_exp MTP: full-attention body")?;
 
     // mHC. The sites are named exactly like a main layer's, so the ordinary
     // loader reads them; only the head mixer lives under its own prefix.

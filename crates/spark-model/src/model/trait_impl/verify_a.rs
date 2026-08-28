@@ -363,7 +363,6 @@ impl TransformerModel {
             }
         }
 
-
         let stream = self.gpu.default_stream();
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);

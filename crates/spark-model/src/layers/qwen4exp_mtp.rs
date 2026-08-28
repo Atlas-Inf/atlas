@@ -270,7 +270,8 @@ impl Qwen4ExpMtpHead {
 
         // ── 3. Embedding branch, shared across streams ──
         let src = self.embed_tokens.weight.offset(token as usize * row_bytes);
-        ctx.gpu.copy_d2d_async(src, self.embed_buf, row_bytes, stream)?;
+        ctx.gpu
+            .copy_d2d_async(src, self.embed_buf, row_bytes, stream)?;
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_k,
@@ -409,7 +410,9 @@ impl Qwen4ExpMtpHead {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("qwen4exp_mtp: no hc_head (hc_mult == 0?)"))?;
         let lowrank = head.lowrank.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("qwen4exp_mtp: mHC head is not low-rank; this model has no Sinkhorn path")
+            anyhow::anyhow!(
+                "qwen4exp_mtp: mHC head is not low-rank; this model has no Sinkhorn path"
+            )
         })?;
         ops::hc_head_lowrank(
             ctx.gpu,
@@ -488,8 +491,14 @@ impl DraftProposer for Qwen4ExpMtpHead {
             // `body.decode` left holding the drafter's own residual — so
             // unlike the collapsed-hidden proposers there is nothing to thread
             // between iterations.
-            let draft =
-                self.forward_one(current_token, position + i, st, ctx, stream, grammar_bitmask)?;
+            let draft = self.forward_one(
+                current_token,
+                position + i,
+                st,
+                ctx,
+                stream,
+                grammar_bitmask,
+            )?;
             tracing::debug!(
                 "qwen4_exp MTP propose[{i}]: token={current_token} pos={} mtp_seq_len={} -> draft={draft}",
                 position + i,

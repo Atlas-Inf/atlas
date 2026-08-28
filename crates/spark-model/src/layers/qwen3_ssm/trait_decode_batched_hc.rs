@@ -59,8 +59,8 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::trait_decode_batched::GdnStates;
 use super::Qwen3SsmLayer;
+use super::trait_decode_batched::GdnStates;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
@@ -156,9 +156,7 @@ impl Qwen3SsmLayer {
                         let ssm = state
                             .as_any_mut()
                             .downcast_mut::<crate::layer::SsmLayerState>()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Expected SsmLayerState for seq {i}")
-                            })?;
+                            .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
                         // A padding row carries `ple: None` by construction and
                         // has no token id — it gets no injection, exactly as on
                         // the multi-seq decode path.
