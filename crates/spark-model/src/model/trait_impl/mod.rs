@@ -352,6 +352,12 @@ impl Model for TransformerModel {
     ) -> Result<crate::engine::GenerateResult> {
         self.generate_speculative_dispatch(prompt_tokens, params, num_drafts)
     }
+    fn verify_context_limit(&self) -> Option<usize> {
+        self.layers
+            .iter()
+            .filter_map(|l| l.verify_context_limit())
+            .min()
+    }
     fn has_proposer(&self) -> bool {
         self.has_proposer_dispatch()
     }

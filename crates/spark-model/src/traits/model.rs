@@ -543,6 +543,15 @@ pub trait Model: Send + Sync {
         num_drafts: usize,
     ) -> Result<crate::engine::GenerateResult>;
 
+    /// Longest visible context at which a BATCHED (K-token) verify is valid,
+    /// or `None` when nothing bounds it. The scheduler must not dispatch a
+    /// speculative step for a sequence past this: the batched attention path
+    /// refuses an ACTIVE QSA selection, and that refusal arrives as a verify
+    /// error, which finishes the request.
+    fn verify_context_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Check if speculative decoding is available (MTP or self-speculative).
     fn has_proposer(&self) -> bool;
 
