@@ -2,7 +2,7 @@
 
 //! Qwen3.8-Flash-Next Multi-Token-Prediction (MTP) draft proposer.
 //!
-//! Implements [`DraftProposer`] over the [`Qwen4ExpMtpModule`] loaded by
+//! Implements [`DraftProposer`] over the `Qwen4ExpMtpModule` loaded by
 //! `load_qwen4exp_mtp_module`. Like DeepSeek-V4's proposer (and unlike the
 //! Qwen-shaped [`crate::layers::MtpHead`], a hand-rolled attention + MoE
 //! block), the body here is a REUSED full model layer, so the proposer only

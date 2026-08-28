@@ -204,7 +204,7 @@ impl TransformerModel {
         // host_token_ids ... capture-unsupported" refusal. #753 item B.
         for (li, l) in self.layers.iter().enumerate() {
             l.verify_prestage(
-                &tokens[..],
+                tokens,
                 seq.layer_states[li].as_mut(),
                 self.gpu.as_ref(),
                 stream,
@@ -225,7 +225,7 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: None,
-            host_token_ids: Some(&tokens[..]),
+            host_token_ids: Some(tokens),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses

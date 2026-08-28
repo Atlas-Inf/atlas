@@ -147,7 +147,7 @@ impl Qwen3SsmLayer {
                         "hc batched verify: PLE has {} host id(s) for {num_tokens} row(s)",
                         host.len()
                     );
-                    let row_stride = (hc.hc_mult as usize) * h * 4; // highway rows are FP32
+                    let row_stride = hc.hc_mult * h * 4; // highway rows are FP32
                     let mut row0 = 0usize;
                     for (i, state) in states.iter_mut().enumerate() {
                         let ki = *ks.get(i).ok_or_else(|| {
