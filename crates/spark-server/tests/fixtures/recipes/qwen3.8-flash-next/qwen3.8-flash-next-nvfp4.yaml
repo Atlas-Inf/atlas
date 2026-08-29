@@ -108,6 +108,42 @@ metadata:
     prefix hit cannot inherit the previous request's n-gram history. Measured
     3.9x warm TTFT on a 3-turn 2.6K needle.
 
+    BFCL, PINNED n=995 DRAW, before and after the Java/JS language-preprocessing
+    fix in `atlas-plugin/assets/bfcl/provision.py`. Same binary, same serve
+    line, temperature 0 -- so every delta below is causal, not variance:
+
+      subset                    before    after
+      simple_java                41.94    58.06
+      simple_javascript          25.81    67.74
+      simple_python              89.92    91.53
+      multiple                   87.90    89.52
+      parallel_multiple          79.84    80.65
+      live_simple               100.00    96.00
+      live_parallel              75.00    68.75
+      live_irrelevance           88.64    87.50
+      irrelevance               100.00    79.17
+      ------------------------------------------
+      non_live      (category)   76.44    82.02
+      live          (category)   78.82    77.65
+      hallucination (category)   94.32    83.33
+      OVERALL                    81.11    83.32
+      NORMALIZED                 83.20    81.00
+
+    OVERALL ROSE AND NORMALIZED FELL, and both are real. `overall` is a plain
+    mean over samples, so it follows non_live (62% of this draw); `normalized`
+    is the unweighted mean of the three CATEGORY scores, so a hallucination
+    regression costs it a third of the damage regardless of sample count.
+
+    ★ The regression is the cost of being faithful to BFCL. Its preprocessing
+    appends " Note that the provided function is in Python 3 syntax." to EVERY
+    function description on non-Java/JS subsets, and that sentence alone moves
+    irrelevance 100.00 -> 79.17 (5 of 24 samples) -- it reads as an
+    endorsement of the offered tool, which is exactly the wrong nudge on a
+    category scored by DECLINING to call. Nothing else about those samples
+    changed. Do not "fix" this by dropping the hint on Python subsets: that
+    would be tuning the harness away from official BFCL to win points, and the
+    Java/JS half of the same call is what bought +16.1 and +41.9.
+
     LATENCY SHAPE (one GB10, thinking ON, 128-token completions, median of
     2 reps after a dropped warmup, unique prompts so nothing hits the cache):
 
