@@ -77,6 +77,32 @@ metadata:
     preamble and `<think>` scaffold on a cheap budget, which is what this
     model's chat template gates everything on.
 
+    DO NOT SERVE TOOL WORKLOADS WITH `--disable-thinking`. It is not a
+    latency knob here, it is an accuracy cliff. Measured on BFCL, one binary,
+    same n=334 draw, thinking the only difference:
+
+                        --disable-thinking    recipe default
+      overall                   76.95              81.74
+      normalized                75.78              82.95
+      hallucination             72.10              92.45
+      irrelevance               85.71             100.00
+      live_irrelevance          58.49              84.91
+      parallel                  63.33              83.33
+
+    The failure it fixes is specific and ugly: with one tool offered and a
+    question that tool cannot answer, the model calls it anyway — "area of a
+    rectangle" -> `draw_circle({radius: 50.265})`, "last year's TSX stock
+    prices" -> `requests_get(PublicHolidays/2024/CA)`. Deliberation is what
+    stops that, and the reference this checkpoint is judged against scores
+    97.16 on the same category.
+
+    The trap is that MLPerf's qwen3.6 submission DOES disable reasoning, and
+    documents why (86.23 -> 78.19 with it on). That finding does not transfer
+    to this checkpoint; neither does that recipe's `disable_tool_grammar =
+    true`, which measured +0.9 overall / +4.5 hallucination when left OFF
+    here. Both were re-measured on this model rather than inherited, and both
+    came out the other way.
+
     Prefix caching is ON: the PLE n-gram history and conv state and the QSA
     ingested indexer keys ride the SSM snapshots as host aux blobs, so a
     prefix hit cannot inherit the previous request's n-gram history. Measured
