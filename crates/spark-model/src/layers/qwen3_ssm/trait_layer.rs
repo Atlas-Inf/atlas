@@ -111,8 +111,43 @@ impl TransformerLayer for Qwen3SsmLayer {
         // K=2 wins on throughput against BOTH, including against a K=3 with
         // strictly better tokens/step. The extra verify row costs more than
         // the extra tokens return on this model, so the acceptance gain is
-        // real and irrelevant. Raising this needs the row-2 defect fixed AND
-        // a verify row that pays for itself — the second is the harder one.
+        // real and irrelevant.
+        //
+        // HOW MUCH MORE ACCEPTANCE WOULD K=3 NEED? At its measured step cost
+        // (119.1 ms vs K=2's 85.0 ms) K=3 must reach 2.582 tokens/step to TIE
+        // K=2. Under 1 + p + p^2 that is a per-draft acceptance of
+        //
+        //     p = 0.853
+        //
+        // and K=2's own measured first-draft acceptance is p1 = 0.843. So a
+        // perfect row-2 fix — one lifting K=3's drafting all the way to K=2's
+        // quality — lands at 2.554 tok/step, 21.43 tok/s, still under K=2's
+        // 21.67. K=3 would have to draft BETTER than K=2 does merely to draw.
+        // And 1 + p + p^2 is optimistic: it assumes the second draft position
+        // accepts at the first's rate, when later positions always accept
+        // less, so the real requirement is higher still.
+        //
+        // WHY THE THIRD ROW COSTS 1.40x. The verify FFN streams each ACTIVATED
+        // expert once, so cost tracks the UNION of experts over the verify
+        // rows, and this model routes top-10 of 512:
+        //
+        //     E[distinct experts over R rows] = 512*(1 - (1 - 10/512)^R)
+        //       R=2 -> 19.8 experts -> 54.8 MB/layer
+        //       R=3 -> 29.4 experts -> 81.3 MB/layer     ratio 1.485
+        //
+        // at 3*2560*640*0.5625 = 2.76 MB per expert. The measured step ratio
+        // 1.401 sits between the token ratio 1.303 and that 1.485, which is
+        // where modest routing correlation puts it. Breaking even would need
+        // ~40% of the third row's experts already resident from rows 1-2.
+        //
+        // Stated as scope, not as a law: for THIS geometry, this kernel, C=1
+        // and the measured acceptance, K=3 does not pay. Independent routing
+        // is a pessimistic estimate, not a strict bound, so this is not proof
+        // that no K=3 can ever win — the same experiment upstream on a 27B
+        // (fewer experts, more natural overlap) came out a wash at -0.2%
+        // rather than a loss. Raising this needs the row-2 defect fixed AND a
+        // verify row that pays for itself; the arithmetic says the second is
+        // the binding constraint.
         Some(1)
     }
 
