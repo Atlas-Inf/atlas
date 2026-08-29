@@ -420,8 +420,18 @@ impl NgramRowCache {
                     self.misses += 1;
                     // Oversubscription still REFUSES here, before a single byte
                     // of I/O is issued -- `victim` bails when every slot is
-                    // pinned by the batch in flight.
-                    let s = self.victim()?;
+                    // pinned by the batch in flight. That refusal must UNDO the
+                    // reservations already made: publishing residency at
+                    // decision time is what makes duplicates cheap, and it is
+                    // also what would leave rows claimed but never read if this
+                    // returned straight out of the loop.
+                    let s = match self.victim() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            self.drop_reservations(&faults);
+                            return Err(e);
+                        }
+                    };
                     self.map.insert(id, s);
                     self.slot_row[s as usize] = id;
                     self.refbit[s as usize] = true;
@@ -440,15 +450,32 @@ impl NgramRowCache {
         if let Err(e) = self.fetch_many(&faults) {
             // A partially-written slot must not stay claimed as resident: a
             // wrong n-gram row reads as fluent output with wrong logits, which
-            // is the failure mode this cache exists to avoid. Drop the whole
-            // batch's claims -- conservative, and only on the error path.
-            for f in &faults {
-                self.map.remove(&f.id);
-                self.slot_row[f.slot as usize] = u64::MAX;
-            }
+            // is the failure mode this cache exists to avoid. Drop the WHOLE
+            // batch's claims rather than only the failed worker's -- the
+            // workers share no progress record, so which rows landed is not
+            // knowable here, and over-dropping only costs a refetch.
+            self.drop_reservations(&faults);
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Un-publish reservations whose bytes never landed.
+    ///
+    /// Conditional on both sides: a claim is only withdrawn if it is still the
+    /// one this batch made. Nothing in the current code can have replaced it —
+    /// the slots stay pinned for the batch — but an unconditional `remove`
+    /// would delete a LIVE mapping the moment that stops being true, and the
+    /// symptom would be a wrong n-gram row rather than a crash.
+    fn drop_reservations(&mut self, faults: &[Fault]) {
+        for f in faults {
+            if self.map.get(&f.id) == Some(&f.slot) {
+                self.map.remove(&f.id);
+            }
+            if self.slot_row[f.slot as usize] == f.id {
+                self.slot_row[f.slot as usize] = u64::MAX;
+            }
+        }
     }
 
     /// Issue `faults` concurrently. `&self`: the residency bookkeeping is
