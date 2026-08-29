@@ -84,6 +84,18 @@ fn bf16_round(values: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// `[rows, cols] -> [cols, rows]`, f32 elements.
+fn transpose(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    assert_eq!(v.len(), rows * cols);
+    let mut out = vec![0.0f32; v.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = v[r * cols + c];
+        }
+    }
+    out
+}
+
 fn bf16_bytes(values: &[f32]) -> Vec<u8> {
     values
         .iter()
@@ -198,7 +210,10 @@ fn make_site(g: &dyn GpuBackend, rng: &mut Rng, inject: bool) -> Site {
         dev: HcLowRank {
             norm_w: upload(g, &bf16_bytes(&norm)),
             down_w: upload(g, &bf16_bytes(&down)),
-            up_w: upload(g, &bf16_bytes(&up)),
+            // `up` stays [wide, RANK] for the reference below; the kernels
+            // read `input_mix_weight_up` transposed as [RANK, wide], which is
+            // what the loader produces (`hc::UpTranspose`).
+            up_w: upload(g, &bf16_bytes(&transpose(&up, wide, RANK))),
             inject_w: match &inject_w {
                 Some(w) => upload(g, &bf16_bytes(w)),
                 None => DevicePtr::NULL,

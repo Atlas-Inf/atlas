@@ -247,20 +247,42 @@ fn hc_pre_gemm(
     let hc_dim = (hc_mult * hidden_size) as usize;
     let rank = w.rank as u32;
     // Scratch layout (BF16): normed [L, hc_dim], up_pre [L, hc_dim],
-    // low [L, rank], inj_pre [L, hc], where L = min(T, 2048). sizes.rs sizes
-    // the region with m.min(2048) and T <= m always, so L-based offsets fit
-    // even when the arena was sized for fewer than 2048 tokens.
+    // low [L, rank], inj_pre [L, hc], up_wt [hc_dim, rank], where
+    // L = min(T, 2048). sizes.rs sizes the region with m.min(2048) and
+    // T <= m always, so L-based offsets fit even when the arena was sized for
+    // fewer than 2048 tokens; `up_wt` is L-independent and sits last.
     let lay = num_tokens.min(SLAB) as usize;
     let normed = scratch;
     let up_pre = scratch.offset(lay * hc_dim * 2);
     let low = scratch.offset(2 * lay * hc_dim * 2);
     let inj_pre = scratch.offset(2 * lay * hc_dim * 2 + lay * w.rank * 2);
+    let up_wt = scratch.offset(
+        2 * lay * hc_dim * 2 + lay * w.rank * 2 + lay * hc_mult as usize * 2,
+    );
 
     let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage_bf16")?;
     let k_silu = gpu.kernel("hyper_connection", "hc_silu_scale")?;
     let k_mix = gpu.kernel("hyper_connection", "hc_pre_mix")?;
     let k_gemm = gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
+    let k_tr = gpu.kernel("hyper_connection", "hc_transpose_bf16")?;
     let inv_hc = 1.0f32 / hc_mult as f32;
+
+    // `up_w` is stored `[rank, hc_dim]` — the layout the decode stage-3 kernel
+    // needs to coalesce (see `hc_pre_split`). This GEMM's tensor-core kernel is
+    // NT (`C[m,n] = A[m,k] . B[n,k]`), so it wants the checkpoint's
+    // `[hc_dim, rank]`. Stage a transposed copy rather than keeping a second
+    // resident buffer: 6.55 MB x 97 sites is 635 MB on a box that already
+    // loads at 113 of 119.6 GB, against ~50 us per call here on a collapse
+    // that measured ~45 ms. Once per call, not once per slab — `up_wt` does
+    // not depend on `t0`.
+    KernelLaunch::new(gpu, k_tr)
+        .grid([(hc_dim as u32).div_ceil(32), rank.div_ceil(32), 1])
+        .block([32, 32, 1])
+        .arg_ptr(w.up_w)
+        .arg_ptr(up_wt)
+        .arg_u32(rank)
+        .arg_u32(hc_dim as u32)
+        .launch(stream)?;
 
     let mut t0 = 0u32;
     while t0 < num_tokens {
@@ -299,12 +321,12 @@ fn hc_pre_gemm(
             .arg_f32(inv_hc)
             .launch(stream)?;
 
-        // up_pre = low x up_w^T   [ts, hc_dim]
+        // up_pre = low x up_wt^T   [ts, hc_dim]
         gemm_raw(
             gpu,
             k_gemm,
             low,
-            w.up_w,
+            up_wt,
             up_pre,
             ts,
             hc_dim as u32,
@@ -421,98 +443,43 @@ fn hc_pre_split(
         .arg_u32(w.rank as u32)
         .launch(stream)?;
 
-    // Stage 3 is the largest kernel in the decode profile: 23% of all GPU
+    // Stage 3 was the largest kernel in the decode profile: 23% of all GPU
     // time (11.86 s of 51.47 s, nsys 2026-08-28), a flat ~173 us regardless of
     // T, ~38 GB/s against the part's ~273. Each output dim gets its own THREAD
-    // and that thread walks a contiguous rank-320 row of `up_w` out of global,
-    // so consecutive threads touch rows 640 B apart and every warp load
-    // scatters over 32 sectors.
+    // and that thread contracts over `rank` sequentially — which, in the
+    // checkpoint's `[hc*H, rank]` layout, means walking a contiguous row, so
+    // consecutive threads touched rows 640 B apart and every warp load
+    // scattered over 32 sectors.
     //
-    // `hc_pre_finish_wc` fixes the access pattern (warp per output dim, lanes
-    // striding the contraction — the shape `hc_pre_down` already uses) and is
-    // worth a lot end-to-end. One GB10, 256-token completions, agg tok/s:
+    // `up_w` is now stored TRANSPOSED as `[rank, hc*H]` (see the kernel's
+    // "WHY `up_w` IS STORED TRANSPOSED" note and `weight_loader::qwen4_exp::
+    // hc::transpose_up_w`), so thread `d` reads `up_w[r*hc_dim + i]`:
+    // consecutive threads read consecutive bf16. The loop body is otherwise
+    // untouched, so the FP32 accumulation order is IDENTICAL and the output is
+    // bitwise unchanged — which is the whole point. Two kernel-side fixes were
+    // measured first and both failed one half of that: warp-per-dim with a
+    // shfl reduction was +17.8% but reassociates, and shared-memory staging
+    // was bit-exact but 44% slower. The layout was the only thing that could
+    // give both.
+    // Block width, swept 32/64/128/256 with `ATLAS_HC_FIN_BLOCK` (agg tok/s,
+    // C=1 / C=2, every arm bitwise identical since this is pure geometry):
     //
-    //   arm                C=1 base    C=1 MTP     C=2 base
-    //   parent                16.14      20.11        24.74
-    //   _wc                   19.46      23.63        29.47
-    //                       (+20.6%)   (+17.5%)     (+19.1%)
+    //   256 -> 21.65 / 25.20    128 -> 21.68 / 25.24  <- default
+    //    64 -> 20.57 / 23.84     32 -> 18.73 / 21.65
     //
-    // It is OPT-IN anyway. It reassociates the rank contraction (lane-strided
-    // partials + a shuffle tree instead of one sequential accumulation) and
-    // runs on all 48 layers, so the served logits MOVE: greedy text matched
-    // the parent on 2 of 8 prompts, the same rate as the engine's existing
-    // batch-width floor. That is not evidence of safety here — this
-    // checkpoint has been measured flipping `live_irrelevance` from a decline
-    // into a fabricated tool call on decode-path numerics alone. Default
-    // stays the parent until an accuracy leg clears the twin.
-    //
-    // A BIT-EXACT coalesced variant was built and measured, and does not
-    // work. Staging `up_w` through shared memory preserves the FMA order
-    // (verified: identical text hash, zero differing bytes across the dumped
-    // FP32 logit prefix) but costs 44% — 9.06 vs 16.10 tok/s. Thread-per-dim
-    // already caps parallelism at H threads per token, and a tile large
-    // enough to matter is ~42 KB, which caps occupancy near one block per SM.
-    // A 5-pass and a 1-pass staging measured the same (9.40 / 9.06), so the
-    // __syncthreads were not the cost — the smem budget was.
-    //
-    // The route to BOTH is a layout change, not a kernel change: store `up_w`
-    // transposed as `[rank, hc*H]`, so thread d reads `up_w_t[r*hc_dim + i]`
-    // — coalesced by construction, no smem, no syncs, per-thread accumulation
-    // order untouched. That touches the other three `up_w` readers (the fused
-    // hc_pre, the split stage, and the `low x up_w^T` GEMM), so it is its own
-    // change rather than a rider on this one.
-    if hc_finish_wc()
-        && let Some(k) = gpu
-            .kernel("hyper_connection", "hc_pre_finish_wc")
-            .ok()
-            .filter(|k| k.0 != 0)
-    {
-        // gridDim.y splits H over WARPS here, not over threads.
-        const WC_BLOCK: u32 = 256;
-        let ysplit = hidden_size.div_ceil(WC_BLOCK / 32).max(1);
-        return KernelLaunch::new(gpu, k)
-            .grid([num_tokens, ysplit, 1])
-            .block([WC_BLOCK, 1, 1])
-            .shared_mem(w.rank as u32 * 4)
-            .arg_ptr(normed)
-            .arg_ptr(low)
-            .arg_ptr(w.up_w)
-            .arg_ptr(if inject { w.inject_w } else { DevicePtr::NULL })
-            .arg_ptr(y_out)
-            .arg_ptr(inj_out)
-            .arg_u32(hidden_size)
-            .arg_u32(hc_mult)
-            .arg_u32(w.rank as u32)
-            .launch(stream);
-    }
-
-    finish_parent(
-        gpu, k_fin, normed, low, w, y_out, inj_out, num_tokens, hidden_size,
-        hc_mult, inject, stream,
-    )
-}
-
-/// The original thread-per-dim stage 3. Also the fallback when a twin cannot
-/// serve the shape (rank wider than the staging tile).
-#[allow(clippy::too_many_arguments)]
-fn finish_parent(
-    gpu: &dyn GpuBackend,
-    k_fin: KernelHandle,
-    normed: DevicePtr,
-    low: DevicePtr,
-    w: &HcLowRank,
-    y_out: DevicePtr,
-    inj_out: DevicePtr,
-    num_tokens: u32,
-    hidden_size: u32,
-    hc_mult: u32,
-    inject: bool,
-    stream: u64,
-) -> Result<()> {
-    let fsplit = (48 / num_tokens.max(1)).clamp(1, 10);
+    // NARROWER IS WORSE, which is the opposite of the guess. Thread-per-`d`
+    // caps the kernel at H threads per token, so a narrower block spreads the
+    // same 2560 threads over more SMs — but every block re-stages the whole
+    // rank-320 `low` vector into its own shared memory first, and at block 32
+    // that is 80 blocks each paying the same staging cost for 32 threads of
+    // work. The extra SMs do not pay for the extra staging. rsafier's original
+    // `S = clamp(48/T, 1, 10)` was already at the useful end of this curve;
+    // 128 is a hair better and 256 is inside the noise.
+    let fblock = hc_finish_block();
+    let fsplit = hidden_size.div_ceil(fblock).max((48 / num_tokens.max(1)).clamp(1, 10));
     KernelLaunch::new(gpu, k_fin)
         .grid([num_tokens, fsplit, 1])
-        .block([256, 1, 1])
+        .block([fblock, 1, 1])
         .shared_mem(w.rank as u32 * 4)
         .arg_ptr(normed)
         .arg_ptr(low)
@@ -526,10 +493,16 @@ fn finish_parent(
         .launch(stream)
 }
 
-/// Opt in to the coalesced stage-3 twin (`ATLAS_HC_FINISH=wc`). Off by
-/// default: it is ~+20% end-to-end but reassociates the rank contraction, so
-/// the served logits move on all 48 layers. See the dispatch comment.
-fn hc_finish_wc() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_HC_FINISH").ok().as_deref() == Some("wc"))
+/// Block width for stage 3 (`ATLAS_HC_FIN_BLOCK`, default 128). Kept as a knob
+/// because it is pure launch geometry — it cannot change the arithmetic, only
+/// how much of the machine runs it.
+fn hc_finish_block() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ATLAS_HC_FIN_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| (32..=1024).contains(n) && n % 32 == 0)
+            .unwrap_or(128)
+    })
 }

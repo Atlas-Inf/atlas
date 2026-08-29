@@ -155,7 +155,17 @@ pub struct HcLowRank {
     pub norm_w: DevicePtr,
     /// `input_mix_weight_down` `[rank, hc_mult*hidden]`.
     pub down_w: DevicePtr,
-    /// `input_mix_weight_up` `[hc_mult*hidden, rank]`.
+    /// `input_mix_weight_up`, **TRANSPOSED to `[rank, hc_mult*hidden]`** —
+    /// the checkpoint ships `[hc_mult*hidden, rank]`, and
+    /// `weight_loader::qwen4_exp::hc` flips it in place at load.
+    ///
+    /// The decode collapse gives one output dim to one thread and contracts
+    /// over `rank` sequentially; in the checkpoint layout that thread walks a
+    /// contiguous row, so adjacent threads land 640 B apart and the kernel ran
+    /// at ~38 GB/s (23% of all decode GPU time). Transposed, adjacent threads
+    /// read adjacent bf16 with the accumulation order untouched — coalesced
+    /// AND bitwise identical. The prefill GEMM, whose NT kernel wants the
+    /// original layout, stages a transposed copy per call.
     pub up_w: DevicePtr,
     /// `block_inject_weight` `[hc_mult, hc_mult*hidden]`. NULL on the
     /// model-level mixer, which is built `use_combine=False` and emits no

@@ -130,12 +130,32 @@ fn compare(label: &str, got: &[f32], want: &[f32], tol: f32) {
     assert!(cos > 0.9999, "{label}: cosine {cos:.9} — shape differs");
 }
 
+/// Transpose a BF16 `[rows, cols]` blob to `[cols, rows]`, elementwise on the
+/// raw u16 pairs. The fixture stores `input_mix_weight_up` in the CHECKPOINT
+/// layout `[hc*H, rank]`; the kernels read the transposed `[rank, hc*H]`, and
+/// the production loader flips it on the GPU at load
+/// (`weight_loader::qwen4_exp::hc::UpTranspose`). Doing it on the host here
+/// keeps this probe testing the kernels rather than the loader.
+fn transpose_bf16(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(bytes.len(), rows * cols * 2, "blob is not [rows, cols] BF16");
+    let mut out = vec![0u8; bytes.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            let src = (r * cols + c) * 2;
+            let dst = (c * rows + r) * 2;
+            out[dst..dst + 2].copy_from_slice(&bytes[src..src + 2]);
+        }
+    }
+    out
+}
+
 /// One site's low-rank weights, uploaded.
 fn site_weights(g: &dyn GpuBackend, f: &Fixture, site: &str, inject: bool) -> HcLowRank {
+    let up = f.bytes(&format!("{site}_w_up"));
     HcLowRank {
         norm_w: upload(g, &f.bytes(&format!("{site}_w_hc_norm"))),
         down_w: upload(g, &f.bytes(&format!("{site}_w_down"))),
-        up_w: upload(g, &f.bytes(&format!("{site}_w_up"))),
+        up_w: upload(g, &transpose_bf16(&up, f.hc * f.h, f.rank)),
         inject_w: if inject {
             upload(g, &f.bytes(&format!("{site}_w_inject")))
         } else {

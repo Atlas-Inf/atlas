@@ -258,10 +258,14 @@ pub fn load_qwen4exp_mtp_module(
     // mHC. The sites are named exactly like a main layer's, so the ordinary
     // loader reads them; only the head mixer lives under its own prefix.
     let hc_head = if config.hc_mult > 0 {
-        let head = hc::load_head_at(store, MTP_MIXER_PREFIX, config)
+        // The MTP block's own `up` tensors, under their own prefixes, so this
+        // is a second transposer rather than a re-run over the main model's.
+        let mut tr = hc::UpTranspose::new(gpu, config)?;
+        let head = hc::load_head_at(store, MTP_MIXER_PREFIX, config, &mut tr)
             .context("qwen4_exp MTP: hyper_connection_mixer")?;
-        let (attn_site, ffn_site) = hc::load_layer_sites(store, MTP_LAYER_PREFIX, config)
+        let (attn_site, ffn_site) = hc::load_layer_sites(store, MTP_LAYER_PREFIX, config, &mut tr)
             .context("qwen4_exp MTP: mHC sites")?;
+        tr.finish()?;
         attach::attach_hc(
             &mut body,
             config.num_hidden_layers,

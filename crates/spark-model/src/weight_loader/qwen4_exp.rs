@@ -144,10 +144,17 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // The model-level mixer collapses the streams before `lm_head` and
         // carries the FINAL NORM (this checkpoint has no `model.norm.weight`).
         // Replicated onto every layer; only the last one consumes it.
-        let hc_head = if config.hc_mult > 0 {
-            Some(hc::load_head(store, config)?)
+        // `input_mix_weight_up` is transposed IN PLACE as each site loads —
+        // see `hc::UpTranspose`. One staging buffer serves every site, so it
+        // has to outlive the layer loop below.
+        let mut up_tr = if config.hc_mult > 0 {
+            Some(hc::UpTranspose::new(gpu, config)?)
         } else {
             None
+        };
+        let hc_head = match up_tr.as_mut() {
+            Some(tr) => Some(hc::load_head(store, config, tr)?),
+            None => None,
         };
 
         // PLE scratch is sized once, for the largest prefill CHUNK a pass can
@@ -284,8 +291,8 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             // residual this model carries is `hc_mult * hidden` wide, so
             // without these the layer would run on a stream it never mixed.
             let mut layer = layer;
-            if config.hc_mult > 0 {
-                let (attn, ffn) = hc::load_layer_sites(store, &lp, config)?;
+            if let Some(tr) = up_tr.as_mut() {
+                let (attn, ffn) = hc::load_layer_sites(store, &lp, config, tr)?;
                 attach::attach_hc(&mut layer, i, attn, ffn, hc_head.clone(), config)?;
             }
             attach::attach_qsa(&mut layer, i, &lp, store, config, gpu)?;
@@ -301,6 +308,9 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             }
             layers.push(layer);
             hc_bytes += f2.saturating_sub(free_now(gpu));
+        }
+        if let Some(tr) = up_tr.take() {
+            tr.finish()?;
         }
         tracing::info!(
             "qwen4_exp layer construction: MoE {:.2} GB ({:.1} MB/layer), \

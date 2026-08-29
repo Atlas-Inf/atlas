@@ -521,11 +521,17 @@ impl BufferSizes {
                 //   low FP32 [64, rank];
                 // - prefill GEMM path (T > 64, slabbed at <= 2048 tokens):
                 //   normed BF16 [Ts, hc*H], up_pre BF16 [Ts, hc*H],
-                //   low BF16 [Ts, rank], inj_pre BF16 [Ts, hc].
+                //   low BF16 [Ts, rank], inj_pre BF16 [Ts, hc], and
+                //   up_wt BF16 [hc*H, rank] — a per-call transposed staging
+                //   copy of `input_mix_weight_up`, which is stored
+                //   [rank, hc*H] so the decode kernels coalesce while this
+                //   path's NT tensor-core GEMM still gets [hc*H, rank].
+                //   Ts-independent, hence added outside the Ts factor.
                 let t = m.min(64);
                 let split = t * (config.hc_mult * h + config.hc_lowrank) * 4;
                 let ts = m.min(2048);
-                let gemm = ts * (2 * config.hc_mult * h + config.hc_lowrank + config.hc_mult) * 2;
+                let gemm = ts * (2 * config.hc_mult * h + config.hc_lowrank + config.hc_mult) * 2
+                    + config.hc_mult * h * config.hc_lowrank * 2;
                 split.max(gemm)
             } else {
                 256
