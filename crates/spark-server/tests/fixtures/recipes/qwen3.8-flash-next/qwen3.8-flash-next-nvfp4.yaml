@@ -107,6 +107,66 @@ metadata:
     ingested indexer keys ride the SSM snapshots as host aux blobs, so a
     prefix hit cannot inherit the previous request's n-gram history. Measured
     3.9x warm TTFT on a 3-turn 2.6K needle.
+
+    LATENCY SHAPE (one GB10, thinking ON, 128-token completions, median of
+    2 reps after a dropped warmup, unique prompts so nothing hits the cache):
+
+      prompt_tok   C=1 TTFT   C=1 TPOT      C=2 TTFT   C=2 TPOT
+             268     1644 ms   52.24 ms       2898 ms   65.16 ms
+            1122     2580 ms   52.86 ms       4800 ms   65.95 ms
+            2347     4222 ms   53.69 ms       8349 ms  108.27 ms
+            4664     8700 ms   54.23 ms      17294 ms  109.35 ms
+            8060    16505 ms   53.63 ms      33053 ms  110.56 ms
+
+    TPOT IS FLAT IN CONTEXT -- 52.24 -> 53.63 ms across a 30x prompt range,
+    +2.7%. That is the 3:1 GDN ratio paying off: decode does not re-read a
+    context-length KV tensor per token, so per-token latency is a constant
+    the operator can plan against. TTFT is the opposite and is where the
+    budget goes: the marginal prefill rate is 1.91 ms/token (~524 tok/s), so
+    TTFT is essentially all of the wall time on a long single-turn prompt.
+
+    C=2 HAS A CLIFF between 1122 and 2347 prompt tokens. Below it, C=2 TPOT
+    is 65 ms and aggregate throughput is ~1.60x C=1. Above it TPOT doubles to
+    ~109 ms and aggregate is ~1.00x -- the second stream buys NOTHING. Size
+    concurrency against the prompt length actually served, not against a
+    short-prompt measurement.
+
+    SSM SNAPSHOTS ARE THE ENTIRE WARM WIN, AND THEY FIRE ONCE. Cold vs warm
+    TTFT on a repeated identical prefix, `--ssm-cache-slots 16` (the default)
+    against `--ssm-cache-slots 0` with KV prefix caching left ON in both, so
+    the difference is the SSM state restore alone:
+
+      prompt_tok   cold      warm (slots 16)   warm (slots 0)
+            1124   2369 ms    600 ms  3.95x    1940 ms  1.47x
+            2346   4180 ms    698 ms  5.99x    3542 ms  1.22x
+            4633   8633 ms    703 ms 12.27x    7863 ms  1.12x
+            8070  16408 ms    679 ms 24.18x   15457 ms  1.07x
+
+    Warm TTFT with snapshots is FLAT at ~680-700 ms regardless of prompt
+    length, which is the whole point of the feature. Without them the KV
+    prefix cache alone decays to 1.07x by 8K, because recomputing the GDN
+    recurrence is what prefill actually costs on this model.
+
+    ★ BUT THE HIT DOES NOT REPEAT. Eight identical back-to-back requests at
+    4545 prompt tokens: 9754 ms cold, 587 ms on the second (16.6x), then
+    ~7950 ms for every one of the remaining six. At 7984 tokens there is no
+    warm hit at all -- all eight land at ~15.7 s. The server says what is
+    happening:
+
+      Prefix cache hit: 4545 tokens (285 blocks) but no SSM snapshot
+        -- recomputing all KV
+
+    KV matches the whole prompt; the SSM snapshot lookup misses, so the GDN
+    state is recomputed from scratch and TTFT reverts to cold. Snapshots ARE
+    being written each request (`Saved SSM snapshot N for 4545 tokens`, slots
+    cycling 1,3,0,2), and the one hit that did land came from an INTERMEDIATE
+    checkpoint at token 4528, not the leaf. This is NOT the default-off
+    `ATLAS_MARCONI_EXACT` shortcut -- that path logs when it bypasses and it
+    never fired in this run. Leading hypothesis is that the snapshot is
+    released when its producing sequence completes, so it is gone before the
+    next request looks; that is a hypothesis, the log line above is the
+    measurement. Multi-turn agentic serving is exactly the workload that
+    should be collecting this win and currently collects it once.
   maintainer: atlas-inf
   category: general
   model_params: 180B
