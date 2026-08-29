@@ -67,7 +67,33 @@ impl TransformerLayer for Qwen3SsmLayer {
         if self.hc.is_none() || self.ffn.is_dense() {
             return None;
         }
-        Some(2)
+        // ONE draft (K=2 verify rows), not two. Two reasons, both measured on
+        // one GB10 with 256-token completions, agg tok/s:
+        //
+        //   arm        C=1     C=2    tok/step  greedy text vs plain decode
+        //   base      17.74   26.93     1.000   (reference)
+        //   K=2       21.73   25.39     1.774   IDENTICAL
+        //   K=3       20.16   24.92     2.420   DIFFERS
+        //
+        // 1. K=3 IS SLOWER. Acceptance genuinely improves — 1.774 -> 2.420
+        //    tokens per step, and 2.504 with the gate forced — but the third
+        //    verify row costs more than the extra 0.65 tokens buys. This holds
+        //    after the small-M MoE substitution that cut the verify's dominant
+        //    term 14x, so it is not the MoE.
+        //
+        // 2. K=3 IS NOT OUTPUT-EXACT. At temperature 0 speculation must be
+        //    indistinguishable from serial decode. K=2 reproduces it byte for
+        //    byte; K=3 does not. Bisected to the stream-row selection
+        //    (`Model::select_mtp_stream_row`): with ATLAS_MTP_STREAM_ROW_FIX=0
+        //    K=3 becomes exact again, and disabling the small-M MoE instead
+        //    leaves it diverging, so the MoE is exonerated. That selection is
+        //    what lifted K=2 acceptance 0.69 -> 0.83, so it is right for the
+        //    row it was validated on and wrong for row 2 — which is exactly
+        //    the kind of thing a width clamp exists to hold.
+        //
+        // Raising this needs the row-2 divergence fixed FIRST, not a benchmark
+        // that happens to look acceptable.
+        Some(1)
     }
 
     fn rollback_aux_verify(
