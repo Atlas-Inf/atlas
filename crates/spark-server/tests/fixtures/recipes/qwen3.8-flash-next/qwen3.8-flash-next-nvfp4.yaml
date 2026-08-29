@@ -154,6 +154,23 @@ metadata:
             4664     8700 ms   54.23 ms      17294 ms  109.35 ms
             8060    16505 ms   53.63 ms      33053 ms  110.56 ms
 
+    ★ THE TTFT COLUMN ABOVE IS PRE-FIX. `perf(ple): fault the n-gram rows
+    concurrently` cut it; how much depends entirely on how cold the PLE row
+    cache is, so both numbers are recorded rather than the flattering one:
+
+      * COLD cache, first large request after a restart -- 22,072 misses on a
+        4720-token prefill -- serial 10137 ms -> parallel 8631 ms, -14.9%.
+      * WARMED cache, the same five-leg sweep run in sequence -- only 2-7k
+        misses, because the legs share n-gram rows -- 3.3% to 11.7%, largest
+        at the SHORT prompts where the fixed PLE cost is the biggest share:
+            268 tok 1660 -> 1467 | 1140 2648 -> 2397 | 2309 4320 -> 3971
+           ~4700   8956 -> 8573 | 7980 16394 -> 15860
+
+    Real prose should sit nearer the cold figure than the warm one: the sweep's
+    filler draws from a 26-WORD vocabulary, so its n-grams collide far more
+    than real text does and its cache warms much faster than a real workload's
+    would.
+
     TPOT IS FLAT IN CONTEXT -- 52.24 -> 53.63 ms across a 30x prompt range,
     +2.7%. That is the 3:1 GDN ratio paying off: decode does not re-read a
     context-length KV tensor per token, so per-token latency is a constant
@@ -182,6 +199,21 @@ metadata:
     length, which is the whole point of the feature. Without them the KV
     prefix cache alone decays to 1.07x by 8K, because recomputing the GDN
     recurrence is what prefill actually costs on this model.
+
+    WHERE COLD TTFT ACTUALLY GOES (per-stage, one 4656-token prefill, 36 SSM
+    layer calls; the profiler syncs at every seam so absolutes are inflated but
+    the shares hold):
+
+      moe          2830 ms  48.8%
+      ple          1683 ms  29.0%   <- ALL of it in ONE layer (L1: 1681.9 ms;
+      gdn_block     686 ms  11.8%      every other layer is 0.0)
+      hc_pre_*      455 ms   7.9%
+      hc_post_*     144 ms   2.5%
+
+    Do not infer this from the warm-hit numbers below, which is the mistake
+    that cost a day: an SSM snapshot hit skips the ENTIRE forward, so it cannot
+    separate the GDN recurrence from the MoE. The GDN state is what makes the
+    forward unskippable; it is not what the forward spends its time on.
 
     ★ BUT THE HIT DOES NOT REPEAT. Eight identical back-to-back requests at
     4545 prompt tokens: 9754 ms cold, 587 ms on the second (16.6x), then
