@@ -45,6 +45,128 @@ use crate::expert_arena::ExpertArena;
 /// O_DIRECT transfer granularity (also `ExpertArena`'s stride requirement).
 const BLOCK: usize = 4096;
 
+/// Queue depth for the fault pass. The misses of one prefill are independent
+/// 4 KiB O_DIRECT reads, and O_DIRECT means no page cache and no kernel
+/// readahead -- the device only overlaps what we hand it at once. Measured on
+/// one prefill of 4656 tokens: 22,462 misses x ~74us ISSUED SERIALLY = 1657 ms,
+/// 17% of that request's TTFT. Raising the cache does not help; the misses are
+/// compulsory first-touch (65536 -> 1048576 slots changed the miss count by
+/// zero), so the depth is the whole lever.
+///
+/// Measured on that prefill, resolve time by depth -- monotone, so the default
+/// is the deepest measured rather than the knee:
+///
+///     QD    resolve    vs serial
+///      1    1631 ms      1.00x
+///      8     424 ms      3.85x
+///     16     257 ms      6.35x
+///     32     171 ms      9.55x
+///
+/// `1` restores the old strictly-serial behaviour for a bisect.
+fn fault_threads() -> usize {
+    std::env::var("ATLAS_PLE_FAULT_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32)
+}
+
+/// One scheduled miss: read row `id` into `slot`. Produced by the decision
+/// pass, consumed by the fault pass.
+struct Fault {
+    id: u64,
+    slot: u32,
+}
+
+/// Where a worker writes. Raw because the slots a batch owns are disjoint, so
+/// the workers do not alias and cannot be expressed as split `&mut` slices
+/// without carving the arena up first.
+///
+/// SAFETY (the `Send`/`Sync`): both pointers are into pinned allocations that
+/// outlive the `thread::scope` below -- the cache owns them and is borrowed for
+/// the whole scope. Every worker writes ONLY `[slot*stride, +stride)` for slots
+/// this batch pinned, and `victim` never hands the same slot out twice while
+/// pinned, so no two workers touch the same bytes.
+struct ArenaPtrs {
+    rows: *mut u8,
+    scales: Option<*mut u8>,
+}
+unsafe impl Send for ArenaPtrs {}
+unsafe impl Sync for ArenaPtrs {}
+
+/// The immutable half of the cache a worker needs: which file holds a row, and
+/// where. Split out so the fault pass can borrow it shared across threads while
+/// each worker keeps its OWN bounce buffer (the old single `self.bounce` was a
+/// second serialisation point, independent of the I/O).
+struct RowSource<'a> {
+    file: &'a File,
+    base_offset: u64,
+    segments: Option<&'a Segments>,
+    row_stride: usize,
+    scale_file: Option<&'a File>,
+}
+
+impl RowSource<'_> {
+    /// The file holding row `id`, and the row's byte offset within it. Same
+    /// divide as the method it replaces -- a shard carries its own base offset
+    /// AND its own backing file, and resolving one without the other was the
+    /// bug this signature exists to prevent.
+    fn row_loc(&self, id: u64) -> (&File, u64) {
+        match self.segments {
+            None => (self.file, self.base_offset + id * self.row_stride as u64),
+            Some(seg) => {
+                let shard = (id / seg.rows_per) as usize;
+                let local = id % seg.rows_per;
+                let file = &seg.files[seg.shard_file[shard] as usize];
+                (file, seg.bases[shard] + local * self.row_stride as u64)
+            }
+        }
+    }
+}
+
+/// Read one row (and its FP8 scale, when the table has a per-row scale file)
+/// into `slot`. Free function, not a method: it must be callable from several
+/// worker threads at once, each with its own `bounce`.
+fn fetch_row(
+    src: &RowSource<'_>,
+    ptrs: &ArenaPtrs,
+    bounce: &mut AlignedBlock,
+    id: u64,
+    slot: u32,
+) -> Result<()> {
+    let (file, byte) = src.row_loc(id);
+    let block_off = byte - (byte % BLOCK as u64);
+    let within = (byte - block_off) as usize;
+    // One block unless the row crosses the boundary (possible whenever the
+    // table's base offset is not 4 KiB-aligned, i.e. reading in place from a
+    // safetensors shard).
+    let nblocks = if within + src.row_stride > BLOCK { 2 } else { 1 };
+    atlas_tier::pio::read_exact_at(file, bounce.blocks(nblocks), block_off)
+        .with_context(|| format!("NgramRowCache: read row {id}"))?;
+    // SAFETY: slot is one this batch pinned, so it is < slots and no other
+    // worker writes it; the arena holds slots*row_stride bytes.
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(
+            ptrs.rows.add(slot as usize * src.row_stride),
+            src.row_stride,
+        )
+    };
+    dst.copy_from_slice(&bounce.blocks(nblocks)[within..within + src.row_stride]);
+
+    // A constant per-tensor scale needs no per-row refresh: every slot already
+    // holds it (see `set_constant_scale`), and `scale_file` is None then.
+    if let (Some(sfile), Some(sbase)) = (src.scale_file, ptrs.scales) {
+        let sbyte = id * 4;
+        let sblock = sbyte - (sbyte % BLOCK as u64);
+        let swithin = (sbyte - sblock) as usize;
+        atlas_tier::pio::read_exact_at(sfile, bounce.blocks(1), sblock)
+            .with_context(|| format!("NgramRowCache: read scale {id}"))?;
+        // SAFETY: as above; the scale arena holds slots*4 bytes.
+        let sdst = unsafe { std::slice::from_raw_parts_mut(sbase.add(slot as usize * 4), 4) };
+        sdst.copy_from_slice(&bounce.blocks(1)[swithin..swithin + 4]);
+    }
+    Ok(())
+}
+
 /// One table's on-NVMe backing file plus its resident row cache.
 pub struct NgramRowCache {
     /// Flat pinned, GPU-addressable `[slots, row_stride]` region.
@@ -79,7 +201,6 @@ pub struct NgramRowCache {
     /// Slots pinned for the batch in flight (never evicted).
     pinned: Vec<bool>,
     hand: usize,
-    bounce: AlignedBlock,
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
@@ -211,7 +332,6 @@ impl NgramRowCache {
             refbit: vec![false; slots],
             pinned: vec![false; slots],
             hand: 0,
-            bounce: AlignedBlock::new(),
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -272,6 +392,16 @@ impl NgramRowCache {
     pub fn resolve(&mut self, row_ids: &[u64], out_slots: &mut Vec<u32>) -> Result<()> {
         out_slots.clear();
         out_slots.reserve(row_ids.len());
+
+        // PASS 1 -- DECIDE. Serial, and deliberately so: the CLOCK hand, the
+        // eviction order and the slot handed to each id are exactly what the
+        // old single-pass loop produced, in the same order. Only the I/O moves.
+        //
+        // The residency bookkeeping that `fetch_into` used to do at its END now
+        // happens HERE, at decision time. That is what makes a repeated id
+        // inside one batch resolve as a hit to the slot already scheduled for
+        // it, instead of being faulted twice into two slots.
+        let mut faults: Vec<Fault> = Vec::new();
         for &id in row_ids {
             if id >= self.rows_total {
                 bail!(
@@ -288,14 +418,97 @@ impl NgramRowCache {
                 }
                 None => {
                     self.misses += 1;
+                    // Oversubscription still REFUSES here, before a single byte
+                    // of I/O is issued -- `victim` bails when every slot is
+                    // pinned by the batch in flight.
                     let s = self.victim()?;
-                    self.fetch_into(id, s)?;
+                    self.map.insert(id, s);
+                    self.slot_row[s as usize] = id;
+                    self.refbit[s as usize] = true;
+                    self.pinned[s as usize] = true;
+                    faults.push(Fault { id, slot: s });
                     s
                 }
             };
             out_slots.push(slot);
         }
+
+        // PASS 2 -- FAULT. The misses are independent: distinct slots (every
+        // slot handed out above is pinned, and `victim` skips pinned slots), so
+        // the arena writes are disjoint, and `read_exact_at` is positional so a
+        // shared `&File` has no cursor to race on.
+        if let Err(e) = self.fetch_many(&faults) {
+            // A partially-written slot must not stay claimed as resident: a
+            // wrong n-gram row reads as fluent output with wrong logits, which
+            // is the failure mode this cache exists to avoid. Drop the whole
+            // batch's claims -- conservative, and only on the error path.
+            for f in &faults {
+                self.map.remove(&f.id);
+                self.slot_row[f.slot as usize] = u64::MAX;
+            }
+            return Err(e);
+        }
         Ok(())
+    }
+
+    /// Issue `faults` concurrently. `&self`: the residency bookkeeping is
+    /// already done (pass 1) and every write below goes through a raw pointer
+    /// into a slot this batch owns exclusively.
+    fn fetch_many(&self, faults: &[Fault]) -> Result<()> {
+        if faults.is_empty() {
+            return Ok(());
+        }
+        let src = RowSource {
+            file: &self.file,
+            base_offset: self.base_offset,
+            segments: self.segments.as_ref(),
+            row_stride: self.row_stride,
+            scale_file: self.scales.as_ref().and_then(|sc| sc.file.as_ref()),
+        };
+        let ptrs = ArenaPtrs {
+            rows: self.arena.slot_host_ptr(0, 0)?,
+            scales: match self.scales.as_ref().filter(|sc| sc.file.is_some()) {
+                Some(sc) => Some(sc.arena.slot_host_ptr(0, 0)?),
+                None => None,
+            },
+        };
+
+        let want = fault_threads();
+        if want <= 1 || faults.len() == 1 {
+            let mut bounce = AlignedBlock::new();
+            for f in faults {
+                fetch_row(&src, &ptrs, &mut bounce, f.id, f.slot)?;
+            }
+            return Ok(());
+        }
+
+        // One chunk per worker rather than a shared queue: the faults cost the
+        // same each (one or two 4 KiB O_DIRECT reads), so static partitioning
+        // needs no synchronisation and leaves no tail worth stealing.
+        let nthreads = want.min(faults.len());
+        let chunk = faults.len().div_ceil(nthreads);
+        let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+        std::thread::scope(|scope| {
+            for part in faults.chunks(chunk) {
+                let (src, ptrs, first_err) = (&src, &ptrs, &first_err);
+                scope.spawn(move || {
+                    let mut bounce = AlignedBlock::new();
+                    for f in part {
+                        if let Err(e) = fetch_row(src, ptrs, &mut bounce, f.id, f.slot) {
+                            let mut g = first_err.lock().expect("fault error mutex");
+                            if g.is_none() {
+                                *g = Some(e);
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        match first_err.into_inner().expect("fault error mutex") {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Release the batch's pins (call after the gather kernels are issued).
@@ -329,80 +542,6 @@ impl NgramRowCache {
              raise the cache size or lower max-prefill-tokens",
             self.slots
         )
-    }
-
-    /// The file holding row `id`, and the row's byte offset within it.
-    ///
-    /// Returned together because for a segmented table the two are decided by
-    /// the SAME divide: a shard carries its own base offset *and* its own
-    /// backing file, so resolving the offset without the file was the bug this
-    /// signature exists to prevent.
-    fn row_loc(&self, id: u64) -> (&File, u64) {
-        match &self.segments {
-            None => (&self.file, self.base_offset + id * self.row_stride as u64),
-            Some(seg) => {
-                let shard = (id / seg.rows_per) as usize;
-                let local = id % seg.rows_per;
-                let file = &seg.files[seg.shard_file[shard] as usize];
-                (file, seg.bases[shard] + local * self.row_stride as u64)
-            }
-        }
-    }
-
-    /// Read row `id` off NVMe straight into `slot`'s pinned (GPU-addressable)
-    /// bytes, via the containing 4 KiB block.
-    fn fetch_into(&mut self, id: u64, slot: u32) -> Result<()> {
-        let byte = self.row_loc(id).1;
-        let block_off = byte - (byte % BLOCK as u64);
-        let within = (byte - block_off) as usize;
-        // One block unless the row crosses the boundary (possible whenever the
-        // table's base offset is not 4 KiB-aligned, i.e. reading in place from
-        // a safetensors shard).
-        let nblocks = if within + self.row_stride > BLOCK {
-            2
-        } else {
-            1
-        };
-        // Resolved by DIRECT FIELD BORROW rather than through `row_loc`, so
-        // that `self.bounce` stays independently borrowable as `&mut`.
-        let file = match &self.segments {
-            None => &self.file,
-            Some(seg) => &seg.files[seg.shard_file[(id / seg.rows_per) as usize] as usize],
-        };
-        atlas_tier::pio::read_exact_at(file, self.bounce.blocks(nblocks), block_off)
-            .with_context(|| format!("NgramRowCache: read row {id}"))?;
-        // SAFETY: slot < self.slots and the arena holds slots*row_stride bytes.
-        let dst = unsafe {
-            let base = self.arena.slot_host_ptr(0, 0)?;
-            std::slice::from_raw_parts_mut(
-                base.add(slot as usize * self.row_stride),
-                self.row_stride,
-            )
-        };
-        dst.copy_from_slice(&self.bounce.blocks(nblocks)[within..within + self.row_stride]);
-
-        // A constant per-tensor scale needs no per-row refresh: every slot
-        // already holds it (see `set_constant_scale`).
-        if let Some(sc) = self.scales.as_ref().filter(|sc| sc.file.is_some()) {
-            let sbyte = id * 4;
-            let sblock = sbyte - (sbyte % BLOCK as u64);
-            let swithin = (sbyte - sblock) as usize;
-            let sfile = sc.file.as_ref().expect("filtered on is_some");
-            atlas_tier::pio::read_exact_at(sfile, self.bounce.blocks(1), sblock)
-                .with_context(|| format!("NgramRowCache: read scale {id}"))?;
-            // SAFETY: slot < slots, scale arena holds slots*4 bytes.
-            let sdst = unsafe {
-                let base = sc.arena.slot_host_ptr(0, 0)?;
-                std::slice::from_raw_parts_mut(base.add(slot as usize * 4), 4)
-            };
-            sdst.copy_from_slice(&self.bounce.blocks(1)[swithin..swithin + 4]);
-        }
-
-        self.map.insert(id, slot);
-        self.slot_row[slot as usize] = id;
-        self.refbit[slot as usize] = true;
-        self.pinned[slot as usize] = true;
-        Ok(())
     }
 }
 
