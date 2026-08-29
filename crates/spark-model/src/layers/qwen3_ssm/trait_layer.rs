@@ -81,18 +81,38 @@ impl TransformerLayer for Qwen3SsmLayer {
         //    after the small-M MoE substitution that cut the verify's dominant
         //    term 14x, so it is not the MoE.
         //
-        // 2. K=3 IS NOT OUTPUT-EXACT. At temperature 0 speculation must be
-        //    indistinguishable from serial decode. K=2 reproduces it byte for
-        //    byte; K=3 does not. Bisected to the stream-row selection
-        //    (`Model::select_mtp_stream_row`): with ATLAS_MTP_STREAM_ROW_FIX=0
-        //    K=3 becomes exact again, and disabling the small-M MoE instead
-        //    leaves it diverging, so the MoE is exonerated. That selection is
-        //    what lifted K=2 acceptance 0.69 -> 0.83, so it is right for the
-        //    row it was validated on and wrong for row 2 — which is exactly
-        //    the kind of thing a width clamp exists to hold.
+        // 2. K=3 IS NOT OUTPUT-EXACT as it stands. At temperature 0
+        //    speculation must be indistinguishable from serial decode. K=2
+        //    reproduces it byte for byte; K=3 does not. Localized to ONE row
+        //    of the stream-row selection (`Model::select_mtp_stream_row`) by
+        //    `ATLAS_MTP_STREAM_ROW_MAX`, two prompts, sha of the completion:
         //
-        // Raising this needs the row-2 divergence fixed FIRST, not a benchmark
-        // that happens to look acceptable.
+        //      arm                        exact   p1      tok/step
+        //      rows 0,1,2 (as shipped)     NO     0.795     2.402
+        //      row 1 only                  yes    0.603     2.069
+        //      no selection at all         yes    0.576     2.017
+        //      K=2                         yes    0.843     1.843
+        //
+        //    Dropping ONLY row 2 restores exactness, so this is not a general
+        //    draft-invariance problem — row 2's copy specifically is wrong.
+        //    (`ATLAS_QWEN4EXP_HC_SMALL_M_FFN=0` still diverges, so the MoE
+        //    substitution is exonerated.) The selection is what lifted K=2
+        //    acceptance 0.69 -> 0.83: right for the row it was validated on,
+        //    wrong for row 2.
+        //
+        // AND FIXING ROW 2 WOULD NOT CHANGE THE ANSWER, which is why the clamp
+        // is here rather than a TODO. The exact K=3 was benched:
+        //
+        //      arm                        C=1     C=2
+        //      K=3 exact (row 1 only)    16.91   22.88
+        //      K=3 as shipped (inexact)  20.16   24.92
+        //      K=2                       21.67   25.41
+        //
+        // K=2 wins on throughput against BOTH, including against a K=3 with
+        // strictly better tokens/step. The extra verify row costs more than
+        // the extra tokens return on this model, so the acceptance gain is
+        // real and irrelevant. Raising this needs the row-2 defect fixed AND
+        // a verify row that pays for itself — the second is the harder one.
         Some(1)
     }
 

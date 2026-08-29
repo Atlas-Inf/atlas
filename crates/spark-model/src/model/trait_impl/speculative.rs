@@ -303,6 +303,15 @@ impl TransformerModel {
         if row == 0 {
             return Ok(());
         }
+        // DIAGNOSTIC (`ATLAS_MTP_STREAM_ROW_MAX`): apply the selection only up
+        // to this row. Exists to separate two explanations for K=3 losing
+        // greedy exactness while K=2 keeps it — is row 2's copy itself wrong,
+        // or is the K=3 verify simply not draft-invariant, so that ANY change
+        // to the proposed drafts moves the output? Setting this to 1 keeps the
+        // copy K=2 validated and drops only row 2.
+        if row > Self::stream_row_max_inner() {
+            return Ok(());
+        }
         // `hc_streams` is [M, hc, H] FP32 (buffers::sizes -- m*hc*h*4), so a
         // row is one contiguous hc*H span and rows never overlap.
         let Some(row_bytes) = self.mtp_stream_row_bytes() else {
@@ -357,6 +366,18 @@ impl TransformerModel {
             }
         }
         Ok(())
+    }
+
+    /// Highest verify row the stream selection is applied to
+    /// (`ATLAS_MTP_STREAM_ROW_MAX`, default unbounded). Diagnostic only.
+    fn stream_row_max_inner() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("ATLAS_MTP_STREAM_ROW_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(usize::MAX)
+        })
     }
 
     /// Bytes per `hc_streams` row (`hc * hidden * 4`), or `None` when this
