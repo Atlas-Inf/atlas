@@ -170,10 +170,49 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // 2048 covers the chunk sizes this model runs at; a larger chunk gets
         // the layer's refusal, which names this variable, rather than a
         // silent overrun.
-        let max_ple_tokens: usize = std::env::var("ATLAS_PLE_MAX_TOKENS")
+        // Sized by `max_batch_tokens` — the widest any single forward can be —
+        // NOT by a standalone constant. The old 2048 default claimed to "cover
+        // the chunk sizes this model runs at" and did not: prefill chunks are
+        // capped, but a fused mixed step sums a padded decode batch with a
+        // prefill slice and is bounded only by `max_batch_tokens` (8196 at the
+        // default serve config). Every prompt past 2048 tokens died with
+        //
+        //   Prefill chunk layer 1 failed: PLE: 3024 tokens exceeds the 2048
+        //   this layer was sized for
+        //
+        // and the API turned that into a 500. On a BFCL subset draw that was
+        // 51 of 334 samples — 15% of the benchmark scoring zero for a reason
+        // unrelated to the model, concentrated in the subsets with the largest
+        // tool schemas (`live_multiple` carries a median 3.2 KB of tool JSON,
+        // up to 22 KB, and scored 30% against `live_simple`'s 93%).
+        //
+        // Capping the prefill chunk instead was TRIED and does nothing: the
+        // failures are batched-forward totals, not single chunks, so they
+        // survive a 2048 chunk cap unchanged (measured: 51 before, 51 after).
+        //
+        // The cost is real — tokens*10240*14 bytes, so 1.18 GB at 8196 against
+        // 293 MB at 2048, out of the KV budget. `ATLAS_PLE_MAX_TOKENS` still
+        // overrides for anyone who would rather have the KV depth, and the
+        // layer's refusal still names it.
+        let ple_floor = config.max_batch_tokens.max(2048);
+        let max_ple_tokens: usize = match std::env::var("ATLAS_PLE_MAX_TOKENS")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2048);
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+        {
+            Some(n) => {
+                // Honouring an override BELOW the forward width is how the
+                // 500s got here in the first place, so it is allowed (it is a
+                // real KV-vs-capacity trade) but never silent.
+                if n < ple_floor {
+                    tracing::warn!(
+                        "ATLAS_PLE_MAX_TOKENS={n} is below the {ple_floor} tokens a single                          forward can present — any prefill wider than {n} will be REFUSED by                          the PLE layer and the request will fail. Raise it, or lower                          --max-num-batched-tokens to match."
+                    );
+                }
+                n
+            }
+            None => ple_floor,
+        };
         // With PLE disabled for bisection, skip the 21 MB arena and the
         // 128-shard open entirely rather than building what we will not run.
         let ple_off = std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1");

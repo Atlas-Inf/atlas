@@ -137,6 +137,23 @@ pub struct ModelConfig {
     /// Consumed by `skip_lm_head_quantization()`. Replaces the ATLAS_LMHEAD_BF16 env var.
     #[serde(default)]
     pub lm_head_bf16_override: Option<bool>,
+    /// The widest token count any single forward can present — the same `m`
+    /// `BufferArena` sizes every scratch region by. Set at serve time (not
+    /// from config.json), 0 when unset.
+    ///
+    /// Exists because one arena was NOT sized by it: qwen4_exp's PLE scratch
+    /// used a standalone 2048 constant, and refuses a wider chunk rather than
+    /// overrunning. Prefill chunks are capped, but a fused mixed step sums a
+    /// padded decode batch with a prefill slice and is bounded only by
+    /// `max_batch_tokens`, so anything past 2048 died in prefill and the API
+    /// returned a 500 — 51 of 334 samples on a BFCL draw.
+    ///
+    /// `skip`, not `default`: a serve-time value has no business being
+    /// supplied — or clobbered — by a checkpoint's config.json. 0 means "no
+    /// serve set this", which every consumer must treat as unknown rather
+    /// than as a real bound.
+    #[serde(skip)]
+    pub max_batch_tokens: usize,
     /// When `skip_lm_head_quantization()` == false, quantize the LM head to FP8
     /// (E4M3, per-row scales, decoded via `w8a16_gemv`) instead of NVFP4.
     /// Set by `--lm-head-dtype fp8`. Additive: leaves the NVFP4/BF16 paths
