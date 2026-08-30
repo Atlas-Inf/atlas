@@ -241,15 +241,25 @@ impl TransformerLayer for Qwen3SsmLayer {
         // the per-row attention duplication (+8.2 ms) and the unattributed
         // forward work (+18.1 ms). Either one, recovered, pays for K=3.
         //
-        // WHICH LEAVES A CONTRADICTION worth naming rather than papering over:
-        // the batched-verify run removed the per-row duplication and moved
-        // throughput 20.13 -> 20.195, i.e. ~nothing, when 8.2 ms of a 113 ms
-        // step should have been worth ~2 tok/s. So either that path does not
-        // actually stop running attention per row (its doc says attention goes
-        // through `decode_multi_seq` "with per-row block tables", which may
-        // still be a loop), or the +8.2 ms attribution is wrong. Resolving
-        // THAT is the cheapest next move, and it is a measurement, not a
-        // mechanism.
+        // THE CONTRADICTION IS RESOLVED, and in the useful direction. The
+        // batched-verify run moved throughput 20.13 -> 20.195 because it
+        // removed NOTHING: counting attention-layer calls per step
+        // (`ATLAS_QWEN4EXP_ATTN_PROF=1`) gives 64 in BOTH arms, at 256.5 us
+        // and 252.6 us. `decode_verify_batched_dispatch` batches ACROSS
+        // SEQUENCES; at n=1 there is nothing for it to batch, and one
+        // sequence's K rows still enter attention one at a time.
+        //
+        // So the +8.2 ms is REAL and still on the table, and it is larger than
+        // the 4.69 ms shortfall. The fix K=3 needs is to batch the full-
+        // attention layers across the K VERIFY ROWS OF ONE SEQUENCE — which is
+        // exactly what the 36 GDN layers already do (`decode_batched_hc`) and
+        // what the 12 attention layers do not. That is a real piece of work,
+        // not a flag: `verify_a.rs`'s loop exists because each row needs its
+        // own position and block-table metadata, which is the thing a batched
+        // arm would have to carry per row.
+        //
+        // It is also the FIRST identified change that would make K=3 pay
+        // without needing better acceptance or a numerics change.
         //
         // Recorded as subtraction, not as a mechanism. Three mechanisms have
         // been proposed here and all three were refuted by the measurement
