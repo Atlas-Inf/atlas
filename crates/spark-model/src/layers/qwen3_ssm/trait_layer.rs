@@ -12,6 +12,84 @@ use super::Qwen3SsmLayer;
 use crate::layer::{ForwardContext, GdnPrefillBuffers, LayerState, TransformerLayer};
 
 impl TransformerLayer for Qwen3SsmLayer {
+    // ── MoE layout transposes ───────────────────────────────────────────
+    // qwen4_exp is 36 gated-delta-net layers + 12 full-attention layers, and
+    // EVERY one of them carries a 512-expert MoE block. Only
+    // `Qwen3AttentionLayer` used to override these, and the trait defaults are
+    // `Ok(())` -- a SILENT no-op -- so the factory transpose pass built the
+    // `_t` tables for 12 of 48 layers and skipped 36 with no log line.
+    //
+    // Measured before this fix (nsys, unified layout on): the transposed
+    // kernels ran exactly 24 gate_up + 24 down = 12 layers x 2, while the
+    // untransposed `moe_w4a16_grouped_gemm_ptrtable` still took 216 launches
+    // and 38% of GPU time. TTFT barely moved because 75% of the MoE work never
+    // left the slow path.
+    //
+    // All five are forwarded so every m2_setup tier (full / gate_up+scratch /
+    // unified / hybrid) reaches the SSM layers, not just the one we happen to
+    // run today.
+
+    fn transpose_moe_for_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn transpose_moe_gate_up_for_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_gate_up_for_prefill(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn set_moe_down_transpose_scratch(
+        &mut self,
+        scratch_packed: DevicePtr,
+        scratch_scale: DevicePtr,
+        packed_ptrs_t: DevicePtr,
+        scale_ptrs_t: DevicePtr,
+    ) {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.set_down_transpose_scratch(
+                scratch_packed,
+                scratch_scale,
+                packed_ptrs_t,
+                scale_ptrs_t,
+            );
+        }
+    }
+
+    fn transpose_moe_for_prefill_unified(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill_unified(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn transpose_moe_for_prefill_hybrid(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill_hybrid(gpu, config)?;
+        }
+        Ok(())
+    }
+
     /// Downcast hook so the LoRA install walk can reach this layer's MoE FFN
     /// (Feature-1: routed-expert/router deltas exist on GDN layers too).
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -50,6 +128,119 @@ impl TransformerLayer for Qwen3SsmLayer {
 
     fn has_aux_state(&self) -> bool {
         self.ple.is_some()
+    }
+
+    /// K=2 and K=3 are the verify widths this layer's mHC batched decode
+    /// actually has MoE arms for (`forward_k2`/`forward_k3`); K=4..8 goes
+    /// through `try_forward_km`, which is dense-only, and a dense FFN can
+    /// also fall back to `forward_prefill` at any K. So a 512-expert MoE
+    /// under the highway tops out at K=3 — two drafts. Off the highway the
+    /// batched path stages per row and nothing here bounds it.
+    ///
+    /// Reported rather than discovered: `trait_decode_batched_hc` bails on
+    /// an unservable K, and that bail reaches the scheduler as a verify
+    /// error, which finishes the request. `--num-drafts 3` on this model
+    /// used to kill every request after one token that way.
+    fn verify_max_drafts(&self) -> Option<usize> {
+        if self.hc.is_none() || self.ffn.is_dense() {
+            return None;
+        }
+        // ONE draft (K=2 verify rows), not two. Two reasons, both measured on
+        // one GB10 with 256-token completions, agg tok/s:
+        //
+        //   arm        C=1     C=2    tok/step  greedy text vs plain decode
+        //   base      17.74   26.93     1.000   (reference)
+        //   K=2       21.73   25.39     1.774   IDENTICAL
+        //   K=3       20.16   24.92     2.420   DIFFERS
+        //
+        // 1. K=3 IS SLOWER. Acceptance genuinely improves — 1.774 -> 2.420
+        //    tokens per step, and 2.504 with the gate forced — but the third
+        //    verify row costs more than the extra 0.65 tokens buys. This holds
+        //    after the small-M MoE substitution that cut the verify's dominant
+        //    term 14x, so it is not the MoE.
+        //
+        // 2. K=3 IS NOT OUTPUT-EXACT as it stands. At temperature 0
+        //    speculation must be indistinguishable from serial decode. K=2
+        //    reproduces it byte for byte; K=3 does not. Localized to ONE row
+        //    of the stream-row selection (`Model::select_mtp_stream_row`) by
+        //    `ATLAS_MTP_STREAM_ROW_MAX`, two prompts, sha of the completion:
+        //
+        //      arm                        exact   p1      tok/step
+        //      rows 0,1,2 (as shipped)     NO     0.795     2.402
+        //      row 1 only                  yes    0.603     2.069
+        //      no selection at all         yes    0.576     2.017
+        //      K=2                         yes    0.843     1.843
+        //
+        //    Dropping ONLY row 2 restores exactness, so this is not a general
+        //    draft-invariance problem — row 2's copy specifically is wrong.
+        //    (`ATLAS_QWEN4EXP_HC_SMALL_M_FFN=0` still diverges, so the MoE
+        //    substitution is exonerated.) The selection is what lifted K=2
+        //    acceptance 0.69 -> 0.83: right for the row it was validated on,
+        //    wrong for row 2.
+        //
+        // AND FIXING ROW 2 WOULD NOT CHANGE THE ANSWER, which is why the clamp
+        // is here rather than a TODO. The exact K=3 was benched:
+        //
+        //      arm                        C=1     C=2
+        //      K=3 exact (row 1 only)    16.91   22.88
+        //      K=3 as shipped (inexact)  20.16   24.92
+        //      K=2                       21.67   25.41
+        //
+        // K=2 wins on throughput against BOTH, including against a K=3 with
+        // strictly better tokens/step. The extra verify row costs more than
+        // the extra tokens return on this model, so the acceptance gain is
+        // real and irrelevant.
+        //
+        // HOW MUCH MORE ACCEPTANCE WOULD K=3 NEED? At its measured step cost
+        // (119.1 ms vs K=2's 85.0 ms) K=3 must reach 2.582 tokens/step to TIE
+        // K=2. Under 1 + p + p^2 that is a per-draft acceptance of
+        //
+        //     p = 0.853
+        //
+        // and K=2's own measured first-draft acceptance is p1 = 0.843. So a
+        // perfect row-2 fix — one lifting K=3's drafting all the way to K=2's
+        // quality — lands at 2.554 tok/step, 21.43 tok/s, still under K=2's
+        // 21.67. K=3 would have to draft BETTER than K=2 does merely to draw.
+        // And 1 + p + p^2 is optimistic: it assumes the second draft position
+        // accepts at the first's rate, when later positions always accept
+        // less, so the real requirement is higher still.
+        //
+        // WHY THE THIRD ROW COSTS 1.40x. The verify FFN streams each ACTIVATED
+        // expert once, so cost tracks the UNION of experts over the verify
+        // rows, and this model routes top-10 of 512:
+        //
+        //     E[distinct experts over R rows] = 512*(1 - (1 - 10/512)^R)
+        //       R=2 -> 19.8 experts -> 54.8 MB/layer
+        //       R=3 -> 29.4 experts -> 81.3 MB/layer     ratio 1.485
+        //
+        // at 3*2560*640*0.5625 = 2.76 MB per expert. The measured step ratio
+        // 1.401 sits between the token ratio 1.303 and that 1.485, which is
+        // where modest routing correlation puts it. Breaking even would need
+        // ~40% of the third row's experts already resident from rows 1-2.
+        //
+        // Stated as scope, not as a law: for THIS geometry, this kernel, C=1
+        // and the measured acceptance, K=3 does not pay. Independent routing
+        // is a pessimistic estimate, not a strict bound, so this is not proof
+        // that no K=3 can ever win — the same experiment upstream on a 27B
+        // (fewer experts, more natural overlap) came out a wash at -0.2%
+        // rather than a loss. Raising this needs the row-2 defect fixed AND a
+        // verify row that pays for itself; the arithmetic says the second is
+        // the binding constraint.
+        //
+        // DIAGNOSTIC (`ATLAS_MTP_MAX_DRAFTS`): raise the clamp to profile the
+        // width it forbids. The arithmetic above says K=3 cannot win, but it
+        // was derived from end-to-end throughput, not from a per-stage
+        // attribution of the verify itself — and the verify is the one width
+        // neither the decode nor the prefill profiler covers. Pair with
+        // `ATLAS_QWEN4EXP_VERIFY_PROF=1` to see where a K=3 row's cost lands.
+        // NOT a serving lever: K=3 is measurably slower AND not output-exact.
+        Some(
+            std::env::var("ATLAS_MTP_MAX_DRAFTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(1),
+        )
     }
 
     fn rollback_aux_verify(

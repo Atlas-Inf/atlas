@@ -193,6 +193,23 @@ impl MoeLayer {
         let shared_inter = config.shared_expert_intermediate_size;
         let _num_experts = self.weights.experts.len();
 
+        // ── Layout state is DERIVED, never declared ──────────────────────
+        // These two flags used to be read independently from env at
+        // construction, so operator intent and the tier that actually ran
+        // could disagree. That was not cosmetic: with both
+        // ATLAS_UNIFIED_MOE_LAYOUT=1 and ATLAS_HYBRID_MOE_LAYOUT=1 on a box
+        // where hybrid does not fit, the orchestrator ran UNIFIED (freeing the
+        // [N,K/2] originals) while `use_t_layout_for_decode()` still returned
+        // false -- its `!self.hybrid_layout` term read the env flag -- so
+        // decode fell through to the originals arm and dereferenced freed
+        // device memory.
+        //
+        // Setting them here, from the branch that is about to execute, makes
+        // that disagreement structurally impossible and removes the need for
+        // the operator to know either flag exists.
+        self.unified_layout = !keep_originals;
+        self.hybrid_layout = keep_originals;
+
         // ── Phase A: transpose gate+up routed experts ──
         // ARM-2 Phase-K Family C: native-MXFP4 routed experts are per-32 E8M0.
         let routed_gs =
