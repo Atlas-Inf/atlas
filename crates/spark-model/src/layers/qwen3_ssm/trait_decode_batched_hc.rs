@@ -98,6 +98,28 @@ impl Qwen3SsmLayer {
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
 
+        // ATLAS_QWEN4EXP_VERIFY_PROF=1: per-stage wall clock for the SPECULATIVE
+        // VERIFY, which is the one width neither the decode nor the prefill
+        // profiler covers. Both of those instrument their own path; the K-row
+        // verify runs through here and was, until this, unattributed -- so the
+        // question "what does the third verify row actually cost" could only be
+        // answered by arithmetic over end-to-end throughput. Each probe syncs,
+        // so the numbers are honest and the mode is not for serving.
+        let mut t = verify_prof_start(ctx, stream);
+        macro_rules! stage {
+            ($name:expr) => {
+                if let Some(t0) = t.as_mut() {
+                    ctx.gpu.synchronize(stream).ok();
+                    tracing::info!(
+                        "hc-verify K={num_tokens} [{}]: {}us",
+                        $name,
+                        t0.elapsed().as_micros()
+                    );
+                    *t0 = std::time::Instant::now();
+                }
+            };
+        }
+
         if hc.is_first_model_layer {
             ops::hc_expand(
                 ctx.gpu,
@@ -175,6 +197,8 @@ impl Qwen3SsmLayer {
             }
         }
 
+        stage!("gdn_block");
+
         ops::hc_pre_site(
             ctx.gpu,
             self.hc_pre_k,
@@ -190,6 +214,7 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        stage!("hc_pre_attn");
         Ok(())
     }
 
@@ -214,6 +239,21 @@ impl Qwen3SsmLayer {
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
 
+        let mut t = verify_prof_start(ctx, stream);
+        macro_rules! stage {
+            ($name:expr) => {
+                if let Some(t0) = t.as_mut() {
+                    ctx.gpu.synchronize(stream).ok();
+                    tracing::info!(
+                        "hc-verify K={num_tokens} [{}]: {}us",
+                        $name,
+                        t0.elapsed().as_micros()
+                    );
+                    *t0 = std::time::Instant::now();
+                }
+            };
+        }
+
         // MUST precede the FFN: on some arms `out_proj_buf` IS
         // `ctx.buffers.moe_output()`, which the FFN below overwrites. Consuming
         // it into the highway first is what makes that safe — same ordering
@@ -231,6 +271,8 @@ impl Qwen3SsmLayer {
             h as u32,
             stream,
         )?;
+
+        stage!("hc_post_attn");
 
         // ── MoE sublayer ──
         let normed2 = ctx.buffers.norm_output();
@@ -255,6 +297,8 @@ impl Qwen3SsmLayer {
         // does NOT: `ffn.forward` reuses row 0 every call, so it would need
         // per-row staging. Rather than stage it subtly wrong, refuse — K=2 (the
         // num_drafts=1 verify) and K=3 are the widths this model actually runs.
+        stage!("hc_pre_ffn");
+
         if num_tokens == 3 {
             self.ffn.forward_k3(normed2, ctx, stream)?;
         } else if num_tokens == 2 {
@@ -277,6 +321,7 @@ impl Qwen3SsmLayer {
                  Lower --num-drafts (K = num_drafts + 1)."
             );
         }
+        stage!("moe");
 
         ops::hc_post_site(
             ctx.gpu,
@@ -291,6 +336,27 @@ impl Qwen3SsmLayer {
             h as u32,
             stream,
         )?;
+        stage!("hc_post_ffn");
         Ok(())
     }
+}
+
+/// Start the verify-path stage clock, or `None` when the probe is off.
+///
+/// Capped like its decode and prefill twins: a verify runs every speculative
+/// step, so an uncapped probe would sync twice per stage per layer for the life
+/// of the process. 600 layer calls is ~16 steps at 36 SSM layers -- enough to
+/// average a K=2 against a K=3 without the syncs themselves becoming the
+/// measurement.
+fn verify_prof_start(ctx: &ForwardContext, stream: u64) -> Option<std::time::Instant> {
+    static PROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static PROF_LEFT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(600);
+    let on = *PROF
+        .get_or_init(|| std::env::var("ATLAS_QWEN4EXP_VERIFY_PROF").as_deref() == Ok("1"))
+        && PROF_LEFT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0;
+    if !on {
+        return None;
+    }
+    ctx.gpu.synchronize(stream).ok();
+    Some(std::time::Instant::now())
 }

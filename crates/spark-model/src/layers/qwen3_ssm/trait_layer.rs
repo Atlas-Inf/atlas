@@ -127,28 +127,63 @@ impl TransformerLayer for Qwen3SsmLayer {
         // accepts at the first's rate, when later positions always accept
         // less, so the real requirement is higher still.
         //
-        // WHY THE THIRD ROW COSTS 1.40x. The verify FFN streams each ACTIVATED
-        // expert once, so cost tracks the UNION of experts over the verify
-        // rows, and this model routes top-10 of 512:
+        // WHY THE THIRD ROW COSTS WHAT IT DOES — MEASURED, and NOT the expert
+        // union this comment used to blame. That story predicted the verify FFN
+        // would scale with the union of activated experts,
+        // 512*(1-(1-10/512)^R): 19.8 experts at R=2, 29.4 at R=3, ratio 1.485.
+        // Profiling the verify (`ATLAS_QWEN4EXP_VERIFY_PROF=1`, mean us per
+        // layer call) says otherwise:
         //
-        //     E[distinct experts over R rows] = 512*(1 - (1 - 10/512)^R)
-        //       R=2 -> 19.8 experts -> 54.8 MB/layer
-        //       R=3 -> 29.4 experts -> 81.3 MB/layer     ratio 1.485
+        //     stage          K=2      K=3     ratio
+        //     moe          287.6    374.1     1.30
+        //     hc_pre_attn  184.9    184.5     1.00
+        //     hc_pre_ffn   183.8    184.5     1.00
+        //     gdn_block     16.8     17.0     1.01
+        //     TOTAL        698.9    786.9     1.126
         //
-        // at 3*2560*640*0.5625 = 2.76 MB per expert. The measured step ratio
-        // 1.401 sits between the token ratio 1.303 and that 1.485, which is
-        // where modest routing correlation puts it. Breaking even would need
-        // ~40% of the third row's experts already resident from rows 1-2.
+        // MoE scales 1.30x, not 1.485x, and the whole SSM verify only 1.126x —
+        // BELOW the 1.354 token ratio. On the SSM half alone K=3 would win.
         //
-        // Stated as scope, not as a law: for THIS geometry, this kernel, C=1
-        // and the measured acceptance, K=3 does not pay. Independent routing
-        // is a pessimistic estimate, not a strict bound, so this is not proof
-        // that no K=3 can ever win — the same experiment upstream on a 27B
-        // (fewer experts, more natural overlap) came out a wash at -0.2%
-        // rather than a loss. Raising this needs the row-2 defect fixed AND a
-        // verify row that pays for itself; the arithmetic says the second is
-        // the binding constraint.
-        Some(1)
+        // WHERE IT ACTUALLY GOES (`ATLAS_MTP_TIMING=1`, per step):
+        //
+        //     phase        K=2       K=3       delta
+        //     fwd        73.54 ms  103.32 ms  +29.78   (90% of it)
+        //     propose     3.64 ms    7.27 ms   +3.63   (the 2nd draft pass)
+        //     d2h         1.98 ms    1.67 ms   -0.31
+        //     step_mtp   80.01 ms  113.07 ms  +33.06
+        //
+        // and the 36 SSM layers are only +3.17 ms of that +29.78 forward. So
+        // +26.6 ms — 80% of the whole K=3 penalty — is the NON-SSM half of the
+        // forward: 12 attention layers, the LM head over 3 rows instead of 2,
+        // and the embedding. That half scales 1.55x where the SSM half scales
+        // 1.126x, and nothing here explains why yet.
+        //
+        // So K=3 is NOT settled as physics, and the earlier claim that it was
+        // is withdrawn. It loses today — step ratio 1.456 against a token
+        // ratio 1.354, measured end to end on the same binary — but the term
+        // that loses it is an unexplained 1.55x in the attention-layer forward,
+        // not a bandwidth floor. If that were brought to the SSM half's 1.126x
+        // the step ratio would fall under the token ratio and K=3 would pay.
+        //
+        // Raising this clamp therefore needs three things, in order: attribute
+        // the attention-half forward at K=2 vs K=3 (it has no per-stage probe
+        // yet, which is why this stops here), fix whatever it finds, and fix
+        // the row-2 exactness defect. The first is the open question.
+        //
+        // DIAGNOSTIC (`ATLAS_MTP_MAX_DRAFTS`): raise the clamp to profile the
+        // width it forbids. The arithmetic above says K=3 cannot win, but it
+        // was derived from end-to-end throughput, not from a per-stage
+        // attribution of the verify itself — and the verify is the one width
+        // neither the decode nor the prefill profiler covers. Pair with
+        // `ATLAS_QWEN4EXP_VERIFY_PROF=1` to see where a K=3 row's cost lands.
+        // NOT a serving lever: K=3 is measurably slower AND not output-exact.
+        Some(
+            std::env::var("ATLAS_MTP_MAX_DRAFTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(1),
+        )
     }
 
     fn rollback_aux_verify(
