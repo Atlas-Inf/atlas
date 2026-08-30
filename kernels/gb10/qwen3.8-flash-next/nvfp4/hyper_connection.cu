@@ -380,15 +380,46 @@ extern "C" __global__ void hc_pre_down(
     float* __restrict__ low_out,               // [T, rank]
     const unsigned int hidden_size,
     const unsigned int hc,
-    const unsigned int rank
+    const unsigned int rank,
+    const unsigned int num_tokens
 ) {
+    // STAGE `normed[t]` IN SHARED MEMORY.
+    //
+    // One block owns one token and every warp contracts its own `down_w` rows
+    // against that token's `nx`. `nx` is hc_dim floats -- 40 KB at
+    // hc_dim=10240 -- and the original kernel re-read it from L2 once per row,
+    // i.e. `rank` times per token. That, not the weight, was the dominant
+    // traffic:
+    //
+    //     down_w   T x rank x 20 KB =  393 MB
+    //     nx       T x rank x 40 KB =  786 MB   <-- dominant
+    //
+    // A first attempt tiled TOKENS so a fetched weight row was reused across
+    // them. That cut only the 393 MB term, so total traffic fell 29% and wall
+    // time 6% -- the nx term was untouched and still dominated. Staging nx in
+    // shared instead drops it to ONE read per block (T x 40 KB = 2 MB), a 3.0x
+    // cut in total traffic.
+    //
+    // Measured at 89.3 ms and 19.4% of a 60-token prefill before this change
+    // (nsys 2026-08-30) -- second only to the MoE gate_up GEMM.
+    //
+    // BITWISE SAFE: each lane still walks `i = lane, lane+32, ...` over the
+    // full hc_dim and the same shfl reduction follows, so the FMA sequence for
+    // every (t, r) is unchanged. Only where the operand is read from changed.
+    extern __shared__ float s_nx[];
+
     const unsigned int t = blockIdx.x;
+    if (t >= num_tokens) return;
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int warp = threadIdx.x >> 5;
     const unsigned int warps = blockDim.x >> 5;
     const unsigned int hc_dim = hc * hidden_size;
-    const float* nx = normed + (size_t)t * hc_dim;
     const float inv_hc = 1.0f / (float)hc;
+
+    for (unsigned int i = threadIdx.x; i < hc_dim; i += blockDim.x) {
+        s_nx[i] = normed[(size_t)t * hc_dim + i];
+    }
+    __syncthreads();
 
     // Rows split first across grid.y, then across warps in the block.
     const unsigned int rows_per_split = (rank + gridDim.y - 1) / gridDim.y;
@@ -398,7 +429,7 @@ extern "C" __global__ void hc_pre_down(
         const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
         float acc = 0.0f;
         for (unsigned int i = lane; i < hc_dim; i += 32) {
-            acc += (float)row[i] * nx[i];
+            acc += (float)row[i] * s_nx[i];
         }
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {

@@ -406,17 +406,37 @@ fn hc_pre_split(
         .arg_f32(norm_eps)
         .launch(stream)?;
 
+    // `hc_pre_down` stages the token's `normed` row in SHARED memory, so the
+    // 40 KB vector is read once per block instead of once per `rank` row. That
+    // was the dominant traffic term (T x rank x 40 KB = 786 MB at T=60, against
+    // 393 MB for the weight); see the kernel note.
+    //
+    // Shared budget: hc_dim floats. At hc_dim=10240 that is 40 KB, inside the
+    // 48 KB default. If a model ever exceeds it the launch would fail, so fall
+    // back to the un-staged path rather than trusting the geometry.
+    let hc_smem = hc_dim as usize * 4;
+    const HC_SMEM_MAX: usize = 48 * 1024;
+    anyhow::ensure!(
+        hc_smem <= HC_SMEM_MAX,
+        "hc_pre_down: normed row is {} B of shared, over the {} B block limit \
+         (hc_dim={}). Tile hc_dim before raising this.",
+        hc_smem,
+        HC_SMEM_MAX,
+        hc_dim,
+    );
     // Spread rank rows over enough blocks to occupy the part even at T=1.
     let dsplit = (48 / num_tokens.max(1)).clamp(1, 10);
     KernelLaunch::new(gpu, k_down)
         .grid([num_tokens, dsplit, 1])
         .block([1024, 1, 1])
+        .shared_mem(hc_smem as u32)
         .arg_ptr(normed)
         .arg_ptr(w.down_w)
         .arg_ptr(low)
         .arg_u32(hidden_size)
         .arg_u32(hc_mult)
         .arg_u32(w.rank as u32)
+        .arg_u32(num_tokens)
         .launch(stream)?;
 
     // Stage 3 was the largest kernel in the decode profile: 23% of all GPU
