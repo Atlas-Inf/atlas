@@ -229,6 +229,28 @@ impl TransformerLayer for Qwen3SsmLayer {
         // embedding, the final norm, the per-row metadata uploads — and none
         // of that has a probe yet.
         //
+        // HOW CLOSE IS IT, EXACTLY? Much closer than everything above implies,
+        // and this is the number to start from. K=2 steps in 80.01 ms at 1.715
+        // tok/step; K=3 in 113.07 at 2.323. The token ratio is 1.3545, so K=3
+        // breaks even at 80.01 * 1.3545 = 108.38 ms and it measures 113.07:
+        //
+        //     SHORTFALL 4.69 ms — 4.2% of the K=3 step
+        //
+        // Not the ~20 ms the unattributed remainder suggests. TWO of the
+        // attributed terms are individually larger than the whole shortfall:
+        // the per-row attention duplication (+8.2 ms) and the unattributed
+        // forward work (+18.1 ms). Either one, recovered, pays for K=3.
+        //
+        // WHICH LEAVES A CONTRADICTION worth naming rather than papering over:
+        // the batched-verify run removed the per-row duplication and moved
+        // throughput 20.13 -> 20.195, i.e. ~nothing, when 8.2 ms of a 113 ms
+        // step should have been worth ~2 tok/s. So either that path does not
+        // actually stop running attention per row (its doc says attention goes
+        // through `decode_multi_seq` "with per-row block tables", which may
+        // still be a loop), or the +8.2 ms attribution is wrong. Resolving
+        // THAT is the cheapest next move, and it is a measurement, not a
+        // mechanism.
+        //
         // Recorded as subtraction, not as a mechanism. Three mechanisms have
         // been proposed here and all three were refuted by the measurement
         // that followed; the next person should probe first.
