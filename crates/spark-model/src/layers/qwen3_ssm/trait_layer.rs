@@ -194,8 +194,25 @@ impl TransformerLayer for Qwen3SsmLayer {
         // comment claimed to have explained it. It is not the expert union
         // (MoE scales 1.30x, measured), not per-row attention (does not
         // happen), and not the drafter (timed). Nobody should propose a fifth
-        // mechanism from an argument; the next step is a probe inside
-        // `verify_c`'s forward at K=2 against K=3.
+        // THE TAIL IS RULED OUT. A probe inside `verify_c`'s own forward gives,
+        // per K=3 verify, norm 9 us / lm_head 1508 us / argmax 289 us — about
+        // 1.8 ms total, matching the ~3.17 ms roofline figure the batched
+        // NVFP4 GEMV is documented at, and far too small to be the +26.3 ms.
+        // So it is not the LM head, not the argmax, and not the final norm.
+        //
+        // The same probe read `layers=0us`, which is not a measurement but a
+        // broken bucket — the layer-loop accumulator never fired — and an
+        // earlier arrangement of it reported an 84 ms "tail" that was purely a
+        // bucket-boundary artifact, its last accumulator absorbing everything
+        // unbucketed. Both readings were discarded and the probe reverted
+        // rather than left in tree producing plausible-looking wrong numbers.
+        //
+        // So: +26.3 ms of K=3's +33.1 ms step is still unattributed, and the
+        // list of things it is NOT is now expert-union bandwidth, per-row
+        // weight re-streaming, per-row layer re-execution, a 12-of-48 batching
+        // gap, and the lm_head/argmax tail. Whoever picks this up should
+        // instrument `verify_c`'s layer loop with a bucket that is verified to
+        // fire before trusting anything it prints.
         //
         // FOUR mechanisms have now been asserted in this file and refuted:
         // expert-union bandwidth, per-row weight re-streaming, per-row layer
