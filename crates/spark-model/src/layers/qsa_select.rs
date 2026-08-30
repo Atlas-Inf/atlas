@@ -286,26 +286,56 @@ impl QsaIndexer {
             });
             gpu.copy_h2d_async(&host_lists, lists, stream)?;
 
-            ops::qsa_prefill_attn(
-                gpu,
-                self.k_prefill_attn_k,
-                q_roped.offset(first_row * q_row * 2),
-                k_pool,
-                v_pool,
-                block_table_dev,
-                lists,
-                attn_ctx.offset(first_row * q_row * 2),
-                rows as u32,
-                first_pos as u32,
-                topk as u32,
-                self.ratio,
-                block_size,
-                nq,
-                self.nkv_attn,
-                self.hd_attn,
-                inv_sqrt_d,
-                stream,
-            )?;
+            // Every q head of a row attends over the SAME selected set --
+            // the list is indexed by row, not by head -- so one block can
+            // serve a whole group of heads and read each K/V row once instead
+            // of once per head. nsys on an 11k prefill: the per-head kernel
+            // was 3.70 s, 32.6% of a 12.3 s window, moving ~51 GB of L2
+            // traffic per launch. Same accumulation order, so same bits; the
+            // one-head kernel stays for geometries the group cannot divide.
+            if ops::qsa_prefill_attn_grouped_ok(nq, self.nkv_attn, self.hd_attn) {
+                ops::qsa_prefill_attn_g(
+                    gpu,
+                    self.k_prefill_attn_g_k,
+                    q_roped.offset(first_row * q_row * 2),
+                    k_pool,
+                    v_pool,
+                    block_table_dev,
+                    lists,
+                    attn_ctx.offset(first_row * q_row * 2),
+                    rows as u32,
+                    first_pos as u32,
+                    topk as u32,
+                    self.ratio,
+                    block_size,
+                    nq,
+                    self.nkv_attn,
+                    self.hd_attn,
+                    inv_sqrt_d,
+                    stream,
+                )?;
+            } else {
+                ops::qsa_prefill_attn(
+                    gpu,
+                    self.k_prefill_attn_k,
+                    q_roped.offset(first_row * q_row * 2),
+                    k_pool,
+                    v_pool,
+                    block_table_dev,
+                    lists,
+                    attn_ctx.offset(first_row * q_row * 2),
+                    rows as u32,
+                    first_pos as u32,
+                    topk as u32,
+                    self.ratio,
+                    block_size,
+                    nq,
+                    self.nkv_attn,
+                    self.hd_attn,
+                    inv_sqrt_d,
+                    stream,
+                )?;
+            }
             slab += rows;
         }
         if diag {
