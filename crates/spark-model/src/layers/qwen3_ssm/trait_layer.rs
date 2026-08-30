@@ -158,17 +158,42 @@ impl TransformerLayer for Qwen3SsmLayer {
         // and the embedding. That half scales 1.55x where the SSM half scales
         // 1.126x, and nothing here explains why yet.
         //
-        // So K=3 is NOT settled as physics, and the earlier claim that it was
-        // is withdrawn. It loses today — step ratio 1.456 against a token
-        // ratio 1.354, measured end to end on the same binary — but the term
-        // that loses it is an unexplained 1.55x in the attention-layer forward,
-        // not a bandwidth floor. If that were brought to the SSM half's 1.126x
-        // the step ratio would fall under the token ratio and K=3 would pay.
+        // AND THE 1.55x IS NOT PHYSICS — THE VERIFY BATCHES 36 OF 48 LAYERS.
+        // `verify_a.rs` runs the GDN layers through one batched call and the
+        // full-attention layers through `for t in 0..k`, re-uploading per-token
+        // attention metadata and re-running the whole layer — its MoE FFN
+        // included — once per verify row:
         //
-        // Raising this clamp therefore needs three things, in order: attribute
-        // the attention-half forward at K=2 vs K=3 (it has no per-stage probe
-        // yet, which is why this stops here), fix whatever it finds, and fix
-        // the row-2 exactness defect. The first is the open question.
+        //     if layer_type == LayerType::FullAttention {
+        //         // Attention layers: sequential per-token (need per-token metadata)
+        //         for t in 0..k {
+        //
+        // That is the whole story. The half that batches scales 1.126x; the
+        // half that loops scales 1.550x, which is just 3 passes where K=2 took
+        // 2. It shows up as 4.03 ms per attention layer against 0.699 ms per
+        // SSM layer — 5.8x — for layers whose only structural difference is
+        // attention instead of GDN, and the GDN block itself is 17 us.
+        //
+        // THE PRIZE, from the measured split. Bring the attention half to the
+        // SSM half's 1.126x and K=3's step falls 113.07 -> 92.55 ms:
+        //
+        //     step ratio 1.157 against a token ratio 1.355  ->  K=3 PAYS
+        //     K=3 25.10 tok/s against K=2's 21.43 today      ->  +17.1%
+        //
+        // So K=3 is blocked on a 12-of-48-layer batching gap, not a bandwidth
+        // floor, and the machinery already exists: `decode_verify_batched_
+        // dispatch` (verify_e.rs) batches attention across all R rows through
+        // `decode_multi_seq` with per-row block tables, gated by
+        // `supports_verify_batched`. It is wired for the CROSS-SEQUENCE case
+        // (n sequences x their k rows) and not for the single-sequence K-row
+        // case a C=1 verify is. Routing C=1 through it is a scheduler change,
+        // and whether the mHC highway survives that path is unverified — which
+        // is why this clamp has not moved.
+        //
+        // Raising it needs, in order: route the single-sequence verify through
+        // the batched dispatch (or batch the attention loop in place), confirm
+        // the mHC pre/post sites still run per row correctly, and fix the row-2
+        // exactness defect. None of those is a numerics problem.
         //
         // DIAGNOSTIC (`ATLAS_MTP_MAX_DRAFTS`): raise the clamp to profile the
         // width it forbids. The arithmetic above says K=3 cannot win, but it
