@@ -304,6 +304,174 @@ extern "C" __global__ void qsa_score_rows(
 // and rope is baked into cached K, so this equals the reference mask.
 // Grid: (rows, nq)  Block: (256,1,1) = 8 warps, warp-striped online softmax.
 #define QSA_PA_WARPS 8
+
+// ── G q-heads per block ──────────────────────────────────────────────────
+//
+// The selected block list is per ROW (`lists + r * topk`), NOT per head, so
+// every q head of a row attends over the IDENTICAL key set. `qsa_prefill_attn`
+// launches grid=[rows, nq] and therefore re-reads those K/V rows once per q
+// head: nq=24 over nkv=2 means twelve reads of every byte.
+//
+// nsys, 11066-token prefill (2026-08-30): qsa_prefill_attn was 3.70 s, 32.6%
+// of a 12.3 s window and the largest kernel in it by a factor of three, moving
+// ~51 GB of L2 traffic per launch at ~1 TB/s. Bandwidth, not arithmetic --
+// the whole selected K/V set for a layer is only a few MB.
+//
+// Serving QSA_PA_G heads per block divides that traffic by QSA_PA_G, and gives
+// each warp G independent dot-product chains per loaded key instead of one.
+// The ceiling is the merge buffer, [QSA_PA_WARPS][G][hd] floats: at hd=128,
+// G=12 is 49 KB and busts the 48 KB block limit; G=4 is 16 KB.
+//
+// BIT-IDENTICAL. Each (row, head) still walks the same warp-striped `t`
+// sequence in the same order, keeps its own online-softmax state, and merges
+// across the same 8 warps in the same order. Only the LOADS are shared, and
+// the K/V values are converted to float before use exactly as before. The
+// launcher falls back to the one-head kernel when the head geometry does not
+// divide evenly or the merge buffer would not fit.
+#define QSA_PA_G 4
+extern "C" __global__ void qsa_prefill_attn_g(
+    const __nv_bfloat16* __restrict__ q,        // [rows, nq, hd] (roped)
+    const __nv_bfloat16* __restrict__ k_cache,  // paged NHD
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ lists,              // [rows, topk] block ids
+    __nv_bfloat16* __restrict__ attn_out,       // [rows, nq, hd]
+    const unsigned int first_pos,
+    const unsigned int topk,
+    const unsigned int ratio,
+    const unsigned int block_size,
+    const unsigned int nq,
+    const unsigned int nkv,
+    const unsigned int hd,
+    const float inv_sqrt_d
+) {
+    const unsigned int r = blockIdx.x;
+    const unsigned int qh0 = blockIdx.y * QSA_PA_G;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int pos = first_pos + r;
+    const unsigned int complete = (pos + 1) / ratio;
+    const unsigned int tail = (pos + 1) - complete * ratio;
+    const unsigned int n_tok = topk * ratio + tail;
+    // Every head in the group maps to the same kv head; the launcher only
+    // dispatches here when QSA_PA_G divides nq / nkv, which guarantees it.
+    const unsigned int kvh = qh0 / (nq / nkv);
+    const unsigned int row_elems = nkv * hd;
+    const unsigned long long page_stride = (unsigned long long)block_size * row_elems;
+    const unsigned int vec = hd / 32;
+
+    extern __shared__ float smem[];
+    float* acc_w = smem;                                    // [WARPS][G][hd]
+    float* m_w = smem + QSA_PA_WARPS * QSA_PA_G * hd;       // [WARPS][G]
+    float* l_w = m_w + QSA_PA_WARPS * QSA_PA_G;             // [WARPS][G]
+
+    float qreg[QSA_PA_G][8];
+    #pragma unroll
+    for (unsigned int g = 0; g < QSA_PA_G; ++g) {
+        const __nv_bfloat16* qrow = q + ((size_t)r * nq + qh0 + g) * hd;
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) {
+            qreg[g][e] = (e < vec) ? (float)qrow[lane * vec + e] : 0.0f;
+        }
+    }
+
+    float m[QSA_PA_G], l[QSA_PA_G], acc[QSA_PA_G][8];
+    #pragma unroll
+    for (unsigned int g = 0; g < QSA_PA_G; ++g) {
+        m[g] = -1e30f;
+        l[g] = 0.0f;
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) acc[g][e] = 0.0f;
+    }
+
+    const int* my_list = lists + (size_t)r * topk;
+    for (unsigned int t = warp; t < n_tok; t += QSA_PA_WARPS) {
+        unsigned int tok;
+        if (t < topk * ratio) {
+            tok = (unsigned int)my_list[t / ratio] * ratio + (t % ratio);
+        } else {
+            tok = complete * ratio + (t - topk * ratio);
+        }
+        const unsigned long long off =
+            (unsigned long long)(unsigned int)block_table[tok / block_size] * page_stride
+            + (unsigned long long)(tok % block_size) * row_elems
+            + (unsigned long long)kvh * hd;
+        // ONE K row and ONE V row for all QSA_PA_G heads -- this is the point.
+        const __nv_bfloat16* krow = k_cache + off;
+        const __nv_bfloat16* vrow = v_cache + off;
+        float kreg[8], vreg[8];
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) {
+            kreg[e] = (e < vec) ? (float)krow[lane * vec + e] : 0.0f;
+            vreg[e] = (e < vec) ? (float)vrow[lane * vec + e] : 0.0f;
+        }
+        #pragma unroll
+        for (unsigned int g = 0; g < QSA_PA_G; ++g) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (unsigned int e = 0; e < 8; ++e) {
+                if (e < vec) dot += qreg[g][e] * kreg[e];
+            }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xFFFFFFFFu, dot, o);
+            dot = __shfl_sync(0xFFFFFFFFu, dot, 0) * inv_sqrt_d;
+
+            const float m_new = fmaxf(m[g], dot);
+            const float scale = __expf(m[g] - m_new);
+            const float p = __expf(dot - m_new);
+            l[g] = l[g] * scale + p;
+            #pragma unroll
+            for (unsigned int e = 0; e < 8; ++e) {
+                if (e < vec) acc[g][e] = acc[g][e] * scale + p * vreg[e];
+            }
+            m[g] = m_new;
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int g = 0; g < QSA_PA_G; ++g) {
+        float* dst = acc_w + ((size_t)warp * QSA_PA_G + g) * hd;
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) {
+            if (e < vec) dst[lane * vec + e] = acc[g][e];
+        }
+        if (lane == 0) {
+            m_w[warp * QSA_PA_G + g] = m[g];
+            l_w[warp * QSA_PA_G + g] = l[g];
+        }
+    }
+    __syncthreads();
+
+    // One warp per head merges its own partials -- the per-head `w` order is
+    // the same 0..WARPS-1 the single-head kernel used.
+    if (warp < QSA_PA_G) {
+        const unsigned int g = warp;
+        float m_tot = -1e30f;
+        for (unsigned int w = 0; w < QSA_PA_WARPS; ++w) {
+            m_tot = fmaxf(m_tot, m_w[w * QSA_PA_G + g]);
+        }
+        float l_tot = 0.0f;
+        float out[8];
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) out[e] = 0.0f;
+        for (unsigned int w = 0; w < QSA_PA_WARPS; ++w) {
+            const float s = __expf(m_w[w * QSA_PA_G + g] - m_tot);
+            l_tot += l_w[w * QSA_PA_G + g] * s;
+            const float* srcw = acc_w + ((size_t)w * QSA_PA_G + g) * hd;
+            #pragma unroll
+            for (unsigned int e = 0; e < 8; ++e) {
+                if (e < vec) out[e] += srcw[lane * vec + e] * s;
+            }
+        }
+        const float inv_l = (l_tot > 0.0f) ? 1.0f / l_tot : 0.0f;
+        __nv_bfloat16* orow = attn_out + ((size_t)r * nq + qh0 + g) * hd;
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) {
+            if (e < vec) orow[lane * vec + e] = __float2bfloat16(out[e] * inv_l);
+        }
+    }
+}
+
 extern "C" __global__ void qsa_prefill_attn(
     const __nv_bfloat16* __restrict__ q,        // [rows, nq, hd] (roped)
     const __nv_bfloat16* __restrict__ k_cache,  // paged NHD

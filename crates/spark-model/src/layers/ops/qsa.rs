@@ -275,3 +275,69 @@ pub fn qsa_prefill_attn(
         .arg_f32(inv_sqrt_d)
         .launch(stream)
 }
+
+/// Heads per block in [`qsa_prefill_attn_g`]. Must match `QSA_PA_G` in
+/// `qsa_indexer.cu`.
+pub const QSA_PA_G: u32 = 4;
+
+/// Whether the grouped kernel can serve this head geometry.
+///
+/// Two conditions, both structural. `nq % G == 0` so the grid divides evenly,
+/// and `(nq / nkv) % G == 0` so every head in a group maps to the SAME kv head
+/// -- the kernel derives `kvh` from the group's first head. The merge buffer is
+/// `[8][G][hd]` floats plus `m`/`l`, which must fit the 48 KB block limit.
+pub fn qsa_prefill_attn_grouped_ok(nq: u32, nkv: u32, hd: u32) -> bool {
+    nkv != 0
+        && nq % QSA_PA_G == 0
+        && (nq / nkv) % QSA_PA_G == 0
+        && qsa_prefill_attn_g_smem(hd) <= 48 * 1024
+}
+
+fn qsa_prefill_attn_g_smem(hd: u32) -> u32 {
+    (8 * QSA_PA_G * hd + 2 * 8 * QSA_PA_G) * 4
+}
+
+/// Stage 2, `QSA_PA_G` q-heads per block. Same math and same accumulation
+/// order as [`qsa_prefill_attn`]; it shares each K/V row across the group
+/// instead of re-reading it per head.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_prefill_attn_g(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    block_table: DevicePtr,
+    lists: DevicePtr,
+    attn_out: DevicePtr,
+    rows: u32,
+    first_pos: u32,
+    topk: u32,
+    ratio: u32,
+    block_size: u32,
+    nq: u32,
+    nkv: u32,
+    hd: u32,
+    inv_sqrt_d: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, nq / QSA_PA_G, 1])
+        .block([256, 1, 1])
+        .shared_mem(qsa_prefill_attn_g_smem(hd))
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(block_table)
+        .arg_ptr(lists)
+        .arg_ptr(attn_out)
+        .arg_u32(first_pos)
+        .arg_u32(topk)
+        .arg_u32(ratio)
+        .arg_u32(block_size)
+        .arg_u32(nq)
+        .arg_u32(nkv)
+        .arg_u32(hd)
+        .arg_f32(inv_sqrt_d)
+        .launch(stream)
+}
