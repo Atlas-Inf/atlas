@@ -61,7 +61,32 @@ pub fn hc_pre_lowrank(
     // ~13 MB of weights per call (measured 2.0 ms; the whole token was
     // 96 x that). The fused kernel stays for prefill, where grid=[T]
     // already fills the machine and skips the global round trip.
-    if num_tokens <= 64 && !scratch.is_null() {
+    //
+    // THRESHOLD. This was `<= 64`, chosen for decode shapes — but a short
+    // PREFILL also has num_tokens <= 64, so a 60-token prompt took the
+    // decode path while a 65-token one took the tensor-core GEMM. That split
+    // is where the short-prefill cost lived: `hc_pre_down` + `hc_pre_finish`
+    // measured 143 ms, 31% of a 60-token prefill (nsys 2026-08-30), both
+    // running FP32 warp loops with a single dependent accumulator chain per
+    // lane — ~19x off the roofline for what is a 393 MFLOP GEMM.
+    //
+    // The split path's own premise says when it stops applying: it exists
+    // because "grid=[T] means grid=[1] at decode - one block, one SM". At
+    // T=60, grid=[60] already fills a 48-SM part, so the premise is false and
+    // the GEMM formulation — which the comment below notes was written
+    // precisely because "47% of prefill was this collapse running as FP32
+    // warp loops" — is the right one.
+    //
+    // 8 covers every genuinely decode-shaped call: T=1 decode, and T=2/3/4
+    // MTP verify (forward_k2/k3, forward_atomic_c4). Above that we are in
+    // prefill and want the GEMM.
+    //
+    // NOTE this makes short prefills numerically CONSISTENT with long ones
+    // rather than introducing a new regime: the GEMM path rounds `normed` to
+    // BF16, and every prefill over 64 tokens already took it. A 60- and a
+    // 65-token prompt previously ran different arithmetic.
+    const HC_DECODE_MAX_T: u32 = 64;
+    if num_tokens <= HC_DECODE_MAX_T && !scratch.is_null() {
         return hc_pre_split(
             gpu,
             streams,
