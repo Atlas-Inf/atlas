@@ -23,18 +23,31 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     // (frees originals between phases) is the fit for V4's tight EP=2 budget;
     // requires ATLAS_UNIFIED_MOE_LAYOUT=1, same as minimax_m2/step3p7. Additive —
     // minimax_m2/step3p7 dispatch is byte-identical (they still match earlier).
-    if config.model_type != "minimax_m2"
-        && config.model_type != "step3p7"
-        && config.model_type != "deepseek_v4"
-    {
+    // Applies to EVERY MoE model. This used to be a hardcoded allowlist of
+    // three model_type strings, which silently skipped every other MoE model
+    // -- qwen4_exp among them -- leaving prefill on the uncoalesced N-major
+    // grouped GEMM with no log line to say so. Capability, not identity: if
+    // the model has routed experts, it wants K-major prefill weights.
+    if config.num_experts == 0 {
         return Ok(());
     }
-    let unified_layout = std::env::var("ATLAS_UNIFIED_MOE_LAYOUT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let hybrid_layout = std::env::var("ATLAS_HYBRID_MOE_LAYOUT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // Escape hatch only, matching `moe_prefill_copies_fit`'s
+    // ATLAS_MOE_PREFILL_COPIES=0: good behaviour is the default, and the lever
+    // turns it OFF for a box under external memory pressure the free-memory
+    // probe cannot see. There is deliberately no env var to turn it ON.
+    if std::env::var("ATLAS_MOE_TRANSPOSE").ok().as_deref() == Some("0") {
+        tracing::info!(
+            "ATLAS_MOE_TRANSPOSE=0: skipping the MoE prefill transpose pass; \
+             prefill will use the uncoalesced fallback grouped GEMM"
+        );
+        return Ok(());
+    }
+    // Tiers are chosen by measured free memory, not by operator flags. The
+    // ladder is ordered best-decode-first: hybrid keeps the N-major originals
+    // so decode stays on the warp-reduction kernels, full and gate_up likewise,
+    // and unified -- which frees the originals and moves decode onto the _t
+    // kernels -- is the last resort, taken only when nothing else fits.
+    let hybrid_layout = true;
     let local_experts: usize = (0..config.num_experts)
         .filter(|e| config.is_local_expert(*e))
         .count();
@@ -55,15 +68,38 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     // to unified if it doesn't fit (defends against KV-cache-heavy
     // configurations exceeding the 122 GB GB10 budget).
     let hybrid_fits = hybrid_layout && free >= 2 * cost_full + safety;
-    if hybrid_layout && !hybrid_fits {
-        tracing::warn!(
-            "MoE transpose pass (hybrid layout): ATLAS_HYBRID_MOE_LAYOUT=1 \
-             requested but doesn't fit (need {:.1} GB, free {:.1} GB) — \
-             falling back to unified-layout (decode regression).",
-            gb(2 * cost_full + safety),
-            gb(free),
-        );
-    }
+    // Unified is the automatic fallback. It is memory-neutral (transpose and
+    // free per layer, roughly one layer of transient), so it fits wherever the
+    // persistent tiers do not, and it is reached only after they are ruled out.
+    let unified_transient = 4 * (local_experts * 2 * per_expert_one);
+    let unified_layout = !hybrid_fits
+        && free < cost_gate_up + safety
+        && free >= unified_transient + safety;
+    // The unified+hybrid use-after-free that used to be reachable here is
+    // gone with the flags. Layout state is now derived inside
+    // `transpose_for_prefill_unified_inner` from the branch that actually
+    // runs, so operator intent and executed tier can no longer disagree.
+    tracing::info!(
+        "MoE transpose: {} experts x {} layers, costs hybrid {:.1} / full {:.1} \
+         / gate_up {:.1} GB, free {:.1} GB -> selected {}",
+        local_experts,
+        config.num_hidden_layers,
+        gb(2 * cost_full),
+        gb(cost_full),
+        gb(cost_gate_up),
+        gb(free),
+        if hybrid_fits {
+            "HYBRID (originals kept, decode unaffected)"
+        } else if free >= cost_full + safety {
+            "FULL (originals kept, decode unaffected)"
+        } else if free >= cost_gate_up + safety {
+            "GATE_UP + lazy down scratch (originals kept)"
+        } else if unified_layout {
+            "UNIFIED (originals freed, decode moves to _t kernels)"
+        } else {
+            "NONE - insufficient memory, prefill stays on the slow path"
+        },
+    );
     if hybrid_fits {
         // Block C Path 2 hybrid-layout: keep originals + add transposed.
         // Decode + MTP verify route through originals (warp-reduction
