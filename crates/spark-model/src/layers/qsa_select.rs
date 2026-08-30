@@ -203,8 +203,39 @@ impl QsaIndexer {
                 stream,
             )?;
 
-            // Host top-k per row (sync D2H drains the stream first). Torch
+            // Host top-k per row (the D2H drains the stream first). Torch
             // tie-break: larger score first, lower index on ties.
+            //
+            // THIS LOOP IS DEAD GPU TIME, and no kernel-time profile can see
+            // it because no kernel is running. nsys on a 2769-token prefill
+            // measured the gap `qsa_score_rows -> qsa_prefill_attn` at
+            // **6.17 ms x 24 launches = 148 ms**, 6.1% of the window. It is not
+            // the transfer (488 KB); it is the sorting, and it scales like
+            // `layers x slabs x rows x complete log complete`. At 32k that is
+            // 12 layers x 15 slabs x 2048 rows x ~2000-element sorts -- of the
+            // order of 1e10 comparisons on ONE core.
+            //
+            // Two changes, neither of which moves a single output bit:
+            //
+            //  * Only the first `topk` of the ordering is ever read, so
+            //    `select_nth_unstable_by` (O(n)) partitions and then only the
+            //    prefix is sorted. The comparator is a TOTAL order -- ties on
+            //    score are broken by index, so no two distinct elements compare
+            //    Equal -- which means the partition point is unique and
+            //    `order[..topk]` is exactly the prefix the full sort produced,
+            //    in the same order. At 32k that is ~2000 elements sorted down
+            //    to ~128.
+            //  * The rows are independent. `std::thread::scope` (already used
+            //    in this crate's mistral loader; no new dependency) fans them
+            //    over the cores. Each thread writes a disjoint slice of
+            //    `host_lists`, so the output is byte-identical regardless of
+            //    how the rows are split or in what order the threads finish.
+            //
+            // ORDER MATTERS, so this must stay an exact reproduction rather
+            // than any top-k that returns the same SET: `qsa_prefill_attn`
+            // walks the list warp-striped (`t = warp; t < n_tok; t += 8`) and
+            // its online softmax accumulates in that order. Permuting the list
+            // reassociates the sum.
             let mut raw = vec![0u8; rows * stride * 4];
             gpu.copy_d2h_on_stream(scores, &mut raw, stream)?;
             let sc: Vec<f32> = raw
@@ -212,16 +243,49 @@ impl QsaIndexer {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             let mut host_lists = vec![0u8; rows * topk * 4];
-            for r in 0..rows {
-                let complete = (first_pos + r + 1) / ratio;
-                let row_sc = &sc[r * stride..r * stride + complete];
-                let mut order: Vec<u32> = (0..complete as u32).collect();
-                order.sort_by(|&a, &b| super::qsa_decode_select::rank_cmp(row_sc, a, b));
-                for (i, b) in order[..topk].iter().enumerate() {
-                    host_lists[(r * topk + i) * 4..(r * topk + i) * 4 + 4]
-                        .copy_from_slice(&(*b as i32).to_le_bytes());
+            // One row is ~2000 comparisons of work; below a few dozen rows the
+            // spawn cost dominates, and a prefill issues thousands of these.
+            let threads = if rows >= 64 {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(rows / 32)
+                    .max(1)
+            } else {
+                1
+            };
+            let rows_per = rows.div_ceil(threads);
+            let sc_ref = &sc;
+            std::thread::scope(|scope| {
+                for (ti, out) in host_lists.chunks_mut(rows_per * topk * 4).enumerate() {
+                    let r0 = ti * rows_per;
+                    scope.spawn(move || {
+                        let mut order: Vec<u32> = Vec::with_capacity(stride);
+                        for (rl, orow) in out.chunks_mut(topk * 4).enumerate() {
+                            let r = r0 + rl;
+                            let complete = (first_pos + r + 1) / ratio;
+                            let row_sc = &sc_ref[r * stride..r * stride + complete];
+                            // Main's total order (NaN last, -0 == 0, lower
+                            // index on ties): `select_nth_unstable_by` needs a
+                            // consistent comparator, and the host arm must rank
+                            // exactly as the device arm it is checked against.
+                            let cmp = |&a: &u32, &b: &u32| {
+                                super::qsa_decode_select::rank_cmp(row_sc, a, b)
+                            };
+                            order.clear();
+                            order.extend(0..complete as u32);
+                            if complete > topk {
+                                order.select_nth_unstable_by(topk - 1, cmp);
+                            }
+                            order[..topk].sort_by(cmp);
+                            for (i, b) in order[..topk].iter().enumerate() {
+                                orow[i * 4..i * 4 + 4]
+                                    .copy_from_slice(&(*b as i32).to_le_bytes());
+                            }
+                        }
+                    });
                 }
-            }
+            });
             gpu.copy_h2d_async(&host_lists, lists, stream)?;
 
             ops::qsa_prefill_attn(
