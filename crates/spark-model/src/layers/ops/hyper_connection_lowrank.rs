@@ -59,7 +59,32 @@ pub fn hc_pre_lowrank(
     // ~13 MB of weights per call (measured 2.0 ms; the whole token was
     // 96 x that). The fused kernel stays for prefill, where grid=[T]
     // already fills the machine and skips the global round trip.
-    if num_tokens <= 64 && !scratch.is_null() {
+    //
+    // THRESHOLD. This was `<= 64`, chosen for decode shapes — but a short
+    // PREFILL also has num_tokens <= 64, so a 60-token prompt took the
+    // decode path while a 65-token one took the tensor-core GEMM. That split
+    // is where the short-prefill cost lived: `hc_pre_down` + `hc_pre_finish`
+    // measured 143 ms, 31% of a 60-token prefill (nsys 2026-08-30), both
+    // running FP32 warp loops with a single dependent accumulator chain per
+    // lane — ~19x off the roofline for what is a 393 MFLOP GEMM.
+    //
+    // The split path's own premise says when it stops applying: it exists
+    // because "grid=[T] means grid=[1] at decode - one block, one SM". At
+    // T=60, grid=[60] already fills a 48-SM part, so the premise is false and
+    // the GEMM formulation — which the comment below notes was written
+    // precisely because "47% of prefill was this collapse running as FP32
+    // warp loops" — is the right one.
+    //
+    // 8 covers every genuinely decode-shaped call: T=1 decode, and T=2/3/4
+    // MTP verify (forward_k2/k3, forward_atomic_c4). Above that we are in
+    // prefill and want the GEMM.
+    //
+    // NOTE this makes short prefills numerically CONSISTENT with long ones
+    // rather than introducing a new regime: the GEMM path rounds `normed` to
+    // BF16, and every prefill over 64 tokens already took it. A 60- and a
+    // 65-token prompt previously ran different arithmetic.
+    const HC_DECODE_MAX_T: u32 = 64;
+    if num_tokens <= HC_DECODE_MAX_T && !scratch.is_null() {
         return hc_pre_split(
             gpu,
             streams,
@@ -252,13 +277,30 @@ fn hc_pre_gemm(
     // T <= m always, so L-based offsets fit even when the arena was sized for
     // fewer than 2048 tokens; `up_wt` is L-independent and sits last.
     let lay = num_tokens.min(SLAB) as usize;
+    // ALIGNMENT. Every sub-buffer must start 16-byte aligned: the tensor-core
+    // `dense_gemm_bf16_pipelined` issues 128-bit loads, and a sub-16B start
+    // faults with CUDA_ERROR_MISALIGNED_ADDRESS (716) — which is sticky, so the
+    // context dies and every later request in the process fails too.
+    //
+    // The raw offsets are not aligned for all T. `inj_pre` is preceded by
+    // `lay * hc_mult * 2` = `lay * 8` bytes, which is only 8-byte aligned when
+    // `lay` is odd, so `up_wt` starts 8 bytes off. This was dormant only
+    // because the path ran exclusively at T > 64, where T is normally the
+    // (even) prefill chunk; it would equally have fired on any odd T in
+    // 65..2047. Lowering the decode threshold to 8 exposed it at small odd T.
+    #[inline]
+    fn a16(x: usize) -> usize {
+        (x + 15) & !15
+    }
+    let off_up_pre = a16(lay * hc_dim * 2);
+    let off_low = a16(off_up_pre + lay * hc_dim * 2);
+    let off_inj_pre = a16(off_low + lay * w.rank * 2);
+    let off_up_wt = a16(off_inj_pre + lay * hc_mult as usize * 2);
     let normed = scratch;
-    let up_pre = scratch.offset(lay * hc_dim * 2);
-    let low = scratch.offset(2 * lay * hc_dim * 2);
-    let inj_pre = scratch.offset(2 * lay * hc_dim * 2 + lay * w.rank * 2);
-    let up_wt = scratch.offset(
-        2 * lay * hc_dim * 2 + lay * w.rank * 2 + lay * hc_mult as usize * 2,
-    );
+    let up_pre = scratch.offset(off_up_pre);
+    let low = scratch.offset(off_low);
+    let inj_pre = scratch.offset(off_inj_pre);
+    let up_wt = scratch.offset(off_up_wt);
 
     let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage_bf16")?;
     let k_silu = gpu.kernel("hyper_connection", "hc_silu_scale")?;

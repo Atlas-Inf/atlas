@@ -521,11 +521,28 @@ impl BufferSizes {
                 //   low FP32 [64, rank];
                 // - prefill GEMM path (T > 64, slabbed at <= 2048 tokens):
                 //   normed BF16 [Ts, hc*H], up_pre BF16 [Ts, hc*H],
-                //   low BF16 [Ts, rank], inj_pre BF16 [Ts, hc].
+                //   low BF16 [Ts, rank], inj_pre BF16 [Ts, hc], and
+                //   up_wt BF16 [hc*H, rank] — a per-call transposed staging
+                //   copy of `input_mix_weight_up`, which is stored
+                //   [rank, hc*H] so the decode kernels coalesce while this
+                //   path's NT tensor-core GEMM still gets [hc*H, rank].
+                //   Ts-independent, hence added outside the Ts factor.
                 let t = m.min(64);
                 let split = t * (config.hc_mult * h + config.hc_lowrank) * 4;
                 let ts = m.min(2048);
-                let gemm = ts * (2 * config.hc_mult * h + config.hc_lowrank + config.hc_mult) * 2;
+                // The GEMM path 16-byte-aligns each of its four sub-buffer
+                // starts (the tensor-core GEMM issues 128-bit loads; a sub-16B
+                // start faults with a sticky CUDA_ERROR_MISALIGNED_ADDRESS).
+                // No extra slack is needed for that rounding: this sizes with
+                // ts = min(m, 2048) while the runtime offsets use
+                // lay = min(T, 2048) <= ts, so for any T below the slab there
+                // is already megabytes of headroom, and at T = ts the four
+                // roundings add at most 45 B against a region measured in tens
+                // of MB. Padding it explicitly shifts every later buffer in the
+                // arena and measured ~6% slower at ctx 700 -- alignment of the
+                // downstream allocations matters more than the slack does.
+                let gemm = ts * (2 * config.hc_mult * h + config.hc_lowrank + config.hc_mult) * 2
+                    + config.hc_mult * h * config.hc_lowrank * 2;
                 split.max(gemm)
             } else {
                 256
