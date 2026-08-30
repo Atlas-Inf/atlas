@@ -158,124 +158,52 @@ impl TransformerLayer for Qwen3SsmLayer {
         // and the embedding. That half scales 1.55x where the SSM half scales
         // 1.126x, and nothing here explains why yet.
         //
-        // AND THE 1.55x IS NOT PHYSICS — THE VERIFY BATCHES 36 OF 48 LAYERS.
-        // `verify_a.rs` runs the GDN layers through one batched call and the
-        // full-attention layers through `for t in 0..k`, re-uploading per-token
-        // attention metadata and re-running the whole layer — its MoE FFN
-        // included — once per verify row:
+        // ★ CORRECTION — THE "PER-ROW ATTENTION" STORY WAS READ FROM THE WRONG
+        // FILE, and everything built on it below the line is withdrawn.
         //
-        //     if layer_type == LayerType::FullAttention {
-        //         // Attention layers: sequential per-token (need per-token metadata)
-        //         for t in 0..k {
+        // `verify_a.rs::decode_verify_dispatch` does run the full-attention
+        // layers `for t in 0..k`, and that is what I attributed K=3's cost to.
+        // But K=3 does NOT go through it. It goes through
+        // `verify_c.rs::decode_verify_graphed_k3_dispatch`, which batches the
+        // attention layers across the verify rows already:
         //
-        // That is the whole story. The half that batches scales 1.126x; the
-        // half that loops scales 1.550x, which is just 3 passes where K=2 took
-        // 2. It shows up as 4.03 ms per attention layer against 0.699 ms per
-        // SSM layer — 5.8x — for layers whose only structural difference is
-        // attention instead of GDN, and the GDN block itself is 17 us.
+        //     // k ROWS of ONE sequence, not k sequences: per-sequence
+        //     // aux state (the QSA indexer) must advance once per row
+        //     // against this sequence's own state. See `decode_multi_seq_rows`.
+        //     layer.decode_multi_seq_rows(hidden, residual, k, ...)
         //
-        // THE PRIZE, from the measured split. Bring the attention half to the
-        // SSM half's 1.126x and K=3's step falls 113.07 -> 92.55 ms:
+        // So there is NO per-row attention duplication in the K=3 path, the
+        // +8.2 ms attributed to it does not exist, and the "12-of-48 layers"
+        // framing is wrong. It also explains the batched-verify null result
+        // trivially — attention was already batched, so relaxing five gates to
+        // reach `decode_verify_batched_dispatch` could not have changed it —
+        // and it explains the 64 equal call counts: that probe sits in
+        // `decode_inner_hc`, the SINGLE-TOKEN path, which the verify does not
+        // use. It was never measuring the verify.
         //
-        //     step ratio 1.157 against a token ratio 1.355  ->  K=3 PAYS
-        //     K=3 25.10 tok/s against K=2's 21.43 today      ->  +17.1%
+        // WHAT SURVIVES, all directly measured:
         //
-        // AND BATCHING IT DOES NOT HELP — TESTED, NOT ASSUMED. The projection
-        // above (+17.1%) assumed the 1.55x was per-row WEIGHT re-streaming, so
-        // the fix would be to run the attention layers across all R rows the
-        // way `decode_verify_batched_dispatch` (verify_e.rs) does via
-        // `decode_multi_seq`. That path is unreachable on this model for a
-        // one-line reason: `impl_a1.rs` allocates `verify_hidden_stash` under
-        // `proposer.is_some()`, and qwen4_exp installs its proposer AFTER
-        // construction, so the stash is NULL and `can_batch_verify` is false
-        // forever. Its sibling allocation two lines below uses `has_mtp` for
-        // exactly that reason and says so; this one was missed.
+        //     K=2 step 80.01 ms @ 1.715 tok/step | K=3 113.07 @ 2.323
+        //     token ratio 1.3545 -> break-even 108.38 ms -> SHORT BY 4.69 ms
         //
-        // Reaching it takes five gates: the scheduler's `verify_idxs.len()>=2`,
-        // its `chunk.len()>=2`, `can_batch_verify_dispatch`'s `n>=2`, the
-        // stash, and an internal `ensure!(n >= 2)`. With all five relaxed the
-        // batched verify RUNS at n=1, R=3 — 324 dispatches, zero errors, and
-        // the greedy completion is byte-identical to the per-row path
-        // (b47ec495171c both ways, so the mHC sites do survive it).
+        //     +3.2 ms   36 SSM verify layers   (VERIFY_PROF, 698.9 -> 786.9 us)
+        //     +3.6 ms   drafter second propose (MTP_TIMING, 3.64 -> 7.27 ms)
+        //     +26.3 ms  everything else in the forward — UNATTRIBUTED
         //
-        // It is also NO FASTER: 20.195 tok/s batched against 20.13 per-row,
-        // versus the 25.10 the projection wanted. So the 1.55x is NOT per-row
-        // weight re-streaming, the +17.1% is withdrawn, and the third
-        // mechanism offered for K=3's cost is as wrong as the first two.
-        // What the attention half actually spends 4.03 ms per layer on is
-        // still unattributed — it needs a probe inside the attention layer,
-        // which is where the next attempt should start rather than with
-        // another mechanism guess.
+        // The unattributed term is now larger, not smaller, than when this
+        // comment claimed to have explained it. It is not the expert union
+        // (MoE scales 1.30x, measured), not per-row attention (does not
+        // happen), and not the drafter (timed). Nobody should propose a fifth
+        // mechanism from an argument; the next step is a probe inside
+        // `verify_c`'s forward at K=2 against K=3.
         //
-        // AND HERE IS WHY IT BOUGHT NOTHING (`ATLAS_QWEN4EXP_ATTN_PROF=1`,
-        // mean us per attention-layer call):
+        // FOUR mechanisms have now been asserted in this file and refuted:
+        // expert-union bandwidth, per-row weight re-streaming, per-row layer
+        // re-execution, and a 12-of-48 batching gap. Three were refuted by
+        // measurement and this one by reading the right file. That record is
+        // the most useful thing here.
         //
-        //     ffn (MoE)    376.1 us   55.3%
-        //     attention    303.5 us   44.7%
-        //     TOTAL        679.6 us
-        //
-        // 679.6 us per call. The 12 attention layers run once per verify row,
-        // so K=2 pays 12*2*679.6 = 16.3 ms and K=3 pays 12*3 = 24.5 ms. The
-        // per-row duplication is therefore worth +8.2 ms at K=3 — against a
-        // MEASURED non-SSM delta of +26.6 ms. It is 31% of the gap, which is
-        // why removing it entirely (the batched-verify run above) moved
-        // throughput 20.13 -> 20.195 and nothing else.
-        //
-        // So the remaining ~18 ms is neither the expert union, nor per-row
-        // weight re-streaming, nor per-row layer re-execution. It is not in
-        // the 36 SSM layers (+3.2 ms, profiled) and not in the 12 attention
-        // layers (+8.2 ms, profiled). By subtraction it is in what the forward
-        // does AROUND the layers at 3 rows instead of 2 — the LM head, the
-        // embedding, the final norm, the per-row metadata uploads — and none
-        // of that has a probe yet.
-        //
-        // HOW CLOSE IS IT, EXACTLY? Much closer than everything above implies,
-        // and this is the number to start from. K=2 steps in 80.01 ms at 1.715
-        // tok/step; K=3 in 113.07 at 2.323. The token ratio is 1.3545, so K=3
-        // breaks even at 80.01 * 1.3545 = 108.38 ms and it measures 113.07:
-        //
-        //     SHORTFALL 4.69 ms — 4.2% of the K=3 step
-        //
-        // Not the ~20 ms the unattributed remainder suggests. TWO of the
-        // attributed terms are individually larger than the whole shortfall:
-        // the per-row attention duplication (+8.2 ms) and the unattributed
-        // forward work (+18.1 ms). Either one, recovered, pays for K=3.
-        //
-        // THE CONTRADICTION IS RESOLVED, and in the useful direction. The
-        // batched-verify run moved throughput 20.13 -> 20.195 because it
-        // removed NOTHING: counting attention-layer calls per step
-        // (`ATLAS_QWEN4EXP_ATTN_PROF=1`) gives 64 in BOTH arms, at 256.5 us
-        // and 252.6 us. The reading is that `decode_verify_batched_dispatch`
-        // batches ACROSS SEQUENCES, so at n=1 there is nothing for it to batch
-        // and one sequence's K rows still enter attention one at a time.
-        //
-        // THAT LAST STEP IS AN INFERENCE, not a direct measurement. The
-        // call-count run had the gate probes reverted, so it shows the counts
-        // are EQUAL without independently confirming the batched arm engaged
-        // that time. Two readings give equal counts — "taken, and does not
-        // batch attention" and "not taken at all" — and only the first is
-        // ruled in, by the earlier run under identical gates that logged
-        // can_batch=true with 324 dispatches and zero errors. A strong chain,
-        // but a chain: re-run the count with the probes in place before
-        // building on it.
-        //
-        // So the +8.2 ms is REAL and still on the table, and it is larger than
-        // the 4.69 ms shortfall. The fix K=3 needs is to batch the full-
-        // attention layers across the K VERIFY ROWS OF ONE SEQUENCE — which is
-        // exactly what the 36 GDN layers already do (`decode_batched_hc`) and
-        // what the 12 attention layers do not. That is a real piece of work,
-        // not a flag: `verify_a.rs`'s loop exists because each row needs its
-        // own position and block-table metadata, which is the thing a batched
-        // arm would have to carry per row.
-        //
-        // It is also the FIRST identified change that would make K=3 pay
-        // without needing better acceptance or a numerics change.
-        //
-        // Recorded as subtraction, not as a mechanism. Three mechanisms have
-        // been proposed here and all three were refuted by the measurement
-        // that followed; the next person should probe first.
-        //
-        // The experiment was reverted; only the diagnostics it needed
+        // The batched-verify experiment was reverted; the diagnostics it needed
         // (`ATLAS_QWEN4EXP_VERIFY_PROF`, `ATLAS_QWEN4EXP_ATTN_PROF`,
         // `ATLAS_MTP_MAX_DRAFTS`, the K=3 stepper's timing records) are kept.
         Some(
