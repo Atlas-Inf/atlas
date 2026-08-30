@@ -180,28 +180,36 @@ impl TransformerLayer for Qwen3SsmLayer {
         //     step ratio 1.157 against a token ratio 1.355  ->  K=3 PAYS
         //     K=3 25.10 tok/s against K=2's 21.43 today      ->  +17.1%
         //
-        // So K=3 is blocked on a 12-of-48-layer batching gap, not a bandwidth
-        // floor, and the machinery already exists: `decode_verify_batched_
-        // dispatch` (verify_e.rs) batches attention across all R rows through
-        // `decode_multi_seq` with per-row block tables, gated by
-        // `supports_verify_batched`. It is wired for the CROSS-SEQUENCE case
-        // (n sequences x their k rows) and not for the single-sequence K-row
-        // case a C=1 verify is. Routing C=1 through it is a scheduler change,
-        // and whether the mHC highway survives that path is unverified — which
-        // is why this clamp has not moved.
+        // AND BATCHING IT DOES NOT HELP — TESTED, NOT ASSUMED. The projection
+        // above (+17.1%) assumed the 1.55x was per-row WEIGHT re-streaming, so
+        // the fix would be to run the attention layers across all R rows the
+        // way `decode_verify_batched_dispatch` (verify_e.rs) does via
+        // `decode_multi_seq`. That path is unreachable on this model for a
+        // one-line reason: `impl_a1.rs` allocates `verify_hidden_stash` under
+        // `proposer.is_some()`, and qwen4_exp installs its proposer AFTER
+        // construction, so the stash is NULL and `can_batch_verify` is false
+        // forever. Its sibling allocation two lines below uses `has_mtp` for
+        // exactly that reason and says so; this one was missed.
         //
-        // Raising it needs, in order: route the single-sequence verify through
-        // the batched dispatch (or batch the attention loop in place), confirm
-        // the mHC pre/post sites still run per row correctly, and fix the row-2
-        // exactness defect. None of those is a numerics problem.
+        // Reaching it takes five gates: the scheduler's `verify_idxs.len()>=2`,
+        // its `chunk.len()>=2`, `can_batch_verify_dispatch`'s `n>=2`, the
+        // stash, and an internal `ensure!(n >= 2)`. With all five relaxed the
+        // batched verify RUNS at n=1, R=3 — 324 dispatches, zero errors, and
+        // the greedy completion is byte-identical to the per-row path
+        // (b47ec495171c both ways, so the mHC sites do survive it).
         //
-        // DIAGNOSTIC (`ATLAS_MTP_MAX_DRAFTS`): raise the clamp to profile the
-        // width it forbids. The arithmetic above says K=3 cannot win, but it
-        // was derived from end-to-end throughput, not from a per-stage
-        // attribution of the verify itself — and the verify is the one width
-        // neither the decode nor the prefill profiler covers. Pair with
-        // `ATLAS_QWEN4EXP_VERIFY_PROF=1` to see where a K=3 row's cost lands.
-        // NOT a serving lever: K=3 is measurably slower AND not output-exact.
+        // It is also NO FASTER: 20.195 tok/s batched against 20.13 per-row,
+        // versus the 25.10 the projection wanted. So the 1.55x is NOT per-row
+        // weight re-streaming, the +17.1% is withdrawn, and the third
+        // mechanism offered for K=3's cost is as wrong as the first two.
+        // What the attention half actually spends 4.03 ms per layer on is
+        // still unattributed — it needs a probe inside the attention layer,
+        // which is where the next attempt should start rather than with
+        // another mechanism guess.
+        //
+        // The experiment was reverted; only the diagnostics it needed
+        // (`ATLAS_QWEN4EXP_VERIFY_PROF`, `ATLAS_MTP_MAX_DRAFTS`, the K=3
+        // stepper's timing records) are kept.
         Some(
             std::env::var("ATLAS_MTP_MAX_DRAFTS")
                 .ok()
