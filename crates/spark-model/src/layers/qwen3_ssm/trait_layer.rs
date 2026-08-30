@@ -245,9 +245,19 @@ impl TransformerLayer for Qwen3SsmLayer {
         // batched-verify run moved throughput 20.13 -> 20.195 because it
         // removed NOTHING: counting attention-layer calls per step
         // (`ATLAS_QWEN4EXP_ATTN_PROF=1`) gives 64 in BOTH arms, at 256.5 us
-        // and 252.6 us. `decode_verify_batched_dispatch` batches ACROSS
-        // SEQUENCES; at n=1 there is nothing for it to batch, and one
-        // sequence's K rows still enter attention one at a time.
+        // and 252.6 us. The reading is that `decode_verify_batched_dispatch`
+        // batches ACROSS SEQUENCES, so at n=1 there is nothing for it to batch
+        // and one sequence's K rows still enter attention one at a time.
+        //
+        // THAT LAST STEP IS AN INFERENCE, not a direct measurement. The
+        // call-count run had the gate probes reverted, so it shows the counts
+        // are EQUAL without independently confirming the batched arm engaged
+        // that time. Two readings give equal counts — "taken, and does not
+        // batch attention" and "not taken at all" — and only the first is
+        // ruled in, by the earlier run under identical gates that logged
+        // can_batch=true with 324 dispatches and zero errors. A strong chain,
+        // but a chain: re-run the count with the probes in place before
+        // building on it.
         //
         // So the +8.2 ms is REAL and still on the table, and it is larger than
         // the 4.69 ms shortfall. The fix K=3 needs is to batch the full-
