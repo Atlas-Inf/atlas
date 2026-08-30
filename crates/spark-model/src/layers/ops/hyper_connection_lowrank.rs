@@ -247,20 +247,42 @@ fn hc_pre_gemm(
     let hc_dim = (hc_mult * hidden_size) as usize;
     let rank = w.rank as u32;
     // Scratch layout (BF16): normed [L, hc_dim], up_pre [L, hc_dim],
-    // low [L, rank], inj_pre [L, hc], where L = min(T, 2048). sizes.rs sizes
-    // the region with m.min(2048) and T <= m always, so L-based offsets fit
-    // even when the arena was sized for fewer than 2048 tokens.
+    // low [L, rank], inj_pre [L, hc], up_wt [hc_dim, rank], where
+    // L = min(T, 2048). sizes.rs sizes the region with m.min(2048) and
+    // T <= m always, so L-based offsets fit even when the arena was sized for
+    // fewer than 2048 tokens; `up_wt` is L-independent and sits last.
     let lay = num_tokens.min(SLAB) as usize;
     let normed = scratch;
     let up_pre = scratch.offset(lay * hc_dim * 2);
     let low = scratch.offset(2 * lay * hc_dim * 2);
     let inj_pre = scratch.offset(2 * lay * hc_dim * 2 + lay * w.rank * 2);
+    let up_wt = scratch.offset(
+        2 * lay * hc_dim * 2 + lay * w.rank * 2 + lay * hc_mult as usize * 2,
+    );
 
     let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage_bf16")?;
     let k_silu = gpu.kernel("hyper_connection", "hc_silu_scale")?;
     let k_mix = gpu.kernel("hyper_connection", "hc_pre_mix")?;
     let k_gemm = gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
+    let k_tr = gpu.kernel("hyper_connection", "hc_transpose_bf16")?;
     let inv_hc = 1.0f32 / hc_mult as f32;
+
+    // `up_w` is stored `[rank, hc_dim]` — the layout the decode stage-3 kernel
+    // needs to coalesce (see `hc_pre_split`). This GEMM's tensor-core kernel is
+    // NT (`C[m,n] = A[m,k] . B[n,k]`), so it wants the checkpoint's
+    // `[hc_dim, rank]`. Stage a transposed copy rather than keeping a second
+    // resident buffer: 6.55 MB x 97 sites is 635 MB on a box that already
+    // loads at 113 of 119.6 GB, against ~50 us per call here on a collapse
+    // that measured ~45 ms. Once per call, not once per slab — `up_wt` does
+    // not depend on `t0`.
+    KernelLaunch::new(gpu, k_tr)
+        .grid([(hc_dim as u32).div_ceil(32), rank.div_ceil(32), 1])
+        .block([32, 32, 1])
+        .arg_ptr(w.up_w)
+        .arg_ptr(up_wt)
+        .arg_u32(rank)
+        .arg_u32(hc_dim as u32)
+        .launch(stream)?;
 
     let mut t0 = 0u32;
     while t0 < num_tokens {
@@ -299,12 +321,12 @@ fn hc_pre_gemm(
             .arg_f32(inv_hc)
             .launch(stream)?;
 
-        // up_pre = low x up_w^T   [ts, hc_dim]
+        // up_pre = low x up_wt^T   [ts, hc_dim]
         gemm_raw(
             gpu,
             k_gemm,
             low,
-            w.up_w,
+            up_wt,
             up_pre,
             ts,
             hc_dim as u32,
@@ -408,23 +430,76 @@ fn hc_pre_split(
         .arg_f32(norm_eps)
         .launch(stream)?;
 
+    // `hc_pre_down` stages the token's `normed` row in SHARED memory, so the
+    // 40 KB vector is read once per block instead of once per `rank` row. That
+    // was the dominant traffic term (T x rank x 40 KB = 786 MB at T=60, against
+    // 393 MB for the weight); see the kernel note.
+    //
+    // Shared budget: hc_dim floats. At hc_dim=10240 that is 40 KB, inside the
+    // 48 KB default. If a model ever exceeds it the launch would fail, so fall
+    // back to the un-staged path rather than trusting the geometry.
+    let hc_smem = hc_dim as usize * 4;
+    const HC_SMEM_MAX: usize = 48 * 1024;
+    anyhow::ensure!(
+        hc_smem <= HC_SMEM_MAX,
+        "hc_pre_down: normed row is {} B of shared, over the {} B block limit \
+         (hc_dim={}). Tile hc_dim before raising this.",
+        hc_smem,
+        HC_SMEM_MAX,
+        hc_dim,
+    );
     // Spread rank rows over enough blocks to occupy the part even at T=1.
     let dsplit = (48 / num_tokens.max(1)).clamp(1, 10);
     KernelLaunch::new(gpu, k_down)
         .grid([num_tokens, dsplit, 1])
         .block([1024, 1, 1])
+        .shared_mem(hc_smem as u32)
         .arg_ptr(normed)
         .arg_ptr(w.down_w)
         .arg_ptr(low)
         .arg_u32(hidden_size)
         .arg_u32(hc_mult)
         .arg_u32(w.rank as u32)
+        .arg_u32(num_tokens)
         .launch(stream)?;
 
-    let fsplit = (48 / num_tokens.max(1)).clamp(1, 10);
+    // Stage 3 was the largest kernel in the decode profile: 23% of all GPU
+    // time (11.86 s of 51.47 s, nsys 2026-08-28), a flat ~173 us regardless of
+    // T, ~38 GB/s against the part's ~273. Each output dim gets its own THREAD
+    // and that thread contracts over `rank` sequentially — which, in the
+    // checkpoint's `[hc*H, rank]` layout, means walking a contiguous row, so
+    // consecutive threads touched rows 640 B apart and every warp load
+    // scattered over 32 sectors.
+    //
+    // `up_w` is now stored TRANSPOSED as `[rank, hc*H]` (see the kernel's
+    // "WHY `up_w` IS STORED TRANSPOSED" note and `weight_loader::qwen4_exp::
+    // hc::transpose_up_w`), so thread `d` reads `up_w[r*hc_dim + i]`:
+    // consecutive threads read consecutive bf16. The loop body is otherwise
+    // untouched, so the FP32 accumulation order is IDENTICAL and the output is
+    // bitwise unchanged — which is the whole point. Two kernel-side fixes were
+    // measured first and both failed one half of that: warp-per-dim with a
+    // shfl reduction was +17.8% but reassociates, and shared-memory staging
+    // was bit-exact but 44% slower. The layout was the only thing that could
+    // give both.
+    // Block width, swept 32/64/128/256 with `ATLAS_HC_FIN_BLOCK` (agg tok/s,
+    // C=1 / C=2, every arm bitwise identical since this is pure geometry):
+    //
+    //   256 -> 21.65 / 25.20    128 -> 21.68 / 25.24  <- default
+    //    64 -> 20.57 / 23.84     32 -> 18.73 / 21.65
+    //
+    // NARROWER IS WORSE, which is the opposite of the guess. Thread-per-`d`
+    // caps the kernel at H threads per token, so a narrower block spreads the
+    // same 2560 threads over more SMs — but every block re-stages the whole
+    // rank-320 `low` vector into its own shared memory first, and at block 32
+    // that is 80 blocks each paying the same staging cost for 32 threads of
+    // work. The extra SMs do not pay for the extra staging. rsafier's original
+    // `S = clamp(48/T, 1, 10)` was already at the useful end of this curve;
+    // 128 is a hair better and 256 is inside the noise.
+    let fblock = hc_finish_block();
+    let fsplit = hidden_size.div_ceil(fblock).max((48 / num_tokens.max(1)).clamp(1, 10));
     KernelLaunch::new(gpu, k_fin)
         .grid([num_tokens, fsplit, 1])
-        .block([256, 1, 1])
+        .block([fblock, 1, 1])
         .shared_mem(w.rank as u32 * 4)
         .arg_ptr(normed)
         .arg_ptr(low)
@@ -436,4 +511,18 @@ fn hc_pre_split(
         .arg_u32(hc_mult)
         .arg_u32(w.rank as u32)
         .launch(stream)
+}
+
+/// Block width for stage 3 (`ATLAS_HC_FIN_BLOCK`, default 128). Kept as a knob
+/// because it is pure launch geometry — it cannot change the arithmetic, only
+/// how much of the machine runs it.
+fn hc_finish_block() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ATLAS_HC_FIN_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| (32..=1024).contains(n) && n % 32 == 0)
+            .unwrap_or(128)
+    })
 }

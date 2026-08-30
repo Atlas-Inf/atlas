@@ -124,10 +124,11 @@ extern "C" __global__ void hc_expand(
 //  2. The down projection runs one WARP per rank row: lanes stride the
 //     10240-wide row (coalesced), then warp-reduce. The first cut gave each
 //     THREAD a serial row: uncoalesced and 32x less parallel.
-//  3. The up projection runs one warp per 32 output elements, each lane
-//     owning one element's rank-320 loop per stream; `up_w` rows for
-//     adjacent outputs are adjacent, so the lane-parallel reads stay warm in
-//     L2.
+//  3. The up projection gives each THREAD one output element's rank-320 loop
+//     per stream, reading `up_w` in its TRANSPOSED `[rank, hc*H]` layout so
+//     that adjacent threads (adjacent `d`) read adjacent bf16 — coalesced by
+//     construction. See `hc_pre_finish` below for why the layout, and not the
+//     loop, is what had to change.
 //
 // The launcher passes block=1024 (32 warps). Grid stays [num_tokens]: at
 // prefill that is thousands of independent blocks; at decode it is one block,
@@ -216,10 +217,9 @@ __device__ __forceinline__ void qhc_collapse(
         float mixed = 0.0f;
         for (unsigned int s2 = 0; s2 < hc; ++s2) {
             const unsigned int i = s2 * H + d;
-            const __nv_bfloat16* urow = up_w + (size_t)i * rank;
             float acc = 0.0f;
             for (unsigned int r = 0; r < rank; ++r) {
-                acc += (float)urow[r] * smem_low[r];
+                acc += (float)up_w[(size_t)r * hc_dim + i] * smem_low[r];
             }
             mixed += qhc_sigmoid(acc) * smem_normed[i];
         }
@@ -252,7 +252,7 @@ extern "C" __global__ void hc_pre(
     const float* __restrict__ streams,
     const __nv_bfloat16* __restrict__ hc_norm_w,  // [hc*H]
     const __nv_bfloat16* __restrict__ down_w,     // [rank, hc*H]
-    const __nv_bfloat16* __restrict__ up_w,       // [hc*H, rank]
+    const __nv_bfloat16* __restrict__ up_w,       // [rank, hc*H]
     const __nv_bfloat16* __restrict__ inject_w,   // [hc, hc*H]
     __nv_bfloat16* __restrict__ y_out,
     float* __restrict__ inj_out,
@@ -380,15 +380,46 @@ extern "C" __global__ void hc_pre_down(
     float* __restrict__ low_out,               // [T, rank]
     const unsigned int hidden_size,
     const unsigned int hc,
-    const unsigned int rank
+    const unsigned int rank,
+    const unsigned int num_tokens
 ) {
+    // STAGE `normed[t]` IN SHARED MEMORY.
+    //
+    // One block owns one token and every warp contracts its own `down_w` rows
+    // against that token's `nx`. `nx` is hc_dim floats -- 40 KB at
+    // hc_dim=10240 -- and the original kernel re-read it from L2 once per row,
+    // i.e. `rank` times per token. That, not the weight, was the dominant
+    // traffic:
+    //
+    //     down_w   T x rank x 20 KB =  393 MB
+    //     nx       T x rank x 40 KB =  786 MB   <-- dominant
+    //
+    // A first attempt tiled TOKENS so a fetched weight row was reused across
+    // them. That cut only the 393 MB term, so total traffic fell 29% and wall
+    // time 6% -- the nx term was untouched and still dominated. Staging nx in
+    // shared instead drops it to ONE read per block (T x 40 KB = 2 MB), a 3.0x
+    // cut in total traffic.
+    //
+    // Measured at 89.3 ms and 19.4% of a 60-token prefill before this change
+    // (nsys 2026-08-30) -- second only to the MoE gate_up GEMM.
+    //
+    // BITWISE SAFE: each lane still walks `i = lane, lane+32, ...` over the
+    // full hc_dim and the same shfl reduction follows, so the FMA sequence for
+    // every (t, r) is unchanged. Only where the operand is read from changed.
+    extern __shared__ float s_nx[];
+
     const unsigned int t = blockIdx.x;
+    if (t >= num_tokens) return;
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int warp = threadIdx.x >> 5;
     const unsigned int warps = blockDim.x >> 5;
     const unsigned int hc_dim = hc * hidden_size;
-    const float* nx = normed + (size_t)t * hc_dim;
     const float inv_hc = 1.0f / (float)hc;
+
+    for (unsigned int i = threadIdx.x; i < hc_dim; i += blockDim.x) {
+        s_nx[i] = normed[(size_t)t * hc_dim + i];
+    }
+    __syncthreads();
 
     // Rows split first across grid.y, then across warps in the block.
     const unsigned int rows_per_split = (rank + gridDim.y - 1) / gridDim.y;
@@ -398,7 +429,7 @@ extern "C" __global__ void hc_pre_down(
         const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
         float acc = 0.0f;
         for (unsigned int i = lane; i < hc_dim; i += 32) {
-            acc += (float)row[i] * nx[i];
+            acc += (float)row[i] * s_nx[i];
         }
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
@@ -410,10 +441,49 @@ extern "C" __global__ void hc_pre_down(
 
 // Stage 3: y[d] = mean_s sigmoid(up[s*H+d] . low) * normed[s*H+d], the
 // d-range split over blockIdx.y; block y==0 also emits the injection vector.
+//
+// WHY `up_w` IS STORED TRANSPOSED. One thread owns one output dim `d` and
+// contracts over `rank` sequentially. In the checkpoint's `[hc*H, rank]`
+// layout that thread walks a contiguous rank-320 row, so consecutive threads
+// touch rows 640 B apart and every lane of a warp lands on its own sector:
+// nsys measured this kernel at a flat ~173 us regardless of T, ~38 GB/s
+// against the part's ~273, and 23% of ALL decode GPU time (11.86 s of
+// 51.47 s) — the largest single kernel in the profile.
+//
+// Two kernel-side fixes were built and measured before the layout one:
+//
+//   * warp-per-output-dim with lane-strided `r` + a shfl reduction: +17.8%
+//     end-to-end, but it REASSOCIATES the FP32 contraction, so the logits
+//     move. On a speculative-decoding model that is not a free trade — and
+//     on this checkpoint decode-path reassociation was measured flipping
+//     tool-calling behaviour on BFCL, not just the last mantissa bits.
+//   * staging `up_w` tiles through shared memory, which keeps each thread's
+//     sequential `r` accumulation and so IS bit-exact: 44% SLOWER (9.06 vs
+//     16.10 tok/s). Re-staging the whole rank in one pass (8 syncs instead of
+//     40) measured 9.06 vs 9.40, so the barriers were not the cost — a useful
+//     tile is ~42 KB, which caps occupancy near one block per SM.
+//
+// AND COALESCING ALONE WAS NOT ENOUGH — measured, 19.79 vs 20.01 tok/s, i.e.
+// nothing. This kernel was never bandwidth-limited. Thread-per-`d` caps it at
+// H = 2560 threads, which at block 256 is TEN blocks: ten of the part's 48 SMs
+// participate, ~2 warps each, every thread walking one strictly dependent
+// 320-step FP32 chain. There are nowhere near enough loads in flight to cover
+// DRAM latency, so a perfectly coalesced access pattern buys nothing on its
+// own. The launcher therefore also shrinks the block (more blocks over the
+// same 2560 threads => more SMs), and the `d` loop below interleaves the `hc`
+// streams so each thread carries `hc` independent chains. Neither touches the
+// summation order.
+//
+// Storing `up_w` as `[rank, hc*H]` instead gets both properties for free:
+// thread `d` reads `up_w[r*hc_dim + i]`, consecutive threads read consecutive
+// bf16, and the per-thread `for r` order is IDENTICAL to the row-major
+// version's — so the output is bitwise unchanged. The transpose happens once
+// at load (`weight_loader::qwen4_exp::hc`); the prefill GEMM, whose NT tensor-
+// core kernel wants the checkpoint layout, transposes a staging copy back.
 extern "C" __global__ void hc_pre_finish(
     const float* __restrict__ normed,          // [T, hc*H]
     const float* __restrict__ low,             // [T, rank]
-    const __nv_bfloat16* __restrict__ up_w,    // [hc*H, rank]
+    const __nv_bfloat16* __restrict__ up_w,    // [rank, hc*H]
     const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
     __nv_bfloat16* __restrict__ y_out,         // [T, H]
     float* __restrict__ inj_out,               // [T, hc] (unused if null inject)
@@ -439,15 +509,45 @@ extern "C" __global__ void hc_pre_finish(
     const unsigned int d1 = min(d0 + d_per_split, H);
     __nv_bfloat16* y = y_out + (size_t)t * H;
     for (unsigned int d = d0 + tid; d < d1; d += blockDim.x) {
+        // The `hc` streams are INTERLEAVED rather than run one after another:
+        // each keeps its own accumulator and they advance together over `r`.
+        // Every accumulator still sums r = 0,1,...,rank-1 into one FP32
+        // register in that exact order, and `mixed` still folds the streams in
+        // s = 0,1,2,3 order, so the result is bit-for-bit what the sequential
+        // version produced — but the thread now has `hc` independent load+FMA
+        // chains in flight instead of one, which is what a latency-bound
+        // kernel is short of.
+        //
+        // SPELLED OUT for hc == 4 (this checkpoint's only value) instead of
+        // looping an `acc[]` array: `hc` is a runtime argument, so a
+        // `for (s2 < hc)` loop over an array cannot be unrolled, the indices
+        // stay dynamic, and nvcc puts the accumulators in LOCAL memory —
+        // which would cost far more than the interleaving wins. The generic
+        // fallback keeps the original one-chain-at-a-time shape.
         float mixed = 0.0f;
-        for (unsigned int s2 = 0; s2 < hc; ++s2) {
-            const unsigned int i = s2 * H + d;
-            const __nv_bfloat16* urow = up_w + (size_t)i * rank;
-            float acc = 0.0f;
+        if (hc == 4) {
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
             for (unsigned int r = 0; r < rank; ++r) {
-                acc += (float)urow[r] * smem_lo[r];
+                const float lo = smem_lo[r];
+                const __nv_bfloat16* u = up_w + (size_t)r * hc_dim + d;
+                a0 += (float)u[0] * lo;
+                a1 += (float)u[H] * lo;
+                a2 += (float)u[2 * H] * lo;
+                a3 += (float)u[3 * H] * lo;
             }
-            mixed += qhc_sigmoid(acc) * nx[i];
+            mixed += qhc_sigmoid(a0) * nx[d];
+            mixed += qhc_sigmoid(a1) * nx[H + d];
+            mixed += qhc_sigmoid(a2) * nx[2 * H + d];
+            mixed += qhc_sigmoid(a3) * nx[3 * H + d];
+        } else {
+            for (unsigned int s2 = 0; s2 < hc; ++s2) {
+                const unsigned int i = s2 * H + d;
+                float acc = 0.0f;
+                for (unsigned int r = 0; r < rank; ++r) {
+                    acc += (float)up_w[(size_t)r * hc_dim + i] * smem_lo[r];
+                }
+                mixed += qhc_sigmoid(acc) * nx[i];
+            }
         }
         y[d] = __float2bfloat16(mixed * inv_hc);
     }
@@ -486,7 +586,9 @@ extern "C" __global__ void hc_pre_finish(
 //   hc_pre_stage_bf16   grid=[T]    rms + (1+w) scale -> normed  [T, hc*H] BF16
 //   dense_gemm          low_pre  = normed x down_w^T             [T, rank]
 //   hc_silu_scale       low      = silu(low_pre / hc)            in place
-//   dense_gemm          up_pre   = low x up_w^T                  [T, hc*H]
+//   hc_transpose_bf16   up_wt    = up_w^T   [hc*H, rank]  (staging copy;
+//                                 up_w is stored [rank, hc*H] for decode)
+//   dense_gemm          up_pre   = low x up_wt^T                 [T, hc*H]
 //   dense_gemm          inj_pre  = normed x inject_w^T           [T, hc]
 //   hc_pre_mix          grid=[T]    y = mean_s sigmoid(up_pre)*normed;
 //                                   inj = 2*sigmoid(inj_pre / hc)
@@ -587,5 +689,38 @@ extern "C" __global__ void hc_pre_mix(
     if (inj_pre != nullptr && tid < hc) {
         inj_out[(size_t)t * hc + tid] =
             2.0f * qhc_sigmoid((float)inj_pre[(size_t)t * hc + tid] * inv_hc);
+    }
+}
+
+// Transpose a BF16 matrix `[R, C] -> [C, R]`. Exists for one caller: the
+// prefill GEMM path needs `up_w` in the checkpoint's `[hc*H, rank]` layout
+// (its tensor-core kernel is NT, `C[m,n] = A[m,k] . B[n,k]`), while every
+// decode kernel needs the transposed `[rank, hc*H]` that `hc_pre_finish`
+// documents. Storing both would cost 6.55 MB x 97 sites = 635 MB on a box
+// that already loads at 113 of 119.6 GB, so prefill pays ~50 us per call to
+// stage a transposed copy instead — against a ~45 ms collapse, and only for
+// T > 64.
+//
+// Classic 32x32 tile with a padded stride: both the read and the write are
+// coalesced, and the +1 keeps the smem access bank-conflict free.
+extern "C" __global__ void hc_transpose_bf16(
+    const __nv_bfloat16* __restrict__ src,     // [R, C]
+    __nv_bfloat16* __restrict__ dst,           // [C, R]
+    const unsigned int R,
+    const unsigned int C
+) {
+    __shared__ __nv_bfloat16 tile[32][33];
+    const unsigned int x = blockIdx.x * 32u + threadIdx.x;   // col of src
+    const unsigned int y = blockIdx.y * 32u + threadIdx.y;   // row of src
+    if (x < C && y < R) {
+        tile[threadIdx.y][threadIdx.x] = src[(size_t)y * C + x];
+    }
+    __syncthreads();
+    // Swap which of the two block indices supplies the fast axis, so the
+    // store is contiguous in `dst` too.
+    const unsigned int xt = blockIdx.y * 32u + threadIdx.x;  // col of dst
+    const unsigned int yt = blockIdx.x * 32u + threadIdx.y;  // row of dst
+    if (xt < R && yt < C) {
+        dst[(size_t)yt * R + xt] = tile[threadIdx.x][threadIdx.y];
     }
 }
