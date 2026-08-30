@@ -11,6 +11,74 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use super::{QsaIndexer, QsaSeqState};
 use crate::layers::ops;
 
+/// Pack `(score DESCENDING, index ASCENDING)` into one `u64` so the top-k
+/// selection is a plain integer partition.
+///
+/// The float goes through the standard monotone `f32 -> u32` map (flip the
+/// sign bit for positives, invert every bit for negatives), which preserves
+/// IEEE ordering; inverting that gives DESCENDING score, and the index in the
+/// low 32 bits breaks ties by ascending index. That is exactly the comparator
+/// this replaces -- `partial_cmp(b, a).then(a.cmp(&b))` -- so the selected set
+/// AND its order are unchanged, which matters: `qsa_prefill_attn` walks the
+/// list warp-striped and its online softmax accumulates in list order.
+///
+/// It is also strictly better defined. The old comparator collapsed a NaN
+/// comparison to `Equal`, which is not a total order and makes `sort_by`'s
+/// output unspecified; here every distinct element has a distinct key. Scores
+/// are `relu`'d sums (or `-1e30` for out-of-range blocks), so NaN should not
+/// arise -- but "should not" is not a sort precondition.
+#[inline]
+fn rank_key(score: f32, idx: u32) -> u64 {
+    // -0.0 and +0.0 have DIFFERENT bit patterns but compare Equal in IEEE, so
+    // the bit map alone would order them while `partial_cmp` would fall
+    // through to the index. Canonicalise first. (`acc` here is a sum of
+    // `fmaxf(dot, 0.0f)` scaled by a positive, so -0.0 should be unreachable --
+    // but a differential check found this as the ONLY disagreement with the
+    // comparator over 500 random values, and "should be unreachable" is a bad
+    // reason to leave a selection subtly wrong.)
+    let b = if score == 0.0 { 0 } else { score.to_bits() };
+    let mono = if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 };
+    ((!mono) as u64) << 32 | idx as u64
+}
+
+#[cfg(test)]
+mod rank_key_tests {
+    use super::rank_key;
+
+    /// `rank_key` ascending must reproduce `partial_cmp(b, a).then(a.cmp(&b))`
+    /// exactly -- the selected set AND its order, because `qsa_prefill_attn`
+    /// accumulates its online softmax in list order.
+    #[test]
+    fn matches_the_comparator_it_replaces() {
+        let mut vals: Vec<f32> = vec![
+            -1e30, -5.0, -1.0, -0.0, 0.0, f32::MIN_POSITIVE, 0.5, 1.0, 3.25, 1e30,
+        ];
+        // Deterministic spread, including repeats so ties are exercised.
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..500 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            vals.push(((s >> 40) as f32 / 1024.0) - 8.0);
+        }
+        let n = vals.len();
+
+        let mut want: Vec<u32> = (0..n as u32).collect();
+        want.sort_by(|&a, &b| {
+            vals[b as usize]
+                .partial_cmp(&vals[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+
+        let mut keys: Vec<u64> = (0..n).map(|i| rank_key(vals[i], i as u32)).collect();
+        keys.sort_unstable();
+        let got: Vec<u32> = keys.iter().map(|k| *k as u32).collect();
+
+        assert_eq!(want, got, "packed key disagrees with the f32 comparator");
+    }
+}
+
 impl QsaIndexer {
     /// Stage 2: per-query prefill selection for ANY prefill chunk. Chunk
     /// rows whose GLOBAL position (`seq_start + row`) is at or past the
@@ -217,13 +285,17 @@ impl QsaIndexer {
             // Two changes, neither of which moves a single output bit:
             //
             //  * Only the first `topk` of the ordering is ever read, so
-            //    `select_nth_unstable_by` (O(n)) partitions and then only the
-            //    prefix is sorted. The comparator is a TOTAL order -- ties on
-            //    score are broken by index, so no two distinct elements compare
-            //    Equal -- which means the partition point is unique and
-            //    `order[..topk]` is exactly the prefix the full sort produced,
-            //    in the same order. At 32k that is ~2000 elements sorted down
-            //    to ~128.
+            //    `select_nth_unstable` (O(n)) partitions and then only the
+            //    prefix is sorted. The order is TOTAL -- ties on score are
+            //    broken by index, so no two distinct elements compare Equal --
+            //    which means the partition point is unique and the prefix is
+            //    exactly what the full sort produced, in the same order.
+            //  * The comparison is a plain integer compare on a packed key
+            //    (`rank_key`), not a closure that indexes back into the score
+            //    matrix twice per comparison. That second indirection was the
+            //    cost: nsys at 30k measured this gap at **49.6 ms**, still the
+            //    largest single item in a 43 s prefill, on ~20k comparisons per
+            //    row x 2048 rows.
             //  * The rows are independent. `std::thread::scope` (already used
             //    in this crate's mistral loader; no new dependency) fans them
             //    over the cores. Each thread writes a disjoint slice of
@@ -281,26 +353,22 @@ impl QsaIndexer {
                 for (ti, out) in host_lists.chunks_mut(rows_per * topk * 4).enumerate() {
                     let r0 = ti * rows_per;
                     scope.spawn(move || {
-                        let mut order: Vec<u32> = Vec::with_capacity(stride);
+                        let mut keys: Vec<u64> = Vec::with_capacity(stride);
                         for (rl, orow) in out.chunks_mut(topk * 4).enumerate() {
                             let r = r0 + rl;
                             let complete = (first_pos + r + 1) / ratio;
                             let row_sc = &sc_ref[r * stride..r * stride + complete];
-                            let cmp = |&a: &u32, &b: &u32| {
-                                row_sc[b as usize]
-                                    .partial_cmp(&row_sc[a as usize])
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                    .then(a.cmp(&b))
-                            };
-                            order.clear();
-                            order.extend(0..complete as u32);
+                            keys.clear();
+                            keys.extend(
+                                row_sc.iter().enumerate().map(|(i, &s)| rank_key(s, i as u32)),
+                            );
                             if complete > topk {
-                                order.select_nth_unstable_by(topk - 1, cmp);
+                                keys.select_nth_unstable(topk - 1);
                             }
-                            order[..topk].sort_by(cmp);
-                            for (i, b) in order[..topk].iter().enumerate() {
+                            keys[..topk].sort_unstable();
+                            for (i, k) in keys[..topk].iter().enumerate() {
                                 orow[i * 4..i * 4 + 4]
-                                    .copy_from_slice(&(*b as i32).to_le_bytes());
+                                    .copy_from_slice(&((*k as u32) as i32).to_le_bytes());
                             }
                         }
                     });
