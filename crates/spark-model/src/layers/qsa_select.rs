@@ -236,12 +236,34 @@ impl QsaIndexer {
             // walks the list warp-striped (`t = warp; t < n_tok; t += 8`) and
             // its online softmax accumulates in that order. Permuting the list
             // reassociates the sum.
-            let mut raw = vec![0u8; rows * stride * 4];
-            gpu.copy_d2h_on_stream(scores, &mut raw, stream)?;
-            let sc: Vec<f32> = raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
+            // Receive straight into an f32 buffer. Landing in a `Vec<u8>` and
+            // then running `chunks_exact(4).map(from_le_bytes).collect()`
+            // walked every score a second time and allocated the matrix twice.
+            // That matrix is `rows x stride`: at 30k context it is 2048 x 7500
+            // = 15.4M floats PER SLAB, and a prefill runs ~14 slabs x 12
+            // layers of them, so the conversion pass alone was seconds.
+            //
+            // The reinterpretation is sound in the direction used: `u8` has no
+            // alignment requirement and the f32 allocation is already
+            // 4-aligned, so the D2H writes exactly the same bytes to exactly
+            // the same place and there is nothing left to convert. Both sides
+            // are little-endian, which the original `from_le_bytes` also
+            // assumed; the assertion below turns that into a build error
+            // rather than silent garbage if this is ever cross-compiled.
+            const _: () = assert!(
+                cfg!(target_endian = "little"),
+                "QSA score D2H reinterprets device f32 bytes in host order"
+            );
+            let mut sc = vec![0f32; rows * stride];
+            {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        sc.as_mut_ptr().cast::<u8>(),
+                        std::mem::size_of_val(sc.as_slice()),
+                    )
+                };
+                gpu.copy_d2h_on_stream(scores, bytes, stream)?;
+            }
             let mut host_lists = vec![0u8; rows * topk * 4];
             // One row is ~2000 comparisons of work; below a few dozen rows the
             // spawn cost dominates, and a prefill issues thousands of these.

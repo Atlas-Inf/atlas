@@ -299,6 +299,106 @@ fn qsa_prefill_attn_matches_cpu() {
     assert!(worst_cos > 0.999, "attention kernel diverges: {worst_cos}");
 }
 
+/// Stage 2B': `qsa_prefill_attn_g` must be BYTE-IDENTICAL to
+/// `qsa_prefill_attn`, not merely close.
+///
+/// The grouped kernel exists only to stop re-reading each K/V row once per q
+/// head (nq=24 over nkv=2 was twelve reads of every byte, 3.70 s and 32.6% of
+/// an 11k prefill). It keeps the same warp-striped `t` order, the same
+/// per-head online-softmax state and the same cross-warp merge order, so the
+/// claim is bit-identity -- and a cosine check against a CPU reference would
+/// not catch a reassociation that quietly costs the last mantissa bits. This
+/// compares the two kernels directly on the same inputs and requires equality.
+#[test]
+#[ignore]
+fn qsa_prefill_attn_g_matches_single_head_bitwise() {
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL='*'");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let stream = g.default_stream();
+    let k1 = g.kernel("qsa_indexer", "qsa_prefill_attn").unwrap();
+    let kg = g.kernel("qsa_indexer", "qsa_prefill_attn_g").unwrap();
+
+    let (rows, nq, nkv, hd, ratio, topk, bs) =
+        (5usize, 24usize, 2usize, 256usize, 4usize, 8usize, 16usize);
+    let first_pos = 41usize;
+    let n_pos = first_pos + rows;
+    let pages = n_pos.div_ceil(bs);
+    assert!(
+        ops::qsa_prefill_attn_grouped_ok(nq as u32, nkv as u32, hd as u32),
+        "this geometry must be eligible or the test proves nothing"
+    );
+
+    let mut seed = 0x9e3779b9u32;
+    let mut nextf = move || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((seed >> 8) as f32 / (1 << 24) as f32) - 0.5
+    };
+    let bf = |v: f32| -> u16 { (v.to_bits() >> 16) as u16 };
+
+    let q_host: Vec<u16> = (0..rows * nq * hd).map(|_| bf(nextf())).collect();
+    let kv_elems = pages * bs * nkv * hd;
+    let k_host: Vec<u16> = (0..kv_elems).map(|_| bf(nextf())).collect();
+    let v_host: Vec<u16> = (0..kv_elems).map(|_| bf(nextf())).collect();
+    let lists_host: Vec<i32> = (0..rows)
+        .flat_map(|r| (0..topk as i32).map(move |i| (i * 5 + r as i32) % 10))
+        .collect();
+
+    let as_bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let q_dev = upload(g, &as_bytes(&q_host));
+    let k_dev = upload(g, &as_bytes(&k_host));
+    let v_dev = upload(g, &as_bytes(&v_host));
+    let lists_dev = upload(
+        g,
+        &lists_host
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let ident: Vec<u8> = (0..pages as i32).flat_map(|v| v.to_le_bytes()).collect();
+    let table = upload(g, &ident);
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    let out_a = g.alloc(rows * nq * hd * 2).unwrap();
+    let out_b = g.alloc(rows * nq * hd * 2).unwrap();
+
+    ops::qsa_prefill_attn(
+        g, k1, q_dev, k_dev, v_dev, table, lists_dev, out_a, rows as u32,
+        first_pos as u32, topk as u32, ratio as u32, bs as u32, nq as u32,
+        nkv as u32, hd as u32, scale, stream,
+    )
+    .unwrap();
+    ops::qsa_prefill_attn_g(
+        g, kg, q_dev, k_dev, v_dev, table, lists_dev, out_b, rows as u32,
+        first_pos as u32, topk as u32, ratio as u32, bs as u32, nq as u32,
+        nkv as u32, hd as u32, scale, stream,
+    )
+    .unwrap();
+    g.synchronize(stream).unwrap();
+
+    let a = dl_bf16(g, out_a, rows * nq * hd);
+    let b = dl_bf16(g, out_b, rows * nq * hd);
+    let mut diffs = 0usize;
+    let mut first: Option<(usize, f32, f32)> = None;
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        if x.to_bits() != y.to_bits() {
+            diffs += 1;
+            if first.is_none() {
+                first = Some((i, *x, *y));
+            }
+        }
+    }
+    assert_eq!(
+        diffs, 0,
+        "grouped kernel is not bit-identical: {diffs}/{} elements differ, first {:?}",
+        a.len(),
+        first
+    );
+    println!("qsa_prefill_attn_g == qsa_prefill_attn on {} elements", a.len());
+}
+
 /// Minimal repro for the dense chunk-0 flash zeroing rows past ~1280 at
 /// qwen4_exp geometry (nq=24, nkv=2, hd=256, causal, seq 2809). Synthetic
 /// q/k/v, CPU reference at probe rows. If this passes, the corruption is in
