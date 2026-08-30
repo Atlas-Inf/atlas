@@ -551,6 +551,28 @@ impl Qwen3AttentionLayer {
             ctx.gpu.copy_d2d_async(hidden, normed, h * 2, stream)?;
         }
 
+        // ATLAS_QWEN4EXP_ATTN_PROF=1: what a full-attention layer spends its
+        // time on. The MTP verify runs these layers `for t in 0..k` while the
+        // GDN layers batch, and they measure 4.03 ms per layer against the GDN
+        // layers' 0.699 -- 5.8x -- which is 80% of K=3's step penalty. Two
+        // mechanisms for that have already been proposed and refuted by
+        // measurement (expert union, per-row weight re-streaming), so this
+        // splits the layer instead of guessing again.
+        let mut t_ap = if std::env::var("ATLAS_QWEN4EXP_ATTN_PROF").as_deref() == Ok("1") {
+            ctx.gpu.synchronize(stream).ok();
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        macro_rules! astage {
+            ($name:expr) => {
+                if let Some(t0) = t_ap.as_mut() {
+                    ctx.gpu.synchronize(stream).ok();
+                    tracing::info!("attn-layer [{}]: {}us", $name, t0.elapsed().as_micros());
+                    *t0 = std::time::Instant::now();
+                }
+            };
+        }
         let attn_out = self.attention_forward(
             state,
             normed,
@@ -562,6 +584,7 @@ impl Qwen3AttentionLayer {
             ctx,
             stream,
         )?;
+        astage!("attention");
 
         if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
@@ -709,6 +732,7 @@ impl Qwen3AttentionLayer {
         }
 
         let ffn_out = self.ffn.forward(normed2, ctx, stream)?;
+        astage!("ffn");
 
         if let Some(ref post_norm) = self.post_ffn_out_norm {
             ops::rms_norm(

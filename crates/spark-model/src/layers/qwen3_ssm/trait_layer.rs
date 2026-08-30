@@ -207,9 +207,35 @@ impl TransformerLayer for Qwen3SsmLayer {
         // which is where the next attempt should start rather than with
         // another mechanism guess.
         //
+        // AND HERE IS WHY IT BOUGHT NOTHING (`ATLAS_QWEN4EXP_ATTN_PROF=1`,
+        // mean us per attention-layer call):
+        //
+        //     ffn (MoE)    376.1 us   55.3%
+        //     attention    303.5 us   44.7%
+        //     TOTAL        679.6 us
+        //
+        // 679.6 us per call. The 12 attention layers run once per verify row,
+        // so K=2 pays 12*2*679.6 = 16.3 ms and K=3 pays 12*3 = 24.5 ms. The
+        // per-row duplication is therefore worth +8.2 ms at K=3 — against a
+        // MEASURED non-SSM delta of +26.6 ms. It is 31% of the gap, which is
+        // why removing it entirely (the batched-verify run above) moved
+        // throughput 20.13 -> 20.195 and nothing else.
+        //
+        // So the remaining ~18 ms is neither the expert union, nor per-row
+        // weight re-streaming, nor per-row layer re-execution. It is not in
+        // the 36 SSM layers (+3.2 ms, profiled) and not in the 12 attention
+        // layers (+8.2 ms, profiled). By subtraction it is in what the forward
+        // does AROUND the layers at 3 rows instead of 2 — the LM head, the
+        // embedding, the final norm, the per-row metadata uploads — and none
+        // of that has a probe yet.
+        //
+        // Recorded as subtraction, not as a mechanism. Three mechanisms have
+        // been proposed here and all three were refuted by the measurement
+        // that followed; the next person should probe first.
+        //
         // The experiment was reverted; only the diagnostics it needed
-        // (`ATLAS_QWEN4EXP_VERIFY_PROF`, `ATLAS_MTP_MAX_DRAFTS`, the K=3
-        // stepper's timing records) are kept.
+        // (`ATLAS_QWEN4EXP_VERIFY_PROF`, `ATLAS_QWEN4EXP_ATTN_PROF`,
+        // `ATLAS_MTP_MAX_DRAFTS`, the K=3 stepper's timing records) are kept.
         Some(
             std::env::var("ATLAS_MTP_MAX_DRAFTS")
                 .ok()
