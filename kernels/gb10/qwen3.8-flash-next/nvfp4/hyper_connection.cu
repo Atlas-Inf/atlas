@@ -439,6 +439,107 @@ extern "C" __global__ void hc_pre_down(
     }
 }
 
+// Prefill-shaped sibling of `hc_pre_down`, tiled over BOTH tokens and hc_dim.
+//
+// `hc_pre_down` stages the whole `normed` row (hc_dim floats, 40 KB) in shared
+// and makes ONE pass. That is right at T=1: a decode call needs a single pass
+// and pays no barriers. It is wrong at prefill widths, where it re-reads the
+// 6.55 MB `down_w` once per token -- 393 MB at T=60, measured 859 GB/s, ~85% of
+// L2 peak, i.e. L2-bandwidth-bound.
+//
+// This tiles tokens (HC_TT per block) so each weight row is amortised, and
+// chunks hc_dim (HC_CH) so the staged `nx` footprint stays HC_TT x HC_CH x 4 B
+// instead of HC_TT x 40 KB. Tiling tokens ALONE was measured and gave only -6%:
+// TT x 40 KB overflows L1, so `nx` starts missing to L2 and cancels the weight
+// saving. Both dimensions have to move together.
+//
+// Measured on an 87-token prefill (nsys): prefill `hc_pre_down` time
+// 89.2 ms -> 33.0 ms, and the whole prefill window 491.5 -> 438.3 ms.
+// At T=1 it is 2.3x SLOWER than the single-pass version (28.8 -> 65.0 ms over
+// 679 decode calls), because hc_dim=10240 becomes 20 chunks = 40 barriers for
+// work that needs one pass. Hence two kernels and a dispatch on T, not one.
+//
+// BITWISE IDENTICAL to `hc_pre_down`: for every (t, r) a lane still walks
+// i = lane, lane+32, ... in increasing order followed by the same shfl
+// reduction. Chunks are contiguous, processed in order, and HC_CH is a multiple
+// of 32, so chunking cannot reorder a lane's walk. Only the order in which
+// independent (t, r) pairs are visited changed.
+#ifndef HC_TT
+#define HC_TT 8u
+#endif
+#ifndef HC_CH
+#define HC_CH 512u
+#endif
+
+extern "C" __global__ void hc_pre_down_tiled(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const __nv_bfloat16* __restrict__ down_w,  // [rank, hc*H]
+    float* __restrict__ low_out,               // [T, rank]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank,
+    const unsigned int num_tokens
+) {
+    __shared__ float s_nx[HC_TT][HC_CH];
+
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int warps = blockDim.x >> 5;
+    const unsigned int hc_dim = hc * hidden_size;
+    const float inv_hc = 1.0f / (float)hc;
+
+    const unsigned int t0 = blockIdx.x * HC_TT;
+    if (t0 >= num_tokens) return;
+    const unsigned int tn = min(HC_TT, num_tokens - t0);
+
+    const unsigned int rows_per_split = (rank + gridDim.y - 1) / gridDim.y;
+    const unsigned int r0 = blockIdx.y * rows_per_split;
+    const unsigned int r1 = min(r0 + rows_per_split, rank);
+
+    for (unsigned int rbase = r0; rbase < r1; rbase += warps) {
+        const unsigned int r = rbase + warp;
+        float acc[HC_TT];
+        #pragma unroll
+        for (unsigned int t = 0; t < HC_TT; ++t) acc[t] = 0.0f;
+
+        for (unsigned int c0 = 0; c0 < hc_dim; c0 += HC_CH) {
+            const unsigned int cn = min(HC_CH, hc_dim - c0);
+            for (unsigned int idx = threadIdx.x; idx < tn * cn; idx += blockDim.x) {
+                const unsigned int t = idx / cn;
+                const unsigned int i = idx - t * cn;
+                s_nx[t][i] = normed[(size_t)(t0 + t) * hc_dim + c0 + i];
+            }
+            __syncthreads();
+            if (r < r1) {
+                const __nv_bfloat16* row = down_w + (size_t)r * hc_dim + c0;
+                for (unsigned int i = lane; i < cn; i += 32u) {
+                    const float w = (float)row[i];
+                    #pragma unroll
+                    for (unsigned int t = 0; t < HC_TT; ++t) {
+                        if (t < tn) acc[t] += w * s_nx[t][i];
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        if (r < r1) {
+            #pragma unroll
+            for (unsigned int t = 0; t < HC_TT; ++t) {
+                if (t >= tn) continue;
+                float a = acc[t];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    a += __shfl_down_sync(0xFFFFFFFFu, a, off);
+                }
+                if (lane == 0) {
+                    low_out[(size_t)(t0 + t) * rank + r] = qhc_silu(a * inv_hc);
+                }
+            }
+        }
+    }
+}
+
 // Stage 3: y[d] = mean_s sigmoid(up[s*H+d] . low) * normed[s*H+d], the
 // d-range split over blockIdx.y; block y==0 also emits the injection vector.
 //
