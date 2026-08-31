@@ -807,9 +807,16 @@ extern "C" __global__ void qsa_prefill_attn_g(
             for (unsigned int e = 0; e < 8; ++e) {
                 if (e < vec) dot += qreg[g][e] * kreg[e];
             }
+            // Butterfly instead of down-shift + broadcast. For lane 0 the two
+            // are the SAME value at every step -- 0^16 == 16, 0^8 == 8, ... --
+            // so the addition order is unchanged, and xor leaves the total in
+            // every lane, which retires the separate broadcast. Six shuffles
+            // per dot become five. `qsa_prefill_attn_g_matches_single_head_
+            // bitwise` compares against the one-head kernel, which still uses
+            // the down-shift, so a mistake here fails loudly.
             #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xFFFFFFFFu, dot, o);
-            dot = __shfl_sync(0xFFFFFFFFu, dot, 0) * inv_sqrt_d;
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, o);
+            dot *= inv_sqrt_d;
 
             const float m_new = fmaxf(m[g], dot);
             const float scale = __expf(m[g] - m_new);
