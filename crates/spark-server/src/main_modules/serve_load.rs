@@ -497,6 +497,15 @@ pub(crate) fn load_model(
         max_batch_tokens,
         spec_tokens: _spec_tokens,
     } = serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk);
+    // Every BufferArena region is sized by this. Carry it so the ONE arena
+    // that is allocated inside a weight loader — qwen4_exp's PLE scratch —
+    // can be sized by it too instead of a standalone constant. Same
+    // "carried on the config, not the environment" rule as the block below.
+    config.max_batch_tokens = max_batch_tokens;
+    // Same rule, for the per-SEQUENCE bound: qwen4_exp's QSA indexer sizes its
+    // key cache from this instead of a standalone 32768 default that ignored
+    // --max-seq-len entirely.
+    config.max_seq_len = args.max_seq_len;
     if args.dflash && args.enable_prefix_caching {
         tracing::warn!(
             "dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
@@ -838,7 +847,19 @@ pub(crate) fn load_model(
             "Self-speculative decoding: ENABLED ({num_drafts} drafts/step, layer-skipping)"
         );
     } else if use_speculative {
-        tracing::info!("Speculative decoding: ENABLED ({num_drafts} drafts/step)");
+        // A model can cap the verify width below what was asked for (the mHC
+        // highway has MoE arms for K=2/3 only). The scheduler clamps every
+        // step to it; say so here, or the operator reads back a depth the
+        // serve will never dispatch.
+        match scheduler_model.verify_max_drafts() {
+            Some(max_nd) if max_nd < num_drafts => tracing::warn!(
+                "Speculative decoding: ENABLED ({max_nd} drafts/step) — \
+                 --num-drafts {num_drafts} CLAMPED to {max_nd}: this model's batched \
+                 verify serves at most K={} rows.",
+                max_nd + 1
+            ),
+            _ => tracing::info!("Speculative decoding: ENABLED ({num_drafts} drafts/step)"),
+        }
     } else if scheduler_model.has_proposer() {
         tracing::info!(
             "MTP proposer available but speculative decoding disabled (use --speculative to enable)"

@@ -136,16 +136,23 @@ impl QsaIndexer {
         hidden: usize,
         nkv_attn: usize,
         hd_attn: usize,
+        serve_max_seq_len: usize,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         anyhow::ensure!(
             ratio > 0 && budget.is_multiple_of(ratio),
             "QSA: budget % ratio != 0"
         );
+        // Bound for `raw_keys`/`block_keys`, and the length past which a
+        // request is refused. It used to default to a standalone 32768 that
+        // ignored `--max-seq-len`, so serving longer loaded fine and then 500'd
+        // every request past 32768 with `QSA: N tokens exceeds ...`. Take the
+        // serve-time bound when there is one; the env var still overrides, and
+        // 32768 remains the floor for callers that set neither (the tests).
         let max_tokens: usize = std::env::var("ATLAS_QSA_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(32768);
+            .unwrap_or_else(|| serve_max_seq_len.max(32768));
         let block_topk = budget / ratio;
         let qk_width = (n_heads + 1) * hd;
         let sel_cap = budget + ratio;

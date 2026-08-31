@@ -55,6 +55,7 @@ pub(super) fn attach_qsa(
             config.hidden_size,
             config.num_key_value_heads,
             config.head_dim,
+            config.max_seq_len,
             gpu,
         )
         .with_context(|| format!("qwen4_exp layer {i}: QSA indexer"))?;

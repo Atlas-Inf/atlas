@@ -138,6 +138,7 @@ fn qsa_matches_reference() {
         hidden,
         /* nkv_attn */ 2,
         /* hd_attn */ 256,
+        /* serve_max_seq_len */ 0,
         g,
     )
     .unwrap();

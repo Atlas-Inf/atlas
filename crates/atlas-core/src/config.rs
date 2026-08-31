@@ -137,6 +137,41 @@ pub struct ModelConfig {
     /// Consumed by `skip_lm_head_quantization()`. Replaces the ATLAS_LMHEAD_BF16 env var.
     #[serde(default)]
     pub lm_head_bf16_override: Option<bool>,
+    /// The widest token count any single forward can present — the same `m`
+    /// `BufferArena` sizes every scratch region by. Set at serve time (not
+    /// from config.json), 0 when unset.
+    ///
+    /// Exists because one arena was NOT sized by it: qwen4_exp's PLE scratch
+    /// used a standalone 2048 constant, and refuses a wider chunk rather than
+    /// overrunning. Prefill chunks are capped, but a fused mixed step sums a
+    /// padded decode batch with a prefill slice and is bounded only by
+    /// `max_batch_tokens`, so anything past 2048 died in prefill and the API
+    /// returned a 500 — 51 of 334 samples on a BFCL draw.
+    ///
+    /// `skip`, not `default`: a serve-time value has no business being
+    /// supplied — or clobbered — by a checkpoint's config.json. 0 means "no
+    /// serve set this", which every consumer must treat as unknown rather
+    /// than as a real bound.
+    #[serde(skip)]
+    pub max_batch_tokens: usize,
+    /// The longest single sequence any request may reach — `--max-seq-len`.
+    /// Set at serve time (not from config.json), 0 when unset.
+    ///
+    /// Exists because one consumer was NOT sized by it: qwen4_exp's QSA
+    /// indexer took its bound from `ATLAS_QSA_MAX_TOKENS`, whose default is a
+    /// standalone 32768. Serving with a longer `--max-seq-len` therefore
+    /// succeeded at load and then failed every request past 32768 tokens with
+    /// `QSA: N tokens exceeds ATLAS_QSA_MAX_TOKENS=32768` — a 500, at a
+    /// context the operator explicitly asked for. It sizes `raw_keys`
+    /// (`max_tokens * hd * 2` per sequence per QSA layer), so it cannot simply
+    /// be raised to `max_position_embeddings`: at 262144 that is ~1 GB per
+    /// sequence across 12 layers.
+    ///
+    /// `skip`, not `default`, for the same reason as `max_batch_tokens`: a
+    /// serve-time value has no business being supplied — or clobbered — by a
+    /// checkpoint's config.json. 0 means "no serve set this".
+    #[serde(skip)]
+    pub max_seq_len: usize,
     /// When `skip_lm_head_quantization()` == false, quantize the LM head to FP8
     /// (E4M3, per-row scales, decoded via `w8a16_gemv`) instead of NVFP4.
     /// Set by `--lm-head-dtype fp8`. Additive: leaves the NVFP4/BF16 paths

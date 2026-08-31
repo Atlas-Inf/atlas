@@ -52,6 +52,7 @@ fn qsa_prefill_select_sets_match_reference() {
         hidden,
         nkv,
         hd_attn,
+        /* serve_max_seq_len */ 0,
         g,
     )
     .unwrap();
