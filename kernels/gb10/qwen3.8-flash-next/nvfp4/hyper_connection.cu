@@ -311,12 +311,27 @@ extern "C" __global__ void hc_post(
     float wv[QHC_MAX_MULT];
     for (unsigned int s = 0; s < hc; ++s) wv[s] = w[s];
 
+#ifdef HC_PROBE_BF16_STREAMS
+    // MEASUREMENT PROBE ONLY -- NEVER SHIP.
+    // Prices the ACCURACY half of storing the mHC residual highway in BF16
+    // instead of F32, without touching a single dtype, allocation or layout.
+    // `hc_post` is what writes the streams every layer, so rounding its output
+    // to BF16 precision means every later read sees BF16-representable values --
+    // exactly what a BF16 highway would deliver -- while the buffers stay F32,
+    // so this measures accuracy at ZERO speed change. The traffic win it is
+    // pricing is ~363 GB of the prefill: `hc_post` and `hc_pre_stage` move the
+    // 4x-wide highway at 40 KB per token per layer per site.
+    #define HC_PQ(x) __bfloat162float(__float2bfloat16(x))
+#else
+    #define HC_PQ(x) (x)
+#endif
     for (unsigned int d = tid; d < H; d += QHC_BLOCK) {
         float xd = (float)x[d];
         for (unsigned int s = 0; s < hc; ++s) {
-            o[s * H + d] = res[s * H + d] + xd * wv[s];
+            o[s * H + d] = HC_PQ(res[s * H + d] + xd * wv[s]);
         }
     }
+    #undef HC_PQ
 }
 
 // ── Split collapse, for SMALL T (decode) ─────────────────────────────────
