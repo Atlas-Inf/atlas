@@ -160,7 +160,13 @@ pub(super) fn load_layer_sites(
     tr: &mut UpTranspose<'_>,
 ) -> Result<(HcSiteWeights, HcSiteWeights)> {
     let rank = config.hc_lowrank;
-    let attn = load_site(store, &format!("{lp}.attn_hyper_connection"), rank, true, tr)?;
+    let attn = load_site(
+        store,
+        &format!("{lp}.attn_hyper_connection"),
+        rank,
+        true,
+        tr,
+    )?;
     let ffn = load_site(store, &format!("{lp}.mlp_hyper_connection"), rank, true, tr)?;
     Ok((site(attn), site(ffn)))
 }

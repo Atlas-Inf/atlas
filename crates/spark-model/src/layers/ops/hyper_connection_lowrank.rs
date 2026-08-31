@@ -256,9 +256,8 @@ fn hc_pre_gemm(
     let up_pre = scratch.offset(lay * hc_dim * 2);
     let low = scratch.offset(2 * lay * hc_dim * 2);
     let inj_pre = scratch.offset(2 * lay * hc_dim * 2 + lay * w.rank * 2);
-    let up_wt = scratch.offset(
-        2 * lay * hc_dim * 2 + lay * w.rank * 2 + lay * hc_mult as usize * 2,
-    );
+    let up_wt =
+        scratch.offset(2 * lay * hc_dim * 2 + lay * w.rank * 2 + lay * hc_mult as usize * 2);
 
     let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage_bf16")?;
     let k_silu = gpu.kernel("hyper_connection", "hc_silu_scale")?;
@@ -476,7 +475,9 @@ fn hc_pre_split(
     // `S = clamp(48/T, 1, 10)` was already at the useful end of this curve;
     // 128 is a hair better and 256 is inside the noise.
     let fblock = hc_finish_block();
-    let fsplit = hidden_size.div_ceil(fblock).max((48 / num_tokens.max(1)).clamp(1, 10));
+    let fsplit = hidden_size
+        .div_ceil(fblock)
+        .max((48 / num_tokens.max(1)).clamp(1, 10));
     KernelLaunch::new(gpu, k_fin)
         .grid([num_tokens, fsplit, 1])
         .block([fblock, 1, 1])

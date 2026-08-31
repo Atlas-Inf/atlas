@@ -141,7 +141,11 @@ fn fetch_row(
     // One block unless the row crosses the boundary (possible whenever the
     // table's base offset is not 4 KiB-aligned, i.e. reading in place from a
     // safetensors shard).
-    let nblocks = if within + src.row_stride > BLOCK { 2 } else { 1 };
+    let nblocks = if within + src.row_stride > BLOCK {
+        2
+    } else {
+        1
+    };
     atlas_tier::pio::read_exact_at(file, bounce.blocks(nblocks), block_off)
         .with_context(|| format!("NgramRowCache: read row {id}"))?;
     // SAFETY: slot is one this batch pinned, so it is < slots and no other

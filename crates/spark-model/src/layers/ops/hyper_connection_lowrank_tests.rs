@@ -137,7 +137,11 @@ fn compare(label: &str, got: &[f32], want: &[f32], tol: f32) {
 /// (`weight_loader::qwen4_exp::hc::UpTranspose`). Doing it on the host here
 /// keeps this probe testing the kernels rather than the loader.
 fn transpose_bf16(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
-    assert_eq!(bytes.len(), rows * cols * 2, "blob is not [rows, cols] BF16");
+    assert_eq!(
+        bytes.len(),
+        rows * cols * 2,
+        "blob is not [rows, cols] BF16"
+    );
     let mut out = vec![0u8; bytes.len()];
     for r in 0..rows {
         for c in 0..cols {
