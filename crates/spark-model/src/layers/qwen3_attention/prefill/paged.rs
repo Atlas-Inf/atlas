@@ -653,9 +653,43 @@ impl Qwen3AttentionLayer {
                 disk_last_offloaded_per_layer,
                 stream,
             };
-            match self.prefill_attention_paged_attn(kv_cache, ctx, &mut args)? {
-                super::paged_attn::PagedAttnOutcome::EarlyReturn(out) => return Ok(out),
-                super::paged_attn::PagedAttnOutcome::Continue => {}
+            // Step 8b below is an OVERWRITE: `qsa.prefill_select` rewrites
+            // `attn_out` for every global row at or past `inert_bound`. When
+            // this whole chunk starts past that bound, dense attention here
+            // computes rows that are thrown away without ever being read --
+            // and it is the expensive kind of waste, because dense cost grows
+            // with position and these are the late rows.
+            //
+            // nsys, 29670-token prefill (2026-08-31). `inert_bound` is
+            // `budget + ratio - 1` = 2051, and the paged chunks start at 8196,
+            // 16392 and 24588:
+            //
+            //   grid          rows    n     ms      kept
+            //   24x129x1      8196   12    291.9   rows < 2051 only (chunk 0,
+            //                                      the cache-skip path)
+            //   24x128x1      8192   24   2613.2   NONE
+            //   24x80x1       5090   12   1369.0   NONE
+            //
+            // 3982 ms of a 41.6 s window, discarded. Skipping is bit-identical
+            // by construction: `prefill_select` writes
+            // `[max(bound, seq_start), total)`, which at `seq_start >= bound`
+            // is every row of the chunk.
+            //
+            // Three guards, all narrowing: QSA must be the one writing those
+            // rows (single-stream only -- 8b refuses batched for this model),
+            // and the TurboQuant output bookend must be inert, so this never
+            // has to reason about rotating a buffer nobody wrote.
+            let qsa_overwrites_all = batched_meta.is_none()
+                && !(v_is_turbo && wht_runtime_active)
+                && self
+                    .qsa
+                    .as_ref()
+                    .is_some_and(|q| seq_len_start >= q.inert_bound());
+            if !qsa_overwrites_all {
+                match self.prefill_attention_paged_attn(kv_cache, ctx, &mut args)? {
+                    super::paged_attn::PagedAttnOutcome::EarlyReturn(out) => return Ok(out),
+                    super::paged_attn::PagedAttnOutcome::Continue => {}
+                }
             }
         }
 
@@ -669,22 +703,6 @@ impl Qwen3AttentionLayer {
                 .arg_ptr(attn_out)
                 .arg_u32(hd)
                 .launch(stream)?;
-        }
-
-        // ATLAS_OP_DUMP: attn_out BEFORE sigmoid gate (raw attention-kernel output).
-        // Compares 1:1 against vLLM's "attn_out" dump in qwen3_next.py:_dump_op.
-        // Use last-token slice n_elements = num_heads * head_dim.
-        if num_tokens > 0 {
-            let nq_hd = (nq * hd) as usize;
-            super::super::op_dump::dump_bf16(
-                ctx.gpu,
-                attn_out,
-                (num_tokens - 1) * nq_hd * bf16,
-                nq_hd,
-                self.attn_layer_idx,
-                "attn_out_pre_gate",
-                stream,
-            )?;
         }
 
         // ── 8b. QSA stage-2: per-query prefill selection for CHUNKED
@@ -718,6 +736,30 @@ impl Qwen3AttentionLayer {
                 inv_sqrt_d,
                 ctx.buffers.qsa_select_scratch(),
                 ctx.gpu,
+                stream,
+            )?;
+        }
+
+        // ATLAS_OP_DUMP: attn_out BEFORE sigmoid gate (raw attention-kernel output).
+        // Compares 1:1 against vLLM's "attn_out" dump in qwen3_next.py:_dump_op.
+        // Use last-token slice n_elements = num_heads * head_dim.
+        //
+        // AFTER 8b, deliberately. It used to sit before the QSA overwrite, so
+        // for any row past `inert_bound` -- which the LAST row of a long prompt
+        // always is -- it dumped the dense value that 8b then discarded, and
+        // compared that against a vLLM dump taken after ITS selective
+        // attention. Post-8b is both the value that survives and the 1:1
+        // comparison the comment claims. (It also has to be here now: when the
+        // dense pass is skipped there is nothing to read before 8b runs.)
+        if num_tokens > 0 {
+            let nq_hd = (nq * hd) as usize;
+            super::super::op_dump::dump_bf16(
+                ctx.gpu,
+                attn_out,
+                (num_tokens - 1) * nq_hd * bf16,
+                nq_hd,
+                self.attn_layer_idx,
+                "attn_out_pre_gate",
                 stream,
             )?;
         }
