@@ -373,6 +373,101 @@ extern "C" __global__ void qsa_score_rows_b(
     }
 }
 
+// Block scores as a TILED GEMM — one thread per score, no block reductions.
+//
+// `qsa_score_rows_b` still spends four block-wide reductions per output, and
+// 8d595d5b measured that those are ~4/5 of its cost (tiling 16 b-values per CTA
+// removed the other 1/5). This removes them: a CTA owns a QSA_SG_BM x QSA_SG_BN
+// tile of scores, stages that tile's `q` rows and `k` blocks in shared once,
+// and each thread contracts ONE score serially over `hd`. Total MACs are
+// unchanged; what goes away is the reduction machinery around them.
+//
+//   qsa_score_rows    1.43 TFLOP in 4.860 s =  294 GFLOP/s   (1 CTA per score)
+//   qsa_score_rows_b                3.795 s =  377 GFLOP/s   (16 scores per CTA)
+//   MoE, same prefill 142.7 TFLOP in 5.089 s = 28.0 TFLOP/s  (a real tiled GEMM)
+//
+// NUMERICS — this is NOT bit-identical, deliberately. The `d` contraction
+// becomes a sequential per-thread sum instead of a block-wide tree, which
+// reassociates it. That matters more here than in most kernels: these scores
+// feed a top-k, so a changed score can change WHICH blocks a query attends to,
+// not merely by how much. Gate with `lc_subset.py` + `kl_drift.py
+// --precision-change` AND `lc_check.py` needle recall — a KL check alone cannot
+// see a model that has quietly stopped retrieving. Everything else is held
+// fixed: `k` is still widened bf16 -> float before the multiply, the `hh` sum is
+// still `fmaxf(dot, 0)` in `hh` order, and the scale is still `rsqrtf(hd)`.
+//
+// SHARED LAYOUT. `ks` is padded to `hd + 1` floats per block. Without the pad,
+// threads of a warp vary `j` while sharing `d`, and a stride of hd=128 floats
+// puts every `j` in the same bank — a 32-way conflict on the hot load.
+#define QSA_SG_BM 8
+#define QSA_SG_BN 32
+extern "C" __global__ void qsa_score_rows_gemm(
+    const float* __restrict__ q,                // [rows, n_heads, hd]
+    const __nv_bfloat16* __restrict__ block_keys,
+    float* __restrict__ scores,                 // [rows, score_stride]
+    const unsigned int first_pos,
+    const unsigned int score_stride,
+    const unsigned int ratio,
+    const unsigned int n_heads,
+    const unsigned int hd,
+    const unsigned int rows,
+    const unsigned int n_blocks_max
+) {
+    const unsigned int r0 = blockIdx.x * QSA_SG_BM;
+    const unsigned int b0 = blockIdx.y * QSA_SG_BN;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int ldk = hd + 1u;
+
+    extern __shared__ float smem[];
+    float* qs = smem;                                   // [BM][n_heads][hd]
+    float* ks = smem + (size_t)QSA_SG_BM * n_heads * hd; // [BN][hd + 1]
+
+    const unsigned int qn = QSA_SG_BM * n_heads * hd;
+    for (unsigned int i = tid; i < qn; i += blockDim.x) {
+        const unsigned int rr = i / (n_heads * hd);
+        const unsigned int rest = i - rr * n_heads * hd;
+        const unsigned int r = r0 + rr;
+        qs[i] = (r < rows) ? q[(size_t)r * n_heads * hd + rest] : 0.0f;
+    }
+    const unsigned int kn = QSA_SG_BN * hd;
+    for (unsigned int i = tid; i < kn; i += blockDim.x) {
+        const unsigned int bb = i / hd;
+        const unsigned int d = i - bb * hd;
+        const unsigned int b = b0 + bb;
+        ks[bb * ldk + d] =
+            (b < n_blocks_max) ? (float)block_keys[(size_t)b * hd + d] : 0.0f;
+    }
+    __syncthreads();
+
+    // One score per thread: QSA_SG_BM * QSA_SG_BN == blockDim.x.
+    const unsigned int ii = tid / QSA_SG_BN;
+    const unsigned int jj = tid - ii * QSA_SG_BN;
+    const unsigned int r = r0 + ii;
+    const unsigned int b = b0 + jj;
+    if (r >= rows || b >= n_blocks_max) {
+        return;
+    }
+    float* out = scores + (size_t)r * score_stride + b;
+    const unsigned int complete = (first_pos + r + 1) / ratio;
+    if (b >= complete) {
+        *out = -1e30f;
+        return;
+    }
+
+    const float* qrow = qs + (size_t)ii * n_heads * hd;
+    const float* krow = ks + (size_t)jj * ldk;
+    float acc = 0.0f;
+    for (unsigned int hh = 0; hh < n_heads; ++hh) {
+        const float* qh = qrow + (size_t)hh * hd;
+        float dot = 0.0f;
+        for (unsigned int d = 0; d < hd; ++d) {
+            dot = __fmaf_rn(qh[d], krow[d], dot);
+        }
+        acc += fmaxf(dot, 0.0f);
+    }
+    *out = acc * rsqrtf((float)hd);
+}
+
 // Attention over EXACTLY the selected set for one (row, q-head): the listed
 // `topk` blocks (ratio tokens each) plus the incomplete tail
 // [complete*ratio, pos]. K/V come straight from the paged cache; the output
