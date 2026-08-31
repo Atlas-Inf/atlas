@@ -795,10 +795,27 @@ extern "C" __global__ void qsa_prefill_attn_g(
         const __nv_bfloat16* krow = k_cache + off;
         const __nv_bfloat16* vrow = v_cache + off;
         float kreg[8], vreg[8];
-        #pragma unroll
-        for (unsigned int e = 0; e < 8; ++e) {
-            kreg[e] = (e < vec) ? (float)krow[lane * vec + e] : 0.0f;
-            vreg[e] = (e < vec) ? (float)vrow[lane * vec + e] : 0.0f;
+        // Lane `l` wants elements [l*vec, l*vec+vec) -- contiguous. At vec == 8
+        // that is 16 bytes, and `off` is a multiple of `hd`, so the address is
+        // 16-byte aligned: one 128-bit load instead of EIGHT 2-byte ones, for
+        // each of K and V, on a loop that runs ~2048 times per (row, group).
+        // Bit-identical -- same bytes, same `(float)` widening, same order.
+        if (vec == 8) {
+            const uint4 kraw = *reinterpret_cast<const uint4*>(krow + lane * 8);
+            const uint4 vraw = *reinterpret_cast<const uint4*>(vrow + lane * 8);
+            const __nv_bfloat16* kp = reinterpret_cast<const __nv_bfloat16*>(&kraw);
+            const __nv_bfloat16* vp = reinterpret_cast<const __nv_bfloat16*>(&vraw);
+            #pragma unroll
+            for (unsigned int e = 0; e < 8; ++e) {
+                kreg[e] = (float)kp[e];
+                vreg[e] = (float)vp[e];
+            }
+        } else {
+            #pragma unroll
+            for (unsigned int e = 0; e < 8; ++e) {
+                kreg[e] = (e < vec) ? (float)krow[lane * vec + e] : 0.0f;
+                vreg[e] = (e < vec) ? (float)vrow[lane * vec + e] : 0.0f;
+            }
         }
         #pragma unroll
         for (unsigned int g = 0; g < QSA_PA_G; ++g) {
@@ -818,6 +835,12 @@ extern "C" __global__ void qsa_prefill_attn_g(
             for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, o);
             dot *= inv_sqrt_d;
 
+            // All 32 lanes compute the same two `__expf` here, because `dot`
+            // is broadcast and `m[g]` is warp-uniform. Computing them once in
+            // lane 0 and broadcasting was tried and is SLOWER -- 26.201 s ->
+            // 26.846 s at 30k. The redundant SFU work hides under the rest of
+            // the loop; two extra shuffles do not. This kernel is not
+            // SFU-bound, so leave it.
             const float m_new = fmaxf(m[g], dot);
             const float scale = __expf(m[g] - m_new);
             const float p = __expf(dot - m_new);
