@@ -721,9 +721,23 @@ __device__ __forceinline__ unsigned long long qsa_key_off(
     }
     const unsigned int pg = bs_p2 ? (tok >> bs_sh) : (tok / block_size);
     const unsigned int inb = bs_p2 ? (tok & bs_mask) : (tok % block_size);
-    return (unsigned long long)(unsigned int)block_table[pg] * page_stride
+    const unsigned long long off =
+           (unsigned long long)(unsigned int)block_table[pg] * page_stride
          + (unsigned long long)inb * row_elems
          + (unsigned long long)kvh * hd;
+#ifdef QSA_PA_PROBE_LOCALITY
+    // MEASUREMENT PROBE ONLY -- PRODUCES WRONG OUTPUT, NEVER SHIP.
+    // Collapses the K/V working set into a 128 KB window so every load hits
+    // cache. Every instruction above still executes (block_table and my_list
+    // are still read, the index math is unchanged); only WHICH bytes are
+    // fetched changes. The delta against the unprobed build is therefore the
+    // cost of K/V memory traffic alone, with occupancy held fixed -- which the
+    // G=2 vs G=4 comparison could not isolate, because G moves registers too.
+    // 0xFF00 preserves the 256-element alignment the uint4 loads require.
+    return off & 0xFF00ull;
+#else
+    return off;
+#endif
 }
 
 // ── G q-heads per block ──────────────────────────────────────────────────
