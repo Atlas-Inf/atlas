@@ -346,6 +346,49 @@ impl QsaIndexer {
                     stream,
                 )?;
             }
+            // ── ATLAS_QSA_UNION_DIAG: how much do neighbouring rows agree? ──
+            // Decides whether an EXACT block-sparse tensor-core attention is
+            // possible here. A TC kernel needs a TILE of query rows to share one
+            // K/V set; QSA selects per ROW. Attending the UNION of a tile's
+            // selections and masking each row back to its own list is exactly
+            // equivalent -- so the only question is how big that union is.
+            // union/topk == 1.0 means free; == tile size means no sharing at all.
+            if std::env::var("ATLAS_QSA_UNION_DIAG").as_deref() == Ok("1") {
+                let mut host = vec![0u8; rows * topk * 4];
+                gpu.synchronize(stream)?;
+                gpu.copy_d2h_on_stream(lists, &mut host, stream)?;
+                let ids: Vec<i32> = host
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let mut line = String::new();
+                for tile in [16usize, 32, 64, 128] {
+                    let (mut tot, mut n) = (0usize, 0usize);
+                    let mut r0 = 0usize;
+                    while r0 + tile <= rows {
+                        let mut set = std::collections::HashSet::new();
+                        for r in r0..r0 + tile {
+                            for k in 0..topk {
+                                let v = ids[r * topk + k];
+                                if v >= 0 {
+                                    set.insert(v);
+                                }
+                            }
+                        }
+                        tot += set.len();
+                        n += 1;
+                        r0 += tile;
+                    }
+                    if n > 0 {
+                        line.push_str(&format!(
+                            " tile{tile}: union={} ({:.2}x topk)",
+                            tot / n,
+                            (tot / n) as f64 / topk as f64
+                        ));
+                    }
+                }
+                tracing::info!("QSA union rows={rows} topk={topk}{line}");
+            }
             if host_select {
                 // Host top-k per row (the D2H drains the stream first). Torch
                 // tie-break: larger score first, lower index on ties.
@@ -464,11 +507,44 @@ impl QsaIndexer {
             // `ATLAS_QSA_ATTN_L8` selects the 8-lanes-per-head reduction. It
             // is NOT bit-identical (the dot-product tree changes), so it is
             // opt-in and gated on `scripts/ppl.py`; see TTFT_GAP.md 22.
-            let l8 = matches!(
+            // `ATLAS_QSA_ATTN_TC` selects the tensor-core attention. Same
+            // selected set and same per-row semantics; NOT bit-identical (a
+            // different summation tree), so it is opt-in and gated on
+            // `scripts/ppl.py`. See TTFT_GAP.md 27.
+            let tc = matches!(
+                std::env::var("ATLAS_QSA_ATTN_TC").as_deref(),
+                Ok("1") | Ok("true")
+            ) && self.k_prefill_attn_tc_k.0 != 0
+                && ops::qsa_prefill_attn_tc_ok(nq, self.nkv_attn, self.hd_attn);
+            if tc {
+                ops::qsa_prefill_attn_tc(
+                    gpu,
+                    self.k_prefill_attn_tc_k,
+                    q_roped.offset(first_row * q_row * 2),
+                    k_pool,
+                    v_pool,
+                    block_table_dev,
+                    lists,
+                    attn_ctx.offset(first_row * q_row * 2),
+                    rows as u32,
+                    first_pos as u32,
+                    topk as u32,
+                    self.ratio,
+                    block_size,
+                    nq,
+                    self.nkv_attn,
+                    self.hd_attn,
+                    inv_sqrt_d,
+                    stream,
+                )?;
+            }
+            let l8 = !tc && matches!(
                 std::env::var("ATLAS_QSA_ATTN_L8").as_deref(),
                 Ok("1") | Ok("true")
             ) && ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn);
-            if l8 {
+            if tc {
+                // already dispatched above
+            } else if l8 {
                 ops::qsa_prefill_attn_l8(
                     gpu,
                     self.k_prefill_attn_l8_k,

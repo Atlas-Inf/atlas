@@ -102,6 +102,7 @@ pub struct QsaIndexer {
     /// instead of per head; see `ops::qsa_prefill_attn_grouped_ok`.
     k_prefill_attn_g_k: KernelHandle,
     k_prefill_attn_l8_k: KernelHandle,
+    k_prefill_attn_tc_k: KernelHandle,
 
     qk_scratch: DevicePtr, // [INGEST_SLAB, (n_heads+1)*hd] BF16
     q_post: DevicePtr,     // [n_heads, hd] F32
@@ -184,6 +185,7 @@ impl QsaIndexer {
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
             k_prefill_attn_g_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_g")?,
             k_prefill_attn_l8_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_l8")?,
+            k_prefill_attn_tc_k: super::try_kernel(gpu, "qsa_attn_tc", "qsa_prefill_attn_tc"),
             qk_scratch: gpu.alloc(INGEST_SLAB * qk_width * 2)?,
             q_post: gpu.alloc(n_heads * hd * 4)?,
             scores_dev: gpu.alloc(max_tokens / ratio * 4)?,
