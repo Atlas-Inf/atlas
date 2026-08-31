@@ -98,6 +98,7 @@ pub struct QsaIndexer {
     /// the reference reduction tree locally. See `qsa_score_rows_exact`.
     k_score_rows_exact_k: KernelHandle,
     k_score_rows_gemm_k: KernelHandle,
+    k_score_rows_tc_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
     /// `QSA_PA_G` q-heads per block. Same math, one K/V read per group
     /// instead of per head; see `ops::qsa_prefill_attn_grouped_ok`.
@@ -186,6 +187,7 @@ impl QsaIndexer {
             k_score_rows_b_k: gpu.kernel("qsa_indexer", "qsa_score_rows_b")?,
             k_score_rows_exact_k: gpu.kernel("qsa_indexer", "qsa_score_rows_exact")?,
             k_score_rows_gemm_k: super::try_kernel(gpu, "qsa_indexer", "qsa_score_rows_gemm"),
+            k_score_rows_tc_k: super::try_kernel(gpu, "qsa_score_tc", "qsa_score_rows_tc"),
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
             k_prefill_attn_g_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_g")?,
             k_prefill_attn_l8_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_l8")?,

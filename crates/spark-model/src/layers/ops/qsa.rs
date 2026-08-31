@@ -527,6 +527,62 @@ pub fn qsa_prefill_attn_tc3(
         .launch(stream)
 }
 
+/// Score-tile dimensions of [`qsa_score_rows_tc`]; must match `QSC_BM` /
+/// `QSC_BN` in `qsa_score_tc.cu`.
+pub const QSC_BM: u32 = 16;
+pub const QSC_BN: u32 = 32;
+
+fn qsa_score_rows_tc_smem(n_heads: u32, hd: u32) -> u32 {
+    let ldq = hd + 8;
+    (n_heads * QSC_BM * ldq + QSC_BN * ldq) * 2 + n_heads * QSC_BM * QSC_BN * 4
+}
+
+/// Whether the tensor-core scorer can serve this geometry.
+///
+/// One warp per indexer head, so exactly 4 heads (the block is 128 threads),
+/// and `hd` a multiple of the 16-wide MMA k-step.
+pub fn qsa_score_rows_tc_ok(n_heads: u32, hd: u32) -> bool {
+    n_heads == 4 && hd % 16 == 0 && qsa_score_rows_tc_smem(n_heads, hd) <= 96 * 1024
+}
+
+/// Stage 1 on TENSOR CORES. Same scores as [`qsa_score_rows_exact`] up to the
+/// MMA's contraction order and a BF16 Q; `block_keys` is already BF16.
+///
+/// NOT bit-identical, so it is gated behind `ATLAS_QSA_SCORE_TC` and needs
+/// `scripts/ppl.py`. TTFT_GAP.md 34 prices the BF16 Q half on its own.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_score_rows_tc(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    block_keys: DevicePtr,
+    scores: DevicePtr,
+    rows: u32,
+    n_blocks_max: u32,
+    first_pos: u32,
+    score_stride: u32,
+    ratio: u32,
+    n_heads: u32,
+    hd: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows.div_ceil(QSC_BM), n_blocks_max.div_ceil(QSC_BN), 1])
+        .block([128, 1, 1])
+        .shared_mem(qsa_score_rows_tc_smem(n_heads, hd))
+        .arg_ptr(q)
+        .arg_ptr(block_keys)
+        .arg_ptr(scores)
+        .arg_u32(first_pos)
+        .arg_u32(score_stride)
+        .arg_u32(ratio)
+        .arg_u32(n_heads)
+        .arg_u32(hd)
+        .arg_u32(rows)
+        .arg_u32(n_blocks_max)
+        .launch(stream)
+}
+
 /// Whether the two-kv-head tensor-core attention can serve this geometry.
 ///
 /// One CTA per ROW, holding BOTH kv heads: rows 0..gqa-1 are kv head 0's

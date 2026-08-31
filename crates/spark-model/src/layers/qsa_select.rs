@@ -303,12 +303,39 @@ impl QsaIndexer {
             // and `scripts/ppl.py` -- written AFTER that rejection, precisely
             // because agreement-with-our-own-build is the wrong question for a
             // scorer whose own summation order is arbitrary -- is that gate.
-            let score_gemm = matches!(
+            // `ATLAS_QSA_SCORE_TC=1`: the same scores on tensor cores. See
+            // TTFT_GAP.md 34 -- the BF16-Q half was priced with a probe BEFORE
+            // this kernel was written, and measured BETTER than F32 Q.
+            let score_tc = matches!(
+                std::env::var("ATLAS_QSA_SCORE_TC").as_deref(),
+                Ok("1") | Ok("true")
+            ) && self.k_score_rows_tc_k.0 != 0
+                && ops::qsa_score_rows_tc_ok(self.n_heads, self.hd);
+            if score_tc {
+                ops::qsa_score_rows_tc(
+                    gpu,
+                    self.k_score_rows_tc_k,
+                    qpost,
+                    st.block_keys,
+                    scores,
+                    rows as u32,
+                    n_blocks_max as u32,
+                    first_pos as u32,
+                    stride as u32,
+                    self.ratio,
+                    self.n_heads,
+                    self.hd,
+                    stream,
+                )?;
+            }
+            let score_gemm = !score_tc && matches!(
                 std::env::var("ATLAS_QSA_SCORE_GEMM").as_deref(),
                 Ok("1") | Ok("true")
             ) && self.k_score_rows_gemm_k.0 != 0
                 && ops::qsa_score_rows_gemm_ok(self.n_heads, self.hd);
-            if score_gemm {
+            if score_tc {
+                // already dispatched above
+            } else if score_gemm {
                 ops::qsa_score_rows_gemm(
                     gpu,
                     self.k_score_rows_gemm_k,
