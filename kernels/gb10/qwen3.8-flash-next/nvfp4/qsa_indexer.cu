@@ -973,6 +973,197 @@ extern "C" __global__ void qsa_prefill_attn_g(
     }
 }
 
+// -- 8 lanes per head: a SHORTER reduction, not a smaller one ---------------
+//
+// `qsa_prefill_attn_g` gives every lane 8 elements of hd=256 and reduces each
+// head across all 32 lanes: five butterfly levels, and four heads reduced
+// separately, so TWENTY shuffle instructions per lane per warp-key on a chain
+// five deep.
+//
+// This variant splits the warp into four 8-lane groups. Group `lane>>3` owns
+// ONE head; lane `lane&7` owns 32 contiguous elements of it. The reduction is
+// then three levels inside an 8-lane group -- and because `__shfl_xor_sync`
+// with an offset below 8 never crosses a group, all four heads reduce in the
+// SAME three warp instructions. Twenty shuffles become three, and the
+// dependency chain goes from five levels to three.
+//
+// WHY THIS SHAPE, given the measurements in TTFT_GAP.md 22. Free K/V memory is
+// worth 2.4% here and cutting 24% of the ALU stream is worth 0%, so this kernel
+// is bound by neither traffic nor instruction count. The only two changes that
+// have ever moved it -- removing one shuffle (-0.28 s) and making loads hit
+// cache (-0.61 s) -- both shortened a latency chain. So the target is the
+// chain, and this trades MORE instructions (~175 vs ~150 per lane per
+// warp-key: 32 dot FMAs and 32 accumulator updates instead of 8 and 8x4, four
+// uint4 loads per operand instead of one) for far less serial latency. Under
+// an instruction-count model that is a losing trade; under the latency model
+// the evidence actually supports, it is the right one. The measurement decides.
+//
+// K/V TRAFFIC IS UNCHANGED, which is the part that is easy to get wrong. All
+// four groups read the same 512-byte K row, so each 16-byte segment is
+// requested by four lanes of the same instruction and the coalescer merges
+// them: 512 unique bytes per warp-key, exactly as before. Only the number of
+// load INSTRUCTIONS rises.
+//
+// NOT BIT-IDENTICAL -- and this is a different kind of reassociation from the
+// one that sank the GEMM scorer (16a). There, reassociated scores fed a top-k
+// over thousands of near-tied blocks and flipped the SELECTION. Here the drift
+// lands in the attention output, which feeds the residual stream, so it is
+// ordinary numerical drift. It still needs `scripts/ppl.py` and `kl_drift.py`,
+// because a later layer's indexer top-k is downstream of it.
+#define QSA_L8_LANES 8
+#define QSA_L8_EV    32          // hd / QSA_L8_LANES at hd = 256; the cap
+
+extern "C" __global__ void qsa_prefill_attn_l8(
+    const __nv_bfloat16* __restrict__ q,        // [rows, nq, hd] (roped)
+    const __nv_bfloat16* __restrict__ k_cache,  // paged NHD
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ lists,              // [rows, topk] block ids
+    __nv_bfloat16* __restrict__ attn_out,       // [rows, nq, hd]
+    const unsigned int first_pos,
+    const unsigned int topk,
+    const unsigned int ratio,
+    const unsigned int block_size,
+    const unsigned int nq,
+    const unsigned int nkv,
+    const unsigned int hd,
+    const float inv_sqrt_d
+) {
+    const unsigned int r = blockIdx.x;
+    const unsigned int qh0 = blockIdx.y * QSA_PA_G;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int gsub = lane >> 3;         // head within the group
+    const unsigned int sub = lane & 7u;          // slice of hd
+    const unsigned int pos = first_pos + r;
+    const unsigned int complete = (pos + 1) / ratio;
+    const unsigned int tail = (pos + 1) - complete * ratio;
+    const unsigned int n_tok = topk * ratio + tail;
+    const unsigned int kvh = qh0 / (nq / nkv);
+    const unsigned int row_elems = nkv * hd;
+    const unsigned long long page_stride = (unsigned long long)block_size * row_elems;
+    const unsigned int ev = hd / QSA_L8_LANES;   // elements per lane
+    const unsigned int nch = ev >> 3;            // 16-byte chunks per lane
+    const unsigned int vec = hd / 32;            // epilogue only
+
+    extern __shared__ float smem[];
+    float* acc_w = smem;                                    // [WARPS][G][hd]
+    float* m_w = smem + QSA_PA_WARPS * QSA_PA_G * hd;       // [WARPS][G]
+    float* l_w = m_w + QSA_PA_WARPS * QSA_PA_G;             // [WARPS][G]
+
+    float qreg[QSA_L8_EV];
+    {
+        const __nv_bfloat16* qrow = q + ((size_t)r * nq + qh0 + gsub) * hd;
+        #pragma unroll
+        for (unsigned int e = 0; e < QSA_L8_EV; ++e) {
+            qreg[e] = (e < ev) ? (float)qrow[sub * ev + e] : 0.0f;
+        }
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc[QSA_L8_EV];
+    #pragma unroll
+    for (unsigned int e = 0; e < QSA_L8_EV; ++e) acc[e] = 0.0f;
+
+    const int* my_list = lists + (size_t)r * topk;
+    const bool ratio_p2 = ratio != 0u && (ratio & (ratio - 1u)) == 0u;
+    const bool bs_p2 = block_size != 0u && (block_size & (block_size - 1u)) == 0u;
+    const unsigned int ratio_sh = ratio_p2 ? (unsigned int)(__ffs((int)ratio) - 1) : 0u;
+    const unsigned int ratio_mask = ratio_p2 ? (ratio - 1u) : 0u;
+    const unsigned int bs_sh = bs_p2 ? (unsigned int)(__ffs((int)block_size) - 1) : 0u;
+    const unsigned int bs_mask = bs_p2 ? (block_size - 1u) : 0u;
+    const unsigned int topk_ratio = topk * ratio;
+
+    for (unsigned int t = warp; t < n_tok; t += QSA_PA_WARPS) {
+        const unsigned long long off =
+            qsa_key_off(t, topk_ratio, ratio, ratio_p2, ratio_sh, ratio_mask,
+                        complete, block_size, bs_p2, bs_sh, bs_mask,
+                        my_list, block_table, page_stride, row_elems, kvh, hd);
+        // `off` is a multiple of hd and `sub * ev` a multiple of 32 elements,
+        // so every `+ c * 8` address below is 16-byte aligned.
+        const __nv_bfloat16* krow = k_cache + off + sub * ev;
+        const __nv_bfloat16* vrow = v_cache + off + sub * ev;
+
+        float dot = 0.0f;
+        #pragma unroll
+        for (unsigned int c = 0; c < (QSA_L8_EV >> 3); ++c) {
+            if (c < nch) {
+                const uint4 kraw = *reinterpret_cast<const uint4*>(krow + c * 8);
+                const __nv_bfloat16* kp = reinterpret_cast<const __nv_bfloat16*>(&kraw);
+                #pragma unroll
+                for (unsigned int e = 0; e < 8; ++e) {
+                    dot += qreg[c * 8 + e] * (float)kp[e];
+                }
+            }
+        }
+        // Three levels, not five -- and offsets below 8 never leave the 8-lane
+        // group, so all four heads reduce in these same three instructions.
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, o);
+        dot *= inv_sqrt_d;
+
+        const float m_new = fmaxf(m, dot);
+        const float scale = __expf(m - m_new);
+        const float p = __expf(dot - m_new);
+        l = l * scale + p;
+        #pragma unroll
+        for (unsigned int c = 0; c < (QSA_L8_EV >> 3); ++c) {
+            if (c < nch) {
+                const uint4 vraw = *reinterpret_cast<const uint4*>(vrow + c * 8);
+                const __nv_bfloat16* vp = reinterpret_cast<const __nv_bfloat16*>(&vraw);
+                #pragma unroll
+                for (unsigned int e = 0; e < 8; ++e) {
+                    acc[c * 8 + e] = acc[c * 8 + e] * scale + p * (float)vp[e];
+                }
+            }
+        }
+        m = m_new;
+    }
+
+    {
+        float* dst = acc_w + ((size_t)warp * QSA_PA_G + gsub) * hd;
+        #pragma unroll
+        for (unsigned int e = 0; e < QSA_L8_EV; ++e) {
+            if (e < ev) dst[sub * ev + e] = acc[e];
+        }
+        if (sub == 0) {
+            m_w[warp * QSA_PA_G + gsub] = m;
+            l_w[warp * QSA_PA_G + gsub] = l;
+        }
+    }
+    __syncthreads();
+
+    // Merge is UNCHANGED from `qsa_prefill_attn_g`: `acc_w` has the identical
+    // [WARPS][G][hd] layout, so the same warp-per-head, same `w` order.
+    if (warp < QSA_PA_G) {
+        const unsigned int g = warp;
+        float m_tot = -1e30f;
+        for (unsigned int w = 0; w < QSA_PA_WARPS; ++w) {
+            m_tot = fmaxf(m_tot, m_w[w * QSA_PA_G + g]);
+        }
+        float l_tot = 0.0f;
+        float out[8];
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) out[e] = 0.0f;
+        for (unsigned int w = 0; w < QSA_PA_WARPS; ++w) {
+            const float sc = __expf(m_w[w * QSA_PA_G + g] - m_tot);
+            l_tot += l_w[w * QSA_PA_G + g] * sc;
+            const float* srcw = acc_w + ((size_t)w * QSA_PA_G + g) * hd;
+            #pragma unroll
+            for (unsigned int e = 0; e < 8; ++e) {
+                if (e < vec) out[e] += srcw[lane * vec + e] * sc;
+            }
+        }
+        const float inv_l = (l_tot > 0.0f) ? 1.0f / l_tot : 0.0f;
+        __nv_bfloat16* orow = attn_out + ((size_t)r * nq + qh0 + g) * hd;
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) {
+            if (e < vec) orow[lane * vec + e] = __float2bfloat16(out[e] * inv_l);
+        }
+    }
+}
+
 extern "C" __global__ void qsa_prefill_attn(
     const __nv_bfloat16* __restrict__ q,        // [rows, nq, hd] (roped)
     const __nv_bfloat16* __restrict__ k_cache,  // paged NHD

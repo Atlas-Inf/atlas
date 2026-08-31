@@ -496,11 +496,75 @@ pub fn qsa_prefill_attn_grouped_ok(nq: u32, nkv: u32, hd: u32) -> bool {
     nkv != 0
         && nq % QSA_PA_G == 0
         && (nq / nkv) % QSA_PA_G == 0
-        && qsa_prefill_attn_g_smem(hd) <= 48 * 1024
+        // The runtime opts in to >48 KB dynamic shared automatically
+        // (registry.rs sets CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES),
+        // so the old 48 KB cap here was self-imposed, not a hardware limit.
+        && qsa_prefill_attn_g_smem(hd) <= 96 * 1024
 }
 
 fn qsa_prefill_attn_g_smem(hd: u32) -> u32 {
     (8 * QSA_PA_G * hd + 2 * 8 * QSA_PA_G) * 4
+}
+
+/// Whether the 8-lanes-per-head variant can serve this geometry.
+///
+/// Everything `qsa_prefill_attn_grouped_ok` needs, plus: the warp must split
+/// into `QSA_PA_G` groups of 8 (so `QSA_PA_G * 8 == 32`), and each lane's slice
+/// `hd / 8` must be a whole number of 16-byte chunks and fit `QSA_L8_EV`.
+pub fn qsa_prefill_attn_l8_ok(nq: u32, nkv: u32, hd: u32) -> bool {
+    qsa_prefill_attn_grouped_ok(nq, nkv, hd)
+        && QSA_PA_G * 8 == 32
+        && hd % 64 == 0
+        && hd / 8 <= 32
+}
+
+/// Stage 2, 8 lanes per head. Same selected set, same per-head online softmax
+/// and same cross-warp merge as [`qsa_prefill_attn_g`]; it reduces each head
+/// across 8 lanes instead of 32, which is three butterfly levels instead of
+/// five and three shuffle instructions per warp-key instead of twenty.
+///
+/// NOT bit-identical -- the dot-product summation tree changes -- so it is
+/// gated behind `ATLAS_QSA_ATTN_L8` and needs `scripts/ppl.py`.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_prefill_attn_l8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    block_table: DevicePtr,
+    lists: DevicePtr,
+    attn_out: DevicePtr,
+    rows: u32,
+    first_pos: u32,
+    topk: u32,
+    ratio: u32,
+    block_size: u32,
+    nq: u32,
+    nkv: u32,
+    hd: u32,
+    inv_sqrt_d: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, nq / QSA_PA_G, 1])
+        .block([256, 1, 1])
+        .shared_mem(qsa_prefill_attn_g_smem(hd))
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(block_table)
+        .arg_ptr(lists)
+        .arg_ptr(attn_out)
+        .arg_u32(first_pos)
+        .arg_u32(topk)
+        .arg_u32(ratio)
+        .arg_u32(block_size)
+        .arg_u32(nq)
+        .arg_u32(nkv)
+        .arg_u32(hd)
+        .arg_f32(inv_sqrt_d)
+        .launch(stream)
 }
 
 /// Stage 2, `QSA_PA_G` q-heads per block. Same math and same accumulation
