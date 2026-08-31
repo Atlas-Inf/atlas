@@ -461,7 +461,35 @@ impl QsaIndexer {
             // was 3.70 s, 32.6% of a 12.3 s window, moving ~51 GB of L2
             // traffic per launch. Same accumulation order, so same bits; the
             // one-head kernel stays for geometries the group cannot divide.
-            if ops::qsa_prefill_attn_grouped_ok(nq, self.nkv_attn, self.hd_attn) {
+            // `ATLAS_QSA_ATTN_L8` selects the 8-lanes-per-head reduction. It
+            // is NOT bit-identical (the dot-product tree changes), so it is
+            // opt-in and gated on `scripts/ppl.py`; see TTFT_GAP.md 22.
+            let l8 = matches!(
+                std::env::var("ATLAS_QSA_ATTN_L8").as_deref(),
+                Ok("1") | Ok("true")
+            ) && ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn);
+            if l8 {
+                ops::qsa_prefill_attn_l8(
+                    gpu,
+                    self.k_prefill_attn_l8_k,
+                    q_roped.offset(first_row * q_row * 2),
+                    k_pool,
+                    v_pool,
+                    block_table_dev,
+                    lists,
+                    attn_ctx.offset(first_row * q_row * 2),
+                    rows as u32,
+                    first_pos as u32,
+                    topk as u32,
+                    self.ratio,
+                    block_size,
+                    nq,
+                    self.nkv_attn,
+                    self.hd_attn,
+                    inv_sqrt_d,
+                    stream,
+                )?;
+            } else if ops::qsa_prefill_attn_grouped_ok(nq, self.nkv_attn, self.hd_attn) {
                 ops::qsa_prefill_attn_g(
                     gpu,
                     self.k_prefill_attn_g_k,
