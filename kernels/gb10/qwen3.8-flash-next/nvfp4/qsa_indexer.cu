@@ -467,15 +467,30 @@ extern "C" __global__ void qsa_score_rows_exact(
             const float* qg = qh + g * 32u;
             const float* kg = krow + g * 32u;
             float t[8];
+#ifdef QSA_SCORE_PROBE_BF16_Q
+            // MEASUREMENT PROBE ONLY -- NEVER SHIP.
+            // Prices the PRECISION half of a tensor-core scorer without writing
+            // one. `block_keys` is already BF16; a tensor-core scorer would
+            // additionally have to round Q from F32, and TTFT_GAP.md 30a's
+            // "+0.036% for reassociation" does NOT cover that -- a BF16 Q is a
+            // ~1e4x larger perturbation than the 4.2e-7 that measured. So round
+            // Q here, in the otherwise-exact kernel, and let ppl.py say what it
+            // costs. Everything else -- the summation tree, the K values, the
+            // ordering -- is untouched, so the delta is Q precision ALONE.
+            #define QSA_PQ(x) __bfloat162float(__float2bfloat16(x))
+#else
+            #define QSA_PQ(x) (x)
+#endif
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 // offsets 16 then 8, in the reference's associativity
-                const float x0 = __fmul_rn(qg[i], kg[i]);
-                const float x1 = __fmul_rn(qg[i + 16], kg[i + 16]);
-                const float x2 = __fmul_rn(qg[i + 8], kg[i + 8]);
-                const float x3 = __fmul_rn(qg[i + 24], kg[i + 24]);
+                const float x0 = __fmul_rn(QSA_PQ(qg[i]), kg[i]);
+                const float x1 = __fmul_rn(QSA_PQ(qg[i + 16]), kg[i + 16]);
+                const float x2 = __fmul_rn(QSA_PQ(qg[i + 8]), kg[i + 8]);
+                const float x3 = __fmul_rn(QSA_PQ(qg[i + 24]), kg[i + 24]);
                 t[i] = __fadd_rn(__fadd_rn(x0, x1), __fadd_rn(x2, x3));
             }
+            #undef QSA_PQ
             #pragma unroll
             for (int i = 0; i < 4; ++i) t[i] = __fadd_rn(t[i], t[i + 4]);
             #pragma unroll
