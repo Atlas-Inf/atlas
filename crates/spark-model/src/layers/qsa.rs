@@ -101,6 +101,7 @@ pub struct QsaIndexer {
     /// One thread per score, BIT-IDENTICAL to `k_score_rows_k`: it replays
     /// the reference reduction tree locally. See `qsa_score_rows_exact`.
     k_score_rows_exact_k: KernelHandle,
+    k_score_rows_gemm_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
     k_select_k: KernelHandle,
     /// `ATLAS_QSA_DEVICE_TOPK=1`: select on the device (no per-layer host
@@ -209,6 +210,7 @@ impl QsaIndexer {
             k_topk_rows_k: gpu.kernel("qsa_indexer", "qsa_topk_rows")?,
             k_score_rows_b_k: gpu.kernel("qsa_indexer", "qsa_score_rows_b")?,
             k_score_rows_exact_k: gpu.kernel("qsa_indexer", "qsa_score_rows_exact")?,
+            k_score_rows_gemm_k: super::try_kernel(gpu, "qsa_indexer", "qsa_score_rows_gemm"),
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
             k_select_k: gpu.kernel("qsa_indexer", "qsa_select_topk")?,
             device_topk: std::env::var("ATLAS_QSA_DEVICE_TOPK").ok().as_deref() == Some("1"),

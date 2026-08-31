@@ -283,9 +283,50 @@ impl QsaIndexer {
             // acceptance, vs the llama.cpp reference), so 69.3% is not close,
             // and needle recall passing is exactly why it is not the deciding
             // metric. Kept in-tree, exercised by
-            // `qsa_score_rows_gemm_vs_reference_drift`, dispatch-disabled until
-            // someone runs the real quality gate.
-            if ops::qsa_score_rows_exact_ok(self.n_heads, self.hd) {
+            // `qsa_score_rows_gemm_vs_reference_drift`.
+            //
+            // THE REAL QUALITY GATE HAS NOW BEEN RUN, and it says the rejection
+            // above was measuring the wrong thing. `scripts/ppl.py` -- written
+            // after that verdict, precisely because agreement-with-our-own-build
+            // is meaningless for a scorer whose own summation order is arbitrary
+            // -- puts this arm at **+0.036% above-bound perplexity**, with the
+            // dense control at 0.000%. So the change that scored 69.3% top-1
+            // agreement costs 0.036% of the only absolute measure available.
+            // Calibrate future QSA verdicts against that pair.
+            //
+            // It still does NOT ship, for a different and simpler reason: the
+            // 3.2 s it was worth in that note was against the OLD scorer.
+            // `qsa_score_rows_exact` has since taken that win bit-identically,
+            // and against it the GEMM arm measures **-0.06 s** at ctx 31481 --
+            // inside run-to-run noise. There is no speed left to trade for even
+            // a 0.036% regression, so it stays off (`ATLAS_QSA_SCORE_GEMM=1`).
+            // `ATLAS_QSA_SCORE_GEMM=1` wires that third arm. The comment above
+            // says "dispatch-disabled until someone runs the real quality gate",
+            // and `scripts/ppl.py` -- written AFTER that rejection, precisely
+            // because agreement-with-our-own-build is the wrong question for a
+            // scorer whose own summation order is arbitrary -- is that gate.
+            let score_gemm = matches!(
+                std::env::var("ATLAS_QSA_SCORE_GEMM").as_deref(),
+                Ok("1") | Ok("true")
+            ) && self.k_score_rows_gemm_k.0 != 0
+                && ops::qsa_score_rows_gemm_ok(self.n_heads, self.hd);
+            if score_gemm {
+                ops::qsa_score_rows_gemm(
+                    gpu,
+                    self.k_score_rows_gemm_k,
+                    qpost,
+                    st.block_keys,
+                    scores,
+                    rows as u32,
+                    n_blocks_max as u32,
+                    first_pos as u32,
+                    stride as u32,
+                    self.ratio,
+                    self.n_heads,
+                    self.hd,
+                    stream,
+                )?;
+            } else if ops::qsa_score_rows_exact_ok(self.n_heads, self.hd) {
                 ops::qsa_score_rows_exact(
                     gpu,
                     self.k_score_rows_exact_k,
