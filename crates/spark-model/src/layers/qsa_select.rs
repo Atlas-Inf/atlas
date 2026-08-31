@@ -262,6 +262,29 @@ impl QsaIndexer {
             // shared once. Identical arithmetic -- same reduction, same order --
             // which matters because these scores feed a top-k, so a shifted
             // score changes WHICH blocks are attended.
+            // SCORER. `_b` gives each CTA QSA_SR_B b-values and stages the
+            // row's `q` in shared, bit-identically; the original is one CTA per
+            // output scalar. The fallback is a shared-memory bound, not policy.
+            //
+            // A third arm exists and is NOT wired here: `qsa_score_rows_gemm`
+            // drops the four block-wide reductions per output (one thread per
+            // score, serial `d` contraction) and is worth **3.2 s of a 29.5 s
+            // 30k prefill** — but it reassociates the contraction, and these
+            // scores pick which blocks a query reads. Gated and REJECTED:
+            //
+            //   needle recall (scripts/lc_check.py)     12/12, unchanged
+            //   kl_drift --precision-change             top-1 69.3%
+            //   score drift vs reference                4.2e-7 rel, 44% bit-exact
+            //
+            // The kernel is correct — 4.2e-7 is ordinary FP32 reassociation over
+            // 128 terms. The top-k amplifies it: near-ties either side of the
+            // 512th block flip, and the attended set genuinely changes. The
+            // project's own QSA bar is **>=98% top-1 agreement** (Phase 4
+            // acceptance, vs the llama.cpp reference), so 69.3% is not close,
+            // and needle recall passing is exactly why it is not the deciding
+            // metric. Kept in-tree, exercised by
+            // `qsa_score_rows_gemm_vs_reference_drift`, dispatch-disabled until
+            // someone runs the real quality gate.
             if ops::qsa_score_rows_b_ok(self.n_heads, self.hd) {
                 ops::qsa_score_rows_b(
                     gpu,
@@ -295,7 +318,6 @@ impl QsaIndexer {
                 stream,
             )?;
             }
-
             // SELECTION. On the GPU when the shape allows it: `qsa_topk_rows`
             // produces byte-for-byte the same list, in the same order, without
             // moving the score matrix anywhere. The host path below is the

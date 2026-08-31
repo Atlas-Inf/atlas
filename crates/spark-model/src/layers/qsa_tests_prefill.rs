@@ -497,6 +497,95 @@ fn qsa_topk_rows_matches_host_selection() {
     println!("qsa_topk_rows == host selection on {rows} rows x {topk}");
 }
 
+/// How far `qsa_score_rows_gemm` moves the scores away from `qsa_score_rows`.
+///
+/// This is a DISCRIMINATOR, not a gate. The GEMM scorer contracts `d` serially
+/// per thread instead of through a block-wide tree, so the scores must differ —
+/// the question is by how much. A relative difference at the 1e-6 level is
+/// ordinary FP32 reassociation over 128 terms, and any downstream behaviour
+/// change is the top-k amplifying it (near-tied blocks either side of the 512th
+/// place). Anything larger is a bug in the kernel, and the two cases call for
+/// completely different responses.
+#[test]
+#[ignore]
+fn qsa_score_rows_gemm_vs_reference_drift() {
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL='*'");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let stream = g.default_stream();
+    let k_ref = g.kernel("qsa_indexer", "qsa_score_rows").unwrap();
+    let k_gemm = g.kernel("qsa_indexer", "qsa_score_rows_gemm").unwrap();
+
+    let (rows, n_heads, hd, ratio) = (37usize, 4usize, 128usize, 4usize);
+    let first_pos = 5000usize;
+    let n_blocks_max = (first_pos + rows) / ratio;
+    let stride = n_blocks_max + 8;
+
+    let mut s = 0x9E3779B97F4A7C15u64;
+    let mut nextf = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f32 / 1024.0) - 12.0
+    };
+    let bf = |v: f32| -> u16 { (v.to_bits() >> 16) as u16 };
+
+    let q_host: Vec<f32> = (0..rows * n_heads * hd).map(|_| nextf()).collect();
+    let k_host: Vec<u16> = (0..n_blocks_max * hd).map(|_| bf(nextf())).collect();
+
+    let q_dev = upload(g, &q_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let k_dev = upload(g, &k_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let a_dev = g.alloc(rows * stride * 4).unwrap();
+    let b_dev = g.alloc(rows * stride * 4).unwrap();
+
+    ops::qsa_score_rows(
+        g, k_ref, q_dev, k_dev, a_dev, rows as u32, n_blocks_max as u32,
+        first_pos as u32, stride as u32, ratio as u32, n_heads as u32, hd as u32, stream,
+    )
+    .unwrap();
+    ops::qsa_score_rows_gemm(
+        g, k_gemm, q_dev, k_dev, b_dev, rows as u32, n_blocks_max as u32,
+        first_pos as u32, stride as u32, ratio as u32, n_heads as u32, hd as u32, stream,
+    )
+    .unwrap();
+    g.synchronize(stream).unwrap();
+
+    let a = dl_f32(g, a_dev, rows * stride);
+    let b = dl_f32(g, b_dev, rows * stride);
+
+    let mut worst_rel = 0.0f64;
+    let mut worst_abs = 0.0f64;
+    let mut n_cmp = 0usize;
+    let mut exact = 0usize;
+    for r in 0..rows {
+        let complete = (first_pos + r + 1) / ratio;
+        for bb in 0..complete {
+            let (x, y) = (a[r * stride + bb] as f64, b[r * stride + bb] as f64);
+            n_cmp += 1;
+            if x.to_bits() == y.to_bits() {
+                exact += 1;
+            }
+            let d = (x - y).abs();
+            worst_abs = worst_abs.max(d);
+            if x.abs() > 1e-6 {
+                worst_rel = worst_rel.max(d / x.abs());
+            }
+        }
+    }
+    println!(
+        "qsa_score_rows_gemm vs reference: {n_cmp} scores, {exact} bit-exact, \
+         worst abs {worst_abs:.3e}, worst rel {worst_rel:.3e}"
+    );
+    // 1e-4 is far above FP32 reassociation over 128 terms and far below a
+    // wrong-layout bug, so it separates the two cases cleanly.
+    assert!(
+        worst_rel < 1e-4,
+        "score drift {worst_rel:.3e} is too large to be reassociation — kernel bug"
+    );
+}
+
 /// Minimal repro for the dense chunk-0 flash zeroing rows past ~1280 at
 /// qwen4_exp geometry (nq=24, nkv=2, hd=256, causal, seq 2809). Synthetic
 /// q/k/v, CPU reference at probe rows. If this passes, the corruption is in

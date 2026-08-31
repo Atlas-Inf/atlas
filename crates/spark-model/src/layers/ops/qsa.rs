@@ -231,6 +231,60 @@ pub fn qsa_score_rows(
         .launch(stream)
 }
 
+/// Score-tile dimensions of [`qsa_score_rows_gemm`]; must match `QSA_SG_BM` /
+/// `QSA_SG_BN` in `qsa_indexer.cu`, and their product is the block width.
+pub const QSA_SG_BM: u32 = 8;
+pub const QSA_SG_BN: u32 = 32;
+
+fn qsa_score_rows_gemm_smem(n_heads: u32, hd: u32) -> u32 {
+    (QSA_SG_BM * n_heads * hd + QSA_SG_BN * (hd + 1)) * 4
+}
+
+/// Whether the tiled-GEMM scorer fits this geometry.
+pub fn qsa_score_rows_gemm_ok(n_heads: u32, hd: u32) -> bool {
+    qsa_score_rows_gemm_smem(n_heads, hd) <= 48 * 1024
+}
+
+/// Per-row block scores as a tiled GEMM: one thread per score, contracting
+/// serially over `hd`, with no block-wide reductions at all.
+///
+/// NOT bit-identical to [`qsa_score_rows`] — the `d` contraction is
+/// reassociated. Gate with `lc_subset.py` + `kl_drift.py --precision-change`
+/// and `lc_check.py` needle recall; these scores choose which blocks a query
+/// reads, so a KL check alone is not sufficient evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_score_rows_gemm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    block_keys: DevicePtr,
+    scores: DevicePtr,
+    rows: u32,
+    n_blocks_max: u32,
+    first_pos: u32,
+    score_stride: u32,
+    ratio: u32,
+    n_heads: u32,
+    hd: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows.div_ceil(QSA_SG_BM), n_blocks_max.div_ceil(QSA_SG_BN), 1])
+        .block([QSA_SG_BM * QSA_SG_BN, 1, 1])
+        .shared_mem(qsa_score_rows_gemm_smem(n_heads, hd))
+        .arg_ptr(q)
+        .arg_ptr(block_keys)
+        .arg_ptr(scores)
+        .arg_u32(first_pos)
+        .arg_u32(score_stride)
+        .arg_u32(ratio)
+        .arg_u32(n_heads)
+        .arg_u32(hd)
+        .arg_u32(rows)
+        .arg_u32(n_blocks_max)
+        .launch(stream)
+}
+
 /// `b` values per block in [`qsa_score_rows_b`]; must match `QSA_SR_B` in
 /// `qsa_indexer.cu`.
 pub const QSA_SR_B: u32 = 16;
