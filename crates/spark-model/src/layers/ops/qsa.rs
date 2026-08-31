@@ -202,6 +202,59 @@ pub fn qsa_score_rows(
         .launch(stream)
 }
 
+/// `b` values per block in [`qsa_score_rows_b`]; must match `QSA_SR_B` in
+/// `qsa_indexer.cu`.
+pub const QSA_SR_B: u32 = 16;
+
+/// Shared bytes [`qsa_score_rows_b`] needs: the reduction scratch plus one
+/// staged copy of the row's `q`.
+fn qsa_score_rows_b_smem(n_heads: u32, hd: u32) -> u32 {
+    (32 + n_heads * hd) * 4
+}
+
+/// Whether the tiled scorer fits this geometry.
+pub fn qsa_score_rows_b_ok(n_heads: u32, hd: u32) -> bool {
+    qsa_score_rows_b_smem(n_heads, hd) <= 48 * 1024
+}
+
+/// Per-row block scores, QSA_SR_B outputs per block.
+///
+/// Identical arithmetic to [`qsa_score_rows`] -- same reduction over the same
+/// 128 threads, same `hh` order, same scale -- with `q` staged in shared once
+/// per block instead of re-read per output, and QSA_SR_B fewer blocks. See the
+/// kernel note for why bit-identity is a requirement here and not a nicety.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_score_rows_b(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    block_keys: DevicePtr,
+    scores: DevicePtr,
+    rows: u32,
+    n_blocks_max: u32,
+    first_pos: u32,
+    score_stride: u32,
+    ratio: u32,
+    n_heads: u32,
+    hd: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, n_blocks_max.div_ceil(QSA_SR_B), 1])
+        .block([hd, 1, 1])
+        .shared_mem(qsa_score_rows_b_smem(n_heads, hd))
+        .arg_ptr(q)
+        .arg_ptr(block_keys)
+        .arg_ptr(scores)
+        .arg_u32(first_pos)
+        .arg_u32(score_stride)
+        .arg_u32(ratio)
+        .arg_u32(n_heads)
+        .arg_u32(hd)
+        .arg_u32(n_blocks_max)
+        .launch(stream)
+}
+
 /// Block width of [`qsa_topk_rows`]; must match `QSA_TOPK_K` in
 /// `qsa_indexer.cu`, and bounds the `topk` it can serve.
 pub const QSA_TOPK_K: u32 = 512;

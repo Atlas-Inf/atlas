@@ -90,6 +90,9 @@ pub struct QsaIndexer {
     /// Per-row top-k block selection, on the GPU. Replaces a D2H of the
     /// whole score matrix plus a host sort per row; see `qsa_topk_rows`.
     k_topk_rows_k: KernelHandle,
+    /// Tiled scorer: QSA_SR_B outputs per block, bit-identical to
+    /// `k_score_rows_k`. See `qsa_score_rows_b`.
+    k_score_rows_b_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
     /// `QSA_PA_G` q-heads per block. Same math, one K/V read per group
     /// instead of per head; see `ops::qsa_prefill_attn_grouped_ok`.
@@ -164,6 +167,7 @@ impl QsaIndexer {
             k_qprep_rows_k: gpu.kernel("qsa_indexer", "qsa_qprep_rows")?,
             k_score_rows_k: gpu.kernel("qsa_indexer", "qsa_score_rows")?,
             k_topk_rows_k: gpu.kernel("qsa_indexer", "qsa_topk_rows")?,
+            k_score_rows_b_k: gpu.kernel("qsa_indexer", "qsa_score_rows_b")?,
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
             k_prefill_attn_g_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_g")?,
             qk_scratch: gpu.alloc(INGEST_SLAB * qk_width * 2)?,

@@ -254,9 +254,16 @@ impl QsaIndexer {
                 stream,
             )?;
             let n_blocks_max = (first_pos + rows) / ratio; // last row's complete
-            ops::qsa_score_rows(
-                gpu,
-                self.k_score_rows_k,
+            // One 128-thread block per OUTPUT SCALAR is 1.397 BILLION blocks
+            // over a 30k prefill, for 512 MACs each. The tiled scorer gives a
+            // block QSA_SR_B consecutive `b` values and stages the row's `q` in
+            // shared once. Identical arithmetic -- same reduction, same order --
+            // which matters because these scores feed a top-k, so a shifted
+            // score changes WHICH blocks are attended.
+            if ops::qsa_score_rows_b_ok(self.n_heads, self.hd) {
+                ops::qsa_score_rows_b(
+                    gpu,
+                    self.k_score_rows_b_k,
                 qpost,
                 st.block_keys,
                 scores,
@@ -269,6 +276,23 @@ impl QsaIndexer {
                 self.hd,
                 stream,
             )?;
+            } else {
+                ops::qsa_score_rows(
+                    gpu,
+                    self.k_score_rows_k,
+                qpost,
+                st.block_keys,
+                scores,
+                rows as u32,
+                n_blocks_max as u32,
+                first_pos as u32,
+                stride as u32,
+                self.ratio,
+                self.n_heads,
+                self.hd,
+                stream,
+            )?;
+            }
 
             // SELECTION. On the GPU when the shape allows it: `qsa_topk_rows`
             // produces byte-for-byte the same list, in the same order, without
