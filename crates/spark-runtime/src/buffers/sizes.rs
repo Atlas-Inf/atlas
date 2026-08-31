@@ -7,6 +7,12 @@ use atlas_core::device::sm121::NUM_SMS;
 
 use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 
+/// QSA stage-2 prefill-selection scratch row cap (Qwen3.8-Flash-Next): the
+/// arena is slabbed at this many selective rows, and the consumer
+/// (`spark-model` `qsa_select.rs`) must slab identically — a drift is a
+/// silent buffer-overrun or under-allocation.
+pub const QSA_SELECT_SCRATCH_ROWS: usize = 2048;
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -537,14 +543,14 @@ impl BufferSizes {
                 256
             },
             qsa_select_scratch: if config.index_topk > 0 && config.index_compress_ratio > 0 {
-                const ROWS: usize = 2048;
+                let rows = QSA_SELECT_SCRATCH_ROWS;
                 let qkw = (config.index_n_heads + 1) * config.index_head_dim;
                 let n_blocks = max_seq_len.div_ceil(config.index_compress_ratio);
                 let topk = config.index_topk / config.index_compress_ratio;
-                ROWS * qkw * 2
-                    + ROWS * config.index_n_heads * config.index_head_dim * 4
-                    + ROWS * n_blocks * 4
-                    + ROWS * topk * 4
+                rows * qkw * 2
+                    + rows * config.index_n_heads * config.index_head_dim * 4
+                    + rows * n_blocks * 4
+                    + rows * topk * 4
             } else {
                 256
             },

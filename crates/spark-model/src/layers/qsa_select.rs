@@ -6,6 +6,7 @@
 //! reachable without widening their visibility.
 
 use anyhow::{Context, Result};
+use spark_runtime::buffers::QSA_SELECT_SCRATCH_ROWS;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::{QsaIndexer, QsaSeqState};
@@ -133,7 +134,7 @@ impl QsaIndexer {
             .collect();
         gpu.copy_h2d_async(&tbytes, self.prefill_table_dev, stream)?;
         let block_table_dev = self.prefill_table_dev;
-        const ROWS: usize = 2048; // must match sizes.rs qsa_select_scratch
+        let row_cap = QSA_SELECT_SCRATCH_ROWS; // shared with sizes.rs qsa_select_scratch
         let ratio = self.ratio as usize;
         let topk = self.block_topk as usize;
         let heads = self.n_heads as usize;
@@ -146,16 +147,16 @@ impl QsaIndexer {
         // allowance because total context never exceeds max_seq_len).
         let stride = total.div_ceil(ratio);
         let qk_buf = scratch;
-        let qpost = scratch.offset(ROWS * qkw * 2);
-        let scores = qpost.offset(ROWS * heads * hd * 4);
-        let lists = scores.offset(ROWS * stride * 4);
+        let qpost = scratch.offset(row_cap * qkw * 2);
+        let scores = qpost.offset(row_cap * heads * hd * 4);
+        let lists = scores.offset(row_cap * stride * 4);
 
         // First selective GLOBAL position, and its chunk-local row.
         let first_sel_pos = bound.max(seq_start);
         let n_sel_total = total - first_sel_pos;
         let mut slab = 0usize;
         while slab < n_sel_total {
-            let rows = ROWS.min(n_sel_total - slab);
+            let rows = row_cap.min(n_sel_total - slab);
             let first_pos = first_sel_pos + slab; // GLOBAL position
             let first_row = first_pos - seq_start; // chunk-local buffer row
 
