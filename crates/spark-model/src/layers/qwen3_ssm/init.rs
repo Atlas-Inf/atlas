@@ -132,14 +132,18 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule",
                 "gated_delta_rule_decode_f32",
             ),
-            gdn_f32_norm_k: super::super::try_kernel(
+            // These two fuse the gated RMS norm into the decode kernel and
+            // hard-code SiLU; qwen4_exp needs sigmoid. See
+            // `kernel_select::fused_gated_norm_kernel` for why the lookup is
+            // SKIPPED rather than allowed to fail.
+            gdn_f32_norm_k: super::kernel_select::fused_gated_norm_kernel(
+                config,
                 gpu,
-                "gated_delta_rule",
                 "gated_delta_rule_decode_f32_norm",
             ),
-            gdn_f32_conv_norm_k: super::super::try_kernel(
+            gdn_f32_conv_norm_k: super::kernel_select::fused_gated_norm_kernel(
+                config,
                 gpu,
-                "gated_delta_rule",
                 "gated_delta_rule_decode_f32_conv_norm",
             ),
             gdn_f32_strided_k: super::super::try_kernel(

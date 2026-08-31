@@ -139,6 +139,36 @@ pub(super) fn gated_norm_kernel(
     }
 }
 
+/// Resolve a FUSED gated-norm decode kernel, but ONLY for a model whose gate
+/// this kernel family actually implements.
+///
+/// `gated_delta_rule_decode_f32_norm` and `..._conv_norm` fold the gated RMS
+/// norm into the decode kernel and hard-code SiLU (`g / (1 + exp(-g))`), the
+/// same gate `gated_rms_norm` uses. `qwen4_exp` declares
+/// `output_gate_type = "sigmoid"` and needs `1 / (1 + exp(-g))`. There is no
+/// `..._sigmoid` twin of either, so on such a model the fused path silently
+/// swapped the model's gate: `--gdn-fused-norm` produced fluent garbage,
+/// reproduced byte-identically across restarts, with no warning.
+///
+/// SKIP the lookup rather than issue one that cannot resolve — same reason as
+/// [`hc_kernel`]. An un-issued lookup leaves no failed row in the fail-closed
+/// startup audit, whereas a failed one aborts startup complaining about a
+/// "silent fallback path" that is in fact the correct separate-norm path. The
+/// `gdn_f32_norm_k.0 != 0` guard in `ssm_forward.rs` then does the right thing.
+///
+/// Adding a sigmoid twin (duplicated, per `rms_norm.cu`'s convention) is the
+/// real fix; this makes the flag SAFE rather than silently wrong until then.
+pub(super) fn fused_gated_norm_kernel(
+    config: &atlas_core::config::ModelConfig,
+    gpu: &dyn GpuBackend,
+    func: &str,
+) -> KernelHandle {
+    match config.output_gate_type.as_str() {
+        "sigmoid" => KernelHandle(0),
+        _ => crate::layers::try_kernel(gpu, "gated_delta_rule", func),
+    }
+}
+
 /// Resolve one `hyper_connection` entry point, but ONLY for a model that
 /// carries the highway. Skipping the lookup rather than discarding its result
 /// is the point: an un-issued lookup leaves no failed row in the fail-closed
