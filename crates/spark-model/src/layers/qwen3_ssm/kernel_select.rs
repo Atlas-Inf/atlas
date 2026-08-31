@@ -127,9 +127,15 @@ pub(super) fn gated_norm_kernel(
     base: &str,
 ) -> Result<String> {
     match config.output_gate_type.as_str() {
-        "" | "silu" => Ok(base.to_string()),
+        // "swish" IS SiLU (x * sigmoid(x)) under its other name; current
+        // unsloth uploads of the Qwen3.6/3.8 checkpoints spell it that way,
+        // so refusing it turns a fresh download into a build failure while
+        // an older download of the SAME weights serves fine.
+        "" | "silu" | "swish" => Ok(base.to_string()),
         "sigmoid" => Ok(format!("{base}_sigmoid")),
-        other => anyhow::bail!("output_gate_type must be \"silu\" or \"sigmoid\", got {other:?}"),
+        other => anyhow::bail!(
+            "output_gate_type must be \"silu\", \"swish\" or \"sigmoid\", got {other:?}"
+        ),
     }
 }
 
