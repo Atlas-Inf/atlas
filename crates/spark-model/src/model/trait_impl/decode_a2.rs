@@ -519,6 +519,7 @@ impl TransformerModel {
                     hidden,
                     residual,
                     padded_n,
+                    n,
                     &mut layer_state_refs,
                     &mut kv_cache,
                     &seq_lens,

@@ -287,6 +287,7 @@ impl TransformerModel {
                             hidden,
                             residual,
                             m,
+                            m,
                             &mut refs,
                             &mut kv_cache,
                             &seq_lens_vec,

@@ -41,6 +41,7 @@ impl Qwen3SsmLayer {
         &self,
         hidden: DevicePtr,
         num_seqs: usize,
+        active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         ctx: &ForwardContext,
         stream: u64,
@@ -88,20 +89,24 @@ impl Qwen3SsmLayer {
             // and pushes dummy layer states for the padding rows — which
             // carry `ple: None` by construction and have no token id.
             //
-            // So a padding row gets NO injection, and requiring
-            // `host.len() >= n` was wrong: it rejected every batch whose
-            // size was not already a padding boundary. Concurrency 4 with
-            // 3 live sequences failed outright with "3 host ids for 4 seqs".
-            //
-            // A row with a LIVE ple state and no token id is a real defect
-            // and still errors — that is the case worth being loud about.
+            // `active_seqs` is the live count, so the skip below is exact
+            // rather than inferred from the dummy state's shape: a row with
+            // a LIVE ple state and no token id is a real defect and still
+            // errors, and an ACTIVE row missing its ple carry errors too.
             for (i, state) in states.iter_mut().enumerate().take(n) {
                 let ssm = state
                     .as_any_mut()
                     .downcast_mut::<SsmLayerState>()
                     .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
                 let Some(st) = ssm.ple.as_mut() else {
-                    continue; // padding row
+                    if i >= active_seqs {
+                        continue; // padding row
+                    }
+                    anyhow::bail!(
+                        "hc multi-seq decode: PLE layer (row {i} of {n}, \
+                         {active_seqs} active) got a state with no PLE carry — \
+                         every active row of a PLE-carrying model must own one"
+                    );
                 };
                 let token = host.get(i..i + 1).ok_or_else(|| {
                     anyhow::anyhow!(

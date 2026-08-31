@@ -657,6 +657,7 @@ pub trait TransformerLayer: Send + Sync {
             hidden,
             residual,
             num_rows,
+            num_rows,
             &mut refs,
             kv_cache,
             seq_lens,
@@ -675,6 +676,12 @@ pub trait TransformerLayer: Send + Sync {
     /// * `hidden` - [N, hidden_size] BF16, contiguous
     /// * `residual` - [N, hidden_size] BF16, contiguous
     /// * `num_seqs` - Number of sequences (N)
+    /// * `active_seqs` - Rows `[0..active_seqs)` are live sequences; rows
+    ///   `[active_seqs..num_seqs)` are CUDA-graph padding (zeroed hidden,
+    ///   dummy states). Layers whose per-row work depends on per-sequence
+    ///   state (e.g. the SSM HC path's PLE injection) must skip the padding
+    ///   rows and must treat a padding-row invariant break as an error only
+    ///   for `i < active_seqs`. Callers with no padding pass `num_seqs`.
     /// * `states` - N per-layer states (one per sequence)
     /// * `kv_cache` - Shared paged KV cache
     /// * `ctx` - Forward context (attn_metadata contains N-sequence metadata)
@@ -687,6 +694,7 @@ pub trait TransformerLayer: Send + Sync {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
+        active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -699,6 +707,7 @@ pub trait TransformerLayer: Send + Sync {
             hidden,
             residual,
             num_seqs,
+            active_seqs,
             states,
             kv_cache,
             seq_lens,

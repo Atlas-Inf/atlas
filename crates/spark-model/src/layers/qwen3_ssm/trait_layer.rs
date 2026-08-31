@@ -402,6 +402,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
+        active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -413,7 +414,14 @@ impl TransformerLayer for Qwen3SsmLayer {
             // #753 item B milestone 2: the highway replaces the residual the
             // non-hc path folds into its fused norm kernels; run the
             // hc-bracketed variant instead of refusing.
-            return self.decode_multi_seq_inner_hc(hidden, num_seqs, states, ctx, stream);
+            return self.decode_multi_seq_inner_hc(
+                hidden,
+                num_seqs,
+                active_seqs,
+                states,
+                ctx,
+                stream,
+            );
         }
         self.decode_multi_seq_inner(
             hidden,
