@@ -477,6 +477,56 @@ fn qsa_prefill_attn_g_smem(hd: u32) -> u32 {
     (8 * QSA_PA_G * hd + 2 * 8 * QSA_PA_G) * 4
 }
 
+/// Same geometry rule as [`qsa_prefill_attn_tc2_ok`]; tc3 differs only in tile
+/// and buffering (BC=32, single-buffered K).
+pub fn qsa_prefill_attn_tc3_ok(nq: u32, nkv: u32, hd: u32) -> bool {
+    qsa_prefill_attn_tc2_ok(nq, nkv, hd)
+}
+
+/// Stage 2 on tensor cores, both kv heads, BC=32. tc2's packing with tc1's
+/// tile, paid for by single-buffering K (a second K buffer at BC=32 would be
+/// 121,088 B of static shared and the driver caps a block at 101,376).
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_prefill_attn_tc3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    block_table: DevicePtr,
+    lists: DevicePtr,
+    attn_out: DevicePtr,
+    rows: u32,
+    first_pos: u32,
+    topk: u32,
+    ratio: u32,
+    block_size: u32,
+    nq: u32,
+    nkv: u32,
+    hd: u32,
+    inv_sqrt_d: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, rows, 1])
+        .block([128, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(attn_out)
+        .arg_ptr(block_table)
+        .arg_ptr(lists)
+        .arg_u32(first_pos)
+        .arg_u32(topk)
+        .arg_u32(ratio)
+        .arg_u32(block_size)
+        .arg_u32(nq)
+        .arg_u32(nkv)
+        .arg_u32(hd)
+        .arg_f32(inv_sqrt_d)
+        .launch(stream)
+}
+
 /// Whether the two-kv-head tensor-core attention can serve this geometry.
 ///
 /// One CTA per ROW, holding BOTH kv heads: rows 0..gqa-1 are kv head 0's

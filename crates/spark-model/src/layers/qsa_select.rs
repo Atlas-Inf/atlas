@@ -554,7 +554,35 @@ impl QsaIndexer {
             // `scripts/ppl.py`. See TTFT_GAP.md 27.
             // `ATLAS_QSA_ATTN_TC2`: the same tensor-core attention with BOTH
             // kv heads in one CTA, which halves the M padding.
-            let tc2 = matches!(
+            // `ATLAS_QSA_ATTN_TC3`: tc2's kv-head packing with tc1's BC=32 tile.
+            let tc3 = matches!(
+                std::env::var("ATLAS_QSA_ATTN_TC3").as_deref(),
+                Ok("1") | Ok("true")
+            ) && self.k_prefill_attn_tc3_k.0 != 0
+                && ops::qsa_prefill_attn_tc3_ok(nq, self.nkv_attn, self.hd_attn);
+            if tc3 {
+                ops::qsa_prefill_attn_tc3(
+                    gpu,
+                    self.k_prefill_attn_tc3_k,
+                    q_roped.offset(first_row * q_row * 2),
+                    k_pool,
+                    v_pool,
+                    block_table_dev,
+                    lists,
+                    attn_ctx.offset(first_row * q_row * 2),
+                    rows as u32,
+                    first_pos as u32,
+                    topk as u32,
+                    self.ratio,
+                    block_size,
+                    nq,
+                    self.nkv_attn,
+                    self.hd_attn,
+                    inv_sqrt_d,
+                    stream,
+                )?;
+            }
+            let tc2 = !tc3 && matches!(
                 std::env::var("ATLAS_QSA_ATTN_TC2").as_deref(),
                 Ok("1") | Ok("true")
             ) && self.k_prefill_attn_tc2_k.0 != 0
@@ -612,7 +640,7 @@ impl QsaIndexer {
                 std::env::var("ATLAS_QSA_ATTN_L8").as_deref(),
                 Ok("1") | Ok("true")
             ) && ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn);
-            if tc2 || tc {
+            if tc3 || tc2 || tc {
                 // already dispatched above
             } else if l8 {
                 ops::qsa_prefill_attn_l8(
