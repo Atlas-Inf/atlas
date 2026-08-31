@@ -506,6 +506,60 @@ fn qsa_prefill_attn_g_smem(hd: u32) -> u32 {
     (8 * QSA_PA_G * hd + 2 * 8 * QSA_PA_G) * 4
 }
 
+/// Whether the two-kv-head tensor-core attention can serve this geometry.
+///
+/// One CTA per ROW, holding BOTH kv heads: rows 0..gqa-1 are kv head 0's
+/// q-heads and rows 16..16+gqa-1 kv head 1's, which is the split the kernel's
+/// inherited warp mapping already makes at 16. So exactly two kv heads, and the
+/// group must fit the 16-row half.
+pub fn qsa_prefill_attn_tc2_ok(nq: u32, nkv: u32, hd: u32) -> bool {
+    nkv == 2 && nq % nkv == 0 && nq / nkv <= 16 && hd == 256
+}
+
+/// Stage 2 on tensor cores, both kv heads per CTA. Same selected set and same
+/// per-row semantics as [`qsa_prefill_attn_tc`]; it halves that kernel's M
+/// padding (2.67x -> 1.33x) by filling the second 16-row half of the tile.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_prefill_attn_tc2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    block_table: DevicePtr,
+    lists: DevicePtr,
+    attn_out: DevicePtr,
+    rows: u32,
+    first_pos: u32,
+    topk: u32,
+    ratio: u32,
+    block_size: u32,
+    nq: u32,
+    nkv: u32,
+    hd: u32,
+    inv_sqrt_d: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, rows, 1])
+        .block([128, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(attn_out)
+        .arg_ptr(block_table)
+        .arg_ptr(lists)
+        .arg_u32(first_pos)
+        .arg_u32(topk)
+        .arg_u32(ratio)
+        .arg_u32(block_size)
+        .arg_u32(nq)
+        .arg_u32(nkv)
+        .arg_u32(hd)
+        .arg_f32(inv_sqrt_d)
+        .launch(stream)
+}
+
 /// Whether the tensor-core attention can serve this geometry.
 ///
 /// One CTA per (row, kv head); the M tile holds that kv head's `nq / nkv`
