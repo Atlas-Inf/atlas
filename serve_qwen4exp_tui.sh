@@ -4,12 +4,12 @@
 # This serves: mHC highway on all 48 layers, PLE at model layer 1, QSA decode
 # and prefill selection, vision, CUDA graphs, prefix caching, C>1.
 #
-# CONTEXT ABOVE 8192 NEEDS ATLAS_PLE_MAX_TOKENS RAISED. The engine's prefill
-# chunk is 8193 (not 8192), and the PLE scratch is sized from
-# ATLAS_PLE_MAX_TOKENS, which defaults to 2048 — a 2191-token prompt already
-# fails layer 1 without it. Anything chunked needs >= 8193; this script sets
-# 9500 whenever MAX_SEQ_LEN is above 8192, and the cap error message says so
-# explicitly when it is hit.
+# PLE SCRATCH IS SIZED FROM THE SERVE CONFIG, NOT AN ENV VAR. The engine
+# derives its floor from --max-num-batched-tokens (floor 2048), so a
+# 2191-token prompt no longer fails layer 1 by default. ATLAS_PLE_MAX_TOKENS
+# is now only an override to trade PLE headroom for KV memory; setting it
+# below the derived floor logs a warning and risks refused prefills. This
+# script still sets it explicitly (9500 above 8192) as a harmless override.
 #
 # PRIMARY CHECKPOINT is the Inferact NVFP4 release. Against RadixArk's it has
 # the same architecture and the same per-expert ModelOpt NVFP4 layout, but

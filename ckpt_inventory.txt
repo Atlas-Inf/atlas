@@ -1,0 +1,61 @@
+== file count ==
+840
+== top-level ==
+aime26_metrics.json
+audit_unchanged_report.json
+chat_template.jinja
+config.json
+conversion_environment.json
+generation_config.json
+gsm8k_metrics.json
+hf_quant_config.json
+layer-00000-experts-0000-0127.complete.json
+layer-00000-experts-0000-0127.safetensors
+layer-00000-experts-0128-0255.complete.json
+layer-00000-experts-0128-0255.safetensors
+layer-00000-experts-0256-0383.complete.json
+layer-00000-experts-0256-0383.safetensors
+layer-00000-experts-0384-0511.complete.json
+layer-00000-experts-0384-0511.safetensors
+layer-00001-experts-0000-0127.complete.json
+layer-00001-experts-0000-0127.safetensors
+layer-00001-experts-0128-0255.complete.json
+layer-00001-experts-0128-0255.safetensors
+layer-00001-experts-0256-0383.complete.json
+layer-00001-experts-0256-0383.safetensors
+layer-00001-experts-0384-0511.complete.json
+layer-00001-experts-0384-0511.safetensors
+layer-00002-experts-0000-0127.complete.json
+layer-00002-experts-0000-0127.safetensors
+layer-00002-experts-0128-0255.complete.json
+layer-00002-experts-0128-0255.safetensors
+layer-00002-experts-0256-0383.complete.json
+layer-00002-experts-0256-0383.safetensors
+== sizes by pattern ==
+126G	/home/zerc/models/radixark-fn-nvfp4
+safetensors files: 206
+/home/zerc/models/radixark-fn-nvfp4/layer-00025-experts-0256-0383.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00018-experts-0384-0511.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00026-experts-0128-0255.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00026-experts-0256-0383.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00012-experts-0000-0127.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00042-experts-0384-0511.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00005-experts-0128-0255.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00005-experts-0000-0127.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00031-experts-0384-0511.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00046-experts-0000-0127.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00018-experts-0000-0127.complete.json
+/home/zerc/models/radixark-fn-nvfp4/layer-00003-experts-0256-0383.complete.json
+== config.json head ==
+model_type: qwen4_exp
+num_hidden_layers : 48
+hc_count : 4
+hc_lowrank : 320
+ple_layer_ids : [2]
+ngram_size : 3
+num_experts : 512
+quantization_config : {'config_groups': {'group_0': {'input_activations': {'dynamic': False, 'group_size': 16, 'num_bits': 4, 'type': 'float'}
+== index keys ==
+tensors: 296475
+shard files: 206
+ngram/per_layer tensors: 131 ['model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets', 'model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes', 'model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight']

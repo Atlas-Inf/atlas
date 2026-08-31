@@ -16,12 +16,14 @@
 #       --gpu-memory-utilization 0.90 --fast-load-prefetch-shards
 #
 # WHY EACH NON-OBVIOUS FLAG IS THERE — all four were learned the hard way on
-# the first real run, and three of them fail SILENTLY if omitted:
+# the first real run, and two of them fail SILENTLY if omitted:
 #
 #   (KV dtype is no longer a flag — MODEL.toml owns it via default_kv_dtype)
 #   --gpu-memory-utilization   BF16 KV needs 0.90; at 0.80 the model loads and
 #                              then dies with "No memory left for KV cache"
-#   ATLAS_PLE_MAX_TOKENS       defaults to 2048; a 2191-token prompt exceeds it
+#   ATLAS_PLE_MAX_TOKENS       the engine now derives the PLE scratch floor
+#                              from --max-num-batched-tokens; this is only an
+#                              override to trade PLE headroom for KV memory
 #   --kernel-target            selects the 177 kernels this architecture needs;
 #                              the startup audit fails closed without it
 set -uo pipefail

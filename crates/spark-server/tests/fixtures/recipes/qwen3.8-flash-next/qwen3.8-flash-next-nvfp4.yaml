@@ -34,11 +34,12 @@ metadata:
     layers hold KV (2 KV heads), so bf16 goes further here than the layer
     count suggests — at 8K context it is a small fraction of the ~27 GB spare.
 
-    CONTEXT ABOVE 8192 NEEDS `ATLAS_PLE_MAX_TOKENS` RAISED. The engine's
-    prefill chunk is 8193, not 8192, and the PLE scratch is sized from that
-    env var (default 2048 — a 2191-token prompt already fails layer 1 without
-    it). Set it to >= 9500 when serving prompts over 8K; the cap error names
-    itself when hit. `serve_qwen4exp_tui.sh` does this automatically.
+    PLE SCRATCH IS SIZED FROM THE SERVE CONFIG, NOT AN ENV VAR. The engine
+    derives its floor from `--max-num-batched-tokens` (floor 2048), so a
+    2191-token prompt no longer fails layer 1 by default. `ATLAS_PLE_MAX_TOKENS`
+    is now only an OVERRIDE to trade PLE headroom for KV memory; setting it
+    below the derived floor logs a warning and risks refused prefills.
+    `serve_qwen4exp_tui.sh` still sets it explicitly above 8K.
 
     SPECULATIVE IS OFF BY MEASUREMENT, NOT BY REFUSAL — AND ONE DRAFT WINS.
     It used to be a refusal: the MTP block is not the `MtpWeights` shape any
