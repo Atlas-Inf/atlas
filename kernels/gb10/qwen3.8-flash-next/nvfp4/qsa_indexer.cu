@@ -700,6 +700,32 @@ extern "C" __global__ void qsa_topk_rows(
 
 #define QSA_PA_WARPS 8
 
+// Physical offset of selected key `t` for one row. Factored out so the
+// software pipeline in `qsa_prefill_attn_g` can compute the NEXT key's address
+// before consuming the current one's data.
+__device__ __forceinline__ unsigned long long qsa_key_off(
+    unsigned int t, unsigned int topk_ratio, unsigned int ratio, bool ratio_p2,
+    unsigned int ratio_sh, unsigned int ratio_mask, unsigned int complete,
+    unsigned int block_size, bool bs_p2, unsigned int bs_sh, unsigned int bs_mask,
+    const int* __restrict__ my_list, const int* __restrict__ block_table,
+    unsigned long long page_stride, unsigned int row_elems,
+    unsigned int kvh, unsigned int hd)
+{
+    unsigned int tok;
+    if (t < topk_ratio) {
+        const unsigned int li = ratio_p2 ? (t >> ratio_sh) : (t / ratio);
+        const unsigned int lo = ratio_p2 ? (t & ratio_mask) : (t % ratio);
+        tok = (unsigned int)my_list[li] * ratio + lo;
+    } else {
+        tok = complete * ratio + (t - topk_ratio);
+    }
+    const unsigned int pg = bs_p2 ? (tok >> bs_sh) : (tok / block_size);
+    const unsigned int inb = bs_p2 ? (tok & bs_mask) : (tok % block_size);
+    return (unsigned long long)(unsigned int)block_table[pg] * page_stride
+         + (unsigned long long)inb * row_elems
+         + (unsigned long long)kvh * hd;
+}
+
 // ── G q-heads per block ──────────────────────────────────────────────────
 //
 // The selected block list is per ROW (`lists + r * topk`), NOT per head, so
@@ -794,22 +820,42 @@ extern "C" __global__ void qsa_prefill_attn_g(
     const unsigned int bs_mask = bs_p2 ? (block_size - 1u) : 0u;
     const unsigned int topk_ratio = topk * ratio;
 
-    for (unsigned int t = warp; t < n_tok; t += QSA_PA_WARPS) {
-        unsigned int tok;
-        if (t < topk_ratio) {
-            const unsigned int li = ratio_p2 ? (t >> ratio_sh) : (t / ratio);
-            const unsigned int lo = ratio_p2 ? (t & ratio_mask) : (t % ratio);
-            tok = (unsigned int)my_list[li] * ratio + lo;
-        } else {
-            tok = complete * ratio + (t - topk_ratio);
+    // Software pipeline. Bandwidth is not the limiter here (a 4x K/V traffic
+    // cut bought only 1.47x), nor SFU, nor principally shuffles -- all measured
+    // -- which leaves load LATENCY, and after vectorisation there are exactly
+    // two loads per key to hide. Issue key t+WARPS's K/V while key t is being
+    // reduced. The online softmax stays strictly sequential in t, so the
+    // arithmetic and its order are untouched; only the loads move earlier.
+    //
+    // The raw uint4s are carried, not the widened floats: 8 registers instead
+    // of 16, and the bf16->float converts stay next to their use.
+    unsigned int t = warp;
+    uint4 kraw_n, vraw_n;
+    unsigned long long off_n = 0ull;
+    if (t < n_tok) {
+        off_n = qsa_key_off(t, topk_ratio, ratio, ratio_p2, ratio_sh, ratio_mask,
+                            complete, block_size, bs_p2, bs_sh, bs_mask,
+                            my_list, block_table, page_stride, row_elems, kvh, hd);
+        if (vec == 8) {
+            kraw_n = *reinterpret_cast<const uint4*>(k_cache + off_n + lane * 8);
+            vraw_n = *reinterpret_cast<const uint4*>(v_cache + off_n + lane * 8);
         }
-        const unsigned int pg = bs_p2 ? (tok >> bs_sh) : (tok / block_size);
-        const unsigned int inb = bs_p2 ? (tok & bs_mask) : (tok % block_size);
-        const unsigned long long off =
-            (unsigned long long)(unsigned int)block_table[pg] * page_stride
-            + (unsigned long long)inb * row_elems
-            + (unsigned long long)kvh * hd;
-        // ONE K row and ONE V row for all QSA_PA_G heads -- this is the point.
+    }
+    for (; t < n_tok; t += QSA_PA_WARPS) {
+        const unsigned long long off = off_n;
+        const uint4 kraw = kraw_n;
+        const uint4 vraw = vraw_n;
+        // Issue the NEXT key's loads before touching this one's data.
+        const unsigned int t_n = t + QSA_PA_WARPS;
+        if (t_n < n_tok) {
+            off_n = qsa_key_off(t_n, topk_ratio, ratio, ratio_p2, ratio_sh, ratio_mask,
+                                complete, block_size, bs_p2, bs_sh, bs_mask,
+                                my_list, block_table, page_stride, row_elems, kvh, hd);
+            if (vec == 8) {
+                kraw_n = *reinterpret_cast<const uint4*>(k_cache + off_n + lane * 8);
+                vraw_n = *reinterpret_cast<const uint4*>(v_cache + off_n + lane * 8);
+            }
+        }
         const __nv_bfloat16* krow = k_cache + off;
         const __nv_bfloat16* vrow = v_cache + off;
         float kreg[8], vreg[8];
@@ -819,8 +865,6 @@ extern "C" __global__ void qsa_prefill_attn_g(
         // each of K and V, on a loop that runs ~2048 times per (row, group).
         // Bit-identical -- same bytes, same `(float)` widening, same order.
         if (vec == 8) {
-            const uint4 kraw = *reinterpret_cast<const uint4*>(krow + lane * 8);
-            const uint4 vraw = *reinterpret_cast<const uint4*>(vrow + lane * 8);
             const __nv_bfloat16* kp = reinterpret_cast<const __nv_bfloat16*>(&kraw);
             const __nv_bfloat16* vp = reinterpret_cast<const __nv_bfloat16*>(&vraw);
             #pragma unroll
