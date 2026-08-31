@@ -25,6 +25,8 @@ use crate::layers::qwen3_attention::HcLowRank;
 /// `ATLAS_QWEN4EXP_NO_HC_GEMM=1`: revert the large-T collapse to the fused
 /// FP32 kernel (deploy-time kill switch; the GEMM path rounds `normed` to
 /// BF16 before the projections).
+use super::hyper_connection_lowrank_gemm::{gemm_raw, hc_finish_block};
+
 fn hc_gemm_disabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_NO_HC_GEMM").as_deref() == Ok("1"))
@@ -369,28 +371,6 @@ fn hc_pre_gemm(
 /// are plain `DevicePtr`s, not `DenseWeight`s). Mirrors
 /// `ops::dense_gemm_bf16_pipelined` exactly: out[m,n] = a[m,k] x w[n,k]^T.
 #[allow(clippy::too_many_arguments)]
-fn gemm_raw(
-    gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
-    a: DevicePtr,
-    w: DevicePtr,
-    out: DevicePtr,
-    m: u32,
-    n: u32,
-    k: u32,
-    stream: u64,
-) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([n.div_ceil(128), m.div_ceil(128), 1])
-        .block([256, 1, 1])
-        .arg_ptr(a)
-        .arg_ptr(w)
-        .arg_ptr(out)
-        .arg_u32(m)
-        .arg_u32(n)
-        .arg_u32(k)
-        .launch(stream)
-}
 
 /// The three-launch collapse for small T. Same math as the fused kernel;
 /// the parity probe's T=8 fixture runs THIS path.
@@ -492,18 +472,4 @@ fn hc_pre_split(
         .arg_u32(hc_mult)
         .arg_u32(w.rank as u32)
         .launch(stream)
-}
-
-/// Block width for stage 3 (`ATLAS_HC_FIN_BLOCK`, default 128). Kept as a knob
-/// because it is pure launch geometry — it cannot change the arithmetic, only
-/// how much of the machine runs it.
-fn hc_finish_block() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("ATLAS_HC_FIN_BLOCK")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| (32..=1024).contains(n) && n % 32 == 0)
-            .unwrap_or(128)
-    })
 }

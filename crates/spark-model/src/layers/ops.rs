@@ -70,6 +70,9 @@ mod hyper_connection;
 mod hyper_connection_dispatch;
 #[path = "ops/hyper_connection_lowrank.rs"]
 mod hyper_connection_lowrank;
+// Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
+#[path = "ops/hyper_connection_lowrank_gemm.rs"]
+mod hyper_connection_lowrank_gemm;
 // GPU parity test, so it needs the cuda backend to compile at all. Gated on
 // the feature and not just `test`, so `--features metal` can still build and
 // RUN this crate's ordinary unit tests — which is the only way they get
@@ -140,6 +143,10 @@ mod qsa;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 pub mod qwen4exp;
+// Shared harness for the oracle-parity tests, split for the 500-LoC cap.
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ops/qwen4exp_oracle_common.rs"]
+mod qwen4exp_oracle_common;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "ops/qwen4exp_oracle_tests.rs"]
 mod qwen4exp_oracle_tests;

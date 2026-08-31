@@ -72,6 +72,13 @@ jobs:
             # Splitting requires moving the unsafe-impl Send/Sync block
             # and ~30 cudarc/cuda-driver C-binding wrappers into a
             # `nccl_ffi/` submodule; deferred until after launch.
+            # 2026-08-31 (#18): 670 LoC — the single `impl TransformerLayer
+            # for Qwen3SsmLayer`. Every body already lives in a `trait_*.rs`
+            # sibling as an `*_inner` fn; what remains is trait-mandated
+            # signatures plus one-call delegation, and one trait impl cannot
+            # span files. Same disease/cure as `transformer_layer.rs` below:
+            # a supertrait split of the SSM-prefill phases frees both.
+            "crates/spark-model/src/layers/qwen3_ssm/trait_layer.rs"
             "crates/spark-comm/src/nccl_backend.rs"
             # 528 LoC — Model trait definition + default impls.
             # Atomic interface; splitting hurts discoverability for
