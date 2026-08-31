@@ -56,11 +56,13 @@ const BLOCK: usize = 4096;
 /// Measured on that prefill, resolve time by depth -- monotone, so the default
 /// is the deepest measured rather than the knee:
 ///
+/// ```text
 ///     QD    resolve    vs serial
 ///      1    1631 ms      1.00x
 ///      8     424 ms      3.85x
 ///     16     257 ms      6.35x
 ///     32     171 ms      9.55x
+/// ```
 ///
 /// `1` restores the old strictly-serial behaviour for a bisect.
 fn fault_threads() -> usize {
