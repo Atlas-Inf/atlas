@@ -231,6 +231,63 @@ pub fn qsa_score_rows(
         .launch(stream)
 }
 
+/// Score-tile dimensions of [`qsa_score_rows_exact`]; must match `QSA_SE_BM` /
+/// `QSA_SE_BN` in `qsa_indexer.cu`.
+pub const QSA_SE_BM: u32 = 8;
+pub const QSA_SE_BN: u32 = 32;
+
+fn qsa_score_rows_exact_smem(n_heads: u32, hd: u32) -> u32 {
+    (QSA_SE_BM * n_heads * hd + QSA_SE_BN * (hd + 1)) * 4
+}
+
+/// Whether the exact-tree scorer fits this geometry. `hd` must be a multiple of
+/// 32 — the kernel replays the reference's per-warp reduction tree, and a warp
+/// is 32 lanes.
+pub fn qsa_score_rows_exact_ok(n_heads: u32, hd: u32) -> bool {
+    hd % 32 == 0 && qsa_score_rows_exact_smem(n_heads, hd) <= 48 * 1024
+}
+
+/// Per-row block scores, one thread per score, BIT-IDENTICAL to
+/// [`qsa_score_rows`].
+///
+/// Evaluates the reference's `__shfl_down_sync` reduction tree locally in one
+/// thread instead of across 128 of them, so the FP addition DAG is unchanged
+/// while every block-wide reduction and `__syncthreads` disappears. See the
+/// kernel note for the tree and for why the `__fmul_rn`/`__fadd_rn` intrinsics
+/// are required rather than stylistic.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_score_rows_exact(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    block_keys: DevicePtr,
+    scores: DevicePtr,
+    rows: u32,
+    n_blocks_max: u32,
+    first_pos: u32,
+    score_stride: u32,
+    ratio: u32,
+    n_heads: u32,
+    hd: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows.div_ceil(QSA_SE_BM), n_blocks_max.div_ceil(QSA_SE_BN), 1])
+        .block([QSA_SE_BM * QSA_SE_BN, 1, 1])
+        .shared_mem(qsa_score_rows_exact_smem(n_heads, hd))
+        .arg_ptr(q)
+        .arg_ptr(block_keys)
+        .arg_ptr(scores)
+        .arg_u32(first_pos)
+        .arg_u32(score_stride)
+        .arg_u32(ratio)
+        .arg_u32(n_heads)
+        .arg_u32(hd)
+        .arg_u32(rows)
+        .arg_u32(n_blocks_max)
+        .launch(stream)
+}
+
 /// Score-tile dimensions of [`qsa_score_rows_gemm`]; must match `QSA_SG_BM` /
 /// `QSA_SG_BN` in `qsa_indexer.cu`, and their product is the block width.
 pub const QSA_SG_BM: u32 = 8;

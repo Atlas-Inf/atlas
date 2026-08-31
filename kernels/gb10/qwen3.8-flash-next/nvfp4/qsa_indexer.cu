@@ -373,6 +373,121 @@ extern "C" __global__ void qsa_score_rows_b(
     }
 }
 
+// Block scores, one thread per score, BIT-IDENTICAL to `qsa_score_rows`.
+//
+// The tiled-GEMM variant below is fast but reassociates: it sums `d` serially
+// per thread, which is a different FP addition tree, and these scores feed a
+// top-k so near-ties around the 512th block flip (measured: 4.2e-7 relative
+// score drift -> top-1 agreement 69.3%).
+//
+// That tension is avoidable. Bit-identity does not require a 128-thread
+// block-wide reduction — it requires evaluating the same FP addition DAG. One
+// thread can evaluate the reference's `__shfl_down_sync` tree locally, with no
+// reductions and no `__syncthreads` at all.
+//
+// The reference, at blockDim.x = hd = 128 (4 warps), lane-0 of each warp after
+// offsets 16,8,4,2,1 holds:
+//
+//   b[i] = (x[i] + x[i+16]) + (x[i+8] + x[i+24])   i = 0..7
+//   c[i] = b[i] + b[i+4]                           i = 0..3
+//   e[i] = c[i] + c[i+2]                           i = 0..1
+//   p    = e[0] + e[1]
+//
+// then thread 0 folds the four warp partials starting from 0.0f, and the caller
+// folds `fmaxf(dot, 0)` over `hh` starting from 0.0f. All of that is reproduced
+// below in order.
+//
+// `__fmul_rn` / `__fadd_rn` are load-bearing, not decoration: with plain `*`
+// and `+` nvcc contracts `q*k + t` into an FMA, which skips the rounding of the
+// product and breaks bit-identity. The reference cannot contract because its
+// addend comes from a shuffle of the rounded product.
+#define QSA_SE_BM 8
+#define QSA_SE_BN 32
+extern "C" __global__ void qsa_score_rows_exact(
+    const float* __restrict__ q,                // [rows, n_heads, hd]
+    const __nv_bfloat16* __restrict__ block_keys,
+    float* __restrict__ scores,                 // [rows, score_stride]
+    const unsigned int first_pos,
+    const unsigned int score_stride,
+    const unsigned int ratio,
+    const unsigned int n_heads,
+    const unsigned int hd,
+    const unsigned int rows,
+    const unsigned int n_blocks_max
+) {
+    const unsigned int r0 = blockIdx.x * QSA_SE_BM;
+    const unsigned int b0 = blockIdx.y * QSA_SE_BN;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int ldk = hd + 1u;            // pad: see the GEMM variant
+
+    extern __shared__ float smem[];
+    float* qs = smem;                                     // [BM][n_heads][hd]
+    float* ks = smem + (size_t)QSA_SE_BM * n_heads * hd;  // [BN][hd + 1]
+
+    const unsigned int qn = QSA_SE_BM * n_heads * hd;
+    for (unsigned int i = tid; i < qn; i += blockDim.x) {
+        const unsigned int rr = i / (n_heads * hd);
+        const unsigned int rest = i - rr * n_heads * hd;
+        const unsigned int r = r0 + rr;
+        qs[i] = (r < rows) ? q[(size_t)r * n_heads * hd + rest] : 0.0f;
+    }
+    const unsigned int kn = QSA_SE_BN * hd;
+    for (unsigned int i = tid; i < kn; i += blockDim.x) {
+        const unsigned int bb = i / hd;
+        const unsigned int d = i - bb * hd;
+        const unsigned int b = b0 + bb;
+        ks[bb * ldk + d] =
+            (b < n_blocks_max) ? (float)block_keys[(size_t)b * hd + d] : 0.0f;
+    }
+    __syncthreads();
+
+    const unsigned int ii = tid / QSA_SE_BN;
+    const unsigned int jj = tid - ii * QSA_SE_BN;
+    const unsigned int r = r0 + ii;
+    const unsigned int b = b0 + jj;
+    if (r >= rows || b >= n_blocks_max) {
+        return;
+    }
+    float* out = scores + (size_t)r * score_stride + b;
+    const unsigned int complete = (first_pos + r + 1) / ratio;
+    if (b >= complete) {
+        *out = -1e30f;
+        return;
+    }
+
+    const float* qrow = qs + (size_t)ii * n_heads * hd;
+    const float* krow = ks + (size_t)jj * ldk;
+    const unsigned int groups = hd >> 5;         // one per warp of the reference
+
+    float acc = 0.0f;                            // reference starts at 0.0f
+    for (unsigned int hh = 0; hh < n_heads; ++hh) {
+        const float* qh = qrow + (size_t)hh * hd;
+        float dot = 0.0f;                        // reference starts at 0.0f
+        for (unsigned int g = 0; g < groups; ++g) {
+            const float* qg = qh + g * 32u;
+            const float* kg = krow + g * 32u;
+            float t[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                // offsets 16 then 8, in the reference's associativity
+                const float x0 = __fmul_rn(qg[i], kg[i]);
+                const float x1 = __fmul_rn(qg[i + 16], kg[i + 16]);
+                const float x2 = __fmul_rn(qg[i + 8], kg[i + 8]);
+                const float x3 = __fmul_rn(qg[i + 24], kg[i + 24]);
+                t[i] = __fadd_rn(__fadd_rn(x0, x1), __fadd_rn(x2, x3));
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) t[i] = __fadd_rn(t[i], t[i + 4]);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) t[i] = __fadd_rn(t[i], t[i + 2]);
+            // thread 0 of the reference folds warp partials from 0.0f, in order
+            dot = __fadd_rn(dot, __fadd_rn(t[0], t[1]));
+        }
+        acc = __fadd_rn(acc, fmaxf(dot, 0.0f));
+    }
+    *out = acc * rsqrtf((float)hd);
+}
+
 // Block scores as a TILED GEMM — one thread per score, no block reductions.
 //
 // `qsa_score_rows_b` still spends four block-wide reductions per output, and
