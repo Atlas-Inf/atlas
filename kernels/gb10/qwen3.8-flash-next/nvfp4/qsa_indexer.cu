@@ -296,6 +296,83 @@ extern "C" __global__ void qsa_score_rows(
     if (d == 0) *out = acc * rsqrtf((float)hd);
 }
 
+// Same scores, several per block.
+//
+// `qsa_score_rows` launches ONE 128-thread block per OUTPUT SCALAR. At 30k that
+// is 1.397 BILLION blocks across the 12 full-attention layers, each computing
+// `n_heads * hd` = 512 MACs and paying four block-wide reductions for them. The
+// kernel measured 1.43 TFLOP in 4.860 s = **294 GFLOP/s**, against 28.0 TFLOP/s
+// for the MoE grouped GEMM in the same prefill -- the same GPU, 95x apart.
+//
+// This variant gives each block QSA_SR_B consecutive `b` values and stages the
+// row's `q` in shared once instead of re-reading it per block. Block count
+// drops by QSA_SR_B; the arithmetic does not change at all.
+//
+// BIT-IDENTICAL, deliberately, because these scores feed a top-k and a shifted
+// score can change WHICH blocks are attended -- not just by how much. Every
+// output still contracts with the same `qsa_block_reduce_sum` over the same 128
+// threads in the same tree, accumulates `fmaxf(dot, 0)` over `hh` in the same
+// order, and scales by the same `rsqrtf(hd)`. Staging `q` through shared moves
+// where the float is read from, never its value. A GEMM formulation would be
+// far faster still, but it reassociates the contraction and so needs the
+// precision gate; this does not.
+#define QSA_SR_B 16
+extern "C" __global__ void qsa_score_rows_b(
+    const float* __restrict__ q,                // [rows, n_heads, hd]
+    const __nv_bfloat16* __restrict__ block_keys,
+    float* __restrict__ scores,                 // [rows, score_stride]
+    const unsigned int first_pos,
+    const unsigned int score_stride,
+    const unsigned int ratio,
+    const unsigned int n_heads,
+    const unsigned int hd,
+    const unsigned int n_blocks_max
+) {
+    const unsigned int r = blockIdx.x;
+    const unsigned int b0 = blockIdx.y * QSA_SR_B;
+    const unsigned int d = threadIdx.x;
+    const unsigned int complete = (first_pos + r + 1) / ratio;
+
+    extern __shared__ float smem[];
+    float* red = smem;              // reduction scratch, as in qsa_score_rows
+    float* qs = smem + 32;          // [n_heads, hd], staged once per block
+
+    const float* qr = q + (size_t)r * n_heads * hd;
+    for (unsigned int h = 0; h < n_heads; ++h) {
+        qs[h * hd + d] = qr[(size_t)h * hd + d];
+    }
+    __syncthreads();
+
+    float* srow = scores + (size_t)r * score_stride;
+    // Both branch conditions below are block-UNIFORM (they depend only on
+    // blockIdx and the loop counter), so every thread runs the same sequence of
+    // `__syncthreads` inside the reduction.
+    for (unsigned int i = 0; i < QSA_SR_B; ++i) {
+        const unsigned int b = b0 + i;
+        if (b >= n_blocks_max) {
+            break;
+        }
+        if (b >= complete) {
+            if (d == 0) {
+                srow[b] = -1e30f;
+            }
+            continue;
+        }
+        const float k = (float)block_keys[(size_t)b * hd + d];
+        float acc = 0.0f;
+        for (unsigned int hh = 0; hh < n_heads; ++hh) {
+            const float dot = qsa_block_reduce_sum(qs[hh * hd + d] * k, red);
+            if (d == 0) {
+                acc += fmaxf(dot, 0.0f);
+            }
+            __syncthreads();
+        }
+        if (d == 0) {
+            srow[b] = acc * rsqrtf((float)hd);
+        }
+    }
+}
+
 // Attention over EXACTLY the selected set for one (row, q-head): the listed
 // `topk` blocks (ratio tokens each) plus the incomplete tail
 // [complete*ratio, pos]. K/V come straight from the paged cache; the output

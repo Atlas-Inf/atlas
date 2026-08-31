@@ -94,6 +94,9 @@ pub struct QsaIndexer {
     /// Per-row top-k block selection, on the GPU. Replaces a D2H of the
     /// whole score matrix plus a host sort per row; see `qsa_topk_rows`.
     k_topk_rows_k: KernelHandle,
+    /// Tiled scorer: QSA_SR_B outputs per block, bit-identical to
+    /// `k_score_rows_k`. See `qsa_score_rows_b`.
+    k_score_rows_b_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
     k_select_k: KernelHandle,
     /// `ATLAS_QSA_DEVICE_TOPK=1`: select on the device (no per-layer host
@@ -197,6 +200,7 @@ impl QsaIndexer {
             k_qprep_rows_k: gpu.kernel("qsa_indexer", "qsa_qprep_rows")?,
             k_score_rows_k: gpu.kernel("qsa_indexer", "qsa_score_rows")?,
             k_topk_rows_k: gpu.kernel("qsa_indexer", "qsa_topk_rows")?,
+            k_score_rows_b_k: gpu.kernel("qsa_indexer", "qsa_score_rows_b")?,
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
             k_select_k: gpu.kernel("qsa_indexer", "qsa_select_topk")?,
             device_topk: std::env::var("ATLAS_QSA_DEVICE_TOPK").ok().as_deref() == Some("1"),
