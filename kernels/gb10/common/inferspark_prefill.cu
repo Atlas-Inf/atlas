@@ -235,8 +235,12 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
         // (BC + PAD_P)=24-wide smem_P row.
         float acc_s[BC / 8][4];  // [n_tile][{row0_c0, row0_c1, row1_c0, row1_c1}]
         if (warp_id < 2) {
+            // BC/8, not 4. The DECLARATION above is a function of BC; this
+            // initialiser was left literal, so at BC=16 the array holds two
+            // entries and the loop writes four -- a stack OOB in exactly the
+            // BR=32/BC=16 shape this file is being parameterised FOR.
             #pragma unroll
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < (int)(BC / 8); i++) {
                 acc_s[i][0] = 0.0f; acc_s[i][1] = 0.0f;
                 acc_s[i][2] = 0.0f; acc_s[i][3] = 0.0f;
             }
@@ -709,10 +713,14 @@ extern "C" __global__ void inferspark_prefill_64(
         }
 
         // === QK^T (warps 0-3, each 16 M-rows) ===
-        float acc_s[4][4];
+        // BC/8, not 4, on both lines. The MMA loop below indexes `acc_s[nt]`
+        // for `nt < BC/8`, so a literal 4 is only correct at the shipped
+        // BC=32. PR #698 parameterised the BR=32 twin of this and did not
+        // reach this entry point.
+        float acc_s[BC / 8][4];
         if (warp_id < 4) {
             #pragma unroll
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < (int)(BC / 8); i++) {
                 acc_s[i][0] = 0.0f; acc_s[i][1] = 0.0f;
                 acc_s[i][2] = 0.0f; acc_s[i][3] = 0.0f;
             }
