@@ -272,111 +272,143 @@ impl QsaIndexer {
                 stream,
             )?;
 
-            // Host top-k per row (the D2H drains the stream first). Torch
-            // tie-break: larger score first, lower index on ties.
+            // SELECTION. On the GPU when the shape allows it: `qsa_topk_rows`
+            // produces byte-for-byte the same list, in the same order, without
+            // moving the score matrix anywhere. The host path below is the
+            // fallback for a `topk` wider than the kernel's running best-K, and
+            // it is what the GPU kernel is tested against
+            // (`qsa_topk_rows_matches_host_selection`).
             //
-            // THIS LOOP IS DEAD GPU TIME, and no kernel-time profile can see
-            // it because no kernel is running. nsys on a 2769-token prefill
-            // measured the gap `qsa_score_rows -> qsa_prefill_attn` at
-            // **6.17 ms x 24 launches = 148 ms**, 6.1% of the window. It is not
-            // the transfer (488 KB); it is the sorting, and it scales like
-            // `layers x slabs x rows x complete log complete`. At 32k that is
-            // 12 layers x 15 slabs x 2048 rows x ~2000-element sorts -- of the
-            // order of 1e10 comparisons on ONE core.
+            // What this is worth: the host round-trip is a full stream drain
+            // per attention layer per slab, and no kernel-time profile can see
+            // it because while it runs no kernel is running. Measuring GPU IDLE
+            // instead (scripts/gaps.py), on a 30k prefill:
             //
-            // Two changes, neither of which moves a single output bit:
-            //
-            //  * Only the first `topk` of the ordering is ever read, so
-            //    `select_nth_unstable` (O(n)) partitions and then only the
-            //    prefix is sorted. The order is TOTAL -- ties on score are
-            //    broken by index, so no two distinct elements compare Equal --
-            //    which means the partition point is unique and the prefix is
-            //    exactly what the full sort produced, in the same order.
-            //  * The comparison is a plain integer compare on a packed key
-            //    (`rank_key`), not a closure that indexes back into the score
-            //    matrix twice per comparison. That second indirection was the
-            //    cost: nsys at 30k measured this gap at **49.6 ms**, still the
-            //    largest single item in a 43 s prefill, on ~20k comparisons per
-            //    row x 2048 rows.
-            //  * The rows are independent. `std::thread::scope` (already used
-            //    in this crate's mistral loader; no new dependency) fans them
-            //    over the cores. Each thread writes a disjoint slice of
-            //    `host_lists`, so the output is byte-identical regardless of
-            //    how the rows are split or in what order the threads finish.
-            //
-            // ORDER MATTERS, so this must stay an exact reproduction rather
-            // than any top-k that returns the same SET: `qsa_prefill_attn`
-            // walks the list warp-striped (`t = warp; t < n_tok; t += 8`) and
-            // its online softmax accumulates in that order. Permuting the list
-            // reassociates the sum.
-            // Receive straight into an f32 buffer. Landing in a `Vec<u8>` and
-            // then running `chunks_exact(4).map(from_le_bytes).collect()`
-            // walked every score a second time and allocated the matrix twice.
-            // That matrix is `rows x stride`: at 30k context it is 2048 x 7500
-            // = 15.4M floats PER SLAB, and a prefill runs ~14 slabs x 12
-            // layers of them, so the conversion pass alone was seconds.
-            //
-            // The reinterpretation is sound in the direction used: `u8` has no
-            // alignment requirement and the f32 allocation is already
-            // 4-aligned, so the D2H writes exactly the same bytes to exactly
-            // the same place and there is nothing left to convert. Both sides
-            // are little-endian, which the original `from_le_bytes` also
-            // assumed; the assertion below turns that into a build error
-            // rather than silent garbage if this is ever cross-compiled.
-            const _: () = assert!(
-                cfg!(target_endian = "little"),
-                "QSA score D2H reinterprets device f32 bytes in host order"
-            );
-            let mut sc = vec![0f32; rows * stride];
-            {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        sc.as_mut_ptr().cast::<u8>(),
-                        std::mem::size_of_val(sc.as_slice()),
-                    )
-                };
-                gpu.copy_d2h_on_stream(scores, bytes, stream)?;
+            //   qsa_score_rows -> qsa_prefill_attn_g
+            //       7279 ms over 179 gaps, 40.7 ms each -- 19% of the window,
+            //       and the largest single item in it.
+            let host_select = !ops::qsa_topk_rows_ok(topk as u32);
+            if !host_select {
+                ops::qsa_topk_rows(
+                    gpu,
+                    self.k_topk_rows_k,
+                    scores,
+                    lists,
+                    rows as u32,
+                    first_pos as u32,
+                    stride as u32,
+                    self.ratio,
+                    topk as u32,
+                    stream,
+                )?;
             }
-            let mut host_lists = vec![0u8; rows * topk * 4];
-            // One row is ~2000 comparisons of work; below a few dozen rows the
-            // spawn cost dominates, and a prefill issues thousands of these.
-            let threads = if rows >= 64 {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-                    .min(rows / 32)
-                    .max(1)
-            } else {
-                1
-            };
-            let rows_per = rows.div_ceil(threads);
-            let sc_ref = &sc;
-            std::thread::scope(|scope| {
-                for (ti, out) in host_lists.chunks_mut(rows_per * topk * 4).enumerate() {
-                    let r0 = ti * rows_per;
-                    scope.spawn(move || {
-                        let mut keys: Vec<u64> = Vec::with_capacity(stride);
-                        for (rl, orow) in out.chunks_mut(topk * 4).enumerate() {
-                            let r = r0 + rl;
-                            let complete = (first_pos + r + 1) / ratio;
-                            let row_sc = &sc_ref[r * stride..r * stride + complete];
-                            keys.clear();
-                            keys.extend(
-                                row_sc.iter().enumerate().map(|(i, &s)| rank_key(s, i as u32)),
-                            );
-                            if complete > topk {
-                                keys.select_nth_unstable(topk - 1);
-                            }
-                            keys[..topk].sort_unstable();
-                            for (i, k) in keys[..topk].iter().enumerate() {
-                                orow[i * 4..i * 4 + 4]
-                                    .copy_from_slice(&((*k as u32) as i32).to_le_bytes());
-                            }
-                        }
-                    });
+            if host_select {
+                // Host top-k per row (the D2H drains the stream first). Torch
+                // tie-break: larger score first, lower index on ties.
+                //
+                // THIS LOOP IS DEAD GPU TIME, and no kernel-time profile can see
+                // it because no kernel is running. nsys on a 2769-token prefill
+                // measured the gap `qsa_score_rows -> qsa_prefill_attn` at
+                // **6.17 ms x 24 launches = 148 ms**, 6.1% of the window. It is not
+                // the transfer (488 KB); it is the sorting, and it scales like
+                // `layers x slabs x rows x complete log complete`. At 32k that is
+                // 12 layers x 15 slabs x 2048 rows x ~2000-element sorts -- of the
+                // order of 1e10 comparisons on ONE core.
+                //
+                // Two changes, neither of which moves a single output bit:
+                //
+                //  * Only the first `topk` of the ordering is ever read, so
+                //    `select_nth_unstable` (O(n)) partitions and then only the
+                //    prefix is sorted. The order is TOTAL -- ties on score are
+                //    broken by index, so no two distinct elements compare Equal --
+                //    which means the partition point is unique and the prefix is
+                //    exactly what the full sort produced, in the same order.
+                //  * The comparison is a plain integer compare on a packed key
+                //    (`rank_key`), not a closure that indexes back into the score
+                //    matrix twice per comparison. That second indirection was the
+                //    cost: nsys at 30k measured this gap at **49.6 ms**, still the
+                //    largest single item in a 43 s prefill, on ~20k comparisons per
+                //    row x 2048 rows.
+                //  * The rows are independent. `std::thread::scope` (already used
+                //    in this crate's mistral loader; no new dependency) fans them
+                //    over the cores. Each thread writes a disjoint slice of
+                //    `host_lists`, so the output is byte-identical regardless of
+                //    how the rows are split or in what order the threads finish.
+                //
+                // ORDER MATTERS, so this must stay an exact reproduction rather
+                // than any top-k that returns the same SET: `qsa_prefill_attn`
+                // walks the list warp-striped (`t = warp; t < n_tok; t += 8`) and
+                // its online softmax accumulates in that order. Permuting the list
+                // reassociates the sum.
+                // Receive straight into an f32 buffer. Landing in a `Vec<u8>` and
+                // then running `chunks_exact(4).map(from_le_bytes).collect()`
+                // walked every score a second time and allocated the matrix twice.
+                // That matrix is `rows x stride`: at 30k context it is 2048 x 7500
+                // = 15.4M floats PER SLAB, and a prefill runs ~14 slabs x 12
+                // layers of them, so the conversion pass alone was seconds.
+                //
+                // The reinterpretation is sound in the direction used: `u8` has no
+                // alignment requirement and the f32 allocation is already
+                // 4-aligned, so the D2H writes exactly the same bytes to exactly
+                // the same place and there is nothing left to convert. Both sides
+                // are little-endian, which the original `from_le_bytes` also
+                // assumed; the assertion below turns that into a build error
+                // rather than silent garbage if this is ever cross-compiled.
+                const _: () = assert!(
+                    cfg!(target_endian = "little"),
+                    "QSA score D2H reinterprets device f32 bytes in host order"
+                );
+                let mut sc = vec![0f32; rows * stride];
+                {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            sc.as_mut_ptr().cast::<u8>(),
+                            std::mem::size_of_val(sc.as_slice()),
+                        )
+                    };
+                    gpu.copy_d2h_on_stream(scores, bytes, stream)?;
                 }
-            });
-            gpu.copy_h2d_async(&host_lists, lists, stream)?;
+                let mut host_lists = vec![0u8; rows * topk * 4];
+                // One row is ~2000 comparisons of work; below a few dozen rows the
+                // spawn cost dominates, and a prefill issues thousands of these.
+                let threads = if rows >= 64 {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                        .min(rows / 32)
+                        .max(1)
+                } else {
+                    1
+                };
+                let rows_per = rows.div_ceil(threads);
+                let sc_ref = &sc;
+                std::thread::scope(|scope| {
+                    for (ti, out) in host_lists.chunks_mut(rows_per * topk * 4).enumerate() {
+                        let r0 = ti * rows_per;
+                        scope.spawn(move || {
+                            let mut keys: Vec<u64> = Vec::with_capacity(stride);
+                            for (rl, orow) in out.chunks_mut(topk * 4).enumerate() {
+                                let r = r0 + rl;
+                                let complete = (first_pos + r + 1) / ratio;
+                                let row_sc = &sc_ref[r * stride..r * stride + complete];
+                                keys.clear();
+                                keys.extend(
+                                    row_sc.iter().enumerate().map(|(i, &s)| rank_key(s, i as u32)),
+                                );
+                                if complete > topk {
+                                    keys.select_nth_unstable(topk - 1);
+                                }
+                                keys[..topk].sort_unstable();
+                                for (i, k) in keys[..topk].iter().enumerate() {
+                                    orow[i * 4..i * 4 + 4]
+                                        .copy_from_slice(&((*k as u32) as i32).to_le_bytes());
+                                }
+                            }
+                        });
+                    }
+                });
+                gpu.copy_h2d_async(&host_lists, lists, stream)?;
+            }
 
             // Every q head of a row attends over the SAME selected set --
             // the list is indexed by row, not by head -- so one block can

@@ -399,6 +399,104 @@ fn qsa_prefill_attn_g_matches_single_head_bitwise() {
     println!("qsa_prefill_attn_g == qsa_prefill_attn on {} elements", a.len());
 }
 
+/// Stage 1B: `qsa_topk_rows` must produce exactly the list the host selection
+/// produced — same blocks, SAME ORDER.
+///
+/// Order is not cosmetic here: `qsa_prefill_attn` walks the list warp-striped
+/// and its online softmax accumulates in list order, so a permutation
+/// reassociates the sum. The reference below is the original comparator
+/// (`partial_cmp(b, a).then(a.cmp(&b))`) rather than the packed key, so this
+/// tests the SPEC and would catch a bug in the packing as well as in the
+/// kernel.
+///
+/// Geometry is chosen to exercise what a single-chunk test would not:
+/// `complete` ~= 1250 spans three of the kernel's 512-wide chunks, so the
+/// running-best merge runs twice; exact ties force the index tie-break; and
+/// both +0.0 and -0.0 appear, which is the one value where the bit map and
+/// IEEE comparison disagree unless zero is canonicalised.
+#[test]
+#[ignore]
+fn qsa_topk_rows_matches_host_selection() {
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL='*'");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let stream = g.default_stream();
+    let k = g.kernel("qsa_indexer", "qsa_topk_rows").unwrap();
+
+    let (rows, ratio, topk, stride) = (7usize, 4usize, 512usize, 1300usize);
+    let first_pos = 5000usize;
+    assert!(ops::qsa_topk_rows_ok(topk as u32));
+
+    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut sc = vec![-1e30f32; rows * stride];
+    for r in 0..rows {
+        let complete = (first_pos + r + 1) / ratio;
+        assert!(complete > 2 * 512 && complete <= stride, "want a multi-chunk row");
+        for b in 0..complete {
+            let v = ((next() >> 40) as f32 / 512.0) - 16.0;
+            sc[r * stride + b] = match b % 37 {
+                0 => 0.0,               // exact ties on zero, across many blocks
+                1 => -0.0,              // the one IEEE-vs-bitmap disagreement
+                2 => 3.5,               // exact ties on a normal value
+                _ => v,
+            };
+        }
+    }
+
+    let sc_bytes: Vec<u8> = sc.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let sc_dev = upload(g, &sc_bytes);
+    let lists_dev = g.alloc(rows * topk * 4).unwrap();
+
+    ops::qsa_topk_rows(
+        g,
+        k,
+        sc_dev,
+        lists_dev,
+        rows as u32,
+        first_pos as u32,
+        stride as u32,
+        ratio as u32,
+        topk as u32,
+        stream,
+    )
+    .unwrap();
+    g.synchronize(stream).unwrap();
+
+    let mut raw = vec![0u8; rows * topk * 4];
+    g.copy_d2h(lists_dev, &mut raw).unwrap();
+    let got: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    for r in 0..rows {
+        let complete = (first_pos + r + 1) / ratio;
+        let row = &sc[r * stride..r * stride + complete];
+        let mut order: Vec<u32> = (0..complete as u32).collect();
+        order.sort_by(|&a, &b| {
+            row[b as usize]
+                .partial_cmp(&row[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        let want: Vec<i32> = order[..topk].iter().map(|&v| v as i32).collect();
+        let mine = &got[r * topk..(r + 1) * topk];
+        assert_eq!(
+            want, mine,
+            "row {r} (complete={complete}) list differs from the host selection"
+        );
+    }
+    println!("qsa_topk_rows == host selection on {rows} rows x {topk}");
+}
+
 /// Minimal repro for the dense chunk-0 flash zeroing rows past ~1280 at
 /// qwen4_exp geometry (nq=24, nkv=2, hd=256, causal, seq 2809). Synthetic
 /// q/k/v, CPU reference at probe rows. If this passes, the corruption is in

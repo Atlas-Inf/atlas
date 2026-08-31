@@ -231,6 +231,48 @@ pub fn qsa_score_rows(
         .launch(stream)
 }
 
+/// Block width of [`qsa_topk_rows`]; must match `QSA_TOPK_K` in
+/// `qsa_indexer.cu`, and bounds the `topk` it can serve.
+pub const QSA_TOPK_K: u32 = 512;
+
+/// Whether the GPU selection can serve this shape. `topk` must fit the running
+/// best-K the kernel keeps in shared memory; anything wider falls back to the
+/// host path, which has no such bound.
+pub fn qsa_topk_rows_ok(topk: u32) -> bool {
+    topk > 0 && topk <= QSA_TOPK_K
+}
+
+/// Stage 1B: per-row top-k block selection, on the GPU.
+///
+/// Replaces a D2H of the whole score matrix, a host sort per row and an H2D of
+/// the lists — a full stream drain per attention layer per slab, measured at
+/// 7.3 s of DEAD GPU on a 30k prefill. Produces the identical list, in the
+/// identical order; see the kernel note for why that is by construction.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_topk_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    scores: DevicePtr,
+    lists: DevicePtr,
+    rows: u32,
+    first_pos: u32,
+    score_stride: u32,
+    ratio: u32,
+    topk: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, 1, 1])
+        .block([QSA_TOPK_K, 1, 1])
+        .arg_ptr(scores)
+        .arg_ptr(lists)
+        .arg_u32(first_pos)
+        .arg_u32(score_stride)
+        .arg_u32(ratio)
+        .arg_u32(topk)
+        .launch(stream)
+}
+
 /// Stage 2: per-row selected-set attention, overwriting the context rows.
 #[allow(clippy::too_many_arguments)]
 pub fn qsa_prefill_attn(
