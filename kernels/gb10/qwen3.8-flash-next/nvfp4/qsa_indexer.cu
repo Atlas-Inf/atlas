@@ -780,16 +780,34 @@ extern "C" __global__ void qsa_prefill_attn_g(
     }
 
     const int* my_list = lists + (size_t)r * topk;
+    // `ratio` and `block_size` are runtime arguments, so nvcc emits a full
+    // integer-division sequence for each of the four divides below -- and they
+    // run once per lane per key, ~2048 keys per (row, head-group). Both are
+    // powers of two in every shipped configuration (4 and 16), so decompose
+    // once here and shift in the loop. Exact integer arithmetic either way; the
+    // `_gen` fallback keeps a non-power-of-two configuration correct.
+    const bool ratio_p2 = ratio != 0u && (ratio & (ratio - 1u)) == 0u;
+    const bool bs_p2 = block_size != 0u && (block_size & (block_size - 1u)) == 0u;
+    const unsigned int ratio_sh = ratio_p2 ? (unsigned int)(__ffs((int)ratio) - 1) : 0u;
+    const unsigned int ratio_mask = ratio_p2 ? (ratio - 1u) : 0u;
+    const unsigned int bs_sh = bs_p2 ? (unsigned int)(__ffs((int)block_size) - 1) : 0u;
+    const unsigned int bs_mask = bs_p2 ? (block_size - 1u) : 0u;
+    const unsigned int topk_ratio = topk * ratio;
+
     for (unsigned int t = warp; t < n_tok; t += QSA_PA_WARPS) {
         unsigned int tok;
-        if (t < topk * ratio) {
-            tok = (unsigned int)my_list[t / ratio] * ratio + (t % ratio);
+        if (t < topk_ratio) {
+            const unsigned int li = ratio_p2 ? (t >> ratio_sh) : (t / ratio);
+            const unsigned int lo = ratio_p2 ? (t & ratio_mask) : (t % ratio);
+            tok = (unsigned int)my_list[li] * ratio + lo;
         } else {
-            tok = complete * ratio + (t - topk * ratio);
+            tok = complete * ratio + (t - topk_ratio);
         }
+        const unsigned int pg = bs_p2 ? (tok >> bs_sh) : (tok / block_size);
+        const unsigned int inb = bs_p2 ? (tok & bs_mask) : (tok % block_size);
         const unsigned long long off =
-            (unsigned long long)(unsigned int)block_table[tok / block_size] * page_stride
-            + (unsigned long long)(tok % block_size) * row_elems
+            (unsigned long long)(unsigned int)block_table[pg] * page_stride
+            + (unsigned long long)inb * row_elems
             + (unsigned long long)kvh * hd;
         // ONE K row and ONE V row for all QSA_PA_G heads -- this is the point.
         const __nv_bfloat16* krow = k_cache + off;
