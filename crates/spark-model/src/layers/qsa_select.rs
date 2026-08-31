@@ -283,10 +283,10 @@ impl QsaIndexer {
             // metric. Kept in-tree, exercised by
             // `qsa_score_rows_gemm_vs_reference_drift`, dispatch-disabled until
             // someone runs the real quality gate.
-            if ops::qsa_score_rows_b_ok(self.n_heads, self.hd) {
-                ops::qsa_score_rows_b(
+            if ops::qsa_score_rows_exact_ok(self.n_heads, self.hd) {
+                ops::qsa_score_rows_exact(
                     gpu,
-                    self.k_score_rows_b_k,
+                    self.k_score_rows_exact_k,
                 qpost,
                 st.block_keys,
                 scores,

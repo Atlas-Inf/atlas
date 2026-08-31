@@ -585,6 +585,88 @@ fn qsa_score_rows_gemm_vs_reference_drift() {
     );
 }
 
+/// `qsa_score_rows_exact` must be BIT-IDENTICAL to `qsa_score_rows` — every
+/// score, every bit.
+///
+/// The point of that kernel is that bit-identity does not require a 128-thread
+/// block-wide reduction, only the same FP addition DAG: it replays the
+/// reference's `__shfl_down_sync` tree inside one thread. If nvcc contracts a
+/// `q*k + t` into an FMA anywhere in that tree, or the warp-partial fold order
+/// drifts, this fails — which is exactly what it is for. A cosine or
+/// small-epsilon check would not catch either.
+#[test]
+#[ignore]
+fn qsa_score_rows_exact_is_bitwise_identical() {
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL='*'");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let stream = g.default_stream();
+    let k_ref = g.kernel("qsa_indexer", "qsa_score_rows").unwrap();
+    let k_exact = g.kernel("qsa_indexer", "qsa_score_rows_exact").unwrap();
+
+    let (rows, n_heads, hd, ratio) = (37usize, 4usize, 128usize, 4usize);
+    let first_pos = 5000usize;
+    let n_blocks_max = (first_pos + rows) / ratio;
+    let stride = n_blocks_max + 8;
+    assert!(ops::qsa_score_rows_exact_ok(n_heads as u32, hd as u32));
+
+    let mut s = 0x9E3779B97F4A7C15u64;
+    let mut nextf = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f32 / 1024.0) - 12.0
+    };
+    let bf = |v: f32| -> u16 { (v.to_bits() >> 16) as u16 };
+
+    let q_host: Vec<f32> = (0..rows * n_heads * hd).map(|_| nextf()).collect();
+    let k_host: Vec<u16> = (0..n_blocks_max * hd).map(|_| bf(nextf())).collect();
+
+    let q_dev = upload(g, &q_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let k_dev = upload(g, &k_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let a_dev = g.alloc(rows * stride * 4).unwrap();
+    let b_dev = g.alloc(rows * stride * 4).unwrap();
+
+    ops::qsa_score_rows(
+        g, k_ref, q_dev, k_dev, a_dev, rows as u32, n_blocks_max as u32,
+        first_pos as u32, stride as u32, ratio as u32, n_heads as u32, hd as u32, stream,
+    )
+    .unwrap();
+    ops::qsa_score_rows_exact(
+        g, k_exact, q_dev, k_dev, b_dev, rows as u32, n_blocks_max as u32,
+        first_pos as u32, stride as u32, ratio as u32, n_heads as u32, hd as u32, stream,
+    )
+    .unwrap();
+    g.synchronize(stream).unwrap();
+
+    let a = dl_f32(g, a_dev, rows * stride);
+    let b = dl_f32(g, b_dev, rows * stride);
+
+    let mut diffs = 0usize;
+    let mut n_cmp = 0usize;
+    let mut first: Option<(usize, usize, f32, f32)> = None;
+    for r in 0..rows {
+        let complete = (first_pos + r + 1) / ratio;
+        for bb in 0..complete {
+            let (x, y) = (a[r * stride + bb], b[r * stride + bb]);
+            n_cmp += 1;
+            if x.to_bits() != y.to_bits() {
+                diffs += 1;
+                if first.is_none() {
+                    first = Some((r, bb, x, y));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        diffs, 0,
+        "exact-tree scorer is not bit-identical: {diffs}/{n_cmp} differ, first {first:?}"
+    );
+    println!("qsa_score_rows_exact == qsa_score_rows on {n_cmp} scores, bit for bit");
+}
+
 /// Minimal repro for the dense chunk-0 flash zeroing rows past ~1280 at
 /// qwen4_exp geometry (nq=24, nkv=2, hd=256, causal, seq 2809). Synthetic
 /// q/k/v, CPU reference at probe rows. If this passes, the corruption is in

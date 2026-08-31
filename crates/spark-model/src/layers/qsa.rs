@@ -92,7 +92,11 @@ pub struct QsaIndexer {
     k_topk_rows_k: KernelHandle,
     /// Tiled scorer: QSA_SR_B outputs per block, bit-identical to
     /// `k_score_rows_k`. See `qsa_score_rows_b`.
+    #[allow(dead_code)] // kept as the fallback below the exact-tree scorer
     k_score_rows_b_k: KernelHandle,
+    /// One thread per score, BIT-IDENTICAL to `k_score_rows_k`: it replays
+    /// the reference reduction tree locally. See `qsa_score_rows_exact`.
+    k_score_rows_exact_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
     /// `QSA_PA_G` q-heads per block. Same math, one K/V read per group
     /// instead of per head; see `ops::qsa_prefill_attn_grouped_ok`.
@@ -168,6 +172,7 @@ impl QsaIndexer {
             k_score_rows_k: gpu.kernel("qsa_indexer", "qsa_score_rows")?,
             k_topk_rows_k: gpu.kernel("qsa_indexer", "qsa_topk_rows")?,
             k_score_rows_b_k: gpu.kernel("qsa_indexer", "qsa_score_rows_b")?,
+            k_score_rows_exact_k: gpu.kernel("qsa_indexer", "qsa_score_rows_exact")?,
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
             k_prefill_attn_g_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_g")?,
             qk_scratch: gpu.alloc(INGEST_SLAB * qk_width * 2)?,
