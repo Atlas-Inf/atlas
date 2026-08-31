@@ -303,6 +303,114 @@ extern "C" __global__ void qsa_score_rows(
 // surrounding dense path needs no other change. Softmax is order-invariant
 // and rope is baked into cached K, so this equals the reference mask.
 // Grid: (rows, nq)  Block: (256,1,1) = 8 warps, warp-striped online softmax.
+// ── Per-row top-k block selection, on the GPU ───────────────────────────
+//
+// WHY THIS EXISTS. The selection used to run on the HOST: copy the whole
+// score matrix D2H, sort each row, copy the list back. That is a full stream
+// drain per attention layer per slab, and it is invisible to any kernel-time
+// profile because while it runs no kernel is running. Measuring GPU IDLE
+// instead (scripts/gaps.py), on a 30k prefill:
+//
+//   qsa_score_rows -> qsa_prefill_attn_g   7279 ms   179 gaps   40.7 ms each
+//
+// 19% of a 41.6 s window, and the largest single item in it. The cost is not
+// the sort algorithm -- that is already O(n) and multi-threaded -- it is
+// shipping `rows x stride` floats (60.8 MB per slab at 30k) across the bus and
+// touching them again on the CPU.
+//
+// EXACTNESS. The list ORDER matters, not just its contents: `qsa_prefill_attn`
+// walks it warp-striped and its online softmax accumulates in list order. So
+// this must reproduce the host's `(score DESCENDING, index ASCENDING)` order
+// exactly. It does so by construction rather than by argument: each element
+// becomes ONE u64 (`qsa_rank_key`, the same monotone f32->u32 map the Rust
+// side uses, inverted for descending, index in the low bits), the keys are
+// DISTINCT because the index is in them, and any correct selection-and-sort of
+// distinct integers has exactly one answer. There is no floating-point
+// reassociation anywhere in here to get wrong.
+//
+// Bitonic top-K: keep a running ascending array of the K best keys, and for
+// each chunk of K new keys sort them ascending, take `min(A[i], B[K-1-i])`
+// (the K smallest of the union, and bitonic by the standard result), then a
+// bitonic merge restores ascending order. K = blockDim.x.
+#define QSA_TOPK_K 512
+
+__device__ __forceinline__ unsigned long long qsa_rank_key(float s, unsigned int idx) {
+    // -0.0f and +0.0f have different bit patterns but compare Equal in IEEE,
+    // so canonicalise before the bit map or the order would differ from the
+    // host comparator on exactly that value. Keep in sync with
+    // `qsa_select.rs::rank_key`.
+    const unsigned int b = (s == 0.0f) ? 0u : __float_as_uint(s);
+    const unsigned int mono = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    return ((unsigned long long)(~mono) << 32) | (unsigned long long)idx;
+}
+
+extern "C" __global__ void qsa_topk_rows(
+    const float* __restrict__ scores,   // [rows, score_stride]
+    int* __restrict__ lists,            // [rows, topk]
+    const unsigned int first_pos,
+    const unsigned int score_stride,
+    const unsigned int ratio,
+    const unsigned int topk
+) {
+    __shared__ unsigned long long s[2 * QSA_TOPK_K];
+    const unsigned int r = blockIdx.x;
+    const unsigned int t = threadIdx.x;
+    const unsigned int complete = (first_pos + r + 1) / ratio;
+    const float* row = scores + (size_t)r * score_stride;
+
+    // Running best-K, seeded with the worst possible key.
+    s[t] = 0xFFFFFFFFFFFFFFFFull;
+    __syncthreads();
+
+    for (unsigned int base = 0; base < complete; base += QSA_TOPK_K) {
+        const unsigned int j = base + t;
+        s[QSA_TOPK_K + t] = (j < complete) ? qsa_rank_key(row[j], j)
+                                           : 0xFFFFFFFFFFFFFFFFull;
+        __syncthreads();
+
+        // Bitonic sort of the incoming chunk, ascending, in place.
+        for (unsigned int k = 2; k <= QSA_TOPK_K; k <<= 1) {
+            for (unsigned int j2 = k >> 1; j2 > 0; j2 >>= 1) {
+                const unsigned int ixj = t ^ j2;
+                if (ixj > t) {
+                    const bool up = ((t & k) == 0);
+                    const unsigned long long a = s[QSA_TOPK_K + t];
+                    const unsigned long long b = s[QSA_TOPK_K + ixj];
+                    if ((a > b) == up) {
+                        s[QSA_TOPK_K + t] = b;
+                        s[QSA_TOPK_K + ixj] = a;
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+        // K smallest of the union of two ascending runs: min(A[i], B[K-1-i]).
+        // The result is bitonic, so one bitonic merge restores ascending.
+        const unsigned long long a = s[t];
+        const unsigned long long b = s[2 * QSA_TOPK_K - 1 - t];
+        __syncthreads();
+        s[t] = (a < b) ? a : b;
+        __syncthreads();
+        for (unsigned int j2 = QSA_TOPK_K >> 1; j2 > 0; j2 >>= 1) {
+            const unsigned int ixj = t ^ j2;
+            if (ixj > t) {
+                const unsigned long long x = s[t];
+                const unsigned long long y = s[ixj];
+                if (x > y) {
+                    s[t] = y;
+                    s[ixj] = x;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (t < topk) {
+        lists[(size_t)r * topk + t] = (int)(unsigned int)(s[t] & 0xFFFFFFFFull);
+    }
+}
+
 #define QSA_PA_WARPS 8
 
 // ── G q-heads per block ──────────────────────────────────────────────────
