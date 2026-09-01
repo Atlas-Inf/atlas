@@ -69,7 +69,7 @@ gate = "bfcl-subset"
 recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
 label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
 default = false
-status = "unmeasured"
+status = "measured"
 note = """\
 FIRST BFCL measurement on any Nemotron target. The recipe serves DSpark, not \
 Atlas MTP: `--dflash` with the published 6-layer Qwen3DSparkModel drafter at \
@@ -83,52 +83,38 @@ the numbers look tidier: with thinking forced off this model returns null \
 content on multi-turn tool follow-ups, which would corrupt exactly the \
 category BFCL scores. The recipe leaves the model default in place and this \
 entry is defined on that. \
-★ RAN 2026-09-01 AND THE RESULT IS NOT USABLE AS A SCORE. overall_accuracy \
-11.26, normalized_single_turn_score 33.33, n=995, 995/995 samples, ZERO \
-transport failures, 3945 s wall. The category breakdown is the tell: \
-hallucination 100.00, live 0.00, non_live 0.00, and every non_live \
-subcategory 0.00 including simple_python. Scoring 100 on the one category \
-whose correct behaviour is NOT to call a tool, and exactly 0 on every category \
-that requires one, is the shape of "no call was ever scored as present". \
-★ THAT IS CONTRADICTED BY DIRECT MEASUREMENT ON THIS EXACT CONFIGURATION. A \
-single-tool request returns a correct, well-formed call - \
-finish_reason=tool_calls, name=get_current_weather, \
-arguments={"location":"San Francisco, CA","unit":"celsius"} - and it does so \
-identically with DSpark ON and with speculation OFF, and over BOTH the \
-non-streaming and the streaming path that the BFCL driver actually uses. The \
-streamed deltas are textbook OpenAI shape: index 0 carrying id/type/name, then \
-incremental `arguments` fragments, terminating with \
-finish_reason "tool_calls". The parser is live and auto-detected \
-(`Tool call parser: qwen3_coder (auto-detected from model_type)`) and the \
-server logged tools_active=true on all 367 tool-bearing requests of the run. \
-CONCLUSION: the generation half demonstrably works and the failure is \
-somewhere in the generation-to-AST-scoring handoff. The exact mechanism is NOT \
-identified. So this run neither certifies nor condemns the DSpark port, the \
-entry stays `unmeasured`, and NO THRESHOLD IS SET FROM 11.26 - a bar taken \
-from a number this contradicted would be worse than no bar. LOCALISED 2026-09-01, after dumping that file. \
-`~/.atlas/artifacts/bfcl/responses.jsonl` (the driver keeps it so a run can be \
-rescored) holds 995 lines and EVERY ONE reads \
-`"has_tool_calls": false, "tool_calls": []`. So the Python AST checker scored \
-faithfully what it was handed - the loss is upstream of scoring, in the \
-GENERATION half of the driver. Ruled out, each by direct experiment on this \
-same server: DSpark (identical call with --dflash and with speculation off); \
-streaming (the SSE deltas carry index 0 with id/type/name then incremental \
-`arguments`, terminating finish_reason "tool_calls"); BFCL's non-JSON-Schema \
-`{"type":"dict"}` parameter shape (schema.rs normalises dict->object and the \
-call still comes back correct); tool grammar (--disable-tool-grammar true \
-changes nothing); and request construction (the driver sends tool_choice auto, \
-temperature 0.0, max_tokens 1024 - equivalent to the hand-sent request). The \
-control is exact: the dataset's own first sample, calculate_triangle_area with \
-base 10 and height 5, returns a correct well-formed call when sent by hand to \
-this server. \
-WHAT IS LEFT is the one thing not controlled for - `atlas_plugin::http::\
-chat_stream`, a hand-rolled TCP + SSE client, where the by-hand control used \
-curl. That is where to look next; the accumulator in http.rs:217 reads correct \
-and has a passing unit test, so suspect the transport/chunk framing above it \
-rather than the delta merge itself. NOT PROVEN, but every alternative that \
-could be tested has been eliminated. \
-★ THE CONSEQUENCE FOR THIS PORT: ST-995 does not implicate DSpark. Tool calling \
-on this checkpoint works."""
+★ RAN TWICE, AND THE FIRST RUN WAS AN ARTEFACT. 2026-09-01 read overall \
+11.26 / normalized 33.33. Cause: the server served `nemotron_h.jinja`, not the \
+`nemotron_lightning.jinja` this target declares, because template selection \
+keyed on `model_type` alone and three gb10 targets all declare `nemotron_h`. \
+The Nano template seeds an OPEN <think> block on the generation prompt, so the \
+model emitted its tool call as reasoning_content, the think-loop watchdog \
+force-closed </think> at 64 tokens, and every reply ended on \
+finish_reason=length with empty content and no tool_calls. hallucination \
+100.00 with everything else 0.00 was the fingerprint of an EMPTY REPLY, not of \
+a lost call - score.py scores hallucination 1.0 when has_tool_calls is false. \
+Fixed by honouring [behavior].jinja_template. \
+★ THE MEASUREMENT THAT COUNTS, corrected template, same recipe, same binary: \
+overall_accuracy 64.22, normalized_single_turn_score 71.25, n=995, 995/995 \
+samples, zero transport failures, 7253 s. By category: hallucination 94.51, \
+live 68.24, non_live 51.01. Hallucination FALLING from 100.00 is the healthy \
+direction - at 11.26 it scored a perfect 100 only because the model never \
+called a tool at all, so it trivially passed the one category whose correct \
+behaviour is silence. \
+★ WHAT THIS NUMBER EMBEDS, so nobody reads it as uniform. parallel 28.23 and \
+parallel_multiple 31.45 against simple_python 76.61 and multiple 80.65: a 2.5x \
+gap confined to PARALLEL calling. Two failure modes, both observed directly - \
+truncation (emits the first call, silently drops the rest) and merging \
+(collapses several calls into one with array arguments). Ruled out as causes: \
+the tool grammar (--disable-tool-grammar gives byte-identical output) and the \
+template's singular phrasing (an A/B adding an explicit multi-call instruction \
+moved 3/10 to 4/10 on the parallel subset - one sample, not a signal). Treated \
+as checkpoint behaviour until evidence says otherwise. \
+★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
+under a single first measurement so a real regression trips them and ordinary \
+variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
+use; read it as the number to notice moving. Ratchet after a second recorded \
+run, never to the best."""
 
 # ── The perf leg ────────────────────────────────────────────────────────────
 # decode-floor, the two TTFT guards and the concurrency sweep, run as one set.
@@ -136,6 +122,15 @@ on this checkpoint works."""
 # that throttles mid-run marks its own record INVALID (hardware_state.postcheck)
 # and those numbers must not be quoted. Check that flag on every record before
 # ratcheting a threshold from it.
+
+[benchmarks.metrics.overall_accuracy]
+min = 60.0
+noise = 0.5
+
+[benchmarks.metrics.normalized_single_turn_score]
+min = 66.0
+noise = 0.5
+
 [[benchmarks]]
 quant = "nvfp4"
 checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
@@ -150,7 +145,16 @@ acceptance measurement wearing a decode-rate hat: the drafter proposes gamma=4 \
 and the target verifies K=3 in one batched step, so the decode number moves \
 with acceptance, and an acceptance regression that leaves output correct still \
 shows up here. Record `output_tokens` and `runs` alongside it — a fast median \
-over runs that decoded almost nothing is not a floor."""
+over runs that decoded almost nothing is not a floor. \
+★ RE-RUN 2026-09-01 ON THE CORRECTED CHAT TEMPLATE and it is STILL \
+INCONCLUSIVE, by a smaller margin. 472 tokens per run (was 259), 67.4 / 67.2 / \
+71.5 tok/s (was 65.9 / 66.0 / 65.9). The model now reasons before answering \
+instead of dying at 64 thinking tokens, which is where the extra 213 tokens \
+come from, but 472 is still under the 750-token vacuity floor and score.rs \
+holds that as a CONSTANT, not a parameter. So this gate cannot certify this \
+checkpoint on this prompt no matter how the engine performs, and the entry \
+stays unmeasured. Fixing it needs a longer fixed prompt, which changes what \
+every other target measured - a separate decision, not one to make here."""
 
 [[benchmarks]]
 quant = "nvfp4"
@@ -220,7 +224,7 @@ gate = "concurrency-sweep"
 recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
 label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
 default = false
-status = "unmeasured"
+status = "measured"
 note = """\
 The C=1..32 ladder. ★ THE RECIPE'S `gpu_memory_utilization: 0.80` IS LOAD- \
 BEARING FOR THIS GATE AND IS NOT A TUNING KNOB. Measured on a GB10 (119 GB \
@@ -245,7 +249,31 @@ the server-side decode rate, not aggregate throughput, so its peak at C=1 is \
 arithmetic and not a scaling failure. Decode rate is flat across every rung and \
 every ISL while TTFT degrades ~68x, which is what `max_batch_size: 8` predicts - \
 at C=16 and C=32 requests are QUEUEING, not batching. Still no thresholds: this \
-gate is not required and a curve is not a bound."""
+gate is not required and a curve is not a bound. \
+★ MEASURED 2026-09-01 ON THE CORRECTED TEMPLATE, and it reproduces the \
+pre-fix run closely enough to trust: 24/24 cells, ZERO request errors, peak \
+60.0 tok/s at concurrency 2, best TTFT p50 506 ms. Aggregate throughput is \
+FLAT across the ladder - 59.9 / 60.0 / 55.8 / 51.8 / 54.4 / 51.8 tok/s at \
+C=1..32 on ISL 128 - while TTFT p50 degrades 506 ms to 38.7 s over the same \
+range, about 76x. That is what max_batch_size 8 predicts: past 8 the rungs \
+queue, so added concurrency buys latency, not throughput. Longer inputs shift \
+the whole curve down (36.4 tok/s at C=1 on ISL 2048) without changing its \
+shape. \
+★ THE PERF LEG TURNED OUT TO BE TEMPLATE-INSENSITIVE. Before/after the \
+template fix: ttft-cold 905.2 -> 905.5 ms median, ttft-warm 900.8 -> 904.2, \
+sweep throughput 48-58 -> 51.8-60 tok/s. That is the expected result once \
+stated plainly - these probes pin the output length, and the template changes \
+GENERATION, not prefill or token count. Only the accuracy leg (ST-995, 11.26 \
+-> 64.22) was destroyed by it. Do not generalise "the wrong template \
+invalidated the measurements" to the speed numbers; it did not. \
+★ THE BOUND BELOW IS A BLOWUP DETECTOR, not a perf gate. c1_aggregate_tok_s \
+is floored well under the two agreeing measurements so a real collapse trips \
+it and ordinary variance does not."""
+
+[benchmarks.metrics.c1_aggregate_tok_s]
+min = 50.0
+noise = 1.0
+
 
 # ── The correctness gate the DSpark verify path most needs ──────────────────
 [[benchmarks]]
