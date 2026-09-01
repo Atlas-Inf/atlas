@@ -446,6 +446,12 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t(
 #define K_STEP_T64 64
 #define PAD_T64 8  // (64+8)*2 = 144 bytes, 144%16 = 0 ✓
 
+// NOTE ON SHARING: this file is the real one for qwen3.6-35b-a3b and is
+// SYMLINKED by gb10/{qwen3.8-flash-next, ornith-1.0-9b, holo-3.1-0.8b,
+// holo-3.1-4b, holo-3.1-35b-a3b} and strix/qwen3.6-35b-a3b. The m-tile striding
+// below is bit-identical at the grid every one of them launches today; only a
+// model that also ships `moe_persist_marker.cu` gets the shortened grid.
+
 extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ B_packed_ptrs,
@@ -466,10 +472,7 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     const int M_expert = m_end - m_start;
     if (M_expert <= 0) return;
 
-    const int cta_m_local = blockIdx.y * M_TILE;
-    if (cta_m_local >= M_expert) return;
 
-    const unsigned int cta_m = m_start + cta_m_local;
     const unsigned int cta_n = blockIdx.x * N_TILE_LG;
 
     const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
@@ -495,6 +498,32 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     __shared__ int smem_tok_k64[M_TILE];
 
     if (threadIdx.x < 16) smem_LUT_k64[threadIdx.x] = E2M1_LUT_MOE[threadIdx.x];
+    // ── PERSISTENT M-TILE LOOP ──
+    // `grid.y` is sized by the HOTTEST expert. At 29,671 tokens the hottest of
+    // 512 experts needs 217 tiles while the average needs 10, so ~95% of the
+    // 1.11M CTAs launched only to fall out at the bound below.
+    //
+    // Those empty CTAs are NOT free. This kernel's static shared memory caps
+    // residency at 2 CTAs/SM, so the part retires ~96 at a time and a million
+    // no-ops serialise ahead of the real work: capping `grid.y` at 8x the
+    // average expert took a 29.7k prefill from 19.23 s to 17.40 s (measured
+    // 2026-09-01, TTFT= from the scheduler).
+    //
+    // So stride `blockIdx.y` instead of returning: the host may then size the
+    // grid by the AVERAGE expert while every expert still computes every row.
+    // At `gridDim.y == max_m_tiles` -- what the host passes unless
+    // ATLAS_MOE_PREFILL_PERSIST_TILES is set -- the loop runs exactly once for
+    // each CTA that had work and not at all for the rest, which is what the
+    // non-striding kernel did, instruction for instruction.
+    for (unsigned int cta_m_local = blockIdx.y * M_TILE;
+         cta_m_local < (unsigned int)M_expert;
+         cta_m_local += gridDim.y * M_TILE) {
+    // Re-entry barrier: the previous iteration's last MMA is still reading
+    // smem_A / smem_B_fp8 when a faster warp reaches the staging below.
+    // Redundant on the first iteration, and on the single-iteration grid that
+    // is every launch today.
+    __syncthreads();
+    const unsigned int cta_m = m_start + cta_m_local;
     if (threadIdx.x < M_TILE) {
         int local_row = threadIdx.x;
         if (sorted_token_ids && (cta_m_local + local_row) < (unsigned int)M_expert)
@@ -684,6 +713,7 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
         if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
         if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
     }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -716,8 +746,6 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     const int M_expert = m_end - m_start;
     if (M_expert <= 0) return;
 
-    const int cta_m_local = blockIdx.y * M_TILE;
-    if (cta_m_local >= M_expert) return;
 
     const unsigned int global_n = blockIdx.x * N_TILE_LG;
     const bool is_up = (global_n >= N);
@@ -741,7 +769,6 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
 
     if (B_expert == 0) return;
 
-    const unsigned int cta_m = m_start + cta_m_local;
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
@@ -757,6 +784,32 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     __shared__ int smem_tok_fgu64[M_TILE];
 
     if (threadIdx.x < 16) smem_LUT_fgu64[threadIdx.x] = E2M1_LUT_MOE[threadIdx.x];
+    // ── PERSISTENT M-TILE LOOP ──
+    // `grid.y` is sized by the HOTTEST expert. At 29,671 tokens the hottest of
+    // 512 experts needs 217 tiles while the average needs 10, so ~95% of the
+    // 1.11M CTAs launched only to fall out at the bound below.
+    //
+    // Those empty CTAs are NOT free. This kernel's static shared memory caps
+    // residency at 2 CTAs/SM, so the part retires ~96 at a time and a million
+    // no-ops serialise ahead of the real work: capping `grid.y` at 8x the
+    // average expert took a 29.7k prefill from 19.23 s to 17.40 s (measured
+    // 2026-09-01, TTFT= from the scheduler).
+    //
+    // So stride `blockIdx.y` instead of returning: the host may then size the
+    // grid by the AVERAGE expert while every expert still computes every row.
+    // At `gridDim.y == max_m_tiles` -- what the host passes unless
+    // ATLAS_MOE_PREFILL_PERSIST_TILES is set -- the loop runs exactly once for
+    // each CTA that had work and not at all for the rest, which is what the
+    // non-striding kernel did, instruction for instruction.
+    for (unsigned int cta_m_local = blockIdx.y * M_TILE;
+         cta_m_local < (unsigned int)M_expert;
+         cta_m_local += gridDim.y * M_TILE) {
+    // Re-entry barrier: the previous iteration's last MMA is still reading
+    // smem_A / smem_B_fp8 when a faster warp reaches the staging below.
+    // Redundant on the first iteration, and on the single-iteration grid that
+    // is every launch today.
+    __syncthreads();
+    const unsigned int cta_m = m_start + cta_m_local;
     if (threadIdx.x < M_TILE) {
         int local_row = threadIdx.x;
         if (sorted_token_ids && (cta_m_local + local_row) < (unsigned int)M_expert)
@@ -938,6 +991,7 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
         if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
         if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
         if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+    }
     }
 }
 
