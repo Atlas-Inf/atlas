@@ -82,7 +82,32 @@ cap_thinking_at_max_tokens = false). Do NOT pass --disable-thinking to make \
 the numbers look tidier: with thinking forced off this model returns null \
 content on multi-turn tool follow-ups, which would corrupt exactly the \
 category BFCL scores. The recipe leaves the model default in place and this \
-entry is defined on that."""
+entry is defined on that. \
+★ RAN 2026-09-01 AND THE RESULT IS NOT USABLE AS A SCORE. overall_accuracy \
+11.26, normalized_single_turn_score 33.33, n=995, 995/995 samples, ZERO \
+transport failures, 3945 s wall. The category breakdown is the tell: \
+hallucination 100.00, live 0.00, non_live 0.00, and every non_live \
+subcategory 0.00 including simple_python. Scoring 100 on the one category \
+whose correct behaviour is NOT to call a tool, and exactly 0 on every category \
+that requires one, is the shape of "no call was ever scored as present". \
+★ THAT IS CONTRADICTED BY DIRECT MEASUREMENT ON THIS EXACT CONFIGURATION. A \
+single-tool request returns a correct, well-formed call - \
+finish_reason=tool_calls, name=get_current_weather, \
+arguments={"location":"San Francisco, CA","unit":"celsius"} - and it does so \
+identically with DSpark ON and with speculation OFF, and over BOTH the \
+non-streaming and the streaming path that the BFCL driver actually uses. The \
+streamed deltas are textbook OpenAI shape: index 0 carrying id/type/name, then \
+incremental `arguments` fragments, terminating with \
+finish_reason "tool_calls". The parser is live and auto-detected \
+(`Tool call parser: qwen3_coder (auto-detected from model_type)`) and the \
+server logged tools_active=true on all 367 tool-bearing requests of the run. \
+CONCLUSION: the generation half demonstrably works and the failure is \
+somewhere in the generation-to-AST-scoring handoff. The exact mechanism is NOT \
+identified. So this run neither certifies nor condemns the DSpark port, the \
+entry stays `unmeasured`, and NO THRESHOLD IS SET FROM 11.26 - a bar taken \
+from a number this contradicted would be worse than no bar. What would settle \
+it: dump the responses file the Rust driver hands the Python checker and score \
+one simple_python sample by hand."""
 
 # ── The perf leg ────────────────────────────────────────────────────────────
 # decode-floor, the two TTFT guards and the concurrency sweep, run as one set.
