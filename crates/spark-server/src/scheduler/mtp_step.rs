@@ -528,7 +528,7 @@ pub fn step_mtp(
                     dflash_verify_raw_argmax,
                 );
             } else {
-    step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
+                step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
             }
         } else {
             // Model can't batch this width (or a lone leftover): fall back

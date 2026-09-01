@@ -223,67 +223,31 @@ mod tests {
 
     #[test]
     fn disabled_or_missing_batch_gemv_uses_transposed_fallback() {
-        let disabled = select_lm_head_nvfp4_route(
-            8,
-            false,
-            KernelHandle(82),
-            true,
-            true,
-        );
+        let disabled = select_lm_head_nvfp4_route(8, false, KernelHandle(82), true, true);
         assert!(matches!(disabled, LmHeadNvfp4Route::TransposedBf16));
 
-        let missing_handle = select_lm_head_nvfp4_route(
-            8,
-            true,
-            KernelHandle(0),
-            true,
-            true,
-        );
+        let missing_handle = select_lm_head_nvfp4_route(8, true, KernelHandle(0), true, true);
         assert!(matches!(missing_handle, LmHeadNvfp4Route::TransposedBf16));
     }
 
     #[test]
     fn transposed_fallback_prefers_bf16_then_other_for_wide_batches() {
-        let bf16 = select_lm_head_nvfp4_route(
-            17,
-            true,
-            KernelHandle(0),
-            true,
-            true,
-        );
+        let bf16 = select_lm_head_nvfp4_route(17, true, KernelHandle(0), true, true);
         assert!(matches!(bf16, LmHeadNvfp4Route::TransposedBf16));
 
-        let other = select_lm_head_nvfp4_route(
-            17,
-            true,
-            KernelHandle(0),
-            false,
-            true,
-        );
+        let other = select_lm_head_nvfp4_route(17, true, KernelHandle(0), false, true);
         assert!(matches!(other, LmHeadNvfp4Route::TransposedOther));
     }
 
     #[test]
     fn missing_transposed_fallback_uses_plain_gemm() {
-        let route = select_lm_head_nvfp4_route(
-            17,
-            true,
-            KernelHandle(0),
-            false,
-            false,
-        );
+        let route = select_lm_head_nvfp4_route(17, true, KernelHandle(0), false, false);
         assert!(matches!(route, LmHeadNvfp4Route::PlainGemm));
     }
 
     #[test]
     fn small_batch_without_exact_gemv_keeps_plain_gemm_fallback() {
-        let route = select_lm_head_nvfp4_route(
-            4,
-            false,
-            KernelHandle(0),
-            true,
-            true,
-        );
+        let route = select_lm_head_nvfp4_route(4, false, KernelHandle(0), true, true);
         assert!(matches!(route, LmHeadNvfp4Route::PlainGemm));
     }
 }
