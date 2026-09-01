@@ -272,12 +272,40 @@ between rounds on a healthy engine. \
 ★ ATTEMPTED 2026-09-01 AND IT COULD NOT EVALUATE THIS CHECKPOINT AT ALL. The \
 gate failed on its REFERENCE round, not on a replay: \
 `reference round failed the script anchors (turn 2: line 1 does not start with \
-its number ...) - replays compared against it would certify nothing`. The model \
-does not emit the numbered-line format the gate's script requires, so there is \
-no valid reference to compare replays against. NOTHING ABOUT SSM POISONING WAS \
-TESTED - this is not a pass and it is not a failure of the rollback path; it is \
-the gate being unable to run. That matters more here than on any other target, \
-because this is the gate the DSpark merge most needs. Probably downstream of \
-this model's thinking_default = true, which the recipe deliberately does not \
-override. Fixing it needs a model-appropriate prompt or a thinking-aware \
-extractor."""
+its number ...) - replays compared against it would certify nothing`. NOTHING \
+ABOUT SSM POISONING WAS TESTED - not a pass, not a failure of the rollback \
+path; the gate could not run. \
+\
+TWO SEPARATE CAUSES, established 2026-09-01, and only the first is fixed. \
+\
+(1) THE REFERENCE FORMAT. `probe.rs` documents this exact failure mode: with \
+thinking ON the gate 'burns the token budget then truncates turns 2-3 \
+(finish_reason=length) and over-produces (turn 2 gave 5 numbered lines, not \
+3)'. That is what was observed. It is compounded by the template bug fixed in \
+this branch - the run used `nemotron_h.jinja` instead of the declared \
+`nemotron_lightning.jinja`, which seeds an OPEN <think> block, so the model \
+could not emit terse numbered lines even in principle. The canonical fix is \
+the one qwen3.6-35b-a3b already uses: `--serve-override disable_thinking=true` \
+(NOT per-request chat_template_kwargs). RE-ATTEMPT after the template fix with \
+that override before concluding anything about the format. \
+\
+(2) THE VACUITY BLOCKER, WHICH IS NOT FIXED AND IS NOT FIXABLE HERE. This gate \
+detects poisoning as a byte-difference between REPLAYS THAT RESTORE FROM A \
+MARCONI PREFIX-CACHE SNAPSHOT; `probe.rs` sizes LONG_PREFIX specifically so \
+'every later round's prefill lands as a prefix-cache restore', and \
+qwen3.6-35b-a3b bounds `min_cached_prompt_tokens` as its VACUITY ATTESTATION. \
+This recipe pins `enable_prefix_caching: false` - deliberately, against the \
+SM12.x DFlash multi-turn correctness regression - so every round is cache-cold, \
+`min_cached_prompt_tokens` is 0, and there is no restore to poison. Bound that \
+metric when thresholds are set here: without it the gate would read GREEN off \
+twelve trivially-identical cold rounds, which is worse than the red it reads \
+today. \
+\
+WHAT THIS DOES NOT EXCUSE. The conv_bytes=0 rollback hazard above is a \
+WITHIN-GENERATION defect - live SSM state surviving a rejected draft - and it \
+does not need prefix caching to manifest. Disabling the cache removes this \
+gate's detection mechanism, NOT the hazard. The instrument that does reach it \
+without a cache is greedy output-equivalence: with greedy verification a \
+correct speculative decoder is exactly output-preserving, so `--dflash` on vs \
+off at temperature 0 must be token-identical, and a failed rollback shows up \
+as divergence. Run that before treating the rollback path as exercised."""
