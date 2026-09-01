@@ -582,6 +582,28 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     } while(0)
 
     // Dequant B: FP4 → FP8 E4M3, 4 scale groups for K64
+#ifdef MOE_PROBE_CHEAP_DEQUANT
+    // ── MEASUREMENT PROBE ONLY -- PRODUCES WRONG OUTPUT, NEVER SHIP. ──
+    // Selected by -DMOE_PROBE_CHEAP_DEQUANT in a target's KERNEL.toml.
+    //
+    // The K-step pipeline runs MMA -> barrier -> DEQUANT -> barrier -> MMA, so
+    // the FP4->FP8 conversion of the whole B tile is serialised with the tensor
+    // cores instead of overlapping them. This kernel measures 39 TFLOP/s where
+    // cuBLAS reaches 156 at the same shape, and that serialisation is the
+    // leading suspect. Stubbing the conversion prices it: both barriers stay,
+    // both cp.async streams stay, and the MMA still issues the same
+    // instructions against the same shared memory. Only the conversion goes.
+    //
+    // One read of smem_Bp is kept so this cannot be mistaken for a probe that
+    // also deleted B's global traffic, and the LUT and scale2 are read so the
+    // shared-memory FOOTPRINT is unchanged -- drop them and nvcc frees the LUT's
+    // allocation, occupancy moves, and the probe measures two things at once.
+    #define K64_DEQUANT(buf) do { \
+        unsigned int my_n = threadIdx.x; \
+        *(unsigned int*)&smem_B_fp8_k64[my_n][0] = (unsigned int)smem_Bp_k64[(buf)][0][my_n] \
+            + (unsigned int)(smem_LUT_k64[my_n & 15] * scale2); \
+    } while(0)
+#else
     #define K64_DEQUANT(buf) do { \
         unsigned int my_n = threadIdx.x; \
         __nv_fp8_e4m3 f0, f1, f2, f3; \
@@ -634,6 +656,7 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
             *(unsigned short*)&smem_B_fp8_k64[my_n][kp * 2] = fp8_pair; \
         } \
     } while(0)
+#endif
 
     // Two m16n8k32 MMA calls per N-tile: first covers k=0..31, second k=32..63.
     // a0..a3 loaded first, all N-tile first-half MMAs done, then a4..a7, then second-half.
@@ -864,6 +887,28 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
         } \
     } while(0)
 
+#ifdef MOE_PROBE_CHEAP_DEQUANT
+    // ── MEASUREMENT PROBE ONLY -- PRODUCES WRONG OUTPUT, NEVER SHIP. ──
+    // Selected by -DMOE_PROBE_CHEAP_DEQUANT in a target's KERNEL.toml.
+    //
+    // The K-step pipeline runs MMA -> barrier -> DEQUANT -> barrier -> MMA, so
+    // the FP4->FP8 conversion of the whole B tile is serialised with the tensor
+    // cores instead of overlapping them. This kernel measures 39 TFLOP/s where
+    // cuBLAS reaches 156 at the same shape, and that serialisation is the
+    // leading suspect. Stubbing the conversion prices it: both barriers stay,
+    // both cp.async streams stay, and the MMA still issues the same
+    // instructions against the same shared memory. Only the conversion goes.
+    //
+    // One read of smem_Bp is kept so this cannot be mistaken for a probe that
+    // also deleted B's global traffic, and the LUT and scale2 are read so the
+    // shared-memory FOOTPRINT is unchanged -- drop them and nvcc frees the LUT's
+    // allocation, occupancy moves, and the probe measures two things at once.
+    #define FGU64_DEQUANT(buf) do { \
+        unsigned int my_n = threadIdx.x; \
+        *(unsigned int*)&smem_B_fp8_fgu64[my_n][0] = (unsigned int)smem_Bp_fgu64[(buf)][0][my_n] \
+            + (unsigned int)(smem_LUT_fgu64[my_n & 15] * scale2); \
+    } while(0)
+#else
     #define FGU64_DEQUANT(buf) do { \
         unsigned int my_n = threadIdx.x; \
         __nv_fp8_e4m3 f0, f1, f2, f3; \
@@ -916,6 +961,7 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
             *(unsigned short*)&smem_B_fp8_fgu64[my_n][kp * 2] = fp8_pair; \
         } \
     } while(0)
+#endif
 
     #define FGU64_COMPUTE_MMA(a_buf) do { \
         const unsigned short* sA = (const unsigned short*)smem_A_fgu64[(a_buf)]; \
