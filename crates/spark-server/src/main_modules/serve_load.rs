@@ -720,6 +720,7 @@ pub(crate) fn load_model(
         eos_tokens[0],
         supports_thinking,
         &config.model_type,
+        ptx_set.behavior.jinja_template,
         Some(std::path::Path::new(".")), // repo root for override templates
         args.disable_template_overrides,
     )?;

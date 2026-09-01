@@ -226,6 +226,15 @@ pub struct ModelBehavior {
     /// a different parser than its siblings (e.g. Nemotron-Super-120B uses
     /// `bare_json` while Nemotron-Nano-30B stays on `qwen3_coder`).
     pub tool_call_parser: &'static str,
+    /// Per-target chat-template override, e.g. `"nemotron_lightning.jinja"`.
+    /// Empty string = fall back to `jinja-templates/{model_type}.jinja`.
+    ///
+    /// Needed because `model_type` is NOT unique per checkpoint: three kernel
+    /// targets (nemotron-3.5-lightning-30b-a3b, nemotron-3-nano-30b-a3b,
+    /// nemotron-super-120b-a12b) all declare `nemotron_h` while needing
+    /// different templates. Under the Nano template Lightning emits its tool
+    /// call inside the seeded `<think>` block, so every call is lost.
+    pub jinja_template: &'static str,
     /// Enable the content-loop watchdog (period-N token-repetition detector
     /// at `decode_logits_step.rs:230`). Default: `false` — most models
     /// terminate cleanly via EOS / `max_tokens` without it. Models with a
@@ -379,6 +388,7 @@ impl Default for ModelBehavior {
             disable_cwd_hint_injection: false,
             use_sampling_presets_for_core: false,
             tool_call_parser: "",
+            jinja_template: "",
             enable_loop_watchdog: false,
             enable_think_loop_watchdog: true,
             honor_eos_inside_thinking: false,

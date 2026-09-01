@@ -292,15 +292,32 @@ impl serde_json::ser::Formatter for PythonJsonFormatter {
     }
 }
 
-/// Try loading an override template from jinja-templates/{model_type}.jinja.
-pub(super) fn load_override_template(model_type: &str, repo_root: Option<&Path>) -> Option<String> {
+/// Try loading an override template from `jinja-templates/`.
+///
+/// `template_override` is MODEL.toml `[behavior].jinja_template` and WINS over
+/// the `{model_type}.jinja` default, because `model_type` is not unique per
+/// checkpoint: nemotron-3.5-lightning-30b-a3b, nemotron-3-nano-30b-a3b and
+/// nemotron-super-120b-a12b all declare `nemotron_h` and need different
+/// templates. Selecting on `model_type` alone silently served Lightning the
+/// Nano template, which seeds an open `<think>` block on a tool request — the
+/// model then emits its tool call as reasoning and every call is lost.
+pub(super) fn load_override_template(
+    model_type: &str,
+    template_override: &str,
+    repo_root: Option<&Path>,
+) -> Option<String> {
+    let named = !template_override.is_empty();
+    let file = if !named {
+        format!("{model_type}.jinja")
+    } else if template_override.ends_with(".jinja") {
+        template_override.to_string()
+    } else {
+        format!("{template_override}.jinja")
+    };
     // Check relative to repo root (Docker: /build, dev: /workspace/atlas)
     let candidates = [
-        repo_root.map(|r| {
-            r.join(TEMPLATE_OVERRIDE_DIR)
-                .join(format!("{model_type}.jinja"))
-        }),
-        Some(std::path::PathBuf::from(TEMPLATE_OVERRIDE_DIR).join(format!("{model_type}.jinja"))),
+        repo_root.map(|r| r.join(TEMPLATE_OVERRIDE_DIR).join(&file)),
+        Some(std::path::PathBuf::from(TEMPLATE_OVERRIDE_DIR).join(&file)),
     ];
     for candidate in candidates.into_iter().flatten() {
         if candidate.exists() {
@@ -322,6 +339,16 @@ pub(super) fn load_override_template(model_type: &str, repo_root: Option<&Path>)
                 }
             }
         }
+    }
+    // A NAMED template that does not exist must be loud. Falling through to
+    // the model's own template is how a wrong prompt format goes unnoticed
+    // for a whole benchmark run.
+    if named {
+        tracing::error!(
+            "MODEL.toml [behavior].jinja_template = {template_override:?} but \
+             {TEMPLATE_OVERRIDE_DIR}/{file} was not found — falling back to the \
+             model's own chat template, which may not match this checkpoint"
+        );
     }
     None
 }
