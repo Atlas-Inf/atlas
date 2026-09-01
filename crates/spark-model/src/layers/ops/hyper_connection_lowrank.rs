@@ -367,11 +367,6 @@ fn hc_pre_gemm(
     Ok(())
 }
 
-/// `dense_gemm_bf16_pipelined` launch over raw BF16 pointers (the hc weights
-/// are plain `DevicePtr`s, not `DenseWeight`s). Mirrors
-/// `ops::dense_gemm_bf16_pipelined` exactly: out[m,n] = a[m,k] x w[n,k]^T.
-#[allow(clippy::too_many_arguments)]
-
 /// The three-launch collapse for small T. Same math as the fused kernel;
 /// the parity probe's T=8 fixture runs THIS path.
 #[allow(clippy::too_many_arguments)]

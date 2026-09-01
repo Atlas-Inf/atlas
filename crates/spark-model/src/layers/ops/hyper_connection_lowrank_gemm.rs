@@ -8,6 +8,10 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use spark_runtime::kernel_args::KernelLaunch;
 
+/// `dense_gemm_bf16_pipelined` launch over raw BF16 pointers (the hc weights
+/// are plain `DevicePtr`s, not `DenseWeight`s). Mirrors
+/// `ops::dense_gemm_bf16_pipelined` exactly: out[m,n] = a[m,k] x w[n,k]^T.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_raw(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
