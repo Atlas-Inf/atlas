@@ -105,9 +105,30 @@ CONCLUSION: the generation half demonstrably works and the failure is \
 somewhere in the generation-to-AST-scoring handoff. The exact mechanism is NOT \
 identified. So this run neither certifies nor condemns the DSpark port, the \
 entry stays `unmeasured`, and NO THRESHOLD IS SET FROM 11.26 - a bar taken \
-from a number this contradicted would be worse than no bar. What would settle \
-it: dump the responses file the Rust driver hands the Python checker and score \
-one simple_python sample by hand."""
+from a number this contradicted would be worse than no bar. LOCALISED 2026-09-01, after dumping that file. \
+`~/.atlas/artifacts/bfcl/responses.jsonl` (the driver keeps it so a run can be \
+rescored) holds 995 lines and EVERY ONE reads \
+`"has_tool_calls": false, "tool_calls": []`. So the Python AST checker scored \
+faithfully what it was handed - the loss is upstream of scoring, in the \
+GENERATION half of the driver. Ruled out, each by direct experiment on this \
+same server: DSpark (identical call with --dflash and with speculation off); \
+streaming (the SSE deltas carry index 0 with id/type/name then incremental \
+`arguments`, terminating finish_reason "tool_calls"); BFCL's non-JSON-Schema \
+`{"type":"dict"}` parameter shape (schema.rs normalises dict->object and the \
+call still comes back correct); tool grammar (--disable-tool-grammar true \
+changes nothing); and request construction (the driver sends tool_choice auto, \
+temperature 0.0, max_tokens 1024 - equivalent to the hand-sent request). The \
+control is exact: the dataset's own first sample, calculate_triangle_area with \
+base 10 and height 5, returns a correct well-formed call when sent by hand to \
+this server. \
+WHAT IS LEFT is the one thing not controlled for - `atlas_plugin::http::\
+chat_stream`, a hand-rolled TCP + SSE client, where the by-hand control used \
+curl. That is where to look next; the accumulator in http.rs:217 reads correct \
+and has a passing unit test, so suspect the transport/chunk framing above it \
+rather than the delta merge itself. NOT PROVEN, but every alternative that \
+could be tested has been eliminated. \
+★ THE CONSEQUENCE FOR THIS PORT: ST-995 does not implicate DSpark. Tool calling \
+on this checkpoint works."""
 
 # ── The perf leg ────────────────────────────────────────────────────────────
 # decode-floor, the two TTFT guards and the concurrency sweep, run as one set.
