@@ -336,4 +336,29 @@ gate's detection mechanism, NOT the hazard. The instrument that does reach it \
 without a cache is greedy output-equivalence: with greedy verification a \
 correct speculative decoder is exactly output-preserving, so `--dflash` on vs \
 off at temperature 0 must be token-identical, and a failed rollback shows up \
-as divergence. Run that before treating the rollback path as exercised."""
+as divergence. Run that before treating the rollback path as exercised. \
+★ THAT TEST HAS NOW RUN, AND IT PASSES. 2026-09-01, same box, same recipe, \
+same binary, temperature 0, 12 prompts, ARM A `--dflash` (mtp=true, \
+num_drafts=3 - the shipped gamma=4 contract, confirmed on the scheduler line) \
+against ARM B speculation off (mtp=false, num_drafts=0): \
+EXACT TOKEN-SEQUENCE MATCH 12/12. Greedy speculative decoding is \
+output-preserving on this port, which is the strongest statement available \
+about the rollback path and it is a bit-exact one. \
+★ AND THE DISTRIBUTIONS AGREE, not just the tokens. 1419 scored positions: \
+88.5% bit-identical top-5, 93.5% sharing the same top-5 support, and on those \
+the top-k restricted KL(A||B) has mean 1.2e-17 and max 3.8e-15 - machine \
+epsilon, i.e. the two decode paths are the same distribution. The remaining \
+6.5% differ only in WHICH token holds the 5th slot (a tie flipping membership); \
+their apparent KL up to 29.96 is entirely the estimator's absent-token floor \
+and means nothing. The one real raw difference is a CONSTANT offset in the log \
+normaliser - at the worst position all five deltas are -0.018286 with spread \
+1e-7 - and KL is invariant to a constant offset, which is exactly why the \
+same-support KL is zero. \
+★ WHAT THIS DOES AND DOES NOT SETTLE. It exercises the conv_bytes=0 rollback \
+hazard directly, without needing the prefix cache, and finds no corruption: \
+live SSM state surviving a rejected draft would move the emitted tokens, and \
+they do not move. It does NOT replace this gate: 12 short greedy prompts are \
+not 12 replayed multi-turn conversations restoring from Marconi snapshots, and \
+a poisoned RESTORE is a different failure than a poisoned ROLLBACK. Keep this \
+entry unmeasured; the equivalence result is evidence about the port, not a \
+substitute for the gate."""
