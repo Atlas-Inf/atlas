@@ -202,22 +202,21 @@ mod tests {
 
     #[test]
     fn exact_batch_gemv_tiers_win_over_transposed_fallbacks() {
-        let cases = [(2, 41), (4, 41), (8, 81), (16, 161)];
-        for (padded_n, expected_handle) in cases {
-            let route = select_lm_head_nvfp4_route(
-                padded_n,
-                true,
-                KernelHandle(41),
-                KernelHandle(81),
-                KernelHandle(161),
-                true,
-                true,
+        // The exact-M tier LOOKUP now lives in the caller
+        // (`self.w4a16_batchm.kernel(padded_n)`), which resolves batch2..16 and
+        // passes a single handle in; this function no longer takes one handle
+        // per tier. What it still owns is the PRECEDENCE, which is the part
+        // that matters numerically: a resolved batch-GEMV handle beats both
+        // transposed fallbacks at every admitted decode width, because the
+        // tiers are byte-identical to M independent scalar GEMVs while
+        // transposed GEMM changes the FP32 reduction order.
+        for padded_n in [2usize, 4, 8, 16] {
+            let route = select_lm_head_nvfp4_route(padded_n, true, KernelHandle(41), true, true);
+            assert!(
+                matches!(route, LmHeadNvfp4Route::BatchGemv(KernelHandle(41))),
+                "padded_n={padded_n}: a resolved tier handle must win over the \
+                 transposed fallbacks"
             );
-            assert!(matches!(
-                route,
-                LmHeadNvfp4Route::BatchGemv(KernelHandle(handle))
-                    if handle == expected_handle
-            ));
         }
     }
 
