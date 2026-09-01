@@ -113,10 +113,27 @@ gate = "ttft-cold-gate"
 recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
 label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
 default = false
-status = "unmeasured"
+status = "measured"
 note = """\
 Uncached prefill TTFT. This is the leg that sees a cold-load regression, and \
-the one to read first on a port that touched the Mamba-2 prefill path."""
+the one to read first on a port that touched the Mamba-2 prefill path. \
+FIRST MEASUREMENT, 2026-09-01, gx10-e3a3 (GB10), binary 70909412, 12 repeats per \
+prompt length: 256 tok median 508.0 / p90 511.0; 1024 tok median 905.2 / p90 \
+907.9; 4096 tok median 2647.4 / p90 2662.5. Pooled median 905.2 ms, pooled p90 \
+2648.5 ms. The gate's own verdict was `Info: no baseline on this box yet - this \
+run is recorded as the baseline`. \
+★ THE BOUNDS BELOW ARE A COARSE CEILING, NOT A CALIBRATED BAR. They are one run \
+on one box with no sigma behind them, set ~15% above the measurement so an \
+honest re-run cannot fail them. The real regression detector is this gate's own \
+median<=3% / p90<=5% comparison against its stored same-box baseline; these \
+numbers exist so the entry is not vacuous, and they should be re-taken from two \
+or more tiers before anyone treats a near-miss as a signal."""
+
+[benchmarks.metrics.median_ms]
+max = 1041.0
+
+[benchmarks.metrics.p90_ms]
+max = 3046.0
 
 [[benchmarks]]
 quant = "nvfp4"
@@ -125,7 +142,7 @@ gate = "ttft-warm-gate"
 recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
 label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
 default = false
-status = "unmeasured"
+status = "measured"
 note = """\
 Cached-prefix TTFT. ★ READ THE RECIPE FIRST: it pins \
 `enable_prefix_caching: false`, and not as a performance choice — the server \
@@ -134,7 +151,21 @@ warns of a community-reported correctness regression on SM12.x with DFlash \
 warm path WITHOUT the radix cache, which is a different quantity from the \
 Qwen entries' warm number and must not be compared to them. If prefix caching \
 is ever proven safe on this stack, this entry's baseline has to be retaken \
-rather than reinterpreted."""
+rather than reinterpreted. \
+FIRST MEASUREMENT, 2026-09-01, same box and binary, 12 repeats per length: 256 \
+tok median 504.5 / p90 506.1; 1024 tok median 900.8 / p90 917.5; 4096 tok median \
+2645.5 / p90 2651.9. Pooled median 900.8 ms, pooled p90 2647.8 ms. \
+★ AND THE MEASUREMENT CONFIRMS THE WARNING ABOVE: warm and cold agree to within \
+0.5% (900.8 vs 905.2 ms), and the harness reports `cached tok = 0` on every row \
+of both. Nothing was cached, because prefix caching is off by correctness pin. \
+So this entry does NOT measure a cache hit and must never be compared against a \
+recipe that caches. Same coarse-ceiling caveat as the cold entry."""
+
+[benchmarks.metrics.median_ms]
+max = 1036.0
+
+[benchmarks.metrics.p90_ms]
+max = 3045.0
 
 [[benchmarks]]
 quant = "nvfp4"
@@ -158,7 +189,17 @@ the BENCH — never the server — when MemAvailable drops below ~1.2 GB, and do
 not raise the utilisation without re-measuring. The dip at C=6 reproduces and \
 is unexplained; it fails nothing. Those numbers came from an ad-hoc ladder, \
 not from this gate, so they are context for whoever reads the first record — \
-not a threshold, and not a baseline."""
+not a threshold, and not a baseline. \
+★ MEASURED 2026-09-01 ON THIS GATE, 24 cells (ISL 128/512/1024/2048 x C \
+1/2/4/8/16/32), verdict `Info: 24 cells, no request errors, all above the \
+vacuity floor`. The shape, at ISL 128: TTFT p50 600 ms -> 4.42 s -> 41.1 s at \
+C=1 -> 8 -> 32, TPOT p50 12.4 -> 114.1 -> 120.6 ms, and SERVER decode flat at \
+58.5 -> 52.8 -> 53.3 tok/s. Read that carefully: the table's `tok/s` column is \
+the server-side decode rate, not aggregate throughput, so its peak at C=1 is \
+arithmetic and not a scaling failure. Decode rate is flat across every rung and \
+every ISL while TTFT degrades ~68x, which is what `max_batch_size: 8` predicts - \
+at C=16 and C=32 requests are QUEUEING, not batching. Still no thresholds: this \
+gate is not required and a curve is not a bound."""
 
 # ── The correctness gate the DSpark verify path most needs ──────────────────
 [[benchmarks]]
@@ -181,4 +222,16 @@ recurrent state is precisely what this gate detects, and it detects it as \
 byte-difference in a replayed conversation rather than as a wrong number. \
 `collapsed` and `unmeasured` take zero tolerance when thresholds are set; \
 `jittered` must NOT be bounded, because restore-anchor selection varies \
-between rounds on a healthy engine."""
+between rounds on a healthy engine. \
+★ ATTEMPTED 2026-09-01 AND IT COULD NOT EVALUATE THIS CHECKPOINT AT ALL. The \
+gate failed on its REFERENCE round, not on a replay: \
+`reference round failed the script anchors (turn 2: line 1 does not start with \
+its number ...) - replays compared against it would certify nothing`. The model \
+does not emit the numbered-line format the gate's script requires, so there is \
+no valid reference to compare replays against. NOTHING ABOUT SSM POISONING WAS \
+TESTED - this is not a pass and it is not a failure of the rollback path; it is \
+the gate being unable to run. That matters more here than on any other target, \
+because this is the gate the DSpark merge most needs. Probably downstream of \
+this model's thinking_default = true, which the recipe deliberately does not \
+override. Fixing it needs a model-appropriate prompt or a thinking-aware \
+extractor."""
