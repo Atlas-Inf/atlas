@@ -1,0 +1,184 @@
+# Benchmarks for Nemotron-3.5-Lightning-30B-A3B, and the thresholds its gate
+# records must meet.
+#
+# ★ EVERY ENTRY HERE IS `status = "unmeasured"`. This model has never been
+# gated: before this file, no Nemotron target in the tree carried a BENCH.toml
+# at all, so there is no committed history to ratchet from and no bar this
+# checkpoint has ever cleared. An unmeasured entry carries NO
+# [benchmarks.metrics] table on purpose — per the header of
+# kernels/gb10/qwen3.8-27b/BENCH.toml, a guessed threshold a run could clear
+# would report PASS for something nobody measured. These entries BASELINE.
+# Thresholds land in a follow-up commit, taken from the records these runs
+# write, and that commit is where the gate starts to mean something.
+#
+# ★ AN UNMEASURED ENTRY CANNOT SELF-START, AND THAT IS BY DESIGN. `--pull-
+# request-gate` resolves through gate::bench::baseline_for, which SKIPS every
+# entry whose status is not "measured" and every entry with no metrics table —
+# so these six are invisible to it and a gate run refuses with "no baseline for
+# model X", which the code calls the honest answer. The first pass therefore
+# runs against an operator-started server:
+#
+#   ATLAS_DFLASH_OPTION_B=1 spark serve <target> --no-tui --port 8899 \
+#     <the recipe's defaults, verbatim>
+#   spark benchmark run <gate> --url http://127.0.0.1:8899 \
+#     --model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \
+#     --no-fail-on-verdict --format json
+#
+# That produces numbers in ~/.atlas/runs but NO committed record. The second
+# pass — thresholds set from those numbers, status flipped to "measured", the
+# cheap gates re-run under --pull-request-gate — is what writes .benchmarks/
+# and what makes any of this a gate rather than a measurement.
+#
+# ★ NOTHING HERE IS `default = true`. The default subject of each of these
+# gates is already claimed by a Qwen target (bfcl-subset, decode-floor and
+# concurrency-sweep by qwen3.8-27b; the two TTFT guards and
+# ssm-state-poisoning-gate by qwen3.6-35b-a3b), and two defaults refuse to
+# assemble at all. Select this checkpoint explicitly:
+#
+#   ATLAS_DFLASH_OPTION_B=1 spark benchmark run <gate> --pull-request-gate \
+#     --hardware gb10 \
+#     --checkpoint nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+#
+# ★ ATLAS_DFLASH_OPTION_B=1 IS REQUIRED and cannot live in the recipe. The
+# Lightning DSpark product policy (dflash_head/product_policy.rs::validate)
+# refuses to start without it, and refuses to start if any DSpark diagnostic
+# toggle is set. The recipe schema has no `env:` key, so it must be exported by
+# whoever starts the gate; a gate run without it fails at boot, not at verdict.
+#
+# ★ THE COHERENCE PROBE WILL WARN, and the warning is correct. bfcl-subset's
+# descriptor declares `intended_for` families qwen3.6-27b / qwen3.6-35b-a3b /
+# qwen3.8-27b, so a run here reports `wrong_family`. The probe only warns and
+# never refuses (ModelExpectation feeds coherence::probe_for, not a veto), and
+# the warning is the honest reading: this checkpoint has no recorded BFCL
+# baseline anywhere, which is exactly what these entries exist to create. Do
+# not silence it by widening the descriptor's family list until a measured
+# baseline exists to justify the claim.
+
+# ── ST-995: the golden n=995 MLPerf-edge BFCL draw ──────────────────────────
+# The single-turn tool-calling leg. It is the gate that matters for the DSpark
+# port specifically: the drafter changes proposal numerics and therefore
+# acceptance, and a speculative path that is subtly wrong shows up as
+# tool-argument damage long before it shows up as incoherence. Scores here are
+# NOT comparable to the qwen3.6-27b entry's MLPerf floor (83.64 / 85.32) — same
+# draw, different architecture and different weights — and this entry
+# deliberately inherits neither that floor nor any Qwen bar.
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "bfcl-subset"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "unmeasured"
+note = """\
+FIRST BFCL measurement on any Nemotron target. The recipe serves DSpark, not \
+Atlas MTP: `--dflash` with the published 6-layer Qwen3DSparkModel drafter at \
+gamma=4 (the server derives num_drafts=3 from it), NOT `--speculative`, and \
+the two flags are mutually exclusive. That is the configuration under test — \
+running BFCL on this model without the drafter would measure a different \
+engine path and say nothing about the port. \
+★ THINKING IS ON, by the model's own MODEL.toml (thinking_default = true, \
+cap_thinking_at_max_tokens = false). Do NOT pass --disable-thinking to make \
+the numbers look tidier: with thinking forced off this model returns null \
+content on multi-turn tool follow-ups, which would corrupt exactly the \
+category BFCL scores. The recipe leaves the model default in place and this \
+entry is defined on that."""
+
+# ── The perf leg ────────────────────────────────────────────────────────────
+# decode-floor, the two TTFT guards and the concurrency sweep, run as one set.
+# All four are speed measurements, so all four are hostage to the box: a GB10
+# that throttles mid-run marks its own record INVALID (hardware_state.postcheck)
+# and those numbers must not be quoted. Check that flag on every record before
+# ratcheting a threshold from it.
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "decode-floor"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "unmeasured"
+note = """\
+Median-of-3 server decode rate. On this target it is really a DSpark \
+acceptance measurement wearing a decode-rate hat: the drafter proposes gamma=4 \
+and the target verifies K=3 in one batched step, so the decode number moves \
+with acceptance, and an acceptance regression that leaves output correct still \
+shows up here. Record `output_tokens` and `runs` alongside it — a fast median \
+over runs that decoded almost nothing is not a floor."""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "ttft-cold-gate"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "unmeasured"
+note = """\
+Uncached prefill TTFT. This is the leg that sees a cold-load regression, and \
+the one to read first on a port that touched the Mamba-2 prefill path."""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "ttft-warm-gate"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "unmeasured"
+note = """\
+Cached-prefix TTFT. ★ READ THE RECIPE FIRST: it pins \
+`enable_prefix_caching: false`, and not as a performance choice — the server \
+warns of a community-reported correctness regression on SM12.x with DFlash \
+(wrong output on multi-turn cache hits). So the warm guard here measures the \
+warm path WITHOUT the radix cache, which is a different quantity from the \
+Qwen entries' warm number and must not be compared to them. If prefix caching \
+is ever proven safe on this stack, this entry's baseline has to be retaken \
+rather than reinterpreted."""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "concurrency-sweep"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "unmeasured"
+note = """\
+The C=1..32 ladder. ★ THE RECIPE'S `gpu_memory_utilization: 0.80` IS LOAD- \
+BEARING FOR THIS GATE AND IS NOT A TUNING KNOB. Measured on a GB10 (119 GB \
+unified) 2026-08-26: at 0.88 the box has ~6 GB of host memory left once the \
+model is resident and concurrency 8 exhausts it between consecutive samples of \
+a 2-second poll — 6.4 GB to 180 MB — taking the machine off the network \
+entirely, with no reboot. At 0.80 the post-load headroom is ~15.8 GB and the \
+1/2/4/6/8 ladder completes with zero failed requests: 76.1 / 95.8 / 120.6 / \
+104.1 / 140.3 aggregate tok/s, 1.84x at C8, 17.6 tok/s per client. That is a \
+CLIFF, not a gradient. Run this sweep behind a host-memory watchdog that kills \
+the BENCH — never the server — when MemAvailable drops below ~1.2 GB, and do \
+not raise the utilisation without re-measuring. The dip at C=6 reproduces and \
+is unexplained; it fails nothing. Those numbers came from an ad-hoc ladder, \
+not from this gate, so they are context for whoever reads the first record — \
+not a threshold, and not a baseline."""
+
+# ── The correctness gate the DSpark verify path most needs ──────────────────
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "ssm-state-poisoning-gate"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "unmeasured"
+note = """\
+Declared because this port has a specific reason to fear it, not because the \
+set looked incomplete. The merge that brought DSpark here combined two \
+rollback implementations in `verify_a.rs` / `async_chkpt.rs`: upstream's \
+`ssm_pool.h_stored_bytes` for h_bytes with the ported \
+`config.ssm_conv_state_bytes()` for conv_bytes — because the GDN formula \
+(nk*kd*2 + nv*vd) evaluates to 0 on a Nemotron-H backbone, which left LIVE SSM \
+state behind on rejected drafts. A speculative decoder that fails to roll back \
+recurrent state is precisely what this gate detects, and it detects it as \
+byte-difference in a replayed conversation rather than as a wrong number. \
+`collapsed` and `unmeasured` take zero tolerance when thresholds are set; \
+`jittered` must NOT be bounded, because restore-anchor selection varies \
+between rounds on a healthy engine."""
