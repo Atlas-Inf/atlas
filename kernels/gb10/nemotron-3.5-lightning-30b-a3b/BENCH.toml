@@ -195,7 +195,27 @@ REQUIREMENT, not a tuning choice, so the memory arithmetic that makes it look \
 free to reverse - 40.8 GB of KV allocated, 14252992 token capacity against the \
 262144 this recipe can use, a 54x margin - is beside the point. Within the FP8 \
 requirement, --kv-high-precision-layers is the ONLY precision lever, and it is \
-measured above. \
+and it is measured above. \
+★ THIRD DRAW, 2026-09-02, run as an MLPerf-submission-style pair: the ST leg \
+and the three perf legs back to back against ONE server on ONE binary, so the \
+accuracy number and the speed numbers describe the same engine state. \
+overall 64.22 / normalized 71.25, n=995, 995/995 drawn, zero transport \
+failures, 2 h 01 m 10 s. The three draws now on record are 64.22 / 64.12 / \
+64.22 - a spread of 0.10, which is ONE sample of 995. hallucination (94.51) \
+and live (68.24) are identical to two decimals across all three; only non_live \
+moves, by a single sample (51.01 / 50.81 / 51.01). This is a reproducible \
+number, not a lucky one, and the bounds below are now backed by three \
+measurements rather than one. \
+★ THE tscg EXPERIMENT WAS RUN AND IS NEGATIVE; DO NOT REPEAT IT. Setting \
+[behavior].tscg = true does remove the duplicated contract - measured, served \
+prompt 1243 -> 883 tokens on parallel_0 (-29%) and 1304 -> 896 on parallel_8 \
+(-31%) - and moves the parallel probe by ONE sample, 35.0% -> 36.7%. It was \
+REVERTED rather than shipped: it also swaps the tool schema for compact \
+signatures, whose effect on the hallucination and irrelevance categories is \
+unmeasured, and prepare.rs records that tool-prompt changes swing hallucination \
+from ~96 to 30/64. A 30% prefill saving is worth revisiting on its own merits \
+with those categories measured; it is not a fix for parallel calling, and an \
+unmeasured change has no place in a submission number. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
@@ -302,7 +322,14 @@ median 896.8 ms, pooled p90 2634.1 ms. The gate's own same-box comparison \
 returns `Pass: median -1.0% (limit +3.0%) - p90 -0.4% (limit +5.0%)`. \
 Marginally FASTER, which is noise, not a win - the point is that extracting \
 logprobs on the verify path costs nothing measurable, exactly as intended by \
-gating the copy on `a.top_logprobs`."""
+gating the copy on `a.top_logprobs`. \
+★ THIRD MEASUREMENT 2026-09-02, in the submission pair: median 912.2 ms, p90 \
+2664.2 ms, `Pass: median +1.7% (limit +3.0%) - p90 +1.1% (limit +5.0%)`. \
+Slower than the morning's 896.8 by 1.7% and still well inside the gate. Read \
+that against the box state rather than the code: this ran after ~6 h of \
+continuous benchmarking on the same GB10, and earlier legs logged chassis-zone \
+rises of +30 C. Thermal drift on a loaded box is the parsimonious reading, and \
+the gate compares against its own same-box baseline, not across boxes."""
 
 [benchmarks.metrics.median_ms]
 max = 1041.0
@@ -339,7 +366,11 @@ recipe that caches. Same coarse-ceiling caveat as the cold entry. \
 897.4 ms, pooled p90 2641.9 ms, verdict `Pass: median -0.8% (limit +3.0%) - \
 p90 -0.2% (limit +5.0%)`, and `cached 0 tok` on every row again. Warm and cold \
 still agree to within 0.1% (897.4 vs 896.8), which is the same statement as \
-before: prefix caching is off, so there is no cache hit to measure."""
+before: prefix caching is off, so there is no cache hit to measure. \
+★ THIRD MEASUREMENT 2026-09-02, submission pair: median 904.9 ms, p90 2658.1 \
+ms, `Pass: median +0.8% (limit +3.0%) - p90 +0.6% (limit +5.0%)`. Warm and cold \
+agree to 0.8% (904.9 vs 912.2) for the third time running, which is the same \
+statement as before and not a new one: nothing is cached."""
 
 [benchmarks.metrics.median_ms]
 max = 1036.0
@@ -413,7 +444,11 @@ and decode p50 4.0 tok/s while the CLIENT sees ttft p50 74.4 s: the server is \
 timing only the requests it has admitted, so the ~73 s difference is queue \
 wait, not prefill. Read the client column for user-visible latency and the \
 server column for engine health; on this recipe past C=8 they answer different \
-questions."""
+questions. \
+★ FOURTH RUN 2026-09-02, submission pair: 24/24 cells, zero request errors, \
+every cell above the vacuity floor, peak 60.2 tok/s at C=2, best TTFT p50 510 \
+ms. The peak now reads 60.0 / 60.1 / 60.2 across three independent runs, which \
+is as tight as this instrument gets."""
 
 [benchmarks.metrics.c1_aggregate_tok_s]
 min = 50.0
