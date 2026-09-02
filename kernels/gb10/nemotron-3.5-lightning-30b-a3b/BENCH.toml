@@ -123,6 +123,17 @@ run, never to the best."""
 # and those numbers must not be quoted. Check that flag on every record before
 # ratcheting a threshold from it.
 
+[benchmarks.metrics.samples]
+# The golden MLPerf draw is exactly 995, and the run on record made exactly
+# that draw (995/995 samples, zero transport failures). Pin BOTH ends: this
+# entry's score bounds are calibrated to this draw and to nothing else, and a
+# one-sided `min` would accept the 3625-sample full draw against subset
+# thresholds. Note the echolp variant draws n=1004 with a different category
+# mix (46/23/12 vs 62/10/10) — its scores are NOT comparable to these and
+# belong to `bfcl-subset-echolp`, which pins its own count.
+min = 995.0
+max = 995.0
+
 [benchmarks.metrics.overall_accuracy]
 min = 60.0
 noise = 0.5
