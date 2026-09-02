@@ -148,6 +148,39 @@ behaviour change with no measured benefit does not belong in a port branch. \
 Keep the ladder in mind for a model that DOES emit long call runs, where the \
 runaway it guards is already bounded by MAX_POST_COMPLETION_TOOL_OPENS = 8 in \
 decode_logits_step.rs, but do not cite it as a cause of THIS number. \
+★★ THE CAUSE IS THINKING, AND IT IS CONFIRMED OUT OF SAMPLE. This is the one \
+positive result on this deficit; everything above it is a falsification. \
+THE TELL was in the raw output all along: the model states its plan inside \
+reasoning_content - "We'll make two calls", "We'll call three times" - then \
+emits ONE call and stops voluntarily on a legal EOS at 83-264 tokens. The plan \
+is spent in the think block and the visible turn behaves as though the work is \
+done. \
+IN-SAMPLE, --disable-thinking split the two subsets in OPPOSITE directions, \
+which is why the aggregate had hidden it: parallel_multiple 9/30 -> 19/30 \
+(12 wins / 2 losses, p=0.0129) while parallel went 12/30 -> 6/30 with zero-call \
+responses 0 -> 5. The aggregate reads 35.0% -> 41.7% at p=0.57, pure noise - \
+two real effects of opposite sign cancelling. \
+CONFIRMED ON HELD-OUT DATA, because a nominal p=0.0129 out of a family of ~16 \
+comparisons across ~8 arms is worth about 0.21 after Bonferroni and this entry \
+has already been wrong twice from weak evidence. Re-run on \
+parallel_multiple[30:75], 45 samples no earlier probe had touched, hypothesis \
+fixed before the data: thinking ON 15/45 (33.3%), thinking OFF 31/45 (68.9%). \
+Paired: 18 ON-wrong->OFF-right against 2 the other way, McNemar exact \
+p=4.025e-04, and p*16 = 6.4e-03 - it SURVIVES correction for every comparison \
+made that night. Calls emitted 76/126 -> 100/126. \
+★ DO NOT SHIP --disable-thinking AS THE FIX. It is a diagnostic. It costs the \
+`parallel` subset (same function repeated: 12/30 -> 6/30, zero-calls 0 -> 5), \
+it raises zero-call responses overall 1 -> 7, and this recipe's own metadata \
+forbids it in production because the model returns null content on multi-turn \
+tool follow-ups with thinking off. What the result establishes is the \
+MECHANISM and where to aim: the thinking BUDGET, not the switch. \
+reasoning_effort is a per-request knob with request-body precedence, so a rung \
+between `none` and `medium` can be searched for without touching the recipe. \
+★ AND IT SEPARATES TWO BUGS THIS ENTRY HAD CONFLATED. `parallel` (one function \
+called N times with different arguments) and `parallel_multiple` (N distinct \
+functions) do NOT share a mechanism - thinking moves them in opposite \
+directions, significantly. Any future work here should score them apart; the \
+combined number will keep hiding effects the way it hid this one. \
 ★ DEFECT 2, CONFIRMED, STRUCTURAL: THE TOOL CONTRACT IS SERVED TWICE. \
 nemotron_lightning.jinja already renders the full function list, the exact \
 <tool_call> format example and the official short <IMPORTANT> reminder (lines \
