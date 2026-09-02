@@ -165,7 +165,26 @@ come from, but 472 is still under the 750-token vacuity floor and score.rs \
 holds that as a CONSTANT, not a parameter. So this gate cannot certify this \
 checkpoint on this prompt no matter how the engine performs, and the entry \
 stays unmeasured. Fixing it needs a longer fixed prompt, which changes what \
-every other target measured - a separate decision, not one to make here."""
+every other target measured - a separate decision, not one to make here. \
+★ RE-RUN AGAIN 2026-09-02 on the binary carrying the DFlash logprobs fix, and \
+the harness named a SECOND blocker that outranks the first: `http://...:8899 is \
+serving Nemotron-3.5-Lightning-30B-A3B-NVFP4, which this benchmark is not \
+defined on. The decode floor is recorded for unsloth/Qwen3.8-27B-NVFP4 (12-run \
+sigma calibration, 2026-08-15).` So even a run clearing the vacuity floor would \
+have no committed floor to be judged against on this checkpoint. \
+★ AND THE VACUITY FLOOR IS A PROPERTY OF THE REFERENCE MODEL, NOT OF THIS \
+ENGINE. score.rs pins MIN_OUTPUT_TOKENS = 750 because the calibrating \
+checkpoint stops at a DETERMINISTIC 915 tokens on the committed MinHeap prompt; \
+750 sits under that with drift margin. This model answers the same prompt in \
+472 tokens - the identical count as the pre-fix run, so it is the model's \
+natural stop and not a truncation - and 472 < 750. Nothing here is tunable at \
+run time: MINHEAP_PROMPT, MAX_TOKENS = 1500 and MIN_OUTPUT_TOKENS = 750 are all \
+compile-time constants, the last of them pinned by its own test \
+(`assert_eq!(MIN_OUTPUT_TOKENS, 750)`), and `--param` reaches none of them. \
+★ CONCLUSION: this gate is inapplicable to this checkpoint for two independent \
+reasons, and neither is an engine defect. It stays `unmeasured` rather than \
+being made to produce a number, because a decode rate judged against another \
+model's floor would be worse than no number at all."""
 
 [[benchmarks]]
 quant = "nvfp4"
@@ -188,7 +207,16 @@ on one box with no sigma behind them, set ~15% above the measurement so an \
 honest re-run cannot fail them. The real regression detector is this gate's own \
 median<=3% / p90<=5% comparison against its stored same-box baseline; these \
 numbers exist so the entry is not vacuous, and they should be re-taken from two \
-or more tiers before anyone treats a near-miss as a signal."""
+or more tiers before anyone treats a near-miss as a signal. \
+★ RE-RUN 2026-09-02 AS A REGRESSION CHECK ON THE LOGPROBS PATCH, which is the \
+only code change since the numbers above and which touches the DFlash verify \
+step directly. Same box, same recipe: 256 tok median 505.4 / p90 510.6; 1024 \
+tok median 896.8 / p90 899.9; 4096 tok median 2631.9 / p90 2647.5. Pooled \
+median 896.8 ms, pooled p90 2634.1 ms. The gate's own same-box comparison \
+returns `Pass: median -1.0% (limit +3.0%) - p90 -0.4% (limit +5.0%)`. \
+Marginally FASTER, which is noise, not a win - the point is that extracting \
+logprobs on the verify path costs nothing measurable, exactly as intended by \
+gating the copy on `a.top_logprobs`."""
 
 [benchmarks.metrics.median_ms]
 max = 1041.0
@@ -220,7 +248,12 @@ tok median 504.5 / p90 506.1; 1024 tok median 900.8 / p90 917.5; 4096 tok median
 0.5% (900.8 vs 905.2 ms), and the harness reports `cached tok = 0` on every row \
 of both. Nothing was cached, because prefix caching is off by correctness pin. \
 So this entry does NOT measure a cache hit and must never be compared against a \
-recipe that caches. Same coarse-ceiling caveat as the cold entry."""
+recipe that caches. Same coarse-ceiling caveat as the cold entry. \
+★ RE-RUN 2026-09-02, same regression check as the cold leg: pooled median \
+897.4 ms, pooled p90 2641.9 ms, verdict `Pass: median -0.8% (limit +3.0%) - \
+p90 -0.2% (limit +5.0%)`, and `cached 0 tok` on every row again. Warm and cold \
+still agree to within 0.1% (897.4 vs 896.8), which is the same statement as \
+before: prefix caching is off, so there is no cache hit to measure."""
 
 [benchmarks.metrics.median_ms]
 max = 1036.0
@@ -278,12 +311,89 @@ GENERATION, not prefill or token count. Only the accuracy leg (ST-995, 11.26 \
 -> 64.22) was destroyed by it. Do not generalise "the wrong template \
 invalidated the measurements" to the speed numbers; it did not. \
 ★ THE BOUND BELOW IS A BLOWUP DETECTOR, not a perf gate. c1_aggregate_tok_s \
-is floored well under the two agreeing measurements so a real collapse trips \
-it and ordinary variance does not."""
+is floored well under the THREE agreeing measurements so a real collapse trips \
+it and ordinary variance does not. \
+★ THIRD RUN 2026-09-02, the same logprobs-patch regression check the TTFT legs \
+got. 24/24 cells, zero request errors, every cell above the vacuity floor. \
+Peak 60.1 tok/s at C=2, best TTFT p50 509 ms, c1_aggregate_tok_s 59.8. The \
+ISL-128 ladder reads 59.8 / 60.1 / 56.0 / 52.7 / 52.5 / 51.8 tok/s at C=1..32 \
+against the previous 59.9 / 60.0 / 55.8 / 51.8 / 54.4 / 51.8, and ISL 2048 at \
+C=1 lands on 36.4 tok/s in both runs. Two independent measurements agreeing to \
+a tenth at the anchor cell is what makes the 50.0 floor a defensible blowup \
+detector rather than a guess off one sample. \
+★ THE QUEUEING STORY IS NOW VISIBLE IN THE EVIDENCE LINES, not just inferred \
+from max_batch_size 8. At ISL 2048 / C=32 the SERVER reports ttft p50 1461 ms \
+and decode p50 4.0 tok/s while the CLIENT sees ttft p50 74.4 s: the server is \
+timing only the requests it has admitted, so the ~73 s difference is queue \
+wait, not prefill. Read the client column for user-visible latency and the \
+server column for engine health; on this recipe past C=8 they answer different \
+questions."""
 
 [benchmarks.metrics.c1_aggregate_tok_s]
 min = 50.0
 noise = 1.0
+
+
+# ── A promotion candidate, run because this port is the reason it exists ────
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "cross-contamination"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+# `true` because this is the ONLY checkpoint declaring this gate anywhere in
+# kernels/, so it is the default by arithmetic rather than by preference. Left
+# `false` the baseline would assemble with no default at all, and a gate run
+# that omits `--checkpoint` refuses on "no default checkpoint" — a landmine
+# that would only go off the day cross-contamination graduates out of
+# PROMOTION_CANDIDATES. The same reason mlperf-agentic-subset, also
+# non-required and also sole-declarer, sets it.
+default = true
+status = "measured"
+note = """\
+NOT one of the ten REQUIRED_GATES - `cross-contamination` sits in \
+PROMOTION_CANDIDATES, whose own doc comment asks for exactly this: a candidate \
+"run on release cuts and recorded as debt until it has proven itself". \
+Declaring it here neither creates nor discharges a gate obligation; the \
+required set is a fixed array of ten in gate/mod.rs and does not read this \
+file. It is recorded because the result is evidence, not because anything \
+demanded it. \
+★ WHY THIS PORT IN PARTICULAR. Every request on this recipe shares one \
+`--ssm-cache-slots 256` pool, and DFlash makes each of them roll back SSM \
+state on every rejected draft. That is a concurrent-mutation shape, and the \
+question "does one request's rollback corrupt another's state" is not answered \
+by the single-stream equivalence test recorded on the poisoning entry below. \
+★ MEASURED 2026-09-02, same box, same binary, same recipe: 2 prompts x rungs \
+C=2/4/8 plus a post-check, 8 comparisons, 8/8 byte-identical to their solo \
+reference over 2048 compared tokens. contaminated 0, diverged 0, persistent 0, \
+alone_unstable 0, unmeasured 0. Verdict Pass. \
+★ READ THE POST-CHECK ROW AS THE INTERESTING ONE. `A post` and `B post` re-run \
+each probe ALONE after the concurrent rungs; identical there is the statement \
+that concurrency left no residue in the shared pool - a transient interference \
+would show in the C=8 rows, whereas a permanently damaged slot shows only \
+here. Both are clean. \
+★ WHAT IT DOES NOT COVER. Two prompts at C<=8 (the recipe's max_batch_size), \
+short generations, prefix caching off. It says nothing about restore-from- \
+snapshot poisoning, which is the separate hazard the entry below is about, and \
+nothing above C=8 where the sweep shows requests queue rather than batch.\
+"""
+
+[benchmarks.metrics.contaminated]
+# Zero-tolerance, all three. These are not rates with a noise band - a single
+# contaminated, diverged or persistently-damaged stream is a correctness bug on
+# a shared-state engine, so the bound is exact and `noise` is deliberately absent.
+max = 0.0
+
+[benchmarks.metrics.diverged]
+max = 0.0
+
+[benchmarks.metrics.persistent]
+max = 0.0
+
+[benchmarks.metrics.identical]
+# Pin the low end too, so a run that compared nothing cannot pass on three
+# zeroes: 8 comparisons is what 2 prompts x 3 rungs + 2 post-checks produces.
+min = 8.0
 
 
 # ── The correctness gate the DSpark verify path most needs ──────────────────
@@ -372,4 +482,34 @@ they do not move. It does NOT replace this gate: 12 short greedy prompts are \
 not 12 replayed multi-turn conversations restoring from Marconi snapshots, and \
 a poisoned RESTORE is a different failure than a poisoned ROLLBACK. Keep this \
 entry unmeasured; the equivalence result is evidence about the port, not a \
-substitute for the gate."""
+substitute for the gate. \
+★ AND THE GATE HAS NOW BEEN RUN, 2026-09-02, instead of only reasoned about - \
+which was worth doing, because it fails EARLIER than this entry predicted and \
+for a reason nothing above anticipated. It never reaches a replay comparison at \
+all. It fails in the REFERENCE round, on the script anchors: `turn 2: line 1 \
+does not start with its number: "Monotonic sequence: each record number exactly \
+one greater than predecessor, gaps treated as corruption."` (likewise lines 2 \
+and 3), and stops with `replays compared against it would certify nothing`. \
+★ READ WHAT THAT ACTUALLY SAYS ABOUT THE MODEL, because it is not a defect. \
+probe.rs requires turn 2 to be exactly three non-empty lines, each beginning \
+with its own numeral (`line.starts_with("1")`, `"2"`, `"3"`). This checkpoint \
+produced EXACTLY THREE LINES carrying EXACTLY THE THREE REQUIRED CONCEPTS - \
+monotonic sequence, bounded drift, closed membership - and simply did not \
+prefix them with numerals. It passed the count check and failed the format \
+check. The anchor is calibrated to another model's output habits, the same way \
+decode-floor's 750-token floor is calibrated to Qwen3.8-27B's deterministic \
+915-token stop. Two of the ten required gates are therefore FIXTURE-BOUND: they \
+cannot certify a checkpoint whose formatting differs from the one they were \
+built on, however healthy the engine underneath. \
+★ THE GATE IS BEHAVING CORRECTLY AND SHOULD NOT BE LOOSENED HERE. Refusing to \
+certify off an unvalidated reference is fail-closed, which is the whole design; \
+relaxing the anchor to accept unnumbered lines would weaken the check for every \
+target that currently passes it, and that is a maintainer's decision on the \
+fixture, not a porting change to smuggle into this branch. \
+★ SO THERE ARE NOW TWO STACKED BLOCKERS, not one. Even with the anchors \
+satisfied, the run announces `12 replay rounds, prefix caching under test` while \
+this recipe pins `enable_prefix_caching: false` against the SM12.x DFlash \
+correctness regression - so the replays would be twelve cold rounds, trivially \
+identical, and the entry would read GREEN having detected nothing. The anchor \
+failure is the nearer blocker; the caching pin is the deeper one. The entry \
+stays unmeasured on both counts."""
