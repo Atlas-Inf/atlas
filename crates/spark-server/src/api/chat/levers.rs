@@ -71,9 +71,13 @@ impl ChatLevers {
 
     /// Resolve from the environment plus this model's `[behavior]` table.
     /// Called once, when the server's `AppState` is built.
-    pub fn resolve(tscg: bool, disable_cwd_hint_injection: bool) -> Self {
+    pub fn resolve(
+        tscg: bool,
+        template_owns_tool_definitions: bool,
+        disable_cwd_hint_injection: bool,
+    ) -> Self {
         Self {
-            prompt: PromptLevers::new(tscg),
+            prompt: PromptLevers::new(tscg, template_owns_tool_definitions),
             bash_wander: std::env::var("ATLAS_BASH_WANDER_WATCHDOG").as_deref() == Ok("1"),
             phase_timing: std::env::var("ATLAS_CHAT_PHASE_TIMING").as_deref() == Ok("1"),
             disable_cwd_hint_injection,
@@ -126,11 +130,14 @@ mod tests {
 
     #[test]
     fn the_model_behavior_reaches_the_renderer() {
-        // `resolve` reads the env for the two diagnostics but takes `tscg`
-        // from the caller, because it is MODEL.toml state and not a
-        // process-wide setting.
-        assert!(ChatLevers::resolve(true, false).prompt.tscg);
-        assert!(!ChatLevers::resolve(false, false).prompt.tscg);
-        assert!(ChatLevers::resolve(false, true).disable_cwd_hint_injection);
+        // `resolve` reads the env for diagnostics but takes prompt decisions
+        // from the caller because they are MODEL.toml state.
+        assert!(ChatLevers::resolve(true, false, false).prompt.tscg);
+        assert!(
+            ChatLevers::resolve(false, true, false)
+                .prompt
+                .template_owns_tool_definitions
+        );
+        assert!(ChatLevers::resolve(false, false, true).disable_cwd_hint_injection);
     }
 }
