@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! PLE Marconi aux-state: serialize / restore the per-sequence lexical
+//! carry (token history + conv state) that rides the SSM snapshots.
+//! Split from `layer.rs` for the ≤500 LoC cap.
+
+use anyhow::{Context, Result};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+
+use crate::layers::ops;
+
+use super::{PleLayer, PleSeqState};
+use crate::layers::ngram_embed::NgramTable;
+use crate::layers::ple::ids::ple_ngram_ids;
+
+impl PleLayer {
+    /// Marconi aux blob: `[hist_len u32][history u32s][conv f32 bytes]`.
+    /// The whole per-sequence carry — a prefix hit restoring KV+SSM without
+    /// this would run the n-gram hash on the PREVIOUS request's history.
+    pub fn snapshot_aux(
+        &self,
+        st: &PleSeqState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Vec<u8>> {
+        let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
+        let mut blob = Vec::with_capacity(4 + st.history.len() * 4 + conv_bytes);
+        blob.extend_from_slice(&(st.history.len() as u32).to_le_bytes());
+        for t in &st.history {
+            blob.extend_from_slice(&t.to_le_bytes());
+        }
+        let off = blob.len();
+        blob.resize(off + conv_bytes, 0);
+        gpu.copy_d2h_on_stream(st.conv, &mut blob[off..], stream)?;
+        Ok(blob)
+    }
+
+    /// Restore the blob from [`Self::snapshot_aux`] on a prefix-cache hit.
+    pub fn restore_aux(
+        &self,
+        st: &mut PleSeqState,
+        blob: &[u8],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(blob.len() >= 4, "PLE aux blob truncated");
+        let n = u32::from_le_bytes(blob[..4].try_into().unwrap()) as usize;
+        let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
+        anyhow::ensure!(
+            blob.len() == 4 + n * 4 + conv_bytes,
+            "PLE aux blob size mismatch"
+        );
+        st.history = blob[4..4 + n * 4]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        st.prestaged_va = None;
+        st.prestaged_n = 0;
+        st.verify_snap_rows = 0;
+        st.verify_tokens.clear();
+        st.history_ckpt.clear();
+        gpu.copy_h2d_async(&blob[4 + n * 4..], st.conv, stream)?;
+        Ok(())
+    }
+}
+
+impl PleLayer {
+    /// Fresh sequence: EOS-filled history and a zeroed conv state.
+    pub(super) fn reset(
+        &self,
+        st: &mut PleSeqState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        st.history = vec![self.dims.eos_token_id; self.dims.context_len()];
+        st.prestaged_va = None;
+        st.prestaged_n = 0;
+        // A reused sequence must not inherit the previous one's verify window:
+        // a stale `verify_snap_rows` would let a rollback restore a carry that
+        // belongs to a different request.
+        st.verify_snap_rows = 0;
+        st.verify_tokens.clear();
+        st.history_ckpt.clear();
+        let zeros = vec![0u8; self.state_len * self.hc_mult * self.hidden * 4];
+        gpu.copy_h2d_async(&zeros, st.conv, stream)?;
+        Ok(())
+    }
+
+    /// Hoisted per-step HOST work for decode under CUDA graphs: the n-gram
+    /// hash, the NVMe fault-in and the slot upload into the stable
+    /// `slots_dev` buffer. All three are capture-illegal (the upload reads
+    /// pageable memory, which invalidates a recording graph with status
+    /// 901), so the scheduler calls this BEFORE graph replay/capture — the
+    /// same phasing decode_a already gives the `token_ids` upload. `forward`
+    /// then consumes `prestaged_va` and enqueues only stable-buffer kernels.
+    ///
+    /// History advances HERE; the prestaged `forward` must not advance it
+    /// again.
+    pub fn prestage(
+        &self,
+        st: &mut PleSeqState,
+        tokens: &[u32],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        if st.history.len() != self.dims.context_len() {
+            self.reset(st, gpu, stream)?;
+        }
+        // Keep what the history was BEFORE this window, and the window's own
+        // ids: `rollback_verify` rebuilds the history for whatever prefix the
+        // target ends up accepting. History is a fixed-width window, so it
+        // cannot simply be truncated back.
+        st.history_ckpt = st.history.clone();
+        st.verify_tokens = tokens.to_vec();
+        let mut window = st.history.clone();
+        window.extend_from_slice(tokens);
+        let all = ple_ngram_ids(&self.dims, &window);
+        let rows = &all[all.len() - tokens.len()..];
+        let flat: Vec<u64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        let va = self.gather_host(&flat, gpu, stream)?;
+        let keep = self.dims.context_len();
+        st.history = window[window.len() - keep..].to_vec();
+        st.prestaged_va = Some(va);
+        st.prestaged_n = tokens.len();
+        st.last_staged_va = va;
+        Ok(())
+    }
+
+    /// Release the pins taken by the PREVIOUS gather, after a stream sync.
+    ///
+    /// A pin marks a slot the batch in flight may still read, and `victim`
+    /// refuses to evict one — but only while the pin OUTLIVES the gather
+    /// kernel. It used to be dropped at the bottom of `gather_host`, i.e.
+    /// before `gather_embed` had even LAUNCHED the kernel (and on the
+    /// prestage path, a whole graph replay before it). A later `resolve`
+    /// could then take the slot as a victim and `fetch_into` would rewrite
+    /// it FROM THE HOST under the pending kernel. The arena is coherent
+    /// unified memory on GB10, so that write is visible to the GPU at
+    /// once: the gather returned other tokens' rows, the model got a
+    /// corrupted input embedding, and it reasoned coherently about text
+    /// nobody sent it ("the user has simply sent FDFDFDFFDFD"). It grew
+    /// worse as the cache filled and evictions began.
+    ///
+    /// Called from the TOP of the next `gather_host`, which makes the pin
+    /// cover the kernel: the sync guarantees every previously issued gather —
+    /// a replayed graph's included — has completed, so nothing can still be
+    /// reading the slots being freed. Legal there because `gather_host` is
+    /// already capture-illegal (its pageable H2D is why `prestage` exists),
+    /// so it never runs inside a capture region.
+    ///
+    /// Costs one stream sync per forward. An event recorded after
+    /// `gather_embed` would avoid the full barrier; correctness first.
+    pub(super) fn release_prev_pins(
+        table: &mut NgramTable,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        gpu.synchronize(stream)?;
+        #[cfg(feature = "cuda")]
+        if let NgramTable::Cached(cache) = table {
+            cache.end_batch();
+        }
+        let _ = table;
+        Ok(())
+    }
+
+    /// The row gather, dispatched on element type.
+    ///
+    /// FP8 rows carry a per-slot scale; BF16 rows do not. Split out of
+    /// `layer.rs` for the 500-LoC cap.
+    pub(super) fn gather_embed_dispatch(
+        &self,
+        table_va: u64,
+        num_tokens: usize,
+        heads: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        // Dispatch on the PRESENCE OF THE SCALE, not a dtype flag: it keeps
+        // "the bytes are E4M3" and "there is something to multiply by" from
+        // being able to disagree.
+        match self.scale_va {
+            Some(scale) => ops::batched_embed_fp8(
+                gpu,
+                self.embed_fp8_k,
+                self.slots_dev,
+                DevicePtr(table_va),
+                DevicePtr(scale),
+                self.emb,
+                (num_tokens * heads) as u32,
+                self.head_dim as u32,
+                stream,
+            )
+            .context("PLE row gather (fp8)"),
+            None => ops::batched_embed(
+                gpu,
+                self.embed_k,
+                self.slots_dev,
+                DevicePtr(table_va),
+                self.emb,
+                (num_tokens * heads) as u32,
+                self.head_dim as u32,
+                stream,
+            )
+            .context("PLE row gather"),
+        }
+    }
+
+    /// Return a sequence's PLE carry to the allocator (see
+    /// `TransformerLayer::free_state`). ~360 KB per sequence, unreclaimed for
+    /// the process's life before this existed. Idempotent.
+    pub(crate) fn free_seq_state(st: &mut PleSeqState, gpu: &dyn GpuBackend) -> Result<()> {
+        if st.conv.0 != 0 {
+            gpu.free(st.conv)?;
+            st.conv = spark_runtime::gpu::DevicePtr(0);
+        }
+        if st.verify_snaps.0 != 0 {
+            gpu.free(st.verify_snaps)?;
+            st.verify_snaps = spark_runtime::gpu::DevicePtr(0);
+        }
+        Ok(())
+    }
+}

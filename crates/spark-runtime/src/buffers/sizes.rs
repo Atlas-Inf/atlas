@@ -7,6 +7,12 @@ use atlas_core::device::sm121::NUM_SMS;
 
 use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 
+/// QSA stage-2 prefill-selection scratch row cap (Qwen3.8-Flash-Next): the
+/// arena is slabbed at this many selective rows, and the consumer
+/// (`spark-model` `qsa_select.rs`) must slab identically — a drift is a
+/// silent buffer-overrun or under-allocation.
+pub const QSA_SELECT_SCRATCH_ROWS: usize = 2048;
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -48,13 +54,27 @@ pub struct BufferSizes {
     /// Zero-filled BF16 weight (length max_dim) for unweighted RMSNorm under the
     /// offset-from-1 kernel convention (scale = 1+weight → 1.0). DeepSeek-V4 q_b_norm.
     pub norm_unit_w: usize,
-    /// HC residual streams: `[M, hc_mult, hidden]` BF16 (DeepSeek-V4 mHC).
-    /// 256 (placeholder) when `hc_mult == 0`.
+    /// HC residual streams: `[M, streams, hidden]` F32, where `streams` is
+    /// `hc_mult` (DeepSeek-V4 mHC) or `hc_count` (qwen4_exp), whichever the
+    /// model sets. 256 (placeholder) when neither is set.
     pub hc_streams: usize,
     /// HC `post` mixing weights: `[M, hc_mult]` F32.
     pub hc_post: usize,
     /// HC `comb` Sinkhorn matrix: `[M, hc_mult, hc_mult]` F32.
     pub hc_comb: usize,
+    /// Low-rank mHC split-collapse scratch (Qwen3.8-Flash-Next): the staged
+    /// normed vector `[T, hc_mult*hidden]` F32 plus the rank vector
+    /// `[T, hc_lowrank]` F32, for SMALL T only — decode runs the collapse as
+    /// three multi-block launches because `grid=[1]` starves the fused kernel
+    /// (measured 2.0 ms/call, one SM's bandwidth). Sized for 64 tokens; the
+    /// dispatcher falls back to the fused kernel above that.
+    pub hc_lowrank_scratch: usize,
+    /// QSA stage-2 prefill-selection scratch (Qwen3.8-Flash-Next), SHARED
+    /// across the 12 indexer layers (they run serially). Layout, slabbed at
+    /// 2048 selective rows: qk [2048, (n_heads+1)*hd] BF16, q_post
+    /// [2048, n_heads, hd] F32, scores [2048, max_seq/ratio] F32, lists
+    /// [2048, topk] i32. 256 (placeholder) when no indexer.
+    pub qsa_select_scratch: usize,
     /// Token IDs `[M]` u32 for the current pass — stable across the layer loop
     /// so DeepSeek-V4 hash-MoE layers can read `tid2eid[token_id]`. Always
     /// allocated (small); unused by models without hash routing.
@@ -133,6 +153,9 @@ impl BufferSizes {
         let bf16 = 2;
         let m = max_batch_tokens;
         let h = config.hidden_size;
+        // Residual streams on the trunk: DeepSeek-V4 states it as `hc_mult`,
+        // qwen4_exp as `hc_count`. A model sets one or the other, never both.
+        let hc_streams_count = config.hc_mult.max(config.hc_count);
 
         // Q projection output: gated models produce [Q, gate] (2× nq*hd),
         // ungated models (VL) produce only [Q] (nq*hd).
@@ -374,12 +397,14 @@ impl BufferSizes {
                     0
                 }),
             gate_logits: if config.num_experts > 0 {
-                m * config.num_experts * bf16
+                // LongCat zero-experts: the router scores (routed + zero)
+                // logits even though only `num_experts` expert FFNs exist.
+                m * (config.num_experts + config.zero_expert_num) * bf16
             } else {
                 256
             },
             gate_logits_f32: if config.num_experts > 0 {
-                m * config.num_experts * 4
+                m * (config.num_experts + config.zero_expert_num) * 4
             } else {
                 256
             },
@@ -446,13 +471,43 @@ impl BufferSizes {
             o_latent: (m * config.o_groups * config.o_lora_rank * bf16).max(256),
             // Zero-filled weight for unweighted RMSNorm (q_b_norm).
             norm_unit_w: max_dim * bf16,
-            // HC buffers: only allocated for DeepSeek-V4 (hc_mult > 0).
-            hc_streams: if config.hc_mult > 0 {
-                // FP32 mHC highway: the residual streams grow large across the
-                // blocks (the manifold-mixing is norm-preserving, eigenvalue 1),
-                // so BF16 storage swamps the small per-layer signal at scale and
-                // collapses generation. Store the streams in FP32 (4 bytes).
-                m * config.hc_mult * h * 4
+            // HC buffers. Two unrelated architectures carry a multi-stream
+            // residual and both need this highway:
+            //
+            //   DeepSeek-V4  `hc_mult`   Sinkhorn-mixed mHC (hc_post/hc_comb)
+            //   qwen4_exp    `hc_count`  low-rank sigmoid-gated (no Sinkhorn)
+            //
+            // Only the STREAM COUNT matters for sizing, so they share the
+            // buffer; `hc_post`/`hc_comb` below stay V4-only because the
+            // Sinkhorn intermediates have no qwen4_exp counterpart.
+            hc_streams: if hc_streams_count > 0 {
+                // F32 FOR BOTH FAMILIES, and this line is load-bearing: the
+                // kernels that read this buffer declare `const float*`
+                // (`hyper_connection.cu` — `streams`, `residual` and `out` are
+                // all float on hc_expand / hc_pre / hc_post / hc_head). Sizing
+                // it bf16 under those kernels does not fail; it reads the wrong
+                // half of every value.
+                //
+                //   V4 (hc_mult)      f32 deliberately: manifold mixing is
+                //                     norm-preserving (eigenvalue 1), so bf16
+                //                     storage swamps the small per-layer signal
+                //                     at scale and collapses generation.
+                //   qwen4_exp         f32 because the serving kernels are the
+                //   (hc_count)        ones above. This CLOSES the drift question
+                //                     that used to sit here open: its mixer is
+                //                     contractive rather than norm-preserving,
+                //                     so V4's argument does not transfer — but
+                //                     the port keeps the FP32 highway anyway
+                //                     and generates coherently across all 48
+                //                     layers, so there is nothing to trade.
+                //
+                // The bf16 arm this line used to carry belonged to the
+                // `q4e_hc_stream_mix` / `q4e_hc_scatter_add` kernels, which
+                // stride by __nv_bfloat16. Those are now the microtest oracles
+                // (`ops::qwen4exp`) and never read this arena buffer, so the
+                // per-family branch was removed rather than left as a trap for
+                // whoever reads it next.
+                m * hc_streams_count * h * 4
             } else {
                 256
             },
@@ -463,6 +518,39 @@ impl BufferSizes {
             },
             hc_comb: if config.hc_mult > 0 {
                 (m * config.hc_mult * config.hc_mult * 4).max(256)
+            } else {
+                256
+            },
+            hc_lowrank_scratch: if config.hc_mult > 0 && config.hc_lowrank > 0 {
+                // Two exclusive layouts share this region:
+                // - decode split path (T <= 64): normed FP32 [64, hc*H] then
+                //   low FP32 [64, rank];
+                // - prefill GEMM path (T > 64, slabbed at <= 2048 tokens):
+                //   normed BF16 [Ts, hc*H], up_pre BF16 [Ts, hc*H],
+                //   low BF16 [Ts, rank], inj_pre BF16 [Ts, hc], and
+                //   up_wt BF16 [hc*H, rank] — a per-call transposed staging
+                //   copy of `input_mix_weight_up`, which is stored
+                //   [rank, hc*H] so the decode kernels coalesce while this
+                //   path's NT tensor-core GEMM still gets [hc*H, rank].
+                //   Ts-independent, hence added outside the Ts factor.
+                let t = m.min(64);
+                let split = t * (config.hc_mult * h + config.hc_lowrank) * 4;
+                let ts = m.min(2048);
+                let gemm = ts * (2 * config.hc_mult * h + config.hc_lowrank + config.hc_mult) * 2
+                    + config.hc_mult * h * config.hc_lowrank * 2;
+                split.max(gemm)
+            } else {
+                256
+            },
+            qsa_select_scratch: if config.index_topk > 0 && config.index_compress_ratio > 0 {
+                let rows = QSA_SELECT_SCRATCH_ROWS;
+                let qkw = (config.index_n_heads + 1) * config.index_head_dim;
+                let n_blocks = max_seq_len.div_ceil(config.index_compress_ratio);
+                let topk = config.index_topk / config.index_compress_ratio;
+                rows * qkw * 2
+                    + rows * config.index_n_heads * config.index_head_dim * 4
+                    + rows * n_blocks * 4
+                    + rows * topk * 4
             } else {
                 256
             },
@@ -502,6 +590,8 @@ impl BufferSizes {
             + self.scratch
             + self.expert_gate_out
             + self.expert_up_out
+            + self.hc_lowrank_scratch
+            + self.qsa_select_scratch
             + self.expert_down_out
             + self.splitk_workspace
             + self.gdn_fla_scratch
@@ -521,5 +611,73 @@ impl BufferSizes {
             + self.lora_seq_slot
             + self.q2_dequant_scratch
             + self.q2_act_q8
+    }
+}
+
+#[cfg(test)]
+mod qwen4exp_hc_tests {
+    use super::*;
+
+    /// A model that spells its stream count `hc_count` must still get a real
+    /// highway. Before this, `hc_streams` was gated on `hc_mult > 0` — the
+    /// DeepSeek-V4 spelling — so qwen4_exp silently received the 256-byte
+    /// placeholder and the first write past it would have been someone else's
+    /// buffer.
+    #[test]
+    fn hc_count_allocates_the_stream_highway() {
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        cfg.hc_mult = 0;
+        cfg.hc_count = 4;
+        cfg.hidden_size = 2560;
+        let sizes = BufferSizes::from_config(&cfg, 128, 2048, 16, 1);
+        // F32, because `hyper_connection.cu` declares this buffer `float*` on
+        // every entry point. bf16 here would not fail — it would read the
+        // wrong half of every value.
+        assert_eq!(sizes.hc_streams, 128 * 4 * 2560 * 4);
+    }
+
+    /// A real `qwen4_exp` config sets BOTH spellings — the parser maps
+    /// `hc_count` onto `hc_mult` because the engine dispatches on the latter,
+    /// and keeps the former because the manifest and the reference read the
+    /// checkpoint's own field names. So the two must size identically, or the
+    /// arena would depend on which name a future caller happened to fill in.
+    #[test]
+    fn both_spellings_size_the_same_highway() {
+        let base = ModelConfig::qwen3_next_80b_nvfp4();
+        let sized = |mult: usize, count: usize| {
+            let mut cfg = base.clone();
+            cfg.hc_mult = mult;
+            cfg.hc_count = count;
+            cfg.hidden_size = 2560;
+            BufferSizes::from_config(&cfg, 128, 2048, 16, 1).hc_streams
+        };
+        let expected = 128 * 4 * 2560 * 4;
+        assert_eq!(sized(4, 0), expected, "hc_mult only");
+        assert_eq!(sized(0, 4), expected, "hc_count only");
+        assert_eq!(sized(4, 4), expected, "both, as the parser sets them");
+    }
+
+    /// DeepSeek-V4 keeps f32 deliberately: its manifold mixing is
+    /// norm-preserving, so bf16 storage swamps the per-layer signal and
+    /// collapses generation. Widening qwen4_exp must not have narrowed V4.
+    #[test]
+    fn hc_mult_keeps_its_f32_highway() {
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        cfg.hc_mult = 4;
+        cfg.hc_count = 0;
+        cfg.hidden_size = 2560;
+        let sizes = BufferSizes::from_config(&cfg, 128, 2048, 16, 1);
+        assert_eq!(sizes.hc_streams, 128 * 4 * 2560 * 4);
+    }
+
+    /// Neither set is the overwhelmingly common case and must stay a
+    /// placeholder rather than a hidden-size allocation on every model.
+    #[test]
+    fn no_streams_stays_a_placeholder() {
+        let cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        assert_eq!(cfg.hc_mult, 0);
+        assert_eq!(cfg.hc_count, 0);
+        let sizes = BufferSizes::from_config(&cfg, 128, 2048, 16, 1);
+        assert_eq!(sizes.hc_streams, 256);
     }
 }

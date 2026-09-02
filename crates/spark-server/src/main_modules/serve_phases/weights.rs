@@ -53,6 +53,22 @@ pub(crate) fn load_weight_store(
         return Ok(store);
     }
 
+    /// Tensors this model reads from disk at use time rather than holding.
+    ///
+    /// Only the `qwen4_exp` PLE n-gram table so far. It is 51.2 B parameters —
+    /// 41% of that checkpoint — and is gathered by row (~2.5 KB per token), so
+    /// making it resident is both unnecessary and, on a 119 GB GB10, impossible:
+    /// the pre-flight lands at 163 GB with it and ~96 GB without.
+    ///
+    /// Keyed on `ple_layer_ids` rather than on `model_type`, because it is the
+    /// presence of the tower that decides this, not the family name.
+    fn demand_paged_patterns(config: &ModelConfig) -> Vec<String> {
+        if config.ple_layer_ids.is_empty() {
+            return Vec::new();
+        }
+        vec![".ple.ple_embedding.ngram_embedding.shard_".to_string()]
+    }
+
     let use_fast_load =
         !args.no_fast_load && std::env::var("ATLAS_FAST_LOAD").ok().as_deref() != Some("0");
     let store = if use_fast_load {
@@ -69,6 +85,15 @@ pub(crate) fn load_weight_store(
                 spark_runtime::fast_weights::FastSafetensorsLoader::new()
             };
             loader.peak_memory_multiplier = mult;
+            loader.demand_paged_patterns = demand_paged_patterns(config);
+            if !loader.demand_paged_patterns.is_empty() {
+                tracing::info!(
+                    "Demand-paged (never resident, read by row at use time): {:?}",
+                    loader.demand_paged_patterns
+                );
+            }
+            loader.skip_activation_scales = skip_activation_scales(config);
+            loader.skip_mtp = skip_mtp(config, args);
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
@@ -91,6 +116,8 @@ pub(crate) fn load_weight_store(
             spark_runtime::weights::SafetensorsLoader::new()
         };
         loader.peak_memory_multiplier = mult;
+        loader.skip_activation_scales = skip_activation_scales(config);
+        loader.skip_mtp = skip_mtp(config, args);
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?
@@ -221,4 +248,38 @@ pub(crate) fn load_lora_adapters(
         });
     }
     Ok(states)
+}
+
+/// Whether this model's loader can skip the W4A4 `*.input_scale` activation
+/// scales.
+///
+/// ModelOpt NVFP4 ships one 0-dim F32 scalar per quantized projection. On
+/// Qwen3.8-Flash-Next that is ~74k four-byte allocations (48 layers x 512
+/// experts x 3 projections), each taking a full allocation granule — GBs of
+/// padding for values the w4a16 path never reads. The NVFP4 loader already
+/// treats the key as optional (`if store.contains(..) else NULL`), so not
+/// uploading them is identical to loading a checkpoint that never had them.
+///
+/// Deliberately an ALLOW-LIST, not a blanket skip: `step3p7` reads
+/// `input_scale` on its own loader path, and silently withholding a tensor a
+/// loader DOES read is exactly the class of bug that stays invisible until
+/// the output is subtly wrong.
+fn skip_activation_scales(config: &ModelConfig) -> bool {
+    matches!(config.model_type.as_str(), "qwen4_exp")
+}
+
+/// Whether this model's loader builds no MTP head, so `mtp.*` need not be
+/// uploaded at all.
+///
+/// Measured, not estimated: `mtp.*` on this checkpoint is 5.21 GB (31 tensors,
+/// 5.03 GB of which is the stacked BF16 expert pair) — not the ~1.5 GB an
+/// earlier note claimed. That is 3.5x the figure the original drop was argued
+/// against, and on a box where 0.90 utilization is already near the boot floor
+/// it is the difference between a usable KV cache and none.
+fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
+    // qwen4_exp now BUILDS an MTP head, but only under `--speculative`
+    // (`weight_loader/qwen4_exp/mtp.rs`). Without the flag the `mtp.*` upload is
+    // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
+    // comes straight out of the KV cache. With the flag it is the drafter.
+    matches!(config.model_type.as_str(), "qwen4_exp") && !args.speculative
 }

@@ -459,6 +459,7 @@ impl TransformerModel {
                 graph_capture: ctx.graph_capture,
                 gdn_exact_replay: false,
                 token_ids: None,
+                host_token_ids: None,
                 // #30: forward the parent's routing (None on this decode-profiling
                 // path, but never silently drop it if a prefill ever re-wraps).
                 routed_lora_layers: ctx.routed_lora_layers,
@@ -587,8 +588,9 @@ impl TransformerModel {
 
         let mut kv_cache = self.kv_cache.lock();
 
-        // 1. Embedding lookup
-        self.embed(token, hidden, stream)?;
+        // 1. Embedding lookup. `seq.tokens` is the history WITHOUT `token`
+        // (pushed after the forward) — exactly the n-gram contract.
+        self.embed_ctx(&seq.tokens, token, hidden, stream)?;
 
         // 2. Pre-allocate KV cache blocks + upload attention metadata
         let bs = kv_cache.block_size();
@@ -668,6 +670,7 @@ impl TransformerModel {
             graph_capture: false, // Eager mode — no CUDA graph
             gdn_exact_replay: false,
             token_ids: None,
+            host_token_ids: None,
             routed_lora_layers: None, // #30: offline single-seq decode; no prefill route.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) skips fold, adapter folds (single-seq reject lifted)

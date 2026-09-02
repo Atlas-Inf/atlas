@@ -53,6 +53,36 @@ pub fn rms_norm_strided(
         .launch(stream)
 }
 
+/// RMSNorm reading an **FP32** input (the mHC stream highway) and writing
+/// BF16. Same offset-from-1 scaling as [`rms_norm`].
+///
+/// Launched once per stream with the matching `[hidden]` slice of a
+/// `[hc_mult * hidden]` weight, this is exactly the GROUPED norm the mHC
+/// kernels apply (`group_size = hidden`, each stream normalised over its own
+/// slice) — the flattened single-group form is a different function.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_f32(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    output: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([hidden_size.min(1024), 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(output)
+        .arg_u32(hidden_size)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
 pub fn rms_norm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,

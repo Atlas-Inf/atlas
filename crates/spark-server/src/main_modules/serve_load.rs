@@ -497,6 +497,11 @@ pub(crate) fn load_model(
         max_batch_tokens,
         spec_tokens: _spec_tokens,
     } = serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk);
+    // Every BufferArena region is sized by this. Carry it so the ONE arena
+    // that is allocated inside a weight loader — qwen4_exp's PLE scratch —
+    // can be sized by it too instead of a standalone constant. Same
+    // "carried on the config, not the environment" rule as the block below.
+    config.max_batch_tokens = max_batch_tokens;
     if args.dflash && args.enable_prefix_caching {
         tracing::warn!(
             "dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
@@ -782,6 +787,17 @@ pub(crate) fn load_model(
     } else {
         args.max_batch_size
     };
+    // mHC highway models (#753 item B): multi-seq decode runs the per-seq
+    // highway loop (decode_a2) with per-sequence PLE/QSA state; batched
+    // prefill/mixed steps are serialized scheduler-side. Concurrency is
+    // honored — the earlier clamp-to-1 mitigation is lifted.
+    if scheduler_model.hc_mult() > 0 && max_batch_size > 1 {
+        tracing::info!(
+            "mHC highway model: concurrency {max_batch_size} via the per-seq \
+             highway decode loop (batched highway kernels are the perf \
+             follow-up)"
+        );
+    }
     // Derived ceiling (wave-14a): the decode-metadata layout, logits rows and
     // scratch block-table envelope are all DERIVED from max_batch_size
     // (`spark_runtime::buffers::DecodeMetaLayout`, rows = max(32, bs) —
@@ -827,7 +843,19 @@ pub(crate) fn load_model(
             "Self-speculative decoding: ENABLED ({num_drafts} drafts/step, layer-skipping)"
         );
     } else if use_speculative {
-        tracing::info!("Speculative decoding: ENABLED ({num_drafts} drafts/step)");
+        // A model can cap the verify width below what was asked for (the mHC
+        // highway has MoE arms for K=2/3 only). The scheduler clamps every
+        // step to it; say so here, or the operator reads back a depth the
+        // serve will never dispatch.
+        match scheduler_model.verify_max_drafts() {
+            Some(max_nd) if max_nd < num_drafts => tracing::warn!(
+                "Speculative decoding: ENABLED ({max_nd} drafts/step) — \
+                 --num-drafts {num_drafts} CLAMPED to {max_nd}: this model's batched \
+                 verify serves at most K={} rows.",
+                max_nd + 1
+            ),
+            _ => tracing::info!("Speculative decoding: ENABLED ({num_drafts} drafts/step)"),
+        }
     } else if scheduler_model.has_proposer() {
         tracing::info!(
             "MTP proposer available but speculative decoding disabled (use --speculative to enable)"

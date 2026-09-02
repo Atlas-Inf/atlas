@@ -24,6 +24,15 @@ impl Qwen3SsmLayer {
         let conv_dim = nk * kd * 2 + nv * vd;
 
         Ok(Self {
+            // mHC is attached later by the loader, and only for models that
+            // carry a hc_mult-wide residual highway. The handles are gated on
+            // the same condition `ArchProbes` uses, so a plain GDN model
+            // never issues the lookup.
+            hc: None,
+            ple: None,
+            hc_pre_k: super::kernel_select::hc_kernel(config, gpu, "hc_pre"),
+            hc_post_k: super::kernel_select::hc_kernel(config, gpu, "hc_post"),
+            hc_expand_k: super::kernel_select::hc_kernel(config, gpu, "hc_expand"),
             input_norm,
             ssm,
             post_attn_norm,
@@ -56,8 +65,15 @@ impl Qwen3SsmLayer {
             // machine?" and that question has no portable answer.
             sm_count: gpu.sm_count()?,
             rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
-            gated_rms_norm_k: gpu.kernel("norm", "gated_rms_norm")?,
-            gated_rms_norm_f32_k: super::super::try_kernel(gpu, "norm", "gated_rms_norm_f32_input"),
+            gated_rms_norm_k: gpu.kernel(
+                "norm",
+                &super::kernel_select::gated_norm_kernel(config, "gated_rms_norm")?,
+            )?,
+            gated_rms_norm_f32_k: super::super::try_kernel(
+                gpu,
+                "norm",
+                &super::kernel_select::gated_norm_kernel(config, "gated_rms_norm_f32_input")?,
+            ),
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batch2_k: gpu.kernel("dense_gemv_bf16_batch2", "dense_gemv_bf16_batch2")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
@@ -162,7 +178,10 @@ impl Qwen3SsmLayer {
                 "norm",
                 "residual_add_rms_norm_gatef32",
             ),
-            gated_rms_norm_prefill_k: gpu.kernel("norm", "gated_rms_norm_prefill")?,
+            gated_rms_norm_prefill_k: gpu.kernel(
+                "norm",
+                &super::kernel_select::gated_norm_kernel(config, "gated_rms_norm_prefill")?,
+            )?,
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: crate::layers::tgemm_kernel(gpu),
             w4a16_gemm_t_k64_k: crate::layers::k64_kernel(gpu)?,
@@ -448,34 +467,8 @@ impl Qwen3SsmLayer {
         })
     }
 
-    /// Construct an SSM layer where QKVZ projection output is already sequential.
-    ///
-    /// Used by Qwen3.5 where separate QKV and Z weights are concatenated at load
-    /// time into `[Q|K|V|Z]` row order. The `deinterleave_qkvz` kernel is skipped
-    /// and plain `w4a16_gemv` writes directly to the deinterleaved buffer.
-    pub fn new_sequential(
-        input_norm: DenseWeight,
-        ssm: SsmWeights,
-        post_attn_norm: DenseWeight,
-        ffn: FfnComponent,
-        qkvz_nvfp4: Option<QuantizedWeight>,
-        qkvz_nvfp4_t: Option<QuantizedWeight>,
-        out_proj_nvfp4_t: Option<QuantizedWeight>,
-        config: &atlas_core::config::ModelConfig,
-        gpu: &dyn GpuBackend,
-    ) -> Result<Self> {
-        let mut layer = Self::new(
-            input_norm,
-            ssm,
-            post_attn_norm,
-            ffn,
-            qkvz_nvfp4,
-            config,
-            gpu,
-        )?;
-        layer.sequential_qkvz = true;
-        layer.qkvz_nvfp4_t = qkvz_nvfp4_t;
-        layer.out_proj_nvfp4_t = out_proj_nvfp4_t;
-        Ok(layer)
-    }
+    // `new_sequential` moved to `init_sequential.rs` (≤500 LoC split).
 }
+
+#[path = "init_sequential.rs"]
+mod init_sequential;

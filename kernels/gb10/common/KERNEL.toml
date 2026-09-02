@@ -35,10 +35,42 @@ extra_nvcc_flags = ["--fmad=false", "-DTQ_PLUS_SIGNS"]
 #       not shadow rms_norm.cu, so it always gets the common/ copies. If a
 #       vanilla-norm model ever forks rms_norm.cu, the startup audit still
 #       hard-errors on the missing kernels.
+#
+#   norm::rms_norm_grouped
+#   norm::{gated_rms_norm_sigmoid, gated_rms_norm_f32_input_sigmoid,
+#          gated_rms_norm_prefill_sigmoid}
+#       qwen4_exp (Qwen3.8-Flash-Next) only, and the same shape of argument as
+#       the vanilla pair above. The grouped norm normalises the `hc_count`
+#       residual streams independently inside one `hc_count * hidden` vector,
+#       which no other family has; the three sigmoid twins are selected by
+#       `kernel_select::gated_norm_kernel` from `output_gate_type == "sigmoid"`,
+#       which is a field only this checkpoint sets — every other Qwen-family GDN
+#       model gates with SiLU and resolves the originals.
+#
+#       They live in common/ rather than in the qwen3.8-flash-next shadow
+#       DELIBERATELY: #754 shipped a per-target `gated_norm_sigmoid.cu` whose
+#       own header warned that a fix to the SiLU originals "should be re-derived
+#       here", which is a maintenance trap. Keeping one copy means the twins and
+#       their originals cannot drift. qwen3.8-flash-next does not shadow
+#       rms_norm.cu, so it always gets these; the ten targets that DO shadow it
+#       are none of them qwen4_exp.
+#
+#       The safety net is unchanged: if a target that needs them ever forks
+#       rms_norm.cu, `gated_norm_kernel` calls `gpu.kernel(...)` (not
+#       `try_kernel`) and the fail-closed startup audit hard-errors by name.
+#       `scripts/dev/check_qwen4exp_kernel_names.py` also asserts all four
+#       resolve for this target specifically.
 [shadow_exempt]
 w4a16 = ["w4a16_dequant"]
 moe_w4a16 = ["moe_w4a16_grouped_gemm"]
-norm = ["rms_norm_residual_vanilla", "residual_add_rms_norm_vanilla"]
+norm = [
+    "rms_norm_residual_vanilla",
+    "residual_add_rms_norm_vanilla",
+    "rms_norm_grouped",
+    "gated_rms_norm_sigmoid",
+    "gated_rms_norm_f32_input_sigmoid",
+    "gated_rms_norm_prefill_sigmoid",
+]
 
 # File stem → module name overrides.
 # Any .cu file not listed here uses its file stem as the module name.

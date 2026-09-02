@@ -153,8 +153,35 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
+    // Attribute the memory the BUILD spends, not just the shards.
+    //
+    // Weight upload reports itself per shard, and the buffer arena reports its
+    // own total, but everything between — per-layer construction, runtime
+    // requantization, derived weights — was invisible. On qwen4_exp that gap
+    // is ~8.5 GB: shards end at 85.2 GB and the KV budget sees 94.7 GB
+    // pre-KV, of which the arena (872 MB) and the GDN prefill scratch (88 MB)
+    // explain under a gigabyte. Without these three lines the only way to
+    // find the rest is to guess.
+    let free_before_layers = gpu.free_memory().unwrap_or(0);
     let mut layers = loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
+    let free_after_layers = gpu.free_memory().unwrap_or(0);
+    tracing::info!(
+        "Layer construction: {:.2} GB consumed ({:.2} GB free -> {:.2} GB free) \
+         across {} layers, {:.1} MB/layer average",
+        (free_before_layers.saturating_sub(free_after_layers)) as f64 / 1e9,
+        free_before_layers as f64 / 1e9,
+        free_after_layers as f64 / 1e9,
+        config.num_hidden_layers,
+        (free_before_layers.saturating_sub(free_after_layers)) as f64
+            / 1e6
+            / config.num_hidden_layers.max(1) as f64,
+    );
     let embed = loader.load_embedding(&store, &config, gpu.as_ref())?;
+    // n-gram fused embedding (LongCat family; None everywhere else). Built
+    // before `config` is moved into the model. Staged for `max_batch_tokens`
+    // because that is exactly the widest embed the arena can be handed.
+    let ngram_embed =
+        loader.load_ngram_embedding(&store, &config, gpu.as_ref(), max_batch_tokens)?;
     let final_norm = loader.load_final_norm(&store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(&store, &config, gpu.as_ref())?;
     let mtp_weights = loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?;
@@ -196,10 +223,35 @@ pub fn build_model(
             None
         };
 
+    // Qwen3.8-Flash-Next ships an MTP block that is architecturally a full
+    // layer (gated attention + QSA indexer + mHC + 512-expert MoE), not the
+    // Qwen-shaped `MtpWeights`, so it loads through its own path exactly like
+    // DeepSeek-V4's. Rank 0 only: no other rank ever drafts.
+    let q4e_mtp_module =
+        if config.model_type == "qwen4_exp" && use_speculative && config.ep_rank == 0 {
+            match crate::weight_loader::qwen4_exp::load_qwen4exp_mtp_module(
+                &store,
+                &config,
+                gpu.as_ref(),
+                &attn_layer_dtypes,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("qwen4_exp MTP module load FAILED: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let q4e_mtp_loaded = q4e_mtp_module.is_some();
+    let q4e_mtp_embed = embed;
+    let q4e_mtp_lm_head = lm_head;
+
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
     // this loudly so the user knows the flag was inert.
-    if use_speculative && mtp_weights.is_empty() {
+    if use_speculative && mtp_weights.is_empty() && !q4e_mtp_loaded {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
              model — speculative decoding will be disabled. Either drop `--speculative` \
@@ -594,6 +646,34 @@ pub fn build_model(
         }
     }
 
+    // ── Step 6c: Qwen3.8-Flash-Next MTP proposer (optional) ──
+    //
+    // Same shape as 6b: the module holds a reused trunk layer, and the
+    // proposer supplies the MTP-specific ends (the per-stream combiner in
+    // front, the head mixer behind).
+    if let Some(q4e_module) = q4e_mtp_module {
+        match crate::layers::Qwen4ExpMtpHead::new(
+            q4e_module,
+            q4e_mtp_embed,
+            q4e_mtp_lm_head,
+            model.config_ref(),
+            model.gpu_backend(),
+            mtp_vocab_size,
+            max_seq_len,
+        ) {
+            Ok(head) => {
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(
+                    "qwen4_exp MTP speculative decoding: ENABLED (single module, \
+                     reused full-attention body)"
+                );
+            }
+            Err(e) => tracing::warn!(
+                "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
+            ),
+        }
+    }
+
     // ── Step 7: DFlash drafter (optional, post-construction) ──
     //
     // Loaded last because it depends on the target's `embed_tokens` and
@@ -632,6 +712,9 @@ pub fn build_model(
     // The pool/tables were loaded up top (pre-KV-sizing); this walk copies
     // the per-layer pairs into the layer structs. M0: layers only STORE the
     // adapter — base output is unchanged until the M1 compute insertions.
+    if let Some(ngram) = ngram_embed {
+        model.set_ngram_embedding(ngram);
+    }
     model.set_lora_weights(lora_weights)?;
 
     // Every layer has taken the pointers it needs; hand the ledger to the model

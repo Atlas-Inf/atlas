@@ -29,6 +29,9 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 mod state_io;
 
+#[path = "sequence_graphs.rs"]
+mod sequence_graphs;
+
 impl TransformerModel {
     pub(super) fn cache_sequence_dispatch(&self, seq: &SequenceState) {
         let bs = self.kv_cache.lock().block_size();
@@ -123,6 +126,32 @@ impl TransformerModel {
         // On the normal teardown path (`slot_idx < max_slots`), `take()` yields
         // the owned index and we release it exactly once. `take()` also makes
         // the guard's Drop a no-op so abort/panic cannot double-release.
+        // Return the per-layer device allocations this sequence owned. Only
+        // the states that hold raw `gpu.alloc` memory do anything here — the
+        // PLE conv carry and the QSA indexer keys — and both were leaked for
+        // the process's lifetime before this call existed: `DevicePtr` has no
+        // `Drop`, and the backend sweeps only at exit ("backend drop reclaimed
+        // N allocation(s) that no owner released").
+        //
+        // ~30 MB per request on qwen4_exp, against ~2 GB of slack after a
+        // 117 GB resident load, which is why a 225-request run was OOM-KILLED
+        // at request 80 while a 13-request smoke suite passed indefinitely.
+        //
+        // Errors are LOGGED, not propagated: a failed free must not strand the
+        // sequence and leak the pool slot below, which would turn a memory
+        // leak into a wedged scheduler.
+        for (layer, st) in self.layers.iter().zip(seq.layer_states.iter_mut()) {
+            if let Err(e) = layer.free_state(self.gpu.as_ref(), st.as_mut()) {
+                tracing::error!("free_sequence: layer.free_state: {e:#}");
+            }
+        }
+
+        // MUST follow `free_state`: the graphs being dropped are the ones that
+        // reference the per-sequence buffers it just released.
+        if seq.slot_idx < self.ssm_pool.max_slots {
+            self.invalidate_slot_graphs(seq.slot_idx);
+        }
+
         let slot_reused_by_compact = seq.slot_idx >= self.ssm_pool.max_slots;
         let taken = seq.ssm_slot.as_mut().and_then(|g| g.take());
         let slot_to_release = if slot_reused_by_compact { None } else { taken };
