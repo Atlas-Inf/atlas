@@ -501,6 +501,43 @@ wrong: it grepped the server log for the flag's warning at boot, but that \
 warning is emitted inside prepare_chat_prompt and only appears once a REQUEST \
 has been served. Verify a manipulation with a live measurement \
 (usage.prompt_tokens on a real request), never with a proxy. \
+★ THE FULL DRAW SETTLES IT: 79.80 / 82.40, AND HALLUCINATION WENT UP. \
+ATLAS_NO_TOOL_INJECT=1, golden n=995, shipped tscg, thinking ON, prompt verified \
+at 411 tokens on a live request BEFORE scoring started. \
+    config                    overall  normalized  halluc   live   non_live \
+    Atlas shipped               64.22     71.25     94.51   68.24    51.01 \
+    Atlas thinking-off          67.64     73.33     94.89   71.18    53.93 \
+    vLLM 0.28.0                 73.57     78.18     99.43   71.18    63.94 \
+    Atlas NO-INJECT             79.80     82.40     96.21   77.06    73.92 \
++15.58 overall against shipped Atlas, and +6.23 against vLLM - the port now \
+BEATS the reference engine on the same weights and draw. \
+★ THE RISK THAT GATED THIS DID NOT MATERIALISE. prepare.rs warned the injection \
+was load-bearing for hallucination ("~96 vs 30/64 without"), which is why the \
+flag shipped default-off and why a subset win was explicitly refused as \
+sufficient. Measured: hallucination 94.51 -> 96.21, an INCREASE. The prose the \
+injection contributed was not what made the model decline; the template's own \
+block already carries that. Nothing was traded - all three categories rose. \
+★ WHERE THE +15.58 COMES FROM. Per subset, NO-INJECT against shipped-thinking-off: \
+    parallel           75.00 vs 20.16   +54.84   (vLLM 58.06 - beats it by 16.94) \
+    live_parallel      87.50 vs 18.75   +68.75   (vLLM 75.00 - beats it by 12.50) \
+    parallel_multiple  68.55 vs 52.42   +16.13   (vLLM 54.03) \
+    live_parallel_mult 54.17 vs 50.00    +4.17 \
+    multiple           88.71 vs 79.03    +9.68 \
+    simple_python      88.71 vs 84.27    +4.44 \
+    simple_javascript  51.61 vs 48.39    +3.22 \
+    simple_java        50.00 vs 59.68    -9.68  (the one regression) \
+The parallel family is the whole story, exactly as the dose-response predicted. \
+simple_java is the single loss and is worth a look, but it is 100 samples of \
+3625 and is swamped by the rest. \
+★ WHAT IS NOW TRUE ABOUT THE BAR. 79.80 is 7.64 under Qwen3.6's 87.44, down from \
+a 23.22 gap at the start. vLLM's 73.57 is no longer the ceiling - the port \
+passed it - so the remaining gap is not obviously unreachable either. The next \
+lever to price is thinking-off ON TOP of no-inject: worth +3.42 on its own, \
+never measured in combination, and the two are independent axes. \
+★ STILL DEFAULT-OFF, DELIBERATELY. One draw, and the multi-turn hazard behind \
+the injection is unmeasured by any single-turn benchmark. Flipping the default \
+is a maintainer call that wants a second draw and a multi-turn check first. The \
+evidence for flipping it is now strong; the decision is still not mine. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
