@@ -285,6 +285,49 @@ unmeasured, and prepare.rs records that tool-prompt changes swing hallucination 
 from ~96 to 30/64. A 30% prefill saving is worth revisiting on its own merits \
 with those categories measured; it is not a fix for parallel calling, and an \
 unmeasured change has no place in a submission number. \
+★ HOW BIG THE SERVED PROMPT ACTUALLY IS, MEASURED. An earlier raw-completion \
+test was discarded as confounded because it assumed a local apply_chat_template \
+render equalled Atlas's prompt without checking. Checked now, against \
+usage.prompt_tokens on 8 parallel_multiple samples: Atlas 1505-1726 tokens \
+versus the checkpoint's own render at 524-644, a delta of +978 to +1082, mean \
++1019. The served prompt is roughly 3x the native one. The extra is the \
+qwen3_coder injection - the tool list re-rendered in a second format, plus \
+IMMEDIATE_TOOL_USE and a 9-bullet IMPORTANT block written entirely about \
+agentic CODING tools (bash, Write, Edit, oldString, markdown fences, heredocs), \
+none of which exist in BFCL. Its thrust is also singular: "the next emission \
+after deciding to run a shell command must be the <tool_call>". \
+★ THE OFFICIAL-PROMPT ARM, RE-SCORED PER SUBSET. ATLAS_OFFICIAL_TOOL_PROMPT=1 \
+swaps that block for the checkpoint's short 4-bullet reminder; it verifiably \
+takes effect, mean prompt_tokens 1513 -> 930. It had read 43.3% vs a 35.0% \
+baseline at p=0.27 on the AGGREGATE of parallel + parallel_multiple, and was \
+re-tested because the thinking result proved that aggregate cancels \
+opposite-sign effects. Held-out slices [30:75], paired, 45 samples each: \
+    subset              baseline   official   paired    exact p   x4 \
+    parallel              31.1%      46.7%    W11/L4    0.1185   0.474 \
+    parallel_multiple     33.3%      37.8%    W6/L4     0.7539   1.000 \
+    AGGREGATE             32.2%      42.2% \
+★ AND THE CANCELLATION HYPOTHESIS DID NOT HOLD. Both subsets move the SAME \
+direction here, so unlike the thinking arm the aggregate was never hiding \
+anything - this arm is underpowered, not masked. The original p=0.27 filing was \
+right, for a reason other than the one given. Note also that pooling this run \
+with the discovery arm gives W26/L12, p=0.034: that is NOT a test and is not \
+claimed, because it pools a discovery result drawn from ~16 comparisons with \
+its own follow-up, which is the standard way to manufacture a false positive. \
+★ AND THE PRE-REGISTERED CONFIRMATION IS NULL. parallel[75:135], 60 fresh samples \
+disjoint from both earlier slices, with hypothesis, threshold and analysis fixed \
+in the script BEFORE the run: baseline 26.7%, official 31.7%, W8/L5, 13 \
+discordant, p=0.5811 - NOT CONFIRMED. The three independent samples read W9/L4, \
+W11/L4, then W8/L5: the effect shrank on fresh data, which is exactly what the \
+pooled p=0.034 would look like if it were regression to the mean rather than \
+signal. Treat the official-prompt lever as DEAD for parallel calling and do not \
+re-open it without a new mechanism. Recorded because a null that cost two \
+measured arms is worth more to the next person than the arm itself was. \
+★ TWO THINGS SURVIVE THE NULL. Zero-call responses went 3 -> 0 across both \
+subsets under the official prompt. And the ~1019-token duplication is a real \
+prefill cost on every tool request, worth fixing on its own merits rather than \
+as a score fix - subject to the same caution as tscg above, that prepare.rs \
+records tool-prompt changes swinging hallucination from ~96 to 30/64, and this \
+target scores 94.51 there. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
