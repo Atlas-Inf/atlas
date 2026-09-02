@@ -160,6 +160,42 @@ hallucination: api/chat/prepare.rs records the injection as load-bearing there \
 - "With it hallucination returns to ~96 (vs 30/64 without)" - and this target \
 scores 94.51. Trading 23 points of hallucination for parallel calling is not a \
 fix. \
+★ THE KV DTYPE IS THE DOMINANT SOURCE OF LOGIT DRIFT, AND IT IS NOT THE CAUSE \
+OF THIS. Measured 2026-09-02 as a precision ladder on identical prompts at \
+temperature 0, top-5 logprobs at every position (only possible because of the \
+DFlash logprobs fix on this branch - before it every array was null). \
+DTYPE MAP, from the boot trace: MoE experts NVFP4; SSM in/out projections FP8 \
+(native_fp8=true); SSM decode h-state F32 full precision; attention Q/K/V/O \
+kept at CHECKPOINT BF16 with no NVFP4 requant; KV cache FP8 on all six \
+attention layers (L5, L12, L19, L26, L33, L42) using per-layer k_scale/v_scale \
+from the checkpoint. Note the tension the engine itself flags: the loader \
+refuses to quantise attention WEIGHTS and holds SSM state at F32, then stores \
+the KV cache for those same protected layers at FP8 - and warns at every boot \
+that this makes NVFP4 models `hallucinate or lose coherence at long context`, \
+recommending --kv-high-precision-layers max (or 2-5). This recipe leaves that \
+flag at its default 0. \
+DRIFT, fp8-everywhere vs fp8-with-boundary-layers-BF16 (--kv-high-precision- \
+layers auto): 939 aligned positions, only 3 bit-identical (0.3%), same-support \
+KL mean 4.573e-03 / max 2.573e-01, max |logprob delta| 4.125 nats on SHARED \
+support, and the emitted TOKENS diverge on 11 of 12 prompts - one as early as \
+position 3. Set that beside this branch's DSpark equivalence result on the same \
+instrument (mean KL 1.2e-17, max 3.8e-15, 12/12 exact token match): KV \
+quantisation drift is roughly FIFTEEN ORDERS OF MAGNITUDE larger than the \
+entire speculative-decoding path. Any bit-exactness claim about this engine \
+must account for KV dtype before it accounts for anything the port added. \
+BUT IT MOVES NOTHING BEHAVIOURAL HERE: count-correct reads 35.0% at fp8-all \
+and 33.3% with boundary layers protected - flat, inside noise. Large numerical \
+drift, no benchmark effect. Record the drift; do NOT sell the flag as a fix for \
+parallel calling. \
+★ AND BF16 KV IS NOT AVAILABLE ON THIS TARGET AT ALL, which corrects the \
+obvious reading of the warning. `--kv-cache-dtype bf16` fails the build: \
+`Lightning DSpark target KV dtype must be FP8, found bf16` \
+(factory/dspark_admission.rs:70). FP8 KV is a hard DSpark ADMISSION \
+REQUIREMENT, not a tuning choice, so the memory arithmetic that makes it look \
+free to reverse - 40.8 GB of KV allocated, 14252992 token capacity against the \
+262144 this recipe can use, a 54x margin - is beside the point. Within the FP8 \
+requirement, --kv-high-precision-layers is the ONLY precision lever, and it is \
+measured above. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
