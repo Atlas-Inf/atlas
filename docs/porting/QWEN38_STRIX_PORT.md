@@ -222,3 +222,67 @@ serve recipes pass `--dangerously-allow-unresolved-kernel-lookups`.
 Closing that gap — compiling the missing kernels, or declaring them in
 `MODEL.toml` `[expected_absent]` with stated reasons — is follow-up work, and no
 Strix performance number is final until it is done.
+
+## 2026-09-02 — the tool-path bug is fixed, and every kernel is drift-measured
+
+### Root cause of the "zero tool calls" leg above
+
+Not the kernel-set gap and not the checkpoint: the BF16 FFN prefill arm
+dispatched `gemm_tc::dense_gemm_tc`, whose gfx1151 WMMA port leaves ~half of
+its output tile unwritten (NaN-sentinel oracle:
+`crates/spark-model/examples/dense_gemm_bf16_oracle.rs`, exact=0.500,
+max_abs=inf) and ran ~1000x slow in situ (2.4 s/GEMM at M=823 N=17408 K=5120
+in serve vs 2.2 ms standalone). The unsloth checkpoint's final-eight per-row
+FP8 FFN layers are the ones that route through that arm (`set_bf16_weights`),
+so layers 43-48 emitted half-stale outputs, the final hidden state collapsed
+to noise, and the first predicted token became `<|audio_pad|>` (248076) with a
+period-2 decode loop behind it. 16-token prompts never crossed a partial
+128-row tile boundary and stayed clean — which is why "Answer exactly: Paris"
+passed while every real prompt failed.
+
+The fix routes the BF16 FFN prefill arm through `gemm::dense_gemm_bf16_pipelined`
+(CPU-oracle-validated: row cosine >= 0.99999991 vs the scalar kernel AND vs an
+f32 CPU reference at M in {16,128,129,512,513,1024,2049} x N in {5120,8192,
+17408}, 1.9-3.5 TFLOPS); `dense_gemm_tc` is quarantined behind
+`ATLAS_FFN_BF16_PREFILL_TC=1` and is never a silent fallback. The same broken
+kernel has other call sites (o_proj multi-seq, paged, cache_skip_v4/mla) that
+this model's active path does not reach — flagged, not changed.
+
+### Kernel drift audit — every kernel the serve path dispatches
+
+`~/q38-kernel-drift-audit.log` on AzeezStrix (2026-09-02), 19 kernels vs CPU
+f32 references or the bit-verified scalar kernel, same tree as the serve
+binary. Clean (cos >= 0.999999 or bit-identical): rmsnorm (all variants),
+rope, conv1d-strided (byte-identical), GDN split4 recurrence, contiguous and
+paged BF16 attention, the whole w4a16 NVFP4 family (t/k64/m128 bit-identical
+to each other; m128 vs CPU max|delta| 4.9e-4), the BF16 scalar GEMM
+(bit-identical to CPU), the BF16 pipelined GEMM, the BF16 decode GEMV M=1
+(new `dense_gemv_bf16_oracle`, mean_rel <= 1.2e-5 at all eight Qwen3.8 decode
+shapes), and w4a16 batch bitparity (byte-identical).
+
+Measured drift, quantified:
+
+* `w4a16_gemv_dp4a` — the NVFP4 decode GEMV every token goes through —
+  cos 0.999991 but **mean relative error 5.58%** (max 45x) at N=2048 K=4096.
+  The int8-DP4A dot product is the drift source; llama.cpp dequantizes and
+  accumulates in fp16/fp32 instead. First replacement candidate if the
+  cross-library check shows decode divergence.
+* `w8a16` / `w8a16t` — cos 0.999997, mean_rel 1.1-1.2%, max_rel tails 48-79x.
+* `dense_gemm_tc` — broken (above), quarantined.
+
+### Accuracy after the fix
+
+* BFCL-70 (reduced draw): overall 81.43 / normalized 77.70, with real tool
+  calls (the leg above scored 14.29 with zero calls).
+* **Pinned ST-995 (golden n=995, no overrides): overall 84.22 / normalized
+  83.68** — overall equals the GB10 reference (84.22) and passes the 83.82
+  floor; normalized is one sample under (0.04, noise floor 0.4). Run record
+  `~/.atlas/runs/bfcl-subset/run-1788366618469517340.json`.
+* The GB10 BENCH.toml's Python/JS cliff reproduces exactly here
+  (simple_python 95.97 / simple_java 46.77 / simple_javascript 25.81) —
+  shared across hardware, checkpoints and load paths, so the serve-path
+  defect that note suspected (chat-template tool-argument serialization) is
+  now confirmed cross-platform and is the largest known accuracy lever.
+* The MLPerf ST-996 leg (harness bfcl_v4, 12/23/46, n=1004) is running under
+  the submission serve profile (0.92/64K/MTP K=2/prefix/slots 16) — reference
+  for the same draw on unsloth-3.6: 78.59 / 80.45.
