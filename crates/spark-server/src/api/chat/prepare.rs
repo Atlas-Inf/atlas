@@ -60,7 +60,20 @@ pub(crate) fn prepare_chat_prompt(
     // don't make assumptions"), which the GDN model needs to correctly
     // DECLINE on irrelevance prompts. With it (and compact tool-JSON)
     // hallucination returns to ~96 (vs 30/64 without).
-    if tools_active && let Some(ref parser) = state.tool_call_parser {
+    // EXPERIMENT (ATLAS_NO_TOOL_INJECT=1, default OFF): serve ONLY the
+    // template's tool block, the way vLLM does. Atlas normally renders the
+    // contract twice - once from the jinja template, once here - and the
+    // duplicate measures +1019 tokens on a BFCL parallel prompt. Skipping the
+    // injection is the only way to reach vLLM's prompt size; no config lever
+    // gets below 731. See the dose-response in BENCH.toml.
+    let skip_inject =
+        matches!(std::env::var("ATLAS_NO_TOOL_INJECT").as_deref(), Ok("1") | Ok("true"));
+    if skip_inject {
+        tracing::warn!(
+            "ATLAS_NO_TOOL_INJECT=1: skipping the parser tool system prompt.              This is an experiment - the injection is load-bearing for the              hallucination category (~96 vs 30/64 without)."
+        );
+    }
+    if tools_active && !skip_inject && let Some(ref parser) = state.tool_call_parser {
         let default_choice = crate::tool_parser::ToolChoice::Mode("auto".to_string());
         let tool_choice = req.tool_choice.as_ref().unwrap_or(&default_choice);
         let tool_prompt = parser.system_prompt(&req.tools, tool_choice, &state.chat.prompt);

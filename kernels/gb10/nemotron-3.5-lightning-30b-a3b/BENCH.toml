@@ -457,6 +457,50 @@ things are true at once and neither cancels the other: ~6 to 9 points are \
 recoverable Atlas defects worth chasing, and the remaining ~14 is not obviously \
 an engine problem. Chase `parallel` and `live_parallel` first - they are the \
 whole recoverable gap. \
+★ ROOT CAUSE OF THE PARALLEL GAP: THE CONTRACT IS RENDERED TWICE. Atlas serves \
+the tool contract from the jinja template AND injects the parser's own copy on \
+top. Skipping the injection alone closes the entire gap to vLLM. Same 45 \
+samples, same weights, thinking ON on both sides, paired: \
+    config                        prompt tok   parallel[30:75] \
+    Atlas shipped                     1314        14/45  31.1% \
+    Atlas tscg+official ("slim")        731        21/45  46.7% \
+    Atlas ATLAS_NO_TOOL_INJECT=1        418        31/45  68.9% \
+    vLLM 0.28.0                         420        31/45  68.9% \
+Against shipped: W21/L4, exact p=0.0009105 - the same statistic the vLLM \
+comparison produced, because it is the same effect. Atlas at vLLM's prompt size \
+gets vLLM's score, to the sample. The dose-response is monotonic across four \
+points and the mechanism is simply prompt length: 1314 -> 731 -> 418 tokens \
+maps to 31.1 -> 46.7 -> 68.9 percent. \
+★ WHY EVERY EARLIER PROMPT ARM READ NULL. tscg and ATLAS_OFFICIAL_TOOL_PROMPT \
+each remove PART of the duplication and bottom out at 731 tokens, because with \
+tscg=true the template's block is suppressed and only the parser injection \
+renders - and that injection is ~311 tokens more verbose than the template's \
+own rendering. No configuration removes the injection. Four arms were run \
+against a hypothesis none of them actually tested, and their nulls were \
+reported as evidence the prompt did not matter. It did. \
+★ THE FLAG. ATLAS_NO_TOOL_INJECT=1 (prepare.rs, DEFAULT OFF) skips the parser's \
+system-prompt injection so the template's block stands alone, which is exactly \
+vLLM's arrangement. Default off, and it must stay that way until the paragraph \
+below is answered. \
+★ NOT YET SHIPPABLE, AND HERE IS THE SPECIFIC RISK. prepare.rs records that this \
+injection is load-bearing for the hallucination category - "with it \
+hallucination returns to ~96 (vs 30/64 without)" - and this target scores 94.51 \
+there. The probe above scores `parallel` ONLY and says nothing about \
+hallucination or irrelevance. If those collapse, the 38-point parallel win is \
+bought with a larger loss and the flag is worthless as-is; the fix would then \
+have to SPLIT the injection, keeping the declining behaviour while dropping the \
+duplicated call-format spec. A full n=995 draw with the flag on is in flight to \
+settle exactly this, and no one should enable this flag until that number \
+exists. \
+★ TWO ARMS BEFORE THIS ONE WERE INVALID, recorded because the failure is easy to \
+repeat. The first no-inject run killed only the vLLM process and left the \
+previous Atlas server bound to 8899, so the probe scored the OLD config and \
+returned byte-identical numbers - at temperature 0, identical output means an \
+identical prompt, which is what exposed it. The guard added next was itself \
+wrong: it grepped the server log for the flag's warning at boot, but that \
+warning is emitted inside prepare_chat_prompt and only appears once a REQUEST \
+has been served. Verify a manipulation with a live measurement \
+(usage.prompt_tokens on a real request), never with a proxy. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
