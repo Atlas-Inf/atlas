@@ -44,10 +44,11 @@ impl RefStore {
             .located
             .get(name)
             .with_context(|| format!("missing {name}"))?;
-        use std::os::unix::fs::FileExt;
         let file = std::fs::File::open(&loc.path)?;
         let mut bytes = vec![0u8; loc.span.len as usize];
-        file.read_exact_at(&mut bytes, loc.span.abs_offset)?;
+        // Positional read shared with the PLE table reader; its unix/windows cfg
+        // pair is what keeps the Windows release leg building.
+        crate::ngram_table::read_exact_at(&file, &mut bytes, loc.span.abs_offset)?;
         Ok((bytes, loc))
     }
 

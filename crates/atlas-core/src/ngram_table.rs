@@ -35,13 +35,13 @@ use std::path::Path;
 /// NVMe tiers are Linux-only in production; this arm exists so the workspace
 /// builds on the Windows release leg, which a missing `cfg` broke.
 #[cfg(unix)]
-fn read_exact_at(file: &File, out: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, out: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(out, offset)
 }
 
 #[cfg(windows)]
-fn read_exact_at(file: &File, out: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, out: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     let mut done = 0usize;
     while done < out.len() {
