@@ -538,6 +538,37 @@ never measured in combination, and the two are independent axes. \
 the injection is unmeasured by any single-turn benchmark. Flipping the default \
 is a maintainer call that wants a second draw and a multi-turn check first. The \
 evidence for flipping it is now strong; the decision is still not mine. \
+★ DO NOT STACK THINKING-OFF ON NO-INJECT. IT COSTS 13.87. Measured, full n=995, \
+both manipulations asserted live before scoring (411 prompt tokens AND \
+reasoning_content absent): no-inject + thinking-off scores 65.93 / 71.92 against \
+no-inject + thinking-ON at 79.80 / 82.40. \
+★ AND IT IS A CROSSOVER INTERACTION, WHICH CORRECTS THE THINKING FINDING. \
+                        thinking ON   thinking OFF    delta \
+    with injection          64.22         67.64       +3.42 \
+    without injection       79.80         65.93      -13.87 \
+Thinking-off HELPS when the duplicated prompt is present and HURTS badly when it \
+is gone. The two are not independent axes; the sign of the thinking effect \
+depends on the prompt regime. \
+★ SO THE ORIGINAL THINKING RESULT WAS AN ARTIFACT OF THE INJECTION. This branch \
+records, at some length, that thinking suppresses parallel calling - confirmed \
+out of sample on 45 held-out samples, McNemar p=4.025e-04, surviving Bonferroni. \
+That statistic was sound and the experiment was clean; the INTERPRETATION was \
+wrong. It measured an interaction with Atlas's 1314-token duplicated prompt, not \
+a property of these weights or of thinking. With the prompt fixed, thinking is \
+REQUIRED for parallel calling, not hostile to it: parallel 75.00 with thinking \
+on versus 22.58 with it off, and live_parallel 87.50 versus 37.50. The earlier \
+mechanism story - the model states a multi-call plan in <think> and stops \
+early - described real behaviour under a broken prompt and does not generalise. \
+★ WHAT THIS MEANS FOR THE +3.42 ALREADY RECORDED ABOVE. That entry stands as a \
+measurement and is retracted as a recommendation. It was true in the shipped \
+(injected) regime, which is the only regime that existed when it was taken. It \
+must not be applied on top of ATLAS_NO_TOOL_INJECT=1. \
+★ THE BEST KNOWN CONFIGURATION IS ATLAS_NO_TOOL_INJECT=1 WITH THINKING ON: \
+79.80 / 82.40. Per subset under the stack, for the record: parallel 22.58, \
+live_parallel 37.50, parallel_multiple 40.32, live_parallel_multiple 41.67 - the \
+entire parallel family collapses. hallucination actually rose to 97.73, so this \
+is not a general degradation; it is specifically the parallel capability being \
+lost with the reasoning block. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
