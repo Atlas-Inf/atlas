@@ -180,7 +180,33 @@ between `none` and `medium` can be searched for without touching the recipe. \
 called N times with different arguments) and `parallel_multiple` (N distinct \
 functions) do NOT share a mechanism - thinking moves them in opposite \
 directions, significantly. Any future work here should score them apart; the \
-combined number will keep hiding effects the way it hid this one. \
+the combined number will keep hiding effects the way it hid this one. \
+★ AND THE BUDGET LEVER DOES NOT EXIST: THE EFFECT IS BINARY. The obvious \
+follow-up was to find a reasoning_effort rung that keeps the \
+parallel_multiple gain without the parallel cost. There is none. Swept \
+per-request over 25 samples per subset: \
+    effort      parallel   parallel_multiple   zero-calls \
+    none          24.0%          76.0%              5 \
+    minimal       40.0%          32.0%              1 \
+    low           40.0%          32.0%              1 \
+    medium        40.0%          32.0%              1 \
+minimal, low and medium are IDENTICAL on both subsets - three different \
+thinking budgets, indistinguishable to the sample. Only `none` moves anything. \
+So the mechanism is not the AMOUNT of reasoning; it is the PRESENCE of the \
+think block. Once the model has closed </think>, its distribution favours one \
+call followed by EOS, which is exactly what the raw traces show: the plan is \
+stated inside reasoning_content and the visible turn emits a single call. \
+★ WHAT THAT LEAVES. No default change to reasoning_effort can capture the \
+gain, so this is not fixable from the recipe. Two directions remain, neither \
+of them a port change: (a) suppress the think block for tool turns \
+specifically, which collides with this recipe's documented multi-turn \
+null-content failure and costs the `parallel` subset; (b) an engine change on \
+the decode path - when a turn used thinking, tools are active, and a call has \
+just completed, decline to end the turn on the model's first EOS so it can \
+emit the calls it planned. Note (b) is NOT the Fix A escape hatch tested \
+above: that one was a null because stopping is already LEGAL there, and what \
+is needed is the opposite of an escape - a hold. Both are maintainer calls, \
+and both should be scored on the two subsets separately. \
 ★ DEFECT 2, CONFIRMED, STRUCTURAL: THE TOOL CONTRACT IS SERVED TWICE. \
 nemotron_lightning.jinja already renders the full function list, the exact \
 <tool_call> format example and the official short <IMPORTANT> reminder (lines \
