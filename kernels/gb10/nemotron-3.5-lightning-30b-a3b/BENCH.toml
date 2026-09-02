@@ -370,6 +370,29 @@ parallel_multiple rises to 52.42 - the same opposite-direction signature every \
 probe found, now on the full draw. The net is positive DESPITE parallel getting \
 worse, which is the strongest evidence yet that these are two different bugs \
 and that a per-subset lever would beat a global one. \
+★ THE FUNCTION-NAME MANGLING IS NOT A BUG. DO NOT RE-CHASE IT. non_live is the \
+whole remaining gap (53.93 against hallucination 94.89 and live 71.18, and \
+normalized is just their mean), and inside it simple_java 59.68 / \
+simple_javascript 48.39 sit 25-36 points under simple_python 84.27 on \
+SINGLE-function calls, which looks like a serialisation defect rather than \
+capability. It is not. The dataset ships tool definitions with UNDERSCORED \
+names (`math_factorial`, `GeometryPresentation_createPresentation`; 0 of them \
+dotted) against DOTTED ground truth (`math.factorial`; 261 samples), so a raw \
+string comparison of what the model emits against ground truth shows a near \
+total name mismatch - simple_java reads 1/12 by that measure. That comparison \
+is the wrong one. Upstream `bfcl_eval` converts in the other direction at score \
+time: ast_checker.convert_func_name() rewrites the DOTTED ground-truth name to \
+underscored when the checker model's config sets underscore_to_dot, because \
+OpenAI-style APIs reject "." in a function name. score.py pins \
+AST_CHECKER_MODEL_NAME = "gpt-4o-2024-11-20-FC", whose config has \
+underscore_to_dot = True (verified in-venv, not assumed). The names match; the \
+59.68 is real. Neither score.py nor provision.py performs any name replacement \
+of its own, so there is nothing on our side to fix. \
+★ WHAT THAT LEAVES. The simple_java / simple_javascript weakness is genuine \
+model behaviour on this checkpoint, and the non_live gap is not one defect - it \
+is parallel 20.16, parallel_multiple 52.42, simple_javascript 48.39 and \
+simple_java 59.68 all being independently weak. Attack them separately or not \
+at all; there is no single lever here. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
