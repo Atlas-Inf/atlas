@@ -108,8 +108,58 @@ truncation (emits the first call, silently drops the rest) and merging \
 (collapses several calls into one with array arguments). Ruled out as causes: \
 the tool grammar (--disable-tool-grammar gives byte-identical output) and the \
 template's singular phrasing (an A/B adding an explicit multi-call instruction \
-moved 3/10 to 4/10 on the parallel subset - one sample, not a signal). Treated \
-as checkpoint behaviour until evidence says otherwise. \
+moved 3/10 to 4/10 on the parallel subset - one sample, not a signal). \
+★ THOSE TWO "RULED OUT"S WERE UNDERPOWERED AND ARE SUPERSEDED. Both were \
+10-sample probes. Re-run 2026-09-02 at n=60 (30 parallel + 30 \
+parallel_multiple, real BFCL samples, scored emitted-vs-ground-truth call \
+count). The instrument is deterministic at temperature 0 - two arms returned \
+byte-identical tallies - so between-arm differences are signal. \
+BASELINE 35.0% count-correct (21/60); 37/60 UNDER-emit; 96 of 137 expected \
+calls produced. It is NOT truncation: 36 of those 37 finish on `tool_calls`, \
+not `length`, at 83-264 completion tokens against a 1024 budget. The model \
+stops VOLUNTARILY while its own reasoning_content says it planned more - \
+"We'll make two calls", "We'll call three times". \
+★ FIVE CANDIDATE CAUSES, ALL FALSIFIED at n=60. Parser identity: qwen3_coder \
+35.0% > bare_json 20.0% > hermes 11.7%, so the shipped default is right and \
+matches NVIDIA's own vLLM guidance. Injected prompt: \
+ATLAS_OFFICIAL_TOOL_PROMPT=1 reads 43.3%, but paired McNemar is 9 wins / 4 \
+losses over 13 discordant pairs, p=0.27 - directionally right, not \
+significant, so the #211 off-policy hypothesis is not the cause here. Tool \
+grammar: --disable-tool-grammar 31.7%, no help. Speculative path: --dflash OFF \
+33.3% - THE PORT DOES NOT CAUSE THIS, it reproduces with speculation entirely \
+disabled. Fix A: ATLAS_TOOL_EOS_ESCAPE=0 gives an exact null (35.0%), because \
+on a tool_choice="auto" trigger grammar stopping is already legal after a \
+closed call, so grammar_blocks_stop is false and the escape never had anything \
+to release. \
+★ DEFECT 1, CONFIRMED, SECONDARY. sampling_setup.rs biases the <tool_call> \
+opener by emitted-call count: +3.0 at 0-1, 0.0 at 2, -5.0 at 3, -10.0 at 4+. \
+Atlas actively SUPPRESSES the fourth and later call. Measured: calls emitted \
+decay 74.5% -> 66.7% -> 50.0% as required arity goes 2 -> 3 -> 4. A correct \
+default for agentic coding, where runaway tool loops are the hazard; wrong for \
+parallel function calling. It bounds only the 13/60 high-arity samples, so it \
+is real but not the main cost. \
+★ DEFECT 2, CONFIRMED, STRUCTURAL: THE TOOL CONTRACT IS SERVED TWICE. \
+nemotron_lightning.jinja already renders the full function list, the exact \
+<tool_call> format example and the official short <IMPORTANT> reminder (lines \
+46-89), and loops over message.tool_calls (133-145), so the native format \
+explicitly supports multiple blocks. Atlas then injects the parser's own \
+differently-worded prompt on top, because api/chat/template.rs withholds \
+`jinja_tools` ONLY when `tscg` is on and [behavior].tscg defaults false and is \
+unset here. MEASURED on the wire: template-only render 371 tokens vs Atlas's \
+served prompt 1243 for parallel_0 (+872, +235%), and 412 vs 1304 for \
+parallel_8 (+892, +217%). The model reads the same contract twice in two \
+phrasings, in a prompt 3.3x its native size. This is consistent with the \
+official-prompt arm being the only one that moved the right way: it makes the \
+two copies agree. \
+★ NOT THE FIX, CHECKED. Both sibling Nemotron targets set \
+`disable_tool_steering = true` and this one does not - but \
+nemotron_lightning.jinja never references that flag (its tool block is gated \
+on `{% if tools %}` alone), so copying it would be cargo-culting. The lever \
+that actually withholds the duplicate is `tscg`. And any fix must PRESERVE \
+hallucination: api/chat/prepare.rs records the injection as load-bearing there \
+- "With it hallucination returns to ~96 (vs 30/64 without)" - and this target \
+scores 94.51. Trading 23 points of hallucination for parallel calling is not a \
+fix. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
