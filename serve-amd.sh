@@ -31,13 +31,8 @@ export ATLAS_W4A16_DP4A=1         # int8-DP4A decode GEMV
 # override, already written for RDNA3.5's 64 KB LDS budget — the thing the
 # lever used to force at dispatch time is now the only kernel there is.
 
-# The GDN-projection prefill fast path (fp8_fp8_gemm_ldmab) is DEFAULT-ON on
-# main and is NVIDIA-only: kernels/gb10/common/w4a16_fp8_ldmab.cu is built from
-# `mma.sync.aligned.m16n8k32...e4m3.e4m3` + `ldmatrix.x4`, which have no RDNA3.5
-# equivalent. The module is absent from the strix kernel set, and the lookup is
-# a HARD runtime failure ("Module 'w4a16_fp8_ldmab' not loaded") on the first
-# request, not a silent fallback. 0 takes the documented scalar path.
-export ATLAS_FP8_LDMAB=0
+# The NVIDIA-only FP8 LDMAB prefill path is compile-time disabled on native HIP;
+# gfx1151 uses the scalar FP8 fallback without requiring a runtime flag.
 
 # ── SSM / MTP levers, unchanged from the certified Qwen3.6 recipe ────────────
 # Carried forward verbatim: these are what the 3.6 submission was measured
@@ -60,44 +55,36 @@ export ATLAS_MTP_GATE_REPROBE=64  # re-probe the MTP accept gate every 64 tokens
 # ── memory: Strix Halo is a unified-memory part ──────────────────────────────
 # The GPU allocates from the same RAM the OS uses. GTT reports 60 GB but the
 # kernel will not hand over the last few — the measured allocatable ceiling is
-# ~55 GB. These defaults are what actually serve a 27B here; raising
-# GPU_UTIL or SSM_SLOTS pushes past the ceiling and fails with `cuMemAlloc_v2
-# failed: status 2` AFTER the KV cache is already allocated.
-GPU_UTIL="${GPU_UTIL:-0.86}"
-SSM_SLOTS="${SSM_SLOTS:-8}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-16384}"
-# The kernel target now ships a vision_encoder, so the ~2.1 GB vision tower is
-# loaded for every serve whether or not you send an image — it is part of the
-# checkpoint. That does not fit alongside the default 8192-token prefill arena
-# (3.63 GB); 2048 brings the arena to ~0.99 GB and buys back more than the
-# tower costs. Measured on a 512-token single-stream run, this costs nothing:
-# TTFT 817-1679 ms / decode 13.3-15.0 tok/s, the same range as the 8192 arena.
-# Long prompts chunk more finely, so raise it if you have headroom and long
-# inputs.
+# ~55 GB. These defaults are the FROZEN Qwen3.8-27B-NVFP4 (unsloth) accuracy
+# recipe — the configuration the targeted controls, BFCL-70 and the pinned
+# ST-995 run under (2026-09-02 fingerprint, see the handoff): 0.88 utilization
+# is the largest that leaves non-fragmented headroom for the SSM pool after the
+# 43.1 GB pre-KV BF16-preservation load; 4096 context matches the gate draws.
+GPU_UTIL="${GPU_UTIL:-0.88}"
+SSM_SLOTS="${SSM_SLOTS:-0}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
+# Qwen3.8 tool schemas routinely exceed 2K tokens. The corrected BC=32 paged-
+# prefill kernel preserves all query rows across chunks, so the 0.99 GB arena
+# can stay at 2048 while long prompts retain single-chunk numerical behavior.
 MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-2048}"
-# Atlas sizes its KV budget against the 60 GB the driver reports, not the ~55 GB
-# the kernel will actually hand over. This tells it to hold 6 GB back.
-export ATLAS_KV_EXTERNAL_RESERVE_GB="${ATLAS_KV_EXTERNAL_RESERVE_GB:-6}"
+# 0 selects self-relative accounting (baseline free minus Atlas allocations),
+# which measured the unified-memory pool correctly on both Linux and Windows.
+export ATLAS_KV_EXTERNAL_RESERVE_GB="${ATLAS_KV_EXTERNAL_RESERVE_GB:-0}"
 
-# Mixed-precision NVFP4 checkpoints (unsloth Qwen3.8-27B-NVFP4) keep 11.56 GB of
-# tensors as FP8 inside an NVFP4 net. The loader requantises them and, with this
-# flag set, RECLAIMS the FP8 sources (7.0 GB here) — without it the model does
-# not fit at all on a 64 GB part.
-#
-# ⚠ TRADE-OFF: this also disables the GDN native-FP8 prefill precision policy,
-# which keeps linear_attn qkvz/out_proj at >=FP8 rather than requantising them
-# to NVFP4. It is a memory-for-accuracy trade, and it is REQUIRED for 3.8 here.
-# A pure-NVFP4 checkpoint (nvidia/Qwen3.6-27B-NVFP4) has no FP8 tensors and does
-# not need it — leave it unset for those.
-# NOTE this flag is read by PRESENCE, not value
-# (weight_map/nvfp4_detect.rs: `env::var_os(...).is_none()`), so exporting it as
-# 0 would still turn it ON. Set ATLAS_NO_GDN_FP8_PREFILL=0 to genuinely disable
-# it — this branch unsets the variable rather than passing a falsy value:
-if [ "${ATLAS_NO_GDN_FP8_PREFILL:-1}" = "0" ]; then
-  unset ATLAS_NO_GDN_FP8_PREFILL
-else
-  export ATLAS_NO_GDN_FP8_PREFILL=1
-fi
+# ── per-row FP8 preservation (correctness default for the unsloth checkpoint) ─
+# The authoritative checkpoint stores attention, GDN, lm_head and the final
+# eight FFN layers as per-row-FP8 inside an NVFP4 net. The block-scaled w8a16
+# kernels cannot consume [N,1] row scales, and the old fallback requantised
+# them to NVFP4 (destructive). These flags dequant once to BF16 instead; the
+# policy no-ops for checkpoints whose projections are not all per-row FP8, so
+# exporting them unconditionally is safe for every other model. On gfx1151 the
+# BF16 FFN prefill routes through the CPU-oracle-validated pipelined WMMA GEMM
+# (the `dense_gemm_tc` port writes only part of its output tile there).
+export ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1
+export ATLAS_FP8_DEQUANT_FFN_TO_BF16=1
+export ATLAS_GDN_BF16_WEIGHTS=1
+# Never let a host environment silently re-enable the quarantined tc kernel.
+unset ATLAS_FFN_BF16_PREFILL_TC
 
 if [ "$HW" = "strix-hip" ]; then
   # The HIP shims (libcuda/libcudart/libcublasLt) are built into atlas-kernels'
@@ -124,6 +111,14 @@ ALLOW_FALLBACKS="--dangerously-allow-unresolved-kernel-lookups"
 # API to report the canonical repo id (as the benchmark configs expect).
 NAME_ARG=(); [ -n "${MODEL_NAME:-}" ] && NAME_ARG=(--model-name "$MODEL_NAME")
 
+# MTP speculation is OPT-IN (NUM_DRAFTS>0): the frozen Qwen3.8 accuracy recipe
+# ran without it (spec decode is hard-gated off under thinking-off tool calls
+# anyway, and the accuracy fingerprint must not carry an unused lever).
+SPEC_ARGS=()
+if [ "${NUM_DRAFTS:-0}" -gt 0 ]; then
+  SPEC_ARGS=(--speculative --num-drafts "$NUM_DRAFTS" --mtp-quantization bf16 --mtp-vocab 100000)
+fi
+
 echo "serving $MODEL on $(/opt/rocm/bin/rocminfo 2>/dev/null | grep -m1 -o gfx[0-9]* || echo AMD) via $HW"
 exec target/release/spark serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
@@ -131,9 +126,8 @@ exec target/release/spark serve "$MODEL" "${NAME_ARG[@]}" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --max-batch-size "${MAX_BATCH:-1}" \
-  --speculative --num-drafts "${NUM_DRAFTS:-2}" \
-  --mtp-quantization bf16 --mtp-vocab 100000 \
-  --disable-tool-grammar true --enable-prefix-caching \
+  "${SPEC_ARGS[@]}" \
+  --disable-tool-grammar true \
   --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval 16 \
   $ALLOW_FALLBACKS \
   --disable-thinking \
