@@ -328,6 +328,48 @@ prefill cost on every tool request, worth fixing on its own merits rather than \
 as a score fix - subject to the same caution as tscg above, that prepare.rs \
 records tool-prompt changes swinging hallucination from ~96 to 30/64, and this \
 target scores 94.51 there. \
+★ THINKING-OFF MOVES THE SCORE, MEASURED ON THE FULL DRAW. 2026-09-02, shipped \
+tree with NO patch (working tree verified empty in the runner), same golden \
+n=995 draw, same recipe, `--disable-thinking` - a first-class server flag whose \
+documented precedence is flag > request body > MODEL.toml thinking_default. A \
+pre-benchmark probe confirmed reasoning_content was ABSENT, so the flag \
+demonstrably took; a run where it silently did not would have scored a normal \
+turn and looked like a null. \
+    category            thinking ON   thinking OFF   delta \
+    hallucination           94.51         94.89      +0.38 \
+    live                    68.24         71.18      +2.94 \
+    non_live                51.01         53.93      +2.92 \
+    OVERALL                 64.22         67.64      +3.42 \
+    normalized              71.25         73.33      +2.08 \
+Per-subset, thinking OFF: irrelevance 100.00, live_irrelevance 89.77, \
+live_multiple 79.05, live_parallel 18.75, live_parallel_multiple 50.00, \
+live_simple 92.00, multiple 79.03, parallel 20.16, parallel_multiple 52.42, \
+simple_java 59.68, simple_javascript 48.39, simple_python 84.27. Wall 56 m 34 s \
+against 2 h 01 m 10 s with thinking on - the completions are much shorter. \
+★ WHY THIS WAS NOT MEASURED FOR MOST OF THE INVESTIGATION. Thinking-off was \
+filed as production-forbidden because this recipe has a documented MULTI-TURN \
+null-content failure. BFCL ST is SINGLE TURN, so that failure cannot be \
+exercised by this benchmark at all. The exclusion was inherited rather than \
+checked, and it cost the largest measured effect on this target. \
+★ THE HALLUCINATION RISK DID NOT MATERIALISE. prepare.rs records tool-prompt \
+and thinking changes swinging hallucination from ~96 to 30/64, which was the \
+main reason to fear this leg. It held at 94.89, slightly ABOVE the 94.51 on \
+record. All three categories improved; nothing was traded. \
+★ CONFIDENCE. Single draw, stated as such. But the thinking-ON baseline was \
+measured THREE times at 64.22 / 64.12 / 64.22 - a spread of 0.10 - and +3.42 is \
+~34x that spread, so this is not draw noise. \
+★ WHAT IT DOES NOT SETTLE, AND WHAT IT IS NOT. 67.64 is still 19.8 points under \
+the 87.44 bar: this is a real improvement, not a solution. It is also NOT a \
+recommendation to ship thinking off. The multi-turn hazard is real and this \
+single-turn leg is structurally incapable of speaking to it. The defensible \
+claim is narrower and worth exactly what it says: disabling thinking on TOOL \
+TURNS is worth +3.42 overall with no hallucination cost, and someone must price \
+the multi-turn risk separately before it goes anywhere near a default. \
+★ AND IT REPRODUCES THE SPLIT. parallel collapses to 20.16 while \
+parallel_multiple rises to 52.42 - the same opposite-direction signature every \
+probe found, now on the full draw. The net is positive DESPITE parallel getting \
+worse, which is the strongest evidence yet that these are two different bugs \
+and that a per-subset lever would beat a global one. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
