@@ -569,6 +569,34 @@ live_parallel 37.50, parallel_multiple 40.32, live_parallel_multiple 41.67 - the
 entire parallel family collapses. hallucination actually rose to 97.73, so this \
 is not a general degradation; it is specifically the parallel capability being \
 lost with the reasoning block. \
+★ THE 87.44 BAR IS NOT REACHABLE BY CONFIGURATION, AND HERE IS THE BOUND. Take \
+the BEST value observed for every subset across every configuration measured - \
+Atlas shipped, Atlas thinking-off, Atlas no-inject, Atlas no-inject+thinking-off, \
+and vLLM 0.28.0 - cherry-picking the winner per subset even where that means \
+taking vLLM's number or shipped-Atlas's: \
+    irrelevance            100.00  live_irrelevance         98.86 (vLLM) \
+    live_multiple           79.05  live_parallel            87.50 \
+    live_parallel_multiple  54.17  live_simple              92.00 \
+    multiple                88.71  parallel                 75.00 \
+    parallel_multiple       68.55  simple_java              59.68 (SHIPPED) \
+    simple_javascript       51.61  simple_python            88.71 \
+    => hallucination 99.43, live 78.18, non_live 72.04 \
+    => ORACLE normalized 83.22 \
+The best single real configuration scores 82.40, so per-subset cherry-picking is \
+worth only +0.82 over just running no-inject with thinking on. Both fall short \
+of the 88.59 normalized / 87.44 overall bar - the oracle by 5.37. No \
+configuration of this engine on these weights reaches it, and that is arithmetic \
+over 12 subsets and 5 configurations rather than an opinion. \
+★ WHAT WOULD BE NEEDED. Different weights, or model-level work. The bar is \
+Qwen3.6's number carried over as a target; vLLM on NVIDIA's own recommended \
+config gets 73.57 on these weights and Atlas now gets 79.80. The remaining 7.64 \
+is not an engine gap. \
+★ ONE SUBSET STILL WANTS ATTENTION. simple_java is the ONLY place the injection \
+helped: 59.68 shipped versus 50.00 under no-inject. It is the single regression \
+the fix introduces, it is 100 samples of 3625 so it is swamped in the headline, \
+and nobody has explained it. That is the loose thread, and a per-request split \
+of the injection (keep it for single-call subsets, drop it for parallel) is the \
+shape of a fix if anyone wants the last point. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
