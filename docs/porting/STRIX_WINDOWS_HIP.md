@@ -416,3 +416,49 @@ That invalidated a full 5-hour run at 75.5%. Pinning concurrency to 1 took reque
 timeouts from 1126/1294 to **0** and the score to 84.2%. Check the serve log for
 `Request timeout` before trusting any number off this box; the behavioural half is
 filed as #482.
+
+## 2026-09-02 — the Linux fix mirrors over, and a durability blocker is bisected
+
+The frozen Linux source (the dense_gemm_tc quarantine + pipelined BF16 FFN
+prefill fix, the preservation module, the GDN HIP route, the BC=32 paged
+validation) was mirrored via `sync-windows-mirror.sh` and built ONCE:
+`target\x86_64-pc-windows-msvc\release\spark.exe`, sha256
+ba99809d6d9bb8ed534cf64990abfcd4d42fece91f3e4f73a4321a9da152147d. Device
+Guard did NOT block this binary. Parity smoke passes (recall + a correct
+get_current_weather tool call). Windows serve specifics: `--no-fast-load`
+(O_DIRECT is Unix-only) and a LOWER utilization than Linux — the Windows ROCm
+pool reports 76.9 GB with 43.8 GB preservation pre-KV, and 0.88 sized a 22 GB
+KV that hit the budget exactly; 0.70-0.74 serves cleanly.
+
+### The preservation BF16 decode paths crash under sustained load
+
+Three serve crashes, three configurations, one pattern:
+
+* util 0.70, MTP K=2 (MODEL.toml default_num_drafts): hung ~52 min on BFCL
+  sample 5, then device loss (status 719 everywhere).
+* util 0.70, --num-drafts 0: hipErrorLaunchFailure (719) ~8 s after a clean
+  89-token completion, during the next prefill start; 25 samples in.
+* util 0.74, destructive requant path: survived a full BFCL-70 (39 min,
+  **overall 82.86 / normalized 78.75** — live 85.71 and hallucination 56.25
+  IDENTICAL to the Linux preservation run), then crashed at ~sample 750 of
+  the pinned ST-995 with the same launch failure.
+
+What this rules out: the configuration (three different configs crash), host
+memory (127 GB RAM, 108 GB free), and the kernels the microtests cover —
+`dense_gemm_bf16_oracle` PASSES on Windows HIP (pipelined cosine >= 0.99999991
+at every shape; tc broken identically to Linux), and gdn_split4 /
+paged-BF16-attn / contiguous-attn / w8a16 / w4a16-parity microtests all PASS.
+What remains: the Windows-only decode-path kernels no microtest covers
+(`dense_gemv_bf16` M=1, the GDN decode recurrence, paged decode) or a Windows
+ROCm shared-pool/driver durability issue. Short runs are clean; sustained load
+dies. Next diagnostics need Windows-side tooling: WDR/driver event logs, a
+gemv + GDN-decode microtest, or an AMD ticket with the three crash logs
+(`C:\Users\azeez\q38-win-bfcl70*.log`, `q38-win-st995.log`).
+
+Until that closes, the Windows evaluation suite cannot pass: the ST-995 leg
+has no valid run (three attempts, all crash-terminated), and per the repo
+rule the branch does not claim a Windows accuracy number. The destructive-
+path BFCL-70 (82.86/78.75, run record
+`C:\Users\azeez\.atlas\runs\bfcl-subset\run-1788342153742063300.json`) stands
+as a stable-path observation, not a gate result — and it usefully proves the
+original 27% disaster was the broken tc serve, not the requant itself.
