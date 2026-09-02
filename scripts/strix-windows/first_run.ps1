@@ -21,7 +21,7 @@
 #
 #        powershell -ExecutionPolicy Bypass -File scripts\strix-windows\first_run.ps1
 #
-# Either way it ends by serving `nvidia/Qwen3.6-27B-NVFP4` and firing a smoke
+# Either way it ends by serving `kristianpaul/Qwen3.8-27B-NVFP4` and firing a smoke
 # request at it, so a successful run prints a real completion.
 #
 # The serve flags and env below are the RUNTIME-VERIFIED config from the
@@ -37,18 +37,17 @@
 # Optional (all have working defaults):
 #   ATLAS_BIN        prebuilt spark.exe. Set it to skip straight to serving.
 #   ATLAS_REPO       repo root.        Default: the checkout this script lives in.
-#   ATLAS_MODEL_DIR  weights snapshot. Default: $env:USERPROFILE\models\Qwen3.6-27B-NVFP4
+#   ATLAS_MODEL_DIR  weights snapshot. Default: $env:USERPROFILE\models\Qwen3.8-27B-NVFP4
 #   ATLAS_MODEL_NAME served model id. Default: derived from ATLAS_MODEL_DIR
-#                    (a Qwen3.8-27B directory serves unsloth/Qwen3.8-27B-NVFP4).
+#                    (a Qwen3.8-27B directory serves kristianpaul/Qwen3.8-27B-NVFP4).
 #                    This drives kernel-target resolution -- see $ModelName below.
 #   HIP_PATH         HIP SDK root.     Default: newest under C:\Program Files\AMD\ROCm
-#   ATLAS_MAX_SEQ_LEN --max-seq-len. Default 16384, matching serve-amd.sh.
+#   ATLAS_MAX_SEQ_LEN --max-seq-len. Default 32768, matching serve-amd.sh.
 #   ATLAS_MAX_PREFILL_TOKENS --max-prefill-tokens. Default 2048, matching
 #                    serve-amd.sh. This is the knob that sizes the buffer arena.
-#   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.86, matching serve-amd.sh.
-#                    Read the note in Serve
-#                    before raising it; it is a fraction of a total the driver
-#                    reports but will not honour.
+#   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.99 for the Windows pool.
+#                    Lower it when other GPU processes share the pool; the
+#                    validated single-model profile consumes nearly the full budget.
 #   ATLAS_PORT       serve port.       Default 8081.
 #   ATLAS_BIND       serve host.       Default 127.0.0.1.
 #
@@ -71,35 +70,21 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot = if ($env:ATLAS_REPO) { $env:ATLAS_REPO }
             else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
 $ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
-            else { "$env:USERPROFILE\models\Qwen3.6-27B-NVFP4" }
-$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.86' }
-# --max-seq-len drives the inference reserve and the buffer arena, so it is a
-# memory knob, not just a capability one. 65536 is affordable for the 3.6
-# text-only recipe this script was written against; a vision-enabled 27B such as
-# Qwen3.8-27B additionally holds a ViT scratch and loads its FP8 sources
-# alongside the requantised NVFP4 weights, and the reserve 65536 implies then
-# leaves no room for a KV pool at all. 16384 is what the certified Linux recipe
-# (serve-amd.sh) uses.
-$MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '16384' }
-# The buffer arena is sized by max_prefill_tokens, NOT max_seq_len: 8193 tokens
-# cost 3632.9 MB of arena plus the inference reserve computed from it. serve-amd.sh
-# has used 2048 on this same silicon since the certified run; this recipe never
-# passed the flag at all and inherited the 8192 default, which is what kept
-# Qwen3.8-27B from fitting even after the FP8 reclaim.
+            else { "$env:USERPROFILE\models\Qwen3.8-27B-NVFP4" }
+$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.99' }
+# The validated Qwen3.8 profile keeps 32K sequence capacity while bounding the
+# vision scratch separately below. The corrected BC=32 paged-prefill kernel
+# preserves query rows across chunks, so the 0.99 GB arena can remain at 2048.
+$MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '32768' }
 $MaxPrefill = if ($env:ATLAS_MAX_PREFILL_TOKENS) { $env:ATLAS_MAX_PREFILL_TOKENS } else { '2048' }
 $Port     = if ($env:ATLAS_PORT) { $env:ATLAS_PORT } else { '8081' }
 $BindHost = if ($env:ATLAS_BIND) { $env:ATLAS_BIND } else { '127.0.0.1' }
 
-# The served model NAME is not cosmetic. Kernel-target resolution breaks the
-# exact (qwen3_5, 5120) tie between qwen3.6-27b and qwen3.8-27b by matching each
-# target's MODEL.toml `match_names` needles against the checkpoint reference --
-# the HF id, --model-name, and the model dir. Hardcoding the 3.6 name while
-# ATLAS_MODEL_DIR points at 3.8 weights resolves the 3.6 target and serves with
-# that target's MTP depth and sampling defaults, with nothing in the log saying
-# so. Default it from the weights directory; ATLAS_MODEL_NAME overrides.
+# The served model name resolves the exact Qwen3.8 kernel target. This branch is
+# Qwen3.8-specific, so custom snapshot-directory names must not silently select
+# Qwen3.6; ATLAS_MODEL_NAME remains an explicit override.
 $ModelName = if ($env:ATLAS_MODEL_NAME) { $env:ATLAS_MODEL_NAME }
-             elseif ((Split-Path $ModelDir -Leaf) -match 'Qwen3\.8-27B') { 'unsloth/Qwen3.8-27B-NVFP4' }
-             else { 'nvidia/Qwen3.6-27B-NVFP4' }
+             else { 'kristianpaul/Qwen3.8-27B-NVFP4' }
 
 # ATLAS_BIN points at a prebuilt spark.exe (the CI zip). When it is set there is
 # nothing to build, so the binary's own directory takes the place of target/ and
@@ -342,7 +327,7 @@ function Phase-Build {
     $env:ATLAS_TARGET_HW     = 'strix-hip'
     # Overridable so the same script serves other targets in this tree
     # (e.g. ATLAS_TARGET_MODEL=qwen3.8-27b, or '*' to build every one).
-    if (-not $env:ATLAS_TARGET_MODEL) { $env:ATLAS_TARGET_MODEL = 'qwen3.6-27b' }
+    if (-not $env:ATLAS_TARGET_MODEL) { $env:ATLAS_TARGET_MODEL = 'qwen3.8-27b' }
     $env:ATLAS_TARGET_QUANT  = 'nvfp4'
     $env:CUDARC_CUDA_VERSION = '12080'
 
@@ -439,45 +424,9 @@ function Phase-Serve {
     $env:ATLAS_SSM_TAIL_LEASE_TTL = '128'
     $env:ATLAS_MTP_GATE_REPROBE   = '64'
 
-    # The GDN-projection prefill fast path (fp8_fp8_gemm_ldmab) is default-ON on
-    # main and is NVIDIA-only: kernels/gb10/common/w4a16_fp8_ldmab.cu is built
-    # from mma.sync...e4m3.e4m3 + ldmatrix.x4, which have no RDNA3.5 equivalent.
-    # The module is simply absent from the strix kernel set, and this lookup is
-    # NOT one of the soft fallbacks -- it is a hard runtime failure on the FIRST
-    # request, after a completely healthy boot:
-    #
-    #   Prefill chunk layer 0 failed: ssm prefill: out_proj GEMM failed:
-    #   Kernel lookup w4a16_fp8_ldmab::fp8_fp8_gemm_ldmab:
-    #   Module 'w4a16_fp8_ldmab' not loaded
-    #
-    # which surfaces to the client as a bare HTTP 500. serve-amd.sh has set this
-    # to 0 since the port; first_run.ps1 never did, so on Windows the server came
-    # up, reported ready, and then failed every single request.
-    $env:ATLAS_FP8_LDMAB          = '0'
-
-    # Enables the FP8-source reclaim, and Qwen3.8-27B does not fit without it.
-    # quantized_from_fp8 frees the BF16 intermediate but keeps the FP8 SOURCE
-    # unless BOTH downstream readers are known to be off -- the GDN native-FP8
-    # prefill policy (this var) and the dense FP8 attention overlay
-    # (ATLAS_DENSE_FP8, unset here). serve-amd.sh has defaulted this to 1 since
-    # the reclaim landed; this recipe predates it and never picked it up, so on
-    # Windows the 11.56 GB of FP8 sources in unsloth/Qwen3.8-27B-NVFP4 stayed
-    # resident beside their NVFP4 copies:
-    #
-    #   Weights: 21.81 GB, estimated free: 54.9 GB, actual free: 33.1 GB
-    #   KV budget (auto): baseline-free 76.7 GB - free-now 18.9 GB = 57.8 GB
-    #   No memory left for KV cache: budget 61.5 GB, but 57.8 GB consumed
-    #     + 14.4 GB inference reserve = 72.2 GB committed
-    #
-    # Raising --gpu-memory-utilization instead does not work: at 0.95 the
-    # allocation is genuinely attempted and the HIP context hard-faults with
-    # status 719. The memory is really in use; it has to be given back.
-    # Set ATLAS_NO_GDN_FP8_PREFILL=0 to genuinely disable, matching serve-amd.sh.
-    if ($env:ATLAS_NO_GDN_FP8_PREFILL -eq '0') {
-        Remove-Item Env:\ATLAS_NO_GDN_FP8_PREFILL -ErrorAction SilentlyContinue
-    } else {
-        $env:ATLAS_NO_GDN_FP8_PREFILL = '1'
-    }
+    # Native HIP compile-time disables NVIDIA's FP8 LDMAB path. Radix scalar-
+    # scaled FP8 attention/GDN stays native, and copied QKV/Z sources are
+    # reclaimed after fusion; no runtime precision opt-out is required.
 
     # 0, NOT the 6 this doc carried before runtime. cuMemGetInfo_v2 now synthesises
     # a truthful free figure from tracked allocations, and that tracker reports
@@ -486,13 +435,6 @@ function Phase-Serve {
     # alloc). 0 fails build.rs's `.filter(|gb| gb > 0.0)` and falls through to the
     # AUTO path (baseline_free - free_now), which is correct given the fixed shim.
     $env:ATLAS_KV_EXTERNAL_RESERVE_GB = '0'
-
-    # 0, NOT 1. Mid-chunk tail capture corrupts CROSS-REQUEST SSM prefix reuse:
-    # BFCL single-turn requests share a system-prompt prefix and reuse each other's
-    # tail snapshot -> garbled tool calls. Observed here as empty 1-token
-    # completions on 12/12 live_multiple entries. This is a strict-"0" opt-out, NOT
-    # a presence flag -- absent, or any other value, leaves it ON.
-    $env:ATLAS_SSM_TAIL_MIDCHUNK = '0'
 
     if (-not $NoSmokeTest) {
         # The server owns this console until Ctrl-C, so probe from a detached
@@ -535,10 +477,9 @@ try {
     Write-Host ''
     $ErrorActionPreference = 'Continue'
 
-    # --gpu-memory-utilization is a fraction of the total the driver REPORTS
-    # (76.9 GB here) but the real allocatable ceiling measured ~63 GB, so this
-    # cannot go much past 0.83. 0.80 -> 61.5 GB budget: 40.3 GB pre-KV + 15.7 GB
-    # reserve -> 5.4 GB KV = 89232 tokens. The Linux 0.35 does not apply.
+    # Windows ROCm reports a 76.9 GB process-local pool. With the 2048-token
+    # arena, the fully-NVFP4 checkpoint uses 70.4 GB pre-KV; 0.99 leaves about
+    # 3.8 GB of BF16 KV after the inference reserve, enough for the 32K limit.
     #
     # --no-fast-load is no longer required (the Unix-only O_DIRECT loader now warns
     # and falls back instead of hard-erroring); passing it just silences the warning.
@@ -563,10 +504,11 @@ try {
         '--model-name', $ModelName, '--host', $BindHost, '--port', $Port
         '--max-seq-len', $MaxSeqLen, '--max-prefill-tokens', $MaxPrefill
         '--gpu-memory-utilization', $GpuUtil, '--kv-cache-dtype', 'bf16'
-        '--max-batch-size', '1', '--speculative', '--num-drafts', '2'
+        '--max-batch-size', '1', '--vision-max-pixels', '262144'
+        '--speculative', '--num-drafts', '2'
         '--mtp-quantization', 'bf16', '--mtp-vocab', '100000'
         '--disable-tool-grammar', 'true', '--enable-prefix-caching'
-        '--ssm-cache-slots', '64', '--ssm-checkpoint-interval', '16'
+        '--ssm-cache-slots', '0', '--ssm-checkpoint-interval', '16'
         '--disable-thinking'
     )
     & $exe @serveArgs
