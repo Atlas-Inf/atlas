@@ -1,0 +1,79 @@
+# Benchmarks for this model, and the thresholds its gate records must meet.
+#
+# Sibling of MODEL.toml so the numbers sit beside the thing they describe;
+# hardware and model are implied by the path and cannot disagree with the
+# contents. Read by `atlas_plugin::gate::bench`.
+#
+# Thresholds are per CHECKPOINT, not per model. This entry is the AUTHORITATIVE
+# unsloth/Qwen3.8-27B-NVFP4 checkpoint (snapshot 7d6f8d4d) on AzeezStrix.
+#
+# This file is deliberately OUTSIDE the closure hash, so ratcheting a threshold
+# does not invalidate the record that justified the ratchet.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "unsloth/Qwen3.8-27B-NVFP4"
+gate = "bfcl-subset"
+label = "Qwen3.8-27B dense (NVFP4, unsloth) — Strix Halo gfx1151"
+default = true
+status = "measured"
+note = """\
+BASELINE ESTABLISHED 2026-09-02, AzeezStrix (gfx1151, 60 GB GTT, ROCm/HIP \
+7.13), golden draw n=995 seed 42 temp 0 with NO param overrides. \
+overall 84.22 / normalized 83.68. Run record \
+~/.atlas/runs/bfcl-subset/run-1788366618469517340.json. \
+FINGERPRINT: serve binary sha256 9961081bb9a15d418147f4a00b8111895acf4e29923a48dc5b6dda6dbdf7cd48 \
+(built from this branch's dirty tree, diff sha256 c7c60ae3... pre-quarantine; \
+the quarantine rebuild differs only in non-measured-path logging), checkpoint \
+unsloth/Qwen3.8-27B-NVFP4 snapshot 7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108. \
+Serve recipe (the frozen preservation recipe): --max-seq-len 4096 \
+--max-prefill-tokens 2048 --gpu-memory-utilization 0.88 --kv-cache-dtype bf16 \
+--lm-head-dtype bf16 --max-batch-size 1 --disable-tool-grammar true \
+--ssm-cache-slots 0 --disable-thinking --dangerously-allow-unresolved-kernel-lookups; \
+env ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1 ATLAS_FP8_DEQUANT_FFN_TO_BF16=1 \
+ATLAS_GDN_BF16_WEIGHTS=1 ATLAS_W4A16_VARIANT=v1 ATLAS_W4A16_DP4A=1 \
+ATLAS_KV_EXTERNAL_RESERVE_GB=0. No speculative decode. \
+THE FIX THIS BASELINE DEPENDS ON: the BF16 FFN prefill arm (used by the \
+checkpoint's final-eight per-row-FP8 FFN layers, installed as BF16 by the \
+preservation module) routes through gemm::dense_gemm_bf16_pipelined \
+(CPU-oracle-validated, row cosine >= 0.99999991). The gfx1151 WMMA port of \
+gemm_tc::dense_gemm_tc leaves ~half its output tile unwritten and ran ~1000x \
+slow in situ — with it, this gate scored 27.14/32.42 with degenerate first \
+tokens (<|audio_pad|>) and period-2 decode loops. dense_gemm_tc is \
+quarantined behind ATLAS_FFN_BF16_PREFILL_TC=1. \
+CATEGORIES: hallucination 86.55 (irrelevance 95.83, live_irrelevance 77.27), \
+live 84.12 (live_multiple 85.71, live_parallel 93.75, live_parallel_multiple \
+66.67, live_simple 88.00), non_live 80.38 (multiple 93.55, parallel 88.71, \
+parallel_multiple 83.06, simple_java 46.77, simple_javascript 25.81, \
+simple_python 95.97). \
+★ THE PYTHON/JS CLIFF REPRODUCES THE GB10 ANOMALY: simple_python 95.97 \
+against simple_java 46.77 and simple_javascript 25.81 — the same split the \
+gb10 entry calls "a defect in the serve path, with the chat-template change \
+the prime suspect", here on different hardware, the same checkpoint, and the \
+preservation load path. It is the largest known accuracy lever (~2 points of \
+overall) and is NOT fixed by this baseline. \
+★ THE BARS BELOW ARE REGRESSION FLOORS cut at measured-minus-noise (0.4, the \
+documented MTP-nondeterminism band), not a quality endorsement: normalized \
+83.68 sits 0.04 under the GB10-derived 83.72 floor — one sample of 995. \
+The MLPerf-instrument number for the same checkpoint (harness bfcl_v4, \
+12/23/46 draw) is a different scorer and draw: the previous working \
+unsloth-3.6 reference there is 78.59/80.45 (results_st996_unsloth_ccdaab7e); \
+the qwen38 leg is recorded separately and does not gate this entry."""
+
+[benchmarks.metrics.samples]
+# The golden MLPerf draw is exactly 995. A run reporting anything else is not
+# this draw and its score is not comparable — pin both ends.
+min = 995.0
+max = 995.0
+
+[benchmarks.metrics.overall_accuracy]
+# Measured 84.22 (see the note for the full fingerprint). Floor at measured
+# minus the documented 0.4 noise band.
+min = 83.82
+noise = 0.4
+
+[benchmarks.metrics.normalized_single_turn_score]
+# Measured 83.68, same run. One sample under the GB10-derived 83.72; the floor
+# here is cut from THIS run's own measurement, not inherited across hardware.
+min = 83.28
+noise = 0.4
