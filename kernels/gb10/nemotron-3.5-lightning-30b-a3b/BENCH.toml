@@ -415,6 +415,48 @@ highest-value unrun experiment on this target. \
 different benchmark with a different scoring model, and a low score there does \
 not arithmetically predict a low BFCL. It is evidence, not proof, and the vLLM \
 control above is what turns it into either. \
+★ CORRECTION TO THE NOTE ABOVE, AND THE CONTROL THAT FORCED IT. The preceding \
+entry says vLLM needs an hours-long aarch64 source build and leans on \
+tau3-bench 9.28 to suggest the gap is the WEIGHTS rather than the engine. Both \
+halves were wrong and are retracted here. A prebuilt \
+vllm-0.28.0-cp38-abi3-manylinux_2_28_aarch64 wheel installs in seconds; the \
+only blocker was a missing `ninja` for flashinfer's JIT. The claim was asserted \
+twice before it was ever checked. \
+★ THE CONTROL RAN. Same golden n=995 draw, same score.py, same ast_checker, \
+same weights, only the serving engine swapped. vLLM 0.28.0 with NVIDIA's own \
+model-card config (--tool-call-parser qwen3_coder, --reasoning-parser \
+nemotron_v3), thinking ON, which is both engines' shipped default. A tool-call \
+smoke test on a real BFCL sample ran first, because a parser mismatch would \
+return zero calls and score ~0 - it extracted 2 of 2. \
+    engine / config          overall   normalized \
+    Atlas, thinking ON         64.22       71.25 \
+    Atlas, thinking OFF        67.64       73.33 \
+    vLLM,  thinking ON         73.57       78.18 \
+Like for like - both engines on their shipped default - vLLM is +9.35 overall. \
+Against Atlas's BEST configuration it is still +5.93. \
+★ SO THE GAP IS SUBSTANTIALLY OURS, AND THE EARLIER FRAMING WAS WRONG. These \
+weights demonstrably do parallel calling far better than Atlas gets out of \
+them. Per subset, vLLM (thinking ON) against Atlas (thinking OFF): \
+    parallel           58.06 vs 20.16   +37.90 \
+    live_parallel      75.00 vs 18.75   +56.25 \
+    multiple           88.71 vs 79.03    +9.68 \
+    live_irrelevance   98.86 vs 89.77    +9.09 \
+    simple_java        43.55 vs 59.68   -16.13  (ATLAS BETTER) \
+    simple_javascript  35.48 vs 48.39   -12.91  (ATLAS BETTER) \
+By category: hallucination +4.54, non_live +10.01, live 0.00 - identical. \
+★ WHAT THAT REWRITES. The parallel-calling defect is REAL and it is OURS: the \
+model reaches 58.06 on `parallel` under vLLM where Atlas manages 20.16. The \
+confirmed thinking mechanism is therefore an Atlas-specific interaction, NOT a \
+property of these weights - vLLM runs with thinking ON and still gets 58.06. \
+And the simple_java / simple_javascript weakness is not an Atlas defect at all; \
+Atlas is 13-16 points BETTER there, so the earlier dead-end note stands and \
+that hunt was correctly abandoned. \
+★ WHAT SURVIVES OF THE BAR ARGUMENT. vLLM's 73.57 is still 13.87 under 87.44, \
+so the bar is probably not reachable with these weights by either engine. Both \
+things are true at once and neither cancels the other: ~6 to 9 points are \
+recoverable Atlas defects worth chasing, and the remaining ~14 is not obviously \
+an engine problem. Chase `parallel` and `live_parallel` first - they are the \
+whole recoverable gap. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
