@@ -393,6 +393,28 @@ model behaviour on this checkpoint, and the non_live gap is not one defect - it 
 is parallel 20.16, parallel_multiple 52.42, simple_javascript 48.39 and \
 simple_java 59.68 all being independently weak. Attack them separately or not \
 at all; there is no single lever here. \
+★ THE 87.44 BAR IS A DIFFERENT MODEL'S NUMBER, AND THESE WEIGHTS MAY NOT REACH \
+IT. Checked against what NVIDIA actually publishes for this checkpoint \
+(model card, 2026-09-02): there is NO published BFCL score at all, so there is \
+no vendor reference point to score this port against. What they do publish for \
+tool use is tau3-bench (Banking) 9.28 and Terminal-Bench 2.1 24.58, against \
+MMLU Pro 81.94, GPQA Diamond 75.44 and SWE-bench Verified 51.56. A 9.28 on a \
+multi-turn tool-use benchmark is very low for a model sold for agentic work, \
+and it is independent evidence that tool calling is a genuine weakness of these \
+WEIGHTS rather than something the engine is breaking. Treat 87.44 for what it \
+is - Qwen3.6's number, carried over as a target - and do not read the gap as \
+proof of an Atlas defect. \
+★ WHAT WOULD ACTUALLY SETTLE IT. Serve this same checkpoint under vLLM or \
+SGLang and run the same n=995 draw. If it also lands near 68, the port is \
+serving these weights correctly and the bar needs to move; if it lands near 87, \
+the gap is ours and this whole investigation missed something. That measurement \
+was NOT run here: vLLM needs an aarch64 / SM121 / CUDA 13 source build on this \
+box, which is hours with a real chance of not completing. It remains the single \
+highest-value unrun experiment on this target. \
+★ tau3-bench IS NOT BFCL, and this note is not claiming otherwise. It is a \
+different benchmark with a different scoring model, and a low score there does \
+not arithmetically predict a low BFCL. It is evidence, not proof, and the vLLM \
+control above is what turns it into either. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
