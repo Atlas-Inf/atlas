@@ -1,6 +1,6 @@
 [model]
 name = "qwen3.8-27b"
-hf_id = "Qwen/Qwen3.8-27B"
+hf_id = "unsloth/Qwen3.8-27B-NVFP4"
 params = "27B"
 active_params = "27B"
 architecture = "Hybrid Attention + GDN + Dense FFN + MRoPE"

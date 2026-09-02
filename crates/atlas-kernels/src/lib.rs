@@ -212,6 +212,9 @@ pub struct ModelBehavior {
     /// when the prefix forces them into that structure. Default: false
     /// (keep the existing Nemotron-Nano-correct behavior).
     pub disable_tool_steering: bool,
+    /// Let the checkpoint chat template render tool definitions and examples;
+    /// Atlas still renders API-level `tool_choice` policy instructions.
+    pub template_owns_tool_definitions: bool,
     /// Do not append Atlas's derived `<environment>working_directory` block to
     /// a client system prompt. Native agent clients may already provide the
     /// cwd; duplicating it can become a tool-selection attractor.
@@ -376,6 +379,7 @@ impl Default for ModelBehavior {
             default_kv_dtype: "",
             default_num_drafts: 0,
             disable_tool_steering: false,
+            template_owns_tool_definitions: false,
             disable_cwd_hint_injection: false,
             use_sampling_presets_for_core: false,
             tool_call_parser: "",

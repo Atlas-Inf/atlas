@@ -133,6 +133,10 @@ name = "inferspark_attn_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "inferspark_attn_paged_bf16_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "moe_shared_microtest"
 required-features = ["cuda", "gpu-examples"]
 
@@ -202,6 +206,14 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "w4a16_parity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w4a16_cpu_reference_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "dense_gemm_bf16_oracle"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

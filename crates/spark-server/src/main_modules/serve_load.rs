@@ -1126,6 +1126,7 @@ pub(crate) fn load_model(
         },
         chat: crate::api::chat::levers::ChatLevers::resolve(
             ptx_set.behavior.tscg,
+            ptx_set.behavior.template_owns_tool_definitions,
             ptx_set.behavior.disable_cwd_hint_injection,
         ),
         vision_config: config.vision.clone(),

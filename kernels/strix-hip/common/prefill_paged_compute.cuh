@@ -18,7 +18,8 @@
 //        and feed P back into the PV WMMA. This decouples the softmax math from
 //        the fragment layout — the exact approach proven in inferspark_prefill_wmma.cu.
 //
-// STATUS: compiles-pending / numerics-pending GPU. Not validated on hardware.
+// STATUS: BC=32 validated on Linux and Windows gfx1151 against an FP32 CPU
+// reference for both base and `_64` production dispatches (cosine 0.999999).
 //
 // Covers (via the including .cu wrapper macros): inferspark_prefill_paged,
 // _paged_batched, _paged_fp8, _paged_fp8_batched, _paged_nvfp4, _paged_nvfp4_batched.
@@ -84,10 +85,10 @@ __device__ __forceinline__ float sw_exp(float x) {
 }
 
 #define BR 32
-// occ2 (2026-07-11): BC 32→16 halves the KV tile → smem_K/V shrink; combined with
-// the K/V buffer-share below this cuts LDS 56→28 KB → 2 workgroups/CU (occupancy
-// 12%→24%, prefill kernel −34%). See project_strix_prefill_occupancy_bound memory.
-#define BC 16
+// BC=32 matches the native-HIP contiguous attention kernel's validated WMMA
+// tile geometry. The prior unvalidated BC=16 occupancy variant wrote only query
+// row 0 and zeroed every later row in paged prefill.
+#define BC 32
 #ifndef HDIM
 #define HDIM 256
 #endif
