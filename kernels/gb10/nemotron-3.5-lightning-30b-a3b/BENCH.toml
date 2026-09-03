@@ -597,6 +597,37 @@ the fix introduces, it is 100 samples of 3625 so it is swamped in the headline, 
 and nobody has explained it. That is the loose thread, and a per-request split \
 of the injection (keep it for single-call subsets, drop it for parallel) is the \
 shape of a fix if anyone wants the last point. \
+★ THE NO-INJECT SUBMISSION PAIR: ACCURACY AND PERF ON ONE ENGINE STATE. \
+Everything below is ATLAS_NO_TOOL_INJECT=1, thinking ON, shipped tscg, prompt \
+verified at 411 tokens on a live request before each leg started. \
+    ACCURACY  draw 1  79.80 / 82.40   draw 2  79.60 / 82.32   spread 0.20 / 0.08 \
+    ttft-cold-gate   median  904.5 ms  p90 2635.8 ms  Pass (-0.8% / -1.1%) \
+    ttft-warm-gate   median  899.0 ms  p90 2648.5 ms  Pass (-0.7% / -0.4%) \
+    concurrency-sweep  24 cells, 0 request errors, all above the vacuity floor, \
+                       peak 59.9 tok/s, best TTFT p50 507 ms \
+    decode-floor     INCONCLUSIVE - 472 tokens against the 750 vacuity floor \
+★ TWO DRAWS MAKE 79.80 REPRODUCIBLE. 79.80 and 79.60, a spread of 0.20 - the \
+same tightness as the thinking-ON baseline's 64.22 / 64.12 / 64.22. The headline \
+is a measurement, not a lucky draw. \
+★ THE ACCURACY WIN COSTS NOTHING IN SPEED, and here is why that is expected \
+rather than surprising: the TTFT gates and the sweep drive SYNTHETIC prompts of \
+fixed length, not BFCL tool prompts, so a change that shrinks the tool prompt \
+from 1314 to 411 tokens cannot move them. Peak sweep throughput reads 59.9 \
+against 60.0 / 60.1 / 60.2 on the three prior runs - inside noise. Both TTFT \
+gates came in slightly FASTER than their own baselines. There is no speed \
+regression to trade against the +15.58. \
+★ decode-floor IS INCONCLUSIVE, NOT FAILED, AND IT IS PRE-EXISTING. The model \
+answers the probe in 472 tokens of a 1500 budget, under the 750-token floor, so \
+the harness declines to score it - the same reason this entry is already \
+carried `unmeasured` above. Nothing about no-inject caused it: acceptance on \
+those runs was 320 / 319 / 135 of 472, i.e. the drafter is working. Do not read \
+the Fail line as a regression from this change. \
+★ THE ACCOMPANYING RECIPE IS UPDATED. Atlas-Inf/sparkrun-recipes @ 9400c6c on \
+branch recipe/nemotron-3.5-lightning-dspark carries the env stack, the four-way \
+accuracy table, and the thinking interaction. ATLAS_NO_TOOL_INJECT cannot be a \
+recipe KEY - `defaults:` carries serve flags only and the Atlas recipe struct \
+has no `env:` field - so it is documented in prose beside ATLAS_DFLASH_OPTION_B, \
+matching the convention the qwen3.8 recipes set. `defaults:` is unchanged. \
 ★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
 under a single first measurement so a real regression trips them and ordinary \
 variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
