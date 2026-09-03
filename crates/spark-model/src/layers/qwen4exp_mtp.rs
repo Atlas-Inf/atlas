@@ -291,7 +291,12 @@ impl DraftProposer for Qwen4ExpMtpHead {
         Ok(())
     }
 
-    fn free_state(&self, _gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+    fn free_state(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
+        state: &mut dyn ProposerState,
+    ) -> Result<()> {
         let st = state
             .as_any_mut()
             .downcast_mut::<Qwen4ExpMtpProposerState>()
