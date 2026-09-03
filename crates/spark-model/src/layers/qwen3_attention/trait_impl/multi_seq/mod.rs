@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Multi-sequence batched-decode body for [`super::super::Qwen3AttentionLayer`].
-//!
-//! Split into phase modules under the `_inner` delegation pattern:
-//! - `ctx`  — `MultiSeqCtx` shared scalars + buffer pointers
-//! - `qkv`  — phase 2: per-token Q/K/V projections (batch3/batch2/seq)
-//! - `attn` — phases 3-6: RoPE → cache write → paged decode → O proj
-//! - `ffn`  — phase 7: residual + post-norm + MoE/dense FFN
-//!
-//! The trait impl in `super::trait_impl` calls
-//! [`Qwen3AttentionLayer::decode_multi_seq_inner`] which simply builds
-//! the ctx, runs phase 1 inline (RMS norm), and dispatches the rest.
+//! Split into phase modules under `_inner` delegation: `ctx`, `qkv`, `attn`, `ffn`.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -25,18 +16,15 @@ mod ctx;
 mod ffn;
 mod mla;
 mod mla_gemv;
+mod nemotron_serial;
 mod qkv;
+
+use nemotron_serial::nemotron_attention_serial;
 
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
-    /// `row_owner`: when `Some`, the N rows are not N independent sequences —
-    /// row `i` belongs to sequence `row_owner[i]`, and `states` is indexed by
-    /// SEQUENCE (so it is shorter than N, and several rows share one entry).
-    /// That is the speculative-verify shape: K consecutive tokens of one
-    /// sequence, or a ragged batch of them. It matters only for per-sequence
-    /// aux state — the QSA indexer — which must advance ONCE PER ROW IN ORDER
-    /// against its owning sequence's state rather than against a private one.
-    /// `None` keeps the plain one-row-per-sequence decode meaning.
+    /// `row_owner`: when `Some`, row `i` belongs to sequence `row_owner[i]`, and `states` is indexed
+    /// by sequence. Used for per-sequence aux state (QSA indexer) to advance once per row in order.
     pub(in crate::layers::qwen3_attention) fn decode_multi_seq_inner<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,
@@ -50,32 +38,17 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // Nemotron-H attention is RoPE-disabled and uses BF16 projections. The
-        // diagnostic serial arm localizes C>1 tensor-core accumulation drift
-        // without changing Qwen/MLA paths.
-        if nemotron_attention_serial(
-            self.rope_disabled,
-            std::env::var("ATLAS_LIGHTNING_ATTN_SERIAL").ok().as_deref(),
-        ) {
-            let h = ctx.config.hidden_size;
-            let bf16 = 2usize;
-            for i in 0..num_seqs {
-                let mut block_table = _block_tables[i].clone();
-                let mut disk_blocks = Vec::new();
-                let mut disk_offsets = Vec::new();
-                self.decode(
-                    hidden.offset(i * h * bf16),
-                    residual.offset(i * h * bf16),
-                    states[i],
-                    kv_cache,
-                    _seq_lens[i],
-                    &mut block_table,
-                    &mut disk_blocks,
-                    &mut disk_offsets,
-                    ctx,
-                    stream,
-                )?;
-            }
+        if self.try_nemotron_attention_serial(
+            hidden,
+            residual,
+            num_seqs,
+            states,
+            kv_cache,
+            _seq_lens,
+            _block_tables,
+            ctx,
+            stream,
+        )? {
             return Ok(());
         }
         let bs = kv_cache.block_size() as u32;
@@ -513,24 +486,5 @@ impl Qwen3AttentionLayer {
         }
 
         Ok(())
-    }
-}
-
-fn nemotron_attention_serial(rope_disabled: bool, value: Option<&str>) -> bool {
-    rope_disabled && matches!(value, Some("1"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::nemotron_attention_serial;
-
-    #[test]
-    fn serial_attention_is_exact_opt_in_for_rope_disabled_layers() {
-        assert!(!nemotron_attention_serial(false, None));
-        assert!(!nemotron_attention_serial(false, Some("1")));
-        assert!(!nemotron_attention_serial(true, None));
-        assert!(!nemotron_attention_serial(true, Some("0")));
-        assert!(!nemotron_attention_serial(true, Some("true")));
-        assert!(nemotron_attention_serial(true, Some("1")));
     }
 }

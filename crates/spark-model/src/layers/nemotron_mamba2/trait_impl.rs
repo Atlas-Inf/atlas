@@ -290,6 +290,7 @@ impl TransformerLayer for NemotronMamba2Layer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
+        _active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         _kv_cache: &mut PagedKvCache,
         _seq_lens: &[usize],
