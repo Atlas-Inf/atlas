@@ -16,8 +16,6 @@
 //! When `ATLAS_TARGET_MODEL=*` or `ATLAS_TARGET_QUANT=*`, multiple
 //! targets are compiled and available at runtime.
 
-use atlas_core::target::KernelTarget;
-
 pub mod resolve;
 pub use resolve::{ResolveCandidate, TargetResolveError, ptx_for_config, ptx_for_exact_target};
 
