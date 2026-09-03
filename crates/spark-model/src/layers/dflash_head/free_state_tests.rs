@@ -178,6 +178,7 @@ fn zero_kernels() -> DflashKernels {
         w4a16_gemv_batch16: zero,
         w4a16_gemv_batch32: zero,
         dflash2_conv: None,
+        dflash2_candidate_selector: None,
     }
 }
 

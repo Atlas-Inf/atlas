@@ -53,6 +53,7 @@ pub struct DflashKernels {
     pub dense_gemv_batchm: KernelHandle,
     pub dense_gemm: KernelHandle,
     pub dflash2_conv: Option<KernelHandle>,
+    pub dflash2_candidate_selector: Option<KernelHandle>,
     /// NVFP4 GEMM for the final logits when the shared lm_head is NVFP4
     /// (e.g. Holo): a BF16 `dense_gemm` on NVFP4-packed bytes reads garbage
     /// (and ~4× OOB → CUDA-700). `.0 == 0` when the target lm_head is BF16.

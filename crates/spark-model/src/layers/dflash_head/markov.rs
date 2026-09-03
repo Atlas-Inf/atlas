@@ -37,6 +37,7 @@ impl BlockDiffusionDraftHead {
                 self.gamma,
                 gpu,
                 self.kernels.dense_gemm_pipelined,
+                self.kernels.dflash2_candidate_selector,
                 stream,
             );
         }
