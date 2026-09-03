@@ -787,14 +787,9 @@ pub fn build_model(
         }
     }
 
-    // ── Step 8: LoRA adapter install (optional, post-construction) ──
-    // The pool/tables were loaded up top (pre-KV-sizing); this walk copies
-    // the per-layer pairs into the layer structs. M0: layers only STORE the
-    // adapter — base output is unchanged until the M1 compute insertions.
     if let Some(ngram) = ngram_embed {
         model.set_ngram_embedding(ngram);
     }
-    model.set_lora_weights(lora_weights)?;
     // Every layer has taken the pointers it needs; hand the ledger to the model
     // so `teardown` can free the weights. Dropping it here — which is what used
     // to happen — orphaned the memory: live, referenced by the layers, with
