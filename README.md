@@ -22,8 +22,14 @@
 </p>
 
 <p align="center">
+  <a href="assets/atlas-demo.mp4"><img alt="Atlas demo — click for full-quality MP4" src="assets/atlas-demo.gif" width="820" /></a>
+</p>
+
+<p align="center">
   <a href="#quick-start"><img alt="Quick Start — under 2 minutes" src="https://img.shields.io/badge/%E2%9A%A1%20Quick%20Start%20%E2%80%94%20%3C%202%20min-2EA44F?style=for-the-badge&logo=docker&logoColor=white"></a>
   <a href="https://atlasinference.dev"><img alt="atlasinference.dev" src="https://img.shields.io/badge/%F0%9F%8C%90%20atlasinference.dev-F48C06?style=for-the-badge"></a>
+  <a href="https://mlcommons.org/2026/07/mlperf-inference-v61-edge-agentic/"><img alt="MLPerf v6.1 Edge Agentic" src="https://img.shields.io/badge/MLPerf%20v6.1-Edge%20Agentic-blue?style=for-the-badge"></a>
+  <a href="docs/GB10_DEPLOYMENT_GUIDE.md"><img alt="Deployment Guide" src="https://img.shields.io/badge/%F0%9F%93%96%20GB10%20Deployment%20Guide-4A154B?style=for-the-badge"></a>
 </p>
 
 ---
@@ -34,8 +40,8 @@ Atlas is a high-performance, pure Rust & CUDA LLM inference engine purpose-built
 
 - **Sub-90s First Token**: Boots in seconds with cached weights; zero JIT compile or Python startup lag.
 - **Default Flagship Qwen 3.8 27B**: Dense hybrid GDN + Attention running at 23.59 tok/s single-stream with MTP speculative decoding on a single GB10.
-- **Qwen 3.8 Flash-Next Support**: Stream massive ~180B hybrid MoE models inside ~90 GB resident VRAM using NVMe PLE n-gram table offloading.
 - **Nemotron 3.5 Lightning + DSpark**: Full bring-up of hybrid Mamba-2 SSM + MoE paired with DSpark speculative decoding drafters for sub-10ms token decode latencies.
+- **Qwen 3.8 Flash-Next Support**: Stream massive ~180B hybrid MoE models inside ~90 GB resident VRAM using direct parallel `pread` NVMe offloading.
 - **Turnkey Sparkrun Integration**: Launch any verified model recipe instantly with `sparkrun run @atlas/<recipe>`.
 - **OpenAI & Anthropic Compatible**: Drop-in API endpoint supporting streaming, tool calling, and reasoning traces.
 - **MLPerf Proven**: Official contributor to the MLPerf Inference v6.1 Edge Agentic benchmark.
@@ -44,7 +50,7 @@ Atlas is a high-performance, pure Rust & CUDA LLM inference engine purpose-built
 
 ## 🚀 Quick Start
 
-### 1. Default Flagship: Qwen 3.8 27B via Sparkrun
+### 1. Default Flagship: Qwen 3.8 27B (Dense) via Sparkrun
 
 The default flagship recipe deploys Qwen 3.8 27B in NVFP4 on a single GB10 with native MTP speculative decoding:
 
@@ -65,20 +71,9 @@ Prefer the one-line quickstart script?
 curl -fsSL https://atlasinference.dev/quickstart.sh | sh
 ```
 
-### 2. Qwen 3.8 Flash-Next (~180B Hybrid MoE)
+### 2. Nemotron 3.5 Lightning 30B + DSpark Speculative Drafter
 
-Atlas dynamically streams the 47.7 GB PLE n-gram table off NVMe, keeping peak resident memory under 90 GB on a single 120 GB GB10:
-
-```bash
-huggingface-cli download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
-  --local-dir ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4
-
-sparkrun run @atlas/qwen3.8-flash-next-nvfp4 --hosts localhost
-```
-
-### 3. Nemotron 3.5 Lightning 30B + DSpark Speculative Drafter
-
-Pairs the hybrid Mamba-2 + Attention + MoE backbone with NVIDIA's 6-layer DSpark drafter (gamma=4 / K=3 verify) for ultra-low latency token generation:
+Pairs the hybrid Mamba-2 + Attention + MoE backbone with NVIDIA's 6-layer DSpark drafter (gamma=4 / K=3 verify) for sub-10ms token generation:
 
 ```bash
 # Export recommended performance environment
@@ -89,7 +84,37 @@ export ATLAS_NO_TOOL_INJECT=1   # +15.58 BFCL accuracy boost
 sparkrun run @atlas/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark --hosts localhost
 ```
 
-### 4. Querying the Endpoint
+### 3. Qwen 3.8 Flash-Next (~180B Hybrid MoE)
+
+Atlas dynamically streams the 47.7 GB PLE n-gram table off NVMe using parallel `pread` workers, keeping peak resident memory under 90 GB on a single 128 GB GB10:
+
+```bash
+huggingface-cli download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --local-dir ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4
+
+sparkrun run @atlas/qwen3.8-flash-next-nvfp4 --hosts localhost
+```
+
+### 4. AMD Strix Halo (gfx1151) Quick Start
+
+Atlas runs identical CUDA sources natively on AMD RDNA 3.5 via **SCALE by Spectral Compute** (no HIP port, no duplicate kernel tree). Bring-up is active across two dedicated branches:
+
+- **Linux Leg (Ubuntu 24.04 / ROCm 6.2+)**: Branch [`port/qwen3.8-strix-linux`](https://github.com/Atlas-Inf/atlas/tree/port/qwen3.8-strix-linux) ([PR #8](https://github.com/Atlas-Inf/atlas/pull/8))
+- **Windows Leg (DirectX 12 / native MSVC)**: Branch [`port/qwen3.8-windows`](https://github.com/Atlas-Inf/atlas/tree/port/qwen3.8-windows) ([PR #9](https://github.com/Atlas-Inf/atlas/pull/9))
+
+```bash
+# Clone the AMD Strix Halo port branch
+git clone -b port/qwen3.8-strix-linux https://github.com/Atlas-Inf/atlas.git
+cd atlas
+
+# Build native binary targeting AMD gfx1151 silicon
+cargo build --release --features scale,rocm
+
+# Launch Qwen 3.8 27B on Strix Halo
+./target/release/spark serve unsloth/Qwen3.8-27B-NVFP4 --bind 127.0.0.1 --port 8888
+```
+
+### 5. Querying the Endpoint
 
 Atlas serves an OpenAI-compatible API on the designated port:
 
@@ -114,11 +139,11 @@ Every recipe is maintained in the [sparkrun-recipes](https://github.com/Atlas-In
 | **Qwen** | **Qwen3.8** | `@atlas/qwen3.8-27b-nvfp4` | NVFP4 | Single GB10 | **Default Flagship**. Dense hybrid GDN + Attn, MTP spec decode, FP8 KV, 23.59 tok/s |
 | **Qwen** | **Qwen3.8** | `@atlas/qwen3.8-27b-nvfp4-latency` | NVFP4 | Single GB10 | Low-concurrency / interactive profile tuned for minimal single-stream latency |
 | **Qwen** | **Qwen3.8** | `@atlas/qwen3.8-27b-nvfp4-throughput` | NVFP4 | Single GB10 | Concurrency profile beating vLLM from 1 to 128 streams on GB10 |
-| **Qwen** | **Qwen3.8** | `@atlas/qwen3.8-flash-next-nvfp4` | NVFP4 | Single GB10 | ~180B hybrid MoE, 8K context, parallel `pread` NVMe offload (750–800 tok/s prefill, 36.7 tok/s decode, ~90 GB resident) |
-| **Qwen** | **Qwen3.8** | `@atlas/qwen3.8-flash-next-nvfp4-throughput` | NVFP4 | Single GB10 | Throughput-tuned 8K context profile |
 | **Nemotron** | **Nemotron-3.5** | `@atlas/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark` | NVFP4 | Single GB10 | **New**. Hybrid Mamba-2 SSM + MoE with 1.3 GB DSpark drafter (K=3 verify) |
 | **Nemotron** | Nemotron-3 | `@atlas/nemotron-3-nano-30b-a3b-nvfp4` | NVFP4 | Single GB10 | 30B / 3B active Mamba-2 + MoE |
 | **Nemotron** | Nemotron-3 | `@atlas/nemotron-3-super-120b-a12b-nvfp4` | NVFP4 | Single GB10 | 120B / 12B active hybrid architecture |
+| **Qwen** | **Qwen3.8** | `@atlas/qwen3.8-flash-next-nvfp4` | NVFP4 | Single GB10 | ~180B hybrid MoE, 8K context, parallel `pread` NVMe offload (750–800 tok/s prefill, 36.7 tok/s decode, ~90 GB resident) |
+| **Qwen** | **Qwen3.8** | `@atlas/qwen3.8-flash-next-nvfp4-throughput` | NVFP4 | Single GB10 | Throughput-tuned 8K context profile |
 | **Qwen** | Qwen3.6 | `@atlas/qwen3.6-35b-a3b-fp8-mtp` | FP8 | Single GB10 | 35B / 3B active GDN + MoE + vision, MTP speculative |
 | **Gemma** | Gemma-4 | `@atlas/gemma-4-26b-a4b-nvfp4` | NVFP4 | Single GB10 | 26B / 4B active MoE with GeGLU |
 | **DeepSeek** | DeepSeek-V4 | `@atlas/deepseek-v4-flash-nvfp4-ep2` | NVFP4 | EP=2 (2 Sparks) | Dual-node Expert Parallelism |
@@ -160,4 +185,4 @@ Browse the interactive recipe browser at [atlasinference.dev/#models](https://at
 - **Community Edition**: Licensed under **AGPLv3**. Free and open for personal use, research, and non-commercial local deployments.
 - **Enterprise Edition**: Commercial licensing for proprietary applications, SaaS hosting without AGPLv3 copyleft obligations, dedicated support, and custom hardware/kernel porting. Contact `debaterishaqui@gmail.com`.
 
-<sub><b>Continuity notice:</b> Atlas is continuing. This repository, the <a href="https://github.com/Atlas-Inf">Atlas-Inf</a> GitHub organization, and <a href="https://atlasinference.dev">atlasinference.dev</a> are the official Atlas channels.</sub>
+<sub><b>Continuity notice.</b> Atlas is continuing. This repository, the <a href="https://github.com/Atlas-Inf">Atlas-Inf</a> GitHub organization, and <a href="https://atlasinference.dev">atlasinference.dev</a> are the replacement official Atlas channels. The existing website and GitHub repository remain disputed Atlas assets that have not been relinquished.</sub>
