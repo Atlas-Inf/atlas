@@ -221,6 +221,10 @@ name = "dense_gemv_bf16_oracle"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "gdn_decode_oracle"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "rope_microtest"
 required-features = ["cuda", "gpu-examples"]
 
