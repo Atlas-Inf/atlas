@@ -160,6 +160,13 @@ MLPerf). Strix Qwen3.8-unsloth baseline on this leg: overall 84.22 /
 normalized 83.68 (run-1788366618469517340.json, 2026-09-02, AzeezStrix,
 preservation recipe - see kernels/strix-hip/qwen3.8-27b/BENCH.toml).
 
+## Strix run policy
+
+The Strix Linux and Windows systems are always-on headless-style benchmark
+hosts. Do not add temperature-triggered aborts or watchdogs that terminate
+benchmarks; thermal data is observability only, and launched runs are expected
+to finish.
+
 ## Code Principles & Agent Workflow
 
 To ensure high code quality, all agents contributing to Atlas must strictly adhere to these core programming principles:

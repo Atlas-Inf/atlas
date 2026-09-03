@@ -4,6 +4,22 @@ Windows AMD is the **native-HIP** path (`ATLAS_TARGET_HW=strix-hip`, hipcc, gfx1
 SCALE — Atlas's other AMD toolchain — is Linux-only, so HIP is the only conceivable
 Windows AMD target.
 
+## Quick start
+
+From PowerShell, with ROCm 10 and Rust/MSVC installed:
+
+```powershell
+$env:HIP_PATH = 'C:\TheRock\10.0.0'
+$env:CARGO_TARGET_DIR = "$PWD\target-rocm10"
+$env:ATLAS_MODEL_DIR = 'C:\path\to\Qwen3.8-27B-NVFP4'
+powershell -ExecutionPolicy Bypass -File scripts\strix-windows\first_run.ps1
+```
+
+That single command checks the toolchain/GPU, repairs Windows symlink checkouts,
+builds, stages runtime DLLs, starts the server, and runs a smoke request. To run
+a packaged build instead, set `ATLAS_BIN` to its `spark.exe` and keep all DLLs
+from the zip beside it; the same command skips compilation.
+
 > **Status: RUNTIME-VERIFIED** on a Framework Desktop (Ryzen AI MAX+ 395 /
 > Radeon 8060S, gfx1151, Windows 11) serving `nvidia/Qwen3.6-27B-NVFP4`,
 > 2026-08-13. Clean build to a served token in ~93 s; BFCL v3 seeded 196-entry
@@ -11,7 +27,18 @@ Windows AMD target.
 > The Linux numbers in [`STRIX_NVFP4_MLPERF.md`](STRIX_NVFP4_MLPERF.md) still do
 > **not** transfer; see "Why the Linux numbers won't reproduce" below.
 
-### Qwen3.8-27B: builds and serves, but the runtime is NOT yet dependable
+### Qwen3.8-27B ROCm 10 candidate (2026-09-03)
+
+The current test stack is ROCm 10.0.0 Core SDK, Adrenalin 26.8.1
+(`32.0.31041.1004`), and Framework BIOS 3.06. The ROCm 10 source build, 11
+kernel oracles, recall/tool smoke, and a 70-sample preservation BFCL diagnostic
+completed successfully; the post-BIOS BFCL run finished all 70 requests without
+the sticky HIP 719 fault seen below. The mirrored K=2 source candidate then
+rebuilt as binary `4af14984…`; its M=2 GEMV, RMSNorm, and GDN device oracles and
+recall/tool smoke pass. The full `agentic_coding_2.5h` durability leg remains
+the long-run gate.
+
+### Historical Qwen3.8 ROCm 6.4/7.2 status
 
 `unsloth/Qwen3.8-27B-NVFP4` was taken end to end on the same box on 2026-08-19:
 95 kernels built (vision included), kernel target resolved as
