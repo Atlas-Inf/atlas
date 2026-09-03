@@ -2,6 +2,8 @@
 
 use atlas_core::target::KernelTarget;
 use super::{ModelBehavior, ModelTypeMatch, SamplingPresets};
+#[allow(unused_imports)]
+use crate::resolve;
 
 /// Drafter configuration for models paired with an speculative proposer.
 #[derive(Debug, Clone)]
