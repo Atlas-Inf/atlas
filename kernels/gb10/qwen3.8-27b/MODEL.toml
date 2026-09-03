@@ -220,13 +220,17 @@ default_kv_dtype = "fp8"
 model_type = "qwen3_5"
 hidden_size = 5120
 
-# ── DFlash: intentionally ABSENT ───────────────────────────────────────────
-# qwen3.6-27b pairs with z-lab/Qwen3.6-27B-DFlash. That drafter was trained
-# on Qwen3.6-27B hidden states (its fc projection consumes target layers
-# [1,16,31,46,61]); Qwen3.8-27B has different weights, so the drafter's
-# inputs would be out-of-distribution — a mismatched drafter degrades to
-# near-zero acceptance and can only slow decode. Add a [dflash] section
-# only when a 3.8-trained drafter exists.
+# ── DFlash2 block-diffusion speculative decoding pairing ─────────────────────
+# Drafter (`incoai/Qwen3.8-27B-DFlash2`) is a 5-layer Qwen3-arch transformer
+# with grouped dynamic causal convolutions and bilinear candidate selector
+# that emits γ=8 tokens per step. The 27B target's hidden_size (5120) determines
+# the drafter's `fc` projection input dimension (5 * 5120 = 25600).
+[dflash]
+draft_model = "incoai/Qwen3.8-27B-DFlash2"
+gamma = 8
+window_size = 4096
+mask_token_id = 248070
+target_layer_ids = [5, 19, 33, 47, 61]
 
 # ── Kernel lookups this model may legitimately fail to resolve ─────────────
 # The compiled kernel set is qwen3.6-27b's (kernel_source above), and the
