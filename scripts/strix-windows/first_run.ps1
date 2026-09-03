@@ -21,7 +21,7 @@
 #
 #        powershell -ExecutionPolicy Bypass -File scripts\strix-windows\first_run.ps1
 #
-# Either way it ends by serving `kristianpaul/Qwen3.8-27B-NVFP4` and firing a smoke
+# Either way it ends by serving `unsloth/Qwen3.8-27B-NVFP4` and firing a smoke
 # request at it, so a successful run prints a real completion.
 #
 # The serve flags and env below are the RUNTIME-VERIFIED config from the
@@ -38,16 +38,12 @@
 #   ATLAS_BIN        prebuilt spark.exe. Set it to skip straight to serving.
 #   ATLAS_REPO       repo root.        Default: the checkout this script lives in.
 #   ATLAS_MODEL_DIR  weights snapshot. Default: $env:USERPROFILE\models\Qwen3.8-27B-NVFP4
-#   ATLAS_MODEL_NAME served model id. Default: derived from ATLAS_MODEL_DIR
-#                    (a Qwen3.8-27B directory serves kristianpaul/Qwen3.8-27B-NVFP4).
+#   ATLAS_MODEL_NAME served model id. Default: unsloth/Qwen3.8-27B-NVFP4.
 #                    This drives kernel-target resolution -- see $ModelName below.
-#   HIP_PATH         HIP SDK root.     Default: newest under C:\Program Files\AMD\ROCm
-#   ATLAS_MAX_SEQ_LEN --max-seq-len. Default 32768, matching serve-amd.sh.
-#   ATLAS_MAX_PREFILL_TOKENS --max-prefill-tokens. Default 2048, matching
-#                    serve-amd.sh. This is the knob that sizes the buffer arena.
-#   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.99 for the Windows pool.
-#                    Lower it when other GPU processes share the pool; the
-#                    validated single-model profile consumes nearly the full budget.
+#   HIP_PATH         ROCm SDK root.    Default: newest under C:\TheRock or C:\Program Files\AMD\ROCm
+#   ATLAS_MAX_SEQ_LEN --max-seq-len. Default 4096, matching the validated gate.
+#   ATLAS_MAX_PREFILL_TOKENS --max-prefill-tokens. Default 2048.
+#   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.70.
 #   ATLAS_PORT       serve port.       Default 8081.
 #   ATLAS_BIND       serve host.       Default 127.0.0.1.
 #
@@ -71,11 +67,9 @@ $RepoRoot = if ($env:ATLAS_REPO) { $env:ATLAS_REPO }
             else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
 $ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
             else { "$env:USERPROFILE\models\Qwen3.8-27B-NVFP4" }
-$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.99' }
-# The validated Qwen3.8 profile keeps 32K sequence capacity while bounding the
-# vision scratch separately below. The corrected BC=32 paged-prefill kernel
-# preserves query rows across chunks, so the 0.99 GB arena can remain at 2048.
-$MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '32768' }
+$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.70' }
+# The validated Qwen3.8 gate uses 4096 context and a 2048-token prefill arena.
+$MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '4096' }
 $MaxPrefill = if ($env:ATLAS_MAX_PREFILL_TOKENS) { $env:ATLAS_MAX_PREFILL_TOKENS } else { '2048' }
 $Port     = if ($env:ATLAS_PORT) { $env:ATLAS_PORT } else { '8081' }
 $BindHost = if ($env:ATLAS_BIND) { $env:ATLAS_BIND } else { '127.0.0.1' }
@@ -84,7 +78,7 @@ $BindHost = if ($env:ATLAS_BIND) { $env:ATLAS_BIND } else { '127.0.0.1' }
 # Qwen3.8-specific, so custom snapshot-directory names must not silently select
 # Qwen3.6; ATLAS_MODEL_NAME remains an explicit override.
 $ModelName = if ($env:ATLAS_MODEL_NAME) { $env:ATLAS_MODEL_NAME }
-             else { 'kristianpaul/Qwen3.8-27B-NVFP4' }
+             else { 'unsloth/Qwen3.8-27B-NVFP4' }
 
 # ATLAS_BIN points at a prebuilt spark.exe (the CI zip). When it is set there is
 # nothing to build, so the binary's own directory takes the place of target/ and
@@ -103,7 +97,11 @@ if ($Prebuilt) {
     if (-not (Test-Path $env:ATLAS_BIN)) { throw "ATLAS_BIN does not exist: $env:ATLAS_BIN" }
     $ReleaseDir = Split-Path (Resolve-Path $env:ATLAS_BIN).Path -Parent
 } else {
-    $ReleaseDir = Join-Path $RepoRoot 'target\x86_64-pc-windows-msvc\release'
+    $TargetRoot = if ($env:CARGO_TARGET_DIR) {
+        if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR }
+        else { Join-Path $RepoRoot $env:CARGO_TARGET_DIR }
+    } else { Join-Path $RepoRoot 'target' }
+    $ReleaseDir = Join-Path $TargetRoot 'x86_64-pc-windows-msvc\release'
 }
 
 $fails = @()
@@ -158,8 +156,18 @@ function Phase-Check {
     }
 
     if (-not $env:HIP_PATH) {
-        $rocm = Get-ChildItem 'C:\Program Files\AMD\ROCm' -Directory -ErrorAction SilentlyContinue |
-                Sort-Object Name -Descending | Select-Object -First 1
+        $rocm = @('C:\Program Files\AMD\ROCm', 'C:\TheRock') |
+                Where-Object { Test-Path $_ } |
+                ForEach-Object { Get-ChildItem $_ -Directory -ErrorAction SilentlyContinue } |
+                Where-Object {
+                    (Test-Path (Join-Path $_.FullName 'bin\hipcc.bin.exe')) -or
+                    (Test-Path (Join-Path $_.FullName 'bin\hipcc.exe'))
+                } |
+                Sort-Object {
+                    $vf = Join-Path $_.FullName '.info\version'
+                    if (Test-Path $vf) { [version](Get-Content $vf -First 1) }
+                    else { try { [version]$_.Name } catch { [version]'0.0' } }
+                } -Descending | Select-Object -First 1
         if ($rocm) { $env:HIP_PATH = $rocm.FullName }
     }
     if ($env:HIP_PATH -and (Test-Path $env:HIP_PATH)) {
@@ -168,7 +176,7 @@ function Phase-Check {
         if (Test-Path $h) { $script:Hipcc = $h; Ok "HIP SDK: $env:HIP_PATH" }
         elseif ($NeedsBuild) { Bad "hipcc not found under $env:HIP_PATH\bin" }
     } elseif ($NeedsBuild) {
-        Bad 'Windows HIP SDK not found under C:\Program Files\AMD\ROCm'
+        Bad 'ROCm SDK not found under C:\TheRock or C:\Program Files\AMD\ROCm'
     }
     # Serving needs no SDK at all -- the runtime DLLs sit beside the exe.
 
@@ -363,7 +371,7 @@ function Phase-Build {
     # discover whatever this SDK actually ships and copy it, then drop the others.
     $hipBin = Join-Path $env:HIP_PATH 'bin'
     $wanted = Get-ChildItem $hipBin -Filter *.dll -EA SilentlyContinue |
-              Where-Object { $_.Name -match '^(amdhip64_\d+|amd_comgr_\d+|hiprtc.*)\.dll$' }
+              Where-Object { $_.Name -match '^(amdhip64(?:_\d+)?|amd_comgr(?:_\d+)?|hiprtc.*)\.dll$' }
     foreach ($f in $wanted) {
         Copy-Item $f.FullName $ReleaseDir -Force
         Ok ("staged {0} ({1:N1} MB)" -f $f.Name, ($f.Length / 1MB))
@@ -379,7 +387,7 @@ function Phase-Build {
     # 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) before writing a single byte to
     # stdout or stderr, and logs no WER entry, so it looks like a corrupt build
     # rather than a missing DLL. Stage them exactly like the SDK runtime DLLs.
-    $shimOut = Get-ChildItem (Join-Path $RepoRoot 'target\x86_64-pc-windows-msvc\release\build') `
+    $shimOut = Get-ChildItem (Join-Path $TargetRoot 'x86_64-pc-windows-msvc\release\build') `
                    -Directory -Filter 'atlas-kernels-*' -EA SilentlyContinue |
                ForEach-Object { Join-Path $_.FullName 'out' } |
                Where-Object { Test-Path (Join-Path $_ 'cuda.dll') } |
@@ -398,7 +406,7 @@ function Phase-Build {
     }
     # Remove runtime DLLs from a DIFFERENT SDK version left over by an earlier build.
     Get-ChildItem $ReleaseDir -Filter *.dll -EA SilentlyContinue |
-        Where-Object { $_.Name -match '^(amdhip64_\d+|amd_comgr_\d+|hiprtc.*)\.dll$' -and
+        Where-Object { $_.Name -match '^(amdhip64(?:_\d+)?|amd_comgr(?:_\d+)?|hiprtc.*)\.dll$' -and
                        $wanted.Name -notcontains $_.Name } |
         ForEach-Object { Remove-Item $_.FullName -Force; Warn ("removed stale {0} from a previous SDK" -f $_.Name) }
 }
@@ -417,16 +425,15 @@ function Phase-Serve {
     Set-Location $ReleaseDir
     $env:PATH = "$ReleaseDir;$env:HIP_PATH\bin;$env:PATH"
 
-    $env:ATLAS_W4A16_DP4A         = '1'
-    $env:ATLAS_FORCE_GLOBAL_GDN   = '1'
-    $env:ATLAS_W4A16_VARIANT      = 'v1'
-    $env:ATLAS_SSM_TAIL_PROTECT   = '1'
-    $env:ATLAS_SSM_TAIL_LEASE_TTL = '128'
-    $env:ATLAS_MTP_GATE_REPROBE   = '64'
+    $env:ATLAS_W4A16_DP4A = '1'
+    $env:ATLAS_W4A16_VARIANT = 'v1'
+    $env:ATLAS_MTP_GATE_REPROBE = '64'
+    $env:ATLAS_FP8_DEQUANT_ATTN_TO_BF16 = '1'
+    $env:ATLAS_FP8_DEQUANT_FFN_TO_BF16 = '1'
+    $env:ATLAS_GDN_BF16_WEIGHTS = '1'
 
-    # Native HIP compile-time disables NVIDIA's FP8 LDMAB path. Radix scalar-
-    # scaled FP8 attention/GDN stays native, and copied QKV/Z sources are
-    # reclaimed after fusion; no runtime precision opt-out is required.
+    # Preserve Qwen3.8's per-row FP8 attention, GDN, and final-eight FFN
+    # projections as BF16; block-scaled FP8 kernels cannot consume row scales.
 
     # 0, NOT the 6 this doc carried before runtime. cuMemGetInfo_v2 now synthesises
     # a truthful free figure from tracked allocations, and that tracker reports
@@ -503,11 +510,11 @@ try {
         '--no-fast-load'
         '--model-name', $ModelName, '--host', $BindHost, '--port', $Port
         '--max-seq-len', $MaxSeqLen, '--max-prefill-tokens', $MaxPrefill
-        '--gpu-memory-utilization', $GpuUtil, '--kv-cache-dtype', 'bf16'
+        '--gpu-memory-utilization', $GpuUtil, '--kv-cache-dtype', 'bf16', '--lm-head-dtype', 'bf16'
         '--max-batch-size', '1', '--vision-max-pixels', '262144'
-        '--speculative', '--num-drafts', '2'
+        '--speculative', '--num-drafts', '1'
         '--mtp-quantization', 'bf16', '--mtp-vocab', '100000'
-        '--disable-tool-grammar', 'true', '--enable-prefix-caching'
+        '--disable-tool-grammar', 'true'
         '--ssm-cache-slots', '0', '--ssm-checkpoint-interval', '16'
         '--disable-thinking'
     )

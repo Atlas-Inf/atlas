@@ -8,7 +8,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $Repo = "C:\Users\azeez\code\atlas-inf-pr9"
-$Bin = "$Repo\target\x86_64-pc-windows-msvc\release\spark.exe"
+$Bin = if ($env:ATLAS_BIN) { $env:ATLAS_BIN } else { "$Repo\target\x86_64-pc-windows-msvc\release\spark.exe" }
 $Log = "C:\Users\azeez\q38-win-smoke.log"
 
 # Frozen preservation env (same as the Linux fingerprint).
