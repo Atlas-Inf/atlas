@@ -155,4 +155,3 @@ impl TransformerModel {
 #[cfg(test)]
 #[path = "impl_b3_accessors_tests.rs"]
 mod identity_transition_tests;
-

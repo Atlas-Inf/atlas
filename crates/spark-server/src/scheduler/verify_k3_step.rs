@@ -18,7 +18,6 @@ const K3_SUMMARY_PERIOD: u64 = 100;
 // without being scored. Verify computes argmax at every position (`v0`, `v1`, `v2`),
 // so `drafts[1] == v1` is observable regardless of `drafts[0] == v0`.
 
-
 #[inline]
 fn k3_record_positional(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
@@ -186,7 +185,9 @@ pub fn step_verify_k3(
         }
     };
     let verify_us = t_verify.elapsed().as_micros();
-    sched.timing.record(crate::scheduler::mtp_timing::Phase::VerifyForward, t_verify);
+    sched
+        .timing
+        .record(crate::scheduler::mtp_timing::Phase::VerifyForward, t_verify);
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax, v2_argmax) = (result_vec[0], result_vec[1], result_vec[2]);
 
@@ -215,7 +216,13 @@ pub fn step_verify_k3(
         )
     };
 
-    let num_accepted = if drafts[0] != v0 { 0 } else if drafts[1] != v1 { 1 } else { 2 };
+    let num_accepted = if drafts[0] != v0 {
+        0
+    } else if drafts[1] != v1 {
+        1
+    } else {
+        2
+    };
 
     // Shadow top-k target line (ATLAS_MTP_SHADOW_TOPK): joins offline with
     // the drafter's SHADOW_TOPK lines — draft i (drafter pos base+i) vs v_i.
@@ -471,7 +478,9 @@ pub fn step_verify_k3(
                 tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
-        sched.timing.record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
+        sched
+            .timing
+            .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
         tracing::debug!(
             "K3 REJECT: verify={verify_us}μs propose={}μs seq_len={}",
             t_propose.elapsed().as_micros(),

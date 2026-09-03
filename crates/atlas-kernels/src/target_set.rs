@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use atlas_core::target::KernelTarget;
 use super::{ModelBehavior, ModelTypeMatch, SamplingPresets};
 #[allow(unused_imports)]
 use crate::resolve;
+use atlas_core::target::KernelTarget;
 
 /// Drafter configuration for models paired with an speculative proposer.
 #[derive(Debug, Clone)]

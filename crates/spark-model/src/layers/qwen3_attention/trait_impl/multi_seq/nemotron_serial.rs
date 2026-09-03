@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use super::super::super::Qwen3AttentionLayer;
+use crate::layer::{ForwardContext, LayerState, TransformerLayer};
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
-use crate::layer::{ForwardContext, LayerState, TransformerLayer};
-use super::super::super::Qwen3AttentionLayer;
 
 pub(super) fn nemotron_attention_serial(rope_disabled: bool, value: Option<&str>) -> bool {
     rope_disabled && matches!(value, Some("1"))
