@@ -748,6 +748,28 @@ pub fn run(
             // dispatch chain actually uses.
             let spec_width_ok = active.len() <= mtp_max_seqs();
             let verify_ctx_limit = model.verify_context_limit();
+            // D-2a latch: a sequence admitted just BELOW the bound gets a
+            // verify step that ingests num_drafts + 1 rows ACROSS it, so the
+            // NEXT verify runs with an ACTIVE QSA selection on the batched
+            // ms path — which refuses it and finishes the request. Decline
+            // MTP for any sequence whose next verify could land at/past the
+            // bound; the `disable_mtp` flag makes the log fire once per
+            // sequence and the serial lane serves active QSA per-seq.
+            for a in active.iter_mut() {
+                if !a.disable_mtp
+                    && verify_ctx_limit.is_some_and(|lim| {
+                        mtp_gate::qsa_latch::crosses_inert_bound(a.seq.seq_len, num_drafts, lim)
+                    })
+                {
+                    a.disable_mtp = true;
+                    tracing::info!(
+                        "mtp declined: qsa_active seq_len={} num_drafts={} lim={}",
+                        a.seq.seq_len,
+                        num_drafts,
+                        verify_ctx_limit.unwrap_or(0),
+                    );
+                }
+            }
             if use_mtp {
                 adaptive_rung::note_width_regime(active.len(), spec_width_ok);
             }

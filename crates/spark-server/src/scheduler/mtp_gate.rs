@@ -555,5 +555,7 @@ impl MtpGate {
     }
 }
 
+pub mod qsa_latch;
+
 #[cfg(test)]
 mod tests;
