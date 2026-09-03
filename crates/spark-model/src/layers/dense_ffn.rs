@@ -223,6 +223,7 @@ pub struct DenseFfnLayer {
     /// broken-indentation pattern).
     bf16_weights: Option<DenseFfnWeightsBf16>,
     dense_gemv_bf16_k: KernelHandle,
+    dense_gemv_bf16_batch2_k: KernelHandle,
     dense_gemm_bf16_k: KernelHandle,
     // Pipelined tensor-core BF16 GEMM (same `gemm` module as the scalar
     // `dense_gemm_bf16`). Preferred by the BF16 prefill arm when present —
@@ -322,6 +323,8 @@ impl DenseFfnLayer {
         // `kernels/gb10/{target}/nvfp4/KERNEL.toml`:
         //   `dense_gemv_bf16 = "gemv"`, `dense_gemm_bf16 = "gemm"`.
         let dense_gemv_bf16_k = super::try_kernel(gpu, "gemv", "dense_gemv_bf16");
+        let dense_gemv_bf16_batch2_k =
+            super::try_kernel(gpu, "dense_gemv_bf16_batch2", "dense_gemv_bf16_batch2");
         let dense_gemm_bf16_k = super::try_kernel(gpu, "gemm", "dense_gemm_bf16");
         let dense_gemm_tc_k = super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc");
         // Same module as the scalar `dense_gemm_bf16`; preferred by the BF16
@@ -399,6 +402,7 @@ impl DenseFfnLayer {
             act_mul,
             bf16_weights: None,
             dense_gemv_bf16_k,
+            dense_gemv_bf16_batch2_k,
             dense_gemm_bf16_k,
             dense_gemm_pipelined_k,
             dense_gemm_tc_k,
@@ -1292,13 +1296,66 @@ impl DenseFfnLayer {
         Ok(())
     }
 
-    /// K=2 speculative: batched GEMV for 2 tokens.
-    /// 3 launches: dual batch2 (gate+up) + silu_mul + batch2 (down).
+    /// K=2 speculative: read-once batched GEMV for two tokens.
+    /// Native BF16 uses separate gate/up batch2 launches; NVFP4 keeps its fused path.
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         // Packed-Q2: NVFP4 fallback weights are NULL, so the NVFP4 batch2 GEMVs
         // below would fault. Route to the keep-packed batchm FFN (m=2).
         if let Some(ref q2w) = self.q2_weights {
             return self.forward_km_q2(q2w, input, ctx, 2, stream);
+        }
+        if native_k2_uses_batch2(
+            self.bf16_weights.is_some(),
+            self.dense_gemv_bf16_batch2_k.0 != 0,
+        ) {
+            let h = ctx.config.hidden_size as u32;
+            let inter = ctx.config.intermediate_size as u32;
+            let weights = self.bf16_weights.as_ref().unwrap();
+            let gate_out = ctx.buffers.expert_gate_out();
+            let up_out = ctx.buffers.expert_up_out();
+            ops::dense_gemv_batch2(
+                ctx.gpu,
+                self.dense_gemv_bf16_batch2_k,
+                input,
+                &weights.gate_proj,
+                gate_out,
+                inter,
+                h,
+                inter,
+                stream,
+            )?;
+            ops::dense_gemv_batch2(
+                ctx.gpu,
+                self.dense_gemv_bf16_batch2_k,
+                input,
+                &weights.up_proj,
+                up_out,
+                inter,
+                h,
+                inter,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                2 * inter,
+                stream,
+            )?;
+            ops::dense_gemv_batch2(
+                ctx.gpu,
+                self.dense_gemv_bf16_batch2_k,
+                gate_out,
+                &weights.down_proj,
+                ctx.buffers.moe_output(),
+                h,
+                inter,
+                h,
+                stream,
+            )?;
+            return Ok(());
         }
         if native_small_batch_uses_prefill(self.bf16_weights.is_some(), self.fp8_weights.is_some())
         {
@@ -1910,9 +1967,7 @@ impl DenseFfnLayer {
                         );
                         timed
                     } else {
-                        ffn_gemm_launch!(
-                            ctx, self, $a, $b, $c, m, $n, $k, stream, tc, pipelined
-                        )
+                        ffn_gemm_launch!(ctx, self, $a, $b, $c, m, $n, $k, stream, tc, pipelined)
                     }
                 };
             }
@@ -2573,6 +2628,10 @@ impl DenseFfnLayer {
     }
 }
 
+fn native_k2_uses_batch2(has_bf16: bool, has_batch2_kernel: bool) -> bool {
+    has_bf16 && has_batch2_kernel
+}
+
 /// Native BF16/FP8 layers do not own usable NVFP4 fallback weights. Their
 /// small-batch path must therefore use the format-aware prefill dispatcher.
 fn native_small_batch_uses_prefill(has_bf16: bool, has_fp8: bool) -> bool {
@@ -2581,7 +2640,15 @@ fn native_small_batch_uses_prefill(has_bf16: bool, has_fp8: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::native_small_batch_uses_prefill;
+    use super::{native_k2_uses_batch2, native_small_batch_uses_prefill};
+
+    #[test]
+    fn bf16_k2_requires_weights_and_the_read_once_kernel() {
+        assert!(native_k2_uses_batch2(true, true));
+        assert!(!native_k2_uses_batch2(true, false));
+        assert!(!native_k2_uses_batch2(false, true));
+        assert!(!native_k2_uses_batch2(false, false));
+    }
 
     #[test]
     fn native_small_batches_never_dispatch_null_nvfp4_placeholders() {

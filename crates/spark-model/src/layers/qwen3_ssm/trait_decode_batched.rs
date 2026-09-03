@@ -37,6 +37,10 @@ fn batched_norm_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_NO_BATCHED_GDN_NORM").is_err())
 }
 
+fn dense_out_proj_uses_batch2(num_tokens: usize) -> bool {
+    num_tokens == 2
+}
+
 /// Row count above which the batched decode/verify GDN projections stop taking
 /// the FP8 PREFILL arm (`fp8_gemm_n128` on the single-scale FP8 copy) and read
 /// the NVFP4 twin through a tile GEMM instead. SSOT for both projections —
@@ -912,17 +916,31 @@ impl Qwen3SsmLayer {
         // ── 9. Output projection → [K, H] ──
         let out_proj_buf = ctx.buffers.moe_output(); // [K, H] BF16
         if let Some(ref dense_out) = self.out_proj_dense {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                normed_out_buf,
-                dense_out,
-                out_proj_buf,
-                k,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )?;
+            if dense_out_proj_uses_batch2(num_tokens) {
+                ops::dense_gemv_batch2(
+                    ctx.gpu,
+                    self.dense_gemv_batch2_k,
+                    normed_out_buf,
+                    dense_out,
+                    out_proj_buf,
+                    h as u32,
+                    value_dim as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm(
+                    ctx.gpu,
+                    self.dense_gemm_k,
+                    normed_out_buf,
+                    dense_out,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            }
         } else if (2..=4).contains(&num_tokens)
             && let Some(ref fp8) = self.out_proj_fp8w
         {
@@ -1277,5 +1295,18 @@ impl Qwen3SsmLayer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dense_out_proj_uses_batch2;
+
+    #[test]
+    fn dense_out_projection_uses_read_once_kernel_only_at_k2() {
+        assert!(!dense_out_proj_uses_batch2(0));
+        assert!(!dense_out_proj_uses_batch2(1));
+        assert!(dense_out_proj_uses_batch2(2));
+        assert!(!dense_out_proj_uses_batch2(3));
     }
 }

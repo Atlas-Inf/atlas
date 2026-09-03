@@ -38,8 +38,9 @@ fn up(g: &dyn GpuBackend, d: &[bf16]) -> Result<DevicePtr> {
     Ok(p)
 }
 
-/// (N, K, label) at the real Qwen3.8-27B decode shapes.
+/// (N, K, label): final-block guard plus real Qwen3.8-27B decode shapes.
 const SHAPES: &[(usize, usize, &str)] = &[
+    (9, 32, "tail_guard"),
     (6144, 5120, "attn_q"),
     (1024, 5120, "attn_k"),
     (1024, 5120, "attn_v"),
@@ -54,7 +55,8 @@ fn main() -> Result<()> {
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
     let kern = g.kernel("gemv", "dense_gemv_bf16")?;
-    println!("dense_gemv_bf16 M=1 oracle — Qwen3.8-27B decode shapes (CPU f32 reference)");
+    let batch2_kern = g.kernel("dense_gemv_bf16_batch2", "dense_gemv_bf16_batch2")?;
+    println!("dense_gemv_bf16 M=1/M=2 oracle — Qwen3.8-27B decode shapes");
 
     let mut rng = Lcg(0x51A7_C0DE);
     let mut all_pass = true;
@@ -126,7 +128,10 @@ fn main() -> Result<()> {
                 (av.abs() as f64).total_cmp(&(bv.abs() as f64))
             })
             .map(|(_, b)| {
-                (bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32().abs() as f64) * 2.0
+                (bf16::from_bits(u16::from_le_bytes([b[0], b[1]]))
+                    .to_f32()
+                    .abs() as f64)
+                    * 2.0
                     / 256.0
             })
             .unwrap_or(0.05);
@@ -137,7 +142,48 @@ fn main() -> Result<()> {
             "{label:>10} N={n:>6} K={k:>6}: cos={cosine:.8} max_abs={max_abs:.3e} mean_rel={mean_rel:.3e} {}",
             if pass { "PASS" } else { "FAIL" }
         );
-        for p in [wd, ad, c] {
+
+        let a1: Vec<bf16> = (0..k).map(|_| bf16::from_f32(rng.r() * 0.5)).collect();
+        let a_batch: Vec<bf16> = a.iter().copied().chain(a1).collect();
+        let a_batch_d = up(g, &a_batch)?;
+        let c_ref = g.alloc(2 * n * 2)?;
+        let c_batch = g.alloc(2 * n * 2)?;
+        g.memset(c_ref, 0xFF, 2 * n * 2)?;
+        g.memset(c_batch, 0xFF, 2 * n * 2)?;
+        let outputs_per_block = if cfg!(atlas_hip) { 8 } else { 4 };
+        for row in 0..2 {
+            KernelLaunch::new(g, kern)
+                .grid([div_ceil(n as u32, outputs_per_block), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(a_batch_d.offset(row * k * 2))
+                .arg_ptr(wd)
+                .arg_ptr(c_ref.offset(row * n * 2))
+                .arg_u32(n as u32)
+                .arg_u32(k as u32)
+                .launch(0)?;
+        }
+        KernelLaunch::new(g, batch2_kern)
+            .grid([div_ceil(n as u32, outputs_per_block), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a_batch_d)
+            .arg_ptr(wd)
+            .arg_ptr(c_batch)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(n as u32)
+            .launch(0)?;
+        g.synchronize(0)?;
+        let mut ref_raw = vec![0u8; 2 * n * 2];
+        let mut batch_raw = vec![0u8; 2 * n * 2];
+        g.copy_d2h(c_ref, &mut ref_raw)?;
+        g.copy_d2h(c_batch, &mut batch_raw)?;
+        let batch2_pass = ref_raw == batch_raw;
+        all_pass &= batch2_pass;
+        println!(
+            "{label:>10} N={n:>6} K={k:>6}: M=2 vs 2x M=1 {}",
+            if batch2_pass { "BIT-IDENTICAL" } else { "FAIL" }
+        );
+        for p in [wd, ad, c, a_batch_d, c_ref, c_batch] {
             let _ = g.free(p);
         }
     }

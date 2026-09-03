@@ -90,6 +90,29 @@ fn launch(
     Ok(())
 }
 
+fn launch_offset_warp(
+    g: &dyn GpuBackend,
+    x: DevicePtr,
+    w: DevicePtr,
+    o: DevicePtr,
+    rows: u32,
+    hidden: u32,
+) -> Result<()> {
+    let k = g.kernel("norm", "rms_norm_offset_warp_row")?;
+    KernelLaunch::new(g, k)
+        .grid([rows.div_ceil(8), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(x)
+        .arg_ptr(w)
+        .arg_ptr(o)
+        .arg_u32(rows)
+        .arg_u32(hidden)
+        .arg_f32(EPS)
+        .launch(0)?;
+    g.synchronize(0)?;
+    Ok(())
+}
+
 /// max |device - truth|, and the max relative error against the truth magnitude.
 fn cmp(dev: &[f64], truth_v: &[f64]) -> (f64, f64) {
     let mut amax = 0.0f64;
@@ -306,6 +329,37 @@ fn main() -> Result<()> {
         fail += 1;
     }
 
+    println!("\n=== V3w — offset warp-row kernel at Qwen3.8 Q/K prefill shapes ===");
+    for rows in [4usize * 823, 24 * 823] {
+        let hidden = 256usize;
+        let mut r = Lcg(rows as u64);
+        let x: Vec<bf16> = (0..rows * hidden)
+            .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
+            .collect();
+        let w: Vec<bf16> = (0..hidden)
+            .map(|_| bf16::from_f32(r.r(-0.5, 0.5) as f32))
+            .collect();
+        let w_eff: Vec<f64> = w.iter().map(|v| 1.0 + v.to_f64()).collect();
+        let xp = ub(g, &x)?;
+        let wp = ub(g, &w)?;
+        let op = g.alloc(rows * hidden * 2)?;
+        launch_offset_warp(g, xp, wp, op, rows as u32, hidden as u32)?;
+        let dev = db(g, op, rows * hidden)?;
+        let truth_v = truth(&x, &w_eff, hidden, rows);
+        let (a, rel) = cmp(&dev, &truth_v);
+        let ok = rel < 0.01;
+        println!(
+            "  rows={rows:>5} hidden={hidden}: max|abs| {a:.3e} max rel {rel:.3e}   {}",
+            if ok { "PASS" } else { "<<< FAIL" }
+        );
+        if !ok {
+            fail += 1;
+        }
+        for p in [xp, wp, op] {
+            g.free(p)?;
+        }
+    }
+
     // ── V1d — OLD vs NEW on device, both scored against F64 truth from the EXACT weight ──
     println!(
         "\n=== V1d — OLD path (1 + bf16(w-1)) vs NEW path (exact w), device, vs F64 truth ==="
@@ -380,6 +434,6 @@ fn main() -> Result<()> {
     if fail > 0 {
         bail!("{fail} failure(s) — READING R1: STOP AND REPAIR. No behavioral eval.");
     }
-    println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V1d).");
+    println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d).");
     Ok(())
 }
