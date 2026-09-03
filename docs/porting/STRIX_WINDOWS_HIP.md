@@ -462,3 +462,13 @@ path BFCL-70 (82.86/78.75, run record
 `C:\Users\azeez\.atlas\runs\bfcl-subset\run-1788342153742063300.json`) stands
 as a stable-path observation, not a gate result — and it usefully proves the
 original 27% disaster was the broken tc serve, not the requant itself.
+
+### Update: the BF16 decode GEMV is exonerated (2026-09-02, later)
+
+`dense_gemv_bf16_oracle` (the M=1 decode GEMV at all eight Qwen3.8 decode
+shapes vs an f32 CPU reference) was run on Windows HIP after the bisection
+above: **PASS, bit-exact-class** — mean_rel <= 1.2e-5, cos >= 0.99999999,
+identical to the Linux result (`scripts/strix-windows/win_gemv_oracle.ps1`).
+The Windows suspect set shrinks to the still-uncovered decode kernels: the
+GDN decode recurrence (`mamba2_ssm_decode`), paged decode attention
+(`paged_decode_attn`), and the SSM snapshot/rollback ring.
