@@ -154,6 +154,11 @@ pub struct ModelConfig {
     /// than as a real bound.
     #[serde(skip)]
     pub max_batch_tokens: usize,
+    /// Served context length, prompt + generation; the serve layer sets it
+    /// from `--max-seq-len`. Like `max_batch_tokens`, this is a serve-time
+    /// value: `skip`, and 0 means "no serve set this".
+    #[serde(skip)]
+    pub max_seq_len: usize,
     /// When `skip_lm_head_quantization()` == false, quantize the LM head to FP8
     /// (E4M3, per-row scales, decoded via `w8a16_gemv`) instead of NVFP4.
     /// Set by `--lm-head-dtype fp8`. Additive: leaves the NVFP4/BF16 paths

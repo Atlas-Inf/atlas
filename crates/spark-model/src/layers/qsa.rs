@@ -116,6 +116,7 @@ impl QsaIndexer {
         hd: usize,
         ratio: usize,
         budget: usize,
+        max_seq_len: usize,
         rot: usize,
         theta: f32,
         eps: f32,
@@ -128,10 +129,32 @@ impl QsaIndexer {
             ratio > 0 && budget.is_multiple_of(ratio),
             "QSA: budget % ratio != 0"
         );
-        let max_tokens: usize = std::env::var("ATLAS_QSA_MAX_TOKENS")
+        // Capacity derives from the served context; ATLAS_QSA_MAX_TOKENS can
+        // only raise it, never below `max_seq_len` (that is what killed decode
+        // at 32768 on a --max-seq-len 65536 serve).
+        let env_max = std::env::var("ATLAS_QSA_MAX_TOKENS")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32768);
+            .and_then(|v| v.parse::<usize>().ok());
+        // A config built outside `serve` carries 0; keep the historical
+        // capacity there rather than allocating a zero-token indexer.
+        let max_seq_len = if max_seq_len == 0 { 32768 } else { max_seq_len };
+        let max_tokens: usize = match env_max {
+            Some(n) if n < max_seq_len => {
+                tracing::warn!(
+                    "QSA: ATLAS_QSA_MAX_TOKENS={n} < max_seq_len={max_seq_len}, clamped up"
+                );
+                max_seq_len
+            }
+            Some(n) => n,
+            None => max_seq_len,
+        };
+        let per_seq_bytes = max_tokens * hd * 2 + max_tokens / ratio * hd * 2;
+        tracing::info!(
+            "QSA: indexer capacity {} tokens (max_seq_len={}, per-seq {} B)",
+            max_tokens,
+            max_seq_len,
+            per_seq_bytes
+        );
         let block_topk = budget / ratio;
         let qk_width = (n_heads + 1) * hd;
         let sel_cap = budget + ratio;
@@ -207,7 +230,8 @@ impl QsaIndexer {
         );
         anyhow::ensure!(
             seq_start + num_tokens <= self.max_tokens,
-            "QSA: {} tokens exceeds ATLAS_QSA_MAX_TOKENS={}",
+            "QSA: {} tokens exceeds the indexer capacity {} — it derives \
+             from --max-seq-len (ATLAS_QSA_MAX_TOKENS overrides)",
             seq_start + num_tokens,
             self.max_tokens
         );
@@ -296,7 +320,9 @@ impl QsaIndexer {
         );
         anyhow::ensure!(
             pos < self.max_tokens,
-            "QSA: pos {pos} >= ATLAS_QSA_MAX_TOKENS"
+            "QSA: pos {pos} >= indexer capacity {} — it derives from \
+             --max-seq-len (ATLAS_QSA_MAX_TOKENS overrides)",
+            self.max_tokens
         );
 
         let hd = self.hd as usize;
