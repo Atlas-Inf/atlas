@@ -205,7 +205,14 @@ impl Qwen3AttentionLayer {
                 gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla_warp_row")
                     .unwrap_or(KernelHandle(0))
             } else {
-                KernelHandle(0)
+                // Offset-convention models (Qwen3.5/3.6/3.8): the warp_row
+                // structure from the vanilla module, applied to the (1 + w)
+                // scaling this module's block kernel implements. The
+                // block-per-row kernel runs ~43x above its bandwidth floor on
+                // the short-row Q/K norm shapes (head_dim 128-256, num_rows
+                // = heads × seq_len), which measured 52 ms/layer on Strix.
+                gpu.kernel("norm", "rms_norm_offset_warp_row")
+                    .unwrap_or(KernelHandle(0))
             },
             norm_vanilla: crate::ships_vanilla_norm_weights(config),
             rms_norm_residual_k: if crate::ships_vanilla_norm_weights(config) {
