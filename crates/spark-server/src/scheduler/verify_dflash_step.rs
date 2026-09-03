@@ -37,6 +37,7 @@ pub fn step_verify_dflash(
 ) {
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
@@ -56,6 +57,7 @@ pub fn step_verify_dflash(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("decode_verify_dflash: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -201,6 +203,7 @@ pub fn step_verify_dflash(
     let total_accepted = num_accepted + 1; // bonus is always "accepted"
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
         tracing::error!("commit_accepted_prefix (dflash): {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
