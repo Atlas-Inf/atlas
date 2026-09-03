@@ -168,6 +168,12 @@ impl Qwen3AttentionLayer {
         if let Some(t) = tp0 {
             crate::layers::qwen3_attention::add_attn_phase_us(0, t.elapsed().as_micros() as u64);
         }
+        t0 = if ctx.profile {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let tp1 = ht.then(std::time::Instant::now);
 
         // ── 4+5. Deinterleave Q/Gate + per-head Q/K RMS norms ──
