@@ -407,6 +407,30 @@ pub fn run(
 
     let mut snapshot_steps: u64 = 0;
     loop {
+        // ── Latched GPU fault: stop scheduling, NOW ──
+        // A destroyed CUDA context is not a per-request failure: every later
+        // driver call in this process returns the same sticky status, so
+        // continuing to loop only produced hours of 500s with the port open
+        // and ~100 GB held (D-4 aftermath — the latch fired, the 503s and the
+        // exit path in `main.rs` were both correct, and this loop never gave
+        // control back to them). Mark every in-flight sequence an engine error
+        // and break: the drain below the loop finishes them with reason
+        // "error" and releases the model, and `main.rs` exits
+        // `EXIT_GPU_FAULT` off the same latch.
+        if let Some(reason) = atlas_core::fault::global().fault() {
+            tracing::error!(
+                "GPU fault latched — scheduler stopping: {reason}; \
+                 finishing {} active sequence(s) with an engine error",
+                active.len()
+            );
+            for a in active.iter_mut() {
+                if a.engine_error.is_none() {
+                    a.engine_error = Some(format!("gpu_fault: {reason}"));
+                }
+                a.finished = true;
+            }
+            break;
+        }
         // ── Drain pending → start prefill (chunked or full) ──
         // The `t_loop_*` brackets attribute the out-of-step GAP the
         // ATLAS_MTP_TIMING summary reports (see mtp_timing::Phase::Gap): each
