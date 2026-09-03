@@ -44,6 +44,9 @@ impl ChatTokenizer {
         eos_token_id: u32,
         supports_thinking: bool,
         model_type: &str,
+        // MODEL.toml `[behavior].jinja_template`; empty = derive from
+        // `model_type`.
+        template_override: &str,
         repo_root: Option<&Path>,
         disable_template_overrides: bool,
     ) -> Result<Self> {
@@ -81,14 +84,16 @@ impl ChatTokenizer {
         // behaviors).
         //
         // Priority (high → low):
-        //   1. jinja-templates/{model_type}.jinja override
+        //   1. jinja-templates/<template> override, where <template> is
+        //      MODEL.toml [behavior].jinja_template when set and
+        //      {model_type}.jinja otherwise
         //      (opt-in: file present AND overrides not disabled)
         //   2. tokenizer_config.json / chat_template.jinja (the MODEL's own)
         //   3. Default ChatML fallback
         let override_tmpl = if disable_template_overrides {
             None
         } else {
-            super::jinja_helpers::load_override_template(model_type, repo_root)
+            super::jinja_helpers::load_override_template(model_type, template_override, repo_root)
         };
         let chat_template = if let Some(override_tmpl) = override_tmpl {
             override_tmpl

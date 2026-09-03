@@ -130,6 +130,7 @@ sxl = "sxl"
 # and the alternative is writing "PNG files" everywhere to appease a splitter.
 PNGs = "PNGs"
 # Pattern compounds the checker doesn't handle via the default list.
+setp = "setp"
 wht_bf16 = "wht_bf16"
 wht_dim = "wht_dim"
 wht_stride = "wht_stride"
@@ -158,4 +159,8 @@ extend-exclude = [
     # Campaign raw artifacts: verbatim model output (logit dumps whose top-k
     # entries include subword fragments like ` summar`, ` repet`). Data, not prose.
     "docs/campaigns/*/raw/",
+    # Published sanitized server logs contain opaque PTX hashes and verbatim
+    # benchmark/model fragments. They are checksummed data, not prose; changing
+    # those bytes to satisfy a spell checker would corrupt the evidence record.
+    "evidence/**/SERVER-SANITIZED.log",
 ]

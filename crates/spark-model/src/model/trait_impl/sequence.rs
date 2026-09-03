@@ -308,10 +308,16 @@ impl TransformerModel {
         }
 
         // Free proposer state (KV cache blocks + per-seq device buffers).
+        // NOTE: no pre-validation here — the proposer's `free_state` owns
+        // terminal owner validation (ownership-only, so a same-owner second
+        // cleanup is the documented idempotent success) AND the transactional
+        // reclaim-on-validation-failure path. A pre-check here would bypass
+        // the reclaim seam and leak state-owned resources on owner mismatch.
+        let expected_owner = seq.dspark_owner;
         if let Some(ref proposer) = self.proposer
             && let Some(ref mut pstate) = seq.proposer_state
         {
-            proposer.free_state(self.gpu.as_ref(), pstate.as_mut())?;
+            proposer.free_state(self.gpu.as_ref(), expected_owner, pstate.as_mut())?;
         }
 
         self.free_chunked_prefill_meta(seq)?;

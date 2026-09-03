@@ -1,0 +1,95 @@
+[model]
+name = "nemotron-3.5-lightning-30b-a3b"
+hf_id = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+model_type = "nemotron_h"
+architecture = "hybrid_mamba2_moe_attention_mtp"
+parameters = "30B"
+active_parameters = "3B"
+# REQUIRED disambiguation against nemotron-3-nano-30b-a3b, which declares
+# the same (nemotron_h, hidden 2688) pair. Lightning deliberately reuses
+# Nano's hidden-2688 SM121 kernel shadow; only the needles separate them.
+match_names = ["nemotron-3.5-lightning", "lightning-30b"]
+
+[[model_types]]
+model_type = "nemotron_h"
+hidden_size = 2688
+# Lightning adds num_nextn_predict_layers=1 and mtp.* tensors.
+# Same 2688 hidden as Nano so Nano SM121 kernels bind.
+
+[sampling.thinking_text]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.tools]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[behavior]
+use_sampling_presets_for_core = true
+thinking_in_tools = true
+max_thinking_budget = 8192
+# Official Lightning template defaults enable_thinking=true. Thinking-off
+# emits empty <think></think> and this checkpoint then copies the first
+# operand (7+5 → 7). Thinking-on ChatML math is correct (12).
+thinking_default = true
+cap_thinking_at_max_tokens = false
+default_system_prompt = "You are a helpful assistant."
+jinja_template = "nemotron_lightning.jinja"
+rollback_resteer = false
+default_num_drafts = 1
+
+# Official Lightning DSpark (Qwen3DSpark, 6-layer, Markov-only).
+# Weights stay on the host; pass --dflash --draft-model <local-or-hf>.
+[dflash]
+draft_model = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark"
+gamma = 4
+window_size = 1024
+mask_token_id = 990
+target_layer_ids = [1, 5, 19, 29, 41, 51]
+
+# Try-kernel probes legitimately absent from the inherited hidden-2688 kernel
+# shadow. Every entry names the exercised fallback; the startup kernel gate
+# remains fail-closed for any undeclared lookup.
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = "3-deep pipeline twin is absent; qwen3_attention::tgemm_kernel falls back to inherited w4a16_gemm_t."
+w4a16_gemm_t_k64_p3 = "3-deep k64 twin is absent; qwen3_attention::k64_kernel falls back to inherited w4a16_gemm_t_k64."
+w4a16_gemm_t_k64_n64_p3 = "Narrow-N probe is optional; dispatch checks the zero handle before use."
+w4a16_gemm_t_m128_bf16 = "BF16 prefill twin is optional; prefill weights fall back through the inherited w4a16 path."
+fp8_gemm_t_m128_mfast = "Optional Mamba FP8 mfast twin; dispatch gates the handle and uses the resolved BF16-A FP8 fallback."
+fp8_fp8_gemm_t_m128_mfast = "Optional pre-cast-A Mamba twin; dispatch falls back to the resolved BF16-A FP8 path."
+fp8_gemm_t_row_scaled = "Optional FP8 drafter probe; Lightning DSpark uses BF16 drafter weights when this handle is absent."
+fp8_gemm_t_row_scaled_m16 = "Optional small-M FP8 drafter twin; Lightning DSpark uses the BF16 drafter path."
+
+[expected_absent.w4a4]
+w4a4_gemm_mfast = "Puzzle-only W4A4 optimization; Nemotron Mamba dispatch falls back to the resolved base w4a4_gemm."
+
+[expected_absent.moe_w4a16]
+moe_w4a16_grouped_gemm_ptrtable_relu2 = "Optional fused ReLU2 grouped prefill; dispatch falls back to the resolved base ptrtable grouped GEMM."
+
+[expected_absent.moe_w4a4]
+moe_w4a4_grouped_gemm_relu2 = "Puzzle-only W4A4 fused MoE probe; dispatch gates the handle and uses Lightning's W4A16 MoE path."

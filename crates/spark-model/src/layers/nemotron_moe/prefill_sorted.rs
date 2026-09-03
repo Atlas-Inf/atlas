@@ -176,7 +176,7 @@ impl NemotronMoeLayer {
                 stream,
             )?;
         } else if let Some(ref upt) = self.up_ptrs_t {
-            ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+            ops::moe_w4a16_grouped_gemm_ptrtable_64(
                 ctx.gpu,
                 self.moe_grouped_gemm_n128_k,
                 expert_input,
@@ -204,7 +204,7 @@ impl NemotronMoeLayer {
             // relu^2 fused into the UP GEMM's store when the epilogue variant is
             // compiled -- saves a full read+write of expert_up_out.
             let fused = self.moe_grouped_gemm_relu2_k.0 != 0;
-            ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+            ops::moe_w4a16_grouped_gemm_ptrtable_64(
                 ctx.gpu,
                 if fused {
                     self.moe_grouped_gemm_relu2_k
@@ -246,7 +246,7 @@ impl NemotronMoeLayer {
             )?;
         }
         if let Some(ref dpt) = self.down_ptrs_t {
-            ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+            ops::moe_w4a16_grouped_gemm_ptrtable_64(
                 ctx.gpu,
                 self.moe_grouped_gemm_n128_k,
                 expert_up_out,
@@ -263,7 +263,7 @@ impl NemotronMoeLayer {
                 stream,
             )?;
         } else {
-            ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+            ops::moe_w4a16_grouped_gemm_ptrtable_64(
                 ctx.gpu,
                 self.moe_grouped_gemm_k,
                 expert_up_out,

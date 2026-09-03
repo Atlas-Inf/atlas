@@ -72,6 +72,12 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
         .map(|(x, y)| (x - y).abs())
         .fold(0.0, f32::max)
 }
+fn mismatch_count(a: &[f32], b: &[f32]) -> usize {
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
+}
 
 fn launch_m1(
     g: &dyn GpuBackend,
@@ -154,10 +160,11 @@ fn main() -> Result<()> {
         for t in 0..m {
             worst = worst.min(cos(&cb[t * N..(t + 1) * N], &cr[t * N..(t + 1) * N]));
         }
-        let pass = worst > 0.99999;
+        let mismatches = mismatch_count(&cb, &cr);
+        let pass = mismatches == 0;
         all_pass &= pass;
         println!(
-            "{name} M={m:2}: worst_cos={worst:.9} max_abs={:.6} {}",
+            "{name} M={m:2}: mismatches={mismatches} worst_cos={worst:.9} max_abs={:.6} {}",
             max_abs(&cb, &cr),
             if pass { "PASS" } else { "FAIL" }
         );

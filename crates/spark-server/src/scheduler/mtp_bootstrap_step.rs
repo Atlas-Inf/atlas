@@ -301,6 +301,7 @@ pub(super) fn step_mtp_bootstrap_batched(
     // per-position and the batched path is grammarless by contract). ──
     if stash_ok {
         let group_cap = model.mtp_propose_batch_max().max(1);
+        let group_min = model.mtp_propose_batch_min().max(1);
         let batchable: Vec<usize> = (0..proposing.len())
             .filter(|&s| {
                 let a = &refs[proposing[s]];
@@ -314,9 +315,9 @@ pub(super) fn step_mtp_bootstrap_batched(
         // default path keeps the plain batched argmax and its narrower D2H.
         let want_conf = crate::scheduler::mtp_dcut::dcut_enabled();
         let mut conf: Vec<Vec<f32>> = Vec::new();
-        if group_cap >= 2 && ladder_nd >= 1 {
+        if group_cap >= group_min && ladder_nd >= 1 {
             for group in batchable.chunks(group_cap) {
-                if group.len() < 2 {
+                if group.len() < group_min {
                     continue;
                 }
                 let tokens: Vec<u32> = group

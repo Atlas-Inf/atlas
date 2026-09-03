@@ -108,6 +108,7 @@ impl DraftProposer for MultiModuleMtpHead {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         ctx: &ForwardContext,
         stream: u64,
         draft_embed_target: Option<DevicePtr>,
@@ -184,6 +185,7 @@ impl DraftProposer for MultiModuleMtpHead {
     fn after_verify(
         &self,
         num_accepted: usize,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         state: &mut dyn ProposerState,
         stream: u64,
     ) -> Result<()> {
@@ -214,7 +216,12 @@ impl DraftProposer for MultiModuleMtpHead {
         Ok(())
     }
 
-    fn free_state(&self, _gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+    fn free_state(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
+        state: &mut dyn ProposerState,
+    ) -> Result<()> {
         let mm_state = state
             .as_any_mut()
             .downcast_mut::<MultiModuleMtpState>()

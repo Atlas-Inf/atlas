@@ -19,6 +19,16 @@ use crate::weight_loader::{
     Qwen35WeightLoader, Step3p7WeightLoader,
 };
 
+mod dspark_admission;
+#[allow(unused_imports)]
+pub(crate) use dspark_admission::{
+    admit_lightning_dspark, admit_lightning_dspark_build, admit_lightning_dspark_product_build,
+};
+#[cfg(test)]
+mod dspark_admission_tests;
+#[cfg(test)]
+mod dspark_product_admission_tests;
+
 /// DFlash speculative-decoding build arguments. `None` for non-DFlash runs;
 /// `Some(...)` carries the drafter's separate [`WeightStore`], parsed
 /// `config.json`, and CLI overrides for γ and the sliding-window size.

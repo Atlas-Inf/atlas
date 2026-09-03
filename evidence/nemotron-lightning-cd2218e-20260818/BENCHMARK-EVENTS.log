@@ -1,0 +1,9 @@
+=== lane latency ===
+{"lane": "latency", "status": "PASS", "infra_errors": 0}
+=== lane concurrency ===
+{"lane": "concurrency", "status": "PASS", "infra_errors": 0}
+=== lane throughput ===
+{"lane": "throughput", "status": "PASS", "infra_errors": 0}
+=== lane gsm8k ===
+{"lane": "gsm8k", "status": "PASS", "infra_errors": 0}
+report: r0b0bench/requested-metrics-20260818T210217Z/report.json

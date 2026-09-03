@@ -255,9 +255,10 @@ pub(super) fn step_verify_k4_batched(
     let want_conf = crate::scheduler::mtp_dcut::dcut_enabled();
     let mut conf: Vec<Vec<f32>> = Vec::new();
     let group_cap = model.mtp_propose_batch_max().max(1);
-    if pending.len() >= 2 && group_cap >= 2 && !batch_propose_disabled() {
+    let group_min = model.mtp_propose_batch_min().max(1);
+    if pending.len() >= group_min && group_cap >= group_min && !batch_propose_disabled() {
         for group in pending.chunks(group_cap) {
-            if group.len() < 2 {
+            if group.len() < group_min {
                 need_fallback.extend_from_slice(group);
                 continue;
             }

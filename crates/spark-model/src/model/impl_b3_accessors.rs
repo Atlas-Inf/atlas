@@ -7,7 +7,51 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 
 use super::types::TransformerModel;
+use crate::layers::dflash_head::{LightningDsparkProductPolicy, LightningStructuralGraphState};
 use crate::speculative::DraftProposer;
+
+/// Immutable view of exactly the structural fields the Lightning product
+/// setter gates on. Production `TransformerModel` implements it by reading
+/// its real fields; the identity-transition tests implement it with the
+/// same three-field harness. The install seam below is shared, so both
+/// run the identical gate-and-install sequence.
+pub(super) trait LightningStructuralView {
+    fn lightning_structural_graph_state(&self) -> LightningStructuralGraphState;
+}
+
+impl LightningStructuralView for TransformerModel {
+    fn lightning_structural_graph_state(&self) -> LightningStructuralGraphState {
+        LightningStructuralGraphState {
+            target_suppress_graphs: self
+                .suppress_graphs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            lora_installed: self.lora.is_some(),
+            distributed_topology: self.comm.is_some(),
+        }
+    }
+}
+
+/// Production-owned Lightning install seam: gate on the structural state,
+/// then install proposer + identity. `TransformerModel::
+/// set_lightning_dspark_proposer` delegates its entire body here, and the
+/// identity-transition tests call this same function — removing the gate
+/// call from the production path fails those tests identically.
+pub(super) fn install_lightning_proposer(
+    structural: LightningStructuralGraphState,
+    proposer_slot: &mut Option<std::sync::Arc<dyn DraftProposer>>,
+    identity: &mut crate::layers::dflash_head::LightningDsparkIdentityLatch,
+    levers: &mut crate::layers::ops::ModelLevers,
+    proposer: std::sync::Arc<dyn DraftProposer>,
+    policy: LightningDsparkProductPolicy,
+) -> anyhow::Result<()> {
+    crate::layers::dflash_head::enforce_lightning_structural_gate(structural)
+        .map_err(anyhow::Error::from)?;
+    *proposer_slot = Some(proposer);
+    levers.lightning_mamba_exact_recurrence = true;
+    levers.lightning_mamba_scalar_in_proj = true;
+    identity.install_lightning(policy);
+    Ok(())
+}
 
 impl TransformerModel {
     /// Borrow the GPU backend for post-construction wiring (e.g. installing
@@ -38,6 +82,37 @@ impl TransformerModel {
             tracing::info!("DFlash: replacing existing MTP proposer with BlockDiffusionDraftHead");
         }
         self.proposer = Some(proposer);
+        self.levers.lightning_mamba_exact_recurrence = false;
+        self.levers.lightning_mamba_scalar_in_proj = false;
+        self.lightning_dspark_identity.install_generic();
+    }
+
+    /// Atomically install the admitted official Lightning proposer and its
+    /// immutable startup policy. Generic DFlash and MTP must use
+    /// [`Self::set_dflash_proposer`] and therefore remain non-product.
+    ///
+    /// Fails closed when the constructed target is structurally eager
+    /// (graph suppression, LoRA, or a distributed topology): an admitted
+    /// policy must never claim product graph eligibility the runtime
+    /// cannot honor.
+    pub fn set_lightning_dspark_proposer(
+        &mut self,
+        proposer: std::sync::Arc<dyn DraftProposer>,
+        policy: LightningDsparkProductPolicy,
+    ) -> anyhow::Result<()> {
+        // The entire body is one delegation to the production-owned,
+        // directly-tested install seam: deleting the structural gate (or
+        // the gated read) anywhere on this path fails
+        // `identity_transition_tests`.
+        let structural = LightningStructuralView::lightning_structural_graph_state(self);
+        install_lightning_proposer(
+            structural,
+            &mut self.proposer,
+            &mut self.lightning_dspark_identity,
+            &mut self.levers,
+            proposer,
+            policy,
+        )
     }
 
     /// Install the fused n-gram input embedding (LongCat family). Once set,
@@ -76,3 +151,7 @@ impl TransformerModel {
         self.layers.iter().any(|l| l.uses_local_mla_prefill())
     }
 }
+
+#[cfg(test)]
+#[path = "impl_b3_accessors_tests.rs"]
+mod identity_transition_tests;
