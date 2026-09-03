@@ -1,4 +1,4 @@
-<p align="center">
+ g<p align="center">
   <img src="assets/logo.svg" alt="Atlas Inference Engine" width="640" />
 </p>
 <p align="center">
@@ -97,7 +97,7 @@ sparkrun run @atlas/qwen3.8-flash-next-nvfp4 --hosts localhost
 
 ### 4. AMD Strix Halo (gfx1151) Quick Start
 
-Atlas runs identical CUDA sources natively on AMD RDNA 3.5 via **SCALE by Spectral Compute** (no HIP port, no duplicate kernel tree). Bring-up is active across two dedicated branches:
+Atlas converts CUDA sources natively to AMD RDNA 3.5. Bring-up is active across two dedicated branches:
 
 - **Linux Leg (Ubuntu 24.04 / ROCm 6.2+)**: Branch [`port/qwen3.8-strix-linux`](https://github.com/Atlas-Inf/atlas/tree/port/qwen3.8-strix-linux) ([PR #8](https://github.com/Atlas-Inf/atlas/pull/8))
 - **Windows Leg (DirectX 12 / native MSVC)**: Branch [`port/qwen3.8-windows`](https://github.com/Atlas-Inf/atlas/tree/port/qwen3.8-windows) ([PR #9](https://github.com/Atlas-Inf/atlas/pull/9))
