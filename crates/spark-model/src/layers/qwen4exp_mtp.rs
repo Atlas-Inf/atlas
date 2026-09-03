@@ -233,6 +233,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         ctx: &ForwardContext,
         stream: u64,
         _draft_embed_target: Option<DevicePtr>,
@@ -274,6 +275,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
     fn after_verify(
         &self,
         num_accepted: usize,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         state: &mut dyn ProposerState,
         _stream: u64,
     ) -> Result<()> {

@@ -8,7 +8,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::Qwen3AttentionLayer;
-use crate::layer::{ForwardContext, LayerState, TransformerLayer};
+use crate::layer::{ForwardContext, LayerState};
 use crate::layers::ops;
 
 mod attn;
@@ -18,8 +18,6 @@ mod mla;
 mod mla_gemv;
 mod nemotron_serial;
 mod qkv;
-
-use nemotron_serial::nemotron_attention_serial;
 
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
