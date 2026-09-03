@@ -183,8 +183,18 @@ impl TransformerModel {
         // main head (NVFP4 default) or the draft-only head built when the main
         // head is BF16. `draft_lm_head_nvfp4` resolves to whichever is present.
         let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
+        // qwen4_exp installs its MTP proposer AFTER construction (its module is
+        // a reused trunk layer, not the Qwen-shaped `MtpWeights`), so
+        // `mtp_weights` is empty here even though drafting WILL run. Its 36 GDN
+        // layers still need the verify/checkpoint pools: without them the very
+        // first draft indexes `conv_intermediate_pools[0]` on a zero-length
+        // Vec and panics. DeepSeek-V4 reaches the proposer the same way but has
+        // no SSM layers, so it never exercised this. Its draft head is BF16
+        // dense, hence no `draft_lm_head_nvfp4` requirement.
+        let external_mtp_module = use_speculative && config.model_type == "qwen4_exp";
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights.is_empty() && draft_lm_head_nvfp4.is_some())
+            || external_mtp_module
             || dflash_kgamma > 0;
         let num_intermediates = if has_mtp {
             (num_drafts + 1).max(dflash_kgamma)
@@ -388,6 +398,21 @@ impl TransformerModel {
         // is ~168 KB.
         let verify_hidden_stash =
             gpu.alloc(crate::layer::VERIFY_WY_TABLE_SEQS * config.hidden_size * 2)?;
+        // Stream-highway twin of the stash above, for a drafter whose input
+        // is the pre-mixer residual rather than the collapsed hidden
+        // (qwen4_exp). `hc_streams` is [M, hc, H] FP32, so one slot is hc*H*4.
+        let hc_for_stash = config.hc_mult.max(config.hc_count);
+        // `has_mtp`, not `proposer.is_some()`: qwen4_exp's proposer is installed
+        // after construction, so the latter is false exactly where this matters.
+        let verify_stream_stash = if has_mtp && hc_for_stash > 0 {
+            gpu.alloc(crate::layer::VERIFY_WY_TABLE_SEQS * hc_for_stash * config.hidden_size * 4)?
+        } else {
+            DevicePtr::NULL
+        };
+        // Batched-verify WY pointer-table staging (fixed address for CUDA
+        // graph stability; contents refreshed pre-graph every batched verify
+        // step). One [h|Hi0|Hi1|Hi2] x 4-entry slice per GDN layer — ~6 KB.
+        // Allocated when SSM layers are present; DSpark attaches post-construct.
         let verify_wy_tables = if config.num_ssm_layers() > 0 {
             let bytes = config.num_ssm_layers() * crate::layer::VERIFY_WY_LAYER_STRIDE_BYTES;
             let buf = gpu.alloc(bytes)?;
@@ -710,6 +735,7 @@ impl TransformerModel {
                 }
             }),
             embed_tokens,
+            ngram_embed: None,
             final_norm,
             lm_head_weight,
             lm_head_nvfp4,
@@ -768,6 +794,7 @@ impl TransformerModel {
             lightning_dspark_identity: Default::default(),
             mtp_hidden_save,
             verify_hidden_stash,
+            verify_stream_stash,
             mtp_catchup_ring,
             mtp_catchup_meta: parking_lot::Mutex::new((0, 0)),
             mtp_prefill_hidden,

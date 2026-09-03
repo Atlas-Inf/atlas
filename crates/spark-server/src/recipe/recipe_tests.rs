@@ -39,8 +39,8 @@ fn all() -> Vec<Recipe> {
 #[test]
 fn the_whole_corpus_reads() {
     let all = all();
-    assert_eq!(all.len(), 25);
-    assert_eq!(all.iter().filter(|r| r.is_atlas()).count(), 23);
+    assert_eq!(all.len(), 26);
+    assert_eq!(all.iter().filter(|r| r.is_atlas()).count(), 24);
     assert_eq!(
         all.iter().filter(|r| r.version == "1").count(),
         2,
@@ -82,7 +82,58 @@ fn every_atlas_recipe_produces_a_valid_serve_config() {
             .unwrap_or_else(|e| panic!("{}: {e:#}", r.id));
         checked += 1;
     }
-    assert_eq!(checked, 23);
+    assert_eq!(checked, 24);
+}
+
+/// The qwen4_exp recipe's settings are DECISIONS, and a key Atlas has no flag
+/// for is accepted by `serve_args` and then ignored. So the census test above
+/// ("it produces a valid config") is not enough for this one: each value has a
+/// reason, and this asserts each one actually ARRIVES.
+///
+/// * `kv_cache_dtype: bf16` — the checkpoint ships no `k_scale`/`v_scale`, so
+///   bare fp8 KV clips to E4M3 [-448, 448].
+/// * `max_seq_len: 8192` — above this the engine chunks at 8193 and
+///   `ATLAS_PLE_MAX_TOKENS` must clear it, which the serve script handles.
+/// * `enable_prefix_caching` — correct only because the PLE/QSA aux rides the
+///   SSM snapshots; a prefix hit would otherwise hash the PREVIOUS request's
+///   n-gram history into the highway.
+/// * `speculative` off — MTP WORKS on this target and at `--num-drafts 1` is a
+///   measured +18% at C=1 (2026-08-28), but −21% at C=2, and a recipe carries
+///   one setting for every concurrency. Operators wanting the C=1 win pass
+///   `--speculative --num-drafts 1` and leave the throughput gate armed.
+#[test]
+fn the_qwen4_exp_recipe_lands_the_settings_it_documents() {
+    let all = all();
+    let r = all
+        .iter()
+        .find(|r| r.id.contains("qwen3.8-flash-next"))
+        .expect("the qwen3.8-flash-next recipe is vendored");
+    let args = r
+        .serve_args(&BTreeMap::new())
+        .unwrap_or_else(|e| panic!("{}: {e:#}", r.id));
+
+    assert_eq!(
+        args.kv_cache_dtype.as_deref(),
+        Some("bf16"),
+        "KV must be bf16"
+    );
+    assert_eq!(args.max_seq_len, 8192);
+    assert!(args.enable_prefix_caching);
+    assert!(
+        !args.speculative,
+        "MTP wins at C=1 and loses at C=2; a one-setting recipe ships it off"
+    );
+    assert_eq!(
+        args.kernel_target.as_deref(),
+        Some("qwen3.8-flash-next"),
+        "the target name is what resolves the kernel set"
+    );
+    assert!(
+        args.default_chat_template_kwargs
+            .as_deref()
+            .is_some_and(|k| k.contains("reasoning_effort")),
+        "the chat template gates its whole scaffold on the thinking kwargs"
+    );
 }
 
 #[test]

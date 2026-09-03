@@ -165,6 +165,12 @@ pub fn step_verify_k3(
         }
     }
 
+    // The K=3 stepper recorded NOTHING while its K=2 and K=4 siblings record
+    // 15 phases each, so `ATLAS_MTP_TIMING=1` emitted no summary at all for
+    // K=3 and the width could only be compared on end-to-end throughput. The
+    // Instants below already existed for the debug line; they just were never
+    // handed to the accumulator.
+    let _step_timer = crate::scheduler::mtp_timing::StepTimer::new(&sched.timing, a.seq.seq_len);
     let t_verify = Instant::now();
     // Fused single-sweep path: DFlash only AND single-rank only. Under EP
     // (multi-rank) the worker ranks dispatch `decode_verify_graphed_k3` on the
@@ -192,6 +198,9 @@ pub fn step_verify_k3(
         }
     };
     let verify_us = t_verify.elapsed().as_micros();
+    sched
+        .timing
+        .record(crate::scheduler::mtp_timing::Phase::VerifyForward, t_verify);
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax, v2_argmax) = (result_vec[0], result_vec[1], result_vec[2]);
 
@@ -342,6 +351,12 @@ pub fn step_verify_k3(
             a.finished = true;
             return;
         }
+        // Same row, the other input shape: a drafter reading the PRE-mixer
+        // stream highway needs row 2 staged into row 0, or it proposes from
+        // the first verify row instead of the accepted one.
+        if let Err(e) = model.select_mtp_stream_row(2) {
+            tracing::error!("select_mtp_stream_row(2): {e:#}");
+        }
         if let Err(e) = model.save_hidden_for_mtp(2, 0) {
             tracing::error!("save_hidden_for_mtp(2): {e:#}");
             return;
@@ -365,6 +380,9 @@ pub fn step_verify_k3(
                 tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
+        sched
+            .timing
+            .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
             "K3 ACCEPT-2: verify={verify_us}μs propose={propose_us}μs seq_len={}",
@@ -392,6 +410,12 @@ pub fn step_verify_k3(
             return;
         }
         a.last_token = v1;
+        // Same row, the other input shape: a drafter reading the PRE-mixer
+        // stream highway needs row 1 staged into row 0, or it proposes from
+        // the first verify row instead of the accepted one.
+        if let Err(e) = model.select_mtp_stream_row(1) {
+            tracing::error!("select_mtp_stream_row(1): {e:#}");
+        }
         if let Err(e) = model.save_hidden_for_mtp(1, 0) {
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
             return;
@@ -412,6 +436,9 @@ pub fn step_verify_k3(
                 tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
+        sched
+            .timing
+            .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
             "K3 ACCEPT-1: verify={verify_us}μs propose={propose_us}μs seq_len={}",
@@ -437,6 +464,12 @@ pub fn step_verify_k3(
             return;
         }
         a.last_token = v0;
+        // Same row, the other input shape: a drafter reading the PRE-mixer
+        // stream highway needs row 0 staged into row 0, or it proposes from
+        // the first verify row instead of the accepted one.
+        if let Err(e) = model.select_mtp_stream_row(0) {
+            tracing::error!("select_mtp_stream_row(0): {e:#}");
+        }
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp(0): {e:#}");
             return;
@@ -457,6 +490,9 @@ pub fn step_verify_k3(
                 tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
+        sched
+            .timing
+            .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
             "K3 REJECT: verify={verify_us}μs propose={propose_us}μs seq_len={}",

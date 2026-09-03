@@ -727,6 +727,7 @@ pub fn run(
             // place — no parallel accounting, the value below is the one the
             // dispatch chain actually uses.
             let spec_width_ok = active.len() <= mtp_max_seqs();
+            let verify_ctx_limit = model.verify_context_limit();
             if use_mtp {
                 adaptive_rung::note_width_regime(active.len(), spec_width_ok);
             }
@@ -757,6 +758,12 @@ pub fn run(
             } else if use_mtp
                 && spec_width_ok
                 && spec_slots_covered
+                // Past this the batched verify refuses an ACTIVE QSA
+                // selection, and a verify error finishes the request — 10 of
+                // them died that way in a BFCL subset run before this gate.
+                // Declining here just decodes the sequence serially instead.
+                && verify_ctx_limit
+                    .is_none_or(|lim| active.iter().all(|a| a.seq.seq_len < lim))
                 && (
                     // Both lanes stay serial inside `<think>` unless
                     // ATLAS_DFLASH_SPEC_THINK=1. Resume guard still

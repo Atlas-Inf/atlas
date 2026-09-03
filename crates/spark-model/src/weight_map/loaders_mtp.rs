@@ -24,7 +24,7 @@ use super::*;
 /// stacked allocations; the offset pointers are aliases and must NEVER
 /// be passed to `gpu.free()` (the loader doesn't, and ModelWeights drops
 /// the WeightStore last in any case).
-pub(super) fn load_mtp_experts_stacked(
+pub(crate) fn load_mtp_experts_stacked(
     store: &WeightStore,
     mlp: &str,
     num_experts: usize,

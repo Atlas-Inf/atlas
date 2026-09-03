@@ -296,6 +296,34 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// Stage mHC stream row `row` into row 0 for the drafter. See
+    /// `Model::select_mtp_stream_row`. `ATLAS_MTP_STREAM_ROW_FIX=0` restores
+    /// the always-row-0 read, for A/B against the acceptance it costs.
+    pub(super) fn select_mtp_stream_row_dispatch(&self, row: usize) -> Result<()> {
+        if row == 0 {
+            return Ok(());
+        }
+        // DIAGNOSTIC (`ATLAS_MTP_STREAM_ROW_MAX`): apply the selection only up
+        // to this row. Exists to separate two explanations for K=3 losing
+        // greedy exactness while K=2 keeps it — is row 2's copy itself wrong,
+        // or is the K=3 verify simply not draft-invariant, so that ANY change
+        // to the proposed drafts moves the output? Setting this to 1 keeps the
+        // copy K=2 validated and drops only row 2.
+        if row > Self::stream_row_max_inner() {
+            return Ok(());
+        }
+        // `hc_streams` is [M, hc, H] FP32 (buffers::sizes -- m*hc*h*4), so a
+        // row is one contiguous hc*H span and rows never overlap.
+        let Some(row_bytes) = self.mtp_stream_row_bytes() else {
+            return Ok(());
+        };
+        let src = self.buffers.hc_streams().offset(row * row_bytes);
+        let dst = self.buffers.hc_streams();
+        let stream = self.gpu.default_stream();
+        self.gpu.copy_d2d_async(src, dst, row_bytes, stream)?;
+        Ok(())
+    }
+
     /// Batched-verify Phase 2: copy the raw-hidden row `rows[i]` (the
     /// accepted position of sequence i in the just-run batched verify
     /// forward) into stash slot i, BEFORE any propose clobbers the shared
@@ -325,7 +353,48 @@ impl TransformerModel {
             let dst = self.verify_hidden_stash.offset(i * h * bf16);
             self.gpu.copy_d2d_async(src, dst, h * bf16, stream)?;
         }
+        // Same rows, the stream highway. Staged together with the hiddens and
+        // restored together, so the two inputs can never name different
+        // positions. See `Model::select_mtp_stream_row`.
+        if let Some(row_bytes) = self.mtp_stream_row_bytes()
+            && !self.verify_stream_stash.is_null()
+        {
+            for (i, &row) in rows.iter().enumerate() {
+                let src = self.buffers.hc_streams().offset(row * row_bytes);
+                let dst = self.verify_stream_stash.offset(i * row_bytes);
+                self.gpu.copy_d2d_async(src, dst, row_bytes, stream)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Highest verify row the stream selection is applied to
+    /// (`ATLAS_MTP_STREAM_ROW_MAX`, default unbounded). Diagnostic only.
+    fn stream_row_max_inner() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("ATLAS_MTP_STREAM_ROW_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(usize::MAX)
+        })
+    }
+
+    /// Bytes per `hc_streams` row (`hc * hidden * 4`), or `None` when this
+    /// model has no highway or the fix is disabled via
+    /// `ATLAS_MTP_STREAM_ROW_FIX=0`.
+    ///
+    /// Deliberately does NOT require `verify_stream_stash`: qwen4_exp installs
+    /// its proposer AFTER construction, so every `proposer.is_some()`-gated
+    /// buffer is NULL for it — including that stash. Gating the LIVE row
+    /// selection on the stash silently disabled the whole fix on the only
+    /// model that needs it. Stash callers check the pointer themselves.
+    fn mtp_stream_row_bytes(&self) -> Option<usize> {
+        let hc = self.config.hc_mult.max(self.config.hc_count);
+        if hc == 0 || std::env::var("ATLAS_MTP_STREAM_ROW_FIX").ok().as_deref() == Some("0") {
+            return None;
+        }
+        Some(hc * self.config.hidden_size * 4)
     }
 
     /// Batched-verify Phase 3: stash slot `idx` → `mtp_hidden_save` (the MTP
@@ -351,6 +420,15 @@ impl TransformerModel {
         let src = self.verify_hidden_stash.offset(idx * h * bf16);
         self.gpu
             .copy_d2d_async(src, self.mtp_hidden_save, h * bf16, stream)?;
+        // Restore this sequence's stream row into `hc_streams` row 0, which is
+        // where a pre-mixer drafter reads its input from.
+        if let Some(row_bytes) = self.mtp_stream_row_bytes()
+            && !self.verify_stream_stash.is_null()
+        {
+            let ssrc = self.verify_stream_stash.offset(idx * row_bytes);
+            self.gpu
+                .copy_d2d_async(ssrc, self.buffers.hc_streams(), row_bytes, stream)?;
+        }
         Ok(())
     }
 
@@ -470,6 +548,7 @@ impl TransformerModel {
             graph_capture: false,
             gdn_exact_replay: false,
             token_ids: None,
+            host_token_ids: None,
             routed_lora_layers: None,
             midchunk_capture: None,
         };

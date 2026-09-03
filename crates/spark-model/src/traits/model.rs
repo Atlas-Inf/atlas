@@ -556,6 +556,24 @@ pub trait Model: Send + Sync {
         num_drafts: usize,
     ) -> Result<crate::engine::GenerateResult>;
 
+    /// Longest visible context at which a BATCHED (K-token) verify is valid,
+    /// or `None` when nothing bounds it. The scheduler must not dispatch a
+    /// speculative step for a sequence past this: the batched attention path
+    /// refuses an ACTIVE QSA selection, and that refusal arrives as a verify
+    /// error, which finishes the request.
+    fn verify_context_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Deepest `num_drafts` a batched verify may dispatch, or `None` when
+    /// nothing bounds it. The tightest bound across the layers; the
+    /// scheduler clamps every speculative step's draft count to it, because
+    /// a layer that cannot serve the width answers with a verify error and
+    /// a verify error finishes the request.
+    fn verify_max_drafts(&self) -> Option<usize> {
+        None
+    }
+
     /// Check if speculative decoding is available (MTP or self-speculative).
     fn has_proposer(&self) -> bool;
 
@@ -785,6 +803,29 @@ pub trait Model: Send + Sync {
     /// overwrites shared buffers including `norm_output`.
     fn save_hidden_for_mtp(&self, token_idx: usize, stream: u64) -> Result<()>;
 
+    /// Move verify row `row` of the mHC stream highway into row 0, so a
+    /// drafter that consumes the PRE-mixer residual reads the accepted
+    /// position rather than the first verify row.
+    ///
+    /// The companion to [`Self::save_hidden_for_mtp`], for the other input
+    /// shape. That one stages `hidden_states[row]` — the post-mixer,
+    /// `hidden`-wide state — into `mtp_hidden_save`, which reaches the
+    /// proposer as `target_hidden`. A drafter whose `pre_fc_norm_hidden` is
+    /// `[hc_mult * hidden]` (qwen4_exp) cannot use that: it needs the
+    /// residual BEFORE the model-level mixer collapses it, and so reads
+    /// `buffers.hc_streams()` directly. Nothing was selecting a row there,
+    /// and `hc_streams` is `[M, hc_mult, hidden]` — so it always read row 0
+    /// while the scheduler was staging row `num_accepted` next door. On
+    /// every ACCEPT the drafter proposed from the position BEFORE the one it
+    /// should, which is invisible in the output (verify rejects the bad
+    /// drafts) and shows up only as depressed acceptance.
+    ///
+    /// Call beside `save_hidden_for_mtp` with the same row. No-op for models
+    /// with no highway, and for row 0 (already correct).
+    fn select_mtp_stream_row(&self, _row: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// ATLAS_MTP_CATCHUP: ring-capture a serially decoded token's final
     /// hidden at `pos` for the drafter catch-up feed. Default no-op.
     fn save_hidden_for_catchup(&self, _token_idx: usize, _pos: usize) -> Result<()> {
@@ -998,6 +1039,15 @@ pub trait Model: Send + Sync {
     /// 2026-05-01 sweep: 8K collapses to "The\nThe…").
     fn is_mla(&self) -> bool {
         false
+    }
+
+    /// mHC hyper-connection stream count (0 = no highway). Non-zero means
+    /// the batched GDN decode paths are UNWIRED for this model (they carry
+    /// their own residual, which the highway replaces — see
+    /// `qwen3_ssm::hc::refuse_batched_under_hc`); the scheduler must clamp
+    /// concurrency to 1 until the batched highway lands (Avarok #753 item B).
+    fn hc_mult(&self) -> usize {
+        0
     }
 
     /// Tokens per paged-KV block, or `None` when the model has no paged KV.

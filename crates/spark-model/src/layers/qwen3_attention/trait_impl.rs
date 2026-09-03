@@ -90,6 +90,10 @@ pub fn diag_norm_f32(
 // and carried on `ForwardContext`.
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    fn uses_local_mla_prefill(&self) -> bool {
+        self.mla.is_some()
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
@@ -98,6 +102,89 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.fp8_calibration
             .as_ref()
             .map(|cal| !cal.is_calibrating())
+    }
+
+    /// QSA selection does a host top-k per step — never capturable, and a
+    /// graph captured on the dense path would replay wrong attention once
+    /// selection activates.
+    fn decode_graph_unsupported(&self) -> bool {
+        self.qsa.is_some()
+    }
+
+    fn has_aux_state(&self) -> bool {
+        self.qsa.is_some()
+    }
+
+    fn verify_context_limit(&self) -> Option<usize> {
+        self.qsa.as_ref().map(|q| q.inert_bound())
+    }
+
+    fn rollback_aux_verify(
+        &self,
+        state: &mut dyn LayerState,
+        num_accepted: usize,
+        k: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(());
+        };
+        let Some(attn) = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::AttnLayerState>()
+        else {
+            return Ok(());
+        };
+        if let Some(st) = attn.qsa.as_mut() {
+            anyhow::ensure!(
+                num_accepted <= k,
+                "QSA rollback: {num_accepted} accepted of a {k}-row verify"
+            );
+            qsa.rewind_verify(st, k - num_accepted)?;
+        }
+        Ok(())
+    }
+
+    fn snapshot_aux(
+        &self,
+        state: &dyn LayerState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(None);
+        };
+        let attn = state
+            .as_any()
+            .downcast_ref::<crate::layer::AttnLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("QSA host layer state is not AttnLayerState"))?;
+        match attn.qsa.as_ref() {
+            Some(st) => Ok(Some(qsa.snapshot_aux(st, gpu, stream)?)),
+            // Sequence never reached this layer's ingest: nothing to carry.
+            None => Ok(None),
+        }
+    }
+
+    fn restore_aux(
+        &self,
+        state: &mut dyn LayerState,
+        blob: &[u8],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let qsa = self
+            .qsa
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("restore_aux: no QSA on this layer"))?;
+        let attn = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::AttnLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("QSA host layer state is not AttnLayerState"))?;
+        if attn.qsa.is_none() {
+            attn.qsa = Some(qsa.new_seq_state(gpu)?);
+        }
+        qsa.restore_aux(attn.qsa.as_mut().expect("just created"), blob, gpu, stream)
     }
 
     fn decode(
@@ -203,6 +290,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
+        _active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -215,6 +303,34 @@ impl TransformerLayer for Qwen3AttentionLayer {
             residual,
             num_seqs,
             states,
+            None,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+        )
+    }
+
+    fn decode_multi_seq_rows<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_rows: usize,
+        seq_states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        row_owner: &[usize],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_multi_seq_inner(
+            hidden,
+            residual,
+            num_rows,
+            seq_states,
+            Some(row_owner),
             kv_cache,
             seq_lens,
             block_tables,
@@ -224,7 +340,26 @@ impl TransformerLayer for Qwen3AttentionLayer {
     }
 
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
-        Ok(Box::new(EmptyLayerState))
+        Ok(Box::new(crate::layer::AttnLayerState::default()))
+    }
+
+    /// Release the QSA indexer carry: ~2.5 MB per sequence on each of the 12
+    /// full-attention layers, which is the bulk of the ~30 MB per request that
+    /// used to leak (see `TransformerLayer::free_state`).
+    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn LayerState) -> Result<()> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(());
+        };
+        let Some(attn) = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::AttnLayerState>()
+        else {
+            return Ok(());
+        };
+        if let Some(st) = attn.qsa.as_mut() {
+            qsa.free_seq_state(st, gpu)?;
+        }
+        Ok(())
     }
 
     fn transpose_moe_for_prefill(

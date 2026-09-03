@@ -118,7 +118,7 @@ impl Qwen3SsmLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_tokens: usize,
-        gdn: GdnStates<'_, '_>,
+        mut gdn: GdnStates<'_, '_>,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -140,20 +140,29 @@ impl Qwen3SsmLayer {
         let d_conv = ctx.config.linear_conv_kernel_dim;
         let qkvz_size = ctx.config.ssm_qkvz_size(); // 12288
 
-        // ── 1. RMS norm + residual for K tokens ──
+        // ── 1. Sublayer input ──
+        // Under the mHC highway the residual is REPLACED by the streams:
+        // `hc_pre` IS the norm and `hc_post` is the only path back onto the
+        // residual, so the fused norm+residual must not run here or every
+        // block output lands on the residual twice. #753 item B.
         let normed = ctx.buffers.norm_output();
-        ops::rms_norm_residual(
-            ctx.gpu,
-            self.rms_norm_residual_k,
-            hidden,
-            &self.input_norm,
-            normed,
-            residual,
-            k,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        let hc_active = self.hc.is_some();
+        if hc_active {
+            self.decode_batched_hc_in(hidden, num_tokens, normed, &mut gdn, ctx, stream)?;
+        } else {
+            ops::rms_norm_residual(
+                ctx.gpu,
+                self.rms_norm_residual_k,
+                hidden,
+                &self.input_norm,
+                normed,
+                residual,
+                k,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
 
         k4_diag_checkpoint(ctx, "1:rms_norm_residual", stream)?;
 
@@ -1167,6 +1176,14 @@ impl Qwen3SsmLayer {
         self.ssm_tp_all_reduce(out_proj_buf, num_tokens, ctx, stream)?;
 
         k4_diag_checkpoint(ctx, "9:out_proj", stream)?;
+
+        if hc_active {
+            // The highway carries the block output back onto the streams and
+            // runs the MoE sublayer between its own hc_pre/hc_post pair. The
+            // non-hc step 10 below would add it to a residual the highway has
+            // already replaced.
+            return self.decode_batched_hc_out(out_proj_buf, num_tokens, ctx, stream);
+        }
 
         // ── 10. Batched residual + post-norm, then MoE + residual ──
         // residual_add_rms_norm supports multi-token (grid.x = num_tokens)

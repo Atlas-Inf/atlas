@@ -121,6 +121,7 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
             .collect(),
         h_is_f16: false,
         h_prefill_stage: None,
+        ple: None,
     }
 }
 
@@ -151,6 +152,7 @@ fn run_batched_verify(
         graph_capture: false,
         gdn_exact_replay: false,
         token_ids: None,
+        host_token_ids: None,
         routed_lora_layers: None,
         midchunk_capture: None,
         // Merge-interaction (#334/#335 stack): this main-side helper postdates
@@ -254,6 +256,120 @@ fn batched_verify_null_out_proj_fails_fast() {
         format!("{err:#}").contains("batched GDN out_proj dispatch"),
         "wrong error: {err:#}"
     );
+}
+
+// ── PLE carry refusal on the hc multi-seq decode path ──
+//
+// `decode_multi_seq_inner_hc` runs the PLE injection only when the layer
+// carries BOTH the highway and PLE (`self.hc.is_some() && self.ple.is_some()`),
+// and then requires every ACTIVE row's `SsmLayerState` to own a `ple` carry:
+// a padding row (`i >= active_seqs`) may skip, an active one may not. The
+// refusal is the guard against a scheduler that pushed a carry-less dummy for
+// a live sequence — silently dropping the n-gram injection for that row.
+
+/// NEGATIVE: an ACTIVE row (row 0 of 1) whose state has `ple: None` (what
+/// `mk_state` builds) must be refused with the "no PLE carry" bail, naming
+/// the row — never silently skipped as if it were padding.
+#[test]
+fn active_row_without_ple_carry_is_refused() {
+    let gpu = MockGpuBackend::new();
+    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    let mut layer = native_fp8_gdn_layer(&gpu, &config, true, true);
+    // The bail runs only under hc + ple; attach both the way the loader's
+    // `attach::attach_hc` / `attach::attach_ple` do (pointers never
+    // dereferenced — the refusal happens before any kernel launch).
+    layer.set_hc_weights(crate::layers::qwen3_attention::HcWeights {
+        attn: crate::layers::qwen3_attention::HcSiteWeights {
+            hc_fn: DevicePtr::NULL,
+            hc_base: DevicePtr::NULL,
+            hc_scale: DevicePtr::NULL,
+            lowrank: None,
+        },
+        ffn: crate::layers::qwen3_attention::HcSiteWeights {
+            hc_fn: DevicePtr::NULL,
+            hc_base: DevicePtr::NULL,
+            hc_scale: DevicePtr::NULL,
+            lowrank: None,
+        },
+        head: None,
+        hc_mult: 4,
+        sinkhorn_iters: 0,
+        hc_eps: config.rms_norm_eps as f32,
+        is_first_model_layer: false,
+        is_last_model_layer: false,
+    });
+    let dw = |bytes: usize| DenseWeight {
+        weight: gpu.alloc(bytes).unwrap(),
+    };
+    let ple = crate::layers::ple::PleLayer::new(
+        crate::layers::ple::PleIdDims {
+            ngram_size: 3,
+            heads_per_ngram: 8,
+            multipliers: vec![1, 3, 5],
+            head_vocab_sizes: vec![7; 16],
+            head_offsets: vec![0; 16],
+            eos_token_id: config.eos_token_id,
+        },
+        80, // 16 ngram heads x 80 = the 1280 embed width below
+        1280,
+        4,
+        4,
+        3,
+        config.rms_norm_eps as f32,
+        crate::layers::ple::PleWeights {
+            key_proj: dw(2),
+            value_proj: dw(2),
+            norm_key: dw(2),
+            norm_query: dw(2),
+            norm_conv: dw(2),
+            conv1d: dw(2),
+        },
+        crate::layers::ngram_embed::NgramTable::Bf16(dw(2)),
+        1,
+        &gpu,
+    )
+    .unwrap();
+    layer.set_ple(ple);
+
+    let mut st = mk_state(&gpu, &layer, 1); // ple: None by construction
+    let mut states: Vec<&mut (dyn LayerState + 'static)> = vec![&mut st];
+    let buffers = BufferArena::new(&config, 64, 4096, 16, 32, &gpu).unwrap();
+    let dispatch = crate::layers::ops::GemmDispatch::defaults();
+    let derived = crate::layers::ops::DerivedWeights::new();
+    let levers = crate::layers::ops::ModelLevers::defaults();
+    let stats = crate::layers::ops::ModelStats::new();
+    let ctx = ForwardContext {
+        dispatch: &dispatch,
+        derived: &derived,
+        levers: &levers,
+        stats: &stats,
+        buffers: &buffers,
+        gpu: &gpu,
+        config: &config,
+        attn_metadata: None,
+        profile: false,
+        comm: None,
+        graph_capture: false,
+        gdn_exact_replay: false,
+        token_ids: None,
+        host_token_ids: Some(&[42]),
+        routed_lora_layers: None,
+        midchunk_capture: None,
+        moe_lora_route: crate::layer::MoeLoraRoute::Fold,
+    };
+    let err = layer
+        .decode_multi_seq_inner_hc(
+            DevicePtr::NULL,
+            1, // num_seqs
+            1, // active_seqs
+            &mut states,
+            &ctx,
+            0,
+        )
+        .expect_err("active row without a PLE carry must be refused, not skipped");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("row 0"), "unexpected error: {msg}");
+    assert!(msg.contains("no PLE carry"), "unexpected error: {msg}");
 }
 
 /// Grid/block pairs of every launch recorded by the mock.

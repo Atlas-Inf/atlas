@@ -26,6 +26,23 @@ pub fn step_mtp(
     // bootstrap, D-Cut plan, chunk sort) — one component of the out-of-step
     // GAP. One Instant::now() when disarmed, same cost note as StepTimer.
     let t_step_outer = std::time::Instant::now();
+    // Model-capability clamp, applied to `num_drafts` itself rather than to
+    // the ladder below, because it has to be TOTAL: the per-sequence verify
+    // dispatch near the end of this function branches on the raw
+    // `num_drafts` (`num_drafts >= 3` picks the K=4 arm), and the bootstrap
+    // propose passes it straight through. Clamping only the ladder left both
+    // of those reaching for a width the model cannot serve.
+    //
+    // The batched verify runs K = drafts + 1 rows, and a model can cap K in a
+    // way no pool capacity lifts (the mHC highway has MoE arms for K=2/3
+    // only). Asking past it bails INSIDE the step, and `verify_k*_step`
+    // answers a verify error with `a.finished = true` — `--num-drafts 3` on
+    // qwen4_exp killed every request after one token that way. Clamped, those
+    // steps just speculate less deeply.
+    let num_drafts = match model.verify_max_drafts() {
+        Some(max_nd) => num_drafts.min(max_nd),
+        None => num_drafts,
+    };
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
     let mut verify_idxs: Vec<usize> = Vec::new();
     for (i, a) in active.iter().enumerate() {

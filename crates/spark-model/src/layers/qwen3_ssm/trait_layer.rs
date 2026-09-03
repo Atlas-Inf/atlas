@@ -18,6 +18,297 @@ impl TransformerLayer for Qwen3SsmLayer {
         Some(self)
     }
 
+    /// PLE's host half (hash + NVMe fault-in + slot upload), hoisted before
+    /// graph replay/capture. No-op on the 47 layers without a PLE site.
+    fn decode_prestage(
+        &self,
+        token: u32,
+        state: &mut dyn LayerState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        if let Some(ple) = self.ple.as_ref() {
+            let st = ple_seq_state(ple, state, gpu)?;
+            ple.prestage(st, &[token], gpu, stream)?;
+        }
+        Ok(())
+    }
+
+    fn verify_prestage(
+        &self,
+        tokens: &[u32],
+        state: &mut dyn LayerState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        if let Some(ple) = self.ple.as_ref() {
+            let st = ple_seq_state(ple, state, gpu)?;
+            ple.prestage(st, tokens, gpu, stream)?;
+        }
+        Ok(())
+    }
+
+    fn has_aux_state(&self) -> bool {
+        self.ple.is_some()
+    }
+
+    /// K=2 and K=3 are the verify widths this layer's mHC batched decode
+    /// actually has MoE arms for (`forward_k2`/`forward_k3`); K=4..8 goes
+    /// through `try_forward_km`, which is dense-only, and a dense FFN can
+    /// also fall back to `forward_prefill` at any K. So a 512-expert MoE
+    /// under the highway tops out at K=3 — two drafts. Off the highway the
+    /// batched path stages per row and nothing here bounds it.
+    ///
+    /// Reported rather than discovered: `trait_decode_batched_hc` bails on
+    /// an unservable K, and that bail reaches the scheduler as a verify
+    /// error, which finishes the request. `--num-drafts 3` on this model
+    /// used to kill every request after one token that way.
+    fn verify_max_drafts(&self) -> Option<usize> {
+        if self.hc.is_none() || self.ffn.is_dense() {
+            return None;
+        }
+        // ONE draft (K=2 verify rows), not two. Two reasons, both measured on
+        // one GB10 with 256-token completions, agg tok/s:
+        //
+        //   arm        C=1     C=2    tok/step  greedy text vs plain decode
+        //   base      17.74   26.93     1.000   (reference)
+        //   K=2       21.73   25.39     1.774   IDENTICAL
+        //   K=3       20.16   24.92     2.420   DIFFERS
+        //
+        // 1. K=3 IS SLOWER. Acceptance genuinely improves — 1.774 -> 2.420
+        //    tokens per step, and 2.504 with the gate forced — but the third
+        //    verify row costs more than the extra 0.65 tokens buys. This holds
+        //    after the small-M MoE substitution that cut the verify's dominant
+        //    term 14x, so it is not the MoE.
+        //
+        // 2. K=3 IS NOT OUTPUT-EXACT as it stands. At temperature 0
+        //    speculation must be indistinguishable from serial decode. K=2
+        //    reproduces it byte for byte; K=3 does not. Localized to ONE row
+        //    of the stream-row selection (`Model::select_mtp_stream_row`) by
+        //    `ATLAS_MTP_STREAM_ROW_MAX`, two prompts, sha of the completion:
+        //
+        //      arm                        exact   p1      tok/step
+        //      rows 0,1,2 (as shipped)     NO     0.795     2.402
+        //      row 1 only                  yes    0.603     2.069
+        //      no selection at all         yes    0.576     2.017
+        //      K=2                         yes    0.843     1.843
+        //
+        //    Dropping ONLY row 2 restores exactness, so this is not a general
+        //    draft-invariance problem — row 2's copy specifically is wrong.
+        //    (`ATLAS_QWEN4EXP_HC_SMALL_M_FFN=0` still diverges, so the MoE
+        //    substitution is exonerated.) The selection is what lifted K=2
+        //    acceptance 0.69 -> 0.83: right for the row it was validated on,
+        //    wrong for row 2.
+        //
+        // AND FIXING ROW 2 WOULD NOT CHANGE THE ANSWER, which is why the clamp
+        // is here rather than a TODO. The exact K=3 was benched:
+        //
+        //      arm                        C=1     C=2
+        //      K=3 exact (row 1 only)    16.91   22.88
+        //      K=3 as shipped (inexact)  20.16   24.92
+        //      K=2                       21.67   25.41
+        //
+        // K=2 wins on throughput against BOTH, including against a K=3 with
+        // strictly better tokens/step. The extra verify row costs more than
+        // the extra tokens return on this model, so the acceptance gain is
+        // real and irrelevant.
+        //
+        // HOW MUCH MORE ACCEPTANCE WOULD K=3 NEED? At its measured step cost
+        // (119.1 ms vs K=2's 85.0 ms) K=3 must reach 2.582 tokens/step to TIE
+        // K=2. Under 1 + p + p^2 that is a per-draft acceptance of
+        //
+        //     p = 0.853
+        //
+        // and K=2's own measured first-draft acceptance is p1 = 0.843. So a
+        // perfect row-2 fix — one lifting K=3's drafting all the way to K=2's
+        // quality — lands at 2.554 tok/step, 21.43 tok/s, still under K=2's
+        // 21.67. K=3 would have to draft BETTER than K=2 does merely to draw.
+        // And 1 + p + p^2 is optimistic: it assumes the second draft position
+        // accepts at the first's rate, when later positions always accept
+        // less, so the real requirement is higher still.
+        //
+        // WHY THE THIRD ROW COSTS WHAT IT DOES — MEASURED, and NOT the expert
+        // union this comment used to blame. That story predicted the verify FFN
+        // would scale with the union of activated experts,
+        // 512*(1-(1-10/512)^R): 19.8 experts at R=2, 29.4 at R=3, ratio 1.485.
+        // Profiling the verify (`ATLAS_QWEN4EXP_VERIFY_PROF=1`, mean us per
+        // layer call) says otherwise:
+        //
+        //     stage          K=2      K=3     ratio
+        //     moe          287.6    374.1     1.30
+        //     hc_pre_attn  184.9    184.5     1.00
+        //     hc_pre_ffn   183.8    184.5     1.00
+        //     gdn_block     16.8     17.0     1.01
+        //     TOTAL        698.9    786.9     1.126
+        //
+        // MoE scales 1.30x, not 1.485x, and the whole SSM verify only 1.126x —
+        // BELOW the 1.354 token ratio. On the SSM half alone K=3 would win.
+        //
+        // WHERE IT ACTUALLY GOES (`ATLAS_MTP_TIMING=1`, per step):
+        //
+        //     phase        K=2       K=3       delta
+        //     fwd        73.54 ms  103.32 ms  +29.78   (90% of it)
+        //     propose     3.64 ms    7.27 ms   +3.63   (the 2nd draft pass)
+        //     d2h         1.98 ms    1.67 ms   -0.31
+        //     step_mtp   80.01 ms  113.07 ms  +33.06
+        //
+        // and the 36 SSM layers are only +3.17 ms of that +29.78 forward. So
+        // +26.6 ms — 80% of the whole K=3 penalty — is the NON-SSM half of the
+        // forward: 12 attention layers, the LM head over 3 rows instead of 2,
+        // and the embedding. That half scales 1.55x where the SSM half scales
+        // 1.126x, and nothing here explains why yet.
+        //
+        // ★ CORRECTION — THE "PER-ROW ATTENTION" STORY WAS READ FROM THE WRONG
+        // FILE, and everything built on it below the line is withdrawn.
+        //
+        // `verify_a.rs::decode_verify_dispatch` does run the full-attention
+        // layers `for t in 0..k`, and that is what I attributed K=3's cost to.
+        // But K=3 does NOT go through it. It goes through
+        // `verify_c.rs::decode_verify_graphed_k3_dispatch`, which batches the
+        // attention layers across the verify rows already:
+        //
+        //     // k ROWS of ONE sequence, not k sequences: per-sequence
+        //     // aux state (the QSA indexer) must advance once per row
+        //     // against this sequence's own state. See `decode_multi_seq_rows`.
+        //     layer.decode_multi_seq_rows(hidden, residual, k, ...)
+        //
+        // So there is NO per-row attention duplication in the K=3 path, the
+        // +8.2 ms attributed to it does not exist, and the "12-of-48 layers"
+        // framing is wrong. It also explains the batched-verify null result
+        // trivially — attention was already batched, so relaxing five gates to
+        // reach `decode_verify_batched_dispatch` could not have changed it —
+        // and it explains the 64 equal call counts: that probe sits in
+        // `decode_inner_hc`, the SINGLE-TOKEN path, which the verify does not
+        // use. It was never measuring the verify.
+        //
+        // WHAT SURVIVES, all directly measured:
+        //
+        //     K=2 step 80.01 ms @ 1.715 tok/step | K=3 113.07 @ 2.323
+        //     token ratio 1.3545 -> break-even 108.38 ms -> SHORT BY 4.69 ms
+        //
+        //     +3.2 ms   36 SSM verify layers   (VERIFY_PROF, 698.9 -> 786.9 us)
+        //     +3.6 ms   drafter second propose (MTP_TIMING, 3.64 -> 7.27 ms)
+        //     +26.3 ms  everything else in the forward — UNATTRIBUTED
+        //
+        // The unattributed term is now larger, not smaller, than when this
+        // comment claimed to have explained it. It is not the expert union
+        // (MoE scales 1.30x, measured), not per-row attention (does not
+        // happen), and not the drafter (timed). Nobody should propose a fifth
+        // THE TAIL IS RULED OUT. A probe inside `verify_c`'s own forward gives,
+        // per K=3 verify, norm 9 us / lm_head 1508 us / argmax 289 us — about
+        // 1.8 ms total, matching the ~3.17 ms roofline figure the batched
+        // NVFP4 GEMV is documented at, and far too small to be the +26.3 ms.
+        // So it is not the LM head, not the argmax, and not the final norm.
+        //
+        // The same probe read `layers=0us`, which is not a measurement but a
+        // broken bucket — the layer-loop accumulator never fired — and an
+        // earlier arrangement of it reported an 84 ms "tail" that was purely a
+        // bucket-boundary artifact, its last accumulator absorbing everything
+        // unbucketed. Both readings were discarded and the probe reverted
+        // rather than left in tree producing plausible-looking wrong numbers.
+        //
+        // So: +26.3 ms of K=3's +33.1 ms step is still unattributed, and the
+        // list of things it is NOT is now expert-union bandwidth, per-row
+        // weight re-streaming, per-row layer re-execution, a 12-of-48 batching
+        // gap, and the lm_head/argmax tail. Whoever picks this up should
+        // instrument `verify_c`'s layer loop with a bucket that is verified to
+        // fire before trusting anything it prints.
+        //
+        // FOUR mechanisms have now been asserted in this file and refuted:
+        // expert-union bandwidth, per-row weight re-streaming, per-row layer
+        // re-execution, and a 12-of-48 batching gap. Three were refuted by
+        // measurement and this one by reading the right file. That record is
+        // the most useful thing here.
+        //
+        // The batched-verify experiment was reverted; the diagnostics it needed
+        // (`ATLAS_QWEN4EXP_VERIFY_PROF`, `ATLAS_QWEN4EXP_ATTN_PROF`,
+        // `ATLAS_MTP_MAX_DRAFTS`, the K=3 stepper's timing records) are kept.
+        Some(
+            std::env::var("ATLAS_MTP_MAX_DRAFTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(1),
+        )
+    }
+
+    fn rollback_aux_verify(
+        &self,
+        state: &mut dyn LayerState,
+        num_accepted: usize,
+        k: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(ple) = self.ple.as_ref() else {
+            return Ok(());
+        };
+        let Some(ssm) = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::SsmLayerState>()
+        else {
+            return Ok(());
+        };
+        if let Some(st) = ssm.ple.as_mut() {
+            ple.rollback_verify(st, num_accepted, k, gpu, stream)?;
+        }
+        Ok(())
+    }
+
+    /// PLE's per-seq host hash on the hc multi-seq decode path is
+    /// capture-illegal (pageable reads); the single-decode path prestages
+    /// around it, the batched path does not — veto batched graphs.
+    fn decode_graph_unsupported(&self) -> bool {
+        self.ple.is_some()
+    }
+
+    fn snapshot_aux(
+        &self,
+        state: &dyn LayerState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(ple) = self.ple.as_ref() else {
+            return Ok(None);
+        };
+        let ssm = state
+            .as_any()
+            .downcast_ref::<crate::layer::SsmLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("PLE host layer state is not SsmLayerState"))?;
+        match ssm.ple.as_ref() {
+            Some(st) => Ok(Some(ple.snapshot_aux(st, gpu, stream)?)),
+            // Sequence never ran this layer (snapshot before first pass):
+            // nothing to carry, and restore-side declines aux-less slots.
+            None => Ok(None),
+        }
+    }
+
+    fn restore_aux(
+        &self,
+        state: &mut dyn LayerState,
+        blob: &[u8],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let ple = self
+            .ple
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("restore_aux: no PLE on this layer"))?;
+        let st = ple_seq_state(ple, state, gpu)?;
+        ple.restore_aux(st, blob, gpu, stream)
+    }
+
+    fn decode_prestage_rearm(&self, state: &mut dyn LayerState) {
+        if let Some(ple) = self.ple.as_ref()
+            && let Some(ssm) = state
+                .as_any_mut()
+                .downcast_mut::<crate::layer::SsmLayerState>()
+            && let Some(st) = ssm.ple.as_mut()
+        {
+            ple.rearm(st);
+        }
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,
@@ -31,6 +322,9 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.hc.is_some() {
+            return self.decode_inner_hc(hidden, state, ctx, stream);
+        }
         self.decode_inner(
             hidden,
             residual,
@@ -59,6 +353,9 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Under an mHC highway `decode_batched_inner` brackets the shared
+        // conv/GDN body with hc_pre/hc_post instead of its own residual
+        // bookkeeping (#753 item B) — no refusal needed.
         self.decode_batched_inner(
             hidden,
             residual,
@@ -105,6 +402,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
+        active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -112,6 +410,19 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.hc.is_some() {
+            // #753 item B milestone 2: the highway replaces the residual the
+            // non-hc path folds into its fused norm kernels; run the
+            // hc-bracketed variant instead of refusing.
+            return self.decode_multi_seq_inner_hc(
+                hidden,
+                num_seqs,
+                active_seqs,
+                states,
+                ctx,
+                stream,
+            );
+        }
         self.decode_multi_seq_inner(
             hidden,
             residual,
@@ -140,6 +451,12 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Under an mHC highway the residual bookkeeping is completely
+        // different — the highway IS the residual — so this is a second entry
+        // path, not a flag on the first. See `trait_prefill_hc.rs`.
+        if self.hc.is_some() {
+            return self.prefill_inner_hc(hidden, num_tokens, state, seq_len_start, ctx, stream);
+        }
         self.prefill_inner(
             hidden,
             residual,
@@ -314,4 +631,40 @@ impl TransformerLayer for Qwen3SsmLayer {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         self.alloc_state_inner(gpu)
     }
+
+    /// Release the PLE carry. The h/conv states are pool slots that
+    /// `free_sequence` releases separately; this is only the `gpu.alloc` the
+    /// carry owns.
+    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn LayerState) -> Result<()> {
+        if self.ple.is_none() {
+            return Ok(());
+        }
+        let Some(ssm) = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::SsmLayerState>()
+        else {
+            return Ok(());
+        };
+        if let Some(st) = ssm.ple.as_mut() {
+            crate::layers::ple::PleLayer::free_seq_state(st, gpu)?;
+        }
+        Ok(())
+    }
+}
+
+/// The PLE per-seq carry from a sequence's [`SsmLayerState`], lazily created
+/// on first use. Errors if the state is not an `SsmLayerState`.
+fn ple_seq_state<'a>(
+    ple: &crate::layers::ple::PleLayer,
+    state: &'a mut dyn LayerState,
+    gpu: &dyn GpuBackend,
+) -> Result<&'a mut crate::layers::ple::PleSeqState> {
+    let ssm = state
+        .as_any_mut()
+        .downcast_mut::<crate::layer::SsmLayerState>()
+        .ok_or_else(|| anyhow::anyhow!("PLE host layer state is not SsmLayerState"))?;
+    if ssm.ple.is_none() {
+        ssm.ple = Some(ple.new_seq_state(gpu)?);
+    }
+    Ok(ssm.ple.as_mut().expect("just created"))
 }

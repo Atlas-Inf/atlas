@@ -188,10 +188,21 @@ impl TransformerModel {
         // currently free (pad writes land on unowned pool state, zeroed
         // again at the next claim) and its tiered intermediate pool covers
         // the baked depth.
+        // A layer whose decode keeps HOST-side per-sequence state cannot be
+        // captured: a replayed graph re-runs the kernels but NOT the Rust that
+        // maintains the counter beside them. The QSA indexer's `ingested`
+        // froze at the capture step while the sequence kept advancing, and the
+        // desync stayed invisible until a non-replayed path ran a
+        // `decode_select` again — at the MTP gate's batch-width switch, which
+        // failed with "decode at pos 34 but 26 tokens ingested". `decode_a`
+        // and `decode_a2` already apply this veto; the verify paths never did,
+        // because on this model they used to refuse before reaching a graph.
+        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
         // Per-layer DFlash timing must see real launches, not one replayed
         // graph, so it disables capture the same way k4 diag does.
         let time_layers = std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
-        let graphs_on = super::verify_e2::verify_graphs_enabled() && !k4_diag && !time_layers;
+        let graphs_on =
+            super::verify_e2::verify_graphs_enabled() && !k4_diag && !layer_veto && !time_layers;
         let graph_key = if graphs_on {
             self.verify_batched_graph_key(&*seqs, ks, wy_tables_base.is_null())
         } else {
@@ -411,6 +422,24 @@ impl TransformerModel {
             // slot-vector churn can never push the path permanently eager.
             let capture = graphs.is_some();
 
+            // PLE's host half for EVERY sequence's draft window, hoisted
+            // before capture/replay. Sequence i owns rows [off[i], off[i+1]),
+            // and its n-gram history is its own — staging the batch prefix for
+            // all of them would inject one sequence's history into the rest.
+            // Without this the forward falls back to a D2H readback, which
+            // invalidates the recording graph (901). #753 item B.
+            for (i, seq) in seqs.iter_mut().enumerate() {
+                let window = &tokens[off[i]..off[i + 1]];
+                for (li, l) in self.layers.iter().enumerate() {
+                    l.verify_prestage(
+                        window,
+                        seq.layer_states[li].as_mut(),
+                        self.gpu.as_ref(),
+                        stream,
+                    )?;
+                }
+            }
+
             let ctx = ForwardContext {
                 buffers: &self.buffers,
                 gpu: self.gpu.as_ref(),
@@ -429,6 +458,9 @@ impl TransformerModel {
                 graph_capture: capture,
                 gdn_exact_replay: false,
                 token_ids: None,
+                // Seq-major rows: sequence i's ids are `tokens[off[i]..off[i+1]]`.
+                // The per-seq PLE loop slices this; nothing reads it whole.
+                host_token_ids: Some(tokens),
                 routed_lora_layers: None,
                 midchunk_capture: None,
             };
@@ -443,40 +475,34 @@ impl TransformerModel {
                 }
             }
 
-            // Dummy attention states are stateless (multi_seq attention
-            // ignores them) — allocated OUTSIDE the capture window.
-            let mut attn_dummy_states: Vec<Vec<Box<dyn LayerState>>> = Vec::new();
-            for (layer_idx, layer) in self.layers.iter().enumerate() {
-                if self.config.layer_type(layer_idx) == LayerType::FullAttention {
-                    attn_dummy_states.push(
-                        (0..r_total)
-                            .map(|_| layer.alloc_state(self.gpu.as_ref()))
-                            .collect::<Result<_>>()?,
-                    );
-                }
-            }
+            // Row -> owning sequence. Rows are seq-major and ragged: sequence
+            // i owns rows [off[i], off[i+1]). Attention's per-sequence aux
+            // state (the QSA indexer) advances once per row against its
+            // owner's state, so the map is what keeps `pos == ingested` true
+            // for every sequence in the batch.
+            let row_owner: Vec<usize> =
+                (0..n).flat_map(|i| std::iter::repeat_n(i, ks[i])).collect();
+            debug_assert_eq!(row_owner.len(), r_total);
 
             if capture {
                 self.gpu.begin_capture(stream)?;
             }
 
-            let mut attn_idx = 0usize;
             let mut ssm_idx = 0usize;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
-                    let mut refs: Vec<&mut (dyn LayerState + 'static)> = attn_dummy_states
-                        [attn_idx]
+                    let mut refs: Vec<&mut (dyn LayerState + 'static)> = seqs
                         .iter_mut()
-                        .map(|s| s.as_mut())
+                        .map(|s| s.layer_states[layer_idx].as_mut())
                         .collect();
-                    attn_idx += 1;
-                    layer.decode_multi_seq(
+                    layer.decode_multi_seq_rows(
                         hidden,
                         residual,
                         r_total,
                         &mut refs,
+                        &row_owner,
                         &mut kv_cache,
                         &seq_lens_vec,
                         &block_tables_vec,

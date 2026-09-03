@@ -250,6 +250,28 @@ impl TransformerModel {
             );
         }
 
+        // Per-sequence AUX state rides the same commit. The verify ingested
+        // all `k` rows into the QSA indexer and the PLE carry; only
+        // `num_accepted` of them are committed, so the rejected tail has to
+        // come back off or the very next decode trips the indexer's
+        // `pos == ingested` invariant ("decode at pos 25 but 26 tokens
+        // ingested") and PLE keeps injecting an n-gram history that never
+        // happened. Runs BEFORE the full-accept return: each implementation
+        // is a no-op when nothing was rejected, and keeping the call on every
+        // reachable path is what stops the two from drifting apart.
+        {
+            let aux_stream = self.gpu.default_stream();
+            for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
+                self.layers[i].rollback_aux_verify(
+                    layer_state.as_mut(),
+                    num_accepted,
+                    k,
+                    self.gpu.as_ref(),
+                    aux_stream,
+                )?;
+            }
+        }
+
         // Full accept: the verify kernel's final h_state/conv_state is
         // already the canonical committed state — nothing to do.
         if num_accepted == k {

@@ -42,6 +42,14 @@ pub const VERIFY_WY_LAYER_STRIDE_BYTES: usize =
     VERIFY_WY_TABLES_PER_LAYER * VERIFY_WY_TABLE_STRIDE_BYTES;
 
 pub trait TransformerLayer: Send + Sync {
+    /// True when this layer's PREFILL attends only over the tokens it is
+    /// handed, so a prefix-cache skip would hide the cached prefix from
+    /// attention entirely. MLA layers on the paged path do; everything else
+    /// reads the paged cache and is unaffected.
+    fn uses_local_mla_prefill(&self) -> bool {
+        false
+    }
+
     /// `&mut dyn Any` downcast hook for post-construction weight overlays (e.g.
     /// the LoRA install walk). Default `None`; overlay-capable layers override.
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -57,6 +65,129 @@ pub trait TransformerLayer: Send + Sync {
     /// immediately.
     fn fp8_calibration_frozen(&self) -> Option<bool> {
         None
+    }
+
+    /// Hoisted per-step HOST work for layers that do host-side computation
+    /// at decode (PLE: n-gram hash + NVMe fault-in + slot upload). The
+    /// scheduler calls this every single-token decode step BEFORE any CUDA
+    /// graph replay/capture — the same phasing as the `token_ids` upload —
+    /// so the captured graph contains only kernels over stable device
+    /// buffers. Layers with no host-side decode work keep the no-op default.
+    fn decode_prestage(
+        &self,
+        _token: u32,
+        _state: &mut dyn LayerState,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// The K-token form, for a speculative VERIFY step: the whole draft
+    /// window is staged in one call, before capture/replay, exactly as
+    /// `decode_prestage` stages the single decode token. Layers with no
+    /// host-side decode work keep the no-op default.
+    fn verify_prestage(
+        &self,
+        _tokens: &[u32],
+        _state: &mut dyn LayerState,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Re-arm consumed prestage state so a failed CUDA-graph capture attempt
+    /// can re-run the SAME step eagerly. Must be idempotent, and must not
+    /// recompute (PLE's history already advanced in `decode_prestage`).
+    fn decode_prestage_rearm(&self, _state: &mut dyn LayerState) {}
+
+    /// True when this layer's decode can NEVER be captured into a CUDA
+    /// graph — e.g. the QSA indexer's host top-k round trip, whose captured
+    /// dense fallback would silently replay WRONG attention once selection
+    /// activates. The scheduler ORs this across layers once and keeps the
+    /// whole model eager.
+    fn decode_graph_unsupported(&self) -> bool {
+        false
+    }
+
+    /// Marconi aux state: host-serialized per-layer SEQUENCE state that must
+    /// travel with an SSM snapshot for a prefix-cache hit to be complete —
+    /// PLE's n-gram history + conv state, QSA's ingested indexer keys.
+    /// Without these a restored prefix would silently serve the PREVIOUS
+    /// request's lexical state. Called at chunk-boundary snapshot saves;
+    /// any D2H inside must be stream-ordered (`copy_d2h_on_stream`).
+    /// Default: the layer carries no aux sequence state.
+    fn snapshot_aux(
+        &self,
+        _state: &dyn LayerState,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// True when this layer WOULD produce aux state — restore sites use it
+    /// to decline snapshots that lack aux rather than restore a stale mix.
+    fn has_aux_state(&self) -> bool {
+        false
+    }
+
+    /// Longest visible context at which this layer can serve a BATCHED
+    /// (K-token) verify, if it is bounded at all.
+    ///
+    /// The QSA indexer is bounded: below its inert bound the selection is
+    /// provably all-visible and `decode_select` returns `None`, so the
+    /// batched multi-row attention path is exact. Above it selection goes
+    /// ACTIVE and that path refuses — correctly, it cannot serve a per-row
+    /// selection — but the refusal reaches the scheduler as a verify error,
+    /// and a verify error finishes the request. So eligibility has to be
+    /// decided BEFORE the step is dispatched, not discovered inside it.
+    fn verify_context_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Deepest `num_drafts` this layer can serve in a BATCHED verify, if it
+    /// is bounded at all. The verify runs `K = num_drafts + 1` rows.
+    ///
+    /// The width half of the same story `verify_context_limit` tells about
+    /// depth: the mHC highway's batched decode has a FIXED set of K-shaped
+    /// MoE arms (`forward_k2`/`forward_k3`, and `forward_km` for K=4..8 on
+    /// dense FFNs only). Ask a 512-expert MoE under the highway for K=4 and
+    /// it refuses — correctly, it has no per-row staging — but the refusal
+    /// arrives as a verify error, and a verify error finishes the request.
+    /// A `--num-drafts` the model cannot serve must therefore be clamped
+    /// BEFORE dispatch, not discovered inside the step.
+    fn verify_max_drafts(&self) -> Option<usize> {
+        None
+    }
+
+    /// Rewind that aux state to the `num_kept` verify tokens that were
+    /// accepted. A layer whose aux state advances per token MUST implement
+    /// this: the verify scanned K tokens, and the rejected tail would
+    /// otherwise stay in the committed state — the exact silent divergence
+    /// speculative decoding is supposed to be free of.
+    fn rollback_aux_verify(
+        &self,
+        _state: &mut dyn LayerState,
+        _num_accepted: usize,
+        _k: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Restore the aux state captured by [`Self::snapshot_aux`] on a
+    /// prefix-cache hit, BEFORE the resumed prefill runs.
+    fn restore_aux(
+        &self,
+        _state: &mut dyn LayerState,
+        _blob: &[u8],
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("restore_aux on a layer with no aux state")
     }
 
     /// Decode one token through this layer, modifying `hidden` in-place.
@@ -492,6 +623,50 @@ pub trait TransformerLayer: Send + Sync {
         )
     }
 
+    /// Decode `num_rows` rows that are NOT independent sequences: row `i`
+    /// belongs to sequence `row_owner[i]`, and `seq_states` is indexed by
+    /// sequence. This is the speculative-verify shape — K consecutive tokens
+    /// of one sequence, or a ragged batch of them.
+    ///
+    /// The default forwards to `decode_multi_seq` with throwaway per-row
+    /// states, which is exactly right for a layer that keeps no per-sequence
+    /// state at the sublayer. A layer that DOES keep some (qwen4_exp's QSA
+    /// indexer, whose `ingested` counter must advance once per row in order)
+    /// must override this — handing it a fresh state per row silently gives
+    /// the indexer an empty history.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_rows<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_rows: usize,
+        _seq_states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _row_owner: &[usize],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let mut owned: Vec<Box<dyn LayerState>> = (0..num_rows)
+            .map(|_| self.alloc_state(ctx.gpu))
+            .collect::<Result<_>>()?;
+        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
+            owned.iter_mut().map(|s| s.as_mut()).collect();
+        self.decode_multi_seq(
+            hidden,
+            residual,
+            num_rows,
+            num_rows,
+            &mut refs,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+        )
+    }
+
     /// Decode N sequences through this layer in a single batched call.
     ///
     /// Each sequence contributes 1 token. The weight matrices are loaded
@@ -501,6 +676,12 @@ pub trait TransformerLayer: Send + Sync {
     /// * `hidden` - [N, hidden_size] BF16, contiguous
     /// * `residual` - [N, hidden_size] BF16, contiguous
     /// * `num_seqs` - Number of sequences (N)
+    /// * `active_seqs` - Rows `[0..active_seqs)` are live sequences; rows
+    ///   `[active_seqs..num_seqs)` are CUDA-graph padding (zeroed hidden,
+    ///   dummy states). Layers whose per-row work depends on per-sequence
+    ///   state (e.g. the SSM HC path's PLE injection) must skip the padding
+    ///   rows and must treat a padding-row invariant break as an error only
+    ///   for `i < active_seqs`. Callers with no padding pass `num_seqs`.
     /// * `states` - N per-layer states (one per sequence)
     /// * `kv_cache` - Shared paged KV cache
     /// * `ctx` - Forward context (attn_metadata contains N-sequence metadata)
@@ -513,6 +694,7 @@ pub trait TransformerLayer: Send + Sync {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
+        active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -525,6 +707,7 @@ pub trait TransformerLayer: Send + Sync {
             hidden,
             residual,
             num_seqs,
+            active_seqs,
             states,
             kv_cache,
             seq_lens,
@@ -571,4 +754,34 @@ pub trait TransformerLayer: Send + Sync {
     /// - `EmptyLayerState` for pure attention layers
     /// - `SsmLayerState` for SSM/recurrent layers
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>>;
+
+    /// Release whatever `alloc_state` allocated for ONE finished sequence.
+    ///
+    /// Default no-op, because most layers keep no per-sequence device memory:
+    /// attention lives in the paged KV cache and the SSM h/conv states are
+    /// slots in a pool that `free_sequence` already releases.
+    ///
+    /// It exists for the states that DO own raw allocations, which had no way
+    /// to give them back. `DevicePtr` is a bare handle with no `Drop`, and the
+    /// backend only reclaims at process exit — its own log says so ("backend
+    /// drop reclaimed N allocation(s) that no owner released"). So a state
+    /// holding `gpu.alloc` memory leaked it for the process's life, once per
+    /// sequence:
+    ///
+    ///   * `PleSeqState::conv` — (k-1)*dilation * hc*hidden * 4 = ~360 KB
+    ///   * `QsaSeqState::{raw_keys, block_keys}` — [max_tokens, hd] +
+    ///     [max_tokens/ratio, hd] BF16, ~2.5 MB, on each of the 12
+    ///     full-attention layers
+    ///
+    /// ~25-30 MB per request on qwen4_exp, against the ~2 GB of slack left
+    /// after a 117 GB resident load at util 0.90 — which is why the server was
+    /// OOM-KILLED at request 80 of a 225-request run while surviving a
+    /// 13-request smoke suite indefinitely.
+    ///
+    /// Symmetric with `alloc_state` on purpose, and mirrors the Proposer
+    /// trait's existing `free_state`. Errors are reported by the caller rather
+    /// than propagated: teardown must not be able to strand a sequence.
+    fn free_state(&self, _gpu: &dyn GpuBackend, _state: &mut dyn LayerState) -> Result<()> {
+        Ok(())
+    }
 }

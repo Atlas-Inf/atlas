@@ -58,6 +58,11 @@ pub struct TransformerModel {
     /// to `levers`: what the kernels did, rather than what they do.
     pub(super) stats: crate::layers::ops::ModelStats,
     pub(super) embed_tokens: DenseWeight,
+    /// Fused n-gram input embedding (LongCat family), when the architecture
+    /// has one. `Mutex` because the forward path is `&self` while the row
+    /// cache mutates on lookup; the lock is taken once per embed, which is
+    /// nothing beside a transformer forward.
+    pub(super) ngram_embed: Option<std::sync::Mutex<crate::layers::ngram_embed::NgramEmbedding>>,
     pub(super) final_norm: DenseWeight,
     pub(super) lm_head_weight: DenseWeight,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
@@ -215,6 +220,10 @@ pub struct TransformerModel {
     /// hidden here FIRST (`stash_verify_hidden_rows`), then feeds the drafter
     /// from the stash (`save_hidden_for_mtp_from_stash`). NULL without MTP.
     pub(super) verify_hidden_stash: DevicePtr,
+    /// Per-sequence stash of the mHC stream rows that accompany
+    /// `verify_hidden_stash`, for drafters consuming the PRE-mixer
+    /// highway. NULL without a proposer or without a highway.
+    pub(super) verify_stream_stash: DevicePtr,
     /// ATLAS_MTP_CATCHUP: circular per-position final-hidden ring captured
     /// during serial-decode stretches (BF16 rows, slot = position % ring
     /// len). Feeds the drafter catch-up on the next propose. NULL when the

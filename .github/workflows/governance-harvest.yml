@@ -16,20 +16,54 @@ name: Governance harvest
 # (head_sha → commits/{sha}/pulls), never from anything the artifact claims,
 # and the binary rejects any event line disagreeing with it.
 
+# ---------------------------------------------------------------------------
+# PARKED 2026-08-26 — dispatch-only. Not deleted, not needed right now.
+#
+# Two reasons, one practical and one about scope.
+#
+# 1. IT HAS NEVER SUCCEEDED ON THIS REPO. Eleven of the last fifteen runs
+#    failed, all at the same line, after doing the entire job:
+#
+#      pull request create failed: GraphQL: GitHub Actions is not permitted
+#      to create or approve pull requests (createPullRequest)
+#
+#    That is the org/repo setting Settings -> Actions -> General -> "Allow
+#    GitHub Actions to create and approve pull requests", which is off and is
+#    staying off. So every run harvested the ledgers, force-pushed
+#    `bot/governance-harvest`, and then died — a third of this repo's red
+#    checks were this one toggle, and none of them meant anything was wrong
+#    with the tree.
+#
+# 2. THE LEDGER NAMESPACE IS COLLIDING. `governance/` holds ~95 files named
+#    pr-502.jsonl .. pr-537.jsonl, which are AVAROK UPSTREAM pr numbers
+#    inherited through the Atlas-Inf migration. The harvester is now writing
+#    pr-1.jsonl .. pr-13.jsonl for THIS repo into the same directory, so two
+#    unrelated numbering schemes are accumulating in one namespace with
+#    nothing distinguishing them. That has to be resolved before the ledger
+#    means anything, and it is not a CI change.
+#
+# `pr-categorize` in ci.yml — the job that PRODUCES the artifact this
+# workflow consumes — is parked in the same commit and for the same reason.
+# Turn them back on together, or the artifacts pile up unread.
+#
+# To resume: restore the `workflow_run` and `schedule` triggers below, flip
+# the repo setting, and decide what happens to the upstream-numbered ledgers.
+# ---------------------------------------------------------------------------
 on:
-  # The moment a CI run finishes, its ledger artifact is ready. This fires for
-  # every CI completion (push, merge_group, dispatch too); the job-level `if`
-  # keeps only pull_request runs, which are the only ones that produce a
-  # governance artifact.
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-  schedule:
-    # Daily backstop: sweeps the last 3 days of completed pull_request CI runs,
-    # so a harvest that raced, failed, or was skipped is retried while the
-    # artifact (30-day retention) is still alive. Dedup by Event::identity
-    # makes the re-harvest converge instead of accumulating.
-    - cron: "43 5 * * *"
+  # PARKED: fired on every CI completion; the job-level `if` kept only
+  # pull_request runs, which are the only ones producing a governance artifact.
+  #
+  # workflow_run:
+  #   workflows: ["CI"]
+  #   types: [completed]
+  #
+  # PARKED: daily backstop sweeping the last 3 days of completed pull_request
+  # CI runs, so a harvest that raced, failed or was skipped got retried while
+  # the artifact (30-day retention) was still alive. Dedup by Event::identity
+  # made the re-harvest converge instead of accumulating.
+  #
+  # schedule:
+  #   - cron: "43 5 * * *"
   workflow_dispatch:
     inputs:
       run_id:

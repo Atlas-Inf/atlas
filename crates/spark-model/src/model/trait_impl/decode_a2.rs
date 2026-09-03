@@ -111,7 +111,30 @@ impl TransformerModel {
         // not the default.
         let mla_perseq_fallback = self.is_mla_dispatch()
             && std::env::var("ATLAS_MLA_PERSEQ_FALLBACK").is_ok_and(|v| v == "1" || v == "true");
-        if mla_perseq_fallback {
+        // mHC highway models (#753 item B): the batched GDN paths are UNWIRED
+        // (they carry their own residual, which the highway replaces), so the
+        // per-seq loop is the DEFAULT here, not a fallback — each sequence
+        // runs the proven single-row highway decode against its own per-seq
+        // PLE/QSA state, and the host staging below isolates the logits rows.
+        // Batched-highway kernels are the perf follow-up.
+        // Highway models: the BATCHED multi-seq path (per-layer hc-bracketed
+        // decode, weight reads amortized at the GEMM level next increment)
+        // is the default. Fall back to the per-seq staging loop when
+        //   * ATLAS_HC_PERSEQ_DECODE=1 (A/B escape hatch), or
+        //   * QSA would be ACTIVE for any sequence (the ms attention path has
+        //     no per-seq indexer hook yet — dense past the budget is NOT the
+        //     reference model, so keep those batches on the proven loop).
+        let qsa_active = self.config.index_topk > 0 && {
+            // Mirrors QsaIndexer::inert_bound: index_topk IS the selection
+            // budget in tokens (2048 on this card); at or below
+            // budget + ratio - 1 visible tokens every block is selected and
+            // selection is inert.
+            let bound = self.config.index_topk + self.config.index_compress_ratio - 1;
+            seqs.iter().any(|s| s.seq_len >= bound)
+        };
+        let hc_perseq = self.config.hc_mult > 0
+            && (qsa_active || std::env::var("ATLAS_HC_PERSEQ_DECODE").as_deref() == Ok("1"));
+        if mla_perseq_fallback || hc_perseq {
             use std::sync::atomic::Ordering;
             let logits = self.decode_logits_ptr();
             let v = self.config.vocab_size;
@@ -121,6 +144,14 @@ impl TransformerModel {
             // slot-keyed; capturing a graph for one slot inside the same
             // stream-capture window as another slot's replay corrupts both.
             let prev_suppress = self.suppress_graphs.swap(true, Ordering::Relaxed);
+            // The scheduler passes stream 0 (legacy) here, but `decode()`
+            // runs its kernels on the BACKEND default stream — staging the
+            // rows on the caller's stream orders the copies against nothing:
+            // all n copies can execute after the LAST decode and read the
+            // same final row 0 (measured: a clean two-way row swap at every
+            // joint C=2 step, '#753 item B' bring-up). Stage on the stream
+            // the kernels actually use.
+            let copy_stream = self.gpu.default_stream();
             let result = (|| -> Result<()> {
                 let mut staged = vec![0u8; n * row_bytes];
                 for i in 0..n {
@@ -128,17 +159,17 @@ impl TransformerModel {
                     // `decode()` wrote this sequence's logits to row 0.
                     // Pull them to the host before the next `decode()`'s
                     // `zero_all` wipes the buffer. `copy_d2h_on_stream`
-                    // syncs `stream` first, so the eager lm_head GEMV has
-                    // fully landed before the copy reads it.
+                    // syncs `copy_stream` first, so the eager lm_head GEMV
+                    // has fully landed before the copy reads it.
                     self.gpu.copy_d2h_on_stream(
                         logits,
                         &mut staged[i * row_bytes..(i + 1) * row_bytes],
-                        stream,
+                        copy_stream,
                     )?;
                 }
                 // Upload the assembled [n, vocab] batch back to the device.
-                self.gpu.copy_h2d_async(&staged, logits, stream)?;
-                self.gpu.synchronize(stream)?;
+                self.gpu.copy_h2d_async(&staged, logits, copy_stream)?;
+                self.gpu.synchronize(copy_stream)?;
                 Ok(())
             })();
             self.suppress_graphs.store(prev_suppress, Ordering::Relaxed);
@@ -226,7 +257,13 @@ impl TransformerModel {
         // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
         // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        let graph_key = if !ms_profile && !lora_eager && multiseq_graphs_enabled() {
+        // Per-layer graph veto (QSA's mid-decode top-k D2H, PLE's per-seq
+        // host hash on the hc multi-seq path) — the single-decode path
+        // consults it (decode_a `layer_veto`); the batched path must too, or
+        // capture hits 'PLE: un-prestaged forward inside CUDA graph capture'
+        // on the first joint hc step.
+        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        let graph_key = if !ms_profile && !lora_eager && !layer_veto && multiseq_graphs_enabled() {
             self.batch_decode_graph_key(&*seqs, padded_n)
         } else {
             None
@@ -291,7 +328,9 @@ impl TransformerModel {
 
         // 1a. Embed active tokens into hidden[0..n)
         for (i, &tok) in tokens.iter().enumerate() {
-            self.embed(tok, hidden.offset(i * h * fp32), stream)?;
+            // Each batch slot is a DIFFERENT sequence: the n-gram context must
+            // come from that sequence's own history, never the batch's.
+            self.embed_ctx(&seqs[i].tokens, tok, hidden.offset(i * h * fp32), stream)?;
         }
 
         // 1b. Zero padding hidden[n..dispatch_n)
@@ -339,6 +378,20 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: None,
+            // The batch's token ids: the hc multi-seq PLE rows read their
+            // per-seq id from this slice.
+            //
+            // NOTE: this is the ONE per-seq input at ACTIVE length. Its
+            // siblings are all padded to `padded_n` — `seq_lens` and
+            // `block_tables` above, `all_layer_states` (dummy states for the
+            // padding rows), and the fixed-stride attention metadata. A
+            // consumer that bounds a per-seq loop by the `padded_n` it is
+            // handed and then indexes THIS slice will run off the end, which
+            // is what broke every concurrent request whose live count was not
+            // already a padding boundary ("3 host ids for 4 seqs"). Padding
+            // rows carry no PLE state, so the fix is to skip them, not to
+            // fabricate token ids for rows whose output is discarded.
+            host_token_ids: Some(tokens),
             routed_lora_layers: None, // #30: batched decode never routes prefill.
             midchunk_capture: None,
         };
@@ -405,6 +458,7 @@ impl TransformerModel {
                             // real one and a stray prefill over it stages
                             // rather than overruns.
                             h_prefill_stage: self.ssm_pool.h_prefill_stage(dummy_ssm_slot),
+                            ple: None,
                         }));
                         ssm_idx += 1;
                     } else {
@@ -465,6 +519,7 @@ impl TransformerModel {
                     hidden,
                     residual,
                     padded_n,
+                    n,
                     &mut layer_state_refs,
                     &mut kv_cache,
                     &seq_lens,

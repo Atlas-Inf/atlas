@@ -12,9 +12,13 @@ pub mod mtp_multi;
 pub(crate) mod nemotron_decode_policy;
 pub mod nemotron_mamba2;
 pub mod nemotron_moe;
+pub mod ngram_embed;
 pub mod ops;
+pub mod ple;
+pub mod qsa;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod qwen4exp_mtp;
 pub mod vision_encoder;
 pub mod w4a16_gemv_tiers;
 
@@ -53,6 +57,7 @@ pub(crate) fn w4a16_k64_min_k() -> u32 {
     })
 }
 
+pub(crate) use deepseek_v4_mtp::argmax_grammar_masked;
 pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
 pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
@@ -64,6 +69,7 @@ pub use nemotron_mamba2::NemotronMamba2Layer;
 pub use nemotron_moe::NemotronMoeLayer;
 pub use qwen3_attention::Qwen3AttentionLayer;
 pub use qwen3_ssm::Qwen3SsmLayer;
+pub use qwen4exp_mtp::{Qwen4ExpMtpHead, Qwen4ExpMtpProposerState};
 pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder};
 
 use crate::layer::ForwardContext;
