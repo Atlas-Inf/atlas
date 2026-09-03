@@ -472,3 +472,23 @@ identical to the Linux result (`scripts/strix-windows/win_gemv_oracle.ps1`).
 The Windows suspect set shrinks to the still-uncovered decode kernels: the
 GDN decode recurrence (`mamba2_ssm_decode`), paged decode attention
 (`paged_decode_attn`), and the SSM snapshot/rollback ring.
+
+### Root cause narrowed: Windows ROCm HIP context loss, NOT TDR (2026-09-02 late)
+
+ST-995 attempt 4 (destructive path, util 0.78, ssm-interval 4096, slots 4)
+completed all 995 samples with the serve dying partway again (score 9.85%,
+pre-crash samples scoring well: irrelevance 100, live_irrelevance 84.09).
+Windows Event Log shows **NO TDR events (4101), no WHEA hardware errors** —
+the GPU context is lost inside the HIP runtime without a Windows driver
+reset. This eliminates:
+* TDR (timeout detection) — no 4101 events
+* Hardware fault — no WHEA errors
+* Atlas kernel bugs — every kernel with an oracle passes on Windows
+* Configuration — five different configs crash
+
+The durability bug is a **ROCm 7.2 HIP SDK on Windows** issue: the GPU
+context becomes unrecoverable after sustained compute load (~30-50 min),
+without any OS-level event. The same binary, same kernels, same recipe on
+Linux runs 8.7 h straight (ST-995, 995 samples). This needs an AMD driver
+fix or a ROCm upgrade. TheBFCL-70 result (82.86/78.75, destructive path)
+is the best Windows accuracy number until then.
