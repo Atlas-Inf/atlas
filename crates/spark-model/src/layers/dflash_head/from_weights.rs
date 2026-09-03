@@ -153,6 +153,9 @@ impl BlockDiffusionDraftHead {
             dflash2_conv: gpu
                 .kernel("dflash2_conv", "dflash2_grouped_dynamic_causal_conv")
                 .ok(),
+            dflash2_candidate_selector: gpu
+                .kernel("dflash2_candidate_selector", "dflash2_candidate_selector")
+                .ok(),
             // Qwen3.6-DFlash uses yarn RoPE — confirmed in the drafter
             // `config.json:rope_scaling.rope_type="yarn"`. Atlas's yarn
             // kernel is `rope::rope_forward_yarn`.

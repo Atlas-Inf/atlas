@@ -79,6 +79,7 @@ impl Dflash2CandidateSelector {
         gamma: usize,
         gpu: &dyn GpuBackend,
         dense_gemm_pipelined: KernelHandle,
+        candidate_selector_kernel: Option<KernelHandle>,
         stream: u64,
     ) -> Result<()> {
         let r = self.rank as u32;
@@ -98,7 +99,25 @@ impl Dflash2CandidateSelector {
             stream,
         )?;
 
-        // 2. Copy projected hidden states and logits to host
+        // 2. On-Device GPU Candidate Selector (Zero D2H, Zero CPU Loop, <0.05ms)
+        if let Some(kernel) = candidate_selector_kernel {
+            return ops::dflash2_candidate_selector(
+                gpu,
+                kernel,
+                logits_buf,
+                projected_hidden_buf,
+                self.predecessor_codebook.weight,
+                self.successor_codebook.weight,
+                draft_tokens_dev,
+                last_token,
+                g,
+                self.vocab_size as u32,
+                r,
+                stream,
+            );
+        }
+
+        // Host fallback (if GPU kernel unavailable)
         let mut proj_bytes = vec![0u8; gamma * self.rank * 2];
         let mut logits_bytes = vec![0u8; gamma * self.vocab_size * 2];
 
