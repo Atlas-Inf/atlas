@@ -257,3 +257,17 @@ fn rom_head_absent_by_default() {
             .is_none()
     );
 }
+
+/// The aux decline is its own fallback so the operator log can tell "no
+/// SSM snapshot" from "SSM snapshot without its QSA/PLE companion".
+#[test]
+fn no_aux_snapshot_is_a_distinct_fallback() {
+    assert_ne!(
+        RollbackFallback::NoAuxSnapshot,
+        RollbackFallback::NoSsmSnapshot
+    );
+    assert_ne!(
+        RollbackFallback::NoAuxSnapshot,
+        RollbackFallback::NoBoundary
+    );
+}

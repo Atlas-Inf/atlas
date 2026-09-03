@@ -93,6 +93,12 @@ pub enum RollbackFallback {
     /// every subsequent token — so the rollback is honestly declined and
     /// the caller hard-stops instead.
     NoSsmSnapshot,
+    /// Hybrid model with per-sequence AUX state (QSA indexer cursor, PLE
+    /// n-gram history): the SSM snapshot exists but its aux companion does
+    /// not (or failed to restore). Rewinding tokens and SSM state without
+    /// the indexer cursor trips `decode_select`'s `pos == ingested`
+    /// invariant on the very next token, so decline and hard-stop.
+    NoAuxSnapshot,
 }
 
 /// Find the index (into `output_tokens`) of the last well-formed
@@ -277,6 +283,19 @@ pub fn rollback_to_boundary(
             );
             return RollbackOutcome::Fallback(RollbackFallback::NoSsmSnapshot);
         }
+        // Aux state (QSA indexer cursor, PLE history) has to come back to
+        // the same boundary, or the next decode reads "pos N, ingested M".
+        if model.requires_aux_state()
+            && let Err(e) = model.restore_decode_aux_snapshot(&mut a.seq, slot)
+        {
+            tracing::error!(
+                error = %e,
+                ring_slot = slot,
+                keep_len,
+                "aux decode-snapshot restore failed; declining rollback"
+            );
+            return RollbackOutcome::Fallback(RollbackFallback::NoAuxSnapshot);
+        }
         // The degenerate tail's snapshots are now stale — drop them so
         // their ring slots are reusable. The boundary snapshot itself is
         // kept (generation resumes from it).
@@ -344,6 +363,19 @@ pub fn snapshot_boundary_if_ssm(
         );
         // The just-recorded entry would point at stale/garbage GPU
         // state — remove it so `slot_for_position` never selects it.
+        a.ssm_rollback_ring
+            .truncate_after(token_position.saturating_sub(1));
+    } else if model.requires_aux_state()
+        && let Err(e) = model.save_decode_aux_snapshot(&a.seq, slot)
+    {
+        // Same slot, same fate: an SSM snapshot without its aux companion
+        // is not a usable rollback point (see `NoAuxSnapshot`).
+        tracing::warn!(
+            error = %e,
+            ring_slot = slot,
+            token_position,
+            "aux decode-snapshot save failed; dropping ring entry"
+        );
         a.ssm_rollback_ring
             .truncate_after(token_position.saturating_sub(1));
     }

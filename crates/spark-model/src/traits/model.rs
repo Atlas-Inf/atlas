@@ -534,6 +534,35 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Whether some layer carries per-sequence AUX state (QSA indexer
+    /// cursors, PLE n-gram history) that a decode-time rollback must rewind
+    /// alongside the SSM state. Rewinding the SSM state but not this is how
+    /// the watchdog desynced the indexer ("decode at pos N but M tokens
+    /// ingested"). Default: no such layers.
+    fn requires_aux_state(&self) -> bool {
+        false
+    }
+
+    /// Decode-time boundary AUX snapshot: byte-exact blobs of every
+    /// aux-carrying layer's per-sequence state, keyed like
+    /// [`Self::save_decode_ssm_snapshot`] by `(seq.slot_idx, ring_slot)`.
+    ///
+    /// Default: no-op `Ok(())` for models without aux state.
+    fn save_decode_aux_snapshot(&self, _seq: &SequenceState, _ring_slot: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Inverse of [`Self::save_decode_aux_snapshot`]. `Err` when no aux
+    /// snapshot exists for that slot — the caller must then decline the
+    /// rollback rather than resume on a desynced indexer.
+    fn restore_decode_aux_snapshot(
+        &self,
+        _seq: &mut SequenceState,
+        _ring_slot: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Speculative decoding via the model's internal MTP proposer; falls
     /// back to regular decode when no proposer is wired up.
     fn generate_speculative(

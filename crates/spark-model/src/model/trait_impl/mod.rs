@@ -344,6 +344,43 @@ impl Model for TransformerModel {
     fn restore_decode_ssm_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
         self.restore_decode_ssm_snapshot_dispatch(seq, ring_slot)
     }
+    fn requires_aux_state(&self) -> bool {
+        TransformerModel::requires_aux_state(self)
+    }
+    fn save_decode_aux_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
+        if !TransformerModel::requires_aux_state(self) {
+            return Ok(());
+        }
+        let stream = self.gpu.default_stream();
+        let blobs = self.collect_aux_states(seq, stream)?;
+        // The blobs are read back on `stream`: make them host-complete now,
+        // since they are restored from an unrelated later point in time.
+        self.gpu.synchronize(stream)?;
+        self.decode_aux_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((seq.slot_idx, ring_slot), blobs);
+        Ok(())
+    }
+    fn restore_decode_aux_snapshot(&self, seq: &mut SequenceState, ring_slot: usize) -> Result<()> {
+        if !TransformerModel::requires_aux_state(self) {
+            return Ok(());
+        }
+        let blobs = self
+            .decode_aux_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(seq.slot_idx, ring_slot))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no decode aux snapshot for slot {} ring {ring_slot}",
+                    seq.slot_idx
+                )
+            })?;
+        let stream = self.gpu.default_stream();
+        self.apply_aux_states(seq, &blobs, stream)
+    }
     fn generate_speculative(
         &self,
         prompt_tokens: &[u32],
