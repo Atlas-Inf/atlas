@@ -13,6 +13,85 @@ use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 /// silent buffer-overrun or under-allocation.
 pub const QSA_SELECT_SCRATCH_ROWS: usize = 2048;
 
+/// Byte alignment every sub-buffer of the low-rank mHC prefill scratch starts
+/// on. `dense_gemm_bf16_pipelined` reads its operands with 16-byte vector
+/// loads; 256 keeps them cache-line aligned as well, for under 1 KB per slab.
+pub const HC_SCRATCH_ALIGN: usize = 256;
+
+/// Sub-buffer byte offsets of the slabbed mHC prefill scratch for a slab of
+/// `lay` tokens, all rounded up to [`HC_SCRATCH_ALIGN`]: `normed [lay, hc_dim]`
+/// at 0, then `up_pre [lay, hc_dim]`, `low [lay, rank]`, `inj_pre [lay, hc_mult]`
+/// and `up_wt [hc_dim, rank]` (all BF16); `total` is the padded size.
+///
+/// These used to be packed back to back as raw byte products. `inj_pre` is
+/// `lay * hc_mult * 2` bytes — `lay * 8` with four streams — so an ODD slab
+/// (the 1,117-token last chunk of a chunked prefill on Qwen3.8-Flash-Next)
+/// put `up_wt` 8 bytes off a 16-byte boundary, and the tensor-core GEMM that
+/// reads it faulted with CUDA_ERROR_MISALIGNED_ADDRESS (2026-09-03). Even
+/// slabs (1,074 / 1,862 / 4,092 tokens) never did, which is why it looked
+/// random. One layout, computed here, sizes the region and places the
+/// buffers so the two can never disagree again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HcPreScratchLayout {
+    pub up_pre: usize,
+    pub low: usize,
+    pub inj_pre: usize,
+    pub up_wt: usize,
+    pub total: usize,
+}
+
+pub fn hc_pre_scratch_layout(
+    lay: usize,
+    hc_dim: usize,
+    rank: usize,
+    hc_mult: usize,
+) -> HcPreScratchLayout {
+    let align = |b: usize| b.div_ceil(HC_SCRATCH_ALIGN) * HC_SCRATCH_ALIGN;
+    let up_pre = align(lay * hc_dim * 2);
+    let low = align(up_pre + lay * hc_dim * 2);
+    let inj_pre = align(low + lay * rank * 2);
+    let up_wt = align(inj_pre + lay * hc_mult * 2);
+    let total = align(up_wt + hc_dim * rank * 2);
+    HcPreScratchLayout {
+        up_pre,
+        low,
+        inj_pre,
+        up_wt,
+        total,
+    }
+}
+
+#[cfg(test)]
+mod hc_scratch_layout_tests {
+    use super::{HC_SCRATCH_ALIGN, hc_pre_scratch_layout};
+
+    /// Odd and even slabs alike: every operand 16-byte aligned (the GEMM's
+    /// vector width), none overlapping, and the padded total is what
+    /// `BufferSizes` reserves for the 2048-token slab.
+    #[test]
+    fn every_sub_buffer_is_aligned_and_disjoint() {
+        let (hc_dim, rank, hc_mult) = (4 * 2560, 32, 4);
+        for lay in [1usize, 63, 64, 1074, 1117, 1118, 1862, 2047, 2048] {
+            let l = hc_pre_scratch_layout(lay, hc_dim, rank, hc_mult);
+            for off in [l.up_pre, l.low, l.inj_pre, l.up_wt, l.total] {
+                assert_eq!(off % HC_SCRATCH_ALIGN, 0, "lay={lay} off={off}");
+            }
+            assert!(l.up_pre >= lay * hc_dim * 2, "lay={lay}");
+            assert!(l.low >= l.up_pre + lay * hc_dim * 2, "lay={lay}");
+            assert!(l.inj_pre >= l.low + lay * rank * 2, "lay={lay}");
+            assert!(l.up_wt >= l.inj_pre + lay * hc_mult * 2, "lay={lay}");
+            assert!(l.total >= l.up_wt + hc_dim * rank * 2, "lay={lay}");
+            // The 1,117-token chunk that faulted: raw packing put up_wt at an
+            // offset ending in 8; the layout must not.
+            if lay == 1117 {
+                let raw = 2 * lay * hc_dim * 2 + lay * rank * 2 + lay * hc_mult * 2;
+                assert_eq!(raw % 16, 8, "the historical misalignment");
+                assert_eq!(l.up_wt % 16, 0);
+            }
+        }
+    }
+}
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -536,8 +615,17 @@ impl BufferSizes {
                 let t = m.min(64);
                 let split = t * (config.hc_mult * h + config.hc_lowrank) * 4;
                 let ts = m.min(2048);
-                let gemm = ts * (2 * config.hc_mult * h + config.hc_lowrank + config.hc_mult) * 2
-                    + config.hc_mult * h * config.hc_lowrank * 2;
+                // The GEMM path's placement is `hc_pre_scratch_layout`; sizing
+                // from the same function keeps the padding it inserts between
+                // sub-buffers accounted for (the region is at most one
+                // alignment unit per boundary larger than the raw products).
+                let gemm = hc_pre_scratch_layout(
+                    ts,
+                    config.hc_mult * h,
+                    config.hc_lowrank,
+                    config.hc_mult,
+                )
+                .total;
                 split.max(gemm)
             } else {
                 256

@@ -254,12 +254,14 @@ fn hc_pre_gemm(
     // T <= m always, so L-based offsets fit even when the arena was sized for
     // fewer than 2048 tokens; `up_wt` is L-independent and sits last.
     let lay = num_tokens.min(SLAB) as usize;
+    // Aligned placement (odd slabs used to put `up_wt` 8 bytes off a 16-byte
+    // boundary and fault the GEMM); sizes.rs reserves from the same layout.
+    let l = spark_runtime::buffers::hc_pre_scratch_layout(lay, hc_dim, w.rank, hc_mult as usize);
     let normed = scratch;
-    let up_pre = scratch.offset(lay * hc_dim * 2);
-    let low = scratch.offset(2 * lay * hc_dim * 2);
-    let inj_pre = scratch.offset(2 * lay * hc_dim * 2 + lay * w.rank * 2);
-    let up_wt =
-        scratch.offset(2 * lay * hc_dim * 2 + lay * w.rank * 2 + lay * hc_mult as usize * 2);
+    let up_pre = scratch.offset(l.up_pre);
+    let low = scratch.offset(l.low);
+    let inj_pre = scratch.offset(l.inj_pre);
+    let up_wt = scratch.offset(l.up_wt);
 
     let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage_bf16")?;
     let k_silu = gpu.kernel("hyper_connection", "hc_silu_scale")?;
