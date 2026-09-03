@@ -19,6 +19,9 @@ cd "$(dirname "$0")"
 MODEL="${1:-unsloth/Qwen3.8-27B-NVFP4}"
 [ $# -gt 0 ] && shift            # anything left in "$@" is passed through to spark
 HW="${ATLAS_TARGET_HW:-strix-hip}"
+ROCM_HOME="${ATLAS_ROCM_HOME:-/opt/rocm}"
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+BIN="${ATLAS_BIN:-$TARGET_DIR/release/spark}"
 
 # ── gfx1151 runtime shims (each explained in docs §4) ────────────────────────
 export ATLAS_W4A16_VARIANT=v1     # BF16-MMA NVFP4 GEMM (SCALE device FP8 encode is broken on gfx1151)
@@ -88,9 +91,10 @@ unset ATLAS_FFN_BF16_PREFILL_TC
 
 if [ "$HW" = "strix-hip" ]; then
   # The HIP shims (libcuda/libcudart/libcublasLt) are built into atlas-kernels'
-  # OUT_DIR; the loader needs them plus the AMD runtime at /opt/rocm/lib.
-  SHIM=$(ls -dt target/release/build/atlas-kernels-*/out 2>/dev/null | head -1)
-  export LD_LIBRARY_PATH="${SHIM:-}:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+  # OUT_DIR; the loader needs them plus the selected ROCm runtime.
+  SHIM=$(ls -dt "$TARGET_DIR"/release/build/atlas-kernels-*/out 2>/dev/null | head -1)
+  export PATH="$ROCM_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="${SHIM:-}:$ROCM_HOME/lib:${LD_LIBRARY_PATH:-}"
 else
   : "${SCALE_HOME:=$HOME/scale171/scale-1.7.1-Linux}"
   # SCALE libs FIRST so /opt/rocm cannot shadow the fixed libhsa-runtime64 (the
@@ -119,8 +123,9 @@ if [ "${NUM_DRAFTS:-0}" -gt 0 ]; then
   SPEC_ARGS=(--speculative --num-drafts "$NUM_DRAFTS" --mtp-quantization bf16 --mtp-vocab 100000)
 fi
 
-echo "serving $MODEL on $(/opt/rocm/bin/rocminfo 2>/dev/null | grep -m1 -o gfx[0-9]* || echo AMD) via $HW"
-exec target/release/spark serve "$MODEL" "${NAME_ARG[@]}" \
+GFX=$("$ROCM_HOME/bin/rocminfo" 2>/dev/null | sed -n 's/.*\(gfx[0-9][0-9]*\).*/\1/p' | head -1)
+echo "serving $MODEL on ${GFX:-AMD} via $HW"
+exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \

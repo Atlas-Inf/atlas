@@ -3,7 +3,7 @@
 # One profiled prefill: ATLAS_PROFILE=1 + ATLAS_PROFILE_FIRST=1, one ~615-token
 # plain prompt, then extract the per-phase SSM prefill timings.
 set -euo pipefail
-cd ~/atlas-inf-pr8
+cd "${ATLAS_REPO:-$HOME/atlas-inf-pr8}"
 PORT=8091
 LOG="$HOME/q38-profile.log"
 SNAP="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108"
@@ -53,7 +53,7 @@ PY
 
 echo "-- profile lines (first SSM layer only, plus attention/prefill lines) --"
 grep -E "SSM prefill \[|ATTN prefill|attn.*prefill|Prefill first token|prompt tokens" "$LOG" \
-  | sed "s/\x1b\[[0-9;]*m//g" | head -60
+  | sed "s/\x1b\[[0-9;]*m//g" | head -60 || true
 kill "$SPARK_PID" 2>/dev/null || true
 sleep 5
 echo "PROFILE DONE"

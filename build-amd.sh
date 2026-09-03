@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Atlas for AMD GPUs. Verified on gfx1151 / Strix Halo, ROCm 7.13, native
+# Build Atlas for AMD GPUs. Verified on gfx1151 / Strix Halo, ROCm 7.13/10, native
 # Ubuntu. See docs/porting/amd-strix-halo-scale.md.
 #
 # Two backends, selected with ATLAS_TARGET_HW:
@@ -18,6 +18,8 @@
 # name (e.g. qwen3.8-27b) for a smaller binary.
 set -euo pipefail
 cd "$(dirname "$0")"
+ROCM_HOME="${ATLAS_ROCM_HOME:-/opt/rocm}"
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 export ATLAS_TARGET_HW="${ATLAS_TARGET_HW:-strix-hip}"
 export ATLAS_TARGET_MODEL="${ATLAS_TARGET_MODEL:-*}"
@@ -29,9 +31,9 @@ export ATLAS_NO_RDMA="${ATLAS_NO_RDMA:-1}"
 
 case "$ATLAS_TARGET_HW" in
   strix-hip)
-    export ATLAS_HIPCC="${ATLAS_HIPCC:-/opt/rocm/bin/hipcc}"
+    export ATLAS_HIPCC="${ATLAS_HIPCC:-$ROCM_HOME/bin/hipcc}"
     export ATLAS_HIP_COMPAT_INCLUDE="$PWD/crates/atlas-kernels/hip/compat"
-    export PATH="/opt/rocm/bin:$PATH"
+    export PATH="$ROCM_HOME/bin:$PATH"
     # Deliberately NO `RUSTFLAGS=-L .../hip-port/link`. atlas-kernels/build.rs
     # compiles the three HIP shims into OUT_DIR and puts that first on the link
     # path; pointing -L at a hand-built shim directory shadows them with an
@@ -44,8 +46,8 @@ case "$ATLAS_TARGET_HW" in
     export SCALE_HOME
     export CUDA_PATH="$SCALE_HOME/targets/gfx1151"
     export CUDA_HOME="$CUDA_PATH"
-    export PATH="$SCALE_HOME/targets/gfx1151/bin:/opt/rocm/bin:$PATH"
-    export LD_LIBRARY_PATH="/opt/rocm/lib:$SCALE_HOME/targets/gfx1151/lib:${LD_LIBRARY_PATH:-}"
+    export PATH="$SCALE_HOME/targets/gfx1151/bin:$ROCM_HOME/bin:$PATH"
+    export LD_LIBRARY_PATH="$ROCM_HOME/lib:$SCALE_HOME/targets/gfx1151/lib:${LD_LIBRARY_PATH:-}"
     echo "nvcc -> $(command -v nvcc)  (SCALE, $ATLAS_TARGET_HW/$ATLAS_TARGET_MODEL/$ATLAS_TARGET_QUANT)"
     ;;
   *) echo "ATLAS_TARGET_HW must be strix-hip or strix (got: $ATLAS_TARGET_HW)" >&2; exit 2 ;;
@@ -56,5 +58,5 @@ esac
 command -v cargo >/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
 command -v cargo >/dev/null || { echo "cargo not found; install Rust (rustup) first" >&2; exit 2; }
 
-rm -rf target/release/build/atlas-kernels-* target/release/build/spark-storage-*
+rm -rf "$TARGET_DIR"/release/build/atlas-kernels-* "$TARGET_DIR"/release/build/spark-storage-*
 cargo build --release -p spark-server --no-default-features --features cuda

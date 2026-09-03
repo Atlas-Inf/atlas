@@ -7,6 +7,27 @@ The Windows half of this port has its own document —
 [`STRIX_WINDOWS_HIP.md`](STRIX_WINDOWS_HIP.md) — because its failure modes are
 entirely different. This one covers the target itself and the Linux legs.
 
+## Quick start
+
+With ROCm installed at `/opt/rocm` and Rust available:
+
+```bash
+ATLAS_HIPCC_WORKERS=3 CARGO_BUILD_JOBS=3 ./build-amd.sh
+NUM_DRAFTS=1 ./serve-amd.sh /path/to/Qwen3.8-27B-NVFP4
+```
+
+For a side-by-side ROCm install, point both commands at the same runtime and
+build directory:
+
+```bash
+export ATLAS_ROCM_HOME="$HOME/rocm-10.0.0-tarball/install"
+export CARGO_TARGET_DIR=target-rocm10
+ATLAS_HIPCC_WORKERS=3 CARGO_BUILD_JOBS=3 ./build-amd.sh
+NUM_DRAFTS=1 ./serve-amd.sh /path/to/Qwen3.8-27B-NVFP4
+```
+
+The server listens on port 8081 by default. Override it with `PORT=9000`.
+
 ## The target compiles no kernels of its own
 
 Two definitions, byte-identical to each other:
@@ -68,6 +89,19 @@ This override existed in the pre-restoration history and was never carried onto
 main; it is restored here. Unset, behaviour is unchanged.
 
 ## Validated
+
+### ROCm 10 + K=2 target-verify candidate — 2026-09-03
+
+On AzeezStrix, binary `4c0a8451…`, checkpoint revision `7d6f8d4d…`:
+
+- the copy-paste ROCm 10 build above completes successfully;
+- M=2 BF16 GEMV is bit-identical to two M=1 calls at a partial-block guard and
+  all eight real Qwen3.8 decode shapes; RMSNorm and GDN device oracles pass;
+- `agentic`-style 1,024-token n=3 MTP median is **8.916 tok/s**
+  [8.901, 8.954], versus **3.992 tok/s** [3.884, 4.184] on the clean pre-patch
+  ROCm 7.13 binary; target verify forward fell from ~497 ms to ~208 ms;
+- the MTP BFCL-70 diagnostic completed all 70 at 81.43 overall / 77.70
+  normalized. This is a diagnostic subset, not the pinned ST-995 gate.
 
 ### Build — Linux, native HIP, 2026-08-25
 

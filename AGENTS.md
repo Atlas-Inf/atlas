@@ -80,6 +80,12 @@ MLPerf). Strix Qwen3.8-unsloth baseline on this leg: overall 84.22 /
 normalized 83.68 (run-1788366618469517340.json, 2026-09-02, AzeezStrix,
 preservation recipe — see kernels/strix-hip/qwen3.8-27b/BENCH.toml).
 
+## Strix run policy
+
+AzeezStrix is an always-on, lid-independent headless-style benchmark host. Do
+not add temperature-triggered aborts or watchdogs that terminate benchmarks;
+thermal data is observability only, and launched runs are expected to finish.
+
 ## Adding a new model
 
 High-level walkthrough — the patterns to follow are already in-tree.

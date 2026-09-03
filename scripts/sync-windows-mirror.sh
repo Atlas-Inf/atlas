@@ -32,10 +32,15 @@ COPY=(
   crates/atlas-kernels/src/lib.rs
   crates/spark-model/Cargo.toml
   crates/spark-model/examples/dense_gemm_bf16_oracle.rs
+  crates/spark-model/examples/dense_gemv_bf16_oracle.rs
   crates/spark-model/examples/w4a16_cpu_reference_microtest.rs
   crates/spark-model/examples/inferspark_attn_paged_bf16_microtest.rs
+  crates/spark-model/examples/rmsnorm_vanilla_microtest.rs
   crates/spark-model/src/layers/dense_ffn.rs
   crates/spark-model/src/layers/ops/gemm_fp8_prefill.rs
+  crates/spark-model/src/layers/ops/gemm_quant.rs
+  crates/spark-model/src/layers/qwen3_attention/prefill/cache_skip.rs
+  crates/spark-model/src/layers/qwen3_ssm/trait_decode_batched.rs
   crates/spark-model/src/layers/qwen3_ssm/trait_prefill.rs
   crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs
   crates/spark-model/src/weight_loader/qwen35_dense.rs
@@ -47,6 +52,7 @@ COPY=(
   crates/spark-server/src/tool_parser/prompt_levers.rs
   crates/spark-server/src/tool_parser/qwen3_coder.rs
   crates/spark-server/src/tool_parser/tests/group_b.rs
+  kernels/strix-hip/common/dense_gemv_bf16_batch2.cu
   kernels/strix-hip/common/prefill_paged_compute.cuh
   kernels/strix-hip/qwen3.8-27b/MODEL.toml
   serve-amd.sh
