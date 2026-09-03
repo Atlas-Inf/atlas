@@ -1,30 +1,40 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# The MLPerf v6.1 edge-agentic ST accuracy leg (bfcl_v4, 62/10/10, floor 25,
-# n=995, seed 42, temp 0) for Qwen3.8-27B-NVFP4 (unsloth) on AzeezStrix —
-# the same instrument and draw as the previous working unsloth runs
-# (mlperf_unsloth_32slot 0.7648 / mlperf_unsloth_ccdaab7e 0.7196), served
-# under the submission profile mapped to Qwen3.8's AMD dtypes.
+# The MLPerf ST leg (harness bfcl_v4, THE MLPERF MIX: non_live 62 / live 10 /
+# hallucination 10, subset_floor 25, n=995, seeds 42, temp 0, offline/
+# max-throughput) for Qwen3.8-27B-NVFP4 (unsloth) on AzeezStrix — the same
+# category mix as the Atlas bfcl-subset golden draw and the
+# online_edge_full_run.yaml reference. Served under the submission profile
+# mapped to Qwen3.8's AMD dtypes (per-row FP8 -> BF16 preservation, rest
+# NVFP4, KV bf16, MTP bf16).
 set -euo pipefail
-cd ~/endpoints-mlperf
-. .venv/bin/activate
-D=examples/11_Edge_Agentic_Example
-sed -e 's|"Qwen3.6-27B-Q4_K_M"|"unsloth/Qwen3.8-27B-NVFP4"|' \
-    -e 's|http://localhost:8080|http://localhost:8081|' \
-    -e 's|results/edge_agentic_full_run/|results/mlperf_qwen38_unsloth_strix/|' \
-    "$D/online_edge_full_run.yaml" > "$D/golden_qwen38_unsloth_strix.yaml"
-echo "=== derived config (must show unsloth + 8081 + 62/10/10) ==="
-grep -nE 'name: "unsloth|localhost:8081|non_live: 62|live: 10|hallucination: 10|report_dir|temperature|seed:' "$D/golden_qwen38_unsloth_strix.yaml"
+SNAP=/home/azeez/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108
+D=/home/azeez/endpoints/examples/10_Edge_Agentic_Example
+RD=results_mlperf_st_qwen38_unsloth_strix
 
-# Serve: the submission profile mapped to Qwen3.8 (see q38_replay1007.sh).
+mkdir -p /home/azeez/endpoints/$RD
+# Derive from the PROVEN st996 config — only the model name, tokenizer,
+# report_dir, and THE MLPERF CATEGORY MIX (62/10/10, floor 25) change.
+sed -e "s|unsloth/Qwen3.6-27B-NVFP4|unsloth/Qwen3.8-27B-NVFP4|" \
+    -e "s|tokenizer_name: .*|tokenizer_name: $SNAP|" \
+    -e "s|results_st996_unsloth_ccdaab7e|$RD|" \
+    -e "s|hallucination: 12|hallucination: 10|" \
+    -e "s|live: 23|live: 10|" \
+    -e "s|non_live: 46|non_live: 62|" \
+    /home/azeez/endpoints/results_st996_unsloth_ccdaab7e/config.yaml \
+    > $D/mlperf_st_qwen38_unsloth.yaml
+echo "=== derived config (must show qwen38 + 62/10/10) ==="
+grep -nE 'name: "unsloth|hallucination: 10|live: 10|non_live: 62|report_dir' $D/mlperf_st_qwen38_unsloth.yaml
+
+# Serve: submission profile + preservation dtype mapping.
 cd ~/atlas-inf-pr8
 SHIM=$(ls -dt target/release/build/atlas-kernels-*/out | head -1)
 export LD_LIBRARY_PATH="$SHIM:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
 export ATLAS_W4A16_DP4A=1 ATLAS_FORCE_GLOBAL_GDN=1 ATLAS_W4A16_VARIANT=v1
 export ATLAS_SSM_TAIL_MIDCHUNK=1 ATLAS_KV_OVERCOMMIT=1
 export ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1 ATLAS_FP8_DEQUANT_FFN_TO_BF16=1 ATLAS_GDN_BF16_WEIGHTS=1
-pkill -f 'spark serve' 2>/dev/null && sleep 8 || true
-target/release/spark serve ~/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108 \
+pkill -f '[s]park serve' 2>/dev/null && sleep 8 || true
+target/release/spark serve "$SNAP" \
   --model-name unsloth/Qwen3.8-27B-NVFP4 \
   --host 127.0.0.1 --port 8081 \
   --max-seq-len 65536 --max-prefill-tokens 2048 \
@@ -33,24 +43,29 @@ target/release/spark serve ~/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B
   --max-batch-size 1 \
   --speculative --num-drafts 1 --mtp-quantization bf16 --mtp-vocab 100000 \
   --disable-tool-grammar true --enable-prefix-caching \
-  --ssm-cache-slots 32 --ssm-checkpoint-interval 16 \
+  --ssm-cache-slots 16 --ssm-checkpoint-interval 16 \
   --disable-thinking \
   --dangerously-allow-unresolved-kernel-lookups \
   >"$HOME/q38-mlperf-st-serve.log" 2>&1 &
 SPARK_PID=$!
-for i in $(seq 1 120); do
-  curl -s -m3 -o /dev/null -w "" http://127.0.0.1:8081/v1/models 2>/dev/null && break
+for i in $(seq 1 150); do
+  curl -s -m2 http://127.0.0.1:8081/v1/models >/dev/null 2>&1 && break
   kill -0 "$SPARK_PID" 2>/dev/null || { echo "SERVER DIED:"; tail -8 "$HOME/q38-mlperf-st-serve.log"; exit 1; }
   sleep 2
 done
-echo "server up (submission profile)"
+echo "server up (submission profile, preservation dtypes)"
 
-cd ~/endpoints-mlperf
-LOG=/home/azeez/mlperf_qwen38_unsloth_$(date +%Y%m%d_%H%M%S).log
-echo "$LOG" > /home/azeez/mlperf_current.txt
-echo "=== MLPerf-edge BFCL accuracy | 62/10/10 | qwen38 unsloth | submission profile | START $(date) ===" > "$LOG"
-inference-endpoint benchmark from-config --config "$D/golden_qwen38_unsloth_strix.yaml" --accuracy-only >> "$LOG" 2>&1
-echo "MLPERF_RC=$? $(date)" >> "$LOG"
-tail -5 "$LOG"
-echo "MLPERF_ST_DONE"
+cd ~/endpoints
+. .venv/bin/activate
+LOG=/home/azeez/mlperf_st_qwen38_$(date +%Y%m%d_%H%M%S).log
+echo "=== MLPerf ST | bfcl_v4 62/10/10 floor 25 | qwen38 unsloth | submission profile | START $(date) ===" > "$LOG"
+inference-endpoint benchmark from-config --config "$D/mlperf_st_qwen38_unsloth.yaml" --accuracy-only >> "$LOG" 2>&1
+echo "RC=$? $(date)" >> "$LOG"
+python3 - <<PY
+import json
+r = json.load(open("/home/azeez/endpoints/$RD/results.json"))
+s = r["accuracy_scores"]["bfcl_v4::function_calling"]["score"]
+print("MLPerf ST qwen38-unsloth:", json.dumps(s, indent=1))
+PY
+echo "MLPERF_ST_DONE rd=/home/azeez/endpoints/$RD"
 kill "$SPARK_PID" 2>/dev/null || true

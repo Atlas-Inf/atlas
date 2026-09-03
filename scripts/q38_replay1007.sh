@@ -33,7 +33,11 @@ yaml.safe_dump(c, open(cfg, "w"), sort_keys=False)
 print("replay config ->", cfg)
 PY
 
-# Serve: the previous working MLPerf submission profile, mapped to Qwen3.8.
+# Serve: the FROZEN ACCURACY RECIPE (the fingerprint the ST-995 baseline
+# used) — measured 2026-09-02: MTP K=2 on the 3.8 preservation build is
+# net-NEGATIVE (3.5 vs 5.9 tok/s at 96% acceptance; drafter+verify step
+# ~3.3x a serial step), so the replay runs without speculation. The
+# submission-profile variant is a follow-up once the drafter path is fixed.
 cd ~/atlas-inf-pr8
 SHIM=$(ls -dt target/release/build/atlas-kernels-*/out | head -1)
 export LD_LIBRARY_PATH="$SHIM:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
@@ -44,13 +48,12 @@ pkill -f 'spark serve' 2>/dev/null && sleep 8 || true
 target/release/spark serve ~/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108 \
   --model-name unsloth/Qwen3.8-27B-NVFP4 \
   --host 127.0.0.1 --port "$PORT" \
-  --max-seq-len 65536 --max-prefill-tokens 2048 \
-  --gpu-memory-utilization 0.92 \
+  --max-seq-len 4096 --max-prefill-tokens 2048 \
+  --gpu-memory-utilization 0.88 \
   --kv-cache-dtype bf16 --lm-head-dtype bf16 \
   --max-batch-size 1 \
-  --speculative --num-drafts 1 --mtp-quantization bf16 --mtp-vocab 100000 \
-  --disable-tool-grammar true --enable-prefix-caching \
-  --ssm-cache-slots 32 --ssm-checkpoint-interval 16 \
+  --disable-tool-grammar true \
+  --ssm-cache-slots 0 --ssm-checkpoint-interval 16 \
   --disable-thinking \
   --dangerously-allow-unresolved-kernel-lookups \
   >"$LOG" 2>&1 &
