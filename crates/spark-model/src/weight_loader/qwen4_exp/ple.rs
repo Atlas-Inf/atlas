@@ -37,14 +37,33 @@ use crate::layers::ple::{PleIdDims, PleWeights};
 use crate::weight_map::dense;
 
 /// Resident rows in the pinned arena. A prefill pins `tokens * ngram_heads`
-/// rows at once (2048 x 16 = 32,768), so the default leaves headroom over the
-/// largest batch this model currently fits; at 320 B/row it costs ~21 MB.
+/// rows at once, so the default is DERIVED from the serve config —
+/// `max_batch_tokens * ngram_heads`, rounded up to a power of two, floored at
+/// 65536 — rather than a fixed count. The old 65536 assumed a 2048-token
+/// chunk (2048 x 16 = 32,768) and the default serve config presents 8193
+/// (8193 x 16 = 131,088), so every prompt past 8192 tokens died on the
+/// cache's "every one of N slots is pinned by the batch in flight" bail. At
+/// 320 B/row the derived 262,144 slots cost ~84 MB.
 #[cfg(feature = "cuda")]
-fn slots_from_env() -> usize {
-    std::env::var("ATLAS_PLE_CACHE_SLOTS")
+fn derived_slots(max_batch_tokens: usize, ngram_heads: usize) -> usize {
+    (max_batch_tokens
+        .saturating_mul(ngram_heads)
+        .next_power_of_two())
+    .max(65536)
+}
+
+#[cfg(feature = "cuda")]
+fn slots_from_env(max_batch_tokens: usize, ngram_heads: usize) -> (usize, &'static str) {
+    match std::env::var("ATLAS_PLE_CACHE_SLOTS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(65536)
+    {
+        Some(n) if n > 0 => (n, "ATLAS_PLE_CACHE_SLOTS"),
+        _ => (
+            derived_slots(max_batch_tokens, ngram_heads),
+            "max_batch_tokens*heads rounded up",
+        ),
+    }
 }
 
 /// Read a small I64 device tensor back to the host.
@@ -202,7 +221,7 @@ pub(super) fn load(
              F8_E4M3 rows (`batched_embed` / `batched_embed_fp8`)"
         ),
     };
-    let slots = slots_from_env();
+    let (slots, slots_from) = slots_from_env(config.max_batch_tokens, heads);
     let mut cache = spark_storage::NgramRowCache::open_segmented(
         &shards,
         rows_per as u64,
@@ -238,7 +257,8 @@ pub(super) fn load(
         "PLE at MODEL LAYER {layer_idx} (ple_layer_ids={:?}, 1-indexed): \
          {} shards over {} file(s) x {rows_per} rows x {head_dim} dims = {} rows \
          ({:.1} GB {dtype:?}) \
-         served off NVMe with {slots} cached slots ({:.1} MB); {heads} heads, \
+         served off NVMe with {slots} cached slots ({:.1} MB, {slots_from}: \
+         max_batch_tokens={} x {heads} heads = {}, floored at 65536); \
          conv k={} dilation={dilation} (state {} steps)",
         config.ple_layer_ids,
         shards.len(),
@@ -246,6 +266,8 @@ pub(super) fn load(
         shards.len() * rows_per,
         (shards.len() * rows_per * head_dim * elem) as f64 / 1e9,
         (slots * head_dim * 2) as f64 / 1e6,
+        config.max_batch_tokens,
+        config.max_batch_tokens.saturating_mul(heads),
         config.ple_conv_kernel_size,
         (config.ple_conv_kernel_size - 1) * dilation,
     );
@@ -288,4 +310,19 @@ pub(super) fn load(
          cache that serves them needs the `cuda` feature; this build cannot \
          serve it"
     )
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod slots_tests {
+    use super::derived_slots;
+
+    /// The fixed 65536 this replaced assumed a 2048-token chunk; the default
+    /// serve config presents 8193, and a prefill pins tokens x heads rows.
+    #[test]
+    fn derived_slots_cover_the_default_chunk() {
+        assert_eq!(derived_slots(8193, 16), 262_144); // 131,088 rounded up
+        assert_eq!(derived_slots(2048, 16), 65_536); // the old assumption is the floor
+        assert_eq!(derived_slots(4096, 16), 65_536); // exactly the floor
+        assert!(derived_slots(20481, 16) >= 20481 * 16);
+    }
 }
