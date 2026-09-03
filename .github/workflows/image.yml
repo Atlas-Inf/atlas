@@ -42,6 +42,11 @@ on:
         required: false
         type: string
         default: ""
+      tag_latest:
+        description: "Also tag and push as :latest"
+        required: false
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -151,6 +156,10 @@ jobs:
           # `:main` is a moving convenience tag for "tip of main, unverified".
           docker push "$IMAGE:sha-$SHA"
           docker push "$IMAGE:main"
+          if [ "${{ inputs.tag_latest }}" = "true" ]; then
+            docker tag "$IMAGE:sha-$SHA" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
 
       - name: Summary
         if: success()

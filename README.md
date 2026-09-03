@@ -30,6 +30,19 @@
   <a href="https://atlasinference.dev"><img alt="atlasinference.dev" src="https://img.shields.io/badge/%F0%9F%8C%90%20atlasinference.dev-F48C06?style=for-the-badge"></a>
 </p>
 
+> [!WARNING]
+> **Work in progress.** This r0b0tlab fork carries active GB10/SM121 and
+> Nemotron 3.5 Lightning + native DSpark development. The current `main` branch
+> is published for source visibility and collaboration; it is **not yet a
+> qualified public Atlas release**. The integrated Lightning source is
+> `1296e125aeafe37c01fc6d1eebb5e58e89dccd3b` with tree
+> `4b303eec5cc24cd502b58e54dc152b925fcd1e8a`. Native source/build/runtime gates
+> pass, including the DSpark churn repair and the AR multi-sequence promotion;
+> the full claim-bearing r0b0bench suite and immutable registry image are still
+> pending. Historical selected-lane evidence remains under
+> [`evidence/nemotron-lightning-cd2218e-20260818/`](evidence/nemotron-lightning-cd2218e-20260818/)
+> and is intentionally not relabeled as evidence for this SHA.
+
 ---
 
 ## 📑 Table of Contents

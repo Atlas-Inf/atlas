@@ -227,6 +227,11 @@ pub struct MtpHead {
     moe_topk_k: Option<KernelHandle>,
     moe_silu_mul_k: Option<KernelHandle>,
     moe_weighted_sum_blend_k: Option<KernelHandle>,
+    /// Lightning MTP: plain Q, skip Q/K RMSNorm + attn sigmoid gate, ReLU² MoE.
+    lightning: bool,
+    /// Shared-expert intermediate for Lightning (3712). Routed uses moe_intermediate.
+    shared_inter: u32,
+    relu2_k: KernelHandle,
     /// Batched BF16 GEMM for the drafter-prefill pass (0 when absent).
     dense_gemm_k: KernelHandle,
     /// Tensor-core pipelined BF16 GEMM (`dense_gemm_bf16_pipelined`) for the

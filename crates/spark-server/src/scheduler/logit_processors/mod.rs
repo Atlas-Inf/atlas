@@ -253,15 +253,7 @@ pub fn process_position_logits(
     //    penalties, no bias. Eligible on both kinds (the diagnostic's point
     //    is an identical bypass everywhere).
     if ctx.sampling.force_temp_zero {
-        let mut best_idx: u32 = 0;
-        let mut best_val: f32 = f32::NEG_INFINITY;
-        for (j, &v) in logits.iter().enumerate() {
-            if v > best_val {
-                best_val = v;
-                best_idx = j as u32;
-            }
-        }
-        return Some(best_idx);
+        return Some(spark_runtime::sampler::argmax_last_wins_f32(logits));
     }
 
     // 2. Canonical pre-sample pipeline (+ AdaDec diagnostic under this

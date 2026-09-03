@@ -293,3 +293,28 @@ fn no_model_shadow_drops_a_common_kernel() {
         drift.join("\n  ")
     );
 }
+
+/// Lightning is its own build/registry target, but hidden-size 2688 uses the
+/// exact Nano SM121 shadows. Pin that inheritance at the filesystem boundary:
+/// selecting the dedicated Lightning target must still compile Nano's norm and
+/// w4a16 override (including the required `w4a16_gemm_t_k64` entry point).
+#[test]
+fn lightning_target_inherits_the_nano_hidden2688_shadows() {
+    let root = kernels_root().join("gb10");
+    let nano = root.join("nemotron-3-nano-30b-a3b/nvfp4");
+    let lightning = root.join("nemotron-3.5-lightning-30b-a3b/nvfp4");
+    for name in ["KERNEL.toml", "rms_norm.cu", "w4a16_gemm.cu"] {
+        let inherited = lightning.join(name);
+        let source = nano.join(name);
+        assert_eq!(
+            std::fs::canonicalize(&inherited)
+                .unwrap_or_else(|e| { panic!("Lightning target missing inherited {name}: {e}") }),
+            std::fs::canonicalize(&source).expect("Nano shadow source exists"),
+            "Lightning {name} must inherit the exact Nano hidden-2688 shadow"
+        );
+    }
+    assert!(
+        entry_points(&lightning.join("w4a16_gemm.cu")).contains("w4a16_gemm_t_k64"),
+        "Lightning target must compile required w4a16::w4a16_gemm_t_k64"
+    );
+}

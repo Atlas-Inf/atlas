@@ -20,6 +20,7 @@ impl DraftProposer for MtpHead {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         ctx: &ForwardContext,
         stream: u64,
         draft_embed_target: Option<DevicePtr>,
@@ -90,6 +91,7 @@ impl DraftProposer for MtpHead {
         positions: &[usize],
         num_drafts: usize,
         states: &mut [&mut dyn ProposerState],
+        _expected_owners: Option<&[crate::layers::dflash_head::SequenceGeneration]>,
         ctx: &ForwardContext,
         stream: u64,
         out_conf: Option<&mut Vec<Vec<f32>>>,
@@ -228,6 +230,7 @@ impl DraftProposer for MtpHead {
     fn after_verify(
         &self,
         num_accepted: usize,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         state: &mut dyn ProposerState,
         _stream: u64,
     ) -> Result<()> {
@@ -263,7 +266,12 @@ impl DraftProposer for MtpHead {
         Ok(())
     }
 
-    fn free_state(&self, _gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+    fn free_state(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
+        state: &mut dyn ProposerState,
+    ) -> Result<()> {
         let mtp_state = state
             .as_any_mut()
             .downcast_mut::<MtpProposerState>()

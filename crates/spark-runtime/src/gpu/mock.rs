@@ -35,6 +35,10 @@ pub struct MockGpuBackend {
     /// assert the SHAPE of the transfer, not just the bytes.
     d2d_2d: AtomicUsize,
     host_pinned_allocs: AtomicUsize,
+    /// Pending `free` failure injections (see [`Self::fail_next_free`]).
+    pending_free_failures: AtomicUsize,
+    /// `destroy_graph` call counter (see [`Self::destroy_graph_count`]).
+    destroyed_graphs: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +67,24 @@ impl MockGpuBackend {
             d2d: AtomicUsize::new(0),
             d2d_2d: AtomicUsize::new(0),
             host_pinned_allocs: AtomicUsize::new(0),
+            pending_free_failures: AtomicUsize::new(0),
+            destroyed_graphs: AtomicUsize::new(0),
         }
+    }
+
+    /// Queue one `free` failure: the next `free` call returns an error and
+    /// consumes one queued failure. Lets cleanup-path tests prove a failed
+    /// free keeps its resource observable/retryable instead of silently
+    /// leaking (queue N to fail N consecutive frees).
+    pub fn fail_next_free(&self) {
+        self.pending_free_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `destroy_graph` calls so far — the tripwire proving a cleanup error
+    /// path does NOT destroy pooled graphs.
+    pub fn destroy_graph_count(&self) -> usize {
+        self.destroyed_graphs
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn alloc_count(&self) -> usize {
@@ -201,6 +222,13 @@ impl GpuBackend for MockGpuBackend {
     }
 
     fn free(&self, ptr: DevicePtr) -> Result<()> {
+        if self
+            .pending_free_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            anyhow::bail!("mock free failed (injected): ptr {ptr}");
+        }
         self.allocs.lock().remove(&ptr.0);
         Ok(())
     }
@@ -356,5 +384,10 @@ impl GpuBackend for MockGpuBackend {
 
     fn free_memory(&self) -> Result<usize> {
         Ok(120 * 1024 * 1024 * 1024) // 120 GB
+    }
+
+    fn destroy_graph(&self, _graph: GraphHandle) -> Result<()> {
+        self.destroyed_graphs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }

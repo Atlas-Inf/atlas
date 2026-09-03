@@ -198,7 +198,11 @@ impl TransformerModel {
         // and `decode_a2` already apply this veto; the verify paths never did,
         // because on this model they used to refuse before reaching a graph.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
-        let graphs_on = super::verify_e2::verify_graphs_enabled() && !k4_diag && !layer_veto;
+        // Per-layer DFlash timing must see real launches, not one replayed
+        // graph, so it disables capture the same way k4 diag does.
+        let time_layers = std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
+        let graphs_on =
+            super::verify_e2::verify_graphs_enabled() && !k4_diag && !layer_veto && !time_layers;
         let graph_key = if graphs_on {
             self.verify_batched_graph_key(&*seqs, ks, wy_tables_base.is_null())
         } else {

@@ -17,6 +17,7 @@ use super::ssm_snapshot::SsmSnapshotPool;
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
+use crate::layers::dflash_head::LightningDsparkIdentityLatch;
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
@@ -204,6 +205,9 @@ pub struct TransformerModel {
     pub(super) suppress_graphs: std::sync::atomic::AtomicBool,
     /// MTP draft proposer (built from mtp_weights at init).
     pub(super) proposer: Option<Arc<dyn DraftProposer>>,
+    /// Immutable typed identity for the admitted official Lightning product.
+    /// `None` for generic DFlash, MTP, and non-speculative models.
+    pub(super) lightning_dspark_identity: LightningDsparkIdentityLatch,
     /// Dedicated buffer for saving hidden state before MTP head runs.
     /// Size: hidden_size * 4 bytes (one FP32 vector). MTP overwrites shared
     /// buffers (norm_output etc.), so the target hidden must be saved here first.
@@ -254,6 +258,9 @@ pub struct TransformerModel {
     /// SSOT). 0 = no capture ever started (matches the fresh-seq stamp 0,
     /// which is harmless: `captured >= prompt_len >= 2` fails at len 0).
     pub(super) mtp_prefill_capture_gen: std::sync::atomic::AtomicU64,
+    /// Monotonic sequence-lifetime generation used by DSpark owner stamps.
+    /// Never emits zero; exhaustion fails sequence allocation.
+    pub(super) dspark_sequence_generation: std::sync::atomic::AtomicU64,
     /// ATLAS_MTP_CARRY_DRAFTER: the previous turn's drafter KV, held so the
     /// next turn of the same session can adopt it instead of rebuilding
     /// (1136 ms at 12k rows) or — as today — silently going without. Single
@@ -282,6 +289,8 @@ pub struct TransformerModel {
     /// `try_dflash_capture_all` must never write past this many rows. Single
     /// source of truth for the buffer's KMAX; 0 when DFlash is disabled.
     pub(super) dflash_hidden_save_rows: usize,
+    /// How many sequences the capture buffer is strided for (1 = C=1 layout).
+    pub(super) dflash_hidden_save_nseq: usize,
     /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
     /// Same rationale as `decode_graph`: the captured graph has SSM
     /// h_state/conv_state pointers baked in as kernel arguments, so replay for

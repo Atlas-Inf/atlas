@@ -188,10 +188,11 @@ pub fn w4a16_gemv_batch3(
 ///
 /// Reads the NVFP4 weight matrix ONCE and computes `m` outputs (one per seq),
 /// amortizing the weight read across the batch. `kernel` is `w4a16_gemv_batch4`
-/// (M<=4), `w4a16_gemv_batch8` (M<=8, chain verify) or `w4a16_gemv_batch16`
-/// (M<=16). A:`[m,K]` BF16, C:`[m,N]` BF16.
+/// (M<=4), `w4a16_gemv_batch8` (M<=8, chain verify),
+/// `w4a16_gemv_batch16` (M<=16), or `w4a16_gemv_batch32` (M<=32).
+/// A:`[m,K]` BF16, C:`[m,N]` BF16.
 ///
-/// Kernel: `w4a16_gemv_batch4/8/16(A, B_packed, B_scale, scale2, C, M, N, K)`
+/// Kernel: `w4a16_gemv_batch4/8/16/32(A, B_packed, B_scale, scale2, C, M, N, K)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 pub fn w4a16_gemv_batchm(
     gpu: &dyn GpuBackend,
@@ -204,10 +205,12 @@ pub fn w4a16_gemv_batchm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    // Largest template is w4a16_gemv_batch16 (MAX_M=16). Above that the
-    // kernel SILENTLY truncates: rows 0..15 computed, rows 16.. never
-    // written — garbage output, not a crash.
-    debug_assert!(m <= 16, "w4a16_gemv_batchm caps at M=16 (m={m})");
+    // Largest template is w4a16_gemv_batch32 (MAX_M=32). Refuse rather than
+    // silently leaving rows above a selected template's bound unwritten.
+    anyhow::ensure!(
+        (1..=32).contains(&m),
+        "w4a16_gemv_batchm: m={m} outside 1..=32"
+    );
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])

@@ -18,6 +18,7 @@
 
 use parking_lot::Mutex;
 use std::any::Any;
+use std::collections::HashMap;
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -25,6 +26,17 @@ use spark_runtime::kv_cache::PagedKvCache;
 
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
+
+pub mod product_policy;
+mod startup_diagnostics;
+pub use product_policy::{
+    DsparkStartupExecution, LightningDsparkIdentityLatch, LightningDsparkPolicyError,
+    LightningDsparkProductPolicy, LightningDsparkRuntimeToggles, LightningStructuralGraphState,
+    enforce_lightning_structural_gate,
+};
+pub use startup_diagnostics::DsparkDiagnostics;
+#[cfg(test)]
+mod product_policy_tests;
 
 /// Kernel handles for the DFlash γ-block forward chain. All resolved once
 /// at `BlockDiffusionDraftHead::from_weights` against the active GPU backend
@@ -34,6 +46,7 @@ pub struct DflashKernels {
     pub rms_norm: KernelHandle,
     pub residual_rms_norm: KernelHandle,
     pub dense_gemv: KernelHandle,
+    pub dense_gemv_batchm: KernelHandle,
     pub dense_gemm: KernelHandle,
     /// NVFP4 GEMM for the final logits when the shared lm_head is NVFP4
     /// (e.g. Holo): a BF16 `dense_gemm` on NVFP4-packed bytes reads garbage
@@ -61,10 +74,15 @@ pub struct DflashKernels {
     /// dynamic values written to the indirect-args buffer pre-launch.
     /// Resolves to kernel `inferspark_prefill_paged_indirect`.
     pub prefill_attn_dflash_bf16_indirect: KernelHandle,
+    pub prefill_attn_dflash_bf16_batched_sink: KernelHandle,
     pub silu_mul: KernelHandle,
     pub residual_add: KernelHandle,
     pub argmax: KernelHandle,
+    pub argmax_batch: KernelHandle,
     pub batched_embed: KernelHandle,
+    pub batch_anchor_add: KernelHandle,
+    pub batch_markov_add_bias: KernelHandle,
+    pub batch_markov_store_tokens: KernelHandle,
     /// Phase 2 Option B: builds `[count]` i32 slot indices on-device
     /// from a host-provided block_table. Used by propose.rs to populate
     /// the slot_mapping passed to reshape_and_cache and precompute_ctx_kv.
@@ -93,6 +111,29 @@ pub struct DflashKernels {
     /// for `fp8_gemm_n128_row_scaled` when M=γ=16. Single warp per CTA,
     /// no wasted M_TILE rows. Used by the lm_head GEMM.
     pub fp8_gemm_n128_row_scaled_m16: KernelHandle,
+    pub w4a16_gemv_batch4: KernelHandle,
+    pub w4a16_gemv_batch8: KernelHandle,
+    pub w4a16_gemv_batch16: KernelHandle,
+    pub w4a16_gemv_batch32: KernelHandle,
+}
+
+/// Per-step scratch buffers for the γ-block forward.
+///
+/// Each propose lane (see [`DflashLane`]) owns one full copy: the piecewise
+/// propose graphs bake these pointers at capture, so a lane must always
+/// replay with the scratch it captured with.
+pub struct DflashLane {
+    /// CUDA stream for this lane (lane 0 = the backend default stream;
+    /// lanes 1.. are non-blocking secondary streams).
+    pub stream: u64,
+    pub scratch: DflashScratch,
+    /// Scratch `[rank]` BF16 for the previous-token Markov embed.
+    pub markov_embed: DevicePtr,
+    /// Scratch `[vocab]` BF16 Markov bias row.
+    pub markov_bias: DevicePtr,
+    /// Event recorded after the lane's propose work; the default stream
+    /// waits on it before verify so cross-lane work is ordered.
+    pub done_event: u64,
 }
 
 /// Per-step scratch buffers for the γ-block forward.
@@ -148,6 +189,15 @@ pub struct DflashScratch {
     pub draft_tokens_event: u64,
     pub logits: DevicePtr,
     pub draft_tokens_dev: DevicePtr,
+    /// 4-byte device slot holding the Markov prev token. Host writes it
+    /// via pinned `markov_prev_host_pinned` BEFORE the captured tail
+    /// graph; the graph only reads this pointer. Do not H2D last_token
+    /// from a stack temporary inside the tail (replay would see garbage).
+    pub markov_prev_dev: DevicePtr,
+    /// Pinned 4-byte host source for `markov_prev_dev`. Stable address
+    /// so a captured H2D (if any) would still be valid; we keep the
+    /// H2D outside the graph anyway.
+    pub markov_prev_host_pinned: std::sync::atomic::AtomicPtr<u8>,
     /// `[ctx_window + γ]` i32 positions. First ctx_window are
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
@@ -168,6 +218,10 @@ pub enum DflashQuantization {
     /// f32 scales at model load. Activations stay BF16; KV cache stays
     /// BF16. GEMMs use `fp8_gemm_n128` (BF16 × FP8 → BF16).
     Fp8Weights,
+    /// Weight-only NVFP4: same seven GEMMs quantized at load, consumed by
+    /// `w4a16_gemv_batch4` at γ≤4 (small-M, no tile waste). Default on;
+    /// `ATLAS_NO_DFLASH_DRAFTER_NVFP4` to keep BF16 pipelined GEMM.
+    Nvfp4Weights,
 }
 
 /// Per-drafter-layer Qwen3-style weights. Phase 1 is BF16-only; **Phase G**
@@ -190,6 +244,9 @@ pub struct DflashLayer {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
+    /// Per-q-head attention sink `[num_q_heads]` BF16. Lightning DSpark ships
+    /// this; Qwen-DFlash does not.
+    pub attention_sink_bias: Option<DenseWeight>,
 
     // Phase G — optional FP8 mirrors of the seven dense-GEMM weights.
     // Populated at load time when `ATLAS_DFLASH_DRAFTER_FP8=1`, consumed
@@ -202,6 +259,13 @@ pub struct DflashLayer {
     pub gate_proj_fp8: Option<crate::weight_map::Fp8DenseWeight>,
     pub up_proj_fp8: Option<crate::weight_map::Fp8DenseWeight>,
     pub down_proj_fp8: Option<crate::weight_map::Fp8DenseWeight>,
+    pub q_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub k_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub v_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub o_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub gate_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub up_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub down_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
 }
 
 /// Per-sequence DFlash drafter state. One paged KV cache per drafter layer
@@ -249,6 +313,16 @@ pub struct DflashProposerState {
     /// Width (bytes) of one `ctx_hidden_acc` slot — `5 * target_hidden * bf16`.
     /// Stored to avoid re-deriving on every append.
     pub ctx_slot_bytes: usize,
+    /// Propose lane this seq is pinned to for its lifetime. Assigned once
+    /// round-robin at `alloc_state` and NEVER derived from the batch
+    /// position: ramp/drain reorders the batch between steps, and a seq's
+    /// captured propose graphs bake their lane's scratch pointers — moving
+    /// lanes would replay against another lane's scratch (silent corruption).
+    /// `usize::MAX` = pre-assignment sentinel (defensive only).
+    pub lane_id: usize,
+    /// Generation-stamped ownership descriptor. Bound by model sequence
+    /// allocation before the state can propose or own CUDA graphs.
+    pub(crate) lifecycle: Option<CaptureDescriptor>,
 
     // ─── Phase 2 Option B fields (paged KV cache for ctx) ───────────────
     /// Device-side block table for the drafter's paged KV cache. Allocated
@@ -285,6 +359,66 @@ pub struct DflashProposerState {
     pub ctx_positions: Vec<i32>,
 }
 
+impl DflashProposerState {
+    /// Transactional reclaim when owner validation fails in `free_state`:
+    /// retire the descriptor best-effort, return KV blocks, free the ctx
+    /// accumulator and device block table, and reset the lazy-alloc
+    /// watermarks — the error still propagates, but nothing owned by this
+    /// state leaks.
+    ///
+    /// A backend `free` that itself fails is LOGGED and the pointer is
+    /// RETAINED (not cleared), so a later cleanup retry can still release
+    /// it — a failed free must not silently convert into an unrecoverable
+    /// leak. Production-owned seam: directly unit-tested including the
+    /// free-failure retention behavior.
+    pub(crate) fn reclaim_on_owner_failure(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        kv_cache: &parking_lot::Mutex<spark_runtime::kv_cache::PagedKvCache>,
+    ) {
+        if let Some(lifecycle) = self.lifecycle.as_mut() {
+            let _ = lifecycle.retire(lifecycle.owner());
+        }
+        if !self.block_table.is_empty() {
+            kv_cache.lock().free_blocks(&self.block_table);
+            self.block_table.clear();
+        }
+        if self.ctx_hidden_acc.0 != 0 {
+            if let Err(error) = gpu.free(self.ctx_hidden_acc) {
+                tracing::error!(
+                    "DSpark reclaim: freeing ctx accumulator {:#x} failed ({error}); \
+                     pointer retained for a later cleanup retry",
+                    self.ctx_hidden_acc.0
+                );
+            } else {
+                self.ctx_hidden_acc = DevicePtr(0);
+            }
+        }
+        if let Some(bt) = self.block_table_dev.take() {
+            match gpu.free(bt) {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::error!(
+                        "DSpark reclaim: freeing device block table {:#x} failed ({error}); \
+                         handle restored for a later cleanup retry",
+                        bt.0
+                    );
+                    // Restore the handle so a later cleanup retry can free it
+                    // (a taken-and-dropped handle is an unrecoverable leak).
+                    self.block_table_dev = Some(bt);
+                }
+            }
+        }
+        self.max_ctx_count_drafter = 0;
+        self.ctx_count_drafter = 0;
+        self.ctx_committed = 0;
+        self.ctx_positions.clear();
+        self.seq_len = 0;
+        self.ctx_len = 0;
+        self.prefill_done = false;
+    }
+}
+
 impl ProposerState for DflashProposerState {
     fn as_any(&self) -> &dyn Any {
         self
@@ -316,6 +450,9 @@ pub struct BlockDiffusionDraftHead {
     pub gamma: usize,
     pub mask_token_id: u32,
     pub window_size: Option<usize>,
+    /// Causal γ-block attention. `true` for Lightning DSpark
+    /// (`dflash_config.causal`); `false` for Qwen-DFlash bidirectional.
+    pub query_causal: bool,
     /// `target_layer_ids`. Same data as `TransformerModel::dflash_capture_layers`,
     /// repeated here so the loader is the single source of truth; the model
     /// reads these to size its capture buffer.
@@ -358,6 +495,11 @@ pub struct BlockDiffusionDraftHead {
     /// once at model entry. Replaces the earlier (incorrect) "per-layer KV
     /// injection" design.
     pub fc: DenseWeight,
+    /// DSpark Markov `w1` `[vocab, rank]` BF16. None for DFlash-only heads.
+    pub markov_w1: Option<DenseWeight>,
+    /// DSpark Markov `w2` `[vocab, rank]` BF16.
+    pub markov_w2: Option<DenseWeight>,
+    pub markov_rank: usize,
     /// Optional draft-vocab-id → target-vocab-id remap. `None` when the
     /// drafter shares vocab with the target (Qwen3.6-35B-A3B-DFlash case:
     /// vocab_size == draft_vocab_size == 248320).
@@ -389,6 +531,45 @@ pub struct BlockDiffusionDraftHead {
 
     /// Per-step scratch buffers (allocated once at construction, reused).
     pub scratch: DflashScratch,
+    /// Stable staging for the first native B×gamma operation. Capacity is the
+    /// model's admitted max batch; rows are `[sequence][gamma]`.
+    pub batch_capacity: usize,
+    pub batch_query_ids_dev: DevicePtr,
+    pub batch_position_ids: DevicePtr,
+    pub batch_query_embed: DevicePtr,
+    pub batch_target_hidden: DevicePtr,
+    pub batch_fc_proj: DevicePtr,
+    pub batch_fc_norm: DevicePtr,
+    pub batch_norm: DevicePtr,
+    pub batch_q: DevicePtr,
+    pub batch_k: DevicePtr,
+    pub batch_v: DevicePtr,
+    pub batch_block_table_ptrs: DevicePtr,
+    pub batch_cu_seqlens: DevicePtr,
+    pub batch_kv_lens: DevicePtr,
+    pub batch_attention_args: DevicePtr,
+    pub batch_slot_mapping: DevicePtr,
+    pub batch_attn_out: DevicePtr,
+    pub batch_attn_proj: DevicePtr,
+    pub batch_mlp_gate: DevicePtr,
+    pub batch_mlp_up: DevicePtr,
+    pub batch_mlp_down: DevicePtr,
+    pub batch_logits: DevicePtr,
+    pub batch_tokens: DevicePtr,
+    pub batch_markov_prev: DevicePtr,
+    pub batch_markov_embed: DevicePtr,
+    pub batch_markov_bias: DevicePtr,
+
+    /// Additional propose lanes (lane 0 IS `self.scratch` on the default
+    /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
+    /// A sequence's lane is fixed for its lifetime (`slot % lanes`) so its
+    /// captured graphs always replay against the scratch they captured with.
+    pub extra_lanes: Vec<DflashLane>,
+
+    /// Lane-0 Markov scratch mirrors (kept on the head for the single-lane
+    /// path; lanes 1.. carry their own copies inside `extra_lanes`).
+    pub lane0_markov_embed: DevicePtr,
+    pub lane0_markov_bias: DevicePtr,
 
     /// All kernel handles needed by `propose()` and the eventual prefill
     /// projection (`precompute_and_store_context_kv`).
@@ -433,7 +614,19 @@ pub struct BlockDiffusionDraftHead {
     /// with one capture per subgraph. Attention is NEVER captured —
     /// it's the natural sync barrier between captured subgraphs
     /// (vLLM piecewise convention). See design doc §15.
-    pub propose_graphs: Mutex<Option<Vec<spark_runtime::gpu::GraphHandle>>>,
+    /// Piecewise propose graphs keyed by validated sequence generation and
+    /// every captured pointer/lane identity. Pointer reuse cannot cross a
+    /// retired generation. `GraphHandle(0)` remains the eager sentinel.
+    pub propose_graphs: Mutex<HashMap<DflashGraphIdentity, Vec<spark_runtime::gpu::GraphHandle>>>,
+    /// Round-robin counter handing out propose lanes at `alloc_state`.
+    /// One extra-lane stream may serve several seqs (n > lanes); the lane
+    /// itself never moves for a seq.
+    pub next_lane: std::sync::atomic::AtomicUsize,
+    /// Entry-ordering event: recorded on the default stream at the top of
+    /// the multi-lane `propose_batch`; every extra lane waits on it so
+    /// drafter-ctx precompute / `after_verify` writes enqueued on the
+    /// default stream are visible before lanes read them.
+    pub lanes_start_event: u64,
     /// When set, all `forward_block` calls run eagerly. Mirrors target-model
     /// `TransformerModel::suppress_graphs` so external code can disable
     /// graphs at runtime (e.g. while calibrating FP8 KV).
@@ -449,16 +642,143 @@ pub struct BlockDiffusionDraftHead {
 
     // Quantization mode (BF16 only for Phase 1).
     pub quant: DflashQuantization,
+
+    /// Startup-static execution values, resolved once at construction.
+    /// `propose`/`forward_block`/lane build read this instead of the
+    /// process environment. Product heads derive it from the validated
+    /// Lightning policy; generic heads keep legacy lenient semantics.
+    pub startup: DsparkStartupExecution,
 }
 
+mod contract;
+pub use contract::{
+    AttentionLayout, BonusLayout, CheckpointLayout, ConfidenceLayout, KvDtype, KvLayout,
+    LIGHTNING_ALGORITHM, LIGHTNING_CHECKPOINT_BLOCK_SIZE, LIGHTNING_EP, LIGHTNING_MARKOV_RANK,
+    LIGHTNING_MODEL_IDENTITY, LIGHTNING_NUM_DRAFTS, LIGHTNING_PHYSICAL_KV_PAGE_SIZE,
+    LIGHTNING_SERVED_GAMMA, LIGHTNING_SWA_WINDOW, LIGHTNING_TAPS, LIGHTNING_TARGET_HIDDEN_SIZE,
+    LIGHTNING_TARGET_MODEL_TYPE, LIGHTNING_TARGET_NUM_EXPERTS, LIGHTNING_TARGET_NUM_LAYERS,
+    LIGHTNING_TARGET_TOP_K, LIGHTNING_TP, LightningDsparkContractError, LightningDsparkProfile,
+    MarkovLayout, ParallelismLayout,
+};
+#[cfg(test)]
+mod contract_tests;
+mod row_contract;
+pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, LightningRowContract};
+mod batch_inputs;
+pub use batch_inputs::{DsparkBatchInput, DsparkBatchInputError, DsparkBatchSequence};
+mod batch_attention;
+mod batch_execution;
+#[cfg(test)]
+mod batch_execution_tests;
+mod batch_forward;
+#[cfg(test)]
+mod batch_inputs_tests;
+mod batch_projection;
+mod lifecycle;
+#[cfg(test)]
+mod row_contract_tests;
+pub use lifecycle::{
+    CaptureDescriptor, CaptureStatus, DflashGraphIdentity, DsparkLifecycleError, SequenceGeneration,
+};
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
+#[cfg(test)]
+mod free_state_tests;
 mod from_weights;
+#[cfg(test)]
+mod lifecycle_tests;
+mod markov;
+mod nvfp4;
 mod precompute_ctx_kv;
 mod propose;
 
+impl BlockDiffusionDraftHead {
+    /// Total propose lanes (lane 0 = default-stream scratch; the rest live
+    /// in `extra_lanes`). `ATLAS_DFLASH_PROPOSE_LANES` overrides (default 1).
+    pub fn lane_count(&self) -> usize {
+        1 + self.extra_lanes.len()
+    }
+
+    /// Resolve a lane's mutable propose resources: (stream, scratch,
+    /// markov_embed, markov_bias). Lane 0 is the head's own scratch on the
+    /// backend default stream; lanes 1.. are independent copies.
+    pub(super) fn lane(
+        &self,
+        lane: usize,
+        default_stream: u64,
+    ) -> (u64, &DflashScratch, DevicePtr, DevicePtr) {
+        if lane == 0 || self.extra_lanes.is_empty() {
+            (
+                default_stream,
+                &self.scratch,
+                self.lane0_markov_embed,
+                self.lane0_markov_bias,
+            )
+        } else {
+            let l = &self.extra_lanes[(lane - 1).min(self.extra_lanes.len() - 1)];
+            (l.stream, &l.scratch, l.markov_embed, l.markov_bias)
+        }
+    }
+    fn validate_dflash_owner(
+        &self,
+        dstate: &DflashProposerState,
+        expected_owner: Option<SequenceGeneration>,
+    ) -> Result<SequenceGeneration> {
+        let expected_owner = expected_owner
+            .ok_or_else(|| anyhow::anyhow!("DFlash operation requires expected owner"))?;
+        dstate
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash operation has no generation owner"))?
+            .validate_access(expected_owner)?;
+        Ok(expected_owner)
+    }
+
+    /// Terminal-path owner validation for `free_state`: ownership only, so
+    /// a same-owner SECOND cleanup is an idempotent success (everything was
+    /// reclaimed by the first pass) rather than a Retired error.
+    fn validate_dflash_owner_terminal(
+        &self,
+        dstate: &DflashProposerState,
+        expected_owner: Option<SequenceGeneration>,
+    ) -> Result<SequenceGeneration> {
+        let expected_owner =
+            expected_owner.ok_or_else(|| anyhow::anyhow!("DFlash free requires expected owner"))?;
+        dstate
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash free has no generation owner"))?
+            .validate_ownership(expected_owner)?;
+        Ok(expected_owner)
+    }
+}
+
 impl DraftProposer for BlockDiffusionDraftHead {
+    fn startup_diagnostics(&self) -> Option<&DsparkDiagnostics> {
+        Some(&self.startup.diagnostics)
+    }
+
+    fn propose_batch_max(
+        &self,
+        _buffers: &spark_runtime::buffers::BufferArena,
+        _config: &atlas_core::config::ModelConfig,
+    ) -> usize {
+        if self.startup.native_batch_authoritative || self.startup.diagnostics.batch_parity {
+            self.batch_capacity
+        } else {
+            1
+        }
+    }
+
+    fn propose_batch_min(&self) -> usize {
+        if self.startup.native_batch_authoritative || self.startup.diagnostics.batch_parity {
+            1
+        } else {
+            2
+        }
+    }
+
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`.
         // Sized once, re-used across the seq's lifetime; reset on
@@ -470,7 +790,20 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let total = self.max_seq_len * ctx_slot_bytes;
         let ctx_hidden_acc = gpu.alloc(total)?;
         // Initialize to zero so stale data doesn't leak between sequences.
-        gpu.memset(ctx_hidden_acc, 0, total)?;
+        // Transactional: a failed memset frees the accumulator instead of
+        // leaking it for the server's lifetime; a failed FREE during that
+        // cleanup is logged (the allocation is then backend-orphaned — the
+        // pointer is already unreachable from any live state).
+        if let Err(error) = gpu.memset(ctx_hidden_acc, 0, total) {
+            if let Err(free_error) = gpu.free(ctx_hidden_acc) {
+                tracing::error!(
+                    "DSpark alloc_state: freeing failed-memset accumulator {:#x} failed \
+                     ({free_error}); allocation orphaned on the backend",
+                    ctx_hidden_acc.0
+                );
+            }
+            return Err(error);
+        }
         Ok(Box::new(DflashProposerState {
             block_table: Vec::with_capacity(64),
             seq_len: 0,
@@ -480,7 +813,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_len: 0,
             last_num_accepted: 0,
             skip_next_decode_append: false,
-            max_ctx_len: self.max_seq_len,
+            max_ctx_len: self
+                .window_size
+                .unwrap_or(self.max_seq_len)
+                .min(self.max_seq_len),
             ctx_slot_bytes,
             // Phase 2 Option B: lazily allocated on first propose when
             // ATLAS_DFLASH_OPTION_B=1. None until then to keep alloc_state
@@ -490,6 +826,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
             max_ctx_count_drafter: 0,
             ctx_committed: 0,
             ctx_positions: Vec::new(),
+            // Propose lane: fixed for the seq lifetime (batch positions
+            // reorder; captured graphs bake lane scratch pointers). Round-
+            // robin keeps concurrent seqs spread across the lane streams.
+            lane_id: self
+                .next_lane
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % self.lane_count(),
+            lifecycle: None,
         }))
     }
 
@@ -500,6 +844,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        expected_owner: Option<SequenceGeneration>,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
         draft_embed_target: Option<spark_runtime::gpu::DevicePtr>,
@@ -512,6 +857,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             position,
             num_drafts,
             state,
+            expected_owner,
             ctx,
             stream,
             draft_embed_target,
@@ -520,12 +866,473 @@ impl DraftProposer for BlockDiffusionDraftHead {
         )
     }
 
+    fn propose_batch(
+        &self,
+        last_tokens: &[u32],
+        target_hiddens: &[spark_runtime::gpu::DevicePtr],
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn crate::speculative::ProposerState],
+        expected_owners: Option<&[SequenceGeneration]>,
+        ctx: &crate::layer::ForwardContext,
+        stream: u64,
+        _out_conf: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        let n = last_tokens.len();
+        let expected_owners = expected_owners
+            .ok_or_else(|| anyhow::anyhow!("DFlash batched propose requires expected owners"))?;
+        // Preserve the historical n<2 fallback, but only after the complete
+        // structural-length seam has run. No GPU work or state downcast occurs
+        // before this check.
+        batch_inputs::validate_batch_input_lengths(
+            n,
+            n,
+            n,
+            target_hiddens.len(),
+            positions.len(),
+            states.len(),
+            expected_owners.len(),
+        )?;
+        let native_authoritative = self.startup.native_batch_authoritative;
+        // Generic DFlash keeps the historical n<2 fallback. The official
+        // Lightning product and explicit parity both enter the native B1 path.
+        if n == 0 || (n == 1 && !(native_authoritative || self.startup.diagnostics.batch_parity)) {
+            return Ok(None);
+        }
+        if self.startup.diagnostics.batch_parity {
+            tracing::info!("DFlash Bxgamma parity dispatch: batch={n}");
+        }
+        let (parity_oracle, parity_hidden_oracle) = if self.startup.diagnostics.batch_parity {
+            let mut oracle = Vec::with_capacity(n);
+            let hidden_bytes = self.gamma * self.hidden_size * 2;
+            let mut hidden = Vec::with_capacity(n * hidden_bytes);
+            for i in 0..n {
+                oracle.push(self.propose_drafts(
+                    last_tokens[i],
+                    target_hiddens[i],
+                    positions[i],
+                    num_drafts,
+                    states[i],
+                    Some(expected_owners[i]),
+                    ctx,
+                    stream,
+                    None,
+                    None,
+                    Some(target_hiddens[i]),
+                )?);
+                ctx.gpu.synchronize(stream)?;
+                let mut bytes = vec![0u8; hidden_bytes];
+                ctx.gpu.copy_d2h(self.scratch.stream_buf, &mut bytes)?;
+                hidden.extend_from_slice(&bytes);
+            }
+            (Some(oracle), Some(hidden))
+        } else {
+            (None, None)
+        };
+        if native_authoritative && parity_oracle.is_none() {
+            for i in 0..n {
+                self.prepare_drafts_state(
+                    last_tokens[i],
+                    target_hiddens[i],
+                    positions[i],
+                    num_drafts,
+                    states[i],
+                    expected_owners[i],
+                    ctx,
+                    stream,
+                    target_hiddens[i],
+                )?;
+            }
+        }
+
+        // Freeze the explicit sequence identities and lifecycle snapshots before
+        // any stream/event dispatch. The current implementation below remains
+        // serial-per-sequence or pinned-lane compute; this is only its validated
+        // B×gamma input seam. Its capacity is the already-admitted call width,
+        // so this does not widen propose_batch_max or allocate batch scratch.
+        let mut owners = Vec::with_capacity(n);
+        let mut lifecycles = Vec::with_capacity(n);
+        let mut block_table_ptrs = Vec::with_capacity(n);
+        let mut batch_kv_lens = Vec::with_capacity(n);
+        let mut batch_block_tables = Vec::with_capacity(n);
+        let mut batch_ctx_counts = Vec::with_capacity(n);
+        for state in states.iter_mut() {
+            let dstate = state
+                .as_any_mut()
+                .downcast_mut::<DflashProposerState>()
+                .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+            let lifecycle = dstate.lifecycle.clone();
+            let owner = lifecycle
+                .as_ref()
+                .map(CaptureDescriptor::owner)
+                .unwrap_or(expected_owners[owners.len()]);
+            owners.push(owner);
+            lifecycles.push(lifecycle);
+            let block_table_dev = dstate.block_table_dev.unwrap_or(DevicePtr::NULL);
+            block_table_ptrs.push(block_table_dev.0);
+            batch_ctx_counts.push(dstate.ctx_count_drafter);
+            batch_block_tables.push(dstate.block_table.clone());
+            batch_kv_lens.push(
+                dstate
+                    .ctx_count_drafter
+                    .checked_add(self.gamma)
+                    .ok_or_else(|| anyhow::anyhow!("DFlash batch KV length overflow"))?,
+            );
+        }
+        let batch_slot_mapping = batch_execution::paged_slot_mapping(
+            &batch_block_tables,
+            &batch_ctx_counts,
+            self.gamma,
+            16,
+        )?;
+        let batch_slots_ready =
+            block_table_ptrs.iter().all(|&pointer| pointer != 0) && batch_slot_mapping.is_some();
+        if self.startup.diagnostics.batch_parity {
+            tracing::info!(
+                "DFlash Bxgamma parity cache gate: batch={} slots_ready={} device_tables={}/{}",
+                n,
+                batch_slots_ready,
+                block_table_ptrs
+                    .iter()
+                    .filter(|&&pointer| pointer != 0)
+                    .count(),
+                n
+            );
+        }
+        if native_authoritative {
+            anyhow::ensure!(
+                batch_slots_ready,
+                "Lightning DSpark native batch cache slots are not ready"
+            );
+            anyhow::ensure!(
+                self.lane_count() == 1,
+                "Lightning DSpark native batch requires exactly one proposal lane"
+            );
+        }
+        let batch_slot_mapping = batch_slot_mapping.unwrap_or_default();
+        let batch_inputs = DsparkBatchInput::validate(
+            self.gamma,
+            self.batch_capacity,
+            &owners,
+            last_tokens,
+            positions,
+            target_hiddens,
+            expected_owners,
+            &lifecycles,
+        )?;
+        // Materialize the exact host execution plan now. The next native slice
+        // uploads these packed queries and depth rows into batch scratch; the
+        // current serial/lane compute below remains the output oracle.
+        let packed_query_tokens = batch_inputs.packed_query_tokens(self.mask_token_id);
+        let _markov_depth_rows: Vec<Vec<usize>> = (1..batch_inputs.gamma())
+            .map(|query| batch_inputs.rows_at_query(query))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let query_bytes: Vec<u8> = packed_query_tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect();
+        let packed_positions = batch_inputs.packed_positions()?;
+        let position_bytes: Vec<u8> = packed_positions
+            .iter()
+            .flat_map(|position| position.to_le_bytes())
+            .collect();
+        let last_token_bytes: Vec<u8> = last_tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect();
+        ctx.gpu.copy_h2d(&query_bytes, self.batch_query_ids_dev)?;
+        ctx.gpu.copy_h2d(&position_bytes, self.batch_position_ids)?;
+        ctx.gpu
+            .copy_h2d(&last_token_bytes, self.batch_markov_prev)?;
+        let ptr_bytes: Vec<u8> = block_table_ptrs
+            .iter()
+            .flat_map(|pointer| pointer.to_le_bytes())
+            .collect();
+        let cu_seqlens: Vec<i32> = (0..=n)
+            .map(|sequence| {
+                i32::try_from(sequence * self.gamma)
+                    .map_err(|_| anyhow::anyhow!("DFlash batch cu_seqlens overflow"))
+            })
+            .collect::<Result<_>>()?;
+        let cu_bytes: Vec<u8> = cu_seqlens
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let kv_lens_i32: Vec<i32> = batch_kv_lens
+            .iter()
+            .copied()
+            .map(|value| {
+                i32::try_from(value)
+                    .map_err(|_| anyhow::anyhow!("DFlash batch KV length i32 overflow"))
+            })
+            .collect::<Result<_>>()?;
+        let kv_bytes: Vec<u8> = kv_lens_i32
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut attention_args = Vec::with_capacity(n * 12);
+        for sequence in 0..n {
+            let kv_len = u32::try_from(batch_kv_lens[sequence])
+                .map_err(|_| anyhow::anyhow!("DFlash attention kv_len exceeds u32"))?;
+            let q_offset = u32::try_from(batch_ctx_counts[sequence])
+                .map_err(|_| anyhow::anyhow!("DFlash attention q_offset exceeds u32"))?;
+            let q_rope_pos = u32::try_from(positions[sequence])
+                .map_err(|_| anyhow::anyhow!("DFlash attention q_rope_pos exceeds u32"))?;
+            attention_args.extend_from_slice(&kv_len.to_le_bytes());
+            attention_args.extend_from_slice(&q_offset.to_le_bytes());
+            attention_args.extend_from_slice(&q_rope_pos.to_le_bytes());
+        }
+        ctx.gpu.copy_h2d(&ptr_bytes, self.batch_block_table_ptrs)?;
+        ctx.gpu.copy_h2d(&cu_bytes, self.batch_cu_seqlens)?;
+        ctx.gpu.copy_h2d(&kv_bytes, self.batch_kv_lens)?;
+        ctx.gpu
+            .copy_h2d(&attention_args, self.batch_attention_args)?;
+        if batch_slots_ready {
+            let slot_bytes: Vec<u8> = batch_slot_mapping
+                .iter()
+                .flat_map(|slot| slot.to_le_bytes())
+                .collect();
+            ctx.gpu.copy_h2d(&slot_bytes, self.batch_slot_mapping)?;
+        }
+        crate::layers::ops::batched_embed(
+            ctx.gpu,
+            self.kernels.batched_embed,
+            self.batch_query_ids_dev,
+            self.embed_tokens_shared,
+            self.batch_query_embed,
+            batch_inputs.total_rows() as u32,
+            self.hidden_size as u32,
+            stream,
+        )?;
+        let batch_rows = u32::try_from(batch_inputs.total_rows())
+            .map_err(|_| anyhow::anyhow!("DFlash batch row count exceeds u32"))?;
+        let batch_size =
+            u32::try_from(n).map_err(|_| anyhow::anyhow!("DFlash batch width exceeds u32"))?;
+        let native_staged = batch_slots_ready && self.lane_count() == 1;
+        if native_staged {
+            let max_kv_len =
+                u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
+                    .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
+            for layer_idx in 0..self.layers.len() {
+                self.run_batched_layer_stage(
+                    layer_idx, batch_rows, batch_size, max_kv_len, None, None, ctx, stream,
+                )?;
+            }
+            if let Some(expected) = parity_hidden_oracle.as_ref() {
+                ctx.gpu.synchronize(stream)?;
+                let mut actual = vec![0u8; expected.len()];
+                ctx.gpu.copy_d2h(self.batch_query_embed, &mut actual)?;
+                if actual != *expected {
+                    let first = actual
+                        .chunks_exact(2)
+                        .zip(expected.chunks_exact(2))
+                        .position(|(lhs, rhs)| lhs != rhs)
+                        .unwrap_or(0);
+                    let per_sequence = self.gamma * self.hidden_size;
+                    let sequence = first / per_sequence;
+                    let local = first % per_sequence;
+                    anyhow::bail!(
+                        "DFlash Bxgamma backbone parity mismatch at sequence {sequence} BF16 element {local}"
+                    );
+                }
+                tracing::info!("DFlash Bxgamma backbone parity PASS: batch={n}");
+            }
+            self.run_batched_tail_base(batch_rows, ctx, stream)?;
+            self.run_batched_markov(batch_size, ctx, stream)?;
+        }
+
+        let native =
+            if native_staged && (native_authoritative || self.startup.diagnostics.batch_parity) {
+                ctx.gpu.synchronize(stream)?;
+                let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
+                ctx.gpu.copy_d2h(self.batch_tokens, &mut raw)?;
+                let row_tokens: Vec<u32> = raw
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect();
+                Some(batch_inputs.reorder_sampled_rows(&row_tokens)?)
+            } else {
+                None
+            };
+
+        let lanes_n = self.lane_count();
+        if lanes_n == 1 {
+            if let Some(oracle) = parity_oracle {
+                let native = native.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("DFlash Bxgamma parity did not stage native tokens")
+                })?;
+                for (sequence, (native_tokens, oracle_tokens)) in
+                    native.iter().zip(oracle.iter()).enumerate()
+                {
+                    anyhow::ensure!(
+                        native_tokens.get(..oracle_tokens.len()) == Some(oracle_tokens.as_slice()),
+                        "DFlash Bxgamma parity mismatch at sequence {sequence}: native={native_tokens:?} oracle={oracle_tokens:?}"
+                    );
+                }
+                tracing::info!(
+                    "DFlash Bxgamma staged parity PASS: batch={} gamma={} rows={}",
+                    n,
+                    self.gamma,
+                    batch_inputs.total_rows()
+                );
+                return Ok(Some(oracle));
+            }
+            if native_authoritative {
+                let mut out = native.ok_or_else(|| {
+                    anyhow::anyhow!("Lightning DSpark native batch returned no staged tokens")
+                })?;
+                let cap = num_drafts.min(self.gamma.saturating_sub(1)).max(1);
+                for (i, tokens) in out.iter_mut().enumerate() {
+                    tokens.truncate(cap);
+                    let dstate = states[i]
+                        .as_any_mut()
+                        .downcast_mut::<DflashProposerState>()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+                    dstate.last_num_drafted = tokens.len();
+                }
+                return Ok(Some(out));
+            }
+            // Generic single-lane path retains the historical serial proposer.
+            let mut serial = Vec::with_capacity(n);
+            for i in 0..n {
+                serial.push(self.propose_drafts(
+                    last_tokens[i],
+                    target_hiddens[i],
+                    positions[i],
+                    num_drafts,
+                    states[i],
+                    Some(expected_owners[i]),
+                    ctx,
+                    stream,
+                    None,
+                    None,
+                    Some(target_hiddens[i]),
+                )?);
+            }
+            return Ok(Some(serial));
+        }
+        // Multi-lane: each seq proposes on its pinned lane (assigned once at
+        // alloc_state — batch position `i` is NOT stable across steps, and a
+        // seq's captured graphs bake their lane's scratch pointers, so the
+        // lane must never move). Ordering: (1) one entry event on the
+        // default stream that every extra lane waits on, so default-stream
+        // pre-propose writes (drafter-ctx precompute, after_verify
+        // bookkeeping) are visible before lanes read them; (2) per-lane
+        // done events the default stream waits on before verify.
+        let default_stream = ctx.gpu.default_stream();
+        ctx.gpu
+            .record_event(self.lanes_start_event, default_stream)?;
+        for l in &self.extra_lanes {
+            ctx.gpu
+                .stream_wait_event(l.stream, self.lanes_start_event)?;
+        }
+        // ENQUEUE phase: launch every lane's propose (readback deferred) so
+        // the GPU overlaps N lanes; a per-lane host sync inside the loop
+        // would serialize them into the old single-stream wall. A lane may
+        // be REUSED within one step (n > lanes): its pinned readback buffer
+        // and event are single-slot, so flush the previous user's drafts
+        // before this enqueue overwrites them.
+        let mut used_lanes: Vec<usize> = Vec::with_capacity(lanes_n.min(n));
+        let mut seen = vec![false; lanes_n];
+        let mut lane_last_use: Vec<Option<usize>> = vec![None; lanes_n];
+        let mut out: Vec<Option<Vec<u32>>> = vec![None; n];
+        let mut lane_scratch_list: Vec<&DflashScratch> = Vec::with_capacity(n);
+        for i in 0..n {
+            let lane = {
+                let dstate = states[i]
+                    .as_any_mut()
+                    .downcast_mut::<DflashProposerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+                batch_execution::resolve_lane_id(dstate.lane_id, lanes_n)?
+            };
+            let (lane_stream, lane_scratch, lane_markov_embed, lane_markov_bias) =
+                self.lane(lane, default_stream);
+            if !seen[lane] {
+                seen[lane] = true;
+                used_lanes.push(lane);
+            }
+            // Flush this lane's previous user BEFORE its single-slot pinned
+            // buffer is overwritten by the enqueue below.
+            if let Some(prev_i) = lane_last_use[lane] {
+                out[prev_i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[prev_i])?);
+            }
+            lane_last_use[lane] = Some(i);
+            lane_scratch_list.push(lane_scratch);
+            self.propose_drafts_on_lane(
+                lane_scratch,
+                lane_markov_embed,
+                lane_markov_bias,
+                lane,
+                last_tokens[i],
+                target_hiddens[i],
+                positions[i],
+                num_drafts,
+                states[i],
+                Some(expected_owners[i]),
+                ctx,
+                lane_stream,
+                None,
+                None,
+                Some(target_hiddens[i]),
+                true,
+                false,
+            )?;
+        }
+        // COLLECT phase: each lane's D2H event is now recorded; synchronize
+        // and read in batch order. Lane scratch borrows outlive the loop.
+        for i in 0..n {
+            if out[i].is_none() {
+                out[i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[i])?);
+            }
+        }
+        let out: Vec<Vec<u32>> = out.into_iter().map(|o| o.unwrap_or_default()).collect();
+        if self.startup.diagnostics.verify_trace {
+            for i in 0..n {
+                tracing::info!(
+                    "DFLASH BATCH TRACE collect: i={} lane={} token_in={} position={} drafts={:?}",
+                    i,
+                    {
+                        states[i]
+                            .as_any_mut()
+                            .downcast_mut::<DflashProposerState>()
+                            .map(|d| d.lane_id)
+                            .unwrap_or(usize::MAX)
+                    },
+                    last_tokens[i],
+                    positions[i],
+                    out[i],
+                );
+            }
+        }
+        // Ordering: the verify step runs on the default stream. Record each
+        // lane's done-event on its own stream, then make the default stream
+        // wait on every lane before returning.
+        for lane in used_lanes {
+            let l = if lane == 0 {
+                None
+            } else {
+                Some(&self.extra_lanes[lane - 1])
+            };
+            match l {
+                Some(l) => {
+                    ctx.gpu.record_event(l.done_event, l.stream)?;
+                    ctx.gpu.stream_wait_event(default_stream, l.done_event)?;
+                }
+                None => { /* lane 0 IS the default stream; nothing to hand off */ }
+            }
+        }
+        Ok(Some(out))
+    }
+
     fn after_verify(
         &self,
         num_accepted: usize,
+        expected_owner: Option<SequenceGeneration>,
         state: &mut dyn ProposerState,
         _stream: u64,
     ) -> Result<()> {
+        let expected_owner = expected_owner
+            .ok_or_else(|| anyhow::anyhow!("DFlash after_verify requires expected owner"))?;
         let dstate = state
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
@@ -542,12 +1349,35 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // `dstate.ctx_committed = dstate.ctx_len` so the next propose
         // recomputes the rolled-back tail instead of reading stale K/V.
         // The `.min(ctx_len)` clamp in propose() is the defensive backstop.
-        let _ = num_accepted;
+        // The batched propose dispatcher reads this to select the
+        // just-verified accepted row's 5-layer stack from the seq's
+        // dflash_hidden_save region [i*kmax + acc). Row acc = the last
+        // accepted position (0 = the greedy row when no draft matched).
+        let lifecycle = dstate
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DFlash after_verify: missing generation owner"))?;
+        lifecycle.validate_access(expected_owner)?;
+        let valid_rows = num_accepted
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("DFlash accepted-row count overflow"))?;
+        lifecycle.advance(
+            expected_owner,
+            lifecycle.absolute_position(),
+            valid_rows,
+            lifecycle.row_stride_bytes(),
+        )?;
+        dstate.last_num_accepted = num_accepted;
         dstate.last_num_drafted = 0;
         Ok(())
     }
 
-    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+    fn free_state(
+        &self,
+        gpu: &dyn GpuBackend,
+        expected_owner: Option<SequenceGeneration>,
+        state: &mut dyn ProposerState,
+    ) -> Result<()> {
         // Phase 2 (Option B) reclaim: return the drafter's lazily-allocated
         // paged KV blocks to the pool on request completion. Without this the
         // ~257-block Option-B drafter cache (allocated in propose.rs when
@@ -559,6 +1389,39 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // Phase 1 / non-DFlash proposer state: nothing allocated, nothing to free.
             None => return Ok(()),
         };
+        // Transactional cleanup: owner validation runs FIRST, but a
+        // validation failure still reclaims every resource below before
+        // propagating — a mismatched owner must not leak graphs, KV blocks,
+        // or the ctx accumulator. (Lifecycle gaps noted 2026-08-17.)
+        let owner = match self.validate_dflash_owner_terminal(dstate, expected_owner) {
+            Ok(owner) => owner,
+            Err(error) => {
+                // Transactional cleanup: reclaim everything reclaimable
+                // before propagating the validation failure. Graphs are
+                // owner-keyed and stay pooled (reclaimed on generation
+                // turnover); blocks, accumulator, and the device block
+                // table belong to THIS state and must not leak.
+                dstate.reclaim_on_owner_failure(gpu, &self.kv_cache);
+                return Err(error);
+            }
+        };
+        dstate
+            .lifecycle
+            .as_mut()
+            .expect("owner validated above")
+            .retire(owner)?;
+        let retired_graphs = {
+            let mut graphs = self.propose_graphs.lock();
+            lifecycle::take_owned_graphs(&mut graphs, owner)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        for graph in retired_graphs {
+            if graph.0 != 0 {
+                gpu.destroy_graph(graph)?;
+            }
+        }
         if !dstate.block_table.is_empty() {
             self.kv_cache.lock().free_blocks(&dstate.block_table);
             dstate.block_table.clear();
@@ -567,14 +1430,33 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // allocation (`max_seq_len × 5 × target_hidden` BF16; ~320 MB at
         // max_seq_len=16384). `DevicePtr` has no Drop, so without this every
         // finished sequence leaks it for the server's lifetime. Guarded on a
-        // non-null pointer so a double free_state is a no-op.
+        // non-null pointer so a double free_state is a no-op. A failed free
+        // is logged and the pointer RETAINED so a cleanup retry can release
+        // it (a silently cleared pointer would leak unrecoverably).
         if dstate.ctx_hidden_acc.0 != 0 {
-            gpu.free(dstate.ctx_hidden_acc)?;
-            dstate.ctx_hidden_acc = DevicePtr(0);
+            if let Err(error) = gpu.free(dstate.ctx_hidden_acc) {
+                tracing::error!(
+                    "DSpark free_state: freeing ctx accumulator {:#x} failed ({error}); \
+                     pointer retained for a later cleanup retry",
+                    dstate.ctx_hidden_acc.0
+                );
+            } else {
+                dstate.ctx_hidden_acc = DevicePtr(0);
+            }
         }
         // Free the device-side block table (lazily allocated in propose.rs).
-        if let Some(bt) = dstate.block_table_dev.take() {
-            gpu.free(bt)?;
+        // A failed free logs and RESTORES the handle so a later cleanup retry
+        // can release it (propose gates re-alloc on block_table_dev.is_none(),
+        // so a restored handle is retried, never re-allocated around).
+        if let Some(bt) = dstate.block_table_dev.take()
+            && let Err(error) = gpu.free(bt)
+        {
+            tracing::error!(
+                "DSpark free_state: freeing device block table {:#x} failed ({error}); \
+                 handle restored for a later cleanup retry",
+                bt.0
+            );
+            dstate.block_table_dev = Some(bt);
         }
         // Reset the lazy-alloc guard + watermarks so the NEXT request's first
         // propose re-allocates fresh blocks and re-precomputes ctx from a clean

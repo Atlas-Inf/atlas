@@ -42,15 +42,13 @@ impl TransformerModel {
                     .downcast_mut::<SsmLayerState>()
                     .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
 
-                let nv = self.config.linear_num_value_heads;
-                let vd = self.config.linear_value_head_dim;
-                let nk = self.config.linear_num_key_heads;
-                let kd = self.config.linear_key_head_dim;
                 // Pool h STORAGE width (SSOT: ssm_reserve::ssm_h_stored_bytes).
                 let h_bytes = self.ssm_pool.h_stored_bytes;
-                let conv_dim = nk * kd * 2 + nv * vd;
-                let d_conv = self.config.linear_conv_kernel_dim;
-                let conv_bytes = conv_dim * d_conv * 4;
+                // Mamba-2 vs GDN: SSOT is config.ssm_conv_state_bytes(). The GDN
+                // nk*kd*2+nv*vd formula is 0 on Nemotron-H (no linear_* heads),
+                // which made MTP reject a no-op copy and leave live SSM state on
+                // the rejected draft.
+                let conv_bytes = self.config.ssm_conv_state_bytes();
 
                 if ssm.h_state_checkpoint.is_none() {
                     ssm.h_state_checkpoint = Some(self.gpu.alloc(h_bytes)?);
@@ -105,15 +103,13 @@ impl TransformerModel {
                     .downcast_mut::<SsmLayerState>()
                     .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
 
-                let nv = self.config.linear_num_value_heads;
-                let vd = self.config.linear_value_head_dim;
-                let nk = self.config.linear_num_key_heads;
-                let kd = self.config.linear_key_head_dim;
                 // Pool h STORAGE width (SSOT: ssm_reserve::ssm_h_stored_bytes).
                 let h_bytes = self.ssm_pool.h_stored_bytes;
-                let conv_dim = nk * kd * 2 + nv * vd;
-                let d_conv = self.config.linear_conv_kernel_dim;
-                let conv_bytes = conv_dim * d_conv * 4;
+                // Mamba-2 vs GDN: SSOT is config.ssm_conv_state_bytes(). The GDN
+                // nk*kd*2+nv*vd formula is 0 on Nemotron-H (no linear_* heads),
+                // which made MTP reject a no-op copy and leave live SSM state on
+                // the rejected draft.
+                let conv_bytes = self.config.ssm_conv_state_bytes();
 
                 // Rollback: restore h_state and conv_state from the appropriate source.
                 if num_accepted == 0 {
@@ -320,13 +316,13 @@ impl TransformerModel {
                 .downcast_mut::<SsmLayerState>()
                 .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
 
-            let nv = self.config.linear_num_value_heads;
-            let vd = self.config.linear_value_head_dim;
-            let nk = self.config.linear_num_key_heads;
-            let kd = self.config.linear_key_head_dim;
             // Pool h STORAGE width (SSOT: ssm_reserve::ssm_h_stored_bytes).
             let h_bytes = self.ssm_pool.h_stored_bytes;
-            let conv_bytes = (nk * kd * 2 + nv * vd) * self.config.linear_conv_kernel_dim * 4;
+            // Mamba-2 vs GDN: SSOT is config.ssm_conv_state_bytes(). The GDN
+            // nk*kd*2+nv*vd formula is 0 on Nemotron-H (no linear_* heads),
+            // which made MTP reject a no-op copy and leave live SSM state on
+            // the rejected draft.
+            let conv_bytes = self.config.ssm_conv_state_bytes();
 
             // Partial accept: rewind live state to the last accepted token's
             // intermediate (state after token `num_accepted-1`).

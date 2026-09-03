@@ -141,7 +141,9 @@ impl GpuBackend for AtlasCudaBackend {
             return Ok(());
         }
         // Off the ledger BEFORE the free: an entry that survives a successful
-        // free would be double-freed at teardown.
+        // free would be double-freed at teardown. On a real failure, restore
+        // ownership to the backend ledger so `sweep_unreleased` is the final
+        // cleanup backstop even if the sequence-local state is dropped.
         self.forget_alloc(ptr);
         let status = unsafe { cuMemFree_v2(ptr.0) };
         // A context that is already being destroyed reports every free as
@@ -153,7 +155,11 @@ impl GpuBackend for AtlasCudaBackend {
         // clean exit — the exact species of false alarm this work set out to
         // remove.
         if status != 0 && !atlas_core::registry::is_teardown_noop(status) {
-            bail!("cuMemFree_v2 failed: status {status}, ptr {ptr}");
+            self.record_alloc(ptr);
+            bail!(
+                "cuMemFree_v2 failed: status {status}, ptr {ptr}; \
+                 pointer restored to backend cleanup ledger"
+            );
         }
         Ok(())
     }

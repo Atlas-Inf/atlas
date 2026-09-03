@@ -558,14 +558,70 @@ impl TransformerModel {
             self.ensure_drafter_context(proposer, seq, &ctx, stream);
         }
         let h = self.config.hidden_size;
-        let hiddens: Vec<spark_runtime::gpu::DevicePtr> = stash_idx
-            .iter()
-            .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
-            .collect();
+        // DFlash drafts from the 5-layer target stack: read the seq's own
+        // region of dflash_hidden_save ([i*kmax .. i*kmax+ks), written by
+        // try_dflash_capture_batched during the batched verify) at the
+        // accepted row. The 1-hidden stash row is NOT the stack — reading
+        // ctx_slot_bytes (5 hiddens) from it let each seq's ctx append
+        // pick up the NEXT seqs' stash slots (garbage ctx → accept 0).
+        // MTP/EAGLE proposers keep the stash path (single hidden).
+        let hiddens: Vec<spark_runtime::gpu::DevicePtr> = match self.dflash_hidden_save {
+            Some(base) if !self.dflash_capture_layers.is_empty() => {
+                let kmax = self.dflash_hidden_save_rows;
+                let slot_bytes = self.dflash_capture_layers.len() * h * 2;
+                seqs.iter()
+                    .map(|seq| -> Result<spark_runtime::gpu::DevicePtr> {
+                        let acc = seq
+                            .proposer_state
+                            .as_ref()
+                            .and_then(|s| {
+                                s.as_any()
+                                    .downcast_ref::<crate::layers::DflashProposerState>()
+                            })
+                            .map(|d| d.last_num_accepted)
+                            .unwrap_or(0)
+                            .min(kmax.saturating_sub(1));
+                        // Stable owner slot: `slot_idx` may migrate after
+                        // compaction or become the detach sentinel, but the
+                        // hidden-save arena is allocated per DSpark owner.
+                        let slot = seq.dflash_hidden_save_slot()?;
+                        anyhow::ensure!(
+                            slot < self.dflash_hidden_save_nseq,
+                            "DFlash re-propose owner slot {slot} exceeds capacity {}",
+                            self.dflash_hidden_save_nseq
+                        );
+                        Ok(base.offset((slot * kmax + acc) * slot_bytes))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            _ => stash_idx
+                .iter()
+                .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
+                .collect(),
+        };
         let mut states: Vec<&mut dyn crate::speculative::ProposerState> = Vec::new();
+        let mut expected_owners = Vec::with_capacity(seqs.len());
         for seq in seqs.iter_mut() {
+            let expected = seq.expected_dspark_owner()?;
             match seq.proposer_state.as_mut() {
-                Some(s) => states.push(s.as_mut()),
+                Some(s) => {
+                    if let Some(dstate) = s
+                        .as_any_mut()
+                        .downcast_mut::<crate::layers::DflashProposerState>()
+                    {
+                        dstate
+                            .lifecycle
+                            .as_ref()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "DFlash batched proposer state has no generation owner"
+                                )
+                            })?
+                            .validate_access(expected)?;
+                    }
+                    expected_owners.push(expected);
+                    states.push(s.as_mut());
+                }
                 None => return Ok(None),
             }
         }
@@ -575,6 +631,7 @@ impl TransformerModel {
             positions,
             num_drafts,
             &mut states,
+            Some(&expected_owners),
             &ctx,
             stream,
             out_conf,
@@ -600,8 +657,19 @@ impl TransformerModel {
             None => return Ok(()),
         };
         let stream = self.gpu.default_stream();
+        let expected = seq.expected_dspark_owner()?;
         if let Some(ref mut state) = seq.proposer_state {
-            proposer.after_verify(num_accepted, state.as_mut(), stream)?;
+            if let Some(dstate) = state
+                .as_any_mut()
+                .downcast_mut::<crate::layers::DflashProposerState>()
+            {
+                dstate
+                    .lifecycle
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("DFlash trim state has no generation owner"))?
+                    .validate_access(expected)?;
+            }
+            proposer.after_verify(num_accepted, Some(expected), state.as_mut(), stream)?;
         }
         Ok(())
     }
