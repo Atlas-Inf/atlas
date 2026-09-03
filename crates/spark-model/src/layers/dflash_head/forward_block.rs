@@ -616,7 +616,15 @@ impl BlockDiffusionDraftHead {
                     let _ = std::fs::write("/tmp/atlas_block_logits_pre.bin", &pre);
                 }
             }
-            self.argmax_block_logits(last_token, gpu, stream, scratch, markov_embed, markov_bias)?;
+            self.argmax_block_logits(
+                last_token,
+                norm_noise_local,
+                gpu,
+                stream,
+                scratch,
+                markov_embed,
+                markov_bias,
+            )?;
 
             // ── BLOCK-FORWARD PARITY DUMP (Friday 2026-06-11) ──────────────
             // Tests Ronald's theory: is the block-diffusion forward COMPUTING

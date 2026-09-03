@@ -19,6 +19,7 @@ impl BlockDiffusionDraftHead {
     pub(super) fn argmax_block_logits(
         &self,
         last_token: u32,
+        hidden_buf: DevicePtr,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         stream: u64,
         scratch: &DflashScratch,
@@ -26,6 +27,19 @@ impl BlockDiffusionDraftHead {
         markov_bias: DevicePtr,
     ) -> Result<()> {
         let bf16 = 2usize;
+        if let Some(ref selector) = self.candidate_selector {
+            return selector.select_candidates(
+                last_token,
+                hidden_buf,
+                scratch.logits,
+                scratch.dflash2_projected_hidden,
+                scratch.draft_tokens_dev,
+                self.gamma,
+                gpu,
+                self.kernels.dense_gemm_pipelined,
+                stream,
+            );
+        }
         if let (Some(w1), Some(w2)) = (self.markov_w1.as_ref(), self.markov_w2.as_ref())
             && self.markov_rank > 0
             && !markov_embed.is_null()
