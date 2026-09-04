@@ -31,6 +31,8 @@ use crate::layers::ops;
 
 #[path = "qsa_aux.rs"]
 mod qsa_aux;
+#[path = "qsa_decode_select.rs"]
+mod qsa_decode_select;
 #[path = "qsa_free.rs"]
 mod qsa_free;
 
@@ -88,6 +90,12 @@ pub struct QsaIndexer {
     k_qprep_rows_k: KernelHandle,
     k_score_rows_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
+    k_select_k: KernelHandle,
+    /// `ATLAS_QSA_DEVICE_TOPK=1`: select on the device (no per-layer host
+    /// round trip); `ATLAS_QSA_TOPK_VERIFY=1` also runs the host reference
+    /// and fails on the first mismatch.
+    device_topk: bool,
+    topk_verify: bool,
 
     qk_scratch: DevicePtr, // [INGEST_SLAB, (n_heads+1)*hd] BF16
     q_post: DevicePtr,     // [n_heads, hd] F32
@@ -116,6 +124,7 @@ impl QsaIndexer {
         hd: usize,
         ratio: usize,
         budget: usize,
+        max_seq_len: usize,
         rot: usize,
         theta: f32,
         eps: f32,
@@ -128,10 +137,32 @@ impl QsaIndexer {
             ratio > 0 && budget.is_multiple_of(ratio),
             "QSA: budget % ratio != 0"
         );
-        let max_tokens: usize = std::env::var("ATLAS_QSA_MAX_TOKENS")
+        // Capacity derives from the served context; ATLAS_QSA_MAX_TOKENS can
+        // only raise it, never below `max_seq_len` (that is what killed decode
+        // at 32768 on a --max-seq-len 65536 serve).
+        let env_max = std::env::var("ATLAS_QSA_MAX_TOKENS")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32768);
+            .and_then(|v| v.parse::<usize>().ok());
+        // A config built outside `serve` carries 0; keep the historical
+        // capacity there rather than allocating a zero-token indexer.
+        let max_seq_len = if max_seq_len == 0 { 32768 } else { max_seq_len };
+        let max_tokens: usize = match env_max {
+            Some(n) if n < max_seq_len => {
+                tracing::warn!(
+                    "QSA: ATLAS_QSA_MAX_TOKENS={n} < max_seq_len={max_seq_len}, clamped up"
+                );
+                max_seq_len
+            }
+            Some(n) => n,
+            None => max_seq_len,
+        };
+        let per_seq_bytes = max_tokens * hd * 2 + max_tokens / ratio * hd * 2;
+        tracing::info!(
+            "QSA: indexer capacity {} tokens (max_seq_len={}, per-seq {} B)",
+            max_tokens,
+            max_seq_len,
+            per_seq_bytes
+        );
         let block_topk = budget / ratio;
         let qk_width = (n_heads + 1) * hd;
         let sel_cap = budget + ratio;
@@ -158,6 +189,9 @@ impl QsaIndexer {
             k_qprep_rows_k: gpu.kernel("qsa_indexer", "qsa_qprep_rows")?,
             k_score_rows_k: gpu.kernel("qsa_indexer", "qsa_score_rows")?,
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
+            k_select_k: gpu.kernel("qsa_indexer", "qsa_select_topk")?,
+            device_topk: std::env::var("ATLAS_QSA_DEVICE_TOPK").ok().as_deref() == Some("1"),
+            topk_verify: std::env::var("ATLAS_QSA_TOPK_VERIFY").ok().as_deref() == Some("1"),
             qk_scratch: gpu.alloc(INGEST_SLAB * qk_width * 2)?,
             q_post: gpu.alloc(n_heads * hd * 4)?,
             scores_dev: gpu.alloc(max_tokens / ratio * 4)?,
@@ -207,7 +241,8 @@ impl QsaIndexer {
         );
         anyhow::ensure!(
             seq_start + num_tokens <= self.max_tokens,
-            "QSA: {} tokens exceeds ATLAS_QSA_MAX_TOKENS={}",
+            "QSA: {} tokens exceeds the indexer capacity {} — it derives \
+             from --max-seq-len (ATLAS_QSA_MAX_TOKENS overrides)",
             seq_start + num_tokens,
             self.max_tokens
         );
@@ -296,7 +331,9 @@ impl QsaIndexer {
         );
         anyhow::ensure!(
             pos < self.max_tokens,
-            "QSA: pos {pos} >= ATLAS_QSA_MAX_TOKENS"
+            "QSA: pos {pos} >= indexer capacity {} — it derives from \
+             --max-seq-len (ATLAS_QSA_MAX_TOKENS overrides)",
+            self.max_tokens
         );
 
         let hd = self.hd as usize;
@@ -354,41 +391,37 @@ impl QsaIndexer {
             stream,
         )?;
 
-        // Host top-k over the block scores (D2H — decode graphs are vetoed
-        // whenever an indexer is present, so this is never inside a capture).
-        let mut raw = vec![0u8; complete * 4];
-        gpu.copy_d2h_on_stream(self.scores_dev, &mut raw, stream)?;
-        let scores: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let mut order: Vec<u32> = (0..complete as u32).collect();
-        // torch.topk returns the k largest, ties broken by LOWER index —
-        // sort by (-score, index) and take the first k for identical sets.
-        order.sort_by(|&a, &b| {
-            scores[b as usize]
-                .partial_cmp(&scores[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
-        let mut blocks: Vec<u32> = order[..self.block_topk as usize].to_vec();
-        blocks.sort_unstable();
-
+        // Block selection. `n_sel` never depends on the scores, only the
+        // CONTENT of `sel_dev` does. Device arm: one kernel writes `sel_dev`
+        // (no D2H, no host sort, no H2D). Host arm (default, and anything
+        // wider than the kernel's flag array): D2H + sort + H2D — decode
+        // graphs are vetoed whenever an indexer is present, so neither arm
+        // ever runs inside a capture.
         let ratio = self.ratio as usize;
-        let mut sel: Vec<i32> = Vec::with_capacity(self.budget as usize + ratio);
-        for b in &blocks {
-            let base = *b as i32 * self.ratio as i32;
-            for r in 0..self.ratio as i32 {
-                sel.push(base + r);
+        let tail_start = complete * ratio;
+        let n_sel = (self.block_topk as usize * ratio + (visible - tail_start)) as u32;
+        if self.device_topk && complete <= qsa_decode_select::QSA_SELECT_MAX_BLOCKS {
+            ops::qsa_select_topk(
+                gpu,
+                self.k_select_k,
+                self.scores_dev,
+                self.sel_dev,
+                complete as u32,
+                self.block_topk,
+                self.ratio,
+                tail_start as u32,
+                visible as u32,
+                stream,
+            )?;
+            if self.topk_verify {
+                self.verify_device_selection(gpu, complete, visible, pos, stream)?;
             }
+        } else {
+            let sel = self.host_select(gpu, complete, visible, stream)?;
+            debug_assert_eq!(sel.len() as u32, n_sel);
+            let sel_bytes: Vec<u8> = sel.iter().flat_map(|v| v.to_le_bytes()).collect();
+            gpu.copy_h2d_async(&sel_bytes, self.sel_dev, stream)?;
         }
-        for t in complete * ratio..visible {
-            sel.push(t as i32);
-        }
-        let n_sel = sel.len() as u32;
-
-        let sel_bytes: Vec<u8> = sel.iter().flat_map(|v| v.to_le_bytes()).collect();
-        gpu.copy_h2d_async(&sel_bytes, self.sel_dev, stream)?;
         ops::qsa_gather(
             gpu,
             self.k_gather_k,

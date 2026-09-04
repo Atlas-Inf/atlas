@@ -409,6 +409,30 @@ pub trait GpuBackend: Send + Sync {
         Ok(())
     }
 
+    /// Create a timing-disabled event. Returns an opaque handle (0 = unsupported).
+    fn event_create(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Record `event` on `stream`. No-op for handle 0.
+    fn event_record(&self, _event: u64, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Block the host until `event` has completed. For handle 0 this must fall
+    /// back to `self.synchronize(stream)` — callers pass the stream for exactly
+    /// that reason, so a backend without events keeps the previous semantics.
+    /// Distinct from [`Self::event_synchronize`], which takes no stream and
+    /// therefore cannot offer that fallback.
+    fn event_synchronize_on_stream(&self, _event: u64, stream: u64) -> Result<()> {
+        self.synchronize(stream)
+    }
+
+    /// Destroy an event created by [`Self::event_create`]. No-op for handle 0.
+    fn event_destroy(&self, _event: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Device-side alias of a page-locked host pointer from
     /// [`Self::alloc_host_pinned`] (cuMemHostGetDevicePointer). On UMA parts
     /// (GB10) this lets a KERNEL write results directly into host-visible

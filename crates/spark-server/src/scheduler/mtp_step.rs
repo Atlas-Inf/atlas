@@ -231,6 +231,7 @@ pub fn step_mtp(
         // EP: broadcast token to worker before decode (worker runs decode in lockstep).
         if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
             tracing::error!("EP broadcast bootstrap token: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             continue;
         }
@@ -238,6 +239,7 @@ pub fn step_mtp(
             Ok(l) => l,
             Err(e) => {
                 tracing::error!("bootstrap decode error: {e:#}");
+                a.engine_error = Some(format!("{e:#}"));
                 a.finished = true;
                 continue;
             }
@@ -286,6 +288,7 @@ pub fn step_mtp(
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("bootstrap sample error: {e:#}");
+                a.engine_error = Some(format!("{e:#}"));
                 a.finished = true;
                 continue;
             }

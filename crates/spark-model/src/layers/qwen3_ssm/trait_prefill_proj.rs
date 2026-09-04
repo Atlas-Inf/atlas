@@ -379,7 +379,7 @@ impl Qwen3SsmLayer {
             // 8.4 s TTFT (63% of prefill, ~2.7 TFLOPS on an 85-TFLOP part).
             // The scalar kernel stays as the fallback for backends without
             // cuBLASLt.
-            if ops::cublas_bf16_proj_dense(
+            if let Err(e) = ops::cublas_bf16_proj_dense(
                 normed,
                 self.ssm.in_proj_qkvz.weight,
                 proj_dst,
@@ -387,9 +387,20 @@ impl Qwen3SsmLayer {
                 qkvz_size as u32,
                 h as u32,
                 stream,
-            )
-            .is_err()
-            {
+            ) {
+                // Say WHY before falling back: a rejected operand here is the
+                // first sign of the misaligned pointer the scalar kernel then
+                // faults on (chunk 2+ of a chunked prefill, 2026-09-03).
+                tracing::warn!(
+                    "ssm prefill: cuBLASLt QKVZ GEMM failed (M={k}, N={qkvz_size}, K={h}, \
+                     in&0xff={:#x}, out&0xff={:#x}) — falling back to dense_gemm: {e:#}",
+                    normed.0 & 0xff,
+                    proj_dst.0 & 0xff
+                );
+                debug_assert!(
+                    normed.0.is_multiple_of(16) && proj_dst.0.is_multiple_of(16),
+                    "misaligned QKVZ GEMM operand"
+                );
                 ops::dense_gemm(
                     ctx.gpu,
                     self.dense_gemm_k,

@@ -411,6 +411,30 @@ pub fn run(
 
     let mut snapshot_steps: u64 = 0;
     loop {
+        // ── Latched GPU fault: stop scheduling, NOW ──
+        // A destroyed CUDA context is not a per-request failure: every later
+        // driver call in this process returns the same sticky status, so
+        // continuing to loop only produced hours of 500s with the port open
+        // and ~100 GB held (D-4 aftermath — the latch fired, the 503s and the
+        // exit path in `main.rs` were both correct, and this loop never gave
+        // control back to them). Mark every in-flight sequence an engine error
+        // and break: the drain below the loop finishes them with reason
+        // "error" and releases the model, and `main.rs` exits
+        // `EXIT_GPU_FAULT` off the same latch.
+        if let Some(reason) = atlas_core::fault::global().fault() {
+            tracing::error!(
+                "GPU fault latched — scheduler stopping: {reason}; \
+                 finishing {} active sequence(s) with an engine error",
+                active.len()
+            );
+            for a in active.iter_mut() {
+                if a.engine_error.is_none() {
+                    a.engine_error = Some(format!("gpu_fault: {reason}"));
+                }
+                a.finished = true;
+            }
+            break;
+        }
         // ── Drain pending → start prefill (chunked or full) ──
         // The `t_loop_*` brackets attribute the out-of-step GAP the
         // ATLAS_MTP_TIMING summary reports (see mtp_timing::Phase::Gap): each
@@ -728,6 +752,28 @@ pub fn run(
             // dispatch chain actually uses.
             let spec_width_ok = active.len() <= mtp_max_seqs();
             let verify_ctx_limit = model.verify_context_limit();
+            // D-2a latch: a sequence admitted just BELOW the bound gets a
+            // verify step that ingests num_drafts + 1 rows ACROSS it, so the
+            // NEXT verify runs with an ACTIVE QSA selection on the batched
+            // ms path — which refuses it and finishes the request. Decline
+            // MTP for any sequence whose next verify could land at/past the
+            // bound; the `disable_mtp` flag makes the log fire once per
+            // sequence and the serial lane serves active QSA per-seq.
+            for a in active.iter_mut() {
+                if !a.disable_mtp
+                    && verify_ctx_limit.is_some_and(|lim| {
+                        mtp_gate::qsa_latch::crosses_inert_bound(a.seq.seq_len, num_drafts, lim)
+                    })
+                {
+                    a.disable_mtp = true;
+                    tracing::info!(
+                        "mtp declined: qsa_active seq_len={} num_drafts={} lim={}",
+                        a.seq.seq_len,
+                        num_drafts,
+                        verify_ctx_limit.unwrap_or(0),
+                    );
+                }
+            }
             if use_mtp {
                 adaptive_rung::note_width_regime(active.len(), spec_width_ok);
             }

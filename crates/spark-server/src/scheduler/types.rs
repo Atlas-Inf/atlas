@@ -168,6 +168,11 @@ pub(super) struct ActiveSeq {
     pub min_tokens: usize,
     pub eos_tokens: Vec<u32>,
     pub finished: bool,
+    /// Set when a decode/verify step aborted the sequence on an ENGINE
+    /// error (cuBLAS failure, bad logits, etc.) rather than on a model
+    /// stop. When set, the wire finish reason becomes `"error"` instead
+    /// of laundering the failure into `"stop"`.
+    pub engine_error: Option<String>,
     /// Which server-side guard force-finished this sequence (e.g.
     /// "fuzzy_repetition"), if any. Surfaced in the synthesized --dump body
     /// so a guard-cut turn is attributable without log archaeology (the
@@ -412,6 +417,15 @@ pub(super) struct ActiveSeq {
     /// output length rather than decremented per step so it costs nothing
     /// on the decode hot path and is deterministic to test.
     pub preempt_immune_until_tokens: usize,
+}
+
+impl ActiveSeq {
+    /// Abort the sequence on an ENGINE error: records the cause so the wire
+    /// finish reason is "error" (never "stop") and marks it finished.
+    pub(super) fn abort_on_engine_error(&mut self, e: impl std::fmt::Display) {
+        self.engine_error = Some(format!("{e:#}"));
+        self.finished = true;
+    }
 }
 
 impl ActiveSeq {

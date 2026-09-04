@@ -8,9 +8,21 @@
 mod tests {
     // `super::super::` — this file is a sibling module of `sampling_setup`,
     // so one `super` only reaches `sampling_setup_tests` itself.
-    use super::super::{tool_choice_required_for_parser, tool_grammar_escape_applies};
+    use super::super::{
+        preset_penalties_apply, tool_choice_required_for_parser, tool_grammar_escape_applies,
+    };
 
     use crate::tool_parser::{ToolChoice, ToolChoiceFunction};
+
+    /// Core requests inherit preset penalties only with the model's opt-in;
+    /// tool-calling requests always keep the `[sampling.tools]` penalties.
+    #[test]
+    fn preset_penalties_follow_the_core_opt_in_but_always_apply_to_tools() {
+        assert!(preset_penalties_apply(false, true));
+        assert!(!preset_penalties_apply(false, false));
+        assert!(preset_penalties_apply(true, true));
+        assert!(preset_penalties_apply(true, false));
+    }
 
     /// The escape hatch's own help text scopes it to `tool_choice="auto"`.
     #[test]

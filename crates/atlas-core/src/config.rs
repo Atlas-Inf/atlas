@@ -159,12 +159,26 @@ pub struct ModelConfig {
     /// than as a real bound.
     #[serde(skip)]
     pub max_batch_tokens: usize,
+    /// Served context length, prompt + generation; the serve layer sets it
+    /// from `--max-seq-len`. Like `max_batch_tokens`, this is a serve-time
+    /// value: `skip`, and 0 means "no serve set this".
+    #[serde(skip)]
+    pub max_seq_len: usize,
     /// When `skip_lm_head_quantization()` == false, quantize the LM head to FP8
     /// (E4M3, per-row scales, decoded via `w8a16_gemv`) instead of NVFP4.
     /// Set by `--lm-head-dtype fp8`. Additive: leaves the NVFP4/BF16 paths
     /// byte-identical when false.
     #[serde(default)]
     pub lm_head_fp8: bool,
+    /// Keep the full-attention Q/K/V/O projections at checkpoint BF16 instead
+    /// of runtime-quantizing them to NVFP4 at load (`--attn-proj-dtype bf16`).
+    /// Serve-time like `lm_head_bf16_override`: `skip`, false when unset. The
+    /// BF16 Q/K/V sources are resident anyway (`AttentionWeights.{q,k,v}_proj`
+    /// feed the dense fallbacks), so this costs only O's BF16 copy. Quality
+    /// lever for checkpoints that ship attention in BF16 (qwen4_exp): 4-bit
+    /// q/k perturbations reroute attention on long prompts.
+    #[serde(skip)]
+    pub attn_proj_bf16: bool,
 
     // ── Model type ──
     #[serde(default)]

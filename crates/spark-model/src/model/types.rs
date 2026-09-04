@@ -182,6 +182,12 @@ pub struct TransformerModel {
     pub(super) ssm_pool: Arc<SsmStatePool>,
     /// SSM state snapshot pool for Marconi prefix caching.
     pub(super) ssm_snapshots: SsmSnapshotPool,
+    /// Decode-rollback AUX snapshots (QSA/PLE per-sequence blobs), keyed by
+    /// `(seq.slot_idx, ring_slot)` exactly like the SSM decode ring; see
+    /// `Model::save_decode_aux_snapshot`. Bounded by slots x ring capacity
+    /// (entries are overwritten when a ring slot is reused).
+    pub(super) decode_aux_snapshots:
+        std::sync::Mutex<std::collections::HashMap<(usize, usize), Vec<(u32, Vec<u8>)>>>,
     /// Optional SSM snapshot spill tier (`ATLAS_SSM_TIER`). `None` (default)
     /// keeps the drop-only reclaim path byte-identical; `Some` moves an evicted
     /// snapshot's bytes to the tier (keeping its index entry findable) so a warm

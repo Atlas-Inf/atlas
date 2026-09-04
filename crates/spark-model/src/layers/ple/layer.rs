@@ -110,6 +110,13 @@ pub struct PleLayer {
     out: DevicePtr,
     slots_dev: DevicePtr,
     max_tokens: usize,
+    /// Event recorded after the gather kernel (see `gather_embed`), so
+    /// `release_prev_pins` waits on THAT kernel instead of the whole stream.
+    /// 0 until lazily created; 0 falls back to a full stream sync.
+    gather_done: std::sync::Mutex<u64>,
+    /// Pinned staging for the slot upload: (host pointer as usize, capacity
+    /// in bytes). (0, 0) until the first `Cached` gather grows it.
+    slots_staging: std::sync::Mutex<(usize, usize)>,
 }
 
 impl PleLayer {
@@ -186,6 +193,8 @@ impl PleLayer {
             out: gpu.alloc(max_tokens * c * 4)?,
             slots_dev: gpu.alloc(max_tokens * heads * 4)?,
             max_tokens,
+            gather_done: std::sync::Mutex::new(0),
+            slots_staging: std::sync::Mutex::new((0, 0)),
         })
     }
 

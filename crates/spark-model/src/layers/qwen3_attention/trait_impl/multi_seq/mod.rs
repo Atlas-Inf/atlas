@@ -49,6 +49,17 @@ impl Qwen3AttentionLayer {
         )? {
             return Ok(());
         }
+        // Pre-mutation guard: a row at/past the inert bound has ACTIVE QSA
+        // selection; the late `sel.is_none()` check below fires after ingest.
+        if let Some(qsa) = self.qsa.as_ref() {
+            let bound = qsa.inert_bound();
+            for (i, &len) in _seq_lens.iter().take(num_seqs).enumerate() {
+                anyhow::ensure!(
+                    len < bound,
+                    "VerifyUnsupportedWithActiveQsa: row {i} visible {len} >= inert bound {bound}"
+                );
+            }
+        }
         let bs = kv_cache.block_size() as u32;
         let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
         // Per-request LoRA routing slot buffer for this step (from metadata).

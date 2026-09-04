@@ -785,6 +785,7 @@ impl TransformerModel {
             ),
             ssm_pool,
             ssm_snapshots,
+            decode_aux_snapshots: Default::default(),
             ssm_tier_store,
             max_blocks_per_seq,
             dummy_kv_block,

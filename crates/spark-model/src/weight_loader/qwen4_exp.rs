@@ -201,15 +201,14 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             .filter(|n| *n > 0)
         {
             Some(n) => {
-                // Honouring an override BELOW the forward width is how the
-                // 500s got here in the first place, so it is allowed (it is a
-                // real KV-vs-capacity trade) but never silent.
+                // Below the forward width: honouring it meant a guaranteed 500.
                 if n < ple_floor {
                     tracing::warn!(
-                        "ATLAS_PLE_MAX_TOKENS={n} is below the {ple_floor} tokens a single                          forward can present — any prefill wider than {n} will be REFUSED by                          the PLE layer and the request will fail. Raise it, or lower                          --max-num-batched-tokens to match."
+                        "ATLAS_PLE_MAX_TOKENS={n} is below the {ple_floor}-token forward \
+                         width — clamped UP; lower --max-num-batched-tokens instead."
                     );
                 }
-                n
+                n.max(ple_floor)
             }
             None => ple_floor,
         };
