@@ -172,15 +172,36 @@ fn snapshot_aware_search_after_eviction_only_sees_live_snapshots() {
 
 #[test]
 fn rewind_truncates_output_and_seq_and_lowers_seq_len() {
-    // output_tokens is the generated suffix; seq_tokens is prompt+gen.
+    // output_tokens is the generated suffix; seq_tokens is prompt+gen and,
+    // at watchdog time, already holds every generated token (the last one
+    // was fed by the decode whose logits are being processed).
     let mut output = vec![50, 51, 52, 53, 54, 55]; // 6 generated
     let mut seq = vec![1, 2, 3, 50, 51, 52, 53, 54, 55]; // 3 prompt + 6 gen
     let seq_len = 9;
-    // Keep the first 4 generated tokens → drop 2.
+    // Keep the first 4 generated tokens → drop 2. The boundary token (53)
+    // stays in `output` but leaves `seq`: it is re-fed as `last_token` on
+    // the next decode, from the state the boundary snapshot captured
+    // (taken before 53 was fed).
     let new_len = rewind_buffers(&mut output, &mut seq, seq_len, 4);
     assert_eq!(output, vec![50, 51, 52, 53]);
-    assert_eq!(seq, vec![1, 2, 3, 50, 51, 52, 53]);
-    assert_eq!(new_len, 7, "seq_len must drop by the 2 rewound tokens");
+    assert_eq!(seq, vec![1, 2, 3, 50, 51, 52]);
+    assert_eq!(
+        new_len, 6,
+        "seq_len drops by the 2 rewound tokens plus the re-fed boundary token"
+    );
+}
+
+#[test]
+fn rewind_leaves_the_boundary_token_for_the_next_decode() {
+    // Regression: with `dropped` pops the boundary token stayed in `seq`
+    // AND was re-fed → decoded twice, one position past the snapshot
+    // ("QSA: decode at pos 6050 but 6049 tokens ingested").
+    let mut output = vec![10, 11, 12, 13];
+    let mut seq = vec![7, 10, 11, 12, 13];
+    let new_len = rewind_buffers(&mut output, &mut seq, 5, 2);
+    assert_eq!(output, vec![10, 11]);
+    assert_eq!(seq, vec![7, 10], "boundary token 11 must not be in seq");
+    assert_eq!(new_len, 2, "next decode of 11 lands at position 2");
 }
 
 #[test]

@@ -396,9 +396,21 @@ pub fn rewind_buffers(
     keep_len: usize,
 ) -> usize {
     let dropped = output_tokens.len().saturating_sub(keep_len);
+    if dropped == 0 {
+        return seq_len;
+    }
     output_tokens.truncate(keep_len);
+    // Every watchdog that rolls back fires from logits processing, i.e.
+    // AFTER `decode(last_token)` pushed that token into `seq_tokens` — so at
+    // this point `seq_tokens` holds the prompt plus *every* generated token,
+    // the boundary token included. `apply_rollback` re-points `last_token`
+    // at the boundary token and the next step decodes it again, so it has to
+    // leave `seq_tokens` too: pop `dropped + 1`. Popping only `dropped`
+    // decoded the boundary token twice — a duplicate KV row at position N+1
+    // and, on hybrid models, "QSA: decode at pos N+1 but N tokens ingested"
+    // (the aux/SSM snapshot was taken before the boundary token was fed).
     let mut new_seq_len = seq_len;
-    for _ in 0..dropped {
+    for _ in 0..=dropped {
         if seq_tokens.pop().is_some() {
             new_seq_len = new_seq_len.saturating_sub(1);
         }
