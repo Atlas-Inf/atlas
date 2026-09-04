@@ -172,9 +172,9 @@ fn snapshot_aware_search_after_eviction_only_sees_live_snapshots() {
 
 #[test]
 fn rewind_truncates_output_and_seq_and_lowers_seq_len() {
-    // output_tokens is the generated suffix; seq_tokens is prompt+gen and,
-    // at watchdog time, already holds every generated token (the last one
-    // was fed by the decode whose logits are being processed).
+    // output_tokens is the generated suffix; seq_tokens is prompt+gen. At
+    // the before-push watchdog site every generated token has been fed
+    // (`unfed_tail = 0`).
     let mut output = vec![50, 51, 52, 53, 54, 55]; // 6 generated
     let mut seq = vec![1, 2, 3, 50, 51, 52, 53, 54, 55]; // 3 prompt + 6 gen
     let seq_len = 9;
@@ -182,7 +182,7 @@ fn rewind_truncates_output_and_seq_and_lowers_seq_len() {
     // stays in `output` but leaves `seq`: it is re-fed as `last_token` on
     // the next decode, from the state the boundary snapshot captured
     // (taken before 53 was fed).
-    let new_len = rewind_buffers(&mut output, &mut seq, seq_len, 4);
+    let new_len = rewind_buffers(&mut output, &mut seq, seq_len, 4, 0);
     assert_eq!(output, vec![50, 51, 52, 53]);
     assert_eq!(seq, vec![1, 2, 3, 50, 51, 52]);
     assert_eq!(
@@ -192,23 +192,45 @@ fn rewind_truncates_output_and_seq_and_lowers_seq_len() {
 }
 
 #[test]
+fn rewind_after_push_site_keeps_the_unfed_token_out_of_the_count() {
+    // The fuzzy detector runs after the step pushed its token (55), which
+    // the model has not decoded yet (`unfed_tail = 1`): seq is one short.
+    let mut output = vec![50, 51, 52, 53, 54, 55]; // 6 generated, 55 unfed
+    let mut seq = vec![1, 2, 3, 50, 51, 52, 53, 54]; // 3 prompt + 5 fed
+    let new_len = rewind_buffers(&mut output, &mut seq, 8, 4, 1);
+    assert_eq!(output, vec![50, 51, 52, 53]);
+    assert_eq!(seq, vec![1, 2, 3, 50, 51, 52], "boundary 53 leaves seq");
+    assert_eq!(new_len, 6, "next decode of 53 lands at position 6");
+}
+
+#[test]
 fn rewind_leaves_the_boundary_token_for_the_next_decode() {
-    // Regression: with `dropped` pops the boundary token stayed in `seq`
-    // AND was re-fed → decoded twice, one position past the snapshot
-    // ("QSA: decode at pos 6050 but 6049 tokens ingested").
+    // Regression: a fixed `dropped` pops left the boundary token in `seq`
+    // AND re-fed it → decoded twice, one position past the snapshot
+    // ("QSA: decode at pos 6050 but 6049 tokens ingested"); a fixed
+    // `dropped + 1` at the after-push site dropped a real token ("pos 8535
+    // but 8536 ingested"). Both sites must land the re-fed boundary token
+    // exactly where the snapshot expects it.
     let mut output = vec![10, 11, 12, 13];
     let mut seq = vec![7, 10, 11, 12, 13];
-    let new_len = rewind_buffers(&mut output, &mut seq, 5, 2);
+    let new_len = rewind_buffers(&mut output, &mut seq, 5, 2, 0);
     assert_eq!(output, vec![10, 11]);
     assert_eq!(seq, vec![7, 10], "boundary token 11 must not be in seq");
     assert_eq!(new_len, 2, "next decode of 11 lands at position 2");
+
+    let mut output = vec![10, 11, 12, 13];
+    let mut seq = vec![7, 10, 11, 12];
+    let new_len = rewind_buffers(&mut output, &mut seq, 4, 2, 1);
+    assert_eq!(output, vec![10, 11]);
+    assert_eq!(seq, vec![7, 10]);
+    assert_eq!(new_len, 2);
 }
 
 #[test]
 fn rewind_keeping_all_is_a_noop() {
     let mut output = vec![50, 51, 52];
     let mut seq = vec![1, 50, 51, 52];
-    let new_len = rewind_buffers(&mut output, &mut seq, 4, 3);
+    let new_len = rewind_buffers(&mut output, &mut seq, 4, 3, 1);
     assert_eq!(output, vec![50, 51, 52]);
     assert_eq!(seq, vec![1, 50, 51, 52]);
     assert_eq!(new_len, 4);
@@ -219,7 +241,7 @@ fn rewind_seq_len_saturates_at_zero() {
     // Pathological: seq_len smaller than the drop count must not wrap.
     let mut output = vec![1, 2, 3, 4, 5];
     let mut seq = vec![1, 2, 3, 4, 5];
-    let new_len = rewind_buffers(&mut output, &mut seq, 2, 1);
+    let new_len = rewind_buffers(&mut output, &mut seq, 2, 1, 1);
     assert_eq!(output, vec![1]);
     assert_eq!(new_len, 0, "saturating, never underflow");
 }

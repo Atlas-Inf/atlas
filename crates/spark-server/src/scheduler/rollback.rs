@@ -206,11 +206,17 @@ pub fn find_last_boundary_with_snapshot(
 /// any-boundary behavior. A model-side restore failure is also surfaced
 /// as a decline (the caller hard-stops cleanly rather than continuing on
 /// corrupt SSM state).
+///
+/// `unfed_tail` is how many of the newest `output_tokens` the caller has
+/// pushed but the model has NOT decoded yet: 0 at a watchdog that runs
+/// before the step's push (`handle_content_token`), 1 at one that runs
+/// after it (the fuzzy detector). See [`rewind_buffers`].
 pub fn rollback_to_boundary(
     a: &mut ActiveSeq,
     min_keep: usize,
     model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
+    unfed_tail: usize,
 ) -> RollbackOutcome {
     if !sched.watchdog.rollback_resteer {
         return RollbackOutcome::Fallback(RollbackFallback::Disabled);
@@ -302,7 +308,7 @@ pub fn rollback_to_boundary(
         a.ssm_rollback_ring.truncate_after(keep_len);
     }
 
-    apply_rollback(a, keep_len, dropped);
+    apply_rollback(a, keep_len, dropped, unfed_tail);
     a.rollback_count = a.rollback_count.saturating_add(1);
     RollbackOutcome::RolledBack { dropped }
 }
@@ -394,23 +400,29 @@ pub fn rewind_buffers(
     seq_tokens: &mut Vec<u32>,
     seq_len: usize,
     keep_len: usize,
+    unfed_tail: usize,
 ) -> usize {
     let dropped = output_tokens.len().saturating_sub(keep_len);
     if dropped == 0 {
         return seq_len;
     }
     output_tokens.truncate(keep_len);
-    // Every watchdog that rolls back fires from logits processing, i.e.
-    // AFTER `decode(last_token)` pushed that token into `seq_tokens` — so at
-    // this point `seq_tokens` holds the prompt plus *every* generated token,
-    // the boundary token included. `apply_rollback` re-points `last_token`
-    // at the boundary token and the next step decodes it again, so it has to
-    // leave `seq_tokens` too: pop `dropped + 1`. Popping only `dropped`
-    // decoded the boundary token twice — a duplicate KV row at position N+1
-    // and, on hybrid models, "QSA: decode at pos N+1 but N tokens ingested"
-    // (the aux/SSM snapshot was taken before the boundary token was fed).
+    // `seq_tokens` grows only when the model decodes a token, so it holds
+    // the prompt plus every generated token the model has FED — that is
+    // every generated token except the `unfed_tail` newest ones the caller
+    // pushed to `output_tokens` but has not decoded yet (0 at a watchdog
+    // that runs before the step's push, 1 at one that runs after it). The
+    // boundary token is re-fed as `last_token` on the next step, from the
+    // SSM/aux snapshot taken before it was fed, so it must leave
+    // `seq_tokens` too: pop every fed token from the boundary onwards. A
+    // fixed `dropped` decoded the boundary token twice at the before-push
+    // site ("QSA: decode at pos N+1 but N tokens ingested"); a fixed
+    // `dropped + 1` discarded a real token at the after-push site
+    // ("pos N but N+1 ingested").
+    let fed_outputs = (output_tokens.len() + dropped).saturating_sub(unfed_tail);
+    let pops = (fed_outputs + 1).saturating_sub(keep_len);
     let mut new_seq_len = seq_len;
-    for _ in 0..=dropped {
+    for _ in 0..pops {
         if seq_tokens.pop().is_some() {
             new_seq_len = new_seq_len.saturating_sub(1);
         }
@@ -420,7 +432,7 @@ pub fn rewind_buffers(
 
 /// Apply the truncation + KV/position rewind + watchdog-state reset to a
 /// live [`ActiveSeq`]. Delegates the buffer rewind to [`rewind_buffers`].
-fn apply_rollback(a: &mut ActiveSeq, keep_len: usize, dropped: usize) {
+fn apply_rollback(a: &mut ActiveSeq, keep_len: usize, dropped: usize, unfed_tail: usize) {
     // 1+2. Truncate the generated-token buffer and rewind the
     //       attention-KV cursor (`seq.tokens` + `seq_len`).
     a.seq.seq_len = rewind_buffers(
@@ -428,6 +440,7 @@ fn apply_rollback(a: &mut ActiveSeq, keep_len: usize, dropped: usize) {
         &mut a.seq.tokens,
         a.seq.seq_len,
         keep_len,
+        unfed_tail,
     );
 
     // 3. Restore the generation budget that the dropped tokens consumed.
