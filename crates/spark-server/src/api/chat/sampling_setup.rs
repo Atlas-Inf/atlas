@@ -82,6 +82,14 @@ fn tool_choice_required_for_parser(
 /// covered by the same term: that parser's grammar is what stops the
 /// `<invokeinvoke` / `<parameterparameter` degenerate-loop corruption class
 /// (see `compile_minimax_xml_tool_grammar`), so the hatch must not remove it.
+/// Whether a request that left its penalties unset inherits them from the
+/// selected `[sampling.*]` preset. Tool-calling requests always do (the
+/// `[sampling.tools]` row is agentic-turn tuned); core requests only when
+/// the model opts in via `use_sampling_preset_penalties_for_core`.
+fn preset_penalties_apply(tools_active: bool, core_penalties_opt_in: bool) -> bool {
+    tools_active || core_penalties_opt_in
+}
+
 fn tool_grammar_escape_applies(disable_tool_grammar: bool, tool_choice_required: bool) -> bool {
     disable_tool_grammar && !tool_choice_required
 }
@@ -174,26 +182,42 @@ pub(super) fn build_sampling(
             .or(if core_preset { preset.min_p } else { None })
             .unwrap_or(state.default_min_p)
     };
+    // Penalties: explicit request > preset, but a core (non-tool) request
+    // inherits the preset penalties only when the model opts in
+    // (`[behavior].use_sampling_preset_penalties_for_core`, default true).
+    // A card's presence_penalty is tuned for short chat turns; over a
+    // 20K-token single-file generation it suppresses every token already
+    // emitted (see the flag's doc in `atlas_kernels::ModelBehavior`).
+    let preset_penalties = preset_penalties_apply(
+        tools_active,
+        state.behavior.use_sampling_preset_penalties_for_core,
+    );
     let repetition_penalty = if force_temp_zero {
         1.0
     } else {
-        req.sampling
-            .repetition_penalty
-            .unwrap_or(preset.repetition_penalty)
+        req.sampling.repetition_penalty.unwrap_or(if preset_penalties {
+            preset.repetition_penalty
+        } else {
+            1.0
+        })
     };
     let presence_penalty = if force_temp_zero {
         0.0
     } else {
-        req.sampling
-            .presence_penalty
-            .unwrap_or(preset.presence_penalty)
+        req.sampling.presence_penalty.unwrap_or(if preset_penalties {
+            preset.presence_penalty
+        } else {
+            0.0
+        })
     };
     let frequency_penalty = if force_temp_zero {
         0.0
     } else {
-        req.sampling
-            .frequency_penalty
-            .unwrap_or(preset.frequency_penalty)
+        req.sampling.frequency_penalty.unwrap_or(if preset_penalties {
+            preset.frequency_penalty
+        } else {
+            0.0
+        })
     };
     // Per-model server-side sampling SAFETY FLOOR/CEILING (MODEL.toml
     // [behavior]). Binds AFTER request/preset resolution so model stability

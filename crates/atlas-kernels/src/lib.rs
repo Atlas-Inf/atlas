@@ -228,6 +228,17 @@ pub struct ModelBehavior {
     /// top-k, and top-p instead of generation_config.json. Explicit request
     /// values still take precedence.
     pub use_sampling_presets_for_core: bool,
+    /// Let the selected MODEL.toml sampling category also supply the
+    /// *penalty* defaults (repetition / presence / frequency) for core
+    /// chat/completions requests that leave them unset. Defaults TRUE (the
+    /// behaviour every model had before the flag). Set false for models whose
+    /// card penalty is tuned for short chat turns: Qwen3.8-Flash-Next's
+    /// `presence_penalty = 1.5` applied to a 20K-token single-file build
+    /// suppressed every already-emitted token (closing braces, repeated
+    /// identifiers) and shipped dead files; with it off the same engine and
+    /// sampler wrote a working 51 KB game. Tool-calling requests keep the
+    /// `[sampling.tools]` penalties regardless — those are agentic-turn tuned.
+    pub use_sampling_preset_penalties_for_core: bool,
     /// Per-model tool-call parser override. Empty string = use the
     /// `tool_defaults.toml` mapping for this `model_type`. Set in MODEL.toml
     /// `[behavior].tool_call_parser` when one variant of a model_type needs
@@ -398,6 +409,7 @@ impl Default for ModelBehavior {
             disable_tool_steering: false,
             disable_cwd_hint_injection: false,
             use_sampling_presets_for_core: false,
+            use_sampling_preset_penalties_for_core: true,
             tool_call_parser: "",
             jinja_template: "",
             enable_loop_watchdog: false,
