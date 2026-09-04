@@ -23,7 +23,7 @@ use super::ServeArgs;
 // enforced cannot drift apart. Their sync with the parse sites in `serve.rs`
 // is pinned by `flag_values_tests`.
 use super::flag_values::{
-    LM_HEAD_DTYPES, MTP_GATES, MTP_QUANTS, SCHEDULING_POLICIES, SSM_H_DTYPES, TOOL_CALL_PARSERS,
+    ATTN_PROJ_DTYPES, LM_HEAD_DTYPES, MTP_GATES, MTP_QUANTS, SCHEDULING_POLICIES, SSM_H_DTYPES, TOOL_CALL_PARSERS,
 };
 
 /// One validation failure: what is wrong, why it is wrong, and how to fix it.
@@ -56,6 +56,12 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         "--lm-head-dtype",
         &args.lm_head_dtype,
         LM_HEAD_DTYPES,
+    );
+    check_enum(
+        &mut v,
+        "--attn-proj-dtype",
+        &args.attn_proj_dtype,
+        ATTN_PROJ_DTYPES,
     );
     if let Some(dtype) = &args.ssm_h_dtype {
         check_enum(&mut v, "--ssm-h-dtype", dtype, SSM_H_DTYPES);

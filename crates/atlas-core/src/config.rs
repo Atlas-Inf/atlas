@@ -170,6 +170,15 @@ pub struct ModelConfig {
     /// byte-identical when false.
     #[serde(default)]
     pub lm_head_fp8: bool,
+    /// Keep the full-attention Q/K/V/O projections at checkpoint BF16 instead
+    /// of runtime-quantizing them to NVFP4 at load (`--attn-proj-dtype bf16`).
+    /// Serve-time like `lm_head_bf16_override`: `skip`, false when unset. The
+    /// BF16 Q/K/V sources are resident anyway (`AttentionWeights.{q,k,v}_proj`
+    /// feed the dense fallbacks), so this costs only O's BF16 copy. Quality
+    /// lever for checkpoints that ship attention in BF16 (qwen4_exp): 4-bit
+    /// q/k perturbations reroute attention on long prompts.
+    #[serde(skip)]
+    pub attn_proj_bf16: bool,
 
     // ── Model type ──
     #[serde(default)]

@@ -42,7 +42,7 @@ pub(crate) fn build_full_attention_nvfp4(
     let tp_size = config.tp_world_size.max(1);
     let i = layer_idx;
 
-    let (attn, q_nvfp4, k_nvfp4, v_nvfp4) = match variant {
+    let (attn, q_nvfp4, k_nvfp4, v_nvfp4, o_dense_bf16) = match variant {
         Nvfp4Variant::CompressedTensors => {
             let group_size = 16usize;
             let load_nvfp4 = |name: &str,
@@ -99,7 +99,7 @@ pub(crate) fn build_full_attention_nvfp4(
                 k_scale,
                 v_scale,
             };
-            (attn, Some(q), Some(k), Some(v))
+            (attn, Some(q), Some(k), Some(v), None)
         }
         Nvfp4Variant::Standard | Nvfp4Variant::Fp8Dequanted | Nvfp4Variant::Bf16Raw => {
             tracing::info!("Layer {i}: loading attention projections ({variant:?})");
@@ -155,8 +155,19 @@ pub(crate) fn build_full_attention_nvfp4(
                 (q_dense, q_nvfp4),
                 (k_dense, k_nvfp4),
                 (v_dense, v_nvfp4),
-                (_o_dense, o_nvfp4),
+                (o_dense, o_nvfp4),
             ] = load_qkvo_tp(config, load_bf16_then_nvfp4)?;
+            // `--attn-proj-dtype bf16`: hand the layer no NVFP4 Q/K/V so its
+            // dense arms run on the resident BF16 sources, and keep O's BF16
+            // copy for `o_dense_bf16`. The NVFP4 copies just built stay
+            // allocated but unused (a few MB per layer) — simpler than a
+            // second loader closure, and this is a quality-gate lever.
+            let keep_bf16 = config.attn_proj_bf16;
+            if keep_bf16 {
+                tracing::info!(
+                    "Layer {i}: --attn-proj-dtype bf16 — Q/K/V/O stay at checkpoint BF16"
+                );
+            }
             tracing::info!(
                 "Layer {i}: Q/K/V/O quantized, {:.1} GB free",
                 gpu.free_memory()? as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -176,7 +187,11 @@ pub(crate) fn build_full_attention_nvfp4(
                 k_scale,
                 v_scale,
             };
-            (attn, Some(q_nvfp4), Some(k_nvfp4), Some(v_nvfp4))
+            if keep_bf16 {
+                (attn, None, None, None, Some(o_dense))
+            } else {
+                (attn, Some(q_nvfp4), Some(k_nvfp4), Some(v_nvfp4), None)
+            }
         }
     };
 
@@ -194,6 +209,9 @@ pub(crate) fn build_full_attention_nvfp4(
         config.fp8_kv_calibration_tokens,
         config,
     )?;
+    if let Some(o_dense) = o_dense_bf16 {
+        layer.set_o_dense_bf16(o_dense);
+    }
 
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_key_value_heads;
