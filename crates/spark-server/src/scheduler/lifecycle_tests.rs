@@ -481,7 +481,7 @@ fn call_site_passes_the_real_guard() {
 fn engine_error_is_never_reported_as_stop() {
     let (mut a, mut rx) = test_seq(vec![5, 6, 42], 5, None, 10);
     a.engine_error = Some("boom".into());
-    finish_sequence(&StubModel, &mut a, MAX_SEQ_LEN);
+    finish_sequence(&StubModel::default(), &mut a, MAX_SEQ_LEN);
     let err = match rx
         .try_recv()
         .expect("finish_sequence must send the blocking response")
