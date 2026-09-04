@@ -390,6 +390,9 @@ use_sampling_presets_for_core = true
 # sampler with presence 0 wrote a working 51 KB game. Tool-calling requests
 # still inherit [sampling.tools]; explicit request values always win.
 use_sampling_preset_penalties_for_core = false
+# ATLAS_MOE_DECODE_ARM=grouped routes every layer's single-token MoE through the
+# tensor-core grouped-GEMM arm (forward_prefill M=1) instead of the scalar FP32-FMA
+# gemv arm. A/B lever for the 2026-09-04 llama.cpp gap study; default stays scalar.
 # The A4 POST_THINK_MIN_REASONING floor (-8 on `</think>` for the first 16
 # think tokens) collides with this model's card-native brief thinking:
 # under `reasoning_effort: low` the model closes its think at ~10 tokens,
