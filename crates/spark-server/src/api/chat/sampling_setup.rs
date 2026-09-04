@@ -195,29 +195,35 @@ pub(super) fn build_sampling(
     let repetition_penalty = if force_temp_zero {
         1.0
     } else {
-        req.sampling.repetition_penalty.unwrap_or(if preset_penalties {
-            preset.repetition_penalty
-        } else {
-            1.0
-        })
+        req.sampling
+            .repetition_penalty
+            .unwrap_or(if preset_penalties {
+                preset.repetition_penalty
+            } else {
+                1.0
+            })
     };
     let presence_penalty = if force_temp_zero {
         0.0
     } else {
-        req.sampling.presence_penalty.unwrap_or(if preset_penalties {
-            preset.presence_penalty
-        } else {
-            0.0
-        })
+        req.sampling
+            .presence_penalty
+            .unwrap_or(if preset_penalties {
+                preset.presence_penalty
+            } else {
+                0.0
+            })
     };
     let frequency_penalty = if force_temp_zero {
         0.0
     } else {
-        req.sampling.frequency_penalty.unwrap_or(if preset_penalties {
-            preset.frequency_penalty
-        } else {
-            0.0
-        })
+        req.sampling
+            .frequency_penalty
+            .unwrap_or(if preset_penalties {
+                preset.frequency_penalty
+            } else {
+                0.0
+            })
     };
     // Per-model server-side sampling SAFETY FLOOR/CEILING (MODEL.toml
     // [behavior]). Binds AFTER request/preset resolution so model stability

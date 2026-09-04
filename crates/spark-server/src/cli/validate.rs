@@ -23,7 +23,8 @@ use super::ServeArgs;
 // enforced cannot drift apart. Their sync with the parse sites in `serve.rs`
 // is pinned by `flag_values_tests`.
 use super::flag_values::{
-    ATTN_PROJ_DTYPES, LM_HEAD_DTYPES, MTP_GATES, MTP_QUANTS, SCHEDULING_POLICIES, SSM_H_DTYPES, TOOL_CALL_PARSERS,
+    ATTN_PROJ_DTYPES, LM_HEAD_DTYPES, MTP_GATES, MTP_QUANTS, SCHEDULING_POLICIES, SSM_H_DTYPES,
+    TOOL_CALL_PARSERS,
 };
 
 /// One validation failure: what is wrong, why it is wrong, and how to fix it.

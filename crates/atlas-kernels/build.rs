@@ -1178,7 +1178,8 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_disable_tool_steering: pb.disable_tool_steering,
                 behavior_disable_cwd_hint_injection: pb.disable_cwd_hint_injection,
                 behavior_use_sampling_presets_for_core: pb.use_sampling_presets_for_core,
-                behavior_use_sampling_preset_penalties_for_core: pb.use_sampling_preset_penalties_for_core,
+                behavior_use_sampling_preset_penalties_for_core: pb
+                    .use_sampling_preset_penalties_for_core,
                 behavior_tool_call_parser: pb.tool_call_parser,
                 behavior_jinja_template: pb.jinja_template,
                 behavior_enable_loop_watchdog: pb.enable_loop_watchdog,
