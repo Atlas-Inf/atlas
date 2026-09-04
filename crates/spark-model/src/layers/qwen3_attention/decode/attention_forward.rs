@@ -444,6 +444,8 @@ impl Qwen3AttentionLayer {
         if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block (to rope portions only).
             // Skip the shared RoPE to avoid double-rotation.
+        } else if self.rope_disabled {
+            // Nemotron-H: no RoPE in attention (position lives in Mamba).
         } else if !self.yarn_inv_freq.is_null() {
             ops::rope_yarn_scaled(
                 ctx.gpu,

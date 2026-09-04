@@ -12,6 +12,10 @@ use super::NemotronMamba2Layer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+pub(super) fn use_lightning_scalar_in_proj(enabled: bool, rows: u32) -> bool {
+    enabled && rows <= 16
+}
+
 impl NemotronMamba2Layer {
     /// in_proj GEMM: `[N, h] × [h, in_proj_size] → [N, in_proj_size]`.
     ///
@@ -60,7 +64,75 @@ impl NemotronMamba2Layer {
             .as_ref()
             .filter(|_| self.native_fp8_prefill)
         {
-            if self.w8a16_gemm_pipelined_k.0 != 0 {
+            if use_lightning_scalar_in_proj(ctx.levers.lightning_mamba_scalar_in_proj, n)
+                && std::env::var("ATLAS_LIGHTNING_MAMBA_BATCH_IN").as_deref() != Ok("1")
+            {
+                for t in 0..n as usize {
+                    ops::w8a16_gemv(
+                        ctx.gpu,
+                        self.w8a16_gemv_k,
+                        normed.offset(t * h * 2),
+                        fp8w.weight,
+                        fp8w.row_scale,
+                        proj.offset(t * self.in_proj_size * 2),
+                        self.in_proj_size as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                }
+            } else if n <= 16 {
+                let k = if n <= 4 {
+                    self.w8a16_gemv_batch4_k
+                } else {
+                    self.w8a16_gemv_batch16_k
+                };
+                if k.0 != 0 {
+                    ops::w8a16_gemv_batch4(
+                        ctx.gpu,
+                        k,
+                        normed,
+                        fp8w.weight,
+                        fp8w.row_scale,
+                        proj,
+                        n,
+                        self.in_proj_size as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                } else if self.w8a16_gemm_pipelined_k.0 != 0 {
+                    ops::w8a16_gemm_pipelined(
+                        ctx.gpu,
+                        self.w8a16_gemm_pipelined_k,
+                        normed,
+                        fp8w.weight,
+                        fp8w.row_scale,
+                        proj,
+                        n,
+                        self.in_proj_size as u32,
+                        h as u32,
+                        stream,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "ssm prefill: in_proj w8a16_gemm_pipelined failed (M={n}, N={}): {e}",
+                            self.in_proj_size
+                        )
+                    })?;
+                } else {
+                    ops::w8a16_gemm(
+                        ctx.gpu,
+                        self.w8a16_gemm_k,
+                        normed,
+                        fp8w.weight,
+                        fp8w.row_scale,
+                        proj,
+                        n,
+                        self.in_proj_size as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                }
+            } else if self.w8a16_gemm_pipelined_k.0 != 0 {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
                     self.w8a16_gemm_pipelined_k,
@@ -229,7 +301,58 @@ impl NemotronMamba2Layer {
             .as_ref()
             .filter(|_| self.native_fp8_prefill)
         {
-            if self.w8a16_gemm_pipelined_k.0 != 0 {
+            if n <= 16 {
+                let k = if n <= 4 {
+                    self.w8a16_gemv_batch4_k
+                } else {
+                    self.w8a16_gemv_batch16_k
+                };
+                if k.0 != 0 {
+                    ops::w8a16_gemv_batch4(
+                        ctx.gpu,
+                        k,
+                        gated_out,
+                        fp8w.weight,
+                        fp8w.row_scale,
+                        out,
+                        n,
+                        h as u32,
+                        self.d_inner as u32,
+                        stream,
+                    )?;
+                } else if self.w8a16_gemm_pipelined_k.0 != 0 {
+                    ops::w8a16_gemm_pipelined(
+                        ctx.gpu,
+                        self.w8a16_gemm_pipelined_k,
+                        gated_out,
+                        fp8w.weight,
+                        fp8w.row_scale,
+                        out,
+                        n,
+                        h as u32,
+                        self.d_inner as u32,
+                        stream,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "ssm prefill: out_proj w8a16_gemm_pipelined failed (M={n}, N={h}): {e}"
+                        )
+                    })?;
+                } else {
+                    ops::w8a16_gemm(
+                        ctx.gpu,
+                        self.w8a16_gemm_k,
+                        gated_out,
+                        fp8w.weight,
+                        fp8w.row_scale,
+                        out,
+                        n,
+                        h as u32,
+                        self.d_inner as u32,
+                        stream,
+                    )?;
+                }
+            } else if self.w8a16_gemm_pipelined_k.0 != 0 {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
                     self.w8a16_gemm_pipelined_k,

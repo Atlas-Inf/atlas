@@ -127,6 +127,19 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Immutable identity for the official Lightning DSpark product.
+    /// Generic DFlash, MTP, and ordinary models return `None` by default.
+    fn lightning_dspark_product_policy(
+        &self,
+    ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
+        None
+    }
+
+    /// Convenience identity check for object-safe scheduler branching.
+    fn is_lightning_dspark_product(&self) -> bool {
+        self.lightning_dspark_product_policy().is_some()
+    }
+
     /// Run beam search to completion for each request, returning each one's
     /// winning hypothesis token ids (EOS-terminated). Called from the prefill
     /// path for `num_beams > 1` requests, bypassing the token-by-token decode
@@ -760,6 +773,11 @@ pub trait Model: Send + Sync {
         1
     }
 
+    /// Smallest group that should enter the batched proposer.
+    fn mtp_propose_batch_min(&self) -> usize {
+        2
+    }
+
     /// DFlash K=γ graphed verify (γ+1 tokens). Specialization of the K=2/3/4
     /// pattern for arbitrary K. Default impl falls back to eager
     /// `decode_verify`. Models can override for CUDA-graph speedup keyed by
@@ -911,6 +929,22 @@ pub trait Model: Send + Sync {
         _num_committed: usize,
         _base_pos: usize,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Preserve the current C=1 front before batched slot-addressed packing.
+    fn preserve_dflash_save_front(&self, _k: usize, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Compact batched UNIFIED_CTX capture for `seq_i` to the C=1 front
+    /// of `dflash_hidden_save` so `commit_ctx` can run unchanged.
+    fn pack_dflash_save_seq(&self, _seq_i: usize, _k: usize, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Restore sequence 0's capture after batched commit packing.
+    fn restore_dflash_save_front(&self, _k: usize, _stream: u64) -> Result<()> {
         Ok(())
     }
 

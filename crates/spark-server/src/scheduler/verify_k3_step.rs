@@ -14,22 +14,9 @@ use super::*;
 const K3_SUMMARY_PERIOD: u64 = 100;
 
 // UNCONDITIONAL per-position draft-match counters (2026-07-21).
-//
-// The accept-chain (`num_accepted`) short-circuits: if draft 1 is rejected,
-// draft 2 is discarded WITHOUT being scored, so the only rate the chain can
-// report for position 2 is the CONDITIONAL p(2|1). Measured p1 ~= 0.70 but
-// p(2|1) ~= 0.53, and it is not possible to tell from the chain alone whether
-// position 2 is genuinely worse or whether p(2|1) is a survivorship artifact
-// (position 2 is only ever scored on contexts where position 1 already
-// succeeded, which is a biased sample).
-//
-// The verify step already computes the target argmax at EVERY position
-// (`v0`, `v1`, `v2`) in one batched pass, so `drafts[1] == v1` is observable
-// on every step regardless of whether `drafts[0] == v0`. That is the
-// unconditional rate. Caveat worth remembering when reading it: `v1` is the
-// target's argmax GIVEN `drafts[0]` as the preceding token, so when draft 1
-// was wrong this measures the drafter on a counterfactual context — which is
-// exactly the comparison we want (same position, unbiased sample of contexts).
+// The accept-chain short-circuits: if draft 1 is rejected, draft 2 is discarded
+// without being scored. Verify computes argmax at every position (`v0`, `v1`, `v2`),
+// so `drafts[1] == v1` is observable regardless of `drafts[0] == v0`.
 
 #[inline]
 fn k3_record_positional(
@@ -204,7 +191,12 @@ pub fn step_verify_k3(
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax, v2_argmax) = (result_vec[0], result_vec[1], result_vec[2]);
 
-    let (v0, v1, v2) = if dflash_verify_raw_argmax && !sched.levers.dflash_masked_verify {
+    let use_raw = crate::scheduler::helpers::dflash_verify_uses_raw_argmax(
+        dflash_verify_raw_argmax,
+        sched.levers.dflash_masked_verify,
+        model.is_lightning_dspark_product(),
+    );
+    let (v0, v1, v2) = if use_raw {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD)
         // basis so verifier/drafter judge identically. No rep_pen/DRY here.
         (v0_argmax, v1_argmax, v2_argmax)
@@ -489,9 +481,9 @@ pub fn step_verify_k3(
         sched
             .timing
             .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
-        let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
-            "K3 REJECT: verify={verify_us}μs propose={propose_us}μs seq_len={}",
+            "K3 REJECT: verify={verify_us}μs propose={}μs seq_len={}",
+            t_propose.elapsed().as_micros(),
             a.seq.seq_len
         );
         k3_record_outcome(sched, 0, a.seq.seq_len);

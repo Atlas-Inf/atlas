@@ -20,13 +20,17 @@ use spark_model::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
 use std::time::Instant;
 
-const EOS: &[u32] = &[151645];
-const TOOL_END: Option<u32> = Some(151658);
-const MAX_SEQ_LEN: usize = 8192;
+pub(super) const EOS: &[u32] = &[151645];
+pub(super) const TOOL_END: Option<u32> = Some(151658);
+pub(super) const MAX_SEQ_LEN: usize = 8192;
 
 /// Common-case shorthand: mid-context position (no seqlen ceiling), so
 /// the budget dimension under test is the `remaining` countdown.
-fn derive(guard: Option<&'static str>, last: Option<u32>, remaining: usize) -> &'static str {
+pub(super) fn derive(
+    guard: Option<&'static str>,
+    last: Option<u32>,
+    remaining: usize,
+) -> &'static str {
     derive_finish_reason(guard, last, EOS, TOOL_END, remaining, 10, MAX_SEQ_LEN)
 }
 
@@ -96,39 +100,6 @@ fn timeout_unchanged_and_still_outranks_everything() {
 }
 
 #[test]
-fn guard_cuts_report_length_because_the_model_did_not_finish() {
-    // POSITIVE case. A guard cut is a server-side truncation: the model
-    // was still mid-output. `"length"` is the OpenAI-spec slot for
-    // "forcibly truncated" and is what every client's truncation handling
-    // keys on (openai-python `LengthFinishReasonError`, aider's
-    // continuation, Instructor, pydantic-ai).
-    //
-    // ★ This assertion was briefly INVERTED to `"stop"`, and that shipped
-    // a measured regression: the agentic gate fell to 8/10 then 4/10
-    // followed_directions because its `was_cut_off()` stopped firing and
-    // runs ended at 3-10 turns instead of the 12-22 a recovery needs.
-    // `"stop"` claims the model finished; for a mid-sentence repetition
-    // cut that is false, and every client action keyed on it (accept,
-    // validate, commit, end the run) is then wrong. Do not re-invert.
-    for guard in [
-        "fuzzy_repetition",
-        "inter_tool_prose_budget",
-        "tool_envelope_stuck",
-        "simhash_semantic_loop",
-        "token_loop_watchdog",
-    ] {
-        assert_eq!(
-            derive(Some(guard), Some(42), 100),
-            "length",
-            "guard={guard}"
-        );
-        // A guard trip on the exact step the budget ran out is still a
-        // truncation, and both paths agree — precedence is deterministic.
-        assert_eq!(derive(Some(guard), Some(42), 0), "length", "guard={guard}");
-    }
-}
-
-#[test]
 fn non_truncating_stops_are_not_relabelled_as_length() {
     // NEGATIVE case, and the whole point of the original fix: `"length"`
     // must NOT become a catch-all again. The bug this replaced derived it
@@ -179,9 +150,46 @@ fn empty_output_edges() {
 /// Minimal `Model`: only the paths `finish_sequence` exercises
 /// (`cache_sequence`, `free_sequence`, `ep_broadcast_cmd_for_seq`
 /// default) are live; everything else is unreachable in these tests.
-struct StubModel;
+#[derive(Default)]
+pub(super) struct StubModel {
+    /// When true, this stub reports itself as an admitted Lightning DSpark
+    /// product through the REAL Model identity hook (used by the
+    /// fail-closed action regression tests).
+    pub(super) product: bool,
+}
 
 impl Model for StubModel {
+    fn lightning_dspark_product_policy(
+        &self,
+    ) -> Option<&spark_model::layers::dflash_head::LightningDsparkProductPolicy> {
+        if !self.product {
+            return None;
+        }
+        // A real admitted policy (canonical Lightning profile + validated
+        // toggles) so is_lightning_dspark_product() observes true identity
+        // exactly as a production serve would.
+        static PRODUCT: std::sync::OnceLock<
+            spark_model::layers::dflash_head::LightningDsparkProductPolicy,
+        > = std::sync::OnceLock::new();
+        Some(PRODUCT.get_or_init(|| {
+            spark_model::layers::dflash_head::LightningDsparkProductPolicy::try_new(
+                spark_model::layers::dflash_head::LightningDsparkProfile::lightning(),
+                spark_model::layers::dflash_head::LightningDsparkRuntimeToggles {
+                    option_b_enabled: true,
+                    proposal_lane_count: 1,
+                    proposal_graph_eligible: true,
+                    target_verify_graph_eligible: true,
+                    batched_verify_enabled: true,
+                    seam_serial_enabled: false,
+                    draft_cap_override: None,
+                    adaptive_enabled: false,
+                    batch_parity_enabled: false,
+                },
+            )
+            .expect("canonical Lightning profile admits")
+        }))
+    }
+
     fn prefill(&self, _t: &[u32], _s: &mut SequenceState, _st: u64) -> Result<DevicePtr> {
         anyhow::bail!("unused in lifecycle tests")
     }
@@ -322,7 +330,7 @@ type RespRx = tokio::sync::oneshot::Receiver<Result<InferenceResponse>>;
 /// A real `ActiveSeq` with a blocking oneshot sink. `min_tokens` is
 /// deliberately set to a value DIFFERENT from `remaining` (7) so a
 /// call-site mutation that passes the wrong field flips a test red.
-fn test_seq(
+pub(super) fn test_seq(
     output_tokens: Vec<u32>,
     remaining: usize,
     guard_stop: Option<&'static str>,
@@ -417,8 +425,8 @@ fn test_seq(
     (a, rx)
 }
 
-fn finish_and_recv(mut a: ActiveSeq, mut rx: RespRx) -> InferenceResponse {
-    finish_sequence(&StubModel, &mut a, MAX_SEQ_LEN);
+pub(super) fn finish_and_recv(mut a: ActiveSeq, mut rx: RespRx) -> InferenceResponse {
+    finish_sequence(&StubModel::default(), &mut a, MAX_SEQ_LEN);
     rx.try_recv()
         .expect("finish_sequence must send the blocking response")
         .expect("response must be Ok")

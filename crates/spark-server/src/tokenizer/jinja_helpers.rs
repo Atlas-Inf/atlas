@@ -292,15 +292,25 @@ impl serde_json::ser::Formatter for PythonJsonFormatter {
     }
 }
 
-/// Try loading an override template from jinja-templates/{model_type}.jinja.
-pub(super) fn load_override_template(model_type: &str, repo_root: Option<&Path>) -> Option<String> {
+/// Try loading an override template from `jinja-templates/`.
+///
+/// MODEL.toml `[behavior].jinja_template` WINS over `{model_type}.jinja`, which
+/// is not unique per checkpoint: three gb10 targets declare `nemotron_h`.
+pub(super) fn load_override_template(
+    model_type: &str,
+    template_override: &str,
+    repo_root: Option<&Path>,
+) -> Option<String> {
+    let named = !template_override.is_empty();
+    let file = match template_override {
+        "" => format!("{model_type}.jinja"),
+        t if t.ends_with(".jinja") => t.to_string(),
+        t => format!("{t}.jinja"),
+    };
     // Check relative to repo root (Docker: /build, dev: /workspace/atlas)
     let candidates = [
-        repo_root.map(|r| {
-            r.join(TEMPLATE_OVERRIDE_DIR)
-                .join(format!("{model_type}.jinja"))
-        }),
-        Some(std::path::PathBuf::from(TEMPLATE_OVERRIDE_DIR).join(format!("{model_type}.jinja"))),
+        repo_root.map(|r| r.join(TEMPLATE_OVERRIDE_DIR).join(&file)),
+        Some(std::path::PathBuf::from(TEMPLATE_OVERRIDE_DIR).join(&file)),
     ];
     for candidate in candidates.into_iter().flatten() {
         if candidate.exists() {
@@ -322,6 +332,14 @@ pub(super) fn load_override_template(model_type: &str, repo_root: Option<&Path>)
                 }
             }
         }
+    }
+    // Loud on a NAMED-but-missing template: a silent fallback hides a wrong prompt.
+    if named {
+        tracing::error!(
+            "MODEL.toml [behavior].jinja_template = {template_override:?} but \
+             {TEMPLATE_OVERRIDE_DIR}/{file} is missing — falling back to the \
+             model's own chat template, which may not match this checkpoint"
+        );
     }
     None
 }

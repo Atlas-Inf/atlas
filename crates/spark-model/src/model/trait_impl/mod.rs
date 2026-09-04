@@ -31,6 +31,7 @@ mod ep_misc;
 mod graph_borrow;
 mod lm_head_batched;
 mod meta;
+mod meta_argmax;
 mod prefill_a;
 mod prefill_b;
 mod prefill_c;
@@ -43,11 +44,19 @@ mod verify_b;
 mod verify_c;
 mod verify_c2;
 mod verify_d;
+mod verify_d_serial;
 mod verify_e;
 pub(in crate::model) mod verify_e2;
 mod verify_fused;
+mod verify_layer_trace;
 
 impl Model for TransformerModel {
+    fn lightning_dspark_product_policy(
+        &self,
+    ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
+        self.lightning_dspark_identity.policy()
+    }
+
     fn teardown(&mut self) -> Result<()> {
         self.release_pools()
     }
@@ -485,6 +494,12 @@ impl Model for TransformerModel {
             None => 1,
         }
     }
+    fn mtp_propose_batch_min(&self) -> usize {
+        match &self.proposer {
+            Some(p) => p.propose_batch_min(),
+            None => 2,
+        }
+    }
     fn decode_verify_graphed_kgamma(
         &self,
         tokens: &[u32],
@@ -704,6 +719,18 @@ impl Model for TransformerModel {
             );
         }
         Ok(())
+    }
+
+    fn preserve_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+        TransformerModel::preserve_dflash_save_front(self, k, stream)
+    }
+
+    fn pack_dflash_save_seq(&self, seq_i: usize, k: usize, stream: u64) -> Result<()> {
+        TransformerModel::pack_dflash_save_seq(self, seq_i, k, stream)
+    }
+
+    fn restore_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+        TransformerModel::restore_dflash_save_front(self, k, stream)
     }
 
     fn dflash_serial_ctx_append(&self, seq: &mut SequenceState) -> Result<()> {

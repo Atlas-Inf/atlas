@@ -70,7 +70,11 @@ impl NemotronMoeLayer {
         // Only transpose routed experts for small models (Nano 30B: 23 MoE layers × 128 experts).
         // Super 120B has 40 MoE layers × 128 experts = 5120 matrices — too much memory.
         // The sorted grouped GEMM still works with non-transposed weights via the base kernel.
-        if self.moe_latent_size == 0 {
+        // ATLAS_NO_MOE_PTRS_T=1 (diagnostic): skip the transposed copies and force the
+        // base kernel — A/B for the G9 grouped-GEMM corruption (suspect: the packed
+        // transpose_for_gemm layout vs what the n128 kernel reads).
+        let no_ptrs_t = std::env::var("ATLAS_NO_MOE_PTRS_T").is_ok();
+        if self.moe_latent_size == 0 && !no_ptrs_t {
             let expert_k = h;
             let mut up_t = Vec::new();
             let mut down_t = Vec::new();

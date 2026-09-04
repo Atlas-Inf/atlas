@@ -314,6 +314,7 @@ fn coherence_test_capital_of_france() -> Result<()> {
         config.eos_token_id,
         false,
         &config.model_type,
+        "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
     )?;
@@ -394,6 +395,7 @@ fn streaming_coherence_test() -> Result<()> {
         config.eos_token_id,
         false,
         &config.model_type,
+        "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
     )?;
@@ -484,6 +486,7 @@ fn speculative_decode_coherence() -> Result<()> {
         config.eos_token_id,
         false,
         &config.model_type,
+        "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
     )?;
@@ -563,6 +566,7 @@ fn prompt_logprobs_collection_during_prefill() -> Result<()> {
         config.eos_token_id,
         false,
         &config.model_type,
+        "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
     )?;

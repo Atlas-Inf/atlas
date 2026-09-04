@@ -248,6 +248,21 @@ impl TransformerModel {
         // graphs for the whole model — a graph captured on the dense path
         // would silently replay WRONG attention once selection activates.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        // Diagnostic: force eager single-seq decode (graph-vs-eager A/B,
+        // and to localize 716s inside captured graphs with LAUNCH_BLOCKING).
+        let no_decode_graphs = std::env::var("ATLAS_NO_DECODE_GRAPHS").is_ok_and(|v| v == "1")
+            || super::verify_layer_trace::enabled();
+        // G1 (2026-08-15): capturing the n=1 decode graph on a step whose
+        // seq_len is an exact multiple of 64 (SSD_L) produces a graph whose
+        // FIRST replay faults with 716/700 (misaligned address). Empirically
+        // cold-capture at 64 / 128 / 2048 faults; 32 / 47 / 52 / 63 / 141 /
+        // 2101 are fine, and a graph captured at a non-multiple replays
+        // cleanly ACROSS later %64==0 steps (e.g. 63-capture replays at 64+).
+        // So only CAPTURE is deferred at the boundary (runs eager, lossless);
+        // replay of an existing graph stays allowed at boundaries — this is
+        // the proven-safe half of the G1 evidence and keeps DSpark C1 from
+        // dropping ~12% on the every-64th eager step.
+        let seq64_boundary = seq.seq_len.is_multiple_of(64);
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
             && !self.profile
             && !self
@@ -256,7 +271,9 @@ impl TransformerModel {
             && !hss_engaged
             && !dump_step0
             && !lora_eager
-            && !layer_veto;
+            && !layer_veto
+            && !no_decode_graphs;
+        let capture_this_step = use_graphs && !seq64_boundary;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -317,7 +334,7 @@ impl TransformerModel {
         // failure falls back to eager execution (and disables graphs for the
         // rest of the run) instead of failing the decode step.
         let mut capture_active = false;
-        if use_graphs {
+        if capture_this_step {
             tracing::info!(
                 "CUDA graph capture: starting for {} layers",
                 self.layers.len()

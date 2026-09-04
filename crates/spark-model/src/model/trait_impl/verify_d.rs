@@ -20,6 +20,7 @@ use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
+use std::time::Instant;
 
 use super::super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
@@ -46,6 +47,11 @@ impl TransformerModel {
         let k = tokens.len();
         if k == 0 {
             return Ok(Vec::new());
+        }
+        if self.lightning_dspark_identity.policy().is_some()
+            && std::env::var("ATLAS_LIGHTNING_VERIFY_SERIAL_M1").as_deref() == Ok("1")
+        {
+            return self.decode_verify_serial_m1_dispatch(tokens, seq, _stream);
         }
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
@@ -174,7 +180,15 @@ impl TransformerModel {
         // ATLAS_DFLASH_DEBUG_NO_GRAPH=1 forces eager (no graph capture) so
         // CUDA_LAUNCH_BLOCKING=1 reports the exact failing kernel — used
         // to localize K=γ illegal-address crashes downstream of SSM.
-        let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
+        // Product Lightning serves froze this switch at admission: the
+        // admitted policy rejects any presence of the variable, so the
+        // product path never consults the environment here. Generic and
+        // diagnostic serves keep the legacy read.
+        let force_eager = if self.lightning_dspark_identity.policy().is_some() {
+            false
+        } else {
+            std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1")
+        };
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         // A layer whose decode keeps HOST-side per-sequence state cannot be
@@ -193,6 +207,7 @@ impl TransformerModel {
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
             && !force_eager
+            && !super::verify_layer_trace::enabled()
             && !lora_eager
             && !layer_veto;
 
@@ -257,8 +272,21 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // Product Lightning serves carry force_eager=false from the
+            // frozen admission, so this timing hatch only arms on
+            // diagnostic/generic serves (it requires eager anyway).
+            let time_layers = force_eager
+                && std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
+            let mut t_attn = 0u128;
+            let mut t_moe = 0u128;
+            let mut t_lin = 0u128;
+
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
+                if time_layers {
+                    self.gpu.synchronize(stream)?;
+                }
+                let t0 = Instant::now();
 
                 if layer_type == LayerType::FullAttention {
                     if hss_engaged {
@@ -316,6 +344,7 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
+                self.trace_lightning_hidden_rows("k4", seq.seq_len, layer_idx, hidden, k, stream)?;
                 // DFlash intermediate hidden capture: snapshot each capture
                 // layer's output at position k-1 (last verify token) into
                 // dflash_hidden_save[slot] while hidden_states still holds
@@ -331,14 +360,40 @@ impl TransformerModel {
                 // the WRONG token's hidden and rows 1.. are stale garbage
                 // (2026-07-09 accept-collapse root cause: EAGLE_FIX=0 under
                 // UNIFIED=1 starved this capture and poisoned drafter ctx).
-                let capture_all = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref()
-                    == Some("1")
-                    || std::env::var("ATLAS_DFLASH_UNIFIED_CTX").ok().as_deref() == Some("1");
-                if capture_all {
-                    self.try_dflash_capture_all(layer_idx, k, stream)?;
-                } else {
+                // Always capture every verify row. commit_ctx copies
+                // 0..=num_accepted; capturing only k-1 poisons the next
+                // propose (2026-07-09 accept-collapse). Opt out with
+                // ATLAS_DFLASH_CAPTURE_LAST_ONLY=1 for ablation.
+                // Ablation only: product Lightning serves never arm this
+                // (the admitted policy freezes the diagnostic surface).
+                let capture_last_only = self.lightning_dspark_identity.policy().is_none()
+                    && std::env::var("ATLAS_DFLASH_CAPTURE_LAST_ONLY")
+                        .ok()
+                        .as_deref()
+                        == Some("1");
+                if capture_last_only {
                     self.try_dflash_capture(layer_idx, k - 1, stream)?;
+                } else {
+                    self.try_dflash_capture_all(layer_idx, k, stream)?;
                 }
+                if time_layers {
+                    self.gpu.synchronize(stream)?;
+                    let dt = t0.elapsed().as_micros();
+                    match layer_type {
+                        LayerType::FullAttention | LayerType::SlidingAttention => t_attn += dt,
+                        LayerType::Moe => t_moe += dt,
+                        LayerType::LinearAttention => t_lin += dt,
+                    }
+                }
+            }
+
+            if time_layers {
+                tracing::info!(
+                    "DFLASH LAYER_TIMING K={k}: attn={:.1}ms moe={:.1}ms mamba={:.1}ms",
+                    t_attn as f64 / 1000.0,
+                    t_moe as f64 / 1000.0,
+                    t_lin as f64 / 1000.0
+                );
             }
 
             // Final norm [K, H]

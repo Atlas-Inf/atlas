@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "generate": "node scripts/gen-models.mjs && node scripts/gen-benchmarks.mjs && node scripts/gen-gates.mjs && node scripts/gen-ladder.mjs && node scripts/gen-stars.mjs",
+    "deploy": "bun run build && bunx wrangler pages deploy build --project-name=atlas-inference --branch=main",
     "test:e2e": "bun x --bun playwright test",
     "test:e2e:live": "LIVE=1 bun x --bun playwright test --grep @live"
   },

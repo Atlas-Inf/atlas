@@ -54,9 +54,17 @@ impl MtpHead {
             Self::quantize_proj(bf16, n, k, quant, gpu, absmax_k, nvfp4_k, fp8_k, stream)
         };
 
+        let lightning = weights.lightning;
+        let shared_inter = if weights.shared_intermediate_size > 0 {
+            weights.shared_intermediate_size
+        } else {
+            inter
+        };
+        let q_out_dim = if lightning { nq * hd } else { nq * hd * 2 };
+
         // Quantize projections
         let fc = q(&weights.fc, h, h * 2)?;
-        let q_proj = q(&weights.q_proj, nq * hd * 2, h)?;
+        let q_proj = q(&weights.q_proj, q_out_dim, h)?;
         let k_proj = q(&weights.k_proj, nkv * hd, h)?;
         let v_proj = q(&weights.v_proj, nkv * hd, h)?;
         let o_proj = q(&weights.o_proj, h, nq * hd)?;
@@ -202,9 +210,9 @@ impl MtpHead {
                         }
                     }
                     let shared = (
-                        q(&weights.shared_expert.gate_proj, inter, h)?,
-                        q(&weights.shared_expert.up_proj, inter, h)?,
-                        q(&weights.shared_expert.down_proj, h, inter)?,
+                        q(&weights.shared_expert.gate_proj, shared_inter, h)?,
+                        q(&weights.shared_expert.up_proj, shared_inter, h)?,
+                        q(&weights.shared_expert.down_proj, h, shared_inter)?,
                     );
                     (None, Some(experts_g), Some(shared))
                 }
@@ -306,7 +314,7 @@ impl MtpHead {
              {ne} experts, vocab={ev}/{fv} (LM head {lm:.1} MB)",
             quant,
             h2 = h * 2,
-            qd = nq * hd * 2,
+            qd = q_out_dim,
             ffn = ffn_kind,
             ne = if dense_ffn_generic.is_some() {
                 0
@@ -407,6 +415,9 @@ impl MtpHead {
             moe_topk_k,
             moe_silu_mul_k,
             moe_weighted_sum_blend_k,
+            lightning,
+            shared_inter: shared_inter as u32,
+            relu2_k: crate::layers::try_kernel(gpu, "relu2", "relu_squared_inplace"),
             // Batched BF16 GEMM for drafter prefill; 0-handle when the
             // target's kernel set lacks it (prefill then no-ops).
             dense_gemm_k: crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16"),

@@ -138,4 +138,9 @@ pub struct MtpWeights {
     pub dense_ffn: Option<DenseExpertWeight>,
     /// Final output RMSNorm: `[hidden_size]` BF16.
     pub norm: DenseWeight,
+    /// Nemotron Lightning MTP: plain Q (not Q+gate), no Q/K RMSNorm,
+    /// ReLU² experts (up/down only), shared expert wider than routed.
+    pub lightning: bool,
+    /// Shared-expert intermediate. 0 = use `moe_intermediate_size`.
+    pub shared_intermediate_size: usize,
 }

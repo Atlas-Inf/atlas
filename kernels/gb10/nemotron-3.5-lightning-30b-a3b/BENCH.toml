@@ -1,0 +1,1048 @@
+# Benchmarks for Nemotron-3.5-Lightning-30B-A3B, and the thresholds its gate
+# records must meet.
+#
+# ★ EVERY ENTRY HERE IS `status = "unmeasured"`. This model has never been
+# gated: before this file, no Nemotron target in the tree carried a BENCH.toml
+# at all, so there is no committed history to ratchet from and no bar this
+# checkpoint has ever cleared. An unmeasured entry carries NO
+# [benchmarks.metrics] table on purpose — per the header of
+# kernels/gb10/qwen3.8-27b/BENCH.toml, a guessed threshold a run could clear
+# would report PASS for something nobody measured. These entries BASELINE.
+# Thresholds land in a follow-up commit, taken from the records these runs
+# write, and that commit is where the gate starts to mean something.
+#
+# ★ AN UNMEASURED ENTRY CANNOT SELF-START, AND THAT IS BY DESIGN. `--pull-
+# request-gate` resolves through gate::bench::baseline_for, which SKIPS every
+# entry whose status is not "measured" and every entry with no metrics table —
+# so these six are invisible to it and a gate run refuses with "no baseline for
+# model X", which the code calls the honest answer. The first pass therefore
+# runs against an operator-started server:
+#
+#   ATLAS_DFLASH_OPTION_B=1 spark serve <target> --no-tui --port 8899 \
+#     <the recipe's defaults, verbatim>
+#   spark benchmark run <gate> --url http://127.0.0.1:8899 \
+#     --model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \
+#     --no-fail-on-verdict --format json
+#
+# That produces numbers in ~/.atlas/runs but NO committed record. The second
+# pass — thresholds set from those numbers, status flipped to "measured", the
+# cheap gates re-run under --pull-request-gate — is what writes .benchmarks/
+# and what makes any of this a gate rather than a measurement.
+#
+# ★ NOTHING HERE IS `default = true`. The default subject of each of these
+# gates is already claimed by a Qwen target (bfcl-subset, decode-floor and
+# concurrency-sweep by qwen3.8-27b; the two TTFT guards and
+# ssm-state-poisoning-gate by qwen3.6-35b-a3b), and two defaults refuse to
+# assemble at all. Select this checkpoint explicitly:
+#
+#   ATLAS_DFLASH_OPTION_B=1 spark benchmark run <gate> --pull-request-gate \
+#     --hardware gb10 \
+#     --checkpoint nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+#
+# ★ ATLAS_DFLASH_OPTION_B=1 IS REQUIRED and cannot live in the recipe. The
+# Lightning DSpark product policy (dflash_head/product_policy.rs::validate)
+# refuses to start without it, and refuses to start if any DSpark diagnostic
+# toggle is set. The recipe schema has no `env:` key, so it must be exported by
+# whoever starts the gate; a gate run without it fails at boot, not at verdict.
+#
+# ★ THE COHERENCE PROBE WILL WARN, and the warning is correct. bfcl-subset's
+# descriptor declares `intended_for` families qwen3.6-27b / qwen3.6-35b-a3b /
+# qwen3.8-27b, so a run here reports `wrong_family`. The probe only warns and
+# never refuses (ModelExpectation feeds coherence::probe_for, not a veto), and
+# the warning is the honest reading: this checkpoint has no recorded BFCL
+# baseline anywhere, which is exactly what these entries exist to create. Do
+# not silence it by widening the descriptor's family list until a measured
+# baseline exists to justify the claim.
+
+# ── ST-995: the golden n=995 MLPerf-edge BFCL draw ──────────────────────────
+# The single-turn tool-calling leg. It is the gate that matters for the DSpark
+# port specifically: the drafter changes proposal numerics and therefore
+# acceptance, and a speculative path that is subtly wrong shows up as
+# tool-argument damage long before it shows up as incoherence. Scores here are
+# NOT comparable to the qwen3.6-27b entry's MLPerf floor (83.64 / 85.32) — same
+# draw, different architecture and different weights — and this entry
+# deliberately inherits neither that floor nor any Qwen bar.
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "bfcl-subset"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "measured"
+note = """\
+FIRST BFCL measurement on any Nemotron target. The recipe serves DSpark, not \
+Atlas MTP: `--dflash` with the published 6-layer Qwen3DSparkModel drafter at \
+gamma=4 (the server derives num_drafts=3 from it), NOT `--speculative`, and \
+the two flags are mutually exclusive. That is the configuration under test — \
+running BFCL on this model without the drafter would measure a different \
+engine path and say nothing about the port. \
+★ THINKING IS ON, by the model's own MODEL.toml (thinking_default = true, \
+cap_thinking_at_max_tokens = false). Do NOT pass --disable-thinking to make \
+the numbers look tidier: with thinking forced off this model returns null \
+content on multi-turn tool follow-ups, which would corrupt exactly the \
+category BFCL scores. The recipe leaves the model default in place and this \
+entry is defined on that. \
+★ RAN TWICE, AND THE FIRST RUN WAS AN ARTEFACT. 2026-09-01 read overall \
+11.26 / normalized 33.33. Cause: the server served `nemotron_h.jinja`, not the \
+`nemotron_lightning.jinja` this target declares, because template selection \
+keyed on `model_type` alone and three gb10 targets all declare `nemotron_h`. \
+The Nano template seeds an OPEN <think> block on the generation prompt, so the \
+model emitted its tool call as reasoning_content, the think-loop watchdog \
+force-closed </think> at 64 tokens, and every reply ended on \
+finish_reason=length with empty content and no tool_calls. hallucination \
+100.00 with everything else 0.00 was the fingerprint of an EMPTY REPLY, not of \
+a lost call - score.py scores hallucination 1.0 when has_tool_calls is false. \
+Fixed by honouring [behavior].jinja_template. \
+★ THE MEASUREMENT THAT COUNTS, corrected template, same recipe, same binary: \
+overall_accuracy 64.22, normalized_single_turn_score 71.25, n=995, 995/995 \
+samples, zero transport failures, 7253 s. By category: hallucination 94.51, \
+live 68.24, non_live 51.01. Hallucination FALLING from 100.00 is the healthy \
+direction - at 11.26 it scored a perfect 100 only because the model never \
+called a tool at all, so it trivially passed the one category whose correct \
+behaviour is silence. \
+★ WHAT THIS NUMBER EMBEDS, so nobody reads it as uniform. parallel 28.23 and \
+parallel_multiple 31.45 against simple_python 76.61 and multiple 80.65: a 2.5x \
+gap confined to PARALLEL calling. Two failure modes, both observed directly - \
+truncation (emits the first call, silently drops the rest) and merging \
+(collapses several calls into one with array arguments). Ruled out as causes: \
+the tool grammar (--disable-tool-grammar gives byte-identical output) and the \
+template's singular phrasing (an A/B adding an explicit multi-call instruction \
+moved 3/10 to 4/10 on the parallel subset - one sample, not a signal). \
+★ THOSE TWO "RULED OUT"S WERE UNDERPOWERED AND ARE SUPERSEDED. Both were \
+10-sample probes. Re-run 2026-09-02 at n=60 (30 parallel + 30 \
+parallel_multiple, real BFCL samples, scored emitted-vs-ground-truth call \
+count). The instrument is deterministic at temperature 0 - two arms returned \
+byte-identical tallies - so between-arm differences are signal. \
+BASELINE 35.0% count-correct (21/60); 37/60 UNDER-emit; 96 of 137 expected \
+calls produced. It is NOT truncation: 36 of those 37 finish on `tool_calls`, \
+not `length`, at 83-264 completion tokens against a 1024 budget. The model \
+stops VOLUNTARILY while its own reasoning_content says it planned more - \
+"We'll make two calls", "We'll call three times". \
+★ FIVE CANDIDATE CAUSES, ALL FALSIFIED at n=60. Parser identity: qwen3_coder \
+35.0% > bare_json 20.0% > hermes 11.7%, so the shipped default is right and \
+matches NVIDIA's own vLLM guidance. Injected prompt: \
+ATLAS_OFFICIAL_TOOL_PROMPT=1 reads 43.3%, but paired McNemar is 9 wins / 4 \
+losses over 13 discordant pairs, p=0.27 - directionally right, not \
+significant, so the #211 off-policy hypothesis is not the cause here. Tool \
+grammar: --disable-tool-grammar 31.7%, no help. Speculative path: --dflash OFF \
+33.3% - THE PORT DOES NOT CAUSE THIS, it reproduces with speculation entirely \
+disabled. Fix A: ATLAS_TOOL_EOS_ESCAPE=0 gives an exact null (35.0%), because \
+on a tool_choice="auto" trigger grammar stopping is already legal after a \
+closed call, so grammar_blocks_stop is false and the escape never had anything \
+to release. \
+★ THE OPENER-BIAS LADDER IS LATENT, NOT ACTIVE HERE - AND AN EARLIER REVISION \
+OF THIS ENTRY GOT THAT WRONG. sampling_setup.rs biases the <tool_call> opener \
+by emitted-call count: +3.0 at 0-1, 0.0 at 2, -5.0 at 3, -10.0 at 4+, which \
+does suppress the fourth and later call by construction. This entry previously \
+called that a CONFIRMED defect and cited calls-emitted decaying 74.5% -> 66.7% \
+-> 50.0% as arity goes 2 -> 3 -> 4 as the evidence. That inference was wrong. \
+TESTED DIRECTLY 2026-09-02: relaxing the ladder to `0|1 => 3.0, 2..=7 => 0.0, \
+_ => -10.0` and rebuilding gives a BYTE-IDENTICAL result - 21/60, the same \
+57/73 and 39/64 splits, the same 37 under / 2 over / 1 zero. An exact null. The \
+penalty rungs are NEVER REACHED: the model emits one call in most failing \
+samples, so tool_call_repeat_count never climbs to 3 and the -5/-10 never \
+fires. The arity decay is sample difficulty - harder prompts need more calls \
+and more get dropped - not the bias. The change was reverted; an engine \
+behaviour change with no measured benefit does not belong in a port branch. \
+Keep the ladder in mind for a model that DOES emit long call runs, where the \
+runaway it guards is already bounded by MAX_POST_COMPLETION_TOOL_OPENS = 8 in \
+decode_logits_step.rs, but do not cite it as a cause of THIS number. \
+★★ THE CAUSE IS THINKING, AND IT IS CONFIRMED OUT OF SAMPLE. This is the one \
+positive result on this deficit; everything above it is a falsification. \
+THE TELL was in the raw output all along: the model states its plan inside \
+reasoning_content - "We'll make two calls", "We'll call three times" - then \
+emits ONE call and stops voluntarily on a legal EOS at 83-264 tokens. The plan \
+is spent in the think block and the visible turn behaves as though the work is \
+done. \
+IN-SAMPLE, --disable-thinking split the two subsets in OPPOSITE directions, \
+which is why the aggregate had hidden it: parallel_multiple 9/30 -> 19/30 \
+(12 wins / 2 losses, p=0.0129) while parallel went 12/30 -> 6/30 with zero-call \
+responses 0 -> 5. The aggregate reads 35.0% -> 41.7% at p=0.57, pure noise - \
+two real effects of opposite sign cancelling. \
+CONFIRMED ON HELD-OUT DATA, because a nominal p=0.0129 out of a family of ~16 \
+comparisons across ~8 arms is worth about 0.21 after Bonferroni and this entry \
+has already been wrong twice from weak evidence. Re-run on \
+parallel_multiple[30:75], 45 samples no earlier probe had touched, hypothesis \
+fixed before the data: thinking ON 15/45 (33.3%), thinking OFF 31/45 (68.9%). \
+Paired: 18 ON-wrong->OFF-right against 2 the other way, McNemar exact \
+p=4.025e-04, and p*16 = 6.4e-03 - it SURVIVES correction for every comparison \
+made that night. Calls emitted 76/126 -> 100/126. \
+★ DO NOT SHIP --disable-thinking AS THE FIX. It is a diagnostic. It costs the \
+`parallel` subset (same function repeated: 12/30 -> 6/30, zero-calls 0 -> 5), \
+it raises zero-call responses overall 1 -> 7, and this recipe's own metadata \
+forbids it in production because the model returns null content on multi-turn \
+tool follow-ups with thinking off. What the result establishes is the \
+MECHANISM and where to aim: the thinking BUDGET, not the switch. \
+reasoning_effort is a per-request knob with request-body precedence, so a rung \
+between `none` and `medium` can be searched for without touching the recipe. \
+★ AND IT SEPARATES TWO BUGS THIS ENTRY HAD CONFLATED. `parallel` (one function \
+called N times with different arguments) and `parallel_multiple` (N distinct \
+functions) do NOT share a mechanism - thinking moves them in opposite \
+directions, significantly. Any future work here should score them apart; the \
+the combined number will keep hiding effects the way it hid this one. \
+★ AND THE BUDGET LEVER DOES NOT EXIST: THE EFFECT IS BINARY. The obvious \
+follow-up was to find a reasoning_effort rung that keeps the \
+parallel_multiple gain without the parallel cost. There is none. Swept \
+per-request over 25 samples per subset: \
+    effort      parallel   parallel_multiple   zero-calls \
+    none          24.0%          76.0%              5 \
+    minimal       40.0%          32.0%              1 \
+    low           40.0%          32.0%              1 \
+    medium        40.0%          32.0%              1 \
+minimal, low and medium are IDENTICAL on both subsets - three different \
+thinking budgets, indistinguishable to the sample. Only `none` moves anything. \
+So the mechanism is not the AMOUNT of reasoning; it is the PRESENCE of the \
+think block. Once the model has closed </think>, its distribution favours one \
+call followed by EOS, which is exactly what the raw traces show: the plan is \
+stated inside reasoning_content and the visible turn emits a single call. \
+★ WHAT THAT LEAVES. No default change to reasoning_effort can capture the \
+gain, so this is not fixable from the recipe. Two directions remain, neither \
+of them a port change: (a) suppress the think block for tool turns \
+specifically, which collides with this recipe's documented multi-turn \
+null-content failure and costs the `parallel` subset; (b) an engine change on \
+the decode path - when a turn used thinking, tools are active, and a call has \
+just completed, decline to end the turn on the model's first EOS so it can \
+emit the calls it planned. Note (b) is NOT the Fix A escape hatch tested \
+above: that one was a null because stopping is already LEGAL there, and what \
+is needed is the opposite of an escape - a hold. Both are maintainer calls, \
+and both should be scored on the two subsets separately. \
+★ DEFECT 2, CONFIRMED, STRUCTURAL: THE TOOL CONTRACT IS SERVED TWICE. \
+nemotron_lightning.jinja already renders the full function list, the exact \
+<tool_call> format example and the official short <IMPORTANT> reminder (lines \
+46-89), and loops over message.tool_calls (133-145), so the native format \
+explicitly supports multiple blocks. Atlas then injects the parser's own \
+differently-worded prompt on top, because api/chat/template.rs withholds \
+`jinja_tools` ONLY when `tscg` is on and [behavior].tscg defaults false and is \
+unset here. MEASURED on the wire: template-only render 371 tokens vs Atlas's \
+served prompt 1243 for parallel_0 (+872, +235%), and 412 vs 1304 for \
+parallel_8 (+892, +217%). The model reads the same contract twice in two \
+phrasings, in a prompt 3.3x its native size. This is consistent with the \
+official-prompt arm being the only one that moved the right way: it makes the \
+two copies agree. \
+★ NOT THE FIX, CHECKED. Both sibling Nemotron targets set \
+`disable_tool_steering = true` and this one does not - but \
+nemotron_lightning.jinja never references that flag (its tool block is gated \
+on `{% if tools %}` alone), so copying it would be cargo-culting. The lever \
+that actually withholds the duplicate is `tscg`. And any fix must PRESERVE \
+hallucination: api/chat/prepare.rs records the injection as load-bearing there \
+- "With it hallucination returns to ~96 (vs 30/64 without)" - and this target \
+scores 94.51. Trading 23 points of hallucination for parallel calling is not a \
+fix. \
+★ THE KV DTYPE IS THE DOMINANT SOURCE OF LOGIT DRIFT, AND IT IS NOT THE CAUSE \
+OF THIS. Measured 2026-09-02 as a precision ladder on identical prompts at \
+temperature 0, top-5 logprobs at every position (only possible because of the \
+DFlash logprobs fix on this branch - before it every array was null). \
+DTYPE MAP, from the boot trace: MoE experts NVFP4; SSM in/out projections FP8 \
+(native_fp8=true); SSM decode h-state F32 full precision; attention Q/K/V/O \
+kept at CHECKPOINT BF16 with no NVFP4 requant; KV cache FP8 on all six \
+attention layers (L5, L12, L19, L26, L33, L42) using per-layer k_scale/v_scale \
+from the checkpoint. Note the tension the engine itself flags: the loader \
+refuses to quantise attention WEIGHTS and holds SSM state at F32, then stores \
+the KV cache for those same protected layers at FP8 - and warns at every boot \
+that this makes NVFP4 models `hallucinate or lose coherence at long context`, \
+recommending --kv-high-precision-layers max (or 2-5). This recipe leaves that \
+flag at its default 0. \
+DRIFT, fp8-everywhere vs fp8-with-boundary-layers-BF16 (--kv-high-precision- \
+layers auto): 939 aligned positions, only 3 bit-identical (0.3%), same-support \
+KL mean 4.573e-03 / max 2.573e-01, max |logprob delta| 4.125 nats on SHARED \
+support, and the emitted TOKENS diverge on 11 of 12 prompts - one as early as \
+position 3. Set that beside this branch's DSpark equivalence result on the same \
+instrument (mean KL 1.2e-17, max 3.8e-15, 12/12 exact token match): KV \
+quantisation drift is roughly FIFTEEN ORDERS OF MAGNITUDE larger than the \
+entire speculative-decoding path. Any bit-exactness claim about this engine \
+must account for KV dtype before it accounts for anything the port added. \
+BUT IT MOVES NOTHING BEHAVIOURAL HERE: count-correct reads 35.0% at fp8-all \
+and 33.3% with boundary layers protected - flat, inside noise. Large numerical \
+drift, no benchmark effect. Record the drift; do NOT sell the flag as a fix for \
+parallel calling. \
+★ AND BF16 KV IS NOT AVAILABLE ON THIS TARGET AT ALL, which corrects the \
+obvious reading of the warning. `--kv-cache-dtype bf16` fails the build: \
+`Lightning DSpark target KV dtype must be FP8, found bf16` \
+(factory/dspark_admission.rs:70). FP8 KV is a hard DSpark ADMISSION \
+REQUIREMENT, not a tuning choice, so the memory arithmetic that makes it look \
+free to reverse - 40.8 GB of KV allocated, 14252992 token capacity against the \
+262144 this recipe can use, a 54x margin - is beside the point. Within the FP8 \
+requirement, --kv-high-precision-layers is the ONLY precision lever, and it is \
+and it is measured above. \
+★ THIRD DRAW, 2026-09-02, run as an MLPerf-submission-style pair: the ST leg \
+and the three perf legs back to back against ONE server on ONE binary, so the \
+accuracy number and the speed numbers describe the same engine state. \
+overall 64.22 / normalized 71.25, n=995, 995/995 drawn, zero transport \
+failures, 2 h 01 m 10 s. The three draws now on record are 64.22 / 64.12 / \
+64.22 - a spread of 0.10, which is ONE sample of 995. hallucination (94.51) \
+and live (68.24) are identical to two decimals across all three; only non_live \
+moves, by a single sample (51.01 / 50.81 / 51.01). This is a reproducible \
+number, not a lucky one, and the bounds below are now backed by three \
+measurements rather than one. \
+★ THE tscg EXPERIMENT WAS RUN AND IS NEGATIVE; DO NOT REPEAT IT. Setting \
+[behavior].tscg = true does remove the duplicated contract - measured, served \
+prompt 1243 -> 883 tokens on parallel_0 (-29%) and 1304 -> 896 on parallel_8 \
+(-31%) - and moves the parallel probe by ONE sample, 35.0% -> 36.7%. It was \
+REVERTED rather than shipped: it also swaps the tool schema for compact \
+signatures, whose effect on the hallucination and irrelevance categories is \
+unmeasured, and prepare.rs records that tool-prompt changes swing hallucination \
+from ~96 to 30/64. A 30% prefill saving is worth revisiting on its own merits \
+with those categories measured; it is not a fix for parallel calling, and an \
+unmeasured change has no place in a submission number. \
+★ HOW BIG THE SERVED PROMPT ACTUALLY IS, MEASURED. An earlier raw-completion \
+test was discarded as confounded because it assumed a local apply_chat_template \
+render equalled Atlas's prompt without checking. Checked now, against \
+usage.prompt_tokens on 8 parallel_multiple samples: Atlas 1505-1726 tokens \
+versus the checkpoint's own render at 524-644, a delta of +978 to +1082, mean \
++1019. The served prompt is roughly 3x the native one. The extra is the \
+qwen3_coder injection - the tool list re-rendered in a second format, plus \
+IMMEDIATE_TOOL_USE and a 9-bullet IMPORTANT block written entirely about \
+agentic CODING tools (bash, Write, Edit, oldString, markdown fences, heredocs), \
+none of which exist in BFCL. Its thrust is also singular: "the next emission \
+after deciding to run a shell command must be the <tool_call>". \
+★ THE OFFICIAL-PROMPT ARM, RE-SCORED PER SUBSET. ATLAS_OFFICIAL_TOOL_PROMPT=1 \
+swaps that block for the checkpoint's short 4-bullet reminder; it verifiably \
+takes effect, mean prompt_tokens 1513 -> 930. It had read 43.3% vs a 35.0% \
+baseline at p=0.27 on the AGGREGATE of parallel + parallel_multiple, and was \
+re-tested because the thinking result proved that aggregate cancels \
+opposite-sign effects. Held-out slices [30:75], paired, 45 samples each: \
+    subset              baseline   official   paired    exact p   x4 \
+    parallel              31.1%      46.7%    W11/L4    0.1185   0.474 \
+    parallel_multiple     33.3%      37.8%    W6/L4     0.7539   1.000 \
+    AGGREGATE             32.2%      42.2% \
+★ AND THE CANCELLATION HYPOTHESIS DID NOT HOLD. Both subsets move the SAME \
+direction here, so unlike the thinking arm the aggregate was never hiding \
+anything - this arm is underpowered, not masked. The original p=0.27 filing was \
+right, for a reason other than the one given. Note also that pooling this run \
+with the discovery arm gives W26/L12, p=0.034: that is NOT a test and is not \
+claimed, because it pools a discovery result drawn from ~16 comparisons with \
+its own follow-up, which is the standard way to manufacture a false positive. \
+★ AND THE PRE-REGISTERED CONFIRMATION IS NULL. parallel[75:135], 60 fresh samples \
+disjoint from both earlier slices, with hypothesis, threshold and analysis fixed \
+in the script BEFORE the run: baseline 26.7%, official 31.7%, W8/L5, 13 \
+discordant, p=0.5811 - NOT CONFIRMED. The three independent samples read W9/L4, \
+W11/L4, then W8/L5: the effect shrank on fresh data, which is exactly what the \
+pooled p=0.034 would look like if it were regression to the mean rather than \
+signal. Treat the official-prompt lever as DEAD for parallel calling and do not \
+re-open it without a new mechanism. Recorded because a null that cost two \
+measured arms is worth more to the next person than the arm itself was. \
+★ TWO THINGS SURVIVE THE NULL. Zero-call responses went 3 -> 0 across both \
+subsets under the official prompt. And the ~1019-token duplication is a real \
+prefill cost on every tool request, worth fixing on its own merits rather than \
+as a score fix - subject to the same caution as tscg above, that prepare.rs \
+records tool-prompt changes swinging hallucination from ~96 to 30/64, and this \
+target scores 94.51 there. \
+★ THINKING-OFF MOVES THE SCORE, MEASURED ON THE FULL DRAW. 2026-09-02, shipped \
+tree with NO patch (working tree verified empty in the runner), same golden \
+n=995 draw, same recipe, `--disable-thinking` - a first-class server flag whose \
+documented precedence is flag > request body > MODEL.toml thinking_default. A \
+pre-benchmark probe confirmed reasoning_content was ABSENT, so the flag \
+demonstrably took; a run where it silently did not would have scored a normal \
+turn and looked like a null. \
+    category            thinking ON   thinking OFF   delta \
+    hallucination           94.51         94.89      +0.38 \
+    live                    68.24         71.18      +2.94 \
+    non_live                51.01         53.93      +2.92 \
+    OVERALL                 64.22         67.64      +3.42 \
+    normalized              71.25         73.33      +2.08 \
+Per-subset, thinking OFF: irrelevance 100.00, live_irrelevance 89.77, \
+live_multiple 79.05, live_parallel 18.75, live_parallel_multiple 50.00, \
+live_simple 92.00, multiple 79.03, parallel 20.16, parallel_multiple 52.42, \
+simple_java 59.68, simple_javascript 48.39, simple_python 84.27. Wall 56 m 34 s \
+against 2 h 01 m 10 s with thinking on - the completions are much shorter. \
+★ WHY THIS WAS NOT MEASURED FOR MOST OF THE INVESTIGATION. Thinking-off was \
+filed as production-forbidden because this recipe has a documented MULTI-TURN \
+null-content failure. BFCL ST is SINGLE TURN, so that failure cannot be \
+exercised by this benchmark at all. The exclusion was inherited rather than \
+checked, and it cost the largest measured effect on this target. \
+★ THE HALLUCINATION RISK DID NOT MATERIALISE. prepare.rs records tool-prompt \
+and thinking changes swinging hallucination from ~96 to 30/64, which was the \
+main reason to fear this leg. It held at 94.89, slightly ABOVE the 94.51 on \
+record. All three categories improved; nothing was traded. \
+★ CONFIDENCE. Single draw, stated as such. But the thinking-ON baseline was \
+measured THREE times at 64.22 / 64.12 / 64.22 - a spread of 0.10 - and +3.42 is \
+~34x that spread, so this is not draw noise. \
+★ WHAT IT DOES NOT SETTLE, AND WHAT IT IS NOT. 67.64 is still 19.8 points under \
+the 87.44 bar: this is a real improvement, not a solution. It is also NOT a \
+recommendation to ship thinking off. The multi-turn hazard is real and this \
+single-turn leg is structurally incapable of speaking to it. The defensible \
+claim is narrower and worth exactly what it says: disabling thinking on TOOL \
+TURNS is worth +3.42 overall with no hallucination cost, and someone must price \
+the multi-turn risk separately before it goes anywhere near a default. \
+★ AND IT REPRODUCES THE SPLIT. parallel collapses to 20.16 while \
+parallel_multiple rises to 52.42 - the same opposite-direction signature every \
+probe found, now on the full draw. The net is positive DESPITE parallel getting \
+worse, which is the strongest evidence yet that these are two different bugs \
+and that a per-subset lever would beat a global one. \
+★ THE FUNCTION-NAME MANGLING IS NOT A BUG. DO NOT RE-CHASE IT. non_live is the \
+whole remaining gap (53.93 against hallucination 94.89 and live 71.18, and \
+normalized is just their mean), and inside it simple_java 59.68 / \
+simple_javascript 48.39 sit 25-36 points under simple_python 84.27 on \
+SINGLE-function calls, which looks like a serialisation defect rather than \
+capability. It is not. The dataset ships tool definitions with UNDERSCORED \
+names (`math_factorial`, `GeometryPresentation_createPresentation`; 0 of them \
+dotted) against DOTTED ground truth (`math.factorial`; 261 samples), so a raw \
+string comparison of what the model emits against ground truth shows a near \
+total name mismatch - simple_java reads 1/12 by that measure. That comparison \
+is the wrong one. Upstream `bfcl_eval` converts in the other direction at score \
+time: ast_checker.convert_func_name() rewrites the DOTTED ground-truth name to \
+underscored when the checker model's config sets underscore_to_dot, because \
+OpenAI-style APIs reject "." in a function name. score.py pins \
+AST_CHECKER_MODEL_NAME = "gpt-4o-2024-11-20-FC", whose config has \
+underscore_to_dot = True (verified in-venv, not assumed). The names match; the \
+59.68 is real. Neither score.py nor provision.py performs any name replacement \
+of its own, so there is nothing on our side to fix. \
+★ WHAT THAT LEAVES. The simple_java / simple_javascript weakness is genuine \
+model behaviour on this checkpoint, and the non_live gap is not one defect - it \
+is parallel 20.16, parallel_multiple 52.42, simple_javascript 48.39 and \
+simple_java 59.68 all being independently weak. Attack them separately or not \
+at all; there is no single lever here. \
+★ THE 87.44 BAR IS A DIFFERENT MODEL'S NUMBER, AND THESE WEIGHTS MAY NOT REACH \
+IT. Checked against what NVIDIA actually publishes for this checkpoint \
+(model card, 2026-09-02): there is NO published BFCL score at all, so there is \
+no vendor reference point to score this port against. What they do publish for \
+tool use is tau3-bench (Banking) 9.28 and Terminal-Bench 2.1 24.58, against \
+MMLU Pro 81.94, GPQA Diamond 75.44 and SWE-bench Verified 51.56. A 9.28 on a \
+multi-turn tool-use benchmark is very low for a model sold for agentic work, \
+and it is independent evidence that tool calling is a genuine weakness of these \
+WEIGHTS rather than something the engine is breaking. Treat 87.44 for what it \
+is - Qwen3.6's number, carried over as a target - and do not read the gap as \
+proof of an Atlas defect. \
+★ WHAT WOULD ACTUALLY SETTLE IT. Serve this same checkpoint under vLLM or \
+SGLang and run the same n=995 draw. If it also lands near 68, the port is \
+serving these weights correctly and the bar needs to move; if it lands near 87, \
+the gap is ours and this whole investigation missed something. That measurement \
+was NOT run here: vLLM needs an aarch64 / SM121 / CUDA 13 source build on this \
+box, which is hours with a real chance of not completing. It remains the single \
+highest-value unrun experiment on this target. \
+★ tau3-bench IS NOT BFCL, and this note is not claiming otherwise. It is a \
+different benchmark with a different scoring model, and a low score there does \
+not arithmetically predict a low BFCL. It is evidence, not proof, and the vLLM \
+control above is what turns it into either. \
+★ CORRECTION TO THE NOTE ABOVE, AND THE CONTROL THAT FORCED IT. The preceding \
+entry says vLLM needs an hours-long aarch64 source build and leans on \
+tau3-bench 9.28 to suggest the gap is the WEIGHTS rather than the engine. Both \
+halves were wrong and are retracted here. A prebuilt \
+vllm-0.28.0-cp38-abi3-manylinux_2_28_aarch64 wheel installs in seconds; the \
+only blocker was a missing `ninja` for flashinfer's JIT. The claim was asserted \
+twice before it was ever checked. \
+★ THE CONTROL RAN. Same golden n=995 draw, same score.py, same ast_checker, \
+same weights, only the serving engine swapped. vLLM 0.28.0 with NVIDIA's own \
+model-card config (--tool-call-parser qwen3_coder, --reasoning-parser \
+nemotron_v3), thinking ON, which is both engines' shipped default. A tool-call \
+smoke test on a real BFCL sample ran first, because a parser mismatch would \
+return zero calls and score ~0 - it extracted 2 of 2. \
+    engine / config          overall   normalized \
+    Atlas, thinking ON         64.22       71.25 \
+    Atlas, thinking OFF        67.64       73.33 \
+    vLLM,  thinking ON         73.57       78.18 \
+Like for like - both engines on their shipped default - vLLM is +9.35 overall. \
+Against Atlas's BEST configuration it is still +5.93. \
+★ SO THE GAP IS SUBSTANTIALLY OURS, AND THE EARLIER FRAMING WAS WRONG. These \
+weights demonstrably do parallel calling far better than Atlas gets out of \
+them. Per subset, vLLM (thinking ON) against Atlas (thinking OFF): \
+    parallel           58.06 vs 20.16   +37.90 \
+    live_parallel      75.00 vs 18.75   +56.25 \
+    multiple           88.71 vs 79.03    +9.68 \
+    live_irrelevance   98.86 vs 89.77    +9.09 \
+    simple_java        43.55 vs 59.68   -16.13  (ATLAS BETTER) \
+    simple_javascript  35.48 vs 48.39   -12.91  (ATLAS BETTER) \
+By category: hallucination +4.54, non_live +10.01, live 0.00 - identical. \
+★ WHAT THAT REWRITES. The parallel-calling defect is REAL and it is OURS: the \
+model reaches 58.06 on `parallel` under vLLM where Atlas manages 20.16. The \
+confirmed thinking mechanism is therefore an Atlas-specific interaction, NOT a \
+property of these weights - vLLM runs with thinking ON and still gets 58.06. \
+And the simple_java / simple_javascript weakness is not an Atlas defect at all; \
+Atlas is 13-16 points BETTER there, so the earlier dead-end note stands and \
+that hunt was correctly abandoned. \
+★ WHAT SURVIVES OF THE BAR ARGUMENT. vLLM's 73.57 is still 13.87 under 87.44, \
+so the bar is probably not reachable with these weights by either engine. Both \
+things are true at once and neither cancels the other: ~6 to 9 points are \
+recoverable Atlas defects worth chasing, and the remaining ~14 is not obviously \
+an engine problem. Chase `parallel` and `live_parallel` first - they are the \
+whole recoverable gap. \
+★ ROOT CAUSE OF THE PARALLEL GAP: THE CONTRACT IS RENDERED TWICE. Atlas serves \
+the tool contract from the jinja template AND injects the parser's own copy on \
+top. Skipping the injection alone closes the entire gap to vLLM. Same 45 \
+samples, same weights, thinking ON on both sides, paired: \
+    config                        prompt tok   parallel[30:75] \
+    Atlas shipped                     1314        14/45  31.1% \
+    Atlas tscg+official ("slim")        731        21/45  46.7% \
+    Atlas ATLAS_NO_TOOL_INJECT=1        418        31/45  68.9% \
+    vLLM 0.28.0                         420        31/45  68.9% \
+Against shipped: W21/L4, exact p=0.0009105 - the same statistic the vLLM \
+comparison produced, because it is the same effect. Atlas at vLLM's prompt size \
+gets vLLM's score, to the sample. The dose-response is monotonic across four \
+points and the mechanism is simply prompt length: 1314 -> 731 -> 418 tokens \
+maps to 31.1 -> 46.7 -> 68.9 percent. \
+★ WHY EVERY EARLIER PROMPT ARM READ NULL. tscg and ATLAS_OFFICIAL_TOOL_PROMPT \
+each remove PART of the duplication and bottom out at 731 tokens, because with \
+tscg=true the template's block is suppressed and only the parser injection \
+renders - and that injection is ~311 tokens more verbose than the template's \
+own rendering. No configuration removes the injection. Four arms were run \
+against a hypothesis none of them actually tested, and their nulls were \
+reported as evidence the prompt did not matter. It did. \
+★ THE FLAG. ATLAS_NO_TOOL_INJECT=1 (prepare.rs, DEFAULT OFF) skips the parser's \
+system-prompt injection so the template's block stands alone, which is exactly \
+vLLM's arrangement. Default off, and it must stay that way until the paragraph \
+below is answered. \
+★ NOT YET SHIPPABLE, AND HERE IS THE SPECIFIC RISK. prepare.rs records that this \
+injection is load-bearing for the hallucination category - "with it \
+hallucination returns to ~96 (vs 30/64 without)" - and this target scores 94.51 \
+there. The probe above scores `parallel` ONLY and says nothing about \
+hallucination or irrelevance. If those collapse, the 38-point parallel win is \
+bought with a larger loss and the flag is worthless as-is; the fix would then \
+have to SPLIT the injection, keeping the declining behaviour while dropping the \
+duplicated call-format spec. A full n=995 draw with the flag on is in flight to \
+settle exactly this, and no one should enable this flag until that number \
+exists. \
+★ TWO ARMS BEFORE THIS ONE WERE INVALID, recorded because the failure is easy to \
+repeat. The first no-inject run killed only the vLLM process and left the \
+previous Atlas server bound to 8899, so the probe scored the OLD config and \
+returned byte-identical numbers - at temperature 0, identical output means an \
+identical prompt, which is what exposed it. The guard added next was itself \
+wrong: it grepped the server log for the flag's warning at boot, but that \
+warning is emitted inside prepare_chat_prompt and only appears once a REQUEST \
+has been served. Verify a manipulation with a live measurement \
+(usage.prompt_tokens on a real request), never with a proxy. \
+★ THE FULL DRAW SETTLES IT: 79.80 / 82.40, AND HALLUCINATION WENT UP. \
+ATLAS_NO_TOOL_INJECT=1, golden n=995, shipped tscg, thinking ON, prompt verified \
+at 411 tokens on a live request BEFORE scoring started. \
+    config                    overall  normalized  halluc   live   non_live \
+    Atlas shipped               64.22     71.25     94.51   68.24    51.01 \
+    Atlas thinking-off          67.64     73.33     94.89   71.18    53.93 \
+    vLLM 0.28.0                 73.57     78.18     99.43   71.18    63.94 \
+    Atlas NO-INJECT             79.80     82.40     96.21   77.06    73.92 \
++15.58 overall against shipped Atlas, and +6.23 against vLLM - the port now \
+BEATS the reference engine on the same weights and draw. \
+★ THE RISK THAT GATED THIS DID NOT MATERIALISE. prepare.rs warned the injection \
+was load-bearing for hallucination ("~96 vs 30/64 without"), which is why the \
+flag shipped default-off and why a subset win was explicitly refused as \
+sufficient. Measured: hallucination 94.51 -> 96.21, an INCREASE. The prose the \
+injection contributed was not what made the model decline; the template's own \
+block already carries that. Nothing was traded - all three categories rose. \
+★ WHERE THE +15.58 COMES FROM. Per subset, NO-INJECT against shipped-thinking-off: \
+    parallel           75.00 vs 20.16   +54.84   (vLLM 58.06 - beats it by 16.94) \
+    live_parallel      87.50 vs 18.75   +68.75   (vLLM 75.00 - beats it by 12.50) \
+    parallel_multiple  68.55 vs 52.42   +16.13   (vLLM 54.03) \
+    live_parallel_mult 54.17 vs 50.00    +4.17 \
+    multiple           88.71 vs 79.03    +9.68 \
+    simple_python      88.71 vs 84.27    +4.44 \
+    simple_javascript  51.61 vs 48.39    +3.22 \
+    simple_java        50.00 vs 59.68    -9.68  (the one regression) \
+The parallel family is the whole story, exactly as the dose-response predicted. \
+simple_java is the single loss and is worth a look, but it is 100 samples of \
+3625 and is swamped by the rest. \
+★ WHAT IS NOW TRUE ABOUT THE BAR. 79.80 is 7.64 under Qwen3.6's 87.44, down from \
+a 23.22 gap at the start. vLLM's 73.57 is no longer the ceiling - the port \
+passed it - so the remaining gap is not obviously unreachable either. The next \
+lever to price is thinking-off ON TOP of no-inject: worth +3.42 on its own, \
+never measured in combination, and the two are independent axes. \
+★ STILL DEFAULT-OFF, DELIBERATELY. One draw, and the multi-turn hazard behind \
+the injection is unmeasured by any single-turn benchmark. Flipping the default \
+is a maintainer call that wants a second draw and a multi-turn check first. The \
+evidence for flipping it is now strong; the decision is still not mine. \
+★ DO NOT STACK THINKING-OFF ON NO-INJECT. IT COSTS 13.87. Measured, full n=995, \
+both manipulations asserted live before scoring (411 prompt tokens AND \
+reasoning_content absent): no-inject + thinking-off scores 65.93 / 71.92 against \
+no-inject + thinking-ON at 79.80 / 82.40. \
+★ AND IT IS A CROSSOVER INTERACTION, WHICH CORRECTS THE THINKING FINDING. \
+                        thinking ON   thinking OFF    delta \
+    with injection          64.22         67.64       +3.42 \
+    without injection       79.80         65.93      -13.87 \
+Thinking-off HELPS when the duplicated prompt is present and HURTS badly when it \
+is gone. The two are not independent axes; the sign of the thinking effect \
+depends on the prompt regime. \
+★ SO THE ORIGINAL THINKING RESULT WAS AN ARTIFACT OF THE INJECTION. This branch \
+records, at some length, that thinking suppresses parallel calling - confirmed \
+out of sample on 45 held-out samples, McNemar p=4.025e-04, surviving Bonferroni. \
+That statistic was sound and the experiment was clean; the INTERPRETATION was \
+wrong. It measured an interaction with Atlas's 1314-token duplicated prompt, not \
+a property of these weights or of thinking. With the prompt fixed, thinking is \
+REQUIRED for parallel calling, not hostile to it: parallel 75.00 with thinking \
+on versus 22.58 with it off, and live_parallel 87.50 versus 37.50. The earlier \
+mechanism story - the model states a multi-call plan in <think> and stops \
+early - described real behaviour under a broken prompt and does not generalise. \
+★ WHAT THIS MEANS FOR THE +3.42 ALREADY RECORDED ABOVE. That entry stands as a \
+measurement and is retracted as a recommendation. It was true in the shipped \
+(injected) regime, which is the only regime that existed when it was taken. It \
+must not be applied on top of ATLAS_NO_TOOL_INJECT=1. \
+★ THE BEST KNOWN CONFIGURATION IS ATLAS_NO_TOOL_INJECT=1 WITH THINKING ON: \
+79.80 / 82.40. Per subset under the stack, for the record: parallel 22.58, \
+live_parallel 37.50, parallel_multiple 40.32, live_parallel_multiple 41.67 - the \
+entire parallel family collapses. hallucination actually rose to 97.73, so this \
+is not a general degradation; it is specifically the parallel capability being \
+lost with the reasoning block. \
+★ THE 87.44 BAR IS NOT REACHABLE BY CONFIGURATION, AND HERE IS THE BOUND. Take \
+the BEST value observed for every subset across every configuration measured - \
+Atlas shipped, Atlas thinking-off, Atlas no-inject, Atlas no-inject+thinking-off, \
+and vLLM 0.28.0 - cherry-picking the winner per subset even where that means \
+taking vLLM's number or shipped-Atlas's: \
+    irrelevance            100.00  live_irrelevance         98.86 (vLLM) \
+    live_multiple           79.05  live_parallel            87.50 \
+    live_parallel_multiple  54.17  live_simple              92.00 \
+    multiple                88.71  parallel                 75.00 \
+    parallel_multiple       68.55  simple_java              59.68 (SHIPPED) \
+    simple_javascript       51.61  simple_python            88.71 \
+    => hallucination 99.43, live 78.18, non_live 72.04 \
+    => ORACLE normalized 83.22 \
+The best single real configuration scores 82.40, so per-subset cherry-picking is \
+worth only +0.82 over just running no-inject with thinking on. Both fall short \
+of the 88.59 normalized / 87.44 overall bar - the oracle by 5.37. No \
+configuration of this engine on these weights reaches it, and that is arithmetic \
+over 12 subsets and 5 configurations rather than an opinion. \
+★ WHAT WOULD BE NEEDED. Different weights, or model-level work. The bar is \
+Qwen3.6's number carried over as a target; vLLM on NVIDIA's own recommended \
+config gets 73.57 on these weights and Atlas now gets 79.80. The remaining 7.64 \
+is not an engine gap. \
+★ ONE SUBSET STILL WANTS ATTENTION. simple_java is the ONLY place the injection \
+helped: 59.68 shipped versus 50.00 under no-inject. It is the single regression \
+the fix introduces, it is 100 samples of 3625 so it is swamped in the headline, \
+and nobody has explained it. That is the loose thread, and a per-request split \
+of the injection (keep it for single-call subsets, drop it for parallel) is the \
+shape of a fix if anyone wants the last point. \
+★ THE NO-INJECT SUBMISSION PAIR: ACCURACY AND PERF ON ONE ENGINE STATE. \
+Everything below is ATLAS_NO_TOOL_INJECT=1, thinking ON, shipped tscg, prompt \
+verified at 411 tokens on a live request before each leg started. \
+    ACCURACY  draw 1  79.80 / 82.40   draw 2  79.60 / 82.32   spread 0.20 / 0.08 \
+    ttft-cold-gate   median  904.5 ms  p90 2635.8 ms  Pass (-0.8% / -1.1%) \
+    ttft-warm-gate   median  899.0 ms  p90 2648.5 ms  Pass (-0.7% / -0.4%) \
+    concurrency-sweep  24 cells, 0 request errors, all above the vacuity floor, \
+                       peak 59.9 tok/s, best TTFT p50 507 ms \
+    decode-floor     INCONCLUSIVE - 472 tokens against the 750 vacuity floor \
+★ TWO DRAWS MAKE 79.80 REPRODUCIBLE. 79.80 and 79.60, a spread of 0.20 - the \
+same tightness as the thinking-ON baseline's 64.22 / 64.12 / 64.22. The headline \
+is a measurement, not a lucky draw. \
+★ THE ACCURACY WIN COSTS NOTHING IN SPEED, and here is why that is expected \
+rather than surprising: the TTFT gates and the sweep drive SYNTHETIC prompts of \
+fixed length, not BFCL tool prompts, so a change that shrinks the tool prompt \
+from 1314 to 411 tokens cannot move them. Peak sweep throughput reads 59.9 \
+against 60.0 / 60.1 / 60.2 on the three prior runs - inside noise. Both TTFT \
+gates came in slightly FASTER than their own baselines. There is no speed \
+regression to trade against the +15.58. \
+★ decode-floor IS INCONCLUSIVE, NOT FAILED, AND IT IS PRE-EXISTING. The model \
+answers the probe in 472 tokens of a 1500 budget, under the 750-token floor, so \
+the harness declines to score it - the same reason this entry is already \
+carried `unmeasured` above. Nothing about no-inject caused it: acceptance on \
+those runs was 320 / 319 / 135 of 472, i.e. the drafter is working. Do not read \
+the Fail line as a regression from this change. \
+★ THE ACCOMPANYING RECIPE IS UPDATED. Atlas-Inf/sparkrun-recipes @ 9400c6c on \
+branch recipe/nemotron-3.5-lightning-dspark carries the env stack, the four-way \
+accuracy table, and the thinking interaction. ATLAS_NO_TOOL_INJECT cannot be a \
+recipe KEY - `defaults:` carries serve flags only and the Atlas recipe struct \
+has no `env:` field - so it is documented in prose beside ATLAS_DFLASH_OPTION_B, \
+matching the convention the qwen3.8 recipes set. `defaults:` is unchanged. \
+★ THE BOUNDS BELOW ARE A REGRESSION FLOOR, NOT A QUALITY BAR. They sit well \
+under a single first measurement so a real regression trips them and ordinary \
+variance does not. Do not read 64.22 as this checkpoint being healthy at tool \
+use; read it as the number to notice moving. Ratchet after a second recorded \
+run, never to the best."""
+
+# ── The perf leg ────────────────────────────────────────────────────────────
+# decode-floor, the two TTFT guards and the concurrency sweep, run as one set.
+# All four are speed measurements, so all four are hostage to the box: a GB10
+# that throttles mid-run marks its own record INVALID (hardware_state.postcheck)
+# and those numbers must not be quoted. Check that flag on every record before
+# ratcheting a threshold from it.
+
+[benchmarks.metrics.samples]
+# The golden MLPerf draw is exactly 995, and the run on record made exactly
+# that draw (995/995 samples, zero transport failures). Pin BOTH ends: this
+# entry's score bounds are calibrated to this draw and to nothing else, and a
+# one-sided `min` would accept the 3625-sample full draw against subset
+# thresholds. Note the echolp variant draws n=1004 with a different category
+# mix (46/23/12 vs 62/10/10) — its scores are NOT comparable to these and
+# belong to `bfcl-subset-echolp`, which pins its own count.
+min = 995.0
+max = 995.0
+
+[benchmarks.metrics.overall_accuracy]
+min = 60.0
+noise = 0.5
+
+[benchmarks.metrics.normalized_single_turn_score]
+min = 66.0
+noise = 0.5
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "decode-floor"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "unmeasured"
+note = """\
+Median-of-3 server decode rate. On this target it is really a DSpark \
+acceptance measurement wearing a decode-rate hat: the drafter proposes gamma=4 \
+and the target verifies K=3 in one batched step, so the decode number moves \
+with acceptance, and an acceptance regression that leaves output correct still \
+shows up here. Record `output_tokens` and `runs` alongside it — a fast median \
+over runs that decoded almost nothing is not a floor. \
+★ RE-RUN 2026-09-01 ON THE CORRECTED CHAT TEMPLATE and it is STILL \
+INCONCLUSIVE, by a smaller margin. 472 tokens per run (was 259), 67.4 / 67.2 / \
+71.5 tok/s (was 65.9 / 66.0 / 65.9). The model now reasons before answering \
+instead of dying at 64 thinking tokens, which is where the extra 213 tokens \
+come from, but 472 is still under the 750-token vacuity floor and score.rs \
+holds that as a CONSTANT, not a parameter. So this gate cannot certify this \
+checkpoint on this prompt no matter how the engine performs, and the entry \
+stays unmeasured. Fixing it needs a longer fixed prompt, which changes what \
+every other target measured - a separate decision, not one to make here. \
+★ RE-RUN AGAIN 2026-09-02 on the binary carrying the DFlash logprobs fix, and \
+the harness named a SECOND blocker that outranks the first: `http://...:8899 is \
+serving Nemotron-3.5-Lightning-30B-A3B-NVFP4, which this benchmark is not \
+defined on. The decode floor is recorded for unsloth/Qwen3.8-27B-NVFP4 (12-run \
+sigma calibration, 2026-08-15).` So even a run clearing the vacuity floor would \
+have no committed floor to be judged against on this checkpoint. \
+★ AND THE VACUITY FLOOR IS A PROPERTY OF THE REFERENCE MODEL, NOT OF THIS \
+ENGINE. score.rs pins MIN_OUTPUT_TOKENS = 750 because the calibrating \
+checkpoint stops at a DETERMINISTIC 915 tokens on the committed MinHeap prompt; \
+750 sits under that with drift margin. This model answers the same prompt in \
+472 tokens - the identical count as the pre-fix run, so it is the model's \
+natural stop and not a truncation - and 472 < 750. Nothing here is tunable at \
+run time: MINHEAP_PROMPT, MAX_TOKENS = 1500 and MIN_OUTPUT_TOKENS = 750 are all \
+compile-time constants, the last of them pinned by its own test \
+(`assert_eq!(MIN_OUTPUT_TOKENS, 750)`), and `--param` reaches none of them. \
+★ CONCLUSION: this gate is inapplicable to this checkpoint for two independent \
+reasons, and neither is an engine defect. It stays `unmeasured` rather than \
+being made to produce a number, because a decode rate judged against another \
+model's floor would be worse than no number at all."""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "ttft-cold-gate"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "measured"
+note = """\
+Uncached prefill TTFT. This is the leg that sees a cold-load regression, and \
+the one to read first on a port that touched the Mamba-2 prefill path. \
+FIRST MEASUREMENT, 2026-09-01, gx10-e3a3 (GB10), binary 70909412, 12 repeats per \
+prompt length: 256 tok median 508.0 / p90 511.0; 1024 tok median 905.2 / p90 \
+907.9; 4096 tok median 2647.4 / p90 2662.5. Pooled median 905.2 ms, pooled p90 \
+2648.5 ms. The gate's own verdict was `Info: no baseline on this box yet - this \
+run is recorded as the baseline`. \
+★ THE BOUNDS BELOW ARE A COARSE CEILING, NOT A CALIBRATED BAR. They are one run \
+on one box with no sigma behind them, set ~15% above the measurement so an \
+honest re-run cannot fail them. The real regression detector is this gate's own \
+median<=3% / p90<=5% comparison against its stored same-box baseline; these \
+numbers exist so the entry is not vacuous, and they should be re-taken from two \
+or more tiers before anyone treats a near-miss as a signal. \
+★ RE-RUN 2026-09-02 AS A REGRESSION CHECK ON THE LOGPROBS PATCH, which is the \
+only code change since the numbers above and which touches the DFlash verify \
+step directly. Same box, same recipe: 256 tok median 505.4 / p90 510.6; 1024 \
+tok median 896.8 / p90 899.9; 4096 tok median 2631.9 / p90 2647.5. Pooled \
+median 896.8 ms, pooled p90 2634.1 ms. The gate's own same-box comparison \
+returns `Pass: median -1.0% (limit +3.0%) - p90 -0.4% (limit +5.0%)`. \
+Marginally FASTER, which is noise, not a win - the point is that extracting \
+logprobs on the verify path costs nothing measurable, exactly as intended by \
+gating the copy on `a.top_logprobs`. \
+★ THIRD MEASUREMENT 2026-09-02, in the submission pair: median 912.2 ms, p90 \
+2664.2 ms, `Pass: median +1.7% (limit +3.0%) - p90 +1.1% (limit +5.0%)`. \
+Slower than the morning's 896.8 by 1.7% and still well inside the gate. Read \
+that against the box state rather than the code: this ran after ~6 h of \
+continuous benchmarking on the same GB10, and earlier legs logged chassis-zone \
+rises of +30 C. Thermal drift on a loaded box is the parsimonious reading, and \
+the gate compares against its own same-box baseline, not across boxes."""
+
+[benchmarks.metrics.median_ms]
+max = 1041.0
+
+[benchmarks.metrics.p90_ms]
+max = 3046.0
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "ttft-warm-gate"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "measured"
+note = """\
+Cached-prefix TTFT. ★ READ THE RECIPE FIRST: it pins \
+`enable_prefix_caching: false`, and not as a performance choice — the server \
+warns of a community-reported correctness regression on SM12.x with DFlash \
+(wrong output on multi-turn cache hits). So the warm guard here measures the \
+warm path WITHOUT the radix cache, which is a different quantity from the \
+Qwen entries' warm number and must not be compared to them. If prefix caching \
+is ever proven safe on this stack, this entry's baseline has to be retaken \
+rather than reinterpreted. \
+FIRST MEASUREMENT, 2026-09-01, same box and binary, 12 repeats per length: 256 \
+tok median 504.5 / p90 506.1; 1024 tok median 900.8 / p90 917.5; 4096 tok median \
+2645.5 / p90 2651.9. Pooled median 900.8 ms, pooled p90 2647.8 ms. \
+★ AND THE MEASUREMENT CONFIRMS THE WARNING ABOVE: warm and cold agree to within \
+0.5% (900.8 vs 905.2 ms), and the harness reports `cached tok = 0` on every row \
+of both. Nothing was cached, because prefix caching is off by correctness pin. \
+So this entry does NOT measure a cache hit and must never be compared against a \
+recipe that caches. Same coarse-ceiling caveat as the cold entry. \
+★ RE-RUN 2026-09-02, same regression check as the cold leg: pooled median \
+897.4 ms, pooled p90 2641.9 ms, verdict `Pass: median -0.8% (limit +3.0%) - \
+p90 -0.2% (limit +5.0%)`, and `cached 0 tok` on every row again. Warm and cold \
+still agree to within 0.1% (897.4 vs 896.8), which is the same statement as \
+before: prefix caching is off, so there is no cache hit to measure. \
+★ THIRD MEASUREMENT 2026-09-02, submission pair: median 904.9 ms, p90 2658.1 \
+ms, `Pass: median +0.8% (limit +3.0%) - p90 +0.6% (limit +5.0%)`. Warm and cold \
+agree to 0.8% (904.9 vs 912.2) for the third time running, which is the same \
+statement as before and not a new one: nothing is cached."""
+
+[benchmarks.metrics.median_ms]
+max = 1036.0
+
+[benchmarks.metrics.p90_ms]
+max = 3045.0
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "concurrency-sweep"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "measured"
+note = """\
+The C=1..32 ladder. ★ THE RECIPE'S `gpu_memory_utilization: 0.80` IS LOAD- \
+BEARING FOR THIS GATE AND IS NOT A TUNING KNOB. Measured on a GB10 (119 GB \
+unified) 2026-08-26: at 0.88 the box has ~6 GB of host memory left once the \
+model is resident and concurrency 8 exhausts it between consecutive samples of \
+a 2-second poll — 6.4 GB to 180 MB — taking the machine off the network \
+entirely, with no reboot. At 0.80 the post-load headroom is ~15.8 GB and the \
+1/2/4/6/8 ladder completes with zero failed requests: 76.1 / 95.8 / 120.6 / \
+104.1 / 140.3 aggregate tok/s, 1.84x at C8, 17.6 tok/s per client. That is a \
+CLIFF, not a gradient. Run this sweep behind a host-memory watchdog that kills \
+the BENCH — never the server — when MemAvailable drops below ~1.2 GB, and do \
+not raise the utilisation without re-measuring. The dip at C=6 reproduces and \
+is unexplained; it fails nothing. Those numbers came from an ad-hoc ladder, \
+not from this gate, so they are context for whoever reads the first record — \
+not a threshold, and not a baseline. \
+★ MEASURED 2026-09-01 ON THIS GATE, 24 cells (ISL 128/512/1024/2048 x C \
+1/2/4/8/16/32), verdict `Info: 24 cells, no request errors, all above the \
+vacuity floor`. The shape, at ISL 128: TTFT p50 600 ms -> 4.42 s -> 41.1 s at \
+C=1 -> 8 -> 32, TPOT p50 12.4 -> 114.1 -> 120.6 ms, and SERVER decode flat at \
+58.5 -> 52.8 -> 53.3 tok/s. Read that carefully: the table's `tok/s` column is \
+the server-side decode rate, not aggregate throughput, so its peak at C=1 is \
+arithmetic and not a scaling failure. Decode rate is flat across every rung and \
+every ISL while TTFT degrades ~68x, which is what `max_batch_size: 8` predicts - \
+at C=16 and C=32 requests are QUEUEING, not batching. Still no thresholds: this \
+gate is not required and a curve is not a bound. \
+★ MEASURED 2026-09-01 ON THE CORRECTED TEMPLATE, and it reproduces the \
+pre-fix run closely enough to trust: 24/24 cells, ZERO request errors, peak \
+60.0 tok/s at concurrency 2, best TTFT p50 506 ms. Aggregate throughput is \
+FLAT across the ladder - 59.9 / 60.0 / 55.8 / 51.8 / 54.4 / 51.8 tok/s at \
+C=1..32 on ISL 128 - while TTFT p50 degrades 506 ms to 38.7 s over the same \
+range, about 76x. That is what max_batch_size 8 predicts: past 8 the rungs \
+queue, so added concurrency buys latency, not throughput. Longer inputs shift \
+the whole curve down (36.4 tok/s at C=1 on ISL 2048) without changing its \
+shape. \
+★ THE PERF LEG TURNED OUT TO BE TEMPLATE-INSENSITIVE. Before/after the \
+template fix: ttft-cold 905.2 -> 905.5 ms median, ttft-warm 900.8 -> 904.2, \
+sweep throughput 48-58 -> 51.8-60 tok/s. That is the expected result once \
+stated plainly - these probes pin the output length, and the template changes \
+GENERATION, not prefill or token count. Only the accuracy leg (ST-995, 11.26 \
+-> 64.22) was destroyed by it. Do not generalise "the wrong template \
+invalidated the measurements" to the speed numbers; it did not. \
+★ THE BOUND BELOW IS A BLOWUP DETECTOR, not a perf gate. c1_aggregate_tok_s \
+is floored well under the THREE agreeing measurements so a real collapse trips \
+it and ordinary variance does not. \
+★ THIRD RUN 2026-09-02, the same logprobs-patch regression check the TTFT legs \
+got. 24/24 cells, zero request errors, every cell above the vacuity floor. \
+Peak 60.1 tok/s at C=2, best TTFT p50 509 ms, c1_aggregate_tok_s 59.8. The \
+ISL-128 ladder reads 59.8 / 60.1 / 56.0 / 52.7 / 52.5 / 51.8 tok/s at C=1..32 \
+against the previous 59.9 / 60.0 / 55.8 / 51.8 / 54.4 / 51.8, and ISL 2048 at \
+C=1 lands on 36.4 tok/s in both runs. Two independent measurements agreeing to \
+a tenth at the anchor cell is what makes the 50.0 floor a defensible blowup \
+detector rather than a guess off one sample. \
+★ THE QUEUEING STORY IS NOW VISIBLE IN THE EVIDENCE LINES, not just inferred \
+from max_batch_size 8. At ISL 2048 / C=32 the SERVER reports ttft p50 1461 ms \
+and decode p50 4.0 tok/s while the CLIENT sees ttft p50 74.4 s: the server is \
+timing only the requests it has admitted, so the ~73 s difference is queue \
+wait, not prefill. Read the client column for user-visible latency and the \
+server column for engine health; on this recipe past C=8 they answer different \
+questions. \
+★ FOURTH RUN 2026-09-02, submission pair: 24/24 cells, zero request errors, \
+every cell above the vacuity floor, peak 60.2 tok/s at C=2, best TTFT p50 510 \
+ms. The peak now reads 60.0 / 60.1 / 60.2 across three independent runs, which \
+is as tight as this instrument gets."""
+
+[benchmarks.metrics.c1_aggregate_tok_s]
+min = 50.0
+noise = 1.0
+
+
+# ── A promotion candidate, run because this port is the reason it exists ────
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "cross-contamination"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+# `true` because this is the ONLY checkpoint declaring this gate anywhere in
+# kernels/, so it is the default by arithmetic rather than by preference. Left
+# `false` the baseline would assemble with no default at all, and a gate run
+# that omits `--checkpoint` refuses on "no default checkpoint" — a landmine
+# that would only go off the day cross-contamination graduates out of
+# PROMOTION_CANDIDATES. The same reason mlperf-agentic-subset, also
+# non-required and also sole-declarer, sets it.
+default = true
+status = "measured"
+note = """\
+NOT one of the ten REQUIRED_GATES - `cross-contamination` sits in \
+PROMOTION_CANDIDATES, whose own doc comment asks for exactly this: a candidate \
+"run on release cuts and recorded as debt until it has proven itself". \
+Declaring it here neither creates nor discharges a gate obligation; the \
+required set is a fixed array of ten in gate/mod.rs and does not read this \
+file. It is recorded because the result is evidence, not because anything \
+demanded it. \
+★ WHY THIS PORT IN PARTICULAR. Every request on this recipe shares one \
+`--ssm-cache-slots 256` pool, and DFlash makes each of them roll back SSM \
+state on every rejected draft. That is a concurrent-mutation shape, and the \
+question "does one request's rollback corrupt another's state" is not answered \
+by the single-stream equivalence test recorded on the poisoning entry below. \
+★ MEASURED 2026-09-02, same box, same binary, same recipe: 2 prompts x rungs \
+C=2/4/8 plus a post-check, 8 comparisons, 8/8 byte-identical to their solo \
+reference over 2048 compared tokens. contaminated 0, diverged 0, persistent 0, \
+alone_unstable 0, unmeasured 0. Verdict Pass. \
+★ READ THE POST-CHECK ROW AS THE INTERESTING ONE. `A post` and `B post` re-run \
+each probe ALONE after the concurrent rungs; identical there is the statement \
+that concurrency left no residue in the shared pool - a transient interference \
+would show in the C=8 rows, whereas a permanently damaged slot shows only \
+here. Both are clean. \
+★ WHAT IT DOES NOT COVER. Two prompts at C<=8 (the recipe's max_batch_size), \
+short generations, prefix caching off. It says nothing about restore-from- \
+snapshot poisoning, which is the separate hazard the entry below is about, and \
+nothing above C=8 where the sweep shows requests queue rather than batch.\
+"""
+
+[benchmarks.metrics.contaminated]
+# Zero-tolerance, all three. These are not rates with a noise band - a single
+# contaminated, diverged or persistently-damaged stream is a correctness bug on
+# a shared-state engine, so the bound is exact and `noise` is deliberately absent.
+max = 0.0
+
+[benchmarks.metrics.diverged]
+max = 0.0
+
+[benchmarks.metrics.persistent]
+max = 0.0
+
+[benchmarks.metrics.identical]
+# Pin the low end too, so a run that compared nothing cannot pass on three
+# zeroes: 8 comparisons is what 2 prompts x 3 rungs + 2 post-checks produces.
+min = 8.0
+
+
+# ── The correctness gate the DSpark verify path most needs ──────────────────
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+gate = "ssm-state-poisoning-gate"
+recipe = "nemotron-3.5-lightning/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark"
+label = "Nemotron-3.5-Lightning-30B-A3B (NVFP4 + DSpark)"
+default = false
+status = "unmeasured"
+note = """\
+Declared because this port has a specific reason to fear it, not because the \
+set looked incomplete. The merge that brought DSpark here combined two \
+rollback implementations in `verify_a.rs` / `async_chkpt.rs`: upstream's \
+`ssm_pool.h_stored_bytes` for h_bytes with the ported \
+`config.ssm_conv_state_bytes()` for conv_bytes — because the GDN formula \
+(nk*kd*2 + nv*vd) evaluates to 0 on a Nemotron-H backbone, which left LIVE SSM \
+state behind on rejected drafts. A speculative decoder that fails to roll back \
+recurrent state is precisely what this gate detects, and it detects it as \
+byte-difference in a replayed conversation rather than as a wrong number. \
+`collapsed` and `unmeasured` take zero tolerance when thresholds are set; \
+`jittered` must NOT be bounded, because restore-anchor selection varies \
+between rounds on a healthy engine. \
+★ ATTEMPTED 2026-09-01 AND IT COULD NOT EVALUATE THIS CHECKPOINT AT ALL. The \
+gate failed on its REFERENCE round, not on a replay: \
+`reference round failed the script anchors (turn 2: line 1 does not start with \
+its number ...) - replays compared against it would certify nothing`. NOTHING \
+ABOUT SSM POISONING WAS TESTED - not a pass, not a failure of the rollback \
+path; the gate could not run. \
+\
+TWO SEPARATE CAUSES, established 2026-09-01, and only the first is fixed. \
+\
+(1) THE REFERENCE FORMAT. `probe.rs` documents this exact failure mode: with \
+thinking ON the gate 'burns the token budget then truncates turns 2-3 \
+(finish_reason=length) and over-produces (turn 2 gave 5 numbered lines, not \
+3)'. That is what was observed. It is compounded by the template bug fixed in \
+this branch - the run used `nemotron_h.jinja` instead of the declared \
+`nemotron_lightning.jinja`, which seeds an OPEN <think> block, so the model \
+could not emit terse numbered lines even in principle. The canonical fix is \
+the one qwen3.6-35b-a3b already uses: `--serve-override disable_thinking=true` \
+(NOT per-request chat_template_kwargs). RE-ATTEMPT after the template fix with \
+that override before concluding anything about the format. \
+\
+(2) THE VACUITY BLOCKER, WHICH IS NOT FIXED AND IS NOT FIXABLE HERE. This gate \
+detects poisoning as a byte-difference between REPLAYS THAT RESTORE FROM A \
+MARCONI PREFIX-CACHE SNAPSHOT; `probe.rs` sizes LONG_PREFIX specifically so \
+'every later round's prefill lands as a prefix-cache restore', and \
+qwen3.6-35b-a3b bounds `min_cached_prompt_tokens` as its VACUITY ATTESTATION. \
+This recipe pins `enable_prefix_caching: false` - deliberately, against the \
+SM12.x DFlash multi-turn correctness regression - so every round is cache-cold, \
+`min_cached_prompt_tokens` is 0, and there is no restore to poison. Bound that \
+metric when thresholds are set here: without it the gate would read GREEN off \
+twelve trivially-identical cold rounds, which is worse than the red it reads \
+today. \
+\
+WHAT THIS DOES NOT EXCUSE. The conv_bytes=0 rollback hazard above is a \
+WITHIN-GENERATION defect - live SSM state surviving a rejected draft - and it \
+does not need prefix caching to manifest. Disabling the cache removes this \
+gate's detection mechanism, NOT the hazard. The instrument that does reach it \
+without a cache is greedy output-equivalence: with greedy verification a \
+correct speculative decoder is exactly output-preserving, so `--dflash` on vs \
+off at temperature 0 must be token-identical, and a failed rollback shows up \
+as divergence. Run that before treating the rollback path as exercised. \
+★ THAT TEST HAS NOW RUN, AND IT PASSES. 2026-09-01, same box, same recipe, \
+same binary, temperature 0, 12 prompts, ARM A `--dflash` (mtp=true, \
+num_drafts=3 - the shipped gamma=4 contract, confirmed on the scheduler line) \
+against ARM B speculation off (mtp=false, num_drafts=0): \
+EXACT TOKEN-SEQUENCE MATCH 12/12. Greedy speculative decoding is \
+output-preserving on this port, which is the strongest statement available \
+about the rollback path and it is a bit-exact one. \
+★ AND THE DISTRIBUTIONS AGREE, not just the tokens. 1419 scored positions: \
+88.5% bit-identical top-5, 93.5% sharing the same top-5 support, and on those \
+the top-k restricted KL(A||B) has mean 1.2e-17 and max 3.8e-15 - machine \
+epsilon, i.e. the two decode paths are the same distribution. The remaining \
+6.5% differ only in WHICH token holds the 5th slot (a tie flipping membership); \
+their apparent KL up to 29.96 is entirely the estimator's absent-token floor \
+and means nothing. The one real raw difference is a CONSTANT offset in the log \
+normaliser - at the worst position all five deltas are -0.018286 with spread \
+1e-7 - and KL is invariant to a constant offset, which is exactly why the \
+same-support KL is zero. \
+★ WHAT THIS DOES AND DOES NOT SETTLE. It exercises the conv_bytes=0 rollback \
+hazard directly, without needing the prefix cache, and finds no corruption: \
+live SSM state surviving a rejected draft would move the emitted tokens, and \
+they do not move. It does NOT replace this gate: 12 short greedy prompts are \
+not 12 replayed multi-turn conversations restoring from Marconi snapshots, and \
+a poisoned RESTORE is a different failure than a poisoned ROLLBACK. Keep this \
+entry unmeasured; the equivalence result is evidence about the port, not a \
+substitute for the gate. \
+★ AND THE GATE HAS NOW BEEN RUN, 2026-09-02, instead of only reasoned about - \
+which was worth doing, because it fails EARLIER than this entry predicted and \
+for a reason nothing above anticipated. It never reaches a replay comparison at \
+all. It fails in the REFERENCE round, on the script anchors: `turn 2: line 1 \
+does not start with its number: "Monotonic sequence: each record number exactly \
+one greater than predecessor, gaps treated as corruption."` (likewise lines 2 \
+and 3), and stops with `replays compared against it would certify nothing`. \
+★ READ WHAT THAT ACTUALLY SAYS ABOUT THE MODEL, because it is not a defect. \
+probe.rs requires turn 2 to be exactly three non-empty lines, each beginning \
+with its own numeral (`line.starts_with("1")`, `"2"`, `"3"`). This checkpoint \
+produced EXACTLY THREE LINES carrying EXACTLY THE THREE REQUIRED CONCEPTS - \
+monotonic sequence, bounded drift, closed membership - and simply did not \
+prefix them with numerals. It passed the count check and failed the format \
+check. The anchor is calibrated to another model's output habits, the same way \
+decode-floor's 750-token floor is calibrated to Qwen3.8-27B's deterministic \
+915-token stop. Two of the ten required gates are therefore FIXTURE-BOUND: they \
+cannot certify a checkpoint whose formatting differs from the one they were \
+built on, however healthy the engine underneath. \
+★ THE GATE IS BEHAVING CORRECTLY AND SHOULD NOT BE LOOSENED HERE. Refusing to \
+certify off an unvalidated reference is fail-closed, which is the whole design; \
+relaxing the anchor to accept unnumbered lines would weaken the check for every \
+target that currently passes it, and that is a maintainer's decision on the \
+fixture, not a porting change to smuggle into this branch. \
+★ SO THERE ARE NOW TWO STACKED BLOCKERS, not one. Even with the anchors \
+satisfied, the run announces `12 replay rounds, prefix caching under test` while \
+this recipe pins `enable_prefix_caching: false` against the SM12.x DFlash \
+correctness regression - so the replays would be twelve cold rounds, trivially \
+identical, and the entry would read GREEN having detected nothing. The anchor \
+failure is the nearer blocker; the caching pin is the deeper one. The entry \
+stays unmeasured on both counts."""

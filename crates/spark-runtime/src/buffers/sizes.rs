@@ -322,7 +322,7 @@ impl BufferSizes {
 
         // Batched expert output buffers for MoE (or dense FFN).
         // Sized for max(K=3 verify, prefill chunk) × top_k experts.
-        let k_max = m.max(3); // prefill chunk or K=3 verify, whichever larger
+        let k_max = m.max(4); // prefill chunk or K=4 verify (1+3 drafts)
         let expert_inter = if config.num_experts > 0 {
             let routed = config.num_experts_per_tok * config.moe_intermediate_size;
             k_max * routed.max(config.intermediate_size)
@@ -330,12 +330,15 @@ impl BufferSizes {
             k_max * config.intermediate_size
         };
         let expert_gate_out = expert_inter * bf16;
-        let expert_up_out = expert_inter * bf16;
+        // +32 rows: the prefill Marlin cfg4 path pads each expert's M to a
+        // 32-multiple (tm=2 tiles); the last expert's padded rows must stay
+        // in-bounds.
+        let expert_up_out = expert_inter * bf16 + 32 * config.moe_intermediate_size.max(1) * bf16;
         // Routed expert down output: [k_max * top_k, moe_input_size].
         // For LatentMoE (Super 120B), routed experts output in latent space.
         let moe_out_dim = config.moe_input_size();
         let expert_down_out = if config.num_experts > 0 {
-            k_max * config.num_experts_per_tok * moe_out_dim * bf16
+            k_max * config.num_experts_per_tok * moe_out_dim * bf16 + 32 * moe_out_dim * bf16
         } else {
             k_max * h * bf16
         };

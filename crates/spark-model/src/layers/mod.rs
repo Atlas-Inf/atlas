@@ -9,6 +9,7 @@ pub mod moe;
 pub mod mtp_head;
 pub(crate) mod mtp_meta;
 pub mod mtp_multi;
+pub(crate) mod nemotron_decode_policy;
 pub mod nemotron_mamba2;
 pub mod nemotron_moe;
 pub mod ngram_embed;

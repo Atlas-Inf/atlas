@@ -36,19 +36,23 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 const GROUP_SIZE: usize = 16;
-const MAX_M: usize = 16;
+const MAX_M: usize = 32;
 const SCALE2: f32 = 0.0123_f32;
+/// Odd N: exercises the padded `ceil(N / 4)` output group.
+const TAIL_N: usize = 10_307;
+const _: () = assert!(!TAIL_N.is_multiple_of(4));
 
 /// The two `nano` rows are the EXACT shapes Nano-30B-A3B / Lightning-30B-A3B
 /// dispatch (hidden 2688, d_inner 4096, in_proj_size 10304). The two `super`
 /// rows cover the hidden-4096 Super/Puzzle backbone at the natural doubling
 /// (d_inner 8192); they are shape COVERAGE for a larger N and a deeper K, not
 /// a claim about that checkpoint's exact `in_proj_size`.
-const SHAPES: [(&str, usize, usize); 4] = [
+const SHAPES: [(&str, usize, usize); 5] = [
     ("nano  in_proj  [10304 x 2688]", 10304, 2688),
     ("nano  out_proj [ 2688 x 4096]", 2688, 4096),
     ("super in_proj  [18560 x 4096]", 18560, 4096),
     ("super out_proj [ 4096 x 8192]", 4096, 8192),
+    ("tail  odd-N    [10307 x 2688]", TAIL_N, 2688),
 ];
 
 struct Lcg(u64);

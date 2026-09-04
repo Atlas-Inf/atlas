@@ -313,6 +313,9 @@ impl Qwen3AttentionLayer {
             .unwrap();
         if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block to rope portions only.
+        } else if self.rope_disabled {
+            // Nemotron-H: the HF reference applies no rotary embeddings in
+            // attention — position lives in the Mamba layers.
         } else if !self.yarn_inv_freq.is_null() {
             ops::rope_yarn_scaled(
                 ctx.gpu,

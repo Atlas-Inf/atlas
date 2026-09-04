@@ -27,6 +27,7 @@ pub(crate) struct ParsedBehavior {
     pub disable_cwd_hint_injection: bool,
     pub use_sampling_presets_for_core: bool,
     pub tool_call_parser: String,
+    pub jinja_template: String,
     pub enable_loop_watchdog: bool,
     /// Gate for the THINKING-phase token-loop watchdog, which force-injects
     /// `</think>` when it detects a period-4..20 repeat in the reasoning tail.
@@ -98,6 +99,7 @@ impl Default for ParsedBehavior {
             disable_cwd_hint_injection: false,
             use_sampling_presets_for_core: false,
             tool_call_parser: String::new(),
+            jinja_template: String::new(),
             enable_loop_watchdog: false,
             enable_think_loop_watchdog: true,
             honor_eos_inside_thinking: false,
@@ -181,6 +183,11 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .unwrap_or(false);
     let tool_call_parser = b
         .and_then(|v| v.get("tool_call_parser"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let jinja_template = b
+        .and_then(|v| v.get("jinja_template"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -292,6 +299,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         disable_cwd_hint_injection,
         use_sampling_presets_for_core,
         tool_call_parser,
+        jinja_template,
         enable_loop_watchdog,
         enable_think_loop_watchdog,
         honor_eos_inside_thinking,
