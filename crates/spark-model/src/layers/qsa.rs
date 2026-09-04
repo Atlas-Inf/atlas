@@ -31,6 +31,8 @@ use crate::layers::ops;
 
 #[path = "qsa_aux.rs"]
 mod qsa_aux;
+#[path = "qsa_decode_select.rs"]
+mod qsa_decode_select;
 #[path = "qsa_free.rs"]
 mod qsa_free;
 
@@ -88,6 +90,12 @@ pub struct QsaIndexer {
     k_qprep_rows_k: KernelHandle,
     k_score_rows_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
+    k_select_k: KernelHandle,
+    /// `ATLAS_QSA_DEVICE_TOPK=1`: select on the device (no per-layer host
+    /// round trip); `ATLAS_QSA_TOPK_VERIFY=1` also runs the host reference
+    /// and fails on the first mismatch.
+    device_topk: bool,
+    topk_verify: bool,
 
     qk_scratch: DevicePtr, // [INGEST_SLAB, (n_heads+1)*hd] BF16
     q_post: DevicePtr,     // [n_heads, hd] F32
@@ -181,6 +189,9 @@ impl QsaIndexer {
             k_qprep_rows_k: gpu.kernel("qsa_indexer", "qsa_qprep_rows")?,
             k_score_rows_k: gpu.kernel("qsa_indexer", "qsa_score_rows")?,
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
+            k_select_k: gpu.kernel("qsa_indexer", "qsa_select_topk")?,
+            device_topk: std::env::var("ATLAS_QSA_DEVICE_TOPK").ok().as_deref() == Some("1"),
+            topk_verify: std::env::var("ATLAS_QSA_TOPK_VERIFY").ok().as_deref() == Some("1"),
             qk_scratch: gpu.alloc(INGEST_SLAB * qk_width * 2)?,
             q_post: gpu.alloc(n_heads * hd * 4)?,
             scores_dev: gpu.alloc(max_tokens / ratio * 4)?,
@@ -380,41 +391,37 @@ impl QsaIndexer {
             stream,
         )?;
 
-        // Host top-k over the block scores (D2H — decode graphs are vetoed
-        // whenever an indexer is present, so this is never inside a capture).
-        let mut raw = vec![0u8; complete * 4];
-        gpu.copy_d2h_on_stream(self.scores_dev, &mut raw, stream)?;
-        let scores: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let mut order: Vec<u32> = (0..complete as u32).collect();
-        // torch.topk returns the k largest, ties broken by LOWER index —
-        // sort by (-score, index) and take the first k for identical sets.
-        order.sort_by(|&a, &b| {
-            scores[b as usize]
-                .partial_cmp(&scores[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
-        let mut blocks: Vec<u32> = order[..self.block_topk as usize].to_vec();
-        blocks.sort_unstable();
-
+        // Block selection. `n_sel` never depends on the scores, only the
+        // CONTENT of `sel_dev` does. Device arm: one kernel writes `sel_dev`
+        // (no D2H, no host sort, no H2D). Host arm (default, and anything
+        // wider than the kernel's flag array): D2H + sort + H2D — decode
+        // graphs are vetoed whenever an indexer is present, so neither arm
+        // ever runs inside a capture.
         let ratio = self.ratio as usize;
-        let mut sel: Vec<i32> = Vec::with_capacity(self.budget as usize + ratio);
-        for b in &blocks {
-            let base = *b as i32 * self.ratio as i32;
-            for r in 0..self.ratio as i32 {
-                sel.push(base + r);
+        let tail_start = complete * ratio;
+        let n_sel = (self.block_topk as usize * ratio + (visible - tail_start)) as u32;
+        if self.device_topk && complete <= qsa_decode_select::QSA_SELECT_MAX_BLOCKS {
+            ops::qsa_select_topk(
+                gpu,
+                self.k_select_k,
+                self.scores_dev,
+                self.sel_dev,
+                complete as u32,
+                self.block_topk,
+                self.ratio,
+                tail_start as u32,
+                visible as u32,
+                stream,
+            )?;
+            if self.topk_verify {
+                self.verify_device_selection(gpu, complete, visible, pos, stream)?;
             }
+        } else {
+            let sel = self.host_select(gpu, complete, visible, stream)?;
+            debug_assert_eq!(sel.len() as u32, n_sel);
+            let sel_bytes: Vec<u8> = sel.iter().flat_map(|v| v.to_le_bytes()).collect();
+            gpu.copy_h2d_async(&sel_bytes, self.sel_dev, stream)?;
         }
-        for t in complete * ratio..visible {
-            sel.push(t as i32);
-        }
-        let n_sel = sel.len() as u32;
-
-        let sel_bytes: Vec<u8> = sel.iter().flat_map(|v| v.to_le_bytes()).collect();
-        gpu.copy_h2d_async(&sel_bytes, self.sel_dev, stream)?;
         ops::qsa_gather(
             gpu,
             self.k_gather_k,
