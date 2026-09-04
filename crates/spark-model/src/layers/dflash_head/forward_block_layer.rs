@@ -88,6 +88,28 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
 
+        let attn_conv_out_delta = if let Some(ref conv) = layer.attention_conv {
+            let out_delta = conv.prepare(
+                gpu,
+                self.kernels.dense_gemm_pipelined,
+                self.kernels.dflash2_conv,
+                scratch.norm_buf,
+                scratch.dflash2_conv_delta,
+                scratch.dflash2_conv_out,
+                n_attn,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                scratch.dflash2_conv_out,
+                scratch.norm_buf,
+                (n_attn * h * bf16 as u32) as usize,
+                stream,
+            )?;
+            Some(out_delta)
+        } else {
+            None
+        };
+
         // 3b. q/k/v projections from norm_buf (n_attn rows).
         ops::dense_gemm_bf16_pipelined(
             gpu,
@@ -277,21 +299,6 @@ impl BlockDiffusionDraftHead {
                 scratch.attn_out.offset(noise_q_offset + 4086 * bf16),
                 10,
             )?;
-            // ATLAS_DFLASH_DEBUG_DUMP_FULL=1: write the FULL 4096-element
-            // attn_out[noise0] row to /tmp/atlas_attn_out.bin so PyTorch
-            // can run o_proj on the exact same bytes.
-            if self.startup.diagnostics.dump_full {
-                let n_bytes = q_dim as usize * bf16;
-                let mut buf = vec![0u8; n_bytes];
-                gpu.synchronize(stream)?;
-                gpu.copy_d2h(scratch.attn_out.offset(noise_q_offset), &mut buf)?;
-                std::fs::write("/tmp/atlas_attn_out.bin", &buf)
-                    .map_err(|e| anyhow::anyhow!("write attn_out dump: {e}"))?;
-                tracing::info!(
-                    "DFLASH DUMP wrote {} bytes attn_out[noise0] to /tmp/atlas_attn_out.bin",
-                    n_bytes
-                );
-            }
         }
 
         // 3f. o_proj.
@@ -318,14 +325,26 @@ impl BlockDiffusionDraftHead {
                 scratch.stream_buf.offset(noise_offset),
                 10,
             )?;
-            if self.startup.diagnostics.dump_full {
-                let n_bytes = self.hidden_size * bf16;
-                let mut buf = vec![0u8; n_bytes];
-                gpu.synchronize(stream)?;
-                gpu.copy_d2h(scratch.stream_acc.offset(noise_offset), &mut buf)?;
-                std::fs::write("/tmp/atlas_o_proj_out.bin", &buf)
-                    .map_err(|e| anyhow::anyhow!("write o_proj_out: {e}"))?;
-            }
+        }
+
+        if let (Some(ref conv), Some(out_delta)) =
+            (layer.attention_conv.as_ref(), attn_conv_out_delta)
+        {
+            conv.finish(
+                gpu,
+                self.kernels.dflash2_conv,
+                scratch.stream_acc,
+                out_delta,
+                scratch.dflash2_conv_out,
+                n_attn,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                scratch.dflash2_conv_out,
+                scratch.stream_acc,
+                (n_attn * h * bf16 as u32) as usize,
+                stream,
+            )?;
         }
 
         // 3g. residual: stream_buf += stream_acc (n_attn rows).
@@ -358,6 +377,28 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
+
+        let mlp_conv_out_delta = if let Some(ref conv) = layer.mlp_conv {
+            let out_delta = conv.prepare(
+                gpu,
+                self.kernels.dense_gemm_pipelined,
+                self.kernels.dflash2_conv,
+                scratch.norm_buf,
+                scratch.dflash2_conv_delta,
+                scratch.dflash2_conv_out,
+                n_attn,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                scratch.dflash2_conv_out,
+                scratch.norm_buf,
+                (n_attn * h * bf16 as u32) as usize,
+                stream,
+            )?;
+            Some(out_delta)
+        } else {
+            None
+        };
 
         // 3i. MLP: gate + up.
         ops::dense_gemm_bf16_pipelined(
@@ -406,6 +447,24 @@ impl BlockDiffusionDraftHead {
             inter,
             stream,
         )?;
+
+        if let (Some(ref conv), Some(out_delta)) = (layer.mlp_conv.as_ref(), mlp_conv_out_delta) {
+            conv.finish(
+                gpu,
+                self.kernels.dflash2_conv,
+                scratch.stream_acc,
+                out_delta,
+                scratch.dflash2_conv_out,
+                n_attn,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                scratch.dflash2_conv_out,
+                scratch.stream_acc,
+                (n_attn * h * bf16 as u32) as usize,
+                stream,
+            )?;
+        }
 
         // 3l. residual.
         ops::residual_add(

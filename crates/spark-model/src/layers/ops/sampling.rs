@@ -175,4 +175,34 @@ pub fn batched_embed_fp8(
         .launch(stream)
 }
 
+/// DFlash2 on-device bilinear candidate selector.
+pub fn dflash2_candidate_selector(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits: DevicePtr,
+    projected_hidden: DevicePtr,
+    pred_codebook: DevicePtr,
+    succ_codebook: DevicePtr,
+    out_tokens: DevicePtr,
+    last_token: u32,
+    gamma: u32,
+    vocab_size: u32,
+    rank: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(logits)
+        .arg_ptr(projected_hidden)
+        .arg_ptr(pred_codebook)
+        .arg_ptr(succ_codebook)
+        .arg_ptr(out_tokens)
+        .arg_u32(last_token)
+        .arg_u32(gamma)
+        .arg_u32(vocab_size)
+        .arg_u32(rank)
+        .launch(stream)
+}
+
 // ── MoE routing ──────────────────────────────────────────────────
