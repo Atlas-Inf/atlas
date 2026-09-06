@@ -438,19 +438,28 @@ extern "C" __global__ void qsa_select_topk(
     int visible)
 {
     __shared__ unsigned char selected[QSA_SELECT_MAX_BLOCKS];
+    __shared__ float sc[QSA_SELECT_MAX_BLOCKS];   // scores staged once (16 KB)
     const int tid = threadIdx.x;
     const int nt = blockDim.x;
+    // Stage the scores in shared memory: the rank loop below reads every
+    // score `complete` times, and nsys had the global-memory version at
+    // ~71 us per launch (12 per token) for complete <= 512.
+    const float neg_inf = __int_as_float(0xff800000u);
     for (int b = tid; b < complete; b += nt) {
-        const float sb = scores[b];
+        const float v = scores[b];
+        sc[b] = isnan(v) ? neg_inf : v;     // NaN never ranks, never selects
+    }
+    __syncthreads();
+    for (int b = tid; b < complete; b += nt) {
+        const float sb = sc[b];
         int rank = 0;
-        if (!isnan(sb)) {
+        if (sb != neg_inf) {
             for (int j = 0; j < complete; ++j) {
-                const float sj = scores[j];
-                if (isnan(sj)) continue;
+                const float sj = sc[j];
                 if (sj > sb || (sj == sb && j < b)) ++rank;
             }
         }
-        selected[b] = (!isnan(sb) && rank < block_topk) ? 1 : 0;
+        selected[b] = (sb != neg_inf && rank < block_topk) ? 1 : 0;
     }
     __syncthreads();
     for (int b = tid; b < complete; b += nt) {
