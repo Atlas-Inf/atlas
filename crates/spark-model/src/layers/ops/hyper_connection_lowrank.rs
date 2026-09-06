@@ -25,7 +25,7 @@ use crate::layers::qwen3_attention::HcLowRank;
 /// `ATLAS_QWEN4EXP_NO_HC_GEMM=1`: revert the large-T collapse to the fused
 /// FP32 kernel (deploy-time kill switch; the GEMM path rounds `normed` to
 /// BF16 before the projections).
-use super::hyper_connection_lowrank_gemm::{gemm_raw, hc_finish_block};
+use super::hyper_connection_lowrank_gemm::{gemm_raw, hc_finish_block, hc_finish_x4};
 
 fn hc_gemm_disabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -451,12 +451,24 @@ fn hc_pre_split(
     // work. The extra SMs do not pay for the extra staging. rsafier's original
     // `S = clamp(48/T, 1, 10)` was already at the useful end of this curve;
     // 128 is a hair better and 256 is inside the noise.
-    let fblock = hc_finish_block();
-    let fsplit = hidden_size
-        .div_ceil(fblock)
-        .max((48 / num_tokens.max(1)).clamp(1, 10));
+    // Stream-per-warp layout (`hc_pre_finish_x4`, hc == 4 only): 4x the
+    // threads of the thread-per-`d` kernel, identical accumulation order.
+    let x4 = hc_mult == 4 && hc_finish_x4();
+    let (k_fin, grid_y, fblock) = if x4 {
+        (
+            gpu.kernel("hyper_connection", "hc_pre_finish_x4")?,
+            hidden_size.div_ceil(32),
+            128,
+        )
+    } else {
+        let fblock = hc_finish_block();
+        let fsplit = hidden_size
+            .div_ceil(fblock)
+            .max((48 / num_tokens.max(1)).clamp(1, 10));
+        (k_fin, fsplit, fblock)
+    };
     KernelLaunch::new(gpu, k_fin)
-        .grid([num_tokens, fsplit, 1])
+        .grid([num_tokens, grid_y, 1])
         .block([fblock, 1, 1])
         .shared_mem(w.rank as u32 * 4)
         .arg_ptr(normed)

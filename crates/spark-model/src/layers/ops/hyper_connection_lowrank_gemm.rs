@@ -38,6 +38,13 @@ pub(crate) fn gemm_raw(
 /// Block width for stage 3 (`ATLAS_HC_FIN_BLOCK`, default 128). Kept as a knob
 /// because it is pure launch geometry — it cannot change the arithmetic, only
 /// how much of the machine runs it.
+/// `ATLAS_HC_FIN_X4`: stream-per-warp `hc_pre_finish_x4` (default on) vs the
+/// thread-per-`d` `hc_pre_finish` (`=0`). Read once per process.
+pub(crate) fn hc_finish_x4() -> bool {
+    static X4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *X4.get_or_init(|| std::env::var("ATLAS_HC_FIN_X4").as_deref() != Ok("0"))
+}
+
 pub(crate) fn hc_finish_block() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
