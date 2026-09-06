@@ -496,9 +496,44 @@ extern "C" __global__ void hc_pre_finish(
         float mixed = 0.0f;
         if (hc == 4) {
             float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-            for (unsigned int r = 0; r < rank; ++r) {
+            // LOADS IN FLIGHT. nsys (2026-09-06, C=1, 3.9K ctx): this kernel
+            // was 121 us x 97 launches = 11.7 ms of a 69 ms token, ~54 GB/s
+            // on 6.5 MB of `up_w` — latency-bound, as the note above says.
+            // Each `r` step below is one dependent load+FMA per stream and
+            // nvcc does not pipeline a runtime-bound loop, so a warp sat on
+            // one DRAM round trip per `r`. Unrolling `r` by 8 with the 32
+            // loads hoisted ahead of the 32 accumulations puts eight `r`
+            // steps' worth of loads in flight per stream. The accumulation
+            // itself is UNCHANGED: every `a_s` still sums r = 0,1,2,... in
+            // that exact order into one FP32 register, so the result is
+            // bit-for-bit the same as the one-`r`-at-a-time loop — this is
+            // pure scheduling, not reassociation (which the note above
+            // measured moving logits and was rejected).
+            const __nv_bfloat16* ub = up_w + d;
+            unsigned int r = 0;
+            for (; r + 8 <= rank; r += 8) {
+                float l[8];
+                __nv_bfloat16 u0[8], u1[8], u2[8], u3[8];
+                #pragma unroll
+                for (unsigned int k = 0; k < 8; ++k) {
+                    const __nv_bfloat16* u = ub + (size_t)(r + k) * hc_dim;
+                    l[k] = smem_lo[r + k];
+                    u0[k] = u[0];
+                    u1[k] = u[H];
+                    u2[k] = u[2 * H];
+                    u3[k] = u[3 * H];
+                }
+                #pragma unroll
+                for (unsigned int k = 0; k < 8; ++k) {
+                    a0 += (float)u0[k] * l[k];
+                    a1 += (float)u1[k] * l[k];
+                    a2 += (float)u2[k] * l[k];
+                    a3 += (float)u3[k] * l[k];
+                }
+            }
+            for (; r < rank; ++r) {
                 const float lo = smem_lo[r];
-                const __nv_bfloat16* u = up_w + (size_t)r * hc_dim + d;
+                const __nv_bfloat16* u = ub + (size_t)r * hc_dim;
                 a0 += (float)u[0] * lo;
                 a1 += (float)u[H] * lo;
                 a2 += (float)u[2 * H] * lo;
