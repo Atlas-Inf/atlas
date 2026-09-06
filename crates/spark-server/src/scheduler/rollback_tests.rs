@@ -12,7 +12,7 @@
 use super::super::ssm_decode_ring::SsmDecodeRing;
 use super::{
     RollbackFallback, RollbackOutcome, find_last_boundary, find_last_boundary_with_snapshot,
-    rewind_buffers,
+    rollback_rewind::rewind_buffers,
 };
 
 // ── boundary detection ──────────────────────────────────────────────
