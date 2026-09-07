@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Locks greedy argmax tie-breaking to the sampler's first-index-wins rule.
+//! Locks greedy argmax tie-breaking to FIRST-index-wins — the rule llama.cpp's
+//! greedy sampler and vLLM's `torch.argmax` share, and the rule every
+//! committed BFCL record for Qwen3.6/3.8-27B was measured under. The
+//! 2026-09-03 switch to last-index-wins (`argmax_other_better`, "value
+//! descending, then higher vocabulary index") moved Qwen3.8-27B's BFCL
+//! normalized score from 83.38 to 83.10 on gb10: BF16 logits tie often at
+//! temperature 0, and on the nine flipped samples of the gate draw the old
+//! rule answered five correctly against two. Reverting the kernel alone
+//! restored all nine. The host paths (`verify_pipeline_helper::argmax`,
+//! the greedy logit processor) follow the same rule so the engine does not
+//! disagree with itself.
 
 use std::path::PathBuf;
 
@@ -10,38 +20,34 @@ fn source() -> String {
 }
 
 #[test]
-fn every_cuda_argmax_reduction_matches_last_index_greedy_contract() {
+fn cuda_argmax_keeps_the_first_strict_maximum() {
     let src = source();
     assert!(
-        src.contains("argmax_other_better"),
-        "CUDA argmax needs one value-desc/index-desc comparator"
-    );
-    let calls = src.matches("argmax_other_better(").count();
-    // One definition plus local scan and tree merge in each of BF16 single,
-    // BF16 batch, BF16 batch+logprob, and FP32.
-    assert_eq!(
-        calls, 9,
-        "all four scans and reductions must use the comparator"
+        !src.contains("argmax_other_better"),
+        "the last-index-wins comparator must not come back silently"
     );
     assert!(
-        src.contains("other_idx > mine_idx"),
-        "equal BF16/FP32 maxima must select the higher vocabulary index"
+        !src.contains("other_idx > mine_idx"),
+        "equal maxima must never select the higher vocabulary index"
+    );
+    // Every scan advances only on a strictly greater value: first max wins.
+    assert!(
+        src.matches("if (v > local_max)").count() >= 3,
+        "each strided scan must keep the first strict maximum"
     );
 }
 
 #[test]
-fn cross_stride_tie_proves_lane_order_is_not_last_vocab_id() {
-    const BLOCK: u32 = 1024;
-    let first_vocab_id = 1024u32;
-    let later_vocab_id = 2047u32;
-    assert!(first_vocab_id < later_vocab_id);
-    assert!(
-        later_vocab_id % BLOCK > first_vocab_id % BLOCK,
-        "fixture must make the later vocab ID live in the higher CUDA lane"
-    );
-    let better = |other_val: f32, other_idx: u32, mine_val: f32, mine_idx: u32| {
-        other_val > mine_val || (other_val == mine_val && other_idx > mine_idx)
-    };
-    assert!(better(7.0, later_vocab_id, 7.0, first_vocab_id));
-    assert!(!better(7.0, first_vocab_id, 7.0, later_vocab_id));
+fn first_index_wins_reference_rule() {
+    // The rule the kernel's strided scan + lower-tid tree merge implements and
+    // the host helpers (`spark_runtime::sampler::argmax_first_wins_f32`) share:
+    // advance only on a strictly greater value.
+    let v = [1.0f32, 7.0, 3.0, 7.0, 2.0];
+    let mut best = 0usize;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    assert_eq!(best, 1);
 }
