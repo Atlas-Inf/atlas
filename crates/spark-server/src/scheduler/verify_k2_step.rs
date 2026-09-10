@@ -111,6 +111,7 @@ pub fn step_verify_k2(
     for &t in &tokens_k2 {
         if let Err(e) = model.ep_broadcast_cmd(t) {
             tracing::error!("EP broadcast verify_k2 token: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }

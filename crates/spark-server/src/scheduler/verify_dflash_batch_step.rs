@@ -56,6 +56,7 @@ pub(super) fn step_verify_dflash_batched(
     if let Err(e) = model.sync_secondary() {
         tracing::error!("dflash-batched sync_secondary: {e:#}");
         for a in batch.iter_mut() {
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
         }
         return;
@@ -95,6 +96,7 @@ pub(super) fn step_verify_dflash_batched(
                 Err(e) => {
                     tracing::error!("decode_verify_dflash serial diagnostic (i={i}): {e:#}");
                     for a in batch.iter_mut() {
+                        a.engine_error = Some(format!("{e:#}"));
                         a.finished = true;
                     }
                     return;
@@ -109,6 +111,7 @@ pub(super) fn step_verify_dflash_batched(
             Err(e) => {
                 tracing::error!("decode_verify_batched dflash (n={n} ks={ks:?}): {e:#}");
                 for a in batch.iter_mut() {
+                    a.engine_error = Some(format!("{e:#}"));
                     a.finished = true;
                 }
                 return;
@@ -172,6 +175,7 @@ pub(super) fn step_verify_dflash_batched(
         Err(error) => {
             tracing::error!("dflash hidden-save owner lookup failed: {error:#}");
             for a in batch.iter_mut() {
+                a.engine_error = Some(format!("{error:#}"));
                 a.finished = true;
             }
             return;
@@ -183,6 +187,7 @@ pub(super) fn step_verify_dflash_batched(
     {
         tracing::error!("preserve_dflash_save_front: {e:#}");
         for a in batch.iter_mut() {
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
         }
         return;
@@ -193,6 +198,8 @@ pub(super) fn step_verify_dflash_batched(
             let Some(k0) = restore_front_k else {
                 tracing::error!("DFlash owner slot 0 appeared without a preserved front");
                 for a in batch.iter_mut() {
+                    a.engine_error =
+                        Some("DFlash owner slot 0 appeared without a preserved front".to_string());
                     a.finished = true;
                 }
                 return;
@@ -200,6 +207,7 @@ pub(super) fn step_verify_dflash_batched(
             if let Err(e) = model.restore_dflash_save_front(k0, 0) {
                 tracing::error!("restore_dflash_save_front before owner-slot-0 commit: {e:#}");
                 for a in batch.iter_mut() {
+                    a.engine_error = Some(format!("{e:#}"));
                     a.finished = true;
                 }
                 return;
@@ -207,6 +215,7 @@ pub(super) fn step_verify_dflash_batched(
         } else if let Err(e) = model.pack_dflash_save_seq(slot, ks[i], 0) {
             tracing::error!("pack_dflash_save_seq(owner_slot={slot}): {e:#}");
             for a in batch.iter_mut() {
+                a.engine_error = Some(format!("{e:#}"));
                 a.finished = true;
             }
             return;
@@ -226,6 +235,7 @@ pub(super) fn step_verify_dflash_batched(
     {
         tracing::error!("restore_dflash_save_front: {e:#}");
         for a in batch.iter_mut() {
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
         }
         return;
@@ -442,6 +452,7 @@ pub(super) fn apply_dflash_accept(
     let total_accepted = num_accepted + 1;
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
         tracing::error!("commit_accepted_prefix (dflash batched): {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }

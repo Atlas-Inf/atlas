@@ -23,6 +23,7 @@ pub fn step_self_spec(
     // 1. Full-model decode to get token_0
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
         tracing::error!("EP broadcast self-spec token: {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
@@ -30,6 +31,7 @@ pub fn step_self_spec(
         Ok(l) => l,
         Err(e) => {
             tracing::error!("self-spec decode error: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -38,6 +40,7 @@ pub fn step_self_spec(
         Ok(t) => t,
         Err(e) => {
             tracing::error!("self-spec argmax error: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -83,6 +86,7 @@ pub fn step_self_spec(
     // 4. Checkpoint SSM states before verification
     if let Err(e) = model.checkpoint_ssm_states(&mut a.seq) {
         tracing::error!("self-spec checkpoint: {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
@@ -96,6 +100,7 @@ pub fn step_self_spec(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("self-spec verify error: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -193,6 +198,7 @@ pub fn step_ngram(
         // ── Phase A: Bootstrap decode + N-gram propose ──
         if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
             tracing::error!("EP broadcast ngram bootstrap: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -200,6 +206,7 @@ pub fn step_ngram(
             Ok(l) => l,
             Err(e) => {
                 tracing::error!("ngram bootstrap decode error: {e:#}");
+                a.engine_error = Some(format!("{e:#}"));
                 a.finished = true;
                 return;
             }
@@ -208,6 +215,7 @@ pub fn step_ngram(
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("ngram bootstrap argmax error: {e:#}");
+                a.engine_error = Some(format!("{e:#}"));
                 a.finished = true;
                 return;
             }
@@ -247,6 +255,7 @@ pub fn step_ngram_verify(
     let t_sync = Instant::now();
     if let Err(e) = model.sync_secondary() {
         tracing::error!("ngram sync_secondary: {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
@@ -256,12 +265,14 @@ pub fn step_ngram_verify(
     let tokens_k2 = [a.last_token, drafts[0]];
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF2) {
         tracing::error!("EP broadcast ngram verify cmd: {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
     for &t in &tokens_k2 {
         if let Err(e) = model.ep_broadcast_cmd(t) {
             tracing::error!("EP broadcast ngram verify token: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -272,6 +283,7 @@ pub fn step_ngram_verify(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("ngram decode_verify_graphed: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -300,6 +312,7 @@ pub fn step_ngram_verify(
     // EP: broadcast accept/reject to worker
     if let Err(e) = model.ep_broadcast_cmd(accepted as u32) {
         tracing::error!("EP broadcast ngram verify result: {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
@@ -345,6 +358,7 @@ pub fn step_ngram_verify(
 
         if let Err(e) = model.start_rollback_and_checkpoint_async(&mut a.seq, 1) {
             tracing::error!("ngram rollback: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
