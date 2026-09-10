@@ -270,6 +270,18 @@ pub fn rollback_to_boundary(
         }
     };
 
+    // A model carrying aux state (QSA indexer cursors, PLE n-gram history)
+    // can only roll back to a boundary whose SSM snapshot AND aux companion
+    // both exist — the aux save rides on the ring slot, so no ssm_slot here
+    // means no aux snapshot was taken either (the ring is skipped at model
+    // init under speculative decode, for instance). Rewinding tokens and KV
+    // anyway leaves the indexer ingested count ahead of seq_len and the
+    // next decode dies on the QSA desync check; decline so the caller takes
+    // its hard-stop fallback — the outcome the watchdog had before rollback.
+    if model.requires_aux_state() && ssm_slot.is_none() {
+        return RollbackOutcome::Fallback(RollbackFallback::NoAuxSnapshot);
+    }
+
     // Tokens to drop = everything strictly after the boundary token.
     let keep_len = boundary_idx + 1;
     let dropped = a.output_tokens.len() - keep_len;
