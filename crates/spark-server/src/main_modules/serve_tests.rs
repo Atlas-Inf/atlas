@@ -189,6 +189,8 @@ fn default_kwargs_legacy_shapes_still_parse() {
     assert_eq!(kw, DefaultChatTemplateKwargs::default());
     let kw = parse_default_chat_template_kwargs(r#"{"preserve_thinking":false}"#).unwrap();
     assert_eq!(kw.preserve_thinking, Some(false));
+    let kw = parse_default_chat_template_kwargs(r#"'{"reasoning_effort":"low"}'"#).unwrap();
+    assert_eq!(kw.reasoning_effort, Some(crate::ir::ReasoningEffort::Low));
 }
 
 #[test]
