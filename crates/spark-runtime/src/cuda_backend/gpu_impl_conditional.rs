@@ -106,7 +106,6 @@ impl AtlasCudaBackend {
                 "cuGraphAddKernelNode_v2(predicate)",
             )?;
 
-            let mut bodies: [sys::CUgraph; 2] = [std::ptr::null_mut(); 2];
             let conditional = sys::CUDA_CONDITIONAL_NODE_PARAMS {
                 handle: conditional_handle,
                 type_: match kind {
@@ -118,7 +117,13 @@ impl AtlasCudaBackend {
                     }
                 },
                 size: body_count as u32,
-                phGraph_out: bodies.as_mut_ptr(),
+                // OUTPUT, not input. The driver overwrites this with a pointer to
+                // its OWN CUDA-owned array of body graphs (valid for the node's
+                // lifetime). Passing our own array here is ignored and yields
+                // null bodies — the NVIDIA graphConditionalNodes sample reads
+                // `cParams.conditional.phGraph_out[0]` after the add and never
+                // assigns the field itself.
+                phGraph_out: std::ptr::null_mut(),
                 ctx: context,
             };
             let mut params: sys::CUgraphNodeParams = unsafe { std::mem::zeroed() };
@@ -139,13 +144,24 @@ impl AtlasCudaBackend {
                 },
                 "cuGraphAddNode_v2(conditional)",
             )?;
-            if bodies[..body_count].iter().any(|body| body.is_null()) {
+            let bodies_ptr = unsafe { params.__bindgen_anon_1.conditional.phGraph_out };
+            if bodies_ptr.is_null() {
+                bail!(
+                    "CUDA returned no conditional body array — conditional nodes are \
+                     unsupported on this driver"
+                );
+            }
+            let bodies = unsafe { std::slice::from_raw_parts(bodies_ptr, body_count) };
+            if bodies.iter().any(|body| body.is_null()) {
                 bail!("CUDA returned a null conditional body graph");
             }
             Ok(ConditionalGraphTemplate {
                 graph: parent as usize as u64,
                 conditional_handle,
-                bodies: [bodies[0] as usize as u64, bodies[1] as usize as u64],
+                bodies: [
+                    bodies[0] as usize as u64,
+                    bodies.get(1).copied().unwrap_or(std::ptr::null_mut()) as usize as u64,
+                ],
                 body_count,
                 kind,
             })
