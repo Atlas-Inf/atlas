@@ -488,6 +488,34 @@ fn churn_attributes_evictions_to_the_evicted_phase() -> anyhow::Result<()> {
 }
 
 #[test]
+fn propose_key_words_participate_in_the_graph_key() -> anyhow::Result<()> {
+    let backend = Arc::new(TestBackend::new());
+    let runtime = runtime(backend, 4, 1_000);
+    let with_words = |words: Vec<u64>| {
+        let mut id = identity(GraphPhase::Propose, 4);
+        if let GraphPayload::Propose { key_words, .. } = &mut id.key.payload {
+            *key_words = words;
+        }
+        id
+    };
+    let captured = with_words(vec![1, 2, 3]);
+    let _lease = runtime.capture(
+        captured.clone(),
+        7,
+        cost(1),
+        vec![],
+        CaptureFailurePolicy::Retry,
+        |_| Ok(()),
+    )?;
+    // Same identity words hit…
+    assert!(runtime.lookup(&with_words(vec![1, 2, 3]))?.is_some());
+    // …a different lane/owner (different words) must miss, or a graph would
+    // replay against state it was not captured for.
+    assert!(runtime.lookup(&with_words(vec![1, 2, 4]))?.is_none());
+    Ok(())
+}
+
+#[test]
 fn stale_key_fallback_is_labeled_by_phase() {
     let backend = Arc::new(TestBackend::new());
     let runtime = runtime(backend, 2, 100);
