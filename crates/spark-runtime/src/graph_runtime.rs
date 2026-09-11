@@ -3,9 +3,11 @@
 mod artifact;
 mod bounded_loop;
 mod cache;
+mod capture_guard;
 mod compatibility;
 mod conditional;
 mod entry;
+mod fallback;
 mod metrics;
 mod policy;
 mod runtime_artifacts;
@@ -31,6 +33,7 @@ pub use types::{
 
 use artifact::ArtifactCatalog;
 use cache::GraphCache;
+use capture_guard::CaptureGuard;
 use entry::GraphEntry;
 use parking_lot::Mutex;
 use std::collections::HashSet;
@@ -38,41 +41,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::gpu::{GpuBackend, GraphHandle};
-
-struct CaptureGuard<'a> {
-    backend: &'a dyn GpuBackend,
-    stream: u64,
-    active: bool,
-}
-
-impl<'a> CaptureGuard<'a> {
-    fn begin(backend: &'a dyn GpuBackend, stream: u64) -> anyhow::Result<Self> {
-        backend.begin_capture(stream)?;
-        Ok(Self {
-            backend,
-            stream,
-            active: true,
-        })
-    }
-
-    fn finish(mut self, dot_path: Option<&std::path::Path>) -> anyhow::Result<GraphHandle> {
-        match self.backend.end_capture_with_dot(self.stream, dot_path) {
-            Ok(handle) => {
-                self.active = false;
-                Ok(handle)
-            }
-            Err(error) => Err(error),
-        }
-    }
-}
-
-impl Drop for CaptureGuard<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            self.backend.abort_capture_if_active(self.stream);
-        }
-    }
-}
 
 pub struct GraphRuntime {
     backend: Arc<dyn GpuBackend>,
