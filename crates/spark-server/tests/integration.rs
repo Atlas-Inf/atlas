@@ -166,7 +166,8 @@ fn setup_model_with_mode(
         config.clone(),
         store,
         gpu,
-        4,          // max_batch_tokens: up to 3 spec-decode verification tokens
+        512, // max_batch_tokens: prompt-prefill arena (the 32-token
+        //             differential prompt needs room; 4 only fit decode)
         block_size, // kv_block_size = 16
         4096,       // max_seq_len
         8,          // max_batch_size

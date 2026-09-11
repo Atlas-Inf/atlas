@@ -32,15 +32,15 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 /// all SSM layers. This enables CUDA graph capture at batch sizes > 1 because
 /// the graph embeds memory addresses that remain stable across replays.
 pub(crate) struct SsmStatePool {
-    pub(super) h_state_pools: Vec<DevicePtr>,
-    pub(super) conv_state_pools: Vec<DevicePtr>,
+    pub(super) h_state_pools: LayerPools,
+    pub(super) conv_state_pools: LayerPools,
     /// Per-slot K=3 intermediate checkpoint pools (only allocated when has_mtp).
     /// Layout: `[num_ssm_layers]`, each allocation = max_slots * 3 * h_bytes.
-    pub(super) h_intermediate_pools: Vec<DevicePtr>,
-    pub(super) conv_intermediate_pools: Vec<DevicePtr>,
+    pub(super) h_intermediate_pools: LayerPools,
+    pub(super) conv_intermediate_pools: LayerPools,
     /// Per-slot SSM state checkpoint pools (only allocated when has_mtp).
-    pub(super) h_checkpoint_pools: Vec<DevicePtr>,
-    pub(super) conv_checkpoint_pools: Vec<DevicePtr>,
+    pub(super) h_checkpoint_pools: LayerPools,
+    pub(super) conv_checkpoint_pools: LayerPools,
     /// FP32-width h blob bytes per layer (`config.ssm_h_state_bytes()`) —
     /// the ELEMENT-count authority (elems = h_bytes / 4) and the width of
     /// everything outside this pool (Marconi snapshots stay FP32).
@@ -102,7 +102,7 @@ pub(crate) struct SsmStatePool {
     /// `ssm_reserve::ssm_replay_ring_bytes` / `ssm_replay_row_bytes`).
     /// Empty in snapshot mode. Allocated so boot sizing is honest; the
     /// capture that would fill it is not wired yet.
-    pub(super) replay_input_rings: Vec<DevicePtr>,
+    pub(super) replay_input_rings: LayerPools,
     pub(super) free_slots: Mutex<Vec<usize>>,
 }
 
@@ -121,8 +121,66 @@ fn h_inter_layout(counts: &[usize]) -> (Vec<usize>, usize) {
     (offsets, acc)
 }
 
+/// One per-layer SSM pool: the per-layer pointers plus, when the strided-run
+/// optimization packed them into ONE contiguous allocation, the base that
+/// owns them.
+///
+/// `cuMemFree` rejects an interior pointer (CUDA_ERROR_INVALID_VALUE), so the
+/// per-layer pointers of a contiguous pool must NOT be freed individually —
+/// `release` frees the base once and drops the pointers. Freeing the derived
+/// pointers instead leaked the block and failed teardown with
+/// "cuMemFree_v2 failed: status 1".
+pub(super) struct LayerPools {
+    ptrs: Vec<DevicePtr>,
+    contiguous_base: Option<DevicePtr>,
+}
+
+impl LayerPools {
+    fn empty() -> Self {
+        Self {
+            ptrs: Vec::new(),
+            contiguous_base: None,
+        }
+    }
+
+    pub(super) fn ptr(&self, layer: usize) -> DevicePtr {
+        self.ptrs[layer]
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.ptrs.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.ptrs.is_empty()
+    }
+
+    fn as_slice(&self) -> &[DevicePtr] {
+        &self.ptrs
+    }
+
+    fn release(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        if let Some(base) = self.contiguous_base.take() {
+            self.ptrs.clear();
+            return gpu.free(base);
+        }
+        let mut first_error = None;
+        for ptr in self.ptrs.drain(..) {
+            if let Err(e) = gpu.free(ptr)
+                && first_error.is_none()
+            {
+                first_error = Some(e);
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Allocate one zeroed region of `bytes` per SSM layer, PREFERRING a single
-/// contiguous block so `pools[l] == pools[0] + l * bytes`.
+/// contiguous block so `pools.ptr(l) == pools.ptr(0) + l * bytes`.
 ///
 /// The uniform layer stride is what lets the verify-state copy sets collapse
 /// from `2 × num_ssm_layers` eager `copy_d2d_async` launches per sequence to
@@ -132,22 +190,30 @@ fn h_inter_layout(counts: &[usize]) -> (Vec<usize>, usize) {
 /// — this falls back to the original per-layer allocations, the strided-run
 /// detector declines, and the copies run as the same per-layer loop they
 /// always did. Bytes allocated, and the addresses every accessor derives, are
-/// identical either way.
+/// identical either way. The contiguous case is the ONLY difference in
+/// ownership: its derived pointers are interior offsets, so [`LayerPools`]
+/// frees the base rather than each pointer.
 fn alloc_layer_pools(
     gpu: &dyn GpuBackend,
     num_ssm_layers: usize,
     bytes: usize,
-) -> Result<Vec<DevicePtr>> {
+) -> Result<LayerPools> {
     if num_ssm_layers == 0 || bytes == 0 {
-        return Ok(vec![DevicePtr::NULL; num_ssm_layers]);
+        return Ok(LayerPools {
+            ptrs: vec![DevicePtr::NULL; num_ssm_layers],
+            contiguous_base: None,
+        });
     }
     if let Some(total) = bytes.checked_mul(num_ssm_layers)
         && let Ok(base) = gpu.alloc(total)
     {
         gpu.memset(base, 0, total)?;
-        return Ok((0..num_ssm_layers)
-            .map(|l| base.offset(l * bytes))
-            .collect());
+        return Ok(LayerPools {
+            ptrs: (0..num_ssm_layers)
+                .map(|l| base.offset(l * bytes))
+                .collect(),
+            contiguous_base: Some(base),
+        });
     }
     tracing::warn!(
         "SSM pool: {num_ssm_layers} × {bytes} B did not fit one contiguous block — \
@@ -160,7 +226,10 @@ fn alloc_layer_pools(
         gpu.memset(p, 0, bytes)?;
         pools.push(p);
     }
-    Ok(pools)
+    Ok(LayerPools {
+        ptrs: pools,
+        contiguous_base: None,
+    })
 }
 
 impl SsmStatePool {
@@ -194,10 +263,10 @@ impl SsmStatePool {
         // num_ssm_layers` extra GPU memory (~kilobytes per pool).
         let total_slots = max_slots + 1;
 
-        let mut h_intermediate_pools = Vec::new();
-        let mut conv_intermediate_pools = Vec::new();
-        let mut h_checkpoint_pools = Vec::new();
-        let mut conv_checkpoint_pools = Vec::new();
+        let mut h_intermediate_pools = LayerPools::empty();
+        let mut conv_intermediate_pools = LayerPools::empty();
+        let mut h_checkpoint_pools = LayerPools::empty();
+        let mut conv_checkpoint_pools = LayerPools::empty();
 
         let h_state_pools = alloc_layer_pools(gpu, num_ssm_layers, total_slots * h_stored_bytes)?;
         let conv_state_pools = alloc_layer_pools(gpu, num_ssm_layers, total_slots * conv_bytes)?;
@@ -272,7 +341,7 @@ impl SsmStatePool {
             Vec::new()
         };
         let (h_inter_offsets, h_inter_total) = h_inter_layout(&h_inter_counts);
-        let mut replay_input_rings = Vec::new();
+        let mut replay_input_rings = LayerPools::empty();
         if has_mtp {
             let ni = num_intermediates;
             let mtp_total = mtp_slots + 1;
@@ -462,7 +531,9 @@ impl SsmStatePool {
     }
 
     pub(super) fn h_state(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
-        self.h_state_pools[ssm_layer_idx].offset(slot * self.h_stored_bytes)
+        self.h_state_pools
+            .ptr(ssm_layer_idx)
+            .offset(slot * self.h_stored_bytes)
     }
 
     /// This slot's FP32 prefill staging blob (stage-3 f16-SIZED pool only).
@@ -477,7 +548,9 @@ impl SsmStatePool {
     }
 
     pub(super) fn conv_state(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
-        self.conv_state_pools[ssm_layer_idx].offset(slot * self.conv_bytes)
+        self.conv_state_pools
+            .ptr(ssm_layer_idx)
+            .offset(slot * self.conv_bytes)
     }
 
     /// DEBUG (env-gated): PER-LAYER fingerprint of h_state + conv_state for a
@@ -564,7 +637,8 @@ impl SsmStatePool {
             "h_intermediate: token_idx {token_idx} >= slot {slot}'s tiered capacity {}",
             self.h_inter_counts[slot],
         );
-        self.h_intermediate_pools[ssm_layer_idx]
+        self.h_intermediate_pools
+            .ptr(ssm_layer_idx)
             .offset((self.h_inter_offsets[slot] + token_idx) * self.h_stored_bytes)
     }
 
@@ -635,16 +709,21 @@ impl SsmStatePool {
     ) -> DevicePtr {
         let ni = self.num_intermediates;
         let slot = self.mtp_slot(slot);
-        self.conv_intermediate_pools[ssm_layer_idx]
+        self.conv_intermediate_pools
+            .ptr(ssm_layer_idx)
             .offset((slot * ni + token_idx) * self.conv_bytes)
     }
 
     pub(super) fn h_checkpoint(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
-        self.h_checkpoint_pools[ssm_layer_idx].offset(self.mtp_slot(slot) * self.h_stored_bytes)
+        self.h_checkpoint_pools
+            .ptr(ssm_layer_idx)
+            .offset(self.mtp_slot(slot) * self.h_stored_bytes)
     }
 
     pub(super) fn conv_checkpoint(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
-        self.conv_checkpoint_pools[ssm_layer_idx].offset(self.mtp_slot(slot) * self.conv_bytes)
+        self.conv_checkpoint_pools
+            .ptr(ssm_layer_idx)
+            .offset(self.mtp_slot(slot) * self.conv_bytes)
     }
 
     pub(super) fn reset_slot(&self, slot: usize, gpu: &dyn GpuBackend) -> Result<()> {
@@ -816,7 +895,8 @@ impl Drop for SlotGuard {
 /// Release every per-layer state pool.
 ///
 /// The intermediate and checkpoint pools are only allocated when MTP is on, so
-/// the vectors are empty otherwise — draining handles both without a branch.
+/// the pools are empty otherwise — [`LayerPools::release`] handles both without
+/// a branch, and frees a contiguous pool's base exactly once.
 impl atlas_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
     fn label(&self) -> &'static str {
         "ssm state pool"
@@ -831,13 +911,12 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
             &mut self.conv_intermediate_pools,
             &mut self.h_checkpoint_pools,
             &mut self.conv_checkpoint_pools,
+            &mut self.replay_input_rings,
         ] {
-            for ptr in pool.drain(..) {
-                if let Err(e) = gpu.free(ptr)
-                    && first_error.is_none()
-                {
-                    first_error = Some(e);
-                }
+            if let Err(e) = pool.release(gpu)
+                && first_error.is_none()
+            {
+                first_error = Some(e);
             }
         }
         match first_error {
@@ -918,32 +997,32 @@ mod h_stored_geometry_tests {
         let families: [(&str, &[DevicePtr], usize); 6] = [
             (
                 "h_state",
-                &p.h_state_pools,
+                p.h_state_pools.as_slice(),
                 (p.max_slots + 1) * p.h_stored_bytes,
             ),
             (
                 "conv_state",
-                &p.conv_state_pools,
+                p.conv_state_pools.as_slice(),
                 (p.max_slots + 1) * p.conv_bytes,
             ),
             (
                 "h_intermediate",
-                &p.h_intermediate_pools,
+                p.h_intermediate_pools.as_slice(),
                 *p.h_inter_offsets.last().unwrap() * p.h_stored_bytes,
             ),
             (
                 "conv_intermediate",
-                &p.conv_intermediate_pools,
+                p.conv_intermediate_pools.as_slice(),
                 (p.mtp_slots + 1) * p.num_intermediates * p.conv_bytes,
             ),
             (
                 "h_checkpoint",
-                &p.h_checkpoint_pools,
+                p.h_checkpoint_pools.as_slice(),
                 (p.mtp_slots + 1) * p.h_stored_bytes,
             ),
             (
                 "conv_checkpoint",
-                &p.conv_checkpoint_pools,
+                p.conv_checkpoint_pools.as_slice(),
                 (p.mtp_slots + 1) * p.conv_bytes,
             ),
         ];
@@ -1092,12 +1171,12 @@ mod slot_guard_tests {
     /// required to validate the exactly-once release invariant.
     fn bare_pool(max_slots: usize) -> Arc<SsmStatePool> {
         Arc::new(SsmStatePool {
-            h_state_pools: Vec::new(),
-            conv_state_pools: Vec::new(),
-            h_intermediate_pools: Vec::new(),
-            conv_intermediate_pools: Vec::new(),
-            h_checkpoint_pools: Vec::new(),
-            conv_checkpoint_pools: Vec::new(),
+            h_state_pools: LayerPools::empty(),
+            conv_state_pools: LayerPools::empty(),
+            h_intermediate_pools: LayerPools::empty(),
+            conv_intermediate_pools: LayerPools::empty(),
+            h_checkpoint_pools: LayerPools::empty(),
+            conv_checkpoint_pools: LayerPools::empty(),
             h_bytes: 0,
             h_stored_bytes: 0,
             h_prefill_stage_pool: None,
@@ -1110,7 +1189,7 @@ mod slot_guard_tests {
             h_inter_counts: Vec::new(),
             h_inter_offsets: Vec::new(),
             rollback_mode: crate::ssm_reserve::SsmRollbackMode::Snapshot,
-            replay_input_rings: Vec::new(),
+            replay_input_rings: LayerPools::empty(),
             free_slots: Mutex::new((0..max_slots).rev().collect()),
         })
     }
