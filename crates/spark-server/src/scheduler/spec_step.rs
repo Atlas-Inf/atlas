@@ -334,6 +334,17 @@ pub fn step_ngram_verify(
         }
         a.last_token = v1;
 
+        // Full-accept commit (num_accepted=k=2): the verify kernel already
+        // wrote the canonical SSM state, and the rejected-tail aux rewind is
+        // a no-op — the call exists so this path shares the aux contract
+        // (QSA indexer / PLE carry) with the K=2 verify.
+        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 2, 2) {
+            tracing::error!("ngram accept commit: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
+            a.finished = true;
+            return;
+        }
+
         // Checkpoint SSM for next verify
         if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
             tracing::error!("ngram accept checkpoint: {e:#}");
@@ -356,7 +367,7 @@ pub fn step_ngram_verify(
         a.seq.seq_len -= 1;
         a.seq.tokens.pop();
 
-        if let Err(e) = model.start_rollback_and_checkpoint_async(&mut a.seq, 1) {
+        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 1, 2) {
             tracing::error!("ngram rollback: {e:#}");
             a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
