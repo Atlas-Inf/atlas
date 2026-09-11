@@ -52,7 +52,9 @@ const CPU_CHECK_ROWS: usize = 256;
 
 /// Qwen3.6-27B shapes: (label, N, K). C[M,N] = A[M,K] · W[N,K].
 const SHAPES: &[(&str, u32, u32)] = &[
+    ("qkvz     N=16384  K=5120 ", 16384, 5120),
     ("qkv/o    N=5120   K=5120 ", 5120, 5120),
+    ("outproj  N=5120   K=6144 ", 5120, 6144),
     ("ffn_up   N=17408  K=5120 ", 17408, 5120),
     ("ffn_down N=5120   K=17408", 5120, 17408),
     ("lm_head  N=248320 K=5120 ", 248320, 5120),

@@ -387,7 +387,14 @@ pub(crate) fn load_model(
     // so the dedicated watchdog isn't needed.
     #[cfg(feature = "cuda")]
     let _oom_watchdog = spark_runtime::cuda_backend::spawn_oom_watchdog(
-        2048, // 2 GB threshold
+        // ATLAS_OOM_WATCHDOG_MB overrides the 2 GB floor — on UMA boxes
+        // (Strix Halo) that run the GPU near-full by design, the default trips
+        // during peak construction even when the load fits, and exit(1) reads
+        // as a GPU fault. 0 disables.
+        std::env::var("ATLAS_OOM_WATCHDOG_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2048),
         std::time::Duration::from_secs(2),
     );
     #[cfg(feature = "cuda")]
@@ -1126,6 +1133,7 @@ pub(crate) fn load_model(
         },
         chat: crate::api::chat::levers::ChatLevers::resolve(
             ptx_set.behavior.tscg,
+            ptx_set.behavior.template_owns_tool_definitions,
             ptx_set.behavior.disable_cwd_hint_injection,
         ),
         vision_config: config.vision.clone(),

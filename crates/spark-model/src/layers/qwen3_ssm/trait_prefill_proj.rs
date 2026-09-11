@@ -70,8 +70,15 @@ impl Qwen3SsmLayer {
         // on this hardware; until then BF16 is what buys the precision back.
         //
         // `force_bf16` still wins, so the `ATLAS_GDN_BF16_WEIGHTS` A/B lever
-        // keeps working.
-        if !force_bf16 && let Some(ref fp8w) = self.qkvz_fp8w_rowwise {
+        // keeps working. The rowwise field is also populated by
+        // ATLAS_GDN_FP8_DECODE for DECODE-only use — gate on the prefill
+        // opt-in env so that install can't pull prefill into cuBLASLt.
+        let fp8_rowwise_prefill =
+            matches!(std::env::var("ATLAS_FP8_ROWWISE").ok().as_deref(), Some("1"));
+        if !force_bf16
+            && fp8_rowwise_prefill
+            && let Some(ref fp8w) = self.qkvz_fp8w_rowwise
+        {
             // This arm returns EARLY, so it shadows the CUTLASS / cuBLAS arms
             // below. That is deliberate — its whole point is precision, and
             // every arm it shadows consumes the NVFP4 copy, i.e. the
@@ -198,7 +205,13 @@ impl Qwen3SsmLayer {
             // which is what made "keep the GDN weights BF16" look like a
             // quality-for-speed trade. It was never the precision — it was
             // the GEMM.
-            ops::cublas_bf16_proj_dense(
+            //
+            // On the HIP-compat targets cublasLtCreate can fail at request time
+            // (library init under the compat shim, e.g. memory pressure from
+            // the ATLAS_GDN_FP8_DECODE extra copies). Fall back to the
+            // hand-written BF16 GEMM on failure — slower, but a 500ing prefill
+            // is worse.
+            let r = ops::cublas_bf16_proj_dense(
                 normed,
                 self.ssm.in_proj_qkvz.weight,
                 proj_dst,
@@ -206,12 +219,25 @@ impl Qwen3SsmLayer {
                 qkvz_size as u32,
                 h as u32,
                 stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "ssm prefill: QKVZ BF16 cuBLASLt GEMM failed (M={k}, N={qkvz_size}): {e}"
-                )
-            })?;
+            );
+            if let Err(e) = r {
+                tracing::warn!(
+                    "ssm prefill: QKVZ cuBLASLt unavailable ({e:#}); falling back to \
+                     dense_gemm (hand-written BF16, slower)"
+                );
+                ops::dense_gemm_prefill(
+                    ctx.gpu,
+                    self.dense_gemm_k,
+                    self.dense_gemm_pipelined_k,
+                    normed,
+                    &self.ssm.in_proj_qkvz,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?;
+            }
         } else if force_w8a8
             && let Some(ref fp8w) = self.qkvz_fp8w
             && self.per_token_group_quant_fp8_k.0 != 0

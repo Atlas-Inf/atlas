@@ -4,6 +4,22 @@ Windows AMD is the **native-HIP** path (`ATLAS_TARGET_HW=strix-hip`, hipcc, gfx1
 SCALE — Atlas's other AMD toolchain — is Linux-only, so HIP is the only conceivable
 Windows AMD target.
 
+## Quick start
+
+From PowerShell, with ROCm 10 and Rust/MSVC installed:
+
+```powershell
+$env:HIP_PATH = 'C:\TheRock\10.0.0'
+$env:CARGO_TARGET_DIR = "$PWD\target-rocm10"
+$env:ATLAS_MODEL_DIR = 'C:\path\to\Qwen3.8-27B-NVFP4'
+powershell -ExecutionPolicy Bypass -File scripts\strix-windows\first_run.ps1
+```
+
+That single command checks the toolchain/GPU, repairs Windows symlink checkouts,
+builds, stages runtime DLLs, starts the server, and runs a smoke request. To run
+a packaged build instead, set `ATLAS_BIN` to its `spark.exe` and keep all DLLs
+from the zip beside it; the same command skips compilation.
+
 > **Status: RUNTIME-VERIFIED** on a Framework Desktop (Ryzen AI MAX+ 395 /
 > Radeon 8060S, gfx1151, Windows 11) serving `nvidia/Qwen3.6-27B-NVFP4`,
 > 2026-08-13. Clean build to a served token in ~93 s; BFCL v3 seeded 196-entry
@@ -11,7 +27,18 @@ Windows AMD target.
 > The Linux numbers in [`STRIX_NVFP4_MLPERF.md`](STRIX_NVFP4_MLPERF.md) still do
 > **not** transfer; see "Why the Linux numbers won't reproduce" below.
 
-### Qwen3.8-27B: builds and serves, but the runtime is NOT yet dependable
+### Qwen3.8-27B ROCm 10 candidate (2026-09-03)
+
+The current test stack is ROCm 10.0.0 Core SDK, Adrenalin 26.8.1
+(`32.0.31041.1004`), and Framework BIOS 3.06. The ROCm 10 source build, 11
+kernel oracles, recall/tool smoke, and a 70-sample preservation BFCL diagnostic
+completed successfully; the post-BIOS BFCL run finished all 70 requests without
+the sticky HIP 719 fault seen below. The mirrored K=2 source candidate then
+rebuilt as binary `4af14984…`; its M=2 GEMV, RMSNorm, and GDN device oracles and
+recall/tool smoke pass. The full `agentic_coding_2.5h` durability leg remains
+the long-run gate.
+
+### Historical Qwen3.8 ROCm 6.4/7.2 status
 
 `unsloth/Qwen3.8-27B-NVFP4` was taken end to end on the same box on 2026-08-19:
 95 kernels built (vision included), kernel target resolved as
@@ -416,3 +443,79 @@ That invalidated a full 5-hour run at 75.5%. Pinning concurrency to 1 took reque
 timeouts from 1126/1294 to **0** and the score to 84.2%. Check the serve log for
 `Request timeout` before trusting any number off this box; the behavioural half is
 filed as #482.
+
+## 2026-09-02 — the Linux fix mirrors over, and a durability blocker is bisected
+
+The frozen Linux source (the dense_gemm_tc quarantine + pipelined BF16 FFN
+prefill fix, the preservation module, the GDN HIP route, the BC=32 paged
+validation) was mirrored via `sync-windows-mirror.sh` and built ONCE:
+`target\x86_64-pc-windows-msvc\release\spark.exe`, sha256
+ba99809d6d9bb8ed534cf64990abfcd4d42fece91f3e4f73a4321a9da152147d. Device
+Guard did NOT block this binary. Parity smoke passes (recall + a correct
+get_current_weather tool call). Windows serve specifics: `--no-fast-load`
+(O_DIRECT is Unix-only) and a LOWER utilization than Linux — the Windows ROCm
+pool reports 76.9 GB with 43.8 GB preservation pre-KV, and 0.88 sized a 22 GB
+KV that hit the budget exactly; 0.70-0.74 serves cleanly.
+
+### The preservation BF16 decode paths crash under sustained load
+
+Three serve crashes, three configurations, one pattern:
+
+* util 0.70, MTP K=2 (MODEL.toml default_num_drafts): hung ~52 min on BFCL
+  sample 5, then device loss (status 719 everywhere).
+* util 0.70, --num-drafts 0: hipErrorLaunchFailure (719) ~8 s after a clean
+  89-token completion, during the next prefill start; 25 samples in.
+* util 0.74, destructive requant path: survived a full BFCL-70 (39 min,
+  **overall 82.86 / normalized 78.75** — live 85.71 and hallucination 56.25
+  IDENTICAL to the Linux preservation run), then crashed at ~sample 750 of
+  the pinned ST-995 with the same launch failure.
+
+What this rules out: the configuration (three different configs crash), host
+memory (127 GB RAM, 108 GB free), and the kernels the microtests cover —
+`dense_gemm_bf16_oracle` PASSES on Windows HIP (pipelined cosine >= 0.99999991
+at every shape; tc broken identically to Linux), and gdn_split4 /
+paged-BF16-attn / contiguous-attn / w8a16 / w4a16-parity microtests all PASS.
+What remains: the Windows-only decode-path kernels no microtest covers
+(`dense_gemv_bf16` M=1, the GDN decode recurrence, paged decode) or a Windows
+ROCm shared-pool/driver durability issue. Short runs are clean; sustained load
+dies. Next diagnostics need Windows-side tooling: WDR/driver event logs, a
+gemv + GDN-decode microtest, or an AMD ticket with the three crash logs
+(`C:\Users\azeez\q38-win-bfcl70*.log`, `q38-win-st995.log`).
+
+Until that closes, the Windows evaluation suite cannot pass: the ST-995 leg
+has no valid run (three attempts, all crash-terminated), and per the repo
+rule the branch does not claim a Windows accuracy number. The destructive-
+path BFCL-70 (82.86/78.75, run record
+`C:\Users\azeez\.atlas\runs\bfcl-subset\run-1788342153742063300.json`) stands
+as a stable-path observation, not a gate result — and it usefully proves the
+original 27% disaster was the broken tc serve, not the requant itself.
+
+### Update: the BF16 decode GEMV is exonerated (2026-09-02, later)
+
+`dense_gemv_bf16_oracle` (the M=1 decode GEMV at all eight Qwen3.8 decode
+shapes vs an f32 CPU reference) was run on Windows HIP after the bisection
+above: **PASS, bit-exact-class** — mean_rel <= 1.2e-5, cos >= 0.99999999,
+identical to the Linux result (`scripts/strix-windows/win_gemv_oracle.ps1`).
+The Windows suspect set shrinks to the still-uncovered decode kernels: the
+GDN decode recurrence (`mamba2_ssm_decode`), paged decode attention
+(`paged_decode_attn`), and the SSM snapshot/rollback ring.
+
+### Root cause narrowed: Windows ROCm HIP context loss, NOT TDR (2026-09-02 late)
+
+ST-995 attempt 4 (destructive path, util 0.78, ssm-interval 4096, slots 4)
+completed all 995 samples with the serve dying partway again (score 9.85%,
+pre-crash samples scoring well: irrelevance 100, live_irrelevance 84.09).
+Windows Event Log shows **NO TDR events (4101), no WHEA hardware errors** —
+the GPU context is lost inside the HIP runtime without a Windows driver
+reset. This eliminates:
+* TDR (timeout detection) — no 4101 events
+* Hardware fault — no WHEA errors
+* Atlas kernel bugs — every kernel with an oracle passes on Windows
+* Configuration — five different configs crash
+
+The durability bug is a **ROCm 7.2 HIP SDK on Windows** issue: the GPU
+context becomes unrecoverable after sustained compute load (~30-50 min),
+without any OS-level event. The same binary, same kernels, same recipe on
+Linux runs 8.7 h straight (ST-995, 995 samples). This needs an AMD driver
+fix or a ROCm upgrade. TheBFCL-70 result (82.86/78.75, destructive path)
+is the best Windows accuracy number until then.

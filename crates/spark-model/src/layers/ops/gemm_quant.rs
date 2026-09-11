@@ -153,8 +153,9 @@ pub fn dense_gemv_batch2(
     out_stride: u32,
     stream: u64,
 ) -> Result<()> {
+    let outputs_per_block = if cfg!(atlas_hip) { 8 } else { 4 };
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 4), 1, 1])
+        .grid([div_ceil(n, outputs_per_block), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)

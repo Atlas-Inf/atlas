@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Atlas Dense BF16 dual-GEMV (batch=2) for SM121 (GB10).
+// Atlas Dense BF16 dual-GEMV (batch=2) for gfx1151 (Strix Halo).
 //
 // The batch=2 sibling of dense_gemv_bf16: computes two output rows from ONE
 // pass over the BF16 weight matrix, halving weight bandwidth vs two M=1
@@ -20,12 +20,12 @@
 // Used by the K=2 MTP verify path (SSM in_proj_qkvz on FP8 checkpoints,
 // which dequant GDN in-projections to dense BF16 at load).
 //
-// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+// Grid: (ceil(N / 8), 1, 1)   Block: (256, 1, 1)
 
 #include <cuda_bf16.h>
 
 #define BLOCK_SIZE 256
-#define N_PER_BLOCK 4
+#define N_PER_BLOCK 8
 #define WARP_SIZE 32
 #define VEC_SIZE 8  // BF16 values per vectorized load (uint4 = 16 bytes)
 
@@ -37,9 +37,8 @@ extern "C" __global__ void dense_gemv_bf16_batch2(
     unsigned int K,
     unsigned int out_stride                // BF16 elements between output rows
 ) {
-    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
-    const unsigned int local_out = threadIdx.x / threads_per_out;
-    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int local_out = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
     if (n >= N) return;
@@ -52,7 +51,7 @@ extern "C" __global__ void dense_gemv_bf16_batch2(
     const uint4* A1_vec = (const uint4*)(A + K);
     const uint4* B_vec = (const uint4*)(B + (unsigned long long)n * K);
 
-    for (unsigned int kv = lane; kv < K_VEC; kv += threads_per_out) {
+    for (unsigned int kv = lane; kv < K_VEC; kv += WARP_SIZE) {
         uint4 a0_data = A0_vec[kv];
         uint4 a1_data = A1_vec[kv];
         uint4 b_data = B_vec[kv];
@@ -86,36 +85,22 @@ extern "C" __global__ void dense_gemv_bf16_batch2(
     {
         const unsigned int tail_start = K_VEC * VEC_SIZE;
         const __nv_bfloat16* B_row = B + (unsigned long long)n * K;
-        for (unsigned int k = tail_start + lane; k < K; k += threads_per_out) {
+        for (unsigned int k = tail_start + lane; k < K; k += WARP_SIZE) {
             const float bf = __bfloat162float(B_row[k]);
             acc0 += __bfloat162float(A[k]) * bf;
             acc1 += __bfloat162float(A[K + k]) * bf;
         }
     }
 
-    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
-
+    // One warp per output: pure shuffle reduction, no shared memory or barrier.
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
         acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
     }
 
-    // 2 warps per output: cross-warp reduce via shared memory, per token.
-    __shared__ float smem0[N_PER_BLOCK * 2];
-    __shared__ float smem1[N_PER_BLOCK * 2];
-
-    if (warp_lane == 0) {
-        unsigned int smem_idx = local_out * 2 + (lane / WARP_SIZE);
-        smem0[smem_idx] = acc0;
-        smem1[smem_idx] = acc1;
-    }
-    __syncthreads();
-
     if (lane == 0) {
-        float r0 = smem0[local_out * 2] + smem0[local_out * 2 + 1];
-        float r1 = smem1[local_out * 2] + smem1[local_out * 2 + 1];
-        C[n] = __float2bfloat16(r0);
-        C[(unsigned long long)out_stride + n] = __float2bfloat16(r1);
+        C[n] = __float2bfloat16(acc0);
+        C[(unsigned long long)out_stride + n] = __float2bfloat16(acc1);
     }
 }

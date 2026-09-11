@@ -122,6 +122,7 @@ pub struct DenseFfnLayer {
     // ~10 TFLOPS at M=8k and was the flat ~155 tok/s dense-FFN prefill
     // bottleneck on Qwen3.6-27B. KernelHandle(0) on miss → scalar-tile fallback.
     w4a16_gemm_t_m128_k: KernelHandle,
+    w4a16_gemm_t_m128_k16_k: KernelHandle,
     // v2: 8-warp (256-thread) variant of t_m128 — parallel chunk MMAs, 3 CTAs/SM.
     // Preferred over t_m128 for dense-FFN prefill when present. KernelHandle(0) → use t_m128.
     w4a16_gemm_t_m128_v2_k: KernelHandle,
@@ -341,6 +342,7 @@ impl DenseFfnLayer {
             w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
+            w4a16_gemm_t_m128_k16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_k16"),
             w4a16_gemm_t_m128_v2_k: super::w4a16_v2_kernel(gpu),
             w4a16_gemm_t_m128_bf16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_bf16"),
             w4a16_gemm_t_m128_bf16_v2_k: super::try_kernel(
@@ -2258,6 +2260,42 @@ impl DenseFfnLayer {
                         $k,
                         stream,
                     )?,
+                    // A/B lever: ATLAS_W4A16_K16=1 routes through the K16 tile
+                    // kernel (~20KB smem -> 3 CTAs/SM on gfx1151 vs 1 for m128).
+                    Some(wt) if self.w4a16_gemm_t_m128_k16_k.0 != 0
+                        && std::env::var_os("ATLAS_W4A16_K16").is_some() =>
+                    {
+                        ops::w4a16_gemm_n128_m128(
+                            ctx.gpu,
+                            self.w4a16_gemm_t_m128_k16_k,
+                            $in,
+                            &wt,
+                            $out,
+                            m,
+                            $n,
+                            $k,
+                            stream,
+                        )?
+                    }
+                    // A/B lever (gfx1151 occupancy): ATLAS_W4A16_M64=1 routes the
+                    // transposed GEMM through the M64 kernel (2 CTAs/SM at ~27KB
+                    // smem) instead of the M128 kernel (1 CTA/SM at ~37KB).
+                    Some(wt) if self.w4a16_gemm_t_m128_k.0 != 0
+                        && self.w4a16_gemm_t_k.0 != 0
+                        && std::env::var_os("ATLAS_W4A16_M64").is_some() =>
+                    {
+                        ops::w4a16_gemm_n128(
+                            ctx.gpu,
+                            self.w4a16_gemm_t_k,
+                            $in,
+                            &wt,
+                            $out,
+                            m,
+                            $n,
+                            $k,
+                            stream,
+                        )?
+                    }
                     Some(wt) if self.w4a16_gemm_t_m128_k.0 != 0 => ops::w4a16_gemm_n128_m128(
                         ctx.gpu,
                         self.w4a16_gemm_t_m128_k,

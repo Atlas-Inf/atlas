@@ -110,6 +110,26 @@ impl Qwen3SsmLayer {
                         h,
                         stream,
                     )
+                } else if ctx.levers.gdn_fp8_decode
+                    && self.dense_gemv_fp8w_k.0 != 0
+                    && let Some(ref fp8w) = self.qkvz_fp8w_rowwise
+                    && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow
+                {
+                    // Per-row-FP8 decode copy (ATLAS_GDN_FP8_DECODE): half
+                    // the BF16 weight bytes for the serial-decode GEMV.
+                    ops::dense_gemv_fp8w(
+                        ctx.gpu,
+                        self.dense_gemv_fp8w_k,
+                        normed,
+                        &crate::weight_map::Fp8DenseWeight {
+                            weight: fp8w.weight,
+                            row_scale: fp8w.row_scale,
+                        },
+                        deinterleaved,
+                        qkvz_size,
+                        h,
+                        stream,
+                    )
                 } else {
                     ops::dense_gemv(
                         ctx.gpu,
@@ -430,16 +450,38 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if let Some(ref dense_out) = self.out_proj_dense {
-            ops::dense_gemv(
-                ctx.gpu,
-                self.dense_gemv_k,
-                normed_out,
-                dense_out,
-                out,
-                h,
-                value_dim as u32,
-                stream,
-            )?;
+            if ctx.levers.gdn_fp8_decode
+                && self.dense_gemv_fp8w_k.0 != 0
+                && let Some(ref fp8w) = self.out_proj_fp8w_rowwise
+                && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow
+            {
+                // Per-row-FP8 decode copy (ATLAS_GDN_FP8_DECODE): half the
+                // BF16 weight bytes for the serial-decode GEMV.
+                ops::dense_gemv_fp8w(
+                    ctx.gpu,
+                    self.dense_gemv_fp8w_k,
+                    normed_out,
+                    &crate::weight_map::Fp8DenseWeight {
+                        weight: fp8w.weight,
+                        row_scale: fp8w.row_scale,
+                    },
+                    out,
+                    h,
+                    value_dim as u32,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_k,
+                    normed_out,
+                    dense_out,
+                    out,
+                    h,
+                    value_dim as u32,
+                    stream,
+                )?;
+            }
         } else {
             ops::w4a16_decode_gemv(
                 ctx.gpu,

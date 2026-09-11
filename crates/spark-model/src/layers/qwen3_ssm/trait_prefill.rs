@@ -25,7 +25,6 @@ impl Qwen3SsmLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let k = num_tokens as u32;
         let bf16 = 2usize;
-        let fp32 = 4usize;
 
         // Per-SSM-layer-prefill counter — used by ATLAS_GDN_DUMP hooks
         // to attribute a captured intermediate to a specific SSM layer
@@ -84,7 +83,7 @@ impl Qwen3SsmLayer {
         super::debug::maybe_dump_gdn_buf(
             ctx.gpu,
             hidden,
-            (num_tokens - 1) * h * fp32,
+            (num_tokens - 1) * h * bf16,
             h,
             ssm_layer_idx,
             "pre_norm",

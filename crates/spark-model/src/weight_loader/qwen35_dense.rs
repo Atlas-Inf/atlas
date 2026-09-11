@@ -967,6 +967,13 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         // scale allocs (weight bytes are store-owned, not freed).
                         gpu.free(qkv_f.row_scale)?;
                         gpu.free(z_f.row_scale)?;
+                        // The concat duplicated qkv+z into `qkvz_f` — the store's
+                        // in_proj_qkv / in_proj_z weight buffers are now dead and
+                        // reclaimable (~83MB/layer × 48 ≈ 4GB on Strix UMA, where
+                        // the resident footprint gates the KV budget). out_proj is
+                        // NOT freed: `out_f` references the live store buffer.
+                        store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight"))?;
+                        store.reclaim(gpu, &format!("{la}.in_proj_z.weight"))?;
                         let ssm = SsmWeights {
                             in_proj_qkvz: DenseWeight {
                                 weight: spark_runtime::gpu::DevicePtr::NULL,
@@ -1120,7 +1127,8 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // way; the NVFP4 build continues underneath because decode
                     // still needs it — `w8a16_gemv` cannot index a per-row
                     // scale. See weight_loader/qwen35_dense/rowwise_fp8.rs.
-                    let rowwise_gdn = rowwise_fp8::rowwise_fp8_enabled()
+                    let rowwise_gdn = (rowwise_fp8::rowwise_fp8_enabled()
+                        || std::env::var("ATLAS_GDN_FP8_DECODE").ok().as_deref() == Some("1"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.in_proj_qkv"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.in_proj_z"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.out_proj"));
@@ -1294,6 +1302,27 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             gpu,
                         )?;
                         layer.out_proj_dense = Some(out_proj_dense);
+                        // ATLAS_GDN_FP8_DECODE: also install the checkpoint's
+                        // native per-row FP8 weights (loaded above, before
+                        // `load_ssm_proj` consumed the store tensors) for
+                        // DECODE only. Prefill keeps the BF16 dequant (the
+                        // GDN precision policy above); decode then reads HALF
+                        // the weight bytes through the `dense_gemv_fp8w`
+                        // family — with zero requant error, since the FP8 on
+                        // disk is the source the BF16 dequant was made from.
+                        if std::env::var("ATLAS_GDN_FP8_DECODE").ok().as_deref()
+                            == Some("1")
+                            && qkvz_rowwise.is_some()
+                        {
+                            layer.set_fp8_rowwise_prefill_weights(
+                                qkvz_rowwise,
+                                out_proj_rowwise,
+                            );
+                            tracing::info!(
+                                "SSM[{lp}] ATLAS_GDN_FP8_DECODE: qkvz + out_proj \
+                                 native per-row FP8 decode copies installed"
+                            );
+                        }
                         tracing::info!(
                             "SSM[{lp}] ATLAS_GDN_BF16_WEIGHTS: qkvz + out_proj kept BF16 \
                              (≥FP8; NVFP4 requant skipped)"

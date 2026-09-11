@@ -142,6 +142,12 @@ pub(super) fn load_sharded(
         }
 
         // Drop mmap before evicting page cache — releases the mapping first.
+        // On Windows UMA the mapped file pages stay resident and count as
+        // GPU-used; discard them explicitly (POSIX_FADV_DONTNEED equivalent).
+        #[cfg(target_os = "windows")]
+        {
+            super::super::evict_page_cache_range(mmap.as_ptr(), mmap.len());
+        }
         drop(tensors);
         drop(mmap);
         evict_page_cache(&file);

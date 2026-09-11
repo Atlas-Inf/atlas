@@ -21,16 +21,25 @@ pub struct PromptLevers {
     /// signatures instead of embedding the raw JSON. Default `false`, which is
     /// the byte-identical pre-TSCG path.
     pub tscg: bool,
+    /// The checkpoint template renders tool definitions/examples. Atlas still
+    /// emits API-level `tool_choice` policy instructions.
+    pub template_owns_tool_definitions: bool,
 }
 
 impl PromptLevers {
     /// Every lever off — the unmodified JSON path. Used by the parser unit
     /// tests, which would otherwise need a `[behavior]` table to render a
     /// prompt.
-    pub const OFF: Self = Self { tscg: false };
+    pub const OFF: Self = Self {
+        tscg: false,
+        template_owns_tool_definitions: false,
+    };
 
-    pub fn new(tscg: bool) -> Self {
-        Self { tscg }
+    pub fn new(tscg: bool, template_owns_tool_definitions: bool) -> Self {
+        Self {
+            tscg,
+            template_owns_tool_definitions,
+        }
     }
 }
 
@@ -41,15 +50,19 @@ mod tests {
     #[test]
     fn off_is_the_default_and_the_json_path() {
         assert_eq!(PromptLevers::default(), PromptLevers::OFF);
-        const { assert!(!PromptLevers::OFF.tscg) };
+        const {
+            assert!(!PromptLevers::OFF.tscg);
+            assert!(!PromptLevers::OFF.template_owns_tool_definitions);
+        }
     }
 
     #[test]
     fn two_models_can_disagree_within_one_process() {
         // The property the `OnceLock<bool>` could not have: `set_tscg_enabled`
         // was idempotent, so the second model to load kept the first's answer.
-        let a = PromptLevers::new(true);
-        let b = PromptLevers::new(false);
+        let a = PromptLevers::new(true, false);
+        let b = PromptLevers::new(false, true);
         assert!(a.tscg && !b.tscg);
+        assert!(!a.template_owns_tool_definitions && b.template_owns_tool_definitions);
     }
 }
