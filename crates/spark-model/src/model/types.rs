@@ -100,6 +100,12 @@ pub struct TransformerModel {
     pub(super) kv_cache: Mutex<PagedKvCache>,
     pub(super) graph_runtime: Arc<spark_runtime::graph_runtime::GraphRuntime>,
     pub(super) prefill_graph_veto: bool,
+    /// Counts capture-eligible prefills. The first one runs eagerly: kernels
+    /// the prefill body resolves lazily (the FP8 GEMM family resolves through
+    /// `op_cache` on first use) would otherwise be looked up *inside* capture,
+    /// which the capture-safety gate rejects. One eager pass warms that cache
+    /// so the second prefill can be captured.
+    pub(super) prefill_graph_warmup: std::sync::atomic::AtomicUsize,
     /// OR of every layer's [`TransformerLayer::decode_graph_unsupported`],
     /// resolved once at construction: a layer whose decode can never be
     /// captured keeps the whole model eager.

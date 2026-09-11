@@ -94,6 +94,23 @@ impl TransformerModel {
                 "model calibration or diagnostics suppress graph capture",
             );
         }
+        // Warm the op cache with one eager pass before the first capture. The
+        // prefill body resolves some kernels lazily (`op_cache.kernel`), and a
+        // dynamic lookup inside capture is rejected by the capture-safety gate
+        // — so the first capture-eligible prefill must run eagerly. Nothing
+        // executes during capture, so the eager pass is the only side effect,
+        // and it is exactly the work this request was going to do anyway.
+        if self
+            .prefill_graph_warmup
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            tracing::debug!(
+                target: "atlas::cuda_graph",
+                "prefill graph warmup: first capture-eligible prefill runs eagerly"
+            );
+            return None;
+        }
         let slot = seq.ssm_slot_idx().unwrap_or(seq.slot_idx) as u32;
         match self.graph_runtime.identity(
             GraphSegment::PrefillCompute,
@@ -370,6 +387,7 @@ impl TransformerModel {
                 | GraphFallbackReason::CacheQuota
                 | GraphFallbackReason::NegativeCached
                 | GraphFallbackReason::CaptureFailed
+                | GraphFallbackReason::CaptureBodyFailed
                 | GraphFallbackReason::InstantiateFailed
                 | GraphFallbackReason::MemoryPressure
         )

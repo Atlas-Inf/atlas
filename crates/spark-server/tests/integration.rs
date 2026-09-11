@@ -139,7 +139,9 @@ fn setup_model_with_mode(
     );
 
     let post_weight_free = gpu.free_memory()?;
-    let kv_budget = (post_weight_free as f64 * 0.85) as usize;
+    // This harness builds a second model in the same process; leave headroom
+    // for it rather than claiming the production 0.90 share.
+    let kv_budget = (post_weight_free as f64 * 0.5) as usize;
     let block_size = 16;
     let kv_config = spark_runtime::kv_cache::KvCacheConfig {
         block_size,
@@ -277,6 +279,10 @@ fn prefill_graph_matches_eager_for_model_matrix() -> Result<()> {
             &model_dir,
             spark_runtime::graph_runtime::GraphMode::Piecewise,
         )?;
+        // The first capture-eligible prefill is an eager warmup (it resolves
+        // kernels that would otherwise be looked up inside capture), the
+        // second captures, the third replays.
+        let _warmup = prefill_logits_bytes(graphed.as_ref(), &prompt)?;
         let capture_logits = prefill_logits_bytes(graphed.as_ref(), &prompt)?;
         let replay_logits = prefill_logits_bytes(graphed.as_ref(), &prompt)?;
         let capture_diff = max_bf16_abs_diff(&eager_logits, &capture_logits);

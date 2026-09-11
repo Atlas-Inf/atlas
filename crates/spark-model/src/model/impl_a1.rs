@@ -774,6 +774,7 @@ impl TransformerModel {
             kv_cache: Mutex::new(kv_cache),
             graph_runtime,
             prefill_graph_veto,
+            prefill_graph_warmup: std::sync::atomic::AtomicUsize::new(0),
             gpu,
             rms_norm_kernel,
             dense_gemv_kernel,
