@@ -921,7 +921,7 @@ impl BlockDiffusionDraftHead {
                             body()?;
                             return Ok(None);
                         }
-                        let managed = self.graph_runtime.register_captured(
+                        let managed = match self.graph_runtime.register_captured(
                             identity,
                             stream,
                             GraphCost {
@@ -932,7 +932,20 @@ impl BlockDiffusionDraftHead {
                             },
                             graph,
                             topology_dot,
-                        )?;
+                        ) {
+                            Ok(managed) => managed,
+                            // A runtime refusal (quota, stale key) must not fail
+                            // the request: run the body eagerly and leave the
+                            // slot as the eager sentinel. `register_captured`
+                            // already destroyed the refused handle.
+                            Err(error) => {
+                                tracing::warn!(
+                                    "DFlash propose graph not registered ({error}); running eager"
+                                );
+                                body()?;
+                                return Ok(None);
+                            }
+                        };
                         self.graph_runtime.launch(&managed, stream)?;
                         Ok(Some(managed.key().clone()))
                     };
