@@ -478,7 +478,30 @@ impl TransformerModel {
                     ) {
                         Ok(graph) => self.graph_runtime.launch(&graph, stream)?,
                         Err(error) => {
-                            return Err(anyhow::anyhow!("register decode graph: {error}"));
+                            // The capture RECORDED the body without executing it,
+                            // and the runtime refused to keep the graph (quota /
+                            // stale key). Fall back to eager rather than aborting
+                            // the request — same contract as the end_capture
+                            // failure arm below.
+                            tracing::warn!(
+                                "decode graph not registered ({error}) — re-running decode \
+                                 step eagerly and disabling graph capture"
+                            );
+                            self.suppress_graphs
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            for (li, l) in self.layers.iter().enumerate() {
+                                l.decode_prestage_rearm(seq.layer_states[li].as_mut());
+                            }
+                            self.decode_forward_body(
+                                hidden,
+                                residual,
+                                seq,
+                                &mut kv_cache,
+                                &ctx,
+                                false,
+                                false,
+                                stream,
+                            )?;
                         }
                     }
                 }
