@@ -100,7 +100,10 @@ fn run_gemm(
         .arg_u32(k as u32)
         .launch(0)?;
     gpu.synchronize(0)?;
-    println!("    kernel wall {:.3?} (M={m} N={n} K={k})", started.elapsed());
+    println!(
+        "    kernel wall {:.3?} (M={m} N={n} K={k})",
+        started.elapsed()
+    );
     let mut raw = vec![0u8; output_bytes];
     gpu.copy_d2h(c, &mut raw)?;
     Ok(raw
@@ -110,8 +113,14 @@ fn run_gemm(
 }
 
 fn cpu_reference(a_bits: &[u16], b_bits: &[u16], m: usize, n: usize, k: usize) -> Vec<f32> {
-    let a: Vec<f32> = a_bits.iter().map(|&x| bf16::from_bits(x).to_f32()).collect();
-    let b: Vec<f32> = b_bits.iter().map(|&x| bf16::from_bits(x).to_f32()).collect();
+    let a: Vec<f32> = a_bits
+        .iter()
+        .map(|&x| bf16::from_bits(x).to_f32())
+        .collect();
+    let b: Vec<f32> = b_bits
+        .iter()
+        .map(|&x| bf16::from_bits(x).to_f32())
+        .collect();
     let threads = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(16)

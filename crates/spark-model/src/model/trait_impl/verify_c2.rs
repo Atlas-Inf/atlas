@@ -228,8 +228,13 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // K4_DIAG per-layer timing (eager mode already syncs each layer —
+            // this just records it). Only compiled in when the env is set.
+            let mut k4_layer_us = k4_diag.then(Vec::new);
+
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
+                let t_layer = k4_diag.then(std::time::Instant::now);
 
                 if layer_type == LayerType::FullAttention {
                     if hss_engaged {
@@ -293,6 +298,11 @@ impl TransformerModel {
                 // No-op when DFlash is disabled.
                 self.try_dflash_capture(layer_idx, k - 1, stream)?;
 
+                if let (Some(t0), Some(ref mut us)) = (t_layer, k4_layer_us.as_mut()) {
+                    self.gpu.synchronize(stream)?;
+                    us.push((layer_idx, layer_type, t0.elapsed().as_micros() as u64));
+                }
+
                 // ATLAS_K4_DIAG checkpoint: surface an illegal access at the
                 // layer that raised it (eager mode only — sync is illegal
                 // under graph capture, and use_graphs is false when k4_diag).
@@ -301,6 +311,24 @@ impl TransformerModel {
                         "K4_DIAG: CUDA error after layer {layer_idx} ({layer_type:?}): {e:#}"
                     );
                 }
+            }
+
+            if let Some(us) = k4_layer_us {
+                let total: u64 = us.iter().map(|x| x.2).sum();
+                let attn: u64 = us
+                    .iter()
+                    .filter(|x| x.1 == LayerType::FullAttention)
+                    .map(|x| x.2)
+                    .sum();
+                let mut top: Vec<_> = us.iter().collect();
+                top.sort_by_key(|x| std::cmp::Reverse(x.2));
+                tracing::info!(
+                    "K4_DIAG layers: total={:.1}ms attn={:.1}ms ssm={:.1}ms top5={:?}",
+                    total as f64 / 1000.0,
+                    attn as f64 / 1000.0,
+                    (total - attn) as f64 / 1000.0,
+                    top.iter().take(5).map(|x| (x.0, x.2)).collect::<Vec<_>>()
+                );
             }
 
             // Final norm [4, H]

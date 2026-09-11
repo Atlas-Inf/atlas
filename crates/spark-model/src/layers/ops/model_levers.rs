@@ -31,6 +31,12 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ModelLevers {
     // ── SSM / GDN recurrence ──
+    /// Route GDN qkvz/out_proj decode through the checkpoint's native
+    /// per-row FP8 weights (`qkvz_fp8w_rowwise`/`out_proj_fp8w_rowwise`,
+    /// `dense_gemv_fp8w` family) — `ATLAS_GDN_FP8_DECODE=1`, opt-IN.
+    /// Requires the rowwise weights to be installed (per-row FP8 checkpoint +
+    /// tp=1); the dispatch sites additionally check `Fp8PerRow` before firing.
+    pub gdn_fp8_decode: bool,
     /// Keep GDN recurrent state in registers across the prefill chunk loop.
     /// Default ON (the fold that shipped in PR #369, −7.25 % wall); the env var
     /// is an opt-OUT, which is why the field is stored positively and the
@@ -132,6 +138,7 @@ impl ModelLevers {
             // negative and the field is positive: `!= "1"` means on.
             gdn_regresident: std::env::var("ATLAS_NO_GDN_REGRESIDENT").as_deref() != Ok("1"),
             gdn_batched_fla: opt_in("ATLAS_GDN_BATCHED_FLA"),
+            gdn_fp8_decode: opt_in("ATLAS_GDN_FP8_DECODE"),
             // Opt-OUT — these three ship ON.
             gdn_wy17: opt_out("ATLAS_GDN_WY17"),
             gdn_wyn: opt_out("ATLAS_GDN_WYN"),

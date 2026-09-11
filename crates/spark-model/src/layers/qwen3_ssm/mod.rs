@@ -54,8 +54,10 @@ pub struct Qwen3SsmLayer {
     /// `w8a16_gemv` in `ssm_forward.rs` and `trait_decode_batched.rs`, which
     /// index the scale as a `[N/128, K/128]` block grid. A per-row buffer is
     /// SMALLER than that index space, so it would not fault — it would return
-    /// plausible garbage. Only the row-wise cuBLASLt prefill arm reads these;
-    /// decode keeps the NVFP4 copy.
+    /// plausible garbage. Read by the row-wise cuBLASLt prefill arm, and —
+    /// when `ATLAS_GDN_FP8_DECODE=1` — by the per-row `dense_gemv_fp8w`
+    /// decode family (the format tag distinguishes them from the
+    /// block-scaled `w8a16_*` arms).
     qkvz_fp8w_rowwise: Option<Fp8Weight>,
     out_proj_fp8w_rowwise: Option<Fp8Weight>,
     /// Tier-1c keep-packed ternary Q2_0 fused in_proj_qkvz (`ATLAS_GGUF_NATIVE_Q2`).
@@ -90,6 +92,15 @@ pub struct Qwen3SsmLayer {
     /// K=2 verify: batched (M=2) BF16 GDN in_proj_qkvz — one weight pass for
     /// both verify tokens instead of two M=1 `dense_gemv` reads.
     dense_gemv_batch2_k: KernelHandle,
+    /// M<=8 batched BF16 GEMV (dense_gemv_bf16_batchm): one weight pass for
+    /// all verify rows. `KernelHandle(0)` on kernel sets that lack it →
+    /// callers keep the per-token `dense_gemv` / tile-GEMM fallback.
+    dense_gemv_batchm_k: KernelHandle,
+    /// Per-row-FP8 GEMV siblings for `qkvz_fp8_dense`/`out_proj_fp8_dense`:
+    /// M=1 `dense_gemv_fp8w` and the M<=8 batched `dense_gemv_fp8w_batchm`.
+    /// `KernelHandle(0)` on kernel sets that lack them → BF16 decode path.
+    dense_gemv_fp8w_k: KernelHandle,
+    dense_gemv_fp8w_batchm_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     w4a16_gemv_sw_k: KernelHandle,
@@ -463,6 +474,7 @@ fn ssm_m128_min_m() -> Option<u32> {
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
+mod fla_dispatch;
 pub mod gdn_flags;
 mod init;
 mod init_fp8;

@@ -82,7 +82,14 @@ pub fn gdn_prefill_fla(
     // L aliases the kk Gram (disjoint triangles) — one C*C*4 buffer, not two.
     let smem_wu = C * kd * 2 + C * C * 4 + C * 4;
     let smem_dh = 2 * (C * (2 * kd + vd) * 2) + 2 * C * 4 + 2 * (C + 1) * 4;
-    let smem_fo = C * kd * 2 + C * kd * 2 + C * C * 4 + C * vd * 2 + kd * vd * 2 + 2 * C * 4;
+    // The gfx1151 fwd_o port drops the S_c staging (32KB bf16) and the ucb copy
+    // (16KB) — both are read from global — keeping sq + sk/o1 + kq + gc/egc ≈
+    // 48.5KB, under RDNA3.5's 64KB LDS cap. The full layout would fail to launch.
+    let smem_fo = if cfg!(atlas_scale) {
+        C * kd * 2 + C * kd * 2 + C * C * 4 + 2 * C * 4
+    } else {
+        C * kd * 2 + C * kd * 2 + C * C * 4 + C * vd * 2 + kd * vd * 2 + 2 * C * 4
+    };
 
     let mut t0: Option<std::time::Instant> = if profile {
         gpu.synchronize(stream)?;
@@ -162,8 +169,12 @@ pub fn gdn_prefill_fla(
     // comparison on a single prompt caught this. A drift too small to change one
     // trajectory still moved BFCL by 1.4 points across 995 samples. Use the
     // ssm-poisoning tripwire before trusting any change to this kernel.
+    // atlas_scale (gfx1151): the ksplit fallback asks for ~99KB dynamic smem,
+    // which cannot launch under the 64KB LDS cap — a resolving fused handle is
+    // always chosen there, so the ATLAS_GDN_VTILE=0 A/B knob cannot strand the
+    // dispatch on an unlaunchable kernel.
     let use_fused = k_chunk_delta_h_fused.0 != 0
-        && std::env::var("ATLAS_GDN_VTILE").ok().as_deref() != Some("0");
+        && (cfg!(atlas_scale) || std::env::var("ATLAS_GDN_VTILE").ok().as_deref() != Some("0"));
     let use_tcvb = !use_fused
         && k_chunk_delta_h_tc_vblock.0 != 0
         && std::env::var("ATLAS_GDN_TC_VBLOCK").ok().as_deref() == Some("1");

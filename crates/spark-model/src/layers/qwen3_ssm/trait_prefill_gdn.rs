@@ -98,6 +98,30 @@ impl Qwen3SsmLayer {
         // smem-H fast paths are a Blackwell-only optimization. NVIDIA (cfg
         // unset) takes the full ladder below unchanged.
         if cfg!(atlas_scale) {
+            // FLA chunked path (recompute_wu → chunk_delta_h_vfused → fwd_o):
+            // the HIP-ported kernels keep state in registers/small smem, unlike
+            // the smem-H variants that exceed the 64KB LDS cap. gdn_exact_replay
+            // stays on split4 (see fla_dispatch.rs).
+            if self.fla_gdn_prefill_atlas_scale(
+                ctx,
+                h_state,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                gate_ptr,
+                beta_ptr,
+                gdn_bufs.output,
+                total,
+                nk,
+                nv,
+                kd,
+                vd,
+                conv_dim,
+                gb_stride,
+                stream,
+            )? {
+                return Ok(());
+            }
             return ops::gdn_prefill_split4(
                 ctx.gpu,
                 self.gdn_prefill_split4_k,

@@ -12,11 +12,21 @@ use super::*;
 /// is only reachable from that eager path.
 fn k4_diag_checkpoint(ctx: &ForwardContext, phase: &str, stream: u64) -> Result<()> {
     let on = ctx.levers.k4_diag;
-    if on
-        && !ctx.graph_capture
-        && let Err(e) = ctx.gpu.synchronize(stream)
-    {
-        anyhow::bail!("K4_DIAG: CUDA error after GDN phase `{phase}`: {e:#}");
+    if on && !ctx.graph_capture {
+        use std::cell::Cell;
+        thread_local! {
+            static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+        }
+        if let Err(e) = ctx.gpu.synchronize(stream) {
+            anyhow::bail!("K4_DIAG: CUDA error after GDN phase `{phase}`: {e:#}");
+        }
+        let now = std::time::Instant::now();
+        let prev = LAST.replace(Some(now));
+        if let Some(prev) = prev {
+            tracing::info!("K4_DIAG {phase}: {:.0}us", (now - prev).as_micros() as f64);
+        } else {
+            tracing::info!("K4_DIAG {phase}: (first)");
+        }
     }
     Ok(())
 }
@@ -234,6 +244,30 @@ impl Qwen3SsmLayer {
                     )?;
                 }
             }
+        } else if (2..=8).contains(&num_tokens)
+            && ctx.levers.gdn_fp8_decode
+            && self.dense_gemv_fp8w_batchm_k.0 != 0
+            && let Some(ref fp8w) = self.qkvz_fp8w_rowwise
+            && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow
+        {
+            // Per-row-FP8 decode (ATLAS_GDN_FP8_DECODE): one pass over the
+            // native FP8 weight serves all verify rows — half the BF16 copy's
+            // bytes, no requant (the on-disk FP8 is the BF16 dequant's source).
+            ops::dense_gemv_fp8w_batchm(
+                ctx.gpu,
+                self.dense_gemv_fp8w_batchm_k,
+                normed,
+                &crate::weight_map::Fp8DenseWeight {
+                    weight: fp8w.weight,
+                    row_scale: fp8w.row_scale,
+                },
+                proj_dst,
+                num_tokens as u32,
+                qkvz_size as u32,
+                h as u32,
+                qkvz_size as u32,
+                stream,
+            )?;
         } else if (5..=8).contains(&num_tokens)
             && self.w4a16_batchm.kernel(num_tokens as u32).0 != 0
             && let Some(ref nvfp4) = self.qkvz_nvfp4
@@ -300,6 +334,14 @@ impl Qwen3SsmLayer {
             }
         } else if num_tokens == 4 {
             if let Some(ref nvfp4) = self.qkvz_nvfp4 {
+                if ctx.levers.k4_diag {
+                    tracing::info!(
+                        "K4_DIAG qkvz==4 nvfp4 arm: batchm handle={:#x} n={} k={}",
+                        self.w4a16_batchm.kernel(4).0,
+                        qkvz_size,
+                        h
+                    );
+                }
                 ops::w4a16_gemv_batchm(
                     ctx.gpu,
                     self.w4a16_batchm.kernel(num_tokens as u32),
@@ -312,6 +354,12 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             } else if let Some(ref fp8w) = self.qkvz_fp8w {
+                if ctx.levers.k4_diag {
+                    tracing::info!(
+                        "K4_DIAG qkvz==4 fp8w arm: batch4 handle={:#x}",
+                        self.w8a16_gemv_batch4_k.0
+                    );
+                }
                 ops::w8a16_gemv_batch4(
                     ctx.gpu,
                     self.w8a16_gemv_batch4_k,
@@ -325,17 +373,39 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             } else {
-                for t in 0..4u32 {
-                    ops::dense_gemv(
+                if ctx.levers.k4_diag {
+                    tracing::info!("K4_DIAG qkvz==4 SERIAL dense_gemv arm (nvfp4=None fp8w=None)");
+                }
+                if self.dense_gemv_batchm_k.0 != 0 {
+                    // One weight pass for all 4 rows — the BF16 twin of the
+                    // NVFP4 batchm tier above. ATLAS_GDN_BF16_WEIGHTS
+                    // checkpoints keep `in_proj_qkvz` BF16 (NVFP4 requant
+                    // skipped for accuracy), so this is their K=4 fast path.
+                    ops::dense_gemv_batchm(
                         ctx.gpu,
-                        self.dense_gemv_k,
-                        normed.offset(t as usize * h * bf16),
+                        self.dense_gemv_batchm_k,
+                        normed,
                         &self.ssm.in_proj_qkvz,
-                        proj_dst.offset(t as usize * qkvz_size * bf16),
+                        proj_dst,
+                        num_tokens as u32,
                         qkvz_size as u32,
                         h as u32,
+                        qkvz_size as u32,
                         stream,
                     )?;
+                } else {
+                    for t in 0..4u32 {
+                        ops::dense_gemv(
+                            ctx.gpu,
+                            self.dense_gemv_k,
+                            normed.offset(t as usize * h * bf16),
+                            &self.ssm.in_proj_qkvz,
+                            proj_dst.offset(t as usize * qkvz_size * bf16),
+                            qkvz_size as u32,
+                            h as u32,
+                            stream,
+                        )?;
+                    }
                 }
             }
         } else if num_tokens == 3 {
@@ -348,6 +418,19 @@ impl Qwen3SsmLayer {
                     proj_dst,
                     qkvz_size as u32,
                     h as u32,
+                    stream,
+                )?;
+            } else if self.dense_gemv_batchm_k.0 != 0 {
+                ops::dense_gemv_batchm(
+                    ctx.gpu,
+                    self.dense_gemv_batchm_k,
+                    normed,
+                    &self.ssm.in_proj_qkvz,
+                    proj_dst,
+                    num_tokens as u32,
+                    qkvz_size as u32,
+                    h as u32,
+                    qkvz_size as u32,
                     stream,
                 )?;
             } else {
@@ -538,6 +621,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         }
+        k4_diag_checkpoint(ctx, "2:qkvz_proj", stream)?;
         if !self.sequential_qkvz {
             for t in 0..(num_tokens as u32) {
                 let src = proj_dst.offset(t as usize * qkvz_size * bf16);
@@ -916,13 +1000,51 @@ impl Qwen3SsmLayer {
         // ── 9. Output projection → [K, H] ──
         let out_proj_buf = ctx.buffers.moe_output(); // [K, H] BF16
         if let Some(ref dense_out) = self.out_proj_dense {
-            if dense_out_proj_uses_batch2(num_tokens) {
+            if num_tokens <= 8
+                && ctx.levers.gdn_fp8_decode
+                && self.dense_gemv_fp8w_batchm_k.0 != 0
+                && let Some(ref fp8w) = self.out_proj_fp8w_rowwise
+                && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow
+            {
+                // Per-row-FP8 decode copy (ATLAS_GDN_FP8_DECODE): half the
+                // BF16 tile-GEMM's weight bytes at verify widths.
+                ops::dense_gemv_fp8w_batchm(
+                    ctx.gpu,
+                    self.dense_gemv_fp8w_batchm_k,
+                    normed_out_buf,
+                    &crate::weight_map::Fp8DenseWeight {
+                        weight: fp8w.weight,
+                        row_scale: fp8w.row_scale,
+                    },
+                    out_proj_buf,
+                    num_tokens as u32,
+                    h as u32,
+                    value_dim as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else if dense_out_proj_uses_batch2(num_tokens) {
                 ops::dense_gemv_batch2(
                     ctx.gpu,
                     self.dense_gemv_batch2_k,
                     normed_out_buf,
                     dense_out,
                     out_proj_buf,
+                    h as u32,
+                    value_dim as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else if num_tokens <= 8 && self.dense_gemv_batchm_k.0 != 0 {
+                // M<=8 verify: a 128-row tile GEMM is ~97% padding at M=4 —
+                // the batched GEMV streams the BF16 weight once for all rows.
+                ops::dense_gemv_batchm(
+                    ctx.gpu,
+                    self.dense_gemv_batchm_k,
+                    normed_out_buf,
+                    dense_out,
+                    out_proj_buf,
+                    num_tokens as u32,
                     h as u32,
                     value_dim as u32,
                     h as u32,
@@ -1202,6 +1324,7 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        k4_diag_checkpoint(ctx, "10r:post_attn_norm", stream)?;
         if num_tokens == 3 {
             // Fused K=3 MoE: 5 kernel launches instead of 15
             self.ffn.forward_k3(normed2_base, ctx, stream)?;
@@ -1241,6 +1364,7 @@ impl Qwen3SsmLayer {
             // the 64-layer dense FFN stack at M=4 vs the ~31 ms
             // weight-traffic floor this path hits. Falls through to
             // forward_prefill when unavailable (MoE / missing kernel).
+            k4_diag_checkpoint(ctx, "10k:ffn_km", stream)?;
             let moe_out = ctx.buffers.moe_output();
             ops::residual_add(
                 ctx.gpu,
@@ -1250,6 +1374,7 @@ impl Qwen3SsmLayer {
                 (num_tokens * h) as u32,
                 stream,
             )?;
+            k4_diag_checkpoint(ctx, "10z:residual_add", stream)?;
         } else if self.ffn.is_dense() {
             // WIDE-VERIFY BATCHED DENSE FFN (DFlash γ=16, num_tokens=17). This
             // is the MAJORITY layer type (GDN/SSM) on the hybrid 27B, so its

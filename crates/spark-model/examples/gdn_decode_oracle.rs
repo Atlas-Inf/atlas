@@ -40,7 +40,9 @@ fn up_f32(g: &dyn GpuBackend, d: &[f32]) -> Result<DevicePtr> {
 fn dn_f32(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<f32>> {
     let mut b = vec![0u8; n * 4];
     g.copy_d2h(p, &mut b)?;
-    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    Ok(b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 fn main() -> Result<()> {
@@ -57,7 +59,9 @@ fn main() -> Result<()> {
     let vw: Vec<f32> = (0..NV * VD).map(|_| rng.r(-0.05, 0.05) as f32).collect();
     let gate: Vec<f32> = (0..NV).map(|_| rng.r(0.80, 0.99) as f32).collect();
     let beta: Vec<f32> = (0..NV).map(|_| rng.r(0.0, 1.0) as f32).collect();
-    let h0: Vec<f32> = (0..NV * KD * VD).map(|_| rng.r(-0.01, 0.01) as f32).collect();
+    let h0: Vec<f32> = (0..NV * KD * VD)
+        .map(|_| rng.r(-0.01, 0.01) as f32)
+        .collect();
 
     // CPU SSOT: one step.
     let mut s: Vec<f64> = h0.iter().map(|&x| x as f64).collect();
@@ -145,4 +149,3 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
-
