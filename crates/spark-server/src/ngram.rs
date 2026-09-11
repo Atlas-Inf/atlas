@@ -219,11 +219,14 @@ impl NgramProposer {
             let d_take = drafts.len().min(need);
             key_ctx.extend_from_slice(&drafts[drafts.len() - d_take..]);
             let h_take = need - d_take;
-            key_ctx.splice(0..0, all_tokens[all_tokens.len() - h_take..].iter().copied());
-            if let Some(cands) = self.table.get(&hash_ngram(&key_ctx)) {
-                if let Some(&(tok, _)) = cands.iter().max_by_key(|(_, c)| *c) {
-                    return Some(tok);
-                }
+            key_ctx.splice(
+                0..0,
+                all_tokens[all_tokens.len() - h_take..].iter().copied(),
+            );
+            if let Some(cands) = self.table.get(&hash_ngram(&key_ctx))
+                && let Some(&(tok, _)) = cands.iter().max_by_key(|(_, c)| *c)
+            {
+                return Some(tok);
             }
         }
         None

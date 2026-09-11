@@ -306,11 +306,7 @@ pub fn step_ngram_verify(
             .decode_verify_graphed_k3(&[tokens[0], tokens[1], tokens[2]], &mut a.seq, 0)
             .map(|r| r.to_vec()),
         _ => model
-            .decode_verify_graphed_k4(
-                &[tokens[0], tokens[1], tokens[2], tokens[3]],
-                &mut a.seq,
-                0,
-            )
+            .decode_verify_graphed_k4(&[tokens[0], tokens[1], tokens[2], tokens[3]], &mut a.seq, 0)
             .map(|r| r.to_vec()),
     }
     .unwrap_or_else(|e| {
@@ -352,7 +348,7 @@ pub fn step_ngram_verify(
     }
 
     if na < nd {
-        // Rewind the rejected tail: seq_len and tokens roll back 
+        // Rewind the rejected tail: seq_len and tokens roll back
         // rows, then commit_accepted_prefix rewinds the aux (QSA indexer /
         // PLE carry) by the same count and re-checkpoints.
         a.seq.seq_len -= nd - na;

@@ -293,7 +293,9 @@ pub fn run(
     let mut ngram_proposer = if use_ngram_speculative {
         // Chains cap at the model's verify width (mHC highway has MoE arms
         // for K=2/3 only → flash-next verifies K=3 max) and at K=4 hard.
-        let chain_cap = num_drafts.min(model.verify_max_drafts().unwrap_or(3)).min(3);
+        let chain_cap = num_drafts
+            .min(model.verify_max_drafts().unwrap_or(3))
+            .min(3);
         Some(NgramProposer::new(4).with_chain_and_cache(chain_cap, ngram_cache_path))
     } else {
         None
@@ -788,9 +790,7 @@ pub fn run(
             // were never forwarded, so discarding them needs no rewind.
             if use_ngram_speculative
                 && active.len() == 1
-                && verify_ctx_limit.is_some_and(|lim| {
-                    active[0].seq.seq_len >= lim
-                })
+                && verify_ctx_limit.is_some_and(|lim| active[0].seq.seq_len >= lim)
                 && !active[0].pending_drafts.is_empty()
             {
                 active[0].pending_drafts.clear();
@@ -800,8 +800,7 @@ pub fn run(
                 && active.len() == 1
                 && spec_slots_covered
                 && active[0].grammar_state.is_none()
-                && verify_ctx_limit
-                    .is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
+                && verify_ctx_limit.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
