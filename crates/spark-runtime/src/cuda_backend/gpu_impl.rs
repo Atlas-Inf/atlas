@@ -40,7 +40,9 @@ use super::{
     AtlasCudaBackend, cuMemAlloc_v2, cuMemAllocManaged, cuMemFree_v2, cuMemGetInfo_v2,
     cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2, cuStreamSynchronize,
 };
-use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use crate::gpu::{
+    ConditionalGraphTemplate, ConditionalNodeKind, DevicePtr, GpuBackend, GraphHandle, KernelHandle,
+};
 
 /// D2H call counter + one-shot caller identification
 /// (`ATLAS_D2H_TRACE=<N>`: log a backtrace on the Nth call, and the running
@@ -105,6 +107,7 @@ fn warn_pinned_transient_source() {
 
 impl GpuBackend for AtlasCudaBackend {
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
+        self.ensure_capture_safe("device allocation")?;
         let mut dptr: u64 = 0;
         let status = unsafe { cuMemAlloc_v2(&mut dptr, bytes) };
         if status != 0 {
@@ -123,6 +126,7 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn alloc_managed(&self, bytes: usize) -> Result<DevicePtr> {
+        self.ensure_capture_safe("managed device allocation")?;
         let mut dptr: u64 = 0;
         const CU_MEM_ATTACH_GLOBAL: u32 = 0x1;
         let status = unsafe { cuMemAllocManaged(&mut dptr, bytes, CU_MEM_ATTACH_GLOBAL) };
@@ -140,6 +144,7 @@ impl GpuBackend for AtlasCudaBackend {
         if ptr.is_null() {
             return Ok(());
         }
+        self.ensure_capture_safe("device free")?;
         // Off the ledger BEFORE the free: an entry that survives a successful
         // free would be double-freed at teardown. On a real failure, restore
         // ownership to the backend ledger so `sweep_unreleased` is the final
@@ -169,15 +174,18 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
+        self.ensure_capture_safe("synchronous host-to-device copy")?;
         AtlasCudaBackend::copy_h2d_impl(self, src, dst)
     }
 
     fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
+        self.ensure_capture_safe("synchronous device-to-host copy")?;
         d2h_trace_tick();
         AtlasCudaBackend::copy_d2h_impl(self, src, dst)
     }
 
     fn copy_d2h_on_stream(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
+        self.ensure_capture_safe("blocking device-to-host copy")?;
         d2h_trace_tick();
         AtlasCudaBackend::copy_d2h_on_stream_impl(self, src, dst, stream)
     }
@@ -249,6 +257,7 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn synchronize(&self, stream: u64) -> Result<()> {
+        self.ensure_capture_safe("host stream synchronization")?;
         let status = unsafe { cuStreamSynchronize(stream) };
         if status != 0 {
             bail!("cuStreamSynchronize failed: {}", cuda_error_text(status));
@@ -274,6 +283,7 @@ impl GpuBackend for AtlasCudaBackend {
 
     #[track_caller]
     fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle> {
+        self.ensure_capture_safe("dynamic kernel lookup")?;
         // The DISPATCH SITE, not this line: `#[track_caller]` here and on the
         // trait declaration carries the `.kernel(…)` / `try_kernel(…)` caller's
         // `file:line` through, which is the only part of an unresolved-lookup
@@ -298,6 +308,7 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, stream: u64) -> Result<()> {
+        self.ensure_capture_safe("transient host-to-device copy")?;
         h2d_enqueue(src, dst, stream)?;
         // The trait promises the caller may drop `src` right now. From PAGEABLE
         // memory the driver already made that true by staging the bytes before
@@ -394,24 +405,133 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
+    fn graph_capabilities(&self) -> crate::graph_runtime::GraphCapabilities {
+        let conditional_nodes = self.conditional_nodes_supported_cu();
+        crate::graph_runtime::GraphCapabilities {
+            basic_graphs: true,
+            debug_dot: cfg!(not(atlas_scale)),
+            graph_upload: false,
+            conditional_nodes,
+            while_nodes: conditional_nodes,
+            native_serialization: false,
+        }
+    }
+
+    fn graph_environment(&self) -> Option<crate::graph_runtime::GraphEnvironment> {
+        match self.graph_environment_cu() {
+            Ok(environment) => Some(environment),
+            Err(error) => {
+                tracing::warn!("CUDA graph environment query failed: {error:#}");
+                None
+            }
+        }
+    }
+
+    fn create_conditional_graph(
+        &self,
+        kind: ConditionalNodeKind,
+        predicate: DevicePtr,
+        setter: KernelHandle,
+        body_count: usize,
+    ) -> Result<ConditionalGraphTemplate> {
+        self.create_conditional_graph_cu(kind, predicate, setter, body_count)
+    }
+    fn begin_conditional_branch(
+        &self,
+        template: &ConditionalGraphTemplate,
+        branch: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if self.graph_fault(super::graph_faults::GraphFaultPoint::Capture) {
+            bail!("injected CUDA conditional branch capture failure");
+        }
+        self.begin_capture_guard()?;
+        let result = self.begin_conditional_branch_cu(template, branch, stream);
+        if result.is_err() {
+            self.finish_capture_guard();
+        }
+        result
+    }
+    fn end_conditional_branch(
+        &self,
+        template: &ConditionalGraphTemplate,
+        branch: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if self.graph_fault(super::graph_faults::GraphFaultPoint::Instantiate) {
+            self.abort_capture_if_active_cu(stream);
+            self.finish_capture_guard();
+            bail!("injected CUDA conditional branch capture failure");
+        }
+        let result = self.end_conditional_branch_cu(template, branch, stream);
+        self.finish_capture_guard();
+        result
+    }
+    fn instantiate_conditional_graph(
+        &self,
+        template: &ConditionalGraphTemplate,
+        dot_path: Option<&std::path::Path>,
+    ) -> Result<GraphHandle> {
+        self.instantiate_conditional_graph_cu(template, dot_path)
+    }
+    fn destroy_conditional_graph_template(&self, template: &ConditionalGraphTemplate) {
+        self.destroy_conditional_graph_template_cu(template)
+    }
+
     fn begin_capture(&self, stream: u64) -> Result<()> {
-        self.begin_capture_cu(stream)
+        if self.graph_fault(super::graph_faults::GraphFaultPoint::Capture) {
+            bail!("injected CUDA graph capture failure");
+        }
+        self.begin_capture_guard()?;
+        let result = self.begin_capture_cu(stream);
+        if result.is_err() {
+            self.finish_capture_guard();
+        }
+        result
     }
     fn end_capture(&self, stream: u64) -> Result<GraphHandle> {
-        self.end_capture_cu(stream)
+        if self.graph_fault(super::graph_faults::GraphFaultPoint::Instantiate) {
+            self.abort_capture_if_active_cu(stream);
+            self.finish_capture_guard();
+            bail!("injected CUDA graph instantiation failure");
+        }
+        let result = self.end_capture_cu(stream);
+        self.finish_capture_guard();
+        result
+    }
+    fn end_capture_with_dot(
+        &self,
+        stream: u64,
+        dot_path: Option<&std::path::Path>,
+    ) -> Result<GraphHandle> {
+        if self.graph_fault(super::graph_faults::GraphFaultPoint::Instantiate) {
+            self.abort_capture_if_active_cu(stream);
+            self.finish_capture_guard();
+            bail!("injected CUDA graph instantiation failure");
+        }
+        let result = self.end_capture_with_dot_cu(stream, dot_path);
+        self.finish_capture_guard();
+        result
     }
 
     fn abort_capture_if_active(&self, stream: u64) {
-        self.abort_capture_if_active_cu(stream)
+        self.abort_capture_if_active_cu(stream);
+        self.finish_capture_guard();
     }
 
     fn launch_graph(&self, graph: GraphHandle, stream: u64) -> Result<()> {
+        self.ensure_capture_safe("graph launch")?;
+        if self.graph_fault(super::graph_faults::GraphFaultPoint::Replay) {
+            bail!("injected CUDA graph replay failure before submission");
+        }
         self.launch_graph_cu(graph, stream)
     }
     fn destroy_graph(&self, graph: GraphHandle) -> Result<()> {
+        self.ensure_capture_safe("graph destruction")?;
         self.destroy_graph_cu(graph)
     }
     fn memset(&self, ptr: DevicePtr, value: u8, bytes: usize) -> Result<()> {
+        self.ensure_capture_safe("synchronous memset")?;
         self.memset_cu(ptr, value, bytes)
     }
     fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, stream: u64) -> Result<()> {
@@ -423,16 +543,24 @@ impl GpuBackend for AtlasCudaBackend {
     fn free_memory(&self) -> Result<usize> {
         self.free_memory_cu()
     }
+    fn live_alloc_count(&self) -> usize {
+        self.live_alloc_len()
+    }
     fn sm_count(&self) -> Result<u32> {
         self.sm_count_cu()
     }
     fn create_stream(&self) -> Result<u64> {
+        self.ensure_capture_safe("stream creation")?;
         self.create_stream_cu()
     }
     fn bind_to_thread(&self) -> Result<()> {
         self.bind_to_thread_cu()
     }
     fn create_event(&self) -> Result<u64> {
+        self.ensure_capture_safe("event creation")?;
+        if self.graph_fault(super::graph_faults::GraphFaultPoint::Event) {
+            bail!("injected CUDA graph retirement-event failure");
+        }
         self.create_event_cu()
     }
     fn record_event(&self, event: u64, stream: u64) -> Result<()> {
@@ -442,9 +570,15 @@ impl GpuBackend for AtlasCudaBackend {
         self.stream_wait_event_cu(stream, event)
     }
     fn event_synchronize(&self, event: u64) -> Result<()> {
+        self.ensure_capture_safe("host event synchronization")?;
         self.event_synchronize_cu(event)
     }
+    fn event_query(&self, event: u64) -> Result<bool> {
+        self.ensure_capture_safe("host event query")?;
+        self.event_query_cu(event)
+    }
     fn destroy_event(&self, event: u64) -> Result<()> {
+        self.ensure_capture_safe("event destruction")?;
         self.destroy_event_cu(event)
     }
     fn host_ptr_to_device(&self, host: *mut u8) -> Result<DevicePtr> {
@@ -458,9 +592,11 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn alloc_host_pinned(&self, bytes: usize) -> Result<*mut u8> {
+        self.ensure_capture_safe("pinned host allocation")?;
         self.alloc_host_pinned_cu(bytes)
     }
     fn free_host_pinned(&self, ptr: *mut u8, _bytes: usize) -> Result<()> {
+        self.ensure_capture_safe("pinned host free")?;
         self.free_host_pinned_cu(ptr, _bytes)
     }
 }

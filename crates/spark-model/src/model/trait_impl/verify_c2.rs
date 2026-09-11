@@ -181,33 +181,27 @@ impl TransformerModel {
         // the K=2 path (verify_b.rs). Diagnostic only — default behavior is
         // byte-for-byte unchanged when the env is unset.
         let k4_diag = std::env::var("ATLAS_K4_DIAG").ok().as_deref() == Some("1");
-        // A layer whose decode keeps HOST-side per-sequence state cannot be
-        // captured: a replayed graph re-runs the kernels but NOT the Rust that
-        // maintains the counter beside them. The QSA indexer's `ingested`
-        // froze at the capture step while the sequence kept advancing, and the
-        // desync stayed invisible until a non-replayed path ran a
-        // `decode_select` again — at the MTP gate's batch-width switch, which
-        // failed with "decode at pos 34 but 26 tokens ingested". `decode_a`
-        // and `decode_a2` already apply this veto; the verify paths never did,
-        // because on this model they used to refuse before reaching a graph.
-        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
-        let use_graphs =
-            self.comm.is_none() && !hss_engaged && !lora_eager && !k4_diag && !layer_veto;
-
-        // PLE's host half (n-gram hash + NVMe fault-in + slot upload) for the
-        // WHOLE draft window, hoisted before capture/replay exactly as
-        // `decode_a` hoists the single decode token. Without it the verify
-        // forward has no staging to consume and falls back to a D2H readback,
-        // which invalidates a recording graph (901) — the "PLE: no
-        // host_token_ids ... capture-unsupported" refusal. #753 item B.
-        for (li, l) in self.layers.iter().enumerate() {
-            l.verify_prestage(
-                &tokens[..],
-                seq.layer_states[li].as_mut(),
-                self.gpu.as_ref(),
-                stream,
-            )?;
-        }
+        // Capture the multi-row verify under EP — ported verbatim from verify_c.rs (K=3),
+        // where it is ON by default since 2026-08-29 and the six probes are byte-identical
+        // to eager. Without this gate K=4 was eager-only under EP (`self.comm.is_some()`),
+        // so no K=4 arm was ever comparable to the graphed K=3 number.
+        //
+        // 🪤 Deliberately does NOT read `ATLAS_EP_GRAPHS`; see verify_c.rs for why the two
+        // are gated apart.
+        let ep_graphs = std::env::var("ATLAS_GLM_VERIFY_GRAPHS").ok().as_deref() != Some("0");
+        // A56 instrument (see verify_c.rs). Implies GRAPHS + NOCACHE.
+        let graph_trace = std::env::var("ATLAS_GLM_VERIFY_GRAPH_TRACE").is_ok_and(|v| v == "1");
+        let ep_graphs = ep_graphs || graph_trace;
+        let graph_eligible =
+            (self.comm.is_none() || ep_graphs) && !hss_engaged && !lora_eager && !k4_diag;
+        let graph_identity = graph_eligible
+            .then(|| {
+                self.verify_graph_identity(vec![seq.slot_idx as u32], vec![k as u32], k, vec![4])
+            })
+            .and_then(Result::ok);
+        let use_graphs = graph_identity.is_some();
+        let cache_graph = !graph_trace
+            && !std::env::var("ATLAS_GLM_VERIFY_GRAPH_NOCACHE").is_ok_and(|v| v == "1");
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -223,7 +217,7 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: None,
-            host_token_ids: Some(&tokens[..]),
+            host_token_ids: None,
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
@@ -231,26 +225,40 @@ impl TransformerModel {
 
         // ── Phase 2: CUDA graph capture / replay ──
 
-        let mut graph_cache = if use_graphs {
-            Some(self.verify4_graph.lock())
+        // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
+        let cached_for_slot = if cache_graph {
+            graph_identity
+                .as_ref()
+                .and_then(|identity| self.graph_runtime.lookup(identity).ok().flatten())
         } else {
             None
         };
-
-        // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
-        let cached_for_slot = graph_cache
-            .as_ref()
-            .and_then(|c| c.get(&seq.slot_idx).copied());
-        if let Some(graph) = cached_for_slot
-            && graph.0 != 0
-        {
-            self.gpu.launch_graph(graph, stream)?;
+        if let Some(graph) = &cached_for_slot {
+            // 🔴 BEFORE the replay, not after. The graph writes GLM-5.3's DSA indexer row
+            // from a device position with no host code in the loop, so past the DSA ceiling
+            // it writes one row off the end of the buffer and the `sync_replayed_step`
+            // reconcile below refuses one write too late — by then a sticky CUDA 700 has
+            // taken the whole serve down, not just this request. ANOMALIES A62.
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, k)?;
+            }
+            self.graph_runtime.launch(graph, stream)?;
+            // 🔴 ANOMALIES A56, K=4 half. A replay runs kernels and NOTHING else, so any
+            // layer keeping per-sequence bookkeeping on the HOST — GLM-5.3's DSA indexer
+            // cache length — must be reconciled here. RECONCILE to `seq_len + k`, not
+            // `+= k`: `decode_k` REWINDS to `seq_len` on entry. See verify_c.rs.
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, k)?;
+            }
         }
         let need_run = cached_for_slot.is_none();
         if need_run {
             let seq_lens_vec: Vec<usize> = (0..k).map(|t| seq.seq_len + t).collect();
             let block_tables_vec: Vec<Vec<u32>> = vec![seq.block_table.clone(); k];
 
+            if graph_trace {
+                spark_runtime::launch_trace::begin();
+            }
             if use_graphs {
                 self.gpu.begin_capture(stream)?;
             }
@@ -279,19 +287,17 @@ impl TransformerModel {
                             stream,
                         )?;
                     } else {
-                        // k ROWS of ONE sequence, not k sequences: per-sequence
-                        // aux state (the QSA indexer) must advance once per row
-                        // against this sequence's own state. See
-                        // `decode_multi_seq_rows`.
-                        let mut seq_state_arr: [&mut (dyn LayerState + 'static); 1] =
-                            [seq.layer_states[layer_idx].as_mut()];
-                        let row_owner = vec![0usize; k];
-                        layer.decode_multi_seq_rows(
+                        let mut dummy_states: Vec<Box<dyn LayerState>> = (0..k)
+                            .map(|_| layer.alloc_state(self.gpu.as_ref()))
+                            .collect::<Result<_>>()?;
+                        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
+                            dummy_states.iter_mut().map(|s| s.as_mut()).collect();
+                        layer.decode_multi_seq(
                             hidden,
                             residual,
                             k,
-                            &mut seq_state_arr,
-                            &row_owner,
+                            k,
+                            &mut refs,
                             &mut kv_cache,
                             &seq_lens_vec,
                             &block_tables_vec,
@@ -335,11 +341,8 @@ impl TransformerModel {
 
             // Final norm [4, H]
             let normed = self.buffers.norm_output();
-            ops::rms_norm(
-                self.gpu.as_ref(),
-                self.rms_norm_kernel,
+            self.final_norm_apply(
                 hidden,
-                &self.final_norm,
                 normed,
                 k as u32,
                 h as u32,
@@ -379,14 +382,34 @@ impl TransformerModel {
             }
 
             if use_graphs {
-                let graph = self.gpu.end_capture(stream)?;
+                let identity = graph_identity
+                    .as_ref()
+                    .expect("capture requires graph identity");
+                let topology_dot = self.graph_runtime.capture_dot_path(identity);
+                let graph = self
+                    .gpu
+                    .end_capture_with_dot(stream, topology_dot.as_deref())?;
                 if graph.0 != 0 {
                     tracing::info!("Captured CUDA graph for K=4 verify (slot={})", seq.slot_idx);
-                    if let Some(ref mut cache) = graph_cache {
-                        cache.insert(seq.slot_idx, graph);
+                    // BISECT HATCH (ATLAS_GLM_VERIFY_GRAPH_NOCACHE=1) — see verify_c.rs.
+                    let managed = self.graph_runtime.register_captured(
+                        identity.clone(),
+                        stream,
+                        self.model_graph_cost(),
+                        graph,
+                        topology_dot,
+                    )?;
+                    self.graph_runtime.launch(&managed, stream)?;
+                    if !cache_graph {
+                        self.graph_runtime.invalidate(
+                            &identity.key,
+                            spark_runtime::graph_runtime::GraphFallbackReason::DiagnosticActive,
+                        );
                     }
-                    self.gpu.launch_graph(graph, stream)?;
                 }
+            }
+            if graph_trace && let Some(report) = spark_runtime::launch_trace::end_and_diff(40) {
+                tracing::info!("A56 trace K=4 (this step vs previous): {}", report);
             }
         }
 

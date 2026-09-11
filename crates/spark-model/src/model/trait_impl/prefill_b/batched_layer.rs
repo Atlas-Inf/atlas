@@ -67,9 +67,7 @@ impl TransformerModel {
     /// `hidden_stacked` and `residual_stacked` are at the arena's
     /// `hidden_states()` / `residual()` pointers respectively, and
     /// contain N streams' tokens at offsets `b * chunk_len * H * dtype`.
-    /// `seqs` provides per-stream `SequenceState` for KV-write routing
-    /// and per-stream layer state (which is `EmptyLayerState` for
-    /// attention but kept in the slice for symmetry with SSM).
+    /// `batch_size` is the number of request segments in the stacked rows.
     /// `meta` is the per-call `BatchedAttnMetadata` from
     /// `stage_batched_attn_metadata`.
     pub(in crate::model) fn prefill_attn_batched_layer(
@@ -78,7 +76,7 @@ impl TransformerModel {
         layer_idx: usize,
         hidden_stacked: DevicePtr,
         residual_stacked: DevicePtr,
-        seqs: &mut [&mut SequenceState],
+        batch_size: usize,
         kv_cache: &mut PagedKvCache,
         kv_write_starts: &[usize],
         seq_lens_start: usize,
@@ -97,14 +95,9 @@ impl TransformerModel {
         // HDIM=512, HSS engaged, seq_len_start == 0); on Err the caller
         // (Phase 4b dispatch) should treat the whole batched path as
         // ineligible and fall back to per-stream prefill.
-        debug_assert_eq!(seqs.len() as u32, meta.batch_size);
+        debug_assert_eq!(batch_size as u32, meta.batch_size);
         let _ = (layer_idx, kv_write_starts);
         let num_tokens = meta.total_tokens as usize;
-        // Mut borrow on seqs is unused inside this branch (the batched
-        // attention call routes block-table info through meta.block_table_ptrs
-        // and seq mutations are not needed for attention prefill). Drop
-        // the borrow before calling.
-        let _ = seqs;
         layer.prefill_inner_batched_q12(
             hidden_stacked,
             residual_stacked,

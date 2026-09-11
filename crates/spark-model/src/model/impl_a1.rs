@@ -3,13 +3,12 @@
 #![allow(unused_imports, dead_code)]
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::block_mgmt::{
@@ -73,7 +72,9 @@ impl TransformerModel {
         vision_encoder: Option<crate::layers::VisionEncoder>,
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
+        graph_runtime_config: spark_runtime::graph_runtime::GraphRuntimeConfig,
     ) -> Result<Self> {
+        let gpu: Arc<dyn GpuBackend> = Arc::from(gpu);
         // `rms_norm_kernel` normalizes exactly one weight: `final_norm` (a
         // checkpoint tensor). Models that ship HF-vanilla norm weights load it
         // exactly and must use the vanilla kernel.
@@ -297,6 +298,17 @@ impl TransformerModel {
 
         // Fixed metadata stride for CUDA graph compatibility
         let max_blocks_per_seq = (max_seq_len / kv_cache.block_size() + 1) as u32;
+        let prefill_block_table_bytes = max_batch_size
+            .checked_mul(max_blocks_per_seq as usize)
+            .and_then(|entries| entries.checked_mul(std::mem::size_of::<u32>()))
+            .ok_or_else(|| anyhow::anyhow!("chunked prefill block-table arena size overflow"))?;
+        let prefill_block_tables = gpu.alloc(prefill_block_table_bytes.max(1))?;
+        let prefill_seq_lens = gpu.alloc(
+            max_batch_size
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| anyhow::anyhow!("chunked prefill seq-len arena size overflow"))?
+                .max(1),
+        )?;
 
         // Permanent dummy KV block for padding sequences. Must be explicitly
         // zeroed: `gpu.alloc()` returns uninitialized memory, and any kernel
@@ -714,6 +726,18 @@ impl TransformerModel {
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
         // Feature-2 overlay kernels: resolve before `gpu` is moved into Self.
         let overlay_kernels = crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
+        let prefill_graph_veto = layers
+            .iter()
+            .any(|layer| layer.decode_graph_unsupported() || layer.graph_stale_on_new_sequence());
+        let graph_runtime = Arc::new(
+            spark_runtime::graph_runtime::GraphRuntime::new(
+                gpu.clone(),
+                gpu.graph_capabilities(),
+                graph_runtime_config,
+                spark_runtime::run_metrics::metrics().graph.clone(),
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
         Ok(Self {
             // Installed by the factory after construction: the layers read
             // from the store during `new`, so it cannot be moved in here.
@@ -741,11 +765,15 @@ impl TransformerModel {
             lm_head_nvfp4,
             lm_head_nvfp4_t,
             lm_head_fp8,
+            // ★ Before `layers` is moved: the veto folds over the layers.
+            decode_graph_veto: layers.iter().any(|l| l.decode_graph_unsupported()),
             layers,
             buffers,
             lora: None,
             lora_rotatable: false,
             kv_cache: Mutex::new(kv_cache),
+            graph_runtime,
+            prefill_graph_veto,
             gpu,
             rms_norm_kernel,
             dense_gemv_kernel,
@@ -767,8 +795,6 @@ impl TransformerModel {
             argmax_logits_kernel,
             batched_embed_kernel,
             fill_slots_kernel,
-            decode_graph: Mutex::new(std::collections::HashMap::new()),
-            batch_decode_graphs: Mutex::new((HashMap::new(), 0)),
             // Suppress graphs during FP8 calibration only. MLA used to be
             // suppressed because an internal sync was placed inside the graph
             // capture region — that sync is now conditional on eager mode
@@ -787,6 +813,9 @@ impl TransformerModel {
             ssm_snapshots,
             ssm_tier_store,
             max_blocks_per_seq,
+            prefill_block_tables,
+            prefill_seq_lens,
+            prefill_meta_slots: max_batch_size,
             dummy_kv_block,
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
@@ -811,17 +840,12 @@ impl TransformerModel {
             dflash_hidden_save,
             dflash_hidden_save_rows,
             dflash_hidden_save_nseq,
-            dflash_capture_layers,
-            verify2_graph: Mutex::new(std::collections::HashMap::new()),
-            verify3_graph: Mutex::new(std::collections::HashMap::new()),
-            verify4_graph: Mutex::new(std::collections::HashMap::new()),
             verify_batched_graphs: Mutex::new((std::collections::HashMap::new(), 0)),
+            dflash_capture_layers,
             verify_wy_tables,
             // Nothing staged yet: the buffer was memset to zero above, and no
             // key describes zero, so the first verify step always uploads.
             verify_wy_cache: Mutex::new(None),
-            verify_kgamma_graph: Mutex::new(std::collections::HashMap::new()),
-            fused_graph: Mutex::new(std::collections::HashMap::new()),
             prefix_cache,
             secondary_stream,
             secondary_event,

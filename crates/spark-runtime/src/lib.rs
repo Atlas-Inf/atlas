@@ -28,11 +28,13 @@ pub mod flashinfer;
 pub mod gpu;
 #[path = "gpu_args.rs"]
 mod gpu_args;
+pub mod graph_runtime;
 pub mod kernel_args;
 pub mod kernel_audit;
 pub mod kv_cache;
 pub mod kv_dequant;
 pub mod kv_spill;
+pub mod launch_trace;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod op_cache;

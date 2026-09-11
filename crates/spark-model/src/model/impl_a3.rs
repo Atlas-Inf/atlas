@@ -470,3 +470,29 @@ impl TransformerModel {
         }
     }
 }
+
+impl TransformerModel {
+    /// The final-norm step in front of every lm_head projection. Shared so the
+    /// decode/verify/prefill sites cannot diverge.
+    pub(super) fn final_norm_apply(
+        &self,
+        input: DevicePtr,
+        output: DevicePtr,
+        num_tokens: u32,
+        hidden_size: u32,
+        eps: f32,
+        stream: u64,
+    ) -> Result<()> {
+        crate::layers::ops::rms_norm(
+            self.gpu.as_ref(),
+            self.rms_norm_kernel,
+            input,
+            &self.final_norm,
+            output,
+            num_tokens,
+            hidden_size,
+            eps,
+            stream,
+        )
+    }
+}

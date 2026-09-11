@@ -615,6 +615,14 @@ pub(crate) fn load_model(
                     None
                 },
             });
+    let graph_runtime_config = serve_phases::resolve_graph_runtime_config(
+        &args,
+        &config,
+        &ptx_set,
+        gpu.as_ref(),
+        &model_dir,
+        dflash_args.as_ref().map(|draft| &draft.drafter_config),
+    )?;
     // NLLB / M2M-100: resolve the translation language pair to token ids from
     // the checkpoint tokenizer (the ChatTokenizer isn't built until after the
     // model). Only for encoder-decoder checkpoints; other models pass `None`.
@@ -678,6 +686,7 @@ pub(crate) fn load_model(
         lora_args,
         nllb_lang,
         nllb_lora_dir,
+        graph_runtime_config,
     )?;
 
     // Kernel load audit + the fail-closed boot gate. Every lookup is eager, so
@@ -688,6 +697,14 @@ pub(crate) fn load_model(
     // and exits with the unresolved count as the process status.
     spark_runtime::progress::phase(7, "kernel audit");
     serve_phases::audit_and_gate(&args, &ptx_set)?;
+    if world_size == 1 {
+        let prewarmed = model.prewarm_graphs()?;
+        if prewarmed > 0 {
+            tracing::info!("CUDA graph startup prewarm recreated {prewarmed} key(s)");
+        }
+    } else if args.cuda_graph_prewarm_profile.is_some() {
+        tracing::warn!("CUDA graph startup prewarm is skipped for a multi-rank serve");
+    }
 
     // Phase 6.3 — HSS config built early so the EP worker can install it.
     let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
@@ -815,21 +832,23 @@ pub(crate) fn load_model(
     // dispatches both MTP and DFlash proposers via the shared `DraftProposer`
     // trait + the `drafts.len() ≥ 4` ladder route to `step_verify_dflash`
     // (scheduler.rs:3013). So `--dflash` enables `use_speculative` too.
-    let use_speculative = (args.speculative || args.dflash) && scheduler_model.has_proposer();
+    let use_speculative =
+        (args.speculative || args.dflash_family()) && scheduler_model.has_proposer();
     let use_self_spec = args.self_speculative && scheduler_model.has_self_speculative();
     let use_ngram_spec = args.ngram_speculative;
     // For DFlash, force `num_drafts = γ - 1` so the scheduler asks the
     // proposer for γ tokens (DraftProposer::propose semantics: "up to
     // num_drafts" → drafts.len() = γ → routes to step_verify_dflash).
-    let num_drafts = if args.dflash {
+    let num_drafts = if args.dflash_family() {
         serve_phases::checked_dflash_num_drafts(args.dflash_gamma)?
     } else {
         args.resolved_num_drafts()
     };
 
-    if args.dflash {
+    if args.dflash_family() {
         tracing::info!(
-            "DFlash speculative decoding: ENABLED (γ={}, window={}, drafter installed)",
+            "{} speculative decoding: ENABLED (γ={}, window={}, drafter installed)",
+            if args.dspark { "D-Spark" } else { "DFlash" },
             args.dflash_gamma,
             if args.dflash_window_size == 0 {
                 "full".to_string()
@@ -914,7 +933,7 @@ pub(crate) fn load_model(
     // `verify_pipeline_helper::dflash_masked_verify_enabled()` and must NOT
     // flip this bool — this selects the verify architecture, not the pick
     // basis.
-    let dflash_verify_raw_argmax = args.dflash;
+    let dflash_verify_raw_argmax = args.dflash_family();
     // DS4F hard-limit lane (2026-07-21): the served-context ceiling the
     // scheduler enforces per decode step (§C-3), not just as a KV-allocation
     // ceiling trued-up on completion. Travels with the run's other hard stops.

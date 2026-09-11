@@ -527,6 +527,19 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false, conflicts_with = "speculative")]
     pub dflash: bool,
 
+    /// Enable D-Spark speculative decoding as a first-class algorithm. D-Spark
+    /// is a DFlash-family drafter whose checkpoint ships D-Spark proposer
+    /// artifacts (a Markov head and/or the SpecForge `"dspark"` projector
+    /// tag); this flag loads that drafter exactly as `--dflash` does but
+    /// selects `SpeculativeAlgorithm::Dspark` explicitly and fails closed if
+    /// the checkpoint carries no D-Spark artifacts.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["speculative", "self_speculative", "ngram_speculative"]
+    )]
+    pub dspark: bool,
+
     /// HuggingFace id (or local path) of the DFlash drafter checkpoint.
     /// When `--dflash` is set without `--draft-model`, the value falls
     /// through from the target's MODEL.toml `[dflash].draft_model` field.
@@ -818,6 +831,38 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub profile: bool,
 
+    /// CUDA graph capture policy: disabled, full, breakable, or piecewise.
+    /// Full preserves Atlas's whole-step decode/verify capture. Breakable and
+    /// piecewise additionally permit explicitly bounded capture segments such
+    /// as exact-shape prompt-prefill compute. Unsupported phases remain eager
+    /// and publish a fallback reason.
+    #[arg(long, default_value = "full")]
+    pub cuda_graph_mode: String,
+
+    /// Comma-separated upper bounds for CUDA graph token buckets.
+    #[arg(long, default_value = "16,32,64,128,256,512,1024,2048,4096,8192")]
+    pub cuda_graph_token_buckets: String,
+
+    /// Comma-separated upper bounds for CUDA graph request-count buckets.
+    #[arg(long, default_value = "1,2,4,8,16,32,64,128")]
+    pub cuda_graph_request_buckets: String,
+
+    /// Maximum resident CUDA graph executable count across all phases.
+    #[arg(long, default_value_t = 256)]
+    pub cuda_graph_cache_entries: usize,
+
+    /// Estimated CUDA graph memory budget across all phases, in MiB.
+    #[arg(long, default_value_t = 2048)]
+    pub cuda_graph_cache_mb: usize,
+
+    /// Directory for CUDA graph DOT topology, manifest, and prewarm exports.
+    #[arg(long)]
+    pub cuda_graph_export_dir: Option<PathBuf>,
+
+    /// Prewarm profile exported by a compatible prior Atlas run.
+    #[arg(long)]
+    pub cuda_graph_prewarm_profile: Option<PathBuf>,
+
     /// Number of warmup tokens for online FP8 KV cache scale calibration.
     /// During the first N tokens, tracks max |K| and max |V| values across
     /// all attention layers. After N tokens, computes per-tensor scales as
@@ -1089,6 +1134,15 @@ impl ServeArgs {
     pub fn resolved_num_drafts(&self) -> usize {
         self.num_drafts
             .expect("num_drafts read before apply_model_default_num_drafts resolved it")
+    }
+
+    /// True when the serve runs a DFlash-family drafter, selected either as
+    /// plain DFlash (`--dflash`) or first-class D-Spark (`--dspark`). Use this
+    /// at the drafter load/preflight boundary, where the two share a runtime;
+    /// use the resolved `SpeculativeAlgorithm` where the algorithm itself
+    /// matters (graph keys, metrics, proposer/verify dispatch).
+    pub fn dflash_family(&self) -> bool {
+        self.dflash || self.dspark
     }
 }
 

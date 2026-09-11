@@ -144,9 +144,13 @@ pub fn badges(a: &crate::cli::ServeArgs, awaiting_model: bool) -> Vec<Badge> {
         ),
         tint: BadgeTint::Quant,
     });
-    if a.dflash {
+    if a.dflash_family() {
         out.push(Badge {
-            text: format!("DFlash γ={}", a.dflash_gamma),
+            text: if a.dspark {
+                format!("D-Spark γ={}", a.dflash_gamma)
+            } else {
+                format!("DFlash γ={}", a.dflash_gamma)
+            },
             tint: BadgeTint::Quant,
         });
     } else if a.speculative || a.self_speculative || a.ngram_speculative {

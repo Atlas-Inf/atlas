@@ -29,6 +29,12 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl Drop for TransformerModel {
     fn drop(&mut self) {
+        if let Err(error) = self.graph_runtime.export_configured_artifacts() {
+            tracing::warn!("CUDA graph artifact export failed: {error:#}");
+        }
+        if let Err(error) = self.graph_runtime.shutdown() {
+            tracing::warn!("CUDA graph runtime shutdown failed: {error:#}");
+        }
         self.drop_pinned_staging();
         // The SSM spill tier's reusable staging blob is page-locked host memory
         // owned by the snapshot pool, which holds no `gpu` handle of its own —

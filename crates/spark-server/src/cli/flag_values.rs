@@ -28,6 +28,7 @@ pub(crate) const MTP_QUANTS: &[&str] = &["bf16", "fp8", "nvfp4"];
 pub(crate) const SCHEDULING_POLICIES: &[&str] = &["fifo", "slai"];
 pub(crate) const SSM_H_DTYPES: &[&str] = &["f32", "f16", "f16-pool"];
 pub(crate) const MTP_GATES: &[&str] = &["auto", "force"];
+pub(crate) const CUDA_GRAPH_MODES: &[&str] = &["disabled", "full", "breakable", "piecewise"];
 pub(crate) const TOOL_CALL_PARSERS: &[&str] = &[
     "hermes",
     "qwen3_coder",
@@ -52,6 +53,7 @@ pub(crate) fn options_for_flag(flag: &str) -> Option<Vec<String>> {
         "scheduling-policy" => Some(owned(SCHEDULING_POLICIES)),
         "ssm-h-dtype" => Some(owned(SSM_H_DTYPES)),
         "mtp-gate" => Some(owned(MTP_GATES)),
+        "cuda-graph-mode" => Some(owned(CUDA_GRAPH_MODES)),
         "tool-call-parser" => Some(owned(TOOL_CALL_PARSERS)),
         "kv-cache-dtype" => Some(
             spark_runtime::kv_cache::KvCacheDtype::ALL

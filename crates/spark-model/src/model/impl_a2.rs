@@ -111,11 +111,28 @@ impl TransformerModel {
         block_size: usize,
     ) -> Result<&'a mut ChunkedPrefillPageMetadata> {
         let required_blocks = total_tokens.saturating_sub(1) / block_size + 1;
+        let block_capacity = self.max_blocks_per_seq as usize;
+        if required_blocks > block_capacity {
+            bail!(
+                "chunked prefill needs {required_blocks} blocks but stable metadata holds {block_capacity}"
+            );
+        }
+        if seq.slot_idx >= self.prefill_meta_slots {
+            bail!(
+                "chunked prefill slot {} exceeds stable metadata slot count {}",
+                seq.slot_idx,
+                self.prefill_meta_slots
+            );
+        }
         if seq.chunked_prefill_meta.is_none() {
             seq.chunked_prefill_meta = Some(ChunkedPrefillPageMetadata {
-                block_table: self.gpu.alloc(required_blocks.max(1) * 4)?,
-                seq_len: self.gpu.alloc(std::mem::size_of::<u32>())?,
-                block_capacity: required_blocks,
+                block_table: self
+                    .prefill_block_tables
+                    .offset(seq.slot_idx * block_capacity * std::mem::size_of::<u32>()),
+                seq_len: self
+                    .prefill_seq_lens
+                    .offset(seq.slot_idx * std::mem::size_of::<u32>()),
+                block_capacity,
                 uploaded_blocks: 0,
             });
         }
@@ -131,16 +148,8 @@ impl TransformerModel {
         Ok(meta)
     }
 
-    pub(super) fn free_chunked_prefill_meta(&self, seq: &mut SequenceState) -> Result<()> {
-        if let Some(meta) = seq.chunked_prefill_meta.take() {
-            if !meta.block_table.is_null() {
-                self.gpu.free(meta.block_table)?;
-            }
-            if !meta.seq_len.is_null() {
-                self.gpu.free(meta.seq_len)?;
-            }
-        }
-        Ok(())
+    pub(super) fn free_chunked_prefill_meta(&self, seq: &mut SequenceState) {
+        seq.chunked_prefill_meta.take();
     }
 
     /// Bulk broadcast: send an array of u32 tokens from rank 0 to all ranks.

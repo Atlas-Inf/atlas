@@ -95,6 +95,87 @@ pub async fn metrics_handler() -> impl IntoResponse {
         atlas_prefix_cache_hit_rate {hit_rate:.4}\n"
     );
 
+    let graph = spark_runtime::run_metrics::metrics().graph.snapshot();
+    let _ = write!(
+        text,
+        "# TYPE atlas_cuda_graph_captures_total counter\n\
+         atlas_cuda_graph_captures_total {}\n\
+         # TYPE atlas_cuda_graph_recaptures_total counter\n\
+         atlas_cuda_graph_recaptures_total {}\n\
+         # TYPE atlas_cuda_graph_replays_total counter\n\
+         atlas_cuda_graph_replays_total {}\n\
+         # TYPE atlas_cuda_graph_capture_failures_total counter\n\
+         atlas_cuda_graph_capture_failures_total {}\n\
+         # TYPE atlas_cuda_graph_replay_failures_total counter\n\
+         atlas_cuda_graph_replay_failures_total {}\n\
+         # TYPE atlas_cuda_graph_eager_fallbacks_total counter\n\
+         atlas_cuda_graph_eager_fallbacks_total {}\n\
+         # TYPE atlas_cuda_graph_evictions_total counter\n\
+         atlas_cuda_graph_evictions_total {}\n\
+         # TYPE atlas_cuda_graph_launches_total counter\n\
+         atlas_cuda_graph_launches_total {}\n\
+         # TYPE atlas_cuda_graph_memory_bytes gauge\n\
+         atlas_cuda_graph_memory_bytes {}\n\
+         # TYPE atlas_cuda_graph_fallback_reason_total counter\n",
+        graph.captures,
+        graph.recaptures,
+        graph.replays,
+        graph.capture_failures,
+        graph.replay_failures,
+        graph.eager_fallbacks,
+        graph.evictions,
+        graph.launches,
+        graph.graph_bytes,
+    );
+    for (reason, count) in graph.fallback_reasons {
+        let _ = writeln!(
+            text,
+            "atlas_cuda_graph_fallback_reason_total{{reason=\"{reason}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        text,
+        "atlas_cuda_graph_algorithm_info{{algorithm=\"{}\"}} 1",
+        graph.algorithm
+    );
+    for (name, kind, values) in [
+        (
+            "atlas_cuda_graph_phase_captures_total",
+            "counter",
+            graph.phase_captures,
+        ),
+        (
+            "atlas_cuda_graph_phase_replays_total",
+            "counter",
+            graph.phase_replays,
+        ),
+        (
+            "atlas_cuda_graph_phase_launches_total",
+            "counter",
+            graph.phase_launches,
+        ),
+        (
+            "atlas_cuda_graph_phase_eager_fallbacks_total",
+            "counter",
+            graph.phase_eager_fallbacks,
+        ),
+        (
+            "atlas_cuda_graph_phase_evictions_total",
+            "counter",
+            graph.phase_evictions,
+        ),
+        (
+            "atlas_cuda_graph_phase_memory_bytes",
+            "gauge",
+            graph.phase_graph_bytes,
+        ),
+    ] {
+        let _ = writeln!(text, "# TYPE {name} {kind}");
+        for (phase, value) in values {
+            let _ = writeln!(text, "{name}{{phase=\"{phase}\"}} {value}");
+        }
+    }
+
     // Entropy monitoring (global atomics from spark-runtime sampler)
     let entropy = spark_runtime::sampler::last_entropy();
     let low_entropy = spark_runtime::sampler::low_entropy_token_count();

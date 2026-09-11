@@ -3,7 +3,6 @@
 #![allow(unused_imports, dead_code)]
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -99,7 +98,13 @@ pub struct TransformerModel {
     /// keeps the decode-graph path byte-identical to today.
     pub(super) lora_rotatable: bool,
     pub(super) kv_cache: Mutex<PagedKvCache>,
-    pub(super) gpu: Box<dyn GpuBackend>,
+    pub(super) graph_runtime: Arc<spark_runtime::graph_runtime::GraphRuntime>,
+    pub(super) prefill_graph_veto: bool,
+    /// OR of every layer's [`TransformerLayer::decode_graph_unsupported`],
+    /// resolved once at construction: a layer whose decode can never be
+    /// captured keeps the whole model eager.
+    pub(super) decode_graph_veto: bool,
+    pub(super) gpu: Arc<dyn GpuBackend>,
     /// TQ+ InnerQ calibration driver, when `TURBO_INNERQ` is set. Owned here
     /// rather than parked in a static: it writes `__device__` globals in THIS
     /// model's modules, so it must not outlive the model. Reached from the
@@ -154,25 +159,6 @@ pub struct TransformerModel {
     pub(super) argmax_logits_kernel: KernelHandle, // FP32 argmax for logits
     pub(super) batched_embed_kernel: KernelHandle,
     pub(super) fill_slots_kernel: KernelHandle,
-    /// Cached CUDA graph for single-sequence decode (layer loop + norm + LM head).
-    /// CUDA graph cache for n=1 decode, keyed by `seq.slot_idx`. The captured
-    /// graph has SSM h_state/conv_state pointers baked in as kernel arguments,
-    /// so a graph captured for slot S can ONLY be replayed for slot S — replay
-    /// for any other slot reads/writes the wrong sequence's recurrent state
-    /// and produces gibberish for both sequences. With concurrent users we may
-    /// alternate between slots in n=1 decode (e.g. via the per-seq fresh-decode
-    /// fix in scheduler::step_decode_only), so we keep one graph per slot.
-    pub(super) decode_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
-    /// Cached CUDA graphs for batched decode, keyed by the per-row SSM pool
-    /// slot VECTOR (`trait_impl/decode_graph_key.rs`) — the only per-sequence
-    /// addresses a capture bakes. The old `padded_n` key was sound only while
-    /// the batch was exactly slots `[0..n)` with `n == padded_n`; the MTP
-    /// Phase-A bootstrap passes a slot SUBSET of the active set and would
-    /// replay another subset's baked GDN pointers.
-    /// Value = `(graph, last_use_tick)`; the `u64` alongside the map is the
-    /// monotonically increasing tick. At `BATCH_DECODE_GRAPH_CAP` entries the
-    /// least-recently-used graph is destroyed and replaced.
-    pub(super) batch_decode_graphs: Mutex<(HashMap<Vec<u32>, (GraphHandle, u64)>, u64)>,
     /// Pre-allocated SSM state pool for stable GPU addresses across graph replays.
     /// `Arc` so each `SequenceState` can hold a `SlotGuard` that releases its
     /// claimed slot on drop — guaranteeing the slot returns to the free list on
@@ -191,6 +177,12 @@ pub struct TransformerModel {
     /// Fixed max blocks per sequence (max_seq_len / block_size + 1).
     /// Used as constant stride in attention metadata for CUDA graph compatibility.
     pub(super) max_blocks_per_seq: u32,
+    /// Slot-major stable device block tables used by chunked prefill graphs.
+    pub(super) prefill_block_tables: DevicePtr,
+    /// Slot-major stable device sequence lengths used by chunked prefill graphs.
+    pub(super) prefill_seq_lens: DevicePtr,
+    /// Number of slot-major rows allocated in both prefill metadata arenas.
+    pub(super) prefill_meta_slots: usize,
     /// Permanent KV cache block for padding sequences in batched decode.
     pub(super) dummy_kv_block: u32,
     /// Profile mode: skip graphs, sync+time each layer. Set ATLAS_PROFILE=1.
@@ -291,31 +283,9 @@ pub struct TransformerModel {
     pub(super) dflash_hidden_save_rows: usize,
     /// How many sequences the capture buffer is strided for (1 = C=1 layout).
     pub(super) dflash_hidden_save_nseq: usize,
-    /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
-    /// Same rationale as `decode_graph`: the captured graph has SSM
-    /// h_state/conv_state pointers baked in as kernel arguments, so replay for
-    /// a different slot writes to the wrong sequence's recurrent state. With
-    /// concurrent users alternating through MTP verify, a single
-    /// `Option<GraphHandle>` would corrupt both slots' SSM state.
-    pub(super) verify2_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
-    /// Cached CUDA graphs for K=3 verification, keyed by `seq.slot_idx`.
-    pub(super) verify3_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
-    /// Cached CUDA graphs for K=4 verification, keyed by `seq.slot_idx`.
-    pub(super) verify4_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
     /// Cached CUDA graphs for the BATCHED K-row verify (verify_e), keyed by
     /// the batch's ssm-pool slot VECTOR (+ the per-seq row count K + a
-    /// wy-tables-present sentinel). Slot-vector keying is what a per-slot
-    /// key cannot give at n>1: the captured graph bakes every sequence's
-    /// h_state/conv_state/intermediate pointers, so it may only replay for
-    /// the exact same slot assignment in the same batch order (K is in the
-    /// key because a graph also bakes the R = n*K launch dimensions).
-    /// Attention metadata/block tables/embeds live at fixed scratch
-    /// addresses refreshed pre-replay (decode_a2 pattern).
-    /// Value = `(graph, last_use_tick)`; the `u64` alongside the map is the
-    /// monotonically increasing tick. At `VERIFY_BATCHED_GRAPH_CAP` entries
-    /// the least-recently-used graph is destroyed and replaced (slot vectors
-    /// churn with request turnover — the old insert-only map went
-    /// permanently eager after 32 distinct vectors on long serves).
+    /// wy-tables-present sentinel). Value = `(graph, last_use_tick)`.
     pub(super) verify_batched_graphs:
         Mutex<(std::collections::HashMap<Vec<u32>, (GraphHandle, u64)>, u64)>,
     /// Batched-verify WY pointer-table staging: `num_ssm_layers` slices of
@@ -337,15 +307,6 @@ pub struct TransformerModel {
     /// Kill switch `ATLAS_NO_VERIFY_WY_CACHE` (PRESENCE) restores the
     /// unconditional re-stage.
     pub(super) verify_wy_cache: Mutex<Option<Vec<u64>>>,
-    /// Cached CUDA graphs for DFlash K=γ verification, keyed by
-    /// `(seq.slot_idx, K)`. K is `tokens.len()` (γ+1 typically). One graph
-    /// per (slot, K) — different γ values coexist via the K dimension.
-    pub(super) verify_kgamma_graph: Mutex<std::collections::HashMap<(usize, usize), GraphHandle>>,
-    /// Cached CUDA graphs for the DFlash decode+verify fused pass, keyed by
-    /// `(seq.slot_idx, M)` where M = tokens.len() = 1 + num_drafts.
-    /// Replaces the separate `decode_graph` (M=1) + `verify{k}_graph` (M=k)
-    /// on the DFlash path with a single M-row weight sweep.
-    pub(super) fused_graph: Mutex<std::collections::HashMap<(usize, usize), GraphHandle>>,
     /// Prefix cache for KV block reuse across requests.
     pub(super) prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     /// Secondary CUDA stream for pipelining checkpoint D2D with MTP propose.
@@ -607,6 +568,26 @@ impl TransformerModel {
             }
         };
 
+        let graph_export = self.graph_runtime.export_configured_artifacts();
+        if let Ok(Some((manifest, prewarm))) = &graph_export {
+            tracing::info!(
+                "CUDA graph artifacts exported: manifest={}, prewarm={}",
+                manifest.display(),
+                prewarm.display()
+            );
+        }
+        attempt("graph artifact export", graph_export.map(|_| ()));
+        attempt("graph runtime", self.graph_runtime.shutdown());
+        let block_tables = self.gpu.free(self.prefill_block_tables);
+        if block_tables.is_ok() {
+            self.prefill_block_tables = DevicePtr::NULL;
+        }
+        attempt("prefill block tables", block_tables);
+        let seq_lens = self.gpu.free(self.prefill_seq_lens);
+        if seq_lens.is_ok() {
+            self.prefill_seq_lens = DevicePtr::NULL;
+        }
+        attempt("prefill sequence lengths", seq_lens);
         attempt("derived weights", self.derived.release(gpu));
         attempt("ssm snapshots", self.ssm_snapshots.release(gpu));
         // The pool is Arc'd because slots are handed out to sequences. A live

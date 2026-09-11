@@ -268,18 +268,15 @@ impl TransformerModel {
         } else {
             None
         };
-        let use_graphs = graph_key.is_some();
+        let graph_identity = graph_key
+            .as_ref()
+            .and_then(|slots| self.decode_graph_identity(n, padded_n, slots.clone()).ok());
+        let use_graphs = graph_identity.is_some();
 
         // Lock order: kv_cache BEFORE the graph cache, matching verify_e.
         let mut kv_cache = self.kv_cache.lock();
 
         // ── Phase 2 (decision): exact CUDA-graph hit, or drain-tail borrow ──
-        let mut graphs = if use_graphs {
-            Some(self.batch_decode_graphs.lock())
-        } else {
-            None
-        };
-
         // Exact hit (LRU-touched), else borrow a WIDER captured graph
         // (`graph_borrow.rs`): a drain batch's slot vector is a prefix of the
         // steady-state canonical vector, so the wider graph's active rows are
@@ -287,39 +284,53 @@ impl TransformerModel {
         // or currently-free slots. `dispatch_n` is the width Phase 1 must
         // prepare (embeds/metadata) — the borrowed graph's captured width on
         // a borrow, `padded_n` otherwise.
-        let mut replay: Option<spark_runtime::gpu::GraphHandle> = None;
+        let mut replay = graph_identity
+            .as_ref()
+            .and_then(|identity| self.graph_runtime.lookup(identity).ok().flatten());
         let mut dispatch_n = padded_n;
-        if let (Some(g), Some(key)) = (&mut graphs, &graph_key) {
-            g.1 += 1;
-            let tick = g.1;
-            if let Some(e) = g.0.get_mut(key) {
-                e.1 = tick;
-                replay = Some(e.0);
-            } else if super::graph_borrow::graph_borrow_enabled()
-                && self.comm.is_none()
-                && self.config.num_ssm_layers() > 0
+        if replay.is_none()
+            && let Some(key) = &graph_key
+            && super::graph_borrow::graph_borrow_enabled()
+            && self.comm.is_none()
+            && self.config.num_ssm_layers() > 0
+        {
+            let candidates: Vec<_> = self
+                .graph_runtime
+                .cached_graphs(spark_runtime::graph_runtime::GraphPhase::Decode)
+                .into_iter()
+                .filter_map(|lease| {
+                    let slots = match &lease.key().payload {
+                        spark_runtime::graph_runtime::GraphPayload::Decode {
+                            padded_request_count,
+                            slots,
+                            ..
+                        } if *padded_request_count > 1 => Some(slots.clone()),
+                        _ => None,
+                    }?;
+                    Some((slots, lease))
+                })
+                .collect();
+            let dummy = self.ssm_pool.dummy_slot() as u32;
+            let borrowed = super::graph_borrow::find_borrowable_decode_key(
+                &key[..n],
+                candidates.iter().map(|(slots, _)| slots),
+                |slot| slot == dummy || self.ssm_pool.slot_is_free(slot as usize),
+            );
+            if let Some(borrowed_key) = borrowed
+                && let Some((_, lease)) = candidates
+                    .into_iter()
+                    .find(|(slots, _)| *slots == borrowed_key)
             {
-                let dummy = self.ssm_pool.dummy_slot() as u32;
-                let borrowed =
-                    super::graph_borrow::find_borrowable_decode_key(&key[..n], g.0.keys(), |s| {
-                        s == dummy || self.ssm_pool.slot_is_free(s as usize)
-                    });
-                if let Some(bk) = borrowed {
-                    dispatch_n = bk.len();
-                    let e =
-                        g.0.get_mut(&bk)
-                            .expect("borrowed key comes from this cache");
-                    e.1 = tick;
-                    replay = Some(e.0);
-                    // INFO once per transition (same cardinality as the
-                    // captures this replaces); repeats of the same pair
-                    // stay silent. Provable engagement: grep "graph borrow".
-                    if super::graph_borrow::DECODE_BORROW_LOG.should_log(key, &bk) {
-                        tracing::info!(
-                            "decode graph borrow: n={n} padded_n={padded_n} -> replaying \
-                             captured width {dispatch_n}"
-                        );
-                    }
+                dispatch_n = borrowed_key.len();
+                replay = Some(lease);
+                // INFO once per transition (same cardinality as the
+                // captures this replaces); repeats of the same pair
+                // stay silent. Provable engagement: grep "graph borrow".
+                if super::graph_borrow::DECODE_BORROW_LOG.should_log(key, &borrowed_key) {
+                    tracing::info!(
+                        "decode graph borrow: n={n} padded_n={padded_n} -> replaying \
+                         captured width {dispatch_n}"
+                    );
                 }
             }
         }
@@ -398,9 +409,7 @@ impl TransformerModel {
 
         if let Some(graph) = replay {
             // Graph exists — replay (kernels use updated metadata + SSM pool addresses)
-            if graph.0 != 0 {
-                self.gpu.launch_graph(graph, stream)?;
-            }
+            self.graph_runtime.launch(&graph, stream)?;
 
             // ── Phase 3: Post-graph (update sequence state) ──
             for (i, seq) in seqs.iter_mut().enumerate() {
@@ -594,15 +603,29 @@ impl TransformerModel {
             }
 
             if use_graphs {
-                let graph = self.gpu.end_capture(stream)?;
+                let identity = graph_identity
+                    .as_ref()
+                    .expect("capture requires graph identity");
+                let topology_dot = self.graph_runtime.capture_dot_path(identity);
+                let graph = self
+                    .gpu
+                    .end_capture_with_dot(stream, topology_dot.as_deref())?;
                 if graph.0 != 0 {
                     tracing::info!(
                         "Captured CUDA graph for batch size {padded_n} (n={n}, slots={graph_key:?})"
                     );
-                    if let (Some(g), Some(key)) = (graphs.as_mut(), graph_key.clone()) {
-                        self.insert_batch_decode_graph(g, key, graph);
+                    match self.graph_runtime.register_captured(
+                        identity.clone(),
+                        stream,
+                        self.model_graph_cost(),
+                        graph,
+                        topology_dot,
+                    ) {
+                        Ok(graph) => self.graph_runtime.launch(&graph, stream)?,
+                        Err(error) => {
+                            return Err(anyhow::anyhow!("register batched decode graph: {error}"));
+                        }
                     }
-                    self.gpu.launch_graph(graph, stream)?;
                 }
             }
 

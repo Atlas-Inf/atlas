@@ -13,10 +13,13 @@ use std::sync::Arc;
 
 use atlas_core::registry::AtlasRegistry;
 
+mod capture_safety;
 mod fault_probe;
 mod gpu_copy;
 mod gpu_impl;
+mod gpu_impl_conditional;
 mod gpu_impl_graph;
+mod graph_faults;
 pub mod tensormap;
 
 // ── Raw CUDA driver API for memory operations ──
@@ -48,6 +51,7 @@ unsafe extern "C" {
     /// Device of the calling context, then any `CUdevice_attribute` on it.
     /// Used for `sm_count` (attribute 16 = MULTIPROCESSOR_COUNT).
     pub(super) fn cuCtxGetDevice(device: *mut i32) -> i32;
+    pub(super) fn cuDriverGetVersion(driverVersion: *mut i32) -> i32;
     pub(super) fn cuDeviceGetAttribute(pi: *mut i32, attrib: u32, dev: i32) -> i32;
     pub(super) fn cuMemsetD8Async(dst: u64, value: u8, n: usize, stream: u64) -> i32;
     // CUDA graph capture/replay
@@ -74,6 +78,12 @@ unsafe extern "C" {
     pub(super) fn cuGraphLaunch(hGraphExec: u64, hStream: u64) -> i32;
     pub(super) fn cuGraphExecDestroy(hGraphExec: u64) -> i32;
     pub(super) fn cuGraphDestroy(hGraph: u64) -> i32;
+    #[cfg(not(atlas_scale))]
+    pub(super) fn cuGraphDebugDotPrint(
+        hGraph: u64,
+        path: *const std::ffi::c_char,
+        flags: u32,
+    ) -> i32;
     fn cuCtxGetCurrent(pctx: *mut u64) -> i32;
     pub(super) fn cuCtxSetCurrent(ctx: u64) -> i32;
     pub(super) fn cuStreamCreate(phStream: *mut u64, flags: u32) -> i32;
@@ -87,6 +97,7 @@ unsafe extern "C" {
     pub(super) fn cuEventRecord(hEvent: u64, hStream: u64) -> i32;
     pub(super) fn cuStreamWaitEvent(hStream: u64, hEvent: u64, flags: u32) -> i32;
     pub(super) fn cuEventSynchronize(hEvent: u64) -> i32;
+    pub(super) fn cuEventQuery(hEvent: u64) -> i32;
     pub(super) fn cuEventDestroy_v2(hEvent: u64) -> i32;
 }
 
@@ -103,6 +114,8 @@ pub struct AtlasCudaBackend {
     /// `ATLAS_DEBUG_SYNC_KERNELS=1` — sync after every launch. Read once here
     /// rather than per launch, and carried rather than cached in a static.
     debug_sync_kernels: bool,
+    capture_safety: capture_safety::CaptureSafety,
+    graph_faults: graph_faults::GraphFaults,
     /// This model's kernel handles and op scratch. Dropped with the backend,
     /// so neither can outlive the registry or context it came from.
     op_cache: crate::op_cache::OpCache,
@@ -163,6 +176,8 @@ impl AtlasCudaBackend {
             live_allocs: parking_lot::Mutex::new(std::collections::HashSet::new()),
             registry,
             debug_sync_kernels: std::env::var("ATLAS_DEBUG_SYNC_KERNELS").as_deref() == Ok("1"),
+            capture_safety: capture_safety::CaptureSafety::new(),
+            graph_faults: graph_faults::GraphFaults::from_env(),
             op_cache: crate::op_cache::OpCache::new(),
             default_stream,
             cuda_ctx,
@@ -173,6 +188,28 @@ impl AtlasCudaBackend {
     /// directly rather than through `GpuBackend`.
     pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr) {
         self.live_allocs.lock().insert(ptr.0);
+    }
+
+    fn graph_fault(&self, point: graph_faults::GraphFaultPoint) -> bool {
+        self.graph_faults.enabled(point)
+    }
+
+    pub(crate) fn begin_capture_guard(&self) -> Result<()> {
+        self.capture_safety.begin()
+    }
+
+    pub(crate) fn finish_capture_guard(&self) {
+        self.capture_safety.finish();
+    }
+
+    pub(crate) fn ensure_capture_safe(&self, operation: &str) -> Result<()> {
+        self.capture_safety.ensure_allowed(operation)
+    }
+
+    /// Live allocations not yet freed. The ledger already exists for teardown;
+    /// this only reads it, so a per-request leak check costs one lock.
+    pub(crate) fn live_alloc_len(&self) -> usize {
+        self.live_allocs.lock().len()
     }
 
     pub(crate) fn forget_alloc(&self, ptr: crate::gpu::DevicePtr) {

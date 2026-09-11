@@ -17,11 +17,16 @@ metal = [
     "atlas-core/metal",
 ]
 test-utils = []
+gpu-examples = []
 
 [[bin]]
 name = "bench_fast_weights"
 path = "benches/bench_fast_weights.rs"
 required-features = ["test-utils"]
+
+[[example]]
+name = "conditional_graph"
+required-features = ["cuda", "gpu-examples"]
 
 # Standalone smoke binary for the metal backend. Loads layer 3 of
 # `mlx-community/Qwen3.5-4B-MLX-8bit` from `~/models/...` (override
@@ -109,9 +114,13 @@ tokio = { version = "1", features = ["rt", "sync", "time", "parking_lot"] }
 rand = "0.8"
 half = "2"
 parking_lot = { workspace = true }
+sha2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

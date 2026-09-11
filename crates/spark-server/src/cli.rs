@@ -11,6 +11,7 @@ mod bench_resolve;
 pub mod bench_run;
 mod bench_selfstart;
 pub(crate) mod flag_values;
+pub(crate) mod graph_config;
 mod serve_args;
 mod validate;
 pub use bench_args::BenchmarkArgs;

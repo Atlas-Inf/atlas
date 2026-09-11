@@ -368,52 +368,8 @@ impl TransformerModel {
     /// scheduler quiescence on the CUDA-bound model thread (like
     /// `free_sequence`'s destroys).
     pub(super) fn destroy_lora_decode_graphs(&self) {
-        let drain = |name: &str, graphs: Vec<spark_runtime::gpu::GraphHandle>| {
-            for g in graphs {
-                if g.0 != 0
-                    && let Err(e) = self.gpu.destroy_graph(g)
-                {
-                    tracing::warn!("LoRA graph clear: destroy {name}: {e:#}");
-                }
-            }
-        };
-        drain(
-            "decode_graph",
-            self.decode_graph.lock().drain().map(|(_, g)| g).collect(),
-        );
-        drain(
-            "batch_decode_graph",
-            self.batch_decode_graphs
-                .lock()
-                .0
-                .drain()
-                .map(|(_, (g, _))| g)
-                .collect(),
-        );
-        drain(
-            "verify2_graph",
-            self.verify2_graph.lock().drain().map(|(_, g)| g).collect(),
-        );
-        drain(
-            "verify3_graph",
-            self.verify3_graph.lock().drain().map(|(_, g)| g).collect(),
-        );
-        drain(
-            "verify4_graph",
-            self.verify4_graph.lock().drain().map(|(_, g)| g).collect(),
-        );
-        drain(
-            "verify_kgamma_graph",
-            self.verify_kgamma_graph
-                .lock()
-                .drain()
-                .map(|(_, g)| g)
-                .collect(),
-        );
-        drain(
-            "fused_graph",
-            self.fused_graph.lock().drain().map(|(_, g)| g).collect(),
-        );
+        self.graph_runtime
+            .clear_captured(spark_runtime::graph_runtime::GraphFallbackReason::StaleKey);
     }
 
     /// Runtime adapter rotation (eager-on-rotate). Selects the resident

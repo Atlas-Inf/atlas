@@ -29,13 +29,17 @@ mod decode_graph_key;
 mod drafter_prefill;
 mod ep_misc;
 mod graph_borrow;
+mod graph_identity;
 mod lm_head_batched;
 mod meta;
 mod meta_argmax;
 mod prefill_a;
+mod prefill_a_compute;
 mod prefill_b;
 mod prefill_c;
 mod prefill_d;
+mod prefill_graph;
+mod prefill_prewarm;
 mod sequence;
 mod speculative;
 pub(in crate::model) mod ssm_fault_in;
@@ -94,6 +98,9 @@ impl Model for TransformerModel {
     // `drafter_prefill.rs`. Kill switch `ATLAS_NO_MTP_EAGER_DRAFTER`.
     fn tokens_contain_vision_pad(&self, tokens: &[u32]) -> bool {
         self.tokens_have_vision_pad(tokens)
+    }
+    fn prewarm_graphs(&self) -> Result<usize> {
+        self.prewarm_graphs_dispatch()
     }
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
         self.stamp_overlay_route(seq.adapter_slot);

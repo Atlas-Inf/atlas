@@ -92,6 +92,7 @@ pub(crate) fn build_model(
     lora_args: Option<spark_model::factory::LoraBuildArgs<'_>>,
     nllb_lang: Option<(u32, u32)>,
     nllb_lora_dir: Option<std::path::PathBuf>,
+    graph_runtime_config: spark_runtime::graph_runtime::GraphRuntimeConfig,
 ) -> Result<Box<dyn spark_model::traits::Model>> {
     let mtp_quant: spark_model::layers::MtpQuantization = args
         .mtp_quantization
@@ -106,12 +107,12 @@ pub(crate) fn build_model(
         args.max_seq_len,
         args.max_batch_size,
         mtp_quant,
-        args.speculative || args.dflash,
+        args.speculative || args.dflash_family(),
         prefix_cache,
         args.mtp_vocab,
         comm,
         args.self_speculative || args.ngram_speculative,
-        if args.dflash {
+        if args.dflash_family() {
             checked_dflash_num_drafts(args.dflash_gamma)?
         } else {
             args.resolved_num_drafts()
@@ -127,6 +128,7 @@ pub(crate) fn build_model(
         lora_args,
         nllb_lang,
         nllb_lora_dir,
+        graph_runtime_config,
     )
     .context("Failed to build model")
 }
@@ -207,8 +209,12 @@ pub(crate) fn maybe_run_ep_worker(
     let rank = args.rank;
     let model_owned = model.take().expect("EP worker requires owned model");
     let model_has_proposer = model_owned.has_proposer();
-    if !args.speculative && !args.self_speculative && !args.ngram_speculative && model_has_proposer
-    {
+    // `--dflash`/`--dspark` count as speculative methods here: a DFlash-family
+    // worker participates in the head's speculative dispatch, so it must not
+    // trip the "started WITHOUT any --speculative flag" bail.
+    let worker_spec =
+        args.speculative || args.self_speculative || args.ngram_speculative || args.dflash_family();
+    if !worker_spec && model_has_proposer {
         let override_set = matches!(
             std::env::var("ATLAS_ALLOW_SPEC_MISMATCH").as_deref(),
             Ok("1") | Ok("true")

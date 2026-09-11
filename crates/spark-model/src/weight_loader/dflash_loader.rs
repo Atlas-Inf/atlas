@@ -92,6 +92,18 @@ pub struct DflashConfig {
     pub markov_rank: Option<usize>,
 }
 
+impl DflashConfig {
+    /// True when this drafter checkpoint ships D-Spark proposer artifacts: a
+    /// Markov head (`markov_rank > 0`) or Lightning DSpark's
+    /// `dspark_markov_rank`. Single source of truth for D-Spark drafter
+    /// detection — `--dspark` validation and the graph runtime's algorithm
+    /// inference both read it, so they cannot drift.
+    pub fn is_dspark(&self) -> bool {
+        self.markov_rank.is_some_and(|rank| rank > 0)
+            || self.dspark_markov_rank.is_some_and(|rank| rank > 0)
+    }
+}
+
 fn default_rope_theta() -> f32 {
     10_000_000.0
 }

@@ -53,7 +53,7 @@ pub(super) fn ssm_h_fp16_preconditions(args: &cli::ServeArgs, config: &ModelConf
     // the same fluent-garbage failure the `--num-drafts > 3` refusal below
     // exists for. It applies to stage 1/2 f16 as much as to the f16-SIZED
     // pool, which is why it sits above the stage-3 branch.
-    if args.dflash {
+    if args.dflash_family() {
         anyhow::bail!(
             "--ssm-h-dtype f16 is incompatible with --dflash: the DFlash verify width \
              (gamma + 1 = 17) dispatches gated_delta_rule_wy17, which has no FP16 h-state \
