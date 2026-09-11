@@ -23,6 +23,35 @@ pub fn dflash_verify_uses_raw_argmax(
     raw_requested && !masked_requested && !lightning_product
 }
 
+/// Per-sequence refinement of the process-wide DFlash raw-argmax verify
+/// mode. The shortcut is only honest when this sequence's verify pick is
+/// provably the raw argmax — penalty-neutral, no grammar mask, no EOS
+/// suppression. Anything else (presence/frequency/repetition penalties,
+/// logit bias, LZ/DRY, grammar, tool-call EOS masking) takes the pipeline
+/// branch so the emitted stream follows the request's sampling parameters.
+/// Verify positions are greedy argmax by design (`PositionKind::Verify`),
+/// so a nonzero request temperature does not itself disqualify the raw
+/// path — only transforms that can move the argmax do.
+pub fn dflash_seq_uses_raw_argmax(
+    raw_requested: bool,
+    masked_requested: bool,
+    lightning_product: bool,
+    a: &crate::scheduler::types::ActiveSeq,
+) -> bool {
+    dflash_verify_uses_raw_argmax(raw_requested, masked_requested, lightning_product)
+        && a.grammar_state.is_none()
+        && !a.require_tool_call
+        && crate::scheduler::fast_greedy::classify_penalties(
+            &crate::scheduler::sample_step::penalty_params_for(
+                a,
+                crate::scheduler::sample_step::PositionKind::Verify,
+                0.0,
+                None,
+                Vec::new(),
+            ),
+        ) == crate::scheduler::fast_greedy::PenaltyGate::Neutral
+}
+
 #[cfg(test)]
 mod dflash_verify_policy_tests {
     use super::dflash_verify_uses_raw_argmax;
@@ -38,6 +67,31 @@ mod dflash_verify_policy_tests {
         assert!(dflash_verify_uses_raw_argmax(true, false, false));
         assert!(!dflash_verify_uses_raw_argmax(true, true, false));
         assert!(!dflash_verify_uses_raw_argmax(false, false, false));
+    }
+
+    #[test]
+    fn per_sequence_gate_stays_raw_only_for_neutral_greedy() {
+        use super::dflash_seq_uses_raw_argmax;
+        let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1, 2, 3], 10, None, 32);
+        // Neutral penalties + no grammar + no tool-call EOS suppression:
+        // the verify pick is provably the raw argmax — shortcut stays on.
+        assert!(dflash_seq_uses_raw_argmax(true, false, false, &a));
+        // The non-thinking preset ships presence_penalty=1.5 — a reduce-only
+        // penalty that CAN flip the argmax against already-emitted tokens.
+        a.presence_penalty = 1.5;
+        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
+        a.presence_penalty = 0.0;
+        a.repetition_penalty = 1.05;
+        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
+        a.repetition_penalty = 1.0;
+        a.dry_multiplier = 0.4;
+        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
+        a.dry_multiplier = 0.0;
+        a.require_tool_call = true;
+        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
+        // Process-wide flag still dominates: raw off stays off per-seq.
+        a.require_tool_call = false;
+        assert!(!dflash_seq_uses_raw_argmax(false, false, false, &a));
     }
 }
 
