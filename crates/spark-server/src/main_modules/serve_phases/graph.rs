@@ -171,7 +171,11 @@ fn policies(args: &cli::ServeArgs, mode: GraphMode) -> Result<GraphPolicies> {
         quota(15, segmented),
         quota(30, true),
         quota(30, true),
-        quota(10, segmented),
+        // Propose is the DFlash / D-Spark drafter's piecewise capture — the
+        // speculative path itself, not an optional segment. It ran by default
+        // before the graph runtime existed, so gating it to Breakable/Piecewise
+        // silently turned every default-mode serve's drafter eager.
+        quota(10, true),
         quota(15, true),
     )
     .map_err(anyhow::Error::msg)

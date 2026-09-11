@@ -946,7 +946,22 @@ impl BlockDiffusionDraftHead {
                                 return Ok(None);
                             }
                         };
-                        self.graph_runtime.launch(&managed, stream)?;
+                        if let Err(error) = self.graph_runtime.launch(&managed, stream) {
+                            // The runtime refused the replay (e.g. the Propose
+                            // phase's replay policy is off in this graph mode).
+                            // That is a configuration answer, not a propose
+                            // failure: drop the graph we just registered and run
+                            // the segment eagerly so the drafter keeps working.
+                            tracing::warn!(
+                                "DFlash propose graph launch refused ({error}); running eager"
+                            );
+                            self.graph_runtime.invalidate(
+                                managed.key(),
+                                spark_runtime::graph_runtime::GraphFallbackReason::PhaseDisabled,
+                            );
+                            body()?;
+                            return Ok(None);
+                        }
                         Ok(Some(managed.key().clone()))
                     };
 
