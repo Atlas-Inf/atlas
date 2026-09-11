@@ -1085,6 +1085,14 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         // expanded scales; native HIP also reclaims copied sources.
                         gpu.free(qkv_f.row_scale)?;
                         gpu.free(z_f.row_scale)?;
+                        // The concat duplicated qkv+z into `qkvz_f` — the store's
+                        // in_proj_qkv / in_proj_z weight buffers are now dead and
+                        // reclaimable (~83MB/layer × 48 ≈ 4GB on Strix UMA, where
+                        // the resident footprint gates the KV budget). out_proj is
+                        // NOT freed: `out_f` references the live store buffer.
+                        // HIP-gated: the fp8-prefill-copy path can still re-read
+                        // the sources on CUDA, so only the UMA-constrained HIP
+                        // build frees them early.
                         if cfg!(atlas_hip) {
                             store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight"))?;
                             store.reclaim(gpu, &format!("{la}.in_proj_z.weight"))?;
@@ -1248,7 +1256,8 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // way; the NVFP4 build continues underneath because decode
                     // still needs it — `w8a16_gemv` cannot index a per-row
                     // scale. See weight_loader/qwen35_dense/rowwise_fp8.rs.
-                    let rowwise_gdn = rowwise_fp8::rowwise_fp8_enabled()
+                    let rowwise_gdn = (rowwise_fp8::rowwise_fp8_enabled()
+                        || std::env::var("ATLAS_GDN_FP8_DECODE").ok().as_deref() == Some("1"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.in_proj_qkv"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.in_proj_z"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.out_proj"));
@@ -1422,9 +1431,36 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             gpu,
                         )?;
                         layer.out_proj_dense = Some(out_proj_dense);
-                        fp8_preservation::reclaim_gdn_bf16_sources(
-                            store, gpu, stream, &la, tp_size,
-                        )?;
+                        // ATLAS_GDN_FP8_DECODE: also install the checkpoint's
+                        // native per-row FP8 weights (loaded above, before
+                        // `load_ssm_proj` consumed the store tensors) for
+                        // DECODE only. Prefill keeps the BF16 dequant (the
+                        // GDN precision policy above); decode then reads HALF
+                        // the weight bytes through the `dense_gemv_fp8w`
+                        // family — with zero requant error, since the FP8 on
+                        // disk is the source the BF16 dequant was made from.
+                        //
+                        // `out_proj_rowwise.weight` ALIASES the store's
+                        // out_proj buffer (load_fp8_per_row returns the store
+                        // ptr; only qkvz is a fresh concat copy). The bf16
+                        // source reclaim frees in_proj_qkv/in_proj_z/out_proj —
+                        // so when the FP8 copies install it must NOT run, or the
+                        // decode GEMV reads freed pages.
+                        let gdn_fp8d_installed =
+                            std::env::var("ATLAS_GDN_FP8_DECODE").ok().as_deref() == Some("1")
+                                && qkvz_rowwise.is_some();
+                        if gdn_fp8d_installed {
+                            layer.set_fp8_rowwise_prefill_weights(qkvz_rowwise, out_proj_rowwise);
+                            tracing::info!(
+                                "SSM[{lp}] ATLAS_GDN_FP8_DECODE: qkvz + out_proj \
+                                 native per-row FP8 decode copies installed"
+                            );
+                        }
+                        if !gdn_fp8d_installed {
+                            fp8_preservation::reclaim_gdn_bf16_sources(
+                                store, gpu, stream, &la, tp_size,
+                            )?;
+                        }
                         tracing::info!(
                             "SSM[{lp}] ATLAS_GDN_BF16_WEIGHTS: qkvz + out_proj kept BF16 \
                              (≥FP8; NVFP4 requant skipped)"

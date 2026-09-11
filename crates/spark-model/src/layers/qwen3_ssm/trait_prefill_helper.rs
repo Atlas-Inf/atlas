@@ -61,8 +61,15 @@ impl Qwen3SsmLayer {
         // PER-ROW FP8 from the checkpoint (`ATLAS_FP8_ROWWISE=1`), dequantised
         // once to BF16 — see the matching arm in `trait_prefill_proj.rs` for
         // why BF16 and not the row-wise FP8 GEMM. First because it is the only
-        // arm that never re-quantises.
-        if let Some(ref fp8w) = self.out_proj_fp8w_rowwise {
+        // arm that never re-quantises. Gated on the PREFILL opt-in env: the
+        // field is also installed by ATLAS_GDN_FP8_DECODE for DECODE-only use,
+        // where routing prefill through cuBLASLt would be wrong (and faults on
+        // the HIP compat shim).
+        let fp8_rowwise_prefill = matches!(
+            std::env::var("ATLAS_FP8_ROWWISE").ok().as_deref(),
+            Some("1")
+        );
+        if fp8_rowwise_prefill && let Some(ref fp8w) = self.out_proj_fp8w_rowwise {
             return ops::cublas_bf16_proj(
                 ctx.gpu,
                 ctx.derived,

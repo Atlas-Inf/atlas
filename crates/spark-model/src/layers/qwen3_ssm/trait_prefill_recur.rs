@@ -107,6 +107,32 @@ impl Qwen3SsmLayer {
                     return seg(cl, k - cl as u32);
                 }
             }
+            // FLA chunked path (recompute_wu → chunk_delta_h_vfused → fwd_o):
+            // the HIP-ported kernels keep state in registers/small smem, unlike
+            // the smem-H variants that exceed the 64KB LDS cap. Reached only
+            // when no mid-chunk capture applies above — captures need split4's
+            // segmented h_state chaining, which FLA's fused chunks can't expose.
+            // gdn_exact_replay stays on split4 (see fla_dispatch.rs).
+            if self.fla_gdn_prefill_atlas_scale(
+                ctx,
+                h_state,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                gates_buf,
+                gates_buf.offset(nv * fp32),
+                gdn_out_buf,
+                k,
+                nk,
+                nv,
+                kd,
+                vd,
+                conv_dim,
+                gb_stride,
+                stream,
+            )? {
+                return Ok(());
+            }
             return ops::gdn_prefill_split4(
                 ctx.gpu,
                 self.gdn_prefill_split4_k,

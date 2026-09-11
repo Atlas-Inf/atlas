@@ -40,6 +40,39 @@ pub fn dense_gemv_fp8w_batch2(
         .launch(stream)
 }
 
+/// Per-row-scaled FP8 batched GEMV (M<=8). `input` is `[M, K]` BF16,
+/// `output` is M rows at `output + t*out_stride` BF16. One pass over the
+/// FP8 weight serves all M rows — the M<=8 sibling of `dense_gemv_fp8w`,
+/// with the same per-row K-order and end-of-dot-product scale application.
+/// `out_stride` decouples output row stride from N (e.g. the multi-token
+/// verify projection buffer). Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_fp8w_batchm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &Fp8DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.row_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(out_stride)
+        .launch(stream)
+}
+
 /// Block-scaled FP8 batched GEMV (M<=4). `input` is `[M, K]` BF16, `output` is
 /// `[M, N]` BF16; `weight`/`block_scale` are the raw `w8a16_gemv` pointers (2D
 /// block-scaled FP8). One pass over the FP8 weight serves all M rows — the M=4

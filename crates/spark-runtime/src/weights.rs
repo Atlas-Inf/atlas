@@ -24,10 +24,30 @@ pub(crate) fn evict_page_cache(file: &std::fs::File) {
     }
 }
 
+/// Windows UMA (Strix Halo gfx1151): the mmap'd safetensors pages stay
+/// resident in the unified pool and `cuMemGetInfo` counts them as GPU-used —
+/// the loader reads ~2x the on-disk size. `DiscardVirtualMemory` is the
+/// POSIX_FADV_DONTNEED equivalent: it drops the clean file-backed pages from
+/// the working set. Takes the mapping's base+len (the file alone can't
+/// address the mapped range).
+#[cfg(target_os = "windows")]
+pub(crate) fn evict_page_cache_range(addr: *const u8, len: usize) {
+    use std::ffi::c_void;
+    unsafe extern "system" {
+        fn DiscardVirtualMemory(addr: *mut c_void, size: usize) -> u32;
+    }
+    if !addr.is_null() && len > 0 {
+        unsafe {
+            DiscardVirtualMemory(addr as *mut c_void, len);
+        }
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn evict_page_cache(_file: &std::fs::File) {
     // No-op: macOS/BSD have no posix_fadvise. Apple Silicon UMA already
-    // shares page cache with the GPU pool, so eviction is unnecessary.
+    // shares page cache with the GPU pool, so eviction is unnecessary. On
+    // Windows the range form above does the real work — this stays a no-op.
 }
 
 /// Data type of a weight tensor.

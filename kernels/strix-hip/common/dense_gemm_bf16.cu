@@ -189,60 +189,77 @@ extern "C" __global__ void dense_gemm_f32in_f32out(
 //   Per-thread prefetch regs: A 8 elems, B 8 elems (128*16/256 = 8 each).
 #define DP_M_TILE 128
 #define DP_N_TILE 128
-#define DP_K_STEP 16
+#define DP_K_STEP 32
 #define DP_THREADS 256
-#define DP_PAD 2
+#define DP_PAD 8
 #define DP_NSUB (DP_N_TILE / 16)                         // 8
-#define DP_A_EPT ((DP_M_TILE * DP_K_STEP) / DP_THREADS)  // 8
-#define DP_B_EPT ((DP_K_STEP * DP_N_TILE) / DP_THREADS)  // 8
 
 typedef __bf16 dp_v16bf __attribute__((ext_vector_type(16)));
 typedef float  dp_v8f   __attribute__((ext_vector_type(8)));
 
+// gfx1151: vectorized register prefetch — A tile [128][32] bf16 = 512 uint4,
+// 256 threads -> 2x uint4 (thread covers half a row). B stays k-major in
+// smem ([32][128]: WMMA B-fragments read adjacent columns = conflict-free);
+// the n-major gmem loads are transposed on store.
+// smem: A 2*128*(32+8)*2 + B 2*32*(128+8)*2 = 20.5+17.4 = 38 KB (< 64 KB).
+
 __device__ __forceinline__ void dp_load_A_regs(
-    const __nv_bfloat16* __restrict__ A, __nv_bfloat16 reg_A[DP_A_EPT],
+    const __nv_bfloat16* __restrict__ A, uint4 reg_A[2],
     unsigned int cta_m, unsigned int k_base, unsigned int M, unsigned int K
 ) {
+    const unsigned int row = threadIdx.x >> 1;              // 0..127
+    const unsigned int col = (threadIdx.x & 1) << 4;        // 0 or 16
+    const unsigned int gr = cta_m + row;
     #pragma unroll
-    for (unsigned int i = 0; i < DP_A_EPT; i++) {
-        unsigned int idx = threadIdx.x * DP_A_EPT + i;
-        unsigned int row = idx / DP_K_STEP, col = idx % DP_K_STEP;
-        unsigned int gr = cta_m + row, gc = k_base + col;
-        reg_A[i] = (gr < M && gc < K) ? A[(unsigned long long)gr * K + gc] : __float2bfloat16(0.0f);
+    for (int h = 0; h < 2; h++) {
+        const unsigned int gc = k_base + col + h * 8;
+        reg_A[h] = (gr < M && gc + 7 < K)
+            ? *(const uint4*)&A[(unsigned long long)gr * K + gc]
+            : uint4{0, 0, 0, 0};
     }
 }
 
 __device__ __forceinline__ void dp_load_B_regs(
-    const __nv_bfloat16* __restrict__ B, __nv_bfloat16 reg_B[DP_B_EPT],
+    const __nv_bfloat16* __restrict__ B, uint4 reg_B[2],
     unsigned int cta_n, unsigned int k_base, unsigned int N, unsigned int K
 ) {
-    // smem_B is [K_STEP][N_TILE]: element (k, n). B is [N, K] row-major.
+    // n-major gmem load (vectorized); stored n-major so frag reads vectorize.
+    const unsigned int n = threadIdx.x >> 1;                // 0..127
+    const unsigned int col = (threadIdx.x & 1) << 4;        // 0 or 16
+    const unsigned int gn = cta_n + n;
     #pragma unroll
-    for (unsigned int i = 0; i < DP_B_EPT; i++) {
-        unsigned int idx = threadIdx.x * DP_B_EPT + i;
-        unsigned int k = idx / DP_N_TILE, n = idx % DP_N_TILE;
-        unsigned int gk = k_base + k, gn = cta_n + n;
-        reg_B[i] = (gk < K && gn < N) ? B[(unsigned long long)gn * K + gk] : __float2bfloat16(0.0f);
+    for (int h = 0; h < 2; h++) {
+        const unsigned int gk = k_base + col + h * 8;
+        reg_B[h] = (gn < N && gk + 7 < K)
+            ? *(const uint4*)&B[(unsigned long long)gn * K + gk]
+            : uint4{0, 0, 0, 0};
     }
 }
 
 __device__ __forceinline__ void dp_store_A_regs(
-    __nv_bfloat16 smem_A[][DP_K_STEP + DP_PAD], const __nv_bfloat16 reg_A[DP_A_EPT]
+    __nv_bfloat16 smem_A[][DP_K_STEP + DP_PAD], const uint4 reg_A[2]
 ) {
+    const unsigned int row = threadIdx.x >> 1;
+    const unsigned int col = (threadIdx.x & 1) << 4;
     #pragma unroll
-    for (unsigned int i = 0; i < DP_A_EPT; i++) {
-        unsigned int idx = threadIdx.x * DP_A_EPT + i;
-        smem_A[idx / DP_K_STEP][idx % DP_K_STEP] = reg_A[i];
-    }
+    for (int h = 0; h < 2; h++)
+        *(uint4*)&smem_A[row][col + h * 8] = reg_A[h];
 }
 
 __device__ __forceinline__ void dp_store_B_regs(
-    __nv_bfloat16 smem_B[][DP_N_TILE + DP_PAD], const __nv_bfloat16 reg_B[DP_B_EPT]
+    __nv_bfloat16 smem_B[][DP_N_TILE + DP_PAD], const uint4 reg_B[2]
 ) {
+    // k-major smem [K_STEP][N_TILE]: WMMA B-fragments read a row of adjacent
+    // columns (conflict-free scalar reads beat vectorized-but-conflicted
+    // n-major reads on gfx1151 — measured: qkvz 85ms vs 107/127ms).
+    const unsigned int n = threadIdx.x >> 1;
+    const unsigned int col = (threadIdx.x & 1) << 4;
     #pragma unroll
-    for (unsigned int i = 0; i < DP_B_EPT; i++) {
-        unsigned int idx = threadIdx.x * DP_B_EPT + i;
-        smem_B[idx / DP_N_TILE][idx % DP_N_TILE] = reg_B[i];
+    for (int h = 0; h < 2; h++) {
+        const __nv_bfloat16* v = (const __nv_bfloat16*)&reg_B[h];
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            smem_B[col + h * 8 + j][n] = v[j];
     }
 }
 
@@ -251,15 +268,18 @@ __device__ __forceinline__ void dp_wmma_compute(
     __nv_bfloat16 smem_B[][DP_N_TILE + DP_PAD],
     dp_v8f acc[DP_NSUB], unsigned int warp_m_offset, unsigned int lane
 ) {
-    dp_v16bf a;
     #pragma unroll
-    for (int i = 0; i < 16; i++) a[i] = (__bf16)(float)smem_A[warp_m_offset + (lane & 15)][i];
-    #pragma unroll
-    for (int nb = 0; nb < DP_NSUB; nb++) {
-        dp_v16bf b;
+    for (int h = 0; h < DP_K_STEP / 16; h++) {
+        dp_v16bf a;
+        memcpy(&a, &smem_A[warp_m_offset + (lane & 15)][h * 16], 32);
         #pragma unroll
-        for (int k = 0; k < 16; k++) b[k] = (__bf16)(float)smem_B[k][nb * 16 + (lane & 15)];
-        acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]);
+        for (int nb = 0; nb < DP_NSUB; nb++) {
+            dp_v16bf b;
+            #pragma unroll
+            for (int k = 0; k < 16; k++)
+                b[k] = (__bf16)(float)smem_B[h * 16 + k][nb * 16 + (lane & 15)];
+            acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]);
+        }
     }
 }
 
@@ -286,8 +306,7 @@ void dense_gemm_bf16_pipelined(
 
     const unsigned int num_tiles = (K + DP_K_STEP - 1) / DP_K_STEP;
 
-    __nv_bfloat16 reg_A[DP_A_EPT];
-    __nv_bfloat16 reg_B[DP_B_EPT];
+    uint4 reg_A[2], reg_B[2];
     dp_load_A_regs(A, reg_A, cta_m, 0, M, K);
     dp_load_B_regs(B, reg_B, cta_n, 0, N, K);
     dp_store_A_regs(smem_A[0], reg_A);
