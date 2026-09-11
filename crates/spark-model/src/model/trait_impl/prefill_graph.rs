@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use spark_runtime::graph_runtime::{
-    GraphCost, GraphFallbackReason, GraphIdentity, GraphMode, GraphPayload, GraphPhase,
-    GraphRuntimeError, GraphSegment,
+    CompatibilityDecision, GraphCost, GraphFallbackReason, GraphIdentity, GraphMode, GraphPayload,
+    GraphPhase, GraphRuntimeError, GraphSegment,
 };
 
 use super::super::types::TransformerModel;
@@ -27,17 +27,27 @@ impl TransformerModel {
                 "prefill requires breakable or piecewise capture",
             );
         }
-        if self.profile {
-            return self.decline_prefill_graph(
-                GraphFallbackReason::Profiling,
-                "prefill profiling synchronizes after kernels",
+        // Feature compatibility (profiling, KV offload) is enforced through
+        // the runtime's registry, so the declared rule set and the actual
+        // fallback cannot drift: both the rule id and its reason are recorded.
+        let active_rules = [
+            self.profile.then_some("profile"),
+            hss_engaged.then_some("high_speed_swap"),
+        ];
+        if let CompatibilityDecision::EagerFallback {
+            rule_id,
+            reason,
+            detail,
+        } = self
+            .graph_runtime
+            .compatibility(active_rules.into_iter().flatten(), GraphPhase::Prefill)
+        {
+            tracing::debug!(
+                target: "atlas::cuda_graph",
+                rule = %rule_id,
+                "prefill graph eager fallback by compatibility rule"
             );
-        }
-        if hss_engaged {
-            return self.decline_prefill_graph(
-                GraphFallbackReason::HighSpeedSwap,
-                "prefill may perform host KV offload",
-            );
+            return self.decline_prefill_graph(reason, detail);
         }
         if self.comm.is_some() {
             return self.decline_prefill_graph(
@@ -368,14 +378,15 @@ impl TransformerModel {
     fn decline_prefill_graph(
         &self,
         reason: GraphFallbackReason,
-        detail: &'static str,
+        detail: impl Into<String>,
     ) -> Option<GraphIdentity> {
+        let detail = detail.into();
         self.graph_runtime
             .record_eager_fallback(GraphPhase::Prefill, reason);
         tracing::debug!(
             target: "atlas::cuda_graph",
             reason = reason.label(),
-            detail,
+            detail = %detail,
             "prefill graph eager fallback"
         );
         None
