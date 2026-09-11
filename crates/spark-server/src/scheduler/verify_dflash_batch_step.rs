@@ -124,10 +124,11 @@ pub(super) fn step_verify_dflash_batched(
         let a = &mut batch[i];
         let drafts = &drafts_per_seq[i];
         let raw = &results[off[i]..off[i + 1]];
-        let verified: Vec<u32> = if crate::scheduler::helpers::dflash_verify_uses_raw_argmax(
+        let verified: Vec<u32> = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
             dflash_verify_raw_argmax,
             sched.levers.dflash_masked_verify,
             model.is_lightning_dspark_product(),
+            a,
         ) {
             raw.to_vec()
         } else {
