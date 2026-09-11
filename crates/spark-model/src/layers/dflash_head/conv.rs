@@ -79,7 +79,7 @@ impl Dflash2Conv {
         if let Some(k) = conv_kernel {
             let total_elems = gamma * h;
             let block_size = 256u32;
-            let grid_size = (total_elems + block_size - 1) / block_size;
+            let grid_size = total_elems.div_ceil(block_size);
             KernelLaunch::new(gpu, k)
                 .grid([grid_size, 1, 1])
                 .block([block_size, 1, 1])
@@ -115,7 +115,7 @@ impl Dflash2Conv {
         if let Some(k) = conv_kernel {
             let total_elems = gamma * h;
             let block_size = 256u32;
-            let grid_size = (total_elems + block_size - 1) / block_size;
+            let grid_size = total_elems.div_ceil(block_size);
             KernelLaunch::new(gpu, k)
                 .grid([grid_size, 1, 1])
                 .block([block_size, 1, 1])

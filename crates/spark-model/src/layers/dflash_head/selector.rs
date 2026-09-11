@@ -3,10 +3,9 @@
 //! DFlash2 bilinear CandidateSelector.
 //!
 //! Evaluates candidate tokens along the sequential chain from the anchor:
-//! 1. Identifies top-k candidate tokens from drafter unary logits at each step t.
-//! 2. Evaluates context transition score:
-//!      Score(b) = Unary(b) + < Pred[prev] ⊙ H_proj(h_t), Succ[b] >
-//! 3. Greedily selects the highest-scoring candidate and advances the chain.
+//! `Score(b) = Unary(b) + <Pred[prev] ⊙ H_proj(h_t), Succ[b]>` applied to the
+//! top-k unary candidates at each step t; the highest-scoring candidate
+//! advances the chain.
 
 use anyhow::Result;
 use half::bf16;
