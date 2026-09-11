@@ -104,6 +104,9 @@ int cuMemsetD8Async(unsigned long long a, unsigned char b, unsigned long c, void
 int cuMemsetD32Async(unsigned long long a, unsigned int b, unsigned long c, void *d) {
     (void)a; (void)b; (void)c; (void)d; return 100;
 }
+/* Driver version (graph-runtime environment fingerprint). */
+int cuDriverGetVersion(int *a) { (void)a; return 100; }
+int cuEventQuery(void *a) { (void)a; return 100; }
 /* Graphs */
 int cuGraphInstantiateWithFlags(void **a, void *b, unsigned long long c) {
     (void)a; (void)b; (void)c; return 100;
@@ -111,6 +114,40 @@ int cuGraphInstantiateWithFlags(void **a, void *b, unsigned long long c) {
 int cuGraphLaunch(void *a, void *b) { (void)a; (void)b; return 100; }
 int cuGraphExecDestroy(void *a) { (void)a; return 100; }
 int cuGraphDestroy(void *a) { (void)a; return 100; }
+int cuGraphDebugDotPrint(void *a, const char *b, unsigned int c) {
+    (void)a; (void)b; (void)c; return 100;
+}
+/* Conditional nodes + capture-to-graph (IF/ELSE, bounded WHILE). */
+int cuGraphConditionalHandleCreate(unsigned long long *a, void *b, void *c,
+                                   unsigned int d, unsigned int e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; return 100;
+}
+int cuGraphAddNode_v2(void **a, void *b, void **c, void **d, unsigned long e, void *f) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; return 100;
+}
+int cuGraphAddKernelNode_v2(void **a, void *b, void **c, unsigned long d, void *e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; return 100;
+}
+int cuStreamBeginCaptureToGraph(void *a, void *b, void *c, void *d,
+                                unsigned long e, int f) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; return 100;
+}
+int cuGraphAddNode(void **a, void *b, void **c, unsigned long d, void *e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; return 100;
+}
+int cuGraphAddEmptyNode(void **a, void *b, void **c, unsigned long d) {
+    (void)a; (void)b; (void)c; (void)d; return 100;
+}
+int cuGraphAddChildGraphNode(void **a, void *b, void **c, unsigned long d, void *e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; return 100;
+}
+int cuGraphInstantiate(void **a, void *b, unsigned long long c) {
+    (void)a; (void)b; (void)c; return 100;
+}
+int cuGraphUpload(void *a, void *b) { (void)a; (void)b; return 100; }
+int cuGraphExecUpdate(void *a, void *b, void **c, int *d) {
+    (void)a; (void)b; (void)c; (void)d; return 100;
+}
 EOF
 cc -shared -fPIC -nostdlib -o /tmp/libcuda.so /tmp/libcuda_stub.c
 sudo install -m 0644 /tmp/libcuda.so "$DEST/libcuda.so"
