@@ -230,9 +230,17 @@ pub fn step_ngram(
         }
         a.last_token = tok;
 
-        // N-gram propose (CPU-only, zero GPU cost)
-        if let Some(draft) = proposer.propose(&a.seq.tokens) {
-            a.pending_drafts = vec![draft];
+        // N-gram propose (CPU-only, zero GPU cost): a chain of up to
+        // `num_drafts` tokens — prompt-lookup continuation extended through
+        // the learned n-gram table (llama.cpp-style). Chain is capped at 3:
+        // the graphed verifies top out at K=4.
+        // `a.last_token` is sampled-but-not-pushed (verify_b comment): the
+        // searchable context ends at the emitted token, not tokens.last().
+        let mut ngram_ctx = a.seq.tokens.clone();
+        ngram_ctx.push(a.last_token);
+        let chain = proposer.propose_chain(&ngram_ctx);
+        if !chain.is_empty() {
+            a.pending_drafts = chain;
 
             // Checkpoint SSM for potential rollback during verify
             if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
@@ -243,7 +251,7 @@ pub fn step_ngram(
     }
 }
 
-/// Verify a single N-gram draft via CUDA-graphed K=2 path.
+/// Verify an N-gram draft chain via the CUDA-graphed K=2/3/4 verify paths.
 pub fn step_ngram_verify(
     model: &dyn Model,
     a: &mut ActiveSeq,
@@ -261,15 +269,26 @@ pub fn step_ngram_verify(
     }
     let sync_us = t_sync.elapsed().as_micros();
 
-    // EP: broadcast verify K=2 command + tokens
-    let tokens_k2 = [a.last_token, drafts[0]];
-    if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF2) {
+    // Verify width k = drafts + 1; the graphed verifies top out at K=4.
+    let nd = drafts.len().min(3);
+    let k = nd + 1;
+    let ep_cmd = match k {
+        2 => 0xFFFFFFF2u32,
+        3 => 0xFFFFFFF3u32,
+        _ => 0xFFFFFFF4u32,
+    };
+    let mut tokens = Vec::with_capacity(k);
+    tokens.push(a.last_token);
+    tokens.extend_from_slice(&drafts[..nd]);
+
+    // EP: broadcast verify command + tokens
+    if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, ep_cmd) {
         tracing::error!("EP broadcast ngram verify cmd: {e:#}");
         a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
-    for &t in &tokens_k2 {
+    for &t in &tokens {
         if let Err(e) = model.ep_broadcast_cmd(t) {
             tracing::error!("EP broadcast ngram verify token: {e:#}");
             a.engine_error = Some(format!("{e:#}"));
@@ -279,118 +298,129 @@ pub fn step_ngram_verify(
     }
 
     let t_verify = Instant::now();
-    let result = match model.decode_verify_graphed(&tokens_k2, &mut a.seq, 0) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("ngram decode_verify_graphed: {e:#}");
-            a.engine_error = Some(format!("{e:#}"));
-            a.finished = true;
-            return;
-        }
-    };
+    let verified_raw: Vec<u32> = match k {
+        2 => model
+            .decode_verify_graphed(&[tokens[0], tokens[1]], &mut a.seq, 0)
+            .map(|r| r.to_vec()),
+        3 => model
+            .decode_verify_graphed_k3(&[tokens[0], tokens[1], tokens[2]], &mut a.seq, 0)
+            .map(|r| r.to_vec()),
+        _ => model
+            .decode_verify_graphed_k4(
+                &[tokens[0], tokens[1], tokens[2], tokens[3]],
+                &mut a.seq,
+                0,
+            )
+            .map(|r| r.to_vec()),
+    }
+    .unwrap_or_else(|e| {
+        tracing::error!("ngram decode_verify_graphed (k={k}): {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
+        a.finished = true;
+        Vec::new()
+    });
+    if a.finished {
+        return;
+    }
     let verify_us = t_verify.elapsed().as_micros();
     a.last_token_time = Instant::now();
-    let [v0_argmax, v1_argmax] = result;
 
-    // Phase C-2 (2026-05-24): apply the full pre-sample
-    // logits-processor pipeline to each verify position before
-    // computing the accept/reject argmax. Without this, ngram-verify
-    // tokens escape mid-word / forced-think-end / pin-to-tool-call /
-    // grammar masks — see `verify_pipeline_helper` for the root-
-    // cause analysis.
+    // Pipeline picks per verify row (penalties/masks honored).
     let processed = crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
         model,
-        &[v0_argmax, v1_argmax],
+        &verified_raw,
         a,
         verify_ctx,
         0,
     );
-    let v0 = processed.first().copied().unwrap_or(v0_argmax);
-    let v1 = processed.get(1).copied().unwrap_or(v1_argmax);
-    let accepted = drafts[0] == v0;
+    let v: Vec<u32> = (0..k)
+        .map(|i| processed.get(i).copied().unwrap_or(verified_raw[i]))
+        .collect();
 
-    // EP: broadcast accept/reject to worker
-    if let Err(e) = model.ep_broadcast_cmd(accepted as u32) {
+    // Accept-prefix: draft[i] must equal the verified pick at row i.
+    let mut na = 0usize;
+    while na < nd && drafts[na] == v[na] {
+        na += 1;
+    }
+
+    // EP: broadcast accept count to worker
+    if let Err(e) = model.ep_broadcast_cmd(na as u32) {
         tracing::error!("EP broadcast ngram verify result: {e:#}");
         a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
 
-    if accepted {
-        // ── ACCEPTED: emit both tokens ──
-        // After verify_graphed, a.seq.tokens has [.., last_token, drafts[0]] appended.
-        // Observe: context ending with last_token → drafts[0] was correct
-        // Observe: context ending with drafts[0] → v1 is the next prediction
-        proposer.observe(&a.seq.tokens[..a.seq.tokens.len() - 1], drafts[0]);
-        proposer.observe(&a.seq.tokens, v1);
-
-        emit_token(a, drafts[0], None, sched);
-        if !a.finished {
-            emit_token(a, v1, None, sched);
+    if na < nd {
+        // Rewind the rejected tail: seq_len and tokens roll back 
+        // rows, then commit_accepted_prefix rewinds the aux (QSA indexer /
+        // PLE carry) by the same count and re-checkpoints.
+        a.seq.seq_len -= nd - na;
+        for _ in 0..(nd - na) {
+            a.seq.tokens.pop();
         }
-        if a.finished {
-            return;
-        }
-        a.last_token = v1;
-
-        // Full-accept commit (num_accepted=k=2): the verify kernel already
-        // wrote the canonical SSM state, and the rejected-tail aux rewind is
-        // a no-op — the call exists so this path shares the aux contract
-        // (QSA indexer / PLE carry) with the K=2 verify.
-        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 2, 2) {
-            tracing::error!("ngram accept commit: {e:#}");
-            a.engine_error = Some(format!("{e:#}"));
-            a.finished = true;
-            return;
-        }
-
-        // Checkpoint SSM for next verify
+    }
+    if let Err(e) = model.commit_accepted_prefix(&mut a.seq, na + 1, k) {
+        tracing::error!("ngram commit_accepted_prefix (k={k} na={na}): {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
+        a.finished = true;
+        return;
+    }
+    if na < nd {
+        // Keep a fresh SSM checkpoint for the next verify — the commit above
+        // already re-checkpointed after the rewind, matching the K-paths.
+    } else {
+        // Full accept: commit was a no-op; checkpoint for the next verify.
         if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
             tracing::error!("ngram accept checkpoint: {e:#}");
         }
+    }
 
-        // Propose next draft
-        if let Some(draft) = proposer.propose(&a.seq.tokens) {
-            a.pending_drafts = vec![draft];
+    // Observe accepted context into the dynamic table, then emit.
+    for j in 0..na {
+        let n = a.seq.tokens.len();
+        if n > 0 {
+            let last = a.seq.tokens[n - 1];
+            proposer.observe(&a.seq.tokens[..n - 1], last);
         }
-
-        if a.seq.seq_len.is_multiple_of(50) {
-            tracing::info!(
-                "NGRAM K2 ACCEPT: sync={sync_us}μs verify={verify_us}μs cache={} seq_len={}",
-                proposer.len(),
-                a.seq.seq_len,
-            );
-        }
-    } else {
-        // ── REJECTED: rollback SSM, emit v0 only ──
-        a.seq.seq_len -= 1;
-        a.seq.tokens.pop();
-
-        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 1, 2) {
-            tracing::error!("ngram rollback: {e:#}");
-            a.engine_error = Some(format!("{e:#}"));
-            a.finished = true;
-            return;
-        }
-
-        // After pop, a.seq.tokens has [.., last_token].
-        // Observe: context ending with last_token → v0 is the correct next token
-        proposer.observe(&a.seq.tokens, v0);
-
-        emit_token(a, v0, None, sched);
+        emit_token(a, drafts[j], None, sched);
         if a.finished {
             return;
         }
-        a.last_token = v0;
+    }
+    proposer.observe(&a.seq.tokens, v[na]);
+    emit_token(a, v[na], None, sched);
+    if a.finished {
+        return;
+    }
+    a.last_token = v[na];
 
-        // Propose next draft
-        if let Some(draft) = proposer.propose(&a.seq.tokens) {
-            a.pending_drafts = vec![draft];
-        }
+    if na == nd {
+        proposer.accepts += na as u64;
+    } else {
+        proposer.rejects += 1;
+    }
 
+    // Propose next chain — same off-by-one: last_token is emitted but not
+    // yet pushed to seq.tokens.
+    let mut ngram_ctx = a.seq.tokens.clone();
+    ngram_ctx.push(a.last_token);
+    let chain = proposer.propose_chain(&ngram_ctx);
+    if !chain.is_empty() {
+        a.pending_drafts = chain;
+    }
+
+    tracing::debug!(
+        "NGRAM detail: drafts={:?} v={:?} na={} seq_len={}",
+        &drafts[..nd],
+        v,
+        na,
+        a.seq.seq_len
+    );
+    if a.seq.seq_len.is_multiple_of(50) {
         tracing::info!(
-            "NGRAM K2 REJECT: sync={sync_us}μs verify={verify_us}μs cache={} seq_len={}",
+            "NGRAM K{k} {}: sync={sync_us}us verify={verify_us}us cache={} seq_len={} na={na}/{nd}",
+            if na == nd { "ACCEPT" } else { "REJECT" },
             proposer.len(),
             a.seq.seq_len,
         );

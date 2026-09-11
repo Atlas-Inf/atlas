@@ -232,6 +232,7 @@ pub fn run(
     max_batch_tokens: usize,
     use_self_speculative: bool,
     use_ngram_speculative: bool,
+    ngram_cache_path: Option<std::path::PathBuf>,
     swap_space_gb: usize,
     high_speed_swap_cfg: Option<spark_storage::HighSpeedSwapConfig>,
     block_size: usize,
@@ -290,7 +291,10 @@ pub fn run(
         None
     };
     let mut ngram_proposer = if use_ngram_speculative {
-        Some(NgramProposer::new(4)) // 4-gram context
+        // Chains cap at the model's verify width (mHC highway has MoE arms
+        // for K=2/3 only → flash-next verifies K=3 max) and at K=4 hard.
+        let chain_cap = num_drafts.min(model.verify_max_drafts().unwrap_or(3)).min(3);
+        Some(NgramProposer::new(4).with_chain_and_cache(chain_cap, ngram_cache_path))
     } else {
         None
     };
@@ -777,10 +781,27 @@ pub fn run(
             if use_mtp {
                 adaptive_rung::note_width_regime(active.len(), spec_width_ok);
             }
+            // Past the QSA inert bound the verify paths refuse an ACTIVE
+            // selection (VerifyUnsupportedWithActiveQsa) and a verify error
+            // finishes the request — the ngram lane declines to serial the
+            // same way the MTP lane does. Pending drafts are dropped: they
+            // were never forwarded, so discarding them needs no rewind.
+            if use_ngram_speculative
+                && active.len() == 1
+                && verify_ctx_limit.is_some_and(|lim| {
+                    active[0].seq.seq_len >= lim
+                })
+                && !active[0].pending_drafts.is_empty()
+            {
+                active[0].pending_drafts.clear();
+                active[0].pending_draft_conf.clear();
+            }
             if use_ngram_speculative
                 && active.len() == 1
                 && spec_slots_covered
                 && active[0].grammar_state.is_none()
+                && verify_ctx_limit
+                    .is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {

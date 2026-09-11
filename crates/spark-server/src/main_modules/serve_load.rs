@@ -844,7 +844,7 @@ pub(crate) fn load_model(
             }
         );
     } else if use_ngram_spec {
-        tracing::info!("N-gram speculative decoding: ENABLED (K=2 verify, CPU proposer)");
+        tracing::info!("N-gram speculative decoding: ENABLED (K=2/3/4 verify, CPU proposer)");
     } else if use_self_spec {
         tracing::info!(
             "Self-speculative decoding: ENABLED ({num_drafts} drafts/step, layer-skipping)"
@@ -964,6 +964,23 @@ pub(crate) fn load_model(
     // the loop drains and returns, and only THEN is the model free to tear
     // down. Without the handle there is no way to wait for that, and the
     // teardown would race a scheduler still touching the weights.
+    // llama.cpp-style n-gram SSD cache: the dynamic draft table persists
+    // beside the HF cache so learned patterns survive restarts.
+    let ngram_cache_path = if use_ngram_spec {
+        let slug: String = model_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        match crate::model_resolver::resolve_cache_root(args.cache_dir.as_deref()) {
+            Ok(root) => Some(root.join("atlas-ngram").join(format!("{slug}.bin"))),
+            Err(e) => {
+                tracing::warn!("ngram cache dir resolution failed ({e:#}) — in-memory only");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let scheduler_handle = std::thread::spawn(move || {
         scheduler::run(
             scheduler_model,
@@ -979,6 +996,7 @@ pub(crate) fn load_model(
             max_batch_tokens,
             use_self_spec,
             use_ngram_spec,
+            ngram_cache_path,
             swap_space_gb,
             high_speed_swap_cfg,
             block_size,
