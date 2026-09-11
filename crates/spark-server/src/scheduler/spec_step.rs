@@ -374,7 +374,7 @@ pub fn step_ngram_verify(
     }
 
     if na < nd {
-        // Rewind the rejected tail: seq_len and tokens roll back
+        // Rewind the rejected tail: seq_len and tokens roll back nd-na
         // rows, then commit_accepted_prefix rewinds the aux (QSA indexer /
         // PLE carry) by the same count and re-checkpoints.
         a.seq.seq_len -= nd - na;
