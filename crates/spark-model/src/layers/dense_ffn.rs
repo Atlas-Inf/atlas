@@ -119,8 +119,12 @@ pub struct DenseFfnLayer {
     dp4a_silu_quant_k: KernelHandle,
     dp4a_gemv_k: KernelHandle,
     dp4a_quant_batch4_k: KernelHandle,
+    /// Guard-free m == 4 specialization of the batch4 DP4A GEMVs.
     dp4a_gemv_batch4_k: KernelHandle,
     dp4a_dual_batch4_k: KernelHandle,
+    /// Runtime-row-guarded batch4 DP4A GEMVs for the m == 2..3 verify rows.
+    dp4a_gemv_batch4_dyn_k: KernelHandle,
+    dp4a_dual_batch4_dyn_k: KernelHandle,
     /// Narrow `w4a16_gemv_batch{M}` family (M=4..8) for the K=4 verify FFN and
     /// the K=5..8 chain verify. SSOT for the M -> tier decision; individual
     /// tiers are 0-handles when the target did not load them.
@@ -376,6 +380,16 @@ impl DenseFfnLayer {
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_dual_batch4_d4",
+            ),
+            dp4a_gemv_batch4_dyn_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch4_d4_dyn",
+            ),
+            dp4a_dual_batch4_dyn_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_dual_batch4_d4_dyn",
             ),
             w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,

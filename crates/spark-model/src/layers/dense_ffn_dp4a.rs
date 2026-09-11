@@ -103,6 +103,8 @@ impl DenseFfnLayer {
             || self.dp4a_quant_batch4_k.0 == 0
             || self.dp4a_gemv_batch4_k.0 == 0
             || self.dp4a_dual_batch4_k.0 == 0
+            || self.dp4a_gemv_batch4_dyn_k.0 == 0
+            || self.dp4a_dual_batch4_dyn_k.0 == 0
         {
             return Ok(false);
         }
@@ -116,6 +118,14 @@ impl DenseFfnLayer {
         if ctx.stats.once("log:decode_ffn_dp4a_batch") {
             tracing::info!(rows = m, "Dense FFN W4A8 DP4A batched path engaged");
         }
+        // m == 4 takes the guard-free specialization; m in 2..3 keeps the
+        // runtime-guarded kernel, whose `row >= M` skip is what makes the
+        // unused rows free. Both are bit-identical per emitted row.
+        let (gemv_k, dual_k) = if m == 4 {
+            (self.dp4a_gemv_batch4_k, self.dp4a_dual_batch4_k)
+        } else {
+            (self.dp4a_gemv_batch4_dyn_k, self.dp4a_dual_batch4_dyn_k)
+        };
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
         ops::quantize_act_int8_batch4(
@@ -130,7 +140,7 @@ impl DenseFfnLayer {
         )?;
         ops::w4a16_gemv_dp4a_dual_batch4(
             ctx.gpu,
-            self.dp4a_dual_batch4_k,
+            dual_k,
             quantized,
             scales,
             &self.weights.gate_proj,
@@ -163,7 +173,7 @@ impl DenseFfnLayer {
         )?;
         ops::w4a16_gemv_dp4a_batch4(
             ctx.gpu,
-            self.dp4a_gemv_batch4_k,
+            gemv_k,
             quantized,
             scales,
             &self.weights.down_proj,

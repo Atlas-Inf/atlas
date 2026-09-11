@@ -174,7 +174,8 @@ extern "C" __global__ void quantize_act_int8_g16_batch4_d4(
     const unsigned int row = blockIdx.y;
     const unsigned int local = threadIdx.x;
     const unsigned int index = group * DP4A_GROUP_SIZE + local;
-    if (row >= M || index >= K) return;
+    (void)M;
+    if (index >= K) return;
 
     const float value = __bfloat162float(A[(unsigned long long)row * K + index]);
     __shared__ float amax_values[DP4A_GROUP_SIZE];
@@ -303,7 +304,15 @@ extern "C" __global__ void w4a16_gemv_dp4a(
     if (lane == 0) C[n] = __float2bfloat16(smem[local_out * 2] + smem[local_out * 2 + 1]);
 }
 
-extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4(
+// FIXED4=true is the K=4 verify specialization: the row loops below are fully
+// unrolled with NO runtime `row >= M` guard. That guard is ~20% of this
+// kernel's cost at M=4 (measured: 321 us -> 255 us on 17408x5120, ranges
+// disjoint) because M is a runtime argument the compiler cannot fold.
+// FIXED4=false keeps the guard and serves the K=2/K=3 verify rows (2..3) the
+// scheduler still dispatches through this path — narrowing the dispatch to
+// M=4 alone would silently demote those rows to the float batch2/batch3 GEMVs.
+template <bool FIXED4>
+__device__ __forceinline__ void w4a16_gemv_dp4a_batch4_impl(
     const signed char* __restrict__ a_q,
     const float* __restrict__ a_scale,
     const unsigned char* __restrict__ B_packed,
@@ -314,6 +323,7 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4(
     unsigned int N,
     unsigned int K
 ) {
+    (void)M;
     const unsigned int threads_per_out = DP4A_BLOCK_SIZE / DP4A_N_PER_BLOCK;
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;
@@ -334,7 +344,9 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4(
                 B_scale[(unsigned long long)n * groups + group]) * (0.5f * scale2);
             #pragma unroll
             for (int row = 0; row < 4; ++row) {
-                if ((unsigned int)row >= M) continue;
+                if constexpr (!FIXED4) {
+                    if ((unsigned int)row >= M) continue;
+                }
                 const int4 activation = *(const int4*)(
                     a_q + (unsigned long long)row * K + group * DP4A_GROUP_SIZE);
                 const int values[4] = {
@@ -355,7 +367,9 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4(
     const unsigned int warp_in_out = lane / DP4A_WARP_SIZE;
     #pragma unroll
     for (int row = 0; row < 4; ++row) {
-        if ((unsigned int)row >= M) continue;
+        if constexpr (!FIXED4) {
+            if ((unsigned int)row >= M) continue;
+        }
         float result = acc[row];
         #pragma unroll
         for (int offset = DP4A_WARP_SIZE / 2; offset > 0; offset >>= 1)
@@ -368,14 +382,17 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4(
     if (valid_n && lane == 0) {
         #pragma unroll
         for (int row = 0; row < 4; ++row) {
-            if ((unsigned int)row < M)
-                C[(unsigned long long)row * N + n] = __float2bfloat16(
-                    partial[row][local_out * 2] + partial[row][local_out * 2 + 1]);
+            if constexpr (!FIXED4) {
+                if ((unsigned int)row >= M) continue;
+            }
+            C[(unsigned long long)row * N + n] = __float2bfloat16(
+                partial[row][local_out * 2] + partial[row][local_out * 2 + 1]);
         }
     }
 }
 
-extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4(
+template <bool FIXED4>
+__device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch4_impl(
     const signed char* __restrict__ a_q,
     const float* __restrict__ a_scale,
     const unsigned char* __restrict__ B0_packed,
@@ -397,6 +414,7 @@ extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4(
     const bool valid_n = n < N;
     const unsigned int half_k = K / 2;
     const unsigned int groups = K / DP4A_GROUP_SIZE;
+    (void)M;
     float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -418,7 +436,9 @@ extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4(
                 B1_scale[(unsigned long long)n * groups + group]) * (0.5f * B1_scale2);
             #pragma unroll
             for (int row = 0; row < 4; ++row) {
-                if ((unsigned int)row >= M) continue;
+                if constexpr (!FIXED4) {
+                    if ((unsigned int)row >= M) continue;
+                }
                 const int4 activation = *(const int4*)(
                     a_q + (unsigned long long)row * K + group * DP4A_GROUP_SIZE);
                 const int values[4] = {
@@ -445,7 +465,9 @@ extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4(
     const unsigned int warp_in_out = lane / DP4A_WARP_SIZE;
     #pragma unroll
     for (int row = 0; row < 4; ++row) {
-        if ((unsigned int)row >= M) continue;
+        if constexpr (!FIXED4) {
+            if ((unsigned int)row >= M) continue;
+        }
         float value0 = acc0[row];
         float value1 = acc1[row];
         #pragma unroll
@@ -463,12 +485,81 @@ extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4(
     if (valid_n && lane == 0) {
         #pragma unroll
         for (int row = 0; row < 4; ++row) {
-            if ((unsigned int)row < M) {
-                C0[(unsigned long long)row * N + n] = __float2bfloat16(
-                    partial0[row][local_out * 2] + partial0[row][local_out * 2 + 1]);
-                C1[(unsigned long long)row * N + n] = __float2bfloat16(
-                    partial1[row][local_out * 2] + partial1[row][local_out * 2 + 1]);
+            if constexpr (!FIXED4) {
+                if ((unsigned int)row >= M) continue;
             }
+            C0[(unsigned long long)row * N + n] = __float2bfloat16(
+                partial0[row][local_out * 2] + partial0[row][local_out * 2 + 1]);
+            C1[(unsigned long long)row * N + n] = __float2bfloat16(
+                partial1[row][local_out * 2] + partial1[row][local_out * 2 + 1]);
         }
     }
+}
+
+// Entry points. The `_dyn` instantiations keep the runtime `row >= M` guard and
+// serve m in 2..3; the bare names are the guard-free m == 4 specialization.
+extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_batch4_impl<true>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_dyn(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_batch4_impl<false>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B0_packed,
+    const unsigned char* __restrict__ B0_scale,
+    const float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_dual_batch4_impl<true>(
+        a_q, a_scale, B0_packed, B0_scale, B0_scale2, C0, B1_packed, B1_scale, B1_scale2, C1, M, N, K);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4_dyn(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B0_packed,
+    const unsigned char* __restrict__ B0_scale,
+    const float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_dual_batch4_impl<false>(
+        a_q, a_scale, B0_packed, B0_scale, B0_scale2, C0, B1_packed, B1_scale, B1_scale2, C1, M, N, K);
 }
