@@ -24,6 +24,8 @@ mod dispatch_proj;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
+#[path = "ops/dp4a.rs"]
+mod dp4a;
 #[path = "ops/embeddings.rs"]
 mod embeddings;
 #[path = "ops/fp8_gemv_batch.rs"]
@@ -147,6 +149,7 @@ pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;
 pub use dispatch_proj_rowwise::*;
+pub use dp4a::*;
 pub use embeddings::*;
 pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;

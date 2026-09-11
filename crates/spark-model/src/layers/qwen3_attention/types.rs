@@ -173,6 +173,8 @@ pub struct Qwen3AttentionLayer {
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     pub(super) w4a16_gemv_sw_k: KernelHandle,
     pub(super) w8a16_gemv_k: KernelHandle,
+    pub(super) w8a16_gemv_batch4_k: KernelHandle,
+    pub(super) w8a16_gemv_batch16_k: KernelHandle,
     pub(super) w8a16_gemm_k: KernelHandle,
     pub(super) w8a16_gemm_pipelined_k: KernelHandle,
     pub(super) w4a16_gemv_dual_k: KernelHandle,

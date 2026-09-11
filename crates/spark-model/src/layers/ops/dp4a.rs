@@ -60,6 +60,28 @@ pub fn quantize_act_int8(
         .launch(stream)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_act_int8_batch4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    a_q: DevicePtr,
+    a_scale: DevicePtr,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(k, DP4A_GROUP_SIZE), m, 1])
+        .block([DP4A_GROUP_SIZE, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(a_q)
+        .arg_ptr(a_scale)
+        .arg_u32(m)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Fused `silu(gate)*up` activation prep for the down-proj: materializes the
 /// hidden then int8-quantizes it (identical math to the float
 /// `w4a16_gemv_silu_input` inline activation + [`quantize_act_int8`]). Hoists the
@@ -114,6 +136,68 @@ pub fn w4a16_gemv_dp4a(
         .arg_ptr(weight.weight_scale)
         .arg_f32(weight.weight_scale_2)
         .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_dp4a_batch4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_q: DevicePtr,
+    a_scale: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a_q)
+        .arg_ptr(a_scale)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_dp4a_dual_batch4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_q: DevicePtr,
+    a_scale: DevicePtr,
+    gate_weight: &QuantizedWeight,
+    gate_out: DevicePtr,
+    up_weight: &QuantizedWeight,
+    up_out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a_q)
+        .arg_ptr(a_scale)
+        .arg_ptr(gate_weight.weight)
+        .arg_ptr(gate_weight.weight_scale)
+        .arg_f32(gate_weight.weight_scale_2)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_weight.weight)
+        .arg_ptr(up_weight.weight_scale)
+        .arg_f32(up_weight.weight_scale_2)
+        .arg_ptr(up_out)
+        .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)
         .launch(stream)

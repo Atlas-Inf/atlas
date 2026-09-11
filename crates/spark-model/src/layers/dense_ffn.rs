@@ -15,6 +15,9 @@ use crate::weight_map::{
     DenseWeight, Fp8Weight, Fp8WeightTransposed, PackedQ2Weight, QuantizedWeight,
 };
 
+#[path = "dense_ffn_dp4a.rs"]
+mod dp4a_decode;
+
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
     pub up_proj: QuantizedWeight,
@@ -112,6 +115,12 @@ pub struct DenseFfnLayer {
     w4a16_gemv_dual_batch3: KernelHandle,
     w4a16_gemv_batch2: KernelHandle,
     w4a16_gemv_batch3: KernelHandle,
+    dp4a_quant_k: KernelHandle,
+    dp4a_silu_quant_k: KernelHandle,
+    dp4a_gemv_k: KernelHandle,
+    dp4a_quant_batch4_k: KernelHandle,
+    dp4a_gemv_batch4_k: KernelHandle,
+    dp4a_dual_batch4_k: KernelHandle,
     /// Narrow `w4a16_gemv_batch{M}` family (M=4..8) for the K=4 verify FFN and
     /// the K=5..8 chain verify. SSOT for the M -> tier decision; individual
     /// tiers are 0-handles when the target did not load them.
@@ -350,6 +359,24 @@ impl DenseFfnLayer {
             w4a16_gemv_dual_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            dp4a_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "quantize_act_int8_g16"),
+            dp4a_silu_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "silu_mul_quant_int8_g16"),
+            dp4a_gemv_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "w4a16_gemv_dp4a"),
+            dp4a_quant_batch4_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "quantize_act_int8_g16_batch4_d4",
+            ),
+            dp4a_gemv_batch4_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch4_d4",
+            ),
+            dp4a_dual_batch4_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_dual_batch4_d4",
+            ),
             w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
@@ -1024,6 +1051,10 @@ impl DenseFfnLayer {
             return Ok(output);
         }
 
+        if let Some(output) = self.forward_dp4a_single(input, ctx, stream)? {
+            return Ok(output);
+        }
+
         // ATLAS_DECODE_FFN_VIA_GEMM=1: route decode's M=1 FFN projections
         // through the SAME transposed-weight GEMM kernels the DFlash verify
         // path uses (`w4a16_prefill_gemm` → w4a16_gemm_t / _t_k64), instead
@@ -1361,6 +1392,9 @@ impl DenseFfnLayer {
         {
             return self.forward_prefill(input, 2, ctx, stream);
         }
+        if self.forward_dp4a_batch(input, 2, ctx, stream)? {
+            return Ok(());
+        }
 
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
@@ -1415,6 +1449,9 @@ impl DenseFfnLayer {
         if native_small_batch_uses_prefill(self.bf16_weights.is_some(), self.fp8_weights.is_some())
         {
             return self.forward_prefill(input, 3, ctx, stream);
+        }
+        if self.forward_dp4a_batch(input, 3, ctx, stream)? {
+            return Ok(());
         }
 
         let h = ctx.config.hidden_size as u32;
@@ -1492,6 +1529,9 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.forward_dp4a_batch(input, m, ctx, stream)? {
+            return Ok(());
+        }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
         let kh = self.batchm_kernel(m);

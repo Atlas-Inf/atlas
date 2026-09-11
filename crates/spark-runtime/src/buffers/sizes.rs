@@ -352,7 +352,7 @@ impl BufferSizes {
             (
                 m * kpad * 4 + (1 << 20), // q8_1_mmq: m*kpad*4 + 1MB (matches q8_1_scratch_bytes)
                 m * kmax,                 // int8 a_i8 [m,K] ≥ NVFP4 packed [m,K/2]
-                m * (kmax / 32) * 4,      // int8 a_scale [m,K/32]*4 ≥ NVFP4 scale [m,K/16]
+                m * (kmax / 16) * 4,      // int8 a_scale [m,K/16]*4
             )
         } else {
             (0, 0, 0)

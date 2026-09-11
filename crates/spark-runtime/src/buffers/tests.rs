@@ -14,6 +14,18 @@ fn mixed_dense_moe_sizes_for_widest_ffn() {
     assert_eq!(sizes.expert_gate_out, 4 * 12_288 * 2);
     assert_eq!(sizes.expert_up_out, 4 * 12_288 * 2);
 }
+
+#[test]
+fn dense_ffn_int8_scale_scratch_covers_group16() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.hidden_size = 5_120;
+    cfg.intermediate_size = 17_408;
+    cfg.num_experts = 0;
+    let rows = 4;
+    let sizes = BufferSizes::from_config(&cfg, rows, 4096, 16, 1);
+    assert_eq!(sizes.ffn_act_scale, rows * (17_408 / 16) * 4);
+}
+
 use crate::gpu::mock::MockGpuBackend;
 
 #[test]

@@ -254,6 +254,22 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
+        } else if (5..=16).contains(&num_tokens)
+            && self.w8a16_gemv_batch16_k.0 != 0
+            && let Some(ref fp8) = self.qkvz_fp8w
+        {
+            ops::w8a16_gemv_batch4(
+                ctx.gpu,
+                self.w8a16_gemv_batch16_k,
+                normed,
+                fp8.weight,
+                fp8.row_scale,
+                proj_dst,
+                num_tokens as u32,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
         } else if num_tokens > 4
             && (self.w8a16_gemm_pipelined_k.0 != 0 || self.w8a16_gemm_k.0 != 0)
             && let Some(ref fp8) = self.qkvz_fp8w
@@ -992,6 +1008,22 @@ impl Qwen3SsmLayer {
                 self.w4a16_batchm_kernel(num_tokens),
                 normed_out_buf,
                 &self.ssm.out_proj,
+                out_proj_buf,
+                num_tokens as u32,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )?;
+        } else if (5..=16).contains(&num_tokens)
+            && self.w8a16_gemv_batch16_k.0 != 0
+            && let Some(ref fp8) = self.out_proj_fp8w
+        {
+            ops::w8a16_gemv_batch4(
+                ctx.gpu,
+                self.w8a16_gemv_batch16_k,
+                normed_out_buf,
+                fp8.weight,
+                fp8.row_scale,
                 out_proj_buf,
                 num_tokens as u32,
                 h as u32,
