@@ -619,9 +619,10 @@ pub struct BlockDiffusionDraftHead {
     /// retired generation. `None` in a slot is the eager sentinel (the
     /// subgraph fell back to eager at capture time).
     ///
-    /// The handles themselves live in the model's [`GraphRuntime`] (Propose
-    /// phase); this map only holds the runtime keys, so the runtime owns LRU,
-    /// quota accounting, and deferred destruction.
+    /// The handles themselves live in the model's
+    /// `spark_runtime::graph_runtime::GraphRuntime` (Propose phase); this map
+    /// only holds the runtime keys, so the runtime owns LRU, quota accounting,
+    /// and deferred destruction.
     pub propose_graphs:
         Mutex<HashMap<DflashGraphIdentity, Vec<Option<spark_runtime::graph_runtime::GraphKey>>>>,
     /// The model's unified graph runtime. Captured propose subgraphs are
