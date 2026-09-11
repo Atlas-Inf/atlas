@@ -185,6 +185,7 @@ pub fn step_ngram(
     active: &mut [ActiveSeq],
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     proposer: &mut NgramProposer,
+    adaptive_sampling: bool,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
 ) {
     let a = &mut active[0];
@@ -211,20 +212,39 @@ pub fn step_ngram(
                 return;
             }
         };
-        let tok = match model.argmax_on_device(logits, 0) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("ngram bootstrap argmax error: {e:#}");
-                a.engine_error = Some(format!("{e:#}"));
-                a.finished = true;
-                return;
-            }
-        };
+        // Sample through the canonical per-seq pipeline — the old
+        // argmax_on_device here collapsed every bootstrap token to greedy for
+        // requests carrying temperature/penalties/grammar (same class of bug
+        // as the DFlash process-wide raw-argmax gate).
+        let vocab_size = model.vocab_size();
+        let logits_fp32 = model.decode_logits_fp32();
+        let elem = if logits_fp32 { 4 } else { 2 };
+        let mut buf = sched.scratch.host_bytes.borrow_mut().split_off(0);
+        buf.resize(vocab_size * elem, 0);
+        if let Err(e) = model.copy_logits_to_host(logits, &mut buf) {
+            tracing::error!("ngram copy_logits_to_host: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
+            a.finished = true;
+            *sched.scratch.host_bytes.borrow_mut() = buf;
+            return;
+        }
+        let (tok, lp) = crate::scheduler::decode_logits_seq::process_seq_logits(
+            model,
+            a,
+            &buf,
+            0,
+            vocab_size,
+            elem,
+            logits_fp32,
+            verify_ctx,
+            adaptive_sampling,
+        );
+        *sched.scratch.host_bytes.borrow_mut() = buf;
 
         // Observe the token for future predictions
         proposer.observe(&a.seq.tokens, tok);
 
-        emit_token(a, tok, None, sched);
+        emit_token(a, tok, lp, sched);
         if a.finished {
             return;
         }
@@ -333,6 +353,12 @@ pub fn step_ngram_verify(
         .map(|i| processed.get(i).copied().unwrap_or(verified_raw[i]))
         .collect();
 
+    let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
+        crate::scheduler::logprobs::extract_verify_logprobs(model, &v, top_logprobs, 0)
+    } else {
+        Vec::new()
+    };
+
     // Accept-prefix: draft[i] must equal the verified pick at row i.
     let mut na = 0usize;
     while na < nd && drafts[na] == v[na] {
@@ -381,13 +407,13 @@ pub fn step_ngram_verify(
         if idx > 0 {
             proposer.observe(&a.seq.tokens[..idx], a.seq.tokens[idx]);
         }
-        emit_token(a, drafts[j], None, sched);
+        emit_token(a, drafts[j], verify_lps.get(j).cloned(), sched);
         if a.finished {
             return;
         }
     }
     proposer.observe(&a.seq.tokens, v[na]);
-    emit_token(a, v[na], None, sched);
+    emit_token(a, v[na], verify_lps.get(na).cloned(), sched);
     if a.finished {
         return;
     }

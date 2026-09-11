@@ -804,7 +804,14 @@ pub fn run(
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
-                    step_ngram(&*model, &mut active, &sched, proposer, &verify_ctx);
+                    step_ngram(
+                        &*model,
+                        &mut active,
+                        &sched,
+                        proposer,
+                        adaptive_sampling,
+                        &verify_ctx,
+                    );
                 }
             } else if use_self_speculative
                 && active.len() == 1
