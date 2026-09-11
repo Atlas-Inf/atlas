@@ -21,6 +21,7 @@ const ENUMERATED: &[&str] = &[
     "mtp-gate",
     "tool-call-parser",
     "kv-cache-dtype",
+    "cuda-graph-mode",
 ];
 
 /// Flags whose values are only self-consistent beside another flag.
