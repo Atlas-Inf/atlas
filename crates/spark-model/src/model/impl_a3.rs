@@ -250,6 +250,49 @@ impl TransformerModel {
                     stream,
                 )?;
             }
+        } else if num_tokens == 4
+            && ops::dp4a_enabled()
+            && self.lm_head_dp4a_gemv_kernel.0 != 0
+            && self.lm_head_dp4a_quant_kernel.0 != 0
+            && !self.buffers.ffn_act_a().is_null()
+            && !self.buffers.ffn_act_scale().is_null()
+            && let Some(ref nvfp4) = self.lm_head_nvfp4
+        {
+            // K=4 verify lm_head via W4A8 DP4A. The NVFP4 LM head is already
+            // the layout the DP4A path consumes (U8 [V, K/2] + F8 [V, K/16]),
+            // so only a hoisted int8 activation quant is added. Measured on
+            // [248320, 5120] at M=4: float `w4a16_gemv_batch4` 5979.7 us
+            // isolated / 6367.8 us in-situ vs `w4a16_gemv_dp4a_batch4_d4`
+            // 3772.6 us — 1.58x. Opt-in behind ATLAS_W4A16_DP4A, like the
+            // dense FFN.
+            //
+            // num_tokens == 4 EXACTLY: the guard-free M=4 DP4A kernel writes
+            // all four rows unconditionally, so it must not be dispatched at
+            // M=3 (the guarded `_dyn` sibling is not wired here).
+            let quantized = self.buffers.ffn_act_a();
+            let scales = self.buffers.ffn_act_scale();
+            ops::quantize_act_int8_batch4(
+                self.gpu.as_ref(),
+                self.lm_head_dp4a_quant_kernel,
+                hidden,
+                quantized,
+                scales,
+                num_tokens,
+                h,
+                stream,
+            )?;
+            ops::w4a16_gemv_dp4a_batch4(
+                self.gpu.as_ref(),
+                self.lm_head_dp4a_gemv_kernel,
+                quantized,
+                scales,
+                nvfp4,
+                logits,
+                num_tokens,
+                v,
+                h,
+                stream,
+            )?;
         } else if (3..=8).contains(&num_tokens)
             && self.w4a16_batchm.kernel(num_tokens).0 != 0
             && let Some(ref nvfp4) = self.lm_head_nvfp4
