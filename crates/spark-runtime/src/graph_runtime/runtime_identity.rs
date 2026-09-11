@@ -2,9 +2,10 @@
 
 use super::{
     CompatibilityDecision, GRAPH_KEY_SCHEMA_VERSION, GraphCapabilities, GraphFallbackReason,
-    GraphIdentity, GraphKey, GraphLease, GraphMetricsSnapshot, GraphPayload, GraphPhase,
+    GraphIdentity, GraphKey, GraphLease, GraphMetricsSnapshot, GraphMode, GraphPayload, GraphPhase,
     GraphRuntime, GraphRuntimeError, GraphSegment, classify_shape_bucket,
 };
+use std::sync::atomic::Ordering;
 
 impl GraphRuntime {
     pub fn mode(&self) -> super::GraphMode {
@@ -26,6 +27,25 @@ impl GraphRuntime {
     ) -> Result<GraphIdentity, GraphRuntimeError> {
         let (tokens, requests) = payload.shape_counts();
         let phase = payload.phase();
+        // An identity for a runtime that cannot capture or replay is not
+        // usable, and returning one made every caller believe capture was
+        // available: the model set `use_graphs = identity.is_some()` and then
+        // failed later in `register_captured` with `runtime_disabled` instead
+        // of running eagerly. Reject here, like `lookup`/`capture`/`register`.
+        if self.shutting_down.load(Ordering::Acquire) || self.mode == GraphMode::Disabled {
+            return Err(self.fallback(
+                phase,
+                GraphFallbackReason::RuntimeDisabled,
+                "CUDA graph runtime is disabled",
+            ));
+        }
+        if !self.capabilities.basic_graphs {
+            return Err(self.fallback(
+                phase,
+                GraphFallbackReason::DriverUnsupported,
+                "backend does not expose basic CUDA graph support",
+            ));
+        }
         let bucket =
             classify_shape_bucket(&self.shape_buckets, tokens, requests).ok_or_else(|| {
                 self.fallback(
