@@ -760,6 +760,7 @@ pub fn build_model(
                     max_seq_len,
                     max_batch_size,
                     startup,
+                    model.graph_runtime(),
                 )?;
                 match lightning_dspark_policy {
                     Some(policy) => {

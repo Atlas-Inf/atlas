@@ -311,6 +311,22 @@ impl DflashGraphIdentity {
     pub fn lane(&self) -> usize {
         self.lane
     }
+
+    /// Every field of this identity as `u64` words, for the graph runtime's
+    /// opaque `Propose::key_words`. Encoding ALL fields is what preserves the
+    /// identity's keying once the captured handles move into the runtime — a
+    /// dropped field would let a graph captured for one lane/owner replay
+    /// against another (silent garbage drafts).
+    pub fn key_words(&self) -> Vec<u64> {
+        vec![
+            self.owner.slot() as u64,
+            self.owner.generation(),
+            self.block_table_ptr,
+            self.ctx_ptr,
+            self.markov_ptr,
+            self.lane as u64,
+        ]
+    }
 }
 
 fn nonzero_pointer(field: &'static str, pointer: u64) -> Result<(), DsparkLifecycleError> {

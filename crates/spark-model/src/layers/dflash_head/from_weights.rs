@@ -30,6 +30,7 @@ impl BlockDiffusionDraftHead {
         max_seq_len: usize,
         max_batch_size: usize,
         startup: DsparkStartupExecution,
+        graph_runtime: std::sync::Arc<spark_runtime::graph_runtime::GraphRuntime>,
     ) -> Result<Self> {
         let embed_tokens_shared = weights
             .embed_tokens
@@ -751,6 +752,7 @@ impl BlockDiffusionDraftHead {
             // Phase F: per-subgraph graph state — empty until the first
             // capture pass lands. Layout: [pre_0, post_0, ..., tail].
             propose_graphs: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            graph_runtime,
             next_lane: std::sync::atomic::AtomicUsize::new(0),
             lanes_start_event: gpu.create_event()?,
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),

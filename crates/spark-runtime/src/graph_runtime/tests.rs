@@ -137,6 +137,7 @@ fn identity(phase: GraphPhase, value: u32) -> GraphIdentity {
             request_count: 1,
             draft_depth: value,
             segment_index: 0,
+            key_words: Vec::new(),
         },
         GraphPhase::Fused => GraphPayload::Fused {
             request_count: 1,

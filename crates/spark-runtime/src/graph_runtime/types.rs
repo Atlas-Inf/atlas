@@ -219,6 +219,14 @@ pub enum GraphPayload {
         request_count: u32,
         draft_depth: u32,
         segment_index: u32,
+        /// Opaque, model-specific identity words that must be part of the key
+        /// or a captured propose subgraph would be replayed against state it
+        /// was not captured for. The DFlash drafter fills this with its
+        /// `DflashGraphIdentity` (graph owner, block-table address, ctx
+        /// accumulator address, scratch pointer, lane); an empty vector means
+        /// the model's propose key needs no extra identity.
+        #[serde(default)]
+        key_words: Vec<u64>,
     },
     Fused {
         request_count: u32,
