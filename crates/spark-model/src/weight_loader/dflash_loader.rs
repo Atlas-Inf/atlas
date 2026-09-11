@@ -236,6 +236,34 @@ pub fn store_has_dflash_weights(store: &WeightStore) -> bool {
     store.contains("fc.weight") || store.contains("model.fc.weight")
 }
 
+/// DFlash2-only tensors Atlas does not implement: a candidate-selector codebook
+/// and per-layer attention / MLP convolutions. The probe list in
+/// [`load_dflash_weights`] is DFlash v1, so these were silently ignored and the
+/// head then ran a forward it was never built for — a sticky CUDA 700 on the
+/// first propose that takes the whole serve down. Returns the first marker
+/// present, with its description, or `None` for a v1 drafter.
+fn unsupported_dflash_marker(
+    store: &WeightStore,
+    prefix: &str,
+) -> Option<(&'static str, &'static str)> {
+    [
+        (
+            "candidate_selector.hidden_projection.weight",
+            "a candidate-selector codebook",
+        ),
+        (
+            "layers.0.attention_conv.base_kernel",
+            "per-layer attention convolutions",
+        ),
+        (
+            "layers.0.mlp_conv.base_kernel",
+            "per-layer MLP convolutions",
+        ),
+    ]
+    .into_iter()
+    .find(|(probe, _)| store.contains(&format!("{prefix}{probe}")))
+}
+
 /// Parse a DFlash drafter's `config.json` into a [`DflashConfig`]. Used by
 /// `main.rs` after fetching the drafter's HF metadata to size the runtime
 /// `BlockDiffusionDraftHead` (layer count, head_dim, vocab_size, the
@@ -295,6 +323,16 @@ pub fn load_dflash_weights(
     } else {
         ""
     };
+
+    // Fail closed on drafter architectures Atlas does not implement.
+    if let Some((probe, what)) = unsupported_dflash_marker(drafter_store, prefix) {
+        anyhow::bail!(
+            "DFlash drafter ships {what} (DFlash2-style architecture: `{prefix}{probe}`); \
+             Atlas implements DFlash v1 only. Use a v1 drafter (e.g. a DFlash/D-Spark \
+             checkpoint with no candidate-selector or conv tensors), or serve without \
+             --dflash/--dspark."
+        );
+    }
 
     // dense_auto: BF16 as-is, packed NVFP4 (Lightning DSpark MLP/fc/markov_w2)
     // dequanted once at load.
@@ -458,6 +496,41 @@ mod tests {
         let sub = config.dflash_config.expect("dflash_config present");
         assert_eq!(sub.mask_token_id, 248070);
         assert_eq!(sub.target_layer_ids, vec![1, 10, 19, 28, 37]);
+    }
+
+    /// A DFlash2 drafter must be refused by name, and a v1 drafter (the DSpark
+    /// layout) must not be. Regression: the DFlash2 tensors used to be silently
+    /// ignored, and the head then ran a forward it was never built for — a
+    /// sticky CUDA 700 on the first propose.
+    #[test]
+    fn dflash2_architecture_is_refused_and_v1_is_not() {
+        use spark_runtime::gpu::DevicePtr;
+        use spark_runtime::weights::{WeightDtype, WeightTensor};
+        use std::collections::HashMap;
+
+        let dummy = || WeightTensor {
+            ptr: DevicePtr::NULL,
+            shape: vec![1],
+            dtype: WeightDtype::BF16,
+        };
+        let store = |keys: &[&str]| {
+            WeightStore::from_map(
+                keys.iter()
+                    .map(|k| (k.to_string(), dummy()))
+                    .collect::<HashMap<_, _>>(),
+            )
+        };
+
+        let dflash2 = store(&["fc.weight", "candidate_selector.hidden_projection.weight"]);
+        let (probe, what) = unsupported_dflash_marker(&dflash2, "").expect("DFlash2 refused");
+        assert_eq!(probe, "candidate_selector.hidden_projection.weight");
+        assert!(
+            what.contains("selector"),
+            "reason names the feature: {what}"
+        );
+
+        let v1 = store(&["fc.weight", "markov_head.markov_w1.weight"]);
+        assert!(unsupported_dflash_marker(&v1, "").is_none());
     }
 
     #[test]
