@@ -123,6 +123,26 @@ impl TransformerModel {
         // On the normal teardown path (`slot_idx < max_slots`), `take()` yields
         // the owned index and we release it exactly once. `take()` also makes
         // the guard's Drop a no-op so abort/panic cannot double-release.
+        // Return the per-layer device allocations this sequence owned. Only
+        // the states that hold raw `gpu.alloc` memory do anything here — the
+        // PLE conv carry and the QSA indexer keys — and both were leaked for
+        // the process's lifetime before this call existed: `DevicePtr` has no
+        // `Drop`, and the backend sweeps only at exit ("backend drop reclaimed
+        // N allocation(s) that no owner released").
+        //
+        // ~30 MB per request on qwen4_exp, against ~2 GB of slack after a
+        // 117 GB resident load, which is why a 225-request run was OOM-KILLED
+        // at request 80 while a 13-request smoke suite passed indefinitely.
+        //
+        // Errors are LOGGED, not propagated: a failed free must not strand the
+        // sequence and leak the pool slot below, which would turn a memory
+        // leak into a wedged scheduler.
+        for (layer, st) in self.layers.iter().zip(seq.layer_states.iter_mut()) {
+            if let Err(e) = layer.free_state(self.gpu.as_ref(), st.as_mut()) {
+                tracing::error!("free_sequence: layer.free_state: {e:#}");
+            }
+        }
+
         let slot_reused_by_compact = seq.slot_idx >= self.ssm_pool.max_slots;
         let taken = seq.ssm_slot.as_mut().and_then(|g| g.take());
         let slot_to_release = if slot_reused_by_compact { None } else { taken };
@@ -135,26 +155,6 @@ impl TransformerModel {
                 tracing::error!("free_sequence: gpu.synchronize after zero_slot({slot}): {e:#}");
             }
             self.ssm_pool.release_slot(slot);
-        }
-
-        // Release per-sequence layer state that is NOT pooled: the QSA indexer
-        // carry (12 full-attention layers x ~61.6 MB at 200K ctx) and the PLE
-        // conv carry. Both are bare `DevicePtr`s inside the layer state, so
-        // dropping `seq.layer_states` reclaims the host structs and leaks the
-        // device buffers — ~739 MB per request, invisible to RSS on unified
-        // memory and reported as N/A by `nvidia-smi`, which is why it read as
-        // "the box is growing" with no process to blame.
-        //
-        // Errors are logged, not propagated: this runs on the teardown path,
-        // and a sequence that cannot free its state is still finished. Bailing
-        // here would strand the KV blocks and prefix refs released below —
-        // trading a leak for a worse one.
-        for (layer_idx, ls) in seq.layer_states.iter_mut().enumerate() {
-            if let Some(layer) = self.layers.get(layer_idx)
-                && let Err(e) = layer.free_state(self.gpu.as_ref(), ls.as_mut())
-            {
-                tracing::error!("free_sequence: free_state(layer {layer_idx}): {e:#}");
-            }
         }
 
         // Task #25: release this sequence's LoRA slot ref (the single terminal
@@ -258,10 +258,10 @@ impl TransformerModel {
         // every replay. A new occupant of this slot can replay them; LRU in
         // `insert_batch_decode_graph` bounds batched-graph memory. Recapturing
         // on every completion was an extra eager step per request. Policy is
-        // covered at the cache-key/LRU layer in `decode_graph_key`.
+        // pinned by `decode_graph_key` tests (`*_graph_on_free` → Retain).
         //
         // verify_kgamma / fused still drop below: they bake a per-occupant
-        // LoRA adapter index, so they must be dropped for this slot.
+        // LoRA adapter index (`lora_baked_graph_on_free` → DropThisSlot).
         // verify_kgamma_graph + fused_graph are keyed by (slot, K). They now
         // capture the LoRA bgmv-vs-installed-pair branch and read the per-seq
         // seq_slot buffer, so a freed slot's entries MUST be destroyed — else a
@@ -312,18 +312,19 @@ impl TransformerModel {
         }
 
         // Free proposer state (KV cache blocks + per-seq device buffers).
+        // NOTE: no pre-validation here — the proposer's `free_state` owns
+        // terminal owner validation (ownership-only, so a same-owner second
+        // cleanup is the documented idempotent success) AND the transactional
+        // reclaim-on-validation-failure path. A pre-check here would bypass
+        // the reclaim seam and leak state-owned resources on owner mismatch.
+        let expected_owner = seq.dspark_owner;
         if let Some(ref proposer) = self.proposer
             && let Some(ref mut pstate) = seq.proposer_state
         {
-            proposer.free_state(self.gpu.as_ref(), None, pstate.as_mut())?;
+            proposer.free_state(self.gpu.as_ref(), expected_owner, pstate.as_mut())?;
         }
 
         self.free_chunked_prefill_meta(seq);
-
-        // ATLAS_SEQ_MEMTRACE: the closing half of this sequence's memory bracket.
-        // Last statement on purpose — everything this sequence owns has now been
-        // handed back, so `live` here is the number a leak moves.
-        crate::model::seq_memtrace::trace(self.gpu.as_ref(), "free");
 
         Ok(())
     }
