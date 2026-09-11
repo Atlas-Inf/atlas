@@ -796,10 +796,17 @@ pub fn run(
                 active[0].pending_drafts.clear();
                 active[0].pending_draft_conf.clear();
             }
+            // Sampled requests decline the ngram lane: the verify pick is
+            // drawn from the sampled distribution, so a deterministic
+            // n-gram draft can only match by coincidence — pure verify
+            // overhead (measured −4% tok/s at temp 0.8 on Flash-Next).
+            // pending_drafts can only have been set under this same gate,
+            // so a non-greedy seq never carries drafts to drain.
             if use_ngram_speculative
                 && active.len() == 1
                 && spec_slots_covered
                 && active[0].grammar_state.is_none()
+                && active[0].temperature == 0.0
                 && verify_ctx_limit.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
