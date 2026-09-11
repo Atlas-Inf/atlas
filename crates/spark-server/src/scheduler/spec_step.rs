@@ -372,12 +372,14 @@ pub fn step_ngram_verify(
         }
     }
 
-    // Observe accepted context into the dynamic table, then emit.
+    // Learn each accepted draft with its true preceding context — the
+    // verify already pushed [anchor, d0..na] into seq.tokens, so accepted
+    // draft j sits at index N-na+j.
+    let n = a.seq.tokens.len();
     for j in 0..na {
-        let n = a.seq.tokens.len();
-        if n > 0 {
-            let last = a.seq.tokens[n - 1];
-            proposer.observe(&a.seq.tokens[..n - 1], last);
+        let idx = n - na + j;
+        if idx > 0 {
+            proposer.observe(&a.seq.tokens[..idx], a.seq.tokens[idx]);
         }
         emit_token(a, drafts[j], None, sched);
         if a.finished {
