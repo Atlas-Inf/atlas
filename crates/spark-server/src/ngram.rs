@@ -41,6 +41,15 @@ pub struct NgramProposer {
     max_chain: usize,
     /// Dynamic table: hash(ngram) → [(next_token, count)] (top CANDS_PER_KEY).
     table: HashMap<u64, Vec<(u32, u32)>>,
+    /// Position index: hash of the 2-gram ENDING at position i -> positions i.
+    /// Without it every proposal is O(len^2 * max_match) — at max_seq_len 8192
+    /// the "free" CPU proposer would cost more than a decode step.
+    pos_index: HashMap<u64, Vec<u32>>,
+    /// High-water mark: tokens[..indexed_up_to] are in `pos_index`.
+    indexed_up_to: usize,
+    /// Fingerprint of the indexed prefix — detects a rewrite where the vec
+    /// ends up the same length or longer (verify reject pops, then refills).
+    indexed_fp: u64,
     /// Disk persistence path (None = in-memory only).
     cache_path: Option<PathBuf>,
     /// Observations since last save.
@@ -67,6 +76,9 @@ impl NgramProposer {
             max_match: 16,
             max_chain: 1,
             table: HashMap::new(),
+            pos_index: HashMap::new(),
+            indexed_up_to: 0,
+            indexed_fp: 0,
             cache_path: None,
             dirty: 0,
             accepts: 0,
@@ -108,7 +120,7 @@ impl NgramProposer {
 
     /// Propose a single draft token (longest prompt-lookup match).
     /// Retained for the K=2-only callers; `propose_chain` is the general path.
-    pub fn propose(&self, all_tokens: &[u32]) -> Option<u32> {
+    pub fn propose(&mut self, all_tokens: &[u32]) -> Option<u32> {
         self.lookup_match(all_tokens)
             .map(|(start, n)| all_tokens[start + n])
     }
@@ -120,7 +132,7 @@ impl NgramProposer {
     /// 2. If the chain is still short, extend it through the dynamic table:
     ///    hash the tail, take the most frequent learned next-token, append,
     ///    repeat. Mirrors llama.cpp's iterative ngram drafting.
-    pub fn propose_chain(&self, all_tokens: &[u32]) -> Vec<u32> {
+    pub fn propose_chain(&mut self, all_tokens: &[u32]) -> Vec<u32> {
         let k = self.max_chain;
         let mut drafts = Vec::new();
         if let Some((start, n)) = self.lookup_match(all_tokens) {
@@ -185,22 +197,70 @@ impl NgramProposer {
         }
     }
 
-    fn lookup_match(&self, all_tokens: &[u32]) -> Option<(usize, usize)> {
+    /// Bring `pos_index` up to date with `all_tokens`. The index only ever
+    /// appends; if the token vec shrank (new sequence, or a rejected-draft
+    /// pop), rebuild from scratch — the one-time O(len) cost beats tracking
+    /// per-position staleness.
+    fn ensure_indexed(&mut self, all_tokens: &[u32]) {
         let len = all_tokens.len();
-        if len < self.min_match + 1 {
+        // The vec can shrink AND regrow between calls (reject pops, then
+        // emit refills) — length alone can't tell an append from a rewrite.
+        // Fingerprint the previously-indexed prefix: O(len), and a mismatch
+        // means positions we indexed were rewritten, so rebuild.
+        let mut fp = self.indexed_up_to as u64;
+        for &t in &all_tokens[..self.indexed_up_to.min(len)] {
+            fp = fp.wrapping_mul(31).wrapping_add(t as u64);
+        }
+        if len < self.indexed_up_to || fp != self.indexed_fp {
+            self.pos_index.clear();
+            self.indexed_up_to = 0;
+        }
+        for i in self.indexed_up_to.max(1)..len {
+            self.pos_index
+                .entry(hash_ngram(&all_tokens[i - 1..=i]))
+                .or_default()
+                .push(i as u32);
+        }
+        self.indexed_up_to = len;
+        let mut fp = len as u64;
+        for &t in all_tokens {
+            fp = fp.wrapping_mul(31).wrapping_add(t as u64);
+        }
+        self.indexed_fp = fp;
+    }
+
+    /// Longest suffix match via the 2-gram position index: the tail pair's
+    /// positions are the candidate match-ends; extend each backward and keep
+    /// the longest (ties prefer the most recent occurrence — recency is what
+    /// prompt-lookup is for).
+    fn lookup_match(&mut self, all_tokens: &[u32]) -> Option<(usize, usize)> {
+        let len = all_tokens.len();
+        if len < self.min_match + 2 {
             return None;
         }
-        let max_n = self.max_match.min(len - 1);
+        self.ensure_indexed(all_tokens);
+        let tail_key = hash_ngram(&all_tokens[len - 2..len]);
+        let cands = self.pos_index.get(&tail_key)?;
+        // Only the newest CAND_CAP occurrences are worth extending; beyond
+        // that the draft is stale anyway.
         let mut best: Option<(usize, usize)> = None;
-        for n in self.min_match..=max_n {
-            let suffix = &all_tokens[len - n..len];
-            for start in 0..=(len - n - 1) {
-                if all_tokens[start..start + n] == *suffix {
-                    if best.is_none_or(|(_, bn)| n > bn) {
-                        best = Some((start, n));
-                    }
-                    break;
-                }
+        for &p in cands.iter().rev().take(64) {
+            let end = p as usize; // position where a match ends
+            if end >= len - 1 {
+                continue; // the tail itself / no continuation to propose
+            }
+            let mut start = end - 1; // 2-gram already matched
+            // Extend backward: match length grows while preceding tokens agree.
+            let mut n = 2usize;
+            while n < self.max_match
+                && start >= 1
+                && all_tokens[start - 1] == all_tokens[len - 1 - n]
+            {
+                start -= 1;
+                n += 1;
+            }
+            if n >= self.min_match && best.is_none_or(|(_, bn)| n > bn) {
+                best = Some((start, n));
             }
         }
         best
@@ -309,35 +369,35 @@ mod tests {
 
     #[test]
     fn test_prompt_lookup_basic() {
-        let p = NgramProposer::new(4);
+        let mut p = NgramProposer::new(4);
         let tokens = vec![1, 2, 3, 4, 5, 1, 2, 3];
         assert_eq!(p.propose(&tokens), Some(4));
     }
 
     #[test]
     fn test_prompt_lookup_no_match() {
-        let p = NgramProposer::new(4);
+        let mut p = NgramProposer::new(4);
         let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
         assert_eq!(p.propose(&tokens), None);
     }
 
     #[test]
     fn test_prompt_lookup_short() {
-        let p = NgramProposer::new(4);
+        let mut p = NgramProposer::new(4);
         let tokens = vec![1, 2];
         assert_eq!(p.propose(&tokens), None);
     }
 
     #[test]
     fn test_prompt_lookup_repetitive() {
-        let p = NgramProposer::new(4);
+        let mut p = NgramProposer::new(4);
         let tokens = vec![10, 20, 30, 10, 20, 30, 10, 20];
         assert_eq!(p.propose(&tokens), Some(30));
     }
 
     #[test]
     fn test_chain_emits_continuation_run() {
-        let p = NgramProposer::new(4).with_chain_and_cache(3, None);
+        let mut p = NgramProposer::new(4).with_chain_and_cache(3, None);
         // "abc abc ab" — suffix "ab" matched at pos 0 → continuation "c a b".
         let tokens = vec![10, 20, 30, 10, 20, 30, 10, 20];
         let chain = p.propose_chain(&tokens);
@@ -355,6 +415,34 @@ mod tests {
         let tokens = vec![5, 6, 1, 2, 3];
         let chain = p.propose_chain(&tokens);
         assert_eq!(chain.first().copied(), Some(9));
+    }
+
+    #[test]
+    fn test_lookup_scales_to_long_context() {
+        // The position index must make lookup O(#candidates), not O(len^2):
+        // 10k tokens with a repeated tail must resolve in well under a decode
+        // step (~ms), where the old full scan cost ~100ms.
+        let mut p = NgramProposer::new(4).with_chain_and_cache(3, None);
+        let mut tokens: Vec<u32> = (0..10_000u32).map(|i| i % 977).collect();
+        tokens.extend_from_slice(&[42, 43, 44, 45]); // tail repeated earlier?
+        tokens.splice(500..500, [42, 43, 44, 45]); // plant the tail mid-history
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            let _ = p.propose_chain(&tokens);
+        }
+        let per = t0.elapsed() / 50;
+        assert!(per.as_millis() < 5, "propose too slow: {per:?}");
+    }
+
+    #[test]
+    fn test_index_rebuilds_after_shrink() {
+        let mut p = NgramProposer::new(4);
+        let mut tokens = vec![1, 2, 3, 4, 5, 1, 2, 3];
+        assert_eq!(p.propose(&tokens), Some(4));
+        // Verify-pop path: tokens shrink (rejected drafts popped).
+        tokens.truncate(4);
+        tokens.extend_from_slice(&[7, 8, 7, 8, 7]);
+        assert_eq!(p.propose(&tokens), Some(8));
     }
 
     #[test]
