@@ -327,8 +327,7 @@ impl BlockDiffusionDraftHead {
             )?;
         }
 
-        if let (Some(ref conv), Some(out_delta)) =
-            (layer.attention_conv.as_ref(), attn_conv_out_delta)
+        if let (Some(conv), Some(out_delta)) = (layer.attention_conv.as_ref(), attn_conv_out_delta)
         {
             conv.finish(
                 gpu,
@@ -448,7 +447,7 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
 
-        if let (Some(ref conv), Some(out_delta)) = (layer.mlp_conv.as_ref(), mlp_conv_out_delta) {
+        if let (Some(conv), Some(out_delta)) = (layer.mlp_conv.as_ref(), mlp_conv_out_delta) {
             conv.finish(
                 gpu,
                 self.kernels.dflash2_conv,
