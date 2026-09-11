@@ -283,11 +283,9 @@ pub struct TransformerModel {
     pub(super) dflash_hidden_save_rows: usize,
     /// How many sequences the capture buffer is strided for (1 = C=1 layout).
     pub(super) dflash_hidden_save_nseq: usize,
-    /// Cached CUDA graphs for the BATCHED K-row verify (verify_e), keyed by
-    /// the batch's ssm-pool slot VECTOR (+ the per-seq row count K + a
-    /// wy-tables-present sentinel). Value = `(graph, last_use_tick)`.
-    pub(super) verify_batched_graphs:
-        Mutex<(std::collections::HashMap<Vec<u32>, (GraphHandle, u64)>, u64)>,
+    // Batched K-row verify (verify_e) graphs now live in `graph_runtime`
+    // (Verify phase), keyed by the same slot-vector layout. The per-path cache
+    // is gone: the runtime owns LRU, quota, and deferred destruction.
     /// Batched-verify WY pointer-table staging: `num_ssm_layers` slices of
     /// `crate::layer::VERIFY_WY_LAYER_STRIDE_BYTES` ([h|Hi0|Hi1|Hi2] × 4
     /// u64 entries each) at a FIXED device address, refreshed pre-graph every

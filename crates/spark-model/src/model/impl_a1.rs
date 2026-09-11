@@ -840,7 +840,6 @@ impl TransformerModel {
             dflash_hidden_save,
             dflash_hidden_save_rows,
             dflash_hidden_save_nseq,
-            verify_batched_graphs: Mutex::new((std::collections::HashMap::new(), 0)),
             dflash_capture_layers,
             verify_wy_tables,
             // Nothing staged yet: the buffer was memset to zero above, and no
