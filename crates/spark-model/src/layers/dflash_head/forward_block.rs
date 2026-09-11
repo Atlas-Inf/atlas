@@ -820,7 +820,7 @@ impl BlockDiffusionDraftHead {
             // longer resolves (evicted, or an identity that went stale) falls
             // back to eager for that segment, exactly like the empty-capture
             // sentinel it replaced.
-            let resolved: Option<Vec<Option<spark_runtime::graph_runtime::GraphLease>>> = gmap
+            let resolved = gmap
                 .get(&graph_key)
                 .filter(|keys| keys.len() == total_slots)
                 .map(|keys| {
@@ -829,7 +829,7 @@ impl BlockDiffusionDraftHead {
                             key.as_ref()
                                 .and_then(|key| self.graph_runtime.lookup_key(key).ok().flatten())
                         })
-                        .collect()
+                        .collect::<Vec<_>>()
                 });
 
             if let Some(graphs) = resolved {

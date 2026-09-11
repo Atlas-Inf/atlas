@@ -623,6 +623,7 @@ pub struct BlockDiffusionDraftHead {
     /// `spark_runtime::graph_runtime::GraphRuntime` (Propose phase); this map
     /// only holds the runtime keys, so the runtime owns LRU, quota accounting,
     /// and deferred destruction.
+    #[allow(clippy::type_complexity)]
     pub propose_graphs:
         Mutex<HashMap<DflashGraphIdentity, Vec<Option<spark_runtime::graph_runtime::GraphKey>>>>,
     /// The model's unified graph runtime. Captured propose subgraphs are
