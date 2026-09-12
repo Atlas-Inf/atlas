@@ -13,7 +13,7 @@ description = "Content hash of a kernel target's transitive include closure."
 
 [dependencies]
 anyhow.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 
 [lints]
 workspace = true

@@ -71,7 +71,7 @@ anyhow = "1"
 # Stable content hashing for kernel-closure provenance. `DefaultHasher` is
 # explicitly NOT stable across Rust releases, and this hash is persisted in
 # committed gate records — it has to mean the same thing next year.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Synchronization — parking_lot Mutex/RwLock are faster than std::sync,
 # don't poison, and `.lock()` returns the guard directly (no Result).
