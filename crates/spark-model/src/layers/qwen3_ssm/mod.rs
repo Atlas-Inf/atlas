@@ -372,6 +372,12 @@ pub struct Qwen3SsmLayer {
     // backend that only ships the 64x64 base tile) — callers fall back to
     // `w8a16_gemm_t_k`.
     w8a16_gemm_t_m128_k: KernelHandle,
+    // Large-M NON-transposed W8A16 prefill: same 128x128 tile but reads the
+    // native `B[N,K]` (k-contiguous) FP8 weight directly — the k-contiguous
+    // load turns the smem_B store into contiguous uint4 writes (no strided
+    // bank-conflicting scalar stores). Preferred over `w8a16_gemm_t_m128_k`
+    // when linked, since it skips the in-kernel transpose entirely.
+    w8a16_gemm_n_m128_k: KernelHandle,
     // W8A8 + FP32 epilogue (vLLM-equivalent) prefill kernels.
     // `per_token_group_quant_fp8` produces FP8 activations + per-token-per-128
     // FP32 scale; `fp8_gemm_t_blockscaled` consumes both with FP8 MMA and

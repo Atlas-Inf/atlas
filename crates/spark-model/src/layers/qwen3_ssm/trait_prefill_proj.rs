@@ -334,6 +334,33 @@ impl Qwen3SsmLayer {
                     "ssm prefill: QKVZ w8a16_gemm_pipelined failed (M={k}, N={qkvz_size}): {e}"
                 )
             })?;
+        } else if let Some(ref fp8w) = self.qkvz_fp8w
+            && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
+            && k > 128
+            && self.w8a16_gemm_n_m128_k.0 != 0
+        {
+            // NON-transposed FP8 m128 (gfx1151): reads the native B[N,K]
+            // k-contiguous weight + block_scale[N/128,K/128] directly. The
+            // k-contiguous load writes contiguous uint4 into smem_B[n][k] — no
+            // strided bank-conflicting scalar stores like the transposed
+            // w8a16_gemm_t_m128. Preferred over the transposed arm when linked.
+            ops::w8a16_gemm_n_m128(
+                ctx.gpu,
+                self.w8a16_gemm_n_m128_k,
+                normed,
+                fp8w.weight,
+                fp8w.row_scale,
+                proj_dst,
+                k,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "ssm prefill: QKVZ w8a16_gemm_n_m128 failed (M={k}, N={qkvz_size}): {e}"
+                )
+            })?;
         } else if let Some(ref fp8t) = self.qkvz_fp8w_t {
             // Coalesced transposed-FP8 path (native-FP8 GDN checkpoints, e.g.
             // the nvidia modelopt SSM projections). `w8a16_gemm_t` reads

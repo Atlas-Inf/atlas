@@ -482,6 +482,11 @@ impl Qwen3SsmLayer {
                 "w8a16_gemm_t_m128",
                 "w8a16_gemm_t_m128",
             ),
+            w8a16_gemm_n_m128_k: super::super::try_kernel(
+                gpu,
+                "w8a16_gemm_n_m128",
+                "w8a16_gemm_n_m128",
+            ),
             per_token_group_quant_fp8_k: super::super::try_kernel(
                 gpu,
                 "per_token_group_quant_fp8",

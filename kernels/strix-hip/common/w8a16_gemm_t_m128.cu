@@ -151,6 +151,10 @@ void w8a16_gemm_t_m128(
         { \
             /* Extract the 16 FP8 bytes from the uint4 words with shifts — */ \
             /* keeps reg_B register-resident (no &rb aliasing -> local mem). */ \
+            /* NOTE: the strided smem_B[n][k] store is bank-conflicted (the */ \
+            /* n-groups are 16 apart and 16*rowstride_words aliases mod 32), */ \
+            /* but a measured A/B showed a rotated-store order costs MORE */ \
+            /* (runtime-indexed rw[] spills) than the conflicts it saves.   */ \
             const unsigned int rw[4] = { (rb).x, (rb).y, (rb).z, (rb).w }; \
             _Pragma("unroll") \
             for (int i = 0; i < 16; i++) { \

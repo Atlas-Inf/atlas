@@ -179,6 +179,26 @@ impl Qwen3SsmLayer {
                 value_dim as u32,
                 stream,
             )
+        } else if let Some(ref fp8w) = self.out_proj_fp8w
+            && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
+            && k > 128
+            && self.w8a16_gemm_n_m128_k.0 != 0
+        {
+            // NON-transposed FP8 m128 (gfx1151): reads native B[N,K] k-contiguous
+            // + block_scale[N/128,K/128] directly — contiguous smem stores, no
+            // strided bank-conflicting writes. Preferred over out_proj_fp8w_t.
+            ops::w8a16_gemm_n_m128(
+                ctx.gpu,
+                self.w8a16_gemm_n_m128_k,
+                normed_out_buf,
+                fp8w.weight,
+                fp8w.row_scale,
+                out_proj_buf,
+                k,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )
         } else if let Some(ref fp8t) = self.out_proj_fp8w_t {
             // Coalesced transposed-FP8 path (native-FP8 GDN checkpoints) — same
             // argument as the QKVZ arm: `w8a16_gemm_t` reads B_t[K,N] coalesced,
