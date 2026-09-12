@@ -5,8 +5,17 @@
   import vendorsRaw from '$lib/models.generated.json';
   import { models as mcopy, recipesUrl } from '$lib/data.js';
 
-  // Flagship first: Qwen3.6 leads its vendor, then Qwen3.5, then the rest as-is.
-  const rankSub = (n) => (n === 'Qwen3.6' ? 0 : n === 'Qwen3.5' ? 1 : 2);
+  // Flagship first: Qwen3.8 leads its vendor, then Qwen3.6, Qwen3.5.
+  // Nemotron-3.5 Lightning leads Nemotron.
+  const rankSub = (n) => {
+    if (n === 'Qwen3.8') return 0;
+    if (n === 'Qwen3.6') return 1;
+    if (n === 'Qwen3.5') return 2;
+    if (n === 'Nemotron-3.5 Lightning') return 0;
+    if (n === 'Nemotron-3 Nano') return 1;
+    if (n === 'Nemotron-3 Super') return 2;
+    return 3;
+  };
   const vendors = vendorsRaw.map((v) => ({
     ...v,
     subfamilies: [...v.subfamilies].sort((a, b) => rankSub(a.name) - rankSub(b.name))
@@ -140,7 +149,7 @@
 
     <div class="ms-foot">
       Every recipe is the single source of truth in
-      <a href={recipesUrl} class="link" target="_blank" rel="noopener">atlas-recipes</a>,
+      <a href={recipesUrl} class="link" target="_blank" rel="noopener">sparkrun-recipes</a>,
       so the site cannot list a model we do not ship. EP=2 is Expert Parallelism across two GB10 nodes.
     </div>
 

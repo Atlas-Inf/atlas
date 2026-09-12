@@ -42,7 +42,7 @@
           <button type="button" class="copy-btn" onclick={copyRepro} aria-label="Copy reproduce command">{copied ? 'Copied' : 'Copy'}</button>
         </div>
         <p class="mlperf-note" style="font-weight:650;color:var(--t1)">{verified.challengeLine}</p>
-        <p class="mlperf-note" style="font-size:0.84rem">Every model card comes from a recipe in <a class="link" href={recipesUrl} target="_blank" rel="noopener">atlas-recipes</a>.</p>
+        <p class="mlperf-note" style="font-size:0.84rem">Every model card comes from a recipe in <a class="link" href={recipesUrl} target="_blank" rel="noopener">sparkrun-recipes</a>.</p>
       </div>
 
       <Receipt />
