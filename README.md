@@ -1,4 +1,4 @@
- g<p align="center">
+<p align="center">
   <img src="assets/logo.svg" alt="Atlas Inference Engine" width="640" />
 </p>
 <p align="center">
