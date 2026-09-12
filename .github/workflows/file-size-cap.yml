@@ -197,6 +197,29 @@ jobs:
             # `sizes_q2.rs`). Clean split (total() → `sizes/total.rs`) tracked
             # as the same follow-up as the buffers.rs getter split.
             "crates/spark-runtime/src/buffers/sizes.rs"
+            # 602 LoC — the single `impl GpuBackend for AtlasCudaBackend`. The
+            # CUDA graph port added capture-safety guards and env-gated fault
+            # injection to the alloc/copy/sync/event/graph methods here. A trait
+            # impl cannot span files (E0119), so the only clean split is to move
+            # each guarded body into an inherent `*_impl` fn and delegate — the
+            # same "one trait impl cannot span files" disease as
+            # `transformer_layer.rs`. Tracked as follow-up.
+            "crates/spark-runtime/src/cuda_backend/gpu_impl.rs"
+            # 603 LoC — the single `pub trait GpuBackend` definition. The CUDA
+            # graph port added the graph/conditional/capture trait methods plus
+            # red-zone and live-allocation probes the model layer now calls.
+            # A trait cannot span files, so there is no clean split.
+            "crates/spark-runtime/src/gpu.rs"
+            # 564 LoC — one `decode_dispatch` (single-token decode). The graph
+            # port added capture registration, the runtime-backed replay branch,
+            # and the eager fallback on a refused registration. Splitting the
+            # launch sequence fragments the graph-critical ordering; the same
+            # reason `qwen3_attention/decode/attention_forward.rs` is listed.
+            "crates/spark-model/src/model/trait_impl/decode_a.rs"
+            # 507 LoC — one `decode_verify_graphed_dispatch`. Same as decode_a:
+            # the runtime-backed replay/capture/branch sequence is read
+            # top-to-bottom against the metadata fill and must not fragment.
+            "crates/spark-model/src/model/trait_impl/verify_b.rs"
             # ── PR #90 (fix/in-think-tool-call-leak) carry-overs ──
             # The overnight coherence-debugging work grew these past 500 LoC
             # (19 newly over-cap + impl_a2/compile_tools inherited from main).

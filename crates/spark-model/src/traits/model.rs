@@ -336,6 +336,11 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Recreate graph keys requested by a validated startup prewarm profile.
+    fn prewarm_graphs(&self) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Per-layer chunked prefill: SSM layers use three phases (proj →
     /// single-launch GDN → post) so the recurrence sees the full sequence
     /// in one launch; attention layers use standard chunked prefill.

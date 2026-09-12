@@ -111,6 +111,39 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// Does a captured decode graph go STALE when a new sequence takes this
+    /// slot? A layer that allocates its own per-sequence state (GLM-5.3
+    /// allocates a fresh indexer cache and KDA state per sequence) breaks the
+    /// "only SSM-pool addresses are baked" premise, so the unified graph
+    /// runtime must invalidate that slot's graphs. Default: slot-keyed graphs
+    /// survive an occupant change.
+    fn graph_stale_on_new_sequence(&self) -> bool {
+        false
+    }
+
+    /// Reconcile HOST-side per-sequence bookkeeping that a step would have
+    /// done, when that step was served by a replayed CUDA graph instead of
+    /// being run. A graph replay executes kernels and nothing else, so a layer
+    /// tracking its own cache length on the host would silently stop
+    /// advancing. `seq_len` is the length BEFORE this step's `k` rows. Default
+    /// is a no-op — only a layer with host-side state needs this.
+    fn sync_replayed_step(
+        &self,
+        _state: &mut dyn LayerState,
+        _seq_len: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Refuse a step whose writes would land past a host-tracked cache —
+    /// BEFORE the graph that performs them is replayed. `sync_replayed_step`
+    /// runs after the launch, which is too late to prevent an overrun that
+    /// leaves a STICKY `CUDA_ERROR_ILLEGAL_ADDRESS`. Default is a no-op.
+    fn check_replay_room(&self, _state: &dyn LayerState, _seq_len: usize, _k: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// Marconi aux state: host-serialized per-layer SEQUENCE state that must
     /// travel with an SSM snapshot for a prefix-cache hit to be complete —
     /// PLE's n-gram history + conv state, QSA's ingested indexer keys.

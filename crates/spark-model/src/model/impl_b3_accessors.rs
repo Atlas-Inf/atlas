@@ -5,6 +5,7 @@
 
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
+use std::sync::Arc;
 
 use super::types::TransformerModel;
 use crate::layers::dflash_head::{LightningDsparkProductPolicy, LightningStructuralGraphState};
@@ -59,6 +60,10 @@ impl TransformerModel {
     /// same GPU the target uses).
     pub fn gpu_backend(&self) -> &dyn GpuBackend {
         self.gpu.as_ref()
+    }
+
+    pub fn graph_runtime(&self) -> Arc<spark_runtime::graph_runtime::GraphRuntime> {
+        self.graph_runtime.clone()
     }
 
     /// Borrow the model config for post-construction wiring (e.g. building the

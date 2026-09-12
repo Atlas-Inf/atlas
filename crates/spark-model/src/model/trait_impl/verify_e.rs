@@ -208,60 +208,87 @@ impl TransformerModel {
         } else {
             None
         };
-        let mut graphs = graph_key
+        let graph_identity = graph_key.as_ref().and_then(|key| {
+            let slots = seqs
+                .iter()
+                .map(|seq| seq.ssm_slot_idx().unwrap_or(seq.slot_idx) as u32)
+                .collect();
+            let depths = ks.iter().map(|&depth| depth as u32).collect();
+            self.verify_graph_identity(slots, depths, r_total, key.clone())
+                .ok()
+        });
+        let candidates: Vec<_> = self
+            .graph_runtime
+            .cached_graphs(spark_runtime::graph_runtime::GraphPhase::Verify)
+            .into_iter()
+            .filter_map(|lease| {
+                let layout = match &lease.key().payload {
+                    spark_runtime::graph_runtime::GraphPayload::Verify {
+                        request_count,
+                        layout,
+                        ..
+                    } if *request_count > 1 => Some(layout.clone()),
+                    _ => None,
+                }?;
+                Some((layout, lease))
+            })
+            .collect();
+        let mut replay = graph_identity
             .as_ref()
-            .map(|_| self.verify_batched_graphs.lock());
-        // LRU touch on hit: bump the tick so eviction always removes the
-        // least-recently-replayed slot vector.
-        let mut replay: Option<spark_runtime::gpu::GraphHandle> = None;
+            .and_then(|identity| self.graph_runtime.lookup(identity).ok().flatten());
         let mut ghosts: Vec<(u32, u32)> = Vec::new();
         // Graph outcome for the periodic ATLAS_MTP_ACCEPT_DEBUG summary
         // (verify_e2). `Eager` until something claims otherwise — that is
         // also the honest value when graphs are off or the batch is
         // unkeyable.
-        let mut outcome = super::verify_e2::VerifyGraphOutcome::Eager;
-        if let (Some(g), Some(key)) = (&mut graphs, &graph_key) {
-            g.1 += 1;
-            let tick = g.1;
-            if let Some(e) = g.0.get_mut(key) {
-                e.1 = tick;
-                replay = Some(e.0);
-                outcome = super::verify_e2::VerifyGraphOutcome::Replay;
-            } else if super::graph_borrow::graph_borrow_enabled() {
-                let wy_present = !wy_tables_base.is_null();
-                let borrowed =
-                    super::graph_borrow::find_borrowable_verify_key(key, g.0.keys(), |s, k| {
-                        self.ssm_pool.slot_is_free(s as usize)
-                            && (!wy_present
-                                || self.ssm_pool.h_inter_count(s as usize) + 1 >= k as usize)
-                    });
-                // Every cached key was captured under `ensure!(R <= 96)`, so
-                // the borrowed total row count fits the fixed 96-row meta
-                // arrays and logits cap by construction — but that bound
-                // guards the `unsafe` upload lengths below, so it is
-                // re-checked as a hard borrow veto, never assumed.
-                if let Some(b) = borrowed
-                    && r_total + b.ghosts.iter().map(|&(_, k)| k as usize).sum::<usize>()
-                        <= super::verify_e2::VERIFY_ROW_CAP
-                {
-                    let e =
-                        g.0.get_mut(&b.key)
-                            .expect("borrowed key comes from this cache");
-                    e.1 = tick;
-                    replay = Some(e.0);
-                    ghosts = b.ghosts;
-                    outcome = super::verify_e2::VerifyGraphOutcome::Borrow;
-                    // INFO once per transition (same cardinality as the
-                    // captures this replaces); repeats of the same pair
-                    // stay silent. Provable engagement: grep "graph borrow".
-                    if super::graph_borrow::VERIFY_BORROW_LOG.should_log(key, &b.key) {
-                        tracing::info!(
-                            "verify graph borrow: n={n} R={r_total} -> replaying captured \
-                             {}-seq key with {} ghost pairs",
-                            (b.key.len() - 1) / 2,
-                            ghosts.len()
-                        );
-                    }
+        let mut outcome = if replay.is_some() {
+            super::verify_e2::VerifyGraphOutcome::Replay
+        } else {
+            super::verify_e2::VerifyGraphOutcome::Eager
+        };
+        if replay.is_none()
+            && let Some(key) = &graph_key
+            && super::graph_borrow::graph_borrow_enabled()
+        {
+            let wy_present = !wy_tables_base.is_null();
+            let borrowed = super::graph_borrow::find_borrowable_verify_key(
+                key,
+                candidates.iter().map(|(layout, _)| layout),
+                |slot, depth| {
+                    self.ssm_pool.slot_is_free(slot as usize)
+                        && (!wy_present
+                            || self.ssm_pool.h_inter_count(slot as usize) + 1 >= depth as usize)
+                },
+            );
+            // Every cached key was captured under the VERIFY_ROW_CAP
+            // ensure!, so the borrowed total row count fits the meta arrays
+            // and logits cap by construction — but that bound guards the
+            // `unsafe` upload lengths below, so it is re-checked as a hard
+            // borrow veto, never assumed.
+            if let Some(borrowed) = borrowed
+                && r_total
+                    + borrowed
+                        .ghosts
+                        .iter()
+                        .map(|&(_, depth)| depth as usize)
+                        .sum::<usize>()
+                    <= super::verify_e2::VERIFY_ROW_CAP
+                && let Some((_, lease)) = candidates
+                    .iter()
+                    .find(|(layout, _)| *layout == borrowed.key)
+            {
+                replay = Some(lease.clone());
+                ghosts = borrowed.ghosts;
+                outcome = super::verify_e2::VerifyGraphOutcome::Borrow;
+                // INFO once per transition (same cardinality as the captures
+                // this replaces); repeats of the same pair stay silent.
+                if super::graph_borrow::VERIFY_BORROW_LOG.should_log(key, &borrowed.key) {
+                    tracing::info!(
+                        "verify graph borrow: n={n} R={r_total} -> replaying captured \
+                         {}-seq key with {} ghost pairs",
+                        (borrowed.key.len() - 1) / 2,
+                        ghosts.len()
+                    );
                 }
             }
         }
@@ -412,15 +439,13 @@ impl TransformerModel {
             // Replay: kernels read this step's metadata + WY tables from the
             // fixed addresses refreshed above; the ~4-5k launches of the
             // layer loop + head + argmax dispatch as one graph.
-            if graph.0 != 0 {
-                self.gpu.launch_graph(graph, stream)?;
-            }
+            self.graph_runtime.launch(&graph, stream)?;
         } else {
             // First step for this (slot vector, k) key (or graphs off): run
             // the body, capturing. A full cache no longer disables capture —
-            // the LRU entry is destroyed at insert time (see below), so
+            // the bounded LRU evicts at insert time (see below), so
             // slot-vector churn can never push the path permanently eager.
-            let capture = graphs.is_some();
+            let capture = graph_identity.is_some();
 
             // PLE's host half for EVERY sequence's draft window, hoisted
             // before capture/replay. Sequence i owns rows [off[i], off[i+1]),
@@ -612,42 +637,46 @@ impl TransformerModel {
             }
 
             if capture {
-                let graph = self.gpu.end_capture(stream)?;
+                let identity = graph_identity
+                    .as_ref()
+                    .expect("capture requires graph identity");
+                let topology_dot = self.graph_runtime.capture_dot_path(identity);
+                let graph = self
+                    .gpu
+                    .end_capture_with_dot(stream, topology_dot.as_deref())?;
                 if graph.0 != 0 {
                     tracing::info!(
                         "Captured CUDA graph for batched verify ks={ks:?} (n={n}, key={:?})",
                         graph_key
                     );
-                    if let (Some(ref mut g), Some(key)) = (graphs.as_mut(), graph_key) {
-                        if g.0.len() >= super::verify_e2::VERIFY_BATCHED_GRAPH_CAP {
-                            // Evict the least-recently-used graph. Safe to
-                            // destroy: every batched verify step ends with a
-                            // blocking argmax D2H on this stream, so any
-                            // earlier step's replay has already completed.
-                            if let Some(evict) =
-                                g.0.iter()
-                                    .min_by_key(|(_, entry)| entry.1)
-                                    .map(|(key, _)| key.clone())
-                                && let Some((old, _)) = g.0.remove(&evict)
-                                && let Err(e) = self.gpu.destroy_graph(old)
-                            {
-                                tracing::warn!("batched-verify graph evict: {e:#}");
-                            }
-                        }
-                        g.1 += 1;
-                        let tick = g.1;
-                        g.0.insert(key, (graph, tick));
-                        outcome = super::verify_e2::VerifyGraphOutcome::Capture;
-                    }
-                    self.gpu.launch_graph(graph, stream)?;
+                    let managed = self.graph_runtime.register_captured(
+                        identity.clone(),
+                        stream,
+                        self.model_graph_cost(),
+                        graph,
+                        topology_dot,
+                    )?;
+                    outcome = super::verify_e2::VerifyGraphOutcome::Capture;
+                    self.graph_runtime.launch(&managed, stream)?;
                 }
             }
         }
-        // Live key count read while the guard is still held — it is the
-        // other half of the capture-rate signal (churn against the 32-entry
-        // LRU is what turns a miss into a re-capture).
-        let live_keys = graphs.as_ref().map(|g| g.0.len()).unwrap_or(0);
-        drop(graphs);
+        // Live key count is the other half of the capture-rate signal (churn
+        // against the bounded LRU is what turns a miss into a re-capture).
+        let live_keys = self
+            .graph_runtime
+            .cached_graphs(spark_runtime::graph_runtime::GraphPhase::Verify)
+            .into_iter()
+            .filter(|lease| {
+                matches!(
+                    &lease.key().payload,
+                    spark_runtime::graph_runtime::GraphPayload::Verify {
+                        request_count,
+                        ..
+                    } if *request_count > 1
+                )
+            })
+            .count();
         super::verify_e2::record_verify_graph_outcome(n, live_keys, outcome);
 
         // ── Phase 5: D2H + host bookkeeping ──

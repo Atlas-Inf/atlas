@@ -616,8 +616,21 @@ pub struct BlockDiffusionDraftHead {
     /// (vLLM piecewise convention). See design doc §15.
     /// Piecewise propose graphs keyed by validated sequence generation and
     /// every captured pointer/lane identity. Pointer reuse cannot cross a
-    /// retired generation. `GraphHandle(0)` remains the eager sentinel.
-    pub propose_graphs: Mutex<HashMap<DflashGraphIdentity, Vec<spark_runtime::gpu::GraphHandle>>>,
+    /// retired generation. `None` in a slot is the eager sentinel (the
+    /// subgraph fell back to eager at capture time).
+    ///
+    /// The handles themselves live in the model's
+    /// `spark_runtime::graph_runtime::GraphRuntime` (Propose phase); this map
+    /// only holds the runtime keys, so the runtime owns LRU, quota accounting,
+    /// and deferred destruction.
+    #[allow(clippy::type_complexity)]
+    pub propose_graphs:
+        Mutex<HashMap<DflashGraphIdentity, Vec<Option<spark_runtime::graph_runtime::GraphKey>>>>,
+    /// The model's unified graph runtime. Captured propose subgraphs are
+    /// registered here (keyed by `DflashGraphIdentity` via the payload's
+    /// `key_words`) so they share the same bounded cache and destruction path
+    /// as decode/verify/prefill graphs.
+    pub graph_runtime: std::sync::Arc<spark_runtime::graph_runtime::GraphRuntime>,
     /// Round-robin counter handing out propose lanes at `alloc_state`.
     /// One extra-lane stream may serve several seqs (n > lanes); the lane
     /// itself never moves for a seq.
@@ -1410,17 +1423,22 @@ impl DraftProposer for BlockDiffusionDraftHead {
             .as_mut()
             .expect("owner validated above")
             .retire(owner)?;
-        let retired_graphs = {
+        // The handles live in the graph runtime now; invalidating the keys
+        // retires them (deferred destruction, LRU accounting) instead of
+        // destroying raw handles here.
+        let retired_keys: Vec<spark_runtime::graph_runtime::GraphKey> = {
             let mut graphs = self.propose_graphs.lock();
             lifecycle::take_owned_graphs(&mut graphs, owner)
                 .into_iter()
                 .flatten()
-                .collect::<Vec<_>>()
+                .flatten()
+                .collect()
         };
-        for graph in retired_graphs {
-            if graph.0 != 0 {
-                gpu.destroy_graph(graph)?;
-            }
+        for key in retired_keys {
+            self.graph_runtime.invalidate(
+                &key,
+                spark_runtime::graph_runtime::GraphFallbackReason::Retired,
+            );
         }
         if !dstate.block_table.is_empty() {
             self.kv_cache.lock().free_blocks(&dstate.block_table);

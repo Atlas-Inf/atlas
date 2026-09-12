@@ -109,6 +109,15 @@ pub struct ModelLevers {
     /// The two halves are coupled — prefill without carry is a measured
     /// −927 ms/turn loss — so they travel as one value.
     pub drafter: crate::model::drafter_context::DrafterContext,
+    /// `ATLAS_SSM_SAVE_DUMP` (presence) — the CBD scratch/SSM-state
+    /// fingerprint probe. Read only to decide whether to do nothing.
+    pub ssm_save_dump: bool,
+    /// `ATLAS_EP_GRAPHS=1|true` — permit CUDA graph capture on the expert-
+    /// parallel all-reduce path.
+    pub ep_graphs: bool,
+    /// `ATLAS_GDN_DECODE_GRAPH=1|true` — permit CUDA graph capture of GDN
+    /// decode.
+    pub gdn_decode_graph: bool,
 }
 
 /// Opt-IN: off unless the variable is exactly `1`.
@@ -163,6 +172,9 @@ impl ModelLevers {
             gemma4_diag: opt_in_truthy("ATLAS_DIAG_GEMMA4"),
             // Presence-gated, not value-gated: any value enables it.
             bf16_tc_proj: std::env::var_os("ATLAS_BF16_TC_PROJ").is_some(),
+            ssm_save_dump: std::env::var_os("ATLAS_SSM_SAVE_DUMP").is_some(),
+            ep_graphs: opt_in_truthy("ATLAS_EP_GRAPHS"),
+            gdn_decode_graph: opt_in_truthy("ATLAS_GDN_DECODE_GRAPH"),
         }
     }
 

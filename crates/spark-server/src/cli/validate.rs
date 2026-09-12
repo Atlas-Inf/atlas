@@ -23,7 +23,8 @@ use super::ServeArgs;
 // enforced cannot drift apart. Their sync with the parse sites in `serve.rs`
 // is pinned by `flag_values_tests`.
 use super::flag_values::{
-    LM_HEAD_DTYPES, MTP_GATES, MTP_QUANTS, SCHEDULING_POLICIES, SSM_H_DTYPES, TOOL_CALL_PARSERS,
+    CUDA_GRAPH_MODES, LM_HEAD_DTYPES, MTP_GATES, MTP_QUANTS, SCHEDULING_POLICIES, SSM_H_DTYPES,
+    TOOL_CALL_PARSERS,
 };
 
 /// One validation failure: what is wrong, why it is wrong, and how to fix it.
@@ -66,6 +67,20 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
     if let Some(gate) = &args.mtp_gate {
         check_enum(&mut v, "--mtp-gate", gate, MTP_GATES);
     }
+    check_enum(
+        &mut v,
+        "--cuda-graph-mode",
+        &args.cuda_graph_mode,
+        CUDA_GRAPH_MODES,
+    );
+    if let Err(error) = super::graph_config::validate_graph_config(args) {
+        v.push(Violation::new(
+            error,
+            "CUDA graph buckets and quotas must be finite and deterministic.",
+            "use positive, strictly increasing bucket lists and non-zero cache limits",
+        ));
+    }
+
     // The FP16 h-state twins live ONLY on the fused-norm decode arm. Without
     // it the dispatch lands on an FP32-only kernel pointed at an FP16 pool,
     // which does not fault — it emits fluent garbage. Reject the pair here,
@@ -95,7 +110,7 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
     // FP32-element intermediate stride. Both halves read an FP16 h-state as
     // FP32: fluent garbage, not an error. Applies to plain `f16` as well as
     // `f16-pool`, hence `h_f16`.
-    if h_f16 && args.dflash {
+    if h_f16 && args.dflash_family() {
         v.push(Violation::new(
             "--dflash together with --ssm-h-dtype f16",
             "the DFlash verify width (gamma + 1 = 17) dispatches gated_delta_rule_wy17, \
@@ -223,13 +238,28 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         && num_drafts > 1
         && !any_spec
     {
-        v.push(Violation::new(
-            format!("--num-drafts {num_drafts} is set but no speculative method is enabled.",),
-            "the draft count only applies when speculative decoding proposes drafts; \
-             without it the flag is ignored.",
-            "add --speculative (MTP), --self-speculative, or --ngram-speculative — or \
-             drop --num-drafts.",
-        ));
+        // --dflash IS a speculative method, but it does not consume
+        // --num-drafts either: the drafter's trained block size (γ) decides
+        // the draft count (`serve_load` forces num_drafts = γ - 1). The flag
+        // is ignored in both arms — what differs is the correct remedy.
+        if args.dflash_family() {
+            v.push(Violation::new(
+                format!("--num-drafts {num_drafts} is ignored under --dflash/--dspark."),
+                "a DFlash serve drafts at the drafter checkpoint's trained block size \
+                 (γ); the scheduler overrides --num-drafts with γ - 1.",
+                "drop --num-drafts, or use --dflash-gamma to override the drafter's γ \
+                 (block-diffusion drafters are trained at ONE block size — expect \
+                 acceptance collapse away from it).",
+            ));
+        } else {
+            v.push(Violation::new(
+                format!("--num-drafts {num_drafts} is set but no speculative method is enabled.",),
+                "the draft count only applies when speculative decoding proposes drafts; \
+                 without it the flag is ignored.",
+                "add --speculative (MTP), --self-speculative, or --ngram-speculative — or \
+                 drop --num-drafts.",
+            ));
+        }
     }
 
     // ── Thinking budget contradicts disabling thinking. ──

@@ -26,7 +26,12 @@ pub(crate) fn preflight_reserve(
 ) -> Result<ReservePreflight> {
     let h_state_bytes = config.ssm_h_state_bytes();
     let conv_state_bytes = config.ssm_conv_state_bytes();
-    let spec_on_pool = args.speculative || args.self_speculative || args.ngram_speculative;
+    // DFlash/D-Spark belong here: `TransformerModel::new` forces the verify
+    // pools ON whenever DFlash capture layers exist (`has_mtp |= dflash`),
+    // so a DFlash-family serve allocates the full K=γ+1 intermediate/checkpoint
+    // pools.
+    let spec_on_pool =
+        args.speculative || args.self_speculative || args.ngram_speculative || args.dflash_family();
     ssm_h_fp16_preconditions(args, config)?;
     // SSM state pool = per-seq live state (max_batch blobs) + MTP verify
     // state (intermediates + checkpoint) for the slots spec dispatch can
@@ -61,7 +66,7 @@ pub(crate) fn preflight_reserve(
         spec_on_pool,
         args.resolved_num_drafts(),
         mtp_state_slots,
-        args.dflash,
+        args.dflash_family(),
         // Stage-3 f16-SIZED pool: mirrors `SsmStatePool::new`'s narrowing.
         // Unreachable today (ssm_h_fp16_preconditions refuses the mode
         // above), wired so preflight and allocator cannot diverge when the
@@ -149,7 +154,7 @@ pub(crate) fn preflight_reserve(
     // stranded ~38 GB at bs32 on the 27B (75.2 GB SSM reserve vs an 85.2 GB
     // budget at util 0.70) and capped the native batch at ~20.
     // `use_speculative` here MUST mirror what `build_model` passes:
-    // `args.speculative || args.dflash`.
+    // `args.speculative || args.dflash_family()`.
     // Kill switch: `ATLAS_SSM_RESERVE_RING_FULL` present ⇒ restore the old
     // unconditional reservation (accounting-only, safe over-reserve;
     // presence-style — `=0` is NOT "off").
@@ -162,7 +167,7 @@ pub(crate) fn preflight_reserve(
     } else {
         spark_model::ssm_reserve::decode_rollback_ring_slots(
             config.num_ssm_layers(),
-            args.speculative || args.dflash,
+            args.speculative || args.dflash_family(),
         )
         .slots
     };

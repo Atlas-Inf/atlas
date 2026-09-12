@@ -354,3 +354,26 @@ fn dflash_refuses_the_f16_h_state() {
         "the FP32 h-state has always been DFlash's supported pairing"
     );
 }
+
+#[test]
+fn dspark_conflicts_with_the_other_speculative_methods() {
+    for conflicting in ["--speculative", "--self-speculative", "--ngram-speculative"] {
+        let argv = ["spark", "serve", "dummy/model", "--dspark", conflicting];
+        assert!(
+            super::super::Cli::try_parse_from(argv).is_err(),
+            "--dspark must conflict with {conflicting}"
+        );
+    }
+}
+
+#[test]
+fn dspark_selects_the_dflash_family_without_touching_plain_dflash() {
+    let dspark = parse(&["--dspark"]);
+    assert!(dspark.dspark && dspark.dflash_family());
+
+    let dflash = parse(&["--dflash"]);
+    assert!(dflash.dflash_family() && !dflash.dspark);
+
+    assert!(!parse(&[]).dflash_family());
+    assert!(validate_serve_args(&dspark).is_ok());
+}

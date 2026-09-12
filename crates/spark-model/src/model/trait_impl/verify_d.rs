@@ -201,7 +201,7 @@ impl TransformerModel {
         // and `decode_a2` already apply this veto; the verify paths never did,
         // because on this model they used to refuse before reaching a graph.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
-        let use_graphs = self.comm.is_none()
+        let graph_eligible = self.comm.is_none()
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -210,6 +210,17 @@ impl TransformerModel {
             && !super::verify_layer_trace::enabled()
             && !lora_eager
             && !layer_veto;
+        let graph_identity = graph_eligible
+            .then(|| {
+                self.verify_graph_identity(
+                    vec![seq.slot_idx as u32],
+                    vec![k as u32],
+                    k,
+                    vec![0xD, k as u32],
+                )
+            })
+            .and_then(Result::ok);
+        let use_graphs = graph_identity.is_some();
 
         // PLE's host half (n-gram hash + NVMe fault-in + slot upload) for the
         // WHOLE draft window, hoisted before capture/replay exactly as
@@ -248,20 +259,11 @@ impl TransformerModel {
 
         // ── Phase 2: CUDA graph capture / replay ──
 
-        let mut graph_cache = if use_graphs {
-            Some(self.verify_kgamma_graph.lock())
-        } else {
-            None
-        };
-
-        let cache_key = (seq.slot_idx, k);
-        let cached_for_slot = graph_cache
+        let cached_for_slot = graph_identity
             .as_ref()
-            .and_then(|c| c.get(&cache_key).copied());
-        if let Some(graph) = cached_for_slot
-            && graph.0 != 0
-        {
-            self.gpu.launch_graph(graph, stream)?;
+            .and_then(|identity| self.graph_runtime.lookup(identity).ok().flatten());
+        if let Some(graph) = &cached_for_slot {
+            self.graph_runtime.launch(graph, stream)?;
         }
         let need_run = cached_for_slot.is_none();
         if need_run {
@@ -430,17 +432,27 @@ impl TransformerModel {
             }
 
             if use_graphs {
-                let graph = self.gpu.end_capture(stream)?;
+                let identity = graph_identity
+                    .as_ref()
+                    .expect("capture requires graph identity");
+                let topology_dot = self.graph_runtime.capture_dot_path(identity);
+                let graph = self
+                    .gpu
+                    .end_capture_with_dot(stream, topology_dot.as_deref())?;
                 if graph.0 != 0 {
                     tracing::info!(
                         "Captured CUDA graph for K=γ verify (slot={} K={})",
                         seq.slot_idx,
                         k
                     );
-                    if let Some(ref mut cache) = graph_cache {
-                        cache.insert(cache_key, graph);
-                    }
-                    self.gpu.launch_graph(graph, stream)?;
+                    let managed = self.graph_runtime.register_captured(
+                        identity.clone(),
+                        stream,
+                        self.model_graph_cost(),
+                        graph,
+                        topology_dot,
+                    )?;
+                    self.graph_runtime.launch(&managed, stream)?;
                 }
             }
         }

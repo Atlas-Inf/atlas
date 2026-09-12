@@ -34,9 +34,63 @@ fn model_dir_path() -> std::path::PathBuf {
     std::path::PathBuf::from(raw)
 }
 
+fn integration_graph_config(
+    mode: spark_runtime::graph_runtime::GraphMode,
+) -> spark_runtime::graph_runtime::GraphRuntimeConfig {
+    use spark_runtime::graph_runtime::{
+        GraphFingerprint, GraphPolicies, GraphRuntimeConfig, PhasePolicy, ShapeBucket,
+        SpeculativeAlgorithm,
+    };
+    let fingerprint = GraphFingerprint {
+        runtime: "integration".into(),
+        model: "integration".into(),
+        kernel_build: "integration".into(),
+        device: "integration-gpu".into(),
+        cuda: "runtime".into(),
+        driver: "runtime".into(),
+        memory_layout: "integration".into(),
+    };
+    if mode == spark_runtime::graph_runtime::GraphMode::Disabled {
+        return GraphRuntimeConfig::disabled(fingerprint);
+    }
+    let policy = PhasePolicy {
+        max_entries: 64,
+        max_estimated_bytes: 512 * 1024 * 1024,
+        capture_enabled: true,
+        replay_enabled: true,
+        prewarm_enabled: true,
+    };
+    GraphRuntimeConfig {
+        mode,
+        speculative_algorithm: SpeculativeAlgorithm::None,
+        shape_buckets: vec![ShapeBucket {
+            token_limit: 8192,
+            request_limit: 8,
+        }],
+        policies: GraphPolicies::new(policy, policy, policy, policy, policy).unwrap(),
+        max_cache_entries: 64,
+        max_cache_bytes: 512 * 1024 * 1024,
+        fingerprint,
+        resource_generation: 1,
+        compatibility_rules: Vec::new(),
+        export_dir: None,
+        prewarm_profile: None,
+    }
+}
+
 /// Helper: build model + GPU backend from model directory.
 fn setup_model(
     model_dir: &Path,
+) -> Result<(
+    Box<dyn spark_model::traits::Model>,
+    atlas_core::config::ModelConfig,
+)> {
+    setup_model_with_mode(model_dir, spark_runtime::graph_runtime::GraphMode::Disabled)
+}
+
+fn setup_model_with_mode(
+    model_dir: &Path,
+    graph_mode: spark_runtime::graph_runtime::GraphMode,
 ) -> Result<(
     Box<dyn spark_model::traits::Model>,
     atlas_core::config::ModelConfig,
@@ -85,7 +139,9 @@ fn setup_model(
     );
 
     let post_weight_free = gpu.free_memory()?;
-    let kv_budget = (post_weight_free as f64 * 0.85) as usize;
+    // This harness builds a second model in the same process; leave headroom
+    // for it rather than claiming the production 0.90 share.
+    let kv_budget = (post_weight_free as f64 * 0.5) as usize;
     let block_size = 16;
     let kv_config = spark_runtime::kv_cache::KvCacheConfig {
         block_size,
@@ -112,7 +168,8 @@ fn setup_model(
         config.clone(),
         store,
         gpu,
-        4,          // max_batch_tokens: up to 3 spec-decode verification tokens
+        512, // max_batch_tokens: prompt-prefill arena (the 32-token
+        //             differential prompt needs room; 4 only fit decode)
         block_size, // kv_block_size = 16
         4096,       // max_seq_len
         8,          // max_batch_size
@@ -134,6 +191,7 @@ fn setup_model(
         None,               // lora_args (no LoRA adapter)
         None,               // nllb_lang (not an NLLB translation model)
         None,               // nllb_lora_dir
+        integration_graph_config(graph_mode),
     )?;
 
     Ok((model, config))
@@ -174,6 +232,69 @@ fn generate(
     let tok_per_sec = decode_tokens as f64 / elapsed.as_secs_f64();
 
     Ok((generated, tok_per_sec))
+}
+
+fn prefill_logits_bytes(model: &dyn spark_model::traits::Model, prompt: &[u32]) -> Result<Vec<u8>> {
+    let mut seq = model.alloc_sequence()?;
+    let logits = model.prefill(prompt, &mut seq, 0)?;
+    let mut bytes = vec![0u8; model.vocab_size() * 2];
+    model.copy_logits_to_host(logits, &mut bytes)?;
+    model.free_sequence(&mut seq)?;
+    Ok(bytes)
+}
+
+fn max_bf16_abs_diff(left: &[u8], right: &[u8]) -> f32 {
+    left.chunks_exact(2)
+        .zip(right.chunks_exact(2))
+        .map(|(left, right)| {
+            let left = f32::from_bits((u16::from_le_bytes([left[0], left[1]]) as u32) << 16);
+            let right = f32::from_bits((u16::from_le_bytes([right[0], right[1]]) as u32) << 16);
+            (left - right).abs()
+        })
+        .fold(0.0, f32::max)
+}
+
+#[test]
+#[ignore] // Requires GPU + one or more model checkpoints
+fn prefill_graph_matches_eager_for_model_matrix() -> Result<()> {
+    let model_dirs = std::env::var("ATLAS_GRAPH_PREFILL_MODEL_DIRS")
+        .ok()
+        .map(|value| value.split(',').map(std::path::PathBuf::from).collect())
+        .unwrap_or_else(|| vec![model_dir_path()]);
+    for model_dir in model_dirs {
+        if !model_dir.exists() {
+            eprintln!("SKIP: model directory not found: {}", model_dir.display());
+            continue;
+        }
+        let (mut eager, eager_config) = setup_model_with_mode(
+            &model_dir,
+            spark_runtime::graph_runtime::GraphMode::Disabled,
+        )?;
+        let prompt = vec![eager_config.bos_token_id; 32];
+        let eager_logits = prefill_logits_bytes(eager.as_ref(), &prompt)?;
+        eager.teardown()?;
+        drop(eager);
+
+        let (mut graphed, _) = setup_model_with_mode(
+            &model_dir,
+            spark_runtime::graph_runtime::GraphMode::Piecewise,
+        )?;
+        // The first capture-eligible prefill is an eager warmup (it resolves
+        // kernels that would otherwise be looked up inside capture), the
+        // second captures, the third replays.
+        let _warmup = prefill_logits_bytes(graphed.as_ref(), &prompt)?;
+        let capture_logits = prefill_logits_bytes(graphed.as_ref(), &prompt)?;
+        let replay_logits = prefill_logits_bytes(graphed.as_ref(), &prompt)?;
+        let capture_diff = max_bf16_abs_diff(&eager_logits, &capture_logits);
+        let replay_diff = max_bf16_abs_diff(&eager_logits, &replay_logits);
+        assert!(capture_diff <= 1e-2, "capture diff {capture_diff}");
+        assert!(replay_diff <= 1e-2, "replay diff {replay_diff}");
+        let metrics = spark_runtime::run_metrics::metrics().graph.snapshot();
+        assert!(metrics.captures > 0, "prefill graph did not capture");
+        assert!(metrics.replays >= 2, "prefill graph did not replay");
+        graphed.teardown()?;
+    }
+    Ok(())
 }
 
 /// Smoke test: parse config, load weights, build model, run one decode step.

@@ -33,6 +33,7 @@ use std::sync::{LazyLock, Mutex};
 /// that keeps a dead model's value while its neighbours restart.
 #[derive(Debug, Default)]
 pub struct RunMetrics {
+    pub graph: std::sync::Arc<crate::graph_runtime::GraphMetrics>,
     // ── Prefix cache (one RadixTree per server) ──
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,

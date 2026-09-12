@@ -191,8 +191,17 @@ impl TransformerModel {
         // and `decode_a2` already apply this veto; the verify paths never did,
         // because on this model they used to refuse before reaching a graph.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
-        let use_graphs =
+        let graph_eligible =
             self.comm.is_none() && !hss_engaged && !lora_eager && !k4_diag && !layer_veto;
+        let graph_identity = graph_eligible
+            .then(|| {
+                self.verify_graph_identity(vec![seq.slot_idx as u32], vec![k as u32], k, vec![4])
+            })
+            .and_then(Result::ok);
+        let use_graphs = graph_identity.is_some();
+        // BISECT HATCH (`ATLAS_GLM_VERIFY_GRAPH_NOCACHE=1`): capture-and-run
+        // every step, never replay.
+        let cache_graph = !std::env::var("ATLAS_GLM_VERIFY_GRAPH_NOCACHE").is_ok_and(|v| v == "1");
 
         // PLE's host half (n-gram hash + NVMe fault-in + slot upload) for the
         // WHOLE draft window, hoisted before capture/replay exactly as
@@ -231,20 +240,31 @@ impl TransformerModel {
 
         // ── Phase 2: CUDA graph capture / replay ──
 
-        let mut graph_cache = if use_graphs {
-            Some(self.verify4_graph.lock())
+        // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
+        let cached_for_slot = if cache_graph {
+            graph_identity
+                .as_ref()
+                .and_then(|identity| self.graph_runtime.lookup(identity).ok().flatten())
         } else {
             None
         };
-
-        // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
-        let cached_for_slot = graph_cache
-            .as_ref()
-            .and_then(|c| c.get(&seq.slot_idx).copied());
-        if let Some(graph) = cached_for_slot
-            && graph.0 != 0
-        {
-            self.gpu.launch_graph(graph, stream)?;
+        if let Some(graph) = &cached_for_slot {
+            // 🔴 BEFORE the replay, not after. The graph writes GLM-5.3's DSA indexer row
+            // from a device position with no host code in the loop, so past the DSA ceiling
+            // it writes one row off the end of the buffer and the `sync_replayed_step`
+            // reconcile below refuses one write too late — by then a sticky CUDA 700 has
+            // taken the whole serve down, not just this request. ANOMALIES A62.
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, k)?;
+            }
+            self.graph_runtime.launch(graph, stream)?;
+            // 🔴 ANOMALIES A56, K=4 half. A replay runs kernels and NOTHING else, so any
+            // layer keeping per-sequence bookkeeping on the HOST — GLM-5.3's DSA indexer
+            // cache length — must be reconciled here. RECONCILE to `seq_len + k`, not
+            // `+= k`: `decode_k` REWINDS to `seq_len` on entry. See verify_c.rs.
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, k)?;
+            }
         }
         let need_run = cached_for_slot.is_none();
         if need_run {
@@ -379,13 +399,30 @@ impl TransformerModel {
             }
 
             if use_graphs {
-                let graph = self.gpu.end_capture(stream)?;
+                let identity = graph_identity
+                    .as_ref()
+                    .expect("capture requires graph identity");
+                let topology_dot = self.graph_runtime.capture_dot_path(identity);
+                let graph = self
+                    .gpu
+                    .end_capture_with_dot(stream, topology_dot.as_deref())?;
                 if graph.0 != 0 {
                     tracing::info!("Captured CUDA graph for K=4 verify (slot={})", seq.slot_idx);
-                    if let Some(ref mut cache) = graph_cache {
-                        cache.insert(seq.slot_idx, graph);
+                    // BISECT HATCH (`ATLAS_GLM_VERIFY_GRAPH_NOCACHE=1`) — see verify_c.rs.
+                    let managed = self.graph_runtime.register_captured(
+                        identity.clone(),
+                        stream,
+                        self.model_graph_cost(),
+                        graph,
+                        topology_dot,
+                    )?;
+                    self.graph_runtime.launch(&managed, stream)?;
+                    if !cache_graph {
+                        self.graph_runtime.invalidate(
+                            &identity.key,
+                            spark_runtime::graph_runtime::GraphFallbackReason::DiagnosticActive,
+                        );
                     }
-                    self.gpu.launch_graph(graph, stream)?;
                 }
             }
         }

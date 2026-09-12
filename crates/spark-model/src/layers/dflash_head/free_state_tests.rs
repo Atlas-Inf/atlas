@@ -129,6 +129,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         rms_norm_eps: 0.0,
         ctx_window: 0,
         propose_graphs: parking_lot::Mutex::new(HashMap::new()),
+        graph_runtime: support::zero_graph_runtime(),
         next_lane: std::sync::atomic::AtomicUsize::new(0),
         lanes_start_event: 0,
         suppress_graphs: std::sync::atomic::AtomicBool::new(false),
@@ -287,7 +288,7 @@ fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
     // reclaims state resources but must NOT destroy owner-keyed graphs.
     head.propose_graphs.lock().insert(
         DflashGraphIdentity::new(own, 0x10, 0x20, 0x30, 0).unwrap(),
-        vec![spark_runtime::gpu::GraphHandle(0xAA)],
+        vec![None],
     );
 
     let mut boxed = live_state(&gpu, own);
@@ -461,3 +462,6 @@ fn reclaim_seam_free_failure_retains_pointers() {
     assert_eq!(dstate.ctx_hidden_acc.0, 0);
     assert!(dstate.block_table_dev.is_none());
 }
+
+#[path = "free_state_support.rs"]
+mod support;

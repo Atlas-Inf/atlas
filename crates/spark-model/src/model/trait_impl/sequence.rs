@@ -29,9 +29,6 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 mod state_io;
 
-#[path = "sequence_graphs.rs"]
-mod sequence_graphs;
-
 impl TransformerModel {
     pub(super) fn cache_sequence_dispatch(&self, seq: &SequenceState) {
         let bs = self.kv_cache.lock().block_size();
@@ -146,12 +143,6 @@ impl TransformerModel {
             }
         }
 
-        // MUST follow `free_state`: the graphs being dropped are the ones that
-        // reference the per-sequence buffers it just released.
-        if seq.slot_idx < self.ssm_pool.max_slots {
-            self.invalidate_slot_graphs(seq.slot_idx);
-        }
-
         let slot_reused_by_compact = seq.slot_idx >= self.ssm_pool.max_slots;
         let taken = seq.ssm_slot.as_mut().and_then(|g| g.take());
         let slot_to_release = if slot_reused_by_compact { None } else { taken };
@@ -228,6 +219,25 @@ impl TransformerModel {
             }
         }
 
+        // 🔴 Drop the graphs captured for THIS slot when a layer owns per-SEQUENCE device
+        // state. The caches are slot-keyed on the premise that the only per-sequence
+        // addresses a capture bakes live in the slot-addressed SSM pool; a layer that
+        // allocates its own state per sequence (GLM-5.3's indexer cache and KDA state)
+        // breaks it, and the next request replays — and writes — this one's freed buffers.
+        // Observed as request 2 continuing request 1's text.
+        //
+        // 🪤 NOT an unconditional drain. `decode_graph_key::tests` pins that, and it is
+        // right: recapturing on every completion is a real cost, and it must not come back
+        // for the models whose premise still holds. This is one slot, and only when a layer
+        // says so.
+        if !slot_reused_by_compact && self.layers.iter().any(|l| l.graph_stale_on_new_sequence()) {
+            let slot = seq.slot_idx as u32;
+            self.graph_runtime.invalidate_matching(
+                spark_runtime::graph_runtime::GraphFallbackReason::StaleKey,
+                |key| key.payload.slots().contains(&slot),
+            );
+        }
+
         // All SSM buffers (h_state, conv_state, checkpoints, intermediates) belong
         // to the pool — do NOT gpu.free() them. Just clear the references.
         for state in &mut seq.layer_states {
@@ -257,25 +267,19 @@ impl TransformerModel {
         // seq_slot buffer, so a freed slot's entries MUST be destroyed — else a
         // reused slot replays a stale adapter index (multi-adapter + DFlash
         // spec-decode output corruption). Drop every K for this slot.
-        for graph_map in [&self.verify_kgamma_graph, &self.fused_graph] {
-            let mut cache = graph_map.lock();
-            let keys: Vec<(usize, usize)> = cache
-                .keys()
-                .filter(|k| k.0 == seq.slot_idx)
-                .copied()
-                .collect();
-            for k in keys {
-                if let Some(graph) = cache.remove(&k)
-                    && let Err(e) = self.gpu.destroy_graph(graph)
-                {
-                    tracing::error!(
-                        "free_sequence: destroy_graph(kgamma/fused[{},{}]): {e:#}",
-                        k.0,
-                        k.1
-                    );
-                }
-            }
-        }
+        let slot = seq.slot_idx as u32;
+        self.graph_runtime.invalidate_matching(
+            spark_runtime::graph_runtime::GraphFallbackReason::StaleKey,
+            |key| {
+                key.payload.slots().contains(&slot)
+                    && (key.phase == spark_runtime::graph_runtime::GraphPhase::Fused
+                        || matches!(
+                            &key.payload,
+                            spark_runtime::graph_runtime::GraphPayload::Verify { layout, .. }
+                                if layout.first() == Some(&0xD)
+                        ))
+            },
+        );
 
         // ATLAS_MTP_CARRY_DRAFTER: hand this turn's drafter KV to the model's
         // single carry slot BEFORE `free_state`, so the next turn of the same
@@ -320,7 +324,7 @@ impl TransformerModel {
             proposer.free_state(self.gpu.as_ref(), expected_owner, pstate.as_mut())?;
         }
 
-        self.free_chunked_prefill_meta(seq)?;
+        self.free_chunked_prefill_meta(seq);
 
         Ok(())
     }

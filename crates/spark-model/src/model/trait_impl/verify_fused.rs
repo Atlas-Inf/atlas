@@ -202,12 +202,16 @@ impl TransformerModel {
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        let use_graphs = self.comm.is_none()
+        let graph_eligible = self.comm.is_none()
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
             && !lora_eager;
+        let graph_identity = graph_eligible
+            .then(|| self.fused_graph_identity(seq.slot_idx, m))
+            .and_then(Result::ok);
+        let use_graphs = graph_identity.is_some();
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -231,20 +235,11 @@ impl TransformerModel {
 
         // ── Phase 2: CUDA graph capture / replay ──
 
-        let cache_key = (seq.slot_idx, m);
-        let mut graph_cache = if use_graphs {
-            Some(self.fused_graph.lock())
-        } else {
-            None
-        };
-
-        let cached_for_slot = graph_cache
+        let cached_for_slot = graph_identity
             .as_ref()
-            .and_then(|c| c.get(&cache_key).copied());
-        if let Some(graph) = cached_for_slot
-            && graph.0 != 0
-        {
-            self.gpu.launch_graph(graph, stream)?;
+            .and_then(|identity| self.graph_runtime.lookup(identity).ok().flatten());
+        if let Some(graph) = &cached_for_slot {
+            self.graph_runtime.launch(graph, stream)?;
         }
         let need_run = cached_for_slot.is_none();
         if need_run {
@@ -353,17 +348,27 @@ impl TransformerModel {
             }
 
             if use_graphs {
-                let graph = self.gpu.end_capture(stream)?;
+                let identity = graph_identity
+                    .as_ref()
+                    .expect("capture requires graph identity");
+                let topology_dot = self.graph_runtime.capture_dot_path(identity);
+                let graph = self
+                    .gpu
+                    .end_capture_with_dot(stream, topology_dot.as_deref())?;
                 if graph.0 != 0 {
                     tracing::info!(
                         "DFlash fused CUDA graph captured (slot={}, M={})",
                         seq.slot_idx,
                         m
                     );
-                    if let Some(ref mut cache) = graph_cache {
-                        cache.insert(cache_key, graph);
-                    }
-                    self.gpu.launch_graph(graph, stream)?;
+                    let managed = self.graph_runtime.register_captured(
+                        identity.clone(),
+                        stream,
+                        self.model_graph_cost(),
+                        graph,
+                        topology_dot,
+                    )?;
+                    self.graph_runtime.launch(&managed, stream)?;
                 }
             }
         }

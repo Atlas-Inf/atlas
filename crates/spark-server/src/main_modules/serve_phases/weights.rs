@@ -137,7 +137,7 @@ pub(crate) fn load_dflash_drafter(
     )>,
 > {
     use spark_runtime::weights::WeightLoader;
-    if !args.dflash {
+    if !args.dflash_family() {
         return Ok(None);
     }
     let drafter_id = args
@@ -145,7 +145,7 @@ pub(crate) fn load_dflash_drafter(
         .clone()
         .or_else(|| ptx_set.dflash.as_ref().map(|d| d.draft_model.to_string()))
         .context(
-            "--dflash set but no drafter HF id provided: pass --draft-model <ID> \
+            "--dflash/--dspark set but no drafter HF id provided: pass --draft-model <ID> \
              or use a target whose MODEL.toml has a [dflash] section",
         )?;
     tracing::info!("DFlash: resolving drafter '{drafter_id}'");

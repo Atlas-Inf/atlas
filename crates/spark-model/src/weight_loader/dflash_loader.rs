@@ -92,6 +92,18 @@ pub struct DflashConfig {
     pub markov_rank: Option<usize>,
 }
 
+impl DflashConfig {
+    /// True when this drafter checkpoint ships D-Spark proposer artifacts: a
+    /// Markov head (`markov_rank > 0`) or Lightning DSpark's
+    /// `dspark_markov_rank`. Single source of truth for D-Spark drafter
+    /// detection — `--dspark` validation and the graph runtime's algorithm
+    /// inference both read it, so they cannot drift.
+    pub fn is_dspark(&self) -> bool {
+        self.markov_rank.is_some_and(|rank| rank > 0)
+            || self.dspark_markov_rank.is_some_and(|rank| rank > 0)
+    }
+}
+
 fn default_rope_theta() -> f32 {
     10_000_000.0
 }
@@ -224,6 +236,34 @@ pub fn store_has_dflash_weights(store: &WeightStore) -> bool {
     store.contains("fc.weight") || store.contains("model.fc.weight")
 }
 
+/// DFlash2-only tensors Atlas does not implement: a candidate-selector codebook
+/// and per-layer attention / MLP convolutions. The probe list in
+/// [`load_dflash_weights`] is DFlash v1, so these were silently ignored and the
+/// head then ran a forward it was never built for — a sticky CUDA 700 on the
+/// first propose that takes the whole serve down. Returns the first marker
+/// present, with its description, or `None` for a v1 drafter.
+fn unsupported_dflash_marker(
+    store: &WeightStore,
+    prefix: &str,
+) -> Option<(&'static str, &'static str)> {
+    [
+        (
+            "candidate_selector.hidden_projection.weight",
+            "a candidate-selector codebook",
+        ),
+        (
+            "layers.0.attention_conv.base_kernel",
+            "per-layer attention convolutions",
+        ),
+        (
+            "layers.0.mlp_conv.base_kernel",
+            "per-layer MLP convolutions",
+        ),
+    ]
+    .into_iter()
+    .find(|(probe, _)| store.contains(&format!("{prefix}{probe}")))
+}
+
 /// Parse a DFlash drafter's `config.json` into a [`DflashConfig`]. Used by
 /// `main.rs` after fetching the drafter's HF metadata to size the runtime
 /// `BlockDiffusionDraftHead` (layer count, head_dim, vocab_size, the
@@ -283,6 +323,16 @@ pub fn load_dflash_weights(
     } else {
         ""
     };
+
+    // Fail closed on drafter architectures Atlas does not implement.
+    if let Some((probe, what)) = unsupported_dflash_marker(drafter_store, prefix) {
+        anyhow::bail!(
+            "DFlash drafter ships {what} (DFlash2-style architecture: `{prefix}{probe}`); \
+             Atlas implements DFlash v1 only. Use a v1 drafter (e.g. a DFlash/D-Spark \
+             checkpoint with no candidate-selector or conv tensors), or serve without \
+             --dflash/--dspark."
+        );
+    }
 
     // dense_auto: BF16 as-is, packed NVFP4 (Lightning DSpark MLP/fc/markov_w2)
     // dequanted once at load.
@@ -415,61 +465,5 @@ pub fn load_dflash_weights(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Smoke-test the DFlash drafter `config.json` parser against the live
-    /// `z-lab/Qwen3.6-35B-A3B-DFlash` checkpoint downloaded into the user's
-    /// HF cache. Skipped when the cache directory isn't populated — keeps
-    /// CI hermetic. Asserts the locked drafter dimensions: 8 layers,
-    /// hidden=2048, vocab=248320, γ=16, mask=248070, layer_ids=[1,10,19,28,37].
-    #[test]
-    fn parse_qwen3_6_35b_dflash_config() {
-        const SNAP: &str = "/workspace/.cache/huggingface/hub/models--z-lab--Qwen3.6-35B-A3B-DFlash/snapshots/42d3b34d588423cdae7ba8f53a8cf7789346a719/config.json";
-        let json = match std::fs::read_to_string(SNAP) {
-            Ok(s) => s,
-            Err(_) => {
-                tracing::warn!("Skipping: drafter snapshot not in cache");
-                return;
-            }
-        };
-        let config = parse_dflash_config(&json).expect("parse drafter config");
-        assert_eq!(config.num_hidden_layers, 8);
-        assert_eq!(config.hidden_size, 2048);
-        assert_eq!(config.intermediate_size, 6144);
-        assert_eq!(config.num_attention_heads, 32);
-        assert_eq!(config.num_key_value_heads, 4);
-        assert_eq!(config.head_dim, 128);
-        assert_eq!(config.vocab_size, 248320);
-        assert!(!config.tie_word_embeddings);
-        assert_eq!(config.block_size, 16);
-        let sub = config.dflash_config.expect("dflash_config present");
-        assert_eq!(sub.mask_token_id, 248070);
-        assert_eq!(sub.target_layer_ids, vec![1, 10, 19, 28, 37]);
-    }
-
-    #[test]
-    fn parse_lightning_dspark_config() {
-        let json = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../test_data/lightning_dspark_config.json"
-        ));
-        let config = parse_dflash_config(json).expect("parse Lightning DSpark config");
-        assert_eq!(config.num_hidden_layers, 6);
-        assert_eq!(config.hidden_size, 2688);
-        assert_eq!(config.intermediate_size, 6144);
-        assert_eq!(config.num_attention_heads, 32);
-        assert_eq!(config.num_key_value_heads, 2);
-        assert_eq!(config.head_dim, 128);
-        assert_eq!(config.vocab_size, 131072);
-        assert_eq!(config.block_size, 8);
-        assert_eq!(config.markov_rank, Some(512));
-        let sub = config.dflash_config.expect("dflash_config present");
-        assert_eq!(sub.mask_token_id, 990);
-        assert_eq!(sub.target_layer_ids, vec![1, 5, 19, 29, 41, 51]);
-        assert_eq!(sub.causal, Some(true));
-        assert_eq!(sub.use_swa, Some(true));
-        assert_eq!(sub.swa_window_size, Some(1024));
-        assert_eq!(sub.attention_sink_bias, Some(true));
-    }
-}
+#[path = "dflash_loader/tests.rs"]
+mod tests;

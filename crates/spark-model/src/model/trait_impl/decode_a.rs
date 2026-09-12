@@ -263,7 +263,7 @@ impl TransformerModel {
         // the proven-safe half of the G1 evidence and keeps DSpark C1 from
         // dropping ~12% on the every-64th eager step.
         let seq64_boundary = seq.seq_len.is_multiple_of(64);
-        let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
+        let graph_eligible = (self.comm.is_none() || ep_graphs || gdn_graphs)
             && !self.profile
             && !self
                 .suppress_graphs
@@ -273,6 +273,10 @@ impl TransformerModel {
             && !lora_eager
             && !layer_veto
             && !no_decode_graphs;
+        let graph_identity = graph_eligible
+            .then(|| self.decode_graph_identity(1, 1, vec![seq.slot_idx as u32]))
+            .and_then(Result::ok);
+        let use_graphs = graph_identity.is_some();
         let capture_this_step = use_graphs && !seq64_boundary;
 
         let ctx = ForwardContext {
@@ -306,11 +310,9 @@ impl TransformerModel {
 
         // ── Phase 2: Try CUDA graph replay ──
 
-        let mut graph_cache = if use_graphs {
-            Some(self.decode_graph.lock())
-        } else {
-            None
-        };
+        let replay = graph_identity
+            .as_ref()
+            .and_then(|identity| self.graph_runtime.lookup(identity).ok().flatten());
 
         // For batch=1, the captured graph works for any max_blocks because
         // max_blocks_per_seq is only used as block_table stride (seq_idx * stride),
@@ -318,11 +320,22 @@ impl TransformerModel {
         // block_table, positions, slots) is read from device memory uploaded
         // before each graph replay.
         // SLOT-KEYED LOOKUP: only replay if this seq's slot matches a captured graph.
-        if let Some(ref cache) = graph_cache
-            && let Some(graph) = cache.get(&seq.slot_idx)
-            && graph.0 != 0
-        {
-            self.gpu.launch_graph(*graph, stream)?;
+        if let Some(graph) = replay {
+            // 🔴 BEFORE the replay, not after. The graph writes GLM-5.3's DSA indexer row
+            // from a device position with no host code in the loop, so past the DSA ceiling
+            // it writes one row off the end of the buffer and the `sync_replayed_step`
+            // reconcile below refuses one write too late — by then a sticky CUDA 700 has
+            // taken the whole serve down, not just this request. ANOMALIES A62.
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, 1)?;
+            }
+            self.graph_runtime.launch(&graph, stream)?;
+            // 🔴 A replay runs kernels and nothing else. Any layer that keeps per-sequence
+            // bookkeeping on the HOST (GLM-5.3's DSA indexer cache length) must be advanced
+            // here; its `decode` did not run. Default impl is a no-op for every other layer.
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, 1)?;
+            }
             seq.tokens.push(token);
             seq.seq_len += 1;
             return Ok(self.decode_logits_ptr());
@@ -419,17 +432,55 @@ impl TransformerModel {
         self.diag_gemma4_decode_logits(token, stream)?;
 
         if capture_active {
-            match self.gpu.end_capture(stream) {
+            let identity = graph_identity
+                .as_ref()
+                .expect("capture requires graph identity");
+            let topology_dot = self.graph_runtime.capture_dot_path(identity);
+            match self
+                .gpu
+                .end_capture_with_dot(stream, topology_dot.as_deref())
+            {
                 Ok(graph) if graph.0 != 0 => {
                     tracing::info!(
                         "CUDA graph captured successfully for slot={} (handle={:?})",
                         seq.slot_idx,
                         graph.0
                     );
-                    if let Some(ref mut cache) = graph_cache {
-                        cache.insert(seq.slot_idx, graph);
+                    match self.graph_runtime.register_captured(
+                        identity.clone(),
+                        stream,
+                        self.model_graph_cost(),
+                        graph,
+                        topology_dot,
+                    ) {
+                        Ok(graph) => self.graph_runtime.launch(&graph, stream)?,
+                        Err(error) => {
+                            // The capture RECORDED the body without executing it,
+                            // and the runtime refused to keep the graph (quota /
+                            // stale key). Fall back to eager rather than aborting
+                            // the request — same contract as the end_capture
+                            // failure arm below.
+                            tracing::warn!(
+                                "decode graph not registered ({error}) — re-running decode \
+                                 step eagerly and disabling graph capture"
+                            );
+                            self.suppress_graphs
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            for (li, l) in self.layers.iter().enumerate() {
+                                l.decode_prestage_rearm(seq.layer_states[li].as_mut());
+                            }
+                            self.decode_forward_body(
+                                hidden,
+                                residual,
+                                seq,
+                                &mut kv_cache,
+                                &ctx,
+                                false,
+                                false,
+                                stream,
+                            )?;
+                        }
                     }
-                    self.gpu.launch_graph(graph, stream)?;
                 }
                 Ok(_) => {
                     tracing::warn!("CUDA graph capture returned null handle — running eagerly");

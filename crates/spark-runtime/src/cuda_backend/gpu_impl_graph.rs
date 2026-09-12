@@ -16,11 +16,11 @@ use std::ffi::c_void;
 use anyhow::{Result, bail};
 
 use super::{
-    AtlasCudaBackend, cuCtxGetDevice, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
-    cuEventDestroy_v2, cuEventRecord, cuEventSynchronize, cuGraphDestroy, cuGraphExecDestroy,
-    cuGraphLaunch, cuMemAllocHost_v2, cuMemFreeHost, cuMemGetInfo_v2, cuMemsetD8Async,
-    cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture, cuStreamSynchronize,
-    cuStreamWaitEvent,
+    AtlasCudaBackend, cuCtxGetDevice, cuCtxSetCurrent, cuDeviceGetAttribute, cuDriverGetVersion,
+    cuEventCreate, cuEventDestroy_v2, cuEventQuery, cuEventRecord, cuEventSynchronize,
+    cuGraphDestroy, cuGraphExecDestroy, cuGraphLaunch, cuMemAllocHost_v2, cuMemFreeHost,
+    cuMemGetInfo_v2, cuMemsetD8Async, cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture,
+    cuStreamSynchronize, cuStreamWaitEvent,
 };
 use crate::gpu::{DevicePtr, GraphHandle};
 
@@ -53,10 +53,34 @@ impl AtlasCudaBackend {
     }
 
     pub(super) fn end_capture_cu(&self, stream: u64) -> Result<GraphHandle> {
+        self.end_capture_with_dot_cu(stream, None)
+    }
+
+    pub(super) fn end_capture_with_dot_cu(
+        &self,
+        stream: u64,
+        dot_path: Option<&std::path::Path>,
+    ) -> Result<GraphHandle> {
         let mut graph: u64 = 0;
         let status = unsafe { cuStreamEndCapture(stream, &mut graph) };
         if status != 0 {
             bail!("cuStreamEndCapture failed: status {status}");
+        }
+        if let Some(path) = dot_path {
+            #[cfg(atlas_scale)]
+            {
+                unsafe { cuGraphDestroy(graph) };
+                bail!("CUDA graph DOT export is unavailable on the SCALE backend");
+            }
+            #[cfg(not(atlas_scale))]
+            {
+                let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+                let status = unsafe { super::cuGraphDebugDotPrint(graph, path.as_ptr(), 0) };
+                if status != 0 {
+                    unsafe { cuGraphDestroy(graph) };
+                    bail!("cuGraphDebugDotPrint failed: status {status}");
+                }
+            }
         }
         // Instantiate the graph into an executable. NVIDIA's libcuda exports
         // `cuGraphInstantiateWithFlags`; SCALE (gfx1151) exposes the
@@ -137,6 +161,37 @@ impl AtlasCudaBackend {
             bail!("cuMemGetInfo_v2 failed: status {status}");
         }
         Ok(total)
+    }
+
+    pub(super) fn graph_environment_cu(&self) -> Result<crate::graph_runtime::GraphEnvironment> {
+        const COMPUTE_CAPABILITY_MAJOR: u32 = 75;
+        const COMPUTE_CAPABILITY_MINOR: u32 = 76;
+        let mut device = 0;
+        let status = unsafe { cuCtxGetDevice(&mut device) };
+        if status != 0 {
+            bail!("cuCtxGetDevice failed: status {status}");
+        }
+        let mut major = 0;
+        let mut minor = 0;
+        for (value, attribute) in [
+            (&mut major, COMPUTE_CAPABILITY_MAJOR),
+            (&mut minor, COMPUTE_CAPABILITY_MINOR),
+        ] {
+            let status = unsafe { cuDeviceGetAttribute(value, attribute, device) };
+            if status != 0 {
+                bail!("cuDeviceGetAttribute({attribute}) failed: status {status}");
+            }
+        }
+        let mut driver = 0;
+        let status = unsafe { cuDriverGetVersion(&mut driver) };
+        if status != 0 {
+            bail!("cuDriverGetVersion failed: status {status}");
+        }
+        Ok(crate::graph_runtime::GraphEnvironment {
+            device: format!("cuda:{device}:sm_{major}{minor}"),
+            cuda: cudarc::driver::sys::CUDA_VERSION.to_string(),
+            driver: driver.to_string(),
+        })
     }
 
     /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT` on the current context's
@@ -231,6 +286,15 @@ impl AtlasCudaBackend {
             bail!("cuEventSynchronize failed: status {status}");
         }
         Ok(())
+    }
+
+    pub(super) fn event_query_cu(&self, event: u64) -> Result<bool> {
+        const CUDA_ERROR_NOT_READY: i32 = 600;
+        match unsafe { cuEventQuery(event) } {
+            0 => Ok(true),
+            CUDA_ERROR_NOT_READY => Ok(false),
+            status => bail!("cuEventQuery failed: status {status}"),
+        }
     }
 
     pub(super) fn destroy_event_cu(&self, event: u64) -> Result<()> {

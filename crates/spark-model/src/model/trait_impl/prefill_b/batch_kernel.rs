@@ -527,7 +527,7 @@ impl TransformerModel {
         // ForwardContext for batched layer calls. attn_metadata is
         // intentionally None — layers read BatchedAttnMetadata directly
         // through the model-level dispatcher arguments.
-        let ctx = ForwardContext {
+        let mut ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -559,45 +559,61 @@ impl TransformerModel {
 
         // Per-stream kv_write_starts vector for attention dispatcher.
         let kv_write_starts: Vec<usize> = per_stream.iter().map(|m| m.kv_write_start_eff).collect();
-
-        // Outer layer loop with mixed dispatch.
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // Gather per-stream seq refs for this layer.
-            let mut seqs_vec: Vec<&mut SequenceState> =
-                streams.iter_mut().map(|s| &mut *s.seq).collect();
-
-            if layer.is_ssm_layer() {
-                let proc_starts: Vec<usize> = per_stream.iter().map(|m| m.proc_start).collect();
-                self.prefill_ssm_batched_layer(
-                    layer.as_ref(),
-                    layer_idx,
-                    hidden_base,
-                    _residual_base,
-                    &mut seqs_vec,
-                    &mut kv_cache,
-                    &proc_starts,
-                    &meta,
-                    &gdn_bufs,
-                    h_state_ptrs_off,
-                    &ctx,
-                    stream,
-                )?;
-            } else {
-                self.prefill_attn_batched_layer(
-                    layer.as_ref(),
-                    layer_idx,
-                    hidden_base,
-                    _residual_base,
-                    &mut seqs_vec,
-                    &mut kv_cache,
-                    &kv_write_starts,
-                    seq_lens_start,
-                    &meta,
-                    &ctx,
-                    stream,
-                )?;
+        let proc_starts: Vec<usize> = per_stream.iter().map(|m| m.proc_start).collect();
+        let graph_identity = self.prefill_batch_graph_identity(
+            streams
+                .iter()
+                .map(|slice| slice.seq.ssm_slot_idx().unwrap_or(slice.seq.slot_idx) as u32)
+                .collect(),
+            per_stream.iter().map(|m| m.proc_count as u32).collect(),
+            per_stream.iter().map(|m| m.num_blocks as u32).collect(),
+            running_proc_off,
+            per_stream[0].effective_seq_len_start,
+            is_last_chunk,
+            per_stream.iter().any(|m| !m.block_table_dev.is_null()),
+            use_mrope,
+            kv_write_starts.iter().all(|&start| start == 0),
+            std::env::var_os("ATLAS_CODISPATCH_BTCHECK").is_some(),
+        );
+        self.execute_prefill_graph(graph_identity, stream, |graph_capture| {
+            ctx.graph_capture = graph_capture;
+            // Outer layer loop with mixed dispatch.
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if layer.is_ssm_layer() {
+                    let mut seqs_vec: Vec<&mut SequenceState> =
+                        streams.iter_mut().map(|slice| &mut *slice.seq).collect();
+                    self.prefill_ssm_batched_layer(
+                        layer.as_ref(),
+                        layer_idx,
+                        hidden_base,
+                        _residual_base,
+                        &mut seqs_vec,
+                        &mut kv_cache,
+                        &proc_starts,
+                        &meta,
+                        &gdn_bufs,
+                        h_state_ptrs_off,
+                        &ctx,
+                        stream,
+                    )?;
+                } else {
+                    self.prefill_attn_batched_layer(
+                        layer.as_ref(),
+                        layer_idx,
+                        hidden_base,
+                        _residual_base,
+                        n,
+                        &mut kv_cache,
+                        &kv_write_starts,
+                        seq_lens_start,
+                        &meta,
+                        &ctx,
+                        stream,
+                    )?;
+                }
             }
-        }
+            Ok(())
+        })?;
 
         // DIAG: detect cross-stream physical-block sharing (co-dispatch KV
         // double-issue hypothesis for the n>=5 decode-bleed bug). Gated.

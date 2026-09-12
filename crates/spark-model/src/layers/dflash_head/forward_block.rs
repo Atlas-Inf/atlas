@@ -816,38 +816,45 @@ impl BlockDiffusionDraftHead {
                 graph_lane,
             )?;
             let mut gmap = self.propose_graphs.lock();
-            let cached_ready = gmap
+            // Resolve every stored key against the runtime. A key that no
+            // longer resolves (evicted, or an identity that went stale) falls
+            // back to eager for that segment, exactly like the empty-capture
+            // sentinel it replaced.
+            let resolved = gmap
                 .get(&graph_key)
-                .map(|v| v.len() == total_slots)
-                .unwrap_or(false);
+                .filter(|keys| keys.len() == total_slots)
+                .map(|keys| {
+                    keys.iter()
+                        .map(|key| {
+                            key.as_ref()
+                                .and_then(|key| self.graph_runtime.lookup_key(key).ok().flatten())
+                        })
+                        .collect::<Vec<_>>()
+                });
 
-            if cached_ready {
-                let graphs = gmap.get(&graph_key).unwrap();
+            if let Some(graphs) = resolved {
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let args = make_paged_args(layer_idx).expect("option_b args available");
 
-                    let pre_handle = graphs[layer_idx * 2];
-                    if pre_handle.0 != 0 {
-                        gpu.launch_graph(pre_handle, stream)?;
+                    if let Some(pre_graph) = &graphs[layer_idx * 2] {
+                        self.graph_runtime.launch(pre_graph, stream)?;
                     } else {
-                        // Empty-capture sentinel: this slot fell back to
-                        // eager at capture time. Replay eager forever.
+                        // Eager sentinel: this slot fell back to eager at
+                        // capture time (or its graph was evicted). Replay eager.
                         let (k_pool, v_pool) =
                             self.forward_block_layer_pre_attn(layer, &args, ctx, scratch)?;
                         self.forward_block_layer_attention(&args, ctx, k_pool, v_pool, scratch)?;
                     }
 
-                    let post_handle = graphs[layer_idx * 2 + 1];
-                    if post_handle.0 != 0 {
-                        gpu.launch_graph(post_handle, stream)?;
+                    if let Some(post_graph) = &graphs[layer_idx * 2 + 1] {
+                        self.graph_runtime.launch(post_graph, stream)?;
                     } else {
                         self.forward_block_layer_post_attn(layer, &args, ctx, scratch)?;
                     }
                 }
 
-                let tail_handle = graphs[tail_slot];
-                if tail_handle.0 != 0 {
-                    gpu.launch_graph(tail_handle, stream)?;
+                if let Some(tail_graph) = &graphs[tail_slot] {
+                    self.graph_runtime.launch(tail_graph, stream)?;
                 } else {
                     run_tail()?;
                 }
@@ -872,8 +879,91 @@ impl BlockDiffusionDraftHead {
                         warmup_target,
                         total_slots
                     );
-                    let mut new_graphs: Vec<spark_runtime::gpu::GraphHandle> =
+                    let mut new_keys: Vec<Option<spark_runtime::graph_runtime::GraphKey>> =
                         Vec::with_capacity(total_slots);
+                    // Capture one subgraph through the unified runtime: build
+                    // its identity (keyed by the DFlash identity words), capture
+                    // the body, register it, and replay it. An identity the
+                    // runtime refuses, or an empty capture, runs the body
+                    // eagerly and stores `None` (the eager sentinel).
+                    let capture_segment = |segment_index: usize,
+                                           body: &mut dyn FnMut() -> Result<()>|
+                     -> Result<
+                        Option<spark_runtime::graph_runtime::GraphKey>,
+                    > {
+                        use spark_runtime::graph_runtime::{GraphCost, GraphPayload, GraphSegment};
+                        let identity = match self.graph_runtime.identity(
+                            GraphSegment::ProposeBody,
+                            GraphPayload::Propose {
+                                request_count: 1,
+                                draft_depth: self.gamma as u32,
+                                segment_index: segment_index as u32,
+                                key_words: graph_key.key_words(),
+                            },
+                        ) {
+                            Ok(identity) => identity,
+                            Err(_) => {
+                                body()?;
+                                return Ok(None);
+                            }
+                        };
+                        gpu.begin_capture(stream)?;
+                        if let Err(error) = body() {
+                            gpu.abort_capture_if_active(stream);
+                            return Err(error);
+                        }
+                        let topology_dot = self.graph_runtime.capture_dot_path(&identity);
+                        let graph = gpu.end_capture_with_dot(stream, topology_dot.as_deref())?;
+                        if graph.0 == 0 {
+                            tracing::warn!(
+                                "DFlash piecewise: segment {segment_index} empty capture — eager fallback"
+                            );
+                            body()?;
+                            return Ok(None);
+                        }
+                        let managed = match self.graph_runtime.register_captured(
+                            identity,
+                            stream,
+                            GraphCost {
+                                estimated_bytes: 1024 * 1024,
+                                node_count: 32,
+                                child_count: 0,
+                                staging_bytes: 0,
+                            },
+                            graph,
+                            topology_dot,
+                        ) {
+                            Ok(managed) => managed,
+                            // A runtime refusal (quota, stale key) must not fail
+                            // the request: run the body eagerly and leave the
+                            // slot as the eager sentinel. `register_captured`
+                            // already destroyed the refused handle.
+                            Err(error) => {
+                                tracing::warn!(
+                                    "DFlash propose graph not registered ({error}); running eager"
+                                );
+                                body()?;
+                                return Ok(None);
+                            }
+                        };
+                        if let Err(error) = self.graph_runtime.launch(&managed, stream) {
+                            // The runtime refused the replay (e.g. the Propose
+                            // phase's replay policy is off in this graph mode).
+                            // That is a configuration answer, not a propose
+                            // failure: drop the graph we just registered and run
+                            // the segment eagerly so the drafter keeps working.
+                            tracing::warn!(
+                                "DFlash propose graph launch refused ({error}); running eager"
+                            );
+                            self.graph_runtime.invalidate(
+                                managed.key(),
+                                spark_runtime::graph_runtime::GraphFallbackReason::PhaseDisabled,
+                            );
+                            body()?;
+                            return Ok(None);
+                        }
+                        Ok(Some(managed.key().clone()))
+                    };
 
                     for (layer_idx, layer) in self.layers.iter().enumerate() {
                         let args = make_paged_args(layer_idx).expect("option_b args available");
@@ -881,61 +971,30 @@ impl BlockDiffusionDraftHead {
                         // pre_attn + paged-indirect attention. kv_len lives in
                         // option_b_indirect_args_dev (written once per propose,
                         // outside capture). Pool pointers are stable.
-                        gpu.begin_capture(stream)?;
-                        let (k_pool, v_pool) =
-                            self.forward_block_layer_pre_attn(layer, &args, ctx, scratch)?;
-                        self.forward_block_layer_attention(&args, ctx, k_pool, v_pool, scratch)?;
-                        let pre_graph = gpu.end_capture(stream)?;
-                        new_graphs.push(pre_graph);
-                        if pre_graph.0 != 0 {
-                            gpu.launch_graph(pre_graph, stream)?;
-                        } else {
-                            tracing::warn!(
-                                "DFlash piecewise: pre_attn layer {} empty capture — eager fallback",
-                                layer_idx
-                            );
+                        let mut pre = || -> Result<()> {
                             let (k_pool, v_pool) =
                                 self.forward_block_layer_pre_attn(layer, &args, ctx, scratch)?;
-                            self.forward_block_layer_attention(
-                                &args, ctx, k_pool, v_pool, scratch,
-                            )?;
-                        }
+                            self.forward_block_layer_attention(&args, ctx, k_pool, v_pool, scratch)
+                        };
+                        new_keys.push(capture_segment(layer_idx * 2, &mut pre)?);
 
                         // post_attn subgraph
-                        gpu.begin_capture(stream)?;
-                        self.forward_block_layer_post_attn(layer, &args, ctx, scratch)?;
-                        let post_graph = gpu.end_capture(stream)?;
-                        new_graphs.push(post_graph);
-                        if post_graph.0 != 0 {
-                            gpu.launch_graph(post_graph, stream)?;
-                        } else {
-                            tracing::warn!(
-                                "DFlash piecewise: post_attn layer {} empty capture — eager fallback",
-                                layer_idx
-                            );
-                            self.forward_block_layer_post_attn(layer, &args, ctx, scratch)?;
-                        }
+                        let mut post =
+                            || self.forward_block_layer_post_attn(layer, &args, ctx, scratch);
+                        new_keys.push(capture_segment(layer_idx * 2 + 1, &mut post)?);
                     }
 
                     // tail subgraph
-                    gpu.begin_capture(stream)?;
-                    run_tail()?;
-                    let tail_graph = gpu.end_capture(stream)?;
-                    new_graphs.push(tail_graph);
-                    if tail_graph.0 != 0 {
-                        gpu.launch_graph(tail_graph, stream)?;
-                    } else {
-                        tracing::warn!("DFlash piecewise: tail empty capture — eager fallback");
-                        run_tail()?;
-                    }
+                    let mut tail = || run_tail();
+                    new_keys.push(capture_segment(tail_slot, &mut tail)?);
 
-                    let success_count = new_graphs.iter().filter(|g| g.0 != 0).count();
+                    let success_count = new_keys.iter().filter(|key| key.is_some()).count();
                     tracing::info!(
                         "DFlash piecewise capture: complete key={graph_key:?} ({}/{} subgraphs captured)",
                         success_count,
                         total_slots
                     );
-                    gmap.insert(graph_key, new_graphs);
+                    gmap.insert(graph_key, new_keys);
                 }
             }
         } else {

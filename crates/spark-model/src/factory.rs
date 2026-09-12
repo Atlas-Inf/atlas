@@ -184,6 +184,17 @@ mod tests {
             None, // lora_args
             None, // nllb_lang
             None, // nllb_lora_dir
+            spark_runtime::graph_runtime::GraphRuntimeConfig::disabled(
+                spark_runtime::graph_runtime::GraphFingerprint {
+                    runtime: "test".into(),
+                    model: "test".into(),
+                    kernel_build: "test".into(),
+                    device: "mock".into(),
+                    cuda: "none".into(),
+                    driver: "none".into(),
+                    memory_layout: "test".into(),
+                },
+            ),
         );
         match result {
             Err(e) => assert!(e.to_string().contains("Unsupported model type: 'llama'")),

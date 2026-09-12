@@ -102,7 +102,7 @@ impl TransformerModel {
             conv_dsts_early: &p.conv_dsts_early,
         });
 
-        let ctx = ForwardContext {
+        let mut ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -147,8 +147,31 @@ impl TransformerModel {
         } else {
             kv_write_start
         };
-        let prefill_t0 = if profile_now {
-            self.gpu.synchronize(stream)?;
+        let diagnostics_armed = [
+            "ATLAS_PREFILL_HOST_TIMING",
+            "ATLAS_DUMP_HYPER_RMS",
+            "ATLAS_NEMO_DUMP",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        let graph_identity = self.prefill_chunk_graph_identity(
+            seq,
+            proc_count,
+            effective_seq_len_start,
+            kv_write_start,
+            marconi_skip,
+            is_last_chunk,
+            needs_paged,
+            use_mrope,
+            kv_cache.config().cache_blocks_per_seq.is_some(),
+            profile_now,
+            diagnostics_armed,
+            midcap.is_some(),
+        );
+        self.execute_prefill_graph(graph_identity, stream, |graph_capture| {
+            ctx.graph_capture = graph_capture;
+            let prefill_t0 = if profile_now {
+                self.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
         } else {
             None
@@ -396,6 +419,8 @@ impl TransformerModel {
                 top5.join(", "),
             );
         }
+            Ok(())
+        })?;
         Ok(())
     }
 }

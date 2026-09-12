@@ -77,6 +77,8 @@ See [FP8](../deep-dives/fp8.md) and [NVFP4](../deep-dives/nvfp4.md) for the trad
 | `--mtp-vocab` | `100000` | Limit MTP LM head to the first N token ids (`0` = full vocab). The default is **not** `0`: out of the box the draft head only scores ids `0..100000`, clamped to the model's real vocab size |
 | `--self-speculative` | off | Layer-skipping drafter (no MTP weights required) |
 | `--ngram-speculative` | off | CPU-side n-gram matching |
+| `--dflash` | off | DFlash drafter (`--draft-model`, or a `[dflash]` section in the target's MODEL.toml); conflicts with `--speculative` |
+| `--dspark` | off | First-class D-Spark: a DFlash-family drafter whose checkpoint ships D-Spark artifacts. Loads the drafter as `--dflash` does but selects D-Spark explicitly and **fails closed** if the checkpoint carries no D-Spark artifacts. Conflicts with `--speculative`/`--self-speculative`/`--ngram-speculative` |
 
 See the [MTP deep dive](../deep-dives/mtp.md). Use only one of `--speculative`,
 `--self-speculative`, `--ngram-speculative` — but note this is **guidance, not an
@@ -89,6 +91,22 @@ serves. The scheduler then resolves them by silent precedence (ngram → self-sp
 `--num-drafts` is also not a plain constant: when it is still `1`, the model's
 `MODEL.toml` `default_num_drafts` replaces it (`serve_phases/config.rs`). On
 `qwen3.6-27b` that is `3`, i.e. K=4.
+
+## CUDA graphs
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--cuda-graph-mode` | `full` | `disabled`, `full`, `breakable`, or `piecewise` |
+| `--cuda-graph-token-buckets` | `16,32,…,8192` | Strictly increasing token-count buckets |
+| `--cuda-graph-request-buckets` | `1,2,…,128` | Strictly increasing request-count buckets |
+| `--cuda-graph-cache-entries` | `256` | Max resident graph executables across all phases |
+| `--cuda-graph-cache-mb` | `2048` | Estimated graph-memory budget, MiB |
+| `--cuda-graph-export-dir` | — | Write DOT topology, manifest, and prewarm profile |
+| `--cuda-graph-prewarm-profile` | — | Recreate the recorded graph key set at startup |
+
+See `docs/CUDA_GRAPH_RUNTIME.md`. `/metrics` exposes
+`atlas_cuda_graph_*` counters (captures, replays, eager fallbacks by reason,
+graph memory); a serve with zero captures did not use a graph.
 
 ## Scheduling / caching
 

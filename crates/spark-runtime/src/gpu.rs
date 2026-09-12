@@ -59,6 +59,39 @@ pub struct KernelHandle(pub u64);
 #[derive(Debug, Clone, Copy)]
 pub struct GraphHandle(pub u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditionalNodeKind {
+    If,
+    While,
+}
+
+#[derive(Debug)]
+pub struct ConditionalGraphTemplate {
+    pub(crate) graph: u64,
+    pub(crate) conditional_handle: u64,
+    pub(crate) bodies: [u64; 2],
+    pub(crate) body_count: usize,
+    pub(crate) kind: ConditionalNodeKind,
+}
+
+impl ConditionalGraphTemplate {
+    pub fn kind(&self) -> ConditionalNodeKind {
+        self.kind
+    }
+
+    pub fn body_count(&self) -> usize {
+        self.body_count
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.graph != 0
+            && self.conditional_handle != 0
+            && self.body_count > 0
+            && self.body_count <= self.bodies.len()
+            && self.bodies[..self.body_count].iter().all(|body| *body != 0)
+    }
+}
+
 /// Typed kernel argument, used by `launch_typed`.
 ///
 /// CUDA's `cuLaunchKernel` is type-blind — every arg is `void*` and the
@@ -188,6 +221,35 @@ pub trait GpuBackend: Send + Sync {
     /// Synchronize a CUDA stream (blocks until all work completes).
     fn synchronize(&self, stream: u64) -> Result<()>;
 
+    /// A55 red-zone probe: verify every guard band still holds its poison.
+    /// Returns the number of bands checked. Default: unsupported, 0 bands.
+    fn scan_redzones(&self) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// A55 bisection: poison guard bands `[lo, hi)` with `0xEE` and the rest
+    /// with `0x00`. Layout-preserving by construction. Default: no-op.
+    fn poison_redzones(&self, _lo: usize, _hi: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Bytes still live on the backend's allocation ledger. `None` on a
+    /// backend with no ledger (the seq-memtrace instrument reports -1 rather
+    /// than a false zero).
+    fn live_bytes(&self) -> Option<usize> {
+        None
+    }
+
+    /// Live allocation count on the backend's ledger.
+    fn live_alloc_count(&self) -> usize {
+        0
+    }
+
+    /// Free device memory in bytes, as the driver reports it.
+    fn device_free_memory(&self) -> Result<usize> {
+        self.free_memory()
+    }
+
     /// Get the default stream handle.
     fn default_stream(&self) -> u64;
 
@@ -313,6 +375,60 @@ pub trait GpuBackend: Send + Sync {
         Ok(())
     }
 
+    /// CUDA graph features exposed by this backend and driver combination.
+    fn graph_capabilities(&self) -> crate::graph_runtime::GraphCapabilities {
+        crate::graph_runtime::GraphCapabilities {
+            basic_graphs: false,
+            debug_dot: false,
+            graph_upload: false,
+            conditional_nodes: false,
+            while_nodes: false,
+            native_serialization: false,
+        }
+    }
+
+    fn graph_environment(&self) -> Option<crate::graph_runtime::GraphEnvironment> {
+        None
+    }
+
+    fn create_conditional_graph(
+        &self,
+        _kind: ConditionalNodeKind,
+        _predicate: DevicePtr,
+        _setter: KernelHandle,
+        _body_count: usize,
+    ) -> Result<ConditionalGraphTemplate> {
+        anyhow::bail!("CUDA conditional graph nodes are not supported by this backend")
+    }
+
+    fn begin_conditional_branch(
+        &self,
+        _template: &ConditionalGraphTemplate,
+        _branch: usize,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("CUDA conditional graph nodes are not supported by this backend")
+    }
+
+    fn end_conditional_branch(
+        &self,
+        _template: &ConditionalGraphTemplate,
+        _branch: usize,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("CUDA conditional graph nodes are not supported by this backend")
+    }
+
+    fn instantiate_conditional_graph(
+        &self,
+        _template: &ConditionalGraphTemplate,
+        _dot_path: Option<&std::path::Path>,
+    ) -> Result<GraphHandle> {
+        anyhow::bail!("CUDA conditional graph nodes are not supported by this backend")
+    }
+
+    fn destroy_conditional_graph_template(&self, _template: &ConditionalGraphTemplate) {}
+
     /// Begin capturing CUDA operations on `stream` into a graph.
     ///
     /// All kernel launches and async copies on this stream between
@@ -325,6 +441,18 @@ pub trait GpuBackend: Send + Sync {
     /// End capture and return an instantiated graph ready for replay.
     fn end_capture(&self, _stream: u64) -> Result<GraphHandle> {
         Ok(GraphHandle(0))
+    }
+
+    /// End capture and emit a DOT topology while the graph template is alive.
+    fn end_capture_with_dot(
+        &self,
+        stream: u64,
+        dot_path: Option<&std::path::Path>,
+    ) -> Result<GraphHandle> {
+        if dot_path.is_some() {
+            anyhow::bail!("CUDA graph DOT export is not supported by this backend");
+        }
+        self.end_capture(stream)
     }
 
     /// Replay all operations captured in the graph on `stream`.
@@ -402,6 +530,11 @@ pub trait GpuBackend: Send + Sync {
     /// not for everything subsequently enqueued.
     fn event_synchronize(&self, _event: u64) -> Result<()> {
         Ok(())
+    }
+
+    /// Return whether all work recorded by an event has completed.
+    fn event_query(&self, _event: u64) -> Result<bool> {
+        Ok(true)
     }
 
     /// Destroy an event.
