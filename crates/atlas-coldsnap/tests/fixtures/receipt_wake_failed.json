@@ -1,0 +1,17 @@
+{
+  "format": 2,
+  "kind": "coldsnap-operation-receipt",
+  "operation_id": "qwen08b-tp1-wake-v1",
+  "operation": "wake",
+  "state": "failed",
+  "request_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "engine": "sglang",
+  "snapshot_driver": "n580",
+  "replay_semantics": "convergent",
+  "started_at": "2026-08-15T12:10:00Z",
+  "completed_at": "2026-08-15T12:10:41.250Z",
+  "duration_seconds": 41.25,
+  "timing": { "format": 2, "clocks": [], "spans": [] },
+  "result": { "artifact": "./artifacts/qwen08b-tp2-published.json" },
+  "error": "hydration boundary not reached before the adapter deadline"
+}
