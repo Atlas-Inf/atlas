@@ -351,6 +351,63 @@ pub trait GpuBackend: Send + Sync {
     /// Set device memory to a byte value on the given stream (async — does not wait).
     fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, stream: u64) -> Result<()>;
 
+    /// Strided 2D (pitched) memset: `height` rows of `width` bytes, each row
+    /// `pitch` bytes apart starting at `dst`. Default = per-row `memset_async`
+    /// loop; the CUDA backend overrides with ONE `cuMemsetD2D8Async`. On WDDM
+    /// this collapses a per-layer `memset_async` loop (e.g. zeroing one pool
+    /// slot's column across all SSM layers) from `height` submissions to one.
+    #[allow(clippy::too_many_arguments)]
+    fn memset_2d_async(
+        &self,
+        dst: DevicePtr,
+        pitch: usize,
+        value: u8,
+        width: usize,
+        height: usize,
+        stream: u64,
+    ) -> Result<()> {
+        for r in 0..height {
+            self.memset_async(dst.offset(r * pitch), value, width, stream)?;
+        }
+        Ok(())
+    }
+
+    /// 32-bit-element memset: fills `n` consecutive u32 at `dst` with `value`.
+    /// On HIP-on-WDDM the 8-bit memset path (`cuMemsetD8Async`) can be
+    /// dramatically slower than the 32-bit fill; callers zeroing large buffers
+    /// should prefer this when `bytes % 4 == 0`. Default degrades to the byte
+    /// path when `value` is a zero fill (u8 0 → u32 0), else falls back
+    /// per-element. `n` is a count of u32 elements, not bytes.
+    fn memset_32_async(&self, dst: DevicePtr, value: u32, n: usize, stream: u64) -> Result<()> {
+        if value == 0 {
+            return self.memset_async(dst, 0, n * 4, stream);
+        }
+        for i in 0..n {
+            self.memset_async(dst.offset(i * 4), (value & 0xff) as u8, 4, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Zero `bytes` at `dst` (async). Prefers the 32-bit fill — on
+    /// HIP-on-WDDM it is ~3× the 8-bit `cuMemsetD8Async` bandwidth — for the
+    /// aligned bulk, then the byte memset for the <4-byte tail. Callers
+    /// zeroing large prefill-setup buffers should use this over
+    /// `memset_async(.., 0, ..)`; semantic-carrying or graph-captured fills
+    /// keep `memset_async` so this stays a deliberate opt-in.
+    fn memset_zero_async(&self, dst: DevicePtr, bytes: usize, stream: u64) -> Result<()> {
+        if dst.0.is_multiple_of(4) && bytes >= 4 {
+            let n32 = bytes / 4;
+            self.memset_32_async(dst, 0, n32, stream)?;
+            let rem = bytes % 4;
+            if rem > 0 {
+                self.memset_async(dst.offset(n32 * 4), 0, rem, stream)?;
+            }
+            Ok(())
+        } else {
+            self.memset_async(dst, 0, bytes, stream)
+        }
+    }
+
     /// Total device memory in bytes.
     fn total_memory(&self) -> Result<usize>;
 

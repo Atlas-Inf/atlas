@@ -151,6 +151,24 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else if let Some(ref fp8t) = self.o_fp8w_t
+            && self.w8a16_gemm_t_m128_k.0 != 0
+        {
+            // gfx1151/HIP: no cp.async, so the pipelined kernel is absent — the
+            // 128x128-tile `w8a16_gemm_t_m128` is the fast transposed fallback
+            // (halves B re-reads vs the 64x64 base tile). Same B_t/scale layout.
+            ops::w8a16_gemm_n128_m128(
+                ctx.gpu,
+                self.w8a16_gemm_t_m128_k,
+                attn_out,
+                fp8t.weight_t,
+                fp8t.scale_t,
+                o_out,
+                n,
+                h,
+                nq * hd,
+                stream,
+            )?;
+        } else if let Some(ref fp8t) = self.o_fp8w_t
             && self.w8a16_gemm_t_k.0 != 0
         {
             // cp.async-free fallback (gfx1151/HIP): non-pipelined transposed W8A16.

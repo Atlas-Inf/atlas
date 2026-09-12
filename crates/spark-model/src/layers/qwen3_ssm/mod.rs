@@ -62,6 +62,12 @@ pub struct Qwen3SsmLayer {
     // FP8 E4M3 checkpoint weights for native FP8 serving (w8a16_gemv LUT kernel)
     qkvz_fp8w: Option<Fp8Weight>,
     out_proj_fp8w: Option<Fp8Weight>,
+    // Transposed [K,N] copies of the block-scaled FP8 weights for the coalesced
+    // `w8a16_gemm_t` prefill path — populated by `transpose_fp8_for_prefill`
+    // for native-FP8 GDN checkpoints. The non-transposed `*_fp8w` copies stay
+    // for the decode `w8a16_gemv` path (which needs [N,K]).
+    qkvz_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
+    out_proj_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
     /// PER-ROW FP8 (`Fp8PerRow`) for PREFILL ONLY, from mixed-precision
     /// compressed-tensors checkpoints (`ATLAS_FP8_ROWWISE=1`).
     ///
@@ -361,6 +367,11 @@ pub struct Qwen3SsmLayer {
     // weight-streaming GEMV, avoids the M-padded MMA at C=8/16.
     w8a16_gemv_batch16_k: KernelHandle,
     w8a16_gemm_t_k: KernelHandle,
+    // Large-M transposed W8A16 prefill: 128x128-tile WMMA variant of
+    // `w8a16_gemm_t`. KernelHandle(0) when the kernel isn't linked (e.g. a
+    // backend that only ships the 64x64 base tile) — callers fall back to
+    // `w8a16_gemm_t_k`.
+    w8a16_gemm_t_m128_k: KernelHandle,
     // W8A8 + FP32 epilogue (vLLM-equivalent) prefill kernels.
     // `per_token_group_quant_fp8` produces FP8 activations + per-token-per-128
     // FP32 scale; `fp8_gemm_t_blockscaled` consumes both with FP8 MMA and

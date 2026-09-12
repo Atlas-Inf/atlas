@@ -314,6 +314,7 @@ pub fn w8a16_gemm(
     let (grid, block) = ([div_ceil(n, 128), div_ceil(m, 256), 1], [512, 1, 1]);
     #[cfg(not(atlas_hip))]
     let (grid, block) = ([div_ceil(n, 64), div_ceil(m, 64), 1], [128, 1, 1]);
+    super::log_gemm_shape(gpu, "w8a16_gemm", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid(grid)
         .block(block)
@@ -729,6 +730,7 @@ pub fn w8a16_gemm_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape(gpu, "w8a16_gemm_t", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
         .block([128, 1, 1])

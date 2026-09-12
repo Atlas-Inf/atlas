@@ -35,6 +35,31 @@ impl Qwen3SsmLayer {
         } else {
             ctx.buffers.ssm_qkvz()
         };
+        // One-time dispatch-state dump: which weight copies / kernel handles are
+        // populated decides which arm of the ladder below actually runs.
+        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!(
+                "SSM_QKVZ_DISPATCH fp8w={} fp8w_t={} nvfp4_t={} fp8={} rowwise={} \
+                 w8a16={:#x} w8a16_t={:#x} w8a16_pipe={:#x} w4a16_t={:#x} force_bf16_env={} \
+                 cutlass_qkvz={} cutlass={} cublas_fp8={} cublas={} w8a8={} M={k} N={qkvz_size} K={h}",
+                self.qkvz_fp8w.is_some(),
+                self.qkvz_fp8w_t.is_some(),
+                self.qkvz_nvfp4_t.is_some(),
+                self.qkvz_fp8.is_some(),
+                self.qkvz_fp8w_rowwise.is_some(),
+                self.w8a16_gemm_k.0,
+                self.w8a16_gemm_t_k.0,
+                self.w8a16_gemm_pipelined_k.0,
+                self.w4a16_gemm_t_k.0,
+                std::env::var("ATLAS_GDN_BF16_WEIGHTS").ok().as_deref() == Some("1"),
+                ctx.dispatch.cutlass_nvfp4_qkvz,
+                ctx.dispatch.cutlass_gemm,
+                ctx.dispatch.cublas_fp8,
+                ctx.dispatch.cublas_gemm,
+                ctx.dispatch.fp8_blockscaled_prefill,
+            );
+        }
         // Tier-1c keep-packed Q2_0: transient-dequant the fused qkvz then dense
         // GEMM. Bonsai is `sequential_qkvz`, so `proj_dst == deinterleaved` and
         // no post-deinterleave is needed. Highest priority (all other weight
@@ -309,6 +334,98 @@ impl Qwen3SsmLayer {
                     "ssm prefill: QKVZ w8a16_gemm_pipelined failed (M={k}, N={qkvz_size}): {e}"
                 )
             })?;
+        } else if let Some(ref fp8t) = self.qkvz_fp8w_t {
+            // Coalesced transposed-FP8 path (native-FP8 GDN checkpoints, e.g.
+            // the nvidia modelopt SSM projections). `w8a16_gemm_t` reads
+            // B_t[K,N] coalesced — the transpose was materialized at load by
+            // `transpose_fp8_for_prefill`. Ordered AFTER `w8a16_gemm_pipelined`
+            // (NVIDIA cp.async) so that path still wins where built; on gfx1151
+            // it is absent and this arm takes over ahead of the strided
+            // `w8a16_gemm` fallback.
+            //
+            // At M>128 the 128x128-tile `w8a16_gemm_t_m128` variant halves the
+            // B re-read traffic vs the 64x64 base tile (each CTA covers 128
+            // M-rows, so B is fetched once per 128-row group instead of per
+            // 64). Same B_t/scale layout — only the tile and pipeline differ.
+            if k > 128 && self.w8a16_gemm_t_m128_k.0 != 0 {
+                ops::w8a16_gemm_n128_m128(
+                    ctx.gpu,
+                    self.w8a16_gemm_t_m128_k,
+                    normed,
+                    fp8t.weight_t,
+                    fp8t.scale_t,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: QKVZ w8a16_gemm_t_m128 failed (M={k}, N={qkvz_size}): {e}"
+                    )
+                })?;
+            } else {
+                ops::w8a16_gemm_t(
+                    ctx.gpu,
+                    self.w8a16_gemm_t_k,
+                    normed,
+                    fp8t.weight_t,
+                    fp8t.scale_t,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: QKVZ w8a16_gemm_t failed (M={k}, N={qkvz_size}): {e}"
+                    )
+                })?;
+            }
+        } else if let Some(ref nvfp4_t) = self.qkvz_nvfp4_t {
+            // Coalesced transposed-NVFP4 path. `qkvz_nvfp4_t` is populated ONLY
+            // for native-NVFP4 checkpoints, so its presence is the provenance
+            // marker — this is the checkpoint's native precision (the FP8 copy
+            // is just a predequant of it) and reads half the B-side bytes while
+            // coalescing the loads that make `w8a16_gemm` ~15x under the memory
+            // floor. Ordered AFTER `w8a16_gemm_pipelined` so NVIDIA's cp.async
+            // tensor-core path still wins where it is built; on gfx1151 that
+            // kernel is absent (handle 0) and this arm takes over.
+            if k > 128 {
+                ops::w4a16_gemm_n128_m128(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m128_k,
+                    normed,
+                    nvfp4_t,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: QKVZ m128 GEMM failed (M={k}, N={qkvz_size}): {e}"
+                    )
+                })?;
+            } else {
+                ops::w4a16_gemm_n128(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_k,
+                    normed,
+                    nvfp4_t,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("ssm prefill: QKVZ GEMM failed (M={k}, N={qkvz_size}): {e}")
+                })?;
+            }
         } else if let Some(ref fp8w) = self.qkvz_fp8w
             && self.w8a16_gemm_k.0 != 0
         {
@@ -347,40 +464,6 @@ impl Qwen3SsmLayer {
             .map_err(|e| {
                 anyhow::anyhow!("ssm prefill: QKVZ FP8 GEMM failed (M={k}, N={qkvz_size}): {e}")
             })?;
-        } else if let Some(ref nvfp4_t) = self.qkvz_nvfp4_t {
-            if k > 128 {
-                ops::w4a16_gemm_n128_m128(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m128_k,
-                    normed,
-                    nvfp4_t,
-                    proj_dst,
-                    k,
-                    qkvz_size as u32,
-                    h as u32,
-                    stream,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "ssm prefill: QKVZ m128 GEMM failed (M={k}, N={qkvz_size}): {e}"
-                    )
-                })?;
-            } else {
-                ops::w4a16_gemm_n128(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_k,
-                    normed,
-                    nvfp4_t,
-                    proj_dst,
-                    k,
-                    qkvz_size as u32,
-                    h as u32,
-                    stream,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("ssm prefill: QKVZ GEMM failed (M={k}, N={qkvz_size}): {e}")
-                })?;
-            }
         } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
             ops::w4a16_gemm(
                 ctx.gpu,

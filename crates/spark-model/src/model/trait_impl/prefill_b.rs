@@ -151,6 +151,9 @@ impl TransformerModel {
             );
         }
 
+        let profile = std::env::var_os("ATLAS_PROFILE_PREFILL").is_some();
+        let tp = std::time::Instant::now();
+
         // Use the caller-provided stream for compute-copy overlap, unless
         // a multi-rank world is active (EP or pure TP — NCCL collectives
         // must stay stream-ordered with the cmd broadcasts, which run on
@@ -173,11 +176,13 @@ impl TransformerModel {
             self.buffers
                 .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
         }
+        let t_zero = tp.elapsed();
 
         let mut kv_cache = self.kv_cache.lock();
 
         // ── Phase 1+1b: embed chunk + vision pad overlay ──
         self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)?;
+        let t_embed = tp.elapsed();
 
         // ── Phase 2: prefix-cache lookup + EP sync + Marconi snapshot restore ──
         let (kv_write_start, marconi_skip) = self.prefill_b_prefix_lookup(
@@ -189,6 +194,7 @@ impl TransformerModel {
             stream,
             None,
         )?;
+        let t_prefix = tp.elapsed();
 
         if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
             self.ssm_pool.debug_state_checksum(
@@ -212,6 +218,7 @@ impl TransformerModel {
             stream,
             self.levers.kv_poison,
         )?;
+        let t_blocks = tp.elapsed();
 
         // ── Phase 2b: compute effective processing range (may early-return) ──
         let (proc_start, proc_count, effective_seq_len_start) = match self.prefill_b_proc_range(
@@ -250,6 +257,7 @@ impl TransformerModel {
                 return Ok(ptr);
             }
         };
+        let t_proc = tp.elapsed();
 
         // ── Phase 3: upload positions + MRoPE + slot metadata ──
         let upload_meta::MetaLayout {
@@ -283,6 +291,7 @@ impl TransformerModel {
                 stream,
             )?;
         }
+        let t_meta = tp.elapsed();
 
         // Force H2D metadata copy to complete before layer forward.
         // On DGX Spark SM121, the DMA engine may not properly serialize
@@ -322,6 +331,37 @@ impl TransformerModel {
             midcap_plan.as_ref(),
             stream,
         )?;
+        let t_fwd = tp.elapsed();
+        // Measure the forward's true GPU execution: the launches are async, so
+        // `t_fwd` is submission time only. A profile-only sync here isolates
+        // real GPU duration from the memset/H2D drain attributed to `embed`.
+        if profile {
+            let _fs = std::time::Instant::now();
+            let _ = self.gpu.synchronize(stream);
+            tracing::info!(
+                "prefill fwd-exec (chunk {}..{}): submit={:?} gpu_exec={:?}",
+                chunk_start,
+                chunk_start + chunk_len,
+                t_fwd.saturating_sub(t_meta),
+                _fs.elapsed(),
+            );
+        }
+        if profile {
+            tracing::info!(
+                "prefill profile (chunk {}..{} len={}): zero={:?} embed={:?} prefix={:?} blocks={:?} proc={:?} meta={:?} fwd={:?} total={:?}",
+                chunk_start,
+                chunk_start + chunk_len,
+                chunk_len,
+                t_zero,
+                t_embed.saturating_sub(t_zero),
+                t_prefix.saturating_sub(t_embed),
+                t_blocks.saturating_sub(t_prefix),
+                t_proc.saturating_sub(t_blocks),
+                t_meta.saturating_sub(t_proc),
+                t_fwd.saturating_sub(t_meta),
+                t_fwd,
+            );
+        }
 
         // Register the reserved slot as the session tail once the full pass has
         // captured the @tb state into it (no-op when no capture was planned).

@@ -528,7 +528,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         }
                         continue;
                     }
+                    // ATLAS_NO_ATTN_FP8 forces the dequant→NVFP4 attention path
+                    // for A/B against the native-FP8 prefill transpose — mirrors
+                    // the ATLAS_NO_GDN_FP8 / ATLAS_NO_Q2_ATTN debug levers.
                     let native_fp8_attention = cfg!(atlas_hip)
+                        && std::env::var_os("ATLAS_NO_ATTN_FP8").is_none()
                         && config.tp_world_size.max(1) == 1
                         && ["q_proj", "k_proj", "v_proj", "o_proj"]
                             .iter()
@@ -1120,6 +1124,14 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             gpu,
                         )?;
                         layer.set_fp8_decode_weights(Some(qkvz_f), Some(out_f));
+                        // Materialize the transposed [K,N] FP8 copies for the
+                        // coalesced `w8a16_gemm_t` prefill GEMM (gfx1151 has no
+                        // cp.async pipelined w8a16, so without this the strided
+                        // non-transposed `w8a16_gemm` runs ~15x under the memory
+                        // floor). No-op where the w8a16_gemm_t module is absent.
+                        if let Err(e) = layer.transpose_fp8_for_prefill(gpu, stream) {
+                            tracing::warn!("SSM[{lp}] fp8 prefill transpose skipped: {e}");
+                        }
                         tracing::info!(
                             "SSM[{lp}] native FP8 GDN: qkvz+out_proj block-scaled FP8 \
                              (no NVFP4 requant; prefill+decode via w8a16)"

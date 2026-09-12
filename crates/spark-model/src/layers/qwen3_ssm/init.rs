@@ -43,6 +43,8 @@ impl Qwen3SsmLayer {
             out_proj_dense: None,
             qkvz_fp8w: None,
             out_proj_fp8w: None,
+            qkvz_fp8w_t: None,
+            out_proj_fp8w_t: None,
             qkvz_fp8w_rowwise: None,
             out_proj_fp8w_rowwise: None,
             qkvz_q2: None,
@@ -475,6 +477,11 @@ impl Qwen3SsmLayer {
                 "w4a16_gemv_dp4a_batch4_d4",
             ),
             w8a16_gemm_t_k: super::super::try_kernel(gpu, "w8a16_gemm_t", "w8a16_gemm_t"),
+            w8a16_gemm_t_m128_k: super::super::try_kernel(
+                gpu,
+                "w8a16_gemm_t_m128",
+                "w8a16_gemm_t_m128",
+            ),
             per_token_group_quant_fp8_k: super::super::try_kernel(
                 gpu,
                 "per_token_group_quant_fp8",

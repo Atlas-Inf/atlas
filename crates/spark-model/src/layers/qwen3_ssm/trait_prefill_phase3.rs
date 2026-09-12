@@ -90,10 +90,12 @@ impl Qwen3SsmLayer {
     }
 
     pub(super) fn alloc_state_inner(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
+        let stream = gpu.default_stream();
         let h_state = gpu.alloc(self.h_state_bytes)?;
-        gpu.memset(h_state, 0, self.h_state_bytes)?;
+        gpu.memset_async(h_state, 0, self.h_state_bytes, stream)?;
         let conv_state = gpu.alloc(self.conv_state_bytes)?;
-        gpu.memset(conv_state, 0, self.conv_state_bytes)?;
+        gpu.memset_async(conv_state, 0, self.conv_state_bytes, stream)?;
+        gpu.synchronize(stream)?;
         Ok(Box::new(SsmLayerState {
             h_state,
             conv_state,
