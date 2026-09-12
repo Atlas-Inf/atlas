@@ -82,9 +82,17 @@ impl TransformerModel {
             // falls through to the GEMM, so targets lacking the kernel are
             // unaffected.
             // Tile GEMM at padded_n >= 5 over the PADDED transposed twin.
-            // padded_n <= 4 stays on the GEMV, which measures 3174 us =
-            // 226 GB/s = 98.3% of the memory roofline on this shape and is
-            // therefore unimprovable; the tile GEMM LOSES there.
+            // padded_n <= 4 stays on the GEMV, and the tile GEMM LOSES there.
+            //
+            // SUPERSEDED MEASUREMENT. This used to read "measures 3174 us =
+            // 226 GB/s = 98.3% of the memory roofline and is therefore
+            // unimprovable". That does not hold on the NVIDIA NVFP4
+            // checkpoint: the float tier measures 5979.7 us isolated and
+            // 6367.8 us in-situ at [248320, 5120] M=4 -- ~120 GB/s, about
+            // half what the DP4A family reaches on the same shape and layout.
+            // The K=4 verify lm_head is therefore NOT at the roofline and is
+            // not unimprovable; see the W4A8 DP4A arm in
+            // `TransformerModel::lm_head_batched` (impl_a3.rs).
             if padded_n >= 5
                 && self.w4a16_gemm_t_bf16_kernel.0 != 0
                 && let Some((ref nvfp4_t, ldb)) = self.lm_head_nvfp4_t

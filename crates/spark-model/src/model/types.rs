@@ -137,12 +137,14 @@ pub struct TransformerModel {
     /// verify tokens. Bit-identical to two `dense_gemv_fp8w` calls; halves the
     /// FP8 weight bandwidth for the lm_head on the MTP verify path.
     pub(super) dense_gemv_fp8w_batch2_kernel: KernelHandle,
-    /// W4A8 DP4A LM-head GEMV (M<=4) and its int8 activation quantizer. The
-    /// NVFP4 LM head is exactly the layout the DP4A path consumes (U8 [V, K/2]
-    /// + F8 [V, K/16]), and the float `w4a16_gemv_batch4` measures ~1.6x slower
-    /// on this shape: [248320, 5120] at M=4 is 5979.7 us float vs 3772.6 us
-    /// DP4A isolated, and 6367.8 us in-situ in the K=4 profile. 0-handle (or
-    /// `ATLAS_W4A16_DP4A` unset) falls back to the float ladder.
+    /// W4A8 DP4A LM-head GEMV (M<=4) and its int8 activation quantizer.
+    ///
+    /// The NVFP4 LM head is exactly the layout the DP4A path consumes
+    /// (U8 `[V, K/2]` + F8 `[V, K/16]`), and the float `w4a16_gemv_batch4`
+    /// measures ~1.6x slower on this shape: at `[248320, 5120]` M=4 it is
+    /// 5979.7 us isolated (6367.8 us in-situ in the K=4 profile) against
+    /// 3772.6 us for the DP4A kernel. A zero handle, or `ATLAS_W4A16_DP4A`
+    /// unset, falls back to the float ladder.
     pub(super) lm_head_dp4a_gemv_kernel: KernelHandle,
     pub(super) lm_head_dp4a_quant_kernel: KernelHandle,
     pub(super) dense_gemm_kernel: KernelHandle,

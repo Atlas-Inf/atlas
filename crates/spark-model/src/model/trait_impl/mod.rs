@@ -30,6 +30,7 @@ mod drafter_prefill;
 mod ep_misc;
 mod graph_borrow;
 mod lm_head_batched;
+mod lm_head_dp4a;
 mod meta;
 mod prefill_a;
 mod prefill_b;
