@@ -81,11 +81,19 @@ fn describe_content_token_loop(
 /// `model` is needed by the Phase-C boundary rollback so it can restore
 /// SSM recurrent state on hybrid models (see
 /// [`super::rollback::rollback_to_boundary`]).
+///
+/// Returns `true` when a watchdog rolled the sequence back. The caller's
+/// current token was sampled from the context that was just discarded, and
+/// `last_token` now points at the boundary token: the caller must DROP the
+/// token (no push, no emit) rather than append it — appending it left a
+/// phantom, never-decoded token in `output_tokens` that reached the client
+/// and put every later rollback one position off. Its budget and content
+/// count are refunded here.
 pub fn handle_content_token(
     a: &mut ActiveSeq,
     model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
-) {
+) -> bool {
     a.consume_generation_budget();
     a.content_started = true;
     a.content_tokens = a.content_tokens.saturating_add(1);
@@ -170,7 +178,9 @@ pub fn handle_content_token(
         // = CONTENT_LOOP_PERIOD_MAX so the rollback always escapes
         // the detected period. Falls back to the legacy hard stop
         // when disabled / capped / no boundary found.
-        match rollback_to_boundary(a, CONTENT_LOOP_PERIOD_MAX, model, sched) {
+        // This handler runs BEFORE the step pushes its token: every token in
+        // `output_tokens` has been fed (`unfed_tail = 0`).
+        match rollback_to_boundary(a, CONTENT_LOOP_PERIOD_MAX, model, sched, 0) {
             RollbackOutcome::RolledBack { dropped } => {
                 tracing::warn!(
                     content_tokens = a.content_tokens,
@@ -182,6 +192,8 @@ pub fn handle_content_token(
                     CONTENT_LOOP_PERIOD_MIN,
                     CONTENT_LOOP_PERIOD_MAX,
                 );
+                refund_pending_token(a);
+                return true;
             }
             RollbackOutcome::Fallback(reason) => {
                 tracing::warn!(
@@ -230,7 +242,7 @@ pub fn handle_content_token(
             // constrained tool-call decoder stays valid.
             // `min_keep` = CONTENT_LOOP_PERIOD_MAX drops a full
             // run-on sentence of stalled prose.
-            match rollback_to_boundary(a, CONTENT_LOOP_PERIOD_MAX, model, sched) {
+            match rollback_to_boundary(a, CONTENT_LOOP_PERIOD_MAX, model, sched, 0) {
                 RollbackOutcome::RolledBack { dropped } => {
                     tracing::warn!(
                         max = max_prose,
@@ -238,6 +250,8 @@ pub fn handle_content_token(
                         rollback = a.rollback_count,
                         "Inter-tool prose budget exhausted; rolled back to boundary, re-steering"
                     );
+                    refund_pending_token(a);
+                    return true;
                 }
                 RollbackOutcome::Fallback(reason) => {
                     tracing::warn!(
@@ -256,4 +270,13 @@ pub fn handle_content_token(
             }
         }
     }
+    false
+}
+
+/// The token the caller sampled this step was charged to the budget and the
+/// content count at the top of `handle_content_token`; a rollback discards
+/// it, so give both back.
+fn refund_pending_token(a: &mut ActiveSeq) {
+    a.remaining = a.remaining.saturating_add(1);
+    a.content_tokens = a.content_tokens.saturating_sub(1);
 }

@@ -49,6 +49,7 @@ pub(super) fn attach_qsa(
             config.index_head_dim,
             config.index_compress_ratio,
             config.index_topk,
+            config.max_seq_len,
             (config.head_dim as f64 * config.partial_rotary_factor) as usize,
             config.rope_theta as f32,
             config.rms_norm_eps as f32,

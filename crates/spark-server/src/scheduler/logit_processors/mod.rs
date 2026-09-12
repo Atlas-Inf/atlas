@@ -253,7 +253,7 @@ pub fn process_position_logits(
     //    penalties, no bias. Eligible on both kinds (the diagnostic's point
     //    is an identical bypass everywhere).
     if ctx.sampling.force_temp_zero {
-        return Some(spark_runtime::sampler::argmax_last_wins_f32(logits));
+        return Some(spark_runtime::sampler::argmax_first_wins_f32(logits));
     }
 
     // 2. Canonical pre-sample pipeline (+ AdaDec diagnostic under this

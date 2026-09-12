@@ -38,6 +38,9 @@ impl From<crate::ir::ChatResponse> for MessagesResponse {
                 // Safety-filtered output maps to Anthropic's dedicated
                 // refusal stop reason (2025-05 API), not a normal end_turn.
                 crate::ir::FinishReason::ContentFilter => "refusal",
+                // Not an Anthropic stop reason on purpose: an engine abort
+                // must not read as end_turn (the truncation this exists for).
+                crate::ir::FinishReason::Error => "error",
                 crate::ir::FinishReason::Other(_) => "end_turn",
             };
             stop_sequence = c.matched_stop;

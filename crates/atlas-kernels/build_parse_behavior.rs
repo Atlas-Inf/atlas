@@ -26,6 +26,7 @@ pub(crate) struct ParsedBehavior {
     pub disable_tool_steering: bool,
     pub disable_cwd_hint_injection: bool,
     pub use_sampling_presets_for_core: bool,
+    pub use_sampling_preset_penalties_for_core: bool,
     pub tool_call_parser: String,
     pub jinja_template: String,
     pub enable_loop_watchdog: bool,
@@ -98,6 +99,7 @@ impl Default for ParsedBehavior {
             disable_tool_steering: false,
             disable_cwd_hint_injection: false,
             use_sampling_presets_for_core: false,
+            use_sampling_preset_penalties_for_core: true,
             tool_call_parser: String::new(),
             jinja_template: String::new(),
             enable_loop_watchdog: false,
@@ -181,6 +183,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("use_sampling_presets_for_core"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let use_sampling_preset_penalties_for_core = b
+        .and_then(|v| v.get("use_sampling_preset_penalties_for_core"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let tool_call_parser = b
         .and_then(|v| v.get("tool_call_parser"))
         .and_then(|v| v.as_str())
@@ -298,6 +304,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         disable_tool_steering,
         disable_cwd_hint_injection,
         use_sampling_presets_for_core,
+        use_sampling_preset_penalties_for_core,
         tool_call_parser,
         jinja_template,
         enable_loop_watchdog,

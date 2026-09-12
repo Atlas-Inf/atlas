@@ -135,6 +135,9 @@ pub(crate) fn load_model(
     };
     config.lm_head_bf16_override = lm_head_bf16_override;
     config.lm_head_fp8 = lm_head_fp8;
+    // `--attn-proj-dtype bf16`: keep the full-attention Q/K/V/O at checkpoint
+    // BF16 (validated by `validate_serve_args`; `default`/`nvfp4` quantize).
+    config.attn_proj_bf16 = args.attn_proj_dtype == "bf16";
 
     // ModelOpt-exported checkpoints drop a sibling `hf_quant_config.json`
     // whose TOP LEVEL is already the quantization block.
@@ -502,6 +505,9 @@ pub(crate) fn load_model(
     // can be sized by it too instead of a standalone constant. Same
     // "carried on the config, not the environment" rule as the block below.
     config.max_batch_tokens = max_batch_tokens;
+    // Served context length (prompt + generation), same carry rule: the QSA
+    // indexer sizes its per-sequence capacity from it instead of a constant.
+    config.max_seq_len = args.max_seq_len;
     if args.dflash && args.enable_prefix_caching {
         tracing::warn!(
             "dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."

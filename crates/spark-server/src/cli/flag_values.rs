@@ -24,6 +24,7 @@
 //! are enforced.
 
 pub(crate) const LM_HEAD_DTYPES: &[&str] = &["default", "bf16", "nvfp4", "fp8"];
+pub(crate) const ATTN_PROJ_DTYPES: &[&str] = &["default", "bf16", "nvfp4"];
 pub(crate) const MTP_QUANTS: &[&str] = &["bf16", "fp8", "nvfp4"];
 pub(crate) const SCHEDULING_POLICIES: &[&str] = &["fifo", "slai"];
 pub(crate) const SSM_H_DTYPES: &[&str] = &["f32", "f16", "f16-pool"];
@@ -48,6 +49,7 @@ pub(crate) fn options_for_flag(flag: &str) -> Option<Vec<String>> {
     let owned = |list: &[&str]| list.iter().map(|s| s.to_string()).collect();
     match flag {
         "lm-head-dtype" => Some(owned(LM_HEAD_DTYPES)),
+        "attn-proj-dtype" => Some(owned(ATTN_PROJ_DTYPES)),
         "mtp-quantization" => Some(owned(MTP_QUANTS)),
         "scheduling-policy" => Some(owned(SCHEDULING_POLICIES)),
         "ssm-h-dtype" => Some(owned(SSM_H_DTYPES)),

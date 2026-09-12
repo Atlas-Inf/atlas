@@ -112,6 +112,10 @@ pub enum FinishReason {
     Length,
     ToolCalls,
     ContentFilter,
+    /// The engine aborted the sequence (a verify/decode step failed);
+    /// distinct from every model-driven stop so clients can tell a
+    /// truncation from a completion.
+    Error,
     Other(String),
 }
 
@@ -124,6 +128,7 @@ impl From<&str> for FinishReason {
             "length" => FinishReason::Length,
             "tool_calls" => FinishReason::ToolCalls,
             "content_filter" => FinishReason::ContentFilter,
+            "error" => FinishReason::Error,
             other => FinishReason::Other(other.to_string()),
         }
     }
@@ -138,6 +143,7 @@ impl FinishReason {
             FinishReason::Length => "length",
             FinishReason::ToolCalls => "tool_calls",
             FinishReason::ContentFilter => "content_filter",
+            FinishReason::Error => "error",
             FinishReason::Other(s) => s,
         }
     }

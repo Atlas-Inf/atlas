@@ -401,6 +401,17 @@ pub struct ServeArgs {
     #[arg(long, default_value = "default")]
     pub lm_head_dtype: String,
 
+    /// Full-attention Q/K/V/O projection precision: `default` = the loader's
+    /// choice (BF16-shipped projections are runtime-quantized to NVFP4 at
+    /// load), `bf16` = keep checkpoint BF16 (the BF16 Q/K/V are resident
+    /// anyway; O keeps a BF16 copy; decode/prefill use the dense GEMV/GEMM
+    /// arms), `nvfp4` = force the quantized arms (today identical to
+    /// `default`). Quality lever in the spirit of --lm-head-dtype: 4-bit q/k
+    /// perturbations reroute attention on long prompts (see the
+    /// ATLAS_ATTN_W4A4 note in the prefill path). Quality-gate per model.
+    #[arg(long, default_value = "default")]
+    pub attn_proj_dtype: String,
+
     /// Boundary attention layers to keep at BF16 KV cache precision (first N + last N).
     /// Protects attention sink tokens (early layers) and output quality (final layers)
     /// from quantization error while saving memory on middle layers.

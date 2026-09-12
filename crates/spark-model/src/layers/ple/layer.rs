@@ -17,45 +17,9 @@ use crate::layers::ngram_embed::NgramTable;
 use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
-/// Per-SEQUENCE carry: the dilated conv's 9 steps and the token history the
-/// id hash needs. Owned by the sequence's [`crate::layer::SsmLayerState`]
-/// (Avarok #753 item B: concurrency needs one of these per in-flight
-/// sequence, not a layer singleton).
-pub struct PleSeqState {
-    /// `[(k-1)*dilation, channels]` FP32, device.
-    conv: DevicePtr,
-    /// The last `context_len` token ids, EOS-filled at a sequence start.
-    history: Vec<u32>,
-    /// Set by `prestage`: the n-gram table's device VA, recorded when the
-    /// step's host work (hash + fault-in + slot upload) already ran BEFORE
-    /// graph replay/capture. `forward` consumes it and enqueues kernels only.
-    prestaged_va: Option<u64>,
-    /// How many token rows `prestaged_va` was staged for. A verify step
-    /// stages K of them; a decode step stages 1. `forward` consumes the
-    /// staging only when this matches its own `num_tokens` — a K=1 staging
-    /// consumed by a K=2 forward would gather one row and read the second
-    /// from whatever followed it.
-    prestaged_n: usize,
-    /// Per-row conv snapshots for the speculative verify in flight, slot `t`
-    /// holding the state after `t` rows (slot 0 = before the window). The
-    /// conv carry advances once per token and is NOT part of the SSM
-    /// checkpoint set, so a partially accepted verify would otherwise leave
-    /// it conditioned on rejected drafts — the n-gram injection for every
-    /// later token then reads a history that never happened.
-    verify_snaps: DevicePtr,
-    /// Rows with a valid snapshot. 0 = none (a prefill-width forward skips
-    /// the per-row split), so a rollback then has nothing to restore.
-    verify_snap_rows: usize,
-    /// `history` as it stood before the window, plus the window's ids —
-    /// together these rebuild the history for any accepted prefix.
-    history_ckpt: Vec<u32>,
-    verify_tokens: Vec<u32>,
-    /// The last VA `prestage` staged, never cleared. `rearm` restores it when
-    /// a failed capture attempt re-runs the step eagerly: the slots are still
-    /// in `slots_dev` and history has already advanced, so re-hashing would
-    /// double-count the token — re-arming is the only correct recovery.
-    last_staged_va: u64,
-}
+#[path = "seq_state.rs"]
+mod seq_state;
+pub use seq_state::PleSeqState;
 
 /// Verify windows this layer can roll back: slot `t` = state after `t` rows,
 /// so K rows need K+1 slots. K is `num_drafts + 1` and the batched MoE arms
@@ -110,6 +74,13 @@ pub struct PleLayer {
     out: DevicePtr,
     slots_dev: DevicePtr,
     max_tokens: usize,
+    /// Event recorded after the gather kernel (see `gather_embed`), so
+    /// `release_prev_pins` waits on THAT kernel instead of the whole stream.
+    /// 0 until lazily created; 0 falls back to a full stream sync.
+    gather_done: std::sync::Mutex<u64>,
+    /// Pinned staging for the slot upload: (host pointer as usize, capacity
+    /// in bytes). (0, 0) until the first `Cached` gather grows it.
+    slots_staging: std::sync::Mutex<(usize, usize)>,
 }
 
 impl PleLayer {
@@ -186,6 +157,8 @@ impl PleLayer {
             out: gpu.alloc(max_tokens * c * 4)?,
             slots_dev: gpu.alloc(max_tokens * heads * 4)?,
             max_tokens,
+            gather_done: std::sync::Mutex::new(0),
+            slots_staging: std::sync::Mutex::new((0, 0)),
         })
     }
 

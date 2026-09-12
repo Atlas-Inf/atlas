@@ -447,6 +447,27 @@ impl GpuBackend for AtlasCudaBackend {
     fn destroy_event(&self, event: u64) -> Result<()> {
         self.destroy_event_cu(event)
     }
+    fn event_create(&self) -> Result<u64> {
+        self.create_event_cu()
+    }
+    fn event_record(&self, event: u64, stream: u64) -> Result<()> {
+        self.record_event_cu(event, stream)
+    }
+    fn event_synchronize_on_stream(&self, event: u64, stream: u64) -> Result<()> {
+        // Handle 0 = no event (create failed or unsupported): fall back to the
+        // full stream sync, which is the behaviour callers had before events.
+        if event == 0 {
+            let status = unsafe { cuStreamSynchronize(stream) };
+            if status != 0 {
+                bail!("cuStreamSynchronize failed: {}", cuda_error_text(status));
+            }
+            return Ok(());
+        }
+        self.event_synchronize_cu(event)
+    }
+    fn event_destroy(&self, event: u64) -> Result<()> {
+        self.destroy_event_cu(event)
+    }
     fn host_ptr_to_device(&self, host: *mut u8) -> Result<DevicePtr> {
         let mut dptr: u64 = 0;
         let status =

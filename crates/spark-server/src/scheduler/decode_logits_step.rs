@@ -532,7 +532,12 @@ pub fn process_decode_logits(
             // `decode_logits_content.rs` to keep this file ≤500 LoC.
             // `model` is threaded through so a watchdog rollback can
             // restore SSM recurrent state on hybrid models (Phase-C).
-            handle_content_token(a, model, sched);
+            if handle_content_token(a, model, sched) {
+                // A watchdog rolled back: `tok` came from the discarded
+                // context and `last_token` is the boundary token. Drop `tok`
+                // (no push / emit / EOS bookkeeping for it).
+                continue;
+            }
         }
 
         // Track <tool_call> token: once seen, legacy tool call requirement is satisfied.
@@ -966,7 +971,9 @@ pub fn process_decode_logits(
                 // so generation cannot resume straight back into the
                 // loop. Falls back to the hard stop when declined.
                 let min_keep = pattern_len * 3;
-                match rollback_to_boundary(a, min_keep, model, sched) {
+                // This detector runs AFTER the step pushed `tok`, which the
+                // model has not decoded yet (`unfed_tail = 1`).
+                match rollback_to_boundary(a, min_keep, model, sched, 1) {
                     RollbackOutcome::RolledBack { dropped } => {
                         tracing::warn!(
                             pattern_len,
