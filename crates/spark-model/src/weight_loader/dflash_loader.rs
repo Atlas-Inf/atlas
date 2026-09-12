@@ -130,14 +130,12 @@ fn default_block_size() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DflashSubConfig {
     /// Token id used to fill the γ "to-be-predicted" positions during draft
-    /// inference. `248070` for Qwen3.6-DFlash.
+    /// inference. `248070` for Qwen3.6-DFlash and Qwen3.8-DFlash2.
     pub mask_token_id: u32,
     /// Target-model layer indices to capture intermediate hidden states from.
-    /// `[1, 10, 19, 28, 37]` for Qwen3.6-35B-A3B-DFlash. Order matters:
-    /// shallow-to-deep concatenation is what `fc` expects.
+    /// `[1, 10, 19, 28, 37]` for Qwen3.6-35B-A3B-DFlash; `[5, 19, 33, 47, 61]` for Qwen3.8-27B.
     pub target_layer_ids: Vec<usize>,
     /// When `Some(true)`, every drafter layer uses causal γ-block attention.
-    /// Lightning DSpark sets this; Qwen-DFlash leaves it unset (bidirectional).
     #[serde(default)]
     pub causal: Option<bool>,
     /// Force sliding-window attention on every drafter layer.
@@ -159,43 +157,73 @@ pub struct DflashSubConfig {
     pub confidence_head: Option<bool>,
     #[serde(default, alias = "dspark_adaptive", alias = "adaptive_verification")]
     pub adaptive: Option<bool>,
+    /// DFlash2 nested block size γ (typically 8).
+    #[serde(default)]
+    pub block_size: Option<usize>,
+    /// Channels sharing a dynamic convolution kernel in DFlash2 (16).
+    #[serde(default)]
+    pub conv_group_size: Option<usize>,
+    /// Convolution kernel size in DFlash2 (2 taps).
+    #[serde(default)]
+    pub conv_kernel_size: Option<usize>,
+    /// Codebook embedding rank in DFlash2 CandidateSelector (256).
+    #[serde(default)]
+    pub selector_rank: Option<usize>,
+    /// Candidate pool size evaluated by DFlash2 CandidateSelector (16).
+    #[serde(default)]
+    pub selector_top_k: Option<usize>,
+}
+
+impl DflashConfig {
+    pub fn block_size(&self) -> usize {
+        self.dflash_config
+            .as_ref()
+            .and_then(|c| c.block_size)
+            .unwrap_or(self.block_size)
+    }
+
+    pub fn is_dflash2(&self) -> bool {
+        self.architectures
+            .as_deref()
+            .map(|a| a.iter().any(|name| name == "DFlash2DraftModel"))
+            .unwrap_or(false)
+    }
+}
+
+/// DFlash2 2-tap grouped dynamic convolution weights.
+#[derive(Clone)]
+pub struct DflashConvWeights {
+    pub base_kernel: DenseWeight,
+    pub kernel_projection: DenseWeight,
+}
+
+/// DFlash2 bilinear candidate selector weights.
+#[derive(Clone)]
+pub struct DflashCandidateSelectorWeights {
+    pub hidden_projection: DenseWeight,
+    pub predecessor_codebook: DenseWeight,
+    pub successor_codebook: DenseWeight,
+    pub rank: usize,
+    pub top_k: usize,
 }
 
 /// Raw weight bundle for the DFlash drafter, post-load.
-///
-/// Verified against `z-lab/Qwen3.6-35B-A3B-DFlash` (commit 42d3b34, May 2026):
-/// the checkpoint ships 91 BF16 tensors — `fc.weight`, `hidden_norm.weight`,
-/// `norm.weight`, plus 11 weights per drafter layer × 8 layers. **No
-/// `embed_tokens` or `lm_head` are in the checkpoint** — the drafter shares
-/// the target's embedding and LM head at construction time. This matches the
-/// vLLM PR #40898 flow: when those keys are absent, vLLM's `AutoWeightsLoader`
-/// adds them to `skip_substrs`, leaving the runtime to slot in the target's
-/// pointers.
 #[allow(dead_code)]
 pub struct DflashWeights {
     pub config: DflashConfig,
-
-    /// `[draft_hidden, len(target_layer_ids) * target_hidden]`.
-    /// Qwen3.6-35B-A3B-DFlash: `[2048, 10240]`.
     pub fc: DenseWeight,
-    /// `[draft_hidden]` — RMSNorm applied to the projected target context
-    /// before mixing with token embeddings.
     pub hidden_norm: DenseWeight,
-    /// `[draft_hidden]` — final RMSNorm before LM head.
     pub norm: DenseWeight,
-
     pub layers: Vec<DflashLayerWeights>,
     pub draft_id_to_target_id: Option<Vec<i64>>,
-    /// DSpark Markov embedding `[vocab, rank]` BF16. None for DFlash-only.
     pub markov_w1: Option<DenseWeight>,
-    /// DSpark Markov projection `[vocab, rank]` BF16 (NVFP4 dequanted).
     pub markov_w2: Option<DenseWeight>,
     pub markov_rank: usize,
-    /// Optional drafter-owned embed. None → share the target's.
     pub embed_tokens: Option<DenseWeight>,
+    pub candidate_selector: Option<DflashCandidateSelectorWeights>,
 }
 
-/// Per-drafter-layer raw weights (BF16). Same shape across all 8 layers.
+/// Per-drafter-layer raw weights (BF16).
 #[allow(dead_code)]
 pub struct DflashLayerWeights {
     pub input_layernorm: DenseWeight,
@@ -209,9 +237,9 @@ pub struct DflashLayerWeights {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
-    /// Per-q-head FlashAttention sink logits `[num_q_heads]` BF16.
-    /// None when the checkpoint has no sink tensor (Qwen-DFlash).
     pub attention_sink_bias: Option<DenseWeight>,
+    pub attention_conv: Option<DflashConvWeights>,
+    pub mlp_conv: Option<DflashConvWeights>,
 }
 
 /// Probe a [`WeightStore`] for the presence of DFlash drafter weights.
@@ -314,6 +342,30 @@ pub fn load_dflash_weights(
         } else {
             None
         };
+        let attn_conv_base = format!("{lp}.attention_conv.base_kernel");
+        let attn_conv_proj = format!("{lp}.attention_conv.kernel_projection.weight");
+        let attention_conv =
+            if drafter_store.contains(&attn_conv_base) && drafter_store.contains(&attn_conv_proj) {
+                Some(DflashConvWeights {
+                    base_kernel: dense_auto(drafter_store, &attn_conv_base, gpu)?,
+                    kernel_projection: dense_auto(drafter_store, &attn_conv_proj, gpu)?,
+                })
+            } else {
+                None
+            };
+
+        let mlp_conv_base = format!("{lp}.mlp_conv.base_kernel");
+        let mlp_conv_proj = format!("{lp}.mlp_conv.kernel_projection.weight");
+        let mlp_conv =
+            if drafter_store.contains(&mlp_conv_base) && drafter_store.contains(&mlp_conv_proj) {
+                Some(DflashConvWeights {
+                    base_kernel: dense_auto(drafter_store, &mlp_conv_base, gpu)?,
+                    kernel_projection: dense_auto(drafter_store, &mlp_conv_proj, gpu)?,
+                })
+            } else {
+                None
+            };
+
         let layer = DflashLayerWeights {
             input_layernorm: dense_auto(
                 drafter_store,
@@ -335,6 +387,8 @@ pub fn load_dflash_weights(
             up_proj: dense_auto(drafter_store, &format!("{lp}.mlp.up_proj.weight"), gpu)?,
             down_proj: dense_auto(drafter_store, &format!("{lp}.mlp.down_proj.weight"), gpu)?,
             attention_sink_bias,
+            attention_conv,
+            mlp_conv,
         };
         layers.push(layer);
     }
@@ -365,6 +419,28 @@ pub fn load_dflash_weights(
             (None, None, 0)
         };
 
+    let sub = drafter_config.dflash_config.as_ref();
+    let cs_proj_name = format!("{prefix}candidate_selector.hidden_projection.weight");
+    let cs_pred_name = format!("{prefix}candidate_selector.predecessor_codebook");
+    let cs_succ_name = format!("{prefix}candidate_selector.successor_codebook");
+    let candidate_selector = if drafter_store.contains(&cs_proj_name)
+        && drafter_store.contains(&cs_pred_name)
+        && drafter_store.contains(&cs_succ_name)
+    {
+        let rank = sub.and_then(|c| c.selector_rank).unwrap_or(256);
+        let top_k = sub.and_then(|c| c.selector_top_k).unwrap_or(16);
+        tracing::info!("DFlash2 candidate selector loaded: rank={rank}, top_k={top_k}");
+        Some(DflashCandidateSelectorWeights {
+            hidden_projection: dense_auto(drafter_store, &cs_proj_name, gpu)?,
+            predecessor_codebook: dense_auto(drafter_store, &cs_pred_name, gpu)?,
+            successor_codebook: dense_auto(drafter_store, &cs_succ_name, gpu)?,
+            rank,
+            top_k,
+        })
+    } else {
+        None
+    };
+
     let embed_name = format!("{prefix}embed_tokens.weight");
     let embed_tokens = if drafter_store.contains(&embed_name) {
         Some(dense_auto(drafter_store, &embed_name, gpu)?)
@@ -372,7 +448,6 @@ pub fn load_dflash_weights(
         None
     };
 
-    let sub = drafter_config.dflash_config.as_ref();
     if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight"))
         && fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8
         && fc_meta.shape.len() == 2
@@ -385,11 +460,11 @@ pub fn load_dflash_weights(
         );
     }
     tracing::info!(
-        "DFlash/DSpark drafter loaded: {} layers, hidden={}, vocab={}, γ={}, markov_rank={}, own_embed={}, causal={:?}, swa={:?}/{:?}, sinks={}/{}, target_layers={:?}",
+        "DFlash/DSpark drafter loaded: {} layers, hidden={}, vocab={}, γ={}, markov_rank={}, own_embed={}, causal={:?}, swa={:?}/{:?}, sinks={}/{}, candidate_selector={}, target_layers={:?}",
         layers.len(),
         drafter_config.hidden_size,
         drafter_config.vocab_size,
-        drafter_config.block_size,
+        drafter_config.block_size(),
         markov_rank,
         embed_tokens.is_some(),
         sub.and_then(|c| c.causal),
@@ -397,6 +472,7 @@ pub fn load_dflash_weights(
         sub.and_then(|c| c.swa_window_size),
         sink_layers,
         layers.len(),
+        candidate_selector.is_some(),
         sub.map(|c| c.target_layer_ids.as_slice()).unwrap_or(&[]),
     );
 
@@ -411,65 +487,10 @@ pub fn load_dflash_weights(
         markov_w2,
         markov_rank,
         embed_tokens,
+        candidate_selector,
     }))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Smoke-test the DFlash drafter `config.json` parser against the live
-    /// `z-lab/Qwen3.6-35B-A3B-DFlash` checkpoint downloaded into the user's
-    /// HF cache. Skipped when the cache directory isn't populated — keeps
-    /// CI hermetic. Asserts the locked drafter dimensions: 8 layers,
-    /// hidden=2048, vocab=248320, γ=16, mask=248070, layer_ids=[1,10,19,28,37].
-    #[test]
-    fn parse_qwen3_6_35b_dflash_config() {
-        const SNAP: &str = "/workspace/.cache/huggingface/hub/models--z-lab--Qwen3.6-35B-A3B-DFlash/snapshots/42d3b34d588423cdae7ba8f53a8cf7789346a719/config.json";
-        let json = match std::fs::read_to_string(SNAP) {
-            Ok(s) => s,
-            Err(_) => {
-                tracing::warn!("Skipping: drafter snapshot not in cache");
-                return;
-            }
-        };
-        let config = parse_dflash_config(&json).expect("parse drafter config");
-        assert_eq!(config.num_hidden_layers, 8);
-        assert_eq!(config.hidden_size, 2048);
-        assert_eq!(config.intermediate_size, 6144);
-        assert_eq!(config.num_attention_heads, 32);
-        assert_eq!(config.num_key_value_heads, 4);
-        assert_eq!(config.head_dim, 128);
-        assert_eq!(config.vocab_size, 248320);
-        assert!(!config.tie_word_embeddings);
-        assert_eq!(config.block_size, 16);
-        let sub = config.dflash_config.expect("dflash_config present");
-        assert_eq!(sub.mask_token_id, 248070);
-        assert_eq!(sub.target_layer_ids, vec![1, 10, 19, 28, 37]);
-    }
-
-    #[test]
-    fn parse_lightning_dspark_config() {
-        let json = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../test_data/lightning_dspark_config.json"
-        ));
-        let config = parse_dflash_config(json).expect("parse Lightning DSpark config");
-        assert_eq!(config.num_hidden_layers, 6);
-        assert_eq!(config.hidden_size, 2688);
-        assert_eq!(config.intermediate_size, 6144);
-        assert_eq!(config.num_attention_heads, 32);
-        assert_eq!(config.num_key_value_heads, 2);
-        assert_eq!(config.head_dim, 128);
-        assert_eq!(config.vocab_size, 131072);
-        assert_eq!(config.block_size, 8);
-        assert_eq!(config.markov_rank, Some(512));
-        let sub = config.dflash_config.expect("dflash_config present");
-        assert_eq!(sub.mask_token_id, 990);
-        assert_eq!(sub.target_layer_ids, vec![1, 5, 19, 29, 41, 51]);
-        assert_eq!(sub.causal, Some(true));
-        assert_eq!(sub.use_swa, Some(true));
-        assert_eq!(sub.swa_window_size, Some(1024));
-        assert_eq!(sub.attention_sink_bias, Some(true));
-    }
-}
+#[path = "dflash_loader_tests.rs"]
+mod tests;

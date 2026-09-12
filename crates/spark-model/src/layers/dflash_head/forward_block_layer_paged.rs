@@ -196,6 +196,25 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
 
+        if let Some(ref conv) = layer.attention_conv {
+            conv.prepare(
+                gpu,
+                self.kernels.dense_gemm_pipelined,
+                self.kernels.dflash2_conv,
+                scratch.norm_buf,
+                scratch.dflash2_conv_delta,
+                scratch.dflash2_conv_out,
+                g,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                scratch.dflash2_conv_out,
+                scratch.norm_buf,
+                (g * h * 2) as usize,
+                stream,
+            )?;
+        }
+
         // id259 per-layer dump: post-input_norm (γ × h).
         if args.block_dump {
             self.block_dump_buf(ctx, scratch.norm_buf, layer_idx, "input_norm", g, h, stream)?;
@@ -840,6 +859,25 @@ impl BlockDiffusionDraftHead {
             q_dim,
         )?;
 
+        if let Some(ref conv) = layer.attention_conv {
+            let output_delta = scratch.dflash2_conv_delta.offset(2 * conv.num_groups * 2);
+            conv.finish(
+                gpu,
+                self.kernels.dflash2_conv,
+                scratch.stream_acc,
+                output_delta,
+                scratch.dflash2_conv_out,
+                g,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                scratch.dflash2_conv_out,
+                scratch.stream_acc,
+                (g * h * 2) as usize,
+                stream,
+            )?;
+        }
+
         // 3h. First residual add: hidden = residual + attn_output.
         // dflash.py:138  hidden_states = residual + hidden_states
         //   stream_buf (residual = pre-3a noise hidden states)
@@ -871,6 +909,25 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
+
+        if let Some(ref conv) = layer.mlp_conv {
+            conv.prepare(
+                gpu,
+                self.kernels.dense_gemm_pipelined,
+                self.kernels.dflash2_conv,
+                scratch.norm_buf,
+                scratch.dflash2_conv_delta,
+                scratch.dflash2_conv_out,
+                g,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                scratch.dflash2_conv_out,
+                scratch.norm_buf,
+                (g * h * 2) as usize,
+                stream,
+            )?;
+        }
 
         // 3j. MLP: gate_proj + up_proj + silu_mul + down_proj — γ rows.
         // dflash.py:141  hidden_states = self.mlp(hidden_states)
@@ -914,6 +971,25 @@ impl BlockDiffusionDraftHead {
             h,
             inter,
         )?;
+
+        if let Some(ref conv) = layer.mlp_conv {
+            let output_delta = scratch.dflash2_conv_delta.offset(2 * conv.num_groups * 2);
+            conv.finish(
+                gpu,
+                self.kernels.dflash2_conv,
+                scratch.stream_acc,
+                output_delta,
+                scratch.dflash2_conv_out,
+                g,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                scratch.dflash2_conv_out,
+                scratch.stream_acc,
+                (g * h * 2) as usize,
+                stream,
+            )?;
+        }
 
         // 3k. Second residual add: hidden = (residual + attn) + mlp_output.
         // dflash.py:142  hidden_states = residual + hidden_states

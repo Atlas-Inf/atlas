@@ -218,7 +218,8 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
     // Only an explicit flag is checked: an omitted --num-drafts resolves
     // against MODEL.toml later, and a model default is inert without a
     // speculative method rather than a user error.
-    let any_spec = args.speculative || args.self_speculative || args.ngram_speculative;
+    let any_spec =
+        args.speculative || args.self_speculative || args.ngram_speculative || args.dflash;
     if let Some(num_drafts) = args.num_drafts
         && num_drafts > 1
         && !any_spec

@@ -52,6 +52,9 @@ fn zero_scratch() -> DflashScratch {
         markov_prev_dev: DevicePtr(0),
         markov_prev_host_pinned: Default::default(),
         position_ids: DevicePtr(0),
+        dflash2_conv_delta: DevicePtr(0),
+        dflash2_conv_out: DevicePtr(0),
+        dflash2_projected_hidden: DevicePtr(0),
     }
 }
 
@@ -89,6 +92,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         markov_rank: 0,
         draft_id_to_target_id: None,
         layers: Vec::new(),
+        candidate_selector: None,
         fused_kv_weight: None,
         kv_cache: parking_lot::Mutex::new(zero_kv_cache()),
         scratch: zero_scratch(),
@@ -173,6 +177,8 @@ fn zero_kernels() -> DflashKernels {
         w4a16_gemv_batch8: zero,
         w4a16_gemv_batch16: zero,
         w4a16_gemv_batch32: zero,
+        dflash2_conv: None,
+        dflash2_candidate_selector: None,
     }
 }
 
