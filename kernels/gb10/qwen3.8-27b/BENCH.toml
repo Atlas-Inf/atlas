@@ -23,7 +23,7 @@
 
 [[benchmarks]]
 quant = "nvfp4"
-checkpoint = "unsloth/Qwen3.8-27B-NVFP4"
+checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "agentic-webserver"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
 label = "Qwen3.8-27B dense (NVFP4, unsloth)"
@@ -106,7 +106,7 @@ min = 10.0
 
 [[benchmarks]]
 quant = "nvfp4"
-checkpoint = "unsloth/Qwen3.8-27B-NVFP4"
+checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "bfcl-subset"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth-bfcl"
 label = "Qwen3.8-27B dense (NVFP4, unsloth)"
@@ -187,7 +187,7 @@ noise = 0.4
 
 [[benchmarks]]
 quant = "nvfp4"
-checkpoint = "unsloth/Qwen3.8-27B-NVFP4"
+checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "decode-floor"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
 label = "Qwen3.8-27B dense (NVFP4, unsloth)"
@@ -231,10 +231,10 @@ noise = 0.5
 # The driver emits the MINIMUM completion_tokens across the 3 runs, so this
 # floor means "every run decoded at least 750 of the 1500 budget" — the same
 # vacuity pin the driver enforces (MIN_OUTPUT_TOKENS), restated where the
-# gate can see it. 750, not 1200: the calibrated instrument's natural stop
-# is a deterministic 915 tokens, and a pin above the instrument's own
-# reference behaviour would fail every honest run.
-min = 750.0
+# gate can see it. 700, not 1200: the served subject (nvidia/Qwen3.8-27B-NVFP4)
+# stops at a deterministic 717-718 tokens, and a pin above the instrument's
+# own reference behaviour would fail every honest run.
+min = 700.0
 
 [benchmarks.metrics.runs]
 # EXACT pin, like the BFCL draw size: a different run count is a different
@@ -266,7 +266,7 @@ max = 3.0
 
 [[benchmarks]]
 quant = "nvfp4"
-checkpoint = "unsloth/Qwen3.8-27B-NVFP4"
+checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "concurrency-sweep"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
 label = "Qwen3.8-27B dense (NVFP4, unsloth)"
@@ -491,7 +491,7 @@ max = 0.0
 
 [[benchmarks]]
 quant = "nvfp4"
-checkpoint = "unsloth/Qwen3.8-27B-NVFP4"
+checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "vision-fidelity"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
 label = "Qwen3.8-27B dense (NVFP4, unsloth)"
@@ -615,7 +615,7 @@ min = 1.0
 
 [[benchmarks]]
 quant = "nvfp4"
-checkpoint = "unsloth/Qwen3.8-27B-NVFP4"
+checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "video-fidelity"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
 label = "Qwen3.8-27B dense (NVFP4, unsloth)"
