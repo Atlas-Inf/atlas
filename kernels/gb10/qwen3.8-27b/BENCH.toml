@@ -25,7 +25,7 @@
 quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "agentic-webserver"
-recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
+recipe = "qwen3.8/qwen3.8-27b-nvfp4-agentic"
 label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 # NOT the default: the required Gate A subject stays the 35B MoE flagship
 # (qwen3.6-35b-a3b/BENCH.toml), whose recorded history is untouched. This
@@ -108,7 +108,7 @@ min = 10.0
 quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "bfcl-subset"
-recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth-bfcl"
+recipe = "qwen3.8/qwen3.8-27b-nvfp4-bfcl"
 label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 # THE REQUIRED bfcl-subset SUBJECT as of 2026-08-15 (flipped from Qwen3.6-27B per
 # maintainer: 3.6 is no longer worth requiring on every PR). The 3.6 entry in
@@ -145,7 +145,7 @@ max = 995.0
 
 [benchmarks.metrics.overall_accuracy]
 # Measured 84.22 (2026-08-14, dgx1, golden draw n=995 seed 42, temp 0,
-# recipe qwen3.8/qwen3.8-27b-nvfp4-unsloth-bfcl). Bar set at the measured
+# recipe qwen3.8/qwen3.8-27b-nvfp4-bfcl). Bar set at the measured
 # value less the documented +-0.4 MTP-nondeterminism noise floor.
 min = 83.82
 noise = 0.4
@@ -189,7 +189,7 @@ noise = 0.4
 quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "decode-floor"
-recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
+recipe = "qwen3.8/qwen3.8-27b-nvfp4-agentic"
 label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 default = true
 status = "measured"
@@ -266,7 +266,7 @@ max = 3.0
 quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "concurrency-sweep"
-recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
+recipe = "qwen3.8/qwen3.8-27b-nvfp4-agentic"
 label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 default = true
 status = "measured"
@@ -491,7 +491,7 @@ max = 0.0
 quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "vision-fidelity"
-recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
+recipe = "qwen3.8/qwen3.8-27b-nvfp4-agentic"
 label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 default = false
 status = "measured"
@@ -615,7 +615,7 @@ min = 1.0
 quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "video-fidelity"
-recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
+recipe = "qwen3.8/qwen3.8-27b-nvfp4-agentic"
 label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 # `default = false` since 2026-08-15: qwen3.6-27b owns this gate's required
 # subject. Not a demotion of the checkpoint and not a lowered bar -- the
