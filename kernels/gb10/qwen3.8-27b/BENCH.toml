@@ -26,7 +26,7 @@ quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "agentic-webserver"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
-label = "Qwen3.8-27B dense (NVFP4, unsloth)"
+label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 # NOT the default: the required Gate A subject stays the 35B MoE flagship
 # (qwen3.6-35b-a3b/BENCH.toml), whose recorded history is untouched. This
 # variant runs via `--checkpoint unsloth/Qwen3.8-27B-NVFP4`, or from the TUI's
@@ -109,7 +109,7 @@ quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "bfcl-subset"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth-bfcl"
-label = "Qwen3.8-27B dense (NVFP4, unsloth)"
+label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 # THE REQUIRED bfcl-subset SUBJECT as of 2026-08-15 (flipped from Qwen3.6-27B per
 # maintainer: 3.6 is no longer worth requiring on every PR). The 3.6 entry in
 # kernels/gb10/qwen3.6-27b/BENCH.toml is now default = false — see the consequence
@@ -190,32 +190,30 @@ quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "decode-floor"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
-label = "Qwen3.8-27B dense (NVFP4, unsloth)"
+label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 default = true
 status = "measured"
 note = """\
-CALIBRATED 2026-08-15, dgx1, this branch's binary: n=12 runs across 4 driver \
-passes, every run 28.0-28.1 tok/s, mean 28.03, sigma ~0.05. Fingerprint (the \
-instrument these bounds belong to): the DRIVER'S OWN MinHeap fixture, \
-per-request reasoning_effort "none", temperature 0, seed 0, max_tokens 1500 \
-with a deterministic 915-token natural stop, K4 num_drafts=3 (the recipe \
-pins num_drafts: 3), accepted 569/915 per run, serve --max-batch-size 32 \
---gpu-memory-utilization 0.85 (the stock recipe serve). ★ SUPERSEDED BASIS, \
-kept for the history: the previous floor (29.0, noise 1.0) came from an n=3 \
-basis of 31.5/29.6/30.5 (median 30.5), 2026-08-15 — measured with a \
-DIFFERENT instrument (batch-1 serve, an ad-hoc probe prompt, not the \
-driver's fixture). Mechanism of the shift: different fixture + serve config \
-moved the LEVEL by -2.4 tok/s while run-to-run sigma on the fixed instrument \
-is 0.05 — an instrument change, not a regression. The gate is calibrated to \
-ITS OWN instrument; never mix bases, and never ratchet from a best run. \
-★ The gate serve needs NO operator flags for thinking: thinking-off arrives \
-per-request (reasoning_effort "none" in the body — honored since the \
-medium-default change), NOT from the recipe, so the stock recipe serve is \
-the correct subject. ★ The accept pin depends on the accept-stats \
-instrumentation (real accepted_prediction_tokens in usage); a binary \
-without it reports INCONCLUSIVE by name, which is correct — a floor \
-measured without proof of speculative engagement is the 2026-08-15 decode \
-flip-flop all over again."""
+CALIBRATED 2026-08-15 on unsloth/Qwen3.8-27B-NVFP4 (dgx1): n=12 across 4 driver \
+passes, every run 28.0-28.1 tok/s, mean 28.03, sigma ~0.05. Fingerprint: the \
+DRIVER'S OWN MinHeap fixture, per-request reasoning_effort "none", temperature \
+0, seed 0, max_tokens 1500, K4 num_drafts=3, serve --max-batch-size 32 \
+--gpu-memory-utilization 0.85 (the stock recipe serve). ★ 2026-09-11/12 RE-BASED \
+on the CURRENT subject, nvidia/Qwen3.8-27B-NVFP4 (reiner, GB10, driver \
+580.126.09, 4 driver passes = 12 runs): per-run 26.1-27.1 tok/s, median \
+26.1-26.3, sigma ~0.36; natural stop 717-718 of the 1500 budget against \
+unsloth's 915 — which is why MIN_OUTPUT_TOKENS moved to 700; accept_len_mean \
+2.77. The rate floor is RETAINED at 21.0 (mean minus ~5, far outside the ~0.4 \
+sigma band) rather than ratcheted: a tighter floor is derivable from this basis \
+but has not been agreed. ★ The checkpoint moved because the unsloth build keeps \
+BOTH an FP8 copy (prefill GEMM) and an NVFP4 copy (decode) for its 303 ignored \
+modules — 29.98 GB of layer construction against 15.85 GB — and at this serve \
+that is 59.5 GB pre-KV + 43.0 GB reserve against a 101.7 GB budget, i.e. it \
+cannot serve at all. ★ The gate serve needs NO operator flags for thinking: \
+thinking-off arrives per-request (reasoning_effort "none" in the body), NOT from \
+the recipe. ★ The accept pin depends on the accept-stats instrumentation (real \
+accepted_prediction_tokens in usage); a binary without it reports INCONCLUSIVE \
+by name, which is correct."""
 
 [benchmarks.metrics.server_decode_tok_s]
 # Median-of-3 server decode rate, judged against the 12-run calibration:
@@ -269,7 +267,7 @@ quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "concurrency-sweep"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
-label = "Qwen3.8-27B dense (NVFP4, unsloth)"
+label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 default = true
 status = "measured"
 note = """\
@@ -494,7 +492,7 @@ quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "vision-fidelity"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
-label = "Qwen3.8-27B dense (NVFP4, unsloth)"
+label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 default = false
 status = "measured"
 note = """\
@@ -618,7 +616,7 @@ quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "video-fidelity"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-unsloth"
-label = "Qwen3.8-27B dense (NVFP4, unsloth)"
+label = "Qwen3.8-27B dense (NVFP4, nvidia)"
 # `default = false` since 2026-08-15: qwen3.6-27b owns this gate's required
 # subject. Not a demotion of the checkpoint and not a lowered bar -- the
 # thresholds below are unchanged and this entry is still measured whenever it
