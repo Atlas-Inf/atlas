@@ -297,27 +297,19 @@ impl Qwen3SsmLayer {
                 }
                 // FP4 batched QKVZ: ONE NVFP4 weight pass for all n seqs
                 // (sequential layout writes the deinterleaved buffer directly).
-                _ => {
-                    // w4a16_gemv_batch16 is a MAX_M=16 template: at M>16 it
-                    // silently computes rows 0..15 and never writes rows 16..
-                    // — garbage, not a crash. The eligibility gate makes this
-                    // arm unreachable at n>16 today; fail fast if that drifts.
-                    anyhow::ensure!(
-                        n <= 16,
-                        "SSM batchm QKVZ GEMV caps at M=16 (n={n}); tile-GEMM twins required"
-                    );
-                    ops::w4a16_gemv_batchm(
-                        ctx.gpu,
-                        fp4_gemv_batch_k,
-                        normed_base,
-                        nvfp4,
-                        deinterleaved,
-                        n as u32,
-                        qkvz_size as u32,
-                        h as u32,
-                        stream,
-                    )?
-                }
+                // `ssm_fp4_proj` takes the W4A8 DP4A arm first at n==4.
+                _ => self.ssm_fp4_proj(
+                    ctx,
+                    "QKVZ",
+                    fp4_gemv_batch_k,
+                    normed_base,
+                    nvfp4,
+                    deinterleaved,
+                    n as u32,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?,
             }
         } else {
             ops::dense_gemm(
@@ -443,26 +435,19 @@ impl Qwen3SsmLayer {
                 // FP4 batched out_proj: ONE NVFP4 weight pass for all n seqs.
                 // (qkvz_nvfp4.is_some() ⇒ the NVFP4 SSM build, where
                 // ssm.out_proj is the NVFP4 weight the per-seq path uses.)
-                _ => {
-                    // Same MAX_M=16 template as the QKVZ arm — silent row
-                    // truncation above 16. Unreachable at n>16 today; fail
-                    // fast if the eligibility gate drifts.
-                    anyhow::ensure!(
-                        n <= 16,
-                        "SSM batchm out_proj GEMV caps at M=16 (n={n}); tile-GEMM twins required"
-                    );
-                    ops::w4a16_gemv_batchm(
-                        ctx.gpu,
-                        fp4_gemv_batch_k,
-                        normed_out_base,
-                        &self.ssm.out_proj,
-                        ssm_out_base,
-                        n as u32,
-                        h as u32,
-                        value_dim as u32,
-                        stream,
-                    )?
-                }
+                // `ssm_fp4_proj` takes the W4A8 DP4A arm first at n==4.
+                _ => self.ssm_fp4_proj(
+                    ctx,
+                    "out_proj",
+                    fp4_gemv_batch_k,
+                    normed_out_base,
+                    &self.ssm.out_proj,
+                    ssm_out_base,
+                    n as u32,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?,
             }
         }
         detail_step!("out_proj");

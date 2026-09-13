@@ -6,6 +6,7 @@ use super::*;
 
 mod ssm_batched;
 mod ssm_batched_recurrent;
+mod ssm_dp4a;
 
 /// Batched dense FFN for wide SSM decode batches: **ON by default**, disabled
 /// only by `ATLAS_NO_SSM_FFN_PREFILL=1`.

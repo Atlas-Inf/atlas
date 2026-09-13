@@ -34,6 +34,36 @@ pub fn dp4a_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("ATLAS_W4A16_DP4A").as_deref() == Ok("1"))
 }
 
+/// Eligibility for the guard-free M=4 DP4A batch4 GEMV arm. `m` must be
+/// EXACTLY 4: `w4a16_gemv_dp4a_batch4_d4` writes all four rows
+/// unconditionally, so dispatching at any other M would write rows the
+/// caller never asked for. Both kernel handles must be resolved and the
+/// int8 activation scratch must be non-null.
+pub fn dp4a_batch4_eligible(
+    m: u32,
+    enabled: bool,
+    quant_kernel: KernelHandle,
+    gemv_kernel: KernelHandle,
+    a_q: DevicePtr,
+    a_scale: DevicePtr,
+) -> bool {
+    m == 4
+        && enabled
+        && quant_kernel.0 != 0
+        && gemv_kernel.0 != 0
+        && !a_q.is_null()
+        && !a_scale.is_null()
+}
+
+/// One `tracing::info!` per process the first time any GDN/attention M=4
+/// DP4A arm dispatches — the serve-log proof the arm engaged.
+pub fn dp4a_arm_active_once() {
+    static ON: std::sync::Once = std::sync::Once::new();
+    ON.call_once(|| {
+        tracing::info!("GDN/attention W4A8 DP4A M=4 arm ACTIVE");
+    });
+}
+
 /// Quantize one BF16 activation row `[1, K]` to int8 `[1, K]` + per-16-group
 /// f32 scales `[K/16]` (symmetric block-q8_1, d = amax/127). Hoisted: call once
 /// per distinct activation, then feed `aq`/`a_scale` to one or more
@@ -201,4 +231,25 @@ pub fn w4a16_gemv_dp4a_dual_batch4(
         .arg_u32(n)
         .arg_u32(k)
         .launch(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dp4a_batch4_eligible_predicate() {
+        let k = KernelHandle(1);
+        let p = DevicePtr(1);
+        // All conditions met -> true.
+        assert!(dp4a_batch4_eligible(4, true, k, k, p, p));
+        // Each single negation -> false.
+        assert!(!dp4a_batch4_eligible(3, true, k, k, p, p));
+        assert!(!dp4a_batch4_eligible(5, true, k, k, p, p));
+        assert!(!dp4a_batch4_eligible(4, false, k, k, p, p));
+        assert!(!dp4a_batch4_eligible(4, true, KernelHandle(0), k, p, p));
+        assert!(!dp4a_batch4_eligible(4, true, k, KernelHandle(0), p, p));
+        assert!(!dp4a_batch4_eligible(4, true, k, k, DevicePtr::NULL, p));
+        assert!(!dp4a_batch4_eligible(4, true, k, k, p, DevicePtr::NULL));
+    }
 }
