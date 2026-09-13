@@ -28,6 +28,8 @@ mod mla_gemv;
 mod qkv;
 mod qkv_dp4a;
 mod qkv_fp8;
+#[cfg(test)]
+mod tests;
 
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]

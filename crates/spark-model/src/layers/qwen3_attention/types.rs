@@ -279,6 +279,14 @@ pub struct Qwen3AttentionLayer {
     /// 0-handles on targets lacking the kernels → float ladder unchanged.
     pub(super) dp4a_quant_batch4_k: KernelHandle,
     pub(super) dp4a_gemv_batch4_k: KernelHandle,
+    /// Strided-output GEMV variants (`*_os`): row t lands at
+    /// `C[t*C_stride + col]`. The K=4..8 QKV verify uses them to write each
+    /// projection straight into its interleaved `qkv_buf` slice, removing
+    /// the 3·M D2D scatter copies per layer. 0-handles → scratch+scatter
+    /// fallback unchanged.
+    pub(super) dp4a_gemv_batch4_os_k: KernelHandle,
+    pub(super) w4a16_gemv_batch4_os_k: KernelHandle,
+    pub(super) w4a16_gemv_batch8_os_k: KernelHandle,
     // Kernels — prefill (GEMM M=N + Flash Attention)
     pub(super) w4a16_gemm_k: KernelHandle,
     pub(super) w4a16_gemm_t_k: KernelHandle,

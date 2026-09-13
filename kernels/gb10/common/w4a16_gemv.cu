@@ -467,7 +467,8 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
     __nv_bfloat16* __restrict__ C,                // [M, N]
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int C_stride
 ) {
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
@@ -597,7 +598,7 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
         for (int t = 0; t < MAX_M; t++) {
             if ((unsigned int)t >= M) continue;
             float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
-            C[(unsigned long long)t * N + n] = __float2bfloat16(r);
+            C[(unsigned long long)t * C_stride + n] = __float2bfloat16(r);
         }
     }
 }
@@ -622,7 +623,7 @@ extern "C" __global__ void w4a16_gemv_batch2(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<2>(A, B_packed, B_scale, scale2, C, 2u, N, K);
+    w4a16_gemv_batchm_impl<2>(A, B_packed, B_scale, scale2, C, 2u, N, K, N);
 }
 
 // M==3 (K=3 spec verify, C=3 multi-seq decode, MoE forward_k3). Same story as
@@ -637,7 +638,7 @@ extern "C" __global__ void w4a16_gemv_batch3(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<3>(A, B_packed, B_scale, scale2, C, 3u, N, K);
+    w4a16_gemv_batchm_impl<3>(A, B_packed, B_scale, scale2, C, 3u, N, K, N);
 }
 
 // M<=4 (common-path batched decode) — sibling of w8a16_gemv_batch4.
@@ -651,7 +652,7 @@ extern "C" __global__ void w4a16_gemv_batch4(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_batchm_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, N);
 }
 
 // ── EXACT-M TIERS 5/6/7 ─────────────────────────────────────────────────────
@@ -709,7 +710,7 @@ extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch5(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<5>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_batchm_impl<5>(A, B_packed, B_scale, scale2, C, M, N, K, N);
 }
 
 extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch6(
@@ -722,7 +723,7 @@ extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch6(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<6>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_batchm_impl<6>(A, B_packed, B_scale, scale2, C, M, N, K, N);
 }
 
 extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch7(
@@ -735,7 +736,7 @@ extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch7(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<7>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_batchm_impl<7>(A, B_packed, B_scale, scale2, C, M, N, K, N);
 }
 
 // M<=8 (chain-verify K=5..8) — keeps M=5..8 projections on the
@@ -764,7 +765,41 @@ extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch8(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<8>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_batchm_impl<8>(A, B_packed, B_scale, scale2, C, M, N, K, N);
+}
+
+// Strided-output variants (`_os`): same bit-exact `w4a16_gemv_batchm_impl`
+// body, but output row `t` lands at `C[t*C_stride + n]` instead of
+// `C[t*N + n]`. The K=4..8 attention QKV verify path writes each projection
+// straight into its interleaved `qkv_buf` slice with these — removing the
+// 3·M D2D scatter copies per attention layer. The contiguous entry points
+// pass C_stride=N, so they are unchanged.
+extern "C" __global__ void w4a16_gemv_batch4_os(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int C_stride
+) {
+    w4a16_gemv_batchm_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, C_stride);
+}
+
+extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch8_os(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int C_stride
+) {
+    w4a16_gemv_batchm_impl<8>(A, B_packed, B_scale, scale2, C, M, N, K, C_stride);
 }
 
 // M<=16 (high-concurrency decode, n=5..16) — sibling of w8a16_gemv_batch16.
@@ -778,7 +813,7 @@ extern "C" __global__ void w4a16_gemv_batch16(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<16>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_batchm_impl<16>(A, B_packed, B_scale, scale2, C, M, N, K, N);
 }
 
 // M<=32 (native-bs32 batched propose, n=17..32) — same M-guarded template.
@@ -797,7 +832,7 @@ extern "C" __global__ void w4a16_gemv_batch32(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<32>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_batchm_impl<32>(A, B_packed, B_scale, scale2, C, M, N, K, N);
 }
 
 // ============================================================

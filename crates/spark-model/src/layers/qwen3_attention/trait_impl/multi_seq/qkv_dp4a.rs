@@ -82,6 +82,39 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
+    /// Strided-output twin of `dp4a_gemv_prequant` (`*_d4_os` kernel): the
+    /// K=4..8 QKV verify writes each projection straight into its
+    /// interleaved `qkv_buf` slice (`out_stride` in BF16 elements), removing
+    /// the per-row D2D scatter. Caller must have checked `dp4a_batch4_ready`
+    /// AND `dp4a_gemv_batch4_os_k` non-null.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dp4a_gemv_prequant_os(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        w_base: &QuantizedWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        out_stride: u32,
+    ) -> Result<()> {
+        ops::w4a16_gemv_dp4a_batch4_os(
+            c.fwd.gpu,
+            self.dp4a_gemv_batch4_os_k,
+            c.fwd.buffers.ffn_act_a(),
+            c.fwd.buffers.ffn_act_scale(),
+            w_base,
+            output,
+            m,
+            n,
+            k,
+            out_stride,
+            c.stream,
+        )?;
+        ops::dp4a_arm_active_once();
+        Ok(())
+    }
+
     /// Full M=4 arm for `wide_verify_gemm`: quantize `input`, run the DP4A
     /// GEMV. Returns `false` when the arm does not apply so the caller's
     /// ladder is left untouched.
