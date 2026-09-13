@@ -321,7 +321,8 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch4_impl(
     __nv_bfloat16* __restrict__ C,
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int C_stride
 ) {
     (void)M;
     const unsigned int threads_per_out = DP4A_BLOCK_SIZE / DP4A_N_PER_BLOCK;
@@ -385,7 +386,7 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch4_impl(
             if constexpr (!FIXED4) {
                 if ((unsigned int)row >= M) continue;
             }
-            C[(unsigned long long)row * N + n] = __float2bfloat16(
+            C[(unsigned long long)row * C_stride + n] = __float2bfloat16(
                 partial[row][local_out * 2] + partial[row][local_out * 2 + 1]);
         }
     }
@@ -509,7 +510,7 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_dp4a_batch4_impl<true>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_dp4a_batch4_impl<true>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
 }
 
 extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_dyn(
@@ -523,7 +524,42 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_dyn(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_dp4a_batch4_impl<false>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_dp4a_batch4_impl<false>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
+}
+
+// Strided-output twins (`_os`): identical math, but row `row` lands at
+// `C[row*C_stride + n]` instead of `C[row*N + n]`. The K=4..8 attention QKV
+// path uses them to write each projection straight into its interleaved
+// `qkv_buf` slice — removing the 3·M D2D scatter copies per layer. The
+// contiguous entry points above pass C_stride=N, so they are unchanged.
+extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_os(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int C_stride
+) {
+    w4a16_gemv_dp4a_batch4_impl<true>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, C_stride);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_dyn_os(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int C_stride
+) {
+    w4a16_gemv_dp4a_batch4_impl<false>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, C_stride);
 }
 
 extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4(

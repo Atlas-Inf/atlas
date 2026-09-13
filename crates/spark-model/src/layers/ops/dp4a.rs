@@ -199,6 +199,41 @@ pub fn w4a16_gemv_dp4a_batch4(
         .launch(stream)
 }
 
+/// Strided-output variant (`w4a16_gemv_dp4a_batch4_d4_os` /
+/// `_dyn_os`): identical GEMV, but output row `t` lands at
+/// `output[t*out_stride + col]` — the K=4..8 attention QKV path writes each
+/// projection straight into its interleaved `qkv_buf` slice with this,
+/// removing the per-row D2D scatter. `out_stride` is in BF16 ELEMENTS.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_dp4a_batch4_os(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_q: DevicePtr,
+    a_scale: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a_q)
+        .arg_ptr(a_scale)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(out_stride)
+        .launch(stream)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_gemv_dp4a_dual_batch4(
     gpu: &dyn GpuBackend,

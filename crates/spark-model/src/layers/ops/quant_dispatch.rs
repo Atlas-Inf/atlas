@@ -222,6 +222,40 @@ pub fn w4a16_gemv_batchm(
         .launch(stream)
 }
 
+/// Strided-output variant (`w4a16_gemv_batch{4,8}_os`): identical GEMV, but
+/// output row `t` lands at `output[t*out_stride + col]` — the K=4..8
+/// attention QKV path writes each projection straight into its interleaved
+/// `qkv_buf` slice with this, removing the per-row D2D scatter.
+/// `out_stride` is in BF16 ELEMENTS.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_batchm_os(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(m <= 8, "w4a16_gemv_batchm_os caps at M=8 (m={m})");
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(out_stride)
+        .launch(stream)
+}
+
 /// W4A16 GEMV with inline Q/Gate deinterleave on output write.
 ///
 /// Same as `w4a16_gemv` but writes Q and Gate to deinterleaved positions,
