@@ -605,6 +605,12 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         let gpu = c.fwd.gpu;
         let stream = c.stream;
+        // W4A8 DP4A M=4 arm (ATLAS_W4A16_DP4A): int8 activation + guard-free
+        // batch4 GEMV on the same NVFP4 weight. o_proj reaches this too —
+        // its `attn_out` input gets its own quant.
+        if self.dp4a_verify_gemv(c, input, w_base, output, m, n, k)? {
+            return Ok(());
+        }
         // K=4 MTP verify (M<=4) and K=5..8 chain verify (M=5..8): the batched
         // GEMV reads the non-transposed weight ONCE for all rows at near-peak
         // stream bandwidth. nsys (2026-07-18, drafts=3): the M64-tile
