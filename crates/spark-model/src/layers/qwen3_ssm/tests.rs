@@ -194,24 +194,27 @@ fn run_batched_verify(
 /// (device 700 in production; here the fail-fast guards turn it into Err,
 /// so `is_ok` is the load-bearing assertion).
 #[test]
-fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_gemm() {
+fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_batch16() {
     let config = ModelConfig::qwen3_next_80b_nvfp4();
     let gpu = MockGpuBackend::new();
     let layer = native_fp8_gdn_layer(&gpu, &config, true, true);
     run_batched_verify(&gpu, &config, &layer, &[4, 3]).unwrap();
-    // Pin the arm identity: w8a16_gemm_pipelined geometry at M=7 —
-    // QKVZ (N=12288): grid [ceil(12288/32)=384, ceil(7/128)=1, 1];
-    // out_proj (N=2048): grid [64, 1, 1]; both block [256,1,1].
+    // Pin the arm identity at R=7: the `w8a16_gemv_batch16` arm sits AHEAD
+    // of the `num_tokens > 4 → w8a16_gemm*` fallback for 5..=16 rows (the
+    // narrowest tier covering them — strix PR8 stack). Under the mock every
+    // kernel resolves, so batch16 always wins regardless of target.
+    // `w8a16_gemv_batch4` launch geometry: grid [ceil(N/4), 1, 1], block
+    // [256,1,1] — QKVZ (N=12288) → [3072,1,1]; out_proj (N=2048) → [512,1,1].
     let launches = (0..gpu.launch_count()).count();
     assert!(launches > 0);
     let seen = gpu_launch_grids(&gpu);
     assert!(
-        seen.contains(&([384, 1, 1], [256, 1, 1])),
-        "QKVZ w8a16_gemm_pipelined launch missing; grids seen: {seen:?}"
+        seen.contains(&([3072, 1, 1], [256, 1, 1])),
+        "QKVZ w8a16_gemv_batch16 launch missing; grids seen: {seen:?}"
     );
     assert!(
-        seen.contains(&([64, 1, 1], [256, 1, 1])),
-        "out_proj w8a16_gemm_pipelined launch missing; grids seen: {seen:?}"
+        seen.contains(&([512, 1, 1], [256, 1, 1])),
+        "out_proj w8a16_gemv_batch16 launch missing; grids seen: {seen:?}"
     );
 }
 
