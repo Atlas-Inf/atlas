@@ -109,6 +109,41 @@ impl Qwen3SsmLayer {
             )
     }
 
+    /// Whether the fused generic-K conv arm can serve this verify width:
+    /// `gdn_verify_fused_conv_kn` is present in the module set (NULL on
+    /// targets lacking the .cu), the conv intermediates are pool-contiguous
+    /// (the kernel writes snapshot t at `base + t*conv_bytes` FP32 — a
+    /// non-contiguous `conv_state_intermediates` would smear state across
+    /// slots, so fail closed to the per-token loop), the intermediates vec
+    /// covers all `num_tokens` slots, and the kill switch is unset.
+    /// Bit-identical to the per-token conv+copy loop: same accumulation
+    /// order under `--fmad=false` (gdn_verify_fused_microtest, cos == 1.0).
+    /// Kill switch `ATLAS_GDN_FUSED_CONVK=0` restores the launches+copies
+    /// for A/B — the WYN arm's `ATLAS_GDN_FUSED_CONV17` stays independent.
+    fn fused_conv_kn_enabled(
+        &self,
+        ssm_state: &SsmLayerState,
+        num_tokens: usize,
+        conv_bytes: usize,
+    ) -> bool {
+        if self.gdn_verify_fused_conv_kn_k.0 == 0
+            || ssm_state.conv_state_intermediates.len() < num_tokens
+            || matches!(
+                std::env::var("ATLAS_GDN_FUSED_CONVK").ok().as_deref(),
+                Some("0")
+            )
+        {
+            return false;
+        }
+        let base = ssm_state.conv_state_intermediates[0];
+        ssm_state
+            .conv_state_intermediates
+            .iter()
+            .take(num_tokens)
+            .enumerate()
+            .all(|(t, p)| p.0 == base.0 + (t * conv_bytes) as u64)
+    }
+
     /// Select the K=2 verify WY kernel: the register-resident twin
     /// (`gated_delta_rule_wy2_resident`, Pass 2 served from registers —
     /// 2R+2W -> 1R+2W of the 64KB/head FP32 state) when it is linked, the
@@ -348,50 +383,78 @@ impl Qwen3SsmLayer {
 
         if num_tokens == 4 {
             // ── K=4 fused path: conv1d+L2norm sequential, GDN WY4 ──
-            for t in 0..4u32 {
-                let qkv_t = deinterleaved.offset(t as usize * qkvz_size * bf16);
-                let conv_out_t = conv_out_buf.offset(t as usize * conv_dim * bf16);
-                ops::conv1d_update_l2norm(
+            // Fused conv arm (one launch for all K positions + inline
+            // rollback snapshots) replaces 4 conv launches + 3 conv-state
+            // D2D copies per SSM layer per verify step — bit-identical.
+            // Falls back to the per-token loop whenever the kernel is
+            // absent from the target's module set or the intermediates
+            // are not pool-contiguous (fused_conv_kn_enabled).
+            if self.fused_conv_kn_enabled(ssm_state, num_tokens, conv_bytes) {
+                ops::gdn_verify_fused_conv_kn(
                     ctx.gpu,
-                    self.conv1d_l2norm_k,
+                    self.gdn_verify_fused_conv_kn_k,
                     ssm_state.conv_state,
-                    qkv_t,
+                    deinterleaved,
                     &self.ssm.conv1d,
-                    conv_out_t,
+                    conv_out_buf,
+                    ssm_state.conv_state_intermediates[0],
+                    4,
                     conv_dim as u32,
                     d_conv as u32,
-                    1,
                     qk_ch,
                     kd as u32,
+                    qkvz_size as u32, // input stride (BF16 elems between positions)
+                    conv_dim as u32,  // output stride (BF16 elems between positions)
+                    (conv_bytes / 4) as u32, // snapshot stride (FP32 elems)
                     1e-6,
                     stream,
                 )?;
-                // Skip t == K-1: no reader exists, and that is ENFORCED, not
-                // merely argued. `commit_accepted_prefix` now bails on both
-                // `num_accepted == 0` and `num_accepted > k` and early-returns
-                // on `num_accepted == k`, so its reachable intermediate index
-                // is exactly [0, k-2] (async_chkpt.rs). The other two readers
-                // are bounded by their callers: `rollback_ssm_states` is only
-                // called from the self-spec path under
-                // `if a.seq.seq_len > expected_seq_len` (spec_step.rs:158),
-                // which means at least one draft was REJECTED, so
-                // `num_accepted + 1 <= K-1` and the index is <= K-2; and
-                // `start_rollback_and_checkpoint_async` is only ever called
-                // with 1..=K-1 (impl_a2.rs:450-509, spec_step.rs:340).
-                // DFlash cannot reach these branches at all: it dispatches
-                // only at `drafts.len() >= 4` (mtp_step.rs:308), i.e. verify
-                // width >= 5, which lands on K=17 or the sequential fallback
-                // (which skips the dead t = K-1 write the same way since the
-                // K-1 h-intermediate shrink).
-                // Writing it cost a conv_bytes D2D per SSM layer per verify
-                // step for nothing (measured: 0.14% of decode GPU time).
-                if t + 1 < 4 {
-                    ctx.gpu.copy_d2d_async(
+            } else {
+                for t in 0..4u32 {
+                    let qkv_t = deinterleaved.offset(t as usize * qkvz_size * bf16);
+                    let conv_out_t = conv_out_buf.offset(t as usize * conv_dim * bf16);
+                    ops::conv1d_update_l2norm(
+                        ctx.gpu,
+                        self.conv1d_l2norm_k,
                         ssm_state.conv_state,
-                        ssm_state.conv_state_intermediates[t as usize],
-                        conv_bytes,
+                        qkv_t,
+                        &self.ssm.conv1d,
+                        conv_out_t,
+                        conv_dim as u32,
+                        d_conv as u32,
+                        1,
+                        qk_ch,
+                        kd as u32,
+                        1e-6,
                         stream,
                     )?;
+                    // Skip t == K-1: no reader exists, and that is ENFORCED, not
+                    // merely argued. `commit_accepted_prefix` now bails on both
+                    // `num_accepted == 0` and `num_accepted > k` and early-returns
+                    // on `num_accepted == k`, so its reachable intermediate index
+                    // is exactly [0, k-2] (async_chkpt.rs). The other two readers
+                    // are bounded by their callers: `rollback_ssm_states` is only
+                    // called from the self-spec path under
+                    // `if a.seq.seq_len > expected_seq_len` (spec_step.rs:158),
+                    // which means at least one draft was REJECTED, so
+                    // `num_accepted + 1 <= K-1` and the index is <= K-2; and
+                    // `start_rollback_and_checkpoint_async` is only ever called
+                    // with 1..=K-1 (impl_a2.rs:450-509, spec_step.rs:340).
+                    // DFlash cannot reach these branches at all: it dispatches
+                    // only at `drafts.len() >= 4` (mtp_step.rs:308), i.e. verify
+                    // width >= 5, which lands on K=17 or the sequential fallback
+                    // (which skips the dead t = K-1 write the same way since the
+                    // K-1 h-intermediate shrink).
+                    // Writing it cost a conv_bytes D2D per SSM layer per verify
+                    // step for nothing (measured: 0.14% of decode GPU time).
+                    if t + 1 < 4 {
+                        ctx.gpu.copy_d2d_async(
+                            ssm_state.conv_state,
+                            ssm_state.conv_state_intermediates[t as usize],
+                            conv_bytes,
+                            stream,
+                        )?;
+                    }
                 }
             }
 
@@ -426,33 +489,57 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if num_tokens == 3 {
-            // ── K=3 fused path: conv1d+L2norm per token, GDN WY3 ──
-            for t in 0..3u32 {
-                let qkv_t = deinterleaved.offset(t as usize * qkvz_size * bf16);
-                let conv_out_t = conv_out_buf.offset(t as usize * conv_dim * bf16);
-                ops::conv1d_update_l2norm(
+            // ── K=3 fused path: conv1d+L2norm sequential, GDN WY3 ──
+            // Same fused conv arm as K=4 (generic-K kernel); see the
+            // num_tokens == 4 branch for the bit-exactness argument.
+            if self.fused_conv_kn_enabled(ssm_state, num_tokens, conv_bytes) {
+                ops::gdn_verify_fused_conv_kn(
                     ctx.gpu,
-                    self.conv1d_l2norm_k,
+                    self.gdn_verify_fused_conv_kn_k,
                     ssm_state.conv_state,
-                    qkv_t,
+                    deinterleaved,
                     &self.ssm.conv1d,
-                    conv_out_t,
+                    conv_out_buf,
+                    ssm_state.conv_state_intermediates[0],
+                    3,
                     conv_dim as u32,
                     d_conv as u32,
-                    1,
                     qk_ch,
                     kd as u32,
+                    qkvz_size as u32,
+                    conv_dim as u32,
+                    (conv_bytes / 4) as u32,
                     1e-6,
                     stream,
                 )?;
-                // Skip t == K-1 (dead write — see the K=4 branch above).
-                if t + 1 < 3 {
-                    ctx.gpu.copy_d2d_async(
+            } else {
+                for t in 0..3u32 {
+                    let qkv_t = deinterleaved.offset(t as usize * qkvz_size * bf16);
+                    let conv_out_t = conv_out_buf.offset(t as usize * conv_dim * bf16);
+                    ops::conv1d_update_l2norm(
+                        ctx.gpu,
+                        self.conv1d_l2norm_k,
                         ssm_state.conv_state,
-                        ssm_state.conv_state_intermediates[t as usize],
-                        conv_bytes,
+                        qkv_t,
+                        &self.ssm.conv1d,
+                        conv_out_t,
+                        conv_dim as u32,
+                        d_conv as u32,
+                        1,
+                        qk_ch,
+                        kd as u32,
+                        1e-6,
                         stream,
                     )?;
+                    // Skip t == K-1 (dead write — see the K=4 branch above).
+                    if t + 1 < 3 {
+                        ctx.gpu.copy_d2d_async(
+                            ssm_state.conv_state,
+                            ssm_state.conv_state_intermediates[t as usize],
+                            conv_bytes,
+                            stream,
+                        )?;
+                    }
                 }
             }
 
