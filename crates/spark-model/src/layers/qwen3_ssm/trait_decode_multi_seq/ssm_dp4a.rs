@@ -15,7 +15,7 @@ impl Qwen3SsmLayer {
     /// `true` when the guard-free M=4 DP4A arm applies: `ATLAS_W4A16_DP4A=1`,
     /// n == 4 exactly (the `_d4` kernel writes all four rows), both kernel
     /// handles resolved, and the shared int8 scratch non-null.
-    pub(super) fn ssm_dp4a_ready(&self, ctx: &ForwardContext<'_>, m: u32) -> bool {
+    pub(crate) fn ssm_dp4a_ready(&self, ctx: &ForwardContext<'_>, m: u32) -> bool {
         ops::dp4a_batch4_eligible(
             m,
             ops::dp4a_enabled(),
@@ -32,7 +32,7 @@ impl Qwen3SsmLayer {
     /// Reuses the dense-FFN int8 scratch: the SSM block and the FFN run
     /// sequentially on one stream and the FFN re-quantizes its own input, so
     /// the lifetimes do not overlap.
-    pub(super) fn ssm_dp4a_batch4_proj(
+    pub(crate) fn ssm_dp4a_batch4_proj(
         &self,
         ctx: &ForwardContext<'_>,
         input: DevicePtr,
@@ -74,7 +74,7 @@ impl Qwen3SsmLayer {
     /// else the float `w4a16_gemv_batchm` GEMV — the previous `_ =>` arm.
     /// `label` names the projection in the M>16 fail-fast.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn ssm_fp4_proj(
+    pub(crate) fn ssm_fp4_proj(
         &self,
         ctx: &ForwardContext<'_>,
         label: &'static str,
