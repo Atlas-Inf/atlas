@@ -77,3 +77,48 @@ noise = 0.4
 # here is cut from THIS run's own measurement, not inherited across hardware.
 min = 83.28
 noise = 0.4
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
+gate = "bfcl-subset"
+label = "Qwen3.8-27B dense (NVFP4, nvidia shipped) — Strix Halo gfx1151"
+status = "measured"
+note = """\
+MEASURED 2026-09-11, AzeezStrix, golden draw n=995 seed 42 temp 0, no \
+param overrides: overall 83.22 / normalized 79.02 (run record \
+~/.atlas/runs/bfcl-subset/run-1789114625433625524.json). Serve binary \
+spark_spec sha256 e4fbc84f2f23105259a076d956d1f9653b8b5d565e000239c07ec2e5dd36963f, \
+recipe: --max-seq-len 8192 --max-prefill-tokens 2048 \
+--gpu-memory-utilization 0.88 --kv-cache-dtype bf16 --lm-head-dtype nvfp4 \
+--max-batch-size 1 --disable-tool-grammar true --ssm-cache-slots 0 \
+--ssm-checkpoint-interval 16 --disable-thinking \
+--dangerously-allow-unresolved-kernel-lookups --speculative --num-drafts 3 \
+--mtp-quantization bf16 --mtp-vocab 100000; env ATLAS_W4A16_DP4A=1 \
+ATLAS_W4A16_VARIANT=v1 ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_MTP_GATE_FORCE=1. \
+DERIVED-CHECKPOINT RESULT on the same binary and recipe: the FP8→NVFP4 \
+requant of this checkpoint's GDN/attention projections \
+(HaloLoom/workspace/qwen38-27b-fp8to4, produced by requant_np.py from \
+snapshot dbb8f445b3145f8a4c18ddc769f032d57d32867c) scored \
+overall 82.71 / normalized 79.58 on the identical draw \
+(run-1789313837819983248.json, replicated run-1789298778720183887.json) — \
+normalized +0.56, inside the 0.4 noise band: the requant is SHIPPABLE. \
+Category detail for the requant run: irrelevance 87.50, \
+live_irrelevance 59.09, live_multiple 88.57, live_parallel 68.75, \
+live_parallel_multiple 70.83, live_simple 92.00. The Python/JS cliff \
+persists on this checkpoint (serve-path defect, ~2 points overall). \
+Floors below are cut from the SHIPPED run minus the 0.4 noise band; the \
+requant derivative is recorded here as provenance, not floored — its own \
+entry belongs beside its own checkpoint directory when it is promoted."""
+
+[benchmarks.metrics.samples]
+min = 995.0
+max = 995.0
+
+[benchmarks.metrics.overall_accuracy]
+min = 82.82
+noise = 0.4
+
+[benchmarks.metrics.normalized_single_turn_score]
+min = 78.62
+noise = 0.4
