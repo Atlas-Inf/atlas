@@ -51,10 +51,14 @@ $Fingerprint = "C:\Users\azeez\q38-win-serve-nv4-$Tag-fingerprint.txt"
 Get-Process spark -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 5
 
+# NOTE: the fingerprinted ST-995 run (2026-09-13) carried
+# `--dangerously-allow-unresolved-kernel-lookups` because the 87 optional-arm
+# probes were undeclared then. MODEL.toml now declares all 87 in
+# [expected_absent], so the boot audit passes WITHOUT the flag — do not re-add
+# it; a new unresolved lookup is exactly the signal the gate exists to catch.
 $proc = Start-Process -FilePath $Bin -ArgumentList @(
     "serve", $ModelDir,
     "--no-fast-load",
-    "--dangerously-allow-unresolved-kernel-lookups",
     "--model-name", "nvidia/Qwen3.8-27B-NVFP4",
     "--host", "0.0.0.0", "--port", $Port,
     "--max-seq-len", "65536", "--max-prefill-tokens", "8192",
