@@ -316,8 +316,13 @@ impl Qwen3SsmLayer {
             }
         } else if num_tokens == 4 {
             if let Some(ref nvfp4) = self.qkvz_nvfp4 {
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
+                // DP4A arm first (same as the multi-seq mixer): int8-quantize
+                // `normed` once and run `w4a16_gemv_dp4a_batch4_d4`; falls
+                // back to the identical `w4a16_gemv_batchm` call when DP4A is
+                // disabled or its handles are unresolved.
+                self.ssm_fp4_proj(
+                    ctx,
+                    "qkvz",
                     self.w4a16_batchm.kernel(num_tokens as u32),
                     normed,
                     nvfp4,
@@ -1002,9 +1007,12 @@ impl Qwen3SsmLayer {
             // NVFP4 out_proj at M=4..8 (K=4 verify + K=5..8 chain verify):
             // previously fell through to the w4a16 tile GEMMs below (M>3
             // cliff — there was no ==4 arm at all on the NVFP4 side); the
-            // batchm GEMV streams the weight once for all rows.
-            ops::w4a16_gemv_batchm(
-                ctx.gpu,
+            // batchm GEMV streams the weight once for all rows. `ssm_fp4_proj`
+            // takes the W4A8 DP4A arm at M==4 when enabled (int8 activation
+            // quant + `w4a16_gemv_dp4a_batch4_d4`), else the same batchm call.
+            self.ssm_fp4_proj(
+                ctx,
+                "out_proj",
                 self.w4a16_batchm_kernel(num_tokens),
                 normed_out_buf,
                 &self.ssm.out_proj,
