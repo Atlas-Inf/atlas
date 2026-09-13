@@ -240,7 +240,10 @@ failing the aggregate run — check the job itself, not the run conclusion.**
 Two independent shims, which is why this is tractable at all:
 
 - **Kernels.** `build.rs` mirrors every `.cu`/`.cuh` into `OUT_DIR/hip_mirror/`
-  applying the 64-wide-wavefront mask widen, then compiles with
+  applying the warp-mask widen (HIP's `_sync` mask args and `__activemask()`
+  are `unsigned long long` API-wide; gfx1151 itself executes **wave32** — no
+  `-mwavefrontsize64` is passed, and the tree's `_w32` WMMA builtins only
+  compile in wave32 mode), then compiles with
   `hipcc --offload-arch=gfx1151`. The NVIDIA `cp.async`/`mma.sync` bodies are
   `#if defined(__HIP_PLATFORM_AMD__)`-guarded, so the AMD arms compile — there is
   no tensor-core wall. Note ~86 of the `kernels/strix-hip` `.cu` files are git
