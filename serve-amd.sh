@@ -2,8 +2,8 @@
 # Serve a model with Atlas on AMD GPUs. Verified coherent on gfx1151 / Strix
 # Halo with Qwen3.8-27B and Qwen3.6-27B. See docs/porting/amd-strix-halo-scale.md.
 #
-#   ./serve-amd.sh                                  # Qwen3.8-27B-NVFP4 (default)
-#   ./serve-amd.sh nvidia/Qwen3.6-27B-NVFP4         # or any local snapshot path
+#   ./serve-amd.sh                                  # nvidia/Qwen3.8-27B-NVFP4 (default)
+#   ./serve-amd.sh unsloth/Qwen3.8-27B-NVFP4        # or any local snapshot path
 #   PORT=9000 MAX_SEQ_LEN=32768 ./serve-amd.sh
 #
 # A binary built with ATLAS_TARGET_MODEL='*' (build-amd.sh's default) carries
@@ -17,7 +17,7 @@
 # FP8-preservation exports remain exactly that recipe's.
 set -euo pipefail
 cd "$(dirname "$0")"
-MODEL="${1:-unsloth/Qwen3.8-27B-NVFP4}"
+MODEL="${1:-nvidia/Qwen3.8-27B-NVFP4}"
 [ $# -gt 0 ] && shift            # anything left in "$@" is passed through to spark
 HW="${ATLAS_TARGET_HW:-strix-hip}"
 ROCM_HOME="${ATLAS_ROCM_HOME:-/opt/rocm}"
@@ -142,16 +142,17 @@ echo "serving $MODEL on ${GFX:-AMD} via $HW"
 # (engine default) and thinking stays requestable — MODEL.toml's
 # thinking_default is unset (off), and a per-request enable_thinking still
 # wins. The 2.55h soak ran a 52%-thinking mix clean.
-# --lm-head-dtype bf16 is the default model's (unsloth) frozen recipe — its
-# lm_head ships per-row FP8 and is preserved to BF16. On the NVIDIA checkpoint
-# LM_HEAD=nvfp4 is the measured decode lever (+~35% on the vocab projection;
-# its head is NVFP4-packed), and `default` resolves there anyway.
+# --lm-head-dtype nvfp4 is the NVIDIA checkpoint's measured decode lever
+# (+~35% on the vocab projection; its head is NVFP4-packed — `default` would
+# resolve to the same thing, kept explicit so LM_HEAD stays a knob). For the
+# unsloth checkpoint use LM_HEAD=bf16 — its lm_head ships per-row FP8 and the
+# frozen accuracy recipe preserves it to BF16.
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
-  --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-bf16}" --max-batch-size "${MAX_BATCH:-1}" \
+  --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-nvfp4}" --max-batch-size "${MAX_BATCH:-1}" \
   "${SPEC_ARGS[@]}" \
   --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval 16 \
   $ALLOW_FALLBACKS \
