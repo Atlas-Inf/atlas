@@ -32,8 +32,8 @@ fn nvfp4(gpu: &MockGpuBackend, n: usize, k: usize) -> QuantizedWeight {
 
 fn attn_layer(gpu: &MockGpuBackend, config: &ModelConfig) -> Qwen3AttentionLayer {
     let h = config.hidden_size;
-    let q_dim = (config.num_attention_heads * config.head_dim) as usize;
-    let kv_dim = (config.num_key_value_heads * config.head_dim) as usize;
+    let q_dim = config.num_attention_heads * config.head_dim;
+    let kv_dim = config.num_key_value_heads * config.head_dim;
     let q_proj_dim = q_dim * 2; // gated: [Q|gate]
     let dw = |bytes: usize| DenseWeight {
         weight: gpu.alloc(bytes).unwrap(),
