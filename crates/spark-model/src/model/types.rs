@@ -143,8 +143,8 @@ pub struct TransformerModel {
     /// (U8 `[V, K/2]` + F8 `[V, K/16]`), and the float `w4a16_gemv_batch4`
     /// measures ~1.6x slower on this shape: at `[248320, 5120]` M=4 it is
     /// 5979.7 us isolated (6367.8 us in-situ in the K=4 profile) against
-    /// 3772.6 us for the DP4A kernel. A zero handle, or `ATLAS_W4A16_DP4A`
-    /// unset, falls back to the float ladder.
+    /// 3772.6 us for the DP4A kernel. A zero handle, or `ATLAS_W4A16_DP4A=0`,
+    /// falls back to the float ladder.
     pub(super) lm_head_dp4a_gemv_kernel: KernelHandle,
     pub(super) lm_head_dp4a_quant_kernel: KernelHandle,
     pub(super) dense_gemm_kernel: KernelHandle,

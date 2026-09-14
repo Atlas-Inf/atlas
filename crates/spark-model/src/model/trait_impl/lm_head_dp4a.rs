@@ -9,8 +9,8 @@
 //! activation quant. Measured at `[248320, 5120]` M=4: the float
 //! `w4a16_gemv_batch4` tier is 5979.7 us isolated — 6367.8 us in-situ in the
 //! K=4 profile, i.e. ~120 GB/s — against 3772.6 us for
-//! `w4a16_gemv_dp4a_batch4_d4`, a 1.58x win. Opt-in behind
-//! `ATLAS_W4A16_DP4A`, exactly like the dense FFN.
+//! `w4a16_gemv_dp4a_batch4_d4`, a 1.58x win. On by default
+//! (`ATLAS_W4A16_DP4A=0` opts out), exactly like the dense FFN.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -21,7 +21,8 @@ use crate::layers::ops;
 impl TransformerModel {
     /// Project the K=4 verify rows through the LM head with W4A8 DP4A.
     ///
-    /// Returns `false` when the arm does not apply — flag off, kernels absent,
+    /// Returns `false` when the arm does not apply — DP4A disabled
+    /// (`ATLAS_W4A16_DP4A=0`), kernels absent,
     /// scratch NULL, or the head is not NVFP4 — so the caller's ladder is left
     /// untouched and targets without the kernels are unaffected.
     ///
