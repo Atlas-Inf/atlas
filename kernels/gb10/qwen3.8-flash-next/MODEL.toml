@@ -63,7 +63,7 @@
 # `qwen4_exp`, so only that one is bound below.
 [model]
 name = "qwen3.8-flash-next"
-hf_id = "RadixArk/Qwen3.8-Flash-Next-NVFP4"
+hf_id = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 architecture = "GDN + QSA sparse attention + mHC + PLE n-gram + MoE"
 params = "180B"
 active_params = "7B"
@@ -209,7 +209,13 @@ top_n_sigma = 0.0
 # `qwen4_exp` is unique across the registry, so resolution cannot tie and
 # match_names is not load-bearing yet. Listed anyway so a future Flash-Next
 # variant sharing (qwen4_exp, 2560) has something to disambiguate against.
-match_names = ["qwen3.8-flash-next", "flash-next"]
+# RadixArk stays listed: hf_id moved to the nvidia pack (the calibrated
+# FP8_PB_WO MTP experts), but the RadixArk release still serves.
+match_names = [
+    "qwen3.8-flash-next",
+    "flash-next",
+    "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+]
 
 [[model_types]]
 model_type = "qwen4_exp"

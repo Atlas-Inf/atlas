@@ -39,6 +39,20 @@ pub fn detect_nvfp4_variant(
             "modelopt" if qc.quant_algo.eq_ignore_ascii_case("FP8") => {
                 return Nvfp4Variant::Fp8Dequanted;
             }
+            "modelopt" if qc.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION") => {
+                // The per-component `quantized_layers` map is authoritative —
+                // and consulting it here is REQUIRED, not optional: nvidia's
+                // Flash-Next pack carries `weight_scale_inv` on its MTP
+                // experts (FP8_PB_WO) while every main-layer expert is
+                // standard ModelOpt NVFP4. Falling through would hit the
+                // global `.weight_scale_inv` fallback below and mis-route the
+                // whole checkpoint to Fp8Dequanted.
+                if let Some(v) = mixed_precision_variant(qc) {
+                    return v;
+                }
+                // Map absent or says nothing about the compute path —
+                // fall through to tensor-name sniffing.
+            }
             "compressed-tensors" => {
                 // `format` is the sub-selector here. Block-scaled FP8 is tagged
                 // either with a literal "fp8" OR with compressed-tensors'
@@ -339,6 +353,45 @@ pub(crate) fn quantized_any(
     }
 }
 
+/// Resolve the global [`Nvfp4Variant`] for a ModelOpt `MIXED_PRECISION`
+/// checkpoint from its `quantized_layers` map.
+///
+/// Only main-model compute paths vote — entries under `*.mlp.experts` or a
+/// `*{gate,up,down,q,k,v,o}_proj` projection. Auxiliary components with their
+/// own loaders (`mtp.*`, `*.ple.*`, `*.visual.*`) are excluded: their scheme
+/// is read by the component loader, and must not steer the global variant.
+///
+/// `None` when the map is empty or names no compute path, leaving detection
+/// to the tensor-name sniffing below.
+fn mixed_precision_variant(qc: &atlas_core::config::QuantizationConfig) -> Option<Nvfp4Variant> {
+    let mut saw_nvfp4 = false;
+    for (path, spec) in &qc.quantized_layers {
+        // Auxiliary namespaces first — nvidia's MTP experts live at
+        // `mtp.layers.0.mlp.experts.*`, which CONTAINS `.mlp.experts`, so
+        // the compute-path check below cannot be trusted to exclude them.
+        if path.starts_with("mtp.") || path.contains(".ple.") || path.contains(".visual.") {
+            continue;
+        }
+        let is_compute = path.contains(".mlp.experts")
+            || path.ends_with("_proj")
+            || path.contains(".self_attn.")
+            || path.contains(".linear_attn.");
+        if !is_compute {
+            continue;
+        }
+        let algo = spec.quant_algo.to_ascii_uppercase();
+        if algo.starts_with("FP8") {
+            // An FP8 main-path component (e.g. FP8 attention in a mixed pack)
+            // must route the checkpoint to the native-FP8 arms.
+            return Some(Nvfp4Variant::Fp8Dequanted);
+        }
+        if algo == "NVFP4" {
+            saw_nvfp4 = true;
+        }
+    }
+    saw_nvfp4.then_some(Nvfp4Variant::Standard)
+}
+
 /// Load a quantized weight from FP8 block-scaled data: FP8→BF16→NVFP4.
 ///
 /// `n` and `k` are the logical weight dimensions (e.g. [inter, hidden] for gate_proj).
@@ -487,6 +540,62 @@ mod ep_detection_tests {
         assert_eq!(
             detect_nvfp4_variant(&store, &cfg),
             Nvfp4Variant::Fp8Dequanted
+        );
+    }
+
+    /// nvidia/Qwen3.8-Flash-Next-NVFP4 shape: `quant_algo=MIXED_PRECISION`
+    /// with a `quantized_layers` map declaring NVFP4 experts, while the MTP
+    /// block ships `weight_scale_inv` (FP8_PB_WO). Without the map arm the
+    /// global `.weight_scale_inv` fallback mis-detects the checkpoint as
+    /// Fp8Dequanted and routes every NVFP4 expert read into the FP8 path.
+    #[test]
+    fn mixed_precision_map_resolves_standard_despite_mtp_scale_inv() {
+        use atlas_core::config::{QuantLayerSpec, QuantizationConfig};
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        let mut map = std::collections::BTreeMap::new();
+        for l in 0..cfg.num_hidden_layers {
+            map.insert(
+                format!("model.language_model.layers.{l}.mlp.experts"),
+                QuantLayerSpec {
+                    quant_algo: "NVFP4".into(),
+                    group_size: 16,
+                },
+            );
+        }
+        map.insert(
+            "mtp.layers.0.mlp.experts".to_string(),
+            QuantLayerSpec {
+                quant_algo: "FP8_PB_WO".into(),
+                group_size: 128,
+            },
+        );
+        map.insert(
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding".to_string(),
+            QuantLayerSpec {
+                quant_algo: "FP8".into(),
+                group_size: 0,
+            },
+        );
+        cfg.quantization_config = Some(QuantizationConfig {
+            quant_method: "modelopt".into(),
+            quant_algo: "MIXED_PRECISION".into(),
+            format: String::new(),
+            ignore_modules: vec![],
+            weight_block_size: vec![],
+            group_size: 16,
+            quantized_layers: map,
+        });
+        // The store shape that fools the fallback: main experts carry the
+        // standard ModelOpt triple; ONLY mtp.* carries weight_scale_inv.
+        let store = store_with(&[
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale".to_string(),
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight_scale_inv".to_string(),
+        ]);
+        assert_eq!(
+            detect_nvfp4_variant(&store, &cfg),
+            Nvfp4Variant::Standard,
+            "MIXED_PRECISION map must route NVFP4-expert checkpoints to Standard \
+             even when mtp.* ships FP8 block scales"
         );
     }
 }
