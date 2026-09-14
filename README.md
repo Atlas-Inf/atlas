@@ -383,25 +383,13 @@ Atlas converts CUDA sources natively to AMD RDNA 3.5. Bring-up is active across 
 - **Linux Leg (Ubuntu 24.04 / ROCm 6.2+)**: Branch [`port/qwen3.8-strix-linux`](https://github.com/Atlas-Inf/atlas/tree/port/qwen3.8-strix-linux) ([PR #8](https://github.com/Atlas-Inf/atlas/pull/8))
 - **Windows Leg (DirectX 12 / native MSVC)**: Branch [`port/qwen3.8-windows`](https://github.com/Atlas-Inf/atlas/tree/port/qwen3.8-windows) ([PR #9](https://github.com/Atlas-Inf/atlas/pull/9))
 
-```bash
-# Clone the AMD Strix Halo port branch
-git clone -b port/qwen3.8-strix-linux https://github.com/Atlas-Inf/atlas.git
-cd atlas
-
-# Build native binary targeting AMD gfx1151 silicon
-cargo build --release --features scale,rocm
-
-# Launch Qwen 3.8 27B on Strix Halo
-./target/release/spark serve unsloth/Qwen3.8-27B-NVFP4 --bind 127.0.0.1 --port 8888
-```
-
-### 5. Querying the Endpoint
-
-### Recipe D — AMD Strix Halo / gfx1151 (Qwen3.8-27B NVFP4, bare-metal Linux)
-
 No container on this one — Strix Halo is a unified-memory APU, and the validated path is the native binary built against ROCm (`/opt/rocm`) with hipcc. Two scripts in the repo root carry the whole thing:
 
 ```bash
+# Clone the AMD Strix Halo port branch (until PR #8 lands on main)
+git clone -b port/qwen3.8-strix-linux https://github.com/Atlas-Inf/atlas.git
+cd atlas
+
 # Build once — strix-hip backend (default), all kernel targets, no SCALE or
 # RDMA prerequisites. Needs ROCm + cargo, nothing else.
 ./build-amd.sh
@@ -424,8 +412,7 @@ Knobs (env-overridable, sane defaults):
 
 ### Hitting the Endpoint
 
-Atlas speaks OpenAI, Anthropic, and Responses APIs on the same port. `curl`, the OpenAI SDK, Open WebUI, opencode, Cline, Claude Code — point them at port 8888:
-Atlas serves an OpenAI-compatible API on the designated port:
+Atlas speaks OpenAI, Anthropic, and Responses APIs on the same port. `curl`, the OpenAI SDK, Open WebUI, opencode, Cline, Claude Code — point them at the served port (`sparkrun` recipes default to 8888; `serve-amd.sh` defaults to 8081):
 
 ```bash
 curl http://localhost:8888/v1/chat/completions \
