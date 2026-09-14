@@ -434,6 +434,31 @@ sudo docker run -d --name atlas \
 
 For 122B with **both** `--speculative` *and* a 64 K window, move to EP=2 across two Sparks ([`QUICKSTART.md`](QUICKSTART.md) §5). For long contexts on a single Spark, add `--high-speed-swap --high-speed-swap-dir /path/on/nvme --high-speed-swap-cache-blocks-per-seq 64` — HSS keeps a rolling 1024-token KV window in HBM and streams older blocks to NVMe through an io_uring orchestrator. The container needs `--security-opt seccomp=unconfined --ulimit memlock=-1` for io_uring access.
 
+### Recipe D — AMD Strix Halo / gfx1151 (Qwen3.8-27B NVFP4, bare-metal Linux)
+
+No container on this one — Strix Halo is a unified-memory APU, and the validated path is the native binary built against ROCm (`/opt/rocm`) with hipcc. Two scripts in the repo root carry the whole thing:
+
+```bash
+# Build once — strix-hip backend (default), all kernel targets, no SCALE or
+# RDMA prerequisites. Needs ROCm + cargo, nothing else.
+./build-amd.sh
+
+# Serve — defaults are the validated configuration: K=4 MTP speculative
+# decode, the default-on W4A8 DP4A decode arm, BF16 KV.
+./serve-amd.sh                              # unsloth/Qwen3.8-27B-NVFP4
+./serve-amd.sh nvidia/Qwen3.8-27B-NVFP4     # or the NVIDIA shipped checkpoint
+```
+
+Measured on AzeezStrix (Ryzen AI Max+ 395 / Radeon 8060S, ROCm 7.13, ~60 GB GTT): **28.3–28.6 tok/s** K=4 decode, 13.3–13.6 tok/s at 30k context, and **83.02 / 80.41** (overall / normalized) on the 995-row bfcl-subset golden draw — no accuracy regression vs the NVIDIA shipped reference (83.22 / 79.02). Details: [`kernels/strix-hip/qwen3.8-27b/BENCH.toml`](kernels/strix-hip/qwen3.8-27b/BENCH.toml), [`docs/porting/amd-strix-halo-scale.md`](docs/porting/amd-strix-halo-scale.md).
+
+Knobs (env-overridable, sane defaults):
+
+- `NUM_DRAFTS=0` — disables speculative decode (reproduces the frozen non-spec accuracy recipe; default `3` = the measured K=4 arm).
+- `MAX_SEQ_LEN` / `GPU_UTIL` / `PORT` — sizing knobs (defaults 4096 / 0.88 / 8081; the unified-memory ceiling is ~55 GB usable).
+- `LM_HEAD=nvfp4` — on the NVIDIA checkpoint, forces the NVFP4-packed lm_head (a measured decode lever; the default `bf16` matches the unsloth checkpoint's preserved-FP8 recipe).
+- `ATLAS_W4A16_DP4A=0` — opt-out of the DP4A decode arm (on by default; accuracy-validated).
+- The FP8-preservation exports (`ATLAS_FP8_DEQUANT_*`, `ATLAS_GDN_BF16_WEIGHTS`) are baked into the script — required for the unsloth checkpoint's per-row-FP8 projections, no-op elsewhere. Don't strip them.
+
 ### Hitting the Endpoint
 
 Atlas speaks OpenAI, Anthropic, and Responses APIs on the same port. `curl`, the OpenAI SDK, Open WebUI, opencode, Cline, Claude Code — point them at port 8888:
