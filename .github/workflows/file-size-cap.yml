@@ -315,6 +315,11 @@ jobs:
             "crates/spark-server/src/scheduler/sample_step.rs"
             "crates/spark-server/src/tool_parser/tests/group_g_parallel.rs"
             "crates/spark-server/src/api/chat_stream/tool_handlers.rs"
+            # 507 LoC — inherited over-cap from port/qwen3.8-strix-linux via
+            # 9bf3487d9 (template_owns_tool_definitions lever); not touched by
+            # PR #30, fails the whole-checkout scan regardless. Same carry-over
+            # precedent as the #229 entries above. Clean split tracked in #31.
+            "crates/spark-server/src/tool_parser/tests/group_b.rs"
             # 572 LoC — SSM batched-decode dispatcher grew with the
             # native-FP8 NULL-QKVZ/out_proj dispatch fix (K=2/K=3 MTP-verify
             # would deref a NULL QuantizedWeight on FP8-only builds). Single
