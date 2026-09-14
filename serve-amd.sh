@@ -10,10 +10,11 @@
 # every strix kernel target, and resolution picks the right one from the
 # checkpoint reference — so the same binary serves 3.6 and 3.8.
 #
-# Every flag and variable below is the one the measured configuration in
-# ../40-bench/RESULTS.md and ../40-bench/BFCL.md actually ran with. If you
-# change one, you are no longer running the configuration those numbers
-# describe.
+# Defaults below are the validated serving configuration: K=4 MTP speculative
+# decode + the default-on DP4A arm (28.3–28.6 tok/s, bfcl-subset 995-row
+# 83.02/80.41, run-1789370409958768995). NUM_DRAFTS=0 reproduces the frozen
+# non-spec accuracy recipe the unsloth baseline was certified under; the
+# FP8-preservation exports remain exactly that recipe's.
 set -euo pipefail
 cd "$(dirname "$0")"
 MODEL="${1:-unsloth/Qwen3.8-27B-NVFP4}"
@@ -25,7 +26,10 @@ BIN="${ATLAS_BIN:-$TARGET_DIR/release/spark}"
 
 # ── gfx1151 runtime shims (each explained in docs §4) ────────────────────────
 export ATLAS_W4A16_VARIANT=v1     # BF16-MMA NVFP4 GEMM (SCALE device FP8 encode is broken on gfx1151)
-export ATLAS_W4A16_DP4A=1         # int8-DP4A decode GEMV
+# ATLAS_W4A16_DP4A is now ON BY DEFAULT (the int8-DP4A decode GEMV arm is
+# accuracy-validated: 995-row bfcl-subset 83.02/80.41, 511/511 M=1 argmax
+# match vs float). No export here — a user-set ATLAS_W4A16_DP4A=0 must keep
+# working as the opt-out.
 #
 # NOT set, though every earlier Strix doc lists it: ATLAS_FORCE_GLOBAL_GDN=1.
 # It has ZERO readers in crates/ on current main (only docs/ still mention it).
@@ -91,8 +95,13 @@ unset ATLAS_FFN_BF16_PREFILL_TC
 
 if [ "$HW" = "strix-hip" ]; then
   # The HIP shims (libcuda/libcudart/libcublasLt) are built into atlas-kernels'
-  # OUT_DIR; the loader needs them plus the selected ROCm runtime.
-  SHIM=$(ls -dt "$TARGET_DIR"/release/build/atlas-kernels-*/out 2>/dev/null | head -1)
+  # OUT_DIR; the loader needs them plus the selected ROCm runtime. Pick the
+  # newest build dir that actually CONTAINS the shim — a plain `ls -dt | head`
+  # can return a stale/stub out/ that predates the shim build.
+  SHIM=""
+  for d in $(ls -dt "$TARGET_DIR"/release/build/atlas-kernels-*/out 2>/dev/null); do
+    if ls "$d"/libcuda.so* >/dev/null 2>&1; then SHIM="$d"; break; fi
+  done
   export PATH="$ROCM_HOME/bin:$PATH"
   export LD_LIBRARY_PATH="${SHIM:-}:$ROCM_HOME/lib:${LD_LIBRARY_PATH:-}"
 else
@@ -115,25 +124,35 @@ ALLOW_FALLBACKS="--dangerously-allow-unresolved-kernel-lookups"
 # API to report the canonical repo id (as the benchmark configs expect).
 NAME_ARG=(); [ -n "${MODEL_NAME:-}" ] && NAME_ARG=(--model-name "$MODEL_NAME")
 
-# MTP speculation is OPT-IN (NUM_DRAFTS>0): the frozen Qwen3.8 accuracy recipe
-# ran without it (spec decode is hard-gated off under thinking-off tool calls
-# anyway, and the accuracy fingerprint must not carry an unused lever).
+# MTP speculation is ON by default at K=4 (num_drafts=3) — the measured
+# decode configuration (28.3-28.6 tok/s on gfx1151, bfcl-subset 83.02/80.41,
+# run-1789370409958768995). num_drafts=3 is also the MODEL.toml
+# default_num_drafts; we pass it explicitly so NUM_DRAFTS stays a knob.
+# NUM_DRAFTS=0 reproduces the frozen non-spec accuracy recipe. mtp-quantization
+# bf16 and mtp-vocab 100000 are the engine defaults already.
 SPEC_ARGS=()
-if [ "${NUM_DRAFTS:-0}" -gt 0 ]; then
-  SPEC_ARGS=(--speculative --num-drafts "$NUM_DRAFTS" --mtp-quantization bf16 --mtp-vocab 100000)
+if [ "${NUM_DRAFTS:-3}" -gt 0 ]; then
+  SPEC_ARGS=(--speculative --num-drafts "${NUM_DRAFTS:-3}")
 fi
 
 GFX=$("$ROCM_HOME/bin/rocminfo" 2>/dev/null | sed -n 's/.*\(gfx[0-9][0-9]*\).*/\1/p' | head -1)
 echo "serving $MODEL on ${GFX:-AMD} via $HW"
+# --disable-tool-grammar and --disable-thinking were the bench-determinism
+# pins of the frozen accuracy recipe; for serving, tool grammar stays on
+# (engine default) and thinking stays requestable — MODEL.toml's
+# thinking_default is unset (off), and a per-request enable_thinking still
+# wins. The 2.55h soak ran a 52%-thinking mix clean.
+# --lm-head-dtype bf16 is the default model's (unsloth) frozen recipe — its
+# lm_head ships per-row FP8 and is preserved to BF16. On the NVIDIA checkpoint
+# LM_HEAD=nvfp4 is the measured decode lever (+~35% on the vocab projection;
+# its head is NVFP4-packed), and `default` resolves there anyway.
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
-  --kv-cache-dtype bf16 --max-batch-size "${MAX_BATCH:-1}" \
+  --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-bf16}" --max-batch-size "${MAX_BATCH:-1}" \
   "${SPEC_ARGS[@]}" \
-  --disable-tool-grammar true \
   --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval 16 \
   $ALLOW_FALLBACKS \
-  --disable-thinking \
   "$@"
