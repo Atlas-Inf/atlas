@@ -154,21 +154,24 @@ enable_loop_watchdog = true
 thinking_in_tools = false
 max_thinking_budget = 512
 
-# default_num_drafts: 1, matching strix/qwen3.6-27b. gb10/qwen3.8-27b leaves
-# this unset on the argument that draft acceptance is a weights property and
-# 3.8 must earn its own K. That argument is right, and 1 is not a tuned K —
-# it is the floor that makes speculative decode WORK at all while a proper
-# chain-widening sweep is run on gfx1151. The Strix serve recipe passes
-# --num-drafts explicitly, which overrides this.
-default_num_drafts = 1
+# default_num_drafts: 3 (K=4 verify). gb10/qwen3.8-27b leaves this unset on
+# the argument that draft acceptance is a weights property and 3.8 must earn
+# its own K — earned: on gfx1151 the K=4 arm measures 28.3–28.6 tok/s vs
+# 24.6 at K=1 (+~15%, mean_na 2.16–2.34 across harnesses), and the 995-row
+# bfcl-subset golden draw scored 83.02/80.41 under it (run record
+# run-1789370409958768995). The serve recipe may still pass --num-drafts
+# explicitly, which overrides this.
+default_num_drafts = 3
 
-# default_kv_dtype: deliberately NOT set. gb10/qwen3.8-27b sets "fp8",
-# carrying it with the shared kernel set. The Strix recipe serves
-# `--kv-cache-dtype bf16` (serve-amd.sh, and the certified MLPerf-edge run),
-# because on gfx1151 the SCALE device FP8 encode path is the one this port
-# works around (ATLAS_W4A16_VARIANT=v1 / ATLAS_NO_FP8_PREDEQUANT=1 exist for
-# exactly that reason). Setting an fp8 default here would silently change the
-# KV dtype of the proven configuration for anyone who does not pass the flag.
+# default_kv_dtype: "bf16" — the proven configuration. gb10/qwen3.8-27b sets
+# "fp8", carrying it with the shared kernel set; on gfx1151 the SCALE device
+# FP8 encode path is the one this port works around (ATLAS_W4A16_VARIANT=v1 /
+# ATLAS_NO_FP8_PREDEQUANT=1 exist for exactly that reason). This field must be
+# set, not merely left unset: an empty default resolves to the ENGINE default
+# fp8 (DEFAULT_KV_CACHE_DTYPE), which would silently put a bare `spark serve`
+# on exactly the unproven path the recipe avoids. The certified MLPerf-edge
+# run and the 2026-09-14 2.55h soak both served bf16.
+default_kv_dtype = "bf16"
 
 # Upstream reports model_type = "qwen3_5". The MRoPE -> "qwen3_6_moe"
 # dispatch rewrite fires only for MoE checkpoints (is_moe gate in
