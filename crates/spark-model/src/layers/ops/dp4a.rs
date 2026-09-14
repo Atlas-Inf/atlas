@@ -3,9 +3,9 @@
 //! W4A8 integer-DP4A decode GEMV dispatch (strix-hip / gfx1151 only).
 //!
 //! These wrap the additive DP4A kernels in
-//! `kernels/strix-hip/common/w4a16_gemv_dp4a.cu`. They are selected ONLY on
-//! gfx1151 behind the `ATLAS_W4A16_DP4A` flag (see `layers::dense_ffn`); the
-//! float E2M1-LUT path (`w4a16_gemv*`) is untouched and remains the default on
+//! `kernels/strix-hip/common/w4a16_gemv_dp4a.cu`. They engage wherever the
+//! target ships them (gfx1151 today; see `layers::dense_ffn`); the float
+//! E2M1-LUT path (`w4a16_gemv*`) is untouched and remains the fallback on
 //! every target. The win is on the bandwidth-bound LPDDR5X part: int8 v_dot4
 //! (`__builtin_amdgcn_sudot4`) + branchless v_perm codebook replace per-weight
 //! FP32 FMA, validated cosine 0.999991 vs the float oracle on real gfx1151.
@@ -24,14 +24,16 @@ use crate::weight_map::QuantizedWeight;
 /// SSOT with `DP4A_GROUP_SIZE` in `w4a16_gemv_dp4a.cu`.
 pub const DP4A_GROUP_SIZE: u32 = 16;
 
-/// Runtime gate for the W4A8 integer-DP4A decode path. OFF by default (PCND: no
-/// implicit production default — the float E2M1-LUT path stays the default on
-/// every target). Set `ATLAS_W4A16_DP4A=1` to enable on gfx1151 builds that
-/// carry the DP4A kernels; on any other target the kernel handles miss
-/// (`KernelHandle(0)`) and callers fall back to the float path regardless.
+/// Runtime gate for the W4A8 integer-DP4A decode path. ON by default:
+/// accuracy-validated on gfx1151 (bfcl-subset 83.02/80.41 on the 995-row
+/// golden draw; 511/511 M=1 argmax match vs the float path — see the strix
+/// BENCH.toml notes) and every call site still requires resolved kernel
+/// handles, so targets without the DP4A kernel set miss on `KernelHandle(0)`
+/// and take the float E2M1-LUT path unchanged. `ATLAS_W4A16_DP4A=0` forces
+/// the float path (rollback / A/B); `=1` is accepted for harness back-compat.
 pub fn dp4a_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("ATLAS_W4A16_DP4A").as_deref() == Ok("1"))
+    *FLAG.get_or_init(|| std::env::var("ATLAS_W4A16_DP4A").as_deref() != Ok("0"))
 }
 
 /// Eligibility for the guard-free M=4 DP4A batch4 GEMV arm. `m` must be

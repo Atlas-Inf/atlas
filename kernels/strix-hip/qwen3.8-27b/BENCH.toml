@@ -75,13 +75,15 @@ quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "bfcl-subset"
 label = "Qwen3.8-27B dense (NVFP4, nvidia shipped) — Strix Halo gfx1151"
-# Same demotion as the unsloth entry above: measured data, but the serve
-# config is env-var-bound (ATLAS_W4A16_DP4A/ATLAS_MTP_GATE_FORCE) and no
-# atlas-recipes entry can express it — the gate cannot self-start it, so it
-# cannot be a checkable baseline. Provenance only; restore "measured" with
-# floors (samples 995 pinned, overall_accuracy min 82.82 noise 0.4,
-# normalized_single_turn_score min 78.62 noise 0.4) when a strix-expressible
-# recipe exists.
+# Same demotion as the unsloth entry above: measured data, but the gate
+# self-starts from `recipe` resolved out of atlas-recipes and no recipe for
+# this serve config exists there. Since the DP4A arm went default-on this
+# config IS flag-expressible now (ATLAS_MTP_GATE_FORCE -> `mtp_gate:
+# force`; the other vars were bench-host pins) — the only blocker left is
+# landing the recipe in the recipes repo. Provenance only; restore
+# "measured" with floors (samples 995 pinned, overall_accuracy min 82.82
+# noise 0.4, normalized_single_turn_score min 78.62 noise 0.4) once it
+# exists.
 status = "unmeasured"
 note = """\
 MEASURED 2026-09-11, AzeezStrix, golden draw n=995 seed 42 temp 0, no \

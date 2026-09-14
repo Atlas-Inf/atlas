@@ -16,8 +16,8 @@ use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 use crate::weight_map::QuantizedWeight;
 
 impl Qwen3AttentionLayer {
-    /// `true` when the guard-free M=4 DP4A arm applies: `ATLAS_W4A16_DP4A=1`,
-    /// m == 4 exactly (the `_d4` kernel writes all four rows), both kernel
+    /// `true` when the guard-free M=4 DP4A arm applies: DP4A not disabled
+    /// (`ATLAS_W4A16_DP4A=0` opts out — default on), m == 4 exactly (the `_d4` kernel writes all four rows), both kernel
     /// handles resolved, and the shared int8 scratch non-null.
     pub(super) fn dp4a_batch4_ready(&self, c: &MultiSeqCtx<'_>, m: u32) -> bool {
         ops::dp4a_batch4_eligible(

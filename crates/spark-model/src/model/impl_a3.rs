@@ -266,8 +266,8 @@ impl TransformerModel {
             // "~2.5 ms near-peak" this comment used to claim does not hold on
             // the NVIDIA NVFP4 checkpoint: the float tier measures 5979.7 us
             // isolated and 6367.8 us in-situ at M=4, i.e. ~120 GB/s. That is
-            // why the DP4A arm above takes this shape instead when
-            // ATLAS_W4A16_DP4A is set (3772.6 us, 1.58x). The M=5..8 tiers
+            // why the DP4A arm above takes this shape instead when it is
+            // not disabled via ATLAS_W4A16_DP4A=0 (3772.6 us, 1.58x). The M=5..8 tiers
             // still extend the float path to the chain-verify rows
             // (batchm_bench).
             ops::w4a16_gemv_batchm(
