@@ -16,7 +16,17 @@ checkpoint = "unsloth/Qwen3.8-27B-NVFP4"
 gate = "bfcl-subset"
 label = "Qwen3.8-27B dense (NVFP4, unsloth) — Strix Halo gfx1151"
 default = true
-status = "measured"
+# DEMOTED to unmeasured 2026-09-14: the numbers below ARE measured gate data,
+# but the gate's self-start resolves `recipe` from atlas-recipes — and no
+# recipe can express this serve config, whose correctness depends on env
+# vars (ATLAS_FP8_DEQUANT_*/ATLAS_GDN_BF16_WEIGHTS/ATLAS_W4A16_*) that the
+# recipe schema has no field for. A "measured" entry without a resolvable
+# recipe fails `every_committed_baseline_parses_resolves_and_is_checkable`;
+# an invented recipe would self-start the wrong config. Kept here as
+# provenance until a strix-expressible recipe exists — restore "measured"
+# and the floors (samples min/max 995, overall_accuracy min 83.82 noise 0.4,
+# normalized_single_turn_score min 83.28 noise 0.4) with it.
+status = "unmeasured"
 note = """\
 BASELINE ESTABLISHED 2026-09-02, AzeezStrix (gfx1151, 60 GB GTT, ROCm/HIP \
 7.13), golden draw n=995 seed 42 temp 0 with NO param overrides. \
@@ -60,30 +70,19 @@ The MLPerf-instrument number for the same checkpoint (harness bfcl_v4, \
 unsloth-3.6 reference there is 78.59/80.45 (results_st996_unsloth_ccdaab7e); \
 the qwen38 leg is recorded separately and does not gate this entry."""
 
-[benchmarks.metrics.samples]
-# The golden MLPerf draw is exactly 995. A run reporting anything else is not
-# this draw and its score is not comparable — pin both ends.
-min = 995.0
-max = 995.0
-
-[benchmarks.metrics.overall_accuracy]
-# Measured 84.22 (see the note for the full fingerprint). Floor at measured
-# minus the documented 0.4 noise band.
-min = 83.82
-noise = 0.4
-
-[benchmarks.metrics.normalized_single_turn_score]
-# Measured 83.68, same run. One sample under the GB10-derived 83.72; the floor
-# here is cut from THIS run's own measurement, not inherited across hardware.
-min = 83.28
-noise = 0.4
-
 [[benchmarks]]
 quant = "nvfp4"
 checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "bfcl-subset"
 label = "Qwen3.8-27B dense (NVFP4, nvidia shipped) — Strix Halo gfx1151"
-status = "measured"
+# Same demotion as the unsloth entry above: measured data, but the serve
+# config is env-var-bound (ATLAS_W4A16_DP4A/ATLAS_MTP_GATE_FORCE) and no
+# atlas-recipes entry can express it — the gate cannot self-start it, so it
+# cannot be a checkable baseline. Provenance only; restore "measured" with
+# floors (samples 995 pinned, overall_accuracy min 82.82 noise 0.4,
+# normalized_single_turn_score min 78.62 noise 0.4) when a strix-expressible
+# recipe exists.
+status = "unmeasured"
 note = """\
 MEASURED 2026-09-11, AzeezStrix, golden draw n=995 seed 42 temp 0, no \
 param overrides: overall 83.22 / normalized 79.02 (run record \
@@ -107,18 +106,12 @@ Category detail for the requant run: irrelevance 87.50, \
 live_irrelevance 59.09, live_multiple 88.57, live_parallel 68.75, \
 live_parallel_multiple 70.83, live_simple 92.00. The Python/JS cliff \
 persists on this checkpoint (serve-path defect, ~2 points overall). \
-Floors below are cut from the SHIPPED run minus the 0.4 noise band; the \
-requant derivative is recorded here as provenance, not floored — its own \
-entry belongs beside its own checkpoint directory when it is promoted."""
-
-[benchmarks.metrics.samples]
-min = 995.0
-max = 995.0
-
-[benchmarks.metrics.overall_accuracy]
-min = 82.82
-noise = 0.4
-
-[benchmarks.metrics.normalized_single_turn_score]
-min = 78.62
-noise = 0.4
+FULL-STACK RE-RUN 2026-09-14 on the same requant checkpoint, binary \
+spark_gdndp4a2 sha256 f94e6d348a5e (this branch's tip stack: GDN K=4 DP4A + \
+fused conv + strided QKV): overall 83.02 / normalized 80.41 on the \
+identical draw (run-1789370409958768995.json) — +0.31 overall / +0.83 \
+normalized vs the prior requant record, no accuracy regression. \
+The demoted floors (see above) were cut from the SHIPPED run minus the 0.4 \
+noise band; the requant derivative is recorded here as provenance, not \
+floored — its own entry belongs beside its own checkpoint directory when \
+it is promoted."""
