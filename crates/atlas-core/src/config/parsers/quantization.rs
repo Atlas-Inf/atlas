@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::super::{ModelConfig, QuantizationConfig};
+use super::super::{ModelConfig, QuantLayerSpec, QuantizationConfig};
 
 pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<QuantizationConfig> {
     let qc_raw = raw.get("quantization_config")?;
@@ -140,9 +140,35 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
         })
         .unwrap_or(0) as usize;
 
+    // ModelOpt MIXED_PRECISION dumps carry a `quantized_layers` object mapping
+    // module path -> {"quant_algo": "...", "group_size": N}. This is the
+    // authoritative per-component scheme: nvidia/Qwen3.8-Flash-Next-NVFP4 uses
+    // it to declare NVFP4 routed experts, an FP8 PLE table, and an FP8_PB_WO
+    // MTP block in one checkpoint — none of which the top-level
+    // `quant_algo: "MIXED_PRECISION"` label can express.
+    let mut quantized_layers = std::collections::BTreeMap::new();
+    if let Some(obj) = qc.get("quantized_layers").and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            let Some(algo) = v.get("quant_algo").and_then(|a| a.as_str()) else {
+                continue;
+            };
+            quantized_layers.insert(
+                k.clone(),
+                QuantLayerSpec {
+                    quant_algo: algo.to_string(),
+                    group_size: v.get("group_size").and_then(|g| g.as_u64()).unwrap_or(0) as usize,
+                },
+            );
+        }
+    }
+
     // An empty quant_method with empty ignore list is not a real quant
     // config — skip so callers can fall through to heuristic detection.
-    if quant_method.is_empty() && quant_algo.is_empty() && ignore_modules.is_empty() {
+    if quant_method.is_empty()
+        && quant_algo.is_empty()
+        && ignore_modules.is_empty()
+        && quantized_layers.is_empty()
+    {
         return None;
     }
 
@@ -153,6 +179,7 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
         ignore_modules,
         weight_block_size,
         group_size,
+        quantized_layers,
     })
 }
 
@@ -279,5 +306,46 @@ mod tests {
         assert_eq!(qc.quant_method, "modelopt");
         assert_eq!(qc.quant_algo, "MIXED_PRECISION");
         assert!(qc.ignore_modules.is_empty());
+    }
+
+    /// nvidia/Qwen3.8-Flash-Next-NVFP4: flat ModelOpt block, `MIXED_PRECISION`
+    /// top label, and a `quantized_layers` map that must survive into the
+    /// config — it is the only place the per-component schemes are declared.
+    #[test]
+    fn modelopt_mixed_precision_quantized_layers_map_parses() {
+        let raw = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "producer": { "name": "modelopt" },
+                "quantized_layers": {
+                    "model.language_model.layers.3.mlp.experts": {
+                        "quant_algo": "NVFP4", "group_size": 16
+                    },
+                    "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {
+                        "quant_algo": "FP8"
+                    },
+                    "mtp.layers.0.mlp.experts": {
+                        "quant_algo": "FP8_PB_WO", "group_size": 128
+                    }
+                }
+            }
+        });
+        let qc = parse_quantization_config(&raw).expect("must parse");
+        assert_eq!(qc.quant_algo, "MIXED_PRECISION");
+        assert_eq!(qc.quantized_layers.len(), 3);
+        let exp = &qc.quantized_layers["model.language_model.layers.3.mlp.experts"];
+        assert_eq!(exp.quant_algo, "NVFP4");
+        assert_eq!(exp.group_size, 16);
+        assert_eq!(
+            qc.quantized_layers["mtp.layers.0.mlp.experts"].quant_algo,
+            "FP8_PB_WO"
+        );
+        // Entries without a group_size still parse, at 0.
+        assert_eq!(
+            qc.quantized_layers["model.language_model.layers.1.ple.ple_embedding.ngram_embedding"]
+                .group_size,
+            0
+        );
     }
 }

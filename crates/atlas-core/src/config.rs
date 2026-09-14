@@ -693,6 +693,21 @@ pub struct QuantizationConfig {
     /// NVFP4 scaling group along the input dimension (ModelOpt `group_size`,
     /// typically 16). `0` when the scheme does not group.
     pub group_size: usize,
+    /// Per-module scheme map from a ModelOpt `MIXED_PRECISION` dump's
+    /// `quantized_layers` object — e.g.
+    /// `"model.language_model.layers.3.mlp.experts": {"quant_algo":"NVFP4","group_size":16}`.
+    /// Empty for uniform checkpoints (RadixArk's `quant_algo: "NVFP4"` has no
+    /// map). This is what distinguishes the nvidia Flash-Next pack: 48 routed-
+    /// expert layers at NVFP4, one FP8 PLE table, one FP8_PB_WO MTP block.
+    pub quantized_layers: std::collections::BTreeMap<String, QuantLayerSpec>,
+}
+
+/// One `quantized_layers` entry: the algorithm applied to that module path
+/// (`"NVFP4"`, `"FP8"`, `"FP8_PB_WO"`, …) plus its scaling group when given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuantLayerSpec {
+    pub quant_algo: String,
+    pub group_size: usize,
 }
 
 /// Vision encoder configuration for Qwen3-VL models.
