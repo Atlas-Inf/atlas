@@ -265,7 +265,21 @@ impl MtpHead {
             moe_silu_mul_k,
             moe_weighted_sum_blend_k,
         ) = match quant {
-            MtpQuantization::Nvfp4 => (None, None, None, None, None, None),
+            MtpQuantization::Nvfp4 => (
+                // Dense-checkpoint NVFP4 heads still run the BF16-kernel
+                // helpers: `dense_ffn_forward_generic` silu_muls its gate/up
+                // pair via `moe_silu_mul` (moe_forward.rs:60) and the batched
+                // path does the same (forward_batch.rs:469) plus gated-Q
+                // `deinterleave_qg` (forward_batch.rs:277) and the
+                // `dense_gemv` row fallback. The MoE-only handles stay None —
+                // NVFP4 MoE uses the fused MoeLayer, never these.
+                Some(gpu.kernel("gemv", "dense_gemv_bf16")?),
+                None,
+                Some(gpu.kernel("ssm_preprocess", "deinterleave_qg")?),
+                None,
+                Some(gpu.kernel("moe_silu_mul", "moe_silu_mul")?),
+                None,
+            ),
             MtpQuantization::Fp8 => (
                 // BF16 GEMV needed for gate (always BF16) + generic MoE dispatch
                 Some(gpu.kernel("gemv", "dense_gemv_bf16")?),
