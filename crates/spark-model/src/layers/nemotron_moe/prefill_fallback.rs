@@ -90,6 +90,7 @@ impl NemotronMoeLayer {
                     p.latent,
                     p.top_k,
                     0,
+                    1,
                     stream,
                 )?;
                 let token_shared_up = p
@@ -211,6 +212,7 @@ impl NemotronMoeLayer {
                     p.h as u32,
                     p.top_k,
                     0,
+                    1,
                     stream,
                 )?;
                 let token_shared_up = p

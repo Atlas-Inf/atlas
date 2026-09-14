@@ -148,7 +148,11 @@ pub fn step_verify_k2(
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax) = (result_vec[0], result_vec[1]);
 
-    let (v0, v1) = if dflash_verify_raw_argmax && !sched.levers.dflash_masked_verify {
+    let (v0, v1) = if crate::scheduler::helpers::dflash_verify_uses_raw_argmax(
+        dflash_verify_raw_argmax,
+        sched.levers.dflash_masked_verify,
+        model.is_lightning_dspark_product(),
+    ) {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD) basis.
         (v0_argmax, v1_argmax)
     } else {
@@ -226,6 +230,12 @@ pub fn step_verify_k2(
             tracing::error!("dflash_eagle_accept_append: {e:#}");
         }
         let t_save = Instant::now();
+        // Same row, the other input shape: a drafter reading the PRE-mixer
+        // stream highway needs row 1 staged into row 0, or it proposes from
+        // the first verify row instead of the accepted one.
+        if let Err(e) = model.select_mtp_stream_row(1) {
+            tracing::error!("select_mtp_stream_row(1): {e:#}");
+        }
         if let Err(e) = model.save_hidden_for_mtp(1, 0) {
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
             return;
@@ -301,6 +311,12 @@ pub fn step_verify_k2(
         a.last_token = v0;
 
         let t_save = Instant::now();
+        // Same row, the other input shape: a drafter reading the PRE-mixer
+        // stream highway needs row 0 staged into row 0, or it proposes from
+        // the first verify row instead of the accepted one.
+        if let Err(e) = model.select_mtp_stream_row(0) {
+            tracing::error!("select_mtp_stream_row(0): {e:#}");
+        }
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp(0): {e:#}");
             return;

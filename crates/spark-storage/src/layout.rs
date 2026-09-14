@@ -118,7 +118,7 @@ fn set_direct_flag(opts: &mut OpenOptions) {
 #[cfg(not(target_os = "linux"))]
 fn set_direct_flag(_opts: &mut OpenOptions) {}
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn preallocate(file: &File, size: u64) -> Result<()> {
     // posix_fallocate is portable across ext4/xfs and reserves space without
     // writing zeros; FALLOC_FL_KEEP_SIZE would be wrong here because we *do*
@@ -128,6 +128,17 @@ fn preallocate(file: &File, size: u64) -> Result<()> {
     if res != 0 {
         anyhow::bail!("posix_fallocate({size}) failed: {res}");
     }
+    Ok(())
+}
+
+// macOS has no `posix_fallocate`; `F_PREALLOCATE` is the nearest primitive and
+// needs a fcntl struct this tier never uses in production (the NVMe tiers are
+// Linux-only). `set_len` reserves the RANGE rather than the blocks -- the same
+// weaker guarantee the Windows arm below documents -- and exists so the
+// workspace type-checks on an Apple-silicon dev box.
+#[cfg(target_os = "macos")]
+fn preallocate(file: &File, size: u64) -> Result<()> {
+    file.set_len(size)?;
     Ok(())
 }
 

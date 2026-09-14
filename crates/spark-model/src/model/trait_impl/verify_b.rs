@@ -221,6 +221,16 @@ impl TransformerModel {
         let k2_diag_eager = std::env::var("ATLAS_K2_DIAG").ok().as_deref() == Some("1");
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
+        // A layer whose decode keeps HOST-side per-sequence state cannot be
+        // captured: a replayed graph re-runs the kernels but NOT the Rust that
+        // maintains the counter beside them. The QSA indexer's `ingested`
+        // froze at the capture step while the sequence kept advancing, and the
+        // desync stayed invisible until a non-replayed path ran a
+        // `decode_select` again — at the MTP gate's batch-width switch, which
+        // failed with "decode at pos 34 but 26 tokens ingested". `decode_a`
+        // and `decode_a2` already apply this veto; the verify paths never did,
+        // because on this model they used to refuse before reaching a graph.
+        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
         let use_graphs = self.comm.is_none()
             && !self
                 .suppress_graphs
@@ -229,7 +239,8 @@ impl TransformerModel {
             // illegal under CUDA graph capture.
             && !hss_engaged
             && !k2_diag_eager
-            && !lora_eager;
+            && !lora_eager
+            && !layer_veto;
 
         // DeepSeek-V4 hash-MoE (first `num_hash_layers`) routes experts by token
         // id via the static tid2eid table, so the verify forward needs the 2
@@ -239,6 +250,21 @@ impl TransformerModel {
         let tid_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         self.gpu
             .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), stream)?;
+
+        // PLE's host half (n-gram hash + NVMe fault-in + slot upload) for the
+        // WHOLE draft window, hoisted before capture/replay exactly as
+        // `decode_a` hoists the single decode token. Without it the verify
+        // forward has no staging to consume and falls back to a D2H readback,
+        // which invalidates a recording graph (901) — the "PLE: no
+        // host_token_ids ... capture-unsupported" refusal. #753 item B.
+        for (li, l) in self.layers.iter().enumerate() {
+            l.verify_prestage(
+                &tokens[..],
+                seq.layer_states[li].as_mut(),
+                self.gpu.as_ref(),
+                stream,
+            )?;
+        }
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -254,6 +280,7 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: Some(self.buffers.token_ids()),
+            host_token_ids: Some(&tokens[..]),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
@@ -322,18 +349,22 @@ impl TransformerModel {
                             stream,
                         )?;
                     } else {
-                        // Attention: treat 2 tokens as 2 virtual sequences via
-                        // decode_multi_seq. EmptyLayerState has no actual state.
-                        let mut dummy_states: Vec<Box<dyn LayerState>> = (0..k)
-                            .map(|_| layer.alloc_state(self.gpu.as_ref()))
-                            .collect::<Result<_>>()?;
-                        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
-                            dummy_states.iter_mut().map(|s| s.as_mut()).collect();
-                        layer.decode_multi_seq(
+                        // Attention: the k tokens ride as k rows, but they are
+                        // k tokens of ONE sequence, not k sequences. Any
+                        // per-sequence aux state (the QSA indexer) must advance
+                        // once per row against THIS sequence's own state —
+                        // `row_owner` says so. Allocating a state per row, as
+                        // this did while attention was stateless, handed the
+                        // indexer an empty history (ingested=0 at pos>0).
+                        let mut seq_state_arr: [&mut (dyn LayerState + 'static); 1] =
+                            [seq.layer_states[layer_idx].as_mut()];
+                        let row_owner = vec![0usize; k];
+                        layer.decode_multi_seq_rows(
                             hidden,
                             residual,
                             k,
-                            &mut refs,
+                            &mut seq_state_arr,
+                            &row_owner,
                             &mut kv_cache,
                             &seq_lens_vec,
                             &block_tables_vec,

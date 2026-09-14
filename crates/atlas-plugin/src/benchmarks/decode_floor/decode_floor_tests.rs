@@ -45,6 +45,9 @@ fn three_healthy_runs_measure_the_median() {
 fn min_output_tokens_is_the_worst_run_not_the_mean() {
     let mut samples = [healthy(30.0), healthy(30.0), healthy(30.0)];
     samples[1].completion_tokens = MIN_OUTPUT_TOKENS; // exactly at the floor: still valid
+    // …but the accept accounting still has to be sane at that width: accepted
+    // must stay strictly below completion or the run is corrupt, not measured.
+    samples[1].accepted_prediction_tokens = Some(MIN_OUTPUT_TOKENS / 2);
     match evaluate(&samples) {
         Evaluation::Measured {
             min_output_tokens, ..
@@ -58,7 +61,7 @@ fn min_output_tokens_is_the_worst_run_not_the_mean() {
 #[test]
 fn output_floor_is_inclusive_and_one_below_is_inconclusive() {
     let mut samples = [healthy(30.0), healthy(30.0), healthy(30.0)];
-    samples[2].completion_tokens = MIN_OUTPUT_TOKENS - 1; // 799
+    samples[2].completion_tokens = MIN_OUTPUT_TOKENS - 1; // 699
     match evaluate(&samples) {
         Evaluation::Inconclusive(why) => {
             assert!(why.contains("run 3"), "{why}");
@@ -273,9 +276,10 @@ fn the_floor_param_is_wired_to_the_gate() {
 fn the_pins_are_the_documented_fingerprint() {
     assert_eq!(RUNS, 3);
     assert_eq!(MAX_TOKENS, 1500);
-    // 750 since the 2026-08-15 promotion calibration: the instrument's
-    // deterministic natural stop is 915, and the pin must sit under it.
-    assert_eq!(MIN_OUTPUT_TOKENS, 750);
+    // 700: the served subject (nvidia/Qwen3.8-27B-NVFP4) stops at a
+    // deterministic 717-718, so the pin must sit under THAT, not the unsloth
+    // checkpoint's 915.
+    assert_eq!(MIN_OUTPUT_TOKENS, 700);
     assert_eq!(MIN_ACCEPT_LEN, 1.5);
     assert!(MINHEAP_PROMPT.contains("MinHeap"));
 }

@@ -48,11 +48,11 @@ export const nvidiaInceptionUrl = 'https://www.nvidia.com/en-us/startups/';
 export const tagline = 'Pure Rust inference, tuned for the machine on your desk.';
 
 // --- commands (one flagship recipe, kept in lockstep with static/quickstart.sh)
-export const flagshipRecipe = 'qwen3.6-35b-a3b-fp8-mtp';
+export const flagshipRecipe = 'qwen3.8-27b-nvfp4';
 export const quickInstall = 'uvx sparkrun setup install';
 export const runCommand = 'curl -fsSL https://atlasinference.dev/quickstart.sh | sh';
 export const runCommandRaw =
-  'uvx sparkrun setup install && sparkrun run @atlas/qwen3.6-35b-a3b-fp8-mtp --hosts localhost';
+  'uvx sparkrun setup install && sparkrun run @atlas/qwen3.8-27b-nvfp4 --hosts localhost';
 
 // --- hardware acknowledgment (modest banner) ---------------------------------
 export const gifts = {
@@ -81,7 +81,7 @@ export const hero = {
   badge: 'Open source. Pure Rust and CUDA. Verified on GB10.',
   headline: ['The inference engine for the', 'machine on your desk.'],
   sub:
-    'Atlas is an open source LLM engine we hand tuned for NVIDIA DGX Spark. One ~75 MB binary, no Python, no PyTorch. What ships is what we verify, and we bench it every single release.',
+    'Atlas is an open source LLM engine hand tuned for NVIDIA DGX Spark. One ~75 MB binary, no Python, no PyTorch. Tuned for Qwen3.8 and Nemotron, and verified every single release.',
   challenge: {
     claim: 'First token in under 90 seconds on a DGX Spark.',
     lead: 'Do not take our word for it.',
@@ -238,7 +238,7 @@ export const hardware = {
       statusText: 'Verified today',
       gift: true,
       body:
-        'One multi model binary serves a full matrix of hand tuned targets on a single GB10. NVFP4 and FP8, MTP speculative decoding, EP=2 across two Sparks. Every target passes the serve matrix before we cut an image.',
+        'One multi model binary serves a full matrix of hand tuned targets on a single GB10. NVFP4 and FP8, Qwen3.8-27B, Qwen 3.8 Flash, Nemotron 3.5 Lightning with DSpark, EP=2 across two Sparks. Every target passes the serve matrix before we cut an image.',
       cta: { text: 'Read the deployment guide', url: guideUrl }
     },
     {
@@ -260,9 +260,9 @@ export const models = {
   label: '// 05 · models',
   title: 'Every model here has a recipe.',
   sub:
-    'Pick a vendor, then a family. Every card maps to one recipe in atlas-recipes, so the site cannot list a model we do not ship. Copy the command and run it as is. Qwen3.6 leads because it is our flagship.',
+    'Pick a vendor, then a family. Every card maps to one recipe in sparkrun-recipes, so the site cannot list a model we do not ship. Copy the command and run it as is. Qwen3.8 leads because it is our flagship.',
   qwen: {
-    kernel: 'Our fused Qwen3.6 Gated DeltaNet kernel ships in Hugging Face Transformers.',
+    kernel: 'Our fused Qwen Gated DeltaNet kernels ship in Hugging Face Transformers.',
     kernelUrl: transformersPrUrl,
     hubText: 'kernel repo on the Hub',
     hubUrl: hubKernelUrl,
@@ -280,7 +280,7 @@ export const getRunning = {
   inspectNote: 'Rather not pipe curl to a shell. Install sparkrun, then run the flagship recipe direct.',
   docsCta: 'Read the deployment guide',
   quickstartHint:
-    'The script checks for sparkrun, installs it with uvx if missing, then runs the flagship Qwen3.6 recipe.'
+    'The script checks for sparkrun, installs it with uvx if missing, then runs the flagship Qwen3.8-27B recipe.'
 };
 
 // --- mission -----------------------------------------------------------------
@@ -309,8 +309,8 @@ export const contribute = {
     },
     {
       title: 'Add or tune a recipe',
-      body: 'Recipes are the model SSOT. Add a model, tune a quant, open a PR against atlas-recipes.',
-      cta: 'atlas-recipes',
+      body: 'Recipes are the model SSOT. Add a model, tune a quant, open a PR against sparkrun-recipes.',
+      cta: 'sparkrun-recipes',
       url: recipesUrl
     },
     {
@@ -335,6 +335,14 @@ export const roadmap = {
   title: 'What we are building next.',
   sub: 'Everything real links to an issue, a PR, or the Discord where the work happens. The teasers are teasers, and we say so.',
   items: [
+    {
+      title: 'Nemotron-3.5-Lightning + DSpark',
+      status: 'PR recipe live',
+      gift: true,
+      body: 'Verified on GB10 silicon. Double-buffered Mamba-2 chunked scans paired with the 6-layer DSpark speculative drafter.',
+      cta: 'Recipe in sparkrun',
+      url: recipesUrl
+    },
     {
       title: 'Trifecta, three Sparks',
       status: 'Next up',
@@ -412,6 +420,142 @@ export const reachout = {
 // --- ask the codebase (chat modal) -------------------------------------------
 // Copy SSOT for the CodeChat modal. Retrieval runs locally in wasm from the
 // repo corpus, answers come from free OpenRouter models with the visitor's own
+
+// --- ask the codebase (chat modal) -------------------------------------------
+// Copy SSOT for the CodeChat modal. Retrieval runs locally in wasm from the
+// repo corpus, answers come from free OpenRouter models with the visitor's own
+// key. Same voice rules as everything above.
+export const codeChat = {
+  navLabel: 'Ask the codebase',
+  closeLabel: 'Close ask the codebase',
+  label: '// 11 \u00b7 ask the codebase',
+  title: 'Ask the codebase.',
+  sub:
+    'The whole Atlas repo is embedded into a vector lattice that runs right here in your browser. Ask a question, get an answer with file and line receipts.',
+  boot: [
+    'atlas code lattice online',
+    'retrieval runs locally in wasm, only the model call leaves this page',
+    'pick a question or type your own'
+  ],
+  starters: [
+    'How does MTP speculative decoding pick which draft tokens to keep?',
+    'Where does the scheduler decide which requests join a decode batch?',
+    'How do the NVFP4 GEMM kernels get dispatched on GB10?'
+  ],
+  key: {
+    tag: 'openrouter key',
+    lead:
+      'Answers come from free models on OpenRouter, so you bring your own key. It stays in this browser and we never see it.',
+    linkText: 'grab a free key at openrouter.ai/keys',
+    url: 'https://openrouter.ai/keys',
+    placeholder: 'sk-or-v1-...',
+    inputLabel: 'OpenRouter API key',
+    reveal: 'show',
+    conceal: 'hide',
+    save: 'connect',
+    connectedTag: 'connected',
+    connectedNote: 'key stored in this browser only',
+    change: 'swap key'
+  },
+  status: {
+    idle: 'standby',
+    'wasm-init': 'starting engine',
+    manifest: 'fetching manifest',
+    'loading-cached': 'reading local cache',
+    downloading: 'downloading corpus',
+    caching: 'writing local cache',
+    indexing: 'indexing',
+    ready: 'ready',
+    error: 'fault'
+  },
+  offlineBadge: 'cached \u00b7 offline',
+  phase: {
+    retrieving: 'searching the lattice',
+    reranking: 'reranking matches',
+    thinking: 'reasoning',
+    writing: 'writing'
+  },
+  trace: {
+    label: 'reasoning',
+    reasonedPrefix: 'reasoned for',
+    show: 'show',
+    hide: 'hide'
+  },
+  loader: {
+    title: 'mounting the code lattice',
+    commitLabel: 'commit',
+    sizeLabel: 'download',
+    chunksLabel: 'chunks',
+    stages: {
+      'wasm-init': 'start the wasm engine',
+      manifest: 'fetch the corpus manifest',
+      corpus: 'load the corpus',
+      indexing: 'index the chunks'
+    },
+    cancelNote: 'close anytime, the download cancels cleanly and nothing partial is kept'
+  },
+  input: {
+    placeholder: 'ask about kernels, scheduling, quantization, anything in the repo',
+    ask: 'ask',
+    hintLoading: 'the corpus is still mounting, hang tight',
+    hintNoKey: 'connect your OpenRouter key above to ask',
+    fine: 'answers are generated and can be wrong, the source links are real so read them before you trust them'
+  },
+  answerTag: 'answer',
+  sourcesHeading: 'source receipts',
+  sourcesOne: 'source',
+  sourcesMany: 'sources',
+  loadFail: 'The chat window did not load, maybe the network blinked. Close and try again.',
+  model: {
+    label: 'answer model',
+    reset: 'back to free'
+  },
+
+  errors: {
+    wasm: {
+      tag: 'engine fault',
+      body: 'The wasm engine failed to start. Usually a one off, a retry brings it right up.',
+      retry: 'restart engine'
+    },
+    manifest: {
+      tag: 'manifest unreachable',
+      body: 'Could not reach the corpus manifest. Check your connection and retry.',
+      retry: 'retry'
+    },
+    corpus: {
+      tag: 'download failed',
+      body: 'The corpus download did not finish. Nothing partial was kept, retry whenever.',
+      retry: 'retry download'
+    },
+    decompress: {
+      tag: 'unpack failed',
+      body: 'Your browser could not unpack the corpus stream. Any current Chrome, Edge, Firefox or Safari handles it.',
+      retry: 'retry'
+    },
+    rate: {
+      tag: 'rate limited',
+      body: 'The free OpenRouter models are catching their breath. Give it a few seconds.',
+      retry: 'ask again'
+    },
+    quota: {
+      tag: 'daily limit reached',
+      body: 'Your OpenRouter key has spent its free model allowance for today. Retrieval still runs locally so the corpus stays loaded and ready.',
+      reset: 'The free pool refills at',
+      paid: 'switch to the paid model and spend my own credits',
+      retry: 'ask again'
+    },
+    key: {
+      tag: 'key rejected',
+      body: 'OpenRouter did not accept that key. Paste a fresh one and reconnect.',
+      retry: 'swap key'
+    },
+    generic: {
+      tag: 'hiccup',
+      body: 'That one did not go through. Retry in a moment.',
+      retry: 'retry'
+    }
+  }
+};
 
 // --- footer ------------------------------------------------------------------
 export const footer = {

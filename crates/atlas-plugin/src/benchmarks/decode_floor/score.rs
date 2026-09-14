@@ -16,17 +16,16 @@ pub(crate) const RUNS: usize = 3;
 pub(crate) const MAX_TOKENS: usize = 1500;
 /// Vacuity floor on every run's `completion_tokens`.
 ///
-/// ★ 750, not 1200 — recalibrated to the gate's own instrument at promotion
-/// (2026-08-15). The 12-run calibration (temp 0 / seed 0, this fixture)
-/// completes at a DETERMINISTIC 915 tokens of the 1500 budget: the model's
-/// natural stop for the MinHeap task, identical every run. The original 1200
-/// floor predated that measurement and would have made the calibrated
-/// instrument INCONCLUSIVE by construction — a gate that fails its own
-/// reference behaviour deterministically gates nothing. 750 keeps the pin's
-/// purpose (a 49-token burst can never read as a decode measurement) while
-/// sitting safely under the instrument's natural 915 with margin for small
-/// completion-length drift.
-pub(crate) const MIN_OUTPUT_TOKENS: usize = 750;
+/// ★ 700, not 1200 — the same rule applied to the CURRENT subject. The gate
+/// serves nvidia/Qwen3.8-27B-NVFP4, whose natural stop for the MinHeap task is
+/// a deterministic 717-718 tokens of the 1500 budget (measured 2026-09-11/12
+/// across the gate's own driver), against the unsloth checkpoint's 915. A pin
+/// above a subject's own reference behaviour fails every honest run by
+/// construction — a gate that cannot pass its own instrument gates nothing —
+/// so the pin sits under the narrower of the two stops with margin for small
+/// completion-length drift, while still refusing a 49-token burst as a decode
+/// measurement.
+pub(crate) const MIN_OUTPUT_TOKENS: usize = 700;
 /// Vacuity floor on the derived tokens-per-decode-step.
 pub(crate) const MIN_ACCEPT_LEN: f64 = 1.5;
 

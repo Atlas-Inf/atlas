@@ -466,3 +466,12 @@ fn watchdog_defaults_keep_mid_think_eos_block_inert() {
         "think-loop watchdog must default ON (opt-out per model)"
     );
 }
+
+#[test]
+fn dspark_proposal_failure_fails_closed_only_for_lightning_product() {
+    // The production decision shared by mtp_step bootstrap and
+    // verify_dflash_step re-propose: generic DFlash/MTP keeps the legacy
+    // log-and-fall-through; the Lightning product fails closed.
+    assert!(crate::scheduler::helpers::dspark_proposal_failure_fails_closed(true));
+    assert!(!crate::scheduler::helpers::dspark_proposal_failure_fails_closed(false));
+}

@@ -14,9 +14,9 @@
 # =============================================================================
 set -eu
 
-# The recipe to launch. Keep in lockstep with the site copy + atlas-recipes
+# The recipe to launch. Keep in lockstep with the site copy + sparkrun-recipes
 # SSOT (https://github.com/Atlas-Inf/sparkrun-recipes).
-RECIPE="qwen3.6-35b-a3b-fp8-mtp"
+RECIPE="qwen3.8-27b-nvfp4"
 
 # sparkrun requires a target host list (it errors "No hosts specified"
 # otherwise). Default to the local Spark; override with ATLAS_HOSTS for a

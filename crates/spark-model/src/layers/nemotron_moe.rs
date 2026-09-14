@@ -16,10 +16,8 @@
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use spark_runtime::kv_cache::PagedKvCache;
 
-use crate::layer::{EmptyLayerState, ForwardContext, LayerState, TransformerLayer};
-use crate::layers::ops;
+use crate::layers::{nemotron_decode_policy, ops};
 use crate::weight_map::{DenseWeight, NemotronMoeWeights, QuantizedWeight};
 
 /// Device-side pointer table for one projection across all experts.
@@ -42,11 +40,20 @@ pub struct NemotronMoeLayer {
     // Kernel handles — decode (single token)
     rms_norm_residual_k: KernelHandle,
     dense_gemv_k: KernelHandle,
+    /// Bit-identical M-row sibling of `dense_gemv_k` (M<=8). K-row verify
+    /// must use this for router logits: the tiled prefill GEMM changes BF16
+    /// rounding and can select different experts than sequential decode.
+    dense_gemv_batchm_k: KernelHandle,
     topk_sigmoid_k: KernelHandle,
     moe_expert_gemv_k: KernelHandle,
+    moe_expert_gemv_wide_k: KernelHandle,
+    moe_expert_gemv_wide_grouped_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     w4a16_gemv_sw_k: KernelHandle,
+    w4a16_gemv_batch4_k: KernelHandle,
+    w4a16_gemv_batch16_k: KernelHandle,
+    w4a16_gemv_batch32_k: KernelHandle,
     /// Native-FP8 decode GEMV for the shared-expert up_proj (see
     /// `NemotronMoeWeights::shared_up_fp8`). 0 when unavailable.
     w8a16_gemv_k: KernelHandle,
@@ -54,6 +61,7 @@ pub struct NemotronMoeLayer {
     w8a16_gemm_k: KernelHandle,
     w8a16_gemm_pipelined_k: KernelHandle,
     relu2_down_shared_k: KernelHandle,
+    relu2_down_wide_k: KernelHandle,
     weighted_sum_scale_k: KernelHandle,
     residual_add_k: KernelHandle,
     // Kernel handles — prefill (batched GEMM)
@@ -100,6 +108,7 @@ pub struct NemotronMoeLayer {
     fp8_gemm_m128_k: KernelHandle,
     w4a4_gemm_k: KernelHandle,
     quantize_nvfp4_k: KernelHandle,
+    marlin: Option<marlin_sidecar::MarlinSidecar>,
 }
 
 impl NemotronMoeLayer {
@@ -143,6 +152,15 @@ impl NemotronMoeLayer {
             crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
         );
 
+        let marlin = marlin_sidecar::MarlinSidecar::try_build(
+            gpu,
+            &weights.experts,
+            moe_inter,
+            config.hidden_size,
+            config.hidden_size,
+            moe_inter,
+        )?;
+
         Ok(Self {
             weights,
             input_norm,
@@ -151,10 +169,28 @@ impl NemotronMoeLayer {
             top_k,
             rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv_batchm_k: super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm",
+            ),
             topk_sigmoid_k: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid")?,
             moe_expert_gemv_k: gpu.kernel("moe_expert_gemv", "moe_expert_gemv")?,
+            moe_expert_gemv_wide_k: super::try_kernel(
+                gpu,
+                "moe_expert_gemv_wide",
+                "moe_expert_gemv_wide",
+            ),
+            moe_expert_gemv_wide_grouped_k: super::try_kernel(
+                gpu,
+                "moe_expert_gemv_wide_grouped",
+                "moe_expert_gemv_wide_grouped",
+            ),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
+            w4a16_gemv_batch4_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch4"),
+            w4a16_gemv_batch16_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
+            w4a16_gemv_batch32_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch32"),
             w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),
             w8a16_gemm_k: super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
             w8a16_gemm_pipelined_k: super::try_kernel(
@@ -163,6 +199,11 @@ impl NemotronMoeLayer {
                 "w8a16_gemm_pipelined",
             ),
             relu2_down_shared_k: gpu.kernel("moe_relu2_fused", "moe_expert_relu2_down_shared")?,
+            relu2_down_wide_k: super::try_kernel(
+                gpu,
+                "moe_expert_relu2_down_wide",
+                "moe_expert_relu2_down_wide",
+            ),
             weighted_sum_scale_k: gpu.kernel("relu2", "moe_weighted_sum_scale")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
@@ -222,184 +263,22 @@ impl NemotronMoeLayer {
             fp8_gemm_m128_k: super::try_kernel(gpu, "w4a16", "fp8_gemm_t_m128_mfast"),
             w4a4_gemm_k: super::try_kernel(gpu, "w4a4", "w4a4_gemm_mfast"),
             quantize_nvfp4_k: super::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4"),
+            marlin,
         })
     }
 }
 
+mod decode_batched;
 mod decode_helpers;
+mod marlin_linear;
+mod marlin_sidecar;
+mod marlin_slots;
 mod prefill_fallback;
+mod prefill_marlin;
 mod prefill_shared_up;
 mod prefill_sorted;
 mod prefill_weights;
 mod ptr_tables;
+mod transformer_layer;
 
-use prefill_sorted::SortedPrefillCtx;
 use ptr_tables::{build_ptr_table, build_ptr_table_from_weights};
-
-impl TransformerLayer for NemotronMoeLayer {
-    fn decode(
-        &self,
-        hidden: DevicePtr,
-        residual: DevicePtr,
-        _state: &mut dyn LayerState,
-        _kv_cache: &mut PagedKvCache,
-        _seq_len: usize,
-        _block_table: &mut Vec<u32>,
-        _disk_block_ids: &mut Vec<u32>,
-        _disk_last_offloaded_per_layer: &mut Vec<u32>,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        self.decode_inner(hidden, residual, ctx, stream)
-    }
-
-    /// Batched MoE prefill: uses GEMM for gate/fc1/fc2/shared, per-token for routing + experts.
-    ///
-    /// For Super 120B with 40 MoE layers, this replaces O(N * 7 kernel_launches) decode calls
-    /// with O(4 GEMMs + N * 3 kernel_launches), cutting TTFT by 30-50%.
-    #[allow(clippy::overly_complex_bool_expr)]
-    fn prefill(
-        &self,
-        hidden: DevicePtr,
-        residual: DevicePtr,
-        num_tokens: usize,
-        _state: &mut dyn LayerState,
-        _kv_cache: &mut PagedKvCache,
-        _seq_len_start: usize,
-        _block_table: &mut Vec<u32>,
-        _disk_block_ids: &mut Vec<u32>,
-        _disk_last_offloaded_per_layer: &mut Vec<u32>,
-        _kv_write_start: usize,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        let h = ctx.config.hidden_size;
-        let inter = self.moe_inter as u32;
-        let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
-        let num_experts = ctx.config.num_experts as u32;
-        let top_k = self.top_k as u32;
-        let eps = ctx.config.rms_norm_eps as f32;
-        let scale = ctx.config.routed_scaling_factor as f32;
-        let n = num_tokens as u32;
-
-        // ── 1. Batched RMS norm: [N, H] → normed[N, H] + residual update ──
-        let normed = ctx.buffers.norm_output();
-        ops::rms_norm_residual(
-            ctx.gpu,
-            self.rms_norm_residual_k,
-            hidden,
-            &self.input_norm,
-            normed,
-            residual,
-            n,
-            h as u32,
-            eps,
-            stream,
-        )?;
-
-        // ── 2. Batched Gate GEMM: [N, H] x [H, num_experts]^T → [N, num_experts] ──
-        let gate_logits = ctx.buffers.gate_logits();
-        self.dense_gemm_prefill(
-            ctx.gpu,
-            normed,
-            &self.weights.gate,
-            gate_logits,
-            n,
-            num_experts,
-            h as u32,
-            stream,
-        )?;
-
-        // Check if batched MoE prefill kernels are available
-        let has_batched = self.topk_sigmoid_batched_k.0 != 0
-            && self.moe_up_prefill_k.0 != 0
-            && self.moe_relu2_down_prefill_k.0 != 0
-            && self.moe_weighted_sum_prefill_k.0 != 0;
-
-        // ── 3. Shared expert UP ──
-        // When batched MoE prefill is available, the shared expert UP is handled
-        // inside the batched UP kernel (step 5b). We only pre-compute here for
-        // the per-token fallback path or LatentMoE.
-        let shared_up_out_base = ctx.buffers.ssm_qkvz();
-        let use_batched_moe = has_batched && num_tokens > 1;
-        // Always compute shared expert UP — even when batched path overwrites it later.
-        // The batched UP kernel writes shared_up_out for shared blocks, but we need
-        // this result for the per-token fallback path AND it's harmless to overwrite.
-        // Arm selection (native FP8 → W4A4 → pre-dequant FP8 → transposed NVFP4
-        // → plain W4A16) lives in `prefill_shared_up.rs` (500-LoC cap split).
-        self.prefill_shared_up(normed, shared_up_out_base, n, h, shared_inter, ctx, stream)?;
-
-        // ── 4. LatentMoE: batched fc1_latent GEMM [N, H] → [N, L] ──
-        // Use attn_output as temp buffer (m*max_dim*2, large enough for [N, L]).
-        // Cannot use ssm_ba (too small) or moe_output (used later for unpermute).
-        let latent = self.moe_latent_size as u32;
-        let latent_base = if latent > 0 {
-            let latent_buf = ctx.buffers.attn_output();
-            if let Some(w_fp8) = self.fc1_pd_fp8 {
-                ops::fp8_gemm_m128_mfast(
-                    ctx.gpu,
-                    self.fp8_gemm_m128_k,
-                    normed,
-                    w_fp8,
-                    latent_buf,
-                    n,
-                    latent,
-                    h as u32,
-                    stream,
-                )?;
-            } else {
-                let fc1 = self.weights.fc1_latent_proj.as_ref().unwrap();
-                self.dense_gemm_prefill(
-                    ctx.gpu, normed, fc1, latent_buf, n, latent, h as u32, stream,
-                )?;
-            }
-            Some(latent_buf)
-        } else {
-            None
-        };
-
-        // ── 5. Batched routing + expert dispatch (N tokens, 4 kernel launches) ──
-        // When batched prefill kernels are available, replace the per-token loop
-        // (N × 5 launches = 10k+ launches) with 4 batched launches.
-        let scratch = ctx.buffers.scratch();
-        let indices_dev = scratch;
-        let weights_dev = scratch.offset(n as usize * top_k as usize * 4);
-
-        // Sorted MoE prefill: sort tokens by expert, then grouped GEMM.
-        // This is the proven Qwen pattern — avoids the crashing batched UP/DOWN kernels.
-        let use_sorted = use_batched_moe
-            && self.moe_sort_k.0 != 0
-            && self.moe_grouped_gemm_k.0 != 0
-            && self.moe_unpermute_reduce_k.0 != 0;
-
-        let p = SortedPrefillCtx {
-            n,
-            num_tokens,
-            h,
-            inter,
-            shared_inter,
-            num_experts,
-            top_k,
-            scale,
-            latent,
-            gate_logits,
-            indices_dev,
-            weights_dev,
-            normed,
-            hidden,
-            latent_base,
-            shared_up_out_base,
-        };
-        if use_sorted {
-            self.prefill_sorted_path(&p, ctx, stream)?;
-        } else {
-            self.prefill_fallback_path(&p, ctx, stream)?;
-        }
-
-        Ok(())
-    }
-
-    fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
-        Ok(Box::new(EmptyLayerState))
-    }
-}

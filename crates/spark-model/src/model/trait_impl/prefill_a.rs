@@ -149,6 +149,10 @@ impl TransformerModel {
                 && self
                     .ssm_snapshots
                     .session_matches(snap_id, seq.session_hash)
+                // Aux-carrying models (PLE/QSA) decline aux-less slots — a
+                // mid-chunk tail capture, or a snapshot from before this
+                // feature — rather than restore a stale lexical state.
+                && (!self.requires_aux_state() || self.ssm_snapshots.aux(snap_id).is_some())
             {
                 self.ssm_snapshots.restore(
                     snap_id,
@@ -157,6 +161,9 @@ impl TransformerModel {
                     self.gpu.as_ref(),
                     stream,
                 )?;
+                if let Some(aux) = self.ssm_snapshots.aux(snap_id) {
+                    self.apply_aux_states(seq, &aux, stream)?;
+                }
                 if snap_tok < kv_write_start {
                     tracing::info!(
                         "Marconi intermediate hit: restored from checkpoint at token {} \
@@ -264,14 +271,17 @@ impl TransformerModel {
             // layers read `tid2eid[token_id]` per token, in this same order.
             self.gpu
                 .copy_h2d_async(token_ids_bytes, self.buffers.token_ids(), stream)?;
-            ops::batched_embed(
-                self.gpu.as_ref(),
-                self.batched_embed_kernel,
-                token_ids_dev,
-                self.embed_tokens.weight,
+            // `proc_tokens` is always a SUFFIX of `tokens` (all three arms of
+            // the binding above slice from the tail), so the tokens preceding
+            // it are exactly `tokens[..start]` — which is what the n-gram hash
+            // needs to read backwards into. `ngram_lookbehind()` is 0 for
+            // models without one, making `ctx` just the processed tokens.
+            let start = tokens.len() - proc_count;
+            let ctx_start = start.saturating_sub(self.ngram_lookbehind());
+            self.embed_tokens_fused(
+                &tokens[ctx_start..start + proc_count],
+                proc_count,
                 hidden,
-                proc_count as u32,
-                h as u32,
                 stream,
             )?;
             self.scale_embeddings(hidden, proc_count, stream)?;
@@ -379,6 +389,7 @@ impl TransformerModel {
             // Hash-MoE: token IDs for the `proc_count` tokens processed this
             // pass, in MoE-loop order (uploaded above to the stable buffer).
             token_ids: Some(self.buffers.token_ids()),
+            host_token_ids: None,
             // #30: request slot pairs (None unless routing to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
             midchunk_capture: None,

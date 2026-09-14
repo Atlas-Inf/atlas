@@ -1,0 +1,10 @@
+# Fast bake: patched spark + Lightning jinja on stock atlas-gb10.
+# Weights stay on the host. AGPL: corresponding source is the atlas fork.
+FROM avarok/atlas-gb10:latest
+COPY spark-fastbin /usr/local/bin/spark
+COPY jinja-templates/nemotron_lightning.jinja /jinja-templates/nemotron_h.jinja
+COPY jinja-templates/nemotron_lightning.jinja /jinja-templates/nemotron_lightning.jinja
+COPY kernels/gb10/nemotron-3.5-lightning-30b-a3b/MODEL.toml /kernels/gb10/nemotron-3.5-lightning-30b-a3b/MODEL.toml
+LABEL org.opencontainers.image.source="https://github.com/r0b0tlab/nemotron-lightning-atlas-sm121"
+LABEL org.opencontainers.image.description="SM121 Atlas Spark for Nemotron 3.5 Lightning (weights not included)"
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only"

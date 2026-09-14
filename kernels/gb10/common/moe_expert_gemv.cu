@@ -68,9 +68,10 @@ extern "C" __global__ void moe_expert_gemv(
 ) {
     const unsigned int expert_slot = blockIdx.y;
     if (expert_slot >= top_k) return;
+    const unsigned int tok = blockIdx.z;
 
     // Look up which expert this slot maps to
-    const unsigned int expert_id = expert_indices[expert_slot];
+    const unsigned int expert_id = expert_indices[(unsigned long long)tok * top_k + expert_slot];
 
     // Get expert's weight pointers via indirection
     const unsigned char* B_packed = (const unsigned char*)packed_ptrs[expert_id];
@@ -81,13 +82,15 @@ extern "C" __global__ void moe_expert_gemv(
     if (B_packed == 0) {
         const unsigned int n_base = blockIdx.x * N_PER_BLOCK;
         for (unsigned int i = threadIdx.x; i < N_PER_BLOCK && n_base + i < N; i += BLOCK_SIZE) {
-            C[expert_slot * N + n_base + i] = __float2bfloat16(0.0f);
+            C[((unsigned long long)tok * top_k + expert_slot) * N + n_base + i] = __float2bfloat16(0.0f);
         }
         return;
     }
 
     // Input pointer: shared (stride=0) or per-expert (stride=K)
-    const __nv_bfloat16* input = A + (input_stride > 0 ? (unsigned long long)expert_slot * input_stride : 0);
+    const __nv_bfloat16* input = A
+        + (unsigned long long)tok * K
+        + (input_stride > 0 ? (unsigned long long)expert_slot * input_stride : 0);
 
     // Standard GEMV logic (vectorized, same structure as w4a16_gemv)
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
@@ -152,7 +155,7 @@ extern "C" __global__ void moe_expert_gemv(
     }
 
     if (lane == 0) {
-        C[(unsigned long long)expert_slot * N + n] = __float2bfloat16(acc);
+        C[((unsigned long long)tok * top_k + expert_slot) * N + n] = __float2bfloat16(acc);
     }
 }
 

@@ -210,6 +210,25 @@ const GATE_MACHINERY: Exclusion = Exclusion {
     rationale: "gate bookkeeping never runs a model; its correctness is covered by cargo test",
 };
 
+/// The governance ledger, on exactly `GATE_MACHINERY`'s rationale.
+///
+/// `atlas-governance` records what PRs were for. Nothing on an inference path
+/// links it: the whole reverse-dependency set is `atlas-plugin`, and inside
+/// that crate the only references are `src/gate/**` — already excluded above —
+/// and the two `ledger_*` CLI bins. No benchmark driver touches it, and
+/// `spark-server`, `spark-model` and `atlas-core` do not name it at all.
+///
+/// ★ Load-bearing precondition, and the reason this is a named constant rather
+/// than an inline entry: the claim is about the DEPENDENCY GRAPH, not about
+/// the files. `governance_exclusion_tests` re-derives it from the manifests
+/// and the sources, so the day someone adds `atlas-governance` to
+/// `spark-server`'s dependencies this exclusion fails a test instead of
+/// silently exempting a crate that now runs in the server.
+const GOVERNANCE_LEDGER: Exclusion = Exclusion {
+    prefix: "crates/atlas-governance",
+    rationale: "the governance ledger never runs a model; no inference crate depends on it",
+};
+
 /// Every other benchmark's driver.
 ///
 /// A change to the BFCL driver can change the BFCL numbers and must invalidate
@@ -229,6 +248,7 @@ const fn other_driver(prefix: &'static str, mine: &'static str) -> Exclusion {
 
 const TTFT_EXCLUDES: &[Exclusion] = &[
     GATE_MACHINERY,
+    GOVERNANCE_LEDGER,
     other_driver(
         "crates/atlas-plugin/src/benchmarks/bfcl",
         "the BFCL driver cannot change what a first-token latency probe measures",
@@ -249,6 +269,7 @@ const TTFT_EXCLUDES: &[Exclusion] = &[
 
 const BFCL_EXCLUDES: &[Exclusion] = &[
     GATE_MACHINERY,
+    GOVERNANCE_LEDGER,
     other_driver(
         "crates/atlas-plugin/src/benchmarks/ttft",
         "the TTFT driver cannot change a tool-calling accuracy score",
@@ -269,6 +290,7 @@ const BFCL_EXCLUDES: &[Exclusion] = &[
 
 const AGENTIC_EXCLUDES: &[Exclusion] = &[
     GATE_MACHINERY,
+    GOVERNANCE_LEDGER,
     other_driver(
         "crates/atlas-plugin/src/benchmarks/ttft",
         "the TTFT driver cannot change whether the agent's webserver task succeeds",
@@ -298,6 +320,7 @@ const AGENTIC_EXCLUDES: &[Exclusion] = &[
 /// replay comes back byte-identical; only the engine can.
 const SSM_POISON_EXCLUDES: &[Exclusion] = &[
     GATE_MACHINERY,
+    GOVERNANCE_LEDGER,
     other_driver(
         "crates/atlas-plugin/src/benchmarks/ttft",
         "the TTFT driver cannot change whether an identical replay returns identical bytes",
@@ -328,6 +351,7 @@ const SSM_POISON_EXCLUDES: &[Exclusion] = &[
 /// measure a single request — they cannot see it.
 const CONCURRENCY_EXCLUDES: &[Exclusion] = &[
     GATE_MACHINERY,
+    GOVERNANCE_LEDGER,
     other_driver(
         "crates/atlas-plugin/src/benchmarks/bfcl",
         "the BFCL driver cannot change the server's latency/throughput curve",
@@ -356,6 +380,7 @@ const CONCURRENCY_EXCLUDES: &[Exclusion] = &[
 /// deliberately NOT here — a change to the pins re-opens the pins.
 const DECODE_FLOOR_EXCLUDES: &[Exclusion] = &[
     GATE_MACHINERY,
+    GOVERNANCE_LEDGER,
     other_driver(
         "crates/atlas-plugin/src/benchmarks/bfcl",
         "the BFCL driver cannot change the server's single-user decode rate",
@@ -384,6 +409,7 @@ const DECODE_FLOOR_EXCLUDES: &[Exclusion] = &[
 /// detector.
 const CONTAMINATION_EXCLUDES: &[Exclusion] = &[
     GATE_MACHINERY,
+    GOVERNANCE_LEDGER,
     other_driver(
         "crates/atlas-plugin/src/benchmarks/ttft",
         "the TTFT driver cannot change whether one request's state leaks into another's output",
@@ -405,6 +431,7 @@ const CONTAMINATION_EXCLUDES: &[Exclusion] = &[
 /// alter vision preprocessing.
 const VISION_EXCLUDES: &[Exclusion] = &[
     GATE_MACHINERY,
+    GOVERNANCE_LEDGER,
     other_driver(
         "crates/atlas-plugin/src/benchmarks/ttft",
         "the TTFT driver cannot change how an image is patched or how many tokens it becomes",

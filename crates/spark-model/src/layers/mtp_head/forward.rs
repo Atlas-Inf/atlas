@@ -143,43 +143,56 @@ impl MtpHead {
             stream,
         )?;
 
-        // 7. Attention: Q+Gate and K+V projections
+        // 7. Attention: Q (+ optional Qwen Q-gate) and K+V projections
         let q_out = ctx.buffers.qkv_output();
         let q_dim = nq * hd;
-        let qg_dim = q_dim * 2;
+        let qg_dim = if self.lightning { q_dim } else { q_dim * 2 };
         let qg_bytes = qg_dim as usize * 2;
 
         match self.quant {
             MtpQuantization::Nvfp4 => {
-                // Fused GEMV + deinterleave in one kernel
                 if let ProjectionWeight::Nvfp4(ref w) = self.q_proj {
-                    ops::w4a16_gemv_qg(
-                        ctx.gpu,
-                        self.w4a16_gemv_qg_k,
-                        normed,
-                        w,
-                        q_out,
-                        qg_dim,
-                        h,
-                        nq,
-                        hd,
-                        stream,
-                    )?;
+                    if self.lightning {
+                        ops::w4a16_gemv(
+                            ctx.gpu,
+                            self.w4a16_gemv_k,
+                            normed,
+                            w,
+                            q_out,
+                            q_dim,
+                            h,
+                            stream,
+                        )?;
+                    } else {
+                        ops::w4a16_gemv_qg(
+                            ctx.gpu,
+                            self.w4a16_gemv_qg_k,
+                            normed,
+                            w,
+                            q_out,
+                            qg_dim,
+                            h,
+                            nq,
+                            hd,
+                            stream,
+                        )?;
+                    }
                 }
             }
             MtpQuantization::Fp8 | MtpQuantization::Bf16 => {
-                // Separate GEMV + deinterleave kernel
                 self.gemv(ctx.gpu, normed, &self.q_proj, q_out, qg_dim, h, stream)?;
-                ops::deinterleave_qg(
-                    ctx.gpu,
-                    self.deinterleave_qg_k.unwrap(),
-                    q_out,
-                    1,
-                    nq,
-                    hd,
-                    nq * hd * 2,
-                    stream,
-                )?;
+                if !self.lightning {
+                    ops::deinterleave_qg(
+                        ctx.gpu,
+                        self.deinterleave_qg_k.unwrap(),
+                        q_out,
+                        1,
+                        nq,
+                        hd,
+                        nq * hd * 2,
+                        stream,
+                    )?;
+                }
             }
         }
         let gate_ptr = q_out.offset(q_dim as usize * 2);
@@ -213,29 +226,31 @@ impl MtpHead {
             }
         }
 
-        // Q/K norms
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            q_out,
-            &self.q_norm,
-            q_out,
-            nq,
-            hd,
-            eps,
-            stream,
-        )?;
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            k_out,
-            &self.k_norm,
-            k_out,
-            nkv,
-            hd,
-            eps,
-            stream,
-        )?;
+        // Q/K norms (Qwen MTP). Lightning has no q/k RMSNorm tensors.
+        if !self.lightning {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                q_out,
+                &self.q_norm,
+                q_out,
+                nq,
+                hd,
+                eps,
+                stream,
+            )?;
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                k_out,
+                &self.k_norm,
+                k_out,
+                nkv,
+                hd,
+                eps,
+                stream,
+            )?;
+        }
 
         // 8. Upload attention metadata for MTP KV cache
         let mut kv_cache = self.kv_cache.lock();
@@ -381,16 +396,18 @@ impl MtpHead {
             );
         }
 
-        // Sigmoid gate: attn_out = attn_out * sigmoid(gate)
-        ops::sigmoid_gate_mul(
-            ctx.gpu,
-            self.sigmoid_gate_mul_k,
-            attn_out,
-            gate_ptr,
-            attn_out,
-            nq * hd,
-            stream,
-        )?;
+        // Sigmoid gate: attn_out = attn_out * sigmoid(gate). Qwen only.
+        if !self.lightning {
+            ops::sigmoid_gate_mul(
+                ctx.gpu,
+                self.sigmoid_gate_mul_k,
+                attn_out,
+                gate_ptr,
+                attn_out,
+                nq * hd,
+                stream,
+            )?;
+        }
 
         // O projection: [nq*hd] → [h]
         let o_out = ctx.buffers.norm_output();

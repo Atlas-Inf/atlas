@@ -30,7 +30,7 @@ use serde::Deserialize;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
-use crate::weight_map::{DenseWeight, dense};
+use crate::weight_map::{DenseWeight, dense_auto};
 
 /// Drafter HF `config.json` (subset Atlas consumes). Mirrors
 /// `z-lab/Qwen3.6-35B-A3B-DFlash/config.json` field names verbatim so
@@ -44,10 +44,34 @@ pub struct DflashConfig {
     pub num_key_value_heads: usize,
     pub head_dim: usize,
     pub vocab_size: usize,
+    /// HF architecture identities; absent on older generic DFlash configs.
+    #[serde(default)]
+    pub architectures: Option<Vec<String>>,
     #[serde(default)]
     pub draft_vocab_size: Option<usize>,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    /// Lightning DSpark's required anchor/sampling declarations.
+    #[serde(default)]
+    pub dspark_bonus_anchor: Option<bool>,
+    #[serde(default)]
+    pub sample_from_anchor: Option<bool>,
+    #[serde(default)]
+    pub attention_sink_bias: Option<bool>,
+    #[serde(default)]
+    pub dspark_markov_rank: Option<usize>,
+    #[serde(default)]
+    pub target_layer_ids: Option<Vec<usize>>,
+    #[serde(
+        default,
+        alias = "dspark_confidence_head",
+        alias = "enable_confidence_head"
+    )]
+    pub confidence_head: Option<bool>,
+    #[serde(default, alias = "dspark_adaptive", alias = "adaptive_verification")]
+    pub adaptive: Option<bool>,
+    #[serde(default)]
+    pub quantization_config: Option<DflashQuantizationConfig>,
     /// Block size γ. Qwen3.6-DFlash ships `block_size: 16`.
     #[serde(default = "default_block_size")]
     pub block_size: usize,
@@ -63,6 +87,9 @@ pub struct DflashConfig {
     /// build the inv_freq table at construction time.
     #[serde(default)]
     pub rope_scaling: Option<DflashRopeScaling>,
+    /// DSpark Markov rank. `None` / 0 = DFlash-only (no sequential fixup).
+    #[serde(default)]
+    pub markov_rank: Option<usize>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -88,6 +115,13 @@ pub struct DflashRopeScaling {
     pub original_max_position_embeddings: Option<f32>,
 }
 
+/// Minimal nested quantization metadata needed for runtime admission.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DflashQuantizationConfig {
+    #[serde(default)]
+    pub kv_cache_quant_algo: Option<String>,
+}
+
 fn default_block_size() -> usize {
     16
 }
@@ -102,6 +136,29 @@ pub struct DflashSubConfig {
     /// `[1, 10, 19, 28, 37]` for Qwen3.6-35B-A3B-DFlash. Order matters:
     /// shallow-to-deep concatenation is what `fc` expects.
     pub target_layer_ids: Vec<usize>,
+    /// When `Some(true)`, every drafter layer uses causal γ-block attention.
+    /// Lightning DSpark sets this; Qwen-DFlash leaves it unset (bidirectional).
+    #[serde(default)]
+    pub causal: Option<bool>,
+    /// Force sliding-window attention on every drafter layer.
+    #[serde(default)]
+    pub use_swa: Option<bool>,
+    /// Sliding-window size when `use_swa` or `layer_types` request SWA.
+    #[serde(default)]
+    pub swa_window_size: Option<usize>,
+    /// When `Some(true)`, each layer must ship `self_attn.attention_sink_bias`.
+    #[serde(default)]
+    pub attention_sink_bias: Option<bool>,
+    #[serde(default)]
+    pub sample_from_anchor: Option<bool>,
+    #[serde(
+        default,
+        alias = "dspark_confidence_head",
+        alias = "enable_confidence_head"
+    )]
+    pub confidence_head: Option<bool>,
+    #[serde(default, alias = "dspark_adaptive", alias = "adaptive_verification")]
+    pub adaptive: Option<bool>,
 }
 
 /// Raw weight bundle for the DFlash drafter, post-load.
@@ -128,11 +185,14 @@ pub struct DflashWeights {
     pub norm: DenseWeight,
 
     pub layers: Vec<DflashLayerWeights>,
-
-    /// Present iff the drafter has a draft-id → target-id mapping (i.e.
-    /// `draft_vocab_size != target_vocab_size`). Absent for
-    /// Qwen3.6-35B-A3B-DFlash (both vocabs = 248320).
     pub draft_id_to_target_id: Option<Vec<i64>>,
+    /// DSpark Markov embedding `[vocab, rank]` BF16. None for DFlash-only.
+    pub markov_w1: Option<DenseWeight>,
+    /// DSpark Markov projection `[vocab, rank]` BF16 (NVFP4 dequanted).
+    pub markov_w2: Option<DenseWeight>,
+    pub markov_rank: usize,
+    /// Optional drafter-owned embed. None → share the target's.
+    pub embed_tokens: Option<DenseWeight>,
 }
 
 /// Per-drafter-layer raw weights (BF16). Same shape across all 8 layers.
@@ -149,6 +209,9 @@ pub struct DflashLayerWeights {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
+    /// Per-q-head FlashAttention sink logits `[num_q_heads]` BF16.
+    /// None when the checkpoint has no sink tensor (Qwen-DFlash).
+    pub attention_sink_bias: Option<DenseWeight>,
 }
 
 /// Probe a [`WeightStore`] for the presence of DFlash drafter weights.
@@ -207,7 +270,7 @@ pub fn parse_dflash_config(json: &str) -> Result<DflashConfig> {
 pub fn load_dflash_weights(
     drafter_store: &WeightStore,
     drafter_config: &DflashConfig,
-    _gpu: &dyn GpuBackend,
+    gpu: &dyn GpuBackend,
     _tp_size: usize,
 ) -> Result<Option<DflashWeights>> {
     if !store_has_dflash_weights(drafter_store) {
@@ -215,55 +278,70 @@ pub fn load_dflash_weights(
         return Ok(None);
     }
 
-    // Detect bare vs. `model.`-prefixed layout. `z-lab` checkpoints use
-    // bare; we accept either to be robust against a hypothetical re-upload
-    // that uses the prefixed layout.
     let prefix = if drafter_store.contains("model.fc.weight") {
         "model."
     } else {
         ""
     };
 
-    let fc = dense(drafter_store, &format!("{prefix}fc.weight"))
+    // dense_auto: BF16 as-is, packed NVFP4 (Lightning DSpark MLP/fc/markov_w2)
+    // dequanted once at load.
+    let fc = dense_auto(drafter_store, &format!("{prefix}fc.weight"), gpu)
         .context("DFlash drafter: load fc.weight")?;
-    let hidden_norm = dense(drafter_store, &format!("{prefix}hidden_norm.weight"))
+    let hidden_norm = dense_auto(drafter_store, &format!("{prefix}hidden_norm.weight"), gpu)
         .context("DFlash drafter: load hidden_norm.weight")?;
-    let norm = dense(drafter_store, &format!("{prefix}norm.weight"))
+    let norm = dense_auto(drafter_store, &format!("{prefix}norm.weight"), gpu)
         .context("DFlash drafter: load norm.weight")?;
 
+    let require_sinks = drafter_config
+        .dflash_config
+        .as_ref()
+        .and_then(|c| c.attention_sink_bias)
+        == Some(true);
     let layer_count = drafter_config.num_hidden_layers;
     let mut layers = Vec::with_capacity(layer_count);
+    let mut sink_layers = 0usize;
     for i in 0..layer_count {
         let lp = format!("{prefix}layers.{i}");
+        let sink_name = format!("{lp}.self_attn.attention_sink_bias");
+        let attention_sink_bias = if drafter_store.contains(&sink_name) {
+            sink_layers += 1;
+            Some(dense_auto(drafter_store, &sink_name, gpu)?)
+        } else if require_sinks {
+            anyhow::bail!(
+                "dflash_config.attention_sink_bias=true but {sink_name} is missing from the checkpoint"
+            );
+        } else {
+            None
+        };
         let layer = DflashLayerWeights {
-            input_layernorm: dense(drafter_store, &format!("{lp}.input_layernorm.weight"))?,
-            post_attention_layernorm: dense(
+            input_layernorm: dense_auto(
+                drafter_store,
+                &format!("{lp}.input_layernorm.weight"),
+                gpu,
+            )?,
+            post_attention_layernorm: dense_auto(
                 drafter_store,
                 &format!("{lp}.post_attention_layernorm.weight"),
+                gpu,
             )?,
-            q_proj: dense(drafter_store, &format!("{lp}.self_attn.q_proj.weight"))?,
-            k_proj: dense(drafter_store, &format!("{lp}.self_attn.k_proj.weight"))?,
-            v_proj: dense(drafter_store, &format!("{lp}.self_attn.v_proj.weight"))?,
-            o_proj: dense(drafter_store, &format!("{lp}.self_attn.o_proj.weight"))?,
-            q_norm: dense(drafter_store, &format!("{lp}.self_attn.q_norm.weight"))?,
-            k_norm: dense(drafter_store, &format!("{lp}.self_attn.k_norm.weight"))?,
-            gate_proj: dense(drafter_store, &format!("{lp}.mlp.gate_proj.weight"))?,
-            up_proj: dense(drafter_store, &format!("{lp}.mlp.up_proj.weight"))?,
-            down_proj: dense(drafter_store, &format!("{lp}.mlp.down_proj.weight"))?,
+            q_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.q_proj.weight"), gpu)?,
+            k_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.k_proj.weight"), gpu)?,
+            v_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.v_proj.weight"), gpu)?,
+            o_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.o_proj.weight"), gpu)?,
+            q_norm: dense_auto(drafter_store, &format!("{lp}.self_attn.q_norm.weight"), gpu)?,
+            k_norm: dense_auto(drafter_store, &format!("{lp}.self_attn.k_norm.weight"), gpu)?,
+            gate_proj: dense_auto(drafter_store, &format!("{lp}.mlp.gate_proj.weight"), gpu)?,
+            up_proj: dense_auto(drafter_store, &format!("{lp}.mlp.up_proj.weight"), gpu)?,
+            down_proj: dense_auto(drafter_store, &format!("{lp}.mlp.down_proj.weight"), gpu)?,
+            attention_sink_bias,
         };
         layers.push(layer);
     }
 
-    // `d2t` (draft-id → target-id) is absent from Qwen3.6-DFlash because
-    // both vocabs are 248320. If a future drafter ships a smaller vocab
-    // (vLLM supports this via `draft_vocab_size`), the int64 mapping table
-    // would land here. Probing first to keep this loader compatible.
     let draft_id_to_target_id = if drafter_store.contains(&format!("{prefix}d2t"))
         || drafter_store.contains(&format!("{prefix}draft_id_to_target_id"))
     {
-        // Mapping is loaded into device memory by upstream paths — for now
-        // we just record presence. Phase 2.5 will copy it to a host Vec<i64>
-        // when the head needs it for logit remapping.
         tracing::warn!(
             "DFlash drafter has draft-id→target-id mapping; remapping path is not yet wired (Phase 2.5 follow-up)"
         );
@@ -272,17 +350,54 @@ pub fn load_dflash_weights(
         None
     };
 
+    let markov_w1_name = format!("{prefix}markov_head.markov_w1.weight");
+    let markov_w2_name = format!("{prefix}markov_head.markov_w2.weight");
+    let (markov_w1, markov_w2, markov_rank) =
+        if drafter_store.contains(&markov_w1_name) && drafter_store.contains(&markov_w2_name) {
+            let rank = drafter_config.markov_rank.unwrap_or(512);
+            tracing::info!("DSpark Markov head: rank={rank} (w1 BF16, w2 auto/NVFP4)");
+            (
+                Some(dense_auto(drafter_store, &markov_w1_name, gpu)?),
+                Some(dense_auto(drafter_store, &markov_w2_name, gpu)?),
+                rank,
+            )
+        } else {
+            (None, None, 0)
+        };
+
+    let embed_name = format!("{prefix}embed_tokens.weight");
+    let embed_tokens = if drafter_store.contains(&embed_name) {
+        Some(dense_auto(drafter_store, &embed_name, gpu)?)
+    } else {
+        None
+    };
+
+    let sub = drafter_config.dflash_config.as_ref();
+    if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight"))
+        && fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8
+        && fc_meta.shape.len() == 2
+    {
+        tracing::info!(
+            "DFlash fc NVFP4 unpack: on-disk {:?} U8 → logical [{}, {}] BF16",
+            fc_meta.shape,
+            fc_meta.shape[0],
+            fc_meta.shape[1] * 2
+        );
+    }
     tracing::info!(
-        "DFlash drafter loaded: {} layers, hidden={}, vocab={}, γ={}, target_layers={:?}",
+        "DFlash/DSpark drafter loaded: {} layers, hidden={}, vocab={}, γ={}, markov_rank={}, own_embed={}, causal={:?}, swa={:?}/{:?}, sinks={}/{}, target_layers={:?}",
         layers.len(),
         drafter_config.hidden_size,
         drafter_config.vocab_size,
         drafter_config.block_size,
-        drafter_config
-            .dflash_config
-            .as_ref()
-            .map(|c| c.target_layer_ids.as_slice())
-            .unwrap_or(&[]),
+        markov_rank,
+        embed_tokens.is_some(),
+        sub.and_then(|c| c.causal),
+        sub.and_then(|c| c.use_swa),
+        sub.and_then(|c| c.swa_window_size),
+        sink_layers,
+        layers.len(),
+        sub.map(|c| c.target_layer_ids.as_slice()).unwrap_or(&[]),
     );
 
     Ok(Some(DflashWeights {
@@ -292,6 +407,10 @@ pub fn load_dflash_weights(
         norm,
         layers,
         draft_id_to_target_id,
+        markov_w1,
+        markov_w2,
+        markov_rank,
+        embed_tokens,
     }))
 }
 
@@ -327,5 +446,30 @@ mod tests {
         let sub = config.dflash_config.expect("dflash_config present");
         assert_eq!(sub.mask_token_id, 248070);
         assert_eq!(sub.target_layer_ids, vec![1, 10, 19, 28, 37]);
+    }
+
+    #[test]
+    fn parse_lightning_dspark_config() {
+        let json = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/lightning_dspark_config.json"
+        ));
+        let config = parse_dflash_config(json).expect("parse Lightning DSpark config");
+        assert_eq!(config.num_hidden_layers, 6);
+        assert_eq!(config.hidden_size, 2688);
+        assert_eq!(config.intermediate_size, 6144);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 2);
+        assert_eq!(config.head_dim, 128);
+        assert_eq!(config.vocab_size, 131072);
+        assert_eq!(config.block_size, 8);
+        assert_eq!(config.markov_rank, Some(512));
+        let sub = config.dflash_config.expect("dflash_config present");
+        assert_eq!(sub.mask_token_id, 990);
+        assert_eq!(sub.target_layer_ids, vec![1, 5, 19, 29, 41, 51]);
+        assert_eq!(sub.causal, Some(true));
+        assert_eq!(sub.use_swa, Some(true));
+        assert_eq!(sub.swa_window_size, Some(1024));
+        assert_eq!(sub.attention_sink_bias, Some(true));
     }
 }

@@ -28,6 +28,7 @@ pub(crate) struct ParsedBehavior {
     pub disable_cwd_hint_injection: bool,
     pub use_sampling_presets_for_core: bool,
     pub tool_call_parser: String,
+    pub jinja_template: String,
     pub enable_loop_watchdog: bool,
     /// Gate for the THINKING-phase token-loop watchdog, which force-injects
     /// `</think>` when it detects a period-4..20 repeat in the reasoning tail.
@@ -59,6 +60,13 @@ pub(crate) struct ParsedBehavior {
     /// let `max_thinking_budget` be the sole cap (false, vLLM single-budget).
     pub cap_thinking_at_max_tokens: bool,
     pub min_p_floor: f32,
+    /// A4 POST_THINK_MIN_REASONING floor: suppress `</think>` (-8 logit)
+    /// until this many thinking tokens have been emitted. 16 = the
+    /// historical constant; 0 disables (models with card-native brief
+    /// thinking, e.g. reasoning_effort=low, must not have their close
+    /// token suppressed — the turn-ending mass reroutes to im_end/im_start
+    /// and sampled runs EOS inside think or simulate template turns).
+    pub min_reasoning_floor_tokens: u32,
     pub temperature_max: f32,
     pub think_loop_min_repeats: u32,
     pub think_loop_scan_window: u32,
@@ -93,11 +101,13 @@ impl Default for ParsedBehavior {
             disable_cwd_hint_injection: false,
             use_sampling_presets_for_core: false,
             tool_call_parser: String::new(),
+            jinja_template: String::new(),
             enable_loop_watchdog: false,
             enable_think_loop_watchdog: true,
             honor_eos_inside_thinking: false,
             cap_thinking_at_max_tokens: true,
             min_p_floor: 0.0,
+            min_reasoning_floor_tokens: 16,
             temperature_max: 0.0,
             think_loop_min_repeats: 3,
             think_loop_scan_window: 160,
@@ -182,6 +192,11 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let jinja_template = b
+        .and_then(|v| v.get("jinja_template"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let enable_loop_watchdog = b
         .and_then(|v| v.get("enable_loop_watchdog"))
         .and_then(|v| v.as_bool())
@@ -208,6 +223,13 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("min_p_floor"))
         .and_then(|v| v.as_float())
         .unwrap_or(0.0) as f32;
+    // A4 floor override; 16 = historical constant, 0 disables. See the
+    // struct field for rationale.
+    let min_reasoning_floor_tokens = b
+        .and_then(|v| v.get("min_reasoning_floor_tokens"))
+        .and_then(|v| v.as_integer())
+        .map(|v| v as u32)
+        .unwrap_or(16);
     let temperature_max = b
         .and_then(|v| v.get("temperature_max"))
         .and_then(|v| v.as_float())
@@ -284,11 +306,13 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         disable_cwd_hint_injection,
         use_sampling_presets_for_core,
         tool_call_parser,
+        jinja_template,
         enable_loop_watchdog,
         enable_think_loop_watchdog,
         honor_eos_inside_thinking,
         cap_thinking_at_max_tokens,
         min_p_floor,
+        min_reasoning_floor_tokens,
         temperature_max,
         think_loop_min_repeats,
         think_loop_scan_window,

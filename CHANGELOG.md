@@ -17,8 +17,130 @@ behind specific subsystems — see the
   failed gate (2).
 - `--version`, sourced from the packaged version so a build cannot report a
   version it was not packaged as.
+- **N-gram scaled embeddings, LongCat flavour: id core and validity envelope**
+  (`NgramDims`, `ngram_ids`) — groundwork for the family whose embedding tables
+  are far larger than their backbones. Row ids are a polynomial rolling hash
+  over token ids only, with document-boundary resets, checked bit-exact against
+  a dependency-free reference (`bench/ngram_embed/`) at real LongCat-Flash-Lite
+  dimensions. A config declaring the trio is validated, not assumed: table
+  counts that would exceed the u32 the gather kernels index with, a
+  `hidden_size` that does not divide by the table count, an accumulator that
+  would wrap u64, and partially-declared trios are all refused at parse.
+- **N-gram hashed embeddings, `qwen4_exp` flavour** (`Qwen4ExpNgram`) — the
+  mechanism Qwen3.8-Flash-Next actually uses, which is a **different algorithm**
+  from the LongCat one above rather than a parameterisation of it. It mixes by
+  XOR of `shift_d · m_d` where the multipliers are seeded SplitMix64 draws, its
+  per-head table sizes are consecutive PRIMES above a base, and its heads share
+  one concatenated table addressed through per-head offsets. Feeding a LongCat
+  id into a `qwen4_exp` table reads an unrelated row, so the two are separate
+  types and a test asserts they do not coincide.
+
+  Every derived quantity is reproduced bit-exact from `config.json` alone and
+  pinned against the published `Qwen/Qwen3.8-Flash-Next-FP8` checkpoint: the
+  `layer_multipliers`, `ngram_heads_vocab_sizes` and `ngram_heads_offsets`
+  buffers, and the `[2_500_012, 160] x 128` shard geometry. Two traps are
+  encoded rather than commented — `ple_layer_ids` is ONE-indexed (`[2]` is
+  decoder layer 1, which is where the checkpoint stores `layers.1.ple.*`), and
+  `seed` is ABSENT from that `config.json`, so it defaults to 1234 instead of
+  zero; a zero seed draws the wrong multipliers and hashes every token to an
+  unrelated row without failing.
+
+  Cross-checked against the reference rather than only against ourselves:
+  `bench/ngram_embed/qwen4exp_xcheck.py` runs the real
+  `Qwen4ExpTextNGramEmbedding.forward` and diffs its row ids against
+  `cargo run -p atlas-core --example qwen4exp_ngram_ids`. 5408/5408 ids match
+  over 32 streams. No GPU and no weights needed — the 51 GB embedding tensor is
+  stubbed, every buffer that feeds the ids is not.
+- **`qwen4_exp` weight manifest** (`atlas_core::weight_manifest`) — what a
+  checkpoint must contain, derived from its config, so a loader's first job is
+  written down separately from the loading and can be checked without the
+  weights. Diffed against the published `Qwen3.8-Flash-Next-FP8`
+  `model.safetensors.index.json`: of its 152,089 tensors, 333 are
+  `model.visual.*` and 75,264 are FP8 `weight_scale_inv` siblings; the manifest
+  covers the remaining **76,492 with zero missing and zero unexpected**, every
+  scale attaches to a routed-expert weight it expects, and 1,653 shapes read
+  from real safetensors headers match. `scripts/dev/verify_qwen4_exp_manifest.py`
+  reproduces this against a checkpoint directory or a bare index.
+
+  It earned its keep immediately, catching three wrong widths in the tiny
+  development checkpoint (hyper-connections are `hc_count * hidden` wide, not
+  `hidden`; `q_proj` is 2x for the gate; the indexer's `index_qk_proj` is
+  `(n_heads + kv_heads) * head_dim`).
+
+  Quantization is described too, and **both published releases now match
+  exactly**: `Qwen/…-FP8` at 151,756 tensors and `RadixArk/…-NVFP4` at 296,142,
+  each with zero missing and zero unexpected against their published indexes.
+  NVFP4 repacks the weight as well as adding siblings — `[2560, 640]` is stored
+  U8 `[2560, 320]`, two FP4 values per byte.
+
+  Three things had to be handled that the tensor names do not reveal:
+  `modules_to_not_convert` was going unparsed (HF's FP8 spelling, 943 literal
+  entries); ModelOpt's ignore globs need `*` to span dots while HF's list has no
+  globs at all; and the 128 n-gram shards are FP8 behind a single shared
+  `weight_scale`, so they take no per-block sibling despite being absent from
+  the ignore list. Expert layout is a fourth: HF stores `gate_up_proj` stacked,
+  quantizers split it per `nn.Linear`, and `Qwen4ExpLayout` expresses both.
+- **`qwen4_exp` config parsing.** The published `Qwen3.8-Flash-Next-FP8`
+  `config.json` now parses (vendored whole into `test_data/`). Two of its
+  defaults are absent rather than stated and both fail silently: `norm_topk_prob`
+  (HF true, serde false — skips top-K renormalisation) and `seed` (HF 1234, a
+  zero would hash every n-gram token to an unrelated row).
+
+  Parsing is not serving — and serving landed separately, below.
+
+- **Qwen3.8-Flash-Next (`qwen4_exp`) SERVES on a single GB10.** The port from
+  Avarok #753/#754 (rsafier) merged onto this branch, with its #746 base: the
+  low-rank multi-hyperconnection highway on all 48 layers, PLE n-gram
+  injection at model layer 1 served by row off NVMe, the QSA indexer selecting
+  on decode and on prefill, the 512-expert MoE, gated-Q attention on the
+  production paged path, the ViT tower, CUDA graph capture, prefix caching and
+  C>1 concurrency. Measured on a GB10: decode 16.5 tok/s, prefill 747 tok/s at
+  a 2191-token prompt, ~90.4 GB peak with ~27.8 GB free.
+
+  What makes it fit is one exclusion: the 47.7 GiB n-gram table is never
+  resident and is read by row (`NgramRowCache::open_segmented`, because the 128
+  shards are not contiguous — they span 26.4 GB of a 102.4 GB table, so a
+  single base offset would read wrong-but-valid rows silently). Without it the
+  same run refuses at 163.64 GB.
+
+  Refused rather than half-wired: MTP (`--speculative` fails at pre-flight) and
+  the stacked expert layout, which neither published release uses.
+
+  Six defects in this family are silent by construction, so each one is pinned
+  by a test rather than a comment: the GDN output gate is a **sigmoid**, not
+  SiLU (wrong on 36 of 48 layers, cos 0.80 before / 0.999990 after);
+  `norm_topk_prob` defaults TRUE in the reference and is omitted from the
+  checkpoint (0.33–1.62 nats/token); `ple_layer_ids` are ONE-indexed; the PLE
+  conv is dilated by `ngram_size`, so its state is 9 steps, not 3; the
+  hyper-connection norms are offset-from-1 and GROUPED per stream; and the
+  stream reduction is a mean, not a sum.
+
+- **GPU parity for the qwen4_exp serving kernels against the in-process CPU
+  oracle** (`ops/qwen4exp_oracle_tests.rs`). The existing gates need a 126 GiB
+  checkpoint, `transformers` and generated fixture bins before they say
+  anything; these drive the same kernels against
+  `atlas_core::qwen4exp_reference` — itself checked against HuggingFace at real
+  weights — so a clean checkout can gate the mHC collapse (at T=1/64/96, which
+  is what selects the split and GEMM paths), the trunk entry (sentinel-checked),
+  the residual fold and the whole PLE chain with one command and no downloads.
+  Every check carries a control that must fail.
 
 ### Fixed
+- **The mHC highway is FP32 for both families.** `hc_streams`' element size was
+  branched per family — f32 for DeepSeek-V4's `hc_mult`, bf16 for `hc_count` —
+  which was correct while this tree's own bf16 kernels read it and wrong for
+  the kernels that now serve, every one of which declares the buffer `float*`.
+  Sizing it bf16 under them does not crash: it reads the wrong half of every
+  value, on all 48 layers. Now unconditional, with all three config fillings
+  pinned to the same size.
+- **`qwen4exp_forward --generate N` appended N+1 tokens**, not N — reported and
+  reproduced twice on a GB10 during independent validation. `--generate 0`
+  keeps its own meaning: one pass, print the argmax, diff the fixture, append
+  nothing.
+- **The qwen4_exp parser skipped `finalize_config`**, which is where
+  `quantization_config` is read off the top level of `config.json`. ModelOpt
+  writes it beside `text_config`, so serde on `text_config` alone never saw it
+  and an NVFP4 checkpoint parsed as unquantized.
 - **Benchmark runs no longer overwrite each other.** History files were named by
   whole seconds, so two runs of the same benchmark within the same second
   silently destroyed the first. Records are now keyed by nanosecond with an

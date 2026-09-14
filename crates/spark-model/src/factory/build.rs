@@ -11,10 +11,12 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use spark_runtime::prefix_cache::PrefixCache;
 use spark_runtime::weights::WeightStore;
 
+use super::dspark_admission;
 use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
-use super::{DflashBuildArgs, LoraBuildArgs};
+use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_product_build};
 use crate::layers::MtpQuantization;
+use crate::layers::dflash_head::{DsparkStartupExecution, LightningDsparkRuntimeToggles};
 use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
@@ -97,6 +99,24 @@ pub fn build_model(
     #[cfg(not(feature = "cuda"))]
     let _ = (nllb_lang, nllb_lora_dir);
 
+    // Strict product toggle parsing runs only when the drafter declares the
+    // exact Lightning architecture; generic DFlash never sees product-only
+    // errors and later takes the lenient one-shot startup parse.
+    let lightning_dspark_policy = match dflash_args.as_ref() {
+        Some(args) if dspark_admission::declares_exact_lightning(args) => {
+            admit_lightning_dspark_product_build(
+                args,
+                &config,
+                num_drafts,
+                kv_block_size,
+                kv_dtype,
+                LightningDsparkRuntimeToggles::from_env()?,
+            )?
+        }
+        _ => None,
+    };
+    let lightning_dspark_admitted = lightning_dspark_policy.is_some();
+
     // ── Step 1: Select weight loader (only model-specific dispatch) ──
     let loader = loader_for_config(&config)?;
 
@@ -153,8 +173,35 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
+    // Attribute the memory the BUILD spends, not just the shards.
+    //
+    // Weight upload reports itself per shard, and the buffer arena reports its
+    // own total, but everything between — per-layer construction, runtime
+    // requantization, derived weights — was invisible. On qwen4_exp that gap
+    // is ~8.5 GB: shards end at 85.2 GB and the KV budget sees 94.7 GB
+    // pre-KV, of which the arena (872 MB) and the GDN prefill scratch (88 MB)
+    // explain under a gigabyte. Without these three lines the only way to
+    // find the rest is to guess.
+    let free_before_layers = gpu.free_memory().unwrap_or(0);
     let mut layers = loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
+    let free_after_layers = gpu.free_memory().unwrap_or(0);
+    tracing::info!(
+        "Layer construction: {:.2} GB consumed ({:.2} GB free -> {:.2} GB free) \
+         across {} layers, {:.1} MB/layer average",
+        (free_before_layers.saturating_sub(free_after_layers)) as f64 / 1e9,
+        free_before_layers as f64 / 1e9,
+        free_after_layers as f64 / 1e9,
+        config.num_hidden_layers,
+        (free_before_layers.saturating_sub(free_after_layers)) as f64
+            / 1e6
+            / config.num_hidden_layers.max(1) as f64,
+    );
     let embed = loader.load_embedding(&store, &config, gpu.as_ref())?;
+    // n-gram fused embedding (LongCat family; None everywhere else). Built
+    // before `config` is moved into the model. Staged for `max_batch_tokens`
+    // because that is exactly the widest embed the arena can be handed.
+    let ngram_embed =
+        loader.load_ngram_embedding(&store, &config, gpu.as_ref(), max_batch_tokens)?;
     let final_norm = loader.load_final_norm(&store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(&store, &config, gpu.as_ref())?;
     let mtp_weights = loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?;
@@ -196,10 +243,35 @@ pub fn build_model(
             None
         };
 
+    // Qwen3.8-Flash-Next ships an MTP block that is architecturally a full
+    // layer (gated attention + QSA indexer + mHC + 512-expert MoE), not the
+    // Qwen-shaped `MtpWeights`, so it loads through its own path exactly like
+    // DeepSeek-V4's. Rank 0 only: no other rank ever drafts.
+    let q4e_mtp_module =
+        if config.model_type == "qwen4_exp" && use_speculative && config.ep_rank == 0 {
+            match crate::weight_loader::qwen4_exp::load_qwen4exp_mtp_module(
+                &store,
+                &config,
+                gpu.as_ref(),
+                &attn_layer_dtypes,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("qwen4_exp MTP module load FAILED: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let q4e_mtp_loaded = q4e_mtp_module.is_some();
+    let q4e_mtp_embed = embed;
+    let q4e_mtp_lm_head = lm_head;
+
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
     // this loudly so the user knows the flag was inert.
-    if use_speculative && mtp_weights.is_empty() {
+    if use_speculative && mtp_weights.is_empty() && !q4e_mtp_loaded {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
              model — speculative decoding will be disabled. Either drop `--speculative` \
@@ -616,11 +688,48 @@ pub fn build_model(
         }
     }
 
+    // ── Step 6c: Qwen3.8-Flash-Next MTP proposer (optional) ──
+    //
+    // Same shape as 6b: the module holds a reused trunk layer, and the
+    // proposer supplies the MTP-specific ends (the per-stream combiner in
+    // front, the head mixer behind).
+    if let Some(q4e_module) = q4e_mtp_module {
+        match crate::layers::Qwen4ExpMtpHead::new(
+            q4e_module,
+            q4e_mtp_embed,
+            q4e_mtp_lm_head,
+            model.config_ref(),
+            model.gpu_backend(),
+            mtp_vocab_size,
+            max_seq_len,
+        ) {
+            Ok(head) => {
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(
+                    "qwen4_exp MTP speculative decoding: ENABLED (single module, \
+                     reused full-attention body)"
+                );
+            }
+            Err(e) => tracing::warn!(
+                "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
+            ),
+        }
+    }
+
     // ── Step 7: DFlash drafter (optional, post-construction) ──
     //
     // Loaded last because it depends on the target's `embed_tokens` and
     // `lm_head` pointers (the drafter checkpoint omits these — they're
     // shared at runtime, mirroring vLLM PR #40898's `skip_substrs` flow).
+    // ── Step 8: LoRA adapter install (optional, post-construction) ──
+    // The pool/tables were loaded up top (pre-KV-sizing); this walk copies
+    // the per-layer pairs into the layer structs. M0: layers only STORE the
+    // adapter — base output is unchanged until the M1 compute insertions.
+    // MUST run before any Lightning product setter below: the setter's
+    // structural gate rejects LoRA-backed targets, so installing adapters
+    // first makes that precondition observable instead of bypassable.
+    model.set_lora_weights(lora_weights)?;
+
     if let Some(args) = dflash_args {
         let weights = load_dflash_weights(
             args.drafter_store,
@@ -628,34 +737,81 @@ pub fn build_model(
             model.gpu_backend(),
             1, // tp_size for the drafter side: replicated, so always 1
         )?;
-        if let Some(weights) = weights {
-            let head = crate::layers::BlockDiffusionDraftHead::from_weights(
-                weights,
-                target_embed_for_dflash,
-                target_lm_head_for_dflash,
-                target_lm_head_nvfp4_for_dflash,
-                target_hidden_for_dflash,
-                args.gamma,
-                args.window_size,
-                model.gpu_backend(),
-                max_seq_len,
-            )?;
-            model.set_dflash_proposer(std::sync::Arc::new(head));
-            tracing::info!("DFlash drafter installed as the active proposer");
-        } else {
-            tracing::warn!(
-                "DFlash drafter store had no fc.weight — proposer not installed; \
-                 falling back to whatever proposer (if any) the target's MTP path built"
-            );
+        match weights {
+            Some(weights) => {
+                if lightning_dspark_admitted {
+                    anyhow::ensure!(
+                        weights.markov_w1.is_some() && weights.markov_w2.is_some(),
+                        "Lightning DSpark required Markov weights disappeared after load"
+                    );
+                    anyhow::ensure!(
+                        weights
+                            .layers
+                            .iter()
+                            .all(|layer| layer.attention_sink_bias.is_some()),
+                        "Lightning DSpark required attention sink weights disappeared after load"
+                    );
+                }
+                // Lightning admission owns the served SWA window. Generic
+                // DFlash keeps the caller's existing override/default path.
+                let served_window_size = lightning_dspark_policy
+                    .as_ref()
+                    .map(|policy| policy.profile().attention.swa_window)
+                    .or(args.window_size);
+                // Startup-static execution is frozen at head construction:
+                // the admitted Lightning product derives it from the
+                // validated policy toggles; generic DFlash keeps legacy
+                // lenient environment semantics, still parsed exactly once.
+                let startup = match lightning_dspark_policy.as_ref() {
+                    Some(policy) => {
+                        DsparkStartupExecution::from_lightning(policy.runtime_toggles())
+                    }
+                    None => DsparkStartupExecution::from_env_lenient(),
+                };
+                let head = crate::layers::BlockDiffusionDraftHead::from_weights(
+                    weights,
+                    target_embed_for_dflash,
+                    target_lm_head_for_dflash,
+                    target_lm_head_nvfp4_for_dflash,
+                    target_hidden_for_dflash,
+                    args.gamma,
+                    served_window_size,
+                    model.gpu_backend(),
+                    max_seq_len,
+                    max_batch_size,
+                    startup,
+                )?;
+                match lightning_dspark_policy {
+                    Some(policy) => {
+                        model.set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?
+                    }
+                    None => model.set_dflash_proposer(std::sync::Arc::new(head)),
+                }
+                tracing::info!(
+                    "{} drafter installed as the active proposer",
+                    if lightning_dspark_admitted {
+                        "Lightning DSpark"
+                    } else {
+                        "DFlash"
+                    }
+                );
+            }
+            None if lightning_dspark_admitted => {
+                anyhow::bail!(
+                    "Lightning DSpark admission passed but required drafter weights were not loaded"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "Generic DFlash drafter store had no fc.weight — proposer not installed"
+                );
+            }
         }
     }
 
-    // ── Step 8: LoRA adapter install (optional, post-construction) ──
-    // The pool/tables were loaded up top (pre-KV-sizing); this walk copies
-    // the per-layer pairs into the layer structs. M0: layers only STORE the
-    // adapter — base output is unchanged until the M1 compute insertions.
-    model.set_lora_weights(lora_weights)?;
-
+    if let Some(ngram) = ngram_embed {
+        model.set_ngram_embedding(ngram);
+    }
     // Every layer has taken the pointers it needs; hand the ledger to the model
     // so `teardown` can free the weights. Dropping it here — which is what used
     // to happen — orphaned the memory: live, referenced by the layers, with

@@ -118,16 +118,21 @@ impl TransformerModel {
             let token_ids_dev = self.buffers.scratch();
             self.gpu
                 .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
-            ops::batched_embed(
-                self.gpu.as_ref(),
-                self.batched_embed_kernel,
-                token_ids_dev,
-                self.embed_tokens.weight,
-                hidden,
-                total_len as u32,
-                h as u32,
-                stream,
-            )?;
+            if self.has_ngram_embedding() {
+                // Whole prompt in one go: `tokens` IS the context.
+                self.embed_tokens_fused(tokens, total_len, hidden, stream)?;
+            } else {
+                ops::batched_embed(
+                    self.gpu.as_ref(),
+                    self.batched_embed_kernel,
+                    token_ids_dev,
+                    self.embed_tokens.weight,
+                    hidden,
+                    total_len as u32,
+                    h as u32,
+                    stream,
+                )?;
+            }
             self.scale_embeddings(hidden, total_len, stream)?;
         }
 
@@ -185,6 +190,8 @@ impl TransformerModel {
                 && self
                     .ssm_snapshots
                     .session_matches(snap_id, seq.session_hash)
+                // See prefill_a: aux-carrying models decline aux-less slots.
+                && (!self.requires_aux_state() || self.ssm_snapshots.aux(snap_id).is_some())
             {
                 self.ssm_snapshots.restore(
                     snap_id,
@@ -193,6 +200,9 @@ impl TransformerModel {
                     self.gpu.as_ref(),
                     stream,
                 )?;
+                if let Some(aux) = self.ssm_snapshots.aux(snap_id) {
+                    self.apply_aux_states(seq, &aux, stream)?;
+                }
                 tracing::info!(
                     "Marconi two-phase: restored SSM snapshot at token {snap_tok} \
                          ({matched} KV blocks cached)",
@@ -272,16 +282,26 @@ impl TransformerModel {
             let token_ids_dev = self.buffers.scratch();
             self.gpu
                 .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
-            ops::batched_embed(
-                self.gpu.as_ref(),
-                self.batched_embed_kernel,
-                token_ids_dev,
-                self.embed_tokens.weight,
-                hidden,
-                proc_count as u32,
-                h as u32,
-                stream,
-            )?;
+            if self.has_ngram_embedding() {
+                let cs = proc_start.saturating_sub(self.ngram_lookbehind());
+                self.embed_tokens_fused(
+                    &tokens[cs..proc_start + proc_count],
+                    proc_count,
+                    hidden,
+                    stream,
+                )?;
+            } else {
+                ops::batched_embed(
+                    self.gpu.as_ref(),
+                    self.batched_embed_kernel,
+                    token_ids_dev,
+                    self.embed_tokens.weight,
+                    hidden,
+                    proc_count as u32,
+                    h as u32,
+                    stream,
+                )?;
+            }
             self.scale_embeddings(hidden, proc_count, stream)?;
         }
 
@@ -431,6 +451,7 @@ impl TransformerModel {
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
             gdn_exact_replay: marconi_skip,
             token_ids: None,
+            host_token_ids: None,
             // #30: request slot pairs (None unless routing to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
             midchunk_capture: None,

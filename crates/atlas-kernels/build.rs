@@ -26,6 +26,7 @@ struct SamplingCat {
     // Model-declared min-p. None = MODEL.toml is silent, so the server's
     // --default-min-p stands (see SamplingCategory in src/lib.rs).
     min_p: Option<f32>,
+    top_n_sigma: Option<f32>,
 }
 
 impl Default for SamplingCat {
@@ -42,6 +43,7 @@ impl Default for SamplingCat {
             dry_allowed_length: 2,
             lz_penalty: 0.0,
             min_p: None,
+            top_n_sigma: None,
         }
     }
 }
@@ -94,9 +96,11 @@ struct Target {
     behavior_disable_cwd_hint_injection: bool,
     behavior_use_sampling_presets_for_core: bool,
     behavior_tool_call_parser: String,
+    behavior_jinja_template: String,
     behavior_enable_loop_watchdog: bool,
     behavior_enable_think_loop_watchdog: bool,
     behavior_honor_eos_inside_thinking: bool,
+    behavior_min_reasoning_floor_tokens: u32,
     behavior_cap_thinking_at_max_tokens: bool,
     behavior_min_p_floor: f32,
     behavior_temperature_max: f32,
@@ -1187,9 +1191,11 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_disable_cwd_hint_injection: pb.disable_cwd_hint_injection,
                 behavior_use_sampling_presets_for_core: pb.use_sampling_presets_for_core,
                 behavior_tool_call_parser: pb.tool_call_parser,
+                behavior_jinja_template: pb.jinja_template,
                 behavior_enable_loop_watchdog: pb.enable_loop_watchdog,
                 behavior_enable_think_loop_watchdog: pb.enable_think_loop_watchdog,
                 behavior_honor_eos_inside_thinking: pb.honor_eos_inside_thinking,
+                behavior_min_reasoning_floor_tokens: pb.min_reasoning_floor_tokens,
                 behavior_cap_thinking_at_max_tokens: pb.cap_thinking_at_max_tokens,
                 behavior_min_p_floor: pb.min_p_floor,
                 behavior_temperature_max: pb.temperature_max,

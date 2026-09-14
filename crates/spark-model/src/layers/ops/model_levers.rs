@@ -61,6 +61,12 @@ pub struct ModelLevers {
     // ── Attention ──
     /// Contiguous-attention path for the DFlash head.
     pub dflash_contig_attn: bool,
+    /// Official Lightning product: preserve sequential Mamba recurrence during
+    /// K-row verify while retaining batched projection staging.
+    pub lightning_mamba_exact_recurrence: bool,
+    /// Official Lightning product: use the scalar W8A16 input projection per
+    /// verify row. The existing batch4 kernel is not byte-identical at K=4.
+    pub lightning_mamba_scalar_in_proj: bool,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -123,6 +129,7 @@ fn opt_in_truthy(var: &str) -> bool {
 impl ModelLevers {
     /// Resolve from the environment. Called once, when the model is built.
     pub fn from_env() -> Self {
+        let lightning_lossless_target = opt_in("ATLAS_LIGHTNING_LOSSLESS_TARGET");
         Self {
             max_decode_seqs: 1,
             shadow_topk: crate::speculative::shadow_topk(),
@@ -145,6 +152,10 @@ impl ModelLevers {
             holo_moe_gateup_fp4: opt_in_truthy("ATLAS_HOLO_MOE_GATEUP_FP4"),
             moe_union_stats: opt_in("ATLAS_MOE_UNION_STATS"),
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
+            // Product installation also arms these. The explicit model-load
+            // diagnostic lets a no-spec control use identical target arithmetic.
+            lightning_mamba_exact_recurrence: lightning_lossless_target,
+            lightning_mamba_scalar_in_proj: lightning_lossless_target,
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),

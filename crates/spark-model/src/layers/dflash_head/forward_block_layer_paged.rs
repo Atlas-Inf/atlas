@@ -38,7 +38,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::{BlockDiffusionDraftHead, DflashLayer};
+use super::{BlockDiffusionDraftHead, DflashLayer, DflashScratch};
 use crate::layer::ForwardContext;
 
 /// Inputs to the γ-only paged-attention per-layer body.
@@ -98,10 +98,11 @@ impl BlockDiffusionDraftHead {
         layer: &DflashLayer,
         args: &PagedLayerArgs,
         ctx: &ForwardContext,
+        scratch: &DflashScratch,
     ) -> Result<()> {
-        let (k_pool, v_pool) = self.forward_block_layer_pre_attn(layer, args, ctx)?;
-        self.forward_block_layer_attention(args, ctx, k_pool, v_pool)?;
-        self.forward_block_layer_post_attn(layer, args, ctx)?;
+        let (k_pool, v_pool) = self.forward_block_layer_pre_attn(layer, args, ctx, scratch)?;
+        self.forward_block_layer_attention(args, ctx, k_pool, v_pool, scratch)?;
+        self.forward_block_layer_post_attn(layer, args, ctx, scratch)?;
         Ok(())
     }
 
@@ -160,6 +161,7 @@ impl BlockDiffusionDraftHead {
         layer: &DflashLayer,
         args: &PagedLayerArgs,
         ctx: &ForwardContext,
+        scratch: &DflashScratch,
     ) -> Result<(DevicePtr, DevicePtr)> {
         use crate::layers::ops;
 
@@ -185,9 +187,9 @@ impl BlockDiffusionDraftHead {
         ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
-            self.scratch.stream_buf,
+            scratch.stream_buf,
             &layer.input_layernorm,
-            self.scratch.norm_buf,
+            scratch.norm_buf,
             g,
             h,
             self.rms_norm_eps,
@@ -196,15 +198,7 @@ impl BlockDiffusionDraftHead {
 
         // id259 per-layer dump: post-input_norm (γ × h).
         if args.block_dump {
-            self.block_dump_buf(
-                ctx,
-                self.scratch.norm_buf,
-                layer_idx,
-                "input_norm",
-                g,
-                h,
-                stream,
-            )?;
+            self.block_dump_buf(ctx, scratch.norm_buf, layer_idx, "input_norm", g, h, stream)?;
         }
 
         // Phase G: when self.quant == Fp8Weights, swap each dense_gemm
@@ -212,38 +206,15 @@ impl BlockDiffusionDraftHead {
         // Per-row f32 scales (built at load time by quantize_bf16_to_fp8)
         // are applied inside the GEMM at write-out. Fp8 mirror None →
         // fall back to BF16 (defensive, shouldn't fire if G.2 ran).
-        let use_fp8 = matches!(self.quant, super::DflashQuantization::Fp8Weights);
         let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
                          w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
+                         w_nvfp4: &Option<crate::weight_map::QuantizedWeight>,
                          src: spark_runtime::gpu::DevicePtr,
                          dst: spark_runtime::gpu::DevicePtr,
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            if use_fp8 && let Some(fp8) = w_fp8 {
-                return ops::fp8_gemm_n128_row_scaled(
-                    gpu,
-                    self.kernels.fp8_gemm_n128_row_scaled,
-                    src,
-                    fp8,
-                    dst,
-                    g,
-                    n_out,
-                    k_in,
-                    stream,
-                );
-            }
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.kernels.dense_gemm_pipelined,
-                src,
-                w_bf16,
-                dst,
-                g,
-                n_out,
-                k_in,
-                stream,
-            )
+            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
         };
 
         // 3b-q / 3c-q. Q branch: q_proj then q_norm — faithful to dflash.py:68-70.
@@ -253,15 +224,16 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.q_proj,
             &layer.q_proj_fp8,
-            self.scratch.norm_buf,
-            self.scratch.q_buf,
+            &layer.q_proj_nvfp4,
+            scratch.norm_buf,
+            scratch.q_buf,
             q_dim,
             h,
         )?;
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
-                self.scratch.q_buf,
+                scratch.q_buf,
                 layer_idx,
                 "q_postproj",
                 g,
@@ -272,9 +244,9 @@ impl BlockDiffusionDraftHead {
         ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
-            self.scratch.q_buf,
+            scratch.q_buf,
             &layer.q_norm,
-            self.scratch.q_buf,
+            scratch.q_buf,
             g * self.num_q_heads as u32,
             self.head_dim as u32,
             self.rms_norm_eps,
@@ -283,7 +255,7 @@ impl BlockDiffusionDraftHead {
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
-                self.scratch.q_buf,
+                scratch.q_buf,
                 layer_idx,
                 "q_postnorm",
                 g,
@@ -302,15 +274,16 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.k_proj,
             &layer.k_proj_fp8,
-            self.scratch.norm_buf,
-            self.scratch.k_buf,
+            &layer.k_proj_nvfp4,
+            scratch.norm_buf,
+            scratch.k_buf,
             kv_dim,
             h,
         )?;
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
-                self.scratch.k_buf,
+                scratch.k_buf,
                 layer_idx,
                 "k_postproj",
                 g,
@@ -321,9 +294,9 @@ impl BlockDiffusionDraftHead {
         ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
-            self.scratch.k_buf,
+            scratch.k_buf,
             &layer.k_norm,
-            self.scratch.k_buf,
+            scratch.k_buf,
             g * self.num_kv_heads as u32,
             self.head_dim as u32,
             self.rms_norm_eps,
@@ -332,7 +305,7 @@ impl BlockDiffusionDraftHead {
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
-                self.scratch.k_buf,
+                scratch.k_buf,
                 layer_idx,
                 "k_postnorm",
                 g,
@@ -347,8 +320,9 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.v_proj,
             &layer.v_proj_fp8,
-            self.scratch.norm_buf,
-            self.scratch.v_buf,
+            &layer.v_proj_nvfp4,
+            scratch.norm_buf,
+            scratch.v_buf,
             kv_dim,
             h,
         )?;
@@ -365,9 +339,9 @@ impl BlockDiffusionDraftHead {
         ops::rope_yarn(
             gpu,
             self.kernels.rope_qwen3,
-            self.scratch.q_buf,
-            self.scratch.k_buf,
-            self.scratch.position_ids,
+            scratch.q_buf,
+            scratch.k_buf,
+            scratch.position_ids,
             g,
             self.num_q_heads as u32,
             self.num_kv_heads as u32,
@@ -382,7 +356,7 @@ impl BlockDiffusionDraftHead {
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
-                self.scratch.q_buf,
+                scratch.q_buf,
                 layer_idx,
                 "q_postrope",
                 g,
@@ -391,14 +365,14 @@ impl BlockDiffusionDraftHead {
             )?;
             self.block_dump_buf(
                 ctx,
-                self.scratch.k_buf,
+                scratch.k_buf,
                 layer_idx,
                 "k_postrope",
                 g,
                 kv_dim,
                 stream,
             )?;
-            self.block_dump_buf(ctx, self.scratch.v_buf, layer_idx, "v", g, kv_dim, stream)?;
+            self.block_dump_buf(ctx, scratch.v_buf, layer_idx, "v", g, kv_dim, stream)?;
         }
 
         // 3e. reshape_and_cache — write γ K/V into the layer's paged cache
@@ -416,8 +390,8 @@ impl BlockDiffusionDraftHead {
         ops::reshape_and_cache(
             gpu,
             self.kernels.reshape_cache_bf16,
-            self.scratch.k_buf,
-            self.scratch.v_buf,
+            scratch.k_buf,
+            scratch.v_buf,
             k_pool,
             v_pool,
             slot_mapping_gamma,
@@ -436,9 +410,7 @@ impl BlockDiffusionDraftHead {
         // K row at the slot we just wrote and compares first 8 BF16 values
         // against the source k_buf row 0. If they differ, the cache write
         // landed in the wrong slot or with the wrong layout. ONE-SHOT.
-        if layer_idx == 0
-            && std::env::var("ATLAS_DFLASH_OPTION_B_DIAG").ok().as_deref() == Some("1")
-        {
+        if layer_idx == 0 && self.startup.diagnostics.option_b_diag {
             // Per-model latch (see `ModelStats::dumped`): a static would let
             // the previous model swallow this model's one-shot diagnostic.
             if ctx.stats.dumped.keyed("dflash_option_b") {
@@ -474,7 +446,7 @@ impl BlockDiffusionDraftHead {
                         })
                         .collect())
                 };
-                let src = read8(self.scratch.k_buf)?;
+                let src = read8(scratch.k_buf)?;
                 let cached = read8(cache_row_ptr)?;
                 tracing::info!(
                     "DFLASH OPTION_B DIAG: γ K layer0 slot0={} phys_block={} off={} \
@@ -541,6 +513,7 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         k_pool: DevicePtr,
         v_pool: DevicePtr,
+        scratch: &DflashScratch,
     ) -> Result<()> {
         use crate::layers::ops;
 
@@ -548,7 +521,7 @@ impl BlockDiffusionDraftHead {
         // non-causal prefill_attention — matches dflash.py:75-97 op-for-op.
         // Default (env unset): paged-indirect kernel, unchanged.
         if ctx.levers.dflash_contig_attn {
-            return self.forward_block_layer_attention_contig(args, ctx, k_pool, v_pool);
+            return self.forward_block_layer_attention_contig(args, ctx, k_pool, v_pool, scratch);
         }
 
         let PagedLayerArgs {
@@ -560,32 +533,33 @@ impl BlockDiffusionDraftHead {
         let gpu = ctx.gpu;
         let g = self.gamma as u32;
 
-        // 3f. paged attention — q_len=γ, kv_len=ctx_count+γ, causal=false.
-        // dflash.py:84-97  `attn_output, _ = attn_fn(self, q, k, v, ...)`
-        //   with `self.is_causal = False` (line 39).  Q(γ) attends over
-        //   full K/V(ctx+γ) bidirectionally — identical semantics.
-        //
-        // Phase 5 (CUDA graph): kv_len and q_offset are read from
-        // `option_b_indirect_args_dev` at kernel entry rather than passed
-        // as scalar args, so the captured launch survives per-call value
-        // changes. Host writes the 8-byte pair in forward_block.rs
-        // pre-graph; replays pick up whatever's there.
+        // 3f. paged attention — q_len=γ, kv_len=ctx_count+γ.
+        // Lightning DSpark: causal=true + SWA 1024 (config.json). Qwen-DFlash
+        // remains bidirectional (query_causal=false).
+        let sinks = self
+            .layers
+            .get(args.layer_idx)
+            .and_then(|l| l.attention_sink_bias.as_ref())
+            .map(|w| w.weight)
+            .unwrap_or(DevicePtr::NULL);
         ops::prefill_attention_paged_dflash_bf16_indirect(
             gpu,
             self.kernels.prefill_attn_dflash_bf16_indirect,
-            self.scratch.q_buf,
+            scratch.q_buf,
             k_pool,
             v_pool,
-            self.scratch.attn_out,
+            scratch.attn_out,
             block_table_dev,
             g,
-            self.scratch.option_b_indirect_args_dev,
+            scratch.option_b_indirect_args_dev,
             self.num_q_heads as u32,
             self.num_kv_heads as u32,
             self.head_dim as u32,
             16, // cache_block_size
-            0,  // sliding_window — drafter not windowed for now
+            self.attn_sliding_window(),
+            self.attn_causal(),
             inv_sqrt_d,
+            sinks,
             stream,
         )?;
 
@@ -593,7 +567,7 @@ impl BlockDiffusionDraftHead {
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
-                self.scratch.attn_out,
+                scratch.attn_out,
                 args.layer_idx,
                 "attn_out",
                 g,
@@ -624,6 +598,7 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         k_pool: DevicePtr,
         v_pool: DevicePtr,
+        scratch: &DflashScratch,
     ) -> Result<()> {
         use crate::layers::ops;
 
@@ -665,24 +640,24 @@ impl BlockDiffusionDraftHead {
             ops::prefill_attention(
                 gpu,
                 self.kernels.prefill_attn,
-                self.scratch.q_buf,
-                self.scratch.k_buf,
-                self.scratch.v_buf,
-                self.scratch.attn_out,
+                scratch.q_buf,
+                scratch.k_buf,
+                scratch.v_buf,
+                scratch.attn_out,
                 g,
                 1,
                 self.num_q_heads as u32,
                 self.num_kv_heads as u32,
                 self.head_dim as u32,
                 inv_sqrt_d,
-                false, // is_causal=false  (dflash.py:39)
-                0,
+                self.attn_causal(),
+                self.attn_sliding_window(),
                 stream,
             )?;
             if args.block_dump {
                 self.block_dump_buf(
                     ctx,
-                    self.scratch.attn_out,
+                    scratch.attn_out,
                     args.layer_idx,
                     "attn_out",
                     g,
@@ -697,9 +672,9 @@ impl BlockDiffusionDraftHead {
         let mut noise_k = vec![0u8; g_us * kv_slot];
         let mut noise_v = vec![0u8; g_us * kv_slot];
         let mut noise_q = vec![0u8; g_us * q_slot];
-        gpu.copy_d2h(self.scratch.k_buf, &mut noise_k)?;
-        gpu.copy_d2h(self.scratch.v_buf, &mut noise_v)?;
-        gpu.copy_d2h(self.scratch.q_buf, &mut noise_q)?;
+        gpu.copy_d2h(scratch.k_buf, &mut noise_k)?;
+        gpu.copy_d2h(scratch.v_buf, &mut noise_v)?;
+        gpu.copy_d2h(scratch.q_buf, &mut noise_q)?;
 
         // ── D2H: block table (ceil(ctx_count / BLOCK_SIZE) u32 entries) ───────
         let num_ctx_blocks = ctx_us.div_ceil(BLOCK_SIZE);
@@ -746,8 +721,8 @@ impl BlockDiffusionDraftHead {
         k_contig[ctx_us * kv_slot..].copy_from_slice(&noise_k);
         v_contig[..ctx_us * kv_slot].copy_from_slice(&ctx_v);
         v_contig[ctx_us * kv_slot..].copy_from_slice(&noise_v);
-        gpu.copy_h2d(&k_contig, self.scratch.k_buf)?;
-        gpu.copy_h2d(&v_contig, self.scratch.v_buf)?;
+        gpu.copy_h2d(&k_contig, scratch.k_buf)?;
+        gpu.copy_h2d(&v_contig, scratch.v_buf)?;
 
         // ── Build padded Q = [zeros(ctx_count), noise_Q]; H2D → q_buf ─────────
         // z-lab Q rows [ctx_count..ctx_count+γ] are the noise queries.
@@ -755,7 +730,7 @@ impl BlockDiffusionDraftHead {
         let total_q = (ctx_us + g_us) * q_slot;
         let mut q_contig = vec![0u8; total_q]; // zero-initialized
         q_contig[ctx_us * q_slot..].copy_from_slice(&noise_q);
-        gpu.copy_h2d(&q_contig, self.scratch.q_buf)?;
+        gpu.copy_h2d(&q_contig, scratch.q_buf)?;
 
         // ── Contiguous non-causal attention ────────────────────────────────────
         // dflash.py:84-97  eager_attention_forward(q, k, v, is_causal=False)
@@ -766,18 +741,18 @@ impl BlockDiffusionDraftHead {
         ops::prefill_attention(
             gpu,
             self.kernels.prefill_attn,
-            self.scratch.q_buf,
-            self.scratch.k_buf,
-            self.scratch.v_buf,
-            self.scratch.attn_out,
+            scratch.q_buf,
+            scratch.k_buf,
+            scratch.v_buf,
+            scratch.attn_out,
             seq_len,
             1,
             self.num_q_heads as u32,
             self.num_kv_heads as u32,
             self.head_dim as u32,
             inv_sqrt_d,
-            false, // is_causal=false  (dflash.py:39)
-            0,
+            self.attn_causal(),
+            self.attn_sliding_window(),
             stream,
         )?;
 
@@ -786,16 +761,13 @@ impl BlockDiffusionDraftHead {
         // so post_attn (o_proj etc.) can read from offset 0 as usual.
         gpu.synchronize(stream)?;
         let mut noise_attn = vec![0u8; g_us * q_slot];
-        gpu.copy_d2h(
-            self.scratch.attn_out.offset(ctx_us * q_slot),
-            &mut noise_attn,
-        )?;
-        gpu.copy_h2d(&noise_attn, self.scratch.attn_out)?;
+        gpu.copy_d2h(scratch.attn_out.offset(ctx_us * q_slot), &mut noise_attn)?;
+        gpu.copy_h2d(&noise_attn, scratch.attn_out)?;
 
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
-                self.scratch.attn_out,
+                scratch.attn_out,
                 args.layer_idx,
                 "attn_out",
                 g,
@@ -824,6 +796,7 @@ impl BlockDiffusionDraftHead {
         layer: &DflashLayer,
         args: &PagedLayerArgs,
         ctx: &ForwardContext,
+        scratch: &DflashScratch,
     ) -> Result<()> {
         use crate::layers::ops;
 
@@ -840,38 +813,15 @@ impl BlockDiffusionDraftHead {
         // Phase G — same swap helper as pre_attn (q/k/v). Single call
         // site per logical GEMM; the row-scaled FP8 GEMM kernel applies
         // the per-row scale internally at write-out.
-        let use_fp8 = matches!(self.quant, super::DflashQuantization::Fp8Weights);
         let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
                          w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
+                         w_nvfp4: &Option<crate::weight_map::QuantizedWeight>,
                          src: spark_runtime::gpu::DevicePtr,
                          dst: spark_runtime::gpu::DevicePtr,
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            if use_fp8 && let Some(fp8) = w_fp8 {
-                return ops::fp8_gemm_n128_row_scaled(
-                    gpu,
-                    self.kernels.fp8_gemm_n128_row_scaled,
-                    src,
-                    fp8,
-                    dst,
-                    g,
-                    n_out,
-                    k_in,
-                    stream,
-                );
-            }
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.kernels.dense_gemm_pipelined,
-                src,
-                w_bf16,
-                dst,
-                g,
-                n_out,
-                k_in,
-                stream,
-            )
+            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
         };
 
         // 3g. o_proj — γ rows, [q_dim → h].
@@ -883,8 +833,9 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.o_proj,
             &layer.o_proj_fp8,
-            self.scratch.attn_out,
-            self.scratch.stream_acc,
+            &layer.o_proj_nvfp4,
+            scratch.attn_out,
+            scratch.stream_acc,
             h,
             q_dim,
         )?;
@@ -897,8 +848,8 @@ impl BlockDiffusionDraftHead {
         ops::residual_add(
             gpu,
             self.kernels.residual_add,
-            self.scratch.stream_buf,
-            self.scratch.stream_acc,
+            scratch.stream_buf,
+            scratch.stream_acc,
             g * h,
             stream,
         )?;
@@ -912,9 +863,9 @@ impl BlockDiffusionDraftHead {
         ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
-            self.scratch.stream_buf,
+            scratch.stream_buf,
             &layer.post_attention_layernorm,
-            self.scratch.norm_buf,
+            scratch.norm_buf,
             g,
             h,
             self.rms_norm_eps,
@@ -930,33 +881,36 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.gate_proj,
             &layer.gate_proj_fp8,
-            self.scratch.norm_buf,
-            self.scratch.mlp_intermediate,
+            &layer.gate_proj_nvfp4,
+            scratch.norm_buf,
+            scratch.mlp_intermediate,
             inter,
             h,
         )?;
         gemm_swap(
             &layer.up_proj,
             &layer.up_proj_fp8,
-            self.scratch.norm_buf,
-            self.scratch.mlp_up,
+            &layer.up_proj_nvfp4,
+            scratch.norm_buf,
+            scratch.mlp_up,
             inter,
             h,
         )?;
         ops::silu_mul(
             gpu,
             self.kernels.silu_mul,
-            self.scratch.mlp_intermediate,
-            self.scratch.mlp_up,
-            self.scratch.mlp_intermediate,
+            scratch.mlp_intermediate,
+            scratch.mlp_up,
+            scratch.mlp_intermediate,
             g * inter,
             stream,
         )?;
         gemm_swap(
             &layer.down_proj,
             &layer.down_proj_fp8,
-            self.scratch.mlp_intermediate,
-            self.scratch.stream_acc,
+            &layer.down_proj_nvfp4,
+            scratch.mlp_intermediate,
+            scratch.stream_acc,
             h,
             inter,
         )?;
@@ -970,8 +924,8 @@ impl BlockDiffusionDraftHead {
         ops::residual_add(
             gpu,
             self.kernels.residual_add,
-            self.scratch.stream_buf,
-            self.scratch.stream_acc,
+            scratch.stream_buf,
+            scratch.stream_acc,
             g * h,
             stream,
         )?;
@@ -982,7 +936,7 @@ impl BlockDiffusionDraftHead {
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
-                self.scratch.stream_buf,
+                scratch.stream_buf,
                 args.layer_idx,
                 "layer_out",
                 g,

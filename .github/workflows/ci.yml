@@ -7,6 +7,13 @@ on:
   # can only be started by an event you do not control is a check you cannot
   # get a verdict from when you most need it.
   workflow_dispatch:
+  # Default types (opened/synchronize/reopened). `labeled` is deliberately NOT
+  # here: this workflow's concurrency group is `cancel-in-progress`, so a run
+  # started by a label would CANCEL the in-flight run for the same ref. Any
+  # label change at all — not just `build:distros` — would kill a CI run that
+  # was most of the way through and restart it from scratch. The opt-in
+  # experimental matrix listens for the label in distros.yml instead, which has
+  # its own concurrency group and cannot disturb this one.
   pull_request:
   push:
     branches: [main, master]
@@ -17,8 +24,9 @@ on:
   # Every job that is (or becomes) a required check must stay event-agnostic
   # or run here too. Jobs that are event-gated to `pull_request` and NOT
   # required (pr-categorize) are advisory only and need not report on queue
-  # commits. release-matrix and pr-benchmark-gate both run under merge_group
-  # deliberately — see their own comments for why.
+  # commits. pr-benchmark-gate runs under merge_group deliberately — see its
+  # own comment for why. release-matrix no longer does: it is opt-in now, and
+  # nothing in this repo's ruleset makes it required.
   merge_group:
   # Reusable: release.yml gates its (expensive) build matrix on CI passing, so
   # a fmt or clippy failure costs one cheap runner instead of eight toolchain
@@ -141,99 +149,108 @@ jobs:
       # is run locally on GB10 hardware via `-- --ignored`.
       - run: cargo test --workspace --locked
 
-  test-macos-metal:
-    name: cargo test --features metal (macOS aarch64)
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # Apple Silicon path: no CUDA toolchain, no nvcc. The `metal`
-      # feature opts out of cudarc workspace-wide and into the Metal
-      # runtime backend (objc2-metal). xcrun + metallib are part of
-      # macOS's built-in Xcode Command Line Tools and don't need a
-      # separate install on macos-14 runners.
-      # `-p spark-server --features metal` activates the metal
-      # feature on every transitive workspace crate via spark-server's
-      # forwarding feature flags. Single-flag spelling — no long
-      # `atlas-core/metal,spark-runtime/metal,...` comma list needed.
-      - name: cargo check spark-server --features metal
-        run: cargo check -p spark-server --no-default-features --features metal
-      # Also check spark-runtime alone so a regression in the metal
-      # backend tests can be diagnosed independently of higher layers.
-      - name: cargo check spark-runtime --features metal
-        run: cargo check -p spark-runtime --no-default-features --features metal
-      # Build the metal kernel set + run every metal_backend parity
-      # test. The real-model parity tests (`#[ignore]`-gated) require
-      # a local copy of mlx-community/Qwen3.5-4B-MLX-8bit and only
-      # run on a developer machine; default `cargo test` skips them.
-      - name: cargo test -p spark-runtime --features metal
-        env:
-          ATLAS_TARGET_HW: metal
-          ATLAS_TARGET_MODEL: qwen3-5-4b-vlm-mlx-int8
-          ATLAS_TARGET_QUANT: mlx_int8
-        run: |
-          cargo test -p spark-runtime --no-default-features \
-            --features metal --locked metal_backend
-      # Sanity check: the metal-feature spark-server binary must not
-      # link against libcuda. Anything else means a stray
-      # `rustc-link-lib=cuda` directive snuck through a build.rs.
-      - name: assert no libcuda linkage in metal binary
-        run: |
-          cargo build -p spark-server --bin spark --no-default-features --features metal
-          if otool -L target/debug/spark | grep -i cuda; then
-            echo "::error::metal-feature spark binary links libcuda"
-            exit 1
-          fi
-          if otool -L target/debug/spark | grep -i nccl; then
-            echo "::error::metal-feature spark binary links libnccl"
-            exit 1
-          fi
+  # `test-macos-metal` was REMOVED on 2026-08-26.
+  #
+  # Read the reason carefully, because the obvious one is WRONG. This job was
+  # first cut on a runner-cost argument — ~2.7 minutes at a 10x macOS
+  # multiplier, 32 runs a week. That argument does not hold: this repository is
+  # PUBLIC and every runner in the tree is standard GitHub-hosted, where Actions
+  # minutes are free. The 2x/10x multipliers are private-repo billing.
+  #
+  # What is real is CONCURRENCY. Public repos still sit under a concurrent-job
+  # cap, and the macOS pool is by far the tightest. Before this change each push
+  # asked for THREE macOS jobs at once — this one plus the two `macos-*-metal`
+  # matrix entries — and nine workflows were observed simultaneously queued on
+  # 2026-08-26. Removing this frees the scarcest pool for the two matrix entries
+  # that still want it on a release.
+  #
+  # The second reason is a product call, recorded so it is not mistaken for an
+  # oversight: macOS/Metal is not a priority for this project right now.
+  #
+  # A REJECTED ALTERNATIVE, kept because it is the right fix if metal comes
+  # back: the job ran FOUR compiles of the same code — `cargo check` twice,
+  # then `cargo test`, then `cargo build` — and the two `check`s are subsumed by
+  # the later `build`, buying only a nicer failure message for most of the
+  # job's ~4m41s. Collapsing four compiles into one preserves every assertion
+  # at a fraction of the runtime. Do that rather than restoring it verbatim.
+  #
+  # What it checked, so that restoring it is a copy from git history rather
+  # than a rewrite (`git show <this-commit>^:.github/workflows/ci.yml`):
+  #   - `cargo check -p spark-server --features metal`
+  #   - `cargo check -p spark-runtime --features metal`
+  #   - `cargo test -p spark-runtime --features metal metal_backend`
+  #     (the `metal_backend` parity tests; the real-model ones are
+  #     `#[ignore]`-gated on a local Qwen3.5-4B-MLX-8bit copy and never ran here)
+  #   - `otool -L` on the metal `spark` binary, asserting no libcuda/libnccl
+  #     linkage leaked in through a stray `rustc-link-lib=cuda`
+  #
+  # NOTE: the two `macos-*-metal` entries in `.github/release-matrix.json` are
+  # untouched, so a release still builds and packages macOS binaries. What is
+  # gone is only the per-PR compile-and-test of the metal backend. Nothing
+  # verifies a metal regression on a PR until this comes back.
 
   # cargo-deny runs in security.yml with path filters on Cargo.toml / Cargo.lock /
   # deny.toml plus a weekly cron. Not duplicated here.
 
-  # The release build matrix runs only after every gate above is green, in
-  # this same CI run — so a PR's checks table shows base CI then the matrix,
-  # and CI is never executed twice for one commit. Guarded to pull_request:
-  # release.yml calls this workflow for its own gate, and must not trigger a
-  # second matrix build there.
+  # The two builds that can actually fail a PR — and only those two.
+  #
+  # `release-build.yml` sets each build's `continue-on-error` from the entry's
+  # `experimental` flag. Seven of the nine entries in release-matrix.json are
+  # `experimental: true`, which makes them STRUCTURALLY INCAPABLE of turning a
+  # PR red — including `windows-x86_64-nvidia-cuda`, at ~34 minutes the longest
+  # job in this repository. Running them per-push bought latency and queue
+  # pressure in exchange for no verdict at all.
+  #
+  # The two that DO gate are `linux-x86_64-nvidia-cuda` and
+  # `linux-aarch64-nvidia-cuda`, and they are also the two cheapest: both are
+  # native builds on free hosted runners (`ubuntu-24.04`, `ubuntu-24.04-arm`),
+  # ~8 and ~5 minutes. `linux-aarch64` in particular is the PRIMARY TARGET —
+  # GB10 / DGX Spark is arm64 Grace — so dropping it from PRs would remove
+  # per-PR verification of the one platform this project exists to serve. They
+  # stay, unconditionally, on every PR.
+  #
+  # The other seven are opt-in through `distros.yml` (label `build:distros`),
+  # or via `release.yml`'s dispatch with `dry_run: true`, which takes any ref
+  # and needed no new machinery. `dev-release.yml` still cuts rolling `bNNNN`
+  # prereleases off green main.
+  #
+  # Not gated on merge_group: this repo's only ruleset (`main-protect`) is
+  # enforcement `disabled` with just deletion + non_fast_forward, so nothing
+  # here is a required check and there is no queue to report into. If a queue
+  # is ever enabled and this becomes required, restore
+  # `github.event_name == 'merge_group'` below — a required check that never
+  # reports hangs every queue entry.
   release-matrix:
     name: release matrix
-    # Runs for pull_request AND merge_group (queue entry validation on the
-    # temporary gh-readonly-queue/** commit). github.event.number is empty
-    # under merge_group, so the version string falls back to "queue".
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
-    needs: [fmt, clippy, license-headers, typos, kernel-structure, test, test-macos-metal]
+    if: github.event_name == 'pull_request'
+    needs: [fmt, clippy, license-headers, typos, kernel-structure, test]
     uses: ./.github/workflows/release-build.yml
     with:
-      version: 0.0.0-pr${{ github.event.number || 'queue' }}
+      version: 0.0.0-pr${{ github.event.number }}
       pr_mode: true
+      # The whole point: gating entries only.
+      include_experimental: false
       retention_days: 1
 
-  # OBSERVE-ONLY, and structurally incapable of being anything else.
+  # PARKED 2026-08-26, together with governance-harvest.yml, which is the ONLY
+  # consumer of the artifact this job uploads. That workflow has never
+  # succeeded on this repo — it dies at `createPullRequest` because "Allow
+  # GitHub Actions to create and approve pull requests" is off and staying off
+  # — and `governance/` is currently mixing ~95 Avarok-upstream-numbered
+  # ledgers with this repo's own pr-1..pr-13, which has to be untangled before
+  # any of it means anything. With the consumer parked, this job would upload
+  # artifacts nobody reads and spend a model call per push doing it.
   #
-  # This job asks a language model what the pull request is *for*, and records
-  # the answer. It does not gate. `pr-benchmark-gate` below neither `needs:`
-  # this job nor reads its outputs — the `--pr` flag that job now passes keys
-  # a lookup of the COMMITTED governance ledger in the checked-out tree, which
-  # only a default-branch harvester can write, so nothing this job emits can
-  # reach that gate inside the same run. There is no path — not a slow one,
-  # not a subtle one — by which this reaches a verdict. That separation is the
-  # design, not a rollout stage: the inputs are attacker-controlled (a PR's
-  # title and body are written by whoever opened it), and arranging for that
-  # text to be UNABLE to affect verification is stronger than hoping a model
-  # resists it. The one input that is NOT attacker-controlled on a fork —
-  # labels, which need triage permission — is exactly the one allowed to
-  # short-circuit the model. See the override step.
+  # It stays dispatch-reachable so the categoriser can still be exercised
+  # deliberately. Turn it back on in the same commit as governance-harvest.
   #
-  # What it is for right now is evidence. Before any category is allowed to add
-  # verification, the log has to show what it would have said, on real pull
-  # requests, including the ones where it abstained.
+  # Everything below is unchanged and still true when it runs — most
+  # importantly that it is OBSERVE-ONLY and structurally incapable of being
+  # anything else. Re-read the block above the job before re-enabling.
   pr-categorize:
     name: PR categorize (advisory)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'workflow_dispatch'
     # One live run per PR. The workflow-level group keys on `github.ref`,
     # which serializes compile jobs fine, but a rapid re-push sequence still
     # queued duplicate MODEL CALLS here — and the free tier rate-limits per

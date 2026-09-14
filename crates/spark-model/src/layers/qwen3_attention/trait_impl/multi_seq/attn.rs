@@ -51,6 +51,9 @@ impl Qwen3AttentionLayer {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| std::env::var("ATLAS_NO_ROPE_STRIDED").ok().as_deref() != Some("1"))
         }
+        if self.rope_disabled {
+            return Ok(());
+        }
         if n > 1 && self.rope_strided_k.0 != 0 && rope_strided_enabled() {
             let stride_e = (per_seq_qkv / bf16) as u32;
             return ops::rope_strided(

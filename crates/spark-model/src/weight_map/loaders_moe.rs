@@ -248,6 +248,8 @@ pub(crate) fn load_mtp(
             experts: Vec::new(),
             dense_ffn: Some(dense_ffn),
             norm: dense(store, "mtp.norm.weight")?,
+            lightning: false,
+            shared_intermediate_size: 0,
         });
     }
 
@@ -310,5 +312,7 @@ pub(crate) fn load_mtp(
         experts,
         dense_ffn: None,
         norm: dense(store, "mtp.norm.weight")?,
+        lightning: false,
+        shared_intermediate_size: 0,
     })
 }

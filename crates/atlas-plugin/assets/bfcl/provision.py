@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import copy
 import json
 import pathlib
 import sys
@@ -81,6 +82,61 @@ def _load_ground_truths(data_dir: pathlib.Path, subset: str) -> dict:
     return out
 
 
+def _preprocessed_functions(sample: dict, subset: str) -> list:
+    """The function doc BFCL hands to the MODEL. Not the one it hands the checker.
+
+    `bfcl_eval` rewrites the doc per language before the model sees it
+    (`add_language_specific_hint_to_function_doc`). For Java and JavaScript
+    that rewrite sets EVERY parameter's type to `string` and says so in the
+    description ("This is Java integer type parameter in string
+    representation."), because those ground truths are source literals rather
+    than JSON values. `ast_checker` enforces the same contract from the other
+    side: for those two languages it rejects a non-string argument.
+
+    Skipping the step does not make the prompt smaller, it makes it
+    unwinnable -- we told the model `pageNo: integer`, it correctly emitted
+    `3`, and the checker demanded `"3"`. On the pinned n=995 draw that alone
+    held simple_java to 41.94% and simple_javascript to 25.81% against
+    simple_python's 89.92%.
+
+    ONLY the model-visible `tools` get this. `func_description` stays RAW,
+    because the checker converts types itself through `JAVA_TYPE_CONVERSION`
+    /`JS_TYPE_CONVERSION`, and neither table has a `string` key -- handing it
+    a preprocessed doc raises KeyError inside `ast_checker`, which `score.py`
+    catches as a zero. That failure is SILENT and scores the whole subset
+    0.0, so the split is load-bearing, not stylistic.
+
+    Applied to every subset because that is what BFCL does: on Python ones the
+    rewrite only appends " Note that the provided function is in Python 3
+    syntax." to each description.
+
+    Delegates to `bfcl_eval` instead of restating the rule, so their
+    preprocessing cannot silently desync from ours, and raises rather than
+    falling back -- a benchmark that quietly provisions the wrong prompt
+    reports a wrong number, which is worse than not running.
+    """
+    from bfcl_eval.utils import add_language_specific_hint_to_function_doc
+
+    functions = sample.get("function", [])
+    entry = {"id": sample.get("id", ""), "function": copy.deepcopy(functions)}
+    add_language_specific_hint_to_function_doc([entry])
+    processed = entry["function"]
+
+    # Java/JS is the case that matters and the case that silently degrades, so
+    # assert the postcondition rather than trusting the call went through.
+    if subset.endswith(("java", "javascript")):
+        for fn in processed:
+            props = fn.get("parameters", {}).get("properties", {})
+            bad = {k: v.get("type") for k, v in props.items() if v.get("type") != "string"}
+            if bad:
+                raise AssertionError(
+                    f"{sample.get('id')}: language preprocessing left non-string "
+                    f"parameter types {bad}; the model would be asked for JSON "
+                    f"values the checker rejects"
+                )
+    return processed
+
+
 def _rows_for_subset(data_dir: pathlib.Path, subset: str):
     path = data_dir / f"BFCL_v4_{subset}.json"
     if not path.exists():
@@ -97,13 +153,14 @@ def _rows_for_subset(data_dir: pathlib.Path, subset: str):
             continue
         sample_id = sample.get("id", "")
         functions = sample.get("function", [])
+        tool_functions = _preprocessed_functions(sample, subset)
         ground_truth = truths.get(sample_id, sample.get("ground_truth", []))
         rows.append(
             {
                 "subset": subset,
                 "sample_id": sample_id,
                 "messages": _messages_from_question(question),
-                "tools": _tools_from_functions(functions),
+                "tools": _tools_from_functions(tool_functions),
                 "tool_choice": "auto",
                 "ground_truth": json.dumps(ground_truth) if ground_truth else "[]",
                 "func_description": json.dumps(functions),

@@ -207,6 +207,82 @@ pub fn residual_add(
         .launch(stream)
 }
 
+/// Add one normalized FC row to each sequence's anchor query row.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_batch_anchor_add(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    query_rows: DevicePtr,
+    projected: DevicePtr,
+    batch: u32,
+    gamma: u32,
+    hidden: u32,
+    stream: u64,
+) -> Result<()> {
+    let total = batch
+        .checked_mul(hidden)
+        .ok_or_else(|| anyhow::anyhow!("DFlash batch anchor add size overflow"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(query_rows)
+        .arg_ptr(projected)
+        .arg_u32(batch)
+        .arg_u32(gamma)
+        .arg_u32(hidden)
+        .launch(stream)
+}
+
+/// Add contiguous `[B,V]` Markov bias to one depth of `[B,gamma,V]`.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_batch_add_depth_bias(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits: DevicePtr,
+    bias: DevicePtr,
+    batch: u32,
+    gamma: u32,
+    vocab: u32,
+    depth: u32,
+    stream: u64,
+) -> Result<()> {
+    let total = batch
+        .checked_mul(vocab)
+        .ok_or_else(|| anyhow::anyhow!("DFlash batch bias size overflow"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(logits)
+        .arg_ptr(bias)
+        .arg_u32(batch)
+        .arg_u32(gamma)
+        .arg_u32(vocab)
+        .arg_u32(depth)
+        .launch(stream)
+}
+
+/// Scatter contiguous sampled IDs into one depth of `[B,gamma]`.
+pub fn dflash_batch_store_depth_tokens(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    tokens: DevicePtr,
+    sampled: DevicePtr,
+    batch: u32,
+    gamma: u32,
+    depth: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(batch, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(tokens)
+        .arg_ptr(sampled)
+        .arg_u32(batch)
+        .arg_u32(gamma)
+        .arg_u32(depth)
+        .launch(stream)
+}
+
 /// BF16 scaled accumulate: `output[i] += scale * src[i]`.
 ///
 /// Kernel: `bf16_scaled_add(output, src, scale, n)`
@@ -249,6 +325,22 @@ pub fn sigmoid_blend(
         .arg_ptr(output)
         .arg_ptr(src)
         .arg_f32(sigmoid_gate)
+        .arg_u32(num_elements)
+        .launch(stream)
+}
+
+/// In-place ReLU²: `x[i] = relu(x[i])^2`. Nemotron-H / Lightning MoE.
+pub fn relu_squared_inplace(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    data: DevicePtr,
+    num_elements: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(num_elements, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(data)
         .arg_u32(num_elements)
         .launch(stream)
 }

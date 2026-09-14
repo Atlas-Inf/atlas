@@ -37,10 +37,21 @@ const SCALE2: f32 = 0.0123_f32;
 
 /// `(label, N, K, num_heads, head_dim)` with `N == num_heads * head_dim * 2`,
 /// the Q+Gate widths the SSM path actually dispatches.
-const SHAPES: [(&str, usize, usize, u32, u32); 3] = [
+/// Odd N: exercises the padded `ceil(N / 4)` output group.
+const TAIL_N: usize = 2051;
+const _: () = assert!(!TAIL_N.is_multiple_of(4));
+
+const SHAPES: [(&str, usize, usize, u32, u32); 4] = [
     ("qg [4096 x 2688] h16 d128", 4096, 2688, 16, 128),
     ("qg [8192 x 4096] h32 d128", 8192, 4096, 32, 128),
     ("qg [2048 x 4096] h8  d128", 2048, 4096, 8, 128),
+    (
+        "tail odd-N identity [2051 x 4096]",
+        TAIL_N,
+        4096,
+        1,
+        TAIL_N as u32,
+    ),
 ];
 
 struct Lcg(u64);

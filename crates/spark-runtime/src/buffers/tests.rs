@@ -12,7 +12,13 @@ fn mixed_dense_moe_sizes_for_widest_ffn() {
 
     let sizes = BufferSizes::from_config(&cfg, 4, 4096, 16, 32);
     assert_eq!(sizes.expert_gate_out, 4 * 12_288 * 2);
-    assert_eq!(sizes.expert_up_out, 4 * 12_288 * 2);
+    // The Marlin cfg4 prefill path pads each expert's M dimension by 32 rows
+    // (tm=2). The gate output is the unpadded logical extent; the up output
+    // must include that extra extent because the activation kernel consumes
+    // the padded expert rows in place.
+    let marlin_padding = 32 * cfg.moe_intermediate_size * 2;
+    assert_eq!(sizes.expert_up_out, sizes.expert_gate_out + marlin_padding);
+    assert_eq!(sizes.expert_up_out, 163_840);
 }
 
 #[test]
@@ -82,10 +88,16 @@ fn test_buffer_arena_alloc() {
     // plus 2 added by the Holo-3.1/Ornith GB10 enablement (buffers.rs):
     //   - fp8_act + fp8_act_scale (persistent FP8 prefill-projection scratch,
     //     allocated unconditionally). 27 + 2 = 29.
-    // (wip-laguna-lora counts 30 here: its keep-packed GGUF grouped MoE adds
-    // a moe_grouped_q8 arena buffer (06c89a33) that this branch does not
-    // carry. Re-sync this count if that work is ever picked.)
-    assert_eq!(gpu.alloc_count(), 29);
+    // plus 2 added by the qwen4_exp enablement:
+    //   - hc_lowrank_scratch (mHC GEMM-formulation staging, .max(256) floor
+    //     so allocated unconditionally),
+    //   - qsa_select_scratch (QSA prefill/decode selection scratch, sized 0
+    //     -> .max floor for non-QSA configs but still allocated). 29 + 2 = 31.
+    // (wip-laguna-lora counts 30 above the pre-qwen4exp 29: its keep-packed
+    // GGUF grouped MoE adds a moe_grouped_q8 arena buffer (06c89a33) that
+    // this branch does not carry. Re-sync this count if that work is ever
+    // picked.)
+    assert_eq!(gpu.alloc_count(), 31);
 }
 
 #[test]

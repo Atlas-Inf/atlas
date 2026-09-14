@@ -395,6 +395,163 @@ fn nemotron_h_rejects_invalid_mamba_geometry() {
 }
 
 #[test]
+fn test_parse_nemotron_h_lightning_public_layers_block_type() {
+    // Nemotron 3.5 Lightning PUBLIC config shape: no hybrid_override_pattern,
+    // hybrid schedule in layers_block_type. Regression for the 2026-08-17
+    // incident where layer_types came back empty and the model silently
+    // degraded to all-attention + RoPE garbage (degenerate repeated tokens at 602 tok/s).
+    let json = r#"{
+        "model_type": "nemotron_h",
+        "architectures": ["NemotronHForCausalLM"],
+        "hidden_size": 2688,
+        "num_hidden_layers": 52,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 1856,
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 6,
+        "moe_intermediate_size": 1856,
+        "moe_shared_expert_intermediate_size": 3712,
+        "vocab_size": 131072,
+        "layers_block_type": [
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "attention",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe",
+                "mamba",
+                "moe"
+        ],
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "n_groups": 8,
+        "expand": 2,
+        "conv_kernel": 4,
+        "norm_eps": 1e-5,
+        "rope_theta": 10000
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.layer_types.len(), 52);
+    assert_eq!(cfg.layer_type(0), LayerType::LinearAttention);
+    assert_eq!(cfg.layer_type(1), LayerType::Moe);
+    assert_eq!(cfg.layer_type(5), LayerType::FullAttention);
+    // The schedule must be HYBRID, never the all-attention fallback:
+    // the incident boot showed 52 attention / 0 SSM layers.
+    assert_eq!(cfg.num_ssm_layers(), 23, "SSM layers must be 23, not 0");
+    assert_eq!(cfg.num_moe_layers(), 23);
+    assert_eq!(cfg.num_attention_layers(), 6);
+    assert_eq!(cfg.num_hidden_layers, 52);
+}
+
+#[test]
+fn test_parse_nemotron_h_contradictory_schedules_fails_closed() {
+    // A config shipping both hybrid_override_pattern and layers_block_type
+    // with DIFFERENT lengths is contradictory: dispatch must reject it
+    // rather than silently preferring one schedule.
+    let json = r#"{
+        "model_type": "nemotron_h",
+        "hidden_size": 2688,
+        "num_hidden_layers": 52,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 1856,
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 6,
+        "moe_intermediate_size": 1856,
+        "vocab_size": 131072,
+        "hybrid_override_pattern": "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME",
+        "layers_block_type": ["mamba", "moe", "attention"],
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "n_groups": 8,
+        "expand": 2,
+        "conv_kernel": 4,
+        "norm_eps": 1e-5
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(err.to_string().contains("contradictory schedules"), "{err}");
+}
+
+#[test]
+fn test_parse_nemotron_h_unknown_block_type_fails_closed() {
+    let json = r#"{
+        "model_type": "nemotron_h",
+        "hidden_size": 2688,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 1856,
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 6,
+        "moe_intermediate_size": 1856,
+        "vocab_size": 131072,
+        "layers_block_type": ["mamba", "moe", "attention", "quantum"],
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "n_groups": 8,
+        "expand": 2,
+        "conv_kernel": 4,
+        "norm_eps": 1e-5
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(
+        err.to_string().contains("unknown layers_block_type entry"),
+        "{err}"
+    );
+}
+
+#[test]
 fn test_parse_nemotron_h_puzzle_config() {
     // Minimal Puzzle-shaped schedule: 4 layers with heterogeneous MoE dims.
     // Full checkpoint has 88 layers; this covers dispatch + per-layer lookup.
@@ -955,4 +1112,169 @@ fn test_num_attention_layers_counts_sliding_attention() {
     assert_eq!(cfg.layer_type(1), LayerType::SlidingAttention);
     assert_eq!(cfg.layer_type(43), LayerType::SlidingAttention);
     assert_eq!(cfg.layer_type(44), LayerType::FullAttention);
+}
+
+// ── qwen4_exp / Qwen3.8-Flash-Next ──────────────────────────────────────────
+// The fixture is the PUBLISHED config.json, vendored whole rather than trimmed
+// (72 KB, most of it the FP8 ignore list). Every number below was read off the
+// real checkpoint, so this test fails if the parse arm ever stops describing
+// the model it is named after.
+
+/// Parsing is not serving -- there is no `qwen4_exp` weight loader. This pins
+/// the half that does exist, because a config that parses into the wrong shape
+/// is the failure mode that surfaces as bad output rather than an error.
+#[test]
+fn qwen4_exp_fixture_parses_the_hybrid_moe_layout() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_config.json"
+    ));
+    let cfg = parse_config(json).expect("published Qwen3.8-Flash-Next-FP8 config must parse");
+
+    assert_eq!(
+        cfg.model_type, "qwen4_exp",
+        "family name, not qwen4_exp_text"
+    );
+    assert_eq!(cfg.hidden_size, 2560);
+    assert_eq!(cfg.num_hidden_layers, 48);
+    assert_eq!(cfg.vocab_size, 248_320);
+    assert_eq!(cfg.max_position_embeddings, 262_144);
+    assert_eq!(cfg.rms_norm_eps, 1e-6);
+    assert!(cfg.nested_config, "config lives under text_config");
+
+    // Hybrid schedule: every 4th layer is full attention, 12 of 48.
+    assert_eq!(cfg.layer_types.len(), 48);
+    assert_eq!(cfg.layer_types[0], LayerType::LinearAttention);
+    assert_eq!(cfg.layer_types[3], LayerType::FullAttention);
+    assert_eq!(cfg.num_attention_layers(), 12);
+    assert_eq!(cfg.num_ssm_layers(), 36);
+
+    // Full attention.
+    assert_eq!(cfg.num_attention_heads, 24);
+    assert_eq!(cfg.num_key_value_heads, 2);
+    assert_eq!(cfg.head_dim, 256);
+    assert_eq!(cfg.gqa_ratio(), 12);
+    // Gated Q. The published q_proj is [12288, 2560]; 24 heads x head_dim 256
+    // is 6144, so the projection is 2x wide and carries an interleaved gate.
+    // Getting this wrong halves the Q the model actually attends with.
+    assert!(cfg.attn_gated, "q_proj is 2x q_dim: Q and gate interleaved");
+    assert_eq!(
+        cfg.num_attention_heads * cfg.head_dim * 2,
+        12288,
+        "must match the checkpoint's q_proj rows"
+    );
+    assert_eq!(
+        cfg.num_attention_heads * cfg.head_dim,
+        6144,
+        "must match the checkpoint's o_proj columns"
+    );
+
+    // Linear attention. `output_gate_type = "sigmoid"` is this pathway's gate
+    // (tensor `linear_attn.in_proj_z`), not an attention-output gate.
+    assert_eq!(cfg.linear_num_key_heads, 16);
+    assert_eq!(cfg.linear_key_head_dim, 128);
+    assert_eq!(cfg.linear_num_value_heads, 48);
+    assert_eq!(cfg.linear_value_head_dim, 128);
+    assert_eq!(cfg.linear_conv_kernel_dim, 4);
+    // The gate activation is SIGMOID here. Atlas's existing GDN hardcodes SiLU,
+    // which is correct for Qwen3.5/3.6 and wrong for this model.
+    assert_eq!(cfg.output_gate_type, "sigmoid");
+
+    // MoE.
+    assert_eq!(cfg.num_experts, 512);
+    assert_eq!(cfg.num_experts_per_tok, 10);
+    assert_eq!(cfg.moe_intermediate_size, 640);
+    assert_eq!(cfg.shared_expert_intermediate_size, 640);
+
+    // MTP: one hybrid block.
+    assert_eq!(cfg.mtp_num_hidden_layers, 1);
+
+    // MRoPE, interleaved, quarter-rotated -- the Qwen3.6 layout.
+    assert_eq!(cfg.rope_theta, 10_000_000.0);
+    assert_eq!(cfg.partial_rotary_factor, 0.25);
+    assert!(cfg.mrope_interleaved);
+    assert_eq!(cfg.mrope_section, [11, 11, 10]);
+
+    // Block-scaled FP8, from the TOP-level quantization_config.
+    let quant = cfg
+        .quantization_config
+        .as_ref()
+        .expect("FP8 checkpoint must retain quantization metadata");
+    assert_eq!(quant.quant_method, "fp8");
+
+    // Vision tower is present and must not be silently dropped.
+    assert!(cfg.vision.is_some(), "vision_config must be parsed");
+}
+
+/// `norm_topk_prob` is ABSENT from the published config.json and HF defaults it
+/// to true. serde would default it to false and silently skip the top-K
+/// renormalisation -- routing weights that no longer sum to 1, which degrades
+/// output without failing anything.
+#[test]
+fn qwen4_exp_forces_topk_renormalisation_the_config_does_not_state() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_config.json"
+    ));
+    let raw: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert!(
+        raw["text_config"].get("norm_topk_prob").is_none(),
+        "fixture is supposed to be the one that omits it"
+    );
+    assert!(parse_config(json).unwrap().norm_topk_prob);
+}
+
+/// The n-gram geometry has to survive the real parse, not just a hand-built
+/// struct: `seed` is absent from this config and must land on 1234, and
+/// `ple_layer_ids` must stay one-indexed.
+#[test]
+fn qwen4_exp_ngram_geometry_survives_the_real_parse() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_config.json"
+    ));
+    let raw: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert!(
+        raw["text_config"].get("seed").is_none(),
+        "fixture is supposed to be the one that omits seed"
+    );
+
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.ngram_seed, 1234, "absent seed must default, not zero");
+    assert_eq!(cfg.ple_layer_ids, vec![2]);
+    assert_eq!(cfg.ple_decoder_layer(0), Some(1), "one-indexed in config");
+    assert_eq!(cfg.ngram_size, 3);
+    assert_eq!(cfg.heads_per_ngram, 8);
+    assert_eq!(cfg.ngram_vocab_size_base, 20_000_000);
+    assert_eq!(cfg.make_ngram_vocab_size_divisible_by, 128);
+    assert_eq!(cfg.split_ngram_parts, 128);
+    assert_eq!(cfg.ple_embed_dim, 2560);
+
+    let ngram = cfg
+        .qwen4exp_ngram(0)
+        .expect("geometry must validate")
+        .expect("PLE tower is declared");
+    assert_eq!(ngram.num_heads(), 16);
+    assert_eq!(ngram.head_dim(), 160);
+    assert_eq!(ngram.padded_rows(cfg.ngram_vocab_size_base), 320_001_536);
+    // The multipliers are what the whole hash hangs on; if the seed defaulted
+    // wrong these would not be the checkpoint's.
+    assert_eq!(
+        ngram.layer_multipliers(),
+        vec![23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071]
+    );
+}
+
+/// The LongCat trio and the qwen4_exp fields are separate config surfaces. A
+/// checkpoint declaring one must not appear to declare the other -- that is
+/// what would route it to the wrong hash.
+#[test]
+fn qwen4_exp_does_not_declare_the_longcat_trio() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_config.json"
+    ));
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.ngram_dims().unwrap(), None, "no LongCat trio here");
+    assert!(cfg.qwen4exp_ngram(0).unwrap().is_some());
 }

@@ -8,7 +8,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::{BlockDiffusionDraftHead, DflashProposerState};
+use super::{BlockDiffusionDraftHead, DflashProposerState, DflashScratch};
 use crate::layer::ForwardContext;
 use crate::speculative::ProposerState;
 
@@ -16,20 +16,107 @@ impl BlockDiffusionDraftHead {
     pub(super) fn propose_drafts(
         &self,
         last_token: u32,
+        target_hidden: DevicePtr,
+        position: usize,
+        num_drafts: usize,
+        state: &mut dyn ProposerState,
+        expected_owner: Option<super::SequenceGeneration>,
+        ctx: &ForwardContext,
+        stream: u64,
+        draft_embed_target: Option<DevicePtr>,
+        grammar_bitmask: Option<&[i32]>,
+        target_hidden_stack: Option<DevicePtr>,
+    ) -> Result<Vec<u32>> {
+        let default_stream = ctx.gpu.default_stream();
+        let (_, scratch, markov_embed, markov_bias) = self.lane(0, default_stream);
+        self.propose_drafts_on_lane(
+            scratch,
+            markov_embed,
+            markov_bias,
+            0,
+            last_token,
+            target_hidden,
+            position,
+            num_drafts,
+            state,
+            expected_owner,
+            ctx,
+            stream,
+            draft_embed_target,
+            grammar_bitmask,
+            target_hidden_stack,
+            false,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_drafts_state(
+        &self,
+        last_token: u32,
+        target_hidden: DevicePtr,
+        position: usize,
+        num_drafts: usize,
+        state: &mut dyn ProposerState,
+        expected_owner: super::SequenceGeneration,
+        ctx: &ForwardContext,
+        stream: u64,
+        target_hidden_stack: DevicePtr,
+    ) -> Result<()> {
+        let default_stream = ctx.gpu.default_stream();
+        let (_, scratch, markov_embed, markov_bias) = self.lane(0, default_stream);
+        self.propose_drafts_on_lane(
+            scratch,
+            markov_embed,
+            markov_bias,
+            0,
+            last_token,
+            target_hidden,
+            position,
+            num_drafts,
+            state,
+            Some(expected_owner),
+            ctx,
+            stream,
+            None,
+            None,
+            Some(target_hidden_stack),
+            false,
+            true,
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn propose_drafts_on_lane(
+        &self,
+        scratch: &DflashScratch,
+        markov_embed: DevicePtr,
+        markov_bias: DevicePtr,
+        lane_id: usize,
+        last_token: u32,
         _target_hidden: DevicePtr,
         position: usize,
         _num_drafts: usize,
         state: &mut dyn ProposerState,
+        expected_owner: Option<super::SequenceGeneration>,
         ctx: &ForwardContext,
         _stream: u64,
         _draft_embed_target: Option<DevicePtr>,
         _grammar_bitmask: Option<&[i32]>,
         target_hidden_stack: Option<DevicePtr>,
+        defer_readback: bool,
+        prepare_only: bool,
     ) -> Result<Vec<u32>> {
         let dstate = state
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        let owner = self.validate_dflash_owner(dstate, expected_owner)?;
+        let lifecycle = dstate
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DFlash proposer state has no generation owner"))?;
+        lifecycle.advance(owner, position, self.gamma, lifecycle.row_stride_bytes())?;
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator at propose entry ──
         // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
@@ -48,10 +135,7 @@ impl BlockDiffusionDraftHead {
             // Per-model latch (see `ModelStats::dumped`) rather than a static: an
             // operator who sets the flag and then swaps models must still get the
             // dump, instead of it being swallowed by the previous model's shot.
-            if std::env::var("ATLAS_DFLASH_CTX_PARITY_DUMP")
-                .ok()
-                .as_deref()
-                == Some("1")
+            if self.startup.diagnostics.ctx_parity_dump
                 && dstate.ctx_len > 0
                 && ctx.stats.dumped.keyed("dflash_ctx_parity")
             {
@@ -246,10 +330,7 @@ impl BlockDiffusionDraftHead {
         // here. K=gamma/K=4 never set it -> their decode-append is unaffected.
         let eagle_skip = dstate.skip_next_decode_append;
         dstate.skip_next_decode_append = false;
-        let skip_decode_append = std::env::var("ATLAS_DFLASH_DEBUG_NO_DECODE_APPEND")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let skip_decode_append = self.startup.diagnostics.no_decode_append;
         if !skip_decode_append
             && !eagle_skip
             && let Some(latest_ctx) = target_hidden_stack
@@ -274,11 +355,11 @@ impl BlockDiffusionDraftHead {
         }
 
         // ── Phase 2 Option B: lazy block_table allocation ─────────────
-        // When ATLAS_DFLASH_OPTION_B=1 and the proposer hasn't yet
-        // allocated paged blocks, do it now. We allocate enough blocks
+        // When the startup policy enabled Option B and the proposer hasn't
+        // yet allocated paged blocks, do it now. We allocate enough blocks
         // to cover the full ctx_hidden_acc plus a safety margin for γ.
         // Block_size matches from_weights.rs:68 (=16).
-        let option_b_enabled = std::env::var("ATLAS_DFLASH_OPTION_B").ok().as_deref() == Some("1");
+        let option_b_enabled = self.startup.option_b_enabled;
         let option_b_arg: Option<(DevicePtr, u32)> = if option_b_enabled {
             // Lazy block table init. ctx slots come from precompute over the
             // accumulated target hiddens; γ slots come from the layer body.
@@ -327,10 +408,7 @@ impl BlockDiffusionDraftHead {
             //
             // Escape hatch: ATLAS_DFLASH_DEBUG_FULL_PRECOMPUTE=1 forces a
             // full recompute (committed=0) for A/B accept-rate parity.
-            let force_full = std::env::var("ATLAS_DFLASH_DEBUG_FULL_PRECOMPUTE")
-                .ok()
-                .as_deref()
-                == Some("1");
+            let force_full = self.startup.diagnostics.full_precompute;
             // Clamp watermark defensively: a rewind should have reset it,
             // but never start past ctx_len.
             let committed = if force_full {
@@ -358,7 +436,7 @@ impl BlockDiffusionDraftHead {
                      needs precompute — scratch has no capacity",
                     new_count,
                 );
-                let slot_mapping = &self.scratch.slot_mapping_dev;
+                let slot_mapping = &scratch.slot_mapping_dev;
                 let mut chunk_start = committed;
                 while chunk_start < dstate.ctx_len {
                     let chunk_count = (dstate.ctx_len - chunk_start).min(self.ctx_window);
@@ -387,6 +465,7 @@ impl BlockDiffusionDraftHead {
                         ctx,
                         _stream,
                         true, // commit: always write to paged cache on production path
+                        scratch,
                     )?;
                     chunk_start += chunk_count;
                 }
@@ -402,7 +481,7 @@ impl BlockDiffusionDraftHead {
             // The think→spec seam (re-probe after a serial stretch) is
             // where a violation would surface. Host-side Vec scan,
             // probe-gated, zero cost when off.
-            if std::env::var("ATLAS_DFLASH_CTXLEN_PROBE").ok().as_deref() == Some("1")
+            if self.startup.diagnostics.ctxlen_probe
                 && let Some(i) = dstate.ctx_positions.windows(2).position(|w| w[1] <= w[0])
             {
                 tracing::warn!(
@@ -423,9 +502,7 @@ impl BlockDiffusionDraftHead {
             // (the bug — likely thinking-mode tokens not appending to ctx).
             // Gated ATLAS_DFLASH_CTXLEN_PROBE=1, rate-limited to ~1/16 steps
             // to avoid log flood.
-            if std::env::var("ATLAS_DFLASH_CTXLEN_PROBE").ok().as_deref() == Some("1")
-                && position.is_multiple_of(16)
-            {
+            if self.startup.diagnostics.ctxlen_probe && position.is_multiple_of(16) {
                 tracing::info!(
                     "DFLASH CTXLEN_PROBE: position={} ctx_len={} q_offset(=ctx_len)={} GAP={} (position - ctx_len; healthy≈prompt_len, BUG if grows unbounded)",
                     position,
@@ -434,14 +511,12 @@ impl BlockDiffusionDraftHead {
                     position.saturating_sub(dstate.ctx_len),
                 );
             }
-            // Ablation: ATLAS_DFLASH_OPTION_B_NO_CTX=1 forces ctx_count=0
-            // in the layer body so paged attention only sees the γ K/V
-            // we write in-layer. If accept rate is bad even here, the
-            // bug is in the cache write/read path, not in precompute.
-            let ablate_no_ctx = std::env::var("ATLAS_DFLASH_OPTION_B_NO_CTX")
-                .ok()
-                .as_deref()
-                == Some("1");
+            // Ablation: startup no-ctx forces ctx_count=0 in the layer
+            // body so paged attention only sees the γ K/V we write
+            // in-layer. If accept rate is bad even here, the bug is in
+            // the cache write/read path, not in precompute. Product heads
+            // always carry `false` here (the policy rejects the override).
+            let ablate_no_ctx = self.startup.option_b_no_ctx;
             let effective_ctx_count = if ablate_no_ctx {
                 0
             } else {
@@ -451,6 +526,14 @@ impl BlockDiffusionDraftHead {
         } else {
             None
         };
+
+        if prepare_only {
+            anyhow::ensure!(
+                option_b_arg.is_some(),
+                "DFlash native batch preparation requires Option B"
+            );
+            return Ok(Vec::new());
+        }
 
         let drafts = self
             .forward_block(
@@ -466,55 +549,49 @@ impl BlockDiffusionDraftHead {
                     None
                 },
                 option_b_arg,
+                scratch,
+                markov_embed,
+                markov_bias,
+                owner,
+                lane_id,
+                defer_readback,
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
                 e
             })?;
-        // Default cap = γ. The nologik spec_ssm merge provides the WY-chunkwise
-        // GDN kernels (gdn_decode_wy17 for K=17, wy2/wy3/wy4 for smaller K)
-        // that snapshot per-position h/conv intermediates into the SSM pool.
-        // commit_verify_state_async (verify_dflash_step.rs) reads those
-        // intermediates to roll back to the accepted prefix on partial reject.
-        // SSM pool is pre-allocated for num_intermediates=17 (impl_a1.rs:129)
-        // and the WY17 strided layout (inter_stride_floats = h_bytes/4) maps
-        // 1:1 to ssm_pool.h_intermediate(layer, slot, i). Override with
-        // ATLAS_DFLASH_DRAFT_CAP=N (N=1 to force K=2 path for ablation).
-        let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(self.gamma);
+        // Verify depth is scheduler K (`_num_drafts` = `--dflash-gamma - 1`).
+        // forward_block returns [mask_1 .. mask_{γ-1}, bonus_0]; the bonus
+        // row is NOT a draft (vLLM sample_off=1). Capping at γ sent that
+        // extra token into M=γ+1 target verify (~11 ms) for no accept gain.
+        // The startup draft-cap override still applies for generic
+        // ablation; the Lightning product policy rejects any override.
+        let default_k = _num_drafts.min(self.gamma.saturating_sub(1)).max(1);
+        let cap: usize = self.startup.draft_cap_override.unwrap_or(default_k);
 
         // ATLAS_DFLASH_VERIFY_TRACE=1: log all γ drafts BEFORE the cap so we
         // can see whether the drafter echoes only at position 0 or across
         // every noise row. Pairs with K2 TRACE in the scheduler.
-        if std::env::var("ATLAS_DFLASH_VERIFY_TRACE").ok().as_deref() == Some("1") {
+        if self.startup.diagnostics.verify_trace {
             tracing::info!(
-                "DFLASH TRACE drafts: token_in={} position={} γ={} drafts_pre_cap={:?}",
+                "DFLASH TRACE drafts: token_in={} position={} γ={} lane_id={} scratch={:x} mp={:x} me={:x} stream={:x} ctx_len={} drafts={:?}",
                 last_token,
                 position,
                 drafts.len(),
+                dstate.lane_id,
+                scratch as *const DflashScratch as usize,
+                scratch.markov_prev_dev.0,
+                markov_embed.0,
+                _stream,
+                dstate.ctx_len,
                 drafts,
             );
         }
 
-        // Block-diffusion drafter convention: noise_row[0]'s input is
-        // `last_token`, and the drafter denoises it trivially back to
-        // itself — that's the "bonus" position. The first USEFUL draft
-        // lives at noise_row[1] (input = mask, predicts position+1).
-        // vLLM ignores row 0 via `token_indices_to_sample`. Atlas was
-        // reading row 0 as draft[0], giving 0% K=2 accept on z-lab
-        // DFlash drafters; dropping it lifts accept to ~80%.
-        //
-        // Gated on `mask_token_id` presence in the drafter config —
-        // that's the diffusion-drafter signal. Autoregressive drafters
-        // (e.g. EAGLE) have no mask token and should keep row 0.
-        let drafts = if self.mask_token_id != 0 && drafts.len() > 1 {
-            drafts[1..].to_vec()
-        } else {
-            drafts
-        };
-
+        // forward_block already returns [mask_row_1 .. mask_row_γ-1, bonus_row_0]
+        // (vLLM sample_off=1). Do not drop drafts[0] — that leftover Qwen-DFlash
+        // slice discarded the first correct mask prediction and forced 0% accept
+        // on Lightning (Hello → '!' was drafted then dropped).
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
         Ok(drafts)

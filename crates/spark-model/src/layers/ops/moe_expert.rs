@@ -36,10 +36,11 @@ pub fn moe_expert_gemv(
     k: u32,
     top_k: u32,
     input_stride: u32,
+    num_tokens: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 4), top_k, 1])
+        .grid([div_ceil(n, 4), top_k, num_tokens.max(1)])
         .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(packed_ptrs)
@@ -51,6 +52,79 @@ pub fn moe_expert_gemv(
         .arg_u32(k)
         .arg_u32(top_k)
         .arg_u32(input_stride)
+        .launch(stream)
+}
+
+/// Coarse-N expert GEMV. A staged in smem. Grid (ceil(N/32), top_k, tokens).
+pub fn moe_expert_gemv_wide(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    input_stride: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), top_k, num_tokens.max(1)])
+        .block([256, 1, 1])
+        .shared_mem(64 + k * 2)
+        .arg_ptr(input)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(input_stride)
+        .launch(stream)
+}
+
+/// Grouped coarse-N expert GEMV. Grid (ceil(N/32), num_experts).
+/// One expert N-tile applies to every token that routed here.
+pub fn moe_expert_gemv_wide_grouped(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    input_stride: u32,
+    num_tokens: u32,
+    num_experts: u32,
+    relu2_input: bool,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), num_experts.max(1), 1])
+        .block([256, 1, 1])
+        .shared_mem(64 + 4 * k * 2)
+        .arg_ptr(input)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(input_stride)
+        .arg_u32(num_tokens)
+        .arg_u32(relu2_input as u32)
         .launch(stream)
 }
 

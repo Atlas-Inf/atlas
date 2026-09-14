@@ -32,6 +32,7 @@ mod graph_borrow;
 mod lm_head_batched;
 mod lm_head_dp4a;
 mod meta;
+mod meta_argmax;
 mod prefill_a;
 mod prefill_b;
 mod prefill_c;
@@ -44,11 +45,19 @@ mod verify_b;
 mod verify_c;
 mod verify_c2;
 mod verify_d;
+mod verify_d_serial;
 mod verify_e;
 pub(in crate::model) mod verify_e2;
 mod verify_fused;
+mod verify_layer_trace;
 
 impl Model for TransformerModel {
+    fn lightning_dspark_product_policy(
+        &self,
+    ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
+        self.lightning_dspark_identity.policy()
+    }
+
     fn teardown(&mut self) -> Result<()> {
         self.release_pools()
     }
@@ -353,6 +362,18 @@ impl Model for TransformerModel {
     ) -> Result<crate::engine::GenerateResult> {
         self.generate_speculative_dispatch(prompt_tokens, params, num_drafts)
     }
+    fn verify_context_limit(&self) -> Option<usize> {
+        self.layers
+            .iter()
+            .filter_map(|l| l.verify_context_limit())
+            .min()
+    }
+    fn verify_max_drafts(&self) -> Option<usize> {
+        self.layers
+            .iter()
+            .filter_map(|l| l.verify_max_drafts())
+            .min()
+    }
     fn has_proposer(&self) -> bool {
         self.has_proposer_dispatch()
     }
@@ -437,6 +458,12 @@ impl Model for TransformerModel {
             None => 1,
         }
     }
+    fn mtp_propose_batch_min(&self) -> usize {
+        match &self.proposer {
+            Some(p) => p.propose_batch_min(),
+            None => 2,
+        }
+    }
     fn decode_verify_graphed_kgamma(
         &self,
         tokens: &[u32],
@@ -459,6 +486,9 @@ impl Model for TransformerModel {
         self.save_hidden_for_catchup_dispatch(token_idx, pos)
     }
 
+    fn select_mtp_stream_row(&self, row: usize) -> Result<()> {
+        self.select_mtp_stream_row_dispatch(row)
+    }
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
     }
@@ -655,6 +685,18 @@ impl Model for TransformerModel {
         Ok(())
     }
 
+    fn preserve_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+        TransformerModel::preserve_dflash_save_front(self, k, stream)
+    }
+
+    fn pack_dflash_save_seq(&self, seq_i: usize, k: usize, stream: u64) -> Result<()> {
+        TransformerModel::pack_dflash_save_seq(self, seq_i, k, stream)
+    }
+
+    fn restore_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+        TransformerModel::restore_dflash_save_front(self, k, stream)
+    }
+
     fn dflash_serial_ctx_append(&self, seq: &mut SequenceState) -> Result<()> {
         // Ctx-holes fix: append the serial-decoded token's captured hidden.
         // The decode layer loop (decode_a.rs try_dflash_capture) already
@@ -825,6 +867,10 @@ impl Model for TransformerModel {
     fn is_ep(&self) -> bool {
         self.is_ep_dispatch()
     }
+    fn hc_mult(&self) -> usize {
+        self.config.hc_mult
+    }
+
     fn is_mla(&self) -> bool {
         self.is_mla_dispatch()
     }
@@ -869,5 +915,50 @@ impl Model for TransformerModel {
     }
     fn synchronize(&self, stream: u64) -> Result<()> {
         self.synchronize_dispatch(stream)
+    }
+}
+
+impl TransformerModel {
+    /// Collect chunk-boundary aux layer state (PLE, QSA) for a Marconi
+    /// snapshot. Returns the blobs to attach; empty when no layer carries
+    /// aux state.
+    pub(in crate::model) fn collect_aux_states(
+        &self,
+        seq: &SequenceState,
+        stream: u64,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for (i, l) in self.layers.iter().enumerate() {
+            if let Some(blob) =
+                l.snapshot_aux(seq.layer_states[i].as_ref(), self.gpu.as_ref(), stream)?
+            {
+                out.push((i as u32, blob));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether restoring a snapshot WITHOUT aux blobs would be unsound for
+    /// this model (some layer carries per-sequence aux state).
+    pub(in crate::model) fn requires_aux_state(&self) -> bool {
+        self.layers.iter().any(|l| l.has_aux_state())
+    }
+
+    /// Apply a snapshot's aux blobs to the owning layers.
+    pub(in crate::model) fn apply_aux_states(
+        &self,
+        seq: &mut SequenceState,
+        blobs: &[(u32, Vec<u8>)],
+        stream: u64,
+    ) -> Result<()> {
+        for (i, blob) in blobs {
+            self.layers[*i as usize].restore_aux(
+                seq.layer_states[*i as usize].as_mut(),
+                blob,
+                self.gpu.as_ref(),
+                stream,
+            )?;
+        }
+        Ok(())
     }
 }

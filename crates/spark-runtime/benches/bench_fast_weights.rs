@@ -44,8 +44,16 @@ fn drop_page_cache(dir: &Path) {
             continue;
         };
         use std::os::unix::io::AsRawFd;
+        // macOS has no posix_fadvise; F_NOCACHE changes FUTURE reads rather
+        // than evicting what is cached, so the drop is best-effort there. The
+        // bench only reports meaningful cold numbers on Linux either way.
+        #[cfg(not(target_os = "macos"))]
         unsafe {
             libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1);
         }
     }
     // A final sync for good measure (flushes dirty pages, not relevant for

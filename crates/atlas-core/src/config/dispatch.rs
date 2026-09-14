@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use super::{
     LayerType, ModelConfig, default_conv_kernel, default_partial_rotary, default_rms_eps,
     default_rope_theta, finalize_config, parse_deepseek_v4, parse_gemma4_params, parse_laguna,
-    parse_minimax_m2, parse_mistral_params, parse_quantization_config, parse_step3p7,
-    parse_vision_config, validate_config,
+    parse_longcat_ngram, parse_minimax_m2, parse_mistral_params, parse_quantization_config,
+    parse_qwen4_exp, parse_step3p7, parse_vision_config, validate_config,
 };
 
 fn required_u64(raw: &serde_json::Value, key: &str, model_type: &str) -> Result<u64> {
@@ -43,9 +43,30 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
     let raw: serde_json::Value =
         serde_json::from_str(json).context("Invalid JSON in config.json")?;
 
+    // A remote-code checkpoint may declare ONLY `architectures` + `auto_map`
+    // and no `model_type` at all — LongCat-Flash-Lite ships exactly that
+    // (`architectures: ["LongcatFlashNgramForCausalLM"]`). Without this
+    // fallback such a config silently falls through to the generic parse and
+    // loses its family, so map the known architecture names onto their
+    // model_type. Only consulted when `model_type` is absent/empty, so no
+    // existing checkpoint changes behaviour.
     let top_model_type = raw
         .get("model_type")
         .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            raw.get("architectures")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(serde_json::Value::as_str)
+                .and_then(|arch| match arch {
+                    "LongcatFlashNgramForCausalLM" => Some("longcat_flash_ngram"),
+                    "LongcatFlashForCausalLM" => Some("longcat_flash"),
+                    "Qwen4ExpForConditionalGeneration"
+                    | "Qwen3_8FlashNextForConditionalGeneration" => Some("qwen4_exp"),
+                    _ => None,
+                })
+        })
         .unwrap_or("");
 
     match top_model_type {
@@ -190,6 +211,20 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             // Architecture flags
             config.attn_gated = false;
             config.weight_prefix = "backbone".to_string();
+            // A config shipping BOTH fields with DIFFERENT schedule lengths
+            // is contradictory: fail closed here rather than letting one
+            // silently win the precedence and the other be ignored.
+            if !config.hybrid_override_pattern.is_empty()
+                && let Some(block_types) = raw.get("layers_block_type").and_then(|v| v.as_array())
+                && block_types.len() != config.hybrid_override_pattern.chars().count()
+            {
+                anyhow::bail!(
+                    "nemotron_h config has contradictory schedules: \
+                     hybrid_override_pattern has {} layers but layers_block_type has {}",
+                    config.hybrid_override_pattern.chars().count(),
+                    block_types.len()
+                );
+            }
             // Parse hybrid_override_pattern → layer_types (Nano / Super)
             if !config.hybrid_override_pattern.is_empty() && config.layer_types.is_empty() {
                 config.layer_types = config
@@ -203,6 +238,31 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
                     })
                     .collect();
             }
+            // Nemotron-H variants without the pattern (e.g. Nemotron 3.5
+            // Lightning's public config) ship the hybrid schedule as
+            // `layers_block_type`. Without this, layer_types stays empty and
+            // the model silently degrades to all-attention with RoPE —
+            // coherent-looking garbage (observed 2026-08-17: 52 attention /
+            // 0 SSM layers, degenerate repeated-token output at 602 tok/s).
+            //
+            if config.layer_types.is_empty()
+                && let Some(block_types) = raw.get("layers_block_type").and_then(|v| v.as_array())
+            {
+                config.layer_types = block_types
+                    .iter()
+                    .map(|v| {
+                        let s = v.as_str().unwrap_or("");
+                        Ok(match s {
+                            "mamba" => LayerType::LinearAttention,
+                            "moe" => LayerType::Moe,
+                            "attention" => LayerType::FullAttention,
+                            other => {
+                                anyhow::bail!("unknown layers_block_type entry: '{other}'")
+                            }
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
             // Puzzle: layers_block_type + block_configs → layer_types + per-layer MoE dims
             if top_model_type == "nemotron_h_puzzle" {
                 apply_nemotron_puzzle_config(&mut config, &raw_mut)?;
@@ -212,6 +272,17 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
         }
         "gemma4" => parse_gemma4_params(&raw),
         "laguna" => parse_laguna(&raw),
+        "longcat_flash_ngram" | "longcat_flash" => parse_longcat_ngram(&raw),
+        // Nested text_config like qwen3_5_moe, but hyper-connections, the QSA
+        // indexer and PLE n-gram injection put it outside that arm.
+        //
+        // TWO NAMES, ONE ARCHITECTURE. Qwen3.8-Flash-Next shipped under
+        // `qwen3_8_flash_next` and was later renamed `qwen4_exp`; quantizers
+        // pinned to different transformers revisions emit different names
+        // (RadixArk -> qwen4_exp, Inferact -> qwen3_8_flash_next). Their
+        // `text_config`s are otherwise IDENTICAL field-for-field, so the
+        // alias is the whole difference at the config layer.
+        "qwen4_exp" | "qwen3_8_flash_next" => parse_qwen4_exp(&raw),
         "m2m_100" | "nllb" => {
             let mut config = ModelConfig::qwen3_next_80b_nvfp4();
             config.model_type = "m2m_100".to_string();

@@ -49,6 +49,10 @@ use crate::scheduler::logit_processors::LogitsContext;
 use crate::scheduler::mtp_timing::Phase;
 use spark_model::traits::Model;
 
+pub(super) fn masked_verify_required(configured: bool, lightning_product: bool) -> bool {
+    configured || lightning_product
+}
+
 /// Returns `Some(picks)` when the fast path proves masked-greedy ==
 /// raw-argmax for every position (picks are the raw `argmax_ids`);
 /// `None` when any gate fails and the caller must run the slow path.
@@ -62,6 +66,7 @@ pub(super) fn try_chat_fast_path(
     a: &ActiveSeq,
     ctx: &LogitsContext,
     row_base: usize,
+    masked_verify: bool,
 ) -> Option<Vec<u32>> {
     // DFlash masked-verify mode ONLY. The fast path exists to make
     // ATLAS_DFLASH_MASKED_VERIFY affordable; it must never run for MTP:
@@ -71,7 +76,7 @@ pub(super) fn try_chat_fast_path(
     // vs an unpatched binary (think block identical, answer flips at
     // low-margin tokens). MTP keeps the slow path unconditionally so
     // its behavior is byte-invariant by construction.
-    if !ctx.sampling.dflash_masked_verify {
+    if !masked_verify {
         return None;
     }
     let fast_masked_enabled = ctx.sampling.fast_masked;
@@ -165,4 +170,17 @@ pub(super) fn try_chat_fast_path(
     // Fall through — grammar fast path can't fire (grammar_state is
     // None), so the slow path handles the call.
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::masked_verify_required;
+
+    #[test]
+    fn lightning_forces_masked_verify_without_environment_toggle() {
+        assert!(masked_verify_required(false, true));
+        assert!(masked_verify_required(true, true));
+        assert!(masked_verify_required(true, false));
+        assert!(!masked_verify_required(false, false));
+    }
 }

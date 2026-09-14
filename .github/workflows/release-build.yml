@@ -29,6 +29,15 @@ on:
         required: false
         type: boolean
         default: false
+      include_experimental:
+        description: >-
+          PR mode only. false selects ONLY the entries that can fail the run
+          (experimental=false); true selects every pr_validate entry, as a
+          release does. Ignored when pr_mode is false — a release always
+          builds everything.
+        required: false
+        type: boolean
+        default: true
       retention_days:
         description: "Artifact retention"
         required: false
@@ -114,14 +123,37 @@ jobs:
           # Entries with pr_validate=false are physically impossible here (the
           # SCALE toolchain is not redistributable) — they are reported as NOT
           # VALIDATED rather than passed vacuously.
+          #
+          # `include_experimental` splits the PR set further, and the split is
+          # about SIGNAL, not cost. The `build` job below sets its
+          # `continue-on-error` from the entry's `experimental` flag, so the seven
+          # experimental entries are STRUCTURALLY INCAPABLE of failing a run —
+          # including the 34-minute Windows CUDA build, the longest job in CI.
+          # On a PR they are latency with no verdict attached. The two entries
+          # that can actually turn a PR red are exactly the two native Linux
+          # builds, and one of them (linux-aarch64) is the primary target: GB10
+          # / DGX Spark is arm64 Grace. Those two run on every PR. The other
+          # seven are opt-in via distros.yml.
           if [ "${{ inputs.pr_mode }}" = true ]; then
-            sel=$(jq -c '{include: [.[] | select(.pr_validate)]}' .github/release-matrix.json)
+            if [ "${{ inputs.include_experimental }}" = true ]; then
+              echo "PR mode: ALL pr_validate entries (experimental included)."
+              sel=$(jq -c '{include: [.[] | select(.pr_validate)]}' \
+                      .github/release-matrix.json)
+            else
+              echo "PR mode: gating entries only (experimental excluded)."
+              sel=$(jq -c '{include: [.[] | select(.pr_validate and (.experimental | not))]}' \
+                      .github/release-matrix.json)
+              jq -r '.[] | select(.pr_validate and .experimental)
+                     | "::notice::\(.id) not built — experimental, so it cannot fail this run. Label the PR `build:distros` to build it."' \
+                .github/release-matrix.json
+            fi
             jq -r '.[] | select(.pr_validate | not)
                    | "::warning::\(.id) NOT VALIDATED in PR mode — \(.note // "toolchain \(.toolchain) unavailable on hosted runners")"' \
               .github/release-matrix.json
           else
             sel=$(jq -c '{include: .}' .github/release-matrix.json)
           fi
+          echo "selected: $(jq -r '.include | map(.id) | join(", ")' <<<"$sel")"
           echo "matrix=$sel" >> "$GITHUB_OUTPUT"
 
       - name: Summary

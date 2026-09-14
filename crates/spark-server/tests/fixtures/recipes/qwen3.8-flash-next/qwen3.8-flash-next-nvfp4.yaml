@@ -1,0 +1,264 @@
+recipe_version: "2"
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+runtime: atlas
+container: azeezish/atlas-gb10:latest
+max_nodes: 1
+
+metadata:
+  description: |
+    Qwen3.8-Flash-Next (`model_type: qwen4_exp`) — a ~180B hybrid multimodal
+    MoE on ONE GB10. 48 layers interleaving gated-delta-net and full
+    attention 3:1, 512 experts top-10 plus a shared expert, a 4-stream
+    low-rank hyper-connection residual, a QSA sparse-attention indexer on the
+    12 full-attention layers, PLE n-gram injection at model layer 1, and a
+    ViT tower.
+
+    CHECKPOINT CHOICE IS NOT A PREFERENCE. The FP8 release does not fit: its
+    routed experts alone are 123.3 GB resident against a GB10's ~119.6 GiB.
+    NVFP4 is the only workable release, and its 47.7 GiB n-gram table is
+    never made resident — it is read by ROW off NVMe. Measured on a GB10:
+
+      pre-flight     78.19 GB on-disk, 1.3x = 101.65 GB projected peak
+      actual peak    ~90.4 GB, ~27.8 GB free, 8 GiB guard held
+      load           206/206 shards, 296,347 tensors, ~139 s
+
+    Without that exclusion the same run refuses at 163.64 GB. Verified
+    independently on two GB10s.
+
+    Throughput, measured (Avarok #754): decode 16.5 tok/s, prefill 747 tok/s
+    at a 2191-token prompt, C=2 aggregate 20.5 tok/s.
+
+    KV IS BF16, DELIBERATELY. This checkpoint ships no `k_scale`/`v_scale`,
+    so bare fp8 KV clips to E4M3 [-448, 448] and Atlas warns; calibration is
+    the alternative and has not been validated for this model. Only 12 of 48
+    layers hold KV (2 KV heads), so bf16 goes further here than the layer
+    count suggests — at 8K context it is a small fraction of the ~27 GB spare.
+
+    PLE SCRATCH IS SIZED FROM THE SERVE CONFIG, NOT AN ENV VAR. The engine
+    derives its floor from `--max-num-batched-tokens` (floor 2048), so a
+    2191-token prompt no longer fails layer 1 by default. `ATLAS_PLE_MAX_TOKENS`
+    is now only an OVERRIDE to trade PLE headroom for KV memory; setting it
+    below the derived floor logs a warning and risks refused prefills.
+    `serve_qwen4exp_tui.sh` still sets it explicitly above 8K.
+
+    SPECULATIVE IS OFF BY MEASUREMENT, NOT BY REFUSAL — AND ONE DRAFT WINS.
+    It used to be a refusal: the MTP block is not the `MtpWeights` shape any
+    other family uses — its own 512-expert stack, its own indexer, two input
+    norms of different widths — so the family `load_mtp_weights` still
+    declines it. It now loads through its own path instead, and
+    `--speculative` works. Measured 2026-08-28 on one GB10, 256-token
+    completions, against a same-binary non-speculative control:
+
+      arm                            C=1 agg tok/s   C=2 agg tok/s
+      base (no speculation)                  16.14           24.74
+      --num-drafts 1, gate ARMED             19.11 (+18.4%)  23.19  (-6.3%)
+      --num-drafts 1, gate forced            19.06 (+18.1%)  19.58 (-20.9%)
+      --num-drafts 2, gate forced            15.76  (-2.4%)  16.61 (-32.9%)
+
+    So the depth matters more than the feature: ONE draft is a real 18% win
+    at C=1, and the default K ladder's 3 drafts is a 2% loss at the same
+    width. Each verify row routes to its own top-10 of 512 experts, so
+    expert weight traffic scales with rows (~0.4 of a decode step per extra
+    row) while acceptance only buys ~0.6 tokens; and at C>1 batched decode
+    is already amortizing the weight reads speculation exists to amortize,
+    which is why the sign flips with width.
+
+    This recipe still ships it OFF because the recipe has one setting for
+    every concurrency and the win is C=1-only. To take the C=1 win, serve
+    with `--speculative --num-drafts 1` and leave the throughput gate armed:
+    it measures both modes per serve and parks in Serial once width rises.
+
+    Sampling and the thinking scaffold come from
+    `kernels/gb10/qwen3.8-flash-next/MODEL.toml`, not from here: the vendor
+    card's presets (thinking 1.0/0.95/20, instruct 0.7/0.80/20 + presence
+    1.5, min_p and top_n_sigma pinned 0) plus three behaviour knobs that were
+    each a measured defect — `use_sampling_presets_for_core`,
+    `min_reasoning_floor_tokens = 0` and `honor_eos_inside_thinking`. The
+    `reasoning_effort: low` default below renders the full reasoning
+    preamble and `<think>` scaffold on a cheap budget, which is what this
+    model's chat template gates everything on.
+
+    DO NOT SERVE TOOL WORKLOADS WITH `--disable-thinking`. It is not a
+    latency knob here, it is an accuracy cliff. Measured on BFCL, one binary,
+    same n=334 draw, thinking the only difference:
+
+                        --disable-thinking    recipe default
+      overall                   76.95              81.74
+      normalized                75.78              82.95
+      hallucination             72.10              92.45
+      irrelevance               85.71             100.00
+      live_irrelevance          58.49              84.91
+      parallel                  63.33              83.33
+
+    The failure it fixes is specific and ugly: with one tool offered and a
+    question that tool cannot answer, the model calls it anyway — "area of a
+    rectangle" -> `draw_circle({radius: 50.265})`, "last year's TSX stock
+    prices" -> `requests_get(PublicHolidays/2024/CA)`. Deliberation is what
+    stops that, and the reference this checkpoint is judged against scores
+    97.16 on the same category.
+
+    The trap is that MLPerf's qwen3.6 submission DOES disable reasoning, and
+    documents why (86.23 -> 78.19 with it on). That finding does not transfer
+    to this checkpoint; neither does that recipe's `disable_tool_grammar =
+    true`, which measured +0.9 overall / +4.5 hallucination when left OFF
+    here. Both were re-measured on this model rather than inherited, and both
+    came out the other way.
+
+    Prefix caching is ON: the PLE n-gram history and conv state and the QSA
+    ingested indexer keys ride the SSM snapshots as host aux blobs, so a
+    prefix hit cannot inherit the previous request's n-gram history. Measured
+    3.9x warm TTFT on a 3-turn 2.6K needle.
+
+    BFCL, PINNED n=995 DRAW, before and after the Java/JS language-preprocessing
+    fix in `atlas-plugin/assets/bfcl/provision.py`. Same binary, same serve
+    line, temperature 0 -- so every delta below is causal, not variance:
+
+      subset                    before    after
+      simple_java                41.94    58.06
+      simple_javascript          25.81    67.74
+      simple_python              89.92    91.53
+      multiple                   87.90    89.52
+      parallel_multiple          79.84    80.65
+      live_simple               100.00    96.00
+      live_parallel              75.00    68.75
+      live_irrelevance           88.64    87.50
+      irrelevance               100.00    79.17
+      ------------------------------------------
+      non_live      (category)   76.44    82.02
+      live          (category)   78.82    77.65
+      hallucination (category)   94.32    83.33
+      OVERALL                    81.11    83.32
+      NORMALIZED                 83.20    81.00
+
+    OVERALL ROSE AND NORMALIZED FELL, and both are real. `overall` is a plain
+    mean over samples, so it follows non_live (62% of this draw); `normalized`
+    is the unweighted mean of the three CATEGORY scores, so a hallucination
+    regression costs it a third of the damage regardless of sample count.
+
+    ★ The regression is the cost of being faithful to BFCL. Its preprocessing
+    appends " Note that the provided function is in Python 3 syntax." to EVERY
+    function description on non-Java/JS subsets, and that sentence alone moves
+    irrelevance 100.00 -> 79.17 (5 of 24 samples) -- it reads as an
+    endorsement of the offered tool, which is exactly the wrong nudge on a
+    category scored by DECLINING to call. Nothing else about those samples
+    changed. Do not "fix" this by dropping the hint on Python subsets: that
+    would be tuning the harness away from official BFCL to win points, and the
+    Java/JS half of the same call is what bought +16.1 and +41.9.
+
+    LATENCY SHAPE (one GB10, thinking ON, 128-token completions, median of
+    2 reps after a dropped warmup, unique prompts so nothing hits the cache):
+
+      prompt_tok   C=1 TTFT   C=1 TPOT      C=2 TTFT   C=2 TPOT
+             268     1644 ms   52.24 ms       2898 ms   65.16 ms
+            1122     2580 ms   52.86 ms       4800 ms   65.95 ms
+            2347     4222 ms   53.69 ms       8349 ms  108.27 ms
+            4664     8700 ms   54.23 ms      17294 ms  109.35 ms
+            8060    16505 ms   53.63 ms      33053 ms  110.56 ms
+
+    ★ THE TTFT COLUMN ABOVE IS PRE-FIX. `perf(ple): fault the n-gram rows
+    concurrently` cut it; how much depends entirely on how cold the PLE row
+    cache is, so both numbers are recorded rather than the flattering one:
+
+      * COLD cache, first large request after a restart -- 22,072 misses on a
+        4720-token prefill -- serial 10137 ms -> parallel 8631 ms, -14.9%.
+      * WARMED cache, the same five-leg sweep run in sequence -- only 2-7k
+        misses, because the legs share n-gram rows -- 3.3% to 11.7%, largest
+        at the SHORT prompts where the fixed PLE cost is the biggest share:
+            268 tok 1660 -> 1467 | 1140 2648 -> 2397 | 2309 4320 -> 3971
+           ~4700   8956 -> 8573 | 7980 16394 -> 15860
+
+    Real prose should sit nearer the cold figure than the warm one: the sweep's
+    filler draws from a 26-WORD vocabulary, so its n-grams collide far more
+    than real text does and its cache warms much faster than a real workload's
+    would.
+
+    TPOT IS FLAT IN CONTEXT -- 52.24 -> 53.63 ms across a 30x prompt range,
+    +2.7%. That is the 3:1 GDN ratio paying off: decode does not re-read a
+    context-length KV tensor per token, so per-token latency is a constant
+    the operator can plan against. TTFT is the opposite and is where the
+    budget goes: the marginal prefill rate is 1.91 ms/token (~524 tok/s), so
+    TTFT is essentially all of the wall time on a long single-turn prompt.
+
+    C=2 HAS A CLIFF between 1122 and 2347 prompt tokens. Below it, C=2 TPOT
+    is 65 ms and aggregate throughput is ~1.60x C=1. Above it TPOT doubles to
+    ~109 ms and aggregate is ~1.00x -- the second stream buys NOTHING. Size
+    concurrency against the prompt length actually served, not against a
+    short-prompt measurement.
+
+    SSM SNAPSHOTS ARE THE ENTIRE WARM WIN, AND THEY FIRE ONCE. Cold vs warm
+    TTFT on a repeated identical prefix, `--ssm-cache-slots 16` (the default)
+    against `--ssm-cache-slots 0` with KV prefix caching left ON in both, so
+    the difference is the SSM state restore alone:
+
+      prompt_tok   cold      warm (slots 16)   warm (slots 0)
+            1124   2369 ms    600 ms  3.95x    1940 ms  1.47x
+            2346   4180 ms    698 ms  5.99x    3542 ms  1.22x
+            4633   8633 ms    703 ms 12.27x    7863 ms  1.12x
+            8070  16408 ms    679 ms 24.18x   15457 ms  1.07x
+
+    Warm TTFT with snapshots is FLAT at ~680-700 ms regardless of prompt
+    length, which is the whole point of the feature. Without them the KV
+    prefix cache alone decays to 1.07x by 8K, because recomputing the GDN
+    recurrence is what prefill actually costs on this model.
+
+    WHERE COLD TTFT ACTUALLY GOES (per-stage, one 4656-token prefill, 36 SSM
+    layer calls; the profiler syncs at every seam so absolutes are inflated but
+    the shares hold):
+
+      moe          2830 ms  48.8%
+      ple          1683 ms  29.0%   <- ALL of it in ONE layer (L1: 1681.9 ms;
+      gdn_block     686 ms  11.8%      every other layer is 0.0)
+      hc_pre_*      455 ms   7.9%
+      hc_post_*     144 ms   2.5%
+
+    Do not infer this from the warm-hit numbers below, which is the mistake
+    that cost a day: an SSM snapshot hit skips the ENTIRE forward, so it cannot
+    separate the GDN recurrence from the MoE. The GDN state is what makes the
+    forward unskippable; it is not what the forward spends its time on.
+
+    ★ BUT THE HIT DOES NOT REPEAT. Eight identical back-to-back requests at
+    4545 prompt tokens: 9754 ms cold, 587 ms on the second (16.6x), then
+    ~7950 ms for every one of the remaining six. At 7984 tokens there is no
+    warm hit at all -- all eight land at ~15.7 s. The server says what is
+    happening:
+
+      Prefix cache hit: 4545 tokens (285 blocks) but no SSM snapshot
+        -- recomputing all KV
+
+    KV matches the whole prompt; the SSM snapshot lookup misses, so the GDN
+    state is recomputed from scratch and TTFT reverts to cold. Snapshots ARE
+    being written each request (`Saved SSM snapshot N for 4545 tokens`, slots
+    cycling 1,3,0,2), and the one hit that did land came from an INTERMEDIATE
+    checkpoint at token 4528, not the leaf. This is NOT the default-off
+    `ATLAS_MARCONI_EXACT` shortcut -- that path logs when it bypasses and it
+    never fired in this run. Leading hypothesis is that the snapshot is
+    released when its producing sequence completes, so it is gone before the
+    next request looks; that is a hypothesis, the log line above is the
+    measurement. Multi-turn agentic serving is exactly the workload that
+    should be collecting this win and currently collects it once.
+  maintainer: atlas-inf
+  category: general
+  model_params: 180B
+  model_dtype: nvfp4
+  quantization: nvfp4
+  kv_dtype: bf16
+
+defaults:
+  port: 8889
+  host: 0.0.0.0
+  kernel_target: qwen3.8-flash-next
+  max_seq_len: 8192
+  # bf16, not fp8 — this checkpoint ships no k/v scales. See the description.
+  kv_cache_dtype: bf16
+  gpu_memory_utilization: 0.85
+  max_num_seqs: 4
+  max_batch_size: 4
+  # Correct since the PLE/QSA aux state rides the snapshots, and faster since
+  # the aux was attached to the snapshots warm turns actually hit.
+  enable_prefix_caching: true
+  # NFS-mounted checkpoints benefit; harmless on local NVMe.
+  fast_load_prefetch_shards: true
+  # The chat template gates its whole scaffold on enable_thinking, and a bare
+  # render collapses chat to a 2-token EOS. `low` keeps the budget cheap while
+  # still rendering the full preamble.
+  default_chat_template_kwargs: '{"reasoning_effort":"low"}'

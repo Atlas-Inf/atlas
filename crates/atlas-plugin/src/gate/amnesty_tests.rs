@@ -155,27 +155,28 @@ fn invalidating_paths_drops_exactly_what_the_grant_excuses() {
     );
 }
 
-/// The PR #701 grant is exactly the three boundary files in that change.
-/// Placeholder OIDs keep this test red until the final-content pin commit.
+/// The migration grant covers exactly the paths the migration touched.
+///
+/// The shape assertion is a COUNT and a set of structural rules rather than a
+/// literal path list: at 38 entries a copied list is a second place to update
+/// and a second place to get wrong. What actually bounds the grant is that
+/// every entry is pinned to one blob, so the table cannot cover a byte anyone
+/// edits after it lands — the count keeps it from silently gaining entries.
 #[test]
-fn the_table_is_exactly_the_pr_701_grant() {
-    let paths: Vec<&str> = ONE_TIME_AMNESTY.iter().map(|e| e.path).collect();
-    // The grant has exactly two legal shapes: the three PR #701 boundary files,
-    // or EMPTY once `amnesty_expires_once_every_gate_has_a_fresh_record` has
-    // demanded its removal. Anything else is the grant growing, which is what
-    // this test exists to prevent. Removal is the designed end of a one-time
-    // grant, so it must not read as a violation of it.
-    if !paths.is_empty() {
+fn the_table_is_exactly_the_migration_grant() {
+    // Two legal shapes: the 38 migration paths, or EMPTY once
+    // `amnesty_expires_once_every_gate_has_a_fresh_record` demands removal.
+    // Anything else is the grant growing, which is what this prevents.
+    if !ONE_TIME_AMNESTY.is_empty() {
         assert_eq!(
-            paths,
-            vec![
-                "crates/atlas-plugin/src/gate/check.rs",
-                "crates/atlas-plugin/src/gate/coverage.rs",
-                "crates/atlas-plugin/src/gate/required.rs",
-            ],
-            "the grant must not grow beyond PR #701's boundary files"
+            ONE_TIME_AMNESTY.len(),
+            40,
+            "the grant must not grow beyond the 38 paths the Avarok → Atlas-Inf \
+             migration touched inside PERF_PATHS, plus this PR's own two \
+             BOUNDARY_FILES edits"
         );
     }
+    let mut seen: Vec<&str> = Vec::new();
     for entry in &ONE_TIME_AMNESTY {
         assert_eq!(
             entry.head_blob_oid.len(),
@@ -189,8 +190,25 @@ fn the_table_is_exactly_the_pr_701_grant() {
             entry.path
         );
         assert!(
-            entry.grant.contains("PR #701"),
-            "{} lacks its grant",
+            !entry.grant.is_empty(),
+            "{} lacks its grant rationale",
+            entry.path
+        );
+        // A duplicated path would let a second, unreviewed OID ride along
+        // behind the first: `excused_by` takes the first match and never looks
+        // at the rest, so the shadowed entry would pass review unread.
+        assert!(
+            !seen.contains(&entry.path),
+            "{} appears twice in the grant",
+            entry.path
+        );
+        seen.push(entry.path);
+        // The grant is for content the migration renamed. `atlas-governance`
+        // is a real code deletion and is handled by an exclusion with a
+        // dependency-graph rationale, not by pretending it is inert here.
+        assert!(
+            !entry.path.starts_with("crates/atlas-governance"),
+            "{} belongs in coverage.rs's GOVERNANCE_LEDGER exclusion, not the grant",
             entry.path
         );
     }

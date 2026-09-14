@@ -9,11 +9,14 @@ pub mod config;
 pub mod dtype;
 pub mod error;
 pub mod fault;
+pub mod ngram_table;
 pub mod numeric;
+pub mod qwen4exp_reference;
 pub mod safetensors;
 pub mod scope;
 pub mod target;
 pub mod tensor;
+pub mod weight_manifest;
 
 // `device` always compiles — its `sm121` submodule is pure constants
 // that spark-model's launch heuristics consume on every backend.

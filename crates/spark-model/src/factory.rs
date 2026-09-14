@@ -11,12 +11,23 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::weights::WeightStore;
 
 use crate::mistral_loader::MistralWeightLoader;
+use crate::weight_loader::LongcatWeightLoader;
 use crate::weight_loader::{
     DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, LagunaWeightLoader,
     MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
-    Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen35DenseWeightLoader, Qwen35WeightLoader,
-    Step3p7WeightLoader,
+    Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen4ExpWeightLoader, Qwen35DenseWeightLoader,
+    Qwen35WeightLoader, Step3p7WeightLoader,
 };
+
+mod dspark_admission;
+#[allow(unused_imports)]
+pub(crate) use dspark_admission::{
+    admit_lightning_dspark, admit_lightning_dspark_build, admit_lightning_dspark_product_build,
+};
+#[cfg(test)]
+mod dspark_admission_tests;
+#[cfg(test)]
+mod dspark_product_admission_tests;
 
 /// DFlash speculative-decoding build arguments. `None` for non-DFlash runs;
 /// `Some(...)` carries the drafter's separate [`WeightStore`], parsed
@@ -99,6 +110,13 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "gemma4" | "gemma_4" => Ok(Box::new(Gemma4WeightLoader)),
         // Mistral family (MLA + MoE, GQA fallback for initial bring-up)
         "mistral" => Ok(Box::new(MistralWeightLoader)),
+        // LongCat-Flash(-Lite): MLA dual-sublayer blocks + shortcut MoE with
+        // zero-computation experts (+ n-gram input embeddings).
+        "longcat_flash_ngram" | "longcat_flash" => Ok(Box::new(LongcatWeightLoader)),
+        // Qwen3.8-Flash-Next. `dispatch.rs` normalizes the older
+        // `qwen3_8_flash_next` naming onto `qwen4_exp`, so one arm covers both
+        // published quantizations.
+        "qwen4_exp" => Ok(Box::new(Qwen4ExpWeightLoader)),
         // MiniMax M2 family (M2.1 / M2.7) — full attention + 256-expert
         // sigmoid-routed MoE + 3-module MTP.
         "minimax_m2" => Ok(Box::new(MinimaxM2WeightLoader)),
@@ -110,7 +128,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "deepseek_v4" => Ok(Box::new(DeepSeekV4WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
-             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, nemotron_h, nemotron_h_puzzle, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
+             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
             config.model_type,
             normalized,
         ),

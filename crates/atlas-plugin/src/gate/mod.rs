@@ -225,6 +225,12 @@ mod fixture_baseline;
 #[path = "coverage_map_tests.rs"]
 mod coverage_map_tests;
 
+/// Split from `coverage_map_tests.rs` for the 500-LoC cap: the dependency-graph
+/// precondition behind the `atlas-governance` exclusion.
+#[cfg(test)]
+#[path = "governance_exclusion_tests.rs"]
+mod governance_exclusion_tests;
+
 /// Proofs for the exact, `#[cfg(test)]`-guarded Rust module exemption.
 #[cfg(test)]
 #[path = "test_only_coverage_tests.rs"]

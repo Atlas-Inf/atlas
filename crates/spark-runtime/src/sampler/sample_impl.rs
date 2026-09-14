@@ -65,7 +65,7 @@ pub fn sample_with_params_seeded(
     // penalties + logit_bias actually re-order logits, so as long as those
     // ran first, this argmax is correct AND respects caller config.
     if params.temperature <= 0.0 {
-        return greedy_pick_last_wins(&raw_logits);
+        return argmax_last_wins_f32(&raw_logits);
     }
     let temperature = params.temperature;
 
@@ -222,7 +222,7 @@ pub fn sample_with_params_seeded(
 /// construction); otherwise the answer is the LAST index equal to the max,
 /// which is exactly what `max_by` returns on NaN-free input (including
 /// -0.0/+0.0 ties, where `partial_cmp` says Equal and `==` agrees).
-fn greedy_pick_last_wins(v: &[f32]) -> u32 {
+pub fn argmax_last_wins_f32(v: &[f32]) -> u32 {
     const LANES: usize = 8;
     let mut acc = [f32::NEG_INFINITY; LANES];
     let mut any_nan = false;
@@ -265,7 +265,7 @@ fn greedy_pick_last_wins(v: &[f32]) -> u32 {
 
 #[cfg(test)]
 mod greedy_tests {
-    use super::greedy_pick_last_wins;
+    use super::argmax_last_wins_f32;
 
     fn reference(v: &[f32]) -> u32 {
         v.iter()
@@ -276,7 +276,7 @@ mod greedy_tests {
     }
 
     fn agree(v: &[f32]) {
-        assert_eq!(greedy_pick_last_wins(v), reference(v), "diverged on {v:?}");
+        assert_eq!(argmax_last_wins_f32(v), reference(v), "diverged on {v:?}");
     }
 
     #[test]
@@ -307,7 +307,7 @@ mod greedy_tests {
             .collect();
         v[100_000] = 999.0;
         v[200_000] = 999.0; // duplicate max — LAST must win here
-        assert_eq!(greedy_pick_last_wins(&v), reference(&v));
-        assert_eq!(greedy_pick_last_wins(&v), 200_000);
+        assert_eq!(argmax_last_wins_f32(&v), reference(&v));
+        assert_eq!(argmax_last_wins_f32(&v), 200_000);
     }
 }

@@ -127,6 +127,19 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Immutable identity for the official Lightning DSpark product.
+    /// Generic DFlash, MTP, and ordinary models return `None` by default.
+    fn lightning_dspark_product_policy(
+        &self,
+    ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
+        None
+    }
+
+    /// Convenience identity check for object-safe scheduler branching.
+    fn is_lightning_dspark_product(&self) -> bool {
+        self.lightning_dspark_product_policy().is_some()
+    }
+
     /// Run beam search to completion for each request, returning each one's
     /// winning hypothesis token ids (EOS-terminated). Called from the prefill
     /// path for `num_beams > 1` requests, bypassing the token-by-token decode
@@ -543,6 +556,24 @@ pub trait Model: Send + Sync {
         num_drafts: usize,
     ) -> Result<crate::engine::GenerateResult>;
 
+    /// Longest visible context at which a BATCHED (K-token) verify is valid,
+    /// or `None` when nothing bounds it. The scheduler must not dispatch a
+    /// speculative step for a sequence past this: the batched attention path
+    /// refuses an ACTIVE QSA selection, and that refusal arrives as a verify
+    /// error, which finishes the request.
+    fn verify_context_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Deepest `num_drafts` a batched verify may dispatch, or `None` when
+    /// nothing bounds it. The tightest bound across the layers; the
+    /// scheduler clamps every speculative step's draft count to it, because
+    /// a layer that cannot serve the width answers with a verify error and
+    /// a verify error finishes the request.
+    fn verify_max_drafts(&self) -> Option<usize> {
+        None
+    }
+
     /// Check if speculative decoding is available (MTP or self-speculative).
     fn has_proposer(&self) -> bool;
 
@@ -713,6 +744,11 @@ pub trait Model: Send + Sync {
         1
     }
 
+    /// Smallest group that should enter the batched proposer.
+    fn mtp_propose_batch_min(&self) -> usize {
+        2
+    }
+
     /// DFlash K=γ graphed verify (γ+1 tokens). Specialization of the K=2/3/4
     /// pattern for arbitrary K. Default impl falls back to eager
     /// `decode_verify`. Models can override for CUDA-graph speedup keyed by
@@ -766,6 +802,29 @@ pub trait Model: Send + Sync {
     /// dedicated MTP input buffer. Must precede `run_mtp_propose` — MTP
     /// overwrites shared buffers including `norm_output`.
     fn save_hidden_for_mtp(&self, token_idx: usize, stream: u64) -> Result<()>;
+
+    /// Move verify row `row` of the mHC stream highway into row 0, so a
+    /// drafter that consumes the PRE-mixer residual reads the accepted
+    /// position rather than the first verify row.
+    ///
+    /// The companion to [`Self::save_hidden_for_mtp`], for the other input
+    /// shape. That one stages `hidden_states[row]` — the post-mixer,
+    /// `hidden`-wide state — into `mtp_hidden_save`, which reaches the
+    /// proposer as `target_hidden`. A drafter whose `pre_fc_norm_hidden` is
+    /// `[hc_mult * hidden]` (qwen4_exp) cannot use that: it needs the
+    /// residual BEFORE the model-level mixer collapses it, and so reads
+    /// `buffers.hc_streams()` directly. Nothing was selecting a row there,
+    /// and `hc_streams` is `[M, hc_mult, hidden]` — so it always read row 0
+    /// while the scheduler was staging row `num_accepted` next door. On
+    /// every ACCEPT the drafter proposed from the position BEFORE the one it
+    /// should, which is invisible in the output (verify rejects the bad
+    /// drafts) and shows up only as depressed acceptance.
+    ///
+    /// Call beside `save_hidden_for_mtp` with the same row. No-op for models
+    /// with no highway, and for row 0 (already correct).
+    fn select_mtp_stream_row(&self, _row: usize) -> Result<()> {
+        Ok(())
+    }
 
     /// ATLAS_MTP_CATCHUP: ring-capture a serially decoded token's final
     /// hidden at `pos` for the drafter catch-up feed. Default no-op.
@@ -841,6 +900,22 @@ pub trait Model: Send + Sync {
         _num_committed: usize,
         _base_pos: usize,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Preserve the current C=1 front before batched slot-addressed packing.
+    fn preserve_dflash_save_front(&self, _k: usize, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Compact batched UNIFIED_CTX capture for `seq_i` to the C=1 front
+    /// of `dflash_hidden_save` so `commit_ctx` can run unchanged.
+    fn pack_dflash_save_seq(&self, _seq_i: usize, _k: usize, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Restore sequence 0's capture after batched commit packing.
+    fn restore_dflash_save_front(&self, _k: usize, _stream: u64) -> Result<()> {
         Ok(())
     }
 
@@ -964,6 +1039,15 @@ pub trait Model: Send + Sync {
     /// 2026-05-01 sweep: 8K collapses to "The\nThe…").
     fn is_mla(&self) -> bool {
         false
+    }
+
+    /// mHC hyper-connection stream count (0 = no highway). Non-zero means
+    /// the batched GDN decode paths are UNWIRED for this model (they carry
+    /// their own residual, which the highway replaces — see
+    /// `qwen3_ssm::hc::refuse_batched_under_hc`); the scheduler must clamp
+    /// concurrency to 1 until the batched highway lands (Avarok #753 item B).
+    fn hc_mult(&self) -> usize {
+        0
     }
 
     /// Tokens per paged-KV block, or `None` when the model has no paged KV.

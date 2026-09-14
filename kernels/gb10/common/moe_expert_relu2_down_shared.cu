@@ -70,6 +70,7 @@ extern "C" __global__ void moe_expert_relu2_down_shared(
     unsigned int top_k
 ) {
     const unsigned int expert_slot = blockIdx.y;
+    const unsigned int tok = blockIdx.z;
     const bool is_shared = (expert_slot == top_k);
 
     const unsigned char* B_packed;
@@ -84,22 +85,22 @@ extern "C" __global__ void moe_expert_relu2_down_shared(
         B_packed = sh_down_packed;
         B_scale = sh_down_scale;
         s2 = sh_down_s2;
-        u_ptr = sh_up_in;
+        u_ptr = sh_up_in + (unsigned long long)tok * K_shared;
         K = K_shared;
         N_out = N_shared;
     } else {
-        const unsigned int expert_id = expert_indices[expert_slot];
+        const unsigned int expert_id = expert_indices[(unsigned long long)tok * top_k + expert_slot];
         B_packed = (const unsigned char*)packed_ptrs[expert_id];
         B_scale = (const unsigned char*)scale_ptrs[expert_id];
         s2 = scale2_vals[expert_id];
-        u_ptr = up_out + (unsigned long long)expert_slot * K_routed;
+        u_ptr = up_out + ((unsigned long long)tok * top_k + expert_slot) * K_routed;
         K = K_routed;
         N_out = N;
         // EP: NULL pointer means remote expert
         if (B_packed == 0) {
             const unsigned int n_base = blockIdx.x * (N_PER_BLOCK * 2);
             for (unsigned int i = threadIdx.x; i < N_PER_BLOCK * 2 && n_base + i < N_out; i += BLOCK_SIZE) {
-                C[expert_slot * N + n_base + i] = __float2bfloat16(0.0f);
+                C[((unsigned long long)tok * top_k + expert_slot) * N + n_base + i] = __float2bfloat16(0.0f);
             }
             return;
         }
@@ -165,7 +166,9 @@ extern "C" __global__ void moe_expert_relu2_down_shared(
     }
 
     // Output: shared writes to sh_down_out, routed writes to C[slot*N]
-    __nv_bfloat16* out = is_shared ? sh_down_out : (C + (unsigned long long)expert_slot * N);
+    __nv_bfloat16* out = is_shared
+        ? (sh_down_out + (unsigned long long)tok * N_shared)
+        : (C + ((unsigned long long)tok * top_k + expert_slot) * N);
 
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
