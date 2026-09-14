@@ -1,0 +1,58 @@
+# Benchmarks for this model, and the thresholds its gate records must meet.
+#
+# Sibling of MODEL.toml so the numbers sit beside the thing they describe;
+# hardware and model are implied by the path and cannot disagree with the
+# contents. Read by `atlas_plugin::gate::bench`.
+#
+# Thresholds are per CHECKPOINT, not per model: two checkpoints of one model
+# can differ by several BFCL points, so they cannot share a bar.
+#
+# This file is deliberately OUTSIDE the closure hash (`taxon::configs` does not
+# list it), so ratcheting a threshold does not invalidate the record that
+# justified the ratchet.
+#
+# `status = "unmeasured"` entries carry NO [benchmarks.metrics] table. Absence
+# is the TODO -- a guessed threshold a run could clear would report PASS for
+# something nobody measured.
+
+# Both entries below are UNMEASURED declarations of intent for the nvidia
+# vendor pack (MIXED_PRECISION: NVFP4 experts + FP8 PLE + FP8_PB_WO MTP).
+# `baseline_for` drops unmeasured entries, so the gate refuses to serve them
+# until floors exist — that refusal is the feature: it keeps a guessed bar
+# from ever reading green. Bootstrap per the repo protocol: drive the leg
+# manually with `--url/--model` (jobqueue 014/015 do exactly this on reiner),
+# collect >=3 repeats, then write floors + flip `status = "measured"`. The
+# recipe below is sparkrun-recipes PR #8 (`qwen3.8-flash-next-nvfp4-nvidia`).
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+gate = "bfcl-subset"
+recipe = "qwen3.8/qwen3.8-flash-next-nvfp4-nvidia"
+label = "Qwen3.8-Flash-Next (NVFP4, nvidia)"
+default = false
+status = "unmeasured"
+note = """\
+First gate subject for the nvidia MIXED_PRECISION pack. The golden ST-995 \
+draw (62/10/10, floor 25, n=995, seed 42, temp 0) is client-side, so the \
+manual-drive leg produces a comparable score directly. Thinking stays ON — \
+the recipe pins reasoning_effort "low" and the dense-27B FAIL traced to \
+disable_thinking, not to NVFP4 (see QWEN38_PORT_GAP_ANALYSIS §I.5). \
+Floors land only after the queued n=995 record exists; do NOT import the \
+RadixArk entry's bars — different weights."""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+gate = "agentic-webserver"
+recipe = "qwen3.8/qwen3.8-flash-next-nvfp4-nvidia"
+label = "Qwen3.8-Flash-Next (NVFP4, nvidia)"
+default = false
+status = "unmeasured"
+note = """\
+Agentic soak for the nvidia pack — the workload most sensitive to the MTP \
+experts being correct (multi-turn tool use over long trajectories). Driven \
+manually at iterations=50, wall_budget_s=9000 (the ~2.5h shape the dense \
+legs use). Whether Sigma-wall becomes a floor here is a decision to make \
+with the measured spread in hand, not before — see the 3.6 dense entry's \
+protocol note for why a ceiling written before calibration is worthless."""
