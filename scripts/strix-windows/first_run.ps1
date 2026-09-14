@@ -24,9 +24,10 @@
 # Either way it ends by serving `unsloth/Qwen3.8-27B-NVFP4` and firing a smoke
 # request at it, so a successful run prints a real completion.
 #
-# The serve flags and env below are the RUNTIME-VERIFIED config from the
-# 2026-08-13 bring-up (BFCL v3 subset 165/196). Three of them differ deliberately
-# from the pre-runtime values the porting doc used to carry -- see the comments at
+# The serve flags and env below are the fingerprinted fp8d recipe behind the
+# 2026-09-13 ST-995 record (995/995, zero faults, ROCm 10) -- NOT the earlier
+# preservation profile, whose bf16-GDN kernel path is a different arm set and
+# is a live suspect in a WDDM bugcheck on a second box. Read the comments at
 # each one before changing it.
 #
 # MUST run from PowerShell, NOT Git Bash: under bash, Git's /usr/bin precedes MSVC
@@ -229,22 +230,28 @@ function Phase-Check {
 }
 
 # The kernels here are gfx1151. Another AMD part builds and loads fine right up
-# until it looks for a matching code object, so name it now rather than later.
+# until it looks for a matching code object -- and on WDDM a wrong-arch or
+# faulting compute launch can escalate to a kernel-mode page fault that
+# BUGCHECKS the whole machine (0x119 VIDEO_SCHEDULER_INTERNAL_ERROR, observed
+# 2026-09-14 on a second Strix-class box). So a detected wrong GPU is a hard
+# FAIL, not a warning -- a first run must never be the thing that bluescreens
+# someone. ATLAS_SKIP_GPU_CHECK=1 overrides for porting work on other arches.
 # hipInfo only exists with the HIP SDK installed, which a prebuilt-zip tester has
 # no reason to have -- fall back to the adapter name from the driver.
 function Check-Gpu {
+    if ($env:ATLAS_SKIP_GPU_CHECK -eq '1') { Warn 'GPU check skipped (ATLAS_SKIP_GPU_CHECK=1)'; return }
     $hipInfo = if ($env:HIP_PATH) { Join-Path $env:HIP_PATH 'bin\hipInfo.exe' } else { $null }
     if ($hipInfo -and (Test-Path $hipInfo)) {
         $gfx = & $hipInfo 2>$null | Select-String 'gcnArchName:\s*(\S+)' |
                ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
         if ($gfx -eq 'gfx1151') { Ok 'GPU: gfx1151 (Strix Halo)'; return }
-        elseif ($gfx) { Warn "GPU reports '$gfx', not gfx1151 -- this tree ships gfx1151 kernels."; return }
+        elseif ($gfx) { Bad "GPU reports '$gfx', not gfx1151 -- this tree ships gfx1151 kernels only. Serving wrong-arch code on WDDM can bugcheck the OS."; return }
     }
     $amd = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
            Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -First 1
     if ($amd) {
         if ($amd.Name -match '8060S|Strix|AI MAX') { Ok "GPU: $($amd.Name)" }
-        else { Warn "GPU is '$($amd.Name)' -- expected a Strix Halo part (Radeon 8060S); kernels are gfx1151." }
+        else { Bad "GPU is '$($amd.Name)' -- expected a Strix Halo part (Radeon 8060S / gfx1151). Serving wrong-arch code on WDDM can bugcheck the OS." }
     } else { Warn 'No AMD adapter found. Is the Adrenalin driver installed?' }
 }
 
@@ -425,15 +432,27 @@ function Phase-Serve {
     Set-Location $ReleaseDir
     $env:PATH = "$ReleaseDir;$env:HIP_PATH\bin;$env:PATH"
 
+    # Serve profile: the fp8d recipe — the fingerprinted configuration behind
+    # the 2026-09-13 ST-995 record (995/995 samples, zero faults, 3.6 h on
+    # ROCm 10; see kernels/strix-hip/qwen3.8-27b/BENCH.toml +
+    # scripts/strix-windows/win_serve_qwen38_nvfp4.ps1). It replaces the older
+    # preservation profile (ATLAS_GDN_BF16_WEIGHTS / ATLAS_FP8_DEQUANT_*),
+    # which is a DIFFERENT kernel path — GDN runs FP8-weight decode here —
+    # and which bugchecked a second Strix-class box on first inference
+    # (0x119, 2026-09-14). If a box cannot serve this recipe, that is a bug
+    # to report, not a knob to turn back: the fallback profile is exactly
+    # the path under suspicion.
     $env:ATLAS_W4A16_DP4A = '1'
     $env:ATLAS_W4A16_VARIANT = 'v1'
+    $env:ATLAS_FORCE_GLOBAL_GDN = '1'
+    $env:ATLAS_GDN_FP8_WEIGHTS = '1'
+    $env:ATLAS_GDN_FP8_DECODE = '1'
+    $env:ATLAS_SSM_TAIL_PROTECT = '1'
+    $env:ATLAS_SSM_TAIL_LEASE_TTL = '128'
+    $env:ATLAS_SSM_TAIL_MIDCHUNK = '0'
     $env:ATLAS_MTP_GATE_REPROBE = '64'
-    $env:ATLAS_FP8_DEQUANT_ATTN_TO_BF16 = '1'
-    $env:ATLAS_FP8_DEQUANT_FFN_TO_BF16 = '1'
-    $env:ATLAS_GDN_BF16_WEIGHTS = '1'
-
-    # Preserve Qwen3.8's per-row FP8 attention, GDN, and final-eight FFN
-    # projections as BF16; block-scaled FP8 kernels cannot consume row scales.
+    $env:ATLAS_MTP_ACCEPT_DEBUG = '1'
+    $env:ATLAS_TRACKED_MEMINFO = '1'
 
     # 0, NOT the 6 this doc carried before runtime. cuMemGetInfo_v2 now synthesises
     # a truthful free figure from tracked allocations, and that tracker reports
@@ -490,32 +509,32 @@ try {
     #
     # --no-fast-load is no longer required (the Unix-only O_DIRECT loader now warns
     # and falls back instead of hard-erroring); passing it just silences the warning.
-    # The gfx1151 kernel set is far smaller than gb10's, so a large number of
-    # dispatch sites resolve to a fallback and main's kernel audit refuses to
-    # serve without this flag -- 94 unresolved lookups for qwen3.8-27b here,
-    # against the 92 serve-amd.sh documents for qwen3.6-27b on the same tree
-    # (3.8 reuses 3.6's kernels via kernel_source, so the set is identical).
-    # These fallbacks are PRE-EXISTING and the certified 3.6 Strix submission was
-    # produced under them; serve-amd.sh has passed this since the audit landed.
-    # Windows simply never picked it up, so a source build stopped dead here.
-    # Do not quote a Strix perf number as final without reading the kernel audit.
+    # The kernel audit's 87 optional-arm probes are all declared in this target's
+    # MODEL.toml [expected_absent] with per-entry reasons, so the boot gate passes
+    # WITHOUT --dangerously-allow-unresolved-kernel-lookups -- and the flag is
+    # deliberately absent here: a NEW unresolved lookup is exactly the signal the
+    # gate exists to catch, and a first-run script must not ship the escape hatch.
     # Built as one array and splatted in a single position. Splatting mid-way
     # through a backtick-continued native call emits a stray bare '-' argument
     # and spark rejects the whole command line.
+    #
+    # Remaining deltas vs the proven recipe are sizing-only and deliberate:
+    # max-seq 4096 / util 0.70 keep the first-run memory footprint conservative
+    # (env-overridable); --disable-thinking keeps the smoke answer inside
+    # 64 tokens. Drafts=3 and ssm-cache-slots=64 match the proven profile —
+    # those select the exercised kernel arms, not just capacity.
     $serveArgs = @('serve', $ModelDir)
-    if ($env:ATLAS_NO_KERNEL_FALLBACKS -ne '1') {
-        $serveArgs += '--dangerously-allow-unresolved-kernel-lookups'
-    }
     $serveArgs += @(
         '--no-fast-load'
         '--model-name', $ModelName, '--host', $BindHost, '--port', $Port
         '--max-seq-len', $MaxSeqLen, '--max-prefill-tokens', $MaxPrefill
         '--gpu-memory-utilization', $GpuUtil, '--kv-cache-dtype', 'bf16', '--lm-head-dtype', 'bf16'
         '--max-batch-size', '1', '--vision-max-pixels', '262144'
-        '--speculative', '--num-drafts', '1'
+        '--speculative', '--num-drafts', '3'
         '--mtp-quantization', 'bf16', '--mtp-vocab', '100000'
         '--disable-tool-grammar', 'true'
-        '--ssm-cache-slots', '0', '--ssm-checkpoint-interval', '16'
+        '--ssm-cache-slots', '64', '--ssm-checkpoint-interval', '16'
+        '--request-timeout', '0'
         '--disable-thinking'
     )
     & $exe @serveArgs
