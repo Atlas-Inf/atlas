@@ -156,16 +156,6 @@ impl BlockDiffusionDraftHead {
                 stream,
             );
         }
-        ops::dense_gemm_bf16_pipelined(
-            gpu,
-            self.kernels.dense_gemm_pipelined,
-            src,
-            w_bf16,
-            dst,
-            g,
-            n_out,
-            k_in,
-            stream,
-        )
+        self.drafter_dense_gemm(gpu, src, w_bf16, dst, g, n_out, k_in, stream)
     }
 }

@@ -709,6 +709,7 @@ mod markov;
 mod nvfp4;
 mod precompute_ctx_kv;
 mod propose;
+mod small_m_gemm;
 
 impl BlockDiffusionDraftHead {
     /// Total propose lanes (lane 0 = default-stream scratch; the rest live

@@ -36,7 +36,7 @@ impl BlockDiffusionDraftHead {
                 scratch.draft_tokens_dev,
                 self.gamma,
                 gpu,
-                self.kernels.dense_gemm_pipelined,
+                &|src, w, dst, m, n, k| self.drafter_dense_gemm(gpu, src, w, dst, m, n, k, stream),
                 self.kernels.dflash2_candidate_selector,
                 stream,
             );
