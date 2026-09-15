@@ -17,10 +17,20 @@
 # non-gfx1151 before any kernel launches. The server owns this console until
 # Ctrl-C; the smoke probe runs detached and writes first_run_smoke.log
 # beside the exe.
+param(
+    # Optional positional arg: a LOCAL weights directory (Windows resolves
+    # weights by path, not HF cache) — equivalent to setting ATLAS_MODEL_DIR.
+    [Parameter(Position = 0)]
+    [string]$ModelDir,
+    # Forwarded to first_run.ps1: skip the post-startup completion probe.
+    [switch]$NoSmokeTest
+)
 $ErrorActionPreference = 'Stop'
-if ($args.Count -gt 0 -and (Test-Path $args[0] -PathType Container)) {
-    $env:ATLAS_MODEL_DIR = (Resolve-Path $args[0]).Path
-    $args = if ($args.Count -gt 1) { $args[1..($args.Count - 1)] } else { @() }
+if ($ModelDir) {
+    if (-not (Test-Path $ModelDir -PathType Container)) {
+        throw "weights dir not found: $ModelDir"
+    }
+    $env:ATLAS_MODEL_DIR = (Resolve-Path $ModelDir).Path
 }
-& (Join-Path $PSScriptRoot 'scripts\strix-windows\first_run.ps1') -Phase serve @args
+& (Join-Path $PSScriptRoot 'scripts\strix-windows\first_run.ps1') -Phase serve -NoSmokeTest:$NoSmokeTest
 if (-not $?) { exit 1 }

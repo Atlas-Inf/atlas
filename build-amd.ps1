@@ -15,10 +15,15 @@
 #
 # Using the prebuilt zip instead? There is nothing to build:
 #   $env:ATLAS_BIN = "C:\path\to\unzipped\spark.exe"   # then .\serve-amd.ps1
+param(
+    # Forwarded to first_run.ps1; a no-op for the build phase but accepted so
+    # the wrappers take the same flags.
+    [switch]$NoSmokeTest
+)
 $ErrorActionPreference = 'Stop'
 if ($env:ATLAS_BIN) {
     Write-Host "ATLAS_BIN is set ($env:ATLAS_BIN) -- prebuilt binary, nothing to build. Run .\serve-amd.ps1"
     exit 0
 }
-& (Join-Path $PSScriptRoot 'scripts\strix-windows\first_run.ps1') -Phase build @args
+& (Join-Path $PSScriptRoot 'scripts\strix-windows\first_run.ps1') -Phase build -NoSmokeTest:$NoSmokeTest
 if (-not $?) { exit 1 }
