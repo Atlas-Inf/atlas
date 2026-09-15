@@ -117,6 +117,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-coldsnap"
+version = "1.0.0-beta-preview"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "atlas-core"
 version = "1.0.0-beta-preview"
 dependencies = [
