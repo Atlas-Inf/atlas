@@ -252,7 +252,8 @@ impl SsmStatePool {
         // dead K-1 snapshot on-device. `num_intermediates` remains the K
         // ceiling (conv count); the uniform H count is `num_intermediates-1`.
         let replay = rollback_mode == crate::ssm_reserve::SsmRollbackMode::Replay;
-        let uniform_h = num_intermediates != num_drafts + 1;
+        let uniform_h =
+            num_intermediates != num_drafts + 1 || crate::ssm_reserve::mtp_pool_full_width();
         let h_inter_counts: Vec<usize> = if has_mtp && replay {
             // Replay: no per-token snapshots exist — every slot's count is 0
             // (the vec stays populated so accessors keep their shape).
@@ -263,7 +264,7 @@ impl SsmStatePool {
                     if s == mtp_slots || uniform_h {
                         num_intermediates.saturating_sub(1)
                     } else {
-                        crate::ssm_reserve::verify_slot_h_intermediates(s, num_drafts, false)
+                        crate::ssm_reserve::verify_slot_h_intermediates(s, num_drafts, uniform_h)
                             .min(num_intermediates.saturating_sub(1))
                     }
                 })

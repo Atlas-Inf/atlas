@@ -502,6 +502,11 @@ pub(crate) fn load_model(
     // can be sized by it too instead of a standalone constant. Same
     // "carried on the config, not the environment" rule as the block below.
     config.max_batch_tokens = max_batch_tokens;
+    if args.dflash {
+        unsafe {
+            std::env::set_var("ATLAS_MTP_POOL_FULL_WIDTH", "1");
+        }
+    }
     if args.dflash && args.enable_prefix_caching {
         tracing::warn!(
             "dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
