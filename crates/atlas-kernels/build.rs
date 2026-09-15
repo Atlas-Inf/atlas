@@ -95,6 +95,7 @@ struct Target {
     behavior_template_owns_tool_definitions: bool,
     behavior_disable_cwd_hint_injection: bool,
     behavior_use_sampling_presets_for_core: bool,
+    behavior_use_sampling_preset_penalties_for_core: bool,
     behavior_tool_call_parser: String,
     behavior_jinja_template: String,
     behavior_enable_loop_watchdog: bool,
@@ -1190,6 +1191,8 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_template_owns_tool_definitions: pb.template_owns_tool_definitions,
                 behavior_disable_cwd_hint_injection: pb.disable_cwd_hint_injection,
                 behavior_use_sampling_presets_for_core: pb.use_sampling_presets_for_core,
+                behavior_use_sampling_preset_penalties_for_core: pb
+                    .use_sampling_preset_penalties_for_core,
                 behavior_tool_call_parser: pb.tool_call_parser,
                 behavior_jinja_template: pb.jinja_template,
                 behavior_enable_loop_watchdog: pb.enable_loop_watchdog,

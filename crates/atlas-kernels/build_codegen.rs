@@ -174,6 +174,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               template_owns_tool_definitions: {},\n\
              \x20               disable_cwd_hint_injection: {},\n\
              \x20               use_sampling_presets_for_core: {},\n\
+             \x20               use_sampling_preset_penalties_for_core: {},\n\
              \x20               tool_call_parser: \"{}\",\n\
              \x20               jinja_template: \"{}\",\n\
              \x20               enable_loop_watchdog: {},\n\
@@ -219,6 +220,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_template_owns_tool_definitions,
             target.behavior_disable_cwd_hint_injection,
             target.behavior_use_sampling_presets_for_core,
+            target.behavior_use_sampling_preset_penalties_for_core,
             target.behavior_tool_call_parser,
             target.behavior_jinja_template,
             target.behavior_enable_loop_watchdog,

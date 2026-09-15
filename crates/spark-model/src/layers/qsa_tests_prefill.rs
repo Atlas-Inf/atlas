@@ -46,6 +46,7 @@ fn qsa_prefill_select_sets_match_reference() {
         hd,
         ratio,
         budget,
+        /* max_seq_len */ 32768,
         rot,
         1.0e7,
         eps,
