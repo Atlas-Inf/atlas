@@ -699,6 +699,7 @@ pub use lifecycle::{
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
+mod forward_block_layer_paged_diag;
 #[cfg(test)]
 mod free_state_tests;
 mod from_weights;

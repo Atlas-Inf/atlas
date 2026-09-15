@@ -520,35 +520,7 @@ impl BlockDiffusionDraftHead {
                 // Full paged-attention input dump (the 095 γ=16 fault was
                 // in this kernel): whole block table + the 12-byte
                 // indirect args the kernel reads at entry.
-                let mut bt_full = vec![0u8; args.block_table_len as usize * 4];
-                gpu.copy_d2h(block_table_dev, &mut bt_full)?;
-                let bt_all: Vec<u32> = bt_full
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                let mut ind_bytes = [0u8; 12];
-                gpu.copy_d2h(scratch.option_b_indirect_args_dev, &mut ind_bytes)?;
-                let indirect: Vec<u32> = ind_bytes
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                let n_bt = bt_all.len();
-                tracing::info!(
-                    "DFLASH OPTION_B DIAG: ptrs k_pool={:#x} v_pool={:#x} q_buf={:#x} \
-                     block_table_dev={:#x} bt[0..8]={:?} bt[last4]={:?} n_bt={} \
-                     indirect(kv_len,q_offset,q_rope_pos)={:?} gamma={} num_kv_heads={} head_dim={}",
-                    k_pool.0,
-                    v_pool.0,
-                    scratch.q_buf.0,
-                    block_table_dev.0,
-                    &bt_all[..8.min(n_bt)],
-                    &bt_all[n_bt.saturating_sub(4)..],
-                    n_bt,
-                    indirect,
-                    g,
-                    self.num_kv_heads,
-                    self.head_dim,
-                );
+                self.option_b_diag_paged_inputs(args, ctx, scratch, k_pool, v_pool)?;
             }
         }
         // Suppress unused-var warnings: kv_len is computed for diagnostics
