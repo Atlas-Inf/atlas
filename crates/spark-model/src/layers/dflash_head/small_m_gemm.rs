@@ -96,6 +96,33 @@ impl BlockDiffusionDraftHead {
             stream,
         )
     }
+
+    /// The legacy (non-paged) path keeps the pipelined GEMM
+    /// unconditionally; same signature shape as the `gemm` closure
+    /// `conv::prepare`/`selector::select_candidates` take.
+    pub(super) fn drafter_pipelined_gemm(
+        &self,
+        gpu: &dyn GpuBackend,
+        src: DevicePtr,
+        w: &DenseWeight,
+        dst: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        ops::dense_gemm_bf16_pipelined(
+            gpu,
+            self.kernels.dense_gemm_pipelined,
+            src,
+            w,
+            dst,
+            m,
+            n,
+            k,
+            stream,
+        )
+    }
 }
 
 #[cfg(test)]
