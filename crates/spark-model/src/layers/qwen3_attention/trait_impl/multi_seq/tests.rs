@@ -89,6 +89,7 @@ fn qkv_phase_d2d(gpu: &MockGpuBackend, config: &ModelConfig, layer: &Qwen3Attent
         graph_capture: false,
         gdn_exact_replay: false,
         token_ids: None,
+        host_token_ids: None,
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
