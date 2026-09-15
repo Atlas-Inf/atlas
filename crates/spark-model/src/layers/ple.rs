@@ -58,4 +58,5 @@ pub mod dump;
 mod layer;
 
 pub use ids::{PleIdDims, ple_ngram_ids};
+pub(crate) use layer::bounded_scratch;
 pub use layer::{PleLayer, PleSeqState, PleWeights};

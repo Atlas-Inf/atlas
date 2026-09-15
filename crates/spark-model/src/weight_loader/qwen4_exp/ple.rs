@@ -36,32 +36,45 @@ use crate::layers::ple::{PleIdDims, PleWeights};
 #[cfg(feature = "cuda")]
 use crate::weight_map::dense;
 
-/// Resident rows in the pinned arena. A prefill pins `tokens * ngram_heads`
-/// rows at once, so the default is DERIVED from the serve config —
-/// `max_batch_tokens * ngram_heads`, rounded up to a power of two, floored at
-/// 65536 — rather than a fixed count. The old 65536 assumed a 2048-token
-/// chunk (2048 x 16 = 32,768) and the default serve config presents 8193
-/// (8193 x 16 = 131,088), so every prompt past 8192 tokens died on the
-/// cache's "every one of N slots is pinned by the batch in flight" bail. At
-/// 320 B/row the derived 262,144 slots cost ~84 MB.
+/// Resident rows in the pinned arena. A forward's gather pins at most one
+/// scratch span of rows at once — `scratch_tokens * ngram_heads` — because
+/// the chunked pipeline resolves and releases a span at a time, so the
+/// default is DERIVED from the span width: `scratch * ngram_heads`, rounded
+/// up to a power of two, floored at 65536. The old `max_batch_tokens`
+/// derivation predates the span loop and would over-provision the arena
+/// 4x at a 32K --max-prefill-tokens (524,288 slots where a span never
+/// pins past 131,072).
 #[cfg(feature = "cuda")]
-fn derived_slots(max_batch_tokens: usize, ngram_heads: usize) -> usize {
-    (max_batch_tokens
+fn derived_slots(scratch_tokens: usize, ngram_heads: usize) -> usize {
+    (scratch_tokens
         .saturating_mul(ngram_heads)
         .next_power_of_two())
     .max(65536)
 }
 
+/// The forward pipeline's scratch width. The six `[span, hc*H]` buffers cost
+/// `scratch * 10240 * 14` bytes — ~1.18 GB at the 8192 default — whatever the
+/// forward width: the llama.cpp ubatch discipline, applied to the one
+/// subsystem whose scratch used to scale with `--max-prefill-tokens`.
 #[cfg(feature = "cuda")]
-fn slots_from_env(max_batch_tokens: usize, ngram_heads: usize) -> (usize, &'static str) {
+fn chunk_from_env() -> usize {
+    std::env::var("ATLAS_PLE_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8192)
+}
+
+#[cfg(feature = "cuda")]
+fn slots_from_env(scratch_tokens: usize, ngram_heads: usize) -> (usize, &'static str) {
     match std::env::var("ATLAS_PLE_CACHE_SLOTS")
         .ok()
         .and_then(|v| v.parse().ok())
     {
         Some(n) if n > 0 => (n, "ATLAS_PLE_CACHE_SLOTS"),
         _ => (
-            derived_slots(max_batch_tokens, ngram_heads),
-            "max_batch_tokens*heads rounded up",
+            derived_slots(scratch_tokens, ngram_heads),
+            "scratch_tokens*heads rounded up",
         ),
     }
 }
@@ -221,7 +234,12 @@ pub(super) fn load(
              F8_E4M3 rows (`batched_embed` / `batched_embed_fp8`)"
         ),
     };
-    let (slots, slots_from) = slots_from_env(config.max_batch_tokens, heads);
+    // The gather pins at most one span's rows at once, so the arena sizes
+    // off the effective span — `bounded_scratch` is the same clamp
+    // `PleLayer::new` applies, keeping the two derivations from drifting.
+    let chunk = chunk_from_env();
+    let span = crate::layers::ple::bounded_scratch(chunk, max_tokens);
+    let (slots, slots_from) = slots_from_env(span, heads);
     let mut cache = spark_storage::NgramRowCache::open_segmented(
         &shards,
         rows_per as u64,
@@ -258,7 +276,8 @@ pub(super) fn load(
          {} shards over {} file(s) x {rows_per} rows x {head_dim} dims = {} rows \
          ({:.1} GB {dtype:?}) \
          served off NVMe with {slots} cached slots ({:.1} MB, {slots_from}: \
-         max_batch_tokens={} x {heads} heads = {}, floored at 65536); \
+         span {span} x {heads} heads, floored at 65536); \
+         scratch {span} tokens = {:.2} GB (ATLAS_PLE_CHUNK={chunk}); \
          conv k={} dilation={dilation} (state {} steps)",
         config.ple_layer_ids,
         shards.len(),
@@ -266,8 +285,7 @@ pub(super) fn load(
         shards.len() * rows_per,
         (shards.len() * rows_per * head_dim * elem) as f64 / 1e9,
         (slots * head_dim * 2) as f64 / 1e6,
-        config.max_batch_tokens,
-        config.max_batch_tokens.saturating_mul(heads),
+        (span * 10240 * 14) as f64 / 1e9,
         config.ple_conv_kernel_size,
         (config.ple_conv_kernel_size - 1) * dilation,
     );
@@ -283,6 +301,7 @@ pub(super) fn load(
         weights,
         NgramTable::Cached(Box::new(cache)),
         max_tokens,
+        span,
         gpu,
     )
     .map(Some)

@@ -190,10 +190,12 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // failures are batched-forward totals, not single chunks, so they
         // survive a 2048 chunk cap unchanged (measured: 51 before, 51 after).
         //
-        // The cost is real — tokens*10240*14 bytes, so 1.18 GB at 8196 against
-        // 293 MB at 2048, out of the KV budget. `ATLAS_PLE_MAX_TOKENS` still
-        // overrides for anyone who would rather have the KV depth, and the
-        // layer's refusal still names it.
+        // The cost is no longer the worry it was: the forward runs in
+        // `ATLAS_PLE_CHUNK`-token spans (default 8192), so the scratch is
+        // `min(chunk, width)*10240*14` bytes — ~1.18 GB at the default —
+        // whatever this width is. `ATLAS_PLE_MAX_TOKENS` still overrides the
+        // WIDTH CAP for anyone who would rather refuse a wide fused step
+        // than pay for one, and the layer's refusal still names it.
         let ple_floor = config.max_batch_tokens.max(2048);
         let max_ple_tokens: usize = match std::env::var("ATLAS_PLE_MAX_TOKENS")
             .ok()

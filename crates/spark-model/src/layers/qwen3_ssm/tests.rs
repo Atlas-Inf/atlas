@@ -326,6 +326,7 @@ fn active_row_without_ple_carry_is_refused() {
         },
         crate::layers::ngram_embed::NgramTable::Bf16(dw(2)),
         1,
+        1,
         &gpu,
     )
     .unwrap();

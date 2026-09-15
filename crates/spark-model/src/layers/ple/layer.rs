@@ -65,7 +65,7 @@ pub struct PleLayer {
     conv_k: KernelHandle,
     add_k: KernelHandle,
 
-    /// Scratch, sized once for `max_tokens`.
+    /// Scratch, sized once for `scratch_tokens` — see `forward_with_ids`.
     emb: DevicePtr,
     key: DevicePtr,
     value: DevicePtr,
@@ -74,6 +74,14 @@ pub struct PleLayer {
     out: DevicePtr,
     slots_dev: DevicePtr,
     max_tokens: usize,
+    /// Width the scratch above was allocated for. Wider forwards run the
+    /// pipeline in `scratch_tokens` spans — every buffer is per-token, and
+    /// the one sequential piece (the conv carry) lives in `st.conv`, which
+    /// threads across calls exactly as the per-row verify path relies on.
+    /// Never below VERIFY_SNAP_SLOTS when `max_tokens` allows it: a
+    /// verify-width forward must stay one span, because the snapshot loop
+    /// indexes the whole window.
+    scratch_tokens: usize,
     /// Event recorded after the gather kernel (see `gather_embed`), so
     /// `release_prev_pins` waits on THAT kernel instead of the whole stream.
     /// 0 until lazily created; 0 falls back to a full stream sync.
@@ -96,6 +104,7 @@ impl PleLayer {
         weights: PleWeights,
         table: NgramTable,
         max_tokens: usize,
+        scratch_tokens: usize,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         dims.validate()?;
@@ -110,6 +119,7 @@ impl PleLayer {
         );
         let c = hc_mult * hidden;
         let state_len = (k_size - 1) * dilation;
+        let w = bounded_scratch(scratch_tokens, max_tokens);
 
         // Fail closed when element width and gather disagree — see
         // `gather_guard`, and the bug it exists for.
@@ -149,14 +159,15 @@ impl PleLayer {
             gate_k: gpu.kernel("ple", "ple_gate")?,
             conv_k: gpu.kernel("ple", "ple_conv")?,
             add_k: gpu.kernel("ple", "ple_add_highway")?,
-            emb: gpu.alloc(max_tokens * hidden * 2)?,
-            key: gpu.alloc(max_tokens * c * 2)?,
-            value: gpu.alloc(max_tokens * hidden * 2)?,
-            gated: gpu.alloc(max_tokens * c * 4)?,
-            gated_normed: gpu.alloc(max_tokens * c * 4)?,
-            out: gpu.alloc(max_tokens * c * 4)?,
-            slots_dev: gpu.alloc(max_tokens * heads * 4)?,
+            emb: gpu.alloc(w * hidden * 2)?,
+            key: gpu.alloc(w * c * 2)?,
+            value: gpu.alloc(w * hidden * 2)?,
+            gated: gpu.alloc(w * c * 4)?,
+            gated_normed: gpu.alloc(w * c * 4)?,
+            out: gpu.alloc(w * c * 4)?,
+            slots_dev: gpu.alloc(w * heads * 4)?,
             max_tokens,
+            scratch_tokens: w,
             gather_done: std::sync::Mutex::new(0),
             slots_staging: std::sync::Mutex::new((0, 0)),
         })
@@ -239,10 +250,12 @@ impl PleLayer {
     ) -> Result<()> {
         anyhow::ensure!(
             num_tokens <= self.max_tokens,
-            "PLE: {num_tokens} tokens exceeds the {} this layer was sized for. \
-             Raise ATLAS_PLE_MAX_TOKENS (costs tokens*10240*14 bytes of \
-             scratch) or lower the prefill chunk size.",
-            self.max_tokens
+            "PLE: {num_tokens} tokens exceeds the {}-token forward width. \
+             Raise ATLAS_PLE_MAX_TOKENS (the scratch stays bounded by \
+             ATLAS_PLE_CHUNK — {} tokens here) or lower \
+             --max-num-batched-tokens.",
+            self.max_tokens,
+            self.scratch_tokens
         );
         let c = self.hc_mult * self.hidden;
         let heads = self.dims.ngram_heads();
@@ -302,6 +315,10 @@ impl PleLayer {
             self.reset(st, gpu, stream)?;
         }
 
+        // `flat` = this forward's row ids, `[token][head]` row-major. A
+        // prestaged step hashed its own in `prestage`; its slots already sit
+        // in `slots_dev`.
+        let mut flat: Vec<u64> = Vec::new();
         if let Some(table_va) = prestaged {
             // The host half already ran from `decode_prestage`, before graph
             // replay/capture: slots sit in `slots_dev`, history has advanced.
@@ -324,120 +341,148 @@ impl PleLayer {
             window.extend_from_slice(&tokens);
             let all = ple_ngram_ids(&self.dims, &window);
             let rows = &all[all.len() - num_tokens..];
-            let flat: Vec<u64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
-
-            self.gather(&flat, num_tokens, heads, gpu, stream)?;
+            flat = rows.iter().flat_map(|r| r.iter().copied()).collect();
 
             // Carry the last `context_len` tokens for the next step.
             let keep = self.dims.context_len();
             st.history = window[window.len() - keep..].to_vec();
         }
 
-        // Projections off the concatenated n-gram embedding.
-        //
-        // `dense_gemm_bf16_pipelined`, NOT `dense_gemm`: the ops wrapper and
-        // the kernel are a PAIR. `dense_gemm` launches grid
-        // [ceil(n,16), ceil(m,16)] block 16x16 for the scalar kernel, while
-        // the pipelined one wants [ceil(n,128), ceil(m,128)] block 256.
-        // Handing the pipelined kernel to the scalar launcher reads far out of
-        // bounds and produced NaN through the whole highway.
-        ops::dense_gemm_bf16_pipelined(
-            gpu,
-            self.gemm_k,
-            self.emb,
-            &self.key_proj,
-            self.key,
-            num_tokens as u32,
-            c as u32,
-            self.hidden as u32,
-            stream,
-        )
-        .context("PLE key_proj")?;
-        ops::dense_gemm_bf16_pipelined(
-            gpu,
-            self.gemm_k,
-            self.emb,
-            &self.value_proj,
-            self.value,
-            num_tokens as u32,
-            self.hidden as u32,
-            self.hidden as u32,
-            stream,
-        )
-        .context("PLE value_proj")?;
-
-        ops::ple_gate(
-            gpu,
-            self.gate_k,
-            highway,
-            self.key,
-            self.value,
-            self.norm_query.weight,
-            self.norm_key.weight,
-            self.norm_conv.weight,
-            self.gated,
-            self.gated_normed,
-            num_tokens as u32,
-            self.hidden as u32,
-            self.hc_mult as u32,
-            self.eps,
-            stream,
-        )?;
-        // The conv carry is the one piece of PLE state a speculative verify
-        // has to be able to rewind, so at verify widths the launch is split
-        // per row and each row's resulting carry is parked. At prefill widths
-        // that would be thousands of launches for a carry nothing rolls back,
-        // so the batched form stays and `verify_snap_rows` says "no snapshots".
+        // The pipeline runs in `scratch_tokens` spans — the bounded
+        // micro-batch discipline llama.cpp applies to its compute buffers —
+        // so a `max_tokens`-wide forward needs only `scratch_tokens`-wide
+        // scratch (~1.2 GB at the 8192-token default, not ~4.7 GB at a
+        // 32K --max-prefill-tokens). Every stage is per-token except the
+        // conv, whose carry lives in `st.conv` and threads across calls —
+        // the per-row verify path already relies on that composability.
+        // A span's NVMe fault-in also overlaps the previous span's kernels.
         let cb = self.conv_bytes();
-        if num_tokens < VERIFY_SNAP_SLOTS && verify_snapshots_enabled() {
-            gpu.copy_d2d_async(st.conv, st.verify_snaps, cb, stream)?;
-            for t in 0..num_tokens {
-                let row = t * c * 4; // [T, c] FP32
+        let mut base = 0;
+        while base < num_tokens {
+            let n = (num_tokens - base).min(self.scratch_tokens);
+            if prestaged.is_none() {
+                self.gather(
+                    &flat[base * heads..(base + n) * heads],
+                    n,
+                    heads,
+                    gpu,
+                    stream,
+                )?;
+            }
+
+            // Projections off the concatenated n-gram embedding.
+            //
+            // `dense_gemm_bf16_pipelined`, NOT `dense_gemm`: the ops wrapper and
+            // the kernel are a PAIR. `dense_gemm` launches grid
+            // [ceil(n,16), ceil(m,16)] block 16x16 for the scalar kernel, while
+            // the pipelined one wants [ceil(n,128), ceil(m,128)] block 256.
+            // Handing the pipelined kernel to the scalar launcher reads far out
+            // of bounds and produced NaN through the whole highway.
+            ops::dense_gemm_bf16_pipelined(
+                gpu,
+                self.gemm_k,
+                self.emb,
+                &self.key_proj,
+                self.key,
+                n as u32,
+                c as u32,
+                self.hidden as u32,
+                stream,
+            )
+            .context("PLE key_proj")?;
+            ops::dense_gemm_bf16_pipelined(
+                gpu,
+                self.gemm_k,
+                self.emb,
+                &self.value_proj,
+                self.value,
+                n as u32,
+                self.hidden as u32,
+                self.hidden as u32,
+                stream,
+            )
+            .context("PLE value_proj")?;
+
+            let hspan = highway.offset(base * c * 4);
+            ops::ple_gate(
+                gpu,
+                self.gate_k,
+                hspan,
+                self.key,
+                self.value,
+                self.norm_query.weight,
+                self.norm_key.weight,
+                self.norm_conv.weight,
+                self.gated,
+                self.gated_normed,
+                n as u32,
+                self.hidden as u32,
+                self.hc_mult as u32,
+                self.eps,
+                stream,
+            )?;
+            // The conv carry is the one piece of PLE state a speculative verify
+            // has to be able to rewind, so at verify widths the launch is split
+            // per row and each row's resulting carry is parked. At prefill widths
+            // that would be thousands of launches for a carry nothing rolls back,
+            // so the batched form stays and `verify_snap_rows` says "no snapshots".
+            // The check is on the WHOLE forward's width, not the span's: a
+            // verify never spans (scratch >= VERIFY_SNAP_SLOTS) and a spanning
+            // forward snapshots nothing — same as before.
+            if num_tokens < VERIFY_SNAP_SLOTS && verify_snapshots_enabled() {
+                gpu.copy_d2d_async(st.conv, st.verify_snaps, cb, stream)?;
+                for t in 0..n {
+                    let row = t * c * 4; // [T, c] FP32
+                    ops::ple_conv(
+                        gpu,
+                        self.conv_k,
+                        self.gated_normed.offset(row),
+                        self.gated.offset(row),
+                        self.conv1d.weight,
+                        st.conv,
+                        self.out.offset(row),
+                        1,
+                        c as u32,
+                        self.k_size as u32,
+                        self.dilation as u32,
+                        stream,
+                    )?;
+                    gpu.copy_d2d_async(st.conv, st.verify_snaps.offset((t + 1) * cb), cb, stream)?;
+                }
+                st.verify_snap_rows = num_tokens;
+            } else {
                 ops::ple_conv(
                     gpu,
                     self.conv_k,
-                    self.gated_normed.offset(row),
-                    self.gated.offset(row),
+                    self.gated_normed,
+                    self.gated,
                     self.conv1d.weight,
                     st.conv,
-                    self.out.offset(row),
-                    1,
+                    self.out,
+                    n as u32,
                     c as u32,
                     self.k_size as u32,
                     self.dilation as u32,
                     stream,
                 )?;
-                gpu.copy_d2d_async(st.conv, st.verify_snaps.offset((t + 1) * cb), cb, stream)?;
+                st.verify_snap_rows = 0;
             }
-            st.verify_snap_rows = num_tokens;
-        } else {
-            ops::ple_conv(
-                gpu,
-                self.conv_k,
-                self.gated_normed,
-                self.gated,
-                self.conv1d.weight,
-                st.conv,
-                self.out,
-                num_tokens as u32,
-                c as u32,
-                self.k_size as u32,
-                self.dilation as u32,
-                stream,
-            )?;
-            st.verify_snap_rows = 0;
+            ops::ple_add_highway(gpu, self.add_k, self.out, hspan, (n * c) as u32, stream)?;
+            base += n;
         }
-        ops::ple_add_highway(
-            gpu,
-            self.add_k,
-            self.out,
-            highway,
-            (num_tokens * c) as u32,
-            stream,
-        )?;
 
         Ok(())
     }
+}
+
+/// The scratch width: `scratch` clamped into `[min(VERIFY_SNAP_SLOTS,
+/// max_tokens), max_tokens]`. The floor is the verify contract — a
+/// verify-width forward must never split across spans, because the per-row
+/// conv snapshot path indexes the whole window. When `max_tokens` itself is
+/// below VERIFY_SNAP_SLOTS the floor relaxes to it, so every legal forward
+/// still fits in one span.
+pub(crate) fn bounded_scratch(scratch: usize, max_tokens: usize) -> usize {
+    scratch.clamp(VERIFY_SNAP_SLOTS.min(max_tokens), max_tokens)
 }
 
 /// The dense weights of one PLE site.
