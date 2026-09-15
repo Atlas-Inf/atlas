@@ -155,6 +155,12 @@ if [ "${DFLASH:-0}" = "1" ]; then
   SPEC_ARGS=()
   DFLASH_ARGS=(--dflash --draft-model "${DRAFT_MODEL:-incoai/Qwen3.8-27B-DFlash2}")
   [ -n "${DFLASH_GAMMA:-}" ] && DFLASH_ARGS+=(--dflash-gamma "$DFLASH_GAMMA")
+  # Default to the paged Option-B drafter path: the legacy propose
+  # re-projects every accumulated ctx slot each step (measured ~1.0 s/step
+  # propose at gamma=8 on gfx1151, dflash-h128-20260915T1546Z); Option B is
+  # incremental, and head_dim-aware sink kernels make its acceptance match
+  # legacy. ATLAS_DFLASH_OPTION_B=0 restores the legacy path.
+  export ATLAS_DFLASH_OPTION_B="${ATLAS_DFLASH_OPTION_B:-1}"
 fi
 # GPU_UTIL default: 0.88 plain / 0.80 under DFlash. The KV budget is computed
 # before the ~5 GB drafter (weights + KV pool + scratch) allocates, so at 0.88
