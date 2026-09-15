@@ -70,7 +70,7 @@ fn the_agentic_gate_declares_both_variants_in_this_tree() {
     assert_eq!(rows[0].checkpoint, "Qwen/Qwen3.6-35B-A3B-FP8");
     let dense = rows
         .iter()
-        .find(|r| r.checkpoint == "unsloth/Qwen3.8-27B-NVFP4")
+        .find(|r| r.checkpoint == "nvidia/Qwen3.8-27B-NVFP4")
         .expect("the dense variant is declared");
     assert!(!dense.is_default, "the required subject is unchanged");
     assert_eq!(

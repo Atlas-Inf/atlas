@@ -192,7 +192,7 @@ fn a_baseline_declared_serve_pin_reaches_the_rendered_serve_args_without_cli_fla
     let baseline = gate::read_baseline(&root, "concurrency-sweep").expect("baseline assembles");
     let resolved = crate::cli::bench_resolve::resolve(&baseline, "concurrency-sweep", None, None)
         .expect("the default variant resolves");
-    assert_eq!(resolved.recipe_id, "qwen3.8/qwen3.8-27b-nvfp4-unsloth");
+    assert_eq!(resolved.recipe_id, "qwen3.8/qwen3.8-27b-nvfp4-agentic");
 
     // No CLI overrides — the whole point of the repro.
     let merged =
