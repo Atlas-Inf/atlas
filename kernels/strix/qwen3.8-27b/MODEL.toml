@@ -187,3 +187,5 @@ hidden_size = 5120
 # out-of-distribution — a mismatched drafter degrades to near-zero acceptance
 # and can only slow decode. Add a [dflash] section when a 3.8-trained drafter
 # exists. Speculative decode on this target rides the native MTP head above.
+# (DFlash2 is wired on the strix-hip kernel tree only — this SCALE tree has
+# no DFlash kernels.)

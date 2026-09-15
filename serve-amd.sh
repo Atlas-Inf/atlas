@@ -5,6 +5,12 @@
 #   ./serve-amd.sh                                  # nvidia/Qwen3.8-27B-NVFP4 (default)
 #   ./serve-amd.sh unsloth/Qwen3.8-27B-NVFP4        # or any local snapshot path
 #   PORT=9000 MAX_SEQ_LEN=32768 ./serve-amd.sh
+#   DFLASH=1 DRAFT_MODEL=/path/to/dflash2 ./serve-amd.sh   # DFlash2 spec decode
+#
+# DFLASH=1 swaps MTP for the DFlash2 drafter: it appends --dflash
+# --draft-model (DRAFT_MODEL, default incoai/Qwen3.8-27B-DFlash2) and forces
+# the MTP --speculative args off — DFlash and MTP are mutually exclusive on
+# this recipe. DFLASH_GAMMA overrides the MODEL.toml gamma when set.
 #
 # A binary built with ATLAS_TARGET_MODEL='*' (build-amd.sh's default) carries
 # every strix kernel target, and resolution picks the right one from the
@@ -140,6 +146,14 @@ SPEC_ARGS=()
 if [ "${NUM_DRAFTS:-3}" -gt 0 ]; then
   SPEC_ARGS=(--speculative --num-drafts "${NUM_DRAFTS:-3}")
 fi
+# DFlash and MTP --speculative are mutually exclusive on this recipe:
+# DFLASH=1 wins and forces the MTP args off.
+DFLASH_ARGS=()
+if [ "${DFLASH:-0}" = "1" ]; then
+  SPEC_ARGS=()
+  DFLASH_ARGS=(--dflash --draft-model "${DRAFT_MODEL:-incoai/Qwen3.8-27B-DFlash2}")
+  [ -n "${DFLASH_GAMMA:-}" ] && DFLASH_ARGS+=(--dflash-gamma "$DFLASH_GAMMA")
+fi
 
 GFX=$("$ROCM_HOME/bin/rocminfo" 2>/dev/null | sed -n 's/.*\(gfx[0-9][0-9]*\).*/\1/p' | head -1)
 echo "serving $MODEL on ${GFX:-AMD} via $HW"
@@ -159,7 +173,7 @@ exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-nvfp4}" --max-batch-size "${MAX_BATCH:-1}" \
-  "${SPEC_ARGS[@]}" \
+  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" \
   --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval 16 \
   $ALLOW_FALLBACKS \
   "$@"
