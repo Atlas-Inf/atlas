@@ -430,6 +430,20 @@ impl GpuBackend for AtlasCudaBackend {
     fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, stream: u64) -> Result<()> {
         self.memset_async_cu(ptr, value, bytes, stream)
     }
+    fn memset_2d_async(
+        &self,
+        dst: DevicePtr,
+        pitch: usize,
+        value: u8,
+        width: usize,
+        height: usize,
+        stream: u64,
+    ) -> Result<()> {
+        self.memset_2d_async_cu(dst, pitch, value, width, height, stream)
+    }
+    fn memset_32_async(&self, dst: DevicePtr, value: u32, n: usize, stream: u64) -> Result<()> {
+        self.memset_32_async_cu(dst, value, n, stream)
+    }
     fn total_memory(&self) -> Result<usize> {
         self.total_memory_cu()
     }

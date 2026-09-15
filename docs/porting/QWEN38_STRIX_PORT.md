@@ -151,6 +151,22 @@ and inherits neither 3.6's floors nor the MLPerf floor.
 
 ### BFCL: the leg ran, and it found a correctness bug rather than a score
 
+> **Superseded 2026-09-13.** On the fp8d tree (`8eedc21cb`, ROCm 10.0.0,
+> Windows 11, gfx1151) serving `nvidia/Qwen3.8-27B-NVFP4`, the full pinned
+> ST-995 draw (n=995, seed 42, temp 0, no overrides) completed cleanly —
+> **overall 83.32 / normalized 78.70**
+> (`~/.atlas/runs/bfcl-subset/run-1789300938267487600.json`; the staged scorer
+> crashed reading `responses.jsonl` under the cp1252 locale and was re-run
+> under `PYTHONUTF8=1`, which is now fixed in-tree). The AST checker scored
+> real tool calls, so the tool path works on this tree with this checkpoint.
+> Several variables changed against the `!!!!!!` reproduction below —
+> checkpoint (unsloth→nvidia), kernel set (fp8d additions), ROCm 6.4→10, and
+> the serve recipe — so *which* change closed it is not recorded; re-running
+> the two-request probe on the unsloth checkpoint under this tree is the
+> one-command attribution. 87 unresolved kernel lookups remain at boot
+> (was 94 here); each silently binds to handle 0. The rest of this section
+> describes the state at the commit it was written, kept for the record.
+
 `bfcl-subset` at a reduced draw (`non_live_pct=4 live_pct=1 hallucination_pct=1
 subset_floor=2`, n=70 across 12 subsets) completed all 70 samples on **both**
 platforms — 1020 s on Linux, 2528 s on Windows. The harness itself flags the

@@ -304,55 +304,40 @@ impl BufferArena {
     /// This reduces per-chunk memset from 17 calls to 2, saving ~15 memset
     /// launches × bandwidth on the LPDDR5X bus per prefill chunk.
     pub fn zero_prefill_essentials(&self, gpu: &dyn GpuBackend, stream: u64) -> anyhow::Result<()> {
-        gpu.memset_async(self.hidden_states, 0, self.sizes.hidden_states, stream)?;
-        gpu.memset_async(self.residual, 0, self.sizes.residual, stream)?;
+        gpu.memset_zero_async(self.hidden_states, self.sizes.hidden_states, stream)?;
+        gpu.memset_zero_async(self.residual, self.sizes.residual, stream)?;
         // MoE buffers: gate_logits may carry stale expert indices from a prior
         // request with different token count, causing out-of-bounds expert access
         // (CUDA error 700 at layer 38+ on 122B). Zero to prevent.
-        gpu.memset_async(self.gate_logits, 0, self.sizes.gate_logits, stream)?;
-        gpu.memset_async(self.expert_gate_out, 0, self.sizes.expert_gate_out, stream)?;
-        gpu.memset_async(self.expert_up_out, 0, self.sizes.expert_up_out, stream)?;
-        gpu.memset_async(self.expert_down_out, 0, self.sizes.expert_down_out, stream)?;
-        gpu.memset_async(self.moe_output, 0, self.sizes.moe_output, stream)?;
+        gpu.memset_zero_async(self.gate_logits, self.sizes.gate_logits, stream)?;
+        gpu.memset_zero_async(self.expert_gate_out, self.sizes.expert_gate_out, stream)?;
+        gpu.memset_zero_async(self.expert_up_out, self.sizes.expert_up_out, stream)?;
+        gpu.memset_zero_async(self.expert_down_out, self.sizes.expert_down_out, stream)?;
+        gpu.memset_zero_async(self.moe_output, self.sizes.moe_output, stream)?;
         Ok(())
     }
 
     /// Zero all reusable buffers to eliminate stale data between requests.
     /// Ensures deterministic computation regardless of request history.
     pub fn zero_all(&self, gpu: &dyn GpuBackend, stream: u64) -> anyhow::Result<()> {
-        gpu.memset_async(self.hidden_states, 0, self.sizes.hidden_states, stream)?;
-        gpu.memset_async(self.residual, 0, self.sizes.residual, stream)?;
-        gpu.memset_async(self.norm_output, 0, self.sizes.norm_output, stream)?;
-        gpu.memset_async(self.qkv_output, 0, self.sizes.qkv_output, stream)?;
-        gpu.memset_async(self.attn_output, 0, self.sizes.attn_output, stream)?;
-        gpu.memset_async(self.gate_logits, 0, self.sizes.gate_logits, stream)?;
-        gpu.memset_async(self.moe_output, 0, self.sizes.moe_output, stream)?;
-        gpu.memset_async(self.ssm_qkvz, 0, self.sizes.ssm_qkvz, stream)?;
-        gpu.memset_async(self.ssm_ba, 0, self.sizes.ssm_ba, stream)?;
-        gpu.memset_async(
-            self.ssm_deinterleaved,
-            0,
-            self.sizes.ssm_deinterleaved,
-            stream,
-        )?;
-        gpu.memset_async(self.ssm_gates, 0, self.sizes.ssm_gates, stream)?;
-        gpu.memset_async(
-            self.ssm_conv_out_f32,
-            0,
-            self.sizes.ssm_conv_out_f32,
-            stream,
-        )?;
-        gpu.memset_async(
-            self.splitk_workspace,
-            0,
-            self.sizes.splitk_workspace,
-            stream,
-        )?;
-        gpu.memset_async(self.expert_gate_out, 0, self.sizes.expert_gate_out, stream)?;
-        gpu.memset_async(self.expert_up_out, 0, self.sizes.expert_up_out, stream)?;
-        gpu.memset_async(self.expert_down_out, 0, self.sizes.expert_down_out, stream)?;
-        gpu.memset_async(self.logits, 0, self.sizes.logits, stream)?;
-        gpu.memset_async(self.scratch, 0, self.sizes.scratch, stream)?;
+        gpu.memset_zero_async(self.hidden_states, self.sizes.hidden_states, stream)?;
+        gpu.memset_zero_async(self.residual, self.sizes.residual, stream)?;
+        gpu.memset_zero_async(self.norm_output, self.sizes.norm_output, stream)?;
+        gpu.memset_zero_async(self.qkv_output, self.sizes.qkv_output, stream)?;
+        gpu.memset_zero_async(self.attn_output, self.sizes.attn_output, stream)?;
+        gpu.memset_zero_async(self.gate_logits, self.sizes.gate_logits, stream)?;
+        gpu.memset_zero_async(self.moe_output, self.sizes.moe_output, stream)?;
+        gpu.memset_zero_async(self.ssm_qkvz, self.sizes.ssm_qkvz, stream)?;
+        gpu.memset_zero_async(self.ssm_ba, self.sizes.ssm_ba, stream)?;
+        gpu.memset_zero_async(self.ssm_deinterleaved, self.sizes.ssm_deinterleaved, stream)?;
+        gpu.memset_zero_async(self.ssm_gates, self.sizes.ssm_gates, stream)?;
+        gpu.memset_zero_async(self.ssm_conv_out_f32, self.sizes.ssm_conv_out_f32, stream)?;
+        gpu.memset_zero_async(self.splitk_workspace, self.sizes.splitk_workspace, stream)?;
+        gpu.memset_zero_async(self.expert_gate_out, self.sizes.expert_gate_out, stream)?;
+        gpu.memset_zero_async(self.expert_up_out, self.sizes.expert_up_out, stream)?;
+        gpu.memset_zero_async(self.expert_down_out, self.sizes.expert_down_out, stream)?;
+        gpu.memset_zero_async(self.logits, self.sizes.logits, stream)?;
+        gpu.memset_zero_async(self.scratch, self.sizes.scratch, stream)?;
         Ok(())
     }
 }

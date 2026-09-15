@@ -74,6 +74,15 @@ __device__ __constant__ float E2M1_LUT[16] = {
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
+// Packed bf16 pair store (HIP has no __floats2bfloat162_rn; __nv_bfloat16 is
+// a 2-byte POD, so a union pun is portable across the CUDA/HIP headers).
+__device__ __forceinline__ void store_bf16_pair(__nv_bfloat16* dst, float lo, float hi) {
+    union { unsigned int u; __nv_bfloat16 h[2]; } p;
+    p.h[0] = __float2bfloat16(lo);
+    p.h[1] = __float2bfloat16(hi);
+    *(unsigned int*)dst = p.u;
+}
+
 // ── Synchronous 16-byte smem copy (cp.async replacement) ────────────
 // Copies 16 bytes gmem→smem when pred, else zero-fills, to preserve the
 // predicated cp.async.16 semantics (out-of-bounds rows became zero).
@@ -202,108 +211,102 @@ extern "C" __global__ void w4a16_gemm_t(
     const unsigned int warp_m_offset = warp_id * 16;
 
     __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_T + PAD_T];
-    __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
-    __shared__ unsigned char smem_Bs[2][K_STEP_T / GROUP_SIZE][N_TILE_LG + BP_PAD];
-    __shared__ __nv_bfloat16 smem_B_bf16[N_TILE_LG][K_STEP_T];
+    __shared__ __nv_bfloat16 smem_B_bf16[2][N_TILE_LG][K_STEP_T + 8];
     __shared__ float smem_LUT[16];
 
     if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
 
     v8f acc[8];
     #pragma unroll
     for (int i = 0; i < 8; i++) acc[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
 
+    // Register prefetch (same gfx1151 recipe as w4a16_gemm_t_m128): the next
+    // tile's global reads stage in VGPRs across the current WMMA, packed B is
+    // dequanted straight from registers into a double-buffered smem_B_bf16,
+    // and the loop carries ONE __syncthreads per K-step.
+    //   A: 64 rows x 32 cols bf16 -> 2x uint4 (thread covers half a row).
+    //   B packed: 16 rows x 128 cols -> 1x uint4 (16 cols of packed row b_kp).
+    //   B scale: 16 cols of group row b_kp>>3 -> 1x uint4.
+    const unsigned int a_row = threadIdx.x >> 1;            // 0..63
+    const unsigned int a_col = (threadIdx.x & 1) << 4;      // 0 or 16
+    const unsigned int b_kp  = threadIdx.x >> 3;            // 0..15
+    const unsigned int b_ns  = (threadIdx.x & 7) << 4;      // 0..112
 
-    #define ISSUE_LOADS(buf, kb) do { \
-        { \
-            unsigned int a_row_base = threadIdx.x >> 2; \
-            unsigned int a_col = (threadIdx.x & 3) << 3; \
-            unsigned int gc = (kb) + a_col; \
-            _Pragma("unroll") \
-            for (int rnd = 0; rnd < 2; rnd++) { \
-                unsigned int row = rnd * 32 + a_row_base; \
-                unsigned int gr = cta_m + row; \
-                sync_copy_16(&smem_A[(buf)][row][a_col], \
-                    &A[gr * K + gc], (gr < M) && (gc + 7 < K)); \
-            } \
+    #define T_LOAD_REGS(kb, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int h = 0; h < 2; h++) { \
+            unsigned int gr = cta_m + a_row; \
+            unsigned int gc = (kb) + a_col + h * 8; \
+            (ra)[h] = ((gr < M) && (gc + 7 < K)) \
+                ? *(const uint4*)&A[(unsigned long long)gr * K + gc] \
+                : uint4{0, 0, 0, 0}; \
         } \
         { \
-            unsigned int kp = threadIdx.x >> 3; \
-            unsigned int ns = (threadIdx.x & 7) << 4; \
-            unsigned int gke = (kb) + (kp << 1); \
-            unsigned int gns = cta_n + ns; \
-            sync_copy_16(&smem_Bp[(buf)][kp][ns], \
-                &B_packed[(unsigned long long)(gke >> 1) * LDB + gns], \
-                (gke + 1 <= K) && (gns + 15 < LDB)); \
-            if (kp < K_STEP_T / GROUP_SIZE) { \
-                unsigned int sg = (kb) / GROUP_SIZE + kp; \
-                sync_copy_16(&smem_Bs[(buf)][kp][ns], \
-                    &B_scale[(unsigned long long)sg * LDB + gns], \
-                    (gns + 15 < LDB)); \
-            } \
+            unsigned int gke = (kb) + (b_kp << 1); \
+            unsigned int gns = cta_n + b_ns; \
+            (rb) = ((gke + 1 <= K) && (gns + 15 < LDB)) \
+                ? *(const uint4*)&B_packed[(unsigned long long)(gke >> 1) * LDB + gns] \
+                : uint4{0, 0, 0, 0}; \
+            unsigned int sg = (kb) / GROUP_SIZE + (b_kp >> 3); \
+            (rs) = (gns + 15 < LDB) \
+                ? *(const uint4*)&B_scale[(unsigned long long)sg * LDB + gns] \
+                : uint4{0, 0, 0, 0}; \
         } \
     } while(0)
 
-    // Dequant B: NVFP4 -> BF16 directly into smem_B_bf16[n][k].
-    #define DEQUANT_T(buf) do { \
-        unsigned int my_n = threadIdx.x; \
-        unsigned char sb0 = smem_Bs[(buf)][0][my_n]; \
-        unsigned char sb1 = smem_Bs[(buf)][1][my_n]; \
-        float sv0 = scl_fp8(sb0) * scale2, sv1 = scl_fp8(sb1) * scale2; \
+    #define T_STORE_TILE(buf, ra, rb, rs) do { \
         _Pragma("unroll") \
-        for (int kp = 0; kp < 8; kp++) { \
-            unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
-            smem_B_bf16[my_n][kp * 2]     = __float2bfloat16(smem_LUT[packed & 0xF] * sv0); \
-            smem_B_bf16[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT[packed >> 4] * sv0); \
-        } \
-        _Pragma("unroll") \
-        for (int kp = 8; kp < 16; kp++) { \
-            unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
-            smem_B_bf16[my_n][kp * 2]     = __float2bfloat16(smem_LUT[packed & 0xF] * sv1); \
-            smem_B_bf16[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT[packed >> 4] * sv1); \
+        for (int h = 0; h < 2; h++) \
+            *(uint4*)&smem_A[(buf)][a_row][a_col + h * 8] = (ra)[h]; \
+        { \
+            const unsigned char* pk = (const unsigned char*)&(rb); \
+            const unsigned char* sc = (const unsigned char*)&(rs); \
+            _Pragma("unroll") \
+            for (int i = 0; i < 16; i++) { \
+                unsigned char packed = pk[i]; \
+                float sv = scl_fp8(sc[i]) * scale2; \
+                store_bf16_pair(&smem_B_bf16[(buf)][b_ns + i][b_kp * 2], \
+                    smem_LUT[packed & 0xF] * sv, \
+                    smem_LUT[packed >> 4]  * sv); \
+            } \
         } \
     } while(0)
 
     // BF16 WMMA: 2× K=16 over the 32-wide K step. 8 n-sub-tiles (128 N).
-    // smem_A[buf] is [M_TILE][K_STEP_T+PAD_T]; smem_B_bf16 is [N][K_STEP_T].
-    #define COMPUTE_MMA(a_buf) do { \
+    #define COMPUTE_MMA(a_buf, b_buf) do { \
         _Pragma("unroll") \
         for (int h = 0; h < 2; h++) { \
             v16bf a; \
-            _Pragma("unroll") \
-            for (int i = 0; i < 16; i++) \
-                a[i] = (__bf16)(float)smem_A[(a_buf)][warp_m_offset + (lane_id & 15)][h * 16 + i]; \
+                        memcpy(&a, &smem_A[(a_buf)][warp_m_offset + (lane_id & 15)][h * 16], 32); \
             _Pragma("unroll") \
             for (int nb = 0; nb < 8; nb++) { \
                 unsigned int nc = nb * 16 + (lane_id & 15); \
                 v16bf b; \
-                _Pragma("unroll") \
-                for (int k = 0; k < 16; k++) \
-                    b[k] = (__bf16)(float)smem_B_bf16[nc][h * 16 + k]; \
+                                memcpy(&b, &smem_B_bf16[(b_buf)][nc][h * 16], 32); \
                 acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]); \
             } \
         } \
     } while(0)
 
-    ISSUE_LOADS(0, 0);
-    __syncthreads();
-    DEQUANT_T(0);
+    uint4 reg_A[2], reg_Bp, reg_Bs;
+    T_LOAD_REGS(0, reg_A, reg_Bp, reg_Bs);
+    T_STORE_TILE(0, reg_A, reg_Bp, reg_Bs);
     __syncthreads();
 
     int cur = 0;
     for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
         int nxt = 1 - cur;
-        ISSUE_LOADS(nxt, k_base);
-        COMPUTE_MMA(cur);
-        __syncthreads();
-        DEQUANT_T(nxt);
+        T_LOAD_REGS(k_base, reg_A, reg_Bp, reg_Bs);
+        COMPUTE_MMA(cur, cur);
+        T_STORE_TILE(nxt, reg_A, reg_Bp, reg_Bs);
         __syncthreads();
         cur = nxt;
     }
-    COMPUTE_MMA(cur);
+    COMPUTE_MMA(cur, cur);
 
-    #undef ISSUE_LOADS
-    #undef DEQUANT_T
+    #undef T_LOAD_REGS
+    #undef T_STORE_TILE
     #undef COMPUTE_MMA
 
     #pragma unroll
@@ -371,9 +374,7 @@ extern "C" __global__ void fp8_gemm_t(
         _Pragma("unroll") \
         for (int h = 0; h < 2; h++) { \
             v16bf a; \
-            _Pragma("unroll") \
-            for (int i = 0; i < 16; i++) \
-                a[i] = (__bf16)(float)smem_A[(a_buf)][warp_m_offset + (lane_id & 15)][h * 16 + i]; \
+                        memcpy(&a, &smem_A[(a_buf)][warp_m_offset + (lane_id & 15)][h * 16], 32); \
             _Pragma("unroll") \
             for (int nb = 0; nb < 8; nb++) { \
                 unsigned int nc = nb * 16 + (lane_id & 15); \
@@ -582,126 +583,108 @@ extern "C" __global__ void w4a16_gemm_t_k64(
     const unsigned int warp_m_offset = warp_id * 16;
 
     __shared__ __nv_bfloat16 smem_A_k64[2][M_TILE][K_STEP_T64 + PAD_T64];
-    __shared__ unsigned char smem_Bp_k64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
-    __shared__ unsigned char smem_Bs_k64[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
-    __shared__ __nv_bfloat16 smem_B_bf16_k64[N_TILE_LG][K_STEP_T64];
+    __shared__ __nv_bfloat16 smem_B_bf16_k64[2][N_TILE_LG][K_STEP_T64 + 8];
     __shared__ float smem_LUT_k64[16];
 
     if (threadIdx.x < 16) smem_LUT_k64[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
 
     v8f acc[8];
     #pragma unroll
     for (int i = 0; i < 8; i++) acc[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
 
+    // Register prefetch (gfx1151 pipeline, same recipe as m128): each of 128
+    // threads stages the next K_STEP_T64=64 tile in VGPRs while WMMA runs on
+    // the current smem buffers, then commits regs->smem with the packed-B
+    // dequant folded in (packed B never round-trips through smem; one
+    // __syncthreads per K-step instead of two).
+    //   A: 64 rows x 64 cols bf16 -> 4x uint4 (thread covers half a row).
+    //   B packed: 32 packed-rows x 128 cols -> 2x uint4 (thread covers
+    //      packed-row b_kp = tid>>2, 32 cols at b_ns = (tid&3)*32).
+    //   B scale: 32 cols of group row b_kp>>3 -> 2x uint4.
+    const unsigned int a_row     = threadIdx.x >> 1;            // 0..63
+    const unsigned int a_col     = (threadIdx.x & 1) << 5;      // 0 or 32
+    const unsigned int b_kp      = threadIdx.x >> 2;            // 0..31
+    const unsigned int b_ns      = (threadIdx.x & 3) << 5;      // 0,32,64,96
 
-    #define K64_ISSUE_LOADS(buf, kb) do { \
-        { \
-            unsigned int a_row_base = threadIdx.x >> 3; \
-            unsigned int a_col = (threadIdx.x & 7) << 3; \
-            unsigned int gc = (kb) + a_col; \
-            _Pragma("unroll") \
-            for (int rnd = 0; rnd < 4; rnd++) { \
-                unsigned int row = rnd * 16 + a_row_base; \
-                unsigned int gr = cta_m + row; \
-                sync_copy_16(&smem_A_k64[(buf)][row][a_col], \
-                    &A[(unsigned long long)gr * K + gc], \
-                    (gr < M) && (gc + 7 < K)); \
-            } \
+    #define K64_LOAD_REGS(kb, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int rnd = 0; rnd < 4; rnd++) { \
+            unsigned int gr = cta_m + a_row; \
+            unsigned int gc = (kb) + a_col + rnd * 8; \
+            (ra)[rnd] = ((gr < M) && (gc + 7 < K)) \
+                ? *(const uint4*)&A[(unsigned long long)gr * K + gc] \
+                : uint4{0, 0, 0, 0}; \
         } \
         { \
-            unsigned int kp = threadIdx.x >> 3; \
-            unsigned int ns = (threadIdx.x & 7) << 4; \
-            unsigned int gns = cta_n + ns; \
+            unsigned int gns = cta_n + b_ns; \
+            unsigned int gke = (kb) + (b_kp << 1); \
+            unsigned int sg  = (kb) / GROUP_SIZE + (b_kp >> 3); \
             _Pragma("unroll") \
-            for (int rnd = 0; rnd < 2; rnd++) { \
-                unsigned int kp_cur = rnd * 16 + kp; \
-                unsigned int gke = (kb) + (kp_cur << 1); \
-                sync_copy_16(&smem_Bp_k64[(buf)][kp_cur][ns], \
-                    &B_packed[(unsigned long long)(gke >> 1) * N + gns], \
-                    (gke + 1 <= K) && (gns + 15 < N)); \
-                if (kp_cur < K_STEP_T64 / GROUP_SIZE) { \
-                    unsigned int sg = (kb) / GROUP_SIZE + kp_cur; \
-                    sync_copy_16(&smem_Bs_k64[(buf)][kp_cur][ns], \
-                        &B_scale[(unsigned long long)sg * N + gns], \
-                        (gns + 15 < N)); \
-                } \
+            for (int half = 0; half < 2; half++) { \
+                (rb)[half] = ((gke + 1 <= K) && (gns + half * 16 + 15 < N)) \
+                    ? *(const uint4*)&B_packed[(unsigned long long)(gke >> 1) * N + gns + half * 16] \
+                    : uint4{0, 0, 0, 0}; \
+                (rs)[half] = (gns + half * 16 + 15 < N) \
+                    ? *(const uint4*)&B_scale[(unsigned long long)sg * N + gns + half * 16] \
+                    : uint4{0, 0, 0, 0}; \
             } \
         } \
     } while(0)
 
-    // 4 scale groups, 32 dequant iters: sv0→K{0..15}, sv1→K{16..31},
-    // sv2→K{32..47}, sv3→K{48..63}. Dequant directly to BF16.
-    #define K64_DEQUANT(buf) do { \
-        unsigned int my_n = threadIdx.x; \
-        float sv0 = scl_fp8(smem_Bs_k64[(buf)][0][my_n]) * scale2; \
-        float sv1 = scl_fp8(smem_Bs_k64[(buf)][1][my_n]) * scale2; \
-        float sv2 = scl_fp8(smem_Bs_k64[(buf)][2][my_n]) * scale2; \
-        float sv3 = scl_fp8(smem_Bs_k64[(buf)][3][my_n]) * scale2; \
+    #define K64_STORE_TILE(buf, ra, rb, rs) do { \
         _Pragma("unroll") \
-        for (int kp = 0; kp < 8; kp++) { \
-            unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
-            smem_B_bf16_k64[my_n][kp * 2]     = __float2bfloat16(smem_LUT_k64[packed & 0xF] * sv0); \
-            smem_B_bf16_k64[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT_k64[packed >> 4] * sv0); \
-        } \
+        for (int rnd = 0; rnd < 4; rnd++) \
+            *(uint4*)&smem_A_k64[(buf)][a_row][a_col + rnd * 8] = (ra)[rnd]; \
         _Pragma("unroll") \
-        for (int kp = 8; kp < 16; kp++) { \
-            unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
-            smem_B_bf16_k64[my_n][kp * 2]     = __float2bfloat16(smem_LUT_k64[packed & 0xF] * sv1); \
-            smem_B_bf16_k64[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT_k64[packed >> 4] * sv1); \
-        } \
-        _Pragma("unroll") \
-        for (int kp = 16; kp < 24; kp++) { \
-            unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
-            smem_B_bf16_k64[my_n][kp * 2]     = __float2bfloat16(smem_LUT_k64[packed & 0xF] * sv2); \
-            smem_B_bf16_k64[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT_k64[packed >> 4] * sv2); \
-        } \
-        _Pragma("unroll") \
-        for (int kp = 24; kp < 32; kp++) { \
-            unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
-            smem_B_bf16_k64[my_n][kp * 2]     = __float2bfloat16(smem_LUT_k64[packed & 0xF] * sv3); \
-            smem_B_bf16_k64[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT_k64[packed >> 4] * sv3); \
+        for (int half = 0; half < 2; half++) { \
+            const unsigned char* pk = (const unsigned char*)&(rb)[half]; \
+            const unsigned char* sc = (const unsigned char*)&(rs)[half]; \
+            _Pragma("unroll") \
+            for (int i = 0; i < 16; i++) { \
+                unsigned char packed = pk[i]; \
+                float sv = scl_fp8(sc[i]) * scale2; \
+                store_bf16_pair(&smem_B_bf16_k64[(buf)][b_ns + half * 16 + i][b_kp * 2], \
+                    smem_LUT_k64[packed & 0xF] * sv, \
+                    smem_LUT_k64[packed >> 4]  * sv); \
+            } \
         } \
     } while(0)
 
     // 4 WMMA K=16 ops (K=0..15,16..31,32..47,48..63) × 8 n-sub-tiles.
-    #define K64_COMPUTE_MMA(a_buf) do { \
+    #define K64_COMPUTE_MMA(a_buf, b_buf) do { \
         _Pragma("unroll") \
         for (int h = 0; h < 4; h++) { \
             v16bf a; \
-            _Pragma("unroll") \
-            for (int i = 0; i < 16; i++) \
-                a[i] = (__bf16)(float)smem_A_k64[(a_buf)][warp_m_offset + (lane_id & 15)][h * 16 + i]; \
+                        memcpy(&a, &smem_A_k64[(a_buf)][warp_m_offset + (lane_id & 15)][h * 16], 32); \
             _Pragma("unroll") \
             for (int nb = 0; nb < 8; nb++) { \
                 unsigned int nc = nb * 16 + (lane_id & 15); \
                 v16bf b; \
-                _Pragma("unroll") \
-                for (int k = 0; k < 16; k++) \
-                    b[k] = (__bf16)(float)smem_B_bf16_k64[nc][h * 16 + k]; \
+                                memcpy(&b, &smem_B_bf16_k64[(b_buf)][nc][h * 16], 32); \
                 acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]); \
             } \
         } \
     } while(0)
 
-    K64_ISSUE_LOADS(0, 0);
-    __syncthreads();
-    K64_DEQUANT(0);
+    uint4 reg_A[4], reg_Bp[2], reg_Bs[2];
+    K64_LOAD_REGS(0, reg_A, reg_Bp, reg_Bs);
+    K64_STORE_TILE(0, reg_A, reg_Bp, reg_Bs);
     __syncthreads();
 
     int cur = 0;
     for (unsigned int k_base = K_STEP_T64; k_base < K; k_base += K_STEP_T64) {
         int nxt = 1 - cur;
-        K64_ISSUE_LOADS(nxt, k_base);
-        K64_COMPUTE_MMA(cur);
-        __syncthreads();
-        K64_DEQUANT(nxt);
+        K64_LOAD_REGS(k_base, reg_A, reg_Bp, reg_Bs);
+        K64_COMPUTE_MMA(cur, cur);
+        K64_STORE_TILE(nxt, reg_A, reg_Bp, reg_Bs);
         __syncthreads();
         cur = nxt;
     }
-    K64_COMPUTE_MMA(cur);
+    K64_COMPUTE_MMA(cur, cur);
 
-    #undef K64_ISSUE_LOADS
-    #undef K64_DEQUANT
+    #undef K64_LOAD_REGS
+    #undef K64_STORE_TILE
     #undef K64_COMPUTE_MMA
 
     #pragma unroll
@@ -719,6 +702,13 @@ extern "C" __global__ void w4a16_gemm_t_k64(
 // ═══════════════════════════════════════════════════════════════════
 // w4a16_gemm_t_m128: 2 consecutive 64-row M-chunks per CTA. NVFP4→BF16.
 // Two accumulator sets (acc0/acc1), each 8 WMMA n-sub-tiles.
+//
+// gfx1151 pipeline (no cp.async): next-tile global reads are staged in
+// VGPRs across the current tile's WMMA (register prefetch), the packed-B
+// dequant reads the REGISTERS directly (packed B never round-trips through
+// smem), and the loop body carries ONE __syncthreads instead of two. The
+// smem_B_bf16 staging buffer is double-buffered so the post-WMMA dequant
+// writes the NEXT tile while the current one is being read.
 // ═══════════════════════════════════════════════════════════════════
 extern "C" __global__
 __launch_bounds__(128, 3)
@@ -739,12 +729,11 @@ void w4a16_gemm_t_m128(
     const unsigned int warp_m_offset = warp_id * 16;
 
     __shared__ __nv_bfloat16 smem_A[2][2 * M_TILE][K_STEP_T + PAD_T];
-    __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
-    __shared__ unsigned char smem_Bs[2][K_STEP_T / GROUP_SIZE][N_TILE_LG + BP_PAD];
-    __shared__ __nv_bfloat16 smem_B_bf16[N_TILE_LG][K_STEP_T];
+    __shared__ __nv_bfloat16 smem_B_bf16[2][N_TILE_LG][K_STEP_T + 8];
     __shared__ float smem_LUT[16];
 
     if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
 
     v8f acc0[8], acc1[8];
     #pragma unroll
@@ -753,58 +742,67 @@ void w4a16_gemm_t_m128(
         acc1[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
     }
 
+    // Per-thread register prefetch state for one K_STEP_T=32 tile:
+    //   A: 128 rows x 32 cols bf16, 128 threads -> 4x uint4 (each covers
+    //      one 8-col slice of a row).
+    //   B packed: 16 packed-rows x 128 cols bytes -> 1x uint4 (16 cols of
+    //      one packed row, i.e. K-pairs 2kp,2kp+1).
+    //   B scale:  group row sg = kp/8 (2 scale groups per tile) for the
+    //      thread's 16 columns — 1x uint4 of scale bytes.
+    const unsigned int a_row_base = threadIdx.x >> 2;          // 0..31
+    const unsigned int a_col      = (threadIdx.x & 3) << 3;    // 0,8,16,24
+    const unsigned int b_kp       = threadIdx.x >> 3;          // 0..15
+    const unsigned int b_ns       = (threadIdx.x & 7) << 4;    // 0..112
 
-    #define M128_LOADS(buf, kb) do { \
-        { \
-            unsigned int a_row_base = threadIdx.x >> 2; \
-            unsigned int a_col      = (threadIdx.x & 3) << 3; \
-            unsigned int gc = (kb) + a_col; \
-            _Pragma("unroll") \
-            for (int rnd = 0; rnd < 4; rnd++) { \
-                unsigned int row = (unsigned int)(rnd * 32) + a_row_base; \
-                unsigned int gr  = cta_m + row; \
-                sync_copy_16(&smem_A[(buf)][row][a_col], \
-                    &A[(unsigned long long)gr * K + gc], \
-                    (gr < M) && (gc + 7 < K)); \
-            } \
+    #define M128_LOAD_REGS(kb, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int rnd = 0; rnd < 4; rnd++) { \
+            unsigned int row = (unsigned int)(rnd * 32) + a_row_base; \
+            unsigned int gr  = cta_m + row; \
+            unsigned int gc  = (kb) + a_col; \
+            (ra)[rnd] = ((gr < M) && (gc + 7 < K)) \
+                ? *(const uint4*)&A[(unsigned long long)gr * K + gc] \
+                : uint4{0, 0, 0, 0}; \
         } \
         { \
-            unsigned int kp  = threadIdx.x >> 3; \
-            unsigned int ns  = (threadIdx.x & 7) << 4; \
-            unsigned int gke = (kb) + (kp << 1); \
-            unsigned int gns = cta_n + ns; \
-            sync_copy_16(&smem_Bp[(buf)][kp][ns], \
-                &B_packed[(unsigned long long)(gke >> 1) * N + gns], \
-                (gke + 1 <= K) && (gns + 15 < N)); \
-            if (kp < K_STEP_T / GROUP_SIZE) { \
-                unsigned int sg = (kb) / GROUP_SIZE + kp; \
-                sync_copy_16(&smem_Bs[(buf)][kp][ns], \
-                    &B_scale[(unsigned long long)sg * N + gns], \
-                    (gns + 15 < N)); \
-            } \
+            unsigned int gke = (kb) + (b_kp << 1); \
+            unsigned int gns = cta_n + b_ns; \
+            (rb) = ((gke + 1 <= K) && (gns + 15 < N)) \
+                ? *(const uint4*)&B_packed[(unsigned long long)(gke >> 1) * N + gns] \
+                : uint4{0, 0, 0, 0}; \
+            unsigned int sg = (kb) / GROUP_SIZE + (b_kp >> 3); \
+            (rs) = (gns + 15 < N) \
+                ? *(const uint4*)&B_scale[(unsigned long long)sg * N + gns] \
+                : uint4{0, 0, 0, 0}; \
         } \
     } while(0)
 
-    #define M128_DEQUANT(buf) do { \
-        unsigned int my_n = threadIdx.x; \
-        float sv0 = scl_fp8(smem_Bs[(buf)][0][my_n]) * scale2; \
-        float sv1 = scl_fp8(smem_Bs[(buf)][1][my_n]) * scale2; \
+    // Commit the prefetched tile to smem: A rows straight through; packed B
+    // dequants in registers into smem_B_bf16[n][k] (the same [N][K] tile the
+    // old two-phase path produced). The thread's packed row b_kp covers
+    // K-pairs (2*b_kp, 2*b_kp+1); its scale group within the tile is b_kp/8.
+    #define M128_STORE_TILE(buf, ra, rb, rs) do { \
         _Pragma("unroll") \
-        for (int kp = 0; kp < 8; kp++) { \
-            unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
-            smem_B_bf16[my_n][kp * 2]     = __float2bfloat16(smem_LUT[packed & 0xF] * sv0); \
-            smem_B_bf16[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT[packed >> 4]  * sv0); \
+        for (int rnd = 0; rnd < 4; rnd++) { \
+            unsigned int row = (unsigned int)(rnd * 32) + a_row_base; \
+            *(uint4*)&smem_A[(buf)][row][a_col] = (ra)[rnd]; \
         } \
-        _Pragma("unroll") \
-        for (int kp = 8; kp < 16; kp++) { \
-            unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
-            smem_B_bf16[my_n][kp * 2]     = __float2bfloat16(smem_LUT[packed & 0xF] * sv1); \
-            smem_B_bf16[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT[packed >> 4]  * sv1); \
+        { \
+            const unsigned char* pk = (const unsigned char*)&(rb); \
+            const unsigned char* sc = (const unsigned char*)&(rs); \
+            _Pragma("unroll") \
+            for (int i = 0; i < 16; i++) { \
+                unsigned char packed = pk[i]; \
+                float sv = scl_fp8(sc[i]) * scale2; \
+                store_bf16_pair(&smem_B_bf16[(buf)][b_ns + i][b_kp * 2], \
+                    smem_LUT[packed & 0xF] * sv, \
+                    smem_LUT[packed >> 4]  * sv); \
+            } \
         } \
     } while(0)
 
     // Both M-chunks (ch=0 rows 0..63, ch=1 rows 64..127); B reused.
-    #define M128_COMPUTE(a_buf) do { \
+    #define M128_COMPUTE(a_buf, b_buf) do { \
         _Pragma("unroll") \
         for (int ch = 0; ch < 2; ch++) { \
             v8f* acc = ch ? acc1 : acc0; \
@@ -812,41 +810,37 @@ void w4a16_gemm_t_m128(
             _Pragma("unroll") \
             for (int h = 0; h < 2; h++) { \
                 v16bf a; \
-                _Pragma("unroll") \
-                for (int i = 0; i < 16; i++) \
-                    a[i] = (__bf16)(float)smem_A[(a_buf)][m_row][h * 16 + i]; \
+                                memcpy(&a, &smem_A[(a_buf)][m_row][h * 16], 32); \
                 _Pragma("unroll") \
                 for (int nb = 0; nb < 8; nb++) { \
                     unsigned int nc = nb * 16 + (lane_id & 15); \
                     v16bf b; \
-                    _Pragma("unroll") \
-                    for (int k = 0; k < 16; k++) \
-                        b[k] = (__bf16)(float)smem_B_bf16[nc][h * 16 + k]; \
+                                        memcpy(&b, &smem_B_bf16[(b_buf)][nc][h * 16], 32); \
                     acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]); \
                 } \
             } \
         } \
     } while(0)
 
-    M128_LOADS(0, 0);
-    __syncthreads();
-    M128_DEQUANT(0);
+    uint4 reg_A[4], reg_Bp;
+    uint4 reg_Bs;
+    M128_LOAD_REGS(0, reg_A, reg_Bp, reg_Bs);
+    M128_STORE_TILE(0, reg_A, reg_Bp, reg_Bs);
     __syncthreads();
 
     int cur = 0;
     for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
         int nxt = 1 - cur;
-        M128_LOADS(nxt, k_base);
-        M128_COMPUTE(cur);
-        __syncthreads();
-        M128_DEQUANT(nxt);
+        M128_LOAD_REGS(k_base, reg_A, reg_Bp, reg_Bs);   // global->regs in flight
+        M128_COMPUTE(cur, cur);                          // WMMA overlaps the loads
+        M128_STORE_TILE(nxt, reg_A, reg_Bp, reg_Bs);     // regs->smem (+ B dequant)
         __syncthreads();
         cur = nxt;
     }
-    M128_COMPUTE(cur);
+    M128_COMPUTE(cur, cur);
 
-    #undef M128_LOADS
-    #undef M128_DEQUANT
+    #undef M128_LOAD_REGS
+    #undef M128_STORE_TILE
     #undef M128_COMPUTE
 
     // Write chunk 0: rows [cta_m..cta_m+63]
@@ -868,6 +862,148 @@ void w4a16_gemm_t_m128(
             if (r < M && c < N) C[r * N + c] = __float2bfloat16(acc1[nb][e]);
         }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_gemm_t_m128_k16: K_STEP=16 twin of w4a16_gemm_t_m128. ~20.5KB smem
+// → 3 CTAs/SM (vs 1 at K_STEP=32): trades barrier frequency for 3× resident
+// warps — on gfx1151 (no cp.async) the co-resident CTAs are what cover the
+// serialized dequant+store phase. A/B via ATLAS_W4A16_K16.
+// ═══════════════════════════════════════════════════════════════════
+#define K_STEP_M128K16 16
+extern "C" __global__
+__launch_bounds__(128, 3)
+void w4a16_gemm_t_m128_k16(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n  = blockIdx.x * N_TILE_LG;
+    const unsigned int cta_m  = blockIdx.y * (2 * M_TILE);
+    if (cta_m >= M) return;
+
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+
+    __shared__ __nv_bfloat16 smem_A_k16[2][2 * M_TILE][K_STEP_M128K16 + PAD_T];
+    __shared__ __nv_bfloat16 smem_B_k16[2][N_TILE_LG][K_STEP_M128K16 + 8];
+    __shared__ float smem_LUT_k16[16];
+
+    if (threadIdx.x < 16) smem_LUT_k16[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    v8f acc0[8], acc1[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        acc0[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+        acc1[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    }
+
+    // Per K16 step: A tile 128x16 bf16 (4KB) -> 2x uint4/thread (row=tid);
+    // packed B 8 rows x 128 cols (1KB) -> 8B/thread (kp=tid>>4, 8 cols);
+    // scale = 1 group row x 128 cols -> 8B/thread at the same 8 cols.
+    const unsigned int a_row = threadIdx.x;                 // 0..127
+    const unsigned int b_kp  = threadIdx.x >> 4;            // 0..7
+    const unsigned int b_ns  = (threadIdx.x & 15) << 3;     // 0..120
+
+    #define K16_LOAD_REGS(kb, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int h = 0; h < 2; h++) { \
+            unsigned int gr = cta_m + a_row; \
+            unsigned int gc = (kb) + h * 8; \
+            (ra)[h] = ((gr < M) && (gc + 7 < K)) \
+                ? *(const uint4*)&A[(unsigned long long)gr * K + gc] \
+                : uint4{0, 0, 0, 0}; \
+        } \
+        { \
+            unsigned int gke = (kb) + (b_kp << 1); \
+            unsigned int gns = cta_n + b_ns; \
+            (rb) = ((gke + 1 <= K) && (gns + 7 < N)) \
+                ? *(const ulonglong1*)&B_packed[(unsigned long long)(gke >> 1) * N + gns] \
+                : ulonglong1{0}; \
+            (rs) = (gns + 7 < N) \
+                ? *(const ulonglong1*)&B_scale[(unsigned long long)((kb) / GROUP_SIZE) * N + gns] \
+                : ulonglong1{0}; \
+        } \
+    } while(0)
+
+    #define K16_STORE_TILE(buf, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int h = 0; h < 2; h++) \
+            *(uint4*)&smem_A_k16[(buf)][a_row][h * 8] = (ra)[h]; \
+        { \
+            const unsigned char* pk = (const unsigned char*)&(rb); \
+            const unsigned char* sc = (const unsigned char*)&(rs); \
+            _Pragma("unroll") \
+            for (int i = 0; i < 8; i++) { \
+                unsigned char packed = pk[i]; \
+                float sv = scl_fp8(sc[i]) * scale2; \
+                store_bf16_pair(&smem_B_k16[(buf)][b_ns + i][b_kp * 2], \
+                    smem_LUT_k16[packed & 0xF] * sv, \
+                    smem_LUT_k16[packed >> 4]  * sv); \
+            } \
+        } \
+    } while(0)
+
+    #define K16_COMPUTE(a_buf, b_buf) do { \
+        _Pragma("unroll") \
+        for (int ch = 0; ch < 2; ch++) { \
+            v8f* acc = ch ? acc1 : acc0; \
+            unsigned int m_row = ch * M_TILE + warp_m_offset + (lane_id & 15); \
+            v16bf a; \
+                        memcpy(&a, &smem_A_k16[(a_buf)][m_row][0], 32); \
+            _Pragma("unroll") \
+            for (int nb = 0; nb < 8; nb++) { \
+                unsigned int nc = nb * 16 + (lane_id & 15); \
+                v16bf b; \
+                                memcpy(&b, &smem_B_k16[(b_buf)][nc][0], 32); \
+                acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]); \
+            } \
+        } \
+    } while(0)
+
+    uint4 reg_A[2];
+    ulonglong1 reg_Bp, reg_Bs;
+    K16_LOAD_REGS(0, reg_A, reg_Bp, reg_Bs);
+    K16_STORE_TILE(0, reg_A, reg_Bp, reg_Bs);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_M128K16; k_base < K; k_base += K_STEP_M128K16) {
+        int nxt = 1 - cur;
+        K16_LOAD_REGS(k_base, reg_A, reg_Bp, reg_Bs);
+        K16_COMPUTE(cur, cur);
+        K16_STORE_TILE(nxt, reg_A, reg_Bp, reg_Bs);
+        __syncthreads();
+        cur = nxt;
+    }
+    K16_COMPUTE(cur, cur);
+
+    #undef K16_LOAD_REGS
+    #undef K16_STORE_TILE
+    #undef K16_COMPUTE
+
+    #pragma unroll
+    for (int nb = 0; nb < 8; nb++)
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            unsigned int r = cta_m + warp_m_offset + 2 * e + (lane_id >> 4);
+            unsigned int c = cta_n + nb * 16 + (lane_id & 15);
+            if (r < M && c < N) C[r * N + c] = __float2bfloat16(acc0[nb][e]);
+        }
+    #pragma unroll
+    for (int nb = 0; nb < 8; nb++)
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            unsigned int r = cta_m + M_TILE + warp_m_offset + 2 * e + (lane_id >> 4);
+            unsigned int c = cta_n + nb * 16 + (lane_id & 15);
+            if (r < M && c < N) C[r * N + c] = __float2bfloat16(acc1[nb][e]);
+        }
+}
+#undef K_STEP_M128K16
 
 // ═══════════════════════════════════════════════════════════════════
 // fp8_gemm_t_m128: BF16 A × FP8 B, 2 M-chunks per CTA. Decode FP8→BF16 + WMMA.
@@ -932,9 +1068,7 @@ void fp8_gemm_t_m128(
             _Pragma("unroll") \
             for (int h = 0; h < 2; h++) { \
                 v16bf a; \
-                _Pragma("unroll") \
-                for (int i = 0; i < 16; i++) \
-                    a[i] = (__bf16)(float)smem_A[(a_buf)][m_row][h * 16 + i]; \
+                                memcpy(&a, &smem_A[(a_buf)][m_row][h * 16], 32); \
                 _Pragma("unroll") \
                 for (int nb = 0; nb < 8; nb++) { \
                     unsigned int nc = nb * 16 + (lane_id & 15); \
