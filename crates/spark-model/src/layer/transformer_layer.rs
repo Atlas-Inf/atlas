@@ -127,6 +127,29 @@ pub trait TransformerLayer: Send + Sync {
         Ok(None)
     }
 
+    /// [`Self::snapshot_aux`] into a caller-owned buffer — returns `true`
+    /// when this layer produced a blob. Aux-carrying layers override it so
+    /// per-save buffers survive ring-slot / snapshot-slot reuse instead of
+    /// re-allocating multi-MB Vecs on every boundary (the alloc/free churn
+    /// measured as serve-RSS growth in jobs 043/058). The default routes
+    /// through `snapshot_aux`, so layers that haven't been updated keep
+    /// working — with the old allocation behaviour.
+    fn snapshot_aux_into(
+        &self,
+        state: &dyn LayerState,
+        buf: &mut Vec<u8>,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        match self.snapshot_aux(state, gpu, stream)? {
+            Some(blob) => {
+                *buf = blob;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// True when this layer WOULD produce aux state — restore sites use it
     /// to decline snapshots that lack aux rather than restore a stale mix.
     fn has_aux_state(&self) -> bool {

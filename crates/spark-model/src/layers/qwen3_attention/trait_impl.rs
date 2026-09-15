@@ -166,6 +166,29 @@ impl TransformerLayer for Qwen3AttentionLayer {
         }
     }
 
+    fn snapshot_aux_into(
+        &self,
+        state: &dyn LayerState,
+        buf: &mut Vec<u8>,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(false);
+        };
+        let attn = state
+            .as_any()
+            .downcast_ref::<crate::layer::AttnLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("QSA host layer state is not AttnLayerState"))?;
+        match attn.qsa.as_ref() {
+            Some(st) => {
+                qsa.snapshot_aux_into(st, buf, gpu, stream)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn restore_aux(
         &self,
         state: &mut dyn LayerState,

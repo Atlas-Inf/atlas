@@ -283,6 +283,29 @@ impl TransformerLayer for Qwen3SsmLayer {
         }
     }
 
+    fn snapshot_aux_into(
+        &self,
+        state: &dyn LayerState,
+        buf: &mut Vec<u8>,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(ple) = self.ple.as_ref() else {
+            return Ok(false);
+        };
+        let ssm = state
+            .as_any()
+            .downcast_ref::<crate::layer::SsmLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("PLE host layer state is not SsmLayerState"))?;
+        match ssm.ple.as_ref() {
+            Some(st) => {
+                ple.snapshot_aux_into(st, buf, gpu, stream)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn restore_aux(
         &self,
         state: &mut dyn LayerState,

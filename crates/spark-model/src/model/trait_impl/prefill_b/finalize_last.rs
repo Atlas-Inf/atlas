@@ -394,7 +394,8 @@ impl TransformerModel {
                     // indexer keys) rides the snapshot — a restore without it
                     // would serve the previous request's lexical state, so
                     // aux-carrying models decline aux-less slots on restore.
-                    let aux = self.collect_aux_states(seq, stream)?;
+                    let mut aux = self.ssm_snapshots.take_aux(snap_id);
+                    self.collect_aux_states_into(seq, stream, &mut aux)?;
                     if !aux.is_empty() {
                         self.ssm_snapshots.set_aux(snap_id, aux);
                     }

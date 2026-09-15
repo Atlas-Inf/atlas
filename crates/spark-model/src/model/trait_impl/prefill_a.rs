@@ -152,7 +152,7 @@ impl TransformerModel {
                 // Aux-carrying models (PLE/QSA) decline aux-less slots — a
                 // mid-chunk tail capture, or a snapshot from before this
                 // feature — rather than restore a stale lexical state.
-                && (!self.requires_aux_state() || self.ssm_snapshots.aux(snap_id).is_some())
+                && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
             {
                 self.ssm_snapshots.restore(
                     snap_id,
@@ -161,8 +161,11 @@ impl TransformerModel {
                     self.gpu.as_ref(),
                     stream,
                 )?;
-                if let Some(aux) = self.ssm_snapshots.aux(snap_id) {
-                    self.apply_aux_states(seq, &aux, stream)?;
+                if let Some(res) = self
+                    .ssm_snapshots
+                    .with_aux(snap_id, |aux| self.apply_aux_states(seq, aux, stream))
+                {
+                    res?;
                 }
                 if snap_tok < kv_write_start {
                     tracing::info!(

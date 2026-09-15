@@ -23,16 +23,31 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<u8>> {
-        let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
-        let mut blob = Vec::with_capacity(4 + st.history.len() * 4 + conv_bytes);
-        blob.extend_from_slice(&(st.history.len() as u32).to_le_bytes());
-        for t in &st.history {
-            blob.extend_from_slice(&t.to_le_bytes());
-        }
-        let off = blob.len();
-        blob.resize(off + conv_bytes, 0);
-        gpu.copy_d2h_on_stream(st.conv, &mut blob[off..], stream)?;
+        let mut blob = Vec::new();
+        self.snapshot_aux_into(st, &mut blob, gpu, stream)?;
         Ok(blob)
+    }
+
+    /// [`Self::snapshot_aux`] writing into a caller-owned buffer — same
+    /// bytes, zero steady-state allocation once the buffer's capacity
+    /// covers the blob (see `QsaIndexer::snapshot_aux_into`).
+    pub fn snapshot_aux_into(
+        &self,
+        st: &PleSeqState,
+        buf: &mut Vec<u8>,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
+        buf.clear();
+        buf.extend_from_slice(&(st.history.len() as u32).to_le_bytes());
+        for t in &st.history {
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        let off = buf.len();
+        buf.resize(off + conv_bytes, 0);
+        gpu.copy_d2h_on_stream(st.conv, &mut buf[off..], stream)?;
+        Ok(())
     }
 
     /// Restore the blob from [`Self::snapshot_aux`] on a prefix-cache hit.
