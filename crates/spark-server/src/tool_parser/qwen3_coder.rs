@@ -60,6 +60,11 @@ impl ToolCallParser for Qwen3CoderParser {
         tool_choice: &ToolChoice,
         levers: &super::PromptLevers,
     ) -> String {
+        if levers.template_owns_tool_definitions {
+            let mut prompt = String::new();
+            append_tool_choice_instruction(&mut prompt, tool_choice);
+            return prompt;
+        }
         // Match the model's native Jinja chat_template exactly:
         // Tool definitions as JSON (not XML), response format as XML.
         let mut prompt =

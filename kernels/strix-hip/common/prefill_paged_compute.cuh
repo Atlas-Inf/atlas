@@ -18,7 +18,8 @@
 //        and feed P back into the PV WMMA. This decouples the softmax math from
 //        the fragment layout — the exact approach proven in inferspark_prefill_wmma.cu.
 //
-// STATUS: compiles-pending / numerics-pending GPU. Not validated on hardware.
+// STATUS: BC=32 validated on Linux and Windows gfx1151 against an FP32 CPU
+// reference for both base and `_64` production dispatches (cosine 0.999999).
 //
 // Covers (via the including .cu wrapper macros): inferspark_prefill_paged,
 // _paged_batched, _paged_fp8, _paged_fp8_batched, _paged_nvfp4, _paged_nvfp4_batched.
@@ -84,11 +85,16 @@ __device__ __forceinline__ float sw_exp(float x) {
 }
 
 #define BR 32
+// BC=32 matches the native-HIP contiguous attention kernel's validated WMMA
+// tile geometry. The prior unvalidated BC=16 occupancy variant wrote only query
+// row 0 and zeroed every later row in paged prefill.
 #define BC 32
 #ifndef HDIM
 #define HDIM 256
 #endif
-#define PAD_KV 8
+// occ2: PAD_KV 8→2 → HDIM_PAD 258, row stride 129 dwords (129%32=1) → fragment rows
+// hit distinct LDS banks (bank-conflict 24%→6.6%), and trims LDS. Bit-faithful (stride only).
+#define PAD_KV 2
 #define HDIM_PAD (HDIM + PAD_KV)
 #define PAD_P 8
 
@@ -99,6 +105,9 @@ __device__ __forceinline__ float sw_exp(float x) {
 #define PV_K_STEPS   (BC / K16)        // PV contraction over key dimension (2)
 #define PV_N_TILES   ((HDIM / K16) / 2) // d-cols per warp half (8 at HDIM=256)
 #define TILE_CHUNKS (BR * (HDIM / 8))
+// NOTE: KV tiles hold BC rows (not BR). The shared LOAD_KV_TILE macro (gb10 .cu)
+// bounds its loop by BC*(HDIM/8) — at BC<BR (strix occ2) that avoids the OOB write
+// past smem_K[BC-1]; on gb10 BC=BR so it equals TILE_CHUNKS (no-op).
 
 // ==========================================================================
 // BR=32 variant: 4 warps (128 threads, wave32).
@@ -150,13 +159,16 @@ extern "C" __global__ void KERNEL_NAME(
 #endif
 
     __shared__ __nv_bfloat16 smem_Q[BR][HDIM_PAD];
+    // occ2 K/V buffer-share: ONE [BC][HDIM_PAD] buffer holds K (for QK^T), then is
+    // reloaded with V (for P×V) after QK has consumed K. Eliminates smem_V → −8.25 KB
+    // LDS, the change that drops us under 32 KB → 2 workgroups/CU. WAR hazard on the
+    // reuse is covered by the post-QK __syncthreads() (barrier B2).
     __shared__ __nv_bfloat16 smem_K[BC][HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_V[BC][HDIM_PAD];
     // PR #90 Phase 2c: P stored as FP16 (10-bit mantissa) vs BF16 (7-bit) →
     // 8× finer softmax-probability precision in the P×V WMMA, the largest
     // remaining attention-output drift source vs the FP32 PyTorch reference.
-    // smem_V stays BF16 (the LOAD_KV_TILE macros write BF16); V is converted
-    // to FP16 per-MMA in registers. Bisect: ATLAS_DISABLE_FP16_PV reverts to
+    // V (in the shared smem_K buffer) stays BF16 (the LOAD_KV_TILE macros write
+    // BF16); V is converted to FP16 per-MMA. Bisect: ATLAS_DISABLE_FP16_PV reverts to
     // the pre-#90 BF16 P×V (smem_P=BF16, __float2bfloat16 store, bf16 WMMA).
 #ifdef ATLAS_DISABLE_FP16_PV
     __shared__ __nv_bfloat16 smem_P[BR][BC];
@@ -211,9 +223,8 @@ extern "C" __global__ void KERNEL_NAME(
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
 
-        // ---- K and V tile loads (synchronous; FP8/NVFP4 dequant in macro) ----
+        // ---- K tile load only (V reloaded into smem_K after QK, buffer-share) ----
         LOAD_KV_TILE(K_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, blockDim.x);
-        LOAD_KV_TILE(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, blockDim.x);
         __syncthreads();
 
         // ---- QK^T: S = Q @ K^T (warps 0-1, each owns 16 query rows) ----
@@ -297,6 +308,11 @@ extern "C" __global__ void KERNEL_NAME(
             smem_ml[r][1] = l_old * resc + sum;
             smem_resc[r] = resc;
         }
+
+        // ---- V reload into smem_K (buffer-share): K was fully consumed by QK^T;
+        //      the post-QK barrier above guarantees those reads finished before this
+        //      write. Overlaps with the softmax above (disjoint smem). ----
+        LOAD_KV_TILE(V_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, blockDim.x);
         __syncthreads();
 
         // ---- Rescale acc_o by per-row exp(m_old - m_new) ----
@@ -334,7 +350,7 @@ extern "C" __global__ void KERNEL_NAME(
                     v16bf bb;
                     #pragma unroll
                     for (int k = 0; k < 16; k++)
-                        bb[k] = (__bf16)(float)smem_V[k_off + k][d_col];
+                        bb[k] = (__bf16)smem_K[k_off + k][d_col]; // buffer-share: smem_K holds V here
                     acc_o[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, bb, acc_o[nt]);
                 }
 #else
@@ -349,7 +365,7 @@ extern "C" __global__ void KERNEL_NAME(
                     v16h bb;
                     #pragma unroll
                     for (int k = 0; k < 16; k++)
-                        bb[k] = (__fp16)(float)smem_V[k_off + k][d_col];
+                        bb[k] = (__fp16)(float)smem_K[k_off + k][d_col]; // buffer-share: smem_K holds V here
                     acc_o[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bb, acc_o[nt]);
                 }
 #endif
@@ -449,8 +465,8 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 #endif
 
     __shared__ __nv_bfloat16 smem_Q[BR64][HDIM_PAD];
+    // occ2 K/V buffer-share (see BR=32 path): one [BC][HDIM_PAD] buffer, K then V.
     __shared__ __nv_bfloat16 smem_K[BC][HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_V[BC][HDIM_PAD];
     // PR #90 Phase 2c: smem_P64 FP16 — same rationale as the BR=32 path.
 #ifdef ATLAS_DISABLE_FP16_PV
     __shared__ __nv_bfloat16 smem_P[BR64][BC];
@@ -502,8 +518,8 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
 
+        // K tile load only (V reloaded into smem_K after QK, buffer-share).
         LOAD_KV_TILE(K_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, 128);
-        LOAD_KV_TILE(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, 128);
         __syncthreads();
 
         if (warp_id < 2) {
@@ -578,6 +594,9 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             smem_ml[r][1] = l_old * resc + sum;
             smem_resc[r] = resc;
         }
+
+        // V reload into smem_K (buffer-share; K consumed by QK, barrier above covers WAR).
+        LOAD_KV_TILE(V_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, 128);
         __syncthreads();
 
         {
@@ -608,7 +627,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                     v16bf bb;
                     #pragma unroll
                     for (int k = 0; k < 16; k++)
-                        bb[k] = (__bf16)(float)smem_V[k_off + k][d_col];
+                        bb[k] = (__bf16)smem_K[k_off + k][d_col]; // buffer-share: smem_K holds V here
                     acc_o[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, bb, acc_o[nt]);
                 }
 #else
@@ -622,7 +641,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                     v16h bb;
                     #pragma unroll
                     for (int k = 0; k < 16; k++)
-                        bb[k] = (__fp16)(float)smem_V[k_off + k][d_col];
+                        bb[k] = (__fp16)(float)smem_K[k_off + k][d_col]; // buffer-share: smem_K holds V here
                     acc_o[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bb, acc_o[nt]);
                 }
 #endif

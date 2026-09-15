@@ -75,6 +75,9 @@ int cuStreamQuery(void* s)                          { return hipStreamQuery((hip
 int cuStreamWaitEvent(void* s, void* e, unsigned f) { return hipStreamWaitEvent((hipStream_t)s, (hipEvent_t)e, f); }
 int cuStreamBeginCapture(void* s, int mode)         { return hipStreamBeginCapture((hipStream_t)s, (hipStreamCaptureMode)mode); }
 int cuStreamEndCapture(void* s, void** pgraph)      { return hipStreamEndCapture((hipStream_t)s, (hipGraph_t*)pgraph); }
+// cudarc's cuStreamIsCapturing(stream, *status) — hip twin writes the same
+// hipStreamCaptureStatus enum (NONE=0 .. GLOBAL/THREAD_LOCAL/RELAXED).
+int cuStreamIsCapturing(void* s, unsigned* status)  { return hipStreamIsCapturing((hipStream_t)s, (hipStreamCaptureStatus*)status); }
 
 // ── events ────────────────────────────────────────────────────────────
 int cuEventCreate(void** e, unsigned flags) { return hipEventCreateWithFlags((hipEvent_t*)e, flags); }

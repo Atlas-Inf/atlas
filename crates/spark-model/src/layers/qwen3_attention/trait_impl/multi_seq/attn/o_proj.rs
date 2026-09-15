@@ -178,21 +178,40 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
-            // FP8 native: per-token w8a16_gemv for O projection.
-            for i in 0..n {
-                let attn_out_i = attn_out.offset(i * q_dim as usize * bf16);
-                let o_out_i = o_out.offset(i * h * bf16);
-                ops::w8a16_gemv(
+            let batch_kernel = if n <= 4 {
+                self.w8a16_gemv_batch4_k
+            } else {
+                self.w8a16_gemv_batch16_k
+            };
+            if (2..=16).contains(&n) && batch_kernel.0 != 0 {
+                ops::w8a16_gemv_batch4(
                     fwd.gpu,
-                    self.w8a16_gemv_k,
-                    attn_out_i,
+                    batch_kernel,
+                    attn_out,
                     o_fp8.weight,
                     o_fp8.row_scale,
-                    o_out_i,
+                    o_out,
+                    n as u32,
                     h as u32,
                     nq * hd,
                     stream,
                 )?;
+            } else {
+                for i in 0..n {
+                    let attn_out_i = attn_out.offset(i * q_dim as usize * bf16);
+                    let o_out_i = o_out.offset(i * h * bf16);
+                    ops::w8a16_gemv(
+                        fwd.gpu,
+                        self.w8a16_gemv_k,
+                        attn_out_i,
+                        o_fp8.weight,
+                        o_fp8.row_scale,
+                        o_out_i,
+                        h as u32,
+                        nq * hd,
+                        stream,
+                    )?;
+                }
             }
         } else if n == 3 && !self.attn.o_proj.is_null() {
             ops::w4a16_gemv_batch3(

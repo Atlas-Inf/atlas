@@ -1,0 +1,119 @@
+# Benchmarks for this model, and the thresholds its gate records must meet.
+#
+# Sibling of MODEL.toml so the numbers sit beside the thing they describe;
+# hardware and model are implied by the path and cannot disagree with the
+# contents. Read by `atlas_plugin::gate::bench`.
+#
+# Thresholds are per CHECKPOINT, not per model. This entry is the AUTHORITATIVE
+# unsloth/Qwen3.8-27B-NVFP4 checkpoint (snapshot 7d6f8d4d) on AzeezStrix.
+#
+# This file is deliberately OUTSIDE the closure hash, so ratcheting a threshold
+# does not invalidate the record that justified the ratchet.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "unsloth/Qwen3.8-27B-NVFP4"
+gate = "bfcl-subset"
+label = "Qwen3.8-27B dense (NVFP4, unsloth) — Strix Halo gfx1151"
+default = true
+# DEMOTED to unmeasured 2026-09-14: the numbers below ARE measured gate data,
+# but the gate's self-start resolves `recipe` from atlas-recipes — and no
+# recipe can express this serve config, whose correctness depends on env
+# vars (ATLAS_FP8_DEQUANT_*/ATLAS_GDN_BF16_WEIGHTS/ATLAS_W4A16_*) that the
+# recipe schema has no field for. A "measured" entry without a resolvable
+# recipe fails `every_committed_baseline_parses_resolves_and_is_checkable`;
+# an invented recipe would self-start the wrong config. Kept here as
+# provenance until a strix-expressible recipe exists — restore "measured"
+# and the floors (samples min/max 995, overall_accuracy min 83.82 noise 0.4,
+# normalized_single_turn_score min 83.28 noise 0.4) with it.
+status = "unmeasured"
+note = """\
+BASELINE ESTABLISHED 2026-09-02, AzeezStrix (gfx1151, 60 GB GTT, ROCm/HIP \
+7.13), golden draw n=995 seed 42 temp 0 with NO param overrides. \
+overall 84.22 / normalized 83.68. Run record \
+~/.atlas/runs/bfcl-subset/run-1788366618469517340.json. \
+FINGERPRINT: serve binary sha256 9961081bb9a15d418147f4a00b8111895acf4e29923a48dc5b6dda6dbdf7cd48 \
+(built from this branch's dirty tree, diff sha256 c7c60ae3... pre-quarantine; \
+the quarantine rebuild differs only in non-measured-path logging), checkpoint \
+unsloth/Qwen3.8-27B-NVFP4 snapshot 7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108. \
+Serve recipe (the frozen preservation recipe): --max-seq-len 4096 \
+--max-prefill-tokens 2048 --gpu-memory-utilization 0.88 --kv-cache-dtype bf16 \
+--lm-head-dtype bf16 --max-batch-size 1 --disable-tool-grammar true \
+--ssm-cache-slots 0 --disable-thinking --dangerously-allow-unresolved-kernel-lookups; \
+env ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1 ATLAS_FP8_DEQUANT_FFN_TO_BF16=1 \
+ATLAS_GDN_BF16_WEIGHTS=1 ATLAS_W4A16_VARIANT=v1 ATLAS_W4A16_DP4A=1 \
+ATLAS_KV_EXTERNAL_RESERVE_GB=0. No speculative decode. \
+THE FIX THIS BASELINE DEPENDS ON: the BF16 FFN prefill arm (used by the \
+checkpoint's final-eight per-row-FP8 FFN layers, installed as BF16 by the \
+preservation module) routes through gemm::dense_gemm_bf16_pipelined \
+(CPU-oracle-validated, row cosine >= 0.99999991). The gfx1151 WMMA port of \
+gemm_tc::dense_gemm_tc leaves ~half its output tile unwritten and ran ~1000x \
+slow in situ — with it, this gate scored 27.14/32.42 with degenerate first \
+tokens (<|audio_pad|>) and period-2 decode loops. dense_gemm_tc is \
+quarantined behind ATLAS_FFN_BF16_PREFILL_TC=1. \
+CATEGORIES: hallucination 86.55 (irrelevance 95.83, live_irrelevance 77.27), \
+live 84.12 (live_multiple 85.71, live_parallel 93.75, live_parallel_multiple \
+66.67, live_simple 88.00), non_live 80.38 (multiple 93.55, parallel 88.71, \
+parallel_multiple 83.06, simple_java 46.77, simple_javascript 25.81, \
+simple_python 95.97). \
+★ THE PYTHON/JS CLIFF REPRODUCES THE GB10 ANOMALY: simple_python 95.97 \
+against simple_java 46.77 and simple_javascript 25.81 — the same split the \
+gb10 entry calls "a defect in the serve path, with the chat-template change \
+the prime suspect", here on different hardware, the same checkpoint, and the \
+preservation load path. It is the largest known accuracy lever (~2 points of \
+overall) and is NOT fixed by this baseline. \
+★ THE BARS BELOW ARE REGRESSION FLOORS cut at measured-minus-noise (0.4, the \
+documented MTP-nondeterminism band), not a quality endorsement: normalized \
+83.68 sits 0.04 under the GB10-derived 83.72 floor — one sample of 995. \
+The MLPerf-instrument number for the same checkpoint (harness bfcl_v4, \
+12/23/46 draw) is a different scorer and draw: the previous working \
+unsloth-3.6 reference there is 78.59/80.45 (results_st996_unsloth_ccdaab7e); \
+the qwen38 leg is recorded separately and does not gate this entry."""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
+gate = "bfcl-subset"
+label = "Qwen3.8-27B dense (NVFP4, nvidia shipped) — Strix Halo gfx1151"
+# Same demotion as the unsloth entry above: measured data, but the gate
+# self-starts from `recipe` resolved out of atlas-recipes and no recipe for
+# this serve config exists there. Since the DP4A arm went default-on this
+# config IS flag-expressible now (ATLAS_MTP_GATE_FORCE -> `mtp_gate:
+# force`; the other vars were bench-host pins) — the only blocker left is
+# landing the recipe in the recipes repo. Provenance only; restore
+# "measured" with floors (samples 995 pinned, overall_accuracy min 82.82
+# noise 0.4, normalized_single_turn_score min 78.62 noise 0.4) once it
+# exists.
+status = "unmeasured"
+note = """\
+MEASURED 2026-09-11, AzeezStrix, golden draw n=995 seed 42 temp 0, no \
+param overrides: overall 83.22 / normalized 79.02 (run record \
+~/.atlas/runs/bfcl-subset/run-1789114625433625524.json). Serve binary \
+spark_spec sha256 e4fbc84f2f23105259a076d956d1f9653b8b5d565e000239c07ec2e5dd36963f, \
+recipe: --max-seq-len 8192 --max-prefill-tokens 2048 \
+--gpu-memory-utilization 0.88 --kv-cache-dtype bf16 --lm-head-dtype nvfp4 \
+--max-batch-size 1 --disable-tool-grammar true --ssm-cache-slots 0 \
+--ssm-checkpoint-interval 16 --disable-thinking \
+--dangerously-allow-unresolved-kernel-lookups --speculative --num-drafts 3 \
+--mtp-quantization bf16 --mtp-vocab 100000; env ATLAS_W4A16_DP4A=1 \
+ATLAS_W4A16_VARIANT=v1 ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_MTP_GATE_FORCE=1. \
+DERIVED-CHECKPOINT RESULT on the same binary and recipe: the FP8→NVFP4 \
+requant of this checkpoint's GDN/attention projections \
+(HaloLoom/workspace/qwen38-27b-fp8to4, produced by requant_np.py from \
+snapshot dbb8f445b3145f8a4c18ddc769f032d57d32867c) scored \
+overall 82.71 / normalized 79.58 on the identical draw \
+(run-1789313837819983248.json, replicated run-1789298778720183887.json) — \
+normalized +0.56, inside the 0.4 noise band: the requant is SHIPPABLE. \
+Category detail for the requant run: irrelevance 87.50, \
+live_irrelevance 59.09, live_multiple 88.57, live_parallel 68.75, \
+live_parallel_multiple 70.83, live_simple 92.00. The Python/JS cliff \
+persists on this checkpoint (serve-path defect, ~2 points overall). \
+FULL-STACK RE-RUN 2026-09-14 on the same requant checkpoint, binary \
+spark_gdndp4a2 sha256 f94e6d348a5e (this branch's tip stack: GDN K=4 DP4A + \
+fused conv + strided QKV): overall 83.02 / normalized 80.41 on the \
+identical draw (run-1789370409958768995.json) — +0.31 overall / +0.83 \
+normalized vs the prior requant record, no accuracy regression. \
+The demoted floors (see above) were cut from the SHIPPED run minus the 0.4 \
+noise band; the requant derivative is recorded here as provenance, not \
+floored — its own entry belongs beside its own checkpoint directory when \
+it is promoted."""

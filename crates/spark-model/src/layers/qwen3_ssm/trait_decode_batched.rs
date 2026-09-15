@@ -37,6 +37,10 @@ fn batched_norm_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_NO_BATCHED_GDN_NORM").is_err())
 }
 
+fn dense_out_proj_uses_batch2(num_tokens: usize) -> bool {
+    num_tokens == 2
+}
+
 /// Row count above which the batched decode/verify GDN projections stop taking
 /// the FP8 PREFILL arm (`fp8_gemm_n128` on the single-scale FP8 copy) and read
 /// the NVFP4 twin through a tile GEMM instead. SSOT for both projections —
@@ -259,6 +263,22 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
+        } else if (5..=16).contains(&num_tokens)
+            && self.w8a16_gemv_batch16_k.0 != 0
+            && let Some(ref fp8) = self.qkvz_fp8w
+        {
+            ops::w8a16_gemv_batch4(
+                ctx.gpu,
+                self.w8a16_gemv_batch16_k,
+                normed,
+                fp8.weight,
+                fp8.row_scale,
+                proj_dst,
+                num_tokens as u32,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
         } else if num_tokens > 4
             && (self.w8a16_gemm_pipelined_k.0 != 0 || self.w8a16_gemm_k.0 != 0)
             && let Some(ref fp8) = self.qkvz_fp8w
@@ -305,8 +325,13 @@ impl Qwen3SsmLayer {
             }
         } else if num_tokens == 4 {
             if let Some(ref nvfp4) = self.qkvz_nvfp4 {
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
+                // DP4A arm first (same as the multi-seq mixer): int8-quantize
+                // `normed` once and run `w4a16_gemv_dp4a_batch4_d4`; falls
+                // back to the identical `w4a16_gemv_batchm` call when DP4A is
+                // disabled or its handles are unresolved.
+                self.ssm_fp4_proj(
+                    ctx,
+                    "qkvz",
                     self.w4a16_batchm.kernel(num_tokens as u32),
                     normed,
                     nvfp4,
@@ -921,17 +946,31 @@ impl Qwen3SsmLayer {
         // ── 9. Output projection → [K, H] ──
         let out_proj_buf = ctx.buffers.moe_output(); // [K, H] BF16
         if let Some(ref dense_out) = self.out_proj_dense {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                normed_out_buf,
-                dense_out,
-                out_proj_buf,
-                k,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )?;
+            if dense_out_proj_uses_batch2(num_tokens) {
+                ops::dense_gemv_batch2(
+                    ctx.gpu,
+                    self.dense_gemv_batch2_k,
+                    normed_out_buf,
+                    dense_out,
+                    out_proj_buf,
+                    h as u32,
+                    value_dim as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm(
+                    ctx.gpu,
+                    self.dense_gemm_k,
+                    normed_out_buf,
+                    dense_out,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            }
         } else if (2..=4).contains(&num_tokens)
             && let Some(ref fp8) = self.out_proj_fp8w
         {
@@ -977,12 +1016,31 @@ impl Qwen3SsmLayer {
             // NVFP4 out_proj at M=4..8 (K=4 verify + K=5..8 chain verify):
             // previously fell through to the w4a16 tile GEMMs below (M>3
             // cliff — there was no ==4 arm at all on the NVFP4 side); the
-            // batchm GEMV streams the weight once for all rows.
-            ops::w4a16_gemv_batchm(
-                ctx.gpu,
+            // batchm GEMV streams the weight once for all rows. `ssm_fp4_proj`
+            // takes the W4A8 DP4A arm at M==4 when enabled (int8 activation
+            // quant + `w4a16_gemv_dp4a_batch4_d4`), else the same batchm call.
+            self.ssm_fp4_proj(
+                ctx,
+                "out_proj",
                 self.w4a16_batchm_kernel(num_tokens),
                 normed_out_buf,
                 &self.ssm.out_proj,
+                out_proj_buf,
+                num_tokens as u32,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )?;
+        } else if (5..=16).contains(&num_tokens)
+            && self.w8a16_gemv_batch16_k.0 != 0
+            && let Some(ref fp8) = self.out_proj_fp8w
+        {
+            ops::w8a16_gemv_batch4(
+                ctx.gpu,
+                self.w8a16_gemv_batch16_k,
+                normed_out_buf,
+                fp8.weight,
+                fp8.row_scale,
                 out_proj_buf,
                 num_tokens as u32,
                 h as u32,
@@ -1294,5 +1352,18 @@ impl Qwen3SsmLayer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dense_out_proj_uses_batch2;
+
+    #[test]
+    fn dense_out_projection_uses_read_once_kernel_only_at_k2() {
+        assert!(!dense_out_proj_uses_batch2(0));
+        assert!(!dense_out_proj_uses_batch2(1));
+        assert!(dense_out_proj_uses_batch2(2));
+        assert!(!dense_out_proj_uses_batch2(3));
     }
 }

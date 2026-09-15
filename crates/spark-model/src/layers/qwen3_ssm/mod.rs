@@ -229,6 +229,8 @@ pub struct Qwen3SsmLayer {
     // amortizes the weight read at C=4..16 like FP8.
     w4a16_batchm: W4a16BatchmTiers,
     w4a16_gemv_batch16_k: KernelHandle,
+    dp4a_quant_batch4_k: KernelHandle, // W4A8 DP4A M=4 QKVZ/out_proj — ssm_dp4a.rs
+    dp4a_gemv_batch4_k: KernelHandle,
     // Kernels — WY-chunkwise path (2-pass verification)
     gdn_wy2_k: KernelHandle,
     /// Register-resident wy2 twin (K=2 verify, the C=32 hot shape): Pass 2
