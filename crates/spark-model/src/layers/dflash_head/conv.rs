@@ -13,7 +13,6 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
 #[derive(Clone)]
@@ -47,10 +46,13 @@ impl Dflash2Conv {
 
     /// Project input states to dynamic kernel delta and apply input-side convolution.
     /// Returns the device pointer to the output-side dynamic coefficients.
+    /// `gemm` computes `dst[m,n] = src[m,k] · w[n,k]^T` (out_stride = n);
+    /// callers route small m through `drafter_dense_gemm` so γ-row
+    /// projections can take the batched GEMV arm.
     pub fn prepare(
         &self,
         gpu: &dyn GpuBackend,
-        dense_gemm_pipelined: KernelHandle,
+        gemm: &dyn Fn(DevicePtr, &DenseWeight, DevicePtr, u32, u32, u32) -> Result<()>,
         conv_kernel: Option<KernelHandle>,
         input_buf: DevicePtr,
         delta_buf: DevicePtr,
@@ -61,16 +63,13 @@ impl Dflash2Conv {
         let h = self.hidden_size as u32;
         let total_dynamic_dims = (2 * self.kernel_size * self.num_groups) as u32;
 
-        ops::dense_gemm_bf16_pipelined(
-            gpu,
-            dense_gemm_pipelined,
+        gemm(
             input_buf,
             &self.kernel_projection,
             delta_buf,
             gamma,
             total_dynamic_dims,
             h,
-            stream,
         )?;
 
         let input_base_kernel = self.base_kernel.weight;

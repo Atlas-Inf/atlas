@@ -77,7 +77,7 @@ impl Dflash2CandidateSelector {
         draft_tokens_dev: DevicePtr,
         gamma: usize,
         gpu: &dyn GpuBackend,
-        dense_gemm_pipelined: KernelHandle,
+        gemm: &dyn Fn(DevicePtr, &DenseWeight, DevicePtr, u32, u32, u32) -> Result<()>,
         candidate_selector_kernel: Option<KernelHandle>,
         stream: u64,
     ) -> Result<()> {
@@ -86,16 +86,14 @@ impl Dflash2CandidateSelector {
         let g = gamma as u32;
 
         // 1. GEMM: projected_hidden_buf [γ, rank] = hidden_buf [γ, H] @ hidden_projection^T [rank, H]
-        ops::dense_gemm_bf16_pipelined(
-            gpu,
-            dense_gemm_pipelined,
+        //    `gemm` is `drafter_dense_gemm`: γ-row fits the batched GEMV arm.
+        gemm(
             hidden_buf,
             &self.hidden_projection,
             projected_hidden_buf,
             g,
             r,
             h,
-            stream,
         )?;
 
         // 2. On-Device GPU Candidate Selector (Zero D2H, Zero CPU Loop, <0.05ms)

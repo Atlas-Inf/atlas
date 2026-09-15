@@ -115,9 +115,8 @@ impl BlockDiffusionDraftHead {
         // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
         //   first half: fc maps [n, L_t*h_t] → [n, h].
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        ops::dense_gemm_bf16_pipelined(
+        self.drafter_dense_gemm(
             gpu,
-            self.kernels.dense_gemm_pipelined,
             src,
             &self.fc,
             scratch.fc_proj,
@@ -159,9 +158,8 @@ impl BlockDiffusionDraftHead {
         // Layout per row: [K_0 | V_0 | K_1 | V_1 | … | K_{L-1} | V_{L-1}].
         let fused_w = DenseWeight { weight: fused_kv };
         let fused_n_cols = (l_total as u32) * 2 * kv_dim;
-        ops::dense_gemm_bf16_pipelined(
+        self.drafter_dense_gemm(
             gpu,
-            self.kernels.dense_gemm_pipelined,
             scratch.fc_proj,
             &fused_w,
             scratch.fused_kv_out,
