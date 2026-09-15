@@ -187,6 +187,9 @@ hidden_size = 5120
 # The strix-hip kernel tree carries the DFlash2 kernels (sink paged
 # attention, batchm GEMV, dflash2 conv/candidate selector), so the
 # incoai/Qwen3.8-27B-DFlash2 drafter is wired here the same as on gb10.
+# Serving defaults (Option-B paged propose, small-M GEMV arm, GPU_UTIL 0.80)
+# live in serve-amd.sh, not here — see docs/porting/QWEN38_STRIX_PORT.md
+# "2026-09-15 — DFlash2 speculative decoding on gfx1151".
 [dflash]
 draft_model = "incoai/Qwen3.8-27B-DFlash2"
 gamma = 8
