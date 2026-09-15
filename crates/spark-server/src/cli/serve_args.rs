@@ -20,6 +20,12 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u32 = 300;
 /// the engine fallback is defined.
 pub const DEFAULT_NUM_DRAFTS: usize = 1;
 
+/// Engine fallback for `--dflash-gamma` when neither the flag nor the target's
+/// MODEL.toml `[dflash].gamma` provides a value. 16 is the `block_size` of
+/// every published Qwen3.6-DFlash drafter. Named per PCND; resolved
+/// explicitly in `serve_phases::config::apply_model_default_dflash_gamma`.
+pub const DEFAULT_DFLASH_GAMMA: usize = 16;
+
 /// Engine fallback for `--kv-cache-dtype` when neither the flag nor MODEL.toml
 /// `[behavior].default_kv_dtype` provides a value. Named per PCND; resolved
 /// explicitly in `serve_phases::kv_cache::resolve_kv_dtype_str`.
@@ -533,19 +539,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub draft_model: Option<String>,
 
-    /// DFlash block size γ (parallel draft tokens per step). Default 16 —
-    /// the `block_size` of every published Qwen3.6-DFlash drafter; override
-    /// only for ablation. Higher γ increases per-step verify cost but
-    /// raises peak speedup.
-    ///
-    /// NOTE: because of this clap default the drafter-`config.json`
-    /// `block_size` fallback downstream (`DflashBuildArgs.gamma: None`) is
-    /// currently unreachable — the served γ is always this flag. Fine while
-    /// every published drafter uses 16; a drafter with a different
-    /// block_size needs this flag made `Option` first (same resolution
-    /// pattern as `--num-drafts`).
-    #[arg(long, default_value_t = 16)]
-    pub dflash_gamma: usize,
+    /// DFlash block size γ (parallel draft tokens per step). Precedence
+    /// (highest wins): this flag → the target's MODEL.toml `[dflash].gamma`
+    /// → 16 (`DEFAULT_DFLASH_GAMMA`, the `block_size` of every published
+    /// Qwen3.6-DFlash drafter). Override only for ablation. Higher γ
+    /// increases per-step verify cost but raises peak speedup.
+    #[arg(long)]
+    pub dflash_gamma: Option<usize>,
 
     /// DFlash drafter sliding-window size for long context. The drafter
     /// runs full-prefix attention by default; at Atlas's typical 16K
@@ -1089,6 +1089,19 @@ impl ServeArgs {
     pub fn resolved_num_drafts(&self) -> usize {
         self.num_drafts
             .expect("num_drafts read before apply_model_default_num_drafts resolved it")
+    }
+
+    /// Effective DFlash block size γ. Valid only AFTER
+    /// `serve_phases::apply_model_default_dflash_gamma` has resolved the
+    /// CLI → MODEL.toml → engine-default precedence into `dflash_gamma`
+    /// (it runs immediately before `apply_model_default_num_drafts` in
+    /// `serve_load`). Reading it earlier is a startup-ordering bug: fail
+    /// fast rather than size a pool off a guessed value. Pre-resolution
+    /// readers (CLI validation, TUI badges) must match on the `Option`
+    /// directly instead.
+    pub fn resolved_dflash_gamma(&self) -> usize {
+        self.dflash_gamma
+            .expect("dflash_gamma read before apply_model_default_dflash_gamma resolved it")
     }
 }
 

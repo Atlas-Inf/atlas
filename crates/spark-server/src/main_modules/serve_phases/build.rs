@@ -112,7 +112,7 @@ pub(crate) fn build_model(
         comm,
         args.self_speculative || args.ngram_speculative,
         if args.dflash {
-            checked_dflash_num_drafts(args.dflash_gamma)?
+            checked_dflash_num_drafts(args.resolved_dflash_gamma())?
         } else {
             args.resolved_num_drafts()
         },

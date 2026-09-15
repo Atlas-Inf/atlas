@@ -146,7 +146,12 @@ pub fn badges(a: &crate::cli::ServeArgs, awaiting_model: bool) -> Vec<Badge> {
     });
     if a.dflash {
         out.push(Badge {
-            text: format!("DFlash γ={}", a.dflash_gamma),
+            // Pre-resolution args: an omitted --dflash-gamma is decided
+            // later against the target's MODEL.toml, so the badge labels
+            // the source rather than a value not yet known.
+            text: a
+                .dflash_gamma
+                .map_or("DFlash γ=model".to_string(), |g| format!("DFlash γ={g}")),
             tint: BadgeTint::Quant,
         });
     } else if a.speculative || a.self_speculative || a.ngram_speculative {
