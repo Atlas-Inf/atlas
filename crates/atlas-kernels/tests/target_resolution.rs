@@ -421,10 +421,15 @@ fn qwen38_target_declarations_are_sound() {
         "tools dry_multiplier must stay 0.0"
     );
 
-    // The 3.6-trained DFlash drafter must NOT be paired with 3.8 weights.
-    assert!(
-        toml.get("dflash").is_none(),
-        "no [dflash] on qwen3.8-27b: z-lab/Qwen3.6-27B-DFlash was trained on \
-         3.6 hidden states and would be out-of-distribution on 3.8"
-    );
+    // The 3.6-trained DFlash drafter must NOT be paired with 3.8 weights; the
+    // only allowed [dflash] is the 3.8-trained DFlash2 drafter.
+    if let Some(dflash) = toml.get("dflash") {
+        assert_eq!(
+            dflash.get("draft_model").and_then(|v| v.as_str()),
+            Some("incoai/Qwen3.8-27B-DFlash2"),
+            "qwen3.8-27b may only pair with the 3.8-trained DFlash2 drafter: \
+             z-lab/Qwen3.6-27B-DFlash was trained on 3.6 hidden states and \
+             would be out-of-distribution on 3.8"
+        );
+    }
 }
