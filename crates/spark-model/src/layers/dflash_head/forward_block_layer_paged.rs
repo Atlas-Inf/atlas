@@ -63,6 +63,10 @@ pub(super) struct PagedLayerArgs {
     /// all drafter layers. Maps logical block indices to physical pool
     /// block indices for the paged attention kernel.
     pub block_table_dev: DevicePtr,
+    /// Number of u32 entries in `block_table_dev` (`blocks_needed` from
+    /// the lazy allocation in propose.rs). Diagnostics bound their D2H
+    /// readback by this — never read past it.
+    pub block_table_len: u32,
     pub stream: u64,
     /// Friday 2026-06-11 (id259 next-action): when true, this propose is the
     /// armed one-shot per-layer block-forward parity dump. Each layer dumps
@@ -428,11 +432,15 @@ impl BlockDiffusionDraftHead {
         // ATLAS_DFLASH_OPTION_B_DIAG=1 reads back layer 0's first cached
         // K row at the slot we just wrote and compares first 8 BF16 values
         // against the source k_buf row 0. If they differ, the cache write
-        // landed in the wrong slot or with the wrong layout. ONE-SHOT.
-        if layer_idx == 0 && self.startup.diagnostics.option_b_diag {
-            // Per-model latch (see `ModelStats::dumped`): a static would let
-            // the previous model swallow this model's one-shot diagnostic.
-            if ctx.stats.dumped.keyed("dflash_option_b") {
+        // landed in the wrong slot or with the wrong layout.
+        // OPTION_B_DIAG is one-shot (latched via `dumped.keyed`);
+        // OPTION_B_DIAG_EVERY fires on every layer-0 propose.
+        if layer_idx == 0
+            && (self.startup.diagnostics.option_b_diag_every
+                || (self.startup.diagnostics.option_b_diag
+                    && ctx.stats.dumped.keyed("dflash_option_b")))
+        {
+            {
                 gpu.synchronize(stream)?;
 
                 // Read slot 0's physical index from slot_mapping (i64).
@@ -508,6 +516,39 @@ impl BlockDiffusionDraftHead {
                     );
                     let _ = ctx0_ptr;
                 }
+
+                // Full paged-attention input dump (the 095 γ=16 fault was
+                // in this kernel): whole block table + the 12-byte
+                // indirect args the kernel reads at entry.
+                let mut bt_full = vec![0u8; args.block_table_len as usize * 4];
+                gpu.copy_d2h(block_table_dev, &mut bt_full)?;
+                let bt_all: Vec<u32> = bt_full
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let mut ind_bytes = [0u8; 12];
+                gpu.copy_d2h(scratch.option_b_indirect_args_dev, &mut ind_bytes)?;
+                let indirect: Vec<u32> = ind_bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let n_bt = bt_all.len();
+                tracing::info!(
+                    "DFLASH OPTION_B DIAG: ptrs k_pool={:#x} v_pool={:#x} q_buf={:#x} \
+                     block_table_dev={:#x} bt[0..8]={:?} bt[last4]={:?} n_bt={} \
+                     indirect(kv_len,q_offset,q_rope_pos)={:?} gamma={} num_kv_heads={} head_dim={}",
+                    k_pool.0,
+                    v_pool.0,
+                    scratch.q_buf.0,
+                    block_table_dev.0,
+                    &bt_all[..8.min(n_bt)],
+                    &bt_all[n_bt.saturating_sub(4)..],
+                    n_bt,
+                    indirect,
+                    g,
+                    self.num_kv_heads,
+                    self.head_dim,
+                );
             }
         }
         // Suppress unused-var warnings: kv_len is computed for diagnostics

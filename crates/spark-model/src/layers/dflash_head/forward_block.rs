@@ -13,7 +13,8 @@ use super::{BlockDiffusionDraftHead, DflashGraphIdentity, DflashScratch, Sequenc
 use crate::layer::ForwardContext;
 
 impl BlockDiffusionDraftHead {
-    /// `option_b`: when `Some((block_table_dev, ctx_count))`, run the
+    /// `option_b`: when `Some((block_table_dev, ctx_count, block_table_len))`,
+    /// run the
     /// Phase 2 γ-only paged-attention path. ctx K/V is precomputed into
     /// the drafter's paged cache from `ctx_buffer` at slots
     /// `[0..ctx_count)`, γ K/V is written by the layer body at slots
@@ -26,7 +27,7 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         stream: u64,
         ctx_buffer: Option<(DevicePtr, usize)>,
-        option_b: Option<(DevicePtr, u32)>,
+        option_b: Option<(DevicePtr, u32, u32)>,
         scratch: &DflashScratch,
         markov_embed: DevicePtr,
         markov_bias: DevicePtr,
@@ -71,9 +72,9 @@ impl BlockDiffusionDraftHead {
         // and the ctx-side of the stream_buf / position_ids / fc_proj
         // paths. The layer body runs over γ rows only and reads ctx
         // K/V from the cache via the paged-attention dispatcher.
-        let (option_b_block_table, option_b_ctx_count) = match option_b {
-            Some((bt, cc)) => (Some(bt), cc),
-            None => (None, 0),
+        let (option_b_block_table, option_b_ctx_count, option_b_bt_len) = match option_b {
+            Some((bt, cc, len)) => (Some(bt), cc, len),
+            None => (None, 0, 0),
         };
         let option_b_on = option_b_block_table.is_some();
         let eff_ctx = if option_b_on { 0 } else { eff_ctx };
@@ -482,6 +483,7 @@ impl BlockDiffusionDraftHead {
                     inv_sqrt_d: inv_sqrt_d_local,
                     slot_mapping_gamma: slot_mapping,
                     block_table_dev: bt,
+                    block_table_len: option_b_bt_len,
                     stream,
                     block_dump: block_dump_armed,
                 })
@@ -741,7 +743,7 @@ impl BlockDiffusionDraftHead {
                     // and the γ queries at [q_offset..q_offset+γ). Record what the
                     // paged attention actually used so the harness stops guessing.
                     let (kv_len_dump, q_offset_dump) = match option_b {
-                        Some((_, cc)) => (cc + self.gamma as u32, cc),
+                        Some((_, cc, _)) => (cc + self.gamma as u32, cc),
                         None => (eff_ctx as u32 + self.gamma as u32, eff_ctx as u32),
                     };
                     // q_rope_pos: the RoPE rotation base for γ queries. After

@@ -360,7 +360,7 @@ impl BlockDiffusionDraftHead {
         // to cover the full ctx_hidden_acc plus a safety margin for γ.
         // Block_size matches from_weights.rs:68 (=16).
         let option_b_enabled = self.startup.option_b_enabled;
-        let option_b_arg: Option<(DevicePtr, u32)> = if option_b_enabled {
+        let option_b_arg: Option<(DevicePtr, u32, u32)> = if option_b_enabled {
             // Lazy block table init. ctx slots come from precompute over the
             // accumulated target hiddens; γ slots come from the layer body.
             // We need ceil((max_ctx_len + γ) / block_size) blocks.
@@ -522,7 +522,11 @@ impl BlockDiffusionDraftHead {
             } else {
                 dstate.ctx_count_drafter as u32
             };
-            Some((dstate.block_table_dev.unwrap(), effective_ctx_count))
+            Some((
+                dstate.block_table_dev.unwrap(),
+                effective_ctx_count,
+                dstate.block_table.len() as u32,
+            ))
         } else {
             None
         };

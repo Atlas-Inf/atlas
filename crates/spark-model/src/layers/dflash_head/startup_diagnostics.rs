@@ -49,6 +49,10 @@ pub struct DsparkDiagnostics {
     pub precompute_dump: bool,
     /// `ATLAS_DFLASH_OPTION_B_DIAG=1`.
     pub option_b_diag: bool,
+    /// `ATLAS_DFLASH_OPTION_B_DIAG_EVERY=1` — like `option_b_diag` but
+    /// fires on EVERY layer-0 propose instead of latching after the
+    /// first. Diagnostic only: injects a D2H + synchronize per propose.
+    pub option_b_diag_every: bool,
 }
 
 impl Default for DsparkDiagnostics {
@@ -73,6 +77,7 @@ impl Default for DsparkDiagnostics {
             batch_parity: false,
             precompute_dump: false,
             option_b_diag: false,
+            option_b_diag_every: false,
         }
     }
 }
@@ -112,6 +117,7 @@ impl DsparkDiagnostics {
             batch_parity: one("ATLAS_DFLASH_BATCH_PARITY"),
             precompute_dump: one("ATLAS_DFLASH_PRECOMPUTE_DUMP"),
             option_b_diag: one("ATLAS_DFLASH_OPTION_B_DIAG"),
+            option_b_diag_every: one("ATLAS_DFLASH_OPTION_B_DIAG_EVERY"),
         }
     }
 }

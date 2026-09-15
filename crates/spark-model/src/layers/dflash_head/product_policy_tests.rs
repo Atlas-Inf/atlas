@@ -233,6 +233,7 @@ fn raw_reader_rejects_every_existing_forbidden_proposal_diagnostic() {
         "ATLAS_DIAG_GEMMA4",
         "ATLAS_DFLASH_DEBUG_DUMP_FULL",
         "ATLAS_DFLASH_OPTION_B_DIAG",
+        "ATLAS_DFLASH_OPTION_B_DIAG_EVERY",
         "ATLAS_DFLASH_PRECOMPUTE_DUMP",
         "ATLAS_DFLASH_VERIFY_TRACE",
         "ATLAS_DFLASH_LOG_DRAFTS",
