@@ -464,7 +464,46 @@ avg TPS 7.0. The third long-context probe (~16 k tokens) 400s against
 Chain `~/dp4a-ab/dflash_overnight.sh`, serve profile DFLASH=1 + Option B +
 small-M GEMV defaults, binary `4de8cd79…`:
 
-- ST-995 (bfcl-subset golden draw, n=995) — PENDING, filled in when the
-  chain completes.
-- ST-996 (bfcl_v4 12/23/46, n~1004) — PENDING.
-- MLPerf agentic-coding 2.5h (20 trajectories, prefix caching) — PENDING.
+- **ST-995 (bfcl-subset golden draw, n=995)** — observed under
+  `st995-fingerprint.txt` (commit `b517dd6d9`, binary sha `4de8cd79…`,
+  nvidia/Qwen3.8-27B-NVFP4 rev `dbb8f445`, drafter
+  incoai/Qwen3.8-27B-DFlash2 γ=8, Option B, small-M GEMV, GPU_UTIL 0.80,
+  max-seq 8192, prefill 2048, kv bf16, head nvfp4, bs1, ssm-slots 0,
+  `--disable-thinking --disable-tool-grammar true --request-timeout 900`):
+  golden draw n=995 seed 42 temp 0, no param overrides — **overall 85.13 /
+  normalized single-turn 78.41**, run record
+  `~/.atlas/runs/bfcl-subset/run-1789510215749772387.json`, 5 h 04 m wall
+  (17:06→22:10Z). Accept over the leg: mean_na avg 5.673 median 6.000,
+  tok_step avg 6.673 median 7.000 (n=997 requests). Per-subset:
+  irrelevance 75.00, live_irrelevance 46.59, live_multiple 87.62,
+  live_parallel 87.50, live_parallel_multiple 75.00, live_simple 92.00,
+  multiple 96.77, parallel 88.71, parallel_multiple 87.10, simple_java
+  67.74, simple_javascript 74.19, simple_python 95.97; categories
+  hallucination 60.80 / live 86.47 / non_live 87.97.
+  - Reference rows — each an observation on a different
+    stack/binary/checkpoint, not an A/B: Strix MTP K=4, shipped nvidia
+    checkpoint, 2026-09-11: 83.22 / 79.02 (run-1789114625433625524,
+    BENCH.toml); Strix MTP K=4 on the FP8→NVFP4 requant derivative,
+    2026-09-14: 83.02 / 80.41 (run-1789370409958768995) with
+    hallucination 75.38 / live 84.71 / non_live 81.15, simple_java
+    45.16, simple_javascript 29.03; GB10 nvidia-checkpoint MTP/n-gram
+    runs 2026-09-12/13: 85.13 / 76.60 with hallucination 55.11,
+    simple_java 67.74, simple_javascript 74.19
+    (QWEN38_PORT_GAP_ANALYSIS §F.2, runs run-1789206159965049753 /
+    run-1789290824981666674).
+  - The DFlash2 leg's overall score and its
+    simple_java/simple_javascript/hallucination profile coincide with
+    the GB10 nvidia-checkpoint runs, and sit +1.91 overall / −0.61
+    normalized from the Strix shipped-nvidia MTP record; the
+    hallucination-category gap vs the requant-checkpoint run is the
+    checkpoint-behaviour pattern §F.2 already documented (weights
+    differ between those two rows). The normalized floor 85.32 shown
+    by the runner is the MLPerf-submission-checkpoint reference and
+    does not gate this checkpoint (runner's own verdict text).
+- **ST-996 (bfcl_v4 12/23/46, n~1004) — dropped from the chain** (merge
+  window); the handover watcher stopped the leg at its banner before it
+  ran. No data recorded.
+- **MLPerf agentic-coding 2.5h (20 trajectories, prefix caching)** —
+  running: outdir `~/dp4a-ab/out/dflash-agentic-20260915T2247Z`, γ=8,
+  max-seq 24576, `--enable-prefix-caching`, SSM_SLOTS=16 with
+  SSM_CKPT_INTERVAL=128 (20 Marconi slots), ETA ~03:00Z.
