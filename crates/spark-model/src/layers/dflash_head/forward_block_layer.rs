@@ -91,19 +91,7 @@ impl BlockDiffusionDraftHead {
         let attn_conv_out_delta = if let Some(ref conv) = layer.attention_conv {
             let out_delta = conv.prepare(
                 gpu,
-                &|src, w, dst, m, n, k| {
-                    ops::dense_gemm_bf16_pipelined(
-                        gpu,
-                        self.kernels.dense_gemm_pipelined,
-                        src,
-                        w,
-                        dst,
-                        m,
-                        n,
-                        k,
-                        stream,
-                    )
-                },
+                &|s, w, d, m, n, k| self.drafter_pipelined_gemm(gpu, s, w, d, m, n, k, stream),
                 self.kernels.dflash2_conv,
                 scratch.norm_buf,
                 scratch.dflash2_conv_delta,
@@ -392,19 +380,7 @@ impl BlockDiffusionDraftHead {
         let mlp_conv_out_delta = if let Some(ref conv) = layer.mlp_conv {
             let out_delta = conv.prepare(
                 gpu,
-                &|src, w, dst, m, n, k| {
-                    ops::dense_gemm_bf16_pipelined(
-                        gpu,
-                        self.kernels.dense_gemm_pipelined,
-                        src,
-                        w,
-                        dst,
-                        m,
-                        n,
-                        k,
-                        stream,
-                    )
-                },
+                &|s, w, d, m, n, k| self.drafter_pipelined_gemm(gpu, s, w, d, m, n, k, stream),
                 self.kernels.dflash2_conv,
                 scratch.norm_buf,
                 scratch.dflash2_conv_delta,
