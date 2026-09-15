@@ -47,7 +47,7 @@ impl Qwen3SsmLayer {
     /// Mirrors `qwen3_attention::prefill_weights::transpose_fp8_for_prefill`.
     ///
     /// Without the transposed copies the SSM prefill projections fall through
-    /// to the strided non-pipelined `w8a16_gemm`, which reads B[N,K] with a
+    /// to the strided non-pipelined `w8a16_gemm`, which reads B\[N,K\] with a
     /// stride-K single-byte access per thread — ~15x under the memory floor on
     /// gfx1151 where the cp.async pipelined variant is absent. The transpose
     /// kernels live in the `w8a16_gemm_t` module, so this is a no-op where that
