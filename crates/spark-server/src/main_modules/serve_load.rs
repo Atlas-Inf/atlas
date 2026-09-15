@@ -361,6 +361,10 @@ pub(crate) fn load_model(
         config.vision = None;
     }
 
+    // Resolve dflash γ first — the dflash num_drafts default derives from it.
+    // Explicit --dflash-gamma → MODEL.toml [dflash].gamma → engine default.
+    // After this call `args.resolved_dflash_gamma()` is valid on dflash runs.
+    serve_phases::apply_model_default_dflash_gamma(&mut args, &ptx_set);
     // Resolve num_drafts: explicit --num-drafts (any value) → MODEL.toml
     // [behavior].default_num_drafts → engine default. After this call
     // `args.num_drafts` is Some and `args.resolved_num_drafts()` is valid.
@@ -613,7 +617,7 @@ pub(crate) fn load_model(
             .map(|(s, c)| spark_model::factory::DflashBuildArgs {
                 drafter_store: s,
                 drafter_config: c.clone(),
-                gamma: Some(args.dflash_gamma),
+                gamma: Some(args.resolved_dflash_gamma()),
                 window_size: if args.dflash_window_size > 0 {
                     Some(args.dflash_window_size)
                 } else {
@@ -827,7 +831,7 @@ pub(crate) fn load_model(
     // proposer for γ tokens (DraftProposer::propose semantics: "up to
     // num_drafts" → drafts.len() = γ → routes to step_verify_dflash).
     let num_drafts = if args.dflash {
-        serve_phases::checked_dflash_num_drafts(args.dflash_gamma)?
+        serve_phases::checked_dflash_num_drafts(args.resolved_dflash_gamma())?
     } else {
         args.resolved_num_drafts()
     };
@@ -835,7 +839,7 @@ pub(crate) fn load_model(
     if args.dflash {
         tracing::info!(
             "DFlash speculative decoding: ENABLED (γ={}, window={}, drafter installed)",
-            args.dflash_gamma,
+            args.resolved_dflash_gamma(),
             if args.dflash_window_size == 0 {
                 "full".to_string()
             } else {
