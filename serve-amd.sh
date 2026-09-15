@@ -13,8 +13,8 @@
 # Defaults below are the validated serving configuration: K=4 MTP speculative
 # decode + the default-on DP4A arm (28.3–28.6 tok/s, bfcl-subset 995-row
 # 83.02/80.41, run-1789370409958768995). NUM_DRAFTS=0 reproduces the frozen
-# non-spec accuracy recipe the unsloth baseline was certified under; the
-# FP8-preservation exports remain exactly that recipe's.
+# non-spec accuracy recipe; the FP8-preservation exports auto-enable only for
+# the unsloth checkpoint that needs them.
 set -euo pipefail
 cd "$(dirname "$0")"
 MODEL="${1:-nvidia/Qwen3.8-27B-NVFP4}"
@@ -26,10 +26,11 @@ BIN="${ATLAS_BIN:-$TARGET_DIR/release/spark}"
 
 # ── gfx1151 runtime shims (each explained in docs §4) ────────────────────────
 export ATLAS_W4A16_VARIANT=v1     # BF16-MMA NVFP4 GEMM (SCALE device FP8 encode is broken on gfx1151)
-# ATLAS_W4A16_DP4A is now ON BY DEFAULT (the int8-DP4A decode GEMV arm is
-# accuracy-validated: 995-row bfcl-subset 83.02/80.41, 511/511 M=1 argmax
-# match vs float). No export here — a user-set ATLAS_W4A16_DP4A=0 must keep
-# working as the opt-out.
+# ATLAS_W4A16_DP4A is ON BY DEFAULT in current source (the int8-DP4A decode
+# GEMV arm is accuracy-validated: 995-row bfcl-subset 83.02/80.41, 511/511
+# M=1 argmax match vs float). The :- default export keeps the arm on for
+# binaries built before the default flip while preserving =0 as the opt-out.
+export ATLAS_W4A16_DP4A="${ATLAS_W4A16_DP4A:-1}"
 #
 # NOT set, though every earlier Strix doc lists it: ATLAS_FORCE_GLOBAL_GDN=1.
 # It has ZERO readers in crates/ on current main (only docs/ still mention it).
@@ -78,18 +79,23 @@ MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-2048}"
 # which measured the unified-memory pool correctly on both Linux and Windows.
 export ATLAS_KV_EXTERNAL_RESERVE_GB="${ATLAS_KV_EXTERNAL_RESERVE_GB:-0}"
 
-# ── per-row FP8 preservation (correctness default for the unsloth checkpoint) ─
-# The authoritative checkpoint stores attention, GDN, lm_head and the final
-# eight FFN layers as per-row-FP8 inside an NVFP4 net. The block-scaled w8a16
-# kernels cannot consume [N,1] row scales, and the old fallback requantised
-# them to NVFP4 (destructive). These flags dequant once to BF16 instead; the
-# policy no-ops for checkpoints whose projections are not all per-row FP8, so
-# exporting them unconditionally is safe for every other model. On gfx1151 the
-# BF16 FFN prefill routes through the CPU-oracle-validated pipelined WMMA GEMM
-# (the `dense_gemm_tc` port writes only part of its output tile there).
-export ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1
-export ATLAS_FP8_DEQUANT_FFN_TO_BF16=1
-export ATLAS_GDN_BF16_WEIGHTS=1
+# ── per-row FP8 preservation (required ONLY for the unsloth checkpoint) ──────
+# The unsloth checkpoint stores attention, GDN, lm_head and the final eight FFN
+# layers as per-row-FP8 inside an NVFP4 net; the block-scaled w8a16 kernels
+# cannot consume [N,1] row scales, so these flags dequant once to BF16. They
+# are NOT no-ops elsewhere: on checkpoints without FP8 projections (the
+# NVIDIA MIXED_PRECISION checkpoint included) the forced dequant path faults
+# the first prefill kernel — observed on gfx1151 as a gfxhub page fault /
+# hipErrorIllegalAddress at "Chunked prefill start". Auto-enabled for unsloth
+# checkpoints; FP8_DEQUANT=1 forces on for a local unsloth snapshot path,
+# FP8_DEQUANT=0 forces off.
+case "${FP8_DEQUANT:-auto}:$MODEL" in
+  1:*|auto:*unsloth*)
+    export ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1
+    export ATLAS_FP8_DEQUANT_FFN_TO_BF16=1
+    export ATLAS_GDN_BF16_WEIGHTS=1
+    ;;
+esac
 # Never let a host environment silently re-enable the quarantined tc kernel.
 unset ATLAS_FFN_BF16_PREFILL_TC
 
