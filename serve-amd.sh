@@ -74,7 +74,9 @@ export ATLAS_MTP_GATE_REPROBE=64  # re-probe the MTP accept gate every 64 tokens
 # ST-995 run under (2026-09-02 fingerprint, see the handoff): 0.88 utilization
 # is the largest that leaves non-fragmented headroom for the SSM pool after the
 # 43.1 GB pre-KV BF16-preservation load; 4096 context matches the gate draws.
-GPU_UTIL="${GPU_UTIL:-0.88}"
+# The actual default is resolved below the DFLASH block — DFlash needs a
+# smaller one (see below).
+GPU_UTIL="${GPU_UTIL:-}"
 SSM_SLOTS="${SSM_SLOTS:-0}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 # Qwen3.8 tool schemas routinely exceed 2K tokens. The corrected BC=32 paged-
@@ -154,6 +156,11 @@ if [ "${DFLASH:-0}" = "1" ]; then
   DFLASH_ARGS=(--dflash --draft-model "${DRAFT_MODEL:-incoai/Qwen3.8-27B-DFlash2}")
   [ -n "${DFLASH_GAMMA:-}" ] && DFLASH_ARGS+=(--dflash-gamma "$DFLASH_GAMMA")
 fi
+# GPU_UTIL default: 0.88 plain / 0.80 under DFlash. The KV budget is computed
+# before the ~5 GB drafter (weights + KV pool + scratch) allocates, so at 0.88
+# the DFlash2 serve OOM'd on gfx1151 (cuMemAlloc status 2, 4.2 GB free at a
+# 635 MB request, 2026-09-15); 0.80 leaves the headroom the drafter needs.
+GPU_UTIL="${GPU_UTIL:-$([ "${DFLASH:-0}" = 1 ] && echo 0.80 || echo 0.88)}"
 
 GFX=$("$ROCM_HOME/bin/rocminfo" 2>/dev/null | sed -n 's/.*\(gfx[0-9][0-9]*\).*/\1/p' | head -1)
 echo "serving $MODEL on ${GFX:-AMD} via $HW"
