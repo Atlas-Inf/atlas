@@ -166,6 +166,18 @@ their target, so pass real interpreter paths; and a process created via
 `Win32_Process.Create` does not inherit the interactive profile, so `HOME` must
 be set explicitly or spark cannot place `~/.atlas`.
 
+A third trap of the same family hit the `agentic-webserver` leg: its `bash`
+tool runs `sh.exe -c ...`, resolved through the scoop shim — whose `.shim`
+target was `scoop\apps\git\current\...`, a junction Windows refused to traverse
+("untrusted mount point", undeletable by the user). Every shell call failed
+before reaching a real shell, so the model retried the same probe for all 40
+turns — a deterministic 0/30 that is a *harness environment failure*, not a
+model result. Diagnose by reading a `sandbox\run-NN.trajectory.txt`: shim
+stderr shows `Could not create process`. Fix by repointing the affected
+`scoop\shims\*.shim` files at the versioned dir (`apps\git\<ver>\bin\...`) —
+recreating the junction is not required. Verify with `sh -c 'echo ok'` before
+rerunning.
+
 Run on ROCm **6.4**. ROCm 7.2 reproduced the status-719 hard fault from the table
 above during model build, so it was not used for measurement. The perf figures
 are a **baseline, not a gate** — Qwen3.8-27B carries no committed thresholds, and
