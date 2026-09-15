@@ -6,6 +6,7 @@
 #   ./serve-amd.sh unsloth/Qwen3.8-27B-NVFP4        # or any local snapshot path
 #   PORT=9000 MAX_SEQ_LEN=32768 ./serve-amd.sh
 #   DFLASH=1 DRAFT_MODEL=/path/to/dflash2 ./serve-amd.sh   # DFlash2 spec decode
+#   SSM_CKPT_INTERVAL=128 ./serve-amd.sh   # coarser SSM snapshots for long ctx
 #
 # DFLASH=1 swaps MTP for the DFlash2 drafter: it appends --dflash
 # --draft-model (DRAFT_MODEL, default incoai/Qwen3.8-27B-DFlash2) and forces
@@ -78,6 +79,12 @@ export ATLAS_MTP_GATE_REPROBE=64  # re-probe the MTP accept gate every 64 tokens
 # smaller one (see below).
 GPU_UTIL="${GPU_UTIL:-}"
 SSM_SLOTS="${SSM_SLOTS:-0}"
+# SSM_CKPT_INTERVAL: tokens between Marconi snapshots; default 16 (=256
+# tok/snapshot, the certified warm-prefill recipe). The engine raises
+# --ssm-cache-slots to cover MAX_SEQ_LEN at that granularity, so at 24K ctx
+# the default costs 104 slots × 151 MB — set e.g. 128 (2048 tok/snapshot →
+# 20 slots, 3 GB) for long-context serving with the DFlash2 drafter resident.
+SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-16}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 # Qwen3.8 tool schemas routinely exceed 2K tokens. The corrected BC=32 paged-
 # prefill kernel preserves all query rows across chunks, so the 0.99 GB arena
@@ -187,6 +194,6 @@ exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-nvfp4}" --max-batch-size "${MAX_BATCH:-1}" \
   "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" \
-  --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval 16 \
+  --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval "$SSM_CKPT_INTERVAL" \
   $ALLOW_FALLBACKS \
   "$@"
