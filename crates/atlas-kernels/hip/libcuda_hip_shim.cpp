@@ -256,13 +256,6 @@ int cuStreamSynchronize(void* s)                    {
 // spark-runtime (copy_d2h_on_stream) after this shim was written.
 int cuStreamQuery(void* s)                          { return hipStreamQuery((hipStream_t)s); }
 int cuStreamWaitEvent(void* s, void* e, unsigned f) { return hipStreamWaitEvent((hipStream_t)s, (hipEvent_t)e, f); }
-<<<<<<< HEAD
-int cuStreamBeginCapture(void* s, int mode)         { return hipStreamBeginCapture((hipStream_t)s, (hipStreamCaptureMode)mode); }
-int cuStreamEndCapture(void* s, void** pgraph)      { return hipStreamEndCapture((hipStream_t)s, (hipGraph_t*)pgraph); }
-// cudarc's cuStreamIsCapturing(stream, *status) — hip twin writes the same
-// hipStreamCaptureStatus enum (NONE=0 .. GLOBAL/THREAD_LOCAL/RELAXED).
-int cuStreamIsCapturing(void* s, unsigned* status)  { return hipStreamIsCapturing((hipStream_t)s, (hipStreamCaptureStatus*)status); }
-=======
 int cuStreamBeginCapture(void* s, int mode)         {
     if (atlas_trace_launch()) { fprintf(stderr, "[graph] begin_capture stream=%p mode=%d\n", s, mode); fflush(stderr); }
     int r = hipStreamBeginCapture((hipStream_t)s, (hipStreamCaptureMode)mode);
@@ -274,7 +267,9 @@ int cuStreamEndCapture(void* s, void** pgraph)      {
     if (atlas_trace_launch()) { fprintf(stderr, "[graph] end_capture -> %d graph=%p\n", r, pgraph?*pgraph:nullptr); fflush(stderr); }
     return r;
 }
->>>>>>> f52757f86 (spark-model/kernels: gfx1151 block-scaled FP8 m128 prefill GEMM + Strix-Windows port infra)
+// cudarc's cuStreamIsCapturing(stream, *status) — hip twin writes the same
+// hipStreamCaptureStatus enum (NONE=0 .. GLOBAL/THREAD_LOCAL/RELAXED).
+int cuStreamIsCapturing(void* s, unsigned* status)  { return hipStreamIsCapturing((hipStream_t)s, (hipStreamCaptureStatus*)status); }
 
 // ── events ────────────────────────────────────────────────────────────
 int cuEventCreate(void** e, unsigned flags) { return hipEventCreateWithFlags((hipEvent_t*)e, flags); }

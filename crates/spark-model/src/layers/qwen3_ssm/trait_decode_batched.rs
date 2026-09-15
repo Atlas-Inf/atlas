@@ -359,7 +359,6 @@ impl Qwen3SsmLayer {
             }
         } else if num_tokens == 4 {
             if let Some(ref nvfp4) = self.qkvz_nvfp4 {
-<<<<<<< HEAD
                 // DP4A arm first (same as the multi-seq mixer): int8-quantize
                 // `normed` once and run `w4a16_gemv_dp4a_batch4_d4`; falls
                 // back to the identical `w4a16_gemv_batchm` call when DP4A is
@@ -367,18 +366,6 @@ impl Qwen3SsmLayer {
                 self.ssm_fp4_proj(
                     ctx,
                     "qkvz",
-=======
-                if ctx.levers.k4_diag {
-                    tracing::info!(
-                        "K4_DIAG qkvz==4 nvfp4 arm: batchm handle={:#x} n={} k={}",
-                        self.w4a16_batchm.kernel(4).0,
-                        qkvz_size,
-                        h
-                    );
-                }
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
->>>>>>> edd5cc20b (strix-windows(qwen3.8): native-FP8 GDN decode + bf16-fdot2 GEMV + watchdog/config fixes)
                     self.w4a16_batchm.kernel(num_tokens as u32),
                     normed,
                     nvfp4,

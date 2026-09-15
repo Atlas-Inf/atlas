@@ -234,7 +234,6 @@ impl TransformerModel {
                 self.gpu.synchronize(stream)?;
                 layer_times.push(lt0.elapsed().as_micros());
             }
-<<<<<<< HEAD
             // Hyper-stream RMS trail (`ATLAS_DUMP_HYPER_RMS=1`): after each
             // layer, RMS over the FP32 mHC highway [proc_count, hc_mult, H]
             // — directly comparable to the reference golden's `layer_rms`
@@ -256,10 +255,9 @@ impl TransformerModel {
                     "HYPER_RMS layer {i} tokens {proc_count} rms {:.6}",
                     (ssq / n as f64).sqrt()
                 );
-=======
+            }
             if !profile_now && sync_every > 0 && (i + 1) % sync_every == 0 {
                 self.gpu.synchronize(stream)?;
->>>>>>> f52757f86 (spark-model/kernels: gfx1151 block-scaled FP8 m128 prefill GEMM + Strix-Windows port infra)
             }
             // MLA diagnostic: per-layer hidden norm for Mistral (once per model).
             // Per-model latch (see `ModelStats::dumped`) rather than a static: an

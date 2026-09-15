@@ -62,7 +62,7 @@ impl TransformerModel {
             // `tid2eid[token_id]` per token in this same chunk order.
             self.gpu
                 .copy_h2d_async(token_ids_bytes, self.buffers.token_ids(), stream)?;
-<<<<<<< HEAD
+            let t_h2d = _tp.elapsed();
             if self.has_ngram_embedding() {
                 // THE chunked-prefill embed. n-gram hashes read behind the
                 // chunk, so hand it the earlier tokens of the prompt as well.
@@ -85,20 +85,7 @@ impl TransformerModel {
                     stream,
                 )?;
             }
-=======
-            let t_h2d = _tp.elapsed();
-            ops::batched_embed(
-                self.gpu.as_ref(),
-                self.batched_embed_kernel,
-                token_ids_dev,
-                self.embed_tokens.weight,
-                hidden_dst,
-                chunk_len as u32,
-                h as u32,
-                stream,
-            )?;
             let t_gather = _tp.elapsed();
->>>>>>> f52757f86 (spark-model/kernels: gfx1151 block-scaled FP8 m128 prefill GEMM + Strix-Windows port infra)
             if std::env::var("ATLAS_DUMP_EMBED").ok().as_deref() == Some("1") {
                 self.gpu.synchronize(stream)?;
                 let offset = (chunk_len - 1) * h * 2;

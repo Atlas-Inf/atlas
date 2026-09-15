@@ -340,7 +340,6 @@ impl TransformerModel {
             Some(p) => Some(p.alloc_state(self.gpu.as_ref())?),
             None => None,
         };
-<<<<<<< HEAD
         if let Some(dstate) = proposer_state
             .as_mut()
             .and_then(|state| state.as_any_mut().downcast_mut::<DflashProposerState>())
@@ -353,9 +352,7 @@ impl TransformerModel {
                 dstate.ctx_slot_bytes,
             )?);
         }
-=======
         let t_proposer = t_alloc.elapsed();
->>>>>>> f52757f86 (spark-model/kernels: gfx1151 block-scaled FP8 m128 prefill GEMM + Strix-Windows port infra)
 
         // No graph invalidation needed — pool addresses are stable across sequences.
 
