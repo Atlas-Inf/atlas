@@ -21,7 +21,7 @@
 #
 #        powershell -ExecutionPolicy Bypass -File scripts\strix-windows\first_run.ps1
 #
-# Either way it ends by serving `unsloth/Qwen3.8-27B-NVFP4` and firing a smoke
+# Either way it ends by serving `nvidia/Qwen3.8-27B-NVFP4` and firing a smoke
 # request at it, so a successful run prints a real completion.
 #
 # The serve flags and env below are the fingerprinted fp8d recipe behind the
@@ -39,7 +39,7 @@
 #   ATLAS_BIN        prebuilt spark.exe. Set it to skip straight to serving.
 #   ATLAS_REPO       repo root.        Default: the checkout this script lives in.
 #   ATLAS_MODEL_DIR  weights snapshot. Default: $env:USERPROFILE\models\Qwen3.8-27B-NVFP4
-#   ATLAS_MODEL_NAME served model id. Default: unsloth/Qwen3.8-27B-NVFP4.
+#   ATLAS_MODEL_NAME served model id. Default: nvidia/Qwen3.8-27B-NVFP4.
 #                    This drives kernel-target resolution -- see $ModelName below.
 #   HIP_PATH         ROCm SDK root.    Default: newest under C:\TheRock or C:\Program Files\AMD\ROCm
 #   ATLAS_MAX_SEQ_LEN --max-seq-len. Default 4096, matching the validated gate.
@@ -79,7 +79,7 @@ $BindHost = if ($env:ATLAS_BIND) { $env:ATLAS_BIND } else { '127.0.0.1' }
 # Qwen3.8-specific, so custom snapshot-directory names must not silently select
 # Qwen3.6; ATLAS_MODEL_NAME remains an explicit override.
 $ModelName = if ($env:ATLAS_MODEL_NAME) { $env:ATLAS_MODEL_NAME }
-             else { 'unsloth/Qwen3.8-27B-NVFP4' }
+             else { 'nvidia/Qwen3.8-27B-NVFP4' }
 
 # ATLAS_BIN points at a prebuilt spark.exe (the CI zip). When it is set there is
 # nothing to build, so the binary's own directory takes the place of target/ and

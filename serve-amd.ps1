@@ -1,7 +1,7 @@
 # Serve a model with Atlas on AMD GPUs under Windows. Verified coherent on
 # gfx1151 / Strix Halo with Qwen3.8-27B-NVFP4. Windows twin of serve-amd.sh.
 #
-#   .\serve-amd.ps1                          # unsloth/Qwen3.8-27B-NVFP4 (default)
+#   .\serve-amd.ps1                          # nvidia/Qwen3.8-27B-NVFP4 (default)
 #   .\serve-amd.ps1 D:\models\Qwen3.8-27B-NVFP4   # a local weights snapshot
 #   $env:ATLAS_PORT=9000; .\serve-amd.ps1
 #
