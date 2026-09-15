@@ -45,7 +45,9 @@
 #   HIP_PATH         ROCm SDK root.    Default: newest under C:\TheRock or C:\Program Files\AMD\ROCm
 #   ATLAS_MAX_SEQ_LEN --max-seq-len. Default 4096, matching the validated gate.
 #   ATLAS_MAX_PREFILL_TOKENS --max-prefill-tokens. Default 2048.
-#   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.70.
+#   ATLAS_GPU_UTIL   --gpu-memory-utilization. Default 0.95, matching the
+#                    fingerprinted fp8d recipe -- on a ~63 GB gfx1151 the
+#                    nvidia checkpoint leaves ~5 GB for KV only at >=0.93.
 #   ATLAS_PORT       serve port.       Default 8081.
 #   ATLAS_BIND       serve host.       Default 127.0.0.1.
 #
@@ -79,7 +81,7 @@ $ModelName = if ($env:ATLAS_MODEL_NAME) { $env:ATLAS_MODEL_NAME }
 # rowwise copies resident at once and exhausts the KV budget.
 $ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
             else { "$env:USERPROFILE\models\$(($ModelName -split '/')[-1])" }
-$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.70' }
+$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.95' }
 # The validated Qwen3.8 gate uses 4096 context and a 2048-token prefill arena.
 $MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '4096' }
 $MaxPrefill = if ($env:ATLAS_MAX_PREFILL_TOKENS) { $env:ATLAS_MAX_PREFILL_TOKENS } else { '2048' }
@@ -524,10 +526,13 @@ try {
     # and spark rejects the whole command line.
     #
     # Remaining deltas vs the proven recipe are sizing-only and deliberate:
-    # max-seq 4096 / util 0.70 keep the first-run memory footprint conservative
-    # (env-overridable); --disable-thinking keeps the smoke answer inside
-    # 64 tokens. Drafts=3 and ssm-cache-slots=64 match the proven profile —
-    # those select the exercised kernel arms, not just capacity.
+    # max-seq 4096 keeps the first-run memory footprint conservative
+    # (env-overridable); util 0.95 matches the fingerprinted recipe — the
+    # ~63 GB gfx1151 budget only clears the ~14.6 GB inference reserve plus a
+    # usable KV slice at >=0.93 on the nvidia checkpoint. --disable-thinking
+    # keeps the smoke answer inside 64 tokens. Drafts=3 and ssm-cache-slots=64
+    # match the proven profile — those select the exercised kernel arms, not
+    # just capacity.
     $serveArgs = @('serve', $ModelDir)
     $serveArgs += @(
         '--no-fast-load'
