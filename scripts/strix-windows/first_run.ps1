@@ -38,7 +38,8 @@
 # Optional (all have working defaults):
 #   ATLAS_BIN        prebuilt spark.exe. Set it to skip straight to serving.
 #   ATLAS_REPO       repo root.        Default: the checkout this script lives in.
-#   ATLAS_MODEL_DIR  weights snapshot. Default: $env:USERPROFILE\models\Qwen3.8-27B-NVFP4
+#   ATLAS_MODEL_DIR  weights snapshot. Default: $env:USERPROFILE\models\<leaf of
+#                    ATLAS_MODEL_NAME> -- nvidia-Qwen3.8-27B-NVFP4 by default.
 #   ATLAS_MODEL_NAME served model id. Default: nvidia/Qwen3.8-27B-NVFP4.
 #                    This drives kernel-target resolution -- see $ModelName below.
 #   HIP_PATH         ROCm SDK root.    Default: newest under C:\TheRock or C:\Program Files\AMD\ROCm
@@ -66,20 +67,24 @@ $ErrorActionPreference = 'Stop'
 # from any working directory and from a moved clone.
 $RepoRoot = if ($env:ATLAS_REPO) { $env:ATLAS_REPO }
             else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
-$ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
-            else { "$env:USERPROFILE\models\Qwen3.8-27B-NVFP4" }
-$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.70' }
-# The validated Qwen3.8 gate uses 4096 context and a 2048-token prefill arena.
-$MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '4096' }
-$MaxPrefill = if ($env:ATLAS_MAX_PREFILL_TOKENS) { $env:ATLAS_MAX_PREFILL_TOKENS } else { '2048' }
-$Port     = if ($env:ATLAS_PORT) { $env:ATLAS_PORT } else { '8081' }
-$BindHost = if ($env:ATLAS_BIND) { $env:ATLAS_BIND } else { '127.0.0.1' }
 
 # The served model name resolves the exact Qwen3.8 kernel target. This branch is
 # Qwen3.8-specific, so custom snapshot-directory names must not silently select
 # Qwen3.6; ATLAS_MODEL_NAME remains an explicit override.
 $ModelName = if ($env:ATLAS_MODEL_NAME) { $env:ATLAS_MODEL_NAME }
              else { 'nvidia/Qwen3.8-27B-NVFP4' }
+# The default weights dir derives from the checkpoint leaf so ATLAS_MODEL_NAME
+# and ATLAS_MODEL_DIR cannot drift apart: serving an unsloth snapshot (per-row
+# FP8 GDN weights) under the nvidia name keeps NVFP4 + transposed + prefill +
+# rowwise copies resident at once and exhausts the KV budget.
+$ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
+            else { "$env:USERPROFILE\models\$(($ModelName -split '/')[-1])" }
+$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.70' }
+# The validated Qwen3.8 gate uses 4096 context and a 2048-token prefill arena.
+$MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '4096' }
+$MaxPrefill = if ($env:ATLAS_MAX_PREFILL_TOKENS) { $env:ATLAS_MAX_PREFILL_TOKENS } else { '2048' }
+$Port     = if ($env:ATLAS_PORT) { $env:ATLAS_PORT } else { '8081' }
+$BindHost = if ($env:ATLAS_BIND) { $env:ATLAS_BIND } else { '127.0.0.1' }
 
 # ATLAS_BIN points at a prebuilt spark.exe (the CI zip). When it is set there is
 # nothing to build, so the binary's own directory takes the place of target/ and

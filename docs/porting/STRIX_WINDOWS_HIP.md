@@ -196,7 +196,7 @@ point one variable at it, run one script:
 #    versioned HIP runtime (amdhip64_6.dll on 6.x, amdhip64_7.dll on 7.x).
 
 # 2. Weights (~21 GB):
-hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir "$env:USERPROFILE\models\Qwen3.8-27B-NVFP4"
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-27B-NVFP4"
 
 # 3. Serve + smoke test:
 $env:ATLAS_BIN = "C:\path\to\unzipped\spark.exe"
