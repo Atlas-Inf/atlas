@@ -14,27 +14,34 @@
 
 use std::path::PathBuf;
 
-fn source() -> String {
+fn sources() -> Vec<String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    std::fs::read_to_string(root.join("kernels/gb10/common/argmax_bf16.cu")).unwrap()
+    [
+        "kernels/gb10/common/argmax_bf16.cu",
+        "kernels/strix-hip/common/argmax_bf16.cu",
+    ]
+    .iter()
+    .map(|p| std::fs::read_to_string(root.join(p)).unwrap())
+    .collect()
 }
 
 #[test]
 fn cuda_argmax_keeps_the_first_strict_maximum() {
-    let src = source();
-    assert!(
-        !src.contains("argmax_other_better"),
-        "the last-index-wins comparator must not come back silently"
-    );
-    assert!(
-        !src.contains("other_idx > mine_idx"),
-        "equal maxima must never select the higher vocabulary index"
-    );
-    // Every scan advances only on a strictly greater value: first max wins.
-    assert!(
-        src.matches("if (v > local_max)").count() >= 3,
-        "each strided scan must keep the first strict maximum"
-    );
+    for src in sources() {
+        assert!(
+            !src.contains("argmax_other_better"),
+            "the last-index-wins comparator must not come back silently"
+        );
+        assert!(
+            !src.contains("other_idx > mine_idx"),
+            "equal maxima must never select the higher vocabulary index"
+        );
+        // Every scan advances only on a strictly greater value: first max wins.
+        assert!(
+            src.matches("if (v > local_max)").count() >= 3,
+            "each strided scan must keep the first strict maximum"
+        );
+    }
 }
 
 #[test]
