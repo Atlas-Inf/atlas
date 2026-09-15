@@ -320,3 +320,190 @@ Measured drift, quantified:
 * The MLPerf ST-996 leg (harness bfcl_v4, 12/23/46, n=1004) is running under
   the submission serve profile (0.92/64K/MTP K=2/prefix/slots 16) — reference
   for the same draw on unsloth-3.6: 78.59 / 80.45.
+
+## 2026-09-15 — DFlash2 speculative decoding on gfx1151 (strix-hip)
+
+DFlash2 block-diffusion drafting (`incoai/Qwen3.8-27B-DFlash2`, γ=8) is ported
+to the native-HIP target. All numbers below are copied verbatim from the three
+frozen A/B summaries on AzeezStrix — every value is observed under the cited
+`fingerprint-<arm>.txt` in its outdir:
+
+- `~/dp4a-ab/out/dflash-ab-20260915T1409Z` — binary `7639415f…`, commit
+  `ed2e90d42`, harness MinHeap warmup-16 + **3×1024** + prose/json 512
+- `~/dp4a-ab/out/dflash-h128-20260915T1546Z` — binaries `7639415f…` (ob_h256)
+  / `51a6b53f…`, harness **3×512**, `ATLAS_DFLASH_STEP_TIMING=1`
+- `~/dp4a-ab/out/dflash-gemv-20260915T1632Z` — binary `4de8cd79…`, commit
+  `b517dd6d`, harness **3×512**, `ATLAS_DFLASH_STEP_TIMING=1`
+
+### How to serve
+
+```bash
+DFLASH=1 DRAFT_MODEL=/home/azeez/.models/dflash2 \
+  ./serve-amd.sh nvidia/Qwen3.8-27B-NVFP4
+```
+
+`DFLASH=1` forces the MTP `--speculative` args off (they are mutually
+exclusive on this recipe) and appends `--dflash --draft-model "$DRAFT_MODEL"`.
+`DFLASH_GAMMA` overrides the MODEL.toml γ. Three DFlash-specific defaults live
+in `serve-amd.sh`, not in MODEL.toml:
+
+- `GPU_UTIL` defaults to **0.80** under DFlash (0.88 otherwise): the KV
+  budget is computed before the ~5 GB drafter allocates, and the 0.88 launch
+  OOM'd — `cuMemAlloc status 2`, 4.2 GB free at a 635 MB request.
+- `ATLAS_DFLASH_OPTION_B=1` (the incremental paged drafter path); `=0`
+  restores the legacy propose.
+- The small-M GEMV arm for drafter projections is on by default on gfx1151;
+  `ATLAS_DFLASH_SMALL_M_GEMV=0` opts out.
+
+Note `--request-timeout` defaults to 300 s: at DFlash speeds several
+1024-token requests hit that cap (`finish=timeout` rows in the first matrix);
+pass `--request-timeout 900` for long-output legs.
+
+### What was ported
+
+`kernels/strix-hip/common/` gained, verbatim from gb10 unless noted:
+`dense_gemv_bf16_batchm.cu`, `dflash_batch_anchor_add.cu`,
+`dflash_batch_markov.cu`, `dflash2_conv.cu`, `dflash2_candidate_selector.cu`,
+the three sink paged wrappers, and HDIM=128 variants of all three sink
+wrappers (see below). `KERNEL.toml` registers the
+`prefill_paged_sink`/`prefill_paged_indirect_sink` module renames plus their
+`_h128` counterparts, and `MODEL.toml` carries the `[dflash]` block
+(draft_model `incoai/Qwen3.8-27B-DFlash2`, γ=8, window 4096, mask 248070,
+target layers [5,19,33,47,61]).
+
+`prefill_paged_compute.cuh` received the four gb10 features the sink kernels
+need, in both BR=32 and BR=64 instantiations: non-const `kv_len`/`q_offset`,
+batched `cu_seqlens`/`kv_lens`/`batch_indirect_args` geometry
+(`q_base_b`/`q_len_eff`), `q_rope_pos` for absolute masking/RoPE, the
+sliding-window `kv_block_lo` skip, and the `ATLAS_ATTN_SINKS` epilogue. This
+also fixes a pre-existing arity mismatch: the Rust
+`ops::prefill_attention_paged_batched` dispatcher already passed
+`cu_seqlens`/`kv_lens` the header did not declare — the batched-prefill path
+is untested at batch>1 on gfx1151 (max batch 1 in the serve recipe); the fix
+is by contract, not by exercise.
+
+### Two engine defects found while porting (both apply to gb10 too)
+
+**Option-B attention ran the wrong head_dim.** The drafter KV is
+`head_dim=128`, but the Option-B paged-attention dispatches
+`prefill_paged_{,indirect_,batched_}sink` built at `HDIM=256` — dims 128..255
+of each KV row read the neighbouring head's data. Fixed by `_h128` kernel
+builds selected via `paged_sink_modules_for_head_dim`. Evidence (h128
+outdir, fingerprints `ob_h256`/`ob_h128`/`legacy_h128`): mean_na
+2.215–2.462 (h256 Option B) → 3.148–4.367 (h128 Option B), matching the
+legacy path's 3.131–4.059; median tok/s 5.351 → 7.572. On GB10 this is the
+mechanism candidate for the documented Option-B acceptance drop there
+(mean_na 5.54 → ~3.9 in the 09-13 profile) — **HYPOTHESIS for GB10 until
+re-measured there.**
+
+**γ-row drafter projections used a 128-row M-tile WMMA GEMM.** At M=γ≤8 the
+pipelined `dense_gemm_bf16_pipelined` spends ~94% of its MMA work on padding
+— on gfx1151 (~2–3.5 TFLOPS BF16 WMMA) that dominated propose.
+`drafter_dense_gemm` now routes M≤8 through the bandwidth-bound
+`dense_gemv_bf16_batchm` (arm logged once per process). Evidence (gemv
+outdir, `ob_h128_gemv_g8` vs `ob_h128_gemv_g8_off`): propose median
+228.7 ms vs 361.0 ms, and the off-arm reproduces the pre-GEMV build
+bit-identically on all three MinHeap texts.
+
+### Measured matrix
+
+All MinHeap, temp 0, seed 0, `reasoning_effort=none`; first table's
+harness is 3×1024 (300 s cap), the other two 3×512 (`--request-timeout 900`).
+Every value observed under the outdir's `fingerprint-<arm>.txt`.
+
+| arm | harness | median tok/s | mean_na | verify_ms | propose_ms |
+|---|---|---|---|---|---|
+| serial | 3×1024 | 10.67 | 0.000 | — | — |
+| mtp_k4 | 3×1024 | 22.57 | 2.127–2.218 | — | — |
+| dflash_g8 (legacy) | 3×1024 | 3.55 | 3.876–4.704 | — | — |
+| dflash_g4 (legacy) | 3×1024 | 2.89 | 2.350–2.465 | — | — |
+| dflash_g6 (legacy) | 3×1024 | 3.24 | 3.223–3.645 | — | — |
+| ob_h256 | 3×512 | 5.351 | 2.215–2.462 | 286.8 | 365.8 |
+| ob_h128 | 3×512 | 7.572 | 3.148–4.367 | 296.9 | 358.3 |
+| legacy_h128 | 3×512 | 3.612 | 3.131–4.059 | 297.4 | 1028.5 |
+| mtp_k4 (control) | 3×512 | 21.308 | 1.91–2.00 | — | — |
+| ob_h128_gemv_g8 | 3×512 | 9.800 | 3.15–4.16 | 292.4 | 228.7 |
+| ob_h128_gemv_g7 | 3×512 | 9.972 | 2.77–3.96 | 269.6 | 220.3 |
+| ob_h128_gemv_g4 | 3×512 | 11.389 | 1.90–2.60 | 118.7 | 190.8 |
+| ob_h128_gemv_g8_off | 3×512 | 7.650 | 3.15–4.37 | 289.9 | 361.0 |
+
+**Parity vs serial** (serial texts from `dflash-ab-20260915T1409Z`): no
+speculative arm is byte-identical to serial on any prompt, but MTP and all
+γ=6/8 DFlash arms diverge at the same character indices — minheap 133,
+prose 15, json 42 — so the spec-vs-serial delta is not specific to any
+drafter. γ=4 additionally diverges at minheap 37.
+
+**Gates** (`tests/single_gpu_suite.py` vs a γ=8 serve):
+`gate-dflash_g8.json` — coherence 3/3, fibonacci 1/1, tool calls 2/2,
+long-context 2/3, avg TPS 5.4; `gate-ob_h128_gemv_g8.json` — same verdicts,
+avg TPS 7.0. The third long-context probe (~16 k tokens) 400s against
+`max_seq_len 8192` — a harness artifact, present on both.
+
+### Honest status / known gaps
+
+- Best observed DFlash2 on gfx1151: **11.389 tok/s** (γ=4), ≈0.5× MTP K4's
+  21.31–22.57. Drafts engage and accept well (mean_na up to 4.7, tok_step up
+  to 5.7) — the deficit is step cost, not acceptance.
+- Verify at K=γ+1 rows lands on the float `w4a16_gemv_batch8/16` tiers
+  (verify_ms median 118.7 at K=5 vs 292.4 at K=9, per the gemv-outdir
+  steptiming files) rather than the M=4 DP4A arm MTP uses.
+- Propose remains ~190–229 ms median against a ~45 ms bandwidth ESTIMATE
+  (drafter ~3.8 GB + fc + lm_head at ~100–200 GB/s — estimate, not measured);
+  rocprof ranking of the propose step is the next lever and could not run
+  while the overnight legs below own the GPU.
+- `prefill_attn_dflash_fp8` remains HDIM-256-only — the FP8 drafter-KV path
+  is wrong for 128-dim drafters; flagged in `paged_attn_modules.rs`, not
+  fixed.
+- The post-drain `pure virtual method called` SIGTERM abort reproduces on
+  every arm including MTP K4 (pre-existing; cf. the 2026-09-14 gates note).
+- DFlash + prefix caching was untested on gfx1151 before the agentic leg
+  below; GB10 reported an illegal-address fault with that combination.
+
+### Overnight legs (2026-09-15, γ=8, `~/dp4a-ab/out/dflash-overnight-20260915T1706Z`)
+
+Chain `~/dp4a-ab/dflash_overnight.sh`, serve profile DFLASH=1 + Option B +
+small-M GEMV defaults, binary `4de8cd79…`:
+
+- **ST-995 (bfcl-subset golden draw, n=995)** — observed under
+  `st995-fingerprint.txt` (commit `b517dd6d9`, binary sha `4de8cd79…`,
+  nvidia/Qwen3.8-27B-NVFP4 rev `dbb8f445`, drafter
+  incoai/Qwen3.8-27B-DFlash2 γ=8, Option B, small-M GEMV, GPU_UTIL 0.80,
+  max-seq 8192, prefill 2048, kv bf16, head nvfp4, bs1, ssm-slots 0,
+  `--disable-thinking --disable-tool-grammar true --request-timeout 900`):
+  golden draw n=995 seed 42 temp 0, no param overrides — **overall 85.13 /
+  normalized single-turn 78.41**, run record
+  `~/.atlas/runs/bfcl-subset/run-1789510215749772387.json`, 5 h 04 m wall
+  (17:06→22:10Z). Accept over the leg: mean_na avg 5.673 median 6.000,
+  tok_step avg 6.673 median 7.000 (n=997 requests). Per-subset:
+  irrelevance 75.00, live_irrelevance 46.59, live_multiple 87.62,
+  live_parallel 87.50, live_parallel_multiple 75.00, live_simple 92.00,
+  multiple 96.77, parallel 88.71, parallel_multiple 87.10, simple_java
+  67.74, simple_javascript 74.19, simple_python 95.97; categories
+  hallucination 60.80 / live 86.47 / non_live 87.97.
+  - Reference rows — each an observation on a different
+    stack/binary/checkpoint, not an A/B: Strix MTP K=4, shipped nvidia
+    checkpoint, 2026-09-11: 83.22 / 79.02 (run-1789114625433625524,
+    BENCH.toml); Strix MTP K=4 on the FP8→NVFP4 requant derivative,
+    2026-09-14: 83.02 / 80.41 (run-1789370409958768995) with
+    hallucination 75.38 / live 84.71 / non_live 81.15, simple_java
+    45.16, simple_javascript 29.03; GB10 nvidia-checkpoint MTP/n-gram
+    runs 2026-09-12/13: 85.13 / 76.60 with hallucination 55.11,
+    simple_java 67.74, simple_javascript 74.19
+    (QWEN38_PORT_GAP_ANALYSIS §F.2, runs run-1789206159965049753 /
+    run-1789290824981666674).
+  - The DFlash2 leg's overall score and its
+    simple_java/simple_javascript/hallucination profile coincide with
+    the GB10 nvidia-checkpoint runs, and sit +1.91 overall / −0.61
+    normalized from the Strix shipped-nvidia MTP record; the
+    hallucination-category gap vs the requant-checkpoint run is the
+    checkpoint-behaviour pattern §F.2 already documented (weights
+    differ between those two rows). The normalized floor 85.32 shown
+    by the runner is the MLPerf-submission-checkpoint reference and
+    does not gate this checkpoint (runner's own verdict text).
+- **ST-996 (bfcl_v4 12/23/46, n~1004) — dropped from the chain** (merge
+  window); the handover watcher stopped the leg at its banner before it
+  ran. No data recorded.
+- **MLPerf agentic-coding 2.5h (20 trajectories, prefix caching)** —
+  running: outdir `~/dp4a-ab/out/dflash-agentic-20260915T2247Z`, γ=8,
+  max-seq 24576, `--enable-prefix-caching`, SSM_SLOTS=16 with
+  SSM_CKPT_INTERVAL=128 (20 Marconi slots), ETA ~03:00Z.

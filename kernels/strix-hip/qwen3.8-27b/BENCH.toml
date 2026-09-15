@@ -116,4 +116,13 @@ normalized vs the prior requant record, no accuracy regression. \
 The demoted floors (see above) were cut from the SHIPPED run minus the 0.4 \
 noise band; the requant derivative is recorded here as provenance, not \
 floored — its own entry belongs beside its own checkpoint directory when \
-it is promoted."""
+it is promoted. \
+DFLASH2 RESULT 2026-09-15 on the shipped checkpoint, binary sha \
+4de8cd79…, branch port/dflash2-strix-linux @ b517dd6d9: `DFLASH=1` \
+serve (Option-B paged drafter, γ=8, GPU_UTIL 0.80, ssm-slots 0, \
+otherwise the 09-11 recipe minus --speculative): overall 85.13 / \
+normalized 78.41 on the identical draw \
+(run-1789510215749772387.json) — provenance only, not floored; \
+category detail hallucination 60.80 / live 86.47 / non_live 87.97 \
+(irrelevance 75.00, live_irrelevance 46.59, simple_java 67.74, \
+simple_javascript 74.19)."""

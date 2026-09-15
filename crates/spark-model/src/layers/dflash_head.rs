@@ -27,13 +27,18 @@ use spark_runtime::kv_cache::PagedKvCache;
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
+pub mod conv;
+mod paged_attn_modules;
 pub mod product_policy;
+pub mod selector;
 mod startup_diagnostics;
+pub use conv::Dflash2Conv;
 pub use product_policy::{
     DsparkStartupExecution, LightningDsparkIdentityLatch, LightningDsparkPolicyError,
     LightningDsparkProductPolicy, LightningDsparkRuntimeToggles, LightningStructuralGraphState,
     enforce_lightning_structural_gate,
 };
+pub use selector::Dflash2CandidateSelector;
 pub use startup_diagnostics::DsparkDiagnostics;
 #[cfg(test)]
 mod product_policy_tests;
@@ -48,6 +53,8 @@ pub struct DflashKernels {
     pub dense_gemv: KernelHandle,
     pub dense_gemv_batchm: KernelHandle,
     pub dense_gemm: KernelHandle,
+    pub dflash2_conv: Option<KernelHandle>,
+    pub dflash2_candidate_selector: Option<KernelHandle>,
     /// NVFP4 GEMM for the final logits when the shared lm_head is NVFP4
     /// (e.g. Holo): a BF16 `dense_gemm` on NVFP4-packed bytes reads garbage
     /// (and ~4× OOB → CUDA-700). `.0 == 0` when the target lm_head is BF16.
@@ -202,6 +209,12 @@ pub struct DflashScratch {
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
     pub position_ids: DevicePtr,
+    /// DFlash2 scratch: dynamic conv delta coefficients `[γ, 4 * num_groups]` BF16.
+    pub dflash2_conv_delta: DevicePtr,
+    /// DFlash2 scratch: convolution output `[γ, hidden_size]` BF16.
+    pub dflash2_conv_out: DevicePtr,
+    /// DFlash2 scratch: projected hidden states `[γ, selector_rank]` BF16.
+    pub dflash2_projected_hidden: DevicePtr,
 }
 
 /// Drafter-side weight precision. Defaults to BF16. **Phase G (2026-05-28)**
@@ -266,6 +279,8 @@ pub struct DflashLayer {
     pub gate_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
     pub up_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
     pub down_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    pub attention_conv: Option<Dflash2Conv>,
+    pub mlp_conv: Option<Dflash2Conv>,
 }
 
 /// Per-sequence DFlash drafter state. One paged KV cache per drafter layer
@@ -506,6 +521,8 @@ pub struct BlockDiffusionDraftHead {
     pub draft_id_to_target_id: Option<DevicePtr>,
     /// Drafter transformer layers (8 for Qwen3.6-35B-A3B-DFlash).
     pub layers: Vec<DflashLayer>,
+    /// DFlash2 CandidateSelector bilinear path scorer (replaces greedy argmax).
+    pub candidate_selector: Option<Dflash2CandidateSelector>,
 
     /// Phase 2 (Option B) fused K/V projection across all L drafter layers.
     /// Shape: `[L × 2 × kv_dim, h]` BF16 — concatenated `[K0; V0; K1; V1; …]`
@@ -692,6 +709,7 @@ mod markov;
 mod nvfp4;
 mod precompute_ctx_kv;
 mod propose;
+mod small_m_gemm;
 
 impl BlockDiffusionDraftHead {
     /// Total propose lanes (lane 0 = default-stream scratch; the rest live
