@@ -75,12 +75,13 @@ $RepoRoot = if ($env:ATLAS_REPO) { $env:ATLAS_REPO }
 # Qwen3.6; ATLAS_MODEL_NAME remains an explicit override.
 $ModelName = if ($env:ATLAS_MODEL_NAME) { $env:ATLAS_MODEL_NAME }
              else { 'nvidia/Qwen3.8-27B-NVFP4' }
-# The default weights dir derives from the checkpoint leaf so ATLAS_MODEL_NAME
+# The default weights dir derives from the checkpoint id so ATLAS_MODEL_NAME
 # and ATLAS_MODEL_DIR cannot drift apart: serving an unsloth snapshot (per-row
 # FP8 GDN weights) under the nvidia name keeps NVFP4 + transposed + prefill +
-# rowwise copies resident at once and exhausts the KV budget.
+# rowwise copies resident at once and exhausts the KV budget. The on-disk
+# convention is org-dash-repo (`hf download org/repo --local-dir models\org-repo`).
 $ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
-            else { "$env:USERPROFILE\models\$(($ModelName -split '/')[-1])" }
+            else { "$env:USERPROFILE\models\$($ModelName -replace '/', '-')" }
 $GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.95' }
 # The validated Qwen3.8 gate uses 4096 context and a 2048-token prefill arena.
 $MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '4096' }
