@@ -188,30 +188,47 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if force_bf16 {
-            // cuBLASLt, NOT the hand-written `dense_gemm`. The weights are
-            // already BF16 [N,K] on this path, so there is no dequant step and
-            // nothing to cache — `cublas_bf16_proj_dense` exists for exactly
-            // this shape.
-            //
-            // MEASURED 2026-08-15 on unsloth/Qwen3.8-27B-NVFP4: this lever
-            // through `dense_gemm` cost 72.9% of prefill (507 -> 137 tok/s),
-            // which is what made "keep the GDN weights BF16" look like a
-            // quality-for-speed trade. It was never the precision — it was
-            // the GEMM.
-            ops::cublas_bf16_proj_dense(
+            // HIP has no working cuBLASLt route here; use the same native BF16
+            // pipelined GEMM already used by the dense out projection.
+            #[cfg(atlas_hip)]
+            ops::dense_gemm_bf16_pipelined(
+                ctx.gpu,
+                self.dense_gemm_pipelined_k,
                 normed,
-                self.ssm.in_proj_qkvz.weight,
+                &self.ssm.in_proj_qkvz,
                 proj_dst,
                 k,
                 qkvz_size as u32,
                 h as u32,
                 stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "ssm prefill: QKVZ BF16 cuBLASLt GEMM failed (M={k}, N={qkvz_size}): {e}"
+            )?;
+            #[cfg(not(atlas_hip))]
+            {
+                // cuBLASLt, NOT the hand-written `dense_gemm`. The weights are
+                // already BF16 [N,K] on this path, so there is no dequant step and
+                // nothing to cache — `cublas_bf16_proj_dense` exists for exactly
+                // this shape.
+                //
+                // MEASURED 2026-08-15 on unsloth/Qwen3.8-27B-NVFP4: this lever
+                // through `dense_gemm` cost 72.9% of prefill (507 -> 137 tok/s),
+                // which is what made "keep the GDN weights BF16" look like a
+                // quality-for-speed trade. It was never the precision — it was
+                // the GEMM.
+                ops::cublas_bf16_proj_dense(
+                    normed,
+                    self.ssm.in_proj_qkvz.weight,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
                 )
-            })?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: QKVZ BF16 cuBLASLt GEMM failed (M={k}, N={qkvz_size}): {e}"
+                    )
+                })?;
+            }
         } else if force_w8a8
             && let Some(ref fp8w) = self.qkvz_fp8w
             && self.per_token_group_quant_fp8_k.0 != 0

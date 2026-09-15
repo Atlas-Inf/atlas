@@ -241,6 +241,9 @@ impl TransformerModel {
                     stream,
                 )?;
             }
+        } else if self.lm_head_dp4a_batch4(hidden, num_tokens, logits, h, v, stream)? {
+            // Handled by the W4A8 DP4A arm (see `trait_impl/lm_head_dp4a.rs`).
+            // Nothing further to launch.
         } else if (3..=8).contains(&num_tokens)
             && self.w4a16_batchm.kernel(num_tokens).0 != 0
             && let Some(ref nvfp4) = self.lm_head_nvfp4
@@ -250,10 +253,14 @@ impl TransformerModel {
             // (2026-07-18, drafts=3 serve): the base M64-tile `w4a16_gemm`
             // below cost 19.3 ms/verify-step on the [248320, 5120] NVFP4
             // lm_head at M=4 — 94% of the M-tile is padding, ~33 GB/s
-            // effective. The batch GEMV streams the same 636 MB once at
-            // near-peak (~2.5 ms), the single largest slice of the K=4
-            // verify-vs-K=2 cost gap; the M=5..8 tiers extend that to the
-            // chain-verify rows (batchm_bench).
+            // effective. The batch GEMV is far cheaper than that, but the
+            // "~2.5 ms near-peak" this comment used to claim does not hold on
+            // the NVIDIA NVFP4 checkpoint: the float tier measures 5979.7 us
+            // isolated and 6367.8 us in-situ at M=4, i.e. ~120 GB/s. That is
+            // why the DP4A arm above takes this shape instead when it is
+            // not disabled via ATLAS_W4A16_DP4A=0 (3772.6 us, 1.58x). The M=5..8 tiers
+            // still extend the float path to the chain-verify rows
+            // (batchm_bench).
             ops::w4a16_gemv_batchm(
                 self.gpu.as_ref(),
                 self.w4a16_batchm.kernel(num_tokens),

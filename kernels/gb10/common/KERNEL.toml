@@ -36,6 +36,16 @@ extra_nvcc_flags = ["--fmad=false", "-DTQ_PLUS_SIGNS", "--expt-relaxed-constexpr
 #       vanilla-norm model ever forks rms_norm.cu, the startup audit still
 #       hard-errors on the missing kernels.
 #
+#   norm::rms_norm_offset_warp_row
+#       Warp-per-row offset-convention RMS norm added for the Strix Qwen3.8
+#       dense port's short-row Q/K norm shapes (52 ms/layer block-kernel →
+#       ~bandwidth floor). Resolved via soft probe
+#       (`gpu.kernel(...).unwrap_or(KernelHandle(0))` in qwen3_attention/
+#       init.rs), so a shadow without it silently keeps the block-per-row
+#       kernel — functionally identical, just slower. The nine gb10
+#       rms_norm.cu shadows predate the kernel and carry no caller that
+#       requires it.
+#
 #   norm::rms_norm_grouped
 #   norm::{gated_rms_norm_sigmoid, gated_rms_norm_f32_input_sigmoid,
 #          gated_rms_norm_prefill_sigmoid}
@@ -66,6 +76,7 @@ moe_w4a16 = ["moe_w4a16_grouped_gemm"]
 norm = [
     "rms_norm_residual_vanilla",
     "residual_add_rms_norm_vanilla",
+    "rms_norm_offset_warp_row",
     "rms_norm_grouped",
     "gated_rms_norm_sigmoid",
     "gated_rms_norm_f32_input_sigmoid",

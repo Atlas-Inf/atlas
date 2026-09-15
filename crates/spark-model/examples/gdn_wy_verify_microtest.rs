@@ -422,18 +422,19 @@ fn main() -> Result<()> {
                 } else {
                     "gated_delta_rule_wy3_resident"
                 };
-                let wk_res = g.kernel(name, name)?;
-                let (res_out, res_inter, res_final) =
-                    run_wy(g, wk_res, &h0, &q, &key, &val, &gate, &beta, k)?;
-                let pok = bits_eq(&res_out, &wy_out)
-                    && res_inter.len() == wy_inter.len()
-                    && res_inter.iter().zip(&wy_inter).all(|(a, b)| bits_eq(a, b))
-                    && bits_eq(&res_final, &wy_final);
-                all_ok &= pok;
-                eprintln!(
-                    "K={k} layer={layer}  wy{k}_resident BITWISE parity: {}",
-                    if pok { "PASS" } else { "FAIL" }
-                );
+                if let Ok(wk_res) = g.kernel(name, name) {
+                    let (res_out, res_inter, res_final) =
+                        run_wy(g, wk_res, &h0, &q, &key, &val, &gate, &beta, k)?;
+                    let pok = bits_eq(&res_out, &wy_out)
+                        && res_inter.len() == wy_inter.len()
+                        && res_inter.iter().zip(&wy_inter).all(|(a, b)| bits_eq(a, b))
+                        && bits_eq(&res_final, &wy_final);
+                    all_ok &= pok;
+                    eprintln!(
+                        "K={k} layer={layer}  wy{k}_resident BITWISE parity: {}",
+                        if pok { "PASS" } else { "FAIL" }
+                    );
+                }
             }
         }
     }

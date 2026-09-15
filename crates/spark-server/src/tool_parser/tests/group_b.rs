@@ -216,7 +216,11 @@ fn tscg_is_decided_per_model_not_per_process() {
     }];
     let tc = ToolChoice::Mode("auto".into());
     let off = parser.system_prompt(&tools, &tc, &crate::tool_parser::PromptLevers::OFF);
-    let on = parser.system_prompt(&tools, &tc, &crate::tool_parser::PromptLevers::new(true));
+    let on = parser.system_prompt(
+        &tools,
+        &tc,
+        &crate::tool_parser::PromptLevers::new(true, false),
+    );
     assert!(
         off.contains("\"name\":\"test\""),
         "TSCG off keeps the JSON body"
@@ -247,6 +251,36 @@ fn qwen3_coder_parser_system_prompt_contains_xml() {
     assert!(prompt.contains("\"name\":\"test\""));
     assert!(prompt.contains("A test function"));
     assert!(prompt.contains("<function=example_function_name>"));
+}
+
+#[test]
+fn qwen3_coder_template_owned_definitions_keep_choice_policy() {
+    let parser = Qwen3CoderParser;
+    let tools = vec![ToolDefinition {
+        tool_type: "function".into(),
+        function: FunctionDefinition {
+            name: "test".into(),
+            description: Some("A test function".into()),
+            parameters: None,
+        },
+    }];
+    let levers = crate::tool_parser::PromptLevers::new(false, true);
+    let auto = parser.system_prompt(&tools, &ToolChoice::Mode("auto".into()), &levers);
+    let required = parser.system_prompt(&tools, &ToolChoice::Mode("required".into()), &levers);
+    let named = parser.system_prompt(
+        &tools,
+        &ToolChoice::Specific {
+            function: crate::tool_parser::ToolChoiceFunction {
+                name: "test".into(),
+            },
+        },
+        &levers,
+    );
+
+    assert!(auto.is_empty());
+    assert!(!required.contains("A test function"));
+    assert!(required.contains("MUST call at least one function"));
+    assert!(named.contains("MUST call the 'test' function"));
 }
 
 #[test]

@@ -209,7 +209,14 @@ impl Qwen3AttentionLayer {
                 gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla_warp_row")
                     .unwrap_or(KernelHandle(0))
             } else {
-                KernelHandle(0)
+                // Offset-convention models (Qwen3.5/3.6/3.8): the warp_row
+                // structure from the vanilla module, applied to the (1 + w)
+                // scaling this module's block kernel implements. The
+                // block-per-row kernel runs ~43x above its bandwidth floor on
+                // the short-row Q/K norm shapes (head_dim 128-256, num_rows
+                // = heads × seq_len), which measured 52 ms/layer on Strix.
+                gpu.kernel("norm", "rms_norm_offset_warp_row")
+                    .unwrap_or(KernelHandle(0))
             },
             norm_vanilla: crate::ships_vanilla_norm_weights(config),
             rms_norm_residual_k: if crate::ships_vanilla_norm_weights(config) {
@@ -236,6 +243,16 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
+            w8a16_gemv_batch4_k: super::super::try_kernel(
+                gpu,
+                "w8a16_gemv_batch4",
+                "w8a16_gemv_batch4",
+            ),
+            w8a16_gemv_batch16_k: super::super::try_kernel(
+                gpu,
+                "w8a16_gemv_batch4",
+                "w8a16_gemv_batch16",
+            ),
             w8a16_gemm_k: super::super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
             w8a16_gemm_pipelined_k: super::super::try_kernel(
                 gpu,
@@ -462,6 +479,31 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_dual_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu),
+            dp4a_quant_batch4_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "quantize_act_int8_g16_batch4_d4",
+            ),
+            dp4a_gemv_batch4_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch4_d4",
+            ),
+            dp4a_gemv_batch4_os_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch4_d4_os",
+            ),
+            w4a16_gemv_batch4_os_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch4_os",
+            ),
+            w4a16_gemv_batch8_os_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch8_os",
+            ),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: crate::layers::tgemm_kernel(gpu),
             w4a16_gemm_t_k64_k: crate::layers::k64_kernel(gpu)?,

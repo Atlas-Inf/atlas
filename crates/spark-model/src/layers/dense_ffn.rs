@@ -15,6 +15,9 @@ use crate::weight_map::{
     DenseWeight, Fp8Weight, Fp8WeightTransposed, PackedQ2Weight, QuantizedWeight,
 };
 
+#[path = "dense_ffn_dp4a.rs"]
+mod dp4a_decode;
+
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
     pub up_proj: QuantizedWeight,
@@ -112,6 +115,16 @@ pub struct DenseFfnLayer {
     w4a16_gemv_dual_batch3: KernelHandle,
     w4a16_gemv_batch2: KernelHandle,
     w4a16_gemv_batch3: KernelHandle,
+    dp4a_quant_k: KernelHandle,
+    dp4a_silu_quant_k: KernelHandle,
+    dp4a_gemv_k: KernelHandle,
+    dp4a_quant_batch4_k: KernelHandle,
+    /// Guard-free m == 4 specialization of the batch4 DP4A GEMVs.
+    dp4a_gemv_batch4_k: KernelHandle,
+    dp4a_dual_batch4_k: KernelHandle,
+    /// Runtime-row-guarded batch4 DP4A GEMVs for the m == 2..3 verify rows.
+    dp4a_gemv_batch4_dyn_k: KernelHandle,
+    dp4a_dual_batch4_dyn_k: KernelHandle,
     /// Narrow `w4a16_gemv_batch{M}` family (M=4..8) for the K=4 verify FFN and
     /// the K=5..8 chain verify. SSOT for the M -> tier decision; individual
     /// tiers are 0-handles when the target did not load them.
@@ -223,7 +236,12 @@ pub struct DenseFfnLayer {
     /// broken-indentation pattern).
     bf16_weights: Option<DenseFfnWeightsBf16>,
     dense_gemv_bf16_k: KernelHandle,
+    dense_gemv_bf16_batch2_k: KernelHandle,
     dense_gemm_bf16_k: KernelHandle,
+    // Pipelined tensor-core BF16 GEMM (same `gemm` module as the scalar
+    // `dense_gemm_bf16`). Preferred by the BF16 prefill arm when present —
+    // same convention as `ops::dense_gemm_prefill`. KernelHandle(0) on miss.
+    dense_gemm_pipelined_k: KernelHandle,
     // Tensor-core BF16 GEMM (m16n8k16 MMA) for the dense-FFN PREFILL path.
     // The scalar `dense_gemm_bf16` is ~10x too slow on long prefills (it was
     // the flat ~155 tok/s prefill bottleneck on Qwen3.6-27B dense NVFP4).
@@ -318,8 +336,15 @@ impl DenseFfnLayer {
         // `kernels/gb10/{target}/nvfp4/KERNEL.toml`:
         //   `dense_gemv_bf16 = "gemv"`, `dense_gemm_bf16 = "gemm"`.
         let dense_gemv_bf16_k = super::try_kernel(gpu, "gemv", "dense_gemv_bf16");
+        let dense_gemv_bf16_batch2_k =
+            super::try_kernel(gpu, "dense_gemv_bf16_batch2", "dense_gemv_bf16_batch2");
         let dense_gemm_bf16_k = super::try_kernel(gpu, "gemm", "dense_gemm_bf16");
         let dense_gemm_tc_k = super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc");
+        // Same module as the scalar `dense_gemm_bf16`; preferred by the BF16
+        // prefill arm when present (the same convention `ops::dense_gemm_prefill`
+        // applies for attention/SSM). The HIP port is CPU-oracle-validated at
+        // prefill shapes; see `dense_gemm_bf16_oracle`.
+        let dense_gemm_pipelined_k = super::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined");
 
         let layer = Self {
             weights,
@@ -338,6 +363,34 @@ impl DenseFfnLayer {
             w4a16_gemv_dual_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            dp4a_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "quantize_act_int8_g16"),
+            dp4a_silu_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "silu_mul_quant_int8_g16"),
+            dp4a_gemv_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "w4a16_gemv_dp4a"),
+            dp4a_quant_batch4_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "quantize_act_int8_g16_batch4_d4",
+            ),
+            dp4a_gemv_batch4_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch4_d4",
+            ),
+            dp4a_dual_batch4_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_dual_batch4_d4",
+            ),
+            dp4a_gemv_batch4_dyn_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch4_d4_dyn",
+            ),
+            dp4a_dual_batch4_dyn_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_dual_batch4_d4_dyn",
+            ),
             w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
@@ -390,7 +443,9 @@ impl DenseFfnLayer {
             act_mul,
             bf16_weights: None,
             dense_gemv_bf16_k,
+            dense_gemv_bf16_batch2_k,
             dense_gemm_bf16_k,
+            dense_gemm_pipelined_k,
             dense_gemm_tc_k,
             fp8_weights: None,
             w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),
@@ -1010,6 +1065,10 @@ impl DenseFfnLayer {
             return Ok(output);
         }
 
+        if let Some(output) = self.forward_dp4a_single(input, ctx, stream)? {
+            return Ok(output);
+        }
+
         // ATLAS_DECODE_FFN_VIA_GEMM=1: route decode's M=1 FFN projections
         // through the SAME transposed-weight GEMM kernels the DFlash verify
         // path uses (`w4a16_prefill_gemm` → w4a16_gemm_t / _t_k64), instead
@@ -1282,17 +1341,73 @@ impl DenseFfnLayer {
         Ok(())
     }
 
-    /// K=2 speculative: batched GEMV for 2 tokens.
-    /// 3 launches: dual batch2 (gate+up) + silu_mul + batch2 (down).
+    /// K=2 speculative: read-once batched GEMV for two tokens.
+    /// Native BF16 uses separate gate/up batch2 launches; NVFP4 keeps its fused path.
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         // Packed-Q2: NVFP4 fallback weights are NULL, so the NVFP4 batch2 GEMVs
         // below would fault. Route to the keep-packed batchm FFN (m=2).
         if let Some(ref q2w) = self.q2_weights {
             return self.forward_km_q2(q2w, input, ctx, 2, stream);
         }
+        if native_k2_uses_batch2(
+            self.bf16_weights.is_some(),
+            self.dense_gemv_bf16_batch2_k.0 != 0,
+        ) {
+            let h = ctx.config.hidden_size as u32;
+            let inter = ctx.config.intermediate_size as u32;
+            let weights = self.bf16_weights.as_ref().unwrap();
+            let gate_out = ctx.buffers.expert_gate_out();
+            let up_out = ctx.buffers.expert_up_out();
+            ops::dense_gemv_batch2(
+                ctx.gpu,
+                self.dense_gemv_bf16_batch2_k,
+                input,
+                &weights.gate_proj,
+                gate_out,
+                inter,
+                h,
+                inter,
+                stream,
+            )?;
+            ops::dense_gemv_batch2(
+                ctx.gpu,
+                self.dense_gemv_bf16_batch2_k,
+                input,
+                &weights.up_proj,
+                up_out,
+                inter,
+                h,
+                inter,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                2 * inter,
+                stream,
+            )?;
+            ops::dense_gemv_batch2(
+                ctx.gpu,
+                self.dense_gemv_bf16_batch2_k,
+                gate_out,
+                &weights.down_proj,
+                ctx.buffers.moe_output(),
+                h,
+                inter,
+                h,
+                stream,
+            )?;
+            return Ok(());
+        }
         if native_small_batch_uses_prefill(self.bf16_weights.is_some(), self.fp8_weights.is_some())
         {
             return self.forward_prefill(input, 2, ctx, stream);
+        }
+        if self.forward_dp4a_batch(input, 2, ctx, stream)? {
+            return Ok(());
         }
 
         let h = ctx.config.hidden_size as u32;
@@ -1348,6 +1463,9 @@ impl DenseFfnLayer {
         if native_small_batch_uses_prefill(self.bf16_weights.is_some(), self.fp8_weights.is_some())
         {
             return self.forward_prefill(input, 3, ctx, stream);
+        }
+        if self.forward_dp4a_batch(input, 3, ctx, stream)? {
+            return Ok(());
         }
 
         let h = ctx.config.hidden_size as u32;
@@ -1425,6 +1543,9 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.forward_dp4a_batch(input, m, ctx, stream)? {
+            return Ok(());
+        }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
         let kh = self.batchm_kernel(m);
@@ -1843,47 +1964,112 @@ impl DenseFfnLayer {
         // kernel isn't loaded for this target. Decode (gemv, M=1) is a
         // separate path, so TPOT is unaffected; BF16 MMA preserves coherence.
         if let Some(ref bf16w) = self.bf16_weights {
-            let tc = self.dense_gemm_tc_k.0 != 0;
+            // `dense_gemm_tc` is QUARANTINED: its gfx1151 WMMA port leaves part
+            // of the output tile unwritten (NaN-sentinel oracle,
+            // `dense_gemm_bf16_oracle`) and ran ~1000x slow in situ. It is
+            // reachable only behind ATLAS_FFN_BF16_PREFILL_TC=1 for diagnosis;
+            // the automatic chain is cublas -> pipelined -> scalar.
+            let tc = std::env::var("ATLAS_FFN_BF16_PREFILL_TC").as_deref() == Ok("1")
+                && self.dense_gemm_tc_k.0 != 0;
+            let pipelined = !tc && self.dense_gemm_pipelined_k.0 != 0;
+            if ctx.stats.once("log:ffn_bf16_prefill_arm") {
+                if tc {
+                    tracing::warn!(
+                        "[atlas] FFN BF16 prefill arm: ATLAS_FFN_BF16_PREFILL_TC=1 forces the \
+                         QUARANTINED dense_gemm_tc (gfx1151 port leaves part of its output tile \
+                         unwritten) — diagnosis only"
+                    );
+                }
+                tracing::info!(
+                    "[atlas] FFN BF16 prefill arm: cublas={} pipelined={pipelined} tc={tc} \
+                     (tc_handle={}) m={m}",
+                    ctx.dispatch.cublas_gemm,
+                    self.dense_gemm_tc_k.0
+                );
+            }
             // helper: cuBLASLt when enabled (the big win at prefill M), else the
-            // tensor-core MMA kernel, else scalar. dense_gemm_tc is ~1.4 TFLOP/s
-            // on the large dense-FFN shapes (e.g. Laguna layer-0 gate/up/down at
-            // N=12288/3072, K=3072) — nsys measured its 3 launches at ~100 ms
-            // EACH = 33% of the whole C=1 prefill. cuBLASLt runs the identical
-            // BF16×BF16→FP32 GEMM at 90+ TFLOP/s (~65× faster), the same path
-            // q/k/v/o and the head-gate already use. Gated on ATLAS_CUBLAS_GEMM.
+            // pipelined tensor-core kernel (the same `dense_gemm_prefill`
+            // preference attention/SSM use; CPU-oracle-validated on gfx1151 by
+            // `dense_gemm_bf16_oracle`), else scalar. `dense_gemm_tc` is
+            // reachable only through the ATLAS_FFN_BF16_PREFILL_TC override
+            // above — never as a silent fallback.
             macro_rules! ffn_gemm {
-                ($a:expr, $b:expr, $c:expr, $n:expr, $k:expr) => {
-                    if ctx.dispatch.cublas_gemm {
-                        ops::cublas_bf16_proj_dense($a, $b.weight, $c, m, $n, $k, stream)?;
-                    } else if tc {
-                        ops::dense_gemm_tc(
-                            ctx.gpu,
-                            self.dense_gemm_tc_k,
-                            $a,
-                            $b,
-                            $c,
+                ($a:expr, $b:expr, $c:expr, $n:expr, $k:expr, $label:expr) => {
+                    if ctx.profile {
+                        ctx.gpu.synchronize(stream)?;
+                        let t0 = std::time::Instant::now();
+                        // The launch status is the diagnostic signal, so it wins
+                        // over a secondary sync error.
+                        let r = ffn_gemm_launch!(
+                            ctx, self, $a, $b, $c, m, $n, $k, stream, tc, pipelined
+                        );
+                        let timed = r.map(|_| ctx.gpu.synchronize(stream)).and_then(|x| x);
+                        tracing::info!(
+                            "  FFN prefill [{} arm={}] N={}: {}µs",
+                            $label,
+                            if ctx.dispatch.cublas_gemm {
+                                "cublas"
+                            } else if pipelined {
+                                "pipelined"
+                            } else if tc {
+                                "tc"
+                            } else {
+                                "scalar"
+                            },
                             m,
-                            $n,
-                            $k,
-                            stream,
-                        )?;
+                            t0.elapsed().as_micros()
+                        );
+                        timed
                     } else {
-                        ops::dense_gemm(
-                            ctx.gpu,
-                            self.dense_gemm_bf16_k,
-                            $a,
-                            $b,
-                            $c,
-                            m,
-                            $n,
-                            $k,
-                            stream,
-                        )?;
+                        ffn_gemm_launch!(ctx, self, $a, $b, $c, m, $n, $k, stream, tc, pipelined)
                     }
                 };
             }
-            ffn_gemm!(input, &bf16w.gate_proj, gate_out, inter, h);
-            ffn_gemm!(input, &bf16w.up_proj, up_out, inter, h);
+            macro_rules! ffn_gemm_launch {
+                ($ctx:ident, $self:ident, $a:expr, $b:expr, $c:expr, $m:expr, $n:expr, $k:expr, $stream:expr, $tc:expr, $pipelined:expr) => {
+                    if $ctx.dispatch.cublas_gemm {
+                        ops::cublas_bf16_proj_dense($a, $b.weight, $c, $m, $n, $k, $stream)
+                    } else if $pipelined {
+                        ops::dense_gemm_bf16_pipelined(
+                            $ctx.gpu,
+                            $self.dense_gemm_pipelined_k,
+                            $a,
+                            $b,
+                            $c,
+                            $m,
+                            $n,
+                            $k,
+                            $stream,
+                        )
+                    } else if $tc {
+                        ops::dense_gemm_tc(
+                            $ctx.gpu,
+                            $self.dense_gemm_tc_k,
+                            $a,
+                            $b,
+                            $c,
+                            $m,
+                            $n,
+                            $k,
+                            $stream,
+                        )
+                    } else {
+                        ops::dense_gemm(
+                            $ctx.gpu,
+                            $self.dense_gemm_bf16_k,
+                            $a,
+                            $b,
+                            $c,
+                            $m,
+                            $n,
+                            $k,
+                            $stream,
+                        )
+                    }
+                };
+            }
+            ffn_gemm!(input, &bf16w.gate_proj, gate_out, inter, h, "gate_proj")?;
+            ffn_gemm!(input, &bf16w.up_proj, up_out, inter, h, "up_proj")?;
             ops::silu_mul(
                 ctx.gpu,
                 self.act_mul,
@@ -1894,7 +2080,7 @@ impl DenseFfnLayer {
                 stream,
             )?;
             let output = ctx.buffers.moe_output();
-            ffn_gemm!(gate_out, &bf16w.down_proj, output, h, inter);
+            ffn_gemm!(gate_out, &bf16w.down_proj, output, h, inter, "down_proj")?;
             return Ok(());
         }
 
@@ -2496,6 +2682,10 @@ impl DenseFfnLayer {
     }
 }
 
+fn native_k2_uses_batch2(has_bf16: bool, has_batch2_kernel: bool) -> bool {
+    has_bf16 && has_batch2_kernel
+}
+
 /// Native BF16/FP8 layers do not own usable NVFP4 fallback weights. Their
 /// small-batch path must therefore use the format-aware prefill dispatcher.
 fn native_small_batch_uses_prefill(has_bf16: bool, has_fp8: bool) -> bool {
@@ -2504,7 +2694,15 @@ fn native_small_batch_uses_prefill(has_bf16: bool, has_fp8: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::native_small_batch_uses_prefill;
+    use super::{native_k2_uses_batch2, native_small_batch_uses_prefill};
+
+    #[test]
+    fn bf16_k2_requires_weights_and_the_read_once_kernel() {
+        assert!(native_k2_uses_batch2(true, true));
+        assert!(!native_k2_uses_batch2(true, false));
+        assert!(!native_k2_uses_batch2(false, true));
+        assert!(!native_k2_uses_batch2(false, false));
+    }
 
     #[test]
     fn native_small_batches_never_dispatch_null_nvfp4_placeholders() {

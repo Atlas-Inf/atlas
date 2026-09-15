@@ -196,24 +196,27 @@ fn run_batched_verify(
 /// (device 700 in production; here the fail-fast guards turn it into Err,
 /// so `is_ok` is the load-bearing assertion).
 #[test]
-fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_gemm() {
+fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_batch16() {
     let config = ModelConfig::qwen3_next_80b_nvfp4();
     let gpu = MockGpuBackend::new();
     let layer = native_fp8_gdn_layer(&gpu, &config, true, true);
     run_batched_verify(&gpu, &config, &layer, &[4, 3]).unwrap();
-    // Pin the arm identity: w8a16_gemm_pipelined geometry at M=7 —
-    // QKVZ (N=12288): grid [ceil(12288/32)=384, ceil(7/128)=1, 1];
-    // out_proj (N=2048): grid [64, 1, 1]; both block [256,1,1].
+    // Pin the arm identity at R=7: the `w8a16_gemv_batch16` arm sits AHEAD
+    // of the `num_tokens > 4 → w8a16_gemm*` fallback for 5..=16 rows (the
+    // narrowest tier covering them — strix PR8 stack). Under the mock every
+    // kernel resolves, so batch16 always wins regardless of target.
+    // `w8a16_gemv_batch4` launch geometry: grid [ceil(N/4), 1, 1], block
+    // [256,1,1] — QKVZ (N=12288) → [3072,1,1]; out_proj (N=2048) → [512,1,1].
     let launches = (0..gpu.launch_count()).count();
     assert!(launches > 0);
     let seen = gpu_launch_grids(&gpu);
     assert!(
-        seen.contains(&([384, 1, 1], [256, 1, 1])),
-        "QKVZ w8a16_gemm_pipelined launch missing; grids seen: {seen:?}"
+        seen.contains(&([3072, 1, 1], [256, 1, 1])),
+        "QKVZ w8a16_gemv_batch16 launch missing; grids seen: {seen:?}"
     );
     assert!(
-        seen.contains(&([64, 1, 1], [256, 1, 1])),
-        "out_proj w8a16_gemm_pipelined launch missing; grids seen: {seen:?}"
+        seen.contains(&([512, 1, 1], [256, 1, 1])),
+        "out_proj w8a16_gemv_batch16 launch missing; grids seen: {seen:?}"
     );
 }
 
@@ -481,5 +484,111 @@ fn qkvz_and_out_proj_share_one_threshold() {
         flip,
         super::trait_decode_batched::VERIFY_TGEMM_MIN_TOKENS + 1,
         "QKVZ must flip at the shared out_proj threshold"
+    );
+}
+
+// ── Fused generic-K verify conv (strix port, lever #3) ──
+//
+// `decode_batched_conv_gdn`'s K=3/K=4 arms issue K-1 `copy_d2d_async`
+// conv-state snapshots per SSM layer per verify step on the per-token
+// fallback, and ZERO when `gdn_verify_fused_conv_kn` serves them (the
+// kernel writes every rollback snapshot inline). `MockGpuBackend` counts
+// copy calls and resolves every kernel to the same 0xDEAD handle, so the
+// d2d delta between a contiguous and a deliberately non-contiguous
+// intermediates layout is exactly the conv-snapshot traffic — nothing else
+// in the K=4 body copies.
+
+/// Drive `decode_batched` (the per-sequence `GdnStates::Single` entry the
+/// K=4 scheduler verify hits) on one SSM layer and return how many d2d
+/// copies the call issued.
+fn single_verify_k4_d2d(
+    gpu: &MockGpuBackend,
+    config: &ModelConfig,
+    layer: &Qwen3SsmLayer,
+    state: &mut SsmLayerState,
+) -> usize {
+    let buffers = BufferArena::new(config, 64, 4096, 16, 32, gpu).unwrap();
+    let dispatch = crate::layers::ops::GemmDispatch::defaults();
+    let derived = crate::layers::ops::DerivedWeights::new();
+    let levers = crate::layers::ops::ModelLevers::defaults();
+    let stats = crate::layers::ops::ModelStats::new();
+    let ctx = ForwardContext {
+        dispatch: &dispatch,
+        derived: &derived,
+        levers: &levers,
+        stats: &stats,
+        buffers: &buffers,
+        gpu,
+        config,
+        attn_metadata: None,
+        profile: false,
+        comm: None,
+        graph_capture: false,
+        gdn_exact_replay: false,
+        token_ids: None,
+        host_token_ids: None,
+        routed_lora_layers: None,
+        midchunk_capture: None,
+        moe_lora_route: crate::layer::MoeLoraRoute::Fold,
+    };
+    let kv_config = spark_runtime::kv_cache::KvCacheConfig {
+        block_size: 16,
+        num_kv_heads: 2,
+        head_dim: 128,
+        num_layers: config.num_hidden_layers,
+        dtype: spark_runtime::kv_cache::KvCacheDtype::Bf16,
+        layer_dtypes: vec![],
+        layer_dims: vec![],
+        cache_blocks_per_seq: None,
+    };
+    let mut kv = spark_runtime::kv_cache::PagedKvCache::new(kv_config, 8, gpu).unwrap();
+    let mut block_table = vec![0u32; 8];
+    let mut disk_block_ids = Vec::new();
+    let mut disk_last_offloaded = Vec::new();
+    let before = gpu.d2d_count();
+    layer
+        .decode_batched(
+            buffers.hidden_states(),
+            buffers.residual(),
+            4,
+            state,
+            &mut kv,
+            0,
+            &mut block_table,
+            &mut disk_block_ids,
+            &mut disk_last_offloaded,
+            &ctx,
+            0,
+        )
+        .unwrap();
+    gpu.d2d_count() - before
+}
+
+#[test]
+fn fused_conv_k4_skips_conv_snapshot_copies() {
+    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    let gpu = MockGpuBackend::new();
+    let layer = native_fp8_gdn_layer(&gpu, &config, true, true);
+
+    // Pool-contiguous intermediates (mk_state) → fused arm: no snapshot
+    // copies. Under the mock every kernel resolves, so the fused arm is
+    // eligible; the win is visible purely as zero conv-state d2d calls.
+    let mut contig = mk_state(&gpu, &layer, 4);
+    let fused = single_verify_k4_d2d(&gpu, &config, &layer, &mut contig);
+
+    // Non-contiguous intermediates → fail closed to the per-token conv
+    // loop with its K-1 = 3 snapshot copies. NOTE: the mock bump-allocates
+    // sequentially, so four `alloc(conv_bytes)` calls would come out
+    // contiguous; assign them out of order to break the stride check.
+    let mut nc = mk_state(&gpu, &layer, 4);
+    let conv_bytes = layer.conv_state_bytes;
+    let slabs: Vec<DevicePtr> = (0..4).map(|_| gpu.alloc(conv_bytes).unwrap()).collect();
+    nc.conv_state_intermediates = vec![slabs[2], slabs[0], slabs[3], slabs[1]];
+    let fallback = single_verify_k4_d2d(&gpu, &config, &layer, &mut nc);
+
+    assert_eq!(
+        fallback - fused,
+        3,
+        "fused arm must remove exactly the K-1 conv snapshots: fused={fused} fallback={fallback}"
     );
 }

@@ -30,6 +30,15 @@ fn fused_qkv_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_NO_FUSED_QKV").ok().as_deref() != Some("1"))
 }
 
+/// Strided-output QKV verify (n in 4..=8): the `*_os` GEMV variants take an
+/// output row stride, so each projection lands directly in its interleaved
+/// `qkv_buf` slice — no scratch round-trip and no 3·n D2D scatter copies.
+/// Kill switch: `ATLAS_NO_QKV_OS=1` restores the scratch+scatter path.
+fn qkv_os_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_NO_QKV_OS").ok().as_deref() != Some("1"))
+}
+
 impl Qwen3AttentionLayer {
     pub(super) fn ms_phase_qkv(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
         let MultiSeqCtx {
@@ -72,6 +81,14 @@ impl Qwen3AttentionLayer {
             // weight loop in the wide verify — one GEMM per Q/K/V reads each
             // weight ONCE for all n rows instead of n× (mirrors batch3 with M=n).
             self.ms_qkv_batchn(c)?;
+        } else if (2..=16).contains(&n)
+            && ((n <= 4 && self.w8a16_gemv_batch4_k.0 != 0)
+                || (n > 4 && self.w8a16_gemv_batch16_k.0 != 0))
+            && self.q_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
+            && self.k_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
+            && self.v_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
+        {
+            self.ms_qkv_batchm_fp8(c)?;
         } else if (2..=8).contains(&n)
             && !self.gated
             && self.dense_gemv_batchm_k.0 != 0
@@ -597,6 +614,12 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         let gpu = c.fwd.gpu;
         let stream = c.stream;
+        // W4A8 DP4A M=4 arm (ATLAS_W4A16_DP4A): int8 activation + guard-free
+        // batch4 GEMV on the same NVFP4 weight. o_proj reaches this too —
+        // its `attn_out` input gets its own quant.
+        if self.dp4a_verify_gemv(c, input, w_base, output, m, n, k)? {
+            return Ok(());
+        }
         // K=4 MTP verify (M<=4) and K=5..8 chain verify (M=5..8): the batched
         // GEMV reads the non-transposed weight ONCE for all rows at near-peak
         // stream bandwidth. nsys (2026-07-18, drafts=3): the M64-tile
@@ -751,6 +774,36 @@ impl Qwen3AttentionLayer {
         // q_proj weight. Only at m > 8 is the transposed tile GEMM guaranteed.
         // n varies as sequences finish, so this is hit at every concurrency.
         let use_fused = fused_qkv_enabled() && self.qkv_nvfp4_t.is_some() && n > 8;
+
+        // STRIDED-WRITE arm (n in 4..=8): the `*_os` GEMV variants write row
+        // t at `C[t*C_stride + col]`, so each projection lands straight in
+        // its interleaved `qkv_buf` slice — same byte layout the fused GEMM
+        // produces — and the scratch round-trip plus the 3·n D2D scatter go
+        // away. On the DP4A M=4 arm the shared `normed` activation is
+        // quantized ONCE for all three projections (the per-call path
+        // re-quantized it three times into the same scratch). Bit-identical:
+        // same dot products, same bytes; only the store addressing differs.
+        // When the `_os` kernels are absent the dispatch stays on whichever
+        // numeric path the scratch route would have used (DP4A or float), so
+        // availability never flips the arithmetic.
+        let kv_dim = nkv * hd;
+        let kv_bytes = kv_dim as usize * bf16;
+        let os_stride = (per_seq_qkv / bf16) as u32;
+        let dp4a_ready = self.dp4a_batch4_ready(c, n as u32);
+        let os_gemv = if n <= 4 && self.w4a16_gemv_batch4_os_k.0 != 0 {
+            self.w4a16_gemv_batch4_os_k
+        } else {
+            self.w4a16_gemv_batch8_os_k
+        };
+        let use_os = !use_fused
+            && qkv_os_enabled()
+            && n <= 8
+            && per_seq_qkv % bf16 == 0
+            && if dp4a_ready {
+                self.dp4a_gemv_batch4_os_k.0 != 0
+            } else {
+                os_gemv.0 != 0
+            };
         if use_fused {
             // per_seq_qkv == q_proj_bytes + 2*kv_bytes == fused_n*bf16, so the
             // fused GEMM's [n, fused_n] output IS the qkv_buf layout byte for
@@ -766,6 +819,38 @@ impl Qwen3AttentionLayer {
                 fused_n as u32,
                 h as u32,
             )?;
+        } else if use_os && dp4a_ready {
+            self.dp4a_quant_input(c, normed, n as u32, h as u32)?;
+            self.dp4a_gemv_prequant_os(
+                c, q_nvfp4, qkv_buf, n as u32, q_proj_dim, h as u32, os_stride,
+            )?;
+            self.dp4a_gemv_prequant_os(
+                c,
+                k_nvfp4,
+                qkv_buf.offset(q_proj_bytes),
+                n as u32,
+                kv_dim,
+                h as u32,
+                os_stride,
+            )?;
+            self.dp4a_gemv_prequant_os(
+                c,
+                v_nvfp4,
+                qkv_buf.offset(q_proj_bytes + kv_bytes),
+                n as u32,
+                kv_dim,
+                h as u32,
+                os_stride,
+            )?;
+        } else if use_os {
+            let gemv = |w: &crate::weight_map::QuantizedWeight, out, n_out| {
+                ops::w4a16_gemv_batchm_os(
+                    fwd.gpu, os_gemv, normed, w, out, n as u32, n_out, h as u32, os_stride, stream,
+                )
+            };
+            gemv(q_nvfp4, qkv_buf, q_proj_dim)?;
+            gemv(k_nvfp4, qkv_buf.offset(q_proj_bytes), kv_dim)?;
+            gemv(v_nvfp4, qkv_buf.offset(q_proj_bytes + kv_bytes), kv_dim)?;
         } else {
             self.wide_verify_gemm(
                 c,
@@ -778,6 +863,10 @@ impl Qwen3AttentionLayer {
                 h as u32,
             )?;
         }
+        let in_qkv_buf = use_fused || use_os;
+        // The deinterleave walks qkv_buf rows at fused_n stride — identical
+        // to the _os write stride (per_seq_qkv == fused_n*bf16).
+        debug_assert!(!in_qkv_buf || os_stride == fused_n as u32);
         if self.gated && !self.q_lora_active() {
             // Split interleaved [Q|Gate] → deinterleaved, in place, all n rows
             // (grid is per-token). Matches what w4a16_gemv_qg_batch3 does inline.
@@ -786,11 +875,11 @@ impl Qwen3AttentionLayer {
             ops::deinterleave_qg(
                 fwd.gpu,
                 self.deinterleave_qg_k,
-                if use_fused { qkv_buf } else { q_scratch },
+                if in_qkv_buf { qkv_buf } else { q_scratch },
                 n as u32,
                 nq,
                 hd,
-                if use_fused {
+                if in_qkv_buf {
                     fused_n as u32
                 } else {
                     q_proj_dim
@@ -800,11 +889,9 @@ impl Qwen3AttentionLayer {
         }
 
         // K, V projections: one GEMM each (weights read once).
-        let kv_dim = nkv * hd;
-        let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(n * kv_bytes);
-        if !use_fused {
+        if !in_qkv_buf {
             self.wide_verify_gemm(
                 c,
                 normed,
@@ -828,8 +915,8 @@ impl Qwen3AttentionLayer {
         }
 
         // Scatter contiguous Q/K/V into the per-seq interleaved qkv_buf.
-        // Not needed when fused: the GEMM already wrote that exact layout.
-        for i in (0..n).take_while(|_| !use_fused) {
+        // Not needed when fused/strided: those already wrote that exact layout.
+        for i in (0..n).take_while(|_| !in_qkv_buf) {
             let q_out_i = qkv_buf.offset(i * per_seq_qkv);
             let k_out_i = q_out_i.offset(q_proj_bytes);
             let v_out_i = k_out_i.offset(kv_bytes);
