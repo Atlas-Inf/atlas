@@ -120,12 +120,17 @@ extern "C" __global__ void KERNEL_NAME(
 #ifdef PREFILL_BATCHED
     const int* const* __restrict__ block_table_ptrs,
     const unsigned int batch_size,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ kv_lens,
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    const unsigned int* __restrict__ batch_indirect_args,
+#endif
 #else
     const int* __restrict__ block_table,
 #endif
     const unsigned int q_len,
-    const unsigned int kv_len,
-    const unsigned int q_offset,
+    unsigned int kv_len,
+    unsigned int q_offset,
     const unsigned int num_q_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
@@ -140,6 +145,28 @@ extern "C" __global__ void KERNEL_NAME(
     const unsigned int b = blockIdx.z;
     if (b >= batch_size) return;
     const int* const __restrict__ block_table = block_table_ptrs[b];
+    // Per-stream geometry (mirrors gb10). VARLEN reads it from the staged
+    // arrays; UNIFORM keeps the legacy scalars so that path stays identical.
+    unsigned int q_base_b = 0;
+    unsigned int q_len_eff = q_len;
+    if (cu_seqlens != nullptr) {
+        q_base_b = (unsigned int)cu_seqlens[b];
+        q_len_eff = (unsigned int)(cu_seqlens[b + 1] - cu_seqlens[b]);
+    } else {
+        q_base_b = b * q_len;
+    }
+    if (kv_lens != nullptr) {
+        kv_len = (unsigned int)kv_lens[b];
+        if (cu_seqlens != nullptr && kv_len >= q_len_eff) {
+            q_offset = kv_len - q_len_eff;
+        }
+    }
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    kv_len = batch_indirect_args[b * 3];
+    q_offset = batch_indirect_args[b * 3 + 1];
+#endif
+#else
+    const unsigned int q_len_eff = q_len;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -149,13 +176,13 @@ extern "C" __global__ void KERNEL_NAME(
 
     if (q_head >= num_q_heads) return;
     const unsigned int q_start = q_block * BR;
-    if (q_start >= q_len) return;
-    const unsigned int q_tile_end = min(q_start + BR, q_len);
+    if (q_start >= q_len_eff) return;
+    const unsigned int q_tile_end = min(q_start + BR, q_len_eff);
     const unsigned int q_tile_len = q_tile_end - q_start;
     const unsigned int q_seq_stride = num_q_heads * head_dim;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 #ifdef PREFILL_BATCHED
-    const unsigned long long q_batch_off = (unsigned long long)b * q_len * q_seq_stride;
+    const unsigned long long q_batch_off = (unsigned long long)q_base_b * q_seq_stride;
 #endif
 
     __shared__ __nv_bfloat16 smem_Q[BR][HDIM_PAD];
@@ -181,6 +208,16 @@ extern "C" __global__ void KERNEL_NAME(
 
     KERNEL_PREAMBLE
 
+    // q_rope_pos: absolute position used to rotate the query block. Indirect
+    // (DFlash) declares it in KERNEL_PREAMBLE from a device u32 (= true decode
+    // position, decoupled from cache-slot base). All other variants: equals
+    // q_offset (correct for causal attention where RoPE pos == cache base).
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+#elif !defined(Q_ROPE_POS_OVERRIDE)
+    unsigned int q_rope_pos = q_offset;
+#endif
+
     // PV warp role mapping (4 warps): (warp_id&1) selects query M-tile;
     // (warp_id>>1) selects d N-tile half (cols 0-127 vs 128-255 at HDIM=256).
     const unsigned int pv_warp_m  = (warp_id & 1) * 16;
@@ -193,6 +230,21 @@ extern "C" __global__ void KERNEL_NAME(
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
     { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
       num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    // Sliding-window lower bound (gb10 port): every KV block strictly below
+    // the first in-window key is fully masked — start there instead of
+    // scoring and discarding. Uses q_rope_pos so the Q_ROPE_POS_OVERRIDE
+    // variant stays correct. Never skip past the end: the epilogue must
+    // still write O (all-masked rows store zeros).
+    unsigned int kv_block_lo = 0;
+    if (causal_mask_enabled && sliding_window > 0) {
+        unsigned int q_abs_lo = q_rope_pos + q_start;
+        if (q_abs_lo + 1 > sliding_window) {
+            kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
+        }
+    }
+    if (kv_block_lo >= num_kv_blocks && num_kv_blocks > 0) {
+        kv_block_lo = num_kv_blocks - 1;
+    }
 
     for (unsigned int r = tid; r < BR; r += blockDim.x) {
         smem_ml[r][0] = -1e30f;
@@ -204,7 +256,7 @@ extern "C" __global__ void KERNEL_NAME(
         const unsigned int cpr = HDIM / 8;
         for (unsigned int idx = tid; idx < TILE_CHUNKS; idx += blockDim.x) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
-            if (q_start + row < q_len) {
+            if (q_start + row < q_len_eff) {
 #ifdef PREFILL_BATCHED
                 const void* gm = (const void*)&Q[q_batch_off + (q_start+row)*q_seq_stride + q_head*head_dim + col];
 #else
@@ -218,7 +270,7 @@ extern "C" __global__ void KERNEL_NAME(
     }
     __syncthreads();
 
-    for (unsigned int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+    for (unsigned int kv_block = kv_block_lo; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
@@ -270,7 +322,7 @@ extern "C" __global__ void KERNEL_NAME(
         // ---- Online softmax in smem — one thread per query row ----
         if (tid < BR) {
             unsigned int r = tid;
-            unsigned int qr = q_offset + q_start + r;
+            unsigned int qr = q_rope_pos + q_start + r;
             bool row_valid = (r < q_tile_len);
 
             float rmax = -1e30f;
@@ -374,6 +426,30 @@ extern "C" __global__ void KERNEL_NAME(
         __syncthreads();
     }
 
+#ifdef ATLAS_ATTN_SINKS
+    // Attention sinks (gb10 port): the sink logit joins the softmax
+    // denominator and O is rescaled by exp(m - mn). All softmax state lives
+    // in smem_ml on this port, so one thread per query row applies the sink
+    // merge; every warp then rescales its acc_o rows via smem_resc using the
+    // same C-fragment map the PV loop uses (row = pv_warp_m + 2*e + lane_hi).
+    if (sinks != nullptr) {
+        if (tid < BR) {
+            float sg = __bfloat162float(sinks[q_head]);
+            float m = smem_ml[tid][0], l = smem_ml[tid][1];
+            float mn = fmaxf(m, sg);
+            float eo = sw_exp(m - mn);
+            smem_ml[tid][1] = l * eo + sw_exp(sg - mn);
+            smem_resc[tid] = eo;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int nt = 0; nt < PV_N_TILES; nt++)
+            #pragma unroll
+            for (int e = 0; e < 8; e++)
+                acc_o[nt][e] *= smem_resc[pv_warp_m + 2 * e + lane_hi];
+    }
+#endif
+
     // ---- Final normalization and store ----
     {
 #ifdef PREFILL_BATCHED
@@ -388,7 +464,7 @@ extern "C" __global__ void KERNEL_NAME(
             for (int e = 0; e < 8; e++) {
                 unsigned int row = pv_warp_m + 2 * e + lane_hi;
                 unsigned int gr = q_start + row;
-                if (gr < q_len && row < q_tile_len && col < head_dim) {
+                if (gr < q_len_eff && row < q_tile_len && col < head_dim) {
                     float l = smem_ml[row][1];
                     float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
                     ob[gr * q_seq_stride + col] = __float2bfloat16(acc_o[nt][e] * inv_l);
@@ -424,12 +500,17 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 #ifdef PREFILL_BATCHED
     const int* const* __restrict__ block_table_ptrs,
     const unsigned int batch_size,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ kv_lens,
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    const unsigned int* __restrict__ batch_indirect_args,
+#endif
 #else
     const int* __restrict__ block_table,
 #endif
     const unsigned int q_len,
-    const unsigned int kv_len,
-    const unsigned int q_offset,
+    unsigned int kv_len,
+    unsigned int q_offset,
     const unsigned int num_q_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
@@ -444,6 +525,26 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const unsigned int b = blockIdx.z;
     if (b >= batch_size) return;
     const int* const __restrict__ block_table = block_table_ptrs[b];
+    unsigned int q_base_b = 0;
+    unsigned int q_len_eff = q_len;
+    if (cu_seqlens != nullptr) {
+        q_base_b = (unsigned int)cu_seqlens[b];
+        q_len_eff = (unsigned int)(cu_seqlens[b + 1] - cu_seqlens[b]);
+    } else {
+        q_base_b = b * q_len;
+    }
+    if (kv_lens != nullptr) {
+        kv_len = (unsigned int)kv_lens[b];
+        if (cu_seqlens != nullptr && kv_len >= q_len_eff) {
+            q_offset = kv_len - q_len_eff;
+        }
+    }
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    kv_len = batch_indirect_args[b * 3];
+    q_offset = batch_indirect_args[b * 3 + 1];
+#endif
+#else
+    const unsigned int q_len_eff = q_len;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -455,13 +556,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
     if (q_head >= num_q_heads) return;
     const unsigned int q_start = q_block * BR64;
-    if (q_start >= q_len) return;
-    const unsigned int q_tile_end = min(q_start + BR64, q_len);
+    if (q_start >= q_len_eff) return;
+    const unsigned int q_tile_end = min(q_start + BR64, q_len_eff);
     const unsigned int q_tile_len = q_tile_end - q_start;
     const unsigned int q_seq_stride = num_q_heads * head_dim;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 #ifdef PREFILL_BATCHED
-    const unsigned long long q_batch_off = (unsigned long long)b * q_len * q_seq_stride;
+    const unsigned long long q_batch_off = (unsigned long long)q_base_b * q_seq_stride;
 #endif
 
     __shared__ __nv_bfloat16 smem_Q[BR64][HDIM_PAD];
@@ -479,6 +580,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
     KERNEL_PREAMBLE
 
+    // q_rope_pos — see the BR=32 kernel for the contract.
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+#elif !defined(Q_ROPE_POS_OVERRIDE)
+    unsigned int q_rope_pos = q_offset;
+#endif
+
     const unsigned int pv_warp_m  = (warp_id & 1) * 16;
     const unsigned int pv_n_start = (warp_id >> 1) * PV_N_TILES;
 
@@ -489,6 +597,16 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
     { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
       num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    unsigned int kv_block_lo = 0;
+    if (causal_mask_enabled && sliding_window > 0) {
+        unsigned int q_abs_lo = q_rope_pos + q_start;
+        if (q_abs_lo + 1 > sliding_window) {
+            kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
+        }
+    }
+    if (kv_block_lo >= num_kv_blocks && num_kv_blocks > 0) {
+        kv_block_lo = num_kv_blocks - 1;
+    }
 
     for (unsigned int r = tid; r < BR64; r += 128) {
         smem_ml[r][0] = -1e30f;
@@ -499,7 +617,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         const unsigned int cpr = HDIM / 8;
         for (unsigned int idx = tid; idx < TILE_CHUNKS_Q64; idx += 128) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
-            if (q_start + row < q_len) {
+            if (q_start + row < q_len_eff) {
 #ifdef PREFILL_BATCHED
                 const void* gm = (const void*)&Q[q_batch_off + (q_start+row)*q_seq_stride + q_head*head_dim + col];
 #else
@@ -513,7 +631,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     }
     __syncthreads();
 
-    for (unsigned int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+    for (unsigned int kv_block = kv_block_lo; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
@@ -560,7 +678,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
         if (tid < BR64) {
             unsigned int r = tid;
-            unsigned int qr = q_offset + q_start + r;
+            unsigned int qr = q_rope_pos + q_start + r;
             bool row_valid = (r < q_tile_len);
             float rmax = -1e30f;
             #pragma unroll
@@ -650,6 +768,26 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         __syncthreads();
     }
 
+#ifdef ATLAS_ATTN_SINKS
+    // Attention sinks — same smem-staged merge as the BR=32 kernel.
+    if (sinks != nullptr) {
+        if (tid < BR64) {
+            float sg = __bfloat162float(sinks[q_head]);
+            float m = smem_ml[tid][0], l = smem_ml[tid][1];
+            float mn = fmaxf(m, sg);
+            float eo = sw_exp(m - mn);
+            smem_ml[tid][1] = l * eo + sw_exp(sg - mn);
+            smem_resc[tid] = eo;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int nt = 0; nt < PV_N_TILES; nt++)
+            #pragma unroll
+            for (int e = 0; e < 8; e++)
+                acc_o[nt][e] *= smem_resc[pv_warp_m + 2 * e + lane_hi];
+    }
+#endif
+
     {
 #ifdef PREFILL_BATCHED
         __nv_bfloat16* ob = O + q_batch_off + q_head * head_dim;
@@ -663,7 +801,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             for (int e = 0; e < 8; e++) {
                 unsigned int row = pv_warp_m + 2 * e + lane_hi;
                 unsigned int gr = q_start + row;
-                if (gr < q_len && row < q_tile_len && col < head_dim) {
+                if (gr < q_len_eff && row < q_tile_len && col < head_dim) {
                     float l = smem_ml[row][1];
                     float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
                     ob[gr * q_seq_stride + col] = __float2bfloat16(acc_o[nt][e] * inv_l);
