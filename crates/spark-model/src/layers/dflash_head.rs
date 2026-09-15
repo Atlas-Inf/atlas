@@ -28,6 +28,7 @@ use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod conv;
+mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
 mod startup_diagnostics;

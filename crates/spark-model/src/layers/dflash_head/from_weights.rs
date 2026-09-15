@@ -131,6 +131,7 @@ impl BlockDiffusionDraftHead {
         // against existing Atlas resolutions in `qwen3_attention/mod.rs` and
         // `mtp_head.rs` plus the `extern "C" __global__` declarations under
         // `kernels/gb10/common/`.
+        let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
         let kernels = DflashKernels {
             // DFlash drafter uses HF's vanilla RMSNorm convention
             // (`out = x * w / RMS(x)`), NOT Atlas's default offset-from-1
@@ -177,17 +178,20 @@ impl BlockDiffusionDraftHead {
             // module as the target's BF16 prefill (`prefill_paged`); the
             // Rust dispatcher `ops::prefill_attention_paged_dflash` passes
             // `causal_mask_enabled=0` for bidirectional γ-block attention.
-            prefill_attn_dflash_bf16: gpu
-                .kernel("prefill_paged_sink", "inferspark_prefill_paged_sink")?,
+            // The sink kernels bake the tile geometry at compile time via
+            // HDIM (default 256); at head_dim=128 the HDIM=256 build reads
+            // dims 128..255 of each KV row — the neighbouring head's data —
+            // into every score, which is what suppressed Option-B
+            // acceptance. `paged_sink_modules_for_head_dim` maps the
+            // drafter's head_dim onto the matching `_h128` build.
+            // `prefill_attn_dflash_fp8` above stays HDIM-256-only: the FP8
+            // drafter-KV path is still wrong for 128-dim drafters.
+            prefill_attn_dflash_bf16: gpu.kernel(paged_sink.sink.0, paged_sink.sink.1)?,
             // Phase 5 (CUDA graph): indirect-args BF16 paged dispatcher + sinks.
-            prefill_attn_dflash_bf16_indirect: gpu.kernel(
-                "prefill_paged_indirect_sink",
-                "inferspark_prefill_paged_indirect_sink",
-            )?,
-            prefill_attn_dflash_bf16_batched_sink: gpu.kernel(
-                "inferspark_prefill_paged_batched_sink",
-                "inferspark_prefill_paged_batched_sink",
-            )?,
+            prefill_attn_dflash_bf16_indirect: gpu
+                .kernel(paged_sink.indirect.0, paged_sink.indirect.1)?,
+            prefill_attn_dflash_bf16_batched_sink: gpu
+                .kernel(paged_sink.batched.0, paged_sink.batched.1)?,
             silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
