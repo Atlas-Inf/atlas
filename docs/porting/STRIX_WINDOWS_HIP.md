@@ -196,7 +196,7 @@ point one variable at it, run one script:
 #    versioned HIP runtime (amdhip64_6.dll on 6.x, amdhip64_7.dll on 7.x).
 
 # 2. Weights (~21 GB):
-hf download nvidia/Qwen3.6-27B-NVFP4 --local-dir "$env:USERPROFILE\models\Qwen3.6-27B-NVFP4"
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir "$env:USERPROFILE\models\Qwen3.8-27B-NVFP4"
 
 # 3. Serve + smoke test:
 $env:ATLAS_BIN = "C:\path\to\unzipped\spark.exe"
@@ -216,9 +216,18 @@ TEXT: The three primary colors are **Red**, **Yellow**, and **Blue**. ...
 If you got that, the port works on your hardware. `-Phase check` audits the box
 and changes nothing, if you want to look before you leap.
 
-**Building from source instead?** Leave `ATLAS_BIN` unset and the same script
-checks the toolchain, repairs the kernel symlinks a Windows clone breaks, builds,
-and serves. Everything it does is spelled out below.
+**Building from source instead?** The Windows twin of the Linux `./build-amd.sh` /
+`./serve-amd.sh` pair lives at the repo root — from PowerShell (not Git Bash):
+
+```powershell
+git clone https://github.com/Atlas-Inf/atlas.git
+.\build-amd.ps1     # check box + toolchain, repair symlinks, cargo build
+.\serve-amd.ps1     # check GPU + weights, serve, smoke-test
+```
+
+These forward to `first_run.ps1 -Phase build` / `-Phase serve`; every
+`ATLAS_*`/`HIP_PATH` override that script documents applies. `.\serve-amd.ps1
+C:\path\to\weights` selects a different local snapshot.
 
 ## What CI proves
 
