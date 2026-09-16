@@ -1338,3 +1338,73 @@ pre-existing `multi_file_rows_are_byte_identical` sits behind the same gate,
 so `flashnext-storage-ignored` runs both in one binary to settle whether this
 is an inherited harness gap or a new defect. Until it reports, treat the three
 as **unverified on hardware**, not as passing.
+
+### Item 6 — the #23 review's correctness contracts, worked
+
+The review left four contracts open. Three are now closed or documented, one is
+a policy decision that needs hardware.
+
+**1. Kernel argmax merge was lane-exact, not index-exact — FIXED**
+(`f49be47a2`). The claim in `argmax_bf16.cu` that the batched form is
+"byte-identical by construction" to n sequential calls because the reduction
+"prefers the lower tid" does not follow. The strided scan keeps the first
+strict max *within a lane's stride class*; the merge was `>` only, so equal
+maxima in different lanes resolve to the lower **lane**. With stride 1024 and
+the max at index 1029 (lane 5) and 2050 (lane 2) the kernel returned 2050
+while the host `argmax_first_wins_f32` — and every committed BFCL record —
+returns 1029. All four merges now take an equal value from the higher lane
+when its index is lower, and the header says what the merge earns instead of
+what the reduction was assumed to imply.
+
+★ This is accuracy-relevant and **not yet measured on hardware**: the same
+class of change moved this gate's score once already (2026-09-03,
+last-index-wins, 83.38 → 83.10 normalized, reverted on the nine flipped
+samples). `flashnext-bfcl-tiebreak` (job 125) runs the ST-995 draw on the
+pushed head to measure it. Until it reports, treat the change as
+**unverified for accuracy**; the committed floors carry 0.4 of margin for
+exactly this.
+
+**2. Residual host last-wins paths — DOCUMENTED.** `sample_step.rs`'s
+suppress-ids greedy branch and its penalty-aware MTP sibling both use
+`max_by`, which returns the *last* of several equal maxima, while the verify
+kernels and `argmax_first_wins_f32` are first-wins. Left as-is (they match the
+record tree; changing them would move every committed accuracy number), with
+a comment at each site naming the rule and the divergence, which is what the
+review asked for.
+
+**3. Boundary-dense snapshot eviction — OPEN, needs a policy call.** An
+8-slot ring whose loop unit ends in a boundary token records a snapshot per
+line and evicts every out-of-`min_keep` snapshot before the watchdog fires
+(observed as `NoSsmSnapshot` declines where a rollback could have succeeded).
+The review's two candidate cures — record every Kth boundary, or skip records
+that would land inside the protected tail — are a *quality* trade in the
+rollback watchdog, not a bug fix, and both need a hardware leg on the
+loop-shaped workload to show they do not simply trade one false negative for
+another. Not attempted here.
+
+**4. `top_logprobs` is not one quantity across the engine — FOUND, NOT YET
+FIXED.** The review asked to "check the n-gram verify path reports the same
+quantity as serial". It does not, and the mechanism is now pinned:
+
+* **serial** (`decode_logits_seq.rs`, both exits) extracts from `f32_logits`
+  *after* `process_position_logits` folded penalties and masks into it in
+  place — the comment at the logit-dump site says so explicitly
+  ("`f32_logits` is now masked AND penalised here"). **Post-penalty.**
+* **every verify lane** — `extract_verify_logprobs` re-reads
+  `model.logits_buffer_ptr()`, the raw GPU buffer the host pipeline never
+  touched. **Pre-penalty.** That is `verify_k2_step`, `verify_k3_step`,
+  `verify_k4_step`, `verify_k4_batch_step`, `verify_dflash_step` and
+  `step_ngram_verify` alike, so the n-gram lane matches the other verify
+  lanes and *all of them* differ from serial.
+
+Consequence: on a request carrying penalties, the reported top-k can rank a
+token the sampler could not have chosen, and the chosen token's reported
+logprob is not the one it was drawn under. The fix is contained but touches a
+hot path — force the slow pipeline when `a.top_logprobs.is_some()` (it already
+produces the processed rows in `verify_pick_all_with_pipeline`'s `buf`, and
+the fast paths deliberately skip that D2H), return those rows, and extract
+from them. Two things to weigh before doing it: the fast paths are documented
+as *not* byte-invariant to the slow path at near-ties, so asking for logprobs
+would change emitted tokens at those ties; and the alternative direction
+(make serial report raw too) changes the numbers every existing client sees.
+Neither is a decision to take in a session that cannot hardware-verify it.
