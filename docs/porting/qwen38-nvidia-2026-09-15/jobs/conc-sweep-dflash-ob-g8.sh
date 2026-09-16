@@ -28,6 +28,19 @@ WT=/home/azeez/code/wt-dflash2-gamma
 [ -x "$WT/target/release/spark" ] || { echo "REFUSE: $WT binary missing — build job did not run"; exit 7; }
 cd "$WT"
 git log --oneline -1
+# 099 and 103 both died at boot with cuMemAlloc OOM (<1 GB free) because the
+# previous job's serve was still releasing ~97 GB when this one started: the
+# dispatcher's GPU gate checks processes, not free memory. nvidia-smi reports
+# memory.used as [N/A] on the GB10, but the memory is unified, so host
+# MemAvailable tracks device frees: wait until MemAvailable > 100 GB (of
+# ~122 GB) for 3 consecutive samples (up to 5 min).
+ok=0
+for i in $(seq 1 60); do
+    avail=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo)
+    if [ "$avail" -gt 100000 ]; then ok=$((ok + 1)); [ "$ok" -ge 3 ] && break; else ok=0; fi
+    sleep 5
+done
+echo "== host MemAvailable=${avail} MB after drain wait (${i}×5 s) =="
 echo "== $(date -u +%H:%M:%SZ) concurrency-sweep gate: nvidia + dflash + OPTION_B + γ(MODEL.toml) + bs16 =="
 ./target/release/spark benchmark run concurrency-sweep --pull-request-gate --yes \
     --serve-override gpu_memory_utilization=0.78 \

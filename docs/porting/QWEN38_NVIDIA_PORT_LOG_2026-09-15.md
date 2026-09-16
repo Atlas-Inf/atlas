@@ -302,6 +302,14 @@ used, 30 s cadence) so a future OOM has a curve.
 (ids are the expected numbering; `qctl status` is the SSOT.) Results are
 appended to §D as they land.
 
+**Actual dispatch (as of 09-16 01:10Z)** — ids drifted through the reorders
+and re-queues described in §D.12: 043 → 044 → 045(fail, env) → 046 → 048(fail,
+no binary) → 053 → 054 → 058 → 067 → 074 → 075 → 077 → 081 → 082 → 087 →
+091(wrong sha) → 095 → 099(OOM) → 100 → 102 → 103(OOM) → **104 (running,
+ST-995 + DFlash2+OB γ=8 + thinking ON, ETA ~06:00Z)** → 105 diag-every →
+108 agentic MTP-27B reference → 109 conc-sweep (with drain wait) → 110
+flashnext agentic4 on `45f5b355`.
+
 ---
 
 ## D. Results landed after this log was opened
@@ -526,3 +534,137 @@ lanes; the scaling matches the dense 27B's C1→C4 shape (20.9→41.9, ~2.0×)
 at roughly 0.85× its absolute numbers.
 
 ### D.9 077 build — `wt-dflash2-gamma` @ `a61f0263` built; `--dflash-gamma` help shows no `default: 16`.
+
+### D.10 095 dflash-g16-syncdebug2 — **the faulting kernel is named**
+
+087 (syncdebug v1) could not run: `ATLAS_DEBUG_SYNC_KERNELS=1` synchronizes
+after every launch, which is illegal inside the K=γ verify graph *capture*
+→ 900/901 on request 0. 095 re-ran with every graph off
+(`ATLAS_DFLASH_DEBUG_NO_GRAPH=1 ATLAS_DEBUG_NO_GRAPH=1`, eager propose):
+request 0 completed 256 tokens (16.4 tok/s), request 1 faulted at its first
+propose with the launch-site backtrace:
+
+```
+ATLAS_DEBUG_SYNC_KERNELS: async GPU fault immediately after kernel launch grid=[32,1,1] block=[128,1,1]: CUDA_ERROR_ILLEGAL_ADDRESS (700)
+  KernelLaunch::launch
+  ops::prefill_attn_main_a::prefill_attention_paged_dflash_bf16_indirect
+  BlockDiffusionDraftHead::forward_block_layer_attention
+  forward_block → propose_drafts_on_lane → DraftProposer::propose → run_mtp_propose_multi → step_mtp
+```
+
+So it is the drafter's paged-indirect attention
+(`inferspark_prefill_paged_indirect_sink`, `[num_q_heads, ceil(γ/32)]`), layer
+0, at the second sequence's bootstrap propose, γ=16 only. The kernel source
+(`prefill_paged_compute.cuh`) bounds every block-table/Q/KV read by
+`kv_len`/`q_len`/the table, so the **inputs** are the suspects: block table
+contents (re-allocated in a different order after `free_state`), the 12-byte
+indirect `(kv_len, q_offset, q_rope_pos)` triple, or the pool/q_buf
+pointers. `0a16369df` (pushed) adds `ATLAS_DFLASH_OPTION_B_DIAG_EVERY=1`,
+which dumps exactly those on every layer-0 propose; job 105 runs it on a
+separate `wt-dflash2-diag` build after the overnight legs and prints request
+0's vs request 1's dump side by side.
+
+### D.11 082 flashnext-nvidia-bfcl2 — ST-995 at the corrected profile, n-gram lane inert
+
+`run-1789501991840065669`, `wt-fnext-nv` @ `9c1ca517`, util 0.88 / 32K /
+prefill 16K / bf16 KV / pcache ON / `--ngram-speculative`, thinking ON
+(MODEL.toml default), n=995: **overall 83.52, normalized 82.45** — identical
+to 023 (83.52 / 82.45) to two decimals. Category: hallucination 85.98, live
+80.00, non_live 81.35. Info verdict (no committed floor). Two reads: (1) the
+memory-profile change (0.95/16K → 0.88/32K) is accuracy-neutral; (2) the
+n-gram lane never fired — **0 `NGRAM detail` lines across 995 requests**
+(3 "ngram" lines total, all boot) — so the run is a serial-path record and
+the identical score is expected, not a parity proof. Host memory: serve RSS
+11.5 GB at the end, MemAvailable min 1.9 GB — the aux-snapshot churn again
+(fix `45f5b355` verification is job 102; 091 built the wrong sha — see D.12).
+
+### D.13 100 agentic-dflash-ob-g8 — first DFlash2+Option-B agentic record on the 27B (23:4xZ)
+
+`run-1789513682099633281`; `.benchmarks/agentic-webserver/2026-09-15-a61f02634f-nvidia-qwen3.8-27b-nvfp4.json`
+in `wt-dflash2-gamma`. Serve: gate recipe `qwen3.8-27b-nvfp4-agentic` +
+`dflash=true speculative=false gpu_memory_utilization=0.75`, **`DFlash γ=8
+(source: model_toml)`** — the `a61f0263` precedence fix working in the gate
+path; pcache ON per recipe.
+
+| metric | DFlash2+OB γ=8 (this) | DFlash legacy γ=16 (`run-1789388076481949662`) |
+|---|---:|---:|
+| webserver_ok | 48 / 50 (run 21: `/ping` timeout) | 49 / 50 |
+| followed_directions | 50 / 50 | 50 / 50 |
+| s_per_turn | **19.6 s** | 57.3 s |
+| Σwall | 9,907 s (verdict Fail: > 9,000) | 28,878 s |
+| CUDA faults | **0** in 9,907 s | 0 |
+| mean_na (335 requests sampled at 22:12Z) | 1.78; spec on 41 % of steps | — |
+
+Reads: correctness holds and the γ=16 crash is gone from the gate path;
+Option B cuts the agentic wall 2.9× vs legacy DFlash, but the run is only
+~10 % over the 9,000 s budget and decodes at ≈ serial speed (~12 tok/s)
+because the drafter accepts 1.8 tokens/step on this text and thinking (ON in
+the agentic recipe) hard-gates spec off. **The gate marked the record
+INVALID for speed quoting: the sw-power-cap throttle counter advanced during
+the run** — s/turn above is descriptive only (rule 1). An MTP-27B reference
+leg on the same harness is queued (108); no such record existed (the 5.5
+s/turn agentic figures in earlier notes are the gate's default 35B subject).
+
+### D.14 102 flashnext-auxfix-verify — `45f5b355` measured
+
+FINGERPRINT `45f5b355` (102 fixed 091's remote/checkout bugs). Same F/G legs
+as 058 (27.5K prompt + 400 out ×6; Σtok 167,320):
+
+| leg | binary | Δ RSS req0→5 | MB / 1K tok |
+|---|---|---:|---:|
+| F ring on | `9c1ca517` (058) | +1,593 | 9.52 |
+| G ring off | `9c1ca517` (058) | +821 | 4.91 |
+| G (repeat) | `9c1ca517` (091, wrong-sha run) | +859 | 5.13 |
+| **F2 ring on** | **`45f5b355`** | **+1,324** | **7.91** |
+| **G2 ring off** | **`45f5b355`** | +1,309 | 7.82 |
+
+Read: on the fixed binary **ring on ≡ ring off** (F2 ≈ G2 within 1 %) — the
+decode-ring churn component is gone, which is what the change targeted. The
+residual ~1.3 GB over 6 long requests is the same on both legs and larger
+than 058-G; with capacity-retaining buffers per Marconi slot the expected
+steady state is 16 slots × (12 indexers × 27.5K × 256 B ≈ 84 MB) ≈ **1.3 GB**
+— i.e. the retained-by-design aux footprint reaching its cap, no longer
+fragmentation on top. That reading predicts a **plateau**, which 6 requests
+cannot show; job 110 (agentic4: 043's exact profile on `45f5b355`, with
+mem-trace) is the end-to-end test — 043 reached 9.8 GB, the prediction here
+is ≲ 3.5 GB flat. Until 110 lands this is "improved and re-shaped", not
+"fixed" (rule 5).
+
+### D.15 103 conc-sweep — boot OOM again (teardown race), re-queued with a drain wait
+
+Second boot-time `cuMemAlloc` failure (79 MB requested, 618 MB free) 40 s
+after the previous job's teardown; γ resolved to 8 correctly before it died.
+The dispatcher's GPU gate is process-based; on the GB10 `nvidia-smi
+memory.used` reads `[N/A]`, so the re-queued script (109) waits for host
+`MemAvailable > 100 GB` ×3 samples — unified memory makes the host counter
+track device frees. The same wait was added to the MTP reference leg (108).
+
+### D.12 Queue hygiene incidents (09-15 afternoon) — for the qctl README
+
+1. **Sanitizer jobs escape teardown.** compute-sanitizer's
+   `TreeLauncherSubreaper` re-parents the serve; after 044 and 081 an
+   orphaned `spark` (PGID outside the job's) kept ~40 GB of device memory
+   and an inherited `queue.lock` FD. 082 sat in `GPU busy — waiting` /
+   lock-blocked from 14:47 to 16:04 until the strays were identified by
+   `fuser`+`ps` and killed by PID. Fix to make: sanitizer jobs must record
+   the launcher's pgid and sweep it in a trap; the dispatcher should not
+   inherit `queue.lock` into job children (`flock` on an FD marked
+   `O_CLOEXEC`).
+2. **Cancel raced a start.** A batch cancel meant for pending 076 caught it
+   the instant it flipped to running; its `setsid` serve escaped the pgid
+   kill (same class as the §J "qctl gap"). Rule: `qctl status` immediately
+   before each cancel; cancel one job at a time.
+3. **`qctl sub --env` does not reach `run.sh`** (`ENV K=V` lines in
+   `meta.env` are not exported by the dispatcher). Scripts now default their
+   own `VAR=${VAR:-…}`.
+4. **091 verified the wrong commit**: `git fetch atlasinf` (no such remote on
+   reiner — it is `origin`) and a `checkout … | tail -1 || exit` whose pipe
+   masked the failure; the job built `9c1ca517` and its numbers (F2 +1594 MB
+   / G2 +859 MB) reproduce 058's baseline to within 2 %, which is at least a
+   clean repeatability check. Re-queued as 102 with the remote fixed and the
+   checkout guard un-piped.
+5. **099 conc-sweep OOMed at boot** (`cuMemAlloc 635 MB with 731 MB free`)
+   because it started ~30 s after 095's teardown, before the previous serve's
+   memory drained; the queue's `QGPU_USED_MAX_MB` gate should also wait for
+   `memory.used` to fall below a threshold for N consecutive samples.
+   Re-queued as 103.
