@@ -417,3 +417,59 @@ extern "C" __global__ void qsa_prefill_attn(
         }
     }
 }
+
+// ── Device-side decode block selection ─────────────────────────────────
+// The `block_topk` largest of `scores[0..complete)` with torch.topk's
+// tie-break (equal scores: the LOWER index wins), emitted in ASCENDING block
+// order and expanded to token ids (`b*ratio + r`), followed by the partial
+// block's tail `tail_start..visible`. Replaces the per-layer D2H copy + host
+// sort + H2D upload (`QsaIndexer::decode_select`); one block of threads,
+// `complete <= QSA_SELECT_MAX_BLOCKS` (the host arm covers anything wider).
+// Rank of block b = #{j : s_j > s_b or (s_j == s_b and j < b)}; selected iff
+// rank < block_topk. NaN scores are never selected.
+#define QSA_SELECT_MAX_BLOCKS 4096
+extern "C" __global__ void qsa_select_topk(
+    const float* __restrict__ scores,   // [complete]
+    int* __restrict__ sel,              // [block_topk*ratio + (visible - tail_start)]
+    int complete,
+    int block_topk,
+    int ratio,
+    int tail_start,
+    int visible)
+{
+    __shared__ unsigned char selected[QSA_SELECT_MAX_BLOCKS];
+    __shared__ float sc[QSA_SELECT_MAX_BLOCKS];   // scores staged once (16 KB)
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    // Stage the scores in shared memory: the rank loop below reads every
+    // score `complete` times, and nsys had the global-memory version at
+    // ~71 us per launch (12 per token) for complete <= 512.
+    const float neg_inf = __int_as_float(0xff800000u);
+    for (int b = tid; b < complete; b += nt) {
+        const float v = scores[b];
+        sc[b] = isnan(v) ? neg_inf : v;     // NaN never ranks, never selects
+    }
+    __syncthreads();
+    for (int b = tid; b < complete; b += nt) {
+        const float sb = sc[b];
+        int rank = 0;
+        if (sb != neg_inf) {
+            for (int j = 0; j < complete; ++j) {
+                const float sj = sc[j];
+                if (sj > sb || (sj == sb && j < b)) ++rank;
+            }
+        }
+        selected[b] = (sb != neg_inf && rank < block_topk) ? 1 : 0;
+    }
+    __syncthreads();
+    for (int b = tid; b < complete; b += nt) {
+        if (!selected[b]) continue;
+        int pos = 0;
+        for (int j = 0; j < b; ++j) pos += selected[j];
+        const int base = pos * ratio;
+        for (int r = 0; r < ratio; ++r) sel[base + r] = b * ratio + r;
+    }
+    for (int t = tail_start + tid; t < visible; t += nt) {
+        sel[block_topk * ratio + (t - tail_start)] = t;
+    }
+}

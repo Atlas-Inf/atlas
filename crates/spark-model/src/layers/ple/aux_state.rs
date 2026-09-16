@@ -148,14 +148,17 @@ impl PleLayer {
     /// already capture-illegal (its pageable H2D is why `prestage` exists),
     /// so it never runs inside a capture region.
     ///
-    /// Costs one stream sync per forward. An event recorded after
-    /// `gather_embed` would avoid the full barrier; correctness first.
+    /// Costs one wait per forward. The event recorded after `gather_embed`
+    /// now provides that guarantee, so the wait covers the gather kernel
+    /// itself instead of the full stream barrier it used to be (backends
+    /// without events fall back to the sync — see `event_synchronize_on_stream`).
     pub(super) fn release_prev_pins(
         table: &mut NgramTable,
         gpu: &dyn GpuBackend,
         stream: u64,
+        event: u64,
     ) -> Result<()> {
-        gpu.synchronize(stream)?;
+        gpu.event_synchronize_on_stream(event, stream)?;
         #[cfg(feature = "cuda")]
         if let NgramTable::Cached(cache) = table {
             cache.end_batch();

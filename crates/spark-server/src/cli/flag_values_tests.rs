@@ -15,6 +15,7 @@ use clap::Parser;
 /// below rather than silently going untested.
 const ENUMERATED: &[&str] = &[
     "lm-head-dtype",
+    "attn-proj-dtype",
     "mtp-quantization",
     "scheduling-policy",
     "ssm-h-dtype",

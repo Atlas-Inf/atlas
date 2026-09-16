@@ -93,6 +93,12 @@ pub enum RollbackFallback {
     /// every subsequent token — so the rollback is honestly declined and
     /// the caller hard-stops instead.
     NoSsmSnapshot,
+    /// Hybrid model with per-sequence AUX state (QSA indexer cursor, PLE
+    /// n-gram history): the SSM snapshot exists but its aux companion does
+    /// not (or failed to restore). Rewinding tokens and SSM state without
+    /// the indexer cursor trips `decode_select`'s `pos == ingested`
+    /// invariant on the very next token, so decline and hard-stop.
+    NoAuxSnapshot,
 }
 
 /// Find the index (into `output_tokens`) of the last well-formed
@@ -200,11 +206,17 @@ pub fn find_last_boundary_with_snapshot(
 /// any-boundary behavior. A model-side restore failure is also surfaced
 /// as a decline (the caller hard-stops cleanly rather than continuing on
 /// corrupt SSM state).
+///
+/// `unfed_tail` is how many of the newest `output_tokens` the caller has
+/// pushed but the model has NOT decoded yet: 0 at a watchdog that runs
+/// before the step's push (`handle_content_token`), 1 at one that runs
+/// after it (the fuzzy detector). See [`rollback_rewind::rewind_buffers`].
 pub fn rollback_to_boundary(
     a: &mut ActiveSeq,
     min_keep: usize,
     model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
+    unfed_tail: usize,
 ) -> RollbackOutcome {
     if !sched.watchdog.rollback_resteer {
         return RollbackOutcome::Fallback(RollbackFallback::Disabled);
@@ -277,13 +289,26 @@ pub fn rollback_to_boundary(
             );
             return RollbackOutcome::Fallback(RollbackFallback::NoSsmSnapshot);
         }
+        // Aux state (QSA indexer cursor, PLE history) has to come back to
+        // the same boundary, or the next decode reads "pos N, ingested M".
+        if model.requires_aux_state()
+            && let Err(e) = model.restore_decode_aux_snapshot(&mut a.seq, slot)
+        {
+            tracing::error!(
+                error = %e,
+                ring_slot = slot,
+                keep_len,
+                "aux decode-snapshot restore failed; declining rollback"
+            );
+            return RollbackOutcome::Fallback(RollbackFallback::NoAuxSnapshot);
+        }
         // The degenerate tail's snapshots are now stale — drop them so
         // their ring slots are reusable. The boundary snapshot itself is
         // kept (generation resumes from it).
         a.ssm_rollback_ring.truncate_after(keep_len);
     }
 
-    apply_rollback(a, keep_len, dropped);
+    apply_rollback(a, keep_len, dropped, unfed_tail);
     a.rollback_count = a.rollback_count.saturating_add(1);
     RollbackOutcome::RolledBack { dropped }
 }
@@ -346,76 +371,25 @@ pub fn snapshot_boundary_if_ssm(
         // state — remove it so `slot_for_position` never selects it.
         a.ssm_rollback_ring
             .truncate_after(token_position.saturating_sub(1));
+    } else if model.requires_aux_state()
+        && let Err(e) = model.save_decode_aux_snapshot(&a.seq, slot)
+    {
+        // Same slot, same fate: an SSM snapshot without its aux companion
+        // is not a usable rollback point (see `NoAuxSnapshot`).
+        tracing::warn!(
+            error = %e,
+            ring_slot = slot,
+            token_position,
+            "aux decode-snapshot save failed; dropping ring entry"
+        );
+        a.ssm_rollback_ring
+            .truncate_after(token_position.saturating_sub(1));
     }
 }
 
-/// Token-buffer rewind applied to a generated-token buffer and the
-/// paged-attention sequence buffers. Pure over plain `Vec`s / scalars so
-/// it is unit-testable without an [`ActiveSeq`] (which carries channels,
-/// `Instant`s and a `SequenceState`). This is the load-bearing KV-rewind
-/// step — see the module doc on why lowering `seq_len` *is* the
-/// attention rewind.
-///
-/// Returns the new `seq_len`.
-pub fn rewind_buffers(
-    output_tokens: &mut Vec<u32>,
-    seq_tokens: &mut Vec<u32>,
-    seq_len: usize,
-    keep_len: usize,
-) -> usize {
-    let dropped = output_tokens.len().saturating_sub(keep_len);
-    output_tokens.truncate(keep_len);
-    let mut new_seq_len = seq_len;
-    for _ in 0..dropped {
-        if seq_tokens.pop().is_some() {
-            new_seq_len = new_seq_len.saturating_sub(1);
-        }
-    }
-    new_seq_len
-}
-
-/// Apply the truncation + KV/position rewind + watchdog-state reset to a
-/// live [`ActiveSeq`]. Delegates the buffer rewind to [`rewind_buffers`].
-fn apply_rollback(a: &mut ActiveSeq, keep_len: usize, dropped: usize) {
-    // 1+2. Truncate the generated-token buffer and rewind the
-    //       attention-KV cursor (`seq.tokens` + `seq_len`).
-    a.seq.seq_len = rewind_buffers(
-        &mut a.output_tokens,
-        &mut a.seq.tokens,
-        a.seq.seq_len,
-        keep_len,
-    );
-
-    // 3. Restore the generation budget that the dropped tokens consumed.
-    //    Every dropped token decremented `remaining` by one (since the §C-1
-    //    hard-limit fix, thinking tokens draw down the budget too, not just
-    //    content) — and the watchdogs that call this only ever fire
-    //    post-`</think>`, dropping content tokens, so `dropped` is an exact
-    //    count of budget to refund.
-    a.remaining = a.remaining.saturating_add(dropped);
-    a.content_tokens = a.content_tokens.saturating_sub(dropped as u32);
-
-    // 4. Re-point the decode cursor at the boundary token.
-    if let Some(&last) = a.output_tokens.last() {
-        a.last_token = last;
-    }
-
-    // 5. Rewind the grammar FSM by the same token count so the
-    //    constrained-decoding matcher stays in sync with the truncated
-    //    token stream. Every dropped token is a post-`</think>` content
-    //    token (the watchdogs that call this fire after thinking has
-    //    closed) and was therefore fed to `grammar_state.accept_token`,
-    //    so `rollback(dropped)` is exact. Reuses the existing
-    //    spec-decode grammar-rewind path (`GrammarState::rollback`).
-    if let Some(ref mut gs) = a.grammar_state {
-        gs.rollback(dropped);
-    }
-
-    // 6. Reset the watchdog accumulators so the just-cleared window does
-    //    not immediately re-trigger before fresh tokens arrive.
-    a.prose_tokens_since_last_tool = 0;
-    a.consecutive_confident = 0;
-}
+#[path = "rollback_rewind.rs"]
+mod rollback_rewind;
+use rollback_rewind::apply_rollback;
 
 // ── Phase-C ROM (arXiv:2603.22016) scaffold — OPTIONAL hook ──────────
 //

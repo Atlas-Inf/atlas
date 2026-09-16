@@ -4,6 +4,18 @@
 
 use super::*;
 
+/// `ATLAS_MOE_DECODE_ARM`: `scalar` (default — the fused FP32-FMA gemv arm) or
+/// `grouped` (route every layer's single-token MoE through the tensor-core
+/// grouped-GEMM arm via `forward_prefill(M=1)`). Read once per process.
+fn moe_decode_arm_grouped() -> bool {
+    static ARM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARM.get_or_init(|| {
+        std::env::var("ATLAS_MOE_DECODE_ARM")
+            .map(|v| v.eq_ignore_ascii_case("grouped"))
+            .unwrap_or(false)
+    })
+}
+
 impl MoeLayer {
     /// True when the ATLAS_FP32_ROUTING path is active: the SSM-side MoE-input
     /// norm should emit an FP32 `router_in` (residual_add_rms_norm_gatef32) which
@@ -93,16 +105,17 @@ impl MoeLayer {
         // preserving Atlas's TPS on the bulk of the network. The 5 capture layers
         // pay ~250 µs each (microbench), totalling ≈1.25 ms per token (negligible
         // at Atlas's ~58 ms/token decode latency).
-        if self.is_dflash_capture_layer
-            && std::env::var("ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL")
-                .ok()
-                .as_deref()
-                == Some("1")
+        if moe_decode_arm_grouped()
+            || (self.is_dflash_capture_layer
+                && std::env::var("ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL")
+                    .ok()
+                    .as_deref()
+                    == Some("1"))
         {
             // One-time per-process log so we can verify the env-gated route is hit.
             if ctx.stats.once("log:moe_route") {
                 tracing::info!(
-                    "FRANKENSTEIN: routing DFlash capture-layer MoE decode through forward_prefill(M=1) (one-time log)"
+                    "MoE single-token decode: grouped-GEMM arm (forward_prefill M=1) for this layer (one-time log)"
                 );
             }
             self.forward_prefill(input, 1, ctx, stream)?;
