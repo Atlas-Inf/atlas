@@ -463,6 +463,28 @@ avg TPS 7.0. The third long-context probe (~16 k tokens) 400s against
 - Verify at K=γ+1 rows lands on the float `w4a16_gemv_batch8/16` tiers
   (verify_ms median 118.7 at K=5 vs 292.4 at K=9, per the gemv-outdir
   steptiming files) rather than the M=4 DP4A arm MTP uses.
+- GB10 batched concurrency is a measured gap, not a defect-free pass:
+  `concurrency-sweep` (job 132, nvidia/Qwen3.8-27B-NVFP4, dflash=true +
+  OPTION_B, gamma=8, bs16, util 0.70, binary sha cfe3d057, run
+  run-1789593412748305110) ran all 4 cells clean - zero request errors,
+  CUDA graphs engaged - but aggregate throughput is FLAT ~24-25.6 tok/s
+  from C1 through C16 vs the 33.5 C=4 floor. MTP reference on the same
+  host scales 20.9/41.9/64.1/85.2. Per-step timing shows why: verify
+  ~123 ms + propose ~50 ms serialize per sequence; mean_na also drops to
+  ~2.1-2.3 under batch vs ~5.0 single-stream. DFlash2 on GB10 today is a
+  single-stream win (~34 tok/s g8, ~45.5 tok/s g16 incl. TTFT vs MTP
+  20.9); batched-verify scheduling is future work.
+- GB10 batched concurrency is a measured gap, not a defect-free pass:
+  `concurrency-sweep` (job 132, nvidia/Qwen3.8-27B-NVFP4, dflash=true +
+  OPTION_B, γ=8, bs16, util 0.70, binary sha cfe3d057, run
+  run-1789593412748305110) ran all 4 cells clean — zero request errors,
+  CUDA graphs engaged — but aggregate throughput is FLAT ~24–25.6 tok/s
+  from C1 through C16 vs the 33.5 C=4 floor. MTP reference on the same
+  host scales 20.9/41.9/64.1/85.2. Per-step timing shows why: verify
+  ≈123 ms + propose ≈50 ms serialize per sequence; mean_na also drops to
+  ~2.1–2.3 under batch vs ~5.0 single-stream. DFlash2 on GB10 today is a
+  single-stream win (~34 tok/s γ8, ~45.5 tok/s γ16 incl. TTFT vs MTP
+  20.9); batched-verify scheduling is future work.
 - Propose remains ~190–229 ms median against a ~45 ms bandwidth ESTIMATE
   (drafter ~3.8 GB + fc + lm_head at ~100–200 GB/s — estimate, not measured);
   rocprof ranking of the propose step is the next lever and could not run
