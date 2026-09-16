@@ -89,6 +89,7 @@ pub struct PleLayer {
     gather_done: std::sync::Mutex<u64>,
     /// Pinned staging for the slot upload: (host pointer as usize, capacity
     /// in bytes). (0, 0) until the first `Cached` gather grows it.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     slots_staging: std::sync::Mutex<(usize, usize)>,
 }
 

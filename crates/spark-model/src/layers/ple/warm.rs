@@ -270,7 +270,7 @@ impl PleLayer {
                 .table
                 .lock()
                 .map_err(|_| anyhow::anyhow!("PLE table mutex poisoned"))?;
-            matches!(&*table, NgramTable::Cached(_))
+            table.is_row_cached()
         };
         if !is_cached {
             return Ok(());
