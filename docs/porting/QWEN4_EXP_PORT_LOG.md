@@ -1287,9 +1287,54 @@ report counted the whole file per arm, reading the short arm's 7 proposals a
 second time as the long arm's. The per-arm counts above are the corrected
 deltas; `flashnext-ngram-longctx2` re-runs it with the offset fix.
 
-### `118` — PLE prefetch
+### `118` — PLE prefetch: the miss term goes to zero, and it is not the TTFT lever
 
-Re-run of 111 with a prompt that fits (370 paragraphs, ~24K tokens against the
-32K cap) and a hard guard that fails if `usage.prompt_tokens > 30,000`. The
-spark-storage prefetch unit tests pass on the CUDA host; the cold/warm
-comparison and the byte-identity check are reported in `WARM.tsv`.
+PASS, and the numbers are worth reading carefully because they cut against
+item 4's framing. Patch = PR #35's head applied to `45f5b355`; one serve per
+arm, 370-paragraph prompt (~23.9K tokens, inside the 32K cap — 111's bug),
+`ATLAS_PLE_WARM` 0 vs 1.
+
+| arm | req | prompt | out | wall | content sha |
+|---|---|---:|---:|---:|---|
+| cold | long | 23,856 | 34 | **76.98 s** | `7b4fbdc2f9ed` |
+| cold | prefix | 23,858 | 21 | 2.36 s | `7f36f5822a6f` |
+| warm | long | 23,856 | 34 | **81.22 s** | `7b4fbdc2f9ed` |
+| warm | prefix | 23,858 | 21 | 2.38 s | `7f36f5822a6f` |
+
+**Correctness holds** — cold and warm produce byte-identical output on both
+requests, so the warm session changes WHEN rows land, not which. **The
+prefetch works**, and the gather lines say so exactly: the cold arm's first
+25K-prompt gather is
+
+```
+PLE gather: 131072 ids, 126049 hits / 5023 misses, resolve 47970us
+```
+
+and the warm arm's is
+
+```
+PLE gather: 131072 ids, 131072 hits / 0 misses, resolve 1823us
+```
+
+Zero misses, and the resolve drops 47,970 µs → 1,823 µs (26×). The worker had
+every row resident before the gather asked. The prefix request shows the
+cursor jump too (cold 144/368 on the tail gather, warm 512/512).
+
+★ **And the wall does not improve: 81.22 s vs 76.98 s.** The miss term this
+removes is ~46 ms out of ~77 s of prefill — 0.06 %. So the port log's item 4
+framing ("the PLE gather's serial miss preads … is why a fresh 25K turn costs
+100+ s of TTFT") is now quantified and the answer is that it is *not*: the
+queue-depth half was the cheap half, and it buys ~46 ms. The remaining ~77 s
+is the indexer, exactly as that item's second sentence said. Two runs, one
+per arm, so the +5.5 % on the warm arm is **observed, single-shot** — not a
+regression claim, and not worth chasing until the indexer is the target.
+
+★ Also found, and NOT a defect of this branch: the three new `#[ignore]`d
+prefetch tests cannot run under the invocation their own doc comment
+prescribes (`cargo test -p spark-storage --features cuda prefetch -- --ignored`).
+They fail with `cuMemAllocHost_v2(4096) failed: 3` — `CUDA_ERROR_NOT_INITIALIZED`
+— because no test process in `spark-storage` creates a CUDA context. The
+pre-existing `multi_file_rows_are_byte_identical` sits behind the same gate,
+so `flashnext-storage-ignored` runs both in one binary to settle whether this
+is an inherited harness gap or a new defect. Until it reports, treat the three
+as **unverified on hardware**, not as passing.
