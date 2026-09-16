@@ -1,6 +1,11 @@
 # `qwen4_exp` — Qwen3.8-Flash-Next: what is in Atlas, and what is not
 
-Status as of 2026-08-27. Read against the published
+Status as of 2026-08-27 for the architecture and component notes; the
+**2026-09-15 status of the `nvidia/Qwen3.8-Flash-Next-NVFP4` pack** — loads,
+ST-995 83.52 / 82.45 twice, 50/50 agentic at util 0.88 / 32K, the unified-memory
+OOM decomposed and its host-churn half fixed (`45f5b355`), the n-gram lane
+engaging but accepting ~0 — and the ordered list of what remains are in
+`QWEN4_EXP_PORT_LOG.md` (last section). Read against the published
 [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
 `config.json` and `model.safetensors.index.json`, plus the reference
 implementation in HuggingFace Transformers (Apache-2.0),

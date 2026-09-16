@@ -841,3 +841,200 @@ The harness applies this checkpoint's chat template client-side to count
 ISL/OSL/TPOT, and the template cannot render the harness's tool-definition
 shape. Non-fatal — it degrades only the token metrics — but it would hit
 anyone using this checkpoint as a client-side tokenizer with tools.
+
+---
+
+## 2026-09-15 — the nvidia pack, the OOM decomposed, the n-gram lane, and what remains
+
+Box `gx10-e3a3` (GB10, 119.6 GB unified, driver 580.126.09). Tree
+`feat/flashnext-nvidia` (PR #35): `review/pr23-fixes` + `9923d498`,
+`dbe6f7d2`, `0902edb6`, `9c1ca517`, `45f5b355`. Every number below is an
+observation under the fingerprint next to it; run-record ids are
+`~/.atlas/runs/<bench>/run-*.json` on the box, and the queue scripts that
+produced them are checked in under
+`docs/porting/qwen38-nvidia-2026-09-15/jobs/` (on `review/pr21-fixes`), with
+the full day's narrative in `docs/porting/QWEN38_NVIDIA_PORT_LOG_2026-09-15.md`.
+
+### The 32K section above is superseded
+
+"The 32K context is not viable on this config" was written against
+`--gpu-memory-utilization 0.92` and a 25.5K-token turn that got the process
+OOM-killed. It is now understood and no longer true as stated:
+
+* At **util 0.88 / `--max-seq-len 32768` / `--max-prefill-tokens 16384`** the
+  nvidia pack ran the full agentic-webserver harness — 50 iterations, 816
+  turns, **32 multi-chunk prompts up to 25,191 tokens**, **50/50
+  webserver_ok**, 0 CUDA faults (`run-1789474170004681458`). What killed the
+  earlier runs was not the 25K turn per se but two host-memory terms, below.
+* The perf verdict of that run is FAIL (Σwall 19,351 s > 9,000 s, 23.7 s/turn)
+  — that is the serial decode floor of this pack on Atlas, not the memory.
+
+### nvidia/Qwen3.8-Flash-Next-NVFP4 — what loads and what it scores
+
+Deltas vs the RadixArk pack that needed code (config+index audit, then
+CPU-verified loader work): the ModelOpt `quantized_layers` MIXED_PRECISION
+map (`9923d498`), per-expert FP8-block-scale MTP experts (512×3
+`weight + weight_scale_inv`, g=128) routed through
+`dequant_fp8_blockscaled_to_bf16 → quantize_to_nvfp4`, and MIXED_PRECISION
+detection that excludes `mtp.*` / `*.ple.*` / `*.visual.*` before resolving
+the main-model variant (`dbe6f7d2` — nvidia's `mtp.layers.0.mlp.experts`
+literally contains `.mlp.experts`, so naive substring matching misroutes the
+pack). Key naming, PLE shard set and the expert scale triple are identical to
+RadixArk; no loader change there.
+
+| leg | fingerprint | result |
+|---|---|---|
+| loader smoke | `dbe6f7d2`, 16K, util 0.95, no spec | MTP shard header F8_E4M3 + g128 `weight_scale_inv`; first request 1.5 s |
+| MTP-on probe | `9c1ca517`, `--speculative --num-drafts 1`, util 0.93 | healthy in 80 s, 995-token answer; MTP gate arbitrated K=1 |
+| **ST-995** (bfcl-subset golden draw, n=995, seed 42, temp 0, thinking ON) | `9c1ca517`, util 0.95 / 16K, no spec | **83.52 overall / 82.45 normalized** (`run-1789433036569430053`) |
+| ST-995 again, corrected memory profile | `9c1ca517`, util 0.88 / 32K, `--ngram-speculative` (lane never engaged — see below) | **83.52 / 82.45**, hallucination 85.98 / live 80.00 / non_live 81.35 (`run-1789501991840065669`) |
+| agentic-webserver ×50 | `9c1ca517`, util 0.88 / 32K | 50/50 ok, 49/50 directions, 23.7 s/turn (`run-1789474170004681458`) |
+| bs4 probe (MinHeap ×N, 256 out) | `9c1ca517`, util 0.88 | C1 17.5–18.5 → **C4 35.2–36.8 agg tok/s**, byte-identical outputs across lanes |
+| KL / coherence, serial vs n-gram (5 prompts, temp 0, penalties 0, top-10 logprobs) | `9c1ca517` | coherent, tool call OK, 3/5 byte-identical; lane inert |
+
+Neither ST-995 record gates yet: the BENCH.toml scaffold (`0902edb6`) has no
+committed floors by design — these two runs are what the floors get derived
+from.
+
+### The OOM, decomposed into two terms
+
+**Term 1 — the pledge is also the host's ceiling.** GB10 memory is unified.
+`--gpu-memory-utilization u` reserves `u × 119.6 GB` for the serve, and the KV
+pool absorbs whatever is left under the pledge after weights + arena +
+reserve (at 0.93: 95.1 GB pre-KV, then **12.2 GB of KV for a bs1 workload
+whose 12 full-attention layers need < 1 GB at 32K**). The host keeps
+`(1−u) × 119.6 GB` minus co-tenants. Measured: at 0.93 `MemAvailable` fell to
+**870 MB** after 25 agentic turns (`run-1789451775373797695` hardware_state);
+at 0.95 the OOM killer fired (journalctl, 118/119 GB) after ~33 iterations.
+Serve-side accounting from the same boot: weights 73.33 GB on disk → 84.0 GB
+resident after load (SGLang reports 83.68 GiB for this pack — parity), + 2.5
+GB layer construction, + 6.3 GB buffer arena, + 4.1 GB inference reserve;
+Marconi pool 1.8 GB + rollback ring 0.9 GB on top. 0.88 hands ~6 GB back to
+the host and is what every leg above ran at.
+
+**Term 2 — the serve's own host memory grows with context.** Under the agentic
+run the process's `RssAnon` went **2.0 → 9.8 GB** (30-s trace in the job dir):
+~110 MB / 5 min while the transcript was 15–20K tokens deep, ~20 MB / 5 min on
+short turns, plateauing near 10 GB. An 8-leg bisect (fresh serve per leg, 6
+requests each, `RssAnon` sampled after every request) put it on one
+mechanism:
+
+| leg | shape | MB per 1K tokens |
+|---|---|---:|
+| 51-tok prompt, 321 out | decode-only | ~14 MB / request fixed |
+| 27.4K distinct prompts, 16 out, pcache ON | prefill | 6.5 |
+| the same 27.4K prompt ×6 (prefix hits) | | 2.3, **flat after the first** |
+| 27.4K distinct, pcache OFF | | 5.0 |
+| 27.4K distinct, `ATLAS_QSA_DEVICE_TOPK=1` | | 6.7 (≡ ON → not the QSA host top-k) |
+| 27.5K prompt + 400 out (the agentic shape), ring ON | | **9.5** |
+| same, `ATLAS_SSM_DECODE_RING=0` | | 4.9 |
+| same, `MALLOC_ARENA_MAX=2 MALLOC_MMAP_THRESHOLD_=1048576` | | 3.5 |
+
+Growth ∝ context depth, halves without the decode-rollback ring, stops on
+prefix-cache hits, shrinks under malloc tuning ⇒ **aux-state snapshots**.
+`QsaIndexer::snapshot_aux` and `PleLayer::snapshot_aux` serialized their
+per-sequence state (QSA raw keys: `ingested × hd × 2` bytes = 256 B/token per
+indexer, 12 indexers ≈ 3 KB/token; ≈ 84 MB per 27K prompt) into a **fresh host
+`Vec` on every save** — at every boundary token for the decode ring
+(`snapshot_boundary_if_ssm`, 620 boundary ids, so nearly every line of code)
+and at every Marconi checkpoint / finish-leaf — then dropped the previous one.
+The live set was bounded (8 ring slots, 16 Marconi slots) but the multi-MB
+alloc/free churn across scheduler threads fragmented glibc arenas (the 2-minute
+`smaps` diff showed ~35 new 64 MB arena heaps per 2 min). `45f5b355`
+snapshots into caller-owned, capacity-retaining buffers on both paths
+(`snapshot_aux_into`, `collect_aux_states_into`; ring entries are taken out of
+the map, refilled, re-inserted; Marconi `free()` clears blobs in place instead
+of dropping them) and applies restores under the pool lock instead of
+`.cloned()`. Bytes on the wire unchanged; 6 unit tests. Verified on the same
+bisect legs: ring-on **7.9** vs ring-off **7.8** MB/1K tok (was 9.5 vs 4.9) —
+the ring term is gone; the residual matches the retained-by-design 16-slot
+Marconi footprint reaching its cap (~1.3 GB at 27K). The end-to-end agentic
+rerun on this binary, mem-traced, is queued; until it lands the honest status
+is "re-shaped and bounded", not "fixed".
+
+Also observed while chasing this: with `RUST_LOG=info` every prefill logs
+`PLE gather: N ids, hits/misses` — on the 25K turns the gather was 55,808 ids
+with ~half misses, and those misses are serial preads under the table mutex
+(the loader's own note). That is the TTFT term for fresh long prompts, not a
+memory term.
+
+### The n-gram lane on this pack: engages, accepts ~nothing
+
+`--ngram-speculative` (the llama.cpp-style dynamic table + multi-token chains
++ SSD persistence on `review/pr23-fixes`) boots (`N-gram speculative decoding:
+ENABLED (K=2/3/4 verify, CPU proposer)`), but:
+
+* KL harness, 5 prompts × 256 tokens: every request `tok_step=1.000
+  mean_na=0.000`, ngram wall = serial wall (14.5 vs 14.4 s); 3/5 outputs
+  byte-identical to serial.
+* Positive control — the PR's own shape (600-word essay, 400 out, temp 0,
+  `RUST_LOG=debug`), 2 requests per leg: the proposer **runs** (`NGRAM detail:
+  drafts=[…] … na=0` lines: 26 on request 0, 145 on request 1 — the table
+  warms) but acceptance is ~0; serial 15.6/16.8 vs ngram 16.0/18.7 tok/s incl.
+  TTFT, `tok_step 1.000` both.
+* ST-995 under the lane: **0 `NGRAM detail` lines in 995 requests**; score
+  identical to the no-spec run (that is expected when nothing engages, not a
+  parity proof).
+
+PR #23 measured +36 % (18.7 → 25.5 tok/s, ~93 % acceptance) on the RadixArk
+pack. Under this fingerprint on the nvidia pack that does not reproduce. Not
+yet determined why; the two things to check first are the draft-vs-target
+position alignment for this checkpoint's tokenization (the class of the
+off-by-one already fixed once on this lane) and what the dynamic table
+actually learns on these prompts. Also observed: the K=2 verify path with
+rejected drafts is not output-neutral (2/5 prompts diverge at exact BF16
+ties) — same tie-contract class as the DFlash lane on the 27B.
+
+### The external agent report (spark box, ~16 h whiteboard build) vs our records
+
+Their two pinned items are already handled on this line: the 32K request cap
+(`qsa.rs` clamps indexer capacity to `--max-seq-len`; `ATLAS_QSA_MAX_TOKENS`
+can only raise it) and the prefill-chunk / PLE-scratch coupling (`9c1ca517`
+loops the PLE pipeline over `ATLAS_PLE_CHUNK` spans regardless of
+`--max-prefill-tokens`). Their unpinned misaligned-address context loss (4× in
+35 min of agent traffic, a D2H at layer 0 of a continuation chunk right after
+an intermediate SSM checkpoint save) did **not** reproduce in our 819-prefill /
+32-continuation-chunk / 1,562-checkpoint agentic run — but our chunk size was
+16K (theirs 8K) and our depth 25K (theirs 42.8K), so that is two
+observations, not an A/B. The eager + `ATLAS_DEBUG_SYNC_KERNELS=1` method that
+named the DFlash fault on the 27B (a Rust backtrace of the launch site) is the
+tool to point at it.
+
+### What remains — ordered by what changes the user-visible number
+
+1. **Make speculation accept on this pack.** Agentic and long-form decode sit
+   at the serial floor (15–18 tok/s, 23.7 s/turn). The n-gram lane is the only
+   one that fits at these memory budgets (the BF16 MTP block does not fit at
+   0.85; the FP8-expert MTP arm fits but arbitrated to K=1 in the probe) and it
+   accepts ~0 here. Diagnose alignment/table first (10-minute leg with
+   position-aligned draft-vs-emitted dump), then re-measure the essay control
+   and ST-995 with the lane actually firing.
+2. **Finish the memory story.** (a) The queued agentic rerun on `45f5b355`
+   with the RSS trace — prediction ≲ 3.5 GB flat vs 9.8 GB; (b) move the
+   Marconi/ring aux blobs to device (or a preallocated pinned arena) so the
+   host footprint stops scaling with slots × depth *and* the per-boundary-token
+   `synchronize` + D2H hitch (review note 5) goes away; (c) need-driven KV
+   sizing for bs1 profiles so the pledge remainder is not swallowed by a KV
+   pool 12× larger than the workload; (d) recipe: util 0.88 / 32K, and
+   `ATLAS_SSM_DECODE_RING=0` for agentic serving (the rollback watchdog is the
+   feature that false-positives on code).
+3. **Gate the nvidia subject.** Derive BENCH.toml floors from the two ST-995
+   records + the agentic record, set `status = "measured"`, so
+   `--pull-request-gate` can serve it and the recipe
+   (`qwen3.8-flash-next-nvfp4-nvidia.yaml`, sparkrun-recipes PR #8) carries the
+   profile above instead of the RadixArk one.
+4. **Long-prefill TTFT** (unchanged from the gap analysis): `qsa_score_rows`
+   is quadratic at 294 GFLOP/s and, with the PLE gather's serial miss preads,
+   is why a fresh 25K turn costs 100+ s of TTFT. Queue-depth on the PLE reads
+   is the cheap half; the indexer kernel is the real one.
+5. **Decode graph capture**: `ATLAS_QSA_DEVICE_TOPK=1` default + the PLE event
+   remove the two vetoes; capture has not been re-attempted on this model.
+   This is where PR #27's runtime becomes relevant to Flash-Next — not before.
+6. **Correctness contracts** still open from the #23 review: kernel
+   lane-vs-index argmax merge, residual host last-wins paths, boundary-dense
+   snapshot eviction, and the pre-/post-penalty `top_logprobs` inconsistency
+   found on the DFlash lane (check the n-gram verify path reports the same
+   quantity as serial).
+7. **W4A4 activation path** for the routed experts (the pack ships static
+   `input_scale`; the loader lands it, the parked `_fp4` MoE kernels do not
+   consume it yet) — a throughput lever once 1–2 are done.
