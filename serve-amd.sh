@@ -5,6 +5,13 @@
 #   ./serve-amd.sh                                  # nvidia/Qwen3.8-27B-NVFP4 (default)
 #   ./serve-amd.sh unsloth/Qwen3.8-27B-NVFP4        # or any local snapshot path
 #   PORT=9000 MAX_SEQ_LEN=32768 ./serve-amd.sh
+#   DFLASH=1 DRAFT_MODEL=/path/to/dflash2 ./serve-amd.sh   # DFlash2 spec decode
+#   SSM_CKPT_INTERVAL=128 ./serve-amd.sh   # coarser SSM snapshots for long ctx
+#
+# DFLASH=1 swaps MTP for the DFlash2 drafter: it appends --dflash
+# --draft-model (DRAFT_MODEL, default incoai/Qwen3.8-27B-DFlash2) and forces
+# the MTP --speculative args off — DFlash and MTP are mutually exclusive on
+# this recipe. DFLASH_GAMMA overrides the MODEL.toml gamma when set.
 #
 # A binary built with ATLAS_TARGET_MODEL='*' (build-amd.sh's default) carries
 # every strix kernel target, and resolution picks the right one from the
@@ -68,8 +75,16 @@ export ATLAS_MTP_GATE_REPROBE=64  # re-probe the MTP accept gate every 64 tokens
 # ST-995 run under (2026-09-02 fingerprint, see the handoff): 0.88 utilization
 # is the largest that leaves non-fragmented headroom for the SSM pool after the
 # 43.1 GB pre-KV BF16-preservation load; 4096 context matches the gate draws.
-GPU_UTIL="${GPU_UTIL:-0.88}"
+# The actual default is resolved below the DFLASH block — DFlash needs a
+# smaller one (see below).
+GPU_UTIL="${GPU_UTIL:-}"
 SSM_SLOTS="${SSM_SLOTS:-0}"
+# SSM_CKPT_INTERVAL: tokens between Marconi snapshots; default 16 (=256
+# tok/snapshot, the certified warm-prefill recipe). The engine raises
+# --ssm-cache-slots to cover MAX_SEQ_LEN at that granularity, so at 24K ctx
+# the default costs 104 slots × 151 MB — set e.g. 128 (2048 tok/snapshot →
+# 20 slots, 3 GB) for long-context serving with the DFlash2 drafter resident.
+SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-16}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 # Qwen3.8 tool schemas routinely exceed 2K tokens. The corrected BC=32 paged-
 # prefill kernel preserves all query rows across chunks, so the 0.99 GB arena
@@ -140,6 +155,25 @@ SPEC_ARGS=()
 if [ "${NUM_DRAFTS:-3}" -gt 0 ]; then
   SPEC_ARGS=(--speculative --num-drafts "${NUM_DRAFTS:-3}")
 fi
+# DFlash and MTP --speculative are mutually exclusive on this recipe:
+# DFLASH=1 wins and forces the MTP args off.
+DFLASH_ARGS=()
+if [ "${DFLASH:-0}" = "1" ]; then
+  SPEC_ARGS=()
+  DFLASH_ARGS=(--dflash --draft-model "${DRAFT_MODEL:-incoai/Qwen3.8-27B-DFlash2}")
+  [ -n "${DFLASH_GAMMA:-}" ] && DFLASH_ARGS+=(--dflash-gamma "$DFLASH_GAMMA")
+  # Default to the paged Option-B drafter path: the legacy propose
+  # re-projects every accumulated ctx slot each step (measured ~1.0 s/step
+  # propose at gamma=8 on gfx1151, dflash-h128-20260915T1546Z); Option B is
+  # incremental, and head_dim-aware sink kernels make its acceptance match
+  # legacy. ATLAS_DFLASH_OPTION_B=0 restores the legacy path.
+  export ATLAS_DFLASH_OPTION_B="${ATLAS_DFLASH_OPTION_B:-1}"
+fi
+# GPU_UTIL default: 0.88 plain / 0.80 under DFlash. The KV budget is computed
+# before the ~5 GB drafter (weights + KV pool + scratch) allocates, so at 0.88
+# the DFlash2 serve OOM'd on gfx1151 (cuMemAlloc status 2, 4.2 GB free at a
+# 635 MB request, 2026-09-15); 0.80 leaves the headroom the drafter needs.
+GPU_UTIL="${GPU_UTIL:-$([ "${DFLASH:-0}" = 1 ] && echo 0.80 || echo 0.88)}"
 
 GFX=$("$ROCM_HOME/bin/rocminfo" 2>/dev/null | sed -n 's/.*\(gfx[0-9][0-9]*\).*/\1/p' | head -1)
 echo "serving $MODEL on ${GFX:-AMD} via $HW"
@@ -159,7 +193,7 @@ exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-nvfp4}" --max-batch-size "${MAX_BATCH:-1}" \
-  "${SPEC_ARGS[@]}" \
-  --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval 16 \
+  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" \
+  --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval "$SSM_CKPT_INTERVAL" \
   $ALLOW_FALLBACKS \
   "$@"

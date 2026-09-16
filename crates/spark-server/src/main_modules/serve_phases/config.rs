@@ -138,8 +138,23 @@ pub(crate) fn apply_model_default_num_drafts(
     args: &mut cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
 ) {
-    let (effective, source) =
-        resolve_num_drafts(args.num_drafts, ptx_set.behavior.default_num_drafts);
+    let dflash_default = if args.dflash {
+        Some(args.resolved_dflash_gamma().saturating_sub(1))
+    } else {
+        None
+    };
+    let (effective, source) = if let Some(cli_val) = args.num_drafts {
+        (cli_val, NumDraftsSource::Cli)
+    } else if let Some(df_val) = dflash_default {
+        (df_val, NumDraftsSource::ModelDefault)
+    } else if ptx_set.behavior.default_num_drafts > 0 {
+        (
+            ptx_set.behavior.default_num_drafts as usize,
+            NumDraftsSource::ModelDefault,
+        )
+    } else {
+        (cli::DEFAULT_NUM_DRAFTS, NumDraftsSource::EngineDefault)
+    };
     match source {
         NumDraftsSource::Cli => {
             let model_default = ptx_set.behavior.default_num_drafts as usize;
@@ -154,7 +169,7 @@ pub(crate) fn apply_model_default_num_drafts(
         }
         NumDraftsSource::ModelDefault => {
             tracing::info!(
-                "num_drafts: using MODEL.toml default_num_drafts={} (K={}) — pass --num-drafts to override",
+                "num_drafts: using default {} (K={}) — pass --num-drafts to override",
                 effective,
                 effective + 1,
             );
@@ -164,9 +179,41 @@ pub(crate) fn apply_model_default_num_drafts(
     args.num_drafts = Some(effective);
 }
 
+/// Resolve the effective DFlash γ. An explicitly passed `--dflash-gamma`
+/// ALWAYS wins; an omitted flag falls back to the target's MODEL.toml
+/// `[dflash].gamma`, else `DEFAULT_DFLASH_GAMMA` (16, the block_size of
+/// every published Qwen3.6-DFlash drafter). Must run BEFORE
+/// `apply_model_default_num_drafts` — that function derives the dflash
+/// num_drafts default from `resolved_dflash_gamma()`. No-op when
+/// `--dflash` is absent: `dflash_gamma` stays `None` and
+/// `resolved_dflash_gamma()` is never reached on the non-dflash path.
+pub(crate) fn apply_model_default_dflash_gamma(
+    args: &mut cli::ServeArgs,
+    ptx_set: &atlas_kernels::TargetPtxSet,
+) {
+    if !args.dflash {
+        return;
+    }
+    let (effective, source) = match (args.dflash_gamma, ptx_set.dflash.as_ref()) {
+        (Some(v), _) => (v, NumDraftsSource::Cli),
+        (None, Some(d)) => (d.gamma, NumDraftsSource::ModelDefault),
+        (None, None) => (cli::DEFAULT_DFLASH_GAMMA, NumDraftsSource::EngineDefault),
+    };
+    let source_name = match source {
+        NumDraftsSource::Cli => "cli",
+        NumDraftsSource::ModelDefault => "model_toml",
+        NumDraftsSource::EngineDefault => "engine_default",
+    };
+    tracing::info!("DFlash γ={effective} (source: {source_name})");
+    args.dflash_gamma = Some(effective);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NumDraftsSource, resolve_num_drafts};
+    use clap::Parser;
+
+    use super::{NumDraftsSource, apply_model_default_dflash_gamma, resolve_num_drafts};
+    use crate::cli::{self, ServeArgs};
 
     /// The observed dgx2 bug: `--num-drafts 1` on a model with
     /// `default_num_drafts = 3` must serve 1 (K=2), not 3 (K=4).
@@ -198,5 +245,69 @@ mod tests {
                 NumDraftsSource::EngineDefault
             )
         );
+    }
+
+    fn ptx_set(dflash_gamma: Option<usize>) -> atlas_kernels::TargetPtxSet {
+        atlas_kernels::TargetPtxSet {
+            target: atlas_kernels::KernelTarget {
+                arch: "sm_121",
+                model: "test-model",
+                quant: "nvfp4",
+            },
+            modules: vec![],
+            sampling: atlas_kernels::SamplingPresets::default(),
+            behavior: atlas_kernels::ModelBehavior::default(),
+            model_type_matches: vec![],
+            match_names: &[],
+            dflash: dflash_gamma.map(|gamma| atlas_kernels::DflashConfig {
+                draft_model: "org/drafter",
+                gamma,
+                window_size: 4096,
+                mask_token_id: 0,
+                target_layer_ids: &[],
+            }),
+            shadowed_dropped: &[],
+            expected_absent: &[],
+        }
+    }
+
+    fn dflash_args(extra: &[&str]) -> ServeArgs {
+        let mut argv = vec!["spark", "org/m", "--dflash"];
+        argv.extend_from_slice(extra);
+        ServeArgs::parse_from(argv)
+    }
+
+    /// The flag always wins — including over a MODEL.toml that pins a
+    /// different γ (the qwen3.8-27b `gamma = 8` pairing).
+    #[test]
+    fn dflash_gamma_cli_beats_model_toml() {
+        let mut args = dflash_args(&["--dflash-gamma", "12"]);
+        apply_model_default_dflash_gamma(&mut args, &ptx_set(Some(8)));
+        assert_eq!(args.resolved_dflash_gamma(), 12);
+    }
+
+    /// The exact bug this fixes: an omitted flag must reach the MODEL.toml
+    /// `[dflash].gamma` instead of being sealed by a clap default.
+    #[test]
+    fn dflash_gamma_falls_back_to_model_toml() {
+        let mut args = dflash_args(&[]);
+        apply_model_default_dflash_gamma(&mut args, &ptx_set(Some(8)));
+        assert_eq!(args.resolved_dflash_gamma(), 8);
+    }
+
+    #[test]
+    fn dflash_gamma_without_model_toml_uses_engine_default() {
+        let mut args = dflash_args(&[]);
+        apply_model_default_dflash_gamma(&mut args, &ptx_set(None));
+        assert_eq!(args.resolved_dflash_gamma(), cli::DEFAULT_DFLASH_GAMMA);
+    }
+
+    /// Without `--dflash` the resolver is a no-op: `dflash_gamma` stays
+    /// `None` and nothing panics.
+    #[test]
+    fn dflash_gamma_untouched_without_dflash_flag() {
+        let mut args = ServeArgs::parse_from(["spark", "org/m"]);
+        apply_model_default_dflash_gamma(&mut args, &ptx_set(Some(8)));
+        assert_eq!(args.dflash_gamma, None);
     }
 }

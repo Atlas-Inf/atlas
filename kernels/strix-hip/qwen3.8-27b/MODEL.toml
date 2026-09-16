@@ -183,13 +183,19 @@ default_kv_dtype = "bf16"
 model_type = "qwen3_5"
 hidden_size = 5120
 
-# ── DFlash: intentionally ABSENT ───────────────────────────────────────────
-# qwen3.6-27b pairs with z-lab/Qwen3.6-27B-DFlash, whose fc projection
-# consumes Qwen3.6-27B hidden states from target layers [1,16,31,46,61].
-# Qwen3.8-27B has different weights, so that drafter's inputs are
-# out-of-distribution — a mismatched drafter degrades to near-zero acceptance
-# and can only slow decode. Add a [dflash] section when a 3.8-trained drafter
-# exists. Speculative decode on this target rides the native MTP head above.
+# ── DFlash2 speculative decoding ───────────────────────────────────────────
+# A 3.8-trained drafter now exists — the strix-hip kernel tree carries the
+# DFlash2 kernels (sink paged attention, batchm GEMV, dflash2 conv/candidate
+# selector), so incoai/Qwen3.8-27B-DFlash2 is wired the same as on gb10.
+# Serving defaults (Option-B paged propose, small-M GEMV arm, GPU_UTIL 0.80)
+# live in serve-amd.sh, not here — see docs/porting/QWEN38_STRIX_PORT.md
+# "2026-09-15 — DFlash2 speculative decoding on gfx1151".
+[dflash]
+draft_model = "incoai/Qwen3.8-27B-DFlash2"
+gamma = 8
+window_size = 4096
+mask_token_id = 248070
+target_layer_ids = [5, 19, 33, 47, 61]
 
 # ── expected_absent ────────────────────────────────────────────────────────
 # Harvested 2026-09-13 from the fingerprinted ST-995 serve (winbox, ROCm

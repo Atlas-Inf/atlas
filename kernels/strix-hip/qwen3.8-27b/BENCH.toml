@@ -137,4 +137,14 @@ hallucination 67.61. NOT an A/B vs the Linux record above — OS/driver, \
 ROCm and recipe all differ; the −18.9-pt hallucination-subset delta is \
 unattributed (checkpoint vs platform unresolved — the isolating run is \
 nvidia-on-Linux under this recipe). Were it floored: samples pinned 995, \
-overall min 82.92, normalized min 78.30, noise 0.4."""
+overall min 82.92, normalized min 78.30, noise 0.4. \
+DFLASH2 RESULT 2026-09-15 on the shipped checkpoint, binary sha \
+4de8cd79…, branch port/dflash2-strix-linux @ b517dd6d9: `DFLASH=1` \
+serve (Option-B paged drafter, γ=8, GPU_UTIL 0.80, ssm-slots 0, \
+otherwise the 09-11 recipe minus --speculative): overall 85.13 / \
+normalized 78.41 on the identical draw \
+(run-1789510215749772387.json) — provenance only, not floored; \
+category detail hallucination 60.80 / live 86.47 / non_live 87.97 \
+(irrelevance 75.00, live_irrelevance 46.59, simple_java 67.74, \
+simple_javascript 74.19).
+"""
