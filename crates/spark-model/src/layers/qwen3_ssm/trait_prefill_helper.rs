@@ -61,8 +61,15 @@ impl Qwen3SsmLayer {
         // PER-ROW FP8 from the checkpoint (`ATLAS_FP8_ROWWISE=1`), dequantised
         // once to BF16 — see the matching arm in `trait_prefill_proj.rs` for
         // why BF16 and not the row-wise FP8 GEMM. First because it is the only
-        // arm that never re-quantises.
-        if let Some(ref fp8w) = self.out_proj_fp8w_rowwise {
+        // arm that never re-quantises. Gated on the PREFILL opt-in env: the
+        // field is also installed by ATLAS_GDN_FP8_DECODE for DECODE-only use,
+        // where routing prefill through cuBLASLt would be wrong (and faults on
+        // the HIP compat shim).
+        let fp8_rowwise_prefill = matches!(
+            std::env::var("ATLAS_FP8_ROWWISE").ok().as_deref(),
+            Some("1")
+        );
+        if fp8_rowwise_prefill && let Some(ref fp8w) = self.out_proj_fp8w_rowwise {
             return ops::cublas_bf16_proj(
                 ctx.gpu,
                 ctx.derived,
@@ -173,6 +180,80 @@ impl Qwen3SsmLayer {
                 stream,
             )
         } else if let Some(ref fp8w) = self.out_proj_fp8w
+            && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
+            && k > 128
+            && self.w8a16_gemm_n_m128_k.0 != 0
+        {
+            // NON-transposed FP8 m128 (gfx1151): reads native B[N,K] k-contiguous
+            // + block_scale[N/128,K/128] directly — contiguous smem stores, no
+            // strided bank-conflicting writes. Preferred over out_proj_fp8w_t.
+            ops::w8a16_gemm_n_m128(
+                ctx.gpu,
+                self.w8a16_gemm_n_m128_k,
+                normed_out_buf,
+                fp8w.weight,
+                fp8w.row_scale,
+                out_proj_buf,
+                k,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )
+        } else if let Some(ref fp8t) = self.out_proj_fp8w_t {
+            // Coalesced transposed-FP8 path (native-FP8 GDN checkpoints) — same
+            // argument as the QKVZ arm: `w8a16_gemm_t` reads B_t[K,N] coalesced,
+            // replacing the strided `w8a16_gemm` below. Ordered after
+            // `w8a16_gemm_pipelined` (NVIDIA cp.async) so that path still wins
+            // where built; on gfx1151 it is absent and this arm takes over.
+            // At M>128 the 128x128-tile `w8a16_gemm_t_m128` variant halves the
+            // B re-read traffic vs the 64x64 base tile (same layout, bigger
+            // CTA footprint) — identical to the QKVZ arm's selection rule.
+            if k > 128 && self.w8a16_gemm_t_m128_k.0 != 0 {
+                ops::w8a16_gemm_n128_m128(
+                    ctx.gpu,
+                    self.w8a16_gemm_t_m128_k,
+                    normed_out_buf,
+                    fp8t.weight_t,
+                    fp8t.scale_t,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )
+            } else {
+                ops::w8a16_gemm_t(
+                    ctx.gpu,
+                    self.w8a16_gemm_t_k,
+                    normed_out_buf,
+                    fp8t.weight_t,
+                    fp8t.scale_t,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )
+            }
+        } else if let Some(ref nvfp4_t) = self.out_proj_nvfp4_t {
+            // Coalesced transposed-NVFP4 path — same provenance argument as the
+            // QKVZ arm: `out_proj_nvfp4_t` exists only for native-NVFP4
+            // checkpoints, so it is the native precision and reads half the
+            // B-side bytes of the strided FP8 GEMM below. Ordered after
+            // `w8a16_gemm_pipelined` so NVIDIA keeps its cp.async path; on
+            // gfx1151 that kernel is absent and this arm takes over.
+            ops::w4a16_gemm_n128(
+                ctx.gpu,
+                self.w4a16_gemm_t_k,
+                normed_out_buf,
+                nvfp4_t,
+                out_proj_buf,
+                k,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )
+        } else if let Some(ref fp8w) = self.out_proj_fp8w
             && self.w8a16_gemm_k.0 != 0
         {
             ops::w8a16_gemm(
@@ -213,18 +294,6 @@ impl Qwen3SsmLayer {
                     stream,
                 )
             }
-        } else if let Some(ref nvfp4_t) = self.out_proj_nvfp4_t {
-            ops::w4a16_gemm_n128(
-                ctx.gpu,
-                self.w4a16_gemm_t_k,
-                normed_out_buf,
-                nvfp4_t,
-                out_proj_buf,
-                k,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )
         } else {
             ops::w4a16_gemm(
                 ctx.gpu,

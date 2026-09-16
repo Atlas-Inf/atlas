@@ -161,6 +161,16 @@ impl TransformerModel {
         // wall-clock spans, to be compared against the GPU-busy time an nsys
         // trace reports for the same request.
         let host_timing = std::env::var("ATLAS_PREFILL_HOST_TIMING").as_deref() == Ok("1");
+        // Queue-pacing experiment (ATLAS_PREFILL_SYNC_EVERY=N, 0/absent = off).
+        // Without it the CPU enqueues every layer's kernels back-to-back and
+        // drains once; on WDDM the flood can cost more than periodically
+        // keeping the submission queue shallow. `--profile` syncs every layer
+        // and measured ~1.4s faster on the 50-token prefill — this knob lets
+        // us recover that without the per-layer profiling overhead.
+        let sync_every: usize = std::env::var("ATLAS_PREFILL_SYNC_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let t_loop = host_timing.then(std::time::Instant::now);
         let mut t_in_prefill = std::time::Duration::ZERO;
         let mut t_dflash = std::time::Duration::ZERO;
@@ -245,6 +255,9 @@ impl TransformerModel {
                     "HYPER_RMS layer {i} tokens {proc_count} rms {:.6}",
                     (ssq / n as f64).sqrt()
                 );
+            }
+            if !profile_now && sync_every > 0 && (i + 1) % sync_every == 0 {
+                self.gpu.synchronize(stream)?;
             }
             // MLA diagnostic: per-layer hidden norm for Mistral (once per model).
             // Per-model latch (see `ModelStats::dumped`) rather than a static: an

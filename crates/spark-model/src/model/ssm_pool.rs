@@ -647,24 +647,118 @@ impl SsmStatePool {
         self.conv_checkpoint_pools[ssm_layer_idx].offset(self.mtp_slot(slot) * self.conv_bytes)
     }
 
+    /// Zero `width` bytes at `slot_off` inside EVERY layer's pool block.
+    ///
+    /// The slot's data is a strided column: `width` contiguous bytes inside
+    /// each layer's block. Each layer's slice is filled with one
+    /// `memset_zero_async`, which takes the ~3×-faster 32-bit driver fill when
+    /// the range is 4-aligned — on WDDM the per-byte drain bandwidth dominates
+    /// the ~µs submission cost, so `height` D32 fills beat one pitched 8-bit
+    /// `memset_2d_async` regardless of how the layers were laid out.
+    fn zero_slot_column(
+        &self,
+        pools: &[DevicePtr],
+        slot_off: usize,
+        width: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let n = pools.len();
+        if n == 0 || width == 0 {
+            return Ok(());
+        }
+        // A slot column is `width` contiguous bytes inside each layer's block.
+        // Issue one `memset_zero_async` per layer so each slice routes through
+        // the ~3×-faster 32-bit fill; on WDDM the drain bandwidth (not the
+        // per-call submission ~µs) dominates, so `height` D32 fills beat a
+        // single pitched 8-bit `memset_2d_async`.
+        for p in pools {
+            gpu.memset_zero_async(p.offset(slot_off), width, stream)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn reset_slot(&self, slot: usize, gpu: &dyn GpuBackend) -> Result<()> {
         // MTP pools only cover slots < mtp_slots (bs>32 diet); an uncovered
         // slot has no MTP state of its own to reset (its accessors clamp to
         // the shared MTP dummy — zeroing that would be wasted work).
         let reset_mtp = self.has_mtp && slot < self.mtp_slots;
-        for i in 0..self.num_ssm_layers {
-            gpu.memset(self.h_state(i, slot), 0, self.h_stored_bytes)?;
-            gpu.memset(self.conv_state(i, slot), 0, self.conv_bytes)?;
-            if reset_mtp {
-                for t in 0..self.h_inter_count(slot) {
-                    gpu.memset(self.h_intermediate(i, slot, t), 0, self.h_stored_bytes)?;
+        let mslot = self.mtp_slot(slot);
+        let ni = self.num_intermediates;
+        // One pitched memset per state type zeroes the slot's column across
+        // all SSM layers — ~6 submissions instead of 48 × ~11 ≈ 528 — then a
+        // single sync preserves the zero-visible-on-return contract. On WDDM
+        // the ~528 per-layer submissions were a dominant TTFT term.
+        let stream = gpu.default_stream();
+        let _tp = std::time::Instant::now();
+        // Diagnostic: when set, sync after each column and report its bytes +
+        // drain time, to identify which pool's memset dominates. Off in prod.
+        let col_prof = std::env::var_os("ATLAS_RESET_COL_PROFILE").is_some();
+        macro_rules! col {
+            ($name:literal, $pools:expr, $off:expr, $width:expr) => {{
+                let _c0 = _tp.elapsed();
+                self.zero_slot_column($pools, $off, $width, gpu, stream)?;
+                if col_prof {
+                    let sub = _tp.elapsed().saturating_sub(_c0);
+                    gpu.synchronize(stream)?;
+                    let tot = _tp.elapsed().saturating_sub(_c0);
+                    let bytes = (*$pools).len() as u64 * ($width) as u64;
+                    tracing::info!(
+                        "reset_slot col {}: submit={:?} drain={:?} bytes={}MB",
+                        $name,
+                        sub,
+                        tot,
+                        bytes >> 20
+                    );
                 }
-                for t in 0..self.num_intermediates {
-                    gpu.memset(self.conv_intermediate(i, slot, t), 0, self.conv_bytes)?;
-                }
-                gpu.memset(self.h_checkpoint(i, slot), 0, self.h_stored_bytes)?;
-                gpu.memset(self.conv_checkpoint(i, slot), 0, self.conv_bytes)?;
-            }
+            }};
+        }
+        col!(
+            "h_state",
+            &self.h_state_pools,
+            slot * self.h_stored_bytes,
+            self.h_stored_bytes
+        );
+        col!(
+            "conv_state",
+            &self.conv_state_pools,
+            slot * self.conv_bytes,
+            self.conv_bytes
+        );
+        if reset_mtp {
+            col!(
+                "h_inter",
+                &self.h_intermediate_pools,
+                self.h_inter_offsets[mslot] * self.h_stored_bytes,
+                self.h_inter_counts[mslot] * self.h_stored_bytes
+            );
+            col!(
+                "conv_inter",
+                &self.conv_intermediate_pools,
+                mslot * ni * self.conv_bytes,
+                ni * self.conv_bytes
+            );
+            col!(
+                "h_ckpt",
+                &self.h_checkpoint_pools,
+                mslot * self.h_stored_bytes,
+                self.h_stored_bytes
+            );
+            col!(
+                "conv_ckpt",
+                &self.conv_checkpoint_pools,
+                mslot * self.conv_bytes,
+                self.conv_bytes
+            );
+        }
+        let t_submit = _tp.elapsed();
+        gpu.synchronize(stream)?;
+        if std::env::var_os("ATLAS_PROFILE_ALLOC_SEQ").is_some() {
+            tracing::info!(
+                "reset_slot profile: submit={:?} sync={:?}",
+                t_submit,
+                _tp.elapsed().saturating_sub(t_submit),
+            );
         }
         Ok(())
     }

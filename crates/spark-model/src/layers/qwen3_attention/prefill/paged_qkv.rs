@@ -251,6 +251,26 @@ impl Qwen3AttentionLayer {
                 h,
                 stream,
             )?;
+        } else if let Some(fp8w) = weight_opt.and_then(|w| w.as_fp8())
+            && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
+            && n > 128
+            && self.w8a16_gemm_n_m128_k.0 != 0
+        {
+            // gfx1151 NON-transposed FP8 m128: native B[N,K] k-contiguous +
+            // block_scale[N/128,K/128] — contiguous smem stores, no strided
+            // bank-conflicting writes. Preferred over the transposed m128 arm.
+            ops::w8a16_gemm_n_m128(
+                ctx.gpu,
+                self.w8a16_gemm_n_m128_k,
+                normed,
+                fp8w.weight,
+                fp8w.row_scale,
+                out,
+                n,
+                out_dim,
+                h,
+                stream,
+            )?;
         } else if let Some(fp8t) = fp8w_t
             && self.w8a16_gemm_t_m128_k.0 != 0
         {

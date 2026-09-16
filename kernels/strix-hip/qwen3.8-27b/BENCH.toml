@@ -116,4 +116,25 @@ normalized vs the prior requant record, no accuracy regression. \
 The demoted floors (see above) were cut from the SHIPPED run minus the 0.4 \
 noise band; the requant derivative is recorded here as provenance, not \
 floored — its own entry belongs beside its own checkpoint directory when \
-it is promoted."""
+it is promoted. \
+SECOND-OBSERVATION (Windows 11, native HIP): 2026-09-13 winbox (gfx1151, \
+ROCm 10.0.0 TheRock, Adrenalin 32.0.31041.1004), fp8d tree 8eedc21cb, \
+golden draw n=995 seed 42 temp 0 no overrides — overall 83.32 / \
+normalized 78.70, zero faults, 3.6 h (run-1789300938267487600, rescored \
+UTF-8 after a cp1252 scorer crash fixed in-tree at 70a3d6863); re-run on \
+the clean no-dangerous-flag binary C5C77C65: 83.12 / 78.45 \
+(run-1789375300874322000). Serve recipe (fp8d): --speculative \
+--num-drafts 3 --kv-cache-dtype bf16 --lm-head-dtype bf16 \
+--ssm-cache-slots 64 --ssm-checkpoint-interval 16 --enable-prefix-caching \
+--request-timeout 0; env ATLAS_W4A16_DP4A=1 ATLAS_W4A16_VARIANT=v1 \
+ATLAS_FORCE_GLOBAL_GDN=1 ATLAS_GDN_FP8_WEIGHTS=1 ATLAS_GDN_FP8_DECODE=1 \
+ATLAS_SSM_TAIL_PROTECT=1 ATLAS_MTP_GATE_REPROBE=64 \
+ATLAS_KV_EXTERNAL_RESERVE_GB=0 \
+(scripts/strix-windows/win_serve_qwen38_nvfp4.ps1). MTP engaged (1003 \
+records: p1 0.834, mean_na 2.28, tok_step 3.28); agentic-webserver x30 \
+durability: webserver_ok 30/30. Categories: non_live 82.02, live 86.47, \
+hallucination 67.61. NOT an A/B vs the Linux record above — OS/driver, \
+ROCm and recipe all differ; the −18.9-pt hallucination-subset delta is \
+unattributed (checkpoint vs platform unresolved — the isolating run is \
+nvidia-on-Linux under this recipe). Were it floored: samples pinned 995, \
+overall min 82.92, normalized min 78.30, noise 0.4."""

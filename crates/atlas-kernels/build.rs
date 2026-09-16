@@ -290,11 +290,14 @@ fn main() {
     //       export ATLAS_HIP_COMPAT_INCLUDE — HipTarget::compile force-includes
     //       hip/hip_runtime.h and `-I`s this dir so the unmodified `.cu` find
     //       cuda_runtime.h / cuda_bf16.h / cuda_fp8.h forwarded to hip/*.
-    //   (b) Per-source mask-widen: gfx1151 wavefronts are 64-wide, so HIP's
-    //       `__shfl_*_sync`/`__ballot_sync` masks and `__activemask()` must be
-    //       64-bit. We mirror each `.cu`/`.cuh` into OUT_DIR with the widen
-    //       transform applied (kernels/ is never mutated in place) and compile
-    //       the mirror. NVIDIA/SCALE compile the originals directly.
+    //   (b) Per-source mask-widen: HIP's `__shfl_*_sync`/`__ballot_sync` mask
+    //       parameter and `__activemask()` return are `unsigned long long` —
+    //       64-bit at the API level on every platform. (gfx1151 itself runs
+    //       wave32: hipcc gets no -mwavefrontsize64, and the kernels'
+    //       `_w32` WMMA builtins only compile in wave32 mode.) We mirror each
+    //       `.cu`/`.cuh` into OUT_DIR with the widen transform applied
+    //       (kernels/ is never mutated in place) and compile the mirror.
+    //       NVIDIA/SCALE compile the originals directly.
     let is_hip = vendor_str == Some("hip");
     let hip_mirror_dir = out_dir.join("hip_mirror");
     if is_hip {
@@ -660,11 +663,14 @@ fn content_hash(s: &str) -> String {
 // ──────────────────────────── HIP (vendor="hip") helpers ────────────────────────────
 // These run ONLY on the native ROCm/HIP path. NVIDIA/SCALE/Apple never call them.
 
-/// Mirror `src` (a `.cu`/`.cuh`) into `mirror_root` with the 64-wide-wavefront
-/// mask-widen transform applied, and return the mirrored path to compile.
+/// Mirror `src` (a `.cu`/`.cuh`) into `mirror_root` with the mask-widen
+/// transform applied, and return the mirrored path to compile.
 ///
-/// gfx1151 wavefronts are 64-wide, so HIP's `__shfl_*_sync` / `__ballot_sync`
-/// masks and the result of `__activemask()` must be 64-bit (NVIDIA's are 32).
+/// HIP's `__shfl_*_sync` / `__ballot_sync` mask parameter and the result of
+/// `__activemask()` are `unsigned long long` (NVIDIA's are 32-bit). This is an
+/// API-width fix, not a wavefront-size fix: gfx1151 kernels run wave32 (the
+/// hipcc invocation passes no `-mwavefrontsize64`, and the tree's `_w32` WMMA
+/// builtins only exist in wave32 mode).
 /// The entire source DIRECTORY is mirrored on first touch so that sibling
 /// `#include "foo.cuh"` resolves next to the mirrored `.cu` (clang resolves
 /// quoted includes relative to the including file). `kernels/` is never mutated.

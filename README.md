@@ -381,7 +381,7 @@ sparkrun run @atlas/qwen3.8-flash-next-nvfp4 --hosts localhost
 Atlas converts CUDA sources natively to AMD RDNA 3.5. Bring-up is active across two dedicated branches:
 
 - **Linux Leg (Ubuntu 24.04 / ROCm 6.2+)**: Branch [`port/qwen3.8-strix-linux`](https://github.com/Atlas-Inf/atlas/tree/port/qwen3.8-strix-linux) ([PR #8](https://github.com/Atlas-Inf/atlas/pull/8))
-- **Windows Leg (DirectX 12 / native MSVC)**: Branch [`port/qwen3.8-windows`](https://github.com/Atlas-Inf/atlas/tree/port/qwen3.8-windows) ([PR #9](https://github.com/Atlas-Inf/atlas/pull/9))
+- **Windows Leg (native HIP / MSVC, ROCm 10 TheRock)**: Branch [`port/qwen3.8-windows`](https://github.com/Atlas-Inf/atlas/tree/port/qwen3.8-windows) ([PR #9](https://github.com/Atlas-Inf/atlas/pull/9))
 
 No container on this one — Strix Halo is a unified-memory APU, and the validated path is the native binary built against ROCm (`/opt/rocm`) with hipcc. Two scripts in the repo root carry the whole thing:
 
@@ -409,6 +409,44 @@ Knobs (env-overridable, sane defaults):
 - `LM_HEAD=bf16` — switch for the unsloth preservation checkpoint (its lm_head ships per-row FP8). The default `nvfp4` is the NVIDIA checkpoint's measured decode lever.
 - `ATLAS_W4A16_DP4A=0` — opt-out of the DP4A decode arm (on by default; accuracy-validated).
 - The FP8-preservation exports (`ATLAS_FP8_DEQUANT_*`, `ATLAS_GDN_BF16_WEIGHTS`) are baked into the script — required for the unsloth checkpoint's per-row-FP8 projections, no-op elsewhere. Don't strip them.
+
+#### Windows (native HIP on gfx1151, `nvidia/Qwen3.8-27B-NVFP4`)
+
+The same checkpoint serves natively on Windows 11 — no WSL, no container: `spark.exe` is compiled by MSVC and talks to the GPU through a thin CUDA→HIP shim (`cuda.dll`/`nvcuda.dll` beside the exe) over ROCm 10 (TheRock). The working startup is two PowerShell scripts in the repo root, twins of the `.sh` pair:
+
+```powershell
+# Clone the Windows port branch (until PR #9 lands on main)
+git clone -b port/qwen3.8-windows https://github.com/Atlas-Inf/atlas.git
+cd atlas
+
+# Weights — Windows resolves by path, not the HF cache. Convention is
+# org-dash-repo under ~\models (serve-amd.ps1 takes the dir positionally).
+hf download nvidia/Qwen3.8-27B-NVFP4 `
+  --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-27B-NVFP4"
+
+# Build once — from PowerShell, NOT Git Bash (bash puts coreutils link.exe
+# ahead of MSVC's). Needs MSVC (Desktop C++ workload), the ROCm SDK
+# (HIP_PATH, e.g. C:\TheRock\10.0.0) and cargo. The script repairs the
+# kernel-symlink checkout, compiles, and stages the HIP runtime + shim DLLs.
+.\build-amd.ps1
+
+# Serve — the fingerprinted fp8d recipe: native FP8 GDN decode, K=4 MTP
+# speculative, BF16 KV + lm_head. Preflight hard-fails on a
+# non-gfx1151 GPU before any kernel launches (a wrong-arch compute launch on
+# WDDM can bugcheck the OS — this is deliberate).
+.\serve-amd.ps1
+```
+
+Running a prebuilt binary instead? Unzip `spark-windows-x86_64-amd-hip` **keeping every DLL beside `spark.exe`** — a lone exe fail-fasts at `cuInit` — then:
+
+```powershell
+$env:ATLAS_BIN = "C:\path\to\unzipped\spark.exe"
+.\serve-amd.ps1   # skips the toolchain check and the build entirely
+```
+
+`serve-amd.ps1` forwards to `scripts/strix-windows/first_run.ps1 -Phase serve`, which runs a detached smoke probe (`first_run_smoke.log` beside the exe) and owns the console until Ctrl-C. Defaults are deliberately conservative for a first boot (`ATLAS_MAX_SEQ_LEN=4096`, `ATLAS_MAX_PREFILL_TOKENS=2048`, `ATLAS_GPU_UTIL=0.95` — the nvidia checkpoint only leaves usable KV at ≥0.93 on the ~63 GB commit ceiling). The full-length record config — 64K context, `--enable-prefix-caching`, thinking on — is [`scripts/strix-windows/win_serve_qwen38_nvfp4.ps1`](scripts/strix-windows/win_serve_qwen38_nvfp4.ps1).
+
+Measured on winbox (Framework Desktop, Ryzen AI Max+ 395 / Radeon 8060S gfx1151, Windows 11, ROCm 10.0.0 TheRock Core SDK, Adrenalin 32.0.31041.1004), fingerprint `run-1789300938267487600`: **83.32 / 78.70** (overall / normalized) on the 995-row bfcl-subset golden draw, zero faults in 3.6 h; clean-rerun without the kernel-fallback flag: 83.12 / 78.45 (`run-1789375300874322000`). Decode headline 17.25 tok/s (`decode_headline.py`, MinHeap prompt, `reasoning_effort:"none"`, MTP engaged at p1 0.834 / tok_step 3.28). Provenance and per-category detail: [`kernels/strix-hip/qwen3.8-27b/BENCH.toml`](kernels/strix-hip/qwen3.8-27b/BENCH.toml); the full porting notes — symlink repair, DLL staging, the traps that cost days — are in [`docs/porting/STRIX_WINDOWS_HIP.md`](docs/porting/STRIX_WINDOWS_HIP.md).
 
 ### Hitting the Endpoint
 

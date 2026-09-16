@@ -137,12 +137,12 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // Per-projection weight bundle. Q transposed dispatch is opt-in until
-        // measured on Holo because this cache-skip path historically skipped it.
-        let use_q_t = std::env::var("ATLAS_ATTN_PREFILL_Q_T").ok().as_deref() == Some("1");
+        // Per-projection weight bundle. Q now uses the transposed FP8 copy
+        // whenever populated, matching K/V and the paged path — the strided
+        // w8a16_gemm fallback is severely underperforming on some targets.
         let (fp8w_t, weight_opt, fp8, nvfp4_t, dense, label) = match proj {
             SkipProj::Q => (
-                use_q_t.then_some(self.q_fp8w_t.as_ref()).flatten(),
+                self.q_fp8w_t.as_ref(),
                 self.q_weight.as_ref(),
                 self.q_fp8,
                 self.q_nvfp4_t.as_ref(),
@@ -209,6 +209,26 @@ impl Qwen3AttentionLayer {
                 normed,
                 fp8t.weight_t,
                 fp8t.scale_t,
+                out,
+                n,
+                out_dim,
+                h,
+                stream,
+            )?;
+        } else if let Some(fp8w) = weight_opt.and_then(|w| w.as_fp8())
+            && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
+            && n > 128
+            && self.w8a16_gemm_n_m128_k.0 != 0
+        {
+            // gfx1151 NON-transposed FP8 m128: native B[N,K] k-contiguous +
+            // block_scale[N/128,K/128] — contiguous smem stores, no strided
+            // bank-conflicting writes. Preferred over the transposed m128 arm.
+            ops::w8a16_gemm_n_m128(
+                ctx.gpu,
+                self.w8a16_gemm_n_m128_k,
+                normed,
+                fp8w.weight,
+                fp8w.row_scale,
                 out,
                 n,
                 out_dim,

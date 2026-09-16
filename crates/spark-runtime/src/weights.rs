@@ -27,7 +27,9 @@ pub(crate) fn evict_page_cache(file: &std::fs::File) {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn evict_page_cache(_file: &std::fs::File) {
     // No-op: macOS/BSD have no posix_fadvise. Apple Silicon UMA already
-    // shares page cache with the GPU pool, so eviction is unnecessary.
+    // shares page cache with the GPU pool, so eviction is unnecessary. On
+    // Windows the shard loader streams tensors via seek+read (no whole-file
+    // mmap), so there are no file-backed mapping pages to discard.
 }
 
 /// Data type of a weight tensor.

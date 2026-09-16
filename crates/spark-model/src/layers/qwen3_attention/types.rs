@@ -149,6 +149,10 @@ pub struct Qwen3AttentionLayer {
     // transpose_fp8 / transpose_block_scale already produce. KernelHandle(0) on
     // miss → fall back to w8a16_gemm_t.
     pub(super) w8a16_gemm_t_m128_k: KernelHandle,
+    // Large-M NON-transposed W8A16 prefill (gfx1151): reads native B[N,K]
+    // k-contiguous + block_scale[N/128,K/128] directly — contiguous smem stores,
+    // no strided bank-conflicting writes. Preferred over w8a16_gemm_t_m128_k.
+    pub(super) w8a16_gemm_n_m128_k: KernelHandle,
     // W8A8 + FP32 epilogue (vLLM-equivalent) — gated by ATLAS_FP8_W8A8=1.
     pub(super) per_token_group_quant_fp8_k: KernelHandle,
     pub(super) fp8_gemm_t_blockscaled_k: KernelHandle,

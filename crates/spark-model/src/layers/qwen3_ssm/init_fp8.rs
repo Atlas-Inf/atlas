@@ -42,6 +42,34 @@ impl Qwen3SsmLayer {
         self.out_proj_fp8w = out_proj;
     }
 
+    /// Transpose the block-scaled FP8 weights for the coalesced `w8a16_gemm_t`
+    /// prefill path. Must be called after [`Self::set_fp8_decode_weights`].
+    /// Mirrors `qwen3_attention::prefill_weights::transpose_fp8_for_prefill`.
+    ///
+    /// Without the transposed copies the SSM prefill projections fall through
+    /// to the strided non-pipelined `w8a16_gemm`, which reads B\[N,K\] with a
+    /// stride-K single-byte access per thread — ~15x under the memory floor on
+    /// gfx1151 where the cp.async pipelined variant is absent. The transpose
+    /// kernels live in the `w8a16_gemm_t` module, so this is a no-op where that
+    /// module is absent. Allocates new GPU buffers; keeps the non-transposed
+    /// copies alive for the decode `w8a16_gemv` path.
+    pub fn transpose_fp8_for_prefill(&mut self, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        if self.w8a16_gemm_t_k.0 == 0 {
+            return Ok(()); // transposed GEMM kernel absent on this target
+        }
+        let transpose_k = gpu.kernel("w8a16_gemm_t", "transpose_fp8")?;
+        let transpose_scale_k = gpu.kernel("w8a16_gemm_t", "transpose_block_scale")?;
+        if let Some(w) = self.qkvz_fp8w.as_ref() {
+            self.qkvz_fp8w_t =
+                Some(w.transpose_for_gemm(gpu, transpose_k, transpose_scale_k, stream)?);
+        }
+        if let Some(w) = self.out_proj_fp8w.as_ref() {
+            self.out_proj_fp8w_t =
+                Some(w.transpose_for_gemm(gpu, transpose_k, transpose_scale_k, stream)?);
+        }
+        Ok(())
+    }
+
     /// Install PER-ROW FP8 weights for the row-wise cuBLASLt PREFILL arm
     /// (`ATLAS_FP8_ROWWISE=1`, mixed-precision compressed-tensors
     /// checkpoints). Decode is untouched and keeps the NVFP4 copy.
