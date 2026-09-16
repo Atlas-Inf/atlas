@@ -1218,10 +1218,20 @@ reasons unrelated to the nvidia pack:
    mostly absent. CI cannot see it: CI checks with `cuda` against stub libs,
    where all four sites are live. The three causes are all "code that only
    means something where `NgramTable::Cached` exists".
-3. **The 500-LoC cap** (`.github/workflows/file-size-cap.yml`) is over in
+3. **The 500-LoC cap** (`.github/workflows/file-size-cap.yml`) was over in
    three files this branch grew: `spec_step.rs` 482→561, `qwen4_exp.rs`
-   500→501, `nvfp4_detect.rs` 492→601. Not yet split — no allow-list entry
-   was added, since that is the workaround the cap exists to prevent.
+   500→501, `nvfp4_detect.rs` 492→601. Split in `810845afd` to 291 / 480 /
+   467 — the n-gram lane into `spec_step/ngram.rs`, `nvfp4_detect`'s tests
+   into a sibling file, and the loader's three free helpers into
+   `qwen4_exp/helpers.rs`. **No allow-list entry was added** — that list buys
+   time for a real split, and none of these needed one.
+4. **A clippy failure in `moe_sorted_diff`** (`d014ea98`) —
+   `g.copy_h2d(&mut v[..], ..)` against a `&[u8]` parameter. Gate-only: CI
+   lints `--tests`, the local gate lints `--all-targets`.
+
+With those, `bash scripts/dev/qwen4exp_local_gate.sh` is **16/16 PASS** on
+this branch — the metal build, the LoC cap, fmt, clippy and both stale tests
+were all red before.
 
 ### Queued / in flight
 
@@ -1233,3 +1243,53 @@ reasons unrelated to the nvidia pack:
   identical prompt text at ~1.2K (under 2051) and ~6.0K (over). Short must
   propose and not decline; long must propose nothing and log a decline.
 * `118-flashnext-ple-warm2` — 111's leg with a prompt that fits.
+
+### `116` — the accounting fix, verified on hardware
+
+PASS. Same shape as 074, same serve profile, patch = PR #35's head applied to
+`45f5b355`. Outputs are **byte-identical to 074** (same three content SHAs),
+so the change is output-neutral, and the `Done:` line is no longer vacuous:
+
+| leg | req | wall | tok/s | `Done:` line | proposals | na>0 | declines |
+|---|---|---:|---:|---|---:|---:|---:|
+| serial | 0 | 25.75 s | 15.53 | `serial=1.00 mtp=0.00 … tok_step=1.000` | — | — | 0 |
+| serial | 1 | 25.04 s | 15.97 | `serial=1.00 mtp=0.00 … tok_step=1.000` | — | — | 0 |
+| ngram | 0 | 25.04 s | 15.97 | `serial=0.00 mtp=1.00 p1=0.005 mean_na=0.005 tok_step=1.005` | 25 | 2 | 0 |
+| ngram | 1 | 21.37 s | 18.72 | `serial=0.00 mtp=1.00 p1=0.295 mean_na=0.295 tok_step=1.295` | 143 | 93 | 0 |
+
+`mean_na = 0.295` is 93 accepted drafts over ~315 lane steps, which is what
+the independent `NGRAM detail` count says — the two instruments now agree.
+The serial leg is unchanged (`serial=1.00`), so nothing leaked between lanes.
+Wall for the warm request: ngram 21.37 s vs serial 25.04 s (**+14.6 %**), and
+cold is a wash (25.04 vs 25.75) — the same shape 074 showed, now measurable
+per request instead of only from debug lines.
+
+### `117` — the QSA bound, verified on hardware
+
+The hypothesis holds, and the mechanism is now visible in the log. One serve,
+two prompt lengths over the same text:
+
+| arm | prompt tokens | proposals | na>0 | declines | declined `seq_len` |
+|---|---:|---:|---:|---:|---|
+| short | 1,140 | 7 | 5 | 0 | — |
+| long | 5,802 | **0** | 0 | **28** | 5802, 5803, … |
+
+Every one of the 7 `NGRAM detail` lines in the whole serve sits at
+`seq_len` 1157–1176, i.e. all of them belong to the short arm; the long arm
+proposed nothing at all. The decline line reads
+`ngram declined: grammar=false temp=0 slots_covered=true seq_len=5802 lim=2051`.
+And the repaired usage field agrees independently:
+`accepted_prediction_tokens` = **5** on the short arm, **0** on the long arm.
+
+★ The leg's own assertion failed on the first run and the failure was in the
+leg, not the finding: both arms share one serve and therefore one log, and the
+report counted the whole file per arm, reading the short arm's 7 proposals a
+second time as the long arm's. The per-arm counts above are the corrected
+deltas; `flashnext-ngram-longctx2` re-runs it with the offset fix.
+
+### `118` — PLE prefetch
+
+Re-run of 111 with a prompt that fits (370 paragraphs, ~24K tokens against the
+32K cap) and a hard guard that fails if `usage.prompt_tokens > 30,000`. The
+spark-storage prefetch unit tests pass on the CUDA host; the cold/warm
+comparison and the byte-identity check are reported in `WARM.tsv`.
