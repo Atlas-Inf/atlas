@@ -353,7 +353,15 @@ pub fn sample_token(
         }
     }
     if temperature == 0.0 {
-        // Greedy argmax over FP32
+        // Greedy argmax over FP32.
+        //
+        // ★ LAST-WINS on exact ties: `max_by` returns the last of several equal
+        // maxima. The verify path's `argmax_*` kernels resolve ties to the
+        // lowest LANE (see review note 1 on the #23 thread), so at an exact tie
+        // a greedy sample here and a greedy verify pick can differ. Kept as-is
+        // because it matches the record tree — the point of this comment is
+        // that the engine is NOT uniformly first-wins, so a future tie
+        // investigation should not assume it is.
         let best = f32_logits
             .iter()
             .enumerate()
@@ -490,6 +498,9 @@ pub fn sample_token_with_grammar(
     // output-token history — identical stage to the non-MTP path.
     apply_penalties_and_bias(&mut f32_logits, penalties, history);
     if temperature == 0.0 {
+        // LAST-WINS on exact ties, same as the suppress-ids branch above —
+        // and same caveat: the verify kernels are lowest-lane-wins, so this is
+        // not a shared tie contract across the engine.
         let best = f32_logits
             .iter()
             .enumerate()
