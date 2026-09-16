@@ -1465,9 +1465,24 @@ of the seven non-multi-hour gates need a checkpoint that is absent:
 | video-fidelity | unsloth/Qwen3.6-27B-NVFP4 | **no** |
 
 `~/code/hf/hub/` holds only the 3.8 family and Nemotron. The `77e0f96c` records
-already in `.benchmarks/` were therefore taken on a different box. A ~50 GB
-download leg is the unblocker; `flashnext-gates-a` (job 130) runs the two that
-can run today.
+already in `.benchmarks/` were therefore taken on a different box.
+`flashnext-gates-a2` (job 131) runs the two that can run today.
+
+★ **The other five are NOT CHASED, BY DECISION (2026-09-16).** Neither
+`Qwen/Qwen3.6-35B-A3B-FP8` nor `unsloth/Qwen3.6-27B-NVFP4` is a subject of this
+work, and neither is being downloaded. So the `PR benchmark gate` **stays red**
+after this campaign — two of ten gates refreshed, eight still stale — and that
+is a known, accepted state rather than a task waiting on a ~50 GB download.
+Greening it means measuring those five on a box that has the checkpoints, or a
+maintainer changing the required subjects. It is deliberately **not** done by
+editing the gate's coverage or its record set: that would be turning a
+compliance control off to make CI agree, which is the one fix this file will
+never take.
+
+The consequence, stated plainly: **PR #35 cannot merge on this gate as it
+stands.** It was already red at `3af3aafb5` before this session, so nothing here
+made it worse — but nothing here can clear it either, and the two facts should
+not be blurred.
 
 ### Two operational facts worth keeping
 
