@@ -418,7 +418,28 @@ the mHC highway has MoE arms for `forward_k2`/`forward_k3` only, and
 this and the scheduler clamps to it — before that clamp, `--num-drafts 3`
 asked for K=4, the highway refused mid-step, and a verify error finishes the
 request, so every request died after one token. Second, speculation is
-declined entirely above the QSA indexer's inert bound of 2051 visible tokens.
+declined entirely above the QSA indexer's inert bound of 2051 visible tokens
+— and on real workloads that is the dominant story, not an edge case.
+
+**The 2051 bound is observed, not hypothetical.** The scheduler's D-2a latch
+(`scheduler/mod.rs`, `mtp_gate::qsa_latch::crosses_inert_bound`) disables
+speculation for any sequence whose next verify could ingest rows across the
+bound — the batched verify path refuses an ACTIVE QSA selection outright
+(`ensure_rows_below_inert_bound` → `VerifyUnsupportedWithActiveQsa`), and a
+mid-verify refusal would finish the request, so the latch turns it into a
+clean serial decline instead. It fires for BOTH lanes — `mtp declined:
+qsa_active` and the n-gram lane's `declined` records share the same `lim=2051`.
+Measured on the nvidia checkpoint 2026-09-16: every request in the bfcl
+(082/129) and agentic-2.5h (110) gate legs ran `mtp=0.00 serial=1.00
+mean_na=0.000` — prompts cross 2051 within the first few exchanges and never
+speculate again. Job 029's probe is the counter-example that proves the
+mechanism: on a sub-2K prompt the draft module loaded (1.78 GB construction),
+engaged, and accepted at p1=0.894 / tok_step=1.894. So "MTP works on this
+checkpoint" is true precisely below 2051 context tokens and vacuous above it
+— `--speculative` on a long-context serve is a silent no-op. The unblock is
+one shared fix (verify-path active-QSA support: per-row selection + indexer
+state across the K+1 verify rows, then rollback on reject), which would
+recover the n-gram lane at the same time.
 
 ### Vision
 27 blocks, hidden 1152, 16 heads, intermediate 4304, patch 16, spatial merge 2,
