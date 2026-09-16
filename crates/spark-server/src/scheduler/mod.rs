@@ -45,6 +45,8 @@ mod mtp_dcut;
 mod mtp_gate;
 mod mtp_step;
 pub(crate) mod mtp_timing;
+#[cfg(test)]
+mod ngram_accounting_tests;
 mod phase_continue_prefills;
 mod phase_promote_prefills;
 mod phase_start_prefills;
@@ -802,6 +804,31 @@ pub fn run(
             // overhead (measured −4% tok/s at temp 0.8 on Flash-Next).
             // pending_drafts can only have been set under this same gate,
             // so a non-greedy seq never carries drafts to drain.
+            // A requested-but-declined ngram lane is otherwise INVISIBLE: the
+            // QSA-inert-bound reason fires on every long prompt, silently, and
+            // a serve where the lane never ran is indistinguishable from one
+            // whose table never learned anything. That ambiguity is what made
+            // the 2026-09-15 nvidia pack read as "engages, accepts ~nothing"
+            // (jobqueue 082: 0 proposals in 995 BFCL requests, every one
+            // admitted past `lim`). Probe only — the dispatch chain below is
+            // unchanged, so a serve running both `--speculative` and
+            // `--ngram-speculative` still falls through to MTP.
+            if use_ngram_speculative
+                && active.len() == 1
+                && !(spec_slots_covered
+                    && active[0].grammar_state.is_none()
+                    && active[0].temperature == 0.0
+                    && verify_ctx_limit.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim))
+            {
+                tracing::debug!(
+                    "ngram declined: grammar={} temp={} slots_covered={} seq_len={} lim={}",
+                    active[0].grammar_state.is_some(),
+                    active[0].temperature,
+                    spec_slots_covered,
+                    active[0].seq.seq_len,
+                    verify_ctx_limit.unwrap_or(0),
+                );
+            }
             if use_ngram_speculative
                 && active.len() == 1
                 && spec_slots_covered
@@ -811,6 +838,23 @@ pub fn run(
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
+                    // Same accept accounting the serial and verify arms do.
+                    // WITHOUT this the lane is invisible to `a.mtp_acct`, so
+                    // the per-request Done line reports `serial=0.00 mtp=0.00
+                    // p1=0.000 mean_na=0.000 tok_step=1.000` no matter what
+                    // the lane actually accepted — the zero is the DEFAULT of
+                    // an un-fed counter, not a measurement. That vacuous line
+                    // is what made the 2026-09-15 nvidia pack read "engages,
+                    // accepts ~nothing" while the lane's own debug lines
+                    // showed na=1 on 93 of 143 proposals (jobqueue 074). It
+                    // also feeds `usage.completion_tokens_details.
+                    // accepted_prediction_tokens`.
+                    //
+                    // Deliberately NOT `mtp_accept_debug::record`: that
+                    // histogram steers `adaptive_rung`'s MTP dispatch width,
+                    // and mixing n-gram verifies into it would steer one
+                    // lane's regime from the other's statistics.
+                    let seq_len_before = active[0].seq.seq_len;
                     step_ngram(
                         &*model,
                         &mut active,
@@ -819,6 +863,8 @@ pub fn run(
                         adaptive_sampling,
                         &verify_ctx,
                     );
+                    let emitted = active[0].seq.seq_len.saturating_sub(seq_len_before);
+                    active[0].mtp_acct.record_verify_emitted(emitted);
                 }
             } else if use_self_speculative
                 && active.len() == 1
