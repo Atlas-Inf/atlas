@@ -11,9 +11,12 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::{ForwardContext, LayerState};
 use crate::layers::ops;
 
+use guard::ensure_rows_below_inert_bound;
+
 mod attn;
 mod ctx;
 mod ffn;
+mod guard;
 mod mla;
 mod mla_gemv;
 mod nemotron_serial;
@@ -51,15 +54,7 @@ impl Qwen3AttentionLayer {
         }
         // Pre-mutation guard: a row at/past the inert bound has ACTIVE QSA
         // selection; the late `sel.is_none()` check below fires after ingest.
-        if let Some(qsa) = self.qsa.as_ref() {
-            let bound = qsa.inert_bound();
-            for (i, &len) in _seq_lens.iter().take(num_seqs).enumerate() {
-                anyhow::ensure!(
-                    len < bound,
-                    "VerifyUnsupportedWithActiveQsa: row {i} visible {len} >= inert bound {bound}"
-                );
-            }
-        }
+        ensure_rows_below_inert_bound(self, _seq_lens, num_seqs)?;
         let bs = kv_cache.block_size() as u32;
         let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
         // Per-request LoRA routing slot buffer for this step (from metadata).

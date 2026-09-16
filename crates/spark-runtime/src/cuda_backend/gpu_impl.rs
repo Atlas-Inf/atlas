@@ -38,70 +38,14 @@ use cudarc::driver::LaunchConfig;
 
 use super::{
     AtlasCudaBackend, cuMemAlloc_v2, cuMemAllocManaged, cuMemFree_v2, cuMemGetInfo_v2,
-    cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2, cuStreamSynchronize,
+    cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuStreamSynchronize,
 };
 use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 
-/// D2H call counter + one-shot caller identification
-/// (`ATLAS_D2H_TRACE=<N>`: log a backtrace on the Nth call, and the running
-/// count on every 10000th).
-///
-/// Every `copy_d2h*` below pairs its async copy with a `cuStreamSynchronize`,
-/// so each call BLOCKS the host until the GPU drains. An nsys trace of a 1K
-/// Laguna prefill counted 32,343 D2H + 32,533 syncs inside the prefill span,
-/// accounting for 212.8 ms of 306 ms of GPU starvation (58% idle). This exists
-/// to name whoever is issuing them.
-static D2H_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn d2h_trace_tick() {
-    use std::sync::atomic::Ordering;
-    let n = D2H_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    let Ok(target) = std::env::var("ATLAS_D2H_TRACE") else {
-        return;
-    };
-    let target: u64 = target.parse().unwrap_or(0);
-    if target != 0 && n == target {
-        tracing::warn!(
-            "ATLAS_D2H_TRACE: call #{n} backtrace:\n{}",
-            std::backtrace::Backtrace::force_capture()
-        );
-    }
-    if n.is_multiple_of(10_000) {
-        tracing::warn!("ATLAS_D2H_TRACE: {n} D2H copies so far (each forces a stream sync)");
-    }
-}
-
-/// Enqueue an H2D copy on `stream` and return without waiting. Shared by both
-/// async H2D entry points so the two differ ONLY in the ordering they add
-/// afterwards, never in the copy itself.
-fn h2d_enqueue(src: &[u8], dst: DevicePtr, stream: u64) -> Result<()> {
-    let status =
-        unsafe { cuMemcpyHtoDAsync_v2(dst.0, src.as_ptr() as *const c_void, src.len(), stream) };
-    if status != 0 {
-        bail!("cuMemcpyHtoDAsync_v2 failed: status {status}");
-    }
-    Ok(())
-}
-
-/// Say once, loudly, that a page-locked buffer reached the transient H2D path.
-///
-/// This is the tripwire the whole `pinned_hosts` registry exists to arm. It is a
-/// warning and not a `bail!` because the copy is still CORRECT — the sync above
-/// restores the guarantee — but it is a real, silent latency regression, and the
-/// call site almost certainly wants `copy_h2d_async_retained` instead.
-fn warn_pinned_transient_source() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        tracing::warn!(
-            "copy_h2d_async was handed a PAGE-LOCKED source. That copy is genuinely \
-             asynchronous, so the promise that the caller may drop the buffer on return \
-             is now being paid for with a cuStreamSynchronize on every such call. If the \
-             source outlives the next sync, switch the call site to \
-             copy_h2d_async_retained; if it does not, this sync is what keeps it from \
-             being a use-after-free."
-        );
-    });
-}
+// The host-side copy helpers live beside this file — see its module doc for
+// why they could not stay (a trait `impl` cannot be split, so only the code
+// OUTSIDE the block can move, and the PR's merge with main needed it).
+use super::host_staging::{d2h_trace_tick, h2d_enqueue, warn_pinned_transient_source};
 
 impl GpuBackend for AtlasCudaBackend {
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
