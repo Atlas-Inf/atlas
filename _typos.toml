@@ -122,6 +122,11 @@ numer = "numer"
 # (q4k_quantize.cu), a faithful port of llama.cpp's make_qkx3_quants
 # least-squares fit (sl/sl2/sxl naming kept 1:1 with upstream). Not `xsl`.
 sxl = "sxl"
+# `dbe` — the leading hex of the commit id `dbe6f7d2`, quoted in the
+# QWEN4_EXP port log. The checker splits an identifier at its first digit, so
+# it reads the `dbe` half as a typo of "be". Commit ids are cited all over
+# these docs; this one's prefix happens to collide. Not a word.
+dbe = "dbe"
 
 [default.extend-identifiers]
 # `PNGs` — the plural of PNG, in the vision-fixture provisioning commentary.
