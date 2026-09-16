@@ -34,7 +34,7 @@ impl Qwen3AttentionLayer {
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         row_owner: Option<&[usize]>,
         kv_cache: &mut PagedKvCache,
-        _seq_lens: &[usize],
+        seq_lens: &[usize],
         _block_tables: &[Vec<u32>],
         ctx: &ForwardContext,
         stream: u64,
@@ -45,7 +45,7 @@ impl Qwen3AttentionLayer {
             num_seqs,
             states,
             kv_cache,
-            _seq_lens,
+            seq_lens,
             _block_tables,
             ctx,
             stream,
@@ -54,7 +54,7 @@ impl Qwen3AttentionLayer {
         }
         // Pre-mutation guard: a row at/past the inert bound has ACTIVE QSA
         // selection; the late `sel.is_none()` check below fires after ingest.
-        ensure_rows_below_inert_bound(self, _seq_lens, num_seqs)?;
+        ensure_rows_below_inert_bound(self, seq_lens, num_seqs)?;
         let bs = kv_cache.block_size() as u32;
         let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
         // Per-request LoRA routing slot buffer for this step (from metadata).
@@ -65,7 +65,7 @@ impl Qwen3AttentionLayer {
         // DeepSeek-V4 / Qwen4-exp: Manifold-Constrained Hyper-Connections.
         if self.hc.is_some() {
             return self
-                .decode_multi_seq_inner_hc(c, states, row_owner, _seq_lens, kv_cache, ctx, stream);
+                .decode_multi_seq_inner_hc(c, states, row_owner, seq_lens, kv_cache, ctx, stream);
         }
         let _ = (states, row_owner); // Non-hc attention keeps no per-seq state.
 
