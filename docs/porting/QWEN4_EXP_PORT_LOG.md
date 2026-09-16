@@ -1408,3 +1408,78 @@ as *not* byte-invariant to the slow path at near-ties, so asking for logprobs
 would change emitted tokens at those ties; and the alternative direction
 (make serial report raw too) changes the numbers every existing client sees.
 Neither is a decision to take in a session that cannot hardware-verify it.
+
+### `123`/`128` — the two re-runs, and one verdict that was the leg's own artifact
+
+**`123` PASS** — the QSA-bound test with per-arm log deltas (117 had counted a
+shared serve log twice):
+
+| arm | prompt | proposals | na>0 | declines | `accepted_prediction_tokens` |
+|---|---:|---:|---:|---:|---|
+| short | 1,140 | 7 | 5 | 0 | **5** |
+| long | 5,802 | **0** | 0 | **28** | **0** |
+
+The repaired usage field agrees with the log-derived counts in both arms, which
+is a second, independent confirmation of the accounting fix.
+
+**`124`'s verdict was invalid, and `128` is the corrected one.** 124 ran the
+pre-existing `multi_file_rows_are_byte_identical` with `--exact multi_file_rows`,
+which matches nothing — the test's full name carries its module path — so the
+comparison arm ran **zero** tests, its `rc=0` was vacuous, and the leg printed
+"this IS a defect in the prefetch work". That conclusion was an artifact of my
+filter, not a finding. `128` names the test in full and runs both arms:
+
+| arm | result | `cuMemAllocHost_v2 … failed: 3` |
+|---|---|---|
+| pre-existing `multi_file_rows_are_byte_identical` | FAILED (rc=101) | **yes** |
+| the three new `prefetch` tests | FAILED (rc=101) | **yes** |
+
+**Verdict: pre-existing harness gap, not a branch defect.** The documented
+invocation (`cargo test -p spark-storage --features cuda <name> -- --ignored`)
+cannot work for ANY pinned-arena test in that crate, because no test process
+creates a CUDA context and `NgramRowCache::open` needs one. The three new tests
+inherit it. Worth fixing (one `CudaContext::new` in a test fixture would do it),
+but it is not this branch's regression and the tests should be read as
+**unverified on hardware** until then.
+
+### The PR benchmark gate: red before this session, and a campaign not a patch
+
+`gh api …/commits/3af3aafb5/check-runs` shows `PR benchmark gate: failure` at
+the PREVIOUS head too, so this is pre-existing. Running the check locally says
+exactly what it wants — all ten required gates read `NONE`, with the latest
+records (for `9da215a1e5`) invalidated by this branch's `crates/` and
+`kernels/` diffs: 55 files named, and "device code changed for 26 target(s)".
+
+Fixing it means measuring on a GB10 and committing the records. ★ **Checkpoint
+availability, not gate cost, is what bounds the campaign on this box** — five
+of the seven non-multi-hour gates need a checkpoint that is absent:
+
+| gate | subject | on `gx10-e3a3`? |
+|---|---|---|
+| decode-floor | nvidia/Qwen3.8-27B-NVFP4 | yes |
+| concurrency-sweep | nvidia/Qwen3.8-27B-NVFP4 | yes |
+| ttft-warm-gate | Qwen/Qwen3.6-35B-A3B-FP8 | **no** |
+| ttft-cold-gate | Qwen/Qwen3.6-35B-A3B-FP8 | **no** |
+| ssm-state-poisoning-gate | Qwen/Qwen3.6-35B-A3B-FP8 | **no** |
+| vision-fidelity | Qwen/Qwen3.6-35B-A3B-FP8 | **no** |
+| video-fidelity | unsloth/Qwen3.6-27B-NVFP4 | **no** |
+
+`~/code/hf/hub/` holds only the 3.8 family and Nemotron. The `77e0f96c` records
+already in `.benchmarks/` were therefore taken on a different box. A ~50 GB
+download leg is the unblocker; `flashnext-gates-a` (job 130) runs the two that
+can run today.
+
+### Two operational facts worth keeping
+
+* **The box has no credentials for `atlasinf`.** `git fetch atlasinf
+  feat/flashnext-nvidia` from `gx10-e3a3` fails with "Please make sure you have
+  the correct access rights" (job 127 died on exactly that, after a force-push
+  also orphaned the sha it had pinned). The working route is a **git bundle**:
+  `git bundle create inc.bundle 45f5b355..feat/flashnext-nvidia`, scp it, then
+  `git fetch <bundle> refs/heads/…:refs/remotes/bundle/…` — which lands the
+  EXACT commit objects, so a gate record can name a real `git_sha` instead of
+  carrying `dirty_paths`.
+* **A force-push orphans any sha a queued leg pinned.** `--force-with-lease`
+  rewrote the last four commits into their intended units; job 125 had
+  `SHA=f49be47a2` hard-coded and refused after the rewrite. Legs that pin a sha
+  need re-submitting after any history rewrite.
