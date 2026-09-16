@@ -478,7 +478,8 @@ avg TPS 7.0. The third long-context probe (~16 k tokens) 400s against
 ### Overnight legs (2026-09-15, γ=8, `~/dp4a-ab/out/dflash-overnight-20260915T1706Z`)
 
 Chain `~/dp4a-ab/dflash_overnight.sh`, serve profile DFLASH=1 + Option B +
-small-M GEMV defaults, binary `4de8cd79…`:
+small-M GEMV defaults, binary `4de8cd79…` (run scripts committed at
+`scripts/strix/dflash2/`):
 
 - **ST-995 (bfcl-subset golden draw, n=995)** — observed under
   `st995-fingerprint.txt` (commit `b517dd6d9`, binary sha `4de8cd79…`,
