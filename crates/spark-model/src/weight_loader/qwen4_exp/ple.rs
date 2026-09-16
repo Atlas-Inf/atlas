@@ -39,14 +39,17 @@ use crate::weight_map::dense;
 /// Resident rows in the pinned arena. A forward's gather pins at most one
 /// scratch span of rows at once — `scratch_tokens * ngram_heads` — because
 /// the chunked pipeline resolves and releases a span at a time, so the
-/// default is DERIVED from the span width: `scratch * ngram_heads`, rounded
-/// up to a power of two, floored at 65536. The old `max_batch_tokens`
-/// derivation predates the span loop and would over-provision the arena
-/// 4x at a 32K --max-prefill-tokens (524,288 slots where a span never
-/// pins past 131,072).
+/// default is DERIVED from the span width: `(scratch + warm_ahead) *
+/// ngram_heads`, rounded up to a power of two, floored at 65536. The
+/// `warm_ahead` term is the prefill prefetch window (`warm.rs`): without
+/// slack beside the span's pins, the worker's rows would have to evict
+/// each other — or the span's — before the gather reads them. The old
+/// `max_batch_tokens` derivation predates the span loop and would
+/// over-provision the arena 4x at a 32K --max-prefill-tokens.
 #[cfg(feature = "cuda")]
 fn derived_slots(scratch_tokens: usize, ngram_heads: usize) -> usize {
     (scratch_tokens
+        .saturating_add(crate::layers::ple::warm_ahead_tokens(scratch_tokens))
         .saturating_mul(ngram_heads)
         .next_power_of_two())
     .max(65536)
@@ -74,7 +77,7 @@ fn slots_from_env(scratch_tokens: usize, ngram_heads: usize) -> (usize, &'static
         Some(n) if n > 0 => (n, "ATLAS_PLE_CACHE_SLOTS"),
         _ => (
             derived_slots(scratch_tokens, ngram_heads),
-            "scratch_tokens*heads rounded up",
+            "(span + warm_ahead)*heads rounded up",
         ),
     }
 }
@@ -337,11 +340,13 @@ mod slots_tests {
 
     /// The fixed 65536 this replaced assumed a 2048-token chunk; the default
     /// serve config presents 8193, and a prefill pins tokens x heads rows.
+    /// Default warm lookahead is 2 spans (`ATLAS_PLE_WARM_AHEAD`), so the
+    /// derived count covers span + lookahead.
     #[test]
     fn derived_slots_cover_the_default_chunk() {
-        assert_eq!(derived_slots(8193, 16), 262_144); // 131,088 rounded up
-        assert_eq!(derived_slots(2048, 16), 65_536); // the old assumption is the floor
-        assert_eq!(derived_slots(4096, 16), 65_536); // exactly the floor
+        assert_eq!(derived_slots(8193, 16), 524_288); // (8193 + 16386) x 16, rounded up
+        assert_eq!(derived_slots(2048, 16), 131_072); // (2048 + 4096) x 16, exact
+        assert_eq!(derived_slots(4096, 16), 262_144); // (4096 + 8192) x 16, exact
         assert!(derived_slots(20481, 16) >= 20481 * 16);
     }
 }

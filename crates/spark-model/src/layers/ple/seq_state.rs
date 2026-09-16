@@ -44,4 +44,9 @@ pub struct PleSeqState {
     /// in `slots_dev` and history has already advanced, so re-hashing would
     /// double-count the token — re-arming is the only correct recovery.
     pub(super) last_staged_va: u64,
+    /// In-flight prefill row prefetch (see `warm.rs`): the prompt's PLE row
+    /// ids are a pure function of the tokens, so a worker streams them into
+    /// the row cache ahead of the layer-1 gather. `None` for resident
+    /// tables, decode-only sequences, and `ATLAS_PLE_WARM=0`.
+    pub(super) warm: Option<super::warm::PleWarm>,
 }

@@ -102,6 +102,12 @@ impl TransformerModel {
         // buffers (norm_output, qkv_output, etc.) are overwritten by each sub-call,
         // safe because same CUDA stream guarantees sequential execution.
 
+        // PLE: warm the prefill stream's row cache — the ids are a pure
+        // function of `prefill_tokens`, so the worker streams rows while the
+        // fused layer loop computes. `prefill_chunk_start` is the first
+        // position this forward runs.
+        self.ple_prefill_warm(prefill_tokens, prefill_chunk_start, prefill_seq)?;
+
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;

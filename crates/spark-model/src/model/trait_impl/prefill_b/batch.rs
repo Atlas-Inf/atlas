@@ -346,6 +346,11 @@ impl TransformerModel {
                     }
                 };
 
+                // PLE: warm the row cache ahead of the layer-1 gather — the
+                // ids are a pure function of `tokens`, so the worker streams
+                // rows while this chunk's layers compute.
+                self.ple_prefill_warm(tokens, proc_start, seq)?;
+
                 // Phase 3+3b: positions / MRoPE / paged metadata.
                 let MetaLayout {
                     meta_base,

@@ -51,8 +51,9 @@ pub struct PleLayer {
     conv1d: DenseWeight,
     /// Behind a mutex because the NVMe cache RESOLVES (and faults, and
     /// evicts) on the forward path, which needs `&mut`, while layers are
-    /// invoked through `&self`.
-    table: std::sync::Mutex<NgramTable>,
+    /// invoked through `&self`. `Arc` so a per-sequence prefill warm worker
+    /// (`warm.rs`) can prefetch rows while earlier chunks/layers compute.
+    table: std::sync::Arc<std::sync::Mutex<NgramTable>>,
 
     embed_k: KernelHandle,
     /// The dequant gather, used when `scale_va` is `Some`.
@@ -153,7 +154,7 @@ impl PleLayer {
                 _ => None,
             },
             embed_fp8_k: gpu.kernel("embed_from_argmax", "batched_embed_fp8")?,
-            table: std::sync::Mutex::new(table),
+            table: std::sync::Arc::new(std::sync::Mutex::new(table)),
             embed_k: gpu.kernel("embed_from_argmax", "batched_embed")?,
             gemm_k: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
             gate_k: gpu.kernel("ple", "ple_gate")?,
@@ -186,6 +187,7 @@ impl PleLayer {
             prestaged_va: None,
             prestaged_n: 0,
             last_staged_va: 0,
+            warm: None,
         })
     }
 
@@ -194,48 +196,9 @@ impl PleLayer {
     // Marconi aux-state (snapshot_aux / restore_aux) moved to
     // `aux_state.rs` (≤500 LoC split).
 
-    /// Inject into `highway` `[T, hc_mult*hidden]` FP32, in place.
-    ///
-    /// `fresh` starts a new sequence (prefill from position 0).
-    /// One highway ROW with an explicit id — the multi-seq decode entry
-    /// (`ctx.host_token_ids` holds the whole batch; the caller slices).
-    pub fn forward_row(
-        &self,
-        st: &mut PleSeqState,
-        highway_row: DevicePtr,
-        ids: &[u32],
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        self.forward_with_ids(st, highway_row, 1, false, Some(ids), ctx, stream)
-    }
-
-    /// Multi-token forward against an EXPLICIT id slice — the batched verify
-    /// path, where the rows of one sequence are a sub-slice of the batch's
-    /// host ids rather than its prefix. `fresh` is false: a verify step never
-    /// starts a sequence.
-    pub fn forward_rows(
-        &self,
-        st: &mut PleSeqState,
-        highway: DevicePtr,
-        ids: &[u32],
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        self.forward_with_ids(st, highway, ids.len(), false, Some(ids), ctx, stream)
-    }
-
-    pub fn forward(
-        &self,
-        st: &mut PleSeqState,
-        highway: DevicePtr,
-        num_tokens: usize,
-        fresh: bool,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        self.forward_with_ids(st, highway, num_tokens, fresh, None, ctx, stream)
-    }
+    // The public forward entry points (`forward`, `forward_row`,
+    // `forward_rows`) live in `forward.rs` (≤500 LoC split); they all funnel
+    // into `forward_with_ids` below.
 
     #[allow(clippy::too_many_arguments)]
     fn forward_with_ids(
@@ -368,6 +331,12 @@ impl PleLayer {
                     gpu,
                     stream,
                 )?;
+                // Pace the prefill warm worker: these positions are now
+                // consumed, so its lookahead window slides forward. No-op
+                // without a session (decode, verify, resident table).
+                if let Some(w) = st.warm.as_ref() {
+                    w.note(n);
+                }
             }
 
             // Projections off the concatenated n-gram embedding.
@@ -503,6 +472,15 @@ mod verify;
 
 #[path = "aux_state.rs"]
 mod aux_state;
+
+#[path = "forward.rs"]
+mod forward;
+
+// `pub(crate)`: `qwen3_ssm::trait_layer` calls `PleLayer::prefill_warm`
+// through here, and `ple.rs` re-exports `warm_ahead_tokens` for the loader's
+// cache sizing.
+#[path = "warm.rs"]
+pub(crate) mod warm;
 
 #[path = "gather_guard.rs"]
 mod gather_guard;

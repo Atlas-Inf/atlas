@@ -269,6 +269,12 @@ impl TransformerModel {
                 .prefill_full_cache_hit(tokens, seq, hidden, h as u32, bs, total_len, stream);
         }
 
+        // PLE: warm the row cache ahead of the layer-1 gather — the ids are
+        // a pure function of `tokens`, and this monolithic forward spans the
+        // whole remainder, so the worker streams while the GDN/pass-A layers
+        // compute. Per-span pacing inside the layer keeps it bounded.
+        self.ple_prefill_warm(tokens, proc_start, seq)?;
+
         // Re-embed only the uncached portion at hidden[0..proc_count].
         if proc_start > 0 {
             let uncached_tokens = &tokens[proc_start..];

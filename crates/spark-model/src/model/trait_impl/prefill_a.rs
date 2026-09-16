@@ -253,6 +253,11 @@ impl TransformerModel {
             (tokens, n, 0usize)
         };
 
+        // PLE: the n-gram row ids are a pure function of `tokens` — start the
+        // NVMe warm now so the fault I/O overlaps embed + the early layers
+        // instead of serializing on the layer-1 gather. No-op without PLE.
+        self.ple_prefill_warm(tokens, seq_len_start, seq)?;
+
         // ── 2. Embed tokens → [proc_count, H] contiguous ──
         {
             // SAFETY: `proc_count` is not an independent count. Each of the

@@ -102,6 +102,24 @@ pub trait TransformerLayer: Send + Sync {
     /// recompute (PLE's history already advanced in `decode_prestage`).
     fn decode_prestage_rearm(&self, _state: &mut dyn LayerState) {}
 
+    /// Prefill-side warm for layers whose row ids are a pure host function
+    /// of the prompt (PLE). Called once per prefill dispatch — before the
+    /// layer loop — with the FULL prompt and `from`, the first position this
+    /// call will process, so the layer can stream its NVMe-resident rows
+    /// into cache while the earlier chunks and layers compute instead of
+    /// faulting them on the gather's critical path. Chunked callers invoke
+    /// it per chunk; the layer paces and deduplicates internally. Default
+    /// no-op: layers with no host-faulted table have nothing to warm.
+    fn prefill_warm(
+        &self,
+        _prompt: &[u32],
+        _from: usize,
+        _state: &mut dyn LayerState,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// True when this layer's decode can NEVER be captured into a CUDA
     /// graph — e.g. the QSA indexer's host top-k round trip, whose captured
     /// dense fallback would silently replay WRONG attention once selection

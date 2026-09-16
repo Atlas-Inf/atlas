@@ -59,4 +59,5 @@ mod layer;
 
 pub use ids::{PleIdDims, ple_ngram_ids};
 pub(crate) use layer::bounded_scratch;
+pub(crate) use layer::warm::warm_ahead_tokens;
 pub use layer::{PleLayer, PleSeqState, PleWeights};

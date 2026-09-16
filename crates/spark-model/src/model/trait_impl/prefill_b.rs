@@ -251,6 +251,11 @@ impl TransformerModel {
             }
         };
 
+        // PLE: warm the row cache ahead of the layer-1 gather — the ids are
+        // a pure function of `tokens`, so the worker streams rows for every
+        // position this request still has to run while this chunk computes.
+        self.ple_prefill_warm(tokens, proc_start, seq)?;
+
         // ── Phase 3: upload positions + MRoPE + slot metadata ──
         let upload_meta::MetaLayout {
             meta_base,

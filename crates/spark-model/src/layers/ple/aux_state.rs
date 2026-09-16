@@ -228,6 +228,9 @@ impl PleLayer {
     /// `TransformerLayer::free_state`). ~360 KB per sequence, unreclaimed for
     /// the process's life before this existed. Idempotent.
     pub(crate) fn free_seq_state(st: &mut PleSeqState, gpu: &dyn GpuBackend) -> Result<()> {
+        // Drop aborts the warm worker (done flag + unpark + join, bounded by
+        // one prefetch quantum's fault time).
+        st.warm = None;
         if st.conv.0 != 0 {
             gpu.free(st.conv)?;
             st.conv = spark_runtime::gpu::DevicePtr(0);

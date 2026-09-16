@@ -48,6 +48,23 @@ impl TransformerLayer for Qwen3SsmLayer {
         Ok(())
     }
 
+    /// PLE's prefill-side NVMe warm — the row ids are known once the prompt
+    /// exists, so the cache starts filling while the earlier chunks compute.
+    /// No-op on the 47 layers without a PLE site.
+    fn prefill_warm(
+        &self,
+        prompt: &[u32],
+        from: usize,
+        state: &mut dyn LayerState,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        if let Some(ple) = self.ple.as_ref() {
+            let st = ple_seq_state(ple, state, gpu)?;
+            ple.prefill_warm(st, prompt, from)?;
+        }
+        Ok(())
+    }
+
     fn has_aux_state(&self) -> bool {
         self.ple.is_some()
     }
