@@ -138,8 +138,23 @@ pub(crate) fn apply_model_default_num_drafts(
     args: &mut cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
 ) {
-    let (effective, source) =
-        resolve_num_drafts(args.num_drafts, ptx_set.behavior.default_num_drafts);
+    let dflash_default = if args.dflash {
+        Some(args.dflash_gamma.saturating_sub(1))
+    } else {
+        None
+    };
+    let (effective, source) = if let Some(cli_val) = args.num_drafts {
+        (cli_val, NumDraftsSource::Cli)
+    } else if let Some(df_val) = dflash_default {
+        (df_val, NumDraftsSource::ModelDefault)
+    } else if ptx_set.behavior.default_num_drafts > 0 {
+        (
+            ptx_set.behavior.default_num_drafts as usize,
+            NumDraftsSource::ModelDefault,
+        )
+    } else {
+        (cli::DEFAULT_NUM_DRAFTS, NumDraftsSource::EngineDefault)
+    };
     match source {
         NumDraftsSource::Cli => {
             let model_default = ptx_set.behavior.default_num_drafts as usize;
@@ -154,7 +169,7 @@ pub(crate) fn apply_model_default_num_drafts(
         }
         NumDraftsSource::ModelDefault => {
             tracing::info!(
-                "num_drafts: using MODEL.toml default_num_drafts={} (K={}) — pass --num-drafts to override",
+                "num_drafts: using default {} (K={}) — pass --num-drafts to override",
                 effective,
                 effective + 1,
             );
