@@ -476,26 +476,5 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
     }
 }
 
-/// A ones-filled `[n]` BF16 norm scale.
-///
-/// BF16 1.0 is `0x3F80`, so the buffer cannot be produced with `memset`.
-fn ones_norm(n: usize, gpu: &dyn GpuBackend) -> Result<DenseWeight> {
-    let host: Vec<u8> = std::iter::repeat_n([0x80u8, 0x3Fu8], n).flatten().collect();
-    let ptr = gpu.alloc(host.len())?;
-    gpu.copy_h2d(&host, ptr)?;
-    Ok(DenseWeight { weight: ptr })
-}
-
-/// `model.language_model` for the multimodal layout, `model` otherwise.
-fn embed_prefix(config: &ModelConfig) -> String {
-    if config.weight_prefix.is_empty() {
-        "model".to_string()
-    } else {
-        config.weight_prefix.clone()
-    }
-}
-
-/// The model-level hyper-connection mixer that collapses the residual streams.
-fn mixer_prefix(config: &ModelConfig) -> String {
-    format!("{}.hyper_connection_mixer", embed_prefix(config))
-}
+mod helpers;
+use helpers::{embed_prefix, mixer_prefix, ones_norm};
