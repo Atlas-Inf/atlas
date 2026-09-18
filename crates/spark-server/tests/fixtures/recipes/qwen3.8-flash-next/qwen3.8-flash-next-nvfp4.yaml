@@ -261,4 +261,4 @@ defaults:
   # The chat template gates its whole scaffold on enable_thinking, and a bare
   # render collapses chat to a 2-token EOS. `low` keeps the budget cheap while
   # still rendering the full preamble.
-  default_chat_template_kwargs: '{"reasoning_effort":"low"}'
+  default_chat_template_kwargs: "'{\"reasoning_effort\":\"low\"}'"

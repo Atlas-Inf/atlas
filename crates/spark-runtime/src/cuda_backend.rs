@@ -51,6 +51,21 @@ unsafe extern "C" {
     pub(super) fn cuCtxGetDevice(device: *mut i32) -> i32;
     pub(super) fn cuDeviceGetAttribute(pi: *mut i32, attrib: u32, dev: i32) -> i32;
     pub(super) fn cuMemsetD8Async(dst: u64, value: u8, n: usize, stream: u64) -> i32;
+    /// Pitched memset: `height` rows of `width` bytes, each row `pitch` bytes
+    /// apart from `dst`. A driver-API export (like `cuMemsetD8Async`), so it
+    /// resolves on both the real driver and the strix HIP shim.
+    pub(super) fn cuMemsetD2D8Async(
+        dst: u64,
+        pitch: usize,
+        value: u8,
+        width: usize,
+        height: usize,
+        stream: u64,
+    ) -> i32;
+    /// 32-bit-element memset: fills `n` consecutive u32 at `dst`. A driver-API
+    /// export resolved by the strix HIP shim (`hipMemsetD32Async`) — on WDDM it
+    /// can be far faster than the 8-bit `cuMemsetD8Async` fill path.
+    pub(super) fn cuMemsetD32Async(dst: u64, value: u32, n: usize, stream: u64) -> i32;
     // CUDA graph capture/replay
     pub(super) fn cuStreamBeginCapture(hStream: u64, mode: u32) -> i32;
     // Capture-status query (telemetry taps must not sync/copy inside an

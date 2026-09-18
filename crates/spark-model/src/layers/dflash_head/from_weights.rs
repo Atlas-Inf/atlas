@@ -24,6 +24,7 @@ impl BlockDiffusionDraftHead {
         lm_head_shared: DevicePtr,
         lm_head_nvfp4: Option<crate::weight_map::QuantizedWeight>,
         target_hidden_size: usize,
+        target_vocab_size: usize,
         gamma: Option<usize>,
         window_size: Option<usize>,
         gpu: &dyn GpuBackend,
@@ -90,7 +91,7 @@ impl BlockDiffusionDraftHead {
         let num_q_heads = weights.config.num_attention_heads;
         let num_kv_heads = weights.config.num_key_value_heads;
         let head_dim = weights.config.head_dim;
-        let vocab_size = weights.config.vocab_size;
+        let vocab_size = target_vocab_size.min(weights.config.vocab_size);
         let gamma_val = gamma.unwrap_or(weights.config.block_size);
 
         // Allocate the drafter's paged FP8 KV cache. One multi-layer cache,
@@ -130,6 +131,7 @@ impl BlockDiffusionDraftHead {
         // against existing Atlas resolutions in `qwen3_attention/mod.rs` and
         // `mtp_head.rs` plus the `extern "C" __global__` declarations under
         // `kernels/gb10/common/`.
+        let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
         let kernels = DflashKernels {
             // DFlash drafter uses HF's vanilla RMSNorm convention
             // (`out = x * w / RMS(x)`), NOT Atlas's default offset-from-1
@@ -149,6 +151,12 @@ impl BlockDiffusionDraftHead {
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemm: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm"),
             dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+            dflash2_conv: gpu
+                .kernel("dflash2_conv", "dflash2_grouped_dynamic_causal_conv")
+                .ok(),
+            dflash2_candidate_selector: gpu
+                .kernel("dflash2_candidate_selector", "dflash2_candidate_selector")
+                .ok(),
             // Qwen3.6-DFlash uses yarn RoPE — confirmed in the drafter
             // `config.json:rope_scaling.rope_type="yarn"`. Atlas's yarn
             // kernel is `rope::rope_forward_yarn`.
@@ -170,17 +178,20 @@ impl BlockDiffusionDraftHead {
             // module as the target's BF16 prefill (`prefill_paged`); the
             // Rust dispatcher `ops::prefill_attention_paged_dflash` passes
             // `causal_mask_enabled=0` for bidirectional γ-block attention.
-            prefill_attn_dflash_bf16: gpu
-                .kernel("prefill_paged_sink", "inferspark_prefill_paged_sink")?,
+            // The sink kernels bake the tile geometry at compile time via
+            // HDIM (default 256); at head_dim=128 the HDIM=256 build reads
+            // dims 128..255 of each KV row — the neighbouring head's data —
+            // into every score, which is what suppressed Option-B
+            // acceptance. `paged_sink_modules_for_head_dim` maps the
+            // drafter's head_dim onto the matching `_h128` build.
+            // `prefill_attn_dflash_fp8` above stays HDIM-256-only: the FP8
+            // drafter-KV path is still wrong for 128-dim drafters.
+            prefill_attn_dflash_bf16: gpu.kernel(paged_sink.sink.0, paged_sink.sink.1)?,
             // Phase 5 (CUDA graph): indirect-args BF16 paged dispatcher + sinks.
-            prefill_attn_dflash_bf16_indirect: gpu.kernel(
-                "prefill_paged_indirect_sink",
-                "inferspark_prefill_paged_indirect_sink",
-            )?,
-            prefill_attn_dflash_bf16_batched_sink: gpu.kernel(
-                "inferspark_prefill_paged_batched_sink",
-                "inferspark_prefill_paged_batched_sink",
-            )?,
+            prefill_attn_dflash_bf16_indirect: gpu
+                .kernel(paged_sink.indirect.0, paged_sink.indirect.1)?,
+            prefill_attn_dflash_bf16_batched_sink: gpu
+                .kernel(paged_sink.batched.0, paged_sink.batched.1)?,
             silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
@@ -339,6 +350,9 @@ impl BlockDiffusionDraftHead {
                     gpu.alloc_host_pinned(4)?,
                 ),
                 position_ids: gpu.alloc(n_attn * 4)?,
+                dflash2_conv_delta: gpu.alloc(n_attn * 4 * (hidden_size / 16).max(1) * bf16)?,
+                dflash2_conv_out: gpu.alloc(n_attn * hidden_size * bf16)?,
+                dflash2_projected_hidden: gpu.alloc(g * 256 * bf16)?,
             };
             // C1 diagnostic: zero ALL device buffers so any uninitialized
             // read sees deterministic zeros instead of per-lane garbage.
@@ -675,39 +689,85 @@ impl BlockDiffusionDraftHead {
                 DevicePtr::NULL
             },
             draft_id_to_target_id: None,
-            layers: weights
-                .layers
-                .into_iter()
-                .map(|l| DflashLayer {
-                    input_layernorm: l.input_layernorm,
-                    post_attention_layernorm: l.post_attention_layernorm,
-                    q_proj: l.q_proj,
-                    k_proj: l.k_proj,
-                    v_proj: l.v_proj,
-                    o_proj: l.o_proj,
-                    q_norm: l.q_norm,
-                    k_norm: l.k_norm,
-                    gate_proj: l.gate_proj,
-                    up_proj: l.up_proj,
-                    down_proj: l.down_proj,
-                    attention_sink_bias: l.attention_sink_bias,
-                    // Phase G — populated below if ATLAS_DFLASH_DRAFTER_FP8=1.
-                    q_proj_fp8: None,
-                    k_proj_fp8: None,
-                    v_proj_fp8: None,
-                    o_proj_fp8: None,
-                    gate_proj_fp8: None,
-                    up_proj_fp8: None,
-                    down_proj_fp8: None,
-                    q_proj_nvfp4: None,
-                    k_proj_nvfp4: None,
-                    v_proj_nvfp4: None,
-                    o_proj_nvfp4: None,
-                    gate_proj_nvfp4: None,
-                    up_proj_nvfp4: None,
-                    down_proj_nvfp4: None,
-                })
-                .collect(),
+            layers: {
+                let dflash2_group_size = weights
+                    .config
+                    .dflash_config
+                    .as_ref()
+                    .and_then(|sc| sc.conv_group_size)
+                    .unwrap_or(16);
+                let dflash2_kernel_size = weights
+                    .config
+                    .dflash_config
+                    .as_ref()
+                    .and_then(|sc| sc.conv_kernel_size)
+                    .unwrap_or(2);
+                weights
+                    .layers
+                    .into_iter()
+                    .map(|l| DflashLayer {
+                        input_layernorm: l.input_layernorm,
+                        post_attention_layernorm: l.post_attention_layernorm,
+                        q_proj: l.q_proj,
+                        k_proj: l.k_proj,
+                        v_proj: l.v_proj,
+                        o_proj: l.o_proj,
+                        q_norm: l.q_norm,
+                        k_norm: l.k_norm,
+                        gate_proj: l.gate_proj,
+                        up_proj: l.up_proj,
+                        down_proj: l.down_proj,
+                        attention_sink_bias: l.attention_sink_bias,
+                        attention_conv: l.attention_conv.map(|c| {
+                            super::Dflash2Conv::new(
+                                c.base_kernel,
+                                c.kernel_projection,
+                                hidden_size,
+                                dflash2_group_size,
+                                dflash2_kernel_size,
+                            )
+                        }),
+                        mlp_conv: l.mlp_conv.map(|c| {
+                            super::Dflash2Conv::new(
+                                c.base_kernel,
+                                c.kernel_projection,
+                                hidden_size,
+                                dflash2_group_size,
+                                dflash2_kernel_size,
+                            )
+                        }),
+                        // Phase G — populated below if ATLAS_DFLASH_DRAFTER_FP8=1.
+                        q_proj_fp8: None,
+                        k_proj_fp8: None,
+                        v_proj_fp8: None,
+                        o_proj_fp8: None,
+                        gate_proj_fp8: None,
+                        up_proj_fp8: None,
+                        down_proj_fp8: None,
+                        q_proj_nvfp4: None,
+                        k_proj_nvfp4: None,
+                        v_proj_nvfp4: None,
+                        o_proj_nvfp4: None,
+                        gate_proj_nvfp4: None,
+                        up_proj_nvfp4: None,
+                        down_proj_nvfp4: None,
+                    })
+                    .collect()
+            },
+            candidate_selector: if let Some(cs) = weights.candidate_selector {
+                Some(super::Dflash2CandidateSelector::new(
+                    cs.hidden_projection,
+                    cs.predecessor_codebook,
+                    cs.successor_codebook,
+                    cs.rank,
+                    cs.top_k,
+                    vocab_size,
+                    hidden_size,
+                    gpu,
+                )?)
+            } else {
+                None
+            },
             // Phase 2 stage 2: fused KV weight built above by copy_d2d
             // from each layer's k_proj/v_proj. precompute_ctx_kv will
             // GEMM against it in stage 3 once we wire the call site.

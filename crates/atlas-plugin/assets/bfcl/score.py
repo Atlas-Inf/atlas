@@ -104,7 +104,9 @@ def _score_ast(tool_calls, ground_truth, func_description, subset):
 
 
 def _read_jsonl(path):
-    with open(path) as f:
+    # UTF-8 explicitly: on Windows the locale default (cp1252) fails on
+    # responses.jsonl, which the harness writes as UTF-8.
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:

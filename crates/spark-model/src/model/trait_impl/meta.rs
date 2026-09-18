@@ -234,19 +234,16 @@ impl TransformerModel {
         // `compact_sequence` paths neutralize the guard so release is
         // exactly-once. `slot_idx` is derived from the guard (SSOT for the
         // owned index lives in the guard until an explicit path takes it).
+        let t_alloc = std::time::Instant::now();
         let slot_guard = self.ssm_pool.claim_guarded()?;
         let slot = slot_guard
             .idx()
             .expect("claim_guarded returns a guard owning a slot");
-        // Zero SSM state to prevent stale h_state/conv_state from prior
-        // sequences corrupting the recurrent computation during prefill.
-        // CRITICAL: use Atlas's own stream (not stream 0) because Atlas's stream
-        // is CU_STREAM_NON_BLOCKING and does NOT synchronize with stream 0.
-        // Using stream 0 would race with the subsequent prefill kernel.
-        let stream = self.gpu.default_stream();
-        self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
-        // Ensure zero completes before any prefill kernels touch this slot.
-        self.gpu.synchronize(stream)?;
+        let t_claim = t_alloc.elapsed();
+        // NOTE: `reset_slot` below zeroes h_state + conv_state + intermediates +
+        // checkpoints — a strict superset of `zero_slot` (h+conv only). The
+        // intervening layer_states construction only assigns pool pointers and
+        // never writes the state, so the earlier `zero_slot` was redundant work.
         let has_mtp = self.proposer.is_some() || self.self_speculative;
 
         // ATLAS_MTP_DRAFTER_PREFILL: a fresh sequence invalidates the
@@ -323,12 +320,15 @@ impl TransformerModel {
             }
         }
 
+        let t_layers = t_alloc.elapsed();
+
         // Zero SSM states for the new sequence.
         // Synchronous reset: memset + stream sync ensures zero is visible
         // before any subsequent kernel reads the state.
         self.ssm_pool.reset_slot(slot, self.gpu.as_ref())?;
         // Double-check: explicit sync to guarantee zero is complete
         self.gpu.synchronize(self.gpu.default_stream())?;
+        let t_reset = t_alloc.elapsed();
 
         let dspark_generation = super::super::dspark_generation::next_dspark_generation(
             &self.dspark_sequence_generation,
@@ -352,6 +352,7 @@ impl TransformerModel {
                 dstate.ctx_slot_bytes,
             )?);
         }
+        let t_proposer = t_alloc.elapsed();
 
         // No graph invalidation needed — pool addresses are stable across sequences.
 
@@ -362,6 +363,18 @@ impl TransformerModel {
         // so the layer-0 offload helper doesn't need to grow a Vec on
         // every sequence's first decode step.
         let num_attn_layers = self.config.num_attention_layers();
+        let t_total = t_alloc.elapsed();
+        if std::env::var_os("ATLAS_PROFILE_ALLOC_SEQ").is_some() {
+            tracing::info!(
+                "alloc_seq profile: claim={:?} layers={:?} reset={:?} proposer={:?} seqstate={:?} total={:?}",
+                t_claim,
+                t_layers.saturating_sub(t_claim),
+                t_reset.saturating_sub(t_layers),
+                t_proposer.saturating_sub(t_reset),
+                t_total.saturating_sub(t_proposer),
+                t_total,
+            );
+        }
         Ok(SequenceState {
             adapter_id: 0,
             adapter_slot: -1,          // default: defer to installed active adapter

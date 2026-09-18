@@ -24,6 +24,7 @@ pub(crate) struct ParsedBehavior {
     pub default_kv_dtype: String,
     pub default_num_drafts: u32,
     pub disable_tool_steering: bool,
+    pub template_owns_tool_definitions: bool,
     pub disable_cwd_hint_injection: bool,
     pub use_sampling_presets_for_core: bool,
     pub use_sampling_preset_penalties_for_core: bool,
@@ -97,6 +98,7 @@ impl Default for ParsedBehavior {
             default_kv_dtype: String::new(),
             default_num_drafts: 0,
             disable_tool_steering: false,
+            template_owns_tool_definitions: false,
             disable_cwd_hint_injection: false,
             use_sampling_presets_for_core: false,
             use_sampling_preset_penalties_for_core: true,
@@ -173,6 +175,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .unwrap_or(0);
     let disable_tool_steering = b
         .and_then(|v| v.get("disable_tool_steering"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let template_owns_tool_definitions = b
+        .and_then(|v| v.get("template_owns_tool_definitions"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let disable_cwd_hint_injection = b
@@ -302,6 +308,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         default_kv_dtype,
         default_num_drafts,
         disable_tool_steering,
+        template_owns_tool_definitions,
         disable_cwd_hint_injection,
         use_sampling_presets_for_core,
         use_sampling_preset_penalties_for_core,

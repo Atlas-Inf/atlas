@@ -14,27 +14,34 @@
 
 use std::path::PathBuf;
 
-fn source() -> String {
+fn sources() -> Vec<String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    std::fs::read_to_string(root.join("kernels/gb10/common/argmax_bf16.cu")).unwrap()
+    [
+        "kernels/gb10/common/argmax_bf16.cu",
+        "kernels/strix-hip/common/argmax_bf16.cu",
+    ]
+    .iter()
+    .map(|p| std::fs::read_to_string(root.join(p)).unwrap())
+    .collect()
 }
 
 #[test]
 fn cuda_argmax_keeps_the_first_strict_maximum() {
-    let src = source();
-    assert!(
-        !src.contains("argmax_other_better"),
-        "the last-index-wins comparator must not come back silently"
-    );
-    assert!(
-        !src.contains("other_idx > mine_idx"),
-        "equal maxima must never select the higher vocabulary index"
-    );
-    // Every scan advances only on a strictly greater value: first max wins.
-    assert!(
-        src.matches("if (v > local_max)").count() >= 3,
-        "each strided scan must keep the first strict maximum"
-    );
+    for src in sources() {
+        assert!(
+            !src.contains("argmax_other_better"),
+            "the last-index-wins comparator must not come back silently"
+        );
+        assert!(
+            !src.contains("other_idx > mine_idx"),
+            "equal maxima must never select the higher vocabulary index"
+        );
+        // Every scan advances only on a strictly greater value: first max wins.
+        assert!(
+            src.matches("if (v > local_max)").count() >= 3,
+            "each strided scan must keep the first strict maximum"
+        );
+    }
 }
 
 #[test]
@@ -67,17 +74,18 @@ fn first_index_wins_reference_rule() {
 /// claim was asserted rather than earned.
 #[test]
 fn cuda_argmax_merge_is_index_exact_on_equal_maxima() {
-    let src = source();
-    let merges = src.matches("s_idx[tid + s] < s_idx[tid]").count();
-    assert!(
-        merges >= 4,
-        "every argmax merge must prefer the lower INDEX on equal maxima; found \
-         {merges} tie clauses, expected one per merge site (argmax_bf16, \
-         argmax_bf16_batch, argmax_bf16_batch_lp, argmax_fp32). A plain `>` \
-         merge resolves ties to the lowest LANE, which is a HIGHER index when \
-         the lower index is in the higher lane — and that divergence is \
-         serial-vs-verify, not cosmetic."
-    );
+    for src in sources() {
+        let merges = src.matches("s_idx[tid + s] < s_idx[tid]").count();
+        assert!(
+            merges >= 4,
+            "every argmax merge must prefer the lower INDEX on equal maxima; found \
+             {merges} tie clauses, expected one per merge site (argmax_bf16, \
+             argmax_bf16_batch, argmax_bf16_batch_lp, argmax_fp32). A plain `>` \
+             merge resolves ties to the lowest LANE, which is a HIGHER index when \
+             the lower index is in the higher lane — and that divergence is \
+             serial-vs-verify, not cosmetic."
+        );
+    }
     // NEGATIVE half: the detector must fire on the pre-2026-09-16 shape, or
     // this test would pass on a file whose merge had been reverted.
     let legacy = "if (s_val[tid + s] > s_val[tid]) { s_val[tid] = s_val[tid + s]; }";

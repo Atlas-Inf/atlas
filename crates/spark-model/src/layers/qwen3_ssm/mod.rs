@@ -62,6 +62,12 @@ pub struct Qwen3SsmLayer {
     // FP8 E4M3 checkpoint weights for native FP8 serving (w8a16_gemv LUT kernel)
     qkvz_fp8w: Option<Fp8Weight>,
     out_proj_fp8w: Option<Fp8Weight>,
+    // Transposed [K,N] copies of the block-scaled FP8 weights for the coalesced
+    // `w8a16_gemm_t` prefill path — populated by `transpose_fp8_for_prefill`
+    // for native-FP8 GDN checkpoints. The non-transposed `*_fp8w` copies stay
+    // for the decode `w8a16_gemv` path (which needs [N,K]).
+    qkvz_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
+    out_proj_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
     /// PER-ROW FP8 (`Fp8PerRow`) for PREFILL ONLY, from mixed-precision
     /// compressed-tensors checkpoints (`ATLAS_FP8_ROWWISE=1`).
     ///
@@ -70,8 +76,10 @@ pub struct Qwen3SsmLayer {
     /// `w8a16_gemv` in `ssm_forward.rs` and `trait_decode_batched.rs`, which
     /// index the scale as a `[N/128, K/128]` block grid. A per-row buffer is
     /// SMALLER than that index space, so it would not fault — it would return
-    /// plausible garbage. Only the row-wise cuBLASLt prefill arm reads these;
-    /// decode keeps the NVFP4 copy.
+    /// plausible garbage. Read by the row-wise cuBLASLt prefill arm, and —
+    /// when `ATLAS_GDN_FP8_DECODE=1` — by the per-row `dense_gemv_fp8w`
+    /// decode family (the format tag distinguishes them from the
+    /// block-scaled `w8a16_*` arms).
     qkvz_fp8w_rowwise: Option<Fp8Weight>,
     out_proj_fp8w_rowwise: Option<Fp8Weight>,
     /// Tier-1c keep-packed ternary Q2_0 fused in_proj_qkvz (`ATLAS_GGUF_NATIVE_Q2`).
@@ -106,6 +114,15 @@ pub struct Qwen3SsmLayer {
     /// K=2 verify: batched (M=2) BF16 GDN in_proj_qkvz — one weight pass for
     /// both verify tokens instead of two M=1 `dense_gemv` reads.
     dense_gemv_batch2_k: KernelHandle,
+    /// M<=8 batched BF16 GEMV (dense_gemv_bf16_batchm): one weight pass for
+    /// all verify rows. `KernelHandle(0)` on kernel sets that lack it →
+    /// callers keep the per-token `dense_gemv` / tile-GEMM fallback.
+    dense_gemv_batchm_k: KernelHandle,
+    /// Per-row-FP8 GEMV siblings for `qkvz_fp8_dense`/`out_proj_fp8_dense`:
+    /// M=1 `dense_gemv_fp8w` and the M<=8 batched `dense_gemv_fp8w_batchm`.
+    /// `KernelHandle(0)` on kernel sets that lack them → BF16 decode path.
+    dense_gemv_fp8w_k: KernelHandle,
+    dense_gemv_fp8w_batchm_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     w4a16_gemv_sw_k: KernelHandle,
@@ -229,6 +246,8 @@ pub struct Qwen3SsmLayer {
     // amortizes the weight read at C=4..16 like FP8.
     w4a16_batchm: W4a16BatchmTiers,
     w4a16_gemv_batch16_k: KernelHandle,
+    dp4a_quant_batch4_k: KernelHandle, // W4A8 DP4A M=4 QKVZ/out_proj — ssm_dp4a.rs
+    dp4a_gemv_batch4_k: KernelHandle,
     // Kernels — WY-chunkwise path (2-pass verification)
     gdn_wy2_k: KernelHandle,
     /// Register-resident wy2 twin (K=2 verify, the C=32 hot shape): Pass 2
@@ -348,6 +367,17 @@ pub struct Qwen3SsmLayer {
     // weight-streaming GEMV, avoids the M-padded MMA at C=8/16.
     w8a16_gemv_batch16_k: KernelHandle,
     w8a16_gemm_t_k: KernelHandle,
+    // Large-M transposed W8A16 prefill: 128x128-tile WMMA variant of
+    // `w8a16_gemm_t`. KernelHandle(0) when the kernel isn't linked (e.g. a
+    // backend that only ships the 64x64 base tile) — callers fall back to
+    // `w8a16_gemm_t_k`.
+    w8a16_gemm_t_m128_k: KernelHandle,
+    // Large-M NON-transposed W8A16 prefill: same 128x128 tile but reads the
+    // native `B[N,K]` (k-contiguous) FP8 weight directly — the k-contiguous
+    // load turns the smem_B store into contiguous uint4 writes (no strided
+    // bank-conflicting scalar stores). Preferred over `w8a16_gemm_t_m128_k`
+    // when linked, since it skips the in-kernel transpose entirely.
+    w8a16_gemm_n_m128_k: KernelHandle,
     // W8A8 + FP32 epilogue (vLLM-equivalent) prefill kernels.
     // `per_token_group_quant_fp8` produces FP8 activations + per-token-per-128
     // FP32 scale; `fp8_gemm_t_blockscaled` consumes both with FP8 MMA and
@@ -361,6 +391,7 @@ pub struct Qwen3SsmLayer {
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
+mod fla_dispatch;
 pub mod gdn_flags;
 mod init;
 mod init_fp8;

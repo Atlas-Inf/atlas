@@ -349,8 +349,10 @@ mod tests {
     ///      NOT block-uniform. A `__syncthreads()` after that return is a
     ///      divergent barrier — undefined behaviour, not a compile error. So
     ///      the staging must publish with `__syncwarp()`, and these kernels
-    ///      must contain no `__syncthreads()` at all (the documented
-    ///      "no smem, no __syncthreads in the reduction" property).
+    ///      must contain no `__syncthreads()` after the early return (the
+    ///      documented "no smem, no __syncthreads in the reduction" property).
+    ///      A barrier BEFORE the return is not divergent — every thread
+    ///      reaches it; the AMD `s_lut2` block staging relies on exactly that.
     ///   2. One private 16-float row per warp, so the row count must track
     ///      `N_PER_BLOCK_SW`. A hardcoded 8 would index out of bounds the day
     ///      that define moves. 8 rows = 512 B/block, ~50x under the smem that
@@ -393,8 +395,17 @@ mod tests {
                         "{}::{k}: must stage its own warp row",
                         path.display()
                     );
+                    // The UB the invariant guards is a barrier reached by a
+                    // non-uniform set of threads — i.e. one AFTER the
+                    // warp-uniform `if (n >= N) return`. A barrier before the
+                    // return (AMD `s_lut2` block staging) is reached by all
+                    // threads and is safe.
+                    let after_return = kb
+                        .split_once("if (n >= N) return")
+                        .map(|(_, tail)| tail)
+                        .unwrap_or(kb);
                     assert!(
-                        !kb.contains("__syncthreads()"),
+                        !after_return.contains("__syncthreads()"),
                         "{}::{k}: block barrier after a warp-uniform early return is \
                          divergent UB — and it would undo the barrier-free reduction",
                         path.display()

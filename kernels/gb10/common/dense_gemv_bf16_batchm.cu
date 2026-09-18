@@ -67,6 +67,38 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
     const unsigned int K_VEC = K / VEC_SIZE;
     const uint4* B_vec = (const uint4*)(B + (unsigned long long)n * K);
 
+#if defined(__HIP_PLATFORM_AMD__)
+    // v_dot2_f32_bf16 path: both operands are already packed bf16x2 in the
+    // loaded words — no unpacking at all. Each fdot2 does the two products
+    // and the accumulate in one instruction; at M>=4 the scalar unpack+FMA
+    // chain was issue-bound, not bandwidth-bound. Products are bit-exact
+    // bf16*bf16->f32 (identical to the float path's); only the intra-8
+    // summation grouping differs (2-term dots vs serial adds).
+    // Inline asm, NOT __builtin_amdgcn_fdot2: the builtin resolves its bf16x2
+    // operands to llvm.amdgcn.fdot2(<2 x half>) — v_dot2_f32_F16 — silently
+    // miscompiling bf16 pairs as fp16.
+    // NOTE: an earlier variant software-pipelined the A-row loads into
+    // a_cur/a_next[MAX_M] register arrays — the static MAX_M=8 arrays spilled
+    // to local memory and REGRESSED qkvz 1.24ms -> 3.07ms. Do not prefetch
+    // into per-row arrays here; the loads stay per-iteration.
+    for (unsigned int kv = lane; kv < K_VEC; kv += threads_per_out) {
+        uint4 b_data = B_vec[kv];
+        const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
+
+        for (unsigned int t = 0; t < m; t++) {
+            const uint4* At_vec = (const uint4*)(A + (unsigned long long)t * K);
+            uint4 a_data = At_vec[kv];
+            const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+            float a = acc[t];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                asm volatile("v_dot2_f32_bf16 %0, %1, %2, %0"
+                             : "+v"(a) : "v"(a_raw[i]), "v"(b_raw[i]));
+            }
+            acc[t] = a;
+        }
+    }
+#else
     for (unsigned int kv = lane; kv < K_VEC; kv += threads_per_out) {
         // ONE weight load feeds every row — this is the whole point.
         uint4 b_data = B_vec[kv];
@@ -99,6 +131,7 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
             acc[t] = a;
         }
     }
+#endif
 
     // Scalar tail for K not divisible by VEC_SIZE (never hits for model dims).
     {

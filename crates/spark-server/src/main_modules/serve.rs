@@ -225,8 +225,12 @@ pub(super) fn parse_default_chat_template_kwargs(
         preserve_thinking: Option<bool>,
     }
 
-    if s.trim().is_empty() {
+    let mut s = s.trim();
+    if s.is_empty() {
         return Ok(DefaultChatTemplateKwargs::default());
+    }
+    if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
+        s = &s[1..s.len() - 1];
     }
     let kw: Kwargs = serde_json::from_str(s)
         .map_err(|e| anyhow::anyhow!("--default-chat-template-kwargs is not valid JSON: {e}"))?;

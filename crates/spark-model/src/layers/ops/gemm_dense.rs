@@ -229,6 +229,7 @@ pub fn w4a16_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    log_gemm_shape(gpu, "w4a16_gemm", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -267,6 +268,7 @@ pub fn w4a16_gemm_n128_ldb(
     ldb: u32,
     stream: u64,
 ) -> Result<()> {
+    log_gemm_shape(gpu, "w4a16_gemm_n128", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -351,6 +353,7 @@ pub fn w4a16_gemm_n128_m128_v2(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    log_gemm_shape(gpu, "w4a16_gemm_n128_m128_v2", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([256, 1, 1])
@@ -393,6 +396,7 @@ pub fn w4a16_gemm_n128_m128(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    log_gemm_shape(gpu, "w4a16_gemm_n128_m128", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([128, 1, 1])

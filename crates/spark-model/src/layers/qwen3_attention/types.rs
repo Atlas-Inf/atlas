@@ -149,6 +149,10 @@ pub struct Qwen3AttentionLayer {
     // transpose_fp8 / transpose_block_scale already produce. KernelHandle(0) on
     // miss → fall back to w8a16_gemm_t.
     pub(super) w8a16_gemm_t_m128_k: KernelHandle,
+    // Large-M NON-transposed W8A16 prefill (gfx1151): reads native B[N,K]
+    // k-contiguous + block_scale[N/128,K/128] directly — contiguous smem stores,
+    // no strided bank-conflicting writes. Preferred over w8a16_gemm_t_m128_k.
+    pub(super) w8a16_gemm_n_m128_k: KernelHandle,
     // W8A8 + FP32 epilogue (vLLM-equivalent) — gated by ATLAS_FP8_W8A8=1.
     pub(super) per_token_group_quant_fp8_k: KernelHandle,
     pub(super) fp8_gemm_t_blockscaled_k: KernelHandle,
@@ -191,6 +195,8 @@ pub struct Qwen3AttentionLayer {
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     pub(super) w4a16_gemv_sw_k: KernelHandle,
     pub(super) w8a16_gemv_k: KernelHandle,
+    pub(super) w8a16_gemv_batch4_k: KernelHandle,
+    pub(super) w8a16_gemv_batch16_k: KernelHandle,
     pub(super) w8a16_gemm_k: KernelHandle,
     pub(super) w8a16_gemm_pipelined_k: KernelHandle,
     pub(super) w4a16_gemv_dual_k: KernelHandle,
@@ -290,6 +296,19 @@ pub struct Qwen3AttentionLayer {
     /// K=5..8 chain verify q/k/v/o projections. SSOT for the M -> tier
     /// decision; individual tiers are 0-handles when the target lacks them.
     pub(super) w4a16_batchm: W4a16BatchmTiers,
+    /// W4A8 DP4A M=4 verify arm (ATLAS_W4A16_DP4A): hoisted int8 activation
+    /// quant + guard-free batch4 GEMV for the NVFP4 q/k/v/o at m==4.
+    /// 0-handles on targets lacking the kernels → float ladder unchanged.
+    pub(super) dp4a_quant_batch4_k: KernelHandle,
+    pub(super) dp4a_gemv_batch4_k: KernelHandle,
+    /// Strided-output GEMV variants (`*_os`): row t lands at
+    /// `C[t*C_stride + col]`. The K=4..8 QKV verify uses them to write each
+    /// projection straight into its interleaved `qkv_buf` slice, removing
+    /// the 3·M D2D scatter copies per layer. 0-handles → scratch+scatter
+    /// fallback unchanged.
+    pub(super) dp4a_gemv_batch4_os_k: KernelHandle,
+    pub(super) w4a16_gemv_batch4_os_k: KernelHandle,
+    pub(super) w4a16_gemv_batch8_os_k: KernelHandle,
     // Kernels — prefill (GEMM M=N + Flash Attention)
     pub(super) w4a16_gemm_k: KernelHandle,
     pub(super) w4a16_gemm_t_k: KernelHandle,

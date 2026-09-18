@@ -101,6 +101,12 @@ int cuMemcpyDtoDAsync_v2(unsigned long long a, unsigned long long b, unsigned lo
 int cuMemsetD8Async(unsigned long long a, unsigned char b, unsigned long c, void *d) {
     (void)a; (void)b; (void)c; (void)d; return 100;
 }
+/* Pitched variant used by spark-runtime's graph-capture KV-clear path. */
+int cuMemsetD2D8Async(unsigned long long dst, unsigned long pitch, unsigned char value,
+                      unsigned long width, unsigned long height, void *stream) {
+    (void)dst; (void)pitch; (void)value; (void)width; (void)height; (void)stream;
+    return 100;
+}
 int cuMemsetD32Async(unsigned long long a, unsigned int b, unsigned long c, void *d) {
     (void)a; (void)b; (void)c; (void)d; return 100;
 }

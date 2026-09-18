@@ -364,6 +364,10 @@ pub(crate) fn load_model(
         config.vision = None;
     }
 
+    // Resolve dflash γ first — the dflash num_drafts default derives from it.
+    // Explicit --dflash-gamma → MODEL.toml [dflash].gamma → engine default.
+    // After this call `args.resolved_dflash_gamma()` is valid on dflash runs.
+    serve_phases::apply_model_default_dflash_gamma(&mut args, &ptx_set);
     // Resolve num_drafts: explicit --num-drafts (any value) → MODEL.toml
     // [behavior].default_num_drafts → engine default. After this call
     // `args.num_drafts` is Some and `args.resolved_num_drafts()` is valid.
@@ -390,7 +394,14 @@ pub(crate) fn load_model(
     // so the dedicated watchdog isn't needed.
     #[cfg(feature = "cuda")]
     let _oom_watchdog = spark_runtime::cuda_backend::spawn_oom_watchdog(
-        2048, // 2 GB threshold
+        // ATLAS_OOM_WATCHDOG_MB overrides the 2 GB floor — on UMA boxes
+        // (Strix Halo) that run the GPU near-full by design, the default trips
+        // during peak construction even when the load fits, and exit(1) reads
+        // as a GPU fault. 0 disables.
+        std::env::var("ATLAS_OOM_WATCHDOG_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2048),
         std::time::Duration::from_secs(2),
     );
     #[cfg(feature = "cuda")]
@@ -508,6 +519,11 @@ pub(crate) fn load_model(
     // Served context length (prompt + generation), same carry rule: the QSA
     // indexer sizes its per-sequence capacity from it instead of a constant.
     config.max_seq_len = args.max_seq_len;
+    if args.dflash {
+        unsafe {
+            std::env::set_var("ATLAS_MTP_POOL_FULL_WIDTH", "1");
+        }
+    }
     if args.dflash && args.enable_prefix_caching {
         tracing::warn!(
             "dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
@@ -614,7 +630,7 @@ pub(crate) fn load_model(
             .map(|(s, c)| spark_model::factory::DflashBuildArgs {
                 drafter_store: s,
                 drafter_config: c.clone(),
-                gamma: Some(args.dflash_gamma),
+                gamma: Some(args.resolved_dflash_gamma()),
                 window_size: if args.dflash_window_size > 0 {
                     Some(args.dflash_window_size)
                 } else {
@@ -828,7 +844,7 @@ pub(crate) fn load_model(
     // proposer for γ tokens (DraftProposer::propose semantics: "up to
     // num_drafts" → drafts.len() = γ → routes to step_verify_dflash).
     let num_drafts = if args.dflash {
-        serve_phases::checked_dflash_num_drafts(args.dflash_gamma)?
+        serve_phases::checked_dflash_num_drafts(args.resolved_dflash_gamma())?
     } else {
         args.resolved_num_drafts()
     };
@@ -836,7 +852,7 @@ pub(crate) fn load_model(
     if args.dflash {
         tracing::info!(
             "DFlash speculative decoding: ENABLED (γ={}, window={}, drafter installed)",
-            args.dflash_gamma,
+            args.resolved_dflash_gamma(),
             if args.dflash_window_size == 0 {
                 "full".to_string()
             } else {
@@ -1179,6 +1195,7 @@ pub(crate) fn load_model(
         },
         chat: crate::api::chat::levers::ChatLevers::resolve(
             ptx_set.behavior.tscg,
+            ptx_set.behavior.template_owns_tool_definitions,
             ptx_set.behavior.disable_cwd_hint_injection,
         ),
         vision_config: config.vision.clone(),

@@ -69,17 +69,13 @@ impl MtpHead {
         let v_proj = q(&weights.v_proj, nkv * hd, h)?;
         let o_proj = q(&weights.o_proj, h, nq * hd)?;
 
-        // Dense FFN MTP heads (Qwen3.6-27B-FP8) bypass the MoE setup entirely.
-        // We quantize the dense gate/up/down triple and stash it; the MoE
-        // fields stay None and the forward path takes the dense shortcut.
+        // Dense FFN MTP heads (Qwen3.6-27B-FP8, Qwen3.8-27B) bypass the MoE
+        // setup entirely. We quantize the dense gate/up/down triple and stash
+        // it; the MoE fields stay None and the forward path takes the dense
+        // shortcut. NVFP4 is supported here: `gemv()`/`dense_ffn_forward_generic`
+        // dispatch `ProjectionWeight::Nvfp4` through `w4a16_decode_gemv`, and
+        // `propose_batch_scope_ok` confines the BF16-only batched path.
         let dense_ffn_generic = if let Some(dense_ffn) = weights.dense_ffn.as_ref() {
-            if matches!(quant, MtpQuantization::Nvfp4) {
-                anyhow::bail!(
-                    "MTP NVFP4 mode is not supported for dense FFN MTP heads yet \
-                     (Qwen3.6-27B-FP8 ships an FP8 MTP head — use \
-                     `--mtp-quantization fp8` or `bf16`)"
-                );
-            }
             Some((
                 q(&dense_ffn.gate_proj, inter, h)?,
                 q(&dense_ffn.up_proj, inter, h)?,
@@ -277,7 +273,21 @@ impl MtpHead {
             moe_silu_mul_k,
             moe_weighted_sum_blend_k,
         ) = match quant {
-            MtpQuantization::Nvfp4 => (None, None, None, None, None, None),
+            MtpQuantization::Nvfp4 => (
+                // Dense-checkpoint NVFP4 heads still run the BF16-kernel
+                // helpers: `dense_ffn_forward_generic` silu_muls its gate/up
+                // pair via `moe_silu_mul` (moe_forward.rs:60) and the batched
+                // path does the same (forward_batch.rs:469) plus gated-Q
+                // `deinterleave_qg` (forward_batch.rs:277) and the
+                // `dense_gemv` row fallback. The MoE-only handles stay None —
+                // NVFP4 MoE uses the fused MoeLayer, never these.
+                Some(gpu.kernel("gemv", "dense_gemv_bf16")?),
+                None,
+                Some(gpu.kernel("ssm_preprocess", "deinterleave_qg")?),
+                None,
+                Some(gpu.kernel("moe_silu_mul", "moe_silu_mul")?),
+                None,
+            ),
             MtpQuantization::Fp8 => (
                 // BF16 GEMV needed for gate (always BF16) + generic MoE dispatch
                 Some(gpu.kernel("gemv", "dense_gemv_bf16")?),

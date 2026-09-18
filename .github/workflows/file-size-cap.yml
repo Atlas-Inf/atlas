@@ -57,6 +57,23 @@ jobs:
             # test module mid-campaign would invalidate the night's gate
             # records (any crates/ diff does); split next cycle.
             "crates/spark-server/src/scheduler/mtp_gate/tests.rs"
+            # 2026-09-14 main→port/qwen3.8-strix-linux merge union (#8):
+            # all three crossed 500 only in the merged tree — each side stayed
+            # under on its own (weights.rs 453+53, nvfp4_detect.rs 492+28,
+            # qwen3_ssm/tests.rs 485+108). Same shape as the 2026-08-15 stack
+            # merge below: split post-merge, not inside the conflict commit.
+            "crates/spark-runtime/src/weights.rs"
+            "crates/spark-model/src/weight_map/nvfp4_detect.rs"
+            "crates/spark-model/src/layers/qwen3_ssm/tests.rs"
+            # 2026-09-15 main→port/qwen3.8-windows rebase union (#9): all four
+            # crossed 500 only in the rebased tree — each side stayed under on
+            # its own (gpu.rs 470+57, qwen3_ssm/init.rs 484+23, ssm_forward.rs
+            # 477+42, trait_prefill_proj.rs 439+119). Same shape as the #8
+            # entries above: split post-merge, not inside the rebase.
+            "crates/spark-runtime/src/gpu.rs"
+            "crates/spark-model/src/layers/qwen3_ssm/init.rs"
+            "crates/spark-model/src/layers/qwen3_ssm/ssm_forward.rs"
+            "crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs"
             # 2026-08-15 stack merge (#516 video + #514 batch6 + reasoning-effort):
             # these crossed 500 in the merged stacks; splitting them mid-campaign
             # was judged riskier than shipping. Reduce when feasible.
@@ -322,6 +339,11 @@ jobs:
             "crates/spark-server/src/scheduler/sample_step.rs"
             "crates/spark-server/src/tool_parser/tests/group_g_parallel.rs"
             "crates/spark-server/src/api/chat_stream/tool_handlers.rs"
+            # 507 LoC — inherited over-cap from port/qwen3.8-strix-linux via
+            # 9bf3487d9 (template_owns_tool_definitions lever); not touched by
+            # PR #30, fails the whole-checkout scan regardless. Same carry-over
+            # precedent as the #229 entries above. Clean split tracked in #31.
+            "crates/spark-server/src/tool_parser/tests/group_b.rs"
             # 572 LoC — SSM batched-decode dispatcher grew with the
             # native-FP8 NULL-QKVZ/out_proj dispatch fix (K=2/K=3 MTP-verify
             # would deref a NULL QuantizedWeight on FP8-only builds). Single

@@ -153,8 +153,9 @@ pub fn dense_gemv_batch2(
     out_stride: u32,
     stream: u64,
 ) -> Result<()> {
+    let outputs_per_block = if cfg!(atlas_hip) { 8 } else { 4 };
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 4), 1, 1])
+        .grid([div_ceil(n, outputs_per_block), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
@@ -313,6 +314,7 @@ pub fn w8a16_gemm(
     let (grid, block) = ([div_ceil(n, 128), div_ceil(m, 256), 1], [512, 1, 1]);
     #[cfg(not(atlas_hip))]
     let (grid, block) = ([div_ceil(n, 64), div_ceil(m, 64), 1], [128, 1, 1]);
+    super::log_gemm_shape(gpu, "w8a16_gemm", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid(grid)
         .block(block)
@@ -728,6 +730,7 @@ pub fn w8a16_gemm_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape(gpu, "w8a16_gemm_t", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -767,6 +770,41 @@ pub fn w8a16_gemm_n128_m128(
         .arg_ptr(input)
         .arg_ptr(weight_t)
         .arg_ptr(block_scale_t)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W8A16 non-transposed M128 GEMM (kernel `w8a16_gemm_n_m128`): reads the
+/// checkpoint's native `B[N,K]` (k-contiguous) FP8 weight + `block_scale[N/128,
+/// K/128]` directly — NO transposed copy needed. The k-contiguous load lets each
+/// thread fetch 16 consecutive k per n and write a contiguous 16-bf16 run into
+/// `smem_B[n][k]` (two uint4 stores), eliminating the strided/conflicted scalar
+/// stores the transposed `w8a16_gemm_t_m128` variant pays. Same 128×128 WMMA
+/// tile and double-buffered pipeline; same output contract.
+/// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemm_n_m128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,      // [N, K] FP8 non-transposed (k-contiguous)
+    block_scale: DevicePtr, // [N/128, K/128] FP32 non-transposed
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    super::log_gemm_shape(gpu, "w8a16_gemm_n_m128", m, n, k);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(block_scale)
         .arg_ptr(output)
         .arg_u32(m)
         .arg_u32(n)

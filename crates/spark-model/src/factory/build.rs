@@ -282,22 +282,44 @@ pub fn build_model(
 
     // If the checkpoint's `quantization_config.ignore_modules` lists MTP
     // (e.g. Sehyo/Qwen3.5-35B-A3B-NVFP4 ignores `mtp.*`), the MTP weights
-    // were stored as BF16 on disk. Runtime-quantizing them to NVFP4
-    // anyway — which is what `mtp_quant` would otherwise do — produces
-    // garbage drafts (vllm PR #38832). Force BF16 in that case.
+    // were stored as BF16 on disk and runtime-quantizing them to NVFP4
+    // can hurt draft acceptance (vllm PR #38832). `mtp_quant` only leaves
+    // its Bf16 default when the user explicitly passed a different
+    // `--mtp-quantization`, so an explicit request is honored — warned,
+    // not silently vetoed. `ATLAS_MTP_RESPECT_QUANT_EXCLUDE=1` restores
+    // the protective Bf16 override for checkpoints where acceptance is
+    // known to collapse.
     let effective_mtp_quant = if !mtp_weights.is_empty() {
         let quant_fmt = crate::quant_format::detect_quant_format(&config, &store);
         if quant_fmt.is_ignored("mtp.fc.weight")
             || quant_fmt.is_ignored("mtp.layers.0.self_attn.q_proj.weight")
         {
-            if mtp_quant != MtpQuantization::Bf16 {
+            if mtp_quant != MtpQuantization::Bf16
+                && matches!(
+                    std::env::var("ATLAS_MTP_RESPECT_QUANT_EXCLUDE")
+                        .ok()
+                        .as_deref(),
+                    Some("1")
+                )
+            {
                 tracing::info!(
                     "MTP head listed in checkpoint ignore_modules — overriding \
                      --mtp-quantization {:?} → Bf16 to preserve precision",
                     mtp_quant,
                 );
+                MtpQuantization::Bf16
+            } else {
+                if mtp_quant != MtpQuantization::Bf16 {
+                    tracing::warn!(
+                        "MTP head is in the checkpoint's ignore_modules (BF16 on disk); \
+                         honoring explicit --mtp-quantization {:?} — runtime-quantized \
+                         drafts may reduce acceptance (vllm #38832). Set \
+                         ATLAS_MTP_RESPECT_QUANT_EXCLUDE=1 to force Bf16.",
+                        mtp_quant,
+                    );
+                }
+                mtp_quant
             }
-            MtpQuantization::Bf16
         } else {
             mtp_quant
         }
@@ -611,6 +633,7 @@ pub fn build_model(
     // GEMM uses w4a16 instead of a BF16 dense_gemm on NVFP4-packed bytes.
     let target_lm_head_nvfp4_for_dflash = lm_head_nvfp4;
     let target_hidden_for_dflash = config.hidden_size;
+    let target_vocab_for_dflash = config.vocab_size;
 
     let mut model = TransformerModel::new(
         config,
@@ -752,6 +775,7 @@ pub fn build_model(
                     target_lm_head_for_dflash,
                     target_lm_head_nvfp4_for_dflash,
                     target_hidden_for_dflash,
+                    target_vocab_for_dflash,
                     args.gamma,
                     served_window_size,
                     model.gpu_backend(),
