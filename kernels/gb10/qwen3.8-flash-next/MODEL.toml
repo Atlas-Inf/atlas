@@ -312,6 +312,28 @@ FP32 fused verify conv for the exact-verify chain (#435), shipped only
 in qwen3.6-27b/nvfp4. Probed handle != 0; absent, the exact chain keeps
 its per-token conv launches (same bits, more launches)."""
 
+# Strix-HIP-only probes pulled into the shared qwen3_ssm / qwen3_attention
+# init paths by the gfx1151 port on main. Every one is a handle != 0-gated
+# try_kernel; on sm_121 the lookup returns 0 and dispatch keeps the compiled
+# gb10 arm. Same declarations qwen3.8-27b carries for the identical lookups.
+[expected_absent.dense_gemv_fp8w]
+dense_gemv_fp8w = """
+Redundant probe for a dense_ spelling of the FP8-weight GEMV: gb10's FP8
+projections resolve through the compiled gemv_fp8w module (KERNEL.toml maps
+dense_gemv_fp8w.cu there). Mirror of the strix-hip declaration for the same
+lookup; handle!=0 gated."""
+
+[expected_absent.w4a16_gemv_dp4a]
+quantize_act_int8_g16_batch4_d4 = "Strix-hip dp4a batch4 quantizer (kernels/strix-hip/common/w4a16_gemv_dp4a.cu) — not compiled for sm_121; gb10 dispatch uses the non-dp4a w4a16_gemv path. handle!=0 gated."
+w4a16_gemv_dp4a_batch4_d4 = "Strix-hip dp4a batch4 GEMV, same module — not compiled for sm_121. handle!=0 gated."
+w4a16_gemv_dp4a_batch4_d4_os = "Strix-hip dp4a batch4 GEMV (outlier-split), same module — not compiled for sm_121. handle!=0 gated."
+
+[expected_absent.w8a16_gemm_n_m128]
+w8a16_gemm_n_m128 = """
+N-major w8a16 GEMM variant, exists only in
+kernels/strix-hip/common/w8a16_gemm_n_m128.cu; gb10 resolves the compiled
+w8a16_gemm_t_m128 arm (handle!=0 gated)."""
+
 [behavior]
 # Qwen3.8-Flash-Next is a THINKING model whose chat template gates
 # EVERYTHING on `enable_thinking is undefined or true`: the default render
