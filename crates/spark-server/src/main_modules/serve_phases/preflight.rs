@@ -42,7 +42,8 @@ pub(crate) fn preflight_reserve(
     // Tiered verify slots (2026-08-16): the H-intermediate term is per-slot
     // (`verify_slot_h_intermediates`); DFlash pools are γ-sized and do not
     // follow the MTP ladder, so they reserve uniform full width — mirroring
-    // `SsmStatePool::new`'s `num_intermediates != num_drafts + 1` condition.
+    // `SsmStatePool::new`'s DFlash-active condition (`args.dflash` → the
+    // target's `dflash_capture_layers`).
     // Stage-3 f16-SIZED pool: the FP32 prefill staging arena, ONE blob per
     // slot (shared across layers — see `ssm_h_prefill_stage_bytes`). A
     // separate term for the same reason the replay ring is: it is sized by a
