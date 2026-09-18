@@ -143,3 +143,55 @@ fn mixed_precision_map_resolves_standard_despite_mtp_scale_inv() {
          even when mtp.* ships FP8 block scales"
     );
 }
+
+/// nvidia/Qwen3.8-27B-NVFP4 shape: `quant_algo=MIXED_PRECISION` whose map is
+/// genuinely mixed on the main path — FP8 linear_attn/self_attn projections
+/// (208 entries) plus NVFP4 MLP gate/up/down (193 entries). An FP8-first
+/// vote routes the checkpoint to `Fp8Dequanted`, whose loader then refuses
+/// the uint8-packed NVFP4 MLP (`Expected FP8E4M3 ... got UInt8`) — this is
+/// the exact failure the PR benchmark gates hit on decode-floor. FP8
+/// projections inside a Standard checkpoint are already served per-key by
+/// `quantized_any`'s `has_fp8_dense` path, so NVFP4 must win the global vote.
+#[test]
+fn mixed_precision_fp8_attn_nvfp4_mlp_resolves_standard() {
+    use atlas_core::config::{QuantLayerSpec, QuantizationConfig};
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    let mut map = std::collections::BTreeMap::new();
+    for l in 0..cfg.num_hidden_layers {
+        for proj in ["out_proj", "in_proj_qkv", "in_proj_z"] {
+            map.insert(
+                format!("model.language_model.layers.{l}.linear_attn.{proj}"),
+                QuantLayerSpec {
+                    quant_algo: "FP8".into(),
+                    group_size: 128,
+                },
+            );
+        }
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            map.insert(
+                format!("model.language_model.layers.{l}.mlp.{proj}"),
+                QuantLayerSpec {
+                    quant_algo: "NVFP4".into(),
+                    group_size: 16,
+                },
+            );
+        }
+    }
+    cfg.quantization_config = Some(QuantizationConfig {
+        quant_method: "modelopt".into(),
+        quant_algo: "MIXED_PRECISION".into(),
+        format: String::new(),
+        ignore_modules: vec![],
+        weight_block_size: vec![],
+        group_size: 16,
+        quantized_layers: map,
+    });
+    let store = store_with(&[]);
+    assert_eq!(
+        detect_nvfp4_variant(&store, &cfg),
+        Nvfp4Variant::Standard,
+        "MIXED_PRECISION map with FP8 attn + NVFP4 MLP must resolve Standard: \
+         the FP8 arm cannot read uint8-packed FP4, while FP8 keys inside a \
+         Standard checkpoint are dequanted per-key"
+    );
+}

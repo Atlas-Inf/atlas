@@ -365,6 +365,7 @@ pub(crate) fn quantized_any(
 /// to the tensor-name sniffing below.
 fn mixed_precision_variant(qc: &atlas_core::config::QuantizationConfig) -> Option<Nvfp4Variant> {
     let mut saw_nvfp4 = false;
+    let mut saw_fp8 = false;
     for (path, spec) in &qc.quantized_layers {
         // Auxiliary namespaces first — nvidia's MTP experts live at
         // `mtp.layers.0.mlp.experts.*`, which CONTAINS `.mlp.experts`, so
@@ -380,16 +381,21 @@ fn mixed_precision_variant(qc: &atlas_core::config::QuantizationConfig) -> Optio
             continue;
         }
         let algo = spec.quant_algo.to_ascii_uppercase();
-        if algo.starts_with("FP8") {
-            // An FP8 main-path component (e.g. FP8 attention in a mixed pack)
-            // must route the checkpoint to the native-FP8 arms.
-            return Some(Nvfp4Variant::Fp8Dequanted);
-        }
-        if algo == "NVFP4" {
-            saw_nvfp4 = true;
-        }
+        saw_fp8 |= algo.starts_with("FP8");
+        saw_nvfp4 |= algo == "NVFP4";
     }
-    saw_nvfp4.then_some(Nvfp4Variant::Standard)
+    // A single global variant cannot express a genuinely mixed main path, so
+    // precedence matters: an NVFP4 component can NEVER be served by the FP8
+    // arm (its `.weight` is uint8-packed FP4, not FP8E4M3 — nvidia's
+    // Qwen3.8-27B pack died on exactly this at `mlp.gate_proj`), while an
+    // FP8 component inside a Standard checkpoint IS served per-key by
+    // `quantized_any`'s `has_fp8_dense` fallback. NVFP4 wins unconditionally.
+    if saw_nvfp4 {
+        Some(Nvfp4Variant::Standard)
+    } else {
+        // FP8-only main path (e.g. a pure FP8 pack): native-FP8 arms.
+        saw_fp8.then_some(Nvfp4Variant::Fp8Dequanted)
+    }
 }
 
 /// Load a quantized weight from FP8 block-scaled data: FP8→BF16→NVFP4.
