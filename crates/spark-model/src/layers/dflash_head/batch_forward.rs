@@ -279,34 +279,22 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
-        if matches!(self.quant, super::DflashQuantization::Fp8Weights) {
-            if let Some(fp8) = self.lm_head_shared_fp8.as_ref() {
-                crate::layers::ops::fp8_gemm_n128_row_scaled(
-                    ctx.gpu,
-                    self.kernels.fp8_gemm_n128_row_scaled,
-                    self.batch_norm,
-                    fp8,
-                    self.batch_logits,
-                    batch_rows,
-                    vocab,
-                    hidden,
-                    stream,
-                )?;
-            } else {
-                crate::layers::ops::dense_gemm_bf16_pipelined(
-                    ctx.gpu,
-                    self.kernels.dense_gemm_pipelined,
-                    self.batch_norm,
-                    &crate::weight_map::DenseWeight {
-                        weight: self.lm_head_shared,
-                    },
-                    self.batch_logits,
-                    batch_rows,
-                    vocab,
-                    hidden,
-                    stream,
-                )?;
-            }
+        if let Some(fp8) = self
+            .lm_head_shared_fp8
+            .as_ref()
+            .filter(|_| matches!(self.quant, super::DflashQuantization::Fp8Weights))
+        {
+            crate::layers::ops::fp8_gemm_n128_row_scaled(
+                ctx.gpu,
+                self.kernels.fp8_gemm_n128_row_scaled,
+                self.batch_norm,
+                fp8,
+                self.batch_logits,
+                batch_rows,
+                vocab,
+                hidden,
+                stream,
+            )?;
         } else if let Some(nvfp4) = self.lm_head_nvfp4.as_ref() {
             let kernel = match batch_rows {
                 1..=4 => self.kernels.w4a16_gemv_batch4,

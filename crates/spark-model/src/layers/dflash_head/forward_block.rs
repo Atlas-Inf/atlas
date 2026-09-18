@@ -529,35 +529,22 @@ impl BlockDiffusionDraftHead {
             // 0%-accept bug was a half-loaded smem_A K-tile in that
             // kernel (fixed: 2-round A-load covers all 32 K-cols).
             // BF16 path (default, or Fp8 mirror missing) unchanged.
-            let lm_head_fp8 = matches!(self.quant, super::DflashQuantization::Fp8Weights);
-            if lm_head_fp8 {
-                if let Some(fp8) = self.lm_head_shared_fp8.as_ref() {
-                    ops::fp8_gemm_n128_row_scaled_m16(
-                        gpu,
-                        self.kernels.fp8_gemm_n128_row_scaled_m16,
-                        norm_noise_local,
-                        fp8,
-                        scratch.logits,
-                        self.gamma as u32,
-                        self.vocab_size as u32,
-                        h_local,
-                        stream,
-                    )?;
-                } else {
-                    ops::dense_gemm_bf16_pipelined(
-                        gpu,
-                        self.kernels.dense_gemm_pipelined,
-                        norm_noise_local,
-                        &crate::weight_map::DenseWeight {
-                            weight: self.lm_head_shared,
-                        },
-                        scratch.logits,
-                        self.gamma as u32,
-                        self.vocab_size as u32,
-                        h_local,
-                        stream,
-                    )?;
-                }
+            let lm_head_fp8 = self
+                .lm_head_shared_fp8
+                .as_ref()
+                .filter(|_| matches!(self.quant, super::DflashQuantization::Fp8Weights));
+            if let Some(fp8) = lm_head_fp8 {
+                ops::fp8_gemm_n128_row_scaled_m16(
+                    gpu,
+                    self.kernels.fp8_gemm_n128_row_scaled_m16,
+                    norm_noise_local,
+                    fp8,
+                    scratch.logits,
+                    self.gamma as u32,
+                    self.vocab_size as u32,
+                    h_local,
+                    stream,
+                )?;
             } else if self.kernels.w4a16_gemm.0 != 0 {
                 match self.lm_head_nvfp4.as_ref() {
                     // Shared lm_head is NVFP4 (pre-packed like Lightning, or
