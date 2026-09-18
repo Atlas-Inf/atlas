@@ -82,7 +82,13 @@ $ModelName = if ($env:ATLAS_MODEL_NAME) { $env:ATLAS_MODEL_NAME }
 # convention is org-dash-repo (`hf download org/repo --local-dir models\org-repo`).
 $ModelDir = if ($env:ATLAS_MODEL_DIR) { $env:ATLAS_MODEL_DIR }
             else { "$env:USERPROFILE\models\$($ModelName -replace '/', '-')" }
-$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } else { '0.95' }
+# DFLASH=1 swaps the default MTP spec decode for the DFlash2 drafter,
+# mirroring serve-amd.sh (DFlash and --speculative are mutually exclusive).
+$Dflash     = $env:DFLASH -eq '1'
+$DraftModel = if ($env:DRAFT_MODEL) { $env:DRAFT_MODEL } else { 'incoai/Qwen3.8-27B-DFlash2' }
+# DFlash needs headroom for the resident drafter + SSM verify pool; 0.80 is
+# the measured gfx1151 util under DFlash (serve-amd.sh), 0.95 under MTP.
+$GpuUtil  = if ($env:ATLAS_GPU_UTIL) { $env:ATLAS_GPU_UTIL } elseif ($Dflash) { '0.80' } else { '0.95' }
 # The validated Qwen3.8 gate uses 4096 context and a 2048-token prefill arena.
 $MaxSeqLen = if ($env:ATLAS_MAX_SEQ_LEN) { $env:ATLAS_MAX_SEQ_LEN } else { '4096' }
 $MaxPrefill = if ($env:ATLAS_MAX_PREFILL_TOKENS) { $env:ATLAS_MAX_PREFILL_TOKENS } else { '2048' }
@@ -541,13 +547,29 @@ try {
         '--max-seq-len', $MaxSeqLen, '--max-prefill-tokens', $MaxPrefill
         '--gpu-memory-utilization', $GpuUtil, '--kv-cache-dtype', 'bf16', '--lm-head-dtype', 'bf16'
         '--max-batch-size', '1', '--vision-max-pixels', '262144'
-        '--speculative', '--num-drafts', '3'
-        '--mtp-quantization', 'bf16', '--mtp-vocab', '100000'
         '--disable-tool-grammar', 'true'
-        '--ssm-cache-slots', '64', '--ssm-checkpoint-interval', '16'
         '--request-timeout', '0'
         '--disable-thinking'
     )
+    if ($Dflash) {
+        # Option-B is the measured gfx1151 path (serve-amd.sh default);
+        # ATLAS_DFLASH_OPTION_B=0 restores the legacy path. slots=20 /
+        # interval=128 is the verified DFlash SSM recipe — the drafter
+        # reserves pool slots for gamma/verify. DFLASH_GAMMA overrides the
+        # MODEL.toml gamma when set.
+        if (-not $env:ATLAS_DFLASH_OPTION_B) { $env:ATLAS_DFLASH_OPTION_B = '1' }
+        $serveArgs += @(
+            '--dflash', '--draft-model', $DraftModel
+            '--ssm-cache-slots', '20', '--ssm-checkpoint-interval', '128'
+        )
+        if ($env:DFLASH_GAMMA) { $serveArgs += @('--dflash-gamma', $env:DFLASH_GAMMA) }
+    } else {
+        $serveArgs += @(
+            '--speculative', '--num-drafts', '3'
+            '--mtp-quantization', 'bf16', '--mtp-vocab', '100000'
+            '--ssm-cache-slots', '64', '--ssm-checkpoint-interval', '16'
+        )
+    }
     & $exe @serveArgs
 }
 
