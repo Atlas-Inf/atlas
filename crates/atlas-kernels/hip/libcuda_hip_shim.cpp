@@ -125,11 +125,30 @@ int cuMemGetInfo_v2(size_t* free, size_t* total)    {
         const char* v = getenv("ATLAS_TRACKED_MEMINFO");
         return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
     }();
+    // An EXPLICIT ATLAS_UMA_COMMIT_LIMIT_GB is an operator-asserted measured
+    // ceiling and is authoritative — including over a successful
+    // hipMemGetInfo, which reports only the carve-out aperture: Strix Halo,
+    // VGM 32 GB: totalGlobalMem 89.47 GiB while the runtime can back
+    // allocations with WDDM shared memory on top of it (hipMalloc +
+    // kernel-touch ladder measured 106 GiB, 2026-09-19).
+    static const size_t explicit_limit = [] {
+        const char* v = getenv("ATLAS_UMA_COMMIT_LIMIT_GB");
+        if (!v) return (size_t)0;
+        double gb = atof(v);
+        return gb > 0.0 ? (size_t)(gb * 1073741824.0) : (size_t)0;
+    }();
     size_t f = 0, t = 0;
     hipError_t e = force_tracked ? hipErrorUnknown : hipMemGetInfo(&f, &t);
     if (e == hipSuccess && t != 0 && f != 0) {
-        if (free)  *free  = f;
-        if (total) *total = t;
+        if (explicit_limit) {
+            size_t u;
+            { std::lock_guard<std::mutex> lk(g_mem_mu); u = g_mem_used; }
+            if (free)  *free  = (u < explicit_limit) ? explicit_limit - u : 0;
+            if (total) *total = explicit_limit;
+        } else {
+            if (free)  *free  = f;
+            if (total) *total = t;
+        }
         return hipSuccess;
     }
     int dev = 0;
@@ -146,16 +165,8 @@ int cuMemGetInfo_v2(size_t* free, size_t* total)    {
     // driver/display holds back a roughly fixed reserve (~14GB here); override
     // with ATLAS_UMA_DRIVER_RESERVE_GB, or cap directly via
     // ATLAS_UMA_COMMIT_LIMIT_GB.
-    // An EXPLICIT ATLAS_UMA_COMMIT_LIMIT_GB is an operator-asserted measured
-    // ceiling and is authoritative — it may legitimately EXCEED
-    // totalGlobalMem when the runtime can back allocations with WDDM shared
-    // memory on top of the carve-out: Strix Halo, VGM 32 GB: totalGlobalMem
-    // 89.47 GiB, hipMalloc+kernel-touch ladder 106 GiB (2026-09-19).
     static const size_t commit_limit = [&] {
-        if (const char* v = getenv("ATLAS_UMA_COMMIT_LIMIT_GB")) {
-            double gb = atof(v);
-            if (gb > 0.0) return (size_t)(gb * 1073741824.0);
-        }
+        if (explicit_limit) return explicit_limit;
         double reserve_gb = 14.0;
         if (const char* v = getenv("ATLAS_UMA_DRIVER_RESERVE_GB")) {
             double g = atof(v);
@@ -165,12 +176,8 @@ int cuMemGetInfo_v2(size_t* free, size_t* total)    {
         return (prop.totalGlobalMem > r) ? prop.totalGlobalMem - r
                                        : prop.totalGlobalMem;
     }();
-    static const bool limit_is_explicit = [] {
-        const char* v = getenv("ATLAS_UMA_COMMIT_LIMIT_GB");
-        return v && atof(v) > 0.0;
-    }();
-    const size_t tot = limit_is_explicit
-        ? commit_limit
+    const size_t tot = explicit_limit
+        ? explicit_limit
         : ((prop.totalGlobalMem < commit_limit) ? prop.totalGlobalMem
                                                 : commit_limit);
     if (total) *total = tot;
