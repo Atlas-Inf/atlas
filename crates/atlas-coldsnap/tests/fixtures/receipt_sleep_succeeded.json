@@ -1,0 +1,31 @@
+{
+  "format": 2,
+  "kind": "coldsnap-operation-receipt",
+  "operation_id": "qwen08b-tp1-sleep-v1",
+  "operation": "sleep",
+  "state": "succeeded",
+  "request_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "engine": "vllm",
+  "snapshot_driver": "n610",
+  "replay_semantics": "convergent",
+  "started_at": "2026-08-15T12:00:00.000000000Z",
+  "completed_at": "2026-08-15T12:00:07.500000000Z",
+  "duration_seconds": 7.5,
+  "timing": {
+    "format": 2,
+    "clocks": [{ "id": "controller", "source": "controller", "origin_unix_ns": 1786104000000000000 }],
+    "spans": [
+      {
+        "id": "controller-1",
+        "name": "controller.operation",
+        "clock": "controller",
+        "duration_seconds": 7.5,
+        "status": "ok"
+      }
+    ]
+  },
+  "result": {
+    "artifact": "./artifacts/qwen08b-tp1-published.json",
+    "prepared": false
+  }
+}

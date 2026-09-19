@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "atlas-coldsnap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Atlas: strict, CUDA-free client for the ColdSnap controller protocol (snapshot / sleep / wake coordination)"
+
+# HARD CONSTRAINT: this crate is an anti-corruption layer over the ColdSnap
+# controller's process boundary. It owns the foreign protocol (request,
+# receipt, capabilities JSON), argv construction, and the single process-I/O
+# seam — nothing else. It must NOT grow CUDA, RDMA, engine, or Atlas-lifecycle
+# policy: what "sleep" means for an Atlas CUDA context is decided by
+# spark-server, which calls this crate. Keeping it dependency-light is what
+# lets it build and unit-test on any host (macOS included) with no GPU.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Stable content hashing for the request digest the controller echoes back.
+sha2 = { workspace = true }
+# RFC3339Nano receipt timestamps. `time` is already in the dependency graph
+# (transitively), so this pins no new crate; `parsing` is the only feature
+# this crate needs beyond the default `std`.
+time = { version = "0.3", features = ["parsing"] }
+
+# Process-group kill on timeout, so a killed controller does not strand the
+# adapter children it spawned. Same pin as atlas-tier and spark-server; no new
+# crate enters the graph.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# The integration tests drive scripted fakes and read JSON fixtures; both
+# need nothing beyond the runtime budget above.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
