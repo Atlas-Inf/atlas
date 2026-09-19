@@ -239,21 +239,30 @@ impl SsmStatePool {
         // `ssm_reserve::verify_slot_h_intermediates` — the same numbers
         // preflight reserves and the scheduler's dispatch clamp enforces
         // (`Model::mtp_slot_draft_capacity`). Uniform (every slot at
-        // `num_intermediates`) when the pools are DFlash-γ sized
-        // (`num_intermediates != num_drafts + 1` — DFlash verify width does
-        // not follow the MTP ladder); the kill switch and a disabled ladder
-        // make `verify_slot_h_intermediates` itself uniform. The MTP dummy
-        // at index `mtp_slots` is ALWAYS full-width (K-1): batched-verify
-        // pad rows may write any of the K-1 live token indices regardless
-        // of the active slots' tiers.
+        // `num_intermediates`) when the pools are DFlash-γ sized — DFlash
+        // verify width does not follow the MTP ladder — detected HERE from
+        // `config.dflash_capture_layers` (the same field `impl_a1` feeds
+        // `dspark_pool::dflash_verify_rows`), NOT from
+        // `num_intermediates != num_drafts + 1`: DFlash verify rows are
+        // exactly `num_drafts + 1` (`[last_token, draft_1, .., draft_K]`),
+        // so that comparison is always equal under `--dflash` and the
+        // ladder would silently under-allocate every slot (γ=8 gets ≤3
+        // intermediates where the first verify needs 7 — the
+        // "SSM MTP intermediate buffers not allocated" refusal that
+        // `ATLAS_MTP_POOL_FULL_WIDTH` was masking). The kill switch and a
+        // disabled ladder make `verify_slot_h_intermediates` itself
+        // uniform. The MTP dummy at index `mtp_slots` is ALWAYS full-width
+        // (K-1): batched-verify pad rows may write any of the K-1 live
+        // token indices regardless of the active slots' tiers.
         // H side allocates K-1 intermediates per K-row verify (index K-1 is
         // never written or read — audit in `verify_slot_h_intermediates`);
         // the CONV side keeps all K because the fused conv kernels write the
         // dead K-1 snapshot on-device. `num_intermediates` remains the K
         // ceiling (conv count); the uniform H count is `num_intermediates-1`.
         let replay = rollback_mode == crate::ssm_reserve::SsmRollbackMode::Replay;
-        let uniform_h =
-            num_intermediates != num_drafts + 1 || crate::ssm_reserve::mtp_pool_full_width();
+        let uniform_h = !config.dflash_capture_layers.is_empty()
+            || num_intermediates != num_drafts + 1
+            || crate::ssm_reserve::mtp_pool_full_width();
         let h_inter_counts: Vec<usize> = if has_mtp && replay {
             // Replay: no per-token snapshots exist — every slot's count is 0
             // (the vec stays populated so accessors keep their shape).

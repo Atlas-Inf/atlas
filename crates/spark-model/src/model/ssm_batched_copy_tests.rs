@@ -366,3 +366,56 @@ fn the_collapsed_run_reproduces_the_plan_row_for_row() {
         .collect();
     assert_eq!(expanded, plan);
 }
+
+/// DFlash-γ verify pools size H intermediates UNIFORMLY at K-1 per slot:
+/// the fixed γ width does not follow the MTP K-ladder. Regression guard
+/// for the dead `num_intermediates != num_drafts + 1` detector — DFlash
+/// verify rows resolve to exactly `num_drafts + 1` (`dspark_pool::
+/// dflash_verify_rows`), so under `--dflash` the comparison was always
+/// equal and every slot fell to the ladder's tier (≤3 at γ=8): the first
+/// verify refused "SSM MTP intermediate buffers not allocated" and only
+/// `ATLAS_MTP_POOL_FULL_WIDTH` masked it.
+#[test]
+fn dflash_pools_size_h_intermediates_uniformly() {
+    let gpu = MockGpuBackend::new();
+    // γ=8 geometry: K = num_drafts + 1 = 8 verify rows → 7 H intermediates
+    // per slot. 16 slots so the ladder's high-slot tier (1 draft at n>8)
+    // would visibly bite without the DFlash uniform.
+    let mut dflash_config = tiny_config();
+    dflash_config.dflash_capture_layers = vec![5, 19];
+    let dflash = SsmStatePool::new(
+        &dflash_config,
+        16,
+        true,
+        8,
+        7,
+        false,
+        SsmRollbackMode::Snapshot,
+        &gpu,
+    )
+    .unwrap();
+    for s in 0..=dflash.mtp_slots {
+        assert_eq!(
+            dflash.h_inter_count(s),
+            7,
+            "slot {s} must hold the full K-1 under DFlash"
+        );
+    }
+    // Counterfactual: identical geometry without the capture layers keeps
+    // the tiered ladder — proves the assertion above discriminates, and
+    // pins the MTP dummy's always-full-width invariant at the same time.
+    let tiered = SsmStatePool::new(
+        &tiny_config(),
+        16,
+        true,
+        8,
+        7,
+        false,
+        SsmRollbackMode::Snapshot,
+        &gpu,
+    )
+    .unwrap();
+    assert_eq!(tiered.h_inter_count(0), 3);
+    assert_eq!(tiered.h_inter_count(15), 1);
+    assert_eq!(tiered.h_inter_count(tiered.mtp_slots), 7);
+}
