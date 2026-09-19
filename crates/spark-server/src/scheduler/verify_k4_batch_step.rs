@@ -84,6 +84,7 @@ pub(super) fn step_verify_k4_batched(
     if let Err(e) = model.sync_secondary() {
         tracing::error!("batched-verify sync_secondary: {e:#}");
         for a in batch.iter_mut() {
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
         }
         return;
@@ -121,6 +122,7 @@ pub(super) fn step_verify_k4_batched(
             Err(e) => {
                 tracing::error!("decode_verify_batched (n={n} ks={ks:?}): {e:#}");
                 for a in batch.iter_mut() {
+                    a.engine_error = Some(format!("{e:#}"));
                     a.finished = true;
                 }
                 return;

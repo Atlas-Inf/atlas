@@ -134,15 +134,21 @@ pub(super) fn derive_finish_reason(
 /// 0 = unlimited) — needed so the `"length"` decision reuses the exact
 /// stop predicate from `emit_step`/`decode_logits_step`.
 pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize) {
-    let reason = derive_finish_reason(
-        a.guard_stop,
-        a.output_tokens.last().copied(),
-        &a.eos_tokens,
-        a.tool_call_end_token,
-        a.remaining,
-        a.seq.seq_len,
-        max_seq_len,
-    );
+    // An engine abort is not a model stop. Reporting it as "stop" is how a
+    // verify failure at token 1,679 read as a clean completion to the client.
+    let reason = if a.engine_error.is_some() {
+        "error"
+    } else {
+        derive_finish_reason(
+            a.guard_stop,
+            a.output_tokens.last().copied(),
+            &a.eos_tokens,
+            a.tool_call_end_token,
+            a.remaining,
+            a.seq.seq_len,
+            max_seq_len,
+        )
+    };
     match &mut a.sink {
         ResponseSink::Streaming(tx) => {
             let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
@@ -170,27 +176,31 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
             if let Some(tx) = tx.take() {
                 let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
                 let decode_ms = a.decode_start.elapsed().as_secs_f64() * 1000.0;
-                if tx
-                    .send(Ok(InferenceResponse {
-                        output_tokens: a.output_tokens.clone(),
-                        finish_reason: reason.to_string(),
-                        time_to_first_token_ms: ttft_ms,
-                        decode_time_ms: decode_ms,
-                        logprobs: std::mem::take(&mut a.logprobs_data),
-                        reasoning_tokens: a.thinking_tokens,
-                        cached_prompt_tokens: a.cached_prompt_tokens,
-                        accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
-                        prompt_logprobs: std::mem::take(&mut a.seq.prompt_logprobs)
-                            .into_iter()
-                            .map(|p| crate::api::TokenLogprobs {
-                                token_id: p.token_id,
-                                logprob: p.logprob,
-                                top: p.top,
-                            })
-                            .collect(),
-                    }))
-                    .is_err()
-                {
+                let response = InferenceResponse {
+                    output_tokens: a.output_tokens.clone(),
+                    finish_reason: reason.to_string(),
+                    time_to_first_token_ms: ttft_ms,
+                    decode_time_ms: decode_ms,
+                    logprobs: std::mem::take(&mut a.logprobs_data),
+                    reasoning_tokens: a.thinking_tokens,
+                    cached_prompt_tokens: a.cached_prompt_tokens,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    prompt_logprobs: std::mem::take(&mut a.seq.prompt_logprobs)
+                        .into_iter()
+                        .map(|p| crate::api::TokenLogprobs {
+                            token_id: p.token_id,
+                            logprob: p.logprob,
+                            top: p.top,
+                        })
+                        .collect(),
+                };
+                // A blocking client gets the engine error as an error (HTTP
+                // 500), not a completion carrying an odd finish reason.
+                let payload = match a.engine_error.take() {
+                    Some(msg) => Err(anyhow::anyhow!("engine error: {msg}")),
+                    None => Ok(response),
+                };
+                if tx.send(payload).is_err() {
                     tracing::warn!(
                         "finish_sequence: blocking response send failed (receiver dropped)"
                     );
@@ -345,6 +355,7 @@ pub fn resume_swapped_seq(
         min_tokens: s.min_tokens,
         eos_tokens: s.eos_tokens,
         finished: false,
+        engine_error: None,
         guard_stop: None,
         param_close_pending: 0,
         sink: s.sink,

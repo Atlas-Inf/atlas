@@ -48,6 +48,23 @@ impl TransformerLayer for Qwen3SsmLayer {
         Ok(())
     }
 
+    /// PLE's prefill-side NVMe warm — the row ids are known once the prompt
+    /// exists, so the cache starts filling while the earlier chunks compute.
+    /// No-op on the 47 layers without a PLE site.
+    fn prefill_warm(
+        &self,
+        prompt: &[u32],
+        from: usize,
+        state: &mut dyn LayerState,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        if let Some(ple) = self.ple.as_ref() {
+            let st = ple_seq_state(ple, state, gpu)?;
+            ple.prefill_warm(st, prompt, from)?;
+        }
+        Ok(())
+    }
+
     fn has_aux_state(&self) -> bool {
         self.ple.is_some()
     }
@@ -280,6 +297,29 @@ impl TransformerLayer for Qwen3SsmLayer {
             // Sequence never ran this layer (snapshot before first pass):
             // nothing to carry, and restore-side declines aux-less slots.
             None => Ok(None),
+        }
+    }
+
+    fn snapshot_aux_into(
+        &self,
+        state: &dyn LayerState,
+        buf: &mut Vec<u8>,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(ple) = self.ple.as_ref() else {
+            return Ok(false);
+        };
+        let ssm = state
+            .as_any()
+            .downcast_ref::<crate::layer::SsmLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("PLE host layer state is not SsmLayerState"))?;
+        match ssm.ple.as_ref() {
+            Some(st) => {
+                ple.snapshot_aux_into(st, buf, gpu, stream)?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 

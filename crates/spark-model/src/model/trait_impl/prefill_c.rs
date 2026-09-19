@@ -191,7 +191,7 @@ impl TransformerModel {
                     .ssm_snapshots
                     .session_matches(snap_id, seq.session_hash)
                 // See prefill_a: aux-carrying models decline aux-less slots.
-                && (!self.requires_aux_state() || self.ssm_snapshots.aux(snap_id).is_some())
+                && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
             {
                 self.ssm_snapshots.restore(
                     snap_id,
@@ -200,8 +200,11 @@ impl TransformerModel {
                     self.gpu.as_ref(),
                     stream,
                 )?;
-                if let Some(aux) = self.ssm_snapshots.aux(snap_id) {
-                    self.apply_aux_states(seq, &aux, stream)?;
+                if let Some(res) = self
+                    .ssm_snapshots
+                    .with_aux(snap_id, |aux| self.apply_aux_states(seq, aux, stream))
+                {
+                    res?;
                 }
                 tracing::info!(
                     "Marconi two-phase: restored SSM snapshot at token {snap_tok} \
@@ -265,6 +268,12 @@ impl TransformerModel {
             return self
                 .prefill_full_cache_hit(tokens, seq, hidden, h as u32, bs, total_len, stream);
         }
+
+        // PLE: warm the row cache ahead of the layer-1 gather — the ids are
+        // a pure function of `tokens`, and this monolithic forward spans the
+        // whole remainder, so the worker streams while the GDN/pass-A layers
+        // compute. Per-span pacing inside the layer keeps it bounded.
+        self.ple_prefill_warm(tokens, proc_start, seq)?;
 
         // Re-embed only the uncached portion at hidden[0..proc_count].
         if proc_start > 0 {

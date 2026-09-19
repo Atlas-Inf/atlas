@@ -156,6 +156,7 @@ pub(super) fn step_mtp_bootstrap_batched(
             Err(e) => {
                 tracing::error!("batched bootstrap decode_batch (n={n}): {e:#}");
                 for a in refs.iter_mut() {
+                    a.engine_error = Some(format!("{e:#}"));
                     a.finished = true;
                 }
                 return;
@@ -260,6 +261,7 @@ pub(super) fn step_mtp_bootstrap_batched(
                     Ok(t) => t,
                     Err(e) => {
                         tracing::error!("batched bootstrap sample error: {e:#}");
+                        a.engine_error = Some(format!("{e:#}"));
                         a.finished = true;
                         continue;
                     }

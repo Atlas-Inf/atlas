@@ -132,6 +132,7 @@ fn qsa_matches_reference() {
         hd,
         ratio,
         budget,
+        /* max_seq_len */ 32768,
         rot,
         theta,
         eps,

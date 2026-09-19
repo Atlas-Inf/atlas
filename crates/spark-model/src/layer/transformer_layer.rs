@@ -102,6 +102,24 @@ pub trait TransformerLayer: Send + Sync {
     /// recompute (PLE's history already advanced in `decode_prestage`).
     fn decode_prestage_rearm(&self, _state: &mut dyn LayerState) {}
 
+    /// Prefill-side warm for layers whose row ids are a pure host function
+    /// of the prompt (PLE). Called once per prefill dispatch — before the
+    /// layer loop — with the FULL prompt and `from`, the first position this
+    /// call will process, so the layer can stream its NVMe-resident rows
+    /// into cache while the earlier chunks and layers compute instead of
+    /// faulting them on the gather's critical path. Chunked callers invoke
+    /// it per chunk; the layer paces and deduplicates internally. Default
+    /// no-op: layers with no host-faulted table have nothing to warm.
+    fn prefill_warm(
+        &self,
+        _prompt: &[u32],
+        _from: usize,
+        _state: &mut dyn LayerState,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// True when this layer's decode can NEVER be captured into a CUDA
     /// graph — e.g. the QSA indexer's host top-k round trip, whose captured
     /// dense fallback would silently replay WRONG attention once selection
@@ -125,6 +143,29 @@ pub trait TransformerLayer: Send + Sync {
         _stream: u64,
     ) -> Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+
+    /// [`Self::snapshot_aux`] into a caller-owned buffer — returns `true`
+    /// when this layer produced a blob. Aux-carrying layers override it so
+    /// per-save buffers survive ring-slot / snapshot-slot reuse instead of
+    /// re-allocating multi-MB Vecs on every boundary (the alloc/free churn
+    /// measured as serve-RSS growth in jobs 043/058). The default routes
+    /// through `snapshot_aux`, so layers that haven't been updated keep
+    /// working — with the old allocation behaviour.
+    fn snapshot_aux_into(
+        &self,
+        state: &dyn LayerState,
+        buf: &mut Vec<u8>,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        match self.snapshot_aux(state, gpu, stream)? {
+            Some(blob) => {
+                *buf = blob;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// True when this layer WOULD produce aux state — restore sites use it

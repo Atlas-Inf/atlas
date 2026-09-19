@@ -213,3 +213,109 @@ fn multi_file_rows_are_byte_identical() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── `prefetch` (the PLE warm path's unpinned decide+fault) ────────────
+//
+// All three need a live CUDA context for the pinned arena — same gate as
+// `multi_file_rows_are_byte_identical`:
+//
+//     cargo test -p spark-storage --features cuda prefetch -- --ignored
+
+/// A scratch single-file table: `rows` rows of `stride` bytes at offset 0,
+/// byte `(row, i)` = `row*31 + i` so a landed row is verifiable end to end.
+fn scratch_table(stride: usize, rows: u64) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("ngram_pf_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let path = dir.join("table.bin");
+    let mut fh = std::fs::File::create(&path).expect("create");
+    for r in 0..rows {
+        let row: Vec<u8> = (0..stride)
+            .map(|i| (r as u8).wrapping_mul(31).wrapping_add(i as u8))
+            .collect();
+        fh.write_all(&row).expect("row");
+    }
+    // Tail pad so the last row's 4 KiB read stays inside the file.
+    fh.write_all(&[0u8; 8192]).expect("pad");
+    (dir, path)
+}
+
+/// The whole point: rows warmed ahead of the gather resolve as hits, and
+/// the landed bytes are the row's bytes.
+#[test]
+#[ignore]
+fn prefetch_then_resolve_is_all_hits() {
+    const STRIDE: usize = 160;
+    let (dir, path) = scratch_table(STRIDE, 64);
+    let mut cache = NgramRowCache::open(&path, None, 64, STRIDE, 32).expect("cache");
+
+    let ids: Vec<u64> = vec![3, 17, 41, 60];
+    let faulted = cache.prefetch(&ids).expect("prefetch");
+    assert_eq!(faulted, ids.len(), "cold cache: every id faults once");
+
+    let (hits0, misses0, _) = cache.stats();
+    let mut slots = Vec::new();
+    cache.resolve(&ids, &mut slots).expect("resolve");
+    let (hits1, misses1, _) = cache.stats();
+    assert_eq!(
+        hits1 - hits0,
+        ids.len() as u64,
+        "warmed rows resolve as hits"
+    );
+    assert_eq!(misses1 - misses0, 0, "no refault");
+    for (id, slot) in ids.iter().zip(&slots) {
+        let got = cache.slot_bytes(*slot).expect("slot bytes");
+        let want: Vec<u8> = (0..STRIDE)
+            .map(|i| (*id as u8).wrapping_mul(31).wrapping_add(i as u8))
+            .collect();
+        assert_eq!(got, &want[..], "row {id} bytes");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Prefetched rows must NOT pin: if they did, a full cache would leave a
+/// consuming `resolve` with no victim and bail "every slot is pinned".
+/// Fill the cache by prefetch, then resolve an entirely different set.
+#[test]
+#[ignore]
+fn prefetched_rows_stay_evictable() {
+    const STRIDE: usize = 160;
+    let (dir, path) = scratch_table(STRIDE, 64);
+    let mut cache = NgramRowCache::open(&path, None, 64, STRIDE, 8).expect("cache");
+
+    let warm: Vec<u64> = (0..8).collect();
+    cache.prefetch(&warm).expect("prefetch fills the cache");
+
+    // A consuming batch of 8 entirely different rows must still find victims.
+    let consume: Vec<u64> = (8..16).collect();
+    let mut slots = Vec::new();
+    cache
+        .resolve(&consume, &mut slots)
+        .expect("resolve must evict, not bail");
+    assert_eq!(slots.len(), consume.len());
+    let (_, _, evictions) = cache.stats();
+    assert!(evictions > 0, "warmed rows were evicted, not pinned");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A repeated id inside one prefetch is one fault and one slot — the same
+/// decide-time dedup `resolve` relies on.
+#[test]
+#[ignore]
+fn prefetch_dedups_repeated_ids() {
+    const STRIDE: usize = 160;
+    let (dir, path) = scratch_table(STRIDE, 64);
+    let mut cache = NgramRowCache::open(&path, None, 64, STRIDE, 16).expect("cache");
+
+    let ids: Vec<u64> = vec![5, 5, 5, 9, 9];
+    let faulted = cache.prefetch(&ids).expect("prefetch");
+    assert_eq!(faulted, 2, "repeats hit the reservation, not the disk");
+
+    let mut slots = Vec::new();
+    cache.resolve(&ids, &mut slots).expect("resolve");
+    assert_eq!(slots[0], slots[1]);
+    assert_eq!(slots[1], slots[2]);
+    assert_eq!(slots[3], slots[4]);
+    assert_ne!(slots[0], slots[3]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
