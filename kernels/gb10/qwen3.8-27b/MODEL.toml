@@ -245,3 +245,44 @@ variant exists solely in nemotron-labs-3-puzzle-75b-a9b. Dispatch
 (qwen3_attention/init.rs) falls back to w4a4_gemm, which is correct but
 UNMEASURED against a ported mfast — see the honesty note in
 qwen3.6-27b/MODEL.toml."""
+
+# ── Strix-hip-only kernels probed by shared init paths ──────────────────────
+# The gfx1151 port (main #9/#33) added `try_kernel` probes for Strix variants
+# inside dense_ffn, qwen3_attention and qwen3_ssm constructors that every
+# gb10 model also instantiates. Every site is `handle != 0`-gated, so on
+# sm_121 the dispatch resolves through the compiled w4a16_gemv / w8a16 /
+# gemv_fp8w arms — the same symmetric declarations strix-hip/*/MODEL.toml
+# already carries for the gb10-only kernels it probes. Absent here by design:
+# porting the dp4a/n_m128 arms to sm_121 is a perf question, not a
+# correctness one.
+
+[expected_absent.dense_gemv_fp8w]
+dense_gemv_fp8w = """
+Redundant probe for a dense_ spelling of the FP8-weight GEMV: gb10's GDN FP8
+projections resolve through the compiled gemv_fp8w module (KERNEL.toml maps
+dense_gemv_fp8w.cu there). Mirror of the strix-hip declaration for the same
+lookup; handle!=0 gated."""
+
+[expected_absent.w4a16]
+w4a16_gemm_t_m128_k16 = """
+K16-tile w4a16 GEMM variant, exists only in
+strix-hip/qwen3.6-27b/nvfp4/w4a16_gemm.cu — and even there it only runs under
+ATLAS_W4A16_K16=1 (a gfx1151 occupancy A/B lever). gb10 uses the compiled
+w4a16_gemm_t_m128 / w4a16_gemm arms; handle!=0 gated."""
+
+[expected_absent.w4a16_gemv_dp4a]
+quantize_act_int8_g16 = "Strix-hip dp4a int8 activation quantizer (kernels/strix-hip/common/w4a16_gemv_dp4a.cu); gb10 dispatch uses the non-dp4a w4a16_gemv path. handle!=0 gated."
+quantize_act_int8_g16_batch4_d4 = "Strix-hip dp4a batch4 quantizer, same module — not compiled for sm_121. handle!=0 gated."
+silu_mul_quant_int8_g16 = "Strix-hip dp4a fused SiLU+quantizer, same module — not compiled for sm_121. handle!=0 gated."
+w4a16_gemv_dp4a = "Strix-hip dp4a w4a16 GEMV, same module — not compiled for sm_121. handle!=0 gated."
+w4a16_gemv_dp4a_batch4_d4 = "Strix-hip dp4a batch4 GEMV, same module — not compiled for sm_121. handle!=0 gated."
+w4a16_gemv_dp4a_batch4_d4_dyn = "Strix-hip dp4a batch4 GEMV (dyn), same module — not compiled for sm_121. handle!=0 gated."
+w4a16_gemv_dp4a_batch4_d4_os = "Strix-hip dp4a batch4 GEMV (outlier-split), same module — not compiled for sm_121. handle!=0 gated."
+w4a16_gemv_dp4a_dual_batch4_d4 = "Strix-hip dp4a dual batch4 GEMV, same module — not compiled for sm_121. handle!=0 gated."
+w4a16_gemv_dp4a_dual_batch4_d4_dyn = "Strix-hip dp4a dual batch4 GEMV (dyn), same module — not compiled for sm_121. handle!=0 gated."
+
+[expected_absent.w8a16_gemm_n_m128]
+w8a16_gemm_n_m128 = """
+N-major w8a16 GEMM variant, exists only in
+kernels/strix-hip/common/w8a16_gemm_n_m128.cu; gb10 resolves the compiled
+w8a16_gemm_t_m128 arm (trait_prefill_helper.rs, handle!=0 gated)."""
