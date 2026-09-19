@@ -146,6 +146,11 @@ int cuMemGetInfo_v2(size_t* free, size_t* total)    {
     // driver/display holds back a roughly fixed reserve (~14GB here); override
     // with ATLAS_UMA_DRIVER_RESERVE_GB, or cap directly via
     // ATLAS_UMA_COMMIT_LIMIT_GB.
+    // An EXPLICIT ATLAS_UMA_COMMIT_LIMIT_GB is an operator-asserted measured
+    // ceiling and is authoritative — it may legitimately EXCEED
+    // totalGlobalMem when the runtime can back allocations with WDDM shared
+    // memory on top of the carve-out: Strix Halo, VGM 32 GB: totalGlobalMem
+    // 89.47 GiB, hipMalloc+kernel-touch ladder 106 GiB (2026-09-19).
     static const size_t commit_limit = [&] {
         if (const char* v = getenv("ATLAS_UMA_COMMIT_LIMIT_GB")) {
             double gb = atof(v);
@@ -160,8 +165,14 @@ int cuMemGetInfo_v2(size_t* free, size_t* total)    {
         return (prop.totalGlobalMem > r) ? prop.totalGlobalMem - r
                                        : prop.totalGlobalMem;
     }();
-    const size_t tot =
-        (prop.totalGlobalMem < commit_limit) ? prop.totalGlobalMem : commit_limit;
+    static const bool limit_is_explicit = [] {
+        const char* v = getenv("ATLAS_UMA_COMMIT_LIMIT_GB");
+        return v && atof(v) > 0.0;
+    }();
+    const size_t tot = limit_is_explicit
+        ? commit_limit
+        : ((prop.totalGlobalMem < commit_limit) ? prop.totalGlobalMem
+                                                : commit_limit);
     if (total) *total = tot;
     if (free)  *free  = (used < tot) ? (tot - used) : 0;
     // Diagnostic: report which path answered + the tracked total, so we can
