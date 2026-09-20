@@ -317,11 +317,20 @@ pub(crate) fn init_gpu_backend(
     let scalar = gpu
         .kernel("gemm", "dense_gemm_bf16")
         .unwrap_or(spark_runtime::gpu::KernelHandle(0));
+    // Optional small-M arm: `dense_gemv_bf16_batchm` serves 1 <= M <= 8
+    // decode projections (e.g. Flash-Next's BF16 `in_proj_qkvz`) in one
+    // bandwidth-bound pass instead of a 128-row WMMA tile. Handle 0 -> the
+    // fallback skips the arm.
+    let gemv_batchm = gpu
+        .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
+        .unwrap_or(spark_runtime::gpu::KernelHandle(0));
     if spark_runtime::cublaslt::install_bf16_fallback(spark_runtime::cublaslt::make_bf16_fallback(
-        pipelined, scalar,
+        pipelined,
+        scalar,
+        gemv_batchm,
     )) {
         tracing::info!(
-            "BF16 GEMM fallback installed (pipelined WMMA / scalar) for backends without cuBLASLt"
+            "BF16 GEMM fallback installed (gemv<=8 / pipelined WMMA / scalar) for backends without cuBLASLt"
         );
     }
     let total_mem = gpu.total_memory()?;
