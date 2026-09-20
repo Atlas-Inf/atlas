@@ -17,9 +17,11 @@ pub(crate) const MAX_TOKENS: usize = 1500;
 /// Vacuity floor on every run's `completion_tokens`.
 ///
 /// ★ 700, not 1200 — the same rule applied to the CURRENT subject. The gate
-/// serves nvidia/Qwen3.8-27B-NVFP4, whose natural stop for the MinHeap task is
-/// a deterministic 717-718 tokens of the 1500 budget (measured 2026-09-11/12
-/// across the gate's own driver), against the unsloth checkpoint's 915. A pin
+/// serves nvidia/Qwen3.8-27B-NVFP4. The 717-718 token "natural stop" measured
+/// 2026-09-11/12 across the gate's own driver was NOT the model stopping: it
+/// was the streaming semantic-loop guard cutting the response inside an
+/// unclosed code fence (observed 2026-09-19/20 — unstreamed, the subject runs
+/// to the full 1500 budget with no repetition). The pin stays at 700: a pin
 /// above a subject's own reference behaviour fails every honest run by
 /// construction — a gate that cannot pass its own instrument gates nothing —
 /// so the pin sits under the narrower of the two stops with margin for small
