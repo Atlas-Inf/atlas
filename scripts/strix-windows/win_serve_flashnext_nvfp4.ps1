@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Serves nvidia/Qwen3.8-Flash-Next-NVFP4 on Windows gfx1151 (Strix Halo) with
 # the measured boot-7g recipe — the profile behind the 2026-09-20 MTP headline
-# (17.0 tok/s decode, mean_na 0.95, serial arm 6.4 tok/s = ~2.6x).
+# (17.0 tok/s decode, mean_na 0.95; serial arm ~8 tok/s after correcting the
+# watchdog-rollback rework in its Done: lines, i.e. ~2.1x — see the doc).
 #
 # MEMORY FACTS this recipe is built around (winbox, 2026-09-19/20):
 #  * VGM MUST be 32 GB — set it with vgmctl (scripts/strix-windows/vgmctl/).
