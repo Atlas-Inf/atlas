@@ -91,6 +91,14 @@ impl MoeLayer {
         // nearly flat in N). Below ATLAS_HIP_MOE_GROUPED_MIN_TOKENS route to
         // the per-token batched path like the bf16/fp8 arms above. cfg gate:
         // NVIDIA byte-unchanged.
+        //
+        // Default 1024 = measured crossover, serial arm, hipBLASLt live,
+        // temp 0, winbox 2026-09-20 (TTFT ms, grouped vs batched):
+        //   20 tok   2053 vs ~600      44 tok  2946 vs ~1000
+        //  266 tok   7027 vs ~4196    708 tok 10825 vs ~9795
+        // 1150 tok  14347 vs 15594  <- grouped wins
+        // Batched leads through 708 and loses at 1150; crossover ~900,
+        // rounded to the nearest power of two.
         if cfg!(atlas_hip) {
             static HIP_NVFP4_GROUPED_MIN_TOKENS: std::sync::OnceLock<usize> =
                 std::sync::OnceLock::new();
@@ -98,7 +106,7 @@ impl MoeLayer {
                 std::env::var("ATLAS_HIP_MOE_GROUPED_MIN_TOKENS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(256) // measured-crossover placeholder
+                    .unwrap_or(1024)
             });
             if num_tokens < min {
                 return self.forward_batched(input, num_tokens, ctx, stream);
