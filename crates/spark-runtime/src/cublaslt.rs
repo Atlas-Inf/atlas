@@ -107,6 +107,20 @@ unsafe extern "C" {
     fn cuMemAlloc_v2(dptr: *mut u64, bytesize: usize) -> i32;
     fn cuMemFree_v2(dptr: u64) -> i32;
     fn cuStreamSynchronize(stream: u64) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn cuLaunchKernel(
+        f: u64,
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        shared_mem_bytes: u32,
+        stream: u64,
+        params: *mut *mut c_void,
+        extra: *mut c_void,
+    ) -> i32;
 }
 
 struct Ctx {
@@ -192,6 +206,85 @@ pub fn prewarm(stream: u64) {
     }
 }
 
+/// Process-global BF16 GEMM for backends whose cuBLASLt is a stub (the HIP
+/// target links `libcublaslt_stub.cpp`, which returns 1 for every call).
+/// Same contract as [`bf16_gemm_act_weight_t`]: row-major
+/// `out[M,N] = act[M,K] @ weight[N,K]ᵀ`, all BF16.
+pub type Bf16GemmFallback = dyn Fn(u64, u64, u64, u32, u32, u32, u64) -> Result<()> + Send + Sync;
+
+static BF16_FALLBACK: OnceLock<Box<Bf16GemmFallback>> = OnceLock::new();
+static FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
+
+/// Install the GEMM [`bf16_gemm_act_weight_t`] routes to when `ctx()` fails.
+/// Returns false if one was already installed — first install wins: the
+/// fallback is a property of the process's backend, not of any model.
+pub fn install_bf16_fallback(f: Box<Bf16GemmFallback>) -> bool {
+    BF16_FALLBACK.set(f).is_ok()
+}
+
+/// Build the Atlas-kernel BF16 GEMM fallback. Launches
+/// `dense_gemm_bf16_pipelined` (tensor core, ~40x scalar on large M) when the
+/// kernel resolved AND its vectorized-load contract holds — 16-byte-aligned
+/// operands and `K % 8 == 0` (uint4 row loads; both ports bounds-check M/N/K,
+/// so tile multiples are not required) — else the scalar `dense_gemm_bf16`,
+/// which has no alignment or shape requirements.
+pub fn make_bf16_fallback(
+    pipelined: crate::gpu::KernelHandle,
+    scalar: crate::gpu::KernelHandle,
+) -> Box<Bf16GemmFallback> {
+    Box::new(move |act, weight, out, m, n, k, stream| {
+        let vectorizable = k % 8 == 0 && act % 16 == 0 && weight % 16 == 0 && out % 16 == 0;
+        let (func, grid, block) = if pipelined.0 != 0 && vectorizable {
+            (
+                pipelined.0,
+                [n.div_ceil(128), m.div_ceil(128), 1],
+                [256, 1, 1],
+            )
+        } else {
+            if scalar.0 == 0 {
+                anyhow::bail!(
+                    "BF16 GEMM fallback: dense_gemm_bf16_pipelined constraints unmet \
+                     (M={m} N={n} K={k} or unresolved) and scalar dense_gemm_bf16 \
+                     also unresolved"
+                );
+            }
+            (scalar.0, [n.div_ceil(16), m.div_ceil(16), 1], [16, 16, 1])
+        };
+        let (mut a, mut w, mut o) = (act, weight, out);
+        let (mut mm, mut nn, mut kk) = (m, n, k);
+        let mut params: [*mut c_void; 6] = [
+            &mut a as *mut u64 as *mut c_void,
+            &mut w as *mut u64 as *mut c_void,
+            &mut o as *mut u64 as *mut c_void,
+            &mut mm as *mut u32 as *mut c_void,
+            &mut nn as *mut u32 as *mut c_void,
+            &mut kk as *mut u32 as *mut c_void,
+        ];
+        // SAFETY: `func` is a CUfunction resolved from this process's loaded
+        // modules (lives as long as the backend, which outlives the serve);
+        // params point at stack values that outlive the launch call, matching
+        // the kernel's (ptr, ptr, ptr, u32, u32, u32) signature; the primary
+        // context is bound on the calling thread by AtlasCudaBackend::new.
+        let st = unsafe {
+            cuLaunchKernel(
+                func,
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                0,
+                stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        chk(st, "Atlas-GEMM fallback launch")?;
+        Ok(())
+    })
+}
+
 fn chk(status: i32, what: &str) -> Result<()> {
     if status != 0 {
         bail!("cuBLASLt {what} failed: status {status}");
@@ -211,7 +304,21 @@ pub fn bf16_gemm_act_weight_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let ctx = ctx()?;
+    let ctx = match ctx() {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(fallback) = BF16_FALLBACK.get() {
+                FALLBACK_LOGGED.call_once(|| {
+                    tracing::info!(
+                        "cuBLASLt unavailable ({e}); BF16 projections route through \
+                         the installed Atlas GEMM fallback"
+                    );
+                });
+                return fallback(act, weight, out, m, n, k, stream);
+            }
+            return Err(e);
+        }
+    };
     unsafe {
         let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
         chk(
@@ -318,4 +425,49 @@ pub fn bf16_gemm_act_weight_t(
         chk(status, "Matmul")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Under the CI GPU stubs (`scripts/ci_gpu_stubs.sh`) `cublasLtCreate`
+    /// returns 1, so `ctx()` fails deterministically and
+    /// `bf16_gemm_act_weight_t` must route to the installed fallback with the
+    /// exact (act, weight, out, m, n, k, stream) it was given. On a build
+    /// where real cuBLASLt exists the fallback is never consulted — this
+    /// test only asserts the wiring, which is also exercised on hosts where
+    /// the FFI itself fails to resolve.
+    #[test]
+    fn install_bf16_fallback_first_wins_and_dispatches() {
+        type Call = (u64, u64, u64, u32, u32, u32, u64);
+        static CALLS: Mutex<Vec<Call>> = Mutex::new(Vec::new());
+        let installed = install_bf16_fallback(Box::new(|act, weight, out, m, n, k, stream| {
+            CALLS
+                .lock()
+                .unwrap()
+                .push((act, weight, out, m, n, k, stream));
+            Ok(())
+        }));
+        assert!(installed, "first install_bf16_fallback must succeed");
+        assert!(
+            !install_bf16_fallback(Box::new(|_, _, _, _, _, _, _| {
+                anyhow::bail!("must never run: second install rejected")
+            })),
+            "second install_bf16_fallback must return false"
+        );
+        // Only meaningful where ctx() fails (CI stubs / HIP shim). On a host
+        // with a real cuBLASLt this call would attempt a device GEMM instead,
+        // so the assertion is conditional on the error path being reachable.
+        if ctx().is_err() {
+            bf16_gemm_act_weight_t(0xAA, 0xBB, 0xCC, 22, 16384, 2560, 0x11)
+                .expect("fallback must serve the GEMM when ctx() fails");
+            let calls = CALLS.lock().unwrap();
+            assert_eq!(
+                calls.as_slice(),
+                &[(0xAA, 0xBB, 0xCC, 22, 16384, 2560, 0x11)]
+            );
+        }
+    }
 }
