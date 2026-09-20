@@ -12,6 +12,7 @@ use half::bf16;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layers::ops;
+use crate::layers::ops::{DFLASH2_SELECTOR_MAX_RANK, DFLASH2_SELECTOR_MAX_TOP_K};
 use crate::weight_map::DenseWeight;
 
 #[derive(Clone)]
@@ -38,6 +39,17 @@ impl Dflash2CandidateSelector {
         hidden_size: usize,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
+        // The on-device selector's shared-memory arrays are compile-time
+        // sized; a checkpoint past the caps must fail loudly, not silently
+        // degrade to a truncated selector.
+        anyhow::ensure!(
+            (1..=DFLASH2_SELECTOR_MAX_RANK).contains(&rank),
+            "DFlash2 selector rank {rank} exceeds the on-device selector's cap {DFLASH2_SELECTOR_MAX_RANK}"
+        );
+        anyhow::ensure!(
+            (1..=DFLASH2_SELECTOR_MAX_TOP_K).contains(&top_k),
+            "DFlash2 selector top_k {top_k} exceeds the on-device selector's cap {DFLASH2_SELECTOR_MAX_TOP_K}"
+        );
         let n_elements = vocab_size * rank;
         let mut pred_buf = vec![0u8; n_elements * 2];
         let mut succ_buf = vec![0u8; n_elements * 2];
@@ -110,6 +122,7 @@ impl Dflash2CandidateSelector {
                 g,
                 self.vocab_size as u32,
                 r,
+                self.top_k as u32,
                 stream,
             );
         }
@@ -143,23 +156,13 @@ impl Dflash2CandidateSelector {
             let logit_slice =
                 &logits_bytes[logit_row_offset..logit_row_offset + self.vocab_size * 2];
 
-            // Extract top-k candidate token IDs from unary logits
-            let mut top_candidates: Vec<(f32, usize)> = Vec::with_capacity(self.top_k + 1);
-            for (idx, chunk) in logit_slice.chunks_exact(2).enumerate() {
-                let val = bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
-                if top_candidates.len() < self.top_k {
-                    top_candidates.push((val, idx));
-                    if top_candidates.len() == self.top_k {
-                        top_candidates.sort_by(|a, b| {
-                            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                    }
-                } else if val > top_candidates[self.top_k - 1].0 {
-                    top_candidates[self.top_k - 1] = (val, idx);
-                    top_candidates
-                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                }
-            }
+            // Extract top-k candidate token IDs from unary logits, ordered
+            // (value desc, index asc) — the same total order the kernel uses.
+            let logits_row: Vec<f32> = logit_slice
+                .chunks_exact(2)
+                .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                .collect();
+            let top_candidates = topk_unary(&logits_row, self.top_k);
 
             // Context vector: c_r = pred[prev, r] * H_proj[mask_row, r]
             let h_step = &proj_hiddens[mask_row * self.rank..(mask_row + 1) * self.rank];
@@ -171,22 +174,17 @@ impl Dflash2CandidateSelector {
                 context[i] = pred_row[i].to_f32() * h_step[i];
             }
 
-            // Score candidates
-            let mut best_score = f32::NEG_INFINITY;
-            let mut best_token = top_candidates.first().map(|c| c.1).unwrap_or(0);
-
-            for (unary_score, cand_id) in &top_candidates {
-                let succ_row = &succ_codebook[*cand_id * self.rank..(*cand_id + 1) * self.rank];
+            // Score candidates; strict `>` in list order, so a score tie
+            // resolves to the earlier (higher-unary) candidate — same rule
+            // as the kernel's tid-0 pick.
+            let (best_token, best_score) = pick_best(&top_candidates, &mut |cand_id| {
+                let succ_row = &succ_codebook[cand_id * self.rank..(cand_id + 1) * self.rank];
                 let mut dot = 0.0f32;
                 for i in 0..self.rank {
                     dot += context[i] * succ_row[i].to_f32();
                 }
-                let total_score = unary_score + dot;
-                if total_score > best_score {
-                    best_score = total_score;
-                    best_token = *cand_id;
-                }
-            }
+                dot
+            });
 
             if step == 0 {
                 let unary_top = top_candidates.first().map(|c| c.1).unwrap_or(0);
@@ -225,5 +223,87 @@ impl Dflash2CandidateSelector {
         gpu.copy_h2d(&dev_bytes, draft_tokens_dev)?;
 
         Ok(())
+    }
+}
+
+/// Top-k of a unary logit row under the selector's total order: value
+/// descending, index ascending (the lower vocab index wins ties) —
+/// identical to the on-device kernel's insert/merge order.
+fn topk_unary(logits: &[f32], top_k: usize) -> Vec<(f32, usize)> {
+    let mut top: Vec<(f32, usize)> = Vec::with_capacity(top_k + 1);
+    for (idx, &val) in logits.iter().enumerate() {
+        if top.len() == top_k {
+            let last = top[top_k - 1];
+            let better = val > last.0 || (val == last.0 && idx < last.1);
+            if !better {
+                continue;
+            }
+        }
+        top.push((val, idx));
+        top.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        top.truncate(top_k);
+    }
+    top
+}
+
+/// Score each candidate as `unary + context·succ[cand]` and pick the max by
+/// strict `>` in list order — a score tie resolves to the earlier
+/// (higher-unary) candidate, matching the kernel's tid-0 pick.
+fn pick_best(top_candidates: &[(f32, usize)], dot: &mut dyn FnMut(usize) -> f32) -> (usize, f32) {
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_token = top_candidates.first().map(|c| c.1).unwrap_or(0);
+    for &(unary, cand_id) in top_candidates {
+        let total = unary + dot(cand_id);
+        if total > best_score {
+            best_score = total;
+            best_token = cand_id;
+        }
+    }
+    (best_token, best_score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exact ties in the unary row must order (value desc, index asc) — the
+    /// kernel's total order and the engine's first-index-wins contract.
+    #[test]
+    fn topk_orders_value_desc_then_index_asc() {
+        let logits = [0.5f32, 1.0, -2.0, 1.0, 1.0, 0.25];
+        let top = topk_unary(&logits, 3);
+        assert_eq!(top, vec![(1.0, 1), (1.0, 3), (1.0, 4)]);
+    }
+
+    /// Fewer logits than k: everything is a candidate, still ordered.
+    #[test]
+    fn topk_shorter_than_k() {
+        let logits = [-1.0f32, 3.0, 0.0];
+        let top = topk_unary(&logits, 16);
+        assert_eq!(top, vec![(3.0, 1), (0.0, 2), (-1.0, 0)]);
+    }
+
+    /// With a zero context every candidate's score is its unary value, so
+    /// the pick must be the lowest-index max — not whichever tied entry the
+    /// scan happened to see last.
+    #[test]
+    fn pick_best_under_zero_context_is_lowest_index_max() {
+        let logits = [0.5f32, 2.0, -1.0, 2.0, 2.0, 0.1];
+        let top = topk_unary(&logits, 4);
+        let (best, _) = pick_best(&top, &mut |_| 0.0);
+        assert_eq!(best, 1);
+    }
+
+    /// A context that flips the ranking must beat the unary leader.
+    #[test]
+    fn pick_best_context_can_overtake_unary() {
+        let top = vec![(2.0f32, 7usize), (1.9f32, 3usize)];
+        let (best, score) = pick_best(&top, &mut |c| if c == 3 { 0.5 } else { 0.0 });
+        assert_eq!(best, 3);
+        assert!((score - 2.4).abs() < 1e-6);
     }
 }
