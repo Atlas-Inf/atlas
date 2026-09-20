@@ -49,6 +49,7 @@ $env:ATLAS_MTP_ACCEPT_DEBUG = "1"
 $Serial = ($env:SERIAL -eq "1")
 $Util = if ($env:ATLAS_UTIL) { $env:ATLAS_UTIL } elseif ($Serial) { "0.86" } else { "0.90" }  # see header: serial pre-KV is ~4 GB lower
 $SeqLen = if ($env:SEQ_LEN) { $env:SEQ_LEN } else { "8192" }
+$PrefillTokens = if ($env:PREFILL_TOKENS) { $env:PREFILL_TOKENS } else { "2048" }
 
 $Fingerprint = "C:\Users\azeez\code\qwen38-port-logs\windows\flash-next\serve-fnext-$Tag-fingerprint.txt"
 @(
@@ -76,7 +77,7 @@ $Args = @(
     "--no-tui",
     "--model-name", "nvidia/Qwen3.8-Flash-Next-NVFP4",
     "--host", "127.0.0.1", "--port", $Port,
-    "--max-seq-len", $SeqLen, "--max-prefill-tokens", "2048",
+    "--max-seq-len", $SeqLen, "--max-prefill-tokens", $PrefillTokens,
     "--max-batch-size", "1", "--max-num-seqs", "1",
     "--gpu-memory-utilization", $Util,
     "--kv-cache-dtype", "bf16",
