@@ -297,6 +297,11 @@ extern "C" __global__ void __launch_bounds__(PM4_THREADS, 2) moe_fp8_grouped_gem
 
         const unsigned int cta_m_local = mt * PM4_M_TILE;
         const unsigned int cta_n = nt * PM4_N_TILE;
+        // Idle-warp skip (same fix as moe_w4a16_grouped_gemm.cu, 2026-09-20
+        // winbox profile): warps whose 16-row M slab lies beyond M_expert skip
+        // the MMA only; loads/stores/__syncthreads stay unconditional and the
+        // epilogue bounds-check already discards their rows.
+        const bool warp_active = (cta_m_local + warp_m_offset) < M_expert;
 
         // Two-level FP32 accumulation: inner over a 128-K block, fold
         // inner*block_scale into outer at the boundary; scale never per-element.
@@ -339,7 +344,8 @@ extern "C" __global__ void __launch_bounds__(PM4_THREADS, 2) moe_fp8_grouped_gem
                 load_B_regs(B_exp, reg_B, cta_n, k_next, N, K);
             }
             // (b) compute the already-resident current tile
-            mma_kstep(smem_A[cur], smem_B[cur], inner_acc, warp_m_offset, n_sub_base, lane_id);
+            if (warp_active)
+                mma_kstep(smem_A[cur], smem_B[cur], inner_acc, warp_m_offset, n_sub_base, lane_id);
 
             // (c) K_BLOCK boundary: fold scaled inner into outer, reset inner.
             k_step_in_block++;
