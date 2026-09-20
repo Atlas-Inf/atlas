@@ -392,9 +392,14 @@ fn chk(status: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
+static CUBLASLT_LIVE_LOGGED: std::sync::Once = std::sync::Once::new();
+
 /// Row-major `out[M,N] = act[M,K] @ weight[N,K]ᵀ`, all BF16 — the standard
 /// projection GEMM (activation × transposed weight). Maps to cuBLASLt's
 /// column-major convention as `D[N,M] = opT(weightᶜ[K,N]) · opN(actᶜ[K,M])`.
+/// Any failure of the cuBLASLt path (stub shim, missing hipBLASLt, or a
+/// rejected shape) routes to the installed Atlas fallback; with none
+/// installed the error propagates.
 pub fn bf16_gemm_act_weight_t(
     act: u64,
     weight: u64,
@@ -404,8 +409,16 @@ pub fn bf16_gemm_act_weight_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let ctx = match ctx() {
-        Ok(c) => c,
+    match bf16_gemm_act_weight_t_cublas(act, weight, out, m, n, k, stream) {
+        Ok(()) => {
+            CUBLASLT_LIVE_LOGGED.call_once(|| {
+                tracing::info!(
+                    "cuBLASLt BF16 GEMM live (first matmul status 0 — real library \
+                     answered; on HIP targets this is the hipBLASLt shim)"
+                );
+            });
+            Ok(())
+        }
         Err(e) => {
             if let Some(fallback) = BF16_FALLBACK.get() {
                 FALLBACK_LOGGED.call_once(|| {
@@ -416,9 +429,21 @@ pub fn bf16_gemm_act_weight_t(
                 });
                 return fallback(act, weight, out, m, n, k, stream);
             }
-            return Err(e);
+            Err(e)
         }
-    };
+    }
+}
+
+fn bf16_gemm_act_weight_t_cublas(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let ctx = ctx()?;
     unsafe {
         let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
         chk(
