@@ -276,6 +276,8 @@ moe_w4a16_fused_gate_up_t_k64_e8m0 = "Same E8M0 family — NVFP4 target uses the
 moe_w4a16_fused_gate_up_t_k64_m128 = """
 M=128 Block-D variant shipped only in minimax-m2-229b's shadow (per the
 dispatch comment in moe/init.rs). Dispatch falls through to M=64."""
+moe_w4a16_fused_gate_up_t_k64_fp4 = "Fused FP4 gate/up under ATLAS_HOLO_MOE_GATEUP_FP4 (init.rs:179); env off, handle!=0 checked before firing."
+moe_w4a16_down_t_k64_fp4 = "FP4 down-proj twin of the same env-gated arm (init.rs:453); off."
 
 # ⚠ HONESTY NOTE on the four gated_delta_rule f16 arms: unlike every
 # entry above, the FP16-h-state decode arms dispatch these handles
@@ -316,6 +318,173 @@ gdn_verify_fused_conv_kn_f32 = """
 FP32 fused verify conv for the exact-verify chain (#435), shipped only
 in qwen3.6-27b/nvfp4. Probed handle != 0; absent, the exact chain keeps
 its per-token conv launches (same bits, more launches)."""
+
+# ── expected_absent: the 62 boot-4 audit list ──────────────────────────────
+# Harvested 2026-09-19 from the winbox boot-4 kernel-load audit
+# (serve-fnext-boot4.err, spark.exe @ 622cd45d5, ROCm 10.0.0, gfx1151): 119
+# modules embedded, 62 probes unresolved. Every site was re-read — all 62 are
+# `try_kernel`/`handle != 0`-gated optional arms (moe/init.rs, qwen3_ssm/
+# init.rs, qwen3_attention/init.rs, token_overlay.rs); NONE is a hard
+# `gpu.kernel()` 0-launch. Where the same module::function is declared in
+# strix-hip/qwen3.8-27b/MODEL.toml its reason text is reused verbatim.
+
+# ── alternative-quant / unselected arms ────────────────────────────────────
+[expected_absent.dense_gemv_fp8w]
+dense_gemv_fp8w = "M=1 FP8-weight GEMV alternate; GDN FP8 projections resolve through gemv_fp8w (compiled) — this dense_ variant is a redundant probe, handle!=0 gated."
+
+[expected_absent.dequant_gguf_bf16]
+dequant_q2_0_gn_to_bf16 = "GGUF Q2_0 group dequant (qwen3_ssm/init.rs:52); fires only when packed-Q2 weights are installed. NVFP4 checkpoint — dtype-gated dead handle."
+
+[expected_absent.q2_0_gemv_vec]
+q2_0_gemv_vec = "Q2_0 GGUF decode GEMV (qwen3_ssm/init.rs:51); q2_weights is None on this checkpoint — dtype-gated dead handle."
+
+[expected_absent.fp8_gemm_t_blockscaled]
+fp8_gemm_t_blockscaled = "Block-scaled FP8 prefill GEMM alternate (moe/init.rs:225); handle!=0 gate, resolved gemm path serves the FP8-weight shapes."
+
+[expected_absent.w8a16_gemm_pipelined]
+w8a16_gemm_pipelined = "Pipelined W8A16 GEMM alternate probed at moe/init.rs:256; dtype-gated, resolved w8a16_gemm/w4a16 arms cover the shapes it would take."
+
+[expected_absent.w8a16_gemm_t]
+w8a16_gemm_t_pipelined = "Pipelined transposed W8A16 GEMM alternate (attn init.rs:182); dtype-gated; resolved w8a16_gemm_t serves."
+
+[expected_absent.gemm]
+dense_gemm_bf16_router = "Router-logits BF16 GEMM alternate (moe/init.rs:83, try_kernel); the resolved dense_gemm_bf16 arm serves the router shape."
+
+# ── MoE: alternative routing / expert-GEMM arms ────────────────────────────
+# All try_kernel-gated probes in moe/init.rs. The serving router resolves
+# moe_topk_sig + moe_topk; experts resolve the ptrtable grouped GEMMs.
+[expected_absent.moe_decode_atomic_c4]
+moe_decode_atomic_c4_silu_down_accum = "Atomic-counter decode MoE arm (init.rs:122); handle!=0 gate — resolved moe_expert_gemv/sorted arms serve decode."
+moe_decode_atomic_c4_finalize = "Finalize twin of the same arm (init.rs:127); same gate, same fallback."
+
+[expected_absent.moe_hash_route]
+moe_hash_route = "DeepSeek-V4 hash-routing arm (init.rs:339); this model is softmax-routed — tid2eid_dev is None, dead probe."
+moe_hash_route_batched = "Batched twin (init.rs:340); same."
+
+[expected_absent.moe_bf16_grouped_gemm]
+moe_bf16_grouped_gemm = "BF16 grouped-GEMM expert arm (init.rs:230); handle!=0 gate — NVFP4 ptrtable grouped GEMM resolves and serves."
+
+[expected_absent.moe_shared_expert_fused_bf16]
+moe_expert_gate_up_shared_bf16 = "Shared-expert fused BF16 gate/up (init.rs:235); this checkpoint has no BF16 shared-expert path — config-gated dead handle."
+moe_expert_silu_down_shared_bf16 = "Shared-expert fused BF16 silu/down twin (init.rs:240); same gate."
+
+[expected_absent.moe_shared_expert_fused_bf16_batch2]
+moe_expert_gate_up_shared_bf16_batch2 = "Batch-2 twin of the shared-expert arm (init.rs:245); same config gate."
+moe_expert_silu_down_shared_bf16_batch2 = "Batch-2 silu/down twin (init.rs:250); same."
+
+[expected_absent.moe_topk_softmax_bias]
+moe_topk_softmax_bias = "Bias-add router arm for zero-expert models (init.rs:321); zero_expert_num=0 on this checkpoint — resolved moe_topk_sig serves."
+moe_topk_softmax_bias_batched = "Batched twin (init.rs:326); same."
+moe_zero_expert_add = "Zero-expert score patch (init.rs:331); dead with zero_expert_num=0."
+
+[expected_absent.moe_topk_sqrt]
+moe_topk_sqrtsoftplus = "DeepSeek sqrt-softplus router arm (init.rs:307); lazy try_kernel — this model uses sigmoid routing."
+moe_topk_sqrtsoftplus_batched = "Batched twin (init.rs:312); same."
+
+[expected_absent.moe_w8a8_grouped_gemm]
+moe_w8a8_grouped_gemm = "W8A8 grouped-GEMM expert arm (init.rs:200); dtype-gated — NVFP4 ptrtable arm resolves."
+moe_w8a8_grouped_gemm_pm4 = "PM4-geometry twin (init.rs:207); same gate."
+
+# ── GDN/SSM: alternative recurrence + h-state arms ─────────────────────────
+# The serving spine is gated_delta_rule_fla::chunk_delta_h_vfused (logged
+# 'GDN state spine:' at boot, resolved). Decode verify uses wy2/wy3/wy4
+# (all resolve). Everything below is a variant arm gated on handle!=0.
+[expected_absent.gated_delta_rule_fla]
+gated_delta_rule_chunk_delta_h_ksplit = "Pre-vfused state spine; vfused resolves and is default (init.rs:237-256 logs the pick)."
+gated_delta_rule_chunk_delta_h_tc_vblock = "Tensor-core vblock twin; unselected."
+gated_delta_rule_chunk_delta_h_tma = "TMA-descriptor variant (sm90+); not applicable to gfx1151."
+
+[expected_absent.gated_delta_rule_regresident]
+gated_delta_rule_prefill_regresident = "Register-resident prefill spine alternate; persistent/chunk paths resolve."
+
+[expected_absent.gated_delta_rule_wy2_resident]
+gated_delta_rule_wy2_resident = "gb10-only register-resident wy2 twin; init comment: 'non-gb10 targets simply resolve 0 and keep the base wy2' (resolved)."
+
+[expected_absent.gated_delta_rule_wy2_resident_f16]
+gated_delta_rule_wy2_resident_f16 = "FP16 h-state twin of the above; additionally needs ATLAS_SSM_H_FP16 (off — preflight would refuse --speculative without twins)."
+
+[expected_absent.gated_delta_rule_wy3_resident]
+gated_delta_rule_wy3_resident = "gb10-only register-resident wy3 twin; base wy3 resolves."
+
+[expected_absent.gated_delta_rule_wy3_resident_f16]
+gated_delta_rule_wy3_resident_f16 = "FP16 h-state twin; ATLAS_SSM_H_FP16 off."
+
+[expected_absent.gated_delta_rule_wy3_f16]
+gated_delta_rule_wy3_f16 = "FP16 h-state wy3; ATLAS_SSM_H_FP16 only (off)."
+
+[expected_absent.gated_delta_rule_wy4_f16]
+gated_delta_rule_wy4_f16 = "FP16 h-state wy4; same flag, off."
+
+[expected_absent.gated_delta_rule_wy_f16]
+gated_delta_rule_wy2_f16 = "FP16 h-state wy2; same flag, off."
+
+[expected_absent.ssm_h_dtype]
+ssm_h_state_f16_to_f32 = "FP16 h-state converter; only under ATLAS_SSM_H_FP16 (off; preflight refuses the flag without the wy_f16 twins anyway)."
+ssm_h_state_f32_to_f16 = "Same, reverse direction."
+
+# ── attention: TurboQuant KV prefill family + fused rope + Hadamard ────────
+# All require a turboKV KV-compression mode (env/config) that this recipe
+# does not enable; the resolved prefill_paged_nvfp4 / prefill_paged arms
+# serve attention prefill. wht_bf16 and tq_plus_innerq are the Hadamard /
+# inner-quant machinery of the same feature family.
+[expected_absent.prefill_paged_turbo2]
+inferspark_prefill_paged_turbo2 = "Turbo2 K/V prefill; turboKV modes off (bf16 KV cache in recipe). Resolved prefill_paged_nvfp4 serves."
+
+[expected_absent.prefill_paged_turbo3]
+inferspark_prefill_paged_turbo3_64 = "Same family, BR=64."
+
+[expected_absent.prefill_paged_turbo4]
+inferspark_prefill_paged_turbo4 = "Same family."
+inferspark_prefill_paged_turbo4_64 = "Same family, BR=64."
+
+[expected_absent.prefill_paged_turbo8]
+inferspark_prefill_paged_turbo8_64 = "Same family, 8-bit-V tile BR=64."
+
+[expected_absent.prefill_paged_bf16k_turbo2v]
+inferspark_prefill_paged_bf16k_turbo2v_64 = "BF16-K + Turbo2-V asym prefill; turboKV off."
+
+[expected_absent.prefill_paged_bf16k_turbo3v]
+inferspark_prefill_paged_bf16k_turbo3v_64 = "BF16-K + Turbo3-V; turboKV off."
+
+[expected_absent.prefill_paged_bf16k_turbo4v]
+inferspark_prefill_paged_bf16k_turbo4v_64 = "BF16-K + Turbo4-V; turboKV off."
+
+[expected_absent.prefill_paged_fp8k_turbo2v]
+inferspark_prefill_paged_fp8k_turbo2v_64 = "FP8-K + Turbo2-V; turboKV off."
+
+[expected_absent.prefill_paged_fp8k_turbo3v]
+inferspark_prefill_paged_fp8k_turbo3v_64 = "FP8-K + Turbo3-V; turboKV off."
+
+[expected_absent.prefill_paged_fp8k_turbo4v]
+inferspark_prefill_paged_fp8k_turbo4v_64 = "FP8-K + Turbo4-V; turboKV off."
+
+[expected_absent.prefill_paged_turbo3k_turbo8v]
+inferspark_prefill_paged_turbo3k_turbo8v_64 = "Both-sides Turbo3K+8V; turboKV off."
+
+[expected_absent.prefill_paged_turbo4k_turbo3v]
+inferspark_prefill_paged_turbo4k_turbo3v_64 = "Both-sides Turbo4K+3V; turboKV off."
+
+[expected_absent.prefill_paged_turbo4k_turbo8v]
+inferspark_prefill_paged_turbo4k_turbo8v_64 = "Both-sides Turbo4K+8V; turboKV off."
+
+[expected_absent.fused_k_norm_rope_cache]
+fused_k_norm_rope_cache_write_bf16 = "Fused K-norm+rope+cache-write; dispatch falls back to the separate norm/rope/reshape_and_cache kernels (all resolved)."
+fused_k_norm_rope_mrope_cache_write_bf16 = "MRoPE twin; same unfused fallback."
+
+[expected_absent.wht_bf16]
+wht_bf16_inplace = "Hadamard transform for TurboQuant+ K path; turboKV off — dead handle."
+wht_bf16_inplace_inv = "Inverse twin; same."
+
+[expected_absent.tq_plus_innerq_apply]
+tq_plus_innerq_apply_q = "TurboQuant+ inner-quant apply on Q; turboKV off."
+tq_plus_innerq_apply_k = "K-side twin; same."
+
+# ── misc optional features ─────────────────────────────────────────────────
+[expected_absent.token_overlay]
+embed_rowdiff_bf16 = "Routed-token overlay feature; every hook guards kernel.0==0 (token_overlay.rs:31) — feature unused on this dense model."
+embed_overlay_routed_bf16 = "Same feature."
+lmhead_overlay_routed_bf16 = "Same feature."
+lmhead_overlay_routed_f32 = "Same feature."
 
 [behavior]
 # Qwen3.8-Flash-Next is a THINKING model whose chat template gates
