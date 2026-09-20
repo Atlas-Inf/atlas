@@ -50,6 +50,7 @@ $Serial = ($env:SERIAL -eq "1")
 $Util = if ($env:ATLAS_UTIL) { $env:ATLAS_UTIL } elseif ($Serial) { "0.86" } else { "0.90" }  # see header: serial pre-KV is ~4 GB lower
 $SeqLen = if ($env:SEQ_LEN) { $env:SEQ_LEN } else { "8192" }
 $PrefillTokens = if ($env:PREFILL_TOKENS) { $env:PREFILL_TOKENS } else { "2048" }
+$SsmSlots = if ($env:SSM_SLOTS) { $env:SSM_SLOTS } else { "0" }
 
 $Fingerprint = "C:\Users\azeez\code\qwen38-port-logs\windows\flash-next\serve-fnext-$Tag-fingerprint.txt"
 @(
@@ -82,8 +83,9 @@ $Args = @(
     "--gpu-memory-utilization", $Util,
     "--kv-cache-dtype", "bf16",
     "--request-timeout", "0",
-    "--ssm-cache-slots", "0"
+    "--ssm-cache-slots", $SsmSlots
 )
+if ($env:PREFIX_CACHE -eq "1") { $Args += "--enable-prefix-caching" }
 if (-not $Serial) { $Args += @("--speculative", "--num-drafts", "1") }
 
 $proc = Start-Process -FilePath $Bin -ArgumentList $Args -RedirectStandardOutput $Log -RedirectStandardError "$Log.err" -PassThru -NoNewWindow
