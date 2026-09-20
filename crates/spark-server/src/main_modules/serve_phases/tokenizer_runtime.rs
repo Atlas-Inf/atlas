@@ -130,6 +130,34 @@ pub(crate) fn resolve_tokenizer_runtime(
         );
     }
 
+    // Punctuation-token mask (2026-09-20, Flash-Next MinHeap incident):
+    // `mask[id] == true` iff the token decodes to a NON-EMPTY string whose
+    // every char is ASCII punctuation or whitespace (`,` `, ` `]` `(` `\n`
+    // `.` …). The digit-normalized content-loop watchdog consults it to
+    // exempt "varying numbers separated only by punctuation" (a data list,
+    // not a loop) — see detect_content_token_loop_normalized_with. Built
+    // unconditionally like its siblings. Fail-open: decode error → false.
+    {
+        let vocab_size = tokenizer.inner().get_vocab_size(true);
+        let mut mask: Vec<bool> = vec![false; vocab_size];
+        let mut punct_count = 0usize;
+        for (id, slot) in mask.iter_mut().enumerate() {
+            if let Ok(s) = tokenizer.decode_with_special(&[id as u32])
+                && !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+            {
+                *slot = true;
+                punct_count += 1;
+            }
+        }
+        vocab_masks.punctuation = Some(std::sync::Arc::from(mask));
+        tracing::info!(
+            "Punctuation-token mask: {punct_count}/{vocab_size} ids classified \
+             as punctuation/whitespace (numeric-list loop exemption active)"
+        );
+    }
+
     // Phase-C boundary-token mask (drives rollback-to-boundary). `mask[id]`
     // is true iff the token decodes to text *ending* in a well-formed
     // generation boundary: a newline, or sentence-ending punctuation
