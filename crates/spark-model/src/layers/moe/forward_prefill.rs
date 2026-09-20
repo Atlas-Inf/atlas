@@ -84,6 +84,27 @@ impl MoeLayer {
             return self.forward_batched(input, num_tokens, ctx, stream);
         }
 
+        // NVFP4 experts on native HIP: the grouped path pays off only for
+        // long prefills — at small N every expert block still walks the full
+        // K loop for ≤1 real row (2026-09-20 GPU-timed winbox trace: grouped
+        // GEMMs = 1,754 of 2,754 ms GPU in a 44-token prefill, ~15 ms/call
+        // nearly flat in N). Below ATLAS_HIP_MOE_GROUPED_MIN_TOKENS route to
+        // the per-token batched path like the bf16/fp8 arms above. cfg gate:
+        // NVIDIA byte-unchanged.
+        if cfg!(atlas_hip) {
+            static HIP_NVFP4_GROUPED_MIN_TOKENS: std::sync::OnceLock<usize> =
+                std::sync::OnceLock::new();
+            let min = *HIP_NVFP4_GROUPED_MIN_TOKENS.get_or_init(|| {
+                std::env::var("ATLAS_HIP_MOE_GROUPED_MIN_TOKENS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(256) // measured-crossover placeholder
+            });
+            if num_tokens < min {
+                return self.forward_batched(input, num_tokens, ctx, stream);
+            }
+        }
+
         // Lazy down_proj transpose: synchronous on the compute stream.
         // (See `kick_off_lazy_transpose` for an attempted overlap path
         // that regressed by 30 % on GB10 — SM contention dominated the
