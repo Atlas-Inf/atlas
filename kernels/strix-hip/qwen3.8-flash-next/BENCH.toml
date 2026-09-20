@@ -1,0 +1,57 @@
+# Benchmarks for this model, and the thresholds its gate records must meet.
+#
+# Sibling of MODEL.toml so the numbers sit beside the thing they describe;
+# hardware and model are implied by the path and cannot disagree with the
+# contents. Read by `atlas_plugin::gate::bench`.
+#
+# Thresholds are per CHECKPOINT, not per model. This file scaffolds the
+# nvidia/Qwen3.8-Flash-Next-NVFP4 checkpoint on Windows Strix Halo gfx1151.
+#
+# This file is deliberately OUTSIDE the closure hash, so ratcheting a threshold
+# does not invalidate the record that justified the ratchet.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+gate = "bfcl-subset"
+label = "Qwen3.8-Flash-Next (NVFP4, nvidia) — Windows 11 Strix Halo gfx1151"
+default = true
+# First labelled observation, recorded without floors: the gate self-start
+# resolves `recipe` from atlas-recipes and no recipe can express this serve
+# (scripts/strix-windows/win_serve_flashnext_nvfp4.ps1 with its env pins), so
+# `measured` would fail the resolvable-recipe check — same demotion as the
+# strix-hip qwen3.8-27b entries. Restore "measured" with floors (samples
+# pinned 995, overall_accuracy min 81.81 noise 0.4,
+# normalized_single_turn_score min 82.00 noise 0.4) when a recipe exists.
+status = "unmeasured"
+note = """\
+FIRST RECORD 2026-09-20, winbox (Windows 11, gfx1151, TheRock ROCm 10.0.0, \
+VGM 32 GB), golden ST-995 draw (62/10/10, subset_floor 25, n=995, seed 42, \
+temp 0, NO param overrides): overall 82.21 / normalized 82.40, wall \
+41,689 s (~11.6 h), zero faults (no status 719 / hipErrorLaunchFailure / \
+context-is-destroyed in the serve log). Run record \
+C:\\Users\\azeez\\.atlas\\runs\\bfcl-subset\\run-1789918248980432100.json \
+(harvested to \
+qwen38-port-logs\\windows\\flash-next\\run-1789918248980432100.json). \
+FINGERPRINT: binary sha256 \
+4F1943CB4D7FE96604C73881A269B8711248FE203EC07CB598A2404286CF9174, worktree \
+ed8e0dd2c (HEAD d9eee900 + MODEL.toml dedup applied), recipe \
+win_serve_flashnext_nvfp4.ps1 boot-7g MTP arm: util 0.90, --max-seq-len \
+8192, prefill 2048, kv bf16, batch 1, drafts 1, ssm_slots 0, port 8095. \
+MTP ENGAGEMENT (998 Done: lines): mean_na avg 0.707 / median 0.80; \
+serial=1.00 latched on 119/998 requests (MTP declines above the QSA inert \
+bound — expected, not a fault). \
+PER-SUBSET: irrelevance 91.67, live_irrelevance 88.64, live_multiple 80.95, \
+live_parallel 56.25, live_parallel_multiple 62.50, live_simple 92.00, \
+multiple 84.68, parallel 77.42, parallel_multiple 82.26, simple_java 58.06, \
+simple_javascript 70.97, simple_python 90.73 (categories: hallucination \
+90.15 / live 77.65 / non_live 79.40). The Java/JS-vs-Python split of the \
+dense sibling persists. \
+CROSS-PLATFORM OBSERVATION ONLY (not an A/B — OS, driver, ROCm, recipe all \
+differ): the same checkpoint on GB10 scored 83.52 / 82.45 in two records \
+(see kernels/gb10/qwen3.8-flash-next/BENCH.toml); this Windows record is \
+1.31 overall / 0.05 normalized below it. \
+SCORER VERDICT: 'not an MLPerf submission checkpoint, so the floor does not \
+gate this run' (overall floor 83.64, normalized floor 85.32 are the \
+MLPerf-edge numbers derived for Qwen3.6-27B and do not transfer across \
+weights)."""
