@@ -92,6 +92,12 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
+    // still ran the full WMMA + smem-fragment work; their results were discarded
+    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
+    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
+    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A[M_TILE][K_STEP + PAD];
     __shared__ __nv_bfloat16 smem_B[K_STEP][N_TILE_SM + PAD];
@@ -147,15 +153,17 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable(
         }
         __syncthreads();
 
-        v16bf a;
-        #pragma unroll
-        for (int i = 0; i < 16; i++) a[i] = (__bf16)(float)smem_A[warp_m_offset + (lane_id & 15)][i];
-        #pragma unroll
-        for (int nb = 0; nb < 4; nb++) {
-            v16bf b;
+        if (warp_active) {
+            v16bf a;
             #pragma unroll
-            for (int k = 0; k < 16; k++) b[k] = (__bf16)(float)smem_B[k][nb * 16 + (lane_id & 15)];
-            acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]);
+            for (int i = 0; i < 16; i++) a[i] = (__bf16)(float)smem_A[warp_m_offset + (lane_id & 15)][i];
+            #pragma unroll
+            for (int nb = 0; nb < 4; nb++) {
+                v16bf b;
+                #pragma unroll
+                for (int k = 0; k < 16; k++) b[k] = (__bf16)(float)smem_B[k][nb * 16 + (lane_id & 15)];
+                acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]);
+            }
         }
         __syncthreads();
     }
@@ -205,6 +213,12 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
+    // still ran the full WMMA + smem-fragment work; their results were discarded
+    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
+    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
+    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_T + PAD_T];
     __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
@@ -305,13 +319,13 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t(
     for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
         int nxt = 1 - cur;
         MOE_ISSUE_LOADS(nxt, k_base);
-        MOE_COMPUTE_MMA(cur);
+        if (warp_active) MOE_COMPUTE_MMA(cur);
         __syncthreads();
         MOE_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    MOE_COMPUTE_MMA(cur);
+    if (warp_active) MOE_COMPUTE_MMA(cur);
 
     #undef MOE_ISSUE_LOADS
     #undef MOE_DEQUANT
@@ -362,6 +376,12 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
+    // still ran the full WMMA + smem-fragment work; their results were discarded
+    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
+    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
+    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A_k64[2][M_TILE][K_STEP_T64 + PAD_T64];
     __shared__ unsigned char smem_Bp_k64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
@@ -480,13 +500,13 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     for (unsigned int k_base = K_STEP_T64; k_base < K; k_base += K_STEP_T64) {
         int nxt = 1 - cur;
         K64_ISSUE_LOADS(nxt, k_base);
-        K64_COMPUTE_MMA(cur);
+        if (warp_active) K64_COMPUTE_MMA(cur);
         __syncthreads();
         K64_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    K64_COMPUTE_MMA(cur);
+    if (warp_active) K64_COMPUTE_MMA(cur);
 
     #undef K64_ISSUE_LOADS
     #undef K64_DEQUANT
@@ -556,6 +576,12 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
+    // still ran the full WMMA + smem-fragment work; their results were discarded
+    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
+    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
+    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A_fgu64[2][M_TILE][K_STEP_T64 + PAD_T64];
     __shared__ unsigned char smem_Bp_fgu64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
@@ -674,13 +700,13 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     for (unsigned int k_base = K_STEP_T64; k_base < K; k_base += K_STEP_T64) {
         int nxt = 1 - cur;
         FGU64_ISSUE_LOADS(nxt, k_base);
-        FGU64_COMPUTE_MMA(cur);
+        if (warp_active) FGU64_COMPUTE_MMA(cur);
         __syncthreads();
         FGU64_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    FGU64_COMPUTE_MMA(cur);
+    if (warp_active) FGU64_COMPUTE_MMA(cur);
 
     #undef FGU64_ISSUE_LOADS
     #undef FGU64_DEQUANT
@@ -750,6 +776,12 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
+    // still ran the full WMMA + smem-fragment work; their results were discarded
+    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
+    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
+    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_T + PAD_T];
     __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
@@ -850,13 +882,13 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t(
     for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
         int nxt = 1 - cur;
         FGU_ISSUE_LOADS(nxt, k_base);
-        FGU_COMPUTE_MMA(cur);
+        if (warp_active) FGU_COMPUTE_MMA(cur);
         __syncthreads();
         FGU_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    FGU_COMPUTE_MMA(cur);
+    if (warp_active) FGU_COMPUTE_MMA(cur);
 
     #undef FGU_ISSUE_LOADS
     #undef FGU_DEQUANT
@@ -908,6 +940,12 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
+    // still ran the full WMMA + smem-fragment work; their results were discarded
+    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
+    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
+    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ unsigned char smem_Af2[2][M_TILE][K_STEP_T];
     __shared__ unsigned char smem_Bp2[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
@@ -1006,13 +1044,13 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
     for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
         int nxt = 1 - cur;
         MOE_FF_LOADS(nxt, k_base);
-        MOE_FF_COMPUTE(cur);
+        if (warp_active) MOE_FF_COMPUTE(cur);
         __syncthreads();
         MOE_FF_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    MOE_FF_COMPUTE(cur);
+    if (warp_active) MOE_FF_COMPUTE(cur);
 
     #undef MOE_FF_LOADS
     #undef MOE_FF_DEQUANT
