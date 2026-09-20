@@ -176,13 +176,25 @@ boot 9 re-verified the same numbers without it.
 | arm | tok/s (n=3) | tok_step | mean_na | p1 | TTFT |
 |---|---|---|---|---|---|
 | **MTP K=2 (boot 7g)** | **17.0 / 16.7 / 17.3** | 1.95 | 0.95–0.97 | 0.95–0.97 | 3.16–3.21 s |
-| serial (boot 8b) | 6.7 / 6.3 / 6.4 | 1.000 | 0 | 0 | 2.93–2.98 s |
+| serial (boot 8b), as reported | 6.7 / 6.3 / 6.4 | 1.000 | 0 | 0 | 2.93–2.98 s |
+| serial (boot 8b), rework-corrected (see below) | ≈ 8.3 / 7.8 / 7.8 (derived) | 1.000 | 0 | 0 | — |
 | MTP, thinking ON (1 shot, serial-floor regime) | 11.3 | 1.93 (post-think only) | 0.93 | — | 3.15 s |
 
-HTTP wall 40–42 s vs 98–104 s for the same 641-token response — **~2.6×
-decode from MTP at K=2** (vs +25% on GB10; the serial floor is
-bandwidth-bound at ~6.5 tok/s and the extra verify row is nearly free on the
-M=2 GEMV tiers). Boot 9 (no dangerous flag, rebuilt audit metadata):
+HTTP wall 40–42 s vs 98–104 s for the same 641-token response. **Supersede
+note (2026-09-20, after reading the UTF-16 serve logs):** the two arms are
+NOT a clean one-variable A/B on this prompt. The content-loop watchdog fired
+on the numeric test-data list on both arms, but the serial path rolled back
+70 tokens and regenerated them twice before ending (`rolled back to boundary
+… rollback=1`, `rollback=2`, `ending response early`; 8.7 s between fires ≈
+70 tokens at ~8 tok/s) while the MTP/emit path has no rollback and ended at
+the first fire. The serial `Done:` tok/s therefore counts 641 tokens over the
+wall of ~781 generated. Derived correction: 641 ÷ (641/6.7 − 18.2 s) ≈ 8.3,
+and ≈ 7.8 / 7.8 for the other two — consistent with the watchdog-free serial
+observations of boot 6 (7.8–8.0 tok/s on a 368-token MinHeap answer). The
+honest headline is **MTP K=2 ≈ 2.1× serial** (17.0 vs ~8), not 2.6×; GB10
+sees +25% on the same model — the serial floor here is bandwidth-bound and the
+second verify row is nearly free on the M=2 GEMV tiers. The A/B will be
+re-run on a watchdog-fixed build with a prompt that does not trip it. Boot 9 (no dangerous flag, rebuilt audit metadata):
 `Done: 641 tokens (length) 16.7 tok/s, TTFT=3281.5ms, mtp=1.00
 mean_na=0.954 tok_step=1.954` — in band.
 
@@ -197,16 +209,20 @@ same spec-vs-serial divergence class the 27B port recorded
 
 Oddity to chase: `Done: 641 tokens (length)` although `max_tokens 1024` —
 the client saw 641 completion tokens, cut mid-list at `values = [8, 3, 1, 6,
-4, 2, 7,` on both arms. **Hypothesis (not yet verified):** the content-loop
-watchdog (`enable_loop_watchdog = true` in this target's MODEL.toml) — its
+4, 2, 7,` on both arms. **Confirmed from the serve logs** (boot 8b, serial;
+the logs are UTF-16 — `iconv -f UTF-16LE`): `Content-loop watchdog fired
+(period-2…64 repeat); rolled back to boundary, re-steering content_tokens=570
+dropped=70 rollback=1` → `rollback=2` → `ending response early (rollback
+declined)`, three times per request, identically on all three runs. The
 digit-normalising detector (`detect_content_token_loop_normalized_with`,
-`scheduler/helpers.rs`) collapses every number to one sentinel, so `[N, N, N,
-N,` reads as a period-2 loop; it checks every `CONTENT_LOOP_CHECK_STRIDE = 16`
-content tokens and a guard stop reports as `"length"`
-(`GUARD_STOP_CONTENT_LOOP`), and 641 = 640 + 1. If so it is engine
-behaviour, reproducible on GB10 with the same request, and not a port
-defect; the discriminator is the same request with `RUST_LOG=debug` or
-`ATLAS_DISABLE_WATCHDOGS` (whichever lever `sched.levers` exposes).
+`scheduler/helpers.rs`) collapses every number to one sentinel, so a plain
+list of distinct numbers `[8, 3, 1, 6, 4, 2, 7,` reads as a period-2
+`N ,` loop with ≥4 repeats. Engine behaviour, not a port defect — it fires
+on GB10 for the same request — and it also means the `Done:` tok/s of these
+requests include two 70-token rollbacks each (both arms equally). Fix
+tracked separately: require the anchored pattern to contain at least one
+token that is neither numeric nor pure punctuation (a real `1, 1, 1, …`
+runaway is still caught by the exact detector).
 
 ## Known gaps / next levers
 
@@ -229,11 +245,13 @@ defect; the discriminator is the same request with `RUST_LOG=debug` or
 
 ## Claims status (measurement-discipline language)
 
-- **Cross-validated (measured, n=3, fingerprinted, one-variable A/B):**
-  MTP K=2 decode ≈ 2.6× serial on the MinHeap harness (17.0/16.7/17.3 vs
-  6.7/6.3/6.4 tok/s, server-attested `Done:` lines with mean_na/tok_step).
-  Re-confirmed single-shot on a second binary (boot 9, audit-metadata build,
-  no dangerous flag).
+- **Measured, n=3, fingerprinted:** MTP K=2 decode 17.0/16.7/17.3 tok/s
+  on the MinHeap harness (server-attested `Done:` lines with
+  mean_na/tok_step), re-confirmed single-shot on a second binary (boot 9,
+  audit-metadata build, no dangerous flag). The serial control's reported
+  6.7/6.3/6.4 includes two watchdog rollbacks per request (see the supersede
+  note); the rework-corrected ≈ 8 tok/s is DERIVED, so the ≈ 2.1× speedup is
+  "observed under fingerprint F", pending a clean re-run.
 - **Observed, single fingerprint:** thinking-on MTP run (11.3 tok/s,
   serial-floor regime, n=1); boot-6 serial smoke values (PRELIMINARY,
   single-shot per prompt class).
