@@ -97,6 +97,13 @@ pub(super) struct StreamState {
     /// F4: pending bytes accumulated until a sentence-boundary or
     /// 1KB force-flush triggers a `simhash_guard.check()`.
     pub(super) simhash_pending: String,
+    /// F4 fence-awareness: true while `simhash_pending` sits inside an
+    /// unclosed triple-backtick fence — sentence splitting is suspended
+    /// and the block is hashed once at its closing fence.
+    pub(super) simhash_in_fence: bool,
+    /// Byte offset into `simhash_pending` up to which fence markers
+    /// have already been counted by `simhash_step`.
+    pub(super) simhash_fence_scan: usize,
     /// F5: cross-flush tool-arg dedup (default thresholds).
     pub(super) tool_arg_dedup: crate::tool_arg_dedup::ToolArgDedup,
     /// F11: tighter within-response tool-arg dedup for the
@@ -221,6 +228,8 @@ impl StreamState {
             salvaged_tool_call: false,
             simhash_guard: crate::loop_simhash::SimHashLoopGuard::new(),
             simhash_pending: String::new(),
+            simhash_in_fence: false,
+            simhash_fence_scan: 0,
             tool_arg_dedup: crate::tool_arg_dedup::ToolArgDedup::new(),
             tool_arg_dedup_within: crate::tool_arg_dedup::ToolArgDedup::with_params(4, 2, 3),
             streaming_tool_args: HashMap::new(),

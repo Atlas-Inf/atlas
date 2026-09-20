@@ -198,3 +198,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 #[path = "main_exit_tests.rs"]
 mod main_exit_tests;
+
+#[cfg(test)]
+#[path = "loop_simhash_tests.rs"]
+mod loop_simhash_tests;
