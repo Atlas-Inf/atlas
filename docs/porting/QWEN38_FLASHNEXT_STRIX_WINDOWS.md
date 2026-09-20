@@ -388,7 +388,7 @@ padding. The warp-skip is kept anyway: dead-work removal, bit-identical.
 ### Fix 1: short-prefill MoE routing threshold (`0a512fdc8`)
 
 For `cfg!(atlas_hip)` only, NVFP4 MoE prefills below
-`ATLAS_HIP_MOE_GROUPED_MIN_TOKENS` (default 256) route to the per-token
+`ATLAS_HIP_MOE_GROUPED_MIN_TOKENS` (default 1024, measured crossover below) route to the per-token
 `forward_batched` path like the bf16/fp8 arms — at N<256 the grouped
 kernel pays ~15 ms/layer for ≤1 real row per expert block. NVIDIA path
 byte-unchanged. Serial arm, hipBLASLt live, default GDN, temp 0
@@ -401,12 +401,41 @@ byte-unchanged. Serial arm, hipBLASLt live, default GDN, temp 0
 | 1150 (big) | **14522 / 14171** | 15457 / 15731 | 15635 / 15634 |
 
 Batched routing cuts 20–44-token TTFT by ~66–71%; at 1,150 tokens the
-grouped path wins by ~9% — crossover is between 44 and 1,150, so the
-256 default is in-range (not yet pinned by measurement). Output parity:
+grouped path wins by ~9% — crossover is between 44 and 1,150. Output parity:
 grouped-vs-batched content for the same prompt diverges at char ~102–135
 (docstring formatting — the known grouped/batched accumulation-order
 class); thr=256 vs thr=0 content is byte-identical at 1,150 tokens (both
 grouped — confirms the routing actually engaged).
+
+Crossover pinned (`a387b38d`, same setup, boots C0/C4096 — prompt_tokens
+from `usage`, n=2):
+
+| prompt tokens | grouped (thr=0) | batched (thr=4096) |
+|---|---|---|
+| 266 | 7174 / 6880 ms | **4401 / 3991** |
+| 708 | 10781 / 10869 | **9741 / 9849** |
+
+Batched still leads at 708 (−10%) and loses at 1,150 (−9%) → crossover
+~900 tokens; default set to **1024** (nearest power of two).
+
+### Fix 3: `hc_pre_down` LDS staging (`3bf401256`) — bit-exact, ~neutral
+
+`hyper_connection.cu` under strix-hip is now a real file (was a gb10
+symlink): `hc_pre_down` stages `normed[t]` (40 KB FP32) into static LDS
+once per block instead of letting all 320 rank rows re-read it from
+L2/DRAM; per-lane FMA order and the shfl reduction are unchanged, and a
+`hc_dim > 10240` runtime guard falls back to the global-read loop.
+Measured (sync trace, serial, binary from `3bf401256`): decode
+`hc_pre_down` 150 → **147.1 µs** (sum 14.6 → 14.3 ms/step), Σgpu/step
+89.1 → 86.5 ms — **within noise; the re-reads were already being served
+by L2**, so the staging bought ~2% at best. Untraced: serial 8.4/8.4/8.5
+tok/s (was 8.2–8.5), MTP 17.6/17.7/17.7 mean_na 0.95 (was 17.3–17.4) —
+decode unchanged. Parity gate: serial MinHeap output is byte-identical
+to the pre-change batched-path output (bootB256, 1061 chars); it differs
+from boot12 (grouped prefill) only at char 135, the known
+grouped-vs-batched divergence — attributable to the routing threshold,
+not this kernel. Kept: removes ~13 MB/launch of redundant traffic at
+zero numeric cost.
 
 ### Fix 2 attempt: GDN requantization A/B — cannot boot (inconclusive)
 
@@ -458,7 +487,7 @@ active proposer. Repo restored to `da943853`.
   ~3 TFLOPS pipelined WMMA), which this workload doesn't exercise.
 - **TTFT is GPU-bound in the grouped MoE GEMMs** (Σgpu 1,754 of 2,754 ms
   at N=44): FIXED for short prefills by the HIP-only routing threshold
-  (`0a512fdc8`, `ATLAS_HIP_MOE_GROUPED_MIN_TOKENS`, default 256) — −66–71%
+  (`0a512fdc8`, `ATLAS_HIP_MOE_GROUPED_MIN_TOKENS`, default 1024 measured) — −66–71%
   TTFT at 20–44 tokens, crossover vs grouped between 44 and 1,150 tokens.
   The remaining lever at mid-length prompts is the grouped kernel's
   ~15 ms/call K-loop floor itself. Graph replay caps at ≈30% on decode
