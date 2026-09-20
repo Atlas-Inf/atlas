@@ -175,6 +175,14 @@ pub fn batched_embed_fp8(
         .launch(stream)
 }
 
+/// Mirrors of the compile-time caps in
+/// `kernels/{gb10,strix-hip}/common/dflash2_candidate_selector.cu`
+/// (`DF2_SEL_MAX_TOP_K` / `DF2_SEL_MAX_RANK`). `Dflash2CandidateSelector::new`
+/// fails fast when a checkpoint's `selector_top_k`/`selector_rank` exceeds
+/// them — pinned to the kernel defines by `tests/dflash2_selector_bounds.rs`.
+pub const DFLASH2_SELECTOR_MAX_TOP_K: usize = 16;
+pub const DFLASH2_SELECTOR_MAX_RANK: usize = 256;
+
 /// DFlash2 on-device bilinear candidate selector.
 pub fn dflash2_candidate_selector(
     gpu: &dyn GpuBackend,
@@ -188,6 +196,7 @@ pub fn dflash2_candidate_selector(
     gamma: u32,
     vocab_size: u32,
     rank: u32,
+    top_k: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -202,6 +211,7 @@ pub fn dflash2_candidate_selector(
         .arg_u32(gamma)
         .arg_u32(vocab_size)
         .arg_u32(rank)
+        .arg_u32(top_k)
         .launch(stream)
 }
 
