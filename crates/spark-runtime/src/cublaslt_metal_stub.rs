@@ -11,6 +11,20 @@
 
 use anyhow::Result;
 
+/// Mirrors `cublaslt::Bf16GemmFallback` for API parity; unused on metal.
+pub type Bf16GemmFallback = dyn Fn(u64, u64, u64, u32, u32, u32, u64) -> Result<()> + Send + Sync;
+
+pub fn install_bf16_fallback(_f: Box<Bf16GemmFallback>) -> bool {
+    unreachable!("cublaslt::install_bf16_fallback is cuda-only (not built for metal)")
+}
+
+pub fn make_bf16_fallback(
+    _pipelined: crate::gpu::KernelHandle,
+    _scalar: crate::gpu::KernelHandle,
+) -> Box<Bf16GemmFallback> {
+    unreachable!("cublaslt::make_bf16_fallback is cuda-only (not built for metal)")
+}
+
 pub fn bf16_gemm_act_weight_t(
     _act: u64,
     _weight: u64,
