@@ -299,16 +299,78 @@ Conclusions (observed under this fingerprint, n=3):
   at char 2511 and 11v16 at char ~2499–2508 inside the test-data list
   (spec-vs-serial divergence class, same as boots 7g/8b).
 
-### Prefill attribution (boot 10 profile, `ATLAS_PROFILE_PREFILL=1`)
+### Prefill attribution — superseded by GPU-timed trace (see below)
 
-44-token prompt: `prefill fwd-exec (chunk 0..44): submit=2.9355628s
-gpu_exec=74.4847ms` — the ~2.9 s is **submit/launch-side, not GPU
-execution**. PLE gather resolve is 122 µs; drafter prefill trivial.
-Per-phase totals across the layer loop (µs, N=20-token chunk):
-`grouped_gate_up` **1,383,150** (48 MoE layers, ~28.8 ms/layer) +
-`grouped_silu_down` 268,516 = **79% of TTFT**; then shared_expert 46,951,
-o_proj 40,386, out_proj 28,573, qkvz_gemm 27,652, q_proj 27,589,
-gdn_prefill 22,893, gate_gemm 21,709, k/v_proj ~17.8k each.
+The boot-10 `ATLAS_PROFILE_PREFILL` span numbers (`submit=2.94 s,
+gpu_exec=74.5 ms`) are real host-side timings, but `gpu_exec` does **not**
+measure device execution — it is ~36× smaller than the HIP-event truth
+below. The phase split (`grouped_gate_up` 1,383 ms + `grouped_silu_down`
+269 ms ≈ 79% of TTFT at N=20) is directionally right: those spans are
+GPU-paced, not submit-paced.
+
+### GPU-timed launch trace (`0b03c82d3`, binary `343DB554…`)
+
+`ATLAS_TRACE_LAUNCH_SYNC=1` now brackets every `hipModuleLaunchKernel`
+with hipEvents (`gpu=` per launch) and records inter-call host time
+(`host_before=`). Same recipe, serial arm, hipBLASLt live.
+
+**Decode is GPU-bound.** Steady state (63 steps, ~964 launches/step):
+
+| | per step |
+|---|---|
+| wall (sync mode) | 196 ms mean / 194 median (async: 92 ms) |
+| Σgpu | **89.1 ms** |
+| Σhost_before | 64.2 ms |
+
+The async step (~92 ms) ≈ Σgpu (89 ms): the ~95 µs/launch inter-launch
+gaps in the plain trace were **queue backpressure mirroring kernel
+durations**, not submit cost. A standalone launchbench (`launchbench.cpp`,
+`hipModuleLaunchKernel`, 5,000 launches) measured HIP/WDDM submit at
+**0.6 µs/launch** — the runtime is not the wall at all. Host dispatch
+(~64 ms/step) hides almost entirely under GPU execution; the only exposed
+per-step host item is `hc_expand`'s 14.8 ms host_before at the
+emit/dispatch boundary. The ~3 D2H + 4 syncs per step (QSA top-k, PLE
+host hash) cost only ~0.4 ms. **Graph replay therefore caps at ≈30%
+decode gain** — it removes the host half but not the ~89 ms of GPU work;
+on the prefill the same logic caps lower because GPU dominates even more.
+
+Top decode kernels by Σgpu/step (geometry for gfx1151 occupancy, 40 CUs):
+
+| kernel | grid | block | n/step | µs each | ms/step |
+|---|---|---|---|---|---|
+| `dense_gemv_bf16` | 4096×1 | 256 | 36 | 415 | 14.9 |
+| `dense_gemv_bf16` | 640×1 | 256 | 36 | 267 | 9.6 |
+| `dense_gemv_bf16` | 62020×1 | 256 | 1 | 5774 | 5.8 |
+| `hc_pre_down` | 1×10 | 1024 | 97 | 150 | 14.6 |
+| `hc_pre_finish_x4` | 1×80 | 128 | 97 | 140 | 13.6 |
+| `moe_expert_silu_down_shared` | 320×11 | 128 | 48 | 138 | 6.6 |
+| `moe_expert_gate_up_shared` | 80×11×2 | 128 | 48 | 134 | 6.4 |
+| `gated_delta_rule_decode_f32` | 48×1 | 128 | 36 | 123 | 4.4 |
+| `hc_post` | 1×1 | 256 | 96 | 23 | 2.2 |
+| `hc_pre_stage` | 1×1 | 1024 | 97 | 20 | 1.9 |
+| `w4a16_gemv_qg` | — | 256 | 12 | ~133 | 1.6 |
+| `moe_topk_softmax` | 1×1 | 256 | 48 | 23 | 1.1 |
+| `w4a16_gemv_sw` | 320×1 / 64×1 | 256 | 12/48 | 108 / 8 | 1.7 |
+| `paged_decode_attn` | 24×1 | 256 | 12 | 23 | 0.3 |
+
+`dense_gemv_bf16` = ~30 ms/step (34% of GPU time) — the 36 BF16 GDN
+projections plus the 62,020-row lm_head GEMV; the `hc_*` family is real
+GPU work (~32 ms/step across four kernels), not launch noise.
+
+**Prefill is GPU-bound too.** 44-token MinHeap chunk: 8,529 launches,
+wall 3,820 ms (sync trace; async 3,034 ms): Σgpu **2,754 ms (72%)**,
+Σhost_before 627 ms. The grouped MoE GEMMs alone — 116
+`moe_w4a16_grouped_gemm_ptrtable`/`fused_gate_up` calls — are
+**Σgpu 1,754 ms (46% of prefill), ~15 ms GPU per call** with only
+~105–139 µs host_before each. The cost is real device time: every routed
+expert block walks the full K loop for ≤1 real row at N≤44, so the call
+cost is nearly flat in token count — which is why the fix below is
+routing, not kernel tuning.
+
+The earlier `gpu_exec ≈ 77 ms` must not be quoted as device time — direct
+HIP-event sums contradict it (89 ms/step decode, 2,754 ms prefill), and
+the async-vs-sync step-wall discriminator (92 → 196 ms under forced sync)
+proves the submit path was overlapping GPU execution all along.
 
 First hypothesis (compute-bound on padding): M_TILE=64 with 4 warps × 16
 rows means an expert holding 1–3 rows still ran all 4 warps' WMMA work
@@ -319,14 +381,50 @@ slab lies entirely beyond `M_expert` in all six grouped kernels +
 to boot 12 ×3 (correctness gate), grouped_gate_up phase total
 1,383,150→1,320,037 µs (−4.6%), `submit` 2.936→2.74–2.77 s, `gpu_exec`
 74.5→77.0 ms (noise), TTFT 2948–2991→2924–2943 ms, decode 8.2–8.3
-(unchanged). **The idle-warp MMA was not the bottleneck**: the phase
-timers measure submit-side spans, and `gpu_exec` — the actual kernel
-execution total — is only ~77 ms of a ~2.8 s prefill. The grouped-GEMM
-cost is launch/submit serialization (hundreds of tiny kernel launches
-through the WDDM submit path), so the real TTFT lever is reducing launch
-count (fusion / fewer per-layer kernels), not per-kernel utilization.
-The warp-skip is kept anyway: it is dead-work removal with verified
-bit-identical output.
+(unchanged). The idle-warp MMA removed real padding work but only ~5% of
+the phase — the ~15 ms/call floor is the expert-block K loop, not warp
+padding. The warp-skip is kept anyway: dead-work removal, bit-identical.
+
+### Fix 1: short-prefill MoE routing threshold (`0a512fdc8`)
+
+For `cfg!(atlas_hip)` only, NVFP4 MoE prefills below
+`ATLAS_HIP_MOE_GROUPED_MIN_TOKENS` (default 256) route to the per-token
+`forward_batched` path like the bf16/fp8 arms — at N<256 the grouped
+kernel pays ~15 ms/layer for ≤1 real row per expert block. NVIDIA path
+byte-unchanged. Serial arm, hipBLASLt live, default GDN, temp 0
+(max_tokens 256; TTFT is the metric):
+
+| prompt tokens | thr=0 (grouped) | thr=256 | thr=4096 (batched) |
+|---|---|---|---|
+| 20 (PONG) | 2104 / 2003 ms | **640 / 597** | 632 / 565 |
+| 44 (MinHeap) | 2975 / 2918 | **1060 / 959** | 1035 / 965 |
+| 1150 (big) | **14522 / 14171** | 15457 / 15731 | 15635 / 15634 |
+
+Batched routing cuts 20–44-token TTFT by ~66–71%; at 1,150 tokens the
+grouped path wins by ~9% — crossover is between 44 and 1,150, so the
+256 default is in-range (not yet pinned by measurement). Output parity:
+grouped-vs-batched content for the same prompt diverges at char ~102–135
+(docstring formatting — the known grouped/batched accumulation-order
+class); thr=256 vs thr=0 content is byte-identical at 1,150 tokens (both
+grouped — confirms the routing actually engaged).
+
+### Fix 2 attempt: GDN requantization A/B — cannot boot (inconclusive)
+
+`ATLAS_QWEN4EXP_BF16_GDN=0` requantizes the 36 GDN projections to NVFP4
+at load — the hypothesis was −6 GB device plus relief on the 30 ms/step
+`dense_gemv_bf16` decode cost. **On winbox it never reaches `Server
+live`:** the requant arm consumes ~82.7 GB at the KV-budget point
+(serial diag: free-now 13.3 GB vs ~15 GB on the default arm; the in-tree
+GB10 table shows the same +5.8 GB pre-KV — requant staging is *heavier*
+at build time even though final weights are smaller). Serial at util
+0.86 fails the budget check outright (84.3 committed > 82.6 budget);
+at 0.89 it passes the check then `cuMemAlloc_v2` fails `status 2` on a
+64 MB request — the 84.5 GiB resident wall. MTP at 0.90 passes the check
+then dies 719 in the alloc run. The in-code comment's GB10 measurement
+(decode 2.207 vs 2.188 tok/s, i.e. ~1%) plus these load failures means
+the option is unbootable here without shedding ~4 GB elsewhere (smaller
+seq len, vision encoder off, or drafter off); the A/B is recorded as a
+load failure, not a performance result.
 
 ### single_gpu_suite (boot 15, new binary, MTP, hipBLASLt live)
 
@@ -358,11 +456,18 @@ active proposer. Repo restored to `da943853`.
   the time is in the grouped-MoE kernels, not BF16 GEMMs. Its value is
   large-M prefill (AzeezStrix probe: 32–34 TFLOPS BF16 at M=2048 vs
   ~3 TFLOPS pipelined WMMA), which this workload doesn't exercise.
-- **TTFT ~2.9 s is launch/submit-bound, not GEMM-bound**: `gpu_exec` is
-  only ~77 ms of the ~2.8 s prefill; the idle-warp skip (`6cc12d03d`)
-  removed dead MMA work bit-identically but moved nothing — the lever is
-  kernel-launch count (fusion), not utilization. See the prefill
-  attribution section.
+- **TTFT is GPU-bound in the grouped MoE GEMMs** (Σgpu 1,754 of 2,754 ms
+  at N=44): FIXED for short prefills by the HIP-only routing threshold
+  (`0a512fdc8`, `ATLAS_HIP_MOE_GROUPED_MIN_TOKENS`, default 256) — −66–71%
+  TTFT at 20–44 tokens, crossover vs grouped between 44 and 1,150 tokens.
+  The remaining lever at mid-length prompts is the grouped kernel's
+  ~15 ms/call K-loop floor itself. Graph replay caps at ≈30% on decode
+  (host ~64 ms/step hides under ~89 ms GPU); it is not the decode fix.
+  HIP/WDDM submit itself is 0.6 µs/launch (launchbench) — never the wall.
+- **GDN requant (`ATLAS_QWEN4EXP_BF16_GDN=0`) does not fit on winbox** —
+  +~5 GB pre-KV over the BF16 arm leaves nothing under the 84.5 GiB wall
+  at seq 8192 (serial fails the KV check at 0.86, alloc status-2 at 0.89,
+  MTP 719s at 0.90). Would need ~4 GB shed elsewhere first.
 - **MoE FP4 arms** (`moe_w4a16_*_fp4`, behind `ATLAS_HOLO_MOE_GATEUP_FP4`)
   and the other expected-absent entries marked "UNPORTED candidate" in
   MODEL.toml are the perf-recovery list.
@@ -394,5 +499,14 @@ active proposer. Repo restored to `da943853`.
   perf-neutral, GEMV arm serial-neutral, MTP ≈ 2.1× serial); boot 14
   marked contaminated (serve died mid-load, responses served by a
   lingering instance).
+- **Measured, fingerprinted (`0b03c82d3` + `0a512fdc8`, binary
+  `343DB554…`/rebuilt):** GPU-timed decode profile (Σgpu 89 ms/step,
+  kernel table above); GPU-timed prefill (Σgpu 2,754 ms, grouped MoE
+  1,754 ms); HIP submit cost 0.6 µs/launch (launchbench); MoE routing
+  threshold TTFT matrix (boots B0/B256/B4096, serial, n=2 per cell).
+- **Negative/inconclusive results (recorded as such):** GDN requant arm
+  unbootable on winbox at the standard recipe (memory, not a kernel —
+  see Fix 2); launchgap-derived "submit-bound" and `gpu_exec=77 ms`
+  readings are SUPERSEDED by the HIP-event trace.
 - **Not yet claimed:** MTP-vs-serial parity beyond char-2508-class
   divergence (the divergences are observed, unattributed).
