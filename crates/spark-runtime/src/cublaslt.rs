@@ -215,6 +215,15 @@ pub type Bf16GemmFallback = dyn Fn(u64, u64, u64, u32, u32, u32, u64) -> Result<
 static BF16_FALLBACK: OnceLock<Box<Bf16GemmFallback>> = OnceLock::new();
 static FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
 
+/// Single source of truth for the dense BF16 GEMM launch geometry — the
+/// `dense_gemm_bf16` family shares one (A,B,C,M,N,K) contract across the
+/// pipelined tensor-core kernel (128x128 CTA tile, 256 threads) and the
+/// scalar fallback (16x16 tile, 16x16 threads). Used by `make_bf16_fallback`
+/// and by `spark-model`'s `ops::gemm_dense` launchers.
+pub const DENSE_GEMM_BF16_PIPELINED_TILE: u32 = 128;
+pub const DENSE_GEMM_BF16_PIPELINED_THREADS: u32 = 256;
+pub const DENSE_GEMM_BF16_SCALAR_TILE: u32 = 16;
+
 /// Install the GEMM [`bf16_gemm_act_weight_t`] routes to when `ctx()` fails.
 /// Returns false if one was already installed — first install wins: the
 /// fallback is a property of the process's backend, not of any model.
@@ -237,8 +246,12 @@ pub fn make_bf16_fallback(
         let (func, grid, block) = if pipelined.0 != 0 && vectorizable {
             (
                 pipelined.0,
-                [n.div_ceil(128), m.div_ceil(128), 1],
-                [256, 1, 1],
+                [
+                    n.div_ceil(DENSE_GEMM_BF16_PIPELINED_TILE),
+                    m.div_ceil(DENSE_GEMM_BF16_PIPELINED_TILE),
+                    1,
+                ],
+                [DENSE_GEMM_BF16_PIPELINED_THREADS, 1, 1],
             )
         } else {
             if scalar.0 == 0 {
@@ -248,7 +261,15 @@ pub fn make_bf16_fallback(
                      also unresolved"
                 );
             }
-            (scalar.0, [n.div_ceil(16), m.div_ceil(16), 1], [16, 16, 1])
+            (
+                scalar.0,
+                [
+                    n.div_ceil(DENSE_GEMM_BF16_SCALAR_TILE),
+                    m.div_ceil(DENSE_GEMM_BF16_SCALAR_TILE),
+                    1,
+                ],
+                [DENSE_GEMM_BF16_SCALAR_TILE, DENSE_GEMM_BF16_SCALAR_TILE, 1],
+            )
         };
         let (mut a, mut w, mut o) = (act, weight, out);
         let (mut mm, mut nn, mut kk) = (m, n, k);
