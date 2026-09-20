@@ -208,7 +208,7 @@ impl TransformerModel {
                     // Aux-carrying models (PLE/QSA) decline aux-less slots —
                     // e.g. mid-chunk tail captures — rather than restore a
                     // stale lexical state. See prefill_a.
-                    && (!self.requires_aux_state() || self.ssm_snapshots.aux(snap_id).is_some())
+                    && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
                 {
                     // Cross-stream ordering: the snapshot we are about to read
                     // was SAVED on the default stream (decode_marconi_checkpoint
@@ -226,8 +226,11 @@ impl TransformerModel {
                         self.gpu.as_ref(),
                         stream,
                     )?;
-                    if let Some(aux) = self.ssm_snapshots.aux(snap_id) {
-                        self.apply_aux_states(seq, &aux, stream)?;
+                    if let Some(res) = self
+                        .ssm_snapshots
+                        .with_aux(snap_id, |aux| self.apply_aux_states(seq, aux, stream))
+                    {
+                        res?;
                     }
                     if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
                         self.ssm_pool.debug_state_checksum(

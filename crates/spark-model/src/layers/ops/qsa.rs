@@ -103,6 +103,35 @@ pub fn qsa_score(
         .launch(stream)
 }
 
+/// Device-side decode block selection (`qsa_select_topk`): writes the
+/// expanded selection straight into `sel`, replacing the D2H + host sort +
+/// H2D round trip. One block of 1024 threads; `complete <= 4096`.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_select_topk(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    scores: DevicePtr,
+    sel: DevicePtr,
+    complete: u32,
+    block_topk: u32,
+    ratio: u32,
+    tail_start: u32,
+    visible: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(scores)
+        .arg_ptr(sel)
+        .arg_u32(complete)
+        .arg_u32(block_topk)
+        .arg_u32(ratio)
+        .arg_u32(tail_start)
+        .arg_u32(visible)
+        .launch(stream)
+}
+
 /// Pack the selected tokens' K/V rows into contiguous NHD scratch.
 #[allow(clippy::too_many_arguments)]
 pub fn qsa_gather(

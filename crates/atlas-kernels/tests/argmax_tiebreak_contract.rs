@@ -58,3 +58,36 @@ fn first_index_wins_reference_rule() {
     }
     assert_eq!(best, 1);
 }
+
+/// The scan above only guarantees first-wins WITHIN one lane's stride class.
+///
+/// `if (v > local_max)` keeps the first strict max of the indices
+/// `tid, tid+stride, tid+2*stride, ...`. Two equal maxima in DIFFERENT lanes
+/// are then resolved by the tree merge, and a plain `>` merge picks the lower
+/// LANE — which is a higher index whenever the lower index sits in the higher
+/// lane. With stride 1024 and the max at index 1029 (lane 5) and 2050 (lane 2),
+/// `>` returns 2050 while `argmax_first_wins_f32` returns 1029.
+///
+/// So the kernel needs the tie clause in every merge, not just the strict
+/// comparison in the scans. This test is the guard for that clause: it was
+/// absent until 2026-09-16, and the file's "same index as n sequential calls"
+/// claim was asserted rather than earned.
+#[test]
+fn cuda_argmax_merge_is_index_exact_on_equal_maxima() {
+    for src in sources() {
+        let merges = src.matches("s_idx[tid + s] < s_idx[tid]").count();
+        assert!(
+            merges >= 4,
+            "every argmax merge must prefer the lower INDEX on equal maxima; found \
+             {merges} tie clauses, expected one per merge site (argmax_bf16, \
+             argmax_bf16_batch, argmax_bf16_batch_lp, argmax_fp32). A plain `>` \
+             merge resolves ties to the lowest LANE, which is a HIGHER index when \
+             the lower index is in the higher lane — and that divergence is \
+             serial-vs-verify, not cosmetic."
+        );
+    }
+    // NEGATIVE half: the detector must fire on the pre-2026-09-16 shape, or
+    // this test would pass on a file whose merge had been reverted.
+    let legacy = "if (s_val[tid + s] > s_val[tid]) { s_val[tid] = s_val[tid + s]; }";
+    assert_eq!(legacy.matches("s_idx[tid + s] < s_idx[tid]").count(), 0);
+}

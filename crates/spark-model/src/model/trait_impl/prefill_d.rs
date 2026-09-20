@@ -278,11 +278,12 @@ impl TransformerModel {
                     // This fn is infallible; an aux collection failure just
                     // leaves the slot aux-less (aux-carrying models then
                     // decline it on restore — a slower miss, never stale).
-                    match self.collect_aux_states(seq, stream) {
-                        Ok(aux) if !aux.is_empty() => {
+                    let mut aux = self.ssm_snapshots.take_aux(snap_id);
+                    match self.collect_aux_states_into(seq, stream, &mut aux) {
+                        Ok(()) if !aux.is_empty() => {
                             self.ssm_snapshots.set_aux(snap_id, aux);
                         }
-                        Ok(_) => {}
+                        Ok(()) => {}
                         Err(e) => tracing::warn!("aux snapshot skipped: {e:#}"),
                     }
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(

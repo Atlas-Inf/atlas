@@ -39,6 +39,20 @@ pub fn detect_nvfp4_variant(
             "modelopt" if qc.quant_algo.eq_ignore_ascii_case("FP8") => {
                 return Nvfp4Variant::Fp8Dequanted;
             }
+            "modelopt" if qc.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION") => {
+                // The per-component `quantized_layers` map is authoritative —
+                // and consulting it here is REQUIRED, not optional: nvidia's
+                // Flash-Next pack carries `weight_scale_inv` on its MTP
+                // experts (FP8_PB_WO) while every main-layer expert is
+                // standard ModelOpt NVFP4. Falling through would hit the
+                // global `.weight_scale_inv` fallback below and mis-route the
+                // whole checkpoint to Fp8Dequanted.
+                if let Some(v) = mixed_precision_variant(qc) {
+                    return v;
+                }
+                // Map absent or says nothing about the compute path —
+                // fall through to tensor-name sniffing.
+            }
             "compressed-tensors" => {
                 // `format` is the sub-selector here. Block-scaled FP8 is tagged
                 // either with a literal "fp8" OR with compressed-tensors'
@@ -339,6 +353,51 @@ pub(crate) fn quantized_any(
     }
 }
 
+/// Resolve the global [`Nvfp4Variant`] for a ModelOpt `MIXED_PRECISION`
+/// checkpoint from its `quantized_layers` map.
+///
+/// Only main-model compute paths vote — entries under `*.mlp.experts` or a
+/// `*{gate,up,down,q,k,v,o}_proj` projection. Auxiliary components with their
+/// own loaders (`mtp.*`, `*.ple.*`, `*.visual.*`) are excluded: their scheme
+/// is read by the component loader, and must not steer the global variant.
+///
+/// `None` when the map is empty or names no compute path, leaving detection
+/// to the tensor-name sniffing below.
+fn mixed_precision_variant(qc: &atlas_core::config::QuantizationConfig) -> Option<Nvfp4Variant> {
+    let mut saw_nvfp4 = false;
+    let mut saw_fp8 = false;
+    for (path, spec) in &qc.quantized_layers {
+        // Auxiliary namespaces first — nvidia's MTP experts live at
+        // `mtp.layers.0.mlp.experts.*`, which CONTAINS `.mlp.experts`, so
+        // the compute-path check below cannot be trusted to exclude them.
+        if path.starts_with("mtp.") || path.contains(".ple.") || path.contains(".visual.") {
+            continue;
+        }
+        let is_compute = path.contains(".mlp.experts")
+            || path.ends_with("_proj")
+            || path.contains(".self_attn.")
+            || path.contains(".linear_attn.");
+        if !is_compute {
+            continue;
+        }
+        let algo = spec.quant_algo.to_ascii_uppercase();
+        saw_fp8 |= algo.starts_with("FP8");
+        saw_nvfp4 |= algo == "NVFP4";
+    }
+    // A single global variant cannot express a genuinely mixed main path, so
+    // precedence matters: an NVFP4 component can NEVER be served by the FP8
+    // arm (its `.weight` is uint8-packed FP4, not FP8E4M3 — nvidia's
+    // Qwen3.8-27B pack died on exactly this at `mlp.gate_proj`), while an
+    // FP8 component inside a Standard checkpoint IS served per-key by
+    // `quantized_any`'s `has_fp8_dense` fallback. NVFP4 wins unconditionally.
+    if saw_nvfp4 {
+        Some(Nvfp4Variant::Standard)
+    } else {
+        // FP8-only main path (e.g. a pure FP8 pack): native-FP8 arms.
+        saw_fp8.then_some(Nvfp4Variant::Fp8Dequanted)
+    }
+}
+
 /// Load a quantized weight from FP8 block-scaled data: FP8→BF16→NVFP4.
 ///
 /// `n` and `k` are the logical weight dimensions (e.g. [inter, hidden] for gate_proj).
@@ -437,84 +496,5 @@ pub(crate) fn load_quantized_proj_qwen35(
 }
 
 #[cfg(test)]
-mod ep_detection_tests {
-    use super::*;
-    use atlas_core::config::ModelConfig;
-    use spark_runtime::weights::WeightStore;
-
-    /// A store holding only the FP8 attention marker at a given layer, which is
-    /// what the detector sniffs for. Names are all the detector reads.
-    fn store_with(names: &[String]) -> WeightStore {
-        use std::collections::HashMap;
-        let map: HashMap<String, spark_runtime::weights::WeightTensor> = names
-            .iter()
-            .map(|n| {
-                (
-                    n.clone(),
-                    spark_runtime::weights::WeightTensor {
-                        ptr: spark_runtime::gpu::DevicePtr::NULL,
-                        shape: vec![1],
-                        dtype: spark_runtime::weights::WeightDtype::FP8E4M3,
-                    },
-                )
-            })
-            .collect();
-        WeightStore::from_map(map)
-    }
-
-    /// Detection must not depend on which EP rank is asking.
-    ///
-    /// ★ CHARACTERISATION, not a regression test — it passes with the bug too,
-    /// and that is worth stating rather than hiding. The old expression indexed
-    /// the second FP8 prefix by `local_expert_range().0`, a global EXPERT index
-    /// used as a LAYER index, so rank 1 of 2 probed layer 47 where rank 0
-    /// probed layer 0. That is genuinely wrong, but UNREACHABLE: the global
-    /// `.weight_scale_inv` fallback below the per-prefix probes catches the
-    /// marker wherever it sits, so both ranks answer the same either way.
-    ///
-    /// This pins the property we want to keep — rank-independence — so that if
-    /// someone tightens or removes that fallback, the latent bug surfaces here
-    /// instead of in a two-rank EP deployment.
-    #[test]
-    fn variant_detection_is_identical_across_ep_ranks() {
-        // Only a deep-layer FP8 attention marker: present at the layer rank 1
-        // used to probe, absent at layer 0. Under the bug the ranks disagree.
-        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
-        // Reach the tensor-name sniffing path: a present `quantization_config`
-        // short-circuits detection before any prefix is built, so leaving it
-        // set makes this test assert the early return, not the bug.
-        cfg.quantization_config = None;
-        let deep = cfg.num_hidden_layers.saturating_sub(1);
-        let store = store_with(&[format!(
-            "model.language_model.layers.{deep}.self_attn.q_proj.weight_scale_inv"
-        )]);
-
-        cfg.ep_world_size = 2;
-        cfg.ep_rank = 0;
-        let rank0 = detect_nvfp4_variant(&store, &cfg);
-        cfg.ep_rank = 1;
-        let rank1 = detect_nvfp4_variant(&store, &cfg);
-
-        assert_eq!(
-            rank0, rank1,
-            "EP rank changed the detected variant for one checkpoint: \
-             rank0={rank0:?} rank1={rank1:?}. Detection reads a file every rank \
-             sees identically, so it must not depend on the expert split."
-        );
-    }
-
-    /// The layer-0 spelling still detects FP8 — the fix must not break the
-    /// case the buggy expression happened to get right.
-    #[test]
-    fn the_alternate_layer0_spelling_still_detects_fp8() {
-        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
-        cfg.quantization_config = None;
-        let store = store_with(&[
-            "model.language_model.layers.0.self_attn.q_proj.weight_scale_inv".to_string(),
-        ]);
-        assert_eq!(
-            detect_nvfp4_variant(&store, &cfg),
-            Nvfp4Variant::Fp8Dequanted
-        );
-    }
-}
+#[path = "nvfp4_detect/ep_detection_tests.rs"]
+mod ep_detection_tests;

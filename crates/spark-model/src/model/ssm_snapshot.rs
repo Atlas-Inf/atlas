@@ -455,7 +455,16 @@ impl SsmSnapshotPool {
     pub(super) fn free(&self, snap_slot: usize) {
         self.slot_has_hidden.lock().remove(&snap_slot);
         self.session_tags.lock().remove(&snap_slot);
-        self.aux_blobs.lock().remove(&snap_slot);
+        // Clear each blob IN PLACE rather than removing the entry: the
+        // buffers' capacity then survives slot reuse (the next save on this
+        // slot refills them via `take_aux`/`collect_aux_states_into`), and
+        // `has_aux` treats an all-empty entry as absent — a freed slot is
+        // never restorable.
+        if let Some(blobs) = self.aux_blobs.lock().get_mut(&snap_slot) {
+            for (_, b) in blobs.iter_mut() {
+                b.clear();
+            }
+        }
         self.free_slots.lock().push(snap_slot);
     }
 
@@ -464,10 +473,8 @@ impl SsmSnapshotPool {
         self.aux_blobs.lock().insert(snap_slot, blobs);
     }
 
-    /// The aux blobs for a slot, if that save carried them.
-    pub(super) fn aux(&self, snap_slot: usize) -> Option<Vec<(u32, Vec<u8>)>> {
-        self.aux_blobs.lock().get(&snap_slot).cloned()
-    }
+    // `has_aux` / `take_aux` / `with_aux` (the capacity-reuse aux accessors)
+    // live in `ssm_snapshot_spill.rs` to keep this file under the LoC cap.
 
     /// Whether any LIVE snapshot slot is tagged with `session_hash` — i.e.
     /// this session has produced at least one snapshot before (a prior turn
@@ -587,3 +594,7 @@ impl SsmSnapshotPool {
     // file under the 500-LoC cap. They are a second `impl SsmSnapshotPool`
     // block over the same fields.
 }
+
+#[cfg(test)]
+#[path = "ssm_snapshot_aux_tests.rs"]
+mod aux_tests;

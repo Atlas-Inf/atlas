@@ -137,3 +137,22 @@ fn validate_rejects_a_head_count_mismatch() {
     d.head_offsets.pop();
     assert!(d.validate().is_err());
 }
+
+/// The scratch-width clamp is the contract that keeps a verify-width
+/// forward single-span: the per-row conv snapshot loop indexes the whole
+/// window, so a verify that split across spans would snapshot (and a
+/// rollback restore) the wrong carry. VERIFY_SNAP_SLOTS = 9.
+#[test]
+fn scratch_never_splits_a_verify() {
+    use super::bounded_scratch;
+    // Chunking engages only above the requested width...
+    assert_eq!(bounded_scratch(8192, 32768), 8192);
+    assert_eq!(bounded_scratch(16384, 8192), 8192); // wider ask clamps to the cap
+    // ...and the floor keeps any verify (K <= 8) inside one span.
+    assert_eq!(bounded_scratch(4, 32768), 9);
+    assert_eq!(bounded_scratch(0, 8192), 9);
+    // Degenerate caps relax the floor rather than panic: a layer whose whole
+    // width is under VERIFY_SNAP_SLOTS simply never spans at all.
+    assert_eq!(bounded_scratch(4, 4), 4);
+    assert_eq!(bounded_scratch(8192, 1), 1);
+}
