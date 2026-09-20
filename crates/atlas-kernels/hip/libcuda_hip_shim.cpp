@@ -258,9 +258,22 @@ int cuLaunchKernel(void* f, unsigned gx, unsigned gy, unsigned gz,
       auto it = g_fn_names.find(f);
       nm = (it != g_fn_names.end()) ? it->second : "?";
     }
-    fprintf(stderr, "[t=%.0f launch] %s grid=%ux%ux%u block=%ux%ux%u shmem=%u\n",
-            atlas_now_ms(), nm.c_str(), gx, gy, gz, bx, by, bz, shmem);
-    fflush(stderr);
+    // ATLAS_TRACE_LAUNCH_SYNC adds exact GPU time to each launch line:
+    // events bracket the launch on the stream, elapsed after the sync.
+    // host_before = wall time since the previous launch returned (the
+    // caller-side dispatch cost this launch waited behind). Diagnostic
+    // only; the events/sync serialize the stream, so timings are for
+    // attribution, not steady-state rate.
+    const bool sync_mode = atlas_trace_launch_sync();
+    static hipEvent_t ev0 = nullptr, ev1 = nullptr;
+    static double t_prev_ret = 0.0;
+    const double t_entry = atlas_now_ms();
+    const double host_before_us = t_prev_ret > 0.0 ? (t_entry - t_prev_ret) * 1000.0 : 0.0;
+    if (sync_mode && !ev0) {
+      hipEventCreateWithFlags(&ev0, 0); // timing events (default flags)
+      hipEventCreateWithFlags(&ev1, 0);
+    }
+    if (sync_mode) hipEventRecord(ev0, (hipStream_t)stream);
     int r = hipModuleLaunchKernel((hipFunction_t)f, gx, gy, gz, bx, by, bz,
                                   shmem, (hipStream_t)stream, params, extra);
     if (r != hipSuccess) {
@@ -268,7 +281,9 @@ int cuLaunchKernel(void* f, unsigned gx, unsigned gy, unsigned gz,
       fflush(stderr);
       return r;
     }
-    if (atlas_trace_launch_sync()) {
+    double gpu_us = -1.0;
+    if (sync_mode) {
+      hipEventRecord(ev1, (hipStream_t)stream);
       int sr = hipStreamSynchronize((hipStream_t)stream);
       if (sr != hipSuccess) {
         fprintf(stderr, "[launch] %s -> ASYNC FAULT err %d (sync after launch)\n",
@@ -276,7 +291,19 @@ int cuLaunchKernel(void* f, unsigned gx, unsigned gy, unsigned gz,
         fflush(stderr);
         return sr;
       }
+      float ms = 0.f;
+      if (hipEventElapsedTime(&ms, ev0, ev1) == hipSuccess) gpu_us = ms * 1000.0;
     }
+    t_prev_ret = atlas_now_ms();
+    if (sync_mode) {
+      fprintf(stderr,
+              "[t=%.0f launch] %s grid=%ux%ux%u block=%ux%ux%u shmem=%u gpu=%.1fus host_before=%.1fus\n",
+              t_entry, nm.c_str(), gx, gy, gz, bx, by, bz, shmem, gpu_us, host_before_us);
+    } else {
+      fprintf(stderr, "[t=%.0f launch] %s grid=%ux%ux%u block=%ux%ux%u shmem=%u\n",
+              t_entry, nm.c_str(), gx, gy, gz, bx, by, bz, shmem);
+    }
+    fflush(stderr);
     return r;
   }
   return hipModuleLaunchKernel((hipFunction_t)f, gx, gy, gz, bx, by, bz,
