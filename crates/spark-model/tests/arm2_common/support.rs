@@ -130,6 +130,14 @@ pub fn rd_u16(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u16>> {
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect())
 }
+pub fn rd_u32(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u32>> {
+    let mut raw = vec![0u8; n * 4];
+    g.copy_d2h(p, &mut raw)?;
+    Ok(raw
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
 
 // bit-identical compare of two bf16 buffers. Returns (all_equal, n_diff, first_idx).
 pub fn cmp_bits(a: &[u16], b: &[u16]) -> (bool, usize, isize) {

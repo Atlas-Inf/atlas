@@ -121,3 +121,43 @@ fn w4a16_launch_family_arity_pins() {
         "arity test checked only {checked} kernels — PTX sets missing? (wildcard build expected)"
     );
 }
+
+/// The DFlash2 on-device candidate selector is a standalone common kernel,
+/// not a member of the w4a16 launch family above, so it gets its own pin:
+/// the launcher in `layers/ops/sampling.rs` passes ten args (the tenth is
+/// `top_k`). Update launcher and pin in the same commit. The source-level
+/// signature pin in spark-model's `dflash2_selector_bounds.rs` covers stub
+/// builds where no PTX exists.
+#[test]
+#[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
+fn dflash2_candidate_selector_arity_pin() {
+    if atlas_kernels::available_targets()
+        .iter()
+        .all(|s| s.modules.is_empty())
+    {
+        eprintln!("no compiled PTX in this binary (stub build) — arity pin skipped");
+        return;
+    }
+    let mut checked = 0usize;
+    for set in atlas_kernels::available_targets() {
+        for (module, blob) in &set.modules {
+            let Ok(ptx) = std::str::from_utf8(blob) else {
+                continue;
+            };
+            if let Some(count) = ptx_param_count(ptx, "dflash2_candidate_selector") {
+                assert_eq!(
+                    count, 10,
+                    "PTX arity drift: {module}::dflash2_candidate_selector on target \
+                     {} has {count} params, pin expects 10 — update the launcher AND \
+                     this pin together",
+                    set.target.model
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 1,
+        "dflash2_candidate_selector not found in any compiled module — registry drift?"
+    );
+}
