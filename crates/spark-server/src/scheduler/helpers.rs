@@ -771,7 +771,7 @@ pub fn detect_content_token_loop_with(
 /// BOTH a sentinel (numeric) and a non-sentinel (structural) token —
 /// pure-number columns and pure-prose loops are left to the exact path.
 pub fn detect_content_token_loop_normalized(tokens: &[u32], mask: &[bool]) -> bool {
-    detect_content_token_loop_normalized_with(tokens, mask, None)
+    detect_content_token_loop_normalized_with(tokens, mask, None, None)
 }
 
 /// Per-sequence override variant of
@@ -779,9 +779,25 @@ pub fn detect_content_token_loop_normalized(tokens: &[u32], mask: &[bool]) -> bo
 /// caller's `(min_pattern_size, max_pattern_size, min_count)` for the
 /// historical content-loop normalized constants. `None` preserves the
 /// boot-global thresholds, matching the legacy call-site behaviour.
+///
+/// `punct` is the punctuation mask (`VocabMasks::punctuation`). When it is
+/// present and the matched period consists ENTIRELY of
+/// [`NUMERIC_SENTINEL`] and punctuation/whitespace tokens, the match is
+/// data, not a loop, and this returns `false`. That is the 2026-09-20
+/// Flash-Next incident on gfx1151 (identical logic on GB10): the MinHeap
+/// unittest fixture `values = [8, 3, 1, 6, 4, 2, 7, …]` normalizes to
+/// `N , N , N , …` — a period-2 anchored repeat — and the watchdog cut the
+/// response mid-list at 641 tokens on BOTH the serial
+/// (`decode_logits_content`) and MTP/emit paths. A list of DISTINCT
+/// numbers is now exempt; a genuine numeric runaway (`1, 1, 1, 1, …`)
+/// still fires — identical tokens repeat literally, so the exact
+/// [`detect_content_token_loop_with`] catches it before this path is
+/// consulted. With `punct == None` the behaviour is unchanged (the legacy
+/// fail-open contract every mask follows).
 pub fn detect_content_token_loop_normalized_with(
     tokens: &[u32],
     mask: &[bool],
+    punct: Option<&[bool]>,
     override_: Option<crate::api::inference_types::RepetitionDetectionParams>,
 ) -> bool {
     let n = tokens.len();
@@ -825,13 +841,26 @@ pub fn detect_content_token_loop_normalized_with(
             CONTENT_LOOP_NORM_MIN_REPEATS,
         ),
     };
-    detect_token_loop_with_period(
+    let Some(period) = detect_token_loop_period(
         &norm,
         period_min,
         period_max,
         min_repeats,
         CONTENT_LOOP_SCAN_WINDOW,
-    )
+    ) else {
+        return false;
+    };
+    match punct {
+        // Exempt a matched period that is only numbers and the punctuation
+        // between them — `8, 3, 1, 6, …` / `[12\n34\n…]` are data tables,
+        // not degeneration. The needle mix check above already guarantees
+        // at least one sentinel in the window, so "all sentinel-or-punct"
+        // here means exactly the number-list shape.
+        Some(pmask) => !norm[norm.len() - period..]
+            .iter()
+            .all(|&t| t == NUMERIC_SENTINEL || ((t as usize) < pmask.len() && pmask[t as usize])),
+        None => true,
+    }
 }
 
 /// 2026-05-24 v3: ALGORITHM REPLACE. Switched from Atlas's scan-anywhere
@@ -910,21 +939,25 @@ fn has_repeating_pattern_anchored(tokens: &[u32], pattern_len: usize, min_repeat
 /// `pattern_len` tokens) must contain BOTH a [`NUMERIC_SENTINEL`] and
 /// a non-sentinel token. Without that mix, pure-number columns or
 /// pure-prose loops would trip here (the exact detector's job).
-fn detect_token_loop_with_period(
+///
+/// Returns the matched `pattern_len` so callers can inspect the matched
+/// window (the punctuation exemption above); `None` when no period in
+/// `[period_min, period_max]` anchors a repeat.
+fn detect_token_loop_period(
     tokens: &[u32],
     period_min: usize,
     period_max: usize,
     min_repeats: usize,
     _scan_window: usize,
-) -> bool {
+) -> Option<usize> {
     let n = tokens.len();
     if min_repeats < 2 {
-        return false;
+        return None;
     }
     let period_min = period_min.max(1);
     for pattern_len in period_min..=period_max {
         if pattern_len * min_repeats > n {
-            return false;
+            return None;
         }
         let window = &tokens[n - pattern_len..];
         let has_numeric = window.contains(&NUMERIC_SENTINEL);
@@ -933,10 +966,10 @@ fn detect_token_loop_with_period(
             continue;
         }
         if has_repeating_pattern_anchored(tokens, pattern_len, min_repeats) {
-            return true;
+            return Some(pattern_len);
         }
     }
-    false
+    None
 }
 
 // F2 confidence-run + code-fence pure helpers (`toggle_code_fence`,
