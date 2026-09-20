@@ -219,27 +219,155 @@ digit-normalising detector (`detect_content_token_loop_normalized_with`,
 list of distinct numbers `[8, 3, 1, 6, 4, 2, 7,` reads as a period-2
 `N ,` loop with ≥4 repeats. Engine behaviour, not a port defect — it fires
 on GB10 for the same request — and it also means the `Done:` tok/s of these
-requests include two 70-token rollbacks each (both arms equally). Fix
-tracked separately: require the anchored pattern to contain at least one
-token that is neither numeric nor pure punctuation (a real `1, 1, 1, …`
-runaway is still caught by the exact detector).
+requests include two 70-token rollbacks each (both arms equally). Fixed
+in `07ad46661` (numeric/punctuation exemption mask).
+
+### ST-995 leg (boot 9 serve, 2026-09-20)
+
+Golden draw, `bfcl-subset` canonical no-overrides against :8095, n=995,
+seed 42, temp 0. **Overall 82.21 / normalized 82.40, wall 41,689 s
+(~11.6 h), zero faults** (no `status 719` / `hipErrorLaunchFailure` /
+`context is destroyed` in the serve log). Run record
+`run-1789918248980432100.json` (harvested into this log dir). Fingerprint:
+binary sha256 `4F1943CB4D7FE9…9174`, worktree `ed8e0dd2c`, boot-7g MTP
+recipe (util 0.90, seq 8192, prefill 2048, kv bf16, drafts 1, slots 0).
+MTP engagement over 998 `Done:` lines: mean_na avg 0.707 / median 0.80;
+119/998 requests ran `serial=1.00` (MTP declines above the QSA inert
+bound — expected, not a fault). Scorer verdict: *"not an MLPerf
+submission checkpoint, so the floor does not gate this run"* (the 83.64 /
+85.32 floors are MLPerf-edge numbers derived for Qwen3.6-27B).
+
+| subset | acc |
+|---|---|
+| irrelevance | 91.67 |
+| live_irrelevance | 88.64 |
+| live_multiple | 80.95 |
+| live_parallel | 56.25 |
+| live_parallel_multiple | 62.50 |
+| live_simple | 92.00 |
+| multiple | 84.68 |
+| parallel | 77.42 |
+| parallel_multiple | 82.26 |
+| simple_java | 58.06 |
+| simple_javascript | 70.97 |
+| simple_python | 90.73 |
+
+(categories: hallucination 90.15 / live 77.65 / non_live 79.40).
+Cross-platform observation only — not an A/B (OS, driver, ROCm, recipe all
+differ): the same checkpoint on GB10 scored 83.52 / 82.45 serial at 16K
+(see `kernels/gb10/qwen3.8-flash-next/BENCH.toml`), so Windows is −1.31
+overall / −0.05 normalized against it.
+
+### Post-leg A/B (boots 11–17, 2026-09-20, binary `59160469…` @ `f18cfffe5`)
+
+All arms: `ATLAS_CONTENT_LOOP_WATCHDOG=0`, MinHeap+unittest prompt,
+`reasoning_effort:"none"`, `max_tokens 1024`, temp 0, n=3, PONG warm-up;
+every request `finish=stop` (~700 tokens). `Done:` lines are
+server-attested.
+
+| boot | binary | arm | hipBLASLt | decode tok/s | TTFT ms |
+|---|---|---|---|---|---|
+| 11 | new | MTP | **ON** (`GEMM live` + `pre-warmed`) | 17.4 / 17.2 / 17.4 | 3082 / 3066 / 3061 |
+| 12 | new | SERIAL | ON | 8.25 / 8.44 / 8.34 | 2972 / 2991 / 2948 |
+| 16 | new | MTP | OFF (`cublasLtCreate failed` → Atlas fallback) | 17.5 / 17.5 / 17.5 | 3140 / 3205 / 3201 |
+| 17 | new | SERIAL | OFF | 8.13 / 8.20 / 8.14 | 3107 / 3114 / 3072 |
+| 13 | old `4F1943CB` | SERIAL | n/a (stub) | 8.16 / 8.13 / 8.05 | 2979 / 2949 / 2916 |
+| 14 | old `4F1943CB` | MTP | n/a | **contaminated — discard** | — |
+
+Conclusions (observed under this fingerprint, n=3):
+
+- **hipBLASLt ON vs OFF: no measurable effect on this workload**
+  (11↔16, 12↔17 within noise). Correct — the prefill profile shows the
+  time is NOT in BF16 GEMMs (below).
+- **The M≤8 GEMV arm has no measurable serial effect** (17↔13: 8.1–8.2
+  both) — the M=1-pipelined-GEMM hypothesis for the serial decode floor
+  is REFUTED. The GEMV arm remains the more efficient route for small-M
+  BF16 projections, it just isn't the bottleneck.
+- **MTP vs serial is ~2.1×** (11↔12: 17.4 vs 8.3; mean_na ≈ 0.95,
+  tok_step ≈ 1.95) — consistent with boot 7g/9.
+- **Boot 14 is invalid.** Its serve process died mid-weight-load at
+  17:06:14Z (status-719 alloc cascade during shard 6/11, backend drop
+  reclaimed 83,658 allocations) and never served — the log contains zero
+  `Done:`/request lines. The three `boot14-minheap-*.json` responses
+  (written 17:10–17:13Z) were answered by a lingering earlier serve still
+  bound to :8095, so their ~60 s walls and ~12 tok/s are unattributable.
+  Boot 9 ran this same old binary at 16.7 tok/s under the same recipe —
+  the GEMV-arm-vs-old comparison on the MTP path is UNMEASURED here, not
+  +44%.
+- Parity: 12≡17 and 17≡13 byte-identical ×3 (serial arms identical across
+  binaries and backends — GEMV arm is numerics-preserving); 11v12 differ
+  at char 2511 and 11v16 at char ~2499–2508 inside the test-data list
+  (spec-vs-serial divergence class, same as boots 7g/8b).
+
+### Prefill attribution (boot 10 profile, `ATLAS_PROFILE_PREFILL=1`)
+
+44-token prompt: `prefill fwd-exec (chunk 0..44): submit=2.9355628s
+gpu_exec=74.4847ms` — the ~2.9 s is **submit/launch-side, not GPU
+execution**. PLE gather resolve is 122 µs; drafter prefill trivial.
+Per-phase totals across the layer loop (µs, N=20-token chunk):
+`grouped_gate_up` **1,383,150** (48 MoE layers, ~28.8 ms/layer) +
+`grouped_silu_down` 268,516 = **79% of TTFT**; then shared_expert 46,951,
+o_proj 40,386, out_proj 28,573, qkvz_gemm 27,652, q_proj 27,589,
+gdn_prefill 22,893, gate_gemm 21,709, k/v_proj ~17.8k each.
+
+First hypothesis (compute-bound on padding): M_TILE=64 with 4 warps × 16
+rows means an expert holding 1–3 rows still ran all 4 warps' WMMA work
+(discarded by the epilogue). `6cc12d03d` skips MMA on warps whose 16-row
+slab lies entirely beyond `M_expert` in all six grouped kernels +
+`common/moe_fp8_grouped_gemm.cu`. Measured (boots 18/19, binary
+`8CACFAA1…`, same fingerprint as boots 11–17): **content byte-identical**
+to boot 12 ×3 (correctness gate), grouped_gate_up phase total
+1,383,150→1,320,037 µs (−4.6%), `submit` 2.936→2.74–2.77 s, `gpu_exec`
+74.5→77.0 ms (noise), TTFT 2948–2991→2924–2943 ms, decode 8.2–8.3
+(unchanged). **The idle-warp MMA was not the bottleneck**: the phase
+timers measure submit-side spans, and `gpu_exec` — the actual kernel
+execution total — is only ~77 ms of a ~2.8 s prefill. The grouped-GEMM
+cost is launch/submit serialization (hundreds of tiny kernel launches
+through the WDDM submit path), so the real TTFT lever is reducing launch
+count (fusion / fewer per-layer kernels), not per-kernel utilization.
+The warp-skip is kept anyway: it is dead-work removal with verified
+bit-identical output.
+
+### single_gpu_suite (boot 15, new binary, MTP, hipBLASLt live)
+
+`--skip-longctx` (suite's 16000-token case > `--max-seq-len 8192`):
+**coherence 3/3 PASS, tool calls 2/2 PASS, fibonacci 0/1 FAIL** — the
+fibonacci failure is the Windows harness shim (`Shim: Could not determine
+if target is a GUI app`) failing to exec the generated code locally, not
+a model failure. Avg TPS 8.9. Results `gate-boot15.json`.
+
+### #44 DFlash smoke (main checkout `atlas-main-verify`)
+
+`feat/strix-windows-dflash-main` (`da943853`+`093f1ae1`), `DFLASH=1`,
+drafter `C:\Users\azeez\models\dflash2` (the HF cache `refs/main` is
+dangling — local path required): **`SMOKE OK  finish=length  tokens=63`**,
+coherent output, `DFlash γ=8 (source: cli)`, drafter installed as the
+active proposer. Repo restored to `da943853`.
 
 ## Known gaps / next levers
 
-- **ST-995 leg**: running on winbox (detached, canonical
-  `bfcl-subset` no-overrides against :8095; marker + fingerprint sidecars in
-  the log dir). Result pending — see Claims status.
-- **`tests/single_gpu_suite.py`**: not yet run on this port.
-- **hipBLASLt**: TheRock 10.0.0 ships `libhipblaslt.dll`/`rocblas.dll` for
-  gfx1151 — a real cuBLASLt→hipBLASLt shim would replace the Atlas GEMM
-  fallback on every BF16 projection (whether hipBLASLt has gfx1151 BF16
-  kernels is unverified). Biggest known perf lever.
+- **ST-995 leg**: DONE — 82.21 / 82.40, n=995, zero faults (see Measured).
+- **`tests/single_gpu_suite.py`**: ran (boot 15) — coherence 3/3,
+  tool calls 2/2, fibonacci harness-shim failure (not model).
+- **hipBLASLt**: DONE and measured — the cuBLASLt entry points are now a
+  dynamically-loaded hipBLASLt translation layer (`080813f3a`, gated by
+  `ATLAS_HIPBLASLT=0`; `f18cfffe5` routes any cuBLASLt failure to the
+  Atlas fallback). Verified live on Windows (`cuBLASLt BF16 GEMM live`,
+  `cuBLASLt pre-warmed`). On THIS decode/short-prefill workload it is
+  perf-neutral (11↔16, 12↔17 within noise) — the prefill profile shows
+  the time is in the grouped-MoE kernels, not BF16 GEMMs. Its value is
+  large-M prefill (AzeezStrix probe: 32–34 TFLOPS BF16 at M=2048 vs
+  ~3 TFLOPS pipelined WMMA), which this workload doesn't exercise.
+- **TTFT ~2.9 s is launch/submit-bound, not GEMM-bound**: `gpu_exec` is
+  only ~77 ms of the ~2.8 s prefill; the idle-warp skip (`6cc12d03d`)
+  removed dead MMA work bit-identically but moved nothing — the lever is
+  kernel-launch count (fusion), not utilization. See the prefill
+  attribution section.
 - **MoE FP4 arms** (`moe_w4a16_*_fp4`, behind `ATLAS_HOLO_MOE_GATEUP_FP4`)
   and the other expected-absent entries marked "UNPORTED candidate" in
   MODEL.toml are the perf-recovery list.
-- **TTFT ~3.2 s** through the scalar/pipelined Atlas GEMMs instead of
-  cuBLASLt; the remaining prefill cost profile is unmeasured.
-- **641-token `length` oddity** above.
+- **641-token `length` oddity**: resolved — content-loop watchdog false
+  positive on numeric lists; fixed in `07ad46661`.
 - A 128 GB **Linux** Strix box would sidestep the WDDM wall entirely;
   AzeezStrix is a 64 GB SKU and can never run this model.
 
@@ -261,6 +389,10 @@ runaway is still caught by the exact detector).
 - **Verified mechanism (instrumented):** the over-commit-then-719 failure
   mode — `ATLAS_TRACE_LAUNCH_SYNC` cleared every one of 850,953 launches in
   boot 7e; the context failed in allocation, before `Server live`.
-- **Not yet claimed:** ST-995 accuracy on this port (leg in flight);
-  MTP-vs-serial parity beyond char-2508-class divergence (the divergences
-  are observed, unattributed); any TTFT claim.
+- **Measured, fingerprinted:** ST-995 82.21 / 82.40 (n=995, 0 faults,
+  `run-1789918248980432100`); post-leg A/B boots 11/12/16/17/13 (hipBLASLt
+  perf-neutral, GEMV arm serial-neutral, MTP ≈ 2.1× serial); boot 14
+  marked contaminated (serve died mid-load, responses served by a
+  lingering instance).
+- **Not yet claimed:** MTP-vs-serial parity beyond char-2508-class
+  divergence (the divergences are observed, unattributed).
