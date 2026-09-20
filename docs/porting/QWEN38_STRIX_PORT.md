@@ -578,3 +578,13 @@ small-M GEMV defaults, binary `4de8cd79…` (run scripts committed at
   running: outdir `~/dp4a-ab/out/dflash-agentic-20260915T2247Z`, γ=8,
   max-seq 24576, `--enable-prefix-caching`, SSM_SLOTS=16 with
   SSM_CKPT_INTERVAL=128 (20 Marconi slots), ETA ~03:00Z.
+
+## 2026-09-20 — Flash-Next on Windows
+
+`nvidia/Qwen3.8-Flash-Next-NVFP4` serves natively on winbox (gfx1151,
+Windows 11, ROCm 10.0.0) on branch `port/flashnext-strix-windows`: MTP K=2
+decode measured ~2.6× over serial (17.0 vs 6.5 tok/s, n=3, fingerprinted),
+with the whole port gated by a ~84.5 GiB WDDM resident-commit wall that
+manifests as an over-commit-then-719 context kill, not a kernel fault.
+Memory model, boot chronology, recipe, and claims status:
+[`QWEN38_FLASHNEXT_STRIX_WINDOWS.md`](QWEN38_FLASHNEXT_STRIX_WINDOWS.md).
