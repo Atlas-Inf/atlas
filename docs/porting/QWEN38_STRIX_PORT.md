@@ -546,3 +546,27 @@ small-M GEMV defaults, binary `4de8cd79…` (run scripts committed at
   running: outdir `~/dp4a-ab/out/dflash-agentic-20260915T2247Z`, γ=8,
   max-seq 24576, `--enable-prefix-caching`, SSM_SLOTS=16 with
   SSM_CKPT_INTERVAL=128 (20 Marconi slots), ETA ~03:00Z.
+
+## 2026-09-19/20 — post-merge verification on main @ `da943853`
+
+DFlash2 γ=8 Option-B, nvidia/Qwen3.8-27B-NVFP4, ST-995 golden draw
+(n=995 seed 42 temp 0, no overrides) re-run after the #33 (+#37, #38)
+merges, on both Strix boxes:
+
+| box | result | mean_na (accept-debug, n=997 Done lines) | faults | record |
+|---|---|---|---|---|
+| winbox (Win11, ROCm 10.0.0, `lm-head bf16`, util 0.80, slots 20 / ckpt 128, `--request-timeout 0`) | **85.43 / 79.49**, n=995, 3.76 h | — (not captured in that script) | 0 | `run-1789814994376463100` (`C:\Users\azeez\.atlas\runs\bfcl-subset\`), fingerprint `C:\Users\azeez\code\atlas-main-verify\out\bfcl-main-fingerprint.txt` |
+| AzeezStrix (Linux, ROCm 10, `lm-head nvfp4`, util 0.80, slots 0 / ckpt 16, `--request-timeout 900`) | **85.23 / 78.61**, n=995 (20:03→~00:00Z) | avg 5.67 / median 6.00 | 0 (`grep 719` = 0) | `run-1789862348481536503`, binary `8e3d96af0cbe8c96…`, `~/dp4a-ab/out/st995-rerun-20260919T2002Z/` |
+
+Reference (pre-merge, branch `b517dd6d9`, Linux): 85.13 / 78.41 — the
+merge did not regress the leg. Per-subset profile identical on both
+boxes (simple_java 67.74, simple_javascript 74.19, live_irrelevance
+46.59, irrelevance 75.00 Linux / 79.17 Windows). Observations, not
+A/Bs (OS, lm-head dtype, slots differ).
+
+The agentic leg above (`dflash-agentic-20260915T2247Z`) completed:
+604/1007 samples in 14,392 s, 22 errors, perf score 0.5918 —
+**acceptance collapsed: mean_na avg 0.496 / median 0.000 (n=585)** —
+the drafter's 4096-token window slides on agentic transcripts, as this
+document predicted. The MTP/DFLASH headline does not carry to the
+agentic regime without a longer drafter window or window pinning.

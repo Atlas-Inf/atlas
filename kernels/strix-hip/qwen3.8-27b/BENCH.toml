@@ -146,5 +146,16 @@ normalized 78.41 on the identical draw \
 (run-1789510215749772387.json) — provenance only, not floored; \
 category detail hallucination 60.80 / live 86.47 / non_live 87.97 \
 (irrelevance 75.00, live_irrelevance 46.59, simple_java 67.74, \
-simple_javascript 74.19).
+simple_javascript 74.19). \
+POST-MERGE VERIFICATION 2026-09-19/20 on main @ da943853 (#33 + #37 + \
+#38 merged), identical golden draw, DFlash2 gamma=8 Option-B: \
+winbox (Windows 11, ROCm 10.0.0, lm-head bf16, util 0.80, slots 20 / \
+ckpt 128) overall 85.43 / normalized 79.49, n=995, 3.76 h, zero \
+faults (run-1789814994376463100); AzeezStrix (Linux, ROCm 10, lm-head \
+nvfp4, util 0.80, slots 0 / ckpt 16) overall 85.23 / normalized \
+78.61, n=995, zero faults, accept mean_na avg 5.67 / median 6.00 \
+over n=997 Done lines (run-1789862348481536503, binary sha \
+8e3d96af0cbe8c96...). Both within 0.3 of the pre-merge 85.13 / 78.41 (same draw; observations, not an A/B). \
+Provenance only, not floored — OS, lm-head dtype and slots differ \
+between the two rows and from the pre-merge record.
 """
