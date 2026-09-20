@@ -64,6 +64,17 @@ static bool atlas_trace_launch() {
     }();
     return on;
 }
+// ATLAS_TRACE_LAUNCH_SYNC=1 (diagnostic only, requires ATLAS_TRACE_LAUNCH):
+// synchronise the stream after every successful launch so an async fault
+// (e.g. a sticky 719) is reported against the kernel that caused it instead
+// of surfacing at an unrelated later call. Very slow; never enable by default.
+static bool atlas_trace_launch_sync() {
+    static const bool on = [] {
+        const char *v = getenv("ATLAS_TRACE_LAUNCH_SYNC");
+        return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+    }();
+    return on;
+}
 // Elapsed-ms wall clock for the launch trace — lets us attribute the TTFT
 // setup window to the slow ops (big allocs, first-use module init) rather
 // than just counting them.
@@ -255,6 +266,16 @@ int cuLaunchKernel(void* f, unsigned gx, unsigned gy, unsigned gz,
     if (r != hipSuccess) {
       fprintf(stderr, "[launch] %s -> err %d\n", nm.c_str(), (int)r);
       fflush(stderr);
+      return r;
+    }
+    if (atlas_trace_launch_sync()) {
+      int sr = hipStreamSynchronize((hipStream_t)stream);
+      if (sr != hipSuccess) {
+        fprintf(stderr, "[launch] %s -> ASYNC FAULT err %d (sync after launch)\n",
+                nm.c_str(), (int)sr);
+        fflush(stderr);
+        return sr;
+      }
     }
     return r;
   }
