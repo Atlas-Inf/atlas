@@ -92,11 +92,14 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
-    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
-    // still ran the full WMMA + smem-fragment work; their results were discarded
-    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
-    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
-    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
     const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A[M_TILE][K_STEP + PAD];
@@ -213,11 +216,14 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
-    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
-    // still ran the full WMMA + smem-fragment work; their results were discarded
-    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
-    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
-    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
     const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_T + PAD_T];
@@ -376,11 +382,14 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
-    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
-    // still ran the full WMMA + smem-fragment work; their results were discarded
-    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
-    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
-    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
     const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A_k64[2][M_TILE][K_STEP_T64 + PAD_T64];
@@ -576,11 +585,14 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
-    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
-    // still ran the full WMMA + smem-fragment work; their results were discarded
-    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
-    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
-    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
     const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A_fgu64[2][M_TILE][K_STEP_T64 + PAD_T64];
@@ -776,11 +788,14 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
-    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
-    // still ran the full WMMA + smem-fragment work; their results were discarded
-    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
-    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
-    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
     const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_T + PAD_T];
@@ -940,11 +955,14 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
-    // Idle-warp skip: warps whose 16-row M slab lies entirely beyond M_expert
-    // still ran the full WMMA + smem-fragment work; their results were discarded
-    // by the epilogue bounds check. 2026-09-20 winbox profile (N=20 decode-class
-    // prefill): grouped_gate_up 28.8 ms/layer, 79% of TTFT — compute-bound on
-    // padding. Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
     const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ unsigned char smem_Af2[2][M_TILE][K_STEP_T];
