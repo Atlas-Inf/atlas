@@ -10,6 +10,38 @@ use super::*;
 /// wider selections take the host arm.
 pub(super) const QSA_SELECT_MAX_BLOCKS: usize = 4096;
 
+/// Shape of the decode selection for one query, from the position alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SelectGeometry {
+    /// Complete `ratio`-token blocks in the visible prefix — the scored set.
+    pub complete: usize,
+    /// First token of the incomplete tail (`complete * ratio`).
+    pub tail_start: usize,
+    /// Tokens gathered: `block_topk` whole blocks plus the tail. Depends on
+    /// the position only, never on the scores.
+    pub n_sel: u32,
+}
+
+/// The selection geometry for the token at 0-based `pos` (`pos + 1` visible),
+/// or `None` while the selection is INERT: with at most `block_topk` complete
+/// blocks every block is selected, so dense attention is exact.
+///
+/// Pure, so the inert/active boundary and the per-row shape of a multi-row
+/// step can be table-tested without a device.
+pub(super) fn select_geometry(pos: usize, ratio: usize, block_topk: usize) -> Option<SelectGeometry> {
+    let visible = pos + 1;
+    let complete = visible / ratio;
+    if complete <= block_topk {
+        return None;
+    }
+    let tail_start = complete * ratio;
+    Some(SelectGeometry {
+        complete,
+        tail_start,
+        n_sel: (block_topk * ratio + (visible - tail_start)) as u32,
+    })
+}
+
 /// The `block_topk` largest scores, ties to the LOWER index (torch.topk),
 /// returned in ascending block order.
 pub(super) fn select_blocks(scores: &[f32], block_topk: usize) -> Vec<u32> {
@@ -109,7 +141,62 @@ impl QsaIndexer {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_selection, select_blocks};
+    use super::{SelectGeometry, expand_selection, select_blocks, select_geometry};
+
+    /// The published card: budget 2048, ratio 4 -> block_topk 512, inert
+    /// bound 2051. Positions are 0-based, so 2050 is the LAST inert token
+    /// (2051 visible) and 2051 the first active one.
+    #[test]
+    fn geometry_flips_exactly_at_the_inert_bound() {
+        let (ratio, topk) = (4usize, 512usize);
+        let bound = topk * ratio + ratio - 1; // QsaIndexer::inert_bound
+        for pos in 0..bound {
+            assert_eq!(select_geometry(pos, ratio, topk), None, "pos {pos} must be inert");
+        }
+        assert_eq!(
+            select_geometry(bound, ratio, topk),
+            Some(SelectGeometry { complete: 513, tail_start: 2052, n_sel: 2048 }),
+        );
+    }
+
+    /// Consecutive rows of one multi-row step each get their OWN shape: the
+    /// tail grows by one per row and folds into a new scored block every
+    /// `ratio` rows. A step that reused row 0's geometry for the others would
+    /// be wrong on every row but the first.
+    #[test]
+    fn consecutive_rows_walk_the_tail_and_close_blocks() {
+        let (ratio, topk) = (4usize, 512usize);
+        let got: Vec<(usize, u32)> = (2051..2060)
+            .map(|pos| {
+                let g = select_geometry(pos, ratio, topk).expect("active");
+                assert_eq!(g.tail_start, g.complete * ratio);
+                (g.complete, g.n_sel)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (513, 2048), (513, 2049), (513, 2050), (513, 2051), // 2052..=2055 visible
+                (514, 2048), (514, 2049), (514, 2050), (514, 2051), // block 513 closed
+                (515, 2048),
+            ]
+        );
+    }
+
+    /// `n_sel` is what `select_blocks` + `expand_selection` actually produce,
+    /// so the gather never reads past what the host arm wrote.
+    #[test]
+    fn geometry_agrees_with_the_host_selection_length() {
+        let (ratio, topk) = (4usize, 8usize);
+        for pos in 0..80 {
+            let Some(g) = select_geometry(pos, ratio, topk) else { continue };
+            let scores: Vec<f32> = (0..g.complete).map(|b| ((b * 7) % 11) as f32).collect();
+            let blocks = select_blocks(&scores, topk);
+            let sel = expand_selection(&blocks, ratio, g.tail_start, pos + 1);
+            assert_eq!(sel.len() as u32, g.n_sel, "pos {pos}");
+            assert!(sel.iter().all(|t| (*t as usize) <= pos), "pos {pos}: a future token was selected");
+        }
+    }
 
     #[test]
     fn ties_go_to_the_lower_index_and_output_is_ascending() {
