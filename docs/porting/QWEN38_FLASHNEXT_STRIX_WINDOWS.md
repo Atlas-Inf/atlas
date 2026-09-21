@@ -463,6 +463,35 @@ fibonacci failure is the Windows harness shim (`Shim: Could not determine
 if target is a GUI app`) failing to exec the generated code locally, not
 a model failure. Avg TPS 8.9. Results `gate-boot15.json`.
 
+### single_gpu_suite FULL (32K server, 2026-09-20)
+
+`SEQ_LEN=32768` recipe boot, MTP arm, hipBLASLt live, watchdog ON
+(production defaults), `python3` shim fixed (`py3shim\python3.exe` on
+PATH — the scoop shim cannot spawn non-interactively). Result
+`gate-full-1789942733.json`: **coherence 3/3, fibonacci 1/1, tool calls
+2/2, long context 3/3 (up to 14,615 prompt tokens), avg TPS 9.7 — 100%**.
+
+### Prefix caching under the resident wall (2026-09-21)
+
+`--enable-prefix-caching` raises the inference reserve ~+0.9 GB
+(Marconi snapshot pool: `--ssm-cache-slots` is auto-raised to cover
+`max-seq-len` — 16 slots / 1,818 MB at 32K, 13 slots at 20K).
+Boot matrix (binary `343DB554…` lineage, tip `e98a3189b`):
+
+| seq | util | prefill | arm | result |
+|---:|---:|---:|---|---|
+| 32768 | 0.901 | 1024 | MTP | FAIL — KV budget check: 81.3 pre-KV + 5.3 reserve = 86.6 > 86.5 |
+| 20480 | 0.901 | 512 | MTP | live (pre-KV 79.2, KV 2.4 GB = 105k tok) — `ATLAS_VISION_MAX_PIXELS=1048576` + smaller arena freed ~2 GB |
+| 32768 | 0.905 | 512 | MTP | live, then MTP proposer `cuMemAlloc` status 2 at committed ~86.4 → degraded to mtp=false, first request hung |
+| 32768 | 0.90 | 256 | MTP | same wall — MTP proposer status 2 |
+| **32768** | **0.86** | **256** | **serial** | **live: KV 13,500 blocks ≈ 216k tok (4.9 GB), Marconi 16 slots, decode-rollback 8 slots, PONG + MinHeap-64 smoke OK (boot `serve32ks`)** |
+
+Serial arm is the fitting configuration because speculative decode's
+`cuda_headroom` reserve is 4 GB vs 0.5 GB serial, plus ~1.5 GB of draft
+weights — prefix caching + MTP at seq 32768 cannot fit under the
+~84.5 GiB resident wall. Agentic leg therefore runs serial+prefix
+(correctness metrics are the gate; decode is ~8.4 tok/s).
+
 ### #44 DFlash smoke (main checkout `atlas-main-verify`)
 
 `feat/strix-windows-dflash-main` (`da943853`+`093f1ae1`), `DFLASH=1`,
