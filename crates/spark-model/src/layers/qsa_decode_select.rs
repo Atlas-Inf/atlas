@@ -354,6 +354,13 @@ mod rank_tests {
             }
             let blocks = select_blocks(&scores, topk);
             assert_eq!(blocks.len(), topk.min(n));
+            // With the kernel ranking NaN instead of dropping it, the device
+            // rule covers these inputs too — and must agree.
+            assert_eq!(
+                blocks,
+                device_rule(&scores, topk),
+                "scores {scores:?} topk {topk}"
+            );
             let sel = expand_selection(&blocks, 4, n * 4, n * 4 + 2);
             assert_eq!(sel.len(), topk.min(n) * 4 + 2);
         }
