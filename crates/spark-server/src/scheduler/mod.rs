@@ -30,6 +30,8 @@ mod finish_guard_tests;
 mod helpers;
 mod lifecycle;
 #[cfg(test)]
+mod lifecycle_cache_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 mod logit_dump;
 mod logit_processors;
@@ -899,6 +901,18 @@ pub fn run(
                 // Declining here just decodes the sequence serially instead.
                 && verify_ctx_limit
                     .is_none_or(|lim| active.iter().all(|a| a.seq.seq_len < lim))
+                // Never run a verify row at a position the serial path would
+                // never reach: a row AT the context ceiling is refused
+                // mid-forward by state sized to --max-seq-len, which ends the
+                // request as "error" on its last "length" step. Declining
+                // decodes serially into the existing force-stop.
+                && active.iter().all(|a| {
+                    mtp_gate::ceiling::verify_rows_fit(
+                        a.seq.seq_len,
+                        num_drafts,
+                        sched.limits.max_seq_len,
+                    )
+                })
                 && (
                     // Both lanes stay serial inside `<think>` unless
                     // ATLAS_DFLASH_SPEC_THINK=1. Resume guard still

@@ -555,6 +555,7 @@ impl MtpGate {
     }
 }
 
+pub mod ceiling;
 pub mod qsa_latch;
 
 #[cfg(test)]
