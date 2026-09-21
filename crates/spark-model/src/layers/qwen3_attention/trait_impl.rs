@@ -104,9 +104,10 @@ impl TransformerLayer for Qwen3AttentionLayer {
             .map(|cal| !cal.is_calibrating())
     }
 
-    /// QSA selection does a host top-k per step — never capturable, and a
-    /// graph captured on the dense path would replay wrong attention once
-    /// selection activates.
+    /// An indexer vetoes decode-graph capture: its ingest counter is host
+    /// state, its launch parameters depend on the position, the default top-k
+    /// arm sorts on the host — and a graph captured on the dense path would
+    /// replay wrong attention once selection activates.
     fn decode_graph_unsupported(&self) -> bool {
         self.qsa.is_some()
     }
@@ -115,7 +116,17 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.qsa.is_some()
     }
 
+    /// `None` when the batched path can serve an ACTIVE selection per row
+    /// (`multi_seq/qsa_rows.rs`) — the same static allow-list the pre-mutation
+    /// guard applies, so the scheduler and the layer cannot disagree.
     fn verify_context_limit(&self) -> Option<usize> {
+        if self.qsa_rows_static_ok() {
+            return None;
+        }
+        self.verify_context_limit_multi_seq()
+    }
+
+    fn verify_context_limit_multi_seq(&self) -> Option<usize> {
         self.qsa.as_ref().map(|q| q.inert_bound())
     }
 

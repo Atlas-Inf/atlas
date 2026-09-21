@@ -230,7 +230,10 @@ mod tests {
                     let mut st = state(&gpu, after_verify, after_verify / 4);
                     qsa.rewind_verify(&mut st, rows - accepted).unwrap();
                     let kept = base + accepted;
-                    assert_eq!(st.ingested, kept, "base {base} rows {rows} accepted {accepted}");
+                    assert_eq!(
+                        st.ingested, kept,
+                        "base {base} rows {rows} accepted {accepted}"
+                    );
                     assert_eq!(
                         st.pooled,
                         kept / 4,
@@ -270,7 +273,10 @@ mod tests {
         let qsa = indexer(&gpu);
         let mut st = state(&gpu, 3, 0);
         let err = qsa.rewind_verify(&mut st, 4).unwrap_err().to_string();
-        assert!(err.contains("QSA rewind of 4 row(s) with only 3 ingested"), "{err}");
+        assert!(
+            err.contains("QSA rewind of 4 row(s) with only 3 ingested"),
+            "{err}"
+        );
         assert_eq!((st.ingested, st.pooled), (3, 0));
     }
 }

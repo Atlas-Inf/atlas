@@ -370,11 +370,9 @@ impl QsaIndexer {
         self.pool_new_blocks(st, gpu, stream)?;
 
         let visible = pos + 1;
-        let Some(geo) = qsa_decode_select::select_geometry(
-            pos,
-            self.ratio as usize,
-            self.block_topk as usize,
-        ) else {
+        let Some(geo) =
+            qsa_decode_select::select_geometry(pos, self.ratio as usize, self.block_topk as usize)
+        else {
             return Ok(None); // provably all-visible: dense path is exact
         };
         let (complete, tail_start, n_sel) = (geo.complete, geo.tail_start, geo.n_sel);

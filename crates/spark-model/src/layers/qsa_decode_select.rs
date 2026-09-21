@@ -28,7 +28,11 @@ pub(super) struct SelectGeometry {
 ///
 /// Pure, so the inert/active boundary and the per-row shape of a multi-row
 /// step can be table-tested without a device.
-pub(super) fn select_geometry(pos: usize, ratio: usize, block_topk: usize) -> Option<SelectGeometry> {
+pub(super) fn select_geometry(
+    pos: usize,
+    ratio: usize,
+    block_topk: usize,
+) -> Option<SelectGeometry> {
     let visible = pos + 1;
     let complete = visible / ratio;
     if complete <= block_topk {
@@ -151,11 +155,19 @@ mod tests {
         let (ratio, topk) = (4usize, 512usize);
         let bound = topk * ratio + ratio - 1; // QsaIndexer::inert_bound
         for pos in 0..bound {
-            assert_eq!(select_geometry(pos, ratio, topk), None, "pos {pos} must be inert");
+            assert_eq!(
+                select_geometry(pos, ratio, topk),
+                None,
+                "pos {pos} must be inert"
+            );
         }
         assert_eq!(
             select_geometry(bound, ratio, topk),
-            Some(SelectGeometry { complete: 513, tail_start: 2052, n_sel: 2048 }),
+            Some(SelectGeometry {
+                complete: 513,
+                tail_start: 2052,
+                n_sel: 2048
+            }),
         );
     }
 
@@ -176,8 +188,14 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (513, 2048), (513, 2049), (513, 2050), (513, 2051), // 2052..=2055 visible
-                (514, 2048), (514, 2049), (514, 2050), (514, 2051), // block 513 closed
+                (513, 2048),
+                (513, 2049),
+                (513, 2050),
+                (513, 2051), // 2052..=2055 visible
+                (514, 2048),
+                (514, 2049),
+                (514, 2050),
+                (514, 2051), // block 513 closed
                 (515, 2048),
             ]
         );
@@ -189,12 +207,17 @@ mod tests {
     fn geometry_agrees_with_the_host_selection_length() {
         let (ratio, topk) = (4usize, 8usize);
         for pos in 0..80 {
-            let Some(g) = select_geometry(pos, ratio, topk) else { continue };
+            let Some(g) = select_geometry(pos, ratio, topk) else {
+                continue;
+            };
             let scores: Vec<f32> = (0..g.complete).map(|b| ((b * 7) % 11) as f32).collect();
             let blocks = select_blocks(&scores, topk);
             let sel = expand_selection(&blocks, ratio, g.tail_start, pos + 1);
             assert_eq!(sel.len() as u32, g.n_sel, "pos {pos}");
-            assert!(sel.iter().all(|t| (*t as usize) <= pos), "pos {pos}: a future token was selected");
+            assert!(
+                sel.iter().all(|t| (*t as usize) <= pos),
+                "pos {pos}: a future token was selected"
+            );
         }
     }
 
