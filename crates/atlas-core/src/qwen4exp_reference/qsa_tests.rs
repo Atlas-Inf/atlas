@@ -305,3 +305,148 @@ fn the_norm_offset_is_load_bearing() {
         .any(|(a, b)| (a - b).abs() > 1e-4);
     assert!(changed, "q_layernorm's weight is not reaching the scores");
 }
+
+// ── Speculative verify: what a (K+1)-row window must select ─────────────────
+//
+// A verify step appends K+1 rows to an existing context and attends all of
+// them in one pass. These pin, without a GPU, what each row is allowed to see
+// once the selection is ACTIVE — the contract the batched verify path has to
+// meet before it may run past the inert bound.
+
+/// The indexer over the first `n` tokens of `hidden`.
+fn select_prefix(
+    d: &QsaDims,
+    w: &(Vec<f32>, Vec<f32>, Vec<f32>),
+    hidden: &[f32],
+    n: usize,
+) -> QsaStages {
+    qsa_select(
+        d,
+        &QsaWeights {
+            index_qk_proj: &w.0,
+            q_layernorm: &w.1,
+            k_layernorm: &w.2,
+        },
+        &hidden[..n * d.hidden],
+    )
+}
+
+/// **Row `i` of a verify window selects exactly what serial decode would have
+/// selected at that position** — same token set, bit-identical scores — for
+/// every phase of `visible % ratio` and every window width K+1 = 2..=4.
+///
+/// This is the oracle for a per-row verify: whatever the GPU path does, its
+/// row `i` must equal a serial step that has seen rows `0..i` and nothing
+/// later.
+#[test]
+fn a_verify_window_selects_per_row_what_serial_decode_would() {
+    let d = dims(16); // block_topk = 4: ACTIVE from 20 visible tokens on
+    let w = weights(&d, 23);
+    for base in 24..28 {
+        for rows in 2..=4 {
+            let seq = base + rows;
+            let hidden = noise(seq * d.hidden, 31 + base as u64);
+            let window = select_prefix(&d, &w, &hidden, seq);
+            let window_blocks = seq / d.ratio;
+            for i in 0..rows {
+                let pos = base + i;
+                let serial = select_prefix(&d, &w, &hidden, pos + 1);
+                let serial_blocks = (pos + 1) / d.ratio;
+                assert!(
+                    window.selected[pos].len() < pos + 1,
+                    "base {base} rows {rows} row {i}: the selection must be ACTIVE for this to test anything"
+                );
+                assert_eq!(
+                    window.selected[pos],
+                    *serial.selected.last().expect("a query"),
+                    "base {base} rows {rows} row {i}: verify row != serial decode at position {pos}"
+                );
+                assert_eq!(
+                    &window.scores[pos * window_blocks..pos * window_blocks + serial_blocks],
+                    &serial.scores[pos * serial_blocks..(pos + 1) * serial_blocks],
+                    "base {base} rows {rows} row {i}: block scores moved with tokens the row cannot see"
+                );
+            }
+        }
+    }
+}
+
+/// **One selection shared by the whole window cannot be right**, so a verify
+/// path that computes it once per step is not an optimisation of the per-row
+/// one — it is a different function.
+///
+/// Row 0 sees 27 tokens: 6 complete blocks and a 3-token tail. Row 1 sees 28:
+/// the draft token COMPLETES block 6, so the tail is empty and a block pooled
+/// partly from draft tokens joins the ranking. The two rows differ in size,
+/// and handing row 1's set to row 0 would show it a token from its future.
+#[test]
+fn one_shared_selection_cannot_serve_a_verify_window() {
+    let d = dims(16); // block_topk = 4, ratio 4
+    let w = weights(&d, 29);
+    let hidden = noise(28 * d.hidden, 37);
+    let out = select_prefix(&d, &w, &hidden, 28);
+    let (row0, row1) = (&out.selected[26], &out.selected[27]);
+    assert_eq!(
+        row0.len(),
+        d.budget + 3,
+        "27 visible: 4 winning blocks plus the 3-token tail"
+    );
+    assert_eq!(
+        row1.len(),
+        d.budget,
+        "28 visible: the tail closed into a block, only the 4 winners remain"
+    );
+    assert!(
+        row0.iter().all(|t| *t <= 26),
+        "row 0 must not see row 1's token"
+    );
+    assert_ne!(row0, row1);
+}
+
+/// **Rejecting drafts leaves the accepted prefix untouched, and only that.**
+///
+/// Replace every token past the accepted prefix with different content (the
+/// corrected continuation) and recompute: selections and raw keys of the kept
+/// tokens are unchanged, the blocks strictly below `kept / ratio` are
+/// unchanged, and EVERY complete block at or above it changed — so those are
+/// exactly the blocks a rollback must drop and re-pool. That boundary is the
+/// one `QsaIndexer::rewind_verify` uses (`pooled.min(ingested / ratio)`).
+#[test]
+fn rejecting_drafts_leaves_exactly_the_accepted_prefix_intact() {
+    let d = dims(16);
+    let w = weights(&d, 41);
+    let hd = d.head_dim;
+    let rows = 4; // K = 3 drafts
+    for base in 24..28 {
+        let seq = base + rows;
+        let drafted = noise(seq * d.hidden, 43 + base as u64);
+        let a = select_prefix(&d, &w, &drafted, seq);
+        for kept_rows in 0..=rows {
+            let kept = base + kept_rows; // tokens [0, kept) survive
+            let mut corrected = drafted.clone();
+            let fresh = noise((seq - kept) * d.hidden, 47 + kept as u64);
+            corrected[kept * d.hidden..].copy_from_slice(&fresh);
+            let b = select_prefix(&d, &w, &corrected, seq);
+
+            assert_eq!(
+                a.selected[..kept],
+                b.selected[..kept],
+                "base {base} kept {kept}: a kept row's selection moved"
+            );
+            assert_eq!(a.raw_keys[..kept * hd], b.raw_keys[..kept * hd]);
+            let intact = kept / d.ratio;
+            assert_eq!(
+                a.block_keys[..intact * hd],
+                b.block_keys[..intact * hd],
+                "base {base} kept {kept}: a block wholly inside the accepted prefix changed"
+            );
+            for blk in intact..seq / d.ratio {
+                assert_ne!(
+                    a.block_keys[blk * hd..(blk + 1) * hd],
+                    b.block_keys[blk * hd..(blk + 1) * hd],
+                    "base {base} kept {kept}: block {blk} holds a rejected token and must be re-pooled"
+                );
+            }
+        }
+    }
+}
