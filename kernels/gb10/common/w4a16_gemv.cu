@@ -980,28 +980,58 @@ extern "C" __global__ void w4a16_gemv_qg(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-
 #if defined(__HIP_PLATFORM_AMD__)
     // Stage + barrier before the warp-uniform early return: s_lut2 is shared
     // by the whole block, so exited threads would leave unwritten entries.
     __shared__ unsigned int s_lut2[256];
     stage_e2m1_lut2_block(s_lut2);
     __syncthreads();
-#else
-    const unsigned int* s_lut2 = nullptr;
 #endif
     if (n >= N) return;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
 
     __shared__ float s_lut[16];
     __shared__ float smem[N_PER_BLOCK * 2];
     if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
     __syncthreads();
 
+#if defined(__HIP_PLATFORM_AMD__)
     float acc = w4a16_gemv_partial(A, B_packed, B_scale, scale2, n, half_K,
                                    num_groups, K / 16, lane, s_lut, s_lut2);
+#else
+    float acc = 0.0f;
+
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+        uint4 a_data = ((const uint4*)A)[k8];
+        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+        float scale = scl_fp8(scale_byte) * scale2;
+#else
+        float scale = (float)fp8 * scale2;
+#endif
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+            __nv_bfloat16 a_lo, a_hi;
+            *(unsigned short*)&a_lo = (unsigned short)(a_raw[b] & 0xFFFF);
+            *(unsigned short*)&a_hi = (unsigned short)(a_raw[b] >> 16);
+            acc += __bfloat162float(a_lo) * w_lo;
+            acc += __bfloat162float(a_hi) * w_hi;
+        }
+    }
+#endif
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
@@ -1065,28 +1095,58 @@ extern "C" __global__ void w4a16_gemv_qkvz(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-
 #if defined(__HIP_PLATFORM_AMD__)
     __shared__ unsigned int s_lut2[256];
     stage_e2m1_lut2_block(s_lut2);
     __syncthreads();
-#else
-    const unsigned int* s_lut2 = nullptr;
 #endif
     if (n >= N) return;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups_k = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
 
     __shared__ float s_lut[16];
     __shared__ float smem[N_PER_BLOCK * 2];
     if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
     __syncthreads();
 
+#if defined(__HIP_PLATFORM_AMD__)
     // Same pipelined partial as w4a16_gemv (scale factored out of the 16-FMA
     // block, two chunks in flight). gfx1151 measured ~5x over the k8 loop.
     float acc = w4a16_gemv_partial(A, B_packed, B_scale, scale2, n, half_K,
                                    num_groups_k, K / 16, lane, s_lut, s_lut2);
+#else
+    float acc = 0.0f;
+
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+        uint4 a_data = ((const uint4*)A)[k8];
+        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups_k + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+        float scale = scl_fp8(scale_byte) * scale2;
+#else
+        float scale = (float)fp8 * scale2;
+#endif
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+            __nv_bfloat16 a_lo, a_hi;
+            *(unsigned short*)&a_lo = (unsigned short)(a_raw[b] & 0xFFFF);
+            *(unsigned short*)&a_hi = (unsigned short)(a_raw[b] >> 16);
+            acc += __bfloat162float(a_lo) * w_lo;
+            acc += __bfloat162float(a_hi) * w_hi;
+        }
+    }
+#endif
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
