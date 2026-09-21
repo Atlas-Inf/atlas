@@ -50,12 +50,7 @@ pub(super) fn select_geometry(
 /// returned in ascending block order.
 pub(super) fn select_blocks(scores: &[f32], block_topk: usize) -> Vec<u32> {
     let mut order: Vec<u32> = (0..scores.len() as u32).collect();
-    order.sort_by(|&a, &b| {
-        scores[b as usize]
-            .partial_cmp(&scores[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
+    order.sort_by(|&a, &b| rank_cmp(scores, a, b));
     let mut blocks: Vec<u32> = order[..block_topk.min(order.len())].to_vec();
     blocks.sort_unstable();
     blocks
@@ -81,6 +76,36 @@ pub(super) fn expand_selection(
         sel.push(t as i32);
     }
     sel
+}
+
+/// Ranking key for a block score.
+///
+/// Block scores are `sum_h relu(q_h . k_b) / sqrt(hd)`: `>= 0`, possibly
+/// `+inf`, and NEVER NaN — the scoring kernels take the relu as
+/// `fmaxf(dot, 0)`, which returns the non-NaN operand, so a NaN query or key
+/// contributes 0 (pinned on the CPU reference by
+/// `nan_activations_score_zero_not_nan`; GB10 kernels build without
+/// fast-math). The key makes the ORDER total regardless, so that invariant is
+/// not load-bearing here: NaN ranks below every real score, and `-0.0` folds
+/// into `+0.0`, which the device kernel's `>` / `==` treat as equal and
+/// `total_cmp` alone would not.
+pub(super) fn rank_key(s: f32) -> f32 {
+    if s.is_nan() {
+        f32::NEG_INFINITY
+    } else if s == 0.0 {
+        0.0
+    } else {
+        s
+    }
+}
+
+/// The order BOTH top-k arms rank blocks by: larger score first, lower index
+/// on ties. Total for every input, so `sort_by` can neither panic on an
+/// inconsistent comparator nor return an unspecified order.
+pub(super) fn rank_cmp(scores: &[f32], a: u32, b: u32) -> std::cmp::Ordering {
+    rank_key(scores[b as usize])
+        .total_cmp(&rank_key(scores[a as usize]))
+        .then(a.cmp(&b))
 }
 
 impl QsaIndexer {
@@ -233,5 +258,104 @@ mod tests {
     fn expansion_matches_the_gather_layout() {
         // ratio 2, blocks [0, 3] → tokens 0,1,6,7, then the tail 8..10.
         assert_eq!(expand_selection(&[0, 3], 2, 8, 10), vec![0, 1, 6, 7, 8, 9]);
+    }
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use super::{expand_selection, select_blocks};
+
+    /// The DEVICE kernel's selection rule (`qsa_select_topk`), transcribed
+    /// with its OWN comparisons — NaN staged as -inf, `rank(b) = #{j : s_j >
+    /// s_b || (s_j == s_b && j < b)}`, selected iff `rank < topk` — and NOT
+    /// through `rank_key`, so the host arm is pinned against the device rule
+    /// rather than against a helper they would share.
+    fn device_rule(scores: &[f32], topk: usize) -> Vec<u32> {
+        let sc: Vec<f32> = scores
+            .iter()
+            .map(|v| if v.is_nan() { f32::NEG_INFINITY } else { *v })
+            .collect();
+        (0..sc.len())
+            .filter(|&b| {
+                let rank = (0..sc.len())
+                    .filter(|&j| sc[j] > sc[b] || (sc[j] == sc[b] && j < b))
+                    .count();
+                rank < topk
+            })
+            .map(|b| b as u32)
+            .collect()
+    }
+
+    /// SplitMix64 — reproducible from the seed, no dev-dependency.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Scores as the kernels produce them: `>= 0`, heavy with exact ties,
+    /// both zeros, and the odd `+inf`.
+    fn reachable_scores(state: &mut u64, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|_| match next(state) % 16 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f32::INFINITY,
+                v => (v % 5) as f32 * 0.25, // few levels => many ties
+            })
+            .collect()
+    }
+
+    #[test]
+    fn host_selection_equals_the_device_rule_on_reachable_scores() {
+        let mut state = 0xA71A5u64;
+        for _ in 0..4000 {
+            let n = 1 + (next(&mut state) % 96) as usize;
+            let topk = 1 + (next(&mut state) % n as u64) as usize;
+            let scores = reachable_scores(&mut state, n);
+            let got = select_blocks(&scores, topk);
+            assert_eq!(
+                got,
+                device_rule(&scores, topk),
+                "scores {scores:?} topk {topk}"
+            );
+            assert_eq!(got.len(), topk.min(n));
+        }
+    }
+
+    #[test]
+    fn signed_zeros_tie_and_go_to_the_lower_index() {
+        // `total_cmp` alone would rank +0.0 above -0.0 and pick block 1.
+        assert_eq!(select_blocks(&[-0.0, 0.0, -0.0], 1), vec![0]);
+        assert_eq!(select_blocks(&[0.0, -0.0, 0.5], 2), vec![0, 2]);
+    }
+
+    /// NaN cannot reach here today (see `rank_key`), but the order must stay
+    /// total if it ever does: no panic, exactly `topk` blocks, real scores
+    /// first, NaN blocks last and by index — so the expanded selection still
+    /// has the length the gather reads.
+    #[test]
+    fn nan_scores_rank_last_and_never_change_the_count() {
+        let nan = f32::NAN;
+        assert_eq!(select_blocks(&[nan, 0.5, nan, 0.25], 2), vec![1, 3]);
+        assert_eq!(select_blocks(&[nan, 0.5, nan, 0.25], 3), vec![0, 1, 3]);
+        assert_eq!(select_blocks(&[nan; 6], 4), vec![0, 1, 2, 3]);
+        let mut state = 0xBADF00Du64;
+        for _ in 0..2000 {
+            let n = 1 + (next(&mut state) % 64) as usize;
+            let topk = 1 + (next(&mut state) % n as u64) as usize;
+            let mut scores = reachable_scores(&mut state, n);
+            for s in scores.iter_mut() {
+                if next(&mut state).is_multiple_of(3) {
+                    *s = nan;
+                }
+            }
+            let blocks = select_blocks(&scores, topk);
+            assert_eq!(blocks.len(), topk.min(n));
+            let sel = expand_selection(&blocks, 4, n * 4, n * 4 + 2);
+            assert_eq!(sel.len(), topk.min(n) * 4 + 2);
+        }
     }
 }

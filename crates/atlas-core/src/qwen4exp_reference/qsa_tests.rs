@@ -111,6 +111,53 @@ fn restricts_once_the_budget_is_crossed() {
     );
 }
 
+/// **NaN activations give ZERO block scores, not NaN ones** — the relu is a
+/// `max(dot, 0)`, and `max` returns the non-NaN operand. That is what keeps
+/// NaN out of the top-k on every implementation (the CUDA kernels use
+/// `fmaxf`): a broken row selects deterministically, the lowest-index blocks,
+/// instead of handing the selection an unordered input. If the relu is ever
+/// rewritten in a NaN-propagating form (`dot * (dot > 0)`), this fails first.
+#[test]
+fn nan_activations_score_zero_not_nan() {
+    let d = dims(16); // block_topk = 4, ratio 4: ACTIVE from 20 visible
+    let (proj, qn, kn) = weights(&d, 13);
+    let seq = 32;
+    let bad = 25; // a NaN hidden row past the bound
+    let mut hidden = noise(seq * d.hidden, 17);
+    for v in &mut hidden[bad * d.hidden..(bad + 1) * d.hidden] {
+        *v = f32::NAN;
+    }
+    let out = qsa_select(
+        &d,
+        &QsaWeights {
+            index_qk_proj: &proj,
+            q_layernorm: &qn,
+            k_layernorm: &kn,
+        },
+        &hidden,
+    );
+    assert!(
+        out.scores.iter().all(|s| !s.is_nan()),
+        "a NaN reached the block scores"
+    );
+    let blocks = seq / d.ratio;
+    // The NaN QUERY: every block scores exactly 0, so the tie-break decides.
+    let complete = (bad + 1) / d.ratio;
+    assert!(
+        out.scores[bad * blocks..bad * blocks + complete]
+            .iter()
+            .all(|s| *s == 0.0)
+    );
+    let mut want: Vec<u32> = (0..(d.block_topk() * d.ratio) as u32).collect();
+    want.extend([24, 25]); // its tail
+    assert_eq!(out.selected[bad], want);
+    // The NaN KEY: block 6 (tokens 24..=27) scores exactly 0 for every later,
+    // finite query — the lowest a score can be, never an unordered value.
+    for t in 27..seq {
+        assert_eq!(out.scores[t * blocks + 6], 0.0, "query {t}");
+    }
+}
+
 /// The incomplete tail is ALWAYS visible — and, the surprise, the CURRENT
 /// TOKEN IS NOT.
 ///
