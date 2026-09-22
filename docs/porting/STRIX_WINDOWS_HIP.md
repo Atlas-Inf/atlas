@@ -221,11 +221,12 @@ and changes nothing, if you want to look before you leap.
 
 ```powershell
 git clone https://github.com/Atlas-Inf/atlas.git
-.\build-amd.ps1     # check box + toolchain, repair symlinks, cargo build
+.\build-amd.ps1     # repair symlinks (first_run -Phase symlinks), then check + cargo build
 .\serve-amd.ps1     # check GPU + weights, serve, smoke-test
 ```
 
-These forward to `first_run.ps1 -Phase build` / `-Phase serve`; every
+`build-amd.ps1` forwards to `first_run.ps1 -Phase symlinks` then `-Phase
+build`; `serve-amd.ps1` to `-Phase serve`. Every
 `ATLAS_*`/`HIP_PATH` override that script documents applies. `.\serve-amd.ps1
 C:\path\to\weights` selects a different local snapshot.
 

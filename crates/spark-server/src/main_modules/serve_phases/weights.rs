@@ -11,7 +11,16 @@ use atlas_core::config::ModelConfig;
 use crate::cli;
 
 pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
-    if config.model_type == "minimax_m2" || config.model_type == "step3p7" {
+    // Both Qwen3.8-Flash-Next NVFP4 packs measure device-after-load / on-disk
+    // at ~1.15: nvidia pack 84.0 GB / 73.33 GB (2026-09-15 serve log,
+    // docs/porting/QWEN38_NVIDIA_PORT_LOG_2026-09-15.md §B.2), RadixArk pack
+    // ~90.4 GB peak / 78.19 GB on-disk (gb10 flash-next MODEL.toml memory
+    // note). The generic 1.3 over-projects by ~10 GB — that is what refused
+    // util >=0.85 + MTP on GB10 (§B.2 rows 014/015) and every boot on a 96 GB
+    // Strix pool. 1.2 keeps ~4.5% margin over the measured ratio.
+    if config.model_type == "qwen4_exp" {
+        Some(1.2)
+    } else if config.model_type == "minimax_m2" || config.model_type == "step3p7" {
         Some(1.02)
     } else if config
         .quantization_config
@@ -282,4 +291,24 @@ fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
     // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
     // comes straight out of the KV cache. With the flag it is the drafter.
     matches!(config.model_type.as_str(), "qwen4_exp") && !args.speculative
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quant_multiplier;
+    use atlas_core::config::ModelConfig;
+
+    #[test]
+    fn qwen4_exp_uses_measured_load_peak() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen4_exp".to_string();
+        assert_eq!(quant_multiplier(&config), Some(1.2));
+    }
+
+    #[test]
+    fn non_fp8_qwen35_keeps_generic_multiplier() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen3_5".to_string();
+        assert_eq!(quant_multiplier(&config), None);
+    }
 }

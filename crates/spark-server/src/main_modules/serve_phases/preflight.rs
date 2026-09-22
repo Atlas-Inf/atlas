@@ -303,6 +303,36 @@ pub(crate) fn init_gpu_backend(
             .context("Failed to initialize CUDA backend")?;
 
     let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(backend);
+    // HIP targets link a cuBLASLt stub (every call fails), which would strand
+    // the ~20 BF16 projection sites that route through
+    // `cublaslt::bf16_gemm_act_weight_t` with no fallback. Install one
+    // process-global Atlas-GEMM fallback now, while the kernel registry is
+    // live: it only ever fires when `ctx()` fails, so cuBLASLt-capable
+    // backends never consult it. `pipelined` may be unresolved on targets
+    // that lack the tensor-core variant — the fallback then uses the scalar
+    // kernel for every shape.
+    let pipelined = gpu
+        .kernel("gemm", "dense_gemm_bf16_pipelined")
+        .unwrap_or(spark_runtime::gpu::KernelHandle(0));
+    let scalar = gpu
+        .kernel("gemm", "dense_gemm_bf16")
+        .unwrap_or(spark_runtime::gpu::KernelHandle(0));
+    // Optional small-M arm: `dense_gemv_bf16_batchm` serves 1 <= M <= 8
+    // decode projections (e.g. Flash-Next's BF16 `in_proj_qkvz`) in one
+    // bandwidth-bound pass instead of a 128-row WMMA tile. Handle 0 -> the
+    // fallback skips the arm.
+    let gemv_batchm = gpu
+        .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
+        .unwrap_or(spark_runtime::gpu::KernelHandle(0));
+    if spark_runtime::cublaslt::install_bf16_fallback(spark_runtime::cublaslt::make_bf16_fallback(
+        pipelined,
+        scalar,
+        gemv_batchm,
+    )) {
+        tracing::info!(
+            "BF16 GEMM fallback installed (gemv<=8 / pipelined WMMA / scalar) for backends without cuBLASLt"
+        );
+    }
     let total_mem = gpu.total_memory()?;
     let free_mem = gpu.free_memory()?;
     // Baseline for self-relative KV budgeting: free memory now (post context +
