@@ -3,6 +3,9 @@
 Every number in `docs/porting/QWEN38_STRIX_PORT.md` §2026-09-15 came from
 these scripts' outdirs under `~/dp4a-ab/out/` on strix.
 
+- `serve_dflash2.sh` — one-line DFlash2 γ=8 Option-B serve (wraps
+  `serve-amd.sh` with the certified env baked in; every knob
+  env-overridable). `DRAFT_MODEL`/`PORT`/`GAMMA` etc. as env.
 - `dflash_ab.sh` — sustained A/B driver: one serve arm per invocation
   (serial / MTP K4 / DFlash γ / Option-B / GEMV toggles), 3×N MinHeap +
   prose + JSON rows, parity + accept capture. Writes
