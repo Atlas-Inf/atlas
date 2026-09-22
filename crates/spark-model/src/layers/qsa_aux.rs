@@ -182,4 +182,101 @@ mod tests {
         assert_eq!(buf.capacity(), cap, "buffer reallocated on reuse");
         assert_eq!(buf.as_ptr(), ptr, "buffer moved on reuse");
     }
+
+    fn indexer(gpu: &MockGpuBackend) -> QsaIndexer {
+        QsaIndexer::new(
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            /*n_heads*/ 2,
+            /*hd*/ 8,
+            /*ratio*/ 4,
+            /*budget*/ 64,
+            /*max_seq_len*/ 256,
+            /*rot*/ 8,
+            /*theta*/ 1e5,
+            /*eps*/ 1e-5,
+            /*hidden*/ 128,
+            /*nkv_attn*/ 2,
+            /*hd_attn*/ 16,
+            gpu,
+        )
+        .unwrap()
+    }
+
+    fn state(gpu: &MockGpuBackend, ingested: usize, pooled: usize) -> QsaSeqState {
+        QsaSeqState {
+            ingested,
+            pooled,
+            table_len: 0,
+            raw_keys: gpu.alloc(256 * 8 * 2).unwrap(),
+            block_keys: gpu.alloc(64 * 8 * 2).unwrap(),
+        }
+    }
+
+    /// After a verify of `rows` rows that kept `accepted`, the counters must
+    /// equal those of a sequence that serially decoded the accepted prefix
+    /// and nothing else: `ingested` back to the prefix, and no pooled block
+    /// that holds a rejected key — for every phase of `visible % ratio`,
+    /// including a rejection that lands exactly on a block boundary.
+    #[test]
+    fn rewind_lands_on_the_serial_state_of_the_accepted_prefix() {
+        let gpu = MockGpuBackend::new();
+        let qsa = indexer(&gpu);
+        for base in 100..108 {
+            for rows in 1..=4 {
+                for accepted in 0..=rows {
+                    let after_verify = base + rows;
+                    let mut st = state(&gpu, after_verify, after_verify / 4);
+                    qsa.rewind_verify(&mut st, rows - accepted).unwrap();
+                    let kept = base + accepted;
+                    assert_eq!(
+                        st.ingested, kept,
+                        "base {base} rows {rows} accepted {accepted}"
+                    );
+                    assert_eq!(
+                        st.pooled,
+                        kept / 4,
+                        "base {base} rows {rows} accepted {accepted}: a block holding a rejected key survived"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pooling may lag ingest (it runs at the next ingest); a rewind must
+    /// never RAISE the pooled count to the new quotient.
+    #[test]
+    fn rewind_never_raises_the_pooled_count() {
+        let gpu = MockGpuBackend::new();
+        let qsa = indexer(&gpu);
+        let mut st = state(&gpu, 110, 20);
+        qsa.rewind_verify(&mut st, 2).unwrap();
+        assert_eq!((st.ingested, st.pooled), (108, 20));
+    }
+
+    #[test]
+    fn rewinding_nothing_changes_nothing() {
+        let gpu = MockGpuBackend::new();
+        let qsa = indexer(&gpu);
+        let mut st = state(&gpu, 110, 27);
+        qsa.rewind_verify(&mut st, 0).unwrap();
+        assert_eq!((st.ingested, st.pooled), (110, 27));
+    }
+
+    /// Rewinding more rows than were ingested means the dispatcher's verify
+    /// width and the rows actually scanned disagree: an error, never a clamp,
+    /// and the state is left as it was.
+    #[test]
+    fn rewinding_past_the_start_is_an_error_and_leaves_the_state() {
+        let gpu = MockGpuBackend::new();
+        let qsa = indexer(&gpu);
+        let mut st = state(&gpu, 3, 0);
+        let err = qsa.rewind_verify(&mut st, 4).unwrap_err().to_string();
+        assert!(
+            err.contains("QSA rewind of 4 row(s) with only 3 ingested"),
+            "{err}"
+        );
+        assert_eq!((st.ingested, st.pooled), (3, 0));
+    }
 }

@@ -188,6 +188,14 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// `verify_context_limit` for a batched verify whose rows span SEVERAL
+    /// sequences, and for any lane that must stay conservative. The per-row
+    /// QSA phase serves ONE sequence's window, so a layer that lifts the
+    /// single-sequence limit still reports its inert bound here.
+    fn verify_context_limit_multi_seq(&self) -> Option<usize> {
+        self.verify_context_limit()
+    }
+
     /// Deepest `num_drafts` this layer can serve in a BATCHED verify, if it
     /// is bounded at all. The verify runs `K = num_drafts + 1` rows.
     ///

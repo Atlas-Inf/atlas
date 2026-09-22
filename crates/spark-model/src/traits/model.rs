@@ -594,6 +594,14 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// The same limit for a verify batch of SEVERAL sequences, and for lanes
+    /// that stay conservative (n-gram). Never looser than
+    /// `verify_context_limit`: a model may serve an active QSA selection for
+    /// one sequence's verify window and still not for a multi-sequence batch.
+    fn verify_context_limit_multi_seq(&self) -> Option<usize> {
+        self.verify_context_limit()
+    }
+
     /// Deepest `num_drafts` a batched verify may dispatch, or `None` when
     /// nothing bounds it. The tightest bound across the layers; the
     /// scheduler clamps every speculative step's draft count to it, because

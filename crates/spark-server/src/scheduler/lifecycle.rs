@@ -136,7 +136,11 @@ pub(super) fn derive_finish_reason(
 pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize) {
     // An engine abort is not a model stop. Reporting it as "stop" is how a
     // verify failure at token 1,679 read as a clean completion to the client.
-    let reason = if a.engine_error.is_some() {
+    // Read ONCE, here: the blocking branch below `take()`s the error to build
+    // the response, so by the caching decision at the end of this function the
+    // field is already `None` for blocking clients.
+    let engine_failed = a.engine_error.is_some();
+    let reason = if engine_failed {
         "error"
     } else {
         derive_finish_reason(
@@ -220,7 +224,16 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
     // Cache the full sequence (prompt + generated) in the prefix cache.
     // Must happen BEFORE free_sequence() so block indices are still valid.
     // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
-    model.cache_sequence(&a.seq);
+    //
+    // NOT after an engine error. A finish leaf pairs `seq.tokens` with a
+    // snapshot of the sequence's LIVE recurrent state; a step that failed
+    // mid-forward leaves the tokens un-advanced while the layers before the
+    // failing one have already consumed it. Caching that pair poisons the next
+    // warm hit — the client's retry of this very conversation. The prompt
+    // prefix was inserted, with its own snapshots, at prefill and stays cached.
+    if !engine_failed {
+        model.cache_sequence(&a.seq);
+    }
     if let Err(e) = model.free_sequence(&mut a.seq) {
         tracing::error!("free_sequence: {e:#}");
     }

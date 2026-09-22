@@ -24,6 +24,13 @@ pub(super) const EOS: &[u32] = &[151645];
 pub(super) const TOOL_END: Option<u32> = Some(151658);
 pub(super) const MAX_SEQ_LEN: usize = 8192;
 
+thread_local! {
+    /// `StubModel::{cache,free}_sequence` calls on THIS test's thread (each
+    /// `#[test]` runs on its own, and `finish_sequence` is synchronous).
+    pub(super) static CACHE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static FREE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Common-case shorthand: mid-context position (no seqlen ceiling), so
 /// the budget dimension under test is the `remaining` countdown.
 pub(super) fn derive(
@@ -312,8 +319,11 @@ impl Model for StubModel {
     fn decode_draft(&self, _t: u32, _s: &mut SequenceState, _st: u64) -> Result<DevicePtr> {
         anyhow::bail!("unused in lifecycle tests")
     }
-    fn cache_sequence(&self, _s: &SequenceState) {}
+    fn cache_sequence(&self, _s: &SequenceState) {
+        CACHE_CALLS.with(|c| c.set(c.get() + 1));
+    }
     fn free_sequence(&self, _s: &mut SequenceState) -> Result<()> {
+        FREE_CALLS.with(|c| c.set(c.get() + 1));
         Ok(())
     }
     fn compact_sequence(&self, _s: &mut SequenceState, _slot: usize) -> Result<()> {
@@ -473,24 +483,4 @@ fn call_site_passes_the_real_guard() {
     // receives is decided.
     let (a, rx) = test_seq(vec![5, 6, 42], 3, Some("fuzzy_repetition"), 10);
     assert_eq!(finish_and_recv(a, rx).finish_reason, "length");
-}
-
-/// An engine abort must never read as a model stop: the blocking client gets
-/// an error payload (→ HTTP 500), not a completion with finish_reason "stop".
-#[test]
-fn engine_error_is_never_reported_as_stop() {
-    let (mut a, mut rx) = test_seq(vec![5, 6, 42], 5, None, 10);
-    a.engine_error = Some("boom".into());
-    finish_sequence(&StubModel::default(), &mut a, MAX_SEQ_LEN);
-    let err = match rx
-        .try_recv()
-        .expect("finish_sequence must send the blocking response")
-    {
-        Err(e) => e,
-        Ok(r) => panic!(
-            "an engine error must surface as Err, got finish_reason={}",
-            r.finish_reason
-        ),
-    };
-    assert!(format!("{err:#}").contains("boom"), "{err:#}");
 }

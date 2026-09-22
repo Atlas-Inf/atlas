@@ -36,6 +36,13 @@ impl TransformerModel {
     ) -> Result<crate::engine::GenerateResult> {
         // Self-speculative mode: draft via layer-skipping (no MTP weights needed)
         if self.self_speculative {
+            // The draft pass runs the attention layers, which advance any
+            // per-sequence aux state (QSA indexer, PLE history); this loop
+            // rewinds only `seq_len`, so the verify would lose sync.
+            anyhow::ensure!(
+                !TransformerModel::requires_aux_state(self),
+                "self-speculative decoding is not supported on a model with per-sequence aux state"
+            );
             let mut seq = self.alloc_sequence()?;
             let stream = self.gpu.default_stream();
             let result = self.generate_self_speculative_inner(

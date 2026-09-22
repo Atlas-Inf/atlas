@@ -30,6 +30,8 @@ mod finish_guard_tests;
 mod helpers;
 mod lifecycle;
 #[cfg(test)]
+mod lifecycle_cache_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 mod logit_dump;
 mod logit_processors;
@@ -759,7 +761,16 @@ pub fn run(
             // place — no parallel accounting, the value below is the one the
             // dispatch chain actually uses.
             let spec_width_ok = active.len() <= mtp_max_seqs();
-            let verify_ctx_limit = model.verify_context_limit();
+            // Conservative bound: multi-sequence verify batches and the
+            // n-gram lane stop at the QSA inert bound. A sequence speculating
+            // ALONE on the MTP lane may go past it when the model serves an
+            // active selection per row (`verify_context_limit` -> `None`).
+            let verify_ctx_limit_batched = model.verify_context_limit_multi_seq();
+            let verify_ctx_limit = mtp_gate::qsa_latch::mtp_verify_limit(
+                active.len(),
+                model.verify_context_limit(),
+                verify_ctx_limit_batched,
+            );
             // D-2a latch: a sequence admitted just BELOW the bound gets a
             // verify step that ingests num_drafts + 1 rows ACROSS it, so the
             // NEXT verify runs with an ACTIVE QSA selection on the batched
@@ -792,7 +803,7 @@ pub fn run(
             // were never forwarded, so discarding them needs no rewind.
             if use_ngram_speculative
                 && active.len() == 1
-                && verify_ctx_limit.is_some_and(|lim| active[0].seq.seq_len >= lim)
+                && verify_ctx_limit_batched.is_some_and(|lim| active[0].seq.seq_len >= lim)
                 && !active[0].pending_drafts.is_empty()
             {
                 active[0].pending_drafts.clear();
@@ -818,7 +829,7 @@ pub fn run(
                 && !(spec_slots_covered
                     && active[0].grammar_state.is_none()
                     && active[0].temperature == 0.0
-                    && verify_ctx_limit.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim))
+                    && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim))
             {
                 tracing::debug!(
                     "ngram declined: grammar={} temp={} slots_covered={} seq_len={} lim={}",
@@ -826,7 +837,7 @@ pub fn run(
                     active[0].temperature,
                     spec_slots_covered,
                     active[0].seq.seq_len,
-                    verify_ctx_limit.unwrap_or(0),
+                    verify_ctx_limit_batched.unwrap_or(0),
                 );
             }
             if use_ngram_speculative
@@ -834,7 +845,7 @@ pub fn run(
                 && spec_slots_covered
                 && active[0].grammar_state.is_none()
                 && active[0].temperature == 0.0
-                && verify_ctx_limit.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
+                && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
@@ -890,6 +901,18 @@ pub fn run(
                 // Declining here just decodes the sequence serially instead.
                 && verify_ctx_limit
                     .is_none_or(|lim| active.iter().all(|a| a.seq.seq_len < lim))
+                // Never run a verify row at a position the serial path would
+                // never reach: a row AT the context ceiling is refused
+                // mid-forward by state sized to --max-seq-len, which ends the
+                // request as "error" on its last "length" step. Declining
+                // decodes serially into the existing force-stop.
+                && active.iter().all(|a| {
+                    mtp_gate::ceiling::verify_rows_fit(
+                        a.seq.seq_len,
+                        num_drafts,
+                        sched.limits.max_seq_len,
+                    )
+                })
                 && (
                     // Both lanes stay serial inside `<think>` unless
                     // ATLAS_DFLASH_SPEC_THINK=1. Resume guard still

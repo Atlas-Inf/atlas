@@ -20,6 +20,31 @@ pub(crate) fn checked_dflash_num_drafts(gamma: usize) -> Result<usize> {
     Ok(num_drafts)
 }
 
+/// Whether the self-speculative lane runs, or an error when it was asked for
+/// on a model that cannot support it.
+///
+/// Self-speculation drafts by running the ATTENTION layers only and then
+/// rewinds `seq_len` / `tokens`, on the premise that nothing else moved. That
+/// premise fails for a model with per-sequence aux state on the attention
+/// side (QSA indexer cursors, PLE n-gram history — `Model::requires_aux_state`):
+/// the draft pass advances it, nothing rewinds it, and the verify that follows
+/// fails its position check — on the first speculative step of every request.
+/// The operator asked for the flag, so refuse loudly instead of serving a lane
+/// that errors, or silently turning it off.
+pub(crate) fn self_spec_supported(
+    requested: bool,
+    model_has_it: bool,
+    requires_aux_state: bool,
+) -> Result<bool> {
+    anyhow::ensure!(
+        !(requested && model_has_it && requires_aux_state),
+        "--self-speculative is not supported on this model: its draft pass advances per-sequence \
+         aux state (QSA indexer / PLE history) that the self-speculative rollback does not rewind. \
+         Use --speculative (MTP) instead."
+    );
+    Ok(requested && model_has_it)
+}
+
 /// Floor SSM snapshot slots so a 1M prefill does not drop Marconi
 /// checkpoints (`SSM snapshot pool exhausted`). Tokens per snapshot =
 /// `ssm_checkpoint_interval * block_size` (default 256*16=4096).
@@ -339,6 +364,32 @@ mod prefix_cache_tests {
 
         let cache = build_prefix_cache(&enabled_args(), &config);
         assert!(!cache.is_active());
+    }
+}
+
+#[cfg(test)]
+mod self_spec_tests {
+    use super::self_spec_supported;
+
+    #[test]
+    fn the_lane_runs_only_when_asked_for_and_available() {
+        assert!(!self_spec_supported(false, false, false).unwrap());
+        assert!(!self_spec_supported(false, true, false).unwrap());
+        assert!(!self_spec_supported(true, false, false).unwrap());
+        assert!(self_spec_supported(true, true, false).unwrap());
+    }
+
+    #[test]
+    fn aux_state_models_refuse_the_flag_and_nothing_else() {
+        let err = self_spec_supported(true, true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--self-speculative is not supported"), "{err}");
+        assert!(err.contains("--speculative (MTP)"), "{err}");
+        // Not requested, or not built with it: aux state is irrelevant.
+        assert!(!self_spec_supported(false, true, true).unwrap());
+        assert!(!self_spec_supported(true, false, true).unwrap());
+        assert!(!self_spec_supported(false, false, true).unwrap());
     }
 }
 
