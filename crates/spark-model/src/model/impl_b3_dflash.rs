@@ -324,7 +324,12 @@ impl TransformerModel {
 
     /// Slot-addressed pack: copies the sequence's slot-indexed capture
     /// region to the front for the commit_ctx reader.
-    pub(super) fn pack_dflash_save_region(&self, slot: usize, k: usize, _stream: u64) -> Result<()> {
+    pub(super) fn pack_dflash_save_region(
+        &self,
+        slot: usize,
+        k: usize,
+        _stream: u64,
+    ) -> Result<()> {
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
             None => return Ok(()),
