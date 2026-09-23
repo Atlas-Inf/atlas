@@ -559,8 +559,9 @@ fn ctx_carry_rejects_divergent_prefix_without_leaking() {
     assert!(fresh.block_table.is_empty());
     assert!(!fresh.prefill_done);
     assert_eq!(fresh.ctx_hidden_acc.0, fresh_acc.0);
-    // Accumulator + device block table freed (no phantom allocs).
-    assert!(gpu.alloc_count() >= allocs_before);
+    // Carried accumulator + device block table freed; fresh acc survives
+    // (alloc_count is a LIVE count — two frees drop it by exactly 2).
+    assert_eq!(gpu.alloc_count(), allocs_before - 2);
 }
 
 /// Partial divergence: common prefix 280 of 300 — the adopt truncates
