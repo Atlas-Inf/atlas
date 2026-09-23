@@ -216,12 +216,7 @@ impl QsaIndexer {
                 let complete = (first_pos + r + 1) / ratio;
                 let row_sc = &sc[r * stride..r * stride + complete];
                 let mut order: Vec<u32> = (0..complete as u32).collect();
-                order.sort_by(|&a, &b| {
-                    row_sc[b as usize]
-                        .partial_cmp(&row_sc[a as usize])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.cmp(&b))
-                });
+                order.sort_by(|&a, &b| super::qsa_decode_select::rank_cmp(row_sc, a, b));
                 for (i, b) in order[..topk].iter().enumerate() {
                     host_lists[(r * topk + i) * 4..(r * topk + i) * 4 + 4]
                         .copy_from_slice(&(*b as i32).to_le_bytes());

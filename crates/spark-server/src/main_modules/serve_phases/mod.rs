@@ -16,7 +16,7 @@ mod weights;
 
 pub(super) use build::{
     build_high_speed_swap_config, build_model, build_prefix_cache, checked_dflash_num_drafts,
-    maybe_run_ep_worker, validate_head_high_speed_swap,
+    maybe_run_ep_worker, self_spec_supported, validate_head_high_speed_swap,
 };
 pub(super) use config::{
     apply_model_default_dflash_gamma, apply_model_default_num_drafts, cap_vocab_size_to_tokenizer,

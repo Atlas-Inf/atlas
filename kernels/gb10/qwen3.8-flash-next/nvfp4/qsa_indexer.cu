@@ -426,7 +426,16 @@ extern "C" __global__ void qsa_prefill_attn(
 // sort + H2D upload (`QsaIndexer::decode_select`); one block of threads,
 // `complete <= QSA_SELECT_MAX_BLOCKS` (the host arm covers anything wider).
 // Rank of block b = #{j : s_j > s_b or (s_j == s_b and j < b)}; selected iff
-// rank < block_topk. NaN scores are never selected.
+// rank < block_topk. A NaN score is staged as -inf, i.e. it ranks BELOW every
+// real score (scores are >= 0) and ties among themselves go by index. The
+// order is therefore total for ANY input, so exactly block_topk blocks are
+// selected whenever complete > block_topk (the only case this runs in). That
+// is a memory-safety property, not a quality one: `n_sel` is derived from the
+// position alone and `qsa_gather` reads all of it, so an entry this launch
+// did not write would be a stale id from another step — or another sequence,
+// `sel` being layer-owned scratch. NaN is not reachable today (`qsa_score`
+// takes the relu as fmaxf, which returns the non-NaN operand); this keeps the
+// kernel safe if that ever changes. Same rule as the host arm (`rank_cmp`).
 #define QSA_SELECT_MAX_BLOCKS 4096
 extern "C" __global__ void qsa_select_topk(
     const float* __restrict__ scores,   // [complete]
@@ -447,19 +456,17 @@ extern "C" __global__ void qsa_select_topk(
     const float neg_inf = __int_as_float(0xff800000u);
     for (int b = tid; b < complete; b += nt) {
         const float v = scores[b];
-        sc[b] = isnan(v) ? neg_inf : v;     // NaN never ranks, never selects
+        sc[b] = isnan(v) ? neg_inf : v;     // NaN ranks below every real score
     }
     __syncthreads();
     for (int b = tid; b < complete; b += nt) {
         const float sb = sc[b];
         int rank = 0;
-        if (sb != neg_inf) {
-            for (int j = 0; j < complete; ++j) {
-                const float sj = sc[j];
-                if (sj > sb || (sj == sb && j < b)) ++rank;
-            }
+        for (int j = 0; j < complete; ++j) {
+            const float sj = sc[j];
+            if (sj > sb || (sj == sb && j < b)) ++rank;
         }
-        selected[b] = (sb != neg_inf && rank < block_topk) ? 1 : 0;
+        selected[b] = (rank < block_topk) ? 1 : 0;
     }
     __syncthreads();
     for (int b = tid; b < complete; b += nt) {

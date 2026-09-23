@@ -12,17 +12,19 @@
 //! tokens the selection is PROVABLY all-visible — the inert regime the port
 //! served in until now.
 //!
-//! v1 SCOPE (decode-side): raw keys are ingested during prefill and decode;
-//! selection runs at DECODE steps once the visible prefix exceeds the inert
-//! bound, and feeds the EXISTING paged decode attention through a gathered
-//! contiguous scratch + identity block table. Prefill queries beyond the
-//! inert bound still run dense (a one-time WARN documents the divergence;
-//! per-query prefill selection is stage 2). Single sequence, BF16 KV only.
+//! SCOPE: raw keys are ingested during prefill and decode. At DECODE steps
+//! past the inert bound, `decode_select` feeds the EXISTING paged decode
+//! attention through a gathered contiguous scratch + identity block table;
+//! PREFILL rows past the bound get a per-query selection from
+//! `prefill_select` (`qsa_select.rs`, both prefill paths). BF16 KV only. The
+//! launch scratch is layer-owned and steps serialize on one stream, so a
+//! `QsaSelection` is valid only until the next `decode_select` on this layer.
 //!
-//! CUDA graphs: selection does a host top-k on the scores (D2H), which can
-//! never sit inside a captured graph — a layer carrying an indexer vetoes
-//! decode-graph capture entirely (graphs measured speed-NEUTRAL on GB10, so
-//! this costs nothing).
+//! CUDA graphs: the default top-k arm is a host sort on the scores (D2H), the
+//! ingest counter is host state, and launch parameters depend on the
+//! position — a layer carrying an indexer vetoes decode-graph capture
+//! entirely. `ATLAS_QSA_DEVICE_TOPK=1` removes the host sort up to
+//! `QSA_SELECT_MAX_BLOCKS` complete blocks; the veto stays.
 
 use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -211,6 +213,15 @@ impl QsaIndexer {
         (self.budget + self.ratio - 1) as usize
     }
 
+    /// Whether the token at 0-based `pos` decodes with an ACTIVE selection,
+    /// i.e. whether `decode_select(pos)` returns `Some`. The one place the
+    /// inert/active boundary is decided: `pos + 1` visible tokens hold more
+    /// than `block_topk` complete blocks exactly when `pos >= inert_bound()`.
+    pub fn is_active_at(&self, pos: usize) -> bool {
+        qsa_decode_select::select_geometry(pos, self.ratio as usize, self.block_topk as usize)
+            .is_some()
+    }
+
     fn qk_width(&self) -> usize {
         (self.n_heads as usize + 1) * self.hd as usize
     }
@@ -359,10 +370,12 @@ impl QsaIndexer {
         self.pool_new_blocks(st, gpu, stream)?;
 
         let visible = pos + 1;
-        let complete = visible / self.ratio as usize;
-        if complete <= self.block_topk as usize {
+        let Some(geo) =
+            qsa_decode_select::select_geometry(pos, self.ratio as usize, self.block_topk as usize)
+        else {
             return Ok(None); // provably all-visible: dense path is exact
-        }
+        };
+        let (complete, tail_start, n_sel) = (geo.complete, geo.tail_start, geo.n_sel);
 
         // q prep + block scores.
         ops::qsa_qprep(
@@ -397,9 +410,6 @@ impl QsaIndexer {
         // wider than the kernel's flag array): D2H + sort + H2D — decode
         // graphs are vetoed whenever an indexer is present, so neither arm
         // ever runs inside a capture.
-        let ratio = self.ratio as usize;
-        let tail_start = complete * ratio;
-        let n_sel = (self.block_topk as usize * ratio + (visible - tail_start)) as u32;
         if self.device_topk && complete <= qsa_decode_select::QSA_SELECT_MAX_BLOCKS {
             ops::qsa_select_topk(
                 gpu,

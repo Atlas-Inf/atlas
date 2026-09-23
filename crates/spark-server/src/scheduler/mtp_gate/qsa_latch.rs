@@ -22,9 +22,44 @@ pub fn crosses_inert_bound(seq_len: usize, num_drafts: usize, lim: usize) -> boo
     seq_len + num_drafts + 1 >= lim
 }
 
+/// The context limit the MTP lane obeys this step.
+///
+/// A sequence speculating ALONE may verify past the inert bound when the
+/// model serves an active selection per row (`single_seq` is then `None`).
+/// A multi-sequence verify batch keeps the conservative limit: past the bound
+/// `decode_batch` routes per-sequence and stages only logits, KV exhaustion
+/// inside a batched verify finishes the whole batch, and none of that has
+/// been exercised at long context. A sequence latched while it shared the
+/// batch stays serial afterwards — conservative by design.
+pub fn mtp_verify_limit(
+    num_active: usize,
+    single_seq: Option<usize>,
+    multi_seq: Option<usize>,
+) -> Option<usize> {
+    if num_active == 1 {
+        single_seq
+    } else {
+        multi_seq
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::crosses_inert_bound;
+    use super::{crosses_inert_bound, mtp_verify_limit};
+
+    #[test]
+    fn only_a_lone_sequence_gets_the_lifted_limit() {
+        // Model serves active QSA per row: single = None, multi = the bound.
+        assert_eq!(mtp_verify_limit(1, None, Some(2051)), None);
+        assert_eq!(mtp_verify_limit(2, None, Some(2051)), Some(2051));
+        assert_eq!(mtp_verify_limit(8, None, Some(2051)), Some(2051));
+        // Switch off / unsupported: both are the bound, nothing changes.
+        assert_eq!(mtp_verify_limit(1, Some(2051), Some(2051)), Some(2051));
+        assert_eq!(mtp_verify_limit(3, Some(2051), Some(2051)), Some(2051));
+        // No indexer at all.
+        assert_eq!(mtp_verify_limit(1, None, None), None);
+        assert_eq!(mtp_verify_limit(4, None, None), None);
+    }
 
     #[test]
     fn latch_table_around_bound() {

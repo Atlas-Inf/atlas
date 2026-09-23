@@ -414,9 +414,21 @@ impl Model for TransformerModel {
         self.generate_speculative_dispatch(prompt_tokens, params, num_drafts)
     }
     fn verify_context_limit(&self) -> Option<usize> {
+        // A parallel serve reaches the batched attention path before
+        // `decode_a2`'s active-QSA gate; the layer guard refuses it, so the
+        // model must not advertise it.
+        if self.comm.is_some() {
+            return self.verify_context_limit_multi_seq();
+        }
         self.layers
             .iter()
             .filter_map(|l| l.verify_context_limit())
+            .min()
+    }
+    fn verify_context_limit_multi_seq(&self) -> Option<usize> {
+        self.layers
+            .iter()
+            .filter_map(|l| l.verify_context_limit_multi_seq())
             .min()
     }
     fn verify_max_drafts(&self) -> Option<usize> {

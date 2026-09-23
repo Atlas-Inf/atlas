@@ -838,7 +838,11 @@ pub(crate) fn load_model(
     // trait + the `drafts.len() ≥ 4` ladder route to `step_verify_dflash`
     // (scheduler.rs:3013). So `--dflash` enables `use_speculative` too.
     let use_speculative = (args.speculative || args.dflash) && scheduler_model.has_proposer();
-    let use_self_spec = args.self_speculative && scheduler_model.has_self_speculative();
+    let use_self_spec = serve_phases::self_spec_supported(
+        args.self_speculative,
+        scheduler_model.has_self_speculative(),
+        scheduler_model.requires_aux_state(),
+    )?;
     let use_ngram_spec = args.ngram_speculative;
     // For DFlash, force `num_drafts = γ - 1` so the scheduler asks the
     // proposer for γ tokens (DraftProposer::propose semantics: "up to
