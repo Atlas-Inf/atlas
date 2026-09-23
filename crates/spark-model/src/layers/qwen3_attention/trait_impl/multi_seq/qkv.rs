@@ -626,9 +626,13 @@ impl Qwen3AttentionLayer {
         // w4a16_gemm_t this bypasses cost 16.3 ms/verify-step across the 16
         // attention layers' q/k/v/o at M=4 (94% tile padding) vs ~4.5 ms via
         // the GEMV. m=5..8 rides the narrow batch{5,6,7,8} tiers (batchm_bench:
-        // same weight-streaming bandwidth, no M>4 cliff). The family caps at
-        // M=8, so the DFlash wide verify (M=17) keeps the GEMM.
-        let batchm = self.w4a16_batchm.kernel(m);
+        // same weight-streaming bandwidth, no M>4 cliff). m=9..16 (batched
+        // DFlash verify) falls back to `w4a16_gemv_batch16`; the family caps
+        // there, so wider verifies (DFlash γ=16, M=17) keep the GEMM.
+        let mut batchm = self.w4a16_batchm.kernel(m);
+        if batchm.0 == 0 && m <= 16 {
+            batchm = self.w4a16_gemv_batch16_k;
+        }
         if batchm.0 != 0 {
             return ops::w4a16_gemv_batchm(gpu, batchm, input, w_base, output, m, n, k, stream);
         }
