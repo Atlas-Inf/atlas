@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Serves nvidia/Qwen3.8-27B-NVFP4 + incoai/Qwen3.8-27B-DFlash2 on Windows
-# gfx1151 (ROCm 10) — the DFlash gamma=8 Option-B profile from win-integ.ps1:
+# gfx1151 (ROCm 10) - the DFlash gamma=8 Option-B profile from win-integ.ps1:
 # util 0.80, seq 8192, prefill 2048, kv/lm_head bf16, batch 1, thinking off,
 # grammar off, ssm-cache-slots 20 / ssm-checkpoint-interval 128.
 #
-# This replaces the box-local DFlash edit of first_run.ps1 — everything the
+# This replaces the box-local DFlash edit of first_run.ps1 - everything the
 # DFlash serve needs is here. Build the tree first:
 #   powershell -ExecutionPolicy Bypass -File scripts\strix-windows\first_run.ps1 -Phase build
 # then:
@@ -15,7 +15,7 @@
 #   -ModelDir            target weights snapshot dir.
 #   -DrafterDir          DFlash2 drafter weights dir (incoai/Qwen3.8-27B-DFlash2).
 #   -Port / -Gamma       serve port (8093) / dflash gamma (8).
-#   ATLAS_BIN            prebuilt spark.exe — skips the repo-binary lookup.
+#   ATLAS_BIN            prebuilt spark.exe - skips the repo-binary lookup.
 param(
     [string]$Repo = "",
     [string]$ModelDir = "$env:USERPROFILE\models\nvidia-Qwen3.8-27B-NVFP4",
@@ -27,7 +27,7 @@ $ErrorActionPreference = "Stop"
 if (-not $Repo) { $Repo = if ($env:ATLAS_REPO) { $env:ATLAS_REPO } else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path } }
 $Rocm10Bin = "$Repo\target-rocm10\x86_64-pc-windows-msvc\release\spark.exe"
 $Bin = if ($env:ATLAS_BIN) { $env:ATLAS_BIN } elseif (Test-Path $Rocm10Bin) { $Rocm10Bin } else { "$Repo\target\x86_64-pc-windows-msvc\release\spark.exe" }
-if (-not (Test-Path $Bin)) { "FAIL: no spark.exe — run first_run.ps1 -Phase build (or set ATLAS_BIN)"; exit 6 }
+if (-not (Test-Path $Bin)) { "FAIL: no spark.exe - run first_run.ps1 -Phase build (or set ATLAS_BIN)"; exit 6 }
 if (-not (Test-Path $DrafterDir)) { "FAIL: drafter dir missing: $DrafterDir"; exit 6 }
 if ($Bin -eq $Rocm10Bin) {
     $env:HIP_PATH = "C:\TheRock\10.0.0"
@@ -38,7 +38,7 @@ $Log = "C:\Users\azeez\q38-win-serve-$Tag.log"
 $env:HOME = "C:\Users\azeez"
 $env:ATLAS_HOME = "C:\Users\azeez\.atlas"
 
-# fp8d recipe env (the fingerprinted ST-995 set — same as first_run.ps1's
+# fp8d recipe env (the fingerprinted ST-995 set - same as first_run.ps1's
 # serve phase), plus the DFlash2 switches.
 $env:ATLAS_W4A16_DP4A = "1"
 $env:ATLAS_W4A16_VARIANT = "v1"
@@ -70,10 +70,10 @@ Get-Process spark -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 5
 
 # NOTE: --dflash replaces --speculative/--num-drafts (DFlash is its own
-# proposer — do not pass both). util 0.80 not 0.95: the drafter's weights,
+# proposer - do not pass both). util 0.80 not 0.95: the drafter's weights,
 # KV and ctx accumulator sit inside the same ~63 GB gfx1151 budget. The
 # boot kernel audit passes without --dangerously-allow-unresolved-kernel-
-# lookups — do not re-add it; a NEW unresolved lookup is the gate's signal.
+# lookups - do not re-add it; a NEW unresolved lookup is the gate's signal.
 $proc = Start-Process -FilePath $Bin -ArgumentList @(
     "serve", $ModelDir,
     "--no-fast-load",
@@ -106,7 +106,7 @@ Select-String -Path $Log -Pattern 'DFlash speculative decoding|DFlash2 candidate
 $unres = (Select-String -Path $Log -Pattern 'unresolved kernel lookup' | Measure-Object).Count
 "kernel audit: unresolved lookups = $unres (want 0)"
 
-# One blocking greedy probe — proves the drafter path actually decodes.
+# One blocking greedy probe - proves the drafter path actually decodes.
 $body = @{ model = "nvidia/Qwen3.8-27B-NVFP4"; messages = @(@{ role = "user"; content = "Reply with exactly one word: the capital of France." }); max_tokens = 32; temperature = 0.0 } | ConvertTo-Json -Compress
 try {
     $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/v1/chat/completions" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 300
