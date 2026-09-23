@@ -829,6 +829,33 @@ impl BlockDiffusionDraftHead {
             ctx_acc_pool: Mutex::new(Vec::new()),
         };
 
+        // Prime the accumulator reuse pool NOW — before the residual KV-pool
+        // sizing consumes every remaining byte of the device map. The acc is
+        // ~`ctx_capacity` rows of target-hiddens (600+ MB at ctx_window≥12K);
+        // allocating it lazily at request time lands AFTER the KV pool claim
+        // and hits the fragmentation wall with GBs nominally free. Two
+        // buffers cover steady state at concurrency 1: one live seq plus one
+        // retained ctx_carry. A failure only forfeits the optimization — the
+        // lazy path still allocates on demand.
+        if ctx_capacity > 0 {
+            let acc_bytes = ctx_capacity
+                .saturating_mul(head.target_layer_ids.len())
+                .saturating_mul(target_hidden_size)
+                .saturating_mul(2);
+            for _ in 0..2 {
+                match gpu.alloc(acc_bytes) {
+                    Ok(ptr) => head.ctx_acc_pool.lock().push(ptr),
+                    Err(e) => {
+                        tracing::warn!(
+                            "DFlash ctx acc pool prime: alloc of {acc_bytes} B failed ({e}); \
+                             request-time path will allocate on demand"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
         tracing::info!(
             "BlockDiffusionDraftHead loaded: {} layers, hidden={}, intermediate={}, \
              GQA {}/{}, head_dim={}, γ={}, vocab={}, mask_token_id={}, causal={}, window={:?}, sinks={}, target_layers={:?}",
