@@ -833,16 +833,16 @@ impl BlockDiffusionDraftHead {
         // sizing consumes every remaining byte of the device map. The acc is
         // ~`ctx_capacity` rows of target-hiddens (600+ MB at ctx_window≥12K);
         // allocating it lazily at request time lands AFTER the KV pool claim
-        // and hits the fragmentation wall with GBs nominally free. Two
-        // buffers cover steady state at concurrency 1: one live seq plus one
-        // retained ctx_carry. A failure only forfeits the optimization — the
-        // lazy path still allocates on demand.
+        // and hits the fragmentation wall with GBs nominally free. One buffer
+        // guarantees the first request; a warm turn's acc comes back through
+        // carry adoption, and any further demand falls to the lazy path. A
+        // failure only forfeits the optimization — request-time still allocs.
         if ctx_capacity > 0 {
             let acc_bytes = ctx_capacity
                 .saturating_mul(head.target_layer_ids.len())
                 .saturating_mul(target_hidden_size)
                 .saturating_mul(2);
-            for _ in 0..2 {
+            for _ in 0..1 {
                 match gpu.alloc(acc_bytes) {
                     Ok(ptr) => head.ctx_acc_pool.lock().push(ptr),
                     Err(e) => {
