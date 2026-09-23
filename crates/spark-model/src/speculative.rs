@@ -368,14 +368,16 @@ pub trait DraftProposer: Send + Sync {
     /// Inverse of [`Self::carry_dflash_ctx`]: adopt the carried ctx into a
     /// fresh state when the carried tokens are a prefix of `prompt`.
     /// Installs the accumulator + paged blocks and restores the watermarks
-    /// clamped to the common prefix; frees the carried resources (and, on
-    /// success, the fresh state's own accumulator) correctly either way.
-    /// Returns true on adoption.
+    /// clamped to the adoptable rows (carried positions strictly below
+    /// `prefill_start`, so prefill captures never duplicate a position);
+    /// frees the carried resources (and, on success, the fresh state's own
+    /// accumulator) correctly either way. Returns true on adoption.
     fn adopt_dflash_ctx(
         &self,
         _gpu: &dyn GpuBackend,
         _state: &mut dyn ProposerState,
         _prompt: &[u32],
+        _prefill_start: usize,
     ) -> bool {
         false
     }

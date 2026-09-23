@@ -216,12 +216,15 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
         last_num_accepted: 1,
         skip_next_decode_append: false,
         max_ctx_len: 1024,
+        ctx_acc_rows: 4096,
+        ctx_prefill_origin: None,
+        ctx_prefill_base: 0,
         ctx_slot_bytes: 64,
         block_table_dev: Some(gpu.alloc(256).unwrap()),
         ctx_count_drafter: 12,
         max_ctx_count_drafter: 1024,
         ctx_committed: 12,
-        ctx_positions: vec![1, 2, 3],
+        ctx_positions: (0..12).collect(),
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
     })
@@ -259,6 +262,9 @@ fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState> {
         last_num_accepted: 0,
         skip_next_decode_append: false,
         max_ctx_len: 1024,
+        ctx_acc_rows: 4096,
+        ctx_prefill_origin: None,
+        ctx_prefill_base: 0,
         ctx_slot_bytes: 64,
         block_table_dev: None,
         ctx_count_drafter: 0,
@@ -538,7 +544,7 @@ fn ctx_carry_round_trip_adopts_prefix() {
     let mut prompt = tokens.clone();
     prompt.extend(300..350);
     let mut fresh = fresh_state(&gpu);
-    assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt));
+    assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt, 300));
     // Carried accumulator + device block table installed; watermarks at
     // the common prefix (all 300 match; carried ctx_len=12 clamps).
     assert_eq!(fresh.ctx_hidden_acc.0, carried_acc.0);
@@ -577,7 +583,7 @@ fn ctx_carry_rejects_divergent_prefix_without_leaking() {
     let allocs_before = gpu.alloc_count();
     // Prompt diverges at token 0 — common=0 < MIN_CARRY_TOKENS.
     let prompt: Vec<u32> = (1000..1400).collect();
-    assert!(!head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt));
+    assert!(!head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt, 300));
     // Carried blocks returned to the pool; fresh state untouched.
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 8);
     assert_eq!(fresh.ctx_len, 0);
@@ -608,11 +614,11 @@ fn ctx_carry_truncates_at_divergence() {
     let mut fresh = fresh_state(&gpu);
     let mut prompt = tokens.clone();
     prompt[280] = 9999; // divergence at index 280
-    assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt));
+    assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt, 300));
     // Carried ctx_len=12 < common=280 → full carried ctx adopted.
     assert_eq!(fresh.ctx_committed, 12);
     assert_eq!(fresh.ctx_len, 12);
-    assert_eq!(fresh.ctx_positions.len(), 3);
+    assert_eq!(fresh.ctx_positions.len(), 12);
 }
 
 /// Graphs captured under the old generation ride the carry: lifted before
@@ -648,7 +654,7 @@ fn ctx_carry_lifts_and_rekeys_propose_graphs() {
     let mut prompt = tokens.clone();
     prompt.extend(300..350);
     let mut fresh = fresh_state_with_owner(&gpu, Some(new_own));
-    assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt));
+    assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt, 300));
 
     // Re-keyed under the NEW owner, same pointer tuple.
     let gmap = head.propose_graphs.lock();

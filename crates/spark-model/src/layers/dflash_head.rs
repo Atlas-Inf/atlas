@@ -322,9 +322,27 @@ pub struct DflashProposerState {
     /// row 0 + row 1 in EAGLE order before calling propose. Consumed (reset to
     /// false) by propose. Only set under ATLAS_DFLASH_EAGLE_FIX=1.
     pub skip_next_decode_append: bool,
-    /// Allocation cap for `ctx_hidden_acc` (in slot count). Mirrors the
-    /// `max_seq_len` build arg so we can clamp without re-fetching it.
+    /// Retention cap for the ctx window (in slot count). Rows beyond this
+    /// are dropped oldest-first by the slide path. Follows `ctx_window`
+    /// (capped at `max_seq_len`).
     pub max_ctx_len: usize,
+    /// Allocation capacity of `ctx_hidden_acc` (in slot count) — mirrors the
+    /// `max_seq_len` build arg. Prefill capture writes append up to this
+    /// bound; `max_ctx_len` is the (smaller) retention cap enforced by the
+    /// slide.
+    pub ctx_acc_rows: usize,
+    /// Absolute position where this seq's prefill captures began (the
+    /// KV-prefix-match point; 0 on a cold turn). Set by the first
+    /// `try_dflash_prefill_capture_layer` call — chunked prefill calls
+    /// `update_dflash_ctx_len_after_prefill` only after the LAST chunk, so
+    /// per-chunk capture rows must be derived: cursor = ctx_prefill_base +
+    /// (chunk_start - origin).
+    pub ctx_prefill_origin: Option<usize>,
+    /// `ctx_len` snapshot taken at the first capture call — i.e. the carried
+    /// rows adopted before this prefill (0 when no carry adopted). Rows
+    /// `[0..ctx_prefill_base)` keep their carried positions; captures fill
+    /// `[base..)` with positions `origin..`.
+    pub ctx_prefill_base: usize,
     /// Width (bytes) of one `ctx_hidden_acc` slot — `5 * target_hidden * bf16`.
     /// Stored to avoid re-deriving on every append.
     pub ctx_slot_bytes: usize,
@@ -888,6 +906,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // and a smaller cap slides the accumulator mid-prompt — which
             // empirically collapses acceptance to zero on prompts past it.
             max_ctx_len: self.ctx_window.min(self.max_seq_len),
+            ctx_acc_rows: self.max_seq_len,
+            ctx_prefill_origin: None,
+            ctx_prefill_base: 0,
             ctx_slot_bytes,
             // Phase 2 Option B: lazily allocated on first propose when
             // ATLAS_DFLASH_OPTION_B=1. None until then to keep alloc_state
@@ -1609,6 +1630,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         gpu: &dyn GpuBackend,
         state: &mut dyn ProposerState,
         prompt: &[u32],
+        prefill_start: usize,
     ) -> bool {
         let Some(dstate) = state.as_any_mut().downcast_mut::<DflashProposerState>() else {
             return false;
@@ -1617,7 +1639,19 @@ impl DraftProposer for BlockDiffusionDraftHead {
             return false;
         };
         let common = entry.common_prefix_len(prompt);
-        if common < carry::MIN_CARRY_TOKENS || common == 0 {
+        // A carried row is adoptable only where its absolute position lands
+        // inside the verified shared prefix AND below this prefill's start:
+        // positions at/above prefill_start are re-captured by the prefill
+        // itself, so adopting them would put two rows on the same position
+        // (duplicate attention keys). A slid carry's positions start above
+        // zero, so `common` verified tokens do NOT imply `common` valid rows.
+        let cut = common.min(prefill_start);
+        let valid = entry
+            .ctx_positions
+            .iter()
+            .take_while(|&&p| p >= 0 && (p as usize) < cut)
+            .count();
+        if valid < carry::MIN_CARRY_TOKENS || valid == 0 {
             self.release_ctx_carry(gpu, entry);
             return false;
         }
@@ -1640,16 +1674,16 @@ impl DraftProposer for BlockDiffusionDraftHead {
         dstate.block_table = entry.block_table;
         dstate.block_table_dev = entry.block_table_dev;
         dstate.max_ctx_count_drafter = entry.max_ctx_count_drafter;
-        // Watermarks clamp to the common prefix: slots past the divergence
-        // were computed from tokens this turn does not share, so they must
-        // be re-precomputed (over this turn's own captured hiddens or, in
-        // the cache-hit hole, the same zeros as before — never worse than
-        // the status quo).
-        dstate.ctx_committed = entry.ctx_committed.min(common);
-        dstate.ctx_count_drafter = entry.ctx_count_drafter.min(common);
-        dstate.ctx_len = entry.ctx_len.min(common);
+        // Watermarks clamp to `valid`: rows past it either sit past the
+        // divergence or overlap positions this prefill re-captures, so they
+        // must be re-precomputed (over this turn's own captured hiddens or,
+        // in the cache-hit hole, absent rows — never worse than the status
+        // quo). Positions stay absolute, so RoPE stamps stay exact.
+        dstate.ctx_committed = entry.ctx_committed.min(valid);
+        dstate.ctx_count_drafter = entry.ctx_count_drafter.min(valid);
+        dstate.ctx_len = entry.ctx_len.min(valid);
         dstate.ctx_positions = entry.ctx_positions;
-        dstate.ctx_positions.truncate(common);
+        dstate.ctx_positions.truncate(valid);
         dstate.prefill_done = true;
         // Pin the lane so the carried graphs' baked lane-scratch pointers
         // (markov_prev_dev et al.) resolve identically, then re-key the
