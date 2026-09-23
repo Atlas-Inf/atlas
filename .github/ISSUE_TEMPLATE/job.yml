@@ -43,7 +43,7 @@ body:
       description: Does this touch code other models also use?
       options:
         - Just this model
-        - Shared code — other models could change
+        - Shared code, other models could change
         - Not sure
     validations:
       required: true
