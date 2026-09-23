@@ -176,8 +176,8 @@ jobs:
           # downstreams identify a build by `spark --version`, so a tag that
           # disagrees with Cargo.toml is a silent mis-identification.
           bash scripts/release-notes.sh bump "$NEW_VERSION"
-          git config user.name  "tbraun96"
-          git config user.email "tbraun96@gmail.com"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
           git commit -m "chore(release): v${NEW_VERSION}"
           git tag -a "v${NEW_VERSION}" -m "Atlas v${NEW_VERSION}"

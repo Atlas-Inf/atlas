@@ -603,7 +603,7 @@ jobs:
         # can honestly carry two intents (a kernel fix plus its gate). The
         # ledger's identity dedup makes re-runs collapse either way.
         #
-        # Committed as tbraun96, per the repo's authorship convention.
+        # Committed later by governance-harvest.yml as github-actions[bot].
         env:
           OVERRIDE_COUNT: ${{ steps.override.outputs.count }}
           OVERRIDE_PATHS: ${{ steps.override.outputs.paths }}
