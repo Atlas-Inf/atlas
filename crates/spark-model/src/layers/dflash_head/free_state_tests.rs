@@ -208,11 +208,11 @@ fn zero_kv_cache() -> PagedKvCache {
 fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashProposerState> {
     Box::new(DflashProposerState {
         block_table: Vec::new(),
-        seq_len: 12,
+        seq_len: 300,
         last_num_drafted: 3,
         prefill_done: true,
         ctx_hidden_acc: gpu.alloc(4096).unwrap(),
-        ctx_len: 12,
+        ctx_len: 300,
         last_num_accepted: 1,
         skip_next_decode_append: false,
         max_ctx_len: 1024,
@@ -221,10 +221,10 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
         ctx_prefill_base: 0,
         ctx_slot_bytes: 64,
         block_table_dev: Some(gpu.alloc(256).unwrap()),
-        ctx_count_drafter: 12,
+        ctx_count_drafter: 300,
         max_ctx_count_drafter: 1024,
-        ctx_committed: 12,
-        ctx_positions: (0..12).collect(),
+        ctx_committed: 300,
+        ctx_positions: (0..300).collect(),
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
     })
@@ -546,15 +546,15 @@ fn ctx_carry_round_trip_adopts_prefix() {
     let mut fresh = fresh_state(&gpu);
     assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt, 300));
     // Carried accumulator + device block table installed; watermarks at
-    // the common prefix (all 300 match; carried ctx_len=12 clamps).
+    // the common prefix (all 300 match; carried ctx_len=300 adopted).
     assert_eq!(fresh.ctx_hidden_acc.0, carried_acc.0);
     assert_eq!(
         fresh.block_table_dev.map(|p| p.0),
         carried_bt_dev.map(|p| p.0)
     );
     assert_eq!(fresh.block_table.len(), 2);
-    assert_eq!(fresh.ctx_committed, 12);
-    assert_eq!(fresh.ctx_len, 12);
+    assert_eq!(fresh.ctx_committed, 300);
+    assert_eq!(fresh.ctx_len, 300);
     assert!(fresh.prefill_done);
 }
 
@@ -615,10 +615,10 @@ fn ctx_carry_truncates_at_divergence() {
     let mut prompt = tokens.clone();
     prompt[280] = 9999; // divergence at index 280
     assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt, 300));
-    // Carried ctx_len=12 < common=280 → full carried ctx adopted.
-    assert_eq!(fresh.ctx_committed, 12);
-    assert_eq!(fresh.ctx_len, 12);
-    assert_eq!(fresh.ctx_positions.len(), 12);
+    // Carried ctx_len=300 > common=280 → truncated at the divergence.
+    assert_eq!(fresh.ctx_committed, 280);
+    assert_eq!(fresh.ctx_len, 280);
+    assert_eq!(fresh.ctx_positions.len(), 280);
 }
 
 /// Graphs captured under the old generation ride the carry: lifted before
