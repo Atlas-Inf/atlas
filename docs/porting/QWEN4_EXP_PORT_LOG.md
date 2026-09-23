@@ -336,7 +336,7 @@ cargo run --release -p atlas-core --example qwen4exp_forward -- <ckpt> /fx/promp
 #    ^ and confirm it now appends 8, not 9
 
 # 7. serve
-./serve_qwen4exp_tui.sh                  # raises ATLAS_PLE_MAX_TOKENS itself above 8K
+./scripts/dev/serve_qwen4exp_tui.sh                  # raises ATLAS_PLE_MAX_TOKENS itself above 8K
 ```
 
 If step 7 misbehaves, the kill switches are the bisect: `ATLAS_QSA_DISABLE=1`,
@@ -534,7 +534,7 @@ logged at load (`per-tensor scale 0.000199`).
 
 The vendored recipe has said `kv_cache_dtype: bf16` since it was added and
 `the_qwen4_exp_recipe_lands_the_settings_it_documents` asserts it, but
-`serve_qwen4exp_tui.sh` never passed the flag. A run started from the
+`scripts/dev/serve_qwen4exp_tui.sh` never passed the flag. A run started from the
 script therefore got the FP8 default, and with it:
 
     FP8 KV cache selected but the checkpoint ships NO k_scale/v_scale

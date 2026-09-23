@@ -145,7 +145,7 @@ printf '  %s\n' "${RESULTS[@]}"
 
 note "step 7 — serve (not run here: it is a long-lived process)"
 cat <<'EOS'
-  ./serve_qwen4exp_tui.sh                     # raises ATLAS_PLE_MAX_TOKENS itself above 8K
+  ./scripts/dev/serve_qwen4exp_tui.sh                     # raises ATLAS_PLE_MAX_TOKENS itself above 8K
 
   If it misbehaves, bisect with the switches rather than guessing — in order,
   each one removing a mechanism:
