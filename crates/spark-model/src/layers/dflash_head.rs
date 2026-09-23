@@ -690,6 +690,13 @@ pub struct BlockDiffusionDraftHead {
     /// gated on token-prefix equality and happens at the new sequence's
     /// first ctx seed (`update_dflash_ctx_len_after_prefill`).
     pub ctx_carry: Mutex<Option<carry::DflashCtxCarry>>,
+    /// Returned per-seq ctx accumulators. Each is ~1.4 GB at
+    /// max_seq_len=26624 — alloc/free churn per request fragmented the
+    /// device map enough to fail a contiguous 1.4 GB request with ~5 GB
+    /// nominally free. Pooling keeps a bounded set mapped for reuse;
+    /// contents are always overwritten before rows are claimed, so no
+    /// memset is needed on reuse.
+    pub ctx_acc_pool: Mutex<Vec<DevicePtr>>,
 }
 
 mod contract;
@@ -744,6 +751,30 @@ impl BlockDiffusionDraftHead {
         1 + self.extra_lanes.len()
     }
 
+    /// Return a ctx accumulator to the reuse pool, or free it when the pool
+    /// is full. Keeps a bounded number of ~1.4 GB buffers mapped so per-turn
+    /// alloc/free churn can't fragment the device map.
+    fn recycle_ctx_acc(&self, gpu: &dyn GpuBackend, ptr: DevicePtr) {
+        const CTX_ACC_POOL_CAP: usize = 3;
+        if ptr.0 == 0 {
+            return;
+        }
+        {
+            let mut pool = self.ctx_acc_pool.lock();
+            if pool.len() < CTX_ACC_POOL_CAP {
+                pool.push(ptr);
+                return;
+            }
+        }
+        if let Err(error) = gpu.free(ptr) {
+            tracing::error!(
+                "DFlash ctx acc recycle: freeing {:#x} failed ({error}); \
+                 buffer leaked to the backend",
+                ptr.0
+            );
+        }
+    }
+
     /// Release every resource a [`carry::DflashCtxCarry`] owns: paged KV
     /// blocks back to the proposer pool, accumulator and device block table
     /// back to the backend. Called when a carry is replaced or its prefix
@@ -767,15 +798,7 @@ impl BlockDiffusionDraftHead {
                 }
             }
         }
-        if entry.ctx_hidden_acc.0 != 0
-            && let Err(e) = gpu.free(entry.ctx_hidden_acc)
-        {
-            tracing::error!(
-                "DFlash ctx carry: freeing accumulator {:#x} failed ({e:#}); \
-                 allocation orphaned on the backend",
-                entry.ctx_hidden_acc.0
-            );
-        }
+        self.recycle_ctx_acc(gpu, entry.ctx_hidden_acc);
         if let Some(bt) = entry.block_table_dev
             && let Err(e) = gpu.free(bt)
         {
@@ -875,7 +898,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let bf16 = 2usize;
         let ctx_slot_bytes = self.target_layer_ids.len() * self.target_hidden_size * bf16;
         let total = self.max_seq_len * ctx_slot_bytes;
-        let ctx_hidden_acc = gpu.alloc(total)?;
+        // Reuse a pooled accumulator when available — per-turn alloc/free
+        // of this ~1.4 GB buffer fragmented the device map enough to fail
+        // contiguous allocations mid-run. Contents are always overwritten
+        // before rows are claimed, so no re-zeroing is needed.
+        let ctx_hidden_acc = match self.ctx_acc_pool.lock().pop() {
+            Some(ptr) => ptr,
+            None => gpu.alloc(total)?,
+        };
         // Initialize to zero so stale data doesn't leak between sequences.
         // Transactional: a failed memset frees the accumulator instead of
         // leaking it for the server's lifetime; a failed FREE during that
@@ -1518,23 +1548,16 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.kv_cache.lock().free_blocks(&dstate.block_table);
             dstate.block_table.clear();
         }
-        // Free the per-seq ctx accumulator — the dominant per-request
-        // allocation (`max_seq_len × 5 × target_hidden` BF16; ~320 MB at
-        // max_seq_len=16384). `DevicePtr` has no Drop, so without this every
-        // finished sequence leaks it for the server's lifetime. Guarded on a
-        // non-null pointer so a double free_state is a no-op. A failed free
-        // is logged and the pointer RETAINED so a cleanup retry can release
-        // it (a silently cleared pointer would leak unrecoverably).
+        // Return the per-seq ctx accumulator to the reuse pool — the
+        // dominant per-request allocation (`max_seq_len × 5 × target_hidden`
+        // BF16; ~1.4 GB at max_seq_len=26624). `DevicePtr` has no Drop, so
+        // without this every finished sequence leaks it for the server's
+        // lifetime. Guarded on a non-null pointer so a double free_state is
+        // a no-op. Pooling also kills the alloc/free churn that fragmented
+        // the device map mid-run.
         if dstate.ctx_hidden_acc.0 != 0 {
-            if let Err(error) = gpu.free(dstate.ctx_hidden_acc) {
-                tracing::error!(
-                    "DSpark free_state: freeing ctx accumulator {:#x} failed ({error}); \
-                     pointer retained for a later cleanup retry",
-                    dstate.ctx_hidden_acc.0
-                );
-            } else {
-                dstate.ctx_hidden_acc = DevicePtr(0);
-            }
+            let acc = std::mem::replace(&mut dstate.ctx_hidden_acc, DevicePtr(0));
+            self.recycle_ctx_acc(gpu, acc);
         }
         // Free the device-side block table (lazily allocated in propose.rs).
         // A failed free logs and RESTORES the handle so a later cleanup retry
@@ -1655,18 +1678,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.release_ctx_carry(gpu, entry);
             return false;
         }
-        // Install: the fresh state's own accumulator is redundant — free it
-        // and take the carried buffer (same allocation shape: both are
-        // `[max_ctx_len, ctx_slot_bytes]` sized at max_seq_len).
-        if dstate.ctx_hidden_acc.0 != 0
-            && let Err(e) = gpu.free(dstate.ctx_hidden_acc)
-        {
-            // Keep the fresh pointer rather than silently leaking it; the
-            // adopt then cannot proceed (two buffers, one slot).
-            self.ctx_carry.lock().replace(entry);
-            tracing::error!("DFlash ctx adopt: freeing fresh accumulator failed: {e:#}");
-            return false;
-        }
+        // Install: the fresh state's own accumulator is redundant — return
+        // it to the reuse pool and take the carried buffer (same allocation
+        // shape: both are `[max_seq_len, ctx_slot_bytes]`).
+        self.recycle_ctx_acc(gpu, dstate.ctx_hidden_acc);
         dstate.ctx_hidden_acc = entry.ctx_hidden_acc;
         // Paged blocks transfer wholesale — the carried table already
         // covers max_ctx_len + γ slots, so the new state never needs the

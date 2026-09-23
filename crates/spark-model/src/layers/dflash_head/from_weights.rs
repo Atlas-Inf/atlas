@@ -826,6 +826,7 @@ impl BlockDiffusionDraftHead {
             quant: DflashQuantization::Bf16,
             startup,
             ctx_carry: Mutex::new(None),
+            ctx_acc_pool: Mutex::new(Vec::new()),
         };
 
         tracing::info!(

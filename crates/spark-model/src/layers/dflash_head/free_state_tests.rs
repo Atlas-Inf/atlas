@@ -140,6 +140,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         quant: super::DflashQuantization::Bf16,
         startup: super::DsparkStartupExecution::from_env_lenient(),
         ctx_carry: parking_lot::Mutex::new(None),
+        ctx_acc_pool: parking_lot::Mutex::new(Vec::new()),
     }
 }
 
@@ -311,8 +312,10 @@ fn real_free_state_success_path_reclaims_all_resources() {
         boxed.lifecycle.as_ref().unwrap().status(),
         CaptureStatus::Retired
     );
-    // Both mock allocations (accumulator + block table) removed.
-    assert_eq!(gpu.alloc_count(), allocs_before - 2);
+    // Block table dev freed to the backend; the accumulator moved to the
+    // reuse pool (still a live allocation).
+    assert_eq!(gpu.alloc_count(), allocs_before - 1);
+    assert_eq!(head.ctx_acc_pool.lock().len(), 1);
 }
 
 #[test]
@@ -433,19 +436,22 @@ fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
     let mut boxed = live_state(&gpu, own);
     hold_two_blocks(boxed.as_mut(), &head.kv_cache);
 
-    // Inject failure on the FIRST free call (the ctx accumulator in the
-    // success path). The pointer must be RETAINED so a retry can release it.
+    // The accumulator goes to the reuse pool (no backend free); the
+    // injected failure lands on the block-table-dev free — its handle must
+    // be RESTORED so a retry can release it.
     gpu.fail_next_free();
     head.free_state(&gpu, Some(own), boxed.as_mut())
         .expect("free_state succeeds despite the backend free failure");
 
-    // Accumulator pointer retained (observable, retryable)…
-    assert_ne!(boxed.ctx_hidden_acc.0, 0);
+    assert_eq!(boxed.ctx_hidden_acc.0, 0);
+    assert!(
+        boxed.block_table_dev.is_some(),
+        "handle restored, retryable"
+    );
     // …and the retry DOES release it (flag is one-shot).
     head.free_state(&gpu, Some(own), boxed.as_mut())
-        .expect("second free retries the accumulator free");
-    assert_eq!(boxed.ctx_hidden_acc.0, 0);
-    assert_eq!(gpu.alloc_count(), 0);
+        .expect("second free retries the block table free");
+    assert!(boxed.block_table_dev.is_none());
 }
 
 #[test]
@@ -456,24 +462,21 @@ fn real_free_state_block_table_free_failure_restores_handle_for_retry() {
 
     let mut boxed = live_state(&gpu, own);
 
-    // Fail BOTH success-path frees: the ctx accumulator first, then the
-    // device block table. Each failed free must retain/restore its handle.
-    gpu.fail_next_free();
+    // Fail the success-path block-table free: the accumulator pools without
+    // a free call; the failed dev-table free must restore its handle.
     gpu.fail_next_free();
     head.free_state(&gpu, Some(own), boxed.as_mut())
-        .expect("free_state succeeds despite the backend free failures");
+        .expect("free_state succeeds despite the backend free failure");
     assert!(
         boxed.block_table_dev.is_some(),
         "handle restored, retryable"
     );
-    assert_ne!(boxed.ctx_hidden_acc.0, 0);
-
-    // Retry with no further injections releases both.
-    head.free_state(&gpu, Some(own), boxed.as_mut())
-        .expect("second free retries both failed frees");
     assert_eq!(boxed.ctx_hidden_acc.0, 0);
+
+    // Retry with no further injections releases it.
+    head.free_state(&gpu, Some(own), boxed.as_mut())
+        .expect("second free retries the failed free");
     assert!(boxed.block_table_dev.is_none());
-    assert_eq!(gpu.alloc_count(), 0);
 }
 
 #[test]
@@ -591,9 +594,9 @@ fn ctx_carry_rejects_divergent_prefix_without_leaking() {
     assert!(fresh.block_table.is_empty());
     assert!(!fresh.prefill_done);
     assert_eq!(fresh.ctx_hidden_acc.0, fresh_acc.0);
-    // Carried accumulator + device block table freed; fresh acc survives
-    // (alloc_count is a LIVE count — two frees drop it by exactly 2).
-    assert_eq!(gpu.alloc_count(), allocs_before - 2);
+    // Carried block table dev freed; the carried accumulator moved to the
+    // reuse pool (still live). Fresh acc survives untouched.
+    assert_eq!(gpu.alloc_count(), allocs_before - 1);
     // Lifted graph destroyed on the reject path.
     assert_eq!(gpu.destroy_graph_count(), 1);
     assert!(head.propose_graphs.lock().is_empty());
