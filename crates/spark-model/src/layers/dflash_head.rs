@@ -735,6 +735,20 @@ impl BlockDiffusionDraftHead {
         if !entry.block_table.is_empty() {
             self.kv_cache.lock().free_blocks(&entry.block_table);
         }
+        // Lifted propose graphs die with the carry — nothing else will
+        // ever own or replay them, and the adopting turn recaptures.
+        for (_, handles) in entry.graphs {
+            for handle in handles {
+                if handle.0 != 0
+                    && let Err(e) = gpu.destroy_graph(handle)
+                {
+                    tracing::error!(
+                        "DFlash ctx carry: destroying released graph {} failed: {e:#}",
+                        handle.0
+                    );
+                }
+            }
+        }
         if entry.ctx_hidden_acc.0 != 0
             && let Err(e) = gpu.free(entry.ctx_hidden_acc)
         {
@@ -1547,7 +1561,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         if dstate.ctx_hidden_acc.0 == 0 || dstate.ctx_len == 0 {
             return false;
         }
-        let entry = carry::DflashCtxCarry {
+        let mut entry = carry::DflashCtxCarry {
             ctx_hidden_acc: std::mem::replace(&mut dstate.ctx_hidden_acc, DevicePtr(0)),
             ctx_len: dstate.ctx_len,
             ctx_committed: dstate.ctx_committed,
@@ -1557,7 +1571,27 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_count_drafter: dstate.ctx_count_drafter,
             max_ctx_count_drafter: dstate.max_ctx_count_drafter,
             tokens: tokens.to_vec(),
+            graphs: Vec::new(),
+            lane_id: dstate.lane_id,
         };
+        // Lift this generation's captured propose graphs before
+        // `free_state`'s retire sweep destroys them. Every pointer the
+        // graph identity pins (block table dev, ctx accumulator, lane
+        // markov scratch) is carried above or lives in lane scratch, so
+        // the graphs stay replayable for the adopting turn.
+        if let Some(owner) = dstate.lifecycle.as_ref().map(|l| l.owner()) {
+            let mut gmap = self.propose_graphs.lock();
+            for key in gmap
+                .keys()
+                .filter(|key| key.owner() == owner)
+                .copied()
+                .collect::<Vec<_>>()
+            {
+                if let Some(handles) = gmap.remove(&key) {
+                    entry.graphs.push((key, handles));
+                }
+            }
+        }
         // Replacing a still-live carry frees the OLD entry: its blocks go
         // back to the pool and its device buffers to the backend, so a
         // carry slot can never accumulate stale allocations.
@@ -1615,6 +1649,57 @@ impl DraftProposer for BlockDiffusionDraftHead {
         dstate.ctx_positions = entry.ctx_positions;
         dstate.ctx_positions.truncate(common);
         dstate.prefill_done = true;
+        // Pin the lane so the carried graphs' baked lane-scratch pointers
+        // (markov_prev_dev et al.) resolve identically, then re-key the
+        // graphs under this generation — pointer fields are unchanged
+        // (the carried buffers ARE the captured ones).
+        dstate.lane_id = entry.lane_id;
+        match dstate.lifecycle.as_ref().map(|l| l.owner()) {
+            Some(new_owner) => {
+                let mut gmap = self.propose_graphs.lock();
+                for (old_key, handles) in entry.graphs {
+                    match DflashGraphIdentity::new(
+                        new_owner,
+                        old_key.block_table_ptr(),
+                        old_key.ctx_ptr(),
+                        old_key.markov_ptr(),
+                        old_key.lane(),
+                    ) {
+                        Ok(new_key) => {
+                            gmap.insert(new_key, handles);
+                        }
+                        Err(error) => {
+                            for handle in handles {
+                                if handle.0 != 0
+                                    && let Err(e) = gpu.destroy_graph(handle)
+                                {
+                                    tracing::error!(
+                                        "DFlash ctx carry: destroying unkeyable graph \
+                                         failed ({e:#}); identity rebuild: {error:#}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                // No owner bound on the adopting state — nothing may key
+                // these graphs again; destroy them now.
+                for (_, handles) in entry.graphs {
+                    for handle in handles {
+                        if handle.0 != 0
+                            && let Err(e) = gpu.destroy_graph(handle)
+                        {
+                            tracing::error!(
+                                "DFlash ctx carry: destroying ownerless graph {} failed: {e:#}",
+                                handle.0
+                            );
+                        }
+                    }
+                }
+            }
+        }
         true
     }
 }

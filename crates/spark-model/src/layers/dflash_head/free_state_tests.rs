@@ -231,6 +231,24 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
 /// watermark at zero, no paged blocks. This is the shape `adopt_dflash_ctx`
 /// sees in production (the call site guards on `ctx_len == 0`).
 fn fresh_state(gpu: &MockGpuBackend) -> Box<DflashProposerState> {
+    fresh_state_with_owner(gpu, None)
+}
+
+/// Fresh state with a lifecycle bound, as `alloc_seq` leaves it before the
+/// first ctx seed — `adopt_dflash_ctx` reads the owner off this to re-key
+/// carried graphs.
+fn fresh_state_with_owner(
+    gpu: &MockGpuBackend,
+    own: Option<SequenceGeneration>,
+) -> Box<DflashProposerState> {
+    let mut s = fresh_state_inner(gpu);
+    if let Some(own) = own {
+        s.lifecycle = Some(CaptureDescriptor::bind(own, 0, 0, 4, 16).unwrap());
+    }
+    s
+}
+
+fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState> {
     Box::new(DflashProposerState {
         block_table: Vec::new(),
         seq_len: 0,
@@ -543,6 +561,14 @@ fn ctx_carry_rejects_divergent_prefix_without_leaking() {
     let own = owner(3, 77);
     let mut boxed = live_state(&gpu, own);
     hold_two_blocks(boxed.as_mut(), &head.kv_cache);
+    let bt_ptr = boxed.block_table_dev.unwrap().0;
+    let acc_ptr = boxed.ctx_hidden_acc.0;
+    // A captured graph set under the carried generation — on reject it
+    // must be destroyed, not left orphaned in the pool.
+    head.propose_graphs.lock().insert(
+        DflashGraphIdentity::new(own, bt_ptr, acc_ptr, 0x30, 0).unwrap(),
+        vec![spark_runtime::gpu::GraphHandle(0xAA)],
+    );
     let tokens: Vec<u32> = (0..300).collect();
     assert!(head.carry_dflash_ctx(&gpu, boxed.as_mut(), &tokens));
 
@@ -562,6 +588,9 @@ fn ctx_carry_rejects_divergent_prefix_without_leaking() {
     // Carried accumulator + device block table freed; fresh acc survives
     // (alloc_count is a LIVE count — two frees drop it by exactly 2).
     assert_eq!(gpu.alloc_count(), allocs_before - 2);
+    // Lifted graph destroyed on the reject path.
+    assert_eq!(gpu.destroy_graph_count(), 1);
+    assert!(head.propose_graphs.lock().is_empty());
 }
 
 /// Partial divergence: common prefix 280 of 300 — the adopt truncates
@@ -584,4 +613,49 @@ fn ctx_carry_truncates_at_divergence() {
     assert_eq!(fresh.ctx_committed, 12);
     assert_eq!(fresh.ctx_len, 12);
     assert_eq!(fresh.ctx_positions.len(), 3);
+}
+
+/// Graphs captured under the old generation ride the carry: lifted before
+/// free_state's retire sweep, re-keyed to the adopting generation with
+/// identical pointer fields, lane pinned.
+#[test]
+fn ctx_carry_lifts_and_rekeys_propose_graphs() {
+    let gpu = MockGpuBackend::new();
+    let head = zero_head();
+    let old_own = owner(3, 77);
+    let new_own = owner(4, 78);
+    let mut boxed = live_state(&gpu, old_own);
+    hold_two_blocks(boxed.as_mut(), &head.kv_cache);
+    boxed.lane_id = 2;
+    let acc_ptr = boxed.ctx_hidden_acc.0;
+    let bt_ptr = boxed.block_table_dev.unwrap().0;
+    // A captured graph set under the OLD generation, keyed by the very
+    // buffers the carry will move (bt dev table + ctx accumulator).
+    head.propose_graphs.lock().insert(
+        DflashGraphIdentity::new(old_own, bt_ptr, acc_ptr, 0x30, 2).unwrap(),
+        vec![
+            spark_runtime::gpu::GraphHandle(0xAA),
+            spark_runtime::gpu::GraphHandle(0xBB),
+        ],
+    );
+
+    let tokens: Vec<u32> = (0..300).collect();
+    assert!(head.carry_dflash_ctx(&gpu, boxed.as_mut(), &tokens));
+    // Lifted out of the pool — free_state's retire sweep finds nothing.
+    assert!(head.propose_graphs.lock().is_empty());
+    assert_eq!(gpu.destroy_graph_count(), 0);
+
+    let mut prompt = tokens.clone();
+    prompt.extend(300..350);
+    let mut fresh = fresh_state_with_owner(&gpu, Some(new_own));
+    assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt));
+
+    // Re-keyed under the NEW owner, same pointer tuple.
+    let gmap = head.propose_graphs.lock();
+    let expected = DflashGraphIdentity::new(new_own, bt_ptr, acc_ptr, 0x30, 2).unwrap();
+    assert_eq!(gmap.len(), 1);
+    assert_eq!(gmap.get(&expected).unwrap().len(), 2);
+    drop(gmap);
+    assert_eq!(fresh.lane_id, 2);
+    assert_eq!(gpu.destroy_graph_count(), 0);
 }
