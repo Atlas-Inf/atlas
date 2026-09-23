@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Serves nvidia/Qwen3.8-27B-NVFP4 + incoai/Qwen3.8-27B-DFlash2 on Windows
-# gfx1151 (Strix Halo) — the configuration behind the 2026-09-22 clean
+# gfx1151 (Strix Halo) - the configuration behind the 2026-09-22 clean
 # agentic leg (winbox r3: 672/672 turns, 0 errors, score 0.6183, mean_na
 # ~2.7 flat through hour 4).
 #
-# What makes this different from a naive DFlash serve — the two knobs that
+# What makes this different from a naive DFlash serve - the two knobs that
 # fixed the 2026-09-15 Linux collapse (604/1007, mean_na 0.496):
 #
 #   * ATLAS_DFLASH_CTX_WINDOW must cover the full transcript. The captured
@@ -15,12 +15,12 @@
 #   * --dflash-window-size 0 resolves to "no explicit sliding window"; the
 #     checkpoint declares no swa_window_size, so the drafter runs full-prefix
 #     attention (KV pool sized to max_seq_len). Long-range signal comes
-#     through the ctx conditioning — verified: mean_na 6.18 on a predictable
+#     through the ctx conditioning - verified: mean_na 6.18 on a predictable
 #     decode at seq_len 28K.
 #
 # MEMORY FACTS (winbox, 2026-09-22):
 #   * GPU exposes ~89.5 GB this boot. util 0.90 OOM'd the watchdog during
-#     drafter scratch alloc after the (budget-sized) KV pool — the pool is
+#     drafter scratch alloc after the (budget-sized) KV pool - the pool is
 #     sized by util, NOT seq-len, so lowering util is the lever, not seq.
 #   * util 0.80 + seq 49152 + ctx 49152 + window=full fits: ~81 GiB WS at
 #     Server live. The agentic dataset peaks ~25.2K ISL, so 32768 also works
