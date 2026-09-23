@@ -1,0 +1,61 @@
+name: Job
+description: A piece of work anyone can pick up — a new model, or a feature for one we already run.
+title: "[job] "
+labels: ["job"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep it short. A couple of lines per box is plenty — you can fill in the rest as you go.
+        Want to take one? Comment "I'll take this" and a maintainer will assign it to you.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - New model support
+        - Feature for a model we already support
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: HuggingFace ID or name.
+      placeholder: nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What's the job?
+      description: One or two lines. What does "done" look like?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: radius
+    attributes:
+      label: Impact radius
+      description: Does this touch code other models also use?
+      options:
+        - Just this model
+        - Shared code — other models could change
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: radius-detail
+    attributes:
+      label: What else could it touch?
+      description: Only if it's shared — e.g. a kernel, the loader, the scheduler, a chat template.
+
+  - type: textarea
+    id: testers
+    attributes:
+      label: Who's waiting or willing to test?
+      description: "@-mention anyone who wants this or can test it, and their hardware (GB10, Strix Halo, …)."
