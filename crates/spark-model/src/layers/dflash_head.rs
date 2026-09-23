@@ -889,38 +889,17 @@ impl DraftProposer for BlockDiffusionDraftHead {
         }
     }
 
-    fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
-        // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`.
-        // Sized once, re-used across the seq's lifetime; reset on
-        // `free_state`. At max_seq_len=16384 and 5×2048 BF16: 320 MB per
-        // seq — tolerable on a single Spark with max_batch_size=1; for
-        // higher batch we may want to reduce to a smaller working window.
+    fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
+        // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`
+        // (~1.4 GB at max_seq_len=26624). Lazy — see below.
         let bf16 = 2usize;
         let ctx_slot_bytes = self.target_layer_ids.len() * self.target_hidden_size * bf16;
-        let total = self.max_seq_len * ctx_slot_bytes;
-        // Reuse a pooled accumulator when available — per-turn alloc/free
-        // of this ~1.4 GB buffer fragmented the device map enough to fail
-        // contiguous allocations mid-run. Contents are always overwritten
-        // before rows are claimed, so no re-zeroing is needed.
-        let ctx_hidden_acc = match self.ctx_acc_pool.lock().pop() {
-            Some(ptr) => ptr,
-            None => gpu.alloc(total)?,
-        };
-        // Initialize to zero so stale data doesn't leak between sequences.
-        // Transactional: a failed memset frees the accumulator instead of
-        // leaking it for the server's lifetime; a failed FREE during that
-        // cleanup is logged (the allocation is then backend-orphaned — the
-        // pointer is already unreachable from any live state).
-        if let Err(error) = gpu.memset(ctx_hidden_acc, 0, total) {
-            if let Err(free_error) = gpu.free(ctx_hidden_acc) {
-                tracing::error!(
-                    "DSpark alloc_state: freeing failed-memset accumulator {:#x} failed \
-                     ({free_error}); allocation orphaned on the backend",
-                    ctx_hidden_acc.0
-                );
-            }
-            return Err(error);
-        }
+        // The ~1.4 GB accumulator is LAZY: allocated at the first prefill
+        // capture (acquire_ctx_acc), after carry adoption — a validated
+        // carry installs the previous seq's buffer instead, so eager
+        // alloc-here forced TWO ~1.4 GB buffers live per warm turn and
+        // fragmented the device map into alloc failures.
+        let ctx_hidden_acc = DevicePtr(0);
         Ok(Box::new(DflashProposerState {
             block_table: Vec::with_capacity(64),
             seq_len: 0,
@@ -957,6 +936,40 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 % self.lane_count(),
             lifecycle: None,
         }))
+    }
+
+    fn acquire_ctx_acc(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+        let Some(dstate) = state.as_any_mut().downcast_mut::<DflashProposerState>() else {
+            return Ok(());
+        };
+        if dstate.ctx_hidden_acc.0 != 0 {
+            return Ok(()); // carry adoption already installed a buffer
+        }
+        let total = dstate.ctx_acc_rows * dstate.ctx_slot_bytes;
+        // Reuse a pooled accumulator when available — per-turn alloc/free
+        // of this ~1.4 GB buffer fragmented the device map enough to fail
+        // contiguous allocations mid-run.
+        let acc = match self.ctx_acc_pool.lock().pop() {
+            Some(ptr) => ptr,
+            None => gpu.alloc(total)?,
+        };
+        // Initialize to zero so stale data doesn't leak between sequences.
+        // Transactional: a failed memset frees the accumulator instead of
+        // leaking it for the server's lifetime; a failed FREE during that
+        // cleanup is logged (the allocation is then backend-orphaned — the
+        // pointer is already unreachable from any live state).
+        if let Err(error) = gpu.memset(acc, 0, total) {
+            if let Err(free_error) = gpu.free(acc) {
+                tracing::error!(
+                    "DSpark acquire_ctx_acc: freeing failed-memset accumulator {:#x} failed \
+                     ({free_error}); allocation orphaned on the backend",
+                    acc.0
+                );
+            }
+            return Err(error);
+        }
+        dstate.ctx_hidden_acc = acc;
+        Ok(())
     }
 
     fn propose(

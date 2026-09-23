@@ -78,6 +78,15 @@ impl TransformerModel {
             dstate.ctx_prefill_origin = Some(chunk_start);
             dstate.ctx_prefill_base = dstate.ctx_len;
         }
+        // Lazy accumulator: adopt may have installed the carried buffer
+        // (ctx_hidden_acc != 0 → no-op); a rejected carry just pooled its
+        // buffer, which this pops right back — either way zero device
+        // allocations on the warm path.
+        if dstate.ctx_hidden_acc.0 == 0
+            && let Some(ref proposer) = self.proposer
+        {
+            proposer.acquire_ctx_acc(self.gpu.as_ref(), dstate)?;
+        }
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();

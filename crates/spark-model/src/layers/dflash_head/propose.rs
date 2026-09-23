@@ -335,6 +335,7 @@ impl BlockDiffusionDraftHead {
             && !eagle_skip
             && let Some(latest_ctx) = target_hidden_stack
             && dstate.ctx_len < dstate.max_ctx_len
+            && dstate.ctx_hidden_acc.0 != 0
         {
             let dst_offset = dstate.ctx_len * dstate.ctx_slot_bytes;
             ctx.gpu.copy_d2d_async(

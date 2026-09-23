@@ -510,7 +510,7 @@ impl Model for TransformerModel {
             .downcast_mut::<crate::layers::DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("not DFlash proposer state"))?;
         let n_layers = self.dflash_capture_layers.len();
-        if n_layers == 0 {
+        if n_layers == 0 || d.ctx_hidden_acc.0 == 0 {
             return Ok(());
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
@@ -537,7 +537,7 @@ impl Model for TransformerModel {
             .downcast_mut::<crate::layers::DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("not DFlash proposer state"))?;
         let n_layers = self.dflash_capture_layers.len();
-        if n_layers == 0 {
+        if n_layers == 0 || d.ctx_hidden_acc.0 == 0 {
             return Ok(());
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
@@ -581,7 +581,7 @@ impl Model for TransformerModel {
             .downcast_mut::<crate::layers::DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("not DFlash proposer state"))?;
         let n_layers = self.dflash_capture_layers.len();
-        if n_layers == 0 {
+        if n_layers == 0 || d.ctx_hidden_acc.0 == 0 {
             return Ok(());
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;

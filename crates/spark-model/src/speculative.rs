@@ -382,6 +382,15 @@ pub trait DraftProposer: Send + Sync {
         false
     }
 
+    /// Lazily populate the per-seq ctx accumulator (pop a pooled buffer or
+    /// allocate + zero a fresh one). Called at the first prefill capture —
+    /// AFTER `adopt_dflash_ctx`, which may install the carried buffer — so
+    /// a validated carry costs zero new device allocations and a rejected
+    /// carry's buffer comes straight back out of the reuse pool.
+    fn acquire_ctx_acc(&self, _gpu: &dyn GpuBackend, _state: &mut dyn ProposerState) -> Result<()> {
+        Ok(())
+    }
+
     /// Append drafter rows at KV slots `row_base ..` with RoPE positions
     /// `pos_base ..` from `(tokens, hiddens)` pairs — the catch-up feed.
     /// Returns rows written (0 = unsupported/no-op).
