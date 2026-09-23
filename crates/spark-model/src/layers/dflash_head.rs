@@ -665,6 +665,13 @@ pub struct BlockDiffusionDraftHead {
     /// process environment. Product heads derive it from the validated
     /// Lightning policy; generic heads keep legacy lenient semantics.
     pub startup: DsparkStartupExecution,
+
+    /// Single-slot ctx carry: the finished sequence's drafter ctx (hidden
+    /// accumulator + paged KV blocks + watermarks) held for the next turn
+    /// of the same session. See the `carry` module docs — adoption is
+    /// gated on token-prefix equality and happens at the new sequence's
+    /// first ctx seed (`update_dflash_ctx_len_after_prefill`).
+    pub ctx_carry: Mutex<Option<carry::DflashCtxCarry>>,
 }
 
 mod contract;
@@ -691,6 +698,7 @@ mod batch_forward;
 #[cfg(test)]
 mod batch_inputs_tests;
 mod batch_projection;
+mod carry;
 mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;
@@ -716,6 +724,35 @@ impl BlockDiffusionDraftHead {
     /// in `extra_lanes`). `ATLAS_DFLASH_PROPOSE_LANES` overrides (default 1).
     pub fn lane_count(&self) -> usize {
         1 + self.extra_lanes.len()
+    }
+
+    /// Release every resource a [`carry::DflashCtxCarry`] owns: paged KV
+    /// blocks back to the proposer pool, accumulator and device block table
+    /// back to the backend. Called when a carry is replaced or its prefix
+    /// fails the adopt check — a carry entry must never leak its ~1.4 GB
+    /// accumulator for the server's lifetime.
+    fn release_ctx_carry(&self, gpu: &dyn GpuBackend, entry: carry::DflashCtxCarry) {
+        if !entry.block_table.is_empty() {
+            self.kv_cache.lock().free_blocks(&entry.block_table);
+        }
+        if entry.ctx_hidden_acc.0 != 0
+            && let Err(e) = gpu.free(entry.ctx_hidden_acc)
+        {
+            tracing::error!(
+                "DFlash ctx carry: freeing accumulator {:#x} failed ({e:#}); \
+                 allocation orphaned on the backend",
+                entry.ctx_hidden_acc.0
+            );
+        }
+        if let Some(bt) = entry.block_table_dev
+            && let Err(e) = gpu.free(bt)
+        {
+            tracing::error!(
+                "DFlash ctx carry: freeing device block table {:#x} failed ({e:#}); \
+                 allocation orphaned on the backend",
+                bt.0
+            );
+        }
     }
 
     /// Resolve a lane's mutable propose resources: (stream, scratch,
@@ -1490,5 +1527,94 @@ impl DraftProposer for BlockDiffusionDraftHead {
         dstate.last_num_accepted = 0;
         dstate.skip_next_decode_append = false;
         Ok(())
+    }
+
+    fn carry_dflash_ctx(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut dyn ProposerState,
+        tokens: &[u32],
+    ) -> bool {
+        if !carry::ctx_carry_enabled() {
+            return false;
+        }
+        let Some(dstate) = state.as_any_mut().downcast_mut::<DflashProposerState>() else {
+            return false;
+        };
+        // Nothing worth carrying: a sequence that never seeded ctx leaves
+        // only the freshly-allocated accumulator (freed by free_state as
+        // usual).
+        if dstate.ctx_hidden_acc.0 == 0 || dstate.ctx_len == 0 {
+            return false;
+        }
+        let entry = carry::DflashCtxCarry {
+            ctx_hidden_acc: std::mem::replace(&mut dstate.ctx_hidden_acc, DevicePtr(0)),
+            ctx_len: dstate.ctx_len,
+            ctx_committed: dstate.ctx_committed,
+            ctx_positions: std::mem::take(&mut dstate.ctx_positions),
+            block_table: std::mem::take(&mut dstate.block_table),
+            block_table_dev: dstate.block_table_dev.take(),
+            ctx_count_drafter: dstate.ctx_count_drafter,
+            max_ctx_count_drafter: dstate.max_ctx_count_drafter,
+            tokens: tokens.to_vec(),
+        };
+        // Replacing a still-live carry frees the OLD entry: its blocks go
+        // back to the pool and its device buffers to the backend, so a
+        // carry slot can never accumulate stale allocations.
+        let previous = self.ctx_carry.lock().replace(entry);
+        if let Some(old) = previous {
+            self.release_ctx_carry(gpu, old);
+        }
+        true
+    }
+
+    fn adopt_dflash_ctx(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut dyn ProposerState,
+        prompt: &[u32],
+    ) -> bool {
+        let Some(dstate) = state.as_any_mut().downcast_mut::<DflashProposerState>() else {
+            return false;
+        };
+        let Some(entry) = self.ctx_carry.lock().take() else {
+            return false;
+        };
+        let common = entry.common_prefix_len(prompt);
+        if common < carry::MIN_CARRY_TOKENS || common == 0 {
+            self.release_ctx_carry(gpu, entry);
+            return false;
+        }
+        // Install: the fresh state's own accumulator is redundant — free it
+        // and take the carried buffer (same allocation shape: both are
+        // `[max_ctx_len, ctx_slot_bytes]` sized at max_seq_len).
+        if dstate.ctx_hidden_acc.0 != 0
+            && let Err(e) = gpu.free(dstate.ctx_hidden_acc)
+        {
+            // Keep the fresh pointer rather than silently leaking it; the
+            // adopt then cannot proceed (two buffers, one slot).
+            self.ctx_carry.lock().replace(entry);
+            tracing::error!("DFlash ctx adopt: freeing fresh accumulator failed: {e:#}");
+            return false;
+        }
+        dstate.ctx_hidden_acc = entry.ctx_hidden_acc;
+        // Paged blocks transfer wholesale — the carried table already
+        // covers max_ctx_len + γ slots, so the new state never needs the
+        // lazy `block_table_dev.is_none()` alloc path.
+        dstate.block_table = entry.block_table;
+        dstate.block_table_dev = entry.block_table_dev;
+        dstate.max_ctx_count_drafter = entry.max_ctx_count_drafter;
+        // Watermarks clamp to the common prefix: slots past the divergence
+        // were computed from tokens this turn does not share, so they must
+        // be re-precomputed (over this turn's own captured hiddens or, in
+        // the cache-hit hole, the same zeros as before — never worse than
+        // the status quo).
+        dstate.ctx_committed = entry.ctx_committed.min(common);
+        dstate.ctx_count_drafter = entry.ctx_count_drafter.min(common);
+        dstate.ctx_len = entry.ctx_len.min(common);
+        dstate.ctx_positions = entry.ctx_positions;
+        dstate.ctx_positions.truncate(common);
+        dstate.prefill_done = true;
+        true
     }
 }

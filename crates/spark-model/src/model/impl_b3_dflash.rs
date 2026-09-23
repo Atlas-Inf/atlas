@@ -96,6 +96,18 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
         {
+            // ATLAS_DFLASH_CTX_CARRY: on this sequence's FIRST ctx seed
+            // (ctx_len still 0), try to adopt the previous turn's ctx —
+            // prefix-matched hiddens + committed paged K/V — so the first
+            // propose precomputes only the new tail AND the cached prefix
+            // contributes real hiddens instead of zeros (the warm-turn
+            // blindness that collapsed acceptance at depth). A consumed
+            // carry slot makes later chunks' attempts cheap no-ops.
+            if dstate.ctx_len == 0
+                && let Some(ref proposer) = self.proposer
+            {
+                proposer.adopt_dflash_ctx(self.gpu.as_ref(), dstate, &seq.tokens);
+            }
             let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
             dstate.ctx_len = new_len;
             // Phase I (v2): seed per-slot fixed positions for the prompt

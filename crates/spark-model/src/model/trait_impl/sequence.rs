@@ -307,6 +307,18 @@ impl TransformerModel {
             }
         }
 
+        // ATLAS_DFLASH_CTX_CARRY: hand this turn's drafter ctx (hidden
+        // accumulator + paged KV + watermarks) to the proposer's carry slot
+        // BEFORE `free_state`, so the next turn of the same session adopts
+        // it instead of re-projecting the whole prompt. On success the
+        // state is left emptied, so `free_state` below releases nothing
+        // carried. No-op for non-DFlash proposers (default trait method).
+        if let Some(ref proposer) = self.proposer
+            && let Some(ref mut pstate) = seq.proposer_state
+        {
+            proposer.carry_dflash_ctx(self.gpu.as_ref(), pstate.as_mut(), &seq.tokens);
+        }
+
         // Free proposer state (KV cache blocks + per-seq device buffers).
         // NOTE: no pre-validation here — the proposer's `free_state` owns
         // terminal owner validation (ownership-only, so a same-owner second
