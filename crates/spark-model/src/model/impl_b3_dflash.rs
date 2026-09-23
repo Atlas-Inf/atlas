@@ -108,13 +108,17 @@ impl TransformerModel {
             {
                 proposer.adopt_dflash_ctx(self.gpu.as_ref(), dstate, &seq.tokens);
             }
+            // Monotone: an adopted carry may have set ctx_len to the shared
+            // prefix (common), which can exceed this chunk's coverage —
+            // never regress it or ctx_len < ctx_committed breaks and the
+            // propose-side `ctx_len - committed` underflows.
             let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
-            dstate.ctx_len = new_len;
+            dstate.ctx_len = dstate.ctx_len.max(new_len);
             // Phase I (v2): seed per-slot fixed positions for the prompt
             // captures. Prefill slot i holds prompt position i, so the
             // fixed rope position is simply its index. Keep parallel to
             // ctx_len. Re-seed idempotently across prefill chunks.
-            dstate.ctx_positions = (0..new_len).map(|i| i as i32).collect();
+            dstate.ctx_positions = (0..dstate.ctx_len).map(|i| i as i32).collect();
         }
         Ok(())
     }
