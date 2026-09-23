@@ -30,7 +30,8 @@
 //! correctness. Prefix equality on tokens is the whole validity condition
 //! (hiddens are a pure function of the token prefix).
 
-use spark_runtime::gpu::DevicePtr;
+use super::lifecycle::DflashGraphIdentity;
+use spark_runtime::gpu::{DevicePtr, GraphHandle};
 
 /// Default-ON switch for the ctx carry. `ATLAS_DFLASH_CTX_CARRY=0` opts out
 /// and restores the per-request rebuild. Mirrors the MTP drafter carry
@@ -77,6 +78,17 @@ pub struct DflashCtxCarry {
     /// The token sequence that produced this ctx (prompt + generated).
     /// Adoption requires it to be a prefix of the new turn's prompt.
     pub tokens: Vec<u32>,
+    /// Captured propose subgraphs lifted out of `propose_graphs` before
+    /// `free_state`'s retire sweep destroys them, under their ORIGINAL
+    /// generation key. On adopt they are re-keyed to the new generation:
+    /// every pointer the identity pins (paged block table, ctx
+    /// accumulator, lane markov scratch) survives the carry, so replaying
+    /// them is exactly as valid as it was pre-free.
+    pub graphs: Vec<(DflashGraphIdentity, Vec<GraphHandle>)>,
+    /// Lane the carried graphs were captured on. Pinned onto the adopting
+    /// state so the identity's lane (and its baked lane-scratch pointers)
+    /// match on the next turn.
+    pub lane_id: usize,
 }
 
 impl DflashCtxCarry {
@@ -106,6 +118,8 @@ mod tests {
             ctx_count_drafter: ctx_len,
             max_ctx_count_drafter: ctx_len + 16,
             tokens: tokens.to_vec(),
+            graphs: Vec::new(),
+            lane_id: 0,
         }
     }
 
