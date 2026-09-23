@@ -3,7 +3,7 @@
 // ATLAS FFN prefill GEMM via vendored llama.cpp NVFP4 W4A4 MMQ (Blackwell block-scale
 // MMA: mma.sync.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64, e2m1×e2m1, ue4m3 scales).
 // De-risk bench (libggml, GB10): 114 TFLOP/s gate/up · 88 down at the 27B FFN shapes — vs
-// faith2 int8 44 and the hand-written w4a4_gemm 52 (see docs/notes/MMQ_PORT_HANDOFF.md).
+// faith2 int8 44 and the hand-written w4a4_gemm 52 (see MMQ_PORT_HANDOFF.md).
 // extern-C entries launched from Rust (ops/nvfp4_mmq.rs). Same conventional 2D tiling as
 // the Q4_K wrapper (q4k_mmq.cu): no MoE ids, single channel; prefill shapes have thousands
 // of tiles >> 48 SMs so stream-k buys ~nothing. dst is BF16 [M,N] (fused store).
