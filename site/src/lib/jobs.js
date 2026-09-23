@@ -41,6 +41,18 @@ export const RADII = ['Just this model', 'Shared code, other models could change
 // Finished jobs stay on the board this long, so a contributor sees their work land.
 const DONE_WINDOW_DAYS = 30;
 
+// Cards render plain text, so strip the Markdown people type into the form:
+// **bold**, _em_, `code`, [text](url) -> text, and leading list bullets.
+function plain(md) {
+  return md
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/(\*\*|__)(.+?)\1/g, '$2')
+    .replace(/(^|[\s(])[*_]([^*_\s][^*_]*?)[*_](?=[\s).,;:!?]|$)/gm, '$1$2')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .trim();
+}
+
 // Split an issue-form body into { heading: answer }. GitHub writes
 // `_No response_` for an optional field left blank.
 function sections(body) {
@@ -48,7 +60,7 @@ function sections(body) {
   const parts = (body || '').replace(/\r\n/g, '\n').split(/^###\s+(.+)$/m);
   for (let i = 1; i < parts.length; i += 2) {
     const answer = parts[i + 1].trim();
-    out[parts[i].trim()] = answer === '_No response_' ? '' : answer;
+    out[parts[i].trim()] = answer === '_No response_' ? '' : plain(answer);
   }
   return out;
 }
