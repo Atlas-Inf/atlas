@@ -109,9 +109,9 @@ impl TransformerModel {
         // needed > max_ctx_len implies cursor > max_ctx_len - proc_count,
         // so the single in-place D2D copy never overlaps.
         let needed = cursor.saturating_add(proc_count);
-        if needed > acc_rows && acc_rows >= 2 {
-            let keep = dstate.max_ctx_len / 2;
-            let drop_n = needed - keep;
+        let keep = dstate.max_ctx_len / 2;
+        let drop_n = needed.saturating_sub(keep);
+        if needed > acc_rows && drop_n > 0 && drop_n <= cursor {
             let slot = dstate.ctx_slot_bytes;
             self.gpu.copy_d2d_async(
                 acc_base.offset(drop_n * slot),
@@ -196,13 +196,18 @@ impl TransformerModel {
             // chunk-wise on the next propose.
             if dstate.ctx_len > dstate.max_ctx_len {
                 let keep = dstate.max_ctx_len / 2;
-                let drop_n = dstate.ctx_len - keep;
+                // Bound by PHYSICAL rows: the buffer is sized to
+                // ctx_acc_rows (== max_ctx_len) and an all-cached-chunks
+                // turn can push formula ctx_len one row past it.
+                let phys = dstate.ctx_len.min(dstate.ctx_acc_rows);
+                let drop_n = phys - keep;
                 let slot = dstate.ctx_slot_bytes;
                 let src = dstate.ctx_hidden_acc.offset(drop_n * slot);
                 let stream = self.gpu.default_stream();
                 self.gpu
                     .copy_d2d_async(src, dstate.ctx_hidden_acc, keep * slot, stream)?;
-                dstate.ctx_positions.drain(..drop_n);
+                let pos_drop = drop_n.min(dstate.ctx_positions.len());
+                dstate.ctx_positions.drain(..pos_drop);
                 dstate.ctx_len = keep;
                 dstate.ctx_committed = 0;
                 tracing::info!(
