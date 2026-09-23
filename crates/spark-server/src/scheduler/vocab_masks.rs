@@ -19,9 +19,9 @@
 
 use std::sync::Arc;
 
-/// The three token-classification masks for one vocabulary.
+/// The token-classification masks for one vocabulary.
 ///
-/// Cheap to clone — three `Arc`s — so it is passed by value where that reads
+/// Cheap to clone — four `Arc`s — so it is passed by value where that reads
 /// better and by reference on the hot decode path.
 #[derive(Clone, Default)]
 pub struct VocabMasks {
@@ -39,6 +39,12 @@ pub struct VocabMasks {
     /// alphanumeric, i.e. emitting `</think>` right after it would split a
     /// word. `None` → the suppression is skipped.
     pub mid_word: Option<Arc<[bool]>>,
+    /// `mask[id]` iff token `id` decodes to a non-empty string whose every
+    /// character is ASCII punctuation or whitespace (`,`, `, `, `]`, `(`,
+    /// `\n`, `.`, …). Drives the digit-normalized content-loop watchdog's
+    /// number-list exemption. `None` → that exemption is inert and the
+    /// normalized detector behaves exactly as before.
+    pub punctuation: Option<Arc<[bool]>>,
 }
 
 impl VocabMasks {
@@ -55,6 +61,10 @@ impl VocabMasks {
 
     pub fn is_mid_word(&self, id: u32) -> bool {
         Self::at(&self.mid_word, id)
+    }
+
+    pub fn is_punctuation(&self, id: u32) -> bool {
+        Self::at(&self.punctuation, id)
     }
 
     fn at(mask: &Option<Arc<[bool]>>, id: u32) -> bool {
@@ -76,6 +86,7 @@ impl std::fmt::Debug for VocabMasks {
             .field("numeric", &count(&self.numeric))
             .field("boundary", &count(&self.boundary))
             .field("mid_word", &count(&self.mid_word))
+            .field("punctuation", &count(&self.punctuation))
             .finish()
     }
 }
@@ -91,7 +102,12 @@ mod tests {
     #[test]
     fn an_absent_mask_classifies_nothing() {
         let m = VocabMasks::default();
-        assert!(!m.is_numeric(0) && !m.is_boundary(7) && !m.is_mid_word(u32::MAX));
+        assert!(
+            !m.is_numeric(0)
+                && !m.is_boundary(7)
+                && !m.is_mid_word(u32::MAX)
+                && !m.is_punctuation(3)
+        );
     }
 
     #[test]
@@ -115,9 +131,12 @@ mod tests {
             numeric: mask(&[true, false]),
             boundary: mask(&[false, true]),
             mid_word: None,
+            punctuation: mask(&[false, true]),
         };
         assert!(m.is_numeric(0) && !m.is_boundary(0) && !m.is_mid_word(0));
         assert!(!m.is_numeric(1) && m.is_boundary(1) && !m.is_mid_word(1));
+        assert!(!m.is_punctuation(0) && m.is_punctuation(1));
+        assert!(!m.is_punctuation(2), "past the end of a 2-token vocabulary");
     }
 
     #[test]

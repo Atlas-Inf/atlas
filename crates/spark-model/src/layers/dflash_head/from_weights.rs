@@ -924,21 +924,29 @@ impl BlockDiffusionDraftHead {
             // 1.27B weights, ~14× any per-layer GEMM). We allocate a SEPARATE
             // FP8 buffer so we don't mutate the target model's BF16 lm_head
             // (the BF16 ptr stays valid for the BF16 path).
-            tracing::info!(
-                "DFlash Phase G: quantizing shared lm_head [{} × {}]",
-                head.vocab_size,
-                head.hidden_size
-            );
-            let lm_head_bf16 = crate::weight_map::DenseWeight {
-                weight: head.lm_head_shared,
-            };
-            head.lm_head_shared_fp8 = Some(lm_head_bf16.quantize_to_fp8(
-                gpu,
-                quant_k,
-                head.vocab_size,
-                head.hidden_size,
-                stream,
-            )?);
+            //
+            // Skip when the shared lm_head is NVFP4-packed (`lm_head_nvfp4`
+            // is Some): the DenseWeight pointer then holds PACKED bytes, and
+            // reading vocab×hidden BF16 from it is a 4×-oversized read
+            // (CUDA-700 ILA). The decode path already drafts logits through
+            // the NVFP4 twin via w4a16 in that case.
+            if head.lm_head_nvfp4.is_none() {
+                tracing::info!(
+                    "DFlash Phase G: quantizing shared lm_head [{} × {}]",
+                    head.vocab_size,
+                    head.hidden_size
+                );
+                let lm_head_bf16 = crate::weight_map::DenseWeight {
+                    weight: head.lm_head_shared,
+                };
+                head.lm_head_shared_fp8 = Some(lm_head_bf16.quantize_to_fp8(
+                    gpu,
+                    quant_k,
+                    head.vocab_size,
+                    head.hidden_size,
+                    stream,
+                )?);
+            }
             head.quant = DflashQuantization::Fp8Weights;
             tracing::info!(
                 "DFlash Phase G: drafter weights ready as FP8 (quant = Fp8Weights). \

@@ -536,35 +536,22 @@ impl BlockDiffusionDraftHead {
             // 0%-accept bug was a half-loaded smem_A K-tile in that
             // kernel (fixed: 2-round A-load covers all 32 K-cols).
             // BF16 path (default, or Fp8 mirror missing) unchanged.
-            let lm_head_fp8 = matches!(self.quant, super::DflashQuantization::Fp8Weights);
-            if lm_head_fp8 {
-                if let Some(fp8) = self.lm_head_shared_fp8.as_ref() {
-                    ops::fp8_gemm_n128_row_scaled_m16(
-                        gpu,
-                        self.kernels.fp8_gemm_n128_row_scaled_m16,
-                        norm_noise_local,
-                        fp8,
-                        scratch.logits,
-                        self.gamma as u32,
-                        self.vocab_size as u32,
-                        h_local,
-                        stream,
-                    )?;
-                } else {
-                    ops::dense_gemm_bf16_pipelined(
-                        gpu,
-                        self.kernels.dense_gemm_pipelined,
-                        norm_noise_local,
-                        &crate::weight_map::DenseWeight {
-                            weight: self.lm_head_shared,
-                        },
-                        scratch.logits,
-                        self.gamma as u32,
-                        self.vocab_size as u32,
-                        h_local,
-                        stream,
-                    )?;
-                }
+            let lm_head_fp8 = self
+                .lm_head_shared_fp8
+                .as_ref()
+                .filter(|_| matches!(self.quant, super::DflashQuantization::Fp8Weights));
+            if let Some(fp8) = lm_head_fp8 {
+                ops::fp8_gemm_n128_row_scaled_m16(
+                    gpu,
+                    self.kernels.fp8_gemm_n128_row_scaled_m16,
+                    norm_noise_local,
+                    fp8,
+                    scratch.logits,
+                    self.gamma as u32,
+                    self.vocab_size as u32,
+                    h_local,
+                    stream,
+                )?;
             } else if self.kernels.w4a16_gemm.0 != 0 {
                 match self.lm_head_nvfp4.as_ref() {
                     // Shared lm_head is NVFP4 (pre-packed like Lightning, or
@@ -573,22 +560,48 @@ impl BlockDiffusionDraftHead {
                     // from a half-size buffer (CUDA-700 ILA crash). Draft from
                     // the same NVFP4 head the verifier uses.
                     Some(nvfp4) => {
-                        ops::w4a16_gemm(
-                            gpu,
-                            self.kernels.w4a16_gemm,
-                            norm_noise_local,
-                            nvfp4,
-                            scratch.logits,
-                            self.gamma as u32,
-                            self.vocab_size as u32,
-                            h_local,
-                            stream,
-                        )?;
+                        // γ-row vocab projection: the batchm GEMV streams the
+                        // packed weight ONCE at memory bandwidth; the M64-tile
+                        // w4a16_gemm pads M=γ to 64 rows — ~7/8 of its MMA is
+                        // dead work on γ=8 (rocprof on gfx1151: ~164 ms/step,
+                        // ~75% of propose). Same pick the batched tail makes
+                        // in batch_forward.rs; w4a16_gemm stays the fallback
+                        // for γ>16 / missing tiers.
+                        let gemv_k = match self.gamma as u32 {
+                            1..=4 => self.kernels.w4a16_gemv_batch4,
+                            5..=8 => self.kernels.w4a16_gemv_batch8,
+                            9..=16 => self.kernels.w4a16_gemv_batch16,
+                            _ => spark_runtime::gpu::KernelHandle(0),
+                        };
+                        if gemv_k.0 != 0 {
+                            ops::w4a16_gemv_batchm(
+                                gpu,
+                                gemv_k,
+                                norm_noise_local,
+                                nvfp4,
+                                scratch.logits,
+                                self.gamma as u32,
+                                self.vocab_size as u32,
+                                h_local,
+                                stream,
+                            )?;
+                        } else {
+                            ops::w4a16_gemm(
+                                gpu,
+                                self.kernels.w4a16_gemm,
+                                norm_noise_local,
+                                nvfp4,
+                                scratch.logits,
+                                self.gamma as u32,
+                                self.vocab_size as u32,
+                                h_local,
+                                stream,
+                            )?;
+                        }
                     }
                     None => {
-                        ops::dense_gemm_bf16_pipelined(
+                        self.drafter_dense_gemm(
                             gpu,
-                            self.kernels.dense_gemm_pipelined,
                             norm_noise_local,
                             &crate::weight_map::DenseWeight {
                                 weight: self.lm_head_shared,
@@ -602,9 +615,8 @@ impl BlockDiffusionDraftHead {
                     }
                 }
             } else {
-                ops::dense_gemm_bf16_pipelined(
+                self.drafter_dense_gemm(
                     gpu,
-                    self.kernels.dense_gemm_pipelined,
                     norm_noise_local,
                     &crate::weight_map::DenseWeight {
                         weight: self.lm_head_shared,

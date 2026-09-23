@@ -330,7 +330,12 @@ pub fn emit_token(
             && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
             && (detect_content_token_loop_with(&a.output_tokens, loop_params)
                 || sched.masks.numeric.as_deref().is_some_and(|m| {
-                    detect_content_token_loop_normalized_with(&a.output_tokens, m, loop_params)
+                    detect_content_token_loop_normalized_with(
+                        &a.output_tokens,
+                        m,
+                        sched.masks.punctuation.as_deref(),
+                        loop_params,
+                    )
                 }))
         {
             tracing::warn!(
