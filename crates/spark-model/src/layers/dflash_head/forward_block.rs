@@ -422,7 +422,14 @@ impl BlockDiffusionDraftHead {
         // `ATLAS_DFLASH_PROPOSE_WARMUP_N`) so PTX→SASS JIT, GB10 clock
         // ramp, and L2 warming all happen eagerly before capture freezes
         // a steady-state SASS pick.
+        // defer_readback (the multi-lane path) is additionally excluded:
+        // piecewise capture happens on the lane stream — lane 0 IS the
+        // default stream — and any error between begin_capture/end_capture
+        // leaks capture mode, after which every unrelated-stream op fails
+        // CAPTURE_ISOLATED and every sync on the capturing stream fails 900.
+        // Multi-lane stays eager until per-lane capture ownership is proven.
         let graph_eligible = option_b_on
+            && !defer_readback
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -1046,11 +1053,15 @@ impl BlockDiffusionDraftHead {
     }
 
     /// Read drafts deferred by `forward_block(defer_readback=true)`.
-    /// Synchronizes this lane's D2H event, then applies the 1+N reorder.
+    /// Synchronizes this lane's D2H event, applies the 1+N reorder, then
+    /// truncates to `cap` — the same scheduler-K cap the immediate path
+    /// applies (the deferred return otherwise hands verify γ drafts → a
+    /// γ+2-token window the intermediates pools were never sized for).
     pub(super) fn read_deferred_drafts(
         &self,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         scratch: &DflashScratch,
+        cap: usize,
     ) -> Result<Vec<u32>> {
         gpu.event_synchronize(scratch.draft_tokens_event)?;
         let pinned_ptr = scratch
@@ -1065,6 +1076,7 @@ impl BlockDiffusionDraftHead {
         let drafts: Vec<u32> = (1..self.gamma)
             .chain(std::iter::once(0))
             .map(|i| row_order[i])
+            .take(cap)
             .collect();
         Ok(drafts)
     }

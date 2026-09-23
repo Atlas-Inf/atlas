@@ -567,10 +567,7 @@ impl BlockDiffusionDraftHead {
         // forward_block returns [mask_1 .. mask_{γ-1}, bonus_0]; the bonus
         // row is NOT a draft (vLLM sample_off=1). Capping at γ sent that
         // extra token into M=γ+1 target verify (~11 ms) for no accept gain.
-        // The startup draft-cap override still applies for generic
-        // ablation; the Lightning product policy rejects any override.
-        let default_k = _num_drafts.min(self.gamma.saturating_sub(1)).max(1);
-        let cap: usize = self.startup.draft_cap_override.unwrap_or(default_k);
+        let cap = self.draft_cap(_num_drafts);
 
         // ATLAS_DFLASH_VERIFY_TRACE=1: log all γ drafts BEFORE the cap so we
         // can see whether the drafter echoes only at position 0 or across
@@ -600,6 +597,14 @@ impl BlockDiffusionDraftHead {
         Ok(drafts)
     }
 
+    /// Draft-count cap shared by the immediate and deferred readback paths:
+    /// scheduler K (`num_drafts` = γ-1) unless the startup ablation override
+    /// is set; the Lightning product policy rejects any override.
+    fn draft_cap(&self, num_drafts: usize) -> usize {
+        let default_k = num_drafts.min(self.gamma.saturating_sub(1)).max(1);
+        self.startup.draft_cap_override.unwrap_or(default_k)
+    }
+
     /// Multi-lane batched propose: each seq proposes on its pinned lane
     /// (assigned once at alloc_state — batch position `i` is NOT stable
     /// across steps, and a seq's captured graphs bake their lane's scratch
@@ -625,6 +630,7 @@ impl BlockDiffusionDraftHead {
     ) -> Result<Vec<Vec<u32>>> {
         let n = last_tokens.len();
         let lanes_n = self.lane_count();
+        let cap = self.draft_cap(num_drafts);
         let default_stream = ctx.gpu.default_stream();
         ctx.gpu
             .record_event(self.lanes_start_event, default_stream)?;
@@ -660,7 +666,8 @@ impl BlockDiffusionDraftHead {
             // Flush this lane's previous user BEFORE its single-slot pinned
             // buffer is overwritten by the enqueue below.
             if let Some(prev_i) = lane_last_use[lane] {
-                out[prev_i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[prev_i])?);
+                out[prev_i] =
+                    Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[prev_i], cap)?);
             }
             lane_last_use[lane] = Some(i);
             lane_scratch_list.push(lane_scratch);
@@ -688,10 +695,15 @@ impl BlockDiffusionDraftHead {
         // and read in batch order. Lane scratch borrows outlive the loop.
         for i in 0..n {
             if out[i].is_none() {
-                out[i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[i])?);
+                out[i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[i], cap)?);
             }
         }
         let out: Vec<Vec<u32>> = out.into_iter().map(|o| o.unwrap_or_default()).collect();
+        for (i, drafts) in out.iter().enumerate() {
+            if let Some(dstate) = states[i].as_any_mut().downcast_mut::<DflashProposerState>() {
+                dstate.last_num_drafted = drafts.len();
+            }
+        }
         if self.startup.diagnostics.verify_trace {
             for i in 0..n {
                 tracing::info!(
