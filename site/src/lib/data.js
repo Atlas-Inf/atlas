@@ -70,7 +70,8 @@ export const nav = {
     { text: 'Hardware', href: '#hardware' },
     { text: 'Models', href: '#models' },
     { text: 'Get running', href: '#run' },
-    { text: 'Contribute', href: '#contribute' }
+    { text: 'Contribute', href: '#contribute' },
+    { text: 'Jobs', href: '#jobs' }
   ],
   menuLabel: 'Menu',
   closeLabel: 'Close menu'
@@ -327,6 +328,46 @@ export const contribute = {
     }
   ],
   cla: 'Contributions are AGPLv3 and the CLA permits Enterprise re licensing. See CONTRIBUTING.md.'
+};
+
+// --- job board (inside the contribute section) -------------------------------
+// Cards come from GitHub issues labeled `job` (see lib/jobs.js). This is only
+// the words around them.
+export const jobs = {
+  title: 'Pick up a job',
+  sub: 'Small, concrete pieces of work. A new model, or a feature for one we already run. Grab one, or post one you want to see.',
+  postOpen: 'Post a job',
+  postClose: 'Close',
+  allOnGithub: 'All jobs on GitHub',
+  filterLabel: 'Filter jobs',
+  filters: [
+    { id: 'all', text: 'All' },
+    { id: 'model', text: 'New models' },
+    { id: 'feature', text: 'Features' }
+  ],
+  showDone: 'Show done',
+  hideDone: 'Hide done',
+  fresh: { live: 'live from GitHub', snapshot: 'from the last deploy' },
+  status: { open: 'Open', taken: 'Taken', done: 'Done' },
+  kindShort: { model: 'New model', feature: 'Feature' },
+  cta: { open: 'Take it', taken: 'Follow along', done: 'See how it landed' },
+  testersLabel: 'Testing',
+  wantThis: 'want this',
+  comments: 'comments',
+  empty: 'No open jobs right now. Got something you want Atlas to run? Post it and it shows up here.',
+  form: {
+    kind: 'Kind',
+    model: 'Model',
+    what: 'What is the job',
+    whatHint: 'One or two lines. What does done look like?',
+    radius: 'Impact radius',
+    radiusDetail: 'What else could it touch',
+    radiusDetailHint: 'A kernel, the loader, the scheduler, a chat template',
+    testers: 'Who is waiting or can test',
+    testersHint: '@you (GB10), @friend (Strix Halo)',
+    submit: 'Continue on GitHub',
+    note: 'Opens the job form on GitHub with this filled in. Check it and press Submit.'
+  }
 };
 
 // --- roadmap (next up + artifact-linked) -------------------------------------

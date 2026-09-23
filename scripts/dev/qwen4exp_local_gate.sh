@@ -218,7 +218,7 @@ if (( FAILED == 0 )); then
   echo "  * cargo test -p spark-model --release hc_lowrank      -- --ignored"
   echo "  * cargo run --release -p spark-model --example qwen4exp_grouped_norm_microtest"
   echo "  * cargo run --release -p atlas-core  --example qwen4exp_preflight -- <ckpt>"
-  echo "  * ./serve_qwen4exp_tui.sh"
+  echo "  * ./scripts/dev/serve_qwen4exp_tui.sh"
 else
   echo "$FAILED gate(s) FAILED — logs in $LOGDIR"
 fi

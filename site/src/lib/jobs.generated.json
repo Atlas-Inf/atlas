@@ -1,0 +1,56 @@
+{
+  "jobs": [
+    {
+      "number": 58,
+      "url": "https://github.com/Atlas-Inf/atlas/issues/58",
+      "title": "DFlash2: batched concurrency on main",
+      "kind": "Feature for a model we already support",
+      "model": "nvidia/Qwen3.8-27B-NVFP4 + incoai/Qwen3.8-27B-DFlash2",
+      "what": "Finish DFlash2 concurrency on main. #52 made batched verify/propose work: aggregate went from 24 to 42 tok/s at C16 on a GB10 (γ=8, Option B). Its known follow-ups are what's left:\na gdn_decode_wy8 kernel, so the batched WY fast path covers k=8 (today it falls back per-sequence, correctly)\nowner-in-key CUDA-graph replay for batched verify (currently vetoed, so it runs eager)\nreport the multi-lane propose validation (ATLAS_DFLASH_PROPOSE_LANES=4)\n\nDone looks like: a C1/C4/C8/C16 sweep on GB10 that beats #52's table, with ST-995 unchanged.",
+      "radius": "Shared code, other models could change",
+      "radiusTone": "shared",
+      "radiusDetail": "the scheduler's batched verify path, GDN decode kernels, and the CUDA graph cache key",
+      "testers": "@AzeezIsh (GB10)",
+      "status": "open",
+      "takenBy": [],
+      "wants": 0,
+      "comments": 0,
+      "updated": "2026-09-23T18:46:49Z"
+    },
+    {
+      "number": 57,
+      "url": "https://github.com/Atlas-Inf/atlas/issues/57",
+      "title": "Qwen3.8-Flash-Next: land the Strix Halo Windows port",
+      "kind": "Feature for a model we already support",
+      "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "what": "Land the Strix Halo Windows port of Qwen3.8-Flash-Next (native HIP, gfx1151). The work is in #41 and its refresh #54, stacked on #35 (the nvidia-pack loader).\n\nDone looks like: #35 and then #41/#54 merged to main, the agentic-webserver leg on #54 reported green, and win_serve_flashnext_nvfp4.ps1 booting from a clean checkout. Note: first_run.ps1 defaults ATLAS_TARGET_MODEL=qwen3.8-27b, so it has to be overridden to qwen3.8-flash-next.",
+      "radius": "Shared code, other models could change",
+      "radiusTone": "shared",
+      "radiusDetail": "the cuBLASLt BF16 fallback (installed at backend init for every model), strix-hip/common/rms_norm.cu becoming a symlink to gb10's",
+      "testers": "@AzeezIsh (Strix Halo, Windows 11)",
+      "status": "open",
+      "takenBy": [],
+      "wants": 0,
+      "comments": 0,
+      "updated": "2026-09-23T18:46:47Z"
+    },
+    {
+      "number": 56,
+      "url": "https://github.com/Atlas-Inf/atlas/issues/56",
+      "title": "Qwen3.8-Flash-Next: run on Strix Halo Linux",
+      "kind": "Feature for a model we already support",
+      "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "what": "Serve Qwen3.8-Flash-Next on Strix Halo Linux (gfx1151, ROCm). The Windows port in #41 / #54 brings up kernels/strix-hip/qwen3.8-flash-next/; nothing has run it on Linux yet.\n\nDone looks like: builds with ATLAS_TARGET_MODEL=qwen3.8-flash-next ./build-amd.sh, boots with a clean kernel audit (no unresolved-kernel flag), and posts an ST-995 run plus one agentic leg on a 128 GB Strix Halo.\n\nHeads-up: the weights are 92.6 GB, so --gpu-memory-utilization 0.90 is the floor. 0.80 will not boot.",
+      "radius": "Shared code, other models could change",
+      "radiusTone": "shared",
+      "radiusDetail": "strix-hip/common kernels and the cuBLASLt BF16 boundary fallback in spark-runtime that #41 adds",
+      "testers": "@AzeezIsh (Strix Halo)",
+      "status": "open",
+      "takenBy": [],
+      "wants": 0,
+      "comments": 0,
+      "updated": "2026-09-23T18:46:45Z"
+    }
+  ],
+  "generated_date": "2026-09-23"
+}
