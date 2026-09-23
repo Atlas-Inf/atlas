@@ -98,9 +98,45 @@ impl TransformerModel {
         // ctx_positions — NOT a position-indexed buffer. Carried rows sit in
         // [0..ctx_prefill_base); this prefill's captures fill rows
         // base + (chunk_start - origin) .. with positions chunk_start.. .
-        let cursor = dstate.ctx_prefill_base.saturating_add(
+        let mut cursor = dstate.ctx_prefill_base.saturating_add(
             chunk_start.saturating_sub(dstate.ctx_prefill_origin.unwrap_or(chunk_start)),
         );
+        // Mid-prefill slide: the accumulator is sized to max_ctx_len rows
+        // and a prompt longer than the window would overflow it. Keep the
+        // NEWEST rows — after this chunk's writes the window holds
+        // keep = max_ctx_len/2 rows. drop_n = needed - keep > 0, and
+        // dst_end = keep - proc_count <= drop_n because
+        // needed > max_ctx_len implies cursor > max_ctx_len - proc_count,
+        // so the single in-place D2D copy never overlaps.
+        let needed = cursor.saturating_add(proc_count);
+        if needed > acc_rows && acc_rows >= 2 {
+            let keep = dstate.max_ctx_len / 2;
+            let drop_n = needed - keep;
+            let slot = dstate.ctx_slot_bytes;
+            self.gpu.copy_d2d_async(
+                acc_base.offset(drop_n * slot),
+                acc_base,
+                (cursor - drop_n) * slot,
+                stream,
+            )?;
+            // Carried rows [0..base) own positions; capture rows get theirs
+            // at update time from ctx_prefill_origin — advance it past the
+            // dropped captures so positions stay aligned with the rows.
+            let carried_drop = drop_n.min(dstate.ctx_prefill_base);
+            let pos_drop = drop_n.min(dstate.ctx_positions.len());
+            dstate.ctx_positions.drain(..pos_drop);
+            dstate.ctx_prefill_base -= carried_drop;
+            if let Some(o) = dstate.ctx_prefill_origin.as_mut() {
+                *o += drop_n - carried_drop;
+            }
+            // Rows moved; their drafter-KV slot mapping is stale.
+            dstate.ctx_committed = 0;
+            cursor -= drop_n;
+            tracing::info!(
+                "DFlash ctx prefill slide: dropped {drop_n} oldest rows \
+                 (mid-prefill overflow, keep {keep})",
+            );
+        }
         for t in 0..proc_count {
             let row = cursor + t;
             if row >= acc_rows {

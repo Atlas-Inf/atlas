@@ -915,7 +915,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // and a smaller cap slides the accumulator mid-prompt — which
             // empirically collapses acceptance to zero on prompts past it.
             max_ctx_len: self.ctx_window.min(self.max_seq_len),
-            ctx_acc_rows: self.max_seq_len,
+            // Dense window: the buffer only ever needs max_ctx_len rows —
+            // decode appends slide before writing and the prefill capture
+            // slides mid-prefill on overflow, so sizing at max_seq_len was
+            // ~0.5 GB of dead allocation at 16K ctx_window.
+            ctx_acc_rows: self.ctx_window.min(self.max_seq_len),
             ctx_prefill_origin: None,
             ctx_prefill_base: 0,
             ctx_slot_bytes,
