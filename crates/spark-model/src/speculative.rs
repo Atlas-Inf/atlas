@@ -345,6 +345,41 @@ pub trait DraftProposer: Send + Sync {
     /// being replaced or dropped).
     fn free_drafter_kv(&self, _blocks: &[u32]) {}
 
+    /// DFlash ctx carry (the Option-B drafter analogue of
+    /// `take_drafter_kv`): move this sequence's drafter ctx — hidden
+    /// accumulator, paged KV blocks, watermarks — into the proposer's
+    /// single carry slot so the next turn of the same session can adopt it
+    /// instead of re-projecting the whole prompt (~6.5 s at 16K ctx on
+    /// gfx1151) and, critically, instead of proposing blind over the
+    /// cached prefix (warm turns never re-capture those hiddens). The
+    /// state is left emptied (null acc, empty block table) so the
+    /// subsequent `free_state` releases nothing. `tokens` is the sequence's
+    /// full token list, kept for prefix validation at adopt time.
+    /// Returns true when the ctx was carried.
+    fn carry_dflash_ctx(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _state: &mut dyn ProposerState,
+        _tokens: &[u32],
+    ) -> bool {
+        false
+    }
+
+    /// Inverse of [`Self::carry_dflash_ctx`]: adopt the carried ctx into a
+    /// fresh state when the carried tokens are a prefix of `prompt`.
+    /// Installs the accumulator + paged blocks and restores the watermarks
+    /// clamped to the common prefix; frees the carried resources (and, on
+    /// success, the fresh state's own accumulator) correctly either way.
+    /// Returns true on adoption.
+    fn adopt_dflash_ctx(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _state: &mut dyn ProposerState,
+        _prompt: &[u32],
+    ) -> bool {
+        false
+    }
+
     /// Append drafter rows at KV slots `row_base ..` with RoPE positions
     /// `pos_base ..` from `(tokens, hiddens)` pairs — the catch-up feed.
     /// Returns rows written (0 = unsupported/no-op).

@@ -817,6 +817,7 @@ impl BlockDiffusionDraftHead {
             propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
             quant: DflashQuantization::Bf16,
             startup,
+            ctx_carry: Mutex::new(None),
         };
 
         tracing::info!(

@@ -139,6 +139,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
         quant: super::DflashQuantization::Bf16,
         startup: super::DsparkStartupExecution::from_env_lenient(),
+        ctx_carry: parking_lot::Mutex::new(None),
     }
 }
 
@@ -223,6 +224,31 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
         ctx_positions: vec![1, 2, 3],
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
+    })
+}
+
+/// A state as `alloc_state` returns it: accumulator allocated, every ctx
+/// watermark at zero, no paged blocks. This is the shape `adopt_dflash_ctx`
+/// sees in production (the call site guards on `ctx_len == 0`).
+fn fresh_state(gpu: &MockGpuBackend) -> Box<DflashProposerState> {
+    Box::new(DflashProposerState {
+        block_table: Vec::new(),
+        seq_len: 0,
+        last_num_drafted: 0,
+        prefill_done: false,
+        ctx_hidden_acc: gpu.alloc(4096).unwrap(),
+        ctx_len: 0,
+        last_num_accepted: 0,
+        skip_next_decode_append: false,
+        max_ctx_len: 1024,
+        ctx_slot_bytes: 64,
+        block_table_dev: None,
+        ctx_count_drafter: 0,
+        max_ctx_count_drafter: 0,
+        ctx_committed: 0,
+        ctx_positions: Vec::new(),
+        lane_id: 0,
+        lifecycle: None,
     })
 }
 
@@ -466,4 +492,96 @@ fn reclaim_seam_free_failure_retains_pointers() {
     dstate.reclaim_on_owner_failure(&gpu, &kv_cache);
     assert_eq!(dstate.ctx_hidden_acc.0, 0);
     assert!(dstate.block_table_dev.is_none());
+}
+
+/// Carry → adopt round trip: the finished state's accumulator, paged
+/// blocks, and watermarks move into the carry slot, then a later sequence
+/// whose prompt extends the carried tokens adopts the prefix portion.
+#[test]
+fn ctx_carry_round_trip_adopts_prefix() {
+    let gpu = MockGpuBackend::new();
+    let head = zero_head();
+    let own = owner(3, 77);
+    let mut boxed = live_state(&gpu, own);
+    hold_two_blocks(boxed.as_mut(), &head.kv_cache);
+    let carried_acc = boxed.ctx_hidden_acc;
+    let carried_bt_dev = boxed.block_table_dev;
+    // 300-token sequence, ctx fully committed.
+    let tokens: Vec<u32> = (0..300).collect();
+    assert!(head.carry_dflash_ctx(&gpu, boxed.as_mut(), &tokens));
+    // Resources moved out: free_state's guards see an emptied state.
+    assert_eq!(boxed.ctx_hidden_acc.0, 0);
+    assert!(boxed.block_table.is_empty());
+    assert!(boxed.block_table_dev.is_none());
+    // Pool blocks are NOT freed — the carry owns them now.
+    assert_eq!(head.kv_cache.lock().num_free_blocks(), 6);
+
+    // New turn: prompt = carried tokens + 50 appended.
+    let mut prompt = tokens.clone();
+    prompt.extend(300..350);
+    let mut fresh = fresh_state(&gpu);
+    assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt));
+    // Carried accumulator + device block table installed; watermarks at
+    // the common prefix (all 300 match; carried ctx_len=12 clamps).
+    assert_eq!(fresh.ctx_hidden_acc.0, carried_acc.0);
+    assert_eq!(
+        fresh.block_table_dev.map(|p| p.0),
+        carried_bt_dev.map(|p| p.0)
+    );
+    assert_eq!(fresh.block_table.len(), 2);
+    assert_eq!(fresh.ctx_committed, 12);
+    assert_eq!(fresh.ctx_len, 12);
+    assert!(fresh.prefill_done);
+}
+
+/// Divergent prefix: the adopt refuses, and every carried resource is
+/// released (blocks back to the pool, buffers to the backend).
+#[test]
+fn ctx_carry_rejects_divergent_prefix_without_leaking() {
+    let gpu = MockGpuBackend::new();
+    let head = zero_head();
+    let own = owner(3, 77);
+    let mut boxed = live_state(&gpu, own);
+    hold_two_blocks(boxed.as_mut(), &head.kv_cache);
+    let tokens: Vec<u32> = (0..300).collect();
+    assert!(head.carry_dflash_ctx(&gpu, boxed.as_mut(), &tokens));
+
+    let mut fresh = fresh_state(&gpu);
+    let fresh_acc = fresh.ctx_hidden_acc;
+    let allocs_before = gpu.alloc_count();
+    // Prompt diverges at token 0 — common=0 < MIN_CARRY_TOKENS.
+    let prompt: Vec<u32> = (1000..1400).collect();
+    assert!(!head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt));
+    // Carried blocks returned to the pool; fresh state untouched.
+    assert_eq!(head.kv_cache.lock().num_free_blocks(), 8);
+    assert_eq!(fresh.ctx_len, 0);
+    assert_eq!(fresh.ctx_committed, 0);
+    assert!(fresh.block_table.is_empty());
+    assert!(!fresh.prefill_done);
+    assert_eq!(fresh.ctx_hidden_acc.0, fresh_acc.0);
+    // Carried accumulator + device block table freed; fresh acc survives
+    // (alloc_count is a LIVE count — two frees drop it by exactly 2).
+    assert_eq!(gpu.alloc_count(), allocs_before - 2);
+}
+
+/// Partial divergence: common prefix 280 of 300 — the adopt truncates
+/// watermarks to the shared span; the tail re-precomputes.
+#[test]
+fn ctx_carry_truncates_at_divergence() {
+    let gpu = MockGpuBackend::new();
+    let head = zero_head();
+    let own = owner(3, 77);
+    let mut boxed = live_state(&gpu, own);
+    hold_two_blocks(boxed.as_mut(), &head.kv_cache);
+    let tokens: Vec<u32> = (0..300).collect();
+    assert!(head.carry_dflash_ctx(&gpu, boxed.as_mut(), &tokens));
+
+    let mut fresh = fresh_state(&gpu);
+    let mut prompt = tokens.clone();
+    prompt[280] = 9999; // divergence at index 280
+    assert!(head.adopt_dflash_ctx(&gpu, fresh.as_mut(), &prompt));
+    // Carried ctx_len=12 < common=280 → full carried ctx adopted.
+    assert_eq!(fresh.ctx_committed, 12);
+    assert_eq!(fresh.ctx_len, 12);
+    assert_eq!(fresh.ctx_positions.len(), 3);
 }
