@@ -463,12 +463,15 @@ pub fn build_model(
     // the post-KV allocs get a clean region. If the balloon itself can't
     // allocate we fall back to the previous behavior — nothing breaks, the
     // late allocs just take their chances as before.
-    let balloon = if inference_reserve > 0 {
-        match gpu.alloc(inference_reserve) {
+    // The reserve covers the target model's SSM pools + Marconi + headroom;
+    // the drafter's own post-KV allocs are held by the second balloon below.
+    let balloon_bytes = inference_reserve;
+    let balloon = if balloon_bytes > 0 {
+        match gpu.alloc(balloon_bytes) {
             Ok(ptr) => Some(ptr),
             Err(e) => {
                 tracing::warn!(
-                    "startup reserve balloon: alloc of {inference_reserve} B failed ({e}); \
+                    "startup reserve balloon: alloc of {balloon_bytes} B failed ({e}); \
                      post-KV allocations will contend with the fragmented tail"
                 );
                 None
@@ -477,14 +480,35 @@ pub fn build_model(
     } else {
         None
     };
-    // When the balloon is held it IS the reserve (the bytes are in
-    // `used_so_far`/`actual_free` already), so the budget subtraction below
-    // must not count it twice.
-    let reserve_net = inference_reserve.saturating_sub(if balloon.is_some() {
-        inference_reserve
+    // The freed reserve region is consumed by ~100 small allocs (Marconi's
+    // per-layer regions, MTP head, GDN buffers) and ends up shredded — the
+    // drafter's NVFP4 staging (44+ MB contiguous per GEMM) still dies. A
+    // second balloon stays held through model construction and is freed only
+    // just before the drafter build below, so those allocs get a region no
+    // earlier alloc was allowed to fragment.
+    let drafter_balloon = if dflash_args.is_some() {
+        match gpu.alloc(1 << 30) {
+            Ok(ptr) => Some(ptr),
+            Err(e) => {
+                tracing::warn!(
+                    "drafter balloon: 1 GiB alloc failed ({e}); drafter build \
+                     allocations will contend with the tail"
+                );
+                None
+            }
+        }
     } else {
+        None
+    };
+    // When the balloons are held their bytes are already inside
+    // `used_so_far`/`actual_free` — subtracting `inference_reserve` again
+    // would double-count. If the reserve balloon failed to allocate, keep
+    // the old virtual-reserve subtraction (conservative).
+    let reserve_net = if balloon.is_some() {
         0
-    });
+    } else {
+        inference_reserve
+    };
 
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
@@ -812,6 +836,14 @@ pub fn build_model(
     // structural gate rejects LoRA-backed targets, so installing adapters
     // first makes that precondition observable instead of bypassable.
     model.set_lora_weights(lora_weights)?;
+
+    // Free the drafter balloon: the drafter's pools, fused weights and NVFP4
+    // staging now allocate into its pristine region — not the shredded tail.
+    if let Some(ptr) = drafter_balloon
+        && let Err(e) = model.gpu_backend().free(ptr)
+    {
+        tracing::warn!("drafter balloon free failed: {e}");
+    }
 
     if let Some(args) = dflash_args {
         let weights = load_dflash_weights(
