@@ -15,10 +15,21 @@
 #   usage: GAMMA=8 strix-dflash2-agentic-only.sh        (run under setsid/nohup)
 # This is the leg-3-only variant of strix-dflash2-overnight.sh (ST-996 dropped
 # to fit the merge window; ST-995 already ran in dflash-overnight-20260915T1706Z).
+#
+# 2026-09-24 proven recipe (carry branch, balloons + contiguous Marconi blobs):
+#   GPU_UTIL=0.81 SSM_SLOTS=12 SSM_CKPT_INTERVAL=512 MAX_PREFILL_TOKENS=1024
+#   MAX_SEQ_LEN=26624 DFLASH_CTX_WINDOW=12288 --dflash-window-size 2048
+# Do NOT raise GPU_UTIL past ~0.82 for this leg: unified memory means the
+# spark process's device allocations are host RAM. At util 0.84 the leg serve
+# (~56 GB RSS) + harness + OS crossed the 61 GB line and the host OOM-killer
+# SIGKILLed both mid-run (kern.log "Out of memory: Killed process (spark)",
+# 2026-09-24T05:08Z). ~0.81 leaves ~7 GB of headroom.
 set -uo pipefail
 
-WT=/home/azeez/atlas-dflash2
+WT="${WT:-/home/azeez/atlas-dflash2}"
 BIN=$WT/target/release/spark
+GPU_UTIL="${GPU_UTIL:-0.81}"
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-1024}"
 GAMMA="${GAMMA:-8}"
 DRAFTER=/home/azeez/.models/dflash2            # incoai/Qwen3.8-27B-DFlash2 (BF16, block_size 8)
 SNAP=/home/azeez/.cache/huggingface/hub/models--nvidia--Qwen3.8-27B-NVFP4/snapshots/dbb8f445b3145f8a4c18ddc769f032d57d32867c
@@ -43,7 +54,7 @@ fingerprint() {  # <leg> <max_seq> <extra serve flags...>
     echo "binary=$BIN sha256=$BIN_SHA"
     echo "checkpoint=$MODEL revision=dbb8f445b3145f8a4c18ddc769f032d57d32867c"
     echo "drafter=incoai/Qwen3.8-27B-DFlash2 path=$DRAFTER gamma=$GAMMA option_b=${OPTION_B:-1} small_m_gemv=${ATLAS_DFLASH_SMALL_M_GEMV:-default}"
-    echo "serve=serve-amd.sh DFLASH=1 GPU_UTIL=0.80 request-timeout=900 MAX_SEQ_LEN=$maxseq prefill=2048 kv=bf16 head=nvfp4 batch=1 ssm-slots=${SSM_SLOTS:-0} ssm-checkpoint-interval=${SSM_CKPT_INTERVAL:-16} dflash-window-size=${DFLASH_WINDOW_SIZE:-0}(full) dflash-ctx-window=${DFLASH_CTX_WINDOW:-$maxseq} mtp=off thinking=off(--disable-thinking) extra='$*'"
+    echo "serve=serve-amd.sh DFLASH=1 GPU_UTIL=$GPU_UTIL request-timeout=900 MAX_SEQ_LEN=$maxseq prefill=$MAX_PREFILL_TOKENS kv=bf16 head=nvfp4 batch=1 ssm-slots=${SSM_SLOTS:-0} ssm-checkpoint-interval=${SSM_CKPT_INTERVAL:-16} dflash-window-size=${DFLASH_WINDOW_SIZE:-0}(full) dflash-ctx-window=${DFLASH_CTX_WINDOW:-$maxseq} mtp=off thinking=off(--disable-thinking) extra='$*'"
     echo "env=ATLAS_W4A16_DP4A=1(default) ATLAS_W4A16_VARIANT=v1 ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_MTP_ACCEPT_DEBUG=1 HF_HUB_OFFLINE=1"
     echo "gpu_temp_edge=$(/opt/rocm/bin/amd-smi metric --temperature 2>/dev/null | sed -n 's/.*EDGE: *//p' | head -1)"
   } | tee "$OUT/$leg-fingerprint.txt"
@@ -61,8 +72,8 @@ serve() {  # <serve-log> <max_seq> <extra serve flags...>
   ( cd "$WT" && HF_HUB_OFFLINE=1 RUST_LOG=info ATLAS_MTP_ACCEPT_DEBUG=1 \
       ATLAS_DFLASH_OPTION_B="${OPTION_B:-1}" \
       ATLAS_DFLASH_CTX_WINDOW="${DFLASH_CTX_WINDOW:-$maxseq}" \
-      DFLASH=1 DRAFT_MODEL="$DRAFTER" DFLASH_GAMMA="$GAMMA" GPU_UTIL=0.80 \
-      MAX_SEQ_LEN="$maxseq" PORT=$PORT HOST=127.0.0.1 MODEL_NAME="$MODEL" SSM_SLOTS="${SSM_SLOTS:-0}" SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-16}" \
+      DFLASH=1 DRAFT_MODEL="$DRAFTER" DFLASH_GAMMA="$GAMMA" GPU_UTIL="$GPU_UTIL" \
+      MAX_SEQ_LEN="$maxseq" MAX_PREFILL_TOKENS="$MAX_PREFILL_TOKENS" PORT=$PORT HOST=127.0.0.1 MODEL_NAME="$MODEL" SSM_SLOTS="${SSM_SLOTS:-0}" SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-16}" \
       ./serve-amd.sh "$MODEL" --disable-thinking --request-timeout 900 \
       --dflash-window-size "${DFLASH_WINDOW_SIZE:-0}" "$@" >"$slog" 2>&1 & echo $! >"$OUT/.serve.pid" )
   sleep 2
@@ -101,18 +112,28 @@ PY
 # finish inside its 4h cap (multi-turn replay); PCACHE=0 disables it if the
 # pre-probe below shows the dflash+prefix-caching fault reported on GB10.
 log "LEG3 MLPerf agentic 2.5h — dflash gamma=$GAMMA"
-# 2026-09-15 22:39Z attempt at SSM_SLOTS=16 OOM'd: the engine raises the slot count
-# to cover max-seq-len at the recipe's 256 tok/snapshot (16 -> 104 slots x 151 MB
-# = 15.7 GB on top of 39 GB pre-KV + 5.9 GB KV + 2.4 GB MTP pools). Interval 128
-# (2048 tok/snapshot) -> 20 slots (3.0 GB); everything else unchanged.
-SSM_SLOTS=16
-SSM_CKPT_INTERVAL=128
+# 2026-09-24 recipe (carry branch): with the acc-prime + reserve/drafter
+# balloons + contiguous Marconi blob, startup clears at util 0.81-0.84; 0.84
+# was host-OOM-killed mid-leg (unified memory: device allocs are host RAM,
+# ~56 GB RSS + harness crossed the 61 GB line) — stay at 0.81. 12 slots @
+# 512-block ckpt interval = an SSM anchor every 8192 tokens (2x finer than the
+# prior leg's 16K), contiguous pool ~1.8 GB. prefill 1024 halves the buffer
+# arena. ctx window 12288 and --dflash-window-size 2048 bound the drafter's
+# carry footprint. MAX_SEQ_LEN=26624 still covers the ~25.2K ISL peak.
+SSM_SLOTS="${SSM_SLOTS:-12}"
+SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-512}"
+DFLASH_CTX_WINDOW="${DFLASH_CTX_WINDOW:-12288}"
+DFLASH_WINDOW_SIZE="${DFLASH_WINDOW_SIZE:-2048}"
+MAXSEQ="${MAXSEQ:-26624}"
 PCACHE_FLAGS=(--enable-prefix-caching)
 [ "${PCACHE:-1}" = 0 ] && PCACHE_FLAGS=()
-fingerprint agentic 32768 "${PCACHE_FLAGS[@]}"
-if serve "$OUT/agentic-serve.log" 32768 "${PCACHE_FLAGS[@]}"; then
+fingerprint agentic "$MAXSEQ" "${PCACHE_FLAGS[@]}"
+if serve "$OUT/agentic-serve.log" "$MAXSEQ" "${PCACHE_FLAGS[@]}"; then
   # pre-probe: a ~12K-token prompt twice (multi-chunk prefill + cache hit) and a
-  # short prompt twice; any server death here is recorded, then the leg runs anyway.
+  # short prompt twice. This also absorbs the one-time kernel JIT / CUDA-graph
+  # capture cost — the 2026-09-24 leg without it paid ~594 s TTFT on turn 1,
+  # tripped the per-turn timeout, and the harness dropped all 58 turns of that
+  # conversation. Any server death here is recorded, then the leg runs anyway.
   python3 - "$PORT" "$MODEL" "$OUT" <<'PY'
 import json, sys, urllib.request, hashlib
 port, model, out = sys.argv[1:4]
@@ -136,8 +157,8 @@ PY
   if ! kill -0 "$(cat "$OUT/.serve.pid")" 2>/dev/null; then
     log "pcache probe KILLED the server — restarting WITHOUT prefix caching for the leg"
     tail -60 "$OUT/agentic-serve.log" > "$OUT/agentic-pcache-crash-tail.log"
-    fingerprint agentic 32768
-    serve "$OUT/agentic-serve.log" 32768 || { log "LEG3 SKIPPED — serve failed"; stop_serve; exit 0; }
+    fingerprint agentic "$MAXSEQ"
+    serve "$OUT/agentic-serve.log" "$MAXSEQ" || { log "LEG3 SKIPPED — serve failed"; stop_serve; exit 0; }
   fi
   RDAG=results_agentic_dflash_$TS
   CFGAG=$EP/examples/10_Edge_Agentic_Example/online_agentic_2.5h_dflash_$TS.yaml
