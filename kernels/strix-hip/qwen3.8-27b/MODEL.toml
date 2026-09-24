@@ -260,6 +260,8 @@ w4a16_gemm_t_m128_bf16_v2 = "8-warp pipelined twin of the bf16 variant; same fal
 w4a16_gemm_t_p3 = "3-deep weight-pipeline twin; tgemm_kernel falls back to w4a16_gemm_t (resolved)."
 w4a16_gemm_t_k64_p3 = "k64 pipelined twin; k64_kernel falls back to w4a16_gemm_t_k64 (required, resolves)."
 w4a16_gemm_t_k64_n64_p3 = "Narrow-N deep-K twin; k64_n64_kernel returns 0-handle when absent and dispatch gates before firing (qwen3.6-27b carries the same entry)."
+fp8_gemm_t_row_scaled = "DFlash Phase-G row-scaled BF16xFP8 GEMM for the FP8 drafter path (dflash_head/from_weights.rs:239, try_kernel). Not in strix-hip's w4a16 module; the ATLAS_DFLASH_DRAFTER_FP8 gate then keeps the BF16 drafter. Observed as the only two unresolved lookups on the 2026-09-19 DFlash gamma=8 ST-995/ST-996 serves at main@da943853 (AzeezStrix), which ran through the fallback. UNPORTED candidate: drafter-propose bytes."
+fp8_gemm_t_row_scaled_m16 = "Small-M (M<=16) twin used for the lm_head swap in the gamma loop (from_weights.rs:252); same gate, same BF16 fallback."
 
 # ── dense FFN: vendored Blackwell NVFP4 W4A4 MMQ family — UNPORTED ─────────
 # The FP4 tensor-core MMA prefill arm (llama-derived, block-scale). Default

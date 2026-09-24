@@ -213,7 +213,7 @@ fn content_loop_rejects_single_occurrence() {
 // ids 1..=11, numeric ids 100..=199; mask len 1100 (prefix noise
 // ids 900..=990 are out of the numeric range → structural).
 
-fn numeric_mask() -> Vec<bool> {
+pub(super) fn numeric_mask() -> Vec<bool> {
     let mut m = vec![false; 1100];
     for (i, slot) in m.iter_mut().enumerate() {
         *slot = (100..=199).contains(&i);
@@ -224,7 +224,7 @@ fn numeric_mask() -> Vec<bool> {
 /// 12-token template `[1..=6, <num>, 7..=11]`; `num` varies each
 /// repeat so the exact detector cannot match, but normalization
 /// collapses every repeat to an identical period.
-fn varying_template_stream(repeats: u32) -> Vec<u32> {
+pub(super) fn varying_template_stream(repeats: u32) -> Vec<u32> {
     let mut t: Vec<u32> = (900u32..990).collect(); // 90 structural-noise prefix
     for k in 0..repeats {
         t.extend([1, 2, 3, 4, 5, 6]);
