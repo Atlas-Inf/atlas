@@ -690,14 +690,19 @@ pub struct BlockDiffusionDraftHead {
     /// gated on token-prefix equality and happens at the new sequence's
     /// first ctx seed (`update_dflash_ctx_len_after_prefill`).
     pub ctx_carry: Mutex<Option<carry::DflashCtxCarry>>,
-    /// Returned per-seq ctx accumulators. Each is ~1.4 GB at
-    /// max_seq_len=26624 — alloc/free churn per request fragmented the
-    /// device map enough to fail a contiguous 1.4 GB request with ~5 GB
-    /// nominally free. Pooling keeps a bounded set mapped for reuse;
-    /// contents are always overwritten before rows are claimed, so no
-    /// memset is needed on reuse.
-    pub ctx_acc_pool: Mutex<Vec<DevicePtr>>,
 }
+
+/// Returned per-seq ctx accumulators. Each is ~1.4 GB at
+/// max_seq_len=26624 — alloc/free churn per request fragmented the
+/// device map enough to fail a contiguous 1.4 GB request with ~5 GB
+/// nominally free. Pooling keeps a bounded set mapped for reuse;
+/// contents are always overwritten before rows are claimed, so no
+/// memset is needed on reuse.
+///
+/// Global (not per-head) so `factory::build` can prime it BEFORE the
+/// residual KV-pool sizing consumes the device map — priming inside
+/// `from_weights` runs after that sizing and still hits the wall.
+pub(crate) static CTX_ACC_POOL: Mutex<Vec<DevicePtr>> = Mutex::new(Vec::new());
 
 mod contract;
 pub use contract::{
@@ -760,7 +765,7 @@ impl BlockDiffusionDraftHead {
             return;
         }
         {
-            let mut pool = self.ctx_acc_pool.lock();
+            let mut pool = CTX_ACC_POOL.lock();
             if pool.len() < CTX_ACC_POOL_CAP {
                 pool.push(ptr);
                 return;
@@ -953,7 +958,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // Reuse a pooled accumulator when available — per-turn alloc/free
         // of this ~1.4 GB buffer fragmented the device map enough to fail
         // contiguous allocations mid-run.
-        let acc = match self.ctx_acc_pool.lock().pop() {
+        let acc = match CTX_ACC_POOL.lock().pop() {
             Some(ptr) => ptr,
             None => gpu.alloc(total)?,
         };

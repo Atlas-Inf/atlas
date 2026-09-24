@@ -20,9 +20,23 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::lifecycle::*;
-use super::{BlockDiffusionDraftHead, DflashKernels, DflashProposerState, DflashScratch};
+use super::{
+    BlockDiffusionDraftHead, DflashKernels, DflashProposerState, DflashScratch, CTX_ACC_POOL,
+};
 use crate::speculative::DraftProposer;
 use crate::weight_map::DenseWeight;
+
+/// Serializes tests that exercise the global `CTX_ACC_POOL` (free_state
+/// success paths and carry-reject recycling push into it). Rust runs tests
+/// in parallel; without this a concurrent push could overflow the pool cap
+/// mid-assertion and flip a pooled buffer into a backend free.
+static POOL_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn lock_and_drain_pool() -> parking_lot::MutexGuard<'static, ()> {
+    let guard = POOL_TEST_LOCK.lock();
+    CTX_ACC_POOL.lock().clear();
+    guard
+}
 
 fn owner(slot: usize, generation: u64) -> SequenceGeneration {
     SequenceGeneration::new(slot, generation).unwrap()
@@ -140,7 +154,6 @@ fn zero_head() -> BlockDiffusionDraftHead {
         quant: super::DflashQuantization::Bf16,
         startup: super::DsparkStartupExecution::from_env_lenient(),
         ctx_carry: parking_lot::Mutex::new(None),
-        ctx_acc_pool: parking_lot::Mutex::new(Vec::new()),
     }
 }
 
@@ -287,6 +300,7 @@ fn hold_two_blocks(state: &mut DflashProposerState, kv: &parking_lot::Mutex<Page
 
 #[test]
 fn real_free_state_success_path_reclaims_all_resources() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -315,11 +329,12 @@ fn real_free_state_success_path_reclaims_all_resources() {
     // Block table dev freed to the backend; the accumulator moved to the
     // reuse pool (still a live allocation).
     assert_eq!(gpu.alloc_count(), allocs_before - 1);
-    assert_eq!(head.ctx_acc_pool.lock().len(), 1);
+    assert_eq!(CTX_ACC_POOL.lock().len(), 1);
 }
 
 #[test]
 fn real_free_state_second_call_is_idempotent_success() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -429,6 +444,7 @@ fn real_free_state_missing_owner_is_rejected_and_reclaimed() {
 
 #[test]
 fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -456,6 +472,7 @@ fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
 
 #[test]
 fn real_free_state_block_table_free_failure_restores_handle_for_retry() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -565,6 +582,7 @@ fn ctx_carry_round_trip_adopts_prefix() {
 /// released (blocks back to the pool, buffers to the backend).
 #[test]
 fn ctx_carry_rejects_divergent_prefix_without_leaking() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
