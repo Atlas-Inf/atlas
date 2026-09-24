@@ -18,17 +18,19 @@
 #     through the ctx conditioning — verified: mean_na 6.18 on a predictable
 #     decode at seq_len 28K.
 #
-# MEMORY FACTS (winbox, 2026-09-22):
-#   * GPU exposes ~89.5 GB this boot. util 0.90 OOM'd the watchdog during
-#     drafter scratch alloc after the (budget-sized) KV pool — the pool is
-#     sized by util, NOT seq-len, so lowering util is the lever, not seq.
-#   * util 0.80 + seq 49152 + ctx 49152 + window=full fits: ~81 GiB WS at
-#     Server live. The agentic dataset peaks ~25.2K ISL, so 32768 also works
-#     if headroom is tighter on a different boot.
-#   * 2026-09-24 merge brings the Linux allocator hardening: ctx-acc pool
-#     primed before KV sizing, startup balloons held across model build,
-#     contiguous Marconi snapshot blobs — util may now go higher, but 0.80
-#     remains the tested value.
+# MEMORY FACTS (winbox, updated 2026-09-24 post-merge):
+#   * GPU exposes ~89.5 GB this boot. Pre-merge, util 0.90 OOM'd the
+#     watchdog during drafter scratch alloc and 0.80 was the tested value.
+#   * The 2026-09-24 merge (ctx-acc pool primed before KV sizing, startup
+#     balloons held across model build, contiguous Marconi snapshot blobs)
+#     raises pre-KV footprint to ~74.5 GB — the primed 2.5 GB ctx-acc plus
+#     ~6 GB of balloons now count inside it. util 0.80's budget (~71.6 GB)
+#     is BELOW that, so kv_budget=0 and startup bails.
+#   * util 0.90 is now the tested value: KV lands ~6.1 GB / ~99K tokens,
+#     32 Marconi slots, one transient watchdog trip during pool alloc but
+#     the balloons carried it through — server live + smoke verified.
+#   * The agentic dataset peaks ~25.2K ISL, so 32768 also works if
+#     headroom is tighter on a different boot.
 #
 #   powershell -ExecutionPolicy Bypass -File .\win_serve_dflash2_nvfp4.ps1 -BindHost 127.0.0.1
 [CmdletBinding()]
@@ -36,7 +38,7 @@ param(
     [string]$BindHost = '127.0.0.1',
     [string]$Port = '8096',
     [string]$SeqLen = '49152',
-    [string]$Util = '0.80',
+    [string]$Util = '0.90',
     [string]$Gamma = '8',
     [string]$SsmSlots = '24',
     [string]$SsmInterval = '128',
