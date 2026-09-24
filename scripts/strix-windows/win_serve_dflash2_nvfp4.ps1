@@ -25,6 +25,10 @@
 #   * util 0.80 + seq 49152 + ctx 49152 + window=full fits: ~81 GiB WS at
 #     Server live. The agentic dataset peaks ~25.2K ISL, so 32768 also works
 #     if headroom is tighter on a different boot.
+#   * 2026-09-24 merge brings the Linux allocator hardening: ctx-acc pool
+#     primed before KV sizing, startup balloons held across model build,
+#     contiguous Marconi snapshot blobs — util may now go higher, but 0.80
+#     remains the tested value.
 #
 #   powershell -ExecutionPolicy Bypass -File .\win_serve_dflash2_nvfp4.ps1 -BindHost 127.0.0.1
 [CmdletBinding()]

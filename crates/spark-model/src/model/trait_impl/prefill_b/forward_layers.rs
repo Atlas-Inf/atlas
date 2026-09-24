@@ -219,11 +219,15 @@ impl TransformerModel {
                 t_in_prefill += t.elapsed();
             }
             let t_df = host_timing.then(std::time::Instant::now);
-            // DFlash chunked-prefill capture.
+            // DFlash chunked-prefill capture. `effective_seq_len_start` (==
+            // proc_start) is the ABSOLUTE position of this chunk's first
+            // computed token; `layer_kv_write_start` is a constant write
+            // floor (0 on cold prefills) and would alias every chunk's
+            // captures onto the same rows.
             self.try_dflash_prefill_capture_layer(
                 seq,
                 i,
-                layer_kv_write_start,
+                effective_seq_len_start,
                 proc_count,
                 stream,
             )?;

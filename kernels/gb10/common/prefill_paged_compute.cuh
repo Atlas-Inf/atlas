@@ -268,15 +268,16 @@ extern "C" __global__ void KERNEL_NAME(
 
     KERNEL_PREAMBLE
 
-    // q_rope_pos: absolute position used to rotate the query block. Indirect
-    // (DFlash) declares it in KERNEL_PREAMBLE from a device u32 (= true decode
-    // position, decoupled from cache-slot base). All other variants: equals
-    // q_offset (correct for causal attention where RoPE pos == cache base).
+    // q_rope_pos: absolute RoPE position of the query block (indirect/DFlash
+    // reads it from the arg triple; other variants get q_offset). Retained
+    // for arg-layout parity — the masks use q_offset (KV SLOT space) since
+    // DFlash compacts the ctx window so slot != absolute position.
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
     unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
 #elif !defined(Q_ROPE_POS_OVERRIDE)
     unsigned int q_rope_pos = q_offset;
 #endif
+    (void)q_rope_pos;
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
@@ -301,11 +302,13 @@ extern "C" __global__ void KERNEL_NAME(
     // Sliding-window lower bound. The mask below drops any key with
     // (q_abs - k) >= sliding_window, so every KV block strictly below the
     // first in-window key is fully masked — start there instead of scoring
-    // and discarding. Uses q_rope_pos (the same absolute position the mask
-    // uses) so the DFlash Q_ROPE_POS_OVERRIDE variant stays correct.
+    // and discarding. The mask coordinate is the KV SLOT space (q_offset),
+    // NOT q_rope_pos: DFlash compacts its ctx window so slot i may hold
+    // an absolute position far greater than i — comparing slot indices
+    // against the absolute RoPE position masks everything.
     unsigned int kv_block_lo = 0;
     if (causal_mask_enabled && sliding_window > 0) {
-        unsigned int q_abs_lo = q_rope_pos + q_start;
+        unsigned int q_abs_lo = q_offset + q_start;
         if (q_abs_lo + 1 > sliding_window) {
             kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
         }
@@ -410,7 +413,8 @@ extern "C" __global__ void KERNEL_NAME(
                 acc_s[nt][0]*=inv_sqrt_d; acc_s[nt][1]*=inv_sqrt_d;
                 acc_s[nt][2]*=inv_sqrt_d; acc_s[nt][3]*=inv_sqrt_d;
                 unsigned int c0=nt*8+tid_in_group*2, c1=c0+1;
-                unsigned int qr0=q_rope_pos+q_start+row0, qr1=q_rope_pos+q_start+row1;
+                // Slot-space mask coordinate (kpos = slot index); see kv_block_lo note.
+                unsigned int qr0=q_offset+q_start+row0, qr1=q_offset+q_start+row1;
                 // Causal mask: only enforce when causal_mask_enabled (default 1).
                 // DFlash γ-block runs with causal_mask_enabled=0 so the γ
                 // queries attend bidirectionally within their block; the prefix
@@ -775,15 +779,16 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
     KERNEL_PREAMBLE
 
-    // q_rope_pos: absolute position used to rotate the query block. Indirect
-    // (DFlash) declares it in KERNEL_PREAMBLE from a device u32 (= true decode
-    // position, decoupled from cache-slot base). All other variants: equals
-    // q_offset (correct for causal attention where RoPE pos == cache base).
+    // q_rope_pos: absolute RoPE position of the query block (indirect/DFlash
+    // reads it from the arg triple; other variants get q_offset). Retained
+    // for arg-layout parity — the masks use q_offset (KV SLOT space) since
+    // DFlash compacts the ctx window so slot != absolute position.
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
     unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
 #elif !defined(Q_ROPE_POS_OVERRIDE)
     unsigned int q_rope_pos = q_offset;
 #endif
+    (void)q_rope_pos;
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
@@ -807,11 +812,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     // Sliding-window lower bound. The mask below drops any key with
     // (q_abs - k) >= sliding_window, so every KV block strictly below the
     // first in-window key is fully masked — start there instead of scoring
-    // and discarding. Uses q_rope_pos (the same absolute position the mask
-    // uses) so the DFlash Q_ROPE_POS_OVERRIDE variant stays correct.
+    // and discarding. The mask coordinate is the KV SLOT space (q_offset),
+    // NOT q_rope_pos: DFlash compacts its ctx window so slot i may hold
+    // an absolute position far greater than i — comparing slot indices
+    // against the absolute RoPE position masks everything.
     unsigned int kv_block_lo = 0;
     if (causal_mask_enabled && sliding_window > 0) {
-        unsigned int q_abs_lo = q_rope_pos + q_start;
+        unsigned int q_abs_lo = q_offset + q_start;
         if (q_abs_lo + 1 > sliding_window) {
             kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
         }
@@ -919,7 +926,8 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 acc_s[nt][0]*=inv_sqrt_d; acc_s[nt][1]*=inv_sqrt_d;
                 acc_s[nt][2]*=inv_sqrt_d; acc_s[nt][3]*=inv_sqrt_d;
                 unsigned int c0=nt*8+tid_in_group*2, c1=c0+1;
-                unsigned int qr0=q_rope_pos+q_start+row0, qr1=q_rope_pos+q_start+row1;
+                // Slot-space mask coordinate (kpos = slot index); see kv_block_lo note.
+                unsigned int qr0=q_offset+q_start+row0, qr1=q_offset+q_start+row1;
                 // Causal mask gated for DFlash γ-block (causal_mask_enabled=0).
                 if(causal_mask_enabled){
                     if(kv_start+c0>qr0) acc_s[nt][0]=-1e30f; if(kv_start+c1>qr0) acc_s[nt][1]=-1e30f;

@@ -413,6 +413,103 @@ pub fn build_model(
     // clamp ensures we never exceed what the device can physically provide
     // right now (handles external memory pressure on shared-memory /
     // unified-memory systems like GB10).
+    // Prime one DFlash ctx accumulator NOW — before the residual KV-pool
+    // sizing below consumes every remaining byte of the device map. The acc
+    // is ~`ctx_window` rows of target hiddens (600+ MB at ctx_window≥12K);
+    // allocating it lazily at request time lands AFTER the KV pool claim
+    // and hits the fragmentation wall with GBs nominally free. One buffer
+    // covers the first request; a warm turn's acc returns through carry
+    // adoption, and any further demand falls to the lazy path. Failure only
+    // forfeits the optimization — the request-time path still allocates.
+    if let Some(ref args) = dflash_args
+        && let Some(ref sub) = args.drafter_config.dflash_config
+    {
+        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
+        let ctx_capacity = ctx_window.min(max_seq_len);
+        if ctx_capacity > 0 && !sub.target_layer_ids.is_empty() {
+            let acc_bytes = ctx_capacity
+                .saturating_mul(sub.target_layer_ids.len())
+                .saturating_mul(config.hidden_size)
+                .saturating_mul(2);
+            match gpu.alloc(acc_bytes) {
+                Ok(ptr) => {
+                    crate::layers::dflash_head::CTX_ACC_POOL.lock().push(ptr);
+                    tracing::info!(
+                        "DFlash ctx acc pool: primed {acc_bytes} B before KV residual sizing"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DFlash ctx acc pool prime: alloc of {acc_bytes} B failed ({e}); \
+                         request-time path will allocate on demand"
+                    );
+                }
+            }
+        }
+    }
+
+    // Materialize the inference reserve as a "balloon" allocation held across
+    // KV residual sizing, then freed right after the KV pool claims its
+    // blocks. The reserve is already deducted from the KV budget below, so
+    // holding it costs nothing — but WITHOUT holding it, the bytes are just
+    // "not claimed by KV": the ~100 mid-size allocs that follow (Marconi
+    // snapshot pool's per-layer regions, drafter KV, NVFP4 quantize staging)
+    // land in whatever the earlier allocs left behind, and on a unified-
+    // memory APU that tail fragments enough that a ~45MB staging alloc fails
+    // with GBs nominally free. Holding the reserve contiguously guarantees
+    // the post-KV allocs get a clean region. If the balloon itself can't
+    // allocate we fall back to the previous behavior — nothing breaks, the
+    // late allocs just take their chances as before.
+    // The reserve covers the target model's SSM pools + Marconi + headroom;
+    // the drafter's own post-KV allocs are held by the second balloon below.
+    let balloon_bytes = inference_reserve;
+    let balloon = if balloon_bytes > 0 {
+        match gpu.alloc(balloon_bytes) {
+            Ok(ptr) => Some(ptr),
+            Err(e) => {
+                tracing::warn!(
+                    "startup reserve balloon: alloc of {balloon_bytes} B failed ({e}); \
+                     post-KV allocations will contend with the fragmented tail"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // The freed reserve region is consumed by ~100 small allocs (Marconi's
+    // per-layer regions, MTP head, GDN buffers) and ends up shredded — the
+    // drafter's NVFP4 staging (44+ MB contiguous per GEMM) still dies. A
+    // second balloon stays held through model construction and is freed only
+    // just before the drafter build below, so those allocs get a region no
+    // earlier alloc was allowed to fragment.
+    let drafter_balloon = if dflash_args.is_some() {
+        match gpu.alloc(3 << 29) {
+            Ok(ptr) => Some(ptr),
+            Err(e) => {
+                tracing::warn!(
+                    "drafter balloon: 1.5 GiB alloc failed ({e}); drafter build \
+                     allocations will contend with the tail"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // When the balloons are held their bytes are already inside
+    // `used_so_far`/`actual_free` — subtracting `inference_reserve` again
+    // would double-count. If the reserve balloon failed to allocate, keep
+    // the old virtual-reserve subtraction (conservative).
+    let reserve_net = if balloon.is_some() {
+        0
+    } else {
+        inference_reserve
+    };
+
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
     let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -485,8 +582,8 @@ pub fn build_model(
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
     let kv_budget = total_budget
         .saturating_sub(used_so_far)
-        .saturating_sub(inference_reserve)
-        .min(actual_free.saturating_sub(inference_reserve));
+        .saturating_sub(reserve_net)
+        .min(actual_free.saturating_sub(reserve_net));
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -623,6 +720,15 @@ pub fn build_model(
     }
     let kv_cache = PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?;
 
+    // Release the reserve balloon: everything after this point (Marconi
+    // snapshot pool, SSM decode states, drafter KV, NVFP4 staging) allocates
+    // into the contiguous region it held instead of the fragmented tail.
+    if let Some(ptr) = balloon
+        && let Err(e) = gpu.free(ptr)
+    {
+        tracing::warn!("startup reserve balloon free failed: {e}");
+    }
+
     // ── Step 6: Assemble model ──
     // Capture pointers for any post-construction sharing (DFlash drafter
     // shares embed_tokens + lm_head with the target). DenseWeight is Copy
@@ -730,6 +836,14 @@ pub fn build_model(
     // structural gate rejects LoRA-backed targets, so installing adapters
     // first makes that precondition observable instead of bypassable.
     model.set_lora_weights(lora_weights)?;
+
+    // Free the drafter balloon: the drafter's pools, fused weights and NVFP4
+    // staging now allocate into its pristine region — not the shredded tail.
+    if let Some(ptr) = drafter_balloon
+        && let Err(e) = model.gpu_backend().free(ptr)
+    {
+        tracing::warn!("drafter balloon free failed: {e}");
+    }
 
     if let Some(args) = dflash_args {
         let weights = load_dflash_weights(

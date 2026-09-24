@@ -22,40 +22,31 @@ use spark_runtime::gpu::GpuBackend;
 use std::collections::HashSet;
 use support::*;
 
-/// bf16 bit patterns for the unary-logit grid. Patterns are monotonic in
-/// value within each sign side: `0x3F80 + i` steps up through the positive
-/// finite normals (from 1.0 toward bf16-max), then `0x8000 + j` continues
-/// down the negative side — every pattern distinct, no duplicates, no
-/// NaN/Inf. `n` past the ~49k available patterns wraps and repeats; those
-/// duplicates are INTENTIONAL tie coverage — the (value desc, index asc)
-/// order the kernel is contracted to match stays deterministic.
+/// Map a rank position to a strictly increasing f32 then bf16. Returns the
+/// bf16 bits. Distinctness over `n` is checked by the caller.
+fn grid_value(i: usize, n: usize, lo: f32, hi: f32) -> u16 {
+    let f = lo + (hi - lo) * (i as f32) / ((n - 1).max(1) as f32);
+    f32_to_bf16_bits(f)
+}
+
+/// bf16 bits of the unary-logit grid; asserts uniqueness when the bf16
+/// format can supply `n` distinct values (bf16 has ~65k finite patterns —
+/// beyond that the idx-asc tie rule keeps the order deterministic anyway).
 fn logit_grid(n: usize) -> Vec<u16> {
-    const POS_BASE: u32 = 0x3F80; // bf16 1.0
-    const POS_CAP: u32 = 0x7F7F - POS_BASE; // 0x3F80..=0x7F7E finite positive
-    const NEG_CAP: u32 = 0x7F7E; // 0x8000..=0xFF7D finite negative
-    const AVAIL: u64 = (POS_CAP + NEG_CAP) as u64;
-    let grid: Vec<u16> = (0..n as u64)
-        .map(|i| {
-            let j = (i % AVAIL) as u32;
-            if j < POS_CAP {
-                (POS_BASE + j) as u16
-            } else {
-                (0x8000 + (j - POS_CAP)) as u16
-            }
-        })
-        .collect();
+    let grid: Vec<u16> = (0..n).map(|i| grid_value(i, n, -20.0, 20.0)).collect();
     let distinct: HashSet<u16> = grid.iter().copied().collect();
-    if n as u64 <= AVAIL {
+    if n <= 65_000 {
         assert_eq!(
             distinct.len(),
             n,
-            "bf16 grid must be duplicate-free for n={n}"
+            "bf16 grid has duplicate values for n={n}; widen the range"
         );
     } else {
         eprintln!(
-            "note: n={n} exceeds the {AVAIL} distinct grid patterns; \
-             {} repeats are intentional tie coverage under the idx-asc rule",
-            n as u64 - AVAIL
+            "note: n={n} exceeds the ~65k distinct finite bf16 values; \
+             grid has {} distinct values — unary ties are resolved \
+             deterministically by the index-asc rule on both sides",
+            distinct.len()
         );
     }
     grid

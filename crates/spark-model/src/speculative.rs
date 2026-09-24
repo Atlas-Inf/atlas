@@ -368,16 +368,27 @@ pub trait DraftProposer: Send + Sync {
     /// Inverse of [`Self::carry_dflash_ctx`]: adopt the carried ctx into a
     /// fresh state when the carried tokens are a prefix of `prompt`.
     /// Installs the accumulator + paged blocks and restores the watermarks
-    /// clamped to the common prefix; frees the carried resources (and, on
-    /// success, the fresh state's own accumulator) correctly either way.
-    /// Returns true on adoption.
+    /// clamped to the adoptable rows (carried positions strictly below
+    /// `prefill_start`, so prefill captures never duplicate a position);
+    /// frees the carried resources (and, on success, the fresh state's own
+    /// accumulator) correctly either way. Returns true on adoption.
     fn adopt_dflash_ctx(
         &self,
         _gpu: &dyn GpuBackend,
         _state: &mut dyn ProposerState,
         _prompt: &[u32],
+        _prefill_start: usize,
     ) -> bool {
         false
+    }
+
+    /// Lazily populate the per-seq ctx accumulator (pop a pooled buffer or
+    /// allocate + zero a fresh one). Called at the first prefill capture —
+    /// AFTER `adopt_dflash_ctx`, which may install the carried buffer — so
+    /// a validated carry costs zero new device allocations and a rejected
+    /// carry's buffer comes straight back out of the reuse pool.
+    fn acquire_ctx_acc(&self, _gpu: &dyn GpuBackend, _state: &mut dyn ProposerState) -> Result<()> {
+        Ok(())
     }
 
     /// Append drafter rows at KV slots `row_base ..` with RoPE positions

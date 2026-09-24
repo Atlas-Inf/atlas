@@ -13,7 +13,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::{
     BlockDiffusionDraftHead, DflashKernels, DflashLane, DflashLayer, DflashQuantization,
-    DflashScratch, DsparkStartupExecution, LIGHTNING_TARGET_HIDDEN_SIZE,
+    DflashScratch, DsparkStartupExecution, CTX_ACC_POOL, LIGHTNING_TARGET_HIDDEN_SIZE,
 };
 use crate::weight_loader::DflashWeights;
 
@@ -66,6 +66,15 @@ impl BlockDiffusionDraftHead {
                 .as_ref()
                 .and_then(|c| c.swa_window_size)
         });
+        // Resolved early: the drafter paged-KV pool must cover every ctx
+        // slot the accumulator can retain. The accumulator cap follows
+        // ctx_window — NOT the SWA window_size — because the paged-attention
+        // path panics when ctx_count exceeds the ctx_window-sized scratch.
+        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
+        let ctx_capacity = ctx_window.min(max_seq_len);
 
         if target_layer_ids.is_empty() {
             anyhow::bail!(
@@ -115,7 +124,7 @@ impl BlockDiffusionDraftHead {
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         };
-        let per_seq_blocks = (window_size.unwrap_or(max_seq_len) + gamma_val + 1) / block_size + 1;
+        let per_seq_blocks = (ctx_capacity + gamma_val + 1) / block_size + 1;
         let num_blocks = per_seq_blocks * max_batch_size.max(1);
         tracing::info!(
             "DFlash KV pool: {} blocks ({} per seq × batch {})",
@@ -285,10 +294,9 @@ impl BlockDiffusionDraftHead {
         // precompute_ctx_kv borrows mlp_intermediate as all_k_stage
         // [L×n×kv_dim ≈ 21 MB]); fused_kv_out ≈ 42 MB. logits is γ-rows
         // only (see alloc below). Total scratch ≈ 250 MB per head.
-        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4096);
+        // ctx_window is resolved near the top of this fn — it also caps the
+        // per-seq ctx accumulator (max_ctx_len) and sizes the drafter paged
+        // KV pool, so all three stay consistent.
         tracing::info!(
             "DFlash ctx_window = {} (set ATLAS_DFLASH_CTX_WINDOW to override; \
              drafter trained on full captured prefix — larger is better, \
@@ -819,6 +827,29 @@ impl BlockDiffusionDraftHead {
             startup,
             ctx_carry: Mutex::new(None),
         };
+
+        // Fallback pool prime for build paths that skipped the early
+        // `factory::build` prime (which runs before the residual KV-pool
+        // sizing and is the one that actually beats fragmentation). One
+        // buffer guarantees the first request; a warm turn's acc comes back
+        // through carry adoption, and any further demand falls to the lazy
+        // path. A failure only forfeits the optimization — request-time
+        // still allocs.
+        if ctx_capacity > 0 && CTX_ACC_POOL.lock().is_empty() {
+            let acc_bytes = ctx_capacity
+                .saturating_mul(head.target_layer_ids.len())
+                .saturating_mul(target_hidden_size)
+                .saturating_mul(2);
+            match gpu.alloc(acc_bytes) {
+                Ok(ptr) => CTX_ACC_POOL.lock().push(ptr),
+                Err(e) => {
+                    tracing::warn!(
+                        "DFlash ctx acc pool prime: alloc of {acc_bytes} B failed ({e}); \
+                         request-time path will allocate on demand"
+                    );
+                }
+            }
+        }
 
         tracing::info!(
             "BlockDiffusionDraftHead loaded: {} layers, hidden={}, intermediate={}, \

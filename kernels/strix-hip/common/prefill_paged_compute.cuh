@@ -208,15 +208,17 @@ extern "C" __global__ void KERNEL_NAME(
 
     KERNEL_PREAMBLE
 
-    // q_rope_pos: absolute position used to rotate the query block. Indirect
-    // (DFlash) declares it in KERNEL_PREAMBLE from a device u32 (= true decode
-    // position, decoupled from cache-slot base). All other variants: equals
-    // q_offset (correct for causal attention where RoPE pos == cache base).
+    // q_rope_pos: absolute RoPE position of the query block (indirect/
+    // DFlash declares it in KERNEL_PREAMBLE from a device u32; all other
+    // variants get q_offset). Retained in the arg triple for layout parity —
+    // the masks below deliberately use q_offset (KV SLOT space), because
+    // DFlash compacts the ctx window so slot != absolute position.
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
     unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
 #elif !defined(Q_ROPE_POS_OVERRIDE)
     unsigned int q_rope_pos = q_offset;
 #endif
+    (void)q_rope_pos;
 
     // PV warp role mapping (4 warps): (warp_id&1) selects query M-tile;
     // (warp_id>>1) selects d N-tile half (cols 0-127 vs 128-255 at HDIM=256).
@@ -232,12 +234,15 @@ extern "C" __global__ void KERNEL_NAME(
       num_kv_blocks = min(num_kv_blocks, mx + 1); }
     // Sliding-window lower bound (gb10 port): every KV block strictly below
     // the first in-window key is fully masked — start there instead of
-    // scoring and discarding. Uses q_rope_pos so the Q_ROPE_POS_OVERRIDE
-    // variant stays correct. Never skip past the end: the epilogue must
-    // still write O (all-masked rows store zeros).
+    // scoring and discarding. The mask coordinate is the KV SLOT space
+    // (q_offset), NOT q_rope_pos: DFlash compacts its ctx window so slot i
+    // may hold an absolute position far greater than i — comparing slot
+    // indices against the absolute RoPE position masks everything. Never
+    // skip past the end: the epilogue must still write O (all-masked rows
+    // store zeros).
     unsigned int kv_block_lo = 0;
     if (causal_mask_enabled && sliding_window > 0) {
-        unsigned int q_abs_lo = q_rope_pos + q_start;
+        unsigned int q_abs_lo = q_offset + q_start;
         if (q_abs_lo + 1 > sliding_window) {
             kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
         }
@@ -322,7 +327,11 @@ extern "C" __global__ void KERNEL_NAME(
         // ---- Online softmax in smem — one thread per query row ----
         if (tid < BR) {
             unsigned int r = tid;
-            unsigned int qr = q_rope_pos + q_start + r;
+            // Query position in KV SLOT space (kpos = slot index). The ctx
+            // window is dense-compacted (slot != absolute position after a
+            // slide), so the causal/SWA mask must use q_offset, not the
+            // absolute RoPE position q_rope_pos.
+            unsigned int qr = q_offset + q_start + r;
             bool row_valid = (r < q_tile_len);
 
             float rmax = -1e30f;
@@ -580,12 +589,14 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
     KERNEL_PREAMBLE
 
-    // q_rope_pos — see the BR=32 kernel for the contract.
+    // q_rope_pos — see the BR=32 kernel for the contract (arg-layout parity;
+    // the mask uses q_offset slot space).
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
     unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
 #elif !defined(Q_ROPE_POS_OVERRIDE)
     unsigned int q_rope_pos = q_offset;
 #endif
+    (void)q_rope_pos;
 
     const unsigned int pv_warp_m  = (warp_id & 1) * 16;
     const unsigned int pv_n_start = (warp_id >> 1) * PV_N_TILES;
@@ -599,7 +610,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
       num_kv_blocks = min(num_kv_blocks, mx + 1); }
     unsigned int kv_block_lo = 0;
     if (causal_mask_enabled && sliding_window > 0) {
-        unsigned int q_abs_lo = q_rope_pos + q_start;
+        unsigned int q_abs_lo = q_offset + q_start;
         if (q_abs_lo + 1 > sliding_window) {
             kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
         }
@@ -678,7 +689,8 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
         if (tid < BR64) {
             unsigned int r = tid;
-            unsigned int qr = q_rope_pos + q_start + r;
+            // Slot-space mask coordinate — see the BR=32 kernel above.
+            unsigned int qr = q_offset + q_start + r;
             bool row_valid = (r < q_tile_len);
             float rmax = -1e30f;
             #pragma unroll

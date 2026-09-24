@@ -510,7 +510,7 @@ impl Model for TransformerModel {
             .downcast_mut::<crate::layers::DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("not DFlash proposer state"))?;
         let n_layers = self.dflash_capture_layers.len();
-        if n_layers == 0 {
+        if n_layers == 0 || d.ctx_hidden_acc.0 == 0 {
             return Ok(());
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
@@ -537,7 +537,7 @@ impl Model for TransformerModel {
             .downcast_mut::<crate::layers::DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("not DFlash proposer state"))?;
         let n_layers = self.dflash_capture_layers.len();
-        if n_layers == 0 {
+        if n_layers == 0 || d.ctx_hidden_acc.0 == 0 {
             return Ok(());
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
@@ -581,7 +581,7 @@ impl Model for TransformerModel {
             .downcast_mut::<crate::layers::DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("not DFlash proposer state"))?;
         let n_layers = self.dflash_capture_layers.len();
-        if n_layers == 0 {
+        if n_layers == 0 || d.ctx_hidden_acc.0 == 0 {
             return Ok(());
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
@@ -629,6 +629,11 @@ impl Model for TransformerModel {
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
         let stream = self.gpu.default_stream();
+        // ctx_window=0 disables ctx conditioning entirely: the slide math
+        // below would keep 0 rows yet still append, overflowing the cap.
+        if d.max_ctx_len == 0 {
+            return Ok(());
+        }
 
         // Watermark slide FIRST, on the ctx_len (row-index) axis. If the
         // incoming rows would exceed capacity, keep the NEWEST rows and drop
@@ -719,6 +724,10 @@ impl Model for TransformerModel {
             Some(d) => d,
             None => return Ok(()),
         };
+        // ctx_window=0 disables ctx conditioning (see commit_ctx).
+        if d.max_ctx_len == 0 {
+            return Ok(());
+        }
         let n_layers = self.dflash_capture_layers.len();
         if n_layers == 0 {
             return Ok(());
