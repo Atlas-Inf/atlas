@@ -69,10 +69,10 @@ impl TransformerModel {
         mtp_vocab_size: u32,
         comm: Option<std::sync::Arc<dyn spark_comm::CommBackend>>,
         self_speculative: bool,
-        num_drafts: usize,
         vision_encoder: Option<crate::layers::VisionEncoder>,
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
+        ssm_pools: super::ssm_pools::SsmPools,
     ) -> Result<Self> {
         // `rms_norm_kernel` normalizes exactly one weight: `final_norm` (a
         // checkpoint tensor). Models that ship HF-vanilla norm weights load it
@@ -173,128 +173,17 @@ impl TransformerModel {
             },
         );
 
-        // Build SSM state pool (with MTP intermediate/checkpoint pools only if speculative decoding enabled)
-        // num_intermediates = K, the verify-width ceiling. The CONV pools
-        // allocate K snapshots per slot; the H pools allocate K-1 (index
-        // K-1 is never written or read — see ssm_reserve) and tier by slot.
-        // For MTP K=2/3/4 verify: K = num_drafts + 1.
-        // For DFlash/DSpark, verify rows are `[last_token, draft_1, ..., draft_K]`:
-        // exactly `num_drafts + 1`. The anchor bonus is not a draft row.
-        let dflash_kgamma = super::dspark_pool::dflash_verify_rows(
-            !config.dflash_capture_layers.is_empty(),
-            num_drafts,
-        )?;
-        // DFlash needs the SSM verify pools regardless of MTP weight presence
-        // or lm_head quantization — its K=γ verify path checkpoints SSM state
-        // for partial-accept rollback. Force `has_mtp` on whenever DFlash is
-        // active so the checkpoint pools exist.
-        // The MTP proposer needs an NVFP4 vocab head for drafting: either the
-        // main head (NVFP4 default) or the draft-only head built when the main
-        // head is BF16. `draft_lm_head_nvfp4` resolves to whichever is present.
-        let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
-        // qwen4_exp installs its MTP proposer AFTER construction (its module is
-        // a reused trunk layer, not the Qwen-shaped `MtpWeights`), so
-        // `mtp_weights` is empty here even though drafting WILL run. Its 36 GDN
-        // layers still need the verify/checkpoint pools: without them the very
-        // first draft indexes `conv_intermediate_pools[0]` on a zero-length
-        // Vec and panics. DeepSeek-V4 reaches the proposer the same way but has
-        // no SSM layers, so it never exercised this. Its draft head is BF16
-        // dense, hence no `draft_lm_head_nvfp4` requirement.
-        let external_mtp_module = use_speculative && config.model_type == "qwen4_exp";
-        let has_mtp = self_speculative
-            || (use_speculative && !mtp_weights.is_empty() && draft_lm_head_nvfp4.is_some())
-            || external_mtp_module
-            || dflash_kgamma > 0;
-        let num_intermediates = if has_mtp {
-            (num_drafts + 1).max(dflash_kgamma)
-        } else {
-            0
-        };
-        let ssm_pool = std::sync::Arc::new(SsmStatePool::new(
-            &config,
-            max_batch_size,
-            has_mtp,
-            num_intermediates,
-            num_drafts,
-            // Stage-3 f16-SIZED h pools. No CLI surface publishes this and
-            // preflight refuses it until prefill narrowing lands, so it is
-            // false on every serveable config today.
-            crate::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
-            // `--ssm-rollback-mode` (EXPERIMENTAL replay scaffold; default
-            // snapshot, published by spark-server's serve_flags).
-            crate::ssm_reserve::ssm_rollback_mode(),
-            gpu.as_ref(),
-        )?);
-
-        // Fail fast if an SSM tier was requested (`ATLAS_SSM_TIER`) on a model
-        // with no recurrent state — a tier request there was previously a
-        // silent no-op. No-op when the tier is unset (default path).
-        super::ssm_tier::ensure_ssm_tier_capability(&config)?;
-
-        // SSM snapshot pool: Marconi prefix-cache slots + Phase-C
-        // decode-rollback ring. The decode-rollback region is only sized
-        // for SSM models — `num_ssm_layers == 0` makes both regions
-        // collapse to empty. The ring retains DECODE_ROLLBACK_RING_SLOTS
-        // boundary snapshots per sequence (DECOUPLED from ROLLBACK_RESTEER_CAP:
-        // the cap bounds re-steer attempts, the ring must retain enough
-        // boundaries that a clean PRE-loop one survives — `CAP+1=3` was too
-        // small and forced NoSsmSnapshot declines). Sized for every
-        // active-sequence pool slot (`max_batch_size`).
-        // The ring's ONLY writer (scheduler snapshot_boundary_if_ssm) and
-        // reader (content-loop rollback_to_boundary) live on the PLAIN decode
-        // path — the speculative path does its rejection rollback through the
-        // verify snapshot, never this ring. Under `--speculative` the ring is
-        // therefore unreachable, and on this model it is NOT cheap: 8 slots x
-        // max_batch x the full SSM blob (27B: 158.9 MB) = ~19.9 GB at batch 16,
-        // allocated up front. Skip it when speculative decode is on.
-        // The ring-depth decision (env overrides + speculative/watchdog
-        // skip) is SSOT'd in `crate::ssm_reserve::decode_rollback_ring_slots`
-        // — spark-server's `preflight_reserve` calls the SAME helper, so the
-        // GPU reservation and this allocation cannot drift. The scheduler
-        // keys off `decode_rollback_ring_slots()`, so a 0 here disables save
-        // AND rollback coherently (rollback declines, the documented
-        // fail-open).
-        let ring = crate::ssm_reserve::decode_rollback_ring_slots(
-            ssm_pool.num_ssm_layers,
-            use_speculative,
-        );
-        if let Some(reason) = ring.skip_reason {
-            let per_seq = (ssm_pool.h_bytes + ssm_pool.conv_bytes)
-                * ssm_pool.num_ssm_layers
-                * atlas_kernels::DECODE_ROLLBACK_RING_SLOTS;
-            tracing::info!(
-                "SSM decode-rollback ring: SKIPPED ({}) — the ring's save/rollback \
-                 path only runs on plain decode with watchdogs enabled. Saves {:.1} GB \
-                 ({} seqs x {} slots x full SSM blob). If plain-decode loop re-steer is \
-                 ever reached it fail-opens to decline; ATLAS_SSM_DECODE_RING=1 \
-                 force-restores the ring.",
-                reason,
-                (per_seq * max_batch_size) as f64 / 1e9,
-                max_batch_size,
-                atlas_kernels::DECODE_ROLLBACK_RING_SLOTS,
-            );
-        }
-        let decode_ring_slots = ring.slots;
-        let ssm_snapshots = SsmSnapshotPool::new(
-            ssm_cache_slots,
-            ssm_pool.h_bytes,
-            ssm_pool.conv_bytes,
-            ssm_pool.num_ssm_layers,
-            decode_ring_slots,
-            max_batch_size,
-            // Last-token hidden snapshot: post-final-norm `norm_output` is
-            // BF16 (`hidden_size` elements). Used to emit exact-hit logits
-            // without re-running the last token through the SSM layers.
-            config.hidden_size * 2,
-            gpu.as_ref(),
-        )?;
-        // Optional SSM snapshot spill tier. `None` (default) keeps the reclaim
-        // drop path byte-identical; blob sizing tracks the pool's spill layout.
-        let ssm_tier_store = super::impl_a1_init::build_ssm_tier_store(
-            &config,
-            ssm_snapshots.spill_blob_bytes(),
-            ssm_pool.num_ssm_layers,
-        )?;
+        // SSM state/snapshot pools arrive pre-built: `build_model` allocates
+        // them before the KV-cache budget snapshot so they are counted in
+        // `used_so_far` and KV shrinks to fit (positional budgeting). The
+        // flag derivations live with the pool construction in
+        // `SsmPools::new`; they are read back here for the downstream
+        // verify-stash and capture-buffer sizing.
+        let ssm_pool = ssm_pools.pool;
+        let ssm_snapshots = ssm_pools.snapshots;
+        let ssm_tier_store = ssm_pools.tier_store;
+        let has_mtp = ssm_pools.has_mtp;
+        let dflash_kgamma = ssm_pools.dflash_kgamma;
         if ssm_checkpoint_interval > 0 && ssm_cache_slots > 0 {
             tracing::info!(
                 "Marconi intermediate checkpoints: every {} blocks ({} tokens at block_size={})",
@@ -369,6 +258,10 @@ impl TransformerModel {
             None
         };
         // Build MTP proposer (extracted to keep `new` under the file cap).
+        // The MTP proposer needs an NVFP4 vocab head for drafting: either the
+        // main head (NVFP4 default) or the draft-only head built when the main
+        // head is BF16. `draft_lm_head_nvfp4` resolves to whichever is present.
+        let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
         let proposer: Option<Arc<dyn DraftProposer>> = super::impl_a1_init::build_mtp_proposer(
             use_speculative,
             mtp_weights,
