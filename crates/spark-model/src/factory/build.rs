@@ -413,6 +413,27 @@ pub fn build_model(
     // clamp ensures we never exceed what the device can physically provide
     // right now (handles external memory pressure on shared-memory /
     // unified-memory systems like GB10).
+    // SSM state/snapshot pools MUST be allocated before the
+    // `gpu.free_memory()` snapshot below: whatever is live at that point
+    // lands in `used_so_far` and shrinks the KV budget automatically
+    // (positional budgeting — the LoRA adapter load above documents the
+    // same rule). These pools used to be built inside
+    // `TransformerModel::new`, after KV sizing, so at long --max-seq-len
+    // they overflowed the physical remainder and boot died in cuMemAlloc
+    // (Atlas-Inf/atlas#61).
+    let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
+    let ssm_pools = crate::model::ssm_pools::SsmPools::new(
+        &config,
+        max_batch_size,
+        self_speculative,
+        use_speculative,
+        mtp_weights.is_empty(),
+        draft_lm_head_nvfp4.is_some(),
+        num_drafts,
+        ssm_cache_slots,
+        gpu.as_ref(),
+    )?;
+
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
     let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -656,10 +677,10 @@ pub fn build_model(
         mtp_vocab_size,
         comm,
         self_speculative,
-        num_drafts,
         vision_encoder,
         ssm_cache_slots,
         ssm_checkpoint_interval,
+        ssm_pools,
     )?;
 
     // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──
