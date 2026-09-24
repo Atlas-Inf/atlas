@@ -12,6 +12,11 @@
 #   KV lands ~4.5 GB / ~73K tokens (measured 2026-09-24, varies with
 #   pre-KV drift). Warm prefix hit on a 14.5K prompt: TTFT ~0.5 s.
 #
+# NOTE: GPU_UTIL=0.84 is for standalone serving. When a benchmark harness
+# is co-resident on this 61 GB host (the agentic leg), use GPU_UTIL=0.81 —
+# at 0.84 the host OOM-killer SIGKILLed spark + harness mid-run
+# (2026-09-24T05:08Z kern.log).
+#
 #   usage: PORT=8097 bash scripts/strix/dflash2/serve_dflash2.sh
 set -uo pipefail
 
