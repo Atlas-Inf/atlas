@@ -487,11 +487,11 @@ pub fn build_model(
     // just before the drafter build below, so those allocs get a region no
     // earlier alloc was allowed to fragment.
     let drafter_balloon = if dflash_args.is_some() {
-        match gpu.alloc(1 << 30) {
+        match gpu.alloc(3 << 29) {
             Ok(ptr) => Some(ptr),
             Err(e) => {
                 tracing::warn!(
-                    "drafter balloon: 1 GiB alloc failed ({e}); drafter build \
+                    "drafter balloon: 1.5 GiB alloc failed ({e}); drafter build \
                      allocations will contend with the tail"
                 );
                 None
