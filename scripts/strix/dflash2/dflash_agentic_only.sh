@@ -16,19 +16,29 @@
 # This is the leg-3-only variant of strix-dflash2-overnight.sh (ST-996 dropped
 # to fit the merge window; ST-995 already ran in dflash-overnight-20260915T1706Z).
 #
-# 2026-09-24 proven recipe (carry branch, balloons + contiguous Marconi blobs):
-#   GPU_UTIL=0.81 SSM_SLOTS=12 SSM_CKPT_INTERVAL=512 MAX_PREFILL_TOKENS=1024
+# 2026-09-24 recipe (carry branch, balloons + contiguous Marconi blobs):
+#   GPU_UTIL=0.84 SSM_SLOTS=12 SSM_CKPT_INTERVAL=512 MAX_PREFILL_TOKENS=1024
 #   MAX_SEQ_LEN=26624 DFLASH_CTX_WINDOW=12288 --dflash-window-size 2048
-# Do NOT raise GPU_UTIL past ~0.82 for this leg: unified memory means the
-# spark process's device allocations are host RAM. At util 0.84 the leg serve
-# (~56 GB RSS) + harness + OS crossed the 61 GB line and the host OOM-killer
-# SIGKILLed both mid-run (kern.log "Out of memory: Killed process (spark)",
-# 2026-09-24T05:08Z). ~0.81 leaves ~7 GB of headroom.
+# Memory reality on the 61 GB host (learned 2026-09-24 across three legs):
+#   pre-KV(~46-48 GB: weights+layers+drafter+balloons+acc+Marconi) + KV +
+#   post-KV(~5.5 GB: Marconi blob 1.8 + SSM pools + drafter staging) must fit
+#   under ~56 GB (60 GB device cap − 4 GB --oom-guard-mb floor). The
+#   util→KV mapping is a knife edge: 0.81 → 2.7K-token pool (leg produced
+#   965 EMPTY 200-responses — 'KV cache exhausted' mid-prefill returns a
+#   vacuous completion the harness counts as successful), 0.84 → ~45-73K
+#   tokens depending on where pre-KV lands this run, ≥0.86 → post-KV allocs
+#   hit the guard floor and startup dies. A co-resident harness adds ~3 GB
+#   host pressure: 0.84 was host-OOM-killed mid-leg (kern.log "Out of memory:
+#   Killed process (spark)", 2026-09-24T05:08Z). For a valid leg either run
+#   the harness OFF-BOX (HOST=0.0.0.0 + yaml endpoint to the tailscale IP)
+#   or accept the OOM risk — the KV_MIN_TOKENS guard below aborts before a
+#   starved pool can silently corrupt a leg.
 set -uo pipefail
 
 WT="${WT:-/home/azeez/atlas-dflash2}"
 BIN=$WT/target/release/spark
-GPU_UTIL="${GPU_UTIL:-0.81}"
+GPU_UTIL="${GPU_UTIL:-0.84}"
+KV_MIN_TOKENS="${KV_MIN_TOKENS:-40000}"   # abort leg if serve lands a pool below this
 MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-1024}"
 GAMMA="${GAMMA:-8}"
 DRAFTER=/home/azeez/.models/dflash2            # incoai/Qwen3.8-27B-DFlash2 (BF16, block_size 8)
@@ -73,7 +83,7 @@ serve() {  # <serve-log> <max_seq> <extra serve flags...>
       ATLAS_DFLASH_OPTION_B="${OPTION_B:-1}" \
       ATLAS_DFLASH_CTX_WINDOW="${DFLASH_CTX_WINDOW:-$maxseq}" \
       DFLASH=1 DRAFT_MODEL="$DRAFTER" DFLASH_GAMMA="$GAMMA" GPU_UTIL="$GPU_UTIL" \
-      MAX_SEQ_LEN="$maxseq" MAX_PREFILL_TOKENS="$MAX_PREFILL_TOKENS" PORT=$PORT HOST=127.0.0.1 MODEL_NAME="$MODEL" SSM_SLOTS="${SSM_SLOTS:-0}" SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-16}" \
+      MAX_SEQ_LEN="$maxseq" MAX_PREFILL_TOKENS="$MAX_PREFILL_TOKENS" PORT=$PORT HOST="${HOST:-127.0.0.1}" MODEL_NAME="$MODEL" SSM_SLOTS="${SSM_SLOTS:-0}" SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-16}" \
       ./serve-amd.sh "$MODEL" --disable-thinking --request-timeout 900 \
       --dflash-window-size "${DFLASH_WINDOW_SIZE:-0}" "$@" >"$slog" 2>&1 & echo $! >"$OUT/.serve.pid" )
   sleep 2
@@ -120,7 +130,10 @@ log "LEG3 MLPerf agentic 2.5h — dflash gamma=$GAMMA"
 # prior leg's 16K), contiguous pool ~1.8 GB. prefill 1024 halves the buffer
 # arena. ctx window 12288 and --dflash-window-size 2048 bound the drafter's
 # carry footprint. MAX_SEQ_LEN=26624 still covers the ~25.2K ISL peak.
-SSM_SLOTS="${SSM_SLOTS:-12}"
+SSM_SLOTS="${SSM_SLOTS:-12}"   # MUST be ≥ the count coverage auto-raises to:
+# preflight sizes the reserve balloon from the REQUESTED slots, but the build
+# raises slots to cover max_seq — asking for less balloons too small for the
+# 1.8 GB contiguous Marconi blob, it spills to the fragmented tail, startup dies
 SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-512}"
 DFLASH_CTX_WINDOW="${DFLASH_CTX_WINDOW:-12288}"
 DFLASH_WINDOW_SIZE="${DFLASH_WINDOW_SIZE:-2048}"
@@ -129,6 +142,18 @@ PCACHE_FLAGS=(--enable-prefix-caching)
 [ "${PCACHE:-1}" = 0 ] && PCACHE_FLAGS=()
 fingerprint agentic "$MAXSEQ" "${PCACHE_FLAGS[@]}"
 if serve "$OUT/agentic-serve.log" "$MAXSEQ" "${PCACHE_FLAGS[@]}"; then
+  # KV-floor guard: a starved pool silently corrupts the leg — the serve
+  # returns EMPTY 200s on 'KV cache exhausted' mid-prefill and the harness
+  # counts them successful (the 2026-09-24T1632Z leg: pool=2704 tokens →
+  # 965/1007 empty turns → score 0.0048). Refuse to run under the floor.
+  KV_TOK=$(grep -aoE "[0-9]+ max KV tokens" "$OUT/agentic-serve.log" | tail -1 | awk '{print $1}')
+  if [ -z "${KV_TOK:-}" ] || [ "$KV_TOK" -lt "$KV_MIN_TOKENS" ]; then
+    log "LEG3 ABORT — KV pool ${KV_TOK:-unknown} tokens < floor $KV_MIN_TOKENS; raise GPU_UTIL or shrink pre-KV (do NOT run: a starved pool yields an invalid leg)"
+    stop_serve
+    log "CHAIN DONE — $OUT"
+    exit 0
+  fi
+  log "KV pool ${KV_TOK} tokens ≥ floor $KV_MIN_TOKENS — proceeding"
   # pre-probe: a ~12K-token prompt twice (multi-chunk prefill + cache hit) and a
   # short prompt twice. This also absorbs the one-time kernel JIT / CUDA-graph
   # capture cost — the 2026-09-24 leg without it paid ~594 s TTFT on turn 1,
@@ -137,7 +162,7 @@ if serve "$OUT/agentic-serve.log" "$MAXSEQ" "${PCACHE_FLAGS[@]}"; then
   python3 - "$PORT" "$MODEL" "$OUT" <<'PY'
 import json, sys, urllib.request, hashlib
 port, model, out = sys.argv[1:4]
-filler = "\n".join(f"Line {i}: the quick brown fox jumps over the lazy dog {i*7%997}" for i in range(1400))
+filler = "\n".join(f"Line {i}: the quick brown fox jumps over the lazy dog {i*7%997}" for i in range(1000))
 def post(tag, content, max_tokens):
     body = {"model": model, "temperature": 0, "seed": 0, "max_tokens": max_tokens, "stream": False,
             "messages": [{"role": "user", "content": content}]}
@@ -176,6 +201,10 @@ PY
     > "$OUT/agentic-harness.log" 2>&1
   log "agentic harness rc=$?"
   grep -iE "Score for|Completed in|successful|dropped|IoU|Estimated QPS" "$OUT/agentic-harness.log" | tail -20 | tee -a "$OUT/chain.log"
+  # Invalid-leg detector: any mid-prefill KV exhaustion means the harness
+  # counted vacuous 200s as successful turns — the leg is NOT a valid result.
+  KVERR=$(grep -c "KV cache exhausted" "$OUT/agentic-serve.log" || true)
+  [ "${KVERR:-0}" -gt 0 ] && log "LEG3 INVALID — $KVERR 'KV cache exhausted' prefill failures produced empty completions the harness counted as successful; score/turn-rate are void"
   accept_summary "$OUT/agentic-serve.log" agentic
   grep -ciE "illegal|fault|panicked|CUDA_ERROR|hipError" "$OUT/agentic-serve.log" | xargs -I{} log "agentic serve-log fault-line count: {}"
 else
