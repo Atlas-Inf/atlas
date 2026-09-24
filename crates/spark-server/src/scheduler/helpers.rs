@@ -983,6 +983,10 @@ fn detect_token_loop_period(
 mod thinking_loop_tests;
 
 #[cfg(test)]
+#[path = "number_list_tests.rs"]
+mod number_list_tests;
+
+#[cfg(test)]
 mod inter_tool_prose_tests {
     use super::{WatchdogParams, resolve_max_inter_tool_prose};
 
