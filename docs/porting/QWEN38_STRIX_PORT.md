@@ -443,6 +443,36 @@ Every value observed under the outdir's `fingerprint-<arm>.txt`.
 | ob_h128_gemv_g4 | 3×512 | 11.389 | 1.90–2.60 | 118.7 | 190.8 |
 | ob_h128_gemv_g8_off | 3×512 | 7.650 | 3.15–4.37 | 289.9 | 361.0 |
 
+### 2026-09-23 re-measurement — lm_head GEMV + verify ladder (`7bd99f31`)
+
+rocprof on the γ=8 decode window attributed ~75% of propose to a single
+`w4a16_gemm` (M64-tile GEMM) launch per step — the drafter's γ×vocab
+lm_head (grid 496256 ≈ 2×248320 vocab rows, ~150–178 ms/call). Two commits
+on `fix/dflash2-strix-batchm16` closed it: `947619a3d` routes the eager
+lm_head γ-projection through `w4a16_gemv_batchm` (the dispatch the
+batched-lane path already used), and `7bd99f314` extends the attention
+o_proj + FFN verify ladder to m≤16 via the `w4a16_gemv_batch16` fallback
+(n=9 verify rows previously fell to tile GEMM / `forward_prefill`).
+
+Same harness (`dflash_ab.sh`, MinHeap warmup16 + 3×512 + prose/json 512,
+temp 0, seed 0, `reasoning_effort=none`), same box, one binary
+(`e3343a66`, commit `7bd99f31`, outdir
+`~/dp4a-ab/out/dflash-batchm16-20260923T1345Z`; serve profile identical to
+the table above):
+
+| arm | median tok/s | mean_na | tok_step | verify_med ms | propose_med ms |
+|---|---|---|---|---|---|
+| ob_h128_gemv_g8 | 15.654 | 3.161 | 4.161 | 255.4 | 60.4 |
+| ob_h128_gemv_g4 | 22.714 | 2.130 | 3.130 | 120.3 | 24.1 |
+| mtp_k4 (control) | 22.011 | 2.000 | 3.000 | — | — |
+
+vs the pre-fix build on the identical harness: γ=8 9.800→15.654
+(propose 228.7→60.4 ms), γ=4 11.389→22.714 (propose 190.8→24.1 ms),
+MTP control 21.308→22.011 (within run noise). γ=4 DFlash2 now measures at
+parity with MTP K4 on this harness. MinHeap determinism: g8 and mtp 3/3
+identical text hashes; g4 2/3 (run 3 diverged — accept-path variance,
+mechanism not yet attributed).
+
 **Parity vs serial** (serial texts from `dflash-ab-20260915T1409Z`): no
 speculative arm is byte-identical to serial on any prompt, but MTP and all
 γ=6/8 DFlash arms diverge at the same character indices — minheap 133,
@@ -457,12 +487,14 @@ avg TPS 7.0. The third long-context probe (~16 k tokens) 400s against
 
 ### Honest status / known gaps
 
-- Best observed DFlash2 on gfx1151: **11.389 tok/s** (γ=4), ≈0.5× MTP K4's
-  21.31–22.57. Drafts engage and accept well (mean_na up to 4.7, tok_step up
-  to 5.7) — the deficit is step cost, not acceptance.
+- Best observed DFlash2 on gfx1151: **22.714 tok/s** (γ=4, `7bd99f31`),
+  at parity with MTP K4's 22.01 on the same harness (was 11.389 ≈ 0.5×
+  before the lm_head GEMV fix). Drafts engage and accept well.
 - Verify at K=γ+1 rows lands on the float `w4a16_gemv_batch8/16` tiers
-  (verify_ms median 118.7 at K=5 vs 292.4 at K=9, per the gemv-outdir
-  steptiming files) rather than the M=4 DP4A arm MTP uses.
+  (verify_ms median 120.3 at K=5 vs 255.4 at K=9 post-fix) rather than the
+  M=4 DP4A arm MTP uses — the verify-side DP4A coverage gap for K>4 row
+  shapes remains the next lever (m≤16 now reaches `w4a16_gemv_batch16`
+  instead of tile GEMM, which took verify 292.4→255.4 ms at K=9).
 - GB10 batched concurrency is a measured gap, not a defect-free pass:
   `concurrency-sweep` (job 132, nvidia/Qwen3.8-27B-NVFP4, dflash=true +
   OPTION_B, gamma=8, bs16, util 0.70, binary sha cfe3d057, run
@@ -485,10 +517,10 @@ avg TPS 7.0. The third long-context probe (~16 k tokens) 400s against
   ~2.1–2.3 under batch vs ~5.0 single-stream. DFlash2 on GB10 today is a
   single-stream win (~34 tok/s γ8, ~45.5 tok/s γ16 incl. TTFT vs MTP
   20.9); batched-verify scheduling is future work.
-- Propose remains ~190–229 ms median against a ~45 ms bandwidth ESTIMATE
-  (drafter ~3.8 GB + fc + lm_head at ~100–200 GB/s — estimate, not measured);
-  rocprof ranking of the propose step is the next lever and could not run
-  while the overnight legs below own the GPU.
+- ~~Propose remains ~190–229 ms median~~ — resolved 2026-09-23: rocprof
+  attributed ~75% of propose to the drafter's γ-row lm_head on the
+  M64-tile `w4a16_gemm`; routing it through `w4a16_gemv_batchm`
+  (`947619a3d`) dropped propose to 24.1 ms (γ=4) / 60.4 ms (γ=8) median.
 - `prefill_attn_dflash_fp8` remains HDIM-256-only — the FP8 drafter-KV path
   is wrong for 128-dim drafters; flagged in `paged_attn_modules.rs`, not
   fixed.

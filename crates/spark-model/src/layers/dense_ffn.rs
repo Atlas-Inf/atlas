@@ -115,6 +115,12 @@ pub struct DenseFfnLayer {
     w4a16_gemv_dual_batch3: KernelHandle,
     w4a16_gemv_batch2: KernelHandle,
     w4a16_gemv_batch3: KernelHandle,
+    /// Wide fallback for `batchm_kernel` when the narrow family (M=4..8)
+    /// cannot cover `m`: DFlash verify at n=9..16 (batched seqs / γ>8).
+    /// Same "narrow tier first, else batch16" rule as
+    /// `mtp_head::lm_head_batch_kernel` and `lm_head_batched`.
+    /// `KernelHandle(0)` on miss → caller falls to `forward_prefill`.
+    w4a16_gemv_batch16: KernelHandle,
     dp4a_quant_k: KernelHandle,
     dp4a_silu_quant_k: KernelHandle,
     dp4a_gemv_k: KernelHandle,
@@ -364,6 +370,7 @@ impl DenseFfnLayer {
             w4a16_gemv_dual_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            w4a16_gemv_batch16: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
             dp4a_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "quantize_act_int8_g16"),
             dp4a_silu_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "silu_mul_quant_int8_g16"),
             dp4a_gemv_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "w4a16_gemv_dp4a"),
@@ -1514,11 +1521,21 @@ impl DenseFfnLayer {
     }
 
     /// Batchm-GEMV kernel for `m` verify rows: the narrowest resolved tier in
-    /// `w4a16_gemv_batch{4,5,6,7,8}` that covers `m`. 0-handle when out of
-    /// range or absent. See `layers::w4a16_gemv_tiers` for the decision and
-    /// the `ATLAS_NO_GEMV_EXACT_M_TIERS=1` kill switch.
+    /// `w4a16_gemv_batch{4,5,6,7,8}` that covers `m`, else `w4a16_gemv_batch16`
+    /// for `m` in 9..=16 (batched DFlash verify — reads the weight ONCE for all
+    /// rows instead of the `forward_prefill` tile-GEMM cliff). 0-handle when
+    /// out of range or absent. See `layers::w4a16_gemv_tiers` for the narrow
+    /// decision and the `ATLAS_NO_GEMV_EXACT_M_TIERS=1` kill switch.
     fn batchm_kernel(&self, m: u32) -> KernelHandle {
-        self.w4a16_batchm.kernel(m)
+        let narrow = self.w4a16_batchm.kernel(m);
+        if narrow.0 != 0 {
+            return narrow;
+        }
+        if m <= 16 {
+            self.w4a16_gemv_batch16
+        } else {
+            KernelHandle(0)
+        }
     }
 
     /// Whether the M-row batched-GEMV verify path is available for `m` rows
@@ -1528,7 +1545,7 @@ impl DenseFfnLayer {
         self.batchm_kernel(m).0 != 0 && !self.weights.gate_proj.weight.is_null()
     }
 
-    /// K=m (m<=8) speculative verify: batched GEMV for m tokens.
+    /// K=m (m<=16) speculative verify: batched GEMV for m tokens.
     /// 4 launches: batchm gate + batchm up + silu_mul + batchm down — each
     /// projection weight is read ONCE for all m rows at near-peak stream
     /// bandwidth. nsys (2026-07-18, M=4): the `forward_prefill` MMQ arm this

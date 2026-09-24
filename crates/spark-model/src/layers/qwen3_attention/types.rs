@@ -296,6 +296,11 @@ pub struct Qwen3AttentionLayer {
     /// K=5..8 chain verify q/k/v/o projections. SSOT for the M -> tier
     /// decision; individual tiers are 0-handles when the target lacks them.
     pub(super) w4a16_batchm: W4a16BatchmTiers,
+    /// Wide fallback for `wide_verify_gemm` at m=9..16 (batched DFlash
+    /// verify): one weight stream for all rows instead of the M64-tile
+    /// `w4a16_gemm_t` cliff. Same "narrow tier first, else batch16" rule as
+    /// `mtp_head::lm_head_batch_kernel`. 0-handle on miss → tile GEMM.
+    pub(super) w4a16_gemv_batch16_k: KernelHandle,
     /// W4A8 DP4A M=4 verify arm (ATLAS_W4A16_DP4A): hoisted int8 activation
     /// quant + guard-free batch4 GEMV for the NVFP4 q/k/v/o at m==4.
     /// 0-handles on targets lacking the kernels → float ladder unchanged.
