@@ -23,16 +23,31 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<u8>> {
-        let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
-        let mut blob = Vec::with_capacity(4 + st.history.len() * 4 + conv_bytes);
-        blob.extend_from_slice(&(st.history.len() as u32).to_le_bytes());
-        for t in &st.history {
-            blob.extend_from_slice(&t.to_le_bytes());
-        }
-        let off = blob.len();
-        blob.resize(off + conv_bytes, 0);
-        gpu.copy_d2h_on_stream(st.conv, &mut blob[off..], stream)?;
+        let mut blob = Vec::new();
+        self.snapshot_aux_into(st, &mut blob, gpu, stream)?;
         Ok(blob)
+    }
+
+    /// [`Self::snapshot_aux`] writing into a caller-owned buffer — same
+    /// bytes, zero steady-state allocation once the buffer's capacity
+    /// covers the blob (see `QsaIndexer::snapshot_aux_into`).
+    pub fn snapshot_aux_into(
+        &self,
+        st: &PleSeqState,
+        buf: &mut Vec<u8>,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
+        buf.clear();
+        buf.extend_from_slice(&(st.history.len() as u32).to_le_bytes());
+        for t in &st.history {
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        let off = buf.len();
+        buf.resize(off + conv_bytes, 0);
+        gpu.copy_d2h_on_stream(st.conv, &mut buf[off..], stream)?;
+        Ok(())
     }
 
     /// Restore the blob from [`Self::snapshot_aux`] on a prefix-cache hit.
@@ -148,14 +163,17 @@ impl PleLayer {
     /// already capture-illegal (its pageable H2D is why `prestage` exists),
     /// so it never runs inside a capture region.
     ///
-    /// Costs one stream sync per forward. An event recorded after
-    /// `gather_embed` would avoid the full barrier; correctness first.
+    /// Costs one wait per forward. The event recorded after `gather_embed`
+    /// now provides that guarantee, so the wait covers the gather kernel
+    /// itself instead of the full stream barrier it used to be (backends
+    /// without events fall back to the sync — see `event_synchronize_on_stream`).
     pub(super) fn release_prev_pins(
         table: &mut NgramTable,
         gpu: &dyn GpuBackend,
         stream: u64,
+        event: u64,
     ) -> Result<()> {
-        gpu.synchronize(stream)?;
+        gpu.event_synchronize_on_stream(event, stream)?;
         #[cfg(feature = "cuda")]
         if let NgramTable::Cached(cache) = table {
             cache.end_batch();
@@ -210,6 +228,9 @@ impl PleLayer {
     /// `TransformerLayer::free_state`). ~360 KB per sequence, unreclaimed for
     /// the process's life before this existed. Idempotent.
     pub(crate) fn free_seq_state(st: &mut PleSeqState, gpu: &dyn GpuBackend) -> Result<()> {
+        // Drop aborts the warm worker (done flag + unpark + join, bounded by
+        // one prefetch quantum's fault time).
+        st.warm = None;
         if st.conv.0 != 0 {
             gpu.free(st.conv)?;
             st.conv = spark_runtime::gpu::DevicePtr(0);

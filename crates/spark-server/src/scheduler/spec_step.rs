@@ -23,6 +23,7 @@ pub fn step_self_spec(
     // 1. Full-model decode to get token_0
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
         tracing::error!("EP broadcast self-spec token: {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
@@ -30,6 +31,7 @@ pub fn step_self_spec(
         Ok(l) => l,
         Err(e) => {
             tracing::error!("self-spec decode error: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -38,6 +40,7 @@ pub fn step_self_spec(
         Ok(t) => t,
         Err(e) => {
             tracing::error!("self-spec argmax error: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -83,6 +86,7 @@ pub fn step_self_spec(
     // 4. Checkpoint SSM states before verification
     if let Err(e) = model.checkpoint_ssm_states(&mut a.seq) {
         tracing::error!("self-spec checkpoint: {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }
@@ -96,6 +100,7 @@ pub fn step_self_spec(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("self-spec verify error: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -170,207 +175,13 @@ pub fn step_self_spec(
     }
 }
 
-/// N-gram speculative step: CPU proposer + CUDA-graphed K=2 verify.
-///
-/// Two-phase pipeline (same as MTP but with N-gram proposer instead):
-/// 1. Bootstrap: regular decode → argmax → N-gram propose → pending_drafts
-/// 2. Verify: decode_verify_graphed(K=2) → accept/reject → SSM rollback
-pub fn step_ngram(
-    model: &dyn Model,
-    active: &mut [ActiveSeq],
-    sched: &crate::scheduler::sched_ctx::SchedCtx,
-    proposer: &mut NgramProposer,
-    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
-) {
-    let a = &mut active[0];
-
-    if !a.pending_drafts.is_empty() {
-        // ── Phase B: Verify pending draft ──
-        let drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
-        a.pending_draft_conf.clear();
-        step_ngram_verify(model, a, sched, &drafts, proposer, verify_ctx);
-    } else {
-        // ── Phase A: Bootstrap decode + N-gram propose ──
-        if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
-            tracing::error!("EP broadcast ngram bootstrap: {e:#}");
-            a.finished = true;
-            return;
-        }
-        let logits = match model.decode(a.last_token, &mut a.seq, 0) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("ngram bootstrap decode error: {e:#}");
-                a.finished = true;
-                return;
-            }
-        };
-        let tok = match model.argmax_on_device(logits, 0) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("ngram bootstrap argmax error: {e:#}");
-                a.finished = true;
-                return;
-            }
-        };
-
-        // Observe the token for future predictions
-        proposer.observe(&a.seq.tokens, tok);
-
-        emit_token(a, tok, None, sched);
-        if a.finished {
-            return;
-        }
-        a.last_token = tok;
-
-        // N-gram propose (CPU-only, zero GPU cost)
-        if let Some(draft) = proposer.propose(&a.seq.tokens) {
-            a.pending_drafts = vec![draft];
-
-            // Checkpoint SSM for potential rollback during verify
-            if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
-                tracing::error!("ngram start_checkpoint_async: {e:#}");
-            }
-        }
-        // If no proposal: next iteration will be another bootstrap (regular decode)
-    }
-}
-
-/// Verify a single N-gram draft via CUDA-graphed K=2 path.
-pub fn step_ngram_verify(
-    model: &dyn Model,
-    a: &mut ActiveSeq,
-    sched: &crate::scheduler::sched_ctx::SchedCtx,
-    drafts: &[u32],
-    proposer: &mut NgramProposer,
-    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
-) {
-    let t_sync = Instant::now();
-    if let Err(e) = model.sync_secondary() {
-        tracing::error!("ngram sync_secondary: {e:#}");
-        a.finished = true;
-        return;
-    }
-    let sync_us = t_sync.elapsed().as_micros();
-
-    // EP: broadcast verify K=2 command + tokens
-    let tokens_k2 = [a.last_token, drafts[0]];
-    if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF2) {
-        tracing::error!("EP broadcast ngram verify cmd: {e:#}");
-        a.finished = true;
-        return;
-    }
-    for &t in &tokens_k2 {
-        if let Err(e) = model.ep_broadcast_cmd(t) {
-            tracing::error!("EP broadcast ngram verify token: {e:#}");
-            a.finished = true;
-            return;
-        }
-    }
-
-    let t_verify = Instant::now();
-    let result = match model.decode_verify_graphed(&tokens_k2, &mut a.seq, 0) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("ngram decode_verify_graphed: {e:#}");
-            a.finished = true;
-            return;
-        }
-    };
-    let verify_us = t_verify.elapsed().as_micros();
-    a.last_token_time = Instant::now();
-    let [v0_argmax, v1_argmax] = result;
-
-    // Phase C-2 (2026-05-24): apply the full pre-sample
-    // logits-processor pipeline to each verify position before
-    // computing the accept/reject argmax. Without this, ngram-verify
-    // tokens escape mid-word / forced-think-end / pin-to-tool-call /
-    // grammar masks — see `verify_pipeline_helper` for the root-
-    // cause analysis.
-    let processed = crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
-        model,
-        &[v0_argmax, v1_argmax],
-        a,
-        verify_ctx,
-        0,
-    );
-    let v0 = processed.first().copied().unwrap_or(v0_argmax);
-    let v1 = processed.get(1).copied().unwrap_or(v1_argmax);
-    let accepted = drafts[0] == v0;
-
-    // EP: broadcast accept/reject to worker
-    if let Err(e) = model.ep_broadcast_cmd(accepted as u32) {
-        tracing::error!("EP broadcast ngram verify result: {e:#}");
-        a.finished = true;
-        return;
-    }
-
-    if accepted {
-        // ── ACCEPTED: emit both tokens ──
-        // After verify_graphed, a.seq.tokens has [.., last_token, drafts[0]] appended.
-        // Observe: context ending with last_token → drafts[0] was correct
-        // Observe: context ending with drafts[0] → v1 is the next prediction
-        proposer.observe(&a.seq.tokens[..a.seq.tokens.len() - 1], drafts[0]);
-        proposer.observe(&a.seq.tokens, v1);
-
-        emit_token(a, drafts[0], None, sched);
-        if !a.finished {
-            emit_token(a, v1, None, sched);
-        }
-        if a.finished {
-            return;
-        }
-        a.last_token = v1;
-
-        // Checkpoint SSM for next verify
-        if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
-            tracing::error!("ngram accept checkpoint: {e:#}");
-        }
-
-        // Propose next draft
-        if let Some(draft) = proposer.propose(&a.seq.tokens) {
-            a.pending_drafts = vec![draft];
-        }
-
-        if a.seq.seq_len.is_multiple_of(50) {
-            tracing::info!(
-                "NGRAM K2 ACCEPT: sync={sync_us}μs verify={verify_us}μs cache={} seq_len={}",
-                proposer.len(),
-                a.seq.seq_len,
-            );
-        }
-    } else {
-        // ── REJECTED: rollback SSM, emit v0 only ──
-        a.seq.seq_len -= 1;
-        a.seq.tokens.pop();
-
-        if let Err(e) = model.start_rollback_and_checkpoint_async(&mut a.seq, 1) {
-            tracing::error!("ngram rollback: {e:#}");
-            a.finished = true;
-            return;
-        }
-
-        // After pop, a.seq.tokens has [.., last_token].
-        // Observe: context ending with last_token → v0 is the correct next token
-        proposer.observe(&a.seq.tokens, v0);
-
-        emit_token(a, v0, None, sched);
-        if a.finished {
-            return;
-        }
-        a.last_token = v0;
-
-        // Propose next draft
-        if let Some(draft) = proposer.propose(&a.seq.tokens) {
-            a.pending_drafts = vec![draft];
-        }
-
-        tracing::info!(
-            "NGRAM K2 REJECT: sync={sync_us}μs verify={verify_us}μs cache={} seq_len={}",
-            proposer.len(),
-            a.seq.seq_len,
-        );
-    }
-}
+// The n-gram lane lives in its own file: it is ~275 lines and shares
+// nothing with the self-speculative step above. Split for the file cap.
+// Only the entry point is re-exported — `step_ngram_verify` is called by
+// `step_ngram` and by nothing else.
+#[path = "spec_step/ngram.rs"]
+mod ngram;
+pub use ngram::step_ngram;
 
 /// Fill the XGrammar bitmask for the current matcher position and clone it
 /// into an owned `Vec<i32>` the caller can pass into MTP draft sampling.

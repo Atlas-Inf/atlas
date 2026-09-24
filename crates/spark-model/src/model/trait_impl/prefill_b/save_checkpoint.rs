@@ -141,7 +141,8 @@ impl TransformerModel {
         // tail-split checkpoint saved here (at tail-bs) is exactly the one
         // warm multi-turn matches land on, so an aux-carrying model would
         // recompute every warm prefill from zero.
-        let aux = self.collect_aux_states(seq, stream)?;
+        let mut aux = self.ssm_snapshots.take_aux(snap_id);
+        self.collect_aux_states_into(seq, stream, &mut aux)?;
         if !aux.is_empty() {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }

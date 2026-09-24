@@ -124,7 +124,11 @@ impl PleLayer {
             .map_err(|_| anyhow::anyhow!("PLE table mutex poisoned"))?;
 
         // Release the PREVIOUS batch's pins. See `release_prev_pins`.
-        Self::release_prev_pins(&mut table, gpu, stream)?;
+        let gather_done = *self
+            .gather_done
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PLE gather_done mutex poisoned"))?;
+        Self::release_prev_pins(&mut table, gpu, stream, gather_done)?;
         let table_va = match &mut *table {
             #[cfg(feature = "cuda")]
             NgramTable::Cached(cache) => {
@@ -153,8 +157,31 @@ impl PleLayer {
                         ids.len()
                     );
                 }
-                let bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
-                gpu.copy_h2d_async(&bytes, self.slots_dev, stream)?;
+                let need = slots.len() * 4;
+                let mut staging = self
+                    .slots_staging
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("PLE slots_staging mutex poisoned"))?;
+                if staging.1 < need {
+                    // Grow (never shrink). The old buffer is leaked on the rare regrow:
+                    // a gather that may still read it could be in flight.
+                    let cap = need.max(64 * 1024);
+                    let ptr = gpu.alloc_host_pinned(cap)?;
+                    *staging = (ptr as usize, cap);
+                }
+                let dst = staging.0 as *mut u8;
+                // SAFETY: `dst` is a live pinned allocation of at least `need`
+                // bytes owned by this layer; it is rewritten only here, and this
+                // point is reached only after `release_prev_pins` waited on the
+                // event recorded behind the previous gather kernel, so the
+                // previous H2D copy from this buffer has completed.
+                let staged: &[u8] = unsafe {
+                    for (i, s) in slots.iter().enumerate() {
+                        std::ptr::copy_nonoverlapping(s.to_le_bytes().as_ptr(), dst.add(i * 4), 4);
+                    }
+                    std::slice::from_raw_parts(dst as *const u8, need)
+                };
+                gpu.copy_h2d_async(staged, self.slots_dev, stream)?;
                 let va = cache.table_dev_va()?;
                 // NOTE: the pins are NOT released here. They are released at
                 // the TOP of the next `gather_host`, after a stream sync — see
@@ -188,6 +215,19 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)
+        self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)?;
+        // The pins taken by this gather must outlive THIS kernel: record an event
+        // right behind it; `release_prev_pins` waits on it before freeing the slots.
+        let mut ev = self
+            .gather_done
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PLE gather_done mutex poisoned"))?;
+        if *ev == 0 {
+            *ev = gpu.event_create()?;
+        }
+        if *ev != 0 {
+            gpu.event_record(*ev, stream)?;
+        }
+        Ok(())
     }
 }

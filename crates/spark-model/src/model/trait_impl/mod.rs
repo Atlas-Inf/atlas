@@ -18,6 +18,7 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, PrefillSlice, SequenceSta
 use crate::weight_map::{DenseWeight, MtpWeights};
 
 mod async_chkpt;
+mod aux_reuse;
 mod decode_a;
 mod decode_a2;
 mod decode_a3;
@@ -354,6 +355,56 @@ impl Model for TransformerModel {
     fn restore_decode_ssm_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
         self.restore_decode_ssm_snapshot_dispatch(seq, ring_slot)
     }
+    fn requires_aux_state(&self) -> bool {
+        TransformerModel::requires_aux_state(self)
+    }
+    fn save_decode_aux_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
+        if !TransformerModel::requires_aux_state(self) {
+            return Ok(());
+        }
+        let stream = self.gpu.default_stream();
+        let key = (seq.slot_idx, ring_slot);
+        // Take the slot's previous blob set OUT of the map so
+        // `collect_aux_states_into` can refill its Vecs in place — after
+        // warm-up the ring stops allocating per boundary token entirely.
+        let mut blobs = self
+            .decode_aux_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key)
+            .unwrap_or_default();
+        self.collect_aux_states_into(seq, stream, &mut blobs)?;
+        // The blobs are read back on `stream`: make them host-complete now,
+        // since they are restored from an unrelated later point in time.
+        self.gpu.synchronize(stream)?;
+        self.decode_aux_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, blobs);
+        Ok(())
+    }
+    fn restore_decode_aux_snapshot(&self, seq: &mut SequenceState, ring_slot: usize) -> Result<()> {
+        if !TransformerModel::requires_aux_state(self) {
+            return Ok(());
+        }
+        // Apply while HOLDING the map lock instead of cloning the blobs
+        // (multi-MB copies per restore were part of the RSS churn). Safe
+        // here: the save path never holds the lock across GPU work — it
+        // removes, collects, re-inserts — so this lock cannot deadlock
+        // against a concurrent save.
+        let map = self
+            .decode_aux_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let blobs = map.get(&(seq.slot_idx, ring_slot)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no decode aux snapshot for slot {} ring {ring_slot}",
+                seq.slot_idx
+            )
+        })?;
+        let stream = self.gpu.default_stream();
+        self.apply_aux_states(seq, blobs, stream)
+    }
     fn generate_speculative(
         &self,
         prompt_tokens: &[u32],
@@ -363,9 +414,21 @@ impl Model for TransformerModel {
         self.generate_speculative_dispatch(prompt_tokens, params, num_drafts)
     }
     fn verify_context_limit(&self) -> Option<usize> {
+        // A parallel serve reaches the batched attention path before
+        // `decode_a2`'s active-QSA gate; the layer guard refuses it, so the
+        // model must not advertise it.
+        if self.comm.is_some() {
+            return self.verify_context_limit_multi_seq();
+        }
         self.layers
             .iter()
             .filter_map(|l| l.verify_context_limit())
+            .min()
+    }
+    fn verify_context_limit_multi_seq(&self) -> Option<usize> {
+        self.layers
+            .iter()
+            .filter_map(|l| l.verify_context_limit_multi_seq())
             .min()
     }
     fn verify_max_drafts(&self) -> Option<usize> {
@@ -928,14 +991,28 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<Vec<(u32, Vec<u8>)>> {
         let mut out = Vec::new();
-        for (i, l) in self.layers.iter().enumerate() {
-            if let Some(blob) =
-                l.snapshot_aux(seq.layer_states[i].as_ref(), self.gpu.as_ref(), stream)?
-            {
-                out.push((i as u32, blob));
-            }
-        }
+        self.collect_aux_states_into(seq, stream, &mut out)?;
         Ok(out)
+    }
+
+    /// [`Self::collect_aux_states`] into caller-owned `out`: entries whose
+    /// layer index is unchanged keep their `Vec<u8>` allocation across
+    /// saves, so the decode-rollback ring and Marconi slots stop
+    /// re-allocating the aux blobs on every boundary.
+    pub(in crate::model) fn collect_aux_states_into(
+        &self,
+        seq: &SequenceState,
+        stream: u64,
+        out: &mut Vec<(u32, Vec<u8>)>,
+    ) -> Result<()> {
+        aux_reuse::collect_aux_reuse_into(out, self.layers.len(), |i, buf| {
+            self.layers[i as usize].snapshot_aux_into(
+                seq.layer_states[i as usize].as_ref(),
+                buf,
+                self.gpu.as_ref(),
+                stream,
+            )
+        })
     }
 
     /// Whether restoring a snapshot WITHOUT aux blobs would be unsound for

@@ -247,7 +247,7 @@ fn fill_sane_scales(g: &dyn GpuBackend, dst: DevicePtr, bytes: usize) -> Result<
     for (i, b) in v.iter_mut().enumerate() {
         *b = pat[i % 3];
     }
-    g.copy_h2d(&mut v[..], dst)?;
+    g.copy_h2d(&v[..], dst)?;
     Ok(())
 }
 
@@ -273,7 +273,7 @@ fn fill_random(g: &dyn GpuBackend, dst: DevicePtr, bytes: usize, seed: u8) -> Re
         x = x.wrapping_mul(1664525).wrapping_add(1013904223);
         *b = (x >> 16) as u8;
     }
-    g.copy_h2d(&mut v[..], dst)?;
+    g.copy_h2d(&v[..], dst)?;
     Ok(())
 }
 

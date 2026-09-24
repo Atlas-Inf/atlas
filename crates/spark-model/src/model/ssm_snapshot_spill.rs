@@ -27,6 +27,39 @@ static SPILL_SHAPE_LOGGED: AtomicBool = AtomicBool::new(false);
 /// out of `ssm_snapshot.rs` (500-LoC cap) as a second impl block over the same
 /// fields; default-off (`tier == None`) keeps every path byte-identical.
 impl SsmSnapshotPool {
+    /// Whether the slot carries restorable aux blobs. An entry left by
+    /// `free` — present but every blob cleared — does not count.
+    pub(super) fn has_aux(&self, snap_slot: usize) -> bool {
+        self.aux_blobs
+            .lock()
+            .get(&snap_slot)
+            .is_some_and(|blobs| blobs.iter().any(|(_, b)| !b.is_empty()))
+    }
+
+    /// Take the slot's aux blob set (cleared buffers left by `free`, or
+    /// empty) for the save path to refill — see `collect_aux_states_into`.
+    pub(super) fn take_aux(&self, snap_slot: usize) -> Vec<(u32, Vec<u8>)> {
+        self.aux_blobs.lock().remove(&snap_slot).unwrap_or_default()
+    }
+
+    /// Run `f` on the slot's aux blobs while holding the map lock, instead
+    /// of cloning them. `apply_aux_states` (H2D copies + a re-pool kernel)
+    /// runs under the lock; the save side never holds it across GPU work,
+    /// so this cannot deadlock against a concurrent `take_aux`/`set_aux`.
+    /// `None` when the slot carries no restorable aux.
+    pub(super) fn with_aux<R>(
+        &self,
+        snap_slot: usize,
+        f: impl FnOnce(&[(u32, Vec<u8>)]) -> Result<R>,
+    ) -> Option<Result<R>> {
+        let map = self.aux_blobs.lock();
+        let blobs = map.get(&snap_slot)?;
+        if !blobs.iter().any(|(_, b)| !b.is_empty()) {
+            return None;
+        }
+        Some(f(blobs))
+    }
+
     /// Tag Marconi slot `snap_slot` as owned by `session_hash` (0 ⇒ untagged).
     pub(super) fn tag_session(&self, snap_slot: usize, session_hash: u64) {
         if session_hash != 0 {

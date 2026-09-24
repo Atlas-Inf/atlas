@@ -159,12 +159,26 @@ pub struct ModelConfig {
     /// than as a real bound.
     #[serde(skip)]
     pub max_batch_tokens: usize,
+    /// Served context length, prompt + generation; the serve layer sets it
+    /// from `--max-seq-len`. Like `max_batch_tokens`, this is a serve-time
+    /// value: `skip`, and 0 means "no serve set this".
+    #[serde(skip)]
+    pub max_seq_len: usize,
     /// When `skip_lm_head_quantization()` == false, quantize the LM head to FP8
     /// (E4M3, per-row scales, decoded via `w8a16_gemv`) instead of NVFP4.
     /// Set by `--lm-head-dtype fp8`. Additive: leaves the NVFP4/BF16 paths
     /// byte-identical when false.
     #[serde(default)]
     pub lm_head_fp8: bool,
+    /// Keep the full-attention Q/K/V/O projections at checkpoint BF16 instead
+    /// of runtime-quantizing them to NVFP4 at load (`--attn-proj-dtype bf16`).
+    /// Serve-time like `lm_head_bf16_override`: `skip`, false when unset. The
+    /// BF16 Q/K/V sources are resident anyway (`AttentionWeights.{q,k,v}_proj`
+    /// feed the dense fallbacks), so this costs only O's BF16 copy. Quality
+    /// lever for checkpoints that ship attention in BF16 (qwen4_exp): 4-bit
+    /// q/k perturbations reroute attention on long prompts.
+    #[serde(skip)]
+    pub attn_proj_bf16: bool,
 
     // ── Model type ──
     #[serde(default)]
@@ -678,6 +692,21 @@ pub struct QuantizationConfig {
     pub weight_block_size: Vec<usize>,
     /// NVFP4 scaling group along the input dimension (ModelOpt `group_size`,
     /// typically 16). `0` when the scheme does not group.
+    pub group_size: usize,
+    /// Per-module scheme map from a ModelOpt `MIXED_PRECISION` dump's
+    /// `quantized_layers` object — e.g.
+    /// `"model.language_model.layers.3.mlp.experts": {"quant_algo":"NVFP4","group_size":16}`.
+    /// Empty for uniform checkpoints (RadixArk's `quant_algo: "NVFP4"` has no
+    /// map). This is what distinguishes the nvidia Flash-Next pack: 48 routed-
+    /// expert layers at NVFP4, one FP8 PLE table, one FP8_PB_WO MTP block.
+    pub quantized_layers: std::collections::BTreeMap<String, QuantLayerSpec>,
+}
+
+/// One `quantized_layers` entry: the algorithm applied to that module path
+/// (`"NVFP4"`, `"FP8"`, `"FP8_PB_WO"`, …) plus its scaling group when given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuantLayerSpec {
+    pub quant_algo: String,
     pub group_size: usize,
 }
 

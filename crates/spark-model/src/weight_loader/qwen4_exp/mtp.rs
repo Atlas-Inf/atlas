@@ -65,10 +65,37 @@ use crate::layers::qwen3_attention::HcHeadWeights;
 use crate::layers::{FfnComponent, MoeLayer};
 use crate::weight_map::{
     DenseWeight, ExpertWeight, MoeWeights, dense_auto, load_mtp_experts_stacked, quantize_to_nvfp4,
+    quantized_from_fp8,
 };
 
 /// The `mtp.layers.0` prefix — this checkpoint has `mtp_num_hidden_layers = 1`.
 const MTP_LAYER_PREFIX: &str = "mtp.layers.0";
+
+/// How the MTP block's routed experts are stored on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MtpExpertLayout {
+    /// RadixArk: fused `[E,2I,H]` + `[E,H,I]` BF16 tensors.
+    StackedBf16,
+    /// nvidia: per-expert `experts.{e}.{gate,up,down}_proj.weight` +
+    /// `weight_scale_inv` (FP8_PB_WO, g=128) — declared by the pack's
+    /// `quantized_layers` map entry `mtp.layers.0.mlp.experts`.
+    PerExpertFp8BlockScaled,
+}
+
+/// Detect the MTP expert storage layout from the store. `weight_scale_inv`
+/// on `experts.0.gate_proj` is the FP8-block-scale marker; the fused
+/// `experts.gate_up_proj` tensor is the stacked marker.
+fn mtp_expert_layout(store: &WeightStore, mlp: &str) -> MtpExpertLayout {
+    if store.contains(&format!("{mlp}.experts.gate_up_proj")) {
+        return MtpExpertLayout::StackedBf16;
+    }
+    if store.contains(&format!("{mlp}.experts.0.gate_proj.weight_scale_inv")) {
+        return MtpExpertLayout::PerExpertFp8BlockScaled;
+    }
+    // Default to the stacked path so its own error names what it expected.
+    MtpExpertLayout::StackedBf16
+}
+
 /// The MTP block's own stream mixer, the twin of the model-level one.
 const MTP_MIXER_PREFIX: &str = "mtp.hyper_connection_mixer";
 
@@ -126,23 +153,69 @@ fn build_mtp_moe(
     let stream = gpu.default_stream();
 
     let mlp = format!("{MTP_LAYER_PREFIX}.mlp");
-    let bf16_experts = load_mtp_experts_stacked(store, &mlp, n_experts)
-        .with_context(|| format!("qwen4_exp MTP: stacked experts at {mlp}"))?;
-
     let q = |w: &DenseWeight, n: usize, k: usize| -> Result<_> {
         quantize_to_nvfp4(w, n, k, gpu, absmax_k, quantize_k, stream)
     };
 
     let mut experts = Vec::with_capacity(n_experts);
-    for (e, x) in bf16_experts.iter().enumerate() {
-        experts.push(ExpertWeight {
-            gate_proj: q(&x.gate_proj, inter, h)
-                .with_context(|| format!("qwen4_exp MTP: expert {e} gate_proj"))?,
-            up_proj: q(&x.up_proj, inter, h)
-                .with_context(|| format!("qwen4_exp MTP: expert {e} up_proj"))?,
-            down_proj: q(&x.down_proj, h, inter)
-                .with_context(|| format!("qwen4_exp MTP: expert {e} down_proj"))?,
-        });
+    match mtp_expert_layout(store, &mlp) {
+        MtpExpertLayout::StackedBf16 => {
+            let bf16_experts = load_mtp_experts_stacked(store, &mlp, n_experts)
+                .with_context(|| format!("qwen4_exp MTP: stacked experts at {mlp}"))?;
+            for (e, x) in bf16_experts.iter().enumerate() {
+                experts.push(ExpertWeight {
+                    gate_proj: q(&x.gate_proj, inter, h)
+                        .with_context(|| format!("qwen4_exp MTP: expert {e} gate_proj"))?,
+                    up_proj: q(&x.up_proj, inter, h)
+                        .with_context(|| format!("qwen4_exp MTP: expert {e} up_proj"))?,
+                    down_proj: q(&x.down_proj, h, inter)
+                        .with_context(|| format!("qwen4_exp MTP: expert {e} down_proj"))?,
+                });
+            }
+        }
+        // nvidia pack: per-expert FP8_PB_WO (weight + weight_scale_inv, g=128
+        // blocks) instead of RadixArk's fused BF16 pair. Dequant to BF16 then
+        // requant to NVFP4 so the body gets the same MoeLayer either way.
+        MtpExpertLayout::PerExpertFp8BlockScaled => {
+            for e in 0..n_experts {
+                let p = |name| format!("{mlp}.experts.{e}.{name}_proj");
+                experts.push(ExpertWeight {
+                    gate_proj: quantized_from_fp8(
+                        store,
+                        &p("gate"),
+                        inter,
+                        h,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        stream,
+                    )
+                    .with_context(|| format!("qwen4_exp MTP: FP8 expert {e} gate_proj"))?,
+                    up_proj: quantized_from_fp8(
+                        store,
+                        &p("up"),
+                        inter,
+                        h,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        stream,
+                    )
+                    .with_context(|| format!("qwen4_exp MTP: FP8 expert {e} up_proj"))?,
+                    down_proj: quantized_from_fp8(
+                        store,
+                        &p("down"),
+                        h,
+                        inter,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        stream,
+                    )
+                    .with_context(|| format!("qwen4_exp MTP: FP8 expert {e} down_proj"))?,
+                });
+            }
+        }
     }
 
     // The shared expert ships per-tensor BF16 like a main layer's, so it takes
@@ -329,4 +402,65 @@ pub fn load_qwen4exp_mtp_module(
         spent as f64 / 1e9,
     );
     Ok(Some(module))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn store_with(names: &[&str]) -> WeightStore {
+        let map: HashMap<String, spark_runtime::weights::WeightTensor> = names
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    spark_runtime::weights::WeightTensor {
+                        ptr: spark_runtime::gpu::DevicePtr::NULL,
+                        shape: vec![1],
+                        dtype: spark_runtime::weights::WeightDtype::BF16,
+                    },
+                )
+            })
+            .collect();
+        WeightStore::from_map(map)
+    }
+
+    /// RadixArk pack: the fused pair selects the stacked path.
+    #[test]
+    fn stacked_markers_select_stacked_layout() {
+        let store = store_with(&[
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "mtp.layers.0.mlp.experts.down_proj",
+        ]);
+        assert_eq!(
+            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
+            MtpExpertLayout::StackedBf16
+        );
+    }
+
+    /// nvidia pack: per-expert weight_scale_inv selects the FP8 block path —
+    /// and must win even when a stray fused name is absent.
+    #[test]
+    fn per_expert_scale_inv_selects_fp8_layout() {
+        let store = store_with(&[
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight",
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
+        ]);
+        assert_eq!(
+            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
+            MtpExpertLayout::PerExpertFp8BlockScaled
+        );
+    }
+
+    /// Neither marker → stacked default, whose loader errors with the names
+    /// it probed (better than guessing the other format).
+    #[test]
+    fn no_markers_defaults_to_stacked() {
+        let store = store_with(&[]);
+        assert_eq!(
+            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
+            MtpExpertLayout::StackedBf16
+        );
+    }
 }

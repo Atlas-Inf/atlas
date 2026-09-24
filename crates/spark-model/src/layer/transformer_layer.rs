@@ -102,6 +102,24 @@ pub trait TransformerLayer: Send + Sync {
     /// recompute (PLE's history already advanced in `decode_prestage`).
     fn decode_prestage_rearm(&self, _state: &mut dyn LayerState) {}
 
+    /// Prefill-side warm for layers whose row ids are a pure host function
+    /// of the prompt (PLE). Called once per prefill dispatch — before the
+    /// layer loop — with the FULL prompt and `from`, the first position this
+    /// call will process, so the layer can stream its NVMe-resident rows
+    /// into cache while the earlier chunks and layers compute instead of
+    /// faulting them on the gather's critical path. Chunked callers invoke
+    /// it per chunk; the layer paces and deduplicates internally. Default
+    /// no-op: layers with no host-faulted table have nothing to warm.
+    fn prefill_warm(
+        &self,
+        _prompt: &[u32],
+        _from: usize,
+        _state: &mut dyn LayerState,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// True when this layer's decode can NEVER be captured into a CUDA
     /// graph — e.g. the QSA indexer's host top-k round trip, whose captured
     /// dense fallback would silently replay WRONG attention once selection
@@ -127,6 +145,29 @@ pub trait TransformerLayer: Send + Sync {
         Ok(None)
     }
 
+    /// [`Self::snapshot_aux`] into a caller-owned buffer — returns `true`
+    /// when this layer produced a blob. Aux-carrying layers override it so
+    /// per-save buffers survive ring-slot / snapshot-slot reuse instead of
+    /// re-allocating multi-MB Vecs on every boundary (the alloc/free churn
+    /// measured as serve-RSS growth in jobs 043/058). The default routes
+    /// through `snapshot_aux`, so layers that haven't been updated keep
+    /// working — with the old allocation behaviour.
+    fn snapshot_aux_into(
+        &self,
+        state: &dyn LayerState,
+        buf: &mut Vec<u8>,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        match self.snapshot_aux(state, gpu, stream)? {
+            Some(blob) => {
+                *buf = blob;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// True when this layer WOULD produce aux state — restore sites use it
     /// to decline snapshots that lack aux rather than restore a stale mix.
     fn has_aux_state(&self) -> bool {
@@ -145,6 +186,14 @@ pub trait TransformerLayer: Send + Sync {
     /// decided BEFORE the step is dispatched, not discovered inside it.
     fn verify_context_limit(&self) -> Option<usize> {
         None
+    }
+
+    /// `verify_context_limit` for a batched verify whose rows span SEVERAL
+    /// sequences, and for any lane that must stay conservative. The per-row
+    /// QSA phase serves ONE sequence's window, so a layer that lifts the
+    /// single-sequence limit still reports its inert bound here.
+    fn verify_context_limit_multi_seq(&self) -> Option<usize> {
+        self.verify_context_limit()
     }
 
     /// Deepest `num_drafts` this layer can serve in a BATCHED verify, if it

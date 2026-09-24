@@ -63,7 +63,7 @@
 # `qwen4_exp`, so only that one is bound below.
 [model]
 name = "qwen3.8-flash-next"
-hf_id = "RadixArk/Qwen3.8-Flash-Next-NVFP4"
+hf_id = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 architecture = "GDN + QSA sparse attention + mHC + PLE n-gram + MoE"
 params = "180B"
 active_params = "7B"
@@ -209,7 +209,13 @@ top_n_sigma = 0.0
 # `qwen4_exp` is unique across the registry, so resolution cannot tie and
 # match_names is not load-bearing yet. Listed anyway so a future Flash-Next
 # variant sharing (qwen4_exp, 2560) has something to disambiguate against.
-match_names = ["qwen3.8-flash-next", "flash-next"]
+# RadixArk stays listed: hf_id moved to the nvidia pack (the calibrated
+# FP8_PB_WO MTP experts), but the RadixArk release still serves.
+match_names = [
+    "qwen3.8-flash-next",
+    "flash-next",
+    "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+]
 
 [[model_types]]
 model_type = "qwen4_exp"
@@ -306,6 +312,28 @@ FP32 fused verify conv for the exact-verify chain (#435), shipped only
 in qwen3.6-27b/nvfp4. Probed handle != 0; absent, the exact chain keeps
 its per-token conv launches (same bits, more launches)."""
 
+# Strix-HIP-only probes pulled into the shared qwen3_ssm / qwen3_attention
+# init paths by the gfx1151 port on main. Every one is a handle != 0-gated
+# try_kernel; on sm_121 the lookup returns 0 and dispatch keeps the compiled
+# gb10 arm. Same declarations qwen3.8-27b carries for the identical lookups.
+[expected_absent.dense_gemv_fp8w]
+dense_gemv_fp8w = """
+Redundant probe for a dense_ spelling of the FP8-weight GEMV: gb10's FP8
+projections resolve through the compiled gemv_fp8w module (KERNEL.toml maps
+dense_gemv_fp8w.cu there). Mirror of the strix-hip declaration for the same
+lookup; handle!=0 gated."""
+
+[expected_absent.w4a16_gemv_dp4a]
+quantize_act_int8_g16_batch4_d4 = "Strix-hip dp4a batch4 quantizer (kernels/strix-hip/common/w4a16_gemv_dp4a.cu) — not compiled for sm_121; gb10 dispatch uses the non-dp4a w4a16_gemv path. handle!=0 gated."
+w4a16_gemv_dp4a_batch4_d4 = "Strix-hip dp4a batch4 GEMV, same module — not compiled for sm_121. handle!=0 gated."
+w4a16_gemv_dp4a_batch4_d4_os = "Strix-hip dp4a batch4 GEMV (outlier-split), same module — not compiled for sm_121. handle!=0 gated."
+
+[expected_absent.w8a16_gemm_n_m128]
+w8a16_gemm_n_m128 = """
+N-major w8a16 GEMM variant, exists only in
+kernels/strix-hip/common/w8a16_gemm_n_m128.cu; gb10 resolves the compiled
+w8a16_gemm_t_m128 arm (handle!=0 gated)."""
+
 [behavior]
 # Qwen3.8-Flash-Next is a THINKING model whose chat template gates
 # EVERYTHING on `enable_thinking is undefined or true`: the default render
@@ -382,6 +410,17 @@ tool_call_parser = "qwen3_coder"
 # after a [sampling.*] header it silently becomes a preset key and does
 # nothing — the exact trap that shipped 2026-08-26.
 use_sampling_presets_for_core = true
+# ...but NOT the card's non-thinking presence_penalty = 1.5 for core requests
+# that leave penalties unset. That value is tuned for short chat turns; on a
+# 20K-token single-file build (2026-09-04 tower-defense benchmark, this
+# checkpoint on a GB10) it suppressed every already-emitted token and the
+# engine shipped dead/inert files twice, while the identical engine and
+# sampler with presence 0 wrote a working 51 KB game. Tool-calling requests
+# still inherit [sampling.tools]; explicit request values always win.
+use_sampling_preset_penalties_for_core = false
+# ATLAS_MOE_DECODE_ARM=grouped routes every layer's single-token MoE through the
+# tensor-core grouped-GEMM arm (forward_prefill M=1) instead of the scalar FP32-FMA
+# gemv arm. A/B lever for the 2026-09-04 llama.cpp gap study; default stays scalar.
 # The A4 POST_THINK_MIN_REASONING floor (-8 on `</think>` for the first 16
 # think tokens) collides with this model's card-native brief thinking:
 # under `reasoning_effort: low` the model closes its think at ~10 tokens,

@@ -14,12 +14,14 @@ use crate::layers::ops;
 mod attn;
 mod ctx;
 mod ffn;
+mod guard;
 mod mla;
 mod mla_gemv;
 mod nemotron_serial;
 mod qkv;
 mod qkv_dp4a;
 mod qkv_fp8;
+mod qsa_rows;
 #[cfg(test)]
 mod tests;
 
@@ -35,7 +37,7 @@ impl Qwen3AttentionLayer {
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         row_owner: Option<&[usize]>,
         kv_cache: &mut PagedKvCache,
-        _seq_lens: &[usize],
+        seq_lens: &[usize],
         _block_tables: &[Vec<u32>],
         ctx: &ForwardContext,
         stream: u64,
@@ -46,13 +48,17 @@ impl Qwen3AttentionLayer {
             num_seqs,
             states,
             kv_cache,
-            _seq_lens,
+            seq_lens,
             _block_tables,
             ctx,
             stream,
         )? {
             return Ok(());
         }
+        // Pre-mutation QSA plan: all rows inert -> batched attention; an
+        // ACTIVE row the per-row phase can serve -> `qsa_rows`; anything else
+        // is refused HERE, before any layer state is touched (`guard.rs`).
+        let qsa_rows = guard::plan_qsa_rows(self, seq_lens, num_seqs, row_owner, kv_cache, ctx)?;
         let bs = kv_cache.block_size() as u32;
         let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
         // Per-request LoRA routing slot buffer for this step (from metadata).
@@ -62,8 +68,9 @@ impl Qwen3AttentionLayer {
 
         // DeepSeek-V4 / Qwen4-exp: Manifold-Constrained Hyper-Connections.
         if self.hc.is_some() {
-            return self
-                .decode_multi_seq_inner_hc(c, states, row_owner, _seq_lens, kv_cache, ctx, stream);
+            return self.decode_multi_seq_inner_hc(
+                c, states, row_owner, qsa_rows, seq_lens, kv_cache, ctx, stream,
+            );
         }
         let _ = (states, row_owner); // Non-hc attention keeps no per-seq state.
 
@@ -136,6 +143,7 @@ impl Qwen3AttentionLayer {
         c: ctx::MultiSeqCtx<'_>,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         row_owner: Option<&[usize]>,
+        qsa_rows: bool,
         seq_lens: &[usize],
         kv_cache: &mut PagedKvCache,
         ctx: &ForwardContext,
@@ -236,7 +244,13 @@ impl Qwen3AttentionLayer {
             self.ms_phase_qkv(&c)?;
             self.ms_phase_rope(&c, meta)?;
             self.ms_phase_cache_write(&c, kv_cache, meta)?;
-            let attn_out = self.ms_phase_paged_decode(&c, kv_cache, meta)?;
+            // `qsa_rows` (decided pre-mutation) owns BOTH this choice and the
+            // ingest loop below, so a row is never ingested twice.
+            let attn_out = if qsa_rows {
+                self.ms_phase_attn_qsa_rows(&c, &mut *states, row_owner, seq_lens, kv_cache, meta)?
+            } else {
+                self.ms_phase_paged_decode(&c, kv_cache, meta)?
+            };
             self.ms_phase_o_proj(&c, attn_out)?
         };
 
@@ -247,48 +261,9 @@ impl Qwen3AttentionLayer {
             comm.all_reduce_async(o_out.0, bytes, c.stream)?;
         }
 
-        // ── QSA ingest continuity (per-seq) ──
-        // Below the inert bound `decode_select` is ingest-only and returns
-        // `None`; the dispatch gate (decode_a2) routes any batch with an
-        // ACTIVE-selection sequence to the per-seq loop, so a `Some` here
-        // means the gate and this path disagree — refuse loudly rather than
-        // serve dense-past-budget (not the reference model).
-        if let Some(qsa) = self.qsa.as_ref() {
-            for i in 0..n {
-                // Row i's indexer state. Without `row_owner` the rows ARE the
-                // sequences (plain concurrent decode). With it, several rows
-                // share one sequence's state and advance it in row order —
-                // `decode_select` asserts `pos == ingested`, so the ordering
-                // here is the invariant, not an optimization.
-                let owner = match row_owner {
-                    Some(map) => *map
-                        .get(i)
-                        .ok_or_else(|| anyhow::anyhow!("QSA row_owner has no entry for row {i}"))?,
-                    None => i,
-                };
-                let state = states.get_mut(owner).ok_or_else(|| {
-                    anyhow::anyhow!("QSA row {i} owned by seq {owner}, which has no state")
-                })?;
-                let st =
-                    crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, *state, ctx.gpu)?;
-                let sel = qsa.decode_select(
-                    st,
-                    c.normed.offset(i * h * c.bf16),
-                    seq_lens[i],
-                    kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    kv_cache.v_pool_ptr(self.attn_layer_idx),
-                    meta.block_table
-                        .offset(i * meta.max_blocks_per_seq as usize * 4),
-                    c.bs,
-                    ctx.gpu,
-                    stream,
-                )?;
-                anyhow::ensure!(
-                    sel.is_none(),
-                    "QSA selection active for row {i} on the batched ms path; \
-                     the dispatch gate should have routed this batch per-seq"
-                );
-            }
+        // ── QSA ingest continuity (all rows inert; see `qsa_rows.rs`) ──
+        if !qsa_rows {
+            self.ms_qsa_ingest_rows(&c, &mut *states, row_owner, seq_lens, kv_cache, meta)?;
         }
 
         // Expand attention output back into multi-stream state.

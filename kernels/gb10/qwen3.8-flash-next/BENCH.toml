@@ -1,0 +1,116 @@
+# Benchmarks for this model, and the thresholds its gate records must meet.
+#
+# Sibling of MODEL.toml so the numbers sit beside the thing they describe;
+# hardware and model are implied by the path and cannot disagree with the
+# contents. Read by `atlas_plugin::gate::bench`.
+#
+# Thresholds are per CHECKPOINT, not per model: two checkpoints of one model
+# can differ by several BFCL points, so they cannot share a bar.
+#
+# This file is deliberately OUTSIDE the closure hash (`taxon::configs` does not
+# list it), so ratcheting a threshold does not invalidate the record that
+# justified the ratchet.
+#
+# `status = "unmeasured"` entries carry NO [benchmarks.metrics] table. Absence
+# is the TODO -- a guessed threshold a run could clear would report PASS for
+# something nobody measured.
+
+# Both entries below are the nvidia vendor pack (MIXED_PRECISION: NVFP4
+# experts + FP8 PLE + FP8_PB_WO MTP). Bootstrap per the repo protocol: drive
+# the leg manually with `--url/--model` (jobqueue 014/015 do exactly this on
+# reiner), collect repeats, then write floors + flip `status = "measured"`.
+# The recipe is sparkrun-recipes PR #8
+# (`qwen3.8-flash-next-nvfp4-nvidia`).
+#
+# ★ 2026-09-16: both flipped to `measured` from the two ST-995 records and the
+# one agentic record below. Read the per-entry notes before ratcheting — the
+# bfcl floors rest on TWO records that agreed to the hundredth across two
+# DIFFERENT serve profiles, which is reproducibility, not a repeat-spread; and
+# the agentic entry deliberately carries NO wall bound.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+gate = "bfcl-subset"
+recipe = "qwen3.8/qwen3.8-flash-next-nvfp4-nvidia"
+label = "Qwen3.8-Flash-Next (NVFP4, nvidia)"
+default = false
+status = "measured"
+note = """\
+First gate subject for the nvidia MIXED_PRECISION pack. The golden ST-995 \
+draw (62/10/10, floor 25, n=995, seed 42, temp 0) is client-side, so the \
+manual-drive leg produces a comparable score directly. Thinking stays ON — \
+the recipe pins reasoning_effort "low" and the dense-27B FAIL traced to \
+disable_thinking, not to NVFP4 (see QWEN38_PORT_GAP_ANALYSIS §I.5). \
+REFERENCE RECORDS (the definition of these numbers), both nvidia/Qwen3.8-\
+Flash-Next-NVFP4 on gx10-e3a3 (GB10, driver 580.126.09), binary 9c1ca517: \
+(1) run-1789433036569430053 — util 0.95 / --max-seq-len 16384, no \
+speculation, 13,820 s; (2) run-1789501991840065669 — util 0.88 / \
+--max-seq-len 32768 / --max-prefill-tokens 16384 / prefix caching, 13,580 s. \
+Both scored overall 83.52 / normalized 82.45. ★ That identity is the whole \
+basis for the 0.4 margin and it is NOT a repeat-spread: the two runs differ \
+in serve profile, and the second ran SERIAL because the --ngram-speculative \
+lane declines above the QSA inert bound (2051 tokens) — the BFCL prompts \
+are admitted past it. So this is one measurement of the score, reproduced \
+under a second memory profile. A true same-config repeat has not been run; \
+the margin is the dense sibling's documented +-0.4 MTP-nondeterminism floor, \
+inherited deliberately and labelled as such. Do NOT import the RadixArk \
+entry's bars — different weights."""
+
+[benchmarks.metrics.samples]
+# The golden MLPerf draw is exactly 995. A run reporting anything else is not
+# this draw and its score is not comparable — pin both ends.
+min = 995.0
+max = 995.0
+
+[benchmarks.metrics.overall_accuracy]
+# Measured 83.52 in both reference records (see the note). Bar = measured
+# less the inherited 0.4 noise floor.
+min = 83.12
+noise = 0.4
+
+[benchmarks.metrics.normalized_single_turn_score]
+# Measured 82.45 in both reference records. ★ This is 2.87 BELOW the
+# MLPerf-edge floor (85.32), which was derived for Qwen3.6-27B and does not
+# transfer across weights. Like the dense sibling's entry this is a QUALITY
+# ALARM, not a submission failure — the submission rides on 3.6. Read the
+# per-subset split before treating the bar as an endorsement.
+min = 82.05
+noise = 0.4
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+gate = "agentic-webserver"
+recipe = "qwen3.8/qwen3.8-flash-next-nvfp4-nvidia"
+label = "Qwen3.8-Flash-Next (NVFP4, nvidia)"
+default = false
+status = "measured"
+note = """\
+Agentic soak for the nvidia pack — the workload most sensitive to the MTP \
+experts being correct (multi-turn tool use over long trajectories). Driven \
+manually at iterations=50, wall_budget_s=9000 (the ~2.5h shape the dense \
+legs use). REFERENCE RECORD: run-1789474170004681458, util 0.88 / 32K, \
+binary 9c1ca517 — 50/50 webserver_ok, 49/50 followed_directions, 816 turns, \
+32 multi-chunk prompts up to 25,191 tokens, 0 CUDA faults, Sigma-wall \
+19,351 s (23.7 s/turn). ★ SPEED IS NOT GATED HERE, DELIBERATELY. One record \
+is one tier: a ceiling derived from it would be the "ceiling written before \
+calibration" the 3.6 dense entry warns about, and the measured Sigma-wall is \
+the pack's serial decode floor on Atlas, not a defect — gating it at today's \
+value would pass a run that is 20% slower tomorrow while catching nothing. \
+`s_per_turn`, `sum_agent_wall_s`, `sum_turns` and `decode_tps` ARE recorded \
+on every run, so a blow-up ceiling can be ratcheted in from real tiers when \
+a second one exists. The two counts below are ABSOLUTE correctness bounds \
+and take no noise, same footing as the 3.6 and dense entries; `iterations` \
+is PINNED at exactly 50 for the same reason stated there — a count bound \
+alone does not describe the run that produced it."""
+
+[benchmarks.metrics.iterations]
+min = 50.0
+max = 50.0
+
+[benchmarks.metrics.webserver_ok]
+min = 50.0
+
+[benchmarks.metrics.followed_directions]
+min = 49.0

@@ -190,10 +190,12 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // failures are batched-forward totals, not single chunks, so they
         // survive a 2048 chunk cap unchanged (measured: 51 before, 51 after).
         //
-        // The cost is real — tokens*10240*14 bytes, so 1.18 GB at 8196 against
-        // 293 MB at 2048, out of the KV budget. `ATLAS_PLE_MAX_TOKENS` still
-        // overrides for anyone who would rather have the KV depth, and the
-        // layer's refusal still names it.
+        // The cost is no longer the worry it was: the forward runs in
+        // `ATLAS_PLE_CHUNK`-token spans (default 8192), so the scratch is
+        // `min(chunk, width)*10240*14` bytes — ~1.18 GB at the default —
+        // whatever this width is. `ATLAS_PLE_MAX_TOKENS` still overrides the
+        // WIDTH CAP for anyone who would rather refuse a wide fused step
+        // than pay for one, and the layer's refusal still names it.
         let ple_floor = config.max_batch_tokens.max(2048);
         let max_ple_tokens: usize = match std::env::var("ATLAS_PLE_MAX_TOKENS")
             .ok()
@@ -201,15 +203,14 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             .filter(|n| *n > 0)
         {
             Some(n) => {
-                // Honouring an override BELOW the forward width is how the
-                // 500s got here in the first place, so it is allowed (it is a
-                // real KV-vs-capacity trade) but never silent.
+                // Below the forward width: honouring it meant a guaranteed 500.
                 if n < ple_floor {
                     tracing::warn!(
-                        "ATLAS_PLE_MAX_TOKENS={n} is below the {ple_floor} tokens a single                          forward can present — any prefill wider than {n} will be REFUSED by                          the PLE layer and the request will fail. Raise it, or lower                          --max-num-batched-tokens to match."
+                        "ATLAS_PLE_MAX_TOKENS={n} is below the {ple_floor}-token forward \
+                         width — clamped UP; lower --max-num-batched-tokens instead."
                     );
                 }
-                n
+                n.max(ple_floor)
             }
             None => ple_floor,
         };
@@ -475,26 +476,5 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
     }
 }
 
-/// A ones-filled `[n]` BF16 norm scale.
-///
-/// BF16 1.0 is `0x3F80`, so the buffer cannot be produced with `memset`.
-fn ones_norm(n: usize, gpu: &dyn GpuBackend) -> Result<DenseWeight> {
-    let host: Vec<u8> = std::iter::repeat_n([0x80u8, 0x3Fu8], n).flatten().collect();
-    let ptr = gpu.alloc(host.len())?;
-    gpu.copy_h2d(&host, ptr)?;
-    Ok(DenseWeight { weight: ptr })
-}
-
-/// `model.language_model` for the multimodal layout, `model` otherwise.
-fn embed_prefix(config: &ModelConfig) -> String {
-    if config.weight_prefix.is_empty() {
-        "model".to_string()
-    } else {
-        config.weight_prefix.clone()
-    }
-}
-
-/// The model-level hyper-connection mixer that collapses the residual streams.
-fn mixer_prefix(config: &ModelConfig) -> String {
-    format!("{}.hyper_connection_mixer", embed_prefix(config))
-}
+mod helpers;
+use helpers::{embed_prefix, mixer_prefix, ones_norm};

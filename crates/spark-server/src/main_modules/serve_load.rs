@@ -135,6 +135,9 @@ pub(crate) fn load_model(
     };
     config.lm_head_bf16_override = lm_head_bf16_override;
     config.lm_head_fp8 = lm_head_fp8;
+    // `--attn-proj-dtype bf16`: keep the full-attention Q/K/V/O at checkpoint
+    // BF16 (validated by `validate_serve_args`; `default`/`nvfp4` quantize).
+    config.attn_proj_bf16 = args.attn_proj_dtype == "bf16";
 
     // ModelOpt-exported checkpoints drop a sibling `hf_quant_config.json`
     // whose TOP LEVEL is already the quantization block.
@@ -513,6 +516,9 @@ pub(crate) fn load_model(
     // can be sized by it too instead of a standalone constant. Same
     // "carried on the config, not the environment" rule as the block below.
     config.max_batch_tokens = max_batch_tokens;
+    // Served context length (prompt + generation), same carry rule: the QSA
+    // indexer sizes its per-sequence capacity from it instead of a constant.
+    config.max_seq_len = args.max_seq_len;
     if args.dflash {
         unsafe {
             std::env::set_var("ATLAS_MTP_POOL_FULL_WIDTH", "1");
@@ -832,7 +838,11 @@ pub(crate) fn load_model(
     // trait + the `drafts.len() ≥ 4` ladder route to `step_verify_dflash`
     // (scheduler.rs:3013). So `--dflash` enables `use_speculative` too.
     let use_speculative = (args.speculative || args.dflash) && scheduler_model.has_proposer();
-    let use_self_spec = args.self_speculative && scheduler_model.has_self_speculative();
+    let use_self_spec = serve_phases::self_spec_supported(
+        args.self_speculative,
+        scheduler_model.has_self_speculative(),
+        scheduler_model.requires_aux_state(),
+    )?;
     let use_ngram_spec = args.ngram_speculative;
     // For DFlash, force `num_drafts = γ - 1` so the scheduler asks the
     // proposer for γ tokens (DraftProposer::propose semantics: "up to
@@ -854,7 +864,7 @@ pub(crate) fn load_model(
             }
         );
     } else if use_ngram_spec {
-        tracing::info!("N-gram speculative decoding: ENABLED (K=2 verify, CPU proposer)");
+        tracing::info!("N-gram speculative decoding: ENABLED (K=2/3/4 verify, CPU proposer)");
     } else if use_self_spec {
         tracing::info!(
             "Self-speculative decoding: ENABLED ({num_drafts} drafts/step, layer-skipping)"
@@ -974,6 +984,23 @@ pub(crate) fn load_model(
     // the loop drains and returns, and only THEN is the model free to tear
     // down. Without the handle there is no way to wait for that, and the
     // teardown would race a scheduler still touching the weights.
+    // llama.cpp-style n-gram SSD cache: the dynamic draft table persists
+    // beside the HF cache so learned patterns survive restarts.
+    let ngram_cache_path = if use_ngram_spec {
+        let slug: String = model_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        match crate::model_resolver::resolve_cache_root(args.cache_dir.as_deref()) {
+            Ok(root) => Some(root.join("atlas-ngram").join(format!("{slug}.bin"))),
+            Err(e) => {
+                tracing::warn!("ngram cache dir resolution failed ({e:#}) — in-memory only");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let scheduler_handle = std::thread::spawn(move || {
         scheduler::run(
             scheduler_model,
@@ -989,6 +1016,7 @@ pub(crate) fn load_model(
             max_batch_tokens,
             use_self_spec,
             use_ngram_spec,
+            ngram_cache_path,
             swap_space_gb,
             high_speed_swap_cfg,
             block_size,

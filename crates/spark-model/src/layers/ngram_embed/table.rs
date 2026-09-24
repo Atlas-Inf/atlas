@@ -29,6 +29,30 @@ pub enum NgramTable {
 }
 
 impl NgramTable {
+    /// Warm `row_ids` into the backing row cache, WITHOUT pinning — the
+    /// prefetch half of a resolve, for a caller that computed its ids ahead
+    /// of time (PLE: a pure function of the prompt). Returns the number of
+    /// rows faulted in; `Ok(0)` for resident tables, which need no warm.
+    pub fn prefetch(&mut self, row_ids: &[u64]) -> Result<usize> {
+        #[cfg(feature = "cuda")]
+        if let Self::Cached(cache) = self {
+            return cache.prefetch(row_ids);
+        }
+        let _ = row_ids;
+        Ok(0)
+    }
+
+    /// Whether this table is NVMe-backed with a bounded resident row set —
+    /// the only kind with rows to warm into. Always false without `cuda`,
+    /// where the `Cached` variant does not exist at all.
+    pub fn is_row_cached(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        if matches!(self, Self::Cached(_)) {
+            return true;
+        }
+        false
+    }
+
     /// Quantize a BF16 table to FP8 on the GPU (per-row E4M3 absmax +
     /// f32 scale via `quantize_bf16_to_fp8`) — the quantize-on-load
     /// lever. The caller frees the BF16 source afterwards; tables are
