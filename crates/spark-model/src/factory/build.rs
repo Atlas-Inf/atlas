@@ -451,6 +451,41 @@ pub fn build_model(
         }
     }
 
+    // Materialize the inference reserve as a "balloon" allocation held across
+    // KV residual sizing, then freed right after the KV pool claims its
+    // blocks. The reserve is already deducted from the KV budget below, so
+    // holding it costs nothing — but WITHOUT holding it, the bytes are just
+    // "not claimed by KV": the ~100 mid-size allocs that follow (Marconi
+    // snapshot pool's per-layer regions, drafter KV, NVFP4 quantize staging)
+    // land in whatever the earlier allocs left behind, and on a unified-
+    // memory APU that tail fragments enough that a ~45MB staging alloc fails
+    // with GBs nominally free. Holding the reserve contiguously guarantees
+    // the post-KV allocs get a clean region. If the balloon itself can't
+    // allocate we fall back to the previous behavior — nothing breaks, the
+    // late allocs just take their chances as before.
+    let balloon = if inference_reserve > 0 {
+        match gpu.alloc(inference_reserve) {
+            Ok(ptr) => Some(ptr),
+            Err(e) => {
+                tracing::warn!(
+                    "startup reserve balloon: alloc of {inference_reserve} B failed ({e}); \
+                     post-KV allocations will contend with the fragmented tail"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // When the balloon is held it IS the reserve (the bytes are in
+    // `used_so_far`/`actual_free` already), so the budget subtraction below
+    // must not count it twice.
+    let reserve_net = inference_reserve.saturating_sub(if balloon.is_some() {
+        inference_reserve
+    } else {
+        0
+    });
+
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
     let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -523,8 +558,8 @@ pub fn build_model(
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
     let kv_budget = total_budget
         .saturating_sub(used_so_far)
-        .saturating_sub(inference_reserve)
-        .min(actual_free.saturating_sub(inference_reserve));
+        .saturating_sub(reserve_net)
+        .min(actual_free.saturating_sub(reserve_net));
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -660,6 +695,15 @@ pub fn build_model(
         }
     }
     let kv_cache = PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?;
+
+    // Release the reserve balloon: everything after this point (Marconi
+    // snapshot pool, SSM decode states, drafter KV, NVFP4 staging) allocates
+    // into the contiguous region it held instead of the fragmented tail.
+    if let Some(ptr) = balloon
+        && let Err(e) = gpu.free(ptr)
+    {
+        tracing::warn!("startup reserve balloon free failed: {e}");
+    }
 
     // ── Step 6: Assemble model ──
     // Capture pointers for any post-construction sharing (DFlash drafter
