@@ -144,7 +144,7 @@ pub fn qsa_score_rows_tc_ok(n_heads: u32, hd: u32) -> bool {
     n_heads == 4 && hd.is_multiple_of(16) && qsa_score_rows_tc_smem(n_heads, hd) <= 96 * 1024
 }
 
-/// Stage 1 on TENSOR CORES. Same scores as [`qsa_score_rows_exact`] up to the
+/// Stage 1 on TENSOR CORES. Same scores as [`qsa_score_rows_exact`](super::qsa_score_rows_exact) up to the
 /// MMA's contraction order and a BF16 Q; `block_keys` is already BF16.
 ///
 /// NOT bit-identical, so it is gated behind `ATLAS_QSA_SCORE_TC` and needs
