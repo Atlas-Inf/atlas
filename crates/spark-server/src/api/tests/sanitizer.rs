@@ -55,8 +55,8 @@ fn a_tag_split_across_chunks_still_matches() {
     let mut s = Stream::new(&markers);
     let first = s.feed("abc<param");
     assert_eq!(
-        first, "",
-        "a chunk that could still be a tag prefix must not be emitted yet"
+        first, "abc",
+        "only the suffix that could still be a tag prefix is held back"
     );
     assert!(!s.suppressing(), "a partial tag is not yet a leak");
     s.feed("eter=x>body</parameter>tail");

@@ -165,27 +165,28 @@ fn sanitizer_suppresses_for_qwen3_markers() {
 #[test]
 fn sanitizer_fuses_tag_across_chunks() {
     // The whole point of the tail buffer: a tag arriving split
-    // across two calls still matches. The first chunk is shorter
-    // than (tag_max - 1), so nothing is emitted yet — we cannot
-    // prove the `<param` suffix is not a tag prefix.
+    // across two calls still matches. Only the `<param` suffix can still
+    // grow into a marker, so exactly that is held; the `abc` before it
+    // is final and goes out in this delta (it used to wait too).
     let markers = Qwen3CoderParser.leak_markers();
     let mut buf = String::new();
     let mut suppress = false;
     let out1 = sanitize_content_chunk("abc<param", &mut buf, &mut suppress, &markers);
     assert!(!suppress, "partial tag must not trigger suppression");
-    assert_eq!(out1, "", "short chunk stays in tail buffer awaiting fusion");
+    assert_eq!(out1, "abc", "only the marker-prefix suffix is held");
+    assert_eq!(buf, "<param", "the partial tag waits for fusion");
     let out2 = sanitize_content_chunk(
         "eter=x>body</parameter>tail",
         &mut buf,
         &mut suppress,
         &markers,
     );
-    // Fusion: `<parameter=x>` found in the combined buffer.
-    // "abc" prefix emits; body suppressed; `</parameter>` ends
-    // suppression; "tail" stays buffered (too short to flush).
-    assert!(
-        out2.starts_with("abc"),
-        "prefix emits after fusion: {out2:?}"
+    // Fusion: `<parameter=x>` found in the combined buffer. Body
+    // suppressed; `</parameter>` ends suppression; "tail" is not a marker
+    // prefix, so it emits now.
+    assert_eq!(
+        out2, "tail",
+        "after fusion only the post-close text emits: {out2:?}"
     );
     assert!(
         !out2.contains("body"),
