@@ -78,6 +78,13 @@ JSON 29.7, prose 25.1 tok/s; code at 5.1k context 18.4 → **28.7 tok/s**, accep
 on code/JSON. `--mtp-vocab` slicing: no gain at K=2 (dropped). Prose under MTP is not
 run-to-run deterministic (quality + determinism gate: job 257). Details on #70.
 
+### Strix Halo 27B prefill: default is best; gap to pwilkin 1.8x (was 2.4x)
+
+Stage-6 matrix on gfx1151 (main66, nvidia 27B): default 233 / 202 / 139.8 tok/s at
+1.9k / 7.2k / 29k; `BF16_TC_PREFILL`, `FP8_M64_PREFILL`, `NO_FFN_NVFP4_MMQ` all equal or
+slower, outputs identical. The long-context loss is not the GEMM tier (every arm ~140
+at 29k). Kernel ranking + chunk-size knob running. Details on #72.
+
 ### PR hygiene
 
 #46, #48, #53 closed: their content is already on main (patch-equivalent / byte-identical);
