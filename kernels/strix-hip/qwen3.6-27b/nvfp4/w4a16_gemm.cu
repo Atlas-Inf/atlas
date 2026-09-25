@@ -729,7 +729,16 @@ void w4a16_gemm_t_m128(
     const unsigned int warp_m_offset = warp_id * 16;
 
     __shared__ __nv_bfloat16 smem_A[2][2 * M_TILE][K_STEP_T + PAD_T];
-    __shared__ __nv_bfloat16 smem_B_bf16[2][N_TILE_LG][K_STEP_T + 8];
+    // smem_B_bf16 is [N][K] with an 80 B row, plus 16 B after every 16 rows.
+    // The dequant store has lane (tid&7) write row 16*(tid&7)+i: with a flat
+    // 80 B stride those 8 rows are 1280 B apart, a multiple of the LDS bank
+    // period, so all 8 lanes hit ONE bank (36 % of LDS-active cycles were
+    // bank conflicts, rocprofv3 SQC_LDS_BANK_CONFLICT on a 7k prefill). The
+    // group pad shifts each 16-row group by 4 banks: bank 20i+4j+kp covers 32
+    // distinct banks. Addresses only; the values are bit-identical.
+    #define M128_B_ROW 40                       // K_STEP_T + 8 bf16 = 80 B
+    #define M128_B_OFF(n) ((n) * M128_B_ROW + ((n) >> 4) * 8)
+    __shared__ __align__(16) __nv_bfloat16 smem_B_bf16[2][M128_B_OFF(N_TILE_LG)];
     __shared__ float smem_LUT[16];
 
     if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
@@ -794,7 +803,7 @@ void w4a16_gemm_t_m128(
             for (int i = 0; i < 16; i++) { \
                 unsigned char packed = pk[i]; \
                 float sv = scl_fp8(sc[i]) * scale2; \
-                store_bf16_pair(&smem_B_bf16[(buf)][b_ns + i][b_kp * 2], \
+                store_bf16_pair(&smem_B_bf16[(buf)][M128_B_OFF(b_ns + i) + b_kp * 2], \
                     smem_LUT[packed & 0xF] * sv, \
                     smem_LUT[packed >> 4]  * sv); \
             } \
@@ -815,7 +824,7 @@ void w4a16_gemm_t_m128(
                 for (int nb = 0; nb < 8; nb++) { \
                     unsigned int nc = nb * 16 + (lane_id & 15); \
                     v16bf b; \
-                                        memcpy(&b, &smem_B_bf16[(b_buf)][nc][h * 16], 32); \
+                                        memcpy(&b, &smem_B_bf16[(b_buf)][M128_B_OFF(nc) + h * 16], 32); \
                     acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]); \
                 } \
             } \
@@ -842,6 +851,8 @@ void w4a16_gemm_t_m128(
     #undef M128_LOAD_REGS
     #undef M128_STORE_TILE
     #undef M128_COMPUTE
+    #undef M128_B_OFF
+    #undef M128_B_ROW
 
     // Write chunk 0: rows [cta_m..cta_m+63]
     #pragma unroll
