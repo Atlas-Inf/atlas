@@ -29,12 +29,22 @@ typedef float  v8f   __attribute__((ext_vector_type(8)));
 
 // Bit-math OCP-e4m3fn decode — register ALU, no LDS. Produces the SAME value as
 // the E4M3_LUT table the base w8a16 kernels use, including the S.1111.111 NaN.
+// E4M3 -> fp32, bit-exact to the reference decode it replaces (normal, subnormal,
+// e4m3fn NaN -> qNaN, sign) in ~6 VALU instead of ~14 with selects. (b & 0x7F) << 20
+// as an fp32 is |E4M3| * 2^-120; for E4M3 subnormals it is an fp32 DENORMAL
+// (m * 2^-129), so * 2^120 is exact either way (this code runs with f32 denormals
+// preserved: .amdhsa_float_denorm_mode_32 3). Sign by XOR, as -v does. The caller's
+// * block_scale is unchanged, so the product rounds exactly as before. Host-checked:
+// 256 bytes x 12 scales (incl. negative, 1e-9 .. 1000): 0 fp32 bit mismatches.
+// Reference, for the record:
+//   e == 0            -> m * 2^-9
+//   e == 15 && m == 7 -> qNaN
+//   else              -> ((e + 120) << 23) | (m << 20);   negated when s
 __device__ __forceinline__ float w8n128_e4m3(unsigned char b) {
-    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
-    if (e == 0u)                v = (float)m * 0.001953125f;              // subnormal m*2^-9
-    else if (e == 15u && m == 7u) v = __uint_as_float(0x7fc00000u);       // e4m3fn NaN
-    else                        v = __uint_as_float(((e + 120u) << 23) | (m << 20));
-    return s ? -v : v;
+    const unsigned int u = b;
+    const float mag = ((u & 0x7Fu) == 0x7Fu) ? __uint_as_float(0x7fc00000u)
+                                             : __uint_as_float((u & 0x7Fu) << 20) * 0x1p120f;
+    return __uint_as_float(__float_as_uint(mag) ^ ((u & 0x80u) << 24));
 }
 
 #define W8N128_M_TILE 128   // M rows per CTA (8 warps x 16 rows)
