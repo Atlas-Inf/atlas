@@ -22,6 +22,14 @@ workstream by watching its job.
 | MTP memory on the nvidia Flash-Next pack | #70 | #78 (draft) |
 | This status page | — | #76 (draft) |
 
+**Per-box campaigns** (what each machine is running right now, and where it reports):
+
+| box | hardware | campaign job(s) | running now |
+|---|---|---|---|
+| reiner | DGX Spark GB10, 119.6 GB | #58, #68/#74, #69, #70, #71, #73 | jobqueue 254-260 (below) |
+| strix | Strix Halo Linux gfx1151 | #72 (27B prefill/DP4A), #56 (Flash-Next Linux) | prefill chunk-size knob at 29k + fp8to4 kernel profile |
+| winbox | Strix Halo Windows gfx1151, 128 GB | #57 (Flash-Next Windows port) | Flash-Next serial vs MTP K=2 decode/TTFT bench |
+
 ---
 
 ## Done (measured)
@@ -101,7 +109,7 @@ the two still-unmerged commits live in #75.
 | 259 `drift-bisect` | build #68 at `cfc6dae8e` (pre-mHC) and `379d741e0` (post-mHC), dense ppl vs main + main-vs-main lc control |
 | 258 `qsa-tc-split` | `QSA_ATTN_TC2` alone vs `QSA_SCORE_TC` alone (which one loses the needle) |
 | ~~252~~ `gdn-pipe-27b` | done: output-identical (above) |
-| 253 `dflash-gamma-resweep` | γ 8/12/16 under Option B. The old "γ=8 optimal" sweep and the γ=16 CUDA 700 both predate #33, which fixed the drafter attention reading the neighbouring head at head_dim 128 |
+| 260 `dflash-gamma-resweep2` (253 cancelled: hung on a bare `wait`) | γ 8/12/16 under Option B. The old "γ=8 optimal" sweep and the γ=16 CUDA 700 both predate #33, which fixed the drafter attention reading the neighbouring head at head_dim 128 |
 | 255 `cublaslt-plan-cache` | #77: build + clippy + CUTLASS-vs-cuBLASLt GPU tests + 27B greedy byte-identity and TTFT vs main66 |
 | 257 `mtp-verify-quality` | MTP + verify-active vs serial: needles + kl_drift; determinism repeat |
 | 256 `mtp-fp8-reclaim` | #78: pre-KV with `--speculative` (main66 104.6 GB, refuses util 0.88) vs releasing the 512 MTP experts' FP8 sources (~2.5 GB est.); greedy identity at 0.93 |
@@ -112,4 +120,4 @@ the two still-unmerged commits live in #75.
 - "#68 defaults are bit-identical" → greedy-identical on 3 short probes only; dense ppl +0.036 %;
   long greedy generations diverge (top-1 46.9 %). Source being bisected (job 259).
 - Strix Halo does ship the `vfused` GDN spine; an earlier note that it did not was wrong.
-- "γ=8 is optimal / γ=16 faults" is unverified on current code (job 253).
+- "γ=8 is optimal / γ=16 faults" is unverified on current code (job 260).
