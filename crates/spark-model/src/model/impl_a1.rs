@@ -158,8 +158,8 @@ impl TransformerModel {
         let fill_slots_kernel = gpu.kernel("metadata_fill", "fill_slots_from_block_table")?;
         let profile = config.profile;
         let profile_first = std::env::var("ATLAS_PROFILE_FIRST").is_ok();
-        let final_norm_identity =
-            crate::model::final_norm::final_norm_is_identity(&config.model_type);
+        let final_norm_identity = config.final_norm_is_identity();
+        super::final_norm::check_final_norm_identity(&config)?;
 
         // Pin the split-K attention split count to the configured max batch so
         // a sequence's attention reduction is invariant to how many other
