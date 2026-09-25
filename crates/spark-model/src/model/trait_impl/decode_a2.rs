@@ -551,17 +551,7 @@ impl TransformerModel {
 
             // Final norm [padded_n, H]
             let normed = self.buffers.norm_output();
-            ops::rms_norm(
-                self.gpu.as_ref(),
-                self.rms_norm_kernel,
-                hidden,
-                &self.final_norm,
-                normed,
-                padded_n as u32,
-                h as u32,
-                self.config.rms_norm_eps as f32,
-                stream,
-            )?;
+            self.final_norm_rows(hidden, normed, padded_n as u32, stream)?;
 
             // LM head: ONE batched [padded_n, vocab] GEMM so the ~254 MB
             // vocab weight is read ONCE per step instead of once per sequence
