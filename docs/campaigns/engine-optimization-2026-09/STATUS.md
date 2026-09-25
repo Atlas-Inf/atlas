@@ -50,7 +50,8 @@ Jobs 239/240/243. `main66` (`5b07b953`) vs the campaign branch (`c8bbd90f8`); se
   MoE transpose orchestrator extended to qwen4_exp, and the `--gdn-fused-norm`
   SiLU-vs-sigmoid correctness fix.
 - `ATLAS_GDN_PIPE` made the default on NVIDIA (job 243: ppl 0.000 % above and below the
-  bound, needles 12/12, kl_drift top-1 100 %). 27B check queued (job 252).
+  bound, needles 12/12, kl_drift top-1 100 %) and on the 27B (job 252: ppl 0.000 %, JSD 0,
+  top-1 100 %, both spines confirmed from the serve log).
 - `ATLAS_QSA_ATTN_TC2` + `ATLAS_QSA_SCORE_TC` stay **opt-in**: ppl neutral (−0.030 %) but
   needles 11/12 and kl_drift top-1 91.7 % (job 243).
 
@@ -92,7 +93,7 @@ the two still-unmerged commits live in #75.
 | ~~251~~ `campaign-drift-pin` | done: long-generation divergence found; `NO_HC_GEMM` not a clean control |
 | 259 `drift-bisect` | build #68 at `cfc6dae8e` (pre-mHC) and `379d741e0` (post-mHC), dense ppl vs main + main-vs-main lc control |
 | 258 `qsa-tc-split` | `QSA_ATTN_TC2` alone vs `QSA_SCORE_TC` alone (which one loses the needle) |
-| 252 `gdn-pipe-27b` | GDN pipe spine on the 27B: ppl + needles + kl_drift vs vfused |
+| ~~252~~ `gdn-pipe-27b` | done: output-identical (above) |
 | 253 `dflash-gamma-resweep` | γ 8/12/16 under Option B. The old "γ=8 optimal" sweep and the γ=16 CUDA 700 both predate #33, which fixed the drafter attention reading the neighbouring head at head_dim 128 |
 | 255 `cublaslt-plan-cache` | #77: build + clippy + CUTLASS-vs-cuBLASLt GPU tests + 27B greedy byte-identity and TTFT vs main66 |
 | 257 `mtp-verify-quality` | MTP + verify-active vs serial: needles + kl_drift; determinism repeat |
