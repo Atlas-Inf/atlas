@@ -18,6 +18,8 @@ workstream by watching its job.
 | 27B on Strix Halo: prefill + DP4A verify | #72 | #75 |
 | Per-request host-memory growth | #73 | — |
 | Client streaming latency | — | #67 (draft) |
+| cuBLASLt per-call setup (shared runtime) | #71 | #77 (draft) |
+| This status page | — | #76 (draft) |
 
 ---
 
@@ -80,6 +82,7 @@ the two still-unmerged commits live in #75.
 | 251 `campaign-drift-pin` | pin the +0.036 % dense-ppl drift to the mHC GEMM path (`ATLAS_QWEN4EXP_NO_HC_GEMM=1` arm) |
 | 252 `gdn-pipe-27b` | GDN pipe spine on the 27B: ppl + needles + kl_drift vs vfused |
 | 253 `dflash-gamma-resweep` | γ 8/12/16 under Option B. The old "γ=8 optimal" sweep and the γ=16 CUDA 700 both predate #33, which fixed the drafter attention reading the neighbouring head at head_dim 128 |
+| 255 `cublaslt-plan-cache` | #77: build + clippy + CUTLASS-vs-cuBLASLt GPU tests + 27B greedy byte-identity and TTFT vs main66 |
 | 254 `mem-slope-ab2` | per-request host-memory growth, main66 vs #68 (the #68 BFCL run lost ~7-27 MB/request and was stopped at 388/995 before the OOM guard) |
 
 ## Corrections recorded
