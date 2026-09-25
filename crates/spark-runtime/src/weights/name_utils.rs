@@ -15,6 +15,15 @@ pub(crate) fn split_trailing_index(name: &str) -> (String, u64) {
     (name.to_string(), u64::MAX)
 }
 
+/// Whether an F16 tensor must reach the GPU as raw FP16 bytes instead of the
+/// usual lossy F16→BF16 conversion. These suffixes only occur in EXL3
+/// checkpoints: the trellis `suh`/`svh` sign·scale vectors and the PLE n-gram
+/// `head_bias` are consumed as fp16 by the kernels, so every other F16 model
+/// keeps today's BF16 conversion.
+pub(crate) fn keeps_raw_f16(name: &str) -> bool {
+    name.ends_with(".suh") || name.ends_with(".svh") || name.ends_with(".ngram_embedding.head_bias")
+}
+
 /// Whether a tensor is an n-gram embedding TABLE — the huge blobs that are
 /// served off NVMe instead of being uploaded with the rest of the checkpoint.
 ///
@@ -25,6 +34,10 @@ pub(crate) fn split_trailing_index(name: &str) -> (String, u64) {
 ///   Qwen3.8-Flash-Next  `*.ple.ple_embedding.ngram_embedding.shard_{i}.weight`
 ///                       128 shards of one logical table, 47.7 GB (FP8) to
 ///                       95.4 GB (BF16) in total
+///   EXL3 (same family)  `*.ple.ple_embedding.ngram_embedding.trellis` (ONE
+///                       I16 tensor, ~39 GB) or `...ngram_embedding.shard_{i}
+///                       .trellis` (128 × I16), next to a small F16
+///                       `head_bias` and I64 aux tensors that stay resident
 ///
 /// Matching is by TENSOR NAME rather than by file, deliberately: RadixArk
 /// isolates the Qwen shards in dedicated `model-plefp8-*` files, but Inferact
@@ -37,10 +50,25 @@ pub(crate) fn split_trailing_index(name: &str) -> (String, u64) {
 ///   - Qwen's `ngram_embedding.weight_scale` (one BF16 scalar)
 ///   - Qwen's `ngram_heads_offsets` / `ngram_heads_vocab_sizes` (I64, 16 each)
 pub fn is_ngram_table(name: &str) -> bool {
-    if !name.ends_with(".weight") {
-        return false;
+    if name.contains("ngram_embeddings.embedders.") || name.contains("ngram_embedding.shard_") {
+        return name.ends_with(".weight") || exl3_trellis_tail(name);
     }
-    name.contains("ngram_embeddings.embedders.") || name.contains("ngram_embedding.shard_")
+    name.ends_with(".ngram_embedding.trellis")
+}
+
+/// True when the tail after the last `ngram_embedding.shard_<digits>` is a
+/// bare `.trellis` (EXL3's sharded n-gram layout) — i.e. the segment(s) after
+/// `shard_<digits>` are exactly `trellis`.
+fn exl3_trellis_tail(name: &str) -> bool {
+    let Some(tail) = name.rsplit("ngram_embedding.shard_").next() else {
+        return false;
+    };
+    // tail = "<digits>.trellis" for the EXL3 shards; for Qwen's FP8/BF16
+    // shards it is "<digits>.weight", which the strip_suffix below rejects.
+    let Some(digits) = tail.strip_suffix(".trellis") else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]

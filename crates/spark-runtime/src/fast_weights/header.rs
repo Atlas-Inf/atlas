@@ -123,10 +123,19 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
         let (dtype, from_f16) = match dtype_str {
             "F32" => (WeightDtype::FP32, false),
             "BF16" => (WeightDtype::BF16, false),
+            "I16" => (WeightDtype::Int16, false),
+            "I32" => (WeightDtype::Int32, false),
             // F16 is not store-legal (WeightDtype is closed to store dtypes):
             // stage as BF16 and mark for byte conversion in the copy loop.
             // centml modelopt W4A4 exports ship all unquantized tensors as F16.
-            "F16" => (WeightDtype::BF16, true),
+            // EXL3 scale vectors are the exception: keep the raw bytes (FP16).
+            "F16" => {
+                if crate::weights::keeps_raw_f16(name) {
+                    (WeightDtype::FP16, false)
+                } else {
+                    (WeightDtype::BF16, true)
+                }
+            }
             "U8" => (WeightDtype::UInt8, false),
             // I8 is a 1-byte raw container; DeepSeek-V4-Flash-NVFP4 ships its MTP
             // experts' 4-bit-packed weights as I8 (vs U8 for the main layers).
@@ -169,3 +178,7 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
     out.sort_by_key(|t| t.abs_offset);
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "header_tests.rs"]
+mod tests;

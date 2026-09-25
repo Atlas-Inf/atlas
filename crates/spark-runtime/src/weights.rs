@@ -36,10 +36,18 @@ pub(crate) fn evict_page_cache(_file: &std::fs::File) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightDtype {
     BF16,
+    /// Raw IEEE-754 half precision, byte-identical on disk→GPU. Only produced
+    /// for EXL3 scale vectors (see `weights::name_utils::keeps_raw_f16`); all
+    /// other F16 checkpoints still convert to BF16 at upload.
+    FP16,
     FP32,
     FP8E4M3,
     FP8E8M0,
     UInt8,
+    /// EXL3 trellis tensors (safetensors I16).
+    Int16,
+    /// EXL3 `mul1` bookkeeping (safetensors I32).
+    Int32,
     Int64,
     /// Keep-packed PrismML ternary Q2_0 (ggml id 42): raw on-disk blocks stay
     /// 2-bit in VRAM (fp16 scale + 2-bit codes per group of `group` elements),
@@ -60,10 +68,13 @@ impl WeightDtype {
     pub fn byte_size(self) -> usize {
         match self {
             Self::BF16 => 2,
+            Self::FP16 => 2,
             Self::FP32 => 4,
             Self::FP8E4M3 => 1,
             Self::FP8E8M0 => 1,
             Self::UInt8 => 1,
+            Self::Int16 => 2,
+            Self::Int32 => 4,
             Self::Int64 => 8,
             Self::PackedQ2_0 { .. } => 0,
         }
@@ -72,6 +83,10 @@ impl WeightDtype {
     fn from_safetensors(dtype: safetensors::Dtype) -> Result<Self> {
         match dtype {
             safetensors::Dtype::BF16 => Ok(Self::BF16),
+            // F16 stays a caller decision: EXL3 scale vectors keep raw bytes
+            // (`keeps_raw_f16` → FP16), everything else converts to BF16.
+            safetensors::Dtype::I16 => Ok(Self::Int16),
+            safetensors::Dtype::I32 => Ok(Self::Int32),
             safetensors::Dtype::F32 => Ok(Self::FP32),
             safetensors::Dtype::U8 => Ok(Self::UInt8),
             // I8: raw 1-byte container for 4-bit-packed NVFP4 (DeepSeek-V4 MTP
@@ -93,6 +108,8 @@ impl WeightDtype {
         Ok(match s {
             "F32" => Self::FP32,
             "BF16" => Self::BF16,
+            "I16" => Self::Int16,
+            "I32" => Self::Int32,
             "U8" => Self::UInt8,
             // I8 is a 1-byte raw container (packed NVFP4); signedness is
             // irrelevant, treat as raw bytes exactly like the disk path.
@@ -100,6 +117,10 @@ impl WeightDtype {
             "F8_E4M3" => Self::FP8E4M3,
             "F8_E8M0" => Self::FP8E8M0,
             "I64" => Self::Int64,
+            // NOTE: "F16" deliberately stays an error here. The RDMA path has
+            // no raw-F16 support (peers stage BF16 only); EXL3's raw-F16 scale
+            // vectors never reach the wire, so the mapping must keep failing
+            // loudly rather than silently reinterpreting bytes.
             other => bail!("Unsupported safetensors dtype '{other}'"),
         })
     }
@@ -459,9 +480,12 @@ pub(crate) use loader::check_oom_guard;
 pub(crate) use loader::estimate_has_fp8;
 
 mod name_utils;
+pub(crate) use name_utils::keeps_raw_f16;
 pub(crate) use name_utils::split_trailing_index;
 pub use name_utils::{is_ngram_table, parse_expert_index};
 
+#[cfg(test)]
+mod exl3_dtype_tests;
 #[cfg(test)]
 mod packed_q2_tests;
 mod prefix_detect;

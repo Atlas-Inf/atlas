@@ -231,7 +231,9 @@ fn validate_dtype(dtype: &str, tensor: &str) -> Result<()> {
         // is F32, some export F16); the `weight_lora_rdma` client converts
         // F16/F32 → BF16 host-side before landing. The base-weight disk
         // loaders never see F16 (they load model.safetensors, not adapters).
-        "F32" | "F16" | "BF16" | "U8" | "I8" | "F8_E4M3" | "F8_E8M0" | "I64" => Ok(()),
+        "F32" | "F16" | "BF16" | "U8" | "I8" | "I16" | "I32" | "F8_E4M3" | "F8_E8M0" | "I64" => {
+            Ok(())
+        }
         other => bail!("unsupported safetensors dtype '{other}' for tensor {tensor}"),
     }
 }
