@@ -48,13 +48,16 @@ fn qsa_topk_rows_matches_host_selection() {
     let mut sc = vec![-1e30f32; rows * stride];
     for r in 0..rows {
         let complete = (first_pos + r + 1) / ratio;
-        assert!(complete > 2 * 512 && complete <= stride, "want a multi-chunk row");
+        assert!(
+            complete > 2 * 512 && complete <= stride,
+            "want a multi-chunk row"
+        );
         for b in 0..complete {
             let v = ((next() >> 40) as f32 / 512.0) - 16.0;
             sc[r * stride + b] = match b % 37 {
-                0 => 0.0,               // exact ties on zero, across many blocks
-                1 => -0.0,              // the one IEEE-vs-bitmap disagreement
-                2 => 3.5,               // exact ties on a normal value
+                0 => 0.0,  // exact ties on zero, across many blocks
+                1 => -0.0, // the one IEEE-vs-bitmap disagreement
+                2 => 3.5,  // exact ties on a normal value
                 _ => v,
             };
         }
@@ -144,19 +147,53 @@ fn qsa_score_rows_gemm_vs_reference_drift() {
     let q_host: Vec<f32> = (0..rows * n_heads * hd).map(|_| nextf()).collect();
     let k_host: Vec<u16> = (0..n_blocks_max * hd).map(|_| bf(nextf())).collect();
 
-    let q_dev = upload(g, &q_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    let k_dev = upload(g, &k_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let q_dev = upload(
+        g,
+        &q_host
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let k_dev = upload(
+        g,
+        &k_host
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
     let a_dev = g.alloc(rows * stride * 4).unwrap();
     let b_dev = g.alloc(rows * stride * 4).unwrap();
 
     ops::qsa_score_rows(
-        g, k_ref, q_dev, k_dev, a_dev, rows as u32, n_blocks_max as u32,
-        first_pos as u32, stride as u32, ratio as u32, n_heads as u32, hd as u32, stream,
+        g,
+        k_ref,
+        q_dev,
+        k_dev,
+        a_dev,
+        rows as u32,
+        n_blocks_max as u32,
+        first_pos as u32,
+        stride as u32,
+        ratio as u32,
+        n_heads as u32,
+        hd as u32,
+        stream,
     )
     .unwrap();
     ops::qsa_score_rows_gemm(
-        g, k_gemm, q_dev, k_dev, b_dev, rows as u32, n_blocks_max as u32,
-        first_pos as u32, stride as u32, ratio as u32, n_heads as u32, hd as u32, stream,
+        g,
+        k_gemm,
+        q_dev,
+        k_dev,
+        b_dev,
+        rows as u32,
+        n_blocks_max as u32,
+        first_pos as u32,
+        stride as u32,
+        ratio as u32,
+        n_heads as u32,
+        hd as u32,
+        stream,
     )
     .unwrap();
     g.synchronize(stream).unwrap();
@@ -234,19 +271,53 @@ fn qsa_score_rows_exact_is_bitwise_identical() {
     let q_host: Vec<f32> = (0..rows * n_heads * hd).map(|_| nextf()).collect();
     let k_host: Vec<u16> = (0..n_blocks_max * hd).map(|_| bf(nextf())).collect();
 
-    let q_dev = upload(g, &q_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    let k_dev = upload(g, &k_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let q_dev = upload(
+        g,
+        &q_host
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let k_dev = upload(
+        g,
+        &k_host
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
     let a_dev = g.alloc(rows * stride * 4).unwrap();
     let b_dev = g.alloc(rows * stride * 4).unwrap();
 
     ops::qsa_score_rows(
-        g, k_ref, q_dev, k_dev, a_dev, rows as u32, n_blocks_max as u32,
-        first_pos as u32, stride as u32, ratio as u32, n_heads as u32, hd as u32, stream,
+        g,
+        k_ref,
+        q_dev,
+        k_dev,
+        a_dev,
+        rows as u32,
+        n_blocks_max as u32,
+        first_pos as u32,
+        stride as u32,
+        ratio as u32,
+        n_heads as u32,
+        hd as u32,
+        stream,
     )
     .unwrap();
     ops::qsa_score_rows_exact(
-        g, k_exact, q_dev, k_dev, b_dev, rows as u32, n_blocks_max as u32,
-        first_pos as u32, stride as u32, ratio as u32, n_heads as u32, hd as u32, stream,
+        g,
+        k_exact,
+        q_dev,
+        k_dev,
+        b_dev,
+        rows as u32,
+        n_blocks_max as u32,
+        first_pos as u32,
+        stride as u32,
+        ratio as u32,
+        n_heads as u32,
+        hd as u32,
+        stream,
     )
     .unwrap();
     g.synchronize(stream).unwrap();

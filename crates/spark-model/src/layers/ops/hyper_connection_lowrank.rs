@@ -403,7 +403,17 @@ fn hc_pre_gemm(
                 stream,
             )?;
         } else {
-            gemm_raw(gpu, k_gemm, low, up_wt, up_pre, ts, hc_dim as u32, rank, stream)?;
+            gemm_raw(
+                gpu,
+                k_gemm,
+                low,
+                up_wt,
+                up_pre,
+                ts,
+                hc_dim as u32,
+                rank,
+                stream,
+            )?;
         }
         if inject {
             // inj_pre = normed x inject_w^T   [ts, hc]   (N=4: one CTA)

@@ -7,8 +7,8 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use crate::layers::qwen3_attention::HcLowRank;
 use super::hyper_connection_lowrank_gemm::{hc_finish_block, hc_finish_x4};
+use crate::layers::qwen3_attention::HcLowRank;
 
 /// The three-launch collapse for small T. Same math as the fused kernel;
 /// the parity probe's T=8 fixture runs THIS path.

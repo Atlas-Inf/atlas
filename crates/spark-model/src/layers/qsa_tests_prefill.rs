@@ -365,15 +365,45 @@ fn qsa_prefill_attn_g_matches_single_head_bitwise() {
     let out_b = g.alloc(rows * nq * hd * 2).unwrap();
 
     ops::qsa_prefill_attn(
-        g, k1, q_dev, k_dev, v_dev, table, lists_dev, out_a, rows as u32,
-        first_pos as u32, topk as u32, ratio as u32, bs as u32, nq as u32,
-        nkv as u32, hd as u32, scale, stream,
+        g,
+        k1,
+        q_dev,
+        k_dev,
+        v_dev,
+        table,
+        lists_dev,
+        out_a,
+        rows as u32,
+        first_pos as u32,
+        topk as u32,
+        ratio as u32,
+        bs as u32,
+        nq as u32,
+        nkv as u32,
+        hd as u32,
+        scale,
+        stream,
     )
     .unwrap();
     ops::qsa_prefill_attn_g(
-        g, kg, q_dev, k_dev, v_dev, table, lists_dev, out_b, rows as u32,
-        first_pos as u32, topk as u32, ratio as u32, bs as u32, nq as u32,
-        nkv as u32, hd as u32, scale, stream,
+        g,
+        kg,
+        q_dev,
+        k_dev,
+        v_dev,
+        table,
+        lists_dev,
+        out_b,
+        rows as u32,
+        first_pos as u32,
+        topk as u32,
+        ratio as u32,
+        bs as u32,
+        nq as u32,
+        nkv as u32,
+        hd as u32,
+        scale,
+        stream,
     )
     .unwrap();
     g.synchronize(stream).unwrap();
@@ -391,10 +421,14 @@ fn qsa_prefill_attn_g_matches_single_head_bitwise() {
         }
     }
     assert_eq!(
-        diffs, 0,
+        diffs,
+        0,
         "grouped kernel is not bit-identical: {diffs}/{} elements differ, first {:?}",
         a.len(),
         first
     );
-    println!("qsa_prefill_attn_g == qsa_prefill_attn on {} elements", a.len());
+    println!(
+        "qsa_prefill_attn_g == qsa_prefill_attn on {} elements",
+        a.len()
+    );
 }

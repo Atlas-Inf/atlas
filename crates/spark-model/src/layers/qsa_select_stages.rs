@@ -37,9 +37,17 @@ fn rank_key(score: f32, idx: u32) -> u64 {
     // reason to leave a selection subtly wrong.)
     // NaN ranks LAST, as in `qsa_decode_select::rank_cmp` (main's total order,
     // shared with the device arm). Raw bits would put a positive NaN FIRST.
-    let score = if score.is_nan() { f32::NEG_INFINITY } else { score };
+    let score = if score.is_nan() {
+        f32::NEG_INFINITY
+    } else {
+        score
+    };
     let b = if score == 0.0 { 0 } else { score.to_bits() };
-    let mono = if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 };
+    let mono = if b & 0x8000_0000 != 0 {
+        !b
+    } else {
+        b | 0x8000_0000
+    };
     ((!mono) as u64) << 32 | idx as u64
 }
 
@@ -53,7 +61,16 @@ mod rank_key_tests {
     #[test]
     fn matches_the_comparator_it_replaces() {
         let mut vals: Vec<f32> = vec![
-            -1e30, -5.0, -1.0, -0.0, 0.0, f32::MIN_POSITIVE, 0.5, 1.0, 3.25, 1e30,
+            -1e30,
+            -5.0,
+            -1.0,
+            -0.0,
+            0.0,
+            f32::MIN_POSITIVE,
+            0.5,
+            1.0,
+            3.25,
+            1e30,
         ];
         // Deterministic spread, including repeats so ties are exercised.
         let mut s = 0x2545_F491_4F6C_DD1Du64;
@@ -186,7 +203,10 @@ impl QsaIndexer {
                         let row_sc = &sc_ref[r * stride..r * stride + complete];
                         keys.clear();
                         keys.extend(
-                            row_sc.iter().enumerate().map(|(i, &s)| rank_key(s, i as u32)),
+                            row_sc
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &s)| rank_key(s, i as u32)),
                         );
                         if complete > topk {
                             keys.select_nth_unstable(topk - 1);
@@ -226,174 +246,177 @@ impl QsaIndexer {
         inv_sqrt_d: f32,
         stream: u64,
     ) -> Result<()> {
-    // Every q head of a row attends over the SAME selected set --
-    // the list is indexed by row, not by head -- so one block can
-    // serve a whole group of heads and read each K/V row once instead
-    // of once per head. nsys on an 11k prefill: the per-head kernel
-    // was 3.70 s, 32.6% of a 12.3 s window, moving ~51 GB of L2
-    // traffic per launch. Same accumulation order, so same bits; the
-    // one-head kernel stays for geometries the group cannot divide.
-    // `ATLAS_QSA_ATTN_L8` selects the 8-lanes-per-head reduction. It
-    // is NOT bit-identical (the dot-product tree changes), so it is
-    // opt-in and gated on `scripts/ppl.py`; see TTFT_GAP.md 22.
-    // `ATLAS_QSA_ATTN_TC` selects the tensor-core attention. Same
-    // selected set and same per-row semantics; NOT bit-identical (a
-    // different summation tree), so it is opt-in and gated on
-    // `scripts/ppl.py`. See TTFT_GAP.md 27.
-    // `ATLAS_QSA_ATTN_TC2`: the same tensor-core attention with BOTH
-    // kv heads in one CTA, which halves the M padding.
-    // `ATLAS_QSA_ATTN_TC3`: tc2's kv-head packing with tc1's BC=32 tile.
-    let tc3 = matches!(
-        std::env::var("ATLAS_QSA_ATTN_TC3").as_deref(),
-        Ok("1") | Ok("true")
-    ) && self.k_prefill_attn_tc3_k.0 != 0
-        && ops::qsa_prefill_attn_tc3_ok(nq, self.nkv_attn, self.hd_attn);
-    if tc3 {
-        ops::qsa_prefill_attn_tc3(
-            gpu,
-            self.k_prefill_attn_tc3_k,
-            q_roped.offset(first_row * q_row * 2),
-            k_pool,
-            v_pool,
-            block_table_dev,
-            lists,
-            attn_ctx.offset(first_row * q_row * 2),
-            rows as u32,
-            first_pos as u32,
-            topk as u32,
-            self.ratio,
-            block_size,
-            nq,
-            self.nkv_attn,
-            self.hd_attn,
-            inv_sqrt_d,
-            stream,
-        )?;
-    }
-    let tc2 = !tc3 && matches!(
-        std::env::var("ATLAS_QSA_ATTN_TC2").as_deref(),
-        Ok("1") | Ok("true")
-    ) && self.k_prefill_attn_tc2_k.0 != 0
-        && ops::qsa_prefill_attn_tc2_ok(nq, self.nkv_attn, self.hd_attn);
-    if tc2 {
-        ops::qsa_prefill_attn_tc2(
-            gpu,
-            self.k_prefill_attn_tc2_k,
-            q_roped.offset(first_row * q_row * 2),
-            k_pool,
-            v_pool,
-            block_table_dev,
-            lists,
-            attn_ctx.offset(first_row * q_row * 2),
-            rows as u32,
-            first_pos as u32,
-            topk as u32,
-            self.ratio,
-            block_size,
-            nq,
-            self.nkv_attn,
-            self.hd_attn,
-            inv_sqrt_d,
-            stream,
-        )?;
-    }
-    let tc = !tc2 && matches!(
-        std::env::var("ATLAS_QSA_ATTN_TC").as_deref(),
-        Ok("1") | Ok("true")
-    ) && self.k_prefill_attn_tc_k.0 != 0
-        && ops::qsa_prefill_attn_tc_ok(nq, self.nkv_attn, self.hd_attn);
-    if tc {
-        ops::qsa_prefill_attn_tc(
-            gpu,
-            self.k_prefill_attn_tc_k,
-            q_roped.offset(first_row * q_row * 2),
-            k_pool,
-            v_pool,
-            block_table_dev,
-            lists,
-            attn_ctx.offset(first_row * q_row * 2),
-            rows as u32,
-            first_pos as u32,
-            topk as u32,
-            self.ratio,
-            block_size,
-            nq,
-            self.nkv_attn,
-            self.hd_attn,
-            inv_sqrt_d,
-            stream,
-        )?;
-    }
-    let l8 = !tc && matches!(
-        std::env::var("ATLAS_QSA_ATTN_L8").as_deref(),
-        Ok("1") | Ok("true")
-    ) && ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn);
-    if tc3 || tc2 || tc {
-        // already dispatched above
-    } else if l8 {
-        ops::qsa_prefill_attn_l8(
-            gpu,
-            self.k_prefill_attn_l8_k,
-            q_roped.offset(first_row * q_row * 2),
-            k_pool,
-            v_pool,
-            block_table_dev,
-            lists,
-            attn_ctx.offset(first_row * q_row * 2),
-            rows as u32,
-            first_pos as u32,
-            topk as u32,
-            self.ratio,
-            block_size,
-            nq,
-            self.nkv_attn,
-            self.hd_attn,
-            inv_sqrt_d,
-            stream,
-        )?;
-    } else if ops::qsa_prefill_attn_grouped_ok(nq, self.nkv_attn, self.hd_attn) {
-        ops::qsa_prefill_attn_g(
-            gpu,
-            self.k_prefill_attn_g_k,
-            q_roped.offset(first_row * q_row * 2),
-            k_pool,
-            v_pool,
-            block_table_dev,
-            lists,
-            attn_ctx.offset(first_row * q_row * 2),
-            rows as u32,
-            first_pos as u32,
-            topk as u32,
-            self.ratio,
-            block_size,
-            nq,
-            self.nkv_attn,
-            self.hd_attn,
-            inv_sqrt_d,
-            stream,
-        )?;
-    } else {
-        ops::qsa_prefill_attn(
-            gpu,
-            self.k_prefill_attn_k,
-            q_roped.offset(first_row * q_row * 2),
-            k_pool,
-            v_pool,
-            block_table_dev,
-            lists,
-            attn_ctx.offset(first_row * q_row * 2),
-            rows as u32,
-            first_pos as u32,
-            topk as u32,
-            self.ratio,
-            block_size,
-            nq,
-            self.nkv_attn,
-            self.hd_attn,
-            inv_sqrt_d,
-            stream,
-        )?;
-    }
+        // Every q head of a row attends over the SAME selected set --
+        // the list is indexed by row, not by head -- so one block can
+        // serve a whole group of heads and read each K/V row once instead
+        // of once per head. nsys on an 11k prefill: the per-head kernel
+        // was 3.70 s, 32.6% of a 12.3 s window, moving ~51 GB of L2
+        // traffic per launch. Same accumulation order, so same bits; the
+        // one-head kernel stays for geometries the group cannot divide.
+        // `ATLAS_QSA_ATTN_L8` selects the 8-lanes-per-head reduction. It
+        // is NOT bit-identical (the dot-product tree changes), so it is
+        // opt-in and gated on `scripts/ppl.py`; see TTFT_GAP.md 22.
+        // `ATLAS_QSA_ATTN_TC` selects the tensor-core attention. Same
+        // selected set and same per-row semantics; NOT bit-identical (a
+        // different summation tree), so it is opt-in and gated on
+        // `scripts/ppl.py`. See TTFT_GAP.md 27.
+        // `ATLAS_QSA_ATTN_TC2`: the same tensor-core attention with BOTH
+        // kv heads in one CTA, which halves the M padding.
+        // `ATLAS_QSA_ATTN_TC3`: tc2's kv-head packing with tc1's BC=32 tile.
+        let tc3 = matches!(
+            std::env::var("ATLAS_QSA_ATTN_TC3").as_deref(),
+            Ok("1") | Ok("true")
+        ) && self.k_prefill_attn_tc3_k.0 != 0
+            && ops::qsa_prefill_attn_tc3_ok(nq, self.nkv_attn, self.hd_attn);
+        if tc3 {
+            ops::qsa_prefill_attn_tc3(
+                gpu,
+                self.k_prefill_attn_tc3_k,
+                q_roped.offset(first_row * q_row * 2),
+                k_pool,
+                v_pool,
+                block_table_dev,
+                lists,
+                attn_ctx.offset(first_row * q_row * 2),
+                rows as u32,
+                first_pos as u32,
+                topk as u32,
+                self.ratio,
+                block_size,
+                nq,
+                self.nkv_attn,
+                self.hd_attn,
+                inv_sqrt_d,
+                stream,
+            )?;
+        }
+        let tc2 =
+            !tc3 && matches!(
+                std::env::var("ATLAS_QSA_ATTN_TC2").as_deref(),
+                Ok("1") | Ok("true")
+            ) && self.k_prefill_attn_tc2_k.0 != 0
+                && ops::qsa_prefill_attn_tc2_ok(nq, self.nkv_attn, self.hd_attn);
+        if tc2 {
+            ops::qsa_prefill_attn_tc2(
+                gpu,
+                self.k_prefill_attn_tc2_k,
+                q_roped.offset(first_row * q_row * 2),
+                k_pool,
+                v_pool,
+                block_table_dev,
+                lists,
+                attn_ctx.offset(first_row * q_row * 2),
+                rows as u32,
+                first_pos as u32,
+                topk as u32,
+                self.ratio,
+                block_size,
+                nq,
+                self.nkv_attn,
+                self.hd_attn,
+                inv_sqrt_d,
+                stream,
+            )?;
+        }
+        let tc =
+            !tc2 && matches!(
+                std::env::var("ATLAS_QSA_ATTN_TC").as_deref(),
+                Ok("1") | Ok("true")
+            ) && self.k_prefill_attn_tc_k.0 != 0
+                && ops::qsa_prefill_attn_tc_ok(nq, self.nkv_attn, self.hd_attn);
+        if tc {
+            ops::qsa_prefill_attn_tc(
+                gpu,
+                self.k_prefill_attn_tc_k,
+                q_roped.offset(first_row * q_row * 2),
+                k_pool,
+                v_pool,
+                block_table_dev,
+                lists,
+                attn_ctx.offset(first_row * q_row * 2),
+                rows as u32,
+                first_pos as u32,
+                topk as u32,
+                self.ratio,
+                block_size,
+                nq,
+                self.nkv_attn,
+                self.hd_attn,
+                inv_sqrt_d,
+                stream,
+            )?;
+        }
+        let l8 =
+            !tc && matches!(
+                std::env::var("ATLAS_QSA_ATTN_L8").as_deref(),
+                Ok("1") | Ok("true")
+            ) && ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn);
+        if tc3 || tc2 || tc {
+            // already dispatched above
+        } else if l8 {
+            ops::qsa_prefill_attn_l8(
+                gpu,
+                self.k_prefill_attn_l8_k,
+                q_roped.offset(first_row * q_row * 2),
+                k_pool,
+                v_pool,
+                block_table_dev,
+                lists,
+                attn_ctx.offset(first_row * q_row * 2),
+                rows as u32,
+                first_pos as u32,
+                topk as u32,
+                self.ratio,
+                block_size,
+                nq,
+                self.nkv_attn,
+                self.hd_attn,
+                inv_sqrt_d,
+                stream,
+            )?;
+        } else if ops::qsa_prefill_attn_grouped_ok(nq, self.nkv_attn, self.hd_attn) {
+            ops::qsa_prefill_attn_g(
+                gpu,
+                self.k_prefill_attn_g_k,
+                q_roped.offset(first_row * q_row * 2),
+                k_pool,
+                v_pool,
+                block_table_dev,
+                lists,
+                attn_ctx.offset(first_row * q_row * 2),
+                rows as u32,
+                first_pos as u32,
+                topk as u32,
+                self.ratio,
+                block_size,
+                nq,
+                self.nkv_attn,
+                self.hd_attn,
+                inv_sqrt_d,
+                stream,
+            )?;
+        } else {
+            ops::qsa_prefill_attn(
+                gpu,
+                self.k_prefill_attn_k,
+                q_roped.offset(first_row * q_row * 2),
+                k_pool,
+                v_pool,
+                block_table_dev,
+                lists,
+                attn_ctx.offset(first_row * q_row * 2),
+                rows as u32,
+                first_pos as u32,
+                topk as u32,
+                self.ratio,
+                block_size,
+                nq,
+                self.nkv_attn,
+                self.hd_attn,
+                inv_sqrt_d,
+                stream,
+            )?;
+        }
         Ok(())
     }
 }

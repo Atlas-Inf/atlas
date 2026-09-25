@@ -298,10 +298,7 @@ pub fn qsa_prefill_attn_tc(
 /// into `QSA_PA_G` groups of 8 (so `QSA_PA_G * 8 == 32`), and each lane's slice
 /// `hd / 8` must be a whole number of 16-byte chunks and fit `QSA_L8_EV`.
 pub fn qsa_prefill_attn_l8_ok(nq: u32, nkv: u32, hd: u32) -> bool {
-    qsa_prefill_attn_grouped_ok(nq, nkv, hd)
-        && QSA_PA_G * 8 == 32
-        && hd % 64 == 0
-        && hd / 8 <= 32
+    qsa_prefill_attn_grouped_ok(nq, nkv, hd) && QSA_PA_G * 8 == 32 && hd % 64 == 0 && hd / 8 <= 32
 }
 
 /// Stage 2, 8 lanes per head. Same selected set, same per-head online softmax

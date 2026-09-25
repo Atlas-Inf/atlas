@@ -261,10 +261,12 @@ impl QsaIndexer {
                     stream,
                 )?;
             }
-            let score_gemm = !score_tc && matches!(
-                std::env::var("ATLAS_QSA_SCORE_GEMM").as_deref(),
-                Ok("1") | Ok("true")
-            ) && self.k_score_rows_gemm_k.0 != 0
+            let score_gemm = !score_tc
+                && matches!(
+                    std::env::var("ATLAS_QSA_SCORE_GEMM").as_deref(),
+                    Ok("1") | Ok("true")
+                )
+                && self.k_score_rows_gemm_k.0 != 0
                 && ops::qsa_score_rows_gemm_ok(self.n_heads, self.hd);
             if score_tc {
                 // already dispatched above
@@ -288,34 +290,34 @@ impl QsaIndexer {
                 ops::qsa_score_rows_exact(
                     gpu,
                     self.k_score_rows_exact_k,
-                qpost,
-                st.block_keys,
-                scores,
-                rows as u32,
-                n_blocks_max as u32,
-                first_pos as u32,
-                stride as u32,
-                self.ratio,
-                self.n_heads,
-                self.hd,
-                stream,
-            )?;
+                    qpost,
+                    st.block_keys,
+                    scores,
+                    rows as u32,
+                    n_blocks_max as u32,
+                    first_pos as u32,
+                    stride as u32,
+                    self.ratio,
+                    self.n_heads,
+                    self.hd,
+                    stream,
+                )?;
             } else {
                 ops::qsa_score_rows(
                     gpu,
                     self.k_score_rows_k,
-                qpost,
-                st.block_keys,
-                scores,
-                rows as u32,
-                n_blocks_max as u32,
-                first_pos as u32,
-                stride as u32,
-                self.ratio,
-                self.n_heads,
-                self.hd,
-                stream,
-            )?;
+                    qpost,
+                    st.block_keys,
+                    scores,
+                    rows as u32,
+                    n_blocks_max as u32,
+                    first_pos as u32,
+                    stride as u32,
+                    self.ratio,
+                    self.n_heads,
+                    self.hd,
+                    stream,
+                )?;
             }
             // SELECTION. On the GPU when the shape allows it: `qsa_topk_rows`
             // produces byte-for-byte the same list, in the same order, without
@@ -391,12 +393,28 @@ impl QsaIndexer {
                 tracing::info!("QSA union rows={rows} topk={topk}{line}");
             }
             if host_select {
-                self.prefill_host_select(gpu, scores, lists, rows, stride, first_pos, ratio, topk, stream)?;
+                self.prefill_host_select(
+                    gpu, scores, lists, rows, stride, first_pos, ratio, topk, stream,
+                )?;
             }
 
             self.prefill_attend_slab(
-                gpu, q_roped, attn_ctx, k_pool, v_pool, block_table_dev, lists, first_row, q_row,
-                rows, first_pos, topk, block_size, nq, inv_sqrt_d, stream,
+                gpu,
+                q_roped,
+                attn_ctx,
+                k_pool,
+                v_pool,
+                block_table_dev,
+                lists,
+                first_row,
+                q_row,
+                rows,
+                first_pos,
+                topk,
+                block_size,
+                nq,
+                inv_sqrt_d,
+                stream,
             )?;
             slab += rows;
         }

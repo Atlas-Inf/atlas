@@ -81,7 +81,11 @@ pub fn qsa_score_rows_exact(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([rows.div_ceil(QSA_SE_BM), n_blocks_max.div_ceil(QSA_SE_BN), 1])
+        .grid([
+            rows.div_ceil(QSA_SE_BM),
+            n_blocks_max.div_ceil(QSA_SE_BN),
+            1,
+        ])
         .block([QSA_SE_BM * QSA_SE_BN, 1, 1])
         .shared_mem(qsa_score_rows_exact_smem(n_heads, hd))
         .arg_ptr(q)
@@ -135,7 +139,11 @@ pub fn qsa_score_rows_gemm(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([rows.div_ceil(QSA_SG_BM), n_blocks_max.div_ceil(QSA_SG_BN), 1])
+        .grid([
+            rows.div_ceil(QSA_SG_BM),
+            n_blocks_max.div_ceil(QSA_SG_BN),
+            1,
+        ])
         .block([QSA_SG_BM * QSA_SG_BN, 1, 1])
         .shared_mem(qsa_score_rows_gemm_smem(n_heads, hd))
         .arg_ptr(q)
