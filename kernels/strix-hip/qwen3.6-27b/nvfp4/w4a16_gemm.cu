@@ -83,17 +83,27 @@ __device__ __forceinline__ void store_bf16_pair(__nv_bfloat16* dst, float lo, fl
     *(unsigned int*)dst = p.u;
 }
 
-// E2M1 (FP4) code -> fp32 in registers, BIT-EXACT to E2M1_LUT (all 16 codes,
-// including -0.0). |v| = 2^(e-1) * (1 + m/2) for e = (n>>1)&3 >= 1, so for
-// mag = n&7 >= 2 the fp32 bits are exactly (mag + 252) << 22; mag 0/1 are
-// 0 / 0.5. Replaces a dynamically indexed LDS LUT read: on gfx1151 the
-// w4a16_gemm_t_m128 dequant is LDS-bound, not VALU-bound (dropping the
-// FP8 scale decode, all VALU, bought nothing; dropping the LUT reads bought
-// ~15 % of 27B prefill in a timing-only ablation).
-__device__ __forceinline__ float e2m1_to_f32(unsigned int n) {
-    const unsigned int mag = n & 7u;
-    const unsigned int bits = (mag < 2u) ? (mag ? 0x3F000000u : 0u) : ((mag + 252u) << 22);
-    return __uint_as_float(bits | ((n & 8u) << 28));
+// Four E2M1 (FP4) codes -> four "offset half-units" bytes, t = 12 + 2*v, where
+// v is the E2M1 value: |v| in half-units is {0,1,2,3,4,6,8,12}. Two v_perm_b32
+// byte lookups (positive / negative half-table, selector = code & 7) and one
+// bitfield select on the sign bit. The caller decodes a byte with
+// v_cvt_f32_ubyteN and computes (t - 12) * (0.5 * sv): 0.5*sv is exact and
+// (t - 12) is an exact small integer, so the one rounding lands on the same
+// fp32 as E2M1_LUT[n] * sv. Checked on all 256 scale bytes x 6 global scales x
+// 8 codes: 0 value mismatches; code 8 gives +0 where the LUT gives -0, which
+// cannot reach the output (the WMMA accumulator starts at +0 and, under RNE,
+// never becomes -0; x + (+/-0) = x).
+//
+// Why: this kernel's dequant was 35 % of its GPU time (rocprofv3, 7.2k prefill:
+// 16.8 s -> 10.9 s with the decode removed, timing-only). A 16-entry LDS LUT
+// read per nibble and a ~9-op branch-free fp32 bit build cost about the same;
+// this is ~4.75 VALU per value and no LDS.
+__device__ __forceinline__ unsigned int e2m1x4_off12(unsigned int codes) {
+    const unsigned int sel = codes & 0x07070707u;
+    const unsigned int pos = __builtin_amdgcn_perm(0x18141210u, 0x0F0E0D0Cu, sel);  // 12,13,14,15,16,18,20,24
+    const unsigned int neg = __builtin_amdgcn_perm(0x00040608u, 0x090A0B0Cu, sel);  // 12,11,10, 9, 8, 6, 4, 0
+    const unsigned int m = ((codes >> 3) & 0x01010101u) * 0xFFu;                     // 0xFF where negative
+    return (neg & m) | (pos & ~m);
 }
 
 // ── Synchronous 16-byte smem copy (cp.async replacement) ────────────
@@ -808,15 +818,20 @@ void w4a16_gemm_t_m128(
             *(uint4*)&smem_A[(buf)][row][a_col] = (ra)[rnd]; \
         } \
         { \
-            const unsigned char* pk = (const unsigned char*)&(rb); \
+            const unsigned int* pw = (const unsigned int*)&(rb); \
             const unsigned char* sc = (const unsigned char*)&(rs); \
             _Pragma("unroll") \
-            for (int i = 0; i < 16; i++) { \
-                unsigned char packed = pk[i]; \
-                float sv = scl_fp8(sc[i]) * scale2; \
-                store_bf16_pair(&smem_B_bf16[(buf)][M128_B_OFF(b_ns + i) + b_kp * 2], \
-                    e2m1_to_f32(packed & 0xFu) * sv, \
-                    e2m1_to_f32(packed >> 4) * sv); \
+            for (int d = 0; d < 4; d++) { \
+                const unsigned int tl = e2m1x4_off12(pw[d] & 0x0F0F0F0Fu); \
+                const unsigned int th = e2m1x4_off12((pw[d] >> 4) & 0x0F0F0F0Fu); \
+                _Pragma("unroll") \
+                for (int k = 0; k < 4; k++) { \
+                    const int i = d * 4 + k; \
+                    const float svh = (scl_fp8(sc[i]) * scale2) * 0.5f; \
+                    store_bf16_pair(&smem_B_bf16[(buf)][M128_B_OFF(b_ns + i) + b_kp * 2], \
+                        ((float)((tl >> (8 * k)) & 0xFFu) - 12.0f) * svh, \
+                        ((float)((th >> (8 * k)) & 0xFFu) - 12.0f) * svh); \
+                } \
             } \
         } \
     } while(0)
