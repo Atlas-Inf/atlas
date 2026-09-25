@@ -13,6 +13,8 @@ use crate::tool_parser::{LeakMarkers, Qwen3CoderParser, ToolCallParser};
 use crate::api::sanitizer::sanitize_content_chunk;
 use crate::api::stream_guards::flush_content_sanitizer;
 
+#[path = "sanitizer_holdback_tests.rs"]
+mod holdback_tests;
 #[path = "sanitizer_chunk_tests.rs"]
 mod sanitizer_tests;
 
