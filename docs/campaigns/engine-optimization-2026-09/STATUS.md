@@ -68,6 +68,13 @@ Job 235: batched verify scales (122 ms at n=1 → 285 ms at n=12) but propose is
 (C4/C8/C16 = 25.6 / 31.4 / 29.2 tok/s vs 36.8 / 46.6 / 47.1): each lane re-reads ~4.5 GB
 of drafter + head weights. Only a B×γ batched propose fixes this — see the design doc.
 
+### Flash-Next decode: MTP past the QSA bound = +56 % (job 250)
+
+MTP K=2 with per-row QSA verify (`ATLAS_QSA_VERIFY_ACTIVE=1`, #51, opt-in): code 29.6,
+JSON 29.7, prose 25.1 tok/s; code at 5.1k context 18.4 → **28.7 tok/s**, accept 0.94-0.98
+on code/JSON. `--mtp-vocab` slicing: no gain at K=2 (dropped). Prose under MTP is not
+run-to-run deterministic (quality + determinism gate: job 257). Details on #70.
+
 ### PR hygiene
 
 #46, #48, #53 closed: their content is already on main (patch-equivalent / byte-identical);
@@ -79,11 +86,12 @@ the two still-unmerged commits live in #75.
 
 | job | what it answers |
 |---|---|
-| 250 `fnext-mtp-vocab-ab2` | Flash-Next decode: MTP K=2 (per-row QSA verify) with and without draft-head vocab slicing (`--mtp-vocab` 65536 / 131072); serial baseline 18.0-18.9 tok/s |
+| ~~250~~ `fnext-mtp-vocab-ab2` (done, above) | Flash-Next decode: MTP K=2 (per-row QSA verify) with and without draft-head vocab slicing (`--mtp-vocab` 65536 / 131072); serial baseline 18.0-18.9 tok/s |
 | 251 `campaign-drift-pin` | pin the +0.036 % dense-ppl drift to the mHC GEMM path (`ATLAS_QWEN4EXP_NO_HC_GEMM=1` arm) |
 | 252 `gdn-pipe-27b` | GDN pipe spine on the 27B: ppl + needles + kl_drift vs vfused |
 | 253 `dflash-gamma-resweep` | γ 8/12/16 under Option B. The old "γ=8 optimal" sweep and the γ=16 CUDA 700 both predate #33, which fixed the drafter attention reading the neighbouring head at head_dim 128 |
 | 255 `cublaslt-plan-cache` | #77: build + clippy + CUTLASS-vs-cuBLASLt GPU tests + 27B greedy byte-identity and TTFT vs main66 |
+| 257 `mtp-verify-quality` | MTP + verify-active vs serial: needles + kl_drift; determinism repeat |
 | 256 `mtp-fp8-reclaim` | #78: pre-KV with `--speculative` (main66 104.6 GB, refuses util 0.88) vs releasing the 512 MTP experts' FP8 sources (~2.5 GB est.); greedy identity at 0.93 |
 | 254 `mem-slope-ab2` | per-request host-memory growth, main66 vs #68 (the #68 BFCL run lost ~7-27 MB/request and was stopped at 388/995 before the OOM guard) |
 
