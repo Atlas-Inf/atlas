@@ -83,6 +83,19 @@ __device__ __forceinline__ void store_bf16_pair(__nv_bfloat16* dst, float lo, fl
     *(unsigned int*)dst = p.u;
 }
 
+// E2M1 (FP4) code -> fp32 in registers, BIT-EXACT to E2M1_LUT (all 16 codes,
+// including -0.0). |v| = 2^(e-1) * (1 + m/2) for e = (n>>1)&3 >= 1, so for
+// mag = n&7 >= 2 the fp32 bits are exactly (mag + 252) << 22; mag 0/1 are
+// 0 / 0.5. Replaces a dynamically indexed LDS LUT read: on gfx1151 the
+// w4a16_gemm_t_m128 dequant is LDS-bound, not VALU-bound (dropping the
+// FP8 scale decode, all VALU, bought nothing; dropping the LUT reads bought
+// ~15 % of 27B prefill in a timing-only ablation).
+__device__ __forceinline__ float e2m1_to_f32(unsigned int n) {
+    const unsigned int mag = n & 7u;
+    const unsigned int bits = (mag < 2u) ? (mag ? 0x3F000000u : 0u) : ((mag + 252u) << 22);
+    return __uint_as_float(bits | ((n & 8u) << 28));
+}
+
 // ── Synchronous 16-byte smem copy (cp.async replacement) ────────────
 // Copies 16 bytes gmem→smem when pred, else zero-fills, to preserve the
 // predicated cp.async.16 semantics (out-of-bounds rows became zero).
@@ -739,9 +752,7 @@ void w4a16_gemm_t_m128(
     #define M128_B_ROW 40                       // K_STEP_T + 8 bf16 = 80 B
     #define M128_B_OFF(n) ((n) * M128_B_ROW + ((n) >> 4) * 8)
     __shared__ __align__(16) __nv_bfloat16 smem_B_bf16[2][M128_B_OFF(N_TILE_LG)];
-    __shared__ float smem_LUT[16];
 
-    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
     __syncthreads();
 
     v8f acc0[8], acc1[8];
@@ -804,8 +815,8 @@ void w4a16_gemm_t_m128(
                 unsigned char packed = pk[i]; \
                 float sv = scl_fp8(sc[i]) * scale2; \
                 store_bf16_pair(&smem_B_bf16[(buf)][M128_B_OFF(b_ns + i) + b_kp * 2], \
-                    smem_LUT[packed & 0xF] * sv, \
-                    smem_LUT[packed >> 4]  * sv); \
+                    e2m1_to_f32(packed & 0xFu) * sv, \
+                    e2m1_to_f32(packed >> 4) * sv); \
             } \
         } \
     } while(0)
