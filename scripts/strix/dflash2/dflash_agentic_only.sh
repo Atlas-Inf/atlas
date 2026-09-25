@@ -86,6 +86,7 @@ serve() {  # <serve-log> <max_seq> <extra serve flags...>
       DFLASH=1 DRAFT_MODEL="$DRAFTER" DFLASH_GAMMA="$GAMMA" GPU_UTIL="$GPU_UTIL" \
       MAX_SEQ_LEN="$maxseq" MAX_PREFILL_TOKENS="$MAX_PREFILL_TOKENS" PORT=$PORT HOST="${HOST:-127.0.0.1}" MODEL_NAME="$MODEL" SSM_SLOTS="${SSM_SLOTS:-0}" SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-16}" \
       ./serve-amd.sh "$MODEL" --disable-thinking --request-timeout 900 \
+      ${NUM_DRAFTS:+--num-drafts "$NUM_DRAFTS"} \
       --dflash-window-size "${DFLASH_WINDOW_SIZE:-0}" "$@" >"$slog" 2>&1 & echo $! >"$OUT/.serve.pid" )
   sleep 2
   SRV=$(cat "$OUT/.serve.pid")
