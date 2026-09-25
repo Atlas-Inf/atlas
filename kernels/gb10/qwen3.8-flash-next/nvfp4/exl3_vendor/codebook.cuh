@@ -1,4 +1,12 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Vendored from turboderp-org/exllamav3 @ 6b84a21 (MIT, Copyright (c) 2025 Turboderp); see NOTICE.md.
+// Modifications: none beyond includes (added <cuda_fp16.h>, <cstdint>, "half_uint16.cuh").
 #pragma once
+
+#include <cuda_fp16.h>
+#include <cstdint>
+
+#include "half_uint16.cuh"
 
 // This used to force integer MAD on sm_86 via inline asm, which outperformed the IMUL emitted by older
 // nvcc versions on the RTX 3090. As of CUDA 13.2 the workaround has inverted: the plain multiply is ~4%

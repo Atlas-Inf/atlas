@@ -1,5 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Vendored from turboderp-org/exllamav3 @ 6b84a21 (MIT, Copyright (c) 2025 Turboderp); see NOTICE.md.
+// Modifications: none beyond includes (dropped unused <cuda/atomic>, added <cuda_fp16.h> and <cstdint>).
 #pragma once
-#include <cuda/atomic>
+
+#include <cuda_fp16.h>
+#include <cstdint>
 
 // Tensor core fragments
 

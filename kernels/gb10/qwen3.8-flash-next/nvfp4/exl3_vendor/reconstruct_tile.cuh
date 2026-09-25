@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Vendored from turboderp-org/exllamav3 @ 6b84a21 (MIT, Copyright (c) 2025 Turboderp); see NOTICE.md.
+// Modifications: removed the deprecated `register` storage class from `frag` (nvcc rejects it under
+// --Werror all-warnings); added #pragma once, <cuda_fp16.h>, <cstdint> and the sibling includes.
+#pragma once
+
+#include <cuda_fp16.h>
+#include <cstdint>
+
+#include "exl3_dq.cuh"
+#include "ptx_frag.cuh"
+
 template <int K, int cb, bool HALF = false>
 __device__ __forceinline__
 void reconstruct_tile
@@ -26,7 +38,7 @@ void reconstruct_tile
     __syncthreads();
 
     // Dequant
-    register FragB frag[2];
+    FragB frag[2];
     dq_dispatch<K, cb, HALF>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
 
     // Shuffle from tensor core layout to row major tile

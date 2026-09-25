@@ -161,3 +161,53 @@ fn dflash2_candidate_selector_arity_pin() {
         "dflash2_candidate_selector not found in any compiled module — registry drift?"
     );
 }
+
+/// The EXL3 reconstruct module is a standalone bundle member (not part of the
+/// w4a16 launch family), so it gets its own pin: every entry takes four params
+/// (out, packed, packed_blocks_n, packed_n_offset) and the launchers in
+/// spark-model must pass exactly four. Update launcher and pin in the same
+/// commit.
+#[test]
+#[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
+fn exl3_reconstruct_arity_pin() {
+    if atlas_kernels::available_targets()
+        .iter()
+        .all(|s| s.modules.is_empty())
+    {
+        eprintln!("no compiled PTX in this binary (stub build) — arity pin skipped");
+        return;
+    }
+    const ENTRIES: &[&str] = &[
+        "exl3_reconstruct_mul1_k3",
+        "exl3_reconstruct_mul1_k4",
+        "exl3_reconstruct_mul1_k5",
+        "exl3_reconstruct_mul1_k6",
+    ];
+    let mut checked = 0usize;
+    for set in atlas_kernels::available_targets() {
+        for (module, blob) in &set.modules {
+            let Ok(ptx) = std::str::from_utf8(blob) else {
+                continue;
+            };
+            if *module != "exl3" {
+                continue;
+            }
+            for kernel in ENTRIES {
+                if let Some(count) = ptx_param_count(ptx, kernel) {
+                    assert_eq!(
+                        count, 4,
+                        "PTX arity drift: {module}::{kernel} on target {} has \
+                         {count} params, pin expects 4 — update the launcher AND \
+                         this pin together",
+                        set.target.model
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= 1,
+        "no exl3 reconstruct entry found in any compiled module — registry drift?"
+    );
+}

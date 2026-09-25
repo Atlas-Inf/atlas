@@ -1,6 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Vendored from turboderp-org/exllamav3 @ 6b84a21 (MIT, Copyright (c) 2025 Turboderp); see NOTICE.md.
+// Modifications: none beyond includes (added <cstdint>, "ptx_frag.cuh", "ptx_bits.cuh").
 #pragma once
 
+#include <cstdint>
+
 #include "codebook.cuh"
+#include "ptx_frag.cuh"
+#include "ptx_bits.cuh"
 
 __device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, int shift)
 {
