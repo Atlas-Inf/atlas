@@ -19,6 +19,7 @@ workstream by watching its job.
 | Per-request host-memory growth | #73 | — |
 | Client streaming latency | — | #67 (draft) |
 | cuBLASLt per-call setup (shared runtime) | #71 | #77 (draft) |
+| MTP memory on the nvidia Flash-Next pack | #70 | #78 (draft) |
 | This status page | — | #76 (draft) |
 
 ---
@@ -83,6 +84,7 @@ the two still-unmerged commits live in #75.
 | 252 `gdn-pipe-27b` | GDN pipe spine on the 27B: ppl + needles + kl_drift vs vfused |
 | 253 `dflash-gamma-resweep` | γ 8/12/16 under Option B. The old "γ=8 optimal" sweep and the γ=16 CUDA 700 both predate #33, which fixed the drafter attention reading the neighbouring head at head_dim 128 |
 | 255 `cublaslt-plan-cache` | #77: build + clippy + CUTLASS-vs-cuBLASLt GPU tests + 27B greedy byte-identity and TTFT vs main66 |
+| 256 `mtp-fp8-reclaim` | #78: pre-KV with `--speculative` (main66 104.6 GB, refuses util 0.88) vs releasing the 512 MTP experts' FP8 sources (~2.5 GB est.); greedy identity at 0.93 |
 | 254 `mem-slope-ab2` | per-request host-memory growth, main66 vs #68 (the #68 BFCL run lost ~7-27 MB/request and was stopped at 388/995 before the OOM guard) |
 
 ## Corrections recorded
