@@ -185,6 +185,14 @@ PY
     fingerprint agentic "$MAXSEQ"
     serve "$OUT/agentic-serve.log" "$MAXSEQ" || { log "LEG3 SKIPPED — serve failed"; stop_serve; exit 0; }
   fi
+  if [ "${SERVE_ONLY:-0}" = "1" ]; then
+    # Off-box harness: on the 61 GB strix the harness must run remotely (the
+    # co-resident harness tipped the host over the OOM line twice on
+    # 2026-09-24 — global_oom killed pipewire/sshd). Leave the serve up and
+    # connect via SSH tunnel; stop with: kill $(cat $OUT/.serve.pid)
+    log "SERVE_ONLY=1 — serve left running on :$PORT (pid $(cat "$OUT/.serve.pid")) for the remote harness; kill the pid to stop"
+    exit 0
+  fi
   RDAG=results_agentic_dflash_$TS
   CFGAG=$EP/examples/10_Edge_Agentic_Example/online_agentic_2.5h_dflash_$TS.yaml
   "$EP/.venv/bin/python" - "$EP/examples/10_Edge_Agentic_Example/online_agentic_2.5h_atlas_strix.yaml" "$CFGAG" "$MODEL" "$RDAG" "$PORT" <<'PY'
