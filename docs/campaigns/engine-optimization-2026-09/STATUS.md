@@ -38,9 +38,11 @@ Jobs 239/240/243. `main66` (`5b07b953`) vs the campaign branch (`c8bbd90f8`); se
 | ~10.2k | 19.40 s | **7.39 s** | 6.34 s | 19.29 s |
 | 31.5k | 92.24 s | **24.33 s** | 19.92 s | 93.45 s |
 
-- Greedy output main == #68 defaults on the probe prompts; main == main (control).
+- Greedy output main == #68 defaults on 3 short probe prompts; main == main (control).
+  **But long generations diverge** (job 251, `lc_subset` 12k-24k prompts): kl_drift
+  top-1 46.9 %, 190 greedy flips — see the corrections below; build bisect is job 259.
 - Logprobs are **near-identical, not bit-identical**: dense-region ppl +0.036 %, above
-  the QSA bound −0.014 % (8 × 12k windows). Kernel attribution queued (job 251).
+  the QSA bound −0.014 % (8 × 12k windows). Kernel attribution: `NO_HC_GEMM` is not a clean control (+0.346 %); build bisect queued (job 259).
 - What is in it: QSA scorer that replays the reference reduction DAG in one thread
   (bit-identical), head-grouped QSA attention, GPU prefill top-k, skipping the dense
   pass QSA overwrites, mHC skinny GEMMs routed to split-K by machine fill (prefill
@@ -87,7 +89,9 @@ the two still-unmerged commits live in #75.
 | job | what it answers |
 |---|---|
 | ~~250~~ `fnext-mtp-vocab-ab2` (done, above) | Flash-Next decode: MTP K=2 (per-row QSA verify) with and without draft-head vocab slicing (`--mtp-vocab` 65536 / 131072); serial baseline 18.0-18.9 tok/s |
-| 251 `campaign-drift-pin` | pin the +0.036 % dense-ppl drift to the mHC GEMM path (`ATLAS_QWEN4EXP_NO_HC_GEMM=1` arm) |
+| ~~251~~ `campaign-drift-pin` | done: long-generation divergence found; `NO_HC_GEMM` not a clean control |
+| 259 `drift-bisect` | build #68 at `cfc6dae8e` (pre-mHC) and `379d741e0` (post-mHC), dense ppl vs main + main-vs-main lc control |
+| 258 `qsa-tc-split` | `QSA_ATTN_TC2` alone vs `QSA_SCORE_TC` alone (which one loses the needle) |
 | 252 `gdn-pipe-27b` | GDN pipe spine on the 27B: ppl + needles + kl_drift vs vfused |
 | 253 `dflash-gamma-resweep` | γ 8/12/16 under Option B. The old "γ=8 optimal" sweep and the γ=16 CUDA 700 both predate #33, which fixed the drafter attention reading the neighbouring head at head_dim 128 |
 | 255 `cublaslt-plan-cache` | #77: build + clippy + CUTLASS-vs-cuBLASLt GPU tests + 27B greedy byte-identity and TTFT vs main66 |
@@ -97,6 +101,7 @@ the two still-unmerged commits live in #75.
 
 ## Corrections recorded
 
-- "#68 defaults are bit-identical" → greedy-identical on the probes; dense ppl +0.036 %.
+- "#68 defaults are bit-identical" → greedy-identical on 3 short probes only; dense ppl +0.036 %;
+  long greedy generations diverge (top-1 46.9 %). Source being bisected (job 259).
 - Strix Halo does ship the `vfused` GDN spine; an earlier note that it did not was wrong.
 - "γ=8 is optimal / γ=16 faults" is unverified on current code (job 253).
