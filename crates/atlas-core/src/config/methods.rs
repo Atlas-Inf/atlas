@@ -258,6 +258,15 @@ impl ModelConfig {
             // Allow rollback via env for A/B testing.
             return std::env::var("ATLAS_GEMMA4_LMHEAD_NVFP4").ok().as_deref() != Some("1");
         }
+        // Qwen3.8-Flash-Next: the checkpoint ships lm_head in BF16 and the
+        // long-form (20K-token single-file) benchmark is exactly the
+        // argmax-flip regime the comment above describes; the 27B recipe
+        // already pins `--lm-head-dtype bf16` for the same reason. Keep the
+        // head at checkpoint precision by default; `--lm-head-dtype nvfp4`
+        // still forces the packed head for the decode-speed trade.
+        if self.model_type == "qwen4_exp" {
+            return true;
+        }
         false
     }
 

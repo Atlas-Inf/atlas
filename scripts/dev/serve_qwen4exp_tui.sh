@@ -19,13 +19,13 @@
 # against 126 GB, but its RESIDENT footprint is smaller (74.9 vs 78.2 GB)
 # because its MTP experts are quantized.
 #
-#   ./serve_qwen4exp_tui.sh                       # Inferact, port 8889
-#   QWEN4EXP_PATH=/path/to/radixark ./serve_qwen4exp_tui.sh
+#   ./scripts/dev/serve_qwen4exp_tui.sh                       # Inferact, port 8889
+#   QWEN4EXP_PATH=/path/to/radixark ./scripts/dev/serve_qwen4exp_tui.sh
 #
 # ONE Atlas instance at a time: --gpu-memory-utilization RESERVES its whole
 # fraction up front, so a second server fails its OOM pre-flight.
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."
 
 SNAP="${QWEN4EXP_PATH:-/tank/hf/hub/models--Inferact--Qwen3.8-Flash-Next-NVFP4/snapshots/129972269565f7f4f664fdf8dd42268d3bbda9fd}"
 if [[ ! -f "$SNAP/config.json" ]]; then

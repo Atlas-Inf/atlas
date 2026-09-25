@@ -2,7 +2,7 @@
 
 //! Debug print helpers + env-gated GDN intermediate dumper for
 //! per-layer numerical comparison vs an HF CPU oracle. See
-//! DEBUGGING_METHODOLOGY.md §3-§5 + bench/longcode/hang-forensics/.
+//! docs/DEBUGGING_METHODOLOGY.md §3-§5 + bench/longcode/hang-forensics/.
 //!
 //! Set `ATLAS_GDN_DUMP=<dir>` to enable, and optionally
 //! `ATLAS_GDN_DUMP_LAYERS=0,15,29` (comma-list of SSM-layer indices) to

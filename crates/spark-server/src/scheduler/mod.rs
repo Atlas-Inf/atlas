@@ -30,6 +30,8 @@ mod finish_guard_tests;
 mod helpers;
 mod lifecycle;
 #[cfg(test)]
+mod lifecycle_cache_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 mod logit_dump;
 mod logit_processors;
@@ -45,6 +47,8 @@ mod mtp_dcut;
 mod mtp_gate;
 mod mtp_step;
 pub(crate) mod mtp_timing;
+#[cfg(test)]
+mod ngram_accounting_tests;
 mod phase_continue_prefills;
 mod phase_promote_prefills;
 mod phase_start_prefills;
@@ -232,6 +236,7 @@ pub fn run(
     max_batch_tokens: usize,
     use_self_speculative: bool,
     use_ngram_speculative: bool,
+    ngram_cache_path: Option<std::path::PathBuf>,
     swap_space_gb: usize,
     high_speed_swap_cfg: Option<spark_storage::HighSpeedSwapConfig>,
     block_size: usize,
@@ -290,7 +295,12 @@ pub fn run(
         None
     };
     let mut ngram_proposer = if use_ngram_speculative {
-        Some(NgramProposer::new(4)) // 4-gram context
+        // Chains cap at the model's verify width (mHC highway has MoE arms
+        // for K=2/3 only → flash-next verifies K=3 max) and at K=4 hard.
+        let chain_cap = num_drafts
+            .min(model.verify_max_drafts().unwrap_or(3))
+            .min(3);
+        Some(NgramProposer::new(4).with_chain_and_cache(chain_cap, ngram_cache_path))
     } else {
         None
     };
@@ -411,6 +421,30 @@ pub fn run(
 
     let mut snapshot_steps: u64 = 0;
     loop {
+        // ── Latched GPU fault: stop scheduling, NOW ──
+        // A destroyed CUDA context is not a per-request failure: every later
+        // driver call in this process returns the same sticky status, so
+        // continuing to loop only produced hours of 500s with the port open
+        // and ~100 GB held (D-4 aftermath — the latch fired, the 503s and the
+        // exit path in `main.rs` were both correct, and this loop never gave
+        // control back to them). Mark every in-flight sequence an engine error
+        // and break: the drain below the loop finishes them with reason
+        // "error" and releases the model, and `main.rs` exits
+        // `EXIT_GPU_FAULT` off the same latch.
+        if let Some(reason) = atlas_core::fault::global().fault() {
+            tracing::error!(
+                "GPU fault latched — scheduler stopping: {reason}; \
+                 finishing {} active sequence(s) with an engine error",
+                active.len()
+            );
+            for a in active.iter_mut() {
+                if a.engine_error.is_none() {
+                    a.engine_error = Some(format!("gpu_fault: {reason}"));
+                }
+                a.finished = true;
+            }
+            break;
+        }
         // ── Drain pending → start prefill (chunked or full) ──
         // The `t_loop_*` brackets attribute the out-of-step GAP the
         // ATLAS_MTP_TIMING summary reports (see mtp_timing::Phase::Gap): each
@@ -727,18 +761,121 @@ pub fn run(
             // place — no parallel accounting, the value below is the one the
             // dispatch chain actually uses.
             let spec_width_ok = active.len() <= mtp_max_seqs();
-            let verify_ctx_limit = model.verify_context_limit();
+            // Conservative bound: multi-sequence verify batches and the
+            // n-gram lane stop at the QSA inert bound. A sequence speculating
+            // ALONE on the MTP lane may go past it when the model serves an
+            // active selection per row (`verify_context_limit` -> `None`).
+            let verify_ctx_limit_batched = model.verify_context_limit_multi_seq();
+            let verify_ctx_limit = mtp_gate::qsa_latch::mtp_verify_limit(
+                active.len(),
+                model.verify_context_limit(),
+                verify_ctx_limit_batched,
+            );
+            // D-2a latch: a sequence admitted just BELOW the bound gets a
+            // verify step that ingests num_drafts + 1 rows ACROSS it, so the
+            // NEXT verify runs with an ACTIVE QSA selection on the batched
+            // ms path — which refuses it and finishes the request. Decline
+            // MTP for any sequence whose next verify could land at/past the
+            // bound; the `disable_mtp` flag makes the log fire once per
+            // sequence and the serial lane serves active QSA per-seq.
+            for a in active.iter_mut() {
+                if !a.disable_mtp
+                    && verify_ctx_limit.is_some_and(|lim| {
+                        mtp_gate::qsa_latch::crosses_inert_bound(a.seq.seq_len, num_drafts, lim)
+                    })
+                {
+                    a.disable_mtp = true;
+                    tracing::info!(
+                        "mtp declined: qsa_active seq_len={} num_drafts={} lim={}",
+                        a.seq.seq_len,
+                        num_drafts,
+                        verify_ctx_limit.unwrap_or(0),
+                    );
+                }
+            }
             if use_mtp {
                 adaptive_rung::note_width_regime(active.len(), spec_width_ok);
+            }
+            // Past the QSA inert bound the verify paths refuse an ACTIVE
+            // selection (VerifyUnsupportedWithActiveQsa) and a verify error
+            // finishes the request — the ngram lane declines to serial the
+            // same way the MTP lane does. Pending drafts are dropped: they
+            // were never forwarded, so discarding them needs no rewind.
+            if use_ngram_speculative
+                && active.len() == 1
+                && verify_ctx_limit_batched.is_some_and(|lim| active[0].seq.seq_len >= lim)
+                && !active[0].pending_drafts.is_empty()
+            {
+                active[0].pending_drafts.clear();
+                active[0].pending_draft_conf.clear();
+            }
+            // Sampled requests decline the ngram lane: the verify pick is
+            // drawn from the sampled distribution, so a deterministic
+            // n-gram draft can only match by coincidence — pure verify
+            // overhead (measured −4% tok/s at temp 0.8 on Flash-Next).
+            // pending_drafts can only have been set under this same gate,
+            // so a non-greedy seq never carries drafts to drain.
+            // A requested-but-declined ngram lane is otherwise INVISIBLE: the
+            // QSA-inert-bound reason fires on every long prompt, silently, and
+            // a serve where the lane never ran is indistinguishable from one
+            // whose table never learned anything. That ambiguity is what made
+            // the 2026-09-15 nvidia pack read as "engages, accepts ~nothing"
+            // (jobqueue 082: 0 proposals in 995 BFCL requests, every one
+            // admitted past `lim`). Probe only — the dispatch chain below is
+            // unchanged, so a serve running both `--speculative` and
+            // `--ngram-speculative` still falls through to MTP.
+            if use_ngram_speculative
+                && active.len() == 1
+                && !(spec_slots_covered
+                    && active[0].grammar_state.is_none()
+                    && active[0].temperature == 0.0
+                    && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim))
+            {
+                tracing::debug!(
+                    "ngram declined: grammar={} temp={} slots_covered={} seq_len={} lim={}",
+                    active[0].grammar_state.is_some(),
+                    active[0].temperature,
+                    spec_slots_covered,
+                    active[0].seq.seq_len,
+                    verify_ctx_limit_batched.unwrap_or(0),
+                );
             }
             if use_ngram_speculative
                 && active.len() == 1
                 && spec_slots_covered
                 && active[0].grammar_state.is_none()
+                && active[0].temperature == 0.0
+                && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
-                    step_ngram(&*model, &mut active, &sched, proposer, &verify_ctx);
+                    // Same accept accounting the serial and verify arms do.
+                    // WITHOUT this the lane is invisible to `a.mtp_acct`, so
+                    // the per-request Done line reports `serial=0.00 mtp=0.00
+                    // p1=0.000 mean_na=0.000 tok_step=1.000` no matter what
+                    // the lane actually accepted — the zero is the DEFAULT of
+                    // an un-fed counter, not a measurement. That vacuous line
+                    // is what made the 2026-09-15 nvidia pack read "engages,
+                    // accepts ~nothing" while the lane's own debug lines
+                    // showed na=1 on 93 of 143 proposals (jobqueue 074). It
+                    // also feeds `usage.completion_tokens_details.
+                    // accepted_prediction_tokens`.
+                    //
+                    // Deliberately NOT `mtp_accept_debug::record`: that
+                    // histogram steers `adaptive_rung`'s MTP dispatch width,
+                    // and mixing n-gram verifies into it would steer one
+                    // lane's regime from the other's statistics.
+                    let seq_len_before = active[0].seq.seq_len;
+                    step_ngram(
+                        &*model,
+                        &mut active,
+                        &sched,
+                        proposer,
+                        adaptive_sampling,
+                        &verify_ctx,
+                    );
+                    let emitted = active[0].seq.seq_len.saturating_sub(seq_len_before);
+                    active[0].mtp_acct.record_verify_emitted(emitted);
                 }
             } else if use_self_speculative
                 && active.len() == 1
@@ -764,6 +901,18 @@ pub fn run(
                 // Declining here just decodes the sequence serially instead.
                 && verify_ctx_limit
                     .is_none_or(|lim| active.iter().all(|a| a.seq.seq_len < lim))
+                // Never run a verify row at a position the serial path would
+                // never reach: a row AT the context ceiling is refused
+                // mid-forward by state sized to --max-seq-len, which ends the
+                // request as "error" on its last "length" step. Declining
+                // decodes serially into the existing force-stop.
+                && active.iter().all(|a| {
+                    mtp_gate::ceiling::verify_rows_fit(
+                        a.seq.seq_len,
+                        num_drafts,
+                        sched.limits.max_seq_len,
+                    )
+                })
                 && (
                     // Both lanes stay serial inside `<think>` unless
                     // ATLAS_DFLASH_SPEC_THINK=1. Resume guard still

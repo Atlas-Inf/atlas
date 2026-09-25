@@ -496,9 +496,44 @@ extern "C" __global__ void hc_pre_finish(
         float mixed = 0.0f;
         if (hc == 4) {
             float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-            for (unsigned int r = 0; r < rank; ++r) {
+            // LOADS IN FLIGHT. nsys (2026-09-06, C=1, 3.9K ctx): this kernel
+            // was 121 us x 97 launches = 11.7 ms of a 69 ms token, ~54 GB/s
+            // on 6.5 MB of `up_w` — latency-bound, as the note above says.
+            // Each `r` step below is one dependent load+FMA per stream and
+            // nvcc does not pipeline a runtime-bound loop, so a warp sat on
+            // one DRAM round trip per `r`. Unrolling `r` by 8 with the 32
+            // loads hoisted ahead of the 32 accumulations puts eight `r`
+            // steps' worth of loads in flight per stream. The accumulation
+            // itself is UNCHANGED: every `a_s` still sums r = 0,1,2,... in
+            // that exact order into one FP32 register, so the result is
+            // bit-for-bit the same as the one-`r`-at-a-time loop — this is
+            // pure scheduling, not reassociation (which the note above
+            // measured moving logits and was rejected).
+            const __nv_bfloat16* ub = up_w + d;
+            unsigned int r = 0;
+            for (; r + 8 <= rank; r += 8) {
+                float l[8];
+                __nv_bfloat16 u0[8], u1[8], u2[8], u3[8];
+                #pragma unroll
+                for (unsigned int k = 0; k < 8; ++k) {
+                    const __nv_bfloat16* u = ub + (size_t)(r + k) * hc_dim;
+                    l[k] = smem_lo[r + k];
+                    u0[k] = u[0];
+                    u1[k] = u[H];
+                    u2[k] = u[2 * H];
+                    u3[k] = u[3 * H];
+                }
+                #pragma unroll
+                for (unsigned int k = 0; k < 8; ++k) {
+                    a0 += (float)u0[k] * l[k];
+                    a1 += (float)u1[k] * l[k];
+                    a2 += (float)u2[k] * l[k];
+                    a3 += (float)u3[k] * l[k];
+                }
+            }
+            for (; r < rank; ++r) {
                 const float lo = smem_lo[r];
-                const __nv_bfloat16* u = up_w + (size_t)r * hc_dim + d;
+                const __nv_bfloat16* u = ub + (size_t)r * hc_dim;
                 a0 += (float)u[0] * lo;
                 a1 += (float)u[H] * lo;
                 a2 += (float)u[2 * H] * lo;
@@ -538,6 +573,101 @@ extern "C" __global__ void hc_pre_finish(
             if (lane == 0) {
                 inj_out[(size_t)t * hc + s2] = 2.0f * qhc_sigmoid(acc * inv_hc);
             }
+        }
+    }
+}
+
+// Stage 3, FOUR-STREAM LAYOUT: one warp per stream, lanes over 32 consecutive
+// output dims. `hc_pre_finish` gives every thread all `hc` streams of one `d`,
+// which caps the kernel at H = 2560 threads per token: 20 blocks of 128 on a
+// 48-SM part, each thread walking four dependent rank-320 chains. nsys
+// (2026-09-06) measured it at 121 us x 97 launches = 11.7 ms of a 69 ms
+// token. This variant puts the same work on 4x the threads: warp `s` of a
+// block owns stream `s` for 32 dims, so a token spans 80 blocks x 4 warps.
+//
+// BIT-EXACT BY CONSTRUCTION. Each (d, s) accumulator still sums
+// r = 0,1,...,rank-1 into one FP32 register in that order (--fmad=false, so
+// multiply then add, exactly as before); the per-stream products
+// sigmoid(a_s) * normed[s*H+d] are the same floats; and `mixed` still folds
+// them in s = 0,1,2,3 order in one thread. Nothing is reassociated — the
+// warp-per-dim shuffle rewrite this file's note rejected split ONE
+// accumulator across lanes; this splits the four INDEPENDENT accumulators
+// across warps.
+extern "C" __global__ void hc_pre_finish_x4(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const float* __restrict__ low,             // [T, rank]
+    const __nv_bfloat16* __restrict__ up_w,    // [rank, hc*H]
+    const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
+    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    float* __restrict__ inj_out,               // [T, hc]
+    const unsigned int hidden_size,
+    const unsigned int hc,                     // must be 4 (host checks)
+    const unsigned int rank
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;        // == stream s
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const float* nx = normed + (size_t)t * hc_dim;
+    const float inv_hc = 1.0f / (float)hc;
+
+    extern __shared__ float smem_lo[];         // [rank]
+    __shared__ float part[4][32];
+    for (unsigned int r = tid; r < rank; r += blockDim.x) {
+        smem_lo[r] = low[(size_t)t * rank + r];
+    }
+    __syncthreads();
+
+    const unsigned int d = blockIdx.y * 32u + lane;
+    if (d < H) {
+        const unsigned int i = warp * H + d;
+        const __nv_bfloat16* ub = up_w + i;
+        float acc = 0.0f;
+        unsigned int r = 0;
+        for (; r + 8 <= rank; r += 8) {
+            float l[8];
+            __nv_bfloat16 u[8];
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) {
+                l[k] = smem_lo[r + k];
+                u[k] = ub[(size_t)(r + k) * hc_dim];
+            }
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) {
+                acc += (float)u[k] * l[k];
+            }
+        }
+        for (; r < rank; ++r) {
+            acc += (float)ub[(size_t)r * hc_dim] * smem_lo[r];
+        }
+        part[warp][lane] = qhc_sigmoid(acc) * nx[i];
+    }
+    __syncthreads();
+    if (warp == 0 && d < H) {
+        float mixed = 0.0f;
+        mixed += part[0][lane];
+        mixed += part[1][lane];
+        mixed += part[2][lane];
+        mixed += part[3][lane];
+        y_out[(size_t)t * H + d] = __float2bfloat16(mixed * inv_hc);
+    }
+
+    // Injection vector: same warp-per-stream contraction as `hc_pre_finish`
+    // (there `s2 = warp; s2 < hc; s2 += warps` with 4 warps is this mapping).
+    if (inject_w != nullptr && blockIdx.y == 0) {
+        const __nv_bfloat16* row = inject_w + (size_t)warp * hc_dim;
+        float acc = 0.0f;
+        for (unsigned int j = lane; j < hc_dim; j += 32) {
+            acc += (float)row[j] * nx[j];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) {
+            inj_out[(size_t)t * hc + warp] = 2.0f * qhc_sigmoid(acc * inv_hc);
         }
     }
 }

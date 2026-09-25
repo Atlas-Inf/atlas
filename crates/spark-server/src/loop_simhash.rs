@@ -31,6 +31,16 @@
 //!
 //! `check` is `O(|A| + |B|)` per ring entry — for typical 10-15
 //! bigrams per sentence and ring=16, ~3-5 µs per call.
+//!
+//! Fenced code blocks (triple-backtick): sentence splitting inside code
+//! is a false-positive source by construction — docstring conventions
+//! make sibling methods near-identical bigram-for-bigram, and code
+//! lines trip the `.`/`:`/blank-line boundaries constantly. The
+//! streaming consumer therefore tracks fence state (`simhash_step`):
+//! inside an unclosed fence no boundary or force-flush is evaluated
+//! and the whole block — up to `FENCE_PENDING_CAP` — is hashed once at
+//! its closing fence. Two identical blocks emitted back to back still
+//! trip, since each close is its own `check`.
 
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
@@ -230,6 +240,115 @@ pub fn ends_at_sentence_boundary(buffer: &str) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Hard bound on `simhash_pending` while inside an unclosed fence —
+/// sentence flush is suspended there, so an over-long (or never-closed)
+/// block would otherwise grow without limit.
+pub const FENCE_PENDING_CAP: usize = 16 * 1024;
+
+/// Count non-overlapping "```" fence markers in `s`, scanning
+/// left-to-right three bytes at a time: a run of four backticks is one
+/// marker plus a stray byte, a run of six is two markers. Deliberately
+/// simple — no line anchoring or language tag handling.
+pub fn count_fence_markers(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut n = 0;
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"```" {
+            n += 1;
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// Drop roughly the older half of `pending`, rounded up to a char
+/// boundary so `drain` never splits a multibyte sequence.
+fn drain_older_half(pending: &mut String) -> usize {
+    let mut drop_to = pending.len() / 2;
+    while !pending.is_char_boundary(drop_to) {
+        drop_to += 1;
+    }
+    pending.drain(..drop_to);
+    drop_to
+}
+
+/// One chunk of the streaming fence-aware sentence-loop state machine.
+/// Appends `chunk` to `pending`, tracks ` ``` ` fences, and runs
+/// `guard.check` at the right flush points. Returns the guard's
+/// duplicate verdict (`true` = semantic loop trip).
+///
+/// - Fence CLOSE this chunk: the whole pending buffer — prose before the
+///   open marker plus the block itself — is hashed once as a single
+///   unit (the F22 design), then cleared. Prose boundaries inside the
+///   same chunk are not evaluated separately; folding the leading prose
+///   into the block's hash is intentional (the alternative — flushing
+///   `pending[..open]` at the open marker — would split a sentence that
+///   runs straight into the fence, a worse false-positive trade).
+/// - Inside an unclosed fence: no `ends_at_sentence_boundary`, no 1KB
+///   force-flush. Past `FENCE_PENDING_CAP` the older half is dropped
+///   (a long block loses part of its hash; the fence state is kept).
+/// - Outside a fence: unchanged F4 behaviour — flush at a sentence
+///   boundary or at 1024 bytes, with the >4096 drain backstop.
+///
+/// `scan` is the caller-held byte offset into `pending` up to which
+/// fence markers have been counted; it is rewound to `len - 2` after
+/// each pass so a marker split across chunks ("`" + "``") is still
+/// counted once it completes.
+pub fn simhash_step(
+    pending: &mut String,
+    in_fence: &mut bool,
+    scan: &mut usize,
+    guard: &mut SimHashLoopGuard,
+    chunk: &str,
+) -> bool {
+    pending.push_str(chunk);
+    let markers = count_fence_markers(&pending[*scan..]);
+    *scan = pending.len().saturating_sub(2);
+    // The rewind target is a byte offset and may land inside a multibyte
+    // char at the chunk tail — walk back so the next call's slice never
+    // panics.
+    while !pending.is_char_boundary(*scan) {
+        *scan -= 1;
+    }
+    let mut closed = false;
+    for _ in 0..markers {
+        *in_fence = !*in_fence;
+        if !*in_fence {
+            closed = true;
+        }
+    }
+
+    if closed {
+        let dup = guard.check(pending);
+        pending.clear();
+        *scan = 0;
+        return dup;
+    }
+    if *in_fence {
+        if pending.len() > FENCE_PENDING_CAP {
+            *scan = scan.saturating_sub(drain_older_half(pending));
+            // `drain_older_half` removes a whole number of chars from the
+            // front, so a boundary stays a boundary (or saturates to 0).
+            debug_assert!(pending.is_char_boundary(*scan));
+        }
+        return false;
+    }
+    let mut dup = false;
+    if ends_at_sentence_boundary(pending).is_some() || pending.len() >= 1024 {
+        dup = guard.check(pending);
+        pending.clear();
+        *scan = 0;
+    }
+    if pending.len() > 4096 {
+        *scan = scan.saturating_sub(drain_older_half(pending));
+        debug_assert!(pending.is_char_boundary(*scan));
+    }
+    dup
 }
 
 #[cfg(test)]

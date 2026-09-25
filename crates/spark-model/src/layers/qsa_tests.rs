@@ -132,6 +132,7 @@ fn qsa_matches_reference() {
         hd,
         ratio,
         budget,
+        /* max_seq_len */ 32768,
         rot,
         theta,
         eps,
@@ -265,3 +266,7 @@ fn qsa_matches_reference() {
 // reachable as `super::*`).
 #[path = "qsa_tests_prefill.rs"]
 mod prefill;
+
+// Device top-k contract (every gathered id is written by the launch).
+#[path = "qsa_tests_topk.rs"]
+mod topk;

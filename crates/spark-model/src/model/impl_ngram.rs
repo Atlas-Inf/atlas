@@ -15,6 +15,7 @@ use spark_runtime::gpu::DevicePtr;
 
 use super::TransformerModel;
 use crate::layers::ops;
+use crate::traits::SequenceState;
 
 impl TransformerModel {
     /// Embed `seq_len` tokens into `out` (`[seq_len, hidden]` BF16).
@@ -61,6 +62,33 @@ impl TransformerModel {
             self.config.hidden_size as u32,
             stream,
         )
+    }
+
+    /// PLE prefill prefetch: the n-gram row ids are a pure function of the
+    /// prompt, so a PLE layer starts its NVMe warm here — once per prefill
+    /// dispatch, before the layer loop — instead of faulting rows on the
+    /// gather's critical path. `from` is the first prompt position this
+    /// dispatch processes. No-op on models without a PLE site (the trait
+    /// default) and cheap even on PLE models: repeat calls pace an existing
+    /// session rather than rebuilding it.
+    pub(crate) fn ple_prefill_warm(
+        &self,
+        tokens: &[u32],
+        from: usize,
+        seq: &mut SequenceState,
+    ) -> Result<()> {
+        if self.config.ple_layer_ids.is_empty() {
+            return Ok(());
+        }
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer.prefill_warm(
+                tokens,
+                from,
+                seq.layer_states[i].as_mut(),
+                self.gpu.as_ref(),
+            )?;
+        }
+        Ok(())
     }
 
     /// How many earlier tokens the n-gram hash reads behind the first token

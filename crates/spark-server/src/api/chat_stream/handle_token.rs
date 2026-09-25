@@ -623,21 +623,17 @@ fn process_detector_content(
     // post-sanitizer text in both call sites.
     let sanitized = sanitized_or_raw;
 
-    // F4 SimHash guard.
+    // F4 SimHash guard — fence-aware sentence-loop state machine
+    // (`simhash_step` owns the rules; this call site only threads the
+    // per-stream state through).
     let semantic_trip = if !state.loop_watchdog_triggered {
-        state.simhash_pending.push_str(sanitized);
-        let mut dup = false;
-        if crate::loop_simhash::ends_at_sentence_boundary(&state.simhash_pending).is_some()
-            || state.simhash_pending.len() >= 1024
-        {
-            dup = state.simhash_guard.check(&state.simhash_pending);
-            state.simhash_pending.clear();
-        }
-        if state.simhash_pending.len() > 4096 {
-            let drop_to = state.simhash_pending.len() / 2;
-            state.simhash_pending.drain(..drop_to);
-        }
-        dup
+        crate::loop_simhash::simhash_step(
+            &mut state.simhash_pending,
+            &mut state.simhash_in_fence,
+            &mut state.simhash_fence_scan,
+            &mut state.simhash_guard,
+            sanitized,
+        )
     } else {
         false
     };

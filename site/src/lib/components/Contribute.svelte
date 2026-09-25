@@ -1,5 +1,6 @@
 <script>
   import { contribute } from '$lib/data.js';
+  import Jobs from './Jobs.svelte';
 </script>
 
 <section id="contribute" class="section-alt">
@@ -17,6 +18,7 @@
         </div>
       {/each}
     </div>
+    <Jobs />
     <p class="cla-line">{contribute.cla}</p>
   </div>
 </section>

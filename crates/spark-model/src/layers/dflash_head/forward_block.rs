@@ -422,7 +422,14 @@ impl BlockDiffusionDraftHead {
         // `ATLAS_DFLASH_PROPOSE_WARMUP_N`) so PTX→SASS JIT, GB10 clock
         // ramp, and L2 warming all happen eagerly before capture freezes
         // a steady-state SASS pick.
+        // defer_readback (the multi-lane path) is additionally excluded:
+        // piecewise capture happens on the lane stream — lane 0 IS the
+        // default stream — and any error between begin_capture/end_capture
+        // leaks capture mode, after which every unrelated-stream op fails
+        // CAPTURE_ISOLATED and every sync on the capturing stream fails 900.
+        // Multi-lane stays eager until per-lane capture ownership is proven.
         let graph_eligible = option_b_on
+            && !defer_readback
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -553,22 +560,48 @@ impl BlockDiffusionDraftHead {
                     // from a half-size buffer (CUDA-700 ILA crash). Draft from
                     // the same NVFP4 head the verifier uses.
                     Some(nvfp4) => {
-                        ops::w4a16_gemm(
-                            gpu,
-                            self.kernels.w4a16_gemm,
-                            norm_noise_local,
-                            nvfp4,
-                            scratch.logits,
-                            self.gamma as u32,
-                            self.vocab_size as u32,
-                            h_local,
-                            stream,
-                        )?;
+                        // γ-row vocab projection: the batchm GEMV streams the
+                        // packed weight ONCE at memory bandwidth; the M64-tile
+                        // w4a16_gemm pads M=γ to 64 rows — ~7/8 of its MMA is
+                        // dead work on γ=8 (rocprof on gfx1151: ~164 ms/step,
+                        // ~75% of propose). Same pick the batched tail makes
+                        // in batch_forward.rs; w4a16_gemm stays the fallback
+                        // for γ>16 / missing tiers.
+                        let gemv_k = match self.gamma as u32 {
+                            1..=4 => self.kernels.w4a16_gemv_batch4,
+                            5..=8 => self.kernels.w4a16_gemv_batch8,
+                            9..=16 => self.kernels.w4a16_gemv_batch16,
+                            _ => spark_runtime::gpu::KernelHandle(0),
+                        };
+                        if gemv_k.0 != 0 {
+                            ops::w4a16_gemv_batchm(
+                                gpu,
+                                gemv_k,
+                                norm_noise_local,
+                                nvfp4,
+                                scratch.logits,
+                                self.gamma as u32,
+                                self.vocab_size as u32,
+                                h_local,
+                                stream,
+                            )?;
+                        } else {
+                            ops::w4a16_gemm(
+                                gpu,
+                                self.kernels.w4a16_gemm,
+                                norm_noise_local,
+                                nvfp4,
+                                scratch.logits,
+                                self.gamma as u32,
+                                self.vocab_size as u32,
+                                h_local,
+                                stream,
+                            )?;
+                        }
                     }
                     None => {
-                        ops::dense_gemm_bf16_pipelined(
+                        self.drafter_dense_gemm(
                             gpu,
-                            self.kernels.dense_gemm_pipelined,
                             norm_noise_local,
                             &crate::weight_map::DenseWeight {
                                 weight: self.lm_head_shared,
@@ -582,9 +615,8 @@ impl BlockDiffusionDraftHead {
                     }
                 }
             } else {
-                ops::dense_gemm_bf16_pipelined(
+                self.drafter_dense_gemm(
                     gpu,
-                    self.kernels.dense_gemm_pipelined,
                     norm_noise_local,
                     &crate::weight_map::DenseWeight {
                         weight: self.lm_head_shared,
@@ -1033,11 +1065,15 @@ impl BlockDiffusionDraftHead {
     }
 
     /// Read drafts deferred by `forward_block(defer_readback=true)`.
-    /// Synchronizes this lane's D2H event, then applies the 1+N reorder.
+    /// Synchronizes this lane's D2H event, applies the 1+N reorder, then
+    /// truncates to `cap` — the same scheduler-K cap the immediate path
+    /// applies (the deferred return otherwise hands verify γ drafts → a
+    /// γ+2-token window the intermediates pools were never sized for).
     pub(super) fn read_deferred_drafts(
         &self,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         scratch: &DflashScratch,
+        cap: usize,
     ) -> Result<Vec<u32>> {
         gpu.event_synchronize(scratch.draft_tokens_event)?;
         let pinned_ptr = scratch
@@ -1052,6 +1088,7 @@ impl BlockDiffusionDraftHead {
         let drafts: Vec<u32> = (1..self.gamma)
             .chain(std::iter::once(0))
             .map(|i| row_order[i])
+            .take(cap)
             .collect();
         Ok(drafts)
     }

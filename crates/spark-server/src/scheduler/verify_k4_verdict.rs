@@ -95,6 +95,7 @@ pub(super) fn k4_apply_verdict(
         if let Err(e) = model.commit_accepted_prefix(&mut a.seq, k_rows, k_rows) {
             // SSM state is no longer trustworthy — terminate, do not continue.
             tracing::error!("commit_accepted_prefix (K={k_rows} accept-{k_rows}): {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }
@@ -114,6 +115,7 @@ pub(super) fn k4_apply_verdict(
                 "commit_accepted_prefix (K={k_rows} accept-{}): {e:#}",
                 na + 1
             );
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
             return;
         }

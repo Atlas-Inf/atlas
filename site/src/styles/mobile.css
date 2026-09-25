@@ -286,3 +286,20 @@ img, svg, video { max-width: 100%; }
   .cc-keyrow-swap, .cm-sources summary { padding-block: 0.55rem; }
   .cm-src { min-height: 42px; align-items: center; }
 }
+
+/* ---- job board (all viewport rules live here) ----------------------------- */
+@media (max-width: 680px) {
+  .jobs { margin-top: 2.5rem; padding-top: 2rem; }
+  .jobs-actions { width: 100%; }
+  .jobs-actions .btn { flex: 1 1 auto; justify-content: center; }
+  .job-post { grid-template-columns: minmax(0, 1fr); padding: 1.1rem 1.05rem; }
+  .jp-foot .btn { width: 100%; justify-content: center; }
+  .jobs-fresh { margin-left: 0; flex-basis: 100%; }
+  .job-card { padding: 1.15rem 1.1rem; }
+}
+@media (pointer: coarse) {
+  .jobs-chip { min-height: 38px; }
+  .job-cta, .job-testers a { padding-block: 0.35rem; }
+  .job-card:hover { transform: none; }
+  .jp-field input, .jp-field select, .jp-field textarea { font-size: 16px; }
+}
