@@ -462,10 +462,16 @@ pub(crate) fn load_model(
     // currently only consulted via `detect_nvfp4_variant`; explicit
     // use at each load site is a follow-up migration.
     let quant_format = spark_model::quant_format::detect_quant_format(&config, &store);
+    // EXL3 has no Nvfp4Variant at all (`base_variant` refuses to guess), so
+    // only ask for it for the formats that do map onto the variant dispatch.
+    let variant = if quant_format.name() == "exl3" {
+        "n/a (exl3)".to_string()
+    } else {
+        format!("{:?}", quant_format.base_variant())
+    };
     tracing::info!(
-        "Quantization format: {} (base variant {:?}), ignored globs = {}",
+        "Quantization format: {} (base variant {variant}), ignored globs = {}",
         quant_format.name(),
-        quant_format.base_variant(),
         match &config.quantization_config {
             Some(qc) => qc.ignore_modules.len(),
             None => 0,

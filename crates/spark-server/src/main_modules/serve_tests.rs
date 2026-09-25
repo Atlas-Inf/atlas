@@ -137,6 +137,17 @@ fn compat_nvfp4_handles_fp8_and_bf16() {
     assert!(quant_pair_compatible("nvfp4", "bf16"));
 }
 
+// EXL3 linears ship in the nvfp4-labeled bundle for this model family
+// (kernels/gb10/qwen3.8-flash-next/nvfp4/), so the pair must be accepted —
+// but only in that direction: an exl3-labeled bundle is not built today,
+// and the BF16 bundle has no EXL3 decode path.
+#[test]
+fn compat_nvfp4_bundle_accepts_exl3_model() {
+    assert!(quant_pair_compatible("nvfp4", "exl3"));
+    assert!(!quant_pair_compatible("bf16", "exl3"));
+    assert!(!quant_pair_compatible("exl3", "nvfp4"));
+}
+
 #[test]
 fn incompat_unknown_rejected() {
     assert!(!quant_pair_compatible("nvfp4", "gptq-4bit"));

@@ -120,6 +120,12 @@ pub fn build_model(
     // ── Step 1: Select weight loader (only model-specific dispatch) ──
     let loader = loader_for_config(&config)?;
 
+    // An EXL3 checkpoint must never reach the variant-based loaders below
+    // (`detect_nvfp4_variant` / `WeightFormat::detect` would guess BF16).
+    // The single refusal lives here; the EXL3 loader branch of a later
+    // milestone replaces this call.
+    crate::quant_format::ensure_not_exl3(&config, "build_model")?;
+
     // ── LoRA adapter load (pre-arena, pre-KV-sizing) ──
     // MUST run before `BufferArena::new` and the `gpu.free_memory()`
     // snapshot below: the pool allocation then lands in `used_so_far`, so

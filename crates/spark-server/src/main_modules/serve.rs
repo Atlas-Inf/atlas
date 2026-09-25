@@ -503,7 +503,12 @@ pub(super) fn quant_pair_compatible(kernel_quant: &str, model_quant: &str) -> bo
         ("nvfp4", "bf16") |
         // BF16 reference bundle handles any quant by dequant on load.
         ("bf16", "fp8") |
-        ("bf16", "nvfp4")
+        ("bf16", "nvfp4") |
+        // The EXL3 kernels for this model family live in the SAME nvfp4
+        // bundle (kernels/gb10/qwen3.8-flash-next/nvfp4/, see M3), so an
+        // nvfp4-labeled build must accept an exl3 checkpoint — the loader
+        // branches on quant_method, not on this string.
+        ("nvfp4", "exl3")
     )
 }
 
