@@ -521,19 +521,7 @@ impl TransformerModel {
         // Final norm + LM head
         let t0 = Instant::now();
         let normed = self.buffers.norm_output();
-        let h = self.config.hidden_size as u32;
-        let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h,
-            eps,
-            stream,
-        )?;
+        self.final_norm_rows(hidden, normed, 1, stream)?;
         self.lm_head(normed, stream)?;
         self.gpu.synchronize(stream)?;
         let head_us = t0.elapsed().as_micros() as u64;
@@ -697,19 +685,7 @@ impl TransformerModel {
 
         // Final norm + LM head
         let normed = self.buffers.norm_output();
-        let h = self.config.hidden_size as u32;
-        let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h,
-            eps,
-            stream,
-        )?;
+        self.final_norm_rows(hidden, normed, 1, stream)?;
         self.lm_head(normed, stream)?;
 
         seq.tokens.push(token);
