@@ -70,7 +70,7 @@ fn chunking_never_changes_the_total_output() {
                 s ^= s << 13;
                 s ^= s >> 7;
                 s ^= s << 17;
-                if s % 4 == 0 {
+                if s.is_multiple_of(4) {
                     cuts.push(b);
                 }
             }

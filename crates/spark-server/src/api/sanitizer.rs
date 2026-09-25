@@ -387,6 +387,34 @@ pub fn primary_arg_for_tool(name: &str, args_json: &str) -> Option<String> {
     None
 }
 
+/// Byte offset where the streaming sanitizer must start holding: the
+/// earliest position `p` in the last `tag_max - 1` bytes such that
+/// `buf[p..]` is a PROPER prefix of some marker (i.e. more bytes could
+/// complete it). Returns `buf.len()` when no such suffix exists, so the
+/// whole buffer is emitted. Always a UTF-8 char boundary.
+pub(crate) fn marker_prefix_hold_start(
+    buf: &str,
+    tag_max: usize,
+    markers: &tool_parser::LeakMarkers,
+) -> usize {
+    let window_start = buf.floor_char_boundary(buf.len().saturating_sub(tag_max.saturating_sub(1)));
+    for (off, _) in buf[window_start..].char_indices() {
+        let p = window_start + off;
+        let tail = &buf[p..];
+        let grows = markers
+            .orphan_open
+            .iter()
+            .chain(markers.close.iter())
+            .chain(markers.envelope_open.iter())
+            .chain(markers.envelope_close.iter())
+            .any(|m| m.len() > tail.len() && m.starts_with(tail));
+        if grows {
+            return p;
+        }
+    }
+    buf.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ToolKind, classify_tool, extract_bash_final_action, primary_arg_for_tool};
@@ -463,32 +491,4 @@ mod tests {
         let out = primary_arg_for_tool("Write", r#"{"content":"fn main(){}"}"#);
         assert_eq!(out, None);
     }
-}
-
-/// Byte offset where the streaming sanitizer must start holding: the
-/// earliest position `p` in the last `tag_max - 1` bytes such that
-/// `buf[p..]` is a PROPER prefix of some marker (i.e. more bytes could
-/// complete it). Returns `buf.len()` when no such suffix exists, so the
-/// whole buffer is emitted. Always a UTF-8 char boundary.
-pub(crate) fn marker_prefix_hold_start(
-    buf: &str,
-    tag_max: usize,
-    markers: &tool_parser::LeakMarkers,
-) -> usize {
-    let window_start = buf.floor_char_boundary(buf.len().saturating_sub(tag_max.saturating_sub(1)));
-    for (off, _) in buf[window_start..].char_indices() {
-        let p = window_start + off;
-        let tail = &buf[p..];
-        let grows = markers
-            .orphan_open
-            .iter()
-            .chain(markers.close.iter())
-            .chain(markers.envelope_open.iter())
-            .chain(markers.envelope_close.iter())
-            .any(|m| m.len() > tail.len() && m.starts_with(tail));
-        if grows {
-            return p;
-        }
-    }
-    buf.len()
 }
