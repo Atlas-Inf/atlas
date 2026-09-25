@@ -35,7 +35,11 @@
 #   starved pool can silently corrupt a leg.
 set -uo pipefail
 
-WT="${WT:-/home/azeez/atlas-dflash2}"
+# WT defaults to the repo containing this script — a hardcoded sibling path
+# silently tests whatever branch that checkout happens to be on (burned a day:
+# atlas-dflash2 had drifted to port/qwen38-strix-linux-followups-r2 while the
+# carry worktree under test was atlas-df2-carry).
+WT="${WT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 BIN=$WT/target/release/spark
 GPU_UTIL="${GPU_UTIL:-0.84}"
 KV_MIN_TOKENS="${KV_MIN_TOKENS:-40000}"   # abort leg if serve lands a pool below this
@@ -66,7 +70,7 @@ fingerprint() {  # <leg> <max_seq> <extra serve flags...>
     echo "drafter=incoai/Qwen3.8-27B-DFlash2 path=$DRAFTER gamma=$GAMMA option_b=${OPTION_B:-1} small_m_gemv=${ATLAS_DFLASH_SMALL_M_GEMV:-default}"
     echo "serve=serve-amd.sh DFLASH=1 GPU_UTIL=$GPU_UTIL request-timeout=900 MAX_SEQ_LEN=$maxseq prefill=$MAX_PREFILL_TOKENS kv=bf16 head=nvfp4 batch=1 ssm-slots=${SSM_SLOTS:-0} ssm-checkpoint-interval=${SSM_CKPT_INTERVAL:-16} dflash-window-size=${DFLASH_WINDOW_SIZE:-0}(full) dflash-ctx-window=${DFLASH_CTX_WINDOW:-$maxseq} mtp=off thinking=off(--disable-thinking) extra='$*'"
     echo "env=ATLAS_W4A16_DP4A=1(default) ATLAS_W4A16_VARIANT=v1 ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_MTP_ACCEPT_DEBUG=1 ATLAS_NO_MTP_DRAFTER_CONTEXT=${ATLAS_NO_MTP_DRAFTER_CONTEXT:-1} HF_HUB_OFFLINE=1"
-    echo "gpu_temp_edge=$(/opt/rocm/bin/amd-smi metric --temperature 2>/dev/null | sed -n 's/.*EDGE: *//p' | head -1)"
+    echo "gpu_temp_edge=$(timeout 15 /opt/rocm/bin/amd-smi metric --temperature 2>/dev/null | sed -n 's/.*EDGE: *//p' | head -1)"
   } | tee "$OUT/$leg-fingerprint.txt"
 }
 
