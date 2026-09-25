@@ -85,6 +85,16 @@ type ShardResolution = (Vec<PathBuf>, Option<HashMap<String, String>>);
 /// (1) model.safetensors.index.json, else consolidated.safetensors.index.json;
 /// (2) single model.safetensors; (3) glob model.safetensors-* / consolidated-*.
 pub(super) fn resolve_shards(dir: &Path) -> Result<ShardResolution> {
+    // The disk loaders merge an EXL3 checkpoint's unindexed side files into the
+    // weight map (see `spark_runtime::weights::side_files`); a manifest built
+    // from the index alone would not be byte-identical to their store. EXL3 is
+    // TP=1 / single-node only and never uses peer staging, so refuse here.
+    if is_exl3_dir(dir)? {
+        bail!(
+            "EXL3 checkpoints are not supported by the RDMA weight peer (TP=1 only; unindexed side files)"
+        );
+    }
+
     let index = dir.join("model.safetensors.index.json");
     let consolidated = dir.join("consolidated.safetensors.index.json");
     let actual = if index.exists() {
@@ -146,6 +156,24 @@ pub(super) fn resolve_shards(dir: &Path) -> Result<ShardResolution> {
         bail!("no safetensor files found in {}", dir.display());
     }
     Ok((shards, None))
+}
+
+/// True when `dir/config.json` declares `quantization_config.quant_method` ==
+/// "exl3" (case-insensitive). Private copy of the check in
+/// `spark_runtime::weights::side_files` — spark-storage cannot call that helper
+/// when its `cuda` feature is off. A missing config is not an EXL3 checkpoint; a
+/// corrupt one is an error, never a silent false.
+fn is_exl3_dir(dir: &Path) -> Result<bool> {
+    let path = dir.join("config.json");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let config: Value = serde_json::from_str(&text)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    let method = config["quantization_config"]["quant_method"].as_str();
+    Ok(method.is_some_and(|m| m.eq_ignore_ascii_case("exl3")))
 }
 
 /// Parse one shard's safetensors header, pushing a [`WeightTensorRecord`]

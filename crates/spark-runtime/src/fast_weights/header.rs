@@ -55,7 +55,10 @@ pub(super) fn resolve_shards(
     if let Some(ip) = actual_index {
         let json = std::fs::read_to_string(&ip)
             .with_context(|| format!("Failed to read {}", ip.display()))?;
-        let index: SafetensorsIndex = serde_json::from_str(&json)?;
+        let mut index: SafetensorsIndex = serde_json::from_str(&json)?;
+        // EXL3 tensors in unindexed side files join the map (no-op otherwise),
+        // so they become shard files below.
+        let _merged = crate::weights::merge_exl3_side_files(model_dir, &mut index.weight_map)?;
         let mut shards: Vec<String> = index
             .weight_map
             .values()

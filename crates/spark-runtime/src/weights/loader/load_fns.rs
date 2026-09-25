@@ -102,7 +102,10 @@ pub(super) fn load_sharded(
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
-    let index: SafetensorsIndex = serde_json::from_str(&index_json)?;
+    let mut index: SafetensorsIndex = serde_json::from_str(&index_json)?;
+    // EXL3 tensors in unindexed side files join the map (no-op otherwise), so
+    // they are grouped into `shard_to_tensors` and estimated below.
+    let _merged = crate::weights::merge_exl3_side_files(model_dir, &mut index.weight_map)?;
 
     let mut offload_logged = false; // Track if we've logged the managed memory fallback
 

@@ -480,9 +480,11 @@ pub(crate) use loader::check_oom_guard;
 pub(crate) use loader::estimate_has_fp8;
 
 mod name_utils;
+mod side_files;
 pub(crate) use name_utils::keeps_raw_f16;
 pub(crate) use name_utils::split_trailing_index;
 pub use name_utils::{is_ngram_table, parse_expert_index};
+pub(crate) use side_files::merge_exl3_side_files;
 
 #[cfg(test)]
 mod exl3_dtype_tests;
