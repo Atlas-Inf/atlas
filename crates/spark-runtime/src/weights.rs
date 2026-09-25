@@ -187,7 +187,7 @@ impl WeightTensor {
 
 /// All model weights loaded onto the GPU, keyed by HuggingFace name.
 pub struct WeightStore {
-    weights: HashMap<String, WeightTensor>,
+    pub(crate) weights: HashMap<String, WeightTensor>,
     /// Pointers freed early by [`WeightStore::reclaim`], recorded so
     /// `release` does not free them a second time.
     ///
@@ -481,6 +481,7 @@ pub(crate) use loader::estimate_has_fp8;
 
 mod name_utils;
 mod side_files;
+mod store_edit;
 pub(crate) use name_utils::keeps_raw_f16;
 pub(crate) use name_utils::split_trailing_index;
 pub use name_utils::{is_ngram_table, parse_expert_index};
@@ -491,6 +492,9 @@ mod exl3_dtype_tests;
 #[cfg(test)]
 mod packed_q2_tests;
 mod prefix_detect;
+#[cfg(test)]
+#[path = "weights/store_edit_tests.rs"]
+mod store_edit_tests;
 pub use prefix_detect::auto_detect_weight_prefix;
 
 /// Release every weight tensor.
