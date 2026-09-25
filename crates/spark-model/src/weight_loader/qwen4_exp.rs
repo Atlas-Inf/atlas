@@ -415,9 +415,9 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
     /// inventing math.
     ///
     /// A ones-filled buffer keeps the shape contract so the footprint can be
-    /// measured at load. The model never applies it: `final_norm_is_identity
-    /// ("qwen4_exp")` makes the model-level final norm a copy, since the
-    /// hyper-connection mixer in the last layer is the final normalization.
+    /// measured at load. The model never applies it: `ModelConfig::
+    /// final_norm_is_identity` makes the model-level final norm a copy, since
+    /// the hyper-connection mixer in the last layer is the final normalization.
     fn load_final_norm(
         &self,
         store: &WeightStore,
