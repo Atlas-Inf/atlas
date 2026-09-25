@@ -98,6 +98,21 @@ __device__ __forceinline__ void store_bf16_pair(__nv_bfloat16* dst, float lo, fl
 // 16.8 s -> 10.9 s with the decode removed, timing-only). A 16-entry LDS LUT
 // read per nibble and a ~9-op branch-free fp32 bit build cost about the same;
 // this is ~4.75 VALU per value and no LDS.
+// (scl_fp8(b) * scale2) * 0.5f, bit-for-bit, in ~7 VALU instead of ~12 plus a
+// multiply. (b & 0x7F) << 20 placed in an fp32 is the E4M3 magnitude rebiased by
+// 2^-120 -- for exponent 0 it is an fp32 DENORMAL, m * 2^-129 -- so * 2^119 gives
+// |E4M3| * 0.5 exactly for normals and subnormals alike (this kernel is built with
+// f32 denormals preserved: .amdhsa_float_denorm_mode_32 3). * scale2 is then the one
+// rounding the reference also takes (x0.5 commutes with rounding in the normal range).
+// Sign by XOR, so a negative scale2 stays right; the NaN byte decodes to 0 as scl_fp8
+// does. Host-simulated: all 256 bytes x 12 global scales (1.7e-12 .. 65000), 0 value
+// mismatches; NaN bytes give +0 where the reference gives -0 (cannot reach the output).
+__device__ __forceinline__ float e4m3_scale_half(unsigned int b, float scale2) {
+    const float mag = __uint_as_float((b & 0x7Fu) << 20) * 0x1p119f;
+    const float v = __uint_as_float(__float_as_uint(mag * scale2) ^ ((b & 0x80u) << 24));
+    return ((b & 0x7Fu) == 0x7Fu) ? 0.0f : v;
+}
+
 __device__ __forceinline__ unsigned int e2m1x4_off12(unsigned int codes) {
     const unsigned int sel = codes & 0x07070707u;
     const unsigned int pos = __builtin_amdgcn_perm(0x18141210u, 0x0F0E0D0Cu, sel);  // 12,13,14,15,16,18,20,24
@@ -827,7 +842,7 @@ void w4a16_gemm_t_m128(
                 _Pragma("unroll") \
                 for (int k = 0; k < 4; k++) { \
                     const int i = d * 4 + k; \
-                    const float svh = (scl_fp8(sc[i]) * scale2) * 0.5f; \
+                    const float svh = e4m3_scale_half(sc[i], scale2); \
                     store_bf16_pair(&smem_B_bf16[(buf)][M128_B_OFF(b_ns + i) + b_kp * 2], \
                         ((float)((tl >> (8 * k)) & 0xFFu) - 12.0f) * svh, \
                         ((float)((th >> (8 * k)) & 0xFFu) - 12.0f) * svh); \
