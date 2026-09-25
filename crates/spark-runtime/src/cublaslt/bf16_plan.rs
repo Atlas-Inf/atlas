@@ -76,6 +76,7 @@ pub(super) fn with_plan<R>(
             map.clear();
         }
         let plan = build(handle, ws_size, m, n, k, op_a)?;
+        tracing::debug!(m, n, k, op_a, cached = map.len() + 1, "cuBLASLt BF16 plan built");
         map.insert(key, plan);
     }
     f(map.get(&key).expect("plan inserted above"))
