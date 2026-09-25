@@ -36,6 +36,8 @@
 
 mod cpu_ref;
 #[cfg(test)]
+pub(crate) mod fixtures;
+#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
 mod weight;
@@ -43,6 +45,8 @@ mod weight;
 #[path = "weight_tests.rs"]
 mod weight_tests;
 
+#[cfg(test)]
+pub(crate) use cpu_ref::{HAD_SCALE, reconstruct as reconstruct_ref};
 pub use cpu_ref::{decode_inner, mul1_decode, reconstruct, tile_states};
 pub use weight::{Exl3Weight, MUL1_TAG, exl3_from_store};
 

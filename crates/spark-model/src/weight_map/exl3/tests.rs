@@ -10,11 +10,9 @@
 //! each stage is pinned on its own: states bit-exact, W_inner bit-exact, then
 //! the assembled f32 weight to the tolerance the f32-vs-f64 Hadamard allows.
 
-use base64::Engine as _;
-use half::f16;
-
 use super::Exl3Shape;
 use super::cpu_ref::{decode_inner, mul1_decode, reconstruct, tile_states};
+use super::fixtures::{fixtures, halves, lanes, shape};
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -26,66 +24,6 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(FNV_PRIME);
     }
     h
-}
-
-#[derive(serde::Deserialize)]
-struct Fixtures {
-    mul1: Mul1,
-    blocks: Vec<Block>,
-}
-
-#[derive(serde::Deserialize)]
-struct Mul1 {
-    table_fnv1a64: String,
-    spots: Vec<[u64; 2]>,
-}
-
-#[derive(serde::Deserialize)]
-struct Block {
-    name: String,
-    bits: u32,
-    in_features: usize,
-    out_features: usize,
-    trellis_i16_b64: String,
-    suh_f16_b64: String,
-    svh_f16_b64: String,
-    states_fnv1a64: String,
-    inner_fnv1a64: String,
-    inner_spots: Vec<[u64; 3]>,
-    w_spots: Vec<[f64; 3]>,
-    w_sum: f64,
-    w_sumsq: f64,
-}
-
-fn fixtures() -> Fixtures {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../bench/exl3/fixtures.json"
-    );
-    let raw = std::fs::read_to_string(path).expect("regenerate with bench/exl3/make_fixtures.py");
-    serde_json::from_str(&raw).expect("fixtures parse")
-}
-
-/// Little-endian lanes of a base64 blob (the fixtures store raw tensor bytes).
-fn lanes(b64: &str) -> Vec<u16> {
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .expect("fixture base64");
-    raw.chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect()
-}
-
-fn halves(b64: &str) -> Vec<f16> {
-    lanes(b64).iter().copied().map(f16::from_bits).collect()
-}
-
-fn shape(b: &Block) -> Exl3Shape {
-    Exl3Shape {
-        in_features: b.in_features,
-        out_features: b.out_features,
-        bits: b.bits,
-    }
 }
 
 /// Every one of the 65536 mul1 codebook entries, bit-exact. The table is shared
