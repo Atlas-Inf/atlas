@@ -339,3 +339,7 @@ fn check_correction_bias_shape(store: &WeightStore, config: &ModelConfig) -> Res
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "preflight_exl3_tests.rs"]
+mod exl3_tests;

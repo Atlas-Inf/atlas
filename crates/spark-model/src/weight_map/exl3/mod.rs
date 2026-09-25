@@ -38,8 +38,13 @@ mod cpu_ref;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+mod weight;
+#[cfg(test)]
+#[path = "weight_tests.rs"]
+mod weight_tests;
 
 pub use cpu_ref::{decode_inner, mul1_decode, reconstruct, tile_states};
+pub use weight::{Exl3Weight, MUL1_TAG, exl3_from_store};
 
 /// The shape of one EXL3 trellis tensor, as derived from its `trellis` dims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
