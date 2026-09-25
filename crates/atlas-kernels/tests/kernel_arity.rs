@@ -162,11 +162,12 @@ fn dflash2_candidate_selector_arity_pin() {
     );
 }
 
-/// The EXL3 reconstruct module is a standalone bundle member (not part of the
-/// w4a16 launch family), so it gets its own pin: every entry takes four params
-/// (out, packed, packed_blocks_n, packed_n_offset) and the launchers in
-/// spark-model must pass exactly four. Update launcher and pin in the same
-/// commit.
+/// The EXL3 module is a standalone bundle member (not part of the w4a16 launch
+/// family), so it gets its own pin: the reconstruct entries take four params
+/// (out, packed, packed_blocks_n, packed_n_offset), the had_r128 entries four
+/// (in, out, scale, r_scale), the conversions three (in, out, n) and the fp16
+/// GEMM six (a, b, c, m, n, k); the launchers in spark-model must pass exactly
+/// that many. Update launcher and pin in the same commit.
 #[test]
 #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
 fn exl3_reconstruct_arity_pin() {
@@ -177,11 +178,17 @@ fn exl3_reconstruct_arity_pin() {
         eprintln!("no compiled PTX in this binary (stub build) — arity pin skipped");
         return;
     }
-    const ENTRIES: &[&str] = &[
-        "exl3_reconstruct_mul1_k3",
-        "exl3_reconstruct_mul1_k4",
-        "exl3_reconstruct_mul1_k5",
-        "exl3_reconstruct_mul1_k6",
+    const ENTRIES: &[(&str, usize)] = &[
+        ("exl3_reconstruct_mul1_k3", 4),
+        ("exl3_reconstruct_mul1_k4", 4),
+        ("exl3_reconstruct_mul1_k5", 4),
+        ("exl3_reconstruct_mul1_k6", 4),
+        ("exl3_had_r128_pre", 4),
+        ("exl3_had_r128_post", 4),
+        ("exl3_had_r128_plain", 4),
+        ("exl3_bf16_to_f16", 3),
+        ("exl3_f16_to_bf16", 3),
+        ("exl3_hgemm_f16", 6),
     ];
     let mut checked = 0usize;
     for set in atlas_kernels::available_targets() {
@@ -192,12 +199,12 @@ fn exl3_reconstruct_arity_pin() {
             if *module != "exl3" {
                 continue;
             }
-            for kernel in ENTRIES {
+            for &(kernel, arity) in ENTRIES {
                 if let Some(count) = ptx_param_count(ptx, kernel) {
                     assert_eq!(
-                        count, 4,
+                        count, arity,
                         "PTX arity drift: {module}::{kernel} on target {} has \
-                         {count} params, pin expects 4 — update the launcher AND \
+                         {count} params, pin expects {arity} — update the launcher AND \
                          this pin together",
                         set.target.model
                     );
@@ -207,7 +214,9 @@ fn exl3_reconstruct_arity_pin() {
         }
     }
     assert!(
-        checked >= 1,
-        "no exl3 reconstruct entry found in any compiled module — registry drift?"
+        checked >= ENTRIES.len(),
+        "exl3 arity test checked only {checked} entries (expected all {}) — \
+         registry drift?",
+        ENTRIES.len()
     );
 }

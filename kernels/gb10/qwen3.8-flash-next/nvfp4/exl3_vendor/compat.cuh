@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Vendored from turboderp-org/exllamav3 @ 6b84a21 (MIT, Copyright (c) 2025 Turboderp); see NOTICE.md.
+// Modifications: none (verbatim except this header block and #pragma once); kept for provenance —
+// hadamard_inner.cuh no longer includes it (the EXL3 linear path uses no activation functions).
 #pragma once
 
 // Approximate tanh

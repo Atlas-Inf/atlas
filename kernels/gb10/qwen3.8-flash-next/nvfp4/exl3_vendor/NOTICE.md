@@ -7,8 +7,10 @@ The `.cuh` files in this directory are adapted from ExLlamaV3 by turboderp-org:
     codebook.cuh        exllamav3_ext/quant/codebook.cuh (trellis codebooks, incl. mul1 decode_3inst<2>)
     exl3_dq.cuh         exllamav3_ext/quant/exl3_dq.cuh (trellis state extraction into MMA fragments)
     reconstruct_tile.cuh exllamav3_ext/quant/reconstruct.cu (reconstruct_tile, lines 12-85)
-    hadamard_inner.cuh  exllamav3_ext/quant/hadamard_inner.cuh (128-wide warp Hadamard)
-    compat.cuh          exllamav3_ext/compat.cuh
+    hadamard_inner.cuh  exllamav3_ext/quant/hadamard_inner.cuh (128-wide warp Hadamard; adapted:
+                        unused variants deleted, see the header's Modifications line)
+    compat.cuh          exllamav3_ext/compat.cuh (verbatim; no longer included by the vendored headers)
+    half4.cuh           exllamav3_ext/util.cuh lines 8-18 (the half4 struct only)
     ptx_frag.cuh        exllamav3_ext/ptx.cuh (fragment types, lines 1-16)
     half_uint16.cuh     exllamav3_ext/util.cuh (half_uint16 union, lines 83-91)
 
