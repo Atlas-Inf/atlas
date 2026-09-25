@@ -8,7 +8,10 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::{BlockDiffusionDraftHead, DflashProposerState, DflashScratch};
+use super::{
+    BlockDiffusionDraftHead, DflashProposerState, DflashScratch, SequenceGeneration,
+    batch_execution,
+};
 use crate::layer::ForwardContext;
 use crate::speculative::ProposerState;
 
@@ -565,10 +568,7 @@ impl BlockDiffusionDraftHead {
         // forward_block returns [mask_1 .. mask_{γ-1}, bonus_0]; the bonus
         // row is NOT a draft (vLLM sample_off=1). Capping at γ sent that
         // extra token into M=γ+1 target verify (~11 ms) for no accept gain.
-        // The startup draft-cap override still applies for generic
-        // ablation; the Lightning product policy rejects any override.
-        let default_k = _num_drafts.min(self.gamma.saturating_sub(1)).max(1);
-        let cap: usize = self.startup.draft_cap_override.unwrap_or(default_k);
+        let cap = self.draft_cap(_num_drafts);
 
         // ATLAS_DFLASH_VERIFY_TRACE=1: log all γ drafts BEFORE the cap so we
         // can see whether the drafter echoes only at position 0 or across
@@ -596,5 +596,150 @@ impl BlockDiffusionDraftHead {
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
         Ok(drafts)
+    }
+
+    /// Draft-count cap shared by the immediate and deferred readback paths:
+    /// scheduler K (`num_drafts` = γ-1) unless the startup ablation override
+    /// is set; the Lightning product policy rejects any override.
+    fn draft_cap(&self, num_drafts: usize) -> usize {
+        let default_k = num_drafts.min(self.gamma.saturating_sub(1)).max(1);
+        self.startup.draft_cap_override.unwrap_or(default_k)
+    }
+
+    /// Multi-lane batched propose: each seq proposes on its pinned lane
+    /// (assigned once at alloc_state — batch position `i` is NOT stable
+    /// across steps, and a seq's captured graphs bake their lane's scratch
+    /// pointers, so the lane must never move). Ordering: (1) one entry
+    /// event on the default stream that every extra lane waits on, so
+    /// default-stream pre-propose writes (drafter-ctx precompute,
+    /// after_verify bookkeeping) are visible before lanes read them;
+    /// (2) per-lane done events the default stream waits on before verify.
+    ///
+    /// Generic DFlash reaches this whenever `ATLAS_DFLASH_PROPOSE_LANES` > 1
+    /// (`propose_batch` skips the Lightning-only Bxgamma seam for generic
+    /// heads); the Lightning/parity path reaches it through the seam tail.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn propose_on_lanes(
+        &self,
+        last_tokens: &[u32],
+        target_hiddens: &[DevicePtr],
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn ProposerState],
+        expected_owners: &[SequenceGeneration],
+        ctx: &ForwardContext,
+    ) -> Result<Vec<Vec<u32>>> {
+        let n = last_tokens.len();
+        let lanes_n = self.lane_count();
+        let cap = self.draft_cap(num_drafts);
+        let default_stream = ctx.gpu.default_stream();
+        ctx.gpu
+            .record_event(self.lanes_start_event, default_stream)?;
+        for l in &self.extra_lanes {
+            ctx.gpu
+                .stream_wait_event(l.stream, self.lanes_start_event)?;
+        }
+        // ENQUEUE phase: launch every lane's propose (readback deferred) so
+        // the GPU overlaps N lanes; a per-lane host sync inside the loop
+        // would serialize them into the old single-stream wall. A lane may
+        // be REUSED within one step (n > lanes): its pinned readback buffer
+        // and event are single-slot, so flush the previous user's drafts
+        // before this enqueue overwrites them.
+        let mut used_lanes: Vec<usize> = Vec::with_capacity(lanes_n.min(n));
+        let mut seen = vec![false; lanes_n];
+        let mut lane_last_use: Vec<Option<usize>> = vec![None; lanes_n];
+        let mut out: Vec<Option<Vec<u32>>> = vec![None; n];
+        let mut lane_scratch_list: Vec<&DflashScratch> = Vec::with_capacity(n);
+        for i in 0..n {
+            let lane = {
+                let dstate = states[i]
+                    .as_any_mut()
+                    .downcast_mut::<DflashProposerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+                batch_execution::resolve_lane_id(dstate.lane_id, lanes_n)?
+            };
+            let (lane_stream, lane_scratch, lane_markov_embed, lane_markov_bias) =
+                self.lane(lane, default_stream);
+            if !seen[lane] {
+                seen[lane] = true;
+                used_lanes.push(lane);
+            }
+            // Flush this lane's previous user BEFORE its single-slot pinned
+            // buffer is overwritten by the enqueue below.
+            if let Some(prev_i) = lane_last_use[lane] {
+                out[prev_i] =
+                    Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[prev_i], cap)?);
+            }
+            lane_last_use[lane] = Some(i);
+            lane_scratch_list.push(lane_scratch);
+            self.propose_drafts_on_lane(
+                lane_scratch,
+                lane_markov_embed,
+                lane_markov_bias,
+                lane,
+                last_tokens[i],
+                target_hiddens[i],
+                positions[i],
+                num_drafts,
+                states[i],
+                Some(expected_owners[i]),
+                ctx,
+                lane_stream,
+                None,
+                None,
+                Some(target_hiddens[i]),
+                true,
+                false,
+            )?;
+        }
+        // COLLECT phase: each lane's D2H event is now recorded; synchronize
+        // and read in batch order. Lane scratch borrows outlive the loop.
+        for i in 0..n {
+            if out[i].is_none() {
+                out[i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[i], cap)?);
+            }
+        }
+        let out: Vec<Vec<u32>> = out.into_iter().map(|o| o.unwrap_or_default()).collect();
+        for (i, drafts) in out.iter().enumerate() {
+            if let Some(dstate) = states[i].as_any_mut().downcast_mut::<DflashProposerState>() {
+                dstate.last_num_drafted = drafts.len();
+            }
+        }
+        if self.startup.diagnostics.verify_trace {
+            for i in 0..n {
+                tracing::info!(
+                    "DFLASH BATCH TRACE collect: i={} lane={} token_in={} position={} drafts={:?}",
+                    i,
+                    {
+                        states[i]
+                            .as_any_mut()
+                            .downcast_mut::<DflashProposerState>()
+                            .map(|d| d.lane_id)
+                            .unwrap_or(usize::MAX)
+                    },
+                    last_tokens[i],
+                    positions[i],
+                    out[i],
+                );
+            }
+        }
+        // Ordering: the verify step runs on the default stream. Record each
+        // lane's done-event on its own stream, then make the default stream
+        // wait on every lane before returning.
+        for lane in used_lanes {
+            let l = if lane == 0 {
+                None
+            } else {
+                Some(&self.extra_lanes[lane - 1])
+            };
+            match l {
+                Some(l) => {
+                    ctx.gpu.record_event(l.done_event, l.stream)?;
+                    ctx.gpu.stream_wait_event(default_stream, l.done_event)?;
+                }
+                None => { /* lane 0 IS the default stream; nothing to hand off */ }
+            }
+        }
+        Ok(out)
     }
 }

@@ -39,7 +39,7 @@ metadata:
     2191-token prompt no longer fails layer 1 by default. `ATLAS_PLE_MAX_TOKENS`
     is now only an OVERRIDE to trade PLE headroom for KV memory; setting it
     below the derived floor logs a warning and risks refused prefills.
-    `serve_qwen4exp_tui.sh` still sets it explicitly above 8K.
+    `scripts/dev/serve_qwen4exp_tui.sh` still sets it explicitly above 8K.
 
     SPECULATIVE IS OFF BY MEASUREMENT, NOT BY REFUSAL — AND ONE DRAFT WINS.
     It used to be a refusal: the MTP block is not the `MtpWeights` shape any

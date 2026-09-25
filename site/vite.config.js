@@ -28,10 +28,12 @@ function atlasGenerators() {
       run('gen-gates.mjs');
       run('gen-ladder.mjs');
       // Best-effort: gh/network flakiness must never fail the build.
-      try {
-        run('gen-stars.mjs');
-      } catch (err) {
-        this.warn(`gen-stars failed (non-fatal): ${err && err.message ? err.message : err}`);
+      for (const script of ['gen-stars.mjs', 'gen-jobs.mjs']) {
+        try {
+          run(script);
+        } catch (err) {
+          this.warn(`${script} failed (non-fatal): ${err && err.message ? err.message : err}`);
+        }
       }
     }
   };

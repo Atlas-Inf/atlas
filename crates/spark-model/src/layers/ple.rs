@@ -58,4 +58,12 @@ pub mod dump;
 mod layer;
 
 pub use ids::{PleIdDims, ple_ngram_ids};
+// Both are consumed by the `cuda`-gated weight loader (the row-cache sizing
+// and the warm window) and by `ple/tests.rs`, which a non-test build does not
+// compile — so a `metal` build sees them as unused. Not dead: the loaders that
+// call them cannot exist without CUDA.
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
+pub(crate) use layer::bounded_scratch;
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
+pub(crate) use layer::warm::warm_ahead_tokens;
 pub use layer::{PleLayer, PleSeqState, PleWeights};

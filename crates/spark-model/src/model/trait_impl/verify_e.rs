@@ -46,21 +46,21 @@ impl TransformerModel {
     /// rows each (ragged since D-Cut).
     ///
     /// Self-gates to the envelope verify_e was built and audited for:
-    /// non-EP, non-HSS, non-DFlash, no LoRA (the uniform seq_slot upload
+    /// non-EP, non-HSS, no LoRA (the uniform seq_slot upload
     /// carries ONE adapter slot), MTP proposer present (stash allocated,
-    /// `VERIFY_WY_TABLE_SEQS` = 32 slots ⇒ n ≤ 32), EVERY `ks[i]` in 2..=4
-    /// (the MTP ladder range; intermediates pools are sized for the
-    /// configured max K), and R = Σ ks ≤ `VERIFY_ROW_CAP` = 96 (the exact
-    /// logits-rows / meta-gap / bt-staging capacity — sizes.rs). Everything
-    /// outside falls back to the per-seq loop.
+    /// `VERIFY_WY_TABLE_SEQS` = 32 slots ⇒ n ≤ 32), and R = Σ ks ≤
+    /// `VERIFY_ROW_CAP` = 96 (the exact logits-rows / meta-gap / bt-staging
+    /// capacity — sizes.rs). Per-seq row counts are gated by
+    /// [`Self::verify_batch_ks_ok`]: the MTP ladder range 2..=4 on the
+    /// non-DFlash envelope, or the DFlash hidden-save geometry when a drafter
+    /// is armed. Everything outside falls back to the per-seq loop.
     pub(super) fn can_batch_verify_dispatch(&self, ks: &[usize]) -> bool {
         let n = ks.len();
         (2..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
-            && ks.iter().all(|k| (2..=4).contains(k))
+            && self.verify_batch_ks_ok(ks)
             && ks.iter().sum::<usize>() <= super::verify_e2::VERIFY_ROW_CAP
             && self.comm.is_none()
             && self.lora.is_none()
-            && self.dflash_hidden_save.is_none()
             && !self.verify_hidden_stash.is_null()
             // HSS: the paged-decode kernel reads HBM only, missing on-disk
             // history (see verify_c2's HSS fallback) — batched path unsupported.
@@ -72,8 +72,33 @@ impl TransformerModel {
                 .is_none()
     }
 
+    /// Per-sequence verify row-count bound — the single source both
+    /// [`Self::can_batch_verify_dispatch`] and the dispatch's entry `ensure!`
+    /// consult so the gate and the forward can never disagree.
+    ///
+    /// MTP mode (no DFlash hidden-save): the audited ladder range 2..=4, and
+    /// the SSM intermediates pools are sized for the configured max K.
+    ///
+    /// DFlash mode (`dflash_hidden_save` armed): the verify rows are uniform
+    /// γ+1 (γ=8 ⇒ k=8, outside the ladder range) and the batch additionally
+    /// needs one slot-indexed hidden-save region per sequence — the arena
+    /// has `dflash_hidden_save_nseq` of them (sized `max_batch_size`, plus a
+    /// preserve tail for the C=1 front). R ≤ `VERIFY_ROW_CAP` still applies
+    /// on top, so γ=8 chunks cap at 12 sequences (`mtp_dcut::chunk_ranges`
+    /// derives the same cap from the row budget).
+    fn verify_batch_ks_ok(&self, ks: &[usize]) -> bool {
+        if self.dflash_hidden_save.is_some() {
+            ks.iter()
+                .all(|&k| (2..=self.dflash_hidden_save_rows).contains(&k))
+                && ks.len() <= self.dflash_hidden_save_nseq
+        } else {
+            ks.iter().all(|k| (2..=4).contains(k))
+        }
+    }
+
     /// Batched K-row verify for `n = seqs.len()` sequences (R = Σ ks rows,
-    /// each `ks[i]` = that sequence's drafts+1 in 2..=4, ragged since D-Cut).
+    /// each `ks[i]` = that sequence's drafts+1 — 2..=4 under the MTP ladder,
+    /// γ+1 under DFlash, ragged since D-Cut).
     ///
     /// Row `off_i + j` is sequence i's token j (its slice of `tokens` is
     /// `[last_verified, d0, .., d_{ks[i]-2}]`, flat seq-major). Weight-bearing
@@ -114,12 +139,24 @@ impl TransformerModel {
         }
         off.push(acc);
         let r_total = acc;
+        // DFlash: per-layer capture needs each sequence's STABLE owner slot —
+        // the capture regions are slot-indexed (`try_dflash_capture_batched_at`),
+        // never batch-positioned, because the batch reorders on churn and a
+        // position-keyed write would hand the re-propose a dead sequence's
+        // hiddens. Resolved here, before the iter_mut walks below. `None` on
+        // the non-DFlash envelope.
+        let dflash_save_slots: Option<Vec<usize>> = if self.dflash_hidden_save.is_some() {
+            let mut v = Vec::with_capacity(n);
+            for s in seqs.iter() {
+                v.push(s.dflash_hidden_save_slot()?);
+            }
+            Some(v)
+        } else {
+            None
+        };
         let k_max = ks.iter().copied().max().unwrap_or(0);
         ensure!(
-            n >= 2
-                && ks.len() == n
-                && ks.iter().all(|k| (2..=4).contains(k))
-                && tokens.len() == r_total,
+            n >= 2 && ks.len() == n && self.verify_batch_ks_ok(ks) && tokens.len() == r_total,
             "batched verify: n={n} ks={ks:?} tokens={}",
             tokens.len()
         );
@@ -201,8 +238,18 @@ impl TransformerModel {
         // Per-layer DFlash timing must see real launches, not one replayed
         // graph, so it disables capture the same way k4 diag does.
         let time_layers = std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
-        let graphs_on =
-            super::verify_e2::verify_graphs_enabled() && !k4_diag && !layer_veto && !time_layers;
+        // DFlash veto: the capture's copy destinations are owner-slot regions
+        // (generation-scoped, immutable across ssm-slot reuse) — NOT a pure
+        // function of the (ssm_slot, k) graph key. A replayed graph could
+        // bake a dead generation's regions and write another sequence's
+        // hiddens. Eager forward still collapses the per-seq weight reads —
+        // the scaling win — while a proper owner-in-key (or owner-in-entry)
+        // replay is follow-up.
+        let graphs_on = super::verify_e2::verify_graphs_enabled()
+            && !k4_diag
+            && !layer_veto
+            && !time_layers
+            && dflash_save_slots.is_none();
         let graph_key = if graphs_on {
             self.verify_batched_graph_key(&*seqs, ks, wy_tables_base.is_null())
         } else {
@@ -531,6 +578,23 @@ impl TransformerModel {
                         &mut kv_cache,
                         wy_slice,
                         &ctx,
+                        stream,
+                    )?;
+                }
+
+                // DFlash hidden capture, same contract as the serial K=γ
+                // path's `try_dflash_capture_all` (verify_d.rs): every verify
+                // row's post-layer hidden lands in the sequence's
+                // owner-slot-indexed region, so the deferred batched propose
+                // reads the accepted row. Early-returns on non-capture
+                // layers. This lane runs eager — the graphs veto above keeps
+                // owner-scoped copy destinations out of replayed graphs.
+                if let Some(ref save_slots) = dflash_save_slots {
+                    self.try_dflash_capture_batched_at(
+                        layer_idx,
+                        ks,
+                        &off,
+                        Some(save_slots.as_slice()),
                         stream,
                     )?;
                 }

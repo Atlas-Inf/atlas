@@ -28,6 +28,8 @@ docker/gb10/spark-fastbin
 /site/build/
 /site/.svelte-kit/
 /site/.vite/
+# Cloudflare wrangler cache: holds the deploying account id and account name.
+.wrangler/
 
 # Editor / agent scratch. `.claude/skills/` is deliberately TRACKED — repo
 # skills (atlas-release, measurement-discipline) are shared process, not

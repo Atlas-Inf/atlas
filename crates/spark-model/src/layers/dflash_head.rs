@@ -881,6 +881,12 @@ impl DraftProposer for BlockDiffusionDraftHead {
     ) -> usize {
         if self.startup.native_batch_authoritative || self.startup.diagnostics.batch_parity {
             self.batch_capacity
+        } else if self.lane_count() > 1 {
+            // Generic multi-lane (ATLAS_DFLASH_PROPOSE_LANES > 1): each seq
+            // proposes on its pinned lane stream, so the batched entry can
+            // produce output at the full admission width even though the
+            // Lightning Bxgamma seam (gamma == 4 contract) never applies.
+            self.batch_capacity
         } else {
             1
         }
@@ -1042,6 +1048,44 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // Lightning product and explicit parity both enter the native B1 path.
         if n == 0 || (n == 1 && !(native_authoritative || self.startup.diagnostics.batch_parity)) {
             return Ok(None);
+        }
+        let consume_native = native_authoritative || self.startup.diagnostics.batch_parity;
+        if !consume_native {
+            // Generic DFlash never consumes the Lightning Bxgamma seam below:
+            // its gamma == 4 contract rejects this head's row shape and the
+            // staged native rows would be discarded anyway. Dispatch directly —
+            // serial on the single lane, or the overlapped per-lane enqueue
+            // when ATLAS_DFLASH_PROPOSE_LANES > 1.
+            if self.lane_count() == 1 {
+                let mut serial = Vec::with_capacity(n);
+                for i in 0..n {
+                    serial.push(self.propose_drafts(
+                        last_tokens[i],
+                        target_hiddens[i],
+                        positions[i],
+                        num_drafts,
+                        states[i],
+                        Some(expected_owners[i]),
+                        ctx,
+                        stream,
+                        None,
+                        None,
+                        Some(target_hiddens[i]),
+                    )?);
+                }
+                return Ok(Some(serial));
+            }
+            return self
+                .propose_on_lanes(
+                    last_tokens,
+                    target_hiddens,
+                    positions,
+                    num_drafts,
+                    states,
+                    expected_owners,
+                    ctx,
+                )
+                .map(Some);
         }
         if self.startup.diagnostics.batch_parity {
             tracing::info!("DFlash Bxgamma parity dispatch: batch={n}");
@@ -1355,117 +1399,18 @@ impl DraftProposer for BlockDiffusionDraftHead {
             }
             return Ok(Some(serial));
         }
-        // Multi-lane: each seq proposes on its pinned lane (assigned once at
-        // alloc_state — batch position `i` is NOT stable across steps, and a
-        // seq's captured graphs bake their lane's scratch pointers, so the
-        // lane must never move). Ordering: (1) one entry event on the
-        // default stream that every extra lane waits on, so default-stream
-        // pre-propose writes (drafter-ctx precompute, after_verify
-        // bookkeeping) are visible before lanes read them; (2) per-lane
-        // done events the default stream waits on before verify.
-        let default_stream = ctx.gpu.default_stream();
-        ctx.gpu
-            .record_event(self.lanes_start_event, default_stream)?;
-        for l in &self.extra_lanes {
-            ctx.gpu
-                .stream_wait_event(l.stream, self.lanes_start_event)?;
-        }
-        // ENQUEUE phase: launch every lane's propose (readback deferred) so
-        // the GPU overlaps N lanes; a per-lane host sync inside the loop
-        // would serialize them into the old single-stream wall. A lane may
-        // be REUSED within one step (n > lanes): its pinned readback buffer
-        // and event are single-slot, so flush the previous user's drafts
-        // before this enqueue overwrites them.
-        let mut used_lanes: Vec<usize> = Vec::with_capacity(lanes_n.min(n));
-        let mut seen = vec![false; lanes_n];
-        let mut lane_last_use: Vec<Option<usize>> = vec![None; lanes_n];
-        let mut out: Vec<Option<Vec<u32>>> = vec![None; n];
-        let mut lane_scratch_list: Vec<&DflashScratch> = Vec::with_capacity(n);
-        for i in 0..n {
-            let lane = {
-                let dstate = states[i]
-                    .as_any_mut()
-                    .downcast_mut::<DflashProposerState>()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
-                batch_execution::resolve_lane_id(dstate.lane_id, lanes_n)?
-            };
-            let (lane_stream, lane_scratch, lane_markov_embed, lane_markov_bias) =
-                self.lane(lane, default_stream);
-            if !seen[lane] {
-                seen[lane] = true;
-                used_lanes.push(lane);
-            }
-            // Flush this lane's previous user BEFORE its single-slot pinned
-            // buffer is overwritten by the enqueue below.
-            if let Some(prev_i) = lane_last_use[lane] {
-                out[prev_i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[prev_i])?);
-            }
-            lane_last_use[lane] = Some(i);
-            lane_scratch_list.push(lane_scratch);
-            self.propose_drafts_on_lane(
-                lane_scratch,
-                lane_markov_embed,
-                lane_markov_bias,
-                lane,
-                last_tokens[i],
-                target_hiddens[i],
-                positions[i],
-                num_drafts,
-                states[i],
-                Some(expected_owners[i]),
-                ctx,
-                lane_stream,
-                None,
-                None,
-                Some(target_hiddens[i]),
-                true,
-                false,
-            )?;
-        }
-        // COLLECT phase: each lane's D2H event is now recorded; synchronize
-        // and read in batch order. Lane scratch borrows outlive the loop.
-        for i in 0..n {
-            if out[i].is_none() {
-                out[i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[i])?);
-            }
-        }
-        let out: Vec<Vec<u32>> = out.into_iter().map(|o| o.unwrap_or_default()).collect();
-        if self.startup.diagnostics.verify_trace {
-            for i in 0..n {
-                tracing::info!(
-                    "DFLASH BATCH TRACE collect: i={} lane={} token_in={} position={} drafts={:?}",
-                    i,
-                    {
-                        states[i]
-                            .as_any_mut()
-                            .downcast_mut::<DflashProposerState>()
-                            .map(|d| d.lane_id)
-                            .unwrap_or(usize::MAX)
-                    },
-                    last_tokens[i],
-                    positions[i],
-                    out[i],
-                );
-            }
-        }
-        // Ordering: the verify step runs on the default stream. Record each
-        // lane's done-event on its own stream, then make the default stream
-        // wait on every lane before returning.
-        for lane in used_lanes {
-            let l = if lane == 0 {
-                None
-            } else {
-                Some(&self.extra_lanes[lane - 1])
-            };
-            match l {
-                Some(l) => {
-                    ctx.gpu.record_event(l.done_event, l.stream)?;
-                    ctx.gpu.stream_wait_event(default_stream, l.done_event)?;
-                }
-                None => { /* lane 0 IS the default stream; nothing to hand off */ }
-            }
-        }
-        Ok(Some(out))
+        // Multi-lane: each seq proposes on its pinned lane — see
+        // `propose_on_lanes` for the enqueue/collect ordering contract.
+        self.propose_on_lanes(
+            last_tokens,
+            target_hiddens,
+            positions,
+            num_drafts,
+            states,
+            expected_owners,
+            ctx,
+        )
+        .map(Some)
     }
 
     fn after_verify(

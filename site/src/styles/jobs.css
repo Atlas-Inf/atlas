@@ -1,0 +1,77 @@
+/* =============================================================================
+   Job board, inside the contribute section (Jobs.svelte).
+   Cards reuse the contrib/road card stock. Status pills: open is the accent,
+   taken is amber, done is the verify green. Viewport rules live in mobile.css.
+   ========================================================================== */
+
+.jobs { margin-top: 3.25rem; padding-top: 2.5rem; border-top: 1px solid var(--border); scroll-margin-top: 120px; }
+.jobs-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
+.jobs-title { font-size: 1.35rem; font-weight: 800; letter-spacing: -0.02em; display: flex; align-items: center; gap: 0.65rem; flex-wrap: wrap; }
+.jobs-count { font-size: 0.7rem; font-weight: 700; padding: 0.2rem 0.55rem; border-radius: 999px; background: var(--accent-soft); color: var(--accent-deep); letter-spacing: 0.02em; }
+.jobs-sub { font-size: 0.92rem; color: var(--t2); max-width: 60ch; margin-top: 0.45rem; line-height: 1.6; }
+.jobs-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+.jobs-actions .btn { padding: 0.6rem 1.1rem; font-size: 0.86rem; }
+
+/* ---- post form (collapsed until "Post a job") ----------------------------- */
+.job-post { display: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem 1.1rem; margin-top: 1.5rem; padding: 1.3rem 1.4rem; background: var(--card); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow-sm); }
+.job-post.is-open { display: grid; }
+.jp-field { display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
+.jp-field > span { font-family: var(--font-mono); font-size: 0.68rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--t2); }
+.jp-field input, .jp-field select, .jp-field textarea {
+  font: inherit; font-size: 0.9rem; color: var(--t1); background: var(--bg); border: 1px solid var(--border-strong);
+  border-radius: 8px; padding: 0.55rem 0.7rem; width: 100%; min-width: 0;
+}
+.jp-field textarea { resize: vertical; line-height: 1.5; }
+.jp-field input:focus, .jp-field select:focus, .jp-field textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.jp-wide { grid-column: 1 / -1; }
+.jp-foot { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.jp-note { font-size: 0.8rem; color: var(--t3); }
+
+/* ---- filters ---------------------------------------------------------------- */
+.jobs-filters { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; margin-top: 1.5rem; }
+.jobs-chip { font: inherit; font-size: 0.8rem; font-weight: 650; color: var(--t2); background: transparent; border: 1px solid var(--border-strong); border-radius: 999px; padding: 0.3rem 0.8rem; cursor: pointer; transition: border-color 0.15s, color 0.15s, background 0.15s; }
+.jobs-chip:hover { border-color: var(--accent); color: var(--accent); }
+.jobs-chip[aria-pressed='true'] { background: var(--t1); border-color: var(--t1); color: var(--bg); }
+.jobs-chip-quiet { border-style: dashed; }
+.jobs-fresh { margin-left: auto; font-size: 0.68rem; color: var(--t3); }
+
+/* ---- cards -------------------------------------------------------------------- */
+.jobs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 1.1rem; margin-top: 1.1rem; }
+.jobs-grid > * { min-width: 0; }
+.job-card { display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.2rem 1.3rem; box-shadow: var(--shadow-sm); transition: border-color 0.2s, transform 0.2s; }
+.job-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.job-card.is-done { opacity: 0.72; }
+.job-top { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; margin-bottom: 0.65rem; }
+.job-status, .job-kind { font-family: var(--font-mono); font-size: 0.64rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 0.2rem 0.5rem; border-radius: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.job-status-open { background: var(--accent-soft); color: var(--accent-deep); }
+.job-status-taken { background: rgba(154,106,26,0.12); color: var(--amber); text-transform: none; letter-spacing: 0.02em; }
+.job-status-done { background: var(--green-soft); color: var(--green); }
+.job-kind { color: var(--t3); border: 1px solid var(--border); }
+.job-card h4 { font-size: 0.98rem; font-weight: 750; line-height: 1.35; }
+.job-card h4 a { color: var(--t1); text-decoration: none; }
+.job-card h4 a:hover { color: var(--accent); }
+.job-model { font-size: 0.74rem; color: var(--t2); margin-top: 0.3rem; overflow-wrap: anywhere; }
+.job-what { font-size: 0.85rem; color: var(--t2); line-height: 1.55; margin-top: 0.6rem; display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.job-radius { align-self: flex-start; margin-top: 0.8rem; font-size: 0.74rem; font-weight: 650; padding: 0.22rem 0.55rem 0.22rem 1.25rem; border-radius: 6px; position: relative; max-width: 100%; }
+.job-radius::before { content: ''; position: absolute; left: 0.5rem; top: 0.72em; width: 0.4rem; height: 0.4rem; border-radius: 50%; background: currentColor; }
+.job-radius-contained { background: var(--green-soft); color: var(--green); }
+.job-radius-shared { background: rgba(154,106,26,0.12); color: var(--amber); }
+.job-radius-unknown { background: var(--bg2); color: var(--t2); }
+.job-radius-detail { font-weight: 500; }
+.job-testers { font-size: 0.8rem; color: var(--t2); margin-top: 0.6rem; overflow-wrap: anywhere; }
+.job-testers-label { font-family: var(--font-mono); font-size: 0.66rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--t3); margin-right: 0.4rem; }
+.job-testers a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.job-testers a:hover { text-decoration: underline; }
+.job-foot { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-top: auto; padding-top: 0.95rem; }
+.job-meta { font-size: 0.7rem; color: var(--t3); }
+.job-cta { font-size: 0.82rem; font-weight: 700; color: var(--accent); text-decoration: none; white-space: nowrap; }
+.job-cta:hover { text-decoration: underline; }
+
+/* ---- empty board --------------------------------------------------------------- */
+.job-empty { margin-top: 1.1rem; padding: 2rem 1.5rem; border: 1.5px dashed var(--border-strong); border-radius: 12px; text-align: center; }
+.job-empty p { color: var(--t2); font-size: 0.92rem; margin-bottom: 1rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  .job-card, .jobs-chip { transition: none; }
+  .job-card:hover { transform: none; }
+}

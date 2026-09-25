@@ -451,20 +451,40 @@ pub fn build_model(
         }
     }
 
+    // SSM state/snapshot pools MUST be allocated before the
+    // `gpu.free_memory()` snapshot below: whatever is live at that point
+    // lands in `used_so_far` and shrinks the KV budget automatically
+    // (positional budgeting — the LoRA adapter load above documents the
+    // same rule). These pools used to be built inside
+    // `TransformerModel::new`, after KV sizing, so at long --max-seq-len
+    // they overflowed the physical remainder and boot died in cuMemAlloc
+    // (Atlas-Inf/atlas#61).
+    let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
+    let ssm_pools = crate::model::ssm_pools::SsmPools::new(
+        &config,
+        max_batch_size,
+        self_speculative,
+        use_speculative,
+        mtp_weights.is_empty(),
+        draft_lm_head_nvfp4.is_some(),
+        num_drafts,
+        ssm_cache_slots,
+        gpu.as_ref(),
+    )?;
+
     // Materialize the inference reserve as a "balloon" allocation held across
     // KV residual sizing, then freed right after the KV pool claims its
     // blocks. The reserve is already deducted from the KV budget below, so
     // holding it costs nothing — but WITHOUT holding it, the bytes are just
-    // "not claimed by KV": the ~100 mid-size allocs that follow (Marconi
-    // snapshot pool's per-layer regions, drafter KV, NVFP4 quantize staging)
-    // land in whatever the earlier allocs left behind, and on a unified-
-    // memory APU that tail fragments enough that a ~45MB staging alloc fails
-    // with GBs nominally free. Holding the reserve contiguously guarantees
-    // the post-KV allocs get a clean region. If the balloon itself can't
-    // allocate we fall back to the previous behavior — nothing breaks, the
-    // late allocs just take their chances as before.
-    // The reserve covers the target model's SSM pools + Marconi + headroom;
-    // the drafter's own post-KV allocs are held by the second balloon below.
+    // "not claimed by KV": the mid-size allocs that follow (drafter KV,
+    // NVFP4 quantize staging, CUDA graph capture) land in whatever the
+    // earlier allocs left behind, and on a unified-memory APU that tail
+    // fragments enough that a ~45MB staging alloc fails with GBs nominally
+    // free. Holding the reserve contiguously guarantees the post-KV allocs
+    // get a clean region. If the balloon itself can't allocate we fall back
+    // to the previous behavior — nothing breaks, the late allocs just take
+    // their chances as before.
+    // The drafter's own post-KV allocs are held by the second balloon below.
     let balloon_bytes = inference_reserve;
     let balloon = if balloon_bytes > 0 {
         match gpu.alloc(balloon_bytes) {
@@ -480,12 +500,12 @@ pub fn build_model(
     } else {
         None
     };
-    // The freed reserve region is consumed by ~100 small allocs (Marconi's
-    // per-layer regions, MTP head, GDN buffers) and ends up shredded — the
-    // drafter's NVFP4 staging (44+ MB contiguous per GEMM) still dies. A
-    // second balloon stays held through model construction and is freed only
-    // just before the drafter build below, so those allocs get a region no
-    // earlier alloc was allowed to fragment.
+    // The freed reserve region is consumed by mid-size allocs (MTP head,
+    // GDN buffers) and ends up shredded — the drafter's NVFP4 staging
+    // (44+ MB contiguous per GEMM) still dies. A second balloon stays held
+    // through model construction and is freed only just before the drafter
+    // build below, so those allocs get a region no earlier alloc was
+    // allowed to fragment.
     let drafter_balloon = if dflash_args.is_some() {
         match gpu.alloc(3 << 29) {
             Ok(ptr) => Some(ptr),
@@ -762,10 +782,10 @@ pub fn build_model(
         mtp_vocab_size,
         comm,
         self_speculative,
-        num_drafts,
         vision_encoder,
         ssm_cache_slots,
         ssm_checkpoint_interval,
+        ssm_pools,
     )?;
 
     // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──

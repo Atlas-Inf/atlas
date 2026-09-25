@@ -336,7 +336,7 @@ cargo run --release -p atlas-core --example qwen4exp_forward -- <ckpt> /fx/promp
 #    ^ and confirm it now appends 8, not 9
 
 # 7. serve
-./serve_qwen4exp_tui.sh                  # raises ATLAS_PLE_MAX_TOKENS itself above 8K
+./scripts/dev/serve_qwen4exp_tui.sh                  # raises ATLAS_PLE_MAX_TOKENS itself above 8K
 ```
 
 If step 7 misbehaves, the kill switches are the bisect: `ATLAS_QSA_DISABLE=1`,
@@ -534,7 +534,7 @@ logged at load (`per-tensor scale 0.000199`).
 
 The vendored recipe has said `kv_cache_dtype: bf16` since it was added and
 `the_qwen4_exp_recipe_lands_the_settings_it_documents` asserts it, but
-`serve_qwen4exp_tui.sh` never passed the flag. A run started from the
+`scripts/dev/serve_qwen4exp_tui.sh` never passed the flag. A run started from the
 script therefore got the FP8 default, and with it:
 
     FP8 KV cache selected but the checkpoint ships NO k_scale/v_scale
@@ -841,3 +841,660 @@ The harness applies this checkpoint's chat template client-side to count
 ISL/OSL/TPOT, and the template cannot render the harness's tool-definition
 shape. Non-fatal — it degrades only the token metrics — but it would hit
 anyone using this checkpoint as a client-side tokenizer with tools.
+
+---
+
+## 2026-09-15 — the nvidia pack, the OOM decomposed, the n-gram lane, and what remains
+
+Box `gx10-e3a3` (GB10, 119.6 GB unified, driver 580.126.09). Tree
+`feat/flashnext-nvidia` (PR #35): `review/pr23-fixes` + `9923d498`,
+`dbe6f7d2`, `0902edb6`, `9c1ca517`, `45f5b355`. Every number below is an
+observation under the fingerprint next to it; run-record ids are
+`~/.atlas/runs/<bench>/run-*.json` on the box, and the queue scripts that
+produced them are checked in under
+`docs/porting/qwen38-nvidia-2026-09-15/jobs/` (on `review/pr21-fixes`), with
+the full day's narrative in `docs/porting/QWEN38_NVIDIA_PORT_LOG_2026-09-15.md`.
+
+### The 32K section above is superseded
+
+"The 32K context is not viable on this config" was written against
+`--gpu-memory-utilization 0.92` and a 25.5K-token turn that got the process
+OOM-killed. It is now understood and no longer true as stated:
+
+* At **util 0.88 / `--max-seq-len 32768` / `--max-prefill-tokens 16384`** the
+  nvidia pack ran the full agentic-webserver harness — 50 iterations, 816
+  turns, **32 multi-chunk prompts up to 25,191 tokens**, **50/50
+  webserver_ok**, 0 CUDA faults (`run-1789474170004681458`). What killed the
+  earlier runs was not the 25K turn per se but two host-memory terms, below.
+* The perf verdict of that run is FAIL (Σwall 19,351 s > 9,000 s, 23.7 s/turn)
+  — that is the serial decode floor of this pack on Atlas, not the memory.
+
+### nvidia/Qwen3.8-Flash-Next-NVFP4 — what loads and what it scores
+
+Deltas vs the RadixArk pack that needed code (config+index audit, then
+CPU-verified loader work): the ModelOpt `quantized_layers` MIXED_PRECISION
+map (`9923d498`), per-expert FP8-block-scale MTP experts (512×3
+`weight + weight_scale_inv`, g=128) routed through
+`dequant_fp8_blockscaled_to_bf16 → quantize_to_nvfp4`, and MIXED_PRECISION
+detection that excludes `mtp.*` / `*.ple.*` / `*.visual.*` before resolving
+the main-model variant (`dbe6f7d2` — nvidia's `mtp.layers.0.mlp.experts`
+literally contains `.mlp.experts`, so naive substring matching misroutes the
+pack). Key naming, PLE shard set and the expert scale triple are identical to
+RadixArk; no loader change there.
+
+| leg | fingerprint | result |
+|---|---|---|
+| loader smoke | `dbe6f7d2`, 16K, util 0.95, no spec | MTP shard header F8_E4M3 + g128 `weight_scale_inv`; first request 1.5 s |
+| MTP-on probe | `9c1ca517`, `--speculative --num-drafts 1`, util 0.93 | healthy in 80 s, 995-token answer; MTP gate arbitrated K=1 |
+| **ST-995** (bfcl-subset golden draw, n=995, seed 42, temp 0, thinking ON) | `9c1ca517`, util 0.95 / 16K, no spec | **83.52 overall / 82.45 normalized** (`run-1789433036569430053`) |
+| ST-995 again, corrected memory profile | `9c1ca517`, util 0.88 / 32K, `--ngram-speculative` (lane never engaged — see below) | **83.52 / 82.45**, hallucination 85.98 / live 80.00 / non_live 81.35 (`run-1789501991840065669`) |
+| agentic-webserver ×50 | `9c1ca517`, util 0.88 / 32K | 50/50 ok, 49/50 directions, 23.7 s/turn (`run-1789474170004681458`) |
+| bs4 probe (MinHeap ×N, 256 out) | `9c1ca517`, util 0.88 | C1 17.5–18.5 → **C4 35.2–36.8 agg tok/s**, byte-identical outputs across lanes |
+| KL / coherence, serial vs n-gram (5 prompts, temp 0, penalties 0, top-10 logprobs) | `9c1ca517` | coherent, tool call OK, 3/5 byte-identical; lane inert |
+
+Neither ST-995 record gates yet: the BENCH.toml scaffold (`0902edb6`) has no
+committed floors by design — these two runs are what the floors get derived
+from.
+
+### The OOM, decomposed into two terms
+
+**Term 1 — the pledge is also the host's ceiling.** GB10 memory is unified.
+`--gpu-memory-utilization u` reserves `u × 119.6 GB` for the serve, and the KV
+pool absorbs whatever is left under the pledge after weights + arena +
+reserve (at 0.93: 95.1 GB pre-KV, then **12.2 GB of KV for a bs1 workload
+whose 12 full-attention layers need < 1 GB at 32K**). The host keeps
+`(1−u) × 119.6 GB` minus co-tenants. Measured: at 0.93 `MemAvailable` fell to
+**870 MB** after 25 agentic turns (`run-1789451775373797695` hardware_state);
+at 0.95 the OOM killer fired (journalctl, 118/119 GB) after ~33 iterations.
+Serve-side accounting from the same boot: weights 73.33 GB on disk → 84.0 GB
+resident after load (SGLang reports 83.68 GiB for this pack — parity), + 2.5
+GB layer construction, + 6.3 GB buffer arena, + 4.1 GB inference reserve;
+Marconi pool 1.8 GB + rollback ring 0.9 GB on top. 0.88 hands ~6 GB back to
+the host and is what every leg above ran at.
+
+**Term 2 — the serve's own host memory grows with context.** Under the agentic
+run the process's `RssAnon` went **2.0 → 9.8 GB** (30-s trace in the job dir):
+~110 MB / 5 min while the transcript was 15–20K tokens deep, ~20 MB / 5 min on
+short turns, plateauing near 10 GB. An 8-leg bisect (fresh serve per leg, 6
+requests each, `RssAnon` sampled after every request) put it on one
+mechanism:
+
+| leg | shape | MB per 1K tokens |
+|---|---|---:|
+| 51-tok prompt, 321 out | decode-only | ~14 MB / request fixed |
+| 27.4K distinct prompts, 16 out, pcache ON | prefill | 6.5 |
+| the same 27.4K prompt ×6 (prefix hits) | | 2.3, **flat after the first** |
+| 27.4K distinct, pcache OFF | | 5.0 |
+| 27.4K distinct, `ATLAS_QSA_DEVICE_TOPK=1` | | 6.7 (≡ ON → not the QSA host top-k) |
+| 27.5K prompt + 400 out (the agentic shape), ring ON | | **9.5** |
+| same, `ATLAS_SSM_DECODE_RING=0` | | 4.9 |
+| same, `MALLOC_ARENA_MAX=2 MALLOC_MMAP_THRESHOLD_=1048576` | | 3.5 |
+
+Growth ∝ context depth, halves without the decode-rollback ring, stops on
+prefix-cache hits, shrinks under malloc tuning ⇒ **aux-state snapshots**.
+`QsaIndexer::snapshot_aux` and `PleLayer::snapshot_aux` serialized their
+per-sequence state (QSA raw keys: `ingested × hd × 2` bytes = 256 B/token per
+indexer, 12 indexers ≈ 3 KB/token; ≈ 84 MB per 27K prompt) into a **fresh host
+`Vec` on every save** — at every boundary token for the decode ring
+(`snapshot_boundary_if_ssm`, 620 boundary ids, so nearly every line of code)
+and at every Marconi checkpoint / finish-leaf — then dropped the previous one.
+The live set was bounded (8 ring slots, 16 Marconi slots) but the multi-MB
+alloc/free churn across scheduler threads fragmented glibc arenas (the 2-minute
+`smaps` diff showed ~35 new 64 MB arena heaps per 2 min). `45f5b355`
+snapshots into caller-owned, capacity-retaining buffers on both paths
+(`snapshot_aux_into`, `collect_aux_states_into`; ring entries are taken out of
+the map, refilled, re-inserted; Marconi `free()` clears blobs in place instead
+of dropping them) and applies restores under the pool lock instead of
+`.cloned()`. Bytes on the wire unchanged; 6 unit tests. Verified on the same
+bisect legs: ring-on **7.9** vs ring-off **7.8** MB/1K tok (was 9.5 vs 4.9) —
+the ring term is gone; the residual matches the retained-by-design 16-slot
+Marconi footprint reaching its cap (~1.3 GB at 27K). The end-to-end agentic
+rerun on this binary, mem-traced, is queued; until it lands the honest status
+is "re-shaped and bounded", not "fixed".
+
+> **SUPERSEDED 2026-09-16.** The rerun landed (job `110-flashnext-nvidia-agentic4`,
+> `45f5b355`) and the prediction did not hold: RSS peaked at 9,512 MB against
+> the ~3.5 GB predicted and 043's ~9.8 GB. The ring term is gone in the
+> bisect, but the end-to-end footprint is NOT bounded, and the ~1.3 GB
+> Marconi-cap explanation does not account for the ~8 GB present. Status is
+> "one term removed, the dominant term still unidentified". See
+> "2026-09-16 — … the memory fix did not bound the curve", below.
+
+Also observed while chasing this: with `RUST_LOG=info` every prefill logs
+`PLE gather: N ids, hits/misses` — on the 25K turns the gather was 55,808 ids
+with ~half misses, and those misses are serial preads under the table mutex
+(the loader's own note). That is the TTFT term for fresh long prompts, not a
+memory term.
+
+### The n-gram lane on this pack: engages, accepts ~nothing
+
+> **SUPERSEDED 2026-09-16 — read the next section before using anything
+> below.** The `tok_step=1.000 mean_na=0.000` lines this subsection rests on
+> are rendered from `a.mtp_acct`, which the n-gram dispatch site never wrote:
+> the zeros are an un-fed counter's default, not a measurement. The same
+> job's `NGRAM detail` lines show `na=1` on 93 of 143 proposals (77 % warm,
+> 8 % cold). And the ST-995 non-engagement is the QSA inert bound (2051),
+> not the draft/table. Mechanism and fix: "2026-09-16 — the n-gram lane was
+> mis-read …", below.
+
+`--ngram-speculative` (the llama.cpp-style dynamic table + multi-token chains
++ SSD persistence on `review/pr23-fixes`) boots (`N-gram speculative decoding:
+ENABLED (K=2/3/4 verify, CPU proposer)`), but:
+
+* KL harness, 5 prompts × 256 tokens: every request `tok_step=1.000
+  mean_na=0.000`, ngram wall = serial wall (14.5 vs 14.4 s); 3/5 outputs
+  byte-identical to serial.
+* Positive control — the PR's own shape (600-word essay, 400 out, temp 0,
+  `RUST_LOG=debug`), 2 requests per leg: the proposer **runs** (`NGRAM detail:
+  drafts=[…] … na=0` lines: 26 on request 0, 145 on request 1 — the table
+  warms) but acceptance is ~0; serial 15.6/16.8 vs ngram 16.0/18.7 tok/s incl.
+  TTFT, `tok_step 1.000` both.
+* ST-995 under the lane: **0 `NGRAM detail` lines in 995 requests**; score
+  identical to the no-spec run (that is expected when nothing engages, not a
+  parity proof).
+
+PR #23 measured +36 % (18.7 → 25.5 tok/s, ~93 % acceptance) on the RadixArk
+pack. Under this fingerprint on the nvidia pack that does not reproduce. Not
+yet determined why; the two things to check first are the draft-vs-target
+position alignment for this checkpoint's tokenization (the class of the
+off-by-one already fixed once on this lane) and what the dynamic table
+actually learns on these prompts. Also observed: the K=2 verify path with
+rejected drafts is not output-neutral (2/5 prompts diverge at exact BF16
+ties) — same tie-contract class as the DFlash lane on the 27B.
+
+### The external agent report (spark box, ~16 h whiteboard build) vs our records
+
+Their two pinned items are already handled on this line: the 32K request cap
+(`qsa.rs` clamps indexer capacity to `--max-seq-len`; `ATLAS_QSA_MAX_TOKENS`
+can only raise it) and the prefill-chunk / PLE-scratch coupling (`9c1ca517`
+loops the PLE pipeline over `ATLAS_PLE_CHUNK` spans regardless of
+`--max-prefill-tokens`). Their unpinned misaligned-address context loss (4× in
+35 min of agent traffic, a D2H at layer 0 of a continuation chunk right after
+an intermediate SSM checkpoint save) did **not** reproduce in our 819-prefill /
+32-continuation-chunk / 1,562-checkpoint agentic run — but our chunk size was
+16K (theirs 8K) and our depth 25K (theirs 42.8K), so that is two
+observations, not an A/B. The eager + `ATLAS_DEBUG_SYNC_KERNELS=1` method that
+named the DFlash fault on the 27B (a Rust backtrace of the launch site) is the
+tool to point at it.
+
+### What remains — ordered by what changes the user-visible number
+
+> **Item 1 re-ordered 2026-09-16.** "Diagnose alignment/table first" would
+> have spent hardware on a non-cause: the lane accepts (93/143 proposals in
+> its own control) and never ran on ST-995 because the QSA inert bound (2051)
+> declines it silently on every long prompt. The lane cannot reach agentic or
+> long-form decode at all. The lever for the serial floor is the verify
+> path's active-QSA support (or MTP), not the n-gram table. See the
+> 2026-09-16 section.
+
+1. **Make speculation accept on this pack.** Agentic and long-form decode sit
+   at the serial floor (15–18 tok/s, 23.7 s/turn). The n-gram lane is the only
+   one that fits at these memory budgets (the BF16 MTP block does not fit at
+   0.85; the FP8-expert MTP arm fits but arbitrated to K=1 in the probe) and it
+   accepts ~0 here. Diagnose alignment/table first (10-minute leg with
+   position-aligned draft-vs-emitted dump), then re-measure the essay control
+   and ST-995 with the lane actually firing.
+2. **Finish the memory story.** (a) The queued agentic rerun on `45f5b355`
+   with the RSS trace — prediction ≲ 3.5 GB flat vs 9.8 GB; (b) move the
+   Marconi/ring aux blobs to device (or a preallocated pinned arena) so the
+   host footprint stops scaling with slots × depth *and* the per-boundary-token
+   `synchronize` + D2H hitch (review note 5) goes away; (c) need-driven KV
+   sizing for bs1 profiles so the pledge remainder is not swallowed by a KV
+   pool 12× larger than the workload; (d) recipe: util 0.88 / 32K, and
+   `ATLAS_SSM_DECODE_RING=0` for agentic serving (the rollback watchdog is the
+   feature that false-positives on code).
+3. **Gate the nvidia subject.** Derive BENCH.toml floors from the two ST-995
+   records + the agentic record, set `status = "measured"`, so
+   `--pull-request-gate` can serve it and the recipe
+   (`qwen3.8-flash-next-nvfp4-nvidia.yaml`, sparkrun-recipes PR #8) carries the
+   profile above instead of the RadixArk one.
+4. **Long-prefill TTFT** (unchanged from the gap analysis): `qsa_score_rows`
+   is quadratic at 294 GFLOP/s and, with the PLE gather's serial miss preads,
+   is why a fresh 25K turn costs 100+ s of TTFT. Queue-depth on the PLE reads
+   is the cheap half; the indexer kernel is the real one.
+5. **Decode graph capture**: `ATLAS_QSA_DEVICE_TOPK=1` default + the PLE event
+   remove the two vetoes; capture has not been re-attempted on this model.
+   This is where PR #27's runtime becomes relevant to Flash-Next — not before.
+6. **Correctness contracts** still open from the #23 review: kernel
+   lane-vs-index argmax merge, residual host last-wins paths, boundary-dense
+   snapshot eviction, and the pre-/post-penalty `top_logprobs` inconsistency
+   found on the DFlash lane (check the n-gram verify path reports the same
+   quantity as serial).
+7. **W4A4 activation path** for the routed experts (the pack ships static
+   `input_scale`; the loader lands it, the parked `_fp4` MoE kernels do not
+   consume it yet) — a throughput lever once 1–2 are done.
+
+## 2026-09-16 — the n-gram lane was mis-read, the memory fix did not bound the curve, and the nvidia subject now gates
+
+Box `gx10-e3a3` (GB10, driver 580.126.09). Tree `feat/flashnext-nvidia`
+(PR #35) — the 2026-09-15 section's tree plus `8e4d4691`, `f5f2dafec`,
+`f990a691`, `4a48d80f`. Two of those four are corrections to claims in that
+section; they are marked as supersede notes below, with the mechanism named,
+per the ledger rule.
+
+### SUPERSEDES item 1's premise: the lane accepts; the counter was never fed
+
+The 2026-09-15 section reads "engages, accepts ~nothing" and cites "every
+request `tok_step=1.000 mean_na=0.000`" as the evidence. **That line is not a
+measurement of the n-gram lane.** It renders `a.mtp_acct`, and the n-gram
+dispatch site in `scheduler/mod.rs` never wrote it — the serial arm calls
+`record_serial`, the MTP/DFlash/self arms call `record_verify_emitted`, and
+the n-gram arm called neither. An un-fed counter reports its default, which
+is exactly `serial=0.00 mtp=0.00 p1=0.000 mean_na=0.000 tok_step=1.000`.
+
+The proof is inside the same job. In `074-flashnext-ngram-control`:
+
+* every ngram `Done:` line shows `serial=0.00 mtp=0.00` (`054` shows the
+  same), i.e. the accounting recorded *nothing at all* — not a low accept
+  rate, zero steps;
+* the lane's own `NGRAM detail: drafts=[…] v=[…] na=…` lines, from the same
+  serve, show `na=1` on **93 of 143** proposals, and the INFO-level
+  `NGRAM K2 ACCEPT … na=1/1` line fires.
+
+Re-read by request: request 0 (cold table) accepted 2 of 25 proposals (8 %);
+request 1 (same prompt, warm table) accepted **91 of 118 (77 %)**. Wall for
+request 1: ngram 21.41 s vs serial 23.86 s (+11 %); request 0: 25.06 vs
+25.67 (+2 %). So the honest summary is "accepts on repetition, ~nothing
+cold", which is ordinary n-gram behaviour — not the defect the section
+implied, and not PR #23's +36 % either.
+
+Fixed in `f5f2dafec`: the dispatch site books its step
+(`record_verify_emitted`), which also repairs
+`usage.completion_tokens_details.accepted_prediction_tokens` for this lane.
+Deliberately NOT `mtp_accept_debug::record` — that histogram steers
+`adaptive_rung`'s MTP dispatch width, so feeding n-gram verifies into it
+would steer one lane's regime from the other's statistics. A source-scan
+test with a negative control pins the booking.
+
+### The lane never ran on ST-995, and the reason is not the table
+
+The same section attributes the 995-request non-engagement to the draft/table
+("the two things to check first are the draft-vs-target position alignment …
+and what the dynamic table actually learns"). The dispatch gate says
+something simpler and much more consequential:
+
+```
+use_ngram_speculative && active.len() == 1 && spec_slots_covered
+  && grammar_state.is_none() && temperature == 0.0
+  && verify_ctx_limit.is_none_or(|lim| seq.seq_len + 4 <= lim)
+```
+
+`verify_context_limit()` is the QSA inert bound — **2051** on this model
+(`qsa.rs`: `budget + ratio - 1`) — because the verify paths refuse an ACTIVE
+selection past it. So the lane is confined to the first ~2047 tokens of
+context, and it declines **silently**: unlike MTP, it has no decline log.
+
+Every BFCL request is admitted well past the bound. `082-flashnext-nvidia-bfcl2`
+logs `mtp declined: qsa_active seq_len=2264 num_drafts=1 lim=2051` — the MTP
+latch, which runs regardless of lane, and is the only reason this was
+findable at all. With `seq_len` above `lim` at admission the n-gram branch can
+never be taken, so "0 NGRAM detail lines in 995 requests" is a statement
+about the gate, not about the table or an off-by-one.
+
+★ This re-orders item 1. Agentic and long-form decode at 25K context is
+**unreachable** by this lane until the verify path can serve an active QSA
+selection (or the bound moves); no amount of table/alignment work changes
+that. The levers for the serial floor are MTP (FP8-expert arm) and that
+verify-path work — not the n-gram table.
+
+A debug `ngram declined:` line now names the reason (same commit).
+
+### SUPERSEDES item 2a's prediction: the aux-buffer fix did not bound RSS end-to-end
+
+The 2026-09-15 section predicted, for the queued agentic rerun on `45f5b355`:
+"prediction ≲ 3.5 GB flat vs 9.8 GB". That rerun is job
+**110-flashnext-nvidia-agentic4** and it **refutes the prediction**:
+
+| reading | 043 (pre-fix) | 110 (`45f5b355`) |
+|---|---:|---:|
+| serve `RssAnon`/RSS peak | ~9.8 GB | **9,512 MB** |
+| `MemAvailable` minimum | 403 MB | **570 MB** |
+| webserver_ok | 50/50 | 50/50 |
+| followed_directions | 49/50 | 49/50 |
+| Σwall | 19,351 s | 19,150 s |
+
+Same serve profile (util 0.88 / 32K / 16K prefill / prefix caching), same
+50-iteration harness, mem-traced at 30 s (`mem-trace.tsv`). The curve is
+unchanged within noise. So the bisect result stands as stated — the ring term
+is gone (7.9 vs 7.8 MB/1K tok) — but the **end-to-end footprint is not
+bounded**, and the "residual matches the retained-by-design 16-slot Marconi
+footprint (~1.3 GB at 27K)" explanation does not account for the ~8 GB that
+is actually there. The honest status is now "one term removed; the dominant
+term is still unidentified", which is a weaker claim than the section's
+"re-shaped and bounded".
+
+`45f5b355` is still a correct change — it removes real alloc/free churn — but
+it is not the fix for the OOM term 2, and the next step is attribution on
+this shape (which mapping/arena the 9.5 GB sits in), not item 2b's
+device-side move. Item 2c (need-driven KV) is unaffected: `MemAvailable`
+falling to 570 MB is the pledge term, and it is still the reason a bs1
+workload needs `--gpu-memory-utilization 0.88`.
+
+### Item 3 done: the nvidia subject gates
+
+`4a48d80f` flips both `kernels/gb10/qwen3.8-flash-next/BENCH.toml` entries to
+`status = "measured"`, so `--pull-request-gate` can serve the pack instead of
+refusing it.
+
+* **bfcl-subset** — `overall_accuracy` 83.12, `normalized_single_turn_score`
+  82.05 (measured 83.52 / 82.45 less the dense sibling's documented ±0.4),
+  `samples` pinned at exactly 995. Two records agree to the hundredth
+  (`run-1789433036569430053` at util 0.95/16K/no-spec, and
+  `run-1789501991840065669` at util 0.88/32K) — and the note states plainly
+  that this is reproducibility under two serve profiles, **not** a
+  repeat-spread, so the margin is inherited rather than measured here. It
+  also records that the second run was SERIAL (the lane declined), so
+  "identical score with the lane inert" is not read as a parity proof.
+* **agentic-webserver** — `webserver_ok` ≥ 50, `followed_directions` ≥ 49,
+  `iterations` pinned at exactly 50, from `run-1789474170004681458`. **No
+  wall bound**, deliberately: one record is one tier, and a ceiling derived
+  from it is the "ceiling written before calibration" the 3.6 dense entry
+  warns about. The measured Σwall is this pack's serial decode floor on
+  Atlas, not a defect.
+
+### What job 111 actually did (so its record is not read as a measurement)
+
+`111-flashnext-ple-warm` ran the right leg against a prompt of **45,306
+tokens** with `--max-seq-len 32768`, so both requests were rejected
+("Prompt too long") and `WARM.tsv` came back as a bare header. The
+generator's comment estimated ~24K tokens; the real ratio is ~64 tokens per
+paragraph, so 700 paragraphs is 45K. **Nothing about PLE prefetch was
+measured in 111.** Replaced by `flashnext-ple-warm2`, which uses 370
+paragraphs and fails loudly if `usage.prompt_tokens > 30,000`.
+
+### CI blockers found on this branch (all pre-existing, all now fixed)
+
+`cargo test --workspace` and the file-size job are both red on PR #35 for
+reasons unrelated to the nvidia pack:
+
+1. **Two stale gate tests** (`f990a691`). `bench_selfstart_tests` pinned
+   `qwen3.8-27b-nvfp4-unsloth` and `bench_variants_tests` pinned
+   `unsloth/Qwen3.8-27B-NVFP4`; the 27B entries were relabelled to
+   `nvidia/Qwen3.8-27B-NVFP4` / `-agentic` in `fbc3a7259`+`ff3e53c3f` without
+   updating them.
+2. **The non-CUDA (metal) build** (`8e4d4691`). `2e74cfe2e` left four
+   `deny(warnings)` errors in the configuration the local gate's metal row
+   checks — the one row that proves the port compiles where its code is
+   mostly absent. CI cannot see it: CI checks with `cuda` against stub libs,
+   where all four sites are live. The three causes are all "code that only
+   means something where `NgramTable::Cached` exists".
+3. **The 500-LoC cap** (`.github/workflows/file-size-cap.yml`) was over in
+   three files this branch grew: `spec_step.rs` 482→561, `qwen4_exp.rs`
+   500→501, `nvfp4_detect.rs` 492→601. Split in `810845afd` to 291 / 480 /
+   467 — the n-gram lane into `spec_step/ngram.rs`, `nvfp4_detect`'s tests
+   into a sibling file, and the loader's three free helpers into
+   `qwen4_exp/helpers.rs`. **No allow-list entry was added** — that list buys
+   time for a real split, and none of these needed one.
+4. **A clippy failure in `moe_sorted_diff`** (`d014ea98`) —
+   `g.copy_h2d(&mut v[..], ..)` against a `&[u8]` parameter. Gate-only: CI
+   lints `--tests`, the local gate lints `--all-targets`.
+
+With those, `bash scripts/dev/qwen4exp_local_gate.sh` is **16/16 PASS** on
+this branch — the metal build, the LoC cap, fmt, clippy and both stale tests
+were all red before.
+
+### Queued / in flight
+
+* `116-flashnext-ngram-instr` — reruns 074's shape on the accounting fix;
+  asserts each ngram `Done:` line reports `mtp>0`, that its `tok_step` agrees
+  with the `NGRAM detail` na counts, and that no decline fires on a ~48-token
+  prompt.
+* `117-flashnext-ngram-longctx` — the one-variable test of the bound above:
+  identical prompt text at ~1.2K (under 2051) and ~6.0K (over). Short must
+  propose and not decline; long must propose nothing and log a decline.
+* `118-flashnext-ple-warm2` — 111's leg with a prompt that fits.
+
+### `116` — the accounting fix, verified on hardware
+
+PASS. Same shape as 074, same serve profile, patch = PR #35's head applied to
+`45f5b355`. Outputs are **byte-identical to 074** (same three content SHAs),
+so the change is output-neutral, and the `Done:` line is no longer vacuous:
+
+| leg | req | wall | tok/s | `Done:` line | proposals | na>0 | declines |
+|---|---|---:|---:|---|---:|---:|---:|
+| serial | 0 | 25.75 s | 15.53 | `serial=1.00 mtp=0.00 … tok_step=1.000` | — | — | 0 |
+| serial | 1 | 25.04 s | 15.97 | `serial=1.00 mtp=0.00 … tok_step=1.000` | — | — | 0 |
+| ngram | 0 | 25.04 s | 15.97 | `serial=0.00 mtp=1.00 p1=0.005 mean_na=0.005 tok_step=1.005` | 25 | 2 | 0 |
+| ngram | 1 | 21.37 s | 18.72 | `serial=0.00 mtp=1.00 p1=0.295 mean_na=0.295 tok_step=1.295` | 143 | 93 | 0 |
+
+`mean_na = 0.295` is 93 accepted drafts over ~315 lane steps, which is what
+the independent `NGRAM detail` count says — the two instruments now agree.
+The serial leg is unchanged (`serial=1.00`), so nothing leaked between lanes.
+Wall for the warm request: ngram 21.37 s vs serial 25.04 s (**+14.6 %**), and
+cold is a wash (25.04 vs 25.75) — the same shape 074 showed, now measurable
+per request instead of only from debug lines.
+
+### `117` — the QSA bound, verified on hardware
+
+The hypothesis holds, and the mechanism is now visible in the log. One serve,
+two prompt lengths over the same text:
+
+| arm | prompt tokens | proposals | na>0 | declines | declined `seq_len` |
+|---|---:|---:|---:|---:|---|
+| short | 1,140 | 7 | 5 | 0 | — |
+| long | 5,802 | **0** | 0 | **28** | 5802, 5803, … |
+
+Every one of the 7 `NGRAM detail` lines in the whole serve sits at
+`seq_len` 1157–1176, i.e. all of them belong to the short arm; the long arm
+proposed nothing at all. The decline line reads
+`ngram declined: grammar=false temp=0 slots_covered=true seq_len=5802 lim=2051`.
+And the repaired usage field agrees independently:
+`accepted_prediction_tokens` = **5** on the short arm, **0** on the long arm.
+
+★ The leg's own assertion failed on the first run and the failure was in the
+leg, not the finding: both arms share one serve and therefore one log, and the
+report counted the whole file per arm, reading the short arm's 7 proposals a
+second time as the long arm's. The per-arm counts above are the corrected
+deltas; `flashnext-ngram-longctx2` re-runs it with the offset fix.
+
+### `118` — PLE prefetch: the miss term goes to zero, and it is not the TTFT lever
+
+PASS, and the numbers are worth reading carefully because they cut against
+item 4's framing. Patch = PR #35's head applied to `45f5b355`; one serve per
+arm, 370-paragraph prompt (~23.9K tokens, inside the 32K cap — 111's bug),
+`ATLAS_PLE_WARM` 0 vs 1.
+
+| arm | req | prompt | out | wall | content sha |
+|---|---|---:|---:|---:|---|
+| cold | long | 23,856 | 34 | **76.98 s** | `7b4fbdc2f9ed` |
+| cold | prefix | 23,858 | 21 | 2.36 s | `7f36f5822a6f` |
+| warm | long | 23,856 | 34 | **81.22 s** | `7b4fbdc2f9ed` |
+| warm | prefix | 23,858 | 21 | 2.38 s | `7f36f5822a6f` |
+
+**Correctness holds** — cold and warm produce byte-identical output on both
+requests, so the warm session changes WHEN rows land, not which. **The
+prefetch works**, and the gather lines say so exactly: the cold arm's first
+25K-prompt gather is
+
+```
+PLE gather: 131072 ids, 126049 hits / 5023 misses, resolve 47970us
+```
+
+and the warm arm's is
+
+```
+PLE gather: 131072 ids, 131072 hits / 0 misses, resolve 1823us
+```
+
+Zero misses, and the resolve drops 47,970 µs → 1,823 µs (26×). The worker had
+every row resident before the gather asked. The prefix request shows the
+cursor jump too (cold 144/368 on the tail gather, warm 512/512).
+
+★ **And the wall does not improve: 81.22 s vs 76.98 s.** The miss term this
+removes is ~46 ms out of ~77 s of prefill — 0.06 %. So the port log's item 4
+framing ("the PLE gather's serial miss preads … is why a fresh 25K turn costs
+100+ s of TTFT") is now quantified and the answer is that it is *not*: the
+queue-depth half was the cheap half, and it buys ~46 ms. The remaining ~77 s
+is the indexer, exactly as that item's second sentence said. Two runs, one
+per arm, so the +5.5 % on the warm arm is **observed, single-shot** — not a
+regression claim, and not worth chasing until the indexer is the target.
+
+★ Also found, and NOT a defect of this branch: the three new `#[ignore]`d
+prefetch tests cannot run under the invocation their own doc comment
+prescribes (`cargo test -p spark-storage --features cuda prefetch -- --ignored`).
+They fail with `cuMemAllocHost_v2(4096) failed: 3` — `CUDA_ERROR_NOT_INITIALIZED`
+— because no test process in `spark-storage` creates a CUDA context. The
+pre-existing `multi_file_rows_are_byte_identical` sits behind the same gate,
+so `flashnext-storage-ignored` runs both in one binary to settle whether this
+is an inherited harness gap or a new defect. Until it reports, treat the three
+as **unverified on hardware**, not as passing.
+
+### Item 6 — the #23 review's correctness contracts, worked
+
+The review left four contracts open. Three are now closed or documented, one is
+a policy decision that needs hardware.
+
+**1. Kernel argmax merge was lane-exact, not index-exact — FIXED**
+(`f49be47a2`). The claim in `argmax_bf16.cu` that the batched form is
+"byte-identical by construction" to n sequential calls because the reduction
+"prefers the lower tid" does not follow. The strided scan keeps the first
+strict max *within a lane's stride class*; the merge was `>` only, so equal
+maxima in different lanes resolve to the lower **lane**. With stride 1024 and
+the max at index 1029 (lane 5) and 2050 (lane 2) the kernel returned 2050
+while the host `argmax_first_wins_f32` — and every committed BFCL record —
+returns 1029. All four merges now take an equal value from the higher lane
+when its index is lower, and the header says what the merge earns instead of
+what the reduction was assumed to imply.
+
+★ This is accuracy-relevant and **not yet measured on hardware**: the same
+class of change moved this gate's score once already (2026-09-03,
+last-index-wins, 83.38 → 83.10 normalized, reverted on the nine flipped
+samples). `flashnext-bfcl-tiebreak` (job 125) runs the ST-995 draw on the
+pushed head to measure it. Until it reports, treat the change as
+**unverified for accuracy**; the committed floors carry 0.4 of margin for
+exactly this.
+
+**2. Residual host last-wins paths — DOCUMENTED.** `sample_step.rs`'s
+suppress-ids greedy branch and its penalty-aware MTP sibling both use
+`max_by`, which returns the *last* of several equal maxima, while the verify
+kernels and `argmax_first_wins_f32` are first-wins. Left as-is (they match the
+record tree; changing them would move every committed accuracy number), with
+a comment at each site naming the rule and the divergence, which is what the
+review asked for.
+
+**3. Boundary-dense snapshot eviction — OPEN, needs a policy call.** An
+8-slot ring whose loop unit ends in a boundary token records a snapshot per
+line and evicts every out-of-`min_keep` snapshot before the watchdog fires
+(observed as `NoSsmSnapshot` declines where a rollback could have succeeded).
+The review's two candidate cures — record every Kth boundary, or skip records
+that would land inside the protected tail — are a *quality* trade in the
+rollback watchdog, not a bug fix, and both need a hardware leg on the
+loop-shaped workload to show they do not simply trade one false negative for
+another. Not attempted here.
+
+**4. `top_logprobs` is not one quantity across the engine — FOUND, NOT YET
+FIXED.** The review asked to "check the n-gram verify path reports the same
+quantity as serial". It does not, and the mechanism is now pinned:
+
+* **serial** (`decode_logits_seq.rs`, both exits) extracts from `f32_logits`
+  *after* `process_position_logits` folded penalties and masks into it in
+  place — the comment at the logit-dump site says so explicitly
+  ("`f32_logits` is now masked AND penalised here"). **Post-penalty.**
+* **every verify lane** — `extract_verify_logprobs` re-reads
+  `model.logits_buffer_ptr()`, the raw GPU buffer the host pipeline never
+  touched. **Pre-penalty.** That is `verify_k2_step`, `verify_k3_step`,
+  `verify_k4_step`, `verify_k4_batch_step`, `verify_dflash_step` and
+  `step_ngram_verify` alike, so the n-gram lane matches the other verify
+  lanes and *all of them* differ from serial.
+
+Consequence: on a request carrying penalties, the reported top-k can rank a
+token the sampler could not have chosen, and the chosen token's reported
+logprob is not the one it was drawn under. The fix is contained but touches a
+hot path — force the slow pipeline when `a.top_logprobs.is_some()` (it already
+produces the processed rows in `verify_pick_all_with_pipeline`'s `buf`, and
+the fast paths deliberately skip that D2H), return those rows, and extract
+from them. Two things to weigh before doing it: the fast paths are documented
+as *not* byte-invariant to the slow path at near-ties, so asking for logprobs
+would change emitted tokens at those ties; and the alternative direction
+(make serial report raw too) changes the numbers every existing client sees.
+Neither is a decision to take in a session that cannot hardware-verify it.
+
+### `123`/`128` — the two re-runs, and one verdict that was the leg's own artifact
+
+**`123` PASS** — the QSA-bound test with per-arm log deltas (117 had counted a
+shared serve log twice):
+
+| arm | prompt | proposals | na>0 | declines | `accepted_prediction_tokens` |
+|---|---:|---:|---:|---:|---|
+| short | 1,140 | 7 | 5 | 0 | **5** |
+| long | 5,802 | **0** | 0 | **28** | **0** |
+
+The repaired usage field agrees with the log-derived counts in both arms, which
+is a second, independent confirmation of the accounting fix.
+
+**`124`'s verdict was invalid, and `128` is the corrected one.** 124 ran the
+pre-existing `multi_file_rows_are_byte_identical` with `--exact multi_file_rows`,
+which matches nothing — the test's full name carries its module path — so the
+comparison arm ran **zero** tests, its `rc=0` was vacuous, and the leg printed
+"this IS a defect in the prefetch work". That conclusion was an artifact of my
+filter, not a finding. `128` names the test in full and runs both arms:
+
+| arm | result | `cuMemAllocHost_v2 … failed: 3` |
+|---|---|---|
+| pre-existing `multi_file_rows_are_byte_identical` | FAILED (rc=101) | **yes** |
+| the three new `prefetch` tests | FAILED (rc=101) | **yes** |
+
+**Verdict: pre-existing harness gap, not a branch defect.** The documented
+invocation (`cargo test -p spark-storage --features cuda <name> -- --ignored`)
+cannot work for ANY pinned-arena test in that crate, because no test process
+creates a CUDA context and `NgramRowCache::open` needs one. The three new tests
+inherit it. Worth fixing (one `CudaContext::new` in a test fixture would do it),
+but it is not this branch's regression and the tests should be read as
+**unverified on hardware** until then.
+
+### The PR benchmark gate: red before this session, and a campaign not a patch
+
+`gh api …/commits/3af3aafb5/check-runs` shows `PR benchmark gate: failure` at
+the PREVIOUS head too, so this is pre-existing. Running the check locally says
+exactly what it wants — all ten required gates read `NONE`, with the latest
+records (for `9da215a1e5`) invalidated by this branch's `crates/` and
+`kernels/` diffs: 55 files named, and "device code changed for 26 target(s)".
+
+Fixing it means measuring on a GB10 and committing the records. ★ **Checkpoint
+availability, not gate cost, is what bounds the campaign on this box** — five
+of the seven non-multi-hour gates need a checkpoint that is absent:
+
+| gate | subject | on `gx10-e3a3`? |
+|---|---|---|
+| decode-floor | nvidia/Qwen3.8-27B-NVFP4 | yes |
+| concurrency-sweep | nvidia/Qwen3.8-27B-NVFP4 | yes |
+| ttft-warm-gate | Qwen/Qwen3.6-35B-A3B-FP8 | **no** |
+| ttft-cold-gate | Qwen/Qwen3.6-35B-A3B-FP8 | **no** |
+| ssm-state-poisoning-gate | Qwen/Qwen3.6-35B-A3B-FP8 | **no** |
+| vision-fidelity | Qwen/Qwen3.6-35B-A3B-FP8 | **no** |
+| video-fidelity | unsloth/Qwen3.6-27B-NVFP4 | **no** |
+
+`~/code/hf/hub/` holds only the 3.8 family and Nemotron. The `77e0f96c` records
+already in `.benchmarks/` were therefore taken on a different box.
+`flashnext-gates-a2` (job 131) runs the two that can run today.
+
+★ **The other five are NOT CHASED, BY DECISION (2026-09-16).** Neither
+`Qwen/Qwen3.6-35B-A3B-FP8` nor `unsloth/Qwen3.6-27B-NVFP4` is a subject of this
+work, and neither is being downloaded. So the `PR benchmark gate` **stays red**
+after this campaign — two of ten gates refreshed, eight still stale — and that
+is a known, accepted state rather than a task waiting on a ~50 GB download.
+Greening it means measuring those five on a box that has the checkpoints, or a
+maintainer changing the required subjects. It is deliberately **not** done by
+editing the gate's coverage or its record set: that would be turning a
+compliance control off to make CI agree, which is the one fix this file will
+never take.
+
+The consequence, stated plainly: **PR #35 cannot merge on this gate as it
+stands.** It was already red at `3af3aafb5` before this session, so nothing here
+made it worse — but nothing here can clear it either, and the two facts should
+not be blurred.
+
+### Two operational facts worth keeping
+
+* **The box has no credentials for `atlasinf`.** `git fetch atlasinf
+  feat/flashnext-nvidia` from `gx10-e3a3` fails with "Please make sure you have
+  the correct access rights" (job 127 died on exactly that, after a force-push
+  also orphaned the sha it had pinned). The working route is a **git bundle**:
+  `git bundle create inc.bundle 45f5b355..feat/flashnext-nvidia`, scp it, then
+  `git fetch <bundle> refs/heads/…:refs/remotes/bundle/…` — which lands the
+  EXACT commit objects, so a gate record can name a real `git_sha` instead of
+  carrying `dirty_paths`.
+* **A force-push orphans any sha a queued leg pinned.** `--force-with-lease`
+  rewrote the last four commits into their intended units; job 125 had
+  `SHA=f49be47a2` hard-coded and refused after the rewrite. Legs that pin a sha
+  need re-submitting after any history rewrite.

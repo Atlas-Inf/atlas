@@ -547,6 +547,35 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Whether some layer carries per-sequence AUX state (QSA indexer
+    /// cursors, PLE n-gram history) that a decode-time rollback must rewind
+    /// alongside the SSM state. Rewinding the SSM state but not this is how
+    /// the watchdog desynced the indexer ("decode at pos N but M tokens
+    /// ingested"). Default: no such layers.
+    fn requires_aux_state(&self) -> bool {
+        false
+    }
+
+    /// Decode-time boundary AUX snapshot: byte-exact blobs of every
+    /// aux-carrying layer's per-sequence state, keyed like
+    /// [`Self::save_decode_ssm_snapshot`] by `(seq.slot_idx, ring_slot)`.
+    ///
+    /// Default: no-op `Ok(())` for models without aux state.
+    fn save_decode_aux_snapshot(&self, _seq: &SequenceState, _ring_slot: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Inverse of [`Self::save_decode_aux_snapshot`]. `Err` when no aux
+    /// snapshot exists for that slot — the caller must then decline the
+    /// rollback rather than resume on a desynced indexer.
+    fn restore_decode_aux_snapshot(
+        &self,
+        _seq: &mut SequenceState,
+        _ring_slot: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Speculative decoding via the model's internal MTP proposer; falls
     /// back to regular decode when no proposer is wired up.
     fn generate_speculative(
@@ -563,6 +592,14 @@ pub trait Model: Send + Sync {
     /// error, which finishes the request.
     fn verify_context_limit(&self) -> Option<usize> {
         None
+    }
+
+    /// The same limit for a verify batch of SEVERAL sequences, and for lanes
+    /// that stay conservative (n-gram). Never looser than
+    /// `verify_context_limit`: a model may serve an active QSA selection for
+    /// one sequence's verify window and still not for a multi-sequence batch.
+    fn verify_context_limit_multi_seq(&self) -> Option<usize> {
+        self.verify_context_limit()
     }
 
     /// Deepest `num_drafts` a batched verify may dispatch, or `None` when

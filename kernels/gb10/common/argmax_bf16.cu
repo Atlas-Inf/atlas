@@ -41,7 +41,17 @@ extern "C" __global__ void argmax_bf16(
     // Phase 2: tree reduction in shared memory
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            if (s_val[tid + s] > s_val[tid]) {
+            // Strictly-greater OR an equal value at a LOWER index. The
+            // second clause is load-bearing: each lane's strided scan keeps
+            // the first strict max WITHIN its own stride class, so a plain
+            // `>` merge resolves equal maxima to the lowest LANE, not the
+            // lowest INDEX. With the max at index 1029 (lane 5) and 2050
+            // (lane 2) at stride 1024, `>` returns 2050 while the host
+            // `argmax_first_wins_f32` returns 1029 — a serial-vs-verify
+            // divergence on exact ties, and a contradiction of this file's
+            // own "same index as n sequential calls" claim below.
+            if (s_val[tid + s] > s_val[tid] ||
+                (s_val[tid + s] == s_val[tid] && s_idx[tid + s] < s_idx[tid])) {
                 s_val[tid] = s_val[tid + s];
                 s_idx[tid] = s_idx[tid + s];
             }
@@ -63,8 +73,13 @@ extern "C" __global__ void argmax_bf16(
 // 16 serial launches = 1.6 ms per decode step.
 //
 // Each block here runs the IDENTICAL per-row body: a strided scan keeping the first
-// strict max, then the same tree reduction preferring the lower tid. Ties therefore
-// resolve to the same index as n sequential calls — byte-identical by construction.
+// strict max, then the same tree reduction. Ties resolve to the lowest INDEX (the
+// merge takes an equal value from the higher lane when its index is lower), so the
+// result is the same index as n sequential calls — byte-identical by construction.
+// ★ That was NOT true before 2026-09-16: the merge was `>` only, which resolves ties
+// to the lowest LANE and returns a HIGHER index when the lower index sits in a higher
+// lane (max at 1029 [lane 5] and 2050 [lane 2], stride 1024 -> 2050 vs the host
+// helper's 1029). The claim is now backed by the merge rather than assumed from it.
 extern "C" __global__ void argmax_bf16_batch(
     const __nv_bfloat16* __restrict__ logits,
     unsigned int* __restrict__ out,
@@ -97,7 +112,17 @@ extern "C" __global__ void argmax_bf16_batch(
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            if (s_val[tid + s] > s_val[tid]) {
+            // Strictly-greater OR an equal value at a LOWER index. The
+            // second clause is load-bearing: each lane's strided scan keeps
+            // the first strict max WITHIN its own stride class, so a plain
+            // `>` merge resolves equal maxima to the lowest LANE, not the
+            // lowest INDEX. With the max at index 1029 (lane 5) and 2050
+            // (lane 2) at stride 1024, `>` returns 2050 while the host
+            // `argmax_first_wins_f32` returns 1029 — a serial-vs-verify
+            // divergence on exact ties, and a contradiction of this file's
+            // own "same index as n sequential calls" claim below.
+            if (s_val[tid + s] > s_val[tid] ||
+                (s_val[tid + s] == s_val[tid] && s_idx[tid + s] < s_idx[tid])) {
                 s_val[tid] = s_val[tid + s];
                 s_idx[tid] = s_idx[tid + s];
             }
@@ -177,6 +202,12 @@ extern "C" __global__ void argmax_bf16_batch_lp(
                 s_idx[tid] = s_idx[tid + s];
             } else {
                 s_sum[tid] = s_sum[tid] + s_sum[tid + s] * __expf(other - mine);
+                // Equal maxima: the sum above is scale-invariant to which
+                // side supplies the index, so the tie only needs the
+                // lower-index rule — same reason as the two merges above.
+                if (other == mine && s_idx[tid + s] < s_idx[tid]) {
+                    s_idx[tid] = s_idx[tid + s];
+                }
             }
         }
         __syncthreads();
@@ -213,7 +244,10 @@ extern "C" __global__ void argmax_fp32(
     __syncthreads();
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && s_val[tid + s] > s_val[tid]) {
+        // Same lower-index-on-ties rule as the BF16 merges above.
+        if (tid < s &&
+            (s_val[tid + s] > s_val[tid] ||
+             (s_val[tid + s] == s_val[tid] && s_idx[tid + s] < s_idx[tid]))) {
             s_val[tid] = s_val[tid + s];
             s_idx[tid] = s_idx[tid + s];
         }

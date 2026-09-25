@@ -403,7 +403,7 @@ impl TransformerModel {
     /// Preserve the current C=1 front before any slot-addressed batch region is
     /// packed over it. The preserve area is the extra sequence-sized region
     /// allocated after all owner slots.
-    pub(super) fn preserve_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+    pub(super) fn preserve_dflash_save_front(&self, k: usize, _stream: u64) -> Result<()> {
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
             None => return Ok(()),
@@ -417,6 +417,11 @@ impl TransformerModel {
         if n == 0 {
             return Ok(());
         }
+        // default_stream, not the caller arg: the front is written by the
+        // capture and read by commit_ctx on the model's (non-blocking)
+        // default stream. The scheduler boundary passes the legacy 0 —
+        // honoring it would leave this copy unordered with both sides.
+        let stream = self.gpu.default_stream();
         let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
         self.gpu
             .copy_d2d_async(dst, preserve, n * ctx_slot_bytes, stream)
@@ -431,7 +436,12 @@ impl TransformerModel {
 
     /// Slot-addressed pack: copies the sequence's slot-indexed capture
     /// region to the front for the commit_ctx reader.
-    pub(super) fn pack_dflash_save_region(&self, slot: usize, k: usize, stream: u64) -> Result<()> {
+    pub(super) fn pack_dflash_save_region(
+        &self,
+        slot: usize,
+        k: usize,
+        _stream: u64,
+    ) -> Result<()> {
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
             None => return Ok(()),
@@ -451,6 +461,9 @@ impl TransformerModel {
         if slot == 0 || n == 0 {
             return Ok(());
         }
+        // See preserve_dflash_save_front: must be ordered with the capture
+        // (writer) and commit_ctx (reader), both on the default stream.
+        let stream = self.gpu.default_stream();
         let src = dst.offset(slot * kmax * ctx_slot_bytes);
         self.gpu
             .copy_d2d_async(src, dst, n * ctx_slot_bytes, stream)
@@ -459,7 +472,7 @@ impl TransformerModel {
     /// Restore the original C=1 front after the batched commit loop packed
     /// owner regions over it. The scheduler calls this only when owner slot 0
     /// was present and therefore was explicitly preserved before the loop.
-    pub(super) fn restore_dflash_save_front(&self, k: usize, stream: u64) -> Result<()> {
+    pub(super) fn restore_dflash_save_front(&self, k: usize, _stream: u64) -> Result<()> {
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
             None => return Ok(()),
@@ -473,6 +486,9 @@ impl TransformerModel {
         if n == 0 {
             return Ok(());
         }
+        // See preserve_dflash_save_front: must be ordered with the capture
+        // (writer) and commit_ctx (reader), both on the default stream.
+        let stream = self.gpu.default_stream();
         let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
         self.gpu
             .copy_d2d_async(preserve, dst, n * ctx_slot_bytes, stream)

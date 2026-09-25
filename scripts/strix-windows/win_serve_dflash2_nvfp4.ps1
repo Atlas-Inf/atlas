@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Serves nvidia/Qwen3.8-27B-NVFP4 + incoai/Qwen3.8-27B-DFlash2 on Windows
-# gfx1151 (Strix Halo) — the configuration behind the 2026-09-22 clean
+# gfx1151 (Strix Halo) - the configuration behind the 2026-09-22 clean
 # agentic leg (winbox r3: 672/672 turns, 0 errors, score 0.6183, mean_na
 # ~2.7 flat through hour 4).
 #
-# What makes this different from a naive DFlash serve — the two knobs that
+# What makes this different from a naive DFlash serve - the two knobs that
 # fixed the 2026-09-15 Linux collapse (604/1007, mean_na 0.496):
 #
 #   * ATLAS_DFLASH_CTX_WINDOW must cover the full transcript. The captured
@@ -15,7 +15,7 @@
 #   * --dflash-window-size 0 resolves to "no explicit sliding window"; the
 #     checkpoint declares no swa_window_size, so the drafter runs full-prefix
 #     attention (KV pool sized to max_seq_len). Long-range signal comes
-#     through the ctx conditioning — verified: mean_na 6.18 on a predictable
+#     through the ctx conditioning - verified: mean_na 6.18 on a predictable
 #     decode at seq_len 28K.
 #
 # MEMORY FACTS (winbox, updated 2026-09-24 post-merge):
@@ -23,12 +23,12 @@
 #     watchdog during drafter scratch alloc and 0.80 was the tested value.
 #   * The 2026-09-24 merge (ctx-acc pool primed before KV sizing, startup
 #     balloons held across model build, contiguous Marconi snapshot blobs)
-#     raises pre-KV footprint to ~74.5 GB — the primed 2.5 GB ctx-acc plus
+#     raises pre-KV footprint to ~74.5 GB - the primed 2.5 GB ctx-acc plus
 #     ~6 GB of balloons now count inside it. util 0.80's budget (~71.6 GB)
 #     is BELOW that, so kv_budget=0 and startup bails.
 #   * util 0.90 is now the tested value: KV lands ~6.1 GB / ~99K tokens,
 #     32 Marconi slots, one transient watchdog trip during pool alloc but
-#     the balloons carried it through — server live + smoke verified.
+#     the balloons carried it through - server live + smoke verified.
 #   * The agentic dataset peaks ~25.2K ISL, so 32768 also works if
 #     headroom is tighter on a different boot.
 #

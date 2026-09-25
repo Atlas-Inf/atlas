@@ -56,6 +56,7 @@ pub(super) fn step_verify_dflash_batched(
     if let Err(e) = model.sync_secondary() {
         tracing::error!("dflash-batched sync_secondary: {e:#}");
         for a in batch.iter_mut() {
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
         }
         return;
@@ -95,6 +96,7 @@ pub(super) fn step_verify_dflash_batched(
                 Err(e) => {
                     tracing::error!("decode_verify_dflash serial diagnostic (i={i}): {e:#}");
                     for a in batch.iter_mut() {
+                        a.engine_error = Some(format!("{e:#}"));
                         a.finished = true;
                     }
                     return;
@@ -109,6 +111,7 @@ pub(super) fn step_verify_dflash_batched(
             Err(e) => {
                 tracing::error!("decode_verify_batched dflash (n={n} ks={ks:?}): {e:#}");
                 for a in batch.iter_mut() {
+                    a.engine_error = Some(format!("{e:#}"));
                     a.finished = true;
                 }
                 return;
@@ -173,6 +176,7 @@ pub(super) fn step_verify_dflash_batched(
         Err(error) => {
             tracing::error!("dflash hidden-save owner lookup failed: {error:#}");
             for a in batch.iter_mut() {
+                a.engine_error = Some(format!("{error:#}"));
                 a.finished = true;
             }
             return;
@@ -184,6 +188,7 @@ pub(super) fn step_verify_dflash_batched(
     {
         tracing::error!("preserve_dflash_save_front: {e:#}");
         for a in batch.iter_mut() {
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
         }
         return;
@@ -194,6 +199,8 @@ pub(super) fn step_verify_dflash_batched(
             let Some(k0) = restore_front_k else {
                 tracing::error!("DFlash owner slot 0 appeared without a preserved front");
                 for a in batch.iter_mut() {
+                    a.engine_error =
+                        Some("DFlash owner slot 0 appeared without a preserved front".to_string());
                     a.finished = true;
                 }
                 return;
@@ -201,6 +208,7 @@ pub(super) fn step_verify_dflash_batched(
             if let Err(e) = model.restore_dflash_save_front(k0, 0) {
                 tracing::error!("restore_dflash_save_front before owner-slot-0 commit: {e:#}");
                 for a in batch.iter_mut() {
+                    a.engine_error = Some(format!("{e:#}"));
                     a.finished = true;
                 }
                 return;
@@ -208,6 +216,7 @@ pub(super) fn step_verify_dflash_batched(
         } else if let Err(e) = model.pack_dflash_save_seq(slot, ks[i], 0) {
             tracing::error!("pack_dflash_save_seq(owner_slot={slot}): {e:#}");
             for a in batch.iter_mut() {
+                a.engine_error = Some(format!("{e:#}"));
                 a.finished = true;
             }
             return;
@@ -227,6 +236,7 @@ pub(super) fn step_verify_dflash_batched(
     {
         tracing::error!("restore_dflash_save_front: {e:#}");
         for a in batch.iter_mut() {
+            a.engine_error = Some(format!("{e:#}"));
             a.finished = true;
         }
         return;
@@ -236,7 +246,14 @@ pub(super) fn step_verify_dflash_batched(
         .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty())
         .collect();
     let batch_min = model.mtp_propose_batch_min().max(1);
-    if pending.len() >= batch_min {
+    // The head declares its own batched-propose envelope
+    // (`mtp_propose_batch_max` = 1 on generic DFlash — the Lightning B×γ
+    // seam is the γ=4 product contract and rejects the γ=8 this lane
+    // serves). Gate on it the same way verify_k4_batch_step does
+    // (`group_cap >= group_min`); below-cap pending takes the serial loop
+    // instead of an error round-trip through the proposer every step.
+    let batch_cap = model.mtp_propose_batch_max().max(1);
+    if pending.len() >= batch_min && batch_cap >= batch_min {
         let tokens: Vec<u32> = pending.iter().map(|&i| batch[i].last_token).collect();
         let positions: Vec<usize> = pending.iter().map(|&i| batch[i].seq.seq_len).collect();
         let stash_idx: Vec<usize> = pending.clone();
@@ -330,35 +347,45 @@ pub(super) fn step_verify_dflash_batched(
                 }
             }
         }
-    } else if let Some(&i) = pending.first() {
-        if let Err(e) = model.save_hidden_for_mtp_from_stash(i, 0) {
-            tracing::error!("save_hidden_for_mtp_from_stash({i}): {e:#}");
-            // Lightning product: a stash failure means the drafter cannot
-            // propose; fail closed instead of leaving the sequence to a
-            // silent serial bootstrap on the next step.
-            let slot = batch[i].seq.slot_idx;
-            let target = &mut batch[i];
-            fail_closed_if_lightning(model, target, "stash save failed (single)", slot);
-        } else {
-            match model.run_mtp_propose_multi(
-                batch[i].last_token,
-                batch[i].seq.seq_len,
-                propose_nd,
-                &mut batch[i].seq,
-                0,
-                None,
-            ) {
-                Ok(d) if !d.is_empty() => batch[i].pending_drafts = d,
-                Ok(_) => {
-                    let slot = batch[i].seq.slot_idx;
-                    let target = &mut batch[i];
-                    fail_closed_if_lightning(model, target, "single returned empty drafts", slot);
-                }
-                Err(e) => {
-                    tracing::error!("run_mtp_propose_multi: {e:#}");
-                    let slot = batch[i].seq.slot_idx;
-                    let target = &mut batch[i];
-                    fail_closed_if_lightning(model, target, "single errored", slot);
+    } else {
+        // Below the head's batched-propose envelope (lone pending, or the
+        // head declares max width 1): every pending sequence still gets its
+        // serial propose this step — not just the first.
+        for &i in &pending {
+            if let Err(e) = model.save_hidden_for_mtp_from_stash(i, 0) {
+                tracing::error!("save_hidden_for_mtp_from_stash({i}): {e:#}");
+                // Lightning product: a stash failure means the drafter cannot
+                // propose; fail closed instead of leaving the sequence to a
+                // silent serial bootstrap on the next step.
+                let slot = batch[i].seq.slot_idx;
+                let target = &mut batch[i];
+                fail_closed_if_lightning(model, target, "stash save failed (single)", slot);
+            } else {
+                match model.run_mtp_propose_multi(
+                    batch[i].last_token,
+                    batch[i].seq.seq_len,
+                    propose_nd,
+                    &mut batch[i].seq,
+                    0,
+                    None,
+                ) {
+                    Ok(d) if !d.is_empty() => batch[i].pending_drafts = d,
+                    Ok(_) => {
+                        let slot = batch[i].seq.slot_idx;
+                        let target = &mut batch[i];
+                        fail_closed_if_lightning(
+                            model,
+                            target,
+                            "single returned empty drafts",
+                            slot,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("run_mtp_propose_multi: {e:#}");
+                        let slot = batch[i].seq.slot_idx;
+                        let target = &mut batch[i];
+                        fail_closed_if_lightning(model, target, "single errored", slot);
+                    }
                 }
             }
         }
@@ -443,6 +470,7 @@ pub(super) fn apply_dflash_accept(
     let total_accepted = num_accepted + 1;
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
         tracing::error!("commit_accepted_prefix (dflash batched): {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
         a.finished = true;
         return;
     }

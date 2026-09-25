@@ -37,7 +37,9 @@
 //! gate's — a run that measured nothing must not read as green):
 //!
 //! * every run's `completion_tokens >= 700` (of the 1500 cap — the served
-//!   subject's deterministic natural stop is 717-718, see `MIN_OUTPUT_TOKENS`);
+//!   subject historically stopped at 717-718 under streaming because the
+//!   semantic-loop guard cut the response inside a code fence, see
+//!   `MIN_OUTPUT_TOKENS`);
 //! * every run reports the server decode rate (`usage."response_token/s"`);
 //! * `accept_len_mean >= 1.5`, derived from
 //!   `usage.completion_tokens_details.accepted_prediction_tokens` — the
@@ -80,8 +82,9 @@ pub const DESCRIPTOR: BenchmarkDescriptor = BenchmarkDescriptor {
              MEDIAN server decode rate (usage.\"response_token/s\"), judged against the \
              BENCH.toml floor under --pull-request-gate. Vacuity pins make the run \
              INCONCLUSIVE rather than PASS when it measured nothing: every run must emit \
-             >=700 of the 1500-token budget (the served subject's natural stop is a \
-             deterministic 717-718), report the server rate, and show accept_len_mean >= 1.5 \
+             >=700 of the 1500-token budget (the served subject previously stopped at \
+             717-718 only because the streaming semantic-loop guard cut the response \
+             inside a code fence), report the server rate, and show accept_len_mean >= 1.5 \
              derived from usage.completion_tokens_details.accepted_prediction_tokens \
              (requires the accept-stats instrumentation; a serve that is not speculating \
              cannot pass this gate's floor honestly). REQUIRED since 2026-08-15, promoted \
