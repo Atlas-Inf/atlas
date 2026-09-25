@@ -53,7 +53,7 @@ fn qsa_score_rows_exact_smem(n_heads: u32, hd: u32) -> u32 {
 /// 32 — the kernel replays the reference's per-warp reduction tree, and a warp
 /// is 32 lanes.
 pub fn qsa_score_rows_exact_ok(n_heads: u32, hd: u32) -> bool {
-    hd % 32 == 0 && qsa_score_rows_exact_smem(n_heads, hd) <= 48 * 1024
+    hd.is_multiple_of(32) && qsa_score_rows_exact_smem(n_heads, hd) <= 48 * 1024
 }
 
 /// Per-row block scores, one thread per score, BIT-IDENTICAL to

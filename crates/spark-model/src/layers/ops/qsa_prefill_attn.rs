@@ -64,8 +64,8 @@ pub const QSA_PA_G: u32 = 4;
 /// `[8][G][hd]` floats plus `m`/`l`, which must fit the 48 KB block limit.
 pub fn qsa_prefill_attn_grouped_ok(nq: u32, nkv: u32, hd: u32) -> bool {
     nkv != 0
-        && nq % QSA_PA_G == 0
-        && (nq / nkv) % QSA_PA_G == 0
+        && nq.is_multiple_of(QSA_PA_G)
+        && (nq / nkv).is_multiple_of(QSA_PA_G)
         // The runtime opts in to >48 KB dynamic shared automatically
         // (registry.rs sets CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES),
         // so the old 48 KB cap here was self-imposed, not a hardware limit.
@@ -141,7 +141,7 @@ fn qsa_score_rows_tc_smem(n_heads: u32, hd: u32) -> u32 {
 /// One warp per indexer head, so exactly 4 heads (the block is 128 threads),
 /// and `hd` a multiple of the 16-wide MMA k-step.
 pub fn qsa_score_rows_tc_ok(n_heads: u32, hd: u32) -> bool {
-    n_heads == 4 && hd % 16 == 0 && qsa_score_rows_tc_smem(n_heads, hd) <= 96 * 1024
+    n_heads == 4 && hd.is_multiple_of(16) && qsa_score_rows_tc_smem(n_heads, hd) <= 96 * 1024
 }
 
 /// Stage 1 on TENSOR CORES. Same scores as [`qsa_score_rows_exact`] up to the
@@ -189,7 +189,7 @@ pub fn qsa_score_rows_tc(
 /// inherited warp mapping already makes at 16. So exactly two kv heads, and the
 /// group must fit the 16-row half.
 pub fn qsa_prefill_attn_tc2_ok(nq: u32, nkv: u32, hd: u32) -> bool {
-    nkv == 2 && nq % nkv == 0 && nq / nkv <= 16 && hd == 256
+    nkv == 2 && nq.is_multiple_of(nkv) && nq / nkv <= 16 && hd == 256
 }
 
 /// Stage 2 on tensor cores, both kv heads per CTA. Same selected set and same
@@ -242,7 +242,7 @@ pub fn qsa_prefill_attn_tc2(
 /// q-heads, so the group must fit `BR = 32`. `hd` must be the 256 the kernel's
 /// `HDIM` is compiled at -- a narrower head would read the wrong columns.
 pub fn qsa_prefill_attn_tc_ok(nq: u32, nkv: u32, hd: u32) -> bool {
-    nkv != 0 && nq % nkv == 0 && nq / nkv <= 32 && hd == 256
+    nkv != 0 && nq.is_multiple_of(nkv) && nq / nkv <= 32 && hd == 256
 }
 
 /// Stage 2 on TENSOR CORES. Same selected set and same per-row semantics as
@@ -298,7 +298,10 @@ pub fn qsa_prefill_attn_tc(
 /// into `QSA_PA_G` groups of 8 (so `QSA_PA_G * 8 == 32`), and each lane's slice
 /// `hd / 8` must be a whole number of 16-byte chunks and fit `QSA_L8_EV`.
 pub fn qsa_prefill_attn_l8_ok(nq: u32, nkv: u32, hd: u32) -> bool {
-    qsa_prefill_attn_grouped_ok(nq, nkv, hd) && QSA_PA_G * 8 == 32 && hd % 64 == 0 && hd / 8 <= 32
+    qsa_prefill_attn_grouped_ok(nq, nkv, hd)
+        && QSA_PA_G * 8 == 32
+        && hd.is_multiple_of(64)
+        && hd / 8 <= 32
 }
 
 /// Stage 2, 8 lanes per head. Same selected set, same per-head online softmax

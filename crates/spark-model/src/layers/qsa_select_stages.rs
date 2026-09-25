@@ -51,51 +51,6 @@ fn rank_key(score: f32, idx: u32) -> u64 {
     ((!mono) as u64) << 32 | idx as u64
 }
 
-#[cfg(test)]
-mod rank_key_tests {
-    use super::rank_key;
-
-    /// `rank_key` ascending must reproduce `qsa_decode_select::rank_cmp`
-    /// exactly -- the selected set AND its order, because `qsa_prefill_attn`
-    /// accumulates its online softmax in list order.
-    #[test]
-    fn matches_the_comparator_it_replaces() {
-        let mut vals: Vec<f32> = vec![
-            -1e30,
-            -5.0,
-            -1.0,
-            -0.0,
-            0.0,
-            f32::MIN_POSITIVE,
-            0.5,
-            1.0,
-            3.25,
-            1e30,
-        ];
-        // Deterministic spread, including repeats so ties are exercised.
-        let mut s = 0x2545_F491_4F6C_DD1Du64;
-        for _ in 0..500 {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            vals.push(((s >> 40) as f32 / 1024.0) - 8.0);
-        }
-        // NaN (both signs) and the infinities: the reference is main's total
-        // order, which ranks NaN LAST, so the packed key must too.
-        vals.extend([f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 2.0]);
-        let n = vals.len();
-
-        let mut want: Vec<u32> = (0..n as u32).collect();
-        want.sort_by(|&a, &b| super::super::qsa_decode_select::rank_cmp(&vals, a, b));
-
-        let mut keys: Vec<u64> = (0..n).map(|i| rank_key(vals[i], i as u32)).collect();
-        keys.sort_unstable();
-        let got: Vec<u32> = keys.iter().map(|k| *k as u32).collect();
-
-        assert_eq!(want, got, "packed key disagrees with the f32 comparator");
-    }
-}
-
 impl QsaIndexer {
     /// Host arm of the prefill top-k: D2H the slab's block scores, select
     /// per row on all cores, H2D the lists. Moved verbatim out of
@@ -418,5 +373,50 @@ impl QsaIndexer {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rank_key_tests {
+    use super::rank_key;
+
+    /// `rank_key` ascending must reproduce `qsa_decode_select::rank_cmp`
+    /// exactly -- the selected set AND its order, because `qsa_prefill_attn`
+    /// accumulates its online softmax in list order.
+    #[test]
+    fn matches_the_comparator_it_replaces() {
+        let mut vals: Vec<f32> = vec![
+            -1e30,
+            -5.0,
+            -1.0,
+            -0.0,
+            0.0,
+            f32::MIN_POSITIVE,
+            0.5,
+            1.0,
+            3.25,
+            1e30,
+        ];
+        // Deterministic spread, including repeats so ties are exercised.
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..500 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            vals.push(((s >> 40) as f32 / 1024.0) - 8.0);
+        }
+        // NaN (both signs) and the infinities: the reference is main's total
+        // order, which ranks NaN LAST, so the packed key must too.
+        vals.extend([f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 2.0]);
+        let n = vals.len();
+
+        let mut want: Vec<u32> = (0..n as u32).collect();
+        want.sort_by(|&a, &b| super::super::qsa_decode_select::rank_cmp(&vals, a, b));
+
+        let mut keys: Vec<u64> = (0..n).map(|i| rank_key(vals[i], i as u32)).collect();
+        keys.sort_unstable();
+        let got: Vec<u32> = keys.iter().map(|k| *k as u32).collect();
+
+        assert_eq!(want, got, "packed key disagrees with the f32 comparator");
     }
 }
