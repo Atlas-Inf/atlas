@@ -121,6 +121,46 @@ extern "C" __global__ void exl3_f16_to_bf16(const half* __restrict__ in, __nv_bf
 }
 
 // ---------------------------------------------------------------------------
+// out[c * rows + r] = in[r * cols + c]: the fp16 transpose, used by the
+// load-time dequant (exl3_dense_bf16_nk) to walk W [in, out] to W^T [out, in].
+// Atlas code — the same 32x32 shared-memory tile (+1 padded, so both the read
+// and the write are coalesced within warps) as common/transpose_u8.cu.
+// Grid: (ceil(cols / 32), ceil(rows / 32))  Block: (32, 8), each thread moving
+// four elements. rows and cols need not be multiples of 32: every access is
+// guarded.
+
+#define EXL3_TRANSPOSE_TILE 32
+
+extern "C" __global__ __launch_bounds__(256) void exl3_transpose_f16(
+    const half* __restrict__ in, half* __restrict__ out, unsigned rows, unsigned cols)
+{
+    __shared__ half tile[EXL3_TRANSPOSE_TILE][EXL3_TRANSPOSE_TILE + 1];
+
+    const unsigned ix = blockIdx.x * EXL3_TRANSPOSE_TILE + threadIdx.x;  // col of in
+    const unsigned iy_base = blockIdx.y * EXL3_TRANSPOSE_TILE + threadIdx.y;
+
+    #pragma unroll
+    for (unsigned j = 0; j < EXL3_TRANSPOSE_TILE; j += 8)
+    {
+        const unsigned r = iy_base + j;
+        if (r < rows && ix < cols)
+            tile[threadIdx.y + j][threadIdx.x] = in[(size_t) r * cols + ix];
+    }
+    __syncthreads();
+
+    const unsigned ox = blockIdx.y * EXL3_TRANSPOSE_TILE + threadIdx.x;  // row of out
+    const unsigned oy_base = blockIdx.x * EXL3_TRANSPOSE_TILE + threadIdx.y;
+
+    #pragma unroll
+    for (unsigned j = 0; j < EXL3_TRANSPOSE_TILE; j += 8)
+    {
+        const unsigned c = oy_base + j;
+        if (c < cols && ox < rows)
+            out[(size_t) c * rows + ox] = tile[threadIdx.x][threadIdx.y + j];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // c[m, n] = a[m, k] * b[k, n], all row-major fp16, fp32 accumulation, one
 // rounding at the store. Correctness-first: a plain 16x16 shared-memory-tiled
 // sgemm-style kernel — the EXL3 path needs SOME fp16 GEMM (Atlas has none and

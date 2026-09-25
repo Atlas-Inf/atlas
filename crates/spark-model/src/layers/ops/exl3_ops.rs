@@ -29,6 +29,7 @@ pub struct Exl3Kernels {
     pub had_plain: KernelHandle,
     pub bf16_to_f16: KernelHandle,
     pub f16_to_bf16: KernelHandle,
+    pub transpose: KernelHandle,
     pub hgemm: KernelHandle,
 }
 
@@ -47,6 +48,7 @@ impl Exl3Kernels {
             had_plain: k("exl3_had_r128_plain")?,
             bf16_to_f16: k("exl3_bf16_to_f16")?,
             f16_to_bf16: k("exl3_f16_to_bf16")?,
+            transpose: k("exl3_transpose_f16")?,
             hgemm: k("exl3_hgemm_f16")?,
         })
     }
@@ -133,6 +135,28 @@ pub fn exl3_convert(
         .arg_ptr(input)
         .arg_ptr(output)
         .arg_u32(n)
+        .launch(stream)
+}
+
+/// `out[c * rows + r] = in[r * cols + c]` — the fp16 transpose. Block (32, 8),
+/// grid (ceil(cols / 32), ceil(rows / 32)); rows and cols need not be multiples
+/// of 32 (every access is guarded in the kernel).
+pub fn exl3_transpose_f16(
+    gpu: &dyn GpuBackend,
+    k: &Exl3Kernels,
+    input: DevicePtr,
+    output: DevicePtr,
+    rows: u32,
+    cols: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, k.transpose)
+        .grid([cols.div_ceil(32), rows.div_ceil(32), 1])
+        .block([32, 8, 1])
+        .arg_ptr(input)
+        .arg_ptr(output)
+        .arg_u32(rows)
+        .arg_u32(cols)
         .launch(stream)
 }
 
@@ -238,6 +262,61 @@ pub fn exl3_linear_bf16(
         (rows * w.shape.out_features) as u32,
         stream,
     )
+}
+
+/// `w` fully dequantized to BF16, row-major `[out_features, in_features]` — the
+/// HF layout Atlas dense weights use.
+///
+/// `W = diag(suh) · H · W_inner · H · diag(svh)` is `[in, out]`, so this walks
+/// the transpose `Wᵀ = diag(svh) · H · W_innerᵀ · H · diag(suh)`:
+/// reconstruct → `had_post` over the rows (scale `svh`) → transpose →
+/// `had_post` over the rows (scale `suh`) → `f16_to_bf16`.
+///
+/// `out_bf16` is caller-owned and must hold `in * out * 2` bytes. The two fp16
+/// scratch buffers are allocated here and freed before returning, including on
+/// the error path. Both feature counts must be multiples of the 128-wide
+/// Hadamard block.
+pub fn exl3_dense_bf16_nk(
+    gpu: &dyn GpuBackend,
+    k: &Exl3Kernels,
+    w: &Exl3Weight,
+    out_bf16: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    let (i, o) = (w.shape.in_features, w.shape.out_features);
+    if i % 128 != 0 || o % 128 != 0 {
+        bail!(
+            "EXL3 dense: in_features {i} and out_features {o} must both be multiples of \
+             the 128-wide Hadamard block"
+        );
+    }
+    let scratch_bytes = i * o * 2;
+    let a = gpu.alloc(scratch_bytes)?;
+    let b = match gpu.alloc(scratch_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = gpu.free(a);
+            return Err(e);
+        }
+    };
+    // Runs the five steps, then frees both scratch buffers — including when a
+    // step failed (`r` is returned after the frees, so nothing leaks on the
+    // error path).
+    let run = |gpu: &dyn GpuBackend| -> Result<()> {
+        exl3_reconstruct(gpu, k, w, a, stream)?;
+        // W_inner · H · diag(svh): one post pass over the rows of [in, out].
+        exl3_had_r128(gpu, k.had_post, a, a, w.svh, i as u32, o as u32, stream)?;
+        exl3_transpose_f16(gpu, k, a, b, i as u32, o as u32, stream)?;
+        // diag(svh) · H · W_innerᵀ · H: the same pass over the rows of [out, in].
+        exl3_had_r128(gpu, k.had_post, b, b, w.suh, o as u32, i as u32, stream)?;
+        exl3_convert(gpu, k.f16_to_bf16, b, out_bf16, (i * o) as u32, stream)
+    };
+    // Scratch must outlive the queued kernels: sync before freeing rather than
+    // relying on cuMemFree synchronizing implicitly.
+    let r = run(gpu).and_then(|()| gpu.synchronize(stream));
+    gpu.free(a)?;
+    gpu.free(b)?;
+    r
 }
 
 #[cfg(all(test, feature = "cuda"))]

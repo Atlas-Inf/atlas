@@ -165,9 +165,10 @@ fn dflash2_candidate_selector_arity_pin() {
 /// The EXL3 module is a standalone bundle member (not part of the w4a16 launch
 /// family), so it gets its own pin: the reconstruct entries take four params
 /// (out, packed, packed_blocks_n, packed_n_offset), the had_r128 entries four
-/// (in, out, scale, r_scale), the conversions three (in, out, n) and the fp16
-/// GEMM six (a, b, c, m, n, k); the launchers in spark-model must pass exactly
-/// that many. Update launcher and pin in the same commit.
+/// (in, out, scale, r_scale), the conversions three (in, out, n), the fp16
+/// transpose four (in, out, rows, cols) and the fp16 GEMM six (a, b, c, m, n,
+/// k); the launchers in spark-model must pass exactly that many. Update launcher
+/// and pin in the same commit.
 #[test]
 #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
 fn exl3_reconstruct_arity_pin() {
@@ -188,6 +189,7 @@ fn exl3_reconstruct_arity_pin() {
         ("exl3_had_r128_plain", 4),
         ("exl3_bf16_to_f16", 3),
         ("exl3_f16_to_bf16", 3),
+        ("exl3_transpose_f16", 4),
         ("exl3_hgemm_f16", 6),
     ];
     let mut checked = 0usize;

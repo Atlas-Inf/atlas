@@ -225,6 +225,108 @@ fn reconstruct_matches_cpu_on_real_tensors() {
     }
 }
 
+/// `exl3_transpose_f16` against a CPU transpose, on a ragged shape so every
+/// guarded load and store runs: bit-exact, the buffers hold no rounding.
+#[test]
+#[ignore = "needs a GB10 GPU and a real kernel build"]
+fn transpose_f16_matches_cpu() {
+    let gpu = gpu();
+    let g: &dyn GpuBackend = &gpu;
+    let k = Exl3Kernels::resolve(g).unwrap();
+    let stream = g.default_stream();
+
+    let (rows, cols) = (37usize, 70usize);
+    let mut seed = 0xF00D_1234_9ABC_DEF0u64;
+    let x: Vec<f16> = (0..rows * cols)
+        .map(|_| {
+            let u = (mix64(&mut seed) >> 16) as f32 / (1u64 << 48) as f32;
+            f16::from_f32(u * 2.0 - 1.0)
+        })
+        .collect();
+    let src = upload(g, &f16_bytes(&x));
+    let dst = upload(g, &vec![0u8; rows * cols * 2]);
+    exl3_transpose_f16(g, &k, src, dst, rows as u32, cols as u32, stream).unwrap();
+    let got = download_u16(g, dst, rows * cols);
+
+    let mut bad = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let want = x[r * cols + c].to_bits();
+            if got[c * rows + r] != want {
+                bad.push((r, c));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "transpose: {}/{} entries differ, first 5 (row, col): {:?}",
+        bad.len(),
+        rows * cols,
+        bad.iter().take(5).collect::<Vec<_>>()
+    );
+    for p in [src, dst] {
+        g.free(p).unwrap();
+    }
+}
+
+/// One EXL3 linear dequantized to BF16 `[out, in]`, against the CPU reference:
+/// `reconstruct(..)` gives W `[in, out]` in f32, the GPU walks the transpose
+/// through two fp16 Hadamard passes and one rounding to bf16.
+fn check_dense_bf16(g: &dyn GpuBackend, k: &Exl3Kernels, t: &Tensor) {
+    let stream = g.default_stream();
+    let (i, o) = (t.shape.in_features, t.shape.out_features);
+    let w = Exl3Weight {
+        trellis: upload(g, &u16_bytes(&t.trellis)),
+        suh: upload(g, &f16_bytes(&t.suh)),
+        svh: upload(g, &f16_bytes(&t.svh)),
+        shape: t.shape,
+    };
+    let out = upload(g, &vec![0u8; i * o * 2]);
+    exl3_dense_bf16_nk(g, k, &w, out, stream).unwrap();
+    let got = download_u16(g, out, i * o);
+
+    let w_ref = exl3::reconstruct_ref(&t.trellis, &t.suh, &t.svh, &t.shape).unwrap();
+    let (mut ngg, mut ngw, mut nw) = (0.0f64, 0.0f64, 0.0f64);
+    for r in 0..i {
+        for c in 0..o {
+            let v = bf16_f64(got[c * i + r]);
+            let x = w_ref[r * o + c] as f64;
+            ngg += v * v;
+            ngw += v * x;
+            nw += x * x;
+        }
+    }
+    // ||gpu - cpu|| / ||cpu||, from the inner products above.
+    let ratio = (ngg - 2.0 * ngw + nw).sqrt() / nw.sqrt();
+    eprintln!("{}: dense_bf16 rel_err = {ratio:.3e}", t.name);
+    assert!(
+        ratio < 5e-3,
+        "{}: relative error {ratio:.3e} >= 5e-3",
+        t.name
+    );
+    for p in [w.trellis, w.suh, w.svh, out] {
+        g.free(p).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "needs a GB10 GPU and a real kernel build"]
+fn dense_bf16_nk_matches_cpu_reconstruct() {
+    let gpu = gpu();
+    let g: &dyn GpuBackend = &gpu;
+    let k = Exl3Kernels::resolve(g).unwrap();
+    for t in fixture_tensors() {
+        check_dense_bf16(g, &k, &t);
+    }
+    let ts = real_tensors();
+    if ts.is_empty() && std::env::var_os("ATLAS_EXL3_TEST_DATA").is_none() {
+        eprintln!("ATLAS_EXL3_TEST_DATA unset: real tensors skipped");
+    }
+    for t in ts {
+        check_dense_bf16(g, &k, &t);
+    }
+}
+
 /// `y = x · diag(suh) H W_inner H diag(svh)` for bf16 `x`: the CPU reference
 /// accumulates `x · reconstruct(..)` in f64, the GPU runs the kernel path.
 fn check_linear(g: &dyn GpuBackend, k: &Exl3Kernels, t: &Tensor) {
