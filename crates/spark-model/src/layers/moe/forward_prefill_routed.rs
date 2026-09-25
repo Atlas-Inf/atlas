@@ -145,7 +145,17 @@ impl MoeLayer {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2);
-        let max_m_tiles = if persist > 0 && self.moe_k64_strides_m_tiles.0 != 0 {
+        //
+        // The short grid goes ONLY to the two launches below whose kernels
+        // stride (`moe_w4a16_fused_gate_up_t_k64`, `..._grouped_gemm_ptrtable_t_k64`).
+        // `max_m_tiles` itself stays the hottest expert's count: every other arm
+        // here -- the untransposed fallbacks (ATLAS_MOE_TRANSPOSE=0, or any boot
+        // or target where the transpose pass did not run), the m128 / fp4 /
+        // e8m0 variants and the FP8 down -- returns past its first m-tile, and
+        // handing it the short grid silently dropped every hot expert's rows
+        // past it: ATLAS_MOE_TRANSPOSE=0 measured dense ppl +14.9 %, above-bound
+        // +174 % (reiner job 267) before this split.
+        let grid_m_strided = if persist > 0 && self.moe_k64_strides_m_tiles.0 != 0 {
             let capped = avg_per_expert.saturating_mul(persist);
             max_m_tiles.min(capped.div_ceil(64).max(1) as u32)
         } else {
@@ -324,7 +334,7 @@ impl MoeLayer {
                             num_experts,
                             inter,
                             h,
-                            max_m_tiles,
+                            grid_m_strided,
                             stream,
                         )?;
                     }
@@ -524,7 +534,7 @@ impl MoeLayer {
                             num_experts,
                             h,
                             inter,
-                            max_m_tiles,
+                            grid_m_strided,
                             stream,
                         )?;
                     }
