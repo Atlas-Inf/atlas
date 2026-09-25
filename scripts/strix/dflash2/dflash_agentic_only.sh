@@ -65,7 +65,7 @@ fingerprint() {  # <leg> <max_seq> <extra serve flags...>
     echo "checkpoint=$MODEL revision=dbb8f445b3145f8a4c18ddc769f032d57d32867c"
     echo "drafter=incoai/Qwen3.8-27B-DFlash2 path=$DRAFTER gamma=$GAMMA option_b=${OPTION_B:-1} small_m_gemv=${ATLAS_DFLASH_SMALL_M_GEMV:-default}"
     echo "serve=serve-amd.sh DFLASH=1 GPU_UTIL=$GPU_UTIL request-timeout=900 MAX_SEQ_LEN=$maxseq prefill=$MAX_PREFILL_TOKENS kv=bf16 head=nvfp4 batch=1 ssm-slots=${SSM_SLOTS:-0} ssm-checkpoint-interval=${SSM_CKPT_INTERVAL:-16} dflash-window-size=${DFLASH_WINDOW_SIZE:-0}(full) dflash-ctx-window=${DFLASH_CTX_WINDOW:-$maxseq} mtp=off thinking=off(--disable-thinking) extra='$*'"
-    echo "env=ATLAS_W4A16_DP4A=1(default) ATLAS_W4A16_VARIANT=v1 ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_MTP_ACCEPT_DEBUG=1 HF_HUB_OFFLINE=1"
+    echo "env=ATLAS_W4A16_DP4A=1(default) ATLAS_W4A16_VARIANT=v1 ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_MTP_ACCEPT_DEBUG=1 ATLAS_NO_MTP_DRAFTER_CONTEXT=${ATLAS_NO_MTP_DRAFTER_CONTEXT:-1} HF_HUB_OFFLINE=1"
     echo "gpu_temp_edge=$(/opt/rocm/bin/amd-smi metric --temperature 2>/dev/null | sed -n 's/.*EDGE: *//p' | head -1)"
   } | tee "$OUT/$leg-fingerprint.txt"
 }
@@ -82,6 +82,7 @@ serve() {  # <serve-log> <max_seq> <extra serve flags...>
   ( cd "$WT" && HF_HUB_OFFLINE=1 RUST_LOG=info ATLAS_MTP_ACCEPT_DEBUG=1 \
       ATLAS_DFLASH_OPTION_B="${OPTION_B:-1}" \
       ATLAS_DFLASH_CTX_WINDOW="${DFLASH_CTX_WINDOW:-$maxseq}" \
+      ATLAS_NO_MTP_DRAFTER_CONTEXT="${ATLAS_NO_MTP_DRAFTER_CONTEXT:-1}" \
       DFLASH=1 DRAFT_MODEL="$DRAFTER" DFLASH_GAMMA="$GAMMA" GPU_UTIL="$GPU_UTIL" \
       MAX_SEQ_LEN="$maxseq" MAX_PREFILL_TOKENS="$MAX_PREFILL_TOKENS" PORT=$PORT HOST="${HOST:-127.0.0.1}" MODEL_NAME="$MODEL" SSM_SLOTS="${SSM_SLOTS:-0}" SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-16}" \
       ./serve-amd.sh "$MODEL" --disable-thinking --request-timeout 900 \
