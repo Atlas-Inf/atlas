@@ -267,10 +267,10 @@ impl Qwen3SsmLayer {
                 // both arms produce a number either way.
                 {
                     let name = match (
-                        std::env::var("ATLAS_GDN_PIPE").ok().as_deref(),
+                        crate::layers::ops::gdn_pipe_enabled(),
                         std::env::var("ATLAS_GDN_VTILE").ok().as_deref(),
                     ) {
-                        (Some("1"), _) => "gated_delta_rule_chunk_delta_h_pipe",
+                        (true, _) => "gated_delta_rule_chunk_delta_h_pipe",
                         (_, Some("1")) => "gated_delta_rule_chunk_delta_h_vtile",
                         _ => "gated_delta_rule_chunk_delta_h_vfused",
                     };
