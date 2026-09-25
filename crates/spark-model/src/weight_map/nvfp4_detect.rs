@@ -240,6 +240,12 @@ pub(crate) fn quantized_any(
     variant: Nvfp4Variant,
     qctx: QuantizeCtx,
 ) -> Result<QuantizedWeight> {
+    // EXL3-packed linear (routed/shared experts stay packed until the loader
+    // asks): dequantize to a transient BF16 buffer, then run the same runtime
+    // quantization the Bf16Raw arm below performs.
+    if store.contains(&format!("{prefix}.trellis")) {
+        return crate::weight_map::exl3::quantized_from_exl3(store, prefix, n, k, gpu, qctx);
+    }
     let _t_detect = std::time::Instant::now();
     // Per-key fallback (B8 #bugs RedHatAI/Qwen3-Coder-Next-NVFP4): some
     // models that are CompressedTensors overall keep certain projections

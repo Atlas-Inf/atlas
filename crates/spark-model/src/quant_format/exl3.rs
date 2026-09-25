@@ -21,6 +21,8 @@ use crate::quant_format::{QuantFormat, module_matches_pattern};
 use crate::weight_map::Nvfp4Variant;
 
 /// EXL3 checkpoint: recognised, named, and refused everywhere it cannot go.
+/// qwen4_exp is supported (materialized to BF16 / requantized at load, see
+/// `weight_map::exl3`); every other model type still refuses.
 #[derive(Debug)]
 pub struct Exl3Format {
     /// Module-path globs from the config's `ignore` list (unquantized
@@ -63,10 +65,10 @@ impl QuantFormat for Exl3Format {
 ///
 /// * `quant_method != "exl3"` (or no `quantization_config`) -> `Ok(())`,
 ///   byte-for-byte the previous behaviour for every other checkpoint.
-/// * `qwen4_exp`: the only model family with EXL3 kernels planned (they
-///   live in the nvfp4 bundle, see M3) — the layer loader is not wired up
-///   yet, so a checkpoint that reaches this site is refused with the
-///   "recognised but not implemented" error a later milestone replaces.
+/// * `qwen4_exp`: supported — `build_model` materializes the dense linears
+///   to BF16 and `quantized_any` requantizes the experts, so this only
+///   validates the EXL3 block and passes. A malformed block still errors,
+///   with the field message rather than the generic one.
 /// * any other `model_type`: EXL3 packing is model-family agnostic but the
 ///   trellis loader is not written for the other architectures — refuse.
 pub fn ensure_not_exl3(config: &ModelConfig, site: &str) -> Result<()> {
@@ -77,16 +79,11 @@ pub fn ensure_not_exl3(config: &ModelConfig, site: &str) -> Result<()> {
         return Ok(());
     }
     if config.model_type == "qwen4_exp" {
-        let bits = match qc.exl3_config() {
-            Ok(cfg) => cfg.bits,
-            // A malformed block is still an exl3 checkpoint; refuse with
-            // what was wrong rather than with the generic message.
-            Err(err) => bail!("{err} (at {site})"),
-        };
-        bail!(
-            "EXL3 checkpoint recognised (bits {bits}, codebook mul1) but EXL3 \
-             layer loading is not implemented yet (at {site})"
-        );
+        // A malformed block is still an exl3 checkpoint; refuse with what
+        // was wrong rather than with the generic message.
+        qc.exl3_config()
+            .map_err(|err| anyhow::anyhow!("{err} (at {site})"))?;
+        return Ok(());
     }
     bail!(
         "EXL3 checkpoints are only supported for qwen4_exp (Qwen3.8-Flash-Next); \
@@ -147,15 +144,8 @@ mod tests {
     }
 
     #[test]
-    fn ensure_not_exl3_refuses_qwen4_exp_with_bits() {
-        let err = ensure_not_exl3(&exl3_config("qwen4_exp"), "test")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("EXL3 checkpoint recognised (bits 4.05, codebook mul1)")
-                && err.contains("not implemented yet"),
-            "{err}"
-        );
+    fn ensure_not_exl3_accepts_qwen4_exp() {
+        ensure_not_exl3(&exl3_config("qwen4_exp"), "test").expect("qwen4_exp must load");
     }
 
     #[test]

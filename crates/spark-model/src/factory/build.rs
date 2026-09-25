@@ -122,9 +122,22 @@ pub fn build_model(
 
     // An EXL3 checkpoint must never reach the variant-based loaders below
     // (`detect_nvfp4_variant` / `WeightFormat::detect` would guess BF16).
-    // The single refusal lives here; the EXL3 loader branch of a later
-    // milestone replaces this call.
+    // `ensure_not_exl3` accepts qwen4_exp and refuses the other model types;
+    // the materialization below is what makes an accepted EXL3 checkpoint
+    // readable by them.
     crate::quant_format::ensure_not_exl3(&config, "build_model")?;
+
+    // EXL3: dense linears become BF16 `.weight` tensors here; routed and shared
+    // experts stay packed and are requantized one by one in `quantized_any`.
+    let mut store = store;
+    if config
+        .quantization_config
+        .as_ref()
+        .is_some_and(|qc| qc.is_exl3())
+    {
+        crate::weight_map::exl3::exl3_materialize_dense(&mut store, gpu.as_ref())?;
+        config.attn_proj_bf16 = true;
+    }
 
     // ── LoRA adapter load (pre-arena, pre-KV-sizing) ──
     // MUST run before `BufferArena::new` and the `gpu.free_memory()`

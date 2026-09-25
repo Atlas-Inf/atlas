@@ -33,10 +33,18 @@
 //! (`decode_3inst<2>`) and `exllamav3/exllamav3/modules/quant/exl3.py` (weight
 //! assembly). `bench/exl3/reference.py` is the NumPy oracle the fixtures in
 //! `bench/exl3/fixtures.json` were generated from.
+//!
+//! Loading an EXL3 checkpoint (`exl3_materialize_dense`, called from
+//! `build_model`) works on that reference: the DENSE linears are dequantized
+//! once to BF16 `<stem>.weight` store entries before layer construction, and
+//! the routed / shared experts are dequantized to a transient BF16 buffer and
+//! runtime-quantized to NVFP4 per expert in `quantized_any` (see `requant`).
 
 mod cpu_ref;
 #[cfg(test)]
 pub(crate) mod fixtures;
+mod materialize;
+mod requant;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
@@ -48,6 +56,8 @@ mod weight_tests;
 #[cfg(test)]
 pub(crate) use cpu_ref::{HAD_SCALE, reconstruct as reconstruct_ref};
 pub use cpu_ref::{decode_inner, mul1_decode, reconstruct, tile_states};
+pub use materialize::exl3_materialize_dense;
+pub(crate) use requant::quantized_from_exl3;
 pub use weight::{Exl3Weight, MUL1_TAG, exl3_from_store};
 
 /// The shape of one EXL3 trellis tensor, as derived from its `trellis` dims.
