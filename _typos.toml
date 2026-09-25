@@ -68,6 +68,10 @@ ba = "ba"
 # the SCALE/HIP Strix-Halo porting docs. Not a typo of `HAS`/`has`.
 HSA = "HSA"
 hsa = "hsa"
+# `VALU` — AMD's vector ALU (the RDNA/CDNA instruction class and profiler
+# counter, e.g. `SQ_INSTS_VALU`), used in the strix-hip kernel commentary.
+# Not a typo of `VALUE`.
+VALU = "VALU"
 # Output-tokens loop variable in Python benchmark scripts (`for ot in ...`).
 ot = "ot"
 # Steps-per-second shorthand in concurrency benchmark output.
