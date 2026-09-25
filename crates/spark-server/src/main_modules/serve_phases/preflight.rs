@@ -69,31 +69,11 @@ pub(crate) fn preflight_reserve(
         // refusal lifts.
         spark_model::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
         // `--ssm-rollback-mode` (published by serve_flags before this runs).
-        // Replay drops every per-token verify intermediate; its input ring
-        // is the separate term below.
+        // Replay drops every per-token verify intermediate.
         spark_model::ssm_reserve::ssm_rollback_mode(),
     );
-    // Replay-mode verify-window input ring (EXPERIMENTAL scaffold): sized by
-    // the SAME SSOT `SsmStatePool::new` allocates through. K ceiling is the
-    // MTP `num_drafts + 1` — matching this preflight's existing convention
-    // for the conv term (the DFlash γ=17 widening and the pools' dummy slot
-    // have never been preflight-counted; the CUDA headroom absorbs them).
-    let ssm_replay_ring = if spec_on_pool
-        && spark_model::ssm_reserve::ssm_rollback_mode()
-            == spark_model::ssm_reserve::SsmRollbackMode::Replay
-    {
-        spark_model::ssm_reserve::ssm_replay_ring_bytes(
-            config.num_ssm_layers(),
-            spark_model::ssm_reserve::ssm_replay_row_bytes(
-                config.ssm_qkvz_size(),
-                config.linear_num_value_heads,
-            ),
-            args.resolved_num_drafts() + 1,
-            mtp_state_slots,
-        )
-    } else {
-        0
-    };
+    // The replay-mode verify-window input ring is likewise allocated inside
+    // `SsmStatePool::new` (pre-snapshot) — no reserve term.
     let spec_tokens_pre = if args.speculative || args.self_speculative || args.ngram_speculative {
         args.resolved_num_drafts() + 2
     } else {
@@ -188,12 +168,14 @@ pub(crate) fn preflight_reserve(
             0
         }
     };
-    let inference_reserve: usize = ssm_pool_bytes
-        + ssm_h_stage_bytes
-        + ssm_replay_ring
-        + ssm_snapshot_bytes
-        + gdn_two_phase_bytes
-        + cuda_headroom;
+    // The SSM state/snapshot pool terms (ssm_pool_bytes, ssm_h_stage_bytes,
+    // ssm_replay_ring, ssm_snapshot_bytes) are deliberately NOT in the
+    // reserve: `build_model` allocates the real pools before the KV-budget
+    // `free_memory()` snapshot, so they land in `used_so_far` — reserving
+    // them again here double-charged ~20 GB and refused configs that
+    // physically fit (the #61 fix turned a silent oversubscription into a
+    // false refusal; seen on the post-merge bfcl leg at util 0.70).
+    let inference_reserve: usize = gdn_two_phase_bytes + cuda_headroom;
     let total_reserve = inference_reserve + buffer_arena_bytes;
     if total_reserve > free_mem {
         let need_gb = total_reserve as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -247,7 +229,8 @@ pub(crate) fn preflight_reserve(
     // need to trace a specific deployment's reserve.
     let spec_on = spec_on_pool;
     tracing::debug!(
-        "Preflight reserve breakdown: \
+        "Preflight reserve breakdown (ssm_pool/ssm_snapshot are estimates of \
+         the pre-snapshot pool allocations — excluded from inference_reserve): \
          ssm_pool={} MB ({} max_batch blobs + {} MTP-covered slots × {} verify blobs, \
          {} ssm_layers × (h+conv)), \
          ssm_snapshot={} MB ({} slots), \
