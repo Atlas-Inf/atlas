@@ -75,6 +75,8 @@ mod hyper_connection_lowrank;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
 #[path = "ops/hyper_connection_lowrank_gemm.rs"]
 mod hyper_connection_lowrank_gemm;
+#[path = "ops/hyper_connection_lowrank_split.rs"]
+mod hyper_connection_lowrank_split;
 // GPU parity test, so it needs the cuda backend to compile at all. Gated on
 // the feature and not just `test`, so `--features metal` can still build and
 // RUN this crate's ordinary unit tests — which is the only way they get
@@ -144,6 +146,10 @@ mod q2_0_mmq;
 mod q4k_mmq;
 #[path = "ops/qsa.rs"]
 mod qsa;
+#[path = "ops/qsa_prefill_attn.rs"]
+mod qsa_prefill_attn;
+#[path = "ops/qsa_rows.rs"]
+mod qsa_rows;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 pub mod qwen4exp;
@@ -230,6 +236,8 @@ pub use prefill_attn_turbok::*;
 pub use q2_0_mmq::*;
 pub use q4k_mmq::*;
 pub use qsa::*;
+pub use qsa_prefill_attn::*;
+pub use qsa_rows::*;
 pub use quant_dispatch::*;
 pub use sampling::*;
 pub use ssm_gdn_a::*;

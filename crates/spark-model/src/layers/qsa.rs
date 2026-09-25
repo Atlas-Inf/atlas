@@ -40,6 +40,8 @@ mod qsa_free;
 
 #[path = "qsa_select.rs"]
 mod qsa_select;
+#[path = "qsa_select_stages.rs"]
+mod qsa_select_stages;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "qsa_tests.rs"]
 mod tests;
