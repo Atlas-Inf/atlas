@@ -873,6 +873,13 @@ impl BlockDiffusionDraftHead {
                 .count(),
             head.target_layer_ids,
         );
+        if head.startup.generic_batch_authoritative {
+            tracing::info!(
+                "DFlash batched propose: authoritative Bxgamma for generic DFlash \
+                 (min 2, max {})",
+                head.batch_capacity
+            );
+        }
 
         // Phase G — opt-in drafter MLP FP8. Quantize the seven dense-GEMM
         // weights per layer (q/k/v/o/gate/up/down) BF16 → FP8 E4M3 with

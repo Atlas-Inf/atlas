@@ -434,3 +434,19 @@ fn shared_structural_gate_rejects_each_eager_cause() {
     })
     .expect("clean structural state passes the shared gate");
 }
+
+/// Table for `generic_batch_authoritative_decision`: the flag requires the
+/// env var AND Option B AND exactly one lane.
+#[test]
+fn generic_batch_authoritative_decision_table() {
+    use super::product_policy::generic_batch_authoritative_decision as d;
+    // env unset / non-"1" / wrong value never enables
+    assert!(!d(None, true, 1));
+    assert!(!d(Some("0"), true, 1));
+    assert!(!d(Some("true"), true, 1));
+    // "1" requires Option B and a single lane
+    assert!(d(Some("1"), true, 1));
+    assert!(!d(Some("1"), false, 1));
+    assert!(!d(Some("1"), true, 2));
+    assert!(!d(Some("1"), false, 0));
+}

@@ -297,6 +297,9 @@ pub struct DsparkStartupExecution {
     pub native_batch_authoritative: bool,
     /// Option B paged-context drafter path is active.
     pub option_b_enabled: bool,
+    /// Generic DFlash serves the staged Bxgamma drafts authoritatively
+    /// (`ATLAS_DFLASH_BATCHED_PROPOSE=1` + Option B + single lane).
+    pub generic_batch_authoritative: bool,
     /// Number of total propose lanes (lane 0 is the default stream).
     pub proposal_lane_count: usize,
     /// Diagnostic draft-depth cap override; `None` keeps scheduler K.
@@ -322,6 +325,7 @@ impl DsparkStartupExecution {
         Self {
             native_batch_authoritative: true,
             option_b_enabled: toggles.option_b_enabled,
+            generic_batch_authoritative: false,
             proposal_lane_count: toggles.proposal_lane_count,
             draft_cap_override: toggles.draft_cap_override,
             option_b_no_ctx: false,
@@ -359,14 +363,32 @@ impl DsparkStartupExecution {
         ]
         .iter()
         .any(|name| present(name));
+        let option_b_enabled = one("ATLAS_DFLASH_OPTION_B");
+        let proposal_lane_count = std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(1)
+            .max(1);
+        let batch_env = std::env::var("ATLAS_DFLASH_BATCHED_PROPOSE")
+            .ok()
+            .map(|v| v.as_str().to_owned());
+        let batch_env_ref = batch_env.as_deref();
+        let generic_batch_authoritative = generic_batch_authoritative_decision(
+            batch_env_ref,
+            option_b_enabled,
+            proposal_lane_count,
+        );
+        if batch_env_ref == Some("1") && !generic_batch_authoritative {
+            tracing::warn!(
+                "ATLAS_DFLASH_BATCHED_PROPOSE=1 ignored: requires ATLAS_DFLASH_OPTION_B=1 \
+                 and a single propose lane (option_b={option_b_enabled}, lanes={proposal_lane_count})"
+            );
+        }
         Self {
             native_batch_authoritative: false,
-            option_b_enabled: one("ATLAS_DFLASH_OPTION_B"),
-            proposal_lane_count: std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or(1)
-                .max(1),
+            option_b_enabled,
+            generic_batch_authoritative,
+            proposal_lane_count,
             draft_cap_override: std::env::var("ATLAS_DFLASH_DRAFT_CAP")
                 .ok()
                 .and_then(|raw| raw.parse().ok()),
@@ -420,4 +442,16 @@ pub fn enforce_lightning_structural_gate(
         ));
     }
     Ok(())
+}
+
+/// Pure decision: generic-DFlash authoritative Bxgamma propose is on only
+/// when the env flag is set AND the staged seam is reachable (Option B paged
+/// context, exactly one proposal lane — multi-lane pins per-lane scratch and
+/// graph state that the staged path does not carry).
+pub fn generic_batch_authoritative_decision(
+    env: Option<&str>,
+    option_b: bool,
+    lanes: usize,
+) -> bool {
+    env == Some("1") && option_b && lanes == 1
 }
