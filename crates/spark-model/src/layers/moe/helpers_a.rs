@@ -253,12 +253,8 @@ impl MoeLayer {
             // Unified: transpose into scratch, copy back over the originals —
             // no per-layer slab allocs and no ~3K small frees per call.
             (
-                self.transpose_experts_inplace(
-                    gpu, &gate_src, inter, h, routed_gs, &mut scratch,
-                )?,
-                self.transpose_experts_inplace(
-                    gpu, &up_src, inter, h, routed_gs, &mut scratch,
-                )?,
+                self.transpose_experts_inplace(gpu, &gate_src, inter, h, routed_gs, &mut scratch)?,
+                self.transpose_experts_inplace(gpu, &up_src, inter, h, routed_gs, &mut scratch)?,
             )
         };
         self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);

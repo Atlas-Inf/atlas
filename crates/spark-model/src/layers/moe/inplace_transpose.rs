@@ -137,7 +137,11 @@ impl MoeLayer {
             if w.is_null() {
                 continue;
             }
-            gpu.copy_d2d(scratch.packed.offset(e * packed_each), w.weight, packed_each)?;
+            gpu.copy_d2d(
+                scratch.packed.offset(e * packed_each),
+                w.weight,
+                packed_each,
+            )?;
             gpu.copy_d2d(
                 scratch.scale.offset(e * scale_each),
                 w.weight_scale,
