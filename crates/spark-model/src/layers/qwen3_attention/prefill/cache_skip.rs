@@ -638,6 +638,33 @@ impl Qwen3AttentionLayer {
                 .arg_u32(hd)
                 .launch(stream)?;
         }
+        // Step 8b below OVERWRITES `attn_out` for every row at or past
+        // `inert_bound`; only rows below it keep this dense output. And this is
+        // causal self-attention over the chunk's OWN tokens (`flash_seq_len` is
+        // `n`, `flash_batch` is 1, k/v_contiguous hold just this chunk), so row
+        // `r` never reads a key past `r`. Computing only `[0, bound)` is
+        // therefore exactly the dense result for the rows that survive -- the
+        // rest is quadratic work thrown away.
+        //
+        // Companion to the whole-launch skip in `paged.rs`, which covers chunks
+        // that start past the bound. This is the chunk that STRADDLES it:
+        // 8196 rows computed, 2051 kept. nsys at 29670 tokens measured the
+        // launch at 291.9 ms, and cost goes as L^2, so 2051/8196 leaves ~6%.
+        //
+        // Guards, all narrowing: single-stream (batched stacks sequences into
+        // `flash_seq_len`, so truncating would cut a sequence in half), and the
+        // TurboQuant output bookend inert, so this never rotates rows nobody
+        // wrote.
+        let dense_seq_len = match self.qsa.as_ref() {
+            Some(q)
+                if batched_meta.is_none()
+                    && !(v_is_turbo && wht_runtime_active)
+                    && (num_tokens as u32) > q.inert_bound() as u32 =>
+            {
+                q.inert_bound() as u32
+            }
+            _ => flash_seq_len,
+        };
         let wide_head_path = hd > 256 && self.prefill_attn_512_k.0 != 0;
         if wide_head_path {
             // HDIM=512: use scalar reference kernel (BR=16, correct for any head_dim)
@@ -649,7 +676,7 @@ impl Qwen3AttentionLayer {
                 k_contiguous,
                 v_contiguous,
                 attn_out,
-                flash_seq_len,
+                dense_seq_len,
                 flash_batch,
                 nq,
                 nkv,
@@ -677,7 +704,7 @@ impl Qwen3AttentionLayer {
                 k_contiguous,
                 v_contiguous,
                 attn_out,
-                flash_seq_len,
+                dense_seq_len,
                 flash_batch,
                 nq,
                 nkv,
@@ -726,21 +753,6 @@ impl Qwen3AttentionLayer {
             None
         };
 
-        // ATLAS_OP_DUMP: attn_out BEFORE sigmoid gate (raw FlashAttention output).
-        // Compares 1:1 against vLLM's "attn_out" dump in qwen3_next.py.
-        if num_tokens > 0 {
-            let nq_hd = (nq * hd) as usize;
-            super::super::op_dump::dump_bf16(
-                ctx.gpu,
-                attn_out,
-                (num_tokens - 1) * nq_hd * bf16,
-                nq_hd,
-                self.attn_layer_idx,
-                "attn_out_pre_gate",
-                stream,
-            )?;
-        }
-
         // ── 8b. QSA stage-2: per-query prefill selection (Qwen3.8-Flash-
         // Next). Rows past the inert bound get their attention CONTEXT
         // overwritten with attention over exactly their reference-selected
@@ -768,6 +780,27 @@ impl Qwen3AttentionLayer {
                 inv_sqrt_d,
                 ctx.buffers.qsa_select_scratch(),
                 ctx.gpu,
+                stream,
+            )?;
+        }
+
+        // ATLAS_OP_DUMP: attn_out BEFORE sigmoid gate (raw FlashAttention output).
+        // Compares 1:1 against vLLM's "attn_out" dump in qwen3_next.py.
+        //
+        // AFTER 8b, deliberately, and for the same reason as the paged path:
+        // the last row of a long prompt is past `inert_bound`, so before 8b
+        // this dumped a dense value that was then discarded -- and compared it
+        // against a vLLM dump taken after ITS selective attention. It also has
+        // to be here now, since the dense pass no longer writes those rows.
+        if num_tokens > 0 {
+            let nq_hd = (nq * hd) as usize;
+            super::super::op_dump::dump_bf16(
+                ctx.gpu,
+                attn_out,
+                (num_tokens - 1) * nq_hd * bf16,
+                nq_hd,
+                self.attn_layer_idx,
+                "attn_out_pre_gate",
                 stream,
             )?;
         }

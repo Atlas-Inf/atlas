@@ -187,18 +187,17 @@ pub fn sanitize_content_chunk(
                 continue;
             }
             None => {
-                let buf_len = tag_scan_buf.len();
-                let hold = tag_max.saturating_sub(1);
-                if buf_len <= hold {
-                    break;
-                }
-                let commit_to = buf_len - hold;
-                let cut = tag_scan_buf
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .take_while(|&i| i <= commit_to)
-                    .last()
-                    .unwrap_or(0);
+                // Hold back only a suffix that could still GROW into a
+                // marker. This used to hold a flat `tag_max - 1` bytes
+                // (~18 for qwen3_coder), which delayed EVERY content delta
+                // by several tokens even in plain prose and sliced deltas
+                // mid-word — the ~135 ms per-delta lag, and the first
+                // delta waiting on a later token, seen client-side.
+                // No complete marker is in the buffer here (the searches
+                // above would have matched it), so every byte before the
+                // earliest marker-prefix suffix is final: emitting it now
+                // produces the same bytes, only sooner.
+                let cut = marker_prefix_hold_start(tag_scan_buf, tag_max, markers);
                 let emit: String = tag_scan_buf.drain(..cut).collect();
                 out.push_str(&emit);
                 break;
@@ -386,6 +385,34 @@ pub fn primary_arg_for_tool(name: &str, args_json: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Byte offset where the streaming sanitizer must start holding: the
+/// earliest position `p` in the last `tag_max - 1` bytes such that
+/// `buf[p..]` is a PROPER prefix of some marker (i.e. more bytes could
+/// complete it). Returns `buf.len()` when no such suffix exists, so the
+/// whole buffer is emitted. Always a UTF-8 char boundary.
+pub(crate) fn marker_prefix_hold_start(
+    buf: &str,
+    tag_max: usize,
+    markers: &tool_parser::LeakMarkers,
+) -> usize {
+    let window_start = buf.floor_char_boundary(buf.len().saturating_sub(tag_max.saturating_sub(1)));
+    for (off, _) in buf[window_start..].char_indices() {
+        let p = window_start + off;
+        let tail = &buf[p..];
+        let grows = markers
+            .orphan_open
+            .iter()
+            .chain(markers.close.iter())
+            .chain(markers.envelope_open.iter())
+            .chain(markers.envelope_close.iter())
+            .any(|m| m.len() > tail.len() && m.starts_with(tail));
+        if grows {
+            return p;
+        }
+    }
+    buf.len()
 }
 
 #[cfg(test)]

@@ -299,88 +299,136 @@ fn qsa_prefill_attn_matches_cpu() {
     assert!(worst_cos > 0.999, "attention kernel diverges: {worst_cos}");
 }
 
-/// Minimal repro for the dense chunk-0 flash zeroing rows past ~1280 at
-/// qwen4_exp geometry (nq=24, nkv=2, hd=256, causal, seq 2809). Synthetic
-/// q/k/v, CPU reference at probe rows. If this passes, the corruption is in
-/// the K/V staging upstream of the kernel, not the kernel.
+/// Stage 2B': `qsa_prefill_attn_g` must be BYTE-IDENTICAL to
+/// `qsa_prefill_attn`, not merely close.
+///
+/// The grouped kernel exists only to stop re-reading each K/V row once per q
+/// head (nq=24 over nkv=2 was twelve reads of every byte, 3.70 s and 32.6% of
+/// an 11k prefill). It keeps the same warp-striped `t` order, the same
+/// per-head online-softmax state and the same cross-warp merge order, so the
+/// claim is bit-identity -- and a cosine check against a CPU reference would
+/// not catch a reassociation that quietly costs the last mantissa bits. This
+/// compares the two kernels directly on the same inputs and requires equality.
 #[test]
 #[ignore]
-fn flash64_long_seq_rows_repro() {
+fn qsa_prefill_attn_g_matches_single_head_bitwise() {
     let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
         .expect("build with ATLAS_TARGET_MODEL='*'");
     let gpu =
         spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
     let g: &dyn GpuBackend = &gpu;
     let stream = g.default_stream();
-    let k = g
-        .kernel("inferspark_prefill", "inferspark_prefill_64")
-        .unwrap();
+    let k1 = g.kernel("qsa_indexer", "qsa_prefill_attn").unwrap();
+    let kg = g.kernel("qsa_indexer", "qsa_prefill_attn_g").unwrap();
 
-    let (n, nq, nkv, hd) = (2809usize, 24usize, 2usize, 256usize);
-    let mut seed = 0xBEEFu32;
+    let (rows, nq, nkv, hd, ratio, topk, bs) =
+        (5usize, 24usize, 2usize, 256usize, 4usize, 8usize, 16usize);
+    let first_pos = 41usize;
+    let n_pos = first_pos + rows;
+    let pages = n_pos.div_ceil(bs);
+    assert!(
+        ops::qsa_prefill_attn_grouped_ok(nq as u32, nkv as u32, hd as u32),
+        "this geometry must be eligible or the test proves nothing"
+    );
+
+    let mut seed = 0x9e3779b9u32;
     let mut nextf = move || {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
         ((seed >> 8) as f32 / (1 << 24) as f32) - 0.5
     };
     let bf = |v: f32| -> u16 { (v.to_bits() >> 16) as u16 };
-    let unbf = |u: u16| -> f32 { f32::from_bits((u as u32) << 16) };
-    let q_host: Vec<u16> = (0..n * nq * hd).map(|_| bf(nextf())).collect();
-    let k_host: Vec<u16> = (0..n * nkv * hd).map(|_| bf(nextf())).collect();
-    let v_host: Vec<u16> = (0..n * nkv * hd).map(|_| bf(nextf())).collect();
+
+    let q_host: Vec<u16> = (0..rows * nq * hd).map(|_| bf(nextf())).collect();
+    let kv_elems = pages * bs * nkv * hd;
+    let k_host: Vec<u16> = (0..kv_elems).map(|_| bf(nextf())).collect();
+    let v_host: Vec<u16> = (0..kv_elems).map(|_| bf(nextf())).collect();
+    let lists_host: Vec<i32> = (0..rows)
+        .flat_map(|r| (0..topk as i32).map(move |i| (i * 5 + r as i32) % 10))
+        .collect();
+
     let as_bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
     let q_dev = upload(g, &as_bytes(&q_host));
     let k_dev = upload(g, &as_bytes(&k_host));
     let v_dev = upload(g, &as_bytes(&v_host));
-    let out_dev = g.alloc(n * nq * hd * 2).unwrap();
-    // Poison the output so unwritten rows are detectable.
-    let poison = vec![0x3Fu8; n * nq * hd * 2];
-    g.copy_h2d_async(&poison, out_dev, stream).unwrap();
+    let lists_dev = upload(
+        g,
+        &lists_host
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let ident: Vec<u8> = (0..pages as i32).flat_map(|v| v.to_le_bytes()).collect();
+    let table = upload(g, &ident);
     let scale = 1.0 / (hd as f32).sqrt();
 
-    ops::prefill_attention_64(
-        g, k, q_dev, k_dev, v_dev, out_dev, n as u32, 1, nq as u32, nkv as u32, hd as u32, scale,
-        true, 0, stream,
+    let out_a = g.alloc(rows * nq * hd * 2).unwrap();
+    let out_b = g.alloc(rows * nq * hd * 2).unwrap();
+
+    ops::qsa_prefill_attn(
+        g,
+        k1,
+        q_dev,
+        k_dev,
+        v_dev,
+        table,
+        lists_dev,
+        out_a,
+        rows as u32,
+        first_pos as u32,
+        topk as u32,
+        ratio as u32,
+        bs as u32,
+        nq as u32,
+        nkv as u32,
+        hd as u32,
+        scale,
+        stream,
+    )
+    .unwrap();
+    ops::qsa_prefill_attn_g(
+        g,
+        kg,
+        q_dev,
+        k_dev,
+        v_dev,
+        table,
+        lists_dev,
+        out_b,
+        rows as u32,
+        first_pos as u32,
+        topk as u32,
+        ratio as u32,
+        bs as u32,
+        nq as u32,
+        nkv as u32,
+        hd as u32,
+        scale,
+        stream,
     )
     .unwrap();
     g.synchronize(stream).unwrap();
-    let got = dl_bf16(g, out_dev, n * nq * hd);
 
-    let group = nq / nkv;
-    for &row in &[100usize, 1024, 1200, 1279, 1280, 1290, 1500, 2051, 2808] {
-        // CPU reference for head 0 only (cheap).
-        let h = 0usize;
-        let kvh = h / group;
-        let qv: Vec<f32> = (0..hd)
-            .map(|d| unbf(q_host[(row * nq + h) * hd + d]))
-            .collect();
-        let mut m = f32::MIN;
-        let scores: Vec<f32> = (0..=row)
-            .map(|t| {
-                let base = (t * nkv + kvh) * hd;
-                let s: f32 = (0..hd).map(|d| qv[d] * unbf(k_host[base + d])).sum::<f32>() * scale;
-                m = m.max(s);
-                s
-            })
-            .collect();
-        let exps: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
-        let l: f32 = exps.iter().sum();
-        let mut refv = vec![0.0f32; hd];
-        for (t, e) in exps.iter().enumerate() {
-            let base = (t * nkv + kvh) * hd;
-            let w = e / l;
-            for d in 0..hd {
-                refv[d] += w * unbf(v_host[base + d]);
+    let a = dl_bf16(g, out_a, rows * nq * hd);
+    let b = dl_bf16(g, out_b, rows * nq * hd);
+    let mut diffs = 0usize;
+    let mut first: Option<(usize, f32, f32)> = None;
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        if x.to_bits() != y.to_bits() {
+            diffs += 1;
+            if first.is_none() {
+                first = Some((i, *x, *y));
             }
         }
-        let gv = &got[(row * nq + h) * hd..(row * nq + h) * hd + hd];
-        let dot: f64 = gv
-            .iter()
-            .zip(&refv)
-            .map(|(a, b)| *a as f64 * *b as f64)
-            .sum();
-        let ng: f64 = gv.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
-        let nr: f64 = refv.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
-        let cos = dot / (ng * nr).max(1e-30);
-        println!("  flash64 row {row:>4}: cos={cos:.6} |got|={ng:.4} |ref|={nr:.4}");
     }
+    assert_eq!(
+        diffs,
+        0,
+        "grouped kernel is not bit-identical: {diffs}/{} elements differ, first {:?}",
+        a.len(),
+        first
+    );
+    println!(
+        "qsa_prefill_attn_g == qsa_prefill_attn on {} elements",
+        a.len()
+    );
 }

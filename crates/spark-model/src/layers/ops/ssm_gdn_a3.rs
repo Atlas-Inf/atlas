@@ -194,7 +194,7 @@ pub fn gdn_prefill_fla(
     // footprint the original (also double-buffered) spine uses — `smem_dh`. Under-
     // sizing this reads the second slot out of bounds, so the selector has to agree
     // with the kernel `init.rs` loaded for the same env value.
-    let pipe = std::env::var("ATLAS_GDN_PIPE").ok().as_deref() == Some("1");
+    let pipe = gdn_pipe_enabled();
     let smem_fused = if pipe {
         smem_dh
     } else {
@@ -368,4 +368,22 @@ pub fn gdn_prefill_fla(
         );
     }
     Ok(())
+}
+
+/// Which GDN state spine the fused chunked prefill uses: the `cp.async`
+/// double-buffered `..._pipe` (default on NVIDIA) or the single-buffered
+/// `..._vfused`. `init.rs` loads the kernel and this file sizes its shared
+/// memory from the SAME answer, so both must call this.
+///
+/// Default ON for NVIDIA since 2026-09-25: GB10 job 243 measured it
+/// output-identical to `vfused` on Flash-Next (ppl 0.000 % above and below the
+/// QSA bound, needles 12/12, kl_drift top-1 100 %) and the campaign priced it
+/// at -0.35 s of a 30k prefill. gfx1151 keeps its existing default (unmeasured
+/// there). `ATLAS_GDN_PIPE=0` / `=1` overrides either way.
+pub(crate) fn gdn_pipe_enabled() -> bool {
+    match std::env::var("ATLAS_GDN_PIPE").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => !cfg!(atlas_scale),
+    }
 }

@@ -710,6 +710,19 @@ pub struct QuantLayerSpec {
     pub group_size: usize,
 }
 
+/// Whether a ModelOpt `quant_algo` label means NVFP4-packed weights.
+///
+/// NVIDIA's packs use both `"NVFP4"` (Qwen3.8-27B, Flash-Next) and the
+/// per-layer `"W4A16_NVFP4"` label (Qwen3.6-35B-A3B, Nemotron-3.5-Lightning —
+/// same scheme: BF16 activations over NVFP4 weights, which is exactly Atlas's
+/// W4A16 NVFP4 path). Case-insensitive; `"NVFP4"` itself or any
+/// `"*_NVFP4"` suffix qualifies. FP8 labels (`"FP8"`, `"FP8_PB_WO"`,
+/// `"FP8_BLOCK_SCALES"`) do NOT — FP8 payloads are a different dtype.
+pub fn is_nvfp4_quant_algo(algo: &str) -> bool {
+    let a = algo.trim();
+    a.eq_ignore_ascii_case("NVFP4") || a.to_ascii_uppercase().ends_with("_NVFP4")
+}
+
 /// Vision encoder configuration for Qwen3-VL models.
 #[derive(Debug, Clone)]
 pub struct VisionConfig {
