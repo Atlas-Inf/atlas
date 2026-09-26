@@ -21,14 +21,18 @@ impl BlockDiffusionDraftHead {
         let total_rows = batch_size
             .checked_mul(self.gamma as u32)
             .ok_or_else(|| anyhow::anyhow!("DFlash staged projection row overflow"))?;
+        // Mirror the serial per-sequence choice (`drafter_gemm` at m = gamma):
+        // NVFP4 only when gamma <= 4, else the FP8/BF16 dense arm. Keying on
+        // total_rows sent gamma=8 DFlash2 through NVFP4 weights while its
+        // serial layer ran BF16 (reiner job 307 parity: 88.5 % draft tokens).
         if matches!(self.quant, super::DflashQuantization::Nvfp4Weights)
+            && self.gamma <= 4
             && let Some(weight) = weight_nvfp4
         {
             let kernel = match total_rows {
                 1..=4 => self.kernels.w4a16_gemv_batch4,
                 5..=8 => self.kernels.w4a16_gemv_batch8,
-                9..=32 => self.kernels.w4a16_gemv_batch16,
-                _ => spark_runtime::gpu::KernelHandle(0),
+                _ => self.kernels.w4a16_gemv_batch16,
             };
             if kernel.0 != 0 {
                 let mut row = 0u32;
