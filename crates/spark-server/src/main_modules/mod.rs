@@ -10,6 +10,7 @@ pub(crate) mod middleware;
 pub(crate) mod model_host;
 pub(crate) mod model_swap;
 pub(crate) mod promotion;
+pub(crate) mod scheduler_supervisor;
 pub(crate) mod serve;
 pub(crate) mod serve_flags;
 pub(crate) mod serve_load;
