@@ -359,6 +359,13 @@ impl Qwen3AttentionLayer {
         if self.w8a16_gemm_t_k.0 == 0 {
             return Ok(()); // kernel not available
         }
+        if self.w8a16_gemm_n_m128_k.0 != 0 {
+            // gfx1151: w8a16_gemm_n_m128 reads the native B[N,K] for every n,
+            // so the transposed copies would only duplicate ~110 MB/layer (~1.7 GB on the 27B).
+            // The prefill arms fall back to it for n <= 128 when the
+            // transposed copy is absent.
+            return Ok(());
+        }
         let transpose_k = gpu.kernel("w8a16_gemm_t", "transpose_fp8")?;
         let transpose_scale_k = gpu.kernel("w8a16_gemm_t", "transpose_block_scale")?;
 
