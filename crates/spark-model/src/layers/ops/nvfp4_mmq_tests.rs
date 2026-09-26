@@ -124,10 +124,46 @@ impl Mmq {
     }
 }
 
-/// Activation y row pitch: `ceil(K/256) * 144` bytes (`block_fp4_mmq` rows
-/// are packed contiguously; `fp4_act_scratch_bytes`'s +1MB is tail slack).
-fn y_row_bytes(k: u32) -> usize {
-    k.div_ceil(256) as usize * 144
+/// `block_fp4_mmq` size: 4 ue4m3 scale words (16 B) + 128 packed e2m1 bytes.
+const FP4_BLOCK_BYTES: usize = 144;
+
+/// K-blocks per row: `block_fp4_mmq` covers 256 activation values.
+fn k_blocks(k: u32) -> usize {
+    k.div_ceil(256) as usize
+}
+
+/// Activation y bytes for one logical row, gathered per k-block. The
+/// quantizer writes `[k_block][ne1]` block-column-major — `ib =
+/// k_block * ne1 + i1` (`atlas_nvfp4_quantize_bf16`, nvfp4_mmq.cu) — so
+/// logical row `r`'s k-block `j` lives at `(j * ne1 + r) * 144`, NOT at
+/// `r * k_blocks * 144`. The 53-row and 5-row launches therefore lay the
+/// same rows at different byte offsets even when every quantized value
+/// is identical.
+fn y_row_gather(y: &[u8], ne1: usize, k: u32, r: usize) -> Vec<u8> {
+    let nkb = k_blocks(k);
+    let mut out = Vec::with_capacity(nkb * FP4_BLOCK_BYTES);
+    for j in 0..nkb {
+        let off = (j * ne1 + r) * FP4_BLOCK_BYTES;
+        out.extend_from_slice(&y[off..off + FP4_BLOCK_BYTES]);
+    }
+    out
+}
+
+/// Gather `rows` logical rows starting at `r0` out of a y buffer produced
+/// by an `ne1`-row quantize launch, into the `[k_block][rows]` layout a
+/// `ncols_y = rows` mmq launch expects (mul_mat_q_process_tile walks y as
+/// `y + ncols_y * (kb0 * qk / ne_block) * sz`, q4k_vendor/mmq.cuh:3619).
+fn y_slice_gather(y: &[u8], ne1: usize, k: u32, r0: usize, rows: usize) -> Vec<u8> {
+    let nkb = k_blocks(k);
+    let mut out = vec![0u8; nkb * rows * FP4_BLOCK_BYTES];
+    for j in 0..nkb {
+        for i in 0..rows {
+            let src = (j * ne1 + r0 + i) * FP4_BLOCK_BYTES;
+            let dst = (j * rows + i) * FP4_BLOCK_BYTES;
+            out[dst..dst + FP4_BLOCK_BYTES].copy_from_slice(&y[src..src + FP4_BLOCK_BYTES]);
+        }
+    }
+    out
 }
 
 /// Quantize `rows` rows of `x` ([M, K] bf16, contiguous) starting at row
@@ -146,27 +182,26 @@ fn quantize(
     ops::nvfp4_mmq_quantize_act(gpu, k.quant, x_off, y, rows, K, stream).unwrap();
 }
 
-/// One `nvfp4_mmq_gemm_tiled` launch on `rows` of `y` starting at row `r0`,
-/// writing `out` [rows, N] bf16. `grid.y` stays 1 — matching production,
-/// which only calls this when `m <= mmq_x`.
+/// One `nvfp4_mmq_gemm_tiled` launch on a y buffer already laid out for
+/// `ncols_y = rows` (`[k_block][rows]` block-column-major — see
+/// `y_slice_gather`), writing `out` [rows, N] bf16. `grid.y` stays 1 —
+/// matching production, which only calls this when `m <= mmq_x`.
 fn gemm(
     gpu: &dyn GpuBackend,
     k: &Mmq,
     tile: usize,
     y: DevicePtr,
-    r0: u32,
     w: DevicePtr,
     out: DevicePtr,
     rows: u32,
     stream: u64,
 ) {
-    let y_off = y.offset((r0 as usize) * y_row_bytes(K));
     ops::nvfp4_mmq_gemm_tiled(
         gpu,
         k.nc[tile],
         k.wc[tile],
         Mmq::mmq_x(tile),
-        y_off,
+        y,
         w,
         out,
         rows,
@@ -177,11 +212,26 @@ fn gemm(
     .unwrap();
 }
 
-/// Bitwise + max|Δ| comparison of `rows` rows of N bf16 values.
-fn assert_rows_identical(label: &str, got: &[u8], want: &[u8], rows: usize) {
+/// Bitwise + max|Δ| comparison of `rows` rows of N bf16 values. Records a
+/// failure line instead of asserting so every stage's comparison prints
+/// before the final verdict.
+fn check_rows_identical(
+    label: &str,
+    got: &[u8],
+    want: &[u8],
+    rows: usize,
+    failures: &mut Vec<String>,
+) {
     let n = rows * N as usize;
-    assert_eq!(got.len(), want.len());
-    assert_eq!(got.len(), n * BF16);
+    if got.len() != want.len() || got.len() != n * BF16 {
+        failures.push(format!(
+            "{label}: length mismatch got={} want={} expected={}",
+            got.len(),
+            want.len(),
+            n * BF16
+        ));
+        return;
+    }
     let mut mismatched = 0usize;
     let (mut worst, mut worst_d) = (0usize, 0.0f64);
     for i in 0..n {
@@ -200,10 +250,11 @@ fn assert_rows_identical(label: &str, got: &[u8], want: &[u8], rows: usize) {
         worst / N as usize,
         worst % N as usize,
     );
-    assert_eq!(
-        got, want,
-        "{label}: {mismatched} bf16 elements differ, max|Δ| {worst_d:.4e}"
-    );
+    if got != want {
+        failures.push(format!(
+            "{label}: {mismatched} bf16 elements differ, max|Δ| {worst_d:.4e}"
+        ));
+    }
 }
 
 #[test]
@@ -249,8 +300,16 @@ fn nvfp4_mmq_m_invariance() {
     let y_bytes = ops::fp4_act_scratch_bytes(M, K);
     let out_bytes = M as usize * N as usize * BF16;
 
+    let mut failures: Vec<String> = Vec::new();
+
     // ── 1. Quantizer is token-local ──────────────────────────────────────
     // y_full rows [0,53) vs y_part rows [0,5) quantized from x[48..53).
+    // The y buffer is `[k_block][ne1]` block-column-major — `ib =
+    // k_block * ne1 + i1` — so the same logical row lands at different
+    // byte offsets in the two launches. Gather per logical row before
+    // comparing (quantizer amax/scale are computed per 16-element
+    // sub-block of the row itself — no cross-row dependence by
+    // construction — so byte-identical blocks are the correct verdict).
     let y_full = gpu.alloc(y_bytes).unwrap();
     let y_part = gpu.alloc(y_bytes).unwrap();
     quantize(&gpu, &kk, x, 0, M, y_full, stream);
@@ -258,21 +317,37 @@ fn nvfp4_mmq_m_invariance() {
     gpu.synchronize(stream).unwrap();
     let yf = download(&gpu, y_full, y_bytes);
     let yp = download(&gpu, y_part, y_bytes);
-    let rb = y_row_bytes(K);
     for r in 0..5usize {
-        assert_eq!(
-            yf[(48 + r) * rb..(49 + r) * rb],
-            yp[r * rb..(r + 1) * rb],
-            "quantizer row {} differs between the 53-row and 5-row launches — not token-local",
-            48 + r
-        );
+        let got = y_row_gather(&yp, 5, K, r);
+        let want = y_row_gather(&yf, M as usize, K, 48 + r);
+        if got != want {
+            let first = got
+                .iter()
+                .zip(want.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            failures.push(format!(
+                "quantize row {} differs between the 53-row and 5-row launches \
+                 (first diff at byte {first}, k-block {}) — a row's quantized \
+                 output depends on launch M, not just the row",
+                48 + r,
+                first / FP4_BLOCK_BYTES
+            ));
+        }
     }
-    println!("quantize: rows 48..52 of the 53-row launch == the 5-row launch, BYTE-IDENTICAL");
+    println!(
+        "quantize: rows 48..52 of the 53-row launch vs the 5-row launch, gathered per logical row: {}",
+        if failures.is_empty() {
+            "BYTE-IDENTICAL"
+        } else {
+            "DIFFER"
+        }
+    );
 
     // ── 2. Tile invariance on the shared quantized buffer ────────────────
     // Reference: mmq64 over all 53 rows (the tile M=53 picks).
     let out_ref = gpu.alloc(out_bytes).unwrap();
-    gemm(&gpu, &kk, 2, y_full, 0, w, out_ref, M, stream);
+    gemm(&gpu, &kk, 2, y_full, w, out_ref, M, stream);
     gpu.synchronize(stream).unwrap();
     let reference = download(&gpu, out_ref, out_bytes);
     let want_rows = |r0: usize, rows: usize| -> Vec<u8> {
@@ -282,24 +357,33 @@ fn nvfp4_mmq_m_invariance() {
     };
 
     // (d) all 53 rows through the 128 tile — the lever-off shape.
-    gemm(&gpu, &kk, 3, y_full, 0, w, out_ref, M, stream);
+    gemm(&gpu, &kk, 3, y_full, w, out_ref, M, stream);
     gpu.synchronize(stream).unwrap();
     let full128 = download(&gpu, out_ref, out_bytes);
-    assert_rows_identical(
+    check_rows_identical(
         "mmq128 all-53-rows vs mmq64 all-53-rows",
         &full128,
         &reference,
         53,
+        &mut failures,
     );
 
-    // (b)/(c): slice launches through each tile vs the reference rows.
+    // (b)/(c): slice launches through each tile vs the reference rows. The
+    // slice's y must be gathered into `[k_block][rows]` for its own
+    // `ncols_y = rows` — a raw byte offset into the 53-row buffer would
+    // misindex rows across k-block boundaries (the M-dependent layout).
     let out_slice = gpu.alloc(out_bytes).unwrap();
     for &tile in &[0usize, 1, 2, 3] {
         for &(r0, rows) in &[(32u32, 16u32), (48, 5)] {
-            gemm(&gpu, &kk, tile, y_full, r0, w, out_slice, rows, stream);
+            let y_slice = upload(
+                &gpu,
+                &y_slice_gather(&yf, M as usize, K, r0 as usize, rows as usize),
+            );
+            gemm(&gpu, &kk, tile, y_slice, w, out_slice, rows, stream);
             gpu.synchronize(stream).unwrap();
+            gpu.free(y_slice).ok();
             let got = download(&gpu, out_slice, rows as usize * N as usize * BF16);
-            assert_rows_identical(
+            check_rows_identical(
                 &format!(
                     "mmq{} rows[{r0}..{}): slice launch vs mmq64 reference rows",
                     Mmq::mmq_x(tile),
@@ -308,6 +392,7 @@ fn nvfp4_mmq_m_invariance() {
                 &got,
                 &want_rows(r0 as usize, rows as usize),
                 rows as usize,
+                &mut failures,
             );
         }
     }
@@ -319,20 +404,10 @@ fn nvfp4_mmq_m_invariance() {
         let y_c = gpu.alloc(y_bytes).unwrap();
         let out_c = gpu.alloc(out_bytes).unwrap();
         quantize(&gpu, &kk, x, r0, rows, y_c, stream);
-        gemm(
-            &gpu,
-            &kk,
-            Mmq::tile_for(rows),
-            y_c,
-            0,
-            w,
-            out_c,
-            rows,
-            stream,
-        );
+        gemm(&gpu, &kk, Mmq::tile_for(rows), y_c, w, out_c, rows, stream);
         gpu.synchronize(stream).unwrap();
         let got = download(&gpu, out_c, rows as usize * N as usize * BF16);
-        assert_rows_identical(
+        check_rows_identical(
             &format!(
                 "end-to-end rows[{r0}..{}): chunk dispatch (m={rows}→mmq{}) vs contiguous mmq64",
                 r0 + rows,
@@ -341,10 +416,19 @@ fn nvfp4_mmq_m_invariance() {
             &got,
             &want_rows(r0 as usize, rows as usize),
             rows as usize,
+            &mut failures,
         );
+        gpu.free(y_c).ok();
+        gpu.free(out_c).ok();
     }
 
     for p in [x, packed, scales, w, y_full, y_part, out_ref, out_slice] {
         gpu.free(p).ok();
     }
+
+    assert!(
+        failures.is_empty(),
+        "nvfp4_mmq M-invariance failures:\n  - {}",
+        failures.join("\n  - ")
+    );
 }
