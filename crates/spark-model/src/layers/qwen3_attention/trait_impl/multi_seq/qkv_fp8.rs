@@ -32,16 +32,26 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(n * kv_bytes);
-        let batch_kernel = if n <= 4 {
-            self.w8a16_gemv_batch4_k
+        let vl2 = ops::gemv_vl2_enabled();
+        let (batch_kernel, use_vl2) = if n <= 4 {
+            (self.w8a16_gemv_batch4_k, false)
+        } else if n <= 8 && vl2 && n == 8 && self.w8a16_gemv_batch8_vl2_k.0 != 0 {
+            (self.w8a16_gemv_batch8_vl2_k, true)
+        } else if n <= 8 && vl2 && self.w8a16_gemv_batch8_dyn_vl2_k.0 != 0 {
+            (self.w8a16_gemv_batch8_dyn_vl2_k, true)
         } else if n <= 8 && self.w8a16_gemv_batch8_k.0 != 0 {
-            self.w8a16_gemv_batch8_k
+            (self.w8a16_gemv_batch8_k, false)
         } else {
-            self.w8a16_gemv_batch16_k
+            (self.w8a16_gemv_batch16_k, false)
         };
 
+        let launcher = if use_vl2 {
+            ops::w8a16_gemv_batch4_vl2
+        } else {
+            ops::w8a16_gemv_batch4
+        };
         let project = |weight: &crate::weight_map::Fp8Weight, output, rows| {
-            ops::w8a16_gemv_batch4(
+            launcher(
                 fwd.gpu,
                 batch_kernel,
                 normed,

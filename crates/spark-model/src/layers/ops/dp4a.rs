@@ -36,6 +36,16 @@ pub fn dp4a_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("ATLAS_W4A16_DP4A").as_deref() != Ok("0"))
 }
 
+/// `ATLAS_GEMV_VL2=0` kills the virtual-lane (VLANES=2) verify GEMV tier —
+/// `_vl2` kernels map two of the original 64 logical lanes onto one physical
+/// thread for 2x memory-level parallelism. Default ON on HIP; the vl2 kernels
+/// only exist in the strix-hip target, so non-HIP callers never resolve them.
+/// Bit-identical outputs; A/B from one binary.
+pub fn gemv_vl2_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("ATLAS_GEMV_VL2").as_deref() != Ok("0"))
+}
+
 /// Eligibility for the guard-free M=4 DP4A batch4 GEMV arm. `m` must be
 /// EXACTLY 4: `w4a16_gemv_dp4a_batch4_d4` writes all four rows
 /// unconditionally, so dispatching at any other M would write rows the
@@ -233,6 +243,70 @@ pub fn w4a16_gemv_dp4a_batch4_os(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(out_stride)
+        .launch(stream)
+}
+
+/// vl2 twins of the batch8 DP4A GEMVs: identical args and signature, but the
+/// kernel covers 8 outputs per 256-thread block — grid `ceil(n/8)`.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_dp4a_batch8_vl2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_q: DevicePtr,
+    a_scale: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a_q)
+        .arg_ptr(a_scale)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_dp4a_dual_batch8_vl2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_q: DevicePtr,
+    a_scale: DevicePtr,
+    gate_weight: &QuantizedWeight,
+    gate_out: DevicePtr,
+    up_weight: &QuantizedWeight,
+    up_out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a_q)
+        .arg_ptr(a_scale)
+        .arg_ptr(gate_weight.weight)
+        .arg_ptr(gate_weight.weight_scale)
+        .arg_f32(gate_weight.weight_scale_2)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_weight.weight)
+        .arg_ptr(up_weight.weight_scale)
+        .arg_f32(up_weight.weight_scale_2)
+        .arg_ptr(up_out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
         .launch(stream)
 }
 

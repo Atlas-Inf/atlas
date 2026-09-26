@@ -311,7 +311,7 @@ extern "C" __global__ void w4a16_gemv_dp4a(
 // FIXED4=false keeps the guard and serves the K=2/K=3 verify rows (2..3) the
 // scheduler still dispatches through this path — narrowing the dispatch to
 // M=4 alone would silently demote those rows to the float batch2/batch3 GEMVs.
-template <int ROWS, bool FIXED4>
+template <int ROWS, bool FIXED4, int VLANES = 1>
 __device__ __forceinline__ void w4a16_gemv_dp4a_batch_impl(
     const signed char* __restrict__ a_q,
     const float* __restrict__ a_scale,
@@ -325,24 +325,44 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch_impl(
     unsigned int C_stride
 ) {
     (void)M;
-    const unsigned int threads_per_out = DP4A_BLOCK_SIZE / DP4A_N_PER_BLOCK;
-    const unsigned int local_out = threadIdx.x / threads_per_out;
-    const unsigned int lane = threadIdx.x % threads_per_out;
-    const unsigned int n = blockIdx.x * DP4A_N_PER_BLOCK + local_out;
+    // VLANES=2 ("virtual lanes"): 32 physical threads per output, each owning
+    // TWO of the original 64 logical lanes — lane p accumulates groups
+    // p, p+64, … into acc[] (old warp 0) and p+32, p+96, … into acc2[] (old
+    // warp 1). Both weight+scale loads issue before the decode/FMA so each
+    // thread keeps twice the bytes in flight; the block then covers
+    // DP4A_N_PER_BLOCK*VLANES outputs. Per-element expressions, the shfl
+    // trees, and the final two-half add are unchanged -> bit-identical.
+    const unsigned int lanes_per_out = DP4A_BLOCK_SIZE / (DP4A_N_PER_BLOCK * VLANES);
+    const unsigned int local_out = threadIdx.x / lanes_per_out;
+    const unsigned int lane = threadIdx.x % lanes_per_out;
+    const unsigned int n = blockIdx.x * (DP4A_N_PER_BLOCK * VLANES) + local_out;
     const bool valid_n = n < N;
     const unsigned int half_k = K / 2;
     const unsigned int groups = K / DP4A_GROUP_SIZE;
+    const unsigned int group_stride = lanes_per_out * VLANES;
     float acc[ROWS] = {};
+    float acc2[ROWS] = {};
 
     if (valid_n) {
-        for (unsigned int group = lane; group < groups; group += threads_per_out) {
+        for (unsigned int group = lane; group < groups; group += group_stride) {
+            const unsigned int g2 = group + lanes_per_out;
+            const bool g2v = VLANES == 2 && g2 < groups;
             const unsigned long long packed = *(const unsigned long long*)(
                 B_packed + (unsigned long long)n * half_k + group * 8);
+            const unsigned long long packed2 = g2v
+                ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_k + g2 * 8)
+                : 0ull;
+            const float weight_scale = dp4a_scl_fp8(
+                B_scale[(unsigned long long)n * groups + group]) * (0.5f * scale2);
+            const float weight_scale2 = g2v
+                ? dp4a_scl_fp8(B_scale[(unsigned long long)n * groups + g2]) * (0.5f * scale2)
+                : 0.0f;
             const int2 first = dp4a_expand_codebook_d4((unsigned int)packed);
             const int2 second = dp4a_expand_codebook_d4((unsigned int)(packed >> 32));
             const int weight[4] = {first.x, first.y, second.x, second.y};
-            const float weight_scale = dp4a_scl_fp8(
-                B_scale[(unsigned long long)n * groups + group]) * (0.5f * scale2);
+            const int2 first2 = dp4a_expand_codebook_d4((unsigned int)packed2);
+            const int2 second2 = dp4a_expand_codebook_d4((unsigned int)(packed2 >> 32));
+            const int weight2[4] = {first2.x, first2.y, second2.x, second2.y};
             #pragma unroll
             for (int row = 0; row < ROWS; ++row) {
                 if constexpr (!FIXED4) {
@@ -360,9 +380,52 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch_impl(
                 acc[row] += (float)dot *
                     a_scale[(unsigned long long)row * groups + group] * weight_scale;
             }
+            if constexpr (VLANES == 2) {
+                if (g2v) {
+                    #pragma unroll
+                    for (int row = 0; row < ROWS; ++row) {
+                        if constexpr (!FIXED4) {
+                            if ((unsigned int)row >= M) continue;
+                        }
+                        const int4 activation = *(const int4*)(
+                            a_q + (unsigned long long)row * K + g2 * DP4A_GROUP_SIZE);
+                        const int values[4] = {
+                            activation.x, activation.y, activation.z, activation.w
+                        };
+                        int dot = 0;
+                        #pragma unroll
+                        for (int index = 0; index < 4; ++index)
+                            dot = DP4A_DOT(values[index], weight2[index], dot);
+                        acc2[row] += (float)dot *
+                            a_scale[(unsigned long long)row * groups + g2] * weight_scale2;
+                    }
+                }
+            }
         }
     }
 
+    if constexpr (VLANES == 2) {
+        // 32 physical lanes per output = exactly one warp per output, so the
+        // two separate shfl reduces ARE the old warp0/warp1 reductions and
+        // acc + acc2 is the old `partial[..0] + partial[..1]` add.
+        #pragma unroll
+        for (int row = 0; row < ROWS; ++row) {
+            if constexpr (!FIXED4) {
+                if ((unsigned int)row >= M) continue;
+            }
+            float v0 = acc[row];
+            float v1 = acc2[row];
+            #pragma unroll
+            for (int offset = DP4A_WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                v0 += __shfl_down_sync(0xffffffffu, v0, offset);
+                v1 += __shfl_down_sync(0xffffffffu, v1, offset);
+            }
+            if (valid_n && lane == 0) {
+                C[(unsigned long long)row * C_stride + n] = __float2bfloat16(v0 + v1);
+            }
+        }
+        return;
+    }
     __shared__ float partial[ROWS][DP4A_N_PER_BLOCK * 2];
     const unsigned int warp_lane = lane % DP4A_WARP_SIZE;
     const unsigned int warp_in_out = lane / DP4A_WARP_SIZE;
@@ -392,7 +455,7 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch_impl(
     }
 }
 
-template <int ROWS, bool FIXED4>
+template <int ROWS, bool FIXED4, int VLANES = 1>
 __device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch_impl(
     const signed char* __restrict__ a_q,
     const float* __restrict__ a_scale,
@@ -408,33 +471,60 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch_impl(
     unsigned int N,
     unsigned int K
 ) {
-    const unsigned int threads_per_out = DP4A_BLOCK_SIZE / DP4A_N_PER_BLOCK;
-    const unsigned int local_out = threadIdx.x / threads_per_out;
-    const unsigned int lane = threadIdx.x % threads_per_out;
-    const unsigned int n = blockIdx.x * DP4A_N_PER_BLOCK + local_out;
+    // VLANES=2: same virtual-lane mapping as the single impl — physical lane
+    // p owns logical lanes p (accA0/accB0 = old warp 0) and p+32 (accA1/accB1
+    // = old warp 1), with all four weight loads + four scale loads issued
+    // before the row loop. Bit-identical per element.
+    const unsigned int lanes_per_out = DP4A_BLOCK_SIZE / (DP4A_N_PER_BLOCK * VLANES);
+    const unsigned int local_out = threadIdx.x / lanes_per_out;
+    const unsigned int lane = threadIdx.x % lanes_per_out;
+    const unsigned int n = blockIdx.x * (DP4A_N_PER_BLOCK * VLANES) + local_out;
     const bool valid_n = n < N;
     const unsigned int half_k = K / 2;
     const unsigned int groups = K / DP4A_GROUP_SIZE;
+    const unsigned int group_stride = lanes_per_out * VLANES;
     (void)M;
     float acc0[ROWS] = {};
     float acc1[ROWS] = {};
+    float acc0b[ROWS] = {};
+    float acc1b[ROWS] = {};
 
     if (valid_n) {
-        for (unsigned int group = lane; group < groups; group += threads_per_out) {
+        for (unsigned int group = lane; group < groups; group += group_stride) {
+            const unsigned int g2 = group + lanes_per_out;
+            const bool g2v = VLANES == 2 && g2 < groups;
             const unsigned long long packed0 = *(const unsigned long long*)(
                 B0_packed + (unsigned long long)n * half_k + group * 8);
             const unsigned long long packed1 = *(const unsigned long long*)(
                 B1_packed + (unsigned long long)n * half_k + group * 8);
+            const unsigned long long packed0b = g2v
+                ? *(const unsigned long long*)(B0_packed + (unsigned long long)n * half_k + g2 * 8)
+                : 0ull;
+            const unsigned long long packed1b = g2v
+                ? *(const unsigned long long*)(B1_packed + (unsigned long long)n * half_k + g2 * 8)
+                : 0ull;
             const int2 first0 = dp4a_expand_codebook_d4((unsigned int)packed0);
             const int2 second0 = dp4a_expand_codebook_d4((unsigned int)(packed0 >> 32));
             const int2 first1 = dp4a_expand_codebook_d4((unsigned int)packed1);
             const int2 second1 = dp4a_expand_codebook_d4((unsigned int)(packed1 >> 32));
             const int weight0[4] = {first0.x, first0.y, second0.x, second0.y};
             const int weight1[4] = {first1.x, first1.y, second1.x, second1.y};
+            const int2 first0b = dp4a_expand_codebook_d4((unsigned int)packed0b);
+            const int2 second0b = dp4a_expand_codebook_d4((unsigned int)(packed0b >> 32));
+            const int2 first1b = dp4a_expand_codebook_d4((unsigned int)packed1b);
+            const int2 second1b = dp4a_expand_codebook_d4((unsigned int)(packed1b >> 32));
+            const int weight0b[4] = {first0b.x, first0b.y, second0b.x, second0b.y};
+            const int weight1b[4] = {first1b.x, first1b.y, second1b.x, second1b.y};
             const float weight_scale0 = dp4a_scl_fp8(
                 B0_scale[(unsigned long long)n * groups + group]) * (0.5f * B0_scale2);
             const float weight_scale1 = dp4a_scl_fp8(
                 B1_scale[(unsigned long long)n * groups + group]) * (0.5f * B1_scale2);
+            const float weight_scale0b = g2v
+                ? dp4a_scl_fp8(B0_scale[(unsigned long long)n * groups + g2]) * (0.5f * B0_scale2)
+                : 0.0f;
+            const float weight_scale1b = g2v
+                ? dp4a_scl_fp8(B1_scale[(unsigned long long)n * groups + g2]) * (0.5f * B1_scale2)
+                : 0.0f;
             #pragma unroll
             for (int row = 0; row < ROWS; ++row) {
                 if constexpr (!FIXED4) {
@@ -457,9 +547,62 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch_impl(
                 acc0[row] += (float)dot0 * activation_scale * weight_scale0;
                 acc1[row] += (float)dot1 * activation_scale * weight_scale1;
             }
+            if constexpr (VLANES == 2) {
+                if (g2v) {
+                    #pragma unroll
+                    for (int row = 0; row < ROWS; ++row) {
+                        if constexpr (!FIXED4) {
+                            if ((unsigned int)row >= M) continue;
+                        }
+                        const int4 activation = *(const int4*)(
+                            a_q + (unsigned long long)row * K + g2 * DP4A_GROUP_SIZE);
+                        const int values[4] = {
+                            activation.x, activation.y, activation.z, activation.w
+                        };
+                        int dot0 = 0;
+                        int dot1 = 0;
+                        #pragma unroll
+                        for (int index = 0; index < 4; ++index) {
+                            dot0 = DP4A_DOT(values[index], weight0b[index], dot0);
+                            dot1 = DP4A_DOT(values[index], weight1b[index], dot1);
+                        }
+                        const float activation_scale =
+                            a_scale[(unsigned long long)row * groups + g2];
+                        acc0b[row] += (float)dot0 * activation_scale * weight_scale0b;
+                        acc1b[row] += (float)dot1 * activation_scale * weight_scale1b;
+                    }
+                }
+            }
         }
     }
 
+    if constexpr (VLANES == 2) {
+        // One warp per output: accX (logical lanes 0..31) and accXb (32..63)
+        // reduce over the same 32-lane tree, then pair-add like the old
+        // partial-table halves.
+        #pragma unroll
+        for (int row = 0; row < ROWS; ++row) {
+            if constexpr (!FIXED4) {
+                if ((unsigned int)row >= M) continue;
+            }
+            float v0 = acc0[row];
+            float v0b = acc0b[row];
+            float v1 = acc1[row];
+            float v1b = acc1b[row];
+            #pragma unroll
+            for (int offset = DP4A_WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                v0 += __shfl_down_sync(0xffffffffu, v0, offset);
+                v0b += __shfl_down_sync(0xffffffffu, v0b, offset);
+                v1 += __shfl_down_sync(0xffffffffu, v1, offset);
+                v1b += __shfl_down_sync(0xffffffffu, v1b, offset);
+            }
+            if (valid_n && lane == 0) {
+                C0[(unsigned long long)row * N + n] = __float2bfloat16(v0 + v0b);
+                C1[(unsigned long long)row * N + n] = __float2bfloat16(v1 + v1b);
+            }
+        }
+        return;
+    }
     __shared__ float partial0[ROWS][DP4A_N_PER_BLOCK * 2];
     __shared__ float partial1[ROWS][DP4A_N_PER_BLOCK * 2];
     const unsigned int warp_lane = lane % DP4A_WARP_SIZE;
@@ -669,5 +812,74 @@ extern "C" __global__ void w4a16_gemv_dp4a_dual_batch8_d4_dyn(
     unsigned int K
 ) {
     w4a16_gemv_dp4a_dual_batch_impl<8, false>(
+        a_q, a_scale, B0_packed, B0_scale, B0_scale2, C0, B1_packed, B1_scale, B1_scale2, C1, M, N, K);
+}
+
+// ── vl2 entry points (2 virtual lanes per thread; grid is ceil(N/8)) ──────
+// Bit-identical to the batch8 entry points: same per-lane group walks, same
+// shfl trees, same final pair-add — only the lane→thread mapping changed.
+extern "C" __global__ void w4a16_gemv_dp4a_batch8_d4_vl2(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_batch_impl<8, true, 2>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_batch8_d4_dyn_vl2(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_batch_impl<8, false, 2>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_dual_batch8_d4_vl2(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B0_packed,
+    const unsigned char* __restrict__ B0_scale,
+    const float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_dual_batch_impl<8, true, 2>(
+        a_q, a_scale, B0_packed, B0_scale, B0_scale2, C0, B1_packed, B1_scale, B1_scale2, C1, M, N, K);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_dual_batch8_d4_dyn_vl2(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B0_packed,
+    const unsigned char* __restrict__ B0_scale,
+    const float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_dual_batch_impl<8, false, 2>(
         a_q, a_scale, B0_packed, B0_scale, B0_scale2, C0, B1_packed, B1_scale, B1_scale2, C1, M, N, K);
 }

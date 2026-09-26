@@ -1159,8 +1159,40 @@ impl Qwen3SsmLayer {
         {
             ops::w8a16_gemv_batch4(
                 ctx.gpu,
-                // Same 5..8 → batch8 tier pick as the QKVZ arm above.
-                if num_tokens <= 8 && self.w8a16_gemv_batch8_k.0 != 0 {
+                // Same 5..8 → batch8 tier pick as the QKVZ arm above; the
+                // vl2 twin is the preferred bit-identical arm when linked.
+                if num_tokens <= 8 {
+                    if ops::gemv_vl2_enabled()
+                        && num_tokens == 8
+                        && self.w8a16_gemv_batch8_vl2_k.0 != 0
+                    {
+                        return ops::w8a16_gemv_batch4_vl2(
+                            ctx.gpu,
+                            self.w8a16_gemv_batch8_vl2_k,
+                            normed_out_buf,
+                            fp8.weight,
+                            fp8.row_scale,
+                            out_proj_buf,
+                            num_tokens as u32,
+                            h as u32,
+                            value_dim as u32,
+                            stream,
+                        );
+                    }
+                    if ops::gemv_vl2_enabled() && self.w8a16_gemv_batch8_dyn_vl2_k.0 != 0 {
+                        return ops::w8a16_gemv_batch4_vl2(
+                            ctx.gpu,
+                            self.w8a16_gemv_batch8_dyn_vl2_k,
+                            normed_out_buf,
+                            fp8.weight,
+                            fp8.row_scale,
+                            out_proj_buf,
+                            num_tokens as u32,
+                            h as u32,
+                            value_dim as u32,
+                            stream,
+                        );
+                    }
                     self.w8a16_gemv_batch8_k
                 } else {
                     self.w8a16_gemv_batch16_k

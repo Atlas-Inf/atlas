@@ -365,6 +365,9 @@ pub struct Qwen3SsmLayer {
     w8a16_gemv_batch4_k: KernelHandle,
     // M=5..8 tier of the same family (DFlash verify rows).
     w8a16_gemv_batch8_k: KernelHandle,
+    // vl2 twins of the M=5..8 tier (8 outputs/block); preferred when linked.
+    w8a16_gemv_batch8_vl2_k: KernelHandle,
+    w8a16_gemv_batch8_dyn_vl2_k: KernelHandle,
     // M<=16 sibling of batch4 for high-concurrency decode (n=5..16): same
     // weight-streaming GEMV, avoids the M-padded MMA at C=8/16.
     w8a16_gemv_batch16_k: KernelHandle,

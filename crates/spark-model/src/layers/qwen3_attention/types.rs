@@ -197,6 +197,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) w8a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemv_batch4_k: KernelHandle,
     pub(super) w8a16_gemv_batch8_k: KernelHandle,
+    pub(super) w8a16_gemv_batch8_vl2_k: KernelHandle,
+    pub(super) w8a16_gemv_batch8_dyn_vl2_k: KernelHandle,
     pub(super) w8a16_gemv_batch16_k: KernelHandle,
     pub(super) w8a16_gemm_k: KernelHandle,
     pub(super) w8a16_gemm_pipelined_k: KernelHandle,

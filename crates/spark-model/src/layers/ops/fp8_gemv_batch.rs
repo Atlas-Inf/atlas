@@ -105,6 +105,34 @@ pub fn w8a16_gemv_batch4(
         .launch(stream)
 }
 
+/// vl2 twin of `w8a16_gemv_batch4`-family calls: the `*_vl2` kernels cover
+/// 8 outputs per block — grid `ceil(n/8)`.
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemv_batch4_vl2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    block_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(block_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Block-scaled FP8 dual-GEMV (batch=2). `input` is `[2, K]` BF16, `output` is
 /// `[2, N]` BF16; `weight`/`block_scale` are the raw `w8a16_gemv` pointers.
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
