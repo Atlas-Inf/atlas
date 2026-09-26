@@ -751,6 +751,8 @@ mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
 #[cfg(test)]
+mod free_state_carry_tests;
+#[cfg(test)]
 mod free_state_tests;
 mod from_weights;
 #[cfg(test)]

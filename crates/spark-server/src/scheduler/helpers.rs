@@ -983,6 +983,10 @@ fn detect_token_loop_period(
 mod thinking_loop_tests;
 
 #[cfg(test)]
+#[path = "helpers_override_tests.rs"]
+mod helpers_override_tests;
+
+#[cfg(test)]
 #[path = "number_list_tests.rs"]
 mod number_list_tests;
 
