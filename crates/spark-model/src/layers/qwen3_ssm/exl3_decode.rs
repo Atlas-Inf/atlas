@@ -11,7 +11,8 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use crate::layers::ops::{
-    Exl3Int8Kernels, Exl3Int8Workspace, Exl3Kernels, exl3_int8_linear_bf16, sq_grid, sq_plan,
+    Exl3Int8Kernels, Exl3Int8Workspace, Exl3Kernels, exl3_int8_linear_bf16,
+    exl3_int8_linear_bf16_rows, sq_grid, sq_plan,
 };
 use crate::weight_map::exl3::Exl3Weight;
 
@@ -148,6 +149,63 @@ impl Exl3GdnDecode {
     ) -> Result<()> {
         exl3_int8_linear_bf16(
             gpu, &self.k8, &self.k, &self.ws, normed_out, 1, &self.out, self.x_f16, self.a_had,
+            self.c_f32, out, self.grid, stream,
+        )
+    }
+
+    /// Batched (MTP-verify) qkvz: `m` contiguous input rows `[m, h]` → rows at
+    /// `row_stride` BF16 elements apart in `dst`, qkv rows then z rows at
+    /// `dst.offset(qkv.out * 2)` — the m = 1..2 generalization of [`Self::qkvz`]
+    /// (row 0 of an m = 2 sq call is bitwise equal to the m = 1 call).
+    pub fn qkvz_rows_batched(
+        &self,
+        gpu: &dyn GpuBackend,
+        normed: DevicePtr,
+        dst: DevicePtr,
+        m: u32,
+        row_stride: usize,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            m == 1 || m == 2,
+            "EXL3 native decode: m = {m} (want 1 or 2)"
+        );
+        exl3_int8_linear_bf16_rows(
+            gpu, &self.k8, &self.k, &self.ws, normed, m, &self.qkv, self.x_f16, self.a_had,
+            self.c_f32, dst, row_stride, self.grid, stream,
+        )?;
+        exl3_int8_linear_bf16_rows(
+            gpu,
+            &self.k8,
+            &self.k,
+            &self.ws,
+            normed,
+            m,
+            &self.z,
+            self.x_f16,
+            self.a_had,
+            self.c_f32,
+            dst.offset(self.qkv.shape.out_features * 2),
+            row_stride,
+            self.grid,
+            stream,
+        )
+    }
+
+    /// Batched (MTP-verify) out_proj: contiguous `[m, value_dim]` in,
+    /// contiguous `[m, h]` out — the m = 1..2 generalization of
+    /// [`Self::out_proj`].
+    pub fn out_proj_batched(
+        &self,
+        gpu: &dyn GpuBackend,
+        normed_out: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(m <= 2, "EXL3 native decode: m = {m} (want <= 2)");
+        exl3_int8_linear_bf16(
+            gpu, &self.k8, &self.k, &self.ws, normed_out, m, &self.out, self.x_f16, self.a_had,
             self.c_f32, out, self.grid, stream,
         )
     }

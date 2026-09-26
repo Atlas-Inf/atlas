@@ -130,6 +130,8 @@ pub struct Exl3Int8Kernels {
     pub sq: [[KernelHandle; 2]; 3],
     /// f32 -> bf16 grid-stride conversion, for the bf16 linear's epilogue.
     pub f32_to_bf16: KernelHandle,
+    /// f32 [rows, cols] → bf16 rows at `out_stride` elements apart (M6d batched verify).
+    pub f32_to_bf16_rows: KernelHandle,
 }
 
 impl Exl3Int8Kernels {
@@ -142,6 +144,7 @@ impl Exl3Int8Kernels {
                 [k("exl3_int8_sq_k6_m1")?, k("exl3_int8_sq_k6_m2")?],
             ],
             f32_to_bf16: k("exl3_f32_to_bf16")?,
+            f32_to_bf16_rows: k("exl3_f32_to_bf16_rows")?,
         })
     }
 }
@@ -231,6 +234,32 @@ pub fn exl3_int8_linear_bf16(
     grid: u32,
     stream: u64,
 ) -> Result<()> {
+    let n = w.shape.out_features;
+    exl3_int8_linear_bf16_rows(
+        gpu, k8, k, ws, x_bf16, m, w, x_f16, a_had, c_f32, out_bf16, n, grid, stream,
+    )
+}
+
+/// [`exl3_int8_linear_bf16`] with the bf16 result written one projection's rows
+/// into a wider `[m, out_stride]` buffer (M6d MTP-verify: the qkvz half lands in
+/// a `[num_tokens, qkvz_size]` row) instead of contiguously.
+#[allow(clippy::too_many_arguments)]
+pub fn exl3_int8_linear_bf16_rows(
+    gpu: &dyn GpuBackend,
+    k8: &Exl3Int8Kernels,
+    k: &Exl3Kernels,
+    ws: &Exl3Int8Workspace,
+    x_bf16: DevicePtr,
+    m: u32,
+    w: &Exl3Weight,
+    x_f16: DevicePtr,
+    a_had: DevicePtr,
+    c_f32: DevicePtr,
+    out_bf16: DevicePtr,
+    out_stride: usize,
+    grid: u32,
+    stream: u64,
+) -> Result<()> {
     let (kdim, n) = (w.shape.in_features, w.shape.out_features);
     exl3_convert(
         gpu,
@@ -241,13 +270,14 @@ pub fn exl3_int8_linear_bf16(
         stream,
     )?;
     exl3_int8_gemv(gpu, k8, ws, x_f16, m, w, a_had, c_f32, grid, stream)?;
-    let count = (m as usize * n) as u32;
-    KernelLaunch::new(gpu, k8.f32_to_bf16)
-        .grid([div_ceil(count, 256).min(1024), 1, 1])
+    KernelLaunch::new(gpu, k8.f32_to_bf16_rows)
+        .grid([div_ceil(m * n as u32, 256).min(1024), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(c_f32)
         .arg_ptr(out_bf16)
-        .arg_u32(count)
+        .arg_u32(m)
+        .arg_u32(n as u32)
+        .arg_u32(out_stride as u32)
         .launch(stream)
 }
 

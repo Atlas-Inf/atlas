@@ -19,3 +19,13 @@ extern "C" __global__ void exl3_f32_to_bf16(const float* __restrict__ in, __nv_b
     unsigned stride = gridDim.x * blockDim.x;
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) out[i] = __float2bfloat16_rn(in[i]);
 }
+
+// f32 [rows, cols] -> bf16 rows at `out_stride` elements apart (writes one projection's rows into a wider
+// [rows, out_stride] buffer).
+extern "C" __global__ void exl3_f32_to_bf16_rows(const float* __restrict__ in, __nv_bfloat16* __restrict__ out,
+                                                 unsigned rows, unsigned cols, unsigned out_stride)
+{
+    unsigned n = rows * cols, stride = gridDim.x * blockDim.x;
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+        out[(i / cols) * out_stride + (i % cols)] = __float2bfloat16_rn(in[i]);
+}

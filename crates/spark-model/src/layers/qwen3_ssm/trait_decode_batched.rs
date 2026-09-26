@@ -197,7 +197,21 @@ impl Qwen3SsmLayer {
         // verify — 2026-07-02 flagship gate). Mirrors the M<=4 dispatch in
         // trait_decode_multi_seq/ssm_batched.rs: one weight pass via
         // `w8a16_gemv_batch4`, per-token `w8a16_gemv` when it isn't linked.
-        if let Some(ref q2) = self.qkvz_q2 {
+        // Native EXL3 overlay for MTP verify (m <= 2 rows through the int8 sq
+        // GEMV on the packed weights); BF16 dispatch otherwise.
+        if num_tokens <= 2
+            && self.sequential_qkvz
+            && let Some(ref e) = self.exl3_decode
+        {
+            e.qkvz_rows_batched(
+                ctx.gpu,
+                normed,
+                proj_dst,
+                num_tokens as u32,
+                qkvz_size,
+                stream,
+            )?;
+        } else if let Some(ref q2) = self.qkvz_q2 {
             // Tier-1c keep-packed Q2_0: per-token 2-bit fused-qkvz GEMV. Bonsai
             // (dense qwen35) has no MTP, so this batched path is only reached
             // under multi-token verify — a per-token loop is bit-identical to
@@ -1021,7 +1035,19 @@ impl Qwen3SsmLayer {
 
         // ── 9. Output projection → [K, H] ──
         let out_proj_buf = ctx.buffers.moe_output(); // [K, H] BF16
-        if let Some(ref dense_out) = self.out_proj_dense {
+        // Native EXL3 overlay for MTP verify (m <= 2 rows through the int8 sq
+        // GEMV on the packed weights); BF16 dispatch otherwise.
+        if num_tokens <= 2
+            && let Some(ref e) = self.exl3_decode
+        {
+            e.out_proj_batched(
+                ctx.gpu,
+                normed_out_buf,
+                out_proj_buf,
+                num_tokens as u32,
+                stream,
+            )?;
+        } else if let Some(ref dense_out) = self.out_proj_dense {
             if num_tokens <= 8
                 && ctx.levers.gdn_fp8_decode
                 && self.dense_gemv_fp8w_batchm_k.0 != 0

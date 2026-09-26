@@ -225,8 +225,9 @@ fn exl3_reconstruct_arity_pin() {
 
 /// The EXL3 int8 "sq" GEMV module (exl3_int8.cu) is a standalone bundle member, so it gets
 /// its own pin: the six sq entries take ten params (A, B, C, size_m, size_k, size_n, locks,
-/// suh, A_had, svh) and the conversion three (in, out, n); the M6b launchers must pass exactly
-/// that many. Update launcher and pin in the same commit.
+/// suh, A_had, svh), the conversion three (in, out, n) and the strided-row conversion five
+/// (in, out, rows, cols, out_stride); the M6b/M6d launchers must pass exactly that many.
+/// Update launcher and pin in the same commit.
 #[test]
 #[ignore = "needs a real kernel build"]
 fn exl3_int8_arity_pin() {
@@ -245,6 +246,7 @@ fn exl3_int8_arity_pin() {
         ("exl3_int8_sq_k6_m1", 10),
         ("exl3_int8_sq_k6_m2", 10),
         ("exl3_f32_to_bf16", 3),
+        ("exl3_f32_to_bf16_rows", 5),
     ];
     let mut checked = 0usize;
     for set in atlas_kernels::available_targets() {
