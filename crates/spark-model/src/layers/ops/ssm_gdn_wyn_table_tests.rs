@@ -26,8 +26,7 @@ const NK: usize = 16;
 const NV: usize = 48;
 const KD: usize = 128;
 const VD: usize = 128;
-const K: usize = 8; // wy8 verifies 8 tokens (DFlash2 gamma)
-const NI: usize = 7; // h intermediates per slot (k-1)
+/// One test case verifies K tokens; intermediates per slot = K-1.
 const CONV_DIM: usize = NK * KD * 2 + NV * VD;
 const GB_STRIDE: usize = NV * 2;
 /// Floats in one sequence's h_state (== the pool's per-slot h stride).
@@ -77,33 +76,30 @@ fn up_ptr_table(g: &dyn GpuBackend, ptrs: &[DevicePtr]) -> DevicePtr {
     p
 }
 
-#[test]
-#[ignore]
-fn gdn_wy8_table_form_byte_identical() {
-    const N: usize = 3;
+fn check_wyn_table_form(n: usize, k: usize) {
+    let ni = k - 1; // h intermediates per slot
     let set = atlas_kernels::ptx_for_exact_target("qwen3.8-27b", "nvfp4")
         .expect("qwen3.8-27b/nvfp4 not in this build");
     let gpu =
         spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
     let g: &dyn GpuBackend = &gpu;
-    let kernel = g
-        .kernel("gated_delta_rule_wyn", "gated_delta_rule_wy8")
-        .expect("wy8 kernel lookup");
-    assert!(kernel.0 != 0, "gated_delta_rule_wy8 resolved to handle 0");
+    let fn_name = format!("gated_delta_rule_wy{k}");
+    let kernel = g.kernel("gated_delta_rule_wyn", &fn_name).unwrap();
+    assert!(kernel.0 != 0, "{fn_name} resolved to handle 0");
 
-    let mut rng = Lcg(0x5eed_8c3a);
-    let rows = N * K;
-    // Token rows are seq-major [seq0_t0..t7, seq1_t0..t7, ...] — the kernel's
-    // (b*K+T) indexing.
+    let mut rng = Lcg(0x5eed_8c3a ^ (k as u64) << 32);
+    let rows = n * k;
+    // Token rows are seq-major [seq0_t0..t{K-1}, seq1_t0.., ...] — the
+    // kernel's (b*K+T) indexing.
     let qkv: Vec<bf16> = (0..rows * CONV_DIM)
         .map(|_| bf16::from_f32(rng.r(-1.0, 1.0)))
         .collect();
     let gate: Vec<f32> = (0..rows * GB_STRIDE).map(|_| rng.r(0.90, 0.999)).collect();
     let beta: Vec<f32> = (0..rows * GB_STRIDE).map(|_| rng.r(0.1, 0.9)).collect();
-    let h_init: Vec<f32> = (0..N * HV).map(|_| rng.r(-0.5, 0.5)).collect();
+    let h_init: Vec<f32> = (0..n * HV).map(|_| rng.r(-0.5, 0.5)).collect();
     // Sentinel per (slot, token) so a cross-sequence intermediate write is
     // visible even where the kernel would not write.
-    let hi_init: Vec<f32> = (0..N * NI * HV)
+    let hi_init: Vec<f32> = (0..n * ni * HV)
         .map(|i| -1000.0 - ((i / HV) as f32))
         .collect();
 
@@ -150,16 +146,16 @@ fn gdn_wy8_table_form_byte_identical() {
     let ref_h = up_f32(g, &h_init);
     let ref_hi = up_f32(g, &hi_init);
     let ref_out = g.alloc(rows * NV * VD * 2).unwrap();
-    for i in 0..N {
+    for i in 0..n {
         let i = i as u64;
         launch(
             DevicePtr(ref_h.0 + (i as usize * HV * 4) as u64),
-            DevicePtr(d_q.0 + i * (K * CONV_DIM * 2) as u64),
-            DevicePtr(d_gate.0 + i * (K * GB_STRIDE * 4) as u64),
-            DevicePtr(d_beta.0 + i * (K * GB_STRIDE * 4) as u64),
-            DevicePtr(ref_out.0 + i * (K * NV * VD * 2) as u64),
-            // pool layout: intermediate (slot, t) at (slot*NI + t) * HV
-            DevicePtr(ref_hi.0 + i * (NI * HV * 4) as u64),
+            DevicePtr(d_q.0 + i * (k * CONV_DIM * 2) as u64),
+            DevicePtr(d_gate.0 + i * (k * GB_STRIDE * 4) as u64),
+            DevicePtr(d_beta.0 + i * (k * GB_STRIDE * 4) as u64),
+            DevicePtr(ref_out.0 + i * (k * NV * VD * 2) as u64),
+            // pool layout: intermediate (slot, t) at (slot*ni + t) * HV
+            DevicePtr(ref_hi.0 + i * (ni * HV * 4) as u64),
             1,
             false,
         );
@@ -171,20 +167,20 @@ fn gdn_wy8_table_form_byte_identical() {
     let tst_out = g.alloc(rows * NV * VD * 2).unwrap();
     let h_tbl = up_ptr_table(
         g,
-        &(0..N)
+        &(0..n)
             .map(|i| DevicePtr(tst_h.0 + (i * HV * 4) as u64))
             .collect::<Vec<_>>(),
     );
     let hi0_tbl = up_ptr_table(
         g,
-        &(0..N)
-            .map(|i| DevicePtr(tst_hi.0 + (i * NI * HV * 4) as u64))
+        &(0..n)
+            .map(|i| DevicePtr(tst_hi.0 + (i * ni * HV * 4) as u64))
             .collect::<Vec<_>>(),
     );
-    launch(h_tbl, d_q, d_gate, d_beta, tst_out, hi0_tbl, N as u32, true);
+    launch(h_tbl, d_q, d_gate, d_beta, tst_out, hi0_tbl, n as u32, true);
 
-    // h_state, all 7 intermediates, and output must be BYTE-identical.
-    let (a, b) = (down_f32(g, ref_h, N * HV), down_f32(g, tst_h, N * HV));
+    // h_state, all K-1 intermediates, and output must be BYTE-identical.
+    let (a, b) = (down_f32(g, ref_h, n * HV), down_f32(g, tst_h, n * HV));
     if let Some(i) = a
         .iter()
         .zip(&b)
@@ -198,8 +194,8 @@ fn gdn_wy8_table_form_byte_identical() {
         );
     }
     let (a, b) = (
-        down_f32(g, ref_hi, N * NI * HV),
-        down_f32(g, tst_hi, N * NI * HV),
+        down_f32(g, ref_hi, n * ni * HV),
+        down_f32(g, tst_hi, n * ni * HV),
     );
     if let Some(i) = a
         .iter()
@@ -209,8 +205,8 @@ fn gdn_wy8_table_form_byte_identical() {
         panic!(
             "INTERMEDIATE differs at float {i} (seq {}, token {}): ref {} vs batched {} \
              — this is the cross-sequence rollback corruption the pointer table fixes",
-            i / (NI * HV),
-            (i / HV) % NI,
+            i / (ni * HV),
+            (i / HV) % ni,
             a[i],
             b[i]
         );
@@ -220,5 +216,19 @@ fn gdn_wy8_table_form_byte_identical() {
     g.copy_d2h(ref_out, &mut ob).unwrap();
     g.copy_d2h(tst_out, &mut tb).unwrap();
     assert_eq!(ob, tb, "output bytes differ");
-    eprintln!("n={N} k={K}: h_state + {NI} intermediates + output all BYTE-IDENTICAL");
+    eprintln!("n={n} k={k}: h_state + {ni} intermediates + output all BYTE-IDENTICAL");
+}
+
+/// wy8 table form — the DFlash2 γ=8 width.
+#[test]
+#[ignore]
+fn gdn_wy8_table_form_byte_identical() {
+    check_wyn_table_form(3, 8);
+}
+
+/// wy12 table form — the adaptive-γ γ=12 width (job 260's code/JSON winner).
+#[test]
+#[ignore]
+fn gdn_wy12_table_form_byte_identical() {
+    check_wyn_table_form(3, 12);
 }

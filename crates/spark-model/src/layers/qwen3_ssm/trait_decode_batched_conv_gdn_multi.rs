@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Cross-sequence batched conv+WY body for the batched K-row MTP verify
-//! (`GdnStates::Multi`, k = 2..=4 from the K-vs-batch ladder and k = 5..=8
+//! (`GdnStates::Multi`, k = 2..=4 from the K-vs-batch ladder and k = 5..=16
 //! for the DFlash2/chain-verify widths via the K-templated wyN kernels). Collapses the
 //! per-sequence loop — n × (k `conv1d_update_l2norm` + (k-1) conv-state
 //! `copy_d2d_async` + 1 `gdn_decode_wy{k}`) = n(2k-1) launches per GDN layer
@@ -17,7 +17,7 @@
 //!    allocates `num_intermediates = K` snapshots per slot, and the
 //!    preconditions below verify index K-1 exists and is intra-slot
 //!    contiguous before the launch.
-//! 2. `gdn_decode_wy{2,3,4}` / `gdn_decode_wyn` (K = 5..=8) at
+//! 2. `gdn_decode_wy{2,3,4}` / `gdn_decode_wyn` (K = 5..=16) at
 //!    `batch_size = n` with `state_is_table = true`:
 //!    ONE launch over device pointer tables (one entry per sequence) for
 //!    h_state + the k-1 Hi intermediates — the table form that sidesteps the
@@ -34,8 +34,9 @@
 //! two-launch path. The conv kernel was already K-generic (`num_tokens` is a
 //! runtime arg).
 //!
-//! K = 5..8 (DFlash2 γ=8 verifies 8 rows/sequence): the K-templated
-//! `gated_delta_rule_wy5..wy8` kernels carry the same `state_is_table`
+//! K = 5..16 (DFlash2 γ=8 verifies 8 rows/sequence; γ=12/γ=16 need 12/16):
+//! the K-templated `gated_delta_rule_wy5..wy16` kernels carry the same
+//! `state_is_table`
 //! trailing arg — `h_state` plus ONE Hi_0-base table per sequence, the K-1
 //! intermediates still striding by `inter_stride_floats` within the slot
 //! (intra-slot contiguity is asserted below, same as the exact arm).
@@ -158,12 +159,12 @@ impl Qwen3SsmLayer {
             4 => self.wy4_kernel(),
             // wyN has no FP16 h-state twin — return 0 so `require_wy_f16`
             // refuses, exactly as an unlinked wy4_f16 twin does.
-            k @ 5..=8 if !super::ssm_h_fp16_enabled() => self
+            k @ 5..=16 if !super::ssm_h_fp16_enabled() => self
                 .wyn_kernel(k, ctx.levers.gdn_wyn)
                 .unwrap_or(spark_runtime::gpu::KernelHandle(0)),
             _ => spark_runtime::gpu::KernelHandle(0),
         };
-        if !(2..=8).contains(&kk) {
+        if !(2..=16).contains(&kk) {
             return Ok(false);
         }
         // ATLAS_SSM_H_FP16: a zero handle below turns into `Ok(false)` and the
@@ -343,7 +344,7 @@ impl Qwen3SsmLayer {
                 true,
                 stream,
             )?,
-            k if (5..=8).contains(&k) => ops::gdn_decode_wyn(
+            k if (5..=16).contains(&k) => ops::gdn_decode_wyn(
                 ctx.gpu,
                 wy_k,
                 wy_tables,

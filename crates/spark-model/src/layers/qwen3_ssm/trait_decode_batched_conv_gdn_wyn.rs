@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Pool-layout WY-chunkwise GDN verify arm, shared by the K=17 DFlash path
-//! (`gated_delta_rule_wy17`) and the chain-verify K∈{5..8} path
-//! (`gated_delta_rule_wy5..wy8`, one K-templated source). Extracted from
+//! (`gated_delta_rule_wy17`) and the chain-verify K∈{5..16} path
+//! (`gated_delta_rule_wy5..wy16`, one K-templated source). Extracted from
 //! `trait_decode_batched_conv_gdn.rs` so both arms dispatch the identical
 //! body (fused conv_kn epilogue + one wyN launch) and to keep that file
 //! under the 500 LoC cap.
@@ -21,12 +21,12 @@ use crate::layers::ops;
 // encodes.
 
 impl Qwen3SsmLayer {
-    /// The wyN kernel for chain-verify `num_tokens` ∈ {5..8}, or `None`
+    /// The wyN kernel for chain-verify `num_tokens` ∈ {5..16}, or `None`
     /// when out of range, the module is absent (non-gb10 target), or the
     /// `ATLAS_GDN_WYN=0` kill-switch is set — all of which keep the caller
     /// on the sequential per-token fallback.
     pub(super) fn wyn_kernel(&self, num_tokens: usize, wyn_enabled: bool) -> Option<KernelHandle> {
-        if !(5..=8).contains(&num_tokens) || !wyn_enabled {
+        if !(5..=16).contains(&num_tokens) || !wyn_enabled {
             return None;
         }
         let k = self.gdn_wyn_k[num_tokens - 5];

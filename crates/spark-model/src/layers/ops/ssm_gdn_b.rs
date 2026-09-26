@@ -280,7 +280,7 @@ pub fn gdn_decode_wy4(
 
 /// WY-Chunkwise Gated Delta Rule, pool-layout intermediates — K-generic
 /// launch shared by the K=17 DFlash verify (`gated_delta_rule_wy17`) and the
-/// chain-verify K∈{5..8} instantiations (`gated_delta_rule_wy5..wy8`, one
+/// chain-verify K∈{5..16} instantiations (`gated_delta_rule_wy5..wy16`, one
 /// templated source `gated_delta_rule_wyn.cu`). K is compile-time in the
 /// kernel; the caller selects it via the `kernel` handle. Computes K H·k dot
 /// products in 1 pass over H, applies WY algebraic correction over K tokens

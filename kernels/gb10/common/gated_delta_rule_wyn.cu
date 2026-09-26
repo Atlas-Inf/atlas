@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Atlas WY-Chunkwise Gated Delta Rule — K∈{5,6,7,8} verification (wyN).
+// Atlas WY-Chunkwise Gated Delta Rule — K∈{5..16} verification (wyN).
 //
 // K-templated generalization of gated_delta_rule_wy17.cu (which itself
 // generalizes wy4). One __device__ impl, instantiated for the chain-verify
 // widths between the dedicated wy4 and the DFlash wy17 — mirroring the
 // w4a16_gemv_batchm_impl<MAX_M> instantiation pattern in w4a16_gemv.cu.
-// Removes the serial per-token GDN fallback at chain-verify K=5..8.
+// Removes the serial per-token GDN fallback at chain-verify K=5..16.
 //
 // Algorithm (identical WY-chunkwise structure — "2 passes over H
 // regardless of K"):
@@ -18,10 +18,12 @@
 //      Hi_t = state after token t for t=0..K-2, and final H = state
 //      after token K-1.
 //
-// SMEM budget @ K=8, k_dim=128:
-//   sk[8][128] + sq[8][128] = 8·128·2·4 = 8 KB
-//   kdots[28] + gate/beta[16] + warp_sums[4]  < 0.25 KB
+// SMEM budget @ K=16, k_dim=128 (the largest instantiation):
+//   sk[16][128] + sq[16][128] = 16·128·2·4 = 16 KB
+//   kdots[120] + gate/beta[32] + warp_sums[4]  < 1 KB
 //   (SM_120 cap: 100 KB — trivially fits for every instantiation)
+// Register arrays vi/hk/vn/qd are [K_TOKENS] per thread — 16 floats each at
+// the max — and kd_flat indexing is t*(t-1)/2 + s, both K-generic.
 //
 // Grid: (num_v_heads, batch, 1)   Block: (128, 1, 1)
 // Reduction primitives (gdn_reduce.cuh) match the per-token baseline
@@ -260,5 +262,13 @@ ATLAS_WYN_INSTANTIATE(5)
 ATLAS_WYN_INSTANTIATE(6)
 ATLAS_WYN_INSTANTIATE(7)
 ATLAS_WYN_INSTANTIATE(8)
+ATLAS_WYN_INSTANTIATE(9)
+ATLAS_WYN_INSTANTIATE(10)
+ATLAS_WYN_INSTANTIATE(11)
+ATLAS_WYN_INSTANTIATE(12)
+ATLAS_WYN_INSTANTIATE(13)
+ATLAS_WYN_INSTANTIATE(14)
+ATLAS_WYN_INSTANTIATE(15)
+ATLAS_WYN_INSTANTIATE(16)
 
 #undef ATLAS_WYN_INSTANTIATE
