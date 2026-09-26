@@ -667,15 +667,15 @@ pub fn build_model(
                 anyhow::bail!(
                     "No memory left for KV cache: total GPU = {:.1} GB, \
                      --gpu-memory-utilization {:.0}% → budget {:.1} GB, \
-                     but {:.1} GB already consumed + {:.1} GB inference reserve\
+                     but {:.1} GB already consumed + {:.1} GB inference reserve (net of balloon)\
                      {lazy_bf16_term} = {:.1} GB committed.  Raise \
                      --gpu-memory-utilization or use a smaller model.",
                     total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                     gpu_memory_utilization * 100.0,
                     total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
                     used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
-                    inference_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
-                    (used_so_far + inference_reserve + derived_reserve) as f64
+                    reserve_net as f64 / (1024.0 * 1024.0 * 1024.0),
+                    (used_so_far + reserve_net + derived_reserve) as f64
                         / (1024.0 * 1024.0 * 1024.0),
                 );
             }
@@ -694,7 +694,7 @@ pub fn build_model(
                 gpu_memory_utilization * 100.0,
                 total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
                 used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
-                inference_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
+                reserve_net as f64 / (1024.0 * 1024.0 * 1024.0),
                 kv_budget as f64 / (1024.0 * 1024.0 * 1024.0),
                 n,
                 kv_block_size,
