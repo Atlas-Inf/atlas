@@ -49,6 +49,22 @@ __device__ __forceinline__ float w8n128_e4m3(unsigned char b) {
 static_assert(W8N128_FP8B % W8N128_KSTEP == 0, "K_STEP must divide the 128-K scale block");
 static_assert(W8N128_N_TILE == W8N128_FP8B, "N tile must equal one 128-N scale block");
 
+
+// Grouped (GROUP_M) CTA order: GM consecutive CTAs share one N tile across GM M tiles, so a B
+// tile is fetched from DRAM once per group instead of once per M tile. Pure index remap over
+// the same (gridDim.x x gridDim.y) set of tiles, so every output tile is computed exactly as before.
+#define W8N128_GROUP_M 8
+__device__ __forceinline__ void w8n128_swizzle_mn(unsigned int gm, unsigned int& m_tile, unsigned int& n_tile) {
+    const unsigned int num_n = gridDim.x, num_m = gridDim.y;
+    const unsigned int bid = blockIdx.y * num_n + blockIdx.x;
+    const unsigned int per_group = gm * num_n;
+    const unsigned int group = bid / per_group;
+    const unsigned int first_m = group * gm;
+    const unsigned int gsize = (num_m - first_m) < gm ? (num_m - first_m) : gm;
+    const unsigned int local = bid - group * per_group;
+    m_tile = first_m + local % gsize;
+    n_tile = local / gsize;
+}
 extern "C" __global__
 __launch_bounds__(256, 1)
 void w8a16_gemm_n_m128(
@@ -60,8 +76,10 @@ void w8a16_gemm_n_m128(
     unsigned int N,
     unsigned int K
 ) {
-    const unsigned int cta_n = blockIdx.x * W8N128_N_TILE;
-    const unsigned int cta_m = blockIdx.y * W8N128_M_TILE;
+    unsigned int m_t, n_t;
+    w8n128_swizzle_mn(W8N128_GROUP_M, m_t, n_t);
+    const unsigned int cta_n = n_t * W8N128_N_TILE;
+    const unsigned int cta_m = m_t * W8N128_M_TILE;
     if (cta_m >= M || cta_n >= N) return;
 
     const unsigned int warp_id = threadIdx.x >> 5;       // 0..7
