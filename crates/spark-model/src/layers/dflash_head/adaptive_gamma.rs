@@ -67,6 +67,71 @@ pub(crate) fn initial_gamma(adaptive: bool, configured: usize) -> usize {
     }
 }
 
+/// Draft cap for one proposal: `min(num_drafts, gamma - 1)` — a γ_i
+/// proposal emits γ_i rows where the last is the anchor bonus, so the cap
+/// must bound by the PROPOSAL γ, not the configured γ_max (a γ=8 proposal
+/// under γ_max=12 otherwise keeps the bonus as a bogus position-γ draft).
+/// Lever-off: `gamma == self.gamma`, identical to the legacy bound.
+pub(crate) fn draft_cap_for(num_drafts: usize, gamma: usize) -> usize {
+    num_drafts.min(gamma.saturating_sub(1)).max(1)
+}
+
+/// Batch-wide adaptive-γ accumulator behind `DflashProposerState` usage:
+/// steps and accepted-draft totals per γ bucket, switch count, and total
+/// verify calls — the periodic `DFLASH ADAPTIVE` INFO line. Touched only
+/// under the adaptive lever (lever-off: the Mutex is never taken).
+#[derive(Default)]
+pub struct AdaptiveGammaStats {
+    /// Verify calls recorded (all γ).
+    pub verify_calls: u64,
+    /// Steps and accepted-draft totals at the floor γ.
+    pub steps_lo: u64,
+    pub accepted_lo: u64,
+    /// Steps and accepted-draft totals at the configured γ_max.
+    pub steps_hi: u64,
+    pub accepted_hi: u64,
+    /// Total γ transitions (any direction, all sequences).
+    pub switches: u64,
+}
+
+impl AdaptiveGammaStats {
+    /// One entry per verify call: `cur` is the γ the just-verified
+    /// proposal ran at (`propose_gamma` before `next_gamma` moves it).
+    pub fn record(&mut self, cur: usize, accepted: usize, gamma_max: usize) {
+        self.verify_calls += 1;
+        if cur < gamma_max {
+            self.steps_lo += 1;
+            self.accepted_lo += accepted as u64;
+        } else {
+            self.steps_hi += 1;
+            self.accepted_hi += accepted as u64;
+        }
+    }
+
+    /// Every 64 verify calls: one INFO summary, house periodic style.
+    pub fn log_periodic(&self) {
+        const PERIOD: u64 = 64;
+        if !self.verify_calls.is_multiple_of(PERIOD) {
+            return;
+        }
+        let mean = |a: u64, s: u64| {
+            if s == 0 { 0.0 } else { a as f64 / s as f64 }
+        };
+        tracing::info!(
+            "DFLASH ADAPTIVE verify_steps={} g{}={} steps (accept {:.2}) g{}={} steps (accept {:.2}) switches={}",
+            self.verify_calls,
+            ADAPTIVE_GAMMA_LO,
+            self.steps_lo,
+            mean(self.accepted_lo, self.steps_lo),
+            // γ_max is the configured gamma; the hi bucket labels it.
+            12,
+            self.steps_hi,
+            mean(self.accepted_hi, self.steps_hi),
+            self.switches,
+        );
+    }
+}
+
 /// Group key order for the batched split: ascending γ puts the cheap
 /// group first. Returns the distinct γ values present in `gammas`.
 pub(crate) fn distinct_gammas(gammas: &[usize]) -> Vec<usize> {
@@ -137,6 +202,19 @@ mod tests {
         assert_eq!(initial_gamma(true, 8), 8);
         assert_eq!(initial_gamma(true, 4), 4);
         assert_eq!(initial_gamma(false, 16), 16);
+    }
+
+    #[test]
+    fn draft_cap_bounds_by_proposal_gamma() {
+        // Fixed-γ parity: configured 8 or 12 caps at γ-1.
+        assert_eq!(draft_cap_for(7, 8), 7);
+        assert_eq!(draft_cap_for(11, 12), 11);
+        // The #98 defect: a γ=8 proposal under γ_max=12 kept all 8 rows —
+        // the 8th being the anchor bonus presented as a position-γ draft.
+        assert_eq!(draft_cap_for(11, 8), 7);
+        // Degenerate edges keep at least one draft.
+        assert_eq!(draft_cap_for(0, 8), 0);
+        assert_eq!(draft_cap_for(7, 0), 1);
     }
 
     #[test]

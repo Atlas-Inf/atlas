@@ -354,7 +354,7 @@ impl BlockDiffusionDraftHead {
                          (cache slots not ready or staging skipped)"
                     )
                 })?;
-                let cap = self.draft_cap(num_drafts);
+                let cap = self.draft_cap(num_drafts, gamma);
                 for (i, tokens) in out.iter_mut().enumerate() {
                     tokens.truncate(cap);
                     let dstate = states[i]

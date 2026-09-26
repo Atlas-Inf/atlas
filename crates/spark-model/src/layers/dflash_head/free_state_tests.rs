@@ -140,6 +140,9 @@ fn zero_head() -> BlockDiffusionDraftHead {
         lanes_start_event: 0,
         suppress_graphs: std::sync::atomic::AtomicBool::new(false),
         propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
+        adaptive_stats: parking_lot::Mutex::new(
+            crate::layers::dflash_head::adaptive_gamma::AdaptiveGammaStats::default(),
+        ),
         quant: super::DflashQuantization::Bf16,
         startup: super::DsparkStartupExecution::from_env_lenient(),
     }
@@ -218,6 +221,7 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
         last_num_accepted: 1,
         propose_gamma: 8,
         accept_ema: 0.0,
+        adaptive_switches: 0,
         gamma_max: 8,
         adaptive_gamma_on: false,
         skip_next_decode_append: false,

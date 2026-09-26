@@ -326,6 +326,10 @@ pub struct DflashProposerState {
     /// EMA of accepted draft tokens per verify step (bonus excluded);
     /// drives `next_gamma`. Lever-off: stays 0 and is never read.
     pub accept_ema: f32,
+    /// Times this sequence's `propose_gamma` changed (adaptive lever on
+    /// only). Steps/accepted per γ live in the head-level
+    /// `adaptive_stats` accumulator — the periodic INFO line.
+    pub adaptive_switches: u64,
     /// The configured γ_max this state was allocated under — the
     /// `next_gamma` ceiling and the reclaim reset point.
     pub gamma_max: usize,
@@ -673,6 +677,11 @@ pub struct BlockDiffusionDraftHead {
     /// `TransformerModel::suppress_graphs` so external code can disable
     /// graphs at runtime (e.g. while calibrating FP8 KV).
     pub suppress_graphs: std::sync::atomic::AtomicBool,
+    /// Adaptive-γ counters (lever on only): steps/accepted per γ bucket,
+    /// γ switches, total verify calls — the periodic `DFLASH ADAPTIVE`
+    /// INFO line aggregates here so it reflects the whole batch, not one
+    /// sequence. Lever-off: never touched.
+    pub adaptive_stats: Mutex<adaptive_gamma::AdaptiveGammaStats>,
     /// How many eager warm-up calls we've executed against the graph path.
     /// Default warmup target is 2 (override via `ATLAS_DFLASH_PROPOSE_WARMUP_N`).
     /// Two eager passes warm the PTX→SASS cache, ramp GB10 clocks to steady
@@ -870,6 +879,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             last_num_accepted: 0,
             propose_gamma: adaptive_gamma::initial_gamma(self.startup.adaptive_gamma, self.gamma),
             accept_ema: 0.0,
+            adaptive_switches: 0,
             gamma_max: self.gamma,
             adaptive_gamma_on: self.startup.adaptive_gamma,
             skip_next_decode_append: false,
@@ -1260,6 +1270,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // EMA and move the next propose's γ. `num_accepted` counts draft
         // tokens only — the bonus token is a verify output, not a draft.
         if self.startup.adaptive_gamma {
+            let mut stats = self.adaptive_stats.lock();
+            stats.record(dstate.propose_gamma, num_accepted, self.gamma);
             dstate.accept_ema = adaptive_gamma::update_ema(dstate.accept_ema, num_accepted);
             let (next, ema) = adaptive_gamma::next_gamma(
                 dstate.propose_gamma,
@@ -1268,17 +1280,21 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 self.gamma,
             );
             if next != dstate.propose_gamma {
-                tracing::debug!(
-                    "DFlash adaptive γ: {} -> {} (ema={:.2} -> {:.2}, accepted={})",
+                stats.switches += 1;
+                dstate.adaptive_switches += 1;
+                tracing::info!(
+                    "DFlash adaptive γ: {} -> {} (ema={:.2} -> {:.2}, accepted={}, seq_switches={})",
                     dstate.propose_gamma,
                     next,
                     dstate.accept_ema,
                     ema,
                     num_accepted,
+                    dstate.adaptive_switches,
                 );
                 dstate.propose_gamma = next;
                 dstate.accept_ema = ema;
             }
+            stats.log_periodic();
         }
         Ok(())
     }

@@ -849,6 +849,9 @@ impl BlockDiffusionDraftHead {
             lanes_start_event: gpu.create_event()?,
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),
             propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
+            adaptive_stats: parking_lot::Mutex::new(
+                super::adaptive_gamma::AdaptiveGammaStats::default(),
+            ),
             quant: DflashQuantization::Bf16,
             startup,
         };

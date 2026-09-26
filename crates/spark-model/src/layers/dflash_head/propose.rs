@@ -615,7 +615,7 @@ impl BlockDiffusionDraftHead {
         // forward_block returns [mask_1 .. mask_{γ-1}, bonus_0]; the bonus
         // row is NOT a draft (vLLM sample_off=1). Capping at γ sent that
         // extra token into M=γ+1 target verify (~11 ms) for no accept gain.
-        let cap = self.draft_cap(_num_drafts);
+        let cap = self.draft_cap(_num_drafts, gamma);
 
         // ATLAS_DFLASH_VERIFY_TRACE=1: log all γ drafts BEFORE the cap so we
         // can see whether the drafter echoes only at position 0 or across
@@ -647,9 +647,13 @@ impl BlockDiffusionDraftHead {
 
     /// Draft-count cap shared by the immediate and deferred readback paths:
     /// scheduler K (`num_drafts` = γ-1) unless the startup ablation override
-    /// is set; the Lightning product policy rejects any override.
-    pub(super) fn draft_cap(&self, num_drafts: usize) -> usize {
-        let default_k = num_drafts.min(self.gamma.saturating_sub(1)).max(1);
+    /// is set; the Lightning product policy rejects any override. `gamma` is
+    /// the γ this proposal ran at (`dstate.propose_gamma`), NOT `self.gamma`:
+    /// under adaptive γ a γ=8 proposal emits 8 rows where the 8th is the
+    /// anchor bonus — capping at γ_max−1 kept it as a bogus position-γ
+    /// draft; the serial γ=8 arm returns only its 7 mask drafts.
+    pub(super) fn draft_cap(&self, num_drafts: usize, gamma: usize) -> usize {
+        let default_k = super::adaptive_gamma::draft_cap_for(num_drafts, gamma);
         self.startup.draft_cap_override.unwrap_or(default_k)
     }
 
@@ -678,7 +682,6 @@ impl BlockDiffusionDraftHead {
     ) -> Result<Vec<Vec<u32>>> {
         let n = last_tokens.len();
         let lanes_n = self.lane_count();
-        let cap = self.draft_cap(num_drafts);
         let default_stream = ctx.gpu.default_stream();
         ctx.gpu
             .record_event(self.lanes_start_event, default_stream)?;
@@ -719,7 +722,7 @@ impl BlockDiffusionDraftHead {
                 out[prev_i] = Some(self.read_deferred_drafts(
                     ctx.gpu,
                     lane_scratch_list[prev_i],
-                    cap,
+                    self.draft_cap(num_drafts, propose_gammas[prev_i]),
                     propose_gammas[prev_i],
                 )?);
             }
@@ -752,7 +755,7 @@ impl BlockDiffusionDraftHead {
                 out[i] = Some(self.read_deferred_drafts(
                     ctx.gpu,
                     lane_scratch_list[i],
-                    cap,
+                    self.draft_cap(num_drafts, propose_gammas[i]),
                     propose_gammas[i],
                 )?);
             }

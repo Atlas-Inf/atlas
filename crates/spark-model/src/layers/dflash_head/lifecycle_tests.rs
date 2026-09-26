@@ -177,6 +177,7 @@ fn owner_failure_reclaim_frees_state_resources_without_leaking() {
         last_num_accepted: 1,
         propose_gamma: 8,
         accept_ema: 0.0,
+        adaptive_switches: 0,
         gamma_max: 8,
         adaptive_gamma_on: false,
         skip_next_decode_append: false,
