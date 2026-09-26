@@ -576,6 +576,13 @@ pub struct BlockDiffusionDraftHead {
     pub batch_markov_prev: DevicePtr,
     pub batch_markov_embed: DevicePtr,
     pub batch_markov_bias: DevicePtr,
+    /// DFlash2 selector projected-hidden scratch, `[B*gamma, rank]` BF16.
+    /// NULL when the head has no candidate selector (Lightning DSpark).
+    pub batch_dflash2_projected: DevicePtr,
+    /// DFlash2 conv scratch: dynamic-delta rows `[B*gamma, 2*kernel_size*groups]`
+    /// and conv output `[B*gamma, hidden]`. NULL when the drafter ships no conv.
+    pub batch_conv_delta: DevicePtr,
+    pub batch_conv_out: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -684,13 +691,18 @@ pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, Lightni
 mod batch_inputs;
 pub use batch_inputs::{DsparkBatchInput, DsparkBatchInputError, DsparkBatchSequence};
 mod batch_attention;
+mod batch_conv;
 mod batch_execution;
 #[cfg(test)]
 mod batch_execution_tests;
+mod batch_fallback;
 mod batch_forward;
 #[cfg(test)]
 mod batch_inputs_tests;
+mod batch_plan;
 mod batch_projection;
+mod batch_propose;
+mod batch_tail_dflash2;
 mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;
@@ -707,6 +719,7 @@ mod from_weights;
 mod lifecycle_tests;
 mod markov;
 mod nvfp4;
+mod parity_report;
 mod precompute_ctx_kv;
 mod propose;
 mod small_m_gemm;
@@ -782,25 +795,24 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _buffers: &spark_runtime::buffers::BufferArena,
         _config: &atlas_core::config::ModelConfig,
     ) -> usize {
-        if self.startup.native_batch_authoritative || self.startup.diagnostics.batch_parity {
-            self.batch_capacity
-        } else if self.lane_count() > 1 {
+        batch_plan::propose_batch_width(
+            self.startup.native_batch_authoritative,
+            self.startup.diagnostics.batch_parity,
+            self.startup.generic_batch_authoritative,
             // Generic multi-lane (ATLAS_DFLASH_PROPOSE_LANES > 1): each seq
             // proposes on its pinned lane stream, so the batched entry can
             // produce output at the full admission width even though the
             // Lightning Bxgamma seam (gamma == 4 contract) never applies.
-            self.batch_capacity
-        } else {
-            1
-        }
+            self.lane_count() > 1,
+            self.batch_capacity,
+        )
     }
 
     fn propose_batch_min(&self) -> usize {
-        if self.startup.native_batch_authoritative || self.startup.diagnostics.batch_parity {
-            1
-        } else {
-            2
-        }
+        batch_plan::propose_batch_floor(
+            self.startup.native_batch_authoritative,
+            self.startup.diagnostics.batch_parity,
+        )
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
@@ -843,7 +855,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 .min(self.max_seq_len),
             ctx_slot_bytes,
             // Phase 2 Option B: lazily allocated on first propose when
-            // ATLAS_DFLASH_OPTION_B=1. None until then to keep alloc_state
+            // Option B is on (the generic default; ATLAS_DFLASH_OPTION_B=0
+            // restores the legacy contiguous path). None until then to
+            // keep alloc_state
             // cheap for sequences that never use Option B.
             block_table_dev: None,
             ctx_count_drafter: 0,
@@ -918,12 +932,18 @@ impl DraftProposer for BlockDiffusionDraftHead {
             expected_owners.len(),
         )?;
         let native_authoritative = self.startup.native_batch_authoritative;
-        // Generic DFlash keeps the historical n<2 fallback. The official
-        // Lightning product and explicit parity both enter the native B1 path.
+        let generic_auth =
+            self.startup.generic_batch_authoritative && !self.startup.diagnostics.batch_parity;
+        // Generic DFlash keeps the historical n<2 fallback — also under the
+        // authoritative batched mode (propose_batch_min=2 keeps the
+        // scheduler off this entry for a lone pending sequence; a defensive
+        // n==1 call still returns None so the caller keeps the serial path).
+        // Lightning and explicit parity both enter the native B1 path.
         if n == 0 || (n == 1 && !(native_authoritative || self.startup.diagnostics.batch_parity)) {
             return Ok(None);
         }
-        let consume_native = native_authoritative || self.startup.diagnostics.batch_parity;
+        let consume_native =
+            native_authoritative || self.startup.diagnostics.batch_parity || generic_auth;
         if !consume_native {
             // Generic DFlash never consumes the Lightning Bxgamma seam below:
             // its gamma == 4 contract rejects this head's row shape and the
@@ -991,9 +1011,16 @@ impl DraftProposer for BlockDiffusionDraftHead {
         } else {
             (None, None)
         };
-        if native_authoritative && parity_oracle.is_none() {
+        if (native_authoritative || generic_auth) && parity_oracle.is_none() {
+            // prepare_drafts_state advances the lifecycle and commits the
+            // ctx-slot precompute; a sequence that was prepared must never
+            // be re-prepared (double advance corrupts the drafter context),
+            // so a mid-loop failure under generic authoritative falls back
+            // to forward_prepared for the prepared prefix and serial
+            // propose for the rest instead of erroring to the scheduler.
+            let mut prepared = 0usize;
             for i in 0..n {
-                self.prepare_drafts_state(
+                if let Err(e) = self.prepare_drafts_state(
                     last_tokens[i],
                     target_hiddens[i],
                     positions[i],
@@ -1003,288 +1030,70 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     ctx,
                     stream,
                     target_hiddens[i],
-                )?;
-            }
-        }
-
-        // Freeze the explicit sequence identities and lifecycle snapshots before
-        // any stream/event dispatch. The current implementation below remains
-        // serial-per-sequence or pinned-lane compute; this is only its validated
-        // B×gamma input seam. Its capacity is the already-admitted call width,
-        // so this does not widen propose_batch_max or allocate batch scratch.
-        let mut owners = Vec::with_capacity(n);
-        let mut lifecycles = Vec::with_capacity(n);
-        let mut block_table_ptrs = Vec::with_capacity(n);
-        let mut batch_kv_lens = Vec::with_capacity(n);
-        let mut batch_block_tables = Vec::with_capacity(n);
-        let mut batch_ctx_counts = Vec::with_capacity(n);
-        for state in states.iter_mut() {
-            let dstate = state
-                .as_any_mut()
-                .downcast_mut::<DflashProposerState>()
-                .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
-            let lifecycle = dstate.lifecycle.clone();
-            let owner = lifecycle
-                .as_ref()
-                .map(CaptureDescriptor::owner)
-                .unwrap_or(expected_owners[owners.len()]);
-            owners.push(owner);
-            lifecycles.push(lifecycle);
-            let block_table_dev = dstate.block_table_dev.unwrap_or(DevicePtr::NULL);
-            block_table_ptrs.push(block_table_dev.0);
-            batch_ctx_counts.push(dstate.ctx_count_drafter);
-            batch_block_tables.push(dstate.block_table.clone());
-            batch_kv_lens.push(
-                dstate
-                    .ctx_count_drafter
-                    .checked_add(self.gamma)
-                    .ok_or_else(|| anyhow::anyhow!("DFlash batch KV length overflow"))?,
-            );
-        }
-        let batch_slot_mapping = batch_execution::paged_slot_mapping(
-            &batch_block_tables,
-            &batch_ctx_counts,
-            self.gamma,
-            16,
-        )?;
-        let batch_slots_ready =
-            block_table_ptrs.iter().all(|&pointer| pointer != 0) && batch_slot_mapping.is_some();
-        if self.startup.diagnostics.batch_parity {
-            tracing::info!(
-                "DFlash Bxgamma parity cache gate: batch={} slots_ready={} device_tables={}/{}",
-                n,
-                batch_slots_ready,
-                block_table_ptrs
-                    .iter()
-                    .filter(|&&pointer| pointer != 0)
-                    .count(),
-                n
-            );
-        }
-        if native_authoritative {
-            anyhow::ensure!(
-                batch_slots_ready,
-                "Lightning DSpark native batch cache slots are not ready"
-            );
-            anyhow::ensure!(
-                self.lane_count() == 1,
-                "Lightning DSpark native batch requires exactly one proposal lane"
-            );
-        }
-        let batch_slot_mapping = batch_slot_mapping.unwrap_or_default();
-        let batch_inputs = DsparkBatchInput::validate(
-            self.gamma,
-            self.batch_capacity,
-            &owners,
-            last_tokens,
-            positions,
-            target_hiddens,
-            expected_owners,
-            &lifecycles,
-        )?;
-        // Materialize the exact host execution plan now. The next native slice
-        // uploads these packed queries and depth rows into batch scratch; the
-        // current serial/lane compute below remains the output oracle.
-        let packed_query_tokens = batch_inputs.packed_query_tokens(self.mask_token_id);
-        let _markov_depth_rows: Vec<Vec<usize>> = (1..batch_inputs.gamma())
-            .map(|query| batch_inputs.rows_at_query(query))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let query_bytes: Vec<u8> = packed_query_tokens
-            .iter()
-            .flat_map(|token| token.to_le_bytes())
-            .collect();
-        let packed_positions = batch_inputs.packed_positions()?;
-        let position_bytes: Vec<u8> = packed_positions
-            .iter()
-            .flat_map(|position| position.to_le_bytes())
-            .collect();
-        let last_token_bytes: Vec<u8> = last_tokens
-            .iter()
-            .flat_map(|token| token.to_le_bytes())
-            .collect();
-        ctx.gpu.copy_h2d(&query_bytes, self.batch_query_ids_dev)?;
-        ctx.gpu.copy_h2d(&position_bytes, self.batch_position_ids)?;
-        ctx.gpu
-            .copy_h2d(&last_token_bytes, self.batch_markov_prev)?;
-        let ptr_bytes: Vec<u8> = block_table_ptrs
-            .iter()
-            .flat_map(|pointer| pointer.to_le_bytes())
-            .collect();
-        let cu_seqlens: Vec<i32> = (0..=n)
-            .map(|sequence| {
-                i32::try_from(sequence * self.gamma)
-                    .map_err(|_| anyhow::anyhow!("DFlash batch cu_seqlens overflow"))
-            })
-            .collect::<Result<_>>()?;
-        let cu_bytes: Vec<u8> = cu_seqlens
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let kv_lens_i32: Vec<i32> = batch_kv_lens
-            .iter()
-            .copied()
-            .map(|value| {
-                i32::try_from(value)
-                    .map_err(|_| anyhow::anyhow!("DFlash batch KV length i32 overflow"))
-            })
-            .collect::<Result<_>>()?;
-        let kv_bytes: Vec<u8> = kv_lens_i32
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let mut attention_args = Vec::with_capacity(n * 12);
-        for sequence in 0..n {
-            let kv_len = u32::try_from(batch_kv_lens[sequence])
-                .map_err(|_| anyhow::anyhow!("DFlash attention kv_len exceeds u32"))?;
-            let q_offset = u32::try_from(batch_ctx_counts[sequence])
-                .map_err(|_| anyhow::anyhow!("DFlash attention q_offset exceeds u32"))?;
-            let q_rope_pos = u32::try_from(positions[sequence])
-                .map_err(|_| anyhow::anyhow!("DFlash attention q_rope_pos exceeds u32"))?;
-            attention_args.extend_from_slice(&kv_len.to_le_bytes());
-            attention_args.extend_from_slice(&q_offset.to_le_bytes());
-            attention_args.extend_from_slice(&q_rope_pos.to_le_bytes());
-        }
-        ctx.gpu.copy_h2d(&ptr_bytes, self.batch_block_table_ptrs)?;
-        ctx.gpu.copy_h2d(&cu_bytes, self.batch_cu_seqlens)?;
-        ctx.gpu.copy_h2d(&kv_bytes, self.batch_kv_lens)?;
-        ctx.gpu
-            .copy_h2d(&attention_args, self.batch_attention_args)?;
-        if batch_slots_ready {
-            let slot_bytes: Vec<u8> = batch_slot_mapping
-                .iter()
-                .flat_map(|slot| slot.to_le_bytes())
-                .collect();
-            ctx.gpu.copy_h2d(&slot_bytes, self.batch_slot_mapping)?;
-        }
-        crate::layers::ops::batched_embed(
-            ctx.gpu,
-            self.kernels.batched_embed,
-            self.batch_query_ids_dev,
-            self.embed_tokens_shared,
-            self.batch_query_embed,
-            batch_inputs.total_rows() as u32,
-            self.hidden_size as u32,
-            stream,
-        )?;
-        let batch_rows = u32::try_from(batch_inputs.total_rows())
-            .map_err(|_| anyhow::anyhow!("DFlash batch row count exceeds u32"))?;
-        let batch_size =
-            u32::try_from(n).map_err(|_| anyhow::anyhow!("DFlash batch width exceeds u32"))?;
-        let native_staged = batch_slots_ready && self.lane_count() == 1;
-        if native_staged {
-            let max_kv_len =
-                u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
-                    .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
-            for layer_idx in 0..self.layers.len() {
-                self.run_batched_layer_stage(
-                    layer_idx, batch_rows, batch_size, max_kv_len, None, None, ctx, stream,
-                )?;
-            }
-            if let Some(expected) = parity_hidden_oracle.as_ref() {
-                ctx.gpu.synchronize(stream)?;
-                let mut actual = vec![0u8; expected.len()];
-                ctx.gpu.copy_d2h(self.batch_query_embed, &mut actual)?;
-                if actual != *expected {
-                    let first = actual
-                        .chunks_exact(2)
-                        .zip(expected.chunks_exact(2))
-                        .position(|(lhs, rhs)| lhs != rhs)
-                        .unwrap_or(0);
-                    let per_sequence = self.gamma * self.hidden_size;
-                    let sequence = first / per_sequence;
-                    let local = first % per_sequence;
-                    anyhow::bail!(
-                        "DFlash Bxgamma backbone parity mismatch at sequence {sequence} BF16 element {local}"
+                ) {
+                    if !generic_auth {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        "DFlash batched propose: prepare failed at sequence {i}/{n}; per-sequence fallback: {e:#}"
                     );
+                    return self
+                        .prepared_fallback_batch(
+                            n,
+                            prepared,
+                            Some(i),
+                            last_tokens,
+                            target_hiddens,
+                            positions,
+                            num_drafts,
+                            states,
+                            expected_owners,
+                            ctx,
+                            stream,
+                        )
+                        .map(Some);
                 }
-                tracing::info!("DFlash Bxgamma backbone parity PASS: batch={n}");
+                prepared = i + 1;
             }
-            self.run_batched_tail_base(batch_rows, ctx, stream)?;
-            self.run_batched_markov(batch_size, ctx, stream)?;
         }
-
-        let native =
-            if native_staged && (native_authoritative || self.startup.diagnostics.batch_parity) {
-                ctx.gpu.synchronize(stream)?;
-                let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
-                ctx.gpu.copy_d2h(self.batch_tokens, &mut raw)?;
-                let row_tokens: Vec<u32> = raw
-                    .chunks_exact(4)
-                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                    .collect();
-                Some(batch_inputs.reorder_sampled_rows(&row_tokens)?)
-            } else {
-                None
-            };
-
-        let lanes_n = self.lane_count();
-        if lanes_n == 1 {
-            if let Some(oracle) = parity_oracle {
-                let native = native.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("DFlash Bxgamma parity did not stage native tokens")
-                })?;
-                for (sequence, (native_tokens, oracle_tokens)) in
-                    native.iter().zip(oracle.iter()).enumerate()
-                {
-                    anyhow::ensure!(
-                        native_tokens.get(..oracle_tokens.len()) == Some(oracle_tokens.as_slice()),
-                        "DFlash Bxgamma parity mismatch at sequence {sequence}: native={native_tokens:?} oracle={oracle_tokens:?}"
-                    );
-                }
-                tracing::info!(
-                    "DFlash Bxgamma staged parity PASS: batch={} gamma={} rows={}",
-                    n,
-                    self.gamma,
-                    batch_inputs.total_rows()
-                );
-                return Ok(Some(oracle));
-            }
-            if native_authoritative {
-                let mut out = native.ok_or_else(|| {
-                    anyhow::anyhow!("Lightning DSpark native batch returned no staged tokens")
-                })?;
-                let cap = num_drafts.min(self.gamma.saturating_sub(1)).max(1);
-                for (i, tokens) in out.iter_mut().enumerate() {
-                    tokens.truncate(cap);
-                    let dstate = states[i]
-                        .as_any_mut()
-                        .downcast_mut::<DflashProposerState>()
-                        .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
-                    dstate.last_num_drafted = tokens.len();
-                }
-                return Ok(Some(out));
-            }
-            // Generic single-lane path retains the historical serial proposer.
-            let mut serial = Vec::with_capacity(n);
-            for i in 0..n {
-                serial.push(self.propose_drafts(
-                    last_tokens[i],
-                    target_hiddens[i],
-                    positions[i],
-                    num_drafts,
-                    states[i],
-                    Some(expected_owners[i]),
-                    ctx,
-                    stream,
-                    None,
-                    None,
-                    Some(target_hiddens[i]),
-                )?);
-            }
-            return Ok(Some(serial));
-        }
-        // Multi-lane: each seq proposes on its pinned lane — see
-        // `propose_on_lanes` for the enqueue/collect ordering contract.
-        self.propose_on_lanes(
+        let staged = self.propose_batch_staged_dispatch(
             last_tokens,
             target_hiddens,
             positions,
             num_drafts,
             states,
             expected_owners,
+            native_authoritative,
+            generic_auth,
+            parity_oracle,
+            parity_hidden_oracle,
             ctx,
-        )
-        .map(Some)
+            stream,
+        );
+        match staged {
+            Err(e) if generic_auth => {
+                // State for every sequence was already advanced — surface
+                // the failure as a per-sequence forward fallback, never Err.
+                tracing::warn!(
+                    "DFlash batched propose failed after prepare; per-sequence fallback: {e:#}"
+                );
+                self.prepared_fallback_batch(
+                    n,
+                    n,
+                    None,
+                    last_tokens,
+                    target_hiddens,
+                    positions,
+                    num_drafts,
+                    states,
+                    expected_owners,
+                    ctx,
+                    stream,
+                )
+                .map(Some)
+            }
+            other => other,
+        }
     }
 
     fn after_verify(

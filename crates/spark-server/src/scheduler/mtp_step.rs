@@ -463,11 +463,11 @@ pub fn step_mtp(
     // arm from the one its depths were assigned under.
     let batch_n = batchable_idxs.len();
 
-    // Chunking: the 96-row buffer bound `can_batch_verify` enforces, with the
-    // per-chunk sequence cap DERIVED from it (`VERIFY_ROW_BUDGET / widest
-    // rows` — chunk_ranges): rows=4 → 24 seqs, rows=3 → 32 (R=96 at n=32,
-    // the 32:2 depth-at-width shape), rows=2 → 48 (n is separately bounded
-    // at 32). Default-ladder shapes chunk exactly as before (every default
+    // Chunking: the 128-row buffer bound `can_batch_verify` enforces, with
+    // the per-chunk sequence cap DERIVED from it (`VERIFY_ROW_BUDGET /
+    // widest rows` — chunk_ranges; n is separately bounded at 32 by
+    // VERIFY_WY_TABLE_SEQS, so the 32:2 shape at 96 rows still fits one
+    // chunk). Default-ladder shapes chunk exactly as before (every default
     // rung's row total already fit the old 64-row budget in one chunk).
     //
     // History — the SAME stale-cap artifact, twice: rows=4 was once capped at

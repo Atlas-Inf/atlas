@@ -176,6 +176,9 @@ mod ssm_gdn_b;
 mod ssm_gdn_batched;
 #[path = "ops/ssm_gdn_snap.rs"]
 mod ssm_gdn_snap;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ops/ssm_gdn_wyn_table_tests.rs"]
+mod ssm_gdn_wyn_table_tests;
 #[path = "ops/ssm_mamba.rs"]
 mod ssm_mamba;
 #[path = "ops/ssm_preproc.rs"]

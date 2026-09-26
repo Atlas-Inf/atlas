@@ -452,6 +452,49 @@ impl BlockDiffusionDraftHead {
         } else {
             DevicePtr::NULL
         };
+        // DFlash2 bilinear selector projected-hidden scratch, allocated only
+        // when the checkpoint ships a candidate selector.
+        let batch_dflash2_projected = if let Some(cs) = weights.candidate_selector.as_ref() {
+            let bytes = batch_rows
+                .checked_mul(cs.rank)
+                .and_then(|n| n.checked_mul(bf16))
+                .ok_or_else(|| anyhow::anyhow!("DFlash batch selector bytes overflow"))?;
+            gpu.alloc(bytes)?
+        } else {
+            DevicePtr::NULL
+        };
+        // DFlash2 grouped causal conv scratch — the conv is causal along the
+        // row dim, so it runs per [sequence, gamma] slice, never across
+        // sequence boundaries.
+        let dflash2_group_size = weights
+            .config
+            .dflash_config
+            .as_ref()
+            .and_then(|sc| sc.conv_group_size)
+            .unwrap_or(16);
+        let dflash2_kernel_size = weights
+            .config
+            .dflash_config
+            .as_ref()
+            .and_then(|sc| sc.conv_kernel_size)
+            .unwrap_or(2);
+        let dflash2_has_conv = weights
+            .layers
+            .iter()
+            .any(|l| l.attention_conv.is_some() || l.mlp_conv.is_some());
+        let (batch_conv_delta, batch_conv_out) = if dflash2_has_conv {
+            let conv_groups = hidden_size / dflash2_group_size.max(1);
+            let delta_bytes = batch_rows
+                .checked_mul(2 * dflash2_kernel_size * conv_groups)
+                .and_then(|n| n.checked_mul(bf16))
+                .ok_or_else(|| anyhow::anyhow!("DFlash batch conv delta bytes overflow"))?;
+            (
+                gpu.alloc(delta_bytes)?,
+                gpu.alloc(batch_rows * hidden_size * bf16)?,
+            )
+        } else {
+            (DevicePtr::NULL, DevicePtr::NULL)
+        };
         gpu.memset(batch_query_ids_dev, 0, batch_rows * 4)?;
         gpu.memset(batch_position_ids, 0, batch_rows * 4)?;
         gpu.memset(batch_query_embed, 0, batch_rows * hidden_size * bf16)?;
@@ -690,18 +733,6 @@ impl BlockDiffusionDraftHead {
             },
             draft_id_to_target_id: None,
             layers: {
-                let dflash2_group_size = weights
-                    .config
-                    .dflash_config
-                    .as_ref()
-                    .and_then(|sc| sc.conv_group_size)
-                    .unwrap_or(16);
-                let dflash2_kernel_size = weights
-                    .config
-                    .dflash_config
-                    .as_ref()
-                    .and_then(|sc| sc.conv_kernel_size)
-                    .unwrap_or(2);
                 weights
                     .layers
                     .into_iter()
@@ -800,6 +831,9 @@ impl BlockDiffusionDraftHead {
             batch_markov_prev,
             batch_markov_embed,
             batch_markov_bias,
+            batch_dflash2_projected,
+            batch_conv_delta,
+            batch_conv_out,
             extra_lanes,
             kernels,
             max_seq_len,
@@ -839,6 +873,13 @@ impl BlockDiffusionDraftHead {
                 .count(),
             head.target_layer_ids,
         );
+        if head.startup.generic_batch_authoritative {
+            tracing::info!(
+                "DFlash batched propose: authoritative Bxgamma for generic DFlash \
+                 (default on; rollback ATLAS_DFLASH_BATCHED_PROPOSE=0; min 2, max {})",
+                head.batch_capacity
+            );
+        }
 
         // Phase G — opt-in drafter MLP FP8. Quantize the seven dense-GEMM
         // weights per layer (q/k/v/o/gate/up/down) BF16 → FP8 E4M3 with

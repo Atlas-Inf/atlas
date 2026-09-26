@@ -67,10 +67,10 @@ impl TransformerModel {
             .launch(stream)
     }
 
-    /// Wide batched LM head, `num_tokens` in 9..=`VERIFY_ROW_CAP` (96) — exactly
-    /// the batched-verify row regime (`can_batch_verify` bounds `Σks` at
-    /// `VERIFY_ROW_CAP`; the 32:2 depth-at-width shape's n=32 × k=3 rows hits
-    /// 96 dead on).
+    /// Wide batched LM head, `num_tokens` in 9..=`VERIFY_ROW_CAP` (128) —
+    /// exactly the batched-verify row regime (`can_batch_verify` bounds `Σks`
+    /// at `VERIFY_ROW_CAP`; the 32:2 depth-at-width shape's n=32 × k=3 = 96
+    /// rows fits inside it).
     /// Below 9 the existing GEMV ladder (batch2/4/8) already owns the dispatch.
     /// When this arm was capped at 32 (pre-2026-07-30), the R=64 verify step
     /// fell through to the base `w4a16_gemm` below at 23.9 ms/step (nsys,

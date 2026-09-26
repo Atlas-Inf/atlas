@@ -7,6 +7,7 @@
 //! `batch_query_embed`; final logits/Markov and returned drafts remain serial.
 
 use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
 
 use super::BlockDiffusionDraftHead;
 
@@ -52,6 +53,9 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
+        if let Some(ref conv) = layer.attention_conv {
+            self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
+        }
         for (weight, fp8, nvfp4, output, width) in [
             (
                 &layer.q_proj,
@@ -131,9 +135,26 @@ impl BlockDiffusionDraftHead {
             self.rope_theta,
             stream,
         )?;
-        let sinks = layer.attention_sink_bias.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("DFlash batched layer {layer_idx} lacks required attention sinks")
-        })?;
+        // Attention sinks are required only by the Lightning product's
+        // batched-sink kernel; generic DFlash2 passes NULL exactly like its
+        // serial Option-B layer does.
+        let sinks = if self.startup.native_batch_authoritative {
+            layer
+                .attention_sink_bias
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DFlash batched layer {layer_idx} lacks required attention sinks"
+                    )
+                })?
+                .weight
+        } else {
+            layer
+                .attention_sink_bias
+                .as_ref()
+                .map(|sinks| sinks.weight)
+                .unwrap_or(DevicePtr::NULL)
+        };
         let (k_pool, v_pool) = {
             let cache = self.kv_cache.lock();
             (cache.k_pool_ptr(layer_idx), cache.v_pool_ptr(layer_idx))
@@ -161,7 +182,7 @@ impl BlockDiffusionDraftHead {
             max_kv_len,
             serial_block_tables,
             serial_attention_args,
-            sinks.weight,
+            sinks,
             k_pool,
             v_pool,
             ctx,
@@ -179,6 +200,9 @@ impl BlockDiffusionDraftHead {
             ctx,
             stream,
         )?;
+        if let Some(ref conv) = layer.attention_conv {
+            self.staged_conv_finish(conv, self.batch_attn_proj, batch_size, hidden, ctx, stream)?;
+        }
         crate::layers::ops::residual_add(
             ctx.gpu,
             self.kernels.residual_add,
@@ -198,6 +222,9 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
+        if let Some(ref conv) = layer.mlp_conv {
+            self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
+        }
         for (weight, fp8, nvfp4, output) in [
             (
                 &layer.gate_proj,
@@ -246,6 +273,9 @@ impl BlockDiffusionDraftHead {
             ctx,
             stream,
         )?;
+        if let Some(ref conv) = layer.mlp_conv {
+            self.staged_conv_finish(conv, self.batch_mlp_down, batch_size, hidden, ctx, stream)?;
+        }
         crate::layers::ops::residual_add(
             ctx.gpu,
             self.kernels.residual_add,

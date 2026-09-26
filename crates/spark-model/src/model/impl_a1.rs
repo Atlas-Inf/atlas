@@ -319,7 +319,7 @@ impl TransformerModel {
         };
         // Batched-verify WY pointer-table staging (fixed address for CUDA
         // graph stability; contents refreshed pre-graph every batched verify
-        // step). One [h|Hi0|Hi1|Hi2] x 4-entry slice per GDN layer — ~6 KB.
+        // step). One [h|Hi0..Hi14] x 32-entry slice per GDN layer — ~192 KB.
         // Allocated when SSM layers are present; DSpark attaches post-construct.
         let verify_wy_tables = if config.num_ssm_layers() > 0 {
             let bytes = config.num_ssm_layers() * crate::layer::VERIFY_WY_LAYER_STRIDE_BYTES;
