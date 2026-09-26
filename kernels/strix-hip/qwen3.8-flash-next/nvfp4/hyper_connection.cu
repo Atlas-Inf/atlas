@@ -389,34 +389,36 @@ extern "C" __global__ void hc_pre_stage(
 // BIT-EXACT BY CONSTRUCTION: the per-lane FMA sequence
 // (`acc += (float)row[i] * nx[i]`, i = lane, lane+32, …) and the shfl
 // reduction are unchanged — `nx` is only re-sourced from shared memory.
-// `HC_PRE_DOWN_SMEM_FLOATS` is the compile-time bound (hc=4, H=2560 →
-// hc_dim 10240 floats = 40 KB, under the 48 KB static limit); if hc_dim
-// ever exceeds it the block falls back to the original global-read loop.
-#define HC_PRE_DOWN_SMEM_FLOATS 10240
+// The call site passes hc_dim*4 bytes of DYNAMIC shared (40 KB at
+// hc=4, H=2560): static `__shared__ smem_nx[10240]` plus the dynamic
+// request would double-count against the 64 KB LDS cap — that wedged
+// this exact launch on the main-merged call site (decode hang, 2026-09-26).
 extern "C" __global__ void hc_pre_down(
     const float* __restrict__ normed,          // [T, hc*H]
     const __nv_bfloat16* __restrict__ down_w,  // [rank, hc*H]
     float* __restrict__ low_out,               // [T, rank]
     const unsigned int hidden_size,
     const unsigned int hc,
-    const unsigned int rank
+    const unsigned int rank,
+    const unsigned int num_tokens
 ) {
     const unsigned int t = blockIdx.x;
+    if (t >= num_tokens) return;
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int warp = threadIdx.x >> 5;
     const unsigned int warps = blockDim.x >> 5;
     const unsigned int hc_dim = hc * hidden_size;
-    const float* nx = normed + (size_t)t * hc_dim;
     const float inv_hc = 1.0f / (float)hc;
 
-    __shared__ float smem_nx[HC_PRE_DOWN_SMEM_FLOATS];
-    const bool use_smem = hc_dim <= HC_PRE_DOWN_SMEM_FLOATS;
-    if (use_smem) {
-        for (unsigned int i = threadIdx.x; i < hc_dim; i += blockDim.x) {
-            smem_nx[i] = nx[i];
-        }
-        __syncthreads();
+    // DYNAMIC shared (the call site passes hc_dim*4 bytes, 40 KB): the LDS
+    // staging is the strix-local part — static smem_nx PLUS a dynamic
+    // request double-counted against the 64 KB LDS cap and wedged the
+    // decode launch. Same staging logic as before, dynamic storage.
+    extern __shared__ float smem_nx[];
+    for (unsigned int i = threadIdx.x; i < hc_dim; i += blockDim.x) {
+        smem_nx[i] = normed[(size_t)t * hc_dim + i];
     }
+    __syncthreads();
 
     // Rows split first across grid.y, then across warps in the block.
     const unsigned int rows_per_split = (rank + gridDim.y - 1) / gridDim.y;
@@ -425,14 +427,8 @@ extern "C" __global__ void hc_pre_down(
     for (unsigned int r = r0 + warp; r < r1; r += warps) {
         const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
         float acc = 0.0f;
-        if (use_smem) {
-            for (unsigned int i = lane; i < hc_dim; i += 32) {
-                acc += (float)row[i] * smem_nx[i];
-            }
-        } else {
-            for (unsigned int i = lane; i < hc_dim; i += 32) {
-                acc += (float)row[i] * nx[i];
-            }
+        for (unsigned int i = lane; i < hc_dim; i += 32) {
+            acc += (float)row[i] * smem_nx[i];
         }
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
