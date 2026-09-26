@@ -159,3 +159,12 @@ atlas_nvfp4_scale_bf16 = "NVFP4 scale handler; gated off with the family."
 # model_type this target serves constructs.
 [expected_absent.moe_persist_marker]
 moe_w4a16_k64_strides_m_tiles = "Capability marker issued by MoeLayer::new on every MoeLayer MoE model; only targets whose k64 prefill kernels were measured to stride m-tiles ship it (qwen3.8-flash-next). Absent here by design: handle 0 keeps the full m-tile grid."
+
+[expected_absent.moe_w4a16]
+moe_w4a16_fused_gate_up_t_k64_bf16a = """
+BF16-activation variant of the K64 transposed fused gate+up (ATLAS_MOE_T_BF16A=1,
+#74). Shipped only in the qwen3.6-35b-a3b moe_w4a16 source and its symlinks;
+this target's module serves the e4m3 K64 kernel instead."""
+moe_w4a16_grouped_gemm_ptrtable_t_k64_bf16a = """
+Same bf16a family — the down-projection twin. This target's module serves the
+e4m3 K64 kernel; handle 0 keeps the default arm."""

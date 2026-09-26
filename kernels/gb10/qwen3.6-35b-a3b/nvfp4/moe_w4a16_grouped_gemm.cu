@@ -2085,3 +2085,551 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
         if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3] * scale2);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// BF16-ACTIVATION (bf16a) variants of the two default transposed K64
+// prefill kernels — ATLAS_MOE_T_BF16A=1 opt-in (#74).
+//
+// Identical signatures, grid, row/expert mapping, persistent M-tile
+// striding (grid_m_strided legal — same loop), cp.async pipeline and
+// epilogue as the e4m3 originals above. ONLY the numeric format moves:
+// A stays BF16 (no bf16→e4m3 activation requant) and B is dequantized to
+// BF16 (e2m1 × e4m3-group scale × fp32 scale2 in f32, then
+// cvt.rn.bf16x2), driving mma.m16n8k16.bf16 — the same operand formats
+// the untransposed W4A16 kernel uses. Smem: the B tile is 2× the e4m3
+// bytes (20,480 B vs 10,240) for ~50 KB total — still inside the 2-CTA/SM
+// budget the originals assume.
+//
+// Motivation (reiner job 269): the e4m3 requant costs +0.74 % dense
+// perplexity vs untransposed bf16 W4A16. This arm keeps the transposed
+// layout's TTFT win while restoring bf16 activation precision — a
+// candidate default after measurement.
+// ═══════════════════════════════════════════════════════════════════
+
+extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_bf16a(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ B_packed_ptrs,
+    const unsigned long long* __restrict__ B_scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int expert_id = blockIdx.z;
+    if (expert_id >= num_experts) return;
+
+    const int m_start = expert_offsets[expert_id];
+    const int m_end = expert_offsets[expert_id + 1];
+    const int M_expert = m_end - m_start;
+    if (M_expert <= 0) return;
+
+
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+
+    const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
+    const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[expert_id];
+    const float scale2 = scale2_vals[expert_id];
+
+    if (B_expert == 0) return;
+
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    // B_bf16 row stride = 160 bytes (80 bf16) — MMA reads land on 8 distinct
+    // banks per n-group, conflict-free like the e4m3 80-byte rows.
+    __shared__ __nv_bfloat16 smem_A_k64[2][M_TILE][K_STEP_T64 + PAD_T64];
+    __shared__ unsigned char smem_Bp_k64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
+    __shared__ unsigned char smem_Bs_k64[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
+    // bf16 B tile: 80-elem rows = 160 B; MMA reads pair (2t,2t+1)+8 via u32 — rows hit 8 distinct banks, conflict-free.
+    __shared__ __nv_bfloat16 smem_B_bf16_k64[N_TILE_LG][K_STEP_T64 + BP_PAD];
+    __shared__ float smem_LUT_k64[16];
+    __shared__ int smem_tok_k64[M_TILE];
+
+    if (threadIdx.x < 16) smem_LUT_k64[threadIdx.x] = E2M1_LUT_MOE[threadIdx.x];
+    // ── PERSISTENT M-TILE LOOP ──
+    // `grid.y` is sized by the HOTTEST expert. At 29,671 tokens the hottest of
+    // 512 experts needs 217 tiles while the average needs 10, so ~95% of the
+    // 1.11M CTAs launched only to fall out at the bound below.
+    //
+    // Those empty CTAs are NOT free. This kernel's static shared memory caps
+    // residency at 2 CTAs/SM, so the part retires ~96 at a time and a million
+    // no-ops serialise ahead of the real work: capping `grid.y` at 8x the
+    // average expert took a 29.7k prefill from 19.23 s to 17.40 s (measured
+    // 2026-09-01, TTFT= from the scheduler).
+    //
+    // So stride `blockIdx.y` instead of returning: the host may then size the
+    // grid by the AVERAGE expert while every expert still computes every row.
+    // At `gridDim.y == max_m_tiles` -- what the host passes unless
+    // ATLAS_MOE_PREFILL_PERSIST_TILES is set -- the loop runs exactly once for
+    // each CTA that had work and not at all for the rest, which is what the
+    // non-striding kernel did, instruction for instruction.
+    for (unsigned int cta_m_local = blockIdx.y * M_TILE;
+         cta_m_local < (unsigned int)M_expert;
+         cta_m_local += gridDim.y * M_TILE) {
+    // Re-entry barrier: the previous iteration's last MMA is still reading
+    // smem_A / smem_B_bf16 when a faster warp reaches the staging below.
+    // Redundant on the first iteration, and on the single-iteration grid that
+    // is every launch today.
+    __syncthreads();
+    const unsigned int cta_m = m_start + cta_m_local;
+    if (threadIdx.x < M_TILE) {
+        int local_row = threadIdx.x;
+        if (sorted_token_ids && (cta_m_local + local_row) < (unsigned int)M_expert)
+            smem_tok_k64[local_row] = sorted_token_ids[cta_m + local_row];
+        else
+            smem_tok_k64[local_row] = (int)(cta_m + local_row);
+    }
+    __syncthreads();
+
+    float acc[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int ast64 = K_STEP_T64 + PAD_T64;
+    const unsigned int M_eff = (unsigned int)M_expert;
+
+    // A: 4 rounds × 128 threads × 16 bytes = 8192B = 64×64 BF16
+    // Bp: 2 rounds × 128 threads × 16 bytes = 4096B = 32×128 packed bytes
+    // Bs: 4 scale groups × 8 ns per group × 16 bytes = 512B per buffer
+    #define K64_ISSUE_LOADS(buf, kb) do { \
+        { \
+            unsigned int a_row_base = threadIdx.x >> 3; \
+            unsigned int a_col = (threadIdx.x & 7) << 3; \
+            unsigned int gc = (kb) + a_col; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 4; rnd++) { \
+                unsigned int row = rnd * 16 + a_row_base; \
+                bool valid = (cta_m_local + row) < M_eff && (gc + 7 < K); \
+                unsigned int a_row = (unsigned int)smem_tok_k64[row]; \
+                moe_cp_async_pred_16(&smem_A_k64[(buf)][row][a_col], \
+                    &A[(unsigned long long)a_row * K + gc], valid); \
+            } \
+        } \
+        { \
+            unsigned int kp = threadIdx.x >> 3; \
+            unsigned int ns = (threadIdx.x & 7) << 4; \
+            unsigned int gns = cta_n + ns; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 2; rnd++) { \
+                unsigned int kp_cur = rnd * 16 + kp; \
+                unsigned int gke = (kb) + (kp_cur << 1); \
+                moe_cp_async_pred_16(&smem_Bp_k64[(buf)][kp_cur][ns], \
+                    &B_expert[(unsigned long long)(gke >> 1) * N + gns], \
+                    (gke + 1 < K) && (gns + 15 < N)); \
+                if (kp_cur < K_STEP_T64 / GROUP_SIZE) { \
+                    unsigned int sg = (kb) / GROUP_SIZE + kp_cur; \
+                    moe_cp_async_pred_16(&smem_Bs_k64[(buf)][kp_cur][ns], \
+                        &S_expert[(unsigned long long)sg * N + gns], \
+                        (gns + 15 < N)); \
+                } \
+            } \
+        } \
+    } while(0)
+    // Dequant B: NVFP4 (e2m1 code x e4m3 group-16 scale x fp32 scale2) → BF16 —
+    // the same f32 product the untransposed kernel (moe_w4a16_grouped_gemm_ptrtable)
+    // writes into smem_B; bf16a stores it as bf16 pairs for the
+    // mma.m16n8k16.bf16 path instead of re-quantizing to e4m3.
+    #define K64_DEQUANT(buf) do { \
+        unsigned int my_n = threadIdx.x; \
+        __nv_fp8_e4m3 f0, f1, f2, f3; \
+        *(unsigned char*)&f0 = smem_Bs_k64[(buf)][0][my_n]; \
+        *(unsigned char*)&f1 = smem_Bs_k64[(buf)][1][my_n]; \
+        *(unsigned char*)&f2 = smem_Bs_k64[(buf)][2][my_n]; \
+        *(unsigned char*)&f3 = smem_Bs_k64[(buf)][3][my_n]; \
+        float sv0 = (float)f0 * scale2; \
+        float sv1 = (float)f1 * scale2; \
+        float sv2 = (float)f2 * scale2; \
+        float sv3 = (float)f3 * scale2; \
+        _Pragma("unroll") \
+        for (int kp = 0; kp < 8; kp++) { \
+            unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
+            float lo = smem_LUT_k64[packed & 0xF] * sv0; \
+            float hi = smem_LUT_k64[packed >> 4] * sv0; \
+            unsigned int pair; \
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" \
+                         : "=r"(pair) : "f"(hi), "f"(lo)); \
+            *(unsigned int*)&smem_B_bf16_k64[my_n][kp * 2] = pair; \
+        } \
+        _Pragma("unroll") \
+        for (int kp = 8; kp < 16; kp++) { \
+            unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
+            float lo = smem_LUT_k64[packed & 0xF] * sv1; \
+            float hi = smem_LUT_k64[packed >> 4] * sv1; \
+            unsigned int pair; \
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" \
+                         : "=r"(pair) : "f"(hi), "f"(lo)); \
+            *(unsigned int*)&smem_B_bf16_k64[my_n][kp * 2] = pair; \
+        } \
+        _Pragma("unroll") \
+        for (int kp = 16; kp < 24; kp++) { \
+            unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
+            float lo = smem_LUT_k64[packed & 0xF] * sv2; \
+            float hi = smem_LUT_k64[packed >> 4] * sv2; \
+            unsigned int pair; \
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" \
+                         : "=r"(pair) : "f"(hi), "f"(lo)); \
+            *(unsigned int*)&smem_B_bf16_k64[my_n][kp * 2] = pair; \
+        } \
+        _Pragma("unroll") \
+        for (int kp = 24; kp < 32; kp++) { \
+            unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
+            float lo = smem_LUT_k64[packed & 0xF] * sv3; \
+            float hi = smem_LUT_k64[packed >> 4] * sv3; \
+            unsigned int pair; \
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" \
+                         : "=r"(pair) : "f"(hi), "f"(lo)); \
+            *(unsigned int*)&smem_B_bf16_k64[my_n][kp * 2] = pair; \
+        } \
+    } while(0)
+
+    // Two m16n8k32 MMA calls per N-tile: first covers k=0..31, second k=32..63.
+    // a0..a3 loaded first, all N-tile first-half MMAs done, then a4..a7, then second-half.
+    // This keeps max 4 A registers live at once (same as K32 variant).
+        // Four m16n8k16 bf16 MMAs per 64-K tile (one per 16-K block). A stays bf16
+    // in smem — no bf16→e4m3 activation conversion — and B is the bf16-dequanted
+    // NVFP4 product. A-frag: (row g, g+8) x (k 2t..2t+1, 2t+8..2t+9); B-frag:
+    // n=g, k (2t..2t+1, +8..9) — identical mapping to the untransposed bf16
+    // kernel, adapted to the n-major B tile here.
+    #define K64_COMPUTE_MMA(a_buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A_k64[(a_buf)]; \
+        unsigned int fr0 = warp_m_offset + group_id, fr1 = fr0 + 8; \
+        _Pragma("unroll") \
+        for (int kb = 0; kb < K_STEP_T64; kb += 16) { \
+            unsigned int fc = kb + tid * 2; \
+            unsigned int a0 = *(const unsigned int*)&sA[fr0 * ast64 + fc]; \
+            unsigned int a1 = *(const unsigned int*)&sA[fr1 * ast64 + fc]; \
+            unsigned int a2 = *(const unsigned int*)&sA[fr0 * ast64 + fc + 8]; \
+            unsigned int a3 = *(const unsigned int*)&sA[fr1 * ast64 + fc + 8]; \
+            _Pragma("unroll") \
+            for (int nt = 0; nt < 16; nt++) { \
+                unsigned int nc = nt * 8 + group_id; \
+                unsigned int b0 = *(const unsigned int*)&smem_B_bf16_k64[nc][fc]; \
+                unsigned int b1 = *(const unsigned int*)&smem_B_bf16_k64[nc][fc + 8]; \
+                asm volatile( \
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                    :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+                     "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+            } \
+        } \
+    } while(0)
+
+    K64_ISSUE_LOADS(0, 0);
+    moe_cp_async_commit();
+    moe_cp_async_wait_all();
+    __syncthreads();
+    K64_DEQUANT(0);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T64; k_base < K; k_base += K_STEP_T64) {
+        int nxt = 1 - cur;
+        K64_ISSUE_LOADS(nxt, k_base);
+        moe_cp_async_commit();
+        K64_COMPUTE_MMA(cur);
+        moe_cp_async_wait_all();
+        __syncthreads();
+        K64_DEQUANT(nxt);
+        __syncthreads();
+        cur = nxt;
+    }
+    K64_COMPUTE_MMA(cur);
+
+    #undef K64_ISSUE_LOADS
+    #undef K64_DEQUANT
+    #undef K64_COMPUTE_MMA
+
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        unsigned int c0 = cta_n + nt*8 + tid*2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
+        bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
+        if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
+        if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
+        if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
+        if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+    }
+    }
+}
+
+extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_bf16a(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ C_gate,
+    __nv_bfloat16* __restrict__ C_up,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int expert_id = blockIdx.z;
+    if (expert_id >= num_experts) return;
+
+    const int m_start = expert_offsets[expert_id];
+    const int m_end = expert_offsets[expert_id + 1];
+    const int M_expert = m_end - m_start;
+    if (M_expert <= 0) return;
+
+
+    const unsigned int global_n = blockIdx.x * N_TILE_LG;
+    const bool is_up = (global_n >= N);
+    const unsigned int cta_n = is_up ? (global_n - N) : global_n;
+
+    const unsigned char* B_expert;
+    const unsigned char* S_expert;
+    float scale2;
+    __nv_bfloat16* C;
+    if (is_up) {
+        B_expert = (const unsigned char*)up_packed_ptrs[expert_id];
+        S_expert = (const unsigned char*)up_scale_ptrs[expert_id];
+        scale2 = up_scale2_vals[expert_id];
+        C = C_up;
+    } else {
+        B_expert = (const unsigned char*)gate_packed_ptrs[expert_id];
+        S_expert = (const unsigned char*)gate_scale_ptrs[expert_id];
+        scale2 = gate_scale2_vals[expert_id];
+        C = C_gate;
+    }
+
+    if (B_expert == 0) return;
+
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A_fgu64[2][M_TILE][K_STEP_T64 + PAD_T64];
+    __shared__ unsigned char smem_Bp_fgu64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
+    __shared__ unsigned char smem_Bs_fgu64[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
+    // bf16 B tile: 80-elem rows = 160 B; MMA reads pair (2t,2t+1)+8 via u32 — rows hit 8 distinct banks, conflict-free.
+    __shared__ __nv_bfloat16 smem_B_bf16_fgu64[N_TILE_LG][K_STEP_T64 + BP_PAD];
+    __shared__ float smem_LUT_fgu64[16];
+    __shared__ int smem_tok_fgu64[M_TILE];
+
+    if (threadIdx.x < 16) smem_LUT_fgu64[threadIdx.x] = E2M1_LUT_MOE[threadIdx.x];
+    // ── PERSISTENT M-TILE LOOP ──
+    // `grid.y` is sized by the HOTTEST expert. At 29,671 tokens the hottest of
+    // 512 experts needs 217 tiles while the average needs 10, so ~95% of the
+    // 1.11M CTAs launched only to fall out at the bound below.
+    //
+    // Those empty CTAs are NOT free. This kernel's static shared memory caps
+    // residency at 2 CTAs/SM, so the part retires ~96 at a time and a million
+    // no-ops serialise ahead of the real work: capping `grid.y` at 8x the
+    // average expert took a 29.7k prefill from 19.23 s to 17.40 s (measured
+    // 2026-09-01, TTFT= from the scheduler).
+    //
+    // So stride `blockIdx.y` instead of returning: the host may then size the
+    // grid by the AVERAGE expert while every expert still computes every row.
+    // At `gridDim.y == max_m_tiles` -- what the host passes unless
+    // ATLAS_MOE_PREFILL_PERSIST_TILES is set -- the loop runs exactly once for
+    // each CTA that had work and not at all for the rest, which is what the
+    // non-striding kernel did, instruction for instruction.
+    for (unsigned int cta_m_local = blockIdx.y * M_TILE;
+         cta_m_local < (unsigned int)M_expert;
+         cta_m_local += gridDim.y * M_TILE) {
+    // Re-entry barrier: the previous iteration's last MMA is still reading
+    // smem_A / smem_B_bf16 when a faster warp reaches the staging below.
+    // Redundant on the first iteration, and on the single-iteration grid that
+    // is every launch today.
+    __syncthreads();
+    const unsigned int cta_m = m_start + cta_m_local;
+    if (threadIdx.x < M_TILE) {
+        int local_row = threadIdx.x;
+        if (sorted_token_ids && (cta_m_local + local_row) < (unsigned int)M_expert)
+            smem_tok_fgu64[local_row] = sorted_token_ids[cta_m + local_row];
+        else
+            smem_tok_fgu64[local_row] = (int)(cta_m + local_row);
+    }
+    __syncthreads();
+
+    float acc[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int ast_fgu64 = K_STEP_T64 + PAD_T64;
+    const unsigned int M_eff = (unsigned int)M_expert;
+
+    #define FGU64_ISSUE_LOADS(buf, kb) do { \
+        { \
+            unsigned int a_row_base = threadIdx.x >> 3; \
+            unsigned int a_col = (threadIdx.x & 7) << 3; \
+            unsigned int gc = (kb) + a_col; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 4; rnd++) { \
+                unsigned int row = rnd * 16 + a_row_base; \
+                bool valid = (cta_m_local + row) < M_eff && (gc + 7 < K); \
+                unsigned int a_row = (unsigned int)smem_tok_fgu64[row]; \
+                moe_cp_async_pred_16(&smem_A_fgu64[(buf)][row][a_col], \
+                    &A[(unsigned long long)a_row * K + gc], valid); \
+            } \
+        } \
+        { \
+            unsigned int kp = threadIdx.x >> 3; \
+            unsigned int ns = (threadIdx.x & 7) << 4; \
+            unsigned int gns = cta_n + ns; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 2; rnd++) { \
+                unsigned int kp_cur = rnd * 16 + kp; \
+                unsigned int gke = (kb) + (kp_cur << 1); \
+                moe_cp_async_pred_16(&smem_Bp_fgu64[(buf)][kp_cur][ns], \
+                    &B_expert[(unsigned long long)(gke >> 1) * N + gns], \
+                    (gke + 1 < K) && (gns + 15 < N)); \
+                if (kp_cur < K_STEP_T64 / GROUP_SIZE) { \
+                    unsigned int sg = (kb) / GROUP_SIZE + kp_cur; \
+                    moe_cp_async_pred_16(&smem_Bs_fgu64[(buf)][kp_cur][ns], \
+                        &S_expert[(unsigned long long)sg * N + gns], \
+                        (gns + 15 < N)); \
+                } \
+            } \
+        } \
+    } while(0)
+    // Dequant B: NVFP4 (e2m1 code x e4m3 group-16 scale x fp32 scale2) → BF16 —
+    // the same f32 product the untransposed kernel (moe_w4a16_grouped_gemm_ptrtable)
+    // writes into smem_B; bf16a stores it as bf16 pairs for the
+    // mma.m16n8k16.bf16 path instead of re-quantizing to e4m3.
+    #define FGU64_DEQUANT(buf) do { \
+        unsigned int my_n = threadIdx.x; \
+        __nv_fp8_e4m3 f0, f1, f2, f3; \
+        *(unsigned char*)&f0 = smem_Bs_fgu64[(buf)][0][my_n]; \
+        *(unsigned char*)&f1 = smem_Bs_fgu64[(buf)][1][my_n]; \
+        *(unsigned char*)&f2 = smem_Bs_fgu64[(buf)][2][my_n]; \
+        *(unsigned char*)&f3 = smem_Bs_fgu64[(buf)][3][my_n]; \
+        float sv0 = (float)f0 * scale2; \
+        float sv1 = (float)f1 * scale2; \
+        float sv2 = (float)f2 * scale2; \
+        float sv3 = (float)f3 * scale2; \
+        _Pragma("unroll") \
+        for (int kp = 0; kp < 8; kp++) { \
+            unsigned char packed = smem_Bp_fgu64[(buf)][kp][my_n]; \
+            float lo = smem_LUT_fgu64[packed & 0xF] * sv0; \
+            float hi = smem_LUT_fgu64[packed >> 4] * sv0; \
+            unsigned int pair; \
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" \
+                         : "=r"(pair) : "f"(hi), "f"(lo)); \
+            *(unsigned int*)&smem_B_bf16_fgu64[my_n][kp * 2] = pair; \
+        } \
+        _Pragma("unroll") \
+        for (int kp = 8; kp < 16; kp++) { \
+            unsigned char packed = smem_Bp_fgu64[(buf)][kp][my_n]; \
+            float lo = smem_LUT_fgu64[packed & 0xF] * sv1; \
+            float hi = smem_LUT_fgu64[packed >> 4] * sv1; \
+            unsigned int pair; \
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" \
+                         : "=r"(pair) : "f"(hi), "f"(lo)); \
+            *(unsigned int*)&smem_B_bf16_fgu64[my_n][kp * 2] = pair; \
+        } \
+        _Pragma("unroll") \
+        for (int kp = 16; kp < 24; kp++) { \
+            unsigned char packed = smem_Bp_fgu64[(buf)][kp][my_n]; \
+            float lo = smem_LUT_fgu64[packed & 0xF] * sv2; \
+            float hi = smem_LUT_fgu64[packed >> 4] * sv2; \
+            unsigned int pair; \
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" \
+                         : "=r"(pair) : "f"(hi), "f"(lo)); \
+            *(unsigned int*)&smem_B_bf16_fgu64[my_n][kp * 2] = pair; \
+        } \
+        _Pragma("unroll") \
+        for (int kp = 24; kp < 32; kp++) { \
+            unsigned char packed = smem_Bp_fgu64[(buf)][kp][my_n]; \
+            float lo = smem_LUT_fgu64[packed & 0xF] * sv3; \
+            float hi = smem_LUT_fgu64[packed >> 4] * sv3; \
+            unsigned int pair; \
+            asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" \
+                         : "=r"(pair) : "f"(hi), "f"(lo)); \
+            *(unsigned int*)&smem_B_bf16_fgu64[my_n][kp * 2] = pair; \
+        } \
+    } while(0)
+
+        // Four m16n8k16 bf16 MMAs per 64-K tile (one per 16-K block). A stays bf16
+    // in smem — no bf16→e4m3 activation conversion — and B is the bf16-dequanted
+    // NVFP4 product. A-frag: (row g, g+8) x (k 2t..2t+1, 2t+8..2t+9); B-frag:
+    // n=g, k (2t..2t+1, +8..9) — identical mapping to the untransposed bf16
+    // kernel, adapted to the n-major B tile here.
+    #define FGU64_COMPUTE_MMA(a_buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A_fgu64[(a_buf)]; \
+        unsigned int fr0 = warp_m_offset + group_id, fr1 = fr0 + 8; \
+        _Pragma("unroll") \
+        for (int kb = 0; kb < K_STEP_T64; kb += 16) { \
+            unsigned int fc = kb + tid * 2; \
+            unsigned int a0 = *(const unsigned int*)&sA[fr0 * ast_fgu64 + fc]; \
+            unsigned int a1 = *(const unsigned int*)&sA[fr1 * ast_fgu64 + fc]; \
+            unsigned int a2 = *(const unsigned int*)&sA[fr0 * ast_fgu64 + fc + 8]; \
+            unsigned int a3 = *(const unsigned int*)&sA[fr1 * ast_fgu64 + fc + 8]; \
+            _Pragma("unroll") \
+            for (int nt = 0; nt < 16; nt++) { \
+                unsigned int nc = nt * 8 + group_id; \
+                unsigned int b0 = *(const unsigned int*)&smem_B_bf16_fgu64[nc][fc]; \
+                unsigned int b1 = *(const unsigned int*)&smem_B_bf16_fgu64[nc][fc + 8]; \
+                asm volatile( \
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                    :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+                     "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+            } \
+        } \
+    } while(0)
+
+    FGU64_ISSUE_LOADS(0, 0);
+    moe_cp_async_commit();
+    moe_cp_async_wait_all();
+    __syncthreads();
+    FGU64_DEQUANT(0);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T64; k_base < K; k_base += K_STEP_T64) {
+        int nxt = 1 - cur;
+        FGU64_ISSUE_LOADS(nxt, k_base);
+        moe_cp_async_commit();
+        FGU64_COMPUTE_MMA(cur);
+        moe_cp_async_wait_all();
+        __syncthreads();
+        FGU64_DEQUANT(nxt);
+        __syncthreads();
+        cur = nxt;
+    }
+    FGU64_COMPUTE_MMA(cur);
+
+    #undef FGU64_ISSUE_LOADS
+    #undef FGU64_DEQUANT
+    #undef FGU64_COMPUTE_MMA
+
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        unsigned int c0 = cta_n + nt*8 + tid*2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
+        bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
+        if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
+        if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
+        if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
+        if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+    }
+    }
+}

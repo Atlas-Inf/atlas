@@ -67,3 +67,20 @@ fn bf16_shared_expert_requires_three_non_null_weights() {
     assert!(Bf16SharedExpert::new(gate, null, down).is_err());
     assert!(Bf16SharedExpert::new(gate, up, null).is_err());
 }
+
+#[test]
+fn moe_t_bf16a_is_opt_in() {
+    use super::forward_prefill_routed::moe_t_bf16a_enabled;
+    // off by default — the e4m3 K64 arm stays the shipped default (#74)
+    for env in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("true"),
+        Some("yes"),
+        Some(" 1"),
+    ] {
+        assert!(!moe_t_bf16a_enabled(env), "{env:?} must stay on e4m3");
+    }
+    assert!(moe_t_bf16a_enabled(Some("1")));
+}

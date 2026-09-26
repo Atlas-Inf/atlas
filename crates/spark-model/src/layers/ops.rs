@@ -122,6 +122,9 @@ mod moe_grouped_fp4;
 pub mod moe_lora_grouped;
 #[path = "ops/moe_prefill.rs"]
 mod moe_prefill;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ops/moe_t_bf16a_tests.rs"]
+mod moe_t_bf16a_tests;
 #[path = "ops/norm.rs"]
 mod norm;
 mod nvfp4_mmq;
