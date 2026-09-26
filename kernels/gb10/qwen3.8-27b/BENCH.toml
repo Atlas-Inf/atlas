@@ -301,7 +301,20 @@ from the 2026-08-15 hand-built batched calibration serve, NOT from a \
 certified run on the pinned profile (fp8 KV, 8 Marconi slots, 4K context \
 change the memory geometry). They stand untouched as placeholders until the \
 first batched certified run on this profile; re-cut all five together from \
-that run's cells."""
+that run's cells. \
+★ DFLASH2 IS JUDGED AGAINST THESE FLOORS (2026-09-26, #58). The gate keys a \
+baseline by (hardware, checkpoint). DFlash2 and MTP share this checkpoint, \
+so a DFlash2 run (--serve-override speculative=false --serve-override \
+dflash=true) self-verdicts against the MTP-lane floors below: min 17.0 / \
+35.0 / 52.0 / 73.5 / 73.5 less noise, i.e. the 16.2 / 33.5 / 50.5 / 72 / 72 \
+bars the gate prints — which an MTP K=4 run passes (run-1789248105378681119: \
+20.9 / 41.9 / 64.1 / 85.2). DFlash2 proposes serially (41 ms × n, job 235), so it plateaus \
+past C4. On main66 (job 240-conc: γ=8 + Option B, bs16, util 0.70) it \
+scored 27.1 / 36.8 / 46.7 / 48.3. It passes C1 and C4, fails C8, and would \
+fail C16. That is an honest read of serial propose, not a bad floor. Expect \
+it until batched B×γ propose lands (docs/design/dflash2-batched-propose.md). \
+A per-recipe DFlash2 variant needs a gate-framework change (bench_resolve \
+keys by checkpoint)."""
 
 # ★ PLACEMENT: a [benchmarks.*] sub-table attaches to the MOST RECENT
 # [[benchmarks]] header above it. This serve pin was first committed ABOVE
