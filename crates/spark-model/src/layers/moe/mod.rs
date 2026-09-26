@@ -305,6 +305,8 @@ pub struct MoeLayer {
     /// handle != 0, `gateup_fp4` is set, and the shared `gate_ptrs_t`/`up_ptrs_t`
     /// tables are present (FAST_MOE=full).
     moe_fused_gate_up_t_k64_fp4: KernelHandle,
+    moe_fused_gate_up_t_k64_bf16a: KernelHandle,
+    moe_grouped_gemm_t_k64_bf16a: KernelHandle,
     moe_fp8_grouped_gemm_t: KernelHandle,
     w4a16_gemm_t: KernelHandle,
     bf16_to_fp8_k: KernelHandle,

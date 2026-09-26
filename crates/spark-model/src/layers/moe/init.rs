@@ -181,6 +181,16 @@ impl MoeLayer {
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_k64_fp4",
             ),
+            moe_fused_gate_up_t_k64_bf16a: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_fused_gate_up_t_k64_bf16a",
+            ),
+            moe_grouped_gemm_t_k64_bf16a: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_grouped_gemm_ptrtable_t_k64_bf16a",
+            ),
             moe_fp8_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_fp8_grouped_gemm_ptrtable_t")?,
             // THE routed-expert FP8 prefill kernel: grid-compaction (persistent
             // 96-CTA grid over a compacted work-list). Handle may be 0 on older

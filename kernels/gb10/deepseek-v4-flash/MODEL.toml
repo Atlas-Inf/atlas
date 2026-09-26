@@ -130,6 +130,13 @@ moe_w4a16_fused_gate_up_t_k64_fp4 = "FUSED-FP4 gate_up (Holo-3.1 family); forwar
 moe_w4a16_fused_gate_up_t_k64_m128 = "M=128 Block-D variant shipped only in minimax-m2-229b; forward_prefill_routed gates on nvfp4_gate_up_m128 && handle != 0, falls through to M=64 (resolves)."
 moe_w4a16_down_t_k64_fp4 = "FP4 down-projection twin; forward_prefill_routed gates on down_fp4 && handle != 0."
 
+moe_w4a16_fused_gate_up_t_k64_bf16a = """
+BF16-activation variant of the K64 transposed fused gate+up (ATLAS_MOE_T_BF16A=1,
+#74). Shipped only in the qwen3.6-35b-a3b moe_w4a16 source and its symlinks;
+this target's module serves the e4m3 K64 kernel instead."""
+moe_w4a16_grouped_gemm_ptrtable_t_k64_bf16a = """
+Same bf16a family — the down-projection twin. This target's module serves the
+e4m3 K64 kernel; handle 0 keeps the default arm."""
 [expected_absent.paged_decode_attn_fp8_512]
 paged_decode_attn_fp8 = """
 HDIM>256 generic FP8-KV decode arm. Probe is issued because MLA sets

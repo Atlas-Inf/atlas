@@ -20,6 +20,19 @@ fn grouped_cutlass_gate_up_enabled() -> bool {
         == Some("1")
 }
 
+/// Whether the BF16-activation transposed-K64 arm is selected
+/// (`ATLAS_MOE_T_BF16A=1`, #74). The default transposed prefill kernels
+/// requantize activations AND dequantized weights to unscaled e4m3
+/// (satfinite, ±448 clip) for `mma.m16n8k32.e4m3`; the bf16a variants run
+/// `mma.m16n8k16.bf16` with bf16 activations and bf16-dequanted weights —
+/// the untransposed kernel's arithmetic on the transposed layout.
+/// Opt-in: job 269 measured the e4m3 arm at +0.74% dense perplexity;
+/// this arm is the precision reference and a candidate default.
+/// Lenient value semantics — anything but literal "1" is off.
+pub(super) fn moe_t_bf16a_enabled(env: Option<&str>) -> bool {
+    env == Some("1")
+}
+
 impl MoeLayer {
     /// Routed-expert grouped-GEMM path: upper-bound grid sizing → grouped
     /// gate+up GEMM → SiLU+mul → grouped down GEMM.
@@ -317,9 +330,20 @@ impl MoeLayer {
                             stream,
                         )?;
                     } else {
+                        // #74: ATLAS_MOE_T_BF16A=1 swaps the e4m3 K64 kernel
+                        // for the bf16-activation clone (same tables, same
+                        // strided grid) when the handle resolved.
+                        let gate_up_k64 = if moe_t_bf16a_enabled(
+                            std::env::var("ATLAS_MOE_T_BF16A").ok().as_deref(),
+                        ) && self.moe_fused_gate_up_t_k64_bf16a.0 != 0
+                        {
+                            self.moe_fused_gate_up_t_k64_bf16a
+                        } else {
+                            self.moe_fused_gate_up_t_k64
+                        };
                         ops::moe_w4a16_fused_gate_up_k64_n128(
                             ctx.gpu,
-                            self.moe_fused_gate_up_t_k64,
+                            gate_up_k64,
                             expert_input,
                             gp.packed_ptrs,
                             gp.scale_ptrs,
@@ -521,9 +545,18 @@ impl MoeLayer {
                             stream,
                         )?;
                     } else {
+                        // #74: bf16a down arm (paired with the gate/up swap).
+                        let down_k64 = if moe_t_bf16a_enabled(
+                            std::env::var("ATLAS_MOE_T_BF16A").ok().as_deref(),
+                        ) && self.moe_grouped_gemm_t_k64_bf16a.0 != 0
+                        {
+                            self.moe_grouped_gemm_t_k64_bf16a
+                        } else {
+                            self.moe_grouped_gemm_t_k64
+                        };
                         ops::moe_w4a16_grouped_gemm_ptrtable_n128(
                             ctx.gpu,
-                            self.moe_grouped_gemm_t_k64,
+                            down_k64,
                             expert_gate_out,
                             dp.packed_ptrs,
                             dp.scale_ptrs,
