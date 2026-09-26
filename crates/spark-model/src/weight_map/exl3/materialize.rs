@@ -30,13 +30,15 @@ pub fn exl3_native_decode() -> bool {
 }
 
 /// True iff the packed four of `stem` must survive materialize: only under
-/// the native-decode gate, and only for the three GDN projections the decode
-/// overlay consumes (everything else keeps the BF16-only behavior).
+/// the native-decode gate, and only for the three GDN projections and the
+/// LM head the decode overlays consume (everything else keeps the BF16-only
+/// behavior).
 pub(crate) fn keeps_packed_with(stem: &str, native: bool) -> bool {
     native
         && (stem.ends_with(".linear_attn.in_proj_qkv")
             || stem.ends_with(".linear_attn.in_proj_z")
-            || stem.ends_with(".linear_attn.out_proj"))
+            || stem.ends_with(".linear_attn.out_proj")
+            || stem == "lm_head")
 }
 
 /// [`keeps_packed_with`] with the env gate applied.

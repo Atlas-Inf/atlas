@@ -878,6 +878,17 @@ pub fn build_model(
     if let Some(ngram) = ngram_embed {
         model.set_ngram_embedding(ngram);
     }
+    // Native EXL3 decode: the LM head runs the int8 sq GEMV on the packed
+    // weight for decode (1 row) and MTP verify (2 rows). The packed four
+    // survived materialize for this stem (see `keeps_packed_with`).
+    if crate::weight_map::exl3::exl3_native_decode() && store.contains("lm_head.trellis") {
+        let w = crate::weight_map::exl3::exl3_from_store(&store, "lm_head", model.gpu_backend())?;
+        model.set_lm_head_exl3(crate::layers::ops::Exl3LinearDecode::new(
+            model.gpu_backend(),
+            w,
+        )?);
+        tracing::info!("EXL3 native decode: lm_head overlay installed");
+    }
     // Every layer has taken the pointers it needs; hand the ledger to the model
     // so `teardown` can free the weights. Dropping it here — which is what used
     // to happen — orphaned the memory: live, referenced by the layers, with

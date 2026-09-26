@@ -41,11 +41,12 @@ fn dense_stems_drops_ngram_embedding() {
 }
 
 #[test]
-fn keeps_packed_with_gdn_stems_only_under_native() {
+fn keeps_packed_with_gdn_and_lm_head_only_under_native() {
     let gdn = [
         "model.language_model.layers.0.linear_attn.in_proj_qkv",
         "model.language_model.layers.35.linear_attn.in_proj_z",
         "model.language_model.layers.7.linear_attn.out_proj",
+        "lm_head",
     ];
     for stem in gdn {
         assert!(keeps_packed_with(stem, true), "{stem}");
@@ -60,6 +61,8 @@ fn keeps_packed_with_gdn_stems_only_under_native() {
         "model.language_model.layers.3.mlp.experts.7.gate_proj",
         true
     ));
+    // Only the exact stem keeps the packing, not a lookalike suffix.
+    assert!(!keeps_packed_with("mtp.lm_head", true));
 }
 
 #[test]
