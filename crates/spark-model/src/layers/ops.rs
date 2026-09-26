@@ -58,6 +58,8 @@ mod gemm_fp4;
 pub mod model_stats;
 pub use model_stats::ModelStats;
 
+#[path = "ops/exl3_bf16_pool.rs"]
+mod exl3_bf16_pool;
 #[path = "ops/exl3_int8_ops.rs"]
 mod exl3_int8_ops;
 #[path = "ops/exl3_linear_decode.rs"]
@@ -201,6 +203,7 @@ pub use dispatch_proj::*;
 pub use dispatch_proj_rowwise::*;
 pub use dp4a::*;
 pub use embeddings::*;
+pub use exl3_bf16_pool::*;
 pub use exl3_int8_ops::*;
 pub use exl3_linear_decode::*;
 pub use exl3_ops::*;

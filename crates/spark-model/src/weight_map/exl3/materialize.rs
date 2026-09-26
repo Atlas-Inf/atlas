@@ -29,6 +29,16 @@ pub fn exl3_native_decode() -> bool {
     *ONCE.get_or_init(|| std::env::var("ATLAS_EXL3_NATIVE_DECODE").ok().as_deref() == Some("1"))
 }
 
+/// `ATLAS_EXL3_LAZY_BF16=1` (with native decode): the GDN BF16 copies are
+/// freed after load and rebuilt on demand from the packed tensors. Read once.
+/// M6f-a plumbing only — no call site consumes it yet.
+pub fn exl3_lazy_bf16() -> bool {
+    static ONCE: OnceLock<bool> = OnceLock::new();
+    *ONCE.get_or_init(|| {
+        exl3_native_decode() && std::env::var("ATLAS_EXL3_LAZY_BF16").ok().as_deref() == Some("1")
+    })
+}
+
 /// True iff the packed four of `stem` must survive materialize: only under
 /// the native-decode gate, and only for the three GDN projections, the four
 /// full-attention projections and the LM head the decode overlays consume
