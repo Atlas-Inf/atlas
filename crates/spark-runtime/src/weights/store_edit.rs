@@ -18,7 +18,7 @@ impl WeightStore {
     /// Fails (and leaves the store unchanged) if `name` is already present:
     /// replacing a live tensor would drop its map entry without freeing the
     /// buffer — a leak the teardown `release` cannot see — so a caller that
-    /// wants to swap a tensor must [`remove`] it first.
+    /// wants to swap a tensor must [`remove`](Self::remove) it first.
     pub fn insert(&mut self, name: String, tensor: WeightTensor) -> Result<()> {
         if let Some(existing) = self.weights.get(&name) {
             bail!(
@@ -55,7 +55,7 @@ impl WeightStore {
 
     /// True if this name's tensor memory was already freed by
     /// [`reclaim`](Self::reclaim) (its map entry may still exist). Call this
-    /// before [`remove`] to decide whether the returned buffer must be freed.
+    /// before [`remove`](Self::remove) to decide whether the returned buffer must be freed.
     pub fn was_reclaimed(&self, name: &str) -> bool {
         let Some(ptr) = self.weights.get(name).map(|t| t.ptr.0) else {
             return false;

@@ -245,6 +245,7 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
         weight_block_size: vec![],
         group_size: 16,
         quantized_layers: map,
+        exl3: None,
     });
     let store = store_with(&[]);
     assert_eq!(
