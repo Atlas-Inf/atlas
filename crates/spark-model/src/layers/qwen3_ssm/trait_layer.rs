@@ -12,6 +12,84 @@ use super::Qwen3SsmLayer;
 use crate::layer::{ForwardContext, GdnPrefillBuffers, LayerState, TransformerLayer};
 
 impl TransformerLayer for Qwen3SsmLayer {
+    // ── MoE layout transposes ───────────────────────────────────────────
+    // qwen4_exp is 36 gated-delta-net layers + 12 full-attention layers, and
+    // EVERY one of them carries a 512-expert MoE block. Only
+    // `Qwen3AttentionLayer` used to override these, and the trait defaults are
+    // `Ok(())` -- a SILENT no-op -- so the factory transpose pass built the
+    // `_t` tables for 12 of 48 layers and skipped 36 with no log line.
+    //
+    // Measured before this fix (nsys, unified layout on): the transposed
+    // kernels ran exactly 24 gate_up + 24 down = 12 layers x 2, while the
+    // untransposed `moe_w4a16_grouped_gemm_ptrtable` still took 216 launches
+    // and 38% of GPU time. TTFT barely moved because 75% of the MoE work never
+    // left the slow path.
+    //
+    // All five are forwarded so every m2_setup tier (full / gate_up+scratch /
+    // unified / hybrid) reaches the SSM layers, not just the one we happen to
+    // run today.
+
+    fn transpose_moe_for_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn transpose_moe_gate_up_for_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_gate_up_for_prefill(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn set_moe_down_transpose_scratch(
+        &mut self,
+        scratch_packed: DevicePtr,
+        scratch_scale: DevicePtr,
+        packed_ptrs_t: DevicePtr,
+        scale_ptrs_t: DevicePtr,
+    ) {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.set_down_transpose_scratch(
+                scratch_packed,
+                scratch_scale,
+                packed_ptrs_t,
+                scale_ptrs_t,
+            );
+        }
+    }
+
+    fn transpose_moe_for_prefill_unified(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill_unified(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn transpose_moe_for_prefill_hybrid(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill_hybrid(gpu, config)?;
+        }
+        Ok(())
+    }
+
     /// Downcast hook so the LoRA install walk can reach this layer's MoE FFN
     /// (Feature-1: routed-expert/router deltas exist on GDN layers too).
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

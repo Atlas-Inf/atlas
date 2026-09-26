@@ -312,3 +312,22 @@ fn deepseek_style_stop_marker_detected() {
     let info = TokenizerInfo::new(&vocab, VocabType::Raw, None, None, false);
     assert_eq!(info.stop_token_ids(), &[1]);
 }
+
+#[test]
+fn tokenizer_info_clone_shares_storage() {
+    // #73: Clone is the C++ pimpl/shared_ptr semantics — the vocabulary
+    // buffers are shared, not deep-copied.
+    let vocab = vec!["+".to_string(), "regular".to_string(), "我".to_string()];
+    let info = TokenizerInfo::new(&vocab, VocabType::Raw, None, None, false);
+    let clone = info.clone();
+    assert_eq!(
+        info.decoded_vocab().as_ptr(),
+        clone.decoded_vocab().as_ptr()
+    );
+    assert_eq!(
+        info.sorted_decoded_vocab().as_ptr(),
+        clone.sorted_decoded_vocab().as_ptr()
+    );
+    // Equality still compares by value.
+    assert_eq!(info, clone);
+}

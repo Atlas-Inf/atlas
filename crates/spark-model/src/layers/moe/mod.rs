@@ -408,6 +408,12 @@ pub struct MoeLayer {
     /// `KernelHandle(0)` on images lacking it; the FP4-down dispatch checks this
     /// handle != 0, `down_fp4` is set, and the shared `down_ptrs_t` table is present.
     pub(crate) moe_down_t_k64_fp4: KernelHandle,
+
+    /// Non-zero when this model's `moe_w4a16_{grouped_gemm_ptrtable,fused_gate_up}
+    /// _t_k64` kernels stride `blockIdx.y` over m-tiles instead of returning past
+    /// the first. Only then may the prefill grid be sized by the AVERAGE expert
+    /// (`ATLAS_MOE_PREFILL_PERSIST_TILES`) rather than the hottest one.
+    pub(crate) moe_k64_strides_m_tiles: KernelHandle,
     /// `moe_permute_tokens` gather kernel — only needed by the FP4 escape-hatch
     /// (which consumes expert-sorted contiguous rows, unlike the FP8 fused
     /// kernel that gathers via `sorted_token_ids` internally). `try_kernel`

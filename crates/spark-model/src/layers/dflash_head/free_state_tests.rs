@@ -21,7 +21,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::lifecycle::*;
 use super::{
-    BlockDiffusionDraftHead, DflashKernels, DflashProposerState, DflashScratch, CTX_ACC_POOL,
+    BlockDiffusionDraftHead, CTX_ACC_POOL, DflashKernels, DflashProposerState, DflashScratch,
 };
 use crate::speculative::DraftProposer;
 use crate::weight_map::DenseWeight;
@@ -136,6 +136,9 @@ fn zero_head() -> BlockDiffusionDraftHead {
         batch_markov_prev: DevicePtr(0),
         batch_markov_embed: DevicePtr(0),
         batch_markov_bias: DevicePtr(0),
+        batch_dflash2_projected: DevicePtr(0),
+        batch_conv_delta: DevicePtr(0),
+        batch_conv_out: DevicePtr(0),
         extra_lanes: Vec::new(),
         lane0_markov_embed: DevicePtr(0),
         lane0_markov_bias: DevicePtr(0),

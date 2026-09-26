@@ -403,3 +403,10 @@ gdn_verify_fused_conv_kn_f32 = """
 FP32 fused verify conv for the exact-verify chain (#435), shipped only
 in qwen3.6-27b/nvfp4. Probed handle != 0; absent, the exact chain keeps
 its per-token conv launches (same bits, more launches)."""
+# `moe_persist_marker` ships only in qwen3.8-flash-next (whose k64 prefill
+# kernel was measured m-tile-strided); everywhere else the marker module is
+# absent by design and handle 0 keeps the full m-tile grid. The lookup is
+# issued unconditionally by MoeLayer::new (moe/init.rs), which every MoE
+# model_type this target serves constructs.
+[expected_absent.moe_persist_marker]
+moe_w4a16_k64_strides_m_tiles = "Capability marker issued by MoeLayer::new on every MoeLayer MoE model; only targets whose k64 prefill kernels were measured to stride m-tiles ship it (qwen3.8-flash-next). Absent here by design: handle 0 keeps the full m-tile grid."

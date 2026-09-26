@@ -335,8 +335,8 @@ pub struct TransformerModel {
     pub(super) verify_batched_graphs:
         Mutex<(std::collections::HashMap<Vec<u32>, (GraphHandle, u64)>, u64)>,
     /// Batched-verify WY pointer-table staging: `num_ssm_layers` slices of
-    /// `crate::layer::VERIFY_WY_LAYER_STRIDE_BYTES` ([h|Hi0|Hi1|Hi2] × 4
-    /// u64 entries each) at a FIXED device address, refreshed pre-graph every
+    /// `crate::layer::VERIFY_WY_LAYER_STRIDE_BYTES` ([h|Hi0..Hi14] — 16 tables
+    /// × 32 u64 entries each) at a FIXED device address, refreshed pre-graph every
     /// batched verify step (`upload_verify_wy_tables`). Enables the
     /// single-launch table-form `gdn_decode_wy4` in the batched GDN arm.
     /// NULL without an MTP proposer (path self-gates).

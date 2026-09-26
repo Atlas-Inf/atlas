@@ -38,7 +38,7 @@ pub(super) fn batch_verify_disabled() -> bool {
 /// Batched K-row verify for `batch.len() >= 2` sequences. Sequence `i` holds
 /// exactly `ks[i] - 1` pending drafts — RAGGED since D-Cut, uniform without
 /// it. Caller (Phase B in `mtp_step.rs`) guarantees: grammarless, non-DFlash,
-/// `pending_drafts.len() == ks[i]-1`, `Σ ks <= VERIFY_ROW_BUDGET` (96 since
+/// `pending_drafts.len() == ks[i]-1`, `Σ ks <= VERIFY_ROW_BUDGET` (128 since
 /// the wave-11 depth-at-width envelope; 64 at the 32:1 rung), batch sorted
 /// deepest-first then by ssm slot (canonical graph key), and
 /// `model.can_batch_verify(ks)`.

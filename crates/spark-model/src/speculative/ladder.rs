@@ -114,8 +114,9 @@ fn mtp_ladder_steps() -> &'static [(usize, usize)] {
         // -4% (176.6-179.4). It is inert at n<=8 by construction (the n<=8
         // rung matches first).
         //
-        // 24:2 / 32:2 (wave 11): the 96-row verify envelope makes depth at
-        // n<=32 a SINGLE chunk (24 x 3 = 72 rows, 32 x 3 = 96 rows), so
+        // 24:2 / 32:2 (wave 11): the verify row envelope makes depth at
+        // n<=32 a SINGLE chunk (24 x 3 = 72 rows, 32 x 3 = 96 rows — both
+        // under the 128-row cap), so
         // `ATLAS_MTP_K_LADDER="4:3,8:3,16:2,24:2,32:2"` is now a measurable
         // shape. NOT default: 32:2 is a PROJECTION so far (~277 tok/s at
         // C=32 from the measured n=16 K=3 verify cost — +50% rows for
@@ -127,7 +128,7 @@ fn mtp_ladder_steps() -> &'static [(usize, usize)] {
         // projections FLAT in rows and the GDN state term per-STEP, so K=2's
         // ~1.8 tok/step (p1~0.8) amortizes the whole step — the one level
         // with NO MTP multiplier while every C<=16 level enjoys one. R =
-        // 32 x 2 = 64 rows = the widened VERIFY_ROW_CAP/meta/logits/stash
+        // 32 x 2 = 64 rows, inside VERIFY_ROW_CAP/meta/logits/stash
         // envelope (verify_e). Explicit rung (not last-step fallthrough) so
         // the shape is visible in `ATLAS_MTP_K_LADDER` terms; dispatch above
         // 16 additionally needs the `mtp_max_seqs` default raised to 32
@@ -306,7 +307,7 @@ mod tests {
         assert_eq!(mtp_ladder_drafts(16, 1), 1);
     }
 
-    // The 24:2 / 32:2 rungs the 96-row envelope permits stay reachable via
+    // The 24:2 / 32:2 rungs the 128-row envelope permits stay reachable via
     // ATLAS_MTP_K_LADDER (pure step arithmetic — same shape the env parse
     // produces for "4:3,8:3,16:2,24:2,32:2").
     #[test]
@@ -321,7 +322,7 @@ mod tests {
                 .unwrap()
         };
         // 24:2 = 24 x 3 = 72 rows; 32:2 = 32 x 3 = 96 rows — both a single
-        // chunk under VERIFY_ROW_BUDGET = 96 (mtp_dcut::chunk_ranges).
+        // chunk under VERIFY_ROW_BUDGET = 128 (mtp_dcut::chunk_ranges).
         assert_eq!(drafts(17), 2);
         assert_eq!(drafts(24), 2);
         assert_eq!(drafts(25), 2);

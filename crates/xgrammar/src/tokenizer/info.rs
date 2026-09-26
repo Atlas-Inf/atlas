@@ -32,8 +32,17 @@ const DETECTION_STOP_TOKENS: &[&str] = &[
 /// Construct with [`TokenizerInfo::new`] from a raw vocabulary, or with
 /// [`TokenizerInfo::from_huggingface`] to additionally infer the vocab
 /// type / prefix-space from a `tokenizer.json`.
+///
+/// Cloning shares the vocabulary (the C++ pimpl/shared_ptr semantics);
+/// every CompiledGrammar holds a handle, not a copy — a deep copy per
+/// compiled grammar was ~20 MB on a 248k vocab and the cause of #73.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenizerInfo {
+    inner: std::sync::Arc<TokenizerInfoData>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TokenizerInfoData {
     vocab_type: VocabType,
     vocab_size: usize,
     add_prefix_space: bool,
@@ -118,14 +127,16 @@ impl TokenizerInfo {
         let trie_subtree_nodes_range = build_trie_ranges(&sorted_decoded_vocab);
 
         TokenizerInfo {
-            vocab_type,
-            vocab_size,
-            add_prefix_space,
-            decoded_vocab,
-            sorted_decoded_vocab,
-            trie_subtree_nodes_range,
-            stop_token_ids: stop_ids,
-            special_token_ids: special_ids,
+            inner: std::sync::Arc::new(TokenizerInfoData {
+                vocab_type,
+                vocab_size,
+                add_prefix_space,
+                decoded_vocab,
+                sorted_decoded_vocab,
+                trie_subtree_nodes_range,
+                stop_token_ids: stop_ids,
+                special_token_ids: special_ids,
+            }),
         }
     }
 
@@ -153,55 +164,60 @@ impl TokenizerInfo {
 
     /// The vocabulary type.
     pub fn vocab_type(&self) -> VocabType {
-        self.vocab_type
+        self.inner.vocab_type
     }
 
     /// The total id space size (raw vocab length, or the override).
     pub fn vocab_size(&self) -> usize {
-        self.vocab_size
+        self.inner.vocab_size
     }
 
     /// Whether the tokenizer prepends a space to the first token.
     pub fn add_prefix_space(&self) -> bool {
-        self.add_prefix_space
+        self.inner.add_prefix_space
     }
 
     /// Decoded token bytes, indexed by token id (length `vocab_size`).
     pub fn decoded_vocab(&self) -> &[Vec<u8>] {
-        &self.decoded_vocab
+        &self.inner.decoded_vocab
     }
 
     /// Ids accepted as end-of-generation by the grammar matcher.
     pub fn stop_token_ids(&self) -> &[i32] {
-        &self.stop_token_ids
+        &self.inner.stop_token_ids
     }
 
     /// Ids masked out during grammar-guided generation.
     pub fn special_token_ids(&self) -> &[i32] {
-        &self.special_token_ids
+        &self.inner.special_token_ids
     }
 
     /// `(id, token)` pairs sorted lexicographically by token bytes,
     /// excluding stop and special tokens.
     pub fn sorted_decoded_vocab(&self) -> &[(i32, Vec<u8>)] {
-        &self.sorted_decoded_vocab
+        &self.inner.sorted_decoded_vocab
     }
 
     /// Pseudo-trie subtree end-indices over [`Self::sorted_decoded_vocab`].
     pub fn trie_subtree_nodes_range(&self) -> &[i32] {
-        &self.trie_subtree_nodes_range
+        &self.inner.trie_subtree_nodes_range
     }
 
     /// Serialize the metadata to the compact JSON form C++
     /// `DumpMetadata` emits:
     /// `{"vocab_type":N,"vocab_size":N,"add_prefix_space":b,"stop_token_ids":[...]}`.
     pub fn dump_metadata(&self) -> String {
-        let ids: Vec<String> = self.stop_token_ids.iter().map(|i| i.to_string()).collect();
+        let ids: Vec<String> = self
+            .inner
+            .stop_token_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect();
         format!(
             "{{\"vocab_type\":{},\"vocab_size\":{},\"add_prefix_space\":{},\"stop_token_ids\":[{}]}}",
-            self.vocab_type.as_int(),
-            self.vocab_size,
-            self.add_prefix_space,
+            self.inner.vocab_type.as_int(),
+            self.inner.vocab_size,
+            self.inner.add_prefix_space,
             ids.join(",")
         )
     }

@@ -195,3 +195,60 @@ fn mixed_precision_fp8_attn_nvfp4_mlp_resolves_standard() {
          Standard checkpoint are dequanted per-key"
     );
 }
+
+/// nvidia/Qwen3.6-35B-A3B-NVFP4 shape (GitHub #88): `quant_algo=MIXED_PRECISION`
+/// whose map labels FP8 attention (130) plus `W4A16_NVFP4` experts and
+/// shared_expert (161) — NOT the bare `"NVFP4"` label. An exact-match vote
+/// leaves `saw_nvfp4` false and mis-routes the checkpoint to `Fp8Dequanted`,
+/// whose loader dies on `Expected FP8E4M3 ... got UInt8` reading the packed
+/// FP4 shared-expert weights. Nemotron-3.5-Lightning's pack uses the same
+/// `W4A16_NVFP4` label ×5935.
+#[test]
+fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
+    use atlas_core::config::{QuantLayerSpec, QuantizationConfig};
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    let mut map = std::collections::BTreeMap::new();
+    for l in 0..cfg.num_hidden_layers {
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            map.insert(
+                format!("model.language_model.layers.{l}.self_attn.{proj}"),
+                QuantLayerSpec {
+                    quant_algo: "FP8".into(),
+                    group_size: 128,
+                },
+            );
+        }
+        map.insert(
+            format!("model.language_model.layers.{l}.mlp.experts"),
+            QuantLayerSpec {
+                quant_algo: "W4A16_NVFP4".into(),
+                group_size: 16,
+            },
+        );
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            map.insert(
+                format!("model.language_model.layers.{l}.mlp.shared_expert.{proj}"),
+                QuantLayerSpec {
+                    quant_algo: "W4A16_NVFP4".into(),
+                    group_size: 16,
+                },
+            );
+        }
+    }
+    cfg.quantization_config = Some(QuantizationConfig {
+        quant_method: "modelopt".into(),
+        quant_algo: "MIXED_PRECISION".into(),
+        format: String::new(),
+        ignore_modules: vec![],
+        weight_block_size: vec![],
+        group_size: 16,
+        quantized_layers: map,
+    });
+    let store = store_with(&[]);
+    assert_eq!(
+        detect_nvfp4_variant(&store, &cfg),
+        Nvfp4Variant::Standard,
+        "MIXED_PRECISION map with FP8 attn + W4A16_NVFP4 experts/shared_expert \
+         must resolve Standard — the FP8 arm cannot read uint8-packed FP4"
+    );
+}

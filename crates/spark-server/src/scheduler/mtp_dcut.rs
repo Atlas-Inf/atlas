@@ -6,7 +6,7 @@
 //!
 //! The drafter emits `k_drafts` tokens per sequence and each one costs a VERIFY
 //! ROW. Rows are the verify step's price: the batched forward reads every weight
-//! once for `R = Σ rows_i` rows, and R is capped at 96 by the row buffers
+//! once for `R = Σ rows_i` rows, and R is capped at 128 by the row buffers
 //! (`VERIFY_ROW_BUDGET`; 64 before the wave-11 depth-at-width widening, 32
 //! before the 32:1 ladder rung). D-Cut spends that budget where it will be
 //! accepted instead of spreading it evenly — but only in the <= 8-sequence
@@ -43,16 +43,17 @@ use super::types::ActiveSeq;
 const BUCKETS: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
 
 /// Verify row-buffer capacity — the exact bound `can_batch_verify` enforces
-/// as `Σ rows_i <= 96` (logits rows / meta gaps / bt staging, `sizes.rs`;
-/// model twin: `VERIFY_ROW_CAP`, verify_e2.rs — keep in lock-step). 96 since
-/// wave 11 (depth at width: 32:2 = n=32 × k=3 rows hits 96 dead on, 24:2 =
-/// 72); previously 64 (the 32:1 rung, n=32 × k=2), 32 before that. Raising
-/// the budget is behavior-neutral for every default-reachable shape: the
-/// default ladder's widest row totals (16:2 = 48, 32:1 = 64, 8:3 = 32) all
-/// fit the OLD 64-row bound in one chunk, so chunking and pruning are
-/// unchanged — only explicit `ATLAS_MTP_K_LADDER` depth-at-width overrides
-/// (24:2 / 32:2) reach rows 65..=96.
-pub(super) const VERIFY_ROW_BUDGET: usize = 96;
+/// as `Σ rows_i <= 128` (logits rows / meta gaps / bt staging, `sizes.rs`;
+/// model twin: `VERIFY_ROW_CAP`, verify_e2.rs — keep in lock-step). 128
+/// since the DFlash2 C=16 sweep (job 376): γ=8 → 8 rows/seq, n=16 ⇒ 128
+/// rows hit the new budget dead on — at 96 it split 12+4 = two verify
+/// passes per step (C16 measured 66.2 < C8's 69.2); at 128 one pass. 96 since wave 11 (depth at
+/// width: 32:2 = n=32 × k=3 rows hits 96 dead on, 24:2 = 72); previously 64
+/// (the 32:1 rung, n=32 × k=2), 32 before that. Raising the budget is
+/// behavior-neutral for every shape that already fit: row totals ≤ 96
+/// chunk and prune identically — only shapes with 97..=128 rows (32:2's
+/// 96 still one chunk) or DFlash γ=8 at n≥12 change.
+pub(super) const VERIFY_ROW_BUDGET: usize = 128;
 
 /// Widest verify batch (SEQUENCES, not rows) D-Cut may prune —
 /// the D-Cut-at-depth policy. Value-parsed from `ATLAS_MTP_DCUT_MAX_SEQS`
@@ -284,10 +285,12 @@ pub(super) fn plan(
 
 /// Split a batch into verify chunks: `[lo, hi)` index ranges over `ks`.
 ///
-/// ONE cap: the row-buffer bound (`VERIFY_ROW_BUDGET` = 96) — the audited
+/// ONE cap: the row-buffer bound (`VERIFY_ROW_BUDGET` = 128) — the audited
 /// verify envelope (meta gaps / logits rows / bt staging, sizes.rs). The
 /// sequence-count cap is DERIVED from it per chunk (`budget / widest rows`:
-/// rows=4 → 24 seqs, rows=3 → 32 = the 32:2 shape in one chunk, rows=2 → 48;
+/// rows=4 → 32 seqs, rows=3 → 42, rows=2 → 64 (sequence count is separately
+/// bounded at 32 by VERIFY_WY_TABLE_SEQS — the 32:2 shape still fits one
+/// chunk at 96 rows);
 /// `can_batch_verify` separately bounds n at 32 = `VERIFY_WY_TABLE_SEQS`), no
 /// longer a hardcoded 8 for the deep widths. The old 8 was stale from the
 /// 32-row budget era and SILENTLY SERIALIZED any depth shape above n=8 into

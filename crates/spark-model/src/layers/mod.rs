@@ -298,6 +298,26 @@ pub fn moe_grouped_decode_for(n: usize) -> bool {
 #[path = "moe_grouped_decode_tests.rs"]
 mod moe_grouped_decode_tests;
 
+/// [`try_kernel`] gated on a condition that decides whether the module can
+/// exist at all (e.g. `cfg!(atlas_hip)` for kernels that only live in
+/// `kernels/strix-hip/`). Skipping the lookup — rather than discarding its
+/// result — is the point: a lookup that is never issued leaves no failed row
+/// in the boot audit, so what remains is actionable. Same contract as
+/// `qwen3_attention::init_arch_gates::gated`; this one is crate-wide.
+#[track_caller]
+pub(crate) fn try_kernel_gated(
+    enabled: bool,
+    gpu: &dyn GpuBackend,
+    module: &str,
+    func: &str,
+) -> KernelHandle {
+    if enabled {
+        try_kernel(gpu, module, func)
+    } else {
+        KernelHandle(0)
+    }
+}
+
 #[track_caller]
 pub fn try_kernel(gpu: &dyn GpuBackend, module: &str, func: &str) -> KernelHandle {
     match gpu.kernel(module, func) {

@@ -132,3 +132,10 @@ GPT-J-interleaved YaRN arm for DeepSeek-V4 MLA rope sites
 (attention_forward_v4.rs / paged_v4.rs) — V4-family paths this model
 does not execute; ships only in deepseek-v4-flash's tree."""
 rope_forward_yarn_interleaved_inv = "Same V4-Flash interleaved-YaRN family; not on any path this model executes."
+# `moe_persist_marker` ships only in qwen3.8-flash-next (whose k64 prefill
+# kernel was measured m-tile-strided); everywhere else the marker module is
+# absent by design and handle 0 keeps the full m-tile grid. The lookup is
+# issued unconditionally by MoeLayer::new (moe/init.rs), which every MoE
+# model_type this target serves constructs.
+[expected_absent.moe_persist_marker]
+moe_w4a16_k64_strides_m_tiles = "Capability marker issued by MoeLayer::new on every MoeLayer MoE model; only targets whose k64 prefill kernels were measured to stride m-tiles ship it (qwen3.8-flash-next). Absent here by design: handle 0 keeps the full m-tile grid."

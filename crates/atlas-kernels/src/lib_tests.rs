@@ -141,6 +141,97 @@ fn exact_verify_snap_lookups_resolve_or_are_declared_on_every_gdn_target() {
     );
 }
 
+/// `moe_persist_marker::moe_w4a16_k64_strides_m_tiles` (PR #68): a capability
+/// marker issued unconditionally by `MoeLayer::new` (`moe/init.rs`) on EVERY
+/// model whose loader constructs a MoeLayer. The module ships only in
+/// qwen3.8-flash-next (the measured m-tile-strided k64 prefill), so every
+/// other MoE-serving target must declare it `expected_absent` or the boot
+/// gate refuses the checkpoint (observed on the merge-train tree for
+/// qwen3.6-35b-a3b, job 306).
+///
+/// Issuer proxy: a target constructs `MoeLayer` iff it can serve a MoE
+/// model_type — i.e. `model_type_matches` names one of the MoE-layer
+/// dispatch types below. `gemma4` is in the set on the declared-type
+/// contract: a dense-31B checkpoint never builds a MoeLayer, but the target
+/// accepts the type, so the declaration is the honest answer for the
+/// checkpoint family it claims to serve.
+#[test]
+#[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
+fn moe_persist_marker_lookup_resolves_or_is_declared_on_every_moe_target() {
+    /// model_types whose loader constructs `MoeLayer` (`MoeLayer::new` /
+    /// `new_with_hash`) at least once for a matching checkpoint — SSM-hybrid
+    /// MoEs (qwen3_next, qwen3_5_moe/qwen3_6_moe family, holo3_1_moe,
+    /// qwen3_vl_moe, qwen4_exp), plus the dense-transformer MoE loaders
+    /// (laguna, longcat, minimax, mistral, step3p7, deepseek_v4, gemma4).
+    /// `nemotron_h*` uses `NemotronMoeLayer`, not `MoeLayer`, and `qwen3_5`
+    /// alone is the dense arm.
+    const MOE_ISSUERS: &[&str] = &[
+        "deepseek_v4",
+        "gemma4",
+        "holo3_1_moe",
+        "laguna",
+        "longcat_flash",
+        "longcat_flash_ngram",
+        "minimax_m2",
+        "mistral",
+        "qwen3_5_moe",
+        "qwen3_6_moe",
+        "qwen3_next",
+        "qwen3_vl_moe",
+        "qwen35_moe",
+        "qwen4_exp",
+        "step3p7",
+    ];
+    let ships = |t: &TargetPtxSet| t.modules.iter().any(|(m, _)| *m == "moe_persist_marker");
+    let declares = |t: &TargetPtxSet| {
+        t.expected_absent
+            .iter()
+            .any(|(em, ef)| *em == "moe_persist_marker" && *ef == "moe_w4a16_k64_strides_m_tiles")
+    };
+
+    let mut moe_targets = 0usize;
+    let mut by_presence = 0usize;
+    let mut by_declaration = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+    for t in available_targets() {
+        let issues = t
+            .model_type_matches
+            .iter()
+            .any(|m| MOE_ISSUERS.contains(&m.model_type));
+        if !issues {
+            continue;
+        }
+        moe_targets += 1;
+        if ships(&t) {
+            by_presence += 1;
+        } else if declares(&t) {
+            by_declaration += 1;
+        } else {
+            violations.push(format!(
+                "{} misses moe_persist_marker::moe_w4a16_k64_strides_m_tiles UNDECLARED — \
+                 its boot gate will refuse to serve",
+                t.target
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "MoE targets with an undeclared unresolvable marker lookup:\n{}",
+        violations.join("\n")
+    );
+    // Non-vacuity guards: the marker must ship on at least the flash-next
+    // target, and the declaration arm must be exercised broadly — a wiped
+    // issuer set or a dropped module would otherwise pass silently.
+    assert_eq!(
+        by_presence, 1,
+        "only qwen3.8-flash-next ships moe_persist_marker (saw {by_presence})"
+    );
+    assert!(
+        by_declaration >= 10,
+        "the MoE fleet must cover the lookup by declaration (saw {by_declaration} of {moe_targets} targets)"
+    );
+}
+
 #[test]
 #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
 fn ptx_for_model_lookup() {

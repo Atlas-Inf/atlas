@@ -308,6 +308,31 @@ pub struct DenseFfnLayer {
     q2_0_mmq_wc_k: KernelHandle,
 }
 
+/// Whether the NVFP4 W4A4 MMQ prefill arm (`atlas_nvfp4_mmq*` + the FP4
+/// activation quantizer) runs for this layer. **OPT-IN** —
+/// `ATLAS_FFN_NVFP4_MMQ=1` — since job 369 (Qwen3.8-27B NVFP4, GB10): the
+/// FP4-activation path is measurably worse on quality — 8x12k perplexity
+/// −0.76 % (first 2k) / −0.45 % (rest) for W4A16, chunk-boundary drift
+/// token-0 max|Δlogprob| median 1.9 / max 12.2 nats vs 8/8 identical under
+/// W4A16 — for a ~7 % TTFT win on a 10k cold prefill. W4A16 (BF16
+/// activations) is the default again.
+///
+/// The retired kill-switch `ATLAS_NO_FFN_NVFP4_MMQ` is now inert: the arm it
+/// suppressed is already off. It is still read once per site to WARN on
+/// stale recipes rather than silently ignoring a flag that used to matter.
+pub(crate) fn fp4mmq_prefill_decision(env: Option<&str>, handles_ok: bool, silu: bool) -> bool {
+    handles_ok && silu && env == Some("1")
+}
+
+/// Warn once (per the caller's once-latch) that `ATLAS_NO_FFN_NVFP4_MMQ` is
+/// deprecated. Called from both the forward path (`ctx.stats.once`) and the
+/// load-time finalize (`gpu.op_cache().once`).
+fn deprecated_no_ffn_nvfp4_mmq_message() -> &'static str {
+    "ATLAS_NO_FFN_NVFP4_MMQ is deprecated: the NVFP4 W4A4 MMQ prefill arm is now \
+     opt-in (ATLAS_FFN_NVFP4_MMQ=1), so the kill switch is a no-op. Remove it \
+     from your recipe."
+}
+
 /// M-sized MMQ tiles: **ON by default**, disabled by `ATLAS_NO_MMQ_SMALL_TILE=1`.
 /// Strict `== "1"` on an `ATLAS_NO_*` name — presence flags here are enabled by `=0`.
 fn mmq_small_tile_enabled() -> bool {
@@ -371,30 +396,50 @@ impl DenseFfnLayer {
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_gemv_batch16: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
-            dp4a_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "quantize_act_int8_g16"),
-            dp4a_silu_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "silu_mul_quant_int8_g16"),
-            dp4a_gemv_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "w4a16_gemv_dp4a"),
-            dp4a_quant_batch4_k: super::try_kernel(
+            dp4a_quant_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "quantize_act_int8_g16",
+            ),
+            dp4a_silu_quant_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "silu_mul_quant_int8_g16",
+            ),
+            dp4a_gemv_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a",
+            ),
+            dp4a_quant_batch4_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "quantize_act_int8_g16_batch4_d4",
             ),
-            dp4a_gemv_batch4_k: super::try_kernel(
+            dp4a_gemv_batch4_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_batch4_d4",
             ),
-            dp4a_dual_batch4_k: super::try_kernel(
+            dp4a_dual_batch4_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_dual_batch4_d4",
             ),
-            dp4a_gemv_batch4_dyn_k: super::try_kernel(
+            dp4a_gemv_batch4_dyn_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_batch4_d4_dyn",
             ),
-            dp4a_dual_batch4_dyn_k: super::try_kernel(
+            dp4a_dual_batch4_dyn_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_dual_batch4_d4_dyn",
@@ -603,19 +648,30 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<()> {
         // Packed-Q2 (ATLAS_GGUF_NATIVE_Q2) FFN keeps its NVFP4 source weights
-        // NULL. This W4A4-MMQ finalize is active by DEFAULT (SiLU + kernels
-        // present) and repacks the NVFP4 gate/up — over NULL pointers that's a
+        // NULL. The W4A4-MMQ finalize (opt-in via ATLAS_FFN_NVFP4_MMQ=1)
+        // repacks the NVFP4 gate/up — over NULL pointers that's a
         // CUDA-700 illegal access. Packed-Q2 uses its own decode/prefill path.
         if self.q2_weights.is_some() {
             return Ok(());
         }
-        let active = self.nvfp4_mmq_nc_k.0 != 0
-            && self.nvfp4_quant_act_k.0 != 0
-            && self.nvfp4_repack_k.0 != 0
-            && self.nvfp4_silu_scaled_k.0 != 0
-            && matches!(self.activation, FfnActivation::SiLU)
-            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_none();
+        // The same resolved flag the forward arm uses (plus repack_k, needed
+        // only here): the `_t` frees below run only when the FP4-MMQ prefill
+        // path is actually enabled, so a default boot keeps the transposed
+        // copies the W4A16 prefill kernels need.
+        let active = fp4mmq_prefill_decision(
+            std::env::var("ATLAS_FFN_NVFP4_MMQ").ok().as_deref(),
+            self.nvfp4_mmq_nc_k.0 != 0
+                && self.nvfp4_quant_act_k.0 != 0
+                && self.nvfp4_repack_k.0 != 0
+                && self.nvfp4_silu_scaled_k.0 != 0,
+            matches!(self.activation, FfnActivation::SiLU),
+        );
         if !active {
+            if std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_some()
+                && gpu.op_cache().once("log:ffn_no_nvfp4_mmq_deprecated")
+            {
+                tracing::warn!("{}", deprecated_no_ffn_nvfp4_mmq_message());
+            }
             return Ok(());
         }
         self.ensure_nvfp4_mmq_weight(
@@ -2153,16 +2209,27 @@ impl DenseFfnLayer {
                 );
             }
         }
-        // NVFP4 W4A4 MMQ prefill (ATLAS_FFN_NVFP4_MMQ) — vendored llama Blackwell
-        // block-scale FP4 MMA, gate/up ONLY (hybrid: down stays on the default t_m128
-        // path — SiLU(gate)*up is heavy-tailed and accuracy-critical). SiLU models only
-        // (the scale2 fold lives in the scaled SiLU-mul). Mutually exclusive with
+        // NVFP4 W4A4 MMQ prefill (ATLAS_FFN_NVFP4_MMQ=1, OPT-IN — job 369 showed
+        // it lossy on the 27B: chunk-boundary logit drift and +0.45..0.76 %
+        // perplexity vs the default W4A16 path; ~7 % 10k TTFT cheaper) —
+        // vendored llama Blackwell block-scale FP4 MMA, gate/up ONLY (hybrid:
+        // down has its own opt-in below). SiLU models only (the scale2 fold
+        // lives in the scaled SiLU-mul). Mutually exclusive with
         // ATLAS_FFN_MMQ (both use the shared ffn_act_q8 scratch); this arm wins.
-        let fp4mmq_prefill = self.nvfp4_mmq_nc_k.0 != 0
-            && self.nvfp4_quant_act_k.0 != 0
-            && self.nvfp4_silu_scaled_k.0 != 0
-            && matches!(self.activation, FfnActivation::SiLU)
-            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_none();
+        let fp4mmq_prefill = fp4mmq_prefill_decision(
+            std::env::var("ATLAS_FFN_NVFP4_MMQ").ok().as_deref(),
+            self.nvfp4_mmq_nc_k.0 != 0
+                && self.nvfp4_quant_act_k.0 != 0
+                && self.nvfp4_repack_k.0 != 0
+                && self.nvfp4_silu_scaled_k.0 != 0,
+            matches!(self.activation, FfnActivation::SiLU),
+        );
+        if !fp4mmq_prefill
+            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_some()
+            && ctx.stats.once("log:ffn_no_nvfp4_mmq_deprecated")
+        {
+            tracing::warn!("{}", deprecated_no_ffn_nvfp4_mmq_message());
+        }
         if fp4mmq_prefill {
             // Log-once latch (see `atlas_core::scope`). It holds no model-derived
             // value — the message is rebuilt from the arguments every call — so a
@@ -2175,8 +2242,11 @@ impl DenseFfnLayer {
                 );
             }
         }
-        // Down-projection MMQ arm (DEFAULT ON; kill-switch ATLAS_NO_FFN_NVFP4_MMQ_DOWN=1): route down through
-        // the same MMQ arm (t_m128 runs the narrow-N down at only ~34 TFLOP/s in-model).
+        // Down-projection MMQ arm — follows the master switch (fp4mmq_prefill
+        // is itself opt-in), with its own kill-switch
+        // ATLAS_NO_FFN_NVFP4_MMQ_DOWN=1 for A/B within the opt-in arm: route
+        // down through the same MMQ arm (t_m128 runs the narrow-N down at only
+        // ~34 TFLOP/s in-model).
         // Accuracy note: down W4A4 cosine 0.9961 (random) — better than the previously
         // coherence-validated all-W4A4 config (0.991) — but still the heavy-tailed
         // projection, so it stays a SEPARATE opt-in gate.
@@ -2751,7 +2821,22 @@ fn native_small_batch_uses_prefill(has_bf16: bool, has_fp8: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{native_k2_uses_batch2, native_small_batch_uses_prefill};
+    use super::{fp4mmq_prefill_decision, native_k2_uses_batch2, native_small_batch_uses_prefill};
+
+    #[test]
+    fn fp4mmq_prefill_is_opt_in() {
+        // Default off even when every handle and SiLU are present —
+        // job 369: W4A16 beats W4A4 on perplexity and chunk invariance.
+        assert!(!fp4mmq_prefill_decision(None, true, true));
+        assert!(fp4mmq_prefill_decision(Some("1"), true, true));
+        // Presence-only values do not enable it.
+        for v in ["0", "true", "yes", ""] {
+            assert!(!fp4mmq_prefill_decision(Some(v), true, true));
+        }
+        // Preconditions still gate the opt-in.
+        assert!(!fp4mmq_prefill_decision(Some("1"), false, true));
+        assert!(!fp4mmq_prefill_decision(Some("1"), true, false));
+    }
 
     #[test]
     fn bf16_k2_requires_weights_and_the_read_once_kernel() {

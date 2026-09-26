@@ -33,7 +33,7 @@ pub fn detect_nvfp4_variant(
     // `CUDA_ERROR_ILLEGAL_ADDRESS` bug.
     if let Some(qc) = &config.quantization_config {
         match qc.quant_method.as_str() {
-            "modelopt" if qc.quant_algo.eq_ignore_ascii_case("NVFP4") => {
+            "modelopt" if atlas_core::config::is_nvfp4_quant_algo(&qc.quant_algo) => {
                 return Nvfp4Variant::Standard;
             }
             "modelopt" if qc.quant_algo.eq_ignore_ascii_case("FP8") => {
@@ -382,7 +382,7 @@ fn mixed_precision_variant(qc: &atlas_core::config::QuantizationConfig) -> Optio
         }
         let algo = spec.quant_algo.to_ascii_uppercase();
         saw_fp8 |= algo.starts_with("FP8");
-        saw_nvfp4 |= algo == "NVFP4";
+        saw_nvfp4 |= atlas_core::config::is_nvfp4_quant_algo(&algo);
     }
     // A single global variant cannot express a genuinely mixed main path, so
     // precedence matters: an NVFP4 component can NEVER be served by the FP8
