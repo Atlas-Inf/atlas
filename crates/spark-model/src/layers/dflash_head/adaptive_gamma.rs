@@ -177,10 +177,11 @@ mod tests {
         assert_eq!(g(8, 4.5), 8); // 0.643, just inside the band: hold
         assert_eq!(g(8, 3.5), 8); // inside the band
         assert_eq!(g(8, 1.4), 8); // job-260 prose
-        // At γ=12 (11 drafts): fall below ratio 0.45 (ema < 4.95).
+        // At γ=12 (11 drafts): fall below ratio 0.35 (ema < 3.85).
         assert_eq!(g(12, 7.8), 12); // job-260 code at γ=12: 0.71
-        assert_eq!(g(12, 5.0), 12); // 0.4545, just inside the band: hold
-        assert_eq!(g(12, 4.0), 8);
+        assert_eq!(g(12, 5.0), 12); // 0.4545, inside the band: hold
+        assert_eq!(g(12, 4.0), 12); // 0.364, still inside: hold
+        assert_eq!(g(12, 1.4), 8); // prose at γ=12: 0.13 — fall
         // Off-band values still land in {lo, hi}.
         assert_eq!(g(10, 7.0), 12);
         assert_eq!(g(10, 3.0), 8);
