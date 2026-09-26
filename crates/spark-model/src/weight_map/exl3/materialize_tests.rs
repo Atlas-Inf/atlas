@@ -41,6 +41,28 @@ fn dense_stems_drops_ngram_embedding() {
 }
 
 #[test]
+fn keeps_packed_with_gdn_stems_only_under_native() {
+    let gdn = [
+        "model.language_model.layers.0.linear_attn.in_proj_qkv",
+        "model.language_model.layers.35.linear_attn.in_proj_z",
+        "model.language_model.layers.7.linear_attn.out_proj",
+    ];
+    for stem in gdn {
+        assert!(keeps_packed_with(stem, true), "{stem}");
+        assert!(!keeps_packed_with(stem, false), "{stem}");
+    }
+    // Attention and expert stems never keep their packing.
+    assert!(!keeps_packed_with(
+        "model.language_model.layers.3.self_attn.q_proj",
+        true
+    ));
+    assert!(!keeps_packed_with(
+        "model.language_model.layers.3.mlp.experts.7.gate_proj",
+        true
+    ));
+}
+
+#[test]
 fn dense_stems_keeps_vision_and_mtp_linears() {
     assert_eq!(
         stems(&[

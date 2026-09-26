@@ -82,6 +82,9 @@ pub struct Qwen3SsmLayer {
     /// block-scaled `w8a16_*` arms).
     qkvz_fp8w_rowwise: Option<Fp8Weight>,
     out_proj_fp8w_rowwise: Option<Fp8Weight>,
+    /// Decode-only native EXL3 overlay: int8 sq GEMV on the packed GDN
+    /// projections (`ATLAS_EXL3_NATIVE_DECODE=1`). Prefill keeps the BF16 copies.
+    pub(crate) exl3_decode: Option<Box<exl3_decode::Exl3GdnDecode>>,
     /// Tier-1c keep-packed ternary Q2_0 fused in_proj_qkvz (`ATLAS_GGUF_NATIVE_Q2`).
     /// [Q|K|V|Z] rows byte-concatenated from packed `in_proj_qkv` (V-region
     /// row-permuted) + `in_proj_z` (row-permuted) at load, so the 2-bit weight is
@@ -391,6 +394,7 @@ pub struct Qwen3SsmLayer {
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
+mod exl3_decode;
 mod fla_dispatch;
 pub mod gdn_flags;
 mod init;
