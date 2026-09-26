@@ -9,7 +9,6 @@ use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
 use super::batch_execution;
-use super::batch_plan::{BatchSeqPlan, plan_prepared_fallback};
 use super::parity_report;
 use super::{
     BlockDiffusionDraftHead, CaptureDescriptor, DflashProposerState, DsparkBatchInput,
@@ -366,7 +365,9 @@ impl BlockDiffusionDraftHead {
                 }
                 return Ok(Some(out));
             }
-            // Generic single-lane path retains the historical serial proposer.
+            // Generic single-lane serial path: reached only when the authoritative
+            // arm is off (rollback ATLAS_DFLASH_BATCHED_PROPOSE=0, unmet Option B/lane
+            // preconditions) or a parity oracle is active.
             let mut serial = Vec::with_capacity(n);
             for i in 0..n {
                 serial.push(self.propose_drafts(
@@ -403,93 +404,5 @@ impl BlockDiffusionDraftHead {
             ctx,
         )
         .map(Some)
-    }
-
-    /// Per-sequence fallback once `prepared` of `n` sequences have had their
-    /// drafter state advanced: prepared sequences run `forward_prepared`
-    /// (no re-prepare — that would double-advance the lifecycle), the
-    /// `failed_at` index gets empty drafts (its prepare may be half-advanced),
-    /// and the rest run the full serial `propose_drafts`.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn prepared_fallback_batch(
-        &self,
-        n: usize,
-        prepared: usize,
-        failed_at: Option<usize>,
-        last_tokens: &[u32],
-        target_hiddens: &[DevicePtr],
-        positions: &[usize],
-        num_drafts: usize,
-        states: &mut [&mut dyn crate::speculative::ProposerState],
-        expected_owners: &[SequenceGeneration],
-        ctx: &crate::layer::ForwardContext,
-        stream: u64,
-    ) -> Result<Vec<Vec<u32>>> {
-        let plans = plan_prepared_fallback(n, prepared, failed_at);
-        let (_, scratch, markov_embed, markov_bias) = self.lane(0, ctx.gpu.default_stream());
-        let mut out = Vec::with_capacity(n);
-        for (i, plan) in plans.iter().enumerate() {
-            match plan {
-                BatchSeqPlan::Skip => out.push(Vec::new()),
-                BatchSeqPlan::ForwardPrepared => {
-                    let dstate = states[i]
-                        .as_any_mut()
-                        .downcast_mut::<DflashProposerState>()
-                        .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
-                    let owner = self.validate_dflash_owner(dstate, Some(expected_owners[i]))?;
-                    // Same option_b_arg the serial setup computes: paged
-                    // block table + effective ctx count (ablation may zero
-                    // it). ctx_count_drafter was set by the prepare pass.
-                    let option_b_arg = if self.startup.option_b_enabled {
-                        let effective_ctx = if self.startup.option_b_no_ctx {
-                            0
-                        } else {
-                            dstate.ctx_count_drafter as u32
-                        };
-                        Some((
-                            dstate.block_table_dev.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "DFlash prepared fallback: state has no block table"
-                                )
-                            })?,
-                            effective_ctx,
-                        ))
-                    } else {
-                        None
-                    };
-                    out.push(self.forward_prepared(
-                        scratch,
-                        markov_embed,
-                        markov_bias,
-                        0,
-                        last_tokens[i],
-                        positions[i],
-                        num_drafts,
-                        dstate,
-                        owner,
-                        option_b_arg,
-                        false,
-                        ctx,
-                        stream,
-                    )?);
-                }
-                BatchSeqPlan::SerialPropose => {
-                    out.push(self.propose_drafts(
-                        last_tokens[i],
-                        target_hiddens[i],
-                        positions[i],
-                        num_drafts,
-                        states[i],
-                        Some(expected_owners[i]),
-                        ctx,
-                        stream,
-                        None,
-                        None,
-                        Some(target_hiddens[i]),
-                    )?);
-                }
-            }
-        }
-        Ok(out)
     }
 }

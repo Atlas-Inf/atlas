@@ -293,7 +293,8 @@ impl std::error::Error for LightningDsparkPolicyError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DsparkStartupExecution {
     /// Official Lightning returns the native B×gamma proposal. Generic
-    /// DFlash remains on its historical proposer unless parity is explicit.
+    /// DFlash's authoritative batched proposer is default-on via
+    /// [`generic_batch_authoritative`] (rollback `ATLAS_DFLASH_BATCHED_PROPOSE=0`).
     pub native_batch_authoritative: bool,
     /// Option B paged-context drafter path is active.
     pub option_b_enabled: bool,
@@ -378,6 +379,14 @@ impl DsparkStartupExecution {
             option_b_enabled,
             proposal_lane_count,
         );
+        if let Some(v) = batch_env_ref
+            && !matches!(v, "0" | "1")
+        {
+            tracing::warn!(
+                "ATLAS_DFLASH_BATCHED_PROPOSE={v:?} is malformed (expected 0 or 1); \
+                 treating as 0 — batched propose disabled"
+            );
+        }
         if batch_env_ref == Some("1") && !generic_batch_authoritative {
             tracing::warn!(
                 "ATLAS_DFLASH_BATCHED_PROPOSE=1 ignored: requires ATLAS_DFLASH_OPTION_B=1 \
@@ -444,14 +453,22 @@ pub fn enforce_lightning_structural_gate(
     Ok(())
 }
 
-/// Pure decision: generic-DFlash authoritative Bxgamma propose is on only
-/// when the env flag is set AND the staged seam is reachable (Option B paged
-/// context, exactly one proposal lane — multi-lane pins per-lane scratch and
-/// graph state that the staged path does not carry).
+/// Pure decision: generic-DFlash authoritative Bxgamma propose. It is
+/// DEFAULT-ON when the staged seam is reachable (Option B paged context,
+/// exactly one proposal lane — multi-lane pins per-lane scratch and graph
+/// state that the staged path does not carry). `ATLAS_DFLASH_BATCHED_PROPOSE`
+/// is the rollback: `"0"` disables, `"1"` forces on when the preconditions
+/// hold (the only spelling that warns when they do not), and any other value
+/// is malformed — off, matching the legacy lenient convention that a
+/// malformed opt-in lever is treated as unset.
 pub fn generic_batch_authoritative_decision(
     env: Option<&str>,
     option_b: bool,
     lanes: usize,
 ) -> bool {
-    env == Some("1") && option_b && lanes == 1
+    let reachable = option_b && lanes == 1;
+    match env {
+        None | Some("1") => reachable,
+        Some(_) => false,
+    }
 }

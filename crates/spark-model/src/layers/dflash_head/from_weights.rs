@@ -876,7 +876,7 @@ impl BlockDiffusionDraftHead {
         if head.startup.generic_batch_authoritative {
             tracing::info!(
                 "DFlash batched propose: authoritative Bxgamma for generic DFlash \
-                 (min 2, max {})",
+                 (default on; rollback ATLAS_DFLASH_BATCHED_PROPOSE=0; min 2, max {})",
                 head.batch_capacity
             );
         }

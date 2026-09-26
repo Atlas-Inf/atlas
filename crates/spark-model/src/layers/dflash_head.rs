@@ -695,6 +695,7 @@ mod batch_conv;
 mod batch_execution;
 #[cfg(test)]
 mod batch_execution_tests;
+mod batch_fallback;
 mod batch_forward;
 #[cfg(test)]
 mod batch_inputs_tests;

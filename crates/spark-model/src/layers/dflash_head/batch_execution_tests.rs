@@ -165,9 +165,7 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
     let stage = source.find("self.run_batched_layer_stage").unwrap();
     let tail = source.find("self.run_batched_tail_base").unwrap();
     let native_readback = source.find("let native =\n").unwrap();
-    let generic_serial = source
-        .find("Generic single-lane path retains the historical serial proposer")
-        .unwrap();
+    let generic_serial = source.find("Generic single-lane serial path").unwrap();
     assert!(
         plan < upload
             && upload < embed
