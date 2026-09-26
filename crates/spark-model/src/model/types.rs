@@ -64,7 +64,16 @@ pub struct TransformerModel {
     /// nothing beside a transformer forward.
     pub(super) ngram_embed: Option<std::sync::Mutex<crate::layers::ngram_embed::NgramEmbedding>>,
     pub(super) final_norm: DenseWeight,
+    /// The final norm is the identity: qwen4_exp's hyper-connection mixer (run
+    /// in the last layer) is the final normalization and the reference feeds
+    /// its output straight to lm_head. See `final_norm_rows`.
+    pub(super) final_norm_identity: bool,
     pub(super) lm_head_weight: DenseWeight,
+    /// Native EXL3 LM head (packed int8 sq GEMV) for decode / MTP verify,
+    /// installed by the factory under `ATLAS_EXL3_NATIVE_DECODE=1` when the
+    /// checkpoint packs `lm_head` as EXL3. Additive: when `None`, the
+    /// FP8/NVFP4/BF16 dispatch is byte-identical to before.
+    pub(super) lm_head_exl3: Option<Box<crate::layers::ops::Exl3LinearDecode>>,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// TRANSPOSED `[K/2, ldb]` twin of `lm_head_nvfp4` + its PADDED row stride.
     ///

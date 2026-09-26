@@ -30,6 +30,12 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
+        if let Some(ref e) = self.exl3_attn {
+            e.k.forward_bf16(ctx.gpu, normed, 1, k_out, (nkv * hd) as usize, stream)?;
+            e.v.forward_bf16(ctx.gpu, normed, 1, v_out, (nkv * hd) as usize, stream)?;
+            return Ok(());
+        }
+
         if let (Some(k_q2), Some(v_q2)) = (
             self.k_weight.as_ref().and_then(|w| w.as_packed_q2()),
             self.v_weight.as_ref().and_then(|w| w.as_packed_q2()),

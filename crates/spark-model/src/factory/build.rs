@@ -120,6 +120,25 @@ pub fn build_model(
     // ── Step 1: Select weight loader (only model-specific dispatch) ──
     let loader = loader_for_config(&config)?;
 
+    // An EXL3 checkpoint must never reach the variant-based loaders below
+    // (`detect_nvfp4_variant` / `WeightFormat::detect` would guess BF16).
+    // `ensure_not_exl3` accepts qwen4_exp and refuses the other model types;
+    // the materialization below is what makes an accepted EXL3 checkpoint
+    // readable by them.
+    crate::quant_format::ensure_not_exl3(&config, "build_model")?;
+
+    // EXL3: dense linears become BF16 `.weight` tensors here; routed and shared
+    // experts stay packed and are requantized one by one in `quantized_any`.
+    let mut store = store;
+    if config
+        .quantization_config
+        .as_ref()
+        .is_some_and(|qc| qc.is_exl3())
+    {
+        crate::weight_map::exl3::exl3_materialize_dense(&mut store, gpu.as_ref())?;
+        config.attn_proj_bf16 = true;
+    }
+
     // ── LoRA adapter load (pre-arena, pre-KV-sizing) ──
     // MUST run before `BufferArena::new` and the `gpu.free_memory()`
     // snapshot below: the pool allocation then lands in `used_so_far`, so
@@ -858,6 +877,17 @@ pub fn build_model(
 
     if let Some(ngram) = ngram_embed {
         model.set_ngram_embedding(ngram);
+    }
+    // Native EXL3 decode: the LM head runs the int8 sq GEMV on the packed
+    // weight for decode (1 row) and MTP verify (2 rows). The packed four
+    // survived materialize for this stem (see `keeps_packed_with`).
+    if crate::weight_map::exl3::exl3_native_decode() && store.contains("lm_head.trellis") {
+        let w = crate::weight_map::exl3::exl3_from_store(&store, "lm_head", model.gpu_backend())?;
+        model.set_lm_head_exl3(crate::layers::ops::Exl3LinearDecode::new(
+            model.gpu_backend(),
+            w,
+        )?);
+        tracing::info!("EXL3 native decode: lm_head overlay installed");
     }
     // Every layer has taken the pointers it needs; hand the ledger to the model
     // so `teardown` can free the weights. Dropping it here — which is what used

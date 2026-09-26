@@ -57,7 +57,6 @@ impl TransformerModel {
 
         let h = self.config.hidden_size;
         let v = self.config.vocab_size;
-        let eps = self.config.rms_norm_eps as f32;
         let elem = 2usize; // BF16 hidden rows (matches finalize_last)
         let hidden = self.buffers.hidden_states();
 
@@ -76,17 +75,7 @@ impl TransformerModel {
             let count = (rows_to_score - start).min(BATCH_ROWS);
             let batch_hidden = hidden.offset((start) * h * elem);
             let normed = self.buffers.norm_output();
-            ops::rms_norm(
-                self.gpu.as_ref(),
-                self.rms_norm_kernel,
-                batch_hidden,
-                &self.final_norm,
-                normed,
-                count as u32,
-                h as u32,
-                eps,
-                stream,
-            )?;
+            self.final_norm_rows(batch_hidden, normed, count as u32, stream)?;
             self.lm_head_batched(normed, count as u32, self.buffers.logits(), stream)?;
             self.gpu.synchronize(stream)?;
             let bytes = &mut host[..count * v * 2];

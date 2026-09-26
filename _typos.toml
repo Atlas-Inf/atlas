@@ -25,6 +25,11 @@ extend-ignore-identifiers-re = [
 ]
 
 [default.extend-words]
+# `suh` / `svh` — the ExLlamaV3 (EXL3) per-linear sign-and-scale vectors
+# applied around the Hadamard rotation (`W = diag(suh) H W_inner H diag(svh)`);
+# real checkpoint tensor names, not a typo of `such`.
+suh = "suh"
+svh = "svh"
 # `RETUNED` — past tense of "retune", used in the MODEL.toml sampling-default
 # changelogs (`presence_penalty RETUNED 1.5 -> 1.0`). A real word; the checker
 # reads it as a misspelling of `RETURNED`, which it is not.
@@ -147,6 +152,9 @@ ue4m3 = "ue4m3"
 extend-exclude = [
     "test_data/",
     "vendor/",
+    # ExLlamaV3 device code kept near-verbatim (MIT, see its NOTICE.md); upstream
+    # identifiers such as `twords` (trellis words per tile) are not ours to rename.
+    "exl3_vendor/",
     "target/",
     "book/output/",
     "tests/all_models_results*/",

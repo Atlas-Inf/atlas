@@ -60,7 +60,11 @@ impl Qwen3AttentionLayer {
             ..
         } = *c;
 
-        if n == 3
+        if n <= 2
+            && let Some(ref e) = self.exl3_attn
+        {
+            self.ms_qkv_exl3(c, e)?;
+        } else if n == 3
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
@@ -210,6 +214,73 @@ impl Qwen3AttentionLayer {
 
     fn q_lora_active(&self) -> bool {
         self.lora.as_ref().and_then(|lw| lw.q.as_ref()).is_some()
+    }
+
+    /// Batched native-EXL3 q/k/v for n <= 2: ONE int8 sq GEMV pass per
+    /// projection writes all `n` rows straight into the per-sequence
+    /// `[q | k | v]` rows of `qkv_buf`, which are `per_seq_qkv` bytes apart
+    /// (same layout contract as [`Self::ms_qkv_batchm_bf16`]). The gated per-seq Q deinterleave runs
+    /// inline here (the projection wrote RAW interleaved `[Q|gate]`); the
+    /// q-LoRA case is left to `ms_qkv_deinterleave_q`.
+    fn ms_qkv_exl3(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        e: &super::super::super::exl3_decode::Exl3AttnDecode,
+    ) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            nq,
+            nkv,
+            hd,
+            bf16,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+
+        debug_assert_eq!(per_seq_qkv % bf16, 0);
+        // Every projection's rows sit `per_seq_qkv` bytes apart, whatever its width.
+        let row_stride = per_seq_qkv / bf16;
+        let kv_bytes = (nkv * hd) as usize * bf16;
+
+        e.q.forward_bf16(fwd.gpu, normed, n as u32, qkv_buf, row_stride, stream)?;
+        e.k.forward_bf16(
+            fwd.gpu,
+            normed,
+            n as u32,
+            qkv_buf.offset(q_proj_bytes),
+            row_stride,
+            stream,
+        )?;
+        e.v.forward_bf16(
+            fwd.gpu,
+            normed,
+            n as u32,
+            qkv_buf.offset(q_proj_bytes + kv_bytes),
+            row_stride,
+            stream,
+        )?;
+
+        if self.gated && !self.q_lora_active() {
+            for i in 0..n {
+                ops::deinterleave_qg(
+                    fwd.gpu,
+                    self.deinterleave_qg_k,
+                    qkv_buf.offset(i * per_seq_qkv),
+                    1,
+                    nq,
+                    hd,
+                    q_proj_dim,
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Deferred Q deinterleave over the per-seq `qkv_buf` Q segments. Runs ONLY

@@ -4,6 +4,7 @@
 //! budget.
 
 mod deepseek_v4;
+mod exl3;
 mod gemma4;
 mod laguna;
 mod longcat;
@@ -16,6 +17,7 @@ mod step3p7;
 mod vision;
 
 pub(crate) use deepseek_v4::parse_deepseek_v4;
+pub use exl3::Exl3QuantConfig;
 pub(crate) use gemma4::parse_gemma4_params;
 pub(crate) use laguna::parse_laguna;
 pub(crate) use longcat::parse_longcat_ngram;

@@ -68,6 +68,19 @@ pub(crate) fn resolve_topology(
     config.ep_rank = ep_rank;
     config.ep_world_size = ep_size;
     if tp_size > 1 {
+        // EXL3 packs each linear into 16x16 trellis tiles laid out
+        // [in/16, out/16, ...]; a tile is atomic, so the tensor cannot be
+        // row-sliced per rank. Refuse before any loader/TP-capability check.
+        if config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|qc| qc.is_exl3())
+        {
+            anyhow::bail!(
+                "EXL3 checkpoints are TP=1 only (packed 16x16 trellis tiles cannot be \
+                 row-sliced); got --tp-size {tp_size}"
+            );
+        }
         let loader = spark_model::factory::loader_for_config(config)?;
         if !loader.supports_tp() {
             anyhow::bail!(
