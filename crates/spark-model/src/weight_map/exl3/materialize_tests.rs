@@ -41,22 +41,28 @@ fn dense_stems_drops_ngram_embedding() {
 }
 
 #[test]
-fn keeps_packed_with_gdn_and_lm_head_only_under_native() {
-    let gdn = [
+fn keeps_packed_with_gdn_attn_lm_head_only_under_native() {
+    let keep = [
         "model.language_model.layers.0.linear_attn.in_proj_qkv",
         "model.language_model.layers.35.linear_attn.in_proj_z",
         "model.language_model.layers.7.linear_attn.out_proj",
+        "model.language_model.layers.3.self_attn.q_proj",
+        "model.language_model.layers.3.self_attn.k_proj",
+        "model.language_model.layers.3.self_attn.v_proj",
+        "model.language_model.layers.3.self_attn.o_proj",
         "lm_head",
     ];
-    for stem in gdn {
+    for stem in keep {
         assert!(keeps_packed_with(stem, true), "{stem}");
         assert!(!keeps_packed_with(stem, false), "{stem}");
     }
-    // Attention and expert stems never keep their packing.
+    // The QSA indexer's stems end in `...self_attn.indexer.<name>_proj` and are
+    // consumed by no decode overlay — they must NOT keep their packing.
     assert!(!keeps_packed_with(
-        "model.language_model.layers.3.self_attn.q_proj",
+        "model.language_model.layers.3.self_attn.indexer.index_qk_proj",
         true
     ));
+    // Expert stems never keep their packing.
     assert!(!keeps_packed_with(
         "model.language_model.layers.3.mlp.experts.7.gate_proj",
         true
