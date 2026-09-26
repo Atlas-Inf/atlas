@@ -109,8 +109,14 @@ impl MoeLayer {
             self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
         }
 
-        // Transpose shared expert weights (tiny: ~5 MB per layer).
-        if !self.weights.shared_expert.gate_proj.is_null() && shared_inter > 0 {
+        // Transpose shared expert weights (tiny: ~5 MB per layer). #74:
+        // ATLAS_MOE_T_SHARED=0 keeps the untransposed originals so
+        // `run_shared_expert_prefill` stays on `w4a16_gemm` (bf16-MMA)
+        // instead of the e4m3-MMA `w4a16_gemm_t`.
+        if !self.weights.shared_expert.gate_proj.is_null()
+            && shared_inter > 0
+            && shared_transpose_enabled()
+        {
             self.shared_gate_t = Some(self.weights.shared_expert.gate_proj.transpose_for_gemm(
                 gpu,
                 shared_inter,
@@ -246,8 +252,13 @@ impl MoeLayer {
         let up_t = self.transpose_experts_gpu(gpu, &up_src, inter, h, routed_gs)?;
         self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
         self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
-        // Shared expert (tiny, do unconditionally — fits regardless).
-        if !self.weights.shared_expert.gate_proj.is_null() && shared_inter > 0 {
+        // Shared expert (tiny). #74: ATLAS_MOE_T_SHARED=0 skips this, which
+        // also keeps the originals alive (Phase B/D frees below are gated on
+        // the _t copy existing) so prefill stays on `w4a16_gemm` (bf16-MMA).
+        if !self.weights.shared_expert.gate_proj.is_null()
+            && shared_inter > 0
+            && shared_transpose_enabled()
+        {
             self.shared_gate_t = Some(self.weights.shared_expert.gate_proj.transpose_for_gemm(
                 gpu,
                 shared_inter,
@@ -279,7 +290,13 @@ impl MoeLayer {
                     expert.up_proj.weight_scale = DevicePtr::NULL;
                 }
             }
-            if !self.weights.shared_expert.gate_proj.weight.is_null() && shared_inter > 0 {
+            // Shared originals are freed only when their _t replacement was
+            // actually built — ATLAS_MOE_T_SHARED=0 leaves shared_*_t None and
+            // the prefill shared-expert arm still reads the originals (#74).
+            if self.shared_gate_t.is_some()
+                && !self.weights.shared_expert.gate_proj.weight.is_null()
+                && shared_inter > 0
+            {
                 gpu.free(self.weights.shared_expert.gate_proj.weight)?;
                 gpu.free(self.weights.shared_expert.gate_proj.weight_scale)?;
                 self.weights.shared_expert.gate_proj.weight = DevicePtr::NULL;
@@ -306,7 +323,10 @@ impl MoeLayer {
             .collect();
         let down_t = self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_gs)?;
         self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
-        if !self.weights.shared_expert.down_proj.is_null() && shared_inter > 0 {
+        if !self.weights.shared_expert.down_proj.is_null()
+            && shared_inter > 0
+            && shared_transpose_enabled()
+        {
             self.shared_down_t = Some(self.weights.shared_expert.down_proj.transpose_for_gemm(
                 gpu,
                 h,
@@ -324,7 +344,10 @@ impl MoeLayer {
                     expert.down_proj.weight_scale = DevicePtr::NULL;
                 }
             }
-            if !self.weights.shared_expert.down_proj.weight.is_null() && shared_inter > 0 {
+            if self.shared_down_t.is_some()
+                && !self.weights.shared_expert.down_proj.weight.is_null()
+                && shared_inter > 0
+            {
                 gpu.free(self.weights.shared_expert.down_proj.weight)?;
                 gpu.free(self.weights.shared_expert.down_proj.weight_scale)?;
                 self.weights.shared_expert.down_proj.weight = DevicePtr::NULL;
@@ -420,5 +443,31 @@ impl MoeLayer {
         gpu.free(dst_tbl.scale_ptrs)?;
         gpu.free(dst_tbl.scale2_vals)?;
         Ok(out)
+    }
+}
+
+/// `ATLAS_MOE_T_SHARED=0` (#74 A/B): unset/`1` builds the transposed shared-
+/// expert tables (today's behaviour); `0` leaves `shared_*_t` unset so
+/// `run_shared_expert_prefill` stays on the untransposed `w4a16_gemm`
+/// (bf16-MMA) arm instead of the e4m3-MMA `w4a16_gemm_t`. The UNIFIED-tier
+/// Phase B/D frees are keyed on the `_t` copy existing, so the originals
+/// survive when this returns false. Read once at transpose time.
+pub(super) fn shared_transpose_enabled() -> bool {
+    std::env::var("ATLAS_MOE_T_SHARED").ok().as_deref() != Some("0")
+}
+
+#[cfg(test)]
+mod shared_transpose_lever_tests {
+    use super::shared_transpose_enabled;
+
+    #[test]
+    fn shared_transpose_lever_parse() {
+        // SAFETY: test-only env mutation, single test thread scope.
+        unsafe { std::env::set_var("ATLAS_MOE_T_SHARED", "0") };
+        assert!(!shared_transpose_enabled());
+        unsafe { std::env::set_var("ATLAS_MOE_T_SHARED", "1") };
+        assert!(shared_transpose_enabled());
+        unsafe { std::env::remove_var("ATLAS_MOE_T_SHARED") };
+        assert!(shared_transpose_enabled());
     }
 }

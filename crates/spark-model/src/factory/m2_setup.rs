@@ -47,6 +47,11 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     // so decode stays on the warp-reduction kernels, full and gate_up likewise,
     // and unified -- which frees the originals and moves decode onto the _t
     // kernels -- is the last resort, taken only when nothing else fits.
+    if std::env::var("ATLAS_MOE_T_SHARED").ok().as_deref() == Some("0") {
+        // #74 A/B: keeps shared_*_t unset inside the transpose pass, so the
+        // prefill shared expert stays on `w4a16_gemm` (bf16-MMA).
+        tracing::info!("MoE transpose: shared expert kept untransposed (ATLAS_MOE_T_SHARED=0)");
+    }
     let hybrid_layout = true;
     let local_experts: usize = (0..config.num_experts)
         .filter(|e| config.is_local_expert(*e))
