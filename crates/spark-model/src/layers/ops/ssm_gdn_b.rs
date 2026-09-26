@@ -294,9 +294,10 @@ pub fn gdn_decode_wy4(
 /// `state_is_table` (the wy4 idiom): when true, `h_state` and
 /// `h_state_inter_base` are device pointer tables of `batch_size` per-sequence
 /// bases — intermediates keep `inter_stride_floats` between Hi_t within a
-/// sequence's slot. The K=17 `gated_delta_rule_wy17` kernels predate the flag
-/// and declare one parameter fewer; the extra params entry is past the
-/// kernel's declared arity, so `cuLaunchKernel` never dereferences it.
+/// sequence's slot. The K=17 `gated_delta_rule_wy17` kernels declare the flag
+/// too (matching this params list contractually) but have only the contiguous
+/// single-sequence form — `state_is_table != 0` traps. wy17 launches here
+/// always pass `false` (its dispatch arm is per-sequence).
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_decode_wyn(
     gpu: &dyn GpuBackend,

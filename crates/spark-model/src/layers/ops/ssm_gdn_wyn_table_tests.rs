@@ -14,7 +14,7 @@
 //! GPU test: `#[ignore]` per repo convention. Run with
 //! ```text
 //! cargo test -p spark-model --release --features cuda \
-//!   gdn_wy8_table_form -- --ignored --nocapture
+//!   gdn_wy_table_form -- --ignored --nocapture
 //! ```
 
 use half::bf16;
@@ -219,16 +219,17 @@ fn check_wyn_table_form(n: usize, k: usize) {
     eprintln!("n={n} k={k}: h_state + {ni} intermediates + output all BYTE-IDENTICAL");
 }
 
-/// wy8 table form — the DFlash2 γ=8 width.
+/// Table form over the full instantiated grid: K ∈ {5, 8, 12, 16} (wyN
+/// covers chain-verify 5..16; 5/12/16 are off the previously-audited K≤8
+/// band) × n ∈ {1, 3}. The n=1 cell is the explicit assertion that the
+/// pointer-table addressing collapses to the contiguous form — same input,
+/// byte-identical output.
 #[test]
 #[ignore]
-fn gdn_wy8_table_form_byte_identical() {
-    check_wyn_table_form(3, 8);
-}
-
-/// wy12 table form — the adaptive-γ γ=12 width (job 260's code/JSON winner).
-#[test]
-#[ignore]
-fn gdn_wy12_table_form_byte_identical() {
-    check_wyn_table_form(3, 12);
+fn gdn_wy_table_form_byte_identical_grid() {
+    for k in [5usize, 8, 12, 16] {
+        for n in [1usize, 3] {
+            check_wyn_table_form(n, k);
+        }
+    }
 }
