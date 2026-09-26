@@ -767,9 +767,19 @@ pub trait Model: Send + Sync {
         seqs: &mut [&mut SequenceState],
         stream: u64,
         out_conf: Option<&mut Vec<Vec<f32>>>,
+        // Per-sequence pos+1 grammar bitmasks for the drafter's draft-0
+        // mask (#102); None = unconstrained on every sequence.
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         let _ = (
-            tokens, positions, stash_idx, num_drafts, seqs, stream, out_conf,
+            tokens,
+            positions,
+            stash_idx,
+            num_drafts,
+            seqs,
+            stream,
+            out_conf,
+            grammar_bitmasks,
         );
         Ok(None)
     }

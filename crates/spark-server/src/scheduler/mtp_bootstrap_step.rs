@@ -331,6 +331,12 @@ pub(super) fn step_mtp_bootstrap_batched(
                     .map(|&s| refs[proposing[s]].seq.seq_len)
                     .collect();
                 let stash_idx: Vec<usize> = group.to_vec();
+                // Resolve through `proposing` (the group's propose index),
+                // then mask per the batched slot order.
+                let grammar_masks: Vec<Option<Vec<i32>>> = group
+                    .iter()
+                    .map(|&s| crate::scheduler::spec_step::mtp_grammar_mask_for(refs[proposing[s]]))
+                    .collect();
                 let result = {
                     let mut seq_refs: Vec<&mut SequenceState> = Vec::with_capacity(group.len());
                     let mut it = refs.iter_mut();
@@ -350,6 +356,7 @@ pub(super) fn step_mtp_bootstrap_batched(
                         &mut seq_refs,
                         0,
                         want_conf.then_some(&mut conf),
+                        Some(&grammar_masks),
                     )
                 };
                 match result {

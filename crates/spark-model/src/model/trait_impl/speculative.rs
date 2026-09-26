@@ -523,6 +523,7 @@ impl TransformerModel {
         num_drafts: usize,
         seqs: &mut [&mut SequenceState],
         out_conf: Option<&mut Vec<Vec<f32>>>,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         let proposer = match &self.proposer {
             Some(p) => p.as_ref(),
@@ -642,6 +643,7 @@ impl TransformerModel {
             &ctx,
             stream,
             out_conf,
+            grammar_bitmasks,
         )
     }
 

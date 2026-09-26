@@ -290,6 +290,8 @@ pub fn step_verify_dflash(
                     &mut one_seq,
                     0,
                     None,
+                    // B1 arm is entered only when this seq's mask is None.
+                    None,
                 ) {
                     Ok(Some(mut all)) if all.len() == 1 => Ok(all.remove(0)),
                     Ok(Some(all)) => Err(anyhow::anyhow!(

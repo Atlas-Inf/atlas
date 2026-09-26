@@ -35,6 +35,7 @@ impl BlockDiffusionDraftHead {
         parity_hidden_oracle: Option<Vec<u8>>,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         let n = last_tokens.len();
 
@@ -269,6 +270,42 @@ impl BlockDiffusionDraftHead {
                 }
             }
             self.run_batched_tail_base(batch_rows, ctx, stream)?;
+            // #102: grammar-mask each masked seq's logits rows 0/1 (anchor +
+            // draft 0 — both predict pos+1). The pre-pass writes -inf in
+            // place; the selector/Markov arms below stay unchanged.
+            if self.kernels.grammar_bitmask.0 != 0
+                && let Some(masks) = grammar_bitmasks
+                && masks.iter().flatten().next().is_some()
+            {
+                let words = crate::layers::ops::grammar_bitmask_words(self.vocab_size as u32);
+                let seq_logits_bytes = self.gamma * self.vocab_size * 2;
+                for (sequence, mask) in masks.iter().take(n).enumerate() {
+                    let Some(mask) = mask else { continue };
+                    if mask.len() < words {
+                        tracing::warn!(
+                            "DFlash grammar bitmask short at seq {sequence} ({} < {words} words): skipping mask",
+                            mask.len()
+                        );
+                        continue;
+                    }
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(mask.as_ptr() as *const u8, words * 4)
+                    };
+                    let mask_dev = self.batch_grammar_bitmask.offset(sequence * words * 4);
+                    ctx.gpu.copy_h2d(bytes, mask_dev)?;
+                    for row in 0..2usize.min(self.gamma) {
+                        crate::layers::ops::apply_grammar_bitmask(
+                            ctx.gpu,
+                            self.kernels.grammar_bitmask,
+                            self.batch_logits
+                                .offset(sequence * seq_logits_bytes + row * self.vocab_size * 2),
+                            mask_dev,
+                            self.vocab_size as u32,
+                            stream,
+                        )?;
+                    }
+                }
+            }
             if self.candidate_selector.is_some() {
                 self.run_batched_dflash2_tail(batch_size, last_tokens, ctx, stream)?;
             } else {
@@ -402,6 +439,7 @@ impl BlockDiffusionDraftHead {
             states,
             expected_owners,
             ctx,
+            grammar_bitmasks,
         )
         .map(Some)
     }

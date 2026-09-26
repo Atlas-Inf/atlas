@@ -424,6 +424,10 @@ pub trait DraftProposer: Send + Sync {
         _ctx: &ForwardContext,
         _stream: u64,
         _out_conf: Option<&mut Vec<Vec<f32>>>,
+        // Per-sequence pos+1 grammar bitmasks (#102); `None`/all-None =
+        // unconstrained. Proposers that don't mask draft-0 may ignore it —
+        // the scheduler's boundary truncation still guards the tail.
+        _grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         Ok(None)
     }
