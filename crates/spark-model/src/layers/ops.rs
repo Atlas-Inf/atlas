@@ -13,6 +13,8 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/derived_reserve.rs"]
+mod derived_reserve;
 #[path = "ops/derived_weights.rs"]
 mod derived_weights;
 #[path = "ops/dispatch_config.rs"]
@@ -185,6 +187,7 @@ pub mod token_overlay;
 mod wide_prefill;
 
 pub use activations::*;
+pub use derived_reserve::{lazy_bf16_copy_bytes, lazy_bf16_reserve, lazy_bf16_reserve_enabled};
 pub use derived_weights::{Derivation, DerivedWeights};
 pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;
