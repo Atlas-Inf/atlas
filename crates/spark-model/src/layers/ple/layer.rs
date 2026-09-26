@@ -61,6 +61,8 @@ pub struct PleLayer {
     /// Device VA of the table's per-slot f32 dequant scale array, `None` for a
     /// BF16 table. Its presence is what selects the FP8 gather.
     scale_va: Option<u64>,
+    /// Packed EXL3 n-gram rows. Host-dequanted into `emb` before the GEMM.
+    trellis: Option<ngram_trellis::NgramTrellis>,
     gemm_k: KernelHandle,
     gate_k: KernelHandle,
     conv_k: KernelHandle,
@@ -107,6 +109,7 @@ impl PleLayer {
         table: NgramTable,
         max_tokens: usize,
         scratch_tokens: usize,
+        trellis: Option<ngram_trellis::NgramTrellis>,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         dims.validate()?;
@@ -129,7 +132,11 @@ impl PleLayer {
         if let NgramTable::Cached(cache) = &table {
             let stride = cache.row_stride();
             let scaled = cache.scale_dev_va()?.is_some();
-            gather_matches_element_size(stride, head_dim, scaled)?;
+            if let Some(t) = trellis.as_ref() {
+                ngram_trellis::check_packed_stride(stride, t, scaled)?;
+            } else {
+                gather_matches_element_size(stride, head_dim, scaled)?;
+            }
         }
         Ok(Self {
             dims,
@@ -154,6 +161,7 @@ impl PleLayer {
                 NgramTable::Cached(c) => c.scale_dev_va()?,
                 _ => None,
             },
+            trellis,
             embed_fp8_k: gpu.kernel("embed_from_argmax", "batched_embed_fp8")?,
             table: std::sync::Arc::new(std::sync::Mutex::new(table)),
             embed_k: gpu.kernel("embed_from_argmax", "batched_embed")?,
@@ -485,5 +493,7 @@ pub(crate) mod warm;
 
 #[path = "gather_guard.rs"]
 mod gather_guard;
+#[path = "ngram_trellis.rs"]
+pub(crate) mod ngram_trellis;
 #[cfg(feature = "cuda")]
 use gather_guard::gather_matches_element_size;

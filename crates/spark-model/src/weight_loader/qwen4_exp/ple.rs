@@ -8,9 +8,9 @@
 //! {lp}.ple.value_proj.weight                     [H,    ple_embed_dim]
 //! {lp}.ple.norm_key/norm_query/norm_conv.weight  [hc*H]
 //! {lp}.ple.conv1d.weight                         [hc*H, 1, K]
-//! {lp}.ple.ple_embedding.layer_multipliers       [ngram_size]   I64
-//! {lp}.ple.ple_embedding.ngram_heads_offsets     [ngram_heads]  I64
-//! {lp}.ple.ple_embedding.ngram_heads_vocab_sizes [ngram_heads]  I64
+//! {lp}.ple.ple_embedding.ngram_embedding.layer_multipliers       [ngram_size]   I64
+//! {lp}.ple.ple_embedding.ngram_embedding.head_offsets     [ngram_heads]  I64
+//! {lp}.ple.ple_embedding.ngram_embedding.head_vocab_sizes [ngram_heads]  I64
 //! {lp}.ple.ple_embedding.ngram_embedding.shard_{0..127}.weight  [R, 160] BF16
 //! ```
 //!
@@ -125,6 +125,32 @@ fn bf16_scalar(store: &WeightStore, name: &str, gpu: &dyn GpuBackend) -> Result<
     Ok(v)
 }
 
+/// A resident FP16 vector, read back as raw fp16 bits.
+///
+/// EXL3 `head_bias` stays FP16 (`keeps_raw_f16`) because the n-gram dequant
+/// adds it in the same units as `decode_mul1` * scale.
+#[cfg(feature = "cuda")]
+fn fp16_host(store: &WeightStore, name: &str, n: usize, gpu: &dyn GpuBackend) -> Result<Vec<u16>> {
+    let t = store.get(name).with_context(|| format!("PLE: {name}"))?;
+    anyhow::ensure!(
+        t.num_elements() == n,
+        "PLE: {name} has {} elements, expected {n}",
+        t.num_elements()
+    );
+    anyhow::ensure!(
+        matches!(t.dtype, spark_runtime::weights::WeightDtype::FP16),
+        "PLE: {name} is {:?}, expected FP16 (raw head_bias)",
+        t.dtype
+    );
+    let mut raw = vec![0u8; n * 2];
+    gpu.copy_d2h(t.ptr, &mut raw)
+        .with_context(|| format!("PLE: reading {name} back to host"))?;
+    Ok(raw
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect())
+}
+
 /// Build the PLE layer for `layer_idx`, or `None` if this model has none.
 #[cfg(feature = "cuda")]
 pub(super) fn load(
@@ -150,15 +176,19 @@ pub(super) fn load(
     let dims = PleIdDims {
         ngram_size: config.emb_neighbor_num,
         heads_per_ngram: config.emb_split_num,
-        multipliers: i64_host(store, &format!("{lp}.ple_embedding.layer_multipliers"), gpu)?,
+        multipliers: i64_host(
+            store,
+            &format!("{lp}.ple_embedding.ngram_embedding.layer_multipliers"),
+            gpu,
+        )?,
         head_vocab_sizes: i64_host(
             store,
-            &format!("{lp}.ple_embedding.ngram_heads_vocab_sizes"),
+            &format!("{lp}.ple_embedding.ngram_embedding.head_vocab_sizes"),
             gpu,
         )?,
         head_offsets: i64_host(
             store,
-            &format!("{lp}.ple_embedding.ngram_heads_offsets"),
+            &format!("{lp}.ple_embedding.ngram_embedding.head_offsets"),
             gpu,
         )?,
         eos_token_id: eos,
@@ -177,9 +207,16 @@ pub(super) fn load(
     let mut head_dim = 0usize;
     let mut dtype = None;
     for i in 0.. {
-        let name = format!("{lp}.ple_embedding.ngram_embedding.shard_{i}.weight");
-        let Some(d) = store.deferred(&name) else {
-            break;
+        // Two naming families: RadixArk NVFP4 ships `shard_{i}.weight`,
+        // EXL3 ships `shard_{i}.trellis` (I16). Probe `.weight` first so the
+        // NVFP4 path is byte-for-byte unchanged; fall back to `.trellis`.
+        let base = format!("{lp}.ple_embedding.ngram_embedding.shard_{i}");
+        let d = match store
+            .deferred(&format!("{base}.weight"))
+            .or_else(|| store.deferred(&format!("{base}.trellis")))
+        {
+            Some(d) => d,
+            None => break,
         };
         anyhow::ensure!(
             d.shape.len() == 2,
@@ -232,9 +269,13 @@ pub(super) fn load(
     let elem = match dtype {
         spark_runtime::weights::WeightDtype::BF16 => 2,
         spark_runtime::weights::WeightDtype::FP8E4M3 => 1,
+        // EXL3 trellis shards are packed I16 (2 bytes/element). The row
+        // cache copies those bytes; host dequant expands each row to 160
+        // BF16 before the GEMM. See `layers/ple/ngram_trellis.rs`.
+        spark_runtime::weights::WeightDtype::Int16 => 2,
         other => anyhow::bail!(
-            "PLE: n-gram table is {other:?}; the row cache gathers BF16 or \
-             F8_E4M3 rows (`batched_embed` / `batched_embed_fp8`)"
+            "PLE: n-gram table is {other:?}; the row cache gathers BF16, \
+             F8_E4M3, or I16 rows (`batched_embed` / `batched_embed_fp8`)"
         ),
     };
     // The gather pins at most one span's rows at once, so the arena sizes
@@ -293,9 +334,36 @@ pub(super) fn load(
         (config.ple_conv_kernel_size - 1) * dilation,
     );
 
+    let (embed_dim, trellis) = if matches!(dtype, spark_runtime::weights::WeightDtype::Int16) {
+        let k = crate::layers::ple::ngram_trellis::k_from_packed_words(head_dim).with_context(|| {
+            format!(
+                "PLE: I16 n-gram row width {head_dim} is not 1+10*K (exllamav3 ngram_codec.words_per_row); cannot dequant the trellis"
+            )
+        })?;
+        let decoded = crate::layers::ple::ngram_trellis::ROW_DIM;
+        let bias_name = format!("{lp}.ple_embedding.ngram_embedding.head_bias");
+        let bias = fp16_host(store, &bias_name, heads * decoded, gpu)?;
+        tracing::info!(
+            "PLE EXL3 ngram trellis: {head_dim} i16 words/row, K={k}, decode to {decoded}-dim mul1 * scale + head_bias before the GEMM (geometry uses {decoded}, not {head_dim})"
+        );
+        (
+            decoded,
+            Some(crate::layers::ple::ngram_trellis::NgramTrellis {
+                k,
+                packed_words: head_dim,
+                heads,
+                bias_fp16: bias,
+                head_offsets: dims.head_offsets.clone(),
+                head_vocab_sizes: dims.head_vocab_sizes.clone(),
+            }),
+        )
+    } else {
+        (head_dim, None)
+    };
+
     PleLayer::new(
         dims,
-        head_dim,
+        embed_dim,
         h,
         hc,
         config.ple_conv_kernel_size,
@@ -305,6 +373,7 @@ pub(super) fn load(
         NgramTable::Cached(Box::new(cache)),
         max_tokens,
         span,
+        trellis,
         gpu,
     )
     .map(Some)
