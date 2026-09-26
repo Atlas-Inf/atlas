@@ -2,6 +2,7 @@
 
 //! Setters + transposes + transpose_for_prefill_unified_inner.
 
+use super::inplace_transpose::TransposeScratch;
 use super::*;
 
 impl MoeLayer {
@@ -193,6 +194,23 @@ impl MoeLayer {
         let shared_inter = config.shared_expert_intermediate_size;
         let _num_experts = self.weights.experts.len();
 
+        // ── Layout state is DERIVED, never declared ──────────────────────
+        // These two flags used to be read independently from env at
+        // construction, so operator intent and the tier that actually ran
+        // could disagree. That was not cosmetic: with both
+        // ATLAS_UNIFIED_MOE_LAYOUT=1 and ATLAS_HYBRID_MOE_LAYOUT=1 on a box
+        // where hybrid does not fit, the orchestrator ran UNIFIED (freeing the
+        // [N,K/2] originals) while `use_t_layout_for_decode()` still returned
+        // false -- its `!self.hybrid_layout` term read the env flag -- so
+        // decode fell through to the originals arm and dereferenced freed
+        // device memory.
+        //
+        // Setting them here, from the branch that is about to execute, makes
+        // that disagreement structurally impossible and removes the need for
+        // the operator to know either flag exists.
+        self.unified_layout = !keep_originals;
+        self.hybrid_layout = keep_originals;
+
         // ── Phase A: transpose gate+up routed experts ──
         // ARM-2 Phase-K Family C: native-MXFP4 routed experts are per-32 E8M0.
         let routed_gs =
@@ -225,8 +243,24 @@ impl MoeLayer {
                 }
             })
             .collect();
-        let gate_t = self.transpose_experts_gpu(gpu, &gate_src, inter, h, routed_gs)?;
-        let up_t = self.transpose_experts_gpu(gpu, &up_src, inter, h, routed_gs)?;
+        let mut scratch = TransposeScratch::new();
+        let (gate_t, up_t) = if keep_originals {
+            (
+                self.transpose_experts_gpu(gpu, &gate_src, inter, h, routed_gs)?,
+                self.transpose_experts_gpu(gpu, &up_src, inter, h, routed_gs)?,
+            )
+        } else {
+            // Unified: transpose into scratch, copy back over the originals —
+            // no per-layer slab allocs and no ~3K small frees per call.
+            (
+                self.transpose_experts_inplace(
+                    gpu, &gate_src, inter, h, routed_gs, &mut scratch,
+                )?,
+                self.transpose_experts_inplace(
+                    gpu, &up_src, inter, h, routed_gs, &mut scratch,
+                )?,
+            )
+        };
         self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
         self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
         // Shared expert (tiny, do unconditionally — fits regardless).
@@ -249,15 +283,13 @@ impl MoeLayer {
             // contain stale addresses, but the unified dispatch never reads
             // them (gated by `use_t_layout_for_decode()`).
             for expert in &mut self.weights.experts {
+                // The original allocations now hold the transposed data;
+                // NULL the fields so no untransposed path can read them.
                 if !expert.gate_proj.weight.is_null() {
-                    gpu.free(expert.gate_proj.weight)?;
-                    gpu.free(expert.gate_proj.weight_scale)?;
                     expert.gate_proj.weight = DevicePtr::NULL;
                     expert.gate_proj.weight_scale = DevicePtr::NULL;
                 }
                 if !expert.up_proj.weight.is_null() {
-                    gpu.free(expert.up_proj.weight)?;
-                    gpu.free(expert.up_proj.weight_scale)?;
                     expert.up_proj.weight = DevicePtr::NULL;
                     expert.up_proj.weight_scale = DevicePtr::NULL;
                 }
@@ -287,7 +319,11 @@ impl MoeLayer {
                 }
             })
             .collect();
-        let down_t = self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_gs)?;
+        let down_t = if keep_originals {
+            self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_gs)?
+        } else {
+            self.transpose_experts_inplace(gpu, &down_src, h, inter, routed_gs, &mut scratch)?
+        };
         self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
         if !self.weights.shared_expert.down_proj.is_null() && shared_inter > 0 {
             self.shared_down_t = Some(self.weights.shared_expert.down_proj.transpose_for_gemm(
@@ -301,8 +337,6 @@ impl MoeLayer {
             // ── Phase D: free down untransposed ──
             for expert in &mut self.weights.experts {
                 if !expert.down_proj.weight.is_null() {
-                    gpu.free(expert.down_proj.weight)?;
-                    gpu.free(expert.down_proj.weight_scale)?;
                     expert.down_proj.weight = DevicePtr::NULL;
                     expert.down_proj.weight_scale = DevicePtr::NULL;
                 }
@@ -314,6 +348,7 @@ impl MoeLayer {
                 self.weights.shared_expert.down_proj.weight_scale = DevicePtr::NULL;
             }
         }
+        scratch.release(gpu)?;
 
         Ok(())
     }

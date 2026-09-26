@@ -483,6 +483,7 @@ mod forward_prefill_routed;
 mod forward_prefill_router;
 mod forward_token_major;
 mod helpers_a;
+mod inplace_transpose;
 mod helpers_b;
 mod helpers_c;
 mod init;
