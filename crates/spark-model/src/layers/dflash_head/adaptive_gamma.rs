@@ -213,7 +213,7 @@ mod tests {
         // the 8th being the anchor bonus presented as a position-γ draft.
         assert_eq!(draft_cap_for(11, 8), 7);
         // Degenerate edges keep at least one draft.
-        assert_eq!(draft_cap_for(0, 8), 0);
+        assert_eq!(draft_cap_for(0, 8), 1);
         assert_eq!(draft_cap_for(7, 0), 1);
     }
 
