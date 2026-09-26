@@ -72,9 +72,8 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     // free per layer, roughly one layer of transient), so it fits wherever the
     // persistent tiers do not, and it is reached only after they are ruled out.
     let unified_transient = 4 * (local_experts * 2 * per_expert_one);
-    let unified_layout = !hybrid_fits
-        && free < cost_gate_up + safety
-        && free >= unified_transient + safety;
+    let unified_layout =
+        !hybrid_fits && free < cost_gate_up + safety && free >= unified_transient + safety;
     // The unified+hybrid use-after-free that used to be reachable here is
     // gone with the flags. Layout state is now derived inside
     // `transpose_for_prefill_unified_inner` from the branch that actually

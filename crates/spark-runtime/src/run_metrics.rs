@@ -49,12 +49,13 @@ pub struct RunMetrics {
     /// `baseline - free_now`, excluding co-tenants automatically. `0` =
     /// unset (the mock backend in tests) and callers fall back.
     pub baseline_free_bytes: AtomicUsize,
-    /// `(module, func, loaded, dispatch site)` for every kernel lookup this run
-    /// made. The site is the `Location` of the `.kernel(…)` / `try_kernel(…)`
-    /// call, carried in through `#[track_caller]`: a bare `module::func` list
-    /// is not actionable when the same module is looked up from a dozen
-    /// constructors and the fix is always "go to that line".
-    pub kernel_audit: Mutex<Vec<(String, String, bool, &'static std::panic::Location<'static>)>>,
+    /// `(module, func, loaded, dispatch site)` for every DISTINCT kernel lookup
+    /// this run made — `record` dedupes, so a non-eager hot-path lookup cannot
+    /// grow it (issue #73). The site is the `Location` of the `.kernel(…)` /
+    /// `try_kernel(…)` call, carried in through `#[track_caller]`: a bare
+    /// `module::func` list is not actionable when the same module is looked up
+    /// from a dozen constructors and the fix is always "go to that line".
+    pub kernel_audit: Mutex<crate::kernel_audit::KernelAuditLog>,
 
     // ── Per-run baselines for the counters above ──
     //

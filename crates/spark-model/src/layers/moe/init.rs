@@ -455,6 +455,16 @@ impl MoeLayer {
                 "moe_w4a16",
                 "moe_w4a16_down_t_k64_fp4",
             ),
+            // Handle 0 unless this model ships `moe_persist_marker.cu`, i.e.
+            // unless its k64 prefill grid has actually been measured short.
+            // Deliberately NOT in the "moe_w4a16" module: that file is a symlink
+            // shared by seven targets, so a marker there would speak for six
+            // models nobody profiled. Gates ATLAS_MOE_PREFILL_PERSIST_TILES.
+            moe_k64_strides_m_tiles: super::super::try_kernel(
+                gpu,
+                "moe_persist_marker",
+                "moe_w4a16_k64_strides_m_tiles",
+            ),
             moe_permute_tokens_k: super::super::try_kernel(gpu, "moe", "moe_permute_tokens"),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,

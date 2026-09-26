@@ -1278,3 +1278,24 @@ fn qwen4_exp_does_not_declare_the_longcat_trio() {
     assert_eq!(cfg.ngram_dims().unwrap(), None, "no LongCat trio here");
     assert!(cfg.qwen4exp_ngram(0).unwrap().is_some());
 }
+
+/// `is_nvfp4_quant_algo`: the ModelOpt NVFP4 label family — `"NVFP4"` and
+/// per-layer `"*_NVFP4"` variants (Qwen3.6-35B-A3B / Nemotron-3.5-Lightning
+/// label their NVFP4 layers `W4A16_NVFP4`). FP8-family labels must stay
+/// false: an FP8 payload is a different dtype, not packed FP4.
+#[test]
+fn nvfp4_quant_algo_label_family() {
+    for algo in ["NVFP4", "nvfp4", "Nvfp4", "W4A16_NVFP4", "w4a16_nvfp4"] {
+        assert!(is_nvfp4_quant_algo(algo), "{algo} must classify NVFP4");
+    }
+    for algo in [
+        "FP8",
+        "FP8_PB_WO",
+        "FP8_BLOCK_SCALES",
+        "MIXED_PRECISION",
+        "",
+        "W8A8_NVFP5",
+    ] {
+        assert!(!is_nvfp4_quant_algo(algo), "{algo} must NOT classify NVFP4");
+    }
+}

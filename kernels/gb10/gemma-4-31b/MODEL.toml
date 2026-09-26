@@ -152,3 +152,10 @@ atlas_nvfp4_silu_mul_scaled = "NVFP4 SiLU epilogue; gated off with the family."
 atlas_nvfp4_silu_mul_quant = "NVFP4 SiLU epilogue (quantized); gated off with the family."
 atlas_nvfp4_scale_bf16 = "NVFP4 scale handler; gated off with the family."
 
+# `moe_persist_marker` ships only in qwen3.8-flash-next (whose k64 prefill
+# kernel was measured m-tile-strided); everywhere else the marker module is
+# absent by design and handle 0 keeps the full m-tile grid. The lookup is
+# issued unconditionally by MoeLayer::new (moe/init.rs), which every MoE
+# model_type this target serves constructs.
+[expected_absent.moe_persist_marker]
+moe_w4a16_k64_strides_m_tiles = "Capability marker issued by MoeLayer::new on every MoeLayer MoE model; only targets whose k64 prefill kernels were measured to stride m-tiles ship it (qwen3.8-flash-next). Absent here by design: handle 0 keeps the full m-tile grid."

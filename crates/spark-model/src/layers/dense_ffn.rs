@@ -371,30 +371,50 @@ impl DenseFfnLayer {
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_gemv_batch16: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
-            dp4a_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "quantize_act_int8_g16"),
-            dp4a_silu_quant_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "silu_mul_quant_int8_g16"),
-            dp4a_gemv_k: super::try_kernel(gpu, "w4a16_gemv_dp4a", "w4a16_gemv_dp4a"),
-            dp4a_quant_batch4_k: super::try_kernel(
+            dp4a_quant_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "quantize_act_int8_g16",
+            ),
+            dp4a_silu_quant_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "silu_mul_quant_int8_g16",
+            ),
+            dp4a_gemv_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a",
+            ),
+            dp4a_quant_batch4_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "quantize_act_int8_g16_batch4_d4",
             ),
-            dp4a_gemv_batch4_k: super::try_kernel(
+            dp4a_gemv_batch4_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_batch4_d4",
             ),
-            dp4a_dual_batch4_k: super::try_kernel(
+            dp4a_dual_batch4_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_dual_batch4_d4",
             ),
-            dp4a_gemv_batch4_dyn_k: super::try_kernel(
+            dp4a_gemv_batch4_dyn_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_batch4_d4_dyn",
             ),
-            dp4a_dual_batch4_dyn_k: super::try_kernel(
+            dp4a_dual_batch4_dyn_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_dual_batch4_d4_dyn",

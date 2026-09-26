@@ -266,6 +266,8 @@ fn qsa_matches_reference() {
 // reachable as `super::*`).
 #[path = "qsa_tests_prefill.rs"]
 mod prefill;
+#[path = "qsa_tests_prefill_b.rs"]
+mod prefill_b;
 
 // Device top-k contract (every gathered id is written by the launch).
 #[path = "qsa_tests_topk.rs"]

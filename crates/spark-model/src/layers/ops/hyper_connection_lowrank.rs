@@ -22,10 +22,34 @@ use spark_runtime::kernel_args::KernelLaunch;
 
 use crate::layers::qwen3_attention::HcLowRank;
 
+/// Above this many tokens the collapse goes to the GEMM formulation; at or
+/// below it, to the hand-rolled split kernels.
+///
+/// 8 covers every genuinely decode-shaped call -- T=1 decode, and T=2/3/4 MTP
+/// verify (`forward_k2`/`k3`, `forward_atomic_c4`) -- and nothing else. Those
+/// are the shapes the split path was written for: its premise is that
+/// `grid=[T]` means `grid=[1]` on one SM, which stops being true the moment T
+/// reaches the tens.
+///
+/// This WAS 64, and lowering it to 8 was measured as a 13% REGRESSION
+/// (2026-08-30, TTFT_GAP.md 6b). That measurement was real and its conclusion
+/// -- "the hand-rolled path beats the tensor-core GEMM at these shapes" -- was
+/// wrong. Two of `hc_pre_gemm`'s three projections were launching on THREE and
+/// ONE CTA of a 48-SM part (`gemm_raw` emits a 128x128 output tile, and N is
+/// 320 and 4), so lowering the gate moved short prefills onto two starved
+/// kernels. With those routed by machine-fill in `hc_gemm` the collapse is
+/// 9-60x faster on exactly those projections and the premise holds again.
+///
+/// A prefill is chunked (96 + tail here), so the TAIL chunk is what this gate
+/// decides: at 64 a 118-token prompt ran its 22-token tail on the split path
+/// for 27.7 ms of a 422 ms window.
+const HC_DECODE_MAX_T: u32 = 8;
+
 /// `ATLAS_QWEN4EXP_NO_HC_GEMM=1`: revert the large-T collapse to the fused
 /// FP32 kernel (deploy-time kill switch; the GEMM path rounds `normed` to
 /// BF16 before the projections).
-use super::hyper_connection_lowrank_gemm::{gemm_raw, hc_finish_block, hc_finish_x4};
+use super::hyper_connection_lowrank_gemm::{gemm_raw, hc_gemm};
+use super::hyper_connection_lowrank_split::hc_pre_split;
 
 fn hc_gemm_disabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -61,7 +85,31 @@ pub fn hc_pre_lowrank(
     // ~13 MB of weights per call (measured 2.0 ms; the whole token was
     // 96 x that). The fused kernel stays for prefill, where grid=[T]
     // already fills the machine and skips the global round trip.
-    if num_tokens <= 64 && !scratch.is_null() {
+    //
+    // THRESHOLD. This was `<= 64`, chosen for decode shapes — but a short
+    // PREFILL also has num_tokens <= 64, so a 60-token prompt took the
+    // decode path while a 65-token one took the tensor-core GEMM. That split
+    // is where the short-prefill cost lived: `hc_pre_down` + `hc_pre_finish`
+    // measured 143 ms, 31% of a 60-token prefill (nsys 2026-08-30), both
+    // running FP32 warp loops with a single dependent accumulator chain per
+    // lane — ~19x off the roofline for what is a 393 MFLOP GEMM.
+    //
+    // The split path's own premise says when it stops applying: it exists
+    // because "grid=[T] means grid=[1] at decode - one block, one SM". At
+    // T=60, grid=[60] already fills a 48-SM part, so the premise is false and
+    // the GEMM formulation — which the comment below notes was written
+    // precisely because "47% of prefill was this collapse running as FP32
+    // warp loops" — is the right one.
+    //
+    // 8 covers every genuinely decode-shaped call: T=1 decode, and T=2/3/4
+    // MTP verify (forward_k2/k3, forward_atomic_c4). Above that we are in
+    // prefill and want the GEMM.
+    //
+    // NOTE this makes short prefills numerically CONSISTENT with long ones
+    // rather than introducing a new regime: the GEMM path rounds `normed` to
+    // BF16, and every prefill over 64 tokens already took it. A 60- and a
+    // 65-token prompt previously ran different arithmetic.
+    if num_tokens <= HC_DECODE_MAX_T && !scratch.is_null() {
         return hc_pre_split(
             gpu,
             streams,
@@ -138,7 +186,7 @@ pub fn hc_head_lowrank(
     norm_eps: f32,
     stream: u64,
 ) -> Result<()> {
-    if num_tokens <= 64 && !scratch.is_null() {
+    if num_tokens <= HC_DECODE_MAX_T && !scratch.is_null() {
         return hc_pre_split(
             gpu,
             streams,
@@ -261,6 +309,10 @@ fn hc_pre_gemm(
     let up_pre = scratch.offset(l.up_pre);
     let low = scratch.offset(l.low);
     let inj_pre = scratch.offset(l.inj_pre);
+    // Still computed, and the region still sized for it, even though only the
+    // no-cuBLASLt arm reads it: shrinking `hc_lowrank_scratch` would shift every
+    // later buffer in the shared arena, which measured 6% SLOWER when tried for
+    // alignment slack (TTFT_GAP.md 6b). Layout stability beats 6.55 MB.
     let up_wt = scratch.offset(l.up_wt);
 
     let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage_bf16")?;
@@ -268,6 +320,9 @@ fn hc_pre_gemm(
     let k_mix = gpu.kernel("hyper_connection", "hc_pre_mix")?;
     let k_gemm = gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
     let k_tr = gpu.kernel("hyper_connection", "hc_transpose_bf16")?;
+    // Read once per call, not once per projection. On failure the machine-fill
+    // rule can never fire, so the path keeps exactly today's behaviour.
+    let sm_count = gpu.sm_count().unwrap_or(0);
     let inv_hc = 1.0f32 / hc_mult as f32;
 
     // `up_w` is stored `[rank, hc_dim]` — the layout the decode stage-3 kernel
@@ -278,14 +333,23 @@ fn hc_pre_gemm(
     // loads at 113 of 119.6 GB, against ~50 us per call here on a collapse
     // that measured ~45 ms. Once per call, not once per slab — `up_wt` does
     // not depend on `t0`.
-    KernelLaunch::new(gpu, k_tr)
-        .grid([(hc_dim as u32).div_ceil(32), rank.div_ceil(32), 1])
-        .block([32, 32, 1])
-        .arg_ptr(w.up_w)
-        .arg_ptr(up_wt)
-        .arg_u32(rank)
-        .arg_u32(hc_dim as u32)
-        .launch(stream)?;
+    // `up_w` is `[rank, hc_dim]`; `gemm_raw` is NT and wants `[hc_dim, rank]`,
+    // so it needs the staging transpose. cuBLASLt does not -- `op_a` selects the
+    // layout -- and the transpose was 9.0 ms of a 422 ms prefill window (97
+    // launches at ~93 us, grid 320x10 of 32-thread blocks). So decide the
+    // layout ONCE, up front, from whether cuBLASLt is usable at all; a per-GEMM
+    // `Result` is too late, because by then the transpose has been skipped.
+    let lt = spark_runtime::cublaslt::available();
+    if !lt {
+        KernelLaunch::new(gpu, k_tr)
+            .grid([(hc_dim as u32).div_ceil(32), rank.div_ceil(32), 1])
+            .block([32, 32, 1])
+            .arg_ptr(w.up_w)
+            .arg_ptr(up_wt)
+            .arg_u32(rank)
+            .arg_u32(hc_dim as u32)
+            .launch(stream)?;
+    }
 
     let mut t0 = 0u32;
     while t0 < num_tokens {
@@ -303,8 +367,8 @@ fn hc_pre_gemm(
             .arg_f32(norm_eps)
             .launch(stream)?;
 
-        // low_pre = normed x down_w^T   [ts, rank]
-        gemm_raw(
+        // low_pre = normed x down_w^T   [ts, rank]   (N=320: skinny, split-K)
+        hc_gemm(
             gpu,
             k_gemm,
             normed,
@@ -313,6 +377,7 @@ fn hc_pre_gemm(
             ts,
             rank,
             hc_dim as u32,
+            sm_count,
             stream,
         )?;
         let n_low = ts * rank;
@@ -324,21 +389,35 @@ fn hc_pre_gemm(
             .arg_f32(inv_hc)
             .launch(stream)?;
 
-        // up_pre = low x up_wt^T   [ts, hc_dim]
-        gemm_raw(
-            gpu,
-            k_gemm,
-            low,
-            up_wt,
-            up_pre,
-            ts,
-            hc_dim as u32,
-            rank,
-            stream,
-        )?;
-        if inject {
-            // inj_pre = normed x inject_w^T   [ts, hc]
+        // up_pre = low x up_w   [ts, hc_dim]. N=10240 is 80 CTAs, so the tile
+        // kernel's grid is not the problem here -- the staging transpose it
+        // would need is. Off the checkpoint layout when cuBLASLt is there.
+        if lt {
+            spark_runtime::cublaslt::bf16_gemm_act_weight_n(
+                low.0,
+                w.up_w.0,
+                up_pre.0,
+                ts,
+                hc_dim as u32,
+                rank,
+                stream,
+            )?;
+        } else {
             gemm_raw(
+                gpu,
+                k_gemm,
+                low,
+                up_wt,
+                up_pre,
+                ts,
+                hc_dim as u32,
+                rank,
+                stream,
+            )?;
+        }
+        if inject {
+            // inj_pre = normed x inject_w^T   [ts, hc]   (N=4: one CTA)
+            hc_gemm(
                 gpu,
                 k_gemm,
                 normed,
@@ -347,6 +426,7 @@ fn hc_pre_gemm(
                 ts,
                 hc_mult,
                 hc_dim as u32,
+                sm_count,
                 stream,
             )?;
         }
@@ -367,118 +447,4 @@ fn hc_pre_gemm(
         t0 += ts;
     }
     Ok(())
-}
-
-/// The three-launch collapse for small T. Same math as the fused kernel;
-/// the parity probe's T=8 fixture runs THIS path.
-#[allow(clippy::too_many_arguments)]
-fn hc_pre_split(
-    gpu: &dyn GpuBackend,
-    streams: DevicePtr,
-    w: &HcLowRank,
-    y_out: DevicePtr,
-    inj_out: DevicePtr,
-    scratch: DevicePtr,
-    num_tokens: u32,
-    hidden_size: u32,
-    hc_mult: u32,
-    norm_eps: f32,
-    inject: bool,
-    stream: u64,
-) -> Result<()> {
-    let hc_dim = hc_mult * hidden_size;
-    // Scratch layout: normed [T<=64, hc_dim] then low [T<=64, rank], F32.
-    let normed = scratch;
-    let low = scratch.offset(64 * hc_dim as usize * 4);
-
-    let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage")?;
-    let k_down = gpu.kernel("hyper_connection", "hc_pre_down")?;
-    let k_fin = gpu.kernel("hyper_connection", "hc_pre_finish")?;
-
-    KernelLaunch::new(gpu, k_stage)
-        .grid([num_tokens, 1, 1])
-        .block([1024, 1, 1])
-        .arg_ptr(streams)
-        .arg_ptr(w.norm_w)
-        .arg_ptr(normed)
-        .arg_u32(hidden_size)
-        .arg_u32(hc_mult)
-        .arg_f32(norm_eps)
-        .launch(stream)?;
-
-    // Spread rank rows over enough blocks to occupy the part even at T=1.
-    let dsplit = (48 / num_tokens.max(1)).clamp(1, 10);
-    KernelLaunch::new(gpu, k_down)
-        .grid([num_tokens, dsplit, 1])
-        .block([1024, 1, 1])
-        .arg_ptr(normed)
-        .arg_ptr(w.down_w)
-        .arg_ptr(low)
-        .arg_u32(hidden_size)
-        .arg_u32(hc_mult)
-        .arg_u32(w.rank as u32)
-        .launch(stream)?;
-
-    // Stage 3 was the largest kernel in the decode profile: 23% of all GPU
-    // time (11.86 s of 51.47 s, nsys 2026-08-28), a flat ~173 us regardless of
-    // T, ~38 GB/s against the part's ~273. Each output dim gets its own THREAD
-    // and that thread contracts over `rank` sequentially — which, in the
-    // checkpoint's `[hc*H, rank]` layout, means walking a contiguous row, so
-    // consecutive threads touched rows 640 B apart and every warp load
-    // scattered over 32 sectors.
-    //
-    // `up_w` is now stored TRANSPOSED as `[rank, hc*H]` (see the kernel's
-    // "WHY `up_w` IS STORED TRANSPOSED" note and `weight_loader::qwen4_exp::
-    // hc::transpose_up_w`), so thread `d` reads `up_w[r*hc_dim + i]`:
-    // consecutive threads read consecutive bf16. The loop body is otherwise
-    // untouched, so the FP32 accumulation order is IDENTICAL and the output is
-    // bitwise unchanged — which is the whole point. Two kernel-side fixes were
-    // measured first and both failed one half of that: warp-per-dim with a
-    // shfl reduction was +17.8% but reassociates, and shared-memory staging
-    // was bit-exact but 44% slower. The layout was the only thing that could
-    // give both.
-    // Block width, swept 32/64/128/256 with `ATLAS_HC_FIN_BLOCK` (agg tok/s,
-    // C=1 / C=2, every arm bitwise identical since this is pure geometry):
-    //
-    //   256 -> 21.65 / 25.20    128 -> 21.68 / 25.24  <- default
-    //    64 -> 20.57 / 23.84     32 -> 18.73 / 21.65
-    //
-    // NARROWER IS WORSE, which is the opposite of the guess. Thread-per-`d`
-    // caps the kernel at H threads per token, so a narrower block spreads the
-    // same 2560 threads over more SMs — but every block re-stages the whole
-    // rank-320 `low` vector into its own shared memory first, and at block 32
-    // that is 80 blocks each paying the same staging cost for 32 threads of
-    // work. The extra SMs do not pay for the extra staging. rsafier's original
-    // `S = clamp(48/T, 1, 10)` was already at the useful end of this curve;
-    // 128 is a hair better and 256 is inside the noise.
-    // Stream-per-warp layout (`hc_pre_finish_x4`, hc == 4 only): 4x the
-    // threads of the thread-per-`d` kernel, identical accumulation order.
-    let x4 = hc_mult == 4 && hc_finish_x4();
-    let (k_fin, grid_y, fblock) = if x4 {
-        (
-            gpu.kernel("hyper_connection", "hc_pre_finish_x4")?,
-            hidden_size.div_ceil(32),
-            128,
-        )
-    } else {
-        let fblock = hc_finish_block();
-        let fsplit = hidden_size
-            .div_ceil(fblock)
-            .max((48 / num_tokens.max(1)).clamp(1, 10));
-        (k_fin, fsplit, fblock)
-    };
-    KernelLaunch::new(gpu, k_fin)
-        .grid([num_tokens, grid_y, 1])
-        .block([fblock, 1, 1])
-        .shared_mem(w.rank as u32 * 4)
-        .arg_ptr(normed)
-        .arg_ptr(low)
-        .arg_ptr(w.up_w)
-        .arg_ptr(if inject { w.inject_w } else { DevicePtr::NULL })
-        .arg_ptr(y_out)
-        .arg_ptr(inj_out)
-        .arg_u32(hidden_size)
-        .arg_u32(hc_mult)
-        .arg_u32(w.rank as u32)
-        .launch(stream)
 }
