@@ -86,3 +86,17 @@ fn dense_stems_keeps_vision_and_mtp_linears() {
         ]
     );
 }
+
+#[test]
+fn native_part_groups_the_kept_stems() {
+    assert_eq!(
+        native_part("model.language_model.layers.0.linear_attn.in_proj_qkv"),
+        0
+    );
+    assert_eq!(
+        native_part("model.language_model.layers.3.self_attn.o_proj"),
+        1
+    );
+    assert_eq!(native_part("mtp.layers.0.self_attn.q_proj"), 1);
+    assert_eq!(native_part("lm_head"), 2);
+}

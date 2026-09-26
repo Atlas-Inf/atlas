@@ -45,9 +45,34 @@ pub(crate) fn keeps_packed_with(stem: &str, native: bool) -> bool {
             || stem == "lm_head")
 }
 
-/// [`keeps_packed_with`] with the env gate applied.
+/// Which overlay group a kept stem feeds: 0 = GDN, 1 = attention, 2 = LM head.
+fn native_part(stem: &str) -> usize {
+    if stem.contains(".linear_attn.") {
+        0
+    } else if stem.contains(".self_attn.") {
+        1
+    } else {
+        2
+    }
+}
+
+/// `ATLAS_EXL3_NATIVE_PARTS` (diagnostic): comma list of `gdn`, `attn`,
+/// `lm_head` naming the overlay groups to install; unset means all three.
+/// Read once.
+fn native_parts() -> [bool; 3] {
+    static ONCE: OnceLock<[bool; 3]> = OnceLock::new();
+    *ONCE.get_or_init(|| match std::env::var("ATLAS_EXL3_NATIVE_PARTS") {
+        Ok(v) => {
+            let has = |k: &str| v.split(',').any(|p| p.trim() == k);
+            [has("gdn"), has("attn"), has("lm_head")]
+        }
+        Err(_) => [true; 3],
+    })
+}
+
+/// [`keeps_packed_with`] with the env gate (and the diagnostic parts filter) applied.
 pub(crate) fn keeps_packed(stem: &str) -> bool {
-    keeps_packed_with(stem, exl3_native_decode())
+    keeps_packed_with(stem, exl3_native_decode()) && native_parts()[native_part(stem)]
 }
 
 /// Stems (name minus `.trellis`) of the DENSE packed linears in `names`,
