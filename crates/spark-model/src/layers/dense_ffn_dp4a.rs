@@ -105,10 +105,6 @@ impl DenseFfnLayer {
             || self.dp4a_dual_batch4_k.0 == 0
             || self.dp4a_gemv_batch4_dyn_k.0 == 0
             || self.dp4a_dual_batch4_dyn_k.0 == 0
-            || self.dp4a_gemv_batch8_k.0 == 0
-            || self.dp4a_dual_batch8_k.0 == 0
-            || self.dp4a_gemv_batch8_dyn_k.0 == 0
-            || self.dp4a_dual_batch8_dyn_k.0 == 0
         {
             return Ok(false);
         }
@@ -126,8 +122,14 @@ impl DenseFfnLayer {
         // runtime `row >= M` skip that makes the unused rows free. Every arm
         // is bit-identical per emitted row.
         let (gemv_k, dual_k) = if m == 8 {
+            if self.dp4a_gemv_batch8_k.0 == 0 || self.dp4a_dual_batch8_k.0 == 0 {
+                return Ok(false);
+            }
             (self.dp4a_gemv_batch8_k, self.dp4a_dual_batch8_k)
         } else if m >= 5 {
+            if self.dp4a_gemv_batch8_dyn_k.0 == 0 || self.dp4a_dual_batch8_dyn_k.0 == 0 {
+                return Ok(false);
+            }
             (self.dp4a_gemv_batch8_dyn_k, self.dp4a_dual_batch8_dyn_k)
         } else if m == 4 {
             (self.dp4a_gemv_batch4_k, self.dp4a_dual_batch4_k)
