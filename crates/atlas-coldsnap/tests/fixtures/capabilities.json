@@ -1,0 +1,81 @@
+{
+  "format": 1,
+  "kind": "coldsnap-controller-capabilities",
+  "controller": { "version": "0.3.23", "commit": "deadbeef" },
+  "protocols": {
+    "request_format": 4,
+    "accepted_request_formats": [4],
+    "artifact_format": 9,
+    "accepted_artifact_formats": [9],
+    "receipt_format": 2,
+    "timing_event_format": 1,
+    "host_provider_format": 1,
+    "payload_validation_rpc_format": 1
+  },
+  "operations": [
+    { "operation": "capture", "replay_semantics": "conflict-on-existing-output" },
+    { "operation": "publish", "replay_semantics": "content-idempotent" },
+    { "operation": "publish-native", "replay_semantics": "content-idempotent" },
+    { "operation": "restore", "replay_semantics": "reconcile-replace" },
+    { "operation": "restore", "replay_semantics": "safe-repeat", "prepare_only": true },
+    { "operation": "sleep", "replay_semantics": "convergent" },
+    { "operation": "status", "replay_semantics": "convergent" },
+    { "operation": "wake", "replay_semantics": "convergent" }
+  ],
+  "engine_adapters": [
+    {
+      "engine": "sglang",
+      "executable": "coldsnap-sglang-adapter",
+      "environment": "COLDSNAP_SGLANG_ADAPTER",
+      "operations": ["capture", "publish", "publish-native", "restore", "sleep", "status", "wake"],
+      "prepare_restore": true,
+      "controller_model": "external-process",
+      "native_materialization": ["off"],
+      "default_native_materialization": "off"
+    },
+    {
+      "engine": "vllm",
+      "executable": "coldsnap-vllm-adapter",
+      "environment": "COLDSNAP_VLLM_ADAPTER",
+      "operations": ["capture", "publish", "publish-native", "restore", "sleep", "status", "wake"],
+      "prepare_restore": true,
+      "controller_model": "external-process",
+      "native_materialization": ["off", "async", "required"],
+      "default_native_materialization": "off"
+    }
+  ],
+  "snapshot_drivers": [
+    {
+      "id": "n580",
+      "abi": 1,
+      "capture_boundary": "pre-cuda-process-template",
+      "minimum_nvidia_driver_major": 580,
+      "base_requirements": { "features": ["criu-process-template", "cuda-fresh-state"] }
+    },
+    {
+      "id": "n610",
+      "abi": 1,
+      "capture_boundary": "initialized-cuda-process-state",
+      "minimum_nvidia_driver_major": 610,
+      "base_requirements": { "features": ["cuda-checkpoint-api", "cuda-classic-ipc"] }
+    }
+  ],
+  "host_transports": [
+    {
+      "name": "manager-provider",
+      "engine_adapter_requests": true,
+      "security": "operation-scoped-unix-token",
+      "status": "required"
+    }
+  ],
+  "features": [
+    "content-addressed-native-payloads",
+    "manager-host-provider",
+    "manager-runtime-v1",
+    "operation-receipts",
+    "operation-timing-events-ndjson-v1",
+    "operation-timing-spans",
+    "placement-independent-artifacts",
+    "prepare-only-restore"
+  ]
+}
