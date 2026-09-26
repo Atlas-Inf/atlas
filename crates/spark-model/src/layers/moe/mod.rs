@@ -461,6 +461,7 @@ impl MoeLayer {
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod audit;
 mod dump;
 mod forward;
 mod lora;

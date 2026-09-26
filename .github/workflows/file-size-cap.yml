@@ -469,6 +469,9 @@ jobs:
             # 509 LoC (was 498) -- routed-expert prefill; grew with p400's
             # native MXFP4/E8M0 routed-expert loading (#293 content).
             "crates/spark-model/src/layers/moe/forward_prefill_routed.rs"
+            # debug/fnext-win-moe-audit only: env-gated audit hooks (+19 LoC)
+            # on a file already over the cap at base; branch is not for merge.
+            "crates/spark-model/src/layers/moe/helpers_a.rs"
             # 501 LoC (was 489) -- tool-call parser entry point; grew with
             # p350 (Laguna-S-2.1) adding its parser arm.
             "crates/spark-server/src/tool_parser.rs"

@@ -2,6 +2,7 @@
 
 //! Setters + transposes + transpose_for_prefill_unified_inner.
 
+use super::audit::{audit_enter, audit_freed2, audit_layout, audit_src, audit_sync};
 use super::*;
 
 impl MoeLayer {
@@ -192,6 +193,11 @@ impl MoeLayer {
         let inter = config.moe_intermediate_size;
         let shared_inter = config.shared_expert_intermediate_size;
         let _num_experts = self.weights.experts.len();
+        let call = audit_enter(
+            self as *const _ as usize,
+            _num_experts,
+            keep_originals,
+        );
 
         // ── Layout state is DERIVED, never declared ──────────────────────
         // These two flags used to be read independently from env at
@@ -209,6 +215,7 @@ impl MoeLayer {
         // the operator to know either flag exists.
         self.unified_layout = !keep_originals;
         self.hybrid_layout = keep_originals;
+        audit_layout(call, self.unified_layout, self.hybrid_layout);
 
         // ── Phase A: transpose gate+up routed experts ──
         // ARM-2 Phase-K Family C: native-MXFP4 routed experts are per-32 E8M0.
@@ -242,6 +249,8 @@ impl MoeLayer {
                 }
             })
             .collect();
+        audit_src(call, "gate", &gate_src);
+        audit_src(call, "up", &up_src);
         let gate_t = self.transpose_experts_gpu(gpu, &gate_src, inter, h, routed_gs)?;
         let up_t = self.transpose_experts_gpu(gpu, &up_src, inter, h, routed_gs)?;
         self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
@@ -267,12 +276,14 @@ impl MoeLayer {
             // them (gated by `use_t_layout_for_decode()`).
             for expert in &mut self.weights.experts {
                 if !expert.gate_proj.weight.is_null() {
+                    audit_freed2(call, expert.gate_proj.weight, expert.gate_proj.weight_scale);
                     gpu.free(expert.gate_proj.weight)?;
                     gpu.free(expert.gate_proj.weight_scale)?;
                     expert.gate_proj.weight = DevicePtr::NULL;
                     expert.gate_proj.weight_scale = DevicePtr::NULL;
                 }
                 if !expert.up_proj.weight.is_null() {
+                    audit_freed2(call, expert.up_proj.weight, expert.up_proj.weight_scale);
                     gpu.free(expert.up_proj.weight)?;
                     gpu.free(expert.up_proj.weight_scale)?;
                     expert.up_proj.weight = DevicePtr::NULL;
@@ -280,6 +291,9 @@ impl MoeLayer {
                 }
             }
             if !self.weights.shared_expert.gate_proj.weight.is_null() && shared_inter > 0 {
+                let se = &self.weights.shared_expert;
+                audit_freed2(call, se.gate_proj.weight, se.gate_proj.weight_scale);
+                audit_freed2(call, se.up_proj.weight, se.up_proj.weight_scale);
                 gpu.free(self.weights.shared_expert.gate_proj.weight)?;
                 gpu.free(self.weights.shared_expert.gate_proj.weight_scale)?;
                 self.weights.shared_expert.gate_proj.weight = DevicePtr::NULL;
@@ -289,6 +303,7 @@ impl MoeLayer {
                 self.weights.shared_expert.up_proj.weight = DevicePtr::NULL;
                 self.weights.shared_expert.up_proj.weight_scale = DevicePtr::NULL;
             }
+            audit_sync(call, "phase-B", gpu);
         }
 
         // ── Phase C: transpose down routed experts ──
@@ -304,6 +319,7 @@ impl MoeLayer {
                 }
             })
             .collect();
+        audit_src(call, "down", &down_src);
         let down_t = self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_gs)?;
         self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
         if !self.weights.shared_expert.down_proj.is_null() && shared_inter > 0 {
@@ -318,6 +334,7 @@ impl MoeLayer {
             // ── Phase D: free down untransposed ──
             for expert in &mut self.weights.experts {
                 if !expert.down_proj.weight.is_null() {
+                    audit_freed2(call, expert.down_proj.weight, expert.down_proj.weight_scale);
                     gpu.free(expert.down_proj.weight)?;
                     gpu.free(expert.down_proj.weight_scale)?;
                     expert.down_proj.weight = DevicePtr::NULL;
@@ -325,11 +342,13 @@ impl MoeLayer {
                 }
             }
             if !self.weights.shared_expert.down_proj.weight.is_null() && shared_inter > 0 {
+                audit_freed2(call, self.weights.shared_expert.down_proj.weight, self.weights.shared_expert.down_proj.weight_scale);
                 gpu.free(self.weights.shared_expert.down_proj.weight)?;
                 gpu.free(self.weights.shared_expert.down_proj.weight_scale)?;
                 self.weights.shared_expert.down_proj.weight = DevicePtr::NULL;
                 self.weights.shared_expert.down_proj.weight_scale = DevicePtr::NULL;
             }
+            audit_sync(call, "phase-D", gpu);
         }
 
         Ok(())
