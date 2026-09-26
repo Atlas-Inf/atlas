@@ -59,27 +59,58 @@ impl BlockDiffusionDraftHead {
             .checked_mul(gamma)
             .ok_or_else(|| anyhow::anyhow!("DFlash batched selector rows overflow"))?;
 
-        // (a) One projected-hidden GEMM over all B*gamma rows.
-        self.drafter_dense_gemm(
-            ctx.gpu,
-            self.batch_norm,
-            &selector.hidden_projection,
-            self.batch_dflash2_projected,
-            total_rows,
-            rank,
-            hidden,
-            stream,
-        )?;
+        // (a) Projected-hidden GEMM — per-sequence at m = gamma, mirroring
+        // the serial arm bit-for-bit. Serial `select_candidates` calls
+        // `drafter_dense_gemm` at m = γ, which takes `dense_gemv_batchm`
+        // when γ ≤ DENSE_GEMV_BATCHM_MAX_M; a single B·γ launch instead hits
+        // `dense_gemm_bf16_pipelined` (MMA-tiled, different accumulation
+        // order) — the measured draft-token divergence in job 316. The
+        // pipelined GEMM is row-M-invariant, so only the GEMV arm needs the
+        // per-sequence mirror; the weight re-read is a [rank, H] table.
+        let seq_hidden_bytes = (gamma as usize)
+            .checked_mul(hidden as usize)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| anyhow::anyhow!("DFlash selector hidden stride overflow"))?;
+        let seq_projected_bytes = (gamma as usize)
+            .checked_mul(selector.rank)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| anyhow::anyhow!("DFlash selector projected stride overflow"))?;
+        if super::small_m_gemm::use_small_m_gemv(
+            super::small_m_gemm::small_m_gemv_enabled(),
+            self.kernels.dense_gemv_batchm.0 != 0,
+            gamma,
+        ) {
+            for sequence in 0..batch_size as usize {
+                self.drafter_dense_gemm(
+                    ctx.gpu,
+                    self.batch_norm.offset(sequence * seq_hidden_bytes),
+                    &selector.hidden_projection,
+                    self.batch_dflash2_projected
+                        .offset(sequence * seq_projected_bytes),
+                    gamma,
+                    rank,
+                    hidden,
+                    stream,
+                )?;
+            }
+        } else {
+            self.drafter_dense_gemm(
+                ctx.gpu,
+                self.batch_norm,
+                &selector.hidden_projection,
+                self.batch_dflash2_projected,
+                total_rows,
+                rank,
+                hidden,
+                stream,
+            )?;
+        }
 
         // (b) One selector launch per sequence on that sequence's slices.
         let seq_logits_bytes = (gamma as usize)
             .checked_mul(vocab as usize)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash selector logits stride overflow"))?;
-        let seq_projected_bytes = (gamma as usize)
-            .checked_mul(selector.rank)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| anyhow::anyhow!("DFlash selector projected stride overflow"))?;
         let seq_token_bytes = (gamma as usize)
             .checked_mul(4)
             .ok_or_else(|| anyhow::anyhow!("DFlash selector token stride overflow"))?;
