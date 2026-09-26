@@ -97,7 +97,9 @@ fn sequence_accessor_is_not_public_api() {
 
 #[test]
 fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
-    let entry = include_str!("../dflash_head.rs");
+    // The staged dispatch (per-layer loop + tail/markov calls) lives in
+    // batch_propose.rs since the dflash_head.rs split.
+    let entry = include_str!("batch_propose.rs");
     assert!(entry.contains("for layer_idx in 0..self.layers.len()"));
     assert!(entry.contains("self.run_batched_layer_stage("));
     assert!(entry.contains("self.run_batched_tail_base("));
@@ -131,7 +133,11 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let projection_source = include_str!("batch_projection.rs");
     assert!(projection_source.contains("(total_rows - row).min(16)"));
     assert!(!projection_source.contains("w4a16_gemv_batch32"));
-    let tail = &source[source.find("fn run_batched_tail_base").unwrap()..];
+    // The tail/markov methods moved to batch_forward_tail.rs with the
+    // batch_forward.rs split; the relative-order assertions still hold
+    // within the moved bodies.
+    let tail_source = include_str!("batch_forward_tail.rs");
+    let tail = &tail_source[tail_source.find("fn run_batched_tail_base").unwrap()..];
     let final_norm = tail.find("&self.norm").unwrap();
     let lm_head = tail.find("ops::w4a16_gemm").unwrap();
     let argmax = tail.find("ops::argmax_bf16_batch").unwrap();
@@ -143,7 +149,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     assert!(tail.contains("self.startup.native_batch_authoritative"));
     assert!(tail.contains("exact NVFP4 LM-head batch kernel is unresolved"));
     assert!(final_norm < lm_head && lm_head < argmax);
-    let markov = &source[source.find("fn run_batched_markov").unwrap()..];
+    let markov = &tail_source[tail_source.find("fn run_batched_markov").unwrap()..];
     let depth_loop = markov.find("for depth in 1..gamma").unwrap();
     let embed = markov.find("ops::batched_embed").unwrap();
     let project = markov.find("ops::dense_gemv_batchm").unwrap();
@@ -157,15 +163,20 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
 
 #[test]
 fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispatch() {
-    let source = include_str!("../dflash_head.rs");
-    let plan = source.find("packed_query_tokens").unwrap();
-    let upload = source.find("copy_h2d(&query_bytes").unwrap();
-    let embed = source.find("ops::batched_embed").unwrap();
+    // The prepare → native-rows → generic-serial seam lives in
+    // batch_propose.rs since the dflash_head.rs split; the orchestrator
+    // (propose_batch admission/fallback gates) stays in ../dflash_head.rs.
+    let staged = include_str!("batch_propose.rs");
+    let plan = staged.find("packed_query_tokens").unwrap();
+    let upload = staged.find("copy_h2d(&query_bytes").unwrap();
+    let embed = staged.find("ops::batched_embed").unwrap();
 
-    let stage = source.find("self.run_batched_layer_stage").unwrap();
-    let tail = source.find("self.run_batched_tail_base").unwrap();
-    let native_readback = source.find("let native =\n").unwrap();
-    let generic_serial = source.find("Generic single-lane serial path").unwrap();
+    let stage = staged.find("self.run_batched_layer_stage").unwrap();
+    let tail = staged.find("self.run_batched_tail_base").unwrap();
+    // The readback arm's binding is `let native = if native_staged …`
+    // (rustfmt joined it onto one line when the body moved files).
+    let native_readback = staged.find("let native = if native_staged").unwrap();
+    let generic_serial = staged.find("Generic single-lane serial path").unwrap();
     assert!(
         plan < upload
             && upload < embed
@@ -174,31 +185,33 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
             && tail < native_readback
             && native_readback < generic_serial
     );
-    assert!(source.contains("self.batch_capacity"));
-    assert!(source.contains("self.batch_query_ids_dev"));
-    assert!(source.contains("self.batch_position_ids"));
-    assert!(source.contains("self.batch_query_embed"));
-    assert!(!source.contains("ops::dflash_batch_anchor_add"));
+    assert!(staged.contains("self.batch_capacity"));
+    assert!(staged.contains("self.batch_query_ids_dev"));
+    assert!(staged.contains("self.batch_position_ids"));
+    assert!(staged.contains("self.batch_query_embed"));
+    assert!(!staged.contains("ops::dflash_batch_anchor_add"));
 
-    assert!(source.contains("self.batch_block_table_ptrs"));
-    assert!(source.contains("self.batch_cu_seqlens"));
-    assert!(source.contains("self.batch_kv_lens"));
-    assert!(source.contains("self.batch_slot_mapping"));
-    assert!(source.contains("ctx_count_drafter"));
-    assert!(!source.contains(".ctx_len\n                    .checked_add(self.gamma)"));
+    assert!(staged.contains("self.batch_block_table_ptrs"));
+    assert!(staged.contains("self.batch_cu_seqlens"));
+    assert!(staged.contains("self.batch_kv_lens"));
+    assert!(staged.contains("self.batch_slot_mapping"));
+    assert!(staged.contains("ctx_count_drafter"));
+    assert!(!staged.contains(".ctx_len\n                    .checked_add(self.gamma)"));
 
-    assert!(source.contains("let native_staged = batch_slots_ready && self.lane_count() == 1"));
+    assert!(staged.contains("let native_staged = batch_slots_ready && self.lane_count() == 1"));
 
-    assert!(source.contains("batch_inputs.reorder_sampled_rows"));
-    assert!(source.contains("DFlash Bxgamma parity mismatch"));
-    assert!(source.contains("self.startup.native_batch_authoritative"));
-    assert!(source.contains("self.prepare_drafts_state"));
-    assert!(source.contains("dstate.last_num_drafted = tokens.len()"));
-    assert!(source.contains("if self.startup.diagnostics.batch_parity"));
-    assert!(source.contains("self.batch_capacity"));
-    assert!(source.contains("n == 1 && !(native_authoritative"));
-    assert!(source.contains("DFlash Bxgamma parity dispatch"));
-    assert!(source.contains("DFlash Bxgamma parity cache gate"));
+    assert!(staged.contains("batch_inputs.reorder_sampled_rows"));
+    assert!(staged.contains("DFlash Bxgamma parity mismatch"));
+    assert!(staged.contains("dstate.last_num_drafted = tokens.len()"));
+    assert!(staged.contains("if self.startup.diagnostics.batch_parity"));
+    assert!(staged.contains("DFlash Bxgamma parity cache gate"));
+
+    // Orchestrator-side gates that stayed in dflash_head.rs's propose_batch.
+    let orchestrator = include_str!("../dflash_head.rs");
+    assert!(orchestrator.contains("self.startup.native_batch_authoritative"));
+    assert!(orchestrator.contains("self.prepare_drafts_state"));
+    assert!(orchestrator.contains("n == 1 && !(native_authoritative"));
+    assert!(orchestrator.contains("DFlash Bxgamma parity dispatch"));
 
     let prepare_source = include_str!("propose.rs");
     assert!(prepare_source.contains("fn prepare_drafts_state"));

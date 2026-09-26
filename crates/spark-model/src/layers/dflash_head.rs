@@ -28,6 +28,7 @@ use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod conv;
+mod levers;
 mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
@@ -715,6 +716,7 @@ mod batch_execution;
 mod batch_execution_tests;
 mod batch_fallback;
 mod batch_forward;
+mod batch_forward_tail;
 #[cfg(test)]
 mod batch_inputs_tests;
 mod batch_plan;
