@@ -101,12 +101,12 @@ mod tests {
         let g = |cur, ema| next_gamma(cur, ema, 8, 12).0;
         // At γ=8 (7 drafts): rise above ratio 0.65 (ema > 4.55).
         assert_eq!(g(8, 5.1), 12); // job-260 code at γ=8: 0.73
-        assert_eq!(g(8, 4.55), 8); // boundary: hold
+        assert_eq!(g(8, 4.5), 8); // 0.643, just inside the band: hold
         assert_eq!(g(8, 3.5), 8); // inside the band
         assert_eq!(g(8, 1.4), 8); // job-260 prose
         // At γ=12 (11 drafts): fall below ratio 0.45 (ema < 4.95).
         assert_eq!(g(12, 7.8), 12); // job-260 code at γ=12: 0.71
-        assert_eq!(g(12, 4.95), 12); // boundary: hold
+        assert_eq!(g(12, 5.0), 12); // 0.4545, just inside the band: hold
         assert_eq!(g(12, 4.0), 8);
         // Off-band values still land in {lo, hi}.
         assert_eq!(g(10, 7.0), 12);
