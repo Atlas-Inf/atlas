@@ -15,18 +15,24 @@
 //!     pipelined-GEMM regression where `w8a16_gemm_pipelined` resolved to 0
 //!     and QKVZ fell back to the ~4.6× slower `w8a16_gemm`).
 //!
-//! Every kernel lookup in Atlas is EAGER: each one sits in a constructor on the
-//! `serve_phases::build_model` path, so by the time the model is built the
-//! audit holds the COMPLETE `(module, func)` set this model asks for. That is
-//! what makes [`seal`] meaningful — after it, a lookup is by definition a late
-//! one, and a late MISS is a silent slow path nobody would ever see. Sealing
-//! turns the invariant from a belief into an assertion.
+//! Every kernel lookup in Atlas is EXPECTED to be EAGER: each one should sit
+//! in a constructor on the `serve_phases::build_model` path, so by the time the
+//! model is built the audit holds the COMPLETE `(module, func)` set this model
+//! asks for. That is what makes [`seal`] meaningful — after it, a lookup is by
+//! definition a late one, and a late MISS is a silent slow path nobody would
+//! ever see. Sealing turns the invariant from a belief into an assertion.
+//! Nothing enforces eagerness, though, so [`record`] dedupes: at most one raw
+//! row per `(module, func, loaded)`, and a non-eager hot-path lookup cannot
+//! grow the audit. (Issue #73: a decode-step dispatcher that looked its
+//! kernels up on every call grew the server heap on every decode step,
+//! measured by a jemalloc profile on a unified-memory GB10.)
 
 mod report;
 
 pub use report::{render_kernel_table, unresolved_report};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -69,6 +75,30 @@ impl AuditRow {
     }
 }
 
+/// The audit log: one raw row per DISTINCT `(module, func, loaded)` triple.
+///
+/// `GpuBackend::kernel` is callable from a hot path (per-decode-step
+/// dispatchers exist), so an unbounded Vec is a heap leak — each push
+/// allocates two `String`s. `seen` hashes the triple before allocating, so a
+/// repeat lookup costs one hash and zero allocation.
+#[derive(Debug, Default)]
+pub struct KernelAuditLog {
+    /// One row per distinct `(module, func, loaded)`. `audit_rows` collapses
+    /// `(module, func)` further for display; the raw triple is kept so a
+    /// failing-then-resolving lookup preserves both observations.
+    pub rows: Vec<(String, String, bool, &'static Location<'static>)>,
+    /// `DefaultHasher` keys of the triples already in `rows`.
+    seen: HashSet<u64>,
+}
+
+impl KernelAuditLog {
+    /// Clear both halves — they must reset together.
+    pub fn clear(&mut self) {
+        self.rows.clear();
+        self.seen.clear();
+    }
+}
+
 /// Record one kernel lookup. Cheap; called from `GpuBackend::kernel`.
 ///
 /// `site` is the caller's `Location`, which the backend obtains from its own
@@ -79,7 +109,15 @@ pub fn record(module: &str, func: &str, loaded: bool, site: &'static Location<'s
         late_miss(module, func, site);
     }
     if let Ok(mut v) = crate::run_metrics::metrics().kernel_audit.lock() {
-        v.push((module.to_string(), func.to_string(), loaded, site));
+        let mut h = DefaultHasher::new();
+        module.hash(&mut h);
+        func.hash(&mut h);
+        loaded.hash(&mut h);
+        if !v.seen.insert(h.finish()) {
+            return;
+        }
+        v.rows
+            .push((module.to_string(), func.to_string(), loaded, site));
     }
 }
 
@@ -155,7 +193,7 @@ pub fn audit_rows() -> Vec<AuditRow> {
     let mut resolved: BTreeMap<(String, String), (bool, &'static Location<'static>)> =
         BTreeMap::new();
     if let Ok(v) = crate::run_metrics::metrics().kernel_audit.lock() {
-        for (m, f, ok, site) in v.iter() {
+        for (m, f, ok, site) in v.rows.iter() {
             let e = resolved
                 .entry((m.clone(), f.clone()))
                 .or_insert((false, *site));
@@ -207,4 +245,70 @@ pub fn split_failures(rows: &[AuditRow], expected_absent: &[(&str, &str)]) -> Fa
                 .any(|(em, ef)| *em == r.module.as_str() && *ef == r.func.as_str())
         });
     FailureSplit { required, expected }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Raw rows in the global log whose module carries the test's unique
+    /// prefix — parallel tests share the one mailbox, so a plain row count
+    /// would race. Per-test module names isolate them.
+    fn rows_for(module: &str) -> Vec<(String, String, bool, &'static Location<'static>)> {
+        crate::run_metrics::metrics()
+            .kernel_audit
+            .lock()
+            .unwrap()
+            .rows
+            .iter()
+            .filter(|(m, _, _, _)| m == module)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn hot_path_lookup_dedupes_to_one_row() {
+        // The #73 case: a dispatcher that looks the same kernel up every
+        // decode step must not grow the audit.
+        let module = "kernel_audit_test_dedupe";
+        let site = Location::caller();
+        for _ in 0..10_000 {
+            record(module, "f", true, site);
+        }
+        let rows = rows_for(module);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "f");
+        assert!(rows[0].2);
+    }
+
+    #[test]
+    fn miss_then_hit_keeps_both_and_audit_rows_reports_loaded() {
+        let module = "kernel_audit_test_miss_hit";
+        let miss_site = Location::caller();
+        record(module, "f", false, miss_site);
+        let hit_site = Location::caller();
+        record(module, "f", true, hit_site);
+        // `loaded` is part of the dedupe key: both observations survive.
+        let rows = rows_for(module);
+        assert_eq!(rows.len(), 2);
+        let agg = audit_rows()
+            .into_iter()
+            .find(|r| r.module == module && r.func == "f")
+            .unwrap();
+        assert!(agg.loaded, "any resolved lookup marks the pair loaded");
+        // `site` is the FIRST lookup's — the miss line above.
+        assert_eq!(agg.site.file(), miss_site.file());
+        assert_eq!(agg.site.line(), miss_site.line());
+    }
+
+    #[test]
+    fn distinct_pairs_stay_distinct() {
+        let module = "kernel_audit_test_distinct";
+        let site = Location::caller();
+        record(module, "f_a", true, site);
+        record(module, "f_b", true, site);
+        record("kernel_audit_test_distinct_other", "f_a", true, site);
+        assert_eq!(rows_for(module).len(), 2);
+        assert_eq!(rows_for("kernel_audit_test_distinct_other").len(), 1);
+    }
 }
