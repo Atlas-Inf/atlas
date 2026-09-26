@@ -131,6 +131,11 @@ pub struct DenseFfnLayer {
     /// Runtime-row-guarded batch4 DP4A GEMVs for the m == 2..3 verify rows.
     dp4a_gemv_batch4_dyn_k: KernelHandle,
     dp4a_dual_batch4_dyn_k: KernelHandle,
+    /// DP4A batch8 GEMVs: FIXED8 for m == 8, runtime-guarded for m in 5..7.
+    dp4a_gemv_batch8_k: KernelHandle,
+    dp4a_dual_batch8_k: KernelHandle,
+    dp4a_gemv_batch8_dyn_k: KernelHandle,
+    dp4a_dual_batch8_dyn_k: KernelHandle,
     /// Narrow `w4a16_gemv_batch{M}` family (M=4..8) for the K=4 verify FFN and
     /// the K=5..8 chain verify. SSOT for the M -> tier decision; individual
     /// tiers are 0-handles when the target did not load them.
@@ -418,6 +423,30 @@ impl DenseFfnLayer {
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_dual_batch4_d4_dyn",
+            ),
+            dp4a_gemv_batch8_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch8_d4",
+            ),
+            dp4a_dual_batch8_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_dual_batch8_d4",
+            ),
+            dp4a_gemv_batch8_dyn_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch8_d4_dyn",
+            ),
+            dp4a_dual_batch8_dyn_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_dual_batch8_d4_dyn",
             ),
             w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
