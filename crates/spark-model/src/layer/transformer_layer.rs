@@ -30,11 +30,13 @@ mod default_loops;
 /// fast path at exactly the concurrencies it was built for) → 32 (the
 /// 32:1 ladder rung: n=32 × k=2 = 64 verify rows; kernels index a table by
 /// sequence and receive each table's base pointer separately, so widening
-/// is a pure host-side layout change). 48 GDN layers x 4 tables x 32
-/// entries x 8 B = 48 KB.
+/// is a pure host-side layout change). 48 GDN layers x 8 tables x 32
+/// entries x 8 B = 96 KB.
 pub const VERIFY_WY_TABLE_SEQS: usize = 32;
-/// Tables per GDN layer: h_state + Hi0..Hi2 (K=4 verify → 3 intermediates).
-pub const VERIFY_WY_TABLES_PER_LAYER: usize = 4;
+/// Tables per GDN layer: h_state + Hi0..Hi6 (K=8 verify → 7 intermediates;
+/// the wy2..4 arms read only the first `k` slabs, so the wyN stride covers
+/// the extra ones without a second layout).
+pub const VERIFY_WY_TABLES_PER_LAYER: usize = 8;
 /// Bytes between consecutive tables within a layer slice.
 pub const VERIFY_WY_TABLE_STRIDE_BYTES: usize = VERIFY_WY_TABLE_SEQS * 8;
 /// Bytes between consecutive GDN layers' table slices.

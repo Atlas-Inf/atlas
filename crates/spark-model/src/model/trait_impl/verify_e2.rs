@@ -256,7 +256,7 @@ impl TransformerModel {
         ))
     }
 
-    /// Stage the per-GDN-layer WY pointer tables (`[h|Hi0|Hi1|Hi2]` ×
+    /// Stage the per-GDN-layer WY pointer tables (`[h|Hi0..Hi6]` ×
     /// `VERIFY_WY_TABLE_SEQS` u64 entries per layer, batch entries filled,
     /// tail zero) into the fixed `verify_wy_tables` device buffer. Runs
     /// PRE-graph on every batched verify step whose table content differs
@@ -283,11 +283,13 @@ impl TransformerModel {
     /// sentinel is in the CUDA-graph key — and `ATLAS_NO_VERIFY_WY_CACHE`
     /// restores the unconditional re-stage for A/B.
     ///
-    /// `k` is this step's verify width (rows per sequence, 2..=4 from the
-    /// ladder). Exactly `k` tables are filled — `[h | Hi_0 .. Hi_{k-2}]` —
-    /// because `gdn_decode_wy{2,3,4}` read one h table plus k-1 intermediate
-    /// tables. Table STRIDES are `k`-independent, so a slice offset never
-    /// depends on the ladder step.
+    /// `k` is this step's verify width (rows per sequence: 2..=4 from the
+    /// K-vs-batch ladder, 5..=8 for the DFlash2/chain widths). Exactly `k`
+    /// tables are filled — `[h | Hi_0 .. Hi_{k-2}]` — because
+    /// `gdn_decode_wy{2,3,4}` read one h table plus k-1 intermediate tables,
+    /// and `gdn_decode_wyn` reads the h table plus the Hi_0 base table
+    /// (intra-slot stride covers the rest). Table STRIDES are
+    /// `k`-independent, so a slice offset never depends on the ladder step.
     ///
     /// Returns NULL — uploading nothing — unless EVERY GDN layer × sequence
     /// provides h_state + ≥ k-1 h intermediates (the layer-side batched arm

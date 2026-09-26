@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Cross-sequence batched conv+WY body for the batched K-row MTP verify
-//! (`GdnStates::Multi`, k = 2..=4 from the K-vs-batch ladder). Collapses the
+//! (`GdnStates::Multi`, k = 2..=4 from the K-vs-batch ladder and k = 5..=8
+//! for the DFlash2/chain-verify widths via the K-templated wyN kernels). Collapses the
 //! per-sequence loop — n × (k `conv1d_update_l2norm` + (k-1) conv-state
 //! `copy_d2d_async` + 1 `gdn_decode_wy{k}`) = n(2k-1) launches per GDN layer
 //! — into TWO launches:
@@ -16,7 +17,8 @@
 //!    allocates `num_intermediates = K` snapshots per slot, and the
 //!    preconditions below verify index K-1 exists and is intra-slot
 //!    contiguous before the launch.
-//! 2. `gdn_decode_wy{2,3,4}` at `batch_size = n` with `state_is_table = true`:
+//! 2. `gdn_decode_wy{2,3,4}` / `gdn_decode_wyn` (K = 5..=8) at
+//!    `batch_size = n` with `state_is_table = true`:
 //!    ONE launch over device pointer tables (one entry per sequence) for
 //!    h_state + the k-1 Hi intermediates — the table form that sidesteps the
 //!    intermediates-stride corruption the contiguous form has at n > 1
@@ -31,6 +33,12 @@
 //! now take the same `state_is_table` flag, so k in {2,3,4} all take the
 //! two-launch path. The conv kernel was already K-generic (`num_tokens` is a
 //! runtime arg).
+//!
+//! K = 5..8 (DFlash2 γ=8 verifies 8 rows/sequence): the K-templated
+//! `gated_delta_rule_wy5..wy8` kernels carry the same `state_is_table`
+//! trailing arg — `h_state` plus ONE Hi_0-base table per sequence, the K-1
+//! intermediates still striding by `inter_stride_floats` within the slot
+//! (intra-slot contiguity is asserted below, same as the exact arm).
 //!
 //! The conv launch needs UNIFORM per-sequence strides, which holds iff the
 //! batch occupies CONSECUTIVE ssm-pool slots in batch order. That is checked
@@ -136,20 +144,28 @@ impl Qwen3SsmLayer {
         if super::verify_exact_enabled() {
             return self.decode_batched_conv_gdn_multi_exact(states, ctx, args);
         }
-        // wy2/wy3/wy4 all carry the `state_is_table` pointer-table form, so
-        // every K-vs-batch ladder width takes the two-launch path. The handle
-        // is selected here (try_kernel misses are a silent 0 — gate on it,
-        // never assume resolution). k=2/k=3 route through `wy2_kernel` /
-        // `wy3_kernel` (the ONE resident-vs-base decision point per K; base
-        // kernel when the resident twin is unlinked/killed/shape-mismatched/
-        // too narrow (n below wy_resident_min_width()), so this stays non-0
-        // either way).
+        // wy2/wy3/wy4 and the K-templated wyN all carry the `state_is_table`
+        // pointer-table form, so every ladder width takes the two-launch
+        // path. The handle is selected here (try_kernel misses are a silent 0
+        // — gate on it, never assume resolution). k=2/k=3 route through
+        // `wy2_kernel` / `wy3_kernel` (the ONE resident-vs-base decision
+        // point per K; base kernel when the resident twin is unlinked/
+        // killed/shape-mismatched/too narrow (n below
+        // wy_resident_min_width()), so this stays non-0 either way).
         let wy_k = match kk {
             2 => self.wy2_kernel(args.kd, args.vd, n),
             3 => self.wy3_kernel(args.kd, args.vd, n),
             4 => self.wy4_kernel(),
-            _ => return Ok(false),
+            // wyN has no FP16 h-state twin — return 0 so `require_wy_f16`
+            // refuses, exactly as an unlinked wy4_f16 twin does.
+            k @ 5..=8 if !super::ssm_h_fp16_enabled() => self
+                .wyn_kernel(k, ctx.levers.gdn_wyn)
+                .unwrap_or(spark_runtime::gpu::KernelHandle(0)),
+            _ => spark_runtime::gpu::KernelHandle(0),
         };
+        if !(2..=8).contains(&kk) {
+            return Ok(false);
+        }
         // ATLAS_SSM_H_FP16: a zero handle below turns into `Ok(false)` and the
         // caller runs the per-sequence FP32 loop — which, over an FP16 pool,
         // is silent corruption rather than an error. Refuse first.
@@ -180,6 +196,17 @@ impl Qwen3SsmLayer {
             // depth; the model declines the upload on the same condition).
             if st.conv_state_intermediates.len() < kk || st.h_state_intermediates.len() < kk - 1 {
                 return Ok(self.gdn_multi_decline(n, kk));
+            }
+            // wyN (k>=5) takes ONE Hi_0 table + a uniform intra-slot stride,
+            // so the k-1 intermediates must also be intra-slot contiguous
+            // (same layout the exact arm asserts; holds for ssm_pool slots).
+            if kk >= 5 {
+                let hi0 = st.h_state_intermediates[0];
+                for t in 1..kk - 1 {
+                    if st.h_state_intermediates[t].0 != hi0.0 + (t * args.h_bytes) as u64 {
+                        return Ok(self.gdn_multi_decline(n, kk));
+                    }
+                }
             }
             let i0 = st.conv_state_intermediates[0];
             for t in 1..kk {
@@ -214,6 +241,7 @@ impl Qwen3SsmLayer {
             gates_buf,
             conv_out_buf,
             gdn_out_buf,
+            h_bytes,
             qkvz_size,
             conv_dim,
             key_dim,
@@ -259,8 +287,10 @@ impl Qwen3SsmLayer {
         // Activation rows are seq-major (`r = b*k + t`), exactly the kernels'
         // `(b*K+T)*stride` indexing; the state args become device pointer
         // tables (h | Hi0 | ..), one `VERIFY_WY_TABLE_STRIDE_BYTES` slab
-        // each, staged by the model pre-graph. Only the first `kk` slabs are
-        // read (wy2 takes h+Hi0, wy3 h+Hi0+Hi1, wy4 h+Hi0..Hi2).
+        // each, staged by the model pre-graph. wy2..wy4 read the first `kk`
+        // slabs (h + one table per Hi); wyN reads slab 0 (h) and slab 1
+        // (Hi_0 base), reaching Hi_t at `+ t * inter_stride_floats` inside
+        // the slot — the contiguity check above is what makes that safe.
         let q_ptr = conv_out_buf;
         let k_ptr = conv_out_buf.offset(key_dim * bf16);
         let v_ptr = conv_out_buf.offset(key_dim * 2 * bf16);
@@ -311,6 +341,29 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 (nv * 2) as u32,
                 true,
+                stream,
+            )?,
+            k if (5..=8).contains(&k) => ops::gdn_decode_wyn(
+                ctx.gpu,
+                wy_k,
+                wy_tables,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                gate_ptr,
+                beta_ptr,
+                gdn_out_buf,
+                hi(1),                // per-sequence Hi_0 bases
+                (h_bytes / 4) as u32, // intra-slot Hi_t stride (FP32 elems)
+                n as u32,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                conv_dim as u32, // qk_stride
+                conv_dim as u32, // v_stride
+                (nv * 2) as u32, // gb_stride
+                true,            // state_is_table
                 stream,
             )?,
             _ => ops::gdn_decode_wy4(
