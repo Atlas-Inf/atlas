@@ -21,19 +21,42 @@ use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 
-/// `ATLAS_QSA_VERIFY_ACTIVE=1`: serve an ACTIVE QSA selection on the batched
-/// multi-row path (speculative verify past the inert bound). Off by default
-/// for the first landing; off means every behaviour is exactly as before.
+/// `ATLAS_QSA_VERIFY_ACTIVE`: serve an ACTIVE QSA selection on the batched
+/// multi-row path (speculative verify past the inert bound). Default ON for
+/// NVIDIA since 2026-09-26 (#70): GB10 job 250 measured MTP K=2 + verify-active
+/// at 5.1k context at 28.7 tok/s vs 18.4 serial (+56 %); job 257 measured
+/// needles 10/12 = 10/12 vs serial and deterministic (M vs M2 top-1 100 %,
+/// JSD 0) — NOT output-identical to serial on long generations (top-1 43.7 %,
+/// the same class as existing short-context MTP divergence). TODO(#70): ST-995
+/// A/B and agentic perf leg numbers land here. `=0`/`=false` restores the old
+/// inert-bound refusal; gfx1151 (`atlas_scale`) keeps default OFF (unmeasured
+/// there).
 pub(in crate::layers::qwen3_attention) fn verify_active_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_QSA_VERIFY_ACTIVE").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| {
+        verify_active_decision(
+            std::env::var("ATLAS_QSA_VERIFY_ACTIVE").ok().as_deref(),
+            cfg!(atlas_scale),
+        )
+    })
+}
+
+/// Pure decision (table-tested): explicit `1`/`true` or `0`/`false` wins;
+/// anything else, including unset, defaults ON for NVIDIA and OFF on gfx1151.
+pub(crate) fn verify_active_decision(env: Option<&str>, gfx: bool) -> bool {
+    match env {
+        Some("1") | Some("true") => true,
+        Some("0") | Some("false") => false,
+        _ => !gfx,
+    }
 }
 
 /// Everything the allow-list looks at, as plain facts, so the decision is a
 /// pure function of them.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RowsFacts {
-    /// `ATLAS_QSA_VERIFY_ACTIVE=1`.
+    /// `ATLAS_QSA_VERIFY_ACTIVE` resolved (default ON for NVIDIA —
+    /// see [`verify_active_enabled`]).
     pub switch_on: bool,
     /// mHC highway layer — the only batched body the per-row phase is wired into.
     pub highway: bool,
@@ -57,7 +80,7 @@ impl RowsFacts {
     /// Why the per-row phase cannot serve this step, if it cannot.
     fn refusal(&self) -> Option<&'static str> {
         if !self.switch_on {
-            Some("ATLAS_QSA_VERIFY_ACTIVE is not 1")
+            Some("ATLAS_QSA_VERIFY_ACTIVE is off")
         } else if !self.highway {
             Some("not an mHC highway layer")
         } else if self.mla {
@@ -152,7 +175,7 @@ pub(super) fn plan_qsa_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::{RowsFacts, plan_rows};
+    use super::{RowsFacts, plan_rows, verify_active_decision};
 
     const SERVABLE: RowsFacts = RowsFacts {
         switch_on: true,
@@ -246,5 +269,20 @@ mod tests {
             );
             assert!(err.contains(why), "refusal for {why:?} reads: {err}");
         }
+    }
+
+    #[test]
+    fn verify_active_decision_table() {
+        // Unset: default ON for NVIDIA, OFF on gfx1151.
+        assert!(verify_active_decision(None, false));
+        assert!(!verify_active_decision(None, true));
+        // Explicit off wins on NVIDIA; explicit on wins on gfx1151.
+        assert!(!verify_active_decision(Some("0"), false));
+        assert!(!verify_active_decision(Some("false"), false));
+        assert!(verify_active_decision(Some("1"), false));
+        assert!(verify_active_decision(Some("true"), true));
+        // Unrecognised values behave as unset.
+        assert!(verify_active_decision(Some("yes"), false));
+        assert!(!verify_active_decision(Some("yes"), true));
     }
 }
