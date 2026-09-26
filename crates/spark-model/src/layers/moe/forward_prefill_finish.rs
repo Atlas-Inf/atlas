@@ -8,6 +8,7 @@ use super::*;
 
 impl MoeLayer {
     #[allow(clippy::too_many_arguments)]
+    #[allow(unused_assignments)]
     pub(super) fn forward_prefill_finish(
         &self,
         input: DevicePtr,

@@ -188,7 +188,6 @@ pub fn make_bf16_fallback(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -23,9 +23,8 @@ mod bf16_fallback;
 pub(crate) use bf16_fallback::{BF16_FALLBACK, FALLBACK_LOGGED};
 pub use bf16_fallback::{
     Bf16GemmFallback, DENSE_GEMM_BF16_PIPELINED_THREADS, DENSE_GEMM_BF16_PIPELINED_TILE,
-    DENSE_GEMM_BF16_SCALAR_TILE, DENSE_GEMV_BATCHM_MAX_M,
-    DENSE_GEMV_BATCHM_OUTPUTS_PER_BLOCK, DENSE_GEMV_BATCHM_THREADS, install_bf16_fallback,
-    make_bf16_fallback,
+    DENSE_GEMM_BF16_SCALAR_TILE, DENSE_GEMV_BATCHM_MAX_M, DENSE_GEMV_BATCHM_OUTPUTS_PER_BLOCK,
+    DENSE_GEMV_BATCHM_THREADS, install_bf16_fallback, make_bf16_fallback,
 };
 
 #[allow(non_camel_case_types)]
