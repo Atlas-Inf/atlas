@@ -397,3 +397,70 @@ pub fn qsa_prefill_attn_g(
         .arg_f32(inv_sqrt_d)
         .launch(stream)
 }
+
+/// Whether the tc2 tensor-core prefill attention is selected when the geometry
+/// allows it. Checked after tc3 and before tc/l8 in `prefill_attend_slab`.
+///
+/// Default ON for NVIDIA since 2026-09-25; evidence GB10 jobs 258 + 263
+/// (nvidia/Qwen3.8-Flash-Next-NVFP4, tc2 alone on top of #68's defaults):
+/// dense-region ppl 0.000 %, above-bound ppl -0.019 %, needles 12/12; server
+/// cold TTFT at 31.5k tokens 24.36 -> 20.97 s (-13.8 %), 10.2k 7.42 -> 6.51 s.
+/// NOT bit-identical to the grouped `_g` kernel (different summation tree; QSA
+/// top-k selection is chaotic, so long greedy generations diverge -- ppl +
+/// needles are the gate, not greedy identity). An explicit
+/// `ATLAS_QSA_ATTN_TC=1` / `ATLAS_QSA_ATTN_L8=1` keeps selecting its own
+/// kernel; `ATLAS_QSA_ATTN_TC3=1` already wins because it is checked first;
+/// `ATLAS_QSA_ATTN_TC2=0` restores the exact grouped kernel. gfx1151
+/// (`atlas_scale`) keeps default OFF (unmeasured there).
+pub fn qsa_attn_tc2_enabled() -> bool {
+    let v = |k: &str| std::env::var(k).ok();
+    qsa_attn_tc2_decision(
+        v("ATLAS_QSA_ATTN_TC2").as_deref(),
+        v("ATLAS_QSA_ATTN_TC").as_deref(),
+        v("ATLAS_QSA_ATTN_L8").as_deref(),
+        cfg!(atlas_scale),
+    )
+}
+
+/// Pure decision (table-tested): explicit TC2 wins; otherwise default ON for
+/// NVIDIA unless the operator explicitly asked for tc1 or l8.
+pub(crate) fn qsa_attn_tc2_decision(
+    tc2: Option<&str>,
+    tc1: Option<&str>,
+    l8: Option<&str>,
+    gfx: bool,
+) -> bool {
+    let on = |v: Option<&str>| matches!(v, Some("1") | Some("true"));
+    match tc2 {
+        Some("1") | Some("true") => true,
+        Some("0") | Some("false") => false,
+        _ => !gfx && !on(tc1) && !on(l8),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qsa_attn_tc2_decision;
+
+    #[test]
+    fn qsa_attn_tc2_decision_table() {
+        let d = qsa_attn_tc2_decision;
+        // Unset: default ON for NVIDIA, OFF on gfx1151.
+        assert!(d(None, None, None, false));
+        assert!(!d(None, None, None, true));
+        // Explicit off wins even on NVIDIA.
+        assert!(!d(Some("0"), None, None, false));
+        assert!(!d(Some("false"), None, None, false));
+        // Explicit on wins even on gfx1151.
+        assert!(d(Some("1"), None, None, false));
+        assert!(d(Some("true"), None, None, true));
+        // Explicit tc1 / l8 opt-in keeps its own kernel.
+        assert!(!d(None, Some("1"), None, false));
+        assert!(!d(None, None, Some("true"), false));
+        // tc2 set wins over a tc1 request.
+        assert!(d(Some("1"), Some("1"), None, false));
+        // Unrecognised tc2 value behaves as unset.
+        assert!(d(Some("yes"), None, None, false));
+        assert!(!d(Some("yes"), None, None, true));
+    }
+}

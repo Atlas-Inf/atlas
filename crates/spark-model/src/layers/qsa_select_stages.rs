@@ -4,11 +4,17 @@
 //! the packed rank key, split out of `qsa_select.rs` for the 500-LoC cap.
 //! Bodies are moved verbatim; `qsa_select.rs` keeps the control flow.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::QsaIndexer;
 use crate::layers::ops;
+
+/// Guards the one-time INFO log naming the prefill attention variant
+/// `prefill_attend_slab` dispatched -- serve logs prove which arm engaged.
+static PREFILL_ATTN_VARIANT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Pack `(score DESCENDING, index ASCENDING)` into one `u64` so the top-k
 /// selection is a plain integer partition.
@@ -216,7 +222,9 @@ impl QsaIndexer {
         // different summation tree), so it is opt-in and gated on
         // `scripts/ppl.py`. See TTFT_GAP.md 27.
         // `ATLAS_QSA_ATTN_TC2`: the same tensor-core attention with BOTH
-        // kv heads in one CTA, which halves the M padding.
+        // kv heads in one CTA, which halves the M padding. This is the
+        // NVIDIA DEFAULT -- see `ops::qsa_attn_tc2_enabled` for the
+        // evidence and the override table.
         // `ATLAS_QSA_ATTN_TC3`: tc2's kv-head packing with tc1's BC=32 tile.
         let tc3 = matches!(
             std::env::var("ATLAS_QSA_ATTN_TC3").as_deref(),
@@ -245,12 +253,10 @@ impl QsaIndexer {
                 stream,
             )?;
         }
-        let tc2 =
-            !tc3 && matches!(
-                std::env::var("ATLAS_QSA_ATTN_TC2").as_deref(),
-                Ok("1") | Ok("true")
-            ) && self.k_prefill_attn_tc2_k.0 != 0
-                && ops::qsa_prefill_attn_tc2_ok(nq, self.nkv_attn, self.hd_attn);
+        let tc2 = !tc3
+            && ops::qsa_attn_tc2_enabled()
+            && self.k_prefill_attn_tc2_k.0 != 0
+            && ops::qsa_prefill_attn_tc2_ok(nq, self.nkv_attn, self.hd_attn);
         if tc2 {
             ops::qsa_prefill_attn_tc2(
                 gpu,
@@ -306,6 +312,29 @@ impl QsaIndexer {
                 std::env::var("ATLAS_QSA_ATTN_L8").as_deref(),
                 Ok("1") | Ok("true")
             ) && ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn);
+        if !PREFILL_ATTN_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
+            let variant = if tc3 {
+                "tc3"
+            } else if tc2 {
+                "tc2"
+            } else if tc {
+                "tc"
+            } else if l8 {
+                "l8"
+            } else if ops::qsa_prefill_attn_grouped_ok(nq, self.nkv_attn, self.hd_attn) {
+                "grouped"
+            } else {
+                "per-head"
+            };
+            if variant == "tc2" {
+                tracing::info!(
+                    "QSA prefill attention: tc2 (tensor-core, both kv heads per CTA); \
+                     ATLAS_QSA_ATTN_TC2=0 restores the exact grouped kernel"
+                );
+            } else {
+                tracing::info!("QSA prefill attention: {variant}");
+            }
+        }
         if tc3 || tc2 || tc {
             // already dispatched above
         } else if l8 {
