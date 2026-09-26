@@ -110,6 +110,57 @@ impl MoeLayer {
                 })
                 .unwrap_or(worst_case_m_tiles)
         };
+        // ── PERSISTENT-TILE GRID ──
+        // `max_m_tiles` above is the HOTTEST expert's tile count, and grid.y
+        // carries it for all 512 experts. At 29,671 tokens that is 217 tiles
+        // against an average expert's 10, so ~95% of the 1.11M CTAs launch only
+        // to fall straight out. They are not free -- this kernel's static shared
+        // memory caps residency at 2 CTAs/SM, so the part retires ~96 at a time
+        // and the no-ops serialise ahead of the real work. Measured on a 29.7k
+        // prefill (2026-09-01, scheduler TTFT=):
+        //
+        //     grid.y = 217 (hottest)          19.23 s
+        //     grid.y =  73 (8x average)       17.40 s
+        //     grid.y =  19 (2x average)       16.13 s
+        //
+        // The k64 kernels now stride `blockIdx.y` over m-tiles, so a short grid
+        // still computes every row -- unlike ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR
+        // above, which produced those numbers by DROPPING the rows past the cap
+        // and is a measurement probe, not a setting.
+        //
+        // Gated on the marker kernel, not just the env var: other models reach
+        // this same dispatch with same-named kernels that do NOT stride, and a
+        // short grid would silently truncate their hot experts.
+        // Factor 2 by default, i.e. grid.y covers twice the average expert.
+        // F = 1, 2 and 4 measured within noise of each other (18.43-18.53 s at
+        // 29.7k, 6.40-6.45 s at 10.4k), so the curve is flat once the no-ops
+        // are gone; 2 sits in the middle of that plateau. `=0` opts out.
+        //
+        // Output is unchanged, not approximately unchanged: each output tile is
+        // still computed by exactly one CTA running the same K loop in the same
+        // order, so striding only moves which `blockIdx.y` owns it. All four
+        // legs above returned a byte-identical 48-token greedy completion at
+        // both context lengths.
+        let persist = std::env::var("ATLAS_MOE_PREFILL_PERSIST_TILES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+        //
+        // The short grid goes ONLY to the two launches below whose kernels
+        // stride (`moe_w4a16_fused_gate_up_t_k64`, `..._grouped_gemm_ptrtable_t_k64`).
+        // `max_m_tiles` itself stays the hottest expert's count: every other arm
+        // here -- the untransposed fallbacks (ATLAS_MOE_TRANSPOSE=0, or any boot
+        // or target where the transpose pass did not run), the m128 / fp4 /
+        // e8m0 variants and the FP8 down -- returns past its first m-tile, and
+        // handing it the short grid silently dropped every hot expert's rows
+        // past it: ATLAS_MOE_TRANSPOSE=0 measured dense ppl +14.9 %, above-bound
+        // +174 % (reiner job 267) before this split.
+        let grid_m_strided = if persist > 0 && self.moe_k64_strides_m_tiles.0 != 0 {
+            let capped = avg_per_expert.saturating_mul(persist);
+            max_m_tiles.min(capped.div_ceil(64).max(1) as u32)
+        } else {
+            max_m_tiles
+        };
         super::dump::dump_expert_load(
             ctx.gpu,
             stream,
@@ -283,7 +334,7 @@ impl MoeLayer {
                             num_experts,
                             inter,
                             h,
-                            max_m_tiles,
+                            grid_m_strided,
                             stream,
                         )?;
                     }
@@ -483,7 +534,7 @@ impl MoeLayer {
                             num_experts,
                             h,
                             inter,
-                            max_m_tiles,
+                            grid_m_strided,
                             stream,
                         )?;
                     }

@@ -199,6 +199,40 @@ fn chk(status: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether cuBLASLt is usable at all — handle plus the 64 MB workspace.
+///
+/// Memoised by `ctx()`, so this is one atomic load after the first call. Call
+/// sites use it to choose a WEIGHT LAYOUT up front (see
+/// `hyper_connection_lowrank::hc_pre_gemm`, which skips staging a transposed
+/// copy entirely when cuBLASLt can take the checkpoint layout directly), which
+/// a per-GEMM `Result` cannot express.
+pub fn available() -> bool {
+    ctx().is_ok()
+}
+
+/// Row-major `out[M,N] = act[M,K] @ weight[K,N]`, all BF16 — the NON-transposed
+/// twin of [`bf16_gemm_act_weight_t`], for a weight already stored `[K,N]`.
+///
+/// Same column-major mapping with `opN` on A: a row-major `[K,N]` weight IS a
+/// column-major `(N,K)` matrix with `ld = N`, so `D[N,M] = opN(Aᶜ[N,K]) ·
+/// opN(actᶜ[K,M])`. Nothing else differs — same compute type, same accumulation
+/// width, same output layout.
+///
+/// Exists so a caller holding `[K,N]` does not have to materialise `[N,K]`
+/// first. The mHC collapse was spending 9.0 ms of a 422 ms prefill on exactly
+/// that staging transpose (`hc_transpose_bf16`, 97 launches x ~93 us).
+pub fn bf16_gemm_act_weight_n(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    gemm_bf16(act, weight, out, m, n, k, CUBLAS_OP_N, stream)
+}
+
 /// Row-major `out[M,N] = act[M,K] @ weight[N,K]ᵀ`, all BF16 — the standard
 /// projection GEMM (activation × transposed weight). Maps to cuBLASLt's
 /// column-major convention as `D[N,M] = opT(weightᶜ[K,N]) · opN(actᶜ[K,M])`.
@@ -211,6 +245,23 @@ pub fn bf16_gemm_act_weight_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    gemm_bf16(act, weight, out, m, n, k, CUBLAS_OP_T, stream)
+}
+
+/// Shared body. `op_a` selects the weight's stored layout: `CUBLAS_OP_T` for a
+/// row-major `[N,K]` weight, `CUBLAS_OP_N` for a row-major `[K,N]` one. The A
+/// LAYOUT MUST MATCH: `(k, n, ld=k)` under opT, `(n, k, ld=n)` under opN.
+#[allow(clippy::too_many_arguments)]
+fn gemm_bf16(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    op_a: i32,
+    stream: u64,
+) -> Result<()> {
     let ctx = ctx()?;
     unsafe {
         let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
@@ -218,7 +269,7 @@ pub fn bf16_gemm_act_weight_t(
             cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
             "DescCreate",
         )?;
-        let ta = CUBLAS_OP_T;
+        let ta = op_a;
         let tb = CUBLAS_OP_N;
         chk(
             cublasLtMatmulDescSetAttribute(
@@ -244,8 +295,13 @@ pub fn bf16_gemm_act_weight_t(
         let mut la: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut ld_: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let (a_rows, a_cols, a_ld) = if op_a == CUBLAS_OP_T {
+            (k as u64, n as u64, k as i64) // row-major [N,K] -> col-major (K,N)
+        } else {
+            (n as u64, k as u64, n as i64) // row-major [K,N] -> col-major (N,K)
+        };
         chk(
-            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, k as u64, n as u64, k as i64),
+            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, a_rows, a_cols, a_ld),
             "LayoutA",
         )?;
         chk(
