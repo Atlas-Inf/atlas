@@ -22,6 +22,8 @@ impl BlockDiffusionDraftHead {
         buf: DevicePtr,
         batch_size: u32,
         hidden: u32,
+        // Group γ (rows per sequence in this staged pass).
+        gamma: u32,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -29,11 +31,11 @@ impl BlockDiffusionDraftHead {
             !self.batch_conv_delta.is_null() && !self.batch_conv_out.is_null(),
             "DFlash batched conv scratch is null"
         );
-        let row_elements = (self.gamma as u32)
+        let row_elements = gamma
             .checked_mul(hidden)
             .ok_or_else(|| anyhow::anyhow!("DFlash conv row elements overflow"))?;
         let row_bytes = row_elements as usize * 2;
-        let delta_row_bytes = (self.gamma)
+        let delta_row_bytes = (gamma as usize)
             .checked_mul(2 * conv.kernel_size * conv.num_groups)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash conv delta row bytes overflow"))?;
@@ -50,7 +52,7 @@ impl BlockDiffusionDraftHead {
                 buf_seq,
                 delta_seq,
                 out_seq,
-                self.gamma as u32,
+                gamma,
                 stream,
             )?;
             ctx.gpu
@@ -66,6 +68,8 @@ impl BlockDiffusionDraftHead {
         buf: DevicePtr,
         batch_size: u32,
         hidden: u32,
+        // Group γ (rows per sequence in this staged pass).
+        gamma: u32,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -73,11 +77,11 @@ impl BlockDiffusionDraftHead {
             !self.batch_conv_delta.is_null() && !self.batch_conv_out.is_null(),
             "DFlash batched conv scratch is null"
         );
-        let row_elements = (self.gamma as u32)
+        let row_elements = gamma
             .checked_mul(hidden)
             .ok_or_else(|| anyhow::anyhow!("DFlash conv row elements overflow"))?;
         let row_bytes = row_elements as usize * 2;
-        let delta_row_bytes = (self.gamma)
+        let delta_row_bytes = (gamma as usize)
             .checked_mul(2 * conv.kernel_size * conv.num_groups)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash conv delta row bytes overflow"))?;
@@ -93,7 +97,7 @@ impl BlockDiffusionDraftHead {
                 buf_seq,
                 delta_seq,
                 out_seq,
-                self.gamma as u32,
+                gamma,
                 stream,
             )?;
             ctx.gpu

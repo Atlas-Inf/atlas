@@ -119,21 +119,15 @@ impl BlockDiffusionDraftHead {
         w_nvfp4: &Option<QuantizedWeight>,
         src: DevicePtr,
         dst: DevicePtr,
+        // Row count = this propose's γ (`dstate.propose_gamma` under
+        // adaptive; configured γ otherwise).
+        rows: u32,
         n_out: u32,
         k_in: u32,
         stream: u64,
     ) -> Result<()> {
         self.drafter_gemm_rows(
-            gpu,
-            w_bf16,
-            w_fp8,
-            w_nvfp4,
-            src,
-            dst,
-            self.gamma as u32,
-            n_out,
-            k_in,
-            stream,
+            gpu, w_bf16, w_fp8, w_nvfp4, src, dst, rows, n_out, k_in, stream,
         )
     }
 

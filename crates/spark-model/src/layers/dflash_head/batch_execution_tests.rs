@@ -133,7 +133,11 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let projection_source = include_str!("batch_projection.rs");
     assert!(projection_source.contains("(total_rows - row).min(16)"));
     assert!(!projection_source.contains("w4a16_gemv_batch32"));
-    let tail = &source[source.find("fn run_batched_tail_base").unwrap()..];
+    // The tail/markov methods moved to batch_forward_tail.rs with the
+    // batch_forward.rs split; the relative-order assertions still hold
+    // within the moved bodies.
+    let tail_source = include_str!("batch_forward_tail.rs");
+    let tail = &tail_source[tail_source.find("fn run_batched_tail_base").unwrap()..];
     let final_norm = tail.find("&self.norm").unwrap();
     let lm_head = tail.find("ops::w4a16_gemm").unwrap();
     let argmax = tail.find("ops::argmax_bf16_batch").unwrap();
@@ -145,8 +149,8 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     assert!(tail.contains("self.startup.native_batch_authoritative"));
     assert!(tail.contains("exact NVFP4 LM-head batch kernel is unresolved"));
     assert!(final_norm < lm_head && lm_head < argmax);
-    let markov = &source[source.find("fn run_batched_markov").unwrap()..];
-    let depth_loop = markov.find("for depth in 1..self.gamma").unwrap();
+    let markov = &tail_source[tail_source.find("fn run_batched_markov").unwrap()..];
+    let depth_loop = markov.find("for depth in 1..gamma").unwrap();
     let embed = markov.find("ops::batched_embed").unwrap();
     let project = markov.find("ops::dense_gemv_batchm").unwrap();
     let bias = markov.find("ops::dflash_batch_add_depth_bias").unwrap();

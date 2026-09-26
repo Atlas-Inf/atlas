@@ -73,6 +73,7 @@ mod test_support;
 #[cfg(test)]
 mod think_skip_tests;
 mod types;
+mod verify_dflash_accept;
 mod verify_dflash_batch_step;
 mod verify_dflash_step;
 mod verify_k2_step;
@@ -209,6 +210,24 @@ pub type LoraRotation = (
 /// back to the serialized per-seq loop that MEASURED (2026-07-27) collapses
 /// throughput: cap=4 at C=4 25.8 vs 48.5 MTP-off. Kill switch for A/B:
 /// `ATLAS_NO_MTP_BATCH_VERIFY` (presence) forces that serialized loop.
+/// Per-sequence draft count for the verify-width guards
+/// (`crosses_inert_bound`, `verify_rows_fit`): a DFlash sequence under
+/// `ATLAS_DFLASH_ADAPTIVE_GAMMA=1` verifies γ_i + 1 rows where γ_i is its
+/// current adaptive γ (`propose_gamma − 1` drafts); lever-off pins
+/// `propose_gamma` to the configured γ, making this `num_drafts`-identical.
+/// Non-DFlash proposers and missing state fall back to the scalar.
+fn seq_drafts(a: &ActiveSeq, num_drafts: usize) -> usize {
+    a.seq
+        .proposer_state
+        .as_ref()
+        .and_then(|s| {
+            s.as_any()
+                .downcast_ref::<spark_model::layers::DflashProposerState>()
+        })
+        .map(|d| d.propose_gamma.saturating_sub(1))
+        .unwrap_or(num_drafts)
+}
+
 fn mtp_max_seqs() -> usize {
     // SSOT moved to `spark_model::speculative::mtp_max_seqs()` (batched-MTP
     // E1/E2): the model-side single-sequence MTP structures (catchup ring,
@@ -781,7 +800,11 @@ pub fn run(
             for a in active.iter_mut() {
                 if !a.disable_mtp
                     && verify_ctx_limit.is_some_and(|lim| {
-                        mtp_gate::qsa_latch::crosses_inert_bound(a.seq.seq_len, num_drafts, lim)
+                        mtp_gate::qsa_latch::crosses_inert_bound(
+                            a.seq.seq_len,
+                            seq_drafts(a, num_drafts),
+                            lim,
+                        )
                     })
                 {
                     a.disable_mtp = true;
@@ -909,7 +932,7 @@ pub fn run(
                 && active.iter().all(|a| {
                     mtp_gate::ceiling::verify_rows_fit(
                         a.seq.seq_len,
-                        num_drafts,
+                        seq_drafts(a, num_drafts),
                         sched.limits.max_seq_len,
                     )
                 })

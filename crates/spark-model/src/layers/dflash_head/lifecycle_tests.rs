@@ -94,8 +94,8 @@ fn retirement_is_same_owner_idempotent_and_blocks_every_access() {
 
 #[test]
 fn pointer_reuse_cannot_reuse_graph_identity_across_generation() {
-    let old = DflashGraphIdentity::new(owner(8, 40), 0x100, 0x200, 0x300, 2).unwrap();
-    let new = DflashGraphIdentity::new(owner(8, 41), 0x100, 0x200, 0x300, 2).unwrap();
+    let old = DflashGraphIdentity::new(owner(8, 40), 0x100, 0x200, 0x300, 2, 8).unwrap();
+    let new = DflashGraphIdentity::new(owner(8, 41), 0x100, 0x200, 0x300, 2, 8).unwrap();
     assert_ne!(old, new);
     let mut set = HashSet::new();
     set.insert(old);
@@ -111,8 +111,8 @@ fn pointer_reuse_cannot_reuse_graph_identity_across_generation() {
         ),
         (0x100, 0x200, 0x300, 2)
     );
-    assert!(DflashGraphIdentity::new(owner(8, 42), 0, 0x200, 0x300, 2).is_err());
-    assert!(DflashGraphIdentity::new(owner(8, 42), 0x100, 0x200, 0x300, usize::MAX).is_err());
+    assert!(DflashGraphIdentity::new(owner(8, 42), 0, 0x200, 0x300, 2, 8).is_err());
+    assert!(DflashGraphIdentity::new(owner(8, 42), 0x100, 0x200, 0x300, usize::MAX, 8).is_err());
 }
 
 #[test]
@@ -139,9 +139,15 @@ fn graph_retirement_removes_only_the_exact_generation_owner() {
     let old = owner(2, 10);
     let new = owner(2, 11);
     let mut graphs = HashMap::from([
-        (DflashGraphIdentity::new(old, 1, 2, 3, 0).unwrap(), "old-a"),
-        (DflashGraphIdentity::new(old, 4, 5, 6, 1).unwrap(), "old-b"),
-        (DflashGraphIdentity::new(new, 1, 2, 3, 0).unwrap(), "new"),
+        (
+            DflashGraphIdentity::new(old, 1, 2, 3, 0, 8).unwrap(),
+            "old-a",
+        ),
+        (
+            DflashGraphIdentity::new(old, 4, 5, 6, 1, 8).unwrap(),
+            "old-b",
+        ),
+        (DflashGraphIdentity::new(new, 1, 2, 3, 0, 8).unwrap(), "new"),
     ]);
     let mut retired = take_owned_graphs(&mut graphs, old);
     retired.sort_unstable();
@@ -169,6 +175,11 @@ fn owner_failure_reclaim_frees_state_resources_without_leaking() {
         ctx_hidden_acc: gpu.alloc(4096).unwrap(),
         ctx_len: 12,
         last_num_accepted: 1,
+        propose_gamma: 8,
+        accept_ema: 0.0,
+        adaptive_switches: 0,
+        gamma_max: 8,
+        adaptive_gamma_on: false,
         skip_next_decode_append: false,
         max_ctx_len: 1024,
         ctx_slot_bytes: 64,

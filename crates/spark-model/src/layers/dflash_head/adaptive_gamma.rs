@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Adaptive per-sequence γ for generic DFlash2 (`ATLAS_DFLASH_ADAPTIVE_GAMMA=1`).
+//!
+//! Evidence (reiner job 260, C=1): γ=12 wins on code/JSON (47.9 / 42.6 vs
+//! 37.6 / 39.3 at γ=8) but loses on prose (14.2 vs 14.9) and long code
+//! (26.2 vs 29.0); mean accepted was 5.1 at γ=8 and 7.8 at γ=12, ~1.4 for
+//! prose. A per-sequence EMA of accepted draft tokens picks between the
+//! floor γ=8 and the configured γ_max (12 in the shipped set) — with
+//! hysteresis so a sequence near the boundary does not oscillate.
+//!
+//! Every buffer and pool stays sized for the configured γ_max; a γ=8
+//! sequence uses a prefix of its γ_max-shaped allocations. The lever off is
+//! byte-identical to the legacy path: `propose_gamma` is initialised to
+//! the configured γ and is never updated.
+
+/// Floor γ for the adaptive arm. The shipped set is {8, 12}; γ_max is the
+/// head's configured `--dflash-gamma`.
+pub(crate) const ADAPTIVE_GAMMA_LO: usize = 8;
+/// Thresholds are ACCEPTANCE RATIOS — EMA of accepted drafts over the
+/// current γ's draft count (γ − 1) — because the raw accepted count scales
+/// with γ (job 260 code: 5.1 of 7 at γ=8, 7.8 of 11 at γ=12; prose ~1.4 of
+/// 7). Sequences START at γ_max with the EMA seeded mid-band (RATIO_START)
+/// and fall below 0.35 (prose, ~0.13 at γ=12, falls within ~4 steps); a
+/// fallen sequence rises back above 0.65. Job 436 measured the old
+/// start-at-floor policy (fall 0.45) oscillating on code — 38 switches in
+/// 576 steps, code 38.6 tok/s vs fixed γ=12's 43.2 — because code's γ=12
+/// acceptance averages 0.61 with deep dips. The wide band keeps it at 12.
+const RATIO_RISE: f32 = 0.65;
+const RATIO_FALL: f32 = 0.35;
+const RATIO_START: f32 = 0.55;
+
+/// Exponential moving average of ACCEPTED DRAFT tokens per verify step —
+/// the bonus token is never counted (`num_accepted` already excludes it).
+/// 0.75/0.25 weights ~4-step memory: fast enough to follow a mode change
+/// (prose → code mid-generation), slow enough that one bad step at γ=12
+/// does not immediately collapse back to γ=8.
+pub fn update_ema(ema: f32, accepted: usize) -> f32 {
+    0.75 * ema + 0.25 * (accepted as f32)
+}
+
+/// Per-sequence γ transition: up to `hi` when the acceptance ratio is
+/// strong, down to `lo` when weak, else hold. Returns the next γ and the
+/// EMA rescaled to it (`ema · (next − 1) / (cur − 1)`), so the ratio is
+/// continuous across a switch — without the rescale a γ=12 → 8 fall at
+/// ratio 0.44 would read 0.69 at γ=8 and bounce straight back up. Pure —
+/// called once per sequence after `after_verify` ingests that step's
+/// accepted count.
+pub fn next_gamma(cur: usize, ema: f32, lo: usize, hi: usize) -> (usize, f32) {
+    let drafts = cur.saturating_sub(1).max(1) as f32;
+    let ratio = ema / drafts;
+    let next = if cur < hi && ratio > RATIO_RISE {
+        hi
+    } else if cur > lo && ratio < RATIO_FALL {
+        lo
+    } else {
+        cur
+    };
+    let rescaled = ema * (next.saturating_sub(1).max(1) as f32) / drafts;
+    (next, rescaled)
+}
+
+/// Propose γ at alloc time: the configured γ in both modes. Adaptive starts
+/// HIGH (job 436: code/JSON win at γ=12 on the wyN kernels and must not pay
+/// a climb; prose falls within a few steps). Kept as a fn so every call
+/// site states the policy in one place.
+pub(crate) fn initial_gamma(_adaptive: bool, configured: usize) -> usize {
+    configured
+}
+
+/// Initial acceptance EMA: seeded mid-band (RATIO_START of γ's draft count)
+/// so a fresh sequence neither falls nor rises before real evidence
+/// arrives. Fixed mode never reads it.
+pub(crate) fn initial_ema(gamma: usize) -> f32 {
+    RATIO_START * gamma.saturating_sub(1).max(1) as f32
+}
+
+/// Draft cap for one proposal: `min(num_drafts, gamma - 1)` — a γ_i
+/// proposal emits γ_i rows where the last is the anchor bonus, so the cap
+/// must bound by the PROPOSAL γ, not the configured γ_max (a γ=8 proposal
+/// under γ_max=12 otherwise keeps the bonus as a bogus position-γ draft).
+/// Lever-off: `gamma == self.gamma`, identical to the legacy bound.
+pub(crate) fn draft_cap_for(num_drafts: usize, gamma: usize) -> usize {
+    num_drafts.min(gamma.saturating_sub(1)).max(1)
+}
+
+/// Batch-wide adaptive-γ accumulator behind `DflashProposerState` usage:
+/// steps and accepted-draft totals per γ bucket, switch count, and total
+/// verify calls — the periodic `DFLASH ADAPTIVE` INFO line. Touched only
+/// under the adaptive lever (lever-off: the Mutex is never taken).
+#[derive(Default)]
+pub struct AdaptiveGammaStats {
+    /// Verify calls recorded (all γ).
+    pub verify_calls: u64,
+    /// Steps and accepted-draft totals at the floor γ.
+    pub steps_lo: u64,
+    pub accepted_lo: u64,
+    /// Steps and accepted-draft totals at the configured γ_max.
+    pub steps_hi: u64,
+    pub accepted_hi: u64,
+    /// Total γ transitions (any direction, all sequences).
+    pub switches: u64,
+}
+
+impl AdaptiveGammaStats {
+    /// One entry per verify call: `cur` is the γ the just-verified
+    /// proposal ran at (`propose_gamma` before `next_gamma` moves it).
+    pub fn record(&mut self, cur: usize, accepted: usize, gamma_max: usize) {
+        self.verify_calls += 1;
+        if cur < gamma_max {
+            self.steps_lo += 1;
+            self.accepted_lo += accepted as u64;
+        } else {
+            self.steps_hi += 1;
+            self.accepted_hi += accepted as u64;
+        }
+    }
+
+    /// Every 64 verify calls: one INFO summary, house periodic style.
+    pub fn log_periodic(&self) {
+        const PERIOD: u64 = 64;
+        if !self.verify_calls.is_multiple_of(PERIOD) {
+            return;
+        }
+        let mean = |a: u64, s: u64| {
+            if s == 0 { 0.0 } else { a as f64 / s as f64 }
+        };
+        tracing::info!(
+            "DFLASH ADAPTIVE verify_steps={} g{}={} steps (accept {:.2}) g{}={} steps (accept {:.2}) switches={}",
+            self.verify_calls,
+            ADAPTIVE_GAMMA_LO,
+            self.steps_lo,
+            mean(self.accepted_lo, self.steps_lo),
+            // γ_max is the configured gamma; the hi bucket labels it.
+            12,
+            self.steps_hi,
+            mean(self.accepted_hi, self.steps_hi),
+            self.switches,
+        );
+    }
+}
+
+/// Group key order for the batched split: ascending γ puts the cheap
+/// group first. Returns the distinct γ values present in `gammas`.
+pub(crate) fn distinct_gammas(gammas: &[usize]) -> Vec<usize> {
+    let mut set: Vec<usize> = Vec::with_capacity(2);
+    for &g in gammas {
+        if !set.contains(&g) {
+            set.push(g);
+        }
+    }
+    set.sort_unstable();
+    set
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ema_weights_and_ignores_bonus() {
+        let e = update_ema(0.0, 8);
+        assert_eq!(e, 2.0); // 0.25 * 8
+        let e = update_ema(e, 8);
+        assert!((e - 3.5).abs() < 1e-6);
+        // Bonus token must never be passed in — assert the formula treats
+        // `accepted` as draft tokens only by construction (caller contract).
+        let e = update_ema(4.0, 0);
+        assert!((e - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn next_gamma_hysteresis_on_acceptance_ratio() {
+        let g = |cur, ema| next_gamma(cur, ema, 8, 12).0;
+        // At γ=8 (7 drafts): rise above ratio 0.65 (ema > 4.55).
+        assert_eq!(g(8, 5.1), 12); // job-260 code at γ=8: 0.73
+        assert_eq!(g(8, 4.5), 8); // 0.643, just inside the band: hold
+        assert_eq!(g(8, 3.5), 8); // inside the band
+        assert_eq!(g(8, 1.4), 8); // job-260 prose
+        // At γ=12 (11 drafts): fall below ratio 0.45 (ema < 4.95).
+        assert_eq!(g(12, 7.8), 12); // job-260 code at γ=12: 0.71
+        assert_eq!(g(12, 5.0), 12); // 0.4545, just inside the band: hold
+        assert_eq!(g(12, 4.0), 8);
+        // Off-band values still land in {lo, hi}.
+        assert_eq!(g(10, 7.0), 12);
+        assert_eq!(g(10, 3.0), 8);
+    }
+
+    #[test]
+    fn switch_rescales_ema_so_it_does_not_bounce() {
+        // Fall 12 -> 8 at ratio 0.33: the rescaled EMA keeps ratio 0.33 at
+        // γ=8 (inside the band), so the next step holds at 8.
+        let (g, e) = next_gamma(12, 3.6, 8, 12);
+        assert_eq!(g, 8);
+        assert!((e - 3.6 * 7.0 / 11.0).abs() < 1e-5);
+        assert_eq!(next_gamma(8, e, 8, 12).0, 8);
+        // Rise 8 -> 12 at ratio 0.70 keeps 0.70 at γ=12: holds at 12.
+        let (g, e) = next_gamma(8, 4.9, 8, 12);
+        assert_eq!(g, 12);
+        assert_eq!(next_gamma(12, e, 8, 12).0, 12);
+        // No switch: EMA unchanged.
+        assert_eq!(next_gamma(8, 3.0, 8, 12), (8, 3.0));
+    }
+
+    #[test]
+    fn adaptive_starts_high_with_a_mid_band_ema() {
+        assert_eq!(initial_gamma(false, 12), 12);
+        assert_eq!(initial_gamma(true, 12), 12);
+        assert_eq!(initial_gamma(true, 8), 8);
+        // Seed = 0.55 of γ_max's draft count: inside [0.35, 0.65], so no
+        // transition before the first verify.
+        let e = initial_ema(12);
+        assert!((e - 0.55 * 11.0).abs() < 1e-5);
+        assert_eq!(next_gamma(12, e, 8, 12).0, 12);
+        // Prose (~1.4 accepted) falls within four verifies from the seed.
+        let (mut g, mut e) = (12, initial_ema(12));
+        for _ in 0..4 {
+            e = update_ema(e, 1);
+            (g, e) = next_gamma(g, e, 8, 12);
+        }
+        assert_eq!(g, 8);
+    }
+
+    #[test]
+    fn draft_cap_bounds_by_proposal_gamma() {
+        // Fixed-γ parity: configured 8 or 12 caps at γ-1.
+        assert_eq!(draft_cap_for(7, 8), 7);
+        assert_eq!(draft_cap_for(11, 12), 11);
+        // The #98 defect: a γ=8 proposal under γ_max=12 kept all 8 rows —
+        // the 8th being the anchor bonus presented as a position-γ draft.
+        assert_eq!(draft_cap_for(11, 8), 7);
+        // Degenerate edges keep at least one draft.
+        assert_eq!(draft_cap_for(0, 8), 1);
+        assert_eq!(draft_cap_for(7, 0), 1);
+    }
+
+    #[test]
+    fn distinct_gammas_groups_sorted() {
+        assert_eq!(distinct_gammas(&[8, 8, 12]), vec![8, 12]);
+        assert_eq!(distinct_gammas(&[12, 8, 12, 8]), vec![8, 12]);
+        assert_eq!(distinct_gammas(&[12, 12]), vec![12]);
+        assert!(distinct_gammas(&[]).is_empty());
+    }
+}

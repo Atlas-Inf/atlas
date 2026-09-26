@@ -119,7 +119,13 @@ impl BlockDiffusionDraftHead {
             .lifecycle
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("DFlash proposer state has no generation owner"))?;
-        lifecycle.advance(owner, position, self.gamma, lifecycle.row_stride_bytes())?;
+        // Per-sequence γ: `propose_gamma` equals the configured γ unless
+        // `ATLAS_DFLASH_ADAPTIVE_GAMMA=1` moved it on the last after_verify.
+        // Row accounting (advance), the ctx commit width, the attention
+        // span, and the graph identity all key on THIS γ — a γ=8 sequence
+        // uses a prefix of its γ_max-sized scratch.
+        let gamma = dstate.propose_gamma;
+        lifecycle.advance(owner, position, gamma, lifecycle.row_stride_bytes())?;
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator at propose entry ──
         // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
@@ -546,6 +552,7 @@ impl BlockDiffusionDraftHead {
             last_token,
             position,
             _num_drafts,
+            gamma,
             dstate,
             owner,
             option_b_arg,
@@ -570,6 +577,7 @@ impl BlockDiffusionDraftHead {
         last_token: u32,
         position: usize,
         _num_drafts: usize,
+        gamma: usize,
         dstate: &mut DflashProposerState,
         owner: super::SequenceGeneration,
         option_b_arg: Option<(DevicePtr, u32)>,
@@ -596,6 +604,7 @@ impl BlockDiffusionDraftHead {
                 markov_bias,
                 owner,
                 lane_id,
+                gamma,
                 defer_readback,
             )
             .map_err(|e| {
@@ -606,7 +615,7 @@ impl BlockDiffusionDraftHead {
         // forward_block returns [mask_1 .. mask_{γ-1}, bonus_0]; the bonus
         // row is NOT a draft (vLLM sample_off=1). Capping at γ sent that
         // extra token into M=γ+1 target verify (~11 ms) for no accept gain.
-        let cap = self.draft_cap(_num_drafts);
+        let cap = self.draft_cap(_num_drafts, gamma);
 
         // ATLAS_DFLASH_VERIFY_TRACE=1: log all γ drafts BEFORE the cap so we
         // can see whether the drafter echoes only at position 0 or across
@@ -638,9 +647,13 @@ impl BlockDiffusionDraftHead {
 
     /// Draft-count cap shared by the immediate and deferred readback paths:
     /// scheduler K (`num_drafts` = γ-1) unless the startup ablation override
-    /// is set; the Lightning product policy rejects any override.
-    pub(super) fn draft_cap(&self, num_drafts: usize) -> usize {
-        let default_k = num_drafts.min(self.gamma.saturating_sub(1)).max(1);
+    /// is set; the Lightning product policy rejects any override. `gamma` is
+    /// the γ this proposal ran at (`dstate.propose_gamma`), NOT `self.gamma`:
+    /// under adaptive γ a γ=8 proposal emits 8 rows where the 8th is the
+    /// anchor bonus — capping at γ_max−1 kept it as a bogus position-γ
+    /// draft; the serial γ=8 arm returns only its 7 mask drafts.
+    pub(super) fn draft_cap(&self, num_drafts: usize, gamma: usize) -> usize {
+        let default_k = super::adaptive_gamma::draft_cap_for(num_drafts, gamma);
         self.startup.draft_cap_override.unwrap_or(default_k)
     }
 
@@ -669,7 +682,6 @@ impl BlockDiffusionDraftHead {
     ) -> Result<Vec<Vec<u32>>> {
         let n = last_tokens.len();
         let lanes_n = self.lane_count();
-        let cap = self.draft_cap(num_drafts);
         let default_stream = ctx.gpu.default_stream();
         ctx.gpu
             .record_event(self.lanes_start_event, default_stream)?;
@@ -688,12 +700,14 @@ impl BlockDiffusionDraftHead {
         let mut lane_last_use: Vec<Option<usize>> = vec![None; lanes_n];
         let mut out: Vec<Option<Vec<u32>>> = vec![None; n];
         let mut lane_scratch_list: Vec<&DflashScratch> = Vec::with_capacity(n);
+        let mut propose_gammas = vec![self.gamma; n];
         for i in 0..n {
             let lane = {
                 let dstate = states[i]
                     .as_any_mut()
                     .downcast_mut::<DflashProposerState>()
                     .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+                propose_gammas[i] = dstate.propose_gamma;
                 batch_execution::resolve_lane_id(dstate.lane_id, lanes_n)?
             };
             let (lane_stream, lane_scratch, lane_markov_embed, lane_markov_bias) =
@@ -705,8 +719,12 @@ impl BlockDiffusionDraftHead {
             // Flush this lane's previous user BEFORE its single-slot pinned
             // buffer is overwritten by the enqueue below.
             if let Some(prev_i) = lane_last_use[lane] {
-                out[prev_i] =
-                    Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[prev_i], cap)?);
+                out[prev_i] = Some(self.read_deferred_drafts(
+                    ctx.gpu,
+                    lane_scratch_list[prev_i],
+                    self.draft_cap(num_drafts, propose_gammas[prev_i]),
+                    propose_gammas[prev_i],
+                )?);
             }
             lane_last_use[lane] = Some(i);
             lane_scratch_list.push(lane_scratch);
@@ -734,7 +752,12 @@ impl BlockDiffusionDraftHead {
         // and read in batch order. Lane scratch borrows outlive the loop.
         for i in 0..n {
             if out[i].is_none() {
-                out[i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[i], cap)?);
+                out[i] = Some(self.read_deferred_drafts(
+                    ctx.gpu,
+                    lane_scratch_list[i],
+                    self.draft_cap(num_drafts, propose_gammas[i]),
+                    propose_gammas[i],
+                )?);
             }
         }
         let out: Vec<Vec<u32>> = out.into_iter().map(|o| o.unwrap_or_default()).collect();

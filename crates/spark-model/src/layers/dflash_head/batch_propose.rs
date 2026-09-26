@@ -27,6 +27,10 @@ impl BlockDiffusionDraftHead {
         target_hiddens: &[DevicePtr],
         positions: &[usize],
         num_drafts: usize,
+        // Group γ for this staged pass — `dstate.propose_gamma` is uniform
+        // within a group under `ATLAS_DFLASH_ADAPTIVE_GAMMA=1`; equals the
+        // configured `gamma` otherwise (single group, unchanged path).
+        gamma: usize,
         states: &mut [&mut dyn crate::speculative::ProposerState],
         expected_owners: &[SequenceGeneration],
         native_authoritative: bool,
@@ -67,16 +71,12 @@ impl BlockDiffusionDraftHead {
             batch_kv_lens.push(
                 dstate
                     .ctx_count_drafter
-                    .checked_add(self.gamma)
+                    .checked_add(gamma)
                     .ok_or_else(|| anyhow::anyhow!("DFlash batch KV length overflow"))?,
             );
         }
-        let batch_slot_mapping = batch_execution::paged_slot_mapping(
-            &batch_block_tables,
-            &batch_ctx_counts,
-            self.gamma,
-            16,
-        )?;
+        let batch_slot_mapping =
+            batch_execution::paged_slot_mapping(&batch_block_tables, &batch_ctx_counts, gamma, 16)?;
         let batch_slots_ready =
             block_table_ptrs.iter().all(|&pointer| pointer != 0) && batch_slot_mapping.is_some();
         if self.startup.diagnostics.batch_parity {
@@ -107,10 +107,10 @@ impl BlockDiffusionDraftHead {
         let expected_gamma = if native_authoritative {
             LIGHTNING_SERVED_GAMMA
         } else {
-            self.gamma
+            gamma
         };
         let batch_inputs = DsparkBatchInput::validate(
-            self.gamma,
+            gamma,
             expected_gamma,
             self.batch_capacity,
             &owners,
@@ -150,7 +150,7 @@ impl BlockDiffusionDraftHead {
             .collect();
         let cu_seqlens: Vec<i32> = (0..=n)
             .map(|sequence| {
-                i32::try_from(sequence * self.gamma)
+                i32::try_from(sequence * gamma)
                     .map_err(|_| anyhow::anyhow!("DFlash batch cu_seqlens overflow"))
             })
             .collect::<Result<_>>()?;
@@ -210,9 +210,8 @@ impl BlockDiffusionDraftHead {
             u32::try_from(n).map_err(|_| anyhow::anyhow!("DFlash batch width exceeds u32"))?;
         let native_staged = batch_slots_ready && self.lane_count() == 1;
         if native_staged {
-            let max_kv_len =
-                u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
-                    .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
+            let max_kv_len = u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(gamma))
+                .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
             // Generic DFlash2 has no attention sinks and uses the same
             // per-sequence indirect attention kernel as the serial Option-B
             // path; the Lightning product keeps the batched-sink kernel.
@@ -230,6 +229,7 @@ impl BlockDiffusionDraftHead {
                     batch_rows,
                     batch_size,
                     max_kv_len,
+                    gamma as u32,
                     serial_tables,
                     serial_args,
                     ctx,
@@ -247,7 +247,7 @@ impl BlockDiffusionDraftHead {
                             .zip(expected.chunks_exact(2))
                             .position(|(lhs, rhs)| lhs != rhs)
                             .unwrap_or(0);
-                        let per_sequence = self.gamma * self.hidden_size;
+                        let per_sequence = gamma * self.hidden_size;
                         let sequence = first / per_sequence;
                         let local = first % per_sequence;
                         anyhow::bail!(
@@ -270,9 +270,9 @@ impl BlockDiffusionDraftHead {
             }
             self.run_batched_tail_base(batch_rows, ctx, stream)?;
             if self.candidate_selector.is_some() {
-                self.run_batched_dflash2_tail(batch_size, last_tokens, ctx, stream)?;
+                self.run_batched_dflash2_tail(batch_size, gamma, last_tokens, ctx, stream)?;
             } else {
-                self.run_batched_markov(batch_size, ctx, stream)?;
+                self.run_batched_markov(batch_size, gamma as u32, ctx, stream)?;
             }
         }
 
@@ -310,7 +310,7 @@ impl BlockDiffusionDraftHead {
                     tracing::info!(
                         "DFlash Bxgamma staged parity PASS: batch={} gamma={} rows={}",
                         n,
-                        self.gamma,
+                        gamma,
                         batch_inputs.total_rows()
                     );
                 } else {
@@ -333,7 +333,7 @@ impl BlockDiffusionDraftHead {
                 let mut out = native.ok_or_else(|| {
                     anyhow::anyhow!("Lightning DSpark native batch returned no staged tokens")
                 })?;
-                let cap = num_drafts.min(self.gamma.saturating_sub(1)).max(1);
+                let cap = num_drafts.min(gamma.saturating_sub(1)).max(1);
                 for (i, tokens) in out.iter_mut().enumerate() {
                     tokens.truncate(cap);
                     let dstate = states[i]
@@ -354,7 +354,7 @@ impl BlockDiffusionDraftHead {
                          (cache slots not ready or staging skipped)"
                     )
                 })?;
-                let cap = self.draft_cap(num_drafts);
+                let cap = self.draft_cap(num_drafts, gamma);
                 for (i, tokens) in out.iter_mut().enumerate() {
                     tokens.truncate(cap);
                     let dstate = states[i]
