@@ -152,6 +152,9 @@ ue4m3 = "ue4m3"
 extend-exclude = [
     "test_data/",
     "vendor/",
+    # ExLlamaV3 device code kept near-verbatim (MIT, see its NOTICE.md); upstream
+    # identifiers such as `twords` (trellis words per tile) are not ours to rename.
+    "exl3_vendor/",
     "target/",
     "book/output/",
     "tests/all_models_results*/",
