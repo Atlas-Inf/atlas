@@ -49,6 +49,10 @@ fn lightning_declares_exact_proven_try_kernel_fallbacks() {
         ("w4a16", "w4a16_gemm_t_m128_bf16"),
         ("w4a16", "w4a16_gemm_t_p3"),
         ("w4a4", "w4a4_gemm_mfast"),
+        ("w4a16_gemv_dp4a", "quantize_act_int8_g16_batch4_d4"),
+        ("w4a16_gemv_dp4a", "w4a16_gemv_dp4a_batch4_d4"),
+        ("w4a16_gemv_dp4a", "w4a16_gemv_dp4a_batch4_d4_os"),
+        ("w8a16_gemm_n_m128", "w8a16_gemm_n_m128"),
     ]
     .into_iter()
     .map(|(m, k)| (m.to_owned(), k.to_owned()))
