@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Vendored from turboderp-org/exllamav3 @ 6b84a21 (MIT, Copyright (c) 2025 Turboderp); see NOTICE.md.
+// Modifications: added pragma once and the exl3_util.cuh shim; sq kernel changed to __device__ (instantiated by exl3_int8.cu); <cublas_v2.h> and util/ptx includes replaced by exl3_util.cuh.
 #pragma once
 
 // Device side of the fused int8-activation GEMV (see comment below). Kernels are instantiated in
@@ -6,12 +9,9 @@
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <cublas_v2.h>
 #include <cstdio>
 #include <cooperative_groups.h>
-#include "../util.h"
-#include "../util.cuh"
-#include "../ptx.cuh"
+#include "exl3_util.cuh"
 #include "exl3_dq.cuh"
 #include "hadamard_inner.cuh"
 
@@ -999,7 +999,7 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
 }
 
 template <int bits, int M, bool c_fp32, bool residual, bool HALF = false>
-__global__ __launch_bounds__(NUM_THREADS)
+__device__ __forceinline__
 void exl3_gemv_int8_sq_kernel
 (
     const half* __restrict__ A,

@@ -222,3 +222,57 @@ fn exl3_reconstruct_arity_pin() {
         ENTRIES.len()
     );
 }
+
+/// The EXL3 int8 "sq" GEMV module (exl3_int8.cu) is a standalone bundle member, so it gets
+/// its own pin: the six sq entries take ten params (A, B, C, size_m, size_k, size_n, locks,
+/// suh, A_had, svh) and the conversion three (in, out, n); the M6b launchers must pass exactly
+/// that many. Update launcher and pin in the same commit.
+#[test]
+#[ignore = "needs a real kernel build"]
+fn exl3_int8_arity_pin() {
+    if atlas_kernels::available_targets()
+        .iter()
+        .all(|s| s.modules.is_empty())
+    {
+        eprintln!("no compiled PTX in this binary (stub build) — arity pin skipped");
+        return;
+    }
+    const ENTRIES: &[(&str, usize)] = &[
+        ("exl3_int8_sq_k4_m1", 10),
+        ("exl3_int8_sq_k4_m2", 10),
+        ("exl3_int8_sq_k5_m1", 10),
+        ("exl3_int8_sq_k5_m2", 10),
+        ("exl3_int8_sq_k6_m1", 10),
+        ("exl3_int8_sq_k6_m2", 10),
+        ("exl3_f32_to_bf16", 3),
+    ];
+    let mut checked = 0usize;
+    for set in atlas_kernels::available_targets() {
+        for (module, blob) in &set.modules {
+            let Ok(ptx) = std::str::from_utf8(blob) else {
+                continue;
+            };
+            if *module != "exl3_int8" {
+                continue;
+            }
+            for &(kernel, arity) in ENTRIES {
+                if let Some(count) = ptx_param_count(ptx, kernel) {
+                    assert_eq!(
+                        count, arity,
+                        "PTX arity drift: {module}::{kernel} on target {} has \
+                         {count} params, pin expects {arity} — update the launcher AND \
+                         this pin together",
+                        set.target.model
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= ENTRIES.len(),
+        "exl3_int8 arity test checked only {checked} entries (expected all {}) — \
+         registry drift?",
+        ENTRIES.len()
+    );
+}
