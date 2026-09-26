@@ -294,7 +294,7 @@ impl std::error::Error for LightningDsparkPolicyError {}
 pub struct DsparkStartupExecution {
     /// Official Lightning returns the native B×gamma proposal. Generic
     /// DFlash's authoritative batched proposer is default-on via
-    /// [`generic_batch_authoritative`] (rollback `ATLAS_DFLASH_BATCHED_PROPOSE=0`).
+    /// `generic_batch_authoritative` (rollback `ATLAS_DFLASH_BATCHED_PROPOSE=0`).
     pub native_batch_authoritative: bool,
     /// Option B paged-context drafter path is active.
     pub option_b_enabled: bool,
