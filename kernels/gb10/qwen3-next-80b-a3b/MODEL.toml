@@ -129,3 +129,10 @@ gated_delta_rule_decode_f16_norm = "FP16 h-state twin; see honesty note above. F
 gated_delta_rule_decode_f16_strided_norm_half = "FP16 h-state twin; see honesty note above. F32 strided-norm arm resolves."
 gated_delta_rule_decode_f32_strided_norm_half = "Half-register twin; selected only under the resolved half-register gate (ATLAS_GDN_HALF_REG presence, off as shipped)."
 gated_delta_rule_decode_f32_strided_norm_smem = "SMEM-staged twin; gated behind ATLAS_GDN_SMEM_STAGE (off as shipped) AND the half-register gate."
+# `moe_persist_marker` ships only in qwen3.8-flash-next (whose k64 prefill
+# kernel was measured m-tile-strided); everywhere else the marker module is
+# absent by design and handle 0 keeps the full m-tile grid. The lookup is
+# issued unconditionally by MoeLayer::new (moe/init.rs), which every MoE
+# model_type this target serves constructs.
+[expected_absent.moe_persist_marker]
+moe_w4a16_k64_strides_m_tiles = "Capability marker issued by MoeLayer::new on every MoeLayer MoE model; only targets whose k64 prefill kernels were measured to stride m-tiles ship it (qwen3.8-flash-next). Absent here by design: handle 0 keeps the full m-tile grid."

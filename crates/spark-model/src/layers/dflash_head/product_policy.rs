@@ -293,10 +293,14 @@ impl std::error::Error for LightningDsparkPolicyError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DsparkStartupExecution {
     /// Official Lightning returns the native B×gamma proposal. Generic
-    /// DFlash remains on its historical proposer unless parity is explicit.
+    /// DFlash's authoritative batched proposer is default-on via
+    /// `generic_batch_authoritative` (rollback `ATLAS_DFLASH_BATCHED_PROPOSE=0`).
     pub native_batch_authoritative: bool,
     /// Option B paged-context drafter path is active.
     pub option_b_enabled: bool,
+    /// Generic DFlash serves the staged Bxgamma drafts authoritatively
+    /// (`ATLAS_DFLASH_BATCHED_PROPOSE=1` + Option B + single lane).
+    pub generic_batch_authoritative: bool,
     /// Number of total propose lanes (lane 0 is the default stream).
     pub proposal_lane_count: usize,
     /// Diagnostic draft-depth cap override; `None` keeps scheduler K.
@@ -322,6 +326,7 @@ impl DsparkStartupExecution {
         Self {
             native_batch_authoritative: true,
             option_b_enabled: toggles.option_b_enabled,
+            generic_batch_authoritative: false,
             proposal_lane_count: toggles.proposal_lane_count,
             draft_cap_override: toggles.draft_cap_override,
             option_b_no_ctx: false,
@@ -359,14 +364,52 @@ impl DsparkStartupExecution {
         ]
         .iter()
         .any(|name| present(name));
+        let option_b_env = std::env::var("ATLAS_DFLASH_OPTION_B")
+            .ok()
+            .map(|v| v.as_str().to_owned());
+        let option_b_enabled = option_b_decision(option_b_env.as_deref());
+        if let Some(v) = option_b_env.as_deref()
+            && !matches!(v, "0" | "1")
+        {
+            tracing::warn!(
+                "ATLAS_DFLASH_OPTION_B={v:?} is malformed (expected 0 or 1); \
+                 keeping the default (on)"
+            );
+        }
+        let proposal_lane_count = std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(1)
+            .max(1);
+        let batch_env = std::env::var("ATLAS_DFLASH_BATCHED_PROPOSE")
+            .ok()
+            .map(|v| v.as_str().to_owned());
+        let batch_env_ref = batch_env.as_deref();
+        let generic_batch_authoritative = generic_batch_authoritative_decision(
+            batch_env_ref,
+            option_b_enabled,
+            proposal_lane_count,
+        );
+        if let Some(v) = batch_env_ref
+            && !matches!(v, "0" | "1")
+        {
+            tracing::warn!(
+                "ATLAS_DFLASH_BATCHED_PROPOSE={v:?} is malformed (expected 0 or 1); \
+                 treating as 0 — batched propose disabled"
+            );
+        }
+        if batch_env_ref == Some("1") && !generic_batch_authoritative {
+            tracing::warn!(
+                "ATLAS_DFLASH_BATCHED_PROPOSE=1 ignored: requires Option B \
+                 (ATLAS_DFLASH_OPTION_B not 0) and a single propose lane \
+                 (option_b={option_b_enabled}, lanes={proposal_lane_count})"
+            );
+        }
         Self {
             native_batch_authoritative: false,
-            option_b_enabled: one("ATLAS_DFLASH_OPTION_B"),
-            proposal_lane_count: std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or(1)
-                .max(1),
+            option_b_enabled,
+            generic_batch_authoritative,
+            proposal_lane_count,
             draft_cap_override: std::env::var("ATLAS_DFLASH_DRAFT_CAP")
                 .ok()
                 .and_then(|raw| raw.parse().ok()),
@@ -420,4 +463,36 @@ pub fn enforce_lightning_structural_gate(
         ));
     }
     Ok(())
+}
+
+/// Pure decision: generic-DFlash Option B (paged drafter context with
+/// incremental ctx precompute, graph-eligible). DEFAULT-ON: it is the only
+/// measured GB10 configuration and is required by batched propose. The
+/// legacy contiguous path stays correct on the h128 drafter (from_weights
+/// hard-requires `inferspark_prefill_h128`), but it is eager-only and
+/// rebuilds ctx K/V every propose. `ATLAS_DFLASH_OPTION_B=0` rolls back;
+/// any other malformed value keeps the default with a startup WARN at the
+/// call site.
+pub fn option_b_decision(env: Option<&str>) -> bool {
+    !matches!(env, Some("0"))
+}
+
+/// Pure decision: generic-DFlash authoritative Bxgamma propose. It is
+/// DEFAULT-ON when the staged seam is reachable (Option B paged context,
+/// exactly one proposal lane — multi-lane pins per-lane scratch and graph
+/// state that the staged path does not carry). `ATLAS_DFLASH_BATCHED_PROPOSE`
+/// is the rollback: `"0"` disables, `"1"` forces on when the preconditions
+/// hold (the only spelling that warns when they do not), and any other value
+/// is malformed — off, matching the legacy lenient convention that a
+/// malformed opt-in lever is treated as unset.
+pub fn generic_batch_authoritative_decision(
+    env: Option<&str>,
+    option_b: bool,
+    lanes: usize,
+) -> bool {
+    let reachable = option_b && lanes == 1;
+    match env {
+        None | Some("1") => reachable,
+        Some(_) => false,
+    }
 }

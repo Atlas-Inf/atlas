@@ -227,3 +227,21 @@ fn compile_invalid_structural_tag_is_typed_error() {
     let err = c.compile_structural_tag("{not json").unwrap_err();
     assert!(matches!(err, CompileError::StructuralTag(_)));
 }
+
+#[test]
+fn compiled_grammar_shares_compiler_tokenizer_storage() {
+    // #73: a CompiledGrammar holds a TokenizerInfo HANDLE — the compiler's
+    // vocabulary buffers, not a ~20 MB deep copy per grammar.
+    let c = compiler(1);
+    let cg = c
+        .compile_grammar_from_ebnf("root ::= \"abc\"\n", "root")
+        .expect("compile");
+    assert_eq!(
+        cg.tokenizer_info().decoded_vocab().as_ptr(),
+        c.tokenizer_info().decoded_vocab().as_ptr()
+    );
+    assert_eq!(
+        cg.tokenizer_info().sorted_decoded_vocab().as_ptr(),
+        c.tokenizer_info().sorted_decoded_vocab().as_ptr()
+    );
+}

@@ -503,11 +503,19 @@ pub fn build_model(
             );
         }
     }
+    // Issue #71: lazy FP8→BF16 dequant copies allocate after this sizing;
+    // see `ops::lazy_bf16_reserve` for what counts and what logs.
+    let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
     let kv_budget = total_budget
         .saturating_sub(used_so_far)
         .saturating_sub(inference_reserve)
-        .min(actual_free.saturating_sub(inference_reserve));
+        .saturating_sub(derived_reserve)
+        .min(
+            actual_free
+                .saturating_sub(inference_reserve)
+                .saturating_sub(derived_reserve),
+        );
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -550,25 +558,41 @@ pub fn build_model(
         }
         None => {
             if kv_budget == 0 {
+                let lazy_bf16_term = if derived_reserve > 0 {
+                    format!(
+                        " + {:.1} GB lazy BF16 reserve (ATLAS_CUBLAS_GEMM / \
+                         ATLAS_CUTLASS_GEMM / ATLAS_FP8_ROWWISE — unset the \
+                         flag to release it)",
+                        gib(derived_reserve),
+                    )
+                } else {
+                    String::new()
+                };
                 anyhow::bail!(
                     "No memory left for KV cache: total GPU = {:.1} GB, \
                      --gpu-memory-utilization {:.0}% → budget {:.1} GB, \
-                     but {:.1} GB already consumed + {:.1} GB inference reserve \
-                     = {:.1} GB committed.  Raise --gpu-memory-utilization or \
-                     use a smaller model.",
+                     but {:.1} GB already consumed + {:.1} GB inference reserve\
+                     {lazy_bf16_term} = {:.1} GB committed.  Raise \
+                     --gpu-memory-utilization or use a smaller model.",
                     total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                     gpu_memory_utilization * 100.0,
                     total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
                     used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
                     inference_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
-                    (used_so_far + inference_reserve) as f64 / (1024.0 * 1024.0 * 1024.0),
+                    (used_so_far + inference_reserve + derived_reserve) as f64
+                        / (1024.0 * 1024.0 * 1024.0),
                 );
             }
             let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
             let max_kv_tokens = n * kv_block_size;
+            let lazy_bf16_term = if derived_reserve > 0 {
+                format!(" + {:.1} GB lazy BF16", gib(derived_reserve))
+            } else {
+                String::new()
+            };
             tracing::info!(
                 "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
-                 {:.1} GB pre-KV + {:.1} GB reserve → {:.1} GB for KV \
+                 {:.1} GB pre-KV + {:.1} GB reserve{lazy_bf16_term} → {:.1} GB for KV \
                  → {} blocks × {} tok/block = {} max KV tokens",
                 total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                 gpu_memory_utilization * 100.0,

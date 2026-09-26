@@ -102,6 +102,11 @@ impl Qwen3AttentionLayer {
         // failed row in the boot audit. See `init_arch_gates`.
         let probes = ArchProbes::from_config(config);
         let mrope_interleaved = config.mrope_interleaved;
+        // The warp_row Q/K-norm dispatch sites (prefill/cache_skip.rs) gate on
+        // the norm WEIGHT being non-null, so the lookup is unissuable for a
+        // model that ships no per-head Q/K norms (Nemotron-H). Compute it
+        // before `attn` moves into the struct literal.
+        let has_per_head_qk_norm = !attn.q_norm.weight.is_null() || !attn.k_norm.weight.is_null();
         Ok(Self {
             input_norm,
             attn,
@@ -189,7 +194,11 @@ impl Qwen3AttentionLayer {
                 "w8a16_gemm_t_m128",
                 "w8a16_gemm_t_m128",
             ),
-            w8a16_gemm_n_m128_k: super::super::try_kernel(
+            // `w8a16_gemm_n_m128` exists only in kernels/strix-hip/common —
+            // ATLAS_TARGET_HW=strix-hip sets cfg!(atlas_hip). On every other
+            // target the lookup can never resolve; don't issue it.
+            w8a16_gemm_n_m128_k: gate(
+                cfg!(atlas_hip),
                 gpu,
                 "w8a16_gemm_n_m128",
                 "w8a16_gemm_n_m128",
@@ -213,15 +222,20 @@ impl Qwen3AttentionLayer {
             rms_norm_w_warp_row_k: if crate::ships_vanilla_norm_weights(config) {
                 gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla_warp_row")
                     .unwrap_or(KernelHandle(0))
-            } else {
+            } else if has_per_head_qk_norm {
                 // Offset-convention models (Qwen3.5/3.6/3.8): the warp_row
                 // structure from the vanilla module, applied to the (1 + w)
                 // scaling this module's block kernel implements. The
                 // block-per-row kernel runs ~43x above its bandwidth floor on
                 // the short-row Q/K norm shapes (head_dim 128-256, num_rows
                 // = heads × seq_len), which measured 52 ms/layer on Strix.
+                // Lookup gated on per-head Q/K norms existing — the only
+                // dispatch sites are behind the same weight-non-null check,
+                // so a norm-less model (Nemotron-H) never issues it.
                 gpu.kernel("norm", "rms_norm_offset_warp_row")
                     .unwrap_or(KernelHandle(0))
+            } else {
+                KernelHandle(0)
             },
             norm_vanilla: crate::ships_vanilla_norm_weights(config),
             rms_norm_residual_k: if crate::ships_vanilla_norm_weights(config) {
@@ -485,17 +499,23 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu),
             w4a16_gemv_batch16_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
-            dp4a_quant_batch4_k: super::super::try_kernel(
+            // `w4a16_gemv_dp4a` exists only in kernels/strix-hip/common —
+            // ATLAS_TARGET_HW=strix-hip sets cfg!(atlas_hip). On every other
+            // target the lookup can never resolve; don't issue it.
+            dp4a_quant_batch4_k: gate(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "quantize_act_int8_g16_batch4_d4",
             ),
-            dp4a_gemv_batch4_k: super::super::try_kernel(
+            dp4a_gemv_batch4_k: gate(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_batch4_d4",
             ),
-            dp4a_gemv_batch4_os_k: super::super::try_kernel(
+            dp4a_gemv_batch4_os_k: gate(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_batch4_d4_os",

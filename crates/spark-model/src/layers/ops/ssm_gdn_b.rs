@@ -280,7 +280,7 @@ pub fn gdn_decode_wy4(
 
 /// WY-Chunkwise Gated Delta Rule, pool-layout intermediates — K-generic
 /// launch shared by the K=17 DFlash verify (`gated_delta_rule_wy17`) and the
-/// chain-verify K∈{5..8} instantiations (`gated_delta_rule_wy5..wy8`, one
+/// chain-verify K∈{5..16} instantiations (`gated_delta_rule_wy5..wy16`, one
 /// templated source `gated_delta_rule_wyn.cu`). K is compile-time in the
 /// kernel; the caller selects it via the `kernel` handle. Computes K H·k dot
 /// products in 1 pass over H, applies WY algebraic correction over K tokens
@@ -290,6 +290,14 @@ pub fn gdn_decode_wy4(
 /// `h_state_inter_base` points to a contiguous pool of (K-1) intermediate
 /// H states per (layer, slot). Each Hi_t is at
 /// `h_state_inter_base + t * inter_stride_floats` (per (b, vh) sub-region).
+///
+/// `state_is_table` (the wy4 idiom): when true, `h_state` and
+/// `h_state_inter_base` are device pointer tables of `batch_size` per-sequence
+/// bases — intermediates keep `inter_stride_floats` between Hi_t within a
+/// sequence's slot. The K=17 `gated_delta_rule_wy17` kernels declare the flag
+/// too (matching this params list contractually) but have only the contiguous
+/// single-sequence form — `state_is_table != 0` traps. wy17 launches here
+/// always pass `false` (its dispatch arm is per-sequence).
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_decode_wyn(
     gpu: &dyn GpuBackend,
@@ -311,20 +319,18 @@ pub fn gdn_decode_wyn(
     qk_stride: u32,
     v_stride: u32,
     gb_stride: u32,
+    state_is_table: bool,
     stream: u64,
 ) -> Result<()> {
-    // `gdn_decode_wyn`'s kernel hardcodes the CONTIGUOUS state stride
-    // ((b*num_v_heads+vh)*hv) for BOTH h_state and the intermediates. That is
-    // wrong for the intermediates, whose pool stride is num_intermediates x
-    // larger — at batch_size>1 sequence 1's Hi0 lands on sequence 0's Hi1,
-    // silently corrupting cross-sequence rollback. Only wy4 has the
-    // `state_is_table` pointer-table form that sidesteps this. Refuse rather
-    // than corrupt; port the table form (see gated_delta_rule_wy4.cu) before
-    // enabling a batched verify at K<4.
+    // The contiguous form strides BOTH h_state and the intermediates by
+    // (b*num_v_heads+vh)*hv — wrong for the intermediates, whose pool stride
+    // is num_intermediates x larger — so batch_size>1 requires the table
+    // form, where `h_state`/`h_state_inter_base` are per-sequence pointer
+    // tables (see gated_delta_rule_wy4.cu / gated_delta_rule_wyn.cu).
     anyhow::ensure!(
-        batch_size == 1,
+        state_is_table || batch_size == 1,
         "gdn_decode_wyn: contiguous state addressing is only valid at batch_size==1 \
-         (got {batch_size}); port the wy4 `state_is_table` pointer-table form first"
+         (got {batch_size}); use the `state_is_table` pointer-table form"
     );
     KernelLaunch::new(gpu, kernel)
         .grid([num_v_heads, batch_size, 1])
@@ -346,6 +352,7 @@ pub fn gdn_decode_wyn(
         .arg_u32(qk_stride)
         .arg_u32(v_stride)
         .arg_u32(gb_stride)
+        .arg_u32(u32::from(state_is_table))
         .launch(stream)
 }
 

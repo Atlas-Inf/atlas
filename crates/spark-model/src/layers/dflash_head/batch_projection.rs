@@ -21,14 +21,18 @@ impl BlockDiffusionDraftHead {
         let total_rows = batch_size
             .checked_mul(self.gamma as u32)
             .ok_or_else(|| anyhow::anyhow!("DFlash staged projection row overflow"))?;
+        // Mirror the serial per-sequence choice (`drafter_gemm` at m = gamma):
+        // NVFP4 only when gamma <= 4, else the FP8/BF16 dense arm. Keying on
+        // total_rows sent gamma=8 DFlash2 through NVFP4 weights while its
+        // serial layer ran BF16 (reiner job 307 parity: 88.5 % draft tokens).
         if matches!(self.quant, super::DflashQuantization::Nvfp4Weights)
+            && self.gamma <= 4
             && let Some(weight) = weight_nvfp4
         {
             let kernel = match total_rows {
                 1..=4 => self.kernels.w4a16_gemv_batch4,
                 5..=8 => self.kernels.w4a16_gemv_batch8,
-                9..=32 => self.kernels.w4a16_gemv_batch16,
-                _ => spark_runtime::gpu::KernelHandle(0),
+                _ => self.kernels.w4a16_gemv_batch16,
             };
             if kernel.0 != 0 {
                 let mut row = 0u32;
@@ -50,28 +54,19 @@ impl BlockDiffusionDraftHead {
                 return Ok(());
             }
         }
-        let rows = self.gamma;
-        let src_row_bytes = rows
-            .checked_mul(k_in as usize)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| anyhow::anyhow!("DFlash staged projection input offset overflow"))?;
-        let dst_row_bytes = rows
-            .checked_mul(n_out as usize)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| anyhow::anyhow!("DFlash staged projection output offset overflow"))?;
-        for sequence in 0..batch_size as usize {
-            self.drafter_gemm(
-                ctx.gpu,
-                weight,
-                weight_fp8,
-                weight_nvfp4,
-                src.offset(sequence * src_row_bytes),
-                dst.offset(sequence * dst_row_bytes),
-                n_out,
-                k_in,
-                stream,
-            )?;
-        }
-        Ok(())
+        // BF16/FP8 fallback: one GEMM over all [B*gamma] rows — a per-sequence
+        // loop would re-read the weight B times.
+        self.drafter_gemm_rows(
+            ctx.gpu,
+            weight,
+            weight_fp8,
+            weight_nvfp4,
+            src,
+            dst,
+            total_rows,
+            n_out,
+            k_in,
+            stream,
+        )
     }
 }

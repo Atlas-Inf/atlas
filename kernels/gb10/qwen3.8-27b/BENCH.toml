@@ -301,7 +301,17 @@ from the 2026-08-15 hand-built batched calibration serve, NOT from a \
 certified run on the pinned profile (fp8 KV, 8 Marconi slots, 4K context \
 change the memory geometry). They stand untouched as placeholders until the \
 first batched certified run on this profile; re-cut all five together from \
-that run's cells."""
+that run's cells. \
+★ DFLASH2 IS JUDGED AGAINST THESE FLOORS (2026-09-26, #58). The gate keys a \
+baseline by (hardware, checkpoint), and DFlash2 shares this checkpoint with \
+MTP, so a DFlash2 run self-verdicts against the MTP-lane floors below. With \
+serial propose (41 ms x n, job 235) it plateaued past C4: main66 job \
+240-conc scored 27.1 / 36.8 / 46.7 / 48.3, failing C8 and C16. With \
+batched Bxgamma propose and VERIFY_ROW_CAP 128 (#86), GB10 job 405 (gamma=8, \
+Option B, bs16, util 0.70, this instrument, 2 interleaved reps) scored \
+C1 23.4/23.6 · C4 43.5/46.3 · C8 66.5/65.4 · C16 75.0/75.2 — every floor \
+met, C16 by only ~2 %. A per-recipe DFlash2 baseline needs a gate-framework \
+change (bench_resolve keys by checkpoint), or a checkpoint-variant label."""
 
 # ★ PLACEMENT: a [benchmarks.*] sub-table attaches to the MOST RECENT
 # [[benchmarks]] header above it. This serve pin was first committed ABOVE

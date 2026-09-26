@@ -214,6 +214,17 @@ fn build_mtp_moe(
                     )
                     .with_context(|| format!("qwen4_exp MTP: FP8 expert {e} down_proj"))?,
                 });
+                // `quantized_from_fp8` keeps its FP8 source whenever the GDN
+                // native-FP8 prefill or the dense FP8 attention overlay is on,
+                // because THOSE read dense linear_attn / self_attn tensors as
+                // FP8. No reader ever consumes a routed MoE expert as FP8, so
+                // for these the NVFP4 copy is the only consumer: release the
+                // source now (~4.9 MB per expert, ~2.5 GB over 512).
+                for proj in ["gate", "up", "down"] {
+                    for part in ["weight", "weight_scale_inv"] {
+                        store.reclaim(gpu, &format!("{}.{part}", p(proj)))?;
+                    }
+                }
             }
         }
     }

@@ -57,8 +57,15 @@ extern "C" __global__ void gated_delta_rule_wy17(
     unsigned int v_dim,
     unsigned int qk_stride,
     unsigned int v_stride,
-    unsigned int gb_stride
+    unsigned int gb_stride,
+    // Contractual trailing arg matching ops::gdn_decode_wyn's params list
+    // (wy5..wy16 carry the real pointer-table form): wy17 is contiguous-only,
+    // so trap loudly rather than silently read the wrong addressing.
+    unsigned int state_is_table
 ) {
+    if (state_is_table) {
+        __trap();
+    }
     const unsigned int vh = blockIdx.x;
     const unsigned int b = blockIdx.y;
     if (vh >= num_v_heads || b >= batch_size) return;
