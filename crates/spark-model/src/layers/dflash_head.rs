@@ -855,7 +855,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 .min(self.max_seq_len),
             ctx_slot_bytes,
             // Phase 2 Option B: lazily allocated on first propose when
-            // ATLAS_DFLASH_OPTION_B=1. None until then to keep alloc_state
+            // Option B is on (the generic default; ATLAS_DFLASH_OPTION_B=0
+            // restores the legacy contiguous path). None until then to
+            // keep alloc_state
             // cheap for sequences that never use Option B.
             block_table_dev: None,
             ctx_count_drafter: 0,

@@ -364,7 +364,18 @@ impl DsparkStartupExecution {
         ]
         .iter()
         .any(|name| present(name));
-        let option_b_enabled = one("ATLAS_DFLASH_OPTION_B");
+        let option_b_env = std::env::var("ATLAS_DFLASH_OPTION_B")
+            .ok()
+            .map(|v| v.as_str().to_owned());
+        let option_b_enabled = option_b_decision(option_b_env.as_deref());
+        if let Some(v) = option_b_env.as_deref()
+            && !matches!(v, "0" | "1")
+        {
+            tracing::warn!(
+                "ATLAS_DFLASH_OPTION_B={v:?} is malformed (expected 0 or 1); \
+                 keeping the default (on)"
+            );
+        }
         let proposal_lane_count = std::env::var("ATLAS_DFLASH_PROPOSE_LANES")
             .ok()
             .and_then(|raw| raw.parse().ok())
@@ -389,8 +400,9 @@ impl DsparkStartupExecution {
         }
         if batch_env_ref == Some("1") && !generic_batch_authoritative {
             tracing::warn!(
-                "ATLAS_DFLASH_BATCHED_PROPOSE=1 ignored: requires ATLAS_DFLASH_OPTION_B=1 \
-                 and a single propose lane (option_b={option_b_enabled}, lanes={proposal_lane_count})"
+                "ATLAS_DFLASH_BATCHED_PROPOSE=1 ignored: requires Option B \
+                 (ATLAS_DFLASH_OPTION_B not 0) and a single propose lane \
+                 (option_b={option_b_enabled}, lanes={proposal_lane_count})"
             );
         }
         Self {
@@ -451,6 +463,18 @@ pub fn enforce_lightning_structural_gate(
         ));
     }
     Ok(())
+}
+
+/// Pure decision: generic-DFlash Option B (paged drafter context with
+/// incremental ctx precompute, graph-eligible). DEFAULT-ON: it is the only
+/// measured GB10 configuration and is required by batched propose. The
+/// legacy contiguous path stays correct on the h128 drafter (from_weights
+/// hard-requires `inferspark_prefill_h128`), but it is eager-only and
+/// rebuilds ctx K/V every propose. `ATLAS_DFLASH_OPTION_B=0` rolls back;
+/// any other malformed value keeps the default with a startup WARN at the
+/// call site.
+pub fn option_b_decision(env: Option<&str>) -> bool {
+    !matches!(env, Some("0"))
 }
 
 /// Pure decision: generic-DFlash authoritative Bxgamma propose. It is

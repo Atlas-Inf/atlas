@@ -297,8 +297,10 @@ fn startup_execution_from_lightning_marks_ineligible_toggles() {
 
 #[test]
 fn startup_execution_from_env_lenient_defaults() {
-    // Generic DFlash defaults: Option B off, one lane, no cap, no dumps.
+    // Generic DFlash defaults: Option B on (the measured path; =0 rolls
+    // back), one lane, no cap, no dumps.
     let execution = super::DsparkStartupExecution::from_env_lenient();
+    assert!(execution.option_b_enabled);
     assert!(!execution.native_batch_authoritative);
     assert_eq!(
         execution.proposal_lane_count.max(1),
@@ -455,4 +457,21 @@ fn generic_batch_authoritative_decision_table() {
     // malformed values are off (lenient convention: treated as unset)
     assert!(!d(Some("true"), true, 1));
     assert!(!d(Some(""), true, 1));
+}
+
+#[test]
+fn option_b_decision_table() {
+    use super::product_policy::option_b_decision;
+    // Unset and explicit-on both take the measured path; "0" is the only
+    // rollback; anything else keeps the default (the WARN lives at the
+    // call site).
+    for (env, want) in [
+        (None, true),
+        (Some("1"), true),
+        (Some("0"), false),
+        (Some("true"), true),
+        (Some(""), true),
+    ] {
+        assert_eq!(option_b_decision(env), want, "env={env:?}");
+    }
 }
