@@ -30,6 +30,9 @@ pub struct Exl3Kernels {
     pub bf16_to_f16: KernelHandle,
     pub f16_to_bf16: KernelHandle,
     pub transpose: KernelHandle,
+    /// The fused rebuild step: both 128-wide Hadamard passes, the transpose and
+    /// the fp16 -> bf16 conversion over one shared-memory tile.
+    pub had2_transpose_bf16: KernelHandle,
     pub hgemm: KernelHandle,
 }
 
@@ -49,6 +52,7 @@ impl Exl3Kernels {
             bf16_to_f16: k("exl3_bf16_to_f16")?,
             f16_to_bf16: k("exl3_f16_to_bf16")?,
             transpose: k("exl3_transpose_f16")?,
+            had2_transpose_bf16: k("exl3_had2_transpose_bf16")?,
             hgemm: k("exl3_hgemm_f16")?,
         })
     }
@@ -285,45 +289,59 @@ pub fn exl3_dense_bf16_nk(
 ) -> Result<()> {
     let scratch_bytes = check_dense_shape(&w.shape)?;
     let a = gpu.alloc(scratch_bytes)?;
-    let b = match gpu.alloc(scratch_bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = gpu.free(a);
-            return Err(e);
-        }
-    };
-    let r = exl3_dense_bf16_nk_with_scratch(gpu, k, w, out_bf16, a, b, stream);
+    let r = exl3_dense_bf16_nk_with_scratch(gpu, k, w, out_bf16, a, stream);
     // Scratch must outlive the queued kernels: sync before freeing rather than
     // relying on cuMemFree synchronizing implicitly.
     let r = r.and_then(|()| gpu.synchronize(stream));
     gpu.free(a)?;
-    gpu.free(b)?;
     r
 }
 
-/// [`exl3_dense_bf16_nk`] on caller-owned scratch: `a` and `b` each `in * out *
-/// 2` bytes of fp16. NO alloc, NO free and NO synchronize — the rebuild runs
-/// entirely as stream-ordered work, so the caller's stream owns the scratch's
-/// lifetime (see `exl3_bf16_pool`). Same kernels in the same order as the
-/// allocating variant: the numerics are identical bit for bit.
+/// [`exl3_dense_bf16_nk`] on caller-owned scratch: `a` is `in * out * 2` bytes
+/// of fp16. NO alloc, NO free and NO synchronize — the rebuild runs entirely as
+/// stream-ordered work, so the caller's stream owns the scratch's lifetime (see
+/// `exl3_bf16_pool`). Reconstruct, then [`exl3_had2_transpose_bf16`], which
+/// fuses the two Hadamard passes, the transpose and the bf16 conversion and is
+/// bitwise identical to running them as separate kernels.
 pub fn exl3_dense_bf16_nk_with_scratch(
     gpu: &dyn GpuBackend,
     k: &Exl3Kernels,
     w: &Exl3Weight,
     out_bf16: DevicePtr,
     a: DevicePtr,
-    b: DevicePtr,
     stream: u64,
 ) -> Result<()> {
-    let (i, o) = (w.shape.in_features, w.shape.out_features);
     check_dense_shape(&w.shape)?;
     exl3_reconstruct(gpu, k, w, a, stream)?;
-    // W_inner · H · diag(svh): one post pass over the rows of [in, out].
-    exl3_had_r128(gpu, k.had_post, a, a, w.svh, i as u32, o as u32, stream)?;
-    exl3_transpose_f16(gpu, k, a, b, i as u32, o as u32, stream)?;
-    // diag(svh) · H · W_innerᵀ · H: the same pass over the rows of [out, in].
-    exl3_had_r128(gpu, k.had_post, b, b, w.suh, o as u32, i as u32, stream)?;
-    exl3_convert(gpu, k.f16_to_bf16, b, out_bf16, (i * o) as u32, stream)
+    exl3_had2_transpose_bf16(gpu, k, a, w, out_bf16, stream)
+}
+
+/// `W^T [out, in]` bf16 from the reconstructed `W_inner [in, out]` fp16 in one
+/// kernel over 128x128 tiles: `had_r128_post` with `svh` over the rows, the
+/// transpose, `had_r128_post` with `suh`, then fp16 -> bf16 — the same
+/// arithmetic and fp16 rounding points as those four separate launches.
+pub fn exl3_had2_transpose_bf16(
+    gpu: &dyn GpuBackend,
+    k: &Exl3Kernels,
+    w_inner: DevicePtr,
+    w: &Exl3Weight,
+    out_bf16: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    check_dense_shape(&w.shape)?;
+    let (i, o) = (w.shape.in_features as u32, w.shape.out_features as u32);
+    KernelLaunch::new(gpu, k.had2_transpose_bf16)
+        .grid([o / 128, i / 128, 1])
+        .block([128, 1, 1])
+        .shared_mem(2 * 128 * 136 * 2)
+        .arg_ptr(w_inner)
+        .arg_ptr(out_bf16)
+        .arg_ptr(w.suh)
+        .arg_ptr(w.svh)
+        .arg_u32(i)
+        .arg_u32(o)
+        .arg_f32(HAD_SCALE)
+        .launch(stream)
 }
 
 /// Shape gate for the dense rebuild; returns the per-buffer scratch bytes.

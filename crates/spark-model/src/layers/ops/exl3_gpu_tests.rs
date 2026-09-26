@@ -346,7 +346,7 @@ fn check_dense_bf16_nk_scratch_parity(g: &dyn GpuBackend, k: &Exl3Kernels, t: &T
         upload(g, &vec![0u8; i * o * 2]),
     ];
     exl3_dense_bf16_nk(g, k, &w, outs[0], stream).unwrap();
-    exl3_dense_bf16_nk_with_scratch(g, k, &w, outs[1], tmps[0], tmps[1], stream).unwrap();
+    exl3_dense_bf16_nk_with_scratch(g, k, &w, outs[1], tmps[0], stream).unwrap();
     g.synchronize(stream).unwrap();
     let (a, b) = (
         download_u16(g, outs[0], i * o),

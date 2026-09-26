@@ -190,6 +190,7 @@ fn exl3_reconstruct_arity_pin() {
         ("exl3_bf16_to_f16", 3),
         ("exl3_f16_to_bf16", 3),
         ("exl3_transpose_f16", 4),
+        ("exl3_had2_transpose_bf16", 7),
         ("exl3_hgemm_f16", 6),
     ];
     let mut checked = 0usize;
