@@ -476,6 +476,7 @@ mod forward_k3;
 mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_bf16;
+mod forward_prefill_finish;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_routed;
