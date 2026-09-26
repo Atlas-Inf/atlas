@@ -114,6 +114,18 @@ Agrees with the plan above and adds bounds (assumes ~230 GB/s effective):
 - Still to verify in code before building: the mask-row RoPE offsets; the mask-row RoPE offsets; the intra-block
   mask; whether draft-row KV is persisted and rolled back.
 
+## 4c. Gate floor note (2026-09-26)
+
+The concurrency-sweep floors 16.2 / 33.5 / 50.5 / 72 belong to the **MTP lane**
+(cut from an MTP K=4 run, C1/C4/C8/C16 = 20.9 / 41.9 / 64.1 / 85.2) — the gate
+keys baselines by (hardware, checkpoint), and a DFlash2 `--serve-override
+speculative=false dflash=true` sweep is judged against them. On main66
+(job 240-conc, DFlash2 γ=8 + Option B, bs16, util 0.70) aggregate was
+**27.1 / 36.8 / 46.7 / 48.3**: passes C1/C4, fails C8, and would fail C16 — an
+honest reading of serial propose, not a bad baseline. The gate cannot express a
+separate DFlash2 variant without a framework change; the behaviour is documented
+in `kernels/gb10/qwen3.8-27b/BENCH.toml` instead.
+
 ## 5. Open questions
 
 - The head at B*γ = 96 rows x 248k vocab: the lm_head read may become the new
