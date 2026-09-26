@@ -125,6 +125,11 @@ mod moe_prefill;
 #[path = "ops/norm.rs"]
 mod norm;
 mod nvfp4_mmq;
+// GPU M-invariance proof for the NVFP4-MMQ prefill tiles — needs the cuda
+// backend to compile (same gating idiom as ple_tests).
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ops/nvfp4_mmq_tests.rs"]
+mod nvfp4_mmq_tests;
 #[path = "ops/ple.rs"]
 mod ple;
 #[cfg(all(test, feature = "cuda"))]
