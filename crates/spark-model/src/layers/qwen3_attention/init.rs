@@ -194,7 +194,11 @@ impl Qwen3AttentionLayer {
                 "w8a16_gemm_t_m128",
                 "w8a16_gemm_t_m128",
             ),
-            w8a16_gemm_n_m128_k: super::super::try_kernel(
+            // `w8a16_gemm_n_m128` exists only in kernels/strix-hip/common —
+            // ATLAS_TARGET_HW=strix-hip sets cfg!(atlas_hip). On every other
+            // target the lookup can never resolve; don't issue it.
+            w8a16_gemm_n_m128_k: gate(
+                cfg!(atlas_hip),
                 gpu,
                 "w8a16_gemm_n_m128",
                 "w8a16_gemm_n_m128",
@@ -495,17 +499,23 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu),
             w4a16_gemv_batch16_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
-            dp4a_quant_batch4_k: super::super::try_kernel(
+            // `w4a16_gemv_dp4a` exists only in kernels/strix-hip/common —
+            // ATLAS_TARGET_HW=strix-hip sets cfg!(atlas_hip). On every other
+            // target the lookup can never resolve; don't issue it.
+            dp4a_quant_batch4_k: gate(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "quantize_act_int8_g16_batch4_d4",
             ),
-            dp4a_gemv_batch4_k: super::super::try_kernel(
+            dp4a_gemv_batch4_k: gate(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_batch4_d4",
             ),
-            dp4a_gemv_batch4_os_k: super::super::try_kernel(
+            dp4a_gemv_batch4_os_k: gate(
+                cfg!(atlas_hip),
                 gpu,
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_batch4_d4_os",
