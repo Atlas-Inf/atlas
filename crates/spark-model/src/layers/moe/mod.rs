@@ -482,6 +482,7 @@ mod forward_k3;
 mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_bf16;
+mod forward_prefill_finish;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_routed;
@@ -491,6 +492,7 @@ mod helpers_a;
 mod helpers_b;
 mod helpers_c;
 mod init;
+mod inplace_transpose;
 #[cfg(test)]
 mod mod_tests;
 mod ptr_table_build;
