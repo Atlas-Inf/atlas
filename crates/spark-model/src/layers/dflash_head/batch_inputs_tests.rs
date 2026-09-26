@@ -46,6 +46,7 @@ pub(super) fn valid(batch: usize) -> DsparkBatchInput {
     let (owners, last_tokens, positions, target_hiddens, expected, lifecycles) = valid_parts(batch);
     DsparkBatchInput::validate(
         LIGHTNING_SERVED_GAMMA,
+        LIGHTNING_SERVED_GAMMA,
         batch,
         &owners,
         &last_tokens,
@@ -62,13 +63,30 @@ fn lightning_contract_consumes_the_existing_gamma_and_tap_ssot() {
     assert_eq!(LIGHTNING_SERVED_GAMMA, 4);
     assert_eq!(LIGHTNING_TAPS, [1, 5, 19, 29, 41, 51]);
     assert!(matches!(
-        DsparkBatchInput::validate(0, 1, &[], &[], &[], &[], &[], &[]),
+        DsparkBatchInput::validate(0, LIGHTNING_SERVED_GAMMA, 1, &[], &[], &[], &[], &[], &[]),
         Err(DsparkBatchInputError::GammaZero)
     ));
     assert!(matches!(
-        DsparkBatchInput::validate(8, 1, &[], &[], &[], &[], &[], &[]),
+        DsparkBatchInput::validate(8, LIGHTNING_SERVED_GAMMA, 1, &[], &[], &[], &[], &[], &[]),
         Err(DsparkBatchInputError::GammaMismatch {
             expected: LIGHTNING_SERVED_GAMMA,
+            found: 8
+        })
+    ));
+}
+
+/// The generic-DFlash caller supplies its own gamma as the contract, so a
+/// non-Lightning draft width (γ=8) validates instead of being pinned to 4.
+#[test]
+fn expected_gamma_is_caller_supplied() {
+    assert!(matches!(
+        DsparkBatchInput::validate(8, 8, 1, &[], &[], &[], &[], &[], &[]),
+        Err(DsparkBatchInputError::EmptyBatch)
+    ));
+    assert!(matches!(
+        DsparkBatchInput::validate(8, 6, 1, &[], &[], &[], &[], &[], &[]),
+        Err(DsparkBatchInputError::GammaMismatch {
+            expected: 6,
             found: 8
         })
     ));
@@ -114,6 +132,7 @@ fn mixed_absolute_positions_and_owner_identity_survive_batch_reordering() {
     target_hiddens[1] = DevicePtr(0xdef0);
     let first = DsparkBatchInput::validate(
         LIGHTNING_SERVED_GAMMA,
+        LIGHTNING_SERVED_GAMMA,
         2,
         &owners,
         &last_tokens,
@@ -131,6 +150,7 @@ fn mixed_absolute_positions_and_owner_identity_survive_batch_reordering() {
     expected.swap(0, 1);
     lifecycles.swap(0, 1);
     let reordered = DsparkBatchInput::validate(
+        LIGHTNING_SERVED_GAMMA,
         LIGHTNING_SERVED_GAMMA,
         2,
         &owners,
@@ -176,6 +196,7 @@ fn all_structural_lengths_must_match_the_batch_width() {
     assert!(matches!(
         DsparkBatchInput::validate(
             LIGHTNING_SERVED_GAMMA,
+            LIGHTNING_SERVED_GAMMA,
             2,
             &owners[..1],
             &last_tokens,
@@ -192,6 +213,7 @@ fn all_structural_lengths_must_match_the_batch_width() {
     ));
     assert!(matches!(
         DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
             LIGHTNING_SERVED_GAMMA,
             2,
             &owners,
@@ -212,12 +234,23 @@ fn all_structural_lengths_must_match_the_batch_width() {
 #[test]
 fn empty_and_capacity_overflow_are_typed_failures() {
     assert!(matches!(
-        DsparkBatchInput::validate(LIGHTNING_SERVED_GAMMA, 1, &[], &[], &[], &[], &[], &[],),
+        DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
+            LIGHTNING_SERVED_GAMMA,
+            1,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ),
         Err(DsparkBatchInputError::EmptyBatch)
     ));
     let parts = valid_parts(2);
     assert!(matches!(
         DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
             LIGHTNING_SERVED_GAMMA,
             1,
             &parts.0,
@@ -244,6 +277,7 @@ fn duplicate_expected_owners_are_rejected_even_when_rows_are_distinct() {
     assert!(matches!(
         DsparkBatchInput::validate(
             LIGHTNING_SERVED_GAMMA,
+            LIGHTNING_SERVED_GAMMA,
             2,
             &owners,
             &last_tokens,
@@ -268,6 +302,7 @@ fn expected_stale_retired_and_missing_lifecycle_owners_fail_closed() {
     assert!(matches!(
         DsparkBatchInput::validate(
             LIGHTNING_SERVED_GAMMA,
+            LIGHTNING_SERVED_GAMMA,
             2,
             &owners,
             &last_tokens,
@@ -283,6 +318,7 @@ fn expected_stale_retired_and_missing_lifecycle_owners_fail_closed() {
     lifecycles[1] = Some(lifecycle(owner(1, 999)));
     assert!(matches!(
         DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
             LIGHTNING_SERVED_GAMMA,
             2,
             &owners,
@@ -302,6 +338,7 @@ fn expected_stale_retired_and_missing_lifecycle_owners_fail_closed() {
     assert!(matches!(
         DsparkBatchInput::validate(
             LIGHTNING_SERVED_GAMMA,
+            LIGHTNING_SERVED_GAMMA,
             2,
             &owners,
             &last_tokens,
@@ -316,6 +353,7 @@ fn expected_stale_retired_and_missing_lifecycle_owners_fail_closed() {
     lifecycles[1] = None;
     assert!(matches!(
         DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
             LIGHTNING_SERVED_GAMMA,
             2,
             &owners,
@@ -335,6 +373,7 @@ fn zero_target_hidden_pointer_is_rejected_with_sequence_index() {
     target_hiddens[1] = DevicePtr(0);
     assert!(matches!(
         DsparkBatchInput::validate(
+            LIGHTNING_SERVED_GAMMA,
             LIGHTNING_SERVED_GAMMA,
             2,
             &owners,

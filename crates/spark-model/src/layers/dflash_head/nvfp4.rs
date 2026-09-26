@@ -123,9 +123,41 @@ impl BlockDiffusionDraftHead {
         k_in: u32,
         stream: u64,
     ) -> Result<()> {
-        let g = self.gamma as u32;
+        self.drafter_gemm_rows(
+            gpu,
+            w_bf16,
+            w_fp8,
+            w_nvfp4,
+            src,
+            dst,
+            self.gamma as u32,
+            n_out,
+            k_in,
+            stream,
+        )
+    }
+
+    /// `drafter_gemm` with an explicit row count — the B×gamma seam calls it
+    /// once per projection over all staged rows so every weight read is
+    /// shared instead of looping per sequence. The ≤4-row NVFP4 GEMV arm is
+    /// unchanged; wider NVFP4 batches keep the ≤16-row `w4a16_gemv_batchm`
+    /// waves in `run_staged_projection`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn drafter_gemm_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        w_bf16: &DenseWeight,
+        w_fp8: &Option<Fp8DenseWeight>,
+        w_nvfp4: &Option<QuantizedWeight>,
+        src: DevicePtr,
+        dst: DevicePtr,
+        m: u32,
+        n_out: u32,
+        k_in: u32,
+        stream: u64,
+    ) -> Result<()> {
         if matches!(self.quant, DflashQuantization::Nvfp4Weights)
-            && g <= 4
+            && m <= 4
             && let Some(w) = w_nvfp4
             && self.kernels.w4a16_gemv_batch4.0 != 0
         {
@@ -135,7 +167,7 @@ impl BlockDiffusionDraftHead {
                 src,
                 w,
                 dst,
-                g,
+                m,
                 n_out,
                 k_in,
                 stream,
@@ -150,12 +182,12 @@ impl BlockDiffusionDraftHead {
                 src,
                 fp8,
                 dst,
-                g,
+                m,
                 n_out,
                 k_in,
                 stream,
             );
         }
-        self.drafter_dense_gemm(gpu, src, w_bf16, dst, g, n_out, k_in, stream)
+        self.drafter_dense_gemm(gpu, src, w_bf16, dst, m, n_out, k_in, stream)
     }
 }

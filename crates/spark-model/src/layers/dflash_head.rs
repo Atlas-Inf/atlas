@@ -576,6 +576,13 @@ pub struct BlockDiffusionDraftHead {
     pub batch_markov_prev: DevicePtr,
     pub batch_markov_embed: DevicePtr,
     pub batch_markov_bias: DevicePtr,
+    /// DFlash2 selector projected-hidden scratch, `[B*gamma, rank]` BF16.
+    /// NULL when the head has no candidate selector (Lightning DSpark).
+    pub batch_dflash2_projected: DevicePtr,
+    /// DFlash2 conv scratch: dynamic-delta rows `[B*gamma, 2*kernel_size*groups]`
+    /// and conv output `[B*gamma, hidden]`. NULL when the drafter ships no conv.
+    pub batch_conv_delta: DevicePtr,
+    pub batch_conv_out: DevicePtr,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -684,6 +691,7 @@ pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, Lightni
 mod batch_inputs;
 pub use batch_inputs::{DsparkBatchInput, DsparkBatchInputError, DsparkBatchSequence};
 mod batch_attention;
+mod batch_conv;
 mod batch_execution;
 #[cfg(test)]
 mod batch_execution_tests;
@@ -691,6 +699,7 @@ mod batch_forward;
 #[cfg(test)]
 mod batch_inputs_tests;
 mod batch_projection;
+mod batch_tail_dflash2;
 mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;
@@ -707,6 +716,7 @@ mod from_weights;
 mod lifecycle_tests;
 mod markov;
 mod nvfp4;
+mod parity_report;
 mod precompute_ctx_kv;
 mod propose;
 mod small_m_gemm;
@@ -1072,8 +1082,16 @@ impl DraftProposer for BlockDiffusionDraftHead {
             );
         }
         let batch_slot_mapping = batch_slot_mapping.unwrap_or_default();
+        // Row contract: the Lightning product pins LIGHTNING_SERVED_GAMMA;
+        // generic DFlash validates against its own configured gamma.
+        let expected_gamma = if native_authoritative {
+            LIGHTNING_SERVED_GAMMA
+        } else {
+            self.gamma
+        };
         let batch_inputs = DsparkBatchInput::validate(
             self.gamma,
+            expected_gamma,
             self.batch_capacity,
             &owners,
             last_tokens,
@@ -1175,32 +1193,67 @@ impl DraftProposer for BlockDiffusionDraftHead {
             let max_kv_len =
                 u32::try_from(batch_kv_lens.iter().copied().max().unwrap_or(self.gamma))
                     .map_err(|_| anyhow::anyhow!("DFlash batched KV length exceeds u32"))?;
+            // Generic DFlash2 has no attention sinks and uses the same
+            // per-sequence indirect attention kernel as the serial Option-B
+            // path; the Lightning product keeps the batched-sink kernel.
+            let (serial_tables, serial_args) = if native_authoritative {
+                (None, None)
+            } else {
+                (
+                    Some(block_table_ptrs.as_slice()),
+                    Some(self.batch_attention_args),
+                )
+            };
             for layer_idx in 0..self.layers.len() {
                 self.run_batched_layer_stage(
-                    layer_idx, batch_rows, batch_size, max_kv_len, None, None, ctx, stream,
+                    layer_idx,
+                    batch_rows,
+                    batch_size,
+                    max_kv_len,
+                    serial_tables,
+                    serial_args,
+                    ctx,
+                    stream,
                 )?;
             }
             if let Some(expected) = parity_hidden_oracle.as_ref() {
                 ctx.gpu.synchronize(stream)?;
                 let mut actual = vec![0u8; expected.len()];
                 ctx.gpu.copy_d2h(self.batch_query_embed, &mut actual)?;
-                if actual != *expected {
-                    let first = actual
-                        .chunks_exact(2)
-                        .zip(expected.chunks_exact(2))
-                        .position(|(lhs, rhs)| lhs != rhs)
-                        .unwrap_or(0);
-                    let per_sequence = self.gamma * self.hidden_size;
-                    let sequence = first / per_sequence;
-                    let local = first % per_sequence;
-                    anyhow::bail!(
-                        "DFlash Bxgamma backbone parity mismatch at sequence {sequence} BF16 element {local}"
+                if native_authoritative {
+                    if actual != *expected {
+                        let first = actual
+                            .chunks_exact(2)
+                            .zip(expected.chunks_exact(2))
+                            .position(|(lhs, rhs)| lhs != rhs)
+                            .unwrap_or(0);
+                        let per_sequence = self.gamma * self.hidden_size;
+                        let sequence = first / per_sequence;
+                        let local = first % per_sequence;
+                        anyhow::bail!(
+                            "DFlash Bxgamma backbone parity mismatch at sequence {sequence} BF16 element {local}"
+                        );
+                    }
+                    tracing::info!("DFlash Bxgamma backbone parity PASS: batch={n}");
+                } else {
+                    // M going γ → B·γ changes GEMM tiling and reduction order,
+                    // so backbone bytes are a report, not a bail.
+                    let (mismatched, max_abs_diff) = parity_report::bf16_diff(&actual, expected);
+                    tracing::info!(
+                        "DFlash Bxgamma backbone parity: batch={} mismatched={}/{} max_abs_diff={:.4e}",
+                        n,
+                        mismatched,
+                        actual.len() / 2,
+                        max_abs_diff
                     );
                 }
-                tracing::info!("DFlash Bxgamma backbone parity PASS: batch={n}");
             }
             self.run_batched_tail_base(batch_rows, ctx, stream)?;
-            self.run_batched_markov(batch_size, ctx, stream)?;
+            if self.candidate_selector.is_some() {
+                self.run_batched_dflash2_tail(batch_size, last_tokens, ctx, stream)?;
+            } else {
+                self.run_batched_markov(batch_size, ctx, stream)?;
+            }
         }
 
         let native =
@@ -1223,20 +1276,36 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 let native = native.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("DFlash Bxgamma parity did not stage native tokens")
                 })?;
-                for (sequence, (native_tokens, oracle_tokens)) in
-                    native.iter().zip(oracle.iter()).enumerate()
-                {
-                    anyhow::ensure!(
-                        native_tokens.get(..oracle_tokens.len()) == Some(oracle_tokens.as_slice()),
-                        "DFlash Bxgamma parity mismatch at sequence {sequence}: native={native_tokens:?} oracle={oracle_tokens:?}"
+                if native_authoritative {
+                    for (sequence, (native_tokens, oracle_tokens)) in
+                        native.iter().zip(oracle.iter()).enumerate()
+                    {
+                        anyhow::ensure!(
+                            native_tokens.get(..oracle_tokens.len())
+                                == Some(oracle_tokens.as_slice()),
+                            "DFlash Bxgamma parity mismatch at sequence {sequence}: native={native_tokens:?} oracle={oracle_tokens:?}"
+                        );
+                    }
+                    tracing::info!(
+                        "DFlash Bxgamma staged parity PASS: batch={} gamma={} rows={}",
+                        n,
+                        self.gamma,
+                        batch_inputs.total_rows()
+                    );
+                } else {
+                    // GEMM tiling differs at B·γ rows, so drafts are a report;
+                    // parity mode still returns the oracle's serial drafts.
+                    let (sequences_exact, tokens_equal, tokens_total) =
+                        parity_report::draft_agreement(native, &oracle);
+                    tracing::info!(
+                        "DFlash Bxgamma draft parity: batch={} sequences_exact={}/{} tokens_equal={}/{}",
+                        n,
+                        sequences_exact,
+                        n,
+                        tokens_equal,
+                        tokens_total
                     );
                 }
-                tracing::info!(
-                    "DFlash Bxgamma staged parity PASS: batch={} gamma={} rows={}",
-                    n,
-                    self.gamma,
-                    batch_inputs.total_rows()
-                );
                 return Ok(Some(oracle));
             }
             if native_authoritative {
