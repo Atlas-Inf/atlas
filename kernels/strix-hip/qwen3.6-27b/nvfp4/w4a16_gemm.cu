@@ -83,6 +83,44 @@ __device__ __forceinline__ void store_bf16_pair(__nv_bfloat16* dst, float lo, fl
     *(unsigned int*)dst = p.u;
 }
 
+// Four E2M1 (FP4) codes -> four "offset half-units" bytes, t = 12 + 2*v, where
+// v is the E2M1 value: |v| in half-units is {0,1,2,3,4,6,8,12}. Two v_perm_b32
+// byte lookups (positive / negative half-table, selector = code & 7) and one
+// bitfield select on the sign bit. The caller decodes a byte with
+// v_cvt_f32_ubyteN and computes (t - 12) * (0.5 * sv): 0.5*sv is exact and
+// (t - 12) is an exact small integer, so the one rounding lands on the same
+// fp32 as E2M1_LUT[n] * sv. Checked on all 256 scale bytes x 6 global scales x
+// 8 codes: 0 value mismatches; code 8 gives +0 where the LUT gives -0, which
+// cannot reach the output (the WMMA accumulator starts at +0 and, under RNE,
+// never becomes -0; x + (+/-0) = x).
+//
+// Why: this kernel's dequant was 35 % of its GPU time (rocprofv3, 7.2k prefill:
+// 16.8 s -> 10.9 s with the decode removed, timing-only). A 16-entry LDS LUT
+// read per nibble and a ~9-op branch-free fp32 bit build cost about the same;
+// this is ~4.75 VALU per value and no LDS.
+// (scl_fp8(b) * scale2) * 0.5f, bit-for-bit, in ~7 VALU instead of ~12 plus a
+// multiply. (b & 0x7F) << 20 placed in an fp32 is the E4M3 magnitude rebiased by
+// 2^-120 -- for exponent 0 it is an fp32 DENORMAL, m * 2^-129 -- so * 2^119 gives
+// |E4M3| * 0.5 exactly for normals and subnormals alike (this kernel is built with
+// f32 denormals preserved: .amdhsa_float_denorm_mode_32 3). * scale2 is then the one
+// rounding the reference also takes (x0.5 commutes with rounding in the normal range).
+// Sign by XOR, so a negative scale2 stays right; the NaN byte decodes to 0 as scl_fp8
+// does. Host-simulated: all 256 bytes x 12 global scales (1.7e-12 .. 65000), 0 value
+// mismatches; NaN bytes give +0 where the reference gives -0 (cannot reach the output).
+__device__ __forceinline__ float e4m3_scale_half(unsigned int b, float scale2) {
+    const float mag = __uint_as_float((b & 0x7Fu) << 20) * 0x1p119f;
+    const float v = __uint_as_float(__float_as_uint(mag * scale2) ^ ((b & 0x80u) << 24));
+    return ((b & 0x7Fu) == 0x7Fu) ? 0.0f : v;
+}
+
+__device__ __forceinline__ unsigned int e2m1x4_off12(unsigned int codes) {
+    const unsigned int sel = codes & 0x07070707u;
+    const unsigned int pos = __builtin_amdgcn_perm(0x18141210u, 0x0F0E0D0Cu, sel);  // 12,13,14,15,16,18,20,24
+    const unsigned int neg = __builtin_amdgcn_perm(0x00040608u, 0x090A0B0Cu, sel);  // 12,11,10, 9, 8, 6, 4, 0
+    const unsigned int m = ((codes >> 3) & 0x01010101u) * 0xFFu;                     // 0xFF where negative
+    return (neg & m) | (pos & ~m);
+}
+
 // ── Synchronous 16-byte smem copy (cp.async replacement) ────────────
 // Copies 16 bytes gmem→smem when pred, else zero-fills, to preserve the
 // predicated cp.async.16 semantics (out-of-bounds rows became zero).
@@ -729,10 +767,17 @@ void w4a16_gemm_t_m128(
     const unsigned int warp_m_offset = warp_id * 16;
 
     __shared__ __nv_bfloat16 smem_A[2][2 * M_TILE][K_STEP_T + PAD_T];
-    __shared__ __nv_bfloat16 smem_B_bf16[2][N_TILE_LG][K_STEP_T + 8];
-    __shared__ float smem_LUT[16];
+    // smem_B_bf16 is [N][K] with an 80 B row, plus 16 B after every 16 rows.
+    // The dequant store has lane (tid&7) write row 16*(tid&7)+i: with a flat
+    // 80 B stride those 8 rows are 1280 B apart, a multiple of the LDS bank
+    // period, so all 8 lanes hit ONE bank (36 % of LDS-active cycles were
+    // bank conflicts, rocprofv3 SQC_LDS_BANK_CONFLICT on a 7k prefill). The
+    // group pad shifts each 16-row group by 4 banks: bank 20i+4j+kp covers 32
+    // distinct banks. Addresses only; the values are bit-identical.
+    #define M128_B_ROW 40                       // K_STEP_T + 8 bf16 = 80 B
+    #define M128_B_OFF(n) ((n) * M128_B_ROW + ((n) >> 4) * 8)
+    __shared__ __align__(16) __nv_bfloat16 smem_B_bf16[2][M128_B_OFF(N_TILE_LG)];
 
-    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
     __syncthreads();
 
     v8f acc0[8], acc1[8];
@@ -788,15 +833,20 @@ void w4a16_gemm_t_m128(
             *(uint4*)&smem_A[(buf)][row][a_col] = (ra)[rnd]; \
         } \
         { \
-            const unsigned char* pk = (const unsigned char*)&(rb); \
+            const unsigned int* pw = (const unsigned int*)&(rb); \
             const unsigned char* sc = (const unsigned char*)&(rs); \
             _Pragma("unroll") \
-            for (int i = 0; i < 16; i++) { \
-                unsigned char packed = pk[i]; \
-                float sv = scl_fp8(sc[i]) * scale2; \
-                store_bf16_pair(&smem_B_bf16[(buf)][b_ns + i][b_kp * 2], \
-                    smem_LUT[packed & 0xF] * sv, \
-                    smem_LUT[packed >> 4]  * sv); \
+            for (int d = 0; d < 4; d++) { \
+                const unsigned int tl = e2m1x4_off12(pw[d] & 0x0F0F0F0Fu); \
+                const unsigned int th = e2m1x4_off12((pw[d] >> 4) & 0x0F0F0F0Fu); \
+                _Pragma("unroll") \
+                for (int k = 0; k < 4; k++) { \
+                    const int i = d * 4 + k; \
+                    const float svh = e4m3_scale_half(sc[i], scale2); \
+                    store_bf16_pair(&smem_B_bf16[(buf)][M128_B_OFF(b_ns + i) + b_kp * 2], \
+                        ((float)((tl >> (8 * k)) & 0xFFu) - 12.0f) * svh, \
+                        ((float)((th >> (8 * k)) & 0xFFu) - 12.0f) * svh); \
+                } \
             } \
         } \
     } while(0)
@@ -815,7 +865,7 @@ void w4a16_gemm_t_m128(
                 for (int nb = 0; nb < 8; nb++) { \
                     unsigned int nc = nb * 16 + (lane_id & 15); \
                     v16bf b; \
-                                        memcpy(&b, &smem_B_bf16[(b_buf)][nc][h * 16], 32); \
+                                        memcpy(&b, &smem_B_bf16[(b_buf)][M128_B_OFF(nc) + h * 16], 32); \
                     acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]); \
                 } \
             } \
@@ -842,6 +892,8 @@ void w4a16_gemm_t_m128(
     #undef M128_LOAD_REGS
     #undef M128_STORE_TILE
     #undef M128_COMPUTE
+    #undef M128_B_OFF
+    #undef M128_B_ROW
 
     // Write chunk 0: rows [cta_m..cta_m+63]
     #pragma unroll
