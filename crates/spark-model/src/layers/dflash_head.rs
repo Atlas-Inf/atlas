@@ -446,10 +446,10 @@ impl DflashProposerState {
         self.ctx_count_drafter = 0;
         self.ctx_committed = 0;
         self.ctx_positions.clear();
-        // γ/EMA back to the floor so a re-prepared state cannot carry a
-        // stale adaptive level into a fresh sequence.
+        // γ/EMA back to the start policy so a re-prepared state cannot carry
+        // a stale adaptive level into a fresh sequence.
         self.propose_gamma = adaptive_gamma::initial_gamma(self.adaptive_gamma_on, self.gamma_max);
-        self.accept_ema = 0.0;
+        self.accept_ema = adaptive_gamma::initial_ema(self.gamma_max);
         self.seq_len = 0;
         self.ctx_len = 0;
         self.prefill_done = false;
@@ -878,7 +878,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_len: 0,
             last_num_accepted: 0,
             propose_gamma: adaptive_gamma::initial_gamma(self.startup.adaptive_gamma, self.gamma),
-            accept_ema: 0.0,
+            accept_ema: adaptive_gamma::initial_ema(self.gamma),
             adaptive_switches: 0,
             gamma_max: self.gamma,
             adaptive_gamma_on: self.startup.adaptive_gamma,

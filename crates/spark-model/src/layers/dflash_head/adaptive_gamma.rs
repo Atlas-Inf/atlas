@@ -20,10 +20,15 @@ pub(crate) const ADAPTIVE_GAMMA_LO: usize = 8;
 /// Thresholds are ACCEPTANCE RATIOS — EMA of accepted drafts over the
 /// current γ's draft count (γ − 1) — because the raw accepted count scales
 /// with γ (job 260 code: 5.1 of 7 at γ=8, 7.8 of 11 at γ=12; prose ~1.4 of
-/// 7). Rise from the floor above 0.65 (code 0.73 rises, prose 0.20 stays);
-/// fall from γ_max below 0.45. The gap is the hysteresis band.
+/// 7). Sequences START at γ_max with the EMA seeded mid-band (RATIO_START)
+/// and fall below 0.35 (prose, ~0.13 at γ=12, falls within ~4 steps); a
+/// fallen sequence rises back above 0.65. Job 436 measured the old
+/// start-at-floor policy (fall 0.45) oscillating on code — 38 switches in
+/// 576 steps, code 38.6 tok/s vs fixed γ=12's 43.2 — because code's γ=12
+/// acceptance averages 0.61 with deep dips. The wide band keeps it at 12.
 const RATIO_RISE: f32 = 0.65;
-const RATIO_FALL: f32 = 0.45;
+const RATIO_FALL: f32 = 0.35;
+const RATIO_START: f32 = 0.55;
 
 /// Exponential moving average of ACCEPTED DRAFT tokens per verify step —
 /// the bonus token is never counted (`num_accepted` already excludes it).
@@ -55,16 +60,19 @@ pub fn next_gamma(cur: usize, ema: f32, lo: usize, hi: usize) -> (usize, f32) {
     (next, rescaled)
 }
 
-/// Propose γ at alloc time: adaptive starts at the floor (conservative —
-/// prose stays cheap, code climbs within a few steps); fixed mode keeps
-/// the configured γ so every call site can read `propose_gamma`
-/// unconditionally.
-pub(crate) fn initial_gamma(adaptive: bool, configured: usize) -> usize {
-    if adaptive && configured > ADAPTIVE_GAMMA_LO {
-        ADAPTIVE_GAMMA_LO
-    } else {
-        configured
-    }
+/// Propose γ at alloc time: the configured γ in both modes. Adaptive starts
+/// HIGH (job 436: code/JSON win at γ=12 on the wyN kernels and must not pay
+/// a climb; prose falls within a few steps). Kept as a fn so every call
+/// site states the policy in one place.
+pub(crate) fn initial_gamma(_adaptive: bool, configured: usize) -> usize {
+    configured
+}
+
+/// Initial acceptance EMA: seeded mid-band (RATIO_START of γ's draft count)
+/// so a fresh sequence neither falls nor rises before real evidence
+/// arrives. Fixed mode never reads it.
+pub(crate) fn initial_ema(gamma: usize) -> f32 {
+    RATIO_START * gamma.saturating_sub(1).max(1) as f32
 }
 
 /// Draft cap for one proposal: `min(num_drafts, gamma - 1)` — a γ_i
@@ -180,11 +188,11 @@ mod tests {
 
     #[test]
     fn switch_rescales_ema_so_it_does_not_bounce() {
-        // Fall 12 -> 8 at ratio 0.44: the rescaled EMA keeps ratio 0.44 at
+        // Fall 12 -> 8 at ratio 0.33: the rescaled EMA keeps ratio 0.33 at
         // γ=8 (inside the band), so the next step holds at 8.
-        let (g, e) = next_gamma(12, 4.84, 8, 12);
+        let (g, e) = next_gamma(12, 3.6, 8, 12);
         assert_eq!(g, 8);
-        assert!((e - 4.84 * 7.0 / 11.0).abs() < 1e-5);
+        assert!((e - 3.6 * 7.0 / 11.0).abs() < 1e-5);
         assert_eq!(next_gamma(8, e, 8, 12).0, 8);
         // Rise 8 -> 12 at ratio 0.70 keeps 0.70 at γ=12: holds at 12.
         let (g, e) = next_gamma(8, 4.9, 8, 12);
@@ -195,13 +203,22 @@ mod tests {
     }
 
     #[test]
-    fn initial_gamma_arms_at_floor_only_when_adaptive() {
+    fn adaptive_starts_high_with_a_mid_band_ema() {
         assert_eq!(initial_gamma(false, 12), 12);
-        assert_eq!(initial_gamma(true, 12), 8);
-        // γ_max <= floor: adaptive has nowhere to go, keep configured.
+        assert_eq!(initial_gamma(true, 12), 12);
         assert_eq!(initial_gamma(true, 8), 8);
-        assert_eq!(initial_gamma(true, 4), 4);
-        assert_eq!(initial_gamma(false, 16), 16);
+        // Seed = 0.55 of γ_max's draft count: inside [0.35, 0.65], so no
+        // transition before the first verify.
+        let e = initial_ema(12);
+        assert!((e - 0.55 * 11.0).abs() < 1e-5);
+        assert_eq!(next_gamma(12, e, 8, 12).0, 12);
+        // Prose (~1.4 accepted) falls within four verifies from the seed.
+        let (mut g, mut e) = (12, initial_ema(12));
+        for _ in 0..4 {
+            e = update_ema(e, 1);
+            (g, e) = next_gamma(g, e, 8, 12);
+        }
+        assert_eq!(g, 8);
     }
 
     #[test]
