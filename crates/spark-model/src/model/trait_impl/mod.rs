@@ -510,9 +510,16 @@ impl Model for TransformerModel {
         seqs: &mut [&mut SequenceState],
         _stream: u64,
         out_conf: Option<&mut Vec<Vec<f32>>>,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         self.run_mtp_propose_batched_dispatch(
-            tokens, positions, stash_idx, num_drafts, seqs, out_conf,
+            tokens,
+            positions,
+            stash_idx,
+            num_drafts,
+            seqs,
+            out_conf,
+            grammar_bitmasks,
         )
     }
     fn mtp_propose_batch_max(&self) -> usize {

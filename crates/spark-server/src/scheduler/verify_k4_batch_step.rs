@@ -267,6 +267,7 @@ pub(super) fn step_verify_k4_batched(
             let tokens: Vec<u32> = group.iter().map(|&i| batch[i].last_token).collect();
             let positions: Vec<usize> = group.iter().map(|&i| batch[i].seq.seq_len).collect();
             let stash_idx: Vec<usize> = group.to_vec();
+            let grammar_masks = crate::scheduler::spec_step::mtp_grammar_masks_for(batch, group);
             let result = {
                 let mut seq_refs: Vec<&mut SequenceState> = Vec::with_capacity(group.len());
                 let mut it = batch.iter_mut();
@@ -285,6 +286,7 @@ pub(super) fn step_verify_k4_batched(
                     &mut seq_refs,
                     0,
                     want_conf.then_some(&mut conf),
+                    Some(&grammar_masks),
                 )
             };
             match result {

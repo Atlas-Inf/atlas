@@ -86,6 +86,10 @@ pub struct DflashKernels {
     pub residual_add: KernelHandle,
     pub argmax: KernelHandle,
     pub argmax_batch: KernelHandle,
+    /// `grammar_bitmask.cu::atlas_apply_grammar_bitmask` — handle 0 on stale
+    /// PTX sets; a missing kernel downgrades grammar masking to the legacy
+    /// unmasked tail (boundary truncation still guards the draft span).
+    pub grammar_bitmask: KernelHandle,
     pub batched_embed: KernelHandle,
     pub batch_anchor_add: KernelHandle,
     pub batch_markov_add_bias: KernelHandle,
@@ -179,6 +183,11 @@ pub struct DflashScratch {
     /// kernel reads at entry. Host writes via `copy_h2d` BEFORE entering the
     /// captured region so the graph itself sees a stable device pointer.
     pub option_b_indirect_args_dev: DevicePtr,
+    /// Grammar bitmask scratch: `ceil(vocab/32)` i32 words — the pos+1 mask
+    /// applied in place to logits rows 0 and 1 (anchor + draft 0, #102).
+    /// Upload happens before the tail so tail graph capture sees a stable
+    /// pointer; rows 2..gamma-1 stay unmasked (boundary truncation guards).
+    pub grammar_bitmask_dev: DevicePtr,
     /// Phase E.2: pinned host buffer (`γ × 4` bytes) for the per-propose
     /// draft-token D2H copy. Allocated once at construction via
     /// `gpu.alloc_host_pinned`; the async D2H lands here without touching
@@ -572,6 +581,9 @@ pub struct BlockDiffusionDraftHead {
     pub batch_mlp_up: DevicePtr,
     pub batch_mlp_down: DevicePtr,
     pub batch_logits: DevicePtr,
+    /// `batch_capacity × ceil(vocab/32)` i32 — per-sequence grammar masks
+    /// packed for the staged tail's row-0/1 masking (#102).
+    pub batch_grammar_bitmask: DevicePtr,
     pub batch_tokens: DevicePtr,
     pub batch_markov_prev: DevicePtr,
     pub batch_markov_embed: DevicePtr,
@@ -915,8 +927,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
         ctx: &crate::layer::ForwardContext,
         stream: u64,
         _out_conf: Option<&mut Vec<Vec<f32>>>,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         let n = last_tokens.len();
+        let mask_of =
+            |i: usize| -> Option<&[i32]> { grammar_bitmasks.and_then(|ms| ms.get(i)?.as_deref()) };
         let expected_owners = expected_owners
             .ok_or_else(|| anyhow::anyhow!("DFlash batched propose requires expected owners"))?;
         // Preserve the historical n<2 fallback, but only after the complete
@@ -963,7 +978,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                         ctx,
                         stream,
                         None,
-                        None,
+                        mask_of(i),
                         Some(target_hiddens[i]),
                     )?);
                 }
@@ -978,6 +993,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     states,
                     expected_owners,
                     ctx,
+                    grammar_bitmasks,
                 )
                 .map(Some);
         }
@@ -999,7 +1015,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     ctx,
                     stream,
                     None,
-                    None,
+                    mask_of(i),
                     Some(target_hiddens[i]),
                 )?);
                 ctx.gpu.synchronize(stream)?;
@@ -1050,6 +1066,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                             expected_owners,
                             ctx,
                             stream,
+                            grammar_bitmasks,
                         )
                         .map(Some);
                 }
@@ -1069,6 +1086,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             parity_hidden_oracle,
             ctx,
             stream,
+            grammar_bitmasks,
         );
         match staged {
             Err(e) if generic_auth => {
@@ -1089,6 +1107,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     expected_owners,
                     ctx,
                     stream,
+                    grammar_bitmasks,
                 )
                 .map(Some)
             }
