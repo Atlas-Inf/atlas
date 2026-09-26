@@ -237,3 +237,4 @@ mod tests {
             Bf16FallbackArm::Pipelined
         );
     }
+}
