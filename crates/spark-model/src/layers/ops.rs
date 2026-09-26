@@ -58,6 +58,8 @@ mod gemm_fp4;
 pub mod model_stats;
 pub use model_stats::ModelStats;
 
+#[path = "ops/exl3_ops.rs"]
+mod exl3_ops;
 #[path = "ops/gemm_fp8_prefill.rs"]
 mod gemm_fp8_prefill;
 #[path = "ops/gemm_quant.rs"]
@@ -195,6 +197,7 @@ pub use dispatch_proj::*;
 pub use dispatch_proj_rowwise::*;
 pub use dp4a::*;
 pub use embeddings::*;
+pub use exl3_ops::*;
 pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;

@@ -29,6 +29,16 @@ pub struct NamespaceReport {
     pub stray_layer_norms: usize,
 }
 
+/// A projection is present in either the dense/NVFP4 layout (`.weight`) or the EXL3 one (`.trellis`).
+fn has_linear(store: &WeightStore, stem: &str) -> bool {
+    store.contains(&format!("{stem}.weight")) || store.contains(&format!("{stem}.trellis"))
+}
+
+/// The n-gram tables are deferred (served from NVMe), which `contains` does not see.
+fn has_table(store: &WeightStore, name: &str) -> bool {
+    store.contains(name) || store.deferred(name).is_some()
+}
+
 pub fn audit_namespace(store: &WeightStore, config: &ModelConfig) -> NamespaceReport {
     let mut r = NamespaceReport {
         layers: config.num_hidden_layers,
@@ -40,17 +50,17 @@ pub fn audit_namespace(store: &WeightStore, config: &ModelConfig) -> NamespaceRe
         config.weight_prefix.clone()
     };
     r.has_embed = store.contains(&format!("{pfx}.embed_tokens.weight"));
-    r.has_lm_head = store.contains("lm_head.weight");
+    r.has_lm_head = has_linear(store, "lm_head");
 
     for i in 0..config.num_hidden_layers {
         let lp = config.layer_prefix(i);
-        if store.contains(&format!("{lp}.linear_attn.in_proj_qkv.weight")) {
+        if has_linear(store, &format!("{lp}.linear_attn.in_proj_qkv")) {
             r.gdn_layers += 1;
         }
-        if store.contains(&format!("{lp}.self_attn.q_proj.weight")) {
+        if has_linear(store, &format!("{lp}.self_attn.q_proj")) {
             r.attn_layers += 1;
         }
-        if store.contains(&format!("{lp}.self_attn.indexer.index_qk_proj.weight")) {
+        if has_linear(store, &format!("{lp}.self_attn.indexer.index_qk_proj")) {
             r.indexer_tensors += 1;
         }
         if store.contains(&format!("{lp}.attn_hyper_connection.hc_norm.weight")) {
@@ -59,7 +69,7 @@ pub fn audit_namespace(store: &WeightStore, config: &ModelConfig) -> NamespaceRe
         if store.contains(&format!("{lp}.mlp_hyper_connection.hc_norm.weight")) {
             r.hc_tensors += 1;
         }
-        if store.contains(&format!("{lp}.mlp.experts.0.gate_proj.weight")) {
+        if has_linear(store, &format!("{lp}.mlp.experts.0.gate_proj")) {
             r.expert_tensors += 1;
         }
         if store.contains(&format!("{lp}.input_layernorm.weight"))
@@ -77,15 +87,24 @@ pub fn audit_namespace(store: &WeightStore, config: &ModelConfig) -> NamespaceRe
         } else {
             0
         };
+        let before = r.ple_shards;
         for s in 0..parts {
-            if store.contains(&format!("{base}.shard_{s}.weight")) {
+            if has_table(store, &format!("{base}.shard_{s}.weight"))
+                || has_table(store, &format!("{base}.shard_{s}.trellis"))
+            {
                 r.ple_shards += 1;
             }
+        }
+        // EXL3 ships the whole table as one deferred `.trellis` tensor: count it as all shards present.
+        if r.ple_shards == before && has_table(store, &format!("{base}.trellis")) {
+            r.ple_shards += parts;
         }
     }
 
     for b in 0..64usize {
-        if store.contains(&format!("model.visual.blocks.{b}.attn.qkv.weight")) {
+        if store.contains(&format!("model.visual.blocks.{b}.attn.qkv.weight"))
+            || has_linear(store, &format!("model.visual.blocks.{b}.attn.q_proj"))
+        {
             r.vision_tensors += 1;
         }
     }
@@ -158,3 +177,7 @@ impl NamespaceReport {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "probe_tests.rs"]
+mod tests;

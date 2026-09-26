@@ -322,17 +322,7 @@ impl TransformerModel {
 
             // Final norm over all M rows.
             let normed = self.buffers.norm_output();
-            ops::rms_norm(
-                self.gpu.as_ref(),
-                self.rms_norm_kernel,
-                hidden,
-                &self.final_norm,
-                normed,
-                m as u32,
-                h as u32,
-                self.config.rms_norm_eps as f32,
-                stream,
-            )?;
+            self.final_norm_rows(hidden, normed, m as u32, stream)?;
 
             // LM head for M tokens (weights read once).
             self.lm_head_batched(normed, m as u32, self.buffers.logits(), stream)?;

@@ -51,6 +51,9 @@ pub fn quant_gemv(
         QuantWeight::PackedQ2(_) => anyhow::bail!(
             "quant_gemv: PackedQ2 not routed through the generic dispatcher; use q2_0_gemv_vec"
         ),
+        QuantWeight::Exl3(_) => anyhow::bail!(
+            "quant_gemv: EXL3 is not routed through the generic dispatcher yet (reconstruct + GEMM lands in M3)"
+        ),
     }
 }
 
@@ -90,6 +93,9 @@ pub fn quant_gemm(
         QuantWeight::PackedQ2(_) => anyhow::bail!(
             "quant_gemm: PackedQ2 not routed through the generic dispatcher; \
              use the layer's transient-dequant prefill path"
+        ),
+        QuantWeight::Exl3(_) => anyhow::bail!(
+            "quant_gemm: EXL3 is not routed through the generic dispatcher yet (reconstruct + GEMM lands in M3)"
         ),
     }
 }

@@ -24,11 +24,16 @@ fn upload_one(
     offload_logged: &mut bool,
 ) -> Result<()> {
     // F16 shards: convert bytes to BF16 before upload (same length,
-    // different bit layout). WeightDtype stays closed to store dtypes.
+    // different bit layout). EXL3 scale vectors (`keeps_raw_f16`) keep their
+    // raw FP16 bytes. WeightDtype stays closed to store dtypes otherwise.
     let converted: Vec<u8>;
     let (data, dtype): (&[u8], _) = if st_dtype == safetensors::Dtype::F16 {
-        converted = f16_to_bf16_bytes(raw);
-        (&converted, WeightDtype::BF16)
+        if crate::weights::keeps_raw_f16(name) {
+            (raw, WeightDtype::FP16)
+        } else {
+            converted = f16_to_bf16_bytes(raw);
+            (&converted, WeightDtype::BF16)
+        }
     } else {
         (raw, WeightDtype::from_safetensors(st_dtype)?)
     };
@@ -97,7 +102,10 @@ pub(super) fn load_sharded(
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
-    let index: SafetensorsIndex = serde_json::from_str(&index_json)?;
+    let mut index: SafetensorsIndex = serde_json::from_str(&index_json)?;
+    // EXL3 tensors in unindexed side files join the map (no-op otherwise), so
+    // they are grouped into `shard_to_tensors` and estimated below.
+    let _merged = crate::weights::merge_exl3_side_files(model_dir, &mut index.weight_map)?;
 
     let mut offload_logged = false; // Track if we've logged the managed memory fallback
 
@@ -384,11 +392,16 @@ pub(super) fn load_single(
             continue;
         }
         let shape: Vec<usize> = view.shape().to_vec();
-        // F16: convert to BF16 at load — see load_sharded above.
+        // F16: convert to BF16 at load — see load_sharded above. EXL3 scale
+        // vectors (`keeps_raw_f16`) keep their raw FP16 bytes.
         let converted: Vec<u8>;
         let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16 {
-            converted = f16_to_bf16_bytes(view.data());
-            (&converted, WeightDtype::BF16)
+            if crate::weights::keeps_raw_f16(&name) {
+                (view.data(), WeightDtype::FP16)
+            } else {
+                converted = f16_to_bf16_bytes(view.data());
+                (&converted, WeightDtype::BF16)
+            }
         } else {
             (view.data(), WeightDtype::from_safetensors(view.dtype())?)
         };

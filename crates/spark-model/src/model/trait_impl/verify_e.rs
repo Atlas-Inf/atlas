@@ -608,17 +608,7 @@ impl TransformerModel {
 
             // ── Phase 4: final norm [R, H] + lm_head + per-row argmax ──
             let normed = self.buffers.norm_output();
-            ops::rms_norm(
-                self.gpu.as_ref(),
-                self.rms_norm_kernel,
-                hidden,
-                &self.final_norm,
-                normed,
-                r_total as u32,
-                h as u32,
-                self.config.rms_norm_eps as f32,
-                stream,
-            )?;
+            self.final_norm_rows(hidden, normed, r_total as u32, stream)?;
 
             if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                 anyhow::bail!("K4_DIAG(batched): CUDA error after final norm: {e:#}");

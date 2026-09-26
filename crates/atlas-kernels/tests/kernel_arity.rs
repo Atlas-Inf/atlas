@@ -161,3 +161,64 @@ fn dflash2_candidate_selector_arity_pin() {
         "dflash2_candidate_selector not found in any compiled module — registry drift?"
     );
 }
+
+/// The EXL3 module is a standalone bundle member (not part of the w4a16 launch
+/// family), so it gets its own pin: the reconstruct entries take four params
+/// (out, packed, packed_blocks_n, packed_n_offset), the had_r128 entries four
+/// (in, out, scale, r_scale), the conversions three (in, out, n), the fp16
+/// transpose four (in, out, rows, cols) and the fp16 GEMM six (a, b, c, m, n,
+/// k); the launchers in spark-model must pass exactly that many. Update launcher
+/// and pin in the same commit.
+#[test]
+#[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
+fn exl3_reconstruct_arity_pin() {
+    if atlas_kernels::available_targets()
+        .iter()
+        .all(|s| s.modules.is_empty())
+    {
+        eprintln!("no compiled PTX in this binary (stub build) — arity pin skipped");
+        return;
+    }
+    const ENTRIES: &[(&str, usize)] = &[
+        ("exl3_reconstruct_mul1_k3", 4),
+        ("exl3_reconstruct_mul1_k4", 4),
+        ("exl3_reconstruct_mul1_k5", 4),
+        ("exl3_reconstruct_mul1_k6", 4),
+        ("exl3_had_r128_pre", 4),
+        ("exl3_had_r128_post", 4),
+        ("exl3_had_r128_plain", 4),
+        ("exl3_bf16_to_f16", 3),
+        ("exl3_f16_to_bf16", 3),
+        ("exl3_transpose_f16", 4),
+        ("exl3_hgemm_f16", 6),
+    ];
+    let mut checked = 0usize;
+    for set in atlas_kernels::available_targets() {
+        for (module, blob) in &set.modules {
+            let Ok(ptx) = std::str::from_utf8(blob) else {
+                continue;
+            };
+            if *module != "exl3" {
+                continue;
+            }
+            for &(kernel, arity) in ENTRIES {
+                if let Some(count) = ptx_param_count(ptx, kernel) {
+                    assert_eq!(
+                        count, arity,
+                        "PTX arity drift: {module}::{kernel} on target {} has \
+                         {count} params, pin expects {arity} — update the launcher AND \
+                         this pin together",
+                        set.target.model
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= ENTRIES.len(),
+        "exl3 arity test checked only {checked} entries (expected all {}) — \
+         registry drift?",
+        ENTRIES.len()
+    );
+}
