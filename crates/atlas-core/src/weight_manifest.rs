@@ -221,7 +221,7 @@ pub fn quantized_manifest(
     }
 
     // ModelOpt NVFP4: packed weights plus a three-tensor scale set.
-    if quant.quant_algo == "NVFP4" {
+    if crate::config::is_nvfp4_quant_algo(&quant.quant_algo) {
         let group = quant.group_size;
         anyhow::ensure!(group > 0, "NVFP4 requires a non-zero group_size");
         let is_ignored = |module: &str| {

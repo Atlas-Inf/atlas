@@ -431,7 +431,10 @@ pub(super) fn canonicalize_model_quant(config: &atlas_core::config::ModelConfig)
     // FP8/BF16 paths (see quant_pair_compatible: nvfp4↔fp8, nvfp4↔bf16).
     // So routing MIXED_PRECISION to the nvfp4 bundle is correct and cannot
     // silently mis-route an FP8 module (it would fault at load, not corrupt).
-    if algo == "nvfp4" || algo == "mixed_precision" || fmt.contains("nvfp4") {
+    if atlas_core::config::is_nvfp4_quant_algo(&algo)
+        || algo == "mixed_precision"
+        || fmt.contains("nvfp4")
+    {
         return "nvfp4".into();
     }
     // FP8 detection — explicit algo OR method/format containing "fp8", OR
