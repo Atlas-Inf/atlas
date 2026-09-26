@@ -298,11 +298,64 @@ impl Qwen3SsmLayer {
         Ok(true)
     }
 
+    /// M6f-b: free this layer's resident BF16 GDN copies (the fused qkvz and
+    /// the store's BF16 out_proj) and switch the overlay to lazy rebuild.
+    /// Only called from the loader when `attach_exl3_decode_from_store`
+    /// installed the overlay AND `exl3_lazy_bf16()`; every runtime read goes
+    /// through [`Self::qkvz_bf16`] / [`Self::out_proj_bf16`] afterwards, so a
+    /// site that was missed dereferences NULL and faults loudly.
+    pub(crate) fn drop_bf16_copies(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        store: &spark_runtime::weights::WeightStore,
+        lp: &str,
+    ) -> Result<()> {
+        let Some(e) = self.exl3_decode.as_mut() else {
+            return Ok(());
+        };
+        e.set_lazy(true);
+        // Decode may be CUDA-graph captured, and capture must never allocate:
+        // pre-grow the pool for the model's default stream now.
+        let sizes = e.bf16_sizes();
+        exl3_bf16_scratch(gpu, gpu.default_stream(), &sizes)?;
+        let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+
+        // The fused qkvz is layer-owned (`gpu_concat_rows` allocated it; tp = 1,
+        // so the shard is the same pointer).
+        let qkvz_bytes = if self.ssm.in_proj_qkvz.weight.is_null() {
+            0
+        } else {
+            let bytes = sizes.qkvz_bytes;
+            gpu.free(self.ssm.in_proj_qkvz.weight)?;
+            self.ssm.in_proj_qkvz.weight = DevicePtr::NULL;
+            bytes
+        };
+        // The BF16 out_proj is a STORE tensor: reclaim frees it and records the
+        // pointer so teardown will not free it again. Keep the field as
+        // Some(null): several dispatch checks test `out_proj_dense.is_some()`.
+        let out_name = format!("{lp}.linear_attn.out_proj.weight");
+        let out_bytes = if self.out_proj_dense.is_some() {
+            store.reclaim(gpu, &out_name)?;
+            self.out_proj_dense = Some(DenseWeight {
+                weight: DevicePtr::NULL,
+            });
+            sizes.out_bytes
+        } else {
+            0
+        };
+        tracing::info!(
+            "EXL3 lazy BF16: freed {:.1} MB (qkvz {:.1} + out_proj {:.1}) for {lp}",
+            mb(qkvz_bytes + out_bytes),
+            mb(qkvz_bytes),
+            mb(out_bytes),
+        );
+        Ok(())
+    }
+
     /// The BF16 qkvz weight for the wide (prefill / verify) paths: the resident
     /// copy, or a rebuild into the stream's scratch once the overlay is lazy.
     /// The returned pointer's contents are stream-ordered against the caller's
-    /// work on `stream`. M6f-a plumbing: M6f-b routes the BF16 call sites here.
-    #[allow(dead_code)]
+    /// work on `stream`. M6f-b routes the BF16 call sites here.
     pub(crate) fn qkvz_bf16(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<DenseWeight> {
         if let Some(e) = self.exl3_decode.as_deref()
             && e.is_lazy()
@@ -315,7 +368,6 @@ impl Qwen3SsmLayer {
     }
 
     /// The BF16 out_proj weight, lazy variant of [`Self::qkvz_bf16`].
-    #[allow(dead_code)]
     pub(crate) fn out_proj_bf16(
         &self,
         gpu: &dyn GpuBackend,
@@ -333,7 +385,6 @@ impl Qwen3SsmLayer {
 
     /// Whether a BF16 qkvz is obtainable: the resident copy, or a lazy overlay
     /// that can rebuild one.
-    #[allow(dead_code)]
     pub(crate) fn has_qkvz_bf16(&self) -> bool {
         self.exl3_decode.as_deref().is_some_and(|e| e.is_lazy())
             || !self.ssm.in_proj_qkvz.weight.is_null()

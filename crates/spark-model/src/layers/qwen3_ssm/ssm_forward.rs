@@ -134,11 +134,12 @@ impl Qwen3SsmLayer {
                         stream,
                     )
                 } else {
+                    let qkvz = self.qkvz_bf16(ctx.gpu, stream)?;
                     ops::dense_gemv(
                         ctx.gpu,
                         self.dense_gemv_k,
                         normed,
-                        &self.ssm.in_proj_qkvz,
+                        &qkvz,
                         deinterleaved,
                         qkvz_size,
                         h,
@@ -164,11 +165,12 @@ impl Qwen3SsmLayer {
             } else {
                 // 80B fallback: interleaved GEMV + separate deinterleave
                 let qkvz_out = ctx.buffers.ssm_qkvz();
+                let qkvz = self.qkvz_bf16(ctx.gpu, stream)?;
                 ops::dense_gemv(
                     ctx.gpu,
                     self.dense_gemv_k,
                     normed,
-                    &self.ssm.in_proj_qkvz,
+                    &qkvz,
                     qkvz_out,
                     qkvz_size,
                     h,
@@ -454,7 +456,7 @@ impl Qwen3SsmLayer {
                 value_dim as u32,
                 stream,
             )?;
-        } else if let Some(ref dense_out) = self.out_proj_dense {
+        } else if let Some(dense_out) = self.out_proj_bf16(ctx.gpu, stream)? {
             if ctx.levers.gdn_fp8_decode
                 && self.dense_gemv_fp8w_k.0 != 0
                 && let Some(ref fp8w) = self.out_proj_fp8w_rowwise
@@ -480,7 +482,7 @@ impl Qwen3SsmLayer {
                     ctx.gpu,
                     self.dense_gemv_k,
                     normed_out,
-                    dense_out,
+                    &dense_out,
                     out,
                     h,
                     value_dim as u32,
