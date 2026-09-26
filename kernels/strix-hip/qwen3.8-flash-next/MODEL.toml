@@ -479,6 +479,25 @@ wht_bf16_inplace_inv = "Inverse twin; same."
 tq_plus_innerq_apply_q = "TurboQuant+ inner-quant apply on Q; turboKV off."
 tq_plus_innerq_apply_k = "K-side twin; same."
 
+# ── QSA tensor-core arms + MoE persist marker (gb10-only builds) ──────────
+# Post-merge additions: qsa_score_tc / qsa_attn_tc{,2,3} and moe_persist_marker
+# are gb10 tensor-core / persistent-MoE arms with no strix-hip build; every
+# probe is a lazy try_kernel with a resolved fallback arm.
+[expected_absent.qsa_score_tc]
+qsa_score_rows_tc = "Tensor-core QSA row-score arm (qsa.rs:218); handle!=0 gate — resolved qsa_score_rows arm serves."
+
+[expected_absent.qsa_attn_tc]
+qsa_prefill_attn_tc = "Tensor-core QSA prefill-attn arm (qsa.rs:225); handle!=0 gate — resolved qsa_prefill_attn arm serves."
+
+[expected_absent.qsa_attn_tc2]
+qsa_prefill_attn_tc2 = "tc2 twin (qsa.rs:226); same gate, same fallback."
+
+[expected_absent.qsa_attn_tc3]
+qsa_prefill_attn_tc3 = "tc3 twin (qsa.rs:227); same gate, same fallback."
+
+[expected_absent.moe_persist_marker]
+moe_w4a16_k64_strides_m_tiles = "Persistent-MoE marker probe (moe/init.rs:466); not built for strix-hip — dead handle probe."
+
 # ── misc optional features ─────────────────────────────────────────────────
 [expected_absent.token_overlay]
 embed_rowdiff_bf16 = "Routed-token overlay feature; every hook guards kernel.0==0 (token_overlay.rs:31) — feature unused on this dense model."
