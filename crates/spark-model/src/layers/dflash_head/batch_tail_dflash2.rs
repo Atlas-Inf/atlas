@@ -19,6 +19,8 @@ impl BlockDiffusionDraftHead {
     pub(super) fn run_batched_dflash2_tail(
         &self,
         batch_size: u32,
+        // Group γ (per-sequence under adaptive; configured γ otherwise).
+        gamma: usize,
         last_tokens: &[u32],
         ctx: &crate::layer::ForwardContext,
         stream: u64,
@@ -48,7 +50,7 @@ impl BlockDiffusionDraftHead {
             batch_size
         );
         let gamma =
-            u32::try_from(self.gamma).map_err(|_| anyhow::anyhow!("DFlash gamma exceeds u32"))?;
+            u32::try_from(gamma).map_err(|_| anyhow::anyhow!("DFlash gamma exceeds u32"))?;
         let hidden = u32::try_from(self.hidden_size)
             .map_err(|_| anyhow::anyhow!("DFlash hidden width exceeds u32"))?;
         let vocab = u32::try_from(self.vocab_size)

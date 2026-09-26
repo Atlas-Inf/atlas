@@ -159,6 +159,7 @@ impl BlockDiffusionDraftHead {
             last_tokens[i],
             positions[i],
             num_drafts,
+            dstate.propose_gamma,
             dstate,
             owner,
             option_b_arg,

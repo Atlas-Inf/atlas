@@ -119,7 +119,25 @@ pub(super) fn step_verify_dflash_batched(
         }
     };
     let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
-    tracing::info!("DFLASH BATCHED verify n={n} R={} {:.1}ms", acc, verify_ms);
+    // γ distribution: ks[i] = γ_i + 1 for DFlash sequences (adaptive γ
+    // makes the per-sequence widths differ; a fixed-γ run prints a single
+    // gN=n bucket).
+    let gamma_dist = {
+        let mut counts = std::collections::BTreeMap::new();
+        for &k in ks {
+            *counts.entry(k.saturating_sub(1)).or_insert(0usize) += 1;
+        }
+        counts
+            .iter()
+            .map(|(g, c)| format!("g{g}={c}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    tracing::info!(
+        "DFLASH BATCHED verify n={n} R={} {gamma_dist} {:.1}ms",
+        acc,
+        verify_ms
+    );
 
     let mut verifieds: Vec<Vec<u32>> = Vec::with_capacity(n);
     let mut accepts: Vec<usize> = Vec::with_capacity(n);

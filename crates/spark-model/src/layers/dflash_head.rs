@@ -317,6 +317,19 @@ pub struct DflashProposerState {
     /// Drafts accepted in the verify that immediately preceded this propose.
     /// Set by `after_verify` so propose can label row-0 with its TRUE position.
     pub last_num_accepted: usize,
+    /// Effective γ for the NEXT propose. Initialised to the configured γ
+    /// (`initial_gamma`), so lever-off is byte-identical to the legacy
+    /// `self.gamma` path; `ATLAS_DFLASH_ADAPTIVE_GAMMA=1` starts it at the
+    /// 8-row floor and `after_verify` moves it via `next_gamma`.
+    pub propose_gamma: usize,
+    /// EMA of accepted draft tokens per verify step (bonus excluded);
+    /// drives `next_gamma`. Lever-off: stays 0 and is never read.
+    pub accept_ema: f32,
+    /// The configured γ_max this state was allocated under — the
+    /// `next_gamma` ceiling and the reclaim reset point.
+    pub gamma_max: usize,
+    /// Frozen lever copy so reclaim can reset γ without the head handle.
+    pub adaptive_gamma_on: bool,
     /// EAGLE-fix one-shot: when set, the next `propose()` skips its internal
     /// decode-append because the verify step (K=2 accept) already appended
     /// row 0 + row 1 in EAGLE order before calling propose. Consumed (reset to
@@ -428,6 +441,10 @@ impl DflashProposerState {
         self.ctx_count_drafter = 0;
         self.ctx_committed = 0;
         self.ctx_positions.clear();
+        // γ/EMA back to the floor so a re-prepared state cannot carry a
+        // stale adaptive level into a fresh sequence.
+        self.propose_gamma = adaptive_gamma::initial_gamma(self.adaptive_gamma_on, self.gamma_max);
+        self.accept_ema = 0.0;
         self.seq_len = 0;
         self.ctx_len = 0;
         self.prefill_done = false;
@@ -688,6 +705,7 @@ pub use contract::{
 mod contract_tests;
 mod row_contract;
 pub use row_contract::{CommitProjection, DsparkProposal, DsparkRowError, LightningRowContract};
+mod adaptive_gamma;
 mod batch_inputs;
 pub use batch_inputs::{DsparkBatchInput, DsparkBatchInputError, DsparkBatchSequence};
 mod batch_attention;
@@ -848,6 +866,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_hidden_acc,
             ctx_len: 0,
             last_num_accepted: 0,
+            propose_gamma: adaptive_gamma::initial_gamma(self.startup.adaptive_gamma, self.gamma),
+            accept_ema: 0.0,
+            gamma_max: self.gamma,
+            adaptive_gamma_on: self.startup.adaptive_gamma,
             skip_next_decode_append: false,
             max_ctx_len: self
                 .window_size
@@ -982,10 +1004,21 @@ impl DraftProposer for BlockDiffusionDraftHead {
         if self.startup.diagnostics.batch_parity {
             tracing::info!("DFlash Bxgamma parity dispatch: batch={n}");
         }
+        // Per-sequence propose γ: `propose_gamma` is the configured γ for
+        // every sequence when `ATLAS_DFLASH_ADAPTIVE_GAMMA` is off, so the
+        // group table below degenerates to the single-group shape today.
+        let propose_gammas: Vec<usize> = states
+            .iter()
+            .map(|s| {
+                s.as_any()
+                    .downcast_ref::<DflashProposerState>()
+                    .map(|d| d.propose_gamma)
+                    .unwrap_or(self.gamma)
+            })
+            .collect();
         let (parity_oracle, parity_hidden_oracle) = if self.startup.diagnostics.batch_parity {
             let mut oracle = Vec::with_capacity(n);
-            let hidden_bytes = self.gamma * self.hidden_size * 2;
-            let mut hidden = Vec::with_capacity(n * hidden_bytes);
+            let mut hidden: Vec<Vec<u8>> = Vec::with_capacity(n);
             for i in 0..n {
                 oracle.push(self.propose_drafts(
                     last_tokens[i],
@@ -1001,9 +1034,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     Some(target_hiddens[i]),
                 )?);
                 ctx.gpu.synchronize(stream)?;
-                let mut bytes = vec![0u8; hidden_bytes];
+                let mut bytes = vec![0u8; propose_gammas[i] * self.hidden_size * 2];
                 ctx.gpu.copy_d2h(self.scratch.stream_buf, &mut bytes)?;
-                hidden.extend_from_slice(&bytes);
+                hidden.push(bytes);
             }
             (Some(oracle), Some(hidden))
         } else {
@@ -1054,20 +1087,98 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 prepared = i + 1;
             }
         }
-        let staged = self.propose_batch_staged_dispatch(
-            last_tokens,
-            target_hiddens,
-            positions,
-            num_drafts,
-            states,
-            expected_owners,
-            native_authoritative,
-            generic_auth,
-            parity_oracle,
-            parity_hidden_oracle,
-            ctx,
-            stream,
-        );
+        // Same-γ grouping for the staged pass: mask-row count, attention
+        // span, conv tail, and graph identity all key on γ, so a mixed-γ
+        // batch cannot share one launch shape. At most two groups with the
+        // shipped {8, 12} set; lever-off degenerates to a single group at
+        // the configured γ — the exact pre-existing call.
+        let groups: Vec<(usize, Vec<usize>)> = if self.startup.adaptive_gamma {
+            adaptive_gamma::distinct_gammas(&propose_gammas)
+                .into_iter()
+                .map(|g| (g, (0..n).filter(|&i| propose_gammas[i] == g).collect()))
+                .collect()
+        } else {
+            vec![(self.gamma, (0..n).collect())]
+        };
+        if groups.len() > 1 {
+            let dist = groups
+                .iter()
+                .map(|(g, idxs)| format!("g{g}={}", idxs.len()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("DFLASH BATCHED propose: {dist}");
+        }
+        let staged = (|| -> Result<Option<Vec<Vec<u32>>>> {
+            if groups.len() == 1 {
+                return self.propose_batch_staged_dispatch(
+                    last_tokens,
+                    target_hiddens,
+                    positions,
+                    num_drafts,
+                    groups[0].0,
+                    states,
+                    expected_owners,
+                    native_authoritative,
+                    generic_auth,
+                    parity_oracle,
+                    parity_hidden_oracle.map(|h| h.concat()),
+                    ctx,
+                    stream,
+                );
+            }
+            // Mixed γ: one staged pass per group on the γ_max-sized shared
+            // scratch (a γ=8 group writes only its prefix), then reassemble
+            // drafts in input order. `elems` unwraps each `&mut` once so a
+            // group's disjoint index set can re-collect it without aliasing.
+            let mut merged: Vec<Option<Vec<u32>>> =
+                std::iter::repeat_with(|| None).take(n).collect();
+            let mut elems: Vec<Option<&mut dyn crate::speculative::ProposerState>> =
+                states.iter_mut().map(|st| Some(&mut **st)).collect();
+            for (g, idxs) in &groups {
+                let g_tokens: Vec<u32> = idxs.iter().map(|&i| last_tokens[i]).collect();
+                let g_hiddens: Vec<spark_runtime::gpu::DevicePtr> =
+                    idxs.iter().map(|&i| target_hiddens[i]).collect();
+                let g_pos: Vec<usize> = idxs.iter().map(|&i| positions[i]).collect();
+                let g_owners: Vec<SequenceGeneration> =
+                    idxs.iter().map(|&i| expected_owners[i]).collect();
+                let g_oracle: Option<Vec<Vec<u32>>> = parity_oracle
+                    .as_ref()
+                    .map(|o| idxs.iter().map(|&i| o[i].clone()).collect());
+                let g_hidden: Option<Vec<u8>> = parity_hidden_oracle
+                    .as_ref()
+                    .map(|hs| idxs.iter().flat_map(|&i| hs[i].iter().copied()).collect());
+                let mut g_states: Vec<&mut dyn crate::speculative::ProposerState> = idxs
+                    .iter()
+                    .map(|&i| {
+                        elems[i]
+                            .take()
+                            .expect("disjoint γ groups share no sequence")
+                    })
+                    .collect();
+                let out = self.propose_batch_staged_dispatch(
+                    &g_tokens,
+                    &g_hiddens,
+                    &g_pos,
+                    num_drafts,
+                    *g,
+                    &mut g_states,
+                    &g_owners,
+                    native_authoritative,
+                    generic_auth,
+                    g_oracle,
+                    g_hidden,
+                    ctx,
+                    stream,
+                )?;
+                let out = out.unwrap_or_else(|| idxs.iter().map(|_| Vec::new()).collect());
+                for (j, &i) in idxs.iter().enumerate() {
+                    merged[i] = Some(out[j].clone());
+                }
+            }
+            Ok(Some(
+                merged.into_iter().map(|o| o.unwrap_or_default()).collect(),
+            ))
+        })();
         match staged {
             Err(e) if generic_auth => {
                 // State for every sequence was already advanced — surface
@@ -1139,6 +1250,32 @@ impl DraftProposer for BlockDiffusionDraftHead {
         )?;
         dstate.last_num_accepted = num_accepted;
         dstate.last_num_drafted = 0;
+        // Adaptive γ (lever-gated; propose_gamma is otherwise pinned to the
+        // configured γ and this block is a no-op read of the environment
+        // resolved once at startup): feed the accepted-draft count into the
+        // EMA and move the next propose's γ. `num_accepted` counts draft
+        // tokens only — the bonus token is a verify output, not a draft.
+        if self.startup.adaptive_gamma {
+            dstate.accept_ema = adaptive_gamma::update_ema(dstate.accept_ema, num_accepted);
+            let (next, ema) = adaptive_gamma::next_gamma(
+                dstate.propose_gamma,
+                dstate.accept_ema,
+                adaptive_gamma::ADAPTIVE_GAMMA_LO,
+                self.gamma,
+            );
+            if next != dstate.propose_gamma {
+                tracing::debug!(
+                    "DFlash adaptive γ: {} -> {} (ema={:.2} -> {:.2}, accepted={})",
+                    dstate.propose_gamma,
+                    next,
+                    dstate.accept_ema,
+                    ema,
+                    num_accepted,
+                );
+                dstate.propose_gamma = next;
+                dstate.accept_ema = ema;
+            }
+        }
         Ok(())
     }
 

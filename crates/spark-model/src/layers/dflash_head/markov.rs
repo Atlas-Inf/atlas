@@ -25,6 +25,8 @@ impl BlockDiffusionDraftHead {
         scratch: &DflashScratch,
         markov_embed: DevicePtr,
         markov_bias: DevicePtr,
+        // Per-call γ (`dstate.propose_gamma` under adaptive).
+        gamma: usize,
     ) -> Result<()> {
         let bf16 = 2usize;
         if let Some(ref selector) = self.candidate_selector {
@@ -34,7 +36,7 @@ impl BlockDiffusionDraftHead {
                 scratch.logits,
                 scratch.dflash2_projected_hidden,
                 scratch.draft_tokens_dev,
-                self.gamma,
+                gamma,
                 gpu,
                 &|src, w, dst, m, n, k| self.drafter_dense_gemm(gpu, src, w, dst, m, n, k, stream),
                 self.kernels.dflash2_candidate_selector,
@@ -46,6 +48,7 @@ impl BlockDiffusionDraftHead {
             && !markov_embed.is_null()
         {
             return self.argmax_with_markov(
+                gamma,
                 last_token,
                 w1,
                 w2,
@@ -56,7 +59,7 @@ impl BlockDiffusionDraftHead {
                 markov_bias,
             );
         }
-        for i in 0..self.gamma {
+        for i in 0..gamma {
             let logits_row = scratch.logits.offset(i * self.vocab_size * bf16);
             let token_slot = scratch.draft_tokens_dev.offset(i * 4);
             ops::argmax_bf16(
@@ -73,6 +76,7 @@ impl BlockDiffusionDraftHead {
 
     fn argmax_with_markov(
         &self,
+        gamma: usize,
         last_token: u32,
         w1: &DenseWeight,
         w2: &DenseWeight,
@@ -104,7 +108,7 @@ impl BlockDiffusionDraftHead {
         )?;
         // Rows 1..γ−1 = mask rows. prev is last_token for row 1, then the
         // just-written draft_tokens_dev[i-1].
-        for i in 1..self.gamma {
+        for i in 1..gamma {
             let prev_dev = if i == 1 {
                 scratch.markov_prev_dev
             } else {

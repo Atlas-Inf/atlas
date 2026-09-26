@@ -55,6 +55,9 @@ pub(super) struct PagedLayerArgs {
     pub kv_dim: u32,
     pub inter: u32,
     pub inv_sqrt_d: f32,
+    /// This propose's γ (per-call under `ATLAS_DFLASH_ADAPTIVE_GAMMA=1`;
+    /// the configured `head.gamma` otherwise).
+    pub gamma: u32,
     /// Slot mapping [γ] i32 — device pointer to the cache slot indices
     /// where this layer should write γ K/V via reshape_and_cache. Same
     /// across all drafter layers (block_table is shared).
@@ -177,7 +180,7 @@ impl BlockDiffusionDraftHead {
             ..
         } = *args;
         let gpu = ctx.gpu;
-        let g = self.gamma as u32;
+        let g = args.gamma;
         let kv_len = ctx_count + g;
 
         // 3a. input_layernorm — γ rows.
@@ -233,7 +236,9 @@ impl BlockDiffusionDraftHead {
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
+            self.drafter_gemm(
+                gpu, w_bf16, w_fp8, w_nvfp4, src, dst, g, n_out, k_in, stream,
+            )
         };
 
         // 3b-q / 3c-q. Q branch: q_proj then q_norm — faithful to dflash.py:68-70.
@@ -550,7 +555,7 @@ impl BlockDiffusionDraftHead {
             ..
         } = *args;
         let gpu = ctx.gpu;
-        let g = self.gamma as u32;
+        let g = args.gamma;
 
         // 3f. paged attention — q_len=γ, kv_len=ctx_count+γ.
         // Lightning DSpark: causal=true + SWA 1024 (config.json). Qwen-DFlash
@@ -631,7 +636,7 @@ impl BlockDiffusionDraftHead {
             ..
         } = *args;
         let gpu = ctx.gpu;
-        let g = self.gamma as u32;
+        let g = args.gamma;
         let ctx_us = ctx_count as usize;
         let g_us = g as usize;
         let seq_len = ctx_count + g;
@@ -827,7 +832,7 @@ impl BlockDiffusionDraftHead {
             ..
         } = *args;
         let gpu = ctx.gpu;
-        let g = self.gamma as u32;
+        let g = args.gamma;
 
         // Phase G — same swap helper as pre_attn (q/k/v). Single call
         // site per logical GEMM; the row-scaled FP8 GEMM kernel applies
@@ -840,7 +845,9 @@ impl BlockDiffusionDraftHead {
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
+            self.drafter_gemm(
+                gpu, w_bf16, w_fp8, w_nvfp4, src, dst, g, n_out, k_in, stream,
+            )
         };
 
         // 3g. o_proj — γ rows, [q_dim → h].

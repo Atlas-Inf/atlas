@@ -32,11 +32,15 @@ impl BlockDiffusionDraftHead {
         markov_bias: DevicePtr,
         graph_owner: SequenceGeneration,
         graph_lane: usize,
+        // Per-call γ — `dstate.propose_gamma` under
+        // `ATLAS_DFLASH_ADAPTIVE_GAMMA=1`, the configured `self.gamma`
+        // otherwise. Sized-to-γ_max scratch covers every smaller γ.
+        gamma: usize,
         defer_readback: bool,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
-        let g = self.gamma as u32;
+        let g = gamma as u32;
         let h = self.hidden_size as u32;
         let q_dim = (self.num_q_heads * self.head_dim) as u32;
         let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
@@ -78,7 +82,7 @@ impl BlockDiffusionDraftHead {
         let option_b_on = option_b_block_table.is_some();
         let eff_ctx = if option_b_on { 0 } else { eff_ctx };
         let _ = ctx_base_ptr; // Option B doesn't read ctx from this path
-        let n_attn = (eff_ctx + self.gamma) as u32;
+        let n_attn = (eff_ctx + gamma) as u32;
         let target_hidden_dim = self.target_layer_ids.len() * self.target_hidden_size;
         let ctx_slot_bytes = target_hidden_dim * bf16;
 
@@ -226,7 +230,7 @@ impl BlockDiffusionDraftHead {
                     eff_ctx,
                     self.target_layer_ids.len(),
                     self.target_hidden_size,
-                    self.gamma,
+                    gamma,
                     self.hidden_size,
                     self.num_kv_heads,
                     self.head_dim,
@@ -279,7 +283,7 @@ impl BlockDiffusionDraftHead {
         let ctx_start = position.saturating_sub(eff_ctx);
         let pos_host: Vec<i32> = (0..eff_ctx)
             .map(|i| (ctx_start + i) as i32)
-            .chain((0..self.gamma).map(|i| (position + i) as i32))
+            .chain((0..gamma).map(|i| (position + i) as i32))
             .collect();
         let pos_bytes: Vec<u8> = pos_host.iter().flat_map(|p| p.to_le_bytes()).collect();
         gpu.copy_h2d(&pos_bytes, scratch.position_ids)?;
@@ -307,10 +311,7 @@ impl BlockDiffusionDraftHead {
         }
         let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
             .chain(std::iter::once(last_token as i32))
-            .chain(std::iter::repeat_n(
-                self.mask_token_id as i32,
-                self.gamma - 1,
-            ))
+            .chain(std::iter::repeat_n(self.mask_token_id as i32, gamma - 1))
             .collect();
         if debug_dump {
             tracing::info!(
@@ -346,8 +347,8 @@ impl BlockDiffusionDraftHead {
         // when both Atlas and PyTorch see identical input.
         let force_noise_pattern = self.startup.diagnostics.force_noise_pattern;
         if force_noise_pattern {
-            let mut bytes = Vec::with_capacity(self.gamma * self.hidden_size * 2);
-            for t in 0..self.gamma {
+            let mut bytes = Vec::with_capacity(gamma * self.hidden_size * 2);
+            for t in 0..gamma {
                 for j in 0..self.hidden_size {
                     let v =
                         0.001_f32 * ((t + 1) as f32) * ((j + 1) as f32) / (self.hidden_size as f32);
@@ -382,7 +383,7 @@ impl BlockDiffusionDraftHead {
                 scratch.slot_mapping_dev,
                 bt,
                 option_b_ctx_count,
-                self.gamma as u32,
+                gamma as u32,
                 16,
                 stream,
             )?;
@@ -392,7 +393,7 @@ impl BlockDiffusionDraftHead {
             // attention launch reads from this pointer at kernel entry.
             // q_offset = ctx_count (cache-block addressing).
             // q_rope_pos = position (true decode position for query RoPE).
-            let kv_len = option_b_ctx_count + self.gamma as u32;
+            let kv_len = option_b_ctx_count + gamma as u32;
             let q_offset = option_b_ctx_count;
             let q_rope_pos = position as u32;
             let indirect_bytes: [u8; 12] = {
@@ -487,6 +488,7 @@ impl BlockDiffusionDraftHead {
                     kv_dim: kv_dim_local,
                     inter: inter_local,
                     inv_sqrt_d: inv_sqrt_d_local,
+                    gamma: g,
                     slot_mapping_gamma: slot_mapping,
                     block_table_dev: bt,
                     stream,
@@ -524,7 +526,7 @@ impl BlockDiffusionDraftHead {
                 stream_noise_local,
                 &self.norm,
                 norm_noise_local,
-                self.gamma as u32,
+                gamma as u32,
                 h_local,
                 self.rms_norm_eps,
                 stream,
@@ -547,7 +549,7 @@ impl BlockDiffusionDraftHead {
                     norm_noise_local,
                     fp8,
                     scratch.logits,
-                    self.gamma as u32,
+                    gamma as u32,
                     self.vocab_size as u32,
                     h_local,
                     stream,
@@ -567,7 +569,7 @@ impl BlockDiffusionDraftHead {
                         // ~75% of propose). Same pick the batched tail makes
                         // in batch_forward.rs; w4a16_gemm stays the fallback
                         // for γ>16 / missing tiers.
-                        let gemv_k = match self.gamma as u32 {
+                        let gemv_k = match gamma as u32 {
                             1..=4 => self.kernels.w4a16_gemv_batch4,
                             5..=8 => self.kernels.w4a16_gemv_batch8,
                             9..=16 => self.kernels.w4a16_gemv_batch16,
@@ -580,7 +582,7 @@ impl BlockDiffusionDraftHead {
                                 norm_noise_local,
                                 nvfp4,
                                 scratch.logits,
-                                self.gamma as u32,
+                                gamma as u32,
                                 self.vocab_size as u32,
                                 h_local,
                                 stream,
@@ -592,7 +594,7 @@ impl BlockDiffusionDraftHead {
                                 norm_noise_local,
                                 nvfp4,
                                 scratch.logits,
-                                self.gamma as u32,
+                                gamma as u32,
                                 self.vocab_size as u32,
                                 h_local,
                                 stream,
@@ -607,7 +609,7 @@ impl BlockDiffusionDraftHead {
                                 weight: self.lm_head_shared,
                             },
                             scratch.logits,
-                            self.gamma as u32,
+                            gamma as u32,
                             self.vocab_size as u32,
                             h_local,
                             stream,
@@ -622,14 +624,14 @@ impl BlockDiffusionDraftHead {
                         weight: self.lm_head_shared,
                     },
                     scratch.logits,
-                    self.gamma as u32,
+                    gamma as u32,
                     self.vocab_size as u32,
                     h_local,
                     stream,
                 )?;
             }
             if self.startup.diagnostics.block_dump {
-                let n_logits_bytes = self.gamma * self.vocab_size * 2;
+                let n_logits_bytes = gamma * self.vocab_size * 2;
                 let mut pre = vec![0u8; n_logits_bytes];
                 if gpu.copy_d2h(scratch.logits, &mut pre).is_ok() {
                     let _ = std::fs::write("/tmp/atlas_block_logits_pre.bin", &pre);
@@ -643,6 +645,7 @@ impl BlockDiffusionDraftHead {
                 scratch,
                 markov_embed,
                 markov_bias,
+                gamma,
             )?;
 
             // ── BLOCK-FORWARD PARITY DUMP (Friday 2026-06-11) ──────────────
@@ -676,7 +679,7 @@ impl BlockDiffusionDraftHead {
                 {
                     gpu.synchronize(stream)?;
                     // Full γ × vocab logits (BF16).
-                    let n_logits_bytes = self.gamma * self.vocab_size * bf16_local;
+                    let n_logits_bytes = gamma * self.vocab_size * bf16_local;
                     let mut lbuf = vec![0u8; n_logits_bytes];
                     let lane_tag = format!("{:x}", scratch.markov_prev_dev.0);
                     if let Err(e) = gpu.copy_d2h(scratch.logits, &mut lbuf) {
@@ -687,9 +690,9 @@ impl BlockDiffusionDraftHead {
                         tracing::warn!("DFLASH BLOCK_DUMP: logits write failed: {e}");
                     } else {
                         // Live argmax drafts (γ × u32).
-                        let mut dbuf = vec![0u8; self.gamma * 4];
+                        let mut dbuf = vec![0u8; gamma * 4];
                         gpu.copy_d2h(scratch.draft_tokens_dev, &mut dbuf)?;
-                        let drafts: Vec<u32> = (0..self.gamma)
+                        let drafts: Vec<u32> = (0..gamma)
                             .map(|i| {
                                 u32::from_le_bytes([
                                     dbuf[i * 4],
@@ -704,7 +707,7 @@ impl BlockDiffusionDraftHead {
                             drafts,
                             last_token,
                             position,
-                            self.gamma,
+                            gamma,
                             self.vocab_size,
                             self.hidden_size,
                             self.mask_token_id,
@@ -749,7 +752,7 @@ impl BlockDiffusionDraftHead {
                     // Noise/mask embedding rows: on the Option-B path eff_ctx=0 so the
                     // γ noise rows sit at the START of stream_buf. Dump γ × hidden BF16.
                     let noise_off = eff_ctx * self.hidden_size * bf16_local;
-                    let n_noise_bytes = self.gamma * self.hidden_size * bf16_local;
+                    let n_noise_bytes = gamma * self.hidden_size * bf16_local;
                     let mut nbuf = vec![0u8; n_noise_bytes];
                     if let Err(e) = gpu.copy_d2h(scratch.stream_buf.offset(noise_off), &mut nbuf) {
                         tracing::warn!("DFLASH BLOCK_INPUT: noise embed copy failed: {e}");
@@ -760,8 +763,8 @@ impl BlockDiffusionDraftHead {
                     // and the γ queries at [q_offset..q_offset+γ). Record what the
                     // paged attention actually used so the harness stops guessing.
                     let (kv_len_dump, q_offset_dump) = match option_b {
-                        Some((_, cc)) => (cc + self.gamma as u32, cc),
-                        None => (eff_ctx as u32 + self.gamma as u32, eff_ctx as u32),
+                        Some((_, cc)) => (cc + gamma as u32, cc),
+                        None => (eff_ctx as u32 + gamma as u32, eff_ctx as u32),
                     };
                     // q_rope_pos: the RoPE rotation base for γ queries. After
                     // the id249 fix this equals `position` (true decode pos),
@@ -771,19 +774,19 @@ impl BlockDiffusionDraftHead {
                     let input_meta = format!(
                         "{{\"eff_ctx\":{},\"gamma\":{},\"hidden_size\":{},\"option_b_kv_len\":{},\"option_b_q_offset\":{},\"q_rope_pos\":{},\"q_block_positions\":{:?}}}",
                         eff_ctx,
-                        self.gamma,
+                        gamma,
                         self.hidden_size,
                         kv_len_dump,
                         q_offset_dump,
                         q_rope_pos_dump,
-                        (0..self.gamma)
+                        (0..gamma)
                             .map(|r| q_rope_pos_dump as usize + r)
                             .collect::<Vec<_>>(),
                     );
                     let _ = std::fs::write("/tmp/atlas_block_input_meta.json", input_meta);
                     tracing::info!(
                         "DFLASH BLOCK_INPUT: wrote noise_embed ({}×{} BF16) + input_meta (q_offset={}, kv_len={}, position={})",
-                        self.gamma,
+                        gamma,
                         self.hidden_size,
                         q_offset_dump,
                         kv_len_dump,
@@ -841,6 +844,7 @@ impl BlockDiffusionDraftHead {
                 ctx_buffer.map(|(p, _)| p.0).unwrap_or(0),
                 scratch.markov_prev_dev.0,
                 graph_lane,
+                gamma,
             )?;
             let mut gmap = self.propose_graphs.lock();
             let cached_ready = gmap
@@ -992,20 +996,20 @@ impl BlockDiffusionDraftHead {
             .load(std::sync::atomic::Ordering::Relaxed);
         // `draft_tokens_host_pinned` is written exactly once, in
         // `from_weights.rs` (`alloc_host_pinned(gamma_val * 4)`), and the same
-        // `gamma_val` is stored as `self.gamma` — but the two live in different
+        // `gamma_val` is stored as `gamma` — but the two live in different
         // files, so pin the equality here rather than trust it silently. A failed
         // `alloc_host_pinned` propagates as an Err at construction, so a null here
         // would mean the field was never initialised.
         anyhow::ensure!(
             !pinned_ptr.is_null(),
             "DFlash draft-token pinned staging buffer is null (γ={})",
-            self.gamma
+            gamma
         );
         // SAFETY: `pinned_ptr` is the page-locked allocation made by
         // `alloc_host_pinned(gamma_val * 4)` in `DFlashHead::from_weights`, and
-        // `self.gamma == gamma_val` (both set from the same local in that
+        // `gamma == gamma_val` (both set from the same local in that
         // constructor; `gamma` is a plain `usize` field never reassigned), so
-        // `self.gamma * 4` is exactly the allocation size — not one byte past it.
+        // `gamma * 4` is exactly the allocation size — not one byte past it.
         // Non-null is checked immediately above; `cuMemAllocHost` returns
         // 64-byte-aligned memory, which trivially satisfies `u8`'s alignment of 1.
         //
@@ -1018,8 +1022,7 @@ impl BlockDiffusionDraftHead {
         // code path, and `host_buf` is the sole live reference to it (dropped
         // before the next propose). `copy_d2h_on_stream` drains `stream` before
         // returning, so no DMA is in flight against it when we read below.
-        let host_buf: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(pinned_ptr, self.gamma * 4) };
+        let host_buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(pinned_ptr, gamma * 4) };
         if defer_readback {
             // Multi-lane mode: enqueue the async D2H into the pinned buffer
             // and record the event WITHOUT blocking the host thread. The
@@ -1041,7 +1044,7 @@ impl BlockDiffusionDraftHead {
         // mask rows 1..γ predict drafts 1..γ−1; the anchor row (0) predicts the
         // block bonus and goes LAST, so the scheduler's num_drafts truncation
         // keeps exactly the mask-row drafts in verify order.
-        let drafts: Vec<u32> = (1..self.gamma)
+        let drafts: Vec<u32> = (1..gamma)
             .chain(std::iter::once(0))
             .map(|i| row_order[i])
             .collect();
@@ -1053,7 +1056,7 @@ impl BlockDiffusionDraftHead {
         {
             tracing::info!(
                 "DFLASH DUMP_FULL drafts (γ={}, last_token={}, position={}, eff_ctx={}): {:?}",
-                self.gamma,
+                gamma,
                 last_token,
                 position,
                 eff_ctx,
@@ -1074,18 +1077,21 @@ impl BlockDiffusionDraftHead {
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         scratch: &DflashScratch,
         cap: usize,
+        // γ the deferred propose ran at (`dstate.propose_gamma`) — the
+        // pinned readback is γ_max-wide but only γ rows are live.
+        gamma: usize,
     ) -> Result<Vec<u32>> {
         gpu.event_synchronize(scratch.draft_tokens_event)?;
         let pinned_ptr = scratch
             .draft_tokens_host_pinned
             .load(std::sync::atomic::Ordering::Relaxed);
         anyhow::ensure!(!pinned_ptr.is_null(), "draft_tokens_host_pinned is null");
-        let host_buf: &[u8] = unsafe { std::slice::from_raw_parts(pinned_ptr, self.gamma * 4) };
+        let host_buf: &[u8] = unsafe { std::slice::from_raw_parts(pinned_ptr, gamma * 4) };
         let row_order: Vec<u32> = host_buf
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let drafts: Vec<u32> = (1..self.gamma)
+        let drafts: Vec<u32> = (1..gamma)
             .chain(std::iter::once(0))
             .map(|i| row_order[i])
             .take(cap)

@@ -33,6 +33,11 @@ pub struct DflashGraphIdentity {
     ctx_ptr: u64,
     markov_ptr: u64,
     lane: usize,
+    /// Propose γ the graph was captured at — mask-row count, attention
+    /// span, and the ctx commit all depend on it, so a graph replayed at a
+    /// different γ would read the wrong shape. Adaptive γ (job 260) makes
+    /// this per (slot, lane, γ); the shipped set is two values.
+    gamma: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +280,7 @@ impl DflashGraphIdentity {
         ctx_ptr: u64,
         markov_ptr: u64,
         lane: usize,
+        gamma: usize,
     ) -> Result<Self, DsparkLifecycleError> {
         SequenceGeneration::new(owner.slot, owner.generation)?;
         nonzero_pointer("block_table_ptr", block_table_ptr)?;
@@ -283,12 +289,16 @@ impl DflashGraphIdentity {
         if lane == usize::MAX {
             return Err(DsparkLifecycleError::InvalidLane { lane });
         }
+        if gamma == 0 {
+            return Err(DsparkLifecycleError::ZeroCapacity);
+        }
         Ok(Self {
             owner,
             block_table_ptr,
             ctx_ptr,
             markov_ptr,
             lane,
+            gamma,
         })
     }
 

@@ -9,6 +9,8 @@ impl BlockDiffusionDraftHead {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_staged_attention(
         &self,
+        // Group γ (rows per sequence in this staged pass).
+        gamma: u32,
         _layer_idx: usize,
         batch_size: u32,
         max_kv_len: u32,
@@ -27,8 +29,7 @@ impl BlockDiffusionDraftHead {
                 tables.len(),
                 batch_size
             );
-            let q_row_bytes = self
-                .gamma
+            let q_row_bytes = (gamma as usize)
                 .checked_mul(self.num_q_heads * self.head_dim)
                 .and_then(|n| n.checked_mul(2))
                 .ok_or_else(|| anyhow::anyhow!("DFlash serial attention row offset overflow"))?;
@@ -41,7 +42,7 @@ impl BlockDiffusionDraftHead {
                     v_pool,
                     self.batch_attn_out.offset(sequence * q_row_bytes),
                     DevicePtr(tables[sequence]),
-                    self.gamma as u32,
+                    gamma,
                     args_base.offset(sequence * 12),
                     self.num_q_heads as u32,
                     self.num_kv_heads as u32,
@@ -68,7 +69,7 @@ impl BlockDiffusionDraftHead {
             self.batch_cu_seqlens,
             self.batch_kv_lens,
             self.batch_attention_args,
-            self.gamma as u32,
+            gamma,
             max_kv_len,
             0,
             self.num_q_heads as u32,

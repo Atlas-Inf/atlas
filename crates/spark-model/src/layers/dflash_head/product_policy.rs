@@ -301,6 +301,10 @@ pub struct DsparkStartupExecution {
     /// Generic DFlash serves the staged Bxgamma drafts authoritatively
     /// (`ATLAS_DFLASH_BATCHED_PROPOSE=1` + Option B + single lane).
     pub generic_batch_authoritative: bool,
+    /// Generic DFlash adapts γ per sequence between the floor (8) and the
+    /// configured γ_max on an accepted-token EMA (`ATLAS_DFLASH_ADAPTIVE_GAMMA=1`).
+    /// Lightning never adapts — `from_lightning` hard-codes this off.
+    pub adaptive_gamma: bool,
     /// Number of total propose lanes (lane 0 is the default stream).
     pub proposal_lane_count: usize,
     /// Diagnostic draft-depth cap override; `None` keeps scheduler K.
@@ -327,6 +331,7 @@ impl DsparkStartupExecution {
             native_batch_authoritative: true,
             option_b_enabled: toggles.option_b_enabled,
             generic_batch_authoritative: false,
+            adaptive_gamma: false,
             proposal_lane_count: toggles.proposal_lane_count,
             draft_cap_override: toggles.draft_cap_override,
             option_b_no_ctx: false,
@@ -387,6 +392,12 @@ impl DsparkStartupExecution {
                  treating as 0 — batched propose disabled"
             );
         }
+        let adaptive_gamma = one("ATLAS_DFLASH_ADAPTIVE_GAMMA");
+        if adaptive_gamma {
+            tracing::info!(
+                "ATLAS_DFLASH_ADAPTIVE_GAMMA=1: per-sequence γ adapts between 8 and                  the configured --dflash-gamma on an accepted-token EMA                  (rise > 6.0, fall < 4.5, 0.75/0.25 decay)"
+            );
+        }
         if batch_env_ref == Some("1") && !generic_batch_authoritative {
             tracing::warn!(
                 "ATLAS_DFLASH_BATCHED_PROPOSE=1 ignored: requires ATLAS_DFLASH_OPTION_B=1 \
@@ -397,6 +408,7 @@ impl DsparkStartupExecution {
             native_batch_authoritative: false,
             option_b_enabled,
             generic_batch_authoritative,
+            adaptive_gamma,
             proposal_lane_count,
             draft_cap_override: std::env::var("ATLAS_DFLASH_DRAFT_CAP")
                 .ok()

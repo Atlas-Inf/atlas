@@ -216,6 +216,10 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
         ctx_hidden_acc: gpu.alloc(4096).unwrap(),
         ctx_len: 12,
         last_num_accepted: 1,
+        propose_gamma: 8,
+        accept_ema: 0.0,
+        gamma_max: 8,
+        adaptive_gamma_on: false,
         skip_next_decode_append: false,
         max_ctx_len: 1024,
         ctx_slot_bytes: 64,
@@ -295,7 +299,7 @@ fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
     // A pooled graph for THIS owner must remain in the pool: the error arm
     // reclaims state resources but must NOT destroy owner-keyed graphs.
     head.propose_graphs.lock().insert(
-        DflashGraphIdentity::new(own, 0x10, 0x20, 0x30, 0).unwrap(),
+        DflashGraphIdentity::new(own, 0x10, 0x20, 0x30, 0, 8).unwrap(),
         vec![spark_runtime::gpu::GraphHandle(0xAA)],
     );
 

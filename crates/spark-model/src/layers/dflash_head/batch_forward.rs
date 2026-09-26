@@ -18,6 +18,8 @@ impl BlockDiffusionDraftHead {
         batch_rows: u32,
         batch_size: u32,
         max_kv_len: u32,
+        // Group γ (per-sequence under adaptive; configured γ otherwise).
+        gamma: u32,
         serial_block_tables: Option<&[u64]>,
         serial_attention_args: Option<spark_runtime::gpu::DevicePtr>,
         ctx: &crate::layer::ForwardContext,
@@ -54,7 +56,15 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
         if let Some(ref conv) = layer.attention_conv {
-            self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
+            self.staged_conv_prepare(
+                conv,
+                self.batch_norm,
+                batch_size,
+                hidden,
+                gamma,
+                ctx,
+                stream,
+            )?;
         }
         for (weight, fp8, nvfp4, output, width) in [
             (
@@ -86,6 +96,7 @@ impl BlockDiffusionDraftHead {
                 fp8,
                 nvfp4,
                 output,
+                gamma,
                 width,
                 hidden,
                 ctx,
@@ -177,6 +188,7 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
         self.run_staged_attention(
+            gamma,
             layer_idx,
             batch_size,
             max_kv_len,
@@ -195,13 +207,22 @@ impl BlockDiffusionDraftHead {
             &layer.o_proj_fp8,
             &layer.o_proj_nvfp4,
             self.batch_attn_proj,
+            gamma,
             hidden,
             q_dim,
             ctx,
             stream,
         )?;
         if let Some(ref conv) = layer.attention_conv {
-            self.staged_conv_finish(conv, self.batch_attn_proj, batch_size, hidden, ctx, stream)?;
+            self.staged_conv_finish(
+                conv,
+                self.batch_attn_proj,
+                batch_size,
+                hidden,
+                gamma,
+                ctx,
+                stream,
+            )?;
         }
         crate::layers::ops::residual_add(
             ctx.gpu,
@@ -223,7 +244,15 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
         if let Some(ref conv) = layer.mlp_conv {
-            self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
+            self.staged_conv_prepare(
+                conv,
+                self.batch_norm,
+                batch_size,
+                hidden,
+                gamma,
+                ctx,
+                stream,
+            )?;
         }
         for (weight, fp8, nvfp4, output) in [
             (
@@ -246,6 +275,7 @@ impl BlockDiffusionDraftHead {
                 fp8,
                 nvfp4,
                 output,
+                gamma,
                 intermediate,
                 hidden,
                 ctx,
@@ -268,13 +298,22 @@ impl BlockDiffusionDraftHead {
             &layer.down_proj_fp8,
             &layer.down_proj_nvfp4,
             self.batch_mlp_down,
+            gamma,
             hidden,
             intermediate,
             ctx,
             stream,
         )?;
         if let Some(ref conv) = layer.mlp_conv {
-            self.staged_conv_finish(conv, self.batch_mlp_down, batch_size, hidden, ctx, stream)?;
+            self.staged_conv_finish(
+                conv,
+                self.batch_mlp_down,
+                batch_size,
+                hidden,
+                gamma,
+                ctx,
+                stream,
+            )?;
         }
         crate::layers::ops::residual_add(
             ctx.gpu,
@@ -402,6 +441,7 @@ impl BlockDiffusionDraftHead {
     pub(super) fn run_batched_markov(
         &self,
         batch_size: u32,
+        gamma: u32,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -421,12 +461,10 @@ impl BlockDiffusionDraftHead {
             .map_err(|_| anyhow::anyhow!("DFlash Markov rank exceeds u32"))?;
         let vocab = u32::try_from(self.vocab_size)
             .map_err(|_| anyhow::anyhow!("DFlash vocab exceeds u32"))?;
-        let gamma =
-            u32::try_from(self.gamma).map_err(|_| anyhow::anyhow!("DFlash gamma exceeds u32"))?;
         let row_stride = gamma
             .checked_mul(vocab)
             .ok_or_else(|| anyhow::anyhow!("DFlash Markov row stride overflow"))?;
-        for depth in 1..self.gamma {
+        for depth in 1..gamma as usize {
             crate::layers::ops::batched_embed(
                 ctx.gpu,
                 self.kernels.batched_embed,
