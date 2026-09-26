@@ -99,12 +99,16 @@ impl DenseFfnLayer {
     ) -> Result<bool> {
         if !ops::dp4a_enabled()
             || self.activation != FfnActivation::SiLU
-            || !(2..=4).contains(&m)
+            || !(2..=8).contains(&m)
             || self.dp4a_quant_batch4_k.0 == 0
             || self.dp4a_gemv_batch4_k.0 == 0
             || self.dp4a_dual_batch4_k.0 == 0
             || self.dp4a_gemv_batch4_dyn_k.0 == 0
             || self.dp4a_dual_batch4_dyn_k.0 == 0
+            || self.dp4a_gemv_batch8_k.0 == 0
+            || self.dp4a_dual_batch8_k.0 == 0
+            || self.dp4a_gemv_batch8_dyn_k.0 == 0
+            || self.dp4a_dual_batch8_dyn_k.0 == 0
         {
             return Ok(false);
         }
@@ -118,10 +122,14 @@ impl DenseFfnLayer {
         if ctx.stats.once("log:decode_ffn_dp4a_batch") {
             tracing::info!(rows = m, "Dense FFN W4A8 DP4A batched path engaged");
         }
-        // m == 4 takes the guard-free specialization; m in 2..3 keeps the
-        // runtime-guarded kernel, whose `row >= M` skip is what makes the
-        // unused rows free. Both are bit-identical per emitted row.
-        let (gemv_k, dual_k) = if m == 4 {
+        // Guard-free specialization per exact tier; the _dyn twins keep the
+        // runtime `row >= M` skip that makes the unused rows free. Every arm
+        // is bit-identical per emitted row.
+        let (gemv_k, dual_k) = if m == 8 {
+            (self.dp4a_gemv_batch8_k, self.dp4a_dual_batch8_k)
+        } else if m >= 5 {
+            (self.dp4a_gemv_batch8_dyn_k, self.dp4a_dual_batch8_dyn_k)
+        } else if m == 4 {
             (self.dp4a_gemv_batch4_k, self.dp4a_dual_batch4_k)
         } else {
             (self.dp4a_gemv_batch4_dyn_k, self.dp4a_dual_batch4_dyn_k)
