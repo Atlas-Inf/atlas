@@ -10,23 +10,25 @@ workstream by watching its job.
 
 | workstream | job | PRs |
 |---|---|---|
-| Flash-Next long-context cold prefill | #74 | #68 (in the GB10 merge train) |
-| Flash-Next multi-turn TTFT (prefix caching) | #69 | — |
-| Flash-Next decode (MTP, draft vocab, graphs) | #70 | #84 (draft: `VERIFY_ACTIVE` default ON) |
-| GB10 tensor-core GEMM ceiling (shared) | #71 | — |
-| 27B DFlash2 concurrency | #58 | design: [`dflash2-batched-propose.md`](../../design/dflash2-batched-propose.md) |
+| Flash-Next long-context cold prefill | #74 | #68 (**merged**) |
+| Flash-Next multi-turn TTFT (prefix caching) | #69 | — (warm path measured: 98 % hits, 16-token recompute in the perf leg) |
+| Flash-Next decode (MTP, draft vocab, graphs) | #70 | #84 (draft: `VERIFY_ACTIVE` default ON; A/B queued) |
+| GB10 tensor-core GEMM ceiling (shared) | #71 | #83 (**merged**, the lazy-BF16 OOM hazard); the ceiling itself is open |
+| 27B DFlash2 concurrency | #58 | #86 (batched B×γ propose, default ON; gate run queued) |
 | 27B on Strix Halo: prefill + DP4A verify | #72 | #75 |
-| Per-request host-memory growth | #73 | #82 (in train) |
-| Client streaming latency | — | #67 (ready, in train) |
-| cuBLASLt per-call setup (shared runtime) | #71 | #77 (closed — correct, no gain; the OOM hazard it exposed moved to #83), #83 (in train) |
-| MTP memory on the nvidia Flash-Next pack | #70 | #78 (ready, in train) |
+| Per-request host-memory growth | #73 (closed) | #82 (**merged**), #92 (exact dedupe follow-up) |
+| Client streaming latency | — | #67 (**merged**) |
+| cuBLASLt per-call setup (shared runtime) | #71 | #77 (closed — correct, no gain) |
+| MTP memory on the nvidia Flash-Next pack | #70 | #78 (**merged**) |
+| GB10 boot kernel gate: the fleet refused Strix-only lookups | #87 (closed) | #89 (**merged**) |
+| Qwen3.6-35B-A3B NVFP4 current revision did not load | #88 (closed) | #90 (**merged**) |
 | This status page | — | #76 (draft) |
 
 **Per-box campaigns** (what each machine is running right now, and where it reports):
 
 | box | hardware | campaign job(s) | running now |
 |---|---|---|---|
-| reiner | DGX Spark GB10, 119.6 GB | merge-train validation + gates (T2 = main + #78 + #67 + #68 + #82 + #83) | jobs 274, 279-283 (below) |
+| reiner | DGX Spark GB10, 119.6 GB | post-merge: #86 concurrency gate, 27B DFlash2 perf leg, #84 A/B, prefill chunking investigation | jobs 362-368 (below) |
 | strix | Strix Halo Linux gfx1151 | #72 (27B prefill/DP4A), #56 (Flash-Next Linux) | idle: next is `w4a16_gemm_t_m128` tile analysis (see atlas-audit 11_HANDOFF_WINDOWS_STRIX_2026-09-25.md) |
 | winbox | Strix Halo Windows gfx1151, 128 GB | #57 (Flash-Next Windows port) | building `port/fnext-win-r3` (see atlas-audit 11_HANDOFF_WINDOWS_STRIX_2026-09-25.md) |
 
@@ -177,20 +179,45 @@ the two still-unmerged commits live in #75. #77 closed (correct, no gain — abo
 
 ---
 
-## Running now (reiner merge train)
+## GB10 merge train: merged (2026-09-26)
 
-T2 = `53f4a3d3a` = main66 + #78 + #67 + #68 + #82 + #83. The merge gate (maintainer,
-2026-09-26): ST-995 plus the 2.5 h agentic perf leg on the combined tree, then merge
-all five PRs. Every job below is **pending** — no results yet.
+The train was #78, #67, #68, #82 and #83, followed by #89 and #90; main is at `1ab38536b`. The maintainer's merge gate was ST-995 plus the 2.5 h agentic perf leg on the combined tree. The main tree is the one the gates and the support-matrix check ran on: it's identical to the job-346 build `f8a04db1f`, and differs from the gated tree `53f4a3d3a` only by TOML `[expected_absent]` declarations.
 
-| job | what it answers |
+| job | result |
 |---|---|
-| 274 `train2-validate` | builds T2 for all targets, GB10 unit tests, and two arm validations: V = recipe memory slope (does #82 stop the ~24 MB/req growth), C71 = 27B cuBLAS boot (does #83 keep the lazy-BF16 copies inside the budget) |
-| 279 `warmturn-t2` | #69 baseline: warm-turn TTFT on the combined tree |
-| 280 `st995-t2` | ST-995 (bfcl-subset) on T2 — the accuracy half of the merge gate |
-| 281 `perf-serve-t2` | the 2.5 h agentic perf leg on T2 — the other half of the merge gate |
-| 282 `st995-t2-va` | ST-995 on T2 with `ATLAS_QSA_VERIFY_ACTIVE=1` — the #84 A/B, off vs on, same binary |
-| 283 `perf-serve-t2-va` | the agentic perf leg with verify-active — the other half of the #84 A/B |
+| 274 `train2-validate` | **PASS.** All-targets build and GB10 unit tests (xgrammar 824 + 2, kernel_audit 7, lazy_bf16 + tc2 5). The recipe memory slope fell from +24.6 to +1.86 MB/request. The 27B cuBLAS boot at util 0.88 keeps 17.4 GB MemAvailable, where it previously left 2.1 GB and was killed. |
+| 279 `warmturn-t2` | #69 baseline: warm turns take 1.7–1.8 s at 9–11k tokens; turn 1 (cold) takes 4.8 s. |
+| 280 `st995-t2` | **PASS: 84.72 / 84.68** against bars of 82.72 / 81.65, with TC2 engaged. RssAnon stayed flat at ~1.76 GB for all 995 requests. The harness is deterministic per tree: repeat runs give identical scores. Earlier Flash-Next gate runs on other trees scored 85.73–86.03. Per-item responses are kept, so later runs can be paired (McNemar, `bfcl_paired.py`). |
+| 298 `perf-serve-t2` | **VALID.** Endpoints `agentic-coding-perf-2.5h`: 1007 of 1007 turns, 0 failed, 0 missing, 89 min. TTFT median 1.16 s / p99 2.76 s, TPOT median 63 ms, score 0.4899. Warm prefix hits were 98 % with a mean recompute of 16 tokens; 0 KV-exhausted, 0 errors. The compliance checker's `all_turns_observed` fails on this dataset whatever the server does: it compares `observed` (capped at the 1006 scorable turns) with `issued` (1007). |
+| 297 / 306 / 324 / 346 `moe-matrix-check` | #68 made the MoE transpose run on every MoE model, where it used to be allowlisted. These runs found:<br>• #87: the boot kernel gate refused Nemotron-3.5-Lightning and Qwen3.6-35B-A3B over Strix-only lookups.<br>• #88: the current Qwen3.6 NVFP4 revision labels its layers `W4A16_NVFP4` and was misread as FP8.<br>• A #68 regression: an undeclared marker probe.<br>After the fixes, job 346 shows all three MoE models booting with 0 unresolved lookups. Greedy output is identical to main66 + fixes, and 10k TTFT is equal or 2–3 % faster; Qwen3.6 now takes the HYBRID transpose tier. |
+
+## #58: 27B DFlash2 batched B×γ propose (PR #86)
+
+- **Parity (job 316, `cffb28553`):** the staged drafter backbone is **byte-identical** to serial (max|Δ| 0), and 94.8 % of draft tokens are equal. An earlier NVFP4-vs-BF16 staged-weight mismatch was fixed in `cffb28553`.
+- **Throughput:** probe-harness aggregate at C=4/8/16 went from 48.8 / 55.4 / 59.5 tok/s serial to **57.3 / 68.5 / 84.2** batched (+17 / +24 / +42 %). Acceptance is equal and there were 0 errors. C=1 is untouched (floor 2).
+- **Cross-sequence wy8 verify:** 60 launches become 2 per GDN layer, byte-identical, with no measurable throughput change.
+- **Default on** since `8bf0539b7` (rollback `ATLAS_DFLASH_BATCHED_PROPOSE=0`); the per-sequence fallback is total.
+- **Gate:** job 362 runs the repo's `concurrency-sweep` with batched propose OFF vs ON (floors 16.2 / 33.5 / 50.5 / 72). Adaptive-γ feasibility is posted on #58, and wyN now covers K=9..16.
+
+## Prefill is chunking-sensitive on the 27B (under investigation)
+
+- The "DFlash2 + prefix caching diverges" hazard is **not** a cache bug and not DFlash2-specific.
+  - Plain decoding diverges the same way (job 317).
+  - Prefix caching enabled with no cache hit is identical to a warm hit, bit for bit.
+  - The trigger is that enabling caching splits prefill at token 32 to save a checkpoint.
+- **Token-0 logits move by up to ~14 nats with the prefill chunking alone** (job 338):
+  - single chunk vs 16-token chunks vs split@32;
+  - the same happens with the independent WY4 GDN prefill.
+- **Per-op dumps (job 354):** the residual stream drifts steadily between a single 53-token chunk and 16-token chunks, from cos 0.9999 at the first attention layer to 0.911 at the last. The dense FFN output is already at cos 0.992 in layer 0. The suspect is M-dependent kernel selection with different activation precision; an audit is in progress.
+- Until this is resolved, output differences between chunkings, including prefix-cache splits, should not be read as a cache or speculation defect.
+
+**Queued on reiner, in order:**
+- 362: #86 concurrency gate.
+- 363: first 27B DFlash2 agentic perf leg.
+- 364 / 365: #84 verify-active A/B (ST paired against job 280, plus the perf leg).
+- 366: #69 at ~27k tokens.
+- 367: γ 8/12/16 on the wyN K=9..16 kernels.
+- 368: TC2-default A/B (`ATLAS_QSA_ATTN_TC2=0`, paired against job 280).
 
 ## Corrections recorded
 
