@@ -278,7 +278,7 @@ fn bf16_fallback_arm(
 
 /// Build the Atlas-kernel BF16 GEMM fallback — three arms. For
 /// `1 <= M <= 8` it launches `dense_gemv_bf16_batchm` (bandwidth-bound GEMV;
-/// on Flash-Next the BF16 `in_proj_qkvz` decode projection is [16384x2560]
+/// on Flash-Next the BF16 `in_proj_qkvz` decode projection is `16384x2560`
 /// at M=1, where the 128-row tile spends ~128x the useful MMA work). Larger
 /// vectorizable shapes launch `dense_gemm_bf16_pipelined` (tensor core,
 /// ~40x scalar on large M) when the kernel resolved AND its
