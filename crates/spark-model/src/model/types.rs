@@ -64,6 +64,10 @@ pub struct TransformerModel {
     /// nothing beside a transformer forward.
     pub(super) ngram_embed: Option<std::sync::Mutex<crate::layers::ngram_embed::NgramEmbedding>>,
     pub(super) final_norm: DenseWeight,
+    /// The final norm is the identity: qwen4_exp's hyper-connection mixer (run
+    /// in the last layer) is the final normalization and the reference feeds
+    /// its output straight to lm_head. See `final_norm_rows`.
+    pub(super) final_norm_identity: bool,
     pub(super) lm_head_weight: DenseWeight,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// TRANSPOSED `[K/2, ldb]` twin of `lm_head_nvfp4` + its PADDED row stride.
