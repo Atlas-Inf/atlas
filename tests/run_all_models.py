@@ -26,6 +26,8 @@ Run: python3 tests/run_all_models.py 2>&1 | tee /tmp/atlas-full-run.log
 import argparse
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -93,6 +95,12 @@ class TestSpec:
     # overlapping topology the two groups share the same NCCL comm.
     tp_size: int = 1
     ep_size: int = 1
+    # Container env vars, e.g. {"ATLAS_DFLASH_OPTION_B": "1"} for the
+    # Lightning DSpark path whose product validate() hard-requires it
+    # (reiner job 495 refused to boot without it). Passed as `-e K=V` on
+    # `docker run`; keys must match ^[A-Z_][A-Z0-9_]*$ (validated by
+    # `load_roster`, the only input surface that sets this).
+    env: dict = field(default_factory=dict)
 
 
 # ─── Plan ──────────────────────────────────────────────────────────────
@@ -340,6 +348,7 @@ def start_container(host: str, spec: TestSpec, port: int) -> str:
     # networking for NCCL, so one networking mode for the whole harness.
     docker_cmd = (
         f"run -d --name {name} --gpus all --ipc=host --network host "
+        f"{env_docker_flags(spec)} "
         f"-v {cache}:/root/.cache/huggingface "
         f"{IMAGE} {serve_cmd}"
     )
@@ -380,6 +389,18 @@ def legacy_ready_marker(port: int, bind: str = SERVE_BIND) -> str:
     `Listening on {bind}:{port}` — keep accepting it so this harness can
     verify older tags."""
     return f"Listening on {bind}:{port}"
+
+
+_ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+
+
+def env_docker_flags(spec: TestSpec) -> str:
+    """`-e K=V` fragment for `docker run`, shell-quoted: the command string
+    crosses `bash -lc` (and ssh on the worker), so quote the whole
+    `KEY=VALUE` pair as one token."""
+    return " ".join(
+        f"-e {shlex.quote(f'{k}={v}')}" for k, v in sorted(spec.env.items())
+    )
 
 
 # Ready-line prefixes that prove SOME bind happened. "Server live at " (no
@@ -687,6 +708,7 @@ def start_ep2(spec: TestSpec) -> tuple:
         f"run -d --name {rank0_name} --gpus all --ipc=host --network host "
         f"{RDMA_FLAGS}{NCCL_ENV} "
         f"-e RUST_LOG=info "
+        f"{env_docker_flags(spec)} "
         f"-v {HF_CACHE_HEAD}:/root/.cache/huggingface "
         f"{IMAGE} {rank0_serve}"
     )
@@ -698,6 +720,7 @@ def start_ep2(spec: TestSpec) -> tuple:
         f"run -d --name {rank1_name} --gpus all --ipc=host --network host "
         f"{RDMA_FLAGS}{NCCL_ENV} "
         f"-e RUST_LOG=info "
+        f"{env_docker_flags(spec)} "
         f"-v {HF_CACHE_WORKER}:/root/.cache/huggingface "
         f"{IMAGE} {rank1_serve}"
     )
@@ -827,11 +850,11 @@ def load_roster(path):
     having to un-edit) the committed roster.
 
     Format — a list of rounds, each a list of specs; every key beyond `host`
-    is a TestSpec field:
+    is a TestSpec field. `env` passes container env vars as `-e K=V`:
 
         [[{"host": "head", "label": "27B-nvfp4", "model": "nvidia/Qwen3.6-27B-NVFP4"}],
          [{"host": "head", "label": "35B-nvfp4", "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
-           "kv_dtype": "bf16"}]]
+           "kv_dtype": "bf16", "env": {"ATLAS_DFLASH_OPTION_B": "1"}}]]
 
     The roster flows through `planned_specs` like any other, so `_manifest.json`
     still records exactly what the run intended and the gate's coverage check
@@ -847,6 +870,12 @@ def load_roster(path):
             host = e.pop("host", "head")
             if host not in ("head", "worker"):
                 raise SystemExit(f"{path}: host must be 'head' or 'worker', got {host!r}")
+            for key in e.get("env", {}):
+                if not _ENV_KEY_RE.match(key):
+                    raise SystemExit(
+                        f"{path}: env key {key!r} (label {e.get('label')!r}) must match "
+                        r"^[A-Z_][A-Z0-9_]*$"
+                    )
             pairs.append((host, TestSpec(**e)))
         rounds.append(pairs)
     return rounds
