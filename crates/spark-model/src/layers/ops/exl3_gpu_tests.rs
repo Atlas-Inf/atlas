@@ -39,8 +39,8 @@ fn u16_bytes(v: &[u16]) -> Vec<u8> {
 fn gpu() -> spark_runtime::cuda_backend::AtlasCudaBackend {
     spark_runtime::cuda_backend::AtlasCudaBackend::new(
         0,
-        &atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
-            .expect("build with ATLAS_TARGET_MODEL='*'")
+        &atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "exl3")
+            .expect("build with ATLAS_TARGET_QUANT=exl3 (or '*')")
             .modules,
     )
     .expect("CUDA backend")

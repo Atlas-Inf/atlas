@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Rust launchers for the `exl3_int8` CUDA module (kernels/gb10/qwen3.8-flash-next/
-//! nvfp4/exl3_int8.cu): exllamav3's int8-activation "sq" GEMV for EXL3 mul1
+//! exl3/exl3_int8.cu): exllamav3's int8-activation "sq" GEMV for EXL3 mul1
 //! weights, and the bf16 linear composed from it.
 //!
 //! Unlike upstream — a cooperative launch with grid.sync — each entry here is
