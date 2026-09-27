@@ -378,6 +378,45 @@ pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOu
     }
 }
 
+/// Upper bound on waiting out the scheduler's teardown at process shutdown.
+/// Long enough for `Model::teardown` to free every pool; bounded so a wedged
+/// teardown can't pin the process past the point the caller gives up and
+/// leaves the exit to the OS.
+const SHUTDOWN_JOIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Process-shutdown twin of the hot-swap join above (#106): `main` returning
+/// used to leave the scheduler thread parked inside `Model::teardown` while
+/// `exit()` ran the HIP runtime's static destructors, so the teardown's
+/// `cuMemFree` calls raced them and the process aborted with "pure virtual
+/// method called". Draining the model's `Arc` and joining the scheduler here
+/// — the same pair the swap path does — makes teardown finish before main
+/// returns.
+pub(crate) fn shutdown(host: &Arc<ModelHost>) {
+    if let Err(e) = release_state(host, DRAIN_GRACE) {
+        tracing::warn!("shutdown: {e:#}; exiting without joining the scheduler");
+        return;
+    }
+    let Some(handle) = host.take_scheduler() else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + SHUTDOWN_JOIN;
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if !handle.is_finished() {
+        tracing::warn!(
+            "shutdown: the scheduler is still tearing down after {}s; exiting without joining it",
+            SHUTDOWN_JOIN.as_secs()
+        );
+        return;
+    }
+    if handle.join().is_err() {
+        tracing::warn!("shutdown: the scheduler thread panicked during teardown");
+        return;
+    }
+    tracing::info!("scheduler joined; model torn down");
+}
+
 #[cfg(test)]
 #[path = "model_swap_tests.rs"]
 mod tests;

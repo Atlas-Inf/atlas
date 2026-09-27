@@ -84,8 +84,16 @@ pub(crate) async fn serve(
             // swap would have nothing to join and would tear down a model with
             // a live scheduler still holding its weights.
             host.set_scheduler(prepared.scheduler);
-            crate::main_modules::serve_router::build_and_serve(host, &prepared.bind, prepared.port)
-                .await
+            let served = crate::main_modules::serve_router::build_and_serve(
+                host.clone(),
+                &prepared.bind,
+                prepared.port,
+            )
+            .await;
+            let h = host.clone();
+            tokio::task::spawn_blocking(move || crate::main_modules::model_swap::shutdown(&h))
+                .await?;
+            served
         }
         Startup::Worker => Ok(()),
         // Nothing to serve YET — but the listener still comes up. Waiting for
@@ -96,7 +104,16 @@ pub(crate) async fn serve(
         // `model_not_loaded`, which is the same shape a client already handles
         // during startup.
         Startup::AwaitingModel => {
-            crate::main_modules::serve_router::build_and_serve(host, &bind_addr, bind_port).await
+            let served = crate::main_modules::serve_router::build_and_serve(
+                host.clone(),
+                &bind_addr,
+                bind_port,
+            )
+            .await;
+            let h = host.clone();
+            tokio::task::spawn_blocking(move || crate::main_modules::model_swap::shutdown(&h))
+                .await?;
+            served
         }
     }
 }
