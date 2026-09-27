@@ -53,6 +53,7 @@ impl BlockDiffusionDraftHead {
             target_hidden_stack,
             false,
             false,
+            None,
         )
     }
 
@@ -68,6 +69,7 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         stream: u64,
         target_hidden_stack: DevicePtr,
+        ctx_collect: Option<&mut Vec<super::batched_ctx::PendingCtxChunk>>,
     ) -> Result<()> {
         let default_stream = ctx.gpu.default_stream();
         let (_, scratch, markov_embed, markov_bias) = self.lane(0, default_stream);
@@ -89,6 +91,7 @@ impl BlockDiffusionDraftHead {
             Some(target_hidden_stack),
             false,
             true,
+            ctx_collect,
         )?;
         Ok(())
     }
@@ -112,6 +115,7 @@ impl BlockDiffusionDraftHead {
         target_hidden_stack: Option<DevicePtr>,
         defer_readback: bool,
         prepare_only: bool,
+        mut ctx_collect: Option<&mut Vec<super::batched_ctx::PendingCtxChunk>>,
     ) -> Result<Vec<u32>> {
         let dstate = state
             .as_any_mut()
@@ -446,33 +450,47 @@ impl BlockDiffusionDraftHead {
                 let mut chunk_start = committed;
                 while chunk_start < dstate.ctx_len {
                     let chunk_count = (dstate.ctx_len - chunk_start).min(self.ctx_window);
-                    // Build slot_mapping for this chunk
-                    // [chunk_start .. chunk_start + chunk_count).
-                    crate::layers::ops::fill_slots_from_block_table(
-                        ctx.gpu,
-                        self.kernels.fill_slots,
-                        *slot_mapping,
-                        dstate.block_table_dev.unwrap(),
-                        chunk_start as u32,
-                        chunk_count as u32,
-                        BLOCK_SIZE as u32,
-                        _stream,
-                    )?;
-                    // The fixed positions for exactly the rows we're
-                    // computing. ctx_positions is parallel to ctx slots.
                     let slot_positions =
                         &dstate.ctx_positions[chunk_start..chunk_start + chunk_count];
-                    self.precompute_ctx_kv(
-                        dstate.ctx_hidden_acc,
-                        chunk_start,
-                        chunk_count,
-                        slot_positions,
-                        *slot_mapping,
-                        ctx,
-                        _stream,
-                        true, // commit: always write to paged cache on production path
-                        scratch,
-                    )?;
+                    if let Some(pending) = ctx_collect.as_deref_mut() {
+                        // Batched propose (#58): record the chunk; the
+                        // prepare loop's run_batched_ctx_stage gathers
+                        // every seq's rows, projects once, and scatters
+                        // (rebuilding slot_mapping) afterwards.
+                        pending.push(super::batched_ctx::PendingCtxChunk {
+                            ctx_base: dstate.ctx_hidden_acc,
+                            block_table: dstate.block_table_dev.unwrap(),
+                            start_slot: chunk_start,
+                            count: chunk_count,
+                            positions: slot_positions.to_vec(),
+                        });
+                    } else {
+                        // Build slot_mapping for this chunk
+                        // [chunk_start .. chunk_start + chunk_count).
+                        crate::layers::ops::fill_slots_from_block_table(
+                            ctx.gpu,
+                            self.kernels.fill_slots,
+                            *slot_mapping,
+                            dstate.block_table_dev.unwrap(),
+                            chunk_start as u32,
+                            chunk_count as u32,
+                            BLOCK_SIZE as u32,
+                            _stream,
+                        )?;
+                        // The fixed positions for exactly the rows we're
+                        // computing. ctx_positions is parallel to ctx slots.
+                        self.precompute_ctx_kv(
+                            dstate.ctx_hidden_acc,
+                            chunk_start,
+                            chunk_count,
+                            slot_positions,
+                            *slot_mapping,
+                            ctx,
+                            _stream,
+                            true, // commit: always write to paged cache on production path
+                            scratch,
+                        )?;
+                    }
                     chunk_start += chunk_count;
                 }
                 // Tail is now committed in the paged cache. Committed slots
@@ -743,6 +761,7 @@ impl BlockDiffusionDraftHead {
                 Some(target_hiddens[i]),
                 true,
                 false,
+                None,
             )?;
         }
         // COLLECT phase: each lane's D2H event is now recorded; synchronize

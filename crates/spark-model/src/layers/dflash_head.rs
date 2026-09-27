@@ -615,6 +615,16 @@ pub struct BlockDiffusionDraftHead {
     /// and conv output `[B*gamma, hidden]`. NULL when the drafter ships no conv.
     pub batch_conv_delta: DevicePtr,
     pub batch_conv_out: DevicePtr,
+    /// #58 batched ctx-precompute staging: the prepare loop gathers every
+    /// sequence's new ctx rows into `batch_ctx_in` [rows, L_t·h_t] BF16,
+    /// runs ONE fc+norm+fused-KV projection into `batch_ctx_fc` /
+    /// `batch_ctx_fused`, then scatters per sequence. `batch_ctx_rows` is
+    /// the row capacity (`batch_capacity × BATCH_CTX_ROWS_PER_SEQ`); a
+    /// plan that overruns it falls back to the per-sequence GEMMs.
+    pub batch_ctx_in: DevicePtr,
+    pub batch_ctx_fc: DevicePtr,
+    pub batch_ctx_fused: DevicePtr,
+    pub batch_ctx_rows: usize,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -735,6 +745,7 @@ mod batch_plan;
 mod batch_projection;
 mod batch_propose;
 mod batch_tail_dflash2;
+mod batched_ctx;
 mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;
@@ -1060,6 +1071,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // to forward_prepared for the prepared prefix and serial
             // propose for the rest instead of erroring to the scheduler.
             let mut prepared = 0usize;
+            // #58: ctx-tail projections collected per sequence, then run
+            // as ONE batched GEMM + per-seq scatter after the loop.
+            let mut pending_ctx: Vec<batched_ctx::PendingCtxChunk> = Vec::with_capacity(n);
             for i in 0..n {
                 if let Err(e) = self.prepare_drafts_state(
                     last_tokens[i],
@@ -1071,6 +1085,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     ctx,
                     stream,
                     target_hiddens[i],
+                    Some(&mut pending_ctx),
                 ) {
                     if !generic_auth {
                         return Err(e);
@@ -1078,6 +1093,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     tracing::warn!(
                         "DFlash batched propose: prepare failed at sequence {i}/{n}; per-sequence fallback: {e:#}"
                     );
+                    // Flush the pending ctx chunks for the already-prepared
+                    // prefix — the fallback's forward_prepared arms assume
+                    // their drafter KV is committed.
+                    if let Err(flush) =
+                        self.run_batched_ctx_stage(&pending_ctx, ctx, stream, &self.scratch)
+                    {
+                        tracing::warn!("DFlash batched ctx flush failed: {flush:#}");
+                    }
                     return self
                         .prepared_fallback_batch(
                             n,
@@ -1097,6 +1120,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 }
                 prepared = i + 1;
             }
+            // #58: one ctx projection over all sequences' recorded tails,
+            // then per-sequence scatter (planner may fall back per chunk).
+            self.run_batched_ctx_stage(&pending_ctx, ctx, stream, &self.scratch)?;
         }
         let staged = self.propose_batch_staged_dispatch(
             last_tokens,

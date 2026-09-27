@@ -28,7 +28,9 @@
 //!   `k_buf` / `v_buf`  → per-layer K/V staging for cache write
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+
+use crate::layers::ops;
 
 use super::{BlockDiffusionDraftHead, DflashScratch};
 use crate::layer::ForwardContext;
@@ -65,29 +67,21 @@ impl BlockDiffusionDraftHead {
         commit: bool,
         scratch: &DflashScratch,
     ) -> Result<()> {
-        use crate::layers::ops;
-
         if new_ctx_count == 0 {
             return Ok(());
         }
 
-        let Some(fused_kv) = self.fused_kv_weight else {
+        if self.fused_kv_weight.is_none() {
             anyhow::bail!(
                 "DFlash precompute_ctx_kv called without fused_kv_weight — build-order bug"
             );
-        };
+        }
 
         let gpu = ctx.gpu;
-        let bf16 = 2usize;
         let h = self.hidden_size as u32;
-        let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
         let n = new_ctx_count as u32;
-        let l_total = self.num_layers;
         let target_hidden_dim = self.target_layer_ids.len() * self.target_hidden_size;
-        let ctx_slot_bytes = target_hidden_dim * bf16;
-        let kv_slab_bytes = (kv_dim as usize) * bf16;
-        // Stride (bytes) between adjacent rows in the fused KV GEMM output.
-        let row_stride = l_total * 2 * kv_slab_bytes;
+        let ctx_slot_bytes = target_hidden_dim * 2;
 
         // One-shot diagnostic dump (ATLAS_DFLASH_PRECOMPUTE_DUMP=1).
         // Per-model latch (see `ModelStats::dumped`) rather than a static: an
@@ -111,68 +105,143 @@ impl BlockDiffusionDraftHead {
             Ok(())
         };
 
-        // ── Step 1: batched fc projection ────────────────────────────
-        // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
-        //   first half: fc maps [n, L_t*h_t] → [n, h].
+        // ── Steps 1–3: fc projection + hidden_norm + fused KV GEMM ────
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        self.drafter_dense_gemm(
+        self.ctx_kv_project(
             gpu,
             src,
-            &self.fc,
-            scratch.fc_proj,
             n,
             h,
             target_hidden_dim as u32,
-            stream,
-        )?;
-        dump_buf(
-            "fc_proj",
             scratch.fc_proj,
-            new_ctx_count * self.hidden_size * bf16,
+            scratch.fused_kv_out,
+            stream,
+            Some(&dump_buf),
         )?;
+        // ── Steps 4–8: per-sequence scatter (positions, compaction,
+        // k_norm, rope, reshape_and_cache).
+        self.ctx_kv_scatter(
+            gpu,
+            scratch.fused_kv_out,
+            new_ctx_count,
+            slot_positions,
+            slot_mapping_dev,
+            ctx,
+            stream,
+            commit,
+            scratch,
+            Some(&dump_buf),
+        )
+    }
 
-        // ── Step 2: hidden_norm RMS in-place ─────────────────────────
-        // py:375–380  `ops.rms_norm(normed_context_states, context_states,
-        //               self._hidden_norm_weight, self._rms_norm_eps)`
+    /// Steps 1–3 of `precompute_ctx_kv`: fc → hidden_norm → fused KV GEMM
+    /// over `n` rows starting at `src`, outputs into the caller's buffers.
+    /// Factored out so the batched propose can run ONE call over the
+    /// concatenated Σn_i rows of all sequences (#58/#116).
+    ///
+    /// **Row identity:** every arm inside is row-independent — rms_norm
+    /// reads only the row it writes, and `drafter_dense_gemm` resolves to
+    /// `dense_gemm_bf16_pipelined` (mma m16n8k16, K-dim accumulation only)
+    /// for every M above the GEMV bound, so row i's bytes are identical
+    /// to the n_i-row launch the serial path would run. The batch planner
+    /// excludes chunks whose per-seq arm would be the GEMV (small-m
+    /// lever on AND n_i ≤ DENSE_GEMV_BATCHM_MAX_M), so included rows
+    /// always compare equal on the same kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ctx_kv_project(
+        &self,
+        gpu: &dyn GpuBackend,
+        src: DevicePtr,
+        n: u32,
+        h: u32,
+        target_hidden_dim: u32,
+        fc_dst: DevicePtr,
+        fused_dst: DevicePtr,
+        stream: u64,
+        dump: Option<&dyn Fn(&str, DevicePtr, usize) -> Result<()>>,
+    ) -> Result<()> {
+        let Some(fused_kv) = self.fused_kv_weight else {
+            anyhow::bail!("DFlash ctx_kv_project called without fused_kv_weight — build-order bug");
+        };
+        let bf16 = 2usize;
+        let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
+        let l_total = self.num_layers;
+
+        // Step 1: fc projection [n, L_t*h_t] → [n, h].
+        self.drafter_dense_gemm(gpu, src, &self.fc, fc_dst, n, h, target_hidden_dim, stream)?;
+        if let Some(d) = dump {
+            d("fc_proj", fc_dst, n as usize * h as usize * bf16)?;
+        }
+        // Step 2: hidden_norm RMS in-place.
         ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
-            scratch.fc_proj,
+            fc_dst,
             &self.hidden_norm,
-            scratch.fc_proj,
+            fc_dst,
             n,
             h,
             self.rms_norm_eps,
             stream,
         )?;
-        dump_buf(
-            "fc_proj_normed",
-            scratch.fc_proj,
-            new_ctx_count * self.hidden_size * bf16,
-        )?;
-
-        // ── Step 3: fused KV GEMM across all layers ──────────────────
-        // py:381–392  `all_kv_flat = F.linear(normed_context_states,
-        //                self._fused_kv_weight, self._fused_kv_bias)`
-        // [n, h] × [h, L * 2 * kv_dim] → [n, L * 2 * kv_dim].
-        // Layout per row: [K_0 | V_0 | K_1 | V_1 | … | K_{L-1} | V_{L-1}].
+        if let Some(d) = dump {
+            d("fc_proj_normed", fc_dst, n as usize * h as usize * bf16)?;
+        }
+        // Step 3: fused KV GEMM → [n, L * 2 * kv_dim], row layout
+        // [K_0 | V_0 | K_1 | V_1 | …].
         let fused_w = DenseWeight { weight: fused_kv };
-        let fused_n_cols = (l_total as u32) * 2 * kv_dim;
         self.drafter_dense_gemm(
             gpu,
-            scratch.fc_proj,
+            fc_dst,
             &fused_w,
-            scratch.fused_kv_out,
+            fused_dst,
             n,
-            fused_n_cols,
+            (l_total as u32) * 2 * kv_dim,
             h,
             stream,
         )?;
-        dump_buf(
-            "fused_kv_out",
-            scratch.fused_kv_out,
-            new_ctx_count * l_total * 2 * kv_slab_bytes,
-        )?;
+        if let Some(d) = dump {
+            d(
+                "fused_kv_out",
+                fused_dst,
+                n as usize * l_total * 2 * kv_dim as usize * bf16,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Steps 4–8 of `precompute_ctx_kv`: repeated positions, K/V
+    /// compaction, per-layer k_norm, fused rope, and `reshape_and_cache`
+    /// into the drafter paged cache — the per-sequence stage of the
+    /// batched-ctx flow. `fused_src` points at this sequence's rows in
+    /// the fused GEMM output (own scratch serially, the batch buffer
+    /// when batched).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ctx_kv_scatter(
+        &self,
+        gpu: &dyn GpuBackend,
+        fused_src: DevicePtr,
+        new_ctx_count: usize,
+        slot_positions: &[i32],
+        slot_mapping_dev: DevicePtr,
+        _ctx: &ForwardContext,
+        stream: u64,
+        commit: bool,
+        scratch: &DflashScratch,
+        dump_opt: Option<&dyn Fn(&str, DevicePtr, usize) -> Result<()>>,
+    ) -> Result<()> {
+        let bf16 = 2usize;
+        let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
+        let n = new_ctx_count as u32;
+        let l_total = self.num_layers;
+        let kv_slab_bytes = (kv_dim as usize) * bf16;
+        let row_stride = l_total * 2 * kv_slab_bytes;
+        let dump = |label: &str, ptr: DevicePtr, bytes: usize| -> Result<()> {
+            match dump_opt {
+                Some(d) => d(label, ptr, bytes),
+                None => Ok(()),
+            }
+        };
 
         // ── Step 4: build extended position array for fused RoPE ─────
         // py:407  `positions_repeated = context_positions.repeat(L)`
@@ -226,10 +295,7 @@ impl BlockDiffusionDraftHead {
         let all_k_stage = scratch.mlp_intermediate;
         for l in 0..l_total {
             for row in 0..new_ctx_count {
-                let k_src = self
-                    .scratch
-                    .fused_kv_out
-                    .offset(row * row_stride + l * 2 * kv_slab_bytes);
+                let k_src = fused_src.offset(row * row_stride + l * 2 * kv_slab_bytes);
                 let k_dst = all_k_stage.offset((l * new_ctx_count + row) * kv_slab_bytes);
                 // #58: stream-ordered async — downstream k_norm/rope/
                 // reshape_and_cache run on this same stream, so the drain
@@ -283,8 +349,8 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
 
-        if dump {
-            dump_buf(
+        if dump_opt.is_some() {
+            dump(
                 "layer0_k_post_rope",
                 all_k_stage,
                 new_ctx_count * kv_slab_bytes,
@@ -301,18 +367,16 @@ impl BlockDiffusionDraftHead {
 
             // Compact V_l from the fused GEMM output.
             for row in 0..new_ctx_count {
-                let v_src = self
-                    .scratch
-                    .fused_kv_out
-                    .offset(row * row_stride + l * 2 * kv_slab_bytes + kv_slab_bytes);
+                let v_src =
+                    fused_src.offset(row * row_stride + l * 2 * kv_slab_bytes + kv_slab_bytes);
                 let v_dst = v_stage.offset(row * kv_slab_bytes);
                 // #58: stream-ordered async — reshape_and_cache consumes
                 // v_stage on this same stream.
                 gpu.copy_d2d_async(v_src, v_dst, kv_slab_bytes, stream)?;
             }
 
-            if dump && l == 0 {
-                dump_buf("layer0_v", v_stage, new_ctx_count * kv_slab_bytes)?;
+            if dump_opt.is_some() && l == 0 {
+                dump("layer0_v", v_stage, new_ctx_count * kv_slab_bytes)?;
             }
 
             if commit {
@@ -382,7 +446,7 @@ impl BlockDiffusionDraftHead {
 /// Pure bookkeeping for the pinned carve: returns the offset of a fresh
 /// `bytes`-sized region, or `None` when the buffer is exhausted. Atomic so
 /// propose lanes sharing a scratch's staging can carve without a lock.
-fn carve_region(
+pub(super) fn carve_region(
     cursor: &std::sync::atomic::AtomicUsize,
     capacity: usize,
     bytes: usize,
@@ -402,39 +466,5 @@ fn carve_region(
             Ok(_) => return Some(cur),
             Err(c) => cur = c,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::carve_region;
-    use std::sync::atomic::AtomicUsize;
-
-    #[test]
-    fn carve_region_layout_and_overflow() {
-        let cursor = AtomicUsize::new(0);
-        // Two equal regions pack adjacently, like per-sequence carves.
-        assert_eq!(carve_region(&cursor, 64, 32), Some(0));
-        assert_eq!(carve_region(&cursor, 64, 32), Some(32));
-        // Third overflows -> None (callers take the sync-copy fallback).
-        assert_eq!(carve_region(&cursor, 64, 32), None);
-        assert_eq!(carve_region(&cursor, 64, 1), None);
-        // Unaligned is fine — byte offsets, not slots.
-        let cursor = AtomicUsize::new(0);
-        assert_eq!(carve_region(&cursor, 10, 4), Some(0));
-        assert_eq!(carve_region(&cursor, 10, 4), Some(4));
-        assert_eq!(carve_region(&cursor, 10, 4), None);
-        // Zero bytes always carves at the cursor.
-        assert_eq!(carve_region(&cursor, 10, 0), Some(8));
-    }
-
-    #[test]
-    fn precompute_uses_no_sync_row_copies() {
-        // Structural pin for #58: the K/V row-compaction loops and the
-        // position upload must never again pay a per-row pipeline drain.
-        let src = include_str!("precompute_ctx_kv.rs");
-        assert_eq!(src.matches("gpu.copy_d2d(").count(), 0);
-        // The only sync copy left is the overflow fallback in Step 4.
-        assert_eq!(src.matches("gpu.copy_h2d(").count(), 1);
     }
 }

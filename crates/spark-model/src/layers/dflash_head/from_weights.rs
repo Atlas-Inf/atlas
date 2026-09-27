@@ -468,6 +468,13 @@ impl BlockDiffusionDraftHead {
             gpu.alloc_host_pinned(batch_grammar_masks_pinned_bytes)?,
         );
         let batch_tokens = gpu.alloc(batch_rows * 4)?;
+        // #58 batched ctx-precompute staging: per-sequence tails are
+        // accepted+1 rows (γ+1 worst); chunks larger than the per-seq cap
+        // (post-prefill commits) just fall back to per-sequence GEMMs.
+        let batch_ctx_rows = batch_capacity * super::batched_ctx::BATCH_CTX_ROWS_PER_SEQ;
+        let batch_ctx_in = gpu.alloc(batch_ctx_rows * batch_target_bytes / batch_capacity)?;
+        let batch_ctx_fc = gpu.alloc(batch_ctx_rows * hidden_size * bf16)?;
+        let batch_ctx_fused = gpu.alloc(batch_ctx_rows * num_layers * 2 * kv_dim * bf16)?;
         let batch_markov_prev = gpu.alloc(batch_capacity * 4)?;
         let batch_markov_embed_bytes = batch_capacity
             .checked_mul(weights.markov_rank)
@@ -865,6 +872,10 @@ impl BlockDiffusionDraftHead {
             batch_grammar_bitmask,
             batch_grammar_masks_host_pinned,
             batch_grammar_masks_pinned_bytes,
+            batch_ctx_in,
+            batch_ctx_fc,
+            batch_ctx_fused,
+            batch_ctx_rows,
             batch_tokens,
             batch_markov_prev,
             batch_markov_embed,
