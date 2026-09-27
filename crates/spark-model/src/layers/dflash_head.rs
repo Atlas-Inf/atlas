@@ -629,6 +629,17 @@ pub struct BlockDiffusionDraftHead {
     pub batch_ctx_fused: DevicePtr,
     pub batch_ctx_rows: usize,
 
+    /// `ATLAS_DFLASH_DRAFTER_CUBLAS=1` && cuBLASLt resolvable, resolved
+    /// once at construction: route the drafter's BF16 projections with
+    /// `m >= 32` through `cublaslt::bf16_gemm_act_weight_t` instead of
+    /// the hand-written `dense_gemm_bf16_pipelined` (~30 % of cuBLAS on
+    /// GB10; 93 ms/step at C=16 in job 596). ACCEPTANCE-ONLY effect —
+    /// cuBLASLt's algo choice varies with M, so staged drafts can differ
+    /// from serial drafts in the last bits; verified tokens come from
+    /// the target's own forward, so outputs are unaffected. Off by
+    /// default; inert where cublaslt is stubbed (non-CUDA builds).
+    pub drafter_cublas: bool,
+
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
     /// A sequence's lane is fixed for its lifetime (`slot % lanes`) so its

@@ -129,6 +129,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         batch_ctx_fc: DevicePtr(0),
         batch_ctx_fused: DevicePtr(0),
         batch_ctx_rows: 0,
+        drafter_cublas: false,
         batch_tokens: DevicePtr(0),
         batch_markov_prev: DevicePtr(0),
         batch_markov_embed: DevicePtr(0),

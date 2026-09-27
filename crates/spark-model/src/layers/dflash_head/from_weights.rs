@@ -881,6 +881,21 @@ impl BlockDiffusionDraftHead {
             batch_ctx_fc,
             batch_ctx_fused,
             batch_ctx_rows,
+            drafter_cublas: {
+                let on = std::env::var("ATLAS_DFLASH_DRAFTER_CUBLAS").as_deref() == Ok("1")
+                    && spark_runtime::cublaslt::available();
+                if std::env::var("ATLAS_DFLASH_DRAFTER_CUBLAS").as_deref() == Ok("1") {
+                    tracing::info!(
+                        "DFlash drafter cuBLASLt route: {}",
+                        if on {
+                            "engaged for m >= 32"
+                        } else {
+                            "requested but cuBLASLt unavailable — inert"
+                        }
+                    );
+                }
+                on
+            },
             batch_tokens,
             batch_markov_prev,
             batch_markov_embed,
