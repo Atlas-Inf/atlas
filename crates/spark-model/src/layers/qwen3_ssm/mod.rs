@@ -363,6 +363,12 @@ pub struct Qwen3SsmLayer {
     // this streams the weight once with 4 FP32 accumulators. Bit-identical per
     // row to w8a16_gemv. KernelHandle(0) when not linked.
     w8a16_gemv_batch4_k: KernelHandle,
+    // M=5..8 tier of the same family (DFlash verify rows).
+    w8a16_gemv_batch8_k: KernelHandle,
+    // vl2 twin of the M=5..8 tier (8 outputs/block) — dyn only: the guarded
+    // twin beat the fixed one at m==8 (475 vs 551 us/call; 47-75 VGPR vs
+    // 98-133). Preferred when linked and ATLAS_GEMV_VL2 != 0.
+    w8a16_gemv_batch8_dyn_vl2_k: KernelHandle,
     // M<=16 sibling of batch4 for high-concurrency decode (n=5..16): same
     // weight-streaming GEMV, avoids the M-padded MMA at C=8/16.
     w8a16_gemv_batch16_k: KernelHandle,

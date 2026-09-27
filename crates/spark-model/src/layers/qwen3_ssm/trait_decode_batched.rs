@@ -298,12 +298,28 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if (5..=16).contains(&num_tokens)
-            && self.w8a16_gemv_batch16_k.0 != 0
+            && (self.w8a16_gemv_batch16_k.0 != 0
+                || (num_tokens <= 8 && self.w8a16_gemv_batch8_k.0 != 0))
             && let Some(ref fp8) = self.qkvz_fp8w
         {
-            ops::w8a16_gemv_batch4(
-                ctx.gpu,
+            // Verify rows 5..8 compute 8 rows on the batch8 tier rather
+            // than 16 on batch16; the vl2 twin (8 outputs/block) is the
+            // preferred bit-identical arm when linked.
+            let (kernel, vl2) = ops::fp8_verify_gemv_tier(
+                num_tokens,
+                ops::gemv_vl2_enabled(),
+                self.w8a16_gemv_batch8_k,
+                self.w8a16_gemv_batch8_dyn_vl2_k,
                 self.w8a16_gemv_batch16_k,
+            );
+            let launch = if vl2 {
+                ops::w8a16_gemv_batch4_vl2
+            } else {
+                ops::w8a16_gemv_batch4
+            };
+            launch(
+                ctx.gpu,
+                kernel,
                 normed,
                 fp8.weight,
                 fp8.row_scale,
@@ -1146,12 +1162,27 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if (5..=16).contains(&num_tokens)
-            && self.w8a16_gemv_batch16_k.0 != 0
+            && (self.w8a16_gemv_batch16_k.0 != 0
+                || (num_tokens <= 8 && self.w8a16_gemv_batch8_k.0 != 0))
             && let Some(ref fp8) = self.out_proj_fp8w
         {
-            ops::w8a16_gemv_batch4(
-                ctx.gpu,
+            // Same tier pick as the QKVZ arm; the vl2 twin (8 outputs/block)
+            // is the preferred bit-identical arm when linked.
+            let (kernel, vl2) = ops::fp8_verify_gemv_tier(
+                num_tokens,
+                ops::gemv_vl2_enabled(),
+                self.w8a16_gemv_batch8_k,
+                self.w8a16_gemv_batch8_dyn_vl2_k,
                 self.w8a16_gemv_batch16_k,
+            );
+            let launch = if vl2 {
+                ops::w8a16_gemv_batch4_vl2
+            } else {
+                ops::w8a16_gemv_batch4
+            };
+            launch(
+                ctx.gpu,
+                kernel,
                 normed_out_buf,
                 fp8.weight,
                 fp8.row_scale,

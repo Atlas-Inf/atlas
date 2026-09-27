@@ -472,6 +472,16 @@ impl Qwen3SsmLayer {
                 "w8a16_gemv_batch4",
                 "w8a16_gemv_batch4",
             ),
+            w8a16_gemv_batch8_k: super::super::try_kernel(
+                gpu,
+                "w8a16_gemv_batch4",
+                "w8a16_gemv_batch8",
+            ),
+            w8a16_gemv_batch8_dyn_vl2_k: super::super::try_kernel(
+                gpu,
+                "w8a16_gemv_batch4",
+                "w8a16_gemv_batch8_dyn_vl2",
+            ),
             w8a16_gemv_batch16_k: super::super::try_kernel(
                 gpu,
                 "w8a16_gemv_batch4",
