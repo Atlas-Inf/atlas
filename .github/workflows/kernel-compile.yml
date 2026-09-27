@@ -198,3 +198,27 @@ jobs:
           # resolved target has at least 31 modules, and default-model lookup
           # resolves.
           cargo test -p atlas-kernels -- --ignored
+
+      - name: Compile the EXL3 target and run its arity pins
+        env:
+          # The EXL3 kernels live in their own target
+          # (`kernels/gb10/qwen3.8-flash-next/exl3/`, composed on `nvfp4/` via
+          # `base_quant`), which the all-models build above does not compile:
+          # it builds the default quant, `nvfp4`. The EXL3 pins skip there, so
+          # this step builds that one target and fails if they skip here too.
+          ATLAS_TARGET_MODEL: qwen3.8-flash-next
+          ATLAS_TARGET_QUANT: exl3
+          CUDARC_CUDA_VERSION: "13000"
+          PATH_CUDA: /usr/local/cuda/bin
+        run: |
+          set -euo pipefail
+          export PATH="$PATH_CUDA:$PATH"
+          cargo test -p atlas-kernels --test kernel_arity -- --ignored --nocapture exl3 2>&1 | tee exl3-arity.log
+          if grep -q "arity pin skipped" exl3-arity.log; then
+            echo "::error::an EXL3 arity pin skipped although the exl3 target was built"
+            exit 1
+          fi
+          grep -q "test result: ok. 2 passed" exl3-arity.log || {
+            echo "::error::expected both EXL3 arity pins (exl3, exl3_int8) to run and pass"
+            exit 1
+          }
