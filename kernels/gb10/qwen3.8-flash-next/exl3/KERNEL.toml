@@ -13,7 +13,7 @@
 # `ATLAS_TARGET_QUANT=exl3` (or `*`).
 #
 #   exl3.cu       vendored exllamav3 reconstruct / Hadamard / hgemm entry
-#                 points plus the fused BF16 rebuild
+#                 points
 #   exl3_int8.cu  exllamav3 int8-activation "sq" GEMV (native decode)
 #   exl3_vendor/  the vendored exllamav3 device headers (see its NOTICE.md)
 
