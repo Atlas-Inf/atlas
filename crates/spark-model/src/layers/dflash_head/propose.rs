@@ -105,7 +105,7 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         _stream: u64,
         _draft_embed_target: Option<DevicePtr>,
-        _grammar_bitmask: Option<&[i32]>,
+        grammar_bitmask: Option<&[i32]>,
         target_hidden_stack: Option<DevicePtr>,
         defer_readback: bool,
         prepare_only: bool,
@@ -552,6 +552,7 @@ impl BlockDiffusionDraftHead {
             defer_readback,
             ctx,
             _stream,
+            grammar_bitmask,
         )
     }
 
@@ -576,6 +577,8 @@ impl BlockDiffusionDraftHead {
         defer_readback: bool,
         ctx: &ForwardContext,
         _stream: u64,
+        // Live pos+1 grammar bitmask for this seq (#102); None = legacy.
+        grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
         let drafts = self
             .forward_block(
@@ -597,6 +600,7 @@ impl BlockDiffusionDraftHead {
                 owner,
                 lane_id,
                 defer_readback,
+                grammar_bitmask,
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
@@ -666,6 +670,7 @@ impl BlockDiffusionDraftHead {
         states: &mut [&mut dyn ProposerState],
         expected_owners: &[SequenceGeneration],
         ctx: &ForwardContext,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Vec<Vec<u32>>> {
         let n = last_tokens.len();
         let lanes_n = self.lane_count();
@@ -724,7 +729,7 @@ impl BlockDiffusionDraftHead {
                 ctx,
                 lane_stream,
                 None,
-                None,
+                grammar_bitmasks.and_then(|ms| ms.get(i)?.as_deref()),
                 Some(target_hiddens[i]),
                 true,
                 false,

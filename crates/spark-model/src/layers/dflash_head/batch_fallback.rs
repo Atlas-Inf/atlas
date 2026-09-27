@@ -47,6 +47,7 @@ impl BlockDiffusionDraftHead {
         expected_owners: &[SequenceGeneration],
         ctx: &crate::layer::ForwardContext,
         stream: u64,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Vec<Vec<u32>>> {
         let plans = plan_prepared_fallback(n, prepared, failed_at);
         let (_, scratch, markov_embed, markov_bias) = self.lane(0, ctx.gpu.default_stream());
@@ -74,6 +75,7 @@ impl BlockDiffusionDraftHead {
                         expected_owners,
                         ctx,
                         stream,
+                        grammar_bitmasks.and_then(|ms| ms.get(i)?.as_deref()),
                     ) {
                         Ok(drafts) => out.push(drafts),
                         Err(e) => {
@@ -96,7 +98,7 @@ impl BlockDiffusionDraftHead {
                         ctx,
                         stream,
                         None,
-                        None,
+                        grammar_bitmasks.and_then(|ms| ms.get(i)?.as_deref()),
                         Some(target_hiddens[i]),
                     ) {
                         Ok(drafts) => out.push(drafts),
@@ -133,6 +135,7 @@ impl BlockDiffusionDraftHead {
         expected_owners: &[SequenceGeneration],
         ctx: &crate::layer::ForwardContext,
         stream: u64,
+        grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
         let owner = self.validate_dflash_owner(dstate, Some(expected_owners[i]))?;
         // ctx_count_drafter was set by the prepare pass.
@@ -165,6 +168,7 @@ impl BlockDiffusionDraftHead {
             false,
             ctx,
             stream,
+            grammar_bitmask,
         )
     }
 }

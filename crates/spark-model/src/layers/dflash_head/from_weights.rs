@@ -15,6 +15,7 @@ use super::{
     BlockDiffusionDraftHead, DflashKernels, DflashLane, DflashLayer, DflashQuantization,
     DflashScratch, DsparkStartupExecution, LIGHTNING_TARGET_HIDDEN_SIZE,
 };
+use crate::layers::ops;
 use crate::weight_loader::DflashWeights;
 
 impl BlockDiffusionDraftHead {
@@ -196,6 +197,13 @@ impl BlockDiffusionDraftHead {
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             argmax_batch: gpu.kernel("argmax", "argmax_bf16_batch")?,
+            // #102 grammar-masked draft-0 tail. try_kernel: absent on PTX
+            // sets that predate grammar_bitmask.cu — masking just disables.
+            grammar_bitmask: crate::layers::try_kernel(
+                gpu,
+                "grammar_bitmask",
+                "atlas_apply_grammar_bitmask",
+            ),
             batched_embed: gpu.kernel("embed_from_argmax", "batched_embed")?,
             batch_anchor_add: gpu.kernel("dflash_batch_anchor_add", "dflash_batch_anchor_add")?,
             batch_markov_add_bias: gpu
@@ -328,6 +336,9 @@ impl BlockDiffusionDraftHead {
                 // paged-attention kernel reads at entry. Host writes via H2D
                 // BEFORE entering the captured region.
                 option_b_indirect_args_dev: gpu.alloc(12)?,
+                // ceil(vocab/32) i32 words for the pos+1 grammar mask (#102).
+                grammar_bitmask_dev: gpu
+                    .alloc(ops::grammar_bitmask_words(vocab_size as u32) * 4)?,
                 // Phase E.2: pinned host buffer + event for the per-propose
                 // drafter D2H. Pinned memory lets cuMemcpyDtoHAsync issue a
                 // true async DMA on the caller's stream (vs. the synchronous
@@ -432,6 +443,10 @@ impl BlockDiffusionDraftHead {
         let batch_mlp_up = gpu.alloc(batch_mlp_bytes)?;
         let batch_mlp_down = gpu.alloc(batch_norm_bytes)?;
         let batch_logits = gpu.alloc(batch_logits_bytes)?;
+        // ceil(vocab/32) i32 words per sequence — the pos+1 grammar mask
+        // applied to each seq's logits rows 0/1 in the staged tail (#102).
+        let batch_grammar_bitmask =
+            gpu.alloc(batch_capacity * ops::grammar_bitmask_words(vocab_size as u32) * 4)?;
         let batch_tokens = gpu.alloc(batch_rows * 4)?;
         let batch_markov_prev = gpu.alloc(batch_capacity * 4)?;
         let batch_markov_embed_bytes = batch_capacity
@@ -827,6 +842,7 @@ impl BlockDiffusionDraftHead {
             batch_mlp_up,
             batch_mlp_down,
             batch_logits,
+            batch_grammar_bitmask,
             batch_tokens,
             batch_markov_prev,
             batch_markov_embed,
