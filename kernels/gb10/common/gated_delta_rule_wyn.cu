@@ -288,9 +288,10 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
         unsigned int gb_stride,                                               \
         unsigned int state_is_table                                           \
     ) {                                                                       \
-        gated_delta_rule_wyn_impl<K>(                                         \
+        gated_delta_rule_wyn_impl<K, 0>(                                      \
             h_state, query, key, value, gate, beta, output,                   \
-            h_state_inter_base, inter_stride_floats, batch_size,              \
+            h_state_inter_base, inter_stride_floats, 0 /* accepted_count */,  \
+            batch_size,                                                       \
             num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, v_stride,      \
             gb_stride, state_is_table);                                       \
     }
@@ -309,6 +310,39 @@ ATLAS_WYN_INSTANTIATE(15)
 ATLAS_WYN_INSTANTIATE(16)
 
 #undef ATLAS_WYN_INSTANTIATE
+
+// Deferred verify (ATLAS_GDN_DEFERRED_COMMIT): identical extern signature —
+// the Rust launcher is the same `gdn_decode_wyn` — but MODE 1 skips every
+// Hi_t store AND the final-H store, leaving `h_state` at H0 for
+// `gated_delta_rule_commit`. `output` is still written.
+#define ATLAS_WYN_DEFER_INSTANTIATE(K)                                        \
+    extern "C" __global__ void gated_delta_rule_wy##K##_defer(                \
+        float* __restrict__ h_state,                                          \
+        const __nv_bfloat16* __restrict__ query,                              \
+        const __nv_bfloat16* __restrict__ key,                                \
+        const __nv_bfloat16* __restrict__ value,                              \
+        const float* __restrict__ gate,                                       \
+        const float* __restrict__ beta,                                       \
+        __nv_bfloat16* __restrict__ output,                                   \
+        float* __restrict__ h_state_inter_base,                               \
+        unsigned int inter_stride_floats,                                     \
+        unsigned int batch_size,                                              \
+        unsigned int num_k_heads,                                             \
+        unsigned int num_v_heads,                                             \
+        unsigned int k_dim,                                                   \
+        unsigned int v_dim,                                                   \
+        unsigned int qk_stride,                                               \
+        unsigned int v_stride,                                                \
+        unsigned int gb_stride,                                               \
+        unsigned int state_is_table                                           \
+    ) {                                                                       \
+        gated_delta_rule_wyn_impl<K, 1>(                                      \
+            h_state, query, key, value, gate, beta, output,                   \
+            h_state_inter_base, inter_stride_floats, 0 /* accepted_count */,  \
+            batch_size,                                                       \
+            num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, v_stride,      \
+            gb_stride, state_is_table);                                       \
+    }
 
 ATLAS_WYN_DEFER_INSTANTIATE(5)
 ATLAS_WYN_DEFER_INSTANTIATE(6)
