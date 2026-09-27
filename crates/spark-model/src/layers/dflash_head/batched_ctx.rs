@@ -270,10 +270,11 @@ mod tests {
         // Same counts with the lever off: everything batches.
         let offs = plan_ctx_chunks(&[3, m + 2, 1], false, cap).unwrap();
         assert_eq!(offs, vec![Some(0), Some(3), Some(m + 5)]);
-        // Capacity overflow: chunks past the cap go serial, earlier
-        // chunks stay batched (partial batching beats none).
+        // Capacity overflow: a chunk that does not fit goes serial, and
+        // later chunks that still fit keep packing (first-fit; partial
+        // batching beats none). Offsets never overlap and stay in cap.
         let offs = plan_ctx_chunks(&[10, 10, 4], false, 16).unwrap();
-        assert_eq!(offs, vec![Some(0), None, None]);
+        assert_eq!(offs, vec![Some(0), None, Some(10)]);
         // Nothing eligible → no batching at all.
         assert!(plan_ctx_chunks(&[1, 2, 3], true, cap).is_none());
         assert!(plan_ctx_chunks(&[], false, cap).is_none());
@@ -284,7 +285,9 @@ mod tests {
     fn batched_prepare_issues_one_projection() {
         // Structural pin: the batched stage runs ONE ctx_kv_project per
         // step (fc + fused inside), not one per sequence.
+        // Production half only: this module's own needles would match too.
         let src = include_str!("batched_ctx.rs");
+        let src = src.split("#[cfg(test)]").next().unwrap();
         assert_eq!(src.matches("self.ctx_kv_project(").count(), 1);
         assert_eq!(src.matches("self.precompute_ctx_kv(").count(), 1); // serial fallback only
     }
