@@ -5,7 +5,7 @@
 //! Dropping the resident BF16 copies of the GDN projections (M6f-b) means every
 //! remaining BF16 reader asks the layer to rebuild the weight on demand. The
 //! rebuild is five stream-ordered kernels ([`crate::layers::ops::
-//! exl3_dense_bf16_nk_with_scratch`]) needing one fp16 temporary plus the
+//! exl3_dense_bf16_nk_with_scratch`]) needing two fp16 temporaries plus the
 //! BF16 result; allocating and freeing those per call would add a
 //! synchronize-and-realloc to every layer, so the buffers are pooled instead.
 //!
@@ -28,8 +28,9 @@ pub struct Exl3Bf16Scratch {
     pub qkvz: DevicePtr,
     /// BF16 `[out.out, out.in]` result of the out_proj rebuild.
     pub out: DevicePtr,
-    /// fp16 `W_inner` temporary of `exl3_dense_bf16_nk_with_scratch`, `tmp_bytes`.
+    /// fp16 temporaries of `exl3_dense_bf16_nk_with_scratch`, `tmp_bytes` each.
     pub tmp_a: DevicePtr,
+    pub tmp_b: DevicePtr,
 }
 
 /// Region sizes requested by one layer (bytes).
@@ -73,12 +74,13 @@ pub fn exl3_bf16_scratch(
         qkvz: gpu.alloc(sizes.qkvz_bytes)?,
         out: gpu.alloc(sizes.out_bytes)?,
         tmp_a: gpu.alloc(sizes.tmp_bytes)?,
+        tmp_b: gpu.alloc(sizes.tmp_bytes)?,
     };
     map.insert(stream, (*sizes, s));
     drop(map);
     if let Some((_, old)) = old {
         gpu.synchronize(stream)?;
-        for p in [old.qkvz, old.out, old.tmp_a] {
+        for p in [old.qkvz, old.out, old.tmp_a, old.tmp_b] {
             gpu.free(p)?;
         }
     }

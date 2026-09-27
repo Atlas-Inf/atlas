@@ -125,7 +125,7 @@ impl Exl3GdnDecode {
     /// the same stream reads it without any sync.
     pub fn rebuild_qkvz_bf16(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<DevicePtr> {
         let s = exl3_bf16_scratch(gpu, stream, &self.bf16_sizes())?;
-        exl3_dense_bf16_nk_with_scratch(gpu, &self.k, &self.qkv, s.qkvz, s.tmp_a, stream)?;
+        exl3_dense_bf16_nk_with_scratch(gpu, &self.k, &self.qkv, s.qkvz, s.tmp_a, s.tmp_b, stream)?;
         let z_rows = self.qkv.shape.out_features * self.qkv.shape.in_features * 2;
         exl3_dense_bf16_nk_with_scratch(
             gpu,
@@ -133,6 +133,7 @@ impl Exl3GdnDecode {
             &self.z,
             s.qkvz.offset(z_rows),
             s.tmp_a,
+            s.tmp_b,
             stream,
         )?;
         Ok(s.qkvz)
@@ -142,7 +143,7 @@ impl Exl3GdnDecode {
     /// scratch and return it. See [`Self::rebuild_qkvz_bf16`].
     pub fn rebuild_out_bf16(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<DevicePtr> {
         let s = exl3_bf16_scratch(gpu, stream, &self.bf16_sizes())?;
-        exl3_dense_bf16_nk_with_scratch(gpu, &self.k, &self.out, s.out, s.tmp_a, stream)?;
+        exl3_dense_bf16_nk_with_scratch(gpu, &self.k, &self.out, s.out, s.tmp_a, s.tmp_b, stream)?;
         Ok(s.out)
     }
 
