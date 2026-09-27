@@ -35,7 +35,6 @@
                            const unsigned int* __restrict__ q_offset_ptr,      \
                            const unsigned int* __restrict__ q_rope_pos_ptr,    \
                            const __nv_bfloat16* __restrict__ sinks
-#define Q_ROPE_POS_OVERRIDE
 #define KERNEL_PREAMBLE                                                         \
     __shared__ unsigned int s_indirect[3];                                      \
     if (threadIdx.x == 0) {                                                     \
@@ -45,7 +44,6 @@
     }                                                                           \
     __syncthreads();                                                            \
     kv_len = s_indirect[0];                                                     \
-    q_offset = s_indirect[1];                                                   \
-    unsigned int q_rope_pos = s_indirect[2];
+    q_offset = s_indirect[1];
 
 #include "prefill_paged_compute.cuh"
