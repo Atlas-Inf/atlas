@@ -153,6 +153,19 @@ impl Qwen3SsmLayer {
         // point per K; base kernel when the resident twin is unlinked/
         // killed/shape-mismatched/too narrow (n below
         // wy_resident_min_width()), so this stays non-0 either way).
+        // Deferred commit (ATLAS_GDN_DEFERRED_COMMIT): wyN K=5..16 takes
+        // the `_defer` twin — same outputs, no Hi_t/final-H stores — while
+        // each seq's conv-out + gate/beta rows are stashed per slot below
+        // for `gated_delta_rule_commit` at accept.
+        let gdn_defer = Self::gdn_defer_active(
+            ctx.levers.gdn_deferred_commit,
+            kk,
+            (5..=16)
+                .contains(&kk)
+                .then_some(self.gdn_wyn_defer_k[kk - 5])
+                .unwrap_or(spark_runtime::gpu::KernelHandle(0)),
+            self.gdn_commit_k,
+        );
         let wy_k = match kk {
             2 => self.wy2_kernel(args.kd, args.vd, n),
             3 => self.wy3_kernel(args.kd, args.vd, n),
@@ -161,6 +174,13 @@ impl Qwen3SsmLayer {
             // refuses, exactly as an unlinked wy4_f16 twin does.
             k @ 5..=16 if !super::ssm_h_fp16_enabled() => self
                 .wyn_kernel(k, ctx.levers.gdn_wyn)
+                .map(|h| {
+                    if gdn_defer {
+                        self.gdn_wyn_defer_k[kk - 5]
+                    } else {
+                        h
+                    }
+                })
                 .unwrap_or(spark_runtime::gpu::KernelHandle(0)),
             _ => spark_runtime::gpu::KernelHandle(0),
         };
@@ -298,6 +318,41 @@ impl Qwen3SsmLayer {
         let gate_ptr = gates_buf;
         let beta_ptr = gates_buf.offset(nv * fp32);
         let hi = |t: usize| wy_tables.offset(t * VERIFY_WY_TABLE_STRIDE_BYTES);
+        if gdn_defer {
+            // Stash this verify's conv-out q/k/v + gate/beta rows into
+            // each sequence's per-slot commit staging — the shared
+            // conv_out_buf/gates_buf scratch is reused next forward.
+            let qkv_seq_bytes = kk * conv_dim * bf16;
+            let gb_seq_bytes = kk * nv * 2 * fp32;
+            for st in states.iter_mut() {
+                let Some(ssm) = st.as_any_mut().downcast_mut::<SsmLayerState>() else {
+                    return Ok(self.gdn_multi_decline(n, kk));
+                };
+                if ssm.gdn_commit_qkv.is_null() {
+                    ssm.gdn_commit_qkv = ctx.gpu.alloc(16 * conv_dim * bf16)?;
+                    ssm.gdn_commit_gb = ctx.gpu.alloc(16 * nv * 2 * fp32)?;
+                }
+            }
+            for (i, st) in states.iter_mut().enumerate() {
+                let ssm = st
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .expect("checked above");
+                ctx.gpu.copy_d2d_async(
+                    conv_out_buf.offset(i * qkv_seq_bytes),
+                    ssm.gdn_commit_qkv,
+                    qkv_seq_bytes,
+                    stream,
+                )?;
+                ctx.gpu.copy_d2d_async(
+                    gates_buf.offset(i * gb_seq_bytes),
+                    ssm.gdn_commit_gb,
+                    gb_seq_bytes,
+                    stream,
+                )?;
+                ssm.gdn_commit_pending = true;
+            }
+        }
         match kk {
             2 => ops::gdn_decode_wy2(
                 ctx.gpu,
