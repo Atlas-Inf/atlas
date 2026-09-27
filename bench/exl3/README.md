@@ -2,6 +2,8 @@
 
 Offline helpers for Atlas's EXL3 (exllamav3 trellis) support. None of them run at serve time.
 
+**Build note:** the EXL3 kernels live in their own kernel target, `kernels/gb10/qwen3.8-flash-next/exl3/` (composed on `nvfp4/`). Build the server with `ATLAS_TARGET_MODEL=qwen3.8-flash-next ATLAS_TARGET_QUANT=exl3`, or `ATLAS_TARGET_QUANT='*'` for both quants. An nvfp4-only build refuses an EXL3 checkpoint at startup.
+
 ## Before serving: `convert_ngram_bf16.py` (interim)
 
 **Serving an EXL3 checkpoint currently needs this step.**

@@ -56,6 +56,18 @@ struct ModelTypeMatch {
 }
 
 /// A resolved (hw, model, quant) compilation target.
+impl Target {
+    /// The model-specific source layers over `common/`, base first.
+    fn overlay_dirs(&self) -> Vec<&std::path::Path> {
+        self.base_kernel_dir
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(self.model_kernel_dir.as_path()))
+            .collect()
+    }
+}
+
+/// A resolved (hw, model, quant) compilation target.
 struct Target {
     hw: String,
     model: String,
@@ -65,6 +77,11 @@ struct Target {
     model_kernel_dir: PathBuf,
     /// Common quant dir (hw_dir/quant/) with shared .cu files.
     common_kernel_dir: Option<PathBuf>,
+    /// Sibling quant dir this target composes on, from `[build] base_quant`
+    /// in the model KERNEL.toml (e.g. `exl3/` on `nvfp4/`). Layered between
+    /// common and the model dir for sources and KERNEL.toml alike, so the
+    /// base quant's own build stays free of the overlay's kernels.
+    base_kernel_dir: Option<PathBuf>,
     extra_flags: Vec<String>,
     module_overrides: HashMap<String, String>,
     /// `(module, kernel)` pairs declared in `[shadow_exempt]` — kernels this
@@ -328,7 +345,7 @@ fn main() {
     for (idx, target) in targets.iter().enumerate() {
         let cu_files = collect_cu_files(
             target.common_kernel_dir.as_deref(),
-            &target.model_kernel_dir,
+            &target.overlay_dirs(),
             source_ext,
         );
         assert!(
@@ -398,7 +415,7 @@ fn main() {
 
         let drops = shadowed_dropped_pairs(
             target.common_kernel_dir.as_deref(),
-            &target.model_kernel_dir,
+            &target.overlay_dirs(),
             source_ext,
             &target.module_overrides,
         );
@@ -442,7 +459,14 @@ fn main() {
         if let Some(ref common) = target.common_kernel_dir {
             println!("cargo:rerun-if-changed={}", common.display());
         }
-        let n_overrides = find_cu_files(&target.model_kernel_dir, source_ext).len();
+        if let Some(ref base) = target.base_kernel_dir {
+            println!("cargo:rerun-if-changed={}", base.display());
+        }
+        let n_overrides: usize = target
+            .overlay_dirs()
+            .iter()
+            .map(|d| find_cu_files(d, source_ext).len())
+            .sum();
         println!(
             "cargo:warning=atlas-kernels: compiled {} kernels for target {} ({}, {}, {}){}",
             cu_files.len(),
@@ -600,7 +624,7 @@ fn closure_attestation(
     for target in targets {
         let sources = collect_cu_files(
             target.common_kernel_dir.as_deref(),
-            &target.model_kernel_dir,
+            &target.overlay_dirs(),
             compute_target.source_extension(),
         );
         if sources.is_empty() {
@@ -613,6 +637,11 @@ fn closure_attestation(
                 .join(&target.hw)
                 .join("HARDWARE.toml"),
             model_dir.map(|d| d.join("MODEL.toml")).unwrap_or_default(),
+            target
+                .base_kernel_dir
+                .as_ref()
+                .map(|d| d.join("KERNEL.toml"))
+                .unwrap_or_default(),
             target.model_kernel_dir.join("KERNEL.toml"),
         ]
         .into_iter()
@@ -1137,15 +1166,38 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 module_overrides.extend(m);
                 shadow_exempt.extend(parse_shadow_exempt(&common_kernel_dir));
             }
-            if has_model_dir && model_kernel_dir.join("KERNEL.toml").exists() {
-                let (f, m) = parse_kernel_toml(&model_kernel_dir, &target_vendor);
+            // A quant dir may compose on a sibling (`[build] base_quant`):
+            // `exl3/` = the nvfp4 bundle + the EXL3 kernels, while `nvfp4/`
+            // alone never carries them. The base merges between common and
+            // the model toml, and is itself a plain dir (no chaining).
+            let base_kernel_dir = has_model_dir
+                .then(|| parse_base_quant(&model_kernel_dir))
+                .flatten()
+                .map(|base| {
+                    let dir = kernel_src_dir.join(&base);
+                    assert!(
+                        dir.is_dir() && parse_base_quant(&dir).is_none(),
+                        "({model}, {quant}): base_quant {base:?} must name a sibling \
+                         quant dir without its own base_quant ({})",
+                        dir.display(),
+                    );
+                    dir
+                });
+            for dir in [base_kernel_dir.as_ref(), Some(&model_kernel_dir)]
+                .into_iter()
+                .flatten()
+            {
+                if !dir.join("KERNEL.toml").exists() {
+                    continue;
+                }
+                let (f, m) = parse_kernel_toml(dir, &target_vendor);
                 for flag in f {
                     if !extra_flags.contains(&flag) {
                         extra_flags.push(flag);
                     }
                 }
                 module_overrides.extend(m);
-                shadow_exempt.extend(parse_shadow_exempt(&model_kernel_dir));
+                shadow_exempt.extend(parse_shadow_exempt(dir));
             }
             shadow_exempt.sort();
             shadow_exempt.dedup();
@@ -1178,6 +1230,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 } else {
                     None
                 },
+                base_kernel_dir,
                 extra_flags,
                 module_overrides,
                 shadow_exempt,
@@ -1347,8 +1400,9 @@ mod build_parse;
 #[path = "build_shadow.rs"]
 mod build_shadow;
 use build_parse::{
-    parse_behavior, parse_dflash, parse_expected_absent, parse_kernel_source, parse_kernel_toml,
-    parse_match_names, parse_model_types, parse_sampling_presets, parse_shadow_exempt,
+    parse_base_quant, parse_behavior, parse_dflash, parse_expected_absent, parse_kernel_source,
+    parse_kernel_toml, parse_match_names, parse_model_types, parse_sampling_presets,
+    parse_shadow_exempt,
 };
 use build_shadow::shadowed_missing_symbols;
 
@@ -1358,7 +1412,7 @@ use build_shadow::shadowed_missing_symbols;
 /// NVIDIA, "metal" for Apple).
 fn collect_cu_files(
     common_dir: Option<&std::path::Path>,
-    model_dir: &std::path::Path,
+    overlay_dirs: &[&std::path::Path],
     source_ext: &str,
 ) -> Vec<PathBuf> {
     let mut files: HashMap<String, PathBuf> = HashMap::new();
@@ -1371,11 +1425,24 @@ fn collect_cu_files(
         }
     }
 
-    // Override layer: model-specific kernel files shadow common ones
-    for f in find_cu_files(model_dir, source_ext) {
-        let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
-        files.insert(stem, f);
+    // Override layer: model-specific kernel files shadow common ones. A
+    // composed target's overlay must not shadow its base quant — whole-file
+    // shadowing is exactly the drift `shadowed_dropped_pairs` polices
+    // against common/, so it is refused outright between the two.
+    let mut overlay: HashMap<String, PathBuf> = HashMap::new();
+    for dir in overlay_dirs {
+        for f in find_cu_files(dir, source_ext) {
+            let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
+            if let Some(prev) = overlay.insert(stem, f.clone()) {
+                panic!(
+                    "{} shadows {} from its base quant dir; move the change into the base",
+                    f.display(),
+                    prev.display()
+                );
+            }
+        }
     }
+    files.extend(overlay);
 
     let mut result: Vec<PathBuf> = files.into_values().collect();
     result.sort();
@@ -1437,7 +1504,7 @@ mod build_diagnose;
 /// the one that matters hides among them.
 fn shadowed_dropped_pairs(
     common_dir: Option<&std::path::Path>,
-    model_dir: &std::path::Path,
+    overlay_dirs: &[&std::path::Path],
     source_ext: &str,
     module_overrides: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
@@ -1449,7 +1516,10 @@ fn shadowed_dropped_pairs(
         .map(|f| (f.file_stem().unwrap().to_str().unwrap().to_string(), f))
         .collect();
     let mut out = Vec::new();
-    for f in find_cu_files(model_dir, source_ext) {
+    let overlay = overlay_dirs
+        .iter()
+        .flat_map(|d| find_cu_files(d, source_ext));
+    for f in overlay {
         let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
         let Some(common_f) = common_by_stem.get(&stem) else {
             continue;

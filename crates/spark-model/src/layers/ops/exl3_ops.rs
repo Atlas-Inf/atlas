@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Rust launchers for the `exl3` CUDA module (kernels/gb10/qwen3.8-flash-next/
-//! nvfp4/exl3.cu) and the EXL3 linear composed from them.
+//! exl3/exl3.cu) and the EXL3 linear composed from them.
 //!
 //! The kernels are the vendored exllamav3 reconstruct / Hadamard / conversion /
 //! hgemm entry points; each launcher here mirrors one kernel signature exactly

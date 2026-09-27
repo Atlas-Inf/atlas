@@ -137,15 +137,28 @@ fn compat_nvfp4_handles_fp8_and_bf16() {
     assert!(quant_pair_compatible("nvfp4", "bf16"));
 }
 
-// EXL3 linears ship in the nvfp4-labeled bundle for this model family
-// (kernels/gb10/qwen3.8-flash-next/nvfp4/), so the pair must be accepted —
-// but only in that direction: an exl3-labeled bundle is not built today,
-// and the BF16 bundle has no EXL3 decode path.
+// EXL3 kernels ship only in the exl3-labeled bundle
+// (kernels/gb10/qwen3.8-flash-next/exl3/, composed on nvfp4/), so an exl3
+// checkpoint needs that build: an nvfp4-only or BF16 build must refuse it at
+// the pairing check rather than fail later on a missing `exl3` module.
 #[test]
-fn compat_nvfp4_bundle_accepts_exl3_model() {
-    assert!(quant_pair_compatible("nvfp4", "exl3"));
+fn compat_exl3_model_needs_exl3_bundle() {
+    assert!(quant_pair_compatible("exl3", "exl3"));
+    assert!(!quant_pair_compatible("nvfp4", "exl3"));
     assert!(!quant_pair_compatible("bf16", "exl3"));
     assert!(!quant_pair_compatible("exl3", "nvfp4"));
+}
+
+// A `*` build compiles qwen3.8-flash-next as two variants, exl3 sorting first.
+#[test]
+fn pick_quant_variant_prefers_exact_then_compatible() {
+    let built = ["exl3", "nvfp4"];
+    assert_eq!(pick_quant_variant(&built, "exl3"), Some(0));
+    assert_eq!(pick_quant_variant(&built, "nvfp4"), Some(1));
+    assert_eq!(pick_quant_variant(&built, "fp8"), Some(1));
+    assert_eq!(pick_quant_variant(&built, "bf16"), Some(1));
+    assert_eq!(pick_quant_variant(&["nvfp4"], "exl3"), None);
+    assert_eq!(pick_quant_variant(&["exl3"], "exl3"), Some(0));
 }
 
 #[test]
