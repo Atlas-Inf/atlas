@@ -347,22 +347,67 @@ def start_container(host: str, spec: TestSpec, port: int) -> str:
     return name
 
 
-def ready_marker(port: int) -> str:
-    """Exact startup line proving the listener is reachable by this harness.
+def _ready_host(bind: str) -> str:
+    """Host rendering for the readiness line — mirrors
+    crates/spark-server/src/main_modules/serve_router.rs::ready_line, the
+    source of truth: wildcard binds (0.0.0.0 / ::) accept on every interface
+    but are not destinations, so they render as 127.0.0.1; IPv6 literals are
+    bracketed so `::1:8888` can't parse as address-plus-port."""
+    if bind in ("0.0.0.0", "::"):
+        return "127.0.0.1"
+    if ":" in bind:
+        return f"[{bind}]"
+    return bind
 
-    The server logs `Listening on {bind}:{port}`, so the bare substring
-    "Listening on" ALSO matches `Listening on 127.0.0.1:8888` — a bind this
-    harness can never reach. Matching that produced a false READY whose
-    downstream connection resets looked exactly like a model regression.
-    Match the address we asked for, so a wrong bind cannot read as ready.
+
+def ready_marker(port: int, bind: str = SERVE_BIND) -> str:
+    """Prefix of the exact startup line proving the listener is reachable by
+    this harness.
+
+    The server logs `Server live and ready at {host}:{port} running {model}`
+    after the bind (serve_router.rs::ready_line). Matching the bare substring
+    "Server live and ready at" — or the legacy "Listening on" — would ALSO
+    match a bind this harness can never reach (e.g. 127.0.0.1 inside the
+    container), producing a false READY whose downstream connection resets
+    looked exactly like a model regression. Match the address we asked for,
+    so a wrong bind cannot read as ready.
     """
-    return f"Listening on {SERVE_BIND}:{port}"
+    return f"Server live and ready at {_ready_host(bind)}:{port} running "
+
+
+def legacy_ready_marker(port: int, bind: str = SERVE_BIND) -> str:
+    """Pre-Aug-2026 readiness line. Older release-verify images still log
+    `Listening on {bind}:{port}` — keep accepting it so this harness can
+    verify older tags."""
+    return f"Listening on {bind}:{port}"
+
+
+# Ready-line prefixes that prove SOME bind happened. "Server live at " (no
+# "and ready") is the modelless boot — live but not serving a model, and this
+# harness always passes one, so it is neither ready nor a wrong-bind fail.
+_BOUND_PREFIXES = ("Server live and ready at ", "Listening on")
+
+
+def log_ready_state(log: str, marker: str, legacy: str) -> str:
+    """Classify a log scrape: 'ready', 'wrong_bind', or 'waiting'.
+
+    The modelless `Server live at {host}:{port} — no model loaded yet…`
+    line lands as 'waiting': it matches neither marker nor bound prefix
+    (`Server live at ` is not `Server live and ready at `), and this
+    harness always passes a model, so the serving line still has to come.
+    """
+    if marker in log or legacy in log:
+        return "ready"
+    if any(p in log for p in _BOUND_PREFIXES):
+        return "wrong_bind"
+    return "waiting"
 
 
 def wait_listening(host: str, name: str, port: int,
                    timeout: int = STARTUP_TIMEOUT) -> bool:
     """Poll docker logs until the reachable-listener line appears, or time out."""
     marker = ready_marker(port)
+    legacy = legacy_ready_marker(port)
     deadline = time.time() + timeout
     while time.time() < deadline:
         # Container might have exited
@@ -372,14 +417,17 @@ def wait_listening(host: str, name: str, port: int,
             return False
         r = docker_on(host, f"logs {name} 2>&1", check=False, capture=True)
         log = r.stdout
-        if marker in log:
+        state = log_ready_state(log, marker, legacy)
+        if state == "ready":
             return True
-        if "Listening on" in log:
-            # Bound, but not where we asked. Fail fast and name the cause —
-            # never let this fall through to a probe that will be refused.
+        if state == "wrong_bind":
+            # Bound, but not where we asked (or modelless). Fail fast and
+            # name the cause — never let this fall through to a probe that
+            # will be refused.
             print(f"    [{host}/{name}] bound the WRONG address: expected "
-                  f"'{marker}'. Not reachable from this harness — check the "
-                  f"--bind argument and the container network mode.")
+                  f"'{marker}' (or legacy '{legacy}'). Not reachable from "
+                  f"this harness — check the --bind argument and the "
+                  f"container network mode.")
             return False
         if "Error:" in log and "ERROR" in log:
             print(f"    [{host}/{name}] error detected in log")
@@ -672,7 +720,8 @@ def wait_ep2_ready(rank0_name: str, rank1_name: str, timeout: int = 900) -> bool
                 return False
             r = docker_on("head", f"logs {rank0_name} 2>&1",
                           check=False, capture=True)
-            if "Listening on" in r.stdout:
+            if "Server live and ready at " in r.stdout \
+                    or "Listening on" in r.stdout:
                 rank0_ready = True
                 print("    [rank0] listening")
         if not rank1_ready:
