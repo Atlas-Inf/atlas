@@ -47,8 +47,18 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 ///    contend with Marconi's LRU slots. Sized for `max_batch_size`
 ///    sequences so the watchdog rollback always has capacity.
 pub(crate) struct SsmSnapshotPool {
+    /// Per-layer Marconi h-state regions. Either `num_ssm_layers` real
+    /// allocations (fallback path) or offset views into `h_blob_base`.
     pub(super) h_snapshots: Vec<DevicePtr>,
     pub(super) conv_snapshots: Vec<DevicePtr>,
+    /// Contiguous backing allocations for the Marconi region. `NULL` when
+    /// the per-layer fallback path ran. The snapshot pool is ~100 separate
+    /// allocations otherwise, which shreds the unified-memory map enough
+    /// that subsequent ~40MB allocs fail with GBs nominally free — one
+    /// contiguous blob per kind keeps the region coalesced. Teardown frees
+    /// the bases (never the offset views).
+    pub(super) h_blob_base: DevicePtr,
+    pub(super) conv_blob_base: DevicePtr,
     pub(super) free_slots: Mutex<Vec<usize>>,
     pub(super) num_slots: usize,
     pub(super) h_bytes: usize,
@@ -137,6 +147,8 @@ impl SsmSnapshotPool {
             return Ok(Self {
                 h_snapshots: Vec::new(),
                 conv_snapshots: Vec::new(),
+                h_blob_base: DevicePtr::NULL,
+                conv_blob_base: DevicePtr::NULL,
                 free_slots: Mutex::new(Vec::new()),
                 num_slots: 0,
                 h_bytes,
@@ -160,10 +172,38 @@ impl SsmSnapshotPool {
         let mut h_snapshots = Vec::new();
         let mut conv_snapshots = Vec::new();
         let mut hidden_snapshot = DevicePtr::NULL;
+        let mut h_blob_base = DevicePtr::NULL;
+        let mut conv_blob_base = DevicePtr::NULL;
         if marconi_enabled {
-            for _ in 0..num_ssm_layers {
-                h_snapshots.push(gpu.alloc(num_slots * h_bytes)?);
-                conv_snapshots.push(gpu.alloc(num_slots * conv_bytes)?);
+            // One contiguous blob per kind, per-layer views via offset. The
+            // per-layer loop is the fallback: if the blob doesn't fit the
+            // current map, scatter as before rather than fail the build.
+            let h_blob_bytes = num_ssm_layers * num_slots * h_bytes;
+            let conv_blob_bytes = num_ssm_layers * num_slots * conv_bytes;
+            match (gpu.alloc(h_blob_bytes), gpu.alloc(conv_blob_bytes)) {
+                (Ok(h_blob), Ok(c_blob)) => {
+                    for i in 0..num_ssm_layers {
+                        h_snapshots.push(h_blob.offset(i * num_slots * h_bytes));
+                        conv_snapshots.push(c_blob.offset(i * num_slots * conv_bytes));
+                    }
+                    h_blob_base = h_blob;
+                    conv_blob_base = c_blob;
+                }
+                (h_res, c_res) => {
+                    // One side failed: release whichever succeeded and fall
+                    // back to per-layer allocations.
+                    for res in [h_res, c_res] {
+                        if let Ok(ptr) = res
+                            && let Err(e) = gpu.free(ptr)
+                        {
+                            tracing::warn!("ssm snapshot blob fallback free failed: {e}");
+                        }
+                    }
+                    for _ in 0..num_ssm_layers {
+                        h_snapshots.push(gpu.alloc(num_slots * h_bytes)?);
+                        conv_snapshots.push(gpu.alloc(num_slots * conv_bytes)?);
+                    }
+                }
             }
             hidden_snapshot = gpu.alloc(num_slots * hidden_bytes)?;
         }
@@ -198,6 +238,8 @@ impl SsmSnapshotPool {
         Ok(Self {
             h_snapshots,
             conv_snapshots,
+            h_blob_base,
+            conv_blob_base,
             free_slots: Mutex::new(free_slots),
             num_slots: if marconi_enabled { num_slots } else { 0 },
             h_bytes,
