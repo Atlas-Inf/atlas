@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Decode an EXL3 (trellis) PLE n-gram table into the BF16 row table Atlas's PLE loader reads.
+"""INTERIM: delete when M7 lands (Atlas decoding EXL3 n-gram rows natively, tracked in #65).
 
-    python3 convert_ngram_bf16.py <exl3 model dir> [--workers 16] [--check <nvfp4 pack dir>]
+Decode an EXL3 (trellis) PLE n-gram table into the BF16 row table Atlas's PLE loader reads.
 
-Interim path until Atlas decodes EXL3 n-gram rows natively (plan M7). Reads the EXL3 side file
-`ngram_embedding.safetensors` and writes, into the same model directory, unindexed side files
-`ngram_bf16_<j>.safetensors` holding:
+    python3 convert_ngram_bf16.py <exl3 model dir> [--workers 16] [--files 8] [--rows-per-job 250000]
+
+Until M7, serving an EXL3 checkpoint needs this step, and it writes about 96 GiB of side files into the
+model directory (Qwen3.8-Flash-Next; see README.md). Reads the EXL3 side file
+`ngram_embedding.safetensors` and writes unindexed side files `ngram_bf16_<j>.safetensors` holding:
 
     <ple prefix>.ngram_embedding.shard_<i>.weight   BF16 [rows_i, 160]   (i = 0..parts-1)
     <ple prefix>.layer_multipliers / .ngram_heads_vocab_sizes / .ngram_heads_offsets   I64

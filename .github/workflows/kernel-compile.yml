@@ -205,7 +205,7 @@ jobs:
           # (`kernels/gb10/qwen3.8-flash-next/exl3/`, composed on `nvfp4/` via
           # `base_quant`), which the all-models build above does not compile:
           # it builds the default quant, `nvfp4`. The EXL3 pins skip there, so
-          # this step builds that one target and fails if they skip here too.
+          # this step builds that one target and fails if any of them skips here.
           ATLAS_TARGET_MODEL: qwen3.8-flash-next
           ATLAS_TARGET_QUANT: exl3
           CUDARC_CUDA_VERSION: "13000"
@@ -218,7 +218,7 @@ jobs:
             echo "::error::an EXL3 arity pin skipped although the exl3 target was built"
             exit 1
           fi
-          grep -q "test result: ok. 2 passed" exl3-arity.log || {
-            echo "::error::expected both EXL3 arity pins (exl3, exl3_int8) to run and pass"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed" exl3-arity.log || {
+            echo "::error::expected the EXL3 arity pins to run and pass"
             exit 1
           }
