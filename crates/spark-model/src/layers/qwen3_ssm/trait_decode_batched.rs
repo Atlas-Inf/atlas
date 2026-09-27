@@ -1437,7 +1437,7 @@ impl Qwen3SsmLayer {
             // M~1 + sort/permute overhead across the 36-layer SSM stack).
             k4_diag_checkpoint(ctx, "10a:residual_add_rms_norm", stream)?;
             self.ffn
-                .forward_prefill(normed2_base, num_tokens, ctx, stream)?;
+                .forward_decode_rows(normed2_base, num_tokens, ctx, stream)?;
             k4_diag_checkpoint(ctx, "10b:ffn_forward_prefill", stream)?;
             let moe_out = ctx.buffers.moe_output();
             ops::residual_add(

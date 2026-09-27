@@ -312,7 +312,8 @@ impl Qwen3SsmLayer {
         {
             // try_forward_km already wrote moe_output for all rows.
         } else if self.ffn.is_dense() {
-            self.ffn.forward_prefill(normed2, num_tokens, ctx, stream)?;
+            self.ffn
+                .forward_decode_rows(normed2, num_tokens, ctx, stream)?;
         } else {
             anyhow::bail!(
                 "qwen3_ssm mHC batched decode: no batched MoE arm for K={num_tokens}. \

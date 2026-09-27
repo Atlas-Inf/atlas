@@ -236,7 +236,7 @@ impl Qwen3SsmLayer {
                 && self.ffn.is_dense()
                 && ssm_ffn_prefill_enabled() =>
             {
-                self.ffn.forward_prefill(normed_base, n, ctx, stream)?;
+                self.ffn.forward_decode_rows(normed_base, n, ctx, stream)?;
                 ops::residual_add(
                     ctx.gpu,
                     self.residual_add_k,
@@ -311,7 +311,7 @@ impl Qwen3SsmLayer {
                     // Grouped-GEMM MoE over all N tokens (each expert read once).
                     // Only sensible under CUDA graphs, where the sort/permute
                     // launch overhead that made this a loss is captured for free.
-                    self.ffn.forward_prefill(normed_base, n, ctx, stream)?;
+                    self.ffn.forward_decode_rows(normed_base, n, ctx, stream)?;
                     let moe_out = ctx.buffers.moe_output();
                     ops::residual_add(
                         ctx.gpu,

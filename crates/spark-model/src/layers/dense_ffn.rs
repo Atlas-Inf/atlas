@@ -324,6 +324,49 @@ pub(crate) fn fp4mmq_prefill_decision(env: Option<&str>, handles_ok: bool, silu:
     handles_ok && silu && env == Some("1")
 }
 
+/// Which caller shape asked for this FFN forward — the fp4mmq decision
+/// cannot distinguish them by `m` alone (a ≤128-token prefill chunk and a
+/// ≤128-row verify batch look identical), so the phase is explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FfnMmPhase {
+    /// A prefill chunk. W4A16 default — #95 showed the MMQ arm's FP4
+    /// activation quantizer is chunk-size sensitive in this phase.
+    Prefill,
+    /// A decode/verify multi-row call (batched decode, DFlash2 R≤128
+    /// verify, MTP K-verify fallthrough). Bounded M, weight-read bound —
+    /// the shape the mmq16/32/64 tiles were built for.
+    DecodeRows,
+}
+
+/// Whether the NVFP4 W4A4 MMQ arm runs for this call. Two levels:
+///
+/// - `ATLAS_FFN_NVFP4_MMQ=1` opts the WHOLE model in — same meaning as
+///   before (#96's opt-in experiment path: prefill + verify both MMQ).
+/// - Otherwise [`FfnMmPhase::DecodeRows`] calls with `m ≤ 128` take MMQ by
+///   DEFAULT on targets that ship `nvfp4_mmq` (handles_ok is the caller's
+///   probe of that). This restores the pre-#96 verify arithmetic — #96
+///   correctly made prefill W4A16 again but also reverted verify rows to
+///   `t_m128` (~51 TF vs ~80 TF). Precision note: prefill stays W4A16, so
+///   the #95 chunk-boundary drift fix is untouched; verify arithmetic is
+///   exactly what ran before #96. `ATLAS_FFN_NVFP4_MMQ_VERIFY=0` disables
+///   this default (restores #96's all-W4A16-verify behavior for A/B).
+pub(crate) fn ffn_fp4mmq_decision(
+    phase: FfnMmPhase,
+    m: u32,
+    env: Option<&str>,
+    verify_env: Option<&str>,
+    handles_ok: bool,
+    silu: bool,
+) -> bool {
+    if !(handles_ok && silu) {
+        return false;
+    }
+    if env == Some("1") {
+        return true;
+    }
+    phase == FfnMmPhase::DecodeRows && m <= 128 && verify_env != Some("0")
+}
+
 /// Warn once (per the caller's once-latch) that `ATLAS_NO_FFN_NVFP4_MMQ` is
 /// deprecated. Called from both the forward path (`ctx.stats.once`) and the
 /// load-time finalize (`gpu.op_cache().once`).
@@ -658,14 +701,22 @@ impl DenseFfnLayer {
         // only here): the `_t` frees below run only when the FP4-MMQ prefill
         // path is actually enabled, so a default boot keeps the transposed
         // copies the W4A16 prefill kernels need.
-        let active = fp4mmq_prefill_decision(
-            std::env::var("ATLAS_FFN_NVFP4_MMQ").ok().as_deref(),
-            self.nvfp4_mmq_nc_k.0 != 0
-                && self.nvfp4_quant_act_k.0 != 0
-                && self.nvfp4_repack_k.0 != 0
-                && self.nvfp4_silu_scaled_k.0 != 0,
-            matches!(self.activation, FfnActivation::SiLU),
-        );
+        let handles_ok = self.nvfp4_mmq_nc_k.0 != 0
+            && self.nvfp4_quant_act_k.0 != 0
+            && self.nvfp4_repack_k.0 != 0
+            && self.nvfp4_silu_scaled_k.0 != 0;
+        let silu = matches!(self.activation, FfnActivation::SiLU);
+        let env_mmq = std::env::var("ATLAS_FFN_NVFP4_MMQ").ok();
+        let all_mmq = fp4mmq_prefill_decision(env_mmq.as_deref(), handles_ok, silu);
+        // The MMQ weights are needed when the verify-rows default could
+        // fire too — m ≤ 128 is decided per call, so finalize builds the
+        // repacked weights whenever either level is active. `_t` frees
+        // below stay gated on `all_mmq`: under verify-rows-only, prefill
+        // still runs W4A16 on those transposed copies.
+        let active = all_mmq
+            || (handles_ok
+                && silu
+                && std::env::var("ATLAS_FFN_NVFP4_MMQ_VERIFY").ok().as_deref() != Some("0"));
         if !active {
             if std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_some()
                 && gpu.op_cache().once("log:ffn_no_nvfp4_mmq_deprecated")
@@ -702,19 +753,22 @@ impl DenseFfnLayer {
             )?;
         }
         gpu.synchronize(stream)?;
-        // Free the dead transposed copies (prefill for those projections now runs on the
-        // MMQ arm; decode reads the non-transposed originals). down_proj_t is freed only
-        // when the down A/B gate is on.
-        let mut down_t = if down_mmq {
+        // Free the dead transposed copies only under the full opt-in:
+        // `ATLAS_FFN_NVFP4_MMQ=1` makes prefill MMQ, so gate/up `_t` are
+        // dead. Under the verify-rows default prefill still runs W4A16 on
+        // them. down_proj_t is freed only when the down A/B gate is on.
+        let mut down_t = if all_mmq && down_mmq {
             Some(&mut self.weights.down_proj_t)
         } else {
             None
         };
         let mut freed = 0usize;
-        for wt in [&mut self.weights.gate_proj_t, &mut self.weights.up_proj_t]
-            .into_iter()
-            .chain(down_t.take())
-        {
+        let gate_up_t: Vec<&mut Option<QuantizedWeight>> = if all_mmq {
+            vec![&mut self.weights.gate_proj_t, &mut self.weights.up_proj_t]
+        } else {
+            Vec::new()
+        };
+        for wt in gate_up_t.into_iter().chain(down_t.take()) {
             if let Some(w) = wt.as_ref()
                 && !w.weight.is_null()
             {
@@ -1790,10 +1844,10 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<()> {
         if !ctx.profile {
-            return self.forward_prefill_inner(input, num_tokens, ctx, stream);
+            return self.forward_prefill_inner(input, num_tokens, ctx, stream, FfnMmPhase::Prefill);
         }
         let t0 = std::time::Instant::now();
-        let r = self.forward_prefill_inner(input, num_tokens, ctx, stream);
+        let r = self.forward_prefill_inner(input, num_tokens, ctx, stream, FfnMmPhase::Prefill);
         // Sync so the figure is the kernel's, not the launch queue's — the
         // attention and MoE timers do the same under `ctx.profile`.
         ctx.gpu.synchronize(stream)?;
@@ -1805,12 +1859,29 @@ impl DenseFfnLayer {
         r
     }
 
+    /// Decode/verify multi-row entry: same GEMM body as `forward_prefill`
+    /// but tagged [`FfnMmPhase::DecodeRows`] so `ffn_fp4mmq_decision` can
+    /// route the bounded-M verify calls onto the NVFP4 MMQ tiles without
+    /// also turning prefill chunks MMQ (the #95 fix). Call this from any
+    /// multi-row decode or speculative-verify path instead of
+    /// `forward_prefill`.
+    pub fn forward_decode_rows(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.forward_prefill_inner(input, num_tokens, ctx, stream, FfnMmPhase::DecodeRows)
+    }
+
     fn forward_prefill_inner(
         &self,
         input: DevicePtr,
         num_tokens: usize,
         ctx: &ForwardContext,
         stream: u64,
+        phase: FfnMmPhase,
     ) -> Result<()> {
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
@@ -2216,8 +2287,11 @@ impl DenseFfnLayer {
         // down has its own opt-in below). SiLU models only (the scale2 fold
         // lives in the scaled SiLU-mul). Mutually exclusive with
         // ATLAS_FFN_MMQ (both use the shared ffn_act_q8 scratch); this arm wins.
-        let fp4mmq_prefill = fp4mmq_prefill_decision(
+        let fp4mmq_prefill = ffn_fp4mmq_decision(
+            phase,
+            m,
             std::env::var("ATLAS_FFN_NVFP4_MMQ").ok().as_deref(),
+            std::env::var("ATLAS_FFN_NVFP4_MMQ_VERIFY").ok().as_deref(),
             self.nvfp4_mmq_nc_k.0 != 0
                 && self.nvfp4_quant_act_k.0 != 0
                 && self.nvfp4_repack_k.0 != 0
@@ -2821,7 +2895,10 @@ fn native_small_batch_uses_prefill(has_bf16: bool, has_fp8: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{fp4mmq_prefill_decision, native_k2_uses_batch2, native_small_batch_uses_prefill};
+    use super::{
+        FfnMmPhase, ffn_fp4mmq_decision, fp4mmq_prefill_decision, native_k2_uses_batch2,
+        native_small_batch_uses_prefill,
+    };
 
     #[test]
     fn fp4mmq_prefill_is_opt_in() {
@@ -2836,6 +2913,54 @@ mod tests {
         // Preconditions still gate the opt-in.
         assert!(!fp4mmq_prefill_decision(Some("1"), false, true));
         assert!(!fp4mmq_prefill_decision(Some("1"), true, false));
+    }
+
+    #[test]
+    fn fp4mmq_verify_rows_table() {
+        let d = |phase, m, env, venv| ffn_fp4mmq_decision(phase, m, env, venv, true, true);
+        // The #96 opt-in keeps its whole-model meaning: env=1 wins every
+        // phase and every M.
+        assert!(d(FfnMmPhase::Prefill, 2048, Some("1"), None));
+        assert!(d(FfnMmPhase::DecodeRows, 8, Some("1"), Some("0")));
+        // Default (no env): prefill stays W4A16 — the #95 fix —
+        // while bounded decode/verify rows take MMQ.
+        assert!(!d(FfnMmPhase::Prefill, 8, None, None));
+        assert!(!d(FfnMmPhase::Prefill, 64, None, None));
+        assert!(d(FfnMmPhase::DecodeRows, 1, None, None));
+        assert!(d(FfnMmPhase::DecodeRows, 128, None, None));
+        assert!(!d(FfnMmPhase::DecodeRows, 129, None, None));
+        assert!(!d(FfnMmPhase::DecodeRows, 2048, None, None));
+        // ATLAS_FFN_NVFP4_MMQ_VERIFY=0 restores the all-W4A16 verify of #96.
+        assert!(!d(FfnMmPhase::DecodeRows, 64, None, Some("0")));
+        assert!(!d(FfnMmPhase::DecodeRows, 128, None, Some("0")));
+        // Only literal "0" disables; other values keep the default.
+        assert!(d(FfnMmPhase::DecodeRows, 64, None, Some("1")));
+        assert!(d(FfnMmPhase::DecodeRows, 64, None, Some("bogus")));
+        // Preconditions: no handles or non-SiLU kills the arm at either level.
+        assert!(!ffn_fp4mmq_decision(
+            FfnMmPhase::DecodeRows,
+            64,
+            None,
+            None,
+            false,
+            true
+        ));
+        assert!(!ffn_fp4mmq_decision(
+            FfnMmPhase::DecodeRows,
+            64,
+            None,
+            None,
+            true,
+            false
+        ));
+        assert!(!ffn_fp4mmq_decision(
+            FfnMmPhase::DecodeRows,
+            64,
+            Some("1"),
+            None,
+            false,
+            true
+        ));
     }
 
     #[test]

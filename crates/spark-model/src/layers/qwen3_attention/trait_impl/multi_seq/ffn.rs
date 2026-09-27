@@ -208,7 +208,7 @@ impl Qwen3AttentionLayer {
                 eps,
                 stream,
             )?;
-            self.ffn.forward_prefill(normed2, n, fwd, stream)?;
+            self.ffn.forward_decode_rows(normed2, n, fwd, stream)?;
             let moe_out = fwd.buffers.moe_output();
             ops::residual_add(
                 fwd.gpu,
@@ -239,7 +239,7 @@ impl Qwen3AttentionLayer {
                 eps,
                 stream,
             )?;
-            self.ffn.forward_prefill(normed2, n, fwd, stream)?;
+            self.ffn.forward_decode_rows(normed2, n, fwd, stream)?;
             let moe_out = fwd.buffers.moe_output();
             ops::residual_add(
                 fwd.gpu,

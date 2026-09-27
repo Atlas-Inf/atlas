@@ -4,6 +4,7 @@ pub mod deepseek_v4_mtp;
 pub mod dense_ffn;
 pub mod dflash_head;
 pub mod ep_dispatch;
+mod ffn_decode_rows;
 pub mod fp8_calibration;
 pub mod moe;
 pub mod mtp_head;
