@@ -22,8 +22,7 @@
       "host": "head",
       "label": "lightning-30B-nvfp4",
       "model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
-      "kv_dtype": "bf16",
-      "env": {"ATLAS_DFLASH_OPTION_B": "1"}
+      "kv_dtype": "bf16"
     }
   ],
   [
