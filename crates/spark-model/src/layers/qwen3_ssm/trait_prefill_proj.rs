@@ -336,7 +336,7 @@ impl Qwen3SsmLayer {
             })?;
         } else if let Some(ref fp8w) = self.qkvz_fp8w
             && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
-            && k > 128
+            && (k > 128 || self.qkvz_fp8w_t.is_none())
             && self.w8a16_gemm_n_m128_k.0 != 0
         {
             // NON-transposed FP8 m128 (gfx1151): reads the native B[N,K]

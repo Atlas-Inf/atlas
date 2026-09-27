@@ -152,7 +152,7 @@ impl Qwen3AttentionLayer {
             )?;
         } else if let Some(fp8w) = self.o_weight.as_ref().and_then(|w| w.as_fp8())
             && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
-            && n > 128
+            && (n > 128 || self.o_fp8w_t.is_none())
             && self.w8a16_gemm_n_m128_k.0 != 0
         {
             // gfx1151 NON-transposed FP8 m128: native B[N,K] k-contiguous +
