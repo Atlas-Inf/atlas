@@ -196,27 +196,33 @@ fn run_batched_verify(
 /// (device 700 in production; here the fail-fast guards turn it into Err,
 /// so `is_ok` is the load-bearing assertion).
 #[test]
-fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_batch16() {
+fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_gemv() {
     let config = ModelConfig::qwen3_next_80b_nvfp4();
     let gpu = MockGpuBackend::new();
     let layer = native_fp8_gdn_layer(&gpu, &config, true, true);
     run_batched_verify(&gpu, &config, &layer, &[4, 3]).unwrap();
-    // Pin the arm identity at R=7: the `w8a16_gemv_batch16` arm sits AHEAD
-    // of the `num_tokens > 4 → w8a16_gemm*` fallback for 5..=16 rows (the
-    // narrowest tier covering them — strix PR8 stack). Under the mock every
-    // kernel resolves, so batch16 always wins regardless of target.
-    // `w8a16_gemv_batch4` launch geometry: grid [ceil(N/4), 1, 1], block
-    // [256,1,1] — QKVZ (N=12288) → [3072,1,1]; out_proj (N=2048) → [512,1,1].
+    // Pin the arm identity at R=7: the batched `w8a16_gemv_*` arm sits AHEAD
+    // of the `num_tokens > 4 → w8a16_gemm*` fallback for 5..=16 rows. Under
+    // the mock every kernel resolves, so `fp8_verify_gemv_tier` picks the
+    // M<=8 tier: the `w8a16_gemv_batch8_dyn_vl2` twin (8 outputs/block, grid
+    // [ceil(N/8),1,1]) unless ATLAS_GEMV_VL2=0, else `w8a16_gemv_batch8`
+    // (grid [ceil(N/4),1,1]). Block is [256,1,1] either way.
+    // QKVZ N=12288, out_proj N=2048.
+    let per_block = if crate::layers::ops::gemv_vl2_enabled() {
+        8
+    } else {
+        4
+    };
     let launches = (0..gpu.launch_count()).count();
     assert!(launches > 0);
     let seen = gpu_launch_grids(&gpu);
     assert!(
-        seen.contains(&([3072, 1, 1], [256, 1, 1])),
-        "QKVZ w8a16_gemv_batch16 launch missing; grids seen: {seen:?}"
+        seen.contains(&([12288 / per_block, 1, 1], [256, 1, 1])),
+        "QKVZ batched w8a16 GEMV launch missing; grids seen: {seen:?}"
     );
     assert!(
-        seen.contains(&([512, 1, 1], [256, 1, 1])),
-        "out_proj w8a16_gemv_batch16 launch missing; grids seen: {seen:?}"
+        seen.contains(&([2048 / per_block, 1, 1], [256, 1, 1])),
+        "out_proj batched w8a16 GEMV launch missing; grids seen: {seen:?}"
     );
 }
 
