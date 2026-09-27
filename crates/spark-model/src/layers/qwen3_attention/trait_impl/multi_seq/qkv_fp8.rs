@@ -34,6 +34,8 @@ impl Qwen3AttentionLayer {
         let v_scratch = k_scratch.offset(n * kv_bytes);
         let batch_kernel = if n <= 4 {
             self.w8a16_gemv_batch4_k
+        } else if n <= 8 && self.w8a16_gemv_batch8_k.0 != 0 {
+            self.w8a16_gemv_batch8_k
         } else {
             self.w8a16_gemv_batch16_k
         };

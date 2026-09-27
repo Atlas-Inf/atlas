@@ -298,12 +298,19 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if (5..=16).contains(&num_tokens)
-            && self.w8a16_gemv_batch16_k.0 != 0
+            && (self.w8a16_gemv_batch16_k.0 != 0
+                || (num_tokens <= 8 && self.w8a16_gemv_batch8_k.0 != 0))
             && let Some(ref fp8) = self.qkvz_fp8w
         {
             ops::w8a16_gemv_batch4(
                 ctx.gpu,
-                self.w8a16_gemv_batch16_k,
+                // Verify rows 5..8 compute 8 rows on the batch8 tier rather
+                // than 16 on batch16; 9..16 keeps batch16.
+                if num_tokens <= 8 && self.w8a16_gemv_batch8_k.0 != 0 {
+                    self.w8a16_gemv_batch8_k
+                } else {
+                    self.w8a16_gemv_batch16_k
+                },
                 normed,
                 fp8.weight,
                 fp8.row_scale,
@@ -1146,12 +1153,18 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if (5..=16).contains(&num_tokens)
-            && self.w8a16_gemv_batch16_k.0 != 0
+            && (self.w8a16_gemv_batch16_k.0 != 0
+                || (num_tokens <= 8 && self.w8a16_gemv_batch8_k.0 != 0))
             && let Some(ref fp8) = self.out_proj_fp8w
         {
             ops::w8a16_gemv_batch4(
                 ctx.gpu,
-                self.w8a16_gemv_batch16_k,
+                // Same 5..8 → batch8 tier pick as the QKVZ arm above.
+                if num_tokens <= 8 && self.w8a16_gemv_batch8_k.0 != 0 {
+                    self.w8a16_gemv_batch8_k
+                } else {
+                    self.w8a16_gemv_batch16_k
+                },
                 normed_out_buf,
                 fp8.weight,
                 fp8.row_scale,

@@ -311,8 +311,8 @@ extern "C" __global__ void w4a16_gemv_dp4a(
 // FIXED4=false keeps the guard and serves the K=2/K=3 verify rows (2..3) the
 // scheduler still dispatches through this path — narrowing the dispatch to
 // M=4 alone would silently demote those rows to the float batch2/batch3 GEMVs.
-template <bool FIXED4>
-__device__ __forceinline__ void w4a16_gemv_dp4a_batch4_impl(
+template <int ROWS, bool FIXED4>
+__device__ __forceinline__ void w4a16_gemv_dp4a_batch_impl(
     const signed char* __restrict__ a_q,
     const float* __restrict__ a_scale,
     const unsigned char* __restrict__ B_packed,
@@ -332,7 +332,7 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch4_impl(
     const bool valid_n = n < N;
     const unsigned int half_k = K / 2;
     const unsigned int groups = K / DP4A_GROUP_SIZE;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[ROWS] = {};
 
     if (valid_n) {
         for (unsigned int group = lane; group < groups; group += threads_per_out) {
@@ -344,7 +344,7 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch4_impl(
             const float weight_scale = dp4a_scl_fp8(
                 B_scale[(unsigned long long)n * groups + group]) * (0.5f * scale2);
             #pragma unroll
-            for (int row = 0; row < 4; ++row) {
+            for (int row = 0; row < ROWS; ++row) {
                 if constexpr (!FIXED4) {
                     if ((unsigned int)row >= M) continue;
                 }
@@ -363,11 +363,11 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch4_impl(
         }
     }
 
-    __shared__ float partial[4][DP4A_N_PER_BLOCK * 2];
+    __shared__ float partial[ROWS][DP4A_N_PER_BLOCK * 2];
     const unsigned int warp_lane = lane % DP4A_WARP_SIZE;
     const unsigned int warp_in_out = lane / DP4A_WARP_SIZE;
     #pragma unroll
-    for (int row = 0; row < 4; ++row) {
+    for (int row = 0; row < ROWS; ++row) {
         if constexpr (!FIXED4) {
             if ((unsigned int)row >= M) continue;
         }
@@ -382,7 +382,7 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch4_impl(
 
     if (valid_n && lane == 0) {
         #pragma unroll
-        for (int row = 0; row < 4; ++row) {
+        for (int row = 0; row < ROWS; ++row) {
             if constexpr (!FIXED4) {
                 if ((unsigned int)row >= M) continue;
             }
@@ -392,8 +392,8 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_batch4_impl(
     }
 }
 
-template <bool FIXED4>
-__device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch4_impl(
+template <int ROWS, bool FIXED4>
+__device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch_impl(
     const signed char* __restrict__ a_q,
     const float* __restrict__ a_scale,
     const unsigned char* __restrict__ B0_packed,
@@ -416,8 +416,8 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch4_impl(
     const unsigned int half_k = K / 2;
     const unsigned int groups = K / DP4A_GROUP_SIZE;
     (void)M;
-    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc0[ROWS] = {};
+    float acc1[ROWS] = {};
 
     if (valid_n) {
         for (unsigned int group = lane; group < groups; group += threads_per_out) {
@@ -436,7 +436,7 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch4_impl(
             const float weight_scale1 = dp4a_scl_fp8(
                 B1_scale[(unsigned long long)n * groups + group]) * (0.5f * B1_scale2);
             #pragma unroll
-            for (int row = 0; row < 4; ++row) {
+            for (int row = 0; row < ROWS; ++row) {
                 if constexpr (!FIXED4) {
                     if ((unsigned int)row >= M) continue;
                 }
@@ -460,12 +460,12 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch4_impl(
         }
     }
 
-    __shared__ float partial0[4][DP4A_N_PER_BLOCK * 2];
-    __shared__ float partial1[4][DP4A_N_PER_BLOCK * 2];
+    __shared__ float partial0[ROWS][DP4A_N_PER_BLOCK * 2];
+    __shared__ float partial1[ROWS][DP4A_N_PER_BLOCK * 2];
     const unsigned int warp_lane = lane % DP4A_WARP_SIZE;
     const unsigned int warp_in_out = lane / DP4A_WARP_SIZE;
     #pragma unroll
-    for (int row = 0; row < 4; ++row) {
+    for (int row = 0; row < ROWS; ++row) {
         if constexpr (!FIXED4) {
             if ((unsigned int)row >= M) continue;
         }
@@ -485,7 +485,7 @@ __device__ __forceinline__ void w4a16_gemv_dp4a_dual_batch4_impl(
 
     if (valid_n && lane == 0) {
         #pragma unroll
-        for (int row = 0; row < 4; ++row) {
+        for (int row = 0; row < ROWS; ++row) {
             if constexpr (!FIXED4) {
                 if ((unsigned int)row >= M) continue;
             }
@@ -510,7 +510,7 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_dp4a_batch4_impl<true>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
+    w4a16_gemv_dp4a_batch_impl<4, true>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
 }
 
 extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_dyn(
@@ -524,7 +524,7 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_dyn(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_dp4a_batch4_impl<false>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
+    w4a16_gemv_dp4a_batch_impl<4, false>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
 }
 
 // Strided-output twins (`_os`): identical math, but row `row` lands at
@@ -544,7 +544,7 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_os(
     unsigned int K,
     unsigned int C_stride
 ) {
-    w4a16_gemv_dp4a_batch4_impl<true>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, C_stride);
+    w4a16_gemv_dp4a_batch_impl<4, true>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, C_stride);
 }
 
 extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_dyn_os(
@@ -559,7 +559,7 @@ extern "C" __global__ void w4a16_gemv_dp4a_batch4_d4_dyn_os(
     unsigned int K,
     unsigned int C_stride
 ) {
-    w4a16_gemv_dp4a_batch4_impl<false>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, C_stride);
+    w4a16_gemv_dp4a_batch_impl<4, false>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, C_stride);
 }
 
 extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4(
@@ -577,7 +577,7 @@ extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_dp4a_dual_batch4_impl<true>(
+    w4a16_gemv_dp4a_dual_batch_impl<4, true>(
         a_q, a_scale, B0_packed, B0_scale, B0_scale2, C0, B1_packed, B1_scale, B1_scale2, C1, M, N, K);
 }
 
@@ -596,6 +596,78 @@ extern "C" __global__ void w4a16_gemv_dp4a_dual_batch4_d4_dyn(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_dp4a_dual_batch4_impl<false>(
+    w4a16_gemv_dp4a_dual_batch_impl<4, false>(
+        a_q, a_scale, B0_packed, B0_scale, B0_scale2, C0, B1_packed, B1_scale, B1_scale2, C1, M, N, K);
+}
+
+// ── batch8 entry points (DFlash verify rows 5..8) ────────────────────────
+// Same impl, ROWS=8: 8-row acc array + 8-row partial table. The FIXED8
+// variant (m == 8) drops the per-row guard exactly like FIXED4 does;
+// the _dyn variant serves m in 5..7. Quantization input comes from the
+// SAME `quantize_act_int8_g16_batch4_d4` (grid.y = m, no row bound), so
+// row r's int8 codes/scales are identical to the batch4 path.
+extern "C" __global__ void w4a16_gemv_dp4a_batch8_d4(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_batch_impl<8, true>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_batch8_d4_dyn(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_batch_impl<8, false>(a_q, a_scale, B_packed, B_scale, scale2, C, M, N, K, N);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_dual_batch8_d4(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B0_packed,
+    const unsigned char* __restrict__ B0_scale,
+    const float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_dual_batch_impl<8, true>(
+        a_q, a_scale, B0_packed, B0_scale, B0_scale2, C0, B1_packed, B1_scale, B1_scale2, C1, M, N, K);
+}
+
+extern "C" __global__ void w4a16_gemv_dp4a_dual_batch8_d4_dyn(
+    const signed char* __restrict__ a_q,
+    const float* __restrict__ a_scale,
+    const unsigned char* __restrict__ B0_packed,
+    const unsigned char* __restrict__ B0_scale,
+    const float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_dp4a_dual_batch_impl<8, false>(
         a_q, a_scale, B0_packed, B0_scale, B0_scale2, C0, B1_packed, B1_scale, B1_scale2, C1, M, N, K);
 }
