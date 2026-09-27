@@ -276,6 +276,9 @@ impl TransformerModel {
                     conv_state_checkpoint: None,
                     h_state_intermediates: Vec::new(),
                     conv_state_intermediates: Vec::new(),
+                    gdn_commit_qkv: DevicePtr(0),
+                    gdn_commit_gb: DevicePtr(0),
+                    gdn_commit_pending: false,
                     // A freshly allocated slot has just been zeroed, and zero
                     // is zero in both formats. Which format it then HOLDS is
                     // decided by the pool width, not by the phase: under the

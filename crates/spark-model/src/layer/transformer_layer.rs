@@ -59,6 +59,14 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// `gated_delta_rule_commit` handle for the deferred-commit accept path
+    /// (ATLAS_GDN_DEFERRED_COMMIT). KernelHandle(0) on non-GDN layers; the
+    /// accept path only consults it when the layer's `gdn_commit_pending`
+    /// state flag is set.
+    fn gdn_commit_kernel(&self) -> spark_runtime::gpu::KernelHandle {
+        spark_runtime::gpu::KernelHandle(0)
+    }
+
     /// Whether this layer's ONLINE FP8-KV calibration has frozen its scale.
     /// `None` = this layer runs no online calibration (non-attention layer,
     /// static checkpoint scales, or a non-FP8 KV dtype). The scheduler's

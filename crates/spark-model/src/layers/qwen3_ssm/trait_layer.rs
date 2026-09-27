@@ -12,6 +12,10 @@ use super::Qwen3SsmLayer;
 use crate::layer::{ForwardContext, GdnPrefillBuffers, LayerState, TransformerLayer};
 
 impl TransformerLayer for Qwen3SsmLayer {
+    fn gdn_commit_kernel(&self) -> spark_runtime::gpu::KernelHandle {
+        self.gdn_commit_k
+    }
+
     // ── MoE layout transposes ───────────────────────────────────────────
     // qwen4_exp is 36 gated-delta-net layers + 12 full-attention layers, and
     // EVERY one of them carries a 512-expert MoE block. Only

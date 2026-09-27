@@ -77,6 +77,18 @@ pub struct SsmLayerState {
     pub h_state_intermediates: Vec<DevicePtr>,
     /// Intermediate conv_state snapshots during batched verification.
     pub conv_state_intermediates: Vec<DevicePtr>,
+    /// Deferred-commit input staging (ATLAS_GDN_DEFERRED_COMMIT): the
+    /// verify-row conv-out q/k/v (`[K_cap][conv_dim]` BF16) and gate/beta
+    /// (`[K_cap][2*nv]` FP32) rows the wyN kernel consumed, copied here so
+    /// `gated_delta_rule_commit` can replay the accepted prefix after the
+    /// shared ctx.buffers scratch is reused. DevicePtr(0) until the first
+    /// deferred verify on this (layer, slot) allocates it.
+    pub gdn_commit_qkv: DevicePtr,
+    pub gdn_commit_gb: DevicePtr,
+    /// Set by a deferred wyN verify on this layer — `h_state` still holds
+    /// H0 and the accept path must commit via `gated_delta_rule_commit`
+    /// rather than the intermediates index-select. Cleared at commit.
+    pub gdn_commit_pending: bool,
     /// Storage dtype of `h_state`: `false` = FP32, `true` = FP16
     /// (`--ssm-h-dtype f16`).
     ///
