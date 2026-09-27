@@ -273,11 +273,10 @@ extern "C" __global__ void KERNEL_NAME(
     // for arg-layout parity — the masks use q_offset (KV SLOT space) since
     // DFlash compacts the ctx window so slot != absolute position.
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
-    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+    [[maybe_unused]] unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
 #elif !defined(Q_ROPE_POS_OVERRIDE)
-    unsigned int q_rope_pos = q_offset;
+    [[maybe_unused]] unsigned int q_rope_pos = q_offset;
 #endif
-    (void)q_rope_pos;
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
@@ -784,11 +783,10 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     // for arg-layout parity — the masks use q_offset (KV SLOT space) since
     // DFlash compacts the ctx window so slot != absolute position.
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
-    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+    [[maybe_unused]] unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
 #elif !defined(Q_ROPE_POS_OVERRIDE)
-    unsigned int q_rope_pos = q_offset;
+    [[maybe_unused]] unsigned int q_rope_pos = q_offset;
 #endif
-    (void)q_rope_pos;
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
