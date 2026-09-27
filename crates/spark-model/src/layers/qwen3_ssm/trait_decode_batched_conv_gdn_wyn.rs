@@ -33,6 +33,18 @@ impl Qwen3SsmLayer {
         (k.0 != 0).then_some(k)
     }
 
+    /// Deferred-commit eligibility: lever on, wyN band (K=5..16), and both
+    /// `_defer`/`commit` kernels resolved — else the storing path runs.
+    /// Pure + `pub(super)` so the host-side decision is unit-tested.
+    pub(super) fn gdn_defer_active(
+        lever_on: bool,
+        num_tokens: usize,
+        defer_k: KernelHandle,
+        commit_k: KernelHandle,
+    ) -> bool {
+        lever_on && (5..=16).contains(&num_tokens) && defer_k.0 != 0 && commit_k.0 != 0
+    }
+
     /// Fused pool-layout WY verify arm for K = `args.num_tokens`:
     /// conv1d+L2norm epilogue (single fused launch writing every rollback
     /// snapshot inline when `gdn_verify_fused_conv_kn` is present and the
@@ -147,6 +159,48 @@ impl Qwen3SsmLayer {
         let gate_ptr = gates_buf;
         let beta_ptr = gates_buf.offset(nv * fp32);
         let inter_stride_floats = (h_bytes / 4) as u32;
+
+        // ATLAS_GDN_DEFERRED_COMMIT (wyN K=5..16 only): launch the `_defer`
+        // twin — identical outputs, no Hi_t/final-H stores, `h_state` stays
+        // H0 — and stash the verify rows' conv-out + gate/beta into
+        // per-slot staging so `gated_delta_rule_commit` can replay the
+        // accepted prefix after accept. `h_state_intermediates` are unused
+        // under defer (arg kept for the signature; the MODE-1 kernel never
+        // reads it).
+        let defer = Self::gdn_defer_active(
+            ctx.levers.gdn_deferred_commit,
+            num_tokens,
+            (5..=16)
+                .contains(&num_tokens)
+                .then_some(self.gdn_wyn_defer_k[num_tokens - 5])
+                .unwrap_or(KernelHandle(0)),
+            self.gdn_commit_k,
+        );
+        if defer {
+            let qkv_bytes = num_tokens * conv_dim * bf16;
+            let gb_bytes = num_tokens * nv * 2 * fp32;
+            if ssm_state.gdn_commit_qkv.is_null() {
+                // 16-row cap (wyN ceiling); allocated once per layer slot.
+                ssm_state.gdn_commit_qkv = ctx.gpu.alloc(16 * conv_dim * bf16)?;
+                ssm_state.gdn_commit_gb = ctx.gpu.alloc(16 * nv * 2 * fp32)?;
+            }
+            ctx.gpu
+                .copy_d2d_async(conv_out_buf, ssm_state.gdn_commit_qkv, qkv_bytes, stream)?;
+            ctx.gpu
+                .copy_d2d_async(gates_buf, ssm_state.gdn_commit_gb, gb_bytes, stream)?;
+            ssm_state.gdn_commit_pending = true;
+        }
+        let wy_kernel = if defer {
+            self.gdn_wyn_defer_k[num_tokens - 5]
+        } else {
+            wy_kernel
+        };
+        let inter_base = if defer {
+            spark_runtime::gpu::DevicePtr(0)
+        } else {
+            ssm_state.h_state_intermediates[0]
+        };
+        let inter_stride = if defer { 0 } else { inter_stride_floats };
         ops::gdn_decode_wyn(
             ctx.gpu,
             wy_kernel,
@@ -157,8 +211,8 @@ impl Qwen3SsmLayer {
             gate_ptr,
             beta_ptr,
             gdn_out_buf,
-            ssm_state.h_state_intermediates[0],
-            inter_stride_floats,
+            inter_base,
+            inter_stride,
             1, // batch_size
             nk as u32,
             nv as u32,
