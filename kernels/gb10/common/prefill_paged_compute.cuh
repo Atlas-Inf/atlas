@@ -268,10 +268,16 @@ extern "C" __global__ void KERNEL_NAME(
 
     KERNEL_PREAMBLE
 
-    // The masks below work in KV SLOT space (q_offset), not absolute RoPE
-    // position: DFlash compacts its ctx window, so slot != position. The
-    // indirect variants keep q_rope_pos in their arg triple for layout
-    // parity; nothing in this body reads it.
+    // q_rope_pos: absolute RoPE position of the query block (indirect/DFlash
+    // reads it from the arg triple; other variants get q_offset). Retained
+    // for arg-layout parity — the masks use q_offset (KV SLOT space) since
+    // DFlash compacts the ctx window so slot != absolute position.
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+#elif !defined(Q_ROPE_POS_OVERRIDE)
+    unsigned int q_rope_pos = q_offset;
+#endif
+    (void)q_rope_pos;
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
@@ -773,10 +779,16 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
     KERNEL_PREAMBLE
 
-    // The masks below work in KV SLOT space (q_offset), not absolute RoPE
-    // position: DFlash compacts its ctx window, so slot != position. The
-    // indirect variants keep q_rope_pos in their arg triple for layout
-    // parity; nothing in this body reads it.
+    // q_rope_pos: absolute RoPE position of the query block (indirect/DFlash
+    // reads it from the arg triple; other variants get q_offset). Retained
+    // for arg-layout parity — the masks use q_offset (KV SLOT space) since
+    // DFlash compacts the ctx window so slot != absolute position.
+#ifdef PREFILL_BATCHED_INDIRECT_ARGS
+    unsigned int q_rope_pos = batch_indirect_args[b * 3 + 2];
+#elif !defined(Q_ROPE_POS_OVERRIDE)
+    unsigned int q_rope_pos = q_offset;
+#endif
+    (void)q_rope_pos;
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;

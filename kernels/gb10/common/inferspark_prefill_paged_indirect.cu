@@ -46,6 +46,9 @@
                            const unsigned int* __restrict__ kv_len_ptr,        \
                            const unsigned int* __restrict__ q_offset_ptr,      \
                            const unsigned int* __restrict__ q_rope_pos_ptr
+// Signal prefill_paged_compute.cuh that KERNEL_PREAMBLE declares q_rope_pos
+// (avoids the default `q_rope_pos = q_offset` initializer in the .cuh body).
+#define Q_ROPE_POS_OVERRIDE
 #define KERNEL_PREAMBLE                                                         \
     /* Read indirect scalar args via shared memory: thread 0 loads, all wait. */\
     /* 12-byte layout: [kv_len, q_offset, q_rope_pos] each u32.              */\
@@ -57,6 +60,7 @@
     }                                                                           \
     __syncthreads();                                                            \
     kv_len = s_indirect[0];                                                     \
-    q_offset = s_indirect[1];
+    q_offset = s_indirect[1];                                                   \
+    unsigned int q_rope_pos = s_indirect[2];
 
 #include "prefill_paged_compute.cuh"
