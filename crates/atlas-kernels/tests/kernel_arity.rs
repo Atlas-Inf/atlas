@@ -162,6 +162,16 @@ fn dflash2_candidate_selector_arity_pin() {
     );
 }
 
+/// Whether any compiled target carries `module`. The EXL3 modules ship only in
+/// the `qwen3.8-flash-next/exl3` target, which a default (`nvfp4`) build does
+/// not compile; their pins skip there and are run by the kernel-compile job's
+/// dedicated EXL3 step, which also fails if they skip.
+fn module_built(module: &str) -> bool {
+    atlas_kernels::available_targets()
+        .iter()
+        .any(|s| s.modules.iter().any(|(m, _)| *m == module))
+}
+
 /// The EXL3 module is a standalone bundle member (not part of the w4a16 launch
 /// family), so it gets its own pin: the reconstruct entries take four params
 /// (out, packed, packed_blocks_n, packed_n_offset), the had_r128 entries four
@@ -177,6 +187,13 @@ fn exl3_reconstruct_arity_pin() {
         .all(|s| s.modules.is_empty())
     {
         eprintln!("no compiled PTX in this binary (stub build) — arity pin skipped");
+        return;
+    }
+    if !module_built("exl3") {
+        eprintln!(
+            "no compiled target carries the `exl3` module (build the exl3 target: \
+             ATLAS_TARGET_QUANT=exl3) — arity pin skipped"
+        );
         return;
     }
     const ENTRIES: &[(&str, usize)] = &[
