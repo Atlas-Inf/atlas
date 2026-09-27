@@ -327,63 +327,6 @@ fn dense_bf16_nk_matches_cpu_reconstruct() {
     }
 }
 
-/// Both rebuild variants into two outputs, raw bf16 bits equal.
-fn check_dense_bf16_nk_scratch_parity(g: &dyn GpuBackend, k: &Exl3Kernels, t: &Tensor) {
-    let stream = g.default_stream();
-    let (i, o) = (t.shape.in_features, t.shape.out_features);
-    let w = Exl3Weight {
-        trellis: upload(g, &u16_bytes(&t.trellis)),
-        suh: upload(g, &f16_bytes(&t.suh)),
-        svh: upload(g, &f16_bytes(&t.svh)),
-        shape: t.shape,
-    };
-    let outs = [
-        upload(g, &vec![0u8; i * o * 2]),
-        upload(g, &vec![0u8; i * o * 2]),
-    ];
-    let tmps = [
-        upload(g, &vec![0u8; i * o * 2]),
-        upload(g, &vec![0u8; i * o * 2]),
-    ];
-    exl3_dense_bf16_nk(g, k, &w, outs[0], stream).unwrap();
-    exl3_dense_bf16_nk_with_scratch(g, k, &w, outs[1], tmps[0], tmps[1], stream).unwrap();
-    g.synchronize(stream).unwrap();
-    let (a, b) = (
-        download_u16(g, outs[0], i * o),
-        download_u16(g, outs[1], i * o),
-    );
-    let mism: Vec<usize> = (0..a.len()).filter(|&j| a[j] != b[j]).collect();
-    assert!(
-        mism.is_empty(),
-        "{}: {}/{} bf16 bits differ between the allocating and scratch variants; \
-         first 5 (idx, alloc, scratch): {:?}",
-        t.name,
-        mism.len(),
-        a.len(),
-        mism.iter()
-            .take(5)
-            .map(|&j| (j, a[j], b[j]))
-            .collect::<Vec<_>>()
-    );
-    for p in [w.trellis, w.suh, w.svh, outs[0], outs[1], tmps[0], tmps[1]] {
-        g.free(p).unwrap();
-    }
-}
-
-#[test]
-#[ignore = "needs a GB10 GPU and a real kernel build"]
-fn dense_bf16_nk_with_scratch_matches_alloc_variant() {
-    let gpu = gpu();
-    let g: &dyn GpuBackend = &gpu;
-    let k = Exl3Kernels::resolve(g).unwrap();
-    for t in fixture_tensors() {
-        check_dense_bf16_nk_scratch_parity(g, &k, &t);
-    }
-    for t in real_tensors() {
-        check_dense_bf16_nk_scratch_parity(g, &k, &t);
-    }
-}
-
 // The linear-path tests (fp32-accumulate GEMM, relative-norm pinned) live in a
 // sibling file to keep each file under the 500-line cap.
 #[path = "exl3_gpu_linear_tests.rs"]

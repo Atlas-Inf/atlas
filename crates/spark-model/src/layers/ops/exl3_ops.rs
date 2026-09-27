@@ -283,7 +283,14 @@ pub fn exl3_dense_bf16_nk(
     out_bf16: DevicePtr,
     stream: u64,
 ) -> Result<()> {
-    let scratch_bytes = check_dense_shape(&w.shape)?;
+    let (i, o) = (w.shape.in_features, w.shape.out_features);
+    if i % 128 != 0 || o % 128 != 0 {
+        bail!(
+            "EXL3 dense: in_features {i} and out_features {o} must both be multiples of \
+             the 128-wide Hadamard block"
+        );
+    }
+    let scratch_bytes = i * o * 2;
     let a = gpu.alloc(scratch_bytes)?;
     let b = match gpu.alloc(scratch_bytes) {
         Ok(p) => p,
@@ -292,50 +299,24 @@ pub fn exl3_dense_bf16_nk(
             return Err(e);
         }
     };
-    let r = exl3_dense_bf16_nk_with_scratch(gpu, k, w, out_bf16, a, b, stream);
+    // Runs the five steps, then frees both scratch buffers — including when a
+    // step failed (`r` is returned after the frees, so nothing leaks on the
+    // error path).
+    let run = |gpu: &dyn GpuBackend| -> Result<()> {
+        exl3_reconstruct(gpu, k, w, a, stream)?;
+        // W_inner · H · diag(svh): one post pass over the rows of [in, out].
+        exl3_had_r128(gpu, k.had_post, a, a, w.svh, i as u32, o as u32, stream)?;
+        exl3_transpose_f16(gpu, k, a, b, i as u32, o as u32, stream)?;
+        // diag(svh) · H · W_innerᵀ · H: the same pass over the rows of [out, in].
+        exl3_had_r128(gpu, k.had_post, b, b, w.suh, o as u32, i as u32, stream)?;
+        exl3_convert(gpu, k.f16_to_bf16, b, out_bf16, (i * o) as u32, stream)
+    };
     // Scratch must outlive the queued kernels: sync before freeing rather than
     // relying on cuMemFree synchronizing implicitly.
-    let r = r.and_then(|()| gpu.synchronize(stream));
+    let r = run(gpu).and_then(|()| gpu.synchronize(stream));
     gpu.free(a)?;
     gpu.free(b)?;
     r
-}
-
-/// [`exl3_dense_bf16_nk`] on caller-owned scratch: `a` and `b` each `in * out *
-/// 2` bytes of fp16. NO alloc, NO free and NO synchronize — the rebuild runs
-/// entirely as stream-ordered work, so the caller's stream owns the scratch's
-/// lifetime (see `exl3_bf16_pool`). Same kernels in the same order as the
-/// allocating variant: the numerics are identical bit for bit.
-pub fn exl3_dense_bf16_nk_with_scratch(
-    gpu: &dyn GpuBackend,
-    k: &Exl3Kernels,
-    w: &Exl3Weight,
-    out_bf16: DevicePtr,
-    a: DevicePtr,
-    b: DevicePtr,
-    stream: u64,
-) -> Result<()> {
-    let (i, o) = (w.shape.in_features, w.shape.out_features);
-    check_dense_shape(&w.shape)?;
-    exl3_reconstruct(gpu, k, w, a, stream)?;
-    // W_inner · H · diag(svh): one post pass over the rows of [in, out].
-    exl3_had_r128(gpu, k.had_post, a, a, w.svh, i as u32, o as u32, stream)?;
-    exl3_transpose_f16(gpu, k, a, b, i as u32, o as u32, stream)?;
-    // diag(svh) · H · W_innerᵀ · H: the same pass over the rows of [out, in].
-    exl3_had_r128(gpu, k.had_post, b, b, w.suh, o as u32, i as u32, stream)?;
-    exl3_convert(gpu, k.f16_to_bf16, b, out_bf16, (i * o) as u32, stream)
-}
-
-/// Shape gate for the dense rebuild; returns the per-buffer scratch bytes.
-fn check_dense_shape(sh: &crate::weight_map::exl3::Exl3Shape) -> Result<usize> {
-    let (i, o) = (sh.in_features, sh.out_features);
-    if i % 128 != 0 || o % 128 != 0 {
-        bail!(
-            "EXL3 dense: in_features {i} and out_features {o} must both be multiples of \
-             the 128-wide Hadamard block"
-        );
-    }
-    Ok(i * o * 2)
 }
 
 #[cfg(all(test, feature = "cuda"))]

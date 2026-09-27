@@ -11,11 +11,9 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use crate::layers::ops::{
-    Exl3Bf16Sizes, Exl3Int8Kernels, Exl3Int8Workspace, Exl3Kernels, exl3_bf16_scratch,
-    exl3_dense_bf16_nk_with_scratch, exl3_int8_linear_bf16, exl3_int8_linear_bf16_rows, sq_grid,
-    sq_plan,
+    Exl3Int8Kernels, Exl3Int8Workspace, Exl3Kernels, exl3_int8_linear_bf16,
+    exl3_int8_linear_bf16_rows, sq_grid, sq_plan,
 };
-use crate::weight_map::DenseWeight;
 use crate::weight_map::exl3::Exl3Weight;
 
 use super::Qwen3SsmLayer;
@@ -35,10 +33,6 @@ pub struct Exl3GdnDecode {
     a_had: DevicePtr,
     c_f32: DevicePtr,
     grid: u32,
-    /// M6f: the BF16 copies of `qkv`/`z`/`out` are freed; prefill and the wide
-    /// paths ask the layer to rebuild them on demand (see
-    /// [`Self::rebuild_qkvz_bf16`]). False keeps the resident copies.
-    lazy: bool,
 }
 
 impl Exl3GdnDecode {
@@ -95,56 +89,7 @@ impl Exl3GdnDecode {
             a_had,
             c_f32,
             grid,
-            lazy: false,
         })
-    }
-
-    /// M6f-b flips this on after freeing the BF16 copies; until then the
-    /// resident weights keep serving the BF16 paths.
-    pub fn set_lazy(&mut self, on: bool) {
-        self.lazy = on;
-    }
-
-    pub fn is_lazy(&self) -> bool {
-        self.lazy
-    }
-
-    /// The scratch regions [`Self::rebuild_qkvz_bf16`] /
-    /// [`Self::rebuild_out_bf16`] need (bytes).
-    pub fn bf16_sizes(&self) -> Exl3Bf16Sizes {
-        let bytes = |w: &Exl3Weight| w.shape.in_features * w.shape.out_features * 2;
-        Exl3Bf16Sizes {
-            qkvz_bytes: bytes(&self.qkv) + bytes(&self.z),
-            out_bytes: bytes(&self.out),
-            tmp_bytes: bytes(&self.qkv).max(bytes(&self.z)).max(bytes(&self.out)),
-        }
-    }
-
-    /// Rebuild the fused qkvz BF16 `[qkv.out + z.out, in]` into the stream's
-    /// pooled scratch and return it. Stream-ordered: the caller's later GEMM on
-    /// the same stream reads it without any sync.
-    pub fn rebuild_qkvz_bf16(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<DevicePtr> {
-        let s = exl3_bf16_scratch(gpu, stream, &self.bf16_sizes())?;
-        exl3_dense_bf16_nk_with_scratch(gpu, &self.k, &self.qkv, s.qkvz, s.tmp_a, s.tmp_b, stream)?;
-        let z_rows = self.qkv.shape.out_features * self.qkv.shape.in_features * 2;
-        exl3_dense_bf16_nk_with_scratch(
-            gpu,
-            &self.k,
-            &self.z,
-            s.qkvz.offset(z_rows),
-            s.tmp_a,
-            s.tmp_b,
-            stream,
-        )?;
-        Ok(s.qkvz)
-    }
-
-    /// Rebuild the out_proj BF16 `[out.out, out.in]` into the stream's pooled
-    /// scratch and return it. See [`Self::rebuild_qkvz_bf16`].
-    pub fn rebuild_out_bf16(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<DevicePtr> {
-        let s = exl3_bf16_scratch(gpu, stream, &self.bf16_sizes())?;
-        exl3_dense_bf16_nk_with_scratch(gpu, &self.k, &self.out, s.out, s.tmp_a, s.tmp_b, stream)?;
-        Ok(s.out)
     }
 
     /// Total rows of the [Q|K|V|Z] projection (qkv rows then z rows,
@@ -290,52 +235,8 @@ impl Qwen3SsmLayer {
         let w = |name: &str| {
             crate::weight_map::exl3::exl3_from_store(store, &format!("{p}.{name}"), gpu)
         };
-        let mut d = Exl3GdnDecode::new(gpu, w("in_proj_qkv")?, w("in_proj_z")?, w("out_proj")?)?;
-        // M6f-b frees the BF16 copies here (ATLAS_EXL3_LAZY_BF16); until then
-        // the resident weights keep serving every BF16 path.
-        d.set_lazy(crate::weight_map::exl3::exl3_lazy_bf16());
+        let d = Exl3GdnDecode::new(gpu, w("in_proj_qkv")?, w("in_proj_z")?, w("out_proj")?)?;
         self.set_exl3_decode(d);
         Ok(true)
-    }
-
-    /// The BF16 qkvz weight for the wide (prefill / verify) paths: the resident
-    /// copy, or a rebuild into the stream's scratch once the overlay is lazy.
-    /// The returned pointer's contents are stream-ordered against the caller's
-    /// work on `stream`. M6f-a plumbing: M6f-b routes the BF16 call sites here.
-    #[allow(dead_code)]
-    pub(crate) fn qkvz_bf16(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<DenseWeight> {
-        if let Some(e) = self.exl3_decode.as_deref()
-            && e.is_lazy()
-        {
-            return Ok(DenseWeight {
-                weight: e.rebuild_qkvz_bf16(gpu, stream)?,
-            });
-        }
-        Ok(self.ssm.in_proj_qkvz)
-    }
-
-    /// The BF16 out_proj weight, lazy variant of [`Self::qkvz_bf16`].
-    #[allow(dead_code)]
-    pub(crate) fn out_proj_bf16(
-        &self,
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Result<Option<DenseWeight>> {
-        if let Some(e) = self.exl3_decode.as_deref()
-            && e.is_lazy()
-        {
-            return Ok(Some(DenseWeight {
-                weight: e.rebuild_out_bf16(gpu, stream)?,
-            }));
-        }
-        Ok(self.out_proj_dense)
-    }
-
-    /// Whether a BF16 qkvz is obtainable: the resident copy, or a lazy overlay
-    /// that can rebuild one.
-    #[allow(dead_code)]
-    pub(crate) fn has_qkvz_bf16(&self) -> bool {
-        self.exl3_decode.as_deref().is_some_and(|e| e.is_lazy())
-            || !self.ssm.in_proj_qkvz.weight.is_null()
     }
 }
