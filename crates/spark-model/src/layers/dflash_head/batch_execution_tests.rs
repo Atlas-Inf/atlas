@@ -241,6 +241,15 @@ fn batched_selector_is_one_launch_with_fallback() {
         src.matches("ops::dflash2_candidate_selector(").count() == 1,
         "the per-seq fallback launch must remain"
     );
+    // Both entry points must stay exported: the per-seq symbol is an
+    // audited load-time lookup, so dropping it refuses boot (job 610).
+    for cu in [
+        include_str!("../../../../../kernels/gb10/common/dflash2_candidate_selector.cu"),
+        include_str!("../../../../../kernels/strix-hip/common/dflash2_candidate_selector.cu"),
+    ] {
+        assert!(cu.contains("extern \"C\" __global__ void dflash2_candidate_selector("));
+        assert!(cu.contains("extern \"C\" __global__ void dflash2_candidate_selector_batched("));
+    }
 }
 
 /// Pure table for the NVFP4 drafter LM-head wave kernel: ≤4→batch4,
