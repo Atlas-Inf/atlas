@@ -21,12 +21,20 @@ use crate::weight_map::exl3::exl3_from_store;
 /// The four tensors one packed EXL3 linear arrives as.
 const PACKED_SUFFIXES: [&str; 4] = ["trellis", "suh", "svh", "mul1"];
 
-/// `ATLAS_EXL3_NATIVE_DECODE=1`: GDN decode runs the int8 sq GEMV on the
-/// packed EXL3 weights instead of the BF16 materialized copies, so those
-/// tensors must survive materialize. Read once.
+static NATIVE_DECODE: OnceLock<bool> = OnceLock::new();
+
+/// Record `--exl3-native-decode` at serve startup, before any model loads.
+/// The first call wins; returns the value in force.
+pub fn set_exl3_native_decode(on: bool) -> bool {
+    *NATIVE_DECODE.get_or_init(|| on)
+}
+
+/// Native EXL3 decode (`--exl3-native-decode`): GDN, attention and LM-head
+/// decode run the int8 sq GEMV on the packed EXL3 weights instead of the BF16
+/// materialized copies, so those tensors must survive materialize. Off unless
+/// the serve flag set it (tests and tools that never call the setter get off).
 pub fn exl3_native_decode() -> bool {
-    static ONCE: OnceLock<bool> = OnceLock::new();
-    *ONCE.get_or_init(|| std::env::var("ATLAS_EXL3_NATIVE_DECODE").ok().as_deref() == Some("1"))
+    NATIVE_DECODE.get().copied().unwrap_or(false)
 }
 
 /// `ATLAS_EXL3_LAZY_BF16=1` (with native decode): the GDN BF16 copies are
@@ -55,34 +63,9 @@ pub(crate) fn keeps_packed_with(stem: &str, native: bool) -> bool {
             || stem == "lm_head")
 }
 
-/// Which overlay group a kept stem feeds: 0 = GDN, 1 = attention, 2 = LM head.
-fn native_part(stem: &str) -> usize {
-    if stem.contains(".linear_attn.") {
-        0
-    } else if stem.contains(".self_attn.") {
-        1
-    } else {
-        2
-    }
-}
-
-/// `ATLAS_EXL3_NATIVE_PARTS` (diagnostic): comma list of `gdn`, `attn`,
-/// `lm_head` naming the overlay groups to install; unset means all three.
-/// Read once.
-fn native_parts() -> [bool; 3] {
-    static ONCE: OnceLock<[bool; 3]> = OnceLock::new();
-    *ONCE.get_or_init(|| match std::env::var("ATLAS_EXL3_NATIVE_PARTS") {
-        Ok(v) => {
-            let has = |k: &str| v.split(',').any(|p| p.trim() == k);
-            [has("gdn"), has("attn"), has("lm_head")]
-        }
-        Err(_) => [true; 3],
-    })
-}
-
-/// [`keeps_packed_with`] with the env gate (and the diagnostic parts filter) applied.
+/// [`keeps_packed_with`] with the serve flag applied.
 pub(crate) fn keeps_packed(stem: &str) -> bool {
-    keeps_packed_with(stem, exl3_native_decode()) && native_parts()[native_part(stem)]
+    keeps_packed_with(stem, exl3_native_decode())
 }
 
 /// Stems (name minus `.trellis`) of the DENSE packed linears in `names`,

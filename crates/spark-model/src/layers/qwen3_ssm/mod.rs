@@ -83,7 +83,7 @@ pub struct Qwen3SsmLayer {
     qkvz_fp8w_rowwise: Option<Fp8Weight>,
     out_proj_fp8w_rowwise: Option<Fp8Weight>,
     /// Decode-only native EXL3 overlay: int8 sq GEMV on the packed GDN
-    /// projections (`ATLAS_EXL3_NATIVE_DECODE=1`). Prefill keeps the BF16 copies.
+    /// projections (`--exl3-native-decode`). Prefill keeps the BF16 copies.
     pub(crate) exl3_decode: Option<Box<exl3_decode::Exl3GdnDecode>>,
     /// Tier-1c keep-packed ternary Q2_0 fused in_proj_qkvz (`ATLAS_GGUF_NATIVE_Q2`).
     /// [Q|K|V|Z] rows byte-concatenated from packed `in_proj_qkv` (V-region

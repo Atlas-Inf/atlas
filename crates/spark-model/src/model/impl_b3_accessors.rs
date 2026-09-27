@@ -129,7 +129,7 @@ impl TransformerModel {
     }
 
     /// Install the native EXL3 LM head decode overlay
-    /// (`ATLAS_EXL3_NATIVE_DECODE=1`). Once set, the 1- and 2-row `lm_head`
+    /// (`--exl3-native-decode`). Once set, the 1- and 2-row `lm_head`
     /// forwards run the int8 sq GEMV on the packed weight; wider calls keep
     /// the BF16 copy.
     pub fn set_lm_head_exl3(&mut self, d: crate::layers::ops::Exl3LinearDecode) {

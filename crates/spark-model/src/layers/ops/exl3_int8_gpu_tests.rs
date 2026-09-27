@@ -278,8 +278,8 @@ fn int8_workspace_counters_reset() {
 }
 
 /// Microseconds per sq GEMV call and the effective weight bandwidth, per case
-/// and m. Informational (no assertion): run it with different
-/// `ATLAS_EXL3_SQ_BLOCKS_PER_SM` values to pick the grid.
+/// and m. Informational (no assertion): change `SQ_BLOCKS_PER_SM` in
+/// `exl3_int8_ops.rs` and rerun to compare grids.
 #[test]
 #[ignore = "needs a GB10 GPU and a real kernel build"]
 fn int8_sq_timing() {

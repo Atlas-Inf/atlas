@@ -70,7 +70,7 @@ pub struct TransformerModel {
     pub(super) final_norm_identity: bool,
     pub(super) lm_head_weight: DenseWeight,
     /// Native EXL3 LM head (packed int8 sq GEMV) for decode / MTP verify,
-    /// installed by the factory under `ATLAS_EXL3_NATIVE_DECODE=1` when the
+    /// installed by the factory under `--exl3-native-decode` when the
     /// checkpoint packs `lm_head` as EXL3. Additive: when `None`, the
     /// FP8/NVFP4/BF16 dispatch is byte-identical to before.
     pub(super) lm_head_exl3: Option<Box<crate::layers::ops::Exl3LinearDecode>>,

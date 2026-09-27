@@ -5,7 +5,7 @@
 //! PACKED EXL3 weights (int8 activations), so decode never touches the BF16
 //! materialized copies. PREFILL is unchanged and keeps the BF16 weights.
 //! Installed by `build_linear_attention_dense_bf16` under
-//! `ATLAS_EXL3_NATIVE_DECODE=1` (see `weight_map::exl3::materialize`).
+//! `--exl3-native-decode` (see `weight_map::exl3::materialize`).
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -275,7 +275,7 @@ impl Qwen3SsmLayer {
 
     /// Install the overlay from the packed GDN projections of `lp` if they
     /// are still in `store` (they only survive materialize under
-    /// `ATLAS_EXL3_NATIVE_DECODE=1`). Returns whether it was installed.
+    /// `--exl3-native-decode`). Returns whether it was installed.
     pub fn attach_exl3_decode_from_store(
         &mut self,
         store: &spark_runtime::weights::WeightStore,

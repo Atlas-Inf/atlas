@@ -2,7 +2,7 @@
 
 //! Decode-only native EXL3 overlay for the full-attention q/k/v/o projections.
 //!
-//! Under `ATLAS_EXL3_NATIVE_DECODE=1` the packed four of these stems survive
+//! Under `--exl3-native-decode` the packed four of these stems survive
 //! materialize (see `weight_map::exl3::keeps_packed_with`); this attaches the
 //! int8 sq GEMV overlays that consume them for single-token decode and
 //! narrow (n <= 2) verify. Prefill and wider batches keep the BF16 copies.

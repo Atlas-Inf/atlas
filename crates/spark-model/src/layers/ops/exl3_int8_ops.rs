@@ -20,8 +20,6 @@
 //! upstream's `exl3_gemv_int8_sq` (exllamav3/exllamav3_ext/quant/
 //! exl3_gemv_int8.cu) for m <= 2, residual = false, half_k = false.
 
-use std::sync::OnceLock;
-
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
@@ -104,24 +102,15 @@ pub fn sq_plan(k: usize, n: usize, m: u32, bits: u32, grid: u32) -> Result<SqPla
     })
 }
 
-/// `ATLAS_EXL3_SQ_BLOCKS_PER_SM`, clamped to 1..=8, read once — Atlas has no
-/// occupancy query, so the blocks-per-SM of upstream's occupancy call is an
-/// env knob (upstream's natural allocation is 2-3 resident blocks/SM).
-fn sq_blocks_per_sm() -> u32 {
-    static ONCE: OnceLock<u32> = OnceLock::new();
-    *ONCE.get_or_init(|| {
-        std::env::var("ATLAS_EXL3_SQ_BLOCKS_PER_SM")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(2)
-            .clamp(1, 8)
-    })
-}
+/// Resident sq blocks per SM. Atlas has no occupancy query, so this stands in
+/// for upstream's occupancy call; upstream's natural allocation on GB10 is 2-3,
+/// and 2 measured best here (the `int8_sq_timing` GPU test compares values).
+const SQ_BLOCKS_PER_SM: u32 = 2;
 
 /// The grid for every sq call on this device: `min(blocks_per_sm * sm_count, 1024)`.
 /// The SAME grid serves m = 1 and m = 2.
 pub fn sq_grid(sm_count: u32) -> u32 {
-    (sq_blocks_per_sm() * sm_count).min(1024)
+    (SQ_BLOCKS_PER_SM * sm_count).min(1024)
 }
 
 /// The `exl3_int8` module's kernels, resolved once per backend.

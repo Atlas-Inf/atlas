@@ -110,7 +110,7 @@ pub struct Qwen3AttentionLayer {
     /// Nvidia ModelOpt's official ignore list.
     pub(super) o_dense_bf16: Option<DenseWeight>,
     /// Decode-only native EXL3 overlay (packed int8 sq GEMV for q/k/v/o).
-    /// Installed under `ATLAS_EXL3_NATIVE_DECODE=1`; `None` otherwise.
+    /// Installed under `--exl3-native-decode`; `None` otherwise.
     pub(crate) exl3_attn: Option<Box<super::exl3_decode::Exl3AttnDecode>>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,

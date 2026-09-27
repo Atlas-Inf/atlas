@@ -4,7 +4,7 @@
 //! the 1- and 2-row forwards run the int8 sq GEMV on the PACKED EXL3 weight,
 //! so decode and MTP verify never touch the BF16 materialized copy. Anything
 //! wider (prompt scoring, wide verify) keeps the BF16 weight. Installed by the
-//! factory under `ATLAS_EXL3_NATIVE_DECODE=1` (see `weight_map::exl3::
+//! factory under `--exl3-native-decode` (see `weight_map::exl3::
 //! materialize`); the pattern mirrors `Exl3GdnDecode`.
 
 use anyhow::Result;
