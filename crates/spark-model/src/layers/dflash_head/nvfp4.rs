@@ -212,17 +212,7 @@ impl BlockDiffusionDraftHead {
             && let Some(k) = nvfp4_kernel
             && k.0 != 0
         {
-            return ops::w4a16_gemv_batchm(
-                gpu,
-                k,
-                src,
-                w,
-                dst,
-                m,
-                n_out,
-                k_in,
-                stream,
-            );
+            return ops::w4a16_gemv_batchm(gpu, k, src, w, dst, m, n_out, k_in, stream);
         }
         if matches!(self.quant, DflashQuantization::Fp8Weights)
             && let Some(fp8) = w_fp8
