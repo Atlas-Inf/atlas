@@ -170,10 +170,11 @@ impl Qwen3SsmLayer {
         let defer = Self::gdn_defer_active(
             ctx.levers.gdn_deferred_commit,
             num_tokens,
-            (5..=16)
-                .contains(&num_tokens)
-                .then_some(self.gdn_wyn_defer_k[num_tokens - 5])
-                .unwrap_or(KernelHandle(0)),
+            if (5..=16).contains(&num_tokens) {
+                self.gdn_wyn_defer_k[num_tokens - 5]
+            } else {
+                KernelHandle(0)
+            },
             self.gdn_commit_k,
         );
         if defer {
