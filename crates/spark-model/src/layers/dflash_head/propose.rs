@@ -32,6 +32,9 @@ impl BlockDiffusionDraftHead {
     ) -> Result<Vec<u32>> {
         let default_stream = ctx.gpu.default_stream();
         let (_, scratch, markov_embed, markov_bias) = self.lane(0, default_stream);
+        // #58: carve cursor reset — this call's readback completes all
+        // pinned-region H2Ds before the next propose overwrites them.
+        Self::ctx_positions_reset(scratch);
         self.propose_drafts_on_lane(
             scratch,
             markov_embed,
@@ -676,6 +679,13 @@ impl BlockDiffusionDraftHead {
         let lanes_n = self.lane_count();
         let cap = self.draft_cap(num_drafts);
         let default_stream = ctx.gpu.default_stream();
+        // #58: every lane's pinned carve region resets once per propose —
+        // the deferred-draft readback below completes all enqueued H2Ds
+        // before the next call reuses them.
+        Self::ctx_positions_reset(&self.scratch);
+        for l in &self.extra_lanes {
+            Self::ctx_positions_reset(&l.scratch);
+        }
         ctx.gpu
             .record_event(self.lanes_start_event, default_stream)?;
         for l in &self.extra_lanes {

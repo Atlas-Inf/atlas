@@ -182,14 +182,38 @@ impl BlockDiffusionDraftHead {
         // (forward_block_layer_pre_attn), which runs after precompute returns.
         debug_assert_eq!(slot_positions.len(), new_ctx_count);
         {
-            let repeated_bytes: Vec<u8> = slot_positions
-                .iter()
-                .cloned()
-                .cycle()
-                .take(l_total * new_ctx_count)
-                .flat_map(|p: i32| p.to_le_bytes())
-                .collect();
-            gpu.copy_h2d(&repeated_bytes, scratch.norm_buf)?;
+            // #58: stage into the lane's pinned region and ship with
+            // copy_h2d_async_retained — the old pageable copy_h2d was a
+            // per-sequence cuStreamSynchronize (a ~full drain per call).
+            // Overflow of the carve region falls back to that same sync
+            // path — correctness identical, only the drain returns.
+            let bytes = l_total * new_ctx_count * 4;
+            match Self::ctx_positions_region(scratch, bytes) {
+                Some(region) => {
+                    // SAFETY: `ctx_positions_region` returned `bytes` of the
+                    // page-locked buffer; regions are exclusive per carve so
+                    // no other writer races this slice before the next
+                    // stream sync (the step's readback `synchronize`).
+                    let staging = unsafe { std::slice::from_raw_parts_mut(region, bytes) };
+                    for (chunk, p) in staging
+                        .chunks_mut(4)
+                        .zip(slot_positions.iter().cloned().cycle())
+                    {
+                        chunk.copy_from_slice(&p.to_le_bytes());
+                    }
+                    gpu.copy_h2d_async_retained(staging, scratch.norm_buf, stream)?;
+                }
+                None => {
+                    let repeated_bytes: Vec<u8> = slot_positions
+                        .iter()
+                        .cloned()
+                        .cycle()
+                        .take(l_total * new_ctx_count)
+                        .flat_map(|p: i32| p.to_le_bytes())
+                        .collect();
+                    gpu.copy_h2d(&repeated_bytes, scratch.norm_buf)?;
+                }
+            }
         }
 
         // ── Step 5: compact all L layers' K → all_k_stage ────────────
@@ -207,7 +231,10 @@ impl BlockDiffusionDraftHead {
                     .fused_kv_out
                     .offset(row * row_stride + l * 2 * kv_slab_bytes);
                 let k_dst = all_k_stage.offset((l * new_ctx_count + row) * kv_slab_bytes);
-                gpu.copy_d2d(k_src, k_dst, kv_slab_bytes)?;
+                // #58: stream-ordered async — downstream k_norm/rope/
+                // reshape_and_cache run on this same stream, so the drain
+                // the sync copy_d2d paid bought nothing.
+                gpu.copy_d2d_async(k_src, k_dst, kv_slab_bytes, stream)?;
             }
         }
 
@@ -279,7 +306,9 @@ impl BlockDiffusionDraftHead {
                     .fused_kv_out
                     .offset(row * row_stride + l * 2 * kv_slab_bytes + kv_slab_bytes);
                 let v_dst = v_stage.offset(row * kv_slab_bytes);
-                gpu.copy_d2d(v_src, v_dst, kv_slab_bytes)?;
+                // #58: stream-ordered async — reshape_and_cache consumes
+                // v_stage on this same stream.
+                gpu.copy_d2d_async(v_src, v_dst, kv_slab_bytes, stream)?;
             }
 
             if dump && l == 0 {
@@ -312,5 +341,100 @@ impl BlockDiffusionDraftHead {
         }
 
         Ok(())
+    }
+}
+
+impl BlockDiffusionDraftHead {
+    /// #58: carve `bytes` from the lane scratch's pinned position-staging
+    /// region. Returns the region start pointer, or `None` on overflow —
+    /// callers fall back to the synchronous `copy_h2d` in that case.
+    ///
+    /// The cursor is reset at each public propose entry (`propose_drafts`,
+    /// `propose_on_lanes`, `propose_batch`). Reuse across calls is safe
+    /// because every propose ends in the step's readback
+    /// (`synchronize` + `copy_d2h` of the drafted tokens), which completes
+    /// all enqueued `copy_h2d_async_retained` copies before the next call
+    /// overwrites the region.
+    pub(super) fn ctx_positions_region(scratch: &DflashScratch, bytes: usize) -> Option<*mut u8> {
+        let base = scratch
+            .ctx_positions_host_pinned
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if base.is_null() {
+            return None;
+        }
+        carve_region(
+            &scratch.ctx_positions_cursor,
+            scratch.ctx_positions_pinned_bytes,
+            bytes,
+        )
+        .map(|off| unsafe { base.add(off) })
+    }
+
+    /// Reset this lane scratch's carve cursor — call at each public
+    /// propose entry (see `ctx_positions_region` for the lifetime rule).
+    pub(super) fn ctx_positions_reset(scratch: &DflashScratch) {
+        scratch
+            .ctx_positions_cursor
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Pure bookkeeping for the pinned carve: returns the offset of a fresh
+/// `bytes`-sized region, or `None` when the buffer is exhausted. Atomic so
+/// propose lanes sharing a scratch's staging can carve without a lock.
+fn carve_region(
+    cursor: &std::sync::atomic::AtomicUsize,
+    capacity: usize,
+    bytes: usize,
+) -> Option<usize> {
+    let mut cur = cursor.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = cur.checked_add(bytes)?;
+        if next > capacity {
+            return None;
+        }
+        match cursor.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(cur),
+            Err(c) => cur = c,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::carve_region;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn carve_region_layout_and_overflow() {
+        let cursor = AtomicUsize::new(0);
+        // Two equal regions pack adjacently, like per-sequence carves.
+        assert_eq!(carve_region(&cursor, 64, 32), Some(0));
+        assert_eq!(carve_region(&cursor, 64, 32), Some(32));
+        // Third overflows -> None (callers take the sync-copy fallback).
+        assert_eq!(carve_region(&cursor, 64, 32), None);
+        assert_eq!(carve_region(&cursor, 64, 1), None);
+        // Unaligned is fine — byte offsets, not slots.
+        let cursor = AtomicUsize::new(0);
+        assert_eq!(carve_region(&cursor, 10, 4), Some(0));
+        assert_eq!(carve_region(&cursor, 10, 4), Some(4));
+        assert_eq!(carve_region(&cursor, 10, 4), None);
+        // Zero bytes always carves at the cursor.
+        assert_eq!(carve_region(&cursor, 10, 0), Some(8));
+    }
+
+    #[test]
+    fn precompute_uses_no_sync_row_copies() {
+        // Structural pin for #58: the K/V row-compaction loops and the
+        // position upload must never again pay a per-row pipeline drain.
+        let src = include_str!("precompute_ctx_kv.rs");
+        assert_eq!(src.matches("gpu.copy_d2d(").count(), 0);
+        // The only sync copy left is the overflow fallback in Step 4.
+        assert_eq!(src.matches("gpu.copy_h2d(").count(), 1);
     }
 }

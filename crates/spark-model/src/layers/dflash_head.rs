@@ -214,6 +214,19 @@ pub struct DflashScratch {
     /// so a captured H2D (if any) would still be valid; we keep the
     /// H2D outside the graph anyway.
     pub markov_prev_host_pinned: std::sync::atomic::AtomicPtr<u8>,
+    /// #58: pinned host staging for `precompute_ctx_kv` Step-4 position
+    /// arrays. `precompute` writes its repeated positions here and ships
+    /// them with `copy_h2d_async_retained` — no per-sequence stream drain.
+    /// Regions are carved by `ctx_positions_cursor` (reset at each public
+    /// propose entry); the step's readback sync completes the copies
+    /// before the next call reuses the region.
+    pub ctx_positions_host_pinned: std::sync::atomic::AtomicPtr<u8>,
+    /// Capacity of `ctx_positions_host_pinned` in bytes.
+    pub ctx_positions_pinned_bytes: usize,
+    /// Running carve offset into `ctx_positions_host_pinned`; see the
+    /// reset sites in `propose_drafts` / `propose_on_lanes` /
+    /// `propose_batch`.
+    pub ctx_positions_cursor: std::sync::atomic::AtomicUsize,
     /// `[ctx_window + γ]` i32 positions. First ctx_window are
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
@@ -584,6 +597,13 @@ pub struct BlockDiffusionDraftHead {
     /// `batch_capacity × ceil(vocab/32)` i32 — per-sequence grammar masks
     /// packed for the staged tail's row-0/1 masking (#102).
     pub batch_grammar_bitmask: DevicePtr,
+    /// #58: pinned host staging for those per-sequence masks — sequence i
+    /// writes slot `i × ceil(vocab/32) × 4` and ships it with
+    /// `copy_h2d_async_retained` (no per-seq drain). Slots are rewritten
+    /// next propose; the step's readback sync completes the copies first.
+    pub batch_grammar_masks_host_pinned: std::sync::atomic::AtomicPtr<u8>,
+    /// Total capacity of `batch_grammar_masks_host_pinned` in bytes.
+    pub batch_grammar_masks_pinned_bytes: usize,
     pub batch_tokens: DevicePtr,
     pub batch_markov_prev: DevicePtr,
     pub batch_markov_embed: DevicePtr,
@@ -932,6 +952,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let n = last_tokens.len();
         let mask_of =
             |i: usize| -> Option<&[i32]> { grammar_bitmasks.and_then(|ms| ms.get(i)?.as_deref()) };
+        // #58: reset the lane-0 carve cursor — the staged prepare loop
+        // carves each sequence's position array from this region; the
+        // batched-token readback below completes every enqueued H2D
+        // before the next propose reuses it.
+        Self::ctx_positions_reset(&self.scratch);
         let expected_owners = expected_owners
             .ok_or_else(|| anyhow::anyhow!("DFlash batched propose requires expected owners"))?;
         // Preserve the historical n<2 fallback, but only after the complete
