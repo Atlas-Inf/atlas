@@ -41,30 +41,14 @@ pub fn dp4a_enabled() -> bool {
 /// thread for 2x memory-level parallelism. Default ON on HIP; the vl2 kernels
 /// only exist in the strix-hip target, so non-HIP callers never resolve them.
 /// Bit-identical outputs; A/B from one binary.
-/// `ATLAS_GEMV_VL2` selects the virtual-lane (VLANES=2) verify-GEMV mode:
-/// `0` = off, unset/`1` = `Fixed` (the `_vl2` twins, compile-time M==8),
-/// `dyn` = `Dyn` (the `_dyn_vl2` twins — runtime-guarded M, but the leaner
-/// register profile). Bit-identical outputs either way; the mode exists so
-/// one binary can A/B all three arms. vl2 kernels exist only in the
-/// strix-hip target, so non-HIP callers never resolve them.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GemvVl2Mode {
-    Off,
-    Fixed,
-    Dyn,
-}
-
-pub fn gemv_vl2_mode() -> GemvVl2Mode {
-    static MODE: std::sync::OnceLock<GemvVl2Mode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("ATLAS_GEMV_VL2").as_deref() {
-        Ok("0") => GemvVl2Mode::Off,
-        Ok("dyn") => GemvVl2Mode::Dyn,
-        _ => GemvVl2Mode::Fixed,
-    })
-}
-
+/// `ATLAS_GEMV_VL2=0` kills the virtual-lane (VLANES=2) verify GEMV tier —
+/// the `*_vl2` kernels map two of the original 64 logical lanes onto one
+/// physical thread for 2x memory-level parallelism. Default ON on HIP; the
+/// vl2 kernels exist only in the strix-hip target, so non-HIP callers never
+/// resolve them. Bit-identical outputs; A/B from one binary.
 pub fn gemv_vl2_enabled() -> bool {
-    gemv_vl2_mode() != GemvVl2Mode::Off
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("ATLAS_GEMV_VL2").as_deref() != Ok("0"))
 }
 
 /// Eligibility for the guard-free M=4 DP4A batch4 GEMV arm. `m` must be
@@ -267,36 +251,8 @@ pub fn w4a16_gemv_dp4a_batch4_os(
         .launch(stream)
 }
 
-/// vl2 twins of the batch8 DP4A GEMVs: identical args and signature, but the
-/// kernel covers 8 outputs per 256-thread block — grid `ceil(n/8)`.
-#[allow(clippy::too_many_arguments)]
-pub fn w4a16_gemv_dp4a_batch8_vl2(
-    gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
-    a_q: DevicePtr,
-    a_scale: DevicePtr,
-    weight: &QuantizedWeight,
-    output: DevicePtr,
-    m: u32,
-    n: u32,
-    k: u32,
-    stream: u64,
-) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 8), 1, 1])
-        .block([256, 1, 1])
-        .arg_ptr(a_q)
-        .arg_ptr(a_scale)
-        .arg_ptr(weight.weight)
-        .arg_ptr(weight.weight_scale)
-        .arg_f32(weight.weight_scale_2)
-        .arg_ptr(output)
-        .arg_u32(m)
-        .arg_u32(n)
-        .arg_u32(k)
-        .launch(stream)
-}
-
+/// vl2 twin of the batch8 DP4A dual GEMV: identical args and signature, but
+/// the kernel covers 8 outputs per 256-thread block — grid `ceil(n/8)`.
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_gemv_dp4a_dual_batch8_vl2(
     gpu: &dyn GpuBackend,

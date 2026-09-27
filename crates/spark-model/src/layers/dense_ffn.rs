@@ -136,12 +136,9 @@ pub struct DenseFfnLayer {
     dp4a_dual_batch8_k: KernelHandle,
     dp4a_gemv_batch8_dyn_k: KernelHandle,
     dp4a_dual_batch8_dyn_k: KernelHandle,
-    /// vl2 (2 virtual lanes per thread, 8 outputs/block) variants of the
-    /// batch8 pair — same bit-exact math, 2x memory-level parallelism.
-    /// Preferred when linked and ATLAS_GEMV_VL2 != 0.
-    dp4a_gemv_batch8_vl2_k: KernelHandle,
-    dp4a_dual_batch8_vl2_k: KernelHandle,
-    dp4a_gemv_batch8_dyn_vl2_k: KernelHandle,
+    /// vl2 dual twin (2 virtual lanes/thread, 8 outputs/block) — dyn only;
+    /// the single-GEMV arm stays vl1 (at K=17408 the fixed vl1 is already
+    /// roofline-bound). Preferred when linked and ATLAS_GEMV_VL2 != 0.
     dp4a_dual_batch8_dyn_vl2_k: KernelHandle,
     /// Narrow `w4a16_gemv_batch{M}` family (M=4..8) for the K=4 verify FFN and
     /// the K=5..8 chain verify. SSOT for the M -> tier decision; individual
@@ -455,24 +452,7 @@ impl DenseFfnLayer {
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_dual_batch8_d4_dyn",
             ),
-            dp4a_gemv_batch8_vl2_k: super::try_kernel_gated(
-                cfg!(atlas_hip),
-                gpu,
-                "w4a16_gemv_dp4a",
-                "w4a16_gemv_dp4a_batch8_d4_vl2",
-            ),
-            dp4a_dual_batch8_vl2_k: super::try_kernel_gated(
-                cfg!(atlas_hip),
-                gpu,
-                "w4a16_gemv_dp4a",
-                "w4a16_gemv_dp4a_dual_batch8_d4_vl2",
-            ),
-            dp4a_gemv_batch8_dyn_vl2_k: super::try_kernel_gated(
-                cfg!(atlas_hip),
-                gpu,
-                "w4a16_gemv_dp4a",
-                "w4a16_gemv_dp4a_batch8_d4_dyn_vl2",
-            ),
+
             dp4a_dual_batch8_dyn_vl2_k: super::try_kernel_gated(
                 cfg!(atlas_hip),
                 gpu,

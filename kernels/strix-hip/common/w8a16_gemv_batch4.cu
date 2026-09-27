@@ -26,7 +26,7 @@ __device__ __forceinline__ float atlas_bf16_bits_to_f32(unsigned int bits) {
     return __uint_as_float(bits << 16);
 }
 
-template <int MAX_M, bool FIXED = false, int VLANES = 1>
+template <int MAX_M, int VLANES = 1>
 __device__ __forceinline__ void w8a16_gemv_batchm_impl(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B,
@@ -107,7 +107,7 @@ __device__ __forceinline__ void w8a16_gemv_batchm_impl(
 
             #pragma unroll
             for (int row_index = 0; row_index < MAX_M; ++row_index) {
-                if (!FIXED && (unsigned int)row_index >= M) continue;
+                if ((unsigned int)row_index >= M) continue;
                 const __nv_bfloat16* row = A + (unsigned long long)row_index * K;
                 const uint4 lo = reinterpret_cast<const uint4*>(row)[k16 * 2];
                 const uint4 hi = reinterpret_cast<const uint4*>(row)[k16 * 2 + 1];
@@ -125,7 +125,7 @@ __device__ __forceinline__ void w8a16_gemv_batchm_impl(
             if (VLANES == 2 && k2v) {
                 #pragma unroll
                 for (int row_index = 0; row_index < MAX_M; ++row_index) {
-                    if (!FIXED && (unsigned int)row_index >= M) continue;
+                    if ((unsigned int)row_index >= M) continue;
                     const __nv_bfloat16* row = A + (unsigned long long)row_index * K;
                     const uint4 lo = reinterpret_cast<const uint4*>(row)[k2 * 2];
                     const uint4 hi = reinterpret_cast<const uint4*>(row)[k2 * 2 + 1];
@@ -149,7 +149,7 @@ __device__ __forceinline__ void w8a16_gemv_batchm_impl(
         // equal the old warp0/warp1 sums; their add is the old partial sum.
         #pragma unroll
         for (int row_index = 0; row_index < MAX_M; ++row_index) {
-            if (!FIXED && (unsigned int)row_index >= M) continue;
+            if ((unsigned int)row_index >= M) continue;
             float v0 = acc[row_index];
             float v1 = acc2[row_index];
             #pragma unroll
@@ -168,7 +168,7 @@ __device__ __forceinline__ void w8a16_gemv_batchm_impl(
     const unsigned int warp_in_out = lane / WARP_SIZE;
     #pragma unroll
     for (int row_index = 0; row_index < MAX_M; ++row_index) {
-        if (!FIXED && (unsigned int)row_index >= M) continue;
+        if ((unsigned int)row_index >= M) continue;
         float value = acc[row_index];
         #pragma unroll
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
@@ -181,7 +181,7 @@ __device__ __forceinline__ void w8a16_gemv_batchm_impl(
     if (valid_n && lane == 0) {
         #pragma unroll
         for (int row_index = 0; row_index < MAX_M; ++row_index) {
-            if (FIXED || (unsigned int)row_index < M)
+            if ((unsigned int)row_index < M)
                 C[(unsigned long long)row_index * N + n] = __float2bfloat16(
                     partial[row_index][local_out * 2]
                     + partial[row_index][local_out * 2 + 1]);
@@ -225,20 +225,10 @@ extern "C" __global__ void w8a16_gemv_batch16(
     w8a16_gemv_batchm_impl<16>(A, B, block_scale, C, M, N, K);
 }
 
-// vl2 variants (2 virtual lanes per thread; grid is ceil(N/8), block 256).
-// Bit-identical to w8a16_gemv_batch8: same k16 walks and reduce halves,
-// only the lane→thread mapping changed.
-extern "C" __global__ void w8a16_gemv_batch8_vl2(
-    const __nv_bfloat16* A,
-    const unsigned char* B,
-    const float* block_scale,
-    __nv_bfloat16* C,
-    unsigned int M,
-    unsigned int N,
-    unsigned int K
-) {
-    w8a16_gemv_batchm_impl<8, true, 2>(A, B, block_scale, C, M, N, K);
-}
+// vl2 variant (2 virtual lanes per thread; grid is ceil(N/8), block 256).
+// Bit-identical to w8a16_gemv_batch8: same k16 walks and reduce halves, only
+// the lane→thread mapping changed. dyn only — the guarded twin beat the fixed
+// one at m==8 (475 vs 551 us/call; fixed's 98-133 VGPR triple vs 47-75).
 
 extern "C" __global__ void w8a16_gemv_batch8_dyn_vl2(
     const __nv_bfloat16* A,
@@ -249,5 +239,5 @@ extern "C" __global__ void w8a16_gemv_batch8_dyn_vl2(
     unsigned int N,
     unsigned int K
 ) {
-    w8a16_gemv_batchm_impl<8, false, 2>(A, B, block_scale, C, M, N, K);
+    w8a16_gemv_batchm_impl<8, 2>(A, B, block_scale, C, M, N, K);
 }

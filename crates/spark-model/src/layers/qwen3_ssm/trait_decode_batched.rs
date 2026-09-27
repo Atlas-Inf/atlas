@@ -307,9 +307,8 @@ impl Qwen3SsmLayer {
             // preferred bit-identical arm when linked.
             let (kernel, vl2) = ops::fp8_verify_gemv_tier(
                 num_tokens,
-                ops::gemv_vl2_mode(),
+                ops::gemv_vl2_enabled(),
                 self.w8a16_gemv_batch8_k,
-                self.w8a16_gemv_batch8_vl2_k,
                 self.w8a16_gemv_batch8_dyn_vl2_k,
                 self.w8a16_gemv_batch16_k,
             );
@@ -1171,9 +1170,8 @@ impl Qwen3SsmLayer {
             // is the preferred bit-identical arm when linked.
             let (kernel, vl2) = ops::fp8_verify_gemv_tier(
                 num_tokens,
-                ops::gemv_vl2_mode(),
+                ops::gemv_vl2_enabled(),
                 self.w8a16_gemv_batch8_k,
-                self.w8a16_gemv_batch8_vl2_k,
                 self.w8a16_gemv_batch8_dyn_vl2_k,
                 self.w8a16_gemv_batch16_k,
             );
