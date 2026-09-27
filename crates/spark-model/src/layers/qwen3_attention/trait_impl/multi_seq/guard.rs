@@ -27,10 +27,12 @@ use crate::layer::ForwardContext;
 /// at 5.1k context at 28.7 tok/s vs 18.4 serial (+56 %); job 257 measured
 /// needles 10/12 = 10/12 vs serial and deterministic (M vs M2 top-1 100 %,
 /// JSD 0) — NOT output-identical to serial on long generations (top-1 43.7 %,
-/// the same class as existing short-context MTP divergence). TODO(#70): ST-995
-/// A/B and agentic perf leg numbers land here. `=0`/`=false` restores the old
-/// inert-bound refusal; gfx1151 (`atlas_scale`) keeps default OFF (unmeasured
-/// there).
+/// the same class as existing short-context MTP divergence). Gates, same tree
+/// as the default-env runs: ST-995 job 464 84.92/84.93 vs job 280 84.72/84.68,
+/// paired McNemar 3 vs 1 discordant, p = 0.625; agentic perf leg job 465
+/// 1007/1007 turns, 73.3 min vs 89.3 min, TPOT median 48.9 vs 63.0 ms, score
+/// 0.491 vs 0.4899. `=0`/`=false` restores the old inert-bound refusal;
+/// gfx1151 (`atlas_scale`) keeps default OFF (unmeasured there).
 pub(in crate::layers::qwen3_attention) fn verify_active_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
