@@ -412,8 +412,6 @@ impl Qwen3SsmLayer {
                 if ctx.levers.k4_diag {
                     tracing::info!("K4_DIAG qkvz==4 SERIAL dense_gemv arm (nvfp4=None fp8w=None)");
                 }
-                // BF16 qkvz (a lazy EXL3 overlay rebuilds it into this stream's scratch).
-                let qkvz = self.qkvz_bf16(ctx.gpu, stream)?;
                 if self.dense_gemv_batchm_k.0 != 0 {
                     // One weight pass for all 4 rows — the BF16 twin of the
                     // NVFP4 batchm tier above. ATLAS_GDN_BF16_WEIGHTS
@@ -423,7 +421,7 @@ impl Qwen3SsmLayer {
                         ctx.gpu,
                         self.dense_gemv_batchm_k,
                         normed,
-                        &qkvz,
+                        &self.ssm.in_proj_qkvz,
                         proj_dst,
                         num_tokens as u32,
                         qkvz_size as u32,
@@ -437,7 +435,7 @@ impl Qwen3SsmLayer {
                             ctx.gpu,
                             self.dense_gemv_k,
                             normed.offset(t as usize * h * bf16),
-                            &qkvz,
+                            &self.ssm.in_proj_qkvz,
                             proj_dst.offset(t as usize * qkvz_size * bf16),
                             qkvz_size as u32,
                             h as u32,
@@ -463,7 +461,7 @@ impl Qwen3SsmLayer {
                     ctx.gpu,
                     self.dense_gemv_batchm_k,
                     normed,
-                    &self.qkvz_bf16(ctx.gpu, stream)?,
+                    &self.ssm.in_proj_qkvz,
                     proj_dst,
                     num_tokens as u32,
                     qkvz_size as u32,
@@ -472,13 +470,12 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             } else {
-                let qkvz = self.qkvz_bf16(ctx.gpu, stream)?;
                 for t in 0..3u32 {
                     ops::dense_gemv(
                         ctx.gpu,
                         self.dense_gemv_k,
                         normed.offset(t as usize * h * bf16),
-                        &qkvz,
+                        &self.ssm.in_proj_qkvz,
                         proj_dst.offset(t as usize * qkvz_size * bf16),
                         qkvz_size as u32,
                         h as u32,
@@ -509,7 +506,7 @@ impl Qwen3SsmLayer {
                     ctx.gpu,
                     self.dense_gemv_batch2_k,
                     normed,
-                    &self.qkvz_bf16(ctx.gpu, stream)?,
+                    &self.ssm.in_proj_qkvz,
                     proj_dst,
                     qkvz_size as u32,
                     h as u32,
@@ -640,7 +637,7 @@ impl Qwen3SsmLayer {
             // form this dispatch has no arm for must error per-request, not
             // kill the serve.
             anyhow::ensure!(
-                self.has_qkvz_bf16(),
+                !self.ssm.in_proj_qkvz.weight.is_null(),
                 "batched GDN QKVZ dispatch: no usable weight for num_tokens={num_tokens} \
                  (dense slot NULL; fp8w={}, nvfp4={}, gemm kernels pipelined/base: {:#x}/{:#x})",
                 self.qkvz_fp8w.is_some(),
@@ -648,12 +645,11 @@ impl Qwen3SsmLayer {
                 self.w8a16_gemm_pipelined_k.0,
                 self.w8a16_gemm_k.0,
             );
-            let qkvz = self.qkvz_bf16(ctx.gpu, stream)?;
             ops::dense_gemm(
                 ctx.gpu,
                 self.dense_gemm_k,
                 normed,
-                &qkvz,
+                &self.ssm.in_proj_qkvz,
                 proj_dst,
                 k,
                 qkvz_size as u32,
@@ -1051,7 +1047,7 @@ impl Qwen3SsmLayer {
                 num_tokens as u32,
                 stream,
             )?;
-        } else if let Some(ref dense_out) = self.out_proj_bf16(ctx.gpu, stream)? {
+        } else if let Some(ref dense_out) = self.out_proj_dense {
             if num_tokens <= 8
                 && ctx.levers.gdn_fp8_decode
                 && self.dense_gemv_fp8w_batchm_k.0 != 0

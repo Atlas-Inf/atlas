@@ -110,7 +110,7 @@ impl Qwen3SsmLayer {
                 value_dim as u32,
                 stream,
             )
-        } else if let Some(ref dense_out) = self.out_proj_bf16(ctx.gpu, stream)? {
+        } else if let Some(ref dense_out) = self.out_proj_dense {
             // SSM out_proj is kept BF16 dense for accuracy (decode uses FP8
             // block-scaled, prefill stays BF16). Always routed through the
             // tensor-core dense_gemm_bf16_pipelined kernel (~40× vs the old

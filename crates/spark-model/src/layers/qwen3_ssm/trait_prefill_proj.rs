@@ -222,8 +222,6 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if force_bf16 {
-            // BF16 qkvz (a lazy EXL3 overlay rebuilds it into this stream's scratch).
-            let qkvz = self.qkvz_bf16(ctx.gpu, stream)?;
             // HIP has no working cuBLASLt route here; use the same native BF16
             // pipelined GEMM already used by the dense out projection.
             #[cfg(atlas_hip)]
@@ -231,7 +229,7 @@ impl Qwen3SsmLayer {
                 ctx.gpu,
                 self.dense_gemm_pipelined_k,
                 normed,
-                &qkvz,
+                &self.ssm.in_proj_qkvz,
                 proj_dst,
                 k,
                 qkvz_size as u32,
@@ -252,7 +250,7 @@ impl Qwen3SsmLayer {
                 // the GEMM.
                 ops::cublas_bf16_proj_dense(
                     normed,
-                    qkvz.weight,
+                    self.ssm.in_proj_qkvz.weight,
                     proj_dst,
                     k,
                     qkvz_size as u32,
@@ -517,10 +515,9 @@ impl Qwen3SsmLayer {
             // 8.4 s TTFT (63% of prefill, ~2.7 TFLOPS on an 85-TFLOP part).
             // The scalar kernel stays as the fallback for backends without
             // cuBLASLt.
-            let qkvz = self.qkvz_bf16(ctx.gpu, stream)?;
             if let Err(e) = ops::cublas_bf16_proj_dense(
                 normed,
-                qkvz.weight,
+                self.ssm.in_proj_qkvz.weight,
                 proj_dst,
                 k,
                 qkvz_size as u32,
@@ -544,7 +541,7 @@ impl Qwen3SsmLayer {
                     ctx.gpu,
                     self.dense_gemm_k,
                     normed,
-                    &qkvz,
+                    &self.ssm.in_proj_qkvz,
                     proj_dst,
                     k,
                     qkvz_size as u32,

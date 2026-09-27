@@ -235,18 +235,7 @@ impl Qwen3SsmLayer {
         } else {
             self.w4a16_gemv_batch16_k
         };
-        if n <= 2
-            && let Some(ref e) = self.exl3_decode
-        {
-            e.qkvz_rows_batched(
-                ctx.gpu,
-                normed_base,
-                deinterleaved,
-                n as u32,
-                qkvz_size,
-                stream,
-            )?;
-        } else if let Some(ref fp8) = self.qkvz_fp8w {
+        if let Some(ref fp8) = self.qkvz_fp8w {
             if use_batch4 {
                 ops::w8a16_gemv_batch4(
                     ctx.gpu,
@@ -326,7 +315,7 @@ impl Qwen3SsmLayer {
             // at n=2 (measured) — cuBLASLt tensor-cores it (381 us).
             ops::cublas_bf16_proj_dense(
                 normed_base,
-                self.qkvz_bf16(ctx.gpu, stream)?.weight,
+                self.ssm.in_proj_qkvz.weight,
                 deinterleaved,
                 n as u32,
                 qkvz_size as u32,
@@ -371,11 +360,7 @@ impl Qwen3SsmLayer {
 
         // ── 4. Batched out_proj: ONE [N,value_dim]→[N,h] GEMM (weights ×1) ──
         // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
-        if n <= 2
-            && let Some(ref e) = self.exl3_decode
-        {
-            e.out_proj_batched(ctx.gpu, normed_out_base, ssm_out_base, n as u32, stream)?;
-        } else if let Some(ref fp8) = self.out_proj_fp8w {
+        if let Some(ref fp8) = self.out_proj_fp8w {
             if use_batch4 {
                 ops::w8a16_gemv_batch4(
                     ctx.gpu,
@@ -416,7 +401,7 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             }
-        } else if let Some(ref out_proj_dense) = self.out_proj_bf16(ctx.gpu, stream)? {
+        } else if let Some(ref out_proj_dense) = self.out_proj_dense {
             // Same cuBLASLt swap as the QKVZ arm (513 -> 194 us at n=2).
             ops::cublas_bf16_proj_dense(
                 normed_out_base,

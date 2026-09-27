@@ -338,11 +338,6 @@ pub(crate) fn build_linear_attention_dense_bf16(
         tracing::info!(
             "Layer {layer_idx}: EXL3 native decode overlay installed (BF16 prefill kept)"
         );
-        // M6f-b: with the lazy gate on, free the BF16 copies too — prefill and
-        // the wide paths rebuild them on demand from the packed weights.
-        if crate::weight_map::exl3::exl3_lazy_bf16() {
-            layer.drop_bf16_copies(gpu, store, lp)?;
-        }
     }
     Ok(Box::new(layer))
 }
