@@ -156,6 +156,9 @@ mod qsa_rows;
 mod quant_dispatch;
 pub mod qwen4exp;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
+#[cfg(test)]
+#[path = "ops/grammar_bitmask_tests.rs"]
+mod grammar_bitmask_tests;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "ops/qwen4exp_oracle_common.rs"]
 mod qwen4exp_oracle_common;

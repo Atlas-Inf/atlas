@@ -95,6 +95,9 @@ impl DraftProposer for MtpHead {
         ctx: &ForwardContext,
         stream: u64,
         out_conf: Option<&mut Vec<Vec<f32>>>,
+        // MTP batches stay grammarless (scheduler gate); masking lives on
+        // the per-seq `propose` path.
+        _grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         if !self.can_propose_batch(last_tokens.len(), ctx.buffers, ctx.config) {
             return Ok(None);
