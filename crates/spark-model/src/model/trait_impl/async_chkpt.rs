@@ -343,14 +343,19 @@ impl TransformerModel {
                 // as intermediates[inter_idx], bit-for-bit.
                 ssm.gdn_commit_pending = false;
                 self.commit_gdn_deferred(i, ssm, num_accepted, stream)?;
-                // Conv side still uses the intermediates (unchanged).
-                conv_plan.push(StateCopy {
-                    src: self
-                        .ssm_pool
-                        .conv_intermediate(ssm_layer_idx, slot, inter_idx),
-                    dst: ssm.conv_state,
-                    bytes: conv_bytes,
-                });
+                // Conv side still uses the intermediates — but only on a
+                // PARTIAL accept: the fused conv path never writes index
+                // k-1 (the final conv state is already canonical), so a
+                // full accept must not read the unwritten slot.
+                if num_accepted < k {
+                    conv_plan.push(StateCopy {
+                        src: self
+                            .ssm_pool
+                            .conv_intermediate(ssm_layer_idx, slot, inter_idx),
+                        dst: ssm.conv_state,
+                        bytes: conv_bytes,
+                    });
+                }
                 ssm_layer_idx += 1;
                 continue;
             }

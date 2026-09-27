@@ -160,10 +160,11 @@ impl Qwen3SsmLayer {
         let gdn_defer = Self::gdn_defer_active(
             ctx.levers.gdn_deferred_commit,
             kk,
-            (5..=16)
-                .contains(&kk)
-                .then_some(self.gdn_wyn_defer_k[kk - 5])
-                .unwrap_or(spark_runtime::gpu::KernelHandle(0)),
+            if (5..=16).contains(&kk) {
+                self.gdn_wyn_defer_k[kk - 5]
+            } else {
+                spark_runtime::gpu::KernelHandle(0)
+            },
             self.gdn_commit_k,
         );
         let wy_k = match kk {
