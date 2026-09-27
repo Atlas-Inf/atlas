@@ -243,4 +243,41 @@ pub fn dflash2_candidate_selector(
         .launch(stream)
 }
 
+/// Batched variant of [`dflash2_candidate_selector`] — one CTA per
+/// sequence (grid.x = n_seqs) over the contiguous [seq][gamma][width]
+/// staging; `last_tokens` is the device array the propose prologue
+/// already uploads (`batch_markov_prev`).
+#[allow(clippy::too_many_arguments)]
+pub fn dflash2_candidate_selector_batched(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits: DevicePtr,
+    projected_hidden: DevicePtr,
+    pred_codebook: DevicePtr,
+    succ_codebook: DevicePtr,
+    out_tokens: DevicePtr,
+    last_tokens: DevicePtr,
+    n_seqs: u32,
+    gamma: u32,
+    vocab_size: u32,
+    rank: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([n_seqs, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(logits)
+        .arg_ptr(projected_hidden)
+        .arg_ptr(pred_codebook)
+        .arg_ptr(succ_codebook)
+        .arg_ptr(out_tokens)
+        .arg_ptr(last_tokens)
+        .arg_u32(gamma)
+        .arg_u32(vocab_size)
+        .arg_u32(rank)
+        .arg_u32(top_k)
+        .launch(stream)
+}
+
 // ── MoE routing ──────────────────────────────────────────────────

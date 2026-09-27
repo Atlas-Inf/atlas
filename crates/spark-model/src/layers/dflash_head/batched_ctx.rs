@@ -22,11 +22,28 @@
 //! the original per-sequence `precompute_ctx_kv` unchanged.
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
 
 use super::{BlockDiffusionDraftHead, DflashScratch, small_m_gemm};
 use crate::layer::ForwardContext;
 use crate::layers::ops::{self, DENSE_GEMV_BATCHM_MAX_M};
+
+/// NVFP4 drafter LM-head wave kernel for `batch_rows` rows — the GEMV
+/// tiers are per-row M-invariant, so 16-row waves over >32 rows match
+/// the serial arm bit-for-bit and cost ~8 weight reads vs the ~7-TF
+/// non-transposed `w4a16_gemm` (job 596: 47.3 ms/launch at 128 rows).
+pub(super) fn nvfp4_lm_head_wave_kernel(
+    batch_rows: u32,
+    batch4: KernelHandle,
+    batch8: KernelHandle,
+    batch16: KernelHandle,
+) -> KernelHandle {
+    match batch_rows {
+        1..=4 => batch4,
+        5..=8 => batch8,
+        _ => batch16,
+    }
+}
 
 /// Per-sequence row cap inside the batched ctx staging. Steady-state
 /// tails are `accepted+1` rows (≤ γ+1 ≈ 9); a chunk larger than this is

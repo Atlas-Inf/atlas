@@ -326,12 +326,12 @@ impl BlockDiffusionDraftHead {
                 stream,
             )?;
         } else if let Some(nvfp4) = self.lm_head_nvfp4.as_ref() {
-            let kernel = match batch_rows {
-                1..=4 => self.kernels.w4a16_gemv_batch4,
-                5..=8 => self.kernels.w4a16_gemv_batch8,
-                9..=32 => self.kernels.w4a16_gemv_batch16,
-                _ => spark_runtime::gpu::KernelHandle(0),
-            };
+            let kernel = super::batched_ctx::nvfp4_lm_head_wave_kernel(
+                batch_rows,
+                self.kernels.w4a16_gemv_batch4,
+                self.kernels.w4a16_gemv_batch8,
+                self.kernels.w4a16_gemv_batch16,
+            );
             if kernel.0 != 0 {
                 let mut row = 0u32;
                 while row < batch_rows {

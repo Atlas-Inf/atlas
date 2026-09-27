@@ -55,6 +55,9 @@ pub struct DflashKernels {
     pub dense_gemm: KernelHandle,
     pub dflash2_conv: Option<KernelHandle>,
     pub dflash2_candidate_selector: Option<KernelHandle>,
+    /// Batched twin (grid.x = n_seqs) — KernelHandle(0) on older PTX;
+    /// the batched tail falls back to the per-seq loop then.
+    pub dflash2_candidate_selector_batched: KernelHandle,
     /// NVFP4 GEMM for the final logits when the shared lm_head is NVFP4
     /// (e.g. Holo): a BF16 `dense_gemm` on NVFP4-packed bytes reads garbage
     /// (and ~4× OOB → CUDA-700). `.0 == 0` when the target lm_head is BF16.

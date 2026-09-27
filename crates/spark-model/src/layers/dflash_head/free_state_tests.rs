@@ -14,9 +14,9 @@
 
 use std::collections::HashMap;
 
-use spark_runtime::gpu::DevicePtr;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::gpu::mock::MockGpuBackend;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::lifecycle::*;
@@ -193,6 +193,7 @@ fn zero_kernels() -> DflashKernels {
         w4a16_gemv_batch16: zero,
         w4a16_gemv_batch32: zero,
         dflash2_conv: None,
+        dflash2_candidate_selector_batched: KernelHandle(0),
         dflash2_candidate_selector: None,
     }
 }
