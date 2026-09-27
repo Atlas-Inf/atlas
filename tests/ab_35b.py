@@ -103,7 +103,7 @@ def wait_listening(name: str, timeout: int = 600) -> bool:
         if not r.stdout.strip():
             return False
         r = sh(f"sudo docker logs {name} 2>&1", check=False, capture=True)
-        if "Listening on" in r.stdout:
+        if "Server live and ready at " in r.stdout or "Listening on" in r.stdout:
             return True
         if "Error:" in r.stdout and "ERROR" in r.stdout:
             return False

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Atlas WY-Chunkwise Gated Delta Rule — K∈{5,6,7,8} verification (wyN).
+// Atlas WY-Chunkwise Gated Delta Rule — K∈{5..16} verification (wyN).
 //
 // K-templated generalization of gated_delta_rule_wy17.cu (which itself
 // generalizes wy4). One __device__ impl, instantiated for the chain-verify
 // widths between the dedicated wy4 and the DFlash wy17 — mirroring the
 // w4a16_gemv_batchm_impl<MAX_M> instantiation pattern in w4a16_gemv.cu.
-// Removes the serial per-token GDN fallback at chain-verify K=5..8.
+// Removes the serial per-token GDN fallback at chain-verify K=5..16.
 //
 // Algorithm (identical WY-chunkwise structure — "2 passes over H
 // regardless of K"):
@@ -18,10 +18,12 @@
 //      Hi_t = state after token t for t=0..K-2, and final H = state
 //      after token K-1.
 //
-// SMEM budget @ K=8, k_dim=128:
-//   sk[8][128] + sq[8][128] = 8·128·2·4 = 8 KB
-//   kdots[28] + gate/beta[16] + warp_sums[4]  < 0.25 KB
+// SMEM budget @ K=16, k_dim=128 (the largest instantiation):
+//   sk[16][128] + sq[16][128] = 16·128·2·4 = 16 KB
+//   kdots[120] + gate/beta[32] + warp_sums[4]  < 1 KB
 //   (SM_120 cap: 100 KB — trivially fits for every instantiation)
+// Register arrays vi/hk/vn/qd are [K_TOKENS] per thread — 16 floats each at
+// the max — and kd_flat indexing is t*(t-1)/2 + s, both K-generic.
 //
 // Grid: (num_v_heads, batch, 1)   Block: (128, 1, 1)
 // Reduction primitives (gdn_reduce.cuh) match the per-token baseline
@@ -38,6 +40,15 @@
 // `h_state_inter_base + t * inter_stride_floats` (per (b, vh) sub-region).
 // `h_state` itself becomes the final (post token K-1) state — same
 // pool-layout contract as gated_delta_rule_wy17.
+//
+// `state_is_table` (trailing arg, wy4 idiom): 0 = contiguous bases indexed by
+// (b*num_v_heads+vh)*hv — byte-identical to the original; 1 = `h_state` and
+// `h_state_inter_base` are device POINTER TABLES of `batch_size` entries, one
+// per sequence — per block b the sequence's base comes from table[b], the
+// per-vh offset and the inter_stride_floats distance between Hi_t are
+// unchanged. The table form sidesteps the wrong contiguous intermediate
+// stride at batch_size>1 (see gated_delta_rule_wy4.cu's comment) AND drops
+// the "active sequences occupy contiguous pool slots" assumption.
 
 template <int K_TOKENS>
 __device__ __forceinline__ void gated_delta_rule_wyn_impl(
@@ -57,7 +68,8 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
     unsigned int v_dim,
     unsigned int qk_stride,
     unsigned int v_stride,
-    unsigned int gb_stride
+    unsigned int gb_stride,
+    unsigned int state_is_table
 ) {
     const unsigned int vh = blockIdx.x;
     const unsigned int b = blockIdx.y;
@@ -68,10 +80,19 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
     const unsigned int kh = vh / hr;
     const unsigned int hv = k_dim * v_dim;
 
-    float* H = h_state + ((b * num_v_heads + vh) * hv);
+    // wy4 table idiom: state_is_table=0 keeps the contiguous (b*nv+vh)*hv
+    // addressing byte-identically; =1 reads each sequence's base from a
+    // device pointer table, then applies the same per-vh head offset.
+    const unsigned long long head_off = (unsigned long long)vh * hv;
+    const unsigned long long flat_off = (unsigned long long)(b * num_v_heads + vh) * hv;
+    float* H = state_is_table ? ((float* const*)h_state)[b] + head_off
+                              : h_state + flat_off;
     // Per-(b, vh) offset into the intermediate pool. Each Hi_t base ptr =
-    // h_state_inter_base + t * inter_stride_floats + ((b*nv+vh)*hv).
-    float* Hi_base = h_state_inter_base + ((b * num_v_heads + vh) * hv);
+    // h_state_inter_base + t * inter_stride_floats + ((b*nv+vh)*hv)
+    // (contiguous), or inter_table[b] + vh*hv + t * inter_stride_floats
+    // (table — intermediates keep their intra-slot stride).
+    float* Hi_base = state_is_table ? ((float* const*)h_state_inter_base)[b] + head_off
+                                    : h_state_inter_base + flat_off;
 
     // ── Load q, k, gate, beta into SMEM ──
     __shared__ float sk[K_TOKENS][128];
@@ -227,18 +248,27 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
         unsigned int v_dim,                                                   \
         unsigned int qk_stride,                                               \
         unsigned int v_stride,                                                \
-        unsigned int gb_stride                                                \
+        unsigned int gb_stride,                                               \
+        unsigned int state_is_table                                           \
     ) {                                                                       \
         gated_delta_rule_wyn_impl<K>(                                         \
             h_state, query, key, value, gate, beta, output,                   \
             h_state_inter_base, inter_stride_floats, batch_size,              \
             num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, v_stride,      \
-            gb_stride);                                                       \
+            gb_stride, state_is_table);                                       \
     }
 
 ATLAS_WYN_INSTANTIATE(5)
 ATLAS_WYN_INSTANTIATE(6)
 ATLAS_WYN_INSTANTIATE(7)
 ATLAS_WYN_INSTANTIATE(8)
+ATLAS_WYN_INSTANTIATE(9)
+ATLAS_WYN_INSTANTIATE(10)
+ATLAS_WYN_INSTANTIATE(11)
+ATLAS_WYN_INSTANTIATE(12)
+ATLAS_WYN_INSTANTIATE(13)
+ATLAS_WYN_INSTANTIATE(14)
+ATLAS_WYN_INSTANTIATE(15)
+ATLAS_WYN_INSTANTIATE(16)
 
 #undef ATLAS_WYN_INSTANTIATE

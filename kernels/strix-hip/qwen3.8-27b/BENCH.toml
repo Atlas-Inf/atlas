@@ -146,5 +146,13 @@ normalized 78.41 on the identical draw \
 (run-1789510215749772387.json) — provenance only, not floored; \
 category detail hallucination 60.80 / live 86.47 / non_live 87.97 \
 (irrelevance 75.00, live_irrelevance 46.59, simple_java 67.74, \
-simple_javascript 74.19).
+simple_javascript 74.19). \
+POST-MERGE VERIFICATION 2026-09-19/20 on main @ da943853 (#33 + #37 + \
+#38 merged), identical golden draw, DFlash2 gamma=8 Option-B: \
+AzeezStrix (Linux, ROCm 10, lm-head nvfp4, util 0.80, slots 0 / \
+ckpt 16) overall 85.23 / normalized 78.61, n=995, zero faults, \
+accept mean_na avg 5.67 / median 6.00 over n=997 Done lines \
+(run-1789862348481536503, binary sha 8e3d96af0cbe8c96...). Within \
+0.1 of the pre-merge 85.13 / 78.41 (same draw; observation, not an \
+A/B — lm-head dtype and slots differ). Provenance only, not floored.
 """

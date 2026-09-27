@@ -26,6 +26,8 @@ Run: python3 tests/run_all_models.py 2>&1 | tee /tmp/atlas-full-run.log
 import argparse
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -93,6 +95,12 @@ class TestSpec:
     # overlapping topology the two groups share the same NCCL comm.
     tp_size: int = 1
     ep_size: int = 1
+    # Container env vars, e.g. {"ATLAS_DFLASH_OPTION_B": "1"} for the
+    # Lightning DSpark path whose product validate() hard-requires it
+    # (reiner job 495 refused to boot without it). Passed as `-e K=V` on
+    # `docker run`; keys must match ^[A-Z_][A-Z0-9_]*$ (validated by
+    # `load_roster`, the only input surface that sets this).
+    env: dict = field(default_factory=dict)
 
 
 # ─── Plan ──────────────────────────────────────────────────────────────
@@ -340,6 +348,7 @@ def start_container(host: str, spec: TestSpec, port: int) -> str:
     # networking for NCCL, so one networking mode for the whole harness.
     docker_cmd = (
         f"run -d --name {name} --gpus all --ipc=host --network host "
+        f"{env_docker_flags(spec)} "
         f"-v {cache}:/root/.cache/huggingface "
         f"{IMAGE} {serve_cmd}"
     )
@@ -347,22 +356,79 @@ def start_container(host: str, spec: TestSpec, port: int) -> str:
     return name
 
 
-def ready_marker(port: int) -> str:
-    """Exact startup line proving the listener is reachable by this harness.
+def _ready_host(bind: str) -> str:
+    """Host rendering for the readiness line — mirrors
+    crates/spark-server/src/main_modules/serve_router.rs::ready_line, the
+    source of truth: wildcard binds (0.0.0.0 / ::) accept on every interface
+    but are not destinations, so they render as 127.0.0.1; IPv6 literals are
+    bracketed so `::1:8888` can't parse as address-plus-port."""
+    if bind in ("0.0.0.0", "::"):
+        return "127.0.0.1"
+    if ":" in bind:
+        return f"[{bind}]"
+    return bind
 
-    The server logs `Listening on {bind}:{port}`, so the bare substring
-    "Listening on" ALSO matches `Listening on 127.0.0.1:8888` — a bind this
-    harness can never reach. Matching that produced a false READY whose
-    downstream connection resets looked exactly like a model regression.
-    Match the address we asked for, so a wrong bind cannot read as ready.
+
+def ready_marker(port: int, bind: str = SERVE_BIND) -> str:
+    """Prefix of the exact startup line proving the listener is reachable by
+    this harness.
+
+    The server logs `Server live and ready at {host}:{port} running {model}`
+    after the bind (serve_router.rs::ready_line). Matching the bare substring
+    "Server live and ready at" — or the legacy "Listening on" — would ALSO
+    match a bind this harness can never reach (e.g. 127.0.0.1 inside the
+    container), producing a false READY whose downstream connection resets
+    looked exactly like a model regression. Match the address we asked for,
+    so a wrong bind cannot read as ready.
     """
-    return f"Listening on {SERVE_BIND}:{port}"
+    return f"Server live and ready at {_ready_host(bind)}:{port} running "
+
+
+def legacy_ready_marker(port: int, bind: str = SERVE_BIND) -> str:
+    """Pre-Aug-2026 readiness line. Older release-verify images still log
+    `Listening on {bind}:{port}` — keep accepting it so this harness can
+    verify older tags."""
+    return f"Listening on {bind}:{port}"
+
+
+_ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+
+
+def env_docker_flags(spec: TestSpec) -> str:
+    """`-e K=V` fragment for `docker run`, shell-quoted: the command string
+    crosses `bash -lc` (and ssh on the worker), so quote the whole
+    `KEY=VALUE` pair as one token."""
+    return " ".join(
+        f"-e {shlex.quote(f'{k}={v}')}" for k, v in sorted(spec.env.items())
+    )
+
+
+# Ready-line prefixes that prove SOME bind happened. "Server live at " (no
+# "and ready") is the modelless boot — live but not serving a model, and this
+# harness always passes one, so it is neither ready nor a wrong-bind fail.
+_BOUND_PREFIXES = ("Server live and ready at ", "Listening on")
+
+
+def log_ready_state(log: str, marker: str, legacy: str) -> str:
+    """Classify a log scrape: 'ready', 'wrong_bind', or 'waiting'.
+
+    The modelless `Server live at {host}:{port} — no model loaded yet…`
+    line lands as 'waiting': it matches neither marker nor bound prefix
+    (`Server live at ` is not `Server live and ready at `), and this
+    harness always passes a model, so the serving line still has to come.
+    """
+    if marker in log or legacy in log:
+        return "ready"
+    if any(p in log for p in _BOUND_PREFIXES):
+        return "wrong_bind"
+    return "waiting"
 
 
 def wait_listening(host: str, name: str, port: int,
                    timeout: int = STARTUP_TIMEOUT) -> bool:
     """Poll docker logs until the reachable-listener line appears, or time out."""
     marker = ready_marker(port)
+    legacy = legacy_ready_marker(port)
     deadline = time.time() + timeout
     while time.time() < deadline:
         # Container might have exited
@@ -372,14 +438,17 @@ def wait_listening(host: str, name: str, port: int,
             return False
         r = docker_on(host, f"logs {name} 2>&1", check=False, capture=True)
         log = r.stdout
-        if marker in log:
+        state = log_ready_state(log, marker, legacy)
+        if state == "ready":
             return True
-        if "Listening on" in log:
-            # Bound, but not where we asked. Fail fast and name the cause —
-            # never let this fall through to a probe that will be refused.
+        if state == "wrong_bind":
+            # Bound, but not where we asked (or modelless). Fail fast and
+            # name the cause — never let this fall through to a probe that
+            # will be refused.
             print(f"    [{host}/{name}] bound the WRONG address: expected "
-                  f"'{marker}'. Not reachable from this harness — check the "
-                  f"--bind argument and the container network mode.")
+                  f"'{marker}' (or legacy '{legacy}'). Not reachable from "
+                  f"this harness — check the --bind argument and the "
+                  f"container network mode.")
             return False
         if "Error:" in log and "ERROR" in log:
             print(f"    [{host}/{name}] error detected in log")
@@ -639,6 +708,7 @@ def start_ep2(spec: TestSpec) -> tuple:
         f"run -d --name {rank0_name} --gpus all --ipc=host --network host "
         f"{RDMA_FLAGS}{NCCL_ENV} "
         f"-e RUST_LOG=info "
+        f"{env_docker_flags(spec)} "
         f"-v {HF_CACHE_HEAD}:/root/.cache/huggingface "
         f"{IMAGE} {rank0_serve}"
     )
@@ -650,6 +720,7 @@ def start_ep2(spec: TestSpec) -> tuple:
         f"run -d --name {rank1_name} --gpus all --ipc=host --network host "
         f"{RDMA_FLAGS}{NCCL_ENV} "
         f"-e RUST_LOG=info "
+        f"{env_docker_flags(spec)} "
         f"-v {HF_CACHE_WORKER}:/root/.cache/huggingface "
         f"{IMAGE} {rank1_serve}"
     )
@@ -672,7 +743,8 @@ def wait_ep2_ready(rank0_name: str, rank1_name: str, timeout: int = 900) -> bool
                 return False
             r = docker_on("head", f"logs {rank0_name} 2>&1",
                           check=False, capture=True)
-            if "Listening on" in r.stdout:
+            if "Server live and ready at " in r.stdout \
+                    or "Listening on" in r.stdout:
                 rank0_ready = True
                 print("    [rank0] listening")
         if not rank1_ready:
@@ -778,11 +850,11 @@ def load_roster(path):
     having to un-edit) the committed roster.
 
     Format — a list of rounds, each a list of specs; every key beyond `host`
-    is a TestSpec field:
+    is a TestSpec field. `env` passes container env vars as `-e K=V`:
 
         [[{"host": "head", "label": "27B-nvfp4", "model": "nvidia/Qwen3.6-27B-NVFP4"}],
          [{"host": "head", "label": "35B-nvfp4", "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
-           "kv_dtype": "bf16"}]]
+           "kv_dtype": "bf16", "env": {"ATLAS_DFLASH_OPTION_B": "1"}}]]
 
     The roster flows through `planned_specs` like any other, so `_manifest.json`
     still records exactly what the run intended and the gate's coverage check
@@ -798,6 +870,12 @@ def load_roster(path):
             host = e.pop("host", "head")
             if host not in ("head", "worker"):
                 raise SystemExit(f"{path}: host must be 'head' or 'worker', got {host!r}")
+            for key in e.get("env", {}):
+                if not _ENV_KEY_RE.match(key):
+                    raise SystemExit(
+                        f"{path}: env key {key!r} (label {e.get('label')!r}) must match "
+                        r"^[A-Z_][A-Z0-9_]*$"
+                    )
             pairs.append((host, TestSpec(**e)))
         rounds.append(pairs)
     return rounds

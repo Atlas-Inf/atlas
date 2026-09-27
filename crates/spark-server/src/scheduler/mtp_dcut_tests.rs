@@ -62,7 +62,8 @@ fn missing_confidences_are_never_pruned() {
 #[test]
 fn chunk_ranges_reproduce_the_uniform_caps() {
     // Every default-ladder-reachable shape is a SINGLE chunk — true under
-    // the old 64-row budget too, so the 96 widening is default-inert.
+    // the old 64-row budget too, so the 96 and 128 widenings are
+    // default-inert.
     assert_eq!(chunk_ranges(&[4; 8]), vec![(0, 8)]);
     assert_eq!(chunk_ranges(&[3; 8]), vec![(0, 8)]);
     // The 16:2 default rung: [3; 16] = 48 rows, one chunk.
@@ -77,19 +78,26 @@ fn chunk_ranges_reproduce_the_uniform_caps() {
 fn chunk_ranges_seq_cap_derives_from_the_row_budget() {
     // Depth above n=8 (env-ladder / ragged-D-Cut shapes) is no longer
     // serialized into 8-wide chunks: the row budget is the only bound.
-    // rows=3: 96/3 = 32 seqs — 16:2, 24:2 AND 32:2 are each ONE chunk.
+    // rows=3: 128/3 = 42 seqs — 16:2, 24:2, 32:2 are each ONE chunk
+    // (sequence count is separately bounded at 32 by VERIFY_WY_TABLE_SEQS,
+    // so nothing beyond n=32 reaches verify in practice).
     assert_eq!(chunk_ranges(&[3; 21]), vec![(0, 21)]);
     assert_eq!(chunk_ranges(&[3; 24]), vec![(0, 24)]);
     assert_eq!(chunk_ranges(&[3; 32]), vec![(0, 32)]);
-    assert_eq!(chunk_ranges(&[3; 33]), vec![(0, 32), (32, 33)]);
-    // rows=4: 96/4 = 24 seqs.
+    assert_eq!(chunk_ranges(&[3; 42]), vec![(0, 42)]);
+    assert_eq!(chunk_ranges(&[3; 43]), vec![(0, 42), (42, 43)]);
+    // rows=4: 128/4 = 32 seqs.
     assert_eq!(chunk_ranges(&[4; 9]), vec![(0, 9)]);
-    assert_eq!(chunk_ranges(&[4; 24]), vec![(0, 24)]);
-    assert_eq!(chunk_ranges(&[4; 25]), vec![(0, 24), (24, 25)]);
-    // rows=2: 96/2 = 48 seqs.
-    assert_eq!(chunk_ranges(&[2; 48]), vec![(0, 48)]);
-    assert_eq!(chunk_ranges(&[2; 49]), vec![(0, 48), (48, 49)]);
-    // rows=3 with 10 seqs (the old (0,8),(8,10) split): one chunk now.
+    assert_eq!(chunk_ranges(&[4; 32]), vec![(0, 32)]);
+    assert_eq!(chunk_ranges(&[4; 33]), vec![(0, 32), (32, 33)]);
+    // rows=2: 128/2 = 64 seqs.
+    assert_eq!(chunk_ranges(&[2; 64]), vec![(0, 64)]);
+    assert_eq!(chunk_ranges(&[2; 65]), vec![(0, 64), (64, 65)]);
+    // rows=8 (DFlash2 γ=8): the job-376 C=16 shape — 16 seqs = 128 rows
+    // hits the new budget dead on (was a 12+4 split at 96).
+    assert_eq!(chunk_ranges(&[8; 16]), vec![(0, 16)]);
+    assert_eq!(chunk_ranges(&[8; 17]), vec![(0, 16), (16, 17)]);
+    // rows=3 with 10 seqs (the old (0,8),(8,10) split): one chunk.
     assert_eq!(chunk_ranges(&[3; 10]), vec![(0, 10)]);
 }
 
