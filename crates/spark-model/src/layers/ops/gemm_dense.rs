@@ -5,6 +5,9 @@
 #![allow(unused_imports)]
 
 use anyhow::Result;
+use spark_runtime::cublaslt::{
+    DENSE_GEMM_BF16_PIPELINED_THREADS, DENSE_GEMM_BF16_PIPELINED_TILE, DENSE_GEMM_BF16_SCALAR_TILE,
+};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
@@ -98,9 +101,10 @@ pub fn dense_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    let t = DENSE_GEMM_BF16_SCALAR_TILE;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 16), div_ceil(m, 16), 1])
-        .block([16, 16, 1])
+        .grid([div_ceil(n, t), div_ceil(m, t), 1])
+        .block([t, t, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
         .arg_ptr(output)
@@ -149,6 +153,8 @@ pub fn dense_gemm_router(
 /// `dense_gemm_bf16_pipelined`): mma.sync.m16n8k16 + cp.async 2-stage, 128x128
 /// tile. ~40x the scalar `dense_gemm` on large-M shapes (cosine=1.0, same math).
 /// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
+/// (`DENSE_GEMM_BF16_PIPELINED_{TILE,THREADS}` — shared with the cuBLASLt
+/// fallback launcher in `spark_runtime::cublaslt`.)
 #[allow(clippy::too_many_arguments)]
 pub fn dense_gemm_bf16_pipelined(
     gpu: &dyn GpuBackend,
@@ -161,9 +167,13 @@ pub fn dense_gemm_bf16_pipelined(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    let (t, th) = (
+        DENSE_GEMM_BF16_PIPELINED_TILE,
+        DENSE_GEMM_BF16_PIPELINED_THREADS,
+    );
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
-        .block([256, 1, 1])
+        .grid([div_ceil(n, t), div_ceil(m, t), 1])
+        .block([th, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
         .arg_ptr(output)

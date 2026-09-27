@@ -1,0 +1,616 @@
+# strix-hip (gfx1151, native HIP) copy of kernels/gb10/qwen3.8-flash-next/MODEL.toml.
+# A real file, not a symlink like qwen3.6-35b-a3b's: [expected_absent] is
+# per-hardware — the gb10 file must declare the strix-hip-only probes absent,
+# while this copy drops those sections because the kernels DO resolve on gfx1151.
+#
+# Qwen3.8-Flash-Next — hybrid GDN + QSA sparse attention, multi-hyperconnection
+# streams, PLE n-gram injection, 512-expert MoE, ViT tower, 1 MTP layer.
+#
+# Ported from Avarok #753/#754 (rsafier) onto the Atlas-Inf n-gram branch.
+# SERVES: mHC highway on all 48 layers, PLE at model layer 1, QSA decode and
+# prefill selection, vision tower, CUDA graphs, prefix caching, C>1, and MTP.
+# The stacked expert layout is unreached by both published releases.
+#
+# MTP WORKS, AND IT PAYS ONLY AT ONE DRAFT. #753 item I is done: the draft
+# module loads through its own loader (NOT the family `load_mtp_weights`,
+# which still declines this shape), proposes, and verifies on the mHC
+# highway, at C=1 and C=2 alike.
+#
+# THE DRAFT DEPTH IS THE WHOLE RESULT. Measured 2026-08-28 on one GB10,
+# 256-token completions, against a same-binary non-speculative control:
+#
+#   arm (gate forced unless noted)   C=1 agg tok/s   C=2 agg tok/s   p1
+#   base (no speculation)                    16.14           24.74    --
+#   --num-drafts 1                           20.14 (+24.8%)  21.13 (-14.6%)  0.83
+#   --num-drafts 2                           19.00 (+17.7%)  20.52 (-17.1%)  0.84
+#   (pre stream-row fix, --num-drafts 1)     19.10 (+18.3%)  19.61 (-20.7%)  0.69
+#
+# K=3 accepts MORE (2.56 tokens/step vs 1.83) and is still SLOWER: the third
+# verify row costs 0.71 of a decode step and buys only 0.73 tokens. Marginal
+# row cost grows with K (0.47 for row 2, 0.71 for row 3), so one draft stays
+# the optimum even at the post-fix acceptance.
+#
+# So: ONE draft. The default K ladder (`4:3,8:3,...`) asks for 3 drafts at
+# these widths, which is exactly the losing depth here -- `--num-drafts 1`
+# is what clamps it, and it is not optional on this target.
+#
+# LEAVE THE GATE ARMED and one serve covers the ladder. Measured doing its
+# job: at C=1 it holds Mtp for the full +18.4%; at C=2 it logs one
+# Mtp -> Serial switch (19.8 vs 27.0 tok/s) and accepted drafts fall from 94
+# per request to ~23, which recovers C=2 from -20.9% to -6.3%. That residual
+# is its periodic re-probe; `ATLAS_MTP_GATE_REPROBE` (default 256 tokens)
+# trades probe frequency against it.
+#
+# Why depth costs so much: each verify row routes to its own top-10 of 512
+# experts, so expert weight traffic scales with the row count while the
+# backbone does not. The measured marginal cost is ~0.34-0.50 of a full
+# decode step per extra verify row. Break-even needs tokens/step > 1 +
+# ~0.4*(K-1); at K=2 acceptance delivers 1.58 tokens/step against a 1.34
+# cost, and at K=3 it delivers 1.72 against 1.76.
+#
+# Why it inverts at C>1: batched decode is ALREADY amortizing exactly the
+# weight reads speculation exists to amortize, so the marginal value of a
+# draft falls as width rises. The throughput gate measures this per serve
+# and parks in Serial on its own, which is why `--speculative` is safe to
+# leave on -- it costs a short probe to rediscover.
+#
+# Two hard bounds also apply: the batched verify serves K<=3 (two drafts --
+# `Model::verify_max_drafts`, which the scheduler clamps to; before that
+# clamp `--num-drafts 3` asked for K=4, the highway refused mid-step, and a
+# verify error finishes the request, so every request died after one token),
+# and speculation is declined entirely above the QSA inert bound of 2051
+# visible tokens.
+#
+# TWO MODEL_TYPE NAMES, ONE ARCHITECTURE. The model shipped as
+# `qwen3_8_flash_next` and was renamed `qwen4_exp`; quantizers pinned to
+# different transformers revisions emit different names (RadixArk ->
+# qwen4_exp, Inferact -> qwen3_8_flash_next). `dispatch.rs` normalizes both to
+# `qwen4_exp`, so only that one is bound below.
+[model]
+name = "qwen3.8-flash-next"
+hf_id = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+architecture = "GDN + QSA sparse attention + mHC + PLE n-gram + MoE"
+params = "180B"
+active_params = "7B"
+
+# ── Why the parameter count looks the way it does ─────────────────────────
+# 179.6 B total, from the weight manifest:
+#
+#   routed experts (trunk)  120.8 B
+#   n-gram table             51.2 B   <- read by ROW, never resident
+#   MTP experts               2.5 B   <- dropped for v1
+#   everything else           5.0 B
+#
+# Active per token is the ~5.0 B backbone + top-10 of 512 experts (~2.4 B) +
+# 16 n-gram rows of 160 dims. So ~7 B, not the 3 B a Qwen3-Next-style
+# "A3B" reading would suggest -- the backbone alone is 5 B here.
+#
+# ── Memory, measured on a GB10 (2026-08-26, reproduced independently) ──────
+# The box is coherent unified memory (Addressing Mode: ATS, ~119.6 GiB), so
+# there is no host/device split to offload across. With the n-gram table
+# demand-paged:
+#
+#   pre-flight     78.19 GB on-disk, 1.3x = 101.65 GB projected peak
+#   actual peak    ~90.4 GB, ~27.8 GB free, 8 GiB guard held
+#   load           206/206 shards, 296,347 tensors, ~139 s
+#
+# The FP8 release does NOT fit: its routed experts alone are 123.3 GB
+# resident. NVFP4 is not the smaller option here, it is the only workable
+# one.
+
+# 3 linear : 1 full, 48 layers. Only the 12 full-attention layers hold KV;
+# the 36 GDN layers hold recurrent state instead, which is why a ~19-24 GB KV
+# budget goes further here than the layer count suggests.
+layers_total = 48
+layers_linear_attention = 36
+layers_full_attention = 12
+layer_pattern = "3:1 (linear, linear, linear, full)"
+
+moe_experts = 512
+moe_topk = 10
+moe_intermediate = 640
+shared_expert_intermediate = 640
+
+hidden_dim = 2560
+head_dim = 256
+q_heads = 24
+kv_heads = 2
+
+linear_attn_key_heads = 16
+linear_attn_key_dim = 128
+linear_attn_value_heads = 48
+linear_attn_value_dim = 128
+linear_conv_kernel = 4
+
+vocab_size = 248320
+max_position_embeddings = 262144
+rope_theta = 10000000
+partial_rotary_factor = 0.25
+attn_output_gate = true
+mrope_interleaved = true
+mrope_section = [11, 11, 10]
+
+# Multi-hyperconnection: the residual is 4 parallel streams of hidden_dim
+# (4 x 2560 = 10240), mixed through a low-rank pair of rank 320. Atlas's mHC
+# plumbing comes from DeepSeek-V4, whose mixer is Sinkhorn-normalized instead
+# — same stream layout, different mixing math.
+hc_count = 4
+hc_lowrank = 320
+
+# QSA indexer, on the full-attention layers only.
+indexer_n_heads = 4
+indexer_head_dim = 128
+indexer_budget = 2048
+indexer_compress_ratio = 4
+
+# PLE n-gram injection at ONE layer. 16 heads x 160 dims = 2560 = hidden, so
+# the per-head slices are CONCATENATED, not projected-and-summed the way
+# LongCat's are. One logical table of ~320M rows stored as 128 shards; served
+# off NVMe via the row cache rather than resident (47.7 GB FP8 in the RadixArk
+# release, 95.4 GB BF16 in Inferact's).
+ngram_size = 3
+ngram_heads = 16
+ngram_dim = 160
+ngram_split_parts = 128
+ple_layer_ids = [2]
+ple_conv_kernel_size = 4
+
+mtp_layers = 1
+mtp_type = "full_attention"
+vision = true
+
+# Sampling: model-card recommendations (2026-08, relayed from the vendor
+# card): thinking temperature=1.0 top_p=0.95 top_k=20 min_p=0
+# presence_penalty=0 repetition_penalty=1.0; instruct/non-thinking
+# temperature=0.7 top_p=0.80 top_k=20 min_p=0 presence_penalty=1.5
+# repetition_penalty=1.0. Tools follows the instruct row (the card has no
+# tools-specific set).
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
+# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
+# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
+# the greedy-thinking loop this model exhibits on short prompts.
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
+# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
+# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
+# the greedy-thinking loop this model exhibits on short prompts.
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+presence_penalty = 1.5
+# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
+# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
+# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
+# the greedy-thinking loop this model exhibits on short prompts.
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.tools]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+presence_penalty = 1.5
+# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
+# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
+# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
+# the greedy-thinking loop this model exhibits on short prompts.
+min_p = 0.0
+top_n_sigma = 0.0
+
+# `qwen4_exp` is unique across the registry, so resolution cannot tie and
+# match_names is not load-bearing yet. Listed anyway so a future Flash-Next
+# variant sharing (qwen4_exp, 2560) has something to disambiguate against.
+# RadixArk stays listed: hf_id moved to the nvidia pack (the calibrated
+# FP8_PB_WO MTP experts), but the RadixArk release still serves.
+match_names = [
+    "qwen3.8-flash-next",
+    "flash-next",
+    "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+]
+
+[[model_types]]
+model_type = "qwen4_exp"
+hidden_size = 2560
+
+# ── Kernel-audit exemptions, mirrored from qwen3.6-35b-a3b ──
+#
+# This target's nvfp4 shadow IS qwen3.6-35b-a3b's (same .cu set, by symlink), so it
+# drops exactly the same kernels and needs the same exemptions. Copied rather
+# than re-derived: each entry below records WHY a dispatch path can live
+# without that kernel, and re-deriving those reasons from scratch for an
+# identical shadow would be inventing justifications.
+#
+# The audit stays fail-closed — an exemption quiets the build warning but the
+# startup gate still hard-errors if a dispatch site actually asks for one.
+
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = """
+3-deep weight-pipeline twin of w4a16_gemm_t, shipped ONLY in
+qwen3.6-27b/nvfp4/w4a16_gemm.cu (49 globals vs this target's slimmer
+shadow). layers::tgemm_kernel probes it first, then falls back to
+w4a16_gemm_t, which resolves here. The fallback is the 2-stage parent
+the p3 twin was derived from; the twin is UNMEASURED for this target's
+shapes — treat as a candidate to measure, not a confirmed loss."""
+w4a16_gemm_t_k64_p3 = """
+Same family: shipped only in qwen3.6-27b's shadow. layers::k64_kernel
+probes it, then REQUIRES w4a16_gemm_t_k64, which resolves here."""
+w4a16_gemm_t_k64_n64_p3 = """
+Narrow-N deep-K twin, shipped only in qwen3.6-27b's shadow.
+layers::k64_n64_kernel returns 0-handle when absent; dispatch gates on
+handle != 0 before firing, so the wide-K64 tile serves these shapes."""
+w4a16_gemm_t_m128_bf16 = """
+BF16-projection prefill twin of w4a16_gemm_t_m128. prefill_weights
+gates the probe result (handle != 0); the fallback is the w4a16 m128
+twin that resolves here, applied through the standard dequant."""
+
+[expected_absent.w4a4]
+w4a4_gemm_mfast = """
+This model's w4a4_gemm.cu defines only w4a4_gemm; the mfast variant
+exists solely in nemotron-labs-3-puzzle-75b-a9b. Dispatch
+(qwen3_attention/init.rs) falls back to w4a4_gemm — same family the
+27B declares. UNMEASURED for this target."""
+
+[expected_absent.moe_w4a16]
+moe_w4a16_grouped_gemm_ptrtable_e8m0 = """
+Native-MXFP4 (E8M0) scale-format variant. Shipped only in
+deepseek-v4-flash's moe_w4a16 module (ARM-2 Phase-K). This target is
+NVFP4; the ptrtable grouped GEMM that resolves here serves it."""
+moe_w4a16_grouped_gemm_ptrtable_t_e8m0 = "Same E8M0 family — NVFP4 target uses the resolved ptrtable_t variant."
+moe_w4a16_grouped_gemm_ptrtable_t_k64_e8m0 = "Same E8M0 family — NVFP4 target uses the resolved ptrtable_t_k64 variant."
+moe_w4a16_fused_gate_up_t_e8m0 = "Same E8M0 family — NVFP4 target uses the resolved fused_gate_up variant."
+moe_w4a16_fused_gate_up_t_k64_e8m0 = "Same E8M0 family — NVFP4 target uses the resolved fused_gate_up_k64 variant."
+moe_w4a16_fused_gate_up_t_k64_m128 = """
+M=128 Block-D variant shipped only in minimax-m2-229b's shadow (per the
+dispatch comment in moe/init.rs). Dispatch falls through to M=64."""
+moe_w4a16_fused_gate_up_t_k64_fp4 = "Fused FP4 gate/up under ATLAS_HOLO_MOE_GATEUP_FP4 (init.rs:179); env off, handle!=0 checked before firing."
+moe_w4a16_down_t_k64_fp4 = "FP4 down-proj twin of the same env-gated arm (init.rs:453); off."
+
+# ⚠ HONESTY NOTE on the four gated_delta_rule f16 arms: unlike every
+# entry above, the FP16-h-state decode arms dispatch these handles
+# UN-PROBED (ssm_batched_recurrent.rs:279/:509) once --ssm-h-dtype f16
+# is active. Preflight refuses f16 for bad env combos but NOT for a
+# target that lacks the twins, so setting the flag on this model is a
+# 0-handle launch, not a fallback. Declared here to unblock the gate;
+# the correct fix is a preflight check on kernel presence. UNMEASURED.
+[expected_absent.gated_delta_rule]
+gated_delta_rule_decode_f16_norm = "FP16 h-state twin; see honesty note in this MODEL.toml. F32 fused-norm arm resolves."
+gated_delta_rule_decode_f16_strided_norm_half = "FP16 h-state twin; see honesty note in this MODEL.toml. F32 strided-norm arm resolves."
+gated_delta_rule_decode_f32_strided_norm_half = """
+Half-register twin of the resolved f32_strided_norm; selected only when
+the resolved half-register gate is set, and that gate is off by default
+(ATLAS_GDN_HALF_REG presence). Not a live path as shipped."""
+gated_delta_rule_decode_f32_strided_norm_smem = """
+SMEM-staged twin; gated behind ATLAS_GDN_SMEM_STAGE (presence, off by
+default) AND the half-register gate. Not a live path as shipped."""
+
+# #438: the exact-verify `_snap` twins are model-shadow staged in
+# qwen3.6-27b/nvfp4 ONLY (shadow-first; promote to common/ once validated
+# per family). Every dispatch site probes handle != 0, and the whole chain
+# is opt-in via --exact-verify; the fallback stays exact.
+[expected_absent.gated_delta_rule_snap]
+gated_delta_rule_decode_f32_norm_snap = """
+Exact-verify snapshot twin (#435), shipped only in qwen3.6-27b/nvfp4.
+trait_decode_batched_conv_gdn_exact probes handle != 0; absent, the
+exact arm uses the parent gdn_f32_norm kernel + copy_d2d snapshots
+(same bits, more launches)."""
+gated_delta_rule_decode_f32_strided_norm_snap = """
+Batched exact-verify snapshot twin (#435), shipped only in
+qwen3.6-27b/nvfp4. trait_decode_batched_conv_gdn_multi_exact declines
+the batched form on handle 0 and the per-sequence exact loop serves
+(still exact)."""
+
+[expected_absent.gdn_verify_fused_conv_kn_f32]
+gdn_verify_fused_conv_kn_f32 = """
+FP32 fused verify conv for the exact-verify chain (#435), shipped only
+in qwen3.6-27b/nvfp4. Probed handle != 0; absent, the exact chain keeps
+its per-token conv launches (same bits, more launches)."""
+
+# ── expected_absent: the 62 boot-4 audit list ──────────────────────────────
+# Harvested 2026-09-19 from the winbox boot-4 kernel-load audit
+# (serve-fnext-boot4.err, spark.exe @ 622cd45d5, ROCm 10.0.0, gfx1151): 119
+# modules embedded, 62 probes unresolved. Every site was re-read — all 62 are
+# `try_kernel`/`handle != 0`-gated optional arms (moe/init.rs, qwen3_ssm/
+# init.rs, qwen3_attention/init.rs, token_overlay.rs); NONE is a hard
+# `gpu.kernel()` 0-launch. Where the same module::function is declared in
+# strix-hip/qwen3.8-27b/MODEL.toml its reason text is reused verbatim.
+
+# ── alternative-quant / unselected arms ────────────────────────────────────
+[expected_absent.dense_gemv_fp8w]
+dense_gemv_fp8w = "M=1 FP8-weight GEMV alternate; GDN FP8 projections resolve through gemv_fp8w (compiled) — this dense_ variant is a redundant probe, handle!=0 gated."
+
+[expected_absent.dequant_gguf_bf16]
+dequant_q2_0_gn_to_bf16 = "GGUF Q2_0 group dequant (qwen3_ssm/init.rs:52); fires only when packed-Q2 weights are installed. NVFP4 checkpoint — dtype-gated dead handle."
+
+[expected_absent.q2_0_gemv_vec]
+q2_0_gemv_vec = "Q2_0 GGUF decode GEMV (qwen3_ssm/init.rs:51); q2_weights is None on this checkpoint — dtype-gated dead handle."
+
+[expected_absent.fp8_gemm_t_blockscaled]
+fp8_gemm_t_blockscaled = "Block-scaled FP8 prefill GEMM alternate (moe/init.rs:225); handle!=0 gate, resolved gemm path serves the FP8-weight shapes."
+
+[expected_absent.w8a16_gemm_pipelined]
+w8a16_gemm_pipelined = "Pipelined W8A16 GEMM alternate probed at moe/init.rs:256; dtype-gated, resolved w8a16_gemm/w4a16 arms cover the shapes it would take."
+
+[expected_absent.w8a16_gemm_t]
+w8a16_gemm_t_pipelined = "Pipelined transposed W8A16 GEMM alternate (attn init.rs:182); dtype-gated; resolved w8a16_gemm_t serves."
+
+[expected_absent.gemm]
+dense_gemm_bf16_router = "Router-logits BF16 GEMM alternate (moe/init.rs:83, try_kernel); the resolved dense_gemm_bf16 arm serves the router shape."
+
+# ── MoE: alternative routing / expert-GEMM arms ────────────────────────────
+# All try_kernel-gated probes in moe/init.rs. The serving router resolves
+# moe_topk_sig + moe_topk; experts resolve the ptrtable grouped GEMMs.
+[expected_absent.moe_decode_atomic_c4]
+moe_decode_atomic_c4_silu_down_accum = "Atomic-counter decode MoE arm (init.rs:122); handle!=0 gate — resolved moe_expert_gemv/sorted arms serve decode."
+moe_decode_atomic_c4_finalize = "Finalize twin of the same arm (init.rs:127); same gate, same fallback."
+
+[expected_absent.moe_hash_route]
+moe_hash_route = "DeepSeek-V4 hash-routing arm (init.rs:339); this model is softmax-routed — tid2eid_dev is None, dead probe."
+moe_hash_route_batched = "Batched twin (init.rs:340); same."
+
+[expected_absent.moe_bf16_grouped_gemm]
+moe_bf16_grouped_gemm = "BF16 grouped-GEMM expert arm (init.rs:230); handle!=0 gate — NVFP4 ptrtable grouped GEMM resolves and serves."
+
+[expected_absent.moe_shared_expert_fused_bf16]
+moe_expert_gate_up_shared_bf16 = "Shared-expert fused BF16 gate/up (init.rs:235); this checkpoint has no BF16 shared-expert path — config-gated dead handle."
+moe_expert_silu_down_shared_bf16 = "Shared-expert fused BF16 silu/down twin (init.rs:240); same gate."
+
+[expected_absent.moe_shared_expert_fused_bf16_batch2]
+moe_expert_gate_up_shared_bf16_batch2 = "Batch-2 twin of the shared-expert arm (init.rs:245); same config gate."
+moe_expert_silu_down_shared_bf16_batch2 = "Batch-2 silu/down twin (init.rs:250); same."
+
+[expected_absent.moe_topk_softmax_bias]
+moe_topk_softmax_bias = "Bias-add router arm for zero-expert models (init.rs:321); zero_expert_num=0 on this checkpoint — resolved moe_topk_sig serves."
+moe_topk_softmax_bias_batched = "Batched twin (init.rs:326); same."
+moe_zero_expert_add = "Zero-expert score patch (init.rs:331); dead with zero_expert_num=0."
+
+[expected_absent.moe_topk_sqrt]
+moe_topk_sqrtsoftplus = "DeepSeek sqrt-softplus router arm (init.rs:307); lazy try_kernel — this model uses sigmoid routing."
+moe_topk_sqrtsoftplus_batched = "Batched twin (init.rs:312); same."
+
+[expected_absent.moe_w8a8_grouped_gemm]
+moe_w8a8_grouped_gemm = "W8A8 grouped-GEMM expert arm (init.rs:200); dtype-gated — NVFP4 ptrtable arm resolves."
+moe_w8a8_grouped_gemm_pm4 = "PM4-geometry twin (init.rs:207); same gate."
+
+# ── GDN/SSM: alternative recurrence + h-state arms ─────────────────────────
+# The serving spine is gated_delta_rule_fla::chunk_delta_h_vfused (logged
+# 'GDN state spine:' at boot, resolved). Decode verify uses wy2/wy3/wy4
+# (all resolve). Everything below is a variant arm gated on handle!=0.
+[expected_absent.gated_delta_rule_fla]
+gated_delta_rule_chunk_delta_h_ksplit = "Pre-vfused state spine; vfused resolves and is default (init.rs:237-256 logs the pick)."
+gated_delta_rule_chunk_delta_h_tc_vblock = "Tensor-core vblock twin; unselected."
+gated_delta_rule_chunk_delta_h_tma = "TMA-descriptor variant (sm90+); not applicable to gfx1151."
+
+[expected_absent.gated_delta_rule_regresident]
+gated_delta_rule_prefill_regresident = "Register-resident prefill spine alternate; persistent/chunk paths resolve."
+
+[expected_absent.gated_delta_rule_wy2_resident]
+gated_delta_rule_wy2_resident = "gb10-only register-resident wy2 twin; init comment: 'non-gb10 targets simply resolve 0 and keep the base wy2' (resolved)."
+
+[expected_absent.gated_delta_rule_wy2_resident_f16]
+gated_delta_rule_wy2_resident_f16 = "FP16 h-state twin of the above; additionally needs ATLAS_SSM_H_FP16 (off — preflight would refuse --speculative without twins)."
+
+[expected_absent.gated_delta_rule_wy3_resident]
+gated_delta_rule_wy3_resident = "gb10-only register-resident wy3 twin; base wy3 resolves."
+
+[expected_absent.gated_delta_rule_wy3_resident_f16]
+gated_delta_rule_wy3_resident_f16 = "FP16 h-state twin; ATLAS_SSM_H_FP16 off."
+
+[expected_absent.gated_delta_rule_wy3_f16]
+gated_delta_rule_wy3_f16 = "FP16 h-state wy3; ATLAS_SSM_H_FP16 only (off)."
+
+[expected_absent.gated_delta_rule_wy4_f16]
+gated_delta_rule_wy4_f16 = "FP16 h-state wy4; same flag, off."
+
+[expected_absent.gated_delta_rule_wy_f16]
+gated_delta_rule_wy2_f16 = "FP16 h-state wy2; same flag, off."
+
+[expected_absent.ssm_h_dtype]
+ssm_h_state_f16_to_f32 = "FP16 h-state converter; only under ATLAS_SSM_H_FP16 (off; preflight refuses the flag without the wy_f16 twins anyway)."
+ssm_h_state_f32_to_f16 = "Same, reverse direction."
+
+# ── attention: TurboQuant KV prefill family + fused rope + Hadamard ────────
+# All require a turboKV KV-compression mode (env/config) that this recipe
+# does not enable; the resolved prefill_paged_nvfp4 / prefill_paged arms
+# serve attention prefill. wht_bf16 and tq_plus_innerq are the Hadamard /
+# inner-quant machinery of the same feature family.
+[expected_absent.prefill_paged_turbo2]
+inferspark_prefill_paged_turbo2 = "Turbo2 K/V prefill; turboKV modes off (bf16 KV cache in recipe). Resolved prefill_paged_nvfp4 serves."
+
+[expected_absent.prefill_paged_turbo3]
+inferspark_prefill_paged_turbo3_64 = "Same family, BR=64."
+
+[expected_absent.prefill_paged_turbo4]
+inferspark_prefill_paged_turbo4 = "Same family."
+inferspark_prefill_paged_turbo4_64 = "Same family, BR=64."
+
+[expected_absent.prefill_paged_turbo8]
+inferspark_prefill_paged_turbo8_64 = "Same family, 8-bit-V tile BR=64."
+
+[expected_absent.prefill_paged_bf16k_turbo2v]
+inferspark_prefill_paged_bf16k_turbo2v_64 = "BF16-K + Turbo2-V asym prefill; turboKV off."
+
+[expected_absent.prefill_paged_bf16k_turbo3v]
+inferspark_prefill_paged_bf16k_turbo3v_64 = "BF16-K + Turbo3-V; turboKV off."
+
+[expected_absent.prefill_paged_bf16k_turbo4v]
+inferspark_prefill_paged_bf16k_turbo4v_64 = "BF16-K + Turbo4-V; turboKV off."
+
+[expected_absent.prefill_paged_fp8k_turbo2v]
+inferspark_prefill_paged_fp8k_turbo2v_64 = "FP8-K + Turbo2-V; turboKV off."
+
+[expected_absent.prefill_paged_fp8k_turbo3v]
+inferspark_prefill_paged_fp8k_turbo3v_64 = "FP8-K + Turbo3-V; turboKV off."
+
+[expected_absent.prefill_paged_fp8k_turbo4v]
+inferspark_prefill_paged_fp8k_turbo4v_64 = "FP8-K + Turbo4-V; turboKV off."
+
+[expected_absent.prefill_paged_turbo3k_turbo8v]
+inferspark_prefill_paged_turbo3k_turbo8v_64 = "Both-sides Turbo3K+8V; turboKV off."
+
+[expected_absent.prefill_paged_turbo4k_turbo3v]
+inferspark_prefill_paged_turbo4k_turbo3v_64 = "Both-sides Turbo4K+3V; turboKV off."
+
+[expected_absent.prefill_paged_turbo4k_turbo8v]
+inferspark_prefill_paged_turbo4k_turbo8v_64 = "Both-sides Turbo4K+8V; turboKV off."
+
+[expected_absent.fused_k_norm_rope_cache]
+fused_k_norm_rope_cache_write_bf16 = "Fused K-norm+rope+cache-write; dispatch falls back to the separate norm/rope/reshape_and_cache kernels (all resolved)."
+fused_k_norm_rope_mrope_cache_write_bf16 = "MRoPE twin; same unfused fallback."
+
+[expected_absent.wht_bf16]
+wht_bf16_inplace = "Hadamard transform for TurboQuant+ K path; turboKV off — dead handle."
+wht_bf16_inplace_inv = "Inverse twin; same."
+
+[expected_absent.tq_plus_innerq_apply]
+tq_plus_innerq_apply_q = "TurboQuant+ inner-quant apply on Q; turboKV off."
+tq_plus_innerq_apply_k = "K-side twin; same."
+
+# ── QSA tensor-core arms + MoE persist marker (gb10-only builds) ──────────
+# Post-merge additions: qsa_score_tc / qsa_attn_tc{,2,3} and moe_persist_marker
+# are gb10 tensor-core / persistent-MoE arms with no strix-hip build; every
+# probe is a lazy try_kernel with a resolved fallback arm.
+[expected_absent.qsa_score_tc]
+qsa_score_rows_tc = "Tensor-core QSA row-score arm (qsa.rs:218); handle!=0 gate — resolved qsa_score_rows arm serves."
+
+[expected_absent.qsa_attn_tc]
+qsa_prefill_attn_tc = "Tensor-core QSA prefill-attn arm (qsa.rs:225); handle!=0 gate — resolved qsa_prefill_attn arm serves."
+
+[expected_absent.qsa_attn_tc2]
+qsa_prefill_attn_tc2 = "tc2 twin (qsa.rs:226); same gate, same fallback."
+
+[expected_absent.qsa_attn_tc3]
+qsa_prefill_attn_tc3 = "tc3 twin (qsa.rs:227); same gate, same fallback."
+
+[expected_absent.moe_persist_marker]
+moe_w4a16_k64_strides_m_tiles = "Persistent-MoE marker probe (moe/init.rs:466); not built for strix-hip — dead handle probe."
+
+# ── misc optional features ─────────────────────────────────────────────────
+[expected_absent.token_overlay]
+embed_rowdiff_bf16 = "Routed-token overlay feature; every hook guards kernel.0==0 (token_overlay.rs:31) — feature unused on this dense model."
+embed_overlay_routed_bf16 = "Same feature."
+lmhead_overlay_routed_bf16 = "Same feature."
+lmhead_overlay_routed_f32 = "Same feature."
+
+[behavior]
+# Qwen3.8-Flash-Next is a THINKING model whose chat template gates
+# EVERYTHING on `enable_thinking is undefined or true`: the default render
+# carries a reasoning-effort system preamble ("Reasoning effort is set to
+# xhigh...") and opens the assistant turn with `<think>\n`. Atlas always
+# passes enable_thinking as a DEFINED boolean, and with thinking_default
+# unset (= false) it rendered a bare 13-token prompt the model was never
+# trained on — which collapsed chat to a 2-token EOS while raw completions
+# were fine. Measured 2026-08-26: the checkpoint's own render answers
+# "12 x 8" with a correct reasoned 96; the bare render emits "**<eos>".
+# Same setting as qwen3.8-27b / qwen3.6-35b: reasoning by default.
+thinking_default = true
+thinking_in_tools = true
+# BF16 KV IS THE DEFAULT FOR THIS TARGET, not a flag the operator must know.
+#
+# The checkpoint ships NO k_scale/v_scale, so the engine's FP8 KV default falls
+# back to scale 1.0 and silently clips BF16 into E4M3's [-448, 448]. That costs
+# coherence at long context — precisely where it is hardest to attribute to the
+# KV dtype rather than to the model. It warns, but a warning in a 200-line load
+# log is not a control.
+#
+# Same reason gemma-4-31b and longcat-flash-lite set it. Precedence is
+# CLI > MODEL.toml > engine default, so `--kv-cache-dtype` still overrides for
+# anyone deliberately measuring FP8.
+#
+# THIS FILE IS A BUILD-TIME INPUT. `atlas-kernels`' build script bakes these
+# keys into the binary, so pulling this change and running an EXISTING binary
+# still gets the FP8 default — silently, since the only signal is one warning
+# in a 200-line load log. Rebuild, or pass `--kv-cache-dtype bf16` until you
+# do. Cost me an aborted benchmark run: the tell was the KV block size, 16384
+# bytes instead of the 32768 that BF16 gives.
+#
+# Anything that builds from source is immune, which is both runners here
+# (`scripts/dev/qwen4exp_quickstart.sh` and the Dockerfile).
+default_kv_dtype = "bf16"
+# ONE DRAFT, FOR THE SAME REASON BF16 KV IS THE DEFAULT: the right value is a
+# property of this target, not something the operator should have to know.
+#
+# K = num_drafts + 1, and the engine's K ladder (`4:3,8:3,16:1,32:1`) would
+# otherwise ask for 3 drafts at every width this box can serve -- which is the
+# one depth that LOSES here (-2.4% at C=1). At 1 draft MTP is +18.4%. The
+# measured break-even is `tokens/step > 1 + ~0.4*(K-1)`: each verify row routes
+# to its own top-10 of 512 experts, so expert weight traffic scales with rows
+# (~0.4 of a decode step per extra row) while acceptance only buys ~0.6 tokens.
+# K=2 clears it best (1.83 delivered vs 1.47 cost = 1.25x); K=3 delivers more
+# but costs more still (2.56 vs 2.17 = 1.18x).
+#
+# Precedence is CLI > MODEL.toml > engine default, so `--num-drafts` still
+# overrides for anyone deliberately measuring a deeper K. Like every key in
+# this file it is a BUILD-TIME input: an existing binary keeps the ladder's
+# depth until it is rebuilt.
+default_num_drafts = 1
+# WITHOUT THIS, TOOL CALLING IS SILENTLY OFF. `tools_active` in
+# `api/chat/prepare.rs` requires `state.tool_call_parser.is_some()`, and with
+# no parser configured the tool definitions are never passed to Jinja at all —
+# so the template's `{%- if tools ... %}` branch falls through, the model is
+# told nothing about any function, and it answers from its own knowledge.
+# Measured 2026-08-27 on a BFCL-style subset: 1/6, and the one pass was the
+# irrelevance case (declining to call is trivially correct when you have not
+# been given tools). The model's reasoning said so outright — "I don't have
+# access to ... any tools that would let me check current conditions."
+#
+# qwen3_coder, not hermes: this checkpoint's own template instructs the XML
+# call syntax, not hermes JSON —
+#   <tool_call><function=NAME><parameter=K>v</parameter></function></tool_call>
+# which is what `qwen3_coder` parses (`<function=X>` / `<parameter=K>`, Qwen's
+# `=` syntax). Same parser the qwen3.6-35b-a3b target documents as its proven
+# path after qwen3_xml garbled arguments there.
+tool_call_parser = "qwen3_coder"
+# Card sampling presets ([sampling.*] above) apply to core chat/completions
+# requests too — without this a plain request gets Atlas's generic CLI
+# defaults (incl. min_p 0.08 + top_n_sigma 1.0, which gut the card's
+# temp-1.0 thinking distribution). NOTE this key lives in [behavior]; placed
+# after a [sampling.*] header it silently becomes a preset key and does
+# nothing — the exact trap that shipped 2026-08-26.
+use_sampling_presets_for_core = true
+# ...but NOT the card's non-thinking presence_penalty = 1.5 for core requests
+# that leave penalties unset. That value is tuned for short chat turns; on a
+# 20K-token single-file build (2026-09-04 tower-defense benchmark, this
+# checkpoint on a GB10) it suppressed every already-emitted token and the
+# engine shipped dead/inert files twice, while the identical engine and
+# sampler with presence 0 wrote a working 51 KB game. Tool-calling requests
+# still inherit [sampling.tools]; explicit request values always win.
+use_sampling_preset_penalties_for_core = false
+# ATLAS_MOE_DECODE_ARM=grouped routes every layer's single-token MoE through the
+# tensor-core grouped-GEMM arm (forward_prefill M=1) instead of the scalar FP32-FMA
+# gemv arm. A/B lever for the 2026-09-04 llama.cpp gap study; default stays scalar.
+# The A4 POST_THINK_MIN_REASONING floor (-8 on `</think>` for the first 16
+# think tokens) collides with this model's card-native brief thinking:
+# under `reasoning_effort: low` the model closes its think at ~10 tokens,
+# and with `</think>` suppressed the turn-ending mass reroutes to
+# <|im_end|>/<|im_start|> — sampled runs EOS inside think (empty body) or
+# simulate new template turns (word salad). Measured 2026-08-26 via
+# ATLAS_LOGIT_DUMP: steps 11-13 topped by im_end/im_start while </think>
+# reappears at logit ~6 the moment the floor expires. 0 disables the floor.
+min_reasoning_floor_tokens = 0
+# When the model does sample an EOS inside <think> (temp 1.0 makes this
+# reachable), honor it by closing the block instead of swallowing the token
+# and forcing continued reasoning — the swallow path is what turned early
+# closes into <|im_start|>user template simulation.
+honor_eos_inside_thinking = true
+max_thinking_budget = 2048
+# Guards carried over from the Atlas-Inf side of the merge: cap the think
+# budget at the request's own max_tokens rather than letting a 2048-token
+# reasoning block starve the answer, and keep the repetition watchdog on --
+# this model's greedy temp-0 behaviour includes a known repetition loop
+# (onset ~token 104 on filler prompts, exonerated from QSA by position).
+cap_thinking_at_max_tokens = true
+enable_loop_watchdog = true
