@@ -55,40 +55,6 @@ pub fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Read from `offset` into `buf` until at least `min` bytes have landed,
-/// looping over short reads; returns how many did. EOF before `min` is an
-/// error, EOF after it is not.
-///
-/// For block-granular reads (O_DIRECT) of a record that ends inside a file's
-/// last, partial block: the aligned block runs past EOF, the record does not.
-/// `read_exact_at` would fail there on bytes nobody needs. Stops as soon as
-/// `min` is covered, so it never issues a follow-up read at the unaligned
-/// offset a short O_DIRECT read leaves behind.
-pub fn read_at_least_at(f: &File, buf: &mut [u8], offset: u64, min: usize) -> io::Result<usize> {
-    assert!(
-        min <= buf.len(),
-        "read_at_least_at: min {min} > buf {}",
-        buf.len()
-    );
-    let (mut off, mut done) = (offset, 0usize);
-    while done < min {
-        let n = read_at(f, &mut buf[done..], off)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "positional read hit EOF after {done} of {min} needed bytes ({} requested) \
-                     at offset {off}",
-                    buf.len()
-                ),
-            ));
-        }
-        done += n;
-        off += n as u64;
-    }
-    Ok(done)
-}
-
 #[cfg(unix)]
 fn write_at(f: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
@@ -144,35 +110,6 @@ mod tests {
         // Reading past the end must fail, not silently return short.
         let mut past = vec![0u8; 8192];
         assert!(read_exact_at(&f, &mut past, 4096).is_err());
-
-        drop(f);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // A block-sized read whose record ends before EOF succeeds with the short
-    // count; one whose record runs past EOF still fails.
-    #[test]
-    fn read_at_least_tolerates_eof_past_the_record() {
-        let dir = std::env::temp_dir().join(format!("atlas_pio_min_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("tail.bin");
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        // 5000 bytes: the second 4 KiB block holds only 904 of them.
-        let data: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
-        write_all_at(&f, &data, 0).unwrap();
-
-        let mut block = vec![0u8; 4096];
-        assert_eq!(read_at_least_at(&f, &mut block, 4096, 904).unwrap(), 904);
-        assert_eq!(&block[..904], &data[4096..]);
-        assert!(read_at_least_at(&f, &mut block, 4096, 905).is_err());
-        // Unchanged contract for the strict reader.
-        assert!(read_exact_at(&f, &mut block, 4096).is_err());
 
         drop(f);
         let _ = std::fs::remove_dir_all(&dir);
