@@ -109,18 +109,27 @@ pub fn w8a16_gemv_batch4(
 /// `_vl2` twin (8 outputs/block -> launch with `w8a16_gemv_batch4_vl2`). 0-handles = not linked.
 pub fn fp8_verify_gemv_tier(
     m: usize,
-    vl2_on: bool,
+    vl2_mode: crate::layers::ops::GemvVl2Mode,
     batch8: KernelHandle,
     batch8_vl2: KernelHandle,
     batch8_dyn_vl2: KernelHandle,
     batch16: KernelHandle,
 ) -> (KernelHandle, bool) {
+    use super::GemvVl2Mode;
     if m <= 8 {
-        if vl2_on && m == 8 && batch8_vl2.0 != 0 {
-            return (batch8_vl2, true);
-        }
-        if vl2_on && batch8_dyn_vl2.0 != 0 {
-            return (batch8_dyn_vl2, true);
+        if vl2_mode != GemvVl2Mode::Off {
+            // Dyn mode prefers the guarded twin even at m == 8 (leaner VGPR
+            // profile); Fixed takes the guard-free twin at 8 with dyn as
+            // fallback either way.
+            if m == 8 && vl2_mode == GemvVl2Mode::Fixed && batch8_vl2.0 != 0 {
+                return (batch8_vl2, true);
+            }
+            if batch8_dyn_vl2.0 != 0 {
+                return (batch8_dyn_vl2, true);
+            }
+            if m == 8 && batch8_vl2.0 != 0 {
+                return (batch8_vl2, true);
+            }
         }
         if batch8.0 != 0 {
             return (batch8, false);
@@ -195,16 +204,19 @@ mod tests {
         let d8 = KernelHandle(3);
         let b16 = KernelHandle(4);
         let z = KernelHandle(0);
-        let pick = |m: usize, on: bool, a, b, c, d| {
-            let (k, v) = fp8_verify_gemv_tier(m, on, a, b, c, d);
+        use crate::layers::ops::GemvVl2Mode::{Dyn, Fixed, Off};
+        let pick = |m: usize, mode: crate::layers::ops::GemvVl2Mode, a, b, c, d| {
+            let (k, v) = fp8_verify_gemv_tier(m, mode, a, b, c, d);
             (k.0, v)
         };
-        assert_eq!(pick(8, true, b8, v8, d8, b16), (2, true));
-        assert_eq!(pick(6, true, b8, v8, d8, b16), (3, true));
-        assert_eq!(pick(8, true, b8, z, d8, b16), (3, true));
-        assert_eq!(pick(7, false, b8, v8, d8, b16), (1, false));
-        assert_eq!(pick(8, true, b8, z, z, b16), (1, false));
-        assert_eq!(pick(8, true, z, z, z, b16), (4, false));
-        assert_eq!(pick(12, true, b8, v8, d8, b16), (4, false));
+        assert_eq!(pick(8, Fixed, b8, v8, d8, b16), (2, true));
+        assert_eq!(pick(6, Fixed, b8, v8, d8, b16), (3, true));
+        assert_eq!(pick(8, Fixed, b8, z, d8, b16), (3, true));
+        assert_eq!(pick(7, Off, b8, v8, d8, b16), (1, false));
+        assert_eq!(pick(8, Fixed, b8, z, z, b16), (1, false));
+        assert_eq!(pick(8, Fixed, z, z, z, b16), (4, false));
+        assert_eq!(pick(12, Fixed, b8, v8, d8, b16), (4, false));
+        assert_eq!(pick(8, Dyn, b8, v8, d8, b16), (3, true));
+        assert_eq!(pick(8, Dyn, b8, v8, z, b16), (2, true));
     }
 }

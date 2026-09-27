@@ -124,9 +124,33 @@ impl DenseFfnLayer {
         // vl2 wins when both twins resolved and the lever is on (bit-identical
         // output; the fall-through arms keep the vl1 handles). `vl2` switches
         // the launch grid ceil(n/4) -> ceil(n/8) via the ops::*_vl2 wrappers.
-        let vl2 = ops::gemv_vl2_enabled();
+        // Mode Dyn prefers the guarded `_dyn_vl2` twins even at m == 8 (leaner
+        // VGPR profile); Fixed takes the guard-free fixed pair at 8.
+        let vl2_mode = ops::gemv_vl2_mode();
+        let vl2 = vl2_mode != ops::GemvVl2Mode::Off;
+        let dyn_first = vl2_mode == ops::GemvVl2Mode::Dyn;
         let (gemv_k, dual_k, use_vl2) = if m == 8 {
-            let (gk, dk, v) = if vl2
+            let (gk, dk, v) = if dyn_first {
+                if self.dp4a_gemv_batch8_dyn_vl2_k.0 != 0 && self.dp4a_dual_batch8_dyn_vl2_k.0 != 0
+                {
+                    (
+                        self.dp4a_gemv_batch8_dyn_vl2_k,
+                        self.dp4a_dual_batch8_dyn_vl2_k,
+                        true,
+                    )
+                } else if vl2
+                    && self.dp4a_gemv_batch8_vl2_k.0 != 0
+                    && self.dp4a_dual_batch8_vl2_k.0 != 0
+                {
+                    (
+                        self.dp4a_gemv_batch8_vl2_k,
+                        self.dp4a_dual_batch8_vl2_k,
+                        true,
+                    )
+                } else {
+                    (self.dp4a_gemv_batch8_k, self.dp4a_dual_batch8_k, false)
+                }
+            } else if vl2
                 && self.dp4a_gemv_batch8_vl2_k.0 != 0
                 && self.dp4a_dual_batch8_vl2_k.0 != 0
             {

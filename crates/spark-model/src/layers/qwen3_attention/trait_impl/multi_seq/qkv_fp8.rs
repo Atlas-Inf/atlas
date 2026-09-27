@@ -37,7 +37,7 @@ impl Qwen3AttentionLayer {
         } else {
             ops::fp8_verify_gemv_tier(
                 n,
-                ops::gemv_vl2_enabled(),
+                ops::gemv_vl2_mode(),
                 self.w8a16_gemv_batch8_k,
                 self.w8a16_gemv_batch8_vl2_k,
                 self.w8a16_gemv_batch8_dyn_vl2_k,

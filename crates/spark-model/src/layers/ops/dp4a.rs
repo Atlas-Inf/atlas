@@ -41,9 +41,30 @@ pub fn dp4a_enabled() -> bool {
 /// thread for 2x memory-level parallelism. Default ON on HIP; the vl2 kernels
 /// only exist in the strix-hip target, so non-HIP callers never resolve them.
 /// Bit-identical outputs; A/B from one binary.
+/// `ATLAS_GEMV_VL2` selects the virtual-lane (VLANES=2) verify-GEMV mode:
+/// `0` = off, unset/`1` = `Fixed` (the `_vl2` twins, compile-time M==8),
+/// `dyn` = `Dyn` (the `_dyn_vl2` twins — runtime-guarded M, but the leaner
+/// register profile). Bit-identical outputs either way; the mode exists so
+/// one binary can A/B all three arms. vl2 kernels exist only in the
+/// strix-hip target, so non-HIP callers never resolve them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GemvVl2Mode {
+    Off,
+    Fixed,
+    Dyn,
+}
+
+pub fn gemv_vl2_mode() -> GemvVl2Mode {
+    static MODE: std::sync::OnceLock<GemvVl2Mode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("ATLAS_GEMV_VL2").as_deref() {
+        Ok("0") => GemvVl2Mode::Off,
+        Ok("dyn") => GemvVl2Mode::Dyn,
+        _ => GemvVl2Mode::Fixed,
+    })
+}
+
 pub fn gemv_vl2_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("ATLAS_GEMV_VL2").as_deref() != Ok("0"))
+    gemv_vl2_mode() != GemvVl2Mode::Off
 }
 
 /// Eligibility for the guard-free M=4 DP4A batch4 GEMV arm. `m` must be
