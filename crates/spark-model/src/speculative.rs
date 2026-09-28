@@ -345,6 +345,52 @@ pub trait DraftProposer: Send + Sync {
     /// being replaced or dropped).
     fn free_drafter_kv(&self, _blocks: &[u32]) {}
 
+    /// DFlash ctx carry (the Option-B drafter analogue of
+    /// `take_drafter_kv`): move this sequence's drafter ctx — hidden
+    /// accumulator, paged KV blocks, watermarks — into the proposer's
+    /// single carry slot so the next turn of the same session can adopt it
+    /// instead of re-projecting the whole prompt (~6.5 s at 16K ctx on
+    /// gfx1151) and, critically, instead of proposing blind over the
+    /// cached prefix (warm turns never re-capture those hiddens). The
+    /// state is left emptied (null acc, empty block table) so the
+    /// subsequent `free_state` releases nothing. `tokens` is the sequence's
+    /// full token list, kept for prefix validation at adopt time.
+    /// Returns true when the ctx was carried.
+    fn carry_dflash_ctx(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _state: &mut dyn ProposerState,
+        _tokens: &[u32],
+    ) -> bool {
+        false
+    }
+
+    /// Inverse of [`Self::carry_dflash_ctx`]: adopt the carried ctx into a
+    /// fresh state when the carried tokens are a prefix of `prompt`.
+    /// Installs the accumulator + paged blocks and restores the watermarks
+    /// clamped to the adoptable rows (carried positions strictly below
+    /// `prefill_start`, so prefill captures never duplicate a position);
+    /// frees the carried resources (and, on success, the fresh state's own
+    /// accumulator) correctly either way. Returns true on adoption.
+    fn adopt_dflash_ctx(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _state: &mut dyn ProposerState,
+        _prompt: &[u32],
+        _prefill_start: usize,
+    ) -> bool {
+        false
+    }
+
+    /// Lazily populate the per-seq ctx accumulator (pop a pooled buffer or
+    /// allocate + zero a fresh one). Called at the first prefill capture —
+    /// AFTER `adopt_dflash_ctx`, which may install the carried buffer — so
+    /// a validated carry costs zero new device allocations and a rejected
+    /// carry's buffer comes straight back out of the reuse pool.
+    fn acquire_ctx_acc(&self, _gpu: &dyn GpuBackend, _state: &mut dyn ProposerState) -> Result<()> {
+        Ok(())
+    }
+
     /// Append drafter rows at KV slots `row_base ..` with RoPE positions
     /// `pos_base ..` from `(tokens, hiddens)` pairs — the catch-up feed.
     /// Returns rows written (0 = unsupported/no-op).
