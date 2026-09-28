@@ -167,8 +167,11 @@ impl Qwen3SsmLayer {
         // accepted prefix after accept. `h_state_intermediates` are unused
         // under defer (arg kept for the signature; the MODE-1 kernel never
         // reads it).
+        // `!fp16` mirrors the host-side `gdn_deferred_wyn` gate — wyN has
+        // no FP16-h-state twin, and the flag must never disagree with what
+        // actually launched.
         let defer = Self::gdn_defer_active(
-            ctx.levers.gdn_deferred_commit,
+            ctx.levers.gdn_deferred_commit && !super::ssm_h_fp16_enabled(),
             num_tokens,
             if (5..=16).contains(&num_tokens) {
                 self.gdn_wyn_defer_k[num_tokens - 5]
@@ -178,18 +181,29 @@ impl Qwen3SsmLayer {
             self.gdn_commit_k,
         );
         if defer {
-            let qkv_bytes = num_tokens * conv_dim * bf16;
-            let gb_bytes = num_tokens * nv * 2 * fp32;
-            if ssm_state.gdn_commit_qkv.is_null() {
-                // 16-row cap (wyN ceiling); allocated once per layer slot.
-                ssm_state.gdn_commit_qkv = ctx.gpu.alloc(16 * conv_dim * bf16)?;
-                ssm_state.gdn_commit_gb = ctx.gpu.alloc(16 * nv * 2 * fp32)?;
-            }
-            ctx.gpu
-                .copy_d2d_async(conv_out_buf, ssm_state.gdn_commit_qkv, qkv_bytes, stream)?;
-            ctx.gpu
-                .copy_d2d_async(gates_buf, ssm_state.gdn_commit_gb, gb_bytes, stream)?;
-            ssm_state.gdn_commit_pending = true;
+            // Staging copies into pool-stable per-slot buffers — they MAY
+            // run inside a captured verify graph: pool pointers are
+            // replay-stable and a captured memcpy re-copies on replay, so
+            // replays re-stage correctly. `gdn_commit_pending` is NOT set
+            // here: host code does not run on replay, so the flag is
+            // assigned at the verify dispatch entry instead
+            // (`mark_gdn_deferred_commit`).
+            anyhow::ensure!(
+                !ssm_state.gdn_commit_qkv.is_null() && !ssm_state.gdn_commit_gb.is_null(),
+                "deferred commit staging missing — the pool was built without                  ATLAS_GDN_DEFERRED_COMMIT"
+            );
+            ctx.gpu.copy_d2d_async(
+                conv_out_buf,
+                ssm_state.gdn_commit_qkv,
+                num_tokens * conv_dim * bf16,
+                stream,
+            )?;
+            ctx.gpu.copy_d2d_async(
+                gates_buf,
+                ssm_state.gdn_commit_gb,
+                num_tokens * nv * 2 * fp32,
+                stream,
+            )?;
         }
         let wy_kernel = if defer {
             self.gdn_wyn_defer_k[num_tokens - 5]

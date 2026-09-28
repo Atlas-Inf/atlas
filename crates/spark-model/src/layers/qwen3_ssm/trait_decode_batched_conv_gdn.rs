@@ -686,14 +686,9 @@ impl Qwen3SsmLayer {
             // The wyN launch writes Hi_t at h_state_intermediates[0] +
             // t*h_bytes — require the pool-contiguous layout it assumes
             // (always true for ssm_pool slots); fail safe to the sequential
-            // fallback otherwise instead of corrupting memory.
-            let h_base = ssm_state.h_state_intermediates[0];
-            ssm_state
-                .h_state_intermediates
-                .iter()
-                .take(num_tokens - 1)
-                .enumerate()
-                .all(|(t, p)| p.0 == h_base.0 + (t * h_bytes) as u64)
+            // fallback otherwise instead of corrupting memory. Shared with
+            // the host-side pending mark (SsmLayerState::h_inter_pool_layout).
+            ssm_state.h_inter_pool_layout(num_tokens, h_bytes)
         }) {
             // ── K∈{5..16} chain verify: fused WY-Chunkwise path (wy5..wy16,
             // one K-templated kernel source). Removes the serial per-token

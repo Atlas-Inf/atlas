@@ -158,7 +158,7 @@ impl Qwen3SsmLayer {
         // each seq's conv-out + gate/beta rows are stashed per slot below
         // for `gated_delta_rule_commit` at accept.
         let gdn_defer = Self::gdn_defer_active(
-            ctx.levers.gdn_deferred_commit,
+            ctx.levers.gdn_deferred_commit && !super::ssm_h_fp16_enabled(),
             kk,
             if (5..=16).contains(&kk) {
                 self.gdn_wyn_defer_k[kk - 5]
@@ -320,19 +320,21 @@ impl Qwen3SsmLayer {
         let beta_ptr = gates_buf.offset(nv * fp32);
         let hi = |t: usize| wy_tables.offset(t * VERIFY_WY_TABLE_STRIDE_BYTES);
         if gdn_defer {
-            // Stash this verify's conv-out q/k/v + gate/beta rows into
-            // each sequence's per-slot commit staging — the shared
-            // conv_out_buf/gates_buf scratch is reused next forward.
+            // Stash this verify's conv-out q/k/v + gate/beta rows into each
+            // sequence's per-slot commit staging (pool-stable — these copies
+            // may be captured and replayed). `gdn_commit_pending` is NOT set
+            // here — host code never runs on graph replay; the flag is
+            // assigned at the dispatch entry (`mark_gdn_deferred_commit`).
             let qkv_seq_bytes = kk * conv_dim * bf16;
             let gb_seq_bytes = kk * nv * 2 * fp32;
             for st in states.iter_mut() {
                 let Some(ssm) = st.as_any_mut().downcast_mut::<SsmLayerState>() else {
                     return Ok(self.gdn_multi_decline(n, kk));
                 };
-                if ssm.gdn_commit_qkv.is_null() {
-                    ssm.gdn_commit_qkv = ctx.gpu.alloc(16 * conv_dim * bf16)?;
-                    ssm.gdn_commit_gb = ctx.gpu.alloc(16 * nv * 2 * fp32)?;
-                }
+                anyhow::ensure!(
+                    !ssm.gdn_commit_qkv.is_null() && !ssm.gdn_commit_gb.is_null(),
+                    "deferred commit staging missing — the pool was built                      without ATLAS_GDN_DEFERRED_COMMIT"
+                );
             }
             for (i, st) in states.iter_mut().enumerate() {
                 let ssm = st
@@ -351,7 +353,6 @@ impl Qwen3SsmLayer {
                     gb_seq_bytes,
                     stream,
                 )?;
-                ssm.gdn_commit_pending = true;
             }
         }
         match kk {

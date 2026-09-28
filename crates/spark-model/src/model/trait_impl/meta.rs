@@ -314,6 +314,12 @@ impl TransformerModel {
                             .conv_state_intermediates
                             .push(self.ssm_pool.conv_intermediate(ssm_layer_idx, slot, t));
                     }
+                    // Deferred-commit input staging: pool-stable addresses —
+                    // the staging copies run inside captured verify graphs,
+                    // so lazy host alloc there would be wrong twice over
+                    // (capture-illegal and replay-invisible).
+                    ssm_state.gdn_commit_qkv = self.ssm_pool.commit_qkv(ssm_layer_idx, slot);
+                    ssm_state.gdn_commit_gb = self.ssm_pool.commit_gb(ssm_layer_idx, slot);
                 }
 
                 layer_states.push(Box::new(ssm_state));

@@ -81,13 +81,16 @@ pub struct SsmLayerState {
     /// verify-row conv-out q/k/v (`[K_cap][conv_dim]` BF16) and gate/beta
     /// (`[K_cap][2*nv]` FP32) rows the wyN kernel consumed, copied here so
     /// `gated_delta_rule_commit` can replay the accepted prefix after the
-    /// shared ctx.buffers scratch is reused. DevicePtr(0) until the first
-    /// deferred verify on this (layer, slot) allocates it.
+    /// shared ctx.buffers scratch is reused. POOL-STABLE per (layer, slot)
+    /// — repointed at slot-bind alongside `h_state`; `DevicePtr(0)` when
+    /// the lever is off.
     pub gdn_commit_qkv: DevicePtr,
     pub gdn_commit_gb: DevicePtr,
-    /// Set by a deferred wyN verify on this layer — `h_state` still holds
-    /// H0 and the accept path must commit via `gated_delta_rule_commit`
-    /// rather than the intermediates index-select. Cleared at commit.
+    /// Set at the VERIFY DISPATCH entry (host side — never inside a
+    /// captured forward) when this layer's wyN verify ran deferred:
+    /// `h_state` still holds H0 and the accept path must commit via
+    /// `gated_delta_rule_commit` rather than the intermediates index-select.
+    /// Cleared at commit / rollback.
     pub gdn_commit_pending: bool,
     /// Storage dtype of `h_state`: `false` = FP32, `true` = FP16
     /// (`--ssm-h-dtype f16`).
@@ -122,6 +125,26 @@ pub struct SsmLayerState {
     /// only on the layer that hosts a `PleLayer` (Avarok #753 item B: one per
     /// in-flight sequence, lazily created on the sequence's first pass).
     pub ple: Option<crate::layers::ple::PleSeqState>,
+}
+
+impl SsmLayerState {
+    /// Whether this sequence's `h_state_intermediates` back a wyN launch
+    /// at `num_tokens = k`: needs ≥ k−1 entries at the pool-contiguous
+    /// `h_bytes` stride the kernel assumes (`Hi_t` at
+    /// `base + t·h_bytes`). Shared SSOT — the layer's dispatch filter and
+    /// the host-side `mark_gdn_deferred_commit` must agree exactly, or the
+    /// pending flag and the launched kernel diverge under graph replay.
+    pub fn h_inter_pool_layout(&self, k: usize, h_bytes: usize) -> bool {
+        if self.h_state_intermediates.len() < k.saturating_sub(1) || k < 2 {
+            return false;
+        }
+        let h_base = self.h_state_intermediates[0];
+        self.h_state_intermediates
+            .iter()
+            .take(k - 1)
+            .enumerate()
+            .all(|(t, p)| p.0 == h_base.0 + (t * h_bytes) as u64)
+    }
 }
 
 impl LayerState for SsmLayerState {
