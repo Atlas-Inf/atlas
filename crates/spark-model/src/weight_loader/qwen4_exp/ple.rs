@@ -291,7 +291,11 @@ pub(super) fn load(
         );
     }
     if let Some(d) = single {
-        anyhow::ensure!(d.shape.len()==2, "PLE: `{single_name}` shape {:?}, expected 2-D", d.shape);
+        anyhow::ensure!(
+            d.shape.len() == 2,
+            "PLE: `{single_name}` shape {:?}, expected 2-D",
+            d.shape
+        );
         rows_per = d.shape[0];
         head_dim = d.shape[1];
         dtype = Some(d.dtype);
