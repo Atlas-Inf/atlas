@@ -29,12 +29,22 @@ typedef float  v8f   __attribute__((ext_vector_type(8)));
 
 // Bit-math OCP-e4m3fn decode — register ALU, no LDS. Produces the SAME value as
 // the E4M3_LUT table the base w8a16 kernels use, including the S.1111.111 NaN.
+// E4M3 -> fp32, bit-exact to the reference decode it replaces (normal, subnormal,
+// e4m3fn NaN -> qNaN, sign) in ~6 VALU instead of ~14 with selects. (b & 0x7F) << 20
+// as an fp32 is |E4M3| * 2^-120; for E4M3 subnormals it is an fp32 DENORMAL
+// (m * 2^-129), so * 2^120 is exact either way (this code runs with f32 denormals
+// preserved: .amdhsa_float_denorm_mode_32 3). Sign by XOR, as -v does. The caller's
+// * block_scale is unchanged, so the product rounds exactly as before. Host-checked:
+// 256 bytes x 12 scales (incl. negative, 1e-9 .. 1000): 0 fp32 bit mismatches.
+// Reference, for the record:
+//   e == 0            -> m * 2^-9
+//   e == 15 && m == 7 -> qNaN
+//   else              -> ((e + 120) << 23) | (m << 20);   negated when s
 __device__ __forceinline__ float w8n128_e4m3(unsigned char b) {
-    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
-    if (e == 0u)                v = (float)m * 0.001953125f;              // subnormal m*2^-9
-    else if (e == 15u && m == 7u) v = __uint_as_float(0x7fc00000u);       // e4m3fn NaN
-    else                        v = __uint_as_float(((e + 120u) << 23) | (m << 20));
-    return s ? -v : v;
+    const unsigned int u = b;
+    const float mag = ((u & 0x7Fu) == 0x7Fu) ? __uint_as_float(0x7fc00000u)
+                                             : __uint_as_float((u & 0x7Fu) << 20) * 0x1p120f;
+    return __uint_as_float(__float_as_uint(mag) ^ ((u & 0x80u) << 24));
 }
 
 #define W8N128_M_TILE 128   // M rows per CTA (8 warps x 16 rows)
@@ -49,6 +59,22 @@ __device__ __forceinline__ float w8n128_e4m3(unsigned char b) {
 static_assert(W8N128_FP8B % W8N128_KSTEP == 0, "K_STEP must divide the 128-K scale block");
 static_assert(W8N128_N_TILE == W8N128_FP8B, "N tile must equal one 128-N scale block");
 
+
+// Grouped (GROUP_M) CTA order: GM consecutive CTAs share one N tile across GM M tiles, so a B
+// tile is fetched from DRAM once per group instead of once per M tile. Pure index remap over
+// the same (gridDim.x x gridDim.y) set of tiles, so every output tile is computed exactly as before.
+#define W8N128_GROUP_M 8
+__device__ __forceinline__ void w8n128_swizzle_mn(unsigned int gm, unsigned int& m_tile, unsigned int& n_tile) {
+    const unsigned int num_n = gridDim.x, num_m = gridDim.y;
+    const unsigned int bid = blockIdx.y * num_n + blockIdx.x;
+    const unsigned int per_group = gm * num_n;
+    const unsigned int group = bid / per_group;
+    const unsigned int first_m = group * gm;
+    const unsigned int gsize = (num_m - first_m) < gm ? (num_m - first_m) : gm;
+    const unsigned int local = bid - group * per_group;
+    m_tile = first_m + local % gsize;
+    n_tile = local / gsize;
+}
 extern "C" __global__
 __launch_bounds__(256, 1)
 void w8a16_gemm_n_m128(
@@ -60,8 +86,10 @@ void w8a16_gemm_n_m128(
     unsigned int N,
     unsigned int K
 ) {
-    const unsigned int cta_n = blockIdx.x * W8N128_N_TILE;
-    const unsigned int cta_m = blockIdx.y * W8N128_M_TILE;
+    unsigned int m_t, n_t;
+    w8n128_swizzle_mn(W8N128_GROUP_M, m_t, n_t);
+    const unsigned int cta_n = n_t * W8N128_N_TILE;
+    const unsigned int cta_m = m_t * W8N128_M_TILE;
     if (cta_m >= M || cta_n >= N) return;
 
     const unsigned int warp_id = threadIdx.x >> 5;       // 0..7
