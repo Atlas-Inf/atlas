@@ -177,6 +177,9 @@ mod ssm_gdn_a3;
 mod ssm_gdn_b;
 #[path = "ops/ssm_gdn_batched.rs"]
 mod ssm_gdn_batched;
+#[cfg(test)]
+#[path = "ops/ssm_gdn_defer_tests.rs"]
+mod ssm_gdn_defer_tests;
 #[path = "ops/ssm_gdn_snap.rs"]
 mod ssm_gdn_snap;
 #[cfg(all(test, feature = "cuda"))]

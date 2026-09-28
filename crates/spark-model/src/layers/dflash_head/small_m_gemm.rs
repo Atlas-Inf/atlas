@@ -51,6 +51,19 @@ pub(super) fn use_small_m_gemv(enabled: bool, handle_nonzero: bool, m: u32) -> b
     enabled && handle_nonzero && (1..=DENSE_GEMV_BATCHM_MAX_M).contains(&m)
 }
 
+/// Below this M the pipelined GEMM stays — cuBLASLt's win is at the
+/// wide staged-verify rows (M≈B·γ up to 128); small-M serial calls are
+/// already cheap and KEEP today's kernel byte-for-byte.
+pub(super) const DRAFTER_CUBLAS_MIN_M: u32 = 32;
+
+/// Pure decision: cuBLASLt iff the lever resolved at construction and
+/// `m` clears the wide-verify threshold. Layout is `bf16_gemm_act_weight_t`
+/// (`out[M,N] = act[M,K] @ W[N,K]ᵀ`) — the same `[N,K]` weight layout
+/// `dense_gemm_bf16_pipelined` consumes.
+pub(super) fn use_drafter_cublas(lever_on: bool, m: u32) -> bool {
+    lever_on && m >= DRAFTER_CUBLAS_MIN_M
+}
+
 impl BlockDiffusionDraftHead {
     /// C[m,n] = A[m,k] · W[n,k]^T in BF16 — `dense_gemv_bf16_batchm`
     /// when `m ≤ 8` and the arm is enabled, `dense_gemm_bf16_pipelined`
@@ -82,6 +95,11 @@ impl BlockDiffusionDraftHead {
                 k,
                 n,
                 stream,
+            );
+        }
+        if use_drafter_cublas(self.drafter_cublas, m) {
+            return spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                src.0, w.weight.0, dst.0, m, n, k, stream,
             );
         }
         ops::dense_gemm_bf16_pipelined(
@@ -128,6 +146,19 @@ impl BlockDiffusionDraftHead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drafter_cublas_decision() {
+        // Lever on: m >= 32 routes cuBLASLt; below keeps the pipelined
+        // kernel (C=1 serial at M=γ+1 untouched). Lever off: inert.
+        assert!(use_drafter_cublas(true, 32));
+        assert!(use_drafter_cublas(true, 128));
+        assert!(!use_drafter_cublas(true, 31));
+        assert!(!use_drafter_cublas(true, 9));
+        assert!(!use_drafter_cublas(false, 128));
+        // Construction resolves `available()`; on non-CUDA stub builds it
+        // returns false, so the field (hence the route) is always off.
+    }
 
     #[test]
     fn small_m_gemv_decision() {

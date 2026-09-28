@@ -50,7 +50,15 @@
 // stride at batch_size>1 (see gated_delta_rule_wy4.cu's comment) AND drops
 // the "active sequences occupy contiguous pool slots" assumption.
 
-template <int K_TOKENS>
+// MODE: 0 = verify+store (Hi_0..Hi_{K-2} + final H, the legacy contract);
+//       1 = verify-defer (same outputs, NO state stores — h_state stays H0
+//           so `gated_delta_rule_commit` can re-apply the accepted prefix);
+//       2 = commit (runtime token count `accepted_count`, single seq;
+//           replays tokens 0..a-1 from live H0 and stores ONLY H_{a-1}).
+// `n_tok` is the runtime token bound: K_TOKENS (compile-time constant) for
+// MODE 0/1 — identical codegen — and `accepted_count` clamped to K_TOKENS for
+// MODE 2, whose loops keep the SAME per-iteration op order.
+template <int K_TOKENS, int MODE>
 __device__ __forceinline__ void gated_delta_rule_wyn_impl(
     float* __restrict__ h_state,
     const __nv_bfloat16* __restrict__ query,
@@ -61,6 +69,7 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
     __nv_bfloat16* __restrict__ output,
     float* __restrict__ h_state_inter_base,
     unsigned int inter_stride_floats,
+    unsigned int accepted_count,
     unsigned int batch_size,
     unsigned int num_k_heads,
     unsigned int num_v_heads,
@@ -74,6 +83,12 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
     const unsigned int vh = blockIdx.x;
     const unsigned int b = blockIdx.y;
     if (vh >= num_v_heads || b >= batch_size) return;
+
+    // MODE 2 is a single-sequence commit: grid.y == 1 and `accepted` is a
+    // scalar (the accepted token count, clamped to the register-cap K_TOKENS).
+    const unsigned int n_tok =
+        (MODE == 2) ? min(accepted_count, (unsigned int)K_TOKENS) : K_TOKENS;
+    if (n_tok == 0) return;
 
     const unsigned int tid = threadIdx.x;
     const unsigned int hr = num_v_heads / num_k_heads;
@@ -91,8 +106,21 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
     // h_state_inter_base + t * inter_stride_floats + ((b*nv+vh)*hv)
     // (contiguous), or inter_table[b] + vh*hv + t * inter_stride_floats
     // (table — intermediates keep their intra-slot stride).
-    float* Hi_base = state_is_table ? ((float* const*)h_state_inter_base)[b] + head_off
-                                    : h_state_inter_base + flat_off;
+    float* Hi_base =
+        h_state_inter_base
+            ? (state_is_table ? ((float* const*)h_state_inter_base)[b] + head_off
+                              : h_state_inter_base + flat_off)
+            : h_state; // MODE 1/2 pass no pool — never dereferenced
+
+    // MODE 2 (commit) is single-sequence: direct bases, row `t` indexes
+    // the per-slot staging directly. Same addresses for MODE != 2 by
+    // construction (verify packs tokens contiguously per sequence).
+    const __nv_bfloat16* const q_seq = query;
+    const __nv_bfloat16* const k_seq = key;
+    const __nv_bfloat16* const v_seq = value;
+    const float* const g_seq = gate;
+    const float* const bt_seq = beta;
+    #define WYN_ROW(t) ((MODE == 2) ? (t) : (b * K_TOKENS + (t)))
 
     // ── Load q, k, gate, beta into SMEM ──
     __shared__ float sk[K_TOKENS][128];
@@ -103,18 +131,18 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
 
     if (tid < k_dim) {
         #pragma unroll
-        for (int t = 0; t < K_TOKENS; t++) {
-            const __nv_bfloat16* q_t = query + (b * K_TOKENS + t) * qk_stride + kh * k_dim;
-            const __nv_bfloat16* k_t = key   + (b * K_TOKENS + t) * qk_stride + kh * k_dim;
+        for (int t = 0; t < n_tok; t++) {
+            const __nv_bfloat16* q_t = q_seq + WYN_ROW(t) * qk_stride + kh * k_dim;
+            const __nv_bfloat16* k_t = k_seq + WYN_ROW(t) * qk_stride + kh * k_dim;
             sq[t][tid] = (float)q_t[tid];
             sk[t][tid] = (float)k_t[tid];
         }
     }
-    if (tid < K_TOKENS) {
+    if (tid < n_tok) {
         // Gate clamp matches per-token gated_delta_rule_decode (see wy4 comment).
-        float g_raw = gate[(b * K_TOKENS + tid) * gb_stride + vh];
+        float g_raw = g_seq[WYN_ROW(tid) * gb_stride + vh];
         sg[tid] = fminf(fmaxf(g_raw, 1e-6f), 1.0f - 1e-6f);
-        sbt[tid] = beta[(b * K_TOKENS + tid) * gb_stride + vh];
+        sbt[tid] = bt_seq[WYN_ROW(tid) * gb_stride + vh];
     }
     __syncthreads();
 
@@ -124,7 +152,7 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
     __shared__ float kd_flat[K_TOKENS * (K_TOKENS - 1) / 2];
 
     #pragma unroll
-    for (int t = 1; t < K_TOKENS; t++) {
+    for (int t = 1; t < (int)n_tok; t++) {
         #pragma unroll
         for (int s = 0; s < t; s++) {
             float p = (tid < k_dim) ? sk[t][tid] * sk[s][tid] : 0.0f;
@@ -140,8 +168,8 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
         // Load v[K] for this thread's v_dim slot.
         float vi[K_TOKENS];
         #pragma unroll
-        for (int t = 0; t < K_TOKENS; t++) {
-            const __nv_bfloat16* v_t = value + (b * K_TOKENS + t) * v_stride + vh * v_dim;
+        for (int t = 0; t < n_tok; t++) {
+            const __nv_bfloat16* v_t = v_seq + WYN_ROW(t) * v_stride + vh * v_dim;
             vi[t] = (float)v_t[tid];
         }
 
@@ -157,7 +185,7 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
             float h2 = H[(j + 2) * v_dim + tid];
             float h3 = H[(j + 3) * v_dim + tid];
             #pragma unroll
-            for (int t = 0; t < K_TOKENS; t++) {
+            for (int t = 0; t < n_tok; t++) {
                 hk[t] += h0 * sk[t][j + 0] + h1 * sk[t][j + 1]
                        + h2 * sk[t][j + 2] + h3 * sk[t][j + 3];
             }
@@ -169,7 +197,7 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
         // vn[t]           = (v[t] - g[t] * hk_corrected[t]) * beta[t]
         float vn[K_TOKENS];
         vn[0] = (vi[0] - sg[0] * hk[0]) * sbt[0];
-        for (int t = 1; t < K_TOKENS; t++) {
+        for (int t = 1; t < (int)n_tok; t++) {
             float lead_prod = 1.0f;
             for (int u = 0; u < t; u++) lead_prod *= sg[u];
             float corrected = lead_prod * hk[t];
@@ -196,18 +224,23 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
             float h3 = H[(j + 3) * v_dim + tid];
 
             #pragma unroll
-            for (int t = 0; t < K_TOKENS; t++) {
+            for (int t = 0; t < n_tok; t++) {
                 h0 = sg[t] * h0 + sk[t][j + 0] * vn[t];
                 h1 = sg[t] * h1 + sk[t][j + 1] * vn[t];
                 h2 = sg[t] * h2 + sk[t][j + 2] * vn[t];
                 h3 = sg[t] * h3 + sk[t][j + 3] * vn[t];
-                if (t < K_TOKENS - 1) {
-                    float* Hi_t = Hi_base + t * inter_stride_floats;
-                    Hi_t[(j + 0) * v_dim + tid] = h0;
-                    Hi_t[(j + 1) * v_dim + tid] = h1;
-                    Hi_t[(j + 2) * v_dim + tid] = h2;
-                    Hi_t[(j + 3) * v_dim + tid] = h3;
-                } else {
+                if (MODE == 0 ? t < K_TOKENS - 1 : t < (int)n_tok - 1) {
+                    // MODE 0: per-token rollback snapshot; MODE 1/2:
+                    // nothing — defer keeps h_state at H0, commit stores
+                    // only the accepted prefix's final state.
+                    if (MODE == 0) {
+                        float* Hi_t = Hi_base + t * inter_stride_floats;
+                        Hi_t[(j + 0) * v_dim + tid] = h0;
+                        Hi_t[(j + 1) * v_dim + tid] = h1;
+                        Hi_t[(j + 2) * v_dim + tid] = h2;
+                        Hi_t[(j + 3) * v_dim + tid] = h3;
+                    }
+                } else if (MODE != 1) {
                     H[(j + 0) * v_dim + tid] = h0;
                     H[(j + 1) * v_dim + tid] = h1;
                     H[(j + 2) * v_dim + tid] = h2;
@@ -218,14 +251,18 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
             }
         }
 
-        // ── Write outputs (K rows × v_dim) ──
-        float s = rsqrtf((float)k_dim);
-        #pragma unroll
-        for (int t = 0; t < K_TOKENS; t++) {
-            output[((b * K_TOKENS + t) * num_v_heads + vh) * v_dim + tid] =
-                __float2bfloat16(qd[t] * s);
+        // ── Write outputs (K rows × v_dim) — commit recomputes the same
+        // values but writes only the state, so `output` is null there.
+        if (MODE != 2) {
+            float s = rsqrtf((float)k_dim);
+            #pragma unroll
+            for (int t = 0; t < n_tok; t++) {
+                output[((b * K_TOKENS + t) * num_v_heads + vh) * v_dim + tid] =
+                    __float2bfloat16(qd[t] * s);
+            }
         }
     }
+    #undef WYN_ROW
 }
 
 // Instantiations for chain-verify K=5..8. The argument list is identical to
@@ -251,9 +288,10 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
         unsigned int gb_stride,                                               \
         unsigned int state_is_table                                           \
     ) {                                                                       \
-        gated_delta_rule_wyn_impl<K>(                                         \
+        gated_delta_rule_wyn_impl<K, 0>(                                      \
             h_state, query, key, value, gate, beta, output,                   \
-            h_state_inter_base, inter_stride_floats, batch_size,              \
+            h_state_inter_base, inter_stride_floats, 0 /* accepted_count */,  \
+            batch_size,                                                       \
             num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, v_stride,      \
             gb_stride, state_is_table);                                       \
     }
@@ -272,3 +310,86 @@ ATLAS_WYN_INSTANTIATE(15)
 ATLAS_WYN_INSTANTIATE(16)
 
 #undef ATLAS_WYN_INSTANTIATE
+
+// Deferred verify (ATLAS_GDN_DEFERRED_COMMIT): identical extern signature —
+// the Rust launcher is the same `gdn_decode_wyn` — but MODE 1 skips every
+// Hi_t store AND the final-H store, leaving `h_state` at H0 for
+// `gated_delta_rule_commit`. `output` is still written.
+#define ATLAS_WYN_DEFER_INSTANTIATE(K)                                        \
+    extern "C" __global__ void gated_delta_rule_wy##K##_defer(                \
+        float* __restrict__ h_state,                                          \
+        const __nv_bfloat16* __restrict__ query,                              \
+        const __nv_bfloat16* __restrict__ key,                                \
+        const __nv_bfloat16* __restrict__ value,                              \
+        const float* __restrict__ gate,                                       \
+        const float* __restrict__ beta,                                       \
+        __nv_bfloat16* __restrict__ output,                                   \
+        float* __restrict__ h_state_inter_base,                               \
+        unsigned int inter_stride_floats,                                     \
+        unsigned int batch_size,                                              \
+        unsigned int num_k_heads,                                             \
+        unsigned int num_v_heads,                                             \
+        unsigned int k_dim,                                                   \
+        unsigned int v_dim,                                                   \
+        unsigned int qk_stride,                                               \
+        unsigned int v_stride,                                                \
+        unsigned int gb_stride,                                               \
+        unsigned int state_is_table                                           \
+    ) {                                                                       \
+        gated_delta_rule_wyn_impl<K, 1>(                                      \
+            h_state, query, key, value, gate, beta, output,                   \
+            h_state_inter_base, inter_stride_floats, 0 /* accepted_count */,  \
+            batch_size,                                                       \
+            num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, v_stride,      \
+            gb_stride, state_is_table);                                       \
+    }
+
+ATLAS_WYN_DEFER_INSTANTIATE(5)
+ATLAS_WYN_DEFER_INSTANTIATE(6)
+ATLAS_WYN_DEFER_INSTANTIATE(7)
+ATLAS_WYN_DEFER_INSTANTIATE(8)
+ATLAS_WYN_DEFER_INSTANTIATE(9)
+ATLAS_WYN_DEFER_INSTANTIATE(10)
+ATLAS_WYN_DEFER_INSTANTIATE(11)
+ATLAS_WYN_DEFER_INSTANTIATE(12)
+ATLAS_WYN_DEFER_INSTANTIATE(13)
+ATLAS_WYN_DEFER_INSTANTIATE(14)
+ATLAS_WYN_DEFER_INSTANTIATE(15)
+ATLAS_WYN_DEFER_INSTANTIATE(16)
+
+#undef ATLAS_WYN_DEFER_INSTANTIATE
+
+// Deferred commit (ATLAS_GDN_DEFERRED_COMMIT): replays tokens 0..a_b-1 of a
+// sequence's deferred-verify inputs against the live H0 in `h_state`,
+// storing only H_{a_b} in place — byte-identical to the storing verify's
+// `Hi_{a_b-1}` (MODE 0) / final H (a_b == K), because the impl runs the same
+// per-iteration arithmetic; only the trip count and the stores differ.
+// ALL state AND input pointers are per-sequence pointer tables (verify
+// staging is per-slot), and `accepted_count` carries the sequence's accepted
+// token count (0 → skip, >K clamps to K).
+// Grid: (num_v_heads, batch, 1)   Block: (128, 1, 1).
+extern "C" __global__ void gated_delta_rule_commit(
+    float* __restrict__ h_state,
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ key,
+    const __nv_bfloat16* __restrict__ value,
+    const float* __restrict__ gate,
+    const float* __restrict__ beta,
+    unsigned int accepted_count,
+    unsigned int num_k_heads,
+    unsigned int num_v_heads,
+    unsigned int k_dim,
+    unsigned int v_dim,
+    unsigned int qk_stride,
+    unsigned int v_stride,
+    unsigned int gb_stride
+) {
+    gated_delta_rule_wyn_impl<16, 2>(
+        h_state, query, key, value, gate, beta,
+        nullptr,           // no outputs
+        nullptr, 0,        // no intermediate pool
+        accepted_count,
+        1 /* batch */, num_k_heads, num_v_heads, k_dim, v_dim,
+        qk_stride, v_stride, gb_stride,
+        0 /* contiguous */);
+}

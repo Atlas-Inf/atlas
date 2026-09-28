@@ -106,7 +106,30 @@ impl BlockDiffusionDraftHead {
             )?;
         }
 
-        // (b) One selector launch per sequence on that sequence's slices.
+        // (b) Selector chain: one grid-wide launch (CTA = sequence) when
+        // the batched kernel resolved — job 596: 16 × 4.70 ms sequential
+        // launches on one SM each. Byte-identical per sequence: the .cu
+        // shares one `df2_selector_body` with the single-seq entry, and
+        // `batch_markov_prev` (the prologue's last_tokens upload) carries
+        // the same values passed scalar below. Fallback = per-seq loop.
+        if self.kernels.dflash2_candidate_selector_batched.0 != 0 {
+            return ops::dflash2_candidate_selector_batched(
+                ctx.gpu,
+                self.kernels.dflash2_candidate_selector_batched,
+                self.batch_logits,
+                self.batch_dflash2_projected,
+                selector.predecessor_codebook.weight,
+                selector.successor_codebook.weight,
+                self.batch_tokens,
+                self.batch_markov_prev,
+                batch_size,
+                gamma,
+                vocab,
+                rank,
+                selector.top_k as u32,
+                stream,
+            );
+        }
         let seq_logits_bytes = (gamma as usize)
             .checked_mul(vocab as usize)
             .and_then(|n| n.checked_mul(2))

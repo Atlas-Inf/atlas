@@ -17,7 +17,7 @@ use crate::tp_shard::{
 };
 use crate::weight_map::{
     DenseWeight, Fp8Weight, Nvfp4Variant, QuantizedWeight, SsmWeights, WeightQuantFormat,
-    dense_auto, dense_f32_safe, dense_keep_f32, gpu_concat_rows, interleave_ba,
+    dense_auto, dense_f32_safe, dense_keep_f32, free_loader_source, gpu_concat_rows, interleave_ba,
     load_fp8_block_scaled_as_fp8weight, load_ssm_qwen35, quantize_to_nvfp4,
 };
 
@@ -248,11 +248,24 @@ pub(crate) fn build_linear_attention_dense_bf16(
     )?;
     // `gpu_concat_rows` allocates an independent combined buffer (alloc +
     // copy_d2d), so the per-projection BF16 expansions of in_proj_qkv /
-    // in_proj_z are dead after this point. They are freshly-allocated
-    // FP8→BF16 dequant outputs (not WeightStore aliases), ~50 MB/layer ×
-    // ~30 GDN layers ≈ 1.5 GB. Free them here — identical numerics.
-    let _ = gpu.free(ssm35.in_proj_qkv.weight);
-    let _ = gpu.free(ssm35.in_proj_z.weight);
+    // in_proj_z are dead after this point (~50 MB/layer × ~30 GDN layers ≈
+    // 1.5 GB). On FP8 checkpoints they are fresh FP8→BF16 dequant outputs; on
+    // BF16 checkpoints `dense_auto` returned the WeightStore's own buffers, and
+    // a plain free would be repeated by the store at teardown.
+    // `free_loader_source` tells the two apart — identical numerics.
+    let la = format!("{lp}.linear_attn");
+    let _ = free_loader_source(
+        store,
+        gpu,
+        &format!("{la}.in_proj_qkv.weight"),
+        ssm35.in_proj_qkv,
+    );
+    let _ = free_loader_source(
+        store,
+        gpu,
+        &format!("{la}.in_proj_z.weight"),
+        ssm35.in_proj_z,
+    );
     let (qkvz_ptr, _, _) = shard_gdn_qkvz_rows(qkvz_full.weight, &dims, gpu)?;
     if tp_size > 1 {
         let _ = gpu.free(qkvz_full.weight);

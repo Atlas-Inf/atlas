@@ -91,6 +91,9 @@ impl SsmPools {
             // `--ssm-rollback-mode` (EXPERIMENTAL replay scaffold; default
             // snapshot, published by spark-server's serve_flags).
             crate::ssm_reserve::ssm_rollback_mode(),
+            // ATLAS_GDN_DEFERRED_COMMIT — build-time lever, same class as
+            // the rollback-mode global (pool geometry is fixed at boot).
+            crate::layers::ops::ModelLevers::from_env().gdn_deferred_commit,
             gpu,
         )?);
 
