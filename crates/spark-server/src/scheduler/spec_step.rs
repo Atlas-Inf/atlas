@@ -210,6 +210,19 @@ pub fn mtp_grammar_mask_for(a: &mut ActiveSeq) -> Option<Vec<i32>> {
     Some(gs.bitmask_data().to_vec())
 }
 
+/// Per-sequence pos+1 masks for a propose group (#102): same
+/// `mtp_grammar_mask_for` semantics mapped over the given sequence indexes.
+/// All-`None` is the grammarless fast path; callers pass it straight through
+/// to `run_mtp_propose_batched`.
+pub fn mtp_grammar_masks_for(
+    batch: &mut [&mut crate::scheduler::ActiveSeq],
+    idx: &[usize],
+) -> Vec<Option<Vec<i32>>> {
+    idx.iter()
+        .map(|&i| mtp_grammar_mask_for(batch[i]))
+        .collect()
+}
+
 /// BUG#4 clamp, complete fix (2026-07-09): when a grammar is active, propose
 /// only ONE draft. `run_mtp_propose_multi` masks every draft position with
 /// the SAME position-0 bitmask snapshot (`mtp_head` warns "mask held fixed

@@ -4,7 +4,7 @@
 //! GDN per-token (with intermediate checkpoints). Extracted from
 //! `trait_decode_batched.rs` to keep the parent file under 500 LoC.
 //! Dispatches one of the fused K=2/3/4 paths, the pool-layout WY arm
-//! (K∈{5..8} chain verify and K=17 DFlash — see
+//! (K∈{5..16} chain verify and K=17 DFlash — see
 //! `trait_decode_batched_conv_gdn_wyn.rs`), or the sequential per-token
 //! fallback. All buffers + state are owned by the caller; this
 //! function only mutates `ssm_state.h_state`, `ssm_state.conv_state`,
@@ -317,7 +317,7 @@ impl Qwen3SsmLayer {
     }
 
     /// Run conv1d_update_l2norm + GDN over `num_tokens` (multi-token decode
-    /// / MTP verify). Picks the K=2/3/4, K∈{5..8} (wyN) or K=17 fused WY
+    /// / MTP verify). Picks the K=2/3/4, K∈{5..16} (wyN) or K=17 fused WY
     /// path if available, otherwise falls back to the sequential per-token
     /// gdn_decode loop.
     pub(super) fn decode_batched_conv_gdn(
@@ -679,7 +679,7 @@ impl Qwen3SsmLayer {
             //
             // Shared pool-layout arm (fused conv_kn epilogue + one wy17
             // launch) — body lives in trait_decode_batched_conv_gdn_wyn.rs,
-            // dispatched identically for the chain-verify K∈{5..8} widths
+            // dispatched identically for the chain-verify K∈{5..16} widths
             // below.
             self.decode_batched_conv_gdn_wyn(ssm_state, ctx, args, self.gdn_wy17_k)?;
         } else if let Some(wyn_k) = self.wyn_kernel(num_tokens, ctx.levers.gdn_wyn).filter(|_| {
@@ -695,12 +695,12 @@ impl Qwen3SsmLayer {
                 .enumerate()
                 .all(|(t, p)| p.0 == h_base.0 + (t * h_bytes) as u64)
         }) {
-            // ── K∈{5..8} chain verify: fused WY-Chunkwise path (wy5..wy8,
+            // ── K∈{5..16} chain verify: fused WY-Chunkwise path (wy5..wy16,
             // one K-templated kernel source). Removes the serial per-token
             // GDN fallback at these widths. Kill-switch: ATLAS_GDN_WYN=0. ──
             self.decode_batched_conv_gdn_wyn(ssm_state, ctx, args, wyn_k)?;
         } else {
-            // ── No fused arm (K>17, K∈{5..8} with wyN absent/killed, or
+            // ── No fused arm (K>17, K∈{5..16} with wyN absent/killed, or
             // non-pool intermediates): sequential per-token path ──
             //
             // gated_delta_rule_decode expects FP32 Q/K/V (see kernel signature),

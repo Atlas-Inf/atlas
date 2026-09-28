@@ -255,6 +255,24 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
+        // ATLAS_OP_DUMP: k AFTER k_norm, BEFORE RoPE — same token-major
+        // [n, kv_dim] slice as the cache_skip chunk-0 site. Chunked prefill
+        // runs this paged path on every chunk-1+, so the dump file ends up
+        // holding the LAST chunk's last token (the global last token),
+        // matching the unchunked capture.
+        if num_tokens > 0 {
+            let kv_dim_e = (nkv * hd) as usize;
+            super::super::op_dump::dump_bf16(
+                ctx.gpu,
+                k_contiguous,
+                (num_tokens - 1) * kv_dim_e * bf16,
+                kv_dim_e,
+                self.attn_layer_idx,
+                "k_post_norm",
+                stream,
+            )?;
+        }
+
         // Gemma-4 v_norm — applied at EVERY layer in HF reference
         // (modeling_gemma4.py:1220 `value_states = self.v_norm(value_states)`
         // with `Gemma4RMSNorm(with_scale=False)`). For full-attention K=V
@@ -422,6 +440,32 @@ impl Qwen3AttentionLayer {
                     .unwrap_or(ctx.config.rotary_dim() as u32),
                 self.rope_theta_override
                     .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
+        }
+
+        // ATLAS_OP_DUMP: k/q AFTER RoPE — same token-major slice as the
+        // cache_skip chunk-0 sites. Every chunk-1+ call overwrites, so the
+        // surviving capture is the global last token.
+        if num_tokens > 0 {
+            let kv_dim_e = (nkv * hd) as usize;
+            let q_dim_e = (nq * hd) as usize;
+            super::super::op_dump::dump_bf16(
+                ctx.gpu,
+                k_contiguous,
+                (num_tokens - 1) * kv_dim_e * bf16,
+                kv_dim_e,
+                self.attn_layer_idx,
+                "k_post_rope",
+                stream,
+            )?;
+            super::super::op_dump::dump_bf16(
+                ctx.gpu,
+                q_contiguous,
+                (num_tokens - 1) * q_dim_e * bf16,
+                q_dim_e,
+                self.attn_layer_idx,
+                "q_post_rope",
                 stream,
             )?;
         }
@@ -856,5 +900,32 @@ impl Qwen3AttentionLayer {
         let o_out = self.prefill_attention_paged_oproj(attn_out, n, h, nq, hd, ctx, stream)?;
 
         Ok(o_out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The Q/K post-norm/rope dumps must exist on BOTH prefill paths:
+    /// `cache_skip` runs chunk 0 only (`seq_len_start == 0`), so without
+    /// these sites here a chunked run's surviving `atlas_op_L*_k_post_*` /
+    /// `q_post_rope` capture is chunk 0's last token — a different token
+    /// than the unchunked run's (reiner job 354: cos ~0.4 on those ops
+    /// while `attn_out` matched at 0.9994 via this file's existing dumps).
+    /// `dump_bf16` overwrites on every call, so the last chunk's last
+    /// token (the global last token) is what survives.
+    #[test]
+    fn qk_dump_ops_exist_on_both_prefill_paths() {
+        let cache_skip = include_str!("cache_skip.rs");
+        let paged = include_str!("paged.rs");
+        for op in ["k_post_norm", "k_post_rope", "q_post_rope"] {
+            assert!(
+                cache_skip.contains(&format!("\"{op}\"")),
+                "cache_skip.rs lost the {op} dump site"
+            );
+            assert!(
+                paged.contains(&format!("\"{op}\"")),
+                "paged.rs lost the {op} chunk-1+ dump site"
+            );
+        }
     }
 }

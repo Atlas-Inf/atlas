@@ -105,7 +105,7 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         _stream: u64,
         _draft_embed_target: Option<DevicePtr>,
-        _grammar_bitmask: Option<&[i32]>,
+        grammar_bitmask: Option<&[i32]>,
         target_hidden_stack: Option<DevicePtr>,
         defer_readback: bool,
         prepare_only: bool,
@@ -538,6 +538,48 @@ impl BlockDiffusionDraftHead {
             return Ok(Vec::new());
         }
 
+        self.forward_prepared(
+            scratch,
+            markov_embed,
+            markov_bias,
+            lane_id,
+            last_token,
+            position,
+            _num_drafts,
+            dstate,
+            owner,
+            option_b_arg,
+            defer_readback,
+            ctx,
+            _stream,
+            grammar_bitmask,
+        )
+    }
+
+    /// The post-prepare half of `propose_drafts_on_lane`: `forward_block`,
+    /// the draft cap, and `last_num_drafted`. `propose_batch` calls this
+    /// directly for sequences whose state `prepare_drafts_state` already
+    /// advanced — re-running the full serial entry would double-advance the
+    /// lifecycle and duplicate a ctx slot.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_prepared(
+        &self,
+        scratch: &DflashScratch,
+        markov_embed: DevicePtr,
+        markov_bias: DevicePtr,
+        lane_id: usize,
+        last_token: u32,
+        position: usize,
+        _num_drafts: usize,
+        dstate: &mut DflashProposerState,
+        owner: super::SequenceGeneration,
+        option_b_arg: Option<(DevicePtr, u32)>,
+        defer_readback: bool,
+        ctx: &ForwardContext,
+        _stream: u64,
+        // Live pos+1 grammar bitmask for this seq (#102); None = legacy.
+        grammar_bitmask: Option<&[i32]>,
+    ) -> Result<Vec<u32>> {
         let drafts = self
             .forward_block(
                 last_token,
@@ -558,6 +600,7 @@ impl BlockDiffusionDraftHead {
                 owner,
                 lane_id,
                 defer_readback,
+                grammar_bitmask,
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
@@ -600,7 +643,7 @@ impl BlockDiffusionDraftHead {
     /// Draft-count cap shared by the immediate and deferred readback paths:
     /// scheduler K (`num_drafts` = γ-1) unless the startup ablation override
     /// is set; the Lightning product policy rejects any override.
-    fn draft_cap(&self, num_drafts: usize) -> usize {
+    pub(super) fn draft_cap(&self, num_drafts: usize) -> usize {
         let default_k = num_drafts.min(self.gamma.saturating_sub(1)).max(1);
         self.startup.draft_cap_override.unwrap_or(default_k)
     }
@@ -627,6 +670,7 @@ impl BlockDiffusionDraftHead {
         states: &mut [&mut dyn ProposerState],
         expected_owners: &[SequenceGeneration],
         ctx: &ForwardContext,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Vec<Vec<u32>>> {
         let n = last_tokens.len();
         let lanes_n = self.lane_count();
@@ -685,7 +729,7 @@ impl BlockDiffusionDraftHead {
                 ctx,
                 lane_stream,
                 None,
-                None,
+                grammar_bitmasks.and_then(|ms| ms.get(i)?.as_deref()),
                 Some(target_hiddens[i]),
                 true,
                 false,
