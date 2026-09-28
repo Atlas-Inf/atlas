@@ -80,7 +80,10 @@ __device__ __forceinline__ void merge_topk(
     }
 }
 
-extern "C" __global__ void dflash2_candidate_selector(
+// Shared per-sequence body — called by the single-sequence entry below
+// and by `dflash2_candidate_selector_batched` once per CTA. Byte-identical
+// by construction: one definition, no behavior split.
+__device__ __forceinline__ void df2_selector_body(
     const __nv_bfloat16* __restrict__ logits,
     const __nv_bfloat16* __restrict__ projected_hidden,
     const __nv_bfloat16* __restrict__ pred_codebook,
@@ -260,4 +263,57 @@ extern "C" __global__ void dflash2_candidate_selector(
         }
         __syncthreads();
     }
+}
+
+// Single-sequence entry — the original kernel symbol, still resolved at
+// load time and launched by the per-sequence path.
+// Grid: (1, 1, 1)   Block: (1024, 1, 1).
+extern "C" __global__ void dflash2_candidate_selector(
+    const __nv_bfloat16* __restrict__ logits,
+    const __nv_bfloat16* __restrict__ projected_hidden,
+    const __nv_bfloat16* __restrict__ pred_codebook,
+    const __nv_bfloat16* __restrict__ succ_codebook,
+    unsigned int* __restrict__ out_tokens,
+    unsigned int last_token,
+    unsigned int gamma,
+    unsigned int vocab_size,
+    unsigned int rank,
+    unsigned int top_k
+) {
+    df2_selector_body(logits, projected_hidden, pred_codebook, succ_codebook, out_tokens,
+                      last_token, gamma, vocab_size, rank, top_k);
+}
+
+// Batched variant (job 596): one CTA per sequence. The serial-per-seq loop
+// launched this kernel grid (1,1,1) n times on one stream — 4.70 ms each,
+// ~75 ms/step at bs16 on ONE SM at a time. Per-sequence pointers are plain
+// base + seq*stride offsets of the contiguous [seq][gamma][width] staging
+// the batched tail already produces; `last_tokens` is the device array
+// (batch_markov_prev) the prologue already uploads.
+// Grid: (n_seqs, 1, 1)   Block: (1024, 1, 1) — same hard requirement.
+extern "C" __global__ void dflash2_candidate_selector_batched(
+    const __nv_bfloat16* __restrict__ logits,
+    const __nv_bfloat16* __restrict__ projected_hidden,
+    const __nv_bfloat16* __restrict__ pred_codebook,
+    const __nv_bfloat16* __restrict__ succ_codebook,
+    unsigned int* __restrict__ out_tokens,
+    const unsigned int* __restrict__ last_tokens,
+    unsigned int gamma,
+    unsigned int vocab_size,
+    unsigned int rank,
+    unsigned int top_k
+) {
+    unsigned int s = blockIdx.x;
+    df2_selector_body(
+        logits + (unsigned long long)s * (unsigned long long)gamma * (unsigned long long)vocab_size,
+        projected_hidden + (unsigned long long)s * (unsigned long long)gamma * (unsigned long long)rank,
+        pred_codebook,
+        succ_codebook,
+        out_tokens + (unsigned long long)s * (unsigned long long)gamma,
+        last_tokens[s],
+        gamma,
+        vocab_size,
+        rank,
+        top_k
+    );
 }

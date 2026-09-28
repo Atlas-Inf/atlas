@@ -55,6 +55,9 @@ pub struct DflashKernels {
     pub dense_gemm: KernelHandle,
     pub dflash2_conv: Option<KernelHandle>,
     pub dflash2_candidate_selector: Option<KernelHandle>,
+    /// Batched twin (grid.x = n_seqs) — KernelHandle(0) on older PTX;
+    /// the batched tail falls back to the per-seq loop then.
+    pub dflash2_candidate_selector_batched: KernelHandle,
     /// NVFP4 GEMM for the final logits when the shared lm_head is NVFP4
     /// (e.g. Holo): a BF16 `dense_gemm` on NVFP4-packed bytes reads garbage
     /// (and ~4× OOB → CUDA-700). `.0 == 0` when the target lm_head is BF16.
@@ -214,6 +217,19 @@ pub struct DflashScratch {
     /// so a captured H2D (if any) would still be valid; we keep the
     /// H2D outside the graph anyway.
     pub markov_prev_host_pinned: std::sync::atomic::AtomicPtr<u8>,
+    /// #58: pinned host staging for `precompute_ctx_kv` Step-4 position
+    /// arrays. `precompute` writes its repeated positions here and ships
+    /// them with `copy_h2d_async_retained` — no per-sequence stream drain.
+    /// Regions are carved by `ctx_positions_cursor` (reset at each public
+    /// propose entry); the step's readback sync completes the copies
+    /// before the next call reuses the region.
+    pub ctx_positions_host_pinned: std::sync::atomic::AtomicPtr<u8>,
+    /// Capacity of `ctx_positions_host_pinned` in bytes.
+    pub ctx_positions_pinned_bytes: usize,
+    /// Running carve offset into `ctx_positions_host_pinned`; see the
+    /// reset sites in `propose_drafts` / `propose_on_lanes` /
+    /// `propose_batch`.
+    pub ctx_positions_cursor: std::sync::atomic::AtomicUsize,
     /// `[ctx_window + γ]` i32 positions. First ctx_window are
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
@@ -584,6 +600,13 @@ pub struct BlockDiffusionDraftHead {
     /// `batch_capacity × ceil(vocab/32)` i32 — per-sequence grammar masks
     /// packed for the staged tail's row-0/1 masking (#102).
     pub batch_grammar_bitmask: DevicePtr,
+    /// #58: pinned host staging for those per-sequence masks — sequence i
+    /// writes slot `i × ceil(vocab/32) × 4` and ships it with
+    /// `copy_h2d_async_retained` (no per-seq drain). Slots are rewritten
+    /// next propose; the step's readback sync completes the copies first.
+    pub batch_grammar_masks_host_pinned: std::sync::atomic::AtomicPtr<u8>,
+    /// Total capacity of `batch_grammar_masks_host_pinned` in bytes.
+    pub batch_grammar_masks_pinned_bytes: usize,
     pub batch_tokens: DevicePtr,
     pub batch_markov_prev: DevicePtr,
     pub batch_markov_embed: DevicePtr,
@@ -595,6 +618,27 @@ pub struct BlockDiffusionDraftHead {
     /// and conv output `[B*gamma, hidden]`. NULL when the drafter ships no conv.
     pub batch_conv_delta: DevicePtr,
     pub batch_conv_out: DevicePtr,
+    /// #58 batched ctx-precompute staging: the prepare loop gathers every
+    /// sequence's new ctx rows into `batch_ctx_in` [rows, L_t·h_t] BF16,
+    /// runs ONE fc+norm+fused-KV projection into `batch_ctx_fc` /
+    /// `batch_ctx_fused`, then scatters per sequence. `batch_ctx_rows` is
+    /// the row capacity (`batch_capacity × BATCH_CTX_ROWS_PER_SEQ`); a
+    /// plan that overruns it falls back to the per-sequence GEMMs.
+    pub batch_ctx_in: DevicePtr,
+    pub batch_ctx_fc: DevicePtr,
+    pub batch_ctx_fused: DevicePtr,
+    pub batch_ctx_rows: usize,
+
+    /// `ATLAS_DFLASH_DRAFTER_CUBLAS=1` && cuBLASLt resolvable, resolved
+    /// once at construction: route the drafter's BF16 projections with
+    /// `m >= 32` through `cublaslt::bf16_gemm_act_weight_t` instead of
+    /// the hand-written `dense_gemm_bf16_pipelined` (~30 % of cuBLAS on
+    /// GB10; 93 ms/step at C=16 in job 596). ACCEPTANCE-ONLY effect —
+    /// cuBLASLt's algo choice varies with M, so staged drafts can differ
+    /// from serial drafts in the last bits; verified tokens come from
+    /// the target's own forward, so outputs are unaffected. Off by
+    /// default; inert where cublaslt is stubbed (non-CUDA builds).
+    pub drafter_cublas: bool,
 
     /// Additional propose lanes (lane 0 IS `self.scratch` on the default
     /// stream). Sized `ATLAS_DFLASH_PROPOSE_LANES - 1` (default 1 lane).
@@ -715,6 +759,7 @@ mod batch_plan;
 mod batch_projection;
 mod batch_propose;
 mod batch_tail_dflash2;
+mod batched_ctx;
 mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;
@@ -932,6 +977,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let n = last_tokens.len();
         let mask_of =
             |i: usize| -> Option<&[i32]> { grammar_bitmasks.and_then(|ms| ms.get(i)?.as_deref()) };
+        // #58: reset the lane-0 carve cursor — the staged prepare loop
+        // carves each sequence's position array from this region; the
+        // batched-token readback below completes every enqueued H2D
+        // before the next propose reuses it.
+        Self::ctx_positions_reset(&self.scratch);
         let expected_owners = expected_owners
             .ok_or_else(|| anyhow::anyhow!("DFlash batched propose requires expected owners"))?;
         // Preserve the historical n<2 fallback, but only after the complete
@@ -1035,6 +1085,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // to forward_prepared for the prepared prefix and serial
             // propose for the rest instead of erroring to the scheduler.
             let mut prepared = 0usize;
+            // #58: ctx-tail projections collected per sequence, then run
+            // as ONE batched GEMM + per-seq scatter after the loop.
+            let mut pending_ctx: Vec<batched_ctx::PendingCtxChunk> = Vec::with_capacity(n);
             for i in 0..n {
                 if let Err(e) = self.prepare_drafts_state(
                     last_tokens[i],
@@ -1046,6 +1099,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     ctx,
                     stream,
                     target_hiddens[i],
+                    Some(&mut pending_ctx),
                 ) {
                     if !generic_auth {
                         return Err(e);
@@ -1053,6 +1107,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     tracing::warn!(
                         "DFlash batched propose: prepare failed at sequence {i}/{n}; per-sequence fallback: {e:#}"
                     );
+                    // Flush the pending ctx chunks for the already-prepared
+                    // prefix — the fallback's forward_prepared arms assume
+                    // their drafter KV is committed.
+                    if let Err(flush) =
+                        self.run_batched_ctx_stage(&pending_ctx, ctx, stream, &self.scratch)
+                    {
+                        tracing::warn!("DFlash batched ctx flush failed: {flush:#}");
+                    }
                     return self
                         .prepared_fallback_batch(
                             n,
@@ -1072,6 +1134,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 }
                 prepared = i + 1;
             }
+            // #58: one ctx projection over all sequences' recorded tails,
+            // then per-sequence scatter (planner may fall back per chunk).
+            self.run_batched_ctx_stage(&pending_ctx, ctx, stream, &self.scratch)?;
         }
         let staged = self.propose_batch_staged_dispatch(
             last_tokens,

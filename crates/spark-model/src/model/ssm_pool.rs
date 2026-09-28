@@ -103,6 +103,17 @@ pub(crate) struct SsmStatePool {
     /// Empty in snapshot mode. Allocated so boot sizing is honest; the
     /// capture that would fill it is not wired yet.
     pub(super) replay_input_rings: Vec<DevicePtr>,
+    /// Deferred-commit input staging (ATLAS_GDN_DEFERRED_COMMIT): per
+    /// (layer, slot) copies of the wyN verify's conv-out q/k/v rows
+    /// (`16 × conv_dim` BF16) and gate/beta rows (`16 × 2·nv` FP32).
+    /// Pool-stable addresses — the staging copies run inside captured
+    /// verify forwards, so they must not be lazily allocated. Empty when
+    /// the lever is off.
+    pub(super) gdn_commit_qkv_pools: Vec<DevicePtr>,
+    pub(super) gdn_commit_gb_pools: Vec<DevicePtr>,
+    /// Per-slot byte sizes of the two staging pools above.
+    pub(super) commit_qkv_slot_bytes: usize,
+    pub(super) commit_gb_slot_bytes: usize,
     pub(super) free_slots: Mutex<Vec<usize>>,
 }
 
@@ -175,6 +186,7 @@ impl SsmStatePool {
         num_drafts: usize,
         h_f16_pool: bool,
         rollback_mode: crate::ssm_reserve::SsmRollbackMode,
+        gdn_deferred_commit: bool,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         let _d_conv = config.linear_conv_kernel_dim;
@@ -201,6 +213,21 @@ impl SsmStatePool {
 
         let h_state_pools = alloc_layer_pools(gpu, num_ssm_layers, total_slots * h_stored_bytes)?;
         let conv_state_pools = alloc_layer_pools(gpu, num_ssm_layers, total_slots * conv_bytes)?;
+
+        // Deferred-commit staging pools (lever-gated): 16-row verify window
+        // of conv-out q/k/v + gate/beta per slot — sized so K=16 fits.
+        let conv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let commit_qkv_slot_bytes = 16 * conv_dim * 2;
+        let commit_gb_slot_bytes = 16 * config.linear_num_value_heads * 2 * 4;
+        let (gdn_commit_qkv_pools, gdn_commit_gb_pools) = if gdn_deferred_commit && has_mtp {
+            (
+                alloc_layer_pools(gpu, num_ssm_layers, total_slots * commit_qkv_slot_bytes)?,
+                alloc_layer_pools(gpu, num_ssm_layers, total_slots * commit_gb_slot_bytes)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // Stage-3 f16-SIZED pool: the FP32 prefill staging arena. Allocated
         // ONLY when the h slots actually narrowed — an FP32-sized pool needs
@@ -368,6 +395,10 @@ impl SsmStatePool {
             h_inter_offsets,
             rollback_mode,
             replay_input_rings,
+            gdn_commit_qkv_pools,
+            gdn_commit_gb_pools,
+            commit_qkv_slot_bytes,
+            commit_gb_slot_bytes,
             free_slots: Mutex::new(free_slots),
         })
     }
@@ -488,6 +519,23 @@ impl SsmStatePool {
 
     pub(super) fn conv_state(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
         self.conv_state_pools[ssm_layer_idx].offset(slot * self.conv_bytes)
+    }
+
+    /// Deferred-commit input staging for (layer, slot): conv-out rows and
+    /// gate/beta rows. `DevicePtr(0)` when the lever is off (pools empty).
+    pub(super) fn commit_qkv(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
+        self.gdn_commit_qkv_pools
+            .get(ssm_layer_idx)
+            .map_or(DevicePtr(0), |p| {
+                p.offset(slot * self.commit_qkv_slot_bytes)
+            })
+    }
+
+    /// See [`Self::commit_qkv`].
+    pub(super) fn commit_gb(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
+        self.gdn_commit_gb_pools
+            .get(ssm_layer_idx)
+            .map_or(DevicePtr(0), |p| p.offset(slot * self.commit_gb_slot_bytes))
     }
 
     /// DEBUG (env-gated): PER-LAYER fingerprint of h_state + conv_state for a
@@ -1004,6 +1052,7 @@ mod h_stored_geometry_tests {
             3,
             h_f16_pool,
             crate::ssm_reserve::SsmRollbackMode::Snapshot,
+            false,
             &gpu,
         )
         .unwrap()
@@ -1083,6 +1132,7 @@ mod h_stored_geometry_tests {
             3,
             false,
             crate::ssm_reserve::SsmRollbackMode::Replay,
+            false,
             &gpu,
         )
         .unwrap();
@@ -1215,6 +1265,10 @@ mod slot_guard_tests {
             h_inter_offsets: Vec::new(),
             rollback_mode: crate::ssm_reserve::SsmRollbackMode::Snapshot,
             replay_input_rings: Vec::new(),
+            gdn_commit_qkv_pools: Vec::new(),
+            gdn_commit_gb_pools: Vec::new(),
+            commit_qkv_slot_bytes: 0,
+            commit_gb_slot_bytes: 0,
             free_slots: Mutex::new((0..max_slots).rev().collect()),
         })
     }
