@@ -28,15 +28,29 @@ use crate::traits::SequenceState;
 pub(super) const VERIFY_BATCHED_GRAPH_CAP: usize = 32;
 
 /// Verify row-buffer capacity R = Σ ks — the exact capacity of the batched
-/// verify's metadata gaps (verify_e.rs layout: positions 384 B | seq_slot
-/// 384 B | slots 768 B | seq_lens 384 B | bt at +2048), the `bt_rows`
-/// staging and the logits rows (`sizes.rs`). 96 = the wave-11 depth-at-width
-/// envelope: 32:2 = n=32 × k=3 rows hits it dead on (24:2 = 72); previously
-/// 64 (the 32:1 rung's n=32 × k=2), 32 before that (n=16 × k=2). Sequence
-/// count stays bounded at `VERIFY_WY_TABLE_SEQS` = 32 — this cap widens
-/// ROWS (depth at width), not width. The scheduler-side `VERIFY_ROW_BUDGET`
-/// (`mtp_dcut.rs`) mirrors this bound — keep them in lock-step.
-pub(in crate::model) const VERIFY_ROW_CAP: usize = 96;
+/// verify's metadata gaps (verify_e.rs layout: positions CAP*4 B | seq_slot
+/// CAP*4 B | slots CAP*8 B | seq_lens CAP*4 B | bt at +CAP*20 — the offsets
+/// are derived in [`verify_e`] from this constant), the `bt_rows` staging and
+/// the logits rows (`sizes.rs`). 128 since the DFlash2 C=16 sweep (job 376):
+/// γ=8 → 8 rows/seq ⇒ n=16 × 8 = 128 hits the new cap dead on — at 96 it
+/// split 12+4 and cost two verify passes per step (C16 measured 66.2 <
+/// C8's 69.2 for exactly that reason). 96 = the wave-11 depth-at-width envelope: 32:2 = n=32 ×
+/// k=3 rows hits it dead on (24:2 = 72); previously 64 (the 32:1 rung's
+/// n=32 × k=2), 32 before that (n=16 × k=2). Sequence count stays bounded
+/// at `VERIFY_WY_TABLE_SEQS` = 32 — this cap widens ROWS (depth at width),
+/// not width. The scheduler-side `VERIFY_ROW_BUDGET` (`mtp_dcut.rs`) mirrors
+/// this bound — keep them in lock-step.
+pub(in crate::model) const VERIFY_ROW_CAP: usize = 128;
+
+/// Meta-gap byte offsets for the wide batched-verify overlay
+/// (`verify_e.rs`), derived from [`VERIFY_ROW_CAP`]: positions u32 at +0,
+/// seq_slot u32, slots i64, seq_lens i32 — each CAP rows — then the block
+/// table. Single source of truth for the gap layout; the staging arrays and
+/// every `meta_base.offset(..)` below use these.
+pub(in crate::model) const META_SEQ_SLOT_OFF: usize = VERIFY_ROW_CAP * 4;
+pub(in crate::model) const META_SLOT_OFF: usize = META_SEQ_SLOT_OFF + VERIFY_ROW_CAP * 4;
+pub(in crate::model) const META_SEQ_LEN_OFF: usize = META_SLOT_OFF + VERIFY_ROW_CAP * 8;
+pub(in crate::model) const META_BT_OFF: usize = META_SEQ_LEN_OFF + VERIFY_ROW_CAP * 4;
 
 /// Batched-verify CUDA graphs: ON by default, disabled by PRESENCE of
 /// `ATLAS_NO_MTP_VERIFY_GRAPHS` (house convention — `=0` is NOT off).
@@ -256,7 +270,7 @@ impl TransformerModel {
         ))
     }
 
-    /// Stage the per-GDN-layer WY pointer tables (`[h|Hi0|Hi1|Hi2]` ×
+    /// Stage the per-GDN-layer WY pointer tables (`[h|Hi0..Hi6]` ×
     /// `VERIFY_WY_TABLE_SEQS` u64 entries per layer, batch entries filled,
     /// tail zero) into the fixed `verify_wy_tables` device buffer. Runs
     /// PRE-graph on every batched verify step whose table content differs
@@ -283,11 +297,13 @@ impl TransformerModel {
     /// sentinel is in the CUDA-graph key — and `ATLAS_NO_VERIFY_WY_CACHE`
     /// restores the unconditional re-stage for A/B.
     ///
-    /// `k` is this step's verify width (rows per sequence, 2..=4 from the
-    /// ladder). Exactly `k` tables are filled — `[h | Hi_0 .. Hi_{k-2}]` —
-    /// because `gdn_decode_wy{2,3,4}` read one h table plus k-1 intermediate
-    /// tables. Table STRIDES are `k`-independent, so a slice offset never
-    /// depends on the ladder step.
+    /// `k` is this step's verify width (rows per sequence: 2..=4 from the
+    /// K-vs-batch ladder, 5..=8 for the DFlash2/chain widths). Exactly `k`
+    /// tables are filled — `[h | Hi_0 .. Hi_{k-2}]` — because
+    /// `gdn_decode_wy{2,3,4}` read one h table plus k-1 intermediate tables,
+    /// and `gdn_decode_wyn` reads the h table plus the Hi_0 base table
+    /// (intra-slot stride covers the rest). Table STRIDES are
+    /// `k`-independent, so a slice offset never depends on the ladder step.
     ///
     /// Returns NULL — uploading nothing — unless EVERY GDN layer × sequence
     /// provides h_state + ≥ k-1 h intermediates (the layer-side batched arm

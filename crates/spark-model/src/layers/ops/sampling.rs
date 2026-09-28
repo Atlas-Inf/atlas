@@ -175,6 +175,34 @@ pub fn batched_embed_fp8(
         .launch(stream)
 }
 
+/// XGrammar bitmask row width: `ceil(vocab / 32)` i32 words; bit `t` of
+/// word `t >> 5` set = allowed (grammar/state.rs `bitmask_data` layout).
+pub fn grammar_bitmask_words(vocab: u32) -> usize {
+    (vocab as usize).div_ceil(32)
+}
+
+/// Apply a grammar bitmask to one BF16 logits row in place: disallowed ids
+/// become -inf so argmax / the DFlash2 selector top-k can only pick a legal
+/// token. Kernel: `grammar_bitmask.cu::atlas_apply_grammar_bitmask`.
+/// Caller-side guard: launch only for rows 0/1 and only when a mask exists.
+pub fn apply_grammar_bitmask(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits_row: DevicePtr,
+    bitmask: DevicePtr,
+    vocab: u32,
+    stream: u64,
+) -> Result<()> {
+    let blocks = vocab.div_ceil(1024);
+    KernelLaunch::new(gpu, kernel)
+        .grid([blocks, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(logits_row)
+        .arg_ptr(bitmask)
+        .arg_u32(vocab)
+        .launch(stream)
+}
+
 /// Mirrors of the compile-time caps in
 /// `kernels/{gb10,strix-hip}/common/dflash2_candidate_selector.cu`
 /// (`DF2_SEL_MAX_TOP_K` / `DF2_SEL_MAX_RANK`). `Dflash2CandidateSelector::new`

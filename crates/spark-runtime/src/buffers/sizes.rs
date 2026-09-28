@@ -259,7 +259,8 @@ impl BufferSizes {
         //     24R = 768 at the 32-row floor)
         //   [32768+24R .. ): decode block table (padded_n × max_blocks × 4 B)
         //   Batched MTP verify (verify_e.rs) overlays the SAME base with
-        //   96-row gaps: meta [32768, 32768+1920), bt at +2048 (bt_rows=96).
+        //   128-row gaps: meta [32768, 32768+2560), bt at +2560
+        //   (bt_rows=128).
         //   Each path re-uploads its own layout pre-dispatch; sizing takes
         //   the wider (verify) envelope.
         //
@@ -286,20 +287,23 @@ impl BufferSizes {
         let sl_offset = (bt_end + 3) & !3;
         let prefill_meta = sl_offset + 4;
         // Block table metadata: the widest user is the batched MTP verify
-        // (verify_e.rs) at R = 96 rows (n=32 × k=3 rows, the wave-11
-        // depth-at-width envelope — 32:2), whose bt staging sits at
-        // meta_base+2048 (wider 96-row gaps: positions 384 | seq_slot 384 |
-        // slots 768 | seq_lens 384). Batched decode (padded_n ≤ 32) and
-        // DFlash K=γ+1=17 verify keep the narrow +768 layout — strictly
-        // inside this envelope.
-        let bt_rows = 96usize; // batched verify R cap (VERIFY_ROW_CAP, verify_e2.rs)
-        // Envelope = max(verify 96-row overlay, DERIVED decode layout).
+        // (verify_e.rs) at R = 128 rows (VERIFY_ROW_CAP — the DFlash2 C=16
+        // sweep widened it past the 96-row wave-11 envelope, n=32 × k=3 =
+        // 96 still fits), whose bt staging sits at meta_base+2560 (wider
+        // 128-row gaps: positions 512 | seq_slot 512 | slots 1024 |
+        // seq_lens 512 — offsets derived in verify_e2.rs `META_*_OFF`).
+        // Batched decode (padded_n ≤ 32) and DFlash K=γ+1=17 verify keep
+        // the narrow +768 layout — strictly inside this envelope.
+        let bt_rows = 128usize; // batched verify R cap (VERIFY_ROW_CAP, verify_e2.rs)
+        // Envelope = max(verify 128-row overlay, DERIVED decode layout).
         // The decode layout (`decode_meta.rs`, rows = max(32, bs)) sits
-        // strictly inside the verify overlay for every rows <= 64 (bt at
-        // 24R <= 1536 < 2048, rows <= 96), so this max() changes NOTHING
-        // for bs <= 64; it only grows the scratch once rows > ~85.
+        // strictly inside the verify overlay for every rows <= 106 (bt at
+        // 24R <= 2560, rows <= 128), so this max() changes NOTHING
+        // for bs <= 106; it only grows the scratch once rows > ~117.
+        // bt at +2560 = positions 512 | seq_slot 512 | slots 1024 | seq_lens
+        // 512 = CAP*20 for VERIFY_ROW_CAP=128 (verify_e2.rs META_*_OFF).
         let bt_meta =
-            32768 + (2048 + bt_rows * max_blocks * 4).max(decode_meta.meta_bytes(max_blocks));
+            32768 + (2560 + bt_rows * max_blocks * 4).max(decode_meta.meta_bytes(max_blocks));
         let scratch_min = 64 * 1024;
         // Q12 kernel-batched prefill stages N per-stream meta blocks plus a
         // stacked BatchedAttnMetadata block — a strictly larger footprint than
@@ -343,19 +347,20 @@ impl BufferSizes {
             k_max * h * bf16
         };
 
-        // Logits: only last token used during prefill. Cap at 96 tokens —
-        // the batched MTP verify's R = Σ ks row cap (n=32 × k=3 rows, the
-        // wave-11 depth-at-width envelope; VERIFY_ROW_CAP in verify_e2.rs).
+        // Logits: only last token used during prefill. Cap at 128 tokens —
+        // the batched MTP verify's R = Σ ks row cap (VERIFY_ROW_CAP in
+        // verify_e2.rs; 128 since the DFlash2 C=16 sweep — γ=8 × n=16 needs
+        // 128 rows, was 96 for the 32:2 depth-at-width envelope).
         // This also covers decode=1, batched decode padded_n<=32 PLUS the
         // run_standard mixed path (`decode_b2`) parking prefill logits at
         // row `padded_n` = 32 (the old 33-row bound), spec_verify≤5, and
-        // DFlash K=γ+1=17. ~45 MB at vocab 248320 (was ~30 MB at 64 rows,
-        // ~16 MB at 33).
+        // DFlash K=γ+1=17. ~63 MB at vocab 248320 (was ~45 MB at 96 rows,
+        // ~30 MB at 64, ~16 MB at 33).
         // Derived floor for wide native batches: the run_standard mixed path
         // (`decode_b2`) parks prefill logits at row `padded_n`, which can be
         // as high as `decode_meta.rows()` — so the arena must hold rows+1.
-        // Inert (96) for every rows <= 95, i.e. all bs <= 95.
-        let logits_tokens = m.min(96.max(decode_meta.rows() + 1));
+        // Inert (128) for every rows <= 127, i.e. all bs <= 127.
+        let logits_tokens = m.min(128.max(decode_meta.rows() + 1));
 
         // Mamba-2 d_inner may exceed hidden_size; norm_output and attn_output must fit.
         let mamba2_d_inner = config.mamba2_d_inner();

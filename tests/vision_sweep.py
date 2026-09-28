@@ -117,7 +117,7 @@ def encode_image(max_dim: int = 320, quality: int = 85) -> str:
 
 def launch_container(spec: ModelSpec, image_tag: str) -> str:
     """Start a fresh atlas-gb10 container for the given model.  Returns
-    the container name.  Blocks until the server logs 'Listening on'.
+    the container name.  Blocks until the server logs 'Server live and ready' (or legacy 'Listening on').
     """
     name = f"atlas-vsweep-{spec.label}"
     subprocess.run(["sudo", "docker", "rm", "-f", name],
@@ -143,14 +143,14 @@ def launch_container(spec: ModelSpec, image_tag: str) -> str:
             ["sudo", "docker", "logs", name],
             check=False, capture_output=True, text=True,
         ).stdout
-        if "Listening on" in logs:
+        if "Server live and ready at " in logs or "Listening on" in logs:
             print("  listening", flush=True)
             return name
         if "Error: " in logs or "FATAL" in logs:
             print(f"  startup failed:\n{logs[-2000:]}", flush=True)
             raise RuntimeError(f"{name} failed to start")
         time.sleep(5)
-    raise RuntimeError(f"{name} timed out waiting for Listening on")
+    raise RuntimeError(f"{name} timed out waiting for a ready line")
 
 
 def stop_container(name: str) -> None:
