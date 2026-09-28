@@ -257,6 +257,7 @@ pub(super) fn step_verify_dflash_batched(
         let tokens: Vec<u32> = pending.iter().map(|&i| batch[i].last_token).collect();
         let positions: Vec<usize> = pending.iter().map(|&i| batch[i].seq.seq_len).collect();
         let stash_idx: Vec<usize> = pending.clone();
+        let grammar_masks = crate::scheduler::spec_step::mtp_grammar_masks_for(batch, &pending); // #102: draft-0 grammar masks
         let result = {
             let mut seq_refs: Vec<&mut SequenceState> = Vec::with_capacity(pending.len());
             let mut it = batch.iter_mut();
@@ -274,6 +275,7 @@ pub(super) fn step_verify_dflash_batched(
                 &mut seq_refs,
                 0,
                 None,
+                Some(&grammar_masks),
             )
         };
         if let Err(error) = &result {

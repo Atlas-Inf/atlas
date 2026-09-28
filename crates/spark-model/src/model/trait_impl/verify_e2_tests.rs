@@ -207,3 +207,33 @@ fn value_switch_is_armed_only_by_a_literal_one() {
         );
     }
 }
+
+/// The meta-gap offsets are DERIVED from `VERIFY_ROW_CAP` — one constant
+/// widens positions/seq_slot/slots/seq_lens/bt in lock-step, and the five
+/// regions are contiguous and non-overlapping for every cap.
+#[test]
+fn meta_gap_offsets_are_derived_and_non_overlapping() {
+    use super::{META_BT_OFF, META_SEQ_LEN_OFF, META_SEQ_SLOT_OFF, META_SLOT_OFF, VERIFY_ROW_CAP};
+    let cap = VERIFY_ROW_CAP;
+    // positions u32 [0, CAP*4) | seq_slot u32 | slots i64 | seq_lens i32 |
+    // bt — each CAP rows of its element size, contiguous.
+    assert_eq!(META_SEQ_SLOT_OFF, cap * 4);
+    assert_eq!(META_SLOT_OFF, META_SEQ_SLOT_OFF + cap * 4);
+    assert_eq!(META_SEQ_LEN_OFF, META_SLOT_OFF + cap * 8);
+    assert_eq!(META_BT_OFF, META_SEQ_LEN_OFF + cap * 4);
+    // Concrete 128-row layout: [0,512) | [512,1024) | [1024,2048) |
+    // [2048,2560) | bt at +2560.
+    assert_eq!(META_SEQ_SLOT_OFF, 512);
+    assert_eq!(META_SLOT_OFF, 1024);
+    assert_eq!(META_SEQ_LEN_OFF, 2048);
+    assert_eq!(META_BT_OFF, 2560);
+    // u32/i64 alignment everywhere a pointer is taken.
+    for off in [
+        META_SEQ_SLOT_OFF,
+        META_SLOT_OFF,
+        META_SEQ_LEN_OFF,
+        META_BT_OFF,
+    ] {
+        assert_eq!(off % 8, 0, "meta gap at +{off} not 8-aligned");
+    }
+}

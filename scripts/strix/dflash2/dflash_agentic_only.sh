@@ -39,11 +39,11 @@ fingerprint() {  # <leg> <max_seq> <extra serve flags...>
     echo "leg=$leg"
     echo "date_utc=$(date -u +%FT%TZ)"
     echo "host=$(hostname)"
-    echo "branch=port/dflash2-strix-linux commit=$COMMIT"
-    echo "binary=$BIN sha256=$BIN_SHA binary_built_from=b517dd6d9 (later commits on the branch are docs/script/LoC-only)"
+    echo "branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD) commit=$COMMIT"
+    echo "binary=$BIN sha256=$BIN_SHA"
     echo "checkpoint=$MODEL revision=dbb8f445b3145f8a4c18ddc769f032d57d32867c"
     echo "drafter=incoai/Qwen3.8-27B-DFlash2 path=$DRAFTER gamma=$GAMMA option_b=${OPTION_B:-1} small_m_gemv=${ATLAS_DFLASH_SMALL_M_GEMV:-default}"
-    echo "serve=serve-amd.sh DFLASH=1 GPU_UTIL=0.80 request-timeout=900 MAX_SEQ_LEN=$maxseq prefill=2048 kv=bf16 head=nvfp4 batch=1 ssm-slots=${SSM_SLOTS:-0} ssm-checkpoint-interval=${SSM_CKPT_INTERVAL:-16} mtp=off thinking=off(--disable-thinking) extra='$*'"
+    echo "serve=serve-amd.sh DFLASH=1 GPU_UTIL=0.80 request-timeout=900 MAX_SEQ_LEN=$maxseq prefill=2048 kv=bf16 head=nvfp4 batch=1 ssm-slots=${SSM_SLOTS:-0} ssm-checkpoint-interval=${SSM_CKPT_INTERVAL:-16} dflash-window-size=${DFLASH_WINDOW_SIZE:-0}(full) dflash-ctx-window=${DFLASH_CTX_WINDOW:-$maxseq} mtp=off thinking=off(--disable-thinking) extra='$*'"
     echo "env=ATLAS_W4A16_DP4A=1(default) ATLAS_W4A16_VARIANT=v1 ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_MTP_ACCEPT_DEBUG=1 HF_HUB_OFFLINE=1"
     echo "gpu_temp_edge=$(/opt/rocm/bin/amd-smi metric --temperature 2>/dev/null | sed -n 's/.*EDGE: *//p' | head -1)"
   } | tee "$OUT/$leg-fingerprint.txt"
@@ -60,9 +60,11 @@ serve() {  # <serve-log> <max_seq> <extra serve flags...>
   stop_serve
   ( cd "$WT" && HF_HUB_OFFLINE=1 RUST_LOG=info ATLAS_MTP_ACCEPT_DEBUG=1 \
       ATLAS_DFLASH_OPTION_B="${OPTION_B:-1}" \
+      ATLAS_DFLASH_CTX_WINDOW="${DFLASH_CTX_WINDOW:-$maxseq}" \
       DFLASH=1 DRAFT_MODEL="$DRAFTER" DFLASH_GAMMA="$GAMMA" GPU_UTIL=0.80 \
       MAX_SEQ_LEN="$maxseq" PORT=$PORT HOST=127.0.0.1 MODEL_NAME="$MODEL" SSM_SLOTS="${SSM_SLOTS:-0}" SSM_CKPT_INTERVAL="${SSM_CKPT_INTERVAL:-16}" \
-      ./serve-amd.sh "$MODEL" --disable-thinking --request-timeout 900 "$@" >"$slog" 2>&1 & echo $! >"$OUT/.serve.pid" )
+      ./serve-amd.sh "$MODEL" --disable-thinking --request-timeout 900 \
+      --dflash-window-size "${DFLASH_WINDOW_SIZE:-0}" "$@" >"$slog" 2>&1 & echo $! >"$OUT/.serve.pid" )
   sleep 2
   SRV=$(cat "$OUT/.serve.pid")
   for _ in $(seq 1 450); do            # up to 15 min (drafter + 22 GB target)
@@ -89,7 +91,13 @@ PY
 }
 
 # ─────────────────────────── leg 3: MLPerf agentic 2.5h perf leg ─────────────
-# Needs ~23.5K peak ISL -> 24576 ctx. Prefix caching is required for the leg to
+# Dataset peaks at ~25.2K ISL -> 32768 ctx covers every sample (the 2026-09-15
+# leg ran 24576 and dropped 3 prompts + cascades on Prompt-too-long 400s).
+# DFlash conditioning now spans the full transcript: ATLAS_DFLASH_CTX_WINDOW
+# defaults to maxseq (the 4096 default had frozen the drafter on the prompt's
+# first 4K positions — root cause of the acceptance collapse) and
+# --dflash-window-size 0 gives the drafter full-prefix attention.
+# Prefix caching is required for the leg to
 # finish inside its 4h cap (multi-turn replay); PCACHE=0 disables it if the
 # pre-probe below shows the dflash+prefix-caching fault reported on GB10.
 log "LEG3 MLPerf agentic 2.5h — dflash gamma=$GAMMA"
@@ -101,8 +109,8 @@ SSM_SLOTS=16
 SSM_CKPT_INTERVAL=128
 PCACHE_FLAGS=(--enable-prefix-caching)
 [ "${PCACHE:-1}" = 0 ] && PCACHE_FLAGS=()
-fingerprint agentic 24576 "${PCACHE_FLAGS[@]}"
-if serve "$OUT/agentic-serve.log" 24576 "${PCACHE_FLAGS[@]}"; then
+fingerprint agentic 32768 "${PCACHE_FLAGS[@]}"
+if serve "$OUT/agentic-serve.log" 32768 "${PCACHE_FLAGS[@]}"; then
   # pre-probe: a ~12K-token prompt twice (multi-chunk prefill + cache hit) and a
   # short prompt twice; any server death here is recorded, then the leg runs anyway.
   python3 - "$PORT" "$MODEL" "$OUT" <<'PY'
@@ -128,8 +136,8 @@ PY
   if ! kill -0 "$(cat "$OUT/.serve.pid")" 2>/dev/null; then
     log "pcache probe KILLED the server — restarting WITHOUT prefix caching for the leg"
     tail -60 "$OUT/agentic-serve.log" > "$OUT/agentic-pcache-crash-tail.log"
-    fingerprint agentic 24576
-    serve "$OUT/agentic-serve.log" 24576 || { log "LEG3 SKIPPED — serve failed"; stop_serve; exit 0; }
+    fingerprint agentic 32768
+    serve "$OUT/agentic-serve.log" 32768 || { log "LEG3 SKIPPED — serve failed"; stop_serve; exit 0; }
   fi
   RDAG=results_agentic_dflash_$TS
   CFGAG=$EP/examples/10_Edge_Agentic_Example/online_agentic_2.5h_dflash_$TS.yaml

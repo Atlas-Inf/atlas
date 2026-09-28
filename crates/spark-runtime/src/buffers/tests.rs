@@ -141,18 +141,18 @@ fn test_buffer_sizes_scale_with_batch() {
     let s128 = BufferSizes::from_config(&cfg, 128, 4096, 16, 32);
     assert_eq!(s128.hidden_states, s1.hidden_states * 128);
     // logits does NOT scale with batch: BF16 rows (2 bytes/elem) capped at
-    // 96 tokens — the batched-verify row cap (n=32 × k=3 rows, the wave-11
-    // depth-at-width envelope, VERIFY_ROW_CAP; sizes.rs `logits_tokens`).
+    // 128 tokens — the batched-verify row cap (VERIFY_ROW_CAP, widened for
+    // DFlash2 γ=8 × n≤16; sizes.rs `logits_tokens`).
     // This assert was stale twice (16-row FP32 era, then unnoticed through
     // the 33-row bump) — it is the byte twin of the sizes.rs formula, so
     // update BOTH together.
-    assert_eq!(s128.logits, 96 * cfg.vocab_size * 2);
+    assert_eq!(s128.logits, 128 * cfg.vocab_size * 2);
 }
 
 /// bs=64 native boots (wave-14a): sizing must be BYTE-IDENTICAL to bs=32 —
 /// the widened decode-meta layout (rows=64) still sits strictly inside the
-/// 96-row verify scratch overlay (bt at 24*64=1536 < 2048, 64 < 96 rows)
-/// and the 65-row logits need is under the 96-row cap. Only above those
+/// 128-row verify scratch overlay (bt at 24*64=1536 < 2560, 64 < 128 rows)
+/// and the 65-row logits need is under the 128-row cap. Only above those
 /// bounds may sizes grow — asserted for the 128-row ceiling.
 #[test]
 fn test_buffer_sizes_decode_meta_widening() {

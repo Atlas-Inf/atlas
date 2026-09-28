@@ -33,6 +33,9 @@ impl BlockDiffusionDraftHead {
         graph_owner: SequenceGeneration,
         graph_lane: usize,
         defer_readback: bool,
+        // Live pos+1 grammar bitmask (host i32 words), or None. Applied to
+        // logits rows 0 and 1 before the tail argmax/selector (#102).
+        grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
@@ -430,6 +433,10 @@ impl BlockDiffusionDraftHead {
         // Multi-lane stays eager until per-lane capture ownership is proven.
         let graph_eligible = option_b_on
             && !defer_readback
+            // #102: a grammar mask forces the eager tail — the per-step
+            // H2D + conditional mask launches can't be captured; stale
+            // captured masks would silently mis-select drafts.
+            && grammar_bitmask.is_none()
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -633,6 +640,35 @@ impl BlockDiffusionDraftHead {
                 let mut pre = vec![0u8; n_logits_bytes];
                 if gpu.copy_d2h(scratch.logits, &mut pre).is_ok() {
                     let _ = std::fs::write("/tmp/atlas_block_logits_pre.bin", &pre);
+                }
+            }
+            // #102: grammar-mask rows 0/1 (anchor + draft 0 — both predict
+            // pos+1, the position the live matcher covers). In-place -inf;
+            // rows 2..γ-1 keep the boundary-truncation guard.
+            if let Some(mask) = grammar_bitmask.filter(|_| self.kernels.grammar_bitmask.0 != 0) {
+                let mask_k = self.kernels.grammar_bitmask;
+                let words = ops::grammar_bitmask_words(self.vocab_size as u32);
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(mask.as_ptr() as *const u8, mask.len() * 4)
+                };
+                if bytes.len() < words * 4 {
+                    tracing::warn!(
+                        "DFlash grammar bitmask short ({} < {} words): skipping mask",
+                        mask.len(),
+                        words
+                    );
+                } else {
+                    gpu.copy_h2d(&bytes[..words * 4], scratch.grammar_bitmask_dev)?;
+                    for row in 0..2usize.min(self.gamma) {
+                        ops::apply_grammar_bitmask(
+                            gpu,
+                            mask_k,
+                            scratch.logits.offset(row * self.vocab_size * bf16_local),
+                            scratch.grammar_bitmask_dev,
+                            self.vocab_size as u32,
+                            stream,
+                        )?;
+                    }
                 }
             }
             self.argmax_block_logits(

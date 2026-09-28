@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use spark_runtime::gpu::DevicePtr;
 
-use super::{CaptureDescriptor, CaptureStatus, LIGHTNING_SERVED_GAMMA, SequenceGeneration};
+use super::{CaptureDescriptor, CaptureStatus, SequenceGeneration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DsparkBatchSequence {
@@ -219,6 +219,7 @@ impl DsparkBatchInput {
     #[allow(clippy::too_many_arguments)]
     pub fn validate(
         gamma: usize,
+        expected_gamma: usize,
         capacity: usize,
         owners: &[SequenceGeneration],
         last_tokens: &[u32],
@@ -230,9 +231,9 @@ impl DsparkBatchInput {
         if gamma == 0 {
             return Err(DsparkBatchInputError::GammaZero);
         }
-        if gamma != LIGHTNING_SERVED_GAMMA {
+        if gamma != expected_gamma {
             return Err(DsparkBatchInputError::GammaMismatch {
-                expected: LIGHTNING_SERVED_GAMMA,
+                expected: expected_gamma,
                 found: gamma,
             });
         }
