@@ -25,5 +25,9 @@ if ($env:ATLAS_BIN) {
     Write-Host "ATLAS_BIN is set ($env:ATLAS_BIN) -- prebuilt binary, nothing to build. Run .\serve-amd.ps1"
     exit 0
 }
+# '-Phase build' does not run Phase-Symlinks, and a fresh Windows clone needs
+# the kernel symlink repair before anything compiles — run it first.
+& (Join-Path $PSScriptRoot 'scripts\strix-windows\first_run.ps1') -Phase symlinks
+if (-not $?) { exit 1 }
 & (Join-Path $PSScriptRoot 'scripts\strix-windows\first_run.ps1') -Phase build -NoSmokeTest:$NoSmokeTest
 if (-not $?) { exit 1 }
