@@ -57,6 +57,13 @@ impl Qwen3SsmLayer {
         if self.w8a16_gemm_t_k.0 == 0 {
             return Ok(()); // transposed GEMM kernel absent on this target
         }
+        if self.w8a16_gemm_n_m128_k.0 != 0 {
+            // gfx1151: w8a16_gemm_n_m128 reads the native B[N,K] for every M,
+            // so the transposed copies would only duplicate ~115 MB/layer
+            // (~5.5 GB on the 27B). The prefill arms fall back to it for
+            // k <= 128 when the transposed copy is absent.
+            return Ok(());
+        }
         let transpose_k = gpu.kernel("w8a16_gemm_t", "transpose_fp8")?;
         let transpose_scale_k = gpu.kernel("w8a16_gemm_t", "transpose_block_scale")?;
         if let Some(w) = self.qkvz_fp8w.as_ref() {
