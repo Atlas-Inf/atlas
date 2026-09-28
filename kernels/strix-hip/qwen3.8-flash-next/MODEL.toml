@@ -297,6 +297,20 @@ gated_delta_rule_decode_f32_strided_norm_smem = """
 SMEM-staged twin; gated behind ATLAS_GDN_SMEM_STAGE (presence, off by
 default) AND the half-register gate. Not a live path as shipped."""
 
+# K=9..16 chain-verify WY arms (51091701a) have no gfx1151 instantiation:
+# strix-hip/common/gated_delta_rule_wyn.cu builds K=5..8 only. This target's
+# Windows recipe serves MTP at --num-drafts 1 (K<=2), so they are unreachable.
+# Same declaration #107 made for strix-hip/qwen3.8-27b.
+[expected_absent.gated_delta_rule_wyn]
+gated_delta_rule_wy9 = "K=9..16 chain-verify WY arms: strix-hip wyn instantiates K=5..8 only; MTP at --num-drafts 1 verifies K<=2, so K=9..16 are unreachable here."
+gated_delta_rule_wy10 = "K=10; same as wy9."
+gated_delta_rule_wy11 = "K=11; same as wy9."
+gated_delta_rule_wy12 = "K=12; same as wy9."
+gated_delta_rule_wy13 = "K=13; same as wy9."
+gated_delta_rule_wy14 = "K=14; same as wy9."
+gated_delta_rule_wy15 = "K=15; same as wy9."
+gated_delta_rule_wy16 = "K=16; same as wy9."
+
 # #438: the exact-verify `_snap` twins are model-shadow staged in
 # qwen3.6-27b/nvfp4 ONLY (shadow-first; promote to common/ once validated
 # per family). Every dispatch site probes handle != 0, and the whole chain
