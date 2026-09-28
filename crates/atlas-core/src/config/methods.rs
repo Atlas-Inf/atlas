@@ -270,6 +270,15 @@ impl ModelConfig {
         false
     }
 
+    /// The model's final normalization happens inside its last layer, so the
+    /// model-level final RMSNorm must be skipped. qwen4_exp: the last layer's
+    /// hyper-connection mixer collapses the `hc_mult` streams and its `hc_norm`
+    /// IS the final norm; the reference feeds the mixer output straight to
+    /// `lm_head` (no `model.norm.weight` exists).
+    pub fn final_norm_is_identity(&self) -> bool {
+        self.model_type == "qwen4_exp"
+    }
+
     /// Mamba-2 d_inner = mamba_num_heads * mamba_head_dim.
     pub fn mamba2_d_inner(&self) -> usize {
         self.mamba_num_heads * self.mamba_head_dim
@@ -409,6 +418,18 @@ mod tests {
         config.model_type = "deepseek_v4".to_string();
         config.compress_ratios = vec![0; 3];
         assert!(config.kv_only_prefix_cache_is_safe());
+    }
+
+    #[test]
+    fn final_norm_identity_only_for_qwen4_exp() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        assert!(!config.final_norm_is_identity());
+
+        config.model_type = "qwen4_exp".to_string();
+        assert!(config.final_norm_is_identity());
+
+        config.model_type = "deepseek_v4".to_string();
+        assert!(!config.final_norm_is_identity());
     }
 
     #[test]

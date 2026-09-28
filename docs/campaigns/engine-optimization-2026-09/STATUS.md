@@ -12,9 +12,9 @@ workstream by watching its job.
 |---|---|---|
 | Flash-Next long-context cold prefill | #74 | #68 (**merged**) |
 | Flash-Next multi-turn TTFT (prefix caching) | #69 | — (warm path measured: 98 % hits, 16-token recompute in the perf leg) |
-| Flash-Next decode (MTP, draft vocab, graphs) | #70 | #84 (draft: `VERIFY_ACTIVE` default ON; A/B queued) |
+| Flash-Next decode (MTP, draft vocab, graphs) | #70 | #84 (**merged**: verify-active default ON; TPOT 63.0 → 48.9 ms on the agentic leg, ST p = 0.625) |
 | GB10 tensor-core GEMM ceiling (shared) | #71 | #83 (**merged**, the lazy-BF16 OOM hazard); the ceiling itself is open |
-| 27B DFlash2 concurrency | #58 | #86 (**merged**: batched B×γ propose, every concurrency floor met), #98 (adaptive γ, draft), #102 (agentic tool-calling limits) |
+| 27B DFlash2 concurrency | #58 | #86 (**merged**: batched B×γ propose, every concurrency floor met), #98 (adaptive γ, draft), #102 (agentic tool-calling limits; #103 **merged**: grammar-masked draft 0) |
 | 27B on Strix Halo: prefill + DP4A verify | #72 | #75 |
 | Per-request host-memory growth | #73 (closed) | #82 (**merged**), #92 (exact dedupe follow-up) |
 | Client streaming latency | — | #67 (**merged**) |
@@ -24,7 +24,8 @@ workstream by watching its job.
 | Qwen3.6-35B-A3B NVFP4 current revision did not load | #88 (closed) | #90 (**merged**) |
 | 27B prefill precision (W4A4 FFN) | #95 (closed) | #96 (**merged**: W4A16 default) |
 | Flash-Next MoE prefill precision | #74 | #97 (draft; measured, not recommended) |
-| This status page | — | #76 |
+| Release verification on a single GB10 | — | #109, #110, #114 (**merged**: harness fixes, roster, rootless-docker notes); record #113 (publish pending) |
+| This status page | — | #76 (**merged**) |
 
 **Per-box campaigns** (what each machine is running right now, and where it reports):
 
@@ -183,10 +184,18 @@ the two still-unmerged commits live in #75. #77 closed (correct, no gain — abo
 
 ## GB10: merged since 2026-09-26
 
-main is at `a83b05c16`, merged in this order:
+main is at `10d4ec718` (2026-09-27 06:30 UTC). Merged in this order:
 - **The merge train** (#78, #67, #68, #82, #83, then #89 and #90). The maintainer's gate was ST-995 plus the 2.5 h agentic perf leg on the combined tree.
-- **Follow-ups:** #92 (exact kernel-audit dedupe), #99 (op-dump fix), **#86** (DFlash2 batched propose) and **#96** (W4A16 dense-FFN prefill default for the 27B).
-- **Recipes:** Atlas-Inf/sparkrun-recipes#14 updates the 27B DFlash2 recipes' text; their defaults are unchanged.
+- **Follow-ups:**
+  - #92: exact kernel-audit dedupe.
+  - #99: op-dump fix.
+  - **#86**: DFlash2 batched propose.
+  - **#96**: W4A16 dense-FFN prefill for the 27B.
+  - **#84**: verify-active default ON.
+  - **#103**: DFlash2 draft-0 grammar mask.
+  - #109 / #110 / #114: release harness.
+- **Release:** `azeezish/atlas-gb10:3fcf8ff` is **verified**. The scoped serve matrix was 5/5 (job 513) and `test_coherence.py` 89/89 (job 521). **Publishing is pending**; the push commands are in #113.
+- **Recipes:** Atlas-Inf/sparkrun-recipes #14, #15 and #16 are text updates; no defaults changed.
 
 | job | result |
 |---|---|
@@ -196,6 +205,9 @@ main is at `a83b05c16`, merged in this order:
 | 346 `moe-matrix-check5` | **Support matrix green** after #89, #90 and the #68 marker declarations. Nemotron-3.5-Lightning NVFP4, Qwen3.6-35B-A3B NVFP4 and Qwen3.6-35B-A3B FP8 all boot, and greedy output is identical to main66 + fixes. |
 | 383 `st995-27b-cand` | **27B ST-995 PASS: 88.14 / 88.68** on main + #86 + #96, against bars of 83.42 / 83.32 (main66: 87.84 / 88.53). |
 | 404 / 405 | **#86:** the staged drafter backbone is byte-identical to serial. The gate instrument measured C1 23.4, C4 45, C8 66, C16 75.0 / 75.2, clearing every floor; serial propose managed C8 45 and C16 54. |
+| 464 / 465 | **#84:** Flash-Next ST-995 with verify-active 84.92 / 84.93, paired vs 280 p = 0.625. Agentic leg: 1007/1007 turns, 73.3 min vs 89.3, TPOT median 48.9 vs 63.0 ms, score 0.491 vs 0.4899. |
+| 457 | **27B agentic perf leg** (MTP agentic recipe, main `a83b05c16`): VALID, 1007/1007 turns, 0 failed, 107 min, score 0.6217. |
+| 513 / 521 | **Release verify `3fcf8ff`:** 5/5 models (coherence, codegen, tools, long context); `test_coherence.py` 89/89 with reasoning off; gate PASS. |
 | 369 / 431 | **#96:** chunk-invariant outputs (8/8) where W4A4 gave 2/8; perplexity −0.76 % / −0.45 %; 10k TTFT +6.9 %. The W4A4 kernels are bitwise M-invariant, so the defect was FP4 rounding amplifying upstream differences (#95, closed). |
 
 ## Findings still open
@@ -219,12 +231,16 @@ main is at `a83b05c16`, merged in this order:
   - The 18:50 outage was the network: reiner stayed up.
   - A GPU/thermal logger now runs in `~/jobqueue/watchers/`.
 
-**Queued on reiner:**
-- 448: the 27B DFlash2 agentic perf leg with prefix caching on the merged tree (running).
-- 449: adaptive-γ re-measure.
-- 453: release verify for main `a83b05c`: image build, the scoped serve matrix and the coherence probe. Publishing stays human-gated.
-- 454 / 455: the #84 verify-active A/B (ST paired against job 280, plus the perf leg).
-- 456: TC2-off ST, paired against job 280.
+**Queued on reiner** (as of 2026-09-27 06:45 UTC). Another agent's `final-norm-gate-111` and `train-gate-gb10` run first. Then:
+- 529: TC2-off ST-995, paired vs 280.
+- 530: #98 adaptive γ at concurrency.
+- 531: #69 Marconi checkpoint spacing.
+- 532: #74 shared-expert e4m3 A/B.
+- 533: DFlash2-lane calibration, 3 reps.
+- 534: #71 cuBLASLt prefill A/B (bf16 cached-dequant vs native block-scaled FP8), 27B and Flash-Next.
+- 535: `ATLAS_DFLASH_ADAPTIVE=1` agentic probe.
+- 536: Lightning DSpark check on main.
+- 537: second serve-matrix sample, to bless tps baselines.
 
 ## Corrections recorded
 
