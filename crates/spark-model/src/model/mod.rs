@@ -24,6 +24,7 @@
 #![allow(unused_imports, dead_code)]
 
 pub(crate) mod block_mgmt;
+pub(crate) mod dflash_ctx_window;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub(crate) mod dspark_generation;

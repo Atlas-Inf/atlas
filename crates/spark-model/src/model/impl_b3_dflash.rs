@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 
+use super::dflash_ctx_window;
 use super::types::TransformerModel;
 
 impl TransformerModel {
@@ -96,49 +97,51 @@ impl TransformerModel {
         // Dense-window append: the ctx accumulator is a compacted array of
         // rows [0..ctx_len) with per-row absolute positions in
         // ctx_positions — NOT a position-indexed buffer. Carried rows sit in
-        // [0..ctx_prefill_base); this prefill's captures fill rows
-        // base + (chunk_start - origin) .. with positions chunk_start.. .
-        let mut cursor = dstate.ctx_prefill_base.saturating_add(
-            chunk_start.saturating_sub(dstate.ctx_prefill_origin.unwrap_or(chunk_start)),
+        // [0..ctx_prefill_base); captures land at base + (chunk_start -
+        // origin). Overflow → plan_capture slides to the newest
+        // max_ctx_len/2 rows; a chunk bigger than keep gets move_rows = 0
+        // and its leading `skip` tokens drop (the old inline code truncated
+        // at acc_rows, then the NEXT chunk's slide read ~200 MB past the
+        // accumulator — the GB10 crash).
+        let plan = dflash_ctx_window::plan_capture(
+            dstate.ctx_prefill_base,
+            dstate.ctx_prefill_origin.unwrap_or(chunk_start),
+            chunk_start,
+            proc_count,
+            acc_rows,
+            dstate.max_ctx_len,
         );
-        // Mid-prefill slide: the accumulator is sized to max_ctx_len rows
-        // and a prompt longer than the window would overflow it. Keep the
-        // NEWEST rows — after this chunk's writes the window holds
-        // keep = max_ctx_len/2 rows. drop_n = needed - keep > 0, and
-        // dst_end = keep - proc_count <= drop_n because
-        // needed > max_ctx_len implies cursor > max_ctx_len - proc_count,
-        // so the single in-place D2D copy never overlaps.
-        let needed = cursor.saturating_add(proc_count);
-        let keep = dstate.max_ctx_len / 2;
-        let drop_n = needed.saturating_sub(keep);
-        if needed > acc_rows && drop_n > 0 && drop_n <= cursor {
+        if let Some(slide) = plan.slide {
             let slot = dstate.ctx_slot_bytes;
-            self.gpu.copy_d2d_async(
-                acc_base.offset(drop_n * slot),
-                acc_base,
-                (cursor - drop_n) * slot,
-                stream,
-            )?;
-            // Carried rows [0..base) own positions; capture rows get theirs
-            // at update time from ctx_prefill_origin — advance it past the
-            // dropped captures so positions stay aligned with the rows.
-            let carried_drop = drop_n.min(dstate.ctx_prefill_base);
-            let pos_drop = drop_n.min(dstate.ctx_positions.len());
-            dstate.ctx_positions.drain(..pos_drop);
-            dstate.ctx_prefill_base -= carried_drop;
-            if let Some(o) = dstate.ctx_prefill_origin.as_mut() {
-                *o += drop_n - carried_drop;
+            if slide.move_rows > 0 {
+                self.gpu.copy_d2d_async(
+                    acc_base.offset(slide.drop_n * slot),
+                    acc_base,
+                    slide.move_rows * slot,
+                    stream,
+                )?;
             }
+            // The plan advanced ctx_prefill_origin past the dropped captures
+            // so positions stay aligned with the rows.
+            let pos = slide.drop_n.min(dstate.ctx_positions.len());
+            dstate.ctx_positions.drain(..pos);
+            dstate.ctx_prefill_base = plan.base;
+            dstate.ctx_prefill_origin = Some(plan.origin);
             // Rows moved; their drafter-KV slot mapping is stale.
             dstate.ctx_committed = 0;
-            cursor -= drop_n;
+            let keep = dstate.max_ctx_len / 2;
+            let skipped = if plan.skip > 0 {
+                format!(", skipped {} chunk tokens", plan.skip)
+            } else {
+                String::new()
+            };
             tracing::info!(
-                "DFlash ctx prefill slide: dropped {drop_n} oldest rows \
-                 (mid-prefill overflow, keep {keep})",
+                "DFlash ctx prefill slide: dropped {} oldest rows{skipped} (mid-prefill overflow, keep {keep})",
+                slide.drop_n,
             );
         }
-        for t in 0..proc_count {
-            let row = cursor + t;
+        for t in plan.skip..proc_count {
+            let row = plan.first_row + (t - plan.skip);
             if row >= acc_rows {
                 break; // accumulator capacity; retention is enforced by the slide
             }
