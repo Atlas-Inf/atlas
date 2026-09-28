@@ -30,7 +30,7 @@ param(
     [string]$Port = "8095"
 )
 $ErrorActionPreference = "Stop"
-$Repo = "C:\Users\azeez\code\atlas-fnext-win"
+$Repo = if ($env:ATLAS_REPO) { $env:ATLAS_REPO } else { (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path }
 $Bin = if ($env:ATLAS_BIN) { $env:ATLAS_BIN } else { "$Repo\target\x86_64-pc-windows-msvc\release\spark.exe" }
 $env:HIP_PATH = "C:\TheRock\10.0.0"
 $env:PATH = "$env:HIP_PATH\bin;$env:PATH"
