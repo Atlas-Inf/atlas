@@ -638,88 +638,10 @@ impl Qwen3AttentionLayer {
         if batchm.0 != 0 {
             return ops::w4a16_gemv_batchm(gpu, batchm, input, w_base, output, m, n, k, stream);
         }
-        if let Some(wt) = w_t {
-            // Small-M routing (w4a16_m17_bench): at M<=64 the M64-tile
-            // `w4a16_gemm_t` beats the M128-tile kernels (87% of an M128
-            // tile is padding at M=17), and `w4a16_gemm_t_k64` wins deep-K
-            // shapes. Mirrors dense_ffn::w4a16_prefill_gemm; same
-            // ATLAS_FFN_SMALLM=0 kill-switch.
-            // The `OnceLock<bool>` static that lived here is now a field on
-            // `layers::ops::ModelLevers` — resolved when the model is built and carried
-            // on `ForwardContext`, because a static outlives the model whose flags it
-            // encodes.
-            if m <= 64 && k.is_multiple_of(32) && c.fwd.levers.ffn_small_m {
-                if k >= crate::layers::w4a16_k64_min_k()
-                    && k.is_multiple_of(64)
-                    && self.w4a16_gemm_t_k64_k.0 != 0
-                {
-                    // Narrow-N deep-K twin: bit-identical, and 1.42x at the
-                    // o_proj shape (N=5120, K=6144 -> 40 CTAs on 48 SMs).
-                    if self.w4a16_gemm_t_k64_n64_k.0 != 0 && crate::layers::k64_n64_wins(m, n) {
-                        return ops::w4a16_gemm(
-                            gpu,
-                            self.w4a16_gemm_t_k64_n64_k,
-                            input,
-                            wt,
-                            output,
-                            m,
-                            n,
-                            k,
-                            stream,
-                        );
-                    }
-                    return ops::w4a16_gemm_n128(
-                        gpu,
-                        self.w4a16_gemm_t_k64_k,
-                        input,
-                        wt,
-                        output,
-                        m,
-                        n,
-                        k,
-                        stream,
-                    );
-                }
-                if self.w4a16_gemm_t_k.0 != 0 {
-                    return ops::w4a16_gemm_n128(
-                        gpu,
-                        self.w4a16_gemm_t_k,
-                        input,
-                        wt,
-                        output,
-                        m,
-                        n,
-                        k,
-                        stream,
-                    );
-                }
-            }
-            if self.w4a16_gemm_t_m128_v2_k.0 != 0 {
-                return ops::w4a16_gemm_n128_m128_v2(
-                    gpu,
-                    self.w4a16_gemm_t_m128_v2_k,
-                    input,
-                    wt,
-                    output,
-                    m,
-                    n,
-                    k,
-                    stream,
-                );
-            }
-            if self.w4a16_gemm_t_m128_k.0 != 0 {
-                return ops::w4a16_gemm_n128_m128(
-                    gpu,
-                    self.w4a16_gemm_t_m128_k,
-                    input,
-                    wt,
-                    output,
-                    m,
-                    n,
-                    k,
-                    stream,
-                );
-            }
+        if let Some(wt) = w_t
+            && self.transposed_verify_gemm(c, input, wt, output, m, n, k)?
+        {
+            return Ok(());
         }
         ops::w4a16_gemm(
             gpu,
@@ -732,6 +654,114 @@ impl Qwen3AttentionLayer {
             k,
             stream,
         )
+    }
+
+    /// The transposed-layout (`w4a16_gemm_t*`) arms of
+    /// [`Self::wide_verify_gemm`]. `Ok(false)` when no transposed kernel
+    /// applies; the caller picks the fallback. The fused [q|k|v] twin
+    /// exists ONLY in this layout, so `ms_qkv_batchn` dispatches it here
+    /// directly and it can never reach a base-weight arm (GEMV / DP4A /
+    /// base GEMM), which would read q_proj at the fused N.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn transposed_verify_gemm(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        input: spark_runtime::gpu::DevicePtr,
+        wt: &crate::weight_map::QuantizedWeight,
+        output: spark_runtime::gpu::DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<bool> {
+        let gpu = c.fwd.gpu;
+        let stream = c.stream;
+        // Small-M routing (w4a16_m17_bench): at M<=64 the M64-tile
+        // `w4a16_gemm_t` beats the M128-tile kernels (87% of an M128
+        // tile is padding at M=17), and `w4a16_gemm_t_k64` wins deep-K
+        // shapes. Mirrors dense_ffn::w4a16_prefill_gemm; same
+        // ATLAS_FFN_SMALLM=0 kill-switch.
+        // The `OnceLock<bool>` static that lived here is now a field on
+        // `layers::ops::ModelLevers` — resolved when the model is built and carried
+        // on `ForwardContext`, because a static outlives the model whose flags it
+        // encodes.
+        if m <= 64 && k.is_multiple_of(32) && c.fwd.levers.ffn_small_m {
+            if k >= crate::layers::w4a16_k64_min_k()
+                && k.is_multiple_of(64)
+                && self.w4a16_gemm_t_k64_k.0 != 0
+            {
+                // Narrow-N deep-K twin: bit-identical, and 1.42x at the
+                // o_proj shape (N=5120, K=6144 -> 40 CTAs on 48 SMs).
+                if self.w4a16_gemm_t_k64_n64_k.0 != 0 && crate::layers::k64_n64_wins(m, n) {
+                    return ops::w4a16_gemm(
+                        gpu,
+                        self.w4a16_gemm_t_k64_n64_k,
+                        input,
+                        wt,
+                        output,
+                        m,
+                        n,
+                        k,
+                        stream,
+                    )
+                    .map(|()| true);
+                }
+                return ops::w4a16_gemm_n128(
+                    gpu,
+                    self.w4a16_gemm_t_k64_k,
+                    input,
+                    wt,
+                    output,
+                    m,
+                    n,
+                    k,
+                    stream,
+                )
+                .map(|()| true);
+            }
+            if self.w4a16_gemm_t_k.0 != 0 {
+                return ops::w4a16_gemm_n128(
+                    gpu,
+                    self.w4a16_gemm_t_k,
+                    input,
+                    wt,
+                    output,
+                    m,
+                    n,
+                    k,
+                    stream,
+                )
+                .map(|()| true);
+            }
+        }
+        if self.w4a16_gemm_t_m128_v2_k.0 != 0 {
+            return ops::w4a16_gemm_n128_m128_v2(
+                gpu,
+                self.w4a16_gemm_t_m128_v2_k,
+                input,
+                wt,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            )
+            .map(|()| true);
+        }
+        if self.w4a16_gemm_t_m128_k.0 != 0 {
+            return ops::w4a16_gemm_n128_m128(
+                gpu,
+                self.w4a16_gemm_t_m128_k,
+                input,
+                wt,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            )
+            .map(|()| true);
+        }
+        Ok(false)
     }
 
     /// Wide-verify (n>3) NVFP4 batched QKV. Reads each of Q/K/V ONCE for all
@@ -774,12 +804,31 @@ impl Qwen3AttentionLayer {
         // q/k/v share one `weight_scale_2`.
         // Kill switch: ATLAS_NO_FUSED_QKV=1.
         let fused_n = q_proj_dim as usize + 2 * kv_dim_e;
-        // n > 8 is REQUIRED, not an optimisation: `wide_verify_gemm` early-returns
-        // on the batched-GEMV arms for m <= 8 using the BASE (non-transposed)
-        // weight and ignoring `w_t` entirely, so a fused N would read past the
-        // q_proj weight. Only at m > 8 is the transposed tile GEMM guaranteed.
+        // The fused twin exists only in the TRANSPOSED tile-GEMM layout, so
+        // it dispatches to `transposed_verify_gemm` directly and can never
+        // reach `wide_verify_gemm`'s base-weight arms — d6e1a9212 widened
+        // that GEMV arm to m<=16 while this arm was gated at n>8, so
+        // n=9..16 ran batch16 over q_proj at the fused N and read past it.
+        // n>8 is now purely a routing choice (n<=8 prefers the strided `_os`
+        // GEMVs). `use_fused` records whether the fused GEMM launched; when
+        // no transposed kernel resolved, the three separate projections run.
         // n varies as sequences finish, so this is hit at every concurrency.
-        let use_fused = fused_qkv_enabled() && self.qkv_nvfp4_t.is_some() && n > 8;
+        // per_seq_qkv == q_proj_bytes + 2*kv_bytes == fused_n*bf16, so the
+        // fused GEMM's [n, fused_n] output IS the qkv_buf layout byte for
+        // byte. Write straight into it and skip the scatter entirely —
+        // that removes 3 GEMMs AND 48 D2D copies per attention layer.
+        let use_fused = match self.qkv_nvfp4_t.as_ref() {
+            Some(qkv_t) if fused_qkv_enabled() && n > 8 => self.transposed_verify_gemm(
+                c,
+                normed,
+                qkv_t,
+                qkv_buf,
+                n as u32,
+                fused_n as u32,
+                h as u32,
+            )?,
+            _ => false,
+        };
 
         // STRIDED-WRITE arm (n in 4..=8): the `*_os` GEMV variants write row
         // t at `C[t*C_stride + col]`, so each projection lands straight in
@@ -810,22 +859,7 @@ impl Qwen3AttentionLayer {
             } else {
                 os_gemv.0 != 0
             };
-        if use_fused {
-            // per_seq_qkv == q_proj_bytes + 2*kv_bytes == fused_n*bf16, so the
-            // fused GEMM's [n, fused_n] output IS the qkv_buf layout byte for
-            // byte. Write straight into it and skip the scatter entirely —
-            // that removes 3 GEMMs AND 48 D2D copies per attention layer.
-            self.wide_verify_gemm(
-                c,
-                normed,
-                q_nvfp4,
-                self.qkv_nvfp4_t.as_ref(),
-                qkv_buf,
-                n as u32,
-                fused_n as u32,
-                h as u32,
-            )?;
-        } else if use_os && dp4a_ready {
+        if use_os && dp4a_ready {
             self.dp4a_quant_input(c, normed, n as u32, h as u32)?;
             self.dp4a_gemv_prequant_os(
                 c, q_nvfp4, qkv_buf, n as u32, q_proj_dim, h as u32, os_stride,
@@ -857,7 +891,7 @@ impl Qwen3AttentionLayer {
             gemv(q_nvfp4, qkv_buf, q_proj_dim)?;
             gemv(k_nvfp4, qkv_buf.offset(q_proj_bytes), kv_dim)?;
             gemv(v_nvfp4, qkv_buf.offset(q_proj_bytes + kv_bytes), kv_dim)?;
-        } else {
+        } else if !use_fused {
             self.wide_verify_gemm(
                 c,
                 normed,
