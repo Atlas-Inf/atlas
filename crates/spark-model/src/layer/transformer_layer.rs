@@ -59,6 +59,19 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// Host-side "this layer's wyN verify runs deferred" at `num_tokens` —
+    /// the same gate the layer's dispatch arms use, but pure and callable
+    /// OUTSIDE `begin_capture`, so `gdn_commit_pending` can be assigned at
+    /// the verify entry and stay correct on graph replay. Default: non-GDN
+    /// layers never defer.
+    fn gdn_deferred_wyn(
+        &self,
+        _levers: &crate::layers::ops::ModelLevers,
+        _num_tokens: usize,
+    ) -> bool {
+        false
+    }
+
     /// `gated_delta_rule_commit` handle for the deferred-commit accept path
     /// (ATLAS_GDN_DEFERRED_COMMIT). KernelHandle(0) on non-GDN layers; the
     /// accept path only consults it when the layer's `gdn_commit_pending`

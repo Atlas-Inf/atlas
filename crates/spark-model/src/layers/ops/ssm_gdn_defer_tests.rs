@@ -230,3 +230,55 @@ fn gdn_deferred_commit_byte_identical() {
         check_deferred_commit(k);
     }
 }
+
+/// The `gdn_commit_pending` flag is the accept path's record that a verify
+/// ran deferred — it MUST be assigned at the dispatch entry (`mod.rs`
+/// `decode_verify*` fns, outside `begin_capture`), never inside the layer
+/// forward, because replayed graphs skip host code entirely. Job-621
+/// corruption: pending set inside the captured forward stayed false on
+/// replay → accept restored from intermediates MODE 1 never wrote.
+#[test]
+fn gdn_commit_pending_is_set_at_dispatch_not_in_the_layer() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src/layers/qwen3_ssm/");
+    for e in std::fs::read_dir(root).unwrap().flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !src.contains("gdn_commit_pending = true"),
+            "{}: gdn_commit_pending is assigned inside the (capturable)              layer forward — replayed graphs never see it; set it at the              decode_verify* dispatch entry instead",
+            p.display()
+        );
+    }
+    // …and the dispatch entries must actually call the mark. Every public
+    // verify path pins `mark_gdn_deferred_commit` at its entry.
+    let mod_rs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/model/trait_impl/mod.rs"
+    ))
+    .unwrap();
+    for entry in [
+        "decode_verify_dispatch(tokens",
+        "decode_verify_graphed_dispatch(tokens",
+        "decode_verify_graphed_k3_dispatch(tokens",
+        "decode_verify_graphed_k4_dispatch(tokens",
+        "decode_verify_batched_dispatch(tokens",
+        "decode_verify_graphed_kgamma_dispatch(tokens",
+        "decode_and_verify_fused_dispatch(tokens",
+    ] {
+        let pos = mod_rs
+            .find(entry)
+            .unwrap_or_else(|| panic!("mod.rs: `{entry}` not found"));
+        let window = &mod_rs[..pos];
+        // The mark precedes the dispatch call within the same fn body —
+        // look back a bounded window (the rollback guard + mark are the
+        // only statements between the signature and the dispatch).
+        let tail = window.rsplit_once("fn ").map(|(_, t)| t).unwrap_or(window);
+        assert!(
+            tail.contains("mark_gdn_deferred_commit"),
+            "`{entry}` is invoked without a preceding mark_gdn_deferred_commit              in its fn body — replays would run the deferred kernel with the              pending flag unset (stale-intermediates corruption)"
+        );
+    }
+}

@@ -16,6 +16,30 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.gdn_commit_k
     }
 
+    fn gdn_deferred_wyn(
+        &self,
+        levers: &crate::layers::ops::ModelLevers,
+        num_tokens: usize,
+    ) -> bool {
+        // Mirrors the conditions every wyN arm checks before dispatching
+        // (verify-exact bypasses the arm entirely; wyN has no FP16-h-state
+        // twin). The intermediates-layout requirement is per-SEQUENCE and
+        // checked by the caller (`SsmLayerState::h_inter_pool_layout`).
+        !super::verify_exact_enabled()
+            && !super::ssm_h_fp16_enabled()
+            && self.wyn_kernel(num_tokens, levers.gdn_wyn).is_some()
+            && Self::gdn_defer_active(
+                levers.gdn_deferred_commit,
+                num_tokens,
+                if (5..=16).contains(&num_tokens) {
+                    self.gdn_wyn_defer_k[num_tokens - 5]
+                } else {
+                    spark_runtime::gpu::KernelHandle(0)
+                },
+                self.gdn_commit_k,
+            )
+    }
+
     // ── MoE layout transposes ───────────────────────────────────────────
     // qwen4_exp is 36 gated-delta-net layers + 12 full-attention layers, and
     // EVERY one of them carries a 512-expert MoE block. Only
