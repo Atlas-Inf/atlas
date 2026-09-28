@@ -1,0 +1,44 @@
+[
+  [
+    {
+      "host": "head",
+      "label": "flash-next-nvfp4-mtp",
+      "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "mtp": true,
+      "kv_dtype": "bf16"
+    }
+  ],
+  [
+    {
+      "host": "head",
+      "label": "27B-nvfp4-dflash2",
+      "model": "nvidia/Qwen3.8-27B-NVFP4",
+      "kv_dtype": "bf16",
+      "extra_args": ["--dflash"]
+    }
+  ],
+  [
+    {
+      "host": "head",
+      "label": "lightning-30B-nvfp4",
+      "model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+      "kv_dtype": "bf16"
+    }
+  ],
+  [
+    {
+      "host": "head",
+      "label": "35B-a3b-nvfp4",
+      "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      "kv_dtype": "bf16"
+    }
+  ],
+  [
+    {
+      "host": "head",
+      "label": "35B-a3b-fp8",
+      "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "quant": "fp8"
+    }
+  ]
+]

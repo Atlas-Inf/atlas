@@ -40,20 +40,9 @@ impl TransformerModel {
         // Decode: RMS norm on N tokens → N logits
         // Prefill: RMS norm on last token only (if is_last) → 1 logit
         let normed = self.buffers.norm_output();
-        let eps = self.config.rms_norm_eps as f32;
 
         // 7a. Decode logits: norm [padded_n, H] → GEMV × padded_n
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            hidden,
-            &self.final_norm,
-            normed,
-            padded_n as u32,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        self.final_norm_rows(hidden, normed, padded_n as u32, stream)?;
 
         // The SAME ladder the pure-decode head uses (`lm_head_batched.rs`).
         //
@@ -74,17 +63,7 @@ impl TransformerModel {
             let last_hidden = prefill_hidden.offset((proc_count - 1) * h * fp32);
             // Place prefill normed output after decode normed to avoid overlap
             let prefill_normed = normed.offset(padded_n * h * bf16);
-            ops::rms_norm(
-                self.gpu.as_ref(),
-                self.rms_norm_kernel,
-                last_hidden,
-                &self.final_norm,
-                prefill_normed,
-                1,
-                h as u32,
-                eps,
-                stream,
-            )?;
+            self.final_norm_rows(last_hidden, prefill_normed, 1, stream)?;
 
             // Place prefill logits after decode logits
             let prefill_logits_ptr = logits.offset(padded_n * v * bf16);
