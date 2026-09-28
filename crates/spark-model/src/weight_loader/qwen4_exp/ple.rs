@@ -16,8 +16,10 @@
 //! NVFP4 packs ship the three lookup tensors under the old names
 //! (`ple_embedding.layer_multipliers`, `.ngram_heads_offsets`,
 //! `.ngram_heads_vocab_sizes`). Probe the EXL3 names first, then those.
-//! A single unsharded `ngram_embedding.trellis` (4.05 bpw) is refused here:
-//! the row cache only opens `shard_{i}.weight` / `shard_{i}.trellis`.
+//! A single unsharded `ngram_embedding.trellis` (4.05 bpw) is one contiguous
+//! row-major table. The row cache opens it at that tensor's byte offset,
+//! the same way a safetensors shard is opened. Equal-sized `shard_{i}`
+//! tensors stay on the segmented path.
 //! ```
 //!
 //! The 128 shards are ONE logical table of `128 * R` rows. They live in a
@@ -271,21 +273,29 @@ pub(super) fn load(
         }
         shards.push((d.path.clone(), d.offset));
     }
-    if shards.is_empty() {
-        let single = format!("{lp}.ple_embedding.ngram_embedding.trellis");
-        if store.deferred(&single).is_some() || store.get(&single).is_ok() {
-            anyhow::bail!(
-                "PLE: `{single}` is a single-tensor n-gram table. This loader only \
-                 reads `shard_{{i}}.weight` or `shard_{{i}}.trellis`. Convert it \
-                 (bench/exl3/convert_ngram_bf16.py handles both layouts) or split \
-                 the trellis before serving."
-            );
-        }
+    // 4.05 bpw stores the whole table as one contiguous tensor, not shards.
+    // open_at reads it at the safetensors data offset. Sharded tables stay
+    // on open_segmented below.
+    let single_name = format!("{lp}.ple_embedding.ngram_embedding.trellis");
+    let single = if shards.is_empty() {
+        store.deferred(&single_name)
+    } else {
+        None
+    };
+    if shards.is_empty() && single.is_none() {
         anyhow::bail!(
-            "PLE: no `{lp}.ple_embedding.ngram_embedding.shard_*` was deferred. Either \
-             the checkpoint has none, or they were UPLOADED whole — which for this \
-             table is 102 GB of BF16 and would not have fit."
+            "PLE: no `{lp}.ple_embedding.ngram_embedding.shard_*` was deferred, \
+             and `{single_name}` is not deferred either. Either the checkpoint \
+             has none, or they were UPLOADED whole — which for this table is \
+             102 GB of BF16 and would not have fit."
         );
+    }
+    if let Some(d) = single {
+        anyhow::ensure!(d.shape.len()==2, "PLE: `{single_name}` shape {:?}, expected 2-D", d.shape);
+        rows_per = d.shape[0];
+        head_dim = d.shape[1];
+        dtype = Some(d.dtype);
+        shards.push((d.path.clone(), d.offset));
     }
     let distinct_files = {
         let mut seen: Vec<&std::path::Path> = Vec::new();
@@ -320,13 +330,25 @@ pub(super) fn load(
     let chunk = chunk_from_env();
     let span = crate::layers::ple::bounded_scratch(chunk, max_tokens);
     let (slots, slots_from) = slots_from_env(span, heads);
-    let mut cache = spark_storage::NgramRowCache::open_segmented(
-        &shards,
-        rows_per as u64,
-        None, // no per-row scale FILE; FP8 uses the per-tensor scalar below
-        head_dim * elem,
-        slots,
-    )
+    let mut cache = if single.is_some() {
+        let (path, off) = &shards[0];
+        spark_storage::NgramRowCache::open_at(
+            path,
+            *off,
+            None,
+            rows_per as u64,
+            head_dim * elem,
+            slots,
+        )
+    } else {
+        spark_storage::NgramRowCache::open_segmented(
+            &shards,
+            rows_per as u64,
+            None, // no per-row scale FILE; FP8 uses the per-tensor scalar below
+            head_dim * elem,
+            slots,
+        )
+    }
     .context("PLE: n-gram row cache")?;
 
     // FP8 rows need their dequant scale, or the gather returns raw E4M3
