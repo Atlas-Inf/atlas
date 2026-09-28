@@ -107,8 +107,16 @@ pub(super) fn fetch_row(
     } else {
         1
     };
-    atlas_tier::pio::read_exact_at(file, bounce.blocks(nblocks), block_off)
-        .with_context(|| format!("NgramRowCache: read row {id}"))?;
+    // Only `within + row_stride` bytes of the block(s) are the row. The rest may
+    // lie past EOF when the row sits in the file's last, partial block (a real
+    // table is not padded to 4 KiB), so require just the row's bytes.
+    atlas_tier::pio::read_at_least_at(
+        file,
+        bounce.blocks(nblocks),
+        block_off,
+        within + src.row_stride,
+    )
+    .with_context(|| format!("NgramRowCache: read row {id}"))?;
     // SAFETY: slot is one this batch pinned, so it is < slots and no other
     // worker writes it; the arena holds slots*row_stride bytes.
     let dst = unsafe {
@@ -125,7 +133,7 @@ pub(super) fn fetch_row(
         let sbyte = id * 4;
         let sblock = sbyte - (sbyte % BLOCK as u64);
         let swithin = (sbyte - sblock) as usize;
-        atlas_tier::pio::read_exact_at(sfile, bounce.blocks(1), sblock)
+        atlas_tier::pio::read_at_least_at(sfile, bounce.blocks(1), sblock, swithin + 4)
             .with_context(|| format!("NgramRowCache: read scale {id}"))?;
         // SAFETY: as above; the scale arena holds slots*4 bytes.
         let sdst = unsafe { std::slice::from_raw_parts_mut(sbase.add(slot as usize * 4), 4) };
