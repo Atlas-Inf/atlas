@@ -244,7 +244,7 @@ pub fn dflash2_candidate_selector(
 }
 
 /// Batched variant of [`dflash2_candidate_selector`] — one CTA per
-/// sequence (grid.x = n_seqs) over the contiguous [seq][gamma][width]
+/// sequence (grid.x = n_seqs) over the contiguous `[seq][gamma][width]`
 /// staging; `last_tokens` is the device array the propose prologue
 /// already uploads (`batch_markov_prev`).
 #[allow(clippy::too_many_arguments)]
