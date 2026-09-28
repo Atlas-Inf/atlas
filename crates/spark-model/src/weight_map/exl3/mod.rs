@@ -57,8 +57,8 @@ mod weight_tests;
 pub(crate) use cpu_ref::{HAD_SCALE, reconstruct as reconstruct_ref};
 pub use cpu_ref::{decode_inner, mul1_decode, reconstruct, tile_states};
 pub use materialize::exl3_materialize_dense;
-pub use materialize::set_exl3_native_decode;
 pub(crate) use materialize::exl3_native_decode;
+pub use materialize::set_exl3_native_decode;
 pub(crate) use requant::quantized_from_exl3;
 pub use weight::{Exl3Weight, MUL1_TAG, exl3_from_store};
 
