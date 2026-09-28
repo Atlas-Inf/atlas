@@ -9,9 +9,15 @@
 //! {lp}.ple.norm_key/norm_query/norm_conv.weight  [hc*H]
 //! {lp}.ple.conv1d.weight                         [hc*H, 1, K]
 //! {lp}.ple.ple_embedding.ngram_embedding.layer_multipliers       [ngram_size]   I64
-//! {lp}.ple.ple_embedding.ngram_embedding.head_offsets     [ngram_heads]  I64
-//! {lp}.ple.ple_embedding.ngram_embedding.head_vocab_sizes [ngram_heads]  I64
-//! {lp}.ple.ple_embedding.ngram_embedding.shard_{0..127}.weight  [R, 160] BF16
+//! {lp}.ple.ple_embedding.ngram_embedding.head_offsets            [ngram_heads]  I64
+//! {lp}.ple.ple_embedding.ngram_embedding.head_vocab_sizes        [ngram_heads]  I64
+//! {lp}.ple.ple_embedding.ngram_embedding.shard_{0..127}.weight   [R, 160] BF16
+//!
+//! NVFP4 packs ship the three lookup tensors under the old names
+//! (`ple_embedding.layer_multipliers`, `.ngram_heads_offsets`,
+//! `.ngram_heads_vocab_sizes`). Probe the EXL3 names first, then those.
+//! A single unsharded `ngram_embedding.trellis` (4.05 bpw) is refused here:
+//! the row cache only opens `shard_{i}.weight` / `shard_{i}.trellis`.
 //! ```
 //!
 //! The 128 shards are ONE logical table of `128 * R` rows. They live in a
@@ -80,6 +86,26 @@ fn slots_from_env(scratch_tokens: usize, ngram_heads: usize) -> (usize, &'static
             "(span + warm_ahead)*heads rounded up",
         ),
     }
+}
+
+/// First uploaded name that exists. EXL3 checkpoints use the nested
+/// `ngram_embedding.*` names; RadixArk NVFP4 still ships the old
+/// `ple_embedding.*` names. Missing both is the caller's error.
+#[cfg(feature = "cuda")]
+fn first_present<'a>(store: &WeightStore, names: &[&'a str]) -> Option<&'a str> {
+    names.iter().copied().find(|n| store.get(n).is_ok())
+}
+
+/// EXL3 name first (`ngram_embedding.{exl3}`), then the NVFP4 name
+/// (`{nvfp4}` directly under `ple_embedding`). If neither is uploaded, return
+/// the EXL3 name so `i64_host` reports that miss.
+#[cfg(feature = "cuda")]
+fn ple_i64_name(store: &WeightStore, lp: &str, exl3: &str, nvfp4: &str) -> String {
+    let nested = format!("{lp}.ple_embedding.ngram_embedding.{exl3}");
+    let flat = format!("{lp}.ple_embedding.{nvfp4}");
+    first_present(store, &[&nested, &flat])
+        .unwrap_or(nested.as_str())
+        .to_string()
 }
 
 /// Read a small I64 device tensor back to the host.
@@ -178,17 +204,17 @@ pub(super) fn load(
         heads_per_ngram: config.emb_split_num,
         multipliers: i64_host(
             store,
-            &format!("{lp}.ple_embedding.ngram_embedding.layer_multipliers"),
+            &ple_i64_name(store, &lp, "layer_multipliers", "layer_multipliers"),
             gpu,
         )?,
         head_vocab_sizes: i64_host(
             store,
-            &format!("{lp}.ple_embedding.ngram_embedding.head_vocab_sizes"),
+            &ple_i64_name(store, &lp, "head_vocab_sizes", "ngram_heads_vocab_sizes"),
             gpu,
         )?,
         head_offsets: i64_host(
             store,
-            &format!("{lp}.ple_embedding.ngram_embedding.head_offsets"),
+            &ple_i64_name(store, &lp, "head_offsets", "ngram_heads_offsets"),
             gpu,
         )?,
         eos_token_id: eos,
@@ -245,12 +271,22 @@ pub(super) fn load(
         }
         shards.push((d.path.clone(), d.offset));
     }
-    anyhow::ensure!(
-        !shards.is_empty(),
-        "PLE: no `{lp}.ple_embedding.ngram_embedding.shard_*` was deferred. Either \
-         the checkpoint has none, or they were UPLOADED whole — which for this \
-         table is 102 GB of BF16 and would not have fit."
-    );
+    if shards.is_empty() {
+        let single = format!("{lp}.ple_embedding.ngram_embedding.trellis");
+        if store.deferred(&single).is_some() || store.get(&single).is_ok() {
+            anyhow::bail!(
+                "PLE: `{single}` is a single-tensor n-gram table. This loader only \
+                 reads `shard_{{i}}.weight` or `shard_{{i}}.trellis`. Convert it \
+                 (bench/exl3/convert_ngram_bf16.py handles both layouts) or split \
+                 the trellis before serving."
+            );
+        }
+        anyhow::bail!(
+            "PLE: no `{lp}.ple_embedding.ngram_embedding.shard_*` was deferred. Either \
+             the checkpoint has none, or they were UPLOADED whole — which for this \
+             table is 102 GB of BF16 and would not have fit."
+        );
+    }
     let distinct_files = {
         let mut seen: Vec<&std::path::Path> = Vec::new();
         for (path, _) in &shards {
