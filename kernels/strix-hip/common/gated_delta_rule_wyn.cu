@@ -23,7 +23,8 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
     unsigned int v_dim,
     unsigned int qk_stride,
     unsigned int v_stride,
-    unsigned int gb_stride
+    unsigned int gb_stride,
+    unsigned int state_is_table
 ) {
     const unsigned int value_head = blockIdx.x;
     const unsigned int batch = blockIdx.y;
@@ -33,8 +34,18 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
     const unsigned int heads_per_key = num_v_heads / num_k_heads;
     const unsigned int key_head = value_head / heads_per_key;
     const unsigned int state_size = k_dim * v_dim;
-    float* state = h_state + ((batch * num_v_heads + value_head) * state_size);
-    float* intermediate = h_state_inter_base + ((batch * num_v_heads + value_head) * state_size);
+    // `state_is_table` (#58, same contract as the gb10 wyn): 0 = contiguous
+    // (batch*nv+vh)*state_size bases, unchanged; 1 = h_state and
+    // h_state_inter_base are device POINTER TABLES with one entry per
+    // sequence (the batched-verify path), then the same per-vh head offset.
+    // Without it the batched verify's tables were read as state -> 700.
+    const unsigned long long head_off = (unsigned long long)value_head * state_size;
+    const unsigned long long flat_off =
+        (unsigned long long)(batch * num_v_heads + value_head) * state_size;
+    float* state = state_is_table ? ((float* const*)h_state)[batch] + head_off
+                                  : h_state + flat_off;
+    float* intermediate = state_is_table ? ((float* const*)h_state_inter_base)[batch] + head_off
+                                         : h_state_inter_base + flat_off;
 
     __shared__ float keys[K_TOKENS][128];
     __shared__ float queries[K_TOKENS][128];
@@ -169,10 +180,10 @@ __device__ __forceinline__ void gated_delta_rule_wyn_impl(
         unsigned int inter_stride_floats, unsigned int batch_size, \
         unsigned int num_k_heads, unsigned int num_v_heads, \
         unsigned int k_dim, unsigned int v_dim, unsigned int qk_stride, \
-        unsigned int v_stride, unsigned int gb_stride) { \
+        unsigned int v_stride, unsigned int gb_stride, unsigned int state_is_table) { \
         gated_delta_rule_wyn_impl<K>(h_state, query, key, value, gate, beta, output, \
             h_state_inter_base, inter_stride_floats, batch_size, num_k_heads, \
-            num_v_heads, k_dim, v_dim, qk_stride, v_stride, gb_stride); \
+            num_v_heads, k_dim, v_dim, qk_stride, v_stride, gb_stride, state_is_table); \
     }
 
 INSTANTIATE_WYN(5)
