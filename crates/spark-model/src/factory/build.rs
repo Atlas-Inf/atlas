@@ -421,7 +421,11 @@ pub fn build_model(
     // covers the first request; a warm turn's acc returns through carry
     // adoption, and any further demand falls to the lazy path. Failure only
     // forfeits the optimization — the request-time path still allocates.
-    if let Some(ref args) = dflash_args
+    // AMD APUs only (atlas_scale), like both balloons below: on GB10 the
+    // lazy path never hit that wall, and every byte held here comes out of
+    // the KV pool (27B DFlash2 at util 0.80: 43.9k -> 9.9k KV tokens).
+    if cfg!(atlas_scale)
+        && let Some(ref args) = dflash_args
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
         let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
@@ -490,7 +494,13 @@ pub fn build_model(
     // still failed (Flash-Next MTP on winbox: a 102 MB layer pool refused
     // with 16 GB reported free, even after the retry below freed the balloon).
     // Windows keeps the virtual-reserve subtraction it booted with before.
-    let balloon_bytes = if cfg!(windows) { 0 } else { inference_reserve };
+    // Nor on GB10 (no atlas_scale): that fragmentation wall is an AMD APU
+    // failure, and GB10 keeps the virtual reserve it has always booted with.
+    let balloon_bytes = if cfg!(windows) || !cfg!(atlas_scale) {
+        0
+    } else {
+        inference_reserve
+    };
     let balloon = if balloon_bytes > 0 {
         match gpu.alloc(balloon_bytes) {
             Ok(ptr) => Some(ptr),
@@ -511,7 +521,10 @@ pub fn build_model(
     // through model construction and is freed only just before the drafter
     // build below, so those allocs get a region no earlier alloc was
     // allowed to fragment.
-    let drafter_balloon = if dflash_args.is_some() {
+    // AMD APUs only: held here, the balloon lands in `used_so_far` and costs
+    // the KV pool 1.5 GiB. GB10 builds the drafter from post-KV headroom, as
+    // it did before the balloon existed.
+    let drafter_balloon = if cfg!(atlas_scale) && dflash_args.is_some() {
         match gpu.alloc(3 << 29) {
             Ok(ptr) => Some(ptr),
             Err(e) => {
