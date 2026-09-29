@@ -48,6 +48,14 @@ pub struct ModelLevers {
     pub gdn_wy17: bool,
     /// WY-N GDN recurrence variant. Ships ON; `ATLAS_GDN_WYN=0` opts out.
     pub gdn_wyn: bool,
+    /// Deferred SSM commit (`ATLAS_GDN_DEFERRED_COMMIT=1`, opt-IN, v1):
+    /// wyN verify writes no per-token Hi_t snapshots nor the final H;
+    /// `gated_delta_rule_commit` replays the accepted prefix from the live
+    /// H0 instead. Cuts ~(K-1)×64 KB of state writes per (seq, v-head,
+    /// layer) at accept-count ~2; kernel entry is load-fixed so verify
+    /// CUDA-graph capture is unaffected. Same outputs, same committed
+    /// state bit-for-bit — replay shares `gated_delta_rule_wyn_impl`.
+    pub gdn_deferred_commit: bool,
 
     // ── FFN / MoE ──
     /// Lossless single-warp decode GEMV (`w4a16_gemv_sw`, `w4a16_gemv_dual_sw`).
@@ -136,7 +144,7 @@ impl ModelLevers {
     /// Resolve from the environment. Called once, when the model is built.
     pub fn from_env() -> Self {
         let lightning_lossless_target = opt_in("ATLAS_LIGHTNING_LOSSLESS_TARGET");
-        Self {
+        let levers = Self {
             max_decode_seqs: 1,
             shadow_topk: crate::speculative::shadow_topk(),
             kv_poison: std::env::var("ATLAS_KV_POISON").as_deref() == Ok("1"),
@@ -149,6 +157,7 @@ impl ModelLevers {
             // Opt-OUT — these three ship ON.
             gdn_wy17: opt_out("ATLAS_GDN_WY17"),
             gdn_wyn: opt_out("ATLAS_GDN_WYN"),
+            gdn_deferred_commit: opt_in("ATLAS_GDN_DEFERRED_COMMIT"),
             ffn_small_m: opt_out("ATLAS_FFN_SMALLM"),
             gemv_sw: super::gemv_sw::gemv_sw_from(
                 std::env::var("ATLAS_NO_GEMV_SW").ok().as_deref(),
@@ -170,7 +179,13 @@ impl ModelLevers {
             gemma4_diag: opt_in_truthy("ATLAS_DIAG_GEMMA4"),
             // Presence-gated, not value-gated: any value enables it.
             bf16_tc_proj: std::env::var_os("ATLAS_BF16_TC_PROJ").is_some(),
+        };
+        if levers.gdn_deferred_commit {
+            tracing::info!(
+                "GDN deferred commit engaged (ATLAS_GDN_DEFERRED_COMMIT=1):                  wyN verify stores nothing; accepted prefix replayed from H0"
+            );
         }
+        levers
     }
 
     /// What a build resolves to with no `ATLAS_*` set — every opt-in off, the
@@ -212,6 +227,10 @@ mod tests {
         assert!(!d.decode_ffn_via_gemm);
         assert!(!d.lora_eager);
         assert!(!d.k4_diag);
+        assert!(
+            !d.gdn_deferred_commit,
+            "ATLAS_GDN_DEFERRED_COMMIT is opt-IN and defaults off"
+        );
     }
 
     #[test]

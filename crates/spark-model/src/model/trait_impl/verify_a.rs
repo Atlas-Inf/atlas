@@ -334,7 +334,8 @@ impl TransformerModel {
                     .as_any()
                     .downcast_ref::<SsmLayerState>()
                     .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
-                if num_accepted > ssm.h_state_intermediates.len() {
+                // Deferred-commit layers keep h_state at H0 (no intermediates).
+                if !ssm.gdn_commit_pending && num_accepted > ssm.h_state_intermediates.len() {
                     anyhow::bail!(
                         "rollback_ssm_states: cannot restore SSM to N={num_accepted} \
                          (layer {i}): only {} per-token intermediate(s) available. \
@@ -369,6 +370,7 @@ impl TransformerModel {
                 let conv_bytes = self.config.ssm_conv_state_bytes();
 
                 if num_accepted == 0 {
+                    ssm.gdn_commit_pending = false;
                     // Restore to pre-verification checkpoint
                     if let Some(ckpt) = ssm.h_state_checkpoint {
                         h_plan.push(StateCopy {
@@ -384,14 +386,21 @@ impl TransformerModel {
                             bytes: conv_bytes,
                         });
                     }
-                } else if num_accepted <= ssm.h_state_intermediates.len() {
-                    // Restore to intermediate checkpoint after the last accepted token
+                } else if ssm.gdn_commit_pending || num_accepted <= ssm.h_state_intermediates.len()
+                {
+                    // Deferred-commit layers replay the prefix from the
+                    // `_defer`-untouched H0; others index the intermediate.
                     let idx = num_accepted - 1;
-                    h_plan.push(StateCopy {
-                        src: ssm.h_state_intermediates[idx],
-                        dst: ssm.h_state,
-                        bytes: h_bytes,
-                    });
+                    if ssm.gdn_commit_pending {
+                        ssm.gdn_commit_pending = false;
+                        self.commit_gdn_deferred(i, ssm, num_accepted, stream)?;
+                    } else {
+                        h_plan.push(StateCopy {
+                            src: ssm.h_state_intermediates[idx],
+                            dst: ssm.h_state,
+                            bytes: h_bytes,
+                        });
+                    }
                     conv_plan.push(StateCopy {
                         src: ssm.conv_state_intermediates[idx],
                         dst: ssm.conv_state,

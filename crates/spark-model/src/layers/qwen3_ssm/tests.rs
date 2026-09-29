@@ -119,6 +119,9 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
         conv_state_intermediates: (0..n_inter)
             .map(|i| conv_slab.offset(i * conv_bytes))
             .collect(),
+        gdn_commit_qkv: DevicePtr(0),
+        gdn_commit_gb: DevicePtr(0),
+        gdn_commit_pending: false,
         h_is_f16: false,
         h_prefill_stage: None,
         ple: None,
@@ -593,4 +596,18 @@ fn fused_conv_k4_skips_conv_snapshot_copies() {
         3,
         "fused arm must remove exactly the K-1 conv snapshots: fused={fused} fallback={fallback}"
     );
+}
+
+#[test]
+fn gdn_defer_active_gates_on_lever_band_and_handles() {
+    let h = |v: u64| spark_runtime::gpu::KernelHandle(v);
+    for k in [5usize, 8, 9, 12, 16] {
+        assert!(Qwen3SsmLayer::gdn_defer_active(true, k, h(1), h(1)));
+        assert!(!Qwen3SsmLayer::gdn_defer_active(false, k, h(1), h(1)));
+        assert!(!Qwen3SsmLayer::gdn_defer_active(true, k, h(0), h(1)));
+        assert!(!Qwen3SsmLayer::gdn_defer_active(true, k, h(1), h(0)));
+    }
+    for k in [1usize, 4, 17] {
+        assert!(!Qwen3SsmLayer::gdn_defer_active(true, k, h(1), h(1)));
+    }
 }
