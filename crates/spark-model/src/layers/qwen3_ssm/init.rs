@@ -455,49 +455,21 @@ impl Qwen3SsmLayer {
                 super::super::try_kernel(gpu, "gated_delta_rule_wyn", "gated_delta_rule_wy15"),
                 super::super::try_kernel(gpu, "gated_delta_rule_wyn", "gated_delta_rule_wy16"),
             ],
-            gdn_wyn_defer_k: [
-                super::super::try_kernel(gpu, "gated_delta_rule_wyn", "gated_delta_rule_wy5_defer"),
-                super::super::try_kernel(gpu, "gated_delta_rule_wyn", "gated_delta_rule_wy6_defer"),
-                super::super::try_kernel(gpu, "gated_delta_rule_wyn", "gated_delta_rule_wy7_defer"),
-                super::super::try_kernel(gpu, "gated_delta_rule_wyn", "gated_delta_rule_wy8_defer"),
-                super::super::try_kernel(gpu, "gated_delta_rule_wyn", "gated_delta_rule_wy9_defer"),
-                super::super::try_kernel(
+            // The deferred-commit variants (#127) and the commit kernel exist
+            // only in kernels/gb10/common/gated_delta_rule_wyn.cu. strix-hip ships
+            // a wyn module without them, so a plain try_kernel resolves to 0 and
+            // the boot kernel gate refuses the model on gfx1151. NULL keeps the
+            // eager commit (gdn_defer_active needs both handles).
+            gdn_wyn_defer_k: std::array::from_fn(|i| {
+                super::super::try_kernel_gated(
+                    !cfg!(atlas_hip),
                     gpu,
                     "gated_delta_rule_wyn",
-                    "gated_delta_rule_wy10_defer",
-                ),
-                super::super::try_kernel(
-                    gpu,
-                    "gated_delta_rule_wyn",
-                    "gated_delta_rule_wy11_defer",
-                ),
-                super::super::try_kernel(
-                    gpu,
-                    "gated_delta_rule_wyn",
-                    "gated_delta_rule_wy12_defer",
-                ),
-                super::super::try_kernel(
-                    gpu,
-                    "gated_delta_rule_wyn",
-                    "gated_delta_rule_wy13_defer",
-                ),
-                super::super::try_kernel(
-                    gpu,
-                    "gated_delta_rule_wyn",
-                    "gated_delta_rule_wy14_defer",
-                ),
-                super::super::try_kernel(
-                    gpu,
-                    "gated_delta_rule_wyn",
-                    "gated_delta_rule_wy15_defer",
-                ),
-                super::super::try_kernel(
-                    gpu,
-                    "gated_delta_rule_wyn",
-                    "gated_delta_rule_wy16_defer",
-                ),
-            ],
-            gdn_commit_k: super::super::try_kernel(
+                    &format!("gated_delta_rule_wy{}_defer", i + 5),
+                )
+            }),
+            gdn_commit_k: super::super::try_kernel_gated(
+                !cfg!(atlas_hip),
                 gpu,
                 "gated_delta_rule_wyn",
                 "gated_delta_rule_commit",
