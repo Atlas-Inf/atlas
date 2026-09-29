@@ -469,7 +469,8 @@ impl Qwen3SsmLayer {
                 "w8a16_gemv_batch4",
                 "w8a16_gemv_batch8",
             ),
-            w8a16_gemv_batch8_dyn_vl2_k: super::super::try_kernel(
+            w8a16_gemv_batch8_dyn_vl2_k: super::super::try_kernel_gated(
+                cfg!(atlas_hip),
                 gpu,
                 "w8a16_gemv_batch4",
                 "w8a16_gemv_batch8_dyn_vl2",
