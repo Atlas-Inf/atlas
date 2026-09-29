@@ -485,7 +485,12 @@ pub fn build_model(
     // to the previous behavior — nothing breaks, the late allocs just take
     // their chances as before.
     // The drafter's own post-KV allocs are held by the second balloon below.
-    let balloon_bytes = inference_reserve;
+    // Not on Windows: there a freed multi-GB block does not become
+    // allocatable again, so after the balloon is released the KV pool claim
+    // still failed (Flash-Next MTP on winbox: a 102 MB layer pool refused
+    // with 16 GB reported free, even after the retry below freed the balloon).
+    // Windows keeps the virtual-reserve subtraction it booted with before.
+    let balloon_bytes = if cfg!(windows) { 0 } else { inference_reserve };
     let balloon = if balloon_bytes > 0 {
         match gpu.alloc(balloon_bytes) {
             Ok(ptr) => Some(ptr),
