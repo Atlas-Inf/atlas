@@ -206,9 +206,11 @@ fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_gemv() {
     // the mock every kernel resolves, so `fp8_verify_gemv_tier` picks the
     // M<=8 tier: the `w8a16_gemv_batch8_dyn_vl2` twin (8 outputs/block, grid
     // [ceil(N/8),1,1]) unless ATLAS_GEMV_VL2=0, else `w8a16_gemv_batch8`
-    // (grid [ceil(N/4),1,1]). Block is [256,1,1] either way.
+    // (grid [ceil(N/4),1,1]). Block is [256,1,1] either way. The vl2 lookup
+    // is only issued on atlas_hip (the twin exists only in strix-hip), so
+    // every other build takes the batch8 arm.
     // QKVZ N=12288, out_proj N=2048.
-    let per_block = if crate::layers::ops::gemv_vl2_enabled() {
+    let per_block = if cfg!(atlas_hip) && crate::layers::ops::gemv_vl2_enabled() {
         8
     } else {
         4
