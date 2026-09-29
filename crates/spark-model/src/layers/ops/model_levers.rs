@@ -48,7 +48,7 @@ pub struct ModelLevers {
     pub gdn_wy17: bool,
     /// WY-N GDN recurrence variant. Ships ON; `ATLAS_GDN_WYN=0` opts out.
     pub gdn_wyn: bool,
-    /// Deferred SSM commit (`ATLAS_GDN_DEFERRED_COMMIT=1`, opt-IN, v1):
+    /// Deferred SSM commit. Ships ON; `ATLAS_GDN_DEFERRED_COMMIT=0` opts out:
     /// wyN verify writes no per-token Hi_t snapshots nor the final H;
     /// `gated_delta_rule_commit` replays the accepted prefix from the live
     /// H0 instead. Cuts ~(K-1)×64 KB of state writes per (seq, v-head,
@@ -157,7 +157,7 @@ impl ModelLevers {
             // Opt-OUT — these three ship ON.
             gdn_wy17: opt_out("ATLAS_GDN_WY17"),
             gdn_wyn: opt_out("ATLAS_GDN_WYN"),
-            gdn_deferred_commit: opt_in("ATLAS_GDN_DEFERRED_COMMIT"),
+            gdn_deferred_commit: opt_out("ATLAS_GDN_DEFERRED_COMMIT"),
             ffn_small_m: opt_out("ATLAS_FFN_SMALLM"),
             gemv_sw: super::gemv_sw::gemv_sw_from(
                 std::env::var("ATLAS_NO_GEMV_SW").ok().as_deref(),
@@ -182,7 +182,7 @@ impl ModelLevers {
         };
         if levers.gdn_deferred_commit {
             tracing::info!(
-                "GDN deferred commit engaged (ATLAS_GDN_DEFERRED_COMMIT=1):                  wyN verify stores nothing; accepted prefix replayed from H0"
+                "GDN deferred commit on (default; ATLAS_GDN_DEFERRED_COMMIT=0 opts out):                  wyN verify stores nothing; accepted prefix replayed from H0"
             );
         }
         levers
@@ -228,8 +228,8 @@ mod tests {
         assert!(!d.lora_eager);
         assert!(!d.k4_diag);
         assert!(
-            !d.gdn_deferred_commit,
-            "ATLAS_GDN_DEFERRED_COMMIT is opt-IN and defaults off"
+            d.gdn_deferred_commit,
+            "ATLAS_GDN_DEFERRED_COMMIT ships ON; =0 opts out"
         );
     }
 
