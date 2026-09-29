@@ -14,9 +14,9 @@
 
 use std::collections::HashMap;
 
-use spark_runtime::gpu::DevicePtr;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::gpu::mock::MockGpuBackend;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::lifecycle::*;
@@ -66,6 +66,9 @@ pub(super) fn zero_scratch() -> DflashScratch {
         draft_tokens_dev: DevicePtr(0),
         markov_prev_dev: DevicePtr(0),
         markov_prev_host_pinned: Default::default(),
+        ctx_positions_host_pinned: Default::default(),
+        ctx_positions_pinned_bytes: 0,
+        ctx_positions_cursor: Default::default(),
         position_ids: DevicePtr(0),
         dflash2_conv_delta: DevicePtr(0),
         dflash2_conv_out: DevicePtr(0),
@@ -134,6 +137,13 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         batch_mlp_down: DevicePtr(0),
         batch_logits: DevicePtr(0),
         batch_grammar_bitmask: DevicePtr(0),
+        batch_grammar_masks_host_pinned: Default::default(),
+        batch_grammar_masks_pinned_bytes: 0,
+        batch_ctx_in: DevicePtr(0),
+        batch_ctx_fc: DevicePtr(0),
+        batch_ctx_fused: DevicePtr(0),
+        batch_ctx_rows: 0,
+        drafter_cublas: false,
         batch_tokens: DevicePtr(0),
         batch_markov_prev: DevicePtr(0),
         batch_markov_embed: DevicePtr(0),
@@ -199,6 +209,7 @@ pub(super) fn zero_kernels() -> DflashKernels {
         w4a16_gemv_batch16: zero,
         w4a16_gemv_batch32: zero,
         dflash2_conv: None,
+        dflash2_candidate_selector_batched: KernelHandle(0),
         dflash2_candidate_selector: None,
     }
 }

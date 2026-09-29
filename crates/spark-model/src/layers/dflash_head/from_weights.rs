@@ -167,6 +167,11 @@ impl BlockDiffusionDraftHead {
             dflash2_candidate_selector: gpu
                 .kernel("dflash2_candidate_selector", "dflash2_candidate_selector")
                 .ok(),
+            dflash2_candidate_selector_batched: crate::layers::try_kernel(
+                gpu,
+                "dflash2_candidate_selector",
+                "dflash2_candidate_selector_batched",
+            ),
             // Qwen3.6-DFlash uses yarn RoPE — confirmed in the drafter
             // `config.json:rope_scaling.rope_type="yarn"`. Atlas's yarn
             // kernel is `rope::rope_forward_yarn`.
@@ -317,6 +322,10 @@ impl BlockDiffusionDraftHead {
         // One scratch set per propose lane: the piecewise graphs bake these
         // pointers at capture, so each lane needs its own. γ rows only for
         // logits (see the per-field note below).
+        // #58: max carve-outs inside one propose = n seqs × one chunked
+        // precompute region (l_total × ctx_window i32) each; the tail chunk
+        // count is ≤ ctx_len/ctx_window and overflow falls back to sync.
+        let ctx_positions_pinned_bytes = max_batch_size.max(1) * num_layers * ctx_window * 4;
         let make_scratch = |gpu: &dyn GpuBackend| -> Result<DflashScratch> {
             let s = DflashScratch {
                 stream_buf: gpu.alloc(n_attn * hidden_size * bf16)?,
@@ -368,6 +377,15 @@ impl BlockDiffusionDraftHead {
                 markov_prev_host_pinned: std::sync::atomic::AtomicPtr::new(
                     gpu.alloc_host_pinned(4)?,
                 ),
+                // #58: l_total × ctx_window × 4B per precompute call × the
+                // max calls inside one propose (n seqs, each ≤ ctx_window
+                // tail rows). Carve-out overflow falls back to the sync
+                // copy — see ctx_positions_region.
+                ctx_positions_host_pinned: std::sync::atomic::AtomicPtr::new(
+                    gpu.alloc_host_pinned(ctx_positions_pinned_bytes)?,
+                ),
+                ctx_positions_pinned_bytes,
+                ctx_positions_cursor: std::sync::atomic::AtomicUsize::new(0),
                 position_ids: gpu.alloc(n_attn * 4)?,
                 dflash2_conv_delta: gpu.alloc(n_attn * 4 * (hidden_size / 16).max(1) * bf16)?,
                 dflash2_conv_out: gpu.alloc(n_attn * hidden_size * bf16)?,
@@ -455,7 +473,21 @@ impl BlockDiffusionDraftHead {
         // applied to each seq's logits rows 0/1 in the staged tail (#102).
         let batch_grammar_bitmask =
             gpu.alloc(batch_capacity * ops::grammar_bitmask_words(vocab_size as u32) * 4)?;
+        // #58: pinned mirror of batch_grammar_bitmask — one slot per
+        // sequence, shipped with copy_h2d_async_retained (no per-seq drain).
+        let batch_grammar_masks_pinned_bytes =
+            batch_capacity * ops::grammar_bitmask_words(vocab_size as u32) * 4;
+        let batch_grammar_masks_host_pinned = std::sync::atomic::AtomicPtr::new(
+            gpu.alloc_host_pinned(batch_grammar_masks_pinned_bytes)?,
+        );
         let batch_tokens = gpu.alloc(batch_rows * 4)?;
+        // #58 batched ctx-precompute staging: per-sequence tails are
+        // accepted+1 rows (γ+1 worst); chunks larger than the per-seq cap
+        // (post-prefill commits) just fall back to per-sequence GEMMs.
+        let batch_ctx_rows = batch_capacity * super::batched_ctx::BATCH_CTX_ROWS_PER_SEQ;
+        let batch_ctx_in = gpu.alloc(batch_ctx_rows * batch_target_bytes / batch_capacity)?;
+        let batch_ctx_fc = gpu.alloc(batch_ctx_rows * hidden_size * bf16)?;
+        let batch_ctx_fused = gpu.alloc(batch_ctx_rows * num_layers * 2 * kv_dim * bf16)?;
         let batch_markov_prev = gpu.alloc(batch_capacity * 4)?;
         let batch_markov_embed_bytes = batch_capacity
             .checked_mul(weights.markov_rank)
@@ -851,6 +883,27 @@ impl BlockDiffusionDraftHead {
             batch_mlp_down,
             batch_logits,
             batch_grammar_bitmask,
+            batch_grammar_masks_host_pinned,
+            batch_grammar_masks_pinned_bytes,
+            batch_ctx_in,
+            batch_ctx_fc,
+            batch_ctx_fused,
+            batch_ctx_rows,
+            drafter_cublas: {
+                let on = std::env::var("ATLAS_DFLASH_DRAFTER_CUBLAS").as_deref() == Ok("1")
+                    && spark_runtime::cublaslt::available();
+                if std::env::var("ATLAS_DFLASH_DRAFTER_CUBLAS").as_deref() == Ok("1") {
+                    tracing::info!(
+                        "DFlash drafter cuBLASLt route: {}",
+                        if on {
+                            "engaged for m >= 32"
+                        } else {
+                            "requested but cuBLASLt unavailable — inert"
+                        }
+                    );
+                }
+                on
+            },
             batch_tokens,
             batch_markov_prev,
             batch_markov_embed,

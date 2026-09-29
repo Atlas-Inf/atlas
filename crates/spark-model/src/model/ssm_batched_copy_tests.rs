@@ -44,6 +44,7 @@ fn pool(gpu: &MockGpuBackend) -> SsmStatePool {
         NUM_DRAFTS,
         false,
         SsmRollbackMode::Snapshot,
+        false,
         gpu,
     )
     .unwrap()
@@ -391,6 +392,7 @@ fn dflash_pools_size_h_intermediates_uniformly() {
         7,
         false,
         SsmRollbackMode::Snapshot,
+        false,
         &gpu,
     )
     .unwrap();
@@ -412,6 +414,7 @@ fn dflash_pools_size_h_intermediates_uniformly() {
         7,
         false,
         SsmRollbackMode::Snapshot,
+        false,
         &gpu,
     )
     .unwrap();

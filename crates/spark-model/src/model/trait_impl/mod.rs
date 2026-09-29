@@ -321,6 +321,7 @@ impl Model for TransformerModel {
         stream: u64,
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
+        self.mark_gdn_deferred_commit(seq, tokens.len());
         let r = self.decode_verify_dispatch(tokens, seq, stream);
         if r.is_err() {
             // Same brick guard as decode_batch: a refuse mid-verify-capture
@@ -462,6 +463,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 2]> {
         self.ssm_pool.require_verify_rollback_supported()?;
+        self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_verify_graphed_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k3(
@@ -471,6 +473,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 3]> {
         self.ssm_pool.require_verify_rollback_supported()?;
+        self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k4(
@@ -480,6 +483,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 4]> {
         self.ssm_pool.require_verify_rollback_supported()?;
+        self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
     }
     fn can_batch_verify(&self, ks: &[usize]) -> bool {
@@ -493,6 +497,15 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
+        anyhow::ensure!(
+            ks.len() == seqs.len(),
+            "decode_verify_batched: {} depths for {} sequences",
+            ks.len(),
+            seqs.len()
+        );
+        for (seq, &k) in seqs.iter_mut().zip(ks) {
+            self.mark_gdn_deferred_commit(seq, k);
+        }
         self.decode_verify_batched_dispatch(tokens, ks, seqs, _stream)
     }
     fn stash_verify_hidden_rows(&self, rows: &[usize], _stream: u64) -> Result<()> {
@@ -541,6 +554,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
+        self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream)
     }
     fn decode_and_verify_fused(
@@ -550,6 +564,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
+        self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_and_verify_fused_dispatch(tokens, seq, _stream)
     }
     fn save_hidden_for_catchup(&self, token_idx: usize, pos: usize) -> Result<()> {

@@ -341,6 +341,28 @@ pub(crate) fn dense_auto(
     }
 }
 
+/// Release a loader intermediate once its contents have been copied elsewhere.
+///
+/// [`dense_auto`] returns the STORE's own buffer for a BF16 tensor and a fresh
+/// allocation only when it had to convert (FP8 / FP32). A loader that frees the
+/// result with a plain `gpu.free` therefore frees store-owned memory on BF16
+/// checkpoints, and `WeightStore::release` frees the same pointer again at
+/// teardown — by then the address may belong to a later allocation. This
+/// routes the alias through [`WeightStore::reclaim`] (which records it so
+/// teardown skips it) and frees a genuine loader allocation directly.
+pub(crate) fn free_loader_source(
+    store: &WeightStore,
+    gpu: &dyn GpuBackend,
+    name: &str,
+    w: DenseWeight,
+) -> Result<()> {
+    if store.get(name).is_ok_and(|t| t.ptr == w.weight) {
+        store.reclaim(gpu, name)
+    } else {
+        gpu.free(w.weight)
+    }
+}
+
 /// Build a QuantizedWeight from Sehyo/compressed-tensors NVFP4 naming convention.
 ///
 /// Sehyo quantization uses: weight_packed, weight_scale, weight_global_scale, input_global_scale
@@ -381,3 +403,7 @@ pub(crate) fn quantized_v2(
         weight_scale_2_vec: DevicePtr::NULL,
     })
 }
+
+#[cfg(test)]
+#[path = "quant_helpers_tests.rs"]
+mod tests;

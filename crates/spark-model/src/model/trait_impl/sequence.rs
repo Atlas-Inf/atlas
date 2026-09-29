@@ -239,6 +239,9 @@ impl TransformerModel {
                 ssm.conv_state_checkpoint = None;
                 ssm.h_state_intermediates.clear();
                 ssm.conv_state_intermediates.clear();
+                ssm.gdn_commit_qkv = DevicePtr(0);
+                ssm.gdn_commit_gb = DevicePtr(0);
+                ssm.gdn_commit_pending = false;
             }
         }
 
@@ -384,6 +387,10 @@ impl TransformerModel {
                 if let Some(ssm) = state.as_any_mut().downcast_mut::<SsmLayerState>() {
                     ssm.h_state = self.ssm_pool.h_state(ssm_layer_idx, new_slot);
                     ssm.conv_state = self.ssm_pool.conv_state(ssm_layer_idx, new_slot);
+                    // Deferred-commit staging is slot-keyed (pool-stable) —
+                    // repoint on rebind like every other pool buffer.
+                    ssm.gdn_commit_qkv = self.ssm_pool.commit_qkv(ssm_layer_idx, new_slot);
+                    ssm.gdn_commit_gb = self.ssm_pool.commit_gb(ssm_layer_idx, new_slot);
                     // Stage-3 f16-SIZED pool: the FP32 prefill staging blob is
                     // per-SLOT, so compaction must repoint it for the same
                     // reason the checkpoint/intermediate families below are

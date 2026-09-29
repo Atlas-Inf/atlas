@@ -341,6 +341,15 @@ pub struct Qwen3SsmLayer {
     /// NULL handles on targets lacking the module → sequential fallback.
     /// Kill-switch: `ATLAS_GDN_WYN=0` (default ON).
     gdn_wyn_k: [KernelHandle; 12],
+    /// Deferred-commit twins (`_defer` MODE-1 entries): identical outputs,
+    /// NO Hi_t/final-H stores — `h_state` stays H0 for
+    /// `gated_delta_rule_commit`. Only consulted when
+    /// `levers.gdn_deferred_commit` is set; NULL → per-token fallback off
+    /// the lever entirely.
+    gdn_wyn_defer_k: [KernelHandle; 12],
+    /// `gated_delta_rule_commit` — replays the accepted prefix from live
+    /// H0 into `h_state`, replacing the intermediates index-select.
+    gdn_commit_k: KernelHandle,
     // State allocation sizes (pre-computed from config)
     h_state_bytes: usize,
     conv_state_bytes: usize,
