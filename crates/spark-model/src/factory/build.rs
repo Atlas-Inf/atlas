@@ -762,7 +762,25 @@ pub fn build_model(
             );
         }
     }
-    let kv_cache = PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?;
+    // The balloon raises peak allocation during this claim by the reserve
+    // (4.1 GB on Flash-Next). Where the driver won't hand out memory it
+    // reports as free (Windows gfx1151: a 102 MB KV pool alloc failed with
+    // 12 GB "free"), release the balloon and retry: the pre-balloon behavior.
+    let mut balloon = balloon;
+    let kv_cache = match PagedKvCache::new(kv_config.clone(), num_kv_blocks, gpu.as_ref()) {
+        Ok(kv) => kv,
+        Err(e) if balloon.is_some() => {
+            tracing::warn!(
+                "KV pool alloc failed with the reserve balloon held ({e}); \
+                 releasing the balloon and retrying"
+            );
+            if let Some(ptr) = balloon.take() {
+                gpu.free(ptr)?;
+            }
+            PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?
+        }
+        Err(e) => return Err(e),
+    };
 
     // Release the reserve balloon: everything after this point (Marconi
     // snapshot pool, SSM decode states, drafter KV, NVFP4 staging) allocates
