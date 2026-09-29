@@ -267,6 +267,16 @@ impl Qwen3AttentionLayer {
                 "w8a16_gemv_batch4",
                 "w8a16_gemv_batch4",
             ),
+            // `w8a16_gemv_batch8` exists only in kernels/strix-hip/common
+            // (w8a16_gemv_batch4.cu); on NVIDIA the lookup can never resolve
+            // and the boot kernel gate would refuse the model. Gate it like
+            // the other Strix-only lookups (#87).
+            w8a16_gemv_batch8_k: super::super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w8a16_gemv_batch4",
+                "w8a16_gemv_batch8",
+            ),
             w8a16_gemv_batch16_k: super::super::try_kernel(
                 gpu,
                 "w8a16_gemv_batch4",

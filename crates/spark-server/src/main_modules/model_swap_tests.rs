@@ -285,3 +285,34 @@ fn a_repeat_of_the_live_config_is_a_no_op_even_with_process_flags_set() {
         "and are equal after it, which is what makes the no-op fire"
     );
 }
+
+/// Process shutdown on an empty host has nothing to join and returns
+/// promptly — the modelless-boot case (#106).
+#[test]
+fn shutdown_on_an_empty_host_returns_promptly() {
+    let host = Arc::new(ModelHost::empty());
+    let began = std::time::Instant::now();
+    super::shutdown(&host);
+    assert!(began.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// Shutdown must not return until the parked scheduler thread finishes its
+/// teardown — that join is what keeps `exit()`'s static destructors off the
+/// HIP calls teardown still makes (#106).
+#[test]
+fn shutdown_waits_for_the_scheduler_thread() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let host = Arc::new(ModelHost::empty());
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = done.clone();
+    host.set_scheduler(std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        flag.store(true, Ordering::SeqCst);
+    }));
+    super::shutdown(&host);
+    assert!(
+        done.load(Ordering::SeqCst),
+        "returned before teardown finished"
+    );
+    assert!(host.take_scheduler().is_none(), "the handle was consumed");
+}

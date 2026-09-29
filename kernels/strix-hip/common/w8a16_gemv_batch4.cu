@@ -131,6 +131,18 @@ extern "C" __global__ void w8a16_gemv_batch4(
     w8a16_gemv_batchm_impl<4>(A, B, block_scale, C, M, N, K);
 }
 
+extern "C" __global__ void w8a16_gemv_batch8(
+    const __nv_bfloat16* A,
+    const unsigned char* B,
+    const float* block_scale,
+    __nv_bfloat16* C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w8a16_gemv_batchm_impl<8>(A, B, block_scale, C, M, N, K);
+}
+
 extern "C" __global__ void w8a16_gemv_batch16(
     const __nv_bfloat16* A,
     const unsigned char* B,

@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 
+use super::dflash_ctx_window;
 use super::types::TransformerModel;
 
 impl TransformerModel {
@@ -55,28 +56,107 @@ impl TransformerModel {
             },
             None => return Ok(()),
         };
+        if dstate.max_ctx_len == 0 {
+            return Ok(()); // ctx conditioning disabled
+        }
+        // ATLAS_DFLASH_CTX_CARRY + first-chunk bookkeeping. Adopt BEFORE the
+        // first capture write (rather than in
+        // update_dflash_ctx_len_after_prefill, which the chunked path calls
+        // only after the LAST chunk) so that:
+        //   1. The carried accumulator install happens before any writes —
+        //      captures already in the fresh buffer would be orphaned when
+        //      adopt frees it.
+        //   2. Captures append AFTER the carried window — no row is ever
+        //      claimed by two positions.
+        //   3. `ctx_prefill_origin`/`ctx_prefill_base` snapshot where the
+        //      window's own coverage begins, so every chunk's capture rows
+        //      derive as base + (chunk_start - origin) even though ctx_len
+        //      only advances at the last chunk's update.
+        if dstate.ctx_prefill_origin.is_none() {
+            if let Some(ref proposer) = self.proposer {
+                proposer.adopt_dflash_ctx(self.gpu.as_ref(), dstate, &seq.tokens, chunk_start);
+            }
+            dstate.ctx_prefill_origin = Some(chunk_start);
+            dstate.ctx_prefill_base = dstate.ctx_len;
+        }
+        // Lazy accumulator: adopt may have installed the carried buffer
+        // (ctx_hidden_acc != 0 → no-op); a rejected carry just pooled its
+        // buffer, which this pops right back — either way zero device
+        // allocations on the warm path.
+        if dstate.ctx_hidden_acc.0 == 0
+            && let Some(ref proposer) = self.proposer
+        {
+            proposer.acquire_ctx_acc(self.gpu.as_ref(), dstate)?;
+        }
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
+        let acc_rows = dstate.ctx_acc_rows;
         let src_base = self.buffers.hidden_states();
-        for t in 0..proc_count {
-            let abs_pos = chunk_start + t;
-            if abs_pos >= max_ctx {
-                break; // accumulator full; drop later positions
+        // Dense-window append: the ctx accumulator is a compacted array of
+        // rows [0..ctx_len) with per-row absolute positions in
+        // ctx_positions — NOT a position-indexed buffer. Carried rows sit in
+        // [0..ctx_prefill_base); captures land at base + (chunk_start -
+        // origin). Overflow → plan_capture slides to the newest
+        // max_ctx_len/2 rows; a chunk bigger than keep gets move_rows = 0
+        // and its leading `skip` tokens drop (the old inline code truncated
+        // at acc_rows, then the NEXT chunk's slide read ~200 MB past the
+        // accumulator — the GB10 crash).
+        let plan = dflash_ctx_window::plan_capture(
+            dstate.ctx_prefill_base,
+            dstate.ctx_prefill_origin.unwrap_or(chunk_start),
+            chunk_start,
+            proc_count,
+            acc_rows,
+            dstate.max_ctx_len,
+        );
+        if let Some(slide) = plan.slide {
+            let slot = dstate.ctx_slot_bytes;
+            if slide.move_rows > 0 {
+                self.gpu.copy_d2d_async(
+                    acc_base.offset(slide.drop_n * slot),
+                    acc_base,
+                    slide.move_rows * slot,
+                    stream,
+                )?;
+            }
+            // The plan advanced ctx_prefill_origin past the dropped captures
+            // so positions stay aligned with the rows.
+            let pos = slide.drop_n.min(dstate.ctx_positions.len());
+            dstate.ctx_positions.drain(..pos);
+            dstate.ctx_prefill_base = plan.base;
+            dstate.ctx_prefill_origin = Some(plan.origin);
+            // Rows moved; their drafter-KV slot mapping is stale.
+            dstate.ctx_committed = 0;
+            let keep = dstate.max_ctx_len / 2;
+            let skipped = if plan.skip > 0 {
+                format!(", skipped {} chunk tokens", plan.skip)
+            } else {
+                String::new()
+            };
+            tracing::info!(
+                "DFlash ctx prefill slide: dropped {} oldest rows{skipped} (mid-prefill overflow, keep {keep})",
+                slide.drop_n,
+            );
+        }
+        for t in plan.skip..proc_count {
+            let row = plan.first_row + (t - plan.skip);
+            if row >= acc_rows {
+                break; // accumulator capacity; retention is enforced by the slide
             }
             let src = src_base.offset(t * h * bf16);
-            let dst_offset = abs_pos * n_capture * h * bf16 + slot_idx * h * bf16;
+            let dst_offset = row * n_capture * h * bf16 + slot_idx * h * bf16;
             self.gpu
                 .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
         }
         Ok(())
     }
 
-    /// After prefill completes, advance the seq's DFlash `ctx_len` to
-    /// `chunk_start + proc_count` so the drafter sees all captured prompt
-    /// positions on the first propose() call.
+    /// After prefill completes (last chunk on the chunked path), set the
+    /// seq's DFlash `ctx_len` to the full captured window — carried rows
+    /// plus every position this prefill covered — and slide to the newest
+    /// half-window if the window exceeds the retention cap.
     pub(super) fn update_dflash_ctx_len_after_prefill(
         &self,
         seq: &mut crate::traits::SequenceState,
@@ -96,13 +176,48 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
         {
-            let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
-            dstate.ctx_len = new_len;
-            // Phase I (v2): seed per-slot fixed positions for the prompt
-            // captures. Prefill slot i holds prompt position i, so the
-            // fixed rope position is simply its index. Keep parallel to
-            // ctx_len. Re-seed idempotently across prefill chunks.
-            dstate.ctx_positions = (0..new_len).map(|i| i as i32).collect();
+            if dstate.max_ctx_len == 0 {
+                return Ok(());
+            }
+            let chunk_end = chunk_start + proc_count;
+            // Pure/idempotent: rows [0..base) are the adopted carry (their
+            // carried positions stay), rows [base..ctx_len) are this
+            // prefill's captures at positions origin..chunk_end — same
+            // layout the capture cursor wrote (base + chunk_start - origin).
+            // A repeat call recomputes the same result.
+            let base = dstate.ctx_prefill_base;
+            let origin = dstate.ctx_prefill_origin.unwrap_or(chunk_start);
+            dstate.ctx_len = base.saturating_add(chunk_end.saturating_sub(origin));
+            dstate.ctx_positions.truncate(base);
+            dstate
+                .ctx_positions
+                .extend((origin..chunk_end).map(|i| i as i32));
+            // Retention slide — same keep-NEWEST-half policy as
+            // commit_ctx/dflash_serial_ctx_append: drop_n >= keep so the
+            // single D2D copy's src/dst ranges can never overlap. Absolute
+            // positions survive the drain; committed K/V is re-precomputed
+            // chunk-wise on the next propose.
+            if dstate.ctx_len > dstate.max_ctx_len {
+                let keep = dstate.max_ctx_len / 2;
+                // Bound by PHYSICAL rows: the buffer is sized to
+                // ctx_acc_rows (== max_ctx_len) and an all-cached-chunks
+                // turn can push formula ctx_len one row past it.
+                let phys = dstate.ctx_len.min(dstate.ctx_acc_rows);
+                let drop_n = phys - keep;
+                let slot = dstate.ctx_slot_bytes;
+                let src = dstate.ctx_hidden_acc.offset(drop_n * slot);
+                let stream = self.gpu.default_stream();
+                self.gpu
+                    .copy_d2d_async(src, dstate.ctx_hidden_acc, keep * slot, stream)?;
+                let pos_drop = drop_n.min(dstate.ctx_positions.len());
+                dstate.ctx_positions.drain(..pos_drop);
+                dstate.ctx_len = keep;
+                dstate.ctx_committed = 0;
+                tracing::info!(
+                    "DFlash ctx prefill watermark: slid ctx window \
+                     (dropped {drop_n} oldest, keep {keep})",
+                );
+            }
         }
         Ok(())
     }

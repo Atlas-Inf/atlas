@@ -161,6 +161,7 @@ impl std::str::FromStr for KvCacheDtype {
 }
 
 /// Configuration for the paged KV cache.
+#[derive(Clone)]
 pub struct KvCacheConfig {
     /// Tokens per block.
     pub block_size: usize,

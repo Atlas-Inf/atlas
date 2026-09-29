@@ -83,7 +83,9 @@ impl Qwen3AttentionLayer {
             self.ms_qkv_batchn(c)?;
         } else if (2..=16).contains(&n)
             && ((n <= 4 && self.w8a16_gemv_batch4_k.0 != 0)
-                || (n > 4 && self.w8a16_gemv_batch16_k.0 != 0))
+                || (n > 4
+                    && (self.w8a16_gemv_batch16_k.0 != 0
+                        || (n <= 8 && self.w8a16_gemv_batch8_k.0 != 0))))
             && self.q_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_fp8()).is_some()

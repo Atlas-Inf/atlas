@@ -24,8 +24,30 @@ impl PagedKvCache {
             let v_block_bytes = config.v_block_bytes_for_layer(i);
             let k_pool_bytes = num_blocks * k_block_bytes;
             let v_pool_bytes = num_blocks * v_block_bytes;
-            let k_pool = gpu.alloc(k_pool_bytes)?;
-            let v_pool = gpu.alloc(v_pool_bytes)?;
+            // A failed alloc frees the pools this call already claimed, so a
+            // caller can release memory and retry (build_model's reserve
+            // balloon fallback) without the first attempt's layers leaking.
+            let release = |layers: &[LayerPool]| {
+                for l in layers {
+                    let _ = gpu.free(l.k_pool);
+                    let _ = gpu.free(l.v_pool);
+                }
+            };
+            let k_pool = match gpu.alloc(k_pool_bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    release(&layers);
+                    return Err(e);
+                }
+            };
+            let v_pool = match gpu.alloc(v_pool_bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = gpu.free(k_pool);
+                    release(&layers);
+                    return Err(e);
+                }
+            };
             total_bytes += k_pool_bytes + v_pool_bytes;
             layers.push(LayerPool {
                 k_pool,
