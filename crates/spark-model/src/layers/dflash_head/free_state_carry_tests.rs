@@ -14,6 +14,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 #[test]
 fn reclaim_seam_free_failure_retains_pointers() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let own = owner(3, 77);
     let mut dstate = live_state(&gpu, own);
@@ -85,6 +86,7 @@ fn real_free_state_block_table_free_failure_restores_handle_for_retry() {
 /// whose prompt extends the carried tokens adopts the prefix portion.
 #[test]
 fn ctx_carry_round_trip_adopts_prefix() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -166,6 +168,7 @@ fn ctx_carry_rejects_divergent_prefix_without_leaking() {
 /// watermarks to the shared span; the tail re-precomputes.
 #[test]
 fn ctx_carry_truncates_at_divergence() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -189,6 +192,7 @@ fn ctx_carry_truncates_at_divergence() {
 /// identical pointer fields, lane pinned.
 #[test]
 fn ctx_carry_lifts_and_rekeys_propose_graphs() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let old_own = owner(3, 77);

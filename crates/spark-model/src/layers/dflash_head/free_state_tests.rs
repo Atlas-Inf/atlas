@@ -375,6 +375,7 @@ fn real_free_state_second_call_is_idempotent_success() {
 
 #[test]
 fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -416,6 +417,7 @@ fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
 
 #[test]
 fn real_free_state_different_live_owner_is_rejected_and_reclaimed() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -442,6 +444,7 @@ fn real_free_state_different_live_owner_is_rejected_and_reclaimed() {
 
 #[test]
 fn real_free_state_missing_owner_is_rejected_and_reclaimed() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
