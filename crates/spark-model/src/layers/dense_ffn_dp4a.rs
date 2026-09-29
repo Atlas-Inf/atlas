@@ -121,20 +121,43 @@ impl DenseFfnLayer {
         // Guard-free specialization per exact tier; the _dyn twins keep the
         // runtime `row >= M` skip that makes the unused rows free. Every arm
         // is bit-identical per emitted row.
-        let (gemv_k, dual_k) = if m == 8 {
-            if self.dp4a_gemv_batch8_k.0 == 0 || self.dp4a_dual_batch8_k.0 == 0 {
+        // vl2 (ATLAS_GEMV_VL2, default on) applies to the gate+up DUAL only:
+        // m 5..=8 → `dual_batch8_d4_dyn_vl2` when linked (the guarded twin
+        // beat the fixed one at m==8: 880 vs 1066 us/call — the dyn's leaner
+        // register profile wins). The single down-proj GEMV stays on the vl1
+        // batch8 tiers: at K=17408 it is already near the streaming roofline
+        // and vl2's halved grid cost more than the extra loads bought (+85%).
+        // Bit-identical either way; a missing handle drops to the vl1 tier.
+        let vl2 = ops::gemv_vl2_enabled();
+        let (gemv_k, dual_k, dual_vl2) = if m >= 5 {
+            let gk = if m == 8 {
+                self.dp4a_gemv_batch8_k
+            } else {
+                self.dp4a_gemv_batch8_dyn_k
+            };
+            if gk.0 == 0 {
                 return Ok(false);
             }
-            (self.dp4a_gemv_batch8_k, self.dp4a_dual_batch8_k)
-        } else if m >= 5 {
-            if self.dp4a_gemv_batch8_dyn_k.0 == 0 || self.dp4a_dual_batch8_dyn_k.0 == 0 {
+            let dvl2 = vl2 && self.dp4a_dual_batch8_dyn_vl2_k.0 != 0;
+            let dk = if dvl2 {
+                self.dp4a_dual_batch8_dyn_vl2_k
+            } else if m == 8 {
+                self.dp4a_dual_batch8_k
+            } else {
+                self.dp4a_dual_batch8_dyn_k
+            };
+            if dk.0 == 0 {
                 return Ok(false);
             }
-            (self.dp4a_gemv_batch8_dyn_k, self.dp4a_dual_batch8_dyn_k)
+            (gk, dk, dvl2)
         } else if m == 4 {
-            (self.dp4a_gemv_batch4_k, self.dp4a_dual_batch4_k)
+            (self.dp4a_gemv_batch4_k, self.dp4a_dual_batch4_k, false)
         } else {
-            (self.dp4a_gemv_batch4_dyn_k, self.dp4a_dual_batch4_dyn_k)
+            (
+                self.dp4a_gemv_batch4_dyn_k,
+                self.dp4a_dual_batch4_dyn_k,
+                false,
+            )
         };
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
@@ -148,7 +171,12 @@ impl DenseFfnLayer {
             h,
             stream,
         )?;
-        ops::w4a16_gemv_dp4a_dual_batch4(
+        let dual_launch = if dual_vl2 {
+            ops::w4a16_gemv_dp4a_dual_batch8_vl2
+        } else {
+            ops::w4a16_gemv_dp4a_dual_batch4
+        };
+        dual_launch(
             ctx.gpu,
             dual_k,
             quantized,

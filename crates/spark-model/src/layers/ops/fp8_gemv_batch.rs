@@ -105,6 +105,54 @@ pub fn w8a16_gemv_batch4(
         .launch(stream)
 }
 
+/// Kernel for the block-scaled FP8 verify GEMV at `m` rows (5..=16) and whether it is a
+/// `_vl2` twin (8 outputs/block -> launch with `w8a16_gemv_batch4_vl2`). 0-handles = not linked.
+pub fn fp8_verify_gemv_tier(
+    m: usize,
+    vl2_on: bool,
+    batch8: KernelHandle,
+    batch8_dyn_vl2: KernelHandle,
+    batch16: KernelHandle,
+) -> (KernelHandle, bool) {
+    if m <= 8 {
+        if vl2_on && batch8_dyn_vl2.0 != 0 {
+            return (batch8_dyn_vl2, true);
+        }
+        if batch8.0 != 0 {
+            return (batch8, false);
+        }
+    }
+    (batch16, false)
+}
+
+/// vl2 twin of `w8a16_gemv_batch4`-family calls: the `*_vl2` kernels cover
+/// 8 outputs per block — grid `ceil(n/8)`.
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemv_batch4_vl2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    block_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(block_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Block-scaled FP8 dual-GEMV (batch=2). `input` is `[2, K]` BF16, `output` is
 /// `[2, N]` BF16; `weight`/`block_scale` are the raw `w8a16_gemv` pointers.
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
@@ -130,4 +178,27 @@ pub fn w8a16_gemv_batch2(
         .arg_u32(n)
         .arg_u32(k)
         .launch(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fp8_verify_tier_pick() {
+        let b8 = KernelHandle(1);
+        let d8 = KernelHandle(3);
+        let b16 = KernelHandle(4);
+        let z = KernelHandle(0);
+        let pick = |m: usize, on: bool, a, b, c| {
+            let (k, v) = fp8_verify_gemv_tier(m, on, a, b, c);
+            (k.0, v)
+        };
+        assert_eq!(pick(8, true, b8, d8, b16), (3, true));
+        assert_eq!(pick(6, true, b8, d8, b16), (3, true));
+        assert_eq!(pick(8, false, b8, d8, b16), (1, false));
+        assert_eq!(pick(8, true, b8, z, b16), (1, false));
+        assert_eq!(pick(8, true, z, z, b16), (4, false));
+        assert_eq!(pick(12, true, b8, d8, b16), (4, false));
+    }
 }
