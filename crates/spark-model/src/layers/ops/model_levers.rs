@@ -202,6 +202,7 @@ impl ModelLevers {
             gdn_wyn: true,
             ffn_small_m: true,
             gemv_sw: true,
+            gdn_deferred_commit: true,
             ..Self::default()
         }
     }
@@ -214,7 +215,7 @@ mod tests {
     #[test]
     fn the_opt_out_lever_is_on_by_default_and_every_opt_in_is_off() {
         let d = ModelLevers::defaults();
-        // Five levers ship ON. Getting one of these senses backwards is a
+        // Six levers ship ON. Getting one of these senses backwards is a
         // silent behaviour change, which is why they are pinned here.
         assert!(d.gdn_regresident, "PR #369 folded this default-on");
         assert!(d.gdn_wy17 && d.gdn_wyn, "opt-OUT via =0");
