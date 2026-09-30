@@ -40,9 +40,8 @@ param(
     [string]$DraftDir = "$env:USERPROFILE\models\dflash2"
 )
 $ErrorActionPreference = 'Stop'
-$env:HOME = 'C:\Users\azeez'
-$env:USERPROFILE = 'C:\Users\azeez'
-$env:ATLAS_HOME = 'C:\Users\azeez\.atlas'
+if (-not $env:HOME) { $env:HOME = $env:USERPROFILE }
+if (-not $env:ATLAS_HOME) { $env:ATLAS_HOME = Join-Path $env:HOME '.atlas' }
 $Repo = if ($env:ATLAS_REPO) { $env:ATLAS_REPO } else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Repo 'target\x86_64-pc-windows-msvc' }
 $Bin = if ($env:ATLAS_BIN) { $env:ATLAS_BIN } else { Join-Path $TargetDir 'release\spark.exe' }

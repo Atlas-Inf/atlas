@@ -32,10 +32,14 @@ param(
 $ErrorActionPreference = "Stop"
 $Repo = if ($env:ATLAS_REPO) { $env:ATLAS_REPO } else { (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path }
 $Bin = if ($env:ATLAS_BIN) { $env:ATLAS_BIN } else { "$Repo\target\x86_64-pc-windows-msvc\release\spark.exe" }
-$env:HIP_PATH = "C:\TheRock\10.0.0"
+if (-not $env:HIP_PATH) {
+    if (Test-Path 'C:\TheRock\10.0.0') { $env:HIP_PATH = 'C:\TheRock\10.0.0' }
+    else { throw 'Set HIP_PATH to the ROCm SDK/runtime root.' }
+}
 $env:PATH = "$env:HIP_PATH\bin;$env:PATH"
-$Log = "C:\Users\azeez\code\qwen38-port-logs\windows\flash-next\serve-fnext-$Tag.log"
-$env:HOME = "C:\Users\azeez"
+if (-not $env:HOME) { $env:HOME = $env:USERPROFILE }
+New-Item -ItemType Directory -Force (Join-Path $Repo 'out') | Out-Null
+$Log = Join-Path $Repo "out\serve-fnext-$Tag.log"
 
 # Measured recipe env (boot-7g, 2026-09-20).
 $env:HF_HUB_OFFLINE = "1"
@@ -52,7 +56,7 @@ $SeqLen = if ($env:SEQ_LEN) { $env:SEQ_LEN } else { "8192" }
 $PrefillTokens = if ($env:PREFILL_TOKENS) { $env:PREFILL_TOKENS } else { "2048" }
 $SsmSlots = if ($env:SSM_SLOTS) { $env:SSM_SLOTS } else { "0" }
 
-$Fingerprint = "C:\Users\azeez\code\qwen38-port-logs\windows\flash-next\serve-fnext-$Tag-fingerprint.txt"
+$Fingerprint = Join-Path $Repo "out\serve-fnext-$Tag-fingerprint.txt"
 @(
     "date=" + (Get-Date).ToUniversalTime().ToString("o")
     "binary=" + $Bin
