@@ -57,6 +57,13 @@ $env:ATLAS_OOM_WATCHDOG_MB = "400"
 $env:ATLAS_MEM_PROFILE = "1"
 $env:ATLAS_UMA_COMMIT_LIMIT_GB = "96"
 $env:ATLAS_MTP_ACCEPT_DEBUG = "1"
+# MTP past the QSA inert bound (~2k context). The engine defaults this ON only
+# for NVIDIA ("unmeasured" on gfx1151), which leaves every agentic-length turn
+# on serial decode here. It is measured on gfx1151: both Windows ST-995 records
+# on #80 (84.22 / 83.61) and the 10/10 agentic-webserver leg at 32k ran with it
+# on, so the recipe serves it by default. An explicit ATLAS_QSA_VERIFY_ACTIVE=0
+# still opts out.
+if (-not $env:ATLAS_QSA_VERIFY_ACTIVE) { $env:ATLAS_QSA_VERIFY_ACTIVE = "1" }
 
 $Serial = ($env:SERIAL -eq "1")
 $Util = if ($env:ATLAS_UTIL) { $env:ATLAS_UTIL } elseif ($Serial) { "0.86" } else { "0.90" }  # see header: serial pre-KV is ~4 GB lower
@@ -73,7 +80,7 @@ $Fingerprint = Join-Path $Repo "out\serve-fnext-$Tag-fingerprint.txt"
     "model=nvidia/Qwen3.8-Flash-Next-NVFP4"
     "model_dir=" + $ModelDir
     "config_sha256=" + (Get-FileHash -Algorithm SHA256 (Join-Path $ModelDir "config.json")).Hash
-    "serve=boot7g util=$Util seq=$SeqLen prefill=2048 kv=bf16 batch=1 drafts=" + $(if ($Serial) { "0" } else { "1" }) + " ssm_slots=0 serial=$Serial vgm=32GB commit_limit=96 bind=$BindHost thinking=" + $(if ($env:DISABLE_THINKING -eq "1") { "off" } else { "checkpoint-default" })
+    "serve=boot7g util=$Util seq=$SeqLen prefill=2048 kv=bf16 batch=1 drafts=" + $(if ($Serial) { "0" } else { "1" }) + " ssm_slots=0 serial=$Serial vgm=32GB commit_limit=96 qsa_verify_active=$env:ATLAS_QSA_VERIFY_ACTIVE bind=$BindHost thinking=" + $(if ($env:DISABLE_THINKING -eq "1") { "off" } else { "checkpoint-default" })
 ) | Out-File $Fingerprint -Encoding utf8
 
 Get-Process spark -ErrorAction SilentlyContinue | Stop-Process -Force
