@@ -348,9 +348,11 @@ function Phase-Build {
     # MODEL and QUANT are MANDATORY: the default target is a qwen3-next-80b kernel
     # dir that does not exist under strix-hip, and build.rs panics resolving it.
     $env:ATLAS_TARGET_HW     = 'strix-hip'
-    # Overridable so the same script serves other targets in this tree
-    # (e.g. ATLAS_TARGET_MODEL=qwen3.8-27b, or '*' to build every one).
-    if (-not $env:ATLAS_TARGET_MODEL) { $env:ATLAS_TARGET_MODEL = 'qwen3.8-27b' }
+    # Overridable per-target (e.g. ATLAS_TARGET_MODEL=qwen3.8-27b); the default
+    # '*' builds every strix-hip target so one build serves all run modes --
+    # the same default the base container uses (docker/gb10/Dockerfile and
+    # Dockerfile.builder set ENV ATLAS_TARGET_MODEL=*) and build-amd.sh on Linux.
+    if (-not $env:ATLAS_TARGET_MODEL) { $env:ATLAS_TARGET_MODEL = '*' }
     $env:ATLAS_TARGET_QUANT  = 'nvfp4'
     $env:CUDARC_CUDA_VERSION = '12080'
 
@@ -440,12 +442,12 @@ function Phase-Serve {
     Set-Location $ReleaseDir
     $env:PATH = "$ReleaseDir;$env:HIP_PATH\bin;$env:PATH"
 
-    # Serve profile: the fp8d recipe — the fingerprinted configuration behind
+    # Serve profile: the fp8d recipe -- the fingerprinted configuration behind
     # the 2026-09-13 ST-995 record (995/995 samples, zero faults, 3.6 h on
     # ROCm 10; see kernels/strix-hip/qwen3.8-27b/BENCH.toml +
     # scripts/strix-windows/win_serve_qwen38_nvfp4.ps1). It replaces the older
     # preservation profile (ATLAS_GDN_BF16_WEIGHTS / ATLAS_FP8_DEQUANT_*),
-    # which is a DIFFERENT kernel path — GDN runs FP8-weight decode here —
+    # which is a DIFFERENT kernel path -- GDN runs FP8-weight decode here --
     # and which bugchecked a second Strix-class box on first inference
     # (0x119, 2026-09-14). If a box cannot serve this recipe, that is a bug
     # to report, not a knob to turn back: the fallback profile is exactly
@@ -528,11 +530,11 @@ try {
     #
     # Remaining deltas vs the proven recipe are sizing-only and deliberate:
     # max-seq 4096 keeps the first-run memory footprint conservative
-    # (env-overridable); util 0.95 matches the fingerprinted recipe — the
+    # (env-overridable); util 0.95 matches the fingerprinted recipe -- the
     # ~63 GB gfx1151 budget only clears the ~14.6 GB inference reserve plus a
     # usable KV slice at >=0.93 on the nvidia checkpoint. --disable-thinking
     # keeps the smoke answer inside 64 tokens. Drafts=3 and ssm-cache-slots=64
-    # match the proven profile — those select the exercised kernel arms, not
+    # match the proven profile -- those select the exercised kernel arms, not
     # just capacity.
     $serveArgs = @('serve', $ModelDir)
     $serveArgs += @(

@@ -1,25 +1,25 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Serves nvidia/Qwen3.8-Flash-Next-NVFP4 on Windows gfx1151 (Strix Halo) with
-# the measured boot-7g recipe — the profile behind the 2026-09-20 MTP headline
+# the measured boot-7g recipe -- the profile behind the 2026-09-20 MTP headline
 # (17.0 tok/s decode, mean_na 0.95; serial arm ~8 tok/s after correcting the
-# watchdog-rollback rework in its Done: lines, i.e. ~2.1x — see the doc).
+# watchdog-rollback rework in its Done: lines, i.e. ~2.1x -- see the doc).
 #
 # MEMORY FACTS this recipe is built around (winbox, 2026-09-19/20):
-#  * VGM MUST be 32 GB — set it with vgmctl (scripts/strix-windows/vgmctl/).
+#  * VGM MUST be 32 GB -- set it with vgmctl (scripts/strix-windows/vgmctl/).
 #    On this runtime VGM 96 GB leaves only 48 GiB usable, VGM 0.5 GB leaves
 #    ~63 GB; VGM 32 GB exposes 96 GB to the HIP shim.
 #  * The resident commit wall is ~84.5 GiB (32 GiB carve-out + ~52.5 GiB WDDM
 #    shared). cuMemAlloc may SUCCEED past it and poison the context with a
-#    sticky 719 on the next submission — the wall is real even when the API
+#    sticky 719 on the next submission -- the wall is real even when the API
 #    reports more free.
 #  * ATLAS_UMA_COMMIT_LIMIT_GB is an OPERATOR-ASSERTED ceiling: the HIP shim
 #    reports it as totalGlobalMem (env > 0 overrides, no min vs the real
-#    property). 96 is what VGM 32 exposes; it is NOT a safe budget — the
+#    property). 96 is what VGM 32 exposes; it is NOT a safe budget -- the
 #    recipe keeps committed under the 84.5 wall instead.
 #  * At Server live the serve process holds ~81 GiB WorkingSet and the host
 #    has ~12 GiB free. NOTHING else memory-heavy may run beside it.
 #  * --ssm-cache-slots 0 drops the 1.8 GB Marconi snapshot pool (dead weight
-#    without --enable-prefix-caching). The KV budget is self-relative — it
+#    without --enable-prefix-caching). The KV budget is self-relative -- it
 #    absorbs whatever you free, so utilization must also stay low.
 #  * SERIAL=1 drops --speculative AND lowers util to 0.86: serial pre-KV is
 #    ~4 GB lower than the MTP arm, so at 0.90 the KV budget absorbs the slack
@@ -74,7 +74,7 @@ Start-Sleep -Seconds 5
 # NOTE: boots 4-7 carried `--dangerously-allow-unresolved-kernel-lookups`
 # because the 62 optional-arm probes were undeclared then. MODEL.toml now
 # declares all 62 in [expected_absent], so the boot audit passes WITHOUT the
-# flag — do not re-add it; a new unresolved lookup is exactly the signal the
+# flag -- do not re-add it; a new unresolved lookup is exactly the signal the
 # gate exists to catch.
 $Args = @(
     "serve", $ModelDir,
