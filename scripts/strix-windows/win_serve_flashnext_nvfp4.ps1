@@ -24,12 +24,20 @@
 #  * SERIAL=1 drops --speculative AND lowers util to 0.86: serial pre-KV is
 #    ~4 GB lower than the MTP arm, so at 0.90 the KV budget absorbs the slack
 #    (~7.1 GB) and crosses the wall during pool allocation. Measured.
+#  * DISABLE_THINKING=1 appends --disable-thinking: the remote-driven perf leg
+#    serves with reasoning off. Default unchanged -- thinking stays at the
+#    checkpoint default, which is what the Windows ST-995 records used.
+#  * -BindHost defaults to 127.0.0.1; set a Tailscale address when the run is
+#    driven from another box (winbox's "Atlas agentic perf" + Tailscale-In
+#    rules allow it). Wildcard binds are refused.
 param(
     [string]$Tag = ("fnext-" + (Get-Date -Format "yyyyMMdd-HHmmss")),
     [string]$ModelDir = "$env:USERPROFILE\models\nvidia-Qwen3.8-Flash-Next-NVFP4",
-    [string]$Port = "8095"
+    [string]$Port = "8095",
+    [string]$BindHost = "127.0.0.1"
 )
 $ErrorActionPreference = "Stop"
+if ($BindHost -in @('0.0.0.0', '::', '*')) { throw 'BindHost must be a specific local or Tailscale address.' }
 $Repo = if ($env:ATLAS_REPO) { $env:ATLAS_REPO } else { (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path }
 $Bin = if ($env:ATLAS_BIN) { $env:ATLAS_BIN } else { "$Repo\target\x86_64-pc-windows-msvc\release\spark.exe" }
 if (-not $env:HIP_PATH) {
@@ -65,7 +73,7 @@ $Fingerprint = Join-Path $Repo "out\serve-fnext-$Tag-fingerprint.txt"
     "model=nvidia/Qwen3.8-Flash-Next-NVFP4"
     "model_dir=" + $ModelDir
     "config_sha256=" + (Get-FileHash -Algorithm SHA256 (Join-Path $ModelDir "config.json")).Hash
-    "serve=boot7g util=$Util seq=$SeqLen prefill=2048 kv=bf16 batch=1 drafts=" + $(if ($Serial) { "0" } else { "1" }) + " ssm_slots=0 serial=$Serial vgm=32GB commit_limit=96"
+    "serve=boot7g util=$Util seq=$SeqLen prefill=2048 kv=bf16 batch=1 drafts=" + $(if ($Serial) { "0" } else { "1" }) + " ssm_slots=0 serial=$Serial vgm=32GB commit_limit=96 bind=$BindHost thinking=" + $(if ($env:DISABLE_THINKING -eq "1") { "off" } else { "checkpoint-default" })
 ) | Out-File $Fingerprint -Encoding utf8
 
 Get-Process spark -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -81,7 +89,7 @@ $Args = @(
     "--no-fast-load",
     "--no-tui",
     "--model-name", "nvidia/Qwen3.8-Flash-Next-NVFP4",
-    "--host", "127.0.0.1", "--port", $Port,
+    "--host", $BindHost, "--port", $Port,
     "--max-seq-len", $SeqLen, "--max-prefill-tokens", $PrefillTokens,
     "--max-batch-size", "1", "--max-num-seqs", "1",
     "--gpu-memory-utilization", $Util,
@@ -90,6 +98,7 @@ $Args = @(
     "--ssm-cache-slots", $SsmSlots
 )
 if ($env:PREFIX_CACHE -eq "1") { $Args += "--enable-prefix-caching" }
+if ($env:DISABLE_THINKING -eq "1") { $Args += "--disable-thinking" }
 if (-not $Serial) { $Args += @("--speculative", "--num-drafts", "1") }
 
 $proc = Start-Process -FilePath $Bin -ArgumentList $Args -RedirectStandardOutput $Log -RedirectStandardError "$Log.err" -PassThru -NoNewWindow
@@ -98,9 +107,9 @@ $up = $false
 for ($i = 0; $i -lt 1350; $i++) {
     Start-Sleep -Seconds 2
     if ($proc.HasExited) { "SERVER DIED"; Get-Content $Log -Tail 8; exit 1 }
-    try { Invoke-WebRequest "http://127.0.0.1:$Port/v1/models" -UseBasicParsing -TimeoutSec 3 | Out-Null; $up = $true; break } catch {}
+    try { Invoke-WebRequest "http://${BindHost}:$Port/v1/models" -UseBasicParsing -TimeoutSec 3 | Out-Null; $up = $true; break } catch {}
 }
 if (-not $up) { "SERVER NOT UP"; Get-Content $Log -Tail 8; exit 1 }
-"server up - nvidia/Qwen3.8-Flash-Next-NVFP4 boot-7g recipe on :$Port (serial=$Serial util=$Util)"
+"server up - nvidia/Qwen3.8-Flash-Next-NVFP4 boot-7g recipe on ${BindHost}:$Port (serial=$Serial util=$Util)"
 "LOG=$Log"
 "FINGERPRINT=$Fingerprint"

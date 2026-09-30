@@ -12,9 +12,13 @@
 #
 # Optional positional arg is the LOCAL weights directory (Windows resolves
 # weights by path, not HF cache) -- equivalent to setting ATLAS_MODEL_DIR.
-# Every env knob first_run.ps1 documents applies here too: ATLAS_MODEL_NAME,
-# ATLAS_BIN (prebuilt spark.exe), ATLAS_PORT, ATLAS_BIND, ATLAS_MAX_SEQ_LEN,
-# ATLAS_MAX_PREFILL_TOKENS, ATLAS_GPU_UTIL.
+# Every env knob first_run.ps1 documents applies to the default (27B + MTP)
+# path: ATLAS_MODEL_NAME, ATLAS_BIN (prebuilt spark.exe), ATLAS_PORT,
+# ATLAS_BIND, ATLAS_MAX_SEQ_LEN, ATLAS_MAX_PREFILL_TOKENS, ATLAS_GPU_UTIL.
+# On -Spec dflash2 and -Model qwen3.8-flash-next, ATLAS_PORT and ATLAS_BIND
+# forward to the recipe's -Port/-BindHost; the Flash-Next recipe also reads
+# its own env knobs (SEQ_LEN, PREFILL_TOKENS, SERIAL, DISABLE_THINKING,
+# PREFIX_CACHE, SSM_SLOTS, ATLAS_UTIL).
 #
 # The serve recipe for the Qwen3.8 27B paths is the fingerprinted fp8d
 # configuration behind the 2026-09-13 ST-995 record -- it lives in
@@ -55,8 +59,10 @@ if ($Model -eq 'qwen3.8-flash-next') {
     }
     Remove-Item Env:SERIAL -ErrorAction SilentlyContinue
     $serve = Join-Path $PSScriptRoot 'scripts\strix-windows\win_serve_flashnext_nvfp4.ps1'
-    if ($env:ATLAS_PORT) { & $serve -ModelDir $ModelDir -Port $env:ATLAS_PORT }
-    else { & $serve -ModelDir $ModelDir }
+    $recipeArgs = @{ ModelDir = $ModelDir }
+    if ($env:ATLAS_PORT) { $recipeArgs.Port = $env:ATLAS_PORT }
+    if ($env:ATLAS_BIND) { $recipeArgs.BindHost = $env:ATLAS_BIND }
+    & $serve @recipeArgs
     if (-not $?) { exit 1 }
 } elseif ($Spec -eq 'dflash2') {
     if (-not $ModelDir) { $ModelDir = "$env:USERPROFILE\models\nvidia-Qwen3.8-27B-NVFP4" }
@@ -68,8 +74,10 @@ if ($Model -eq 'qwen3.8-flash-next') {
         throw "no weights at $DraftDir. Fetch with: hf download incoai/Qwen3.8-27B-DFlash2 --local-dir `"$DraftDir`""
     }
     $serve = Join-Path $PSScriptRoot 'scripts\strix-windows\win_serve_dflash2_nvfp4.ps1'
-    if ($env:ATLAS_PORT) { & $serve -ModelDir $ModelDir -DraftDir $DraftDir -Port $env:ATLAS_PORT }
-    else { & $serve -ModelDir $ModelDir -DraftDir $DraftDir }
+    $recipeArgs = @{ ModelDir = $ModelDir; DraftDir = $DraftDir }
+    if ($env:ATLAS_PORT) { $recipeArgs.Port = $env:ATLAS_PORT }
+    if ($env:ATLAS_BIND) { $recipeArgs.BindHost = $env:ATLAS_BIND }
+    & $serve @recipeArgs
     if (-not $?) { exit 1 }
 } else {
     if ($ModelDir) {
