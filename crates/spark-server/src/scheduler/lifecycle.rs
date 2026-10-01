@@ -297,20 +297,22 @@ pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
 ///
 /// Removes the sequence at `victim_idx` from `active`, saves its state
 /// to a swap file, frees GPU resources, and returns a `SwappedSeq`.
+///
+/// ORDER: the victim is saved and freed FIRST — releasing its own SSM slot to
+/// the pool — and only then are the survivors compacted. The old order
+/// compacted the swapped-in sequence onto slot `victim_idx` before the save,
+/// as an ownership transfer from the victim. That (a) wrote the survivor's
+/// SSM state over the victim's slot BEFORE `save_sequence_state` read it, so
+/// the swap image carried the wrong recurrent state, and (b) assumed
+/// `slot_idx == position`, so on a non-contiguous active vec it copied onto
+/// a slot owned by a third sequence. `compact_sequence` now only accepts
+/// targets it can claim from the free list, which this order satisfies.
 pub fn swap_out_sequence(
     model: &dyn Model,
     active: &mut Vec<ActiveSeq>,
     victim_idx: usize,
     spill: &mut KvSpillManager,
 ) -> Result<SwappedSeq> {
-    // No slot transfer here. This used to compact the swapped-in sequence onto
-    // slot `victim_idx` BEFORE the save below and then disown the victim's
-    // slot. `compact_sequence` now only accepts targets it can claim from the
-    // free list, and the victim still owns its slot at this point, so that
-    // transfer can no longer happen (and it overwrote the victim's SSM state
-    // before `save_sequence_state` read it). The victim releases its own slot
-    // when the spill frees it; the survivors are compacted by the next
-    // `retire_finished_sequences` pass.
     let a = active.swap_remove(victim_idx);
 
     // Save + free + build moved to `preempt::spill_out_sequence` so the
@@ -319,13 +321,22 @@ pub fn swap_out_sequence(
     // victim is surfaced to its client and freed here rather than silently
     // dropped (the old path leaked the GPU blocks AND the client saw only
     // "Inference cancelled").
-    match super::preempt::spill_out_sequence(model, a, spill) {
+    let res = match super::preempt::spill_out_sequence(model, a, spill) {
         Ok(s) => Ok(s),
         Err((mut a, e)) => {
             send_error(model, &mut a, &format!("swap-out failed: {e:#}"));
             Err(e)
         }
+    };
+
+    // The victim's slot is back in the pool on both arms above (`free_sequence`
+    // in the spill, or in `send_error`), which is the PRECONDITION of the
+    // shared compaction core. v2 EP keeps slots pinned (same rule as the
+    // retire path).
+    if !model.ep_protocol_v2() {
+        super::mod_helpers::compact_survivors_into_range(model, active);
     }
+    res
 }
 
 /// Resume a swapped-out sequence by restoring its state from disk.

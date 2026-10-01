@@ -14,9 +14,11 @@
 //! The pool half of the contract is covered in `spark-model`
 //! (`ssm_pool::slot_guard_tests`).
 
+use super::lifecycle::swap_out_sequence;
 use super::lifecycle_tests::{FREE_CALLS, HELD_SLOTS, MAX_SEQ_LEN, StubModel, test_seq};
 use super::mod_helpers::{compact_survivors_into_range, retire_finished_sequences};
 use super::types::ActiveSeq;
+use spark_runtime::kv_spill::KvSpillManager;
 
 /// A live (unfinished) sequence on SSM slot `slot`.
 fn live_on(slot: usize) -> ActiveSeq {
@@ -77,4 +79,23 @@ fn retire_compacts_into_the_retired_slot_but_not_the_held_one() {
     assert_eq!(FREE_CALLS.with(|c| c.get()), 1, "the finished seq is freed");
     // n = 2 → candidates {0, 1}: slot 1 was just vacated, slot 0 is held.
     assert_eq!(slots(&active), vec![1, 3]);
+}
+
+/// Swap-out frees the victim BEFORE compacting (the compaction PRECONDITION),
+/// and its compaction obeys the same never-onto-an-owner rule. `StubModel`
+/// has no swap support, so this drives the save-error arm: the victim is
+/// freed via `send_error` and the survivors are still compacted afterwards.
+#[test]
+fn swap_out_frees_the_victim_then_compacts_only_onto_free_slots() {
+    hold(&[0]); // L prefilling on slot 0
+    let dir = tempfile::tempdir().unwrap();
+    let mut spill = KvSpillManager::new(dir.path().to_path_buf(), 1 << 20).unwrap();
+    let mut active = vec![live_on(1), live_on(2), live_on(3)];
+    FREE_CALLS.with(|c| c.set(0));
+    let res = swap_out_sequence(&StubModel::default(), &mut active, 0, &mut spill);
+    assert!(res.is_err(), "StubModel cannot save a swap image");
+    assert_eq!(FREE_CALLS.with(|c| c.get()), 1, "victim freed exactly once");
+    // swap_remove(0) → [slot 3, slot 2]; n = 2 → candidates {0, 1}. Slot 1 is
+    // the victim's (now free); slot 0 is held → exactly one migration.
+    assert_eq!(slots(&active), vec![1, 2]);
 }
