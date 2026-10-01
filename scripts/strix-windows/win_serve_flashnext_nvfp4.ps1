@@ -86,7 +86,7 @@ $Fingerprint = Join-Path $Repo "out\serve-fnext-$Tag-fingerprint.txt"
     "model=nvidia/Qwen3.8-Flash-Next-NVFP4"
     "model_dir=" + $ModelDir
     "config_sha256=" + (Get-FileHash -Algorithm SHA256 (Join-Path $ModelDir "config.json")).Hash
-    "serve=boot7g util=$Util seq=$SeqLen prefill=2048 kv=bf16 batch=1 drafts=" + $(if ($Serial) { "0" } else { "1" }) + " ssm_slots=0 serial=$Serial vgm=32GB commit_limit=96 qsa_verify_active=$env:ATLAS_QSA_VERIFY_ACTIVE bind=$BindHost thinking=" + $(if ($env:DISABLE_THINKING -eq "1") { "off" } else { "checkpoint-default" })
+    "serve=boot7g util=$Util seq=$SeqLen prefill=2048 kv=bf16 batch=1 drafts=" + $(if ($Serial) { "0" } else { "1" }) + " ssm_slots=0 serial=$Serial vgm=32GB commit_limit=96 qsa_verify_active=$env:ATLAS_QSA_VERIFY_ACTIVE bind=$BindHost thinking=" + $(if ($Thinking -eq 'default') { 'default(checkpoint)' } else { $Thinking })
 ) | Out-File $Fingerprint -Encoding utf8
 
 Get-Process spark -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -111,10 +111,11 @@ $Args = @(
     "--ssm-cache-slots", $SsmSlots
 )
 if ($env:PREFIX_CACHE -eq "1") { $Args += "--enable-prefix-caching" }
-# The 'on' argument passes through Start-Process -ArgumentList, where PS
-# joins elements and strips embedded quotes, so the JSON is escaped as
-# {\"...\"}: spark.exe's argv parser then sees {"enable_thinking":true}
-# (and startup would fail fast on malformed JSON).
+# The 'on' JSON rides Start-Process -ArgumentList: PS (5.1 AND 7.x --
+# ArgumentList is a plain space-joined string, unaffected by
+# PSNativeCommandArgumentPassing) strips embedded quotes, so \"...\" is
+# required and spark.exe's argv parser sees {"enable_thinking":true}.
+# Startup would fail fast on malformed JSON.
 if ($Thinking -eq 'off') { $Args += "--disable-thinking" }
 if ($Thinking -eq 'on') { $Args += @("--default-chat-template-kwargs", '{\"enable_thinking\":true}') }
 if ($Thinking -notin @('default','off','on')) { throw "ATLAS_THINKING must be default|off|on, got '$Thinking'" }

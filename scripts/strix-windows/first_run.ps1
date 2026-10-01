@@ -536,6 +536,18 @@ try {
     # keeps the smoke answer inside 64 tokens. Drafts=3 and ssm-cache-slots=64
     # match the proven profile -- those select the exercised kernel arms, not
     # just capacity.
+# pwsh 7.3+ defaults $PSNativeCommandArgumentPassing to 'Windows' (Standard
+# escaping), so spark.exe would see the literal backslashes and the JSON parse
+# fails fast. On Windows PowerShell 5.1, pwsh < 7.3, or an explicit Legacy
+# opt-in, embedded double quotes are stripped and the \" escape is required.
+# (about_Parsing: native argument passing; about_Pwsh: PSNativeCommandArgumentPassing)
+function Get-ThinkingOnKwarg {
+    $legacy = ($PSVersionTable.PSVersion.Major -lt 7) -or
+              ($PSVersionTable.PSVersion -lt [version]'7.3') -or
+              ($PSNativeCommandArgumentPassing -eq 'Legacy')
+    if ($legacy) { '{\"enable_thinking\":true}' } else { '{"enable_thinking":true}' }
+}
+
     $serveArgs = @('serve', $ModelDir)
     $serveArgs += @(
         '--no-fast-load'
@@ -552,17 +564,15 @@ try {
     # ATLAS_THINKING=off pins the engine kill switch (this recipe's shipped
     # default); =on sets the SERVER default via --default-chat-template-kwargs
     # (per-request off still wins); =default keeps the shipped --disable-thinking.
-    # The escaped-quote form {\"...\"} is deliberate: Windows PowerShell 5.1
-    # strips embedded double quotes from native-exe arguments, so a bare
-    # '{"enable_thinking":true}' would reach spark as {enable_thinking:true}
-    # and fail JSON validation.
+    # PS 5.1 needs the escaped-quote form; pwsh 7.3+ Standard escaping needs
+    # the plain one -- Get-ThinkingOnKwarg picks by host.
     $thinking = if ($env:ATLAS_THINKING) { $env:ATLAS_THINKING }
                 elseif ($env:DISABLE_THINKING -eq '1') { 'off' }
                 else { 'default' }
     switch ($thinking) {
         'off'     { $serveArgs += '--disable-thinking' }
         'default' { $serveArgs += '--disable-thinking' }
-        'on'      { $serveArgs += '--default-chat-template-kwargs', '{\"enable_thinking\":true}' }
+        'on'      { $serveArgs += '--default-chat-template-kwargs', (Get-ThinkingOnKwarg) }
         default   { throw "ATLAS_THINKING must be default|off|on, got '$thinking'" }
     }
     & $exe @serveArgs
