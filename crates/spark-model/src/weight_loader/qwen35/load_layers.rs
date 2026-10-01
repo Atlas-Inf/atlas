@@ -357,7 +357,8 @@ pub(super) fn load_layers(
                     moe_layer.transpose_gate_up_for_prefill(gpu, config)?;
                 }
                 Some(HoloFastMoeMode::Unified) if fast_holo_moe_layer => {
-                    moe_layer.transpose_for_prefill_unified(gpu, config)?;
+                    let freed = moe_layer.transpose_for_prefill_unified(gpu, config)?;
+                    store.mark_freed_elsewhere(&freed)?;
                 }
                 _ => {
                     moe_layer.transpose_for_prefill(gpu, config)?;
