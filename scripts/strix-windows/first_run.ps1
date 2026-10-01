@@ -513,6 +513,18 @@ try {
     Write-Host ''
     $ErrorActionPreference = 'Continue'
 
+    # pwsh 7.3+ defaults $PSNativeCommandArgumentPassing to 'Windows' (Standard
+    # escaping), so spark.exe would see the literal backslashes and the JSON parse
+    # fails fast. On Windows PowerShell 5.1, pwsh < 7.3, or an explicit Legacy
+    # opt-in, embedded double quotes are stripped and the \" escape is required.
+    # (about_Parsing: native argument passing; about_Pwsh: PSNativeCommandArgumentPassing)
+    function Get-ThinkingOnKwarg {
+        $legacy = ($PSVersionTable.PSVersion.Major -lt 7) -or
+                  ($PSVersionTable.PSVersion -lt [version]'7.3') -or
+                  ($PSNativeCommandArgumentPassing -eq 'Legacy')
+        if ($legacy) { '{\"enable_thinking\":true}' } else { '{"enable_thinking":true}' }
+    }
+
     # Windows ROCm reports a 76.9 GB process-local pool. With the 2048-token
     # arena, the fully-NVFP4 checkpoint uses 70.4 GB pre-KV; 0.99 leaves about
     # 3.8 GB of BF16 KV after the inference reserve, enough for the 32K limit.
@@ -536,18 +548,6 @@ try {
     # keeps the smoke answer inside 64 tokens. Drafts=3 and ssm-cache-slots=64
     # match the proven profile -- those select the exercised kernel arms, not
     # just capacity.
-# pwsh 7.3+ defaults $PSNativeCommandArgumentPassing to 'Windows' (Standard
-# escaping), so spark.exe would see the literal backslashes and the JSON parse
-# fails fast. On Windows PowerShell 5.1, pwsh < 7.3, or an explicit Legacy
-# opt-in, embedded double quotes are stripped and the \" escape is required.
-# (about_Parsing: native argument passing; about_Pwsh: PSNativeCommandArgumentPassing)
-function Get-ThinkingOnKwarg {
-    $legacy = ($PSVersionTable.PSVersion.Major -lt 7) -or
-              ($PSVersionTable.PSVersion -lt [version]'7.3') -or
-              ($PSNativeCommandArgumentPassing -eq 'Legacy')
-    if ($legacy) { '{\"enable_thinking\":true}' } else { '{"enable_thinking":true}' }
-}
-
     $serveArgs = @('serve', $ModelDir)
     $serveArgs += @(
         '--no-fast-load'
