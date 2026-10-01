@@ -305,19 +305,15 @@ impl Qwen3SsmLayer {
             // Verify rows 5..8 compute 8 rows on the batch8 tier rather
             // than 16 on batch16; the vl2 twin (8 outputs/block) is the
             // preferred bit-identical arm when linked.
-            let (kernel, vl2) = ops::fp8_verify_gemv_tier(
+            let (kernel, grid_div) = ops::fp8_verify_gemv_tier(
                 num_tokens,
                 ops::gemv_vl2_enabled(),
                 self.w8a16_gemv_batch8_k,
                 self.w8a16_gemv_batch8_dyn_vl2_k,
+                self.w8a16_gemv_batch8_dyn_vl2_n2_k,
                 self.w8a16_gemv_batch16_k,
             );
-            let launch = if vl2 {
-                ops::w8a16_gemv_batch4_vl2
-            } else {
-                ops::w8a16_gemv_batch4
-            };
-            launch(
+            ops::w8a16_gemv_batch4_div(
                 ctx.gpu,
                 kernel,
                 normed,
@@ -327,6 +323,7 @@ impl Qwen3SsmLayer {
                 num_tokens as u32,
                 qkvz_size as u32,
                 h as u32,
+                grid_div,
                 stream,
             )?;
         } else if num_tokens > 4
@@ -1168,19 +1165,15 @@ impl Qwen3SsmLayer {
         {
             // Same tier pick as the QKVZ arm; the vl2 twin (8 outputs/block)
             // is the preferred bit-identical arm when linked.
-            let (kernel, vl2) = ops::fp8_verify_gemv_tier(
+            let (kernel, grid_div) = ops::fp8_verify_gemv_tier(
                 num_tokens,
                 ops::gemv_vl2_enabled(),
                 self.w8a16_gemv_batch8_k,
                 self.w8a16_gemv_batch8_dyn_vl2_k,
+                self.w8a16_gemv_batch8_dyn_vl2_n2_k,
                 self.w8a16_gemv_batch16_k,
             );
-            let launch = if vl2 {
-                ops::w8a16_gemv_batch4_vl2
-            } else {
-                ops::w8a16_gemv_batch4
-            };
-            launch(
+            ops::w8a16_gemv_batch4_div(
                 ctx.gpu,
                 kernel,
                 normed_out_buf,
@@ -1190,6 +1183,7 @@ impl Qwen3SsmLayer {
                 num_tokens as u32,
                 h as u32,
                 value_dim as u32,
+                grid_div,
                 stream,
             )?;
         } else if num_tokens > 4
