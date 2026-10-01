@@ -548,8 +548,23 @@ try {
         '--disable-tool-grammar', 'true'
         '--ssm-cache-slots', '64', '--ssm-checkpoint-interval', '16'
         '--request-timeout', '0'
-        '--disable-thinking'
     )
+    # ATLAS_THINKING=off pins the engine kill switch (this recipe's shipped
+    # default); =on sets the SERVER default via --default-chat-template-kwargs
+    # (per-request off still wins); =default keeps the shipped --disable-thinking.
+    # The escaped-quote form {\"...\"} is deliberate: Windows PowerShell 5.1
+    # strips embedded double quotes from native-exe arguments, so a bare
+    # '{"enable_thinking":true}' would reach spark as {enable_thinking:true}
+    # and fail JSON validation.
+    $thinking = if ($env:ATLAS_THINKING) { $env:ATLAS_THINKING }
+                elseif ($env:DISABLE_THINKING -eq '1') { 'off' }
+                else { 'default' }
+    switch ($thinking) {
+        'off'     { $serveArgs += '--disable-thinking' }
+        'default' { $serveArgs += '--disable-thinking' }
+        'on'      { $serveArgs += '--default-chat-template-kwargs', '{\"enable_thinking\":true}' }
+        default   { throw "ATLAS_THINKING must be default|off|on, got '$thinking'" }
+    }
     & $exe @serveArgs
 }
 

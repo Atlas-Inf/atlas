@@ -174,7 +174,7 @@ hf download nvidia/Qwen3.8-27B-NVFP4 `
 #   hf download nvidia/Qwen3.8-Flash-Next-NVFP4 --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-Flash-Next-NVFP4"
 ```
 
-`.\build-amd.ps1` compiles every strix-hip target once; `serve-amd.ps1` picks the model + speculation mode (`-Model qwen3.8-flash-next -Spec dflash2` is rejected — no Flash-Next drafter exists).
+`.\build-amd.ps1` compiles every strix-hip target once; `serve-amd.ps1` picks the model + speculation mode (`-Model qwen3.8-flash-next -Spec dflash2` is rejected — no Flash-Next drafter exists). Add `-Thinking off|on` to pin `--disable-thinking` or make thinking the server default (issue #146; Linux twin: `THINKING=off|on` on `serve-amd.sh`).
 
 Prebuilt instead? Unzip `spark-windows-x86_64-amd-hip` keeping every DLL beside `spark.exe`, set `$env:ATLAS_BIN` to it, and run `.\serve-amd.ps1`. That skips the toolchain check and the build; the prebuilt zip is built with every target too (`.github/release-matrix.json` row `windows-x86_64-amd-hip` has `target_model: "*"`), so the same `-Model`/`-Spec` options apply. The script runs a detached smoke probe (`first_run_smoke.log`), and the 64K-context record config is [`win_serve_qwen38_nvfp4.ps1`](scripts/strix-windows/win_serve_qwen38_nvfp4.ps1).
 

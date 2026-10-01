@@ -70,6 +70,12 @@ $Util = if ($env:ATLAS_UTIL) { $env:ATLAS_UTIL } elseif ($Serial) { "0.86" } els
 $SeqLen = if ($env:SEQ_LEN) { $env:SEQ_LEN } else { "8192" }
 $PrefillTokens = if ($env:PREFILL_TOKENS) { $env:PREFILL_TOKENS } else { "2048" }
 $SsmSlots = if ($env:SSM_SLOTS) { $env:SSM_SLOTS } else { "0" }
+# ATLAS_THINKING (from serve-amd.ps1 -Thinking) or DISABLE_THINKING=1 alias:
+# off -> --disable-thinking, on -> --default-chat-template-kwargs, default ->
+# the checkpoint's template default. Resolved before the fingerprint line.
+$Thinking = if ($env:ATLAS_THINKING) { $env:ATLAS_THINKING }
+            elseif ($env:DISABLE_THINKING -eq "1") { 'off' }
+            else { 'default' }
 
 $Fingerprint = Join-Path $Repo "out\serve-fnext-$Tag-fingerprint.txt"
 @(
@@ -105,7 +111,13 @@ $Args = @(
     "--ssm-cache-slots", $SsmSlots
 )
 if ($env:PREFIX_CACHE -eq "1") { $Args += "--enable-prefix-caching" }
-if ($env:DISABLE_THINKING -eq "1") { $Args += "--disable-thinking" }
+# The 'on' argument passes through Start-Process -ArgumentList, where PS
+# joins elements and strips embedded quotes, so the JSON is escaped as
+# {\"...\"}: spark.exe's argv parser then sees {"enable_thinking":true}
+# (and startup would fail fast on malformed JSON).
+if ($Thinking -eq 'off') { $Args += "--disable-thinking" }
+if ($Thinking -eq 'on') { $Args += @("--default-chat-template-kwargs", '{\"enable_thinking\":true}') }
+if ($Thinking -notin @('default','off','on')) { throw "ATLAS_THINKING must be default|off|on, got '$Thinking'" }
 if (-not $Serial) { $Args += @("--speculative", "--num-drafts", "1") }
 
 $proc = Start-Process -FilePath $Bin -ArgumentList $Args -RedirectStandardOutput $Log -RedirectStandardError "$Log.err" -PassThru -NoNewWindow

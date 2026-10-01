@@ -20,6 +20,11 @@
 # its own env knobs (SEQ_LEN, PREFILL_TOKENS, SERIAL, DISABLE_THINKING,
 # PREFIX_CACHE, SSM_SLOTS, ATLAS_UTIL).
 #
+#   .\serve-amd.ps1 -Thinking off    # --disable-thinking on any recipe
+#   .\serve-amd.ps1 -Thinking on     # thinking = server default (per-request off still wins)
+#
+# -Thinking forwards to every recipe as env ATLAS_THINKING (issue #146).
+#
 # The serve recipe for the Qwen3.8 27B paths is the fingerprinted fp8d
 # configuration behind the 2026-09-13 ST-995 record -- it lives in
 # first_run.ps1's Phase-Serve, which the default (27B + MTP) mode forwards to
@@ -43,10 +48,20 @@ param(
     # Speculation mode: mtp (default) or dflash2 (Qwen3.8 27B only).
     [ValidateSet('mtp', 'dflash2')]
     [string]$Spec = 'mtp',
+    # Thinking switch: 'off' is the engine kill switch (--disable-thinking,
+    # outranks every request); 'on' makes thinking the server default
+    # (--default-chat-template-kwargs, per-request off still wins); 'default'
+    # keeps each recipe's shipped behavior. DISABLE_THINKING=1 stays an alias
+    # for 'off'.
+    [ValidateSet('default', 'off', 'on')]
+    [string]$Thinking = 'default',
     # Forwarded to first_run.ps1: skip the post-startup completion probe.
     [switch]$NoSmokeTest
 )
 $ErrorActionPreference = 'Stop'
+# DISABLE_THINKING=1 aliases -Thinking off when -Thinking wasn't given.
+if (-not $PSBoundParameters.ContainsKey('Thinking') -and $env:DISABLE_THINKING -eq '1') { $Thinking = 'off' }
+$env:ATLAS_THINKING = $Thinking
 # serve-amd.sh parity: DFLASH=1 selects the drafter when -Spec wasn't given.
 if ($env:DFLASH -eq '1' -and -not $PSBoundParameters.ContainsKey('Spec')) { $Spec = 'dflash2' }
 if ($Model -eq 'qwen3.8-flash-next' -and $Spec -eq 'dflash2') {

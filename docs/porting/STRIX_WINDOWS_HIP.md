@@ -346,6 +346,11 @@ $env:ATLAS_MTP_GATE_REPROBE = "64"
   --ssm-cache-slots 64 --ssm-checkpoint-interval 16 --disable-thinking
 ```
 
+Thinking control since #146: `serve-amd.ps1 -Thinking off|on` (env
+`ATLAS_THINKING`; `DISABLE_THINKING=1` aliases `off`) -- `on` serves thinking
+as the default via `--default-chat-template-kwargs` while per-request
+`enable_thinking:false` still wins.
+
 **`ATLAS_KV_EXTERNAL_RESERVE_GB` must be 0, not 6.** `hipMemGetInfo` is broken on
 Windows HIP — `hipErrorInvalidValue` standalone, `free == 0` under a live context —
 so `cuMemGetInfo_v2` now synthesises a truthful figure from tracked allocations.

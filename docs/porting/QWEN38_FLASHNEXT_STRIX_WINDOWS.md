@@ -26,6 +26,8 @@ git clone https://github.com/Atlas-Inf/atlas.git; cd atlas
 .\serve-amd.ps1                            # Qwen3.8 27B + MTP on :8081 (default)
 .\serve-amd.ps1 -Spec dflash2              # Qwen3.8 27B + DFlash2 on :8096
 .\serve-amd.ps1 -Model qwen3.8-flash-next  # Flash-Next + MTP on :8095
+# -Thinking off|on works on every recipe (ATLAS_THINKING); DISABLE_THINKING=1
+# remains an alias for off.
 # (-Model qwen3.8-flash-next -Spec dflash2 is rejected: no DFlash2 drafter exists.)
 ```
 
