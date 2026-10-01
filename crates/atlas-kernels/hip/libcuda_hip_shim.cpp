@@ -64,6 +64,17 @@ static bool atlas_trace_launch() {
     }();
     return on;
 }
+// ATLAS_TRACE_LAUNCH_SYNC=1 (diagnostic only, requires ATLAS_TRACE_LAUNCH):
+// synchronise the stream after every successful launch so an async fault
+// (e.g. a sticky 719) is reported against the kernel that caused it instead
+// of surfacing at an unrelated later call. Very slow; never enable by default.
+static bool atlas_trace_launch_sync() {
+    static const bool on = [] {
+        const char *v = getenv("ATLAS_TRACE_LAUNCH_SYNC");
+        return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+    }();
+    return on;
+}
 // Elapsed-ms wall clock for the launch trace — lets us attribute the TTFT
 // setup window to the slow ops (big allocs, first-use module init) rather
 // than just counting them.
@@ -125,11 +136,30 @@ int cuMemGetInfo_v2(size_t* free, size_t* total)    {
         const char* v = getenv("ATLAS_TRACKED_MEMINFO");
         return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
     }();
+    // An EXPLICIT ATLAS_UMA_COMMIT_LIMIT_GB is an operator-asserted measured
+    // ceiling and is authoritative — including over a successful
+    // hipMemGetInfo, which reports only the carve-out aperture: Strix Halo,
+    // VGM 32 GB: totalGlobalMem 89.47 GiB while the runtime can back
+    // allocations with WDDM shared memory on top of it (hipMalloc +
+    // kernel-touch ladder measured 106 GiB, 2026-09-19).
+    static const size_t explicit_limit = [] {
+        const char* v = getenv("ATLAS_UMA_COMMIT_LIMIT_GB");
+        if (!v) return (size_t)0;
+        double gb = atof(v);
+        return gb > 0.0 ? (size_t)(gb * 1073741824.0) : (size_t)0;
+    }();
     size_t f = 0, t = 0;
     hipError_t e = force_tracked ? hipErrorUnknown : hipMemGetInfo(&f, &t);
     if (e == hipSuccess && t != 0 && f != 0) {
-        if (free)  *free  = f;
-        if (total) *total = t;
+        if (explicit_limit) {
+            size_t u;
+            { std::lock_guard<std::mutex> lk(g_mem_mu); u = g_mem_used; }
+            if (free)  *free  = (u < explicit_limit) ? explicit_limit - u : 0;
+            if (total) *total = explicit_limit;
+        } else {
+            if (free)  *free  = f;
+            if (total) *total = t;
+        }
         return hipSuccess;
     }
     int dev = 0;
@@ -147,10 +177,7 @@ int cuMemGetInfo_v2(size_t* free, size_t* total)    {
     // with ATLAS_UMA_DRIVER_RESERVE_GB, or cap directly via
     // ATLAS_UMA_COMMIT_LIMIT_GB.
     static const size_t commit_limit = [&] {
-        if (const char* v = getenv("ATLAS_UMA_COMMIT_LIMIT_GB")) {
-            double gb = atof(v);
-            if (gb > 0.0) return (size_t)(gb * 1073741824.0);
-        }
+        if (explicit_limit) return explicit_limit;
         double reserve_gb = 14.0;
         if (const char* v = getenv("ATLAS_UMA_DRIVER_RESERVE_GB")) {
             double g = atof(v);
@@ -160,8 +187,10 @@ int cuMemGetInfo_v2(size_t* free, size_t* total)    {
         return (prop.totalGlobalMem > r) ? prop.totalGlobalMem - r
                                        : prop.totalGlobalMem;
     }();
-    const size_t tot =
-        (prop.totalGlobalMem < commit_limit) ? prop.totalGlobalMem : commit_limit;
+    const size_t tot = explicit_limit
+        ? explicit_limit
+        : ((prop.totalGlobalMem < commit_limit) ? prop.totalGlobalMem
+                                                : commit_limit);
     if (total) *total = tot;
     if (free)  *free  = (used < tot) ? (tot - used) : 0;
     // Diagnostic: report which path answered + the tracked total, so we can
@@ -229,15 +258,52 @@ int cuLaunchKernel(void* f, unsigned gx, unsigned gy, unsigned gz,
       auto it = g_fn_names.find(f);
       nm = (it != g_fn_names.end()) ? it->second : "?";
     }
-    fprintf(stderr, "[t=%.0f launch] %s grid=%ux%ux%u block=%ux%ux%u shmem=%u\n",
-            atlas_now_ms(), nm.c_str(), gx, gy, gz, bx, by, bz, shmem);
-    fflush(stderr);
+    // ATLAS_TRACE_LAUNCH_SYNC adds exact GPU time to each launch line:
+    // events bracket the launch on the stream, elapsed after the sync.
+    // host_before = wall time since the previous launch returned (the
+    // caller-side dispatch cost this launch waited behind). Diagnostic
+    // only; the events/sync serialize the stream, so timings are for
+    // attribution, not steady-state rate.
+    const bool sync_mode = atlas_trace_launch_sync();
+    static hipEvent_t ev0 = nullptr, ev1 = nullptr;
+    static double t_prev_ret = 0.0;
+    const double t_entry = atlas_now_ms();
+    const double host_before_us = t_prev_ret > 0.0 ? (t_entry - t_prev_ret) * 1000.0 : 0.0;
+    if (sync_mode && !ev0) {
+      hipEventCreateWithFlags(&ev0, 0); // timing events (default flags)
+      hipEventCreateWithFlags(&ev1, 0);
+    }
+    if (sync_mode) hipEventRecord(ev0, (hipStream_t)stream);
     int r = hipModuleLaunchKernel((hipFunction_t)f, gx, gy, gz, bx, by, bz,
                                   shmem, (hipStream_t)stream, params, extra);
     if (r != hipSuccess) {
       fprintf(stderr, "[launch] %s -> err %d\n", nm.c_str(), (int)r);
       fflush(stderr);
+      return r;
     }
+    double gpu_us = -1.0;
+    if (sync_mode) {
+      hipEventRecord(ev1, (hipStream_t)stream);
+      int sr = hipStreamSynchronize((hipStream_t)stream);
+      if (sr != hipSuccess) {
+        fprintf(stderr, "[launch] %s -> ASYNC FAULT err %d (sync after launch)\n",
+                nm.c_str(), (int)sr);
+        fflush(stderr);
+        return sr;
+      }
+      float ms = 0.f;
+      if (hipEventElapsedTime(&ms, ev0, ev1) == hipSuccess) gpu_us = ms * 1000.0;
+    }
+    t_prev_ret = atlas_now_ms();
+    if (sync_mode) {
+      fprintf(stderr,
+              "[t=%.0f launch] %s grid=%ux%ux%u block=%ux%ux%u shmem=%u gpu=%.1fus host_before=%.1fus\n",
+              t_entry, nm.c_str(), gx, gy, gz, bx, by, bz, shmem, gpu_us, host_before_us);
+    } else {
+      fprintf(stderr, "[t=%.0f launch] %s grid=%ux%ux%u block=%ux%ux%u shmem=%u\n",
+              t_entry, nm.c_str(), gx, gy, gz, bx, by, bz, shmem);
+    }
+    fflush(stderr);
     return r;
   }
   return hipModuleLaunchKernel((hipFunction_t)f, gx, gy, gz, bx, by, bz,

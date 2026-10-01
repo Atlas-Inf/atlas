@@ -186,7 +186,9 @@ pub fn dense_gemv_batch2(
 #[allow(clippy::too_many_arguments)]
 /// Mirror of `MAX_M` in `kernels/gb10/common/dense_gemv_bf16_batchm.cu`.
 /// The kernel clamps silently above this, so the Rust side must refuse.
-pub const DENSE_GEMV_BATCHM_MAX_M: u32 = 8;
+/// Geometry lives with the GEMM constants in
+/// `spark_runtime::cublaslt` (single source of truth).
+pub const DENSE_GEMV_BATCHM_MAX_M: u32 = spark_runtime::cublaslt::DENSE_GEMV_BATCHM_MAX_M;
 
 pub fn dense_gemv_batchm(
     gpu: &dyn GpuBackend,
@@ -211,8 +213,15 @@ pub fn dense_gemv_batchm(
          (kernel MAX_M clamps silently; use dense_gemm_tc for wider batches)"
     );
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 4), 1, 1])
-        .block([256, 1, 1])
+        .grid([
+            div_ceil(
+                n,
+                spark_runtime::cublaslt::DENSE_GEMV_BATCHM_OUTPUTS_PER_BLOCK,
+            ),
+            1,
+            1,
+        ])
+        .block([spark_runtime::cublaslt::DENSE_GEMV_BATCHM_THREADS, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
         .arg_ptr(output)
