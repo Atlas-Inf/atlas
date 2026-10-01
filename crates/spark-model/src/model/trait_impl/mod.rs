@@ -904,7 +904,7 @@ impl Model for TransformerModel {
     ) -> Result<()> {
         self.trim_proposer_state_dispatch(seq, num_accepted, _stream)
     }
-    fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
+    fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<bool> {
         self.compact_sequence_dispatch(seq, new_slot)
     }
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {

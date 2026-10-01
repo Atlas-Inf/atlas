@@ -333,7 +333,9 @@ pub(super) fn retire_finished_sequences(
     //   Phase 1: drop every finished seq, releasing ITS OWN slot to the pool.
     //   Phase 2: compact survivors into contiguous slots [0..n), each migration
     //            target CLAIMED exclusively from the free list (compact_sequence
-    //            → claim_specific). No two live seqs can ever share a slot.
+    //            → claim_specific) BEFORE anything is copied; a target the pool
+    //            will not hand over (held by a PREFILLING seq) is skipped. No
+    //            two live seqs can ever share a slot.
 
     // Phase 1.
     let mut survivors: Vec<ActiveSeq> = Vec::with_capacity(active.len());
@@ -350,16 +352,30 @@ pub(super) fn retire_finished_sequences(
     *active = survivors;
 }
 
-/// Compact live sequences into contiguous SSM slots `[0..n)` (n = the slice
-/// length), claiming each migration target exclusively from the free list so
-/// no two live sequences can ever share a slot.
+/// Compact live sequences towards contiguous SSM slots `[0..n)` (n = the
+/// slice length), claiming each migration target exclusively from the pool's
+/// free list so no two live sequences can ever share a slot.
 ///
 /// This is the exclusivity-safe core shared by `retire_finished_sequences`
 /// (Phase 2) and `swap_out_sequence`: every sequence whose `slot_idx` is out
-/// of the `[0..n)` range is migrated onto a free slot in that range (a slot
-/// not held by any surviving sequence — i.e. one freed by a just-retired /
-/// swapped-out sequence, or never occupied). There are exactly as many free
-/// targets as out-of-range survivors, so each lands on a unique slot.
+/// of the `[0..n)` range is migrated onto a FREE slot in that range.
+///
+/// `survivors` is only the ACTIVE list, so "not held by a survivor" does NOT
+/// mean free: a sequence that is still PREFILLING owns a slot too (claimed
+/// lowest-first, so typically one inside `[0..n)`). The candidates computed
+/// here are therefore only candidates — the model's slot pool is the source
+/// of truth, and `compact_sequence` returns `Ok(false)` without copying when
+/// the target is owned. Such a target is dropped and the next one tried; with
+/// none left the sequence simply stays where it is. Overwriting an owner's
+/// state was the prefill-overlap double-ownership fault (short request active
+/// on slot 1, long prompt prefilling on slot 0 → both on slot 0).
+///
+/// Contiguity is therefore BEST-EFFORT. Nothing downstream needs it for
+/// correctness: decode/verify graphs are keyed by the slot vector, pad rows
+/// use the dummy slot, the batched-recurrent SSM path checks contiguity per
+/// step and falls back, and spec dispatch clamps on the real `slot_idx`. A
+/// left-in-place sequence is retried on every later retire tick and lands as
+/// soon as the holder is promoted to active or freed.
 ///
 /// PRECONDITION: any slot being vacated (a retired/swapped-out sequence's
 /// slot) must already be released to the pool before this runs, so it is
@@ -369,21 +385,36 @@ pub(super) fn compact_survivors_into_range(model: &dyn Model, survivors: &mut [A
     let n = survivors.len();
     let occupied: std::collections::HashSet<usize> =
         survivors.iter().map(|a| a.seq.slot_idx).collect();
-    let mut free_targets: Vec<usize> = (0..n).filter(|s| !occupied.contains(s)).collect();
+    let mut candidates: Vec<usize> = (0..n).filter(|s| !occupied.contains(s)).collect();
     for a in survivors.iter_mut() {
-        if a.seq.slot_idx >= n {
-            match free_targets.pop() {
-                Some(target) => {
-                    if let Err(e) = model.compact_sequence(&mut a.seq, target) {
-                        tracing::error!("compact_sequence: {e:#}");
-                    }
+        if a.seq.slot_idx < n {
+            continue;
+        }
+        let from = a.seq.slot_idx;
+        let mut migrated = false;
+        while let Some(target) = candidates.pop() {
+            match model.compact_sequence(&mut a.seq, target) {
+                Ok(true) => {
+                    migrated = true;
+                    break;
                 }
-                None => tracing::error!(
-                    "compact_survivors_into_range: no free target for out-of-range \
-                     slot {} (n={n})",
-                    a.seq.slot_idx
+                // Owned by a non-active sequence (prefilling): not a target
+                // for anyone this tick. Try the next candidate.
+                Ok(false) => tracing::debug!(
+                    "compact_survivors_into_range: slot {target} is held by a \
+                     non-active sequence; not migrating slot {from} onto it"
                 ),
+                Err(e) => {
+                    tracing::error!("compact_sequence: {e:#}");
+                    break;
+                }
             }
+        }
+        if !migrated {
+            tracing::debug!(
+                "compact_survivors_into_range: slot {from} left in place \
+                 (no free target in [0..{n}))"
+            );
         }
     }
 }

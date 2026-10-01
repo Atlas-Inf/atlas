@@ -196,8 +196,8 @@ impl Model for PreemptStubModel {
         self.freed_slots.lock().unwrap().push(s.slot_idx);
         Ok(())
     }
-    fn compact_sequence(&self, _s: &mut SequenceState, _slot: usize) -> Result<()> {
-        Ok(())
+    fn compact_sequence(&self, _s: &mut SequenceState, _slot: usize) -> Result<bool> {
+        Ok(true)
     }
     fn detach_slot_for_reuse(&self, _s: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _i: usize, _st: u64) -> Result<()> {

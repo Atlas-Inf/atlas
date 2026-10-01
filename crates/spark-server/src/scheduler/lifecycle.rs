@@ -303,17 +303,15 @@ pub fn swap_out_sequence(
     victim_idx: usize,
     spill: &mut KvSpillManager,
 ) -> Result<SwappedSeq> {
-    let mut a = active.swap_remove(victim_idx);
-
-    // Compact the swapped-in sequence (same logic as retire path).
-    if victim_idx < active.len() && active[victim_idx].seq.slot_idx != victim_idx {
-        model.compact_sequence(&mut active[victim_idx].seq, victim_idx)?;
-        // Disown the victim's migrated slot BEFORE the fallible save below: sets
-        // the reuse sentinel AND neutralizes the RAII guard so a `?`-early-
-        // return (create_file/save_sequence_state error) that drops `a` cannot
-        // double-release the slot now owned by the swapped-in sequence.
-        model.detach_slot_for_reuse(&mut a.seq);
-    }
+    // No slot transfer here. This used to compact the swapped-in sequence onto
+    // slot `victim_idx` BEFORE the save below and then disown the victim's
+    // slot. `compact_sequence` now only accepts targets it can claim from the
+    // free list, and the victim still owns its slot at this point, so that
+    // transfer can no longer happen (and it overwrote the victim's SSM state
+    // before `save_sequence_state` read it). The victim releases its own slot
+    // when the spill frees it; the survivors are compacted by the next
+    // `retire_finished_sequences` pass.
+    let a = active.swap_remove(victim_idx);
 
     // Save + free + build moved to `preempt::spill_out_sequence` so the
     // decode-time preemption path (which must NOT reorder/compact the active

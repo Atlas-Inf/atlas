@@ -646,10 +646,21 @@ pub trait Model: Send + Sync {
     /// Copies h_state and conv_state across all SSM layers from the current
     /// slot to `new_slot`. Used by the scheduler for slot compaction after
     /// swap_remove to keep active sequences at contiguous slots [0..N).
-    fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()>;
+    ///
+    /// `new_slot` must be FREE: the implementation claims it from its slot
+    /// pool before copying anything. Returns `Ok(true)` when the sequence now
+    /// sits on `new_slot`, and `Ok(false)` — sequence untouched, nothing
+    /// copied — when `new_slot` is owned by another live sequence (e.g. one
+    /// still prefilling). Callers must treat `false` as "leave it in place";
+    /// contiguity is a throughput preference, never a correctness need.
+    fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<bool>;
 
     /// Disown a retired sequence's SSM pool slot after `compact_sequence`
     /// migrated it to a surviving sequence.
+    ///
+    /// LEGACY: no scheduler path transfers a slot this way any more —
+    /// `compact_sequence` only accepts FREE targets, so a vacating sequence
+    /// releases its own slot first (see `compact_survivors_into_range`).
     ///
     /// Sets the `slot_idx` reuse sentinel AND neutralizes the sequence's
     /// internal slot-release guard so the migrated slot is NOT released when

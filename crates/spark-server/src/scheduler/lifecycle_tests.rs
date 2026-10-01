@@ -29,6 +29,10 @@ thread_local! {
     /// `#[test]` runs on its own, and `finish_sequence` is synchronous).
     pub(super) static CACHE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static FREE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Slots owned by a sequence the active list cannot see (a PREFILLING
+    /// one): `StubModel::compact_sequence` refuses them like the real pool.
+    pub(super) static HELD_SLOTS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Common-case shorthand: mid-context position (no seqlen ceiling), so
@@ -326,8 +330,12 @@ impl Model for StubModel {
         FREE_CALLS.with(|c| c.set(c.get() + 1));
         Ok(())
     }
-    fn compact_sequence(&self, _s: &mut SequenceState, _slot: usize) -> Result<()> {
-        Ok(())
+    fn compact_sequence(&self, s: &mut SequenceState, slot: usize) -> Result<bool> {
+        if HELD_SLOTS.with(|h| h.borrow().contains(&slot)) {
+            return Ok(false);
+        }
+        s.slot_idx = slot;
+        Ok(true)
     }
     fn detach_slot_for_reuse(&self, _s: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _i: usize, _st: u64) -> Result<()> {
