@@ -18,9 +18,17 @@
 #    recipe keeps committed under the 84.5 wall instead.
 #  * At Server live the serve process holds ~81 GiB WorkingSet and the host
 #    has ~12 GiB free. NOTHING else memory-heavy may run beside it.
-#  * --ssm-cache-slots 0 drops the 1.8 GB Marconi snapshot pool (dead weight
-#    without --enable-prefix-caching). The KV budget is self-relative -- it
-#    absorbs whatever you free, so utilization must also stay low.
+#  * Prefix caching is ON with a 4-slot Marconi snapshot pool (~113 MB/slot,
+#    ~0.45 GB). Without it every agentic turn re-prefills its whole history:
+#    in the 2026-10-01 1007-turn replay, TTFT was 92% of wall (median 64.5 s,
+#    p90 112 s) against 3.9 s of decode. On GB10 the same model restores the
+#    previous prompt's tail snapshot (#69: 27k warm turn 0.74 s vs 18.1 s
+#    cold, ssm-state-poisoning-gate green). The KV budget is self-relative, so
+#    the pool comes out of KV, not out of the commit wall: at util 0.90 KV goes
+#    from ~97k to ~77k tokens, still > 2x the 32k context. The old default, 16
+#    slots (1.8 GB), would cut KV to ~17k tokens -- below 32k -- so keep slots
+#    small. PREFIX_CACHE=0 restores the boot-7g recipe (slots 0, no cache).
+#    The KV budget absorbs whatever you free, so utilization must stay low.
 #  * SERIAL=1 drops --speculative AND lowers util to 0.86: serial pre-KV is
 #    ~4 GB lower than the MTP arm, so at 0.90 the KV budget absorbs the slack
 #    (~7.1 GB) and crosses the wall during pool allocation. Measured.
@@ -69,7 +77,8 @@ $Serial = ($env:SERIAL -eq "1")
 $Util = if ($env:ATLAS_UTIL) { $env:ATLAS_UTIL } elseif ($Serial) { "0.86" } else { "0.90" }  # see header: serial pre-KV is ~4 GB lower
 $SeqLen = if ($env:SEQ_LEN) { $env:SEQ_LEN } else { "8192" }
 $PrefillTokens = if ($env:PREFILL_TOKENS) { $env:PREFILL_TOKENS } else { "2048" }
-$SsmSlots = if ($env:SSM_SLOTS) { $env:SSM_SLOTS } else { "0" }
+$PrefixCache = ($env:PREFIX_CACHE -ne "0")
+$SsmSlots = if ($env:SSM_SLOTS) { $env:SSM_SLOTS } elseif ($PrefixCache) { "4" } else { "0" }
 # ATLAS_THINKING (from serve-amd.ps1 -Thinking) or DISABLE_THINKING=1 alias:
 # off -> --disable-thinking, on -> --default-chat-template-kwargs, default ->
 # the checkpoint's template default. Resolved before the fingerprint line.
@@ -86,7 +95,7 @@ $Fingerprint = Join-Path $Repo "out\serve-fnext-$Tag-fingerprint.txt"
     "model=nvidia/Qwen3.8-Flash-Next-NVFP4"
     "model_dir=" + $ModelDir
     "config_sha256=" + (Get-FileHash -Algorithm SHA256 (Join-Path $ModelDir "config.json")).Hash
-    "serve=boot7g util=$Util seq=$SeqLen prefill=2048 kv=bf16 batch=1 drafts=" + $(if ($Serial) { "0" } else { "1" }) + " ssm_slots=0 serial=$Serial vgm=32GB commit_limit=96 qsa_verify_active=$env:ATLAS_QSA_VERIFY_ACTIVE bind=$BindHost thinking=" + $(if ($Thinking -eq 'default') { 'default(checkpoint)' } else { $Thinking })
+    "serve=boot7g util=$Util seq=$SeqLen prefill=$PrefillTokens kv=bf16 batch=1 drafts=" + $(if ($Serial) { "0" } else { "1" }) + " ssm_slots=$SsmSlots prefix_cache=$PrefixCache serial=$Serial vgm=32GB commit_limit=96 qsa_verify_active=$env:ATLAS_QSA_VERIFY_ACTIVE bind=$BindHost thinking=" + $(if ($Thinking -eq 'default') { 'default(checkpoint)' } else { $Thinking })
 ) | Out-File $Fingerprint -Encoding utf8
 
 Get-Process spark -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -110,7 +119,7 @@ $Args = @(
     "--request-timeout", "0",
     "--ssm-cache-slots", $SsmSlots
 )
-if ($env:PREFIX_CACHE -eq "1") { $Args += "--enable-prefix-caching" }
+if ($PrefixCache) { $Args += "--enable-prefix-caching" }
 # The 'on' JSON rides Start-Process -ArgumentList: PS (5.1 AND 7.x --
 # ArgumentList is a plain space-joined string, unaffected by
 # PSNativeCommandArgumentPassing) strips embedded quotes, so \"...\" is
