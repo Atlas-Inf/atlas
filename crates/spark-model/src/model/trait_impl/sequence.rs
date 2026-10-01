@@ -453,7 +453,7 @@ impl TransformerModel {
         // keeps a live slot (the NEW one). Take the old idx out of the guard so
         // its Drop won't re-release it, release the old slot exactly once, then
         // re-point the guard at the new slot it now owns. This preserves the
-        // exactly-once invariant: old_slot is pushed here (once) and new_slot
+        // exactly-once invariant: old_slot is pushed below (once) and new_slot
         // will be pushed by whichever path later frees THIS sequence (once).
         if let Some(g) = seq.ssm_slot.as_mut() {
             // Guard owned `old_slot`; drop that ownership before releasing.
@@ -463,14 +463,13 @@ impl TransformerModel {
                 Some(old_slot),
                 "compact_sequence: guard owned {owned:?}, expected old_slot {old_slot}"
             );
-            self.ssm_pool.release_slot(old_slot);
             g.migrate(new_slot);
-        } else {
-            // No guard (e.g. mock model with no SSM pool): preserve the legacy
-            // explicit release so behavior is unchanged where there is no guard.
-            self.ssm_pool.release_slot(old_slot);
         }
+        // A failed sync returns BEFORE the release: the copy may still be reading
+        // old_slot, so leak it on the (dead) context rather than hand it out.
         synced?;
+        // Released exactly once, guard or no guard (mock model with no SSM pool).
+        self.ssm_pool.release_slot(old_slot);
         Ok(true)
     }
 
