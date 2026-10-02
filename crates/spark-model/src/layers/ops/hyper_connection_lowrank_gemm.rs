@@ -45,6 +45,20 @@ pub(crate) fn hc_finish_x4() -> bool {
     *X4.get_or_init(|| std::env::var("ATLAS_HC_FIN_X4").as_deref() != Ok("0"))
 }
 
+/// `ATLAS_HC_MT`: token-fused decode collapse (`hc_pre_down_mt` +
+/// `hc_pre_finish_x4_mt`) for T <= 4. Default ON under HIP, where it was
+/// measured; default off elsewhere until measured there (`=1` opts in). It is
+/// bit-identical to the per-token kernels either way, so the flag only picks
+/// launch shape. Read once per process.
+pub(crate) fn hc_token_fused() -> bool {
+    static MT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MT.get_or_init(|| match std::env::var("ATLAS_HC_MT").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => cfg!(atlas_hip),
+    })
+}
+
 pub(crate) fn hc_finish_block() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {

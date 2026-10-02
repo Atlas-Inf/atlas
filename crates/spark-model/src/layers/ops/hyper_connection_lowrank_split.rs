@@ -7,7 +7,7 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use super::hyper_connection_lowrank_gemm::{hc_finish_block, hc_finish_x4};
+use super::hyper_connection_lowrank_gemm::{hc_finish_block, hc_finish_x4, hc_token_fused};
 use crate::layers::qwen3_attention::HcLowRank;
 
 /// The three-launch collapse for small T. Same math as the fused kernel;
@@ -57,6 +57,50 @@ pub(super) fn hc_pre_split(
         .arg_u32(hc_mult)
         .arg_f32(norm_eps)
         .launch(stream)?;
+
+    // Token-fused stages 2+3 for decode and the K=2 MTP verify. The per-token
+    // kernels below stream each 6.55 MB weight once PER TOKEN with ~8 rows of
+    // loads in flight per warp: at T=2 on gfx1151 that pair measured 136 + 143
+    // us per call, 97 calls per verify step, 27 ms of a 111 ms step
+    // (ATLAS_TRACE_LAUNCH_SYNC, winbox 2026-10-02). The `_mt` kernels read each
+    // weight once for all tokens and keep 16 loads in flight per lane. Bit-
+    // identical by construction (same per-output accumulation order; see the
+    // kernel note), so this picks launch shape only.
+    const HC_MT_MAX: u32 = 4; // must match HC_MT_MAX in hyper_connection.cu
+    const HC_MT_DOWN_BLOCK: u32 = 128;
+    if num_tokens <= HC_MT_MAX && hc_mult == 4 && hc_token_fused() {
+        let k_down_mt = crate::layers::try_kernel(gpu, "hyper_connection", "hc_pre_down_mt");
+        let k_fin_mt = crate::layers::try_kernel(gpu, "hyper_connection", "hc_pre_finish_x4_mt");
+        if k_down_mt.0 != 0 && k_fin_mt.0 != 0 {
+            let rank = w.rank as u32;
+            KernelLaunch::new(gpu, k_down_mt)
+                .grid([rank.div_ceil(HC_MT_DOWN_BLOCK / 32), 1, 1])
+                .block([HC_MT_DOWN_BLOCK, 1, 1])
+                .arg_ptr(normed)
+                .arg_ptr(w.down_w)
+                .arg_ptr(low)
+                .arg_u32(hidden_size)
+                .arg_u32(hc_mult)
+                .arg_u32(rank)
+                .arg_u32(num_tokens)
+                .launch(stream)?;
+            return KernelLaunch::new(gpu, k_fin_mt)
+                .grid([hidden_size.div_ceil(32), 1, 1])
+                .block([128, 1, 1])
+                .shared_mem(num_tokens * rank * 4)
+                .arg_ptr(normed)
+                .arg_ptr(low)
+                .arg_ptr(w.up_w)
+                .arg_ptr(if inject { w.inject_w } else { DevicePtr::NULL })
+                .arg_ptr(y_out)
+                .arg_ptr(inj_out)
+                .arg_u32(hidden_size)
+                .arg_u32(hc_mult)
+                .arg_u32(rank)
+                .arg_u32(num_tokens)
+                .launch(stream);
+        }
+    }
 
     // `hc_pre_down` stages the token's `normed` row in SHARED memory, so the
     // 40 KB vector is read once per block instead of once per `rank` row. That
