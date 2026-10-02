@@ -167,10 +167,16 @@ hf download nvidia/Qwen3.8-27B-NVFP4 `
 
 # Serve, the fingerprinted fp8d recipe. Native FP8 GDN, K=4 MTP, BF16 KV
 # and lm_head. Preflight hard-fails on non-gfx1151 GPUs.
-.\serve-amd.ps1
+.\serve-amd.ps1                              # Qwen3.8 27B + MTP (default)
+# .\serve-amd.ps1 -Spec dflash2              # 27B + DFlash2 — also needs:
+#   hf download incoai/Qwen3.8-27B-DFlash2 --local-dir "$env:USERPROFILE\models\dflash2"
+# .\serve-amd.ps1 -Model qwen3.8-flash-next  # Flash-Next + MTP — needs VGM 32 GB and:
+#   hf download nvidia/Qwen3.8-Flash-Next-NVFP4 --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-Flash-Next-NVFP4"
 ```
 
-Prebuilt instead? Unzip `spark-windows-x86_64-amd-hip` keeping every DLL beside `spark.exe`, set `$env:ATLAS_BIN` to it, and run `.\serve-amd.ps1`. That skips the toolchain check and the build. The script runs a detached smoke probe (`first_run_smoke.log`), and the 64K-context record config is [`win_serve_qwen38_nvfp4.ps1`](scripts/strix-windows/win_serve_qwen38_nvfp4.ps1).
+`.\build-amd.ps1` compiles every strix-hip target once; `serve-amd.ps1` picks the model + speculation mode (`-Model qwen3.8-flash-next -Spec dflash2` is rejected — no Flash-Next drafter exists). Add `-Thinking off|on` to pin `--disable-thinking` or make thinking the server default (issue #146; Linux twin: `THINKING=off|on` on `serve-amd.sh`).
+
+Prebuilt instead? Unzip `spark-windows-x86_64-amd-hip` keeping every DLL beside `spark.exe`, set `$env:ATLAS_BIN` to it, and run `.\serve-amd.ps1`. That skips the toolchain check and the build; the prebuilt zip is built with every target too (`.github/release-matrix.json` row `windows-x86_64-amd-hip` has `target_model: "*"`), so the same `-Model`/`-Spec` options apply. The script runs a detached smoke probe (`first_run_smoke.log`), and the 64K-context record config is [`win_serve_qwen38_nvfp4.ps1`](scripts/strix-windows/win_serve_qwen38_nvfp4.ps1).
 
 Measured on a Framework Desktop (Ryzen AI Max+ 395, Radeon 8060S, Windows 11, ROCm 10.0.0 TheRock, Adrenalin 32.0.31041.1004). **83.32 / 78.70** on the bfcl-subset golden draw with zero faults in 3.6 hours, and **17.25 tok/s** decode with MTP engaged at p1 0.834. Provenance in [`BENCH.toml`](kernels/strix-hip/qwen3.8-27b/BENCH.toml) and [`STRIX_WINDOWS_HIP.md`](docs/porting/STRIX_WINDOWS_HIP.md).
 

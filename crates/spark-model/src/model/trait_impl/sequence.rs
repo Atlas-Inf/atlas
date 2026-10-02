@@ -360,15 +360,22 @@ impl TransformerModel {
         &self,
         seq: &mut SequenceState,
         new_slot: usize,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let old_slot = seq.slot_idx;
         if old_slot == new_slot {
-            return Ok(());
+            return Ok(true);
         }
 
+        // Claim the NEW slot EXCLUSIVELY, BEFORE any copy. A target not on the
+        // pool free list is OWNED by a live sequence (e.g. one still PREFILLING,
+        // which the scheduler's active list does not see): refuse, copy nothing.
+        if !self.ssm_pool.claim_specific(new_slot) {
+            return Ok(false);
+        }
         let stream = self.gpu.default_stream();
         self.ssm_pool
-            .copy_slot(old_slot, new_slot, self.gpu.as_ref(), stream)?;
+            .copy_slot(old_slot, new_slot, self.gpu.as_ref(), stream)
+            .inspect_err(|_| self.ssm_pool.release_slot(new_slot))?; // un-claim
 
         // Update ALL SsmLayerState pool pointers to point at the new slot.
         // BUG FIX: previously only h_state and conv_state were repointed, leaving
@@ -440,22 +447,14 @@ impl TransformerModel {
         // (queued D2D), so without this barrier, claim_slot() in the next request
         // could hand the old_slot back to a new sequence while the copy's source
         // reads are still in flight — cross-seq race that produces partial data.
-        self.gpu.synchronize(stream)?;
+        // Surfaced AFTER the bookkeeping: the guard must follow the repoint.
+        let synced = self.gpu.synchronize(stream);
         // Slot-migration is an ownership TRANSFER, not a free: this sequence
         // keeps a live slot (the NEW one). Take the old idx out of the guard so
         // its Drop won't re-release it, release the old slot exactly once, then
         // re-point the guard at the new slot it now owns. This preserves the
-        // exactly-once invariant: old_slot is pushed here (once) and new_slot
+        // exactly-once invariant: old_slot is pushed below (once) and new_slot
         // will be pushed by whichever path later frees THIS sequence (once).
-        // Claim the NEW slot EXCLUSIVELY (bug-2 fix): if the migration target
-        // is on the free list (a slot freed by a retiring sequence in the
-        // two-phase retire compaction), remove it so it is never simultaneously
-        // owned (by this guard) and free. Without this, a later release of this
-        // slot double-pushes it and `claim_slot` hands the same slot to two
-        // sequences → shared GDN state → cross-stream content bleed. A no-op
-        // for the ownership-TRANSFER caller (lifecycle swap-out), where the
-        // target is owned by the retiring victim and not on the free list.
-        self.ssm_pool.claim_specific(new_slot);
         if let Some(g) = seq.ssm_slot.as_mut() {
             // Guard owned `old_slot`; drop that ownership before releasing.
             let owned = g.take();
@@ -464,14 +463,14 @@ impl TransformerModel {
                 Some(old_slot),
                 "compact_sequence: guard owned {owned:?}, expected old_slot {old_slot}"
             );
-            self.ssm_pool.release_slot(old_slot);
             g.migrate(new_slot);
-        } else {
-            // No guard (e.g. mock model with no SSM pool): preserve the legacy
-            // explicit release so behavior is unchanged where there is no guard.
-            self.ssm_pool.release_slot(old_slot);
         }
-        Ok(())
+        // A failed sync returns BEFORE the release: the copy may still be reading
+        // old_slot, so leak it on the (dead) context rather than hand it out.
+        synced?;
+        // Released exactly once, guard or no guard (mock model with no SSM pool).
+        self.ssm_pool.release_slot(old_slot);
+        Ok(true)
     }
 
     pub(super) fn num_free_blocks_dispatch(&self) -> usize {

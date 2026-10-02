@@ -43,12 +43,34 @@ param(
     [string]$SsmSlots = '24',
     [string]$SsmInterval = '128',
     [string]$ModelDir = "$env:USERPROFILE\models\nvidia-Qwen3.8-27B-NVFP4",
-    [string]$DraftDir = "$env:USERPROFILE\models\dflash2"
+    [string]$DraftDir = "$env:USERPROFILE\models\dflash2",
+    # default|off|on -- ATLAS_THINKING (from serve-amd.ps1 -Thinking) or
+    # DISABLE_THINKING=1 alias 'off' when unset.
+    [ValidateSet('default', 'off', 'on')]
+    [string]$Thinking = ''
 )
 $ErrorActionPreference = 'Stop'
-$env:HOME = 'C:\Users\azeez'
-$env:USERPROFILE = 'C:\Users\azeez'
-$env:ATLAS_HOME = 'C:\Users\azeez\.atlas'
+# pwsh 7.3+ defaults $PSNativeCommandArgumentPassing to 'Windows' (Standard
+# escaping), so spark.exe would see the literal backslashes and the JSON parse
+# fails fast. On Windows PowerShell 5.1, pwsh < 7.3, or an explicit Legacy
+# opt-in, embedded double quotes are stripped and the \" escape is required.
+# (about_Parsing: native argument passing; about_Pwsh: PSNativeCommandArgumentPassing)
+function Get-ThinkingOnKwarg {
+    $legacy = ($PSVersionTable.PSVersion.Major -lt 7) -or
+              ($PSVersionTable.PSVersion -lt [version]'7.3') -or
+              ($PSNativeCommandArgumentPassing -eq 'Legacy')
+    if ($legacy) { '{\"enable_thinking\":true}' } else { '{"enable_thinking":true}' }
+}
+# Thinking resolution: explicit -Thinking param > ATLAS_THINKING env >
+# DISABLE_THINKING=1 alias > shipped default (off).
+if (-not $Thinking) {
+    if ($env:ATLAS_THINKING) { $Thinking = $env:ATLAS_THINKING }
+    elseif ($env:DISABLE_THINKING -eq '1') { $Thinking = 'off' }
+    else { $Thinking = 'default' }
+}
+if ($Thinking -notin @('default','off','on')) { throw "ATLAS_THINKING/-Thinking must be default|off|on, got '$Thinking'" }
+if (-not $env:HOME) { $env:HOME = $env:USERPROFILE }
+if (-not $env:ATLAS_HOME) { $env:ATLAS_HOME = Join-Path $env:HOME '.atlas' }
 $Repo = if ($env:ATLAS_REPO) { $env:ATLAS_REPO } else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Repo 'target\x86_64-pc-windows-msvc' }
 $Bin = if ($env:ATLAS_BIN) { $env:ATLAS_BIN } else { Join-Path $TargetDir 'release\spark.exe' }
@@ -80,7 +102,7 @@ New-Item -ItemType Directory -Force (Join-Path $Repo 'out') | Out-Null
     "model=nvidia/Qwen3.8-27B-NVFP4 dir=$ModelDir"
     "drafter=incoai/Qwen3.8-27B-DFlash2 dir=$DraftDir gamma=$Gamma option_b=1"
     "bind=" + $BindHost + ':' + $Port
-    "serve=max_seq_len:$SeqLen max_prefill_tokens:2048 gpu_util:$Util kv:bf16 lm_head:bf16 batch:1 dflash_window:0(full) dflash_ctx_window:$SeqLen ssm_slots:$SsmSlots ssm_ckpt:$SsmInterval prefix_cache:true thinking:off request_timeout:900"
+    "serve=max_seq_len:$SeqLen max_prefill_tokens:2048 gpu_util:$Util kv:bf16 lm_head:bf16 batch:1 dflash_window:0(full) dflash_ctx_window:$SeqLen ssm_slots:$SsmSlots ssm_ckpt:$SsmInterval prefix_cache:true thinking:" + $(if ($Thinking -eq 'default') { 'default(off)' } else { $Thinking }) + " request_timeout:900"
 ) | Out-File $Fingerprint -Encoding utf8
 $HashFiles = @(
     (Join-Path $ModelDir 'config.json'),
@@ -102,7 +124,14 @@ $ServeArgs = @(
     '--dflash', '--draft-model', $DraftDir,
     '--dflash-gamma', $Gamma, '--dflash-window-size', '0',
     '--ssm-cache-slots', $SsmSlots, '--ssm-checkpoint-interval', $SsmInterval,
-    '--enable-prefix-caching', '--disable-thinking',
+    '--enable-prefix-caching',
     '--request-timeout', '900'
 )
+# off/default keep the shipped --disable-thinking; 'on' makes thinking the
+# SERVER default instead. The escaped-quote form is required: PS 5.1 strips
+# embedded double quotes from native-exe arguments.
+switch ($Thinking) {
+    'on'      { $ServeArgs += '--default-chat-template-kwargs', (Get-ThinkingOnKwarg) }
+    default   { $ServeArgs += '--disable-thinking' }
+}
 & $Bin @ServeArgs 2>&1 | Tee-Object -FilePath $Log

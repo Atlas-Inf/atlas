@@ -378,6 +378,10 @@ pub struct Qwen3SsmLayer {
     // twin beat the fixed one at m==8 (475 vs 551 us/call; 47-75 VGPR vs
     // 98-133). Preferred when linked and ATLAS_GEMV_VL2 != 0.
     w8a16_gemv_batch8_dyn_vl2_k: KernelHandle,
+    // n2 twin (2 outputs/thread sharing the activation loads; 16
+    // outputs/block, grid ceil(N/16)) — bit-identical to dyn_vl2, measured
+    // 1.15-1.31x on the verify shapes. Preferred at m<=8 when linked.
+    w8a16_gemv_batch8_dyn_vl2_n2_k: KernelHandle,
     // M<=16 sibling of batch4 for high-concurrency decode (n=5..16): same
     // weight-streaming GEMV, avoids the M-padded MMA at C=8/16.
     w8a16_gemv_batch16_k: KernelHandle,

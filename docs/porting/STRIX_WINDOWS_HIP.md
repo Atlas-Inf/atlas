@@ -223,10 +223,15 @@ and changes nothing, if you want to look before you leap.
 git clone https://github.com/Atlas-Inf/atlas.git
 .\build-amd.ps1     # repair symlinks (first_run -Phase symlinks), then check + cargo build
 .\serve-amd.ps1     # check GPU + weights, serve, smoke-test
+# or pick a mode:   -Spec dflash2 | -Model qwen3.8-flash-next
 ```
 
 `build-amd.ps1` forwards to `first_run.ps1 -Phase symlinks` then `-Phase
-build`; `serve-amd.ps1` to `-Phase serve`. Every
+build`. `serve-amd.ps1` dispatches on `-Model`/`-Spec`: the default
+(Qwen3.8 with MTP) goes to `first_run.ps1 -Phase serve`, `-Spec dflash2` goes to
+`scripts\strix-windows\win_serve_dflash2_nvfp4.ps1`, and
+`-Model qwen3.8-flash-next` to
+`scripts\strix-windows\win_serve_flashnext_nvfp4.ps1`. Every
 `ATLAS_*`/`HIP_PATH` override that script documents applies. `.\serve-amd.ps1
 C:\path\to\weights` selects a different local snapshot.
 
@@ -340,6 +345,11 @@ $env:ATLAS_MTP_GATE_REPROBE = "64"
   --mtp-vocab 100000 --disable-tool-grammar true --enable-prefix-caching `
   --ssm-cache-slots 64 --ssm-checkpoint-interval 16 --disable-thinking
 ```
+
+Thinking control since #146: `serve-amd.ps1 -Thinking off|on` (env
+`ATLAS_THINKING`; `DISABLE_THINKING=1` aliases `off`) -- `on` serves thinking
+as the default via `--default-chat-template-kwargs` while per-request
+`enable_thinking:false` still wins.
 
 **`ATLAS_KV_EXTERNAL_RESERVE_GB` must be 0, not 6.** `hipMemGetInfo` is broken on
 Windows HIP — `hipErrorInvalidValue` standalone, `free == 0` under a live context —

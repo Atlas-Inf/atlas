@@ -62,6 +62,8 @@ pub enum WeightQuantFormat {
     /// native `q2_0_gemv` decode GEMV. Consumed only by that kernel — feeding
     /// these bytes through any other GEMV/GEMM is silent garbage.
     PackedQ2_0,
+    /// ExLlamaV3 EXL3 trellis (mul1 codebook): packed 16x16 tiles + fp16 suh/svh.
+    Exl3,
 }
 
 impl WeightQuantFormat {

@@ -82,7 +82,7 @@ fn check_quant_method(config: &ModelConfig) -> Result<()> {
     if qc.quant_method.is_empty() {
         return Ok(());
     }
-    const KNOWN_METHODS: &[&str] = &["compressed-tensors", "modelopt", "fp8"];
+    const KNOWN_METHODS: &[&str] = &["compressed-tensors", "modelopt", "fp8", "exl3"];
     if !KNOWN_METHODS.contains(&qc.quant_method.as_str()) {
         bail!(
             "Pre-flight: checkpoint declares quant_method={:?} which Atlas doesn't \
@@ -339,3 +339,7 @@ fn check_correction_bias_shape(store: &WeightStore, config: &ModelConfig) -> Res
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "preflight_exl3_tests.rs"]
+mod exl3_tests;

@@ -7,6 +7,8 @@
 //!
 //! Refactor wave 4a (2026-05-03): split into `weight_map/` sub-modules.
 
+#[path = "weight_map/exl3/mod.rs"]
+pub mod exl3;
 #[path = "weight_map/expert.rs"]
 mod expert;
 #[path = "weight_map/fp8_dequant.rs"]

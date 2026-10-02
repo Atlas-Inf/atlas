@@ -129,6 +129,7 @@ fn mixed_precision_map_resolves_standard_despite_mtp_scale_inv() {
         weight_block_size: vec![],
         group_size: 16,
         quantized_layers: map,
+        exl3: None,
     });
     // The store shape that fools the fallback: main experts carry the
     // standard ModelOpt triple; ONLY mtp.* carries weight_scale_inv.
@@ -185,6 +186,7 @@ fn mixed_precision_fp8_attn_nvfp4_mlp_resolves_standard() {
         weight_block_size: vec![],
         group_size: 16,
         quantized_layers: map,
+        exl3: None,
     });
     let store = store_with(&[]);
     assert_eq!(
@@ -243,6 +245,7 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
         weight_block_size: vec![],
         group_size: 16,
         quantized_layers: map,
+        exl3: None,
     });
     let store = store_with(&[]);
     assert_eq!(

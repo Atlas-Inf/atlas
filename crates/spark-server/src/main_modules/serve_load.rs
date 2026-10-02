@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use super::serve::{
     Prepared, canonicalize_model_quant, describe_quant_source, parse_default_chat_template_kwargs,
-    quant_pair_compatible, resolve_vision_max_pixels,
+    pick_quant_variant, quant_pair_compatible, resolve_vision_max_pixels,
 };
 use crate::api::InferenceRequest;
 use crate::main_modules::AppState;
@@ -302,6 +302,22 @@ pub(crate) fn load_model(
                 .collect::<Vec<_>>(),
         )
     })?;
+    // One target can compile several quant variants (qwen3.8-flash-next:
+    // nvfp4, and exl3 composed on it) under the same name, and
+    // `ptx_for_config` resolves by name — so it returns whichever variant
+    // was built first. Serve the one this checkpoint's quant asks for.
+    let ptx_set = {
+        let model_quant = canonicalize_model_quant(&config);
+        let mut variants: Vec<_> = atlas_kernels::available_targets()
+            .into_iter()
+            .filter(|t| t.target.model == ptx_set.target.model)
+            .collect();
+        let quants: Vec<&'static str> = variants.iter().map(|t| t.target.quant).collect();
+        match pick_quant_variant(&quants, &model_quant) {
+            Some(i) => variants.swap_remove(i),
+            None => ptx_set,
+        }
+    };
     let sampling_presets = ptx_set.sampling;
     // Record the RESOLVED target identity for the dashboard's kernel table.
     // It used to re-run resolution from (model_type, hidden_size), but that
@@ -462,10 +478,16 @@ pub(crate) fn load_model(
     // currently only consulted via `detect_nvfp4_variant`; explicit
     // use at each load site is a follow-up migration.
     let quant_format = spark_model::quant_format::detect_quant_format(&config, &store);
+    // EXL3 has no Nvfp4Variant at all (`base_variant` refuses to guess), so
+    // only ask for it for the formats that do map onto the variant dispatch.
+    let variant = if quant_format.name() == "exl3" {
+        "n/a (exl3)".to_string()
+    } else {
+        format!("{:?}", quant_format.base_variant())
+    };
     tracing::info!(
-        "Quantization format: {} (base variant {:?}), ignored globs = {}",
+        "Quantization format: {} (base variant {variant}), ignored globs = {}",
         quant_format.name(),
-        quant_format.base_variant(),
         match &config.quantization_config {
             Some(qc) => qc.ignore_modules.len(),
             None => 0,

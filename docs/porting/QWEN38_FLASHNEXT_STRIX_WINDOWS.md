@@ -14,18 +14,48 @@ labels (**PRELIMINARY**, observed, n=3) — see "Claims status" at the end.
 ## Quick start
 
 ```powershell
-# 1. VGM must be 32 GB (see the memory model below). One-time, reboots:
+git clone https://github.com/Atlas-Inf/atlas.git; cd atlas
+.\build-amd.ps1                          # compiles every strix-hip target once
+.\serve-amd.ps1 -Model qwen3.8-flash-next  # serve picks model + speculation mode
+```
+
+`serve-amd.ps1` takes `-Model {qwen3.8|qwen3.8-flash-next}` and
+`-Spec {mtp|dflash2}` — three supported combinations:
+
+```powershell
+.\serve-amd.ps1                            # Qwen3.8 27B + MTP on :8081 (default)
+.\serve-amd.ps1 -Spec dflash2              # Qwen3.8 27B + DFlash2 on :8096
+.\serve-amd.ps1 -Model qwen3.8-flash-next  # Flash-Next + MTP on :8095
+# -Thinking off|on works on every recipe (ATLAS_THINKING); DISABLE_THINKING=1
+# remains an alias for off.
+# (-Model qwen3.8-flash-next -Spec dflash2 is rejected: no DFlash2 drafter exists.)
+```
+
+`-Model qwen3.8-flash-next` returns once the server is up — spark keeps
+running; stop it with `Get-Process spark | Stop-Process`.
+
+One-time prerequisites:
+
+```powershell
+# VGM must be 32 GB (see the memory model below). One-time, reboots:
 vgmctl set 32          # scripts/strix-windows/vgmctl/ — build notes in its README
 
-# 2. Build (repairs kernel symlinks first — required on fresh Windows clones):
-powershell -ExecutionPolicy Bypass -File .\build-amd.ps1
+# TheRock ROCm at C:\TheRock\10.0.0, or HIP_PATH set to the SDK/runtime root.
+# MSVC ("Desktop development with C++" workload) and Rust (rustup).
 
-# 3. Serve the measured MTP profile (writes a fingerprint sidecar):
-powershell -ExecutionPolicy Bypass -File `
-  scripts\strix-windows\win_serve_flashnext_nvfp4.ps1 -Tag myboot
-# SERIAL=1 in the environment drops --speculative and lowers util to 0.86.
+# Weights — Flash-Next needs the first; -Spec dflash2 needs the 27B target
+# plus the DFlash2 drafter:
+hf download nvidia/Qwen3.8-Flash-Next-NVFP4 --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-Flash-Next-NVFP4"
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-27B-NVFP4"
+hf download incoai/Qwen3.8-27B-DFlash2 --local-dir "$env:USERPROFILE\models\dflash2"
+```
 
-# 4. Smoke (thinking off):
+`-Model qwen3.8-flash-next` serves the measured MTP K=2 profile on :8095
+(writes a fingerprint sidecar under `out\`); `SERIAL=1` in the environment
+drops `--speculative` and lowers util to 0.86. `-Spec dflash2` serves 27B +
+DFlash2 on :8096. Smoke (thinking off):
+
+```powershell
 $body = @{ model = 'nvidia/Qwen3.8-Flash-Next-NVFP4'; messages = @(
   @{ role='user'; content='Reply with exactly PONG' });
   max_tokens = 64; temperature = 0; reasoning_effort = 'none' } |

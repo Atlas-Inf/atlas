@@ -198,6 +198,7 @@ fn every_fingerprint_field_is_load_bearing() {
                     weight_block_size: Vec::new(),
                     group_size: 0,
                     quantized_layers: Default::default(),
+                    exl3: None,
                 });
             }),
         ),
@@ -248,6 +249,7 @@ fn string_encoding_is_injective() {
         weight_block_size: Vec::new(),
         group_size: 0,
         quantized_layers: Default::default(),
+        exl3: None,
     });
     let mut b = hybrid();
     b.model_type = "a".into();
@@ -259,6 +261,7 @@ fn string_encoding_is_injective() {
         weight_block_size: Vec::new(),
         group_size: 0,
         quantized_layers: Default::default(),
+        exl3: None,
     });
     assert_ne!(fp(&a), fp(&b));
 }
