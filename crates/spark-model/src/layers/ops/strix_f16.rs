@@ -33,20 +33,66 @@ fn f16_twin(gpu: &dyn GpuBackend, module: &str, func: &str) -> KernelHandle {
 #[track_caller]
 pub fn w4a16_m128_kernel(gpu: &dyn GpuBackend) -> KernelHandle {
     let h = f16_twin(gpu, "w4a16", "w4a16_gemm_t_m128");
-    if h.0 != 0 {
+    let base = try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128");
+    if h.0 != 0 && base.0 != 0 {
+        record_m128_pair(h, base);
         return h;
     }
-    try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128")
+    base
+}
+
+/// The dense twin wins only on large weights. strix job 146 (gfx1151), BF16 vs
+/// F16-twin TF/s at M=2048, N x K:
+///
+///   27B gate/up 17408x5120   17.68 -> 21.31   27B down 5120x17408   18.32 -> 20.71
+///   FNext qkvz  16384x2560   17.49 -> 20.14   FNext attn q 12288x2560 21.65 -> 20.45
+///   27B qkv      5120x5120   22.17 -> 21.77   FNext out    2560x6144  22.67 -> 20.58
+///
+/// The BF16 kernel already reaches ~22 TF/s on the smaller weights, where its
+/// software bf16 rounding is not the limiter, and the twin's extra LDS pass for
+/// the A tile then costs more than it saves. `N*K >= 40M` separates the six
+/// measured shapes exactly; it is a fitted cut from six points, so
+/// `ATLAS_F16_M128_MIN_NK` overrides it (0 = always the twin). The routed-MoE
+/// twins are not gated: they won 2.1x / 1.9x on the Flash-Next shapes.
+const F16_M128_MIN_NK_DEFAULT: u64 = 40_000_000;
+
+static M128_PAIR: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
+fn record_m128_pair(twin: KernelHandle, base: KernelHandle) {
+    let _ = M128_PAIR.set((twin.0, base.0));
+}
+
+fn f16_m128_min_nk() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ATLAS_F16_M128_MIN_NK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(F16_M128_MIN_NK_DEFAULT)
+    })
+}
+
+/// Pick the kernel for one `w4a16_gemm_t_m128` launch: the F16 twin on large
+/// weights, its BF16 base below the cut. Any other handle passes through.
+pub(crate) fn m128_for_shape(kernel: KernelHandle, n: u32, k: u32) -> KernelHandle {
+    match M128_PAIR.get() {
+        Some(&(twin, base)) if kernel.0 == twin && (n as u64) * (k as u64) < f16_m128_min_nk() => {
+            KernelHandle(base)
+        }
+        _ => kernel,
+    }
 }
 
 /// [`w4a16_m128_kernel`] for callers that require the kernel.
 #[track_caller]
 pub fn w4a16_m128_kernel_required(gpu: &dyn GpuBackend) -> Result<KernelHandle> {
     let h = f16_twin(gpu, "w4a16", "w4a16_gemm_t_m128");
+    let base = gpu.kernel("w4a16", "w4a16_gemm_t_m128")?;
     if h.0 != 0 {
+        record_m128_pair(h, base);
         return Ok(h);
     }
-    gpu.kernel("w4a16", "w4a16_gemm_t_m128")
+    Ok(base)
 }
 
 /// A routed-expert MoE prefill kernel (`moe_w4a16_fused_gate_up_t`,
@@ -58,4 +104,37 @@ pub fn moe_w4a16_t_kernel(gpu: &dyn GpuBackend, func: &str) -> Result<KernelHand
         return Ok(h);
     }
     gpu.kernel("moe_w4a16", func)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The only test that touches M128_PAIR, so the process-global set is safe.
+    #[test]
+    fn m128_shape_gate_matches_the_measured_wins() {
+        record_m128_pair(KernelHandle(11), KernelHandle(22));
+        if std::env::var_os("ATLAS_F16_M128_MIN_NK").is_some() {
+            return; // an override changes the cut; the table below is for the default
+        }
+        let twin = KernelHandle(11);
+        // Twin won (strix job 146): 27B gate/up, 27B down, Flash-Next GDN qkvz.
+        for (n, k) in [(17408, 5120), (5120, 17408), (16384, 2560)] {
+            assert_eq!(
+                m128_for_shape(twin, n, k).0,
+                11,
+                "{n}x{k} should keep the twin"
+            );
+        }
+        // Twin lost: Flash-Next attn q, 27B qkv, Flash-Next out.
+        for (n, k) in [(12288, 2560), (5120, 5120), (2560, 6144)] {
+            assert_eq!(
+                m128_for_shape(twin, n, k).0,
+                22,
+                "{n}x{k} should fall back to bf16"
+            );
+        }
+        // Any other handle passes through untouched.
+        assert_eq!(m128_for_shape(KernelHandle(33), 2560, 6144).0, 33);
+    }
 }
