@@ -232,3 +232,211 @@ void w8a16_gemm_n_m128(
             if (r < M && c < N) C[(unsigned long long)r * N + c] = __float2bfloat16(acc[nb][e]);
         }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// w8a16_gemm_n_m128_f16a — F16-operand drop-in twin of w8a16_gemm_n_m128 (gfx1151).
+// Same signature, grid, swizzle and pipeline. The BF16 kernel decodes each E4M3
+// weight, multiplies by the 128x128 block scale and rounds to bf16 in software
+// (no f32->bf16 instruction on gfx1151): ~11 VALU per weight. Here E4M3 -> f16 is
+// EXACT (bits<<7 * 256; E4M3 is a subset of f16), the WMMA accumulates each
+// 128-K scale block UNSCALED, and the fp32 block scale is applied once per block
+// (acc += blk * scale; one block = 4 K-steps). The bf16 A tile converts to f16 in
+// LDS (exact for |a| <= 65504). Scaling after the products is also more precise
+// than rounding scaled weights to bf16.
+// ═══════════════════════════════════════════════════════════════════
+typedef _Float16 w8f_v16h __attribute__((ext_vector_type(16)));
+typedef _Float16 w8f_v2h  __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ unsigned int w8f_e4m3x2_f16bits(unsigned int b01) {
+    const unsigned int w = (b01 & 0xFFu) | ((b01 & 0xFF00u) << 8);     // [b0,0,b1,0]
+    const unsigned int bits = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+    w8f_v2h h; __builtin_memcpy(&h, &bits, 4);
+    h = h * (w8f_v2h){(_Float16)256.0f, (_Float16)256.0f};
+    unsigned int out; __builtin_memcpy(&out, &h, 4);
+    return out;
+}
+
+__device__ __forceinline__ uint4 w8f_bf16x8_to_f16x8(uint4 v) {
+    const unsigned int w[4] = {v.x, v.y, v.z, v.w};
+    unsigned int o[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const auto h = __builtin_amdgcn_cvt_pkrtz(__uint_as_float(w[i] << 16), __uint_as_float(w[i] & 0xFFFF0000u));
+        __builtin_memcpy(&o[i], &h, 4);
+    }
+    return uint4{o[0], o[1], o[2], o[3]};
+}
+
+extern "C" __global__
+__launch_bounds__(256, 1)
+void w8a16_gemm_n_m128_f16a(
+    const __nv_bfloat16* __restrict__ A,                // [M, K] BF16
+    const unsigned char* __restrict__ B,                // [N, K] FP8 E4M3 (k-contiguous)
+    const float* __restrict__ block_scale,              // [N/128, K/128] FP32 (non-transposed)
+    __nv_bfloat16* __restrict__ C,                      // [M, N] BF16
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    unsigned int m_t, n_t;
+    w8n128_swizzle_mn(W8N128_GROUP_M, m_t, n_t);
+    const unsigned int cta_n = n_t * W8N128_N_TILE;
+    const unsigned int cta_m = m_t * W8N128_M_TILE;
+    if (cta_m >= M || cta_n >= N) return;
+
+    const unsigned int warp_id = threadIdx.x >> 5;       // 0..7
+    const unsigned int lane_id = threadIdx.x & 31;
+    const unsigned int warp_m_offset = warp_id * 16;     // 0..112 (one 16-row band/warp)
+
+    __shared__ __align__(16) _Float16 smem_A[2][W8N128_M_TILE][W8N128_KSTEP + W8N128_APAD];
+    __shared__ __align__(16) _Float16 smem_B[2][W8N128_N_TILE][W8N128_KSTEP + W8N128_BPAD];
+
+    // acc = sum over finished 128-K scale blocks of (block partial * block scale);
+    // blk = the current block's partial with UNSCALED (exact) f16 weights.
+    v8f acc[8], blk[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { acc[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0}; blk[i] = acc[i]; }
+    float s_cur = 0.0f;   // block scale of the tile in the CURRENT buffer
+
+    // Per-thread register-prefetch state for one K_STEP=32 tile:
+    //   A: 128 rows x 32 cols bf16 -> 512 uint4; 256 threads -> 2 uint4 (one
+    //      8-col slice of a row, two rounds cover 64+64 rows).
+    //   B: 128 N-rows x 32 K-cols FP8 = 4096 B -> 256 uint4; 256 threads -> 1
+    //      uint4 (16 CONTIGUOUS K-bytes of one N-row, since B is [N,K]).
+    const unsigned int a_row_base = threadIdx.x >> 2;          // 0..63
+    const unsigned int a_col      = (threadIdx.x & 3) << 3;    // 0,8,16,24
+    // Non-transposed B: thread t -> n_local = t>>1 (0..127), k_half = t&1.
+    // Each thread reads B[gn][k_base + k_half*16 .. +16] = 16 contiguous k bytes.
+    const unsigned int b_n        = threadIdx.x >> 1;          // 0..127 (N row)
+    const unsigned int b_koff     = (threadIdx.x & 1) << 4;    // 0 or 16 (K col offset)
+    const unsigned int k_scale_blocks = (K + W8N128_FP8B - 1) / W8N128_FP8B;
+    const unsigned int n_block      = cta_n >> 7;              // == blockIdx.x
+
+    #define W8N128_LOAD_REGS(kb, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int rnd = 0; rnd < 2; rnd++) { \
+            unsigned int row = (unsigned int)(rnd * 64) + a_row_base; \
+            unsigned int gr  = cta_m + row; \
+            unsigned int gc  = (kb) + a_col; \
+            /* 16-B load needs a 16-B-aligned src: A[gr*K+gc] aligned iff K%8==0 */ \
+            if ((gr < M) && (gc + 7 < K) && ((K & 7) == 0)) { \
+                (ra)[rnd] = *(const uint4*)&A[(unsigned long long)gr * K + gc]; \
+            } else { \
+                union { __nv_bfloat16 h[8]; uint4 v; } u; \
+                _Pragma("unroll") \
+                for (int i = 0; i < 8; i++) \
+                    u.h[i] = ((gr < M) && (gc + i < K)) \
+                        ? A[(unsigned long long)gr * K + gc + i] \
+                        : __float2bfloat16(0.0f); \
+                (ra)[rnd] = u.v; \
+            } \
+        } \
+        { \
+            /* Non-transposed B[N,K]: read 16 CONTIGUOUS k at one n. */ \
+            unsigned int gn = cta_n + b_n; \
+            unsigned int gk = (kb) + b_koff; \
+            /* 16-B load needs a 16-B-aligned src: B[gn*K+gk] aligned iff */ \
+            /* K%16==0 (gk is already %16). Uniform branch; else scalar.   */ \
+            if ((gn < N) && (gk + 15 < K) && ((K & 15) == 0)) { \
+                (rb) = *(const uint4*)&B[(unsigned long long)gn * K + gk]; \
+            } else { \
+                union { unsigned char b[16]; uint4 v; } u; \
+                _Pragma("unroll") \
+                for (int i = 0; i < 16; i++) \
+                    u.b[i] = ((gn < N) && (gk + i < K)) \
+                        ? B[(unsigned long long)gn * K + gk + i] : 0; \
+                (rb) = u.v; \
+            } \
+            /* Non-transposed block scale [N/128, K/128]: scale[nb][kb]. */ \
+            (rs) = ((kb) < K) ? block_scale[ \
+                (unsigned long long)n_block * k_scale_blocks + ((kb) >> 7)] \
+                : 0.0f; \
+        } \
+    } while(0)
+
+    // Commit prefetched tile: A straight through; FP8 B dequants in registers
+    // into a bf16[16] union (constant indices) then writes TWO contiguous uint4
+    // into smem_B[n][k] — no transpose, no strided/conflicted scalar stores.
+    #define W8N128_STORE_TILE(buf, ra, rb) do { \
+        _Pragma("unroll") \
+        for (int rnd = 0; rnd < 2; rnd++) { \
+            unsigned int row = (unsigned int)(rnd * 64) + a_row_base; \
+            *(uint4*)&smem_A[(buf)][row][a_col] = w8f_bf16x8_to_f16x8((ra)[rnd]); \
+        } \
+        { \
+            /* E4M3 -> f16 EXACTLY (no scale): 2 bytes per word, bits<<7 * 256. */ \
+            const unsigned int rw[4] = { (rb).x, (rb).y, (rb).z, (rb).w }; \
+            unsigned int o[8]; \
+            _Pragma("unroll") \
+            for (int i = 0; i < 4; i++) { \
+                o[2 * i]     = w8f_e4m3x2_f16bits(rw[i] & 0xFFFFu); \
+                o[2 * i + 1] = w8f_e4m3x2_f16bits(rw[i] >> 16); \
+            } \
+            *(uint4*)&smem_B[(buf)][b_n][b_koff]     = uint4{o[0], o[1], o[2], o[3]}; \
+            *(uint4*)&smem_B[(buf)][b_n][b_koff + 8] = uint4{o[4], o[5], o[6], o[7]}; \
+        } \
+    } while(0)
+
+    // Each warp covers one 16-row band x all 8 n-sub-tiles. smem_B[n][k]
+    // fragment read identical to w8a16_gemm_t_m128's WMMA compute.
+    #define W8N128_COMPUTE(buf) do { \
+        unsigned int m_row = warp_m_offset + (lane_id & 15); \
+        _Pragma("unroll") \
+        for (int h = 0; h < 2; h++) { \
+            w8f_v16h a; \
+            __builtin_memcpy(&a, &smem_A[(buf)][m_row][h * 16], 32); \
+            _Pragma("unroll") \
+            for (int nb = 0; nb < 8; nb++) { \
+                unsigned int nc = nb * 16 + (lane_id & 15); \
+                w8f_v16h b; \
+                __builtin_memcpy(&b, &smem_B[(buf)][nc][h * 16], 32); \
+                blk[nb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, blk[nb]); \
+            } \
+        } \
+    } while(0)
+
+    uint4 reg_A[2], reg_B;
+    float reg_S;
+    W8N128_LOAD_REGS(0, reg_A, reg_B, reg_S);
+    W8N128_STORE_TILE(0, reg_A, reg_B);
+    s_cur = reg_S;
+    __syncthreads();
+
+    // Fold the finished 128-K block into acc. Called on a UNIFORM condition of
+    // the scalar loop counter, so it stays a scalar branch (an indexed condition
+    // got if-converted into 64 FMAs + selects on every step).
+    #define W8N128_FLUSH() do { \
+        _Pragma("unroll") \
+        for (int nb = 0; nb < 8; nb++) { acc[nb] += blk[nb] * s_cur; blk[nb] = v8f{0, 0, 0, 0, 0, 0, 0, 0}; } \
+    } while (0)
+
+    int cur = 0;
+    for (unsigned int k_base = W8N128_KSTEP; k_base < K; k_base += W8N128_KSTEP) {
+        int nxt = 1 - cur;
+        W8N128_LOAD_REGS(k_base, reg_A, reg_B, reg_S);   // global->regs in flight
+        W8N128_COMPUTE(cur);                             // WMMA overlaps the loads
+        if ((k_base % W8N128_FP8B) == 0) W8N128_FLUSH(); // tile k_base-32 closed a block
+        W8N128_STORE_TILE(nxt, reg_A, reg_B);
+        s_cur = reg_S;
+        __syncthreads();
+        cur = nxt;
+    }
+    W8N128_COMPUTE(cur);
+    W8N128_FLUSH();                                      // the last (possibly partial) block
+
+    #undef W8N128_FLUSH
+    #undef W8N128_LOAD_REGS
+    #undef W8N128_STORE_TILE
+    #undef W8N128_COMPUTE
+
+    // Each warp writes its own 16-row band x 128 cols (no shuffle).
+    const unsigned int row_base = cta_m + warp_m_offset;
+    #pragma unroll
+    for (int nb = 0; nb < 8; nb++)
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            unsigned int r = row_base + 2 * e + (lane_id >> 4);
+            unsigned int c = cta_n + nb * 16 + (lane_id & 15);
+            if (r < M && c < N) C[(unsigned long long)r * N + c] = __float2bfloat16(acc[nb][e]);
+        }
+}

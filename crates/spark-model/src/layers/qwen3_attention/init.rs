@@ -197,12 +197,7 @@ impl Qwen3AttentionLayer {
             // `w8a16_gemm_n_m128` exists only in kernels/strix-hip/common —
             // ATLAS_TARGET_HW=strix-hip sets cfg!(atlas_hip). On every other
             // target the lookup can never resolve; don't issue it.
-            w8a16_gemm_n_m128_k: gate(
-                cfg!(atlas_hip),
-                gpu,
-                "w8a16_gemm_n_m128",
-                "w8a16_gemm_n_m128",
-            ),
+            w8a16_gemm_n_m128_k: crate::layers::ops::w8a16_n_m128_kernel(gpu),
             per_token_group_quant_fp8_k: super::super::try_kernel(
                 gpu,
                 "per_token_group_quant_fp8",

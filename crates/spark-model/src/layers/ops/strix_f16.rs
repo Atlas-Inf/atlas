@@ -59,3 +59,18 @@ pub fn moe_w4a16_t_kernel(gpu: &dyn GpuBackend, func: &str) -> Result<KernelHand
     }
     gpu.kernel("moe_w4a16", func)
 }
+
+/// `w8a16_gemm_n_m128` (FP8 weights, 128x128 block scales), or its F16 twin on
+/// gfx1151. The kernel exists only in `kernels/strix-hip/common`, so off HIP no
+/// lookup is issued at all (0, like the gated lookup this replaces).
+#[track_caller]
+pub fn w8a16_n_m128_kernel(gpu: &dyn GpuBackend) -> KernelHandle {
+    if !cfg!(atlas_hip) {
+        return KernelHandle(0);
+    }
+    let h = f16_twin(gpu, "w8a16_gemm_n_m128", "w8a16_gemm_n_m128");
+    if h.0 != 0 {
+        return h;
+    }
+    try_kernel(gpu, "w8a16_gemm_n_m128", "w8a16_gemm_n_m128")
+}
