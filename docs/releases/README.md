@@ -16,7 +16,10 @@ here, cross-checked against the image's revision label.
 
 ## Verifying on a single GB10
 
-The serve-matrix leg runs on any single-node GB10 with the checkpoints cached:
+The serve-matrix leg runs on any single-node GB10 with the checkpoints cached.
+`scripts/release/verify-gb10-local.sh <sha7>` runs the whole pipeline below —
+worktree, build, matrix, coherence, gate, save — including the rootless/sudo
+handling in the notes; the per-stage commands are:
 
 ```bash
 python3 tests/run_all_models.py --roster tests/rosters/gb10-cached.json
