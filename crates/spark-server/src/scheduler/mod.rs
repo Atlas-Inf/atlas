@@ -62,6 +62,8 @@ mod repetition;
 mod rollback;
 mod sample_step;
 pub mod sched_ctx;
+#[cfg(test)]
+mod slot_compaction_tests;
 pub mod snapshot;
 mod spec_capacity;
 pub mod spec_stats;

@@ -451,18 +451,32 @@ impl SsmStatePool {
 
     pub(super) fn release_slot(&self, idx: usize) {
         let mut free = self.free_slots.lock();
-        debug_assert!(
-            !free.contains(&idx),
-            "release_slot: slot {idx} already free (double-release hands it to two seqs)"
-        );
+        // UNCONDITIONAL (was a `debug_assert!`, compiled out of release
+        // builds): a slot pushed twice stays on the free list twice for the
+        // life of the process, and `claim_slot` then hands it to two sequences
+        // on every later overlap. Dropping the second push turns a slot
+        // double-ownership bug into a one-request fault instead of a
+        // process-lifetime one. `max_slots` is small, so the scan is free.
+        if free.contains(&idx) {
+            tracing::error!(
+                "release_slot: slot {idx} already free — double release ignored \
+                 (two sequences owned this slot; their SSM state was shared)"
+            );
+            return;
+        }
         free.push(idx);
     }
 
     /// Remove a SPECIFIC slot from the free list if present, returning whether
-    /// it was. Used by `compact_sequence` to claim a known-free migration
-    /// target EXCLUSIVELY, so a slot is never simultaneously owned and free —
-    /// the bug-2 invariant (an owned-and-free slot gets handed to two sequences
+    /// it was. Used by `compact_sequence` to claim its migration target
+    /// EXCLUSIVELY, so a slot is never simultaneously owned and free — the
+    /// bug-2 invariant (an owned-and-free slot gets handed to two sequences
     /// by `claim_slot`, sharing GDN state → cross-stream corruption).
+    ///
+    /// `false` means the slot is OWNED by a live sequence (active, prefilling,
+    /// anything): the caller must NOT copy onto it. The free list is the only
+    /// source of truth for that — the scheduler's active list does not see
+    /// sequences that are still prefilling.
     pub(super) fn claim_specific(&self, slot: usize) -> bool {
         let mut free = self.free_slots.lock();
         if let Some(pos) = free.iter().position(|&s| s == slot) {
@@ -1345,6 +1359,46 @@ mod slot_guard_tests {
         let mut sorted = free.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1], "both slots free exactly once, no dupes");
+    }
+
+    #[test]
+    fn double_release_is_ignored_in_every_build() {
+        // The guard is unconditional (not a `debug_assert!`): a second release
+        // of the same index must not put it on the free list twice, or
+        // `claim_slot` would hand it to two sequences from then on.
+        let pool = bare_pool(2);
+        let a = pool.claim_slot().unwrap();
+        assert_eq!(a, 0);
+        pool.release_slot(a);
+        pool.release_slot(a); // double release: logged, NOT pushed
+        assert_eq!(free_count(&pool), 2, "slot 0 must be free exactly once");
+        // Two concurrent claims therefore still get DISTINCT slots.
+        let x = pool.claim_slot().unwrap();
+        let y = pool.claim_slot().unwrap();
+        assert_ne!(x, y, "a duplicated free entry hands one slot to two seqs");
+        assert!(pool.claim_slot().is_err(), "no phantom third slot");
+    }
+
+    #[test]
+    fn claim_specific_refuses_an_owned_slot() {
+        // The prefill-overlap collision: L (still prefilling) owns slot 0, S
+        // (active) owns slot 1, and compaction wants S on slot 0. The claim
+        // must FAIL so `compact_sequence` never copies onto L's state.
+        let pool = bare_pool(4);
+        let l = pool.claim_guarded().unwrap(); // slot 0
+        let s = pool.claim_guarded().unwrap(); // slot 1
+        assert_eq!((l.idx(), s.idx()), (Some(0), Some(1)));
+        assert!(!pool.claim_specific(0), "slot 0 is owned, not free");
+        assert_eq!(free_count(&pool), 2, "a refused claim changes nothing");
+        // Once L is gone its slot IS a legal target, claimable exactly once.
+        drop(l);
+        assert!(pool.claim_specific(0));
+        assert!(!pool.claim_specific(0));
+        pool.release_slot(0); // undo the bare claim above
+        drop(s);
+        let mut sorted = pool.free_slots.lock().clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3], "every slot free exactly once");
     }
 
     #[test]
