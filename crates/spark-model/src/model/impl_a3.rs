@@ -219,7 +219,7 @@ impl TransformerModel {
             {
                 // One BF16 weight pass for both verify tokens (Flash-Next ships a
                 // BF16 [248320, 2560] head: the fallback read 1.27 GB twice per
-                // step). Bit-identical to it on HIP, see the handle's lookup.
+                // step). Bit-identical to it, see the handle's lookup.
                 // Off with ATLAS_NO_LM_HEAD_BATCH_GEMV=1 like the other arms.
                 ops::dense_gemv_batch2(
                     self.gpu.as_ref(),
