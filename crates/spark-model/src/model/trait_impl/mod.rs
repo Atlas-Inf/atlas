@@ -31,6 +31,7 @@ mod drafter_prefill;
 mod ep_misc;
 mod graph_borrow;
 mod lm_head_batched;
+pub(crate) use lm_head_batched::lm_head_batch_gemv_enabled;
 mod lm_head_dp4a;
 mod meta;
 mod meta_argmax;
