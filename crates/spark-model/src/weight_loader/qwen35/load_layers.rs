@@ -416,15 +416,12 @@ pub(super) fn load_layers(
             let mut down_bf16 = Vec::with_capacity(config.num_experts);
             let mut load_err: Option<anyhow::Error> = None;
             // Free FP8 source GPU memory after each successful dequant.
-            // The HashMap entry retains a stale ptr; nothing else reads
-            // these expert weights after dequant on the BF16 path, so
-            // the orphan key is benign.
+            // Nothing reads these expert weights after dequant on the BF16
+            // path. `reclaim` records the free so teardown does not free the
+            // stale pointer a second time (#122).
             let free_src = |prefix: &str| {
                 for suffix in ["weight", "weight_scale_inv"] {
-                    let k = format!("{prefix}.{suffix}");
-                    if let Ok(w) = store.get(&k) {
-                        let _ = gpu.free(w.ptr);
-                    }
+                    let _ = store.reclaim(gpu, &format!("{prefix}.{suffix}"));
                 }
             };
             for e in 0..config.num_experts {
