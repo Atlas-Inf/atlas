@@ -68,7 +68,13 @@ pub(super) fn hc_pre_split(
     // kernel note), so this picks launch shape only.
     const HC_MT_MAX: u32 = 4; // must match HC_MT_MAX in hyper_connection.cu
     const HC_MT_DOWN_BLOCK: u32 = 128;
-    if num_tokens <= HC_MT_MAX && hc_mult == 4 && hc_token_fused() {
+    // The finish kernel computes token t's injection in block t, so its grid
+    // (H / 32 blocks) must cover every token.
+    if num_tokens <= HC_MT_MAX
+        && hc_mult == 4
+        && hidden_size.div_ceil(32) >= num_tokens
+        && hc_token_fused()
+    {
         let k_down_mt = crate::layers::try_kernel(gpu, "hyper_connection", "hc_pre_down_mt");
         let k_fin_mt = crate::layers::try_kernel(gpu, "hyper_connection", "hc_pre_finish_x4_mt");
         if k_down_mt.0 != 0 && k_fin_mt.0 != 0 {
