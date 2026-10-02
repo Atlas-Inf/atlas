@@ -36,10 +36,12 @@ use spark_runtime::weights::WeightStore;
 use crate::weight_map::Nvfp4Variant;
 
 mod compressed_tensors;
+mod exl3;
 mod fp8_blockscaled;
 mod modelopt;
 
 pub use compressed_tensors::CompressedTensorsFormat;
+pub use exl3::{Exl3Format, ensure_not_exl3};
 pub use fp8_blockscaled::Fp8BlockScaledFormat;
 pub use modelopt::ModeloptFormat;
 
@@ -122,6 +124,16 @@ pub fn detect_quant_format(config: &ModelConfig, store: &WeightStore) -> Box<dyn
                     ignore.len(),
                 );
                 return Box::new(Fp8BlockScaledFormat::new(ignore));
+            }
+            "exl3" | "EXL3" => {
+                // EXL3 linears never go through the Nvfp4Variant dispatch;
+                // naming the format here is what stops the heuristic below
+                // from treating the checkpoint as BF16-to-requantize.
+                tracing::info!(
+                    "QuantFormat: exl3 (ExLlamaV3 trellis), {} ignored module(s)",
+                    ignore.len(),
+                );
+                return Box::new(Exl3Format::new(ignore));
             }
             other if !other.is_empty() => {
                 tracing::warn!(

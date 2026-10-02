@@ -700,6 +700,12 @@ pub struct QuantizationConfig {
     /// map). This is what distinguishes the nvidia Flash-Next pack: 48 routed-
     /// expert layers at NVFP4, one FP8 PLE table, one FP8_PB_WO MTP block.
     pub quantized_layers: std::collections::BTreeMap<String, QuantLayerSpec>,
+    /// EXL3-only fields, populated when `quant_method == "exl3"` (see
+    /// `parsers/exl3.rs`). `None` for every other scheme; `Some(Err(msg))`
+    /// when an exl3 block is missing/mistyping a required field — the error
+    /// surfaces at the first consumer (`QuantizationConfig::exl3_config`),
+    /// because this parser has no error channel of its own.
+    pub exl3: Option<Result<Exl3QuantConfig, String>>,
 }
 
 /// One `quantized_layers` entry: the algorithm applied to that module path
@@ -818,7 +824,7 @@ pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
 pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos, shift_right_ignore_eos_fill};
 pub use ngram_qwen4exp::Qwen4ExpNgram;
 pub use parsers::{
-    PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
+    Exl3QuantConfig, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
     parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{

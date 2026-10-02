@@ -8,10 +8,18 @@
 //! {lp}.ple.value_proj.weight                     [H,    ple_embed_dim]
 //! {lp}.ple.norm_key/norm_query/norm_conv.weight  [hc*H]
 //! {lp}.ple.conv1d.weight                         [hc*H, 1, K]
-//! {lp}.ple.ple_embedding.layer_multipliers       [ngram_size]   I64
-//! {lp}.ple.ple_embedding.ngram_heads_offsets     [ngram_heads]  I64
-//! {lp}.ple.ple_embedding.ngram_heads_vocab_sizes [ngram_heads]  I64
-//! {lp}.ple.ple_embedding.ngram_embedding.shard_{0..127}.weight  [R, 160] BF16
+//! {lp}.ple.ple_embedding.ngram_embedding.layer_multipliers       [ngram_size]   I64
+//! {lp}.ple.ple_embedding.ngram_embedding.head_offsets            [ngram_heads]  I64
+//! {lp}.ple.ple_embedding.ngram_embedding.head_vocab_sizes        [ngram_heads]  I64
+//! {lp}.ple.ple_embedding.ngram_embedding.shard_{0..127}.weight   [R, 160] BF16
+//!
+//! NVFP4 packs ship the three lookup tensors under the old names
+//! (`ple_embedding.layer_multipliers`, `.ngram_heads_offsets`,
+//! `.ngram_heads_vocab_sizes`). Probe the EXL3 names first, then those.
+//! A single unsharded `ngram_embedding.trellis` (4.05 bpw) is one contiguous
+//! row-major table. The row cache opens it at that tensor's byte offset,
+//! the same way a safetensors shard is opened. Equal-sized `shard_{i}`
+//! tensors stay on the segmented path.
 //! ```
 //!
 //! The 128 shards are ONE logical table of `128 * R` rows. They live in a
@@ -82,6 +90,26 @@ fn slots_from_env(scratch_tokens: usize, ngram_heads: usize) -> (usize, &'static
     }
 }
 
+/// First uploaded name that exists. EXL3 checkpoints use the nested
+/// `ngram_embedding.*` names; RadixArk NVFP4 still ships the old
+/// `ple_embedding.*` names. Missing both is the caller's error.
+#[cfg(feature = "cuda")]
+fn first_present<'a>(store: &WeightStore, names: &[&'a str]) -> Option<&'a str> {
+    names.iter().copied().find(|n| store.get(n).is_ok())
+}
+
+/// EXL3 name first (`ngram_embedding.{exl3}`), then the NVFP4 name
+/// (`{nvfp4}` directly under `ple_embedding`). If neither is uploaded, return
+/// the EXL3 name so `i64_host` reports that miss.
+#[cfg(feature = "cuda")]
+fn ple_i64_name(store: &WeightStore, lp: &str, exl3: &str, nvfp4: &str) -> String {
+    let nested = format!("{lp}.ple_embedding.ngram_embedding.{exl3}");
+    let flat = format!("{lp}.ple_embedding.{nvfp4}");
+    first_present(store, &[&nested, &flat])
+        .unwrap_or(nested.as_str())
+        .to_string()
+}
+
 /// Read a small I64 device tensor back to the host.
 ///
 /// `layer_multipliers` and the two per-head tables are 3 and 16 elements —
@@ -125,6 +153,32 @@ fn bf16_scalar(store: &WeightStore, name: &str, gpu: &dyn GpuBackend) -> Result<
     Ok(v)
 }
 
+/// A resident FP16 vector, read back as raw fp16 bits.
+///
+/// EXL3 `head_bias` stays FP16 (`keeps_raw_f16`) because the n-gram dequant
+/// adds it in the same units as `decode_mul1` * scale.
+#[cfg(feature = "cuda")]
+fn fp16_host(store: &WeightStore, name: &str, n: usize, gpu: &dyn GpuBackend) -> Result<Vec<u16>> {
+    let t = store.get(name).with_context(|| format!("PLE: {name}"))?;
+    anyhow::ensure!(
+        t.num_elements() == n,
+        "PLE: {name} has {} elements, expected {n}",
+        t.num_elements()
+    );
+    anyhow::ensure!(
+        matches!(t.dtype, spark_runtime::weights::WeightDtype::FP16),
+        "PLE: {name} is {:?}, expected FP16 (raw head_bias)",
+        t.dtype
+    );
+    let mut raw = vec![0u8; n * 2];
+    gpu.copy_d2h(t.ptr, &mut raw)
+        .with_context(|| format!("PLE: reading {name} back to host"))?;
+    Ok(raw
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect())
+}
+
 /// Build the PLE layer for `layer_idx`, or `None` if this model has none.
 #[cfg(feature = "cuda")]
 pub(super) fn load(
@@ -150,15 +204,19 @@ pub(super) fn load(
     let dims = PleIdDims {
         ngram_size: config.emb_neighbor_num,
         heads_per_ngram: config.emb_split_num,
-        multipliers: i64_host(store, &format!("{lp}.ple_embedding.layer_multipliers"), gpu)?,
+        multipliers: i64_host(
+            store,
+            &ple_i64_name(store, &lp, "layer_multipliers", "layer_multipliers"),
+            gpu,
+        )?,
         head_vocab_sizes: i64_host(
             store,
-            &format!("{lp}.ple_embedding.ngram_heads_vocab_sizes"),
+            &ple_i64_name(store, &lp, "head_vocab_sizes", "ngram_heads_vocab_sizes"),
             gpu,
         )?,
         head_offsets: i64_host(
             store,
-            &format!("{lp}.ple_embedding.ngram_heads_offsets"),
+            &ple_i64_name(store, &lp, "head_offsets", "ngram_heads_offsets"),
             gpu,
         )?,
         eos_token_id: eos,
@@ -177,9 +235,16 @@ pub(super) fn load(
     let mut head_dim = 0usize;
     let mut dtype = None;
     for i in 0.. {
-        let name = format!("{lp}.ple_embedding.ngram_embedding.shard_{i}.weight");
-        let Some(d) = store.deferred(&name) else {
-            break;
+        // Two naming families: RadixArk NVFP4 ships `shard_{i}.weight`,
+        // EXL3 ships `shard_{i}.trellis` (I16). Probe `.weight` first so the
+        // NVFP4 path is byte-for-byte unchanged; fall back to `.trellis`.
+        let base = format!("{lp}.ple_embedding.ngram_embedding.shard_{i}");
+        let d = match store
+            .deferred(&format!("{base}.weight"))
+            .or_else(|| store.deferred(&format!("{base}.trellis")))
+        {
+            Some(d) => d,
+            None => break,
         };
         anyhow::ensure!(
             d.shape.len() == 2,
@@ -208,12 +273,34 @@ pub(super) fn load(
         }
         shards.push((d.path.clone(), d.offset));
     }
-    anyhow::ensure!(
-        !shards.is_empty(),
-        "PLE: no `{lp}.ple_embedding.ngram_embedding.shard_*` was deferred. Either \
-         the checkpoint has none, or they were UPLOADED whole — which for this \
-         table is 102 GB of BF16 and would not have fit."
-    );
+    // 4.05 bpw stores the whole table as one contiguous tensor, not shards.
+    // open_at reads it at the safetensors data offset. Sharded tables stay
+    // on open_segmented below.
+    let single_name = format!("{lp}.ple_embedding.ngram_embedding.trellis");
+    let single = if shards.is_empty() {
+        store.deferred(&single_name)
+    } else {
+        None
+    };
+    if shards.is_empty() && single.is_none() {
+        anyhow::bail!(
+            "PLE: no `{lp}.ple_embedding.ngram_embedding.shard_*` was deferred, \
+             and `{single_name}` is not deferred either. Either the checkpoint \
+             has none, or they were UPLOADED whole — which for this table is \
+             102 GB of BF16 and would not have fit."
+        );
+    }
+    if let Some(d) = single {
+        anyhow::ensure!(
+            d.shape.len() == 2,
+            "PLE: `{single_name}` shape {:?}, expected 2-D",
+            d.shape
+        );
+        rows_per = d.shape[0];
+        head_dim = d.shape[1];
+        dtype = Some(d.dtype);
+        shards.push((d.path.clone(), d.offset));
+    }
     let distinct_files = {
         let mut seen: Vec<&std::path::Path> = Vec::new();
         for (path, _) in &shards {
@@ -232,9 +319,13 @@ pub(super) fn load(
     let elem = match dtype {
         spark_runtime::weights::WeightDtype::BF16 => 2,
         spark_runtime::weights::WeightDtype::FP8E4M3 => 1,
+        // EXL3 trellis shards are packed I16 (2 bytes/element). The row
+        // cache copies those bytes; host dequant expands each row to 160
+        // BF16 before the GEMM. See `layers/ple/ngram_trellis.rs`.
+        spark_runtime::weights::WeightDtype::Int16 => 2,
         other => anyhow::bail!(
-            "PLE: n-gram table is {other:?}; the row cache gathers BF16 or \
-             F8_E4M3 rows (`batched_embed` / `batched_embed_fp8`)"
+            "PLE: n-gram table is {other:?}; the row cache gathers BF16, \
+             F8_E4M3, or I16 rows (`batched_embed` / `batched_embed_fp8`)"
         ),
     };
     // The gather pins at most one span's rows at once, so the arena sizes
@@ -243,13 +334,25 @@ pub(super) fn load(
     let chunk = chunk_from_env();
     let span = crate::layers::ple::bounded_scratch(chunk, max_tokens);
     let (slots, slots_from) = slots_from_env(span, heads);
-    let mut cache = spark_storage::NgramRowCache::open_segmented(
-        &shards,
-        rows_per as u64,
-        None, // no per-row scale FILE; FP8 uses the per-tensor scalar below
-        head_dim * elem,
-        slots,
-    )
+    let mut cache = if single.is_some() {
+        let (path, off) = &shards[0];
+        spark_storage::NgramRowCache::open_at(
+            path,
+            *off,
+            None,
+            rows_per as u64,
+            head_dim * elem,
+            slots,
+        )
+    } else {
+        spark_storage::NgramRowCache::open_segmented(
+            &shards,
+            rows_per as u64,
+            None, // no per-row scale FILE; FP8 uses the per-tensor scalar below
+            head_dim * elem,
+            slots,
+        )
+    }
     .context("PLE: n-gram row cache")?;
 
     // FP8 rows need their dequant scale, or the gather returns raw E4M3
@@ -293,9 +396,36 @@ pub(super) fn load(
         (config.ple_conv_kernel_size - 1) * dilation,
     );
 
+    let (embed_dim, trellis) = if matches!(dtype, spark_runtime::weights::WeightDtype::Int16) {
+        let k = crate::layers::ple::ngram_trellis::k_from_packed_words(head_dim).with_context(|| {
+            format!(
+                "PLE: I16 n-gram row width {head_dim} is not 1+10*K (exllamav3 ngram_codec.words_per_row); cannot dequant the trellis"
+            )
+        })?;
+        let decoded = crate::layers::ple::ngram_trellis::ROW_DIM;
+        let bias_name = format!("{lp}.ple_embedding.ngram_embedding.head_bias");
+        let bias = fp16_host(store, &bias_name, heads * decoded, gpu)?;
+        tracing::info!(
+            "PLE EXL3 ngram trellis: {head_dim} i16 words/row, K={k}, decode to {decoded}-dim mul1 * scale + head_bias before the GEMM (geometry uses {decoded}, not {head_dim})"
+        );
+        (
+            decoded,
+            Some(crate::layers::ple::ngram_trellis::NgramTrellis {
+                k,
+                packed_words: head_dim,
+                heads,
+                bias_fp16: bias,
+                head_offsets: dims.head_offsets.clone(),
+                head_vocab_sizes: dims.head_vocab_sizes.clone(),
+            }),
+        )
+    } else {
+        (head_dim, None)
+    };
+
     PleLayer::new(
         dims,
-        head_dim,
+        embed_dim,
         h,
         hc,
         config.ple_conv_kernel_size,
@@ -305,6 +435,7 @@ pub(super) fn load(
         NgramTable::Cached(Box::new(cache)),
         max_tokens,
         span,
+        trellis,
         gpu,
     )
     .map(Some)

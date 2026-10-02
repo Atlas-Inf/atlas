@@ -524,6 +524,18 @@ pub(super) fn quant_pair_compatible(kernel_quant: &str, model_quant: &str) -> bo
     )
 }
 
+/// Which of one target's compiled quant variants serves a `model_quant`
+/// checkpoint: the exact quant first, else the first compatible one (an
+/// FP8 checkpoint on a `*` build takes `nvfp4`, not the `exl3` overlay).
+/// `None` leaves the resolved target as is, for the compat check to reject.
+pub(super) fn pick_quant_variant(quants: &[&str], model_quant: &str) -> Option<usize> {
+    quants.iter().position(|q| *q == model_quant).or_else(|| {
+        quants
+            .iter()
+            .position(|q| quant_pair_compatible(q, model_quant))
+    })
+}
+
 #[cfg(test)]
 #[path = "serve_tests.rs"]
 mod tests;
