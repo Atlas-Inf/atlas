@@ -601,3 +601,13 @@ The agentic leg above (`dflash-agentic-20260915T2247Z`) completed:
 the drafter's 4096-token window slides on agentic transcripts, as this
 document predicted. The MTP/DFLASH headline does not carry to the
 agentic regime without a longer drafter window or window pinning.
+
+## 2026-09-20 — Flash-Next on Windows
+
+`nvidia/Qwen3.8-Flash-Next-NVFP4` serves natively on winbox (gfx1151,
+Windows 11, ROCm 10.0.0) on branch `port/flashnext-strix-windows`: MTP K=2
+decode measured ~2.6× over serial (17.0 vs 6.5 tok/s, n=3, fingerprinted),
+with the whole port gated by a ~84.5 GiB WDDM resident-commit wall that
+manifests as an over-commit-then-719 context kill, not a kernel fault.
+Memory model, boot chronology, recipe, and claims status:
+[`QWEN38_FLASHNEXT_STRIX_WINDOWS.md`](QWEN38_FLASHNEXT_STRIX_WINDOWS.md).
