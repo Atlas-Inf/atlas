@@ -50,6 +50,8 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
+        } else if let Some(ref e) = self.exl3_attn {
+            e.o.forward_bf16(ctx.gpu, attn_out, 1, o_out, h as usize, stream)?;
         } else if let Some(o_bf16) = self.o_dense_bf16.as_ref() {
             ops::dense_gemv(
                 ctx.gpu,

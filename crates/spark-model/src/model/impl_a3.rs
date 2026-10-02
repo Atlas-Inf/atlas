@@ -169,7 +169,19 @@ impl TransformerModel {
         // aliasing: all streams' first token collapsed to one). Verify/decode
         // callers pass `self.buffers.logits()` (base) — unchanged behaviour.
         let logits = logits_dst;
-        if let Some(ref fp8) = self.lm_head_fp8 {
+        if num_tokens <= 2
+            && let Some(ref e) = self.lm_head_exl3
+        {
+            // Native EXL3 lm_head (1-2 rows); wider calls keep the BF16 copy.
+            e.forward_bf16(
+                self.gpu.as_ref(),
+                hidden,
+                num_tokens,
+                logits,
+                v as usize,
+                stream,
+            )?;
+        } else if let Some(ref fp8) = self.lm_head_fp8 {
             // FP8 E4M3 LM head. The dual-GEMV (batch=2) reads the FP8 weight
             // once for both K=2 verify tokens — bit-identical to two M=1 GEMVs
             // but halves the full-vocab weight bandwidth. Falls back to the
@@ -326,7 +338,14 @@ impl TransformerModel {
         } else {
             (self.buffers.logits(), false)
         };
-        if let Some(ref fp8) = self.lm_head_fp8 {
+        if let Some(ref e) = self.lm_head_exl3 {
+            // Native EXL3 lm_head; FP32 logits take the fp32 accumulator directly.
+            if fp32 {
+                e.forward_f32(self.gpu.as_ref(), hidden, 1, logits, stream)?;
+            } else {
+                e.forward_bf16(self.gpu.as_ref(), hidden, 1, logits, v as usize, stream)?;
+            }
+        } else if let Some(ref fp8) = self.lm_head_fp8 {
             // FP8 E4M3 LM head (`--lm-head-dtype fp8`). `w8a16_gemv` has no
             // FP32-output variant — it writes to whichever buffer is passed.
             // `use_fp32_logits` is false in production, so `logits` is the

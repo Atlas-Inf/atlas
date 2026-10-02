@@ -23,8 +23,9 @@
 //!
 //! What is genuinely different is the MoE **storage**: the main layers ship
 //! per-expert NVFP4 (packed E2M1), the MTP block ships two stacked BF16
-//! tensors. [`build_mtp_moe`] slices and requantizes them so the body gets the
-//! same [`MoeLayer`] every other layer gets.
+//! tensors (or, on the turboderp EXL3 build, per-expert packed trellises).
+//! [`build_mtp_moe`] requantizes either so the body gets the same [`MoeLayer`]
+//! every other layer gets.
 //!
 //! ## Forward (supplied by the proposer, not here)
 //!
@@ -64,8 +65,8 @@ use crate::layer::TransformerLayer;
 use crate::layers::qwen3_attention::HcHeadWeights;
 use crate::layers::{FfnComponent, MoeLayer};
 use crate::weight_map::{
-    DenseWeight, ExpertWeight, MoeWeights, dense_auto, load_mtp_experts_stacked, quantize_to_nvfp4,
-    quantized_from_fp8,
+    DenseWeight, ExpertWeight, MoeWeights, QuantizeCtx, dense_auto, load_mtp_experts_stacked,
+    quantize_to_nvfp4, quantized_from_fp8,
 };
 
 /// The `mtp.layers.0` prefix — this checkpoint has `mtp_num_hidden_layers = 1`.
@@ -80,14 +81,22 @@ enum MtpExpertLayout {
     /// `weight_scale_inv` (FP8_PB_WO, g=128) — declared by the pack's
     /// `quantized_layers` map entry `mtp.layers.0.mlp.experts`.
     PerExpertFp8BlockScaled,
+    /// turboderp EXL3 build: per-expert
+    /// `experts.{e}.{gate,up,down}_proj.trellis` (+suh/svh/mul1). Interim
+    /// EXL3 -> BF16 -> NVFP4 until native MoE (M5).
+    PerExpertExl3,
 }
 
 /// Detect the MTP expert storage layout from the store. `weight_scale_inv`
 /// on `experts.0.gate_proj` is the FP8-block-scale marker; the fused
-/// `experts.gate_up_proj` tensor is the stacked marker.
+/// `experts.gate_up_proj` tensor is the stacked marker; a per-expert `trellis`
+/// is the EXL3 marker.
 fn mtp_expert_layout(store: &WeightStore, mlp: &str) -> MtpExpertLayout {
     if store.contains(&format!("{mlp}.experts.gate_up_proj")) {
         return MtpExpertLayout::StackedBf16;
+    }
+    if store.contains(&format!("{mlp}.experts.0.gate_proj.trellis")) {
+        return MtpExpertLayout::PerExpertExl3;
     }
     if store.contains(&format!("{mlp}.experts.0.gate_proj.weight_scale_inv")) {
         return MtpExpertLayout::PerExpertFp8BlockScaled;
@@ -128,37 +137,46 @@ pub struct Qwen4ExpMtpModule {
     pub hc_head: Option<HcHeadWeights>,
 }
 
-/// Build the MTP MoE from the stacked BF16 expert pair.
+/// Build the MTP MoE, detecting the expert storage layout from the store
+/// ([`mtp_expert_layout`]) and requantizing to NVFP4 so the body gets the same
+/// [`MoeLayer`] every other layer gets.
 ///
 /// The main layers upload per-expert NVFP4 straight through and cost nothing
-/// to build. This block instead ships `experts.gate_up_proj` `[E, 2I, H]` and
-/// `experts.down_proj` `[E, H, I]` as BF16, so each expert is sliced out
-/// (zero-copy — the slices alias the stacked allocation) and requantized to
-/// NVFP4 so the body gets the same [`MoeLayer`] every other layer gets.
+/// to build. The RadixArk MTP block instead ships `experts.gate_up_proj`
+/// `[E, 2I, H]` and `experts.down_proj` `[E, H, I]` as BF16, so each expert is
+/// sliced out (zero-copy — the slices alias the stacked allocation) and
+/// requantized.
 ///
-/// Requantizing is not the free choice it looks like: it leaves BOTH the 5.03
-/// GB of stacked BF16 (owned by the `WeightStore`, which has no release API)
-/// and the ~1.4 GB of NVFP4 resident. Keeping the experts BF16 instead is not
-/// an option — [`MoeWeights`] holds [`ExpertWeight`], which is NVFP4-only.
+/// Requantizing is not the free choice it looks like: on the stacked path it
+/// leaves BOTH the 5.03 GB of stacked BF16 (owned by the `WeightStore`, which
+/// has no release API) and the ~1.4 GB of NVFP4 resident. Keeping the experts
+/// BF16 instead is not an option — [`MoeWeights`] holds [`ExpertWeight`],
+/// which is NVFP4-only.
 fn build_mtp_moe(
     store: &WeightStore,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
-) -> Result<FfnComponent> {
+) -> Result<(FfnComponent, MtpExpertLayout)> {
     let h = config.hidden_size;
     let inter = config.moe_intermediate_size;
     let n_experts = config.num_experts;
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
     let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
     let stream = gpu.default_stream();
+    let qctx = QuantizeCtx {
+        absmax_k,
+        quantize_k,
+        stream,
+    };
 
     let mlp = format!("{MTP_LAYER_PREFIX}.mlp");
     let q = |w: &DenseWeight, n: usize, k: usize| -> Result<_> {
         quantize_to_nvfp4(w, n, k, gpu, absmax_k, quantize_k, stream)
     };
 
+    let layout = mtp_expert_layout(store, &mlp);
     let mut experts = Vec::with_capacity(n_experts);
-    match mtp_expert_layout(store, &mlp) {
+    match layout {
         MtpExpertLayout::StackedBf16 => {
             let bf16_experts = load_mtp_experts_stacked(store, &mlp, n_experts)
                 .with_context(|| format!("qwen4_exp MTP: stacked experts at {mlp}"))?;
@@ -227,27 +245,84 @@ fn build_mtp_moe(
                 }
             }
         }
+        // turboderp EXL3 build: per-expert packed trellis/suh/svh/mul1. Same
+        // interim path the main layers take through `quantized_any`: EXL3 ->
+        // transient BF16 -> NVFP4, until native MoE (M5) replaces it.
+        MtpExpertLayout::PerExpertExl3 => {
+            for e in 0..n_experts {
+                let p = |name| format!("{mlp}.experts.{e}.{name}_proj");
+                experts.push(ExpertWeight {
+                    gate_proj: crate::weight_map::exl3::quantized_from_exl3(
+                        store,
+                        &p("gate"),
+                        inter,
+                        h,
+                        gpu,
+                        qctx,
+                    )
+                    .with_context(|| format!("qwen4_exp MTP: EXL3 expert {e} gate_proj"))?,
+                    up_proj: crate::weight_map::exl3::quantized_from_exl3(
+                        store,
+                        &p("up"),
+                        inter,
+                        h,
+                        gpu,
+                        qctx,
+                    )
+                    .with_context(|| format!("qwen4_exp MTP: EXL3 expert {e} up_proj"))?,
+                    down_proj: crate::weight_map::exl3::quantized_from_exl3(
+                        store,
+                        &p("down"),
+                        h,
+                        inter,
+                        gpu,
+                        qctx,
+                    )
+                    .with_context(|| format!("qwen4_exp MTP: EXL3 expert {e} down_proj"))?,
+                });
+            }
+        }
     }
 
     // The shared expert ships per-tensor BF16 like a main layer's, so it takes
-    // the ordinary named path rather than the stacked slicer.
+    // the ordinary named path rather than the stacked slicer — except on the
+    // EXL3 build, where it stays packed (`{se}.*_proj.trellis`) and takes the
+    // same requant path as the routed experts.
     let se = format!("{mlp}.shared_expert");
-    let shared_expert = ExpertWeight {
-        gate_proj: q(
-            &dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?,
-            inter,
-            h,
-        )?,
-        up_proj: q(
-            &dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?,
-            inter,
-            h,
-        )?,
-        down_proj: q(
-            &dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?,
-            h,
-            inter,
-        )?,
+    let shared_expert = if store.contains(&format!("{se}.gate_proj.trellis")) {
+        let exl3 = |name: &str, n: usize, k: usize| -> Result<_> {
+            crate::weight_map::exl3::quantized_from_exl3(
+                store,
+                &format!("{se}.{name}_proj"),
+                n,
+                k,
+                gpu,
+                qctx,
+            )
+        };
+        ExpertWeight {
+            gate_proj: exl3("gate", inter, h)?,
+            up_proj: exl3("up", inter, h)?,
+            down_proj: exl3("down", h, inter)?,
+        }
+    } else {
+        ExpertWeight {
+            gate_proj: q(
+                &dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?,
+                inter,
+                h,
+            )?,
+            up_proj: q(
+                &dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?,
+                inter,
+                h,
+            )?,
+            down_proj: q(
+                &dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?,
+                h,
+                inter,
+            )?,
+        }
     };
 
     let gate = dense_auto(store, &format!("{mlp}.gate.weight"), gpu)?;
@@ -265,7 +340,7 @@ fn build_mtp_moe(
     let gate_nvfp4 = Some(q(&gate, n_experts, h)?);
     let moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
         .context("qwen4_exp MTP: MoeLayer")?;
-    Ok(FfnComponent::Moe(moe))
+    Ok((FfnComponent::Moe(moe), layout))
 }
 
 /// Load the Qwen3.8-Flash-Next MTP draft module.
@@ -296,7 +371,7 @@ pub fn load_qwen4exp_mtp_module(
     let stream = gpu.default_stream();
     let free_before = gpu.free_memory().unwrap_or(0) as u64;
 
-    let ffn = build_mtp_moe(store, config, gpu)?;
+    let (ffn, layout) = build_mtp_moe(store, config, gpu)?;
 
     // Norm placeholders, exactly as the main layers get them: this model keeps
     // its normalization inside the hyper-connection blocks, so there is no
@@ -407,71 +482,15 @@ pub fn load_qwen4exp_mtp_module(
     let spent = free_before.saturating_sub(gpu.free_memory().unwrap_or(0) as u64);
     tracing::info!(
         "qwen4_exp MTP draft module loaded: 1 reused full-attention layer \
-         (gated attn, dense — no QSA indexer + mHC + {}-expert MoE requantized from stacked BF16), \
+         (gated attn, dense — no QSA indexer + mHC + {}-expert MoE requantized to NVFP4 (layout {:?})), \
          shared embed/lm_head, own head mixer. Construction cost {:.2} GB.",
         config.num_experts,
+        layout,
         spent as f64 / 1e9,
     );
     Ok(Some(module))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn store_with(names: &[&str]) -> WeightStore {
-        let map: HashMap<String, spark_runtime::weights::WeightTensor> = names
-            .iter()
-            .map(|n| {
-                (
-                    n.to_string(),
-                    spark_runtime::weights::WeightTensor {
-                        ptr: spark_runtime::gpu::DevicePtr::NULL,
-                        shape: vec![1],
-                        dtype: spark_runtime::weights::WeightDtype::BF16,
-                    },
-                )
-            })
-            .collect();
-        WeightStore::from_map(map)
-    }
-
-    /// RadixArk pack: the fused pair selects the stacked path.
-    #[test]
-    fn stacked_markers_select_stacked_layout() {
-        let store = store_with(&[
-            "mtp.layers.0.mlp.experts.gate_up_proj",
-            "mtp.layers.0.mlp.experts.down_proj",
-        ]);
-        assert_eq!(
-            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
-            MtpExpertLayout::StackedBf16
-        );
-    }
-
-    /// nvidia pack: per-expert weight_scale_inv selects the FP8 block path —
-    /// and must win even when a stray fused name is absent.
-    #[test]
-    fn per_expert_scale_inv_selects_fp8_layout() {
-        let store = store_with(&[
-            "mtp.layers.0.mlp.experts.0.gate_proj.weight",
-            "mtp.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
-        ]);
-        assert_eq!(
-            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
-            MtpExpertLayout::PerExpertFp8BlockScaled
-        );
-    }
-
-    /// Neither marker → stacked default, whose loader errors with the names
-    /// it probed (better than guessing the other format).
-    #[test]
-    fn no_markers_defaults_to_stacked() {
-        let store = store_with(&[]);
-        assert_eq!(
-            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
-            MtpExpertLayout::StackedBf16
-        );
-    }
-}
+#[path = "mtp_tests.rs"]
+mod tests;
