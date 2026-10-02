@@ -214,6 +214,24 @@ impl TransformerModel {
                     h,
                     stream,
                 )?;
+            } else if self.dense_gemv_bf16_batch2_kernel.0 != 0 {
+                // BF16 LM head, one weight pass for both verify tokens.
+                // Qwen3.8-Flash-Next ships its [248320, 2560] LM head BF16, so
+                // the two-GEMV fallback below read 1.27 GB twice per MTP
+                // verify step: 2 x 5.87 ms of a 111 ms step on gfx1151
+                // (ATLAS_TRACE_LAUNCH_SYNC, winbox 2026-10-02). Bit-identical
+                // to that fallback; see the handle's lookup.
+                ops::dense_gemv_batch2(
+                    self.gpu.as_ref(),
+                    self.dense_gemv_bf16_batch2_kernel,
+                    hidden,
+                    &self.lm_head_weight,
+                    logits,
+                    v,
+                    h,
+                    v,
+                    stream,
+                )?;
             } else {
                 // Dense fallback: 2× GEMV. Stays BF16 even when
                 // use_fp32_logits is on — the FP32 path is decode-only
