@@ -313,10 +313,10 @@ extern "C" __global__ void __launch_bounds__(256) w8a16_gemv_batch8_dyn_vl2_n2(
             const unsigned int aw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
             #pragma unroll
             for (int pair = 0; pair < 8; ++pair) {
-                const float alo = atlas_bf16_bits_to_f32(aw[pair] & 0xffffu);
-                const float ahi = atlas_bf16_bits_to_f32(aw[pair] >> 16);
-                acc[0][row] += alo * w0[pair * 2] + ahi * w0[pair * 2 + 1];
-                acc_b[0][row] += alo * w1[pair * 2] + ahi * w1[pair * 2 + 1];
+                const float a_lo = atlas_bf16_bits_to_f32(aw[pair] & 0xffffu);
+                const float a_hi = atlas_bf16_bits_to_f32(aw[pair] >> 16);
+                acc[0][row] += a_lo * w0[pair * 2] + a_hi * w0[pair * 2 + 1];
+                acc_b[0][row] += a_lo * w1[pair * 2] + a_hi * w1[pair * 2 + 1];
             }
         }
         if (k2v) {
@@ -355,10 +355,10 @@ extern "C" __global__ void __launch_bounds__(256) w8a16_gemv_batch8_dyn_vl2_n2(
                 const unsigned int aw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
                 #pragma unroll
                 for (int pair = 0; pair < 8; ++pair) {
-                    const float alo = atlas_bf16_bits_to_f32(aw[pair] & 0xffffu);
-                    const float ahi = atlas_bf16_bits_to_f32(aw[pair] >> 16);
-                    acc[1][row] += alo * u0[pair * 2] + ahi * u0[pair * 2 + 1];
-                    acc_b[1][row] += alo * u1[pair * 2] + ahi * u1[pair * 2 + 1];
+                    const float a_lo = atlas_bf16_bits_to_f32(aw[pair] & 0xffffu);
+                    const float a_hi = atlas_bf16_bits_to_f32(aw[pair] >> 16);
+                    acc[1][row] += a_lo * u0[pair * 2] + a_hi * u0[pair * 2 + 1];
+                    acc_b[1][row] += a_lo * u1[pair * 2] + a_hi * u1[pair * 2 + 1];
                 }
             }
         }
