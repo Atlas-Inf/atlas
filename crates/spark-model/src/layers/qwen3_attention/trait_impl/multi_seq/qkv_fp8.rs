@@ -32,25 +32,21 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(n * kv_bytes);
-        let (batch_kernel, vl2) = if n <= 4 {
-            (self.w8a16_gemv_batch4_k, false)
+        let (batch_kernel, grid_div) = if n <= 4 {
+            (self.w8a16_gemv_batch4_k, 4)
         } else {
             ops::fp8_verify_gemv_tier(
                 n,
                 ops::gemv_vl2_enabled(),
                 self.w8a16_gemv_batch8_k,
                 self.w8a16_gemv_batch8_dyn_vl2_k,
+                self.w8a16_gemv_batch8_dyn_vl2_n2_k,
                 self.w8a16_gemv_batch16_k,
             )
         };
 
-        let launcher = if vl2 {
-            ops::w8a16_gemv_batch4_vl2
-        } else {
-            ops::w8a16_gemv_batch4
-        };
         let project = |weight: &crate::weight_map::Fp8Weight, output, rows| {
-            launcher(
+            ops::w8a16_gemv_batch4_div(
                 fwd.gpu,
                 batch_kernel,
                 normed,
@@ -60,6 +56,7 @@ impl Qwen3AttentionLayer {
                 n as u32,
                 rows,
                 h as u32,
+                grid_div,
                 stream,
             )
         };
