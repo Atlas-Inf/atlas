@@ -407,6 +407,7 @@ pub fn w4a16_gemm_n128_m128(
     stream: u64,
 ) -> Result<()> {
     log_gemm_shape(gpu, "w4a16_gemm_n128_m128", m, n, k);
+    let kernel = super::m128_for_shape(kernel, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([128, 1, 1])

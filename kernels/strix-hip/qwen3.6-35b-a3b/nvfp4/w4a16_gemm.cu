@@ -19,6 +19,7 @@
 //   Store: lane l, acc elem e(0..7) → C[row + 2*e + (l>>4)][col + (l&15)]
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
@@ -1091,4 +1092,221 @@ void fp8_fp8_gemm_t_m128(
             unsigned int c = cta_n + nb * 16 + (lane_id & 15);
             if (r < M && c < N) C[r * N + c] = __float2bfloat16(acc1[nb][e]);
         }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_gemm_t_m128_f16a — F16-operand drop-in twin of w4a16_gemm_t_m128 (gfx1151).
+//
+// Same signature, grid, tiling and register-prefetch pipeline as
+// w4a16_gemm_t_m128; differs only in the operand type and the dequant:
+//   * gfx1151 has no f32->bf16 instruction (software RNE = 5 VALU per weight,
+//     the dominant cost of the BF16 kernel's hot loop: 829 instructions per
+//     32-K step for 32 WMMA), but has v_cvt_f16_f32 and packed v_pk_mul_f16.
+//   * f16(e2m1) has a zero low byte for every code: one v_perm per four codes.
+//     e2m1 * e4m3 is EXACT in f16 (<= 5 mantissa bits; checked exhaustively over
+//     all 254 non-NaN scale bytes x 16 codes), so the dequant has NO rounding,
+//     where the BF16 kernel rounds every scaled weight to bf16.
+//   * The fp32 per-tensor scale2 is applied once per output in the epilogue.
+//   * The bf16 A tile converts to f16 while staged into LDS: exact for every
+//     |a| <= 65504 (bf16 has 7 mantissa bits, f16 10, so rtz == RNE); larger
+//     values saturate to +/-65504.
+// Hot loop: 378 instructions per 32-K step for the same 32 WMMA.
+// ═══════════════════════════════════════════════════════════════════
+typedef _Float16 v16h __attribute__((ext_vector_type(16)));
+typedef _Float16 v2h  __attribute__((ext_vector_type(2)));
+typedef float    v8f  __attribute__((ext_vector_type(8)));
+
+#define F16_M_TILE 64
+#define F16_N_TILE 128
+#define F16_K_STEP 32
+#define F16_PAD_T 8
+#define F16_GROUP 16
+
+// Four E2M1 codes (one per byte, low nibble) -> four f16 HIGH bytes. The low byte
+// of f16(v) is 0x00 for every E2M1 value: 0.5=0x3800 1=0x3C00 1.5=0x3E00 2=0x4000
+// 3=0x4200 4=0x4400 6=0x4600. One v_perm over an 8-entry table plus the sign bit.
+__device__ __forceinline__ unsigned int e2m1x4_f16hi(unsigned int codes) {
+    const unsigned int mag = __builtin_amdgcn_perm(0x46444240u, 0x3E3C3800u, codes & 0x07070707u);
+    return mag | ((codes & 0x08080808u) << 4);
+}
+
+// Two E4M3 scale bytes (b0 in bits 7:0, b1 in bits 15:8) -> packed f16 pair. The
+// E4M3 bits shifted into the f16 field (exp aligned to bit 10, mantissa to bit 7)
+// read as an f16 equal to |e4m3| * 2^-8, subnormals included, so * 256 is exact.
+__device__ __forceinline__ v2h e4m3x2_f16(unsigned int b01) {
+    const unsigned int w = (b01 & 0xFFu) | ((b01 & 0xFF00u) << 8);     // [b0,0,b1,0]
+    const unsigned int bits = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+    v2h h;
+    __builtin_memcpy(&h, &bits, 4);
+    return h * (v2h){(_Float16)256.0f, (_Float16)256.0f};
+}
+
+
+// 8 bf16 (one uint4) -> 8 f16 (one uint4). bf16 has 7 mantissa bits and f16 10,
+// so every in-range value converts EXACTLY and round-toward-zero equals RNE;
+// |x| > 65504 saturates to +/-65504 (rtz) instead of becoming inf, and values
+// below f16's subnormal range flush toward zero. Two values per v_cvt_pk_rtz.
+__device__ __forceinline__ uint4 bf16x8_to_f16x8(uint4 v) {
+    const unsigned int w[4] = {v.x, v.y, v.z, v.w};
+    unsigned int o[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float lo = __uint_as_float(w[i] << 16), hi = __uint_as_float(w[i] & 0xFFFF0000u);
+        const auto h = __builtin_amdgcn_cvt_pkrtz(lo, hi);
+        __builtin_memcpy(&o[i], &h, 4);
+    }
+    return uint4{o[0], o[1], o[2], o[3]};
+}
+
+
+template <bool A_BF16>
+__device__ __forceinline__ void w4a16_m128_f16_body(
+    const unsigned short* __restrict__ A,       // [M, K] f16, or bf16 when A_BF16
+    const unsigned char* __restrict__ B_packed, // [K/2, N] E2M1 pairs (lo nibble = even k)
+    const unsigned char* __restrict__ B_scale,  // [K/16, N] E4M3
+    const float scale2,                         // per-tensor fp32 scale (epilogue)
+    __nv_bfloat16* __restrict__ C,              // [M, N] bf16
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * F16_N_TILE;
+    const unsigned int cta_m = blockIdx.y * (2 * F16_M_TILE);
+    if (cta_m >= M) return;
+
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+
+    __shared__ __align__(16) _Float16 smem_A[2][2 * F16_M_TILE][F16_K_STEP + F16_PAD_T];
+    #define F16_B_ROW 40
+    #define F16_B_OFF(n) ((n) * F16_B_ROW + ((n) >> 4) * 8)
+    __shared__ __align__(16) _Float16 smem_B[2][F16_B_OFF(F16_N_TILE)];
+
+    v8f acc0[8], acc1[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        acc0[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+        acc1[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    }
+
+    const unsigned int a_row_base = threadIdx.x >> 2;
+    const unsigned int a_col      = (threadIdx.x & 3) << 3;
+    const unsigned int b_kp       = threadIdx.x >> 3;
+    const unsigned int b_ns       = (threadIdx.x & 7) << 4;
+
+    #define F16_LOAD_REGS(kb, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int rnd = 0; rnd < 4; rnd++) { \
+            unsigned int row = (unsigned int)(rnd * 32) + a_row_base; \
+            unsigned int gr  = cta_m + row; \
+            unsigned int gc  = (kb) + a_col; \
+            (ra)[rnd] = ((gr < M) && (gc + 7 < K)) \
+                ? *(const uint4*)&A[(unsigned long long)gr * K + gc] \
+                : uint4{0, 0, 0, 0}; \
+        } \
+        { \
+            unsigned int gke = (kb) + (b_kp << 1); \
+            unsigned int gns = cta_n + b_ns; \
+            (rb) = ((gke + 1 <= K) && (gns + 15 < N)) \
+                ? *(const uint4*)&B_packed[(unsigned long long)(gke >> 1) * N + gns] \
+                : uint4{0, 0, 0, 0}; \
+            unsigned int sg = (kb) / F16_GROUP + (b_kp >> 3); \
+            (rs) = (gns + 15 < N) \
+                ? *(const uint4*)&B_scale[(unsigned long long)sg * N + gns] \
+                : uint4{0, 0, 0, 0}; \
+        } \
+    } while (0)
+
+    // Column j of a 4-column group: word = [0x00, HL_j, 0x00, HH_j] = (f16 even k,
+    // f16 odd k) of e2m1, then one packed multiply by (s_j, s_j) — exact.
+    #define F16_STORE_TILE(buf, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int rnd = 0; rnd < 4; rnd++) { \
+            unsigned int row = (unsigned int)(rnd * 32) + a_row_base; \
+            *(uint4*)&smem_A[(buf)][row][a_col] = A_BF16 ? bf16x8_to_f16x8((ra)[rnd]) : (ra)[rnd]; \
+        } \
+        { \
+            const unsigned int* pw = (const unsigned int*)&(rb); \
+            const unsigned int* ps = (const unsigned int*)&(rs); \
+            _Pragma("unroll") \
+            for (int d = 0; d < 4; d++) { \
+                const unsigned int hl = e2m1x4_f16hi(pw[d] & 0x0F0F0F0Fu); \
+                const unsigned int hh = e2m1x4_f16hi((pw[d] >> 4) & 0x0F0F0F0Fu); \
+                const v2h s01 = e4m3x2_f16(ps[d] & 0xFFFFu); \
+                const v2h s23 = e4m3x2_f16(ps[d] >> 16); \
+                _Pragma("unroll") \
+                for (int j = 0; j < 4; j++) { \
+                    const unsigned int sel = 0x0Cu | ((unsigned)j << 8) | (0x0Cu << 16) | ((4u + j) << 24); \
+                    const unsigned int wb = __builtin_amdgcn_perm(hh, hl, sel); \
+                    v2h w; __builtin_memcpy(&w, &wb, 4); \
+                    const _Float16 s = (j == 0) ? s01.x : (j == 1) ? s01.y : (j == 2) ? s23.x : s23.y; \
+                    w = w * (v2h){s, s}; \
+                    *(v2h*)&smem_B[(buf)][F16_B_OFF(b_ns + d * 4 + j) + b_kp * 2] = w; \
+                } \
+            } \
+        } \
+    } while (0)
+
+    #define F16_COMPUTE(buf) do { \
+        _Pragma("unroll") \
+        for (int ch = 0; ch < 2; ch++) { \
+            v8f* acc = ch ? acc1 : acc0; \
+            unsigned int m_row = ch * F16_M_TILE + warp_m_offset + (lane_id & 15); \
+            _Pragma("unroll") \
+            for (int h = 0; h < 2; h++) { \
+                v16h a; \
+                __builtin_memcpy(&a, &smem_A[(buf)][m_row][h * 16], 32); \
+                _Pragma("unroll") \
+                for (int nb = 0; nb < 8; nb++) { \
+                    unsigned int nc = nb * 16 + (lane_id & 15); \
+                    v16h b; \
+                    __builtin_memcpy(&b, &smem_B[(buf)][F16_B_OFF(nc) + h * 16], 32); \
+                    acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[nb]); \
+                } \
+            } \
+        } \
+    } while (0)
+
+    uint4 reg_A[4], reg_Bp, reg_Bs;
+    F16_LOAD_REGS(0, reg_A, reg_Bp, reg_Bs);
+    F16_STORE_TILE(0, reg_A, reg_Bp, reg_Bs);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = F16_K_STEP; k_base < K; k_base += F16_K_STEP) {
+        int nxt = 1 - cur;
+        F16_LOAD_REGS(k_base, reg_A, reg_Bp, reg_Bs);
+        F16_COMPUTE(cur);
+        F16_STORE_TILE(nxt, reg_A, reg_Bp, reg_Bs);
+        __syncthreads();
+        cur = nxt;
+    }
+    F16_COMPUTE(cur);
+
+    #undef F16_LOAD_REGS
+    #undef F16_STORE_TILE
+    #undef F16_COMPUTE
+    #undef F16_B_OFF
+    #undef F16_B_ROW
+
+    #pragma unroll
+    for (int ch = 0; ch < 2; ch++) {
+        v8f* acc = ch ? acc1 : acc0;
+        #pragma unroll
+        for (int nb = 0; nb < 8; nb++)
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                unsigned int r = cta_m + ch * F16_M_TILE + warp_m_offset + 2 * e + (lane_id >> 4);
+                unsigned int c = cta_n + nb * 16 + (lane_id & 15);
+                if (r < M && c < N) C[(unsigned long long)r * N + c] = __float2bfloat16(acc[nb][e] * scale2);
+            }
+    }
+}
+
+
+// Drop-in twin of w4a16_gemm_t_m128: SAME signature (bf16 A), f16 operands inside.
+extern "C" __global__ __launch_bounds__(128, 3)
+void w4a16_gemm_t_m128_f16a(const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K) {
+    w4a16_m128_f16_body<true>((const unsigned short*)A, B_packed, B_scale, scale2, C, M, N, K);
 }
