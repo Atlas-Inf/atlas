@@ -217,14 +217,10 @@ impl TransformerModel {
             } else if self.dense_gemv_bf16_batch2_kernel.0 != 0
                 && super::trait_impl::lm_head_batch_gemv_enabled()
             {
-                // BF16 LM head, one weight pass for both verify tokens.
-                // Qwen3.8-Flash-Next ships its [248320, 2560] LM head BF16, so
-                // the two-GEMV fallback below read 1.27 GB twice per MTP
-                // verify step: 2 x 5.87 ms of a 111 ms step on gfx1151
-                // (ATLAS_TRACE_LAUNCH_SYNC, winbox 2026-10-02). Bit-identical
-                // to that fallback; see the handle's lookup.
-                // `ATLAS_NO_LM_HEAD_BATCH_GEMV=1` turns it off with the other
-                // batched-GEMV LM-head arms (A/B attribution).
+                // One BF16 weight pass for both verify tokens (Flash-Next ships a
+                // BF16 [248320, 2560] head: the fallback read 1.27 GB twice per
+                // step). Bit-identical to it on HIP, see the handle's lookup.
+                // Off with ATLAS_NO_LM_HEAD_BATCH_GEMV=1 like the other arms.
                 ops::dense_gemv_batch2(
                     self.gpu.as_ref(),
                     self.dense_gemv_bf16_batch2_kernel,
