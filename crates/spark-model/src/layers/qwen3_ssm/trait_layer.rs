@@ -100,11 +100,11 @@ impl TransformerLayer for Qwen3SsmLayer {
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
-    ) -> Result<()> {
+    ) -> Result<Vec<DevicePtr>> {
         if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_for_prefill_unified(gpu, config)?;
+            return moe.transpose_for_prefill_unified(gpu, config);
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     fn transpose_moe_for_prefill_hybrid(

@@ -37,6 +37,9 @@ pub struct MockGpuBackend {
     host_pinned_allocs: AtomicUsize,
     /// Pending `free` failure injections (see [`Self::fail_next_free`]).
     pending_free_failures: AtomicUsize,
+    /// `free` calls on a pointer that is not the base of a live allocation
+    /// (see [`Self::invalid_free_count`]).
+    invalid_frees: AtomicUsize,
     /// `destroy_graph` call counter (see [`Self::destroy_graph_count`]).
     destroyed_graphs: AtomicUsize,
 }
@@ -68,6 +71,7 @@ impl MockGpuBackend {
             d2d_2d: AtomicUsize::new(0),
             host_pinned_allocs: AtomicUsize::new(0),
             pending_free_failures: AtomicUsize::new(0),
+            invalid_frees: AtomicUsize::new(0),
             destroyed_graphs: AtomicUsize::new(0),
         }
     }
@@ -85,6 +89,15 @@ impl MockGpuBackend {
     pub fn destroy_graph_count(&self) -> usize {
         self.destroyed_graphs
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `free` calls whose pointer was not the base of a live allocation: a
+    /// double free, or an offset view into a block. The real backend rejects
+    /// both with `CUDA_ERROR_INVALID_VALUE` and puts the pointer back on its
+    /// cleanup ledger; the mock accepts them silently, so this counter is how
+    /// a teardown test sees them.
+    pub fn invalid_free_count(&self) -> usize {
+        self.invalid_frees.load(Ordering::Relaxed)
     }
 
     pub fn alloc_count(&self) -> usize {
@@ -229,7 +242,9 @@ impl GpuBackend for MockGpuBackend {
         {
             anyhow::bail!("mock free failed (injected): ptr {ptr}");
         }
-        self.allocs.lock().remove(&ptr.0);
+        if self.allocs.lock().remove(&ptr.0).is_none() && !ptr.is_null() {
+            self.invalid_frees.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 

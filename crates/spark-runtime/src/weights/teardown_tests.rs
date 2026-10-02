@@ -44,6 +44,37 @@ fn releasing_twice_is_harmless() {
     assert_eq!(gpu.alloc_count(), 0);
 }
 
+/// #122: the unified MoE transpose frees store tensors behind the store's
+/// back. Once they are marked, release must free only the rest — no double
+/// free, which the real backend rejects with status 1 and re-ledgers.
+#[test]
+fn tensors_freed_elsewhere_are_not_freed_again() {
+    let gpu = MockGpuBackend::new();
+    let mut store = store_with(&gpu, 6);
+    let gone: Vec<DevicePtr> = ["w0", "w3", "w5"]
+        .iter()
+        .map(|n| store.get(n).expect("present").ptr)
+        .collect();
+    for p in &gone {
+        gpu.free(*p).expect("freed by the other owner");
+    }
+    store.mark_freed_elsewhere(&gone).expect("marked");
+    store.release(&gpu).expect("released");
+    assert_eq!(gpu.invalid_free_count(), 0, "no tensor was freed twice");
+    assert_eq!(gpu.alloc_count(), 0, "and the unmarked ones were freed");
+}
+
+/// The control for the test above: without the mark, release double-frees.
+#[test]
+fn unmarked_external_free_is_a_double_free() {
+    let gpu = MockGpuBackend::new();
+    let mut store = store_with(&gpu, 2);
+    gpu.free(store.get("w1").expect("present").ptr)
+        .expect("freed");
+    store.release(&gpu).expect("released");
+    assert_eq!(gpu.invalid_free_count(), 1);
+}
+
 /// `fp8_kv_scale_count` counts exactly the `*.k_scale` tensors — one per
 /// attention layer in checkpoints that ship calibrated FP8 KV scales —
 /// and ignores `v_scale` (paired 1:1 with `k_scale`, counting both would
