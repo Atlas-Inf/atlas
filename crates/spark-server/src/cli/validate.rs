@@ -251,6 +251,23 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         ));
     }
 
+    // ── Reference mode locks thinking to the client's request. ──
+    if args.reference_mode && args.disable_thinking {
+        v.push(Violation::new(
+            "--reference-mode is set together with --disable-thinking.",
+            "reference mode serves the client's thinking flags unchanged; \
+             --disable-thinking forces reasoning off for every request.",
+            "drop --disable-thinking (the client decides thinking in reference mode).",
+        ));
+    }
+    if args.reference_mode && args.max_thinking_budget.is_some() {
+        v.push(Violation::new(
+            "--reference-mode is set together with --max-thinking-budget.",
+            "reference mode leaves the client's max_tokens as the only cap on reasoning.",
+            "drop --max-thinking-budget.",
+        ));
+    }
+
     // ── Distributed topology sanity. ──
     if args.rank >= args.world_size {
         v.push(Violation::new(

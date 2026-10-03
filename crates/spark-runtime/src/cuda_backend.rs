@@ -73,6 +73,11 @@ unsafe extern "C" {
     // minimal and an unresolved extern would break the gfx1151 link.
     #[cfg(not(atlas_scale))]
     pub(super) fn cuStreamIsCapturing(hStream: u64, captureStatus: *mut u32) -> i32;
+    // Kernel name for a CUfunction (driver API 12.3+), used only to name the
+    // kernel in a launch-failure error. NVIDIA libcuda only: neither the SCALE
+    // libcuda nor the strix HIP shim exports it.
+    #[cfg(not(atlas_scale))]
+    pub(super) fn cuFuncGetName(name: *mut *const std::ffi::c_char, hfunc: *mut std::ffi::c_void) -> i32;
     pub(super) fn cuStreamEndCapture(hStream: u64, phGraph: *mut u64) -> i32;
     // CUDA-graph instantiate. NVIDIA's libcuda exports the 3-arg
     // `cuGraphInstantiateWithFlags`; SCALE's libcuda (gfx1151) exports only

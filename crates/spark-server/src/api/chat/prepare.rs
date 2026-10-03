@@ -66,11 +66,14 @@ pub(crate) fn prepare_chat_prompt(
     // duplicate measures +1019 tokens on a BFCL parallel prompt. Skipping the
     // injection is the only way to reach vLLM's prompt size; no config lever
     // gets below 731. See the dose-response in BENCH.toml.
-    let skip_inject = matches!(
+    let skip_inject_env = matches!(
         std::env::var("ATLAS_NO_TOOL_INJECT").as_deref(),
         Ok("1") | Ok("true")
     );
-    if skip_inject {
+    // `--reference-mode` renders only the template's tool block, as a
+    // reference server does.
+    let skip_inject = skip_inject_env || state.reference_mode;
+    if skip_inject_env {
         tracing::warn!(
             "ATLAS_NO_TOOL_INJECT=1: skipping the parser tool system prompt.              This is an experiment - the injection is load-bearing for the              hallucination category (~96 vs 30/64 without)."
         );

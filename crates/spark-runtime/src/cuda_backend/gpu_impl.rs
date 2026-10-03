@@ -169,7 +169,9 @@ impl GpuBackend for AtlasCudaBackend {
             // see `fault_probe`. This does not change control flow: the caller
             // still receives its error either way.
             super::fault_probe::note_failure("kernel launch", &e.to_string());
-            anyhow::anyhow!("Kernel launch failed: {e}")
+            // Name the kernel: under CUDA_LAUNCH_BLOCKING=1 this is the kernel
+            // that faulted, and grid/block alone do not identify it.
+            anyhow::anyhow!("Kernel launch failed ({}): {e}", kernel_name(raw_func.0))
         })
     }
 
@@ -455,4 +457,22 @@ impl GpuBackend for AtlasCudaBackend {
     fn free_host_pinned(&self, ptr: *mut u8, _bytes: usize) -> Result<()> {
         self.free_host_pinned_cu(ptr, _bytes)
     }
+}
+
+/// The kernel's name for a launch-failure message; `?` where the driver
+/// cannot say (SCALE / HIP shim builds, or an old driver).
+fn kernel_name(func: *mut c_void) -> String {
+    #[cfg(not(atlas_scale))]
+    {
+        let mut name: *const std::ffi::c_char = std::ptr::null();
+        // SAFETY: `func` is a live CUfunction handle from the registry, and the
+        // driver writes a NUL-terminated string it owns (valid for the module's
+        // lifetime) into `name`, which is only read here.
+        let rc = unsafe { super::cuFuncGetName(&mut name, func) };
+        if rc == 0 && !name.is_null() {
+            return unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
+        }
+    }
+    let _ = func;
+    "?".to_string()
 }
