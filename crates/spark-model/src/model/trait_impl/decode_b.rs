@@ -261,7 +261,18 @@ impl TransformerModel {
         let proc_start = prefill_chunk_start;
         let proc_count = n_prefill;
         let effective_seq_len_start = prefill_chunk_start;
-        let moe_scratch_bytes = proc_count * self.config.num_experts_per_tok * 4 * 2;
+        // The fused layer loop runs the DECODE portion first each layer, and its
+        // MoE routing (top-k ids + weights, `padded_n * k * 8` bytes) also lives
+        // at scratch[0..]. Sizing the guard from `proc_count` alone let a short
+        // prefill chunk's positions/slots sit inside that region: a 21-token tail
+        // mixed with 31 decodes (1,344 B vs 2,048 B) had its slots clobbered
+        // every layer, and the next `reshape_and_cache_flash` wrote K/V through
+        // garbage slots → CUDA 700, context destroyed (GB10, Qwen3.6-35B,
+        // MLPerf C=36, 2026-10-03). Chunks of >= padded_n rows were unaffected.
+        // (The opt-in ATLAS_MOE_ATOMIC_C4_DECODE arm also stages an fp32 accum
+        // in scratch and is not covered — it is a diagnostic arm.)
+        let k_bytes = self.config.num_experts_per_tok * 4 * 2;
+        let moe_scratch_bytes = proc_count.max(padded_n) * k_bytes;
         let meta_offset = (moe_scratch_bytes + 7) & !7;
         let prefill_meta_base = self.buffers.scratch().offset(meta_offset);
         let slot_offset = (proc_count * 4 + 7) & !7;
