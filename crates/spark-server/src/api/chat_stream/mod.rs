@@ -187,10 +187,16 @@ pub(crate) async fn run_chat_stream(
         .map(|p| p.leak_markers())
         .unwrap_or(tool_parser::LeakMarkers::EMPTY);
 
-    let max_tool_calls_per_response: usize = std::env::var("ATLAS_MAX_TOOL_CALLS_PER_RESPONSE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12);
+    // `--reference-mode`: no per-response tool-call cap (a reference server
+    // returns every call the model emits).
+    let max_tool_calls_per_response: usize = if state.reference_mode {
+        usize::MAX
+    } else {
+        std::env::var("ATLAS_MAX_TOOL_CALLS_PER_RESPONSE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12)
+    };
 
     // Cache the hold-back window length once. vLLM's
     // `IncrementalDetokenizer.update` uses
@@ -216,7 +222,8 @@ pub(crate) async fn run_chat_stream(
         prompt_len,
         enable_thinking,
         tool_defs_for_backfill: tool_defs,
-        cwd_for_normalize: cwd_hint,
+        // `--reference-mode`: tool-call paths are returned as generated.
+        cwd_for_normalize: if state.reference_mode { None } else { cwd_hint },
         stop_strings,
         stop_string_buffer_len,
         leak_markers,

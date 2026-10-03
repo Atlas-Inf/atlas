@@ -73,7 +73,10 @@ pub(super) fn handle_complete_tool_call(
             token_ids: state.take_ids_if(ctx.req_return_token_ids),
         });
     }
-    tool_parser::backfill_required_params(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
+    // `--reference-mode`: never invent arguments the model did not emit.
+    if !ctx.state.reference_mode {
+        tool_parser::backfill_required_params(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
+    }
     if ctx.wants_typed_arguments {
         tool_parser::coerce_all(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
     }
@@ -167,9 +170,10 @@ pub(super) fn handle_complete_tool_call(
                 });
             }
         }
-    } else if state
-        .tool_arg_dedup
-        .check(&tc.function.name, &tc.function.arguments)
+    } else if !ctx.state.reference_mode
+        && state
+            .tool_arg_dedup
+            .check(&tc.function.name, &tc.function.arguments)
     {
         tracing::warn!(
             tool = %tc.function.name,
@@ -185,7 +189,7 @@ pub(super) fn handle_complete_tool_call(
         // runaway loops in the complete-tool-call path that
         // tool_arg_dedup misses because of args drift.
         let run_len = advance_name_run(&mut state.name_run, &tc.function.name);
-        if run_len >= MAX_CONSEC_SAME_NAME_CALLS {
+        if run_len >= MAX_CONSEC_SAME_NAME_CALLS && !ctx.state.reference_mode {
             tracing::warn!(
                 tool = %tc.function.name,
                 run = run_len,
@@ -475,9 +479,10 @@ fn advance_name_run(name_run: &mut Option<(String, u32)>, name: &str) -> u32 {
 /// are still caught earlier by the F11 within-response dedup.
 const MAX_CONSEC_SAME_NAME_CALLS: u32 = 8;
 
-pub(super) fn handle_tool_call_end(state: &mut StreamState, _ctx: &StreamCtx, idx: usize) {
+pub(super) fn handle_tool_call_end(state: &mut StreamState, ctx: &StreamCtx, idx: usize) {
     if let Some((name, args_json)) = state.streaming_tool_args.remove(&idx) {
-        if state.tool_arg_dedup_within.check(&name, &args_json) {
+        let reference = ctx.state.reference_mode;
+        if !reference && state.tool_arg_dedup_within.check(&name, &args_json) {
             tracing::warn!(
                 tool = %name,
                 "F11 within-response dedup tripped: 2+ identical streaming tool calls; ending response"
@@ -486,7 +491,7 @@ pub(super) fn handle_tool_call_end(state: &mut StreamState, _ctx: &StreamCtx, id
             state.tool_loop_capped = true;
         }
         let run_len = advance_name_run(&mut state.name_run, &name);
-        if run_len >= MAX_CONSEC_SAME_NAME_CALLS && !state.stop_string_triggered {
+        if run_len >= MAX_CONSEC_SAME_NAME_CALLS && !state.stop_string_triggered && !reference {
             tracing::warn!(
                 tool = %name,
                 run = run_len,
