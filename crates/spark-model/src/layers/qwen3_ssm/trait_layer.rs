@@ -385,6 +385,12 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.ple.is_some()
     }
 
+    /// The single-row decode prestages PLE's host half (`decode_prestage`),
+    /// so its forward is capture-safe; lifted only under ATLAS_EXL3_PLE_GRAPHS=1.
+    fn single_decode_graph_unsupported(&self) -> bool {
+        self.ple.is_some() && !crate::layers::ple::ple_graphs_enabled()
+    }
+
     fn snapshot_aux(
         &self,
         state: &dyn LayerState,

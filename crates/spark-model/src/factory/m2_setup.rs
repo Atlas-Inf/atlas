@@ -31,6 +31,16 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     if config.num_experts == 0 {
         return Ok(());
     }
+    // Packed EXL3 experts have no NVFP4 [N, K/2] copy. Every tier below
+    // would allocate a transposed NVFP4 set, which is a second copy of all
+    // experts and the dequant-requant this path refuses.
+    let packed = crate::weight_map::exl3::moe_pack::exl3_moe_pack_count();
+    if packed > 0 {
+        tracing::info!(
+            "MoE transpose: {packed} MoE block(s) are packed EXL3; skipping the NVFP4 prefill transpose"
+        );
+        return Ok(());
+    }
     // Escape hatch only, matching `moe_prefill_copies_fit`'s
     // ATLAS_MOE_PREFILL_COPIES=0: good behaviour is the default, and the lever
     // turns it OFF for a box under external memory pressure the free-memory

@@ -49,6 +49,11 @@ use crate::scheduler::logit_processors::LogitsContext;
 use crate::scheduler::mtp_timing::Phase;
 use spark_model::traits::Model;
 
+fn mtp_fast_masked_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_MTP_FAST_MASKED").as_deref() == Ok("1"))
+}
+
 pub(super) fn masked_verify_required(configured: bool, lightning_product: bool) -> bool {
     configured || lightning_product
 }
@@ -76,7 +81,14 @@ pub(super) fn try_chat_fast_path(
     // vs an unpatched binary (think block identical, answer flips at
     // low-margin tokens). MTP keeps the slow path unconditionally so
     // its behavior is byte-invariant by construction.
-    if !masked_verify {
+    //
+    // ATLAS_MTP_FAST_MASKED=1 re-admits MTP: the tie-break mismatch above was
+    // fixed in argmax_bf16 (2026-09-16, lowest index wins on both sides), and
+    // the greedy-only guard below keeps temp>0 sampling on the slow path.
+    if !masked_verify && !mtp_fast_masked_env() {
+        return None;
+    }
+    if !masked_verify && a.temperature != 0.0 && !ctx.sampling.force_temp_zero {
         return None;
     }
     let fast_masked_enabled = ctx.sampling.fast_masked;

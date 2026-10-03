@@ -605,6 +605,7 @@ impl Qwen3AttentionLayer {
         // scratch — which, through an identity block table, IS a valid paged
         // cache for the standard decode attention below. Runs AFTER
         // write_kv_cache so the current token is gatherable.
+        let mut qsa_dev_done = false;
         let qsa_sel = if let Some(ref qsa) = self.qsa {
             anyhow::ensure!(
                 matches!(self.kv_dtype.kv_pair().0, KvCacheDtype::Bf16)
@@ -624,17 +625,51 @@ impl Qwen3AttentionLayer {
             // keys already ingested by prefill.
             let qsa_st =
                 crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
-            qsa.decode_select(
-                qsa_st,
-                normed,
-                seq_len,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
-                meta.block_table,
-                bs as u32,
-                ctx.gpu,
-                stream,
-            )?
+            if qsa.dev_enabled() && !use_orchestrator {
+                // Device arm: ingest + select + attend, straight into attn_out.
+                let a = crate::layers::qsa::QsaDevAttn {
+                    q: q_out,
+                    q_stride: nq * hd,
+                    out: attn_out,
+                    k_pool: kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    v_pool: kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    block_table: meta.block_table,
+                    max_blocks_per_seq: meta.max_blocks_per_seq,
+                    nq,
+                    nkv,
+                    block_size: bs as u32,
+                    inv_sqrt_d,
+                };
+                let hb = h as usize * 2;
+                qsa.dev_decode_rows(
+                    qsa_st,
+                    normed,
+                    hb,
+                    seq_len,
+                    1,
+                    meta.positions,
+                    &a,
+                    ctx.gpu,
+                    stream,
+                )?;
+                qsa_dev_done = true;
+                None
+            } else if ctx.graph_capture && self.qsa_decode_graph_ok() {
+                // ATLAS_EXL3_PLE_GRAPHS: position read on device, always dense.
+                qsa.decode_ingest_graph(qsa_st, normed, seq_len, meta.positions, ctx.gpu, stream)?
+            } else {
+                qsa.decode_select(
+                    qsa_st,
+                    normed,
+                    seq_len,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    meta.block_table,
+                    bs as u32,
+                    ctx.gpu,
+                    stream,
+                )?
+            }
         } else {
             None
         };
@@ -693,7 +728,7 @@ impl Qwen3AttentionLayer {
                 0,
                 stream,
             )?;
-        } else {
+        } else if !qsa_dev_done {
             self.run_paged_decode(
                 ctx.gpu,
                 q_out,

@@ -89,6 +89,8 @@ pub struct PleLayer {
     /// `release_prev_pins` waits on THAT kernel instead of the whole stream.
     /// 0 until lazily created; 0 falls back to a full stream sync.
     gather_done: std::sync::Mutex<u64>,
+    /// The last gather ran in a graph step (no event recorded behind it).
+    gather_in_graph: std::sync::atomic::AtomicBool,
     /// Pinned staging for the slot upload: (host pointer as usize, capacity
     /// in bytes). (0, 0) until the first `Cached` gather grows it.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -179,6 +181,7 @@ impl PleLayer {
             max_tokens,
             scratch_tokens: w,
             gather_done: std::sync::Mutex::new(0),
+            gather_in_graph: std::sync::atomic::AtomicBool::new(false),
             slots_staging: std::sync::Mutex::new((0, 0)),
         })
     }
@@ -295,7 +298,7 @@ impl PleLayer {
             // The host half already ran from `decode_prestage`, before graph
             // replay/capture: slots sit in `slots_dev`, history has advanced.
             // Only the capture-safe kernel half remains.
-            self.gather_embed(table_va, num_tokens, heads, gpu, stream)?;
+            self.gather_embed(table_va, num_tokens, heads, ctx.graph_capture, gpu, stream)?;
         } else {
             anyhow::ensure!(
                 !ctx.graph_capture,
