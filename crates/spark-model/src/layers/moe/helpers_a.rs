@@ -57,6 +57,18 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         include_down: bool,
     ) -> Result<()> {
+        // Packed EXL3 experts have no NVFP4 [N, K/2] copy to transpose, and
+        // building one would be the dequant-requant this path refuses. The
+        // decode/prefill for these layers reconstructs the selected experts
+        // (interim) or runs CoopMK; the K-major grouped GEMM does not apply.
+        if crate::weight_map::exl3::moe_pack::exl3_moe_registered(
+            self.weights.shared_expert_gate.weight.0,
+        ) {
+            tracing::info!(
+                "MoE transpose: layer is packed EXL3 — skipping the NVFP4 prefill transpose"
+            );
+            return Ok(());
+        }
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
         let shared_inter = config.shared_expert_intermediate_size;
@@ -189,6 +201,14 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         keep_originals: bool,
     ) -> Result<()> {
+        // Packed EXL3 experts: nothing NVFP4 to transpose, and allocating the
+        // transposed set would be a second copy of every expert.
+        if crate::weight_map::exl3::moe_pack::exl3_moe_registered(
+            self.weights.shared_expert_gate.weight.0,
+        ) {
+            tracing::debug!("MoE unified/hybrid transpose: packed EXL3 layer, skipped");
+            return Ok(());
+        }
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
         let shared_inter = config.shared_expert_intermediate_size;

@@ -104,12 +104,15 @@ impl TransformerLayer for Qwen3AttentionLayer {
             .map(|cal| !cal.is_calibrating())
     }
 
-    /// An indexer vetoes decode-graph capture: its ingest counter is host
-    /// state, its launch parameters depend on the position, the default top-k
-    /// arm sorts on the host — and a graph captured on the dense path would
-    /// replay wrong attention once selection activates.
+    // Indexer graph vetoes: see `helpers::qsa_decode_graph_ok`.
     fn decode_graph_unsupported(&self) -> bool {
         self.qsa.is_some()
+    }
+    fn single_decode_graph_unsupported(&self) -> bool {
+        !self.qsa_decode_graph_ok()
+    }
+    fn decode_graph_replayed(&self, state: &mut dyn LayerState, pos: usize) {
+        self.qsa_graph_replayed(state, pos);
     }
 
     fn has_aux_state(&self) -> bool {

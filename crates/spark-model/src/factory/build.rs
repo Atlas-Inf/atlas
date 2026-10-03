@@ -127,8 +127,8 @@ pub fn build_model(
     // readable by them.
     crate::quant_format::ensure_not_exl3(&config, "build_model")?;
 
-    // EXL3: dense linears become BF16 `.weight` tensors here; routed and shared
-    // experts stay packed and are requantized one by one in `quantized_any`.
+    // EXL3: dense linears become BF16 `.weight` tensors here. Routed and
+    // shared experts stay packed Exl3Weight (no NVFP4 requant).
     let mut store = store;
     if config
         .quantization_config

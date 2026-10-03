@@ -475,6 +475,11 @@ jobs:
             # 501 LoC (was 499) -- paged QKV prefill; +2 lines from the
             # Nemotron-H-Puzzle/Mamba work (#281 content) carried in the stack.
             "crates/spark-model/src/layers/qwen3_attention/prefill/paged_qkv.rs"
+            # -- PR #160 (Qwen3.8-Flash-Next EXL3 M5 Native MoE) carry-overs --
+            "crates/spark-model/src/layers/moe/forward_exl3.rs"
+            "crates/spark-model/src/layers/moe/forward_exl3_grouped.rs"
+            "crates/spark-model/src/layers/ops/exl3_coopmk.rs"
+            "crates/spark-model/src/layers/ops/exl3_dense.rs"
           )
 
           violations=0

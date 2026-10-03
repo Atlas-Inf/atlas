@@ -145,7 +145,7 @@ fn real_tensors() -> Vec<Tensor> {
             .collect()
     };
     let mut out = Vec::new();
-    for i in 0..4 {
+    for i in 0..64 {
         let Some((tr, tr_dims, tr_dt)) = tensor(&format!("t{i}.trellis")) else {
             continue;
         };
@@ -331,3 +331,7 @@ fn dense_bf16_nk_matches_cpu_reconstruct() {
 // sibling file to keep each file under the 500-line cap.
 #[path = "exl3_gpu_linear_tests.rs"]
 mod linear;
+
+// Native batch-1 GEMV on the packed trellis (exl3_dense / exl3_gemv.cu).
+#[path = "exl3_gpu_gemv_tests.rs"]
+mod gemv;
