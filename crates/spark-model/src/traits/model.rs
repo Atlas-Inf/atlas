@@ -84,15 +84,13 @@ pub struct BeamReq {
 /// `upload_batch_metadata_fixed` ensures `padded_n <= rows`. Rungs above the
 /// boot's `max_batch_size` are unreachable (the scheduler admits at most
 /// `max_batch_size` active sequences), so every bs<=32 boot never pads past
-/// 32 — byte-identical by construction. Rungs <=32 unchanged.
+/// 32 — byte-identical by construction. Rungs <=32 unchanged. The layout
+/// rounds `max_batch_size` UP to its rung (`DecodeMetaLayout`), since a
+/// non-rung width (36) still pads its widest batch to the next rung (48).
 /// Above 128 the fall-through behaviour is unchanged (guarded downstream).
 #[inline]
 pub fn padded_batch_n(n: usize) -> usize {
-    [2usize, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
-        .iter()
-        .copied()
-        .find(|&s| s >= n)
-        .unwrap_or(n)
+    spark_runtime::buffers::padded_batch_rung(n)
 }
 
 pub trait Model: Send + Sync {
