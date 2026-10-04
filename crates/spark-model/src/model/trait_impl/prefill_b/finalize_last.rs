@@ -282,7 +282,7 @@ impl TransformerModel {
         // below inserts the grid-floored prefix without a snapshot.
         let grid = self.prefill_grid();
         if grid > 0 {
-            let grid_blocks = spark_runtime::prefill_grid::grid_floor(tokens.len(), grid) / bs;
+            let grid_blocks = spark_runtime::prefill_grid::cuts().floor(tokens.len()) / bs;
             cache_blocks = cache_blocks.min(grid_blocks);
             cap_applied = true;
         }

@@ -68,7 +68,7 @@ impl TransformerModel {
                 // pass are layout-dependent) and save no finish-leaf snapshot.
                 let grid = self.prefill_grid();
                 if grid > 0 {
-                    let n = spark_runtime::prefill_grid::grid_floor(seq.prompt_len, grid)
+                    let n = spark_runtime::prefill_grid::cuts().floor(seq.prompt_len)
                         .min(seq.tokens.len());
                     let nb = (n / bs).min(seq.block_table.len());
                     if nb > 0 {

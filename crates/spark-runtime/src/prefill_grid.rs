@@ -17,10 +17,17 @@
 //! cache, so a warm replay from grid point `g` runs exactly the passes a
 //! cold run runs from `g`.
 //!
-//! `ATLAS_PREFILL_GRID=0` restores the old layout (tail split, leaf /
-//! decode / finish-leaf snapshots). Default 2048 tokens. The grid must be a
-//! multiple of 64 (GDN sub-chunk, KV block) and should divide
-//! `--max-prefill-tokens` so scheduler chunk ends land on grid points.
+//! The cut set is `{k*G} ∪ {k*F : k*F < G}`: a coarse grid `G` plus an
+//! optional fine grid `F` below the first coarse point, so short prompts
+//! (agent tool preambles) still get reuse anchors. Any FIXED cut set works:
+//! warm from cut `a` runs the passes between consecutive cuts above `a`,
+//! exactly as a cold run does.
+//!
+//! `ATLAS_PREFILL_GRID` = G (default 4096; 0 restores the old layout: tail
+//! split, leaf / decode / finish-leaf snapshots). `ATLAS_PREFILL_GRID_FINE`
+//! = F (default 0 = none). Both must be multiples of 64 (GDN sub-chunk, KV
+//! block), F must divide G, and G should divide `--max-prefill-tokens` so
+//! scheduler chunk ends land on cut points.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,65 +45,106 @@ pub fn subblock_disabled() -> bool {
     SUBBLOCK_OFF.load(Ordering::Relaxed)
 }
 
-/// Default grid in tokens.
-pub const DEFAULT_PREFILL_GRID: usize = 2048;
+/// Default coarse grid in tokens.
+pub const DEFAULT_PREFILL_GRID: usize = 4096;
 
-/// The active grid (tokens), or 0 when the grid is off. Read once.
-pub fn prefill_grid() -> usize {
-    static G: OnceLock<usize> = OnceLock::new();
-    *G.get_or_init(|| {
-        parse_grid(std::env::var("ATLAS_PREFILL_GRID").ok().as_deref())
-    })
+/// A fixed cut set: multiples of `g`, plus multiples of `f` below `g`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cuts {
+    pub g: usize,
+    pub f: usize,
 }
 
-/// Parse the env value: unset -> default, "0" -> off, otherwise a positive
-/// multiple of 64 (anything else falls back to the default).
-pub fn parse_grid(v: Option<&str>) -> usize {
+impl Cuts {
+    pub fn new(g: usize, f: usize) -> Self {
+        // A fine grid that does not divide the coarse one is ignored.
+        let f = if g > 0 && f > 0 && f < g && g % f == 0 { f } else { 0 };
+        Cuts { g, f }
+    }
+    pub fn is_on(&self) -> bool {
+        self.g > 0
+    }
+    pub fn is_cut(&self, p: usize) -> bool {
+        self.g > 0 && p > 0 && (p % self.g == 0 || (self.f > 0 && p < self.g && p % self.f == 0))
+    }
+    /// Smallest cut strictly greater than `p`.
+    pub fn next_after(&self, p: usize) -> usize {
+        if self.f > 0 && p < self.g {
+            ((p / self.f + 1) * self.f).min(self.g)
+        } else {
+            (p / self.g + 1) * self.g
+        }
+    }
+    /// Largest cut `<= n` (0 when none or off).
+    pub fn floor(&self, n: usize) -> usize {
+        if self.g == 0 {
+            return 0;
+        }
+        if n >= self.g {
+            return (n / self.g) * self.g;
+        }
+        if self.f > 0 { (n / self.f) * self.f } else { 0 }
+    }
+    /// First cut strictly inside `(start, end)`.
+    pub fn cut(&self, start: usize, end: usize) -> Option<usize> {
+        if self.g == 0 || end <= start {
+            return None;
+        }
+        let c = self.next_after(start);
+        (c < end).then_some(c)
+    }
+    /// Passes `[s, e)` covering `[start, end)`.
+    pub fn layout(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut s = start;
+        while s < end {
+            let e = self.cut(s, end).unwrap_or(end);
+            out.push((s, e));
+            s = e;
+        }
+        out
+    }
+    /// Save an SSM checkpoint at a pass ending at `end` of a `total`-token
+    /// prompt: one of the last two cuts strictly below the prompt end.
+    pub fn is_checkpoint(&self, end: usize, total: usize) -> bool {
+        if !self.is_cut(end) || end >= total {
+            return false;
+        }
+        let last = self.floor(total - 1);
+        end == last || (last > 0 && end == self.floor(last - 1))
+    }
+}
+
+fn parse_size(v: Option<&str>, default: usize) -> usize {
     match v {
-        None => DEFAULT_PREFILL_GRID,
+        None => default,
         Some(s) => match s.trim().parse::<usize>() {
             Ok(0) => 0,
             Ok(g) if g % 64 == 0 => g,
-            _ => DEFAULT_PREFILL_GRID,
+            _ => default,
         },
     }
 }
 
-/// Largest multiple of `grid` that is `<= n` (0 when `grid == 0`).
-pub fn grid_floor(n: usize, grid: usize) -> usize {
-    if grid == 0 { 0 } else { (n / grid) * grid }
+/// Parse `ATLAS_PREFILL_GRID`: unset -> default, "0" -> off.
+pub fn parse_grid(v: Option<&str>) -> usize {
+    parse_size(v, DEFAULT_PREFILL_GRID)
 }
 
-/// First grid point strictly inside `(start, end)`, if any.
-pub fn grid_cut(start: usize, end: usize, grid: usize) -> Option<usize> {
-    if grid == 0 || end <= start {
-        return None;
-    }
-    let c = (start / grid + 1) * grid;
-    (c < end).then_some(c)
+/// The active cut set (read once from the environment).
+pub fn cuts() -> Cuts {
+    static C: OnceLock<Cuts> = OnceLock::new();
+    *C.get_or_init(|| {
+        Cuts::new(
+            parse_grid(std::env::var("ATLAS_PREFILL_GRID").ok().as_deref()),
+            parse_size(std::env::var("ATLAS_PREFILL_GRID_FINE").ok().as_deref(), 0),
+        )
+    })
 }
 
-/// The passes `[s, e)` that cover `[start, end)` under the grid.
-pub fn pass_layout(start: usize, end: usize, grid: usize) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut s = start;
-    while s < end {
-        let e = grid_cut(s, end, grid).unwrap_or(end);
-        out.push((s, e));
-        s = e;
-    }
-    out
-}
-
-/// Whether a pass ending at `end_token` of a `total`-token prompt should
-/// save an SSM checkpoint: a grid point, strictly below the prompt end, and
-/// one of the last two grid points below it (the anchors a next turn needs).
-pub fn is_grid_checkpoint(end_token: usize, total: usize, grid: usize) -> bool {
-    if grid == 0 || end_token == 0 || end_token >= total || end_token % grid != 0 {
-        return false;
-    }
-    let last = grid_floor(total - 1, grid);
-    end_token == last || end_token + grid == last
+/// The active coarse grid (tokens), or 0 when the grid is off.
+pub fn prefill_grid() -> usize {
+    cuts().g
 }
 
 #[cfg(test)]
@@ -109,70 +157,86 @@ mod tests {
         assert_eq!(parse_grid(Some("0")), 0);
         assert_eq!(parse_grid(Some("1024")), 1024);
         assert_eq!(parse_grid(Some("100")), DEFAULT_PREFILL_GRID);
-        assert_eq!(parse_grid(Some("x")), DEFAULT_PREFILL_GRID);
+        assert_eq!(Cuts::new(4096, 1000).f, 0);
+        assert_eq!(Cuts::new(4096, 1024).f, 1024);
     }
 
     #[test]
     fn cut_and_floor() {
-        assert_eq!(grid_cut(0, 1081, 1024), Some(1024));
-        assert_eq!(grid_cut(1024, 1081, 1024), None);
-        assert_eq!(grid_cut(0, 1024, 1024), None);
-        assert_eq!(grid_cut(5, 10, 0), None);
-        assert_eq!(grid_floor(2047, 1024), 1024);
-        assert_eq!(grid_floor(5, 0), 0);
+        let c = Cuts::new(1024, 0);
+        assert_eq!(c.cut(0, 1081), Some(1024));
+        assert_eq!(c.cut(1024, 1081), None);
+        assert_eq!(c.floor(2047), 1024);
+        assert_eq!(c.floor(1000), 0);
+        let c = Cuts::new(4096, 1024);
+        assert_eq!(c.cut(0, 1081), Some(1024));
+        assert_eq!(c.cut(3072, 5000), Some(4096));
+        assert_eq!(c.cut(4096, 9000), Some(8192));
+        assert_eq!(c.floor(1081), 1024);
+        assert_eq!(c.floor(4095), 3072);
+        assert_eq!(c.floor(5000), 4096);
+        assert_eq!(Cuts::new(0, 0).cut(5, 10), None);
     }
 
-    /// Cold layout from 0 restricted to `[g, n)` equals the warm layout from
-    /// any grid point g, for many prompt lengths and grids. Also holds when
-    /// the cold run is first cut into scheduler chunks that are multiples of
-    /// the grid.
+    /// Proof obligation as a test: for every cut set, the cold layout from 0
+    /// restricted to `[a, n)` equals the warm layout from any cut `a < n`,
+    /// also when the cold run is first split into 8192-token scheduler chunks.
+    /// Every pass ends at a cut or at `n`.
     #[test]
     fn warm_layout_equals_cold_suffix() {
-        for &grid in &[64usize, 1024, 2048, 4096] {
-            for n in [1usize, 63, 64, 65, 1081, 1146, 2048, 2049, 8192, 8193, 30001] {
-                let cold = pass_layout(0, n, grid);
-                // Scheduler chunks of 8192 (a multiple of every grid here).
+        for c in [
+            Cuts::new(64, 0),
+            Cuts::new(1024, 0),
+            Cuts::new(2048, 0),
+            Cuts::new(4096, 0),
+            Cuts::new(4096, 512),
+            Cuts::new(4096, 1024),
+            Cuts::new(8192, 1024),
+        ] {
+            for n in [1usize, 63, 64, 65, 1081, 1146, 2048, 2049, 4095, 4097, 8192, 8193, 30001, 100_003] {
+                let cold = c.layout(0, n);
                 let mut chunked = Vec::new();
                 let mut s = 0;
                 while s < n {
                     let e = (s + 8192).min(n);
-                    chunked.extend(pass_layout(s, e, grid));
+                    chunked.extend(c.layout(s, e));
                     s = e;
                 }
-                assert_eq!(cold, chunked, "grid {grid} n {n}");
-                let mut g = grid;
-                while g < n {
-                    let warm = pass_layout(g, n, grid);
-                    let suffix: Vec<_> = cold.iter().copied().filter(|p| p.0 >= g).collect();
-                    assert_eq!(warm, suffix, "grid {grid} n {n} g {g}");
-                    g += grid;
+                assert_eq!(cold, chunked, "{c:?} n {n}");
+                let mut a = c.next_after(0);
+                while a < n {
+                    let warm = c.layout(a, n);
+                    let suffix: Vec<_> = cold.iter().copied().filter(|p| p.0 >= a).collect();
+                    assert_eq!(warm, suffix, "{c:?} n {n} a {a}");
+                    a = c.next_after(a);
                 }
                 for p in &cold {
-                    assert!(p.1 == n || p.1 % grid == 0);
-                    assert!(p.1 - p.0 <= grid);
+                    assert!(p.1 == n || c.is_cut(p.1), "{c:?} n {n} pass {p:?}");
                 }
             }
         }
     }
 
+    /// Checkpoints are cuts, strictly below the prompt end, and the anchor
+    /// the next turn needs (the deepest cut below the end) is always one.
     #[test]
-    fn checkpoints_are_grid_points() {
-        for &grid in &[1024usize, 2048] {
-            for n in 1..(5 * grid) {
-                for end in (0..=n).step_by(16) {
-                    if is_grid_checkpoint(end, n, grid) {
-                        assert_eq!(end % grid, 0);
-                        assert!(end < n && end > 0);
-                        assert!(end + 2 * grid > n - 1);
+    fn checkpoints_are_cuts() {
+        for c in [Cuts::new(1024, 0), Cuts::new(4096, 1024), Cuts::new(2048, 512)] {
+            for n in 2..(3 * c.g) {
+                let mut count = 0;
+                for end in 1..n {
+                    if c.is_checkpoint(end, n) {
+                        assert!(c.is_cut(end) && end < n);
+                        count += 1;
                     }
+                }
+                assert!(count <= 2);
+                let last = c.floor(n - 1);
+                if last > 0 {
+                    assert!(c.is_checkpoint(last, n), "{c:?} n {n}");
                 }
             }
         }
-        assert!(is_grid_checkpoint(1024, 1081, 1024));
-        assert!(!is_grid_checkpoint(1024, 1024, 1024));
-        assert!(is_grid_checkpoint(2048, 4000, 1024));
-        assert!(is_grid_checkpoint(3072, 4000, 1024));
-        assert!(!is_grid_checkpoint(1024, 4000, 1024));
-        assert!(!is_grid_checkpoint(1024, 4000, 0));
+        assert!(!Cuts::new(0, 0).is_checkpoint(1024, 4000));
     }
 }

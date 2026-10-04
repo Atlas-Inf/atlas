@@ -68,7 +68,7 @@ impl TransformerModel {
         // in every run, so the anchor state is layout-independent).
         let grid = self.prefill_grid();
         let wanted = if grid > 0 {
-            spark_runtime::prefill_grid::is_grid_checkpoint(end_token, tokens.len(), grid)
+            spark_runtime::prefill_grid::cuts().is_checkpoint(end_token, tokens.len())
         } else {
             is_prompt_tail || on_interval
         };

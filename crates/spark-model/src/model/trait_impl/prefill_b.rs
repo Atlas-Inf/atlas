@@ -100,7 +100,7 @@ impl TransformerModel {
         let grid = self.prefill_grid();
         if grid > 0 && !self.tokens_have_vision_pad(tokens) {
             if let Some(cut) =
-                spark_runtime::prefill_grid::grid_cut(chunk_start, chunk_start + chunk_len, grid)
+                spark_runtime::prefill_grid::cuts().cut(chunk_start, chunk_start + chunk_len)
             {
                 self.prefill_chunk_dispatch(
                     tokens,
