@@ -81,6 +81,15 @@ impl TransformerModel {
         g
     }
 
+    /// R11 fix 6: under the prefill grid a warm replay runs exactly the cold
+    /// passes, so it must use the same GDN kernels (FLA) rather than the WY4
+    /// "exact replay" path. `ATLAS_GRID_EXACT_REPLAY=1` restores the old forcing.
+    pub(super) fn grid_replay_is_cold(&self) -> bool {
+        static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.prefill_grid() > 0
+            && !*FORCE.get_or_init(|| std::env::var("ATLAS_GRID_EXACT_REPLAY").as_deref() == Ok("1"))
+    }
+
     /// Storage dtype of this sequence's SSM h-state (`ATLAS_SSM_H_FP16`).
     ///
     /// Read from the sequence's own first SSM layer state, which the decode
