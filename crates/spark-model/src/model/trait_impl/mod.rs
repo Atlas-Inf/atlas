@@ -290,6 +290,29 @@ impl Model for TransformerModel {
     fn normalize_ssm_states(&self, seq: &SequenceState, stream: u64) -> Result<()> {
         self.normalize_ssm_states_dispatch(seq, stream)
     }
+
+    fn align_prefill_chunk(&self, offset: usize, len: usize, total: usize) -> usize {
+        if self.prefill_grid() == 0
+            || offset + len >= total
+            || std::env::var("ATLAS_PREFILL_CHUNK_ALIGN").as_deref() == Ok("0")
+        {
+            return len;
+        }
+        let end = spark_runtime::prefill_grid::cuts().floor(offset + len);
+        if end > offset { end - offset } else { len }
+    }
+
+    fn normalize_after_chunk(&self, seq: &SequenceState, chunk_end: usize) -> bool {
+        // The cold run clamp-normalizes the SSM state at every scheduler chunk
+        // end. A warm run restored at `marconi_skip_to` must not normalize at
+        // chunk ends BELOW the anchor: the restored state already holds those
+        // (it was saved by a cold run that applied them), so normalizing again
+        // changes it. A chunk ending exactly at the anchor still normalizes —
+        // the snapshot there was saved before the cold run's normalize.
+        // `ATLAS_NORM_ALL_CHUNKS=1` restores the old always-normalize.
+        chunk_end >= seq.marconi_skip_to
+            || std::env::var("ATLAS_NORM_ALL_CHUNKS").as_deref() == Ok("1")
+    }
     fn bind_gpu_to_thread(&self) -> Result<()> {
         self.bind_gpu_to_thread_dispatch()
     }
