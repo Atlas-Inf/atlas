@@ -130,8 +130,11 @@ pub fn start_chunked_prefill(
 
     let request_start = Instant::now();
     let total = prompt_tokens.len();
-    let mut chunk_len = total.min(max_prefill_tokens);
+    // R11 fix 5: a non-last chunk 0 ends on the model's prefill cut grid.
+    let mut chunk_len = model.align_prefill_chunk(0, total.min(max_prefill_tokens), total);
     // ATLAS_QWEN4EXP_PREFILL_ROWINV: the next chunk starts on the GDN grid.
+    // A chunk end on the prefill cut grid is unchanged when the grid is a
+    // multiple of the granule (the shipped grids, 1024 and 4096, are).
     let g = spark_runtime::prefill_chunk_granule();
     if chunk_len < total && g > 4 && chunk_len >= g {
         chunk_len -= chunk_len % g;
