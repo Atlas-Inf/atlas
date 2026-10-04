@@ -63,6 +63,12 @@ impl MoeLayer {
         let weights_correction_bias: Option<DevicePtr> =
             weights.correction_bias.map(|dw| dw.weight);
 
+        // Resolve the gfx1151 F16-operand twins AND whether both resolved —
+        // production prefill only engages the pair (forward_prefill_routed.rs
+        // launches them via the n128 launchers when `moe_f16_prefill` holds).
+        let (moe_grouped_gemm_t, moe_fused_gate_up_t, moe_f16_prefill) =
+            crate::layers::ops::moe_f16_prefill_handles(gpu)?;
+
         let _ = num_experts;
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
         Ok(Self {
@@ -137,10 +143,11 @@ impl MoeLayer {
             moe_sorted_gate_up: gpu.kernel("moe_sorted", "moe_sorted_gate_up")?,
             moe_sorted_silu_down: gpu.kernel("moe_sorted", "moe_sorted_silu_down")?,
             moe_grouped_gemm: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable")?,
-            moe_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t")?,
+            moe_grouped_gemm_t,
             moe_grouped_gemm_t_k64: gpu
                 .kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?,
-            moe_fused_gate_up_t: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?,
+            moe_fused_gate_up_t,
+            moe_f16_prefill,
             moe_fused_gate_up_t_k64: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?,
             // ARM-2 Phase-K native-MXFP4 (E8M0) prefill variants — try_kernel:
             // only the deepseek-v4-flash target's moe_w4a16 module ships them.

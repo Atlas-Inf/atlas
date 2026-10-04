@@ -56,6 +56,8 @@ mod gemm_dense_int8;
 mod gemm_fp4;
 #[path = "ops/model_stats.rs"]
 pub mod model_stats;
+#[path = "ops/strix_f16.rs"]
+mod strix_f16;
 pub use model_stats::ModelStats;
 
 #[path = "ops/exl3_ops.rs"]
@@ -266,5 +268,6 @@ pub use ssm_gdn_snap::*;
 pub use ssm_mamba::*;
 pub use ssm_preproc::*;
 pub use ssm_ssd::*;
+pub use strix_f16::*;
 pub use strix_s64::*;
 pub use wide_prefill::*;
