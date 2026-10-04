@@ -170,6 +170,159 @@ extern "C" __global__ void w4a16_gemm(
         }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_gemm_s64: BIT-IDENTICAL twin of w4a16_gemm with a 64-deep K stage.
+//
+// Same signature, grid (ceil(N/64), ceil(M/64)) and block (128) as
+// w4a16_gemm, and identical math: every dequantized weight is exactly
+// __float2bfloat16(E2M1_LUT[nibble] * scl_fp8(sb) * scale2), the WMMA
+// fragments are built the same way (a[i] = sA[wm + (lane&15)][16*s+i],
+// b[k] = sB[16*s+k][nb*16 + (lane&15)]), and each 16x16 subtile accumulates
+// its WMMA k-steps kb = 0,16,32,... in the SAME ascending order. Only the
+// staging changes:
+//   * 64 K per stage (4 WMMA k-steps between one barrier pair instead of 2
+//     barriers per 16 K).
+//   * A staged with 16-byte loads into sA[64][64+8].
+//   * B staged per thread as (n = tid & 63, part = tid >> 6) covering
+//     k in [k0+32*part, k0+32*part+32): one 16-byte packed load + its 2
+//     scale bytes, dequantized into sB[64][64+8] laid out [k][n].
+// Zero-fill matches the original exactly (any element with gk >= K or
+// gn >= N or gr >= M is 0), with elementwise fallbacks wherever a 16-byte
+// load would cross the K/N bounds or be misaligned, and NO WMMA is issued
+// for a k-step with kb >= K (an extra all-zero WMMA can flip -0.0 to +0.0).
+// ═══════════════════════════════════════════════════════════════════
+extern "C" __global__ void w4a16_gemm_s64(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_m = blockIdx.y * M_TILE;
+    const unsigned int cta_n = blockIdx.x * N_TILE_SM;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+
+    // 64-deep stage; +8 pad keeps rows 16-byte aligned ((64+8)*2 = 144).
+    __shared__ __nv_bfloat16 sA[M_TILE][64 + 8];
+    __shared__ __nv_bfloat16 sB[64][N_TILE_SM + 8];
+
+    v8f acc[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) acc[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    // A rows are 16-byte aligned only when K is a multiple of 8 bf16; the
+    // packed-B row base gn*half_K is 16-byte aligned only when half_K % 16
+    // == 0 (K % 32 == 0). Base pointers are assumed 16-byte aligned, as for
+    // every other staged kernel in this file.
+    const bool a_vec_ok = (K % 8) == 0;
+    const bool b_vec_ok = (half_K % 16) == 0;
+
+    for (unsigned int k0 = 0; k0 < K; k0 += 64) {
+        // ── Stage A: 64x64 bf16 = 512 uint4, 4 per thread ─────────────
+        #pragma unroll
+        for (unsigned int j = 0; j < 4; j++) {
+            unsigned int idx = threadIdx.x + 128 * j;
+            unsigned int row = idx / 8;          // 8 uint4 per row
+            unsigned int seg = idx % 8;
+            unsigned int gr = cta_m + row;
+            if (a_vec_ok && gr < M && k0 + 64 <= K) {
+                *(uint4*)&sA[row][seg * 8] =
+                    *(const uint4*)(A + (unsigned long long)gr * K + k0 + seg * 8);
+            } else {
+                #pragma unroll
+                for (unsigned int i = 0; i < 8; i++) {
+                    unsigned int col = seg * 8 + i;
+                    unsigned int gc = k0 + col;
+                    sA[row][col] = (gr < M && gc < K)
+                        ? A[(unsigned long long)gr * K + gc]
+                        : __float2bfloat16(0.0f);
+                }
+            }
+        }
+        // ── Stage B: thread (n = tid&63, part = tid>>6) owns column n,
+        //    k in [k0+32*part, k0+32*part+32) ──────────────────────────
+        {
+            const unsigned int n = threadIdx.x & 63;
+            const unsigned int part = threadIdx.x >> 6;   // 0 or 1
+            const unsigned int kk0 = 32 * part;           // stage-local k base
+            const unsigned int gn = cta_n + n;
+            if (gn < N && b_vec_ok && k0 + kk0 + 32 <= K) {
+                const unsigned int kp = (k0 + kk0) / 2;   // byte offset, %16==0
+                uint4 packed = *(const uint4*)(B_packed +
+                    (unsigned long long)gn * half_K + kp);
+                const unsigned int sg = (k0 + kk0) / GROUP_SIZE;
+                const unsigned char sb0 = B_scale[(unsigned long long)gn * num_groups + sg];
+                const unsigned char sb1 = B_scale[(unsigned long long)gn * num_groups + sg + 1];
+                const unsigned char* pb = (const unsigned char*)&packed;
+                #pragma unroll
+                for (unsigned int kk = 0; kk < 32; kk++) {
+                    unsigned char byte = pb[kk / 2];
+                    unsigned int nibble = (kk & 1) ? (byte >> 4) : (byte & 0xF);
+                    unsigned char sb = (kk < 16) ? sb0 : sb1;
+                    sB[kk0 + kk][n] =
+                        __float2bfloat16(E2M1_LUT[nibble] * scl_fp8(sb) * scale2);
+                }
+            } else {
+                #pragma unroll
+                for (unsigned int kk = 0; kk < 32; kk++) {
+                    unsigned int gk = k0 + kk0 + kk;
+                    if (gk < K && gn < N) {
+                        unsigned int k_pair = gk / 2;
+                        unsigned char packed_byte =
+                            B_packed[(unsigned long long)gn * half_K + k_pair];
+                        unsigned int nibble =
+                            (gk & 1) ? (packed_byte >> 4) : (packed_byte & 0xF);
+                        unsigned int sg = gk / GROUP_SIZE;
+                        unsigned char sb =
+                            B_scale[(unsigned long long)gn * num_groups + sg];
+                        sB[kk0 + kk][n] =
+                            __float2bfloat16(E2M1_LUT[nibble] * scl_fp8(sb) * scale2);
+                    } else {
+                        sB[kk0 + kk][n] = __float2bfloat16(0.0f);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // 4 WMMA k-steps per stage, ascending kb. Skip any step with
+        // kb >= K entirely — the original issues exactly ceil(K/16) WMMAs
+        // per accumulator and an extra all-zero step can flip -0.0 to +0.0.
+        #pragma unroll
+        for (int s = 0; s < 4; s++) {
+            if (k0 + 16 * s >= K) break;
+            v16bf a;
+            #pragma unroll
+            for (int i = 0; i < 16; i++)
+                a[i] = (__bf16)(float)sA[warp_m_offset + (lane_id & 15)][16 * s + i];
+            #pragma unroll
+            for (int nb = 0; nb < 4; nb++) {
+                v16bf b;
+                #pragma unroll
+                for (int k = 0; k < 16; k++)
+                    b[k] = (__bf16)(float)sB[16 * s + k][nb * 16 + (lane_id & 15)];
+                acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]);
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int nb = 0; nb < 4; nb++)
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            unsigned int r = cta_m + warp_m_offset + 2 * e + (lane_id >> 4);
+            unsigned int c = cta_n + nb * 16 + (lane_id & 15);
+            if (r < M && c < N) C[r * N + c] = __float2bfloat16(acc[nb][e]);
+        }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // w4a16_gemm_t: transposed B, N_TILE=128, 2-stage double-buffered pipeline.
 // B_packed[K/2, N], B_scale[K/GROUP_SIZE, N]. Dequant NVFP4→BF16.
