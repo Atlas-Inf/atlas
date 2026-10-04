@@ -23,7 +23,9 @@ impl TransformerModel {
         chunk_len: usize,
         stream: u64,
     ) -> Result<()> {
-        if !self.ssm_snapshots.is_enabled() {
+        if !self.ssm_snapshots.is_enabled()
+            || (self.prefill_grid() > 0 && !self.prefix_cache.is_active())
+        {
             return Ok(());
         }
         let bs = kv_cache.block_size();
