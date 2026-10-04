@@ -39,6 +39,7 @@ pub mod metal_backend;
 pub mod op_cache;
 pub mod own_footprint;
 pub mod pinned_hosts;
+pub mod prefill_grid;
 pub mod prefix_cache;
 pub mod progress;
 pub mod radix_tree;

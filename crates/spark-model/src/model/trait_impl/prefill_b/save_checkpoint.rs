@@ -63,9 +63,19 @@ impl TransformerModel {
         // and is deliberately NOT made here; it needs its own measured A/B.
         let on_interval = self.ssm_checkpoint_interval > 0
             && end_block.is_multiple_of(self.ssm_checkpoint_interval);
-        // ATLAS_GLM_PC_BRANCH: the planned branch checkpoint (`pc_policy`).
-        let is_branch = seq.pc_branch_at == Some(end_token);
-        if end_block == 0 || !(is_prompt_tail || on_interval || is_branch) {
+        // R11 fix 1: under the pass grid, checkpoint ONLY at the last two grid
+        // points below the prompt end (the passes there are full grid passes
+        // in every run, so the anchor state is layout-independent). A planned
+        // branch checkpoint (ATLAS_GLM_PC_BRANCH, `pc_policy`) sits at an
+        // arbitrary token, so the grid declines it.
+        let grid = self.prefill_grid();
+        let is_branch = grid == 0 && seq.pc_branch_at == Some(end_token);
+        let wanted = if grid > 0 {
+            spark_runtime::prefill_grid::is_grid_checkpoint(end_token, tokens.len(), grid)
+        } else {
+            is_prompt_tail || on_interval || is_branch
+        };
+        if end_block == 0 || !wanted {
             return Ok(());
         }
         // Stale-V cap (mirrors finalize_last): never checkpoint-cache a block

@@ -70,6 +70,30 @@ impl TransformerModel {
                 // the next warm hit restores at this turn's END and replays
                 // ~nothing. Save logic + the secondary-stream ordering guard
                 // live in decode_checkpoint.rs (finish_leaf_snapshot).
+                // R11 fix 1: under the pass grid share only the KV of full
+                // grid passes of the PROMPT (decode KV and the last partial
+                // pass are layout-dependent) and save no finish-leaf snapshot.
+                let grid = self.prefill_grid();
+                if grid > 0 {
+                    let n = spark_runtime::prefill_grid::grid_floor(seq.prompt_len, grid)
+                        .min(seq.tokens.len());
+                    let nb = (n / bs).min(seq.block_table.len());
+                    if nb > 0 {
+                        let acquired = self.prefix_cache.insert(
+                            &seq.tokens[..nb * bs],
+                            &seq.block_table[..nb],
+                            &seq.disk_block_ids[..nb.min(seq.disk_block_ids.len())],
+                            bs,
+                            nb * bs,
+                            seq.adapter_id,
+                        );
+                        super::super::block_mgmt::cache_acquires_refs(
+                            &acquired,
+                            &mut self.kv_cache.lock(),
+                        );
+                    }
+                    return;
+                }
                 // finish_leaf.rs caches a multi-rank world's sequence, or not at all.
                 if self.finish_cache_multi_rank(seq, bs) {
                     return;
