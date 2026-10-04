@@ -116,32 +116,48 @@ impl TransformerModel {
             return;
         }
         while st.total + n > cap_bytes() {
-            let Some(old) = st.order.pop_front() else { break };
+            let Some(old) = st.order.pop_front() else {
+                break;
+            };
             if let Some(e) = st.map.remove(&old) {
                 st.total -= e.bytes.len();
             }
         }
         let mut bytes = vec![0u8; n];
-        if let Err(e) = self.gpu.copy_d2h_on_stream(self.mtp_prefill_hidden, &mut bytes, stream) {
+        if let Err(e) = self
+            .gpu
+            .copy_d2h_on_stream(self.mtp_prefill_hidden, &mut bytes, stream)
+        {
             tracing::warn!("MTP anchor save failed (anchor stays drafter-less): {e:#}");
             return;
         }
         st.total += n;
         st.order.push_back(snap_slot);
-        st.map.insert(snap_slot, Entry { hash: prefix_hash(&tokens[..rows]), rows, bytes });
+        st.map.insert(
+            snap_slot,
+            Entry {
+                hash: prefix_hash(&tokens[..rows]),
+                rows,
+                bytes,
+            },
+        );
     }
 
     /// True when a warm restore from `snap_slot` at `rows` can rebuild the
     /// cold drafter context (or when exactness is off).
-    pub(in crate::model) fn mtp_anchor_available(&self, snap_slot: usize, tokens: &[u32], rows: usize) -> bool {
+    pub(in crate::model) fn mtp_anchor_available(
+        &self,
+        snap_slot: usize,
+        tokens: &[u32],
+        rows: usize,
+    ) -> bool {
         if !self.mtp_anchor_on() {
             return true;
         }
         let st = store().lock();
-        let ok = st
-            .map
-            .get(&snap_slot)
-            .is_some_and(|e| e.rows == rows && rows <= tokens.len() && e.hash == prefix_hash(&tokens[..rows]));
+        let ok = st.map.get(&snap_slot).is_some_and(|e| {
+            e.rows == rows && rows <= tokens.len() && e.hash == prefix_hash(&tokens[..rows])
+        });
         if !ok {
             tracing::info!(
                 "MTP anchor: no drafter rows stored for snapshot {snap_slot} @ {rows} — \
@@ -167,13 +183,15 @@ impl TransformerModel {
         let Some(e) = st.map.get(&snap_slot) else {
             anyhow::bail!("MTP anchor vanished between check and restore");
         };
-        self.gpu.copy_h2d_async(&e.bytes, self.mtp_prefill_hidden, stream)?;
+        self.gpu
+            .copy_h2d_async(&e.bytes, self.mtp_prefill_hidden, stream)?;
         // The H2D reads host memory owned by the store; finish it before the
         // lock is released so a concurrent eviction cannot free it mid-copy.
         self.gpu.synchronize(stream)?;
         let generation = self.mtp_prefill_capture_gen.fetch_add(1, Ordering::Relaxed) + 1;
         seq.mtp_capture_gen = generation;
-        self.mtp_prefill_capture_len.store(e.rows, Ordering::Relaxed);
+        self.mtp_prefill_capture_len
+            .store(e.rows, Ordering::Relaxed);
         let _ = DevicePtr::NULL;
         Ok(())
     }

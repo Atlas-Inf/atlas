@@ -58,14 +58,20 @@ pub struct Cuts {
 impl Cuts {
     pub fn new(g: usize, f: usize) -> Self {
         // A fine grid that does not divide the coarse one is ignored.
-        let f = if g > 0 && f > 0 && f < g && g % f == 0 { f } else { 0 };
+        let f = if g > 0 && f > 0 && f < g && g.is_multiple_of(f) {
+            f
+        } else {
+            0
+        };
         Cuts { g, f }
     }
     pub fn is_on(&self) -> bool {
         self.g > 0
     }
     pub fn is_cut(&self, p: usize) -> bool {
-        self.g > 0 && p > 0 && (p % self.g == 0 || (self.f > 0 && p < self.g && p % self.f == 0))
+        self.g > 0
+            && p > 0
+            && (p.is_multiple_of(self.g) || (self.f > 0 && p < self.g && p.is_multiple_of(self.f)))
     }
     /// Smallest cut strictly greater than `p`.
     pub fn next_after(&self, p: usize) -> usize {
@@ -193,7 +199,9 @@ mod tests {
             Cuts::new(4096, 1024),
             Cuts::new(8192, 1024),
         ] {
-            for n in [1usize, 63, 64, 65, 1081, 1146, 2048, 2049, 4095, 4097, 8192, 8193, 30001, 100_003] {
+            for n in [
+                1usize, 63, 64, 65, 1081, 1146, 2048, 2049, 4095, 4097, 8192, 8193, 30001, 100_003,
+            ] {
                 let cold = c.layout(0, n);
                 let mut chunked = Vec::new();
                 let mut s = 0;
@@ -221,7 +229,11 @@ mod tests {
     /// the next turn needs (the deepest cut below the end) is always one.
     #[test]
     fn checkpoints_are_cuts() {
-        for c in [Cuts::new(1024, 0), Cuts::new(4096, 1024), Cuts::new(2048, 512)] {
+        for c in [
+            Cuts::new(1024, 0),
+            Cuts::new(4096, 1024),
+            Cuts::new(2048, 512),
+        ] {
             for n in 2..(3 * c.g) {
                 let mut count = 0;
                 for end in 1..n {
