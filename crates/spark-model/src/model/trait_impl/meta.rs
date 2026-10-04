@@ -28,6 +28,8 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+mod grid;
+
 impl TransformerModel {
     pub(super) fn vocab_size_dispatch(&self) -> usize {
         self.config.vocab_size
@@ -64,30 +66,6 @@ impl TransformerModel {
             block_size: self.kv_cache.lock().block_size() as u16,
             model_fp,
         })
-    }
-
-    /// R11 fix 1: active prefill pass grid in tokens for this model, 0 = off.
-    /// Only hybrid-SSM models (whose warm path replays from an SSM anchor)
-    /// use it; `ATLAS_PREFILL_GRID=0` turns it off.
-    pub(super) fn prefill_grid(&self) -> usize {
-        if self.config.num_ssm_layers() == 0 {
-            return 0;
-        }
-        let g = spark_runtime::prefill_grid::prefill_grid();
-        if g > 0 && !spark_runtime::prefill_grid::subblock_disabled() {
-            spark_runtime::prefill_grid::disable_subblock();
-            tracing::info!("prefill pass grid: {g} tokens (ATLAS_PREFILL_GRID=0 turns it off)");
-        }
-        g
-    }
-
-    /// R11 fix 6: under the prefill grid a warm replay runs exactly the cold
-    /// passes, so it must use the same GDN kernels (FLA) rather than the WY4
-    /// "exact replay" path. `ATLAS_GRID_EXACT_REPLAY=1` restores the old forcing.
-    pub(super) fn grid_replay_is_cold(&self) -> bool {
-        static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        self.prefill_grid() > 0
-            && !*FORCE.get_or_init(|| std::env::var("ATLAS_GRID_EXACT_REPLAY").as_deref() == Ok("1"))
     }
 
     /// Storage dtype of this sequence's SSM h-state (`ATLAS_SSM_H_FP16`).
