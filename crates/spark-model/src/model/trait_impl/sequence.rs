@@ -73,25 +73,7 @@ impl TransformerModel {
                 // R11 fix 1: under the pass grid share only the KV of full
                 // grid passes of the PROMPT (decode KV and the last partial
                 // pass are layout-dependent) and save no finish-leaf snapshot.
-                let grid = self.prefill_grid();
-                if grid > 0 {
-                    let n = spark_runtime::prefill_grid::cuts().floor(seq.prompt_len)
-                        .min(seq.tokens.len());
-                    let nb = (n / bs).min(seq.block_table.len());
-                    if nb > 0 {
-                        let acquired = self.prefix_cache.insert(
-                            &seq.tokens[..nb * bs],
-                            &seq.block_table[..nb],
-                            &seq.disk_block_ids[..nb.min(seq.disk_block_ids.len())],
-                            bs,
-                            nb * bs,
-                            seq.adapter_id,
-                        );
-                        super::super::block_mgmt::cache_acquires_refs(
-                            &acquired,
-                            &mut self.kv_cache.lock(),
-                        );
-                    }
+                if self.cache_grid_prefix(seq, bs) {
                     return;
                 }
                 // finish_leaf.rs caches a multi-rank world's sequence, or not at all.
