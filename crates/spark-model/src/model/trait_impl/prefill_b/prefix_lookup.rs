@@ -209,6 +209,9 @@ impl TransformerModel {
                     // e.g. mid-chunk tail captures — rather than restore a
                     // stale lexical state. See prefill_a.
                     && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
+                    // R11 fix 7: MTP output equals cold only with the cold
+                    // drafter context; decline a hit that cannot rebuild it.
+                    && self.mtp_anchor_available(snap_id, tokens, snap_tok)
                     // R11 fix 2: reuse KV only up to the snapshot depth. Runs
                     // BEFORE the restore so a declined cap leaves the pool
                     // untouched (full recompute from a clean state).
@@ -243,6 +246,7 @@ impl TransformerModel {
                     {
                         res?;
                     }
+                    self.mtp_anchor_restore(seq, snap_id, stream)?;
                     if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
                         self.ssm_pool.debug_state_checksum(
                             seq.slot_idx,
