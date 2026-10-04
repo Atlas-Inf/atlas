@@ -63,7 +63,16 @@ impl TransformerModel {
         // and is deliberately NOT made here; it needs its own measured A/B.
         let on_interval = self.ssm_checkpoint_interval > 0
             && end_block.is_multiple_of(self.ssm_checkpoint_interval);
-        if end_block == 0 || !(is_prompt_tail || on_interval) {
+        // R11 fix 1: under the pass grid, checkpoint ONLY at the last two grid
+        // points below the prompt end (the passes there are full grid passes
+        // in every run, so the anchor state is layout-independent).
+        let grid = self.prefill_grid();
+        let wanted = if grid > 0 {
+            spark_runtime::prefill_grid::is_grid_checkpoint(end_token, tokens.len(), grid)
+        } else {
+            is_prompt_tail || on_interval
+        };
+        if end_block == 0 || !wanted {
             return Ok(());
         }
         // Stale-V cap (mirrors finalize_last): never checkpoint-cache a block
