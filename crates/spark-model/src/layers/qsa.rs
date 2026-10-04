@@ -20,11 +20,11 @@
 //! launch scratch is layer-owned and steps serialize on one stream, so a
 //! `QsaSelection` is valid only until the next `decode_select` on this layer.
 //!
-//! CUDA graphs: the default top-k arm is a host sort on the scores (D2H), the
-//! ingest counter is host state, and launch parameters depend on the
-//! position — a layer carrying an indexer vetoes decode-graph capture
-//! entirely. `ATLAS_QSA_DEVICE_TOPK=1` removes the host sort up to
-//! `QSA_SELECT_MAX_BLOCKS` complete blocks; the veto stays.
+//! CUDA graphs: the ingest counter is host state and launch parameters depend
+//! on the position, so a layer carrying an indexer vetoes decode-graph capture
+//! entirely. Top-k runs on the device by default (`qsa_select_topk_radix`,
+//! O(complete), identical selection to the host `rank_cmp`) up to
+//! `QSA_SELECT_MAX_BLOCKS`; `ATLAS_QSA_DEVICE_TOPK=0` restores the host sort.
 
 use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -217,8 +217,8 @@ impl QsaIndexer {
             k_score_rows_gemm_k: super::try_kernel(gpu, "qsa_indexer", "qsa_score_rows_gemm"),
             k_score_rows_tc_k: super::try_kernel(gpu, "qsa_score_tc", "qsa_score_rows_tc"),
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
-            k_select_k: gpu.kernel("qsa_indexer", "qsa_select_topk")?,
-            device_topk: std::env::var("ATLAS_QSA_DEVICE_TOPK").ok().as_deref() == Some("1"),
+            k_select_k: gpu.kernel("qsa_indexer", "qsa_select_topk_radix")?,
+            device_topk: std::env::var("ATLAS_QSA_DEVICE_TOPK").ok().as_deref() != Some("0"),
             topk_verify: std::env::var("ATLAS_QSA_TOPK_VERIFY").ok().as_deref() == Some("1"),
             k_prefill_attn_g_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_g")?,
             k_prefill_attn_l8_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_l8")?,
@@ -436,9 +436,9 @@ impl QsaIndexer {
         )?;
 
         // Block selection. `n_sel` never depends on the scores, only the
-        // CONTENT of `sel_dev` does. Device arm: one kernel writes `sel_dev`
-        // (no D2H, no host sort, no H2D). Host arm (default, and anything
-        // wider than the kernel's flag array): D2H + sort + H2D — decode
+        // CONTENT of `sel_dev` does. Device arm (default): one radix-select
+        // kernel writes `sel_dev` (no D2H, sort or H2D). Host arm (rollback,
+        // and wider than QSA_SELECT_MAX_BLOCKS): D2H + sort + H2D — decode
         // graphs are vetoed whenever an indexer is present, so neither arm
         // ever runs inside a capture.
         if self.device_topk && complete <= qsa_decode_select::QSA_SELECT_MAX_BLOCKS {
