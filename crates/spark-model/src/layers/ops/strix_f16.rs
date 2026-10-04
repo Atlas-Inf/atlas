@@ -106,9 +106,65 @@ pub fn moe_w4a16_t_kernel(gpu: &dyn GpuBackend, func: &str) -> Result<KernelHand
     gpu.kernel("moe_w4a16", func)
 }
 
+/// The `_f16a` twin of a routed-MoE prefill kernel (`moe_w4a16_fused_gate_up_t`,
+/// `moe_w4a16_grouped_gemm_ptrtable_t`), or `KernelHandle(0)` when the target
+/// does not ship it (or is not native HIP). Unlike [`moe_w4a16_t_kernel`] this
+/// never falls back to the BF16 base — it reports twin-ness, which is what
+/// engages the twins in production prefill (layers/moe/
+/// forward_prefill_routed.rs): that path dispatches the `_k64` handles, so
+/// the init-time swap alone engaged nothing (winbox B2 vs B1: TTFT 1.01x,
+/// byte-identical greedy output).
+///
+/// The twins carry the SAME signatures as their BF16 bases and the same
+/// 64-row `blockIdx.y` M tile with NO grid striding, so the n128 launchers
+/// pass `max_m_tiles`, not `grid_m_strided`.
+#[track_caller]
+pub fn moe_w4a16_t_f16_twin(gpu: &dyn GpuBackend, func: &str) -> KernelHandle {
+    f16_twin(gpu, "moe_w4a16", func)
+}
+
+/// Should routed-MoE prefill run the F16 twins? Only when BOTH resolved. The
+/// pair is added and validated together — a half-resolved set is not a
+/// supported configuration, so it keeps the BF16 `_k64` arms rather than
+/// mixing operand widths across the gate_up/down boundary. Pure, for unit
+/// testing.
+pub fn moe_f16_prefill_engaged(gate_up_twin: KernelHandle, down_twin: KernelHandle) -> bool {
+    gate_up_twin.0 != 0 && down_twin.0 != 0
+}
+
+/// Resolve the routed-MoE prefill pair for `MoeLayer::new_*`: returns
+/// `(grouped_gemm_t, fused_gate_up_t, both_are_f16)` where each handle is the
+/// `_f16a` twin when the target ships it else the BF16 base (required — every
+/// MoE target ships the base kernels).
+#[track_caller]
+pub fn moe_f16_prefill_handles(gpu: &dyn GpuBackend) -> Result<(KernelHandle, KernelHandle, bool)> {
+    let down = moe_w4a16_t_f16_twin(gpu, "moe_w4a16_grouped_gemm_ptrtable_t");
+    let gate_up = moe_w4a16_t_f16_twin(gpu, "moe_w4a16_fused_gate_up_t");
+    let both = moe_f16_prefill_engaged(gate_up, down);
+    let down = if down.0 != 0 {
+        down
+    } else {
+        gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t")?
+    };
+    let gate_up = if gate_up.0 != 0 {
+        gate_up
+    } else {
+        gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?
+    };
+    Ok((down, gate_up, both))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moe_f16_prefill_requires_both_twins() {
+        assert!(moe_f16_prefill_engaged(KernelHandle(7), KernelHandle(9)));
+        assert!(!moe_f16_prefill_engaged(KernelHandle(0), KernelHandle(9)));
+        assert!(!moe_f16_prefill_engaged(KernelHandle(7), KernelHandle(0)));
+        assert!(!moe_f16_prefill_engaged(KernelHandle(0), KernelHandle(0)));
+    }
 
     // The only test that touches M128_PAIR, so the process-global set is safe.
     #[test]

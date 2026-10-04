@@ -284,6 +284,8 @@ pub struct MoeLayer {
     moe_grouped_gemm_t_k64: KernelHandle,
     moe_fused_gate_up_t: KernelHandle,
     moe_fused_gate_up_t_k64: KernelHandle,
+    /// Both `_f16a` routed-MoE twins resolved (native HIP only).
+    moe_f16_prefill: bool,
     // ARM-2 Phase-K: native-MXFP4 (E8M0 per-32) prefill variants of the W4A16
     // routed-expert GEMMs. KernelHandle(0) on models that don't ship them
     // (only the deepseek-v4-flash target compiles the `_e8m0` entries).
