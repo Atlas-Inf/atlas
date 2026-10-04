@@ -200,6 +200,9 @@ impl TransformerModel {
                 // stale lexical state. See prefill_a. The whole gate is
                 // `pc_policy::marconi_restorable`.
                 if self.marconi_restorable(snap_id, snap_tok, eff_is_tail, matched, total, seq)
+                    // R11 fix 7: MTP output equals cold only with the cold
+                    // drafter context; decline a hit that cannot rebuild it.
+                    && self.mtp_anchor_available(snap_id, tokens, snap_tok)
                     // R11 fix 2: reuse KV only up to the snapshot depth. Runs
                     // BEFORE the restore so a declined cap leaves the pool
                     // untouched (full recompute from a clean state). A no-op
@@ -235,6 +238,7 @@ impl TransformerModel {
                     {
                         res?;
                     }
+                    self.mtp_anchor_restore(seq, snap_id, stream)?;
                     if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
                         self.ssm_pool.debug_state_checksum(
                             seq.slot_idx,
