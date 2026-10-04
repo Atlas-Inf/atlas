@@ -167,6 +167,8 @@ impl TransformerModel {
         if !aux.is_empty() {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }
+        // R11 fix 7: the MTP drafter's hidden rows [0, end_token) ride along.
+        self.mtp_anchor_save(seq, tokens, snap_id, end_token, stream);
 
         if !self
             .register_intermediate_checkpoint(tokens, seq, kv_cache, end_token, snap_id, is_branch)
