@@ -16,8 +16,12 @@
 //! whole-prompt `prefill_drafter` a cold run does. A hit whose rows are not
 //! stored is declined (full recompute): correct, slower.
 //!
-//! Memory: one entry per checkpoint slot, bounded by
-//! `ATLAS_MTP_ANCHOR_MAX_MB` (default 4096; oldest evicted first).
+//! Memory: one entry per checkpoint slot, in host RAM, bounded by
+//! `ATLAS_MTP_ANCHOR_MAX_MB` (default 512; oldest evicted first). On
+//! unified-memory boxes (GB10, Strix Halo) host RAM is GPU memory, so the
+//! default is kept small: a 30k-token anchor is ~120 MB at hidden 2048, and
+//! an evicted anchor only costs a declined hit (full recompute), never a
+//! wrong answer.
 //! `ATLAS_MTP_ANCHOR=0` restores the old carry behaviour.
 
 use std::collections::{HashMap, VecDeque};
@@ -48,13 +52,16 @@ fn store() -> &'static Mutex<Store> {
     STORE.get_or_init(|| Mutex::new(Store::default()))
 }
 
+/// Default anchor budget in MiB (see the module doc for why it is small).
+const DEFAULT_CAP_MB: usize = 512;
+
 fn cap_bytes() -> usize {
     static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
         std::env::var("ATLAS_MTP_ANCHOR_MAX_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4096)
+            .unwrap_or(DEFAULT_CAP_MB)
             * 1024
             * 1024
     })
