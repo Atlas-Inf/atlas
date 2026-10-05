@@ -299,8 +299,7 @@ impl Model for TransformerModel {
         {
             return len;
         }
-        let end = spark_runtime::prefill_grid::cuts().floor(offset + len);
-        if end > offset { end - offset } else { len }
+        spark_runtime::prefill_grid::cuts().align_chunk(offset, len, total)
     }
 
     fn normalize_after_chunk(&self, seq: &SequenceState, chunk_end: usize) -> bool {

@@ -110,6 +110,18 @@ impl Cuts {
         }
         out
     }
+    /// R11 fix 5: end a non-last scheduler chunk `[offset, offset+len)` of a
+    /// `total`-token prompt on the deepest cut inside it; keep `len` when no
+    /// cut lies above `offset` (e.g. `--max-prefill-tokens` below the grid).
+    /// Depends only on `(offset, len, total)`, so a warm run, which chunks
+    /// from 0 like a cold one, gets the same chunk ends.
+    pub fn align_chunk(&self, offset: usize, len: usize, total: usize) -> usize {
+        if self.g == 0 || offset + len >= total {
+            return len;
+        }
+        let end = self.floor(offset + len);
+        if end > offset { end - offset } else { len }
+    }
     /// Save an SSM checkpoint at a pass ending at `end` of a `total`-token
     /// prompt: one of the last two cuts strictly below the prompt end.
     pub fn is_checkpoint(&self, end: usize, total: usize) -> bool {
@@ -220,6 +232,52 @@ mod tests {
                 }
                 for p in &cold {
                     assert!(p.1 == n || c.is_cut(p.1), "{c:?} n {n} pass {p:?}");
+                }
+            }
+        }
+    }
+
+    /// Scheduler budget below the grid (gfx1151: `--max-prefill-tokens 2048`,
+    /// G = 4096). Chunk ends alternate on/off grid, but `align_chunk` depends
+    /// only on `(offset, len, total)` and a warm run chunks from 0 like a cold
+    /// one, so both see the same chunk ends and (fix 4) the same normalize
+    /// points at or above the anchor. What must hold is that every cut is a
+    /// pass boundary of the cold run, so a snapshot saved at a cut is the
+    /// cold state there, and that every pass ends at a cut, a chunk end, or n.
+    #[test]
+    fn chunk_ends_below_grid_match_warm_and_cold() {
+        for c in [
+            Cuts::new(4096, 0),
+            Cuts::new(4096, 1024),
+            Cuts::new(2048, 0),
+        ] {
+            for budget in [1024usize, 1536, 2048, 3072, 4096, 8192] {
+                for n in [2049usize, 4097, 6144, 6300, 12_289, 30_001] {
+                    let mut ends = Vec::new();
+                    let mut s = 0;
+                    while s < n {
+                        let e = s + c.align_chunk(s, budget.min(n - s), n);
+                        assert!(e > s && e <= n, "{c:?} b {budget} n {n}");
+                        ends.push(e);
+                        s = e;
+                    }
+                    let mut passes = Vec::new();
+                    let mut s = 0;
+                    for &e in &ends {
+                        passes.extend(c.layout(s, e));
+                        s = e;
+                    }
+                    for p in &passes {
+                        assert!(p.1 == n || c.is_cut(p.1) || ends.contains(&p.1));
+                    }
+                    let mut a = c.next_after(0);
+                    while a < n {
+                        assert!(
+                            passes.iter().any(|p| p.1 == a),
+                            "{c:?} b {budget} n {n}: cut {a} is not a pass boundary"
+                        );
+                        a = c.next_after(a);
+                    }
                 }
             }
         }
