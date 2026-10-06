@@ -674,3 +674,54 @@ max = 0.0
 
 [benchmarks.metrics.control_held]
 min = 1.0
+
+
+# ── SSM state poisoning, dense hybrid subject ───────────────────────────────
+# Moved here from the FP8 35B MoE 2026-10-06 (owner decision: NVFP4-only gates,
+# dense 27B subject). The invariant is unchanged — see the gate definition for
+# what a round, a collapse and a restore are.
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
+gate = "ssm-state-poisoning-gate"
+recipe = "qwen3.8/qwen3.8-27b-nvfp4"
+default = true
+status = "measured"
+note = """\
+SSM State Poisoning Gate on the dense hybrid 27B — replays a fixed 4-turn script \
+12 times against one prefix-cached server at temperature 0; any collapsed round \
+is accumulated engine-state corruption. Recipe qwen3.8-27b-nvfp4 is the \
+prefix-caching profile (enable_prefix_caching true, ssm_cache_slots 64, \
+thinking off), so the restore path this gate polices is live with no further \
+override. Both are still pinned below (equal to the recipe, so the measured \
+config is the declared one): a recipe change cannot silently re-enable the \
+thinking budget that once made the #513 anchors unsatisfiable, nor shrink the \
+Marconi pool into the eviction churn that made restores drift on the 35B. \
+FIRST MEASUREMENT: 2026-10-06, spark2 (GB10), main 1d3324989, two fresh serves: \
+PASS both — rounds 12, collapsed 0, unmeasured 0, jittered 12 (unbounded by \
+design), min_cached_prompt_tokens 1026 both times, sum_wall_s 165.70 / 165.82, \
+0 serve faults. The zero-tolerance bars are definitions, not measurements. \
+min_cached_prompt_tokens stays at the definitional floor of 1 (vacuity check: \
+the restore path ran); ratchet toward the observed ~1026 anchor only after a \
+production-path record carries it. sum_wall_s is a blowup detector at ~2.4x the \
+measured wall, not a perf bar."""
+
+[benchmarks.serve_overrides]
+disable_thinking = "true"
+ssm_cache_slots = "64"
+
+[benchmarks.metrics.rounds]
+min = 12.0
+max = 12.0
+
+[benchmarks.metrics.collapsed]
+max = 0.0
+
+[benchmarks.metrics.unmeasured]
+max = 0.0
+
+[benchmarks.metrics.min_cached_prompt_tokens]
+min = 1.0
+
+[benchmarks.metrics.sum_wall_s]
+max = 400.0
