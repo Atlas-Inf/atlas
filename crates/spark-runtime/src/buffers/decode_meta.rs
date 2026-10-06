@@ -47,7 +47,11 @@ pub const DECODE_BATCH_RUNGS: [usize; 11] = [2, 4, 8, 12, 16, 24, 32, 48, 64, 96
 /// The rung a batch of `n` pads to; `n` itself above the last rung.
 #[inline]
 pub fn padded_batch_rung(n: usize) -> usize {
-    DECODE_BATCH_RUNGS.iter().copied().find(|&s| s >= n).unwrap_or(n)
+    DECODE_BATCH_RUNGS
+        .iter()
+        .copied()
+        .find(|&s| s >= n)
+        .unwrap_or(n)
 }
 
 /// Derived fixed-stride decode-metadata layout.
@@ -136,7 +140,11 @@ mod tests {
         for bs in [33usize, 64, 128] {
             let l = DecodeMetaLayout::for_max_batch_size(bs);
             let r = l.rows();
-            assert_eq!(r, padded_batch_rung(bs), "bs={bs}: rows are the padded rung");
+            assert_eq!(
+                r,
+                padded_batch_rung(bs),
+                "bs={bs}: rows are the padded rung"
+            );
             // positions [0,4R) then seq_slot [4R,8R): no overlap.
             assert_eq!(l.seq_slot_off(), l.positions_off() + 4 * r);
             // slots i64 begins exactly after seq_slot and is 8-byte aligned.
