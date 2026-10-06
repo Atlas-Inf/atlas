@@ -21,6 +21,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_forward_exl3(input, num_tokens, ctx, stream)? {
+            return Ok(());
+        }
         // Native-HIP (gfx1151) has NO ported grouped-GEMM MoE path:
         // moe_fp8_grouped_gemm is a compile stub (kernels/strix-hip/.../
         // moe_fp8_grouped_gemm.cu writes nothing) and the grouped prefill

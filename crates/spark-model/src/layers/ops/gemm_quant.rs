@@ -119,6 +119,12 @@ pub fn dense_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // EXL3 packed dense linears (ATLAS_EXL3_DENSE_NATIVE=1): a BF16 copy that
+    // was materialized from a registered trellis runs the native batch-1
+    // EXL3 GEMV on the packed weight instead. No-op otherwise.
+    if let Some(r) = exl3_dense_try(gpu, kernel, input, weight.weight, output, n, k, stream) {
+        return r;
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -153,6 +159,19 @@ pub fn dense_gemv_batch2(
     out_stride: u32,
     stream: u64,
 ) -> Result<()> {
+    if let Some(r) = exl3_dense_try_rows(
+        gpu,
+        input,
+        weight.weight,
+        output,
+        2,
+        n,
+        k,
+        out_stride,
+        stream,
+    ) {
+        return r;
+    }
     let outputs_per_block = if cfg!(atlas_hip) { 8 } else { 4 };
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, outputs_per_block), 1, 1])
@@ -212,6 +231,19 @@ pub fn dense_gemv_batchm(
         "dense_gemv_batchm: m={m} outside 1..={DENSE_GEMV_BATCHM_MAX_M} \
          (kernel MAX_M clamps silently; use dense_gemm_tc for wider batches)"
     );
+    if let Some(r) = exl3_dense_try_rows(
+        gpu,
+        input,
+        weight.weight,
+        output,
+        m as usize,
+        n,
+        k,
+        out_stride,
+        stream,
+    ) {
+        return r;
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([
             div_ceil(

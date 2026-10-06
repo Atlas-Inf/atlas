@@ -16,6 +16,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_forward_exl3(input, num_tokens, ctx, stream)? {
+            return Ok(());
+        }
         // LongCat zero-experts ARE wired here (softmax+bias arm below); the
         // other scoring functions on this variant are not, and would silently
         // mis-route the 384-wide router. Named refusal, not silent wrongness.

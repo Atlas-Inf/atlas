@@ -10,6 +10,41 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
+/// Graph-mode decode ingest: position from `pos_dev`; raw key store + pool
+/// of a just-completed block (`qsa_decode_ingest` in qsa_indexer.cu).
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_decode_ingest(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    key_row: DevicePtr,
+    pos_dev: DevicePtr,
+    raw_keys: DevicePtr,
+    k_norm_w: DevicePtr,
+    block_keys: DevicePtr,
+    ratio: u32,
+    hd: u32,
+    rot: u32,
+    theta: f32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([hd, 1, 1])
+        .shared_mem((hd + 32) * 4)
+        .arg_ptr(key_row)
+        .arg_ptr(pos_dev)
+        .arg_ptr(raw_keys)
+        .arg_ptr(k_norm_w)
+        .arg_ptr(block_keys)
+        .arg_u32(ratio)
+        .arg_u32(hd)
+        .arg_u32(rot)
+        .arg_f32(theta)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
 /// Pool `n_new` freshly complete blocks starting at `first_block`:
 /// mean over `ratio` raw keys -> RMSNorm*(1+w) -> rope at block-start pos.
 #[allow(clippy::too_many_arguments)]

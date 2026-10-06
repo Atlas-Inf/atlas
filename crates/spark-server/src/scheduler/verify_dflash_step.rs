@@ -263,6 +263,11 @@ pub fn step_verify_dflash(
     // would overwrite the correct per-layer intermediates with a repeated
     // final-layer hidden, collapsing all 5 slots to the same value.
     let bonus_token_idx = total_accepted.saturating_sub(1);
+    // Stream-highway drafters (qwen4_exp MTP) read row 0 of the mHC streams:
+    // select the accepted row first, as the K=2/3 steps do.
+    if let Err(e) = model.select_mtp_stream_row(bonus_token_idx) {
+        tracing::error!("select_mtp_stream_row (dflash): {e:#}");
+    }
     if let Err(e) = model.save_hidden_for_mtp(bonus_token_idx, 0) {
         tracing::error!("save_hidden_for_mtp (dflash): {e:#}");
     }

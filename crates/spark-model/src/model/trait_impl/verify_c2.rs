@@ -190,7 +190,10 @@ impl TransformerModel {
         // failed with "decode at pos 34 but 26 tokens ingested". `decode_a`
         // and `decode_a2` already apply this veto; the verify paths never did,
         // because on this model they used to refuse before reaching a graph.
-        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        let layer_veto = self
+            .layers
+            .iter()
+            .any(|l| l.single_decode_graph_unsupported());
         let use_graphs =
             self.comm.is_none() && !hss_engaged && !lora_eager && !k4_diag && !layer_veto;
 
@@ -245,6 +248,11 @@ impl TransformerModel {
             && graph.0 != 0
         {
             self.gpu.launch_graph(graph, stream)?;
+            for t in 0..k {
+                for (li, l) in self.layers.iter().enumerate() {
+                    l.decode_graph_replayed(seq.layer_states[li].as_mut(), seq.seq_len + t);
+                }
+            }
         }
         let need_run = cached_for_slot.is_none();
         if need_run {

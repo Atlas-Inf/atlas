@@ -99,6 +99,19 @@ pub(crate) fn load_moe_qwen35(
     skip_routed_experts: bool,
 ) -> Result<MoeWeights> {
     let p = format!("{layer_prefix}.mlp");
+    // Packed EXL3 experts stay trellis. Do not fall through to quantized_any.
+    if store.contains(&format!("{p}.experts.0.gate_proj.trellis"))
+        || store.contains(&format!("{p}.shared_expert.gate_proj.trellis"))
+    {
+        return crate::weight_map::exl3::moe_pack::load_moe_exl3_packed(
+            store,
+            &p,
+            num_experts,
+            gpu,
+            config,
+            skip_routed_experts,
+        );
+    }
 
     let gate = dense_auto(store, &format!("{p}.gate.weight"), gpu)?;
     let shared_expert_gate = dense_auto(store, &format!("{p}.shared_expert_gate.weight"), gpu)?;

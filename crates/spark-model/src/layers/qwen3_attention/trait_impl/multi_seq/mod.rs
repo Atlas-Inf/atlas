@@ -162,6 +162,7 @@ impl Qwen3AttentionLayer {
         let comb = ctx.buffers.hc_comb();
         let diag_this =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
+        let qsa_dev = self.ms_qsa_dev_ok(row_owner, n, kv_cache);
 
         if is_first_layer {
             ops::hc_expand(
@@ -246,7 +247,9 @@ impl Qwen3AttentionLayer {
             self.ms_phase_cache_write(&c, kv_cache, meta)?;
             // `qsa_rows` (decided pre-mutation) owns BOTH this choice and the
             // ingest loop below, so a row is never ingested twice.
-            let attn_out = if qsa_rows {
+            let attn_out = if qsa_dev {
+                self.ms_phase_attn_qsa_dev(&c, &mut *states, seq_lens, row_owner, kv_cache, meta)?
+            } else if qsa_rows {
                 self.ms_phase_attn_qsa_rows(&c, &mut *states, row_owner, seq_lens, kv_cache, meta)?
             } else {
                 self.ms_phase_paged_decode(&c, kv_cache, meta)?
@@ -262,7 +265,7 @@ impl Qwen3AttentionLayer {
         }
 
         // ── QSA ingest continuity (all rows inert; see `qsa_rows.rs`) ──
-        if !qsa_rows {
+        if !qsa_rows && !qsa_dev {
             self.ms_qsa_ingest_rows(&c, &mut *states, row_owner, seq_lens, kv_cache, meta)?;
         }
 
@@ -390,10 +393,29 @@ impl Qwen3AttentionLayer {
                 .copy_d2d_async(c.hidden, c.normed, n * h * 2, stream)?;
         }
 
+        // Verify rows on a packed EXL3 MoE: one batched MoE call for all n
+        // rows (CoopMK bsz = n), as the SSM layers already do through
+        // try_forward_km. moe_output then holds [n, h]; the per-row hc_post
+        // below is unchanged. MLA models keep the per-token loop.
+        // ATLAS_HC_MOE_ROWS=0 restores the per-token loop.
+        let km_rows = self.mla.is_none()
+            && !self.ffn.is_dense()
+            && (2..=8).contains(&n)
+            && std::env::var("ATLAS_HC_MOE_ROWS").as_deref() != Ok("0")
+            && self
+                .ffn
+                .try_forward_km(c.normed, n as u32, ctx, stream)
+                .inspect_err(|e| tracing::error!("attn ffn.try_forward_km: {e:#}"))
+                .unwrap_or(false);
+        let moe_rows = ctx.buffers.moe_output();
         // Per-token sequential FFN (MLA models always take this path).
         for i in 0..n {
             let normed2_i = c.normed.offset(i * c.h * c.bf16);
-            let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
+            let moe_out = if km_rows {
+                moe_rows.offset(i * c.h * c.bf16)
+            } else {
+                self.ffn.forward(normed2_i, ctx, stream)?
+            };
             // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
             let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
             let post_i = post.offset(i * hc.hc_mult * 4);

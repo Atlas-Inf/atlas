@@ -137,6 +137,7 @@ impl PleLayer {
         st.history = window[window.len() - keep..].to_vec();
         st.prestaged_va = Some(va);
         st.prestaged_n = tokens.len();
+        st.verify_snap_rows = tokens.len();
         st.last_staged_va = va;
         Ok(())
     }
