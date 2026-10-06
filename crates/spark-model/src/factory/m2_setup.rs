@@ -5,6 +5,7 @@
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
+use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
 
@@ -13,6 +14,7 @@ use crate::layer::TransformerLayer;
 pub(super) fn maybe_run_minimax_m2_moe_transpose(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
+    store: &WeightStore,
     layers: &mut [Box<dyn TransformerLayer>],
 ) -> Result<()> {
     // ARM-2 Phase-K: deepseek_v4 native-MXFP4 routed experts REQUIRE the
@@ -126,8 +128,11 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
              phased transpose with frees, free pre-pass {:.1} GB → RUNNING",
             gb(free),
         );
+        // The freed originals are the store's tensors: mark them, or
+        // teardown frees every one a second time (#122).
         for layer in layers.iter_mut() {
-            layer.transpose_moe_for_prefill_unified(gpu, config)?;
+            let freed = layer.transpose_moe_for_prefill_unified(gpu, config)?;
+            store.mark_freed_elsewhere(&freed)?;
         }
         tracing::info!(
             "MoE transpose pass (unified layout): done, {:.1} GB free",

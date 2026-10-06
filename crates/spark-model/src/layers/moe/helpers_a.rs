@@ -155,11 +155,15 @@ impl MoeLayer {
     ///      returns true at dispatch time.
     ///   2. Call this method INSTEAD of `transpose_for_prefill` /
     ///      `transpose_gate_up_for_prefill`.
+    ///
+    /// Returns the original pointers it freed. They are the weight store's
+    /// tensors, so the caller marks them in the store or teardown frees them
+    /// a second time (#122).
     pub fn transpose_for_prefill_unified(
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
-    ) -> Result<()> {
+    ) -> Result<Vec<DevicePtr>> {
         self.transpose_for_prefill_unified_inner(gpu, config, false)
     }
 
@@ -175,20 +179,23 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
+        // Hybrid keeps the originals, so there is nothing freed to report.
         self.transpose_for_prefill_unified_inner(gpu, config, true)
+            .map(|_| ())
     }
 
     /// Phased build of the transposed weight set. When `keep_originals` is true
     /// (hybrid-layout mode), Phase B and Phase D frees are skipped so decode
     /// paths still find the untransposed weights. When false (unified-layout
     /// mode), the originals are freed between phases — current Phase 8a
-    /// behavior.
+    /// behavior — and returned, so their owner can stop tracking them.
     pub(super) fn transpose_for_prefill_unified_inner(
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
         keep_originals: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<DevicePtr>> {
+        let mut freed = Vec::new();
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
         let shared_inter = config.shared_expert_intermediate_size;
@@ -291,12 +298,20 @@ impl MoeLayer {
                 }
             }
             if !self.weights.shared_expert.gate_proj.weight.is_null() && shared_inter > 0 {
-                gpu.free(self.weights.shared_expert.gate_proj.weight)?;
-                gpu.free(self.weights.shared_expert.gate_proj.weight_scale)?;
+                free_original(gpu, &mut freed, self.weights.shared_expert.gate_proj.weight)?;
+                free_original(
+                    gpu,
+                    &mut freed,
+                    self.weights.shared_expert.gate_proj.weight_scale,
+                )?;
                 self.weights.shared_expert.gate_proj.weight = DevicePtr::NULL;
                 self.weights.shared_expert.gate_proj.weight_scale = DevicePtr::NULL;
-                gpu.free(self.weights.shared_expert.up_proj.weight)?;
-                gpu.free(self.weights.shared_expert.up_proj.weight_scale)?;
+                free_original(gpu, &mut freed, self.weights.shared_expert.up_proj.weight)?;
+                free_original(
+                    gpu,
+                    &mut freed,
+                    self.weights.shared_expert.up_proj.weight_scale,
+                )?;
                 self.weights.shared_expert.up_proj.weight = DevicePtr::NULL;
                 self.weights.shared_expert.up_proj.weight_scale = DevicePtr::NULL;
             }
@@ -338,15 +353,19 @@ impl MoeLayer {
                 }
             }
             if !self.weights.shared_expert.down_proj.weight.is_null() && shared_inter > 0 {
-                gpu.free(self.weights.shared_expert.down_proj.weight)?;
-                gpu.free(self.weights.shared_expert.down_proj.weight_scale)?;
+                free_original(gpu, &mut freed, self.weights.shared_expert.down_proj.weight)?;
+                free_original(
+                    gpu,
+                    &mut freed,
+                    self.weights.shared_expert.down_proj.weight_scale,
+                )?;
                 self.weights.shared_expert.down_proj.weight = DevicePtr::NULL;
                 self.weights.shared_expert.down_proj.weight_scale = DevicePtr::NULL;
             }
         }
         scratch.release(gpu)?;
 
-        Ok(())
+        Ok(freed)
     }
 
     /// Transpose one projection across ALL routed experts on the GPU, into a
@@ -435,4 +454,12 @@ impl MoeLayer {
         gpu.free(dst_tbl.scale2_vals)?;
         Ok(out)
     }
+}
+
+/// Free one original weight and remember it for the store (see
+/// `transpose_for_prefill_unified`).
+fn free_original(gpu: &dyn GpuBackend, freed: &mut Vec<DevicePtr>, ptr: DevicePtr) -> Result<()> {
+    gpu.free(ptr)?;
+    freed.push(ptr);
+    Ok(())
 }
