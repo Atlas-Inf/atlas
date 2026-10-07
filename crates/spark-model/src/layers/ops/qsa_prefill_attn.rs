@@ -448,11 +448,7 @@ pub(crate) fn qsa_attn_tc2_decision(
 /// windows). Unlike the numerics question `scripts/ppl.py` was meant to
 /// answer, this is a hard fault — so the env flag is refused outright on
 /// `atlas_scale` rather than merely made non-default.
-pub(crate) fn qsa_attn_l8_selectable(
-    l8: Option<&str>,
-    gfx: bool,
-    shape_ok: bool,
-) -> bool {
+pub(crate) fn qsa_attn_l8_selectable(l8: Option<&str>, gfx: bool, shape_ok: bool) -> bool {
     matches!(l8, Some("1") | Some("true")) && !gfx && shape_ok
 }
 
