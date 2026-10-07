@@ -23,8 +23,12 @@
 //! warm from cut `a` runs the passes between consecutive cuts above `a`,
 //! exactly as a cold run does.
 //!
-//! `ATLAS_PREFILL_GRID` = G (default 4096; 0 restores the old layout: tail
-//! split, leaf / decode / finish-leaf snapshots). `ATLAS_PREFILL_GRID_FINE`
+//! Off by default: the grid makes a warm turn re-prefill up to G tokens past
+//! its last cut (main resumes at the end-of-turn snapshot), which costs ~50%
+//! wall time on long agentic replays at G = 4096. `--exact-prefix-cache`
+//! turns it on at G = 4096; `ATLAS_PREFILL_GRID` = G sets it explicitly
+//! (overrides the flag; 0 = off, i.e. main's layout: tail split, leaf /
+//! decode / finish-leaf snapshots). `ATLAS_PREFILL_GRID_FINE`
 //! = F (default 0 = none). Both must be multiples of 64 (GDN sub-chunk, KV
 //! block), F must divide G, and G should divide `--max-prefill-tokens` so
 //! scheduler chunk ends land on cut points.
@@ -45,7 +49,20 @@ pub fn subblock_disabled() -> bool {
     SUBBLOCK_OFF.load(Ordering::Relaxed)
 }
 
-/// Default coarse grid in tokens.
+static EXACT: AtomicBool = AtomicBool::new(false);
+static CUTS: OnceLock<Cuts> = OnceLock::new();
+
+/// `--exact-prefix-cache`: turn the grid on at the default G when
+/// `ATLAS_PREFILL_GRID` is unset. Call before the model is built; the cut
+/// set is read once.
+pub fn set_exact_prefix_cache(on: bool) {
+    if CUTS.get().is_some() {
+        tracing::warn!("--exact-prefix-cache set after the prefill grid was read; ignored");
+    }
+    EXACT.store(on, Ordering::Relaxed);
+}
+
+/// Coarse grid used by `--exact-prefix-cache`, in tokens.
 pub const DEFAULT_PREFILL_GRID: usize = 4096;
 
 /// A fixed cut set: multiples of `g`, plus multiples of `f` below `g`.
@@ -144,17 +161,22 @@ fn parse_size(v: Option<&str>, default: usize) -> usize {
     }
 }
 
-/// Parse `ATLAS_PREFILL_GRID`: unset -> default, "0" -> off.
-pub fn parse_grid(v: Option<&str>) -> usize {
-    parse_size(v, DEFAULT_PREFILL_GRID)
+/// Grid size from `ATLAS_PREFILL_GRID` and `--exact-prefix-cache`: an
+/// explicit value wins ("0" = off, invalid = the flag's choice); unset ->
+/// `DEFAULT_PREFILL_GRID` with the flag, off without it.
+pub fn parse_grid(v: Option<&str>, exact: bool) -> usize {
+    let default = if exact { DEFAULT_PREFILL_GRID } else { 0 };
+    parse_size(v, default)
 }
 
 /// The active cut set (read once from the environment).
 pub fn cuts() -> Cuts {
-    static C: OnceLock<Cuts> = OnceLock::new();
-    *C.get_or_init(|| {
+    *CUTS.get_or_init(|| {
         Cuts::new(
-            parse_grid(std::env::var("ATLAS_PREFILL_GRID").ok().as_deref()),
+            parse_grid(
+                std::env::var("ATLAS_PREFILL_GRID").ok().as_deref(),
+                EXACT.load(Ordering::Relaxed),
+            ),
             parse_size(std::env::var("ATLAS_PREFILL_GRID_FINE").ok().as_deref(), 0),
         )
     })
@@ -171,10 +193,16 @@ mod tests {
 
     #[test]
     fn parse() {
-        assert_eq!(parse_grid(None), DEFAULT_PREFILL_GRID);
-        assert_eq!(parse_grid(Some("0")), 0);
-        assert_eq!(parse_grid(Some("1024")), 1024);
-        assert_eq!(parse_grid(Some("100")), DEFAULT_PREFILL_GRID);
+        // Off by default; --exact-prefix-cache turns on the default grid.
+        assert_eq!(parse_grid(None, false), 0);
+        assert_eq!(parse_grid(None, true), DEFAULT_PREFILL_GRID);
+        // An explicit ATLAS_PREFILL_GRID wins either way.
+        assert_eq!(parse_grid(Some("0"), true), 0);
+        assert_eq!(parse_grid(Some("1024"), false), 1024);
+        assert_eq!(parse_grid(Some("1024"), true), 1024);
+        // Invalid values fall back to the flag's choice.
+        assert_eq!(parse_grid(Some("100"), false), 0);
+        assert_eq!(parse_grid(Some("100"), true), DEFAULT_PREFILL_GRID);
         assert_eq!(Cuts::new(4096, 1000).f, 0);
         assert_eq!(Cuts::new(4096, 1024).f, 1024);
     }

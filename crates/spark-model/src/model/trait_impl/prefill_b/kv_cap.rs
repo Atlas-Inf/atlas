@@ -27,7 +27,10 @@ impl TransformerModel {
         kv_cache: &mut PagedKvCache,
     ) -> bool {
         let bs = kv_cache.block_size();
-        if snap_tok >= *matched
+        // Part of the exact path: off with the grid, so default cache-on
+        // keeps main's KV reuse.
+        if self.prefill_grid() == 0
+            || snap_tok >= *matched
             || std::env::var("ATLAS_PREFIX_KV_CAP").as_deref() == Ok("0")
             || !snap_tok.is_multiple_of(bs)
             || !seq.disk_block_ids.is_empty()

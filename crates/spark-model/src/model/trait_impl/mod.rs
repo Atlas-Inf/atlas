@@ -310,7 +310,10 @@ impl Model for TransformerModel {
         // changes it. A chunk ending exactly at the anchor still normalizes —
         // the snapshot there was saved before the cold run's normalize.
         // `ATLAS_NORM_ALL_CHUNKS=1` restores the old always-normalize.
-        chunk_end >= seq.marconi_skip_to
+        // Only under the grid (`--exact-prefix-cache`); otherwise main's
+        // always-normalize.
+        self.prefill_grid() == 0
+            || chunk_end >= seq.marconi_skip_to
             || std::env::var("ATLAS_NORM_ALL_CHUNKS").as_deref() == Ok("1")
     }
     fn bind_gpu_to_thread(&self) -> Result<()> {
