@@ -7,7 +7,7 @@ use super::super::super::types::TransformerModel;
 impl TransformerModel {
     /// R11 fix 1: active prefill pass grid in tokens for this model, 0 = off.
     /// Only hybrid-SSM models (whose warm path replays from an SSM anchor)
-    /// use it; `ATLAS_PREFILL_GRID=0` turns it off.
+    /// use it. Off unless `--exact-prefix-cache` or `ATLAS_PREFILL_GRID`.
     pub(in super::super) fn prefill_grid(&self) -> usize {
         if self.config.num_ssm_layers() == 0 {
             return 0;
@@ -15,7 +15,7 @@ impl TransformerModel {
         let g = spark_runtime::prefill_grid::prefill_grid();
         if g > 0 && !spark_runtime::prefill_grid::subblock_disabled() {
             spark_runtime::prefill_grid::disable_subblock();
-            tracing::info!("prefill pass grid: {g} tokens (ATLAS_PREFILL_GRID=0 turns it off)");
+            tracing::info!("exact prefix cache: prefill pass grid {g} tokens");
         }
         g
     }
