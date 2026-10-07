@@ -17,10 +17,17 @@ use super::*;
 ///
 /// Resolves the effective type from a JSON schema property, handling `anyOf`/`oneOf`
 /// wrappers (e.g., Pydantic v2's `Optional[int]` → `{"anyOf": [{"type":"integer"},{"type":"null"}]}`).
-fn resolve_schema_type(schema: &serde_json::Value) -> Option<&str> {
-    // Direct "type" field
-    if let Some(t) = schema.get("type").and_then(|t| t.as_str()) {
-        return Some(t);
+pub(super) fn resolve_schema_type(schema: &serde_json::Value) -> Option<&str> {
+    // Direct "type" field, or the first non-null member of a type array
+    // (`["integer", "null"]`).
+    match schema.get("type") {
+        Some(serde_json::Value::String(t)) => return Some(t),
+        Some(serde_json::Value::Array(types)) => {
+            if let Some(t) = types.iter().filter_map(|t| t.as_str()).find(|t| *t != "null") {
+                return Some(t);
+            }
+        }
+        _ => {}
     }
     // anyOf / oneOf: pick first non-null type
     for key in ["anyOf", "oneOf"] {
