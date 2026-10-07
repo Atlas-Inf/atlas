@@ -46,6 +46,7 @@ impl Qwen3SsmLayer {
             qkvz_fp8w_t: None,
             out_proj_fp8w_t: None,
             qkvz_fp8w_rowwise: None,
+            exl3_decode: None,
             out_proj_fp8w_rowwise: None,
             qkvz_q2: None,
             q2_0_gemv_k: super::super::try_kernel(gpu, "q2_0_gemv_vec", "q2_0_gemv_vec"),

@@ -128,6 +128,14 @@ impl TransformerModel {
         self.ngram_embed.is_some()
     }
 
+    /// Install the native EXL3 LM head decode overlay
+    /// (`--exl3-native-decode`). Once set, the 1- and 2-row `lm_head`
+    /// forwards run the int8 sq GEMV on the packed weight; wider calls keep
+    /// the BF16 copy.
+    pub fn set_lm_head_exl3(&mut self, d: crate::layers::ops::Exl3LinearDecode) {
+        self.lm_head_exl3 = Some(Box::new(d));
+    }
+
     /// True when MLA prefill cannot honour a prefix-cache skip.
     ///
     /// `paged_mla`'s flash call is fed the K/V it just assembled — its own

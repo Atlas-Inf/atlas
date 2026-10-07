@@ -13,6 +13,8 @@ The `.cuh` files in this directory are adapted from ExLlamaV3 by turboderp-org:
     half4.cuh           exllamav3_ext/util.cuh lines 8-18 (the half4 struct only)
     ptx_frag.cuh        exllamav3_ext/ptx.cuh (fragment types, lines 1-16)
     half_uint16.cuh     exllamav3_ext/util.cuh (half_uint16 union, lines 83-91)
+    exl3_gemv_int8_kernel.cuh  exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh (int8 sq GEMV; adapted, see Modifications)
+    exl3_util.cuh       exllamav3_ext/util.h + ptx.cuh (CEIL_DIVIDE/MIN/MAX, cp_async helpers)
 
 Only device code is vendored; the torch/ATen host launchers are replaced by Atlas extern "C" entry points
 (../exl3.cu) and Rust launchers. Each file keeps the AGPL SPDX line Atlas requires plus this MIT notice.

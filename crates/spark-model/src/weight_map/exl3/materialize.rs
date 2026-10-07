@@ -9,6 +9,8 @@
 //! reads it as a plain BF16 linear — no per-site EXL3 branch. The experts
 //! keep their packing until `quantized_any` asks for them (see `requant`).
 
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::{WeightDtype, WeightStore, WeightTensor};
@@ -18,6 +20,43 @@ use crate::weight_map::exl3::exl3_from_store;
 
 /// The four tensors one packed EXL3 linear arrives as.
 const PACKED_SUFFIXES: [&str; 4] = ["trellis", "suh", "svh", "mul1"];
+
+static NATIVE_DECODE: OnceLock<bool> = OnceLock::new();
+
+/// Record `--exl3-native-decode` at serve startup, before any model loads.
+/// The first call wins; returns the value in force.
+pub fn set_exl3_native_decode(on: bool) -> bool {
+    *NATIVE_DECODE.get_or_init(|| on)
+}
+
+/// Native EXL3 decode (`--exl3-native-decode`): GDN, attention and LM-head
+/// decode run the int8 sq GEMV on the packed EXL3 weights instead of the BF16
+/// materialized copies, so those tensors must survive materialize. Off unless
+/// the serve flag set it (tests and tools that never call the setter get off).
+pub fn exl3_native_decode() -> bool {
+    NATIVE_DECODE.get().copied().unwrap_or(false)
+}
+
+/// True iff the packed four of `stem` must survive materialize: only under
+/// the native-decode gate, and only for the three GDN projections, the four
+/// full-attention projections and the LM head the decode overlays consume
+/// (everything else keeps the BF16-only behavior).
+pub(crate) fn keeps_packed_with(stem: &str, native: bool) -> bool {
+    native
+        && (stem.ends_with(".linear_attn.in_proj_qkv")
+            || stem.ends_with(".linear_attn.in_proj_z")
+            || stem.ends_with(".linear_attn.out_proj")
+            || stem.ends_with(".self_attn.q_proj")
+            || stem.ends_with(".self_attn.k_proj")
+            || stem.ends_with(".self_attn.v_proj")
+            || stem.ends_with(".self_attn.o_proj")
+            || stem == "lm_head")
+}
+
+/// [`keeps_packed_with`] with the serve flag applied.
+pub(crate) fn keeps_packed(stem: &str) -> bool {
+    keeps_packed_with(stem, exl3_native_decode())
+}
 
 /// Stems (name minus `.trellis`) of the DENSE packed linears in `names`,
 /// sorted. Excludes routed and shared experts — those stay packed until the
@@ -53,15 +92,19 @@ pub fn exl3_materialize_dense(
         let buf = gpu.alloc(out * in_features * 2)?;
         exl3_dense_bf16_nk(gpu, &kernels, &w, buf, stream)?;
         gpu.synchronize(stream)?;
-        for suffix in PACKED_SUFFIXES {
-            let name = format!("{stem}.{suffix}");
-            // Ask before removing: a reclaimed tensor's pointer is dead and
-            // must not be freed a second time.
-            let reclaimed = store.was_reclaimed(&name);
-            if let Some(t) = store.remove(&name)
-                && !reclaimed
-            {
-                gpu.free(t.ptr)?;
+        // Under the native-decode gate the GDN projections keep their packing
+        // (the BF16 `.weight` above still serves prefill).
+        if !keeps_packed(&stem) {
+            for suffix in PACKED_SUFFIXES {
+                let name = format!("{stem}.{suffix}");
+                // Ask before removing: a reclaimed tensor's pointer is dead and
+                // must not be freed a second time.
+                let reclaimed = store.was_reclaimed(&name);
+                if let Some(t) = store.remove(&name)
+                    && !reclaimed
+                {
+                    gpu.free(t.ptr)?;
+                }
             }
         }
         store.insert(

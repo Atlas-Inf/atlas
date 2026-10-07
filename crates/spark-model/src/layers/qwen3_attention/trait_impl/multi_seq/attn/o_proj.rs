@@ -137,6 +137,10 @@ impl Qwen3AttentionLayer {
                 let o_out_i = o_out.offset(i * h * bf16);
                 ops::q2_0_gemv_vec(fwd.gpu, self.q2_0_gemv_k, attn_out_i, q2, o_out_i, stream)?;
             }
+        } else if n <= 2
+            && let Some(ref e) = self.exl3_attn
+        {
+            e.o.forward_bf16(fwd.gpu, attn_out, n as u32, o_out, h, stream)?;
         } else if let Some(o_bf16) = self.o_dense_bf16.as_ref() {
             // ATLAS_FP8_DEQUANT_ATTN_TO_BF16: O-proj dequanted to BF16 at load.
             // attn_out is contiguous [n, q_dim] and o_out is [n, h], so a single
