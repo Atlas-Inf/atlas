@@ -63,9 +63,8 @@ impl MoeLayer {
         let weights_correction_bias: Option<DevicePtr> =
             weights.correction_bias.map(|dw| dw.weight);
 
-        // Resolve the gfx1151 F16-operand twins AND whether both resolved —
-        // production prefill only engages the pair (forward_prefill_routed.rs
-        // launches them via the n128 launchers when `moe_f16_prefill` holds).
+        // Resolve the gfx1151 F16-operand twins + whether both resolved; the
+        // forward engages them via the n128 launchers when `moe_f16_prefill` holds.
         let (moe_grouped_gemm_t, moe_fused_gate_up_t, moe_f16_prefill) =
             crate::layers::ops::moe_f16_prefill_handles(gpu)?;
 
