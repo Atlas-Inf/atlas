@@ -145,6 +145,17 @@ impl TransformerModel {
             "dense_gemv_fp8w_batch2",
             "dense_gemv_fp8w_batch2",
         );
+        // BF16 dual-GEMV (batch=2) for the K=2 verify lm_head on a BF16 LM
+        // head. Every build's kernel is bit-identical to two `dense_gemv_bf16`
+        // calls: the strix-hip pair walks 32 lanes per row, the gb10/strix
+        // (NVIDIA) pair 64 lanes per row with the same smem pair-sum, and in
+        // both the second token is only an extra accumulator. Absent kernel ->
+        // handle 0 -> the two-GEMV fallback.
+        let dense_gemv_bf16_batch2_kernel = crate::layers::try_kernel(
+            gpu.as_ref(),
+            "dense_gemv_bf16_batch2",
+            "dense_gemv_bf16_batch2",
+        );
         let dense_gemm_kernel = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let dense_gemv_batchm_kernel = gpu
             .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
@@ -671,6 +682,7 @@ impl TransformerModel {
             w4a16_gemv_batch16_kernel,
             dense_gemv_fp8w_kernel,
             dense_gemv_fp8w_batch2_kernel,
+            dense_gemv_bf16_batch2_kernel,
             lm_head_dp4a_gemv_kernel,
             lm_head_dp4a_quant_kernel,
             dense_gemm_kernel,
