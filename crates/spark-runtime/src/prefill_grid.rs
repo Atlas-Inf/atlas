@@ -26,7 +26,8 @@
 //! Off by default: the grid makes a warm turn re-prefill up to G tokens past
 //! its last cut (main resumes at the end-of-turn snapshot), which costs ~50%
 //! wall time on long agentic replays at G = 4096. `--exact-prefix-cache`
-//! turns it on at G = 4096; `ATLAS_PREFILL_GRID` = G sets it explicitly
+//! turns it on at G = 1024 (GB10 Flash-Next agentic replay: +11% wall vs
+//! main at 1024, +29% at 512, +53% at 4096); `ATLAS_PREFILL_GRID` = G sets it explicitly
 //! (overrides the flag; 0 = off, i.e. main's layout: tail split, leaf /
 //! decode / finish-leaf snapshots). `ATLAS_PREFILL_GRID_FINE`
 //! = F (default 0 = none). Both must be multiples of 64 (GDN sub-chunk, KV
@@ -63,7 +64,7 @@ pub fn set_exact_prefix_cache(on: bool) {
 }
 
 /// Coarse grid used by `--exact-prefix-cache`, in tokens.
-pub const DEFAULT_PREFILL_GRID: usize = 4096;
+pub const DEFAULT_PREFILL_GRID: usize = 1024;
 
 /// A fixed cut set: multiples of `g`, plus multiples of `f` below `g`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
