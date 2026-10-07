@@ -143,10 +143,22 @@ Strix Halo is a unified-memory APU, so the validated path is the native binary b
 ```bash
 git clone https://github.com/Atlas-Inf/atlas.git
 cd atlas
+
+# Prerequisites — install Rust first (rust-toolchain.toml pins the version;
+# distro-packaged rustc is too old), plus ROCm's hipcc + headers:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+sudo apt install rocm-hip-dev
+
 ./build-amd.sh                              # strix-hip backend, all targets, needs ROCm + cargo
 ./serve-amd.sh                              # nvidia/Qwen3.8-27B-NVFP4, validated config
 ./serve-amd.sh unsloth/Qwen3.8-27B-NVFP4    # or the preservation checkpoint
 ```
+
+`./build-amd.sh` preflights hipcc, the HIP headers, and cargo and says what's
+missing instead of failing 120 kernel compiles in (a hipcc with no dev headers
+dies as `'hip/hip_runtime.h' file not found`). If ROCm lives outside
+`/opt/rocm`, point `ATLAS_HIPCC` and `ATLAS_ROCM_HOME` at it.
 
 Defaults are the validated config. K=4 MTP speculative, the W4A8 DP4A decode arm, BF16 KV. `NUM_DRAFTS=0` disables speculation, `LM_HEAD=bf16` switches for the unsloth checkpoint's per-row-FP8 lm_head, and `ATLAS_W4A16_DP4A=0` opts out of DP4A. The `ATLAS_FP8_DEQUANT_*` and `ATLAS_GDN_BF16_WEIGHTS` exports are baked in and required for unsloth.
 
@@ -157,6 +169,11 @@ Measured on a Ryzen AI Max+ 395 with Radeon 8060S under ROCm 7.13 at ~60 GB GTT.
 ```powershell
 git clone https://github.com/Atlas-Inf/atlas.git
 cd atlas
+
+# Prerequisites — Rust via rustup (rust-toolchain.toml pins the version;
+# do not use the Store/other distro rust), MSVC Desktop C++, and the
+# ROCm SDK with HIP_PATH set:
+winget install Rustlang.Rustup   # or https://rustup.rs
 
 hf download nvidia/Qwen3.8-27B-NVFP4 `
   --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-27B-NVFP4"
