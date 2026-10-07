@@ -170,6 +170,11 @@ Measured on a Ryzen AI Max+ 395 with Radeon 8060S under ROCm 7.13 at ~60 GB GTT.
 git clone https://github.com/Atlas-Inf/atlas.git
 cd atlas
 
+# Prerequisites — Rust via rustup (rust-toolchain.toml pins the version;
+# do not use the Store/other distro rust), MSVC Desktop C++, and the
+# ROCm SDK with HIP_PATH set:
+winget install Rustlang.Rustup   # or https://rustup.rs
+
 hf download nvidia/Qwen3.8-27B-NVFP4 `
   --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-27B-NVFP4"
 
