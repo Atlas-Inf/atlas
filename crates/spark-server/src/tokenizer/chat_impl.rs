@@ -109,11 +109,20 @@ impl ChatTokenizer {
         // Load OpenAI-variant template if it exists (jinja-templates/openai/{model_type}.jinja).
         // This variant gates historical <think> wrappers on enable_thinking, preventing
         // spontaneous thinking during tool-use when thinking is disabled.
-        let openai_jinja_env = super::jinja_helpers::load_openai_template(model_type, repo_root)
-            .and_then(|tmpl| {
+        //
+        // It lives under `jinja-templates/` too, so `--disable-template-overrides`
+        // skips it: the flag promises the MODEL's own template, and the chat
+        // completions path renders through this variant whenever it exists. Before
+        // this, Qwen3.6-35B kept the qwen3_5_moe variant under the flag — and that
+        // variant ignores `preserve_thinking`, dropping prior-turn reasoning.
+        let openai_jinja_env = if disable_template_overrides {
+            None
+        } else {
+            super::jinja_helpers::load_openai_template(model_type, repo_root).and_then(|tmpl| {
                 tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
                 super::jinja_helpers::build_jinja_env(&tmpl).ok()
-            });
+            })
+        };
         let chat_encoding = if model_type == "deepseek_v4" {
             tracing::info!("Using checkpoint-native DeepSeek-V4 message encoding");
             ChatEncoding::DeepseekV4

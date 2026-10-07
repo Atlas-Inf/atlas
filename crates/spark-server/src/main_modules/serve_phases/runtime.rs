@@ -115,15 +115,25 @@ pub(crate) fn resolve_sampling_defaults(
         .and_then(|v| v.get("top_p")?.as_f64())
         .map(|p| p as f32)
         .unwrap_or(preset.top_p);
+    // `--reference-mode`: a field generation_config.json does not set is
+    // disabled (0.0), as on a reference server, not the CLI's 0.08 / 1.0.
     let top_n_sigma = gen_cfg
         .and_then(|v| v.get("top_n_sigma")?.as_f64())
         .map(|s| s as f32)
-        .unwrap_or(args.default_top_n_sigma);
+        .unwrap_or(if args.reference_mode {
+            0.0
+        } else {
+            args.default_top_n_sigma
+        });
     let min_p = gen_cfg
         .and_then(|v| v.get("min_p")?.as_f64())
         .map(|p| p as f32)
-        .or(preset.min_p)
-        .unwrap_or(args.default_min_p);
+        .or(if args.reference_mode { None } else { preset.min_p })
+        .unwrap_or(if args.reference_mode {
+            0.0
+        } else {
+            args.default_min_p
+        });
     SamplingDefaults {
         temperature,
         top_k,

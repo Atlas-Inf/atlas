@@ -764,6 +764,22 @@ pub(crate) fn load_model(
     // The --enable-thinking flag controls OPEN-ENDED vs CLOSED thinking.
     let caps = config.capabilities();
     let supports_thinking = caps.supports_thinking;
+    // `--reference-mode`: one neutralized copy of `[behavior]`, read below by
+    // the watchdogs, the chat levers and AppState alike.
+    let behavior = {
+        let mut b = ptx_set.behavior.clone();
+        if args.reference_mode {
+            crate::main_modules::reference_mode::neutralize_behavior(&mut b);
+            let changes =
+                crate::main_modules::reference_mode::describe_changes(&ptx_set.behavior, &b);
+            tracing::warn!(
+                "REFERENCE MODE: client sampling only, model's own chat template, no injected \
+                 prompt text, all output watchdogs off. [behavior] changes: {}",
+                if changes.is_empty() { "none".to_string() } else { changes.join(", ") }
+            );
+        }
+        b
+    };
     let tokenizer = ChatTokenizer::from_model_dir(
         &model_dir,
         eos_tokens[0],
@@ -771,7 +787,7 @@ pub(crate) fn load_model(
         &config.model_type,
         ptx_set.behavior.jinja_template,
         Some(std::path::Path::new(".")), // repo root for override templates
-        args.disable_template_overrides,
+        args.disable_template_overrides || args.reference_mode,
     )?;
 
     // (AM1 attractor-mask registration removed 2026-06-03 — see
@@ -952,7 +968,7 @@ pub(crate) fn load_model(
     // cap per architecture.
     let scheduler_spontaneous_think_budget = args
         .max_thinking_budget
-        .unwrap_or(ptx_set.behavior.max_thinking_budget);
+        .unwrap_or(behavior.max_thinking_budget);
     // DFlash mode: the drafter proposes on raw argmax, so the verify steps
     // must judge acceptance on the same (GOLD) basis — skipping the
     // rep_pen/DRY pre-sample pipeline — or drafter and verifier disagree by
@@ -970,18 +986,32 @@ pub(crate) fn load_model(
     // spawns — the installer this replaces ran from `log_behavior_audit`,
     // which is called well after the spawn.
     let watchdog_params = crate::scheduler::WatchdogParams::from_behavior(
-        &ptx_set.behavior,
-        args.max_inter_tool_prose,
+        &behavior,
+        if args.reference_mode {
+            Some(0)
+        } else {
+            args.max_inter_tool_prose
+        },
         args.content_loop_min_repeats,
     );
     // The run's levers. Shared with the dashboard so `/watchdog on|off`
     // toggles this run's flag; the MODEL.toml `[behavior]` value is its
     // starting position.
-    let sched_levers = std::sync::Arc::new(crate::scheduler::levers::SchedLevers::from_env());
+    let sched_levers = std::sync::Arc::new({
+        let mut l = crate::scheduler::levers::SchedLevers::from_env();
+        if args.reference_mode {
+            l.disable_watchdogs = true;
+        }
+        l
+    });
     sched_levers.set_loop_watchdog(crate::scheduler::resolve_content_loop_watchdog(
-        ptx_set.behavior.enable_loop_watchdog,
+        behavior.enable_loop_watchdog,
         std::env::var("ATLAS_CONTENT_LOOP_WATCHDOG").ok().as_deref(),
-        args.content_loop_watchdog,
+        if args.reference_mode {
+            Some(false)
+        } else {
+            args.content_loop_watchdog
+        },
     ));
     // The run's snapshot cell, shared with the dashboard for the same reason
     // and by the same route as the levers.
@@ -1221,11 +1251,18 @@ pub(crate) fn load_model(
         } else {
             Some(rotation_tx)
         },
-        chat: crate::api::chat::levers::ChatLevers::resolve(
-            ptx_set.behavior.tscg,
-            ptx_set.behavior.template_owns_tool_definitions,
-            ptx_set.behavior.disable_cwd_hint_injection,
-        ),
+        chat: {
+            let mut c = crate::api::chat::levers::ChatLevers::resolve(
+                behavior.tscg,
+                behavior.template_owns_tool_definitions,
+                behavior.disable_cwd_hint_injection,
+            );
+            if args.reference_mode {
+                // The in-think tool-leak guard ends a response early.
+                c.in_think_leak_openers = 0;
+            }
+            c
+        },
         vision_config: config.vision.clone(),
         vision_max_pixels,
         remote_image_policy,
@@ -1248,7 +1285,7 @@ pub(crate) fn load_model(
         // Behavior and effective_context from MODEL.toml, embedded at build time.
         effective_context: 0, // TODO: embed effective_context in TargetPtxSet
         behavior: {
-            let mut b = ptx_set.behavior.clone();
+            let mut b = behavior.clone();
             if let Some(cli_budget) = args.max_thinking_budget {
                 b.max_thinking_budget = cli_budget;
             }
@@ -1265,6 +1302,7 @@ pub(crate) fn load_model(
             b
         },
         disable_thinking: args.disable_thinking,
+        reference_mode: args.reference_mode,
         default_thinking: default_kwargs.thinking,
         default_reasoning_effort: default_kwargs.reasoning_effort,
         response_store,
