@@ -605,9 +605,9 @@ pub struct ServeArgs {
 
     /// Make prefix-cache hits on hybrid-SSM models give the same output as
     /// caching off at temperature 0 (#158). Prefill passes and SSM snapshots
-    /// sit on a fixed 4096-token grid, so a warm turn re-prefills up to one
+    /// sit on a fixed 1024-token grid, so a warm turn re-prefills up to one
     /// grid step past its last cut. Costs throughput on long agentic replays
-    /// (~50% wall at G = 4096 on GB10 Flash-Next). `ATLAS_PREFILL_GRID=N`
+    /// (~11% wall at G = 1024 on GB10 Flash-Next). `ATLAS_PREFILL_GRID=N`
     /// overrides the grid size.
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
     pub exact_prefix_cache: bool,
