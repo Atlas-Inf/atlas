@@ -345,13 +345,14 @@ min = 85.0
 fn the_trees_serve_pins_sit_on_the_gates_that_need_them() {
     let root = repo_root();
 
-    // Gate B: the 35B echolp draw self-starts with the Marconi pool pinned, so
-    // a 1004-sample serial generate cannot evict its own snapshots — with the
-    // ratcheted floors untouched.
+    // Gate B: the NVFP4 35B echolp draw self-starts with the Marconi pool
+    // pinned, so a 1004-sample serial generate cannot evict its own snapshots —
+    // with the floors from its first GB10 measurement untouched.
     let echolp = baseline_for(&root, "bfcl-subset-echolp").unwrap();
-    let (_, e) = echolp.resolve("gb10", None).unwrap();
-    assert_eq!(e.metrics["overall_accuracy"].min, Some(86.50));
-    assert_eq!(e.metrics["normalized_single_turn_score"].min, Some(86.90));
+    let (ck, e) = echolp.resolve("gb10", None).unwrap();
+    assert_eq!(ck, "nvidia/Qwen3.6-35B-A3B-NVFP4");
+    assert_eq!(e.metrics["overall_accuracy"].min, Some(81.72));
+    assert_eq!(e.metrics["normalized_single_turn_score"].min, Some(73.66));
     assert_eq!(e.metrics["samples"].min, Some(1004.0));
     assert_eq!(e.metrics["samples"].max, Some(1004.0));
     assert_eq!(
@@ -364,10 +365,11 @@ fn the_trees_serve_pins_sit_on_the_gates_that_need_them() {
     // `--pull-request-gate` run needs no operator flags at all and still
     // matches the config probe.rs documents as required.
     let poison = baseline_for(&root, "ssm-state-poisoning-gate").unwrap();
-    let (_, p) = poison.resolve("gb10", None).unwrap();
+    let (ck, p) = poison.resolve("gb10", None).unwrap();
+    assert_eq!(ck, "nvidia/Qwen3.8-27B-NVFP4");
     assert_eq!(
         p.serve_overrides.get("ssm_cache_slots").map(String::as_str),
-        Some("256")
+        Some("64")
     );
     assert_eq!(
         p.serve_overrides
