@@ -179,7 +179,7 @@ extern "C" __global__ void w4a16_gemm(
 // w4a16_gemm, and identical math: every dequantized weight is exactly
 // __float2bfloat16(E2M1_LUT[nibble] * scl_fp8(sb) * scale2), the WMMA
 // fragments are built the same way (a[i] = sA[wm + (lane&15)][16*s+i],
-// b[k] = sB[16*s+k][nb*16 + (lane&15)]), and each 16x16 subtile accumulates
+// b[k] = sB[16*s+k][nb*16 + (lane&15)]), and each 16x16 sub-tile accumulates
 // its WMMA k-steps kb = 0,16,32,... in the SAME ascending order. Only the
 // staging changes:
 //   * 64 K per stage (4 WMMA k-steps between one barrier pair instead of 2
