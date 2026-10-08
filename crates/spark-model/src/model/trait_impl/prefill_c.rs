@@ -458,7 +458,7 @@ impl TransformerModel {
             graph_capture: false,
             // Marconi warm hit: GDN layers replay from a restored SSM state
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
-            gdn_exact_replay: marconi_skip,
+            gdn_exact_replay: marconi_skip && !self.grid_replay_is_cold(),
             token_ids: None,
             host_token_ids: None,
             // #30: request slot pairs (None unless routing to a non-active slot).

@@ -603,6 +603,16 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
     pub enable_prefix_caching: bool,
 
+    /// Make prefix-cache hits on hybrid-SSM models give the same output as
+    /// caching off **with this flag** at temperature 0 (#158). Both arms use
+    /// a fixed 1024-token prefill grid, so a warm turn re-prefills up to one
+    /// grid step past its last cut, and exact-mode outputs differ from
+    /// default-mode outputs. Costs throughput on long agentic replays
+    /// (+3–11% wall at G = 1024 on GB10 Flash-Next, same box). `ATLAS_PREFILL_GRID=N`
+    /// overrides the grid size.
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
+    pub exact_prefix_cache: bool,
+
     /// Dump every /v1/chat/completions, /v1/responses, and
     /// /v1/messages (Anthropic) request — plus the corresponding
     /// response (non-streaming) or aggregated stream — as JSONL to a

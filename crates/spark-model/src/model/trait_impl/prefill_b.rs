@@ -33,6 +33,7 @@ mod embed_chunk;
 mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
+mod kv_cap;
 mod midchunk_capture;
 mod prefix_lookup;
 mod proc_range;
@@ -92,7 +93,36 @@ impl TransformerModel {
         // across ranks (bug #33 invariant). Skipped for vision prompts (pad
         // runs must not straddle chunk boundaries) and non-SSM models
         // (KV-only cache hits need no snapshot).
-        if is_last_chunk
+        // R11 fix 1: position-fixed pass grid (spark_runtime::prefill_grid).
+        // Every pass ends at a grid multiple or the prompt end, with prefix
+        // caching on or off, so a warm replay from a grid anchor runs the same
+        // passes as a cold run. Replaces the tail split below while active
+        // (`ATLAS_PREFILL_GRID=0` restores it).
+        let grid = self.prefill_grid();
+        if grid > 0
+            && !self.tokens_have_vision_pad(tokens)
+            && let Some(cut) =
+                spark_runtime::prefill_grid::cuts().cut(chunk_start, chunk_start + chunk_len)
+        {
+            self.prefill_chunk_dispatch(
+                tokens,
+                seq,
+                chunk_start,
+                cut - chunk_start,
+                false,
+                stream,
+            )?;
+            return self.prefill_chunk_dispatch(
+                tokens,
+                seq,
+                cut,
+                chunk_start + chunk_len - cut,
+                is_last_chunk,
+                stream,
+            );
+        }
+        if grid == 0
+            && is_last_chunk
             && self.config.num_ssm_layers() > 0
             && self.ssm_snapshots.is_enabled()
             && self.prefix_cache.is_active()

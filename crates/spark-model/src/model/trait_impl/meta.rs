@@ -28,6 +28,8 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+mod grid;
+
 impl TransformerModel {
     pub(super) fn vocab_size_dispatch(&self) -> usize {
         self.config.vocab_size

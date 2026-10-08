@@ -116,7 +116,10 @@ impl TransformerModel {
             graph_capture: false,
             // Marconi warm hit: GDN layers replay from a restored SSM state
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
-            gdn_exact_replay: marconi_skip,
+            // R11 fix 6: under the prefill grid a warm replay pass IS a cold
+            // pass (same start, same length), so the cold run's FLA kernel is
+            // the bit-faithful one; forcing WY4 here made warm != cold.
+            gdn_exact_replay: marconi_skip && !self.grid_replay_is_cold(),
             // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
             // to the stable buffer, in chunk order matching the MoE loop).
             token_ids: Some(self.buffers.token_ids()),

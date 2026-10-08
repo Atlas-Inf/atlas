@@ -23,7 +23,9 @@ impl TransformerModel {
         chunk_len: usize,
         stream: u64,
     ) -> Result<()> {
-        if !self.ssm_snapshots.is_enabled() {
+        if !self.ssm_snapshots.is_enabled()
+            || (self.prefill_grid() > 0 && !self.prefix_cache.is_active())
+        {
             return Ok(());
         }
         let bs = kv_cache.block_size();
@@ -63,7 +65,16 @@ impl TransformerModel {
         // and is deliberately NOT made here; it needs its own measured A/B.
         let on_interval = self.ssm_checkpoint_interval > 0
             && end_block.is_multiple_of(self.ssm_checkpoint_interval);
-        if end_block == 0 || !(is_prompt_tail || on_interval) {
+        // R11 fix 1: under the pass grid, checkpoint ONLY at the last two grid
+        // points below the prompt end (the passes there are full grid passes
+        // in every run, so the anchor state is layout-independent).
+        let grid = self.prefill_grid();
+        let wanted = if grid > 0 {
+            spark_runtime::prefill_grid::cuts().is_checkpoint(end_token, tokens.len())
+        } else {
+            is_prompt_tail || on_interval
+        };
+        if end_block == 0 || !wanted {
             return Ok(());
         }
         // Stale-V cap (mirrors finalize_last): never checkpoint-cache a block
@@ -146,6 +157,8 @@ impl TransformerModel {
         if !aux.is_empty() {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }
+        // R11 fix 7: the MTP drafter's hidden rows [0, end_token) ride along.
+        self.mtp_anchor_save(seq, tokens, snap_id, end_token, stream);
 
         let boundary_tokens = &tokens[..end_token];
         // Phase 6.3 sliding-window: when HSS is engaged AND sliding has begun
