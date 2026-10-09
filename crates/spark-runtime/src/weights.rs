@@ -301,6 +301,21 @@ impl WeightStore {
         gpu.free(t.ptr)
     }
 
+    /// Record tensors another owner has already freed, so `release` skips them.
+    ///
+    /// The unified MoE transpose frees each expert's original weights once its
+    /// K-major copy exists. Those originals are this store's tensors, so without
+    /// this `release` frees them again at teardown: ~147k `status 1` frees on
+    /// Flash-Next (#122). Pointers the store never held are harmless here.
+    pub fn mark_freed_elsewhere(&self, ptrs: &[DevicePtr]) -> Result<()> {
+        let mut seen = self
+            .reclaimed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("weight store reclaim set poisoned"))?;
+        seen.extend(ptrs.iter().filter(|p| !p.is_null()).map(|p| p.0));
+        Ok(())
+    }
+
     /// Bytes released so far by [`Self::reclaim`] — for the load-time memory trace.
     pub fn reclaimed_count(&self) -> usize {
         self.reclaimed.lock().map(|s| s.len()).unwrap_or(0)

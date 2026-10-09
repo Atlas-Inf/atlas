@@ -378,7 +378,7 @@ pub fn build_model(
     // window but not the pre-load one. Other loaders (qwen35, qwen3,
     // gemma4) still call `transpose_for_prefill` inline during layer
     // construction; this default-no-op hook doesn't perturb them.
-    maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &mut layers)?;
+    maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &store, &mut layers)?;
     // ── Step 4: Create buffer arena ──
     let buffers = BufferArena::new(
         &config,
