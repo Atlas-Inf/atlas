@@ -31,7 +31,28 @@ export ATLAS_NO_RDMA="${ATLAS_NO_RDMA:-1}"
 
 case "$ATLAS_TARGET_HW" in
   strix-hip)
-    export ATLAS_HIPCC="${ATLAS_HIPCC:-$ROCM_HOME/bin/hipcc}"
+    # Prefer an existing hipcc on PATH; fall back to $ROCM_HOME/bin.
+    if [ -z "${ATLAS_HIPCC:-}" ]; then
+      ATLAS_HIPCC="$(command -v hipcc || true)"
+      [ -n "$ATLAS_HIPCC" ] || ATLAS_HIPCC="$ROCM_HOME/bin/hipcc"
+    fi
+    export ATLAS_HIPCC
+    if [ ! -x "$ATLAS_HIPCC" ]; then
+      echo "hipcc not found at $ATLAS_HIPCC — install ROCm HIP dev tools:" >&2
+      echo "  sudo apt install rocm-hip-dev        # or amdgpu-install --usecase=hip" >&2
+      echo "  (override with ATLAS_HIPCC=/path/to/hipcc if ROCm lives elsewhere)" >&2
+      exit 2
+    fi
+    # hipcc must be able to find hip_runtime.h on its own. On partial installs
+    # (hipcc present, no dev headers) every kernel compile dies with
+    # "'hip/hip_runtime.h' file not found" — catch it here, not 120 kernels in.
+    HIP_INC_DIR="$(dirname "$(dirname "$(readlink -f "$ATLAS_HIPCC")")")/include"
+    if [ ! -f "$HIP_INC_DIR/hip/hip_runtime.h" ] && [ ! -f "$ROCM_HOME/include/hip/hip_runtime.h" ]; then
+      echo "hip_runtime.h not found beside $ATLAS_HIPCC or under $ROCM_HOME/include." >&2
+      echo "The HIP runtime headers are missing — install them:" >&2
+      echo "  sudo apt install rocm-hip-dev libamdhip64-dev" >&2
+      exit 2
+    fi
     export ATLAS_HIP_COMPAT_INCLUDE="$PWD/crates/atlas-kernels/hip/compat"
     export PATH="$ROCM_HOME/bin:$PATH"
     # Deliberately NO `RUSTFLAGS=-L .../hip-port/link`. atlas-kernels/build.rs
@@ -56,7 +77,12 @@ esac
 # rustup installs cargo to ~/.cargo/bin, which a non-interactive shell (ssh
 # "cmd", CI, systemd) does not get from the login profile.
 command -v cargo >/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
-command -v cargo >/dev/null || { echo "cargo not found; install Rust (rustup) first" >&2; exit 2; }
+if ! command -v cargo >/dev/null; then
+  echo "cargo not found — install Rust via rustup (distro rustc is too old;" >&2
+  echo "rust-toolchain.toml pins $(grep -m1 'channel' rust-toolchain.toml | tr -d 'channel =" ')):" >&2
+  echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" >&2
+  exit 2
+fi
 
 rm -rf "$TARGET_DIR"/release/build/atlas-kernels-* "$TARGET_DIR"/release/build/spark-storage-*
 cargo build --release -p spark-server --no-default-features --features cuda
