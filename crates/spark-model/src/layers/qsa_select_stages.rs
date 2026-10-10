@@ -307,12 +307,24 @@ impl QsaIndexer {
                 stream,
             )?;
         }
-        let l8 =
-            !tc && matches!(
-                std::env::var("ATLAS_QSA_ATTN_L8").as_deref(),
-                Ok("1") | Ok("true")
-            ) && ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn);
+        // `ATLAS_QSA_ATTN_L8` is refused outright on atlas_scale: the kernel
+        // faults on gfx1151 (winbox p9 gate, 2026-10-06) — see
+        // `ops::qsa_attn_l8_selectable`.
+        let l8_env = std::env::var("ATLAS_QSA_ATTN_L8").ok();
+        let l8 = !tc
+            && ops::qsa_attn_l8_selectable(
+                l8_env.as_deref(),
+                cfg!(atlas_scale),
+                ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn),
+            );
+        let l8_refused = !tc && l8_env.is_some() && !l8 && cfg!(atlas_scale);
         if !PREFILL_ATTN_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
+            if l8_refused {
+                tracing::warn!(
+                    "ATLAS_QSA_ATTN_L8 refused on this kernel target \
+                     (qsa_prefill_attn_l8 faults on gfx1151)"
+                );
+            }
             let variant = if tc3 {
                 "tc3"
             } else if tc2 {
