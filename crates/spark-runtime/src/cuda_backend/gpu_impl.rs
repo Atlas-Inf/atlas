@@ -304,9 +304,11 @@ impl GpuBackend for AtlasCudaBackend {
         height: usize,
         stream: u64,
     ) -> Result<()> {
-        // NVIDIA: one pitched copy (cudaMemcpyDeviceToDevice = 3) on the caller's
-        // stream via the cudart runtime, replacing a per-row copy_d2d_async loop.
-        #[cfg(not(atlas_scale))]
+        // NVIDIA and native HIP (strix-hip): one pitched copy
+        // (cudaMemcpyDeviceToDevice = 3) on the caller's stream via the cudart
+        // runtime — on HIP the cudart→HIP shim maps this to hipMemcpy2DAsync —
+        // replacing a per-row copy_d2d_async loop.
+        #[cfg(any(not(atlas_scale), atlas_hip))]
         {
             unsafe extern "C" {
                 fn cudaMemcpy2DAsync(
@@ -337,10 +339,11 @@ impl GpuBackend for AtlasCudaBackend {
             }
             Ok(())
         }
-        // strix/SCALE: no cudart runtime linked (SCALE's libcuda is driver-only).
-        // Fall back to the per-row driver-API loop this pitched copy replaced —
-        // `copy_d2d_async` uses `cuMemcpyDtoDAsync`, which SCALE provides.
-        #[cfg(atlas_scale)]
+        // strix/SCALE (not strix-hip): no cudart runtime linked (SCALE's
+        // libcuda is driver-only). Fall back to the per-row driver-API loop
+        // this pitched copy replaced — `copy_d2d_async` uses
+        // `cuMemcpyDtoDAsync`, which SCALE provides.
+        #[cfg(all(atlas_scale, not(atlas_hip)))]
         {
             for row in 0..height {
                 let s = DevicePtr(src.0 + (row * src_pitch) as u64);

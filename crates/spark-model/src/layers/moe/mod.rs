@@ -13,32 +13,6 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
 
-/// Device-side pointer table for one projection across all experts.
-///
-/// Enables GPU-side expert dispatch: the batched GEMV kernel reads
-/// expert_id from device memory, then indexes these tables to find
-/// the correct weight pointers — no CPU involvement needed.
-pub(crate) struct ExpertPtrTable {
-    /// `[num_experts]` u64 device pointers to each expert's B_packed.
-    pub(crate) packed_ptrs: DevicePtr,
-    /// `[num_experts]` u64 device pointers to each expert's B_scale.
-    pub(crate) scale_ptrs: DevicePtr,
-    /// `[num_experts]` f32 per-expert scale2 values.
-    pub(crate) scale2_vals: DevicePtr,
-}
-
-/// Device-side pointer table for FP8 expert dispatch (one projection).
-///
-/// FP8 experts use 2 pointer arrays (weight + block_scale) instead of
-/// NVFP4's 3 (packed + scale + scale2). The fused FP8 MoE kernel indexes
-/// these tables by expert_id to load the correct FP8 weight matrix.
-pub(crate) struct Fp8ExpertPtrTable {
-    /// `[num_experts]` u64 device pointers to each expert's FP8 weight.
-    pub(crate) weight_ptrs: DevicePtr,
-    /// `[num_experts]` u64 device pointers to each expert's block scales.
-    pub(crate) scale_ptrs: DevicePtr,
-}
-
 /// Checkpoint-native BF16 weights for a shared expert.
 ///
 /// This is intentionally independent of routed-expert precision. Models such
@@ -64,26 +38,6 @@ impl Bf16SharedExpert {
             down_proj,
         })
     }
-}
-
-/// Unified expert pointer table for any quantization format.
-///
-/// Replaces the separate `ExpertPtrTable` (NVFP4) and `Fp8ExpertPtrTable` (FP8)
-/// with a single enum. The MoE forward path matches on this to select the
-/// correct fused kernel (moe_shared_expert_fused vs moe_shared_expert_fused_fp8).
-#[allow(dead_code)]
-pub(crate) enum ExpertPtrSet {
-    /// NVFP4: 3 pointer arrays (packed_ptrs, scale_ptrs, per-expert scale2 f32).
-    Nvfp4 {
-        packed_ptrs: DevicePtr,
-        scale_ptrs: DevicePtr,
-        scale2_vals: DevicePtr,
-    },
-    /// FP8: 2 pointer arrays (weight_ptrs, block_scale_ptrs).
-    Fp8 {
-        weight_ptrs: DevicePtr,
-        scale_ptrs: DevicePtr,
-    },
 }
 
 /// MoE feed-forward network component.
@@ -284,6 +238,8 @@ pub struct MoeLayer {
     moe_grouped_gemm_t_k64: KernelHandle,
     moe_fused_gate_up_t: KernelHandle,
     moe_fused_gate_up_t_k64: KernelHandle,
+    /// Both `_f16a` routed-MoE twins resolved (native HIP only).
+    moe_f16_prefill: bool,
     // ARM-2 Phase-K: native-MXFP4 (E8M0 per-32) prefill variants of the W4A16
     // routed-expert GEMMs. KernelHandle(0) on models that don't ship them
     // (only the deepseek-v4-flash target compiles the `_e8m0` entries).
@@ -496,5 +452,7 @@ mod inplace_transpose;
 #[cfg(test)]
 mod mod_tests;
 mod ptr_table_build;
+mod types;
 mod union_stats;
 pub(crate) use ptr_table_build::*;
+pub(crate) use types::*;

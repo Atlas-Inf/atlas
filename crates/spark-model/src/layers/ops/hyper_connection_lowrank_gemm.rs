@@ -96,7 +96,11 @@ pub(crate) fn hc_gemm(
     sm_count: u32,
     stream: u64,
 ) -> Result<()> {
-    if n.div_ceil(128) * m.div_ceil(128) < sm_count {
+    // On native HIP the machine-fill test stays for NVIDIA: hipBLASLt wins
+    // at EVERY shape on gfx1151 (measured 2026-10-04: 2.3-2.6x the tile
+    // kernel incl. the wide up-projection), so try it unconditionally; any
+    // Err lands on the same warn-once + gemm_raw fallback.
+    if cfg!(atlas_hip) || n.div_ceil(128) * m.div_ceil(128) < sm_count {
         match crate::layers::ops::cublas_bf16_proj_dense(a, w, out, m, n, k, stream) {
             Ok(()) => return Ok(()),
             Err(e) => {

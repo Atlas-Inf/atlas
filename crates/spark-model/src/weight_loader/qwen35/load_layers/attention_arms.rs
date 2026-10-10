@@ -250,7 +250,15 @@ pub(crate) fn build_full_attention_nvfp4(
             .transpose_for_gemm(gpu, h, num_heads * head_dim)?;
         layer.set_prefill_weights(Some(qt), Some(kt), Some(vt), Some(ot));
     }
-    layer.predequant_for_prefill(gpu, config, stream)?;
+    // Native-HIP (atlas_hip) lacks the FP8 *prefill* GEMM kernels
+    // (fp8_gemm_n128 / fp8_gemm_t_blockscaled are inline-PTX, not yet
+    // WMMA-ported). Skip the FP8→FP8 predequant so q/k/v/o prefill falls to
+    // the NVFP4 w4a16 WMMA path (`w4a16_gemm_t_m128` arms in
+    // cache_skip_qkv.rs / paged_qkv.rs / paged_oproj.rs). SCALE/NVIDIA keep
+    // FP8 prefill. Mirrors the sibling guard in linear_attn_arms.rs.
+    if !cfg!(atlas_hip) {
+        layer.predequant_for_prefill(gpu, config, stream)?;
+    }
 
     Ok(Box::new(layer))
 }

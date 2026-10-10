@@ -222,19 +222,35 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if force_bf16 {
-            // HIP has no working cuBLASLt route here; use the same native BF16
-            // pipelined GEMM already used by the dense out projection.
+            // On native HIP, try hipBLASLt first — 2.3x faster than the tile
+            // kernel at this shape (2048x16384x2560 measured 2026-10-04) —
+            // falling back to the same native BF16 pipelined GEMM already
+            // used by the dense out projection. The fallback STAYS: 9fc8e57f1
+            // moved this GEMM off cuBLASLt on an older ROCm whose hipBLASLt
+            // failed here; a regression must degrade, not refuse.
             #[cfg(atlas_hip)]
-            ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.dense_gemm_pipelined_k,
+            ops::hip_bf16_proj_or(
+                "gdn_qkvz_bf16",
                 normed,
-                &self.ssm.in_proj_qkvz,
+                self.ssm.in_proj_qkvz.weight,
                 proj_dst,
                 k,
                 qkvz_size as u32,
                 h as u32,
                 stream,
+                || {
+                    ops::dense_gemm_bf16_pipelined(
+                        ctx.gpu,
+                        self.dense_gemm_pipelined_k,
+                        normed,
+                        &self.ssm.in_proj_qkvz,
+                        proj_dst,
+                        k,
+                        qkvz_size as u32,
+                        h as u32,
+                        stream,
+                    )
+                },
             )?;
             #[cfg(not(atlas_hip))]
             {

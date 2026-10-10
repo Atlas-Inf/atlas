@@ -63,6 +63,11 @@ impl MoeLayer {
         let weights_correction_bias: Option<DevicePtr> =
             weights.correction_bias.map(|dw| dw.weight);
 
+        // Resolve the gfx1151 F16-operand twins + whether both resolved; the
+        // forward engages them via the n128 launchers when `moe_f16_prefill` holds.
+        let (moe_grouped_gemm_t, moe_fused_gate_up_t, moe_f16_prefill) =
+            crate::layers::ops::moe_f16_prefill_handles(gpu)?;
+
         let _ = num_experts;
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
         Ok(Self {
@@ -78,7 +83,11 @@ impl MoeLayer {
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
-            w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
+            // Untransposed router GEMM. On native HIP this resolves to the
+            // bit-identical `w4a16_gemm_s64` twin (64-deep K stage) when the
+            // target ships it; every other target keeps `w4a16_gemm`. See
+            // layers/ops/strix_s64.rs.
+            w4a16_gemm: crate::layers::ops::w4a16_gemm_kernel(gpu)?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
             dense_gemm_pipelined: super::super::try_kernel(
@@ -133,10 +142,11 @@ impl MoeLayer {
             moe_sorted_gate_up: gpu.kernel("moe_sorted", "moe_sorted_gate_up")?,
             moe_sorted_silu_down: gpu.kernel("moe_sorted", "moe_sorted_silu_down")?,
             moe_grouped_gemm: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable")?,
-            moe_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t")?,
+            moe_grouped_gemm_t,
             moe_grouped_gemm_t_k64: gpu
                 .kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?,
-            moe_fused_gate_up_t: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?,
+            moe_fused_gate_up_t,
+            moe_f16_prefill,
             moe_fused_gate_up_t_k64: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?,
             // ARM-2 Phase-K native-MXFP4 (E8M0) prefill variants — try_kernel:
             // only the deepseek-v4-flash target's moe_w4a16 module ships them.

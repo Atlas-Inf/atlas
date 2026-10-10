@@ -112,9 +112,36 @@ impl Qwen3SsmLayer {
             )
         } else if let Some(ref dense_out) = self.out_proj_dense {
             // SSM out_proj is kept BF16 dense for accuracy (decode uses FP8
-            // block-scaled, prefill stays BF16). Always routed through the
-            // tensor-core dense_gemm_bf16_pipelined kernel (~40× vs the old
-            // scalar dense_gemm, identical BF16 math, cosine=1.0).
+            // block-scaled, prefill stays BF16). On native HIP, hipBLASLt
+            // first (2.3x faster than the tile kernel at the Flash-Next
+            // 2560x6144 shape, 2026-10-04) with the tensor-core
+            // dense_gemm_bf16_pipelined kernel (~40x vs the old scalar
+            // dense_gemm, identical BF16 math, cosine=1.0) as fallback.
+            #[cfg(atlas_hip)]
+            return ops::hip_bf16_proj_or(
+                "ssm_out_proj",
+                normed_out_buf,
+                dense_out.weight,
+                out_proj_buf,
+                k,
+                h as u32,
+                value_dim as u32,
+                stream,
+                || {
+                    ops::dense_gemm_bf16_pipelined(
+                        ctx.gpu,
+                        self.dense_gemm_pipelined_k,
+                        normed_out_buf,
+                        dense_out,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )
+                },
+            );
+            #[cfg(not(atlas_hip))]
             ops::dense_gemm_bf16_pipelined(
                 ctx.gpu,
                 self.dense_gemm_pipelined_k,

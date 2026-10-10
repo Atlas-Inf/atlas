@@ -316,6 +316,31 @@ impl MoeLayer {
                             max_m_tiles_m128,
                             stream,
                         )?;
+                    } else if self.moe_f16_prefill {
+                        // gfx1151 F16-operand twin (moe_w4a16_fused_gate_up_t_f16a):
+                        // same signature as the base kernel and a 64-row
+                        // blockIdx.y M tile with NO striding, so the n128
+                        // launcher passes max_m_tiles, not grid_m_strided.
+                        ops::moe_w4a16_fused_gate_up_n128(
+                            ctx.gpu,
+                            self.moe_fused_gate_up_t,
+                            expert_input,
+                            gp.packed_ptrs,
+                            gp.scale_ptrs,
+                            gp.scale2_vals,
+                            up.packed_ptrs,
+                            up.scale_ptrs,
+                            up.scale2_vals,
+                            expert_gate_out,
+                            expert_up_out,
+                            expert_offsets,
+                            sorted_token_ids,
+                            num_experts,
+                            inter,
+                            h,
+                            max_m_tiles,
+                            stream,
+                        )?;
                     } else {
                         ops::moe_w4a16_fused_gate_up_k64_n128(
                             ctx.gpu,
@@ -508,6 +533,27 @@ impl MoeLayer {
                             ctx.gpu,
                             self.moe_fp8_grouped_gemm_t,
                             expert_up_out,
+                            dp.packed_ptrs,
+                            dp.scale_ptrs,
+                            dp.scale2_vals,
+                            expert_down_out,
+                            expert_offsets,
+                            DevicePtr(0),
+                            num_experts,
+                            h,
+                            inter,
+                            max_m_tiles,
+                            stream,
+                        )?;
+                    } else if self.moe_f16_prefill {
+                        // gfx1151 F16-operand twin
+                        // (moe_w4a16_grouped_gemm_ptrtable_t_f16a): same
+                        // signature as the base kernel and a 64-row blockIdx.y
+                        // M tile with NO striding -> max_m_tiles.
+                        ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+                            ctx.gpu,
+                            self.moe_grouped_gemm_t,
+                            expert_gate_out,
                             dp.packed_ptrs,
                             dp.scale_ptrs,
                             dp.scale2_vals,
