@@ -92,10 +92,17 @@ impl TransformerModel {
         // across ranks (bug #33 invariant). Skipped for vision prompts (pad
         // runs must not straddle chunk boundaries) and non-SSM models
         // (KV-only cache hits need no snapshot).
+        // The cache gates were dropped for issue #158: the split must be a
+        // function of absolute token position only. With them in place the
+        // layout depended on *whether prefix caching is enabled* — caching-on
+        // prompts took [0..cut)+[cut..N), caching-off took one pass — so
+        // temp-0 answers differed between the two modes on identical input.
+        // Firing unconditionally (SSM models only; the checkpoint save inside
+        // still requires an enabled snapshot pool) makes on/off and
+        // cold/warm share one layout. The +1 pass on caching-off single-shot
+        // prefills is the price of the invariant.
         if is_last_chunk
             && self.config.num_ssm_layers() > 0
-            && self.ssm_snapshots.is_enabled()
-            && self.prefix_cache.is_active()
             && !self.tokens_have_vision_pad(tokens)
         {
             let bs = self.kv_cache.lock().block_size();
