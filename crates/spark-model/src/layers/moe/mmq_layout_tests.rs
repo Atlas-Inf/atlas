@@ -6,15 +6,14 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::weights::{WeightDtype, WeightStore, WeightTensor};
 use std::collections::HashMap;
 
-fn payload(gpu: &MockGpuBackend, carveout: bool) -> (WeightStore, QuantizedWeight) {
-    let alloc = || {
-        if carveout {
-            gpu.alloc_carveout(256)
-        } else {
-            gpu.alloc(256)
-        }
-        .unwrap()
-    };
+// Reuse the byte recorder to force allocation-address reuse independently
+// of optional carveout support.
+#[allow(dead_code)]
+#[path = "helpers_unified_test_gpu.rs"]
+mod recording;
+
+fn payload(gpu: &dyn GpuBackend) -> (WeightStore, QuantizedWeight) {
+    let alloc = || gpu.alloc(256).unwrap();
     let weight = QuantizedWeight {
         weight: alloc(),
         weight_scale: alloc(),
@@ -44,7 +43,7 @@ fn payload(gpu: &MockGpuBackend, carveout: bool) -> (WeightStore, QuantizedWeigh
 #[test]
 fn mmq_payload_retirement_prevents_checkpoint_double_free() {
     let gpu = MockGpuBackend::new();
-    let (mut store, mut weight) = payload(&gpu, false);
+    let (mut store, mut weight) = payload(&gpu);
     free_quantized_payload(&gpu, &store, &mut weight).unwrap();
     store.release(&gpu).unwrap();
     assert_eq!(gpu.invalid_free_count(), 0);
@@ -53,11 +52,12 @@ fn mmq_payload_retirement_prevents_checkpoint_double_free() {
 
 #[test]
 fn mmq_retired_checkpoint_cannot_free_reused_slab_address() {
-    let gpu = MockGpuBackend::with_carveout(4 * 65536);
-    let (mut store, mut weight) = payload(&gpu, true);
+    let gpu = recording::RecordingGpu::new(false);
+    let (mut store, mut weight) = payload(&gpu);
     let original = weight.weight;
     free_quantized_payload(&gpu, &store, &mut weight).unwrap();
-    let slab = gpu.alloc_carveout(256).unwrap();
+    gpu.reuse_next(original);
+    let slab = gpu.alloc(256).unwrap();
     assert_eq!(slab, original);
     gpu.copy_h2d(&[31; 256], slab).unwrap();
     store.release(&gpu).unwrap();
@@ -66,13 +66,13 @@ fn mmq_retired_checkpoint_cannot_free_reused_slab_address() {
         .expect("replacement slab remains owned by the layer");
     assert_eq!(bytes, [31; 256]);
     gpu.free(slab).unwrap();
-    assert_eq!(gpu.invalid_free_count(), 0);
+    assert!(gpu.live().is_empty());
 }
 
 #[test]
 fn mmq_partial_payload_free_clears_each_pointer_before_the_next_attempt() {
     let gpu = MockGpuBackend::new();
-    let (mut store, mut weight) = payload(&gpu, false);
+    let (mut store, mut weight) = payload(&gpu);
     let original = weight.weight;
     gpu.fail_next_free();
     assert!(free_quantized_payload(&gpu, &store, &mut weight).is_err());
