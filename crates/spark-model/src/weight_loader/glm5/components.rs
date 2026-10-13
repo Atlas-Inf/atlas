@@ -142,6 +142,9 @@ fn load_moe(
     qctx: QuantizeCtx,
     allow_prefill_layout: bool,
 ) -> Result<FfnComponent> {
+    let mmq_moe = env_flag("ATLAS_NVFP4_MMQ_MOE");
+    let cutlass_moe = env_flag("ATLAS_MOE_GROUPED_CUTLASS");
+    validate_moe_layout(config.expert_tp, mmq_moe, cutlass_moe)?;
     let p = format!("{lp}.mlp");
     let h = config.hidden_size;
     let inter = config.moe_intermediate_size;
@@ -262,14 +265,8 @@ fn load_moe(
     };
     let mut layer = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
     layer.set_shared_fp8_origins([gate_origin, up_origin, down_origin])?;
-    let mmq_moe = env_flag("ATLAS_NVFP4_MMQ_MOE");
-    let cutlass_moe = env_flag("ATLAS_MOE_GROUPED_CUTLASS");
-    anyhow::ensure!(
-        !(mmq_moe && cutlass_moe),
-        "ATLAS_NVFP4_MMQ_MOE and ATLAS_MOE_GROUPED_CUTLASS are mutually exclusive"
-    );
     if mmq_moe {
-        layer.repack_nvfp4_mmq_unified(gpu, config)?;
+        layer.repack_nvfp4_mmq_unified(gpu, config, store)?;
     } else if cutlass_moe {
         // CUTLASS consumes the checkpoint-native packed weights and adds only
         // its block-scale swizzle. Avoid materializing the much larger Atlas
@@ -292,6 +289,18 @@ fn load_moe(
     // The factory installs optional shared FP8 caches only after all target,
     // MTP and head loading has released replaced checkpoint allocations.
     Ok(FfnComponent::Moe(layer))
+}
+
+fn validate_moe_layout(expert_tp: bool, mmq: bool, cutlass: bool) -> Result<()> {
+    anyhow::ensure!(
+        !(mmq && expert_tp),
+        "ATLAS_NVFP4_MMQ_MOE does not support expert TP"
+    );
+    anyhow::ensure!(
+        !(mmq && cutlass),
+        "ATLAS_NVFP4_MMQ_MOE and ATLAS_MOE_GROUPED_CUTLASS are mutually exclusive"
+    );
+    Ok(())
 }
 
 fn unified_moe_layout_enabled(value: Option<&str>) -> bool {
@@ -452,7 +461,21 @@ pub(super) fn load_kda_weights(
 
 #[cfg(test)]
 mod tests {
-    use super::unified_moe_layout_enabled;
+    use super::{unified_moe_layout_enabled, validate_moe_layout};
+
+    #[test]
+    fn mmq_layout_rejects_unsupported_loading_combinations() {
+        for expert_tp in [false, true] {
+            for mmq in [false, true] {
+                for cutlass in [false, true] {
+                    assert_eq!(
+                        validate_moe_layout(expert_tp, mmq, cutlass).is_ok(),
+                        !(mmq && (expert_tp || cutlass))
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn unified_moe_layout_is_explicitly_opt_in() {
