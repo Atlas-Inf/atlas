@@ -84,7 +84,7 @@ fn build_random(tree: &RadixTree, rng: &mut Rng) {
             .collect();
         tree.insert(&tokens, &blocks, &[], BS, 0, 0);
         tree.release(&tokens, BS, 0);
-        if rng.next() % 3 == 0 {
+        if rng.next().is_multiple_of(3) {
             let _ = tree.lookup(&tokens, BS, 0, 0); // pin live, no release
         }
     }
