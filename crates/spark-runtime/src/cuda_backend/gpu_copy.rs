@@ -19,10 +19,10 @@
 //!   supply their own `len()`, so a host over-run is not expressible.
 //! * The DEVICE end is UNCHECKED. `copy_d2d_impl` in particular takes a bare
 //!   `bytes` that is validated against neither allocation. It cannot be checked
-//!   here: `AtlasCudaBackend::live_allocs` is a `HashSet<u64>` of base pointers
-//!   with no sizes, and callers legitimately pass interior pointers from
-//!   `DevicePtr::offset`, so there is nothing to compare against. Sizing a
-//!   device copy correctly is the CALLER's obligation.
+//!   here: `AtlasCudaBackend::live_allocs` is keyed by BASE pointer (its
+//!   sizes exist for footprint accounting), and callers legitimately pass
+//!   interior pointers from `DevicePtr::offset`, so there is no lookup to
+//!   compare against. Sizing a device copy correctly is the CALLER's obligation.
 //!
 //! The Metal backend does check its device end (`metal_backend.rs`), because a
 //! `metal::Buffer` knows its own `length()`. The divergence is real, not an

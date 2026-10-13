@@ -36,6 +36,7 @@ pub mod kv_spill;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_backend;
 pub mod op_cache;
+pub mod own_footprint;
 pub mod pinned_hosts;
 pub mod prefix_cache;
 pub mod progress;

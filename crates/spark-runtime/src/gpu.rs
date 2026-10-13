@@ -111,6 +111,14 @@ pub trait GpuBackend: Send + Sync {
         0
     }
 
+    /// Memory this process took since the backend was created, from counters
+    /// no other process can move ([`crate::own_footprint`]). `None`: the
+    /// backend keeps no such account (mock, Metal, and the CUDA backend built
+    /// for AMD, where the counters are unmeasured) and callers use free memory.
+    fn own_footprint(&self) -> Option<crate::own_footprint::OwnFootprint> {
+        None
+    }
+
     /// Copy from host to device.
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()>;
 

@@ -18,6 +18,8 @@ mod gpu_copy;
 mod gpu_impl;
 mod gpu_impl_graph;
 mod host_staging;
+#[cfg(unix)]
+mod nvml;
 pub mod tensormap;
 
 // ── Raw CUDA driver API for memory operations ──
@@ -140,7 +142,15 @@ pub struct AtlasCudaBackend {
     /// (`cutlass.rs:246`) and FlashInfer (`flashinfer.rs:145`) call
     /// `cuMemAlloc_v2` directly rather than through this allocator, so freeing
     /// the ledger cannot invalidate a static that outlives the model.
-    live_allocs: parking_lot::Mutex<std::collections::HashSet<u64>>,
+    ///
+    /// Each pointer carries the bytes requested: the sum is the device floor
+    /// of [`crate::own_footprint`], which KV sizing checks its free-memory
+    /// delta against.
+    live_allocs: parking_lot::Mutex<crate::own_footprint::AllocLedger>,
+    /// The process-wide counters as this backend was created, so
+    /// `own_footprint` reports growth over the same span as the free-memory
+    /// baseline (context and kernel modules are already in both).
+    own_baseline: crate::own_footprint::Sample,
     /// Default CUDA stream handle (from the process CUDA host).
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
@@ -176,7 +186,8 @@ impl AtlasCudaBackend {
         );
 
         Ok(Self {
-            live_allocs: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            live_allocs: parking_lot::Mutex::default(),
+            own_baseline: Self::own_sample(),
             registry,
             debug_sync_kernels: std::env::var("ATLAS_DEBUG_SYNC_KERNELS").as_deref() == Ok("1"),
             op_cache: crate::op_cache::OpCache::new(),
@@ -187,12 +198,31 @@ impl AtlasCudaBackend {
 
     /// This model's kernel modules, for the paths that need the registry
     /// directly rather than through `GpuBackend`.
-    pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr) {
-        self.live_allocs.lock().insert(ptr.0);
+    pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr, bytes: usize) {
+        self.live_allocs.lock().record(ptr.0, bytes);
     }
 
-    pub(crate) fn forget_alloc(&self, ptr: crate::gpu::DevicePtr) {
-        self.live_allocs.lock().remove(&ptr.0);
+    /// Drop `ptr` from the ledger, returning the bytes it was recorded with.
+    pub(crate) fn forget_alloc(&self, ptr: crate::gpu::DevicePtr) -> Option<usize> {
+        self.live_allocs.lock().forget(ptr.0)
+    }
+
+    fn own_sample() -> crate::own_footprint::Sample {
+        #[cfg(unix)]
+        let driver = nvml::process_device_bytes();
+        #[cfg(not(unix))]
+        let driver = None;
+        crate::own_footprint::Sample {
+            driver,
+            host: crate::own_footprint::host_bytes(),
+        }
+    }
+
+    /// What this process took since the backend was created, from counters no
+    /// other process can move. See [`crate::own_footprint`].
+    pub(crate) fn own_footprint(&self) -> crate::own_footprint::OwnFootprint {
+        let ledger = self.live_allocs.lock().bytes();
+        crate::own_footprint::since(self.own_baseline, Self::own_sample(), ledger)
     }
 
     /// Free every allocation this backend made and nobody released.
@@ -208,7 +238,7 @@ impl AtlasCudaBackend {
     /// ever sees what those missed — and each `free` here has already been
     /// removed from the ledger by `forget_alloc`, so it cannot double-free.
     pub fn sweep_unreleased(&self) -> usize {
-        let outstanding: Vec<u64> = self.live_allocs.lock().drain().collect();
+        let outstanding = self.live_allocs.lock().drain();
         let count = outstanding.len();
         for raw in outstanding {
             // Bypass `free`: the ledger is already drained, and a failure here
