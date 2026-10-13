@@ -101,9 +101,7 @@ impl TransformerModel {
         // still requires an enabled snapshot pool) makes on/off and
         // cold/warm share one layout. The +1 pass on caching-off single-shot
         // prefills is the price of the invariant.
-        if is_last_chunk
-            && self.config.num_ssm_layers() > 0
-            && !self.tokens_have_vision_pad(tokens)
+        if is_last_chunk && self.config.num_ssm_layers() > 0 && !self.tokens_have_vision_pad(tokens)
         {
             let bs = self.kv_cache.lock().block_size();
             // One block below the last block boundary strictly under `total`.
