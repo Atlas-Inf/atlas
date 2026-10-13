@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include <cuda_bf16.h>
 
+// The ticket protocol publishes scratch through device fences. HIP's
+// agent-scope atomic load keeps these cross-CU reads coherent; a plain
+// cached load cannot replace CUDA's L2-only __ldcg here.
+template <typename T>
+__device__ __forceinline__ T df2_sel_published_load(const T* ptr) {
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
 // DFlash2 on-device bilinear candidate selector — full checkpoint geometry.
 //
 // Eliminates the logits D2H sync and CPU float loop by running the whole
@@ -242,8 +250,8 @@ extern "C" __global__ void dflash2_candidate_selector(
             float v = -INFINITY;
             unsigned int i = 0xFFFFFFFFu;
             if (tid < n) {
-                v = __ldcg(cand_v + base + tid);
-                i = __ldcg(cand_i + base + tid);
+                v = df2_sel_published_load(cand_v + base + tid);
+                i = df2_sel_published_load(cand_i + base + tid);
             }
             for (unsigned int out = 0; out < top_k; out++) {
                 float bv = v;
