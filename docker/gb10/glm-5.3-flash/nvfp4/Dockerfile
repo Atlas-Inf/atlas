@@ -49,6 +49,8 @@ COPY tests/fixtures/ tests/fixtures/
 # Neither accelerator uses an external model-specific library or host dispatcher.
 COPY third_party/nvidia_sparse_mla_sm120/ third_party/nvidia_sparse_mla_sm120/
 COPY LICENSE ./LICENSE
+# Includes the full MIT notice for the adapted knapcio confidence tables.
+COPY docs/glm-prior-art.md /opt/atlas/notices/glm-prior-art.md
 
 # Preserve upstream notices and exact imported-source provenance in the image.
 RUN mkdir -p /opt/atlas/notices/flashkda /opt/atlas/notices/nvidia-sparse-mla /opt/atlas/notices/cutlass && \
