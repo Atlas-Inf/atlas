@@ -622,13 +622,15 @@ pub trait TransformerLayer: Send + Sync {
     /// Phased flow keeps memory budget tight enough for MiniMax M2.7 EP=2.
     /// After this call, the untransposed-layout decode kernels can no
     /// longer execute correctly — `MoeLayer::use_t_layout_for_decode()` must
-    /// gate dispatch to the `_t` decode kernels. Default no-op.
+    /// gate dispatch to the `_t` decode kernels. Returns the original
+    /// pointers it freed, which the weight store must stop tracking (#122).
+    /// Default no-op.
     fn transpose_moe_for_prefill_unified(
         &mut self,
         _gpu: &dyn GpuBackend,
         _config: &ModelConfig,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<Vec<DevicePtr>> {
+        Ok(Vec::new())
     }
 
     /// Block C Path 2 hybrid-layout MoE transpose: build persistent

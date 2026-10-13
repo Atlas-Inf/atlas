@@ -453,14 +453,15 @@ impl TransformerLayer for Qwen3AttentionLayer {
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
-    ) -> Result<()> {
+    ) -> Result<Vec<DevicePtr>> {
+        let mut freed = Vec::new();
         if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_for_prefill_unified(gpu, config)?;
+            freed.extend(moe.transpose_for_prefill_unified(gpu, config)?);
         }
         if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.transpose_for_prefill_unified(gpu, config)?;
+            freed.extend(moe.transpose_for_prefill_unified(gpu, config)?);
         }
-        Ok(())
+        Ok(freed)
     }
 
     fn transpose_moe_for_prefill_hybrid(
