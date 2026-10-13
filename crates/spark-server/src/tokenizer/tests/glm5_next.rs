@@ -57,6 +57,9 @@ fn glm5_tools_respect_resolved_thinking_before_generation() {
             "<|assistant|><think></think>"
         };
         assert!(rendered.ends_with(suffix), "resolved thinking={enabled}");
+        // An empty think block carries no effort header, as in the upstream
+        // template's own thinking switch.
+        assert_eq!(rendered.contains("Reasoning Effort: Max"), enabled);
         assert!(rendered.contains("<tools>"));
         assert!(rendered.contains("get_weather"));
     }

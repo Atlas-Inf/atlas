@@ -42,6 +42,9 @@ pub enum Command {
     Serve(ServeArgs),
     /// Run and inspect the benchmark suite, without the dashboard.
     Benchmark(BenchmarkArgs),
+    /// Run a command (`spark serve ...`) with the GB10 display carveout as
+    /// extra KV memory.
+    DisplayCarveout(crate::display_carveout::DisplayCarveoutArgs),
 }
 
 #[cfg(test)]

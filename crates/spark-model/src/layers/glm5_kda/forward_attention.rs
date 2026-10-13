@@ -22,6 +22,11 @@ impl Glm5KdaLayer {
         let m = tokens as u32;
         let h = self.hidden_size as u32;
         let p = self.heads * self.dim;
+        // ATLAS_GLM_CANONICAL_VERIFY: one kernel family per projection for
+        // every row count, K=5 seams off; a plain one-row decode takes the
+        // verify projections too, so its row matches the same row verified.
+        let canonical = crate::layers::canonical_verify::enabled();
+        let verify_proj = capture_verify_intermediates || (decode && canonical);
         let bf16 = 2usize;
         let mut profile_timer = profile::start(ctx, stream)?;
         // Sequence-parallel prefill: the highway and `hidden` hold this rank's
@@ -78,7 +83,7 @@ impl Glm5KdaLayer {
             p,
             h,
             decode,
-            capture_verify_intermediates,
+            verify_proj,
             &mut profile_timer,
             ctx,
             stream,
@@ -88,19 +93,36 @@ impl Glm5KdaLayer {
         let fa = beta.offset(tokens * self.heads * bf16);
         let ga = fa.offset(tokens * self.dim * bf16);
         let fused_dense_pairs = capture_verify_intermediates
+            && !canonical
             && m == 5
             && self.dense_gemv_batch5_dual_k.0 != 0
             && verify_fused_dense_pairs_enabled();
         let fused_dense_triple = capture_verify_intermediates
+            && !canonical
             && m == 5
             && self.dense_gemv_batch5_triple_n_k.0 != 0
             && verify_fused_dense_triple_enabled();
         // Verify rows 2..=8 otherwise: the same batchm body per plane, one grid.
         let batchm_fused = capture_verify_intermediates
+            && !canonical
             && (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&m)
             && self.dense_gemv_batchm_triple_n_k.0 != 0
             && self.dense_gemv_batchm_dual_k.0 != 0;
-        if batchm_fused && !fused_dense_triple {
+        if canonical && verify_proj {
+            // One canonical launch for the three side projections.
+            let (heads, dim) = (self.heads as u32, self.dim as u32);
+            crate::layers::canonical_verify::dense_planes(
+                ctx.gpu,
+                &[
+                    (normed, &self.weights.b_proj, beta, heads, h),
+                    (normed, &self.weights.f_a_proj, fa, dim, h),
+                    (normed, &self.weights.g_a_proj, ga, dim, h),
+                ],
+                m,
+                stream,
+            )?;
+            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
+        } else if batchm_fused && !fused_dense_triple {
             ops::dense_gemv_batchm_triple_n(
                 ctx.gpu,
                 self.dense_gemv_batchm_triple_n_k,
@@ -134,7 +156,7 @@ impl Glm5KdaLayer {
                 stream,
             )?;
             profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
-        } else if !capture_verify_intermediates
+        } else if !verify_proj
             && m > 1
             && self.dense_gemm_pipelined_k.0 != 0
             && self.dense_gemm_pipelined_triple_n_k.0 != 0
@@ -157,7 +179,7 @@ impl Glm5KdaLayer {
             )?;
             profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
         } else {
-            if capture_verify_intermediates {
+            if verify_proj {
                 self.project_dense_verify(
                     normed,
                     &self.weights.b_proj,
@@ -196,7 +218,7 @@ impl Glm5KdaLayer {
                     stream,
                 )?;
             } else {
-                if capture_verify_intermediates {
+                if verify_proj {
                     self.project_dense_verify(
                         normed,
                         &self.weights.f_a_proj,
@@ -220,7 +242,7 @@ impl Glm5KdaLayer {
                     )?;
                 }
                 profile::step(ctx, stream, &mut profile_timer, "f_a_proj")?;
-                if capture_verify_intermediates {
+                if verify_proj {
                     self.project_dense_verify(
                         normed,
                         &self.weights.g_a_proj,
@@ -251,7 +273,18 @@ impl Glm5KdaLayer {
 
         let g1 = ctx.buffers.ssm_deinterleaved();
         let g2 = g1.offset(plane_bytes);
-        if batchm_fused && !fused_dense_pairs {
+        if canonical && verify_proj {
+            let dim = self.dim as u32;
+            crate::layers::canonical_verify::dense_planes(
+                ctx.gpu,
+                &[
+                    (fa, &self.weights.f_b_proj, g1, p as u32, dim),
+                    (ga, &self.weights.g_b_proj, g2, p as u32, dim),
+                ],
+                m,
+                stream,
+            )?;
+        } else if batchm_fused && !fused_dense_pairs {
             ops::dense_gemv_batchm_dual(
                 ctx.gpu,
                 self.dense_gemv_batchm_dual_k,
@@ -277,7 +310,7 @@ impl Glm5KdaLayer {
                 self.dim as u32,
                 stream,
             )?;
-        } else if capture_verify_intermediates {
+        } else if verify_proj {
             self.project_dense_verify(
                 fa,
                 &self.weights.f_b_proj,
@@ -342,7 +375,7 @@ impl Glm5KdaLayer {
         )?;
         profile::step(ctx, stream, &mut profile_timer, "gated_norm")?;
         det.tap("x_gated", gated, (0, tokens), p * bf16);
-        if capture_verify_intermediates {
+        if verify_proj {
             self.project_hot_verify(
                 gated,
                 &self.weights.o_proj,
@@ -369,6 +402,7 @@ impl Glm5KdaLayer {
         profile::step(ctx, stream, &mut profile_timer, "o_proj")?;
         det.tap("attn", normed, (0, tokens), row);
         let fused_tp_hc = capture_verify_intermediates
+            && !canonical
             && tokens == 5
             && !ctx.graph_capture
             && verify_fused_tp_hc_enabled()

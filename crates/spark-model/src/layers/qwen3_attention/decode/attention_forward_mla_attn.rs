@@ -13,15 +13,15 @@ use crate::layers::ops;
 
 impl Qwen3AttentionLayer {
     /// GLM semantic-index selection for the decode row, plus whether the
-    /// cache holds the `fp8_g128` latent.
+    /// cache holds the `fp8_g128` latent. `causal_ids`: a dense row gets its
+    /// causal IDs as its selection, as an `fp8_g128` row always does.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn mla_decode_sparse_indices(
         &self,
         mla: &MlaWeights,
         meta: AttnMetadataDev,
-        normed: DevicePtr,
-        q_latent: DevicePtr,
-        pos: Option<u32>,
+        (normed, q_latent): (DevicePtr, DevicePtr),
+        (pos, causal_ids): (Option<u32>, bool),
         kv_cache: &PagedKvCache,
         ctx: &ForwardContext,
         stream: u64,
@@ -41,7 +41,7 @@ impl Qwen3AttentionLayer {
         // every cached token (device length, so decode graphs stay valid).
         let fp8 = self.kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128;
         let sparse_indices = match sparse_indices {
-            None if fp8 => {
+            None if fp8 || causal_ids => {
                 let indices = ctx.buffers.expert_gate_out();
                 ops::glm_index_fill_causal_dev(
                     ctx.gpu,
@@ -56,6 +56,62 @@ impl Qwen3AttentionLayer {
             other => other,
         };
         Ok((sparse_indices, fp8))
+    }
+
+    /// Step 8's attention of the decode row into `attn_out`: the sharded
+    /// merge form, the canonical form (`canonical`: this rank, on an
+    /// unsharded GLM pair), or the paged kernels. `dims` = heads, latent
+    /// width, cache block size.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn mla_decode_attn(
+        &self,
+        ctx: &ForwardContext,
+        kv_cache: &PagedKvCache,
+        meta: AttnMetadataDev,
+        (sparse, pos, fp8, canonical): (Option<(DevicePtr, u32)>, Option<u32>, bool, Option<u32>),
+        query: DevicePtr,
+        attn_out: DevicePtr,
+        [heads, dim, bs]: [u32; 3],
+        scale: f32,
+        stream: u64,
+    ) -> Result<()> {
+        if kv_cache.latent_shard().is_some() {
+            let selection = (sparse, pos);
+            return self.mla_decode_shard_attn(
+                kv_cache,
+                ctx,
+                meta,
+                selection,
+                query,
+                attn_out,
+                [heads, dim],
+                stream,
+            );
+        }
+        if let (Some(rank), Some((ids, _))) = (canonical, sparse) {
+            let rows = super::super::prefill::CanonicalRows {
+                query,
+                selected: Some(ids),
+                causal_start: 0,
+                block_table: meta.block_table,
+                rows: 1,
+            };
+            return self.glm_canonical_attention(kv_cache, ctx, rank, rows, attn_out, stream);
+        }
+        self.mla_decode_paged_attn(
+            ctx,
+            kv_cache,
+            meta,
+            sparse,
+            fp8,
+            query,
+            attn_out,
+            heads,
+            dim,
+            bs as usize,
+            scale,
+            stream,
+        )
     }
 
     /// `ATLAS_GLM_KV_SHARD=1`: the decode row through the sharded merge form

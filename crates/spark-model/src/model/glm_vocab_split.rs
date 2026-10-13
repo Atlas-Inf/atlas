@@ -313,6 +313,50 @@ impl TransformerModel {
     }
 }
 
+impl TransformerModel {
+    /// Whether a one-row verify's split head runs the MXFP8 shard, the
+    /// row-invariant arithmetic `glm_split_head_full_row` completes.
+    pub(super) fn glm_split_head_mxfp8(&self) -> bool {
+        self.glm_split_head_decline(1).is_none()
+            && self.comm.as_ref().is_some_and(|c| {
+                SHARD_MX
+                    .get()
+                    .is_some_and(|(s, _)| *s == c.rank() * (self.config.vocab_size / 2))
+            })
+    }
+
+    /// After a one-row split-head verify left this rank's half of row 0's
+    /// logits in `logits`, fetch the peer's half (through `moe_output`, free
+    /// once the layers ran) so the row holds the full vocabulary: the plain
+    /// decode of `ATLAS_GLM_CANONICAL_VERIFY` samples it. Both ranks call it.
+    pub(super) fn glm_split_head_full_row(&self, stream: u64) -> Result<()> {
+        let comm = self
+            .comm
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("split head full row needs the pair"))?;
+        let shard = self.config.vocab_size / 2;
+        let bytes = shard * 2;
+        let stage = self.buffers.moe_output();
+        ensure!(
+            self.buffers.sizes().moe_output >= 2 * bytes,
+            "split head full row: moe_output holds {} of {} bytes",
+            self.buffers.sizes().moe_output,
+            2 * bytes
+        );
+        let logits = self.buffers.logits();
+        let rank = comm.rank();
+        self.gpu
+            .copy_d2d_async(logits.offset(rank * bytes), stage, bytes, stream)?;
+        comm.peer_exchange_async(stage.0, stage.offset(bytes).0, bytes, stream)?;
+        self.gpu.copy_d2d_async(
+            stage.offset(bytes),
+            logits.offset((1 - rank) * bytes),
+            bytes,
+            stream,
+        )
+    }
+}
+
 /// Launch the per-row shard argmax: `argmax_bf16_value_ban`, or under row
 /// masks `argmax_bf16_value_ban_allow` (`(kernel, masks, words per row)`):
 /// each row's full-vocabulary mask, read from bit `start` on, so the rank's

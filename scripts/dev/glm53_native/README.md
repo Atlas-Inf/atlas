@@ -16,6 +16,8 @@ KDA uses BF16 internally despite FP32 state storage. Keep all explicit zeroes;
 these disable other experimental paths. This is a qualification configuration,
 not a claim that every supported model or flag combination has been validated.
 
+For the RC2 integration, apply the [RC2 profile and validation limits](../../../docs/porting/GLM_5_3_FLASH_RC2.md) after this historical environment. In particular, RC2 qualification currently disables dependent launch.
+
 ## Build and host prerequisites
 
 Use the [GLM Dockerfile](../../../docker/gb10/glm-5.3-flash/nvfp4/Dockerfile) or

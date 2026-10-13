@@ -45,10 +45,20 @@ fn coerce_call_args(call: &mut ToolCall, tool_def: Option<&ToolDefinition>) {
     };
 
     for (key, prop) in props {
-        let Some(ty) = prop.get("type").and_then(|t| t.as_str()) else {
+        let Some(val) = obj.get_mut(key) else {
             continue;
         };
-        let Some(val) = obj.get_mut(key) else {
+        // Poolside emits JSON null as the same raw text as a string "null".
+        // Only the schema can disambiguate them. Keep strings untouched when
+        // they are permitted, or when a union contains an unknown schema.
+        if matches!(val, serde_json::Value::String(s) if s == "null") {
+            if permits_unambiguous_null(prop) {
+                *val = serde_json::Value::Null;
+                changed = true;
+            }
+            continue;
+        }
+        let Some(ty) = super::validation::resolve_schema_type(prop) else {
             continue;
         };
         match ty {
@@ -123,6 +133,42 @@ fn coerce_call_args(call: &mut ToolCall, tool_def: Option<&ToolDefinition>) {
     if changed && let Ok(s) = serde_json::to_string(&args) {
         call.function.arguments = s;
     }
+}
+
+/// Whether declared types allow null but exclude strings. Unknown union
+/// branches are deliberately inconclusive: they might allow the literal text.
+pub(super) fn permits_unambiguous_null(schema: &serde_json::Value) -> bool {
+    const NULL: u8 = 1;
+    const STRING: u8 = 2;
+
+    fn types(schema: &serde_json::Value) -> Option<u8> {
+        let named = |name: &str| match name {
+            "null" => Some(NULL),
+            "string" => Some(STRING),
+            "integer" | "number" | "boolean" | "array" | "object" => Some(0),
+            _ => None,
+        };
+        match schema.get("type") {
+            Some(serde_json::Value::String(name)) => return named(name),
+            Some(serde_json::Value::Array(names)) => {
+                return names
+                    .iter()
+                    .try_fold(0, |bits, name| Some(bits | named(name.as_str()?)?));
+            }
+            Some(_) => return None,
+            None => {}
+        }
+        for key in ["anyOf", "oneOf"] {
+            if let Some(branches) = schema.get(key).and_then(|v| v.as_array()) {
+                return branches
+                    .iter()
+                    .try_fold(0, |bits, branch| Some(bits | types(branch)?));
+            }
+        }
+        None
+    }
+
+    types(schema).is_some_and(|bits| bits & NULL != 0 && bits & STRING == 0)
 }
 
 /// Recursively repair empty-string object keys (`""`) to the unique missing
@@ -213,4 +259,67 @@ fn value_matches_schema(val: &serde_json::Value, prop_schema: Option<&serde_json
         }
     }
     true
+}
+
+#[cfg(test)]
+mod nullable_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn coerce_null(schema: serde_json::Value) -> serde_json::Value {
+        let mut call = super::super::poolside_v1::parse_poolside_v1_call(
+            "set<arg_key>value</arg_key><arg_value>null</arg_value>",
+        )
+        .unwrap();
+        let tools: Vec<ToolDefinition> = serde_json::from_value(json!([{
+            "type": "function",
+            "function": {"name": "set", "parameters": {
+                "type": "object", "properties": {"value": schema}
+            }}
+        }]))
+        .unwrap();
+        // Serving backfills before coercion; live XML fields coerce directly.
+        let mut buffered_call = call.clone();
+        super::super::validation::backfill_required_params(
+            std::slice::from_mut(&mut buffered_call),
+            &tools,
+        );
+        coerce_all(std::slice::from_mut(&mut buffered_call), &tools);
+        coerce_all(std::slice::from_mut(&mut call), &tools);
+        assert_eq!(buffered_call.function.arguments, call.function.arguments);
+        serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap()["value"]
+            .clone()
+    }
+
+    #[test]
+    fn poolside_null_is_typed_for_nullable_non_string_parameters() {
+        for ty in ["integer", "number", "boolean", "array", "object"] {
+            for schema in [
+                json!({"type": [ty, "null"]}),
+                json!({"anyOf": [{"type": ty}, {"type": "null"}]}),
+                json!({"oneOf": [{"type": "null"}, {"type": ty}]}),
+            ] {
+                assert_eq!(coerce_null(schema.clone()), json!(null), "{schema}");
+            }
+        }
+        assert_eq!(coerce_null(json!({"type": "null"})), json!(null));
+        assert_eq!(coerce_null(json!({"type": ["null"]})), json!(null));
+    }
+
+    #[test]
+    fn null_text_stays_a_string_when_string_is_allowed_or_schema_is_unknown() {
+        for schema in [
+            json!({"type": "string"}),
+            json!({"type": ["string", "null"]}),
+            json!({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+            json!({"oneOf": [{"type": "null"}, {"type": "string"}]}),
+            json!({"anyOf": [{"type": "integer"}, {"type": "null"}, {}]}),
+            json!({"anyOf": [{"type": "array"}, {"type": "null"}, {}]}),
+            json!({"type": ["array", "null", "string"]}),
+            json!({"type": "integer"}),
+            json!({}),
+        ] {
+            assert_eq!(coerce_null(schema.clone()), json!("null"), "{schema}");
+        }
+    }
 }

@@ -41,6 +41,15 @@
 //! only. Prefetches only, so the same bytes. A target lacking any of the
 //! `_l2pf` twins keeps the stream kernels.
 //!
+//! `ATLAS_GLM_MOE_DECODE_PERSIST=1` (with `ATLAS_GLM_MOE_DECODE_L2PF=1` and
+//! the zero-row skip) launches the prefetching pair's persistent twins: one
+//! CTA per SM, each striding over the worklist's (expert, column tile) items
+//! and asking its next item's first stages into L2 while it finishes the
+//! last, so fewer experts' tables stream at once and an item's start is
+//! hidden. Each item's loads, MMAs and epilogue are the grid kernels', so the
+//! same bytes (glm_moe_decode_stream.cuh). A target lacking any of them keeps
+//! the prefetching twins.
+//!
 //! `ATLAS_GLM_MOE_STREAM_NOSYNC=1` (with the stream twins) skips the exact
 //! M64 tile count (`ATLAS_MOE_PREFILL_EXACT_TILES`, default on for NVFP4) for
 //! the batches the stream twins take ([`MoeLayer::offsets_unread`]). That
@@ -75,6 +84,9 @@ pub(super) struct DecodeM16 {
     k128w: bool,
     /// `ATLAS_GLM_MOE_STREAM_NOSYNC`.
     nosync: bool,
+    /// CTAs of the persistent twins (`ATLAS_GLM_MOE_DECODE_PERSIST`, the
+    /// SMs), 0 for the grid kernels.
+    ctas: u32,
 }
 
 impl DecodeM16 {
@@ -122,14 +134,23 @@ impl DecodeM16 {
         };
         let streams = twins(on && stream, "");
         let prefetch = twins(streams.is_some() && l2pf.is_some(), "_l2pf");
+        let persist = toggle("ATLAS_GLM_MOE_DECODE_PERSIST")?;
+        let persistent = twins(
+            persist && prefetch.is_some() && l2pf == Some(true) && zskip,
+            "_l2pf_p",
+        );
         let [[mut gate_up_silu, mut down], mut wide] =
             streams.unwrap_or_else(|| [pair(on, "m16", ""), [KernelHandle(0); 2]]);
-        if let Some([[gate_up16, down16], [gate_up32, down32]]) = prefetch {
+        if let Some([[gate_up16, down16], [gate_up32, down32]]) = persistent.or(prefetch) {
             [gate_up_silu, wide[0]] = [gate_up16, gate_up32];
             if l2pf == Some(true) {
                 [down, wide[1]] = [down16, down32];
             }
         }
+        let ctas = match persistent {
+            Some(_) => gpu.sm_count()?,
+            None => 0,
+        };
         let mut this = Self {
             gate_up_silu,
             down,
@@ -137,6 +158,7 @@ impl DecodeM16 {
             zskip,
             k128w: toggle("ATLAS_GLM_MOE_DECODE_K128W")? && glm,
             nosync: toggle("ATLAS_GLM_MOE_STREAM_NOSYNC")? && glm,
+            ctas,
         };
         if !this.loaded() {
             // Both or neither: half a pair never launches.
@@ -153,7 +175,8 @@ impl DecodeM16 {
                 );
             }
         }
-        if (requested || zskip || stream || l2pf.is_some()) && gpu.op_cache().once("moe:decode_m16")
+        if (requested || zskip || stream || l2pf.is_some() || persist)
+            && gpu.op_cache().once("moe:decode_m16")
         {
             if this.loaded() {
                 tracing::info!(
@@ -179,11 +202,20 @@ impl DecodeM16 {
                         );
                     }
                 }
+                if persistent.is_some() {
+                    tracing::info!(
+                        "ATLAS_GLM_MOE_DECODE_PERSIST: persistent prefetching twins over {ctas} CTAs"
+                    );
+                } else if persist {
+                    tracing::warn!(
+                        "ATLAS_GLM_MOE_DECODE_PERSIST=1 ignored: needs ATLAS_GLM_MOE_DECODE_L2PF=1, ATLAS_GLM_MOE_DOWN_ZSKIP=1 and the target's _l2pf_p twins"
+                    );
+                }
             } else if on {
                 tracing::warn!("ATLAS_GLM_MOE_DECODE_M16=1 ignored: target lacks the M16 kernels");
             } else if !requested {
                 tracing::warn!(
-                    "ATLAS_GLM_MOE_DOWN_ZSKIP / _DECODE_STREAM / _DECODE_L2PF ignored: they need ATLAS_GLM_MOE_DECODE_M16=1"
+                    "ATLAS_GLM_MOE_DOWN_ZSKIP / _DECODE_STREAM / _DECODE_L2PF / _DECODE_PERSIST ignored: they need ATLAS_GLM_MOE_DECODE_M16=1"
                 );
             }
         }
@@ -436,14 +468,23 @@ impl MoeLayer {
             persist: KernelHandle(0),
         };
         let [gate_up_silu, down] = k.pair(rows);
-        Ok(Some(MtileGrid {
-            prefix: total_tiles,
-            schedule: ops::K128wSchedule::Grid {
+        // The persistent twins stride over the worklist's items themselves.
+        let schedule = match k.ctas {
+            0 => ops::K128wSchedule::Grid {
                 bound: total_expanded.min(num_experts),
             },
+            ctas => ops::K128wSchedule::Stride { ctas },
+        };
+        Ok(Some(MtileGrid {
+            prefix: total_tiles,
+            schedule,
             rows: total_expanded,
             gate_up_silu: grid_only(gate_up_silu),
             down: grid_only(down),
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "decode_m16_test_gpu.rs"]
+mod gpu_tests;

@@ -106,3 +106,7 @@ pub use types::TransformerModel;
 pub fn ep_protocol_v2_requested() -> bool {
     matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"))
 }
+
+#[cfg(test)]
+#[path = "impl_a2/idle_command_fixture.rs"]
+mod test_fixture;

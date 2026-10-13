@@ -12,6 +12,7 @@ mod allocation_failure;
 mod latent_shard;
 mod nvme_bench;
 mod nvme_fast;
+mod nvme_shard;
 mod nvme_spill;
 mod sparse_index;
 mod zero_alias;

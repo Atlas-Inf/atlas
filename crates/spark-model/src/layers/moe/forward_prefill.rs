@@ -203,6 +203,7 @@ impl MoeLayer {
         let has_shared = shared_inter > 0;
         let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
         let defer_shared_hc = defer_shared_hc
+            && !crate::layers::canonical_verify::enabled()
             && has_shared
             && is_ep_prefill
             && num_tokens == 5

@@ -486,7 +486,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
     // scheduler-side <|im_start|> hard-stop. Suppressed mid tool-call
     // body: there a standalone `tool` token is the leading BPE fragment
     // of a `tool_*` NAME (issue #222) being reassembled, not a role leak.
-    {
+    // ChatML formats only: elsewhere `user`, `assistant` and `tool` are
+    // ordinary words, and GLM streams " tool" as one token, so the strip
+    // deleted it from prose ("I don't have a that can ...").
+    if ctx.role_literal_leaks {
         let inside_tool_call = state
             .detector
             .as_ref()

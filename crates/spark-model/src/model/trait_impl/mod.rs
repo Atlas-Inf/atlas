@@ -25,6 +25,7 @@ mod decode_a3;
 mod decode_a_diag;
 mod decode_b;
 mod decode_b2;
+mod decode_canonical;
 mod decode_checkpoint;
 mod decode_graph_key;
 pub(super) mod drafter_prefill;

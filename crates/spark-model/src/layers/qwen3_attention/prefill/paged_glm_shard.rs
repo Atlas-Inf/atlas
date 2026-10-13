@@ -238,7 +238,6 @@ impl Qwen3AttentionLayer {
             dtype: self.kv_dtype,
             pool: kv_cache.latent_pool_ptr(self.attn_layer_idx),
             scale: self.effective_attn_scale(hd),
-            compact: tuning.compact,
             lane: self.glm_shard_lane(kv_cache, ctx),
         }
         .run(a, output, stream)

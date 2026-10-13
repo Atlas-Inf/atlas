@@ -381,37 +381,56 @@ extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_rec_
 // Advance each head's live state over the first `rows` records written by
 // kda_recurrent_bf16_verify_rec_owners (the accepted prefix of a verify):
 // the same kda_fold per element, so the result is bit-identical to the
-// state the verify reached at row `rows - 1`. Grid: heads; block 128.
+// state the verify reached at row `rows - 1`.
+//
+// The fold is elementwise — h[k][v] takes decay[k], key[k] and delta[v] of
+// each row — so any element-to-thread split is exact. One launch commits
+// every SSM layer of a sequence: blockIdx.y is the layer, its state and
+// records `state_layer_stride` / `records_layer_stride` floats past layer 0
+// (the pools' uniform layer stride). Each CTA owns 128 / KDA_COMMIT_KSPLIT
+// key rows of one head; thread = (key lane, 4 value columns), float4 I/O.
+// Grid: heads * KDA_COMMIT_KSPLIT x layers; block 128.
+#define KDA_COMMIT_KSPLIT 4u
+#define KDA_COMMIT_KPT (128u / KDA_COMMIT_KSPLIT / 4u)
 extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
     float* __restrict__ state,
+    unsigned long long state_layer_stride,
     const float* __restrict__ records,
+    unsigned long long records_layer_stride,
     unsigned long long record_stride,
     unsigned int rows,
     unsigned int heads
 ) {
     atlas_pdl_enter();
-    const unsigned int head = blockIdx.x;
-    const unsigned int vrow = threadIdx.x;
-    if (head >= heads || blockDim.x != 128) return;
-    __shared__ float decay[128];
-    __shared__ float key[128];
-    float* H = state + (unsigned long long)head * 128 * 128;
-    float h[128];
+    const unsigned int head = blockIdx.x / KDA_COMMIT_KSPLIT;
+    if (head >= heads || blockDim.x != 128 || rows == 0) return;
+    const unsigned int col = (threadIdx.x & 31u) * 4u;
+    const unsigned int k0 = (blockIdx.x % KDA_COMMIT_KSPLIT) * (128u / KDA_COMMIT_KSPLIT)
+        + (threadIdx.x >> 5);
+    float* H = state + (unsigned long long)blockIdx.y * state_layer_stride
+        + (unsigned long long)head * 128 * 128 + col;
+    const float* R = records + (unsigned long long)blockIdx.y * records_layer_stride
+        + (unsigned long long)head * KDA_RECORD_FLOATS;
+    float4 h[KDA_COMMIT_KPT];
     #pragma unroll
-    for (unsigned int k = 0; k < 128; ++k) h[k] = H[(unsigned long long)k * 128 + vrow];
+    for (unsigned int i = 0; i < KDA_COMMIT_KPT; ++i)
+        h[i] = *reinterpret_cast<const float4*>(H + (unsigned long long)(k0 + 4u * i) * 128);
     for (unsigned int t = 0; t < rows; ++t) {
-        const float* rec = records + (unsigned long long)t * record_stride
-            + (unsigned long long)head * KDA_RECORD_FLOATS;
-        decay[vrow] = rec[vrow];
-        key[vrow] = rec[128 + vrow];
-        const float delta = rec[256 + vrow];
-        __syncthreads();
+        const float* rec = R + (unsigned long long)t * record_stride;
+        const float4 d = *reinterpret_cast<const float4*>(rec + 256 + col);
         #pragma unroll
-        for (unsigned int k = 0; k < 128; ++k) h[k] = kda_fold(h[k], decay[k], key[k], delta);
-        __syncthreads();
+        for (unsigned int i = 0; i < KDA_COMMIT_KPT; ++i) {
+            const float decay = rec[k0 + 4u * i];
+            const float key = rec[128 + k0 + 4u * i];
+            h[i].x = kda_fold(h[i].x, decay, key, d.x);
+            h[i].y = kda_fold(h[i].y, decay, key, d.y);
+            h[i].z = kda_fold(h[i].z, decay, key, d.z);
+            h[i].w = kda_fold(h[i].w, decay, key, d.w);
+        }
     }
     #pragma unroll
-    for (unsigned int k = 0; k < 128; ++k) H[(unsigned long long)k * 128 + vrow] = h[k];
+    for (unsigned int i = 0; i < KDA_COMMIT_KPT; ++i)
+        *reinterpret_cast<float4*>(H + (unsigned long long)(k0 + 4u * i) * 128) = h[i];
 }
 
 // Precompute normalized Q/K and row decay once per token/head. The recurrence

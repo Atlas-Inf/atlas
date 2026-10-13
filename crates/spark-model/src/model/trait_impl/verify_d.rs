@@ -183,24 +183,27 @@ impl TransformerModel {
             && crate::speculative::glm_repair_policy::dflash_prefill_verify()
             && !hss_engaged
             && !use_graphs
-            && k >= 2)
-            .then(|| ForwardContext {
-                attn_metadata: Some(AttnMetadataDev {
-                    positions: metadata.positions,
-                    positions_h: metadata.positions,
-                    positions_w: metadata.positions,
-                    slot: metadata.slot,
-                    // Chunk-total length: the last row's causal extent.
-                    seq_len: metadata.seq_len.offset((k - 1) * 4),
-                    block_table: metadata.block_table,
-                    max_blocks_per_seq: metadata.max_blocks_per_seq,
-                    num_seqs: 1,
-                    seq_slot: metadata.seq_slot,
-                    moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
-                }),
-                midchunk_capture: None,
-                ..ctx
-            });
+            // ATLAS_GLM_CANONICAL_VERIFY: one row too, so a lone row runs the
+            // same MLA pipeline (MXFP8 projections, indexer, canonical sparse
+            // attention, grouped FFN) as a row of a wider block.
+            && (k >= 2 || crate::layers::canonical_verify::enabled()))
+        .then(|| ForwardContext {
+            attn_metadata: Some(AttnMetadataDev {
+                positions: metadata.positions,
+                positions_h: metadata.positions,
+                positions_w: metadata.positions,
+                slot: metadata.slot,
+                // Chunk-total length: the last row's causal extent.
+                seq_len: metadata.seq_len.offset((k - 1) * 4),
+                block_table: metadata.block_table,
+                max_blocks_per_seq: metadata.max_blocks_per_seq,
+                num_seqs: 1,
+                seq_slot: metadata.seq_slot,
+                moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
+            }),
+            midchunk_capture: None,
+            ..ctx
+        });
 
         // ── Phase 2: CUDA graph capture / replay ──
 

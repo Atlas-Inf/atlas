@@ -17,6 +17,7 @@ fn parse_fast_prefill(value: Option<&str>) -> bool {
 fn fast_prefill(tokens: u32) -> bool {
     (tokens >= 128 && parse_fast_prefill(std::env::var("ATLAS_HC_CUBLAS_PREFILL").ok().as_deref()))
         || (tokens == 5
+            && !crate::layers::canonical_verify::enabled()
             && parse_fast_prefill(std::env::var("ATLAS_GLM_K5_HC_CUBLAS").ok().as_deref()))
 }
 

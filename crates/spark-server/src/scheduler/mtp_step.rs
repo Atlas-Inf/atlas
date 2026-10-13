@@ -160,6 +160,7 @@ pub fn step_mtp(
                         late_dflash.push(idx);
                         continue;
                     }
+                    crate::scheduler::copy_drafts::offer(a);
                     let (init, conf) = a.take_drafts();
                     if dflash_verify_raw_argmax || glm_repaired_narrow {
                         step_verify_dflash(
@@ -420,6 +421,12 @@ pub fn step_mtp(
         }
     }
     verify_idxs.extend(late_dflash);
+    // Copy drafts (`ATLAS_DFLASH_COPY_DRAFTS`) before any width is chosen.
+    if dflash_verify_raw_argmax {
+        for &idx in &verify_idxs {
+            crate::scheduler::copy_drafts::offer(&mut active[idx]);
+        }
+    }
 
     // ── Phase B: Verify with pipelined checkpoint ──
     //
@@ -456,6 +463,7 @@ pub fn step_mtp(
             if a.grammar_state.is_none() && a.pending_drafts.len() >= ladder_nd {
                 if a.pending_drafts.len() > ladder_nd {
                     a.pending_drafts.truncate(ladder_nd);
+                    crate::scheduler::copy_drafts::cut_conf(a);
                 }
                 batchable_idxs.push(idx);
             } else {

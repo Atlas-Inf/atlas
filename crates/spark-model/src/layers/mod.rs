@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+pub mod canonical_verify;
 pub mod deepseek_v4_mtp;
 pub mod dense_ffn;
 pub mod dflash_head;
@@ -447,3 +448,6 @@ impl FfnComponent {
         }
     }
 }
+
+#[cfg(test)]
+mod glm_gpu_test_backend;

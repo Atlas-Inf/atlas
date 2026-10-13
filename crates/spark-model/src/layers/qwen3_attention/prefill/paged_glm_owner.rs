@@ -30,6 +30,13 @@ impl GlmChunkOwner {
         floor.saturating_sub(self.row0).min(self.rows)
     }
 
+    /// The owner's causal extent: one past its last row's position.
+    pub(super) fn end(&self) -> anyhow::Result<usize> {
+        self.seq_len_start
+            .checked_add(self.rows)
+            .ok_or_else(|| anyhow::anyhow!("GLM prefill sequence length overflow"))
+    }
+
     /// Dense attention over the owner's whole causal history is exact: its
     /// sequence ends within `index_topk`, so it selects nothing.
     pub(super) fn dense_is_exact(&self, index_topk: usize) -> bool {

@@ -106,10 +106,17 @@ pub(super) fn parse_poolside_v1_call(text: &str) -> Option<ToolCall> {
         rest = &rest[key_end + "</arg_key>".len()..];
         rest = rest.strip_prefix("<arg_value>")?;
         let value_end = rest.find("</arg_value>")?;
+        // Keep the text as written. GLM's template renders a string argument
+        // raw and anything else as JSON, so `true` or `42` is a string or a
+        // typed value depending only on the tool's schema: `coerce_all`
+        // (`wants_typed_arguments`) types it, as for qwen3_coder. Parsing it
+        // here turned string parameters such as a Java boolean literal
+        // `"true"` or a zip code into JSON booleans and numbers.
         let raw_value = &rest[..value_end];
-        let value = serde_json::from_str(raw_value)
-            .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
-        args.insert(key.to_string(), value);
+        args.insert(
+            key.to_string(),
+            serde_json::Value::String(raw_value.to_string()),
+        );
         rest = &rest[value_end + "</arg_value>".len()..];
     }
 
@@ -137,7 +144,47 @@ mod tests {
         assert_eq!(call.function.name, "Bash");
         assert_eq!(
             call.function.arguments,
-            r#"{"command":"pwd","timeout":120}"#
+            r#"{"command":"pwd","timeout":"120"}"#
+        );
+    }
+
+    #[test]
+    fn schema_types_values_and_string_parameters_keep_their_text() {
+        let mut calls = vec![
+            parse_poolside_v1_call(
+                "set<arg_key>flag</arg_key><arg_value>true</arg_value>\
+                 <arg_key>zip</arg_key><arg_value>02134</arg_value>\
+                 <arg_key>version</arg_key><arg_value>1.10</arg_value>\
+                 <arg_key>enabled</arg_key><arg_value>true</arg_value>\
+                 <arg_key>count</arg_key><arg_value>42</arg_value>\
+                 <arg_key>limit</arg_key><arg_value>7</arg_value>\
+                 <arg_key>xy</arg_key><arg_value>[60, 30]</arg_value>",
+            )
+            .expect("poolside call"),
+        ];
+        let tools: Vec<ToolDefinition> = serde_json::from_value(serde_json::json!([{
+            "type": "function",
+            "function": {"name": "set", "parameters": {"type": "object", "properties": {
+                "flag": {"type": "string"},
+                "zip": {"type": "string"},
+                "version": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "count": {"type": "integer"},
+                "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "xy": {"type": ["array", "null"]}
+            }}}
+        }]))
+        .unwrap();
+
+        crate::tool_parser::coerce_all(&mut calls, &tools);
+
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "flag": "true", "zip": "02134", "version": "1.10",
+                "enabled": true, "count": 42, "limit": 7, "xy": [60, 30]
+            })
         );
     }
 

@@ -176,10 +176,9 @@ pub(super) struct StreamState {
     /// True iff the reasoning/`<think>` phase has finished. Starts
     /// `true` when the request did not enable thinking.
     pub(super) thinking_done: bool,
-    /// Dead after the tool-call retry stack was removed (`tool_retry_enabled`
-    /// is now constant `false`, so deltas are always streamed in real time
-    /// and this map stays empty). Retained so the buffering helpers in
-    /// `tool_handlers.rs` still type-check.
+    /// A tool call's deltas held until the call validates, by index: for
+    /// Poolside v1 streams (`tool_handlers::holds_tool_deltas`). Anything
+    /// still held when the stream ends is dropped, never sent.
     pub(super) buffered_tool_chunks: std::collections::HashMap<usize, Vec<crate::ir::StreamDelta>>,
     /// Dead after the tool-call retry stack was removed; never set now that
     /// `tool_retry_enabled` is constant `false`.

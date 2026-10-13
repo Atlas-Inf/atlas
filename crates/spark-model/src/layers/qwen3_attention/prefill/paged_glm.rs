@@ -20,6 +20,8 @@ use crate::layers::ops;
 #[path = "paged_glm_projection.rs"]
 mod projection;
 
+#[path = "paged_glm_canonical.rs"]
+pub(in crate::layers::qwen3_attention) mod canonical;
 #[path = "paged_glm_output.rs"]
 mod output;
 #[path = "paged_glm_owner.rs"]
@@ -241,10 +243,7 @@ impl Qwen3AttentionLayer {
                 midchunk_capture: None,
                 ..*ctx
             };
-            let sequence_end = o
-                .seq_len_start
-                .checked_add(o.rows)
-                .ok_or_else(|| anyhow::anyhow!("GLM prefill sequence length overflow"))?;
+            let sequence_end = o.end()?;
             let use_dense = o.dense_is_exact(ctx.config.index_topk);
             let o_normed = normed.offset(o.row0 * h as usize * bf16);
             let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
@@ -280,23 +279,25 @@ impl Qwen3AttentionLayer {
             let sparse_view = ops::glm_sparse_owner_needs_view(&ctx.config.model_type, on, || {
                 ops::glm_sparse_native_admits(&octx, on, o.seq_len_start, false, stream)
             })?;
-            // Sharded latents (`ATLAS_GLM_KV_SHARD=1`): few rows merge each rank's
-            // attention over its own tokens; larger owners read an assembled view.
+            // Few rows merge per-rank attention under a shard (`ATLAS_GLM_KV_SHARD=1`),
+            // the canonical form's bits unsharded; larger sharded owners read a view.
             let sharded = kv_cache.latent_shard().is_some();
             let latents = self.glm_owner_latents(kv_cache, &octx, o, sequence_end, stream)?;
             let merge_form = latents.is_none();
+            let canonical = self.glm_canonical_rank(kv_cache, ctx, nq, o.rows)?;
             let [k_source, v_source, table_source] = latents.unwrap_or([DevicePtr::NULL; 3]);
+            let reads_pool = !merge_form && canonical.is_none();
             let view = self.glm_owner_bf16_view(
                 k_source,
                 table_source,
                 sequence_end,
-                !merge_form && (use_dense || sparse_view),
+                reads_pool && (use_dense || sparse_view),
                 bs,
                 ctx,
                 stream,
             )?;
             ensure!(
-                merge_form || !use_dense || self.kv_dtype == KvCacheDtype::Bf16 || view.is_some(),
+                !reads_pool || !use_dense || self.kv_dtype == KvCacheDtype::Bf16 || view.is_some(),
                 "GLM dense prefill has no BF16 view of the fp8_g128 cache"
             );
             let (k_cache, v_cache, block_table, cache_dtype) = match view {
@@ -334,6 +335,9 @@ impl Qwen3AttentionLayer {
                     attn_latent,
                     stream,
                 )?;
+            } else if let Some(rank) = canonical {
+                let rows = canonical::owner_rows(o, q_absorbed, sparse_indices, &octx, stream);
+                self.glm_canonical_attention(kv_cache, &octx, rank, rows, attn_latent, stream)?;
             } else if let Some((indices, index_width)) = sparse_indices {
                 det.tap("sel", indices, (o.row0, o.rows), index_width as usize * 4);
                 let mut profile = super::glm_index::profile_start(&octx, stream)?;
@@ -364,9 +368,9 @@ impl Qwen3AttentionLayer {
                         kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
                     ),
                 };
-                // SparkGLM-only: the out-of-tree NVIDIA sparse-MLA prefill,
-                // when loaded (`ATLAS_GLM_SPARSE_NATIVE=1`). Sharded latents
-                // without a BF16 view have no geometry the bridge understands.
+                // Atlas native sparse-MLA prefill (`ATLAS_GLM_SPARSE_NATIVE=1`)
+                // requires the qualified BF16 cache geometry. Sharded latents
+                // must supply an assembled BF16 view for this kernel path.
                 let native = cache_dtype == KvCacheDtype::Bf16
                     && (view.is_some() || !sharded)
                     && ops::try_glm_sparse_native(

@@ -64,11 +64,13 @@ fn native_header_precedes_nested_attachment_name() {
         matches!(outputs.as_slice(), [DetectorOutput::ToolCallStart { name, .. }] if name == "ManageMessages")
     );
     outputs.extend(detector.process("</tool_call>"));
+    // Poolside values stay as written; the API layer types them from the
+    // tool schema (`coerce_all`), which this schema-less detector lacks.
     assert_call(
         &outputs,
         "ManageMessages",
         &serde_json::json!({
-            "attachments": [{"path": "song.wav", "name": "evening-piece.wav"}]
+            "attachments": "[{\"path\":\"song.wav\",\"name\":\"evening-piece.wav\"}]"
         }),
     );
 }

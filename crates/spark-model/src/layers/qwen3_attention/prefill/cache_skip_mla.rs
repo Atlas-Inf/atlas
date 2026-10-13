@@ -80,6 +80,17 @@ impl Qwen3AttentionLayer {
                 ctx.gpu, kernel, input, mx.data, mx.scales, output, m, n, k, n, stream,
             );
         }
+        if ctx.config.model_type == "glm5_next"
+            && m <= crate::layers::canonical_verify::MAX_ROWS
+            && crate::layers::canonical_verify::enabled()
+        {
+            // The indexer projections: one tensor-core family for every
+            // verify width (cuBLASLt picks its algorithm per row count, and
+            // one row took `dense_gemm_tc`).
+            return crate::layers::canonical_verify::dense(
+                ctx.gpu, input, weight, output, m, n, k, n, stream,
+            );
+        }
         if use_cublas_mla_prefill(ctx.dispatch.cublas_gemm, m) {
             return ops::cublas_bf16_proj_dense(input, weight.weight, output, m, n, k, stream);
         }

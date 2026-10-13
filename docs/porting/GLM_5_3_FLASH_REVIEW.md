@@ -13,6 +13,11 @@ and [standalone qualification recipe](../../scripts/dev/glm53_native/README.md).
 The recipe deliberately keeps all qualified tuning values explicit. Changing or
 collapsing those values into new defaults requires another runtime qualification.
 
+The [native RC2 update](GLM_5_3_FLASH_RC2.md) adds canonical verification, decode
+kernels, prompt lookup, sharded disk prefixes and optional display-memory
+allocation. Its runtime changes require fresh validation; historical benchmark
+results below remain pinned to their original code.
+
 ## History and review boundaries
 
 Atlas base is `7ffd183f210708d5b1afba1e046049f14ad498c7`. The original

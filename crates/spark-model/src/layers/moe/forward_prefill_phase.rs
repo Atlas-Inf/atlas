@@ -47,6 +47,34 @@ impl MoeLayer {
         let shared_gate_out = ctx.buffers.ssm_deinterleaved();
         let shared_up_out = ctx.buffers.ssm_qkvz();
         let shared_down_out = ctx.buffers.attn_output();
+        // ATLAS_GLM_CANONICAL_VERIFY: the tensor-core tier of `n` rows for
+        // every verify width (the family the 9..32-row branch below runs).
+        let canonical = ctx.config.model_type == "glm5_next"
+            && n <= crate::layers::canonical_verify::MAX_ROWS
+            && crate::layers::canonical_verify::enabled()
+            && crate::layers::w4a16_gemv_tiers::tc_kernel(n).0 != 0
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && !self.weights.shared_expert.gate_proj.is_null()
+            && !self.weights.shared_expert.up_proj.is_null()
+            && !self.weights.shared_expert.down_proj.is_null();
+        if canonical {
+            self.run_shared_tc(
+                crate::layers::w4a16_gemv_tiers::tc_kernel(n),
+                input,
+                shared_gate_out,
+                shared_up_out,
+                shared_down_out,
+                n,
+                h,
+                shared_inter,
+                ctx,
+                aux,
+            )?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         if self.independent_grouped(ctx, n) {
             anyhow::ensure!(
                 !use_overlap,

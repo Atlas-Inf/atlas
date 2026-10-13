@@ -8,6 +8,9 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod carveout;
+mod host_pitched;
+
 #[derive(Debug)]
 pub struct MockAlloc {
     pub bytes: usize,
@@ -54,6 +57,8 @@ pub struct MockGpuBackend {
     /// [`Self::live_streams_and_events`]).
     live_streams: AtomicUsize,
     live_events: AtomicUsize,
+    /// Lendable carveout ([`Self::with_carveout`]); `None` = no carveout.
+    carveout: Mutex<Option<super::carveout::CarveoutArena>>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +97,7 @@ impl MockGpuBackend {
             destroyed_graphs: AtomicUsize::new(0),
             live_streams: AtomicUsize::new(0),
             live_events: AtomicUsize::new(0),
+            carveout: Mutex::new(None),
         }
     }
 
@@ -281,10 +287,19 @@ impl GpuBackend for MockGpuBackend {
         {
             anyhow::bail!("mock free failed (injected): ptr {ptr}");
         }
+        self.carveout_release(ptr);
         if self.allocs.lock().remove(&ptr.0).is_none() && !ptr.is_null() {
             self.invalid_frees.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    fn carveout_capacity(&self) -> usize {
+        self.carveout_bytes()
+    }
+
+    fn alloc_carveout(&self, bytes: usize) -> Result<DevicePtr> {
+        self.carveout_alloc(bytes)
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
@@ -468,31 +483,6 @@ impl GpuBackend for MockGpuBackend {
 
     fn destroy_event(&self, _event: u64) -> Result<()> {
         self.live_events.fetch_sub(1, Ordering::Relaxed);
-        Ok(())
-    }
-}
-
-impl HostPitched for MockGpuBackend {
-    fn h2d_retained(&self, src: &[u8], dst: DevicePtr, shape: Pitched, _stream: u64) -> Result<()> {
-        // One tick per call, as `copy_d2d_2d_async`: the rows are emulation.
-        self.host_pitched.fetch_add(1, Ordering::Relaxed);
-        for r in 0..shape.height {
-            let row = &src[r * shape.host_pitch..][..shape.width];
-            self.copy_h2d(row, dst.offset(r * shape.dev_pitch))?;
-        }
-        Ok(())
-    }
-
-    fn d2h(&self, src: DevicePtr, dst: &mut [u8], shape: Pitched, _stream: u64) -> Result<()> {
-        self.host_pitched.fetch_add(1, Ordering::Relaxed);
-        let allocs = self.allocs.lock();
-        for r in 0..shape.height {
-            let from = src.offset(r * shape.dev_pitch);
-            let (offset, alloc) = find_alloc(&allocs, from)
-                .ok_or_else(|| anyhow::anyhow!("pitched D2H: ptr {from} not allocated"))?;
-            dst[r * shape.host_pitch..][..shape.width]
-                .copy_from_slice(&alloc.data[offset..offset + shape.width]);
-        }
         Ok(())
     }
 }

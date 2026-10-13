@@ -64,6 +64,22 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if ctx.config.model_type == "glm5_next"
+            && rows <= crate::layers::canonical_verify::MAX_ROWS
+            && crate::layers::canonical_verify::enabled()
+        {
+            // One tensor-core family for every verify width (the cuBLASLt
+            // grouped GEMM picks its algorithm per row count; the MXFP8 twin
+            // stops at 16 rows).
+            return crate::layers::canonical_verify::dense_grouped(
+                ctx.gpu,
+                a,
+                weight,
+                c,
+                [rows, g, k, n, a_stride, c_stride],
+                stream,
+            );
+        }
         let tiers = &self.mxfp8_gemv_grouped_k;
         if let Some(mx) = glm_head_twin(&self.mla_mx, tiers, weight, [rows, g, k, n]) {
             return ops::mxfp8_gemv_grouped(

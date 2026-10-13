@@ -124,6 +124,18 @@ pub trait GpuBackend: Send + Sync {
         None
     }
 
+    /// Bytes this backend can lend from device memory outside the system
+    /// pool ([`carveout`]: the GB10 display carveout). Default `0`: no such
+    /// region (mock, Metal, AMD, and CUDA started without one).
+    fn carveout_capacity(&self) -> usize {
+        0
+    }
+
+    /// Allocate `bytes` from that region; [`Self::free`] releases it.
+    fn alloc_carveout(&self, bytes: usize) -> Result<DevicePtr> {
+        anyhow::bail!("this GPU backend has no carveout to allocate {bytes} bytes from")
+    }
+
     /// Copy from host to device.
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()>;
 
@@ -575,6 +587,7 @@ impl fmt::Display for DevicePtr {
     }
 }
 
+pub mod carveout;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
 

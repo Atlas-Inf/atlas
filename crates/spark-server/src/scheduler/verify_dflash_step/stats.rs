@@ -33,4 +33,10 @@ pub(super) fn record(
     crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
     a.spec_adapt.survival.record(drafts.len(), num_accepted);
     crate::scheduler::dflash_conf_width::record(draft_conf, drafts.len(), num_accepted);
+    crate::scheduler::copy_drafts::settle(
+        &mut a.spec_adapt.copy,
+        draft_conf,
+        drafts.len(),
+        num_accepted,
+    );
 }

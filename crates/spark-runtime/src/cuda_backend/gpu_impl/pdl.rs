@@ -39,6 +39,9 @@ pub fn pdl_enabled() -> bool {
 /// parameters (kernels/gb10/glm-5.3-flash/nvfp4/atlas_pdl_touch.cuh). A kernel
 /// launched with PDL must not read its predecessor's output before that wait,
 /// so only these qualify.
+/// This is a launch allowlist, not every kernel containing a wait. In
+/// particular, persistent MoE twins retain the source's ordinary launch
+/// semantics until their overlapping execution is qualified separately.
 pub(super) const PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_tc8",
     "w4a16_gemv_tc8_ld",
@@ -65,6 +68,15 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "dense_gemv_bf16_batchm_dual",
     "dense_gemv_bf16_batchm_dual_k128",
     "dense_gemv_bf16_batchm_triple_n",
+    "dense_gemv_bf16_tc8",
+    "dense_gemv_bf16_tc16",
+    "dense_gemv_bf16_tc32",
+    "dense_gemv_bf16_tc8_grouped",
+    "dense_gemv_bf16_tc16_grouped",
+    "dense_gemv_bf16_tc32_grouped",
+    "dense_gemv_bf16_tc8_planes",
+    "dense_gemv_bf16_tc16_planes",
+    "dense_gemv_bf16_tc32_planes",
     "rms_norm_vanilla",
     "rms_norm_vanilla_regs",
     "bf16_add_inplace",

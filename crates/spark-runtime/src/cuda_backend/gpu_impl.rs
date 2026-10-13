@@ -87,7 +87,7 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn free(&self, ptr: DevicePtr) -> Result<()> {
-        if ptr.is_null() {
+        if ptr.is_null() || super::display_carveout::free(ptr) {
             return Ok(());
         }
         // Off the ledger BEFORE the free: an entry that survives a successful
@@ -116,6 +116,13 @@ impl GpuBackend for AtlasCudaBackend {
 
     fn sweep_unreleased(&self) -> usize {
         AtlasCudaBackend::sweep_unreleased(self)
+    }
+
+    fn carveout_capacity(&self) -> usize {
+        super::display_carveout::capacity()
+    }
+    fn alloc_carveout(&self, bytes: usize) -> Result<DevicePtr> {
+        super::display_carveout::alloc(bytes)
     }
 
     fn own_footprint(&self) -> Option<crate::own_footprint::OwnFootprint> {

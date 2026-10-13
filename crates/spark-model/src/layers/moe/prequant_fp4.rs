@@ -103,7 +103,9 @@ impl MoeLayer {
     /// ownership. Keep the control's router and shared expert, changing only
     /// routed GEMV to the established prequantized native-FP4 grouped path.
     pub(super) fn glm_c3_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
-        std::env::var("ATLAS_GLM_C3_GROUPED_MOE").as_deref() == Ok("1")
+        // ATLAS_GLM_CANONICAL_VERIFY: no K=3-only arm (router, shared, tiles).
+        !crate::layers::canonical_verify::enabled()
+            && std::env::var("ATLAS_GLM_C3_GROUPED_MOE").as_deref() == Ok("1")
             && c3_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
             && self.glm_grouped_resources(ctx)
             && self.w4a16_gemv_batch3.0 != 0

@@ -148,24 +148,36 @@ pub fn kda_recurrent_verify_snap_owners(
 /// Floats per head in one row of KDA fold records (decay, key, correction).
 pub const KDA_RECORD_FLOATS: usize = 384;
 
-/// Advance `state` (FP32, `heads` x 128 x 128) over the first `rows` fold
-/// records `record_stride` floats apart: the accepted prefix of a records
-/// verify, bit-identical to the state that verify reached at that row.
+/// Key-row blocks per head in [`kda_commit_records`] (`KDA_COMMIT_KSPLIT`).
+const KDA_COMMIT_KSPLIT: u32 = 4;
+
+/// Advance `layers` FP32 states (`heads` x 128 x 128 each, layer `l` at
+/// `state + l * state_layer_stride` floats) over the first `rows` fold
+/// records `record_stride` floats apart (layer `l`'s at `records + l *
+/// records_layer_stride` floats): the accepted prefix of a records verify,
+/// bit-identical to the state that verify reached at that row. One launch
+/// for every layer; a single layer passes `layers == 1` (strides unused).
+#[allow(clippy::too_many_arguments)]
 pub fn kda_commit_records(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     state: DevicePtr,
+    state_layer_stride: usize,
     records: DevicePtr,
+    records_layer_stride: usize,
     record_stride: usize,
     rows: u32,
     heads: u32,
+    layers: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([heads, 1, 1])
+        .grid([heads * KDA_COMMIT_KSPLIT, layers, 1])
         .block([128, 1, 1])
         .arg_ptr(state)
+        .arg_u64(state_layer_stride as u64)
         .arg_ptr(records)
+        .arg_u64(records_layer_stride as u64)
         .arg_u64(record_stride as u64)
         .arg_u32(rows)
         .arg_u32(heads)

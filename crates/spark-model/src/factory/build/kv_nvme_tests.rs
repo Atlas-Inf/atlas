@@ -3,6 +3,7 @@
 //! Tests for the NVMe spill tier's construction (`kv_nvme.rs`): env parsing,
 //! the rank agreement word, attach on both I/O paths and the host-memory reserve.
 
+use super::shard_tests::GLM;
 use super::*;
 
 fn switches(fast: Option<&str>, keep: Option<&str>) -> [(&'static str, Option<String>); 2] {
@@ -66,10 +67,10 @@ fn slots_floor_the_budget() {
 
 /// `(fast, keep)` for [`rank_fingerprint`].
 const OFF: (bool, bool) = (false, false);
-const FAST: (bool, bool) = (true, false);
+pub(super) const FAST: (bool, bool) = (true, false);
 const KEEP: (bool, bool) = (false, true);
 /// Snapshot-tier homes: on an O_DIRECT file, and on a peer.
-const DISK: Option<SpillHome> = Some(SpillHome::Disk { hot_slots: 2 });
+pub(super) const DISK: Option<SpillHome> = Some(SpillHome::Disk { hot_slots: 2 });
 const PEER: Option<SpillHome> = Some(SpillHome::Peer);
 
 #[test]
@@ -99,7 +100,7 @@ fn fingerprint_separates_every_field() {
     );
 }
 
-fn tier(gb: &str, fast: bool) -> NvmeKvConfig {
+pub(super) fn tier(gb: &str, fast: bool) -> NvmeKvConfig {
     let on = switches(fast.then_some("1"), None);
     config_from(Some("/nvme"), Some(gb), on).unwrap().unwrap()
 }
@@ -107,28 +108,28 @@ fn tier(gb: &str, fast: bool) -> NvmeKvConfig {
 #[test]
 fn the_rank_word_is_zero_only_with_every_spill_tier_off() {
     // Off: the word the ranks already gather stays the bare block count.
-    assert_eq!(word_for(None, 106_496, None, true).unwrap(), TIER_OFF);
-    assert_eq!(word_for(None, 106_496, None, false).unwrap(), TIER_OFF);
+    assert_eq!(word_for(None, GLM, None, true).unwrap(), TIER_OFF);
+    assert_eq!(word_for(None, GLM, None, false).unwrap(), TIER_OFF);
     // The snapshot tier alone is a word too: its ranks run the restore
     // agreement, so a rank without it must not start beside one with it.
     // Nothing is refused there — that start is integ/next's.
-    let ssm_only = word_for(None, 106_496, DISK, false).unwrap();
+    let ssm_only = word_for(None, GLM, DISK, false).unwrap();
     assert!(ssm_only != TIER_OFF && ssm_only != FAILED_RANK);
-    assert_ne!(ssm_only, word_for(None, 106_496, PEER, true).unwrap());
+    assert_ne!(ssm_only, word_for(None, GLM, PEER, true).unwrap());
     let ram = Some(SpillHome::HostRam);
-    assert_ne!(word_for(None, 106_496, ram, true).unwrap(), TIER_OFF);
-    let on = word_for(Some(&tier("24", false)), 106_496, DISK, true).unwrap();
+    assert_ne!(word_for(None, GLM, ram, true).unwrap(), TIER_OFF);
+    let on = word_for(Some(&tier("24", false)), GLM, DISK, true).unwrap();
     assert!(on != TIER_OFF && on != FAILED_RANK && on != ssm_only);
     for other in [
-        word_for(Some(&tier("24", true)), 106_496, DISK, true),
-        word_for(Some(&tier("25", false)), 106_496, DISK, true),
-        word_for(Some(&tier("24", false)), 106_496, None, true),
-        word_for(Some(&tier("24", false)), 106_496, PEER, true),
+        word_for(Some(&tier("24", true)), GLM, DISK, true),
+        word_for(Some(&tier("25", false)), GLM, DISK, true),
+        word_for(Some(&tier("24", false)), GLM, None, true),
+        word_for(Some(&tier("24", false)), GLM, PEER, true),
     ] {
         assert_ne!(on, other.unwrap());
     }
     // A budget below one record is this rank's error, sent as the sentinel.
-    assert!(word_for(Some(&tier("0.00001", false)), 106_496, DISK, true).is_err());
+    assert!(word_for(Some(&tier("0.00001", false)), GLM, DISK, true).is_err());
     // No field combination lands on either reserved word.
     for slots in 0..4096 {
         let home = [None, DISK, PEER, ram][slots as usize % 4];
@@ -142,19 +143,19 @@ fn the_kv_tier_refuses_a_host_ram_snapshot_tier_and_a_pair_without_lifeline() {
     let cfg = tier("24", true);
     // Spilled snapshots in host RAM are outside the reserve the pool is sized
     // around (legacy store, no usable swap directory, non-4 KiB blob).
-    let e = word_for(Some(&cfg), 106_496, Some(SpillHome::HostRam), true).unwrap_err();
+    let e = word_for(Some(&cfg), GLM, Some(SpillHome::HostRam), true).unwrap_err();
     let text = format!("{e:#}");
     assert!(text.contains("ATLAS_SSM_TIER_SWAP_DIR"), "{text}");
     assert!(text.contains("host RAM"), "{text}");
     // A rank that fails in its local attach stops its peer through the
     // lifeline only.
-    let e = word_for(Some(&cfg), 106_496, DISK, false).unwrap_err();
+    let e = word_for(Some(&cfg), GLM, DISK, false).unwrap_err();
     assert!(format!("{e:#}").contains("ATLAS_EP_PEER_LIFELINE"), "{e:#}");
     assert!(snapshots_off_host(Some(SpillHome::HostRam)).is_err());
     assert!(snapshots_off_host(DISK).is_ok() && snapshots_off_host(None).is_ok());
     // Either refusal reaches every rank as the failure sentinel.
     let peer = rank_fingerprint(10, 4096, DISK, FAST);
-    let refused = word_for(Some(&cfg), 106_496, Some(SpillHome::HostRam), true);
+    let refused = word_for(Some(&cfg), GLM, Some(SpillHome::HostRam), true);
     assert!(verify_ranks(refused, &[FAILED_RANK, peer]).is_err());
     let e = verify_ranks(Ok(peer), &[FAILED_RANK, peer]).unwrap_err();
     assert!(format!("{e:#}").contains("rank 0"), "{e:#}");
@@ -271,8 +272,8 @@ fn setup(
     prefix_cache: &dyn PrefixCache,
     gpu: &spark_runtime::gpu::mock::MockGpuBackend,
 ) -> Result<u32> {
-    let record = kv.nvme_record_bytes();
-    setup_local(cfg, 0, record, kv, prefix_cache, gpu)
+    let geometry = kv.nvme_geometry();
+    setup_local(cfg, 0, geometry, kv, prefix_cache, gpu)
 }
 
 fn glm_kv(gpu: &spark_runtime::gpu::mock::MockGpuBackend) -> PagedKvCache {
@@ -313,7 +314,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
 /// nothing to test there. Never silently: the skip is printed, and a run
 /// that must cover the record file sets `ATLAS_TIER_REQUIRE_O_DIRECT` (as
 /// `atlas-tier`'s own tests do), which turns the skip into a failure.
-fn disk_scratch_dir(tag: &str) -> Option<PathBuf> {
+pub(super) fn disk_scratch_dir(tag: &str) -> Option<PathBuf> {
     let d = scratch_dir(tag);
     std::fs::create_dir_all(&d).unwrap();
     match atlas_tier::unsuitable_swap_fs(&d) {
@@ -426,37 +427,6 @@ fn fast_attach_spills_and_restores_through_the_record_file() {
     assert_eq!(back, pattern, "block 1's bytes restored into block 0");
     assert!(kv.nvme_take_failed().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn host_reserve_covers_staging_index_and_the_ssm_tier() {
-    use spark_runtime::prefix_cache::NVME_HOST_BYTES_PER_BLOCK;
-    let record = 106_496; // GLM-5.3, per rank
-    assert_eq!(reserve_for(None, record, 1 << 30), 0, "tier off: nothing");
-    let cfg = |fast| NvmeKvConfig {
-        dir: PathBuf::from("/nvme"),
-        budget_bytes: 24 << 30,
-        fast,
-        keep: false,
-    };
-    let slots = (24usize << 30) / record;
-    let index = slots * NVME_HOST_BYTES_PER_BLOCK;
-    assert_eq!(
-        reserve_for(Some(&cfg(false)), record, 0),
-        32 * record + index
-    );
-    assert_eq!(
-        reserve_for(Some(&cfg(true)), record, 5000),
-        128 * record + index + 5000
-    );
-    // 24 GiB of records costs about 148 MiB of host RAM for the index alone.
-    assert!((140 << 20..150 << 20).contains(&index), "{index}");
-    // A budget below one record is refused at attach; the reserve stays 0.
-    let tiny = NvmeKvConfig {
-        budget_bytes: 100,
-        ..cfg(true)
-    };
-    assert_eq!(reserve_for(Some(&tiny), record, 5000), 0);
 }
 
 #[test]

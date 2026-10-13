@@ -9,7 +9,11 @@
     response_format requests (glm_empty_think_off) restore the empty block. -#}
 {%- set low_think = not thinking_enabled and not tools and not (glm_empty_think_off is defined and glm_empty_think_off) -%}
 {%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else ('low' if low_think else 'max') -%}
-{%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
+{#- The effort header belongs to a turn that reasons. With the empty think
+    block (thinking off with tools, or glm_empty_think_off) it is omitted, as in
+    the upstream template's own thinking switch; `Max` there told the model to
+    reason at full effort while giving it no room to. -#}
+{%- if (thinking_enabled or low_think) and effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
 {%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
 {%- if tools -%}
 {%- macro tool_to_json(tool) -%}

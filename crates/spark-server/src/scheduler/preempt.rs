@@ -309,10 +309,12 @@ pub(super) fn preempt_requeue(model: &dyn Model, mut a: ActiveSeq) -> PreemptedS
         tracing::error!("preempt_requeue: free_sequence: {e:#}");
     }
     let _ = model.ep_broadcast_cmd_for_seq(slot_idx, 0xFFFFFFF1);
-    // GPU-tied speculative state died with the slot.
+    // GPU-tied speculative state died with the slot; copy drafts' is host-side.
     a.pending_drafts.clear();
     a.pending_draft_conf.clear();
+    let copy = std::mem::take(&mut a.spec_adapt.copy);
     a.spec_adapt = Default::default();
+    a.spec_adapt.copy = copy.resumed();
     PreemptedSeq { a, tokens }
 }
 

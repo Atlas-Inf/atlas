@@ -209,13 +209,6 @@ pub(super) fn shard_plan(
         kv_config.cache_blocks_per_seq.is_none(),
         "ATLAS_GLM_KV_SHARD=1 does not support --high-speed-swap"
     );
-    // The NVMe prefix tier spills and restores whole blocks' latents by
-    // physical id, and a rank stores only its own blocks'.
-    ensure!(
-        super::kv_nvme::config_from_env()?.is_none(),
-        "ATLAS_GLM_KV_SHARD=1 does not support the NVMe prefix tier ({})",
-        super::kv_nvme::DIR_VAR
-    );
     ensure!(
         (0..kv_config.num_layers).all(|l| matches!(
             kv_config.dtype_for_layer(l),
@@ -234,8 +227,7 @@ pub(super) fn shard_plan(
         lane.unwrap_or_default()
     );
     tracing::info!(
-        "KV latent shard merge form: compact={} overlap={} check={}",
-        tuning.compact,
+        "KV latent shard merge form: compact (always) overlap={} check={}",
         tuning.overlap,
         tuning.check
     );
@@ -248,17 +240,21 @@ pub(super) fn shard_plan(
 }
 
 /// The paged cache `plan` describes: latent-sharded, V aliasing K (GLM), or
-/// the generic layout.
+/// the generic layout, with `placement`'s pools in the carveout
+/// (`kv_carveout::plan`, which sizes a shard's pools at its local slots).
 pub(super) fn new_kv_cache(
     kv_config: KvCacheConfig,
     num_blocks: usize,
     gpu: &dyn GpuBackend,
     plan: Option<GlmCachePlan>,
+    placement: spark_runtime::kv_cache::KvPlacement,
 ) -> Result<spark_runtime::kv_cache::PagedKvCache> {
     use spark_runtime::kv_cache::PagedKvCache;
     match plan.and_then(GlmCachePlan::shard) {
-        Some(spec) => PagedKvCache::new_latent_sharded(kv_config, num_blocks, gpu, spec),
-        None => PagedKvCache::new_with_v_alias(kv_config, num_blocks, gpu, plan.is_some()),
+        Some(spec) => {
+            PagedKvCache::new_latent_sharded_placed(kv_config, num_blocks, gpu, spec, placement)
+        }
+        None => PagedKvCache::new_placed(kv_config, num_blocks, gpu, plan.is_some(), placement),
     }
 }
 

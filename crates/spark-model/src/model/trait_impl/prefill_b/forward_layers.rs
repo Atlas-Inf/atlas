@@ -277,7 +277,7 @@ impl TransformerModel {
             if let Some(t) = t_pf {
                 t_in_prefill += t.elapsed();
             }
-            det.tap("out", ctx.buffers.hc_streams(), det_out, hc_row);
+            det.tap_floats("out", ctx.buffers.hc_streams(), det_out, hc_row, hc_elem);
             let t_df = host_timing.then(std::time::Instant::now);
             // DFlash chunked-prefill capture. `effective_seq_len_start` (==
             // proc_start) is the ABSOLUTE position of this chunk's first

@@ -39,7 +39,12 @@
 //!
 //! Every tap synchronizes the stream and copies the tensor to the host, so
 //! a traced prefill is several times slower and its stream timing differs.
-//! Unset, the taps return on one cached flag and nothing else changes.
+//! `ATLAS_GLM_DET_FINITE=1` adds NaN/infinity counts and the first bad element
+//! for known BF16/FP32 stages, with an additional host read. Integer stages
+//! remain hash-only. Unset, the taps return on one cached flag.
+
+#[path = "det_trace_finite.rs"]
+mod finite;
 
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
@@ -308,10 +313,39 @@ fn device_line(
     ptr: DevicePtr,
     rows: (usize, usize),
     row_bytes: usize,
+    element_bytes: Option<usize>,
 ) -> String {
     let bytes = rows.1 * row_bytes;
     let hash = device_hash(gpu, stream, ptr, bytes, SEGMENT);
-    format_line(at, stage, rows, bytes, hash)
+    let mut line = format_line(at, stage, rows, bytes, hash);
+    static FINITE: OnceLock<bool> = OnceLock::new();
+    if *FINITE.get_or_init(|| std::env::var("ATLAS_GLM_DET_FINITE").as_deref() == Ok("1"))
+        && let Some(width) = finite::width(stage, element_bytes)
+    {
+        let mut counts = finite::Counts::default();
+        let mut raw = vec![0u8; bytes.min(SEGMENT)];
+        let result = (|| -> anyhow::Result<()> {
+            gpu.synchronize(stream)?;
+            for offset in (0..bytes).step_by(SEGMENT) {
+                let n = (bytes - offset).min(SEGMENT);
+                gpu.copy_d2h(ptr.offset(offset), &mut raw[..n])?;
+                counts.update(&raw[..n], width);
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => line.push_str(&format!(
+                " fp{} nan={} inf={} values={} first_bad={:?}",
+                width * 8,
+                counts.nan,
+                counts.inf,
+                counts.values,
+                counts.first
+            )),
+            Err(error) => line.push_str(&format!(" finite_read_error={error:?}")),
+        }
+    }
+    line
 }
 
 /// Taps reading after `stream` (see [`on_stream`]).
@@ -332,6 +366,31 @@ impl Taps<'_> {
     /// outside a traced chunk, so the verify and decode callers of shared
     /// layer code are silent, and nothing for an empty span.
     pub fn tap(&self, stage: &str, ptr: DevicePtr, rows: (usize, usize), row_bytes: usize) {
+        self.tap_inner(stage, ptr, rows, row_bytes, None);
+    }
+
+    /// Trace float storage whose representation varies with the caller's
+    /// configuration. `element_bytes` is 2 for BF16 or 4 for FP32; unsupported
+    /// widths keep only the byte hash. No numeric read occurs unless enabled.
+    pub fn tap_floats(
+        &self,
+        stage: &str,
+        ptr: DevicePtr,
+        rows: (usize, usize),
+        row_bytes: usize,
+        element_bytes: usize,
+    ) {
+        self.tap_inner(stage, ptr, rows, row_bytes, Some(element_bytes));
+    }
+
+    fn tap_inner(
+        &self,
+        stage: &str,
+        ptr: DevicePtr,
+        rows: (usize, usize),
+        row_bytes: usize,
+        element_bytes: Option<usize>,
+    ) {
         if rows.1 * row_bytes == 0 {
             return;
         }
@@ -344,6 +403,7 @@ impl Taps<'_> {
                 ptr,
                 rows,
                 row_bytes,
+                element_bytes,
             ));
         }
     }

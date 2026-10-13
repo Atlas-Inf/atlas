@@ -22,12 +22,19 @@
 //! The tier refuses to start when `ATLAS_SSM_TIER` keeps spilled snapshots in
 //! host RAM ([`snapshots_off_host`]), and on a multi-rank world with
 //! `ATLAS_EP_PEER_LIFELINE=0` ([`word_for`]); every rank stops.
+//!
+//! Under a latent shard (`ATLAS_GLM_KV_SHARD=1`) the record slots come in two
+//! classes ([`NvmeGeometry`], `kv_cache/nvme_lanes.rs`): each rank keeps one
+//! record file per class — full records for the blocks whose latents it
+//! stores, index-only records for the peer's — and the budget buys
+//! `ATLAS_KV_NVME_GB / (own + peer record)` slots of EACH class. On GLM-5.3
+//! (106 496 + 12 288 B) a GiB then holds ~1.8× the tokens it holds unsharded.
 
 use std::path::PathBuf;
 
 use anyhow::{Result, bail, ensure};
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::kv_cache::PagedKvCache;
+use spark_runtime::kv_cache::{NvmeGeometry, PagedKvCache};
 use spark_runtime::prefix_cache::PrefixCache;
 
 use crate::model::ssm_tier::SpillHome;
@@ -99,7 +106,7 @@ pub(super) fn config_from(
 /// Host memory the spill tiers take AFTER the KV pool is sized, which
 /// `build_model` therefore leaves out of the pool (0 with the KV tier off):
 ///
-/// * the pinned staging (`PagedKvCache::nvme_staging_bytes`);
+/// * the pinned staging of every record class (`NvmeGeometry::staging_bytes`);
 /// * the tree's index for a FULL disk budget — every on-disk block keeps its
 ///   radix node (`NVME_HOST_BYTES_PER_BLOCK`), so the budget in GiB is also a
 ///   budget in host RAM;
@@ -107,9 +114,9 @@ pub(super) fn config_from(
 ///
 /// Never fails: a bad configuration is reported by the rank exchange
 /// ([`verify_ranks`]; an early error here would leave the peers in it).
-pub(super) fn host_reserve_bytes(record_bytes: usize, ssm_lazy_bytes: usize) -> usize {
+pub(super) fn host_reserve_bytes(geometry: NvmeGeometry, ssm_lazy_bytes: usize) -> usize {
     let cfg = config_from_env().ok().flatten();
-    let reserve = reserve_for(cfg.as_ref(), record_bytes, ssm_lazy_bytes);
+    let reserve = reserve_for(cfg.as_ref(), geometry, ssm_lazy_bytes);
     if reserve > 0 {
         tracing::info!(
             "NVMe spill tiers: reserving {:.1} MiB of host memory out of the KV budget \
@@ -121,15 +128,16 @@ pub(super) fn host_reserve_bytes(record_bytes: usize, ssm_lazy_bytes: usize) -> 
     reserve
 }
 
-fn reserve_for(cfg: Option<&NvmeKvConfig>, record_bytes: usize, ssm_lazy_bytes: usize) -> usize {
+fn reserve_for(cfg: Option<&NvmeKvConfig>, geometry: NvmeGeometry, ssm_lazy_bytes: usize) -> usize {
     let Some(cfg) = cfg else {
         return 0;
     };
-    let Ok(slots) = max_slots(cfg.budget_bytes, record_bytes) else {
+    let Ok(per_class) = slots_per_class(cfg.budget_bytes, geometry) else {
         return 0;
     };
-    PagedKvCache::nvme_staging_bytes(record_bytes, cfg.fast)
-        + slots as usize * spark_runtime::prefix_cache::NVME_HOST_BYTES_PER_BLOCK
+    let slots = per_class as usize * geometry.classes();
+    geometry.staging_bytes(cfg.fast)
+        + slots * spark_runtime::prefix_cache::NVME_HOST_BYTES_PER_BLOCK
         + ssm_lazy_bytes
 }
 
@@ -141,6 +149,14 @@ pub(super) fn max_slots(budget_bytes: u64, record_bytes: usize) -> Result<u32> {
         "{GB_VAR}: {budget_bytes} B cannot hold one {record_bytes} B KV block record"
     );
     Ok(n.min(u32::MAX as u64 - 1) as u32)
+}
+
+/// Slots of each record class the budget buys: one record of EVERY class per
+/// slot index (unsharded: [`max_slots`] of the one record), so the classes'
+/// files together stay within the budget.
+pub(super) fn slots_per_class(budget_bytes: u64, geometry: NvmeGeometry) -> Result<u32> {
+    let classes = geometry.classes() as u32;
+    Ok(max_slots(budget_bytes, geometry.row_bytes())?.min((u32::MAX - 1) / classes))
 }
 
 /// What every rank must agree on before serving: the KV tier's geometry and
@@ -184,19 +200,17 @@ pub(super) const FAILED_RANK: u32 = u32::MAX;
 /// environment holds — and otherwise a fingerprint of everything in
 /// [`rank_fingerprint`]. `Err` when the KV tier's environment does not parse,
 /// its budget cannot hold one record, or [`word_for`] refuses the combination.
-pub(super) fn rank_word(record_bytes: usize, ssm_home: Option<SpillHome>) -> Result<u32> {
+pub(super) fn rank_word(geometry: NvmeGeometry, ssm_home: Option<SpillHome>) -> Result<u32> {
     let lifeline = std::env::var("ATLAS_EP_PEER_LIFELINE").as_deref() != Ok("0");
-    word_for(
-        config_from_env()?.as_ref(),
-        record_bytes,
-        ssm_home,
-        lifeline,
-    )
+    word_for(config_from_env()?.as_ref(), geometry, ssm_home, lifeline)
 }
 
+/// The fingerprint covers every slot of every class and the bytes of one
+/// slot of each (unsharded: the one class's slots and record, as before).
+/// Both ranks of a latent shard size the same pair of records.
 fn word_for(
     cfg: Option<&NvmeKvConfig>,
-    record_bytes: usize,
+    geometry: NvmeGeometry,
     ssm_home: Option<SpillHome>,
     lifeline: bool,
 ) -> Result<u32> {
@@ -214,9 +228,14 @@ fn word_for(
         lifeline,
         "{DIR_VAR} requires the EP peer lifeline: unset ATLAS_EP_PEER_LIFELINE=0"
     );
-    let slots = max_slots(cfg.budget_bytes, record_bytes)?;
+    let slots = slots_per_class(cfg.budget_bytes, geometry)? * geometry.classes() as u32;
     let switches = (cfg.fast, cfg.keep);
-    Ok(rank_fingerprint(slots, record_bytes, ssm_home, switches))
+    Ok(rank_fingerprint(
+        slots,
+        geometry.row_bytes(),
+        ssm_home,
+        switches,
+    ))
 }
 
 /// Hosts hang on unified-memory exhaustion: the KV pool is sized around what
@@ -280,8 +299,8 @@ pub(super) fn attach(
             }
         }
     }
-    let record = kv_cache.nvme_record_bytes();
-    setup_local(cfg, rank, record, kv_cache, prefix_cache, gpu).map(|_| ())
+    let geometry = kv_cache.nvme_geometry();
+    setup_local(cfg, rank, geometry, kv_cache, prefix_cache, gpu).map(|_| ())
 }
 
 /// The snapshot tier's swap directory, when it is configured to use one.
@@ -311,12 +330,13 @@ fn usable_disk_dir(var: &str, dir: &std::path::Path) -> Result<()> {
         .map_err(|e| e.context(format!("{var}={} is not usable", dir.display())))
 }
 
-/// Env-free body of [`attach`]: validate, create the record file, attach it
-/// and enable the tree side. Returns the slot budget (0 = off).
+/// Env-free body of [`attach`]: validate, create the record file of every
+/// slot class, attach them and enable the tree side. Returns the slot budget
+/// over all classes (0 = off).
 fn setup_local(
     cfg: Option<NvmeKvConfig>,
     rank: usize,
-    record: usize,
+    geometry: NvmeGeometry,
     kv_cache: &mut PagedKvCache,
     prefix_cache: &dyn PrefixCache,
     gpu: &dyn GpuBackend,
@@ -324,7 +344,13 @@ fn setup_local(
     let Some(cfg) = cfg else {
         return Ok(0);
     };
-    let slots = max_slots(cfg.budget_bytes, record)?;
+    let per_class = slots_per_class(cfg.budget_bytes, geometry)?;
+    let classes = geometry.classes();
+    ensure!(
+        classes == kv_cache.nvme_classes(),
+        "NVMe prefix tier sized for {classes} record class(es), the KV cache has {}",
+        kv_cache.nvme_classes()
+    );
     ensure!(
         prefix_cache.is_active(),
         "{DIR_VAR} requires --enable-prefix-caching (it spills evicted prefix-cache blocks)"
@@ -345,9 +371,78 @@ fn setup_local(
             cfg.dir.display()
         );
     }
-    let path = cfg
-        .dir
-        .join(format!("{FILE_PREFIX}{}.r{rank}.swap", std::process::id()));
+    for class in 0..classes {
+        let record = geometry.class_bytes(class, rank);
+        attach_class_file(
+            &cfg,
+            &file_name(rank, class, classes),
+            record,
+            per_class,
+            kv_cache,
+            gpu,
+        )?;
+    }
+    ensure!(
+        tier.enable_classes(per_class, classes as u32),
+        "prefix cache NVMe tier already enabled"
+    );
+    tier.set_keep_restored(cfg.keep);
+    let slots = per_class * classes as u32;
+    // Disk bytes per cached token: one slot of every class covers `classes`
+    // blocks (one of each residue) under a shard.
+    let per_token = geometry.row_bytes() as f64 / (classes * kv_cache.block_size()) as f64;
+    let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
+    let records = match geometry.peer {
+        None => format!(
+            "{} B/block record ({per_token:.0} B/token: latent + pooled index, no raw tails)",
+            geometry.own
+        ),
+        Some(peer) => format!(
+            "latent shard: {} B/block record for this rank's blocks (latent + pooled index), \
+             {peer} B for the peer's (pooled index only), {per_class} slots each \
+             ({per_token:.0} B/token)",
+            geometry.own
+        ),
+    };
+    tracing::info!(
+        "prefix cache NVMe spill tier ON (rank {rank}): {} ({DIR_VAR}, O_DIRECT, unlinked), \
+         {records}, budget {:.1} GiB = {slots} blocks = {} tokens; {} I/O ({FAST_VAR}), \
+         restored records {} ({KEEP_VAR}), {:.1} MiB pinned staging, up to {:.1} MiB host index",
+        cfg.dir.display(),
+        cfg.budget_bytes as f64 / (1u64 << 30) as f64,
+        slots as u64 * kv_cache.block_size() as u64,
+        if cfg.fast { "fast" } else { "synchronous" },
+        if cfg.keep { "kept" } else { "released" },
+        mib(geometry.staging_bytes(cfg.fast)),
+        mib(slots as usize * spark_runtime::prefix_cache::NVME_HOST_BYTES_PER_BLOCK),
+    );
+    Ok(slots)
+}
+
+/// Record file of slot class `class` of `classes`: `<prefix><pid>.r<rank>.swap`
+/// with one class (as it always was), `...r<rank>.c<class>.swap` under a
+/// latent shard.
+fn file_name(rank: usize, class: usize, classes: usize) -> String {
+    let pid = std::process::id();
+    if classes == 1 {
+        format!("{FILE_PREFIX}{pid}.r{rank}.swap")
+    } else {
+        format!("{FILE_PREFIX}{pid}.r{rank}.c{class}.swap")
+    }
+}
+
+/// Create class `kv_cache.nvme_classes()`'s next record file (`name` in the
+/// tier's directory, records of `record` bytes, room for `slots`) and attach
+/// it on the configured I/O path.
+fn attach_class_file(
+    cfg: &NvmeKvConfig,
+    name: &str,
+    record: usize,
+    slots: u32,
+    kv_cache: &mut PagedKvCache,
+    gpu: &dyn GpuBackend,
+) -> Result<()> {
+    let path = cfg.dir.join(name);
     // Records hold prompt-derived KV: owner-only, and never through a
     // pre-planted file or symlink (remove_file drops a link, not its target;
     // an exclusive create refuses anything that reappears). ONE open per
@@ -379,26 +474,12 @@ fn setup_local(
     // may have unlinked it first — the descriptor is what matters.)
     #[cfg(unix)]
     let _ = std::fs::remove_file(&path);
-    ensure!(tier.enable(slots), "prefix cache NVMe tier already enabled");
-    tier.set_keep_restored(cfg.keep);
-    let per_token = record as f64 / kv_cache.block_size() as f64;
-    let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
-    tracing::info!(
-        "prefix cache NVMe spill tier ON (rank {rank}): {} ({DIR_VAR}, O_DIRECT, unlinked), \
-         {record} B/block record ({per_token:.0} B/token: latent + pooled index, no raw \
-         tails), budget {:.1} GiB = {slots} blocks = {} tokens; {} I/O ({FAST_VAR}), \
-         restored records {} ({KEEP_VAR}), {:.1} MiB pinned staging, up to {:.1} MiB host index",
-        cfg.dir.display(),
-        cfg.budget_bytes as f64 / (1u64 << 30) as f64,
-        slots as u64 * kv_cache.block_size() as u64,
-        if cfg.fast { "fast" } else { "synchronous" },
-        if cfg.keep { "kept" } else { "released" },
-        mib(PagedKvCache::nvme_staging_bytes(record, cfg.fast)),
-        mib(slots as usize * spark_runtime::prefix_cache::NVME_HOST_BYTES_PER_BLOCK),
-    );
-    Ok(slots)
+    Ok(())
 }
 
+#[cfg(test)]
+#[path = "kv_nvme_shard_tests.rs"]
+mod shard_tests;
 #[cfg(test)]
 #[path = "kv_nvme_tests.rs"]
 mod tests;

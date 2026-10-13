@@ -271,6 +271,11 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_W4A16_TC", || {
         Ok(w4a16_gemv_tiers::tc_requested() as u64)
     }),
+    // Whether the shared expert's TP split and every verify op take the
+    // canonical row-invariant kernels (`layers::canonical_verify`).
+    ("ATLAS_GLM_CANONICAL_VERIFY", || {
+        Ok(layers::canonical_verify::enabled() as u64)
+    }),
     // The MTP body a rank loads.
     ("ATLAS_GLM_MTP_DISTRIBUTED", || {
         Ok(glm_repair_policy::mtp_distributed() as u64)
