@@ -17,6 +17,9 @@ pub struct StreamingToolDetector {
     /// `ToolCallParser::promotes_bare_call_names`). Default FALSE: every
     /// other format drops it as malformed, matching the blocking parser.
     pub(super) promote_bare_names: bool,
+    /// Require a closed Poolside envelope before emitting any call event.
+    /// GLM uses this to validate native calls before exposing their headers.
+    pub(super) complete_poolside_calls: bool,
     pub(super) call_counter: u32,
     /// Track if any tool calls were emitted during process() to prevent
     /// flush() from re-emitting them (causes duplicate arguments in stream).
@@ -93,8 +96,15 @@ impl StreamingToolDetector {
 }
 
 /// Extract function name from partial tool call buffer for incremental streaming.
-/// Handles Hermes JSON, Qwen3-Coder XML, Gemma-4, and Mistral native formats.
-pub(super) fn extract_streaming_name(buffer: &str) -> Option<String> {
+/// Handles Poolside v1, Hermes JSON, Qwen3-Coder XML, Gemma-4, and Mistral native.
+pub(super) fn extract_streaming_name(buffer: &str, poolside: bool) -> Option<String> {
+    // The detector has already removed <tool_call>. In Poolside mode the
+    // leading name is complete only when <arg_key> arrives. Never scan a
+    // nested JSON value for a Hermes "name" field in this mode.
+    if poolside {
+        let end = buffer.find("<arg_key>")?;
+        return poolside_v1_name(&buffer[..end]);
+    }
     // Mistral native: [TOOL_CALLS]NAME[ARGS]
     if let Some(start) = buffer.find(MISTRAL_TOOL_CALLS_TAG) {
         let after = &buffer[start + MISTRAL_TOOL_CALLS_TAG.len()..];

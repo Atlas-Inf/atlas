@@ -17,6 +17,9 @@ use super::tool_handlers::{
 
 type DeltaVec = Vec<StreamDelta>;
 
+#[path = "done_finalization.rs"]
+mod finalization;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_done(
     state: &mut StreamState,
@@ -29,7 +32,112 @@ pub(super) fn handle_done(
     cached_prompt_tokens: u32,
     accepted_prediction_tokens: usize,
 ) -> DeltaVec {
+    // ── Usage block (neutral IR; the wire encoder derives
+    //    total_tokens and the details sub-objects from it) ───────────
+    let tps = if decode_time_ms > 0.0 {
+        completion_tokens.saturating_sub(1) as f64 / (decode_time_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let usage = crate::ir::Usage {
+        prompt_tokens: ctx.prompt_len,
+        completion_tokens,
+        cached_prompt_tokens: cached_prompt_tokens as usize,
+        reasoning_tokens: reasoning_tokens as usize,
+        accepted_prediction_tokens,
+        time_to_first_token_ms,
+        response_tokens_per_second: tps,
+    };
+
+    let (deltas, fr) = finalization::finalize_done(
+        state,
+        &finish_reason,
+        usage,
+        ctx.req_return_token_ids,
+        |state| flush_pending_output(state, ctx),
+    );
+
+    // Metrics. (REQUESTS_ACTIVE is released by the ActiveRequestGuard in
+    // StreamCtx when the stream is dropped — not here, so a stream that ends
+    // without a terminal event still decrements.)
+    crate::metrics::PROMPT_TOKENS_TOTAL.inc_by(ctx.prompt_len as u64);
+    crate::metrics::GENERATION_TOKENS_TOTAL.inc_by(completion_tokens as u64);
+    crate::metrics::TTFT_SECONDS
+        .with_label_values(&[ctx.model.as_str()])
+        .observe(time_to_first_token_ms / 1000.0);
+
+    // Rate-limit true-up.
+    if let Some(ref rctx) = ctx.req_ctx {
+        let actual = (ctx.prompt_len + completion_tokens) as u64;
+        let refund = rctx.reserved_tokens.saturating_sub(actual);
+        if refund > 0 {
+            ctx.state.rate_limiter.refund_tokens(&rctx.identity, refund);
+        }
+    }
+
+    // --dump synthesized response entry. Diagnostics, not the stream:
+    // the dump keeps the OpenAI wire-usage shape (same numbers the
+    // encoder derives for the terminal chunk).
+    if let (Some(seq), Some(dump)) = (ctx.dump_seq, ctx.state.dump_writer.as_ref()) {
+        let has_tool_calls = state.detector.as_ref().is_some_and(|d| d.has_tool_calls());
+        let usage_for_dump = crate::openai::Usage {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.prompt_tokens + usage.completion_tokens,
+            prompt_tokens_details: Some(crate::openai::PromptTokensDetails {
+                cached_tokens: usage.cached_prompt_tokens,
+                audio_tokens: 0,
+            }),
+            completion_tokens_details: Some(crate::openai::CompletionTokensDetails {
+                reasoning_tokens: usage.reasoning_tokens,
+                audio_tokens: 0,
+                accepted_prediction_tokens: usage.accepted_prediction_tokens,
+                rejected_prediction_tokens: 0,
+            }),
+            time_to_first_token_ms: usage.time_to_first_token_ms,
+            response_tokens_per_second: usage.response_tokens_per_second,
+        };
+        let body = serde_json::json!({
+            "id": ctx.id,
+            "model": ctx.model,
+            "object": "chat.completion.synthesized",
+            "finish_reason": fr,
+            "content": state.refusal_scan_buf,
+            "has_tool_calls": has_tool_calls,
+            "usage": usage_for_dump,
+            "stop_string_triggered": state.stop_string_triggered,
+            "loop_watchdog_triggered": state.loop_watchdog_triggered,
+            "tool_loop_capped": state.tool_loop_capped,
+            "guard_stop": state.guard_stop,
+            "_note": "Synthesized from post-sanitizer accumulators; \
+                      per-chunk capture is a follow-up.",
+        });
+        dump.dump_response("/v1/chat/completions", seq, &body, true);
+    }
+
+    deltas
+}
+
+fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
     let mut deltas: DeltaVec = Vec::new();
+
+    // EOS or a token limit can arrive before </think>. The reasoning
+    // sanitizer still holds a short safe tail in that case; preserve its
+    // channel instead of losing it or treating it as final answer content.
+    // finalize_done skips this entire flush for rejected output.
+    if ctx.enable_thinking && !state.reasoning_xml_leak_detected {
+        let tail = flush_content_sanitizer(
+            &mut state.reasoning_tag_scan_buf,
+            &mut state.reasoning_suppressing_leak,
+            &ctx.leak_markers,
+        );
+        if !tail.is_empty() {
+            deltas.push(StreamDelta::Reasoning {
+                text: tail,
+                token_ids: state.take_ids_if(ctx.req_return_token_ids),
+            });
+        }
+    }
 
     // ── Stop-string hold-back flush ─────────────────────────────────
     // vLLM's `IncrementalDetokenizer` releases any bytes still in the
@@ -169,112 +277,6 @@ pub(super) fn handle_done(
             text: tail,
             token_ids: state.take_ids_if(ctx.req_return_token_ids),
         });
-    }
-
-    // ── Usage block (neutral IR; the wire encoder derives
-    //    total_tokens and the details sub-objects from it) ───────────
-    let tps = if decode_time_ms > 0.0 {
-        completion_tokens.saturating_sub(1) as f64 / (decode_time_ms / 1000.0)
-    } else {
-        0.0
-    };
-    let usage = crate::ir::Usage {
-        prompt_tokens: ctx.prompt_len,
-        completion_tokens,
-        cached_prompt_tokens: cached_prompt_tokens as usize,
-        reasoning_tokens: reasoning_tokens as usize,
-        accepted_prediction_tokens,
-        time_to_first_token_ms,
-        response_tokens_per_second: tps,
-    };
-
-    let fr = resolve_wire_finish_reason(
-        &finish_reason,
-        state.tool_loop_capped,
-        state.detector.as_ref().is_some_and(|d| d.has_tool_calls()) || state.salvaged_tool_call,
-        state.stop_string_matched,
-        state.guard_stop,
-    );
-
-    // Refusal classification.
-    let refusal_signal = if state.detector.as_ref().is_none_or(|d| !d.has_tool_calls()) {
-        crate::refusal::detect(&state.refusal_scan_buf)
-    } else {
-        None
-    };
-    if let Some(ref r) = refusal_signal {
-        deltas.push(StreamDelta::Refusal { text: r.clone() });
-    }
-
-    // Terminal delta: finish reason + usage. The `include_usage`
-    // two-chunk framing (usage-only chunk before a usage-less finish
-    // chunk) is the OpenAI encoder's decision
-    // (`openai::delta_to_chunk_events`), not the core's. Residual
-    // token ids — tokens whose decoded text was buffered/suppressed
-    // and never rode a content delta — ride the Finish delta so
-    // Σ token_ids == completion_tokens exactly.
-    deltas.push(StreamDelta::Finish {
-        reason: crate::ir::FinishReason::from(fr),
-        usage,
-        token_ids: state.take_ids_if(ctx.req_return_token_ids),
-    });
-
-    // Metrics. (REQUESTS_ACTIVE is released by the ActiveRequestGuard in
-    // StreamCtx when the stream is dropped — not here, so a stream that ends
-    // without a terminal event still decrements.)
-    crate::metrics::PROMPT_TOKENS_TOTAL.inc_by(ctx.prompt_len as u64);
-    crate::metrics::GENERATION_TOKENS_TOTAL.inc_by(completion_tokens as u64);
-    crate::metrics::TTFT_SECONDS
-        .with_label_values(&[ctx.model.as_str()])
-        .observe(time_to_first_token_ms / 1000.0);
-
-    // Rate-limit true-up.
-    if let Some(ref rctx) = ctx.req_ctx {
-        let actual = (ctx.prompt_len + completion_tokens) as u64;
-        let refund = rctx.reserved_tokens.saturating_sub(actual);
-        if refund > 0 {
-            ctx.state.rate_limiter.refund_tokens(&rctx.identity, refund);
-        }
-    }
-
-    // --dump synthesized response entry. Diagnostics, not the stream:
-    // the dump keeps the OpenAI wire-usage shape (same numbers the
-    // encoder derives for the terminal chunk).
-    if let (Some(seq), Some(dump)) = (ctx.dump_seq, ctx.state.dump_writer.as_ref()) {
-        let has_tool_calls = state.detector.as_ref().is_some_and(|d| d.has_tool_calls());
-        let usage_for_dump = crate::openai::Usage {
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-            total_tokens: usage.prompt_tokens + usage.completion_tokens,
-            prompt_tokens_details: Some(crate::openai::PromptTokensDetails {
-                cached_tokens: usage.cached_prompt_tokens,
-                audio_tokens: 0,
-            }),
-            completion_tokens_details: Some(crate::openai::CompletionTokensDetails {
-                reasoning_tokens: usage.reasoning_tokens,
-                audio_tokens: 0,
-                accepted_prediction_tokens: usage.accepted_prediction_tokens,
-                rejected_prediction_tokens: 0,
-            }),
-            time_to_first_token_ms: usage.time_to_first_token_ms,
-            response_tokens_per_second: usage.response_tokens_per_second,
-        };
-        let body = serde_json::json!({
-            "id": ctx.id,
-            "model": ctx.model,
-            "object": "chat.completion.synthesized",
-            "finish_reason": fr,
-            "content": state.refusal_scan_buf,
-            "has_tool_calls": has_tool_calls,
-            "usage": usage_for_dump,
-            "stop_string_triggered": state.stop_string_triggered,
-            "loop_watchdog_triggered": state.loop_watchdog_triggered,
-            "tool_loop_capped": state.tool_loop_capped,
-            "guard_stop": state.guard_stop,
-            "_note": "Synthesized from post-sanitizer accumulators; \
-                      per-chunk capture is a follow-up.",
-        });
-        dump.dump_response("/v1/chat/completions", seq, &body, true);
     }
 
     deltas

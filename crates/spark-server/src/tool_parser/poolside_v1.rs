@@ -85,12 +85,14 @@ impl ToolCallParser for PoolsideV1Parser {
     }
 }
 
+pub(super) fn poolside_v1_name(header: &str) -> Option<String> {
+    let name = normalize_tool_name(header.trim());
+    is_tool_name_component(&name).then_some(name)
+}
+
 pub(super) fn parse_poolside_v1_call(text: &str) -> Option<ToolCall> {
     let name_end = text.find("<arg_key>").unwrap_or(text.len());
-    let name = normalize_tool_name(text[..name_end].trim());
-    if !is_tool_name_component(&name) {
-        return None;
-    }
+    let name = poolside_v1_name(&text[..name_end])?;
 
     let mut args = serde_json::Map::new();
     let mut rest = &text[name_end..];
