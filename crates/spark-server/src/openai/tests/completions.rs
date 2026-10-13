@@ -5,6 +5,18 @@
 use crate::openai::*;
 
 #[test]
+fn completion_request_deserializes_timeout_override() {
+    let req: CompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test-model",
+        "prompt": "hello",
+        "timeout": 1200.0,
+    }))
+    .expect("valid completion request with timeout");
+
+    assert_eq!(req.timeout, Some(1200.0));
+}
+
+#[test]
 fn completion_request_echo_logprobs_n_deser() {
     let req: CompletionRequest = serde_json::from_value(serde_json::json!({
         "model": "test",

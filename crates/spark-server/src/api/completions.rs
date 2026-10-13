@@ -116,12 +116,12 @@ pub async fn completions(
     }
     for prompt_tokens in &prompts {
         let prompt_len = prompt_tokens.len();
-        if prompt_len >= state.max_seq_len {
+        if prompt_len.saturating_add(req.max_tokens) > state.max_seq_len {
             return openai_error_response(
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "Prompt too long: {prompt_len} tokens exceeds max_seq_len {}",
-                    state.max_seq_len
+                    "Prompt plus max_tokens exceeds max_seq_len {} (prompt={}, max_tokens={})",
+                    state.max_seq_len, prompt_len, req.max_tokens
                 ),
             );
         }
@@ -344,9 +344,7 @@ pub(super) async fn completions_stream(
         top_logprobs: logprobs_k,
         prompt_logprobs: if echo { logprobs_k } else { None },
         echo,
-        // Was hard-coded `None`: streaming /v1/completions was the one
-        // surface with NO deadline while every other surface had 300 s.
-        timeout_at: state.request_deadline(None),
+        timeout_at: state.request_deadline(req.timeout),
         token_tx,
         // /v1/completions has no guard pipeline yet — the flag is
         // created so the scheduler's emit_step type-checks cleanly,

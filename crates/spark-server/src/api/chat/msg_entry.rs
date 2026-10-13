@@ -145,7 +145,11 @@ fn resolve_media_uri(
                     ),
                 ));
             }
-            match super::remote_image::fetch_as_data_uri(url, remote) {
+            let remote_kind = match kind {
+                MediaKind::Image => super::remote_image::RemoteMediaKind::Image,
+                MediaKind::Video => super::remote_image::RemoteMediaKind::Video,
+            };
+            match super::remote_image::fetch_media_as_data_uri(url, remote, remote_kind) {
                 Ok(data_uri) => Ok(data_uri),
                 Err(why) => {
                     // The reason is surfaced rather than flattened to "could

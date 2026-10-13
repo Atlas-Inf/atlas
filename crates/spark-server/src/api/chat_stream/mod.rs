@@ -313,3 +313,6 @@ pub(crate) async fn run_chat_stream(
 
     Ok(Box::pin(token_stream))
 }
+
+#[cfg(test)]
+mod blocking_vision_choices_tests;
