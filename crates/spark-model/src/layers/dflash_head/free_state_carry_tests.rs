@@ -232,3 +232,51 @@ fn ctx_carry_lifts_and_rekeys_propose_graphs() {
     assert_eq!(fresh.lane_id, 2);
     assert_eq!(gpu.destroy_graph_count(), 0);
 }
+
+#[test]
+fn own_row_accumulator_free_failure_retains_both_handles_for_retry() {
+    let _pool_guard = lock_and_drain_pool();
+    let gpu = MockGpuBackend::new();
+    let mut head = zero_head();
+    head.startup.diagnostics.first_append = super::FirstAppend::Own;
+    let own = owner(3, 77);
+    let mut state = live_state(&gpu, own);
+    let acc = state.ctx_hidden_acc;
+    let row = acc.offset(16);
+    state.own_row = Some(row);
+    gpu.fail_next_free();
+    head.free_state(&gpu, Some(own), state.as_mut()).unwrap();
+    assert_eq!(state.ctx_hidden_acc, acc);
+    assert_eq!(state.own_row, Some(row));
+    head.free_state(&gpu, Some(own), state.as_mut()).unwrap();
+    assert_eq!(state.ctx_hidden_acc, spark_runtime::gpu::DevicePtr(0));
+    assert_eq!(state.own_row, None);
+}
+
+#[test]
+fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
+    let _pool_guard = lock_and_drain_pool();
+    let gpu = MockGpuBackend::new();
+    let head = zero_head();
+    let own = owner(3, 77);
+
+    let mut boxed = live_state(&gpu, own);
+    hold_two_blocks(boxed.as_mut(), &head.kv_cache);
+
+    // The accumulator goes to the reuse pool (no backend free); the
+    // injected failure lands on the block-table-dev free — its handle must
+    // be RESTORED so a retry can release it.
+    gpu.fail_next_free();
+    head.free_state(&gpu, Some(own), boxed.as_mut())
+        .expect("free_state succeeds despite the backend free failure");
+
+    assert_eq!(boxed.ctx_hidden_acc.0, 0);
+    assert!(
+        boxed.block_table_dev.is_some(),
+        "handle restored, retryable"
+    );
+    // …and the retry DOES release it (flag is one-shot).
+    head.free_state(&gpu, Some(own), boxed.as_mut())
+        .expect("second free retries the block table free");
+    assert!(boxed.block_table_dev.is_none());
+}

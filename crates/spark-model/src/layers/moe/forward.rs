@@ -75,6 +75,13 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.btile_input_guard(input, 1, ctx, stream)?;
+        // Expert TP slices the routed width, which the fused routed+shared
+        // decode kernels assume equals the shared expert's; take the grouped path.
+        if self.routed_scales_released || ctx.config.expert_tp {
+            self.forward_prefill(input, 1, ctx, stream)?;
+            return Ok(ctx.buffers.moe_output());
+        }
         // SOLID Incr-4: a genuine single-token decode (num_seqs == 1) folds the
         // routed expert down_proj LoRA delta below (before the wsum blend). The
         // multi-seq per-token reuse of this fn (num_seqs > 1 — decode_batch's
@@ -490,7 +497,26 @@ impl MoeLayer {
                     stream,
                 )
             })?;
-        } else if self.use_t_layout_for_decode() {
+        } else if self.nvfp4_mmq_layout {
+            prof!("exp_mmq", {
+                self.dispatch_nvfp4_mmq_decode(
+                    ctx,
+                    expert_input,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_down_out,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    shared_out,
+                    indices_dev,
+                    h,
+                    inter,
+                    top_k,
+                    single_seq_decode,
+                    stream,
+                )
+            })?;
+        } else if self.btile_storage.is_published() || self.use_t_layout_for_decode() {
             prof!("exp_unified_t", {
                 self.dispatch_unified_t_decode(
                     ctx,

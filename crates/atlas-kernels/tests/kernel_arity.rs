@@ -124,8 +124,9 @@ fn w4a16_launch_family_arity_pins() {
 
 /// The DFlash2 on-device candidate selector is a standalone common kernel,
 /// not a member of the w4a16 launch family above, so it gets its own pin:
-/// the launcher in `layers/ops/sampling.rs` passes ten args (the tenth is
-/// `top_k`). Update launcher and pin in the same commit. The source-level
+/// the launcher in `layers/ops/sampling.rs` passes sixteen args (device
+/// anchor and ban-depth pointers, `top_k` eleventh, four end ids, scratch). Update
+/// launcher and pin in the same commit. The source-level
 /// signature pin in spark-model's `dflash2_selector_bounds.rs` covers stub
 /// builds where no PTX exists.
 #[test]
@@ -144,15 +145,21 @@ fn dflash2_candidate_selector_arity_pin() {
             let Ok(ptx) = std::str::from_utf8(blob) else {
                 continue;
             };
-            if let Some(count) = ptx_param_count(ptx, "dflash2_candidate_selector") {
-                assert_eq!(
-                    count, 10,
-                    "PTX arity drift: {module}::dflash2_candidate_selector on target \
-                     {} has {count} params, pin expects 10 — update the launcher AND \
-                     this pin together",
-                    set.target.model
-                );
-                checked += 1;
+            for (kernel, want) in [
+                ("dflash2_candidate_selector", 16),
+                ("dflash2_candidate_selector_conf", 16),
+                ("dflash2_candidate_selector_batched", 10),
+            ] {
+                if let Some(count) = ptx_param_count(ptx, kernel) {
+                    assert_eq!(
+                        count, want,
+                        "PTX arity drift: {module}::{kernel} on target \
+                         {} has {count} params, pin expects {want} — update the launcher AND \
+                         this pin together",
+                        set.target.model
+                    );
+                    checked += 1;
+                }
             }
         }
     }

@@ -11,7 +11,7 @@
 //!   seq_slot   i32  [4R,      8R)   (per-request LoRA routing)
 //!   slots      i64  [8R,     16R)
 //!   seq_lens   i32  [16R,    20R)
-//!   (gap            [20R,    24R))  — legacy [640,768) pad, scaled
+//!   ssm_slots  i32  [20R,    24R)   (reserved live SSM pool IDs; -1 padding)
 //!   block_tbl  i32  [24R,    24R + R·max_blocks·4)
 //!
 //! At `R = 32` this reproduces the legacy layout BYTE-FOR-BYTE
@@ -79,6 +79,12 @@ impl DecodeMetaLayout {
         16 * self.rows
     }
 
+    /// Live SSM pool-slot i32 stream, independent of KV and LoRA slots.
+    /// Reuses the legacy gap without changing any existing offsets or sizes.
+    pub fn ssm_slots_off(&self) -> usize {
+        20 * self.rows
+    }
+
     /// Flattened block-table offset (row stride `max_blocks · 4` bytes).
     pub fn block_table_off(&self) -> usize {
         24 * self.rows
@@ -93,6 +99,19 @@ impl DecodeMetaLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssm_slots_reuse_only_the_existing_gap() {
+        for rows in [32, 64, 128] {
+            let layout = DecodeMetaLayout::for_max_batch_size(rows);
+            assert_eq!(layout.ssm_slots_off(), 20 * rows);
+            assert_eq!(layout.seq_lens_off() + rows * 4, layout.ssm_slots_off());
+            assert_eq!(layout.ssm_slots_off() + rows * 4, layout.block_table_off());
+            assert_eq!(layout.meta_bytes(257), 24 * rows + rows * 257 * 4);
+            assert_eq!(layout.seq_slot_off(), 4 * rows);
+            assert_eq!(layout.slots_off(), 8 * rows);
+        }
+    }
 
     /// bs <= 32 must reproduce the legacy hardcoded layout byte-for-byte.
     #[test]

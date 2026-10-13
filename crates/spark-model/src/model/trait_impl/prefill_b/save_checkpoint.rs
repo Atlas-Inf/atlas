@@ -63,7 +63,9 @@ impl TransformerModel {
         // and is deliberately NOT made here; it needs its own measured A/B.
         let on_interval = self.ssm_checkpoint_interval > 0
             && end_block.is_multiple_of(self.ssm_checkpoint_interval);
-        if end_block == 0 || !(is_prompt_tail || on_interval) {
+        // ATLAS_GLM_PC_BRANCH: the planned branch checkpoint (`pc_policy`).
+        let is_branch = seq.pc_branch_at == Some(end_token);
+        if end_block == 0 || !(is_prompt_tail || on_interval || is_branch) {
             return Ok(());
         }
         // Stale-V cap (mirrors finalize_last): never checkpoint-cache a block
@@ -88,6 +90,9 @@ impl TransformerModel {
             );
         }
 
+        // ATLAS_GLM_PC_FINISH_LEAF: the slot may have been a finish leaf a
+        // moment ago, with its copy still in flight on another stream.
+        self.finish_leaf_wait_copies(stream)?;
         let snap_result = match self.ssm_snapshots.save(
             seq.slot_idx,
             seq.session_hash,
@@ -134,6 +139,7 @@ impl TransformerModel {
         let Some(snap_id) = snap_result else {
             return Ok(());
         };
+        self.finish_leaf_record_copy(stream)?;
         // Aux (PLE n-gram history/conv + QSA indexer keys) rides the
         // checkpoint. This boundary is a completed pass end, so the lexical
         // state is position-correct at `end_token` by construction. Without
@@ -199,6 +205,10 @@ impl TransformerModel {
             seq.adapter_id,
         ) {
             self.ssm_snapshots.free(old);
+        }
+        if is_branch {
+            self.prefix_cache
+                .mark_branch_snapshot(boundary_tokens, seq.adapter_id);
         }
         tracing::info!(
             "Intermediate SSM checkpoint saved at token {} (snapshot_id {}, block {})",

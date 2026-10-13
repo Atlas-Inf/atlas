@@ -27,18 +27,22 @@ mod decode_b;
 mod decode_b2;
 mod decode_checkpoint;
 mod decode_graph_key;
-mod drafter_prefill;
+pub(super) mod drafter_prefill;
+mod entry;
 mod ep_misc;
+pub(crate) mod finish_leaf;
 mod graph_borrow;
+mod kda_commit;
 mod lm_head_batched;
 mod lm_head_dp4a;
 mod meta;
 mod meta_argmax;
 mod prefill_a;
-mod prefill_b;
+pub(in crate::model) mod prefill_b;
 mod prefill_c;
 mod prefill_d;
 mod sequence;
+mod sequence_compact;
 mod speculative;
 pub(in crate::model) mod ssm_fault_in;
 mod verify_a;
@@ -53,6 +57,10 @@ mod verify_fused;
 mod verify_layer_trace;
 
 impl Model for TransformerModel {
+    fn verify_logits_argmax_only(&self) -> bool {
+        self.glm_verify_logits_argmax_only()
+    }
+
     fn lightning_dspark_product_policy(
         &self,
     ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
@@ -83,10 +91,32 @@ impl Model for TransformerModel {
     ) -> Result<Vec<(usize, usize, usize, usize)>> {
         self.prepare_vision_embed_batched_dispatch(per_request)
     }
-    fn set_vision_slice_base(&self, row_base: usize, grid_base: usize, owned_images: usize) {
-        *self.vision_row_base.lock() = row_base;
-        *self.vision_grid_base.lock() = grid_base;
-        *self.vision_owned_images.lock() = owned_images;
+    fn set_vision_slice_base(
+        &self,
+        row_base: usize,
+        grid_base: usize,
+        owned_images: usize,
+        slice_rows: usize,
+    ) {
+        self.set_vision_slice_base_entry(row_base, grid_base, owned_images, slice_rows);
+    }
+    fn ep_broadcast_vision_state_for_seq(
+        &self,
+        seq_id: u32,
+        enabled: bool,
+        row_base: usize,
+        grid_base: usize,
+        owned_images: usize,
+        slice_rows: usize,
+    ) -> Result<()> {
+        self.ep_broadcast_vision_state_for_seq_dispatch(
+            seq_id,
+            enabled,
+            row_base,
+            grid_base,
+            owned_images,
+            slice_rows,
+        )
     }
     // The four prefill entry points each end with `try_eager_drafter_prefill`:
     // the whole-prompt drafter capture is a single shared slot, so it must be
@@ -97,11 +127,8 @@ impl Model for TransformerModel {
     fn tokens_contain_vision_pad(&self, tokens: &[u32]) -> bool {
         self.tokens_have_vision_pad(tokens)
     }
-    fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
-        self.stamp_overlay_route(seq.adapter_slot);
-        let logits = self.prefill_dispatch(tokens, seq, stream)?;
-        self.try_eager_drafter_prefill(seq, true, stream);
-        Ok(logits)
+    fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
+        self.prefill_entry(tokens, seq)
     }
     fn prefill_chunk(
         &self,
@@ -112,17 +139,7 @@ impl Model for TransformerModel {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr> {
-        self.stamp_overlay_route(seq.adapter_slot);
-        let logits = self.prefill_chunk_dispatch(
-            tokens,
-            seq,
-            chunk_start,
-            chunk_len,
-            is_last_chunk,
-            stream,
-        )?;
-        self.try_eager_drafter_prefill(seq, is_last_chunk, stream);
-        Ok(logits)
+        self.prefill_chunk_entry(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream)
     }
     fn prefill_twophase(
         &self,
@@ -131,15 +148,22 @@ impl Model for TransformerModel {
         chunk_size: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
-        self.stamp_overlay_route(seq.adapter_slot);
-        let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
-        self.try_eager_drafter_prefill(seq, true, stream);
-        Ok(logits)
+        self.prefill_twophase_entry(tokens, seq, chunk_size, stream)
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         self.stamp_overlay_route(seq.adapter_slot);
         self.stamp_decode_moe_single(seq.adapter_slot);
-        self.decode_dispatch(token, seq, _stream)
+        let logits = self.decode_dispatch(token, seq, _stream)?;
+        // The decode left this token's hidden stack in the shared DFlash
+        // capture row; a sequence with a row of its own keeps it there.
+        crate::layers::dflash_head::keep_own_capture(
+            seq.proposer_state.as_deref_mut(),
+            self.dflash_hidden_save,
+            seq.seq_len,
+            self.gpu.as_ref(),
+        )?;
+        self.finish_leaf_after_decode(seq);
+        Ok(logits)
     }
     fn decode_batch(
         &self,
@@ -158,6 +182,8 @@ impl Model for TransformerModel {
             // refused concurrent request would otherwise brick the server). The
             // batched path captures on the default stream (decode_a2).
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
+        } else {
+            seqs.iter().for_each(|s| self.finish_leaf_after_decode(s));
         }
         r
     }
@@ -194,7 +220,7 @@ impl Model for TransformerModel {
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
         }
         let out = r?;
-        self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream);
+        self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream)?;
         Ok(out)
     }
 
@@ -486,6 +512,53 @@ impl Model for TransformerModel {
         self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
     }
+    fn can_batch_glm_long_verify_rows(&self, owners: usize, rows: usize) -> bool {
+        self.can_batch_glm_long_verify_impl(owners, rows)
+    }
+    fn decode_verify_glm_long_owner_rows(
+        &self,
+        rows: usize,
+        tokens: &[u32],
+        seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<u32>> {
+        self.decode_verify_glm_long_owners_impl(rows, tokens, seqs)
+    }
+    fn has_shared_prompt_capture(&self) -> bool {
+        self.has_shared_prompt_capture_impl()
+    }
+    fn can_fuse_glm_prefill_verify(
+        &self,
+        prompt: &[u32],
+        seq: &SequenceState,
+        chunk_len: usize,
+        owners: usize,
+        rows: usize,
+    ) -> bool {
+        self.glm_fused_chunk_supported(prompt, seq, chunk_len, owners, rows)
+    }
+    fn prefill_chunk_with_glm_owner_rows(
+        &self,
+        prompt: &[u32],
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        rows: usize,
+        tokens: &[u32],
+        owners: &mut [&mut SequenceState],
+    ) -> Result<(DevicePtr, Vec<u32>)> {
+        self.prefill_chunk_with_glm_owners_impl(
+            prompt,
+            seq,
+            chunk_start,
+            chunk_len,
+            rows,
+            tokens,
+            owners,
+        )
+    }
+    fn begin_glm_long_owner_tail(&self, slot: u32, owner: usize, tokens: &[u32]) -> Result<()> {
+        self.begin_glm_long_owner_tail_impl(slot, owner, tokens)
+    }
     fn can_batch_verify(&self, ks: &[usize]) -> bool {
         self.can_batch_verify_dispatch(ks)
     }
@@ -553,9 +626,12 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        // Taken first, so staged row masks never outlive the verify they
+        // were staged for (`glm_verify_masks`).
+        let allow = self.take_verify_row_masks(tokens.len())?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len());
-        self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream)
+        self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)
     }
     fn decode_and_verify_fused(
         &self,
@@ -873,6 +949,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Option<u32>> {
+        self.ensure_mtp_propose_allowed(seq)?;
         self.run_mtp_propose_dispatch(token, position, seq, _stream)
     }
     fn run_mtp_propose_multi(
@@ -884,6 +961,7 @@ impl Model for TransformerModel {
         _stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
+        self.ensure_mtp_propose_allowed(seq)?;
         self.run_mtp_propose_multi_dispatch(
             token,
             position,
@@ -924,6 +1002,10 @@ impl Model for TransformerModel {
         reader: &mut dyn std::io::Read,
     ) -> Result<()> {
         self.restore_sequence_state_dispatch(seq, num_blocks, reader)
+    }
+    fn swap_resumable(&self) -> bool {
+        // The spill image holds no GLM semantic-index pools or tails.
+        self.kv_cache.lock().sparse_index_config().is_none()
     }
     fn num_free_blocks(&self) -> usize {
         self.num_free_blocks_dispatch()
@@ -968,6 +1050,9 @@ impl Model for TransformerModel {
     fn is_mla(&self) -> bool {
         self.is_mla_dispatch()
     }
+    fn supports_chunked_mla(&self) -> bool {
+        self.supports_chunked_mla_impl()
+    }
 
     fn kv_block_size(&self) -> Option<usize> {
         Some(self.kv_cache.lock().block_size())
@@ -991,6 +1076,12 @@ impl Model for TransformerModel {
     }
     fn ep_broadcast_tokens(&self, tokens: &[u32]) -> Result<Vec<u32>> {
         self.ep_broadcast_tokens_dispatch(tokens)
+    }
+    fn prepare_verify_row_masks(&self, rows: usize, masks: &[u32]) -> Result<()> {
+        self.upload_row_masks(rows, masks)
+    }
+    fn send_verify_row_masks(&self, rows: usize) -> Result<()> {
+        self.send_row_masks(rows)
     }
     fn default_stream(&self) -> u64 {
         self.default_stream_dispatch()

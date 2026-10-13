@@ -9,6 +9,18 @@ use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
 
+/// Whether the K-major prefill transpose applies to `config`'s routed experts.
+///
+/// GLM-5.3 (`glm5_next`) is the exception: its routed prefill runs the prequant
+/// NVFP4 grouped GEMMs on the N-major originals, and its checkpoint-backed
+/// gate/up B-tile binding, expert-TP slicing and shared FP8 cache provenance
+/// are all defined over those originals. The unified tier frees them, which
+/// breaks the FP8 cache provenance check at load; every tier populates
+/// `gate_ptrs_t`, which disables the B-tile binding.
+fn runs_prefill_transpose(config: &ModelConfig) -> bool {
+    config.num_experts > 0 && config.model_type != "glm5_next"
+}
+
 /// Pre-flight memory audit + MoE-transpose pass for MiniMax-M2 unified /
 /// hybrid layout modes.
 pub(super) fn maybe_run_minimax_m2_moe_transpose(
@@ -30,7 +42,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     // -- qwen4_exp among them -- leaving prefill on the uncoalesced N-major
     // grouped GEMM with no log line to say so. Capability, not identity: if
     // the model has routed experts, it wants K-major prefill weights.
-    if config.num_experts == 0 {
+    if !runs_prefill_transpose(config) {
         return Ok(());
     }
     // Escape hatch only, matching `moe_prefill_copies_fit`'s
@@ -244,3 +256,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "m2_setup_tests.rs"]
+mod tests;

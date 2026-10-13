@@ -56,7 +56,7 @@ impl Qwen3AttentionLayer {
             eps,
             bs,
             stream,
-            pos: _,
+            pos,
         } = *args;
         let mla = self
             .mla
@@ -198,7 +198,9 @@ impl Qwen3AttentionLayer {
         // Q_rope scatter
         let q_rope_direct = ctx.buffers.ssm_conv_out_f32();
         prof!("q_rope_scatter", {
-            if self.mla_q_rope_scatter_k.0 != 0 {
+            if mla_rope == 0 {
+                Ok(())
+            } else if self.mla_q_rope_scatter_k.0 != 0 {
                 ops::mla_q_rope_scatter(
                     ctx.gpu,
                     self.mla_q_rope_scatter_k,
@@ -276,52 +278,54 @@ impl Qwen3AttentionLayer {
         // Step 4: K_rope + RoPE + writeback
         let k_rope_single = ctx.buffers.ssm_ba();
         prof!("k_rope+RoPE+wb", {
-            ops::dense_gemv(
-                ctx.gpu,
-                self.dense_gemv_k,
-                normed,
-                &mla.wkv_a_rope,
-                k_rope_single,
-                mla_rope,
-                h,
-                stream,
-            )?;
-            ops::rope_yarn(
-                ctx.gpu,
-                self.rope_yarn_k,
-                q_rope_direct,
-                k_rope_single,
-                meta.positions,
-                1,
-                nq,
-                1,
-                mla_rope,
-                mla_rope,
-                mla.yarn_inv_freq,
-                ctx.config.rope_theta as f32,
-                stream,
-            )?;
-            if self.mla_q_rope_writeback_k.0 != 0 {
-                ops::mla_q_rope_writeback(
+            if mla_rope > 0 {
+                ops::dense_gemv(
                     ctx.gpu,
-                    self.mla_q_rope_writeback_k,
-                    q_rope_direct,
-                    q_absorbed_buf,
-                    nq,
+                    self.dense_gemv_k,
+                    normed,
+                    &mla.wkv_a_rope,
+                    k_rope_single,
                     mla_rope,
-                    kv_lora,
-                    mla_cache_dim,
+                    h,
                     stream,
-                )
-            } else {
-                for head_idx in 0..nq as usize {
-                    let src = q_rope_direct.offset(head_idx * mla.rope * 2);
-                    let dst = q_absorbed_buf
-                        .offset((head_idx * mla_cache_dim as usize + mla.kv_lora_rank) * 2);
-                    ctx.gpu.copy_d2d_async(src, dst, mla.rope * 2, stream)?;
+                )?;
+                ops::rope_yarn(
+                    ctx.gpu,
+                    self.rope_yarn_k,
+                    q_rope_direct,
+                    k_rope_single,
+                    meta.positions,
+                    1,
+                    nq,
+                    1,
+                    mla_rope,
+                    mla_rope,
+                    mla.yarn_inv_freq,
+                    ctx.config.rope_theta as f32,
+                    stream,
+                )?;
+                if self.mla_q_rope_writeback_k.0 != 0 {
+                    ops::mla_q_rope_writeback(
+                        ctx.gpu,
+                        self.mla_q_rope_writeback_k,
+                        q_rope_direct,
+                        q_absorbed_buf,
+                        nq,
+                        mla_rope,
+                        kv_lora,
+                        mla_cache_dim,
+                        stream,
+                    )?;
+                } else {
+                    for head_idx in 0..nq as usize {
+                        let src = q_rope_direct.offset(head_idx * mla.rope * 2);
+                        let dst = q_absorbed_buf
+                            .offset((head_idx * mla_cache_dim as usize + mla.kv_lora_rank) * 2);
+                        ctx.gpu.copy_d2d_async(src, dst, mla.rope * 2, stream)?;
+                    }
                 }
-                Ok(())
             }
+            Ok::<(), anyhow::Error>(())
         })?;
 
         // Step 6: Cache assemble + write
@@ -379,25 +383,21 @@ impl Qwen3AttentionLayer {
         // Step 8: Paged decode attention
         let attn_out = ctx.buffers.attn_output();
         let inv_sqrt_d = self.effective_attn_scale(hd);
+        let (sparse_indices, fp8) = self
+            .mla_decode_sparse_indices(mla, meta, normed, q_latent, pos, kv_cache, ctx, stream)?;
         prof!("paged_attn", {
-            ops::paged_decode_attn_bf16(
-                ctx.gpu,
-                self.paged_decode_mla_k,
+            self.mla_decode_paged_attn(
+                ctx,
+                kv_cache,
+                meta,
+                sparse_indices,
+                fp8,
                 q_absorbed_buf,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
                 attn_out,
-                meta.block_table,
-                meta.seq_len,
-                meta.max_blocks_per_seq,
-                1,
                 nq,
-                1,
                 mla_cache_dim,
-                bs as u32,
+                bs,
                 inv_sqrt_d,
-                nq * mla_cache_dim,
-                0,
                 stream,
             )
         })?;

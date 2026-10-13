@@ -68,7 +68,6 @@ pub fn prefill_request(
     let req_top_logprobs = req.top_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let mut grammar_state = compile_grammar_state(grammar_engine, &grammar_spec, eos_tokens);
     let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
@@ -103,6 +102,17 @@ pub fn prefill_request(
         ),
     };
 
+    // After the sink exists: a strict grammar that cannot be armed is reported
+    // to the client. Strict grammars start after `</think>` (see
+    // `GrammarState::masks_first_token`).
+    let mut grammar_state = compile_grammar_state(
+        grammar_engine,
+        &grammar_spec,
+        eos_tokens,
+        req_enable_thinking && think_end_token.is_some(),
+        &mut sink,
+    )?;
+
     let request_start = Instant::now();
     tracing::info!(
         "Prefilling: {} prompt tokens, max_tokens={max_tokens}",
@@ -120,6 +130,9 @@ pub fn prefill_request(
             return Err(e);
         }
     };
+    // Carry the request-local native-decode fence into model-owned state so
+    // prefill hooks cannot touch shared MTP capture/eager-drafter state.
+    seq.disable_mtp = req_disable_mtp;
     seq.session_hash = req_session_hash;
     seq.adapter_slot = req_adapter_slot;
     seq.src_lang_id = req_src_lang;
@@ -158,7 +171,7 @@ pub fn prefill_request(
         let last = hyp.last().copied().unwrap_or(0);
         let use_legacy_tool_call =
             req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
-        let tool_request = grammar_state.is_some() || use_legacy_tool_call;
+        let tool_request = tool_request_for(grammar_state.as_ref(), use_legacy_tool_call);
         let now = Instant::now();
         let cached_prompt_tok = seq.cached_prefix_tokens as u32;
         let mut a = ActiveSeq {
@@ -255,6 +268,15 @@ pub fn prefill_request(
         }
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
+        model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
+        model.ep_broadcast_vision_state_for_seq(
+            seq.slot_idx as u32,
+            !image_pixels.is_empty(),
+            0,
+            0,
+            0,
+            0,
+        )?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start = 0 (non-chunked)
@@ -306,6 +328,15 @@ pub fn prefill_request(
     // Spontaneous <think>: if the first token is <think> and thinking was not
     // requested, suppress it and enter thinking mode on the ActiveSeq.
     let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
+    let thinking = first_token_thinking::FirstTokenThinking::resolve_with_tool_boundary(
+        req_enable_thinking,
+        first,
+        think_start_token,
+        think_end_token,
+        sched.limits.glm_tool_boundary.filter(|_| req_tools_present),
+    );
+    let native_tool_open =
+        max_tokens > 0 && req_tools_present && sched.limits.glm_tool_boundary == Some(first);
     // Legacy echo+logprobs: prompt logprobs precede any token event.
     if seq.collect_prompt_logprobs.is_some()
         && let ResponseSink::Streaming(ref tx) = sink
@@ -350,7 +381,7 @@ pub fn prefill_request(
         req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
     // F4: sticky tool-request flag — grammar attached OR legacy tool path.
     // Computed before `grammar_state` is moved into the ActiveSeq below.
-    let tool_request = grammar_state.is_some() || use_legacy_tool_call;
+    let tool_request = tool_request_for(grammar_state.as_ref(), use_legacy_tool_call);
 
     let now = Instant::now();
     let cached_prompt_tok = seq.cached_prefix_tokens as u32;
@@ -387,7 +418,7 @@ pub fn prefill_request(
             logit_bias: logit_bias.clone(),
             pending_drafts: Vec::new(),
             pending_draft_conf: Vec::new(),
-            inside_thinking: req_enable_thinking && think_end_token.is_some(),
+            inside_thinking: thinking.inside_thinking,
             enable_thinking: req_enable_thinking,
             thinking_budget: req_thinking_budget,
             repetition_detection: req_repetition_detection,
@@ -402,12 +433,12 @@ pub fn prefill_request(
             in_code_fence: false,
             think_end_token,
             think_start_token,
-            think_ended: !req_enable_thinking && think_end_token.is_some(),
-            think_just_ended: false,
+            think_ended: thinking.think_ended,
+            think_just_ended: thinking.think_just_ended,
             post_think_emitted: 0,
             spec_adapt: Default::default(),
             think_skip_count: 0,
-            require_tool_call: use_legacy_tool_call,
+            require_tool_call: use_legacy_tool_call && !native_tool_open,
             tool_request,
             tools_present: req_tools_present,
             suppress_tool_call: req_suppress_tool_call,
@@ -420,8 +451,8 @@ pub fn prefill_request(
             rollback_count: 0,
             ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
             tool_call_start_token,
-            tool_call_opened: false,
-            inside_tool_body: false,
+            tool_call_opened: native_tool_open,
+            inside_tool_body: native_tool_open,
             tool_call_completed: false,
             post_completion_tool_opens: 0,
             tool_body_streak_tokens: 0,
@@ -442,6 +473,8 @@ pub fn prefill_request(
         return Ok(None);
     }
 
+    // The min_tokens end-token ban, as on the chunked paths.
+    spark_model::traits::EosBan::new(seq.prompt_len, req_min_tokens, eos_tokens).arm(&mut seq);
     Ok(Some(ActiveSeq {
         seq,
         session_hash: req_session_hash,
@@ -473,7 +506,7 @@ pub fn prefill_request(
         logit_bias,
         pending_drafts: Vec::new(),
         pending_draft_conf: Vec::new(),
-        inside_thinking: spontaneous_think || (req_enable_thinking && think_end_token.is_some()),
+        inside_thinking: thinking.inside_thinking,
         enable_thinking: req_enable_thinking,
         thinking_budget: if spontaneous_think {
             Some(spontaneous_think_budget)
@@ -492,16 +525,12 @@ pub fn prefill_request(
         in_code_fence: false,
         think_end_token,
         think_start_token,
-        think_ended: if spontaneous_think {
-            false
-        } else {
-            !req_enable_thinking && think_end_token.is_some()
-        },
-        think_just_ended: false,
+        think_ended: thinking.think_ended,
+        think_just_ended: thinking.think_just_ended,
         post_think_emitted: 0,
         spec_adapt: Default::default(),
         think_skip_count: 0,
-        require_tool_call: use_legacy_tool_call,
+        require_tool_call: use_legacy_tool_call && !native_tool_open,
         tool_request,
         tools_present: req_tools_present,
         suppress_tool_call: req_suppress_tool_call,
@@ -514,8 +543,8 @@ pub fn prefill_request(
         rollback_count: 0,
         ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
         tool_call_start_token,
-        tool_call_opened: false,
-        inside_tool_body: false,
+        tool_call_opened: native_tool_open,
+        inside_tool_body: native_tool_open,
         tool_call_completed: false,
         post_completion_tool_opens: 0,
         tool_body_streak_tokens: 0,

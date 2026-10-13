@@ -336,17 +336,6 @@ impl CompletionChunk {
 
 // ── Tokenize endpoint types ──
 
-/// Request body for POST /tokenize.
-#[derive(Debug, Deserialize)]
-pub struct TokenizeRequest {
-    #[allow(dead_code)]
-    pub model: Option<String>,
-    /// Raw text to tokenize (mutually exclusive with `messages`).
-    pub prompt: Option<String>,
-    /// Chat messages to tokenize via the chat template (mutually exclusive with `prompt`).
-    pub messages: Option<Vec<IncomingMessage>>,
-}
-
 /// Response body for POST /tokenize.
 #[derive(Debug, Serialize)]
 pub struct TokenizeResponse {

@@ -295,8 +295,33 @@ impl Qwen3SsmLayer {
         // The batched MoE arms all leave `[num_tokens, h]` in `moe_output`,
         // which is what `hc_post` needs. The non-hc path's per-token fallback
         // does NOT: `ffn.forward` reuses row 0 every call, so it would need
-        // per-row staging. Rather than stage it subtly wrong, refuse — K=2 (the
-        // num_drafts=1 verify) and K=3 are the widths this model actually runs.
+        // per-row staging.
+        //
+        // K=4..8 used to bail for MoE here, because `try_forward_km` is
+        // dense-only. That capped the verify width at K=3 and therefore capped
+        // speculative yield at 3 tokens/step for this model.
+        //
+        // Why that cap is worth removing: the A/B in `verify_max_drafts` that
+        // condemned wide K was taken at **256-token completions**, where `fwd`
+        // grows ~40 % from K=2 to K=3 (+29.78 ms of a 786.9 us/layer verify) and
+        // that growth is what made K=3 lose — its own profiler table shows the
+        // *attention/SSM* half scaling only 1.126x, BELOW the 1.354 token ratio,
+        // so "on the SSM half alone K=3 would win". At long context the forward
+        // is weight-read bound and flat in row count instead: measured `fwd`
+        // ~= 106 ms at both 3 rows (C1) and 12 rows (C4), and the whole step
+        // ~= 119 ms. The row-count penalty that decided the 256-token A/B is
+        // largely absent here, which is exactly the regime change that makes
+        // deeper speculation worth re-measuring.
+        //
+        // `forward_batched` is the generic multi-token MoE dispatcher, and it is
+        // already what `forward_k2`/`forward_k3` themselves fall back to (LoRA
+        // adapters, BF16-dequant experts, E8M0 scale kinds). It stages every row
+        // into `moe_output` and is the same entry ordinary batched decode uses.
+        // Routing the remaining widths through it beats refusing: the caller
+        // answers a verify error by finishing the request, so refusing is not a
+        // safe default — it is a truncated answer. Set
+        // `ATLAS_HC_GENERIC_MOE_ARM=0` to restore the old refusal.
+        let generic_arm = std::env::var("ATLAS_HC_GENERIC_MOE_ARM").as_deref() != Ok("0");
         stage!("hc_pre_ffn");
 
         if num_tokens == 3 {
@@ -313,6 +338,8 @@ impl Qwen3SsmLayer {
             // try_forward_km already wrote moe_output for all rows.
         } else if self.ffn.is_dense() {
             self.ffn.forward_prefill(normed2, num_tokens, ctx, stream)?;
+        } else if generic_arm {
+            self.ffn.forward_batched(normed2, num_tokens, ctx, stream)?;
         } else {
             anyhow::bail!(
                 "qwen3_ssm mHC batched decode: no batched MoE arm for K={num_tokens}. \

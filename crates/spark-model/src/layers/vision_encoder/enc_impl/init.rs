@@ -3,9 +3,11 @@
 //! `VisionEncoder::new` constructor.
 
 use anyhow::Result;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
-use super::super::{MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder};
+use super::super::{
+    GlmVisionEncoder, GlmVisionWeights, MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder,
+};
 
 /// Encoder capacity, in patches, when nothing bounds the image.
 ///
@@ -40,7 +42,10 @@ pub const CEILING_MAX_PATCHES: usize = 16384;
 /// decision alongside the value so the caller can say out loud when a
 /// checkpoint asked for more than it got — silently ignoring the checkpoint is
 /// the failure mode this whole change exists to remove.
-pub fn derive_max_patches(max_pixels: Option<usize>, patch_size: usize) -> (usize, Option<usize>) {
+pub(crate) fn derive_max_patches(
+    max_pixels: Option<usize>,
+    patch_size: usize,
+) -> (usize, Option<usize>) {
     let Some(area) = max_pixels.filter(|&a| a > 0) else {
         return (FALLBACK_MAX_PATCHES, None);
     };
@@ -167,6 +172,7 @@ impl VisionEncoder {
             .collect();
 
         Ok(Self {
+            glm: None,
             patch_embed_w,
             patch_embed_b,
             pos_embed,
@@ -227,6 +233,75 @@ impl VisionEncoder {
             buf_o_stage,
             pos_embed_host_f32,
             rope_inv_freq,
+        })
+    }
+
+    /// Construct the distinct GLM-5.3 visual tower while retaining the
+    /// historical `VisionEncoder` wrapper used by model prefill/splicing.
+    pub(crate) fn new_glm(
+        weights: GlmVisionWeights,
+        config: &atlas_core::config::VisionConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        let glm = GlmVisionEncoder::new(weights, config, gpu)?;
+        let glm_buf_out = glm.buf_out;
+        let glm_p_max = glm.p_max;
+        Ok(Self {
+            glm: Some(Box::new(glm)),
+            patch_embed_w: DevicePtr::NULL,
+            patch_embed_b: DevicePtr::NULL,
+            pos_embed: DevicePtr::NULL,
+            blocks: Vec::new(),
+            deepstack: Vec::new(),
+            deepstack_indexes: Vec::new(),
+            merger: MergerLayer {
+                norm_w: DevicePtr::NULL,
+                norm_b: DevicePtr::NULL,
+                fc1_w: DevicePtr::NULL,
+                fc1_b: DevicePtr::NULL,
+                fc2_w: DevicePtr::NULL,
+                fc2_b: DevicePtr::NULL,
+            },
+            k_gemm: KernelHandle(0),
+            k_gemm_pipelined: KernelHandle(0),
+            k_add_bias: KernelHandle(0),
+            k_norm: KernelHandle(0),
+            k_add: KernelHandle(0),
+            k_gelu: KernelHandle(0),
+            k_attn: KernelHandle(0),
+            k_rope_deint: KernelHandle(0),
+            k_softmax: KernelHandle(0),
+            k_scatter_head: KernelHandle(0),
+            k_gemm_f32: KernelHandle(0),
+            k_merge: KernelHandle(0),
+            k_f32_bf16: KernelHandle(0),
+            k_copy: KernelHandle(0),
+            hidden_size: config.hidden_size,
+            num_heads: config.num_heads,
+            head_dim: config.hidden_size / config.num_heads,
+            spatial_merge_size: config.spatial_merge_size,
+            out_hidden_size: config.out_hidden_size,
+            intermediate_size: config.intermediate_size,
+            p_max: glm_p_max,
+            num_grid_per_side: 0,
+            buf_f32: DevicePtr::NULL,
+            buf_h1: DevicePtr::NULL,
+            buf_h2: DevicePtr::NULL,
+            buf_wide: DevicePtr::NULL,
+            buf_merge_in: DevicePtr::NULL,
+            buf_merge_fc1: DevicePtr::NULL,
+            buf_out: glm_buf_out,
+            buf_pos_resampled: DevicePtr::NULL,
+            buf_rope_cos: DevicePtr::NULL,
+            buf_rope_sin: DevicePtr::NULL,
+            buf_qr: DevicePtr::NULL,
+            buf_kr: DevicePtr::NULL,
+            buf_vt: DevicePtr::NULL,
+            buf_scores: DevicePtr::NULL,
+            buf_probs: DevicePtr::NULL,
+            buf_o_stage: DevicePtr::NULL,
+            pos_embed_host_f32: Vec::new(),
+            rope_inv_freq: Vec::new(),
         })
     }
 }

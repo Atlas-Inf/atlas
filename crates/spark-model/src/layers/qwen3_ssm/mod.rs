@@ -429,6 +429,7 @@ mod trait_decode_batched_conv_gdn_wyn;
 mod trait_decode_batched_hc;
 mod trait_decode_hc;
 mod trait_decode_multi_seq;
+pub(crate) use trait_decode_multi_seq::moe_legacy_pertoken_decode;
 mod trait_layer;
 mod trait_prefill;
 mod trait_prefill_block;

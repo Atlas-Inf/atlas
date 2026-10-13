@@ -25,7 +25,9 @@ mod unified;
 pub(crate) use arena_store::{ArenaSnapshotStore, PagingSnapshotStore, RdmaSnapshotStore};
 pub(crate) use capability::ensure_ssm_tier_capability;
 pub(crate) use fingerprint::ModelFingerprint;
-pub(crate) use selectors::{build_decode_tier_store, build_tier_store, ssm_tier_enabled};
+pub(crate) use selectors::{
+    SpillHome, build_decode_tier_store, build_tier_store, ssm_tier_enabled,
+};
 pub(crate) use store::{BlobStoreStats, MemBlobStore, SnapshotBlobStore};
 pub(crate) use transport::{
     FileSnapshotArena, MockSnapshotTransport, PagingTransport, SnapshotTransport,

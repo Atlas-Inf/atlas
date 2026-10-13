@@ -197,7 +197,10 @@ pub use ngram::step_ngram;
 /// `emit_token`, while the MTP propose call borrows the model immutably —
 /// cloning sidesteps the lifetime overlap.
 pub fn mtp_grammar_mask_for(a: &mut ActiveSeq) -> Option<Vec<i32>> {
-    if a.inside_thinking {
+    // A strict grammar speculating (`strict_spec`) drafts unmasked: a drafter
+    // mask would cost the propose its graph and its rank split, and the
+    // verify trims any draft the grammar refuses.
+    if a.inside_thinking || a.strict_grammar() {
         return None;
     }
     let gs = a.grammar_state.as_mut()?;
@@ -237,7 +240,9 @@ pub fn mtp_grammar_masks_for(
 /// for all six propose sites — semantics identical to the bootstrap clamp
 /// (`grammar_state.is_some()`). No-op when grammar is inactive: full K kept.
 pub fn effective_drafts_under_grammar(a: &ActiveSeq, num_drafts: usize) -> usize {
-    if a.grammar_state.is_some() {
+    // A strict grammar speculating (ATLAS_GLM_STRICT_SPEC, the only way it
+    // reaches a propose) keeps full width: its verify masks every row.
+    if a.grammar_state.is_some() && !a.strict_grammar() {
         1
     } else {
         num_drafts

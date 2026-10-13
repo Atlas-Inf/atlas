@@ -272,6 +272,19 @@ impl TransformerModel {
             }
         }
 
+        // KDA records: the verify left h_state untouched, so every accept
+        // (full included) folds its rows in; conv still rewinds by snapshot.
+        if self.ssm_pool.kda_record_row_bytes != 0 {
+            anyhow::ensure!(
+                num_accepted > 0,
+                "commit_accepted_prefix: num_accepted == 0 (k={k}) with KDA records"
+            );
+            let stream = self.secondary_stream;
+            self.commit_kda_records_with_leaf(seq, num_accepted, k, stream)?;
+            self.gpu.record_event(self.secondary_event, stream)?;
+            return Ok(());
+        }
+
         // Full accept: the verify kernel's final h_state/conv_state is
         // already the canonical committed state — nothing to do — UNLESS a
         // layer ran the deferred-commit verify (`gdn_commit_pending`), in

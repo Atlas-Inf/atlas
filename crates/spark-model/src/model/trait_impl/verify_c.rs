@@ -212,6 +212,7 @@ impl TransformerModel {
         }
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -220,7 +221,16 @@ impl TransformerModel {
             levers: &self.levers,
             stats: &self.stats,
             attn_metadata: Some(metadata),
-            profile: false,
+            // Honour `--profile`. This is the context the K=3 verify actually
+            // runs its layers in, so hardcoding `false` left the served verify
+            // — ~106 ms, about 90 % of every decode step — unattributable by
+            // any in-tree profiler: the highway verify profiler sits on a path
+            // this configuration does not take, and the per-layer profiler is
+            // this field. Graphs are already off here for a multi-rank world
+            // (`use_graphs` above requires `comm.is_none()` and our comm is
+            // Some), so enabling profiling does not have to disable capture
+            // and cannot perturb what it measures.
+            profile: self.config.profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,

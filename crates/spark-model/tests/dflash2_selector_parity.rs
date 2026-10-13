@@ -116,24 +116,44 @@ fn run_case(c: &Case) -> Result<()> {
     let d_pred = up_u16(&gpu, &pred)?;
     let d_succ = up_u16(&gpu, &succ)?;
     let d_out = gpu.alloc(c.gamma * 4)?;
+    // The anchor is read on device (graph-replay safe); no min_tokens ban.
+    let d_anchor = gpu.alloc(4)?;
+    gpu.copy_h2d(&last_token.to_le_bytes(), d_anchor)?;
+    let scratch_bytes = ops::dflash2_selector_scratch_bytes(c.gamma);
+    let d_scratch = gpu.alloc(scratch_bytes)?;
+    gpu.memset(d_scratch, 0, scratch_bytes)?;
 
-    ops::dflash2_candidate_selector(
-        &gpu,
-        kernel,
-        d_logits,
-        d_proj,
-        d_pred,
-        d_succ,
-        d_out,
-        last_token,
-        c.gamma as u32,
-        c.vocab as u32,
-        c.rank as u32,
-        c.top_k as u32,
-        stream,
-    )?;
-    gpu.synchronize(stream)?;
-    let kern_out = rd_u32(&gpu, d_out, c.gamma)?;
+    // Two launches over one scratch: the first must leave its ticket at zero
+    // (graph replay), so the second must pick the same chain.
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        gpu.memset(d_out, 0xff, c.gamma * 4)?;
+        ops::dflash2_candidate_selector(
+            &gpu,
+            kernel,
+            d_logits,
+            d_proj,
+            d_pred,
+            d_succ,
+            d_out,
+            d_anchor,
+            spark_runtime::gpu::DevicePtr::NULL,
+            [u32::MAX; 4],
+            c.gamma as u32,
+            c.vocab as u32,
+            c.rank as u32,
+            c.top_k as u32,
+            d_scratch,
+            stream,
+        )?;
+        gpu.synchronize(stream)?;
+        runs.push(rd_u32(&gpu, d_out, c.gamma)?);
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "second launch over the same scratch diverged"
+    );
+    let kern_out = runs.pop().unwrap();
 
     // ── f32 host reference ──────────────────────────────────────────────
     let logits_f32 = |row: usize, tok: usize| bf16_bits_to_f32(logits[row * c.vocab + tok]);

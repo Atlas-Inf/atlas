@@ -23,7 +23,11 @@ impl SsmSnapshotIndex {
             return None;
         }
         let tail_protect = self.tail_lease_active();
-        let idx = self.session_aware_victim(tail_protect, /*skip_tiered*/ true)?;
+        let idx = if super::snapshot_chain::glm_pc_evict_enabled() {
+            self.chain_victim(/*skip_tiered*/ true)?
+        } else {
+            self.session_aware_victim(tail_protect, /*skip_tiered*/ true)?
+        };
         self.evictions_since_lookup = self.evictions_since_lookup.saturating_add(1);
         let depth = self.entries[idx].token_count;
         if min_tokens > 0 && depth < min_tokens {

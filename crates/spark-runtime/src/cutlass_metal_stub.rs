@@ -11,6 +11,27 @@
 
 use anyhow::Result;
 
+/// Never produced on metal; present so callers that classify CUTLASS errors
+/// compile unchanged.
+#[derive(Debug)]
+pub struct RejectedBeforeLaunch;
+
+impl std::fmt::Display for RejectedBeforeLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CUTLASS rejected the operands before launching")
+    }
+}
+
+impl std::error::Error for RejectedBeforeLaunch {}
+
+pub fn rejected_before_launch(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RejectedBeforeLaunch>().is_some()
+}
+
+pub fn launch_failed(_error: &anyhow::Error) -> bool {
+    false
+}
+
 pub fn bf16_gemm_act_weight_t(
     _act: u64,
     _weight: u64,

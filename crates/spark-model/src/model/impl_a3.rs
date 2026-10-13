@@ -35,6 +35,19 @@ fn lmhead_batched_wide_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_NO_LMHEAD_BATCHED_WIDE").is_err())
 }
 
+/// Exact five-row BF16 vocabulary projection for GLM's K=5 verifier. The
+/// existing batched GEMV streams each BF16 weight row once and reuses it for
+/// all five hidden rows; the generic tiny-M GEMM is retained as an A/B fallback.
+fn glm_k5_bf16_lmhead_batchm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_GLM_K5_BF16_LMHEAD_BATCHM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 impl TransformerModel {
     /// Scale in-place embeddings by config.embed_scale. The residual stream
     /// is always BF16, so this dispatches `embed_scale::bf16_scale_inplace`.
@@ -290,16 +303,20 @@ impl TransformerModel {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
+            super::glm_k3_head::project(
                 self.gpu.as_ref(),
-                self.dense_gemm_kernel,
+                &self.config,
                 hidden,
                 &self.lm_head_weight,
                 logits,
                 num_tokens,
-                v,
-                h,
+                self.dense_gemv_batchm_kernel,
+                self.dense_gemm_kernel,
                 stream,
+                num_tokens == 5
+                    && self.config.model_type == "glm5_next"
+                    && self.dense_gemv_batchm_kernel.0 != 0
+                    && glm_k5_bf16_lmhead_batchm_enabled(),
             )?;
         }
         // Feature-2: overlay overridden logit columns AFTER the base projection,

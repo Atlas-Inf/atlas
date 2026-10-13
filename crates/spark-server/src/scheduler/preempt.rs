@@ -111,6 +111,15 @@ pub(super) fn decode_batch_with_preemption(
                 };
                 let Some(vi) = victim else {
                     tracing::error!("decode_batch error: {e:#}");
+                    // The EP worker treats the same step error as fatal and
+                    // exits; a head that carried on would block forever in
+                    // its next collective while reporting healthy. Exit too,
+                    // so clients see the connection drop and a supervisor
+                    // restarts the pair.
+                    if model.is_ep() {
+                        eprintln!("EP head step error (peer exits on it too); terminating: {e:#}");
+                        crate::ep_peer_lifeline::terminate();
+                    }
                     for mut a in active.drain(..) {
                         send_error(model, &mut a, &format!("{e:#}"));
                     }
@@ -157,6 +166,20 @@ pub(super) fn decode_batch_with_preemption(
             }
         }
     }
+}
+
+/// Whether to run the `--swap-space` pool. A model that cannot resume a
+/// swapped sequence gets none: admission then waits for blocks and decode
+/// preemption requeues for re-prefill.
+pub(super) fn spill_pool_enabled(model: &dyn Model, swap_space_gb: usize) -> bool {
+    if swap_space_gb > 0 && !model.swap_resumable() {
+        tracing::warn!(
+            "--swap-space-gb={swap_space_gb} ignored: this model cannot resume a swapped \
+             sequence, so preempted sequences re-prefill instead"
+        );
+        return false;
+    }
+    swap_space_gb > 0
 }
 
 /// Save a (already removed from `active`) sequence's KV+SSM image to the
@@ -209,6 +232,7 @@ pub(super) fn spill_out_sequence(
         output_tokens: a.output_tokens,
         remaining: a.remaining,
         min_tokens: a.min_tokens,
+        eos_ban: a.seq.eos_ban,
         eos_tokens: a.eos_tokens,
         sink: a.sink,
         temperature: a.temperature,
@@ -310,6 +334,7 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
         }
     };
     seq.session_hash = a.session_hash;
+    seq.disable_mtp = a.disable_mtp;
     seq.adapter_slot = a.seq.adapter_slot;
     // Task #24/#25 parity with the swap-in path: keep the STABLE adapter_id
     // stamped at the original prefill and re-acquire the slot ref released
@@ -321,6 +346,7 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
     // EP: mirror the non-chunked prefill preamble so the worker mirrors the
     // re-prefill (no-ops on non-EP models).
     let prefill_result = (|| -> Result<()> {
+        model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, a.disable_mtp)?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(tokens.len() as u32)?;
         model.ep_broadcast_cmd(0)?;
@@ -342,13 +368,40 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
     // as prefill stamped it, because it must describe what prefill actually
     // ref-bumped for `cache_sequence`'s prompt/generated split; restoring
     // the original prompt length would double-bump the pre-preemption
-    // output blocks at finish and pin them forever.
+    // output blocks at finish and pin them forever. The min_tokens floor is
+    // an absolute position, so it carries over to the new owner unchanged.
+    a.seq.eos_ban.arm(&mut seq);
     a.seq = seq;
     // The rollback ring's GPU snapshots died with the old slot; start empty
     // (identical to the disk-swap resume path).
     a.ssm_rollback_ring = SsmDecodeRing::new(model.decode_rollback_ring_slots());
     a.preempt_immune_until_tokens = a.output_tokens.len() + PREEMPT_IMMUNITY_TOKENS;
     Ok(a)
+}
+
+/// Swapped sequences released their GPU ownership when spilled. Remove dead
+/// buffered callers and their spill files before restoring any GPU state.
+pub(super) fn discard_disconnected_swapped(
+    swapped: &mut Vec<SwappedSeq>,
+    spill: &mut KvSpillManager,
+) {
+    swapped.retain(|s| {
+        if !s.sink.receiver_closed() {
+            return true;
+        }
+        if let Err(e) = spill.remove_file(s.swap_id) {
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return false;
+            }
+            tracing::warn!("discard disconnected spill: {e:#}");
+            // Retain ownership so a later sweep can retry cleanup. The
+            // swap-in selector excludes closed sinks even on cleanup failure.
+            return true;
+        }
+        false
+    });
 }
 
 /// Resume requeued victims while KV blocks and batch slots allow.
@@ -364,6 +417,9 @@ pub(super) fn resume_preempted_seqs(
     max_batch_size: usize,
     block_size: usize,
 ) {
+    // GPU ownership was released at preemption. Drop disconnected callers
+    // before reclaiming cache blocks or rebuilding their entire history.
+    preempted.retain(|p| !p.a.sink.receiver_closed());
     while !preempted.is_empty() && active.len() < max_batch_size {
         let Some((idx, needed)) = preempted
             .iter()

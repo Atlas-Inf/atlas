@@ -48,8 +48,9 @@ pub(crate) fn self_spec_supported(
 /// Floor SSM snapshot slots so a 1M prefill does not drop Marconi
 /// checkpoints (`SSM snapshot pool exhausted`). Tokens per snapshot =
 /// `ssm_checkpoint_interval * block_size` (default 256*16=4096).
-/// `--ssm-cache-slots 0` still disables the pool.
-fn resolve_ssm_cache_slots(args: &cli::ServeArgs) -> usize {
+/// `--ssm-cache-slots 0` still disables the pool. Every rank must resolve
+/// the same count (`topology::rank_settings`).
+pub(super) fn resolve_ssm_cache_slots(args: &cli::ServeArgs) -> usize {
     let requested = args.ssm_cache_slots;
     if requested == 0 || args.ssm_checkpoint_interval == 0 || args.block_size == 0 {
         return requested;
@@ -60,18 +61,7 @@ fn resolve_ssm_cache_slots(args: &cli::ServeArgs) -> usize {
         .div_ceil(tok_per)
         .saturating_add(8)
         .min(512);
-    if needed > requested {
-        tracing::warn!(
-            "raising --ssm-cache-slots {requested} → {needed} so Marconi \
-             snapshots cover --max-seq-len={} ({} tok/snapshot). \
-             Pass a larger --ssm-cache-slots to override the cap (512).",
-            args.max_seq_len,
-            tok_per
-        );
-        needed
-    } else {
-        requested
-    }
+    requested.max(needed)
 }
 
 pub(crate) fn build_prefix_cache(
@@ -122,6 +112,17 @@ pub(crate) fn build_model(
         .mtp_quantization
         .parse()
         .context("Invalid --mtp-quantization value")?;
+    let ssm_cache_slots = resolve_ssm_cache_slots(args);
+    if ssm_cache_slots > args.ssm_cache_slots {
+        tracing::warn!(
+            "raising --ssm-cache-slots {} → {ssm_cache_slots} so Marconi \
+             snapshots cover --max-seq-len={} ({} tok/snapshot). \
+             Pass a larger --ssm-cache-slots to override the cap (512).",
+            args.ssm_cache_slots,
+            args.max_seq_len,
+            args.ssm_checkpoint_interval * args.block_size,
+        );
+    }
     spark_model::factory::build_model(
         config.clone(),
         store,
@@ -144,7 +145,7 @@ pub(crate) fn build_model(
         kv_dtype,
         inference_reserve,
         args.gpu_memory_utilization,
-        resolve_ssm_cache_slots(args),
+        ssm_cache_slots,
         layer_dtypes,
         args.ssm_checkpoint_interval,
         hss_cache_blocks_per_seq,
@@ -320,10 +321,20 @@ pub(crate) fn maybe_run_ep_worker(
         loop {
             match model_owned.ep_worker_step(&mut slots) {
                 Ok(true) => {}
-                Ok(false) => break,
-                Err(e) => {
-                    tracing::error!("EP worker error: {e:#}");
+                Ok(false) => {
+                    crate::ep_peer_lifeline::expect_peer_exit();
                     break;
+                }
+                Err(e) => {
+                    // An EP worker error may follow a failed collective.  A
+                    // local break leaves the rank alive and lets the head
+                    // issue another collective against a dead peer, which
+                    // turns a reportable failure into an indefinite hang.
+                    // Use the existing fail-fast propagation path so every
+                    // rank/process exits together after communicator state is
+                    // uncertain.
+                    tracing::error!("EP worker fatal error: {e:#}; terminating rank");
+                    crate::ep_peer_lifeline::terminate();
                 }
             }
         }

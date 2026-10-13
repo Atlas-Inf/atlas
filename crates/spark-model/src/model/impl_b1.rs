@@ -446,6 +446,7 @@ impl TransformerModel {
         } else {
             // Suppress per-op profiling by creating a non-profile context
             &ForwardContext {
+                ssm_batch: None,
                 buffers: ctx.buffers,
                 gpu: ctx.gpu,
                 config: ctx.config,
@@ -645,6 +646,7 @@ impl TransformerModel {
         };
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,

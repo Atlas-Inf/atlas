@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 /// checkpoint's `config.json` declares `swiglu_limit` / `swiglu_limits`. Adding
 /// a name here should mean you have read that checkpoint's config, not that you
 /// wanted the test to pass.
-const DECLARES_A_SWIGLU_LIMIT: &[&str] = &["deepseek-v4-flash", "step3p7-flash"];
+const DECLARES_A_SWIGLU_LIMIT: &[&str] = &["deepseek-v4-flash", "glm-5.3-flash", "step3p7-flash"];
 
 /// Kernels whose clamp is known-inconsistent and deliberately left alone. See
 /// the comment block at the clamp in `moe_shared_expert_fused.cu`: resolving it

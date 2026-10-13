@@ -2,13 +2,16 @@
 
 use xgrammar::{GrammarCompiler, TokenizerInfo, VocabType, detect_metadata_from_hf};
 
-/// Byte budget for the Tier-1 compiled-grammar cache (`GrammarCompiler`).
+/// Byte budget for the compiled-grammar caches (`GrammarCompiler`).
 ///
-/// 1 GiB. Sized against the measured footprint of a compiled tool grammar plus
-/// the masks it accumulates in use (~17 MB under BFCL), so this holds roughly
-/// sixty distinct schemas — far beyond any realistic hot set, while bounding a
-/// tail that was previously unbounded. See issue #368.
-const GRAMMAR_CACHE_BUDGET_BYTES: isize = 1024 * 1024 * 1024;
+/// 512 MiB. Sized against the measured footprint of a compiled tool grammar
+/// plus the masks it accumulates in use (~17 MB under BFCL), so this holds
+/// about thirty distinct schemas — beyond any realistic hot set, while
+/// bounding a tail that was previously unbounded (issue #368). Halved from
+/// 1 GiB: a large strict response_format object (~100 keys) accumulates a few
+/// hundred MiB of masks as it is used, and the GB10 hosts run within a few GiB
+/// of their memory guard.
+const GRAMMAR_CACHE_BUDGET_BYTES: isize = 512 * 1024 * 1024;
 
 use super::extract_ordered_vocab;
 
@@ -139,16 +142,18 @@ impl GrammarEngine {
 
     fn from_tokenizer_info(tokenizer_info: TokenizerInfo) -> Result<Self, GrammarError> {
         let vocab_size = tokenizer_info.vocab_size();
-        // Single compilation thread, cache enabled, no memory limit.
+        // Single compilation thread, cache enabled and bounded.
         // ★ NOT -1 (unlimited). `CacheKey::Schema` is keyed by the full tool
         // schema, so agentic traffic mints a distinct compiled grammar per
         // request; unbounded, that grew host RSS ~100 MB/min under BFCL and is
-        // the shape behind issue #368's ~7-hour restart cadence. A GiB is far
+        // the shape behind issue #368's ~7-hour restart cadence. The budget is far
         // above any realistic hot set (tens of schemas) while bounding the
         // tail. `-1` remains available as an explicit opt-in for callers that
         // genuinely want every grammar pinned.
-        let compiler = GrammarCompiler::new(&tokenizer_info, 1, true, GRAMMAR_CACHE_BUDGET_BYTES)
-            .map_err(GrammarError::Compilation)?;
+        let mut compiler =
+            GrammarCompiler::new(&tokenizer_info, 1, true, GRAMMAR_CACHE_BUDGET_BYTES)
+                .map_err(GrammarError::Compilation)?;
+        compiler.set_max_schema_grammar_bytes(super::compile_misc::MAX_SCHEMA_GRAMMAR_BYTES);
         Ok(Self {
             compiler,
             vocab_size,

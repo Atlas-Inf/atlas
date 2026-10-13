@@ -52,6 +52,7 @@ ue = "ue"
 # "subtiles" = sub-tiles: WMMA n-sub-tile partitioning in the strix-hip
 # MoE/dense GEMM kernels (PM4_SUBTILES_PER_WARP). Not a typo of "subtitles".
 subtiles = "subtiles"
+subtile = "subtile"
 # CUDA device-attribute constant token. Not a typo of `OPTION`.
 OPTIN = "OPTIN"
 # `image_grid_thw` is the HuggingFace tensor name for vision-input
@@ -138,6 +139,18 @@ sxl = "sxl"
 dbe = "dbe"
 
 [default.extend-identifiers]
+# GLM kernel and numerical-harness names: Atlas output, device outputs,
+# log-A, device function weights, weight element count and projection N.
+aout = "aout"
+dout = "dout"
+dout0 = "dout0"
+dout1 = "dout1"
+d_alog = "d_alog"
+fnd = "fnd"
+wel = "wel"
+pn = "pn"
+# Exact historical source revision in the GLM seam benchmark recipe.
+daa94067 = "daa94067"
 # `PNGs` — the plural of PNG, in the vision-fixture provisioning commentary.
 # The checker splits an uppercase run followed by a lowercase tail, so it sees
 # `PN` + `Gs` and reports `PN` as a typo of `ON`. The word is correct English

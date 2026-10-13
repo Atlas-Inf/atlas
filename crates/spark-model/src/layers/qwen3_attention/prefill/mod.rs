@@ -13,14 +13,22 @@
 
 mod cache_skip;
 mod cache_skip_mla;
+mod cache_skip_mla_kv_only;
 mod cache_skip_qkv;
 mod cache_skip_v4;
+mod glm_index;
+mod glm_index_split;
+pub(crate) use glm_index_split::index_split_words;
 mod paged;
 mod paged_attn;
 mod paged_attn_batched;
 mod paged_attn_fp8k;
 mod paged_attn_turbok;
+mod paged_glm;
+pub(crate) use paged_glm::write_floor_legacy;
+pub(in crate::layers::qwen3_attention) use paged_glm::{GlmChunkOwner, glm_chunk_pieces};
 mod paged_mla;
+mod paged_mla_args;
 mod paged_oproj;
 mod paged_qkv;
 mod paged_v4;

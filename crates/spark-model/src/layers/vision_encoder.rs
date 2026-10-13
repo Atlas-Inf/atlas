@@ -9,6 +9,11 @@
 
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 
+mod glm;
+pub(crate) use glm::{
+    GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights,
+};
+
 pub(super) const IMAGE_PAD_TOKEN: u32 = 151_655;
 pub const IMAGE_PAD_TOKEN_ID: u32 = IMAGE_PAD_TOKEN;
 
@@ -55,6 +60,7 @@ pub struct MergerLayer {
 }
 
 pub struct VisionEncoder {
+    pub(crate) glm: Option<Box<GlmVisionEncoder>>,
     pub patch_embed_w: DevicePtr,      // [1152, 1536] BF16
     pub patch_embed_b: DevicePtr,      // [1152] BF16
     pub pos_embed: DevicePtr,          // [2304, 1152] BF16 (untouched, kept for reference)
@@ -111,3 +117,11 @@ pub struct VisionEncoder {
 }
 
 mod enc_impl;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/glm_oracle_tests.rs"]
+mod glm_oracle_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/glm_attention_gpu_tests.rs"]
+mod glm_attention_gpu_tests;

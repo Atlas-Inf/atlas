@@ -40,12 +40,16 @@ use super::{
     AtlasCudaBackend, cuMemAlloc_v2, cuMemAllocManaged, cuMemFree_v2, cuMemGetInfo_v2,
     cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuStreamSynchronize,
 };
-use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, HostPitched, KernelHandle};
 
 // The host-side copy helpers live beside this file — see its module doc for
 // why they could not stay (a trait `impl` cannot be split, so only the code
 // OUTSIDE the block can move, and the PR's merge with main needed it).
 use super::host_staging::{d2h_trace_tick, h2d_enqueue, warn_pinned_transient_source};
+
+mod pdl;
+use pdl::PDL_KERNELS;
+pub use pdl::{configure_pdl, pdl_enabled};
 
 impl GpuBackend for AtlasCudaBackend {
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
@@ -213,6 +217,14 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
+    fn synchronize_device(&self) -> Result<()> {
+        let status = unsafe { super::cuCtxSynchronize() };
+        if status != 0 {
+            bail!("cuCtxSynchronize failed: {}", cuda_error_text(status));
+        }
+        Ok(())
+    }
+
     fn default_stream(&self) -> u64 {
         self.default_stream
     }
@@ -243,6 +255,9 @@ impl GpuBackend for AtlasCudaBackend {
         match registry.raw_function_cached(&cache, module, func_name) {
             Ok(raw) => {
                 crate::kernel_audit::record(module, func_name, true, site);
+                if pdl_enabled() && PDL_KERNELS.contains(&func_name) {
+                    atlas_core::registry::mark_pdl(raw);
+                }
                 Ok(KernelHandle(raw.0 as u64))
             }
             Err(e) => {
@@ -285,6 +300,10 @@ impl GpuBackend for AtlasCudaBackend {
         // no implicit ordering is added — that is the whole reason this variant
         // exists (a 60-chunk pinned scatter must not pay 60 stream drains).
         h2d_enqueue(src, dst, stream)
+    }
+
+    fn host_pitched(&self) -> Option<&dyn HostPitched> {
+        Some(self)
     }
 
     fn copy_d2d_async(
@@ -412,6 +431,9 @@ impl GpuBackend for AtlasCudaBackend {
     }
     fn create_stream(&self) -> Result<u64> {
         self.create_stream_cu()
+    }
+    fn destroy_stream(&self, stream: u64) -> Result<()> {
+        self.destroy_stream_cu(stream)
     }
     fn bind_to_thread(&self) -> Result<()> {
         self.bind_to_thread_cu()

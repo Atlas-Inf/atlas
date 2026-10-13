@@ -105,6 +105,35 @@ pub fn rms_norm(
         .launch(stream)
 }
 
+/// GLM MTP: build `[enorm(embed[token]), hnorm(target_hidden)]` directly.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_mtp_eh_norm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    embed_table: DevicePtr,
+    token: u32,
+    target_hidden: DevicePtr,
+    enorm: &DenseWeight,
+    hnorm: &DenseWeight,
+    output: DevicePtr,
+    hidden_size: u32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([2, 1, 1])
+        .block([hidden_size.min(1024), 1, 1])
+        .arg_ptr(embed_table)
+        .arg_u32(token)
+        .arg_ptr(target_hidden)
+        .arg_ptr(enorm.weight)
+        .arg_ptr(hnorm.weight)
+        .arg_ptr(output)
+        .arg_u32(hidden_size)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
 /// Warp-per-row RMS norm for SHORT rows — one warp per row instead of one
 /// block, so the grid shrinks 8x and the reduction needs no shared memory or
 /// barrier. Profitable exactly for the Qwen3 per-head `q_norm`/`k_norm` during

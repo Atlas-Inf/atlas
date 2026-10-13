@@ -412,6 +412,15 @@ pub(crate) async fn chat_completions_inner(
         Ok(s) => s,
         Err(resp) => return ChatOutcome::Http(resp),
     };
+    if prompt_len.saturating_add(max_tokens) > state.max_seq_len {
+        return ChatOutcome::Http(openai_error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Prompt plus max_tokens exceeds max_seq_len {} (prompt={}, max_tokens={})",
+                state.max_seq_len, prompt_len, max_tokens
+            ),
+        ));
+    }
     if state.chat.phase_timing {
         let us_sampling =
             _t_seg.elapsed().as_micros() - us_prepare - us_loop_detect - us_session_hash;

@@ -1,0 +1,64 @@
+{
+  "repository": "https://github.com/Enntity/sparkglm",
+  "commit": "84310dc3bbdfb99526e1b17342859241b447606d",
+  "license_note": "Bridge: AGPL-3.0-only AND MIT. Patch: MIT upstream context and AGPL-3.0-only modifications. LICENSE preserves MoonshotAI MIT notice. Atlas LICENSE applies to AGPL portions.",
+  "adapted_recipes": [
+    "install/build-native.sh",
+    "install/flash_kda/rebuild.sh"
+  ],
+  "files": [
+    {
+      "path": "atlas_flash_kda_bridge.cu",
+      "origin_path": "install/flash_kda/atlas_flash_kda_bridge.cu",
+      "sha256": "6989340b5d6d27c504ab68265b0f1b0ea517dba9903412fb7d2e441389157411",
+      "modifications": "none"
+    },
+    {
+      "path": "flash_kda_sm121_slots.patch",
+      "origin_path": "install/flash_kda/flash_kda_sm121_slots.patch",
+      "sha256": "5c453a58b9152c89e1c8e9ebf2f514d664bff007f72636a406c68906aa278d13",
+      "modifications": "none"
+    },
+    {
+      "path": "LICENSE",
+      "origin_path": "install/flash_kda/LICENSE",
+      "sha256": "05f1750624d6ab5f6dd59dea79e3156f4fec6b3065c94aeeaf265df677f9e6e8",
+      "modifications": "none"
+    },
+    {
+      "path": "SparkGLM-LICENSE",
+      "origin_path": "LICENSE",
+      "sha256": "d8a6cc31abc16b6748c7a21f21611f5a1ec33f67d22ca23d7da1c19b95496bee",
+      "modifications": "none"
+    }
+  ],
+  "credits": [
+    {
+      "name": "Jason McCartney / Enntity",
+      "contribution": "SparkGLM build recipes, Atlas FlashKDA bridge and state-slot patch; git history attributes imported files to Jason McCartney."
+    },
+    {
+      "name": "MoonshotAI",
+      "contribution": "MIT FlashKDA upstream kernels and bridge arithmetic / launch interface."
+    },
+    {
+      "name": "NVIDIA",
+      "contribution": "BSD-3-Clause CUTLASS and sparse-MLA kernel source fetched through FlashInfer."
+    },
+    {
+      "name": "FlashInfer contributors",
+      "contribution": "Apache-2.0 source distribution and build interfaces for the pinned sparse-MLA translation unit."
+    },
+    {
+      "name": "Atlas contributors including Reiner Schmidt / Mango-kid",
+      "contribution": "Existing Atlas runtime adapters and GLM integration; engine file history remains authoritative."
+    }
+  ],
+  "scope": "Historical attribution for the removed reference-only bridge and patch. Neither is built, copied or loaded by native Atlas. Current native provenance is in crates/spark-runtime/cuda/glm_kda/vendor/ and third_party/nvidia_sparse_mla_sm120/.",
+  "archive": {
+    "atlas_revision": "3c991613462c79730e2936a7b0f97add40f74370",
+    "path_prefix": "third_party/glm_prefill/",
+    "note": "Source and patch entries describe historical files, removed from the current tree after native qualification. License texts are retained. Original and review revisions have identical file trees; recover using git show <review_revision>:<path_prefix><path>.",
+    "review_revision": "b09ee1b6903931296e5a63d922150fb7cac272ca"
+  }
+}

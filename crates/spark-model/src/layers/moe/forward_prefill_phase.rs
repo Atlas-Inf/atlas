@@ -33,6 +33,11 @@ impl MoeLayer {
         if shared_inter == 0 {
             return Ok(());
         }
+        anyhow::ensure!(
+            !self.shared_fp8_cache.verify
+                || (!use_overlap && !ctx.graph_capture && !ctx.gpu.stream_is_capturing(aux)),
+            "shared FP8 VERIFY requires eager, non-overlapped execution"
+        );
         if use_overlap {
             // Ensure secondary stream sees `input` (produced by prior default-stream work)
             ctx.gpu.record_event(self.event_a, stream)?;
@@ -42,6 +47,53 @@ impl MoeLayer {
         let shared_gate_out = ctx.buffers.ssm_deinterleaved();
         let shared_up_out = ctx.buffers.ssm_qkvz();
         let shared_down_out = ctx.buffers.attn_output();
+        if self.independent_grouped(ctx, n) {
+            anyhow::ensure!(
+                !use_overlap,
+                "independent small-row shared work is sequential"
+            );
+            return self.independent_shared_expert(input, n, ctx, aux);
+        }
+        if self.glm_c2_grouped(ctx, n) {
+            anyhow::ensure!(
+                !use_overlap,
+                "C2 compact shared work must remain sequential"
+            );
+            return self.c2_shared_expert(input, ctx, aux);
+        }
+        if self.glm_c4_grouped(ctx, n) {
+            self.c4_shared_expert(
+                input,
+                shared_gate_out,
+                shared_up_out,
+                shared_down_out,
+                h,
+                shared_inter,
+                ctx,
+                aux,
+            )?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
+        if self.glm_c3_grouped(ctx, n) {
+            self.c3_shared_expert(
+                input,
+                shared_gate_out,
+                shared_up_out,
+                shared_down_out,
+                h,
+                shared_inter,
+                n,
+                ctx,
+                aux,
+            )?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         if self.run_bf16_shared_expert(
             input,
             n,
@@ -59,54 +111,111 @@ impl MoeLayer {
             return Ok(());
         }
 
+        // GLM's K=5 verifier enters the grouped routed-expert pipeline to
+        // amortize its expert weights, but the generic shared-expert prefill
+        // kernels pad this five-row problem to a much wider GEMM tile. Reuse
+        // the exact-M decode kernels already proven by forward_k5: they read
+        // each native NVFP4 projection once while computing only five rows.
+        let batch5 = self.w4a16_batchm.kernel(5);
+        let exact_k5 = n == 5
+            && std::env::var("ATLAS_GLM_K5_BATCHED_SHARED").as_deref() == Ok("1")
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && batch5.0 != 0
+            && !self.weights.shared_expert.gate_proj.is_null()
+            && !self.weights.shared_expert.up_proj.is_null()
+            && !self.weights.shared_expert.down_proj.is_null();
+        let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(n);
+        if n > 8
+            && tc.0 != 0
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && !self.weights.shared_expert.gate_proj.is_null()
+            && !self.weights.shared_expert.up_proj.is_null()
+            && !self.weights.shared_expert.down_proj.is_null()
+        {
+            self.run_shared_tc(
+                tc,
+                input,
+                shared_gate_out,
+                shared_up_out,
+                shared_down_out,
+                n,
+                h,
+                shared_inter,
+                ctx,
+                aux,
+            )?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
+        if exact_k5 {
+            self.run_exact_k5_shared(
+                input,
+                shared_gate_out,
+                shared_up_out,
+                shared_down_out,
+                h,
+                shared_inter,
+                ctx,
+                aux,
+            )?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
+
         // Shared gate + up GEMM on aux stream
         if let (Some(sg_fp8), Some(su_fp8)) = (self.shared_gate_fp8, self.shared_up_fp8) {
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
+            self.run_shared_fp8_cache(
+                0,
                 input,
                 sg_fp8,
                 shared_gate_out,
                 n,
                 shared_inter,
                 h,
+                ctx,
                 aux,
             )?;
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
+            self.run_shared_fp8_cache(
+                1,
                 input,
                 su_fp8,
                 shared_up_out,
                 n,
                 shared_inter,
                 h,
+                ctx,
                 aux,
             )?;
         } else if let (Some(sg), Some(su), Some(_sd)) =
             (&self.shared_gate_t, &self.shared_up_t, &self.shared_down_t)
         {
-            ops::w4a16_gemm_n128(
-                ctx.gpu,
-                self.w4a16_gemm_t,
+            self.run_shared_m16(
+                shared_m16::SharedProjection::Gate,
                 input,
                 sg,
                 shared_gate_out,
                 n,
                 shared_inter,
                 h,
+                ctx,
                 aux,
+                use_overlap,
             )?;
-            ops::w4a16_gemm_n128(
-                ctx.gpu,
-                self.w4a16_gemm_t,
+            self.run_shared_m16(
+                shared_m16::SharedProjection::Up,
                 input,
                 su,
                 shared_up_out,
                 n,
                 shared_inter,
                 h,
+                ctx,
                 aux,
+                use_overlap,
             )?;
         } else {
             ops::w4a16_gemm(
@@ -144,28 +253,29 @@ impl MoeLayer {
             aux,
         )?;
         if let Some(sd_fp8) = self.shared_down_fp8 {
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
+            self.run_shared_fp8_cache(
+                2,
                 shared_gate_out,
                 sd_fp8,
                 shared_down_out,
                 n,
                 h,
                 shared_inter,
+                ctx,
                 aux,
             )?;
         } else if let Some(sd) = &self.shared_down_t {
-            ops::w4a16_gemm_n128(
-                ctx.gpu,
-                self.w4a16_gemm_t,
+            self.run_shared_m16(
+                shared_m16::SharedProjection::Down,
                 shared_gate_out,
                 sd,
                 shared_down_out,
                 n,
                 h,
                 shared_inter,
+                ctx,
                 aux,
+                use_overlap,
             )?;
         } else {
             ops::w4a16_gemm(

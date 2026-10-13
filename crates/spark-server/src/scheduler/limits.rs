@@ -32,6 +32,8 @@ pub struct SchedLimits {
     /// long think block cannot run past it. `0` = unset → every guard that
     /// reads it becomes a no-op.
     pub max_seq_len: usize,
+    /// Model-qualified native GLM tool opener; per-request tools must also be active.
+    pub glm_tool_boundary: Option<u32>,
 }
 
 impl SchedLimits {
@@ -42,6 +44,7 @@ impl SchedLimits {
         im_start_hard_stop: None,
         tool_response_hard_stop: None,
         max_seq_len: 0,
+        glm_tool_boundary: None,
     };
 }
 

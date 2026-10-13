@@ -107,6 +107,7 @@ pub fn handle_content_token(
     // 1536 in MODEL.toml.
     if !sched.levers.disable_watchdogs
         && a.grammar_state.is_some()
+        && !a.strict_grammar()
         && a.content_tokens > sched.watchdog.max_post_think_content_tokens
     {
         tracing::warn!(
@@ -158,6 +159,8 @@ pub fn handle_content_token(
     if !sched.levers.disable_watchdogs
         && sched.levers.loop_watchdog()
         && !a.inside_tool_body
+        && !a.strict_grammar()
+        && watchdog_floor_reached(a.output_tokens.len().saturating_add(1), a.min_tokens)
         && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
         && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
         && (detect_content_token_loop_with(&a.output_tokens, loop_params)

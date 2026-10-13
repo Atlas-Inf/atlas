@@ -19,8 +19,8 @@ use super::{
     AtlasCudaBackend, cuCtxGetDevice, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
     cuEventDestroy_v2, cuEventRecord, cuEventSynchronize, cuGraphDestroy, cuGraphExecDestroy,
     cuGraphLaunch, cuMemAllocHost_v2, cuMemFreeHost, cuMemGetInfo_v2, cuMemsetD2D8Async,
-    cuMemsetD8Async, cuMemsetD32Async, cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture,
-    cuStreamSynchronize, cuStreamWaitEvent,
+    cuMemsetD8Async, cuMemsetD32Async, cuStreamBeginCapture, cuStreamCreate, cuStreamDestroy_v2,
+    cuStreamEndCapture, cuStreamSynchronize, cuStreamWaitEvent,
 };
 use crate::gpu::{DevicePtr, GraphHandle};
 
@@ -217,6 +217,16 @@ impl AtlasCudaBackend {
             bail!("cuStreamCreate failed: status {status}");
         }
         Ok(stream)
+    }
+
+    pub(super) fn destroy_stream_cu(&self, stream: u64) -> Result<()> {
+        if stream != 0 {
+            let status = unsafe { cuStreamDestroy_v2(stream) };
+            if status != 0 {
+                bail!("cuStreamDestroy_v2 failed: status {status}");
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn bind_to_thread_cu(&self) -> Result<()> {

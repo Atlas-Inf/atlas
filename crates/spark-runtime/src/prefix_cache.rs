@@ -83,10 +83,6 @@ pub struct InsertAcquired {
     /// Physical KV blocks stored in radix nodes CREATED by this insert; the
     /// caller `inc_ref`s each exactly once.
     pub blocks: Vec<u32>,
-    /// Physical KV blocks this insert stopped storing — a `partial_suffix` slot
-    /// that was overwritten or dropped. The caller `dec_ref`s each exactly once,
-    /// releasing the reference taken when that slot was first filled.
-    pub released_blocks: Vec<u32>,
 }
 
 impl EvictedBlocks {
@@ -192,6 +188,27 @@ pub trait PrefixCache: Send + Sync {
         session_hash: u64,
         adapter_id: u64,
     ) -> PrefixMatch;
+
+    /// [`Self::lookup`] over the whole blocks of `tokens` only, which is how a
+    /// sequence acquires its cached prefix.
+    ///
+    /// No two sequences may hold a writable reference to one KV block, and a
+    /// sequence writes the block holding its next position: a decode step
+    /// appends a row there and a speculative verify writes several, rejected
+    /// drafts included. A match that ended inside a cached block would hand
+    /// that block to a sequence that then overwrites the rest of it under its
+    /// other holders. The tokens past the last whole block are therefore never
+    /// offered for matching, whatever the implementation would do with them.
+    fn lookup_whole_blocks(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> PrefixMatch {
+        let whole = tokens.len() - tokens.len() % block_size;
+        self.lookup(&tokens[..whole], block_size, session_hash, adapter_id)
+    }
 
     /// Read-only longest-prefix probe: number of tokens (block-aligned)
     /// `lookup` would match, WITHOUT taking refs, touching LRU state, or
@@ -305,6 +322,47 @@ pub trait PrefixCache: Send + Sync {
         adapter_id: u64,
     ) -> Option<usize>;
 
+    /// Register a finish leaf (`ATLAS_GLM_PC_FINISH_LEAF`) for exactly
+    /// `tokens` in the index only: a snapshot evicted before any chain
+    /// frontier and never linked into a chain. Returns a snapshot id for the
+    /// caller to free: the leaf it replaces, or `snapshot_id` itself when it
+    /// was not stored (a checkpoint already serves the prefix; the default).
+    fn insert_leaf_snapshot(
+        &self,
+        tokens: &[u32],
+        snapshot_id: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> Option<usize> {
+        let _ = (tokens, session_hash, adapter_id);
+        Some(snapshot_id)
+    }
+
+    /// Unregister the finish leaf at exactly `tokens` if it still holds
+    /// `snapshot_id`: the owning sequence moves its leaf to a later boundary
+    /// or gives it up. `true` hands the slot back to the caller; `false`
+    /// means it is no longer the caller's (evicted, promoted or replaced).
+    /// Default: `false`.
+    fn take_leaf_snapshot(&self, tokens: &[u32], snapshot_id: usize, adapter_id: u64) -> bool {
+        let _ = (tokens, snapshot_id, adapter_id);
+        false
+    }
+
+    /// The turn the finish leaf at exactly `tokens` (if any) was saved for
+    /// has restored it. `keep` turns it into an ordinary checkpoint (that
+    /// turn saves none of its own); otherwise it becomes superseded history.
+    /// Default: no-op.
+    fn settle_leaf_snapshot(&self, tokens: &[u32], adapter_id: u64, keep: bool) {
+        let _ = (tokens, adapter_id, keep);
+    }
+
+    /// Evict one snapshot to make room for a finish leaf, returning its id:
+    /// superseded history or another leaf, never a chain frontier or a branch
+    /// point. Default: `None`.
+    fn evict_snapshot_for_leaf(&self) -> Option<usize> {
+        None
+    }
+
     /// Release ref_counts on blocks that were acquired via `lookup`.
     ///
     /// Called when a sequence finishes. Decrements ref_count on cache
@@ -379,6 +437,31 @@ pub trait PrefixCache: Send + Sync {
         false
     }
 
+    /// The resident, exact-prefix (non-tail) snapshot registered at exactly
+    /// `depth` tokens of `tokens`, without touching the radix tree. Used when
+    /// ranks must agree on one restore depth (`ATLAS_GLM_PC_EVICT` /
+    /// `ATLAS_GLM_PC_BRANCH`). Default: `None`.
+    fn snapshot_at(&self, tokens: &[u32], depth: usize, adapter_id: u64) -> Option<usize> {
+        let _ = (tokens, depth, adapter_id);
+        None
+    }
+
+    /// Whether the cached block path through `tokens[..depth]` (block-aligned)
+    /// continues with a block other than this request's next one: another
+    /// request diverged from it exactly at `depth`. Rank-local; used to place
+    /// branch-point checkpoints (`ATLAS_GLM_PC_BRANCH`). Default: `false`.
+    fn forks_at(&self, tokens: &[u32], depth: usize, block_size: usize, adapter_id: u64) -> bool {
+        let _ = (tokens, depth, block_size, adapter_id);
+        false
+    }
+
+    /// Mark the snapshot registered for exactly `tokens` as a branch point
+    /// (a prefix shared by diverging requests), which chain-aware eviction
+    /// never treats as superseded. Default: no-op.
+    fn mark_branch_snapshot(&self, tokens: &[u32], adapter_id: u64) {
+        let _ = (tokens, adapter_id);
+    }
+
     /// Number of SSM snapshots currently stored in the snapshot index.
     fn snapshot_count(&self) -> usize;
 
@@ -387,39 +470,4 @@ pub trait PrefixCache: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_prefix_match_empty() {
-        let m = PrefixMatch::empty();
-        assert!(m.is_empty());
-        assert_eq!(m.matched_tokens, 0);
-        assert!(m.matched_blocks.is_empty());
-    }
-
-    #[test]
-    fn test_no_prefix_caching_is_noop() {
-        let cache = NoPrefixCaching;
-        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let block_table = vec![0, 1];
-        let disk_block_ids: Vec<u32> = vec![];
-
-        let m = cache.lookup(&tokens, 4, 0, 0);
-        assert!(m.is_empty());
-
-        // These should not panic
-        let new_acq = cache.insert(&tokens, &block_table, &disk_block_ids, 4, 0, 0);
-        assert!(new_acq.disk_block_ids.is_empty());
-        assert!(new_acq.blocks.is_empty());
-        cache.release(&tokens, 4, 0);
-
-        let evicted = cache.evict(10);
-        assert!(evicted.is_empty());
-
-        assert_eq!(cache.evict_snapshot_lru(), None);
-        assert_eq!(cache.snapshot_count(), 0);
-
-        assert_eq!(cache.stats(), (0, 0));
-    }
-}
+mod tests;

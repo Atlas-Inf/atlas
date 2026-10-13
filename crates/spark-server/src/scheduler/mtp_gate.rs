@@ -163,6 +163,29 @@ pub fn spec_dispatch_eligible(
     }
 }
 
+/// [`spec_dispatch_eligible`] for one active sequence. A strict
+/// (`response_format`) grammar bars speculation like `disable_mtp` (see
+/// `ActiveSeq::strict_grammar`) unless `strict_spec`: the run masks every
+/// verify row of a strict sequence (`scheduler::strict_spec`).
+pub(super) fn seq_spec_eligible(
+    a: &super::ActiveSeq,
+    spec_think: bool,
+    resume_guard: u32,
+    dflash_raw_argmax: bool,
+    strict_spec: bool,
+) -> bool {
+    spec_dispatch_eligible(
+        a.inside_thinking,
+        a.post_think_emitted,
+        a.output_tokens.len() as u32,
+        a.suppress_tool_call,
+        a.disable_mtp || (a.strict_grammar() && !strict_spec),
+        spec_think,
+        resume_guard,
+        dflash_raw_argmax,
+    )
+}
+
 /// What the gate wants the scheduler to run for the NEXT step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStep {

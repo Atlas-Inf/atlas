@@ -2,7 +2,7 @@
 
 //! Which tensors the fast loader does NOT upload.
 //!
-//! Four independent rules, worth reading together because each one withholds
+//! Five independent rules, worth reading together because each one withholds
 //! bytes a downstream loader might expect:
 //!
 //!   1. **`demand_paged_patterns`** — tensors a model declares it will read by
@@ -13,7 +13,9 @@
 //!   3. **`skip_activation_scales`** — W4A4 `*.input_scale`, opt-in.
 //!   4. **`skip_mtp`** — `mtp.*` for a loader that builds no MTP head, opt-in.
 //!
-//! Rules 3 and 4 default OFF and are allow-listed per model, because
+//!   5. **`skip_layer_prefix`** — an unused appended predictor layer, opt-in.
+//!
+//! Rules 3, 4, and 5 default OFF and are allow-listed per model, because
 //! withholding a tensor a loader DOES read is invisible until the output is
 //! subtly wrong. Rule 2 is structural and always active under EP, and rule 1
 //! is only ever populated by a loader that has its own row reader.
@@ -22,7 +24,31 @@ use super::FastSafetensorsLoader;
 use crate::weights::parse_expert_index;
 
 impl FastSafetensorsLoader {
+    /// Expert TP: a routed expert's packed weight or block scale, which the
+    /// model loader slices straight from disk. The appended predictor layer
+    /// keeps its own replication rules, and the scalars load as usual.
+    pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        self.expert_tp
+            && !name.starts_with("mtp.")
+            && (name.ends_with(".weight") || name.ends_with(".weight_scale"))
+            && parse_expert_index(name).is_some()
+            && ![
+                &self.replicated_expert_prefix,
+                &self.rank0_only_expert_prefix,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|prefix| name.contains(prefix.as_str()))
+    }
+
     pub(super) fn should_skip_tensor(&self, name: &str) -> bool {
+        if self
+            .skip_layer_prefix
+            .as_ref()
+            .is_some_and(|prefix| name.starts_with(prefix))
+        {
+            return true;
+        }
         // Demand-paged first: the model has declared it reads these by row at
         // use time, which is independent of expert parallelism and must hold
         // on a single rank where the EP check below returns early.
@@ -62,6 +88,23 @@ impl FastSafetensorsLoader {
             return false;
         }
         if let Some(idx) = parse_expert_index(name) {
+            if self
+                .replicated_expert_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.contains(prefix))
+            {
+                return false;
+            }
+            if self
+                .rank0_only_expert_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.contains(prefix))
+            {
+                return self.ep_rank != 0;
+            }
+            if self.expert_tp {
+                return false;
+            }
             let per_rank = self.num_experts / self.ep_world_size;
             let local_start = self.ep_rank * per_rank;
             let local_end = if self.ep_rank == self.ep_world_size - 1 {

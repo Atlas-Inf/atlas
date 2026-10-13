@@ -5,6 +5,7 @@
 //! Defines the [`DraftProposer`] trait for speculative decoding strategies.
 //! MTP implements this first; EAGLE-3 can implement later without engine changes.
 
+pub mod glm_repair_policy;
 pub mod ladder;
 pub mod tree_shape;
 pub mod verify_key;
@@ -27,6 +28,9 @@ use crate::layer::ForwardContext;
 pub trait ProposerState: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// The request's min_tokens floor (`EosBan::floor`, 0 = none): drafts
+    /// for positions below it should not end the turn. Default: ignored.
+    fn set_end_floor(&mut self, _floor: usize) {}
 }
 
 /// A draft token proposer for speculative decoding.
@@ -294,6 +298,44 @@ pub trait DraftProposer: Send + Sync {
     /// environment, so post-startup mutation cannot change behavior.
     fn startup_diagnostics(&self) -> Option<&crate::layers::dflash_head::DsparkDiagnostics> {
         None
+    }
+
+    /// Whether a single-sequence [`Self::propose`] handed `comm` (with a
+    /// grammar mask or not) swaps work with the peer rank
+    /// (`ATLAS_GLM_DRAFT_TP`). The model announces such a propose to the
+    /// worker before it calls it.
+    fn rank_split_ready(&self, _comm: &dyn spark_comm::CommBackend, _grammar: bool) -> bool {
+        false
+    }
+
+    /// The rows a [`Self::propose_batch`] of `n` sequences handed `comm`
+    /// (with a grammar mask or not) swaps halves with the peer rank over
+    /// (`ATLAS_GLM_DRAFT_TP_BATCH`), if it does. The model announces such a
+    /// propose to the worker, with these rows, before it calls it.
+    fn rank_split_batch_rows(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _n: usize,
+        _grammar: bool,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// `ATLAS_GLM_DRAFT_TP_CTX`: the context rows the split propose about to
+    /// be announced over `comm` appends split, packed for the announce
+    /// (`rank_split::announce_word`; 0 = none). `seqs` holds each sequence's
+    /// state, capture row and position as the propose will receive them.
+    /// The proposer keeps the rows for that propose.
+    fn rank_split_ctx(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _seqs: &[(
+            &dyn ProposerState,
+            Option<spark_runtime::gpu::DevicePtr>,
+            usize,
+        )],
+    ) -> u32 {
+        0
     }
 
     /// Chain confidence of the most recent `propose` (min top-1 softmax prob

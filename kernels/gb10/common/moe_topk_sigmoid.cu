@@ -12,6 +12,7 @@
 //
 // Grid: (1, 1, 1)   Block: (256, 1, 1)
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define BLOCK_SIZE 256
@@ -144,6 +145,7 @@ extern "C" __global__ void moe_topk_sigmoid_batched(
     unsigned int normalize,
     float scaling_factor
 ) {
+    atlas_pdl_enter();
     __shared__ float s_sigmoid[MAX_EXPERTS];
     __shared__ float s_selection[MAX_EXPERTS];
     __shared__ float s_top_vals[MAX_TOP_K];

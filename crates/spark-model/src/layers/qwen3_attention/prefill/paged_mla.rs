@@ -178,62 +178,63 @@ impl Qwen3AttentionLayer {
 
         // K_rope: single shared head [N, rope=64] (MQA-style)
         let k_rope_buf = ctx.buffers.ssm_ba();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
-            normed,
-            &mla.wkv_a_rope,
-            k_rope_buf,
-            n,
-            mla_rope,
-            h,
-            stream,
-        )?;
-
-        // Apply RoPE to Q rope portions and K_rope BEFORE assembly
-        let q_rope_tmp = ctx.buffers.ssm_conv_out_f32();
-        ops::mla_q_rope_extract_batched(
-            ctx.gpu,
-            self.mla_q_rope_extract_batched_k,
-            qg_out,
-            q_rope_tmp,
-            n,
-            nq,
-            hd,
-            mla_nope,
-            mla_rope,
-            nq * hd,
-            stream,
-        )?;
-        let rope_meta = ctx.attn_metadata.expect("MLA prefill requires metadata");
-        ops::rope_yarn(
-            ctx.gpu,
-            self.rope_yarn_k,
-            q_rope_tmp,
-            k_rope_buf,
-            rope_meta.positions,
-            n,
-            nq,
-            1,
-            mla_rope,
-            mla_rope,
-            mla.yarn_inv_freq,
-            ctx.config.rope_theta as f32,
-            stream,
-        )?;
-        ops::mla_q_rope_writeback_batched(
-            ctx.gpu,
-            self.mla_q_rope_writeback_batched_k,
-            q_rope_tmp,
-            qg_out,
-            n,
-            nq,
-            hd,
-            mla_nope,
-            mla_rope,
-            nq * hd,
-            stream,
-        )?;
+        if mla_rope > 0 {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm_k,
+                normed,
+                &mla.wkv_a_rope,
+                k_rope_buf,
+                n,
+                mla_rope,
+                h,
+                stream,
+            )?;
+            // Apply RoPE to Q rope portions and K_rope BEFORE assembly.
+            let q_rope_tmp = ctx.buffers.ssm_conv_out_f32();
+            ops::mla_q_rope_extract_batched(
+                ctx.gpu,
+                self.mla_q_rope_extract_batched_k,
+                qg_out,
+                q_rope_tmp,
+                n,
+                nq,
+                hd,
+                mla_nope,
+                mla_rope,
+                nq * hd,
+                stream,
+            )?;
+            let rope_meta = ctx.attn_metadata.expect("MLA prefill requires metadata");
+            ops::rope_yarn(
+                ctx.gpu,
+                self.rope_yarn_k,
+                q_rope_tmp,
+                k_rope_buf,
+                rope_meta.positions,
+                n,
+                nq,
+                1,
+                mla_rope,
+                mla_rope,
+                mla.yarn_inv_freq,
+                ctx.config.rope_theta as f32,
+                stream,
+            )?;
+            ops::mla_q_rope_writeback_batched(
+                ctx.gpu,
+                self.mla_q_rope_writeback_batched_k,
+                q_rope_tmp,
+                qg_out,
+                n,
+                nq,
+                hd,
+                mla_nope,
+                mla_rope,
+                nq * hd,
+                stream,
+            )?;
+        }
 
         // Assemble K=[nope|rope] and extract V (1 kernel vs N*nkv*3 copies)
         let k_contiguous = ctx.buffers.ssm_qkvz();

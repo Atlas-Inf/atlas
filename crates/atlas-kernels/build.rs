@@ -120,6 +120,7 @@ struct Target {
     behavior_jinja_template: String,
     behavior_enable_loop_watchdog: bool,
     behavior_enable_think_loop_watchdog: bool,
+    behavior_enable_stream_loop_guards: bool,
     behavior_honor_eos_inside_thinking: bool,
     behavior_min_reasoning_floor_tokens: u32,
     behavior_cap_thinking_at_max_tokens: bool,
@@ -346,6 +347,16 @@ fn main() {
     }
 
     for (idx, target) in targets.iter().enumerate() {
+        if target.hw == "gb10" && target.model == "glm-5.3-flash" {
+            // The normal source include closure covers provenance; Cargo also
+            // needs to rerun when an imported device header changes.
+            println!(
+                "cargo:rerun-if-changed={}",
+                workspace_root
+                    .join("third_party/nvidia_sparse_mla_sm120")
+                    .display()
+            );
+        }
         let cu_files = collect_cu_files(
             target.common_kernel_dir.as_deref(),
             &target.overlay_dirs(),
@@ -1280,6 +1291,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_jinja_template: pb.jinja_template,
                 behavior_enable_loop_watchdog: pb.enable_loop_watchdog,
                 behavior_enable_think_loop_watchdog: pb.enable_think_loop_watchdog,
+                behavior_enable_stream_loop_guards: pb.enable_stream_loop_guards,
                 behavior_honor_eos_inside_thinking: pb.honor_eos_inside_thinking,
                 behavior_min_reasoning_floor_tokens: pb.min_reasoning_floor_tokens,
                 behavior_cap_thinking_at_max_tokens: pb.cap_thinking_at_max_tokens,

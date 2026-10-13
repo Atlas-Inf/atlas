@@ -322,7 +322,7 @@ pub(super) fn build_auth_config(
     Ok(Some(Arc::new(cfg)))
 }
 
-/// Resolve the vision area bound: operator override, else the checkpoint's
+/// Resolve the vision pixel budget: operator override, else the checkpoint's
 /// own `preprocessor_config.json`, else `None` (preprocessor falls back to
 /// its historical 1280px long-side clamp).
 ///

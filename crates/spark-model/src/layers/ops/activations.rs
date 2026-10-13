@@ -75,6 +75,35 @@ pub fn silu_mul_quant_fp8(
         .launch(stream)
 }
 
+/// Fused model-specific SiLU·mul + standard token-major NVFP4 quantization.
+/// The product rounds through BF16, so output is numerically identical to the
+/// separate `silu_mul` -> `quantize_bf16_to_nvfp4(scale2=1)` route.
+#[allow(clippy::too_many_arguments)]
+pub fn silu_mul_quant_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    out_bf16: DevicePtr,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([m, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_ptr(out_bf16)
+        .arg_u32(m)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// L2 normalization (in-place): `data[i] = data[i] / sqrt(sum(data^2) + eps)`.
 ///
 /// Applied per head: data is [num_heads, head_dim], each head normalized independently.

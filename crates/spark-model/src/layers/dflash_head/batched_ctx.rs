@@ -24,7 +24,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 
-use super::{BlockDiffusionDraftHead, DflashScratch, small_m_gemm};
+use super::{BlockDiffusionDraftHead, DflashScratch};
 use crate::layer::ForwardContext;
 use crate::layers::ops::{self, DENSE_GEMV_BATCHM_MAX_M};
 
@@ -117,7 +117,7 @@ impl BlockDiffusionDraftHead {
         let ctx_slot_bytes = (target_hidden_dim as usize) * 2;
         let row_stride = self.num_layers * 2 * (kv_dim as usize) * 2;
         let small_m_gemv_active =
-            small_m_gemm::small_m_gemv_enabled() && self.kernels.dense_gemv_batchm.0 != 0;
+            self.kernels.small_m_gemv && self.kernels.dense_gemv_batchm.0 != 0;
         let counts: Vec<usize> = pending.iter().map(|c| c.count).collect();
         let offsets = plan_ctx_chunks(&counts, small_m_gemv_active, self.batch_ctx_rows);
 
@@ -144,8 +144,19 @@ impl BlockDiffusionDraftHead {
                 stream,
                 true,
                 scratch,
+                None,
             )
         };
+
+        // Quantized/tensor-core context dispatch depends on row count. A
+        // concatenated launch can select a different kernel from each serial
+        // chunk, so retain serial projection for these configurations.
+        let offsets =
+            if self.twins.ctx_q4.is_some() || self.kernels.small_m_gemv || self.drafter_cublas {
+                None
+            } else {
+                offsets
+            };
 
         let Some(offsets) = offsets else {
             for chunk in pending {

@@ -15,12 +15,40 @@ pub fn step_decode_only(
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
-    spill: Option<&mut KvSpillManager>,
+    mut spill: Option<&mut KvSpillManager>,
     swapped: &mut Vec<SwappedSeq>,
     preempted: &mut Vec<PreemptedSeq>,
 ) {
     let t0 = std::time::Instant::now();
     let n = active.len();
+    // GLM long context has no plain multi-sequence decode: its multi-seq
+    // MLA path is the verify lane, and a batch of independent rows fails
+    // its checks (fatal on the EP worker). Decode each sequence alone on the
+    // proven single-slot path, which also keeps the DFlash drafter context
+    // appended per sequence (n == 1 below).
+    if n > 1 && spark_model::speculative::glm_repair_policy::long_context_enabled() {
+        let mut done = Vec::with_capacity(n);
+        for a in active.drain(..) {
+            let mut one = vec![a];
+            step_decode_only(
+                model,
+                &mut one,
+                think_end_token,
+                think_start_token,
+                code_fence_token,
+                tool_call_start_token,
+                tool_call_end_token,
+                adaptive_sampling,
+                sched,
+                spill.as_deref_mut(),
+                swapped,
+                preempted,
+            );
+            done.append(&mut one);
+        }
+        *active = done;
+        return;
+    }
     // Batched decode (CUDA-graph replay + batched-recurrent SSM) requires the
     // active sequences in SSM-pool-slot order, so batch position i maps to a
     // contiguous state address (pool_base + i*stride). The pool assigns

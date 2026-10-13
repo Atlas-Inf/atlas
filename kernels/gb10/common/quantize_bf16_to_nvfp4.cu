@@ -13,6 +13,7 @@
 //
 // Dequant: weight = E2M1_LUT[nibble] * fp8_scale * scale2
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -181,6 +182,7 @@ extern "C" __global__ void quantize_bf16_to_nvfp4(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     unsigned int row = blockIdx.x;
     if (row >= N) return;
 

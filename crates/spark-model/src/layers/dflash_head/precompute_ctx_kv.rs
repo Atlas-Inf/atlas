@@ -32,6 +32,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use crate::layers::ops;
 
+use super::rank_split::CtxTurn;
 use super::{BlockDiffusionDraftHead, DflashScratch};
 use crate::layer::ForwardContext;
 use crate::weight_map::DenseWeight;
@@ -54,6 +55,8 @@ impl BlockDiffusionDraftHead {
     /// `slot_mapping_dev`: device pointer to an `i32[new_ctx_count]`
     ///   array of paged-cache slot indices.
     /// `commit`: when `true`, write the computed K/V into the paged cache.
+    /// `split`: `ATLAS_GLM_DRAFT_TP_CTX` — steps 1–3 run split with the
+    /// worker as this announced append (`rank_split_ctx`), same values.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn precompute_ctx_kv(
         &self,
@@ -66,6 +69,7 @@ impl BlockDiffusionDraftHead {
         stream: u64,
         commit: bool,
         scratch: &DflashScratch,
+        split: Option<CtxTurn<'_>>,
     ) -> Result<()> {
         if new_ctx_count == 0 {
             return Ok(());
@@ -87,8 +91,12 @@ impl BlockDiffusionDraftHead {
         // Per-model latch (see `ModelStats::dumped`) rather than a static: an
         // operator who sets the flag and then swaps models must still get the
         // dump, instead of it being swallowed by the previous model's shot.
-        let dump =
-            self.startup.diagnostics.precompute_dump && ctx.stats.dumped.keyed("dflash_precompute");
+        // ATLAS_DFLASH_BLOCK_DUMP_AT_POS also defers this one-shot dump.
+        let dump = self.startup.diagnostics.precompute_dump
+            && slot_positions
+                .last()
+                .is_some_and(|&p| p as usize + 1 >= self.startup.diagnostics.block_dump_at_pos)
+            && ctx.stats.dumped.keyed("dflash_precompute");
         let dump_buf = |label: &str, ptr: DevicePtr, bytes: usize| -> Result<()> {
             if !dump {
                 return Ok(());
@@ -107,17 +115,21 @@ impl BlockDiffusionDraftHead {
 
         // ── Steps 1–3: fc projection + hidden_norm + fused KV GEMM ────
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        self.ctx_kv_project(
-            gpu,
-            src,
-            n,
-            h,
-            target_hidden_dim as u32,
-            scratch.fc_proj,
-            scratch.fused_kv_out,
-            stream,
-            Some(&dump_buf),
-        )?;
+        if let Some(turn) = split {
+            self.walk_ctx_split(turn, src, gpu, scratch, stream)?;
+        } else {
+            self.ctx_kv_project(
+                gpu,
+                src,
+                n,
+                h,
+                target_hidden_dim as u32,
+                scratch.fc_proj,
+                scratch.fused_kv_out,
+                stream,
+                Some(&dump_buf),
+            )?;
+        }
         // ── Steps 4–8: per-sequence scatter (positions, compaction,
         // k_norm, rope, reshape_and_cache).
         self.ctx_kv_scatter(
@@ -168,7 +180,17 @@ impl BlockDiffusionDraftHead {
         let l_total = self.num_layers;
 
         // Step 1: fc projection [n, L_t*h_t] → [n, h].
-        self.drafter_dense_gemm(gpu, src, &self.fc, fc_dst, n, h, target_hidden_dim, stream)?;
+        self.ctx_projection(
+            gpu,
+            0,
+            &self.fc,
+            src,
+            fc_dst,
+            n,
+            h,
+            target_hidden_dim,
+            stream,
+        )?;
         if let Some(d) = dump {
             d("fc_proj", fc_dst, n as usize * h as usize * bf16)?;
         }
@@ -190,10 +212,11 @@ impl BlockDiffusionDraftHead {
         // Step 3: fused KV GEMM → [n, L * 2 * kv_dim], row layout
         // [K_0 | V_0 | K_1 | V_1 | …].
         let fused_w = DenseWeight { weight: fused_kv };
-        self.drafter_dense_gemm(
+        self.ctx_projection(
             gpu,
-            fc_dst,
+            1,
             &fused_w,
+            fc_dst,
             fused_dst,
             n,
             (l_total as u32) * 2 * kv_dim,
@@ -289,19 +312,23 @@ impl BlockDiffusionDraftHead {
         // py:386–391  `all_kv = all_kv_flat.view(n,L,2,nkv,hd)
         //                          .permute(2,1,0,3,4).contiguous()`
         //              `all_k = all_kv[0]`  → [L, n, nkv, hd] contiguous.
-        // Atlas: copy_d2d row-by-row to build the same [L, n, kv_dim] layout
-        // in mlp_intermediate (borrowed; not used until step 3j of the
-        // γ-block layer loop). Capacity: n_attn × inter × 2 >> L×n×kv_dim×2.
+        // Atlas: one pitched async copy per layer builds the same
+        // [L, n, kv_dim] layout in mlp_intermediate (borrowed; not used until
+        // step 3j of the γ-block layer loop). Capacity: n_attn × inter × 2 >>
+        // L×n×kv_dim×2. It reads the GEMM output from `scratch` — the lane
+        // scratch step 3 wrote — and never syncs the stream (a row-by-row
+        // blocking copy_d2d cost ~20k syncs after a 16K prefill).
         let all_k_stage = scratch.mlp_intermediate;
         for l in 0..l_total {
-            for row in 0..new_ctx_count {
-                let k_src = fused_src.offset(row * row_stride + l * 2 * kv_slab_bytes);
-                let k_dst = all_k_stage.offset((l * new_ctx_count + row) * kv_slab_bytes);
-                // #58: stream-ordered async — downstream k_norm/rope/
-                // reshape_and_cache run on this same stream, so the drain
-                // the sync copy_d2d paid bought nothing.
-                gpu.copy_d2d_async(k_src, k_dst, kv_slab_bytes, stream)?;
-            }
+            gpu.copy_d2d_2d_async(
+                fused_src.offset(l * 2 * kv_slab_bytes),
+                row_stride,
+                all_k_stage.offset(l * new_ctx_count * kv_slab_bytes),
+                kv_slab_bytes,
+                kv_slab_bytes,
+                new_ctx_count,
+                stream,
+            )?;
         }
 
         // ── Step 6: per-layer k_norm ──────────────────────────────────
@@ -365,15 +392,16 @@ impl BlockDiffusionDraftHead {
         for l in 0..l_total {
             let k_l = all_k_stage.offset(l * new_ctx_count * kv_slab_bytes);
 
-            // Compact V_l from the fused GEMM output.
-            for row in 0..new_ctx_count {
-                let v_src =
-                    fused_src.offset(row * row_stride + l * 2 * kv_slab_bytes + kv_slab_bytes);
-                let v_dst = v_stage.offset(row * kv_slab_bytes);
-                // #58: stream-ordered async — reshape_and_cache consumes
-                // v_stage on this same stream.
-                gpu.copy_d2d_async(v_src, v_dst, kv_slab_bytes, stream)?;
-            }
+            // Compact V_l from the fused GEMM output (same pitched copy).
+            gpu.copy_d2d_2d_async(
+                fused_src.offset(l * 2 * kv_slab_bytes + kv_slab_bytes),
+                row_stride,
+                v_stage,
+                kv_slab_bytes,
+                kv_slab_bytes,
+                new_ctx_count,
+                stream,
+            )?;
 
             if dump_opt.is_some() && l == 0 {
                 dump("layer0_v", v_stage, new_ctx_count * kv_slab_bytes)?;

@@ -277,6 +277,7 @@ impl TransformerModel {
                 // forward overwrites the remaining scratch buffers before read.
                 if self.comm.is_some() {
                     self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+                    self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
                 } else if chunk_start == 0 {
                     self.buffers
                         .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
@@ -365,6 +366,7 @@ impl TransformerModel {
                     chunk_len,
                     proc_start,
                     proc_count,
+                    0,
                     effective_seq_len_start,
                     &kv_cache,
                     stream,
@@ -405,6 +407,7 @@ impl TransformerModel {
                     use_mrope,
                     needs_paged,
                     // Batched path does not do mid-chunk tail capture (single-seq only).
+                    None,
                     None,
                     stream,
                 )?;

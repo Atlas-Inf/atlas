@@ -159,11 +159,16 @@ impl WeightLoader for SafetensorsLoader {
         };
 
         // Load extra weight files (e.g. MTP weights grafted from another quantization).
-        // Extra weights (MTP) are always fully loaded — they have their own expert lists.
-        let no_skip = |_: &str| false;
+        // Extra weights keep their own expert lists, but a predictor the caller
+        // explicitly does not build must not be reintroduced by an extra file.
+        let skip_unused = |name: &str| {
+            self.skip_layer_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.starts_with(prefix))
+        };
         let extra = model_dir.join("extra_weights.safetensors");
         if extra.exists() {
-            let extra_weights = load_single(&extra, gpu, oom_reserve_bytes, &no_skip)?;
+            let extra_weights = load_single(&extra, gpu, oom_reserve_bytes, &skip_unused)?;
             tracing::info!(
                 "Loaded {} extra weight tensors from extra_weights.safetensors",
                 extra_weights.len()

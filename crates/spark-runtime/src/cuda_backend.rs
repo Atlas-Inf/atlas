@@ -16,6 +16,7 @@ use atlas_core::registry::AtlasRegistry;
 mod fault_probe;
 mod gpu_copy;
 mod gpu_impl;
+pub use gpu_impl::{configure_pdl, pdl_enabled};
 mod gpu_impl_graph;
 mod host_staging;
 #[cfg(unix)]
@@ -41,6 +42,7 @@ unsafe extern "C" {
     ) -> i32;
     pub(super) fn cuMemcpyDtoDAsync_v2(dst: u64, src: u64, bytes: usize, stream: u64) -> i32;
     pub(super) fn cuStreamSynchronize(stream: u64) -> i32;
+    pub(super) fn cuCtxSynchronize() -> i32;
     pub(super) fn cuStreamQuery(stream: u64) -> i32;
     pub(super) fn cuMemHostGetDevicePointer_v2(
         dptr: *mut u64,
@@ -95,6 +97,7 @@ unsafe extern "C" {
     fn cuCtxGetCurrent(pctx: *mut u64) -> i32;
     pub(super) fn cuCtxSetCurrent(ctx: u64) -> i32;
     pub(super) fn cuStreamCreate(phStream: *mut u64, flags: u32) -> i32;
+    pub(super) fn cuStreamDestroy_v2(hStream: u64) -> i32;
     // Page-locked host memory for efficient async transfers
     pub(super) fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> i32;
     pub(super) fn cuMemFreeHost(p: *mut c_void) -> i32;
@@ -358,6 +361,16 @@ pub fn spawn_oom_watchdog(
     threshold_mb: usize,
     interval: std::time::Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_oom_watchdog_with_exit(threshold_mb, interval, legacy_oom_exit)
+}
+
+/// Preserve the same memory watchdog while an explicitly supervised caller
+/// supplies its nonreturning terminal sink. No threshold or polling override.
+pub fn spawn_oom_watchdog_with_exit(
+    threshold_mb: usize,
+    interval: std::time::Duration,
+    on_oom: fn() -> !,
+) -> Option<tokio::task::JoinHandle<()>> {
     if WATCHDOG_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return None;
     }
@@ -384,8 +397,7 @@ pub fn spawn_oom_watchdog(
                             "OOM watchdog: 3 consecutive readings below threshold. \
                              Terminating to prevent system freeze."
                         );
-                        // Flush logs before exit
-                        std::process::exit(1);
+                        dispatch_oom_exit(on_oom);
                     }
                 } else {
                     consecutive_low = 0;
@@ -393,6 +405,14 @@ pub fn spawn_oom_watchdog(
             }
         }
     }))
+}
+
+fn legacy_oom_exit() -> ! {
+    std::process::exit(1)
+}
+
+fn dispatch_oom_exit(on_oom: fn() -> !) -> ! {
+    on_oom()
 }
 
 #[cfg(test)]

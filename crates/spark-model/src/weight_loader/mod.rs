@@ -16,7 +16,9 @@
 
 pub(crate) mod deepseek_v4;
 pub mod dflash_loader;
+pub mod dflash_preshrink;
 mod gemma4;
+pub(crate) mod glm5;
 mod laguna;
 mod longcat;
 mod minimax;
@@ -36,6 +38,7 @@ pub use dflash_loader::{
     store_has_dflash_weights,
 };
 pub use gemma4::Gemma4WeightLoader;
+pub use glm5::Glm5WeightLoader;
 pub use laguna::LagunaWeightLoader;
 pub use longcat::LongcatWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;

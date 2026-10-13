@@ -9,8 +9,12 @@ use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
+// The three switches below pick the MoE passes of a batched decode step, so
+// its EP reduces: one over every row, one a pair, or one a row. Every rank
+// must run the same values (`model::startup_parity`).
+
 /// Kill-switch for the pairwise batched MoE decode path (`ATLAS_MOE_PAIRWISE_DECODE=0`).
-fn pairwise_moe_decode_enabled() -> bool {
+pub(crate) fn pairwise_moe_decode_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_MOE_PAIRWISE_DECODE").as_deref() != Ok("0"))
@@ -19,12 +23,12 @@ fn pairwise_moe_decode_enabled() -> bool {
 /// Route batched decode MoE (n >= min) through the grouped read-once GEMM
 /// (forward_prefill) instead of the pairwise per-slot loop. Default OFF.
 /// Min default 2: one consistent grouped path for every batched decode size.
-fn grouped_routed_decode_enabled() -> bool {
+pub(crate) fn grouped_routed_decode_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_MOE_GROUPED_ROUTED_DECODE").as_deref() == Ok("1"))
 }
-fn grouped_routed_decode_min() -> usize {
+pub(crate) fn grouped_routed_decode_min() -> usize {
     use std::sync::OnceLock;
     static M: OnceLock<usize> = OnceLock::new();
     *M.get_or_init(|| {

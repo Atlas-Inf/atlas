@@ -114,7 +114,9 @@ impl TransformerModel {
         if seq.chunked_prefill_meta.is_none() {
             seq.chunked_prefill_meta = Some(ChunkedPrefillPageMetadata {
                 block_table: self.gpu.alloc(required_blocks.max(1) * 4)?,
-                seq_len: self.gpu.alloc(std::mem::size_of::<u32>())?,
+                seq_len: self.gpu.alloc(
+                    (1 + crate::layer::PREFILL_MAX_SUB_CHUNKS) * std::mem::size_of::<u32>(),
+                )?,
                 block_capacity: required_blocks,
                 uploaded_blocks: 0,
             });
@@ -153,8 +155,12 @@ impl TransformerModel {
             return Ok(tokens.to_vec());
         }
         let comm = self.comm.as_ref().unwrap();
+        if self.ep_cmd_words_on_host(n) {
+            return self.ep_cmd_words(tokens);
+        }
         let byte_len = n * 4;
         let stream = self.gpu.default_stream();
+        let _transfer = self.warm.transfer_span(); // ATLAS_GLM_WARM_TRACE
 
         // Use scratch buffer as device staging. This is safe because
         // ep_broadcast_tokens is called BEFORE prefill_chunk, which overwrites
@@ -259,10 +265,9 @@ impl TransformerModel {
     /// byte-identical to the legacy single-sequence protocol — head and
     /// worker built before this change continue to interoperate.
     ///
-    /// Both ranks must agree on `v2` at startup (e.g. via the same env
-    /// var). Disagreement causes the worker to misread the next u32 as a
-    /// command code and is the kind of misconfiguration we want to fail
-    /// loudly in development — there's no graceful fallback.
+    /// Both ranks must agree on `v2`: disagreement makes the worker misread
+    /// the next u32 as a command code. `startup_parity` compares it across
+    /// the ranks at startup.
     /// True when the head↔worker command protocol must be live: a
     /// multi-rank NCCL world exists — EP **or** pure TP. Under
     /// `--tp-size 2 --ep-size 1` (GDN HeadParallel 2-node) rank>0 still
@@ -349,23 +354,14 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// Receive a `(seq_id, cmd)` pair from rank 0. Worker-side counterpart
-    /// of [`Self::ep_broadcast_seq_and_cmd`].
-    ///
-    /// With `v2` enabled the returned `seq_id` is the slot the head wants
-    /// the worker to dispatch the command into; with `v2` disabled the
-    /// returned `seq_id` is always 0 (the legacy singleton slot).
-    pub(super) fn ep_recv_seq_and_cmd(&self, v2: bool) -> Result<(u32, u32)> {
-        let seq_id = if v2 { self.ep_broadcast_u32(0)? } else { 0 };
-        let cmd = self.ep_broadcast_u32(0)?;
-        Ok((seq_id, cmd))
-    }
-
     /// Broadcast a u32 command from rank 0 to all ranks.
     /// Rank 0 writes `val` to GPU buffer and broadcasts.
     /// Other ranks receive the value and return it.
     pub(super) fn ep_broadcast_u32(&self, val: u32) -> Result<u32> {
         let comm = self.comm.as_ref().expect("ep_broadcast_u32 without comm");
+        if self.ep_cmd_words_on_host(1) {
+            return Ok(self.ep_cmd_words(&[val])?[0]);
+        }
         let stream = self.gpu.default_stream();
         if comm.rank() == 0 {
             // Sender: H2D + broadcast. Stream ordering ensures completion
@@ -400,6 +396,8 @@ impl TransformerModel {
     /// - 0xFFFFFFF0: prefill start → chunk_len, chunk_start, full_len, then full_len tokens
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
+    /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
+    /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -415,6 +413,9 @@ impl TransformerModel {
         // + tokens off the wire and dispatches the matched compute.
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
+        }
+        if let Some(keep) = self.ep_worker_glm_cmd(seq_id, cmd, slots)? {
+            return Ok(keep);
         }
 
         let slot_idx = seq_id as usize;
@@ -467,10 +468,16 @@ impl TransformerModel {
     /// (seq_id, cmd) preamble + slot lookup + shutdown + alloc are already
     /// handled by the caller; this routine assumes `seq` is the right
     /// slot's allocated `SequenceState`.
-    fn ep_worker_dispatch_cmd(&self, cmd: u32, seq: &mut SequenceState) -> Result<bool> {
+    pub(super) fn ep_worker_dispatch_cmd(&self, cmd: u32, seq: &mut SequenceState) -> Result<bool> {
         let stream = self.gpu.default_stream();
 
         match cmd {
+            super::vision_transport::EP_CMD_VISION_STATE => self.ep_worker_recv_vision_state()?,
+            super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
+            0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
+            super::trait_impl::finish_leaf::EP_CMD_CACHE_SEQUENCE => {
+                self.finish_leaf_cache_command(seq)
+            }
             0xFFFFFFF0 => {
                 // Prefill chunk: receive chunk_len, chunk_start, full prompt length,
                 // then ALL prompt tokens via bulk broadcast (single NCCL op).
@@ -481,6 +488,7 @@ impl TransformerModel {
                 // Compute is_last from chunk bounds — must match rank 0's
                 // value so Marconi skip branches are identical (bug #33).
                 let is_last = chunk_start + chunk_len >= full_len;
+                super::kv_admission::check_worker_chunk_start(seq, chunk_start)?;
                 let _ =
                     self.prefill_chunk(&full_tokens, seq, chunk_start, chunk_len, is_last, stream)?;
                 // Normalize SSM states after every chunk — must mirror the head's
@@ -568,8 +576,13 @@ impl TransformerModel {
                     }
                 }
             }
+            0xFFFFFFF5 => self.ep_worker_generic_verify(seq, stream)?,
             token => {
-                // Regular decode
+                // Regular decode. A verify commit may still be in flight on
+                // the secondary stream: the head orders its decode after it
+                // (`sync_secondary` in the scheduler), which no wire command
+                // carries, so the worker orders its own.
+                self.sync_secondary()?;
                 self.decode(token, seq, stream)?;
             }
         }
@@ -592,6 +605,7 @@ impl TransformerModel {
     /// payload from a buggy head fails before touching slot state.
     fn ep_worker_decode_batch(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let n = self.ep_broadcast_u32(0)? as usize;
+        self.ep_worker_check_independent_width(n, slots)?;
         let seq_ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
         let tokens = self.ep_broadcast_tokens(&vec![0u32; n])?;
 
@@ -638,7 +652,9 @@ impl TransformerModel {
         }
 
         let stream = self.gpu.default_stream();
+        self.sync_secondary()?; // as for the single-token decode above
         self.decode_batch_compute_main(&tokens, &mut refs, stream)?;
+        refs.iter().for_each(|s| self.finish_leaf_after_decode(s));
         Ok(true)
     }
 }

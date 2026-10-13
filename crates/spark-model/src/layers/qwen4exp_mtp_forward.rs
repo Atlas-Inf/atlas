@@ -147,6 +147,7 @@ impl Qwen4ExpMtpHead {
         }
 
         let mtp_ctx = ForwardContext {
+            ssm_batch: None,
             buffers: ctx.buffers,
             gpu: ctx.gpu,
             config: ctx.config,

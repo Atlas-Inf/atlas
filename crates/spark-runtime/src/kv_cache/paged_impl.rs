@@ -13,6 +13,18 @@ use crate::gpu::{DevicePtr, GpuBackend};
 impl PagedKvCache {
     /// Allocate the KV cache pool on the GPU.
     pub fn new(config: KvCacheConfig, num_blocks: usize, gpu: &dyn GpuBackend) -> Result<Self> {
+        Self::new_with_v_alias(config, num_blocks, gpu, false)
+    }
+
+    /// [`Self::new`], optionally with every layer's V side aliasing its K
+    /// storage: for caches whose writers store one latent on both sides
+    /// (GLM-5 NoPE MLA), which halves the pool.
+    pub fn new_with_v_alias(
+        config: KvCacheConfig,
+        num_blocks: usize,
+        gpu: &dyn GpuBackend,
+        v_aliases_k: bool,
+    ) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_layers);
         let mut total_bytes: usize = 0;
         for i in 0..config.num_layers {
@@ -21,32 +33,38 @@ impl PagedKvCache {
             // and the V pool is allocated turbo3-sized — avoids the 4× V over-
             // allocation that would result from a single MAX-sized stride.
             let k_block_bytes = config.k_block_bytes_for_layer(i);
-            let v_block_bytes = config.v_block_bytes_for_layer(i);
             let k_pool_bytes = num_blocks * k_block_bytes;
-            let v_pool_bytes = num_blocks * v_block_bytes;
-            // A failed alloc frees the pools this call already claimed, so a
-            // caller can release memory and retry (build_model's reserve
-            // balloon fallback) without the first attempt's layers leaking.
+            // Preserve allocation-failure rollback for both ordinary K/V pools
+            // and GLM's shared latent pool. An alias owns only one allocation.
             let release = |layers: &[LayerPool]| {
-                for l in layers {
-                    let _ = gpu.free(l.k_pool);
-                    let _ = gpu.free(l.v_pool);
+                for layer in layers {
+                    let _ = gpu.free(layer.k_pool);
+                    if layer.v_pool != layer.k_pool {
+                        let _ = gpu.free(layer.v_pool);
+                    }
                 }
             };
             let k_pool = match gpu.alloc(k_pool_bytes) {
-                Ok(p) => p,
-                Err(e) => {
+                Ok(ptr) => ptr,
+                Err(error) => {
                     release(&layers);
-                    return Err(e);
+                    return Err(error);
                 }
             };
-            let v_pool = match gpu.alloc(v_pool_bytes) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = gpu.free(k_pool);
-                    release(&layers);
-                    return Err(e);
-                }
+            let (v_pool, v_block_bytes, v_pool_bytes) = if v_aliases_k {
+                (k_pool, k_block_bytes, 0)
+            } else {
+                let v_block_bytes = config.v_block_bytes_for_layer(i);
+                let v_pool_bytes = num_blocks * v_block_bytes;
+                let v_pool = match gpu.alloc(v_pool_bytes) {
+                    Ok(ptr) => ptr,
+                    Err(error) => {
+                        let _ = gpu.free(k_pool);
+                        release(&layers);
+                        return Err(error);
+                    }
+                };
+                (v_pool, v_block_bytes, v_pool_bytes)
             };
             total_bytes += k_pool_bytes + v_pool_bytes;
             layers.push(LayerPool {
@@ -55,6 +73,12 @@ impl PagedKvCache {
                 k_block_stride: k_block_bytes,
                 v_block_stride: v_block_bytes,
                 dtype: config.dtype_for_layer(i),
+                sparse_index_values: DevicePtr::NULL,
+                sparse_index_scales: DevicePtr::NULL,
+                sparse_index_tail: DevicePtr::NULL,
+                sparse_index_values_block_stride: 0,
+                sparse_index_scales_block_stride: 0,
+                sparse_index_tail_block_stride: 0,
             });
         }
 
@@ -78,12 +102,11 @@ impl PagedKvCache {
             );
         } else {
             tracing::info!(
-                "KV cache: {} blocks × {} layers × {} bytes/block = {:.1} GB total",
+                "KV cache: {} blocks × {} layers = {:.1} GB total{}",
                 num_blocks,
                 config.num_layers,
-                config.block_bytes_kv(),
-                (num_blocks * config.num_layers * config.block_bytes_kv()) as f64
-                    / (1024.0 * 1024.0 * 1024.0),
+                total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                if v_aliases_k { " (V aliases K)" } else { "" },
             );
         }
 
@@ -93,6 +116,8 @@ impl PagedKvCache {
             free_blocks,
             block_ref_counts,
             config,
+            sparse_index_config: None,
+            tail_slots: None,
             trace: BlockTrace::new(num_blocks),
         })
     }
@@ -110,34 +135,6 @@ impl PagedKvCache {
                 .record(idx as usize, "alloc", 1, std::panic::Location::caller());
         }
         Ok(idx)
-    }
-
-    /// Zero all KV data in a block across all layers.
-    /// Prevents stale KV data from previous sequences from leaking into
-    /// new sequences via paged attention reads beyond the current seq_len.
-    pub fn zero_block(
-        &self,
-        block_idx: u32,
-        gpu: &dyn crate::gpu::GpuBackend,
-        stream: u64,
-    ) -> anyhow::Result<()> {
-        for layer in &self.layers {
-            let k_offset = block_idx as usize * layer.k_block_stride;
-            let v_offset = block_idx as usize * layer.v_block_stride;
-            gpu.memset_async(
-                layer.k_pool.offset(k_offset),
-                0,
-                layer.k_block_stride,
-                stream,
-            )?;
-            gpu.memset_async(
-                layer.v_pool.offset(v_offset),
-                0,
-                layer.v_block_stride,
-                stream,
-            )?;
-        }
-        Ok(())
     }
 
     /// DIAGNOSTIC (ATLAS_KV_POISON): fill a freshly-allocated block with 0xFF
@@ -236,6 +233,7 @@ impl PagedKvCache {
         }
         if self.block_ref_counts[idx] == 0 {
             self.free_blocks.push(block_idx);
+            self.release_tail_slot_if_freed(block_idx);
             true
         } else {
             false
@@ -253,6 +251,15 @@ impl PagedKvCache {
     pub fn free_blocks(&mut self, block_table: &[u32]) {
         for &idx in block_table {
             self.free_block(idx);
+            // A departing sequence never reads these raw index tails again. A
+            // block that outlives it is one the prefix cache published: a
+            // whole block of committed tokens, whose pools are finalized, and
+            // which no holder appends to (a snapshot replay over it needs no
+            // tail: the kernel skips the block). So the tail returns to the
+            // pool now instead of when the cache finally evicts the block.
+            if let Some(tails) = self.tail_slots.as_mut() {
+                tails.release(idx);
+            }
         }
     }
 
@@ -278,9 +285,7 @@ impl PagedKvCache {
         // entry and two subsequent `alloc_block`s hand the SAME physical block to
         // two sequences: they interleave writes into each other's KV, and when
         // both later free it the second `dec_ref` underflows. That is reachable
-        // whenever the cache returns a block it never took a ref on — notably a
-        // `partial_suffix` block, which `insert` stores but `cache_sequence`
-        // never `inc_ref`s, and which `evict` nevertheless hands back.
+        // whenever the cache returns a block it never took a ref on.
         if self.block_ref_counts[idx] == 0 {
             tracing::warn!(
                 "return_evicted_block({block_idx}) with 0 refs (from {}) — the prefix cache \
@@ -303,6 +308,7 @@ impl PagedKvCache {
         }
         if self.block_ref_counts[idx] == 0 {
             self.free_blocks.push(idx as u32);
+            self.release_tail_slot_if_freed(block_idx);
         }
     }
 

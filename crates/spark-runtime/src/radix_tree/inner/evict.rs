@@ -51,13 +51,6 @@ impl RadixTreeInner {
                     freed_phys.push(block);
                     freed_disk.push(disk);
 
-                    if let Some((_, partial_block, partial_disk)) =
-                        self.nodes[node_id].partial_suffix.take()
-                    {
-                        freed_phys.push(partial_block);
-                        freed_disk.push(partial_disk);
-                    }
-
                     if let Some(parent_id) = self.nodes[node_id].parent
                         && let Some(key) = self.nodes[node_id].parent_key.clone()
                     {
@@ -69,7 +62,6 @@ impl RadixTreeInner {
                     self.nodes[node_id].children.clear();
                     self.nodes[node_id].parent = None;
                     self.nodes[node_id].parent_key = None;
-                    self.nodes[node_id].partial_suffix = None;
                     self.free_nodes.push(node_id);
                 }
                 None => break,

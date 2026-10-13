@@ -20,22 +20,14 @@ use crate::layer::{ForwardContext, LayerState, SsmLayerState};
 use crate::layers::ops;
 use crate::traits::{Model, SequenceState};
 
+mod glm;
+
 /// Route the BF16 lm_head decode through the batched GEMV (dense_gemv_bf16_batchm)
 /// instead of the scalar dense_gemm_bf16. Default ON. Mirrors PR #332's
 /// ATLAS_LMHEAD_BATCH_GEMV for the NVFP4 head; this is the BF16 sibling.
 fn lmhead_batch_gemv_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_LMHEAD_BATCH_GEMV").ok().as_deref() != Some("0"))
-}
-
-/// Multi-seq decode CUDA graphs: **ON by default**, disabled by
-/// `ATLAS_NO_DECODE_GRAPHS_MULTISEQ=1`.
-///
-/// Strict `== "1"` on an `ATLAS_NO_*` name rather than a presence check —
-/// presence-checked flags here are ENABLED by `=0`. Read once per process.
-fn multiseq_graphs_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_NO_DECODE_GRAPHS_MULTISEQ").as_deref() != Ok("1"))
 }
 
 impl TransformerModel {
@@ -46,6 +38,7 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        self.glm_dispatch_guard(tokens, seqs)?;
         assert_eq!(n, seqs.len(), "tokens.len() must equal seqs.len()");
         // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly
         // once, HERE — outside the CUDA-graph region. No-op without the flag.
@@ -196,6 +189,7 @@ impl TransformerModel {
         _stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        let (independent_lane, c4_lane) = self.glm_decode_lanes(tokens, seqs, n)?;
         // SOLID Incr-4 pre-lookup guard (the bail `forward_batched.rs` and
         // `build_moe_row_adapter_decode` document): a batch with a row routed
         // to a NON-active adapter cannot be served by the single-active fold —
@@ -237,9 +231,8 @@ impl TransformerModel {
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
-        // Pad to the nearest captured graph size — SSOT ladder in
-        // `traits::padded_batch_n` (now includes 12 and 16 for the C-sweep).
-        let padded_n = crate::traits::padded_batch_n(n);
+        // Pad to the captured graph size (exact protocol width on GLM-5 EP).
+        let (padded_n, ssm_batch) = self.glm_padded_batch(seqs, n, stream)?;
 
         // CUDA graphs for multi-sequence decode (ATLAS_DECODE_GRAPHS_MULTISEQ=1).
         //
@@ -253,25 +246,34 @@ impl TransformerModel {
         // DEFAULT-ON since 2026-07-27; disable with
         // ATLAS_NO_DECODE_GRAPHS_MULTISEQ=1. Measurements + the rewrite this
         // retired: `decode_graph_key.rs`.
-        let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
+        let ms_profile = crate::model::graph_flags::ms_profile();
         // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
         // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        // Per-layer graph veto (QSA's mid-decode top-k D2H, PLE's per-seq
-        // host hash on the hc multi-seq path) — the single-decode path
-        // consults it (decode_a `layer_veto`); the batched path must too, or
-        // capture hits 'PLE: un-prestaged forward inside CUDA graph capture'
-        // on the first joint hc step.
+        // Host-maintained QSA/PLE state cannot advance under graph replay.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
-        let graph_key = if !ms_profile && !lora_eager && !layer_veto && multiseq_graphs_enabled() {
+        let (glm_dynamic, glm_graphs_ok) = self.glm_multiseq_graph_gate()?;
+        let graph_key = if glm_graphs_ok
+            && !ms_profile
+            && !lora_eager
+            && !layer_veto
+            && crate::model::graph_flags::multiseq_graphs_enabled()
+        {
             self.batch_decode_graph_key(&*seqs, padded_n)
         } else {
             None
         };
         let use_graphs = graph_key.is_some();
+        self.validate_multiseq_graph_ops(padded_n, use_graphs)?;
 
         // Lock order: kv_cache BEFORE the graph cache, matching verify_e.
         let mut kv_cache = self.kv_cache.lock();
+        if c4_lane || independent_lane {
+            self.validate_glm_c4_kv(&kv_cache, seqs)?;
+        }
+        if glm_dynamic {
+            self.validate_glm_dynamic_step(&kv_cache, seqs, n, padded_n)?;
+        }
 
         // ── Phase 2 (decision): exact CUDA-graph hit, or drain-tail borrow ──
         let mut graphs = if use_graphs {
@@ -296,6 +298,7 @@ impl TransformerModel {
                 e.1 = tick;
                 replay = Some(e.0);
             } else if super::graph_borrow::graph_borrow_enabled()
+                && !glm_dynamic
                 && self.comm.is_none()
                 && self.config.num_ssm_layers() > 0
             {
@@ -357,6 +360,7 @@ impl TransformerModel {
         let metadata = self.upload_batch_metadata_fixed(seqs, dispatch_n, &mut kv_cache, stream)?;
 
         let ctx = ForwardContext {
+            ssm_batch,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -448,6 +452,7 @@ impl TransformerModel {
                             h_state_checkpoint: None,
                             conv_state_checkpoint: None,
                             h_state_intermediates: Vec::new(),
+                            kda_records: spark_runtime::gpu::DevicePtr::NULL,
                             conv_state_intermediates: Vec::new(),
                             gdn_commit_qkv: DevicePtr(0),
                             gdn_commit_gb: DevicePtr(0),

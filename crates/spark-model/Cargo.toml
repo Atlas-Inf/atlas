@@ -31,7 +31,7 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 # no-GPU CI `cargo test --workspace` skips building them (they link CUDA
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
 # CI runner). Build on a real GPU host with `--features gpu-examples`.
-gpu-examples = []
+gpu-examples = ["dep:safetensors"]
 
 [dependencies]
 atlas-core = { workspace = true }
@@ -48,13 +48,14 @@ spark-storage = { path = "../spark-storage", default-features = false }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tracing = "0.1"
 half = "2"
 base64 = "0.22"
 # `gif` carries the video path: it is the one genuinely multi-frame container
 # decodable in pure Rust with no system dependency, so the whole temporal
 # pipeline can be proven before committing to an H.264 decoder.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
 parking_lot = { workspace = true }
 
 # Used by the `metal_qwen35_inference` example only — gated by

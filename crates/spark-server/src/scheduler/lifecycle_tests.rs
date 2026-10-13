@@ -20,6 +20,8 @@ use spark_model::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
 use std::time::Instant;
 
+mod call_site;
+
 pub(super) const EOS: &[u32] = &[151645];
 pub(super) const TOOL_END: Option<u32> = Some(151658);
 pub(super) const MAX_SEQ_LEN: usize = 8192;
@@ -33,6 +35,23 @@ thread_local! {
     /// one): `StubModel::compact_sequence` refuses them like the real pool.
     pub(super) static HELD_SLOTS: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// `StubModel::commit_accepted_prefix` calls on this thread, as
+    /// `(seq.tokens.len(), num_accepted, k)`.
+    pub(super) static COMMITS: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The picks `StubModel`'s verify entry points return on this thread
+    /// (empty: they fail, as before).
+    pub(super) static VERIFY_PICKS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A scripted verify: like the real one, the verified rows join the sequence.
+fn scripted_verify<const K: usize>(t: &[u32], s: &mut SequenceState) -> Result<[u32; K]> {
+    let picks = VERIFY_PICKS.with(|p| p.borrow().clone());
+    anyhow::ensure!(picks.len() == t.len(), "unused in lifecycle tests");
+    s.tokens.extend_from_slice(t);
+    s.seq_len += t.len();
+    Ok(std::array::from_fn(|i| picks[i]))
 }
 
 /// Common-case shorthand: mid-context position (no seqlen ceiling), so
@@ -239,27 +258,27 @@ impl Model for StubModel {
     }
     fn decode_verify_graphed(
         &self,
-        _t: &[u32; 2],
-        _s: &mut SequenceState,
+        t: &[u32; 2],
+        s: &mut SequenceState,
         _st: u64,
     ) -> Result<[u32; 2]> {
-        anyhow::bail!("unused in lifecycle tests")
+        scripted_verify(t, s)
     }
     fn decode_verify_graphed_k3(
         &self,
-        _t: &[u32; 3],
-        _s: &mut SequenceState,
+        t: &[u32; 3],
+        s: &mut SequenceState,
         _st: u64,
     ) -> Result<[u32; 3]> {
-        anyhow::bail!("unused in lifecycle tests")
+        scripted_verify(t, s)
     }
     fn decode_verify_graphed_k4(
         &self,
-        _t: &[u32; 4],
-        _s: &mut SequenceState,
+        t: &[u32; 4],
+        s: &mut SequenceState,
         _st: u64,
     ) -> Result<[u32; 4]> {
-        anyhow::bail!("unused in lifecycle tests")
+        scripted_verify(t, s)
     }
     fn run_mtp_propose(
         &self,
@@ -339,6 +358,10 @@ impl Model for StubModel {
     }
     fn detach_slot_for_reuse(&self, _s: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _i: usize, _st: u64) -> Result<()> {
+        Ok(())
+    }
+    fn commit_accepted_prefix(&self, s: &mut SequenceState, n: usize, k: usize) -> Result<()> {
+        COMMITS.with(|c| c.borrow_mut().push((s.tokens.len(), n, k)));
         Ok(())
     }
 }
@@ -448,47 +471,4 @@ pub(super) fn finish_and_recv(mut a: ActiveSeq, mut rx: RespRx) -> InferenceResp
     rx.try_recv()
         .expect("finish_sequence must send the blocking response")
         .expect("response must be Ok")
-}
-
-#[test]
-fn call_site_passes_the_real_budget() {
-    // Budget exhausted ⇒ "length". Red if finish_sequence stops passing
-    // `a.remaining` (e.g. a constant, or the decoy `min_tokens` = 7).
-    let (a, rx) = test_seq(vec![5, 6, 42], 0, None, 10);
-    assert_eq!(finish_and_recv(a, rx).finish_reason, "length");
-    // Budget left ⇒ NOT "length" (same decoy: min_tokens=7 ≠ remaining).
-    let (a, rx) = test_seq(vec![5, 6, 42], 7, None, 10);
-    assert_eq!(finish_and_recv(a, rx).finish_reason, "stop");
-}
-
-#[test]
-fn call_site_passes_the_real_seq_len() {
-    // Context-ceiling stop with budget left ⇒ "length". Red if the
-    // call site stops passing `a.seq.seq_len` / the served ceiling.
-    let (a, rx) = test_seq(vec![5, 6, 42], 500, None, MAX_SEQ_LEN - 1);
-    assert_eq!(finish_and_recv(a, rx).finish_reason, "length");
-}
-
-#[test]
-fn call_site_passes_the_real_last_token_and_eos() {
-    // Red if the call site stops passing `output_tokens.last()` or
-    // `a.eos_tokens`.
-    let (a, rx) = test_seq(vec![5, 6, 151645], 0, None, 10);
-    assert_eq!(finish_and_recv(a, rx).finish_reason, "stop");
-    let (a, rx) = test_seq(vec![5, 6, 151658], 3, None, 10);
-    assert_eq!(finish_and_recv(a, rx).finish_reason, "tool_calls");
-}
-
-#[test]
-fn call_site_passes_the_real_guard() {
-    // Timeout is the one guard with a distinct wire reason — proves
-    // `a.guard_stop` reaches the decision.
-    let (a, rx) = test_seq(vec![5, 6, 42], 3, Some(GUARD_STOP_REQUEST_TIMEOUT), 10);
-    assert_eq!(finish_and_recv(a, rx).finish_reason, FINISH_REASON_TIMEOUT);
-    // And a degeneration guard reaches the response as "length" — the
-    // truncation signal. Asserted at the CALL SITE, not just over the pure
-    // function, because that is where the wire value the client actually
-    // receives is decided.
-    let (a, rx) = test_seq(vec![5, 6, 42], 3, Some("fuzzy_repetition"), 10);
-    assert_eq!(finish_and_recv(a, rx).finish_reason, "length");
 }

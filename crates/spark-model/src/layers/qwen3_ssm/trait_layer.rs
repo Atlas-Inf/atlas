@@ -190,6 +190,24 @@ impl TransformerLayer for Qwen3SsmLayer {
         if self.hc.is_none() || self.ffn.is_dense() {
             return None;
         }
+        // The ceiling this returns is already tunable: `ATLAS_MTP_MAX_DRAFTS`
+        // below (default 1 = two verify rows) lifts it without a rebuild, and
+        // the scheduler's own `--num-drafts` / `ATLAS_MTP_K_LADDER` decide how
+        // many drafts are actually proposed. So the only thing that ever made
+        // K>=4 unreachable was the MoE arm refusing the width — see
+        // `trait_decode_batched_hc`, which now routes K=4..8 through
+        // `forward_batched` instead of bailing. A verify error there finishes
+        // the request, so the previous refusal silently truncated answers
+        // rather than merely speculating less.
+        //
+        // Everything below this line was measured on ONE GB10 with 256-TOKEN
+        // COMPLETIONS. That regime is where the ceiling came from: `fwd` grows
+        // +29.78 ms from K=2 to K=3 there, out of a 786.9 us/layer verify, and
+        // that growth is what made K=3 lose. At long context the forward
+        // instead measures flat in row count (`fwd` ~= 106 ms at both 3 and 12
+        // rows), so the row penalty that decided that comparison is the part
+        // least likely to transfer. Re-measure on the target workload before
+        // treating any of it as a recommendation.
         // ONE draft (K=2 verify rows), not two. Two reasons, both measured on
         // one GB10 with 256-token completions, agg tok/s:
         //

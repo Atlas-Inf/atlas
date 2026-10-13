@@ -75,6 +75,18 @@ mod error_dedup_tests {
 }
 
 #[cfg(test)]
+mod glm5_video_metadata_tests {
+    use super::super::checked_glm5_video_timestamps;
+
+    #[test]
+    fn timestamp_group_mismatch_is_rejected() {
+        let err = checked_glm5_video_timestamps(vec![0.0], 2)
+            .expect_err("metadata must cover every temporal group");
+        assert!(err.contains("1 timestamps for 2 temporal groups"));
+    }
+}
+
+#[cfg(test)]
 mod vacuous_system_tests {
     use super::super::is_vacuous_system_content;
 

@@ -20,6 +20,7 @@ impl BlockDiffusionDraftHead {
         &self,
         batch_size: u32,
         last_tokens: &[u32],
+        has_end_ban: bool,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -38,7 +39,8 @@ impl BlockDiffusionDraftHead {
                 )
             })?;
         anyhow::ensure!(
-            self.batch_dflash2_projected != DevicePtr::NULL,
+            self.batch_dflash2_projected != DevicePtr::NULL
+                && self.batch_dflash2_selector_scratch != DevicePtr::NULL,
             "DFlash batched selector scratch is null"
         );
         anyhow::ensure!(
@@ -75,11 +77,7 @@ impl BlockDiffusionDraftHead {
             .checked_mul(selector.rank)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash selector projected stride overflow"))?;
-        if super::small_m_gemm::use_small_m_gemv(
-            super::small_m_gemm::small_m_gemv_enabled(),
-            self.kernels.dense_gemv_batchm.0 != 0,
-            gamma,
-        ) {
+        if self.kernels.small_m_gemv || self.drafter_cublas {
             for sequence in 0..batch_size as usize {
                 self.drafter_dense_gemm(
                     ctx.gpu,
@@ -112,7 +110,10 @@ impl BlockDiffusionDraftHead {
         // shares one `df2_selector_body` with the single-seq entry, and
         // `batch_markov_prev` (the prologue's last_tokens upload) carries
         // the same values passed scalar below. Fallback = per-seq loop.
-        if self.kernels.dflash2_candidate_selector_batched.0 != 0 {
+        if self.kernels.dflash2_candidate_selector_batched.0 != 0
+            && !self.startup.diagnostics.draft_conf
+            && !has_end_ban
+        {
             return ops::dflash2_candidate_selector_batched(
                 ctx.gpu,
                 self.kernels.dflash2_candidate_selector_batched,
@@ -134,9 +135,10 @@ impl BlockDiffusionDraftHead {
             .checked_mul(vocab as usize)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash selector logits stride overflow"))?;
-        let seq_token_bytes = (gamma as usize)
-            .checked_mul(4)
-            .ok_or_else(|| anyhow::anyhow!("DFlash selector token stride overflow"))?;
+        let seq_token_bytes = self.draft_record_bytes();
+        // Anchors and min_tokens ban depths were uploaded beside each other
+        // in batch_markov_prev (`batch_ban_depth`).
+        let end_ids = crate::traits::EosBan::model_end_ids();
         for sequence in 0..batch_size as usize {
             ops::dflash2_candidate_selector(
                 ctx.gpu,
@@ -147,11 +149,14 @@ impl BlockDiffusionDraftHead {
                 selector.predecessor_codebook.weight,
                 selector.successor_codebook.weight,
                 self.batch_tokens.offset(sequence * seq_token_bytes),
-                last_tokens[sequence],
+                self.batch_markov_prev.offset(sequence * 4),
+                self.batch_ban_depth().offset(sequence * 4),
+                end_ids,
                 gamma,
                 vocab,
                 rank,
                 selector.top_k as u32,
+                self.batch_dflash2_selector_scratch,
                 stream,
             )?;
         }

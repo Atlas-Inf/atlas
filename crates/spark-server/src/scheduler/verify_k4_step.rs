@@ -93,6 +93,9 @@ pub fn step_verify_k4(
             }
         }
     };
+    sched
+        .timing
+        .record(crate::scheduler::mtp_timing::Phase::VerifyForward, t_verify);
     let verify_us = t_verify.elapsed().as_micros();
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax, v2_argmax, v3_argmax) =
@@ -101,7 +104,7 @@ pub fn step_verify_k4(
     let (v0, v1, v2, v3) = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
-        model.is_lightning_dspark_product(),
+        model,
         a,
     ) {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD)

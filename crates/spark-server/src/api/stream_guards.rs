@@ -19,6 +19,16 @@
 
 use crate::tool_parser;
 
+/// Return whether an explicit request-level minimum generation floor has
+/// been reached.  Loop detectors are output-quality heuristics; they must not
+/// turn a request asking for at least `min_tokens` into a shorter response.
+/// Safety guards (cancellation, deadlines, OOM handling, and EOS policy) do
+/// not use this predicate and remain effective below the floor.
+#[inline]
+pub fn watchdog_floor_reached(generated_tokens: usize, min_tokens: usize) -> bool {
+    generated_tokens >= min_tokens
+}
+
 /// Bump the per-response tool-call counter and trip
 /// `stop_string_triggered` when the cap is exceeded. Catches
 /// pathological responses emitting dozens of tool calls. Default
@@ -261,5 +271,36 @@ mod tests {
             "buffer should self-trim, got {}",
             buf.len()
         );
+    }
+
+    #[test]
+    fn watchdog_floor_honors_explicit_min_tokens() {
+        assert!(watchdog_floor_reached(0, 0));
+        assert!(!watchdog_floor_reached(281, 400));
+        assert!(watchdog_floor_reached(400, 400));
+        assert!(watchdog_floor_reached(401, 400));
+    }
+
+    #[test]
+    fn quality_watchdog_does_not_fire_before_request_floor() {
+        let line = "Running cargo test on the project\n";
+        let mut buf = String::new();
+
+        // This mirrors the stream caller's gate: detector state must not be
+        // advanced while the request still requires more output. The former
+        // path could stop a response at 281 tokens despite min_tokens=400.
+        for _ in 0..4 {
+            if watchdog_floor_reached(281, 400) {
+                assert!(check_loop_watchdog(line, &mut buf, false));
+            }
+        }
+        assert!(buf.is_empty());
+
+        // Once the floor is reached, the existing heuristic remains active.
+        assert!(watchdog_floor_reached(400, 400));
+        assert!(!check_loop_watchdog(line, &mut buf, false));
+        assert!(!check_loop_watchdog(line, &mut buf, false));
+        assert!(!check_loop_watchdog(line, &mut buf, false));
+        assert!(check_loop_watchdog(line, &mut buf, false));
     }
 }

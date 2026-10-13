@@ -32,7 +32,7 @@ impl TransformerModel {
         &self,
         slots: &mut [Option<SequenceState>],
     ) -> Result<bool> {
-        self.ep_worker_step_impl(slots)
+        super::super::kv_admission::worker_step_outcome(self.ep_worker_step_impl(slots))
     }
 
     pub(super) fn is_ep_dispatch(&self) -> bool {

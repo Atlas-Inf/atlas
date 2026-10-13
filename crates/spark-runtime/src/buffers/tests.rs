@@ -183,3 +183,14 @@ fn test_buffer_sizes_decode_meta_widening() {
     let max_blocks = 4096 / 16 + 1;
     assert!(s128.scratch >= 32768 + 24 * 128 + 128 * max_blocks * 4);
 }
+
+#[test]
+fn glm_kda_skips_gdn_scratch() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    assert!(BufferSizes::from_config(&cfg, 64, 4096, 16, 4).gdn_fla_scratch > 0);
+    cfg.model_type = "glm5_next".into();
+    assert_eq!(
+        BufferSizes::from_config(&cfg, 64, 4096, 16, 4).gdn_fla_scratch,
+        0
+    );
+}

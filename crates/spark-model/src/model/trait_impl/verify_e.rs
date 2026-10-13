@@ -500,6 +500,7 @@ impl TransformerModel {
             }
 
             let ctx = ForwardContext {
+                ssm_batch: None,
                 buffers: &self.buffers,
                 gpu: self.gpu.as_ref(),
                 config: &self.config,

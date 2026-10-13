@@ -35,11 +35,6 @@ impl MoeLayer {
         // for all three projections. Only fires when ATLAS_UNIFIED_MOE_LAYOUT=1
         // AND the weight loader has built persistent transposed copies for
         // gate / up / down (no lazy-scratch path).
-        let gate_t = self
-            .gate_ptrs_t
-            .as_ref()
-            .expect("gate_ptrs_t under unified_t");
-        let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
         let down_t = self
             .down_ptrs_t
             .as_ref()
@@ -55,32 +50,50 @@ impl MoeLayer {
                 "decode fused _e8m0 kernel assumes an NVFP4 shared expert",
             );
         }
-        ops::moe_expert_gate_up_shared_t(
-            ctx.gpu,
-            self.e8m0_or(
-                self.moe_expert_gate_up_shared_t_k,
-                self.moe_expert_gate_up_shared_t_e8m0_k,
-                "decode gate_up_shared_t (unified_t)",
-            ),
-            expert_input,
-            gate_t.packed_ptrs,
-            gate_t.scale_ptrs,
-            gate_t.scale2_vals,
-            expert_gate_out,
-            up_t.packed_ptrs,
-            up_t.scale_ptrs,
-            up_t.scale2_vals,
-            expert_up_out,
-            indices_dev,
-            sh_gate_t,
-            shared_gate_scratch,
-            sh_up_t,
-            shared_up_scratch,
-            inter,
-            h,
-            top_k,
-            stream,
-        )?;
+        if self.btile_storage.is_published() {
+            self.dispatch_btile_decode(
+                ctx,
+                expert_input,
+                expert_gate_out,
+                expert_up_out,
+                indices_dev,
+                Some((shared_gate_scratch, shared_up_scratch)),
+                1,
+                stream,
+            )?;
+        } else {
+            let gate_t = self
+                .gate_ptrs_t
+                .as_ref()
+                .expect("gate_ptrs_t under unified_t");
+            let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
+            ops::moe_expert_gate_up_shared_t(
+                ctx.gpu,
+                self.e8m0_or(
+                    self.moe_expert_gate_up_shared_t_k,
+                    self.moe_expert_gate_up_shared_t_e8m0_k,
+                    "decode gate_up_shared_t (unified_t)",
+                ),
+                expert_input,
+                gate_t.packed_ptrs,
+                gate_t.scale_ptrs,
+                gate_t.scale2_vals,
+                expert_gate_out,
+                up_t.packed_ptrs,
+                up_t.scale_ptrs,
+                up_t.scale2_vals,
+                expert_up_out,
+                indices_dev,
+                sh_gate_t,
+                shared_gate_scratch,
+                sh_up_t,
+                shared_up_scratch,
+                inter,
+                h,
+                top_k,
+                stream,
+            )?;
+        }
         // Feature-1: fold routed-expert gate/up_proj deltas onto the slot-major
         // `expert_gate_out`/`expert_up_out` BEFORE the fused silu+down consumes
         // them (x = `expert_input`, no recompute). No-op unless gate/up deltas are

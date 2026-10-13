@@ -430,7 +430,10 @@ impl BufferSizes {
             0
         };
 
+        // GDN (qwen3_ssm) only: GLM-5's KDA layers share the 128-dim heads but
+        // never read this scratch.
         let gdn_fla_scratch = if config.linear_num_value_heads > 0
+            && config.model_type != "glm5_next"
             && config.linear_key_head_dim == 128
             && config.linear_value_head_dim == 128
         {

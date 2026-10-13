@@ -456,15 +456,15 @@ impl Qwen3AttentionLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let hc = self.hc.as_ref().unwrap();
         let hc_mult = hc.hc_mult as u32;
-        // MODEL layer indices, carried on the weights. `attn_layer_idx`
-        // counts ATTENTION layers: it coincides with the model index only on
-        // an all-attention model like DeepSeek-V4. On a 3:1 GDN:attention
-        // interleave `attn_layer_idx == 0` is model layer 3 (the highway
-        // would seed three layers late) and `attn_layer_idx + 1 ==
-        // num_hidden_layers` is `12 == 48` (hc_head would never fire, and on
-        // Qwen the mixer IS the final norm).
-        let is_first_layer = hc.is_first_model_layer;
-        let is_last_layer = hc.is_last_model_layer;
+        // GLM carries its physical block index; upstream mixed models carry model indices.
+        let (is_first_layer, is_last_layer) = if ctx.config.model_type == "glm5_next" {
+            (
+                self.block_idx == 0,
+                self.block_idx + 1 == ctx.config.num_hidden_layers,
+            )
+        } else {
+            (hc.is_first_model_layer, hc.is_last_model_layer)
+        };
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
@@ -636,6 +636,17 @@ impl Qwen3AttentionLayer {
                     eps,
                     stream,
                 )?;
+            } else if is_last_layer && ctx.config.model_type == "glm5_next" {
+                ops::hc_contract(
+                    ctx.gpu,
+                    self.hc_contract_k,
+                    hc_streams,
+                    hidden,
+                    1,
+                    h as u32,
+                    hc_mult,
+                    stream,
+                )?;
             }
             return Ok(());
         }
@@ -805,6 +816,17 @@ impl Qwen3AttentionLayer {
                     &format!("V4-decode L{} hc_head", self.attn_layer_idx),
                 );
             }
+        } else if is_last_layer && ctx.config.model_type == "glm5_next" {
+            ops::hc_contract(
+                ctx.gpu,
+                self.hc_contract_k,
+                hc_streams,
+                hidden,
+                1,
+                h as u32,
+                hc_mult,
+                stream,
+            )?;
         } else if is_last_layer {
             tracing::warn!(
                 "V4-decode L{}: hc_head SKIPPED (no head weights)",

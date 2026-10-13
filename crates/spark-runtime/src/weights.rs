@@ -381,6 +381,12 @@ pub struct SafetensorsLoader {
     pub ep_world_size: usize,
     /// Total number of MoE experts in the model (for EP partitioning).
     pub num_experts: usize,
+    /// Optional layer-name fragment whose expert tensors are loaded only on
+    /// EP rank 0, with all experts replicated there.
+    pub rank0_only_expert_prefix: Option<String>,
+    /// Optional layer-name fragment whose expert tensors bypass EP filtering
+    /// and are replicated on every rank.
+    pub replicated_expert_prefix: Option<String>,
     /// Override for the peak memory multiplier in the pre-flight OOM check.
     /// Set from QuantFormat::peak_memory_multiplier() in the caller.
     /// When None, the pre-flight uses its own heuristic (1.3x NVFP4 / 1.5x FP8).
@@ -406,6 +412,8 @@ pub struct SafetensorsLoader {
     /// OPT-IN: a model that DOES build an MTP head must keep them, so this is
     /// set only where `load_mtp_weights` is known to return `None`.
     pub skip_mtp: bool,
+    /// Exact tensor prefix of an unused appended predictor layer; default retains it.
+    pub skip_layer_prefix: Option<String>,
 }
 
 impl Default for SafetensorsLoader {
@@ -421,9 +429,12 @@ impl SafetensorsLoader {
             ep_rank: 0,
             ep_world_size: 1,
             num_experts: 0,
+            rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layer_prefix: None,
         }
     }
 
@@ -433,45 +444,12 @@ impl SafetensorsLoader {
             ep_rank,
             ep_world_size,
             num_experts,
+            rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
-        }
-    }
-
-    /// Check if a tensor should be skipped under EP.
-    /// Skips `*.experts.{E}.*` tensors where E is not in local range.
-    /// MTP head experts are never skipped (small, fully replicated).
-    fn should_skip_tensor(&self, name: &str) -> bool {
-        // MTP head weights for a model whose loader does not build one.
-        if self.skip_mtp && name.starts_with("mtp.") {
-            return true;
-        }
-        // W4A4 activation scales: never read on the w4a16 path (the NVFP4
-        // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
-        // almost pure granule padding at expert scale.
-        if self.skip_activation_scales && name.ends_with(".input_scale") {
-            return true;
-        }
-        if self.ep_world_size <= 1 {
-            return false;
-        }
-        // MTP head experts are small — always replicate, never shard.
-        if name.starts_with("mtp.") {
-            return false;
-        }
-        // Parse expert index from patterns like "*.experts.42.gate_proj*"
-        if let Some(idx) = parse_expert_index(name) {
-            let per_rank = self.num_experts / self.ep_world_size;
-            let local_start = self.ep_rank * per_rank;
-            let local_end = if self.ep_rank == self.ep_world_size - 1 {
-                self.num_experts
-            } else {
-                local_start + per_rank
-            };
-            idx < local_start || idx >= local_end
-        } else {
-            false // Non-expert tensors are always loaded (replicated)
+            skip_layer_prefix: None,
         }
     }
 }
@@ -494,6 +472,15 @@ pub(crate) use loader::check_oom_guard;
 #[cfg(unix)]
 pub(crate) use loader::estimate_has_fp8;
 
+#[cfg(test)]
+#[path = "weights/appended_skip_tests.rs"]
+mod appended_skip_tests;
+
+#[cfg(test)]
+mod expert_filter_tests;
+
+#[cfg(test)]
+mod from_str_tests;
 mod name_utils;
 mod side_files;
 mod store_edit;
@@ -507,6 +494,7 @@ mod exl3_dtype_tests;
 #[cfg(test)]
 mod packed_q2_tests;
 mod prefix_detect;
+mod skip;
 #[cfg(test)]
 #[path = "weights/store_edit_tests.rs"]
 mod store_edit_tests;

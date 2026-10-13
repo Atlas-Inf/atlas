@@ -30,7 +30,7 @@ pub fn pack_weight_sfb(
 ) -> Result<()> {
     #[cfg(atlas_cutlass)]
     {
-        let status = unsafe {
+        let status = drained("pack_weight_sfb", unsafe {
             atlas_cutlass_pack_weight_sfb(
                 scale_in as *const c_void,
                 scale_out as *mut c_void,
@@ -39,7 +39,7 @@ pub fn pack_weight_sfb(
                 i32::from(src_n_major),
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
             bail!("CUTLASS weight SFB pack failed: status {status} for {n}x{k}");
         }
@@ -66,7 +66,7 @@ pub fn pack_bf16_weight_to_nvfp4_t(
 ) -> Result<()> {
     #[cfg(atlas_cutlass)]
     {
-        let status = unsafe {
+        let status = drained("pack_bf16_weight_to_nvfp4_t", unsafe {
             atlas_cutlass_pack_bf16_weight_to_nvfp4_t(
                 weight_bf16 as *const c_void,
                 packed_t as *mut c_void,
@@ -75,7 +75,7 @@ pub fn pack_bf16_weight_to_nvfp4_t(
                 k as i32,
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
             bail!("CUTLASS BF16->NVFP4 weight pack failed: status {status} for {n}x{k}");
         }
@@ -102,7 +102,7 @@ pub fn transpose_nvfp4_packed_kton(
 ) -> Result<()> {
     #[cfg(atlas_cutlass)]
     {
-        let status = unsafe {
+        let status = drained("transpose_nvfp4_packed_kton", unsafe {
             atlas_cutlass_transpose_nvfp4_packed_kton(
                 src_packed_t as *const c_void,
                 dst_packed as *mut c_void,
@@ -110,7 +110,7 @@ pub fn transpose_nvfp4_packed_kton(
                 k as i32,
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
             bail!("CUTLASS NVFP4 weight transpose failed: status {status} for {n}x{k}");
         }

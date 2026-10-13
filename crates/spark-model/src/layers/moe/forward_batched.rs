@@ -16,6 +16,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if ctx.config.expert_tp {
+            return self.forward_prefill(input, num_tokens, ctx, stream);
+        }
         // LongCat zero-experts ARE wired here (softmax+bias arm below); the
         // other scoring functions on this variant are not, and would silently
         // mis-route the 384-wide router. Named refusal, not silent wrongness.
@@ -28,6 +31,18 @@ impl MoeLayer {
                 || (self.correction_bias_dev.is_some() && ctx.config.scoring_func == "softmax"),
             "zero-expert MoE routing is not wired on this dispatch variant yet (forward_batched)"
         );
+        self.btile_input_guard(input, num_tokens, ctx, stream)?;
+        // The equal-memory NVFP4 MMQ repack replaces the checkpoint-native
+        // expert payloads. Only the grouped dispatcher understands that block
+        // layout; the per-token fused kernels below expect the original packed
+        // weights. Small speculative-verification batches reach this entry
+        // through the K2/K3/K5 fallbacks, so route them through the same MMQ
+        // pipeline as ordinary prefill rather than interpreting repacked bytes
+        // with the old-layout kernels. `forward_prefill` does not bounce MMQ
+        // layers back here, so this cannot recurse.
+        if self.nvfp4_mmq_layout || self.routed_scales_released {
+            return self.forward_prefill(input, num_tokens, ctx, stream);
+        }
 
         // SOLID Incr-4: batched decode folds the routed-expert gate/up + down
         // LoRA delta per token (below) AND the router (mlp.gate) delta on the
@@ -266,14 +281,9 @@ impl MoeLayer {
                     top_k,
                     stream,
                 )?;
-            } else if self.use_t_layout_for_prefill() {
+            } else if self.btile_storage.is_published() || self.use_t_layout_for_prefill() {
                 // Phase 8a unified-layout NVFP4 batched prefill — transposed
                 // kernels coalesce well at large N. Hybrid mode lands here too.
-                let gate_t = self
-                    .gate_ptrs_t
-                    .as_ref()
-                    .expect("gate_ptrs_t under unified_t");
-                let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
                 let down_t = self
                     .down_ptrs_t
                     .as_ref()
@@ -291,32 +301,50 @@ impl MoeLayer {
                         "decode fused _e8m0 kernel assumes an NVFP4 shared expert",
                     );
                 }
-                ops::moe_expert_gate_up_shared_t(
-                    ctx.gpu,
-                    self.e8m0_or(
-                        self.moe_expert_gate_up_shared_t_k,
-                        self.moe_expert_gate_up_shared_t_e8m0_k,
-                        "decode gate_up_shared_t",
-                    ),
-                    input_t,
-                    gate_t.packed_ptrs,
-                    gate_t.scale_ptrs,
-                    gate_t.scale2_vals,
-                    expert_gate_out,
-                    up_t.packed_ptrs,
-                    up_t.scale_ptrs,
-                    up_t.scale2_vals,
-                    expert_up_out,
-                    indices_dev,
-                    sh_gate_t,
-                    shared_gate_scratch,
-                    sh_up_t,
-                    shared_up_scratch,
-                    inter,
-                    h,
-                    top_k,
-                    stream,
-                )?;
+                if self.btile_storage.is_published() {
+                    self.dispatch_btile_decode(
+                        ctx,
+                        input_t,
+                        expert_gate_out,
+                        expert_up_out,
+                        indices_dev,
+                        Some((shared_gate_scratch, shared_up_scratch)),
+                        1,
+                        stream,
+                    )?;
+                } else {
+                    let gate_t = self
+                        .gate_ptrs_t
+                        .as_ref()
+                        .expect("gate_ptrs_t under unified_t");
+                    let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
+                    ops::moe_expert_gate_up_shared_t(
+                        ctx.gpu,
+                        self.e8m0_or(
+                            self.moe_expert_gate_up_shared_t_k,
+                            self.moe_expert_gate_up_shared_t_e8m0_k,
+                            "decode gate_up_shared_t",
+                        ),
+                        input_t,
+                        gate_t.packed_ptrs,
+                        gate_t.scale_ptrs,
+                        gate_t.scale2_vals,
+                        expert_gate_out,
+                        up_t.packed_ptrs,
+                        up_t.scale_ptrs,
+                        up_t.scale2_vals,
+                        expert_up_out,
+                        indices_dev,
+                        sh_gate_t,
+                        shared_gate_scratch,
+                        sh_up_t,
+                        shared_up_scratch,
+                        inter,
+                        h,
+                        top_k,
+                        stream,
+                    )?;
+                }
                 // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
                 self.apply_expert_lora_decode_gateup(
                     expert_gate_out,

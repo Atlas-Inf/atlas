@@ -127,7 +127,7 @@ impl ModelConfig {
     /// Range of expert indices local to this EP rank.
     /// Returns (start, end) where start is inclusive and end is exclusive.
     pub fn local_expert_range(&self) -> (usize, usize) {
-        if self.ep_world_size <= 1 {
+        if self.ep_world_size <= 1 || self.expert_tp {
             return (0, self.num_experts);
         }
         let per_rank = self.num_experts / self.ep_world_size;
@@ -138,6 +138,16 @@ impl ModelConfig {
             start + per_rank
         };
         (start, end)
+    }
+
+    /// Routed-expert intermediate width held by this rank: the full
+    /// `moe_intermediate_size`, or its EP-rank slice under expert TP.
+    pub fn routed_inter_local(&self) -> usize {
+        if self.expert_tp {
+            self.moe_intermediate_size / self.ep_world_size
+        } else {
+            self.moe_intermediate_size
+        }
     }
 
     /// Whether the given expert ID is local to this EP rank.

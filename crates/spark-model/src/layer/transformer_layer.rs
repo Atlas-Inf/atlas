@@ -45,6 +45,39 @@ pub const VERIFY_WY_LAYER_STRIDE_BYTES: usize =
     VERIFY_WY_TABLES_PER_LAYER * VERIFY_WY_TABLE_STRIDE_BYTES;
 
 pub trait TransformerLayer: Send + Sync {
+    /// Long-context verify of several owners, `rows` rows each, in one
+    /// traversal (`glm_long_owner`). Unsupported layers refuse before any work.
+    fn decode_glm_long_owners(
+        &self,
+        _owners: &mut [super::glm_long_owner::GlmLongOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _stage: &super::glm_long_owner::GlmLongStage,
+        _ctx: &ForwardContext<'_>,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM long-context owner-batched verify is unsupported for this layer")
+    }
+
+    /// A prefill chunk of `num_tokens` rows at arena rows `[0, num_tokens)`
+    /// that DFlash verify owners ride (`glm_long_owner`): owner `o`'s rows sit
+    /// at `num_tokens + o * rows`. Row-local work runs once over every row;
+    /// each sequence advances only its own state. Unsupported layers refuse
+    /// before any work.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_with_glm_passengers(
+        &self,
+        _hidden: DevicePtr,
+        _num_tokens: usize,
+        _state: &mut dyn LayerState,
+        _seq_len_start: usize,
+        _passengers: &mut [super::glm_long_owner::GlmLongOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _ctx: &ForwardContext<'_>,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM fused prefill + verify is unsupported for this layer")
+    }
+
     /// True when this layer's PREFILL attends only over the tokens it is
     /// handed, so a prefix-cache skip would hide the cached prefix from
     /// attention entirely. MLA layers on the paged path do; everything else
@@ -89,6 +122,31 @@ pub trait TransformerLayer: Send + Sync {
     /// immediately.
     fn fp8_calibration_frozen(&self) -> Option<bool> {
         None
+    }
+
+    /// Read-only capability check before a KV-only caller mutates scratch or
+    /// temporarily overwrites a reference cache prefix. No GPU work is allowed.
+    fn supports_mla_kv_only(&self) -> bool {
+        false
+    }
+
+    /// Populate only this layer's compressed MLA K/V cache for a batch of
+    /// already-combined MTP inputs. This deliberately skips Q projection,
+    /// attention, output projection, and FFN work: an autoregressive draft
+    /// layer's cached K/V depends only on its normalized input row.
+    ///
+    /// `slots` is a device array of `num_tokens` physical paged-cache slots.
+    /// The default declines the optimization; MLA attention layers override.
+    fn prefill_mla_kv_only(
+        &self,
+        _hidden: DevicePtr,
+        _num_tokens: usize,
+        _kv_cache: &mut PagedKvCache,
+        _slots: DevicePtr,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Hoisted per-step HOST work for layers that do host-side computation

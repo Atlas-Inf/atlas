@@ -70,6 +70,19 @@ pub enum GrammarSpec {
     JsonSchema { schema: String },
 }
 
+/// The scheduler rejected the request as asked (e.g. a `response_format` it
+/// cannot enforce). The blocking chat path maps it to HTTP 400, not 500.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidRequestError(pub String);
+
+impl GrammarSpec {
+    /// A `response_format` grammar, whose output must conform.
+    pub fn is_response_format(&self) -> bool {
+        matches!(self, Self::JsonObject | Self::JsonSchema { .. })
+    }
+}
+
 /// Request submitted to the scheduler.
 pub enum InferenceRequest {
     /// Blocking: waits for full response.

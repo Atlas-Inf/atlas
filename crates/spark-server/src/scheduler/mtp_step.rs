@@ -4,6 +4,13 @@
 
 use super::*;
 
+mod depth;
+mod glm_repair;
+mod owner_batch;
+use depth::{ladder_truncate, lone_dflash_width, single_depth_ladder};
+use glm_repair::{glm_repaired_narrow, mark_engine_error};
+use owner_batch::verify_owner_batch;
+
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
 /// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
 ///
@@ -43,6 +50,7 @@ pub fn step_mtp(
         Some(max_nd) => num_drafts.min(max_nd),
         None => num_drafts,
     };
+    let glm_repaired_narrow = glm_repaired_narrow(num_drafts);
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
     let mut verify_idxs: Vec<usize> = Vec::new();
     for (i, a) in active.iter().enumerate() {
@@ -71,6 +79,7 @@ pub fn step_mtp(
     } else {
         crate::scheduler::adaptive_rung::drafts_for(active.len(), num_drafts)
     };
+    let ladder_nd = single_depth_ladder(active, sched, ladder_nd, dflash_verify_raw_argmax);
     // Tiered verify-pool capacity clamp (2026-08-16): the step's draft
     // count must respect the MINIMUM slot capacity across the active
     // sequences — a sequence in a K=2-sized slot must never receive K=4
@@ -100,7 +109,9 @@ pub fn step_mtp(
     // target and n of the drafter. Falls back to the per-sequence loop below
     // whenever the envelope does not hold (`mtp_bootstrap_step`); kill switch
     // ATLAS_NO_MTP_BATCH_BOOTSTRAP.
-    if can_batch_bootstrap(model, sched, bootstrap_idxs.len(), dflash_verify_raw_argmax) {
+    if !spark_model::speculative::glm_repair_policy::enabled()
+        && can_batch_bootstrap(model, sched, bootstrap_idxs.len(), dflash_verify_raw_argmax)
+    {
         step_mtp_bootstrap_batched(model, active, sched, &bootstrap_idxs, ladder_nd, verify_ctx);
         bootstrap_idxs.clear();
     }
@@ -123,7 +134,9 @@ pub fn step_mtp(
             && !sched.levers.dflash_seam_serial
             && crate::scheduler::adaptive_spec::spec_allowed(a, sched)
         {
-            let eff = if a.grammar_state.is_some() {
+            // A strict grammar here speculates at full width: its verify
+            // masks every row and trims the drafts (`strict_spec`).
+            let eff = if a.grammar_state.is_some() && !a.strict_grammar() {
                 1
             } else {
                 num_drafts
@@ -142,17 +155,19 @@ pub fn step_mtp(
                     // run one decode_verify_batched over every ready seq.
                     // In-loop step_verify_dflash left only 1 seq with drafts
                     // (shared propose scratch / graph) and never hit Phase B.
+                    a.set_proposed_drafts(init);
                     if n_active >= 2 && !dspark_batch_verify_disabled() {
-                        a.pending_drafts = init;
                         late_dflash.push(idx);
                         continue;
                     }
-                    if dflash_verify_raw_argmax {
+                    let (init, conf) = a.take_drafts();
+                    if dflash_verify_raw_argmax || glm_repaired_narrow {
                         step_verify_dflash(
                             model,
                             a,
                             sched,
                             &init,
+                            &conf,
                             num_drafts,
                             verify_ctx,
                             dflash_verify_raw_argmax,
@@ -231,16 +246,14 @@ pub fn step_mtp(
         // EP: broadcast token to worker before decode (worker runs decode in lockstep).
         if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
             tracing::error!("EP broadcast bootstrap token: {e:#}");
-            a.engine_error = Some(format!("{e:#}"));
-            a.finished = true;
+            mark_engine_error(a, format!("EP broadcast bootstrap token failed: {e:#}"));
             continue;
         }
         let logits = match model.decode(a.last_token, &mut a.seq, 0) {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!("bootstrap decode error: {e:#}");
-                a.engine_error = Some(format!("{e:#}"));
-                a.finished = true;
+                mark_engine_error(a, format!("bootstrap decode failed: {e:#}"));
                 continue;
             }
         };
@@ -288,8 +301,7 @@ pub fn step_mtp(
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("bootstrap sample error: {e:#}");
-                a.engine_error = Some(format!("{e:#}"));
-                a.finished = true;
+                mark_engine_error(a, format!("bootstrap sampling failed: {e:#}"));
                 continue;
             }
         };
@@ -344,6 +356,9 @@ pub fn step_mtp(
 
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp: {e:#}");
+            if spark_model::speculative::glm_repair_policy::enabled() {
+                mark_engine_error(a, format!("save_hidden_for_mtp failed: {e:#}"));
+            }
             continue;
         }
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
@@ -377,13 +392,27 @@ pub fn step_mtp(
             ) {
                 Ok(drafts) if !drafts.is_empty() => {
                     tracing::debug!("MTP bootstrap: tok={tok} → drafts={drafts:?}");
-                    a.pending_drafts = drafts;
+                    a.set_proposed_drafts(drafts);
                 }
-                Ok(_) => tracing::warn!("MTP propose returned empty"),
+                Ok(_) => {
+                    tracing::warn!("MTP propose returned empty");
+                    if spark_model::speculative::glm_repair_policy::enabled() {
+                        mark_engine_error(a, "MTP propose returned empty");
+                    }
+                }
                 Err(e) => {
                     tracing::error!("run_mtp_propose_multi: {e:#}");
+                    if spark_model::speculative::glm_repair_policy::enabled() {
+                        mark_engine_error(a, format!("MTP proposal failed: {e:#}"));
+                    }
                 }
             }
+        }
+
+        // A terminal proposal failure must not start a checkpoint on the
+        // partially-mutated proposer state before retirement frees it.
+        if a.finished {
+            continue;
         }
 
         if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
@@ -415,7 +444,8 @@ pub fn step_mtp(
             ladder_nd
         );
     }
-    if verify_idxs.len() >= 2
+    if !spark_model::speculative::glm_repair_policy::enabled()
+        && verify_idxs.len() >= 2
         && spark_model::speculative::mtp_multi_seq_mode()
         && dspark_batch_ok
         && !batch_verify_disabled()
@@ -556,15 +586,25 @@ pub fn step_mtp(
             serial_idxs.extend_from_slice(chunk);
         }
     }
+    verify_owner_batch(
+        model,
+        active,
+        sched,
+        &mut serial_idxs,
+        num_drafts,
+        ladder_nd,
+        glm_repaired_narrow,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+    );
     for &idx in &serial_idxs {
         let a = &mut active[idx];
-        let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
-        // Confidences describe the taken drafts; clearing here is the single
-        // place the two vectors are kept in lock-step for the serial path.
-        a.pending_draft_conf.clear();
+        // Confidences travel with the taken drafts and are cut with them.
+        let (mut drafts, mut conf) = a.take_drafts();
         if drafts.is_empty() {
             continue;
         }
+        lone_dflash_width(a, &conf, &mut drafts, dflash_verify_raw_argmax);
 
         // Spec-decode boundary awareness (arXiv:2512.15834): when a
         // grammar is active, validate the draft sequence against the
@@ -575,7 +615,8 @@ pub fn step_mtp(
         // `accept_token` silently fails — desync'ing the grammar
         // from the output stream. Truncating here downgrades K=4 →
         // K=3 → K=2 cleanly.
-        if let Some(ref mut gs) = a.grammar_state {
+        // Strict grammars trim at the verify, thinking-aware (`strict_spec`).
+        if let Some(gs) = a.grammar_state.as_mut().filter(|gs| !gs.is_strict()) {
             let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
             if kept < drafts.len() {
                 drafts.truncate(kept);
@@ -584,16 +625,19 @@ pub fn step_mtp(
                 continue;
             }
         }
+        ladder_truncate(a, &mut drafts, ladder_nd);
+        conf.truncate(drafts.len());
 
         // DFlash/DSpark verify: route by proposer, not draft count.
         // `--dflash` sets dflash_verify_raw_argmax. The old `drafts.len()>=4`
         // ladder sent K=3 (`--dflash-gamma 4`) into MTP K=3 verify.
-        if dflash_verify_raw_argmax || drafts.len() >= 4 {
+        if dflash_verify_raw_argmax || glm_repaired_narrow || drafts.len() >= 4 {
             step_verify_dflash(
                 model,
                 a,
                 sched,
                 &drafts,
+                &conf,
                 num_drafts,
                 verify_ctx,
                 dflash_verify_raw_argmax,

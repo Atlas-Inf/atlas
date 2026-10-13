@@ -244,6 +244,7 @@ impl ModelWeightLoader for LongcatWeightLoader {
                     weight: DevicePtr::NULL,
                 };
                 let mla = MlaWeights {
+                    glm_indexer: None,
                     wq_a,
                     wq_a_fp8: None,
                     wq_a_nvfp4: if disable_nvfp4_mla {

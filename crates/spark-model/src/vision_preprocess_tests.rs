@@ -53,9 +53,121 @@ fn test_image_pad_count_zero_sms_clamps_to_one() {
     assert_eq!(image_pad_count(64, 64, 0), 64 * 64);
 }
 
+#[test]
+fn glm_patch_order_keeps_each_spatial_merge_block_contiguous() {
+    let mut cfg = ok_cfg();
+    cfg.is_glm5_next = true;
+    let got = patch_coordinates(&cfg, 4, 4);
+    assert_eq!(
+        got,
+        vec![
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 0),
+            (2, 1),
+            (3, 0),
+            (3, 1),
+            (2, 2),
+            (2, 3),
+            (3, 2),
+            (3, 3),
+        ]
+    );
+}
+
+#[test]
+fn glm_processor_geometry_uses_token_budget_and_clip_normalization() {
+    let mut cfg = ok_cfg();
+    cfg.is_glm5_next = true;
+    cfg.patch_size = 14;
+    cfg.spatial_merge_size = 2;
+    cfg.temporal_patch_size = 2;
+    let (h, w) = glm_target_size(&cfg, 1, 1, 2, None, false).unwrap();
+    assert_eq!((h, w), (112, 112));
+    let red = normalize_channel(&cfg, 0, 255);
+    let blue = normalize_channel(&cfg, 2, 0);
+    assert!((red - (1.0 - GLM_MEAN[0]) / GLM_STD[0]).abs() < 1e-6);
+    assert!((blue - (0.0 - GLM_MEAN[2]) / GLM_STD[2]).abs() < 1e-6);
+}
+
+#[test]
+fn glm_resize_or_pad_keeps_content_in_the_upper_left() {
+    let source = image::RgbImage::from_pixel(2, 4, image::Rgb([255, 0, 0]));
+    let padded = glm_resize_or_pad(&source, 4, 8, false);
+    assert_eq!(padded.dimensions(), (8, 4));
+    assert_eq!(padded.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
+    assert_eq!(padded.get_pixel(7, 3), &image::Rgb([0, 0, 0]));
+}
+
+fn glm_budget_cfg() -> VisionConfig {
+    let mut cfg = ok_cfg();
+    cfg.is_glm5_next = true;
+    cfg.patch_size = 14;
+    cfg.temporal_patch_size = 2;
+    cfg.spatial_merge_size = 2;
+    cfg
+}
+
+#[test]
+fn glm_large_photo_fits_the_bounded_encoder_capacity() {
+    let cfg = glm_budget_cfg();
+    let (h, w) = glm_target_size(&cfg, 1080, 1920, 2, None, false).unwrap();
+    assert_eq!(h % 28, 0);
+    assert_eq!(w % 28, 0);
+    assert!(h as usize / 14 * (w as usize / 14) <= GLM_FALLBACK_MAX_PATCHES);
+}
+
+#[test]
+fn glm_panorama_fits_without_unbounded_encoder_growth() {
+    let cfg = glm_budget_cfg();
+    let (h, w) = glm_target_size(&cfg, 512, 8192, 2, None, false).unwrap();
+    assert_eq!(h % 28, 0);
+    assert_eq!(w % 28, 0);
+    assert!(h as usize / 14 * (w as usize / 14) <= GLM_FALLBACK_MAX_PATCHES);
+}
+
+#[test]
+fn glm_video_total_rows_fit_the_bounded_encoder_capacity() {
+    let cfg = glm_budget_cfg();
+    for frames in [2, 4, 8, 256] {
+        let (h, w) = glm_target_size(&cfg, 4096, 4096, frames, None, true).unwrap();
+        let groups = frames / cfg.temporal_patch_size;
+        let per_group_patches = h as usize / 14 * (w as usize / 14);
+        let output_rows = groups * (h as usize / 14 / 2) * (w as usize / 14 / 2);
+        assert!(
+            per_group_patches <= GLM_FALLBACK_MAX_PATCHES,
+            "frames={frames}: per-group patches={per_group_patches}"
+        );
+        assert!(
+            output_rows <= GLM_FALLBACK_MAX_PATCHES,
+            "frames={frames}: output rows={output_rows}"
+        );
+    }
+    assert!(glm_runtime_max_pixels(&cfg, None, true) > 0);
+}
+
+#[test]
+fn glm_explicit_budget_counts_temporal_volume_for_encoder_capacity() {
+    let cfg = glm_budget_cfg();
+    let volume =
+        GLM_FALLBACK_MAX_PATCHES * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+    let (patches, _) =
+        derive_glm_max_patches(Some(volume), cfg.patch_size, cfg.temporal_patch_size);
+    assert_eq!(patches, GLM_FALLBACK_MAX_PATCHES);
+    assert_eq!(glm_runtime_max_pixels(&cfg, Some(volume), false), volume);
+}
+
 /// A `vision_config` for the shipped Qwen3-VL geometry.
 fn ok_cfg() -> VisionConfig {
     VisionConfig {
+        is_glm5_next: false,
+        in_channels: 3,
         depth: 27,
         hidden_size: 1152,
         num_heads: 16,
@@ -64,9 +176,16 @@ fn ok_cfg() -> VisionConfig {
         spatial_merge_size: 2,
         intermediate_size: 4304,
         out_hidden_size: 2048,
+        projection_intermediate_size: 0,
+        rms_norm_eps: 1e-6,
+        swiglu_limit: 0.0,
         deepstack_visual_indexes: vec![8, 16, 24],
         image_pad_token_id: 151_655,
         video_pad_token_id: 151_656,
+        image_start_token_id: 0,
+        image_end_token_id: 0,
+        video_start_token_id: 0,
+        video_end_token_id: 0,
         // These tests drive `preprocess_image_with_max_pixels` directly
         // with an explicit bound, so the config-carried one is not the
         // subject here.

@@ -15,6 +15,22 @@ use crate::layers::ops;
 use crate::layers::ops::{DFLASH2_SELECTOR_MAX_RANK, DFLASH2_SELECTOR_MAX_TOP_K};
 use crate::weight_map::DenseWeight;
 
+/// The block anchor (row 1's predecessor) and min_tokens ban of one selector
+/// walk: host values for the host fallback, device `u32` slots for the
+/// kernel. The device slots are written before any captured tail, so a
+/// replayed graph walks from the current step's anchor (a by-value kernel
+/// argument would be frozen at capture).
+#[derive(Clone, Copy)]
+pub struct SelectorAnchor {
+    pub token: u32,
+    pub token_dev: DevicePtr,
+    /// Rows `1..=ban_depth` may not pick an end token (below min_tokens).
+    pub ban_depth: u32,
+    pub ban_depth_dev: DevicePtr,
+    /// The model end tokens (`EosBan::model_end_ids`, unused slots `u32::MAX`).
+    pub end_ids: [u32; 4],
+}
+
 #[derive(Clone)]
 pub struct Dflash2CandidateSelector {
     pub hidden_projection: DenseWeight,
@@ -82,10 +98,11 @@ impl Dflash2CandidateSelector {
     /// Select candidate tokens using the bilinear codebook path walk.
     pub fn select_candidates(
         &self,
-        last_token: u32,
+        anchor: SelectorAnchor,
         hidden_buf: DevicePtr,
         logits_buf: DevicePtr,
         projected_hidden_buf: DevicePtr,
+        selector_scratch: DevicePtr,
         draft_tokens_dev: DevicePtr,
         gamma: usize,
         gpu: &dyn GpuBackend,
@@ -118,11 +135,14 @@ impl Dflash2CandidateSelector {
                 self.predecessor_codebook.weight,
                 self.successor_codebook.weight,
                 draft_tokens_dev,
-                last_token,
+                anchor.token_dev,
+                anchor.ban_depth_dev,
+                anchor.end_ids,
                 g,
                 self.vocab_size as u32,
                 r,
                 self.top_k as u32,
+                selector_scratch,
                 stream,
             );
         }
@@ -148,7 +168,7 @@ impl Dflash2CandidateSelector {
         // step 0's predecessor = last_token.
         let num_draft_steps = gamma.saturating_sub(1);
         let mut mask_drafts = Vec::with_capacity(num_draft_steps);
-        let mut prev_token = last_token as usize;
+        let mut prev_token = anchor.token as usize;
 
         for step in 0..num_draft_steps {
             let mask_row = step + 1;
@@ -162,7 +182,16 @@ impl Dflash2CandidateSelector {
                 .chunks_exact(2)
                 .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
                 .collect();
-            let top_candidates = topk_unary(&logits_row, self.top_k);
+            let mut top_candidates = topk_unary(&logits_row, self.top_k);
+            // Below the min_tokens floor an end token only truncates the
+            // chain; score it out like the kernel does.
+            if mask_row <= anchor.ban_depth as usize {
+                for (value, id) in top_candidates.iter_mut() {
+                    if anchor.end_ids.contains(&(*id as u32)) {
+                        *value = f32::NEG_INFINITY;
+                    }
+                }
+            }
 
             // Context vector: c_r = pred[prev, r] * H_proj[mask_row, r]
             let h_step = &proj_hiddens[mask_row * self.rank..(mask_row + 1) * self.rank];

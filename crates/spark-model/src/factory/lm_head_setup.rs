@@ -21,7 +21,7 @@ pub(super) fn setup_lm_heads(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     use_speculative: bool,
-    have_mtp_weights: bool,
+    need_draft_nvfp4_head: bool,
 ) -> Result<(
     Option<crate::weight_map::QuantizedWeight>,
     Option<Fp8DenseWeight>,
@@ -122,7 +122,7 @@ pub(super) fn setup_lm_heads(
     // When the main head is NVFP4 (`lm_head_nvfp4.is_some()`), this stays
     // `None` and the proposer falls back to the main NVFP4 head — byte-for-byte
     // unchanged from the pre-decouple behavior.
-    let mtp_lm_head_nvfp4 = if lm_head_nvfp4.is_none() && use_speculative && have_mtp_weights {
+    let mtp_lm_head_nvfp4 = if lm_head_nvfp4.is_none() && use_speculative && need_draft_nvfp4_head {
         let q = quantize_to_nvfp4(
             lm_head,
             config.vocab_size,

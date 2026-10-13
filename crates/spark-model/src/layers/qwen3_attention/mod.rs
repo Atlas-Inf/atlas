@@ -18,9 +18,16 @@ mod decode;
 // V4: `pub(crate)` so the DeepSeek-V4 weight loader (`weight_loader::deepseek_v4`)
 // and the V4 attention submodules can call `helpers::yarn_rope_mscale`. Non-V4
 // code paths are unaffected by the wider visibility.
+mod glm_index_capacity;
+pub(crate) mod glm_k3_mla_o;
+mod glm_long_context;
+mod glm_sparse_graphs_policy;
+mod hc_prefill;
 pub(crate) mod helpers;
 mod init;
 mod init_arch_gates;
+mod init_glm;
+mod init_independent;
 mod init_kernel_dispatch;
 mod kernel_requirements;
 mod op_dump;
@@ -40,11 +47,34 @@ mod types_weights;
 pub use innerq_driver::InnerQDriver;
 // V4: re-export the new hyper-connection / compressor weight types alongside the
 // existing ones. These are only constructed under DeepSeek-V4 detection.
+pub use glm_sparse_graphs_policy::{
+    glm_c1_decode_graph_vetoed, glm_multi_seq_sparse_graphs_enabled,
+};
+pub(crate) use hc_prefill::{hc_post_pre_prefill_fused, hc_pre_prefill_mix};
+pub(crate) use prefill::{index_split_words, write_floor_legacy};
+pub(crate) use trait_impl::{
+    grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
+};
 pub(crate) use types::HeadGateActivation;
 pub use types::Qwen3AttentionLayer;
 pub use types_weights::{
-    CompressorWeights, HcHeadWeights, HcLowRank, HcSiteWeights, HcWeights, MlaWeights,
+    CompressorWeights, GlmIndexerWeights, HcHeadWeights, HcLowRank, HcSiteWeights, HcWeights,
+    MlaWeights,
 };
+
+/// `ATLAS_GLM_MLA_MULTI_SEQ=1`: GLM MLA layers decode a batch of sequences
+/// together. Both ranks must run the same value (`model::startup_parity`): a
+/// rank without it runs the per-sequence path, or refuses a C4 batch its peer
+/// has already started.
+pub(crate) fn glm_mla_multi_seq_enabled() -> bool {
+    std::env::var("ATLAS_GLM_MLA_MULTI_SEQ").ok().as_deref() == Some("1")
+}
+
+/// Opt-in eager semantic indexing for independent GLM C2/C3 decode rows.
+/// The model and server share this gate so admission and graph policy agree.
+pub fn glm_multi_seq_sparse_enabled(model_type: &str) -> bool {
+    model_type == "glm5_next" && std::env::var("ATLAS_GLM_MULTI_SEQ_SPARSE").as_deref() == Ok("1")
+}
 
 /// Startup fail-fast for `--kv-cache-dtype`: resolve every kernel handle the
 /// dtype's dispatch arms require (chunked-prefill kernel, WHT bookends) and
@@ -152,3 +182,6 @@ mod split_ref_seqs_tests {
         assert_ne!(split_ref_seqs(1, 4), split_ref_seqs(1, 16));
     }
 }
+
+#[cfg(test)]
+mod init_glm_probe_tests;

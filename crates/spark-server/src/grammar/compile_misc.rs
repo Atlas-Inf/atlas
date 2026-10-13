@@ -6,6 +6,15 @@ use xgrammar::CompiledGrammar;
 
 use super::engine::{GrammarEngine, GrammarError};
 
+/// Largest JSON schema text compiled for response_format.
+pub(crate) const MAX_SCHEMA_TEXT_BYTES: usize = 1 << 20;
+/// Largest compiled response_format grammar structure. Masks are excluded:
+/// they fill lazily as the grammar is used, and the compiler cache counts
+/// them only when it next measures (on insert), so one live grammar's masks
+/// grow with the parser states its requests visit. A strict object of 96
+/// required object-valued properties compiles to a few MiB.
+pub(crate) const MAX_SCHEMA_GRAMMAR_BYTES: usize = 64 << 20;
+
 impl GrammarEngine {
     /// Build and compile a structural tag grammar from raw JSON components.
     /// This bypasses xgrammar-rs's `compile_structural_tag` wrapper to access
@@ -50,7 +59,18 @@ impl GrammarEngine {
     const MAX_JSON_SCHEMA_WHITESPACE: i32 = 8;
 
     /// Compile a grammar that enforces a JSON schema.
+    ///
+    /// Refuses a schema over [`MAX_SCHEMA_TEXT_BYTES`] before compiling; the
+    /// compiler refuses (and never caches) one whose grammar is over
+    /// [`MAX_SCHEMA_GRAMMAR_BYTES`] or over the FSM encoding limits.
+    /// response_format reports either as an invalid request (HTTP 400).
     pub fn compile_json_schema(&mut self, schema: &str) -> Result<CompiledGrammar, GrammarError> {
+        if schema.len() > MAX_SCHEMA_TEXT_BYTES {
+            return Err(GrammarError::Compilation(format!(
+                "JSON schema is {} bytes, over the {MAX_SCHEMA_TEXT_BYTES}-byte limit",
+                schema.len()
+            )));
+        }
         self.compiler
             .compile_json_schema(
                 schema,

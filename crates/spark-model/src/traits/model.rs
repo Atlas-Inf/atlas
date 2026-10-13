@@ -140,6 +140,13 @@ pub trait Model: Send + Sync {
         self.lightning_dspark_product_policy().is_some()
     }
 
+    /// The speculative verify head writes only argmax ids, not the full
+    /// logits buffer (GLM's TP2 vocab-split head), so a verify pick cannot
+    /// go through the logits pipeline. Default: full logits.
+    fn verify_logits_argmax_only(&self) -> bool {
+        false
+    }
+
     /// Run beam search to completion for each request, returning each one's
     /// winning hypothesis token ids (EOS-terminated). Called from the prefill
     /// path for `num_beams > 1` requests, bypassing the token-by-token decode
@@ -733,6 +740,76 @@ pub trait Model: Send + Sync {
         bail!("decode_verify_batched: unsupported by this model")
     }
 
+    /// Whether [`Self::decode_verify_glm_long_owner_rows`] can verify `owners`
+    /// long-context sequences of `rows` rows each in one target traversal:
+    /// K3 on the repaired MTP lane, a 2..=8 row block on the GLM DFlash lane.
+    fn can_batch_glm_long_verify_rows(&self, _owners: usize, _rows: usize) -> bool {
+        false
+    }
+
+    /// Owner-batched long-context verify of `seqs.len()` owners of `rows`
+    /// rows each in one traversal (EP-coherent). `tokens` is owner-major,
+    /// `rows` per owner. On success each sequence advanced by `rows` rows,
+    /// like the per-sequence verify, and the owner-major argmax IDs are
+    /// returned. Before each owner's verdict tail the caller must call
+    /// [`Self::begin_glm_long_owner_tail`] for that owner with its `rows`
+    /// tokens.
+    fn decode_verify_glm_long_owner_rows(
+        &self,
+        _rows: usize,
+        _tokens: &[u32],
+        _seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<u32>> {
+        bail!("decode_verify_glm_long_owner_rows: unsupported by this model")
+    }
+
+    /// Whether prompt prefills share one capture buffer (one writer), so a
+    /// new prompt may not start while another is chunking. Conservatively
+    /// true unless the model knows otherwise.
+    fn has_shared_prompt_capture(&self) -> bool {
+        true
+    }
+
+    /// Whether a prefill chunk of `chunk_len` rows of `prompt` may carry
+    /// `owners` DFlash verify owners of `rows` rows each after its own rows.
+    fn can_fuse_glm_prefill_verify(
+        &self,
+        _prompt: &[u32],
+        _seq: &SequenceState,
+        _chunk_len: usize,
+        _owners: usize,
+        _rows: usize,
+    ) -> bool {
+        false
+    }
+
+    /// One prefill chunk of `prompt` for `seq` carrying the verify rows of
+    /// `owners` (`tokens` owner-major, `rows` per owner) in the same
+    /// traversal (EP-coherent). Returns the chunk's logits (NULL before the
+    /// last chunk) and the owners' argmax IDs; each owner advanced by `rows`
+    /// rows exactly as after [`Self::decode_verify_glm_long_owner_rows`], so
+    /// its tail begins with [`Self::begin_glm_long_owner_tail`].
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_chunk_with_glm_owner_rows(
+        &self,
+        _prompt: &[u32],
+        _seq: &mut SequenceState,
+        _chunk_start: usize,
+        _chunk_len: usize,
+        _rows: usize,
+        _tokens: &[u32],
+        _owners: &mut [&mut SequenceState],
+    ) -> Result<(DevicePtr, Vec<u32>)> {
+        bail!("prefill_chunk_with_glm_owner_rows: unsupported by this model")
+    }
+
+    /// Restore owner `owner`'s `tokens.len()` verify rows on every rank so
+    /// its ordinary single-owner verdict/commit/propose tail can run
+    /// unchanged.
+    fn begin_glm_long_owner_tail(&self, _slot: u32, _owner: usize, _tokens: &[u32]) -> Result<()> {
+        bail!("begin_glm_long_owner_tail: unsupported by this model")
+    }
+
     /// Copy raw-hidden rows `rows[i]` of the just-run batched verify forward
     /// into stash slot `i` (`verify_hidden_stash`), BEFORE any propose
     /// clobbers the shared `hidden_states` buffer. Companion of
@@ -824,6 +901,22 @@ pub trait Model: Send + Sync {
     /// argmax. Variable-length γ (vs fixed K=2/3/4) because it's a drafter
     /// config field. CUDA-graph capture keyed by `(slot_idx, tokens.len())`.
     /// Default routes to `decode_verify_graphed_kgamma`.
+    /// Strict structured-output verify (`ATLAS_GLM_STRICT_SPEC`), head side,
+    /// step 1 of 2: validate and upload `rows * ceil(vocab / 32)` mask words
+    /// (row r: the grammar state verify row r is picked under) BEFORE the
+    /// verify command is sent, so a failure leaves every rank untouched. A
+    /// model that cannot mask its verify refuses, so strict output is never
+    /// unmasked.
+    fn prepare_verify_row_masks(&self, _rows: usize, _masks: &[u32]) -> Result<()> {
+        bail!("this model cannot grammar-mask a speculative verify")
+    }
+
+    /// Step 2 of 2, after the verify tokens are sent: broadcast the masks to
+    /// every rank and stage them for the next `decode_verify_dflash`.
+    fn send_verify_row_masks(&self, _rows: usize) -> Result<()> {
+        bail!("this model cannot grammar-mask a speculative verify")
+    }
+
     fn decode_verify_dflash(
         &self,
         tokens: &[u32],
@@ -1036,10 +1129,37 @@ pub trait Model: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Set the co-dispatched batched-ViT slice base for the NEXT prefill_chunk
-    /// (row offset into buf_out, grid index offset, image count owned). Pass
-    /// (0,0,0) to reset to the legacy single-request behaviour. Default: no-op.
-    fn set_vision_slice_base(&self, _row_base: usize, _grid_base: usize, _owned_images: usize) {}
+    /// Set the co-dispatched batched-ViT slice for the NEXT prefill_chunk
+    /// (row offset into buf_out, grid index offset, image count and row count
+    /// owned). Pass all zeroes to reset to the legacy single-request
+    /// behaviour. Default: no-op.
+    fn set_vision_slice_base(
+        &self,
+        _row_base: usize,
+        _grid_base: usize,
+        _owned_images: usize,
+        _slice_rows: usize,
+    ) {
+    }
+
+    /// Synchronize the rank-local vision state before an EP/TP prefill.
+    ///
+    /// `enabled=false` explicitly clears the worker's pending image state for
+    /// a text request. When enabled, the implementation sends the encoded BF16
+    /// rows and grid metadata, plus the optional co-dispatch slice. The final
+    /// argument is zero for the legacy single-request range and non-zero for a
+    /// packed slice. Text-only models keep the default no-op implementation.
+    fn ep_broadcast_vision_state_for_seq(
+        &self,
+        _seq_id: u32,
+        _enabled: bool,
+        _row_base: usize,
+        _grid_base: usize,
+        _owned_images: usize,
+        _slice_rows: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// EP worker step: receive a (seq_id, cmd) preamble from rank 0 and
     /// execute the command in the addressed slot.
@@ -1091,11 +1211,18 @@ pub trait Model: Send + Sync {
         )
     }
 
-    /// Multi-head Latent Attention guard. When true, chunked prefill MUST run
-    /// as a single chunk — Atlas has no paged-MLA prefill kernel and
-    /// multi-chunk MLA silently corrupts attention output (see Mistral-Small-4
-    /// 2026-05-01 sweep: 8K collapses to "The\nThe…").
+    /// Multi-head Latent Attention guard. Unless
+    /// [`Self::supports_chunked_mla`] also returns true, the scheduler keeps
+    /// the remaining prefill in one chunk because legacy MLA kernels do not
+    /// read prior paged history.
     fn is_mla(&self) -> bool {
+        false
+    }
+
+    /// Whether this MLA implementation reads prior paged history during
+    /// chunked prefill. Most MLA architectures still require one chunk; GLM-5
+    /// overrides this after maintaining its checkpoint semantic index.
+    fn supports_chunked_mla(&self) -> bool {
         false
     }
 
@@ -1138,6 +1265,15 @@ pub trait Model: Send + Sync {
     /// single-sequence broadcast.
     fn ep_broadcast_cmd_for_seq(&self, _seq_id: u32, _cmd: u32) -> Result<()> {
         Ok(()) // no-op for non-EP models
+    }
+
+    /// Set the request-local native-decode fence on the worker's matching
+    /// sequence before a prefill or resumed decode. The command is emitted
+    /// only for the native-only case so the established MTP wire transcript
+    /// remains unchanged. Workers consume the value before the next model
+    /// command, keeping TP2/EP2 prefill hooks in lockstep with the head.
+    fn ep_broadcast_disable_mtp_for_seq(&self, seq_id: u32, disabled: bool) -> Result<()> {
+        super::model_defaults::ep_broadcast_disable_mtp_for_seq(self, seq_id, disabled)
     }
 
     /// Returns true if this model's EP comm path is using the v2 protocol
@@ -1198,6 +1334,11 @@ pub trait Model: Send + Sync {
     /// index-select of `h_state_intermediates[num_accepted-1]`. No-op
     /// default for backends without the dual-buffer SSM state.
     /// Runs on `secondary_stream`; pair with `sync_secondary`.
+    ///
+    /// Call it with `seq.tokens` / `seq_len` already rolled back to the
+    /// accepted prefix, and before emitting the accepted tokens: an emit can
+    /// finish the sequence, and with KDA records every accept (full accepts
+    /// too) folds rows into the state that finish then caches.
     fn commit_accepted_prefix(
         &self,
         _seq: &mut SequenceState,
@@ -1229,6 +1370,12 @@ pub trait Model: Send + Sync {
         _reader: &mut dyn std::io::Read,
     ) -> Result<()> {
         bail!("swap not supported by this model")
+    }
+
+    /// Whether the two calls above round-trip everything a resumed sequence
+    /// reads. Otherwise the scheduler runs no `--swap-space` pool.
+    fn swap_resumable(&self) -> bool {
+        false
     }
 
     /// Whether `tokens` contains a vision pad token for this model — i.e.

@@ -99,6 +99,8 @@ pub(crate) fn hc_gemm(
     if n.div_ceil(128) * m.div_ceil(128) < sm_count {
         match crate::layers::ops::cublas_bf16_proj_dense(a, w, out, m, n, k, stream) {
             Ok(()) => return Ok(()),
+            // A failed launch may have written part of `out`: never rerun it.
+            Err(e) if spark_runtime::cutlass::launch_failed(&e) => return Err(e),
             Err(e) => {
                 static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                 if WARNED.set(()).is_ok() {

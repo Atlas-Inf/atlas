@@ -524,6 +524,11 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             ) {
+                // A failed launch may have written part of the output: never
+                // rerun it in the scalar kernel.
+                if spark_runtime::cutlass::launch_failed(&e) {
+                    return Err(e);
+                }
                 // Say WHY before falling back: a rejected operand here is the
                 // first sign of the misaligned pointer the scalar kernel then
                 // faults on (chunk 2+ of a chunked prefill, 2026-09-03).

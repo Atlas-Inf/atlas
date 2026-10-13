@@ -28,6 +28,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+#[path = "verify_a_decode_snapshot.rs"]
+mod decode_snapshot;
+
 impl TransformerModel {
     pub(super) fn decode_verify_dispatch(
         &self,
@@ -143,6 +146,7 @@ impl TransformerModel {
                     };
 
                     let ctx = ForwardContext {
+                        ssm_batch: None,
                         buffers: &self.buffers,
                         gpu: self.gpu.as_ref(),
                         config: &self.config,
@@ -180,6 +184,7 @@ impl TransformerModel {
             } else {
                 // SSM layers: GEMM-batched via decode_batched override
                 let ctx = ForwardContext {
+                    ssm_batch: None,
                     buffers: &self.buffers,
                     gpu: self.gpu.as_ref(),
                     config: &self.config,
@@ -319,6 +324,34 @@ impl TransformerModel {
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        // KDA records: the verify left h_state untouched. Fold the accepted
+        // rows in, or on a full reject restore conv alone from its checkpoint.
+        if self.ssm_pool.kda_record_row_bytes != 0 {
+            let stream = self.gpu.default_stream();
+            if num_accepted > 0 {
+                return self.commit_kda_records(seq, 0..num_accepted, true, stream);
+            }
+            let conv_bytes = self.config.ssm_conv_state_bytes();
+            let mut conv_plan = Vec::new();
+            for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
+                if self.config.layer_type(i) != atlas_core::config::LayerType::LinearAttention {
+                    continue;
+                }
+                let ssm = layer_state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+                if let Some(ckpt) = ssm.conv_state_checkpoint {
+                    conv_plan.push(StateCopy {
+                        src: ckpt,
+                        dst: ssm.conv_state,
+                        bytes: conv_bytes,
+                    });
+                }
+            }
+            return run_ssm_state_copies(self.gpu.as_ref(), &[], &conv_plan, stream);
+        }
+
         // PRE-VALIDATION PASS — no GPU work is enqueued until every SSM layer
         // is known to be restorable. Bailing part-way through the copy loop
         // below would leave the first N layers rewound and the rest advanced
@@ -434,56 +467,5 @@ impl TransformerModel {
         // No synchronize needed: rollback copies and subsequent operations
         // are on the same CUDA stream, so ordering is guaranteed.
         Ok(())
-    }
-
-    /// Phase-C decode-time boundary snapshot save.
-    ///
-    /// Copies the sequence's live SSM state (the active `SsmStatePool`
-    /// slot `seq.slot_idx`) into the decode-rollback ring slot
-    /// `(seq.slot_idx, ring_slot)` of [`SsmSnapshotPool`]. Reuses the
-    /// same D2D copy primitive Marconi and MTP verify use (SSOT). The
-    /// copies run on the default stream so they are ordered after the
-    /// decode that produced this boundary token and before any later
-    /// decode that would overwrite the pool slot.
-    pub(super) fn save_decode_ssm_snapshot_dispatch(
-        &self,
-        seq: &SequenceState,
-        ring_slot: usize,
-    ) -> Result<()> {
-        if !self.ssm_snapshots.decode_rollback_enabled() {
-            anyhow::bail!("save_decode_ssm_snapshot: decode-rollback region not allocated");
-        }
-        let stream = self.gpu.default_stream();
-        self.ssm_snapshots.save_decode(
-            seq.slot_idx,
-            ring_slot,
-            &self.ssm_pool,
-            self.gpu.as_ref(),
-            stream,
-        )
-    }
-
-    /// Phase-C decode-time boundary snapshot restore.
-    ///
-    /// Inverse of [`Self::save_decode_ssm_snapshot_dispatch`]: copies the
-    /// ring snapshot `(seq.slot_idx, ring_slot)` back into the live
-    /// `SsmStatePool` slot, undoing every recurrent update the dropped
-    /// degenerate tail applied.
-    pub(super) fn restore_decode_ssm_snapshot_dispatch(
-        &self,
-        seq: &SequenceState,
-        ring_slot: usize,
-    ) -> Result<()> {
-        if !self.ssm_snapshots.decode_rollback_enabled() {
-            anyhow::bail!("restore_decode_ssm_snapshot: decode-rollback region not allocated");
-        }
-        let stream = self.gpu.default_stream();
-        self.ssm_snapshots.restore_decode(
-            seq.slot_idx,
-            ring_slot,
-            &self.ssm_pool,
-            self.gpu.as_ref(),
-            stream,
-        )
     }
 }

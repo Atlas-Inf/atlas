@@ -576,8 +576,10 @@ extern "C" __global__ void causal_conv1d_update_l2norm_f32_strided(
 // spans channels so the [t*stride + ch] loads stay coalesced, and 8 token rows
 // per CTA amortise the weight loads.
 //
-// The conv_state write-back (last d_conv inputs) is done ONLY by the threads
-// owning the final token, since that is all it ever was.
+// conv_state is owned by the t0 == 0 thread of each channel: it is the only
+// thread that reads the incoming window, so it also writes the outgoing one
+// (the last d_conv inputs), after its reads. Letting the owner of the final
+// token write it instead raced with those reads once seq_len > 8.
 extern "C" __global__ void __launch_bounds__(256, 4)
 causal_conv1d_update_prefill_tp(
     float* __restrict__ conv_state,
@@ -633,9 +635,11 @@ causal_conv1d_update_prefill_tp(
         s0 = s1; s1 = s2; s2 = s3;
     }
 
-    // Only the owner of the last token writes the outgoing state: it is just the
-    // final d_conv inputs, which is all the serial kernel's trailing loop stored.
-    if (t0 + 8u >= seq_len) {
+    // The thread that read the incoming state writes the outgoing one: it is just
+    // the final d_conv inputs, which is all the serial kernel's trailing loop
+    // stored. For seq_len < d_conv the window keeps old entries, st[k] =
+    // state[k + seq_len], each read before ascending k overwrites it.
+    if (t0 == 0u) {
         float* st = conv_state + (unsigned long long)ch * d_conv;
         #pragma unroll
         for (unsigned int k = 0; k < 4; k++)

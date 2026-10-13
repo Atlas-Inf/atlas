@@ -12,11 +12,22 @@ use crate::layer::{ForwardContext, LayerState};
 use crate::layers::ops;
 
 mod attn;
+mod c4;
 mod ctx;
 mod ffn;
+pub(crate) use ffn::{
+    grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
+};
+mod glm_long_owner;
 mod guard;
+mod hc_ffn;
+mod hc_generic;
+mod hc_pre_site;
 mod mla;
 mod mla_gemv;
+mod mla_glm;
+mod mla_glm_sparse;
+mod mla_independent;
 mod nemotron_serial;
 mod qkv;
 mod qkv_dp4a;
@@ -60,7 +71,8 @@ impl Qwen3AttentionLayer {
         // is refused HERE, before any layer state is touched (`guard.rs`).
         let qsa_rows = guard::plan_qsa_rows(self, seq_lens, num_seqs, row_owner, kv_cache, ctx)?;
         let bs = kv_cache.block_size() as u32;
-        let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
+        let mut c =
+            ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, seq_lens, bs, stream);
         // Per-request LoRA routing slot buffer for this step (from metadata).
         if let Some(m) = ctx.attn_metadata.as_ref() {
             c.seq_slot = m.seq_slot;
@@ -135,9 +147,8 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    /// HC-enabled batched multi-sequence decode.  Only the sequential
-    /// per-token FFN branch is implemented (DeepSeek-V4 MLA always
-    /// takes this path).
+    /// Run serial phases while retaining upstream per-sequence auxiliary state.
+    #[allow(clippy::too_many_arguments)]
     fn decode_multi_seq_inner_hc<'a, 'b: 'a>(
         &self,
         c: ctx::MultiSeqCtx<'_>,
@@ -149,14 +160,48 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if let Some(phase) = self.ms_hc_attention_norm_impl(
+            &c,
+            kv_cache,
+            ctx,
+            stream,
+            Some(states),
+            row_owner,
+            qsa_rows,
+            seq_lens,
+        )? {
+            self.ms_hc_ffn_post(&c, phase, ctx, stream)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ms_hc_attention_norm_impl<'a, 'b: 'a>(
+        &self,
+        c: &ctx::MultiSeqCtx<'_>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+        mut states: Option<&'a mut [&'b mut (dyn LayerState + 'static)]>,
+        row_owner: Option<&[usize]>,
+        qsa_rows: bool,
+        seq_lens: &[usize],
+    ) -> Result<Option<hc_ffn::HcFfnPhase>> {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
         let n = c.n;
         let hc = self.hc.as_ref().unwrap();
+        self.validate_glm_c4(c)?;
         let hc_mult = hc.hc_mult as u32;
-        // MODEL layer indices — see the note in `prefill_inner.rs`.
-        let is_first_layer = hc.is_first_model_layer;
-        let is_last_layer = hc.is_last_model_layer;
+        // GLM uses physical block_idx; mixed upstream models carry model indices.
+        let (is_first_layer, is_last_layer) = if ctx.config.model_type == "glm5_next" {
+            (
+                self.block_idx == 0,
+                self.block_idx + 1 == ctx.config.num_hidden_layers,
+            )
+        } else {
+            (hc.is_first_model_layer, hc.is_last_model_layer)
+        };
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
@@ -177,20 +222,8 @@ impl Qwen3AttentionLayer {
         }
 
         // ── Phase 1: collapse + norm for N tokens ──
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            &hc.attn,
-            hc,
-            c.hidden,
-            post,
-            comb,
-            ctx.buffers.hc_lowrank_scratch(),
-            n as u32,
-            h as u32,
-            eps,
-            stream,
+        self.ms_hc_pre_site(
+            &hc.attn, hc, hc_streams, c.hidden, post, comb, n, eps, ctx, stream,
         )?;
         if diag_this {
             super::diag_norm(
@@ -239,19 +272,22 @@ impl Qwen3AttentionLayer {
 
         // ── Phases 2-6: attention ──
         let o_out = if let Some(ref _mla) = self.mla {
-            self.ms_mla_decode(&c, kv_cache, meta)?
+            self.ms_mla_decode(c, kv_cache, meta)?
         } else {
-            self.ms_phase_qkv(&c)?;
-            self.ms_phase_rope(&c, meta)?;
-            self.ms_phase_cache_write(&c, kv_cache, meta)?;
+            self.ms_phase_qkv(c)?;
+            self.ms_phase_rope(c, meta)?;
+            self.ms_phase_cache_write(c, kv_cache, meta)?;
             // `qsa_rows` (decided pre-mutation) owns BOTH this choice and the
             // ingest loop below, so a row is never ingested twice.
             let attn_out = if qsa_rows {
-                self.ms_phase_attn_qsa_rows(&c, &mut *states, row_owner, seq_lens, kv_cache, meta)?
+                let states = states.as_deref_mut().ok_or_else(|| {
+                    anyhow::anyhow!("QSA per-row phase requires per-sequence state")
+                })?;
+                self.ms_phase_attn_qsa_rows(c, states, row_owner, seq_lens, kv_cache, meta)?
             } else {
-                self.ms_phase_paged_decode(&c, kv_cache, meta)?
+                self.ms_phase_paged_decode(c, kv_cache, meta)?
             };
-            self.ms_phase_o_proj(&c, attn_out)?
+            self.ms_phase_o_proj(c, attn_out)?
         };
 
         if c.fwd.config.tp_world_size > 1
@@ -262,8 +298,11 @@ impl Qwen3AttentionLayer {
         }
 
         // ── QSA ingest continuity (all rows inert; see `qsa_rows.rs`) ──
-        if !qsa_rows {
-            self.ms_qsa_ingest_rows(&c, &mut *states, row_owner, seq_lens, kv_cache, meta)?;
+        if !qsa_rows && self.qsa.is_some() {
+            let states = states.ok_or_else(|| {
+                anyhow::anyhow!("QSA batched HC requires actual per-sequence state")
+            })?;
+            self.ms_qsa_ingest_rows(c, states, row_owner, seq_lens, kv_cache, meta)?;
         }
 
         // Expand attention output back into multi-stream state.
@@ -331,24 +370,12 @@ impl Qwen3AttentionLayer {
                     self.attn_layer_idx
                 );
             }
-            return Ok(());
+            return Ok(None);
         }
 
-        // ── Phase 7: FFN + hc_post (per-token sequential only) ──
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            &hc.ffn,
-            hc,
-            c.hidden,
-            post,
-            comb,
-            ctx.buffers.hc_lowrank_scratch(),
-            n as u32,
-            h as u32,
-            eps,
-            stream,
+        // Phase 7: collapse/norm, with the variant-specific kernel ABI.
+        self.ms_hc_pre_site(
+            &hc.ffn, hc, hc_streams, c.hidden, post, comb, n, eps, ctx, stream,
         )?;
         if diag_this {
             super::diag_norm(
@@ -390,78 +417,28 @@ impl Qwen3AttentionLayer {
                 .copy_d2d_async(c.hidden, c.normed, n * h * 2, stream)?;
         }
 
-        // Per-token sequential FFN (MLA models always take this path).
-        for i in 0..n {
-            let normed2_i = c.normed.offset(i * c.h * c.bf16);
-            let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
-            // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
-            let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
-            let post_i = post.offset(i * hc.hc_mult * 4);
-            let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
-            ops::hc_post_site(
-                ctx.gpu,
-                self.hc_post_k,
-                hc,
-                moe_out,
-                hc_streams_i,
-                post_i,
-                comb_i,
-                hc_streams_i,
-                1,
-                h as u32,
-                stream,
-            )?;
-        }
-        if diag_this {
-            super::diag_norm_f32(
-                ctx.gpu,
+        // GLM's caller consumes these shared-arena pointers immediately (or saves them).
+        if ctx.config.model_type == "glm5_next" {
+            return Ok(Some(hc_ffn::HcFfnPhase {
                 hc_streams,
-                h,
-                stream,
-                &format!("V4-msdecode L{} hc_post-ffn", self.attn_layer_idx),
-            );
-            super::diag_norm_f32(
-                ctx.gpu,
-                hc_streams,
-                n * (hc_mult as usize) * h,
-                stream,
-                &format!(
-                    "V4-msdecode L{} hc_post-ffn ALL_STREAMS",
-                    self.attn_layer_idx
-                ),
-            );
+                post,
+                comb,
+                diag_this,
+            }));
         }
+        self.ms_hc_generic_finish(
+            c,
+            ctx,
+            stream,
+            hc_ffn::HcFfnPhase {
+                hc_streams,
+                post,
+                comb,
+                diag_this,
+            },
+            is_last_layer,
+        )?;
 
-        if is_last_layer && let Some(ref head) = hc.head {
-            ops::hc_head_site(
-                ctx.gpu,
-                self.hc_head_k,
-                hc_streams,
-                head,
-                hc,
-                c.hidden,
-                ctx.buffers.hc_lowrank_scratch(),
-                n as u32,
-                h as u32,
-                eps,
-                stream,
-            )?;
-            if diag_this {
-                super::diag_norm(
-                    ctx.gpu,
-                    c.hidden,
-                    n * h,
-                    stream,
-                    &format!("V4-msdecode L{} hc_head", self.attn_layer_idx),
-                );
-            }
-        } else if is_last_layer {
-            tracing::warn!(
-                "V4-msdecode L{}: hc_head SKIPPED (no head weights)",
-                self.attn_layer_idx
-            );
-        }
-
-        Ok(())
+        Ok(None)
     }
 }

@@ -5,7 +5,12 @@
 // attribute under recent rustc).
 
 use super::*;
+use crate::gpu::GpuBackend;
 use crate::gpu::mock::MockGpuBackend;
+
+mod allocation_failure;
+mod sparse_index;
+mod zero_alias;
 
 fn test_config() -> KvCacheConfig {
     KvCacheConfig {

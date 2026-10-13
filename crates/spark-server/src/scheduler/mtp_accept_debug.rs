@@ -188,8 +188,26 @@ pub struct RequestAccept {
     mtp_steps: u64,
     d1: u64,
     na: u64,
+    /// Verifies that accepted at least `i + 1` drafts (the per-position
+    /// survival curve that sizes the draft cap).
+    survive: [u64; SURVIVAL_POSITIONS],
     pub regime_reprobes: u64,
+    // Per-request K=3/K=5 controller.  Zero is deliberately the deep state so
+    // `Default` starts every request with an informative K=5 probe.
+    depth_mode: u8,
+    last_verify_drafts: usize,
+    depth_steps: u16,
+    depth_full_accepts: u32,
+    depth_k3_accepts: u32,
+    shallow_steps_since_probe: u16,
+    depth_switches: u16,
 }
+
+const SURVIVAL_POSITIONS: usize = 7;
+const DEPTH_DEEP: u8 = 0;
+const DEPTH_SHALLOW: u8 = 1;
+const DEPTH_WINDOW: u16 = 12;
+const DEPTH_REPROBE_STEPS: u16 = 128;
 
 impl RequestAccept {
     pub fn record_serial(&mut self) {
@@ -205,6 +223,95 @@ impl RequestAccept {
         if accepted > 0 {
             self.d1 = self.d1.saturating_add(1);
         }
+        for s in self.survive.iter_mut().take(accepted as usize) {
+            *s = s.saturating_add(1);
+        }
+    }
+
+    /// Desired proposal depth for a single request.  This controller only
+    /// selects the two measured efficient kernels: K=3 (two drafts) and K=5
+    /// (four drafts).  Intermediate K=4 was slower than both on GB10.
+    pub fn depth_drafts(&self, max_drafts: usize, enabled: bool) -> usize {
+        if enabled && max_drafts >= 4 && self.depth_mode == DEPTH_SHALLOW {
+            2
+        } else {
+            max_drafts
+        }
+    }
+
+    /// Feed a true verify outcome to the per-request depth controller.
+    ///
+    /// A K=5 verify tells us both yields at identical context: the full
+    /// accepted prefix and `min(accepted, 2)`, the tokens K=3 would have kept.
+    /// We retain K=5 only when its token-yield ratio pays for its measured
+    /// ~20% higher target-forward cost.  K=3 periodically probes K=5 again,
+    /// and promotes early when its own acceptance becomes high.
+    pub fn record_depth_verify(&mut self, drafts: usize, accepted: usize, enabled: bool) {
+        self.last_verify_drafts = drafts;
+        if !enabled {
+            return;
+        }
+        self.record_depth_verify_inner(drafts, accepted);
+    }
+
+    fn record_depth_verify_inner(&mut self, drafts: usize, accepted: usize) {
+        if drafts >= 4 {
+            self.depth_steps = self.depth_steps.saturating_add(1);
+            self.depth_full_accepts = self
+                .depth_full_accepts
+                .saturating_add(accepted.min(drafts) as u32);
+            self.depth_k3_accepts = self.depth_k3_accepts.saturating_add(accepted.min(2) as u32);
+
+            if self.depth_steps >= DEPTH_WINDOW {
+                let steps = self.depth_steps as f64;
+                let full_yield = 1.0 + self.depth_full_accepts as f64 / steps;
+                let k3_yield = 1.0 + self.depth_k3_accepts as f64 / steps;
+                let yield_ratio = full_yield / k3_yield;
+                // Measured K5/K3 step-cost ratio is 1.20 on dual GB10.  A
+                // small margin avoids oscillation on a boundary workload.
+                if yield_ratio < 1.18 {
+                    if self.depth_mode != DEPTH_SHALLOW {
+                        self.depth_switches = self.depth_switches.saturating_add(1);
+                        tracing::info!(
+                            "MTP depth adapt: K5 -> K3 (yield_ratio={yield_ratio:.3}, window={})",
+                            self.depth_steps
+                        );
+                    }
+                    self.depth_mode = DEPTH_SHALLOW;
+                    self.shallow_steps_since_probe = 0;
+                } else {
+                    self.depth_mode = DEPTH_DEEP;
+                }
+                self.reset_depth_window();
+            }
+        } else if drafts == 2 && self.depth_mode == DEPTH_SHALLOW {
+            self.depth_steps = self.depth_steps.saturating_add(1);
+            self.depth_k3_accepts = self.depth_k3_accepts.saturating_add(accepted.min(2) as u32);
+            self.shallow_steps_since_probe = self.shallow_steps_since_probe.saturating_add(1);
+
+            if self.depth_steps >= DEPTH_WINDOW {
+                let mean = self.depth_k3_accepts as f64 / self.depth_steps as f64;
+                // Near-saturated K3 cannot observe positions 3/4, so promote
+                // to a K5 measurement window.  Low-acceptance prose measured
+                // ~1.0 here; high-acceptance requests measured ~1.75.
+                if mean >= 1.70 || self.shallow_steps_since_probe >= DEPTH_REPROBE_STEPS {
+                    self.depth_mode = DEPTH_DEEP;
+                    self.depth_switches = self.depth_switches.saturating_add(1);
+                    tracing::info!(
+                        "MTP depth adapt: K3 -> K5 probe (mean_k3={mean:.3}, since_probe={})",
+                        self.shallow_steps_since_probe
+                    );
+                    self.shallow_steps_since_probe = 0;
+                }
+                self.reset_depth_window();
+            }
+        }
+    }
+
+    fn reset_depth_window(&mut self) {
+        self.depth_steps = 0;
+        self.depth_full_accepts = 0;
+        self.depth_k3_accepts = 0;
     }
 
     /// Total draft tokens ACCEPTED for this request — the per-request quantity
@@ -262,14 +369,30 @@ impl RequestAccept {
     }
 
     pub fn done_suffix(&self) -> String {
+        let steps = self.mtp_steps.max(1) as f64;
+        let survival: Vec<String> = self
+            .survive
+            .iter()
+            .map(|&s| format!("{:.2}", s as f64 / steps))
+            .collect();
         format!(
-            "serial={:.2} mtp={:.2} p1={:.3} mean_na={:.3} tok_step={:.3} regime_reprobes={}",
+            "serial={:.2} mtp={:.2} p1={:.3} mean_na={:.3} tok_step={:.3} regime_reprobes={} depth={} depth_switches={} surv={}",
             self.serial_frac(),
             self.mtp_frac(),
             self.p1(),
             self.mean_na(),
             self.tok_step(),
-            self.regime_reprobes
+            self.regime_reprobes,
+            match self.last_verify_drafts {
+                1 => "k2",
+                2 => "k3",
+                3 => "k4",
+                4 => "k5",
+                _ if self.depth_mode == DEPTH_SHALLOW => "k3",
+                _ => "k5",
+            },
+            self.depth_switches,
+            survival.join(","),
         )
     }
 
@@ -282,92 +405,5 @@ impl RequestAccept {
 }
 
 #[cfg(test)]
-mod tests {
-
-    // The bucket table must cover the MTP dispatch cap, or distinct widths
-    // alias onto one bucket and `adaptive_rung` steers the n=16 rung from a
-    // mixture of n=16 and n>16 statistics (see the MAX_N doc). Regression
-    // guard for the 2026-07-30 cap raise that MAX_N never followed.
-    #[test]
-    fn bucket_table_covers_the_mtp_dispatch_cap() {
-        assert_eq!(BUCKETS.len(), MAX_N);
-        // The compiled default cap is 32, so 32 must be individually tracked.
-        const { assert!(MAX_N > 32) };
-        // And it must cover whatever cap THIS process is configured for
-        // (CI does not set the override; an operator who raises it past the
-        // table re-introduces the documented fold).
-        if std::env::var_os("ATLAS_MTP_MAX_SEQS").is_none() {
-            assert!(
-                MAX_N > spark_model::speculative::mtp_max_seqs(),
-                "MAX_N {MAX_N} does not cover dispatch cap {}",
-                spark_model::speculative::mtp_max_seqs()
-            );
-        }
-    }
-
-    // Distinct widths must not share a bucket anywhere the scheduler can
-    // dispatch MTP. Asserted on `bucket_idx`, the SSOT `record` indexes
-    // with, so it fails for exactly the widths that aliased before the fix
-    // (17..=32 onto 16). Env-independent: CI sets neither override.
-    #[test]
-    fn widths_up_to_the_cap_do_not_alias() {
-        if std::env::var_os("ATLAS_MTP_ACCEPT_FOLD_AT_16").is_some()
-            || std::env::var_os("ATLAS_MTP_MAX_SEQS").is_some()
-        {
-            return; // the kill switch deliberately restores the fold
-        }
-        for n in 0..=spark_model::speculative::mtp_max_seqs() {
-            assert_eq!(bucket_idx(n), n, "width {n} aliases onto another bucket");
-        }
-        // Beyond the table the documented fold still applies, and it must
-        // stay inside the array.
-        assert_eq!(bucket_idx(1_000), MAX_N - 1);
-        assert!(bucket_idx(usize::MAX) < BUCKETS.len());
-    }
-
-    use super::*;
-
-    #[test]
-    fn empty_suffix_is_zeros() {
-        let a = RequestAccept::default();
-        assert_eq!(
-            a.done_suffix(),
-            "serial=0.00 mtp=0.00 p1=0.000 mean_na=0.000 tok_step=1.000 regime_reprobes=0"
-        );
-    }
-
-    #[test]
-    fn thinking_serial_run_is_all_serial() {
-        let mut a = RequestAccept::default();
-        for _ in 0..300 {
-            a.record_serial();
-        }
-        assert!((a.serial_frac() - 1.0).abs() < 1e-9);
-        assert_eq!(a.mean_na(), 0.0);
-        assert_eq!(a.tok_step(), 1.0);
-        assert!(a.done_suffix().contains("serial=1.00"));
-        assert!(a.done_suffix().contains("mtp=0.00"));
-    }
-
-    #[test]
-    fn mtp_run_reports_p1_mean_na_tok_step() {
-        let mut a = RequestAccept::default();
-        for _ in 0..7 {
-            a.record_verify_emitted(2); // 1 draft, d1 match
-        }
-        for _ in 0..3 {
-            a.record_verify_emitted(1); // reject
-        }
-        assert!((a.mtp_frac() - 1.0).abs() < 1e-9);
-        assert!((a.p1() - 0.7).abs() < 1e-9);
-        assert!((a.mean_na() - 0.7).abs() < 1e-9);
-        // 7 verifies each accepting 1 draft: the per-request total the usage
-        // field reports is the raw sum, not a rate.
-        assert_eq!(a.accepted_total(), 7);
-        assert!((a.tok_step() - 1.7).abs() < 1e-9);
-        a.note_regime_reprobe();
-        assert!(a.done_suffix().contains("mean_na=0.700"));
-        assert!(a.done_suffix().contains("tok_step=1.700"));
-        assert!(a.done_suffix().contains("regime_reprobes=1"));
-    }
-}
+#[path = "mtp_accept_debug_tests.rs"]
+mod tests;

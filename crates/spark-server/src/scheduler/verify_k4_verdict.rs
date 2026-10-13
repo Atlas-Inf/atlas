@@ -54,7 +54,7 @@ fn save_hidden(model: &dyn Model, hidden: K4Hidden, na: usize) -> anyhow::Result
 /// (per-row picks incl. the bonus row), `num_accepted` in 0..=nd. At nd=3
 /// this is the verbatim four-branch tail of the pre-refactor
 /// `step_verify_k4`, branch-collapsed; the phase ORDER of each original
-/// branch is preserved exactly (full accept: emit → commit → save → trim →
+/// branch is preserved exactly (full accept: commit → emit → save → trim →
 /// propose; partial/reject: rewind → trim → commit → emit → save → propose).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn k4_apply_verdict(
@@ -77,6 +77,18 @@ pub(super) fn k4_apply_verdict(
 
     if na == nd {
         // ── Full accept: every draft matched; v[nd] is the free bonus. ──
+        // Item #2 (STree-style in-place verify commit). Full accept
+        // (num_accepted == k): the verify kernel already wrote the canonical
+        // h_state, so the commit is a no-op, except with KDA records, where
+        // it folds the rows in. Committed before emission for that case: an
+        // emit that finishes the sequence returns (see `verify_dflash_tail`).
+        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, k_rows, k_rows) {
+            // SSM state is no longer trustworthy — terminate, do not continue.
+            tracing::error!("commit_accepted_prefix (K={k_rows} accept-{k_rows}): {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
+            a.finished = true;
+            return;
+        }
         for j in 0..nd {
             emit_token(a, drafts[j], verify_lps.get(j).cloned(), sched);
             if a.finished {
@@ -88,17 +100,6 @@ pub(super) fn k4_apply_verdict(
             return;
         }
         a.last_token = v[nd];
-
-        // Item #2 (STree-style in-place verify commit). Full accept
-        // (num_accepted == k): the verify kernel already wrote the canonical
-        // h_state, so the commit is a no-op.
-        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, k_rows, k_rows) {
-            // SSM state is no longer trustworthy — terminate, do not continue.
-            tracing::error!("commit_accepted_prefix (K={k_rows} accept-{k_rows}): {e:#}");
-            a.engine_error = Some(format!("{e:#}"));
-            a.finished = true;
-            return;
-        }
     } else {
         // ── Partial accept / reject: rewind the rejected tail. ──
         a.seq.seq_len -= nd - na;
@@ -159,6 +160,9 @@ pub(super) fn k4_apply_verdict(
                 tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
+        sched
+            .timing
+            .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
             "K{k_rows} ACCEPT-{na}: verify={verify_us}μs propose={propose_us}μs seq_len={}",

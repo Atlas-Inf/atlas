@@ -179,6 +179,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               jinja_template: \"{}\",\n\
              \x20               enable_loop_watchdog: {},\n\
              \x20               enable_think_loop_watchdog: {},\n\
+             \x20               enable_stream_loop_guards: {},\n\
              \x20               honor_eos_inside_thinking: {},\n\
              \x20               cap_thinking_at_max_tokens: {},\n\
              \x20               min_p_floor: {:?},\n\
@@ -225,6 +226,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_jinja_template,
             target.behavior_enable_loop_watchdog,
             target.behavior_enable_think_loop_watchdog,
+            target.behavior_enable_stream_loop_guards,
             target.behavior_honor_eos_inside_thinking,
             target.behavior_cap_thinking_at_max_tokens,
             target.behavior_min_p_floor,

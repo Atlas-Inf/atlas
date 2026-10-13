@@ -91,7 +91,7 @@ pub(super) fn required_optional_kernels_for_dtype(
                 "inferspark_prefill_paged_turbo3k_turbo8v_64",
             ));
         }
-        KvCacheDtype::Bf16 | KvCacheDtype::Fp8 | KvCacheDtype::Nvfp4 => {}
+        KvCacheDtype::Bf16 | KvCacheDtype::Fp8 | KvCacheDtype::Nvfp4 | KvCacheDtype::Fp8G128 => {}
     }
     // WHT rotation bookends: the write path stores turbo cache contents in
     // the rotated basis whenever either side is a turbo dtype at a supported

@@ -32,6 +32,8 @@ use crate::scheduler::ActiveSeq;
 /// Rolling accept window + suspend state, embedded in [`ActiveSeq`].
 #[derive(Default)]
 pub(crate) struct AdaptState {
+    /// Per-position draft acceptance for the verify width choice.
+    pub(crate) survival: super::dflash_width::DraftSurvival,
     window: Vec<u32>,
     suspended: bool,
     serial_tokens: u32,

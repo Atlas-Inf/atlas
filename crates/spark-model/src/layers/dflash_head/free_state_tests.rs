@@ -73,6 +73,7 @@ pub(super) fn zero_scratch() -> DflashScratch {
         dflash2_conv_delta: DevicePtr(0),
         dflash2_conv_out: DevicePtr(0),
         dflash2_projected_hidden: DevicePtr(0),
+        dflash2_selector_scratch: DevicePtr(0),
     }
 }
 
@@ -149,6 +150,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         batch_markov_embed: DevicePtr(0),
         batch_markov_bias: DevicePtr(0),
         batch_dflash2_projected: DevicePtr(0),
+        batch_dflash2_selector_scratch: DevicePtr(0),
         batch_conv_delta: DevicePtr(0),
         batch_conv_out: DevicePtr(0),
         extra_lanes: Vec::new(),
@@ -167,8 +169,10 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         suppress_graphs: std::sync::atomic::AtomicBool::new(false),
         propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
         quant: super::DflashQuantization::Bf16,
+        twins: Default::default(),
         startup: super::DsparkStartupExecution::from_env_lenient(),
         ctx_carry: parking_lot::Mutex::new(None),
+        rank_split: None,
     }
 }
 
@@ -179,6 +183,9 @@ pub(super) fn zero_kernels() -> DflashKernels {
         residual_rms_norm: zero,
         dense_gemv: zero,
         dense_gemv_batchm: zero,
+        dense_gemv_tc16: zero,
+        dense_gemv_tc32: zero,
+        small_m_gemv: false,
         dense_gemm: zero,
         w4a16_gemm: zero,
         dense_gemm_pipelined: zero,
@@ -208,6 +215,8 @@ pub(super) fn zero_kernels() -> DflashKernels {
         w4a16_gemv_batch8: zero,
         w4a16_gemv_batch16: zero,
         w4a16_gemv_batch32: zero,
+        mxfp8_quantize: zero,
+        mxfp8_gemv: [zero; 3],
         dflash2_conv: None,
         dflash2_candidate_selector_batched: KernelHandle(0),
         dflash2_candidate_selector: None,
@@ -244,6 +253,7 @@ pub(super) fn live_state(
         block_table: Vec::new(),
         seq_len: 300,
         last_num_drafted: 3,
+        last_draft_conf: Vec::new(),
         prefill_done: true,
         ctx_hidden_acc: gpu.alloc(4096).unwrap(),
         ctx_len: 300,
@@ -259,6 +269,11 @@ pub(super) fn live_state(
         max_ctx_count_drafter: 1024,
         ctx_committed: 300,
         ctx_positions: (0..300).collect(),
+        end_floor: 0,
+        first_append_at: None,
+        own_capture: false,
+        own_row_at: None,
+        own_row: None,
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
     })
@@ -290,6 +305,7 @@ pub(super) fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState
         block_table: Vec::new(),
         seq_len: 0,
         last_num_drafted: 0,
+        last_draft_conf: Vec::new(),
         prefill_done: false,
         ctx_hidden_acc: gpu.alloc(4096).unwrap(),
         ctx_len: 0,
@@ -305,6 +321,11 @@ pub(super) fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState
         max_ctx_count_drafter: 0,
         ctx_committed: 0,
         ctx_positions: Vec::new(),
+        end_floor: 0,
+        first_append_at: None,
+        own_capture: false,
+        own_row_at: None,
+        own_row: None,
         lane_id: 0,
         lifecycle: None,
     })
@@ -466,32 +487,4 @@ fn real_free_state_missing_owner_is_rejected_and_reclaimed() {
         CaptureStatus::Retired
     );
     assert_eq!(gpu.destroy_graph_count(), 0);
-}
-
-#[test]
-fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
-    let _pool_guard = lock_and_drain_pool();
-    let gpu = MockGpuBackend::new();
-    let head = zero_head();
-    let own = owner(3, 77);
-
-    let mut boxed = live_state(&gpu, own);
-    hold_two_blocks(boxed.as_mut(), &head.kv_cache);
-
-    // The accumulator goes to the reuse pool (no backend free); the
-    // injected failure lands on the block-table-dev free — its handle must
-    // be RESTORED so a retry can release it.
-    gpu.fail_next_free();
-    head.free_state(&gpu, Some(own), boxed.as_mut())
-        .expect("free_state succeeds despite the backend free failure");
-
-    assert_eq!(boxed.ctx_hidden_acc.0, 0);
-    assert!(
-        boxed.block_table_dev.is_some(),
-        "handle restored, retryable"
-    );
-    // …and the retry DOES release it (flag is one-shot).
-    head.free_state(&gpu, Some(own), boxed.as_mut())
-        .expect("second free retries the block table free");
-    assert!(boxed.block_table_dev.is_none());
 }

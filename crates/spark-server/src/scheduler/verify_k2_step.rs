@@ -156,7 +156,7 @@ pub fn step_verify_k2(
     let (v0, v1) = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
-        model.is_lightning_dspark_product(),
+        model,
         a,
     ) {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD) basis.
@@ -205,18 +205,11 @@ pub fn step_verify_k2(
 
     if accepted {
         // ── ACCEPTED ──
-        emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
-        if !a.finished {
-            emit_token(a, v1, verify_lps.get(1).cloned(), sched);
-        }
-        if a.finished {
-            return;
-        }
-        a.last_token = v1;
-
         // Item #2 (STree-style in-place K=2 verify commit). Full accept
         // (num_accepted=k=2): the verify kernel already wrote the canonical
-        // h_state, so the commit is a no-op.
+        // h_state, so the commit is a no-op, except with KDA records, where
+        // it folds the rows in. Committed before emission for that case: an
+        // emit that finishes the sequence returns (see `verify_dflash_tail`).
         let t_commit = Instant::now();
         if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 2, 2) {
             // An SSM-state commit error means the recurrent state is no longer
@@ -228,6 +221,15 @@ pub fn step_verify_k2(
             return;
         }
         sched.timing.record(Phase::Commit, t_commit);
+
+        emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
+        if !a.finished {
+            emit_token(a, v1, verify_lps.get(1).cloned(), sched);
+        }
+        if a.finished {
+            return;
+        }
+        a.last_token = v1;
 
         // EAGLE-fix (ATLAS_DFLASH_EAGLE_FIX=1, K=2 accept only): append row 0 @ N
         // then row 1 @ N+1 BEFORE propose so forward_block conditions on row 1

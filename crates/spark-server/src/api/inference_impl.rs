@@ -55,6 +55,17 @@ impl InferenceRequest {
         }
     }
 
+    /// Buffered (`stream: false`) caller dropped its response receiver, so any
+    /// further model work for this request is unobservable. Streaming requests
+    /// always report `false` here — they are cancelled cooperatively through
+    /// `cancel_flag`, which the scheduler checks at its step boundaries.
+    pub fn caller_gone(&self) -> bool {
+        match self {
+            InferenceRequest::Blocking { response_tx, .. } => response_tx.is_closed(),
+            InferenceRequest::Streaming { .. } => false,
+        }
+    }
+
     /// Preprocessed image data, consumed by the scheduler before prefill.
     pub fn take_image_pixels(&mut self) -> Vec<spark_model::VisionItem> {
         match self {
@@ -466,15 +477,6 @@ pub(crate) fn strip_stop_sequences_matched(
     (text, None)
 }
 
-/// Strip `<think>...</think>` reasoning content from model output.
-///
-/// Qwen3.5 models generate internal reasoning between `<think>` and `</think>` tags.
-/// This must be removed from the API response so that:
-/// 1. Clients don't see internal reasoning in the content field
-/// 2. Multi-turn conversations aren't corrupted when clients echo assistant content back
-///
-/// Returns only the text after the final `</think>` tag (the actual response),
-/// trimmed of leading whitespace.
 /// Extract `<think>...</think>` reasoning from model output.
 ///
 /// Returns `(reasoning_content, response_content)`.
