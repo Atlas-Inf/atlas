@@ -7,6 +7,10 @@ use atlas_core::device::sm121::NUM_SMS;
 
 use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 
+#[cfg(test)]
+#[path = "sizes_total_tests.rs"]
+mod total_tests;
+
 /// QSA stage-2 prefill-selection scratch row cap (Qwen3.8-Flash-Next): the
 /// arena is slabbed at this many selective rows, and the consumer
 /// (`spark-model` `qsa_select.rs`) must slab identically — a drift is a
@@ -165,7 +169,8 @@ pub struct BufferSizes {
     /// `ffn_act_q8`: q8_1_mmq activations `m*kpad*4 + 1MB` (Q4_K path).
     /// `ffn_act_a`: int8 `[m,K]` / NVFP4 packed `[m,K/2]` activations.
     /// `ffn_act_scale`: int8 `[m,K/32]*4` / NVFP4 `[m,K/16]` group scales.
-    /// 0 for MoE models (dense FFN prefill path is Dense-only).
+    /// 0 only when the model has no dense FFN layers. Hybrid dense/MoE models
+    /// (for example GLM-5) still need this scratch for `mlp_only_layers`.
     pub ffn_act_q8: usize,
     pub ffn_act_a: usize,
     pub ffn_act_scale: usize,
@@ -455,14 +460,31 @@ impl BufferSizes {
         // Dense-FFN activation-quant scratch, shared across all layers (SSOT).
         // Sized for the largest projection K = max(hidden, intermediate); the
         // dense_ffn prefill paths pass `h.max(inter)` to the requant kernels.
-        // 0 for MoE (num_experts>0) — those never take the dense_ffn MMQ path.
-        let (ffn_act_q8, ffn_act_a, ffn_act_scale) = if config.num_experts == 0 {
+        // Pure MoE models never take the dense_ffn path, but hybrid models do:
+        // GLM-5 has routed experts globally plus three `mlp_only_layers`.
+        let has_dense_ffn = config.num_experts == 0 || !config.mlp_only_layers.is_empty();
+        let (ffn_act_q8, ffn_act_a, ffn_act_scale) = if has_dense_ffn {
             let kmax = h.max(config.intermediate_size);
             let kpad = kmax.div_ceil(256) * 256;
+            // Hybrid MoE models (a few dense layers, e.g. GLM-5) size only what
+            // their dense prefill reads: the NVFP4 MMQ needs just its
+            // block_fp4_mmq form (144 B per 256 values), and the int8/FP4
+            // activation pair is read only by `ATLAS_FFN_MMQ` (Q4_K),
+            // `ATLAS_INT8_PREFILL` and `ATLAS_FP4_PREFILL`. On GLM-5 at 8K-row
+            // chunks this returns ~0.5 GB to the KV pool. Dense models keep
+            // the unconditional sizing.
+            let hybrid = config.num_experts > 0;
+            let env = |name| std::env::var_os(name).is_some();
+            let q4k = !hybrid || env("ATLAS_FFN_MMQ");
+            let requant = !hybrid || q4k || env("ATLAS_INT8_PREFILL") || env("ATLAS_FP4_PREFILL");
             (
-                m * kpad * 4 + (1 << 20), // q8_1_mmq: m*kpad*4 + 1MB (matches q8_1_scratch_bytes)
-                m * kmax,                 // int8 a_i8 [m,K] ≥ NVFP4 packed [m,K/2]
-                m * (kmax / 16) * 4,      // int8 a_scale [m,K/16]*4
+                if q4k {
+                    m * kpad * 4 + (1 << 20) // q8_1_mmq: m*kpad*4 + 1MB (matches q8_1_scratch_bytes)
+                } else {
+                    m * (kpad / 256) * 144 + (1 << 20) // block_fp4_mmq
+                },
+                if requant { m * kmax } else { 0 }, // int8 a_i8 [m,K] >= NVFP4 packed [m,K/2]
+                if requant { m * (kmax / 16) * 4 } else { 0 }, // int8 a_scale [m,K/16]*4
             )
         } else {
             (0, 0, 0)
@@ -690,6 +712,8 @@ impl BufferSizes {
             + self.qsa_select_scratch
             + self.expert_down_out
             + self.splitk_workspace
+            + self.o_latent
+            + self.norm_unit_w
             + self.gdn_fla_scratch
             + self.ssd_scratch
             + self.hc_streams
