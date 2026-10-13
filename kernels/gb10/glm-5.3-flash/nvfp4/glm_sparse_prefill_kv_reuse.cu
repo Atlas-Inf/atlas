@@ -104,6 +104,9 @@ __device__ __forceinline__ void glm_kvp_load_tile(
 // IDs and writes its normalized FP32 output and natural LSE (-inf when empty)
 // for glm_sparse_decode_split_merge, instead of the BF16 output. Few-row
 // callers (verify owners) then fill the GPU; one split is the unsplit kernel.
+// `row_counts` (SPLIT, may be null): row `r` selects only its first
+// `row_counts[r]` IDs (glm_kv_shard_localize_compact), and the splits
+// partition that prefix instead of the whole `index_width`.
 template <bool FP8, bool SPLIT>
 __device__ __forceinline__ void glm_kv_pad_body(
     const __nv_bfloat16* Q,
@@ -118,7 +121,8 @@ __device__ __forceinline__ void glm_kv_pad_body(
     unsigned int cache_block_size,
     float inv_sqrt_d,
     float* __restrict__ part_o,     // SPLIT: [splits, rows, heads, 512]
-    float* __restrict__ part_lse    // SPLIT: [splits, rows, heads]
+    float* __restrict__ part_lse,   // SPLIT: [splits, rows, heads]
+    const unsigned int* __restrict__ row_counts = nullptr  // SPLIT: [rows]
 ) {
     const unsigned int token_row = blockIdx.y;
     const unsigned int head_start = blockIdx.x * 32;
@@ -133,10 +137,12 @@ __device__ __forceinline__ void glm_kv_pad_body(
     // This CTA's selected-ID range [kv_begin, kv_len).
     unsigned int kv_begin = 0, kv_len = index_width;
     if constexpr (SPLIT) {
-        const unsigned int tiles = (index_width + BC_512 - 1) / BC_512;
+        const unsigned int width =
+            row_counts != nullptr ? min(row_counts[token_row], index_width) : index_width;
+        const unsigned int tiles = (width + BC_512 - 1) / BC_512;
         const unsigned int per = (tiles + gridDim.z - 1) / gridDim.z;
-        kv_begin = min(blockIdx.z * per * BC_512, index_width);
-        kv_len = min(kv_begin + per * BC_512, index_width);
+        kv_begin = min(blockIdx.z * per * BC_512, width);
+        kv_len = min(kv_begin + per * BC_512, width);
     }
     const int* indices = token_indices + (unsigned long long)token_row * index_width;
     Q += ((unsigned long long)token_row * num_heads + head_start) * head_dim;
@@ -418,6 +424,9 @@ __device__ __forceinline__ void glm_kv_pad_body(
     Q, K_cache, token_indices, O, block_table, rows, num_heads, head_dim, index_width, \
     cache_block_size, inv_sqrt_d
 
+// glm_kv_shard.cu includes this file for the body above and instantiates its
+// own entry points (the counted split); the ones below stay in this module.
+#ifndef GLM_KV_SHARD_MODULE
 extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(GLM_KV_PAD_ARGS) {
     (void)V_cache;
     glm_kv_pad_body<false, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr);
@@ -443,3 +452,4 @@ extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split
 
 // Opt-in pipelined fp8_g128 variant (ATLAS_GLM_SPARSE_PREFILL_PIPE=1), bit-identical to the above.
 #include "glm_sparse_prefill_pipe.cuh"
+#endif  // GLM_KV_SHARD_MODULE

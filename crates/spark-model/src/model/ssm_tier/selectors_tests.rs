@@ -66,7 +66,11 @@ fn build_tier_store_defaults_to_host_ram_unbounded() {
 }
 
 #[test]
-fn spill_home_tracks_the_actual_swap_backing() {
+fn a_spill_home_reserves_its_staging_blob_and_its_host_arena() {
+    // What the KV sizing leaves out of the pool (with the NVMe prefix tier).
+    assert_eq!(SpillHome::Peer.lazy_host_bytes(100), 100);
+    assert_eq!(SpillHome::Disk { hot_slots: 0 }.lazy_host_bytes(100), 100);
+    assert_eq!(SpillHome::Disk { hot_slots: 64 }.lazy_host_bytes(100), 6500);
     // The arena is host RAM only when the swap tier behind it is a file:
     // a host-RAM swap has no bound to reserve.
     assert_eq!(

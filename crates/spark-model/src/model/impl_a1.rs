@@ -210,7 +210,9 @@ impl TransformerModel {
         // fill in upload_batch_metadata_*) would otherwise dequant random
         // bytes and inject garbage into attention scores.
         let mut kv_cache = kv_cache;
-        let dummy_kv_block = kv_cache.alloc_block()?;
+        // Padding tables name it at every logical index; draw it as logical
+        // block 0 (a latent-sharded cache refuses index-less allocation).
+        let dummy_kv_block = kv_cache.alloc_block_at(0)?;
         kv_cache.zero_block(dummy_kv_block, gpu.as_ref(), gpu.default_stream())?;
         gpu.synchronize(gpu.default_stream())?;
 
@@ -604,6 +606,8 @@ impl TransformerModel {
         // value is dead code and must not suppress CUDA graphs.
         let has_fp8_calibration = config.fp8_kv_calibration_tokens > 0
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
+        // Sharded latents exchange with the peer inside attention (eager only).
+        let latent_shard = kv_cache.latent_shard().is_some();
         // Feature-2 overlay kernels: resolve before `gpu` is moved into Self.
         let overlay_kernels = crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
         let warm = super::warm_turn::WarmTurn::from_env(&config.model_type)?;
@@ -674,6 +678,7 @@ impl TransformerModel {
             // naturally outside the captured region.
             suppress_graphs: std::sync::atomic::AtomicBool::new(
                 has_fp8_calibration
+                    || latent_shard
                     || std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true")
                     // PCND diagnostic: force eager decode (no CUDA-graph capture)
                     // so ATLAS_DEBUG_SYNC_KERNELS can synchronize per launch and

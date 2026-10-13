@@ -444,7 +444,7 @@ impl LayerPool {
 pub struct PagedKvCache {
     layers: Vec<LayerPool>,
     num_blocks: usize,
-    free_blocks: Vec<u32>,
+    free_blocks: free_blocks::FreeBlocks,
     /// Per-block reference count. Enables shared blocks (prefix caching).
     /// Default: 1 on alloc, freed when decremented to 0.
     block_ref_counts: Vec<u32>,
@@ -454,16 +454,30 @@ pub struct PagedKvCache {
     tail_slots: Option<tail_slots::TailSlots>,
     /// Per-block refcount event history (`ATLAS_KV_TRACE=1`; inert otherwise).
     trace: block_trace::BlockTrace,
+    /// Prefix-cache NVMe spill store (`ATLAS_KV_NVME_DIR`); `None` = off.
+    nvme: Option<nvme_spill::NvmeSpill>,
+    /// Token-sharded latent storage (`ATLAS_GLM_KV_SHARD=1`); `None` stores
+    /// every block's latents locally.
+    latent_shard: Option<LatentShard>,
 }
 
 mod block_trace;
 mod catalog;
+mod debug_impl;
+mod free_blocks;
+mod latent_shard;
+mod nvme_fast;
+mod nvme_io;
+mod nvme_spill;
+mod nvme_sync;
+pub use nvme_spill::NvmeIoStats;
 mod paged_impl;
 mod release;
 mod sparse_index;
 mod sparse_index_impl;
 mod tail_slots;
 mod zero_impl;
+pub use latent_shard::{ExchangeLane, LatentShard, LatentShardSpec, LatentViewPlan};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
 pub use tail_slots::{NO_TAIL, TailSlotPlan};
 #[cfg(test)]

@@ -12,6 +12,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, SparseIndexCacheConfi
 use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
+use crate::layers::glm_kv_shard as shard;
 use crate::layers::moe::SharedFp8Reserve;
 use crate::model::glm_cache_plan::{GlmCachePlan, GlmMlaShape};
 
@@ -175,15 +176,101 @@ pub(super) fn cache_plan(
     Ok((sparse_index, tail_slots, glm_cache_plan))
 }
 
+/// `ATLAS_GLM_KV_SHARD=1`: `plan` with this rank storing only its blocks'
+/// latents (see `layers::glm_kv_shard`), once the topology admits it.
+pub(super) fn shard_plan(
+    plan: Option<GlmCachePlan>,
+    config: &ModelConfig,
+    kv_config: &KvCacheConfig,
+    comm: Option<&dyn spark_comm::CommBackend>,
+    max_seq_len: usize,
+    max_batch_tokens: usize,
+) -> Result<Option<GlmCachePlan>> {
+    use anyhow::{Context, ensure};
+    // Junk shard settings, and tunings or the check without the shard, fail
+    // the boot.
+    let tuning = shard::MergeTuning::get()?;
+    if !shard::requested()? {
+        return Ok(plan);
+    }
+    let plan = plan.context("ATLAS_GLM_KV_SHARD=1 shards the GLM-5 NoPE MLA latent cache only")?;
+    let comm = comm
+        .filter(|c| c.world_size() == 2)
+        .context("ATLAS_GLM_KV_SHARD=1 needs a two-rank communicator")?;
+    ensure!(
+        // Serving topology has already converted this to local heads.
+        config.tp_world_size == 2 && config.num_attention_heads == 32,
+        "ATLAS_GLM_KV_SHARD=1 needs TP2 over 64 attention heads (32 per rank); \
+         got tp_world_size={} num_attention_heads={}",
+        config.tp_world_size,
+        config.num_attention_heads
+    );
+    ensure!(
+        kv_config.cache_blocks_per_seq.is_none(),
+        "ATLAS_GLM_KV_SHARD=1 does not support --high-speed-swap"
+    );
+    // The NVMe prefix tier spills and restores whole blocks' latents by
+    // physical id, and a rank stores only its own blocks'.
+    ensure!(
+        super::kv_nvme::config_from_env()?.is_none(),
+        "ATLAS_GLM_KV_SHARD=1 does not support the NVMe prefix tier ({})",
+        super::kv_nvme::DIR_VAR
+    );
+    ensure!(
+        (0..kv_config.num_layers).all(|l| matches!(
+            kv_config.dtype_for_layer(l),
+            KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128
+        )),
+        "ATLAS_GLM_KV_SHARD=1 needs a BF16 or fp8_g128 latent cache on every layer"
+    );
+    // Lanes that read latents by global block id and are chosen by the
+    // environment: refused here rather than mid-request (the pool accessors
+    // panic under a shard).
+    let lane = shard::unsharded_lane(|name| std::env::var(name).ok());
+    ensure!(
+        lane.is_none(),
+        "ATLAS_GLM_KV_SHARD=1 does not support {}: its attention reads latents by global \
+         block id, and this rank stores only its own blocks",
+        lane.unwrap_or_default()
+    );
+    tracing::info!(
+        "KV latent shard merge form: compact={} overlap={} check={}",
+        tuning.compact,
+        tuning.overlap,
+        tuning.check
+    );
+    // A cache write carries at most one chunk of rows (plus verify slack).
+    let spec = spark_runtime::kv_cache::LatentShardSpec {
+        lane: tuning.overlap,
+        ..shard::spec(comm.rank(), kv_config, max_seq_len, max_batch_tokens + 64)
+    };
+    Ok(Some(plan.latent_sharded(kv_config, spec)))
+}
+
+/// The paged cache `plan` describes: latent-sharded, V aliasing K (GLM), or
+/// the generic layout.
+pub(super) fn new_kv_cache(
+    kv_config: KvCacheConfig,
+    num_blocks: usize,
+    gpu: &dyn GpuBackend,
+    plan: Option<GlmCachePlan>,
+) -> Result<spark_runtime::kv_cache::PagedKvCache> {
+    use spark_runtime::kv_cache::PagedKvCache;
+    match plan.and_then(GlmCachePlan::shard) {
+        Some(spec) => PagedKvCache::new_latent_sharded(kv_config, num_blocks, gpu, spec),
+        None => PagedKvCache::new_with_v_alias(kv_config, num_blocks, gpu, plan.is_some()),
+    }
+}
+
 pub(super) fn agree_kv_blocks(
     comm: Option<&dyn spark_comm::CommBackend>,
     gpu: &dyn GpuBackend,
     mut num_kv_blocks: usize,
     glm_cache_plan: Option<GlmCachePlan>,
-    spill_tier: u32,
+    spill_tier: Result<u32>,
 ) -> Result<usize> {
     // Test knob: cap the pool (e.g. to force prefix-cache eviction and the
-    // optional cache tiers without starving the rest of the budget).
+    // NVMe tier without starving the rest of the budget).
     if let Some(cap) = std::env::var("ATLAS_KV_MAX_BLOCKS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -196,7 +283,10 @@ pub(super) fn agree_kv_blocks(
     // with less headroom (e.g. no drafter, different co-tenants) must not
     // size a pool the others cannot back: all ranks take the minimum.
     if let Some(comm) = comm.filter(|c| c.world_size() > 1) {
-        let agreed = min_across_ranks(comm, gpu, num_kv_blocks, spill_tier)?;
+        // The same gather carries the latent-shard settings (0 unsharded).
+        let sharded = glm_cache_plan.and_then(GlmCachePlan::shard).is_some();
+        let settings = shard::settings_word(sharded)?;
+        let agreed = min_across_ranks(comm, gpu, num_kv_blocks, spill_tier, settings)?;
         if agreed < num_kv_blocks {
             tracing::info!(
                 "KV cache: rank {} fits {num_kv_blocks} blocks; all ranks agree on {agreed}",
@@ -211,27 +301,31 @@ pub(super) fn agree_kv_blocks(
     Ok(num_kv_blocks)
 }
 
-/// The minimum block count over all ranks. The upper half of the gathered
-/// word carries the SSM backing mode so ranks agree on restore collectives.
+/// The minimum of `value` over all ranks (one 8-byte all-gather).
+///
+/// The upper half of each rank's word is its spill-tier word
+/// (`kv_nvme::rank_word`), which every rank must share: the agreement the
+/// tier needs rides the collective the ranks already issue here. The lower
+/// half is the block count under the latent-shard settings `shard_settings`
+/// (`glm_kv_shard::blocks_word`, bits 28-31), which every rank must share
+/// too. With both off the word is the bare block count, as before.
 fn min_across_ranks(
     comm: &dyn spark_comm::CommBackend,
     gpu: &dyn GpuBackend,
     value: usize,
-    spill_tier: u32,
+    spill_tier: Result<u32>,
+    shard_settings: u64,
 ) -> Result<usize> {
-    let blocks = u32::try_from(value)?;
-    let word = u64::from(blocks) | u64::from(spill_tier) << 32;
-    let (tiers, blocks): (Vec<u32>, Vec<u32>) =
+    let tier = *spill_tier.as_ref().unwrap_or(&super::kv_nvme::FAILED_RANK);
+    let ours = shard::blocks_word(value, shard_settings)?;
+    let word = ours | u64::from(tier) << 32;
+    let (tiers, blocks): (Vec<u32>, Vec<u64>) =
         crate::model::startup_parity::gather_words(comm, gpu, &[word])?
             .into_iter()
-            .map(|word| ((word >> 32) as u32, word as u32))
+            .map(|w| ((w >> 32) as u32, w & u64::from(u32::MAX)))
             .unzip();
-    super::ssm_spill::verify_ranks(spill_tier, &tiers)?;
-    blocks
-        .into_iter()
-        .min()
-        .map(|blocks| blocks as usize)
-        .ok_or_else(|| anyhow::anyhow!("empty rank gather"))
+    super::kv_nvme::verify_ranks(spill_tier, &tiers)?;
+    shard::agreed_blocks(comm.rank(), ours, &blocks)
 }
 
 #[cfg(test)]

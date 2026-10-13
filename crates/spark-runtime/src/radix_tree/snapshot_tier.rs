@@ -129,6 +129,28 @@ impl SsmSnapshotIndex {
         result
     }
 
+    /// Read-only twin of [`Self::lookup_tiered`]'s selection: the deepest
+    /// anchor (resident or spilled) with depth ≤ `limit`, same session gate for
+    /// tails. Touches no LRU, lease or stats state — used to decide whether an
+    /// NVMe KV restore can pay off before doing any I/O. 0 when none.
+    pub(super) fn peek_deepest(
+        &self,
+        tokens: &[u32],
+        limit: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> usize {
+        let limit = limit.min(tokens.len());
+        self.entries
+            .iter()
+            .filter(|e| e.token_count <= limit)
+            .filter(|e| !e.is_tail || (session_hash != 0 && e.session_hash == session_hash))
+            .filter(|e| hash_token_prefix(tokens, e.token_count, adapter_id) == e.prefix_hash)
+            .map(|e| e.token_count)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// **Promote** a spilled entry back to HBM after the caller faulted its
     /// bytes into `new_slot`. Flips `tiered → false` and re-homes `snapshot_id`.
     /// Returns `false` if `prefix_hash` is unknown (entry evicted meanwhile).

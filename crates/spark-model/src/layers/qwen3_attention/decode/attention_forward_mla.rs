@@ -386,20 +386,34 @@ impl Qwen3AttentionLayer {
         let (sparse_indices, fp8) = self
             .mla_decode_sparse_indices(mla, meta, normed, q_latent, pos, kv_cache, ctx, stream)?;
         prof!("paged_attn", {
-            self.mla_decode_paged_attn(
-                ctx,
-                kv_cache,
-                meta,
-                sparse_indices,
-                fp8,
-                q_absorbed_buf,
-                attn_out,
-                nq,
-                mla_cache_dim,
-                bs,
-                inv_sqrt_d,
-                stream,
-            )
+            if kv_cache.latent_shard().is_some() {
+                let dims = [nq, mla_cache_dim];
+                self.mla_decode_shard_attn(
+                    kv_cache,
+                    ctx,
+                    meta,
+                    (sparse_indices, pos),
+                    q_absorbed_buf,
+                    attn_out,
+                    dims,
+                    stream,
+                )
+            } else {
+                self.mla_decode_paged_attn(
+                    ctx,
+                    kv_cache,
+                    meta,
+                    sparse_indices,
+                    fp8,
+                    q_absorbed_buf,
+                    attn_out,
+                    nq,
+                    mla_cache_dim,
+                    bs,
+                    inv_sqrt_d,
+                    stream,
+                )
+            }
         })?;
 
         // Step 9: V extraction (batched GEMV)

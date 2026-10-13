@@ -25,8 +25,8 @@ use crate::weight_loader::load_dflash_weights;
 
 mod glm;
 mod kv_budget;
+mod kv_nvme;
 mod kv_summary;
-mod ssm_spill;
 
 pub fn build_model(
     mut config: ModelConfig,
@@ -502,6 +502,14 @@ pub fn build_model(
         kv_block_size,
         max_batch_size,
     )?;
+    let glm_cache_plan = glm::shard_plan(
+        glm_cache_plan,
+        &config,
+        &kv_config,
+        comm.as_deref(),
+        max_seq_len,
+        max_batch_tokens,
+    )?;
 
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
@@ -660,6 +668,12 @@ pub fn build_model(
     // Issue #71: lazy FP8→BF16 dequant copies allocate after this sizing;
     // see `ops::lazy_bf16_reserve` for what counts and what logs.
     let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
+    // NVMe spill tiers (default off → 0): their staging, the index of a full
+    // disk budget and the SSM tier's arena are all committed after this point.
+    let nvme_record_bytes =
+        PagedKvCache::nvme_record_bytes_for(&kv_config, glm_cache_plan.is_some(), sparse_index);
+    let reserve_net = reserve_net
+        + kv_nvme::host_reserve_bytes(nvme_record_bytes, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
         total_mem,
@@ -768,7 +782,7 @@ pub fn build_model(
         gpu.as_ref(),
         num_kv_blocks,
         glm_cache_plan,
-        ssm_spill::rank_word(ssm_pools.tier_home),
+        kv_nvme::rank_word(nvme_record_bytes, ssm_pools.tier_home),
     )?;
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
     // Phase 6.1.f / 6.2.c — when --high-speed-swap is on with HBM-shrink, the
@@ -834,11 +848,11 @@ pub fn build_model(
     // reports as free (Windows gfx1151: a 102 MB KV pool alloc failed with
     // 12 GB "free"), release the balloon and retry: the pre-balloon behavior.
     let mut balloon = balloon;
-    let mut kv_cache = match PagedKvCache::new_with_v_alias(
+    let mut kv_cache = match glm::new_kv_cache(
         kv_config.clone(),
         num_kv_blocks,
         gpu.as_ref(),
-        glm_cache_plan.is_some(),
+        glm_cache_plan,
     ) {
         Ok(kv) => kv,
         Err(e) if balloon.is_some() => {
@@ -849,12 +863,7 @@ pub fn build_model(
             if let Some(ptr) = balloon.take() {
                 gpu.free(ptr)?;
             }
-            PagedKvCache::new_with_v_alias(
-                kv_config,
-                num_kv_blocks,
-                gpu.as_ref(),
-                glm_cache_plan.is_some(),
-            )?
+            glm::new_kv_cache(kv_config, num_kv_blocks, gpu.as_ref(), glm_cache_plan)?
         }
         Err(e) => return Err(e),
     };
@@ -870,6 +879,13 @@ pub fn build_model(
     if let Some(index) = sparse_index {
         kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }
+    kv_nvme::attach(
+        &mut kv_cache,
+        prefix_cache.as_ref(),
+        gpu.as_ref(),
+        comm.as_deref().map_or(0, |c| c.rank()),
+        ssm_pools.tier_home,
+    )?;
 
     // ── Step 6: Assemble model ──
     // Capture pointers for any post-construction sharing (DFlash drafter

@@ -12,9 +12,15 @@
 
 use std::sync::atomic::Ordering;
 
+mod evicted;
 mod no_caching;
+pub mod nvme;
 mod tier_evict;
+pub use evicted::EvictedBlocks;
 pub use no_caching::NoPrefixCaching;
+pub use nvme::{
+    DiskRef, NVME_HOST_BYTES_PER_BLOCK, NvmePrefixTier, NvmeStats, RestorePlan, SpillOrder,
+};
 pub use tier_evict::TierEvict;
 
 // The three counters that lived here are fields of the single run mailbox,
@@ -50,16 +56,6 @@ pub fn cache_hit_tokens_total() -> u64 {
         .load(Ordering::Relaxed)
 }
 
-/// Result of evicting LRU cached blocks (Phase 6.1.e).
-#[derive(Debug, Clone, Default)]
-pub struct EvictedBlocks {
-    /// Physical block indices freed (caller calls `PagedKvCache::free_block`).
-    pub physical: Vec<u32>,
-    /// Parallel disk-block IDs to release (caller calls
-    /// `HighSpeedSwap::dec_disk_ref`). Empty when HSS isn't in use.
-    pub disk_block_ids: Vec<u32>,
-}
-
 /// What an `insert` newly took ownership of, so the caller can take the
 /// matching references.
 ///
@@ -83,16 +79,6 @@ pub struct InsertAcquired {
     /// Physical KV blocks stored in radix nodes CREATED by this insert; the
     /// caller `inc_ref`s each exactly once.
     pub blocks: Vec<u32>,
-}
-
-impl EvictedBlocks {
-    pub fn is_empty(&self) -> bool {
-        self.physical.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.physical.len()
-    }
 }
 
 /// Result of looking up a token sequence in the prefix cache.
@@ -460,6 +446,12 @@ pub trait PrefixCache: Send + Sync {
     /// never treats as superseded. Default: no-op.
     fn mark_branch_snapshot(&self, tokens: &[u32], adapter_id: u64) {
         let _ = (tokens, adapter_id);
+    }
+
+    /// The NVMe spill tier, when this implementation has one (see
+    /// [`NvmePrefixTier::is_enabled`]). Default: none.
+    fn nvme(&self) -> Option<&dyn NvmePrefixTier> {
+        None
     }
 
     /// Number of SSM snapshots currently stored in the snapshot index.

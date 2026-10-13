@@ -72,6 +72,8 @@ required-features = ["test-utils"]
 
 [dependencies]
 atlas-core = { workspace = true }
+# NVMe prefix spill tier: the O_DIRECT record store (CUDA-free, anyhow+libc).
+atlas-tier = { workspace = true }
 atlas-kernels = { workspace = true }
 cudarc = { workspace = true, optional = true }
 

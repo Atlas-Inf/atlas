@@ -58,6 +58,51 @@ impl Qwen3AttentionLayer {
         Ok((sparse_indices, fp8))
     }
 
+    /// `ATLAS_GLM_KV_SHARD=1`: the decode row through the sharded merge form
+    /// (`layers::glm_kv_shard`). `selection` is the row's selected IDs (or
+    /// `None` below the top-k threshold) and its host position.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn mla_decode_shard_attn(
+        &self,
+        kv_cache: &PagedKvCache,
+        ctx: &ForwardContext,
+        meta: AttnMetadataDev,
+        selection: (Option<(DevicePtr, u32)>, Option<u32>),
+        query: DevicePtr,
+        attn_out: DevicePtr,
+        [heads, dim]: [u32; 2],
+        stream: u64,
+    ) -> Result<()> {
+        use crate::layers::glm_kv_shard::{HEADS, LATENT, WIDTH};
+        anyhow::ensure!(
+            heads == HEADS && dim == LATENT,
+            "GLM KV shard decode needs {HEADS} local heads of the {LATENT}-wide latent"
+        );
+        let (sparse, pos) = selection;
+        let (selected, causal_start) = match sparse {
+            Some((indices, width)) => {
+                anyhow::ensure!(width == WIDTH, "GLM KV shard decode selected width {width}");
+                (Some(indices), 0)
+            }
+            None => (
+                None,
+                pos.ok_or_else(|| {
+                    anyhow::anyhow!("GLM KV shard dense decode row needs its host position")
+                })?,
+            ),
+        };
+        let rows = super::super::prefill::ShardRows {
+            query,
+            selected,
+            causal_start,
+            block_table: meta.block_table,
+            rows: 1,
+            end: pos.map(|p| p as usize + 1),
+            queries_swapped: false,
+        };
+        self.glm_shard_merge_attention(kv_cache, ctx, rows, attn_out, stream)
+    }
+
     /// Paged MLA decode attention of the absorbed query into `attn_out`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn mla_decode_paged_attn(

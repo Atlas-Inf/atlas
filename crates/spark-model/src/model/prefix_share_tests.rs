@@ -253,7 +253,7 @@ impl World {
             if evicted.is_empty() {
                 break;
             }
-            apply_evicted_blocks(evicted, &mut self.kv);
+            apply_evicted_blocks(evicted, &mut self.kv, &self.cache, &self.gpu);
         }
         assert_eq!(self.cache.stats().0, 0, "cache nodes left unevictable");
         assert_eq!(self.kv.num_free_blocks(), BLOCKS, "KV blocks leaked");

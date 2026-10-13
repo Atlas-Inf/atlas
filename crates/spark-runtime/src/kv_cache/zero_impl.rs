@@ -46,17 +46,37 @@ impl PagedKvCache {
         // Slotted tails are indexed by slot, not block, and every row is
         // written before its pool is finalized: nothing to zero.
         let slotted = self.tail_slots.is_some();
+        // A latent shard holds only its own blocks of the run, which sit at
+        // consecutive local slots; every other pool is indexed by block id.
+        let (latent_first, latent_count) = match &self.latent_shard {
+            Some(shard) => shard.owned_run(first, count),
+            None => (first as usize, count),
+        };
         for layer in &self.layers {
-            for (base, stride) in [
-                (layer.k_pool, layer.k_block_stride),
-                (layer.owned_v_pool(), layer.v_block_stride),
+            for (base, stride, first, count) in [
+                (
+                    layer.k_pool,
+                    layer.k_block_stride,
+                    latent_first,
+                    latent_count,
+                ),
+                (
+                    layer.owned_v_pool(),
+                    layer.v_block_stride,
+                    first as usize,
+                    count,
+                ),
                 (
                     layer.sparse_index_values,
                     layer.sparse_index_values_block_stride,
+                    first as usize,
+                    count,
                 ),
                 (
                     layer.sparse_index_scales,
                     layer.sparse_index_scales_block_stride,
+                    first as usize,
+                    count,
                 ),
                 (
                     if slotted {
@@ -65,17 +85,14 @@ impl PagedKvCache {
                         layer.sparse_index_tail
                     },
                     layer.sparse_index_tail_block_stride,
+                    first as usize,
+                    count,
                 ),
             ] {
-                if base.is_null() || stride == 0 {
+                if base.is_null() || stride == 0 || count == 0 {
                     continue;
                 }
-                gpu.memset_async(
-                    base.offset(first as usize * stride),
-                    0,
-                    count * stride,
-                    stream,
-                )?;
+                gpu.memset_async(base.offset(first * stride), 0, count * stride, stream)?;
             }
         }
         Ok(())

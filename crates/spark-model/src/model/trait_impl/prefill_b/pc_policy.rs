@@ -53,8 +53,12 @@
 //! TP2 ranks keep their own snapshot pools and indexes. Only the radix match
 //! is min-reduced across ranks (F83), and the Marconi restore depth sets each
 //! rank's processed row range, so ranks that restore at different depths run
-//! mismatched collectives. With either policy flag or an SSM spill tier,
-//! the ranks also agree on the restore depth ([`agree_restore`]): the minimum depth any rank can restore,
+//! mismatched collectives. With either flag, or with a spill tier (the NVMe
+//! prefix tier `ATLAS_KV_NVME_DIR` or the snapshot tier `ATLAS_SSM_TIER`: a
+//! KV restore or a snapshot fault-in can succeed on one rank only; startup
+//! refuses ranks that differ in either, `factory/build/kv_nvme.rs`), the
+//! ranks also agree on the restore depth
+//! ([`agree_restore`]): the minimum depth any rank can restore,
 //! taken only if every rank holds an exact-prefix snapshot at that depth, and
 //! otherwise a full recompute everywhere. That costs one 4-byte
 //! min-reduction per prefill, plus a second one when there is something to
@@ -144,6 +148,14 @@ pub(super) fn layer_write_floor(
 }
 
 impl TransformerModel {
+    /// Whether a recompute-all prefix hit of this model keeps its matched
+    /// rows as cached (`ATLAS_GLM_PC_WRITE_FLOOR`, GLM only): what
+    /// [`layer_write_floor`] gives a one-row pass under a one-row match.
+    pub(in crate::model) fn pc_write_floor_keeps_matched(&self) -> bool {
+        let flag = glm_pc_write_floor_enabled();
+        layer_write_floor(flag, &self.config.model_type, 0, 1, 0, 1) == 1
+    }
+
     /// [`layer_write_floor`] of one pass of this model, logged when the flag
     /// raised it.
     pub(super) fn pc_write_floor(
@@ -290,7 +302,8 @@ impl TransformerModel {
 
     /// Agree on one restore `(snapshot, depth, is_tail)` across ranks (see
     /// the module docs and [`agree_restore`]). Returns the local choice
-    /// unchanged when agreement is off or this is a single-rank world;
+    /// unchanged when agreement is off (neither policy flag, no spill tier)
+    /// or this is a single-rank world;
     /// `(None, 0, false)` means no rank restores.
     pub(super) fn pc_agree_restore(
         &self,
@@ -302,9 +315,8 @@ impl TransformerModel {
         local: (Option<usize>, usize),
     ) -> Result<(Option<usize>, usize, bool)> {
         let is_tail = prefix_match.ssm_snapshot_is_tail;
-        if !(pc_rank_agree_enabled() || self.ssm_tier_store.is_some())
-            || !self.multi_rank_protocol_active()
-        {
+        let spill_tier = || self.ssm_tier_store.is_some() || self.nvme_tier().is_some();
+        if !(pc_rank_agree_enabled() || spill_tier()) || !self.multi_rank_protocol_active() {
             return Ok((local.0, local.1, is_tail));
         }
         let restorable = |id: usize, tok: usize, tail: bool| {

@@ -2442,6 +2442,7 @@ dependencies = [
  "anyhow",
  "atlas-core",
  "atlas-kernels",
+ "atlas-tier",
  "cudarc",
  "dispatch2",
  "half",

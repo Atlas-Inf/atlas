@@ -5,6 +5,7 @@
 //! `inner` so it keeps field access to the private node arena.
 
 use super::RadixTreeInner;
+use crate::prefix_cache::SpillOrder;
 
 impl RadixTreeInner {
     /// Evict up to `num_blocks` LRU zero-ref leaf nodes.
@@ -13,11 +14,21 @@ impl RadixTreeInner {
     /// in the result is `u32::MAX` and the caller should ignore them; the
     /// public-trait wrapper filters those out into the returned
     /// `EvictedBlocks::disk_block_ids`.
-    pub(in crate::radix_tree) fn evict(&mut self, num_blocks: usize) -> (Vec<u32>, Vec<u32>) {
+    ///
+    /// With the NVMe spill tier on, victims are spilled instead of deleted:
+    /// the third vec lists the writes the caller must perform first.
+    pub(in crate::radix_tree) fn evict(
+        &mut self,
+        num_blocks: usize,
+    ) -> (Vec<u32>, Vec<u32>, Vec<SpillOrder>) {
         let mut freed_phys = Vec::new();
         let mut freed_disk = Vec::new();
         if num_blocks == 0 {
-            return (freed_phys, freed_disk);
+            return (freed_phys, freed_disk, Vec::new());
+        }
+        if self.nvme_on() {
+            let (phys, orders) = self.evict_spill(num_blocks);
+            return (phys, freed_disk, orders);
         }
 
         loop {
@@ -68,7 +79,7 @@ impl RadixTreeInner {
             }
         }
 
-        (freed_phys, freed_disk)
+        (freed_phys, freed_disk, Vec::new())
     }
 
     pub(in crate::radix_tree) fn num_entries(&self) -> usize {

@@ -69,6 +69,7 @@ pub(crate) mod impl_lora;
 pub(crate) mod impl_lora_swap;
 mod impl_ngram;
 pub mod kv_admission;
+mod kv_nvme;
 pub(crate) mod mtp_carry;
 pub(crate) mod pinned_pack;
 pub(crate) mod prefix_share;

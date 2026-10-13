@@ -90,6 +90,8 @@ mod glm_hc_prefill;
 mod glm_indexer;
 #[path = "ops/glm_indexer_dynamic.rs"]
 mod glm_indexer_dynamic;
+#[path = "ops/glm_kv_shard.rs"]
+mod glm_kv_shard;
 #[path = "ops/glm_router_bn4.rs"]
 mod glm_router_bn4;
 #[path = "ops/glm_sparse_native.rs"]
@@ -268,6 +270,7 @@ pub use gemv_touch::{
 pub use glm_hc_prefill::*;
 pub use glm_indexer::*;
 pub use glm_indexer_dynamic::*;
+pub use glm_kv_shard::*;
 pub use glm_sparse_native::*;
 pub use glm_sparse_prefill_tc::*;
 pub use hyper_connection::*;

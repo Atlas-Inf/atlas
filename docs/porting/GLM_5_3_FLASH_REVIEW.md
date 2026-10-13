@@ -2,18 +2,6 @@
 
 # GLM-5.3-Flash review guide
 
-This reduced core follows the shared compiler, server, transport, memory and
-native KDA prerequisite branches under `pr/glm53-*`. It retains native GLM
-loading, prefill, decode and optional DFlash, with replicated KV storage.
-Token-sharded KV and the optional NVMe prefix tier are restored separately
-in `pr/glm53-context-storage`; developer performance harnesses follow in
-`pr/glm53-benchmark-tools`. Correctness tests, SSM tier agreement and cleanup,
-native qualification recipes and source/license notices remain with this core.
-The bounded core campaign below measured `f873fee4`; subsequent MMQ source
-fixes require fresh qualification. The later RC2, RC4 and MTP stages are outside
-this branch. Their context, throughput and full-stack gate results do not
-qualify this reduced core.
-
 This integration loads NVIDIA's original NVFP4 checkpoint through Atlas and
 runs TP2/EP2 across two GB10 Sparks. Atlas owns model loading, scheduling,
 KV/SSM state, distributed execution and kernel dispatch. Optional DFlash loads

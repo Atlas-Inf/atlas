@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
-use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
+use spark_runtime::kv_cache::KvCacheDtype;
 
 use super::super::super::Qwen3AttentionLayer;
 use super::projection;
@@ -172,6 +172,8 @@ pub(super) struct Bf16LatentView {
 impl Qwen3AttentionLayer {
     /// Owner-batched projections for a verify batch (several owners, few
     /// rows), when the scratch holds every row; `None` projects per owner.
+    /// `solo` also batches a single owner, whose queries are then ready
+    /// before its selection (the same projections, in a different order).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_owner_projections(
         &self,
@@ -180,6 +182,7 @@ impl Qwen3AttentionLayer {
         q_latent: DevicePtr,
         rows: usize,
         nq: usize,
+        solo: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<GlmOwnerProjections>> {
@@ -198,7 +201,7 @@ impl Qwen3AttentionLayer {
         let latent_row = nq * kv_lora * 2;
         let sizes = ctx.buffers.sizes();
         if !on
-            || owners.len() < 2
+            || owners.len() < if solo { 1 } else { 2 }
             || rows > 64
             || sizes.ssm_qkvz < 2 * rows * key_row
             || sizes.ssm_deinterleaved < rows * (latent_row + query_row)
@@ -246,12 +249,13 @@ impl Qwen3AttentionLayer {
     }
 
     /// When `wanted` and the cache is `fp8_g128`, dequantize the owner's
-    /// tokens `[0, end)` into the BF16 view — unless they outgrow it, in
+    /// tokens `[0, end)` of `cache` (the latent pool, or a sharded owner's
+    /// assembled view) into the BF16 view — unless they outgrow it, in
     /// which case the caller reads the FP8 cache directly.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_owner_bf16_view(
         &self,
-        kv_cache: &PagedKvCache,
+        cache: DevicePtr,
         block_table: DevicePtr,
         end: usize,
         wanted: bool,
@@ -272,7 +276,7 @@ impl Qwen3AttentionLayer {
         ops::glm_latent_dequant_fp8g128(
             ctx.gpu,
             self.glm_latent_dequant_k,
-            kv_cache.k_pool_ptr(self.attn_layer_idx),
+            cache,
             block_table,
             latents,
             end as u32,

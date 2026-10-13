@@ -153,7 +153,7 @@ impl TransformerModel {
                 if evicted.is_empty() {
                     break;
                 }
-                super::super::super::block_mgmt::apply_evicted_blocks(evicted, &mut kv_cache);
+                self.apply_evicted(evicted, &mut kv_cache);
             }
             let free = kv_cache.num_free_blocks();
             if free < needed {

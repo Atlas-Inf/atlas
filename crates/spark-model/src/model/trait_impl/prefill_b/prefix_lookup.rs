@@ -55,6 +55,9 @@ impl TransformerModel {
             } else if let Some(prefix_match) = reserved_match {
                 prefix_match
             } else {
+                // NVMe spill tier: page the on-disk continuation back in so
+                // the resident-only lookup below sees it (no-op when off).
+                self.nvme_restore_prefix(tokens, seq, kv_cache, stream);
                 self.prefix_cache
                     .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
             };
@@ -358,6 +361,9 @@ impl TransformerModel {
             } else {
                 0
             };
+            // ATLAS_GLM_NVME_KEEP: kept records of the blocks this pass
+            // recomputes in place are stale from here on (no-op otherwise).
+            self.nvme_forget_rewritten(tokens, seq.adapter_id, skip_tokens, matched, bs);
             self.pc_plan_branch(tokens, seq, matched, skip_tokens, bs)?;
             self.finish_leaf_restored(tokens, seq, skip_tokens, bs, stream)?;
             seq.marconi_skip_to = skip_tokens;

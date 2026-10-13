@@ -3,7 +3,9 @@
 //! Validated GLM NoPE cache geometry and current-layout byte accounting.
 
 use anyhow::{Result, ensure};
-use spark_runtime::kv_cache::{KvCacheConfig, SparseIndexCacheConfig, TailSlotPlan};
+use spark_runtime::kv_cache::{
+    KvCacheConfig, LatentShardSpec, SparseIndexCacheConfig, TailSlotPlan,
+};
 
 /// Only constructible for the GLM shape supported by the existing kernels.
 /// This describes geometry, not a new KV dtype or allocation policy.
@@ -70,6 +72,8 @@ pub(crate) struct GlmCachePlan {
     block_bytes_all_layers: usize,
     /// Pool-size-independent bytes (slot-mapped index tails).
     fixed_bytes: usize,
+    /// `ATLAS_GLM_KV_SHARD=1`: this rank stores only its blocks' latents.
+    shard: Option<LatentShardSpec>,
 }
 
 impl GlmCachePlan {
@@ -129,6 +133,7 @@ impl GlmCachePlan {
             token_block_size: config.block_size,
             block_bytes_all_layers: total,
             fixed_bytes: 0,
+            shard: None,
         })
     }
 
@@ -161,6 +166,35 @@ impl GlmCachePlan {
         }
     }
 
+    /// The plan when each rank of a pair stores only its blocks' latents
+    /// (`PagedKvCache::new_latent_sharded`): a block costs half its latent
+    /// bytes plus half of a u32 identity entry; one extra block of latents
+    /// (the odd slot), the shard scratch and the view's identity entries
+    /// are fixed. Apply after [`Self::aliased_v`].
+    pub(crate) fn latent_sharded(self, config: &KvCacheConfig, spec: LatentShardSpec) -> Self {
+        let latent: usize = (0..config.num_layers)
+            .map(|layer| config.k_block_bytes_for_layer(layer))
+            .sum();
+        let world = spec.world.max(1);
+        Self {
+            block_bytes_all_layers: self.block_bytes_all_layers - latent
+                + latent.div_ceil(world)
+                + 4usize.div_ceil(world),
+            fixed_bytes: self.fixed_bytes
+                + latent
+                + spec.scratch_bytes.next_multiple_of(256)
+                + 4 * spec.view_blocks
+                + 4,
+            shard: Some(spec),
+            ..self
+        }
+    }
+
+    /// The latent shard this plan was sized for.
+    pub(crate) fn shard(self) -> Option<LatentShardSpec> {
+        self.shard
+    }
+
     pub(crate) fn block_bytes_all_layers(self) -> usize {
         self.block_bytes_all_layers
     }
@@ -187,6 +221,10 @@ impl GlmCachePlan {
             .ok_or_else(|| anyhow::anyhow!("GLM cache allocation byte count overflow"))
     }
 }
+
+#[cfg(test)]
+#[path = "glm_cache_plan_shard_tests.rs"]
+mod shard_tests;
 
 #[cfg(test)]
 mod tests {

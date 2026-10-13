@@ -166,7 +166,8 @@ fn pair_caps_the_deeper_rank_and_recovers_on_the_next_turn() {
 
     let evicted = p.worker.cache.evict(2);
     assert_eq!(evicted.physical.len(), 2);
-    apply_evicted_blocks(evicted, &mut p.worker.kv);
+    let w = &mut p.worker;
+    apply_evicted_blocks(evicted, &mut w.kv, &w.cache, &w.gpu);
 
     let turn2_blocks = turn2.len() / BS * BS;
     let turn3 = join(&[&turn2, &answer2, &toks(950..975)]);

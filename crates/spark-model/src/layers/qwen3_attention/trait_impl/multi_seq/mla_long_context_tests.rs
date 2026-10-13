@@ -17,6 +17,8 @@ use gpu::TestGpu;
 mod owner_batch_tests;
 #[path = "mla_query_dispatch_tests.rs"]
 mod query_dispatch_tests;
+#[path = "mla_shard_tests.rs"]
+mod shard_tests;
 #[path = "mla_split_context_tests.rs"]
 mod split_tests;
 #[path = "mla_write_floor_tests.rs"]

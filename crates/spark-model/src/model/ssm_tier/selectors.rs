@@ -21,9 +21,9 @@ pub(crate) fn ssm_tier_enabled() -> bool {
     std::env::var_os("ATLAS_SSM_TIER").is_some()
 }
 
-/// Where a built tier store keeps spilled snapshots. Paired ranks agree on
-/// this backing before serving so they participate in the same restore-depth
-/// collectives. The store is otherwise only a `dyn SnapshotBlobStore`. Decided by
+/// Where a built tier store keeps the snapshots spilled into it — what the KV
+/// sizing (and, with the NVMe prefix tier, the startup check) needs to know
+/// about a store that is otherwise only a `dyn SnapshotBlobStore`. Decided by
 /// [`build_tier_store`] from what it BUILT, never from the environment: every
 /// arm falls back to host RAM on a setup failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +45,20 @@ impl SpillHome {
             SwapBacking::ODirect => Self::Disk { hot_slots },
             SwapBacking::HostRam => Self::HostRam,
         }
+    }
+
+    /// Host RAM the tier commits only AFTER construction, for KV sizing
+    /// (`SsmPools::tier_lazy_host_bytes`): the pinned spill/fault-in staging
+    /// blob (allocated on the first spill) and the host hot arena — a zeroed
+    /// `Vec` the kernel backs page by page as slots fill. [`Self::HostRam`]
+    /// has no such bound; the NVMe prefix tier, the one consumer of this
+    /// number, refuses to start on it (`factory/build/kv_nvme.rs`).
+    pub(crate) fn lazy_host_bytes(self, blob_bytes: usize) -> usize {
+        let arena = match self {
+            Self::Disk { hot_slots } => hot_slots,
+            Self::HostRam | Self::Peer => 0,
+        };
+        (arena + 1) * blob_bytes
     }
 }
 

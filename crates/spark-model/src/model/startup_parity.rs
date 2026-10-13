@@ -62,7 +62,7 @@ use crate::layers::qwen3_attention::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
     pairwise_moe_decode_enabled, write_floor_legacy,
 };
-use crate::layers::{self, glm_sp, moe, ops, qwen3_ssm, w4a16_gemv_tiers};
+use crate::layers::{self, glm_kv_shard, glm_sp, moe, ops, qwen3_ssm, w4a16_gemv_tiers};
 use crate::speculative::glm_repair_policy;
 
 /// One agreed setting: its name and a rank's value.
@@ -156,6 +156,21 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_GLM_KV_WRITE_FLOOR_LEGACY", || {
         Ok(write_floor_legacy() as u64)
+    }),
+    // Which rank stores each block's latents, and the exchanges the shard's
+    // attention runs (the pool-size gather checks them again:
+    // `glm_kv_shard::agreed_blocks`).
+    ("ATLAS_GLM_KV_SHARD", || {
+        Ok(glm_kv_shard::requested()? as u64)
+    }),
+    ("ATLAS_GLM_KV_SHARD_COMPACT", || {
+        Ok(glm_kv_shard::MergeTuning::get()?.compact as u64)
+    }),
+    ("ATLAS_GLM_KV_SHARD_OVERLAP", || {
+        Ok(glm_kv_shard::MergeTuning::get()?.overlap as u64)
+    }),
+    ("ATLAS_GLM_KV_SHARD_CHECK", || {
+        Ok(glm_kv_shard::MergeTuning::get()?.check as u64)
     }),
     // Work the pair splits, and the exchanges that stand in for a reduce.
     ("ATLAS_GLM_SHARED_TP_SPLIT", || {
