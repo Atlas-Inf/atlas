@@ -6,7 +6,7 @@
 // A tokenizer-bound cache that produces `CompiledGrammar`s, avoiding
 // redundant preprocessing of grammars / schemas seen before.
 
-use crate::grammar::functor::{GrammarNormalizer, GrammarOptimizer};
+use crate::grammar::functor::{GrammarNormalizer, GrammarOptimizer, check_fsm_limits};
 use crate::grammar::{GrammarData, parse_ebnf};
 use crate::schema::{SchemaConverterOptions, builtin_json_grammar_ebnf, json_schema_to_ebnf};
 use crate::structural_tag::structural_tag_to_grammar;
@@ -29,6 +29,9 @@ pub enum CompileError {
     /// A structural tag failed to compile.
     #[error("failed to compile structural tag: {0}")]
     StructuralTag(String),
+    /// The grammar is too large to compile (FSM encoding or size limit).
+    #[error("grammar too large: {0}")]
+    TooLarge(String),
 }
 
 /// The cache key — exactly the request parameters that determine the
@@ -75,6 +78,8 @@ pub struct GrammarCompiler {
     /// `CompiledGrammar` this compiler produces. Port of the C++
     /// `GrammarCompiler::Impl::rule_level_cache_`.
     rule_cache: Option<RuleLevelCache>,
+    /// See [`Self::set_max_schema_grammar_bytes`].
+    max_schema_grammar_bytes: usize,
 }
 
 impl GrammarCompiler {
@@ -129,36 +134,63 @@ impl GrammarCompiler {
                 (cache_limit_bytes / 3 * 2) as usize
             }),
             rule_cache,
+            max_schema_grammar_bytes: usize::MAX,
         }
     }
 
     /// Run the full W3 pipeline (normalize then optimize) on a parsed
     /// grammar, then compile it against this compiler's tokenizer.
-    fn compile_normalized(&self, grammar: GrammarData) -> CompiledGrammar {
+    ///
+    /// A grammar over the FSM encoding limits is refused, both on the
+    /// parsed grammar (cheap: before any pass runs on a huge input) and
+    /// after optimization, before its FSM is built.
+    fn compile_normalized(&self, grammar: GrammarData) -> Result<CompiledGrammar, CompileError> {
+        check_fsm_limits(&grammar).map_err(CompileError::TooLarge)?;
         let normalized = GrammarNormalizer::apply(grammar);
-        let optimized = GrammarOptimizer::apply(normalized);
-        compile_optimized_grammar(
+        let optimized = GrammarOptimizer::try_apply(normalized).map_err(CompileError::TooLarge)?;
+        Ok(compile_optimized_grammar(
             optimized,
             &self.tokenizer_info,
             self.max_threads,
             self.rule_cache.clone(),
-        )
+        ))
     }
 
-    /// Fetch from cache or compute via `f`, honoring `cache_enabled`.
-    fn get_or_compute<F>(&self, key: CacheKey, f: F) -> CompiledGrammar
+    /// Fetch from cache or compute via `f`, honoring `cache_enabled`. A
+    /// failed compile, or one over `max_grammar_bytes`, is never cached.
+    fn get_or_compute<F>(
+        &self,
+        key: CacheKey,
+        max_grammar_bytes: usize,
+        f: F,
+    ) -> Result<CompiledGrammar, CompileError>
     where
-        F: FnOnce() -> CompiledGrammar,
+        F: FnOnce() -> Result<CompiledGrammar, CompileError>,
     {
-        if !self.cache_enabled {
-            return f();
+        if self.cache_enabled
+            && let Some(hit) = self.cache.get(&key)
+        {
+            return Ok(hit);
         }
-        if let Some(hit) = self.cache.get(&key) {
-            return hit;
+        let value = f()?;
+        let bytes = value.grammar_memory_size_bytes();
+        if bytes > max_grammar_bytes {
+            return Err(CompileError::TooLarge(format!(
+                "compiles to a {} MiB grammar, over the {} MiB limit",
+                bytes >> 20,
+                max_grammar_bytes >> 20
+            )));
         }
-        let value = f();
-        self.cache.insert(key, value.clone());
-        value
+        if self.cache_enabled {
+            self.cache.insert(key, value.clone());
+        }
+        Ok(value)
+    }
+
+    /// Refuse JSON schemas whose compiled grammar structure is larger than
+    /// `bytes` (default: no limit). Refused grammars are not cached.
+    pub fn set_max_schema_grammar_bytes(&mut self, bytes: usize) {
+        self.max_schema_grammar_bytes = bytes;
     }
 
     /// Compile a grammar from an EBNF string. Port of
@@ -176,17 +208,17 @@ impl GrammarCompiler {
             ebnf: ebnf.to_string(),
             root_rule: root_rule_name.to_string(),
         };
-        Ok(self.get_or_compute(key, || self.compile_normalized(grammar)))
+        self.get_or_compute(key, usize::MAX, || self.compile_normalized(grammar))
     }
 
     /// Compile an already-parsed [`GrammarData`]. Port of
     /// `GrammarCompiler::CompileGrammar(const Grammar&)` — keyed by the
     /// grammar's printed EBNF, as the C++ does.
-    pub fn compile_grammar(&self, grammar: GrammarData) -> CompiledGrammar {
+    pub fn compile_grammar(&self, grammar: GrammarData) -> Result<CompiledGrammar, CompileError> {
         let ebnf = crate::grammar::print_grammar(&grammar);
         let root_rule = grammar.root_rule().name.clone();
         let key = CacheKey::Ebnf { ebnf, root_rule };
-        self.get_or_compute(key, || self.compile_normalized(grammar))
+        self.get_or_compute(key, usize::MAX, || self.compile_normalized(grammar))
     }
 
     /// Compile the builtin "any JSON value" grammar. Port of
@@ -194,7 +226,9 @@ impl GrammarCompiler {
     pub fn compile_builtin_json_grammar(&self) -> Result<CompiledGrammar, CompileError> {
         let ebnf = builtin_json_grammar_ebnf();
         let grammar = parse_ebnf(&ebnf, "root").map_err(|e| CompileError::Schema(e.to_string()))?;
-        Ok(self.get_or_compute(CacheKey::BuiltinJson, || self.compile_normalized(grammar)))
+        self.get_or_compute(CacheKey::BuiltinJson, usize::MAX, || {
+            self.compile_normalized(grammar)
+        })
     }
 
     /// Compile a JSON schema. Port of
@@ -229,7 +263,9 @@ impl GrammarCompiler {
             strict_mode,
             max_whitespace_cnt,
         };
-        Ok(self.get_or_compute(key, || self.compile_normalized(grammar)))
+        self.get_or_compute(key, self.max_schema_grammar_bytes, || {
+            self.compile_normalized(grammar)
+        })
     }
 
     /// Compile a structural tag. Port of
@@ -244,7 +280,7 @@ impl GrammarCompiler {
         let grammar = structural_tag_to_grammar(structural_tag_json)
             .map_err(|e| CompileError::StructuralTag(e.to_string()))?;
         let key = CacheKey::StructuralTag(structural_tag_json.to_string());
-        Ok(self.get_or_compute(key, || self.compile_normalized(grammar)))
+        self.get_or_compute(key, usize::MAX, || self.compile_normalized(grammar))
     }
 
     /// Clear the internal compiled-grammar cache *and* the cross-grammar

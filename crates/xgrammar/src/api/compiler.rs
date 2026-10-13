@@ -105,7 +105,9 @@ impl GrammarCompiler {
     /// The pure-Rust core consumes a `GrammarData` by value; the handle
     /// is cloned so the caller keeps ownership (vendored took `&Grammar`).
     pub fn compile_grammar(&mut self, grammar: &Grammar) -> Result<CompiledGrammar, String> {
-        Ok(self.inner.compile_grammar(grammar.data().clone()))
+        self.inner
+            .compile_grammar(grammar.data().clone())
+            .map_err(|e| e.to_string())
     }
 
     /// Compile a grammar from a structural-tag JSON document. Port of
@@ -124,6 +126,12 @@ impl GrammarCompiler {
     /// `GrammarCompiler::clear_cache`.
     pub fn clear_cache(&mut self) {
         self.inner.clear_cache();
+    }
+
+    /// Refuse JSON schemas whose compiled grammar structure exceeds `bytes`;
+    /// refused grammars are never cached.
+    pub fn set_max_schema_grammar_bytes(&mut self, bytes: usize) {
+        self.inner.set_max_schema_grammar_bytes(bytes);
     }
 
     /// Approximate cache size in bytes. Port of the vendored
