@@ -13,8 +13,8 @@ Three kinds of debt, kept apart:
   module that implements them, separately from copied source material.
 - **Related work** we did not derive from: listed so readers can compare.
 
-Commit messages cannot be amended, so these credits live in the code and
-in this file.
+Credits are retained in the code and this file independently of commit-message
+normalization in the local review history.
 
 ## Code and data from other projects
 
@@ -34,10 +34,20 @@ full-model qualification are separate from source integration; see
 
 ### Historical comparison scaffolding (removed after qualification)
 
-The native GPU tests no longer require the external bridge builders. Their
-source is preserved in Atlas commit `3c991613462c79730e2936a7b0f97add40f74370`,
-including `scripts/build_glm_prefill/`, `research/flash-kda-prefill/` and the
-historical files under `scripts/dev/glm_sparse_native/`.
+The native GPU tests no longer require the external bridge builders. Local
+archive commit `3c991613462c79730e2936a7b0f97add40f74370` retains
+`scripts/build_glm_prefill/`, `research/flash-kda-prefill/` and historical files
+under `scripts/dev/glm_sparse_native/`. That commit and its rewritten counterpart
+are not ancestors of the proposed PR branches: cloning this stack does not
+provide those local archive objects.
+
+The original SparkGLM [FlashKDA bridge](https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/install/flash_kda/atlas_flash_kda_bridge.cu),
+[state-slot patch](https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/install/flash_kda/flash_kda_sm121_slots.patch)
+and [native build recipe](https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/install/build-native.sh)
+remain accessible at their pinned upstream revision. These recover the credited
+upstream inputs, not all later local comparison scaffolding. The inventory
+below records the original paths and hashes; native builds need none of these
+removed reference implementations.
 
 | Retained record | Origin and purpose |
 |---|---|

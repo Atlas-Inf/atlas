@@ -9,9 +9,10 @@ Token-sharded KV and the optional NVMe prefix tier are restored separately
 in `pr/glm53-context-storage`; developer performance harnesses follow in
 `pr/glm53-benchmark-tools`. Correctness tests, SSM tier agreement and cleanup,
 native qualification recipes and source/license notices remain with this core.
-Historical GPU results below describe their original revisions, not a fresh
-qualification of this reduced branch. The later RC2, RC4 and MTP stages are
-unchanged in scope. The complete final stack retains the original runtime.
+The bounded core campaign below measured `f873fee4`; subsequent MMQ source
+fixes require fresh qualification. The later RC2, RC4 and MTP stages are outside
+this branch. Their context, throughput and full-stack gate results do not
+qualify this reduced core.
 
 This integration loads NVIDIA's original NVFP4 checkpoint through Atlas and
 runs TP2/EP2 across two GB10 Sparks. Atlas owns model loading, scheduling,
@@ -28,11 +29,15 @@ collapsing those values into new defaults requires another runtime qualification
 
 Atlas base is `7ffd183f210708d5b1afba1e046049f14ad498c7`. The original
 integration merged Enntity candidate `619da6ff` at `352d087e`. Review history
-normalizes commit-message metadata while retaining all human authors,
-committers, dates, source trees and parent relationships. The [history map](glm53-validation/history-map.json)
-links original revisions to their corresponding review commits. Historical
-source and binary receipts keep their original identities; a source-equivalent
-review commit is not a newly measured binary.
+normalizes commit-message metadata and, at the submitting contributor's request,
+Reiner Schmidt's author/committer timestamps. The October 12 rewrite places
+those timestamps in 23:30–02:30 windows using fixed EST (UTC−05:00); they do not
+establish when work or tests ran. Human identities and imported author dates
+remain intact. The [history map](glm53-validation/history-map.json) records the
+earlier message-only rewrite, before the timestamp normalization and stack
+extraction; its revisions are historical identities, not the current branch tip.
+Historical source and binary receipts keep their measured revisions. A
+source-equivalent review commit is not a newly measured binary.
 
 Later Atlas commits reconcile interfaces, repair regressions, replace the
 external prefill bridges and qualify the native implementation.
@@ -40,9 +45,20 @@ Review the combined diff against the Atlas base, then inspect each area below.
 The total branch is substantial; the small native-operator delta alone does not
 represent the shared runtime changes included in this submission.
 
+At the measured `f873fee4` boundary, the core delta against `6b13e372` is
+971 files, 130,280 additions and 8,215 deletions. Later corrections change that
+diff; derive submission counts from the actual proposed refs. The core also
+changes `kernels/strix-hip/common/dflash2_candidate_selector.cu` (326 additions,
+42 deletions at that boundary): scratch/ticket layout, device anchor/end-token
+inputs and confidence output follow the shared host selector ABI. This is a
+cross-platform compatibility change. CPU-stub and GB10 tests do not establish
+native HIP compilation or selector correctness/graph replay. That platform
+coverage remains pending; do not remove the companion kernel without keeping
+the host/device ABI consistent.
+
 | Review area | Main paths | Invariants to examine |
 |---|---|---|
-| Model configuration and loading | `crates/atlas-core/src/config/parsers/glm5_next.rs`, `crates/spark-model/src/factory/build/glm.rs`, `crates/spark-model/src/weight_loader/`, `kernels/gb10/glm-5.3-flash/nvfp4/MODEL.toml` | Original NVIDIA ModelOpt scales/layouts; expert slicing; skip appended MTP weights unless used; unsupported combinations fail before allocation |
+| Model configuration and loading | `crates/atlas-core/src/config/parsers/glm5_next.rs`, `crates/spark-model/src/factory/build/glm.rs`, `crates/spark-model/src/weight_loader/`, `kernels/gb10/glm-5.3-flash/MODEL.toml` | Original NVIDIA ModelOpt scales/layouts; expert slicing; skip appended MTP weights unless used; unsupported combinations fail before allocation |
 | Shared KV and SSM ownership | `crates/spark-model/src/factory/build/kv_budget.rs`, `crates/spark-model/src/model/ssm_pool/`, `crates/spark-runtime/src/kv_cache/` | Rank-minimum memory budget; rollback/compaction cleanup; owner isolation; shared pool versus per-request limit |
 | Distributed execution | `crates/spark-comm/src/nccl_backend/rdma_pair/`, `crates/atlas-rdma/`, `crates/spark-comm/src/peer_lifeline.rs` | Matching rank commands; flags/order and timeouts; lifetimes across capture/replay; failure propagation |
 | Optional DFlash | `crates/spark-model/src/layers/dflash_head/`, `crates/spark-server/src/scheduler/`, `crates/spark-server/src/cli/serve_args.rs` | Opt-in loading; single/batched selector ABI; first append; verification and rollback; per-request state |
@@ -53,18 +69,33 @@ represent the shared runtime changes included in this submission.
 
 Inspect these groups separately when reviewing. They are review boundaries,
 not claims that each group can be cherry-picked without its dependencies.
-Microbenchmarks, numerical oracles and the KV-sizing campaign remain because
-they explain and reproduce runtime decisions. Obsolete bridge implementations
+Numerical oracles, correctness probes and the KV-sizing campaign remain because
+they explain and reproduce runtime decisions. Optional developer performance
+harnesses are in the later benchmark-tools branch. Obsolete bridge implementations
 and builders have been removed; their source history and notices remain.
 
 ## Evidence and outstanding limits
 
-GPU execution is qualified at code commit `451bbc21`. The later polish changes
-remove unused scaffolding and update documentation/evidence; they do not change
-runtime algorithms or the tuned profile. The report distinguishes fresh
-CPU/documentation checks from historical GPU measurements.
+The core campaign at `f873fee48e9f88907ecfe8ac8b1330e172ee9c4c` passed
+18 focused checkpoint-retirement tests, a clean Docker build, three API cases
+and four short coherence cases. Both ranks shut down without the previously
+reproduced invalid-free/model-teardown error; fallback ownership warnings
+remain. That bounded campaign does not exercise every optional loading path.
+Subsequent MMQ corrections change source inputs and need new exact-tip checks.
 
-The tested maximum is 524,288 configured tokens, shared across up to four slots.
+Earlier reduced core `77152c68` passed 6,906 CPU tests with zero failed and
+116 ignored, plus formatting, Clippy and rustdoc using CPU build/link stubs.
+Those tests retain that earlier source identity. The assembled full-stack ten
+Qwen gate passes at `6447f929` belong to a different binary and cannot serve as
+this core's current-tip formal gates. Their receipt is in the separate review
+evidence attachment, not implied to be present on this intermediate branch.
+Native x86_64/aarch64 CUDA release builds and HIP coverage also remain separate
+requirements; CPU stub compilation is not native kernel or release validation.
+
+The historical `451bbc21` serving campaign remains in the linked validation
+report. Its context and throughput measurements are historical evidence, not
+current-core capacity qualification. Its tested maximum was 524,288 configured
+tokens, shared across up to four slots.
 It is not 1M-context qualification or four fully occupied 524K requests. Native
 sparse acceleration ends at 32K; the Atlas fallback handles longer contexts.
 Performance is workload-dependent and output is not identical to the original
@@ -76,6 +107,12 @@ and general video/vision quality are outside this qualification. Shared code
 changes therefore warrant review even when GLM's bounded tests pass.
 
 ## Attribution and distribution
+
+The local integration, fixes, documentation and validation are AI-assisted;
+Reiner Schmidt is the submitting contributor. Imported human credits remain
+intact. No contributor agreement has been signed on anyone else's behalf.
+Attribution does not establish the additional CLA/commercial-relicensing grant
+requested by Atlas; imported-contributor clearance evidence remains unresolved.
 
 [Prior art](../glm-prior-art.md) separates copied code/data, design references,
 and related work. Native vendor inventories record source pins and hashes;

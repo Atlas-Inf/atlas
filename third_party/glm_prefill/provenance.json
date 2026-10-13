@@ -11,25 +11,29 @@
       "path": "atlas_flash_kda_bridge.cu",
       "origin_path": "install/flash_kda/atlas_flash_kda_bridge.cu",
       "sha256": "6989340b5d6d27c504ab68265b0f1b0ea517dba9903412fb7d2e441389157411",
-      "modifications": "none"
+      "modifications": "none",
+      "upstream_url": "https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/install/flash_kda/atlas_flash_kda_bridge.cu"
     },
     {
       "path": "flash_kda_sm121_slots.patch",
       "origin_path": "install/flash_kda/flash_kda_sm121_slots.patch",
       "sha256": "5c453a58b9152c89e1c8e9ebf2f514d664bff007f72636a406c68906aa278d13",
-      "modifications": "none"
+      "modifications": "none",
+      "upstream_url": "https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/install/flash_kda/flash_kda_sm121_slots.patch"
     },
     {
       "path": "LICENSE",
       "origin_path": "install/flash_kda/LICENSE",
       "sha256": "05f1750624d6ab5f6dd59dea79e3156f4fec6b3065c94aeeaf265df677f9e6e8",
-      "modifications": "none"
+      "modifications": "none",
+      "upstream_url": "https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/install/flash_kda/LICENSE"
     },
     {
       "path": "SparkGLM-LICENSE",
       "origin_path": "LICENSE",
       "sha256": "d8a6cc31abc16b6748c7a21f21611f5a1ec33f67d22ca23d7da1c19b95496bee",
-      "modifications": "none"
+      "modifications": "none",
+      "upstream_url": "https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/LICENSE"
     }
   ],
   "credits": [
@@ -58,7 +62,8 @@
   "archive": {
     "atlas_revision": "3c991613462c79730e2936a7b0f97add40f74370",
     "path_prefix": "third_party/glm_prefill/",
-    "note": "Source and patch entries describe historical files, removed from the current tree after native qualification. License texts are retained. Original and review revisions have identical file trees; recover using git show <review_revision>:<path_prefix><path>.",
-    "review_revision": "b09ee1b6903931296e5a63d922150fb7cac272ca"
+    "note": "Source and patch entries describe historical files removed after native qualification; license texts remain in this tree. Original and review revisions have identical file trees but are available only in the preparer's local archive. A clone of the proposed stack cannot rely on git show for those objects. Each upstream_url below identifies the original pinned source; these originals do not reconstruct all later local scaffolding.",
+    "review_revision": "b09ee1b6903931296e5a63d922150fb7cac272ca",
+    "availability": "local-only; archive revisions are not ancestors of the proposed PR branches"
   }
 }
