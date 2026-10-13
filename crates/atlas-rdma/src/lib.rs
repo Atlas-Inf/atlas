@@ -22,6 +22,8 @@
 /// Rail-env resolution helpers (`first_set` / `first_nonempty` /
 /// `first_set_u32`) — un-gated, pure `std::env`.
 pub mod env;
+/// RoCE v2 IPv4 GID-index discovery from sysfs — un-gated, pure `std::fs`.
+pub mod gid;
 /// Client handshake steps as pure `Read`/`Write` byte functions (identity
 /// tuples, no `Verbs`) — un-gated so the transcript goldens run everywhere.
 pub mod handshake;

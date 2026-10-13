@@ -61,6 +61,18 @@ unsafe extern "C" {
         len: u32,
         wr_id: u64,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn rs_post_write_flag(
+        c: *mut RsConn,
+        local_addr: *mut c_void,
+        lkey: u32,
+        remote_addr: u64,
+        rkey: u32,
+        len: u32,
+        flag_addr: *mut c_void,
+        flag_remote: u64,
+        wr_id: u64,
+    ) -> c_int;
     fn rs_poll(c: *mut RsConn, out_wr_id: *mut u64) -> c_int;
 }
 
@@ -239,6 +251,48 @@ impl Verbs {
             unsafe { rs_post_write(self.conn, local_addr, lkey, remote_addr, rkey, len, wr_id) };
         if rc != 0 {
             bail!("ibv_post_send(RDMA_WRITE) failed: {rc}");
+        }
+        Ok(())
+    }
+
+    /// [`Self::post_write`] of `len` bytes, then an 8-byte WRITE of the word
+    /// at `flag_addr` to `flag_remote`, in one post; only the flag is
+    /// signaled, so a single `poll` reaps both. Relies on the responder
+    /// placing same-QP WRITEs in order (true without relaxed ordering, which
+    /// no MR here requests), so the peer sees the flag after the data.
+    ///
+    /// # Safety
+    /// As [`Self::post_write`], for both buffers: each must lie in a live MR
+    /// registered under `lkey` (and the remote ones under `rkey`), unmodified
+    /// until the flag's completion is reaped.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn post_write_flag(
+        &mut self,
+        local_addr: *mut c_void,
+        lkey: u32,
+        remote_addr: u64,
+        rkey: u32,
+        len: u32,
+        flag_addr: *mut c_void,
+        flag_remote: u64,
+        wr_id: u64,
+    ) -> Result<()> {
+        // SAFETY: conn live; caller upholds the buffer/key validity.
+        let rc = unsafe {
+            rs_post_write_flag(
+                self.conn,
+                local_addr,
+                lkey,
+                remote_addr,
+                rkey,
+                len,
+                flag_addr,
+                flag_remote,
+                wr_id,
+            )
+        };
+        if rc != 0 {
+            bail!("ibv_post_send(RDMA_WRITE + flag) failed: {rc}");
         }
         Ok(())
     }
