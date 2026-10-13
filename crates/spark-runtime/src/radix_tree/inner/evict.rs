@@ -7,7 +7,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use super::RadixTreeInner;
+use super::{NodeId, RadixTreeInner};
 use crate::prefix_cache::SpillOrder;
 
 impl RadixTreeInner {
@@ -21,12 +21,17 @@ impl RadixTreeInner {
     /// With the NVMe spill tier on, victims are spilled instead of deleted:
     /// the third vec lists the writes the caller must perform first.
     ///
-    /// The victim set is scanned ONCE per call (not once per block): eligible
-    /// leaves go into a min-heap keyed by `(last_access, node_id)` — the exact
-    /// old total order — and each eviction pops the minimum and pushes the
-    /// single parent that the pop may have made eligible. The old loop
-    /// re-scanned the whole arena for every block, so a full 10^3–10^5-node
-    /// pool drained N blocks in O(N·K); this is O(N + K·log N).
+    /// Victim order is the exact old total order `(last_access, node_id)`.
+    ///
+    /// Single-block calls retain the allocation-free linear victim search.
+    /// Decode cannot amortize building a heap to select just one leaf.
+    ///
+    /// Bulk calls (`num_blocks > 1`) scan the candidate set ONCE: eligible
+    /// leaves go into a min-heap keyed by `(last_access, node_id)` and each
+    /// eviction pops the minimum and pushes the single parent that the pop may
+    /// have made eligible. The old loop re-scanned the whole arena for every
+    /// block, so a full 10^3–10^5-node pool drained N blocks in O(N·K); this is
+    /// O(N + K·log N) and wins once K is large enough to amortise the heapify.
     pub(in crate::radix_tree) fn evict(
         &mut self,
         num_blocks: usize,
@@ -39,6 +44,14 @@ impl RadixTreeInner {
         if self.nvme_on() {
             let (phys, orders) = self.evict_spill(num_blocks);
             return (phys, freed_disk, orders);
+        }
+        if num_blocks == 1 {
+            if let Some(node_id) = self.least_evictable_leaf() {
+                let (block, disk) = self.unlink_evictable_leaf(node_id);
+                freed_phys.push(block);
+                freed_disk.push(disk);
+            }
+            return (freed_phys, freed_disk, Vec::new());
         }
 
         // Heap key `(Reverse(access), Reverse(id))` so `peek`/`pop` yield the
@@ -76,25 +89,10 @@ impl RadixTreeInner {
             }
             heap.pop();
 
-            let block = self.nodes[node_id].block_idx;
-            let disk = self.nodes[node_id].disk_block_id;
+            let parent = self.nodes[node_id].parent;
+            let (block, disk) = self.unlink_evictable_leaf(node_id);
             freed_phys.push(block);
             freed_disk.push(disk);
-
-            let parent = self.nodes[node_id].parent;
-            if let Some(parent_id) = parent
-                && let Some(key) = self.nodes[node_id].parent_key.clone()
-            {
-                self.nodes[parent_id].children.remove(&key);
-            }
-
-            self.nodes[node_id].block_idx = u32::MAX;
-            self.nodes[node_id].disk_block_id = u32::MAX;
-            self.nodes[node_id].children.clear();
-            self.nodes[node_id].parent = None;
-            self.nodes[node_id].parent_key = None;
-            self.free_nodes.push(node_id);
-
             // The removal may have emptied `parent`; if it just became an
             // eligible leaf it is now the only newly-eligible node, so one
             // push maintains the candidate set.
@@ -109,6 +107,46 @@ impl RadixTreeInner {
         }
 
         (freed_phys, freed_disk, Vec::new())
+    }
+
+    /// Smallest `(last_access, arena index)` eligible leaf, or `None` when the
+    /// arena holds no evictable leaf. This is the pre-rewrite victim rule; the
+    /// single-block path and the heap-based bulk path agree on it exactly.
+    fn least_evictable_leaf(&self) -> Option<NodeId> {
+        let mut best: Option<(NodeId, u64)> = None;
+        for (id, node) in self.nodes.iter().enumerate() {
+            if !Self::evictable_leaf(node) {
+                continue;
+            }
+            match best {
+                None => best = Some((id, node.last_access)),
+                Some((_, access)) if node.last_access < access => {
+                    best = Some((id, node.last_access))
+                }
+                _ => {}
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    /// Unlink `node_id` (which the caller just proved an eligible leaf) from
+    /// the tree and return its `(block_idx, disk_block_id)` so both eviction
+    /// paths share one copy of the removal logic.
+    fn unlink_evictable_leaf(&mut self, node_id: NodeId) -> (u32, u32) {
+        let block = self.nodes[node_id].block_idx;
+        let disk = self.nodes[node_id].disk_block_id;
+        if let Some(parent_id) = self.nodes[node_id].parent
+            && let Some(key) = self.nodes[node_id].parent_key.clone()
+        {
+            self.nodes[parent_id].children.remove(&key);
+        }
+        self.nodes[node_id].block_idx = u32::MAX;
+        self.nodes[node_id].disk_block_id = u32::MAX;
+        self.nodes[node_id].children.clear();
+        self.nodes[node_id].parent = None;
+        self.nodes[node_id].parent_key = None;
+        self.free_nodes.push(node_id);
+        (block, disk)
     }
 
     /// A node the delete-path eviction may remove: a non-root node (`parent`

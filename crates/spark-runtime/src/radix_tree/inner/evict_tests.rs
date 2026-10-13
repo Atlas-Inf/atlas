@@ -91,3 +91,38 @@ impl RadixTreeInner {
         }
     }
 }
+
+/// Repeated single-block eviction must free the same leaves and newly exposed
+/// parent as a bulk call, leaving the same tree available for prefix reuse.
+#[test]
+fn single_block_fast_path_matches_batch_evict() {
+    use crate::prefix_cache::PrefixCache;
+    use crate::radix_tree::RadixTree;
+
+    let build = |tree: &RadixTree| {
+        let root: Vec<u32> = (0..16u32).collect();
+        tree.insert(&root, &[10], &[], 16, 0, 0);
+        tree.release(&root, 16, 0);
+        for (first, block) in [(100u32, 20u32), (200, 30), (300, 40), (400, 50)] {
+            let mut tokens = root.clone();
+            tokens.extend(first..first + 16);
+            tree.insert(&tokens, &[10, block], &[], 16, 0, 0);
+            tree.release(&tokens, 16, 0);
+        }
+    };
+    let step_tree = RadixTree::new();
+    let batch_tree = RadixTree::new();
+    build(&step_tree);
+    build(&batch_tree);
+    let mut stepped = Vec::new();
+    for _ in 0..5 {
+        stepped.extend(step_tree.evict(1).physical);
+    }
+    let batched = batch_tree.evict(5).physical;
+    assert_eq!(stepped, vec![20, 30, 40, 50, 10]);
+    assert_eq!(stepped, batched);
+    assert_eq!(
+        step_tree.inner.lock().structure_snapshot(),
+        batch_tree.inner.lock().structure_snapshot(),
+    );
+}
