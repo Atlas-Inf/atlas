@@ -260,71 +260,19 @@ impl MoeLayer {
 
         // ATLAS_GLM_DET_TRACE stages (`det_rows`: the rows the reduce leaves here).
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
-        let (row, route) = (h as usize * 2, top_k as usize * 4);
+        let row = h as usize * 2;
         det.tap("moe_in", input, (0, num_tokens), row);
-        // Gemma-4 router pre-norm (no-op for other models).
-        let router_in = self.router_input(input, n, h, ctx, stream)?;
-        super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
-        // 1. Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
-        let gate_logits = ctx.buffers.gate_logits();
-        self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
-        super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
-        det.tap(
-            "x_gate",
-            gate_logits,
-            (0, num_tokens),
-            num_experts as usize * 2,
-        );
-        prof_step!("gate_gemm");
-
-        // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
-        // logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op unless a router
-        // delta is installed (ATLAS_LORA_EXPERTS=1).
-        self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
-
-        // 2. Batched topK dispatch. DeepSeek-V3 / MiniMax-M2 use sigmoid
-        //    + correction bias (detected via `correction_bias_dev`);
-        //    every other model takes the softmax path (no behavior
-        //    change — this is additive).
-        let scratch = ctx.buffers.scratch();
-        let indices_dev = scratch;
-        let weights_dev = scratch.offset(total_expanded as usize * 4);
-        self.prefill_topk(
-            gate_logits,
-            indices_dev,
-            weights_dev,
-            n,
-            num_experts,
-            top_k,
-            ctx,
-            stream,
-        )?;
-        super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, n, top_k)?;
-        det.tap("rt_ids", indices_dev, (0, num_tokens), route);
-        det.tap("rt_w", weights_dev, (0, num_tokens), route);
-        prof_step!("topk");
-
-        // 3. Sort tokens by expert → L2-optimized ordering.
-        let te = total_expanded as usize;
-        let ne = num_experts as usize;
-        let sorted_token_ids = gate_logits;
-        let sorted_expert_ids = gate_logits.offset(te * 4);
-        let expert_offsets = gate_logits.offset(te * 4 * 2);
-        let token_to_perm = gate_logits.offset(te * 4 * 2 + (ne + 1) * 4);
-        ops::moe_sort_by_expert(
-            ctx.gpu,
-            self.moe_sort_by_expert,
-            indices_dev,
+        // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs).
+        let routes = self.route_and_sort(input, [n, h, inter], det, ctx, stream)?;
+        let super::route_fuse::Routes {
+            indices: indices_dev,
+            weights: weights_dev,
             sorted_token_ids,
-            sorted_expert_ids,
             expert_offsets,
             token_to_perm,
-            total_expanded,
-            num_experts,
-            top_k,
-            stream,
-        )?;
-        prof_step!("sort");
+            prerouted,
+        } = routes;
+        prof_step!("route");
 
         // 3.5. Pre-expert norm: norm the input for expert dispatch (Gemma-4 26B).
         // Router already used the raw input for routing; now norm for experts.
@@ -364,7 +312,8 @@ impl MoeLayer {
             num_experts,
             top_k,
             num_tokens,
-            ne,
+            num_experts as usize,
+            prerouted,
             &mut t0,
             ctx,
             stream,

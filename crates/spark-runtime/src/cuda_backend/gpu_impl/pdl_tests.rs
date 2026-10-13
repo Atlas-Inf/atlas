@@ -40,7 +40,7 @@ fn weight_param(signature: &str, name: &str) -> bool {
 
 /// Whether a function body (the text after its `{`) waits before anything
 /// else: `atlas_pdl_enter();`, or `atlas_pdl_enter_touch({w, ..}, {s, ..}, ..);`
-/// (`_pair`: one pair per plane), the same entry with discarded loads ahead
+/// (`_pair`: one pair per plane; `_tri`: one pair per projection), the same entry with discarded loads ahead
 /// of its wait, which is safe only while every touched region is a weight
 /// parameter of `signature` (a predecessor may still be writing anything else).
 fn waits_first(signature: &str, body: &str) -> bool {
@@ -56,7 +56,8 @@ fn waits_first(signature: &str, body: &str) -> bool {
     }
     let touch = body
         .strip_prefix("atlas_pdl_enter_touch(")
-        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_pair("));
+        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_pair("))
+        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_tri("));
     if let Some(args) = touch {
         let call = args.split(");").next().unwrap_or("");
         let regions: Vec<&str> = call
@@ -190,6 +191,16 @@ extern "C" __global__ void pair(const unsigned char* __restrict__ w0,
 extern "C" __global__ void pair_input(const unsigned char* __restrict__ w0, const float* a) {
     atlas_pdl_enter_touch_pair({w0, 8u, 8u}, {w0, 1u, 1u}, {a, 8u, 8u}, {w0, 1u, 1u}, 4u, 0u, 2u);
 }
+extern "C" __global__ void tri(const unsigned char* __restrict__ w0,
+                               const unsigned char* __restrict__ w1) {
+    atlas_pdl_enter_touch_tri({w0, 8u, 0ull}, {w1, 1u, 0ull}, {w1, 8u, 0ull}, {w0, 1u, 0ull},
+                              {w0, 8u, 0ull}, {w1, 1u, 0ull}, 1u, role(4u));
+    body<1>(w0);
+}
+extern "C" __global__ void tri_input(const unsigned char* __restrict__ w0, float* a) {
+    atlas_pdl_enter_touch_tri({w0, 8u, 0ull}, {w0, 1u, 0ull}, {w0, 8u, 0ull}, {w0, 1u, 0ull},
+                              {a, 8u, 0ull}, {w0, 1u, 0ull}, 1u, role(4u));
+}
 "#,
     );
     assert_eq!(
@@ -209,6 +220,8 @@ extern "C" __global__ void pair_input(const unsigned char* __restrict__ w0, cons
             ("touches_prefix", false),
             ("pair", true),
             ("pair_input", false),
+            ("tri", true),
+            ("tri_input", false),
         ]
     );
 }

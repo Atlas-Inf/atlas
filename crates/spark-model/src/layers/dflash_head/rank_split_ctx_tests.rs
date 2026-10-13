@@ -30,9 +30,9 @@ fn the_ctx_switch_is_0_or_1_and_sets_its_own_parity_bit() {
         assert!(parse_ctx(Some(bad)).is_err(), "{bad}");
     }
     for batch in [false, true] {
-        let off = parity_word(Some(ALL), batch, false);
+        let off = parity_word(Some(ALL), batch, false, false);
         assert_eq!(off, Parts::word(Some(ALL)) | (batch as u64) << 2);
-        assert_eq!(parity_word(Some(ALL), batch, true), off | 8);
+        assert_eq!(parity_word(Some(ALL), batch, true, false), off | 8);
     }
 }
 

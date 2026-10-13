@@ -58,6 +58,13 @@ impl MoeLayer {
         )
     }
 
+    /// Whether [`Self::prepare_ep_prefill_outputs`] zeroes the expert
+    /// buffers (remote rows read by a dense reduce, or forced).
+    pub(super) fn ep_prefill_zeroes(&self, ctx: &ForwardContext) -> bool {
+        let force_zero = std::env::var("ATLAS_MOE_PREFILL_ZERO").ok().as_deref() == Some("1");
+        force_zero || (ctx.comm.is_some() && !self.use_sparse_ep_reduce(ctx))
+    }
+
     pub(super) fn prepare_ep_prefill_outputs(
         &self,
         total_expanded: u32,
@@ -66,11 +73,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let force_zero = std::env::var("ATLAS_MOE_PREFILL_ZERO").ok().as_deref() == Some("1");
-        if self.use_sparse_ep_reduce(ctx) && !force_zero {
-            return Ok(());
-        }
-        if ctx.comm.is_none() && !force_zero {
+        if !self.ep_prefill_zeroes(ctx) {
             return Ok(());
         }
         let rows = total_expanded as usize;

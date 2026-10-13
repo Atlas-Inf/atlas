@@ -18,6 +18,16 @@
 //!    a fenced stream memop between 2 and 3, the legacy `ready` ordering
 //!    (about 5-7 us slower per call on GB10).
 //!
+//! `ATLAS_RDMA_ONESHOT_SM_STAGE=1` makes it one stream operation: the kernel
+//! waits for `stage` == 0 and stages the payload itself (write-through
+//! stores, a system-scope fence, then `stage`), and is launched with
+//! programmatic dependent launch (`ATLAS_RDMA_ONESHOT_PDL`, default on), so
+//! the producer -> all-reduce -> consumer chain has no copy-engine hops or
+//! launch gaps. The landing is the same code, so the result is bit-identical
+//! to the copy-engine path whenever the NIC reads what the SMs stored; mode
+//! `2` (plain stores) exists only as the control of the stress test for that
+//! (`nic_loopback_sm_stage_stress`). Checked equal on both ranks.
+//!
 //! The proxy serves a non-zero `stage` as op `served + 1`: it WRITEs `S` into
 //! the peer's receive slot `seq % 2` (striped over the rails from
 //! `stripe_min`), then a flag `seq << 24 | bytes` per rail, and clears `stage`
@@ -64,7 +74,34 @@ use atlas_rdma::Verbs;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// `CUlaunchAttribute` / `CUlaunchConfig` (driver API), as in atlas-core's
+/// `registry/launch.rs`.
+#[repr(C)]
+struct CuLaunchAttribute {
+    id: u32,
+    pad: [u8; 4],
+    value: [u8; 64],
+}
+
+#[repr(C)]
+struct CuLaunchConfig {
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_mem_bytes: u32,
+    stream: u64,
+    attrs: *mut CuLaunchAttribute,
+    num_attrs: u32,
+}
+
+const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: u32 = 6;
+
 unsafe extern "C" {
+    fn cuLaunchKernelEx(
+        config: *const CuLaunchConfig,
+        f: u64,
+        params: *mut *mut c_void,
+        extra: *mut *mut c_void,
+    ) -> i32;
     fn cuMemcpyHtoD_v2(dst: u64, src: *const c_void, bytes: usize) -> i32;
     fn cuStreamWaitValue32_v2(stream: u64, addr: u64, value: u32, flags: u32) -> i32;
     fn cuStreamWriteValue32_v2(stream: u64, addr: u64, value: u32, flags: u32) -> i32;
@@ -78,7 +115,8 @@ const MAX_LIMIT: usize = (1 << 24) - 64;
 const MIN_MAX: usize = 512 << 10;
 const MAX_RAILS: usize = 8;
 const THREADS: usize = 256;
-/// Kernel state in device memory (see `rdma_oneshot.cu`).
+/// Kernel state in device memory (see `rdma_oneshot.cu`): seq, finished
+/// blocks, go, staged blocks.
 const STATE_BYTES: usize = 32;
 const MAX_BLOCKS: usize = 16;
 
@@ -111,8 +149,16 @@ pub(super) struct Config {
     /// Kernel wait limit (`ATLAS_RDMA_ONESHOT_TIMEOUT_MS`, 30 s; 0 = none).
     pub(super) timeout_ns: u64,
     /// Publish `stage` with a fenced stream memop rather than from the
-    /// kernel (`ATLAS_RDMA_ONESHOT_STAGE_FENCE=1`); local only.
+    /// kernel (`ATLAS_RDMA_ONESHOT_STAGE_FENCE=1`); local only, and ignored
+    /// under `sm_stage`.
     pub(super) stage_fence: bool,
+    /// The kernel stages the payload (`ATLAS_RDMA_ONESHOT_SM_STAGE`): 0 =
+    /// copy engine (default), 1 = write-through SM stores, 2 = plain SM
+    /// stores (stress-test control only).
+    pub(super) sm_stage: u32,
+    /// Launch the kernel with programmatic dependent launch under `sm_stage`
+    /// (`ATLAS_RDMA_ONESHOT_PDL`, default 1); local only.
+    pub(super) pdl: bool,
 }
 
 impl Config {
@@ -138,6 +184,12 @@ impl Config {
             timeout_ns: (num("ATLAS_RDMA_ONESHOT_TIMEOUT_MS", 30_000) as u64)
                 .saturating_mul(1_000_000),
             stage_fence: var("ATLAS_RDMA_ONESHOT_STAGE_FENCE").as_deref() == Some("1"),
+            sm_stage: match var("ATLAS_RDMA_ONESHOT_SM_STAGE").as_deref() {
+                Some("1") => 1,
+                Some("2") => 2,
+                _ => 0,
+            },
+            pdl: var("ATLAS_RDMA_ONESHOT_PDL").as_deref() != Some("0"),
         })
     }
 
@@ -147,9 +199,12 @@ impl Config {
         bytes > 0 && bytes <= self.max && bytes.is_multiple_of(2)
     }
 
-    /// Bootstrap form, `max` and `stripe_min`: both ranks must send the same.
-    pub(super) fn wire(cfg: Option<Self>) -> [u64; 2] {
-        cfg.map_or([0; 2], |c| [c.max as u64, c.stripe_min as u64])
+    /// Bootstrap form, `max`, `stripe_min` and `sm_stage`: both ranks must
+    /// send the same.
+    pub(super) fn wire(cfg: Option<Self>) -> [u64; 3] {
+        cfg.map_or([0; 3], |c| {
+            [c.max as u64, c.stripe_min as u64, u64::from(c.sm_stage)]
+        })
     }
 }
 
@@ -218,7 +273,8 @@ pub(in crate::nccl_backend) struct OneShot {
     host: usize,
     dev: u64,
     /// Device-resident kernel state: sequence (u64), finished-block counter
-    /// (u32 at 8) and the sequence block 0 saw arrive (u64 at 16).
+    /// (u32 at 8), the sequence block 0 saw arrive (u64 at 16) and the
+    /// staged-block counter (u32 at 24).
     state: u64,
     kernel: AtomicU64,
 }
@@ -265,91 +321,6 @@ impl OneShot {
     /// Why the channel stopped (the kernel trapped or will), if it did.
     pub(in crate::nccl_backend) fn poisoned(&self) -> Option<String> {
         poison_at(self.host + ctrl_off(self.cfg.max))
-    }
-
-    /// Send `src[..bytes]` to the peer and land its payload in `dst` (added
-    /// in place when `add`, else copied), all on `stream` and capturable.
-    /// `false` (nothing enqueued) when the size is ineligible or the kernel
-    /// is missing; both ranks see the same answer.
-    pub(in crate::nccl_backend) fn enqueue(
-        &self,
-        src: u64,
-        dst: u64,
-        bytes: usize,
-        add: bool,
-        stream: u64,
-    ) -> Result<bool> {
-        let kernel = self.kernel.load(Ordering::Relaxed);
-        if kernel == 0 || !self.cfg.eligible(bytes) {
-            return Ok(false);
-        }
-        let ctrl = self.dev + ctrl_off(self.cfg.max) as u64;
-        let stage = ctrl + STAGE as u64;
-        cu(
-            unsafe { cuStreamWaitValue32_v2(stream, stage, 0, CU_STREAM_WAIT_VALUE_EQ) },
-            "cuStreamWaitValue32(one-shot stage)",
-        )?;
-        cu(
-            unsafe { cuMemcpyAsync(self.dev, src, bytes, stream) },
-            "cuMemcpyAsync(one-shot stage)",
-        )?;
-        if self.cfg.stage_fence {
-            // Default flags fence the copy before the word lands.
-            cu(
-                unsafe { cuStreamWriteValue32_v2(stream, stage, bytes as u32, 0) },
-                "cuStreamWriteValue32(one-shot stage)",
-            )?;
-        }
-        let blocks = (bytes / 16).div_ceil(THREADS).clamp(1, MAX_BLOCKS) as u32;
-        let mut args = (
-            dst,
-            self.dev + recv_off(self.cfg.max, 0) as u64,
-            self.cfg.max as u64,
-            bytes as u32,
-            add as u32,
-            ctrl + FLAGS as u64,
-            stripes(bytes, self.rails, self.cfg.stripe_min).len() as u32,
-            self.state,
-            if self.cfg.stage_fence { 0 } else { stage },
-            ctrl + POISON as u64,
-            self.cfg.timeout_ns,
-        );
-        let mut params: [*mut c_void; 11] = [
-            (&raw mut args.0).cast(),
-            (&raw mut args.1).cast(),
-            (&raw mut args.2).cast(),
-            (&raw mut args.3).cast(),
-            (&raw mut args.4).cast(),
-            (&raw mut args.5).cast(),
-            (&raw mut args.6).cast(),
-            (&raw mut args.7).cast(),
-            (&raw mut args.8).cast(),
-            (&raw mut args.9).cast(),
-            (&raw mut args.10).cast(),
-        ];
-        let status = unsafe {
-            cuLaunchKernel(
-                kernel,
-                blocks,
-                1,
-                1,
-                THREADS as u32,
-                1,
-                1,
-                0,
-                stream,
-                params.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-        if status != 0 && self.cfg.stage_fence {
-            // `stage` is already on the stream: the proxy will serve an op no
-            // kernel consumes, and its count would stay ahead of the device
-            // sequence (stale receive slots). Stop the channel instead.
-            poison_host(self.host + ctrl_off(self.cfg.max), POISON_LAUNCH);
-        }
-        cu(status, "cuLaunchKernel(rdma_oneshot_bf16)")?;
-        Ok(true)
     }
 }
 
@@ -484,3 +455,6 @@ mod gpu_tests;
 #[cfg(test)]
 #[path = "oneshot_tests.rs"]
 mod tests;
+
+#[path = "oneshot_launch.rs"]
+mod launch;

@@ -19,6 +19,9 @@ use crate::weight_map::{
 mod dp4a_decode;
 #[path = "dense_ffn_prefill_bf16.rs"]
 mod prefill_bf16;
+#[path = "dense_ffn_tp_split.rs"]
+mod tp_split;
+pub(crate) use tp_split::dense_tp_split_requested;
 
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,

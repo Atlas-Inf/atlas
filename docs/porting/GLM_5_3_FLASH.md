@@ -4,6 +4,9 @@
 
 Review: [change areas and invariants](GLM_5_3_FLASH_REVIEW.md) · [measured results](glm53-validation/README.md) · [launch recipe](../../scripts/dev/glm53_native/README.md)
 
+Current source update: [RC4 integration and pending validation](GLM_5_3_FLASH_RC4.md)
+(October 12). The results below retain their original measurement scope.
+
 Status on 2026-10-09: **integrated and tested locally; not published or merged
 upstream.** Native GPU and bounded end-to-end checks passed on the test pair;
 see the measured scope below. This document supersedes the
@@ -27,8 +30,9 @@ on two DGX Sparks with TP2/EP2. Model weights are downloaded separately.
 
 The local branch is `feat/glm53-native-integration`. Source history and the
 final review commits are authoritative; the reconciliation checkpoint above
-is not a final validation tag. Display-carveout changes following the bridge
-commit are deliberately excluded. No deployment recipe or benchmark result
+is not a final validation tag. Display-carveout changes following the original bridge
+commit were initially excluded; the later [RC2 update](GLM_5_3_FLASH_RC2.md)
+adapts them as an optional native path with hardware and driver guards. No deployment recipe or benchmark result
 from the reference fork is evidence that this rebased tree works.
 
 Atlas owns model loading, scheduling, KV/SSM state, distributed execution,

@@ -178,23 +178,27 @@ impl MoeLayer {
         max_m_tiles: u32,
         compact: Option<CompactMoeWorklist>,
         wide: Option<MtileGrid>,
+        prerouted: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
         // expert_down_out is not consumed until after gate/up and has ample
         // capacity for packed token-major A followed by its group scales.
+        // `prerouted`: `glm_moe_router_quant` wrote them (route_fuse.rs).
         let a_packed = ctx.buffers.expert_down_out();
         let a_scale = a_packed.offset(n as usize * h as usize / 2);
-        ops::quantize_bf16_to_nvfp4(
-            ctx.gpu,
-            self.quantize_nvfp4_k,
-            expert_input,
-            a_packed,
-            a_scale,
-            n,
-            h,
-            stream,
-        )?;
+        if !prerouted {
+            ops::quantize_bf16_to_nvfp4(
+                ctx.gpu,
+                self.quantize_nvfp4_k,
+                expert_input,
+                a_packed,
+                a_scale,
+                n,
+                h,
+                stream,
+            )?;
+        }
         let grouped_kernel = if self.nvfp4_vecscale && self.moe_w4a4_prequant_t_k64_vecscale.0 != 0
         {
             self.moe_w4a4_prequant_t_k64_vecscale
@@ -291,6 +295,7 @@ impl MoeLayer {
             )?;
             return Ok(true);
         }
+        anyhow::ensure!(!prerouted, "fused MoE routing: the M16 gate/up did not run");
         for (weight, output) in [(gate, expert_gate_out), (up, expert_up_out)] {
             if let Some(work) = compact {
                 let compact_kernel = if self.nvfp4_vecscale

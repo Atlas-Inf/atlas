@@ -71,8 +71,14 @@ pub(crate) fn prepare_shard_mxfp8(
         h,
         stream,
     )?;
+    let mut w = crate::weight_map::Mxfp8Weight {
+        data,
+        scales,
+        tiled: false,
+    };
+    ops::mxfp8_tile_if_requested(gpu, &mut w, shard, h, stream)?;
     gpu.synchronize(stream)?;
-    let _ = SHARD_MX.set((start, crate::weight_map::Mxfp8Weight { data, scales }));
+    let _ = SHARD_MX.set((start, w));
     tracing::info!(
         rank = config.ep_rank,
         shard,
@@ -199,11 +205,7 @@ impl TransformerModel {
                 let m = (rows - first).min(32);
                 ops::mxfp8_gemv(
                     self.gpu.as_ref(),
-                    k[match m {
-                        0..=8 => 0,
-                        9..=16 => 1,
-                        _ => 2,
-                    }],
+                    ops::mxfp8_kernel(self.gpu.as_ref(), &w, &k, m as u32),
                     normed.offset(first * h * 2),
                     w.data,
                     w.scales,

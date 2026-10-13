@@ -10,4 +10,7 @@ use spark_runtime::gpu::DevicePtr;
 pub struct Mxfp8Weight {
     pub data: DevicePtr,
     pub scales: DevicePtr,
+    /// The bytes are in `mxfp8_tile16`'s chunk-tiled layout
+    /// (`ops::mxfp8_tile_if_requested`), served only by the `_tiled` tiers.
+    pub tiled: bool,
 }

@@ -61,6 +61,7 @@ impl Qwen3AttentionLayer {
             // Not at 17..=32 rows, where the 32-row tier lost time to it
             // (scripts/dev/glm_decode_gemv_touch_bench.cu).
             if m <= 16
+                && !mx.tiled
                 && self
                     .mla
                     .as_ref()
@@ -71,11 +72,7 @@ impl Qwen3AttentionLayer {
                     ctx.gpu, input, mx.data, mx.scales, output, m, n, k, n, stream,
                 );
             }
-            let kernel = self.mxfp8_gemv_k[match m {
-                0..=8 => 0,
-                9..=16 => 1,
-                _ => 2,
-            }];
+            let kernel = ops::mxfp8_kernel(ctx.gpu, mx, &self.mxfp8_gemv_k, m);
             return ops::mxfp8_gemv(
                 ctx.gpu, kernel, input, mx.data, mx.scales, output, m, n, k, n, stream,
             );

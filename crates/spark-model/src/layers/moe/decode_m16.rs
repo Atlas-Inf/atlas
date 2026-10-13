@@ -296,8 +296,12 @@ impl MoeLayer {
     /// then [`Self::prequant_tiles`] taking [`Self::decode_m16_grid`], whose
     /// gate/up and down both launch over its grid.
     pub(super) fn offsets_unread(&self, rows: u32, h: u32, inter: u32) -> bool {
-        self.decode_m16.nosync
-            && self.decode_m16.stream()
+        self.decode_m16.nosync && self.stream_m16_prequant(rows, h, inter)
+    }
+
+    /// Whether a routed FFN of `rows` rows takes the stream twins' prequant path.
+    pub(super) fn stream_m16_prequant(&self, rows: u32, h: u32, inter: u32) -> bool {
+        self.decode_m16.stream()
             && self.m16_grid_fits(rows, STREAM_MAX_ROWS, h, inter)
             && !self.nvfp4_mmq_layout
             && !(super::forward_prefill_routed::grouped_cutlass_gate_up_enabled()
@@ -336,6 +340,7 @@ impl MoeLayer {
         [rows, top_k]: [u32; 2],
         [h, inter]: [u32; 2],
         num_experts: u32,
+        prerouted: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<(Option<CompactMoeWorklist>, Option<MtileGrid>)> {
@@ -358,6 +363,7 @@ impl MoeLayer {
                 total_expanded,
                 [h, inter],
                 num_experts,
+                prerouted,
                 ctx,
                 stream,
             )?
@@ -425,6 +431,7 @@ impl MoeLayer {
     /// "prefix" is the compact worklist scratch with one N tile per routed
     /// local expert, which the twins index by grid row. The grid bound is
     /// host-static: there are at most `total_expanded` routed experts.
+    /// `prerouted`: `glm_moe_route_select` already built that worklist.
     #[allow(clippy::too_many_arguments)]
     fn decode_m16_grid(
         &self,
@@ -434,6 +441,7 @@ impl MoeLayer {
         total_expanded: u32,
         [h, inter]: [u32; 2],
         num_experts: u32,
+        prerouted: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<MtileGrid>> {
@@ -451,18 +459,20 @@ impl MoeLayer {
             ctx.buffers.sizes().moe_router_in_f32 >= 16 + total_expanded as usize * 8,
             "M16 decode worklist exceeds router scratch"
         );
-        ops::moe_build_tile_worklist(
-            ctx.gpu,
-            self.moe_build_tile_worklist_k,
-            expert_offsets,
-            local_ptrs,
-            total_tiles.offset(16),
-            total_tiles,
-            num_experts,
-            1,
-            64,
-            stream,
-        )?;
+        if !prerouted {
+            ops::moe_build_tile_worklist(
+                ctx.gpu,
+                self.moe_build_tile_worklist_k,
+                expert_offsets,
+                local_ptrs,
+                total_tiles.offset(16),
+                total_tiles,
+                num_experts,
+                1,
+                64,
+                stream,
+            )?;
+        }
         let grid_only = |grid| ops::K128wKernel {
             grid,
             persist: KernelHandle(0),

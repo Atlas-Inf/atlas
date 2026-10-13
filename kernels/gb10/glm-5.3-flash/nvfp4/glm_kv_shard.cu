@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include "glm_kv_shard_pack.cuh"
 #ifndef GLM_KV_SHARD_BODIES_INCLUDED
 #define GLM_KV_SHARD_MODULE
 #include "glm_sparse_prefill_kv_reuse.cu"
@@ -47,45 +48,6 @@ extern "C" __global__ void glm_kv_shard_map_slots(
         : -1;
 }
 
-// Pack one row's selected ids (`in == nullptr`: the causal ids of row `r`,
-// tokens [0, causal_start + r + 1)) that `keep(token, &value)` keeps, as
-// `value`, to the front of `out`'s row in selected order (a stable
-// partition); the rest of the row is -1 and the number kept goes to
-// `count[r]`. One CTA of 256 threads per row; thread `t` owns the
-// `ceil(width / 256)` consecutive ids from `t * ceil(width / 256)`. `out`
-// must not alias `in`. `s_kept` is 256 words of shared memory, reused only
-// after a barrier.
-#define GLM_KV_SHARD_COMPACT_CHUNK 16u
-template <class Keep>
-__device__ __forceinline__ void glm_kv_shard_pack_row(
-    const int* __restrict__ in, int* __restrict__ out, unsigned int* __restrict__ count,
-    unsigned int r, unsigned int width, unsigned int causal_start, unsigned int* s_kept,
-    Keep keep) {
-    const unsigned int t = threadIdx.x;
-    const unsigned int chunk = (width + 255u) / 256u;
-    const unsigned int begin = min(t * chunk, width);
-    const unsigned int end = min(begin + chunk, width);
-    const size_t row = (size_t)r * width;
-    int value[GLM_KV_SHARD_COMPACT_CHUNK];
-    unsigned int kept = 0;
-    for (unsigned int c = begin; c < end; ++c) {
-        const int token = in != nullptr ? in[row + c] : (c < causal_start + r + 1u ? (int)c : -1);
-        if (token >= 0 && keep((unsigned int)token, value[kept])) ++kept;
-    }
-    s_kept[t] = kept;
-    __syncthreads();
-    unsigned int before = 0, total = 0;
-    for (unsigned int i = 0; i < 256u; ++i) {
-        if (i == t) before = total;
-        total += s_kept[i];
-    }
-    for (unsigned int k = 0; k < kept; ++k) out[row + before + k] = value[k];
-    // The ids this thread dropped land after every kept id, in order.
-    const unsigned int dropped = begin - before;
-    for (unsigned int k = 0; k < (end - begin) - kept; ++k) out[row + total + dropped + k] = -1;
-    if (t == 0) count[r] = total;
-}
-
 // Selected-ID remap for this rank's partial attention: each row's ids whose
 // block this rank stores, as local token ids (read through an identity block
 // table over the local pool), packed to the front in selected order, their
@@ -106,13 +68,8 @@ extern "C" __global__ void glm_kv_shard_localize_compact(
     __shared__ unsigned int s_kept[256];
     const unsigned int r = blockIdx.x;
     if (r >= rows || blockDim.x != 256u || (width + 255u) / 256u > GLM_KV_SHARD_COMPACT_CHUNK) return;
-    glm_kv_shard_pack_row(in, out, counts, r, width, causal_start, s_kept,
-                          [&](unsigned int id, int& local) {
-                              const unsigned int block = block_table[id / block_size];
-                              if (block % world != rank) return false;
-                              local = (int)((block / world) * block_size + id % block_size);
-                              return true;
-                          });
+    glm_kv_shard_localize_row(in, out, counts, block_table, r, width, block_size, rank, world,
+                              causal_start, s_kept, GlmCtaBarrier{});
 }
 
 // The canonical form of an unsharded TP pair (crates/spark-model/src/layers/
@@ -144,9 +101,11 @@ extern "C" __global__ void glm_kv_canonical_partition(
             return (id / block_size) % 2u == residue;
         };
     };
-    glm_kv_shard_pack_row(in, own, own_counts, r, width, causal_start, s_kept, group(rank));
+    glm_kv_shard_pack_row(in, own, own_counts, r, width, causal_start, s_kept, group(rank),
+                          GlmCtaBarrier{});
     __syncthreads();  // s_kept is read by every thread above
-    glm_kv_shard_pack_row(in, peer, peer_counts, r, width, causal_start, s_kept, group(1u - rank));
+    glm_kv_shard_pack_row(in, peer, peer_counts, r, width, causal_start, s_kept,
+                          group(1u - rank), GlmCtaBarrier{});
 }
 
 // Block gather/scatter: dst block `dst_idx[i]` (or `i` when null) receives

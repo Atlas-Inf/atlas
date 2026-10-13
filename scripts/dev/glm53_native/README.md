@@ -18,6 +18,8 @@ not a claim that every supported model or flag combination has been validated.
 
 For the RC2 integration, apply the [RC2 profile and validation limits](../../../docs/porting/GLM_5_3_FLASH_RC2.md) after this historical environment. In particular, RC2 qualification currently disables dependent launch.
 
+For the latest source imports, read the [RC4 notes](../../../docs/porting/GLM_5_3_FLASH_RC4.md). They include a separately qualified bounded C4 profile and a near-1M C1 retrieval run, with exact overrides and receipts. The historical recipe below remains pinned to its original revision.
+
 ## Build and host prerequisites
 
 Use the [GLM Dockerfile](../../../docker/gb10/glm-5.3-flash/nvfp4/Dockerfile) or

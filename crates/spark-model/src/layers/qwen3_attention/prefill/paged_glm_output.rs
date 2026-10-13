@@ -12,8 +12,9 @@ use crate::layers::ops;
 use crate::weight_map::Mxfp8Weight;
 
 /// The MXFP8 twin `glm_head_gemm` reads for `rows` of the `g`-head weight
-/// `weight` (`[g, n, k]`): only a twin quantized as exactly `[g * n, k]`, for
-/// at most 16 rows, with both grouped tiers resolved. Else BF16.
+/// `weight` (`[g, n, k]`): only a row-major twin quantized as exactly
+/// `[g * n, k]`, for at most 16 rows, with both grouped tiers resolved. Else
+/// BF16.
 fn glm_head_twin<'a>(
     twins: &'a [(DevicePtr, [usize; 2], Mxfp8Weight)],
     tiers: &[KernelHandle; 2],
@@ -24,7 +25,7 @@ fn glm_head_twin<'a>(
     let servable = rows <= ops::MXFP8_GROUPED_MAX_M && tiers.iter().all(|t| t.0 != 0);
     twins
         .iter()
-        .find(|&&(w, s, _)| servable && w == weight && s == shape)
+        .find(|&&(w, s, mx)| servable && !mx.tiled && w == weight && s == shape)
         .map(|(.., mx)| mx)
 }
 
@@ -159,7 +160,16 @@ mod tests {
         ]
         .map(|(w, shape, p)| {
             let (data, scales) = (DevicePtr(p), DevicePtr(p + 0x800));
-            (w, shape, Mxfp8Weight { data, scales })
+            let tiled = false;
+            (
+                w,
+                shape,
+                Mxfp8Weight {
+                    data,
+                    scales,
+                    tiled,
+                },
+            )
         })
         .to_vec()
     }

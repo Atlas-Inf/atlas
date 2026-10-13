@@ -409,8 +409,11 @@ __device__ __forceinline__ void dg_tc_load(
     }
 }
 
+// The body for weight-row tile `cta` (rows 16 * cta ..): the plain tiers'
+// CTA `blockIdx.x`, or a CTA of a launch that runs other work beside it
+// (glm_mla_fuse.cu).
 template <int NT>
-__device__ __forceinline__ void dense_gemv_bf16_tc_impl(
+__device__ __forceinline__ void dense_gemv_bf16_tc_cta(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -418,13 +421,14 @@ __device__ __forceinline__ void dense_gemv_bf16_tc_impl(
     unsigned int N,
     unsigned int K,
     unsigned int out_stride,
-    unsigned int lda
+    unsigned int lda,
+    unsigned int cta
 ) {
     __shared__ float s_red[DG_TC_WARPS][WARP_SIZE][NT * 4];
     const unsigned int warp = threadIdx.x / WARP_SIZE;
     const unsigned int lane = threadIdx.x % WARP_SIZE;
     const unsigned int g = lane >> 2, c = lane & 3u;
-    const unsigned int r0 = blockIdx.x * 16u + g, r1 = r0 + 8u;
+    const unsigned int r0 = cta * 16u + g, r1 = r0 + 8u;
     const bool v0 = r0 < N, v1 = r1 < N;
     const __nv_bfloat16* w0p = B + (unsigned long long)(v0 ? r0 : 0u) * K;
     const __nv_bfloat16* w1p = B + (unsigned long long)(v1 ? r1 : 0u) * K;
@@ -480,6 +484,14 @@ __device__ __forceinline__ void dense_gemv_bf16_tc_impl(
             if (n < N && m < M) C[(unsigned long long)m * out_stride + n] = __float2bfloat16(v);
         }
     }
+}
+
+template <int NT>
+__device__ __forceinline__ void dense_gemv_bf16_tc_impl(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int out_stride, unsigned int lda) {
+    dense_gemv_bf16_tc_cta<NT>(A, B, C, M, N, K, out_stride, lda, blockIdx.x);
 }
 
 extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE)

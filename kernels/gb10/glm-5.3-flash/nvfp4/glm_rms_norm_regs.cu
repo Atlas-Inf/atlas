@@ -13,15 +13,18 @@
 // Grid: (num_tokens, 1, 1)  Block: (min(hidden_size, 1024), 1, 1); at most
 // four pairs a thread (hidden_size <= 8 * blockDim.x, else it traps).
 #define RMSV_REGS_PAIRS 4
-extern "C" __global__ void rms_norm_vanilla_regs(
+// The body for row `token`, on the whole CTA (glm_mla_fuse.cu runs it on a
+// CTA of a launch with other roles). A row of `hidden_size` <= 2 * blockDim.x
+// gives each pair its own thread, so any such block size sums the same values
+// in the same order: the warps past the row add exact zeros.
+__device__ __forceinline__ void rms_norm_vanilla_regs_row(
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ output,
     unsigned int hidden_size,
-    float eps
+    float eps,
+    unsigned int token
 ) {
-    atlas_pdl_enter();
-    unsigned int token = blockIdx.x;
     unsigned int tid = threadIdx.x;
     const unsigned int half_size = hidden_size / 2;
     if (half_size > RMSV_REGS_PAIRS * blockDim.x) __trap();
@@ -89,4 +92,15 @@ extern "C" __global__ void rms_norm_vanilla_regs(
         float w = __bfloat162float(weight[hidden_size - 1]);
         out[hidden_size - 1] = __float2bfloat16(val * rms * w);
     }
+}
+
+extern "C" __global__ void rms_norm_vanilla_regs(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    unsigned int hidden_size,
+    float eps
+) {
+    atlas_pdl_enter();
+    rms_norm_vanilla_regs_row(input, weight, output, hidden_size, eps, blockIdx.x);
 }

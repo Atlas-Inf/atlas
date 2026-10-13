@@ -98,9 +98,9 @@ impl BlockDiffusionDraftHead {
         let vocab_size = target_vocab_size.min(weights.config.vocab_size);
         let gamma_val = gamma.unwrap_or(weights.config.block_size());
 
-        // Allocate the drafter's paged FP8 KV cache. One multi-layer cache,
-        // sized for `max_seq_len + γ + 1` positions (prompt + γ drafts +
-        // 1 bonus). Block size 16 matches the rest of Atlas.
+        // Allocate the drafter's paged BF16 KV cache. Per-sequence capacity
+        // follows ctx_capacity plus γ drafts and one bonus, not the full
+        // session length. Block size 16 matches the target.
         let block_size = 16;
         let kv_config = KvCacheConfig {
             block_size,

@@ -41,6 +41,9 @@ impl MoeLayer {
         top_k: u32,
         num_tokens: usize,
         ne: usize,
+        // `route_and_sort` already wrote the M16 worklist and the NVFP4
+        // input (`ATLAS_GLM_MOE_ROUTE_FUSE`).
+        prerouted: bool,
         t0: &mut Option<std::time::Instant>,
         ctx: &ForwardContext,
         stream: u64,
@@ -323,9 +326,14 @@ impl MoeLayer {
                         [n, top_k],
                         [h, inter],
                         num_experts,
+                        prerouted,
                         ctx,
                         stream,
                     )?;
+                    anyhow::ensure!(
+                        wide.is_some() || !prerouted,
+                        "fused MoE routing: {n} rows left the M16 grid it built a worklist for"
+                    );
                     silu_done = self.prequant_fp4_gate_up(
                         expert_input,
                         gp,
@@ -341,6 +349,7 @@ impl MoeLayer {
                         max_m_tiles,
                         compact,
                         wide,
+                        prerouted,
                         ctx,
                         stream,
                     )?;

@@ -892,7 +892,7 @@ mod context_window;
 mod markov_slots;
 use markov_slots::{MARKOV_BAN_DEPTH_OFFSET, MARKOV_PREV_BYTES};
 mod twins;
-pub use twins::{DflashTwins, LayerMxfp8};
+pub use twins::{ConvTwinKind, DflashTwins, LayerMxfp8};
 
 impl BlockDiffusionDraftHead {
     /// Total propose lanes (lane 0 = default-stream scratch; the rest live

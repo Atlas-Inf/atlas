@@ -180,6 +180,7 @@ impl MoeLayer {
                 .moe_w4a4_prequant_t_k64_vecscale_compact,
             m16_gate_up,
             decode_m16: super::decode_m16::DecodeM16::new(gpu, config)?,
+            route_fuse: super::route_fuse::RouteFuse::new(gpu, config)?,
             m5_projections,
             moe_w4a4_prequant_t_k64_compact_gate_up: optional
                 .moe_w4a4_prequant_t_k64_compact_gate_up,

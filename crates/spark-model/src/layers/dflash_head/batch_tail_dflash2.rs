@@ -106,12 +106,12 @@ impl BlockDiffusionDraftHead {
 
         // (b) Selector chain: one grid-wide launch (CTA = sequence) when
         // the batched kernel resolved — job 596: 16 × 4.70 ms sequential
-        // launches on one SM each. Byte-identical per sequence: the .cu
-        // shares one `df2_selector_body` with the single-seq entry, and
-        // `batch_markov_prev` (the prologue's last_tokens upload) carries
-        // the same values passed scalar below. Fallback = per-seq loop.
-        // HIP retains unmasked upstream draft picks even below min_tokens;
-        // the target verifier still enforces that floor.
+        // launches on one SM each. The batched entry retains its per-CTA
+        // selector body; the single-sequence entry uses the grid-wide
+        // selector. Both read the same per-sequence anchors from
+        // `batch_markov_prev`. Confidence output or end-token bans require
+        // the per-sequence fallback below on CUDA. HIP keeps upstream's
+        // unmasked draft picks; its target verifier enforces min_tokens.
         if self.kernels.dflash2_candidate_selector_batched.0 != 0
             && !self.startup.diagnostics.draft_conf
             && (!has_end_ban || !ops::DFLASH2_SELECTOR_BANS_END_TOKENS)

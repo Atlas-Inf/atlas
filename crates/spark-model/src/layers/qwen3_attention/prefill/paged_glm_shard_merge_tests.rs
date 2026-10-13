@@ -73,6 +73,7 @@ fn owner(query: u64, rows: u32, queries_swapped: bool) -> ShardRows {
         rows,
         end: None,
         queries_swapped,
+        localized: false,
     }
 }
 
@@ -220,6 +221,31 @@ fn queries_swapped_ahead_are_not_swapped_again() {
         "{order:?}"
     );
     assert!(order[0].starts_with("glm_kv_shard_localize"), "{order:?}");
+}
+
+#[test]
+fn owners_localized_ahead_are_not_localized_again() {
+    for overlap in [false, true] {
+        let gpu = ShardGpu::default();
+        let (pair, config) = (ShardPair { gpu: &gpu, rank: 1 }, config());
+        let a = ShardRows {
+            localized: true,
+            ..owner(QUERY, 8, false)
+        };
+        merge(&gpu, &pair, &config, tuning(overlap))
+            .run(a, DevicePtr(OUTPUT), STREAM)
+            .unwrap();
+        let order = gpu.order();
+        assert!(
+            !order.iter().any(|s| s.starts_with("glm_kv_shard_localize")),
+            "{order:?}"
+        );
+        assert_eq!(
+            order.iter().filter(|s| s.starts_with("exchange")).count(),
+            2,
+            "{order:?}"
+        );
+    }
 }
 
 /// The verify path under the overlap: each owner's queries fly beside its

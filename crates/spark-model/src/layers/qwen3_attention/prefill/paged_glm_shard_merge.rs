@@ -75,6 +75,9 @@ impl ShardMerge<'_> {
         // Each row's IDs this rank stores, packed to the front and counted.
         let counts = at(m.counts(a.rows, splits));
         let localize = || {
+            if a.localized {
+                return Ok(());
+            }
             ops::glm_kv_shard_localize(
                 gpu,
                 a.selected,

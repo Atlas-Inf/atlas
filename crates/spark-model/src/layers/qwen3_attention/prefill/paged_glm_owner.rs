@@ -181,6 +181,8 @@ impl Qwen3AttentionLayer {
     /// rows), when the scratch holds every row; `None` projects per owner.
     /// `solo` also batches a single owner, whose queries are then ready
     /// before its selection (the same projections, in a different order).
+    /// `keys`: project the index keys and gates (not when the fused front
+    /// already updated the index cache with them).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_owner_projections(
         &self,
@@ -190,6 +192,7 @@ impl Qwen3AttentionLayer {
         rows: usize,
         nq: usize,
         solo: bool,
+        keys: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<GlmOwnerProjections>> {
@@ -218,9 +221,12 @@ impl Qwen3AttentionLayer {
             return Ok(None);
         }
         let n = rows as u32;
+        let project_keys = keys;
         let keys = ctx.buffers.ssm_qkvz();
         let gates = keys.offset(rows * key_row);
-        self.glm_index_project_keys(normed, n, keys, gates, ctx, stream)?;
+        if project_keys {
+            self.glm_index_project_keys(normed, n, keys, gates, ctx, stream)?;
+        }
         let q_absorbed = ctx.buffers.ssm_deinterleaved();
         // Short-context batches (every owner dense) skip wq_b and weights_proj.
         let index = if any_owner_selects(owners, c.index_topk) {

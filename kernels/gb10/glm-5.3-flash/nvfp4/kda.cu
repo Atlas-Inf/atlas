@@ -392,24 +392,26 @@ extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_rec_
 // Grid: heads * KDA_COMMIT_KSPLIT x layers; block 128.
 #define KDA_COMMIT_KSPLIT 4u
 #define KDA_COMMIT_KPT (128u / KDA_COMMIT_KSPLIT / 4u)
-extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
+// One CTA's share: key-row block `bx` (head bx / KSPLIT) of layer `layer`.
+__device__ __forceinline__ void kda_commit_records_item(
     float* __restrict__ state,
     unsigned long long state_layer_stride,
     const float* __restrict__ records,
     unsigned long long records_layer_stride,
     unsigned long long record_stride,
     unsigned int rows,
-    unsigned int heads
+    unsigned int heads,
+    unsigned int bx,
+    unsigned int layer
 ) {
-    atlas_pdl_enter();
-    const unsigned int head = blockIdx.x / KDA_COMMIT_KSPLIT;
+    const unsigned int head = bx / KDA_COMMIT_KSPLIT;
     if (head >= heads || blockDim.x != 128 || rows == 0) return;
     const unsigned int col = (threadIdx.x & 31u) * 4u;
-    const unsigned int k0 = (blockIdx.x % KDA_COMMIT_KSPLIT) * (128u / KDA_COMMIT_KSPLIT)
+    const unsigned int k0 = (bx % KDA_COMMIT_KSPLIT) * (128u / KDA_COMMIT_KSPLIT)
         + (threadIdx.x >> 5);
-    float* H = state + (unsigned long long)blockIdx.y * state_layer_stride
+    float* H = state + (unsigned long long)layer * state_layer_stride
         + (unsigned long long)head * 128 * 128 + col;
-    const float* R = records + (unsigned long long)blockIdx.y * records_layer_stride
+    const float* R = records + (unsigned long long)layer * records_layer_stride
         + (unsigned long long)head * KDA_RECORD_FLOATS;
     float4 h[KDA_COMMIT_KPT];
     #pragma unroll
@@ -431,6 +433,44 @@ extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
     #pragma unroll
     for (unsigned int i = 0; i < KDA_COMMIT_KPT; ++i)
         *reinterpret_cast<float4*>(H + (unsigned long long)(k0 + 4u * i) * 128) = h[i];
+}
+
+extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
+    float* __restrict__ state,
+    unsigned long long state_layer_stride,
+    const float* __restrict__ records,
+    unsigned long long records_layer_stride,
+    unsigned long long record_stride,
+    unsigned int rows,
+    unsigned int heads
+) {
+    atlas_pdl_enter();
+    kda_commit_records_item(state, state_layer_stride, records, records_layer_stride,
+                            record_stride, rows, heads, blockIdx.x, blockIdx.y);
+}
+
+// kda_commit_records over a fixed grid (ATLAS_GLM_KDA_COMMIT_CTAS): CTA c
+// takes the grid's blocks c, c + gridDim.x, ... of `heads * KSPLIT * layers`,
+// each the same elements with the same folds, so the same state words. The
+// grid kernel queues every block of every layer at once (4352 at 34 layers),
+// so a kernel or copy enqueued behind it on another stream waits for nearly
+// all of them; a grid of a few CTAs a SM leaves room beside the commit.
+// Grid: (ctas, 1, 1); block 128.
+extern "C" __global__ void __launch_bounds__(128) kda_commit_records_stride(
+    float* __restrict__ state,
+    unsigned long long state_layer_stride,
+    const float* __restrict__ records,
+    unsigned long long records_layer_stride,
+    unsigned long long record_stride,
+    unsigned int rows,
+    unsigned int heads,
+    unsigned int layers
+) {
+    atlas_pdl_enter();
+    const unsigned int per_layer = heads * KDA_COMMIT_KSPLIT;
+    for (unsigned int item = blockIdx.x; item < per_layer * layers; item += gridDim.x)
+        kda_commit_records_item(state, state_layer_stride, records, records_layer_stride,
+                                record_stride, rows, heads, item % per_layer, item / per_layer);
 }
 
 // Precompute normalized Q/K and row decay once per token/head. The recurrence

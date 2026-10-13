@@ -126,6 +126,7 @@ pub(super) fn run_case(
                             rows,
                             end: None,
                             queries_swapped: false,
+                            localized: false,
                         };
                         merge.run(a, output, stream)?;
                         gpu.synchronize(stream)?;

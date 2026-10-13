@@ -18,6 +18,11 @@ kernels, prompt lookup, sharded disk prefixes and optional display-memory
 allocation. Its runtime changes require fresh validation; historical benchmark
 results below remain pinned to their original code.
 
+The [native RC4 update](GLM_5_3_FLASH_RC4.md) records the October 12 source
+imports through `0b515eec`, their credits and separate runtime/context
+qualification: bounded C1/C4 output checks with PDL off and on, plus a near-1M
+C1 retrieval run. See its receipts and limits before using the larger profile.
+
 ## History and review boundaries
 
 Atlas base is `7ffd183f210708d5b1afba1e046049f14ad498c7`. The original

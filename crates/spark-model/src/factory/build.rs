@@ -98,6 +98,7 @@ pub fn build_model(
     crate::layers::ops::preload_glm_sparse_native(gpu.as_ref())?;
     crate::layers::ops::initialize_glm_sparse_prefill_pipe(gpu.as_ref(), &config)?;
     crate::layers::ops::initialize_glm_kv_canonical(gpu.as_ref(), &config, kv_dtype)?;
+    crate::layers::ops::initialize_glm_mla_fuse(gpu.as_ref(), &config)?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this
@@ -1097,7 +1098,8 @@ pub fn build_model(
                 if let Some(parts) = split {
                     let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
                     let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
-                    head.enable_rank_split(parts, batch, ctx, model.gpu_backend())?;
+                    let topk = crate::layers::dflash_head::rank_split::topk_requested()?;
+                    head.enable_rank_split(parts, batch, ctx, topk, model.gpu_backend())?;
                 }
                 if rank != 0 {
                     anyhow::ensure!(

@@ -112,6 +112,9 @@ impl Pools {
 struct Dev<'a> {
     g: &'a dyn GpuBackend,
     kernel: spark_runtime::gpu::KernelHandle,
+    /// 0: the grid kernel; else the stride kernel over this many CTAs.
+    ctas: u32,
+    stream: u64,
     state: DevicePtr,
     records: DevicePtr,
     p: &'a Pools,
@@ -133,7 +136,8 @@ impl Dev<'_> {
                 rows.len() as u32,
                 HEADS as u32,
                 layers as u32,
-                self.g.default_stream(),
+                self.ctas,
+                self.stream,
             )
             .unwrap()
         };
@@ -158,7 +162,6 @@ fn backend() -> &'static spark_runtime::cuda_backend::AtlasCudaBackend {
 fn kda_commit_layer_batched_byte_identical() {
     let gpu = backend();
     let g: &dyn GpuBackend = gpu;
-    let kernel = g.kernel("kda", "kda_commit_records").unwrap();
     // Slot 2 is a spare no owner commits; owner ranges cover none, one row,
     // a leaf-split tail and the full verify.
     let owners: [(usize, std::ops::Range<usize>); 4] =
@@ -169,11 +172,22 @@ fn kda_commit_layer_batched_byte_identical() {
         p.fold(&mut want, *slot, rows);
     }
     let want: Vec<u32> = want.iter().map(|x| x.to_bits()).collect();
-    for batched in [true, false] {
+    // The stride kernel over 1, 7, 48 and more CTAs than blocks: every
+    // block-to-CTA phase.
+    for (ctas, batched) in [
+        (0, true),
+        (0, false),
+        (1, true),
+        (7, true),
+        (48, true),
+        (9999, true),
+    ] {
         let (state, records) = setup(g, &p);
         let dev = Dev {
             g,
-            kernel,
+            kernel: ops::kda_commit_kernel(g, ctas).unwrap(),
+            ctas,
+            stream: g.default_stream(),
             state,
             records,
             p: &p,
@@ -184,7 +198,10 @@ fn kda_commit_layer_batched_byte_identical() {
         g.synchronize(g.default_stream()).unwrap();
         let got = down(g, state, p.state.len());
         let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
-        assert_eq!(bad, 0, "batched={batched}: {bad} state words differ");
+        assert_eq!(
+            bad, 0,
+            "ctas={ctas} batched={batched}: {bad} state words differ"
+        );
         g.free(state).unwrap();
         g.free(records).unwrap();
     }
@@ -195,12 +212,13 @@ fn kda_commit_layer_batched_byte_identical() {
 fn kda_commit_layer_batched_timing() {
     let gpu = backend();
     let g: &dyn GpuBackend = gpu;
-    let kernel = g.kernel("kda", "kda_commit_records").unwrap();
     let p = Pools::new(34, 5, 7);
     let (state, records) = setup(g, &p);
     let dev = Dev {
         g,
-        kernel,
+        kernel: ops::kda_commit_kernel(g, 0).unwrap(),
+        ctas: 0,
+        stream: g.default_stream(),
         state,
         records,
         p: &p,
@@ -232,6 +250,61 @@ fn kda_commit_layer_batched_timing() {
                 );
             }
         }
+    }
+    g.free(state).unwrap();
+    g.free(records).unwrap();
+}
+
+/// The serving shape of a records commit (34 layers, 32 heads, three
+/// accepted rows) on a second stream, as `commit_accepted_prefix` issues it,
+/// and an 8 KiB device copy plus host sync on the default stream right
+/// after, as the step's drain does: how long the copy's sync waits behind
+/// the commit, and how long the commit takes, for the grid kernel and the
+/// stride kernel over several CTA counts.
+#[test]
+#[ignore]
+fn kda_commit_beside_a_copy_timing() {
+    let gpu = backend();
+    let g: &dyn GpuBackend = gpu;
+    let p = Pools::new(34, 1, 11);
+    let (state, records) = setup(g, &p);
+    let side = g.create_stream().unwrap();
+    let main = g.default_stream();
+    let (src, dst) = (g.alloc(8192).unwrap(), g.alloc(8192).unwrap());
+    const ITERS: usize = 20;
+    for ctas in [0u32, 24, 48, 96, 192] {
+        let dev = Dev {
+            g,
+            kernel: ops::kda_commit_kernel(g, ctas).unwrap(),
+            ctas,
+            stream: side,
+            state,
+            records,
+            p: &p,
+        };
+        let (mut copy_us, mut commit_us) = (Vec::new(), Vec::new());
+        for i in 0..=ITERS {
+            g.synchronize_device().unwrap();
+            let t = std::time::Instant::now();
+            dev.commit(0, &(0..3), true);
+            g.copy_d2d_async(src, dst, 8192, main).unwrap();
+            g.synchronize(main).unwrap();
+            let copied = t.elapsed();
+            g.synchronize(side).unwrap();
+            if i > 0 {
+                copy_us.push(copied.as_secs_f64() * 1e6);
+                commit_us.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        eprintln!(
+            "kda_commit ctas={ctas}: copy+sync {:.1} us, commit {:.1} us (median of {ITERS})",
+            median(&mut copy_us),
+            median(&mut commit_us)
+        );
     }
     g.free(state).unwrap();
     g.free(records).unwrap();

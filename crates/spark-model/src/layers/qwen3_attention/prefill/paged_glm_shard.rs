@@ -31,6 +31,9 @@ pub(in crate::layers::qwen3_attention) struct ShardRows {
     /// The peer's queries are already in the merge scratch
     /// ([`Qwen3AttentionLayer::glm_shard_swap_queries_during`]).
     pub queries_swapped: bool,
+    /// The causal IDs are already localized in the merge scratch
+    /// ([`Qwen3AttentionLayer::glm_shard_localize_target`]).
+    pub localized: bool,
 }
 
 #[path = "paged_glm_shard_merge.rs"]
@@ -252,7 +255,7 @@ impl Qwen3AttentionLayer {
         kv_cache: &PagedKvCache,
         ctx: &ForwardContext,
         o: &super::GlmChunkOwner,
-        (query, queries_swapped): (DevicePtr, bool),
+        (query, queries_swapped, localized): (DevicePtr, bool, bool),
         selected: Option<(DevicePtr, u32)>,
         output: DevicePtr,
         stream: u64,
@@ -274,6 +277,7 @@ impl Qwen3AttentionLayer {
             rows: o.rows as u32,
             end: Some(o.seq_len_start + o.rows),
             queries_swapped,
+            localized,
         };
         self.glm_shard_merge_attention(kv_cache, ctx, rows, output, stream)
     }
@@ -354,6 +358,24 @@ impl Qwen3AttentionLayer {
             start += n;
         }
         Ok((view, s.identity))
+    }
+
+    /// Where the merge form of a `rows`-row owner keeps its localized IDs
+    /// and their counts (`glm_kv_shard_localize`'s `out` and `counts`), for a
+    /// caller that localizes a causal owner ahead of the merge
+    /// (`ShardRows::localized`).
+    pub(in crate::layers::qwen3_attention) fn glm_shard_localize_target(
+        &self,
+        kv_cache: &PagedKvCache,
+        rows: u32,
+    ) -> Result<(DevicePtr, DevicePtr)> {
+        let s = kv_cache
+            .latent_shard()
+            .context("GLM KV shard localization on an unsharded cache")?;
+        let layout = ScratchLayout::of(&s, kv_cache.config())?;
+        let m = shard::MergeLayout::new(rows, shard::MERGE_SPLITS);
+        let at = |offset: usize| s.scratch.offset(layout.work + offset);
+        Ok((at(m.ids), at(m.counts(rows, shard::MERGE_SPLITS))))
     }
 
     /// This rank's local write slots for `num_tokens` global `slot`s (`-1`

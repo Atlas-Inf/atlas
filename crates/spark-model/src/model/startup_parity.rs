@@ -56,7 +56,7 @@ use super::trait_impl::finish_leaf;
 use super::trait_impl::prefill_b::pc_policy as pc;
 use super::{glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry, verify_pieces};
 use crate::layer::glm_long_owner;
-use crate::layers::dflash_head::rank_split;
+use crate::layers::dflash_head::{ConvTwinKind, rank_split};
 use crate::layers::qwen3_attention::{
     glm_mla_multi_seq_enabled, glm_multi_seq_sparse_enabled, glm_multi_seq_sparse_graphs_enabled,
     grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
@@ -176,6 +176,23 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_SHARED_TP_SPLIT", || {
         Ok(moe::shared_tp_split_requested() as u64)
     }),
+    ("ATLAS_GLM_DENSE_TP_SPLIT", || {
+        Ok(layers::dense_ffn::dense_tp_split_requested()? as u64)
+    }),
+    // Same bytes either way; agreed so a pair never mixes the routing
+    // chains it was measured with.
+    ("ATLAS_GLM_MOE_ROUTE_FUSE", || {
+        Ok(moe::route_fuse_requested()? as u64)
+    }),
+    ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
+        Ok(ops::kda_commit_ctas()? as u64)
+    }),
+    ("ATLAS_GLM_MLA_FUSE", || {
+        Ok(ops::glm_mla_fuse_requested()? as u64)
+    }),
+    ("ATLAS_GLM_MXFP8_TILED", || {
+        Ok(ops::mxfp8_tiled_requested()? as u64)
+    }),
     ("ATLAS_MOE_SHARED_REDUCE_OVERLAP", || {
         Ok(moe::shared_reduce_overlap_requested() as u64)
     }),
@@ -281,14 +298,21 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
         Ok(glm_repair_policy::mtp_distributed() as u64)
     }),
     // The drafter a worker loads and the swaps of a rank-split propose,
-    // batched ones included (ATLAS_GLM_DRAFT_TP_BATCH, bit 2), and how the
-    // worker reads its announce (ATLAS_GLM_DRAFT_TP_CTX, bit 3).
+    // batched ones included (ATLAS_GLM_DRAFT_TP_BATCH, bit 2), how the
+    // worker reads its announce (ATLAS_GLM_DRAFT_TP_CTX, bit 3) and what the
+    // vocabulary halves swap (ATLAS_GLM_DRAFT_TP_TOPK, bit 4).
     ("ATLAS_GLM_DRAFT_TP", || {
         Ok(rank_split::parity_word(
             rank_split::requested()?,
             rank_split::batch_requested()?,
             rank_split::ctx_requested()?,
+            rank_split::topk_requested()?,
         ))
+    }),
+    // Changes drafts only (the convs run on the head of a split propose);
+    // agreed so a pair never drafts from a twin it was not measured with.
+    ("ATLAS_DFLASH_CONV_TWIN", || {
+        Ok(ConvTwinKind::word(ConvTwinKind::requested()?))
     }),
     // Whether a step runs as a CUDA graph: a capturing forward takes other
     // collective paths than an eager one (`graph_flags`).

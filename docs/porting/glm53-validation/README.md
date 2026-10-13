@@ -15,6 +15,10 @@ committer records, dates and parent topology. The measured code `451bbc21`
 maps to `6114dbc21f266680598d4b25999a1a80d1527dbd`; this is source
 equivalence, not a new binary measurement.
 
+The later [RC4 update](../GLM_5_3_FLASH_RC4.md) has separate
+[receipts](rc4-results.json), including bounded concurrency and near-1M retrieval.
+The measurements in this historical report retain their original revision.
+
 ## Review order
 
 1. Read the [integration and provenance notes](../GLM_5_3_FLASH.md) for model

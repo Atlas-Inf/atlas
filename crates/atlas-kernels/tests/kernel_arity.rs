@@ -128,7 +128,9 @@ fn w4a16_launch_family_arity_pins() {
 /// anchor and ban-depth pointers, `top_k` eleventh, four end ids, scratch). Update
 /// launcher and pin in the same commit. The source-level
 /// signature pin in spark-model's `dflash2_selector_bounds.rs` covers stub
-/// builds where no PTX exists.
+/// builds where no PTX exists. The rank split's two launches
+/// (`dflash2_selector_topk`, seven args; `dflash2_selector_walk` and its
+/// confidence twin, sixteen) are pinned with it.
 #[test]
 #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
 fn dflash2_candidate_selector_arity_pin() {
@@ -139,23 +141,26 @@ fn dflash2_candidate_selector_arity_pin() {
         eprintln!("no compiled PTX in this binary (stub build) — arity pin skipped");
         return;
     }
+    const SELECTOR_PINS: [(&str, usize); 6] = [
+        ("dflash2_candidate_selector", 16),
+        ("dflash2_candidate_selector_conf", 16),
+        ("dflash2_candidate_selector_batched", 10),
+        ("dflash2_selector_topk", 7),
+        ("dflash2_selector_walk", 16),
+        ("dflash2_selector_walk_conf", 16),
+    ];
     let mut checked = 0usize;
     for set in atlas_kernels::available_targets() {
         for (module, blob) in &set.modules {
             let Ok(ptx) = std::str::from_utf8(blob) else {
                 continue;
             };
-            for (kernel, want) in [
-                ("dflash2_candidate_selector", 16),
-                ("dflash2_candidate_selector_conf", 16),
-                ("dflash2_candidate_selector_batched", 10),
-            ] {
+            for (kernel, pin) in SELECTOR_PINS {
                 if let Some(count) = ptx_param_count(ptx, kernel) {
                     assert_eq!(
-                        count, want,
-                        "PTX arity drift: {module}::{kernel} on target \
-                         {} has {count} params, pin expects {want} — update the launcher AND \
-                         this pin together",
+                        count, pin,
+                        "PTX arity drift: {module}::{kernel} on target {} has {count} params, \
+                         pin expects {pin} — update the launcher AND this pin together",
                         set.target.model
                     );
                     checked += 1;

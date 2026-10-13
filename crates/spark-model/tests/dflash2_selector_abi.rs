@@ -62,7 +62,7 @@ fn single_selector_dispatch_matches_the_backend_abi_without_host_readback() {
     } else {
         assert_eq!(
             (launch.grid, launch.block, launch.args),
-            ([12, 8, 1], [512, 1, 1], 16)
+            ([6, 8, 1], [512, 1, 1], 16)
         );
     }
     let expected = if cfg!(atlas_hip) {
