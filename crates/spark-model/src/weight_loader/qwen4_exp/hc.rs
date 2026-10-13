@@ -146,6 +146,7 @@ fn load_site(
 fn site(lowrank: HcLowRank) -> HcSiteWeights {
     HcSiteWeights {
         hc_fn: DevicePtr::NULL,
+        hc_fn_bf16: DevicePtr::NULL,
         hc_base: DevicePtr::NULL,
         hc_scale: DevicePtr::NULL,
         lowrank: Some(lowrank),

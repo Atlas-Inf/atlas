@@ -77,6 +77,17 @@ pub(super) fn build_choice_message(
             tool_parser::parse_tool_calls(&output_text_i)
         };
         let mut tool_calls_i = merge_hoisted_tool_calls(hoisted_tool_calls, parsed_tool_calls);
+        if state.glm_tool_boundary.is_some() {
+            // Native GLM parser semantics require a declared name. Do this
+            // before repair/coercion: the generic validator can fuzzy-map an
+            // unknown name to the sole supplied tool, which is not authority
+            // to execute a call emitted at an implicit reasoning boundary.
+            tool_calls_i.retain(|call| {
+                req.tools
+                    .iter()
+                    .any(|tool| tool.function.name == call.function.name)
+            });
+        }
         if !tool_calls_i.is_empty() {
             let tools_ref = req.tools.clone();
             tool_parser::backfill_required_params(&mut tool_calls_i, &tools_ref);

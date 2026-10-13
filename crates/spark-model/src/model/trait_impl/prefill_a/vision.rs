@@ -26,22 +26,20 @@ impl TransformerModel {
         // ONE batched ViT forward over all images in this request — block GEMM
         // weights read once over Σpatches instead of N× (the per-image loop also
         // overwrote buf_out row 0 every call, corrupting multi-image requests).
-        // Each returned (post_h, post_w, merged_p) preserves image order, so the
-        // packed buf_out matches the pad-token splice order downstream.
-        // FLATTEN to the encoder's unit: one row-block per temporal group.
-        // The ViT has no notion of time, so a clip's groups ride the same path
-        // as separate stills; `item_groups` remembers which belong together so
-        // the grids below can carry the item's temporal extent.
-        let mut img_refs: Vec<(&[f32], usize, usize)> = Vec::new();
+        // Each returned (post_h, post_w, merged_p) preserves group order, so
+        // the packed buf_out matches the pad-token splice order downstream.
+        // Keep items intact for the native GLM path. It emits one attention
+        // sequence per temporal group and returns one geometry tuple per
+        // group, while the splice/MRoPE bookkeeping below collapses those
+        // tuples back to the original item boundaries.
+        let mut item_refs: Vec<&crate::VisionItem> = Vec::with_capacity(images.len());
         let mut item_groups: Vec<usize> = Vec::with_capacity(images.len());
         for it in images {
             item_groups.push(it.t_len());
-            for g in &it.groups {
-                img_refs.push((g.as_slice(), it.grid_h, it.grid_w));
-            }
+            item_refs.push(it);
         }
         let _vt0 = std::time::Instant::now();
-        let per_image = ve.forward_batched(&img_refs, self.gpu.as_ref(), stream)?;
+        let per_image = ve.forward_items(&item_refs, self.gpu.as_ref(), stream)?;
         if std::env::var("ATLAS_VISION_TIMING").is_ok() {
             self.gpu.synchronize(stream).ok();
             tracing::info!(
@@ -92,23 +90,26 @@ impl TransformerModel {
         };
         let stream = self.gpu.default_stream();
         // Flatten all requests' images, recording each request's (start, count).
-        let mut flat: Vec<(&[f32], usize, usize)> = Vec::new();
+        let mut flat_items: Vec<&crate::VisionItem> = Vec::new();
         let mut req_bounds: Vec<(usize, usize)> = Vec::with_capacity(per_request.len());
         let mut per_req_groups: Vec<Vec<usize>> = Vec::with_capacity(per_request.len());
+        let mut group_cursor = 0usize;
         for imgs in per_request {
-            let start = flat.len();
+            let start = group_cursor;
             let mut groups = Vec::with_capacity(imgs.len());
+            let mut group_count = 0usize;
             for it in imgs {
                 groups.push(it.t_len());
-                for g in &it.groups {
-                    flat.push((g.as_slice(), it.grid_h, it.grid_w));
-                }
+                group_count += it.t_len();
+                flat_items.push(it);
             }
-            // Bounds are in ENCODER ROWS, which is what buf_out is indexed by.
-            req_bounds.push((start, flat.len() - start));
+            // Bounds are in per-group encoder rows, which is what buf_out and
+            // the returned geometry vector index.
+            req_bounds.push((start, group_count));
+            group_cursor += group_count;
             per_req_groups.push(groups);
         }
-        let per_image = ve.forward_batched(&flat, self.gpu.as_ref(), stream)?;
+        let per_image = ve.forward_items(&flat_items, self.gpu.as_ref(), stream)?;
         let grids: Vec<(usize, usize, usize)> = {
             let mut out = Vec::new();
             let mut row = 0usize;
@@ -145,7 +146,7 @@ impl TransformerModel {
         tracing::info!(
             "Vision encoder (co-dispatch): {} requests, {} images, {} merged patches",
             per_request.len(),
-            flat.len(),
+            flat_items.len(),
             total_merged
         );
         Ok(out)

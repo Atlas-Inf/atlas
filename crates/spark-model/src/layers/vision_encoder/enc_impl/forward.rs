@@ -13,6 +13,36 @@ use spark_runtime::gpu::GpuBackend;
 use super::super::VisionEncoder;
 
 impl VisionEncoder {
+    /// Forward vision items while preserving temporal groups. Qwen's ViT and
+    /// native GLM both treat each temporal group as an independent attention
+    /// sequence; GLM's model-specific path additionally applies its native
+    /// RMSNorm/RoPE/merger semantics.
+    pub fn forward_items(
+        &self,
+        items: &[&crate::VisionItem],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Vec<(usize, usize, usize)>> {
+        if let Some(glm) = &self.glm {
+            return glm.forward_items(items, gpu, stream);
+        }
+        let mut images = Vec::new();
+        for item in items {
+            for group in &item.groups {
+                images.push((group.as_slice(), item.grid_h, item.grid_w));
+            }
+        }
+        self.forward_batched(&images, gpu, stream)
+    }
+
+    /// Merged rows `buf_out` can hold for one request: the bound on the
+    /// vision rows a prefill may splice and a rank may receive. The Qwen tower
+    /// packs every image into one `p_max` batch; native GLM encodes items
+    /// separately into a larger packed output.
+    pub fn output_rows(&self) -> usize {
+        self.glm.as_ref().map_or(self.p_max, |glm| glm.out_rows)
+    }
+
     /// Single-image forward (back-compat shim). For N=1 this issues the SAME
     /// kernels with the SAME args in the SAME order as the old per-image path
     /// → byte-identical output. Returns `total_rows = (1+n_deepstack)*merged_p`
@@ -50,6 +80,9 @@ impl VisionEncoder {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<(usize, usize, usize)>> {
+        if let Some(glm) = &self.glm {
+            return glm.forward_batched(images, gpu, stream);
+        }
         let sms2 = self.spatial_merge_size * self.spatial_merge_size;
         let sms = self.spatial_merge_size.max(1);
         let n_img = images.len();

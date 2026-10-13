@@ -15,6 +15,10 @@ use std::collections::HashMap;
 use crate::tool_parser;
 
 pub(super) struct StreamState {
+    /// Total sampled completion tokens, including reasoning tokens. Unlike
+    /// `all_toks`, this counter is not reset at the `</think>` boundary, so
+    /// request-level `min_tokens` applies to the complete generation.
+    pub(super) generated_tokens: usize,
     /// Token IDs accumulated since the last reset (cleared at the
     /// `</think>` boundary so post-thinking content decodes cleanly).
     pub(super) all_toks: Vec<u32>,
@@ -205,6 +209,7 @@ impl StreamState {
         tool_defs: Vec<tool_parser::ToolDefinition>,
     ) -> Self {
         Self {
+            generated_tokens: 0,
             all_toks: Vec::new(),
             emitted: 0,
             content_decoded: String::new(),

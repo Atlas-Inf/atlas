@@ -9,7 +9,7 @@ use anyhow::Result;
 use spark_runtime::kv_cache::PagedKvCache;
 use spark_runtime::prefix_cache::PrefixMatch;
 
-use super::super::super::block_mgmt::reuse_prefix_match_disk_ids;
+use super::super::super::prefix_share::{adopt_prefix_match, cap_prefix_match};
 use super::super::super::types::TransformerModel;
 use crate::traits::{PrefillSlice, SequenceState};
 
@@ -44,16 +44,22 @@ impl TransformerModel {
             // position — a cache/Marconi skip would leave gaps. Force the
             // full-recompute path (documented perf cost, scoring calls only).
             let reserved = reserved_match.is_some();
+            // ATLAS_GLM_DET_TRACE=1 traces every request as a full recompute.
+            let det_recompute = crate::det_trace::begin_request(seq.slot_idx);
             let mut prefix_match = if self.tokens_have_vision_pad(tokens)
                 || seq.collect_prompt_logprobs.is_some()
                 || self.mla_prefill_needs_full_recompute()
+                || (det_recompute && !reserved)
             {
                 PrefixMatch::empty()
             } else if let Some(prefix_match) = reserved_match {
                 prefix_match
             } else {
+                // NVMe spill tier: page the on-disk continuation back in so
+                // the resident-only lookup below sees it (no-op when off).
+                self.nvme_restore_prefix(tokens, seq, kv_cache, stream);
                 self.prefix_cache
-                    .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
+                    .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
             };
             // F83 (2026-04-30): on EP>1, head and worker have
             // independent local prefix caches whose match counts can
@@ -82,17 +88,15 @@ impl TransformerModel {
                 let local = prefix_match.matched_tokens as u32;
                 let agreed = self.ep_min_u32(local)? as usize;
                 if agreed < prefix_match.matched_tokens {
-                    self.prefix_cache.release(tokens, bs, seq.adapter_id);
-                    if agreed > 0 {
-                        prefix_match = self.prefix_cache.lookup(
-                            &tokens[..agreed],
-                            bs,
-                            seq.session_hash,
-                            seq.adapter_id,
-                        );
-                    } else {
-                        prefix_match = spark_runtime::prefix_cache::PrefixMatch::empty();
-                    }
+                    prefix_match = cap_prefix_match(
+                        self.prefix_cache.as_ref(),
+                        tokens,
+                        bs,
+                        seq.session_hash,
+                        seq.adapter_id,
+                        prefix_match,
+                        agreed,
+                    );
                     tracing::info!(
                         "F83 EP-cache-sync: local_matched={local} agreed_matched={agreed} \
                          (cap to min across ranks)"
@@ -104,8 +108,6 @@ impl TransformerModel {
                 }
             }
             let matched = prefix_match.matched_tokens;
-            seq.cached_prefix_tokens = matched;
-            seq.cached_prefix_blocks = prefix_match.matched_blocks.len();
             // Stash the matched prefix so `free_sequence` can release the radix
             // refs the lookup just bumped even if this prefill fails to allocate
             // its suffix before `seq.tokens` is populated (else those nodes leak
@@ -117,14 +119,7 @@ impl TransformerModel {
                 seq.prefix_ref_tokens.clear();
             }
             seq.prompt_len = total;
-            for &block_idx in &prefix_match.matched_blocks {
-                kv_cache.inc_ref(block_idx);
-                seq.block_table.push(block_idx);
-            }
-            reuse_prefix_match_disk_ids(
-                &prefix_match.matched_disk_block_ids,
-                &mut seq.disk_block_ids,
-            );
+            adopt_prefix_match(seq, &prefix_match, kv_cache)?;
             // Issue #31: the prefix cache stores per-layer K/V on disk for every
             // matched block (that's the radix-tree invariant — blocks with a
             // non-MAX `disk_block_id` are fully offloaded across every attention
@@ -155,6 +150,16 @@ impl TransformerModel {
             // faulted-back spilled anchor; see `ssm_fault_in::eff_ssm_snapshot`.
             let (eff_snapshot, eff_snapshot_tokens) =
                 self.eff_ssm_snapshot(&prefix_match, seq.session_hash, stream);
+            // Multi-rank + ATLAS_GLM_PC_EVICT/BRANCH: every rank restores at
+            // one agreed depth or none does (`pc_policy`). Otherwise unchanged.
+            let (eff_snapshot, eff_snapshot_tokens, eff_is_tail) = self.pc_agree_restore(
+                tokens,
+                seq,
+                &prefix_match,
+                matched,
+                total,
+                (eff_snapshot, eff_snapshot_tokens),
+            )?;
 
             let mut skip = if let Some(snap_id) = eff_snapshot {
                 let snap_tok = eff_snapshot_tokens;
@@ -163,9 +168,6 @@ impl TransformerModel {
                 // produce the first token's logits, so fall through to the
                 // no-snapshot full-recompute path. Only affects identical
                 // retried prompts; multi-turn warm hits have matched < total.
-                let exact_without_hidden = snap_tok == matched
-                    && matched == total
-                    && !self.ssm_snapshots.has_hidden(snap_id);
                 // The bypass must be decided HERE, not after the restore below.
                 // It used to be checked ~80 lines further down, where it set
                 // `skip = false` to force a full recompute — but by then
@@ -185,9 +187,6 @@ impl TransformerModel {
                 // SHARED with the prefix cache. `ctx.gdn_exact_replay`'s own doc
                 // in layer.rs describes this same poisoning for the GDN path.
                 // `ATLAS_MARCONI_EXACT=1` re-enables it for A/B.
-                let bypass_exact = snap_tok == matched
-                    && matched == total
-                    && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1");
                 // Session gate applies ONLY to TAIL snapshots (their state
                 // bleeds past the exact prefix). Exact / is_tail_sibling
                 // snapshots are content-addressed by the verified token prefix
@@ -196,20 +195,11 @@ impl TransformerModel {
                 // turn anchor and forced recompute-all. See lookup_tiered.
                 // Below `marconi_min_tokens()` the snapshot restore costs more in lost
                 // drafter acceptance than the skipped prefill saves — see the helper.
-                if snap_tok >= crate::model::mtp_carry::marconi_min_tokens()
-                    && snap_tok > 0
-                    && matched <= total
-                    && !exact_without_hidden
-                    && !bypass_exact
-                    && (!prefix_match.ssm_snapshot_is_tail
-                        || self
-                            .ssm_snapshots
-                            .session_matches(snap_id, seq.session_hash))
-                    // Aux-carrying models (PLE/QSA) decline aux-less slots —
-                    // e.g. mid-chunk tail captures — rather than restore a
-                    // stale lexical state. See prefill_a.
-                    && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
-                {
+                // Aux-carrying models (PLE/QSA) decline aux-less slots —
+                // e.g. mid-chunk tail captures — rather than restore a
+                // stale lexical state. See prefill_a. The whole gate is
+                // `pc_policy::marconi_restorable`.
+                if self.marconi_restorable(snap_id, snap_tok, eff_is_tail, matched, total, seq) {
                     // Cross-stream ordering: the snapshot we are about to read
                     // was SAVED on the default stream (decode_marconi_checkpoint
                     // / finish_leaf_snapshot / prefill_save_snapshot), but this
@@ -302,7 +292,7 @@ impl TransformerModel {
             if skip
                 && prefix_match.ssm_snapshot_tokens == matched
                 && matched == total
-                && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1")
+                && !crate::model::mtp_carry::marconi_exact()
             {
                 skip = false;
                 seq.marconi_exact_snap = None;
@@ -371,6 +361,11 @@ impl TransformerModel {
             } else {
                 0
             };
+            // ATLAS_GLM_NVME_KEEP: kept records of the blocks this pass
+            // recomputes in place are stale from here on (no-op otherwise).
+            self.nvme_forget_rewritten(tokens, seq.adapter_id, skip_tokens, matched, bs);
+            self.pc_plan_branch(tokens, seq, matched, skip_tokens, bs)?;
+            self.finish_leaf_restored(tokens, seq, skip_tokens, bs, stream)?;
             seq.marconi_skip_to = skip_tokens;
             seq.prefix_lookup_skip = skip;
             seq.prefix_lookup_applied = true;
@@ -420,7 +415,7 @@ impl TransformerModel {
                 self.release_batched_prefix_reservations(streams, &matches, block_size);
                 return None;
             }
-            matches.push(self.prefix_cache.lookup(
+            matches.push(self.prefix_cache.lookup_whole_blocks(
                 slice.prompt_tokens,
                 block_size,
                 seq.session_hash,

@@ -21,7 +21,10 @@
 
 #[cfg(test)]
 mod cancel_guard_tests;
+
 mod ctx;
+#[cfg(test)]
+mod glm_tool_boundary_tests;
 mod handle_done;
 mod handle_error;
 mod handle_token;
@@ -64,6 +67,7 @@ pub(crate) async fn run_chat_stream(
     image_pixels: Vec<spark_model::VisionItem>,
     max_tokens: usize,
     min_tokens: usize,
+    ignore_eos: bool,
     temperature: f32,
     top_k: u32,
     top_p: f32,
@@ -134,6 +138,7 @@ pub(crate) async fn run_chat_stream(
         image_pixels,
         max_tokens,
         min_tokens,
+        ignore_eos,
         temperature,
         top_k,
         top_p,
@@ -225,6 +230,7 @@ pub(crate) async fn run_chat_stream(
             .as_ref()
             .is_some_and(|p| p.wants_typed_arguments()),
         max_tool_calls_per_response,
+        min_tokens,
         req_return_token_ids,
         req_ctx,
         dump_seq,

@@ -234,6 +234,7 @@ impl From<MessagesRequest> for ir::ChatRequest {
             },
             max_tokens: req.max_tokens,
             min_tokens: 0,
+            ignore_eos: false,
             stop: req.stop_sequences,
             stream: req.stream,
             n: 1,

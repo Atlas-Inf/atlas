@@ -104,6 +104,8 @@ pub struct AppState {
     pub sampling_presets: atlas_kernels::SamplingPresets,
     /// Token ID for `<tool_call>` — used for logit bias boost when tools are active.
     pub tool_call_start_token_id: Option<u32>,
+    /// Actual GLM native opener, model-scoped at startup; gated by request tools.
+    pub glm_tool_boundary: Option<u32>,
     /// Auto-compact threshold (fraction of max_seq_len). None = disabled.
     pub auto_compact_threshold: Option<f32>,
     /// Default request timeout in seconds. 0 = no timeout.

@@ -14,7 +14,13 @@ use std::sync::OnceLock;
 // Native FP8 (E4M3) GEMM paths live in the `fp8` sibling (≤500 LoC split);
 // re-exported so `spark_runtime::cublaslt::fp8_gemm_*` paths are unchanged.
 mod fp8;
+mod fp8_tensorwise;
+pub use fp8_tensorwise::fp8_gemm_act_weight_t_tensorwise;
+mod grouped;
 pub use fp8::{fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_rowwise};
+pub use grouped::bf16_grouped_gemm_act_weight_t;
+mod tf32;
+pub use tf32::tf32_gemm_act_weight_t;
 
 // The BF16 Atlas-kernel fallback (installed when cuBLASLt is a stub) lives in
 // the `bf16_fallback` sibling (≤500 LoC split); re-exported so
@@ -40,6 +46,7 @@ const CUDA_R_16BF: i32 = 14;
 const CUDA_R_32F: i32 = 0;
 const CUDA_R_8F_E4M3: i32 = 28;
 const CUBLAS_COMPUTE_32F: i32 = 68;
+const CUBLAS_COMPUTE_32F_FAST_TF32: i32 = 77;
 const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
 const DESC_TRANSA: u32 = 3;
@@ -54,6 +61,7 @@ const SCALE_MODE_BLK128X128_32F: i32 = 5;
 const PREF_MAX_WORKSPACE_BYTES: u32 = 1;
 
 unsafe extern "C" {
+    fn cublasLtGetVersion() -> usize;
     fn cublasLtCreate(handle: *mut cublasLtHandle_t) -> i32;
     fn cublasLtMatmulDescCreate(
         desc: *mut cublasLtMatmulDesc_t,
@@ -73,6 +81,12 @@ unsafe extern "C" {
         rows: u64,
         cols: u64,
         ld: i64,
+    ) -> i32;
+    fn cublasLtMatrixLayoutSetAttribute(
+        layout: cublasLtMatrixLayout_t,
+        attr: u32,
+        buf: *const c_void,
+        size: usize,
     ) -> i32;
     fn cublasLtMatrixLayoutDestroy(layout: cublasLtMatrixLayout_t) -> i32;
     fn cublasLtMatmulPreferenceCreate(pref: *mut cublasLtMatmulPreference_t) -> i32;
@@ -235,6 +249,16 @@ static CUBLASLT_LIVE_LOGGED: std::sync::Once = std::sync::Once::new();
 /// a per-GEMM `Result` cannot express.
 pub fn available() -> bool {
     ctx().is_ok()
+}
+
+/// The linked cuBLASLt's version, `major * 10000 + minor * 100 + patch`
+/// (130000 for CUDA 13.0's); 0 under the stub shims. Which kernel the
+/// heuristic picks for a shape -- and so the exact bits of the result --
+/// changes between versions: a caller whose output must equal another
+/// kernel's bit for bit gates on the versions it was verified against.
+pub fn version() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| unsafe { cublasLtGetVersion() })
 }
 
 /// Row-major `out[M,N] = act[M,K] @ weight[K,N]`, all BF16 — the NON-transposed
@@ -427,7 +451,6 @@ fn gemm_bf16(
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

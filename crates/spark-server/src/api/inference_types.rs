@@ -70,6 +70,19 @@ pub enum GrammarSpec {
     JsonSchema { schema: String },
 }
 
+/// The scheduler rejected the request as asked (e.g. a `response_format` it
+/// cannot enforce). The blocking chat path maps it to HTTP 400, not 500.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidRequestError(pub String);
+
+impl GrammarSpec {
+    /// A `response_format` grammar, whose output must conform.
+    pub fn is_response_format(&self) -> bool {
+        matches!(self, Self::JsonObject | Self::JsonSchema { .. })
+    }
+}
+
 /// Request submitted to the scheduler.
 pub enum InferenceRequest {
     /// Blocking: waits for full response.
@@ -105,6 +118,10 @@ pub enum InferenceRequest {
         max_tokens: usize,
         /// Minimum tokens before allowing EOS/stop (0 = no minimum).
         min_tokens: usize,
+        /// vLLM `ignore_eos`: the model's end tokens do not end the request;
+        /// they are ordinary output tokens and generation runs to
+        /// `max_tokens`. The request's own `stop_tokens` still end it.
+        ignore_eos: bool,
         temperature: f32,
         /// Top-k: keep only the k highest-probability tokens (0 = disabled).
         top_k: u32,
@@ -213,6 +230,8 @@ pub enum InferenceRequest {
         max_tokens: usize,
         /// Minimum tokens before allowing EOS/stop (0 = no minimum).
         min_tokens: usize,
+        /// vLLM `ignore_eos` (see Blocking variant).
+        ignore_eos: bool,
         temperature: f32,
         /// Top-k: keep only the k highest-probability tokens (0 = disabled).
         top_k: u32,

@@ -4,36 +4,63 @@
 
 use super::*;
 
+#[path = "forward_k3_routing.rs"]
+mod routing;
+#[path = "forward_k3_shared.rs"]
+mod shared;
+
 impl MoeLayer {
-    /// Fused K=3 forward: process 3 tokens through MoE in 5 kernel launches.
-    ///
-    /// Gate GEMV batch3 → batched topK → fused expert gate+up → fused silu+down → fused wsum+blend.
-    /// Expert buffers sized for 3*top_k slots. Output at moe_output() [3, H].
-    pub fn forward_k3(
+    /// K=3 routed experts without the EP reduction. GLM's K=5 verifier
+    /// combines this partial result with K=2 before reducing all five rows.
+    pub(super) fn forward_k3_routed_local(
         &self,
-        input: DevicePtr, // [3, H] BF16 — normed MoE input for 3 tokens
+        input: DevicePtr,
+        routes: PrecomputedRoutes,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // LongCat zero-experts are wired only on the single-token decode
-        // + prefill paths (v1); this variant would silently mis-route the
-        // 384-wide router. Named refusal, not silent wrongness.
+        self.forward_k3_impl(input, ctx, stream, false, false, Some(routes))
+    }
+
+    fn forward_k3_impl(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+        include_shared: bool,
+        reduce_ep: bool,
+        routes: Option<PrecomputedRoutes>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !ctx.config.expert_tp,
+            "expert TP runs K=3 on the grouped path"
+        );
+        self.btile_input_guard(input, 3, ctx, stream)?;
+        if !include_shared {
+            anyhow::ensure!(
+                self.lora.is_none()
+                    && self.bf16_gate_weight_ptrs.is_none()
+                    && self.fp8_gate_weight_ptrs.is_none()
+                    && !self.has_mixed_bf16_shared_expert()
+                    && matches!(
+                        self.experts_scale_kind,
+                        crate::weight_map::WeightQuantFormat::Nvfp4
+                    )
+                    && self.use_btile_or_t_decode(),
+                "routed-only K3 requires unified-layout NVFP4 experts"
+            );
+        }
+        // This variant does not support LongCat zero-expert routing.
         anyhow::ensure!(
             self.router_logits_n as usize == ctx.config.num_experts,
             "zero-expert MoE routing is not wired on this dispatch variant yet (forward_k3)"
         );
-
-        // Feature-1: a resident MoE adapter forces the per-row batched fallback
-        // (folds gate/up/down route-agnostically; base rows no-op; same
-        // moe_output[3,H]), skipping any no-fold fast path. Install-time gate →
-        // graph-safe (graphs drain on rotate/swap). Router adapter refused inside.
+        // Resident adapters require the route-aware batched fallback.
         if self.lora.is_some() {
             return self.forward_batched(input, 3, ctx, stream);
         }
-        // BF16 (FP8-dequant-on-load) experts have no fused batch3 kernel.
-        // The FP8 batch3 branch below would read expert weights that were
-        // FREED at dequant-load → garbage MTP-verify logits → degenerate
-        // repetition. Route the 3-token verify through the per-token BF16
+        // BF16-dequant experts have no batch3 kernel; FP8 originals are freed.
+        // Route the 3-token verify through the per-token BF16
         // batched path, which produces the same moe_output()[3,H]. (SSOT:
         // reuses the decode BF16 kernels via forward_batched.)
         if self.bf16_gate_weight_ptrs.is_some() {
@@ -44,7 +71,7 @@ impl MoeLayer {
         // pass afterwards. See forward_k2 for the rationale.
         let mixed_bf16_shared = self.has_mixed_bf16_shared_expert();
         if mixed_bf16_shared
-            && !(self.use_t_layout_for_decode()
+            && !(self.use_btile_or_t_decode()
                 && self.moe_expert_gate_up_shared_batch3_t_k.0 != 0
                 && self.moe_expert_silu_down_shared_batch3_t_k.0 != 0
                 && !(ctx.comm.is_some() && ctx.config.ep_world_size > 1))
@@ -71,71 +98,11 @@ impl MoeLayer {
         let num_experts = ctx.config.num_experts as u32;
         let top_k = ctx.config.num_experts_per_tok as u32;
 
-        // Gemma-4 router pre-norm (no-op for other models).
-        let router_in = self.router_input(input, 3, h, ctx, stream)?;
-        // 1. Gate GEMV batch3: reads gate weight once for 3 tokens
-        let gate_logits = ctx.buffers.gate_logits();
-        if let Some(ref nvfp4) = self.gate_nvfp4 {
-            ops::w4a16_gemv_batch3(
-                ctx.gpu,
-                self.w4a16_gemv_batch3,
-                router_in,
-                nvfp4,
-                gate_logits,
-                num_experts,
-                h,
-                stream,
-            )?;
+        let (indices_dev, weights_dev) = if let Some(routes) = routes {
+            (routes.indices, routes.weights)
         } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm,
-                router_in,
-                &self.weights.gate,
-                gate_logits,
-                3,
-                num_experts,
-                h,
-                stream,
-            )?;
-        }
-
-        // 2. Batched topK for 3 tokens. Sigmoid+bias for MiniMax/DeepSeek-V3,
-        //    softmax otherwise.
-        let scratch = ctx.buffers.scratch();
-        let indices_dev = scratch;
-        let weights_dev = scratch.offset(3 * top_k as usize * 4);
-        if let Some(bias) = self.correction_bias_dev {
-            ops::moe_topk_sigmoid_batched(
-                ctx.gpu,
-                self.moe_topk_sigmoid_batched_k,
-                gate_logits,
-                bias,
-                indices_dev,
-                weights_dev,
-                num_experts,
-                top_k,
-                ctx.config.norm_topk_prob,
-                ctx.config.routed_scaling_factor as f32,
-                3,
-                stream,
-            )?;
-        } else {
-            ops::moe_topk_softmax_batched(
-                ctx.gpu,
-                self.moe_topk_batched,
-                gate_logits,
-                indices_dev,
-                weights_dev,
-                num_experts,
-                top_k,
-                ctx.config.norm_topk_prob,
-                3,
-                stream,
-            )?;
-        }
-
-        super::union_stats::maybe_sample_expert_union(ctx, indices_dev, 3, top_k as usize, stream);
+            self.forward_k3_route(input, h, num_experts, top_k, ctx, stream)?
+        };
 
         // 3-5. Fused expert dispatch for 3 tokens
         let expert_gate_out = ctx.buffers.expert_gate_out();
@@ -215,15 +182,10 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
-        } else if self.use_t_layout_for_decode() {
+        } else if self.use_btile_or_t_decode() {
             // Phase 8a unified-layout NVFP4 batch=3 verify (MTP K=3). Hybrid
             // mode skips this branch — small-N MTP verify wins on warp-
             // reduction originals.
-            let gate_t = self
-                .gate_ptrs_t
-                .as_ref()
-                .expect("gate_ptrs_t under unified_t");
-            let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
             let down_t = self
                 .down_ptrs_t
                 .as_ref()
@@ -232,7 +194,7 @@ impl MoeLayer {
             // Mixed config: in-kernel shared expert off (NULL), computed in
             // BF16 below instead — the NVFP4 shared_*_t tables are load-time
             // placeholders and numerically wrong for this checkpoint.
-            let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared {
+            let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared || !include_shared {
                 (&null_qw, &null_qw, &null_qw)
             } else {
                 (
@@ -241,47 +203,103 @@ impl MoeLayer {
                     self.shared_down_t.as_ref().unwrap_or(&null_qw),
                 )
             };
-            ops::moe_expert_gate_up_shared_batch3_t(
-                ctx.gpu,
-                self.moe_expert_gate_up_shared_batch3_t_k,
-                input,
-                gate_t.packed_ptrs,
-                gate_t.scale_ptrs,
-                gate_t.scale2_vals,
-                expert_gate_out,
-                up_t.packed_ptrs,
-                up_t.scale_ptrs,
-                up_t.scale2_vals,
-                expert_up_out,
-                indices_dev,
-                sh_gate_t,
-                shared_gate_scratch,
-                sh_up_t,
-                shared_up_scratch,
-                inter,
-                h,
-                top_k,
-                stream,
-            )?;
-            ops::moe_expert_silu_down_shared_batch3_t(
-                ctx.gpu,
-                self.moe_expert_silu_down_shared_batch3_t_k,
-                expert_gate_out,
-                expert_up_out,
-                down_t.packed_ptrs,
-                down_t.scale_ptrs,
-                down_t.scale2_vals,
-                expert_down_out,
-                indices_dev,
-                shared_gate_scratch,
-                shared_up_scratch,
-                sh_down_t,
-                shared_down_out,
-                h,
-                inter,
-                top_k,
-                stream,
-            )?;
+            if self.btile_storage.is_published() {
+                self.dispatch_btile_decode(
+                    ctx,
+                    input,
+                    expert_gate_out,
+                    expert_up_out,
+                    indices_dev,
+                    include_shared.then_some((shared_gate_scratch, shared_up_scratch)),
+                    3,
+                    stream,
+                )?;
+            } else if self.qwen4exp_fast_t() {
+                self.qwen4exp_fast_gate_up(
+                    ctx,
+                    input,
+                    expert_gate_out,
+                    expert_up_out,
+                    indices_dev,
+                    sh_gate_t,
+                    shared_gate_scratch,
+                    sh_up_t,
+                    shared_up_scratch,
+                    3,
+                    stream,
+                )?;
+            } else {
+                let gate_t = self
+                    .gate_ptrs_t
+                    .as_ref()
+                    .expect("gate_ptrs_t under unified_t");
+                let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
+                ops::moe_expert_gate_up_shared_batch3_t(
+                    ctx.gpu,
+                    self.moe_expert_gate_up_shared_batch3_t_k,
+                    input,
+                    gate_t.packed_ptrs,
+                    gate_t.scale_ptrs,
+                    gate_t.scale2_vals,
+                    expert_gate_out,
+                    up_t.packed_ptrs,
+                    up_t.scale_ptrs,
+                    up_t.scale2_vals,
+                    expert_up_out,
+                    indices_dev,
+                    sh_gate_t,
+                    shared_gate_scratch,
+                    sh_up_t,
+                    shared_up_scratch,
+                    inter,
+                    h,
+                    top_k,
+                    stream,
+                )?;
+            }
+            // In routed-only mode preserve the precomputed five-row shared
+            // output in attn_output. Rows 3/4 of moe_output are outside this
+            // K3 result and provide scratch for the disabled shared branch.
+            let kernel_shared_down_out = if include_shared {
+                shared_down_out
+            } else {
+                output.offset(3 * h as usize * 2)
+            };
+            if self.qwen4exp_fast_t() {
+                self.qwen4exp_fast_silu_down(
+                    ctx,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_down_out,
+                    indices_dev,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    sh_down_t,
+                    kernel_shared_down_out,
+                    3,
+                    stream,
+                )?;
+            } else {
+                ops::moe_expert_silu_down_shared_batch3_t(
+                    ctx.gpu,
+                    self.moe_expert_silu_down_shared_batch3_t_k,
+                    expert_gate_out,
+                    expert_up_out,
+                    down_t.packed_ptrs,
+                    down_t.scale_ptrs,
+                    down_t.scale2_vals,
+                    expert_down_out,
+                    indices_dev,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    sh_down_t,
+                    kernel_shared_down_out,
+                    h,
+                    inter,
+                    top_k,
+                    stream,
+                )?;
+            }
             if mixed_bf16_shared {
                 let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
                 self.run_bf16_shared_expert(
@@ -298,7 +316,9 @@ impl MoeLayer {
             }
             // The _t branch previously returned without writing moe_output at
             // all — every sibling branch ends in this blend.
-            let shared_for_blend = if is_ep && !shared_down_out.is_null() {
+            let shared_for_blend = if !include_shared {
+                kernel_shared_down_out
+            } else if is_ep && !shared_down_out.is_null() {
                 ctx.gpu
                     .memset_async(expert_gate_out, 0, 3 * h as usize * 2, stream)?;
                 expert_gate_out
@@ -387,7 +407,8 @@ impl MoeLayer {
         }
 
         // EP all-reduce: sum partial outputs for 3 tokens
-        if let Some(comm) = ctx.comm
+        if reduce_ep
+            && let Some(comm) = ctx.comm
             && ctx.config.ep_world_size > 1
         {
             if ctx.graph_capture {
@@ -396,7 +417,7 @@ impl MoeLayer {
                 comm.all_reduce_async(output.0, 3 * h as usize * 2, stream)?;
             }
             // Add shared expert with sigmoid gate (BUG #41 fix)
-            if !shared_down_out.is_null() {
+            if include_shared && !shared_down_out.is_null() {
                 if self.weights.shared_expert_gate.weight.0 == 0 {
                     ops::residual_add(
                         ctx.gpu,

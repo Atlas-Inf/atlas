@@ -14,31 +14,17 @@
 
 use std::collections::HashMap;
 
+use spark_runtime::gpu::DevicePtr;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::gpu::mock::MockGpuBackend;
-use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::lifecycle::*;
-use super::{
-    BlockDiffusionDraftHead, CTX_ACC_POOL, DflashKernels, DflashProposerState, DflashScratch,
-};
+use super::{BlockDiffusionDraftHead, DflashKernels, DflashProposerState, DflashScratch};
 use crate::speculative::DraftProposer;
 use crate::weight_map::DenseWeight;
 
-/// Serializes tests that exercise the global `CTX_ACC_POOL` (free_state
-/// success paths and carry-reject recycling push into it). Rust runs tests
-/// in parallel; without this a concurrent push could overflow the pool cap
-/// mid-assertion and flip a pooled buffer into a backend free.
-pub(super) static POOL_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-pub(super) fn lock_and_drain_pool() -> parking_lot::MutexGuard<'static, ()> {
-    let guard = POOL_TEST_LOCK.lock();
-    CTX_ACC_POOL.lock().clear();
-    guard
-}
-
-pub(super) fn owner(slot: usize, generation: u64) -> SequenceGeneration {
+fn owner(slot: usize, generation: u64) -> SequenceGeneration {
     SequenceGeneration::new(slot, generation).unwrap()
 }
 
@@ -66,13 +52,11 @@ pub(super) fn zero_scratch() -> DflashScratch {
         draft_tokens_dev: DevicePtr(0),
         markov_prev_dev: DevicePtr(0),
         markov_prev_host_pinned: Default::default(),
-        ctx_positions_host_pinned: Default::default(),
-        ctx_positions_pinned_bytes: 0,
-        ctx_positions_cursor: Default::default(),
         position_ids: DevicePtr(0),
         dflash2_conv_delta: DevicePtr(0),
         dflash2_conv_out: DevicePtr(0),
         dflash2_projected_hidden: DevicePtr(0),
+        dflash2_selector_scratch: DevicePtr(0),
     }
 }
 
@@ -137,18 +121,12 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         batch_mlp_down: DevicePtr(0),
         batch_logits: DevicePtr(0),
         batch_grammar_bitmask: DevicePtr(0),
-        batch_grammar_masks_host_pinned: Default::default(),
-        batch_grammar_masks_pinned_bytes: 0,
-        batch_ctx_in: DevicePtr(0),
-        batch_ctx_fc: DevicePtr(0),
-        batch_ctx_fused: DevicePtr(0),
-        batch_ctx_rows: 0,
-        drafter_cublas: false,
         batch_tokens: DevicePtr(0),
         batch_markov_prev: DevicePtr(0),
         batch_markov_embed: DevicePtr(0),
         batch_markov_bias: DevicePtr(0),
         batch_dflash2_projected: DevicePtr(0),
+        batch_dflash2_selector_scratch: DevicePtr(0),
         batch_conv_delta: DevicePtr(0),
         batch_conv_out: DevicePtr(0),
         extra_lanes: Vec::new(),
@@ -167,18 +145,22 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         suppress_graphs: std::sync::atomic::AtomicBool::new(false),
         propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
         quant: super::DflashQuantization::Bf16,
+        twins: Default::default(),
         startup: super::DsparkStartupExecution::from_env_lenient(),
-        ctx_carry: parking_lot::Mutex::new(None),
+        rank_split: None,
     }
 }
 
-pub(super) fn zero_kernels() -> DflashKernels {
+fn zero_kernels() -> DflashKernels {
     let zero = spark_runtime::gpu::KernelHandle(0);
     DflashKernels {
         rms_norm: zero,
         residual_rms_norm: zero,
         dense_gemv: zero,
         dense_gemv_batchm: zero,
+        dense_gemv_tc16: zero,
+        dense_gemv_tc32: zero,
+        small_m_gemv: false,
         dense_gemm: zero,
         w4a16_gemm: zero,
         dense_gemm_pipelined: zero,
@@ -208,13 +190,14 @@ pub(super) fn zero_kernels() -> DflashKernels {
         w4a16_gemv_batch8: zero,
         w4a16_gemv_batch16: zero,
         w4a16_gemv_batch32: zero,
+        mxfp8_quantize: zero,
+        mxfp8_gemv: [zero; 3],
         dflash2_conv: None,
-        dflash2_candidate_selector_batched: KernelHandle(0),
         dflash2_candidate_selector: None,
     }
 }
 
-pub(super) fn zero_kv_cache() -> PagedKvCache {
+fn zero_kv_cache() -> PagedKvCache {
     let gpu = MockGpuBackend::new();
     PagedKvCache::new(
         KvCacheConfig {
@@ -236,85 +219,36 @@ pub(super) fn zero_kv_cache() -> PagedKvCache {
 /// A live per-sequence state mirroring `owner_failure_reclaim_frees_state_
 /// resources_without_leaking`'s setup but driven through the REAL trait
 /// method (`<BlockDiffusionDraftHead as DraftProposer>::free_state`).
-pub(super) fn live_state(
-    gpu: &MockGpuBackend,
-    own: SequenceGeneration,
-) -> Box<DflashProposerState> {
+fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashProposerState> {
     Box::new(DflashProposerState {
         block_table: Vec::new(),
-        seq_len: 300,
+        seq_len: 12,
         last_num_drafted: 3,
+        last_draft_conf: Vec::new(),
         prefill_done: true,
         ctx_hidden_acc: gpu.alloc(4096).unwrap(),
-        ctx_len: 300,
+        ctx_len: 12,
         last_num_accepted: 1,
         skip_next_decode_append: false,
         max_ctx_len: 1024,
-        ctx_acc_rows: 4096,
-        ctx_prefill_origin: None,
-        ctx_prefill_base: 0,
         ctx_slot_bytes: 64,
         block_table_dev: Some(gpu.alloc(256).unwrap()),
-        ctx_count_drafter: 300,
+        ctx_count_drafter: 12,
         max_ctx_count_drafter: 1024,
-        ctx_committed: 300,
-        ctx_positions: (0..300).collect(),
+        ctx_committed: 12,
+        ctx_positions: vec![1, 2, 3],
+        end_floor: 0,
+        first_append_at: None,
+        own_capture: false,
+        own_row_at: None,
+        own_row: None,
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
     })
 }
 
-/// A state as `alloc_state` returns it: accumulator allocated, every ctx
-/// watermark at zero, no paged blocks. This is the shape `adopt_dflash_ctx`
-/// sees in production (the call site guards on `ctx_len == 0`).
-pub(super) fn fresh_state(gpu: &MockGpuBackend) -> Box<DflashProposerState> {
-    fresh_state_with_owner(gpu, None)
-}
-
-/// Fresh state with a lifecycle bound, as `alloc_seq` leaves it before the
-/// first ctx seed — `adopt_dflash_ctx` reads the owner off this to re-key
-/// carried graphs.
-pub(super) fn fresh_state_with_owner(
-    gpu: &MockGpuBackend,
-    own: Option<SequenceGeneration>,
-) -> Box<DflashProposerState> {
-    let mut s = fresh_state_inner(gpu);
-    if let Some(own) = own {
-        s.lifecycle = Some(CaptureDescriptor::bind(own, 0, 0, 4, 16).unwrap());
-    }
-    s
-}
-
-pub(super) fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState> {
-    Box::new(DflashProposerState {
-        block_table: Vec::new(),
-        seq_len: 0,
-        last_num_drafted: 0,
-        prefill_done: false,
-        ctx_hidden_acc: gpu.alloc(4096).unwrap(),
-        ctx_len: 0,
-        last_num_accepted: 0,
-        skip_next_decode_append: false,
-        max_ctx_len: 1024,
-        ctx_acc_rows: 4096,
-        ctx_prefill_origin: None,
-        ctx_prefill_base: 0,
-        ctx_slot_bytes: 64,
-        block_table_dev: None,
-        ctx_count_drafter: 0,
-        max_ctx_count_drafter: 0,
-        ctx_committed: 0,
-        ctx_positions: Vec::new(),
-        lane_id: 0,
-        lifecycle: None,
-    })
-}
-
 /// Grab two real KV pool blocks into the state's block table.
-pub(super) fn hold_two_blocks(
-    state: &mut DflashProposerState,
-    kv: &parking_lot::Mutex<PagedKvCache>,
-) {
+fn hold_two_blocks(state: &mut DflashProposerState, kv: &parking_lot::Mutex<PagedKvCache>) {
     for _ in 0..2 {
         let block = kv.lock().try_alloc_block().expect("block available");
         state.block_table.push(block);
@@ -323,7 +257,6 @@ pub(super) fn hold_two_blocks(
 
 #[test]
 fn real_free_state_success_path_reclaims_all_resources() {
-    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -349,15 +282,12 @@ fn real_free_state_success_path_reclaims_all_resources() {
         boxed.lifecycle.as_ref().unwrap().status(),
         CaptureStatus::Retired
     );
-    // Block table dev freed to the backend; the accumulator moved to the
-    // reuse pool (still a live allocation).
-    assert_eq!(gpu.alloc_count(), allocs_before - 1);
-    assert_eq!(CTX_ACC_POOL.lock().len(), 1);
+    // Both mock allocations (accumulator + block table) removed.
+    assert_eq!(gpu.alloc_count(), allocs_before - 2);
 }
 
 #[test]
 fn real_free_state_second_call_is_idempotent_success() {
-    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -375,7 +305,6 @@ fn real_free_state_second_call_is_idempotent_success() {
 
 #[test]
 fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
-    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -417,7 +346,6 @@ fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
 
 #[test]
 fn real_free_state_different_live_owner_is_rejected_and_reclaimed() {
-    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -444,7 +372,6 @@ fn real_free_state_different_live_owner_is_rejected_and_reclaimed() {
 
 #[test]
 fn real_free_state_missing_owner_is_rejected_and_reclaimed() {
-    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -470,7 +397,6 @@ fn real_free_state_missing_owner_is_rejected_and_reclaimed() {
 
 #[test]
 fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
-    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -478,20 +404,87 @@ fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
     let mut boxed = live_state(&gpu, own);
     hold_two_blocks(boxed.as_mut(), &head.kv_cache);
 
-    // The accumulator goes to the reuse pool (no backend free); the
-    // injected failure lands on the block-table-dev free — its handle must
-    // be RESTORED so a retry can release it.
+    // Inject failure on the FIRST free call (the ctx accumulator in the
+    // success path). The pointer must be RETAINED so a retry can release it.
     gpu.fail_next_free();
     head.free_state(&gpu, Some(own), boxed.as_mut())
         .expect("free_state succeeds despite the backend free failure");
 
+    // Accumulator pointer retained (observable, retryable)…
+    assert_ne!(boxed.ctx_hidden_acc.0, 0);
+    // …and the retry DOES release it (flag is one-shot).
+    head.free_state(&gpu, Some(own), boxed.as_mut())
+        .expect("second free retries the accumulator free");
     assert_eq!(boxed.ctx_hidden_acc.0, 0);
+    assert_eq!(gpu.alloc_count(), 0);
+}
+
+#[test]
+fn real_free_state_block_table_free_failure_restores_handle_for_retry() {
+    let gpu = MockGpuBackend::new();
+    let head = zero_head();
+    let own = owner(3, 77);
+
+    let mut boxed = live_state(&gpu, own);
+
+    // Fail BOTH success-path frees: the ctx accumulator first, then the
+    // device block table. Each failed free must retain/restore its handle.
+    gpu.fail_next_free();
+    gpu.fail_next_free();
+    head.free_state(&gpu, Some(own), boxed.as_mut())
+        .expect("free_state succeeds despite the backend free failures");
     assert!(
         boxed.block_table_dev.is_some(),
         "handle restored, retryable"
     );
-    // …and the retry DOES release it (flag is one-shot).
+    assert_ne!(boxed.ctx_hidden_acc.0, 0);
+
+    // Retry with no further injections releases both.
     head.free_state(&gpu, Some(own), boxed.as_mut())
-        .expect("second free retries the block table free");
+        .expect("second free retries both failed frees");
+    assert_eq!(boxed.ctx_hidden_acc.0, 0);
     assert!(boxed.block_table_dev.is_none());
+    assert_eq!(gpu.alloc_count(), 0);
+}
+
+#[test]
+fn reclaim_seam_free_failure_retains_pointers() {
+    let gpu = MockGpuBackend::new();
+    let own = owner(3, 77);
+    let mut dstate = live_state(&gpu, own);
+    let kv_cache = parking_lot::Mutex::new(
+        PagedKvCache::new(
+            KvCacheConfig {
+                block_size: 16,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 8,
+                dtype: KvCacheDtype::Bf16,
+                layer_dtypes: vec![],
+                layer_dims: vec![],
+                cache_blocks_per_seq: None,
+            },
+            8,
+            &gpu,
+        )
+        .unwrap(),
+    );
+    for _ in 0..2 {
+        let block = kv_cache.lock().try_alloc_block().expect("block available");
+        dstate.block_table.push(block);
+    }
+
+    gpu.fail_next_free();
+    gpu.fail_next_free();
+    dstate.reclaim_on_owner_failure(&gpu, &kv_cache);
+
+    // Both failed frees keep their handles (retryable)…
+    assert_ne!(dstate.ctx_hidden_acc.0, 0);
+    assert!(dstate.block_table_dev.is_some());
+    // …blocks are still returned, and a plain second reclaim retries both
+    // frees (injections are one-shot).
+    assert!(dstate.block_table.is_empty());
+    dstate.reclaim_on_owner_failure(&gpu, &kv_cache);
+    assert_eq!(dstate.ctx_hidden_acc.0, 0);
+    assert!(dstate.block_table_dev.is_none());
 }

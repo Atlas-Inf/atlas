@@ -186,7 +186,8 @@ impl StreamingToolDetector {
                 // emission. The name header is emitted immediately so clients get instant
                 // feedback that a tool call started.
                 if self.current_tc_name.is_none()
-                    && let Some(name) = extract_streaming_name(&self.buffer)
+                    && let Some(name) =
+                        extract_streaming_name(&self.buffer, self.promote_bare_names)
                 {
                     let id = next_tool_call_id();
                     let idx = self.call_counter as usize;

@@ -15,6 +15,7 @@
 //   group_dim = 2*128 + 2*2*128 = 768
 //   total QKVZ = 16*768 = 12288
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <math.h>
 
@@ -394,6 +395,7 @@ extern "C" __global__ void dense_gemv_ba_gates(
     unsigned int K,                              // 2048
     unsigned int vheads_per_group                // 2
 ) {
+    atlas_pdl_enter();
     const unsigned int threads_per_out = 256 / 4;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;

@@ -38,6 +38,10 @@ pub(crate) struct ParsedBehavior {
     /// the model did not choose to end leaves it in a state it cannot continue
     /// from, and the post-close content degenerates into token spam.
     pub enable_think_loop_watchdog: bool,
+    /// Arm the chat stream's SimHash sentence-repeat and token-loop guards
+    /// (default true). They end legitimately repetitive output — counting,
+    /// code with similar lines — so a model can opt out.
+    pub enable_stream_loop_guards: bool,
     /// Honor an EOS the model samples INSIDE a `<think>` block by implicitly
     /// closing the block, instead of discarding the token and forcing the
     /// model to keep reasoning.
@@ -106,6 +110,7 @@ impl Default for ParsedBehavior {
             jinja_template: String::new(),
             enable_loop_watchdog: false,
             enable_think_loop_watchdog: true,
+            enable_stream_loop_guards: true,
             honor_eos_inside_thinking: false,
             cap_thinking_at_max_tokens: true,
             min_p_floor: 0.0,
@@ -209,6 +214,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .unwrap_or(false);
     let enable_think_loop_watchdog = b
         .and_then(|v| v.get("enable_think_loop_watchdog"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let enable_stream_loop_guards = b
+        .and_then(|v| v.get("enable_stream_loop_guards"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     // Default FALSE: pre-p350 behaviour (discard a mid-think EOS, let the
@@ -316,6 +325,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         jinja_template,
         enable_loop_watchdog,
         enable_think_loop_watchdog,
+        enable_stream_loop_guards,
         honor_eos_inside_thinking,
         cap_thinking_at_max_tokens,
         min_p_floor,

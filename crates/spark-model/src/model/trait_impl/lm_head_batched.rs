@@ -72,7 +72,7 @@ impl TransformerModel {
     /// `v` is read from `self.config.vocab_size` rather than passed: it is the
     /// same number at both call sites and a parameter would be a second place
     /// for it to be wrong.
-    pub(super) fn lm_head_project_batched(
+    pub(in crate::model) fn lm_head_project_batched(
         &self,
         normed: DevicePtr,
         padded_n: usize,

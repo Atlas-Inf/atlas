@@ -153,9 +153,12 @@ fn qsa_matches_reference() {
     g.synchronize(stream).unwrap();
 
     let want_raw = f32s("raw_keys");
+    // The raw-key window (`qsa_window.rs`) has not slid at this length: it
+    // still holds every position from 0.
+    assert_eq!(qst.raw.base(), 0);
     compare(
         "raw_keys",
-        &dl_bf16(g, qst.raw_keys, t_pre * hd),
+        &dl_bf16(g, qsa.raw_slot(&qst, 0), t_pre * hd),
         &want_raw[..t_pre * hd],
         0.05,
     );

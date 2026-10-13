@@ -6,9 +6,9 @@
 
 use super::*;
 
-/// Widest `complete` the device kernel handles (its shared-memory flag array);
-/// wider selections take the host arm.
-pub(super) const QSA_SELECT_MAX_BLOCKS: usize = 4096;
+/// Widest `complete` the device kernel handles (`QSA_SELECT_RADIX_MAX` in
+/// qsa_indexer.cu, 65,536 tokens at ratio 4); wider selections take the host arm.
+pub(super) const QSA_SELECT_MAX_BLOCKS: usize = 16384;
 
 /// Shape of the decode selection for one query, from the position alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

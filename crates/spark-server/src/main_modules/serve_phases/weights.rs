@@ -20,6 +20,13 @@ pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
     // Strix pool. 1.2 keeps ~4.5% margin over the measured ratio.
     if config.model_type == "qwen4_exp" {
         Some(1.2)
+    } else if config.model_type == "glm5_next" {
+        // The EP loader has already removed the remote half of the routed
+        // experts. ModelOpt tensors are kept packed/zero-copy and the GLM
+        // loader deliberately omits transposed MoE copies, so the generic
+        // 1.30x NVFP4 estimate is not representative. Keep 5% for CUDA
+        // metadata and the few BF16 dense/shared weights quantized at load.
+        Some(1.05)
     } else if config.model_type == "minimax_m2" || config.model_type == "step3p7" {
         Some(1.02)
     } else if config
@@ -44,6 +51,27 @@ pub(crate) fn load_weight_store(
 ) -> Result<spark_runtime::weights::WeightStore> {
     use spark_runtime::weights::WeightLoader;
     let mult = quant_multiplier(config);
+    let glm_mtp_distributed = spark_model::speculative::glm_repair_policy::mtp_distributed();
+    let unused_mtp_prefix = unused_glm_mtp_prefix(config, args.speculative);
+    if glm_mtp_distributed {
+        anyhow::ensure!(
+            config.model_type == "glm5_next"
+                && args.speculative
+                && args.world_size == 2
+                && args.tp_size == 2
+                && args.ep_size == 2,
+            "ATLAS_GLM_MTP_DISTRIBUTED=1 requires speculative GLM with overlapping \
+             TP=EP=world=2 (model={}, speculative={}, TP={}, EP={}, world={})",
+            config.model_type,
+            args.speculative,
+            args.tp_size,
+            args.ep_size,
+            args.world_size,
+        );
+        tracing::info!(
+            "GLM-5 split-vocabulary MTP enabled: appended body is mirrored on both ranks"
+        );
+    }
 
     // GGUF checkpoints are dequantized to BF16 by a dedicated loader; take that
     // path whenever a .gguf file is present (fast/safetensors loaders can't read it).
@@ -93,7 +121,22 @@ pub(crate) fn load_weight_store(
             } else {
                 spark_runtime::fast_weights::FastSafetensorsLoader::new()
             };
+            if config.model_type == "glm5_next" && args.speculative {
+                let prefix = format!(".layers.{}.", config.num_hidden_layers);
+                if glm_mtp_distributed {
+                    loader.replicated_expert_prefix = Some(prefix);
+                    tracing::info!(
+                        "GLM-5 distributed MTP: appended-layer experts are replicated on both ranks"
+                    );
+                } else {
+                    loader.rank0_only_expert_prefix = Some(prefix);
+                    tracing::info!(
+                        "GLM-5 MTP: appended-layer experts are rank-0-only and fully replicated"
+                    );
+                }
+            }
             loader.peak_memory_multiplier = mult;
+            loader.expert_tp = config.expert_tp;
             loader.demand_paged_patterns = demand_paged_patterns(config);
             if !loader.demand_paged_patterns.is_empty() {
                 tracing::info!(
@@ -103,6 +146,7 @@ pub(crate) fn load_weight_store(
             }
             loader.skip_activation_scales = skip_activation_scales(config);
             loader.skip_mtp = skip_mtp(config, args);
+            loader.skip_layer_prefix = unused_mtp_prefix.clone();
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
@@ -119,14 +163,27 @@ pub(crate) fn load_weight_store(
             anyhow::bail!("--fast-load requires a Unix host (needs O_DIRECT / posix_fadvise)");
         }
     } else {
+        anyhow::ensure!(
+            !config.expert_tp,
+            "ATLAS_GLM_EXPERT_TP=1 needs the fast weight loader (ATLAS_FAST_LOAD)"
+        );
         let mut loader = if ep_size > 1 {
             spark_runtime::weights::SafetensorsLoader::with_ep(ep_rank, ep_size, config.num_experts)
         } else {
             spark_runtime::weights::SafetensorsLoader::new()
         };
+        if config.model_type == "glm5_next" && args.speculative {
+            let prefix = format!(".layers.{}.", config.num_hidden_layers);
+            if glm_mtp_distributed {
+                loader.replicated_expert_prefix = Some(prefix);
+            } else {
+                loader.rank0_only_expert_prefix = Some(prefix);
+            }
+        }
         loader.peak_memory_multiplier = mult;
         loader.skip_activation_scales = skip_activation_scales(config);
         loader.skip_mtp = skip_mtp(config, args);
+        loader.skip_layer_prefix = unused_mtp_prefix;
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?
@@ -170,11 +227,35 @@ pub(crate) fn load_dflash_drafter(
         })?;
     let drafter_config =
         spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
+    // Only the head proposes. A worker keeps the drafter's config (its target
+    // capture layers shape the verify rows and SSM pools) but no weights, so
+    // no proposer is built there and its memory goes to the KV pool. Under
+    // ATLAS_GLM_DRAFT_TP the worker reads half of each propose, from the
+    // same weights.
+    let worker_shares = spark_model::layers::dflash_head::rank_split::requested()?.is_some();
+    if args.rank != 0 && !worker_shares {
+        tracing::info!(
+            "DFlash: rank {} keeps the drafter config only; the head proposes",
+            args.rank
+        );
+        return Ok(Some((
+            spark_runtime::weights::WeightStore::empty(),
+            drafter_config,
+        )));
+    }
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
-    let drafter_store = loader
+    let mut drafter_store = loader
         .load(&drafter_dir, gpu, 0)
         .context("Failed to load DFlash drafter weights")?;
+    // Before the KV pool is sized, so the freed BF16 bytes become KV blocks.
+    if spark_model::weight_loader::dflash_preshrink::requested() {
+        spark_model::weight_loader::dflash_preshrink::preshrink(
+            &mut drafter_store,
+            drafter_config.num_hidden_layers,
+            gpu,
+        )?;
+    }
     tracing::info!(
         "DFlash drafter store: {} tensors, {} bytes",
         drafter_store.len(),
@@ -289,14 +370,32 @@ fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
     // qwen4_exp now BUILDS an MTP head, but only under `--speculative`
     // (`weight_loader/qwen4_exp/mtp.rs`). Without the flag the `mtp.*` upload is
     // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
-    // comes straight out of the KV cache. With the flag it is the drafter.
-    matches!(config.model_type.as_str(), "qwen4_exp") && !args.speculative
+    // comes straight out of the KV cache. With the flag it is the drafter, on
+    // rank 0 only (`factory::build`): every other rank skips it as well.
+    matches!(config.model_type.as_str(), "qwen4_exp") && (!args.speculative || config.ep_rank != 0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::quant_multiplier;
+    use super::{quant_multiplier, skip_mtp};
     use atlas_core::config::ModelConfig;
+    use clap::Parser as _;
+
+    /// qwen4_exp's `mtp.*` (5.21 GB) is uploaded only where it drafts: rank 0
+    /// under `--speculative`.
+    #[test]
+    fn qwen4_exp_mtp_is_uploaded_on_the_drafting_rank_only() {
+        let args = |more: &[&str]| {
+            let argv = ["spark", "some/model"].iter().chain(more);
+            crate::cli::ServeArgs::parse_from(argv)
+        };
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen4_exp".to_string();
+        assert!(skip_mtp(&config, &args(&[])));
+        assert!(!skip_mtp(&config, &args(&["--speculative"])));
+        config.ep_rank = 1;
+        assert!(skip_mtp(&config, &args(&["--speculative"])));
+    }
 
     #[test]
     fn qwen4_exp_uses_measured_load_peak() {
@@ -310,5 +409,41 @@ mod tests {
         let mut config = ModelConfig::qwen3_next_80b_nvfp4();
         config.model_type = "qwen3_5".to_string();
         assert_eq!(quant_multiplier(&config), None);
+    }
+}
+
+// GLM's predictor is a physical appended layer, not the generic `mtp.*` tree.
+// Without speculative decoding the factory never consumes any of its tensors.
+fn unused_glm_mtp_prefix(config: &ModelConfig, speculative: bool) -> Option<String> {
+    (config.model_type == "glm5_next" && !speculative).then(|| {
+        format!(
+            "{}.layers.{}.",
+            config.weight_prefix, config.num_hidden_layers
+        )
+    })
+}
+
+#[cfg(test)]
+mod unused_glm_mtp_tests {
+    use super::*;
+
+    #[test]
+    fn unused_glm_mtp_policy_uses_actual_prefix_and_target_layer_count() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        assert!(unused_glm_mtp_prefix(&config, false).is_none());
+        config.model_type = "glm5_next".into();
+        config.weight_prefix = "model.language_model".into();
+        config.num_hidden_layers = 45;
+        assert_eq!(
+            unused_glm_mtp_prefix(&config, false).as_deref(),
+            Some("model.language_model.layers.45.")
+        );
+        assert!(unused_glm_mtp_prefix(&config, true).is_none());
+        config.weight_prefix = "fixture".into();
+        config.num_hidden_layers = 3;
+        assert_eq!(
+            unused_glm_mtp_prefix(&config, false).as_deref(),
+            Some("fixture.layers.3.")
+        );
     }
 }

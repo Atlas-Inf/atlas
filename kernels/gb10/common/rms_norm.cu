@@ -12,6 +12,7 @@
 // Input/output: BF16, computation in FP32.
 // Vectorized: 2 BF16 elements per 32-bit load/store.
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 // Unpack a 32-bit word containing 2 packed BF16 values into 2 floats.
@@ -49,6 +50,7 @@ extern "C" __global__ void rms_norm(
     unsigned int hidden_size,
     float eps
 ) {
+    atlas_pdl_enter();
     unsigned int token = blockIdx.x;
     unsigned int tid = threadIdx.x;
 
@@ -1347,6 +1349,7 @@ extern "C" __global__ void gated_rms_norm_f32_input_sigmoid(
     unsigned int gate_stride,
     unsigned int group_size
 ) {
+    atlas_pdl_enter();
     (void)group_size;
     unsigned int token = blockIdx.x;
     unsigned int tid = threadIdx.x;

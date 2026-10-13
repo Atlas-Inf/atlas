@@ -36,6 +36,25 @@ pub fn argmax_bf16(
         .launch(stream)
 }
 
+/// Shard-local BF16 argmax that writes `(max_value: f32, local_index: u32)`.
+/// Its reduction and tie semantics match [`argmax_bf16`].
+pub fn argmax_bf16_value(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits: DevicePtr,
+    out_value_index: DevicePtr,
+    vocab_size: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(logits)
+        .arg_ptr(out_value_index)
+        .arg_u32(vocab_size)
+        .launch(stream)
+}
+
 /// Batched argmax: ONE launch, one block per row, instead of n serial launches of
 /// the single-row `argmax_bf16` (which is a one-CTA reduction and so uses 1 of 48
 /// SMs). Byte-identical — each block runs the identical per-row body.
@@ -210,8 +229,32 @@ pub fn apply_grammar_bitmask(
 /// them — pinned to the kernel defines by `tests/dflash2_selector_bounds.rs`.
 pub const DFLASH2_SELECTOR_MAX_TOP_K: usize = 16;
 pub const DFLASH2_SELECTOR_MAX_RANK: usize = 256;
+/// Mirrors `DF2_SEL_MAX_SPLITS` / `DF2_SEL_THREADS` in the same kernel.
+pub const DFLASH2_SELECTOR_MAX_SPLITS: usize = 16;
+pub const DFLASH2_SELECTOR_THREADS: u32 = 512;
 
-/// DFlash2 on-device bilinear candidate selector.
+/// Vocab slices per row: about two blocks per SM on GB10 over the
+/// `gamma` rows.
+fn dflash2_selector_splits(gamma: u32) -> u32 {
+    (96 / gamma.max(1)).clamp(1, DFLASH2_SELECTOR_MAX_SPLITS as u32)
+}
+
+/// Bytes of `dflash2_candidate_selector` scratch for up to `gamma` rows:
+/// a u32 ticket (padded to 16 bytes) plus f32 values and u32 ids of every
+/// slice's top-`DFLASH2_SELECTOR_MAX_TOP_K`. It must start zeroed (the kernel
+/// leaves the ticket at zero), and launches sharing it must be stream-ordered.
+pub fn dflash2_selector_scratch_bytes(gamma: usize) -> usize {
+    16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * DFLASH2_SELECTOR_MAX_TOP_K
+}
+
+/// DFlash2 on-device bilinear candidate selector over one `gamma`-row block.
+///
+/// `anchor` is a device `u32` holding the block anchor (row 1's
+/// predecessor) and `ban_depth` a device `u32` (or null): rows
+/// `1..=*ban_depth` never pick one of `end_ids` (the min_tokens floor; unused
+/// slots `u32::MAX`). Both are read on device so a captured graph replays
+/// with the values the host wrote for this step.
+#[allow(clippy::too_many_arguments)]
 pub fn dflash2_candidate_selector(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -220,27 +263,34 @@ pub fn dflash2_candidate_selector(
     pred_codebook: DevicePtr,
     succ_codebook: DevicePtr,
     out_tokens: DevicePtr,
-    last_token: u32,
+    anchor: DevicePtr,
+    ban_depth: DevicePtr,
+    end_ids: [u32; 4],
     gamma: u32,
     vocab_size: u32,
     rank: u32,
     top_k: u32,
+    scratch: DevicePtr,
     stream: u64,
 ) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([1, 1, 1])
-        .block([1024, 1, 1])
+    let mut launch = KernelLaunch::new(gpu, kernel)
+        .grid([dflash2_selector_splits(gamma), gamma, 1])
+        .block([DFLASH2_SELECTOR_THREADS, 1, 1])
         .arg_ptr(logits)
         .arg_ptr(projected_hidden)
         .arg_ptr(pred_codebook)
         .arg_ptr(succ_codebook)
         .arg_ptr(out_tokens)
-        .arg_u32(last_token)
+        .arg_ptr(anchor)
+        .arg_ptr(ban_depth)
         .arg_u32(gamma)
         .arg_u32(vocab_size)
         .arg_u32(rank)
-        .arg_u32(top_k)
-        .launch(stream)
+        .arg_u32(top_k);
+    for id in end_ids {
+        launch = launch.arg_u32(id);
+    }
+    launch.arg_ptr(scratch).launch(stream)
 }
 
 /// Batched variant of [`dflash2_candidate_selector`] — one CTA per

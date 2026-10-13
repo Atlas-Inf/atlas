@@ -2,12 +2,15 @@
 
 #include <cuda_runtime_api.h>
 
+#include "atlas_stale_cuda_error.h"
+
 #include <cublasLt.h>
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/device/gemm_batched.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/layout/matrix.h"
 
@@ -59,8 +62,7 @@ int atlas_cutlass_bf16_gemm_act_weight_t_impl(
   if (status != cutlass::Status::kSuccess) {
     return static_cast<int>(status);
   }
-  status = gemm(stream);
-  return static_cast<int>(status);
+  return atlas_launch_status(static_cast<int>(gemm(stream)));
 }
 
 extern "C" int atlas_cutlass_bf16_gemm_act_weight_t(
@@ -73,6 +75,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<128, 128, 32, 64, 64, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -87,6 +90,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_128x256(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<128, 256, 32, 64, 64, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -101,6 +105,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_256x128(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<256, 128, 32, 64, 64, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -115,6 +120,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_64x128(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<64, 128, 32, 32, 64, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -129,6 +135,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_128x64(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<128, 64, 32, 64, 32, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -143,8 +150,164 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_64x64(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<64, 64, 32, 32, 32, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
+}
+
+// Head-batched `out[t*c_stride+h*n+j] = sum_k act[t*a_stride+h*k+i]*w[h*n*k+j*k+i]`
+// (the MLA absorb / V-up shape): one strided batch per head, token rows keep
+// their interleaved stride, so no gather/scatter.
+template <int TB_M, int TB_N, int TB_K, int W_M, int W_N, int W_K, int STAGES>
+int atlas_cutlass_bf16_grouped_impl(
+    const void* act,
+    const void* weight,
+    void* out,
+    int m,
+    int g,
+    int n,
+    int k,
+    int a_stride,
+    int c_stride,
+    cudaStream_t stream) {
+  using Element = cutlass::bfloat16_t;
+  using Gemm = cutlass::gemm::device::GemmBatched<
+      Element,
+      cutlass::layout::RowMajor,
+      Element,
+      cutlass::layout::ColumnMajor,
+      Element,
+      cutlass::layout::RowMajor,
+      float,
+      cutlass::arch::OpClassTensorOp,
+      cutlass::arch::Sm80,
+      cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,
+      cutlass::gemm::GemmShape<W_M, W_N, W_K>,
+      cutlass::gemm::GemmShape<16, 8, 16>,
+      cutlass::epilogue::thread::LinearCombination<Element, 8, float, float>,
+      cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+      STAGES>;
+  Element const* a = static_cast<Element const*>(act);
+  Element const* w = static_cast<Element const*>(weight);
+  Element* d = static_cast<Element*>(out);
+  typename Gemm::Arguments args(
+      {m, n, k},
+      {a, a_stride},
+      static_cast<int64_t>(k),
+      {w, k},
+      static_cast<int64_t>(n) * k,
+      {d, c_stride},
+      static_cast<int64_t>(n),
+      {d, c_stride},
+      static_cast<int64_t>(n),
+      {1.0f, 0.0f},
+      g);
+  Gemm gemm;
+  cutlass::Status status = gemm.can_implement(args);
+  if (status != cutlass::Status::kSuccess) {
+    return static_cast<int>(status);
+  }
+  status = gemm.initialize(args, nullptr, stream);
+  if (status != cutlass::Status::kSuccess) {
+    return static_cast<int>(status);
+  }
+  return atlas_launch_status(static_cast<int>(gemm(stream)));
+}
+
+extern "C" int atlas_cutlass_bf16_grouped_gemm_act_weight_t(
+    const void* act,
+    const void* weight,
+    void* out,
+    int m,
+    int g,
+    int n,
+    int k,
+    int a_stride,
+    int c_stride,
+    cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
+  return atlas_cutlass_bf16_grouped_impl<128, 128, 32, 64, 64, 32, 3>(
+      act, weight, out, m, g, n, k, a_stride, c_stride, stream);
+}
+
+// Row-major `out[m, ldc] = act[m, lda] @ weight[n, k]^T` with an L2-aware CTA
+// raster: without it, K >= 4096 re-streams every weight strip from DRAM per
+// M-row of tiles (the whole [N, K] panel outgrows L2).
+template <int TB_M, int TB_N, int TB_K, int W_M, int W_N, int W_K, int STAGES, int SWIZZLE>
+int atlas_cutlass_bf16_tuned_impl(
+    const void* act,
+    const void* weight,
+    void* out,
+    int m,
+    int n,
+    int k,
+    int lda,
+    int ldc,
+    cudaStream_t stream) {
+  using Element = cutlass::bfloat16_t;
+  using Gemm = cutlass::gemm::device::Gemm<
+      Element,
+      cutlass::layout::RowMajor,
+      Element,
+      cutlass::layout::ColumnMajor,
+      Element,
+      cutlass::layout::RowMajor,
+      float,
+      cutlass::arch::OpClassTensorOp,
+      cutlass::arch::Sm80,
+      cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,
+      cutlass::gemm::GemmShape<W_M, W_N, W_K>,
+      cutlass::gemm::GemmShape<16, 8, 16>,
+      cutlass::epilogue::thread::LinearCombination<Element, 8, float, float>,
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<SWIZZLE>,
+      STAGES>;
+  typename Gemm::Arguments args(
+      {m, n, k},
+      {static_cast<Element const*>(act), lda},
+      {static_cast<Element const*>(weight), k},
+      {static_cast<Element const*>(out), ldc},
+      {static_cast<Element*>(out), ldc},
+      {1.0f, 0.0f});
+  Gemm gemm;
+  cutlass::Status status = gemm.can_implement(args);
+  if (status != cutlass::Status::kSuccess) {
+    return static_cast<int>(status);
+  }
+  status = gemm.initialize(args, nullptr, stream);
+  if (status != cutlass::Status::kSuccess) {
+    return static_cast<int>(status);
+  }
+  return atlas_launch_status(static_cast<int>(gemm(stream)));
+}
+
+extern "C" int atlas_cutlass_bf16_gemm_tuned(
+    const void* act,
+    const void* weight,
+    void* out,
+    int m,
+    int n,
+    int k,
+    int lda,
+    int ldc,
+    int config,
+    cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
+  switch (config) {
+    case 0:
+      return atlas_cutlass_bf16_tuned_impl<128, 128, 32, 64, 64, 32, 4, 1>(
+          act, weight, out, m, n, k, lda, ldc, stream);
+    case 4:
+      return atlas_cutlass_bf16_tuned_impl<128, 256, 32, 64, 64, 32, 3, 4>(
+          act, weight, out, m, n, k, lda, ldc, stream);
+    case 5:
+      return atlas_cutlass_bf16_tuned_impl<128, 256, 32, 64, 64, 32, 3, 8>(
+          act, weight, out, m, n, k, lda, ldc, stream);
+    case 9:
+      return atlas_cutlass_bf16_tuned_impl<128, 128, 64, 64, 64, 64, 3, 8>(
+          act, weight, out, m, n, k, lda, ldc, stream);
+    default:
+      return -5;
+  }
 }
 
 extern "C" int atlas_cublaslt_bf16_gemm_act_weight_t_algo(
@@ -284,4 +447,13 @@ extern "C" int atlas_cublaslt_bf16_gemm_act_weight_t_algo(
       stream);
   cleanup();
   return static_cast<int>(st);
+}
+
+// Stale sticky errors the wrappers drained: the count so far and the most
+// recent code (see atlas_stale_cuda_error.h).
+extern "C" unsigned long long atlas_cuda_stale_error_stats(int* last_code) {
+  if (last_code != nullptr) {
+    *last_code = atlas_stale_cuda_error_last.load(std::memory_order_relaxed);
+  }
+  return atlas_stale_cuda_error_count.load(std::memory_order_relaxed);
 }

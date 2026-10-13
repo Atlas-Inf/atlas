@@ -101,6 +101,9 @@ pub(super) fn drain_pending_requests(
     prefilling: &[PrefillInProgress],
     policy: &dyn SchedulingPolicy,
     max_batch_size: usize,
+    // `Model::has_shared_prompt_capture`: new prompts wait for the one in
+    // progress (GLM long context with the MTP prompt capture).
+    shared_prompt_capture: bool,
     // True when spilled/requeued sequences are parked awaiting resume. They
     // wait on KV BLOCKS, not on the request condvar — blocking here with an
     // empty active set would strand them (their resume only runs at the end
@@ -200,6 +203,19 @@ pub(super) fn drain_pending_requests(
 
     // Account for both active and in-progress prefilling sequences.
     let cap = max_batch_size.saturating_sub(active.len() + prefilling.len());
+    let cap = if shared_prompt_capture
+        && spark_model::speculative::glm_repair_policy::long_context_enabled()
+    {
+        cap.min(
+            spark_model::speculative::glm_repair_policy::new_prompt_capacity(
+                active.len(),
+                prefilling.len(),
+                max_batch_size,
+            ),
+        )
+    } else {
+        cap
+    };
 
     let infos: Vec<PendingRequestInfo> = g
         .requests

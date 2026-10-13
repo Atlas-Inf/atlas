@@ -4,19 +4,10 @@
 
 use super::*;
 
-// The AtomicU64 counters that lived here are now `SchedCtx::stats`
-// (`scheduler::spec_stats::SpecStats`), so a run's acceptance rate describes
-// the model that produced it rather than blending two across a swap.
-
-// Periodic accept-distribution summary (P4, 2026-05-24). K=3 has
-// three outcomes (0/1/2 drafts accepted) so we track three counters
-// and emit a summary line every K3_SUMMARY_PERIOD verify steps.
+// Per-model counters summarize the three K3 acceptance outcomes.
 const K3_SUMMARY_PERIOD: u64 = 100;
 
-// UNCONDITIONAL per-position draft-match counters (2026-07-21).
-// The accept-chain short-circuits: if draft 1 is rejected, draft 2 is discarded
-// without being scored. Verify computes argmax at every position (`v0`, `v1`, `v2`),
-// so `drafts[1] == v1` is observable regardless of `drafts[0] == v0`.
+// Verify observes draft2's match even when draft1 rejection short-circuits acceptance.
 
 #[inline]
 fn k3_record_positional(
@@ -194,7 +185,7 @@ pub fn step_verify_k3(
     let use_raw = crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
-        model.is_lightning_dspark_product(),
+        model,
         a,
     );
     let (v0, v1, v2) = if use_raw {
@@ -224,6 +215,10 @@ pub fn step_verify_k3(
     } else {
         2
     };
+    if !dflash_verify_raw_argmax {
+        a.mtp_acct
+            .record_depth_verify(2, num_accepted, sched.levers.mtp_single_depth_adapt);
+    }
 
     // Shadow top-k target line (ATLAS_MTP_SHADOW_TOPK): joins offline with
     // the drafter's SHADOW_TOPK lines — draft i (drafter pos base+i) vs v_i.
@@ -319,6 +314,15 @@ pub fn step_verify_k3(
     );
 
     if num_accepted == 2 {
+        // Item #2 (STree-style in-place K=3 verify commit). Full accept: a
+        // no-op unless KDA records fold the rows in, so it precedes the emits
+        // (an emit that finishes the sequence returns; `verify_dflash_tail`).
+        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 3, 3) {
+            // SSM state is no longer trustworthy — terminate, do not continue.
+            tracing::error!("commit_accepted_prefix (K=3 accept-3): {e:#}");
+            a.abort_on_engine_error(&e);
+            return;
+        }
         emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
         if !a.finished {
             emit_token(a, drafts[1], verify_lps.get(1).cloned(), sched);
@@ -331,15 +335,6 @@ pub fn step_verify_k3(
         }
         a.last_token = v2;
 
-        // Item #2 (STree-style in-place K=3 verify commit). Full accept
-        // (num_accepted=k=3): the verify kernel already wrote the canonical
-        // h_state, so the commit is a no-op.
-        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 3, 3) {
-            // SSM state is no longer trustworthy — terminate, do not continue.
-            tracing::error!("commit_accepted_prefix (K=3 accept-3): {e:#}");
-            a.abort_on_engine_error(&e);
-            return;
-        }
         // Same row, the other input shape: a drafter reading the PRE-mixer
         // stream highway needs row 2 staged into row 0, or it proposes from
         // the first verify row instead of the accepted one.
@@ -358,7 +353,11 @@ pub fn step_verify_k3(
         match model.run_mtp_propose_multi(
             v2,
             a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
+            crate::scheduler::spec_step::effective_drafts_under_grammar(
+                a,
+                a.mtp_acct
+                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+            ),
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),
@@ -414,7 +413,11 @@ pub fn step_verify_k3(
         match model.run_mtp_propose_multi(
             v1,
             a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
+            crate::scheduler::spec_step::effective_drafts_under_grammar(
+                a,
+                a.mtp_acct
+                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+            ),
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),
@@ -468,7 +471,11 @@ pub fn step_verify_k3(
         match model.run_mtp_propose_multi(
             v0,
             a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
+            crate::scheduler::spec_step::effective_drafts_under_grammar(
+                a,
+                a.mtp_acct
+                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+            ),
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),

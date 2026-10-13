@@ -231,6 +231,34 @@ impl QsaIndexer {
             Ok("1") | Ok("true")
         ) && self.k_prefill_attn_tc3_k.0 != 0
             && ops::qsa_prefill_attn_tc3_ok(nq, self.nkv_attn, self.hd_attn);
+        // ATLAS_QWEN4EXP_PREFILL_QSA_{TC2R,LEAN}: tc2's arithmetic on a lean
+        // tile -- two rows per CTA at one kv head (TP2), or tc2's own shape.
+        let tc2_in_force = !tc3
+            && ops::qsa_attn_tc2_enabled()
+            && self.k_prefill_attn_tc2_k.0 != 0
+            && ops::qsa_prefill_attn_tc2_ok(nq, self.nkv_attn, self.hd_attn);
+        let slab = ops::qwen4exp_prefill::QsaAttnSlab {
+            q: q_roped.offset(first_row * q_row * 2),
+            k_cache: k_pool,
+            v_cache: v_pool,
+            block_table: block_table_dev,
+            lists,
+            attn_out: attn_ctx.offset(first_row * q_row * 2),
+            rows: rows as u32,
+            first_pos: first_pos as u32,
+            topk: topk as u32,
+            ratio: self.ratio,
+            block_size,
+            nq,
+            nkv: self.nkv_attn,
+            hd: self.hd_attn,
+            inv_sqrt_d,
+        };
+        if !tc3
+            && ops::qwen4exp_prefill::try_qsa_prefill_attn_lean(gpu, &slab, tc2_in_force, stream)?
+        {
+            return Ok(());
+        }
         if tc3 {
             ops::qsa_prefill_attn_tc3(
                 gpu,
@@ -253,10 +281,7 @@ impl QsaIndexer {
                 stream,
             )?;
         }
-        let tc2 = !tc3
-            && ops::qsa_attn_tc2_enabled()
-            && self.k_prefill_attn_tc2_k.0 != 0
-            && ops::qsa_prefill_attn_tc2_ok(nq, self.nkv_attn, self.hd_attn);
+        let tc2 = tc2_in_force;
         if tc2 {
             ops::qsa_prefill_attn_tc2(
                 gpu,

@@ -67,6 +67,13 @@ pub(crate) fn resolve_topology(
     config.tp_world_size = tp_size;
     config.ep_rank = ep_rank;
     config.ep_world_size = ep_size;
+    // Every rank must resolve the same value (`rank_settings`): with it each
+    // rank holds a slice of every routed expert, without it half of them.
+    config.expert_tp = std::env::var("ATLAS_GLM_EXPERT_TP").as_deref() == Ok("1")
+        && config.model_type == "glm5_next"
+        && ep_size == 2
+        && tp_size == ep_size
+        && world_size == ep_size;
     if tp_size > 1 {
         // EXL3 packs each linear into 16x16 trellis tiles laid out
         // [in/16, out/16, ...]; a tile is atomic, so the tensor cannot be
@@ -93,6 +100,14 @@ pub(crate) fn resolve_topology(
             );
         }
         drop(loader);
+        // The MTP head (`--speculative`) runs unsharded on rank 0 from the
+        // TP=1 view of the config; a DFlash drafter has not been tried here.
+        if config.model_type == "qwen4_exp" && args.dflash {
+            anyhow::bail!(
+                "qwen4_exp: --dflash is not supported with --tp-size {tp_size} yet; \
+                 use --speculative (MTP)"
+            );
+        }
         if !config.num_attention_heads.is_multiple_of(tp_size) {
             anyhow::bail!(
                 "TP requires num_attention_heads ({}) divisible by tp_size ({})",
@@ -144,7 +159,8 @@ pub(crate) fn resolve_topology(
     if world_size > 1 {
         let (start, end) = config.local_expert_range();
         tracing::info!(
-            "Parallelism: global rank {}/{} (tp_rank={}/{}, ep_rank={}/{}), local experts [{}, {})",
+            "Parallelism: global rank {}/{} (tp_rank={}/{}, ep_rank={}/{}), local experts [{}, {}), \
+             expert TP {}",
             args.rank,
             world_size,
             tp_rank,
@@ -153,6 +169,7 @@ pub(crate) fn resolve_topology(
             ep_size,
             start,
             end,
+            config.expert_tp,
         );
     }
     Ok(Topology {
@@ -161,6 +178,82 @@ pub(crate) fn resolve_topology(
         ep_size,
         tp_rank,
         ep_rank,
+    })
+}
+
+/// The settings this crate resolves that every rank must share, for
+/// `spark_model::model::startup_parity`: a mismatch changes the rows of a
+/// prefill pass, the exchanges it may take, what a rank computes, the state
+/// it sizes and keeps, or whether it captures a step as a CUDA graph.
+#[cfg(feature = "nccl")]
+fn rank_settings(
+    args: &cli::ServeArgs,
+    expert_tp: bool,
+    prefill_budget: usize,
+    max_batch_tokens: usize,
+) -> [spark_model::model::startup_parity::Setting; 14] {
+    // Off the speculative lanes no pool is sized by the draft depth.
+    let num_drafts = if args.speculative || args.self_speculative || args.ngram_speculative {
+        args.num_drafts.unwrap_or(0)
+    } else {
+        0
+    };
+    [
+        ("ATLAS_GLM_EXPERT_TP", expert_tp as u64),
+        // The arena and pair capacity, and what it is resolved from: equal
+        // capacities can hide another chunk or another batch.
+        ("max batch tokens", max_batch_tokens as u64),
+        (
+            "prefill chunk (--max-prefill-tokens)",
+            prefill_budget as u64,
+        ),
+        ("--max-batch-size", args.max_batch_size as u64),
+        ("--max-seq-len", args.max_seq_len as u64),
+        ("--block-size", args.block_size as u64),
+        ("--enable-prefix-caching", args.enable_prefix_caching as u64),
+        // As the pool is built, not as given.
+        (
+            "--ssm-cache-slots",
+            super::build::resolve_ssm_cache_slots(args) as u64,
+        ),
+        (
+            "--ssm-checkpoint-interval",
+            args.ssm_checkpoint_interval as u64,
+        ),
+        // The speculative state a rank builds for the head's verify commands.
+        (
+            "--speculative or --dflash",
+            (args.speculative || args.dflash) as u64,
+        ),
+        // The verify width the SSM pools keep rollback state for (`SsmPools`:
+        // `num_drafts + 1` intermediates a slot), and which slots carry it
+        // with how many drafts each, as the pool is built from the MTP ladder
+        // environment. The head clamps a step's drafts to its own pool, so a
+        // worker with a narrower one rolls back from state it never kept.
+        ("--num-drafts", num_drafts as u64),
+        (
+            "MTP verify pool (ATLAS_MTP_MAX_SEQS, _K_LADDER, _POOL_FULL_WIDTH)",
+            mtp_verify_pool_word(args.max_batch_size, num_drafts),
+        ),
+        // Both keep a step out of a CUDA graph.
+        ("--high-speed-swap", args.high_speed_swap as u64),
+        ("--profile", args.profile as u64),
+    ]
+}
+
+/// One word for the MTP verify-state pool's geometry (`ssm_reserve`): the
+/// slots that carry rollback state and each slot's draft capacity. 0 off the
+/// speculative lanes.
+#[cfg(feature = "nccl")]
+fn mtp_verify_pool_word(max_batch_size: usize, num_drafts: usize) -> u64 {
+    use spark_model::ssm_reserve::{mtp_state_slots, verify_slot_drafts};
+    if num_drafts == 0 {
+        return 0;
+    }
+    let slots = mtp_state_slots(max_batch_size);
+    (0..slots).fold(slots as u64, |word, slot| {
+        word.wrapping_mul(31)
+            .wrapping_add(verify_slot_drafts(slot, num_drafts) as u64)
     })
 }
 
@@ -176,10 +269,12 @@ pub(crate) fn init_nccl_comm(
     args: &cli::ServeArgs,
     gpu: &dyn spark_runtime::gpu::GpuBackend,
     world_size: usize,
+    prefill_budget: usize,
     max_batch_tokens: usize,
-    hidden_size: usize,
+    config: &ModelConfig,
 ) -> Result<Option<std::sync::Arc<dyn spark_comm::CommBackend>>> {
     use spark_comm::CommBackend;
+    let hidden_size = config.hidden_size;
     if world_size <= 1 {
         return Ok(None);
     }
@@ -212,6 +307,12 @@ pub(crate) fn init_nccl_comm(
     )
     .context("Failed to initialize NCCL")?;
     tracing::info!("NCCL initialized: rank {}", backend.rank());
+    crate::ep_peer_lifeline::watch(&backend).context("Failed to arm the EP peer lifeline")?;
+    // Before any other collective: a rank running another value of one of
+    // these would deadlock or mispair the ranks at a prompt-dependent step.
+    let settings = rank_settings(args, config.expert_tp, prefill_budget, max_batch_tokens);
+    spark_model::model::startup_parity::agree(&backend, gpu, &settings)
+        .context("Startup settings agreement")?;
     Ok(Some(
         std::sync::Arc::new(backend) as std::sync::Arc<dyn spark_comm::CommBackend>
     ))
@@ -227,8 +328,9 @@ pub(crate) fn init_nccl_comm(
     _args: &cli::ServeArgs,
     _gpu: &dyn spark_runtime::gpu::GpuBackend,
     world_size: usize,
+    _prefill_budget: usize,
     _max_batch_tokens: usize,
-    _hidden_size: usize,
+    _config: &ModelConfig,
 ) -> Result<Option<std::sync::Arc<dyn spark_comm::CommBackend>>> {
     if world_size > 1 {
         anyhow::bail!(
@@ -250,8 +352,9 @@ pub(crate) fn init_nccl_comm(
     _args: &cli::ServeArgs,
     _gpu: &dyn spark_runtime::gpu::GpuBackend,
     world_size: usize,
+    _prefill_budget: usize,
     _max_batch_tokens: usize,
-    _hidden_size: usize,
+    _config: &ModelConfig,
 ) -> Result<Option<std::sync::Arc<dyn spark_comm::CommBackend>>> {
     if world_size > 1 {
         anyhow::bail!(
@@ -260,4 +363,76 @@ pub(crate) fn init_nccl_comm(
         );
     }
     Ok(None)
+}
+
+#[cfg(all(test, feature = "nccl"))]
+mod tests {
+    use clap::Parser as _;
+
+    /// The names of the settings two launches would disagree on.
+    fn differing(a: (&[&str], usize, usize), b: (&[&str], usize, usize)) -> Vec<&'static str> {
+        let settings = |(argv, prefill_budget, max_batch_tokens): (&[&str], usize, usize)| {
+            let argv = ["spark", "some/model"].iter().chain(argv);
+            let args = crate::cli::ServeArgs::parse_from(argv);
+            super::rank_settings(&args, false, prefill_budget, max_batch_tokens)
+        };
+        let (a, b) = (settings(a), settings(b));
+        a.iter()
+            .zip(b)
+            .filter(|(a, b)| a != &b)
+            .map(|(a, _)| a.0)
+            .collect()
+    }
+
+    #[test]
+    fn the_snapshot_slots_are_compared_as_the_pool_is_built() {
+        let pool = ["--ssm-checkpoint-interval=256", "--block-size=16"];
+        let launch = |more: [&'static str; 2]| [&pool[..], &more[..]].concat();
+        // One requested count, two contexts: pools of 136 and 72 slots.
+        let long = launch(["--ssm-cache-slots=16", "--max-seq-len=524288"]);
+        let short = launch(["--ssm-cache-slots=16", "--max-seq-len=262144"]);
+        assert_eq!(
+            differing((&long, 8192, 8196), (&short, 8192, 8196)),
+            ["--max-seq-len", "--ssm-cache-slots"]
+        );
+        // Two requested counts that are raised to one pool.
+        let fewer = launch(["--ssm-cache-slots=8", "--max-seq-len=524288"]);
+        assert!(differing((&long, 8192, 8196), (&fewer, 8192, 8196)).is_empty());
+    }
+
+    #[test]
+    fn one_capacity_does_not_hide_another_chunk_or_batch() {
+        // `ATLAS_MAX_BATCH_TOKENS` gives both ranks one arena.
+        assert_eq!(
+            differing(
+                (&["--max-batch-size=4"], 8192, 16384),
+                (&["--max-batch-size=2"], 4096, 16384)
+            ),
+            ["prefill chunk (--max-prefill-tokens)", "--max-batch-size"]
+        );
+    }
+
+    #[test]
+    fn a_worker_with_another_draft_depth_is_named() {
+        assert_eq!(
+            differing(
+                (&["--speculative", "--num-drafts=2"], 8192, 8196),
+                (&["--speculative", "--num-drafts=1"], 8192, 8196)
+            ),
+            [
+                "--num-drafts",
+                "MTP verify pool (ATLAS_MTP_MAX_SEQS, _K_LADDER, _POOL_FULL_WIDTH)"
+            ]
+        );
+        // Off the speculative lanes the depth sizes nothing.
+        assert!(differing((&["--num-drafts=2"], 8192, 8196), (&[], 8192, 8196)).is_empty());
+    }
+
+    #[test]
+    fn a_worker_without_the_heads_speculative_lane_is_named() {
+        assert_eq!(
+            differing((&["--speculative"], 8192, 8196), (&[], 8192, 8196)),
+            ["--speculative or --dflash"]
+        );
+    }
 }

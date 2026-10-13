@@ -16,11 +16,16 @@ use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
 use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_product_build};
 use crate::layers::MtpQuantization;
-use crate::layers::dflash_head::{DsparkStartupExecution, LightningDsparkRuntimeToggles};
+use crate::layers::dflash_head::{
+    DsparkStartupExecution, FirstAppend, LightningDsparkRuntimeToggles,
+};
 use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
+mod glm;
+mod kv_budget;
+mod kv_nvme;
 mod kv_summary;
 
 pub fn build_model(
@@ -66,6 +71,19 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    super::glm_sparse_decode::initialize(
+        gpu.as_ref(),
+        super::glm_sparse_decode::BuildPolicy {
+            config: &config,
+            self_speculative,
+            context: super::glm_sparse_decode::repair_context(max_seq_len),
+            block_size: kv_block_size,
+            kv_dtype,
+            layer_dtypes: &layer_dtypes,
+            dflash: dflash_args.is_some() && lora_args.is_none(),
+        },
+    )?;
+    crate::layers::ops::initialize_glm_sparse_prefill_pipe(gpu.as_ref(), &config)?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this
@@ -192,6 +210,16 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
+    let shared_cache_reserve = crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
+        &config,
+        gpu.as_ref(),
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        inference_reserve,
+        true,
+    )?;
     // Attribute the memory the BUILD spends, not just the shards.
     //
     // Weight upload reports itself per shard, and the buffer arena reports its
@@ -262,6 +290,7 @@ pub fn build_model(
             None
         };
 
+    glm::ensure_expert_tp_drafter(&config, use_speculative, dflash_args.is_none())?;
     // Qwen3.8-Flash-Next ships an MTP block that is architecturally a full
     // layer (gated attention + QSA indexer + mHC + 512-expert MoE), not the
     // Qwen-shaped `MtpWeights`, so it loads through its own path exactly like
@@ -289,8 +318,15 @@ pub fn build_model(
 
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
-    // this loudly so the user knows the flag was inert.
-    if use_speculative && mtp_weights.is_empty() && !q4e_mtp_loaded {
+    // this loudly so the user knows the flag was inert. Rank 0 only: the
+    // other ranks never draft and load no rank-0-only module.
+    if use_speculative
+        && config.ep_rank == 0
+        && dflash_args.is_none()
+        && mtp_weights.is_empty()
+        && v4_mtp_module.is_none()
+        && !q4e_mtp_loaded
+    {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
              model — speculative decoding will be disabled. Either drop `--speculative` \
@@ -369,7 +405,6 @@ pub fn build_model(
     // same BF16 head via dense_gemv (drafts are re-verified by the target, so the
     // draft head only affects acceptance). DenseWeight is Copy.
     let v4_mtp_lm_head = lm_head;
-
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
     // MiniMax M2.7-NVFP4 EP=2 has ~46 GB free at layer-0 load time but
@@ -379,8 +414,20 @@ pub fn build_model(
     // gemma4) still call `transpose_for_prefill` inline during layer
     // construction; this default-no-op hook doesn't perturb them.
     maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &store, &mut layers)?;
+    glm::init_weight_caches(
+        &config,
+        &store,
+        gpu.as_ref(),
+        &mut layers,
+        shared_cache_reserve,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        inference_reserve,
+    )?;
     // ── Step 4: Create buffer arena ──
-    let buffers = BufferArena::new(
+    let mut buffers = BufferArena::new(
         &config,
         max_batch_tokens,
         max_seq_len,
@@ -388,11 +435,26 @@ pub fn build_model(
         max_batch_size,
         gpu.as_ref(),
     )?;
+    glm::init_arena_consumers(
+        &config,
+        &store,
+        gpu.as_ref(),
+        &mut layers,
+        &mut buffers,
+        kv_dtype,
+        max_seq_len,
+        max_batch_tokens,
+        lm_head.weight,
+        lm_head_fp8.is_none() && lm_head_nvfp4.is_none(),
+    )?;
 
     // ── Step 5: Size KV cache from actual free memory ──
     // MLA absorbed: cache compressed latent [kv_lora + rope] instead of expanded [nkv * hd]
     // This gives 12.8x smaller KV cache AND better precision (no expand→cache→read roundtrip)
-    let (kv_num_heads, kv_head_dim) = if config.kv_lora_rank > 0 {
+    let glm_cache_shape = glm::cache_shape(&config, kv_dtype, &layer_dtypes)?;
+    let (kv_num_heads, kv_head_dim) = if let Some(shape) = glm_cache_shape {
+        (shape.num_kv_heads(), shape.head_dim())
+    } else if config.kv_lora_rank > 0 {
         let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
         tracing::info!(
             "MLA absorbed KV cache: 1 head × {} dims ({}+{}) per token (vs {} heads × {})",
@@ -416,64 +478,35 @@ pub fn build_model(
         layer_dims: config.kv_layer_dims.clone(),
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
     };
+    let (sparse_index, tail_slots, glm_cache_plan) = glm::cache_plan(
+        &config,
+        &kv_config,
+        glm_cache_shape,
+        // Slotted index tails need every resume to be lag-bounded. A prefix
+        // match covers whole cached blocks, which hold only finalized pools
+        // (`model::prefix_share`), provided SSM restores are block-aligned too.
+        use_speculative
+            && (!prefix_cache.is_active() || crate::model::mtp_carry::marconi_prefill_only())
+            && hss_cache_blocks_per_seq.is_none(),
+        max_batch_tokens,
+        kv_block_size,
+        max_batch_size,
+    )?;
+    let glm_cache_plan = glm::shard_plan(
+        glm_cache_plan,
+        &config,
+        &kv_config,
+        comm.as_deref(),
+        max_seq_len,
+        max_batch_tokens,
+    )?;
 
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
     }
-    // ── gpu_memory_utilization as fraction of TOTAL GPU memory ──
+    // ── KV budget: what is left of total × gpu_memory_utilization ──
+    // (contract, own-footprint measures and headroom floor: `kv_budget`).
     //
-    // User-facing contract (matches vLLM / sparkrun convention):
-    //   total_memory × gpu_memory_utilization = hard ceiling on everything
-    //   this process consumes (weights + buffers + KV cache + reserves).
-    //
-    // KV cache gets whatever remains inside that ceiling after deducting
-    // prior allocations (model weights, buffer arena, CUDA context/driver)
-    // and the inference reserve (SSM state pools, CUDA headroom).  A safety
-    // clamp ensures we never exceed what the device can physically provide
-    // right now (handles external memory pressure on shared-memory /
-    // unified-memory systems like GB10).
-    // Prime one DFlash ctx accumulator NOW — before the residual KV-pool
-    // sizing below consumes every remaining byte of the device map. The acc
-    // is ~`ctx_window` rows of target hiddens (600+ MB at ctx_window≥12K);
-    // allocating it lazily at request time lands AFTER the KV pool claim
-    // and hits the fragmentation wall with GBs nominally free. One buffer
-    // covers the first request; a warm turn's acc returns through carry
-    // adoption, and any further demand falls to the lazy path. Failure only
-    // forfeits the optimization — the request-time path still allocates.
-    // AMD APUs only (atlas_scale), like both balloons below: on GB10 the
-    // lazy path never hit that wall, and every byte held here comes out of
-    // the KV pool (27B DFlash2 at util 0.80: 43.9k -> 9.9k KV tokens).
-    if cfg!(atlas_scale)
-        && let Some(ref args) = dflash_args
-        && let Some(ref sub) = args.drafter_config.dflash_config
-    {
-        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4096);
-        let ctx_capacity = ctx_window.min(max_seq_len);
-        if ctx_capacity > 0 && !sub.target_layer_ids.is_empty() {
-            let acc_bytes = ctx_capacity
-                .saturating_mul(sub.target_layer_ids.len())
-                .saturating_mul(config.hidden_size)
-                .saturating_mul(2);
-            match gpu.alloc(acc_bytes) {
-                Ok(ptr) => {
-                    crate::layers::dflash_head::CTX_ACC_POOL.lock().push(ptr);
-                    tracing::info!(
-                        "DFlash ctx acc pool: primed {acc_bytes} B before KV residual sizing"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "DFlash ctx acc pool prime: alloc of {acc_bytes} B failed ({e}); \
-                         request-time path will allocate on demand"
-                    );
-                }
-            }
-        }
-    }
-
     // SSM state/snapshot pools MUST be allocated before the
     // `gpu.free_memory()` snapshot below: whatever is live at that point
     // lands in `used_so_far` and shrinks the KV budget automatically
@@ -569,92 +602,35 @@ pub fn build_model(
 
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
-    let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    let mut used_so_far = total_mem.saturating_sub(actual_free);
-    // GB10 is shared (ComfyUI/voxel/etc.). Raw `used_so_far` counts those
-    // co-tenants against our --gpu-memory-utilization budget, so a low util
-    // needlessly starves the KV pool (vs vLLM, whose util is self-relative).
-    //
-    // We want the KV pool sized against Atlas's OWN footprint (weights +
-    // buffers), excluding co-tenants. Two ways to find that footprint:
-    //
-    //   1. AUTO (default, preferred): free-at-context-init minus free-now =
-    //      exactly what THIS process allocated since startup. Co-tenants that
-    //      were already resident at init are in the baseline, so they cancel
-    //      out — and it self-corrects as co-tenants come and go (no stale
-    //      constant). Requires `set_baseline_free_bytes` to have run (it does
-    //      under the real server; absent under the mock backend → we skip it).
-    //
-    //   2. MANUAL override: ATLAS_KV_EXTERNAL_RESERVE_GB=<co-tenant GB> still
-    //      wins when explicitly set (>0), for operators who want to RESERVE
-    //      headroom for co-tenants that will arrive LATER (the auto measure
-    //      only sees current state).
-    //
-    // The `.min(actual_free - reserve)` clamp below still guarantees a physical
-    // fit regardless of which path set `used_so_far`.
-    let manual_reserve_gb = std::env::var("ATLAS_KV_EXTERNAL_RESERVE_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|&gb| gb > 0.0);
-    if let Some(gb) = manual_reserve_gb {
-        let ext = (gb * 1024.0 * 1024.0 * 1024.0) as usize;
-        let discounted = used_so_far.saturating_sub(ext);
-        tracing::info!(
-            "ATLAS_KV_EXTERNAL_RESERVE_GB={gb} (manual override): discounting \
-             external/co-tenant memory from KV budget — used_so_far {:.1} GB → \
-             Atlas-own {:.1} GB",
-            gib(used_so_far),
-            gib(discounted),
-        );
-        used_so_far = discounted;
-    } else if let Some(baseline) = spark_runtime::gpu::baseline_free_bytes() {
-        // AUTO: bytes this process consumed since context init.
-        let atlas_own = baseline.saturating_sub(actual_free);
-        // Sanity-gate: baseline must be ≥ free-now, atlas_own positive and no
-        // larger than total used (co-tenants can't be negative). If a co-tenant
-        // *freed* memory during our load, baseline > free-now still holds and
-        // atlas_own just slightly overcounts (conservative — fine). If the
-        // numbers are implausible, fall back to raw used_so_far.
-        if atlas_own > 0 && atlas_own <= used_so_far {
-            tracing::info!(
-                "KV budget self-relative (auto): baseline-free {:.1} GB − free-now \
-                 {:.1} GB = Atlas-own {:.1} GB; co-tenants {:.1} GB excluded \
-                 (set ATLAS_KV_EXTERNAL_RESERVE_GB to override)",
-                gib(baseline),
-                gib(actual_free),
-                gib(atlas_own),
-                gib(used_so_far - atlas_own),
-            );
-            used_so_far = atlas_own;
-        } else {
-            tracing::warn!(
-                "KV budget auto-measure implausible (baseline {:.1} GB, free-now \
-                 {:.1} GB, used {:.1} GB) — using raw used_so_far",
-                gib(baseline),
-                gib(actual_free),
-                gib(used_so_far),
-            );
-        }
-    }
+    let gib = kv_budget::gib;
     // Issue #71: lazy FP8→BF16 dequant copies allocate after this sizing;
     // see `ops::lazy_bf16_reserve` for what counts and what logs.
     let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
-    let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
-    let kv_budget = total_budget
-        .saturating_sub(used_so_far)
-        .saturating_sub(reserve_net)
-        .saturating_sub(derived_reserve)
-        .min(
-            actual_free
-                .saturating_sub(reserve_net)
-                .saturating_sub(derived_reserve),
-        );
+    // NVMe spill tiers (default off → 0): their staging, the index of a full
+    // disk budget and the SSM tier's arena are all committed after this point.
+    let nvme_record_bytes =
+        PagedKvCache::nvme_record_bytes_for(&kv_config, glm_cache_plan.is_some(), sparse_index);
+    let reserve_net = reserve_net
+        + kv_nvme::host_reserve_bytes(nvme_record_bytes, ssm_pools.tier_lazy_host_bytes());
+    let budget = kv_budget::measure(
+        gpu.as_ref(),
+        total_mem,
+        actual_free,
+        gpu_memory_utilization,
+        reserve_net + derived_reserve,
+        hss_cache_blocks_per_seq.is_none(),
+    );
+    let (used_so_far, total_budget, kv_budget) = (budget.own, budget.total_budget, budget.bytes);
+    // Per-sequence state that grows with a sequence's tokens outside the pool
+    // (the QSA indexer carry): charged per pool token, so the pool and the
+    // state riding with its tokens fit the budget together.
+    let aux_bytes_per_token: usize = layers.iter().map(|l| l.aux_bytes_per_token()).sum();
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
     // feature — the production cache becomes write staging only; older
     // blocks live on disk under the orchestrator's control.
-    let num_kv_blocks = match hss_cache_blocks_per_seq {
+    let mut num_kv_blocks = match hss_cache_blocks_per_seq {
         Some(cap) => {
             // Phase 6.3 (original): pool = max_batch × cap + 1 dummy + 1 spare per seq.
             // Issue #31 (2026-05-08): the cap×bs sizing assumed prefill would
@@ -705,8 +681,7 @@ pub fn build_model(
                     "No memory left for KV cache: total GPU = {:.1} GB, \
                      --gpu-memory-utilization {:.0}% → budget {:.1} GB, \
                      but {:.1} GB already consumed + {:.1} GB inference reserve (net of balloon)\
-                     {lazy_bf16_term} = {:.1} GB committed.  Raise \
-                     --gpu-memory-utilization or use a smaller model.",
+                     {lazy_bf16_term} = {:.1} GB committed.  {}",
                     total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                     gpu_memory_utilization * 100.0,
                     total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -714,18 +689,31 @@ pub fn build_model(
                     reserve_net as f64 / (1024.0 * 1024.0 * 1024.0),
                     (used_so_far + reserve_net + derived_reserve) as f64
                         / (1024.0 * 1024.0 * 1024.0),
+                    budget.no_room_advice(actual_free),
                 );
             }
-            let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            let n = match glm_cache_plan {
+                Some(plan) => plan.num_blocks_for_budget(kv_budget),
+                None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
+            };
             let max_kv_tokens = n * kv_block_size;
             let lazy_bf16_term = if derived_reserve > 0 {
                 format!(" + {:.1} GB lazy BF16", gib(derived_reserve))
             } else {
                 String::new()
             };
+            let aux_term = if aux_bytes_per_token > 0 {
+                format!(
+                    " (incl. {:.1} GB for {aux_bytes_per_token} B/token of per-sequence \
+                     indexer state)",
+                    gib(max_kv_tokens * aux_bytes_per_token),
+                )
+            } else {
+                String::new()
+            };
             tracing::info!(
                 "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
-                 {:.1} GB pre-KV + {:.1} GB reserve{lazy_bf16_term} → {:.1} GB for KV \
+                 {:.1} GB pre-KV + {:.1} GB reserve{lazy_bf16_term} → {:.1} GB for KV{aux_term} \
                  → {} blocks × {} tok/block = {} max KV tokens",
                 total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                 gpu_memory_utilization * 100.0,
@@ -740,6 +728,13 @@ pub fn build_model(
             n
         }
     };
+    num_kv_blocks = glm::agree_kv_blocks(
+        comm.as_deref(),
+        gpu.as_ref(),
+        num_kv_blocks,
+        glm_cache_plan,
+        kv_nvme::rank_word(nvme_record_bytes, ssm_pools.tier_home),
+    )?;
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
     // Phase 6.1.f / 6.2.c — when --high-speed-swap is on with HBM-shrink, the
     // production KV cache only has to fit the per-seq HBM window, not the full
@@ -804,7 +799,12 @@ pub fn build_model(
     // reports as free (Windows gfx1151: a 102 MB KV pool alloc failed with
     // 12 GB "free"), release the balloon and retry: the pre-balloon behavior.
     let mut balloon = balloon;
-    let kv_cache = match PagedKvCache::new(kv_config.clone(), num_kv_blocks, gpu.as_ref()) {
+    let mut kv_cache = match glm::new_kv_cache(
+        kv_config.clone(),
+        num_kv_blocks,
+        gpu.as_ref(),
+        glm_cache_plan,
+    ) {
         Ok(kv) => kv,
         Err(e) if balloon.is_some() => {
             tracing::warn!(
@@ -814,10 +814,20 @@ pub fn build_model(
             if let Some(ptr) = balloon.take() {
                 gpu.free(ptr)?;
             }
-            PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?
+            glm::new_kv_cache(kv_config, num_kv_blocks, gpu.as_ref(), glm_cache_plan)?
         }
         Err(e) => return Err(e),
     };
+    if let Some(index) = sparse_index {
+        kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
+    }
+    kv_nvme::attach(
+        &mut kv_cache,
+        prefix_cache.as_ref(),
+        gpu.as_ref(),
+        comm.as_deref().map_or(0, |c| c.rank()),
+        ssm_pools.tier_home,
+    )?;
 
     // Release the reserve balloon: everything after this point (Marconi
     // snapshot pool, SSM decode states, drafter KV, NVFP4 staging) allocates
@@ -904,7 +914,6 @@ pub fn build_model(
             q4e_module,
             q4e_mtp_embed,
             q4e_mtp_lm_head,
-            model.config_ref(),
             model.gpu_backend(),
             mtp_vocab_size,
             max_seq_len,
@@ -944,7 +953,8 @@ pub fn build_model(
         tracing::warn!("drafter balloon free failed: {e}");
     }
 
-    if let Some(args) = dflash_args {
+    // A worker rank carries the drafter config only; the head proposes.
+    if let Some(args) = dflash_args.filter(|a| !a.drafter_store.is_empty()) {
         let weights = load_dflash_weights(
             args.drafter_store,
             &args.drafter_config,
@@ -976,13 +986,15 @@ pub fn build_model(
                 // the admitted Lightning product derives it from the
                 // validated policy toggles; generic DFlash keeps legacy
                 // lenient environment semantics, still parsed exactly once.
-                let startup = match lightning_dspark_policy.as_ref() {
+                let mut startup = match lightning_dspark_policy.as_ref() {
                     Some(policy) => {
                         DsparkStartupExecution::from_lightning(policy.runtime_toggles())
                     }
                     None => DsparkStartupExecution::from_env_lenient(),
                 };
-                let head = crate::layers::BlockDiffusionDraftHead::from_weights(
+                // Strict for every head: an unknown value fails the build.
+                startup.diagnostics.first_append = FirstAppend::for_head()?;
+                let mut head = crate::layers::BlockDiffusionDraftHead::from_weights(
                     weights,
                     target_embed_for_dflash,
                     target_lm_head_for_dflash,
@@ -996,20 +1008,45 @@ pub fn build_model(
                     max_batch_size,
                     startup,
                 )?;
-                match lightning_dspark_policy {
-                    Some(policy) => {
-                        model.set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?
-                    }
-                    None => model.set_dflash_proposer(std::sync::Arc::new(head)),
+                // ATLAS_GLM_DRAFT_TP: on the TP2 pair both ranks hold the
+                // drafter and swap halves of a propose; the worker's copy
+                // serves its half and proposes nothing.
+                let (rank, pair) = {
+                    let c = model.config_ref();
+                    (c.ep_rank, c.tp_world_size == 2 && c.ep_world_size == 2)
+                };
+                let split = crate::layers::dflash_head::rank_split::requested()?
+                    .filter(|_| pair && !lightning_dspark_admitted);
+                if let Some(parts) = split {
+                    let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
+                    let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
+                    head.enable_rank_split(parts, batch, ctx, model.gpu_backend())?;
                 }
-                tracing::info!(
-                    "{} drafter installed as the active proposer",
-                    if lightning_dspark_admitted {
-                        "Lightning DSpark"
-                    } else {
-                        "DFlash"
+                if rank != 0 {
+                    anyhow::ensure!(
+                        split.is_some(),
+                        "rank {rank} loaded a drafter it cannot use: ATLAS_GLM_DRAFT_TP \
+                         needs the generic DFlash drafter on the TP2 pair"
+                    );
+                    model.set_draft_assist(std::sync::Arc::new(head));
+                    tracing::info!(
+                        "DFlash drafter installed on rank {rank} to serve split proposes"
+                    );
+                } else {
+                    match lightning_dspark_policy {
+                        Some(policy) => model
+                            .set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?,
+                        None => model.set_dflash_proposer(std::sync::Arc::new(head)),
                     }
-                );
+                    tracing::info!(
+                        "{} drafter installed as the active proposer",
+                        if lightning_dspark_admitted {
+                            "Lightning DSpark"
+                        } else {
+                            "DFlash"
+                        }
+                    );
+                }
             }
             None if lightning_dspark_admitted => {
                 anyhow::bail!(

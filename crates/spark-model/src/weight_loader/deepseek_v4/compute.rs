@@ -116,8 +116,12 @@ pub fn build_per_head_views(
             }
         }
     }
-    let wq_b_rope_ptr = alloc_or_managed(gpu, rope_size)?;
-    gpu.copy_h2d(&rope_host, wq_b_rope_ptr)?;
+    let wq_b_rope_ptr = alloc_or_managed(gpu, rope_size.max(256))?;
+    if rope_size > 0 {
+        gpu.copy_h2d(&rope_host, wq_b_rope_ptr)?;
+    } else {
+        gpu.memset(wq_b_rope_ptr, 0, 256)?;
+    }
 
     Ok((
         DenseWeight { weight: w_uk_t_ptr },

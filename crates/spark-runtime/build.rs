@@ -170,6 +170,9 @@ fn build_cutlass_object(cutlass_home: std::path::PathBuf) {
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
     }
+    // The three sources share this header; its launch-status base must match
+    // `cutlass::LAUNCH_FAILED`.
+    println!("cargo:rerun-if-changed=cuda/atlas_stale_cuda_error.h");
     println!("cargo:rustc-cfg=atlas_cutlass");
 
     let mut objects = Vec::new();

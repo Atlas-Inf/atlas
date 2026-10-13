@@ -147,6 +147,7 @@ fn logits_context_field_set_is_stable() {
     let scratch = crate::scheduler::sched_ctx::DecodeScratch::default();
     let dumps = crate::scheduler::dumps::RunDumps::default();
     let ctx = LogitsContext {
+        glm_tool_boundary: None,
         scratch: &scratch,
         dumps: &dumps,
         stats: std::sync::Arc::new(crate::scheduler::spec_stats::SpecStats::new()),

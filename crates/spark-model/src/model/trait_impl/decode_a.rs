@@ -109,15 +109,7 @@ impl TransformerModel {
         // 2. Pre-allocate KV cache blocks + upload attention metadata
         let bs = kv_cache.block_size();
         let blocks_needed = (seq.seq_len / bs) + 1;
-        ensure_blocks_through_decode(
-            seq,
-            blocks_needed - 1,
-            &mut kv_cache,
-            self.prefix_cache.as_ref(),
-            self.gpu.as_ref(),
-            stream,
-            self.levers.kv_poison,
-        )?;
+        self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
 
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = seq.block_table.len() as u32;
@@ -214,13 +206,13 @@ impl TransformerModel {
         // probes can sync (illegal under graph capture). Subsequent steps
         // still capture/replay normally.
         let dump_step0 =
-            seq.seq_len == seq.prompt_len && std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok();
+            seq.seq_len == seq.prompt_len && crate::model::graph_flags::ssm_save_dump();
         // EXPERIMENT (ATLAS_EP_GRAPHS=1): allow CUDA-graph capture under EP. The
         // EP all-reduce queues ncclSend/Recv + local-add on the compute (capture)
         // stream; NCCL ≥2.9 supports graph capture, so this MAY capture cleanly
         // and remove per-kernel launch overhead. Env-gated so it can be toggled
         // off at deploy time (instant revert) if capture crashes / replay hangs.
-        let ep_graphs = std::env::var("ATLAS_EP_GRAPHS").is_ok_and(|v| v == "1" || v == "true");
+        let ep_graphs = crate::model::graph_flags::ep_graphs();
         // GDN HeadParallel TP decode graphs (ATLAS_GDN_DECODE_GRAPH=1, default
         // OFF): capture the whole single-token decode forward — ~130 kernels
         // plus the per-layer TP all-reduces (48 GDN SSM out_proj + 16
@@ -236,8 +228,7 @@ impl TransformerModel {
         // so replay is shape/pointer-static. This removes the per-token host
         // launch cost that dominates 2-node GDN HeadParallel decode. Capture
         // failure falls back to eager execution (graphs then stay disabled).
-        let gdn_graphs =
-            std::env::var("ATLAS_GDN_DECODE_GRAPH").is_ok_and(|v| v == "1" || v == "true");
+        let gdn_graphs = crate::model::graph_flags::gdn_decode_graph();
         // LoRA debugging hatch (ATLAS_LORA_EAGER=1): force eager decode when an
         // adapter is active so graph-vs-eager delta parity can be compared.
         // Default (unset) keeps graphs ON — the LoRA delta launches are
@@ -250,8 +241,8 @@ impl TransformerModel {
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
         // Diagnostic: force eager single-seq decode (graph-vs-eager A/B,
         // and to localize 716s inside captured graphs with LAUNCH_BLOCKING).
-        let no_decode_graphs = std::env::var("ATLAS_NO_DECODE_GRAPHS").is_ok_and(|v| v == "1")
-            || super::verify_layer_trace::enabled();
+        let no_decode_graphs =
+            crate::model::graph_flags::no_decode_graphs() || super::verify_layer_trace::enabled();
         // G1 (2026-08-15): capturing the n=1 decode graph on a step whose
         // seq_len is an exact multiple of 64 (SSD_L) produces a graph whose
         // FIRST replay faults with 716/700 (misaligned address). Empirically
@@ -264,6 +255,9 @@ impl TransformerModel {
         // dropping ~12% on the every-64th eager step.
         let seq64_boundary = seq.seq_len.is_multiple_of(64);
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
+            // The GLM C1 selector embeds host positions, whether a serial step
+            // or C3/C2 draining to C1 in the opt-in sparse session reaches it.
+            && !crate::layers::qwen3_attention::glm_c1_decode_graph_vetoed(&kv_cache)
             && !self.profile
             && !self
                 .suppress_graphs
@@ -276,6 +270,7 @@ impl TransformerModel {
         let capture_this_step = use_graphs && !seq64_boundary;
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -306,6 +301,7 @@ impl TransformerModel {
 
         // ── Phase 2: Try CUDA graph replay ──
 
+        crate::layers::moe::validate_shared_fp8_cache_graphs(&self.config.model_type, use_graphs)?;
         let mut graph_cache = if use_graphs {
             Some(self.decode_graph.lock())
         } else {
@@ -372,8 +368,7 @@ impl TransformerModel {
             // `synchronize`) fails with STREAM_CAPTURE_UNSUPPORTED and every
             // subsequent op on this stream is poisoned — a single refused request
             // bricks the whole server. Release the stream (discarding the partial
-            // graph) before propagating; no-op when not capturing. Graphs stay
-            // enabled: the next decode step begins a fresh capture.
+            // graph).
             self.gpu.abort_capture_if_active(stream);
             // A capture-poison error (900 CAPTURE_UNSUPPORTED / 901
             // CAPTURE_INVALIDATED) is a property of the graph attempt, not of

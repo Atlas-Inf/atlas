@@ -35,7 +35,6 @@ use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
-use super::super::block_mgmt::ensure_blocks_through_decode;
 use super::super::types::TransformerModel;
 use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::ops;
@@ -46,7 +45,8 @@ impl TransformerModel {
     /// rows each (ragged since D-Cut).
     ///
     /// Self-gates to the envelope verify_e was built and audited for:
-    /// non-EP, non-HSS, no LoRA (the uniform seq_slot upload
+    /// non-EP (but see `ep_verify_batch.rs`: qwen4_exp's exact lane runs it
+    /// over a TP pair), non-HSS, no LoRA (the uniform seq_slot upload
     /// carries ONE adapter slot), MTP proposer present (stash allocated,
     /// `VERIFY_WY_TABLE_SEQS` = 32 slots ⇒ n ≤ 32), and R = Σ ks ≤
     /// `VERIFY_ROW_CAP` = 128 (the exact logits-rows / meta-gap / bt-staging
@@ -59,7 +59,7 @@ impl TransformerModel {
         (2..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
             && self.verify_batch_ks_ok(ks)
             && ks.iter().sum::<usize>() <= super::verify_e2::VERIFY_ROW_CAP
-            && self.comm.is_none()
+            && (self.comm.is_none() || self.batched_verify_under_comm())
             && self.lora.is_none()
             && !self.verify_hidden_stash.is_null()
             // HSS: the paged-decode kernel reads HBM only, missing on-disk
@@ -171,6 +171,10 @@ impl TransformerModel {
             super::verify_e2::VERIFY_ROW_CAP
         );
 
+        // ATLAS_QWEN4EXP_BATCH_FAST_CHECK: serial reference rows first, before
+        // the KV lock below (`batch_fast_check.rs`).
+        let serial_check = self.batch_fast_serial_rows(tokens, Some(ks), seqs)?;
+
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
@@ -184,15 +188,7 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         for (i, seq) in seqs.iter_mut().enumerate() {
             let last_pos = seq.seq_len + ks[i] - 1;
-            ensure_blocks_through_decode(
-                seq,
-                last_pos / bs,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, last_pos / bs, &mut kv_cache, stream)?;
         }
 
         // ATLAS_K4_DIAG=1: stream-sync checkpoint after every layer so an
@@ -500,6 +496,7 @@ impl TransformerModel {
             }
 
             let ctx = ForwardContext {
+                ssm_batch: None,
                 buffers: &self.buffers,
                 gpu: self.gpu.as_ref(),
                 config: &self.config,
@@ -547,8 +544,50 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // qwen4_exp piecewise graphs (`model::decode_pieces`): over a
+            // parallel communicator the whole-step graph above is off, so the
+            // GDN runs (and on an all-inert step the attention layers too)
+            // replay per slot/row vector. DFlash's owner-slot captures stay
+            // eager, as for the whole-step graph.
+            let piece_key = if dflash_save_slots.is_none()
+                && self.decode_pieces_admitted(capture, &kv_cache, &ctx)
+            {
+                self.verify_batched_graph_key(&*seqs, ks, wy_tables_base.is_null())
+            } else {
+                None
+            };
+            let wide = piece_key.is_some()
+                && self.decode_pieces_wide(
+                    seqs.iter()
+                        .zip(ks)
+                        .map(|(s, &k)| s.seq_len + k - 1)
+                        .max()
+                        .unwrap_or(0),
+                );
+
             let mut ssm_idx = 0usize;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if let Some(key) = piece_key.as_deref()
+                    && self.verify_batch_piece_run(
+                        layer_idx,
+                        wide,
+                        key,
+                        ks,
+                        &row_owner,
+                        seqs,
+                        &mut kv_cache,
+                        &seq_lens_vec,
+                        &block_tables_vec,
+                        wy_tables_base,
+                        &ctx,
+                        stream,
+                    )?
+                {
+                    if self.config.layer_type(layer_idx) == LayerType::LinearAttention {
+                        ssm_idx += 1;
+                    }
+                    continue;
+                }
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
@@ -618,6 +657,17 @@ impl TransformerModel {
                 }
             }
 
+            if wide {
+                let rows: Vec<(usize, usize)> = row_owner
+                    .iter()
+                    .enumerate()
+                    .map(|(r, &i)| (i, seqs[i].seq_len + r - off[i]))
+                    .collect();
+                let mut owners: Vec<&mut Vec<Box<dyn LayerState>>> =
+                    seqs.iter_mut().map(|s| &mut s.layer_states).collect();
+                self.qsa_commit_staged(&rows, &mut owners, stream)?;
+            }
+
             // ── Phase 4: final norm [R, H] + lm_head + per-row argmax ──
             let normed = self.buffers.norm_output();
             self.final_norm_rows(hidden, normed, r_total as u32, stream)?;
@@ -627,7 +677,10 @@ impl TransformerModel {
             }
 
             // R ≤ VERIFY_ROW_CAP = the 128-row logits buffer cap (sizes.rs).
-            self.lm_head_batched(normed, r_total as u32, self.buffers.logits(), stream)?;
+            // Vocab-split over a TP pair when admitted (both ranks run this
+            // forward in lockstep), single-row arithmetic per row under
+            // ATLAS_QWEN4EXP_BATCH_FAST.
+            self.lm_head_batched_tp(normed, r_total, stream)?;
 
             if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                 anyhow::bail!("K4_DIAG(batched): CUDA error after lm_head_batched: {e:#}");
@@ -834,6 +887,9 @@ impl TransformerModel {
                 seq.tokens.push(t);
             }
             seq.seq_len += ks[i];
+        }
+        if let Some(rows) = serial_check {
+            self.batch_fast_compare(rows, self.buffers.logits())?;
         }
 
         Ok(out)

@@ -70,6 +70,8 @@ pub struct LogitsContext<'a> {
     pub think_end_token: Option<u32>,
     pub think_start_token: Option<u32>,
     pub tool_call_start_token: Option<u32>,
+    /// Explicit model/tokenizer-scoped implicit thinking boundary (GLM only).
+    pub glm_tool_boundary: Option<u32>,
     pub tool_call_end_token: Option<u32>,
     /// `mask[id]` iff token `id` decodes to text ending in a generation
     /// boundary. Vocab-sized and INDEXED BY TOKEN ID, so it is meaningless

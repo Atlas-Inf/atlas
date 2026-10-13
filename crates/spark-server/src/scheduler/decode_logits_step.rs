@@ -4,6 +4,9 @@
 
 use super::*;
 
+mod post_think_eos;
+use post_think_eos::should_suppress_post_think_eos;
+
 // The reusable host staging buffer for the D2H logits copy is now
 // `SchedCtx::scratch.host_bytes` — same zero-contention single-thread
 // access, with a lifetime that ends when the run does.
@@ -35,6 +38,7 @@ fn logits_ctx<'a>(
     tool_call_end_token: Option<u32>,
 ) -> crate::scheduler::logit_processors::LogitsContext<'a> {
     crate::scheduler::logit_processors::LogitsContext {
+        glm_tool_boundary: sched.limits.glm_tool_boundary,
         think_end_token,
         think_start_token,
         tool_call_start_token,
@@ -257,6 +261,7 @@ pub fn process_decode_logits(
             // `&`-to-`Sync` — and leave the scratch to each worker.
             let dumps = &sched.dumps;
             let watchdog = sched.watchdog;
+            let glm_tool_boundary = sched.limits.glm_tool_boundary;
             let stats = sched.stats.clone();
             let boundary_mask = sched.masks.boundary.clone();
             let mid_word_mask = sched.masks.mid_word.clone();
@@ -266,12 +271,19 @@ pub fn process_decode_logits(
                 .par_iter_mut()
                 .enumerate()
                 .map(|(i, a)| {
+                    // Preserve batch row mapping but skip mutable host sampling
+                    // for an already-cancelled request. The retained last token
+                    // is only a placeholder: the commit gate below discards it.
+                    if retire_if_cancelled(a) {
+                        return (a.last_token, None);
+                    }
                     // The run's `DecodeScratch` is a `RefCell` — neither
                     // `Sync` nor shareable across the pool — so each worker
                     // borrows its own and builds the context around it. Same
                     // reuse, one buffer per worker instead of one per run.
                     PAR_SAMPLE_SCRATCH.with(|scratch| {
                         let ctx = crate::scheduler::logit_processors::LogitsContext {
+                            glm_tool_boundary,
                             think_end_token,
                             think_start_token,
                             tool_call_start_token,
@@ -312,6 +324,9 @@ pub fn process_decode_logits(
                 .iter_mut()
                 .enumerate()
                 .map(|(i, a)| {
+                    if retire_if_cancelled(a) {
+                        return (a.last_token, None);
+                    }
                     process_seq_logits(
                         model,
                         a,
@@ -346,6 +361,12 @@ pub fn process_decode_logits(
     let now = Instant::now();
     for (i, (tok, logprobs)) in new_tokens.into_iter().enumerate() {
         let a = &mut active[i];
+        // Recheck after sampling: stream cancellation can arrive during this
+        // step or while a preceding independent row is being delivered. Do not
+        // compact rows or undo the completed forward; lifecycle retires state.
+        if retire_if_cancelled(a) {
+            continue;
+        }
         a.last_token = tok;
         a.last_token_time = now;
 
@@ -370,6 +391,8 @@ pub fn process_decode_logits(
             tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
             continue;
         }
+
+        first_token_thinking::apply_native_tool_boundary(a, tok, sched.limits.glm_tool_boundary);
 
         // Spontaneous <think>: model generates <think> even when thinking
         // was not requested. Enter thinking mode so EOS is suppressed and
@@ -435,10 +458,14 @@ pub fn process_decode_logits(
         // once thinking is finished, because thinking tokens are
         // stripped from the API output and should not consume grammar
         // slots (matches the bitmask-skip in the sampler above).
+        // A strict (response_format) grammar fails loud on a refusal.
         if !a.inside_thinking
             && let Some(ref mut gs) = a.grammar_state
+            && !gs.accept_token(tok)
+            && gs.is_strict()
         {
-            gs.accept_token(tok);
+            crate::scheduler::emit_step::fail_strict_grammar(a, tok);
+            continue;
         }
 
         // §C-1 (DS4F hard-limit lane, 2026-07-21): thinking tokens draw down
@@ -452,6 +479,12 @@ pub fn process_decode_logits(
         // commit path (below) finishes the sequence even while inside thinking
         // (§C-2 budget half). Every generated token (content OR thinking,
         // including `</think>`) now decrements exactly once.
+        let native_glm_eos = crate::glm_tool_boundary::native_eos_while_thinking(
+            sched.limits.glm_tool_boundary,
+            a.inside_thinking,
+            tok,
+            &a.eos_tokens,
+        );
         if a.inside_thinking {
             a.consume_generation_budget();
             if think_end_token == Some(tok) {
@@ -466,7 +499,7 @@ pub fn process_decode_logits(
                 // tool call (Change 3b). Cleared in the `else`
                 // branch below on the next emit.
                 a.think_just_ended = true;
-            } else {
+            } else if !native_glm_eos {
                 a.thinking_tokens += 1;
                 // Track ``` code-fence parity within the thinking block:
                 // each fence token flips in/out of a fenced code span.
@@ -506,6 +539,7 @@ pub fn process_decode_logits(
                 if !sched.levers.disable_watchdogs
                     && sched.watchdog.enable_think_loop_watchdog
                     && !a.force_end_thinking
+                    && watchdog_floor_reached(a.output_tokens.len().saturating_add(1), a.min_tokens)
                     && a.thinking_tokens >= THINK_LOOP_MIN_TOKENS
                     && a.thinking_tokens.is_multiple_of(THINK_LOOP_CHECK_STRIDE)
                     && detect_thinking_token_loop_with(
@@ -718,7 +752,10 @@ pub fn process_decode_logits(
         // decrement (thinking or content branch above); `a.seq.seq_len` is the
         // current KV position. No-op until a ceiling is actually hit.
         let hard_ceiling = hard_ceiling_hit(a.remaining, a.seq.seq_len, sched.limits.max_seq_len);
-        let thinking_suppresses_eos = eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling);
+        // GLM can end its turn without closing reasoning. Do not fabricate a
+        // close or keep decoding after that native EOS; other guards remain.
+        let thinking_suppresses_eos =
+            eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling) && !native_glm_eos;
         // Post-thinking EOS guard. Empirically (dump fix22b 2026-04-25
         // ses_23b4781f7ffebc7UgkKWedTmjd seq=43): when the thinking-loop
         // watchdog force-closes `</think>` mid-narration, the model can
@@ -743,23 +780,20 @@ pub fn process_decode_logits(
         // a short post-thinking answer is the expected output and EOS
         // should fire normally. `min_tokens_suppresses` still enforces
         // any explicit caller-set floor.
-        const POST_THINK_MIN_CONTENT: u32 = 16;
         let post_think_content_tokens =
             (a.output_tokens.len() as u32).saturating_sub(a.thinking_tokens);
         // Tools-armed scoping (the narrowing the 2026-05-24 comment above
-        // describes but was never coded into this branch): the post-think guard
-        // exists to give the model room to OPEN a `<tool_call>` after the
-        // watchdog force-closes `</think>` mid-narration. That is only relevant
-        // when tools are armed for this turn. On a plain (no-tool) thinking turn
-        // a short post-`</think>` answer ("2+2"→"4", "say hello"→"Hello") plus
-        // its `<|im_end|>`/`<|endoftext|>` IS the expected output, so the guard
-        // must NOT fire — otherwise the legitimate EOS is discarded and the
-        // model runs on into chat-template scaffold (`\nuser\nassistant`). The
-        // MTP-verify emit path (`emit_step.rs`) has no such guard, which is why
-        // MTP-on stopped here while MTP-off leaked; this restores parity.
-        let tools_armed = a.require_tool_call || a.tool_request;
+        // describes): the post-think guard exists to give the model room to
+        // OPEN a `<tool_call>` after the watchdog force-closes `</think>`
+        // mid-narration. `tool_request` is deliberately sticky for the whole
+        // request, so it is too broad here: an auto-tools turn answering an
+        // existing tool result has tools available but no current call to
+        // open. In that case a short plain answer must be allowed to end,
+        // including when thinking was disabled and `think_ended` is already
+        // true at prefill. Keep the guard for a required call and for a call
+        // that the output has actually opened but not closed.
         let post_think_suppresses_eos =
-            tools_armed && a.think_ended && post_think_content_tokens < POST_THINK_MIN_CONTENT;
+            should_suppress_post_think_eos(a, post_think_content_tokens);
         let suppress_eos = grammar_suppresses_eos
             || legacy_suppresses_eos
             || min_tokens_suppresses
@@ -959,6 +993,7 @@ pub fn process_decode_logits(
             if sched.levers.loop_watchdog()
                 && !a.finished
                 && !a.inside_thinking
+                && watchdog_floor_reached(a.output_tokens.len(), a.min_tokens)
                 && !inside_tool_call
                 && let Some((pattern_len, mis_a, mis_b)) = detect_fuzzy_repetition(
                     &a.output_tokens,
@@ -1003,3 +1038,6 @@ pub fn process_decode_logits(
         }
     }
 }
+
+#[cfg(test)]
+mod auto_tool_eos_tests;

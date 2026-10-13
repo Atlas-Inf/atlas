@@ -44,6 +44,7 @@ mod scan_charclass;
 mod state;
 
 pub use parser::{CompletableEntry, EarleyParser};
+pub(crate) use prune::ProductivityTable;
 pub use queue::ProcessQueue;
 pub use state::{NO_PREV_INPUT_POS, ParserState, UNEXPANDED_RULE_START_SEQUENCE_ID, cache_key};
 

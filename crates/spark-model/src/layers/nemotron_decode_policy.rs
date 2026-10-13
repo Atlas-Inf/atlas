@@ -79,9 +79,12 @@ mod tests {
     #[test]
     fn layer_trace_covers_literal_m1_and_k4_without_graph_capture() {
         let trace = include_str!("../model/trait_impl/verify_layer_trace.rs");
+        let flags = include_str!("../model/graph_flags.rs");
         let m1 = include_str!("../model/trait_impl/decode_a3.rs");
         let k4 = include_str!("../model/trait_impl/verify_d.rs");
-        assert!(trace.contains("ATLAS_LIGHTNING_VERIFY_LAYER_TRACE"));
+        // One reader of the switch, shared with the startup agreement.
+        assert!(flags.contains("ATLAS_LIGHTNING_VERIFY_LAYER_TRACE"));
+        assert!(trace.contains("graph_flags::verify_layer_trace()"));
         assert!(m1.contains("trace_lightning_hidden_rows(\"m1\""));
         assert!(k4.contains("\"k4\""));
         assert!(k4.contains("!super::verify_layer_trace::enabled()"));

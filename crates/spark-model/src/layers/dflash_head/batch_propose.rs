@@ -36,6 +36,7 @@ impl BlockDiffusionDraftHead {
         ctx: &crate::layer::ForwardContext,
         stream: u64,
         grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
+        batch_split: Option<(&super::rank_split::RankSplit, &dyn spark_comm::CommBackend)>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         let n = last_tokens.len();
 
@@ -49,7 +50,8 @@ impl BlockDiffusionDraftHead {
         let mut batch_kv_lens = Vec::with_capacity(n);
         let mut batch_block_tables = Vec::with_capacity(n);
         let mut batch_ctx_counts = Vec::with_capacity(n);
-        for state in states.iter_mut() {
+        let mut ban_depths: Vec<u32> = Vec::with_capacity(n);
+        for (sequence, state) in states.iter_mut().enumerate() {
             let dstate = state
                 .as_any_mut()
                 .downcast_mut::<DflashProposerState>()
@@ -61,6 +63,13 @@ impl BlockDiffusionDraftHead {
                 .unwrap_or(expected_owners[owners.len()]);
             owners.push(owner);
             lifecycles.push(lifecycle);
+            ban_depths.push(positions.get(sequence).map_or(0, |&anchor| {
+                crate::traits::EosBan::banned_draft_depth(
+                    dstate.end_floor,
+                    anchor,
+                    self.gamma.saturating_sub(1),
+                )
+            }));
             let block_table_dev = dstate.block_table_dev.unwrap_or(DevicePtr::NULL);
             block_table_ptrs.push(block_table_dev.0);
             batch_ctx_counts.push(dstate.ctx_count_drafter);
@@ -145,6 +154,9 @@ impl BlockDiffusionDraftHead {
         ctx.gpu.copy_h2d(&position_bytes, self.batch_position_ids)?;
         ctx.gpu
             .copy_h2d(&last_token_bytes, self.batch_markov_prev)?;
+        // min_tokens: leading draft depths the selector walk may not end on.
+        let ban_depth_bytes: Vec<u8> = ban_depths.iter().flat_map(|d| d.to_le_bytes()).collect();
+        ctx.gpu.copy_h2d(&ban_depth_bytes, self.batch_ban_depth())?;
         let ptr_bytes: Vec<u8> = block_table_ptrs
             .iter()
             .flat_map(|pointer| pointer.to_le_bytes())
@@ -225,17 +237,37 @@ impl BlockDiffusionDraftHead {
                     Some(self.batch_attention_args),
                 )
             };
-            for layer_idx in 0..self.layers.len() {
-                self.run_batched_layer_stage(
-                    layer_idx,
-                    batch_rows,
-                    batch_size,
-                    max_kv_len,
-                    serial_tables,
-                    serial_args,
-                    ctx,
-                    stream,
-                )?;
+            // ATLAS_GLM_DRAFT_TP_BATCH: the same layers and tail base, the
+            // MLP and head halves swapped with the worker (no parity oracle).
+            let walked = match batch_split {
+                Some((split, comm)) => {
+                    let a = super::batch_forward::BatchLayerArgs {
+                        batch_rows,
+                        batch_size,
+                        max_kv_len,
+                        serial_block_tables: serial_tables,
+                        serial_attention_args: serial_args,
+                        ctx,
+                        stream,
+                    };
+                    self.walk_batch_split(split, comm, a)?;
+                    true
+                }
+                None => false,
+            };
+            if !walked {
+                for layer_idx in 0..self.layers.len() {
+                    self.run_batched_layer_stage(
+                        layer_idx,
+                        batch_rows,
+                        batch_size,
+                        max_kv_len,
+                        serial_tables,
+                        serial_args,
+                        ctx,
+                        stream,
+                    )?;
+                }
             }
             if let Some(expected) = parity_hidden_oracle.as_ref() {
                 ctx.gpu.synchronize(stream)?;
@@ -269,7 +301,9 @@ impl BlockDiffusionDraftHead {
                     );
                 }
             }
-            self.run_batched_tail_base(batch_rows, ctx, stream)?;
+            if !walked {
+                self.run_batched_tail_base(batch_rows, ctx, stream)?;
+            }
             // #102: grammar-mask each masked seq's logits rows 0/1 (anchor +
             // draft 0 — both predict pos+1). The pre-pass writes -inf in
             // place; the selector/Markov arms below stay unchanged.
@@ -288,39 +322,11 @@ impl BlockDiffusionDraftHead {
                         );
                         continue;
                     }
-                    // #58: stage in the head's pinned mask region (slot =
-                    // sequence) and ship retained-async — a sync copy_h2d
-                    // here was one stream drain per masked sequence.
-                    let base = self
-                        .batch_grammar_masks_host_pinned
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(mask.as_ptr() as *const u8, words * 4)
+                    };
                     let mask_dev = self.batch_grammar_bitmask.offset(sequence * words * 4);
-                    let pinned_bytes = words * 4;
-                    if !base.is_null()
-                        && sequence * pinned_bytes + pinned_bytes
-                            <= self.batch_grammar_masks_pinned_bytes
-                    {
-                        // SAFETY: slot `sequence` of the page-locked mask
-                        // region is exclusively this sequence's for the
-                        // whole call; the batch-token readback completes
-                        // the retained copies before the slot is reused.
-                        let staging = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                base.add(sequence * pinned_bytes),
-                                pinned_bytes,
-                            )
-                        };
-                        let src: &[u8] = unsafe {
-                            std::slice::from_raw_parts(mask.as_ptr() as *const u8, pinned_bytes)
-                        };
-                        staging.copy_from_slice(src);
-                        ctx.gpu.copy_h2d_async_retained(staging, mask_dev, stream)?;
-                    } else {
-                        let bytes: &[u8] = unsafe {
-                            std::slice::from_raw_parts(mask.as_ptr() as *const u8, pinned_bytes)
-                        };
-                        ctx.gpu.copy_h2d(bytes, mask_dev)?;
-                    }
+                    ctx.gpu.copy_h2d(bytes, mask_dev)?;
                     for row in 0..2usize.min(self.gamma) {
                         crate::layers::ops::apply_grammar_bitmask(
                             ctx.gpu,
@@ -341,14 +347,19 @@ impl BlockDiffusionDraftHead {
             }
         }
 
+        // One selector record per sequence: gamma tokens, then its draft
+        // confidences when the head reports them (`draft_conf`).
+        let record_bytes = self.draft_record_bytes();
+        let mut records = Vec::new();
         let native = if native_staged
             && (native_authoritative || self.startup.diagnostics.batch_parity || generic_auth)
         {
             ctx.gpu.synchronize(stream)?;
-            let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
-            ctx.gpu.copy_d2h(self.batch_tokens, &mut raw)?;
-            let row_tokens: Vec<u32> = raw
-                .chunks_exact(4)
+            records.resize(n * record_bytes, 0u8);
+            ctx.gpu.copy_d2h(self.batch_tokens, &mut records)?;
+            let row_tokens: Vec<u32> = records
+                .chunks_exact(record_bytes)
+                .flat_map(|record| record.chunks_exact(4).take(self.gamma))
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect();
             Some(batch_inputs.reorder_sampled_rows(&row_tokens)?)
@@ -419,7 +430,12 @@ impl BlockDiffusionDraftHead {
                          (cache slots not ready or staging skipped)"
                     )
                 })?;
-                let cap = self.draft_cap(num_drafts);
+                // Plus the optional tighter cap for owner-batched steps.
+                let cap = super::batch_plan::batched_draft_cap(
+                    self.draft_cap(num_drafts),
+                    super::batch_plan::multi_owner_draft_cap(),
+                    n,
+                );
                 for (i, tokens) in out.iter_mut().enumerate() {
                     tokens.truncate(cap);
                     let dstate = states[i]
@@ -427,6 +443,13 @@ impl BlockDiffusionDraftHead {
                         .downcast_mut::<DflashProposerState>()
                         .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
                     dstate.last_num_drafted = tokens.len();
+                    dstate.last_draft_conf = records
+                        .chunks_exact(record_bytes)
+                        .nth(i)
+                        .map(|record| {
+                            super::draft_conf::draft_conf(record, self.gamma, tokens.len())
+                        })
+                        .unwrap_or_default();
                 }
                 return Ok(Some(out));
             }

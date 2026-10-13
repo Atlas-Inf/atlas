@@ -81,6 +81,7 @@ fn qkv_phase_d2d(
     let levers = crate::layers::ops::ModelLevers::defaults();
     let stats = crate::layers::ops::ModelStats::new();
     let fwd = ForwardContext {
+        ssm_batch: None,
         dispatch: &dispatch,
         derived: &derived,
         levers: &levers,
@@ -99,12 +100,14 @@ fn qkv_phase_d2d(
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
     };
+    let positions = vec![1; n];
     let c = MultiSeqCtx::new(
         layer,
         &fwd,
         buffers.hidden_states(),
         buffers.residual(),
         n,
+        &positions,
         16,
         0,
     );

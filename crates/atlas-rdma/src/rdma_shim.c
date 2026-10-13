@@ -248,6 +248,43 @@ int rs_post_write(struct rs_conn *c, void *local_addr, uint32_t lkey,
     return ibv_post_send(c->qp, &wr, &bad);
 }
 
+// Post a WRITE of `len` bytes followed, in the same ibv_post_send, by an 8-byte
+// WRITE of the word at `flag_addr` (same MR, same lkey/rkey) to `flag_remote`.
+// Only the flag is signaled: its completion (tagged `wr_id`) retires both.
+// Without relaxed ordering on the MRs, the responder places same-QP WRITEs in
+// order, so the peer does not observe the flag before the data (a practical
+// NIC property, not an IB-spec guarantee: callers keep it opt-in).
+// Same chaining as b12x RoCEnante's proxy (data WR -> signaled flag WR;
+// github.com/local-inference-lab/b12x b12x/comm/roce/_roce_proxy.c,
+// Apache-2.0; idea only, no code).
+int rs_post_write_flag(struct rs_conn *c, void *local_addr, uint32_t lkey,
+                       uint64_t remote_addr, uint32_t rkey, uint32_t len,
+                       void *flag_addr, uint64_t flag_remote, uint64_t wr_id) {
+    struct ibv_sge sge[2];
+    memset(sge, 0, sizeof(sge));
+    sge[0].addr = (uintptr_t)local_addr;
+    sge[0].length = len;
+    sge[0].lkey = lkey;
+    sge[1].addr = (uintptr_t)flag_addr;
+    sge[1].length = 8;
+    sge[1].lkey = lkey;
+    struct ibv_send_wr wr[2];
+    memset(wr, 0, sizeof(wr));
+    for (int i = 0; i < 2; i++) {
+        wr[i].wr_id = wr_id;
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+        wr[i].opcode = IBV_WR_RDMA_WRITE;
+        wr[i].wr.rdma.rkey = rkey;
+    }
+    wr[0].next = &wr[1];
+    wr[0].wr.rdma.remote_addr = remote_addr;
+    wr[1].wr.rdma.remote_addr = flag_remote;
+    wr[1].send_flags = IBV_SEND_SIGNALED;
+    struct ibv_send_wr *bad = NULL;
+    return ibv_post_send(c->qp, wr, &bad);
+}
+
 // Blocking busy-poll for exactly one completion. On success returns 0 and writes
 // the completed work-request's id to *out_wr_id; on a completion error returns
 // the positive `ibv_wc_status`; on a poll error returns -1.

@@ -26,6 +26,10 @@ impl LogitsProcessor for MidWordThinkEndMask {
         ctx: &LogitsContext,
     ) -> ProcessorOutcome {
         if !ctx.sampling.disable_watchdogs
+            // GLM's native reasoning may finish directly after an answer
+            // token (including a number). This Qwen-specific defer must not
+            // suppress that close; request tools are irrelevant here.
+            && ctx.glm_tool_boundary.is_none()
             && a.inside_thinking
             && let Some(end_tok) = ctx.think_end_token
             && let Some(prev_tok) = a.output_tokens.last().copied()
@@ -44,3 +48,7 @@ impl LogitsProcessor for MidWordThinkEndMask {
         "mid_word_think_end_mask"
     }
 }
+
+#[cfg(test)]
+#[path = "glm_natural_end_tests.rs"]
+mod glm_natural_end_tests;

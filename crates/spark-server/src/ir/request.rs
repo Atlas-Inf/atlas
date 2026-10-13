@@ -27,6 +27,8 @@ pub struct ChatRequest {
     pub sampling: SamplingParams,
     pub max_tokens: usize,
     pub min_tokens: usize,
+    /// vLLM `ignore_eos`: model end tokens are ordinary output tokens.
+    pub ignore_eos: bool,
     /// Stop sequences (generation halts when one is produced).
     pub stop: Vec<String>,
     pub stream: bool,

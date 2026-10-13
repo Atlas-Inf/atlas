@@ -322,6 +322,11 @@ pub(crate) fn resolve_tokenizer_runtime(
             im_start_hard_stop: im_start_id,
             tool_response_hard_stop: tool_response_id,
             max_seq_len: 0,
+            glm_tool_boundary: crate::glm_tool_boundary::native_opener(
+                &config.model_type,
+                true,
+                tokenizer.inner().token_to_id("<tool_call>"),
+            ),
         },
         vocab_masks,
         reasoning_parser_box,

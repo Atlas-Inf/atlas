@@ -34,6 +34,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
             &mut self.replay_input_rings,
             &mut self.gdn_commit_qkv_pools,
             &mut self.gdn_commit_gb_pools,
+            &mut self.kda_record_pools,
         ] {
             views.clear();
         }

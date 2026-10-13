@@ -123,6 +123,11 @@ pub struct ChatCompletionRequest {
     /// 0 = no minimum (default). Useful for preventing empty responses.
     #[serde(default)]
     pub min_tokens: usize,
+    /// vLLM `ignore_eos`: the model's end tokens do not end the response;
+    /// they are ordinary tokens and generation runs to `max_tokens`
+    /// (benchmark harnesses send it with `min_tokens`). `stop` still applies.
+    #[serde(default)]
+    pub ignore_eos: bool,
     /// Seed for deterministic sampling. When set, stochastic sampling uses this
     /// seed for the RNG, producing reproducible output for the same inputs.
     /// None = non-deterministic (default).

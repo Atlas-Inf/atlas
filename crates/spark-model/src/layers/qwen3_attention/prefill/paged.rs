@@ -29,7 +29,8 @@ impl Qwen3AttentionLayer {
         batched_meta: Option<&BatchedAttnMetadata>,
         // First `kv_write_floor` processed tokens skip the paged-cache K/V
         // write (Marconi warm-hit replay over already-cached positions —
-        // see the section-7 comment). 0 on cold prefills.
+        // see the section-7 comment). 0 on cold prefills. Honoured by the
+        // standard path and GLM MLA; the other MLA paths take 0 only.
         kv_write_floor: usize,
         ctx: &ForwardContext,
         stream: u64,
@@ -63,26 +64,33 @@ impl Qwen3AttentionLayer {
 
         // ── MLA 2-step prefill (reference: HuggingFace modeling_mistral4.py) ──
         if let Some(ref mla) = self.mla {
-            let args = super::paged_mla::MlaPrefillArgs {
-                normed,
-                num_tokens,
-                n,
-                h,
-                nq,
-                nkv,
-                hd,
-                seq_len_start,
-                kv_dim,
-                eps,
-                bf16,
-                bs: bs as u32,
-                stream,
-            };
+            let args = self.mla_prefill_args(normed, num_tokens, seq_len_start, bs, ctx, stream);
+            // The V4 and generic MLA paths below write every row. They are
+            // never floored today (no MLA model but GLM replays a snapshot,
+            // and a KV-only hit resumes at the match): fail loudly if one is.
+            anyhow::ensure!(
+                kv_write_floor == 0 || mla.glm_indexer.is_some(),
+                "MLA paged prefill (layer {}) cannot honour a KV write floor of {kv_write_floor}",
+                self.attn_layer_idx
+            );
             // DeepSeek-V4-Flash: o_lora_rank > 0 selects the V4 prefill path
             // (wo_a→wo_b output LoRA, GQA FlashAttention). Non-V4 MLA models
             // (Mistral, DeepSeek-V3) keep o_lora_rank == 0 and fall through.
             if mla.o_lora_rank > 0 {
                 return self.prefill_attention_paged_v4(kv_cache, ctx, &args, seq_len_start);
+            }
+            // GLM-5 uses zero-RoPE MLA. Its cache already stores the
+            // compressed 512-wide latent, so chunk 1+ must absorb Q and read
+            // the complete paged history. The generic MLA prefill below only
+            // attends within the current contiguous chunk.
+            if mla.glm_indexer.is_some() {
+                return self.prefill_attention_paged_glm_dense(
+                    kv_cache,
+                    ctx,
+                    &args,
+                    seq_len_start,
+                    kv_write_floor,
+                );
             }
             return self.prefill_attention_paged_mla(kv_cache, ctx, &args);
         }

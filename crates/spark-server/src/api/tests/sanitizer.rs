@@ -58,6 +58,7 @@ fn a_tag_split_across_chunks_still_matches() {
         first, "abc",
         "only the suffix that could still be a tag prefix is held back"
     );
+    assert_eq!(s.buffered(), "<param");
     assert!(!s.suppressing(), "a partial tag is not yet a leak");
     s.feed("eter=x>body</parameter>tail");
     assert_eq!(s.finish(), "abctail");

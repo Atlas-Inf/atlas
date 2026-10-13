@@ -645,6 +645,19 @@ fn expert_parallelism_partitions_experts_without_dropping_remainder() {
 }
 
 #[test]
+fn expert_tp_makes_every_expert_local_at_a_sliced_width() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.ep_rank = 1;
+    cfg.ep_world_size = 2;
+    cfg.moe_intermediate_size = 2048;
+    assert_eq!(cfg.routed_inter_local(), 2048);
+    cfg.expert_tp = true;
+    assert_eq!(cfg.local_expert_range(), (0, cfg.num_experts));
+    assert!(cfg.is_local_expert(0));
+    assert_eq!(cfg.routed_inter_local(), 1024);
+}
+
+#[test]
 fn test_tensor_parallelism_range() {
     let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
 

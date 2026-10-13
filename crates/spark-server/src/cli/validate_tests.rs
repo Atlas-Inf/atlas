@@ -354,3 +354,23 @@ fn dflash_refuses_the_f16_h_state() {
         "the FP32 h-state has always been DFlash's supported pairing"
     );
 }
+
+#[test]
+fn a_non_rung_batch_width_above_32_is_refused() {
+    // 36 pads to the 48 rung; per-row buffers sized to 36 are overrun (reiner 691).
+    let err = validate_serve_args(&parse(&["--max-batch-size", "36"])).unwrap_err();
+    assert!(
+        err.contains("--max-batch-size 36 is not a decode padding rung"),
+        "{err}"
+    );
+    assert!(
+        err.contains("48"),
+        "the message names the rung to use: {err}"
+    );
+    for ok in ["1", "20", "32", "48", "64", "96", "128"] {
+        assert!(
+            validate_serve_args(&parse(&["--max-batch-size", ok])).is_ok(),
+            "--max-batch-size {ok} must stay valid"
+        );
+    }
+}

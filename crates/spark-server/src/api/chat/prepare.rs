@@ -107,6 +107,7 @@ pub(crate) fn prepare_chat_prompt(
         cwd_hint,
         image_pixels,
         image_pad_counts,
+        vision_placeholders,
     } = msg_entry::build_msg_entries(
         state.vision_config.as_ref(),
         state.vision_max_pixels,
@@ -152,6 +153,7 @@ pub(crate) fn prepare_chat_prompt(
         &req.tools,
         &messages,
         &image_pad_counts,
+        &vision_placeholders,
         enable_thinking,
         thinking_budget,
         reasoning_effort,
@@ -160,6 +162,7 @@ pub(crate) fn prepare_chat_prompt(
         // leaves the Jinja variable undefined (template default).
         req.preserve_thinking.or(state.behavior.preserve_thinking),
         tools_active,
+        req.response_format.is_some(),
     )?;
     if state.chat.phase_timing {
         let us_template = _t_phase.elapsed().as_micros() - us_msg_entry - us_thinking;

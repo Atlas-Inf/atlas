@@ -93,6 +93,7 @@ pub(super) async fn dispatch_streaming(
         image_pixels,
         max_tokens,
         req.min_tokens,
+        req.ignore_eos,
         temperature,
         top_k,
         top_p,

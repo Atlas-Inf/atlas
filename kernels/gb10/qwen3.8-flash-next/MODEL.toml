@@ -271,6 +271,9 @@ moe_w4a16_fused_gate_up_t_k64_e8m0 = "Same E8M0 family — NVFP4 target uses the
 moe_w4a16_fused_gate_up_t_k64_m128 = """
 M=128 Block-D variant shipped only in minimax-m2-229b's shadow (per the
 dispatch comment in moe/init.rs). Dispatch falls through to M=64."""
+moe_w4a16_grouped_gemm_ptrtable_t_k64_m32 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; M=32 tile for draft-verify batches. The resolved ptrtable_t_k64 serves it."
+moe_w4a4_grouped_gemm_prequant_t_k64 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4 (pre-quantized W4A4 grouped GEMM). This target runs the W4A16 grouped arm."
+moe_w4a4_grouped_gemm_prequant_t_k64_vecscale = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; vector-scale twin of the line above."
 
 # ⚠ HONESTY NOTE on the four gated_delta_rule f16 arms: unlike every
 # entry above, the FP16-h-state decode arms dispatch these handles
@@ -443,3 +446,48 @@ max_thinking_budget = 2048
 # (onset ~token 104 on filler prompts, exonerated from QSA by position).
 cap_thinking_at_max_tokens = true
 enable_loop_watchdog = true
+
+# Optional probes added to the shared MoE / attention / router init by the
+# SparkGLM GLM-5.3-Flash series (Enntity/atlas upstream/glm53-flash-*). Every
+# one is compiled only in kernels/gb10/glm-5.3-flash/nvfp4 and resolves to
+# handle 0 here, which selects the pre-series path this target always ran.
+[expected_absent.moe]
+moe_unpermute_reduce_indexed_ep = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; EP prefill sparse reduce. A null handle keeps the dense EP reduce."
+
+[expected_absent.gemm]
+dense_gemm_bf16_router_m5 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; M=5 router GEMM for verify batches. Router falls back to the generic BF16 GEMM."
+dense_gemm_bf16_router_rows = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; row-tiled router GEMM. Same fallback."
+
+[expected_absent.dense_gemv_bf16_batchm]
+dense_gemv_bf16_batch5 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; batch-5 exact BF16 GEMV for verify. The per-row GEMV serves it."
+
+[expected_absent.w4a16_gemv]
+w4a16_gemv_batch5_dual = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; dual-output batch-5 W4A16 GEMV. Batch-3/2 and single-row arms resolve."
+
+[expected_absent.hyper_connection]
+hc_contract = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4's Sinkhorn mHC (DeepSeek-V4 style). This model's low-rank mHC uses its own hyper_connection.cu symbols."
+hc_post_moe_blend = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4's Sinkhorn mHC fusion. Not this model's mHC."
+hc_pre_from_raw_mix = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4's Sinkhorn mHC fusion. Not this model's mHC."
+
+[expected_absent.mxfp8_gemv]
+mxfp8_gemv_tc8 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 attention-projection twins (ATLAS_GLM_MLA_MXFP8, lossy opt-in). Not used here."
+mxfp8_gemv_tc16 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 twin. Not used here."
+mxfp8_gemv_tc32 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 twin. Not used here."
+mxfp8_gemv_tc8_grouped = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 grouped twin. Not used here."
+mxfp8_gemv_tc16_grouped = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 grouped twin. Not used here."
+mxfp8_quantize_bf16 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 weight quantizer for the twins above. Not used here."
+
+[expected_absent.moe_nvfp4_mmq]
+atlas_moe_nvfp4_mmq64_gate_up = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; W4A4 MMQ MoE prefill tier. This target runs the W4A16 grouped GEMM."
+atlas_moe_nvfp4_mmq64_down = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; same MMQ tier."
+atlas_moe_nvfp4_quantize_bf16 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; same MMQ tier."
+atlas_moe_nvfp4_repack_batched = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; same MMQ tier."
+atlas_moe_nvfp4_scale2_rows = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; same MMQ tier."
+atlas_moe_nvfp4_silu_scale2 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; same MMQ tier."
+
+[expected_absent.moe_shared_expert_fused_mmq]
+moe_expert_gate_up_shared_mmq = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; shared expert fused into the MMQ tier. The separate shared-expert path serves it."
+moe_expert_silu_down_shared_mmq = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; same."
+
+[expected_absent.moe_silu_mul]
+silu_mul_quant_nvfp4 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; fused SiLU-mul + NVFP4 quantize for the W4A4 MMQ tier. Not used by the W4A16 arm."

@@ -203,6 +203,14 @@ impl TransformerModel {
             self.lm_head_batched(normed, 1, dst, stream)?;
             dst
         };
+        if !self.use_fp32_logits {
+            // ATLAS_GLM_DET_TRACE: the last prompt position's BF16 logits.
+            let (det, row) = (
+                crate::det_trace::on_stream(self.gpu.as_ref(), stream),
+                (proc_count - 1, 1),
+            );
+            det.tap("logits", logits_ptr, row, self.config.vocab_size * 2);
+        }
 
         // Per-layer divergence dump: full logits vector + top-10 token IDs.
         if let Ok(dir) = std::env::var("ATLAS_NEMO_DUMP")
@@ -266,11 +274,13 @@ impl TransformerModel {
         // complete block past it (e.g. left stale by the `proc_count == 1`
         // last-chunk decode shortcut) is excluded so a future turn never reads
         // donor/zeroed V from it. When the whole prompt's complete blocks are
-        // valid we keep the full token range (preserving the partial-suffix
-        // sub-block TTFT optimization); otherwise we truncate to the
-        // block-aligned valid prefix AND drop the SSM snapshot attach (the
-        // snapshot, keyed at full prompt length, would be unreachable through
-        // the shortened tree and would only orphan a pool slot).
+        // valid we keep the full token range, which keys the leaf snapshot;
+        // the insert publishes its complete blocks only, never the partly
+        // filled frontier block this sequence goes on to decode into.
+        // Otherwise we truncate to the block-aligned valid prefix AND drop the
+        // SSM snapshot attach (the snapshot, keyed at full prompt length,
+        // would be unreachable through the shortened tree and would only
+        // orphan a pool slot).
         let full_blocks = tokens.len() / bs;
         let valid_blocks = seq.kv_valid_tokens / bs;
         let cache_blocks = full_blocks.min(valid_blocks);
@@ -317,7 +327,9 @@ impl TransformerModel {
                 );
                 super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
             }
-        } else if self.ssm_snapshots.is_enabled() {
+        } else if self.ssm_snapshots.is_enabled()
+            && !crate::model::mtp_carry::marconi_prefill_only()
+        {
             if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
                 self.ssm_pool.debug_state_checksum(
                     seq.slot_idx,

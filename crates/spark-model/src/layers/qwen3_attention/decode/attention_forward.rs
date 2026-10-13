@@ -622,19 +622,30 @@ impl Qwen3AttentionLayer {
             // sits at position `seq_len` — verified live: a 35-token
             // prompt's first decode arrives with seq_len=35 and 35 raw
             // keys already ingested by prefill.
-            let qsa_st =
-                crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
-            qsa.decode_select(
-                qsa_st,
-                normed,
-                seq_len,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
-                meta.block_table,
-                bs as u32,
-                ctx.gpu,
-                stream,
-            )?
+            if crate::layers::qsa::staged_ingest() {
+                // Inside a staged run (`qsa_staged.rs`, inert steps only):
+                // the projection here, the rest of the ingest after the run.
+                anyhow::ensure!(
+                    !qsa.is_active_at(seq_len),
+                    "QSA staged ingest at active pos {seq_len}"
+                );
+                qsa.stage_row(normed, 0, ctx.gpu, stream)?;
+                None
+            } else {
+                let qsa_st =
+                    crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
+                qsa.decode_select(
+                    qsa_st,
+                    normed,
+                    seq_len,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    meta.block_table,
+                    bs as u32,
+                    ctx.gpu,
+                    stream,
+                )?
+            }
         } else {
             None
         };

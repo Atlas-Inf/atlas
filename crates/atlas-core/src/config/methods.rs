@@ -127,7 +127,7 @@ impl ModelConfig {
     /// Range of expert indices local to this EP rank.
     /// Returns (start, end) where start is inclusive and end is exclusive.
     pub fn local_expert_range(&self) -> (usize, usize) {
-        if self.ep_world_size <= 1 {
+        if self.ep_world_size <= 1 || self.expert_tp {
             return (0, self.num_experts);
         }
         let per_rank = self.num_experts / self.ep_world_size;
@@ -138,6 +138,16 @@ impl ModelConfig {
             start + per_rank
         };
         (start, end)
+    }
+
+    /// Routed-expert intermediate width held by this rank: the full
+    /// `moe_intermediate_size`, or its EP-rank slice under expert TP.
+    pub fn routed_inter_local(&self) -> usize {
+        if self.expert_tp {
+            self.moe_intermediate_size / self.ep_world_size
+        } else {
+            self.moe_intermediate_size
+        }
     }
 
     /// Whether the given expert ID is local to this EP rank.
@@ -170,6 +180,28 @@ impl ModelConfig {
             return total;
         }
         total / self.tp_world_size
+    }
+
+    /// This config as one rank running the whole model alone: the head counts
+    /// the TP split divided (`resolve_topology` in spark-server) restored to
+    /// full width, and no TP or EP split. For a module one rank holds in full
+    /// and runs without collectives (the qwen4_exp MTP head on rank 0), so its
+    /// loaders take every weight unsliced and its kernels run every head.
+    /// A single-rank config comes back unchanged.
+    pub fn tp1_view(&self) -> Self {
+        let tp = self.tp_world_size.max(1);
+        Self {
+            num_attention_heads: self.num_attention_heads * tp,
+            num_key_value_heads: self.num_key_value_heads * tp,
+            linear_num_key_heads: self.linear_num_key_heads * tp,
+            linear_num_value_heads: self.linear_num_value_heads * tp,
+            tp_rank: 0,
+            tp_world_size: self.tp_world_size.min(1),
+            ep_rank: 0,
+            ep_world_size: self.ep_world_size.min(1),
+            expert_tp: false,
+            ..self.clone()
+        }
     }
 
     /// Weight key prefix for layer-level weights.
@@ -430,6 +462,41 @@ mod tests {
 
         config.model_type = "deepseek_v4".to_string();
         assert!(!config.final_norm_is_identity());
+    }
+
+    /// A TP=EP=2 rank's view restores the full head counts and drops the
+    /// split; a single-rank config is its own view.
+    #[test]
+    fn tp1_view_undoes_the_tp_head_split() {
+        let full = ModelConfig::qwen3_next_80b_nvfp4();
+        let mut rank1 = full.clone();
+        rank1.num_attention_heads /= 2;
+        rank1.num_key_value_heads /= 2;
+        rank1.linear_num_key_heads /= 2;
+        rank1.linear_num_value_heads /= 2;
+        (rank1.tp_rank, rank1.tp_world_size) = (1, 2);
+        (rank1.ep_rank, rank1.ep_world_size) = (1, 2);
+        let view = rank1.tp1_view();
+        let heads = |c: &ModelConfig| {
+            (
+                c.num_attention_heads,
+                c.num_key_value_heads,
+                c.linear_num_key_heads,
+                c.linear_num_value_heads,
+            )
+        };
+        assert_eq!(heads(&view), heads(&full));
+        assert_eq!((view.tp_rank, view.tp_world_size), (0, 1));
+        assert_eq!((view.ep_rank, view.ep_world_size), (0, 1));
+        assert_eq!(view.local_expert_range(), (0, full.num_experts));
+
+        for world in [0, 1] {
+            let mut single = full.clone();
+            (single.tp_world_size, single.ep_world_size) = (world, world);
+            let view = single.tp1_view();
+            assert_eq!(heads(&view), heads(&single));
+            assert_eq!((view.tp_world_size, view.ep_world_size), (world, world));
+        }
     }
 
     #[test]

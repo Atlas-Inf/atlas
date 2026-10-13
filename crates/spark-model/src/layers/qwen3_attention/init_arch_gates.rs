@@ -43,6 +43,9 @@ pub(super) struct ArchProbes {
     /// superset of the per-layer overrides and can never gate a live path off.
     /// MLA carries its own >256 shapes (576-dim compressed KV), hence the or.
     pub wide_head_dim: bool,
+    /// GLM-5.3's four-token semantic-index pool. Unlike generic MLA, this is
+    /// declared directly by the checkpoint config and has dedicated kernels.
+    pub glm_kpool_indexer: bool,
 }
 
 impl ArchProbes {
@@ -52,6 +55,9 @@ impl ArchProbes {
             hyper_connection: config.hc_mult > 0,
             compressed_attn: config.compress_ratios.iter().any(|&r| r > 0),
             wide_head_dim: config.head_dim > 256 || config.kv_lora_rank > 0,
+            glm_kpool_indexer: config.model_type == "glm5_next"
+                && config.index_kpool > 1
+                && config.index_head_dim > 0,
         }
     }
 }
@@ -88,6 +94,7 @@ mod tests {
         assert!(!p.hyper_connection);
         assert!(!p.compressed_attn);
         assert!(!p.wide_head_dim);
+        assert!(!p.glm_kpool_indexer);
     }
 
     /// DeepSeek-V4: latent KV, hyper-connections, compressed attention, and
@@ -104,6 +111,7 @@ mod tests {
         assert!(p.hyper_connection);
         assert!(p.compressed_attn);
         assert!(p.wide_head_dim, "MLA carries its own >256 shapes");
+        assert!(!p.glm_kpool_indexer);
     }
 
     /// Gemma-4 sizes buffers from the MAX per-layer head_dim, so the config
@@ -123,5 +131,14 @@ mod tests {
         let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
         cfg.compress_ratios = vec![0, 0, 0];
         assert!(!ArchProbes::from_config(&cfg).compressed_attn);
+    }
+
+    #[test]
+    fn glm5_declares_its_pooled_semantic_index() {
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        cfg.model_type = "glm5_next".into();
+        cfg.index_kpool = 4;
+        cfg.index_head_dim = 128;
+        assert!(ArchProbes::from_config(&cfg).glm_kpool_indexer);
     }
 }

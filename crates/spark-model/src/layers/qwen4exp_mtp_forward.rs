@@ -7,7 +7,8 @@
 use super::*;
 
 impl Qwen4ExpMtpHead {
-    /// One draft step. Returns the drafted token id.
+    /// One draft step. Returns the drafted token id and, when `want_conf`,
+    /// the draft head's softmax probability of it (over the draft rows).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_one(
         &self,
@@ -17,7 +18,8 @@ impl Qwen4ExpMtpHead {
         ctx: &ForwardContext,
         stream: u64,
         grammar_bitmask: Option<&[i32]>,
-    ) -> Result<u32> {
+        want_conf: bool,
+    ) -> Result<(u32, Option<f32>)> {
         let h = ctx.config.hidden_size;
         let hc = ctx.config.hc_mult.max(1);
         let eps = ctx.config.rms_norm_eps as f32;
@@ -147,17 +149,20 @@ impl Qwen4ExpMtpHead {
         }
 
         let mtp_ctx = ForwardContext {
+            ssm_batch: None,
             buffers: ctx.buffers,
             gpu: ctx.gpu,
-            config: ctx.config,
+            // The body's own config, never the trunk's: under TP the trunk's
+            // is this rank's head share, the body holds every head.
+            config: &self.module.config,
             dispatch: ctx.dispatch,
             derived: ctx.derived,
             levers: ctx.levers,
             stats: ctx.stats,
             attn_metadata: Some(mtp_meta),
             profile: ctx.profile,
-            // Rank 0 only: the body holds ALL experts locally, so its MoE must
-            // not issue an EP all-reduce no other rank will join.
+            // Rank 0 only: the body holds ALL heads and experts locally, so
+            // it must not issue a TP or EP all-reduce no other rank will join.
             comm: None,
             // Host-built metadata + the H2D uploads above are illegal under
             // graph capture.
@@ -220,33 +225,62 @@ impl Qwen4ExpMtpHead {
 
         // ── 6. Shared LM head. No separate final norm: the mixer's `hc_norm`
         //       IS it, which is why the checkpoint ships no `mtp.norm.weight`. ──
-        let v = if self.mtp_vocab_size > 0 {
-            self.mtp_vocab_size.min(ctx.config.vocab_size as u32)
-        } else {
-            ctx.config.vocab_size as u32
-        };
         let logits = ctx.buffers.logits();
-        ops::dense_gemv(
-            ctx.gpu,
-            self.dense_gemv_k,
-            self.h_out,
-            &self.lm_head,
-            logits,
-            v,
-            h as u32,
-            stream,
-        )?;
-
-        let token_id = if let Some(bitmask) = grammar_bitmask {
-            crate::layers::argmax_grammar_masked(ctx.gpu, logits, v as usize, bitmask, position)?
+        let (token_id, conf) = if let Some(bitmask) = grammar_bitmask {
+            // The grammar mask indexes full-vocabulary ids: the `--mtp-vocab`
+            // prefix of the shared head, never a gathered draft list.
+            let v = if self.mtp_vocab_size > 0 {
+                self.mtp_vocab_size.min(ctx.config.vocab_size as u32)
+            } else {
+                ctx.config.vocab_size as u32
+            };
+            ops::dense_gemv(
+                ctx.gpu,
+                self.dense_gemv_k,
+                self.h_out,
+                &self.lm_head,
+                logits,
+                v,
+                h as u32,
+                stream,
+            )?;
+            let id = crate::layers::argmax_grammar_masked(
+                ctx.gpu, logits, v as usize, bitmask, position,
+            )?;
+            (id, None)
         } else {
-            ops::argmax_bf16(ctx.gpu, self.argmax_k, logits, self.argmax_out, v, stream)?;
+            // The draft head (`qwen4exp_draft_head.rs`): a prefix, a gathered
+            // id list, optionally NVFP4. Its row index maps back to the id.
+            let rows = self.draft.rows();
+            self.draft.project(
+                ctx.gpu,
+                self.dense_gemv_k,
+                self.h_out,
+                logits,
+                h as u32,
+                stream,
+            )?;
+            ops::argmax_bf16(
+                ctx.gpu,
+                self.argmax_k,
+                logits,
+                self.argmax_out,
+                rows,
+                stream,
+            )?;
             let mut buf = [0u8; 4];
             ctx.gpu.copy_d2h(self.argmax_out, &mut buf)?;
-            u32::from_le_bytes(buf)
+            let conf = if want_conf {
+                let mut row = vec![0u8; rows as usize * 2];
+                ctx.gpu.copy_d2h(logits, &mut row)?;
+                Some(crate::layers::qwen4exp_draft_head::top1_prob_bf16(&row))
+            } else {
+                None
+            };
+            (self.draft.token(u32::from_le_bytes(buf)), conf)
         };
 
         state.seq_len += 1;
-        Ok(token_id)
+        Ok((token_id, conf))
     }
 }

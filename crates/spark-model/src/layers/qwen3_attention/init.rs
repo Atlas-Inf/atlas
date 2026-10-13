@@ -11,6 +11,7 @@ use spark_runtime::kv_cache::KvCacheDtype;
 // function pointer: coercing a `#[track_caller]` fn to a pointer inserts a shim
 // and the audit would name the shim instead of the dispatch site below.
 use super::init_arch_gates::{ArchProbes, gated as gate};
+use super::init_glm::{GlmIndexSelection, paged_decode_mla};
 use super::types::{HeadGateActivation, Qwen3AttentionLayer};
 use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
@@ -95,8 +96,15 @@ impl Qwen3AttentionLayer {
         fp8_calibration_tokens: usize,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<Self> {
+        let hc_name = |base: &str| crate::layers::ops::hc_kernel_name(&config.model_type, base);
+        let independent = crate::model::glm_independent::enabled(&config.model_type)?;
         let (reshape_mod, reshape_fn, decode_mod, decode_fn) =
             super::init_kernel_dispatch::kernel_modules_for_dtype(kv_dtype, config.head_dim);
+        let mla_decode_mod = super::init_kernel_dispatch::mla_bf16_module(
+            &config.model_type,
+            config.kv_lora_rank,
+            config.qk_rope_head_dim,
+        )?;
         // Which cross-architecture kernel families this config says exist. A
         // family the model does not have is never LOOKED UP, so it leaves no
         // failed row in the boot audit. See `init_arch_gates`.
@@ -107,12 +115,24 @@ impl Qwen3AttentionLayer {
         // model that ships no per-head Q/K norms (Nemotron-H). Compute it
         // before `attn` moves into the struct literal.
         let has_per_head_qk_norm = !attn.q_norm.weight.is_null() || !attn.k_norm.weight.is_null();
-        Ok(Self {
+        let GlmIndexSelection {
+            glm_sparse_attn_heads_per_cta,
+            glm_sparse_attn_fn,
+            glm_index_logits_rows_per_cta,
+            glm_index_logits_pools_per_cta,
+            glm_index_wmma,
+            glm_sparse_graphs,
+            glm_index_logits_fn,
+        } = GlmIndexSelection::from_config(config, &probes)?;
+        // Short gate flags so each GLM/hyper-connection lookup stays one line.
+        let (glm, hc) = (probes.glm_kpool_indexer, probes.hyper_connection);
+        let layer = Self {
             input_norm,
             attn,
             post_attn_norm,
             ffn,
             attn_layer_idx,
+            block_idx: attn_layer_idx,
             lora: None,
             gated,
             mrope_interleaved,
@@ -158,6 +178,8 @@ impl Qwen3AttentionLayer {
             o_weight: None,
             o_dense_bf16: None,
             mla: None,
+            mla_mx: Vec::new(),
+            mla_q4: Vec::new(),
             // ── DeepSeek-V4 Manifold-Constrained Hyper-Connections (mHC) ──
             // `hc` stays None for non-V4 models; the V4 loader attaches real
             // HcWeights after this constructor. Kernel handles are lazy (null
@@ -165,15 +187,19 @@ impl Qwen3AttentionLayer {
             // still start cleanly.
             hc: None,
             qsa: None,
-            hc_pre_k: gate(probes.hyper_connection, gpu, "hyper_connection", "hc_pre"),
-            hc_post_k: gate(probes.hyper_connection, gpu, "hyper_connection", "hc_post"),
-            hc_expand_k: gate(
-                probes.hyper_connection,
+            hc_pre_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_pre")),
+            hc_pre_from_raw_mix_k: gate(
+                hc,
                 gpu,
                 "hyper_connection",
-                "hc_expand",
+                &hc_name("hc_pre_from_raw_mix"),
             ),
-            hc_head_k: gate(probes.hyper_connection, gpu, "hyper_connection", "hc_head"),
+            hc_pre_mix_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_pre_mix")),
+            hc_post_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_post")),
+            hc_post_moe_blend_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_post_moe_blend")),
+            hc_expand_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_expand")),
+            hc_head_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_head")),
+            hc_contract_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_contract")),
             qkv_nvfp4_t: None,
             q_nvfp4_t: None,
             k_nvfp4_t: None,
@@ -215,7 +241,12 @@ impl Qwen3AttentionLayer {
             ),
             rms_norm_k: gpu.kernel("norm", "rms_norm")?,
             rms_norm_w_k: if crate::ships_vanilla_norm_weights(config) {
-                gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?
+                crate::layers::ops::glm_decode_fuse::twin(
+                    gpu,
+                    crate::layers::ops::glm_decode_fuse::RMS_NORM,
+                    gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
+                    ("glm_rms_norm_regs", "rms_norm_vanilla_regs"),
+                )?
             } else {
                 gpu.kernel("norm", "rms_norm")?
             },
@@ -259,6 +290,11 @@ impl Qwen3AttentionLayer {
             dense_gemv_batchm_k: gpu
                 .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
                 .unwrap_or(KernelHandle(0)),
+            dense_gemv_batch5_k: super::super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batch5",
+            ),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
@@ -329,6 +365,21 @@ impl Qwen3AttentionLayer {
             ),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
+            glm_latent_dequant_k: if kv_dtype == KvCacheDtype::Fp8G128 {
+                gpu.kernel("reshape_and_cache", "glm_latent_dequant_fp8g128")?
+            } else {
+                KernelHandle(0)
+            },
+            glm_index_fill_causal_dev_k: if kv_dtype == KvCacheDtype::Fp8G128 {
+                gpu.kernel("glm_indexer", "glm_index_fill_causal_dev")?
+            } else {
+                KernelHandle(0)
+            },
+            glm_latent_qdq_k: if std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1") {
+                gpu.kernel("reshape_and_cache", "glm_latent_qdq_fp8g128")?
+            } else {
+                KernelHandle(0)
+            },
             fused_k_norm_rope_cache_write_bf16_k: super::super::try_kernel(
                 gpu,
                 "fused_k_norm_rope_cache",
@@ -387,6 +438,8 @@ impl Qwen3AttentionLayer {
                     "paged_decode_turbo4_512",
                     "paged_decode_attn_turbo4",
                 ),
+                // The GLM latent is read by its chunk path, never this one.
+                KvCacheDtype::Fp8G128 => KernelHandle(0),
                 _ => gate(
                     probes.wide_head_dim,
                     gpu,
@@ -394,7 +447,7 @@ impl Qwen3AttentionLayer {
                     "paged_decode_attn_fp8",
                 ),
             },
-            paged_decode_mla_k: gate(probes.mla, gpu, "paged_decode_mla", "paged_decode_attn"),
+            paged_decode_mla_k: paged_decode_mla(&probes, gpu, config, mla_decode_mod)?,
             // DeepSeek-V4-Flash MLA paged decode (compressed 576-dim KV cache).
             mla_paged_decode_k: gate(
                 probes.mla,
@@ -409,6 +462,33 @@ impl Qwen3AttentionLayer {
                 "mla_paged_decode_fp8",
             ),
             mla_batched_gemv_k: gate(probes.mla, gpu, "mla_absorbed", "mla_batched_gemv"),
+            mla_batched_gemv_batch2_k: gate(glm, gpu, "mla_absorbed", "mla_batched_gemv_batch2"),
+            mla_batched_gemv_batch3_k: gate(glm, gpu, "mla_absorbed", "mla_batched_gemv_batch3"),
+            mla_batched_gemv_batch4_k: gate(glm, gpu, "mla_absorbed", "mla_batched_gemv_batch4"),
+            mla_batched_gemv_batch5_k: gate(
+                probes.mla,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch5",
+            ),
+            mla_batched_gemv_batch6_k: gate(
+                independent,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch6",
+            ),
+            mla_batched_gemv_batch7_k: gate(
+                independent,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch7",
+            ),
+            mla_batched_gemv_batch8_k: gate(
+                independent,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch8",
+            ),
             mla_q_rope_scatter_k: gate(probes.mla, gpu, "mla_absorbed", "mla_q_rope_scatter"),
             mla_q_rope_writeback_k: gate(probes.mla, gpu, "mla_absorbed", "mla_q_rope_writeback"),
             mla_cache_assemble_k: gate(probes.mla, gpu, "mla_absorbed", "mla_cache_assemble"),
@@ -443,6 +523,50 @@ impl Qwen3AttentionLayer {
                 "mla_prefill_attn_320",
             ),
             grouped_gemm_mla_k: gate(probes.mla, gpu, "grouped_gemm_mla", "grouped_gemm_mla"),
+            glm_index_layernorm_k: gate(glm, gpu, "glm_indexer", "glm_index_layernorm_bf16"),
+            glm_index_tail_write_k: gate(glm, gpu, "glm_indexer", "glm_index_tail_write_bf16"),
+            glm_index_kpool_finalize_k: gate(
+                glm,
+                gpu,
+                "glm_indexer",
+                "glm_index_kpool_finalize_bf16",
+            ),
+            glm_index_fill_causal_k: gate(glm, gpu, "glm_indexer", "glm_index_fill_causal"),
+            glm_index_logits_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                if glm_index_wmma {
+                    "glm_indexer_wmma"
+                } else {
+                    "glm_indexer"
+                },
+                glm_index_logits_fn,
+            ),
+            glm_index_logits_rows_per_cta,
+            glm_index_logits_pools_per_cta,
+            glm_index_logits_decode_k: gate(glm, gpu, "glm_indexer", "glm_index_logits_bf16"),
+            glm_index_topk_expand_k: gate(glm, gpu, "glm_indexer", "glm_index_topk_expand"),
+            glm_sparse_attn_k: gate(glm, gpu, "glm_indexer", glm_sparse_attn_fn),
+            glm_sparse_attn_heads_per_cta,
+            glm_sparse_attn_decode_k: gate(glm, gpu, "glm_indexer", "glm_sparse_mla_prefill_bf16"),
+            glm_index_logits_dynamic_k: gate(
+                glm_sparse_graphs,
+                gpu,
+                "glm_indexer",
+                "glm_index_logits_bf16_dynamic",
+            ),
+            glm_index_topk_dynamic_k: gate(
+                glm_sparse_graphs,
+                gpu,
+                "glm_indexer",
+                "glm_index_topk_expand_dynamic",
+            ),
+            glm_sparse_attn_dynamic_k: gate(
+                glm_sparse_graphs,
+                gpu,
+                "glm_indexer",
+                "glm_sparse_mla_prefill_bf16_dynamic",
+            ),
             mla_q_final_assemble_k: gate(
                 probes.mla,
                 gpu,
@@ -461,6 +585,11 @@ impl Qwen3AttentionLayer {
                 "dense_gemm_splitk_reduce",
             ),
             dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
+            mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
+                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
+            mxfp8_gemv_grouped_k: ["mxfp8_gemv_tc8_grouped", "mxfp8_gemv_tc16_grouped"]
+                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
+            mxfp8_quantize_k: super::super::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
             paged_decode_splitk_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_splitk_nvfp4")?)
@@ -519,6 +648,11 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_qg_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg_batch3")?,
             w4a16_gemv_dual_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            w4a16_gemv_qg_batch4_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_qg_batch4",
+            ),
             w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu),
             w4a16_gemv_batch16_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
             // `w4a16_gemv_dp4a` exists only in kernels/strix-hip/common —
@@ -761,6 +895,10 @@ impl Qwen3AttentionLayer {
             } else {
                 None
             },
-        })
+        };
+        if independent {
+            layer.validate_independent_kernels()?;
+        }
+        Ok(layer)
     }
 }

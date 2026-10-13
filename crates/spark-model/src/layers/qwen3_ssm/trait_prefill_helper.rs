@@ -36,6 +36,11 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Sequence-parallel prefill (`layers::glm_sp`, qwen4_exp): a
+        // reduce-scatter into this rank's rows, at `sp.local(out_proj_buf)`.
+        if let Some(sp) = crate::layers::glm_sp::current().filter(|sp| sp.total() == num_tokens) {
+            return sp.reduce_scatter(out_proj_buf, ctx.config.hidden_size, ctx, stream);
+        }
         if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
@@ -97,6 +102,7 @@ impl Qwen3SsmLayer {
                 stream,
             )
         } else if ctx.dispatch.cutlass_nvfp4_ssm_out
+            && !self.fp8w_decode_only
             && let Some(ref fp8w) = self.out_proj_fp8w
         {
             ops::log_cutlass_nvfp4_route(ctx.gpu, "ssm_out_fp8pack", k, h as u32, value_dim as u32);

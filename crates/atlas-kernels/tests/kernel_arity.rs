@@ -124,8 +124,9 @@ fn w4a16_launch_family_arity_pins() {
 
 /// The DFlash2 on-device candidate selector is a standalone common kernel,
 /// not a member of the w4a16 launch family above, so it gets its own pin:
-/// the launcher in `layers/ops/sampling.rs` passes ten args (the tenth is
-/// `top_k`). Update launcher and pin in the same commit. The source-level
+/// the launcher in `layers/ops/sampling.rs` passes sixteen args (device
+/// anchor and ban-depth pointers, `top_k` eleventh, four end ids, scratch). Update
+/// launcher and pin in the same commit. The source-level
 /// signature pin in spark-model's `dflash2_selector_bounds.rs` covers stub
 /// builds where no PTX exists.
 #[test]
@@ -146,9 +147,9 @@ fn dflash2_candidate_selector_arity_pin() {
             };
             if let Some(count) = ptx_param_count(ptx, "dflash2_candidate_selector") {
                 assert_eq!(
-                    count, 10,
+                    count, 16,
                     "PTX arity drift: {module}::dflash2_candidate_selector on target \
-                     {} has {count} params, pin expects 10 — update the launcher AND \
+                     {} has {count} params, pin expects 16 — update the launcher AND \
                      this pin together",
                     set.target.model
                 );

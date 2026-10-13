@@ -141,6 +141,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             },
             max_tokens,
             min_tokens: req.min_tokens,
+            ignore_eos: req.ignore_eos,
             temperature,
             top_k,
             top_p,
@@ -181,8 +182,15 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         let response = match rx.await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
+                // A request the scheduler cannot serve as asked is the
+                // client's to fix: 400, which SDKs do not retry.
+                let status = if e.is::<super::InvalidRequestError>() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
                 return super::chat::ChatOutcome::Http(openai_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    status,
                     format!("Inference error: {e}"),
                 ));
             }
@@ -208,7 +216,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         total_cached_prompt_tokens = total_cached_prompt_tokens.max(response.cached_prompt_tokens);
 
         let (reasoning_content_i, output_text_i) =
-            decode_response_text(&state, &response, enable_thinking);
+            decode_response_text(&state, &response, enable_thinking, tools_active);
         let (output_text_i, matched_stop) =
             super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
 
@@ -251,41 +259,62 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
 /// init in chat_stream/state.rs and recovers the answer Qwen3.x emits
 /// inside `<think>...</think>` when it ignores a closed-thinking
 /// prefill (issue #40).
-fn decode_response_text(
+pub(super) fn decode_response_text(
     state: &AppState,
     response: &super::inference_types::InferenceResponse,
     enable_thinking: bool,
+    tools_active: bool,
 ) -> (Option<String>, String) {
     let output_tokens =
         output_tokens_without_stop(&response.output_tokens, response.finish_reason.as_str());
-    if let Some(think_tok) = state.think_end_token_id {
-        if let Some((thinking_tokens, content_tokens)) =
-            split_at_first_think_end(output_tokens, think_tok, enable_thinking)
-        {
-            let reasoning = if !thinking_tokens.is_empty() {
-                state
-                    .tokenizer
-                    .decode(thinking_tokens)
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            } else {
+    // GLM's native tool opener also closes reasoning, but belongs to the tool
+    // parser. Prefer the FIRST boundary; a later </think> must not swallow the
+    // tool call. This never scans arbitrary reasoning text for call syntax.
+    let native_split = if enable_thinking && tools_active {
+        state.glm_tool_boundary.and_then(|opener| {
+            let pos = output_tokens.iter().position(|&token| token == opener)?;
+            if output_tokens[..pos]
+                .iter()
+                .any(|token| Some(*token) == state.think_end_token_id)
+            {
                 None
-            };
-            // The split consumes only the FIRST close. Laguna emits the close
-            // more than once (observed: [19, answer, 19, answer] for a question
-            // it declines to reason about), so scrub any survivor — the
-            // streaming path has always done this, the blocking path did not,
-            // which is why stream:false leaked '</think>' into content while
-            // stream:true did not.
-            let content = super::strip::scrub_think_markers(
-                state
-                    .tokenizer
-                    .decode(content_tokens)
-                    .unwrap_or_default()
-                    .trim_start(),
-            );
-            return (reasoning, content);
-        }
+            } else {
+                Some((&output_tokens[..pos], &output_tokens[pos..]))
+            }
+        })
+    } else {
+        None
+    };
+    if let Some((thinking_tokens, content_tokens)) = native_split.or_else(|| {
+        state.think_end_token_id.and_then(|think_tok| {
+            split_at_first_think_end(output_tokens, think_tok, enable_thinking)
+        })
+    }) {
+        let reasoning = if !thinking_tokens.is_empty() {
+            state
+                .tokenizer
+                .decode(thinking_tokens)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
+        // The split consumes only the FIRST close. Laguna emits the close
+        // more than once (observed: [19, answer, 19, answer] for a question
+        // it declines to reason about), so scrub any survivor — the
+        // streaming path has always done this, the blocking path did not,
+        // which is why stream:false leaked '</think>' into content while
+        // stream:true did not.
+        let content = super::strip::scrub_think_markers(
+            state
+                .tokenizer
+                .decode(content_tokens)
+                .unwrap_or_default()
+                .trim_start(),
+        );
+        return (reasoning, content);
+    }
+    if state.think_end_token_id.is_some() {
         // Fallback: the exact close TOKEN was not found. That does not mean
         // the model never closed — it routinely spells the close as ordinary
         // BPE tokens instead of id 19, because the scheduler masks id 19:

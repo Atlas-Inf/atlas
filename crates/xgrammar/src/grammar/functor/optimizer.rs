@@ -227,7 +227,7 @@ impl GrammarMutator for DeadCodeEliminator {
 }
 #[path = "optimizer_pipeline.rs"]
 mod optimizer_pipeline;
-pub use optimizer_pipeline::{GrammarOptimizer, RepetitionNormalizer};
+pub use optimizer_pipeline::{GrammarOptimizer, RepetitionNormalizer, check_fsm_limits};
 
 #[cfg(test)]
 #[path = "optimizer_tests.rs"]

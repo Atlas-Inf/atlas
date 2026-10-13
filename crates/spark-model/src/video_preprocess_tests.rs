@@ -17,6 +17,8 @@ fn no_ffmpeg() -> FfmpegPolicy {
 
 fn cfg() -> VisionConfig {
     VisionConfig {
+        is_glm5_next: false,
+        in_channels: 3,
         depth: 2,
         hidden_size: 32,
         num_heads: 2,
@@ -25,9 +27,16 @@ fn cfg() -> VisionConfig {
         spatial_merge_size: 2,
         intermediate_size: 64,
         out_hidden_size: 32,
+        projection_intermediate_size: 0,
+        rms_norm_eps: 1e-6,
+        swiglu_limit: 0.0,
         deepstack_visual_indexes: vec![],
         image_pad_token_id: 248_056,
         video_pad_token_id: 248_057,
+        image_start_token_id: 0,
+        image_end_token_id: 0,
+        video_start_token_id: 0,
+        video_end_token_id: 0,
         max_pixels: None,
     }
 }
@@ -135,6 +144,33 @@ fn one_frame_cannot_make_a_group_at_tp2() {
     assert!(got.len() < 2, "and it is short of one tp=2 group");
 }
 
+#[test]
+fn glm5_sampling_plans_whole_temporal_groups() {
+    // The old sampler asked ffmpeg for an odd count and then duplicated the
+    // last frame so `group_indices` had a full pair. Duplicating charged the
+    // model for a frame it could not learn from. The split now is: the planner
+    // chooses how many frames to take, and the group step keeps whole pairs of
+    // them. So the contract to hold is that grouping never drops a frame the
+    // planner asked the decoder for, and that a short clip still yields at
+    // least one group.
+    for (duration, native, target) in [(2.5, 10.0, 2.0), (1.0, 8.0, 2.0), (300.0, 8.0, 2.0)] {
+        let want = crate::video_sample::wanted_frames(duration, native, target, 2_048, DEFAULT_FPS);
+        assert!(want >= 1, "planner returned no frames for {duration}s");
+        let plan = crate::video_sample::sample_plan(want, duration).expect("plan");
+        assert_eq!(plan.times.len(), want);
+        let grouped = group_indices(plan.times.len(), 2);
+        assert!(!grouped.is_empty(), "one group at tp=2 needs two frames");
+        // At most the odd trailing frame is dropped, and the planner's count
+        // was available to the caller to round before it got here.
+        assert!(
+            plan.times.len() - grouped.len() <= 1,
+            "grouping dropped {} of {} planned frames",
+            plan.times.len() - grouped.len(),
+            plan.times.len()
+        );
+    }
+}
+
 // ── decode + grouping, against a real generated GIF ──────────────────────
 
 /// Build an animated GIF of `n` solid-color frames at `size`x`size`.
@@ -170,10 +206,19 @@ fn make_gif(n: u16, size: u16) -> String {
 #[test]
 fn an_animated_gif_decodes_to_its_frames() {
     let uri = make_gif(6, 64);
-    let (frames, fps) = decode_frames(&uri, 10.0, &no_ffmpeg()).expect("decode");
+    let (frames, timestamps) = decode_frames(&uri, 10.0, &no_ffmpeg()).expect("decode");
     assert_eq!(frames.len(), 6);
+    // PER-FRAME timestamps, not one nominal fps for the whole clip: the decoder
+    // reports where each returned frame actually sits so the sample plan can
+    // span the full duration instead of the leading seconds.
+    assert_eq!(timestamps.len(), frames.len(), "one timestamp per frame");
     // 100 ms per frame → 10 fps.
-    assert!((fps - 10.0).abs() < 0.5, "fps was {fps}");
+    let steps: Vec<f32> = timestamps.windows(2).map(|w| w[1] - w[0]).collect();
+    let mean_step = steps.iter().sum::<f32>() / steps.len() as f32;
+    assert!(
+        (mean_step - 0.1).abs() < 0.02,
+        "timestamps were {timestamps:?}"
+    );
 }
 
 /// The shape contract the encoder depends on: one buffer per temporal group,

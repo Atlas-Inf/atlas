@@ -90,9 +90,12 @@
 // COMPILE-ONLY on AMD (non-paged contiguous prefill — not dispatched for
 // FP8 chunked serving). Single-buffer smem_K/smem_K64 (+ BR64=32 below)
 // only need to fit LDS so the binary builds. NVIDIA #else verbatim.
-#if defined(__SCALE__)
+// QSA_TC2_LEAN takes the single buffer too: the K[i+1] prefetch is issued
+// after the mid-iteration barrier, when no warp still reads K[i], so the
+// second buffer never overlapped anything -- it only cost 17 KB of shared.
+#if defined(__SCALE__) || defined(QSA_TC2_LEAN)
 #define ATLAS_KBUFN 1
-#define ATLAS_KB(x) 0u
+#define ATLAS_KB(x) ((void)(x), 0u)
 #else
 #define ATLAS_KBUFN 2
 #define ATLAS_KB(x) (x)
@@ -129,7 +132,12 @@ __device__ __forceinline__ unsigned long long qsa_tc2_key_off(
          + (unsigned long long)kvh * hd;
 }
 
-extern "C" __global__ void ATLAS_PREFILL_ENTRY(
+#ifdef QSA_TC2_LEAN
+#define QSA_TC2_BOUNDS __launch_bounds__(128, 2)
+#else
+#define QSA_TC2_BOUNDS
+#endif
+extern "C" __global__ void QSA_TC2_BOUNDS ATLAS_PREFILL_ENTRY(
     const __nv_bfloat16* __restrict__ Q,          // [rows, nq, hd]
     const __nv_bfloat16* __restrict__ K,          // paged NHD
     const __nv_bfloat16* __restrict__ V,
@@ -144,7 +152,30 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
     const float inv_sqrt_d
+#ifdef QSA_TC2_ROWPAIR
+    , const unsigned int rows
+#endif
 ) {
+#ifdef QSA_TC2_ROWPAIR
+    // ROW PAIR (see `qsa_attn_tc2r.cu`): half h of the M tile is row
+    // `r + h` of a one-kv-head rank, each half with its own block list and
+    // selected-key count. A missing second row (odd `rows`) has no keys.
+    const unsigned int r = blockIdx.y * 2u;      // first row of the pair
+    const unsigned int gqa = num_q_heads / num_kv_heads;
+    unsigned int complete_h[2], seq_len_h[2], nblk_h[2];
+    const int* list_h[2];
+    #pragma unroll
+    for (unsigned int h = 0; h < 2u; ++h) {
+        const unsigned int pos_h = first_pos + r + h;
+        complete_h[h] = (pos_h + 1) / ratio;
+        const unsigned int tail_h = (pos_h + 1) - complete_h[h] * ratio;
+        seq_len_h[h] = (r + h < rows) ? topk * ratio + tail_h : 0u;
+        nblk_h[h] = (seq_len_h[h] + BC - 1) / BC;
+        list_h[h] = lists + (size_t)(r + h) * topk;
+    }
+    #define QSA_TC2_SEQ(h_) seq_len_h[(h_)]
+    #define QSA_TC2_ROW_LIVE(h_) (r + (h_) < rows)
+#else
     const unsigned int r = blockIdx.y;           // one CTA per ROW; both kv heads
     const unsigned int gqa = num_q_heads / num_kv_heads;
 
@@ -155,6 +186,9 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
     const unsigned int seq_len = topk * ratio + tail;   // == n_tok; bounds K/V
 
     const int* my_list = lists + (size_t)r * topk;
+    #define QSA_TC2_SEQ(h_) seq_len
+    #define QSA_TC2_ROW_LIVE(h_) true
+#endif
     const unsigned int row_elems = num_kv_heads * head_dim;
     const unsigned long long page_stride =
         (unsigned long long)block_size * row_elems;
@@ -168,9 +202,16 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
     // Both halves of the M tile are the SAME row, so they share one block
     // list; the two kv heads differ only by a constant `kvh * head_dim` inside
     // each cached token. That is what makes the double-fill nearly free.
+#ifdef QSA_TC2_ROWPAIR
+    // Here the half index selects the ROW; the only kv head is 0.
+    #define QSA_TC2_KEY_OFF(t, h_) qsa_tc2_key_off((t), topk_ratio, ratio, ratio_p2, \
+        ratio_sh, ratio_mask, complete_h[(h_)], block_size, bs_p2, bs_sh, bs_mask, \
+        list_h[(h_)], block_table, page_stride, row_elems, 0u, head_dim)
+#else
     #define QSA_TC2_KEY_OFF(t, kvh_) qsa_tc2_key_off((t), topk_ratio, ratio, ratio_p2, \
         ratio_sh, ratio_mask, complete, block_size, bs_p2, bs_sh, bs_mask, \
         my_list, block_table, page_stride, row_elems, (kvh_), head_dim)
+#endif
 
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -178,7 +219,14 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
 
     // Rows 0..15 are kv head 0's heads, rows 16..31 kv head 1's -- which is
     // exactly the split this file's warp mapping already makes at 16.
+#ifdef QSA_TC2_ROWPAIR
+    // With one kv head `nq == gqa`, so `r * q_seq_stride + ((row >> 4) * gqa
+    // + (row & 15)) * head_dim` below already addresses head `row & 15` of row
+    // `r + (row >> 4)`: the Q load and O store keep their arithmetic.
+    if (num_kv_heads != 1u || gqa > 16u) return;
+#else
     if (num_kv_heads != 2u || gqa > 16u) return;
+#endif
 
     // Rows of the M tile are this row's q-heads: 0..gqa-1 live, the rest zero.
 
@@ -192,7 +240,9 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
     __nv_bfloat16* O_batch = O + (size_t)r * q_seq_stride;
 
     // Shared memory — double-buffered K + separate V for full async overlap
+#ifndef QSA_TC2_LEAN
     __shared__ __nv_bfloat16 smem_Q[BR][HDIM_PAD];
+#endif
     __shared__ __nv_bfloat16 smem_K[ATLAS_KBUFN][2][BC][HDIM_PAD];  // [buf][kv head]
     __shared__ __nv_bfloat16 smem_V[2][BC][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_P[BR][BC + PAD_P];
@@ -224,7 +274,11 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
     // === KV block count (computed early for merged load) ===
     // No causal trim: seq_len here is the SELECTED key COUNT, and every
     // selected key is at or below this row's position by construction.
+#ifdef QSA_TC2_ROWPAIR
+    unsigned int num_kv_blocks = max(nblk_h[0], nblk_h[1]);
+#else
     unsigned int num_kv_blocks = (seq_len + BC - 1) / BC;
+#endif
     unsigned int kv_block_lo = 0;
 
     // === Merged Q + K[kv_block_lo] load (single cp.async commit group) ===
@@ -232,6 +286,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
     {
         const unsigned int chunks_per_row = HDIM / 8;  // 32
 
+#ifndef QSA_TC2_LEAN
         // Q tile
         for (unsigned int idx = tid; idx < TILE_CHUNKS; idx += 128) {
             unsigned int row = idx / chunks_per_row;
@@ -239,7 +294,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
             unsigned int col = chunk * 8;
             unsigned int smem_addr = __cvta_generic_to_shared(&smem_Q[row][col]);
 
-            if ((row & 15u) < gqa) {
+            if ((row & 15u) < gqa && QSA_TC2_ROW_LIVE(row >> 4)) {
                 const unsigned int gh = (row >> 4) * gqa + (row & 15u);
                 const void* gmem = (const void*)&Q_batch[gh * head_dim + col];
                 asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(smem_addr), "l"(gmem));
@@ -247,6 +302,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
                 *((uint4*)&smem_Q[row][col]) = make_uint4(0, 0, 0, 0);
             }
         }
+#endif
 
         // K[kv_block_lo] tile (same commit group — no extra sync)
         if (num_kv_blocks > 0) {
@@ -259,7 +315,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
                 unsigned int k_row = kv_block_lo * BC + row;
                 unsigned int smem_addr = __cvta_generic_to_shared(&smem_K[0][kvh][row][col]);
 
-                if (k_row < seq_len) {
+                if (k_row < QSA_TC2_SEQ(kvh)) {
                     const void* gmem = (const void*)&K_batch[QSA_TC2_KEY_OFF(k_row, kvh) + col];
                     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(smem_addr), "l"(gmem));
                 } else {
@@ -273,11 +329,42 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
     }
     __syncthreads();
 
+#ifdef QSA_TC2_LEAN
+    // The QK warps' A fragments for all HDIM/16 k-steps, straight from global
+    // into registers: the same u32 pairs the smem tile would have handed the
+    // MMA (zero for padding rows), without the 17 KB tile -- which is what
+    // lets two CTAs share an SM.
+    unsigned int qf[HDIM / 16][4];
+    if (warp_id < 2) {
+        const unsigned int ar0 = qk_warp_m + group_id, ar1 = ar0 + 8;
+        const bool live0 = (ar0 & 15u) < gqa && QSA_TC2_ROW_LIVE(ar0 >> 4);
+        const bool live1 = (ar1 & 15u) < gqa && QSA_TC2_ROW_LIVE(ar1 >> 4);
+        const __nv_bfloat16* q0 = Q_batch + ((ar0 >> 4) * gqa + (ar0 & 15u)) * head_dim;
+        const __nv_bfloat16* q1 = Q_batch + ((ar1 >> 4) * gqa + (ar1 & 15u)) * head_dim;
+        #pragma unroll
+        for (unsigned int ks = 0; ks < HDIM / 16; ks++) {
+            const unsigned int ac0 = ks * 16 + tid_in_group * 2, ac1 = ac0 + 8;
+            qf[ks][0] = live0 ? *(const unsigned int*)&q0[ac0] : 0u;
+            qf[ks][1] = live1 ? *(const unsigned int*)&q1[ac0] : 0u;
+            qf[ks][2] = live0 ? *(const unsigned int*)&q0[ac1] : 0u;
+            qf[ks][3] = live1 ? *(const unsigned int*)&q1[ac1] : 0u;
+        }
+    }
+#endif
     for (unsigned int kv_block = kv_block_lo; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * BC;
-        unsigned int kv_end = min(kv_start + BC, seq_len);
+        // The QK warp's own half (tc2's two halves share one `seq_len`).
+        unsigned int kv_end = min(kv_start + BC, QSA_TC2_SEQ(warp_id & 1u));
         unsigned int kv_len = kv_end - kv_start;
         unsigned int buf = (kv_block - kv_block_lo) & 1;
+#ifdef QSA_TC2_ROWPAIR
+        // A half whose row has run out of keys sits the block out: its warps
+        // skip QK, softmax, rescale and PV (warp-uniform), so every value it
+        // holds is the one tc2 leaves after that row's last block.
+        const bool half_live = kv_block < nblk_h[warp_id & 1u];
+#else
+        const bool half_live = true;
+#endif
 
         // === Start async V load into smem_V (overlaps with QK^T below) ===
         {
@@ -291,7 +378,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
                 unsigned int v_row = kv_start + row;
                 unsigned int smem_addr = __cvta_generic_to_shared(&smem_V[kvh][row][col]);
 
-                if (v_row < seq_len) {
+                if (v_row < QSA_TC2_SEQ(kvh)) {
                     const void* gmem = (const void*)&V_batch[QSA_TC2_KEY_OFF(v_row, kvh) + col];
                     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(smem_addr), "l"(gmem));
                 } else {
@@ -308,7 +395,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
         // BC/8 at BC=32; at BC=16 the GEMM produced 32 columns into a
         // (BC + PAD_P)=24-wide smem_P row.
         float acc_s[BC / 8][4];  // [n_tile][{row0_c0, row0_c1, row1_c0, row1_c1}]
-        if (warp_id < 2) {
+        if (warp_id < 2 && half_live) {
             // BC/8, not 4: `acc_s` is [BC/8][4], and the literal wrote
             // past the end of a 2-entry array at BC=16.
             #pragma unroll
@@ -321,6 +408,11 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
             for (unsigned int ks = 0; ks < (HDIM / 16); ks++) {
                 unsigned int k_base = ks * 16;
 
+#ifdef QSA_TC2_LEAN
+                const unsigned int a0 = qf[ks][0], a1 = qf[ks][1];
+                const unsigned int a2 = qf[ks][2], a3 = qf[ks][3];
+                (void)k_base;
+#else
                 // SM121 workaround: manual Q register loading
                 // (ldmatrix.x4 produces incorrect results on GB10)
                 const unsigned short* sQ_u16 = (const unsigned short*)smem_Q;
@@ -332,6 +424,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
                 unsigned int a1 = *(const unsigned int*)&sQ_u16[ar1 * HDIM_PAD + ac0];
                 unsigned int a2 = *(const unsigned int*)&sQ_u16[ar0 * HDIM_PAD + ac1];
                 unsigned int a3 = *(const unsigned int*)&sQ_u16[ar1 * HDIM_PAD + ac1];
+#endif
 
                 // B fragments: iterate over 4 N-tiles of K^T
                 // SM121 workaround: manual B-operand register loading
@@ -454,7 +547,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
         __syncthreads();
 
         // Warps 2-3: rescale accumulators to match current m
-        if (warp_id >= 2) {
+        if (warp_id >= 2 && half_live) {
             unsigned int row0 = pv_warp_m + group_id;
             unsigned int row1 = row0 + 8;
             float cur_m0 = smem_ml[row0][0];
@@ -482,7 +575,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
                 unsigned int k_row = next_kv_start + row;
                 unsigned int smem_addr = __cvta_generic_to_shared(&smem_K[ATLAS_KB(1 - buf)][kvh2][row][col]);
 
-                if (k_row < seq_len) {
+                if (k_row < QSA_TC2_SEQ(kvh2)) {
                     const void* gmem = (const void*)&K_batch[QSA_TC2_KEY_OFF(k_row, kvh2) + col];
                     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(smem_addr), "l"(gmem));
                 } else {
@@ -493,7 +586,7 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
         }
 
         // === PV MMA (all 4 warps, 16 n-tiles each, V from smem_V) ===
-        {
+        if (half_live) {
             #pragma unroll
             // BC/16 k-steps: each `mma.sync.m16n8k16` contracts 16 of the BC
             // kv rows. `2` was BC/16 at BC=32; at BC=16 it read a second,
@@ -575,12 +668,12 @@ extern "C" __global__ void ATLAS_PREFILL_ENTRY(
 
             // Rows of this tile are HEADS of row r, so the store strides by
             // head_dim within the row rather than by q_seq_stride.
-            if ((row0 & 15u) < gqa && col0 < head_dim) {
+            if ((row0 & 15u) < gqa && col0 < head_dim && QSA_TC2_ROW_LIVE(row0 >> 4)) {
                 unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][0] * inv_l0));
                 unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][1] * inv_l0));
                 *(unsigned int*)&o_base[((row0 >> 4) * gqa + (row0 & 15u)) * head_dim + col0] = lo | (hi << 16);
             }
-            if ((row1 & 15u) < gqa && col0 < head_dim) {
+            if ((row1 & 15u) < gqa && col0 < head_dim && QSA_TC2_ROW_LIVE(row1 >> 4)) {
                 unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][2] * inv_l1));
                 unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][3] * inv_l1));
                 *(unsigned int*)&o_base[((row1 >> 4) * gqa + (row1 & 15u)) * head_dim + col0] = lo | (hi << 16);

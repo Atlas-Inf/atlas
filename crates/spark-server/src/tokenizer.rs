@@ -92,6 +92,23 @@ pub struct ChatTokenizer {
     openai_jinja_env: Option<minijinja::Environment<'static>>,
 }
 
+/// One GLM-5 multimodal placeholder after CPU preprocessing. The chat
+/// template emits one compact marker per media item; the tokenizer expands
+/// it to the exact number of encoder rows before the prompt reaches prefill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Glm5VisionKind {
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Glm5VisionPlaceholder {
+    pub(crate) kind: Glm5VisionKind,
+    pub(crate) pad_count: usize,
+    pub(crate) per_frame_pad_count: usize,
+    pub(crate) timestamps: Vec<f32>,
+}
+
 /// Wrapper around tokenizers::DecodeStream that hides the generic parameters.
 /// O(1) per step vs O(n) for full re-decode.
 pub struct StreamingDecoder<'a> {

@@ -165,7 +165,7 @@ pub fn cublas_bf16_proj(
     stream: u64,
 ) -> anyhow::Result<()> {
     let w_bf16 = dequant_fp8_bf16_cached(gpu, derived, fp8w, stream)?;
-    spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, w_bf16, out.0, m, n, k, stream)
+    super::bf16_gemm(act, w_bf16, out, m, n, k, stream)
 }
 
 /// Route a projection `out[M,N] = act[M,K] @ weightᵀ` through cuBLASLt BF16 for
@@ -181,7 +181,7 @@ pub fn cublas_bf16_proj_dense(
     k: u32,
     stream: u64,
 ) -> anyhow::Result<()> {
-    spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, weight_bf16.0, out.0, m, n, k, stream)
+    super::bf16_gemm(act, weight_bf16.0, out, m, n, k, stream)
 }
 
 /// Route a projection `out[M,N] = act[M,K] @ weightᵀ` through CUTLASS BF16.

@@ -128,7 +128,7 @@ impl Qwen3SsmLayer {
         // ── GDN sublayer ──
         // hc_pre writes the mixed+normed rows straight into norm_output —
         // both the batched-GEMM core and the per-seq fallback read there.
-        ops::hc_pre_site(
+        ops::hc_pre_site_rows(
             ctx.gpu,
             self.hc_pre_k,
             streams,
@@ -141,6 +141,7 @@ impl Qwen3SsmLayer {
             n as u32,
             h as u32,
             eps,
+            ctx.levers.qwen4exp_hc_rows(),
             stream,
         )?;
         // Batched-GEMM core (QKVZ/out_proj weights read ONCE for all n rows —
@@ -172,39 +173,78 @@ impl Qwen3SsmLayer {
             }
             hidden
         };
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            gdn_rows,
-            streams,
-            post,
-            comb,
-            streams,
-            n as u32,
-            h as u32,
-            stream,
-        )?;
-
         // ── MoE sublayer ──
         // hc_pre writes the mixed rows straight into norm_output — the
-        // batched expert kernels' input convention.
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            streams,
-            &hc.ffn,
-            hc,
-            normed,
-            post,
-            comb,
-            ctx.buffers.hc_lowrank_scratch(),
-            n as u32,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        // batched expert kernels' input convention. ATLAS_QWEN4EXP_BATCH_SMALL
+        // (n <= 8): the mixer's post runs inside the MoE site's stage, the
+        // single-token decode's seam (`hc_post_pre_site`), every row's bytes
+        // the two kernels' (not under BISECT_HC, which wants a row a launch).
+        if ctx.levers.qwen4exp_batch_small
+            && n as u32 <= ops::HC_SPLIT_MAX_ROWS
+            && !ctx.levers.batch_bisect(ops::BISECT_HC)
+        {
+            ops::hc_post_pre_site(
+                ctx.gpu,
+                self.hc_post_k,
+                self.hc_pre_k,
+                hc,
+                gdn_rows,
+                streams,
+                &hc.ffn,
+                normed,
+                post,
+                comb,
+                ctx.buffers.hc_lowrank_scratch(),
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        } else {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                gdn_rows,
+                streams,
+                post,
+                comb,
+                streams,
+                n as u32,
+                h as u32,
+                stream,
+            )?;
+            ops::hc_pre_site_rows(
+                ctx.gpu,
+                self.hc_pre_k,
+                streams,
+                &hc.ffn,
+                hc,
+                normed,
+                post,
+                comb,
+                ctx.buffers.hc_lowrank_scratch(),
+                n as u32,
+                h as u32,
+                eps,
+                ctx.levers.qwen4exp_hc_rows(),
+                stream,
+            )?;
+        }
+        // ATLAS_QWEN4EXP_BATCH_FAST: every live row through `forward`'s own
+        // kernels with the EP all-reduce batched (`MoeLayer::forward_rows`),
+        // where `forward_k2/k3` are a different function of the row and the
+        // per-row loop pays an all-reduce per row. Under BATCH_SMALL its EP
+        // blend may take the layer's post too (`posted`).
+        let fold = ops::qwen4exp_decode_fuse::MoeHcPost::for_rows(ctx.levers, hc, streams, post);
+        let exact_rows = if ctx.levers.qwen4exp_batch_fast {
+            self.ffn
+                .forward_rows_padded(normed, n, active_seqs, fold, ctx, stream)?
+        } else {
+            None
+        };
         let moe_rows = match n {
+            _ if exact_rows.is_some() => moe_out,
             2 => {
                 self.ffn.forward_k2(normed, ctx, stream)?;
                 moe_out
@@ -224,19 +264,21 @@ impl Qwen3SsmLayer {
                 hidden
             }
         };
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            moe_rows,
-            streams,
-            post,
-            comb,
-            streams,
-            n as u32,
-            h as u32,
-            stream,
-        )?;
+        if !exact_rows.is_some_and(|(_, posted)| posted) {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                moe_rows,
+                streams,
+                post,
+                comb,
+                streams,
+                n as u32,
+                h as u32,
+                stream,
+            )?;
+        }
         Ok(())
     }
 }

@@ -153,7 +153,7 @@ impl TransformerModel {
                 if evicted.is_empty() {
                     break;
                 }
-                super::super::super::block_mgmt::apply_evicted_blocks(evicted, &mut kv_cache);
+                self.apply_evicted(evicted, &mut kv_cache);
             }
             let free = kv_cache.num_free_blocks();
             if free < needed {
@@ -183,6 +183,7 @@ impl TransformerModel {
         // Zero shared buffers once (instead of N times in per-stream).
         if self.comm.is_some() {
             self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+            self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
         } else if streams[0].chunk_start == 0 {
             self.buffers
                 .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
@@ -528,6 +529,7 @@ impl TransformerModel {
         // intentionally None — layers read BatchedAttnMetadata directly
         // through the model-level dispatcher arguments.
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,

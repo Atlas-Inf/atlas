@@ -23,6 +23,7 @@ use super::super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::super::prefix_share::adopt_prefix_match;
 use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
@@ -73,6 +74,7 @@ impl TransformerModel {
         // token counts. The EP=2 CUDA 700 was from the 4MB recv buffer overflow
         // (fixed in 1ae4883); zero_all kept everywhere as defense-in-depth.
         self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+        self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
 
         let mut kv_cache = self.kv_cache.lock();
 
@@ -82,24 +84,15 @@ impl TransformerModel {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
             self.prefix_cache
-                .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
+                .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
         };
         let mut kv_write_start = prefix_match.matched_tokens;
-        seq.cached_prefix_tokens = prefix_match.matched_tokens;
-        seq.cached_prefix_blocks = prefix_match.matched_blocks.len();
         // Record the original prompt length — cache_sequence() uses it later
         // to avoid double-bumping ref_counts on the prompt portion.
         seq.prompt_len = n;
 
         // Reuse cached blocks (inc_ref for shared ownership).
-        for &block_idx in &prefix_match.matched_blocks {
-            kv_cache.inc_ref(block_idx);
-            seq.block_table.push(block_idx);
-        }
-        reuse_prefix_match_disk_ids(
-            &prefix_match.matched_disk_block_ids,
-            &mut seq.disk_block_ids,
-        );
+        adopt_prefix_match(seq, &prefix_match, &mut kv_cache)?;
 
         // Allocate new blocks for the remaining (uncached) tokens.
         let blocks_needed = (n - 1) / bs + 1;
@@ -380,6 +373,7 @@ impl TransformerModel {
         };
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,

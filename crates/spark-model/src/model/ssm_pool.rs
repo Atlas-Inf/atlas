@@ -26,6 +26,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+mod kda_records;
+mod specific_claim;
+
 /// Pre-allocated contiguous GPU memory pool for SSM layer states.
 ///
 /// Each pool slot has fixed GPU addresses for h_state and conv_state across
@@ -114,6 +117,9 @@ pub(crate) struct SsmStatePool {
     /// Per-slot byte sizes of the two staging pools above.
     pub(super) commit_qkv_slot_bytes: usize,
     pub(super) commit_gb_slot_bytes: usize,
+    /// GLM KDA fold records (`--ssm-rollback-mode records`); layout in `kda_records`.
+    pub(super) kda_record_pools: Vec<DevicePtr>,
+    pub(super) kda_record_row_bytes: usize,
     pub(super) free_slots: Mutex<Vec<usize>>,
     /// Every device allocation behind the pools above, and nothing else.
     /// `alloc_layer_pools` hands out per-layer offset VIEWS into one block, so
@@ -342,10 +348,27 @@ impl SsmStatePool {
         };
         let (h_inter_offsets, h_inter_total) = h_inter_layout(&h_inter_counts);
         let mut replay_input_rings = Vec::new();
+        let records = has_mtp && rollback_mode == crate::ssm_reserve::SsmRollbackMode::Records;
+        let (kda_record_row_bytes, h_inter_held) =
+            kda_records::plan(records, config, h_stored_bytes, h_bytes, h_inter_total)?;
+        let mut kda_record_pools = Vec::new();
         if has_mtp {
             let ni = num_intermediates;
             let mtp_total = mtp_slots + 1;
-            if !replay {
+            if records {
+                kda_record_pools = alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    mtp_total * ni * kda_record_row_bytes,
+                )?;
+                conv_intermediate_pools = alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    mtp_total * ni * conv_bytes,
+                )?;
+            } else if !replay {
                 h_intermediate_pools = alloc_layer_pools(
                     gpu,
                     &mut allocations,
@@ -388,8 +411,9 @@ impl SsmStatePool {
             )?;
 
             let mtp_mb = num_ssm_layers
-                * (h_inter_total * h_stored_bytes
-                    + mtp_total * (ni * conv_bytes + h_stored_bytes + conv_bytes))
+                * (h_inter_held * h_stored_bytes
+                    + mtp_total
+                        * (ni * (conv_bytes + kda_record_row_bytes) + h_stored_bytes + conv_bytes))
                 / (1024 * 1024);
             // Baseline for the log: FULL-WIDTH UNIFORM sizing at today's
             // per-slot shape ((ni-1) H + ni conv + checkpoint).
@@ -449,6 +473,8 @@ impl SsmStatePool {
             gdn_commit_gb_pools,
             commit_qkv_slot_bytes,
             commit_gb_slot_bytes,
+            kda_record_pools,
+            kda_record_row_bytes,
             free_slots: Mutex::new(free_slots),
             allocations,
         })
@@ -920,7 +946,7 @@ impl SsmStatePool {
                 // is lossless. The intermediates are per-verify-step scratch
                 // regardless — nothing in them survives a step — so even a
                 // truncated copy could not lose live state.
-                for t in 0..self.h_inter_count(from).min(self.h_inter_count(to)) {
+                for t in 0..self.h_snapshot_count(from).min(self.h_snapshot_count(to)) {
                     gpu.copy_d2d_async(
                         self.h_intermediate(i, from, t),
                         self.h_intermediate(i, to, t),
@@ -1275,7 +1301,7 @@ mod slot_guard_tests {
     /// (`free_slots`/`max_slots`). All GPU pointer vectors are empty; the guard
     /// path and `claim_slot`/`release_slot` never dereference them, so no GPU is
     /// required to validate the exactly-once release invariant.
-    fn bare_pool(max_slots: usize) -> Arc<SsmStatePool> {
+    pub(super) fn bare_pool(max_slots: usize) -> Arc<SsmStatePool> {
         Arc::new(SsmStatePool {
             h_state_pools: Vec::new(),
             conv_state_pools: Vec::new(),
@@ -1300,6 +1326,8 @@ mod slot_guard_tests {
             gdn_commit_gb_pools: Vec::new(),
             commit_qkv_slot_bytes: 0,
             commit_gb_slot_bytes: 0,
+            kda_record_pools: Vec::new(),
+            kda_record_row_bytes: 0,
             free_slots: Mutex::new((0..max_slots).rev().collect()),
             allocations: Vec::new(),
         })

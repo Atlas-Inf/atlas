@@ -186,6 +186,17 @@ pub(super) fn step_verify_k4_batched(
     sched
         .timing
         .record(crate::scheduler::mtp_timing::Phase::PipelineProc, t_phase1);
+    // Over a TP pair the worker ran the same forward and waits for these to
+    // commit what Phase 3 commits (`ep_verify_batch.rs`). No-op single-rank.
+    let accepted: Vec<u32> = verdicts.iter().map(|v| v.1 as u32).collect();
+    if let Err(e) = model.ep_broadcast_verify_verdicts(&accepted) {
+        tracing::error!("EP broadcast batched-verify verdicts: {e:#}");
+        for a in batch.iter_mut() {
+            a.engine_error = Some(format!("{e:#}"));
+            a.finished = true;
+        }
+        return;
+    }
     let t_stash = Instant::now();
     // ── Phase 2: stash the accepted-position hiddens before any propose ──
     // Absolute forward row i*rows + num_accepted_i → stash slot i; the

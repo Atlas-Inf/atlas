@@ -27,6 +27,17 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
+    // TODO(glm-sparse-index swap): `--swap-space-gb` preemption saves and
+    // restores only per-layer K/V (+ SSM). A cache with a sparse semantic
+    // index (GLM-5.x) also holds, per block, the pooled index keys + scales
+    // (`sparse_index_pool_ptr` / `sparse_index_scale_pool_ptr`) and a raw
+    // key/gate tail for the pool still being assembled — per block, or lent
+    // from `tail_slots` (then the restored blocks must be re-lent via
+    // `lend_tail_slots` and the tails copied by slot). None of that is in the
+    // image, so a GLM sequence swapped back in decodes against the stale index
+    // of whatever last used those physical blocks. Not a small fix (format +
+    // tail-slot handling); until then do not combine --swap-space-gb with GLM
+    // sparse-index models. (A bail here would requeue the victim every step.)
     pub(crate) fn save_sequence_state_dispatch(
         &self,
         seq: &SequenceState,

@@ -109,6 +109,10 @@ const MTP_MIXER_PREFIX: &str = "mtp.hyper_connection_mixer";
 // fields are read once the proposer lands.
 #[allow(dead_code)]
 pub struct Qwen4ExpMtpModule {
+    /// The config the module was built with and must run with: the TP=1 view
+    /// ([`ModelConfig::tp1_view`]). Only rank 0 drafts, so under TP it holds
+    /// every attention head and all of its own experts and runs them alone.
+    pub config: ModelConfig,
     /// Reused full-attention layer body (gated attn + QSA + mHC + 512-expert
     /// MoE), built from `mtp.layers.0`.
     pub body: Box<dyn TransformerLayer>,
@@ -273,7 +277,8 @@ fn build_mtp_moe(
 /// `Ok(None)` when the checkpoint ships no `mtp.*` (so this is safe to call
 /// unconditionally), or when they were skipped at upload — see `skip_mtp` in
 /// `spark-server`, which must be OFF for this model when `--speculative` is
-/// set or the tensors never reach the store.
+/// set or the tensors never reach the store (it stays ON on every rank but 0,
+/// which never drafts and never calls this).
 pub fn load_qwen4exp_mtp_module(
     store: &WeightStore,
     config: &ModelConfig,
@@ -289,6 +294,13 @@ pub fn load_qwen4exp_mtp_module(
         return Ok(None);
     }
 
+    // Built and run on rank 0 alone, unsharded: under TP the rank's own config
+    // would give the attention body that rank's heads only and leave a
+    // partial o_proj sum no other rank completes, and under EP its MoE would
+    // be built for this rank's share of the experts though it holds all 512.
+    // The MTP tensors are never sliced or EP-skipped at upload, so every one
+    // is here in full.
+    let config = &config.tp1_view();
     let h = config.hidden_size;
     let variant = crate::weight_map::detect_nvfp4_variant(store, config);
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
@@ -396,6 +408,7 @@ pub fn load_qwen4exp_mtp_module(
     }
 
     let module = Qwen4ExpMtpModule {
+        config: config.clone(),
         body,
         pre_fc_norm_embedding: dense_auto(store, "mtp.pre_fc_norm_embedding.weight", gpu)?,
         pre_fc_norm_hidden: dense_auto(store, "mtp.pre_fc_norm_hidden.weight", gpu)?,

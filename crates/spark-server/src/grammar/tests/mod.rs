@@ -14,6 +14,7 @@ mod param_key_constraint;
 mod poolside;
 mod qwen3_coder_required;
 mod sanitize;
+pub(crate) mod schema_limits;
 mod tools_basic;
 
 /// Build a minimal vocabulary for testing.

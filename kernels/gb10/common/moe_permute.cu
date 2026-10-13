@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <assert.h>   // device-side assert() for the work-list packing guard
 
@@ -131,6 +132,7 @@ extern "C" __global__ void moe_batched_blend(
     unsigned int hidden_size,
     unsigned int num_tokens
 ) {
+    atlas_pdl_enter();
     __shared__ float s_dot_partial[8]; // one per warp (256/32=8)
 
     unsigned int token = blockIdx.x;
@@ -197,6 +199,14 @@ extern "C" __global__ void moe_batched_blend(
 // Output layout: sorted_token_ids groups all slots for the same expert
 // contiguously. expert_offsets[e] is the first sorted position for expert e.
 // token_to_perm[slot] = sorted position of original slot.
+//
+// CONTRACT: row order inside an expert group is unspecified. A slot's position
+// is offsets[e] plus what its atomicAdd returned, and nothing orders the warps
+// in the scatter, so two launches (or two TP ranks) may order one expert's
+// rows differently. expert_offsets is fixed, and sorted_token_ids and
+// token_to_perm always describe the same permutation. Consumers must address
+// rows only through sorted_token_ids / token_to_perm and treat each row on its
+// own; a bytewise comparison or hash of a route-major buffer is not meaningful.
 extern "C" __global__ void moe_sort_by_expert(
     const unsigned int* __restrict__ topk_ids,      // [total_expanded] expert ids
     int* __restrict__ sorted_token_ids,              // [total_expanded] → original token index

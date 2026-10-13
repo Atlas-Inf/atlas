@@ -153,6 +153,23 @@ impl TransformerModel {
         if !cfg!(atlas_scale) {
             return None;
         }
+        // Aux-carrying models (PLE n-gram history, QSA indexer keys:
+        // Qwen3.8-Flash-Next) cannot use this capture at all. Their lexical
+        // state is position-exact only at a completed pass end, so a mid-pass
+        // capture is necessarily aux-less, and the restore gate declines
+        // aux-less slots (prefix_lookup.rs / prefill_a.rs). Worse, the
+        // `tb - bs` sibling is indexed under the SAME prefix key as
+        // `prefill_b_save_checkpoint`'s tail-split checkpoint, which DOES
+        // carry aux, so registering the sibling displaced and freed the one
+        // anchor the next turn could restore. Every warm turn then recomputed
+        // the whole prompt (winbox #149 replay, 2026-10-02: "Prefix cache hit:
+        // 20288 tokens ... but no SSM snapshot" on every turn, TTFT within
+        // 5-10% of no-cache). With the plan refused, the tail-split checkpoint
+        // at `tb - bs` is the anchor for both match points (`tb`, `tb - bs`),
+        // the same path non-`atlas_scale` builds (GB10, #69) already take.
+        if self.requires_aux_state() {
+            return None;
+        }
         // Reuse gate: capture costs a per-prefill kernel split + D2D copy and
         // is only ever consumable by a LATER request of the SAME session (the
         // snapshot lookup is session-gated). A session seen for the FIRST

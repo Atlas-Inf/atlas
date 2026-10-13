@@ -5,10 +5,46 @@
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
-use anyhow::Result;
+use anyhow::{Result, bail, ensure};
 
 use super::super::super::types::TransformerModel;
 use crate::layers::ops;
+
+/// Return the packed vision-row range covered by one prompt chunk. The
+/// encoder output follows the complete prompt's pad-token order, so a chunk
+/// starting in the middle of a media run must begin after every earlier image
+/// or video pad token. `row_base` is the request slice in co-dispatch output;
+/// `pending` is the complete packed output row count.
+fn vision_pad_row_range(
+    tokens: &[u32],
+    chunk_start: usize,
+    chunk_len: usize,
+    image_pad: u32,
+    video_pad: u32,
+    row_base: usize,
+    pending: usize,
+) -> Result<(usize, usize)> {
+    let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
+    let is_pad = |tok: &&u32| **tok == image_pad || **tok == video_pad;
+    let prior_pad_count = tokens[..chunk_start].iter().filter(is_pad).count();
+    let chunk_pad_count = chunk_tokens.iter().filter(is_pad).count();
+    let start = row_base
+        .checked_add(prior_pad_count)
+        .ok_or_else(|| anyhow::anyhow!("vision pad overlay row offset overflow"))?;
+    let end = start
+        .checked_add(chunk_pad_count)
+        .ok_or_else(|| anyhow::anyhow!("vision pad overlay row count overflow"))?;
+    if end > pending {
+        bail!(
+            "vision pad overlay exceeds packed encoder output: base={}, prior={}, chunk={}, pending={}",
+            row_base,
+            prior_pad_count,
+            chunk_pad_count,
+            pending
+        );
+    }
+    Ok((start, end))
+}
 
 impl TransformerModel {
     pub(super) fn prefill_b_embed_chunk(
@@ -168,24 +204,97 @@ impl TransformerModel {
                 // embedding, and the model described a featureless gray field
                 // while every token count looked correct.
                 let (image_pad, video_pad) = self.vision_pad_ids();
+                let prior_pad_rows = crate::model::vision_transport::pad_rows_before_chunk(
+                    tokens,
+                    chunk_start,
+                    image_pad,
+                    video_pad,
+                );
                 // Co-dispatch: this request's slice starts at vision_row_base
                 // in the shared packed buf_out (0 for the legacy single encode).
                 let row_base = *self.vision_row_base.lock();
-                let mut img_idx = 0usize; // pad-token count within the chunk
+                let owned_images = *self.vision_owned_images.lock();
+                let slice_rows = *self.vision_slice_rows.lock();
+                let chunk_pad_rows = chunk_tokens
+                    .iter()
+                    .filter(|&&tok| tok == image_pad || tok == video_pad)
+                    .count();
+                ensure!(
+                    row_base
+                        .checked_add(prior_pad_rows)
+                        .and_then(|v| v.checked_add(chunk_pad_rows))
+                        .is_some_and(|end| end <= pending),
+                    "vision pad rows exceed encoded rows: base={row_base}, prior={prior_pad_rows}, chunk={chunk_pad_rows}, encoded={pending}"
+                );
+                if owned_images > 0 {
+                    ensure!(
+                        slice_rows > 0
+                            && prior_pad_rows
+                                .checked_add(chunk_pad_rows)
+                                .is_some_and(|end| end <= slice_rows),
+                        "vision pad rows exceed co-dispatched slice: prior={prior_pad_rows}, chunk={chunk_pad_rows}, slice={slice_rows}"
+                    );
+                }
+                // The encoder output is packed in prompt order, while this
+                // function may be called for several chunks. Starting at
+                // zero for every chunk would repeat earlier vision rows.
+                let (mut row_idx, _) = vision_pad_row_range(
+                    tokens,
+                    chunk_start,
+                    chunk_len,
+                    image_pad,
+                    video_pad,
+                    row_base,
+                    pending,
+                )?;
+
                 for (i, &tok) in chunk_tokens.iter().enumerate() {
                     if tok == image_pad || tok == video_pad {
-                        let src = ve
-                            .buf_out
-                            .offset((row_base + img_idx) * ve.out_hidden_size * 2);
+                        let src = ve.buf_out.offset(row_idx * ve.out_hidden_size * 2);
                         let dst = hidden_dst.offset(i * h * elem_bytes);
                         self.gpu
                             .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;
-                        img_idx += 1;
+                        row_idx += 1;
                     }
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vision_pad_row_range;
+
+    #[test]
+    fn vision_rows_follow_the_full_prompt_across_chunks() {
+        let image = 10;
+        let video = 11;
+        let text = 1;
+        let tokens = [text, image, image, text, image, video, video, text];
+
+        assert_eq!(
+            vision_pad_row_range(&tokens, 0, 3, image, video, 4, 9).unwrap(),
+            // `row_base` is already included in this absolute range; the
+            // copy site must not add it a second time.
+            (4, 6)
+        );
+        assert_eq!(
+            vision_pad_row_range(&tokens, 3, 3, image, video, 4, 9).unwrap(),
+            (6, 8)
+        );
+        assert_eq!(
+            vision_pad_row_range(&tokens, 6, 2, image, video, 4, 9).unwrap(),
+            (8, 9)
+        );
+    }
+
+    #[test]
+    fn vision_rows_fail_closed_when_the_packed_slice_is_short() {
+        let err = vision_pad_row_range(&[1, 10, 10], 1, 2, 10, 11, 3, 4)
+            .expect_err("two rows cannot fit in one packed row");
+        assert!(err.to_string().contains("exceeds packed encoder output"));
     }
 }

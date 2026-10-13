@@ -32,6 +32,25 @@ pub(super) fn propose_batch_floor(native_authoritative: bool, batch_parity: bool
     }
 }
 
+/// `ATLAS_DFLASH_MULTI_DRAFT_CAP`: draft-depth cap for generic proposals
+/// batched over two or more sequences, read once (malformed = unset). Each
+/// extra verify row of an owner-batched step pulls more distinct routed
+/// experts, so those steps pay more per row than a single sequence does.
+pub(super) fn multi_owner_draft_cap() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_MULTI_DRAFT_CAP")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+    })
+}
+
+/// Draft cap of a batched generic proposal over `n` sequences: the
+/// multi-owner cap when `n >= 2` and set, else the single-sequence cap.
+pub(super) fn batched_draft_cap(single: usize, multi: Option<usize>, n: usize) -> usize {
+    multi.filter(|_| n >= 2).unwrap_or(single)
+}
+
 /// Per-sequence execution after a batched run failed with `prepared` of `n`
 /// sequences' drafter state already advanced (lifecycle stepped, ctx slot
 /// appended, precompute committed). Prepared sequences MUST NOT re-prepare —
@@ -89,6 +108,13 @@ mod tests {
         // Generic authoritative and plain generic both floor at 2: the
         // single-sequence case stays on the serial path either way.
         assert_eq!(propose_batch_floor(false, false), 2);
+    }
+
+    #[test]
+    fn multi_owner_cap_applies_only_to_two_or_more_sequences() {
+        assert_eq!(batched_draft_cap(7, Some(4), 2), 4);
+        assert_eq!(batched_draft_cap(7, Some(4), 1), 7);
+        assert_eq!(batched_draft_cap(7, None, 4), 7);
     }
 
     #[test]

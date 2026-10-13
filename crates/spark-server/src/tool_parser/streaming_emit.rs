@@ -68,6 +68,12 @@ impl StreamingToolDetector {
         limit: usize,
         final_close: bool,
     ) -> Vec<DetectorOutput> {
+        // Poolside values can themselves contain Hermes/XML markers. Buffer
+        // them for parse_poolside_v1_call instead of scanning nested values
+        // as argument envelopes for a different format.
+        if self.promote_bare_names {
+            return Vec::new();
+        }
         let mut outputs = Vec::new();
         let idx = self.call_counter as usize;
         let scan = &self.buffer[..limit.min(self.buffer.len())];
@@ -339,7 +345,7 @@ impl StreamingToolDetector {
         // `<parameter=` / `</parameter>` pairs, so the leading `<function=NAME>`
         // still sitting in the buffer is simply skipped — no stripping needed.
         if self.current_tc_name.is_none()
-            && let Some(name) = extract_streaming_name(&self.buffer)
+            && let Some(name) = extract_streaming_name(&self.buffer, false)
         {
             let id = next_tool_call_id();
             let idx = self.call_counter as usize;

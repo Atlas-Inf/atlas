@@ -40,6 +40,16 @@ fn ssm_ffn_prefill_min_n() -> usize {
     })
 }
 
+/// `ATLAS_MOE_LEGACY_PERTOKEN_DECODE=1`: the MoE of a batched decode step a
+/// row at a time, so one EP reduce a row instead of one over every row.
+/// Every rank must run the same value (`model::startup_parity`).
+pub(crate) fn moe_legacy_pertoken_decode() -> bool {
+    std::env::var("ATLAS_MOE_LEGACY_PERTOKEN_DECODE")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 fn ssm_ffn_prefill_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_NO_SSM_FFN_PREFILL").as_deref() != Ok("1"))
@@ -338,11 +348,7 @@ impl Qwen3SsmLayer {
                         (n * h) as u32,
                         stream,
                     )?;
-                } else if std::env::var("ATLAS_MOE_LEGACY_PERTOKEN_DECODE")
-                    .ok()
-                    .as_deref()
-                    != Some("1")
-                {
+                } else if !moe_legacy_pertoken_decode() {
                     // Token-major N-token MoE decode — DEFAULT for n>=4. Packs
                     // (token, expert) into blockIdx.y so all N tokens' experts run
                     // in ~3 batched kernel launches/layer instead of the legacy

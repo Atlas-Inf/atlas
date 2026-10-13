@@ -30,13 +30,15 @@ impl TransformerModel {
         chunk_len: usize,
         proc_start: usize,
         proc_count: usize,
+        // Rows after the chunk's that share its MoE routing (fused verify).
+        extra_rows: usize,
         effective_seq_len_start: usize,
         kv_cache: &PagedKvCache,
         stream: u64,
     ) -> Result<MetaLayout> {
         // Single-stream entry point: lay metadata at the default offset
         // after the MoE topk staging area.
-        let moe_scratch_bytes = proc_count * self.config.num_experts_per_tok * 4 * 2;
+        let moe_scratch_bytes = (proc_count + extra_rows) * self.config.num_experts_per_tok * 4 * 2;
         let meta_offset = (moe_scratch_bytes + 7) & !7;
         let meta_base = self.buffers.scratch().offset(meta_offset);
         self.prefill_b_upload_meta_at(
@@ -87,7 +89,8 @@ impl TransformerModel {
         } else {
             (pos_stream_bytes + 7) & !7
         };
-        let needs_paged = effective_seq_len_start > 0;
+        // GLM-5 MLA attends through the paged cache from the first chunk on.
+        let needs_paged = effective_seq_len_start > 0 || self.config.model_type == "glm5_next";
 
         // Lock staging, build positions plus non-paged slots, and upload.
         {
@@ -127,11 +130,21 @@ impl TransformerModel {
                 let (pad_id, video_pad_id) = self.vision_pad_ids();
                 let is_pad = |tok: u32| tok == pad_id || tok == video_pad_id;
                 let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
-                let have_vision = !grids.is_empty() && chunk_tokens.iter().copied().any(is_pad);
+                let glm_vision = self.config.vision.as_ref().filter(|v| v.is_glm5_next);
+                // GLM's expanded video has structural text tokens between
+                // frame planes, and post-media text inherits the compressed
+                // position base. Build against the complete prompt and slice
+                // the processed range below; looking only at this chunk loses
+                // the active video frame at a chunk boundary.
+                let have_vision = !grids.is_empty()
+                    && if glm_vision.is_some() {
+                        tokens.iter().copied().any(is_pad)
+                    } else {
+                        chunk_tokens.iter().copied().any(is_pad)
+                    };
 
                 if have_vision {
                     stg.positions.clear();
-                    let current_pos: u32 = proc_start as u32;
                     // Co-dispatch: this request owns grids[grid_base .. grid_base+owned]
                     // of the shared packed vision_image_grids (0/all for legacy).
                     let grid_base = *self.vision_grid_base.lock();
@@ -141,18 +154,58 @@ impl TransformerModel {
                     } else {
                         grids.len()
                     };
-                    mrope_pos::build(
-                        chunk_tokens,
-                        &grids,
-                        grid_base,
-                        grid_hi,
-                        current_pos,
-                        pad_id,
-                        video_pad_id,
-                        &mut stg.positions,
-                        &mut stg.positions_h,
-                        &mut stg.positions_w,
-                    );
+                    if let Some(v) = glm_vision {
+                        // GLM-5 expands a video into per-frame image markers
+                        // and timestamp text. The generic contiguous-pad
+                        // walker would skip the boundary/timestamp tokens and
+                        // assign the following image to the wrong grid.
+                        let (mut full_t, mut full_h, mut full_w) =
+                            (Vec::new(), Vec::new(), Vec::new());
+                        mrope_pos::build_glm5(
+                            tokens,
+                            &grids,
+                            grid_base,
+                            grid_hi,
+                            0,
+                            v.image_start_token_id,
+                            v.image_end_token_id,
+                            v.video_start_token_id,
+                            v.video_end_token_id,
+                            pad_id,
+                            video_pad_id,
+                            &mut full_t,
+                            &mut full_h,
+                            &mut full_w,
+                        );
+                        let end = proc_start.checked_add(proc_count).ok_or_else(|| {
+                            anyhow::anyhow!("GLM-5 MRoPE position range overflow")
+                        })?;
+                        if end > full_t.len() || end > full_h.len() || end > full_w.len() {
+                            anyhow::bail!(
+                                "GLM-5 MRoPE position range {}..{} exceeds prompt length {}",
+                                proc_start,
+                                end,
+                                full_t.len()
+                            );
+                        }
+                        stg.positions.extend_from_slice(&full_t[proc_start..end]);
+                        stg.positions_h.extend_from_slice(&full_h[proc_start..end]);
+                        stg.positions_w.extend_from_slice(&full_w[proc_start..end]);
+                    } else {
+                        let current_pos: u32 = proc_start as u32;
+                        mrope_pos::build(
+                            chunk_tokens,
+                            &grids,
+                            grid_base,
+                            grid_hi,
+                            current_pos,
+                            pad_id,
+                            video_pad_id,
+                            &mut stg.positions,
+                            &mut stg.positions_h,
+                            &mut stg.positions_w,
+                        );
+                    }
                 } else {
                     stg.positions_h.extend_from_slice(&stg.positions);
                     stg.positions_w.extend_from_slice(&stg.positions);

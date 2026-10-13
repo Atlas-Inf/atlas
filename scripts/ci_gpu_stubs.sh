@@ -30,6 +30,7 @@ int cuCtxDestroy_v2(void *a) { (void)a; return 100; }
 int cuCtxGetCurrent(void **a) { (void)a; return 100; }
 int cuCtxSetCurrent(void *a) { (void)a; return 100; }
 int cuCtxGetDevice(int *a) { (void)a; return 100; }
+int cuCtxSynchronize(void) { return 100; }
 int cuDeviceGetAttribute(int *a, unsigned int b, int c) { (void)a; (void)b; (void)c; return 100; }
 /* Errors */
 int cuGetErrorName(int code, const char **out) { (void)code; (void)out; return 100; }
@@ -53,11 +54,15 @@ int cuModuleGetGlobal_v2(unsigned long long *dptr, unsigned long *bytes,
     (void)dptr; (void)bytes; (void)hmod; (void)name; return 100;
 }
 int cuFuncSetAttribute(void *f, int attr, int val) { (void)f; (void)attr; (void)val; return 100; }
+int cuFuncGetName(const char **name, void *f) { (void)name; (void)f; return 100; }
 int cuLaunchKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
                    unsigned int bx, unsigned int by, unsigned int bz,
                    unsigned int sm, void *s, void **p, void **e) {
     (void)f; (void)gx; (void)gy; (void)gz; (void)bx; (void)by; (void)bz;
     (void)sm; (void)s; (void)p; (void)e; return 100;
+}
+int cuLaunchKernelEx(const void *cfg, void *f, void **p, void **e) {
+    (void)cfg; (void)f; (void)p; (void)e; return 100;
 }
 /* Events */
 int cuEventCreate(void **a, unsigned int b) { (void)a; (void)b; return 100; }
@@ -175,6 +180,7 @@ sudo install -m 0644 /tmp/libnccl.so "$DEST/libnccl.so"
 # under ATLAS_SKIP_BUILD. Every symbol returns 1 so a real invocation
 # fails-fast; GPU paths are #[ignore]-gated.
 cat > /tmp/libcublaslt_stub.c <<'EOF'
+unsigned long cublasLtGetVersion(void){return 0;}
 int cublasLtCreate(void){return 1;}
 int cublasLtDestroy(void){return 1;}
 int cublasLtMatmul(void){return 1;}

@@ -441,18 +441,19 @@ __device__ __forceinline__ void dm_mma_kstep(
     }
 }
 
-/// Tensor-core pipelined BF16 dense GEMM: C[M,N] = A[M,K] · B[N,K]^T.
-/// 128×32 tile (M×N), 8 warps, DM_STAGES-deep cp.async prefetch pipeline.
-extern "C" __global__ void dense_gemm_bf16_pipelined(
+/// The `dense_gemm_bf16_pipelined` body for the output tile at (cta_m, cta_n).
+/// Multi-plane twins call it unchanged, so each plane is bit-identical to its
+/// own single-weight launch.
+__device__ __forceinline__ void dense_gemm_bf16_pipelined_tile(
     const __nv_bfloat16* __restrict__ A,   // [M, K] BF16 activations
     const __nv_bfloat16* __restrict__ B,   // [N, K] BF16 weights (read transposed)
     __nv_bfloat16* __restrict__ C,          // [M, N] BF16 output
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int cta_m,
+    unsigned int cta_n
 ) {
-    const unsigned int cta_m = blockIdx.y * DM_M_TILE;
-    const unsigned int cta_n = blockIdx.x * DM_N_TILE;
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;   // 8 warps × 16 = 128 M-rows
@@ -568,6 +569,14 @@ extern "C" __global__ void dense_gemm_bf16_pipelined(
     }
 
     // ── Store C tile: f32 accumulators → BF16 output ──
+    // col0 is even, so with N even and C 4-byte aligned (col0, col1) leave as
+    // one 32-bit store of the same two __float2bfloat16 values: half the store
+    // instructions and sectors (a K=128, N=4096 call is bound by these stores).
+    const bool pairs = (N & 1u) == 0u && ((unsigned long long)C & 3u) == 0u;
+    auto pack = [](float lo, float hi) {
+        return (unsigned int)__bfloat16_as_ushort(__float2bfloat16(lo))
+            | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(hi)) << 16);
+    };
     #pragma unroll
     for (int n_tile = 0; n_tile < DM_N_TILES_PER_WARP; n_tile++) {
         unsigned int base_n = cta_n + n_tile * 8;
@@ -576,11 +585,33 @@ extern "C" __global__ void dense_gemm_bf16_pipelined(
         unsigned int row0 = cta_m + warp_m_offset + group_id;
         unsigned int row1 = row0 + 8;
 
+        if (pairs) {
+            if (col0 < N && row0 < M)
+                *(unsigned int*)&C[row0 * N + col0] = pack(acc[n_tile][0], acc[n_tile][1]);
+            if (col0 < N && row1 < M)
+                *(unsigned int*)&C[row1 * N + col0] = pack(acc[n_tile][2], acc[n_tile][3]);
+            continue;
+        }
         if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(acc[n_tile][0]);
         if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(acc[n_tile][1]);
         if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(acc[n_tile][2]);
         if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(acc[n_tile][3]);
     }
+}
+
+/// Tensor-core pipelined BF16 dense GEMM: C[M,N] = A[M,K] · B[N,K]^T.
+/// 128×128 tile (M×N), 8 warps, DM_STAGES-deep cp.async prefetch pipeline.
+/// Grid: (ceil(N/DM_N_TILE), ceil(M/DM_M_TILE), 1), Block: (256,1,1).
+extern "C" __global__ void dense_gemm_bf16_pipelined(
+    const __nv_bfloat16* __restrict__ A,   // [M, K] BF16 activations
+    const __nv_bfloat16* __restrict__ B,   // [N, K] BF16 weights (read transposed)
+    __nv_bfloat16* __restrict__ C,          // [M, N] BF16 output
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    dense_gemm_bf16_pipelined_tile(A, B, C, M, N, K, blockIdx.y * DM_M_TILE,
+        blockIdx.x * DM_N_TILE);
 }
 
 // Fused SiLU(gate) * up activation — vectorized 2-wide BF16 loads/stores.

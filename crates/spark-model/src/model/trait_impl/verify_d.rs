@@ -1,41 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! K=γ (DFlash) verify path.
-//!
-//! ## Safety
-//!
-//! `unsafe { from_raw_parts(...) }` blocks reinterpret stack arrays
-//! / `Vec`s of POD integers (`u32`, `i32`, `i64`, `usize`) as byte
-//! slices for H2D upload. See `verify_c.rs` module docs for the full
-//! safety contract — same pattern, same invariants here.
+//! H2D POD byte slices follow the safety contract documented in `verify_c.rs`.
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use anyhow::{Result, bail};
-use atlas_core::config::{LayerType, ModelConfig};
-use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
-use spark_runtime::kv_cache::PagedKvCache;
+use anyhow::Result;
+use atlas_core::config::LayerType;
 use std::time::Instant;
 
-use super::super::block_mgmt::{
-    apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
-    extract_layer_refs, reuse_prefix_match_disk_ids,
-};
-use super::super::ssm_pool::SsmStatePool;
-use super::super::ssm_snapshot::SsmSnapshotPool;
-use super::super::types::{PinnedMetaStaging, TransformerModel};
-use crate::layer::{
-    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
-};
+use super::super::types::TransformerModel;
+use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::ops;
-use crate::speculative::DraftProposer;
-use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
-use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
+use crate::traits::{Model, SequenceState};
+
+#[path = "verify_d_graph_policy.rs"]
+mod graph_policy;
+#[path = "verify_d_meta.rs"]
+mod meta;
+#[path = "verify_d_oracle.rs"]
+mod oracle;
+#[path = "verify_d_pieces.rs"]
+mod pieces;
 
 impl TransformerModel {
     pub(super) fn decode_verify_graphed_kgamma_dispatch(
@@ -43,14 +29,20 @@ impl TransformerModel {
         tokens: &[u32],
         seq: &mut SequenceState,
         _stream: u64,
+        // Strict structured-output row masks staged for this verify
+        // (`glm_verify_masks`): eager only, and the split head must serve.
+        allow: Option<spark_runtime::gpu::DevicePtr>,
     ) -> Result<Vec<u32>> {
         let k = tokens.len();
         if k == 0 {
             return Ok(Vec::new());
         }
+        let ban = seq.eos_ban;
+        let ban_rows = ban.row_mask(seq.seq_len, k);
         if self.lightning_dspark_identity.policy().is_some()
             && std::env::var("ATLAS_LIGHTNING_VERIFY_SERIAL_M1").as_deref() == Ok("1")
         {
+            anyhow::ensure!(allow.is_none(), "masked verify on the serial-M1 lane");
             return self.decode_verify_serial_m1_dispatch(tokens, seq, _stream);
         }
         let stream = self.gpu.default_stream();
@@ -58,11 +50,7 @@ impl TransformerModel {
         let bf16 = 2usize;
         let fp32 = 2usize;
 
-        // Item #2 (STree-style in-place K=γ verify): `h_state` IS canonical
-        // — the verify kernel reads/writes it directly and the commit
-        // (`commit_accepted_prefix`) rewinds it in place on reject. No
-        // scratch/canonical split — dual-buffer pre-verify copy eliminated.
-        // Modeled on verify_b.rs (K=2 in-place).
+        // Canonical h_state is rewound in place by commit_accepted_prefix.
 
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
@@ -81,99 +69,11 @@ impl TransformerModel {
         for t in 0..k {
             let pos = seq.seq_len + t;
             let blocks_needed = (pos / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
-        // 1c. Upload K-entry attention metadata. Layout in scratch (after
-        // mtp metadata reservation): positions[K*4] | slots[K*8] | seq_lens[K*4]
-        // | block_table[K*max_blocks*4]. Need K*16 + K*max_blocks*4 bytes per
-        // call — at K=17 max_blocks=512 that's ~36 KB which fits comfortably
-        // in the scratch arena (offset 32768).
-        let meta_base = self.buffers.scratch().offset(32768);
-        let max_blocks = self.max_blocks_per_seq;
-
-        let positions: Vec<u32> = (0..k).map(|t| (seq.seq_len + t) as u32).collect();
-        // SAFETY: `positions` is built one line above by `(0..k).map(..)
-        // .collect()`, so `positions.len() == k` exactly (collect on a
-        // `Range` yields one element per step) — `k * 4 == size_of_val(&
-        // positions[..])`. Every element is written by the collect, so no
-        // uninitialised spare capacity is read. `u32` is POD.
-        let pos_bytes =
-            unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, k * 4) };
-        self.gpu.copy_h2d_async(pos_bytes, meta_base, stream)?;
-
-        let mut slots = vec![0i64; k];
-        for t in 0..k {
-            let pos = seq.seq_len + t;
-            let block_idx = pos / bs;
-            let block_offset = pos % bs;
-            let physical_block = seq.physical_block_for(block_idx).unwrap_or(0);
-            slots[t] = (physical_block as i64) * (bs as i64) + (block_offset as i64);
-        }
-        // 256-byte gap mirrors K=4 layout for ABI compatibility with
-        // attention kernels that index meta_base + fixed offsets.
-        // SAFETY: `slots` is `vec![0i64; k]`, so its LEN (not merely its
-        // capacity) is `k` and every element is zero-initialised before the
-        // `for t in 0..k` loop overwrites it — `k * 8 == size_of_val(&
-        // slots[..])`, with no read past `len` into spare capacity.
-        let slot_bytes = unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, k * 8) };
-        self.gpu
-            .copy_h2d_async(slot_bytes, meta_base.offset(256), stream)?;
-
-        let seq_lens: Vec<i32> = (0..k).map(|t| (seq.seq_len + t + 1) as i32).collect();
-        // SAFETY: `seq_lens` is `(0..k).map(..).collect()` on the line above,
-        // so `seq_lens.len() == k` and `k * 4 == size_of_val(&seq_lens[..])`;
-        // all `k` elements are initialised by the collect. `i32` is POD.
-        let sl_bytes = unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, k * 4) };
-        self.gpu
-            .copy_h2d_async(sl_bytes, meta_base.offset(512), stream)?;
-
-        let mb = max_blocks as usize;
-        let needed = k * mb;
-        let mut bt_buf = vec![0i32; needed];
-        for row in 0..k {
-            for (j, &block) in seq.block_table.iter().enumerate().take(mb) {
-                bt_buf[row * mb + j] = block as i32;
-            }
-        }
-        // SAFETY: `bt_buf` is `vec![0i32; needed]` on the line above, so its
-        // LEN is `needed` and `needed * 4 == size_of_val(&bt_buf[..])` — the
-        // read stops at `len`, never in the `Vec`'s spare capacity. The
-        // zero-init at construction covers the tail the `for row in 0..k`
-        // fill leaves untouched when `block_table.len() < mb`.
-        let bt_bytes =
-            unsafe { std::slice::from_raw_parts(bt_buf.as_ptr() as *const u8, needed * 4) };
-        self.gpu
-            .copy_h2d_async(bt_bytes, meta_base.offset(768), stream)?;
-
-        // Request-scoped LoRA routing (graphed γ-verify) — see verify_b.rs. One
-        // sequence → one adapter; [K]-all-equal buffer at the +128 gap, uploaded
-        // pre-`begin_capture`. γ spec depth MUST stay ≤ 32 or +128+K*4 would
-        // overrun slot@+256. `DevicePtr(0)` (no pool) → installed-pair path.
-        debug_assert!(k <= 32, "γ verify seq_slot +128 gap holds K ≤ 32");
-        let seq_slot =
-            self.upload_seq_slot_uniform(seq.adapter_slot, k, meta_base.offset(128), stream)?;
-
-        let metadata = AttnMetadataDev {
-            positions: meta_base,
-            positions_h: meta_base,
-            positions_w: meta_base,
-            slot: meta_base.offset(256),
-            seq_len: meta_base.offset(512),
-            block_table: meta_base.offset(768),
-            max_blocks_per_seq: max_blocks,
-            num_seqs: k as u32,
-            seq_slot,
-            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
-        };
+        // 1c. Upload K-entry attention metadata (see `kgamma_upload_meta`).
+        let metadata = self.kgamma_upload_meta(seq, k, bs, stream)?;
 
         // Phase 6.2.c — HSS host I/O is illegal under CUDA graph capture.
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
@@ -187,21 +87,29 @@ impl TransformerModel {
         let force_eager = if self.lightning_dspark_identity.policy().is_some() {
             false
         } else {
-            std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1")
+            crate::model::graph_flags::dflash_debug_no_graph()
         };
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        // A layer whose decode keeps HOST-side per-sequence state cannot be
-        // captured: a replayed graph re-runs the kernels but NOT the Rust that
-        // maintains the counter beside them. The QSA indexer's `ingested`
-        // froze at the capture step while the sequence kept advancing, and the
-        // desync stayed invisible until a non-replayed path ran a
-        // `decode_select` again — at the MTP gate's batch-width switch, which
-        // failed with "decode at pos 34 but 26 tokens ingested". `decode_a`
-        // and `decode_a2` already apply this veto; the verify paths never did,
-        // because on this model they used to refuse before reaching a graph.
+        // Host-maintained per-layer state must not freeze during graph replay.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
-        let use_graphs = self.comm.is_none()
+        // Preserve K5 opt-in; repaired C1 K2 has a separate default-off gate.
+        let glm_tp_graphs = (self.config.model_type == "glm5_next"
+            && k == 5
+            && self.config.tp_world_size == 2
+            && crate::model::graph_flags::glm_tp_verify_graph())
+            || graph_policy::mtp1_graph_allowed(
+                crate::model::graph_flags::glm_mtp1_verify_graph(),
+                &self.config.model_type,
+                self.config.tp_world_size,
+                self.config.ep_world_size,
+                self.levers.max_decode_seqs,
+                k,
+                crate::speculative::glm_repair_policy::enabled(),
+                crate::model::graph_flags::k2_diag(),
+            );
+        let use_graphs = (self.comm.is_none() || glm_tp_graphs)
+            && allow.is_none()
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -210,6 +118,13 @@ impl TransformerModel {
             && !super::verify_layer_trace::enabled()
             && !lora_eager
             && !layer_veto;
+        // The optional M16 oracle must never perform D2H inside capture.
+        crate::layers::moe::validate_m16_gate_up_graphs(&self.config.model_type, use_graphs)?;
+        crate::layers::moe::validate_shared_fp8_cache_graphs(&self.config.model_type, use_graphs)?;
+        crate::layers::moe::validate_m5_projection_graphs(&self.config.model_type, k, use_graphs)?;
+        let verify_profile = std::env::var("ATLAS_GLM_VERIFY_PROFILE").ok().as_deref() == Some("1")
+            && self.config.model_type == "glm5_next"
+            && !use_graphs;
 
         // PLE's host half (n-gram hash + NVMe fault-in + slot upload) for the
         // WHOLE draft window, hoisted before capture/replay exactly as
@@ -227,6 +142,7 @@ impl TransformerModel {
         }
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -235,7 +151,7 @@ impl TransformerModel {
             levers: &self.levers,
             stats: &self.stats,
             attn_metadata: Some(metadata),
-            profile: false,
+            profile: verify_profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
@@ -245,6 +161,37 @@ impl TransformerModel {
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
         };
+
+        // GLM DFlash lane: a verify block is an ordinary causal prefill chunk
+        // of k rows continuing at seq_len, so full-attention (MLA) layers take
+        // the multi-row prefill path (batched projections, row-tiled index
+        // selection and sparse attention) instead of one decode chain per row.
+        // Rejected rows' K/V and per-token index entries are rewritten by the
+        // next block, which re-finalizes the pools it touches. KDA layers keep
+        // the verify path that snapshots per-row recurrent state.
+        let glm_prefill_ctx = (self.config.model_type == "glm5_next"
+            && crate::speculative::glm_repair_policy::dflash_enabled()
+            && crate::speculative::glm_repair_policy::dflash_prefill_verify()
+            && !hss_engaged
+            && !use_graphs
+            && k >= 2)
+            .then(|| ForwardContext {
+                attn_metadata: Some(AttnMetadataDev {
+                    positions: metadata.positions,
+                    positions_h: metadata.positions,
+                    positions_w: metadata.positions,
+                    slot: metadata.slot,
+                    // Chunk-total length: the last row's causal extent.
+                    seq_len: metadata.seq_len.offset((k - 1) * 4),
+                    block_table: metadata.block_table,
+                    max_blocks_per_seq: metadata.max_blocks_per_seq,
+                    num_seqs: 1,
+                    seq_slot: metadata.seq_slot,
+                    moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
+                }),
+                midchunk_capture: None,
+                ..ctx
+            });
 
         // ── Phase 2: CUDA graph capture / replay ──
 
@@ -272,6 +219,10 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            let mut attn_us = 0u128;
+            let mut kda_us = 0u128;
+            let mut attn_layers = 0usize;
+            let mut kda_layers = 0usize;
             // Product Lightning serves carry force_eager=false from the
             // frozen admission, so this timing hatch only arms on
             // diagnostic/generic serves (it requires eager anyway).
@@ -280,15 +231,60 @@ impl TransformerModel {
             let mut t_attn = 0u128;
             let mut t_moe = 0u128;
             let mut t_lin = 0u128;
+            // ATLAS_GLM_VERIFY_GRAPH: KDA runs replay piecewise graphs; the
+            // sparse-MLA layers and the head stay eager (host seq_len/ban).
+            let pieces = pieces::admitted(
+                crate::model::verify_pieces::requested(),
+                &self.config.model_type,
+                self.config.tp_world_size,
+                use_graphs
+                    || self.comm.is_none()
+                    || self.lora.is_some()
+                    || self
+                        .suppress_graphs
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    || hss_engaged
+                    || force_eager
+                    || layer_veto
+                    || verify_profile
+                    || super::verify_layer_trace::enabled()
+                    || pieces::diagnostics_sync(),
+            );
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if pieces && self.kgamma_kda_run(layer_idx, k, seq, &mut kv_cache, &ctx, stream)? {
+                    continue;
+                }
                 let layer_type = self.config.layer_type(layer_idx);
+                let layer_started = if verify_profile {
+                    self.gpu.synchronize(stream)?;
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 if time_layers {
                     self.gpu.synchronize(stream)?;
                 }
                 let t0 = Instant::now();
 
-                if layer_type == LayerType::FullAttention {
+                if layer_type == LayerType::FullAttention
+                    && let Some(ref prefill_ctx) = glm_prefill_ctx
+                {
+                    layer.prefill(
+                        hidden,
+                        residual,
+                        k,
+                        seq.layer_states[layer_idx].as_mut(),
+                        &mut kv_cache,
+                        seq.seq_len,
+                        &mut seq.block_table,
+                        &mut seq.disk_block_ids,
+                        &mut seq.disk_last_offloaded_per_layer,
+                        0,
+                        prefill_ctx,
+                        stream,
+                    )?;
+                } else if layer_type == LayerType::FullAttention {
                     if hss_engaged {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context
@@ -345,36 +341,17 @@ impl TransformerModel {
                     )?;
                 }
                 self.trace_lightning_hidden_rows("k4", seq.seq_len, layer_idx, hidden, k, stream)?;
-                // DFlash intermediate hidden capture: snapshot each capture
-                // layer's output at position k-1 (last verify token) into
-                // dflash_hidden_save[slot] while hidden_states still holds
-                // this layer's activation — mirrors verify_b.rs for K=2.
-                // Must be inside the graph capture region so the per-layer
-                // intermediate (not the final-layer-only post-loop value) is
-                // recorded. Under ATLAS_DFLASH_EAGLE_FIX=1 OR
-                // ATLAS_DFLASH_UNIFIED_CTX=1, capture ALL k verify rows so
-                // the scheduler can append rows 0..=num_accepted to ctx
-                // after the accept walk (EAGLE order). UNIFIED_CTX requires
-                // the same full capture: commit_ctx copies scratch rows
-                // 0..=num_accepted — with only the k-1 capture, row 0 holds
-                // the WRONG token's hidden and rows 1.. are stale garbage
-                // (2026-07-09 accept-collapse root cause: EAGLE_FIX=0 under
-                // UNIFIED=1 starved this capture and poisoned drafter ctx).
-                // Always capture every verify row. commit_ctx copies
-                // 0..=num_accepted; capturing only k-1 poisons the next
-                // propose (2026-07-09 accept-collapse). Opt out with
-                // ATLAS_DFLASH_CAPTURE_LAST_ONLY=1 for ablation.
-                // Ablation only: product Lightning serves never arm this
-                // (the admitted policy freezes the diagnostic surface).
-                let capture_last_only = self.lightning_dspark_identity.policy().is_none()
-                    && std::env::var("ATLAS_DFLASH_CAPTURE_LAST_ONLY")
-                        .ok()
-                        .as_deref()
-                        == Some("1");
-                if capture_last_only {
-                    self.try_dflash_capture(layer_idx, k - 1, stream)?;
-                } else {
-                    self.try_dflash_capture_all(layer_idx, k, stream)?;
+                self.kgamma_dflash_capture(layer_idx, k, stream)?;
+                if let Some(started) = layer_started {
+                    self.gpu.synchronize(stream)?;
+                    let elapsed = started.elapsed().as_micros();
+                    if layer_type == LayerType::FullAttention {
+                        attn_us += elapsed;
+                        attn_layers += 1;
+                    } else {
+                        kda_us += elapsed;
+                        kda_layers += 1;
+                    }
                 }
                 if time_layers {
                     self.gpu.synchronize(stream)?;
@@ -387,6 +364,15 @@ impl TransformerModel {
                 }
             }
 
+            if verify_profile {
+                tracing::info!(
+                    "GLM Kgamma layer profile K={k}: kda={:.2}ms({}L) mla={:.2}ms({}L)",
+                    kda_us as f64 / 1000.0,
+                    kda_layers,
+                    attn_us as f64 / 1000.0,
+                    attn_layers,
+                );
+            }
             if time_layers {
                 tracing::info!(
                     "DFLASH LAYER_TIMING K={k}: attn={:.1}ms moe={:.1}ms mamba={:.1}ms",
@@ -400,23 +386,35 @@ impl TransformerModel {
             let normed = self.buffers.norm_output();
             self.final_norm_rows(hidden, normed, k as u32, stream)?;
 
-            // LM head for K tokens
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
-
-            // Argmax inside graph (fixed scratch addresses — graph-safe)
-            let vocab = self.config.vocab_size;
+            // LM head + argmax for K tokens, inside the graph (fixed scratch
+            // addresses — graph-safe).
             let argmax_out = self.buffers.scratch();
-            for t in 0..k {
-                let logits_t = self.buffers.logits().offset(t * vocab * bf16);
-                let out_t = argmax_out.offset(t * 4);
-                ops::argmax_bf16(
-                    self.gpu.as_ref(),
-                    self.argmax_kernel,
-                    logits_t,
-                    out_t,
-                    vocab as u32,
-                    stream,
-                )?;
+            if !self.glm_split_head_argmax(
+                normed,
+                k,
+                argmax_out,
+                (ban_rows, &ban),
+                allow,
+                stream,
+            )? {
+                anyhow::ensure!(
+                    allow.is_none(),
+                    "masked verify needs the GLM vocab-split head, which declined"
+                );
+                self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+                let vocab = self.config.vocab_size;
+                for t in 0..k {
+                    let logits_t = self.buffers.logits().offset(t * vocab * bf16);
+                    let out_t = argmax_out.offset(t * 4);
+                    ops::argmax_bf16(
+                        self.gpu.as_ref(),
+                        self.argmax_kernel,
+                        logits_t,
+                        out_t,
+                        vocab as u32,
+                        stream,
+                    )?;
+                }
             }
 
             if use_graphs {
@@ -449,6 +447,11 @@ impl TransformerModel {
                 buf[off + 2],
                 buf[off + 3],
             ]));
+        }
+
+        // The diagnostic compares against an unmasked head; masked rows differ.
+        if allow.is_none() {
+            self.check_glm_k5_bf16_head(k, &out, stream)?;
         }
 
         // See decode_verify_graphed for rationale on `seq_len += k` fix.

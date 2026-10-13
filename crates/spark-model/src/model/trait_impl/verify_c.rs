@@ -51,6 +51,10 @@ impl TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 3]> {
         let stream = self.gpu.default_stream();
+        // ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK: serial reference rows first,
+        // before the KV lock below (`exact_verify_check.rs`).
+        let serial_rows = self.exact_verify_serial_rows(&tokens[..], seq)?;
+        let seq_len_in = seq.seq_len;
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let fp32 = 2usize;
@@ -80,15 +84,7 @@ impl TransformerModel {
         for t in 0..k {
             let pos = seq.seq_len + t;
             let blocks_needed = (pos / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
         // 1c. Upload 3-entry attention metadata
@@ -212,6 +208,7 @@ impl TransformerModel {
         }
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -220,7 +217,16 @@ impl TransformerModel {
             levers: &self.levers,
             stats: &self.stats,
             attn_metadata: Some(metadata),
-            profile: false,
+            // Honour `--profile`. This is the context the K=3 verify actually
+            // runs its layers in, so hardcoding `false` left the served verify
+            // — ~106 ms, about 90 % of every decode step — unattributable by
+            // any in-tree profiler: the highway verify profiler sits on a path
+            // this configuration does not take, and the per-layer profiler is
+            // this field. Graphs are already off here for a multi-rank world
+            // (`use_graphs` above requires `comm.is_none()` and our comm is
+            // Some), so enabling profiling does not have to disable capture
+            // and cannot perturb what it measures.
+            profile: self.config.profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
@@ -257,7 +263,27 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // qwen4_exp piecewise graphs (`model::decode_pieces`), as in
+            // verify_b.
+            let pieces = self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx);
+            let wide = self.decode_piece_wide(pieces, seq, k);
+
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if pieces
+                    && self.verify_piece_run(
+                        layer_idx,
+                        k,
+                        wide,
+                        seq,
+                        &mut kv_cache,
+                        &seq_lens_vec,
+                        &block_tables_vec,
+                        &ctx,
+                        stream,
+                    )?
+                {
+                    continue;
+                }
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
@@ -325,13 +351,16 @@ impl TransformerModel {
                 // No-op when DFlash is disabled.
                 self.try_dflash_capture(layer_idx, k - 1, stream)?;
             }
+            if wide {
+                self.qsa_commit_staged_seq(seq, k, stream)?;
+            }
 
             // Final norm [3, H]
             let normed = self.buffers.norm_output();
             self.final_norm_rows(hidden, normed, k as u32, stream)?;
 
             // LM head for 3 tokens
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+            self.lm_head_batched_tp(normed, k, stream)?;
 
             // Argmax inside graph
             let vocab = self.config.vocab_size;
@@ -359,6 +388,10 @@ impl TransformerModel {
                     self.gpu.launch_graph(graph, stream)?;
                 }
             }
+        }
+
+        if let Some(rows) = serial_rows {
+            self.exact_verify_compare(rows, seq_len_in)?;
         }
 
         // ── Phase 3: Post-graph (D2H copy only) ──

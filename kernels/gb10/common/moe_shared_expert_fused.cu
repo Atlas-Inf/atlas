@@ -252,7 +252,6 @@ extern "C" __global__ void moe_expert_silu_down_shared(
 
     const unsigned int n1 = blockIdx.x * (N_PER_BLOCK * 2) + local_out * 2;
     const unsigned int n2 = n1 + 1;
-    if (n1 >= N) return;
     const bool have_n2 = (n2 < N);
 
     const unsigned int half_K = K / 2;
@@ -312,6 +311,10 @@ extern "C" __global__ void moe_expert_silu_down_shared(
         s_act[i] = (gf / (1.0f + __expf(-gf))) * uf;
     }
     __syncthreads();
+
+    // A warp with no output row (last x-block when N % 8 is 1..6) leaves only
+    // here: the warps that stay read every s_act slot, its share included.
+    if (n1 >= N) return;
 
     // Phase 2: GEMV with 16 K-values per iteration
     float acc1 = 0.0f, acc2 = 0.0f;

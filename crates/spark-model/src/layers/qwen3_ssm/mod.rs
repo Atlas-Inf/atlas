@@ -62,6 +62,12 @@ pub struct Qwen3SsmLayer {
     // FP8 E4M3 checkpoint weights for native FP8 serving (w8a16_gemv LUT kernel)
     qkvz_fp8w: Option<Fp8Weight>,
     out_proj_fp8w: Option<Fp8Weight>,
+    /// The `*_fp8w` copies serve DECODE only: the prefill GEMMs keep reading
+    /// the BF16 `ssm.in_proj_qkvz` / `out_proj_dense` they were derived from,
+    /// and the batched decode out_proj reads FP8 ahead of that BF16 copy.
+    /// Set by `quantize_dense_gdn_to_fp8` (`ATLAS_QWEN4EXP_FP8_GDN=1`); false
+    /// everywhere else, where the dispatch is unchanged.
+    fp8w_decode_only: bool,
     // Transposed [K,N] copies of the block-scaled FP8 weights for the coalesced
     // `w8a16_gemm_t` prefill path — populated by `transpose_fp8_for_prefill`
     // for native-FP8 GDN checkpoints. The non-transposed `*_fp8w` copies stay
@@ -410,13 +416,16 @@ pub struct Qwen3SsmLayer {
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
+mod exact_rows;
 mod fla_dispatch;
 pub mod gdn_flags;
+mod gdn_fused_rows;
 mod init;
 mod init_fp8;
 mod init_q2;
 mod kernel_select;
 mod lora;
+mod ssm_decode_tail;
 mod ssm_forward;
 pub(crate) mod ssm_h_fp16;
 mod trait_decode;
@@ -429,6 +438,7 @@ mod trait_decode_batched_conv_gdn_wyn;
 mod trait_decode_batched_hc;
 mod trait_decode_hc;
 mod trait_decode_multi_seq;
+pub(crate) use trait_decode_multi_seq::moe_legacy_pertoken_decode;
 mod trait_layer;
 mod trait_prefill;
 mod trait_prefill_block;
@@ -442,7 +452,7 @@ mod trait_prefill_recur;
 
 pub use gdn_flags::{
     GdnFlags, gdn_fused_norm_enabled, ssm_batched_recurrent_enabled, ssm_h_dtype_bits,
-    ssm_h_f16_pool_enabled, ssm_h_fp16_enabled, verify_exact_enabled,
+    ssm_h_f16_pool_enabled, ssm_h_fp16_enabled, verify_exact_enabled, verify_exact_for,
 };
 
 // ── TransformerLayer impl (delegates to per-file inherent _inner methods) ──

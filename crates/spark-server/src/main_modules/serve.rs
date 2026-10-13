@@ -84,7 +84,7 @@ pub(crate) async fn serve(
             // swap would have nothing to join and would tear down a model with
             // a live scheduler still holding its weights.
             host.set_scheduler(prepared.scheduler);
-            let served = crate::main_modules::serve_router::build_and_serve(
+            let result = crate::main_modules::serve_router::build_and_serve(
                 host.clone(),
                 &prepared.bind,
                 prepared.port,
@@ -93,7 +93,7 @@ pub(crate) async fn serve(
             let h = host.clone();
             tokio::task::spawn_blocking(move || crate::main_modules::model_swap::shutdown(&h))
                 .await?;
-            served
+            result
         }
         Startup::Worker => Ok(()),
         // Nothing to serve YET — but the listener still comes up. Waiting for
@@ -322,7 +322,7 @@ pub(super) fn build_auth_config(
     Ok(Some(Arc::new(cfg)))
 }
 
-/// Resolve the vision area bound: operator override, else the checkpoint's
+/// Resolve the vision pixel budget: operator override, else the checkpoint's
 /// own `preprocessor_config.json`, else `None` (preprocessor falls back to
 /// its historical 1280px long-side clamp).
 ///

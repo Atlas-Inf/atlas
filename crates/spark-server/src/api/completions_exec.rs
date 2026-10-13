@@ -87,6 +87,7 @@ pub(super) async fn run_blocking(
                 image_pixels: Vec::new(),
                 max_tokens: req.max_tokens,
                 min_tokens: 0,
+                ignore_eos: req.ignore_eos,
                 temperature: p.temperature,
                 top_k: p.top_k,
                 top_p: p.top_p,
@@ -119,7 +120,7 @@ pub(super) async fn run_blocking(
                 top_logprobs: p.logprobs_k,
                 prompt_logprobs: if req.echo { p.logprobs_k } else { None },
                 echo: req.echo,
-                timeout_at: state.request_deadline(None),
+                timeout_at: state.request_deadline(req.timeout),
                 response_tx: tx,
             };
 

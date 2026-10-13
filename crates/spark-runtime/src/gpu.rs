@@ -81,6 +81,11 @@ pub enum KernelArg<'a> {
 
 pub use crate::gpu_args::pack_kernel_args;
 
+pub use crate::gpu_pitched::{
+    HOST_PINNED_ALIGN, HostPitched, Pitched, copy_d2h_pitched_async,
+    copy_h2d_pitched_async_retained,
+};
+
 /// GPU backend trait — SBIO IORouter for all CUDA operations.
 ///
 /// Implementations: `AtlasCudaBackend` (production), `MockGpuBackend` (tests).
@@ -109,6 +114,14 @@ pub trait GpuBackend: Send + Sync {
     /// sweep, which is honest for the mock and for Metal.
     fn sweep_unreleased(&self) -> usize {
         0
+    }
+
+    /// Memory this process took since the backend was created, from counters
+    /// no other process can move ([`crate::own_footprint`]). `None`: the
+    /// backend keeps no such account (mock, Metal, and the CUDA backend built
+    /// for AMD, where the counters are unmeasured) and callers use free memory.
+    fn own_footprint(&self) -> Option<crate::own_footprint::OwnFootprint> {
+        None
     }
 
     /// Copy from host to device.
@@ -187,6 +200,13 @@ pub trait GpuBackend: Send + Sync {
 
     /// Synchronize a CUDA stream (blocks until all work completes).
     fn synchronize(&self, stream: u64) -> Result<()>;
+
+    /// Block until work on EVERY stream of this device context completes
+    /// (e.g. before host reads of memory other streams may still be writing).
+    /// Default: the default stream only — correct for single-stream backends.
+    fn synchronize_device(&self) -> Result<()> {
+        self.synchronize(self.default_stream())
+    }
 
     /// Get the default stream handle.
     fn default_stream(&self) -> u64;
@@ -313,6 +333,12 @@ pub trait GpuBackend: Send + Sync {
         Ok(())
     }
 
+    /// This backend's native pitched host↔device copies, if it has them
+    /// (see [`copy_h2d_pitched_async_retained`]; `None` = a copy per row).
+    fn host_pitched(&self) -> Option<&dyn HostPitched> {
+        None
+    }
+
     /// Begin capturing CUDA operations on `stream` into a graph.
     ///
     /// All kernel launches and async copies on this stream between
@@ -427,6 +453,12 @@ pub trait GpuBackend: Send + Sync {
         Ok(0) // Default: return legacy stream
     }
 
+    /// Destroy a stream from [`Self::create_stream`] once its work is done
+    /// (stream 0, the legacy stream, is never destroyed).
+    fn destroy_stream(&self, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Bind the CUDA context to the current thread.
     ///
     /// Must be called on any thread that uses GPU operations (alloc, launch, etc.)
@@ -516,7 +548,7 @@ pub trait GpuBackend: Send + Sync {
     /// on their own and their wrappers memset explicitly.
     fn alloc_host_pinned(&self, bytes: usize) -> Result<*mut u8> {
         // Default: regular heap allocation (mock backend, no pinning)
-        let layout = std::alloc::Layout::from_size_align(bytes, 64)
+        let layout = std::alloc::Layout::from_size_align(bytes, HOST_PINNED_ALIGN)
             .map_err(|e| anyhow::anyhow!("invalid layout: {e}"))?;
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
@@ -529,7 +561,7 @@ pub trait GpuBackend: Send + Sync {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn free_host_pinned(&self, ptr: *mut u8, bytes: usize) -> Result<()> {
         if !ptr.is_null() {
-            let layout = std::alloc::Layout::from_size_align(bytes, 64)
+            let layout = std::alloc::Layout::from_size_align(bytes, HOST_PINNED_ALIGN)
                 .map_err(|e| anyhow::anyhow!("invalid layout: {e}"))?;
             unsafe { std::alloc::dealloc(ptr, layout) };
         }

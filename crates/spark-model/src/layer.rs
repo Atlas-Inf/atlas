@@ -13,6 +13,12 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
+pub mod glm_long_owner;
+mod prefill_pieces;
+pub mod ssm_batch;
+pub use prefill_pieces::{
+    PREFILL_ATTENTION_ROWS, PREFILL_MAX_SUB_CHUNKS, prefill_attention_pieces,
+};
 mod transformer_layer;
 pub use transformer_layer::{
     TransformerLayer, VERIFY_WY_LAYER_STRIDE_BYTES, VERIFY_WY_TABLE_SEQS,
@@ -92,6 +98,10 @@ pub struct SsmLayerState {
     /// `gated_delta_rule_commit` rather than the intermediates index-select.
     /// Cleared at commit / rollback.
     pub gdn_commit_pending: bool,
+    /// GLM KDA fold records of a verify (`--ssm-rollback-mode records`): the
+    /// verify leaves `h_state` untouched and the commit folds the accepted
+    /// rows into it (NULL, with snapshots in `h_state_intermediates`, off).
+    pub kda_records: DevicePtr,
     /// Storage dtype of `h_state`: `false` = FP32, `true` = FP16
     /// (`--ssm-h-dtype f16`).
     ///
@@ -345,6 +355,9 @@ pub struct ForwardContext<'a> {
     pub stats: &'a crate::layers::ops::ModelStats,
     /// Pre-uploaded attention metadata (None if no attention layers).
     pub attn_metadata: Option<AttnMetadataDev>,
+    /// Independent live FP32 SSM rows, validated and refreshed before replay.
+    /// None for prefill, temporal verification, and unsupported decode scopes.
+    pub ssm_batch: Option<ssm_batch::SsmBatchView<'a>>,
     /// Profile mode: sync+time per-operation within layers.
     pub profile: bool,
     /// Communication backend for expert parallelism (EP) all-reduce.

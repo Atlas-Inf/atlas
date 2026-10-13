@@ -84,9 +84,7 @@ impl CompiledGrammarImpl {
     /// `MemorySize(const CompiledGrammar::Impl&)`. The mask term sums
     /// only the masks computed so far (the lazy cache).
     pub fn memory_size(&self) -> usize {
-        let grammar_bytes = self.grammar.complete_fsm.memory_size()
-            + self.grammar.num_exprs() as usize * 4
-            + self.grammar.num_rules() as usize * 32;
+        let grammar_bytes = self.grammar_memory_size();
         let mask_bytes: usize = self
             .mask_cache
             .lock()
@@ -95,6 +93,11 @@ impl CompiledGrammarImpl {
             .map(|m| m.memory_size())
             .sum();
         grammar_bytes + mask_bytes
+    }
+
+    /// The grammar term of [`Self::memory_size`].
+    pub fn grammar_memory_size(&self) -> usize {
+        self.grammar.memory_size()
     }
 
     /// Build the cross-grammar [`RuleMaskKey`] for a canonical parser
@@ -297,6 +300,13 @@ impl CompiledGrammar {
     /// `CompiledGrammar::MemorySizeBytes`.
     pub fn memory_size_bytes(&self) -> usize {
         self.pimpl.memory_size()
+    }
+
+    /// Approximate memory of the grammar structure alone, without the
+    /// lazily filled mask cache: a fixed property of the grammar, unlike
+    /// [`Self::memory_size_bytes`], which grows as the grammar is used.
+    pub fn grammar_memory_size_bytes(&self) -> usize {
+        self.pimpl.grammar_memory_size()
     }
 
     /// OVERLAPPED MASK GENERATION (Tier 2, "configurable JIT").

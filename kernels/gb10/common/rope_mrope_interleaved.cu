@@ -29,6 +29,7 @@
 // Grid: (num_q_heads + num_kv_heads, ceil(seq_len / pos_per_block), batch)
 // Block: (128, 1, 1)
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 extern "C" __global__ void rope_forward_mrope_interleaved(
@@ -44,6 +45,7 @@ extern "C" __global__ void rope_forward_mrope_interleaved(
     const unsigned int rotary_dim,
     const float theta
 ) {
+    atlas_pdl_enter();
     const unsigned int head_idx = blockIdx.x;
     const unsigned int seq_block = blockIdx.y;
     const unsigned int batch = blockIdx.z;

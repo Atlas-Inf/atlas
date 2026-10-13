@@ -29,7 +29,7 @@ const VERIFY_SNAP_SLOTS: usize = 9;
 /// Bisection hatch: `ATLAS_PLE_VERIFY_SNAPSHOTS=0` restores the single batched
 /// conv launch, which leaves nothing for `rollback_verify` to restore — the
 /// PLE carry then keeps rejected drafts. Debug only.
-fn verify_snapshots_enabled() -> bool {
+pub(crate) fn verify_snapshots_enabled() -> bool {
     std::env::var("ATLAS_PLE_VERIFY_SNAPSHOTS").ok().as_deref() != Some("0")
 }
 

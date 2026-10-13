@@ -220,7 +220,14 @@ fn every_finish_site_is_a_recorded_decision() {
             11,
             3,
         ),
-        ("emit_step.rs", include_str!("emit_step.rs"), 11, 6),
+        ("emit_step.rs", include_str!("emit_step.rs"), 10, 6),
+        // The cooperative-cancel retirement, shared with the decode path.
+        (
+            "emit_step/cancel.rs",
+            include_str!("emit_step/cancel.rs"),
+            1,
+            0,
+        ),
         (
             "decode_logits_content.rs",
             include_str!("decode_logits_content.rs"),

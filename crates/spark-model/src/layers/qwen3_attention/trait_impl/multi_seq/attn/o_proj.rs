@@ -213,6 +213,20 @@ impl Qwen3AttentionLayer {
                     )?;
                 }
             }
+        } else if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) && !self.attn.o_proj.is_null() {
+            // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the single-row GEMV per row.
+            for i in 0..n {
+                self.nvfp4_decode_gemv(
+                    fwd.gpu,
+                    fwd.levers.gemv_sw,
+                    attn_out.offset(i * q_dim as usize * bf16),
+                    &self.attn.o_proj,
+                    o_out.offset(i * h * bf16),
+                    h as u32,
+                    nq * hd,
+                    stream,
+                )?;
+            }
         } else if n == 3 && !self.attn.o_proj.is_null() {
             ops::w4a16_gemv_batch3(
                 fwd.gpu,
@@ -231,6 +245,25 @@ impl Qwen3AttentionLayer {
                 attn_out,
                 &self.attn.o_proj,
                 o_out,
+                h as u32,
+                nq * hd,
+                stream,
+            )?;
+        } else if n == 4
+            && fwd.levers.qwen4exp_exact_verify
+            && !self.attn.o_proj.is_null()
+            && self.w4a16_batchm.scalar_kernel(4).0 != 0
+        {
+            // qwen4_exp exact K=4 verify: the scalar batch4 template, whose
+            // rows equal serial decode's `w4a16_gemv[_sw]`. The wide arm below
+            // may take DP4A or the tensor-core tier, which do not.
+            ops::w4a16_gemv_batchm(
+                fwd.gpu,
+                self.w4a16_batchm.scalar_kernel(4),
+                attn_out,
+                &self.attn.o_proj,
+                o_out,
+                4,
                 h as u32,
                 nq * hd,
                 stream,

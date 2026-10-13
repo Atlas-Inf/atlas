@@ -93,8 +93,15 @@ impl StreamingToolDetector {
 }
 
 /// Extract function name from partial tool call buffer for incremental streaming.
-/// Handles Hermes JSON, Qwen3-Coder XML, Gemma-4, and Mistral native formats.
-pub(super) fn extract_streaming_name(buffer: &str) -> Option<String> {
+/// Handles Poolside v1, Hermes JSON, Qwen3-Coder XML, Gemma-4, and Mistral native.
+pub(super) fn extract_streaming_name(buffer: &str, poolside: bool) -> Option<String> {
+    // The detector has already removed <tool_call>. In Poolside mode the
+    // leading name is complete only when <arg_key> arrives. Never scan a
+    // nested JSON value for a Hermes "name" field in this mode.
+    if poolside {
+        let end = buffer.find("<arg_key>")?;
+        return poolside_v1_name(&buffer[..end]);
+    }
     // Mistral native: [TOOL_CALLS]NAME[ARGS]
     if let Some(start) = buffer.find(MISTRAL_TOOL_CALLS_TAG) {
         let after = &buffer[start + MISTRAL_TOOL_CALLS_TAG.len()..];

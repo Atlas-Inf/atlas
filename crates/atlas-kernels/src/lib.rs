@@ -271,6 +271,9 @@ pub struct ModelBehavior {
     pub enable_loop_watchdog: bool,
     /// See build_parse.rs: gate for the THINKING-phase loop watchdog.
     pub enable_think_loop_watchdog: bool,
+    /// See build_parse_behavior.rs: arm the chat stream's SimHash and
+    /// token-loop guards. Defaults TRUE.
+    pub enable_stream_loop_guards: bool,
     /// See build_parse_behavior.rs: honor a mid-`<think>` EOS by implicitly
     /// closing the block. Defaults FALSE (pre-p350 behaviour).
     pub honor_eos_inside_thinking: bool,
@@ -418,6 +421,7 @@ impl Default for ModelBehavior {
             jinja_template: "",
             enable_loop_watchdog: false,
             enable_think_loop_watchdog: true,
+            enable_stream_loop_guards: true,
             honor_eos_inside_thinking: false,
             min_reasoning_floor_tokens: 16,
             cap_thinking_at_max_tokens: true,

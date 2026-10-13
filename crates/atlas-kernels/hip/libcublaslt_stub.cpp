@@ -223,6 +223,9 @@ constexpr int UNSUPPORTED = 7;
 
 extern "C" {
 
+// Not a cuBLASLt: callers gating bit-exact paths on a verified version see 0.
+size_t cublasLtGetVersion(void) { return 0; }
+
 int cublasLtCreate(hipblasLtHandle_t* handle) {
     if (!ready()) return STUB;
     return static_cast<int>(g_lt.create(handle));

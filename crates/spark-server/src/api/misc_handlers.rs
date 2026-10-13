@@ -225,59 +225,58 @@ pub async fn hardware() -> Response {
 }
 
 /// POST /tokenize — tokenize text or chat messages, return token IDs and count.
+///
+/// A `messages` body is counted against the EXACT prompt chat completions
+/// renders: it is read as a chat-completions request (so
+/// `chat_template_kwargs`, tools and effort apply) and lowered through the
+/// same IR adapter and `prepare_chat_prompt`, like Anthropic count_tokens.
 pub async fn tokenize(
     CurrentModel(state): CurrentModel,
-    req: Result<Json<crate::openai::TokenizeRequest>, JsonRejection>,
+    req: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let Json(req) = match req {
+    let bad_request = |msg: String| openai_error_response(StatusCode::BAD_REQUEST, msg);
+    let Json(mut body) = match req {
         Ok(r) => r,
-        Err(e) => {
-            return openai_error_response(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid request JSON: {e}"),
-            );
-        }
+        Err(e) => return bad_request(format!("Invalid request JSON: {e}")),
     };
 
-    let tokens = if let Some(ref prompt) = req.prompt {
+    let tokens = if let Some(prompt) = body.get("prompt").and_then(|p| p.as_str()) {
         match state.tokenizer.encode(prompt) {
             Ok(t) => t,
-            Err(e) => {
-                return openai_error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Tokenization error: {e}"),
-                );
-            }
+            Err(e) => return bad_request(format!("Tokenization error: {e}")),
         }
-    } else if let Some(ref messages) = req.messages {
-        let json_messages: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content.text}))
-            .collect();
-        match state.tokenizer.apply_chat_template_jinja_with_effort(
-            &json_messages,
-            None,
-            false,
-            state.behavior.disable_tool_steering,
-            None,
-            // Honor the MODEL.toml preserve_thinking override so the counted
-            // bytes match what serving renders (Qwen3.8 emits think markers
-            // on historical assistant turns unless this is false).
-            state.behavior.preserve_thinking,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
+    } else if body.get("messages").is_some() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.entry("model")
+                .or_insert_with(|| serde_json::Value::String(String::new()));
+        }
+        let chat: ChatCompletionRequest = match serde_json::from_value(body) {
+            Ok(c) => c,
+            Err(e) => return bad_request(format!("Invalid request JSON: {e}")),
+        };
+        let mut ir_req = crate::ir::ChatRequest::from(chat);
+        // Counting must not require the vision encoder (see count_tokens).
+        for m in &mut ir_req.messages {
+            m.content
+                .retain(|p| !matches!(p, crate::ir::ContentPart::Image(_)));
+        }
+        let state_for_prepare = state.clone();
+        match tokio::task::spawn_blocking(move || {
+            super::chat::prepare::prepare_chat_prompt(&state_for_prepare, &mut ir_req)
+        })
+        .await
+        {
+            Ok(Ok(p)) => p.prompt_tokens,
+            Ok(Err(resp)) => return resp,
+            Err(join_err) => {
                 return openai_error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Tokenization error: {e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Error preparing prompt: {join_err}"),
                 );
             }
         }
     } else {
-        return openai_error_response(
-            StatusCode::BAD_REQUEST,
-            "Either 'prompt' or 'messages' is required".to_string(),
-        );
+        return bad_request("Either 'prompt' or 'messages' is required".to_string());
     };
 
     let count = tokens.len();

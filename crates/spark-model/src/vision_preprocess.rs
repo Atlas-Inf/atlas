@@ -6,9 +6,15 @@
 //! `patch_size × spatial_merge_size`, normalizes with ImageNet stats,
 //! and produces a flat `f32` tensor ready for the GPU vision encoder.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use atlas_core::config::VisionConfig;
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
+use image::{DynamicImage, ImageDecoder, ImageReader, Limits, Rgb, RgbImage};
+
+mod glm_sizing;
+use glm_sizing::glm_pixel_budget;
+#[cfg(test)]
+use glm_sizing::{GLM_FALLBACK_MAX_PATCHES, glm_runtime_max_pixels};
+pub(crate) use glm_sizing::{derive_glm_max_patches, glm_resize_or_pad, glm_target_size};
 
 /// SigLIP normalization — matches HF's Qwen2VLImageProcessor
 /// (`image_mean = image_std = (0.5, 0.5, 0.5)` → pixels mapped to [-1, 1]).
@@ -17,6 +23,11 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 /// numbers is two places for them to drift apart.
 pub(crate) const MEAN: [f32; 3] = [0.5, 0.5, 0.5];
 pub(crate) const STD: [f32; 3] = [0.5, 0.5, 0.5];
+
+/// GLM-5.3 ships the OpenAI CLIP processor constants in its nested
+/// `processor_config.json`, rather than the Qwen/SigLIP defaults above.
+pub(crate) const GLM_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const GLM_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 
 /// Long-side cap used ONLY when nothing else bounds the image — i.e. the
 /// caller passed no `max_pixels` because the checkpoint shipped no
@@ -84,12 +95,22 @@ pub(crate) fn decode_data_uri_bytes(data_uri: &str) -> Result<(String, Vec<u8>)>
     Ok((mime, bytes))
 }
 
+/// The image formats `decode_image` reads (the `image` crate features enabled
+/// in this crate's Cargo.toml), as the client is told when it sends another.
+const SUPPORTED_IMAGE_FORMATS: &str = "send JPEG, PNG, GIF, WebP, BMP, TIFF or ICO";
+
 /// Decode a base64 data URI or raw base64 string into a `DynamicImage`.
 fn decode_image(data_uri: &str) -> Result<DynamicImage> {
     let (_mime, bytes) = decode_data_uri_bytes(data_uri)?;
 
-    // Probe format from magic bytes.
-    let fmt = image::guess_format(&bytes).unwrap_or(ImageFormat::Jpeg);
+    // Probe format from magic bytes. Anything we cannot read is refused by
+    // name, so the client learns what to send instead of seeing a decoder
+    // error about a JPEG it never sent.
+    let fmt = image::guess_format(&bytes)
+        .map_err(|_| anyhow::anyhow!("unrecognized image format; {SUPPORTED_IMAGE_FORMATS}"))?;
+    if !fmt.reading_enabled() {
+        bail!("{fmt:?} images are not supported; {SUPPORTED_IMAGE_FORMATS}");
+    }
     // Decode through `ImageReader` rather than `load_from_memory_with_format`
     // so the limits are ours. (The free function is not unlimited — it applies
     // `Limits::default()`, i.e. 512 MiB alloc — but it sets NO dimension cap,
@@ -155,6 +176,40 @@ fn validate_geometry(vcfg: &VisionConfig) -> Result<()> {
         bail!("vision_config.temporal_patch_size is 0 (missing or invalid in config.json)");
     }
     Ok(())
+}
+
+/// Return patch coordinates in the order consumed by the native GLM tower.
+/// GLM's `view(-1, merge, merge, hidden)` downsample assumes each spatial
+/// merge block is contiguous; Qwen keeps the historical row-major ordering.
+pub(crate) fn patch_coordinates(
+    vcfg: &VisionConfig,
+    grid_h: usize,
+    grid_w: usize,
+) -> Vec<(usize, usize)> {
+    if !vcfg.is_glm5_next {
+        return (0..grid_h)
+            .flat_map(|ph| (0..grid_w).map(move |pw| (ph, pw)))
+            .collect();
+    }
+    let merge = vcfg.spatial_merge_size;
+    (0..grid_h / merge)
+        .flat_map(|bh| {
+            (0..grid_w / merge).flat_map(move |bw| {
+                (0..merge).flat_map(move |ih| {
+                    (0..merge).map(move |iw| (bh * merge + ih, bw * merge + iw))
+                })
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn normalize_channel(vcfg: &VisionConfig, channel: usize, raw: u8) -> f32 {
+    let (mean, std) = if vcfg.is_glm5_next {
+        (GLM_MEAN[channel], GLM_STD[channel])
+    } else {
+        (MEAN[channel], STD[channel])
+    };
+    (raw as f32 / 255.0 - mean) / std
 }
 
 /// Compute the target (H, W) so that:
@@ -233,12 +288,29 @@ pub fn preprocess_image_with_max_pixels(
     let img = img.to_rgb8();
     let (orig_w, orig_h) = (img.width(), img.height());
 
-    let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let (th, tw) = target_size_with_max_pixels(orig_h, orig_w, grid_unit, max_pixels);
-
-    // Resize with CatmullRom — closest BICUBIC match in the `image` crate,
-    // matching HF's `Qwen2VLImageProcessor` which uses PIL resample=3 (BICUBIC).
-    let img = image::imageops::resize(&img, tw, th, image::imageops::FilterType::CatmullRom);
+    let (th, tw, img) = if vcfg.is_glm5_next {
+        let (th, tw) = glm_target_size(
+            vcfg,
+            orig_h,
+            orig_w,
+            vcfg.temporal_patch_size,
+            max_pixels,
+            false,
+        )?;
+        let allow_upscale = vcfg.temporal_patch_size * orig_h as usize * (orig_w as usize)
+            < glm_pixel_budget(vcfg, max_pixels, false).0;
+        (th, tw, glm_resize_or_pad(&img, th, tw, allow_upscale))
+    } else {
+        let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
+        let (th, tw) = target_size_with_max_pixels(orig_h, orig_w, grid_unit, max_pixels);
+        // Resize with CatmullRom — closest BICUBIC match in the `image` crate,
+        // matching HF's `Qwen2VLImageProcessor` which uses PIL resample=3 (BICUBIC).
+        (
+            th,
+            tw,
+            image::imageops::resize(&img, tw, th, image::imageops::FilterType::CatmullRom),
+        )
+    };
 
     let ps = vcfg.patch_size;
     let tp = vcfg.temporal_patch_size;
@@ -251,22 +323,24 @@ pub fn preprocess_image_with_max_pixels(
 
     // Build patches. The temporal dimension is handled by duplicating the image `tp` times.
     // Layout: [P, C, T, Hp, Wp] → stored as [P, C*T*Hp*Wp] in row-major order.
-    for ph in 0..grid_h {
-        for pw in 0..grid_w {
-            let patch_idx = ph * grid_w + pw;
-            for c in 0..3usize {
-                for t in 0..tp {
-                    for py in 0..ps {
-                        for px in 0..ps {
-                            let pixel_y = ph * ps + py;
-                            let pixel_x = pw * ps + px;
-                            let raw =
-                                img.get_pixel(pixel_x as u32, pixel_y as u32)[c] as f32 / 255.0;
-                            let norm = (raw - MEAN[c]) / STD[c];
-                            // Offset into patch_dim: c*(T*Hp*Wp) + t*(Hp*Wp) + py*Wp + px
-                            let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
-                            pixels[patch_idx * patch_dim + off] = norm;
-                        }
+    for (patch_idx, (ph, pw)) in patch_coordinates(vcfg, grid_h, grid_w)
+        .into_iter()
+        .enumerate()
+    {
+        for c in 0..3usize {
+            for t in 0..tp {
+                for py in 0..ps {
+                    for px in 0..ps {
+                        let pixel_y = ph * ps + py;
+                        let pixel_x = pw * ps + px;
+                        let norm = normalize_channel(
+                            vcfg,
+                            c,
+                            img.get_pixel(pixel_x as u32, pixel_y as u32)[c],
+                        );
+                        // Offset into patch_dim: c*(T*Hp*Wp) + t*(Hp*Wp) + py*Wp + px
+                        let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
+                        pixels[patch_idx * patch_dim + off] = norm;
                     }
                 }
             }
@@ -285,6 +359,9 @@ pub fn image_pad_count(grid_h: usize, grid_w: usize, spatial_merge_size: usize) 
     (grid_h / sms) * (grid_w / sms)
 }
 
+#[cfg(test)]
+#[path = "vision_preprocess_format_tests.rs"]
+mod format_tests;
 #[cfg(test)]
 #[path = "vision_preprocess_tests.rs"]
 mod tests;

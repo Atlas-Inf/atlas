@@ -228,19 +228,9 @@ pub(super) fn plan(
     {
         return ks;
     }
-    let confs: Vec<&[f32]> = batchable
-        .iter()
-        .map(|&i| {
-            let a = &active[i];
-            // Length-matched or nothing: a stale or absent confidence vector
-            // must read as "not measured" (full depth), never as a score.
-            if a.pending_draft_conf.len() == a.pending_drafts.len() {
-                a.pending_draft_conf.as_slice()
-            } else {
-                &[]
-            }
-        })
-        .collect();
+    // Length-matched or nothing: a stale or absent confidence vector must
+    // read as "not measured" (full depth), never as a score.
+    let confs: Vec<&[f32]> = batchable.iter().map(|&i| active[i].draft_conf()).collect();
     let retained = select(&confs, ladder_nd, VERIFY_ROW_BUDGET, dcut_ratio());
     for (pos, r) in retained.iter().enumerate() {
         ks[pos] = (*r).clamp(1, ladder_nd) + 1;

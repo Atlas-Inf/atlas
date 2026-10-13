@@ -86,6 +86,12 @@ impl Qwen3AttentionLayer {
     /// contiguous. A `Some` here means the pre-mutation plan (`guard.rs`) and
     /// this path disagree — refuse loudly rather than serve dense-past-budget,
     /// which is not the reference model.
+    ///
+    /// Live rows only: the padding rows of a batched decode (`c.active..c.n`)
+    /// sit on dummy states, and ingesting them allocated a fresh indexer
+    /// carry (raw + pooled key buffers) per padding row, layer and step that
+    /// nothing ever freed. Inside a staged run (`qsa_staged.rs`) each live
+    /// row only stages; the model commits after the run.
     pub(super) fn ms_qsa_ingest_rows(
         &self,
         c: &MultiSeqCtx<'_>,
@@ -98,7 +104,13 @@ impl Qwen3AttentionLayer {
         let Some(qsa) = self.qsa.as_ref() else {
             return Ok(());
         };
-        for i in 0..c.n {
+        if crate::layers::qsa::staged_ingest() {
+            for i in 0..c.active {
+                qsa.stage_row(c.normed.offset(i * c.h * c.bf16), i, c.fwd.gpu, c.stream)?;
+            }
+            return Ok(());
+        }
+        for i in 0..c.active {
             let sel =
                 self.qsa_select_row(qsa, c, states, row_owner, seq_lens, kv_cache, meta, i)?;
             anyhow::ensure!(
@@ -150,8 +162,14 @@ impl Qwen3AttentionLayer {
             // sequence per launch the kernel never applies the stride.
             let q_i = qkv_buf.offset(i * per_seq_qkv);
             let out_i = attn_out.offset(i * out_row);
-            // Consumed inside this iteration — see THE INVARIANT above.
-            match self.qsa_select_row(qsa, c, states, row_owner, seq_lens, kv_cache, meta, i)? {
+            // Consumed inside this iteration — see THE INVARIANT above. A
+            // padding row (`c.active..n`) owns no indexer carry: dense.
+            let sel = if i < c.active {
+                self.qsa_select_row(qsa, c, states, row_owner, seq_lens, kv_cache, meta, i)?
+            } else {
+                None
+            };
+            match sel {
                 Some(sel) => ops::paged_decode_attn_bf16(
                     fwd.gpu,
                     self.paged_decode_k,

@@ -7,10 +7,12 @@
 use super::*;
 
 impl QsaIndexer {
-    /// Marconi aux blob: `[ingested u64][pooled u64][raw_keys bf16 bytes]`.
-    /// Raw keys are a deterministic function of the token prefix, so the
-    /// snapshot IS the indexer state; block keys are re-pooled on restore
-    /// (one kernel) rather than serialized.
+    /// Marconi aux blob: `[ingested u64][pooled u64][pooled block keys]
+    /// [raw keys of the unpooled tail]`, all BF16 rows of `hd`. That IS the
+    /// indexer state: scoring reads only pooled keys, and the next pool reads
+    /// only the tail. Restoring writes the same bytes back, so a restored
+    /// carry equals the saved one byte for byte. (It used to carry every raw
+    /// key and re-pool on restore: 4x the host bytes per checkpoint.)
     pub fn snapshot_aux(
         &self,
         st: &QsaSeqState,
@@ -23,10 +25,10 @@ impl QsaIndexer {
     }
 
     /// [`Self::snapshot_aux`] writing into a caller-owned buffer: after the
-    /// first call the buffer's capacity covers `16 + ingested*hd*2`, so ring
-    /// and pool slots that snapshot repeatedly stop paying a fresh
-    /// multi-MB malloc per save (the job-058 RSS bisect showed that churn —
-    /// ~55 MB/boundary at 18K ctx — fragmenting glibc arenas).
+    /// first call the buffer's capacity covers the blob, so ring and pool
+    /// slots that snapshot repeatedly stop paying a fresh multi-MB malloc per
+    /// save (the job-058 RSS bisect showed that churn — ~55 MB/boundary at
+    /// 18K ctx — fragmenting glibc arenas).
     pub fn snapshot_aux_into(
         &self,
         st: &QsaSeqState,
@@ -34,21 +36,35 @@ impl QsaIndexer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        let hd = self.hd as usize;
-        let key_bytes = st.ingested * hd * 2;
+        let row = self.hd as usize * 2;
+        let tail_start = st.pooled * self.ratio as usize;
+        anyhow::ensure!(
+            tail_start <= st.ingested && st.raw.base() <= tail_start,
+            "QSA aux snapshot: pooled frontier {tail_start} outside [{}, {}]",
+            st.raw.base(),
+            st.ingested
+        );
+        let (pooled_bytes, tail_bytes) = (st.pooled * row, (st.ingested - tail_start) * row);
         buf.clear();
         buf.extend_from_slice(&(st.ingested as u64).to_le_bytes());
         buf.extend_from_slice(&(st.pooled as u64).to_le_bytes());
         let off = buf.len();
-        buf.resize(off + key_bytes, 0);
-        if key_bytes > 0 {
-            gpu.copy_d2h_on_stream(st.raw_keys, &mut buf[off..], stream)?;
+        buf.resize(off + pooled_bytes + tail_bytes, 0);
+        if pooled_bytes > 0 {
+            gpu.copy_d2h_on_stream(st.block_keys, &mut buf[off..off + pooled_bytes], stream)?;
+        }
+        if tail_bytes > 0 {
+            gpu.copy_d2h_on_stream(
+                self.raw_slot(st, tail_start),
+                &mut buf[off + pooled_bytes..],
+                stream,
+            )?;
         }
         Ok(())
     }
 
     /// Restore the blob from [`Self::snapshot_aux`] on a prefix-cache hit:
-    /// upload the raw keys, reset the counters, re-pool the block keys.
+    /// upload the pooled keys and the raw tail, set the counters.
     pub fn restore_aux(
         &self,
         st: &mut QsaSeqState,
@@ -59,35 +75,24 @@ impl QsaIndexer {
         anyhow::ensure!(blob.len() >= 16, "QSA aux blob truncated");
         let ingested = u64::from_le_bytes(blob[..8].try_into().unwrap()) as usize;
         let pooled = u64::from_le_bytes(blob[8..16].try_into().unwrap()) as usize;
-        let hd = self.hd as usize;
+        let row = self.hd as usize * 2;
+        let tail_start = pooled * self.ratio as usize;
         anyhow::ensure!(
-            blob.len() == 16 + ingested * hd * 2,
+            tail_start <= ingested && blob.len() == 16 + (pooled + ingested - tail_start) * row,
             "QSA aux blob size mismatch"
         );
-        anyhow::ensure!(ingested <= self.max_tokens, "QSA aux exceeds key cache");
-        if ingested > 0 {
-            gpu.copy_h2d_async(&blob[16..], st.raw_keys, stream)?;
+        self.reserve(st, ingested, gpu, stream)?;
+        let (keys, tail) = blob[16..].split_at(pooled * row);
+        if pooled > 0 {
+            gpu.copy_h2d_async(keys, st.block_keys, stream)?;
+        }
+        (st.ingested, st.pooled) = (tail_start, pooled);
+        st.raw.restart_at(tail_start);
+        self.raw_room(st, ingested - tail_start, gpu, stream)?;
+        if !tail.is_empty() {
+            gpu.copy_h2d_async(tail, self.raw_slot(st, tail_start), stream)?;
         }
         st.ingested = ingested;
-        st.pooled = 0;
-        if pooled > 0 {
-            ops::qsa_block_pool(
-                gpu,
-                self.k_pool_k,
-                st.raw_keys,
-                self.k_norm_w,
-                st.block_keys,
-                0,
-                pooled as u32,
-                self.ratio,
-                self.hd,
-                self.rot,
-                self.theta,
-                self.eps,
-                stream,
-            )?;
-            st.pooled = pooled;
-        }
         Ok(())
     }
 
@@ -101,11 +106,12 @@ impl QsaIndexer {
     /// needs no pairing — the verify scanned `k` rows and kept `num_accepted`,
     /// so exactly `k - num_accepted` ingests have to come back off.
     ///
-    /// Raw keys past the new end stay in `raw_keys` but are dead: the next
+    /// Raw keys past the new end stay in the window but are dead: the next
     /// ingest overwrites them before anything reads them. A pooled block
     /// strictly below `ingested / ratio` lies wholly inside the accepted
     /// prefix, so keeping those is exact; anything above is dropped and
-    /// re-pooled from corrected keys.
+    /// re-pooled from corrected keys, which the window still holds
+    /// (`qsa_window::REWIND_MARGIN`).
     pub fn rewind_verify(&self, st: &mut QsaSeqState, rejected: usize) -> Result<()> {
         if rejected == 0 {
             return Ok(());
@@ -121,8 +127,15 @@ impl QsaIndexer {
             st.ingested
         );
         anyhow::ensure!(self.ratio > 0, "QSA ratio is 0");
-        st.ingested -= rejected;
-        st.pooled = st.pooled.min(st.ingested / self.ratio as usize);
+        let ingested = st.ingested - rejected;
+        let pooled = st.pooled.min(ingested / self.ratio as usize);
+        anyhow::ensure!(
+            pooled * self.ratio as usize >= st.raw.base(),
+            "QSA rewind of {rejected} row(s) reaches below the raw-key window \
+             (base {}): wider than the rewind margin",
+            st.raw.base()
+        );
+        (st.ingested, st.pooled) = (ingested, pooled);
         Ok(())
     }
 }
@@ -138,40 +151,19 @@ mod tests {
     #[test]
     fn snapshot_aux_into_reuses_buffer() {
         let gpu = MockGpuBackend::new();
-        let qsa = QsaIndexer::new(
-            DevicePtr::NULL,
-            DevicePtr::NULL,
-            DevicePtr::NULL,
-            /*n_heads*/ 2,
-            /*hd*/ 8,
-            /*ratio*/ 4,
-            /*budget*/ 64,
-            /*max_seq_len*/ 256,
-            /*rot*/ 8,
-            /*theta*/ 1e5,
-            /*eps*/ 1e-5,
-            /*hidden*/ 128,
-            /*nkv_attn*/ 2,
-            /*hd_attn*/ 16,
-            &gpu,
-        )
-        .unwrap();
-        let ingested = 5usize;
-        let st = QsaSeqState {
-            ingested,
-            pooled: 0,
-            table_len: 0,
-            raw_keys: gpu.alloc(256 * 8 * 2).unwrap(),
-            block_keys: gpu.alloc(64 * 8 * 2).unwrap(),
-        };
-        let keys: Vec<u8> = (0..(ingested * 8 * 2) as u32)
-            .map(|v| (v % 251) as u8)
-            .collect();
-        gpu.copy_h2d(&keys, st.raw_keys).unwrap();
+        let qsa = indexer(&gpu);
+        // 5 ingested, 1 block pooled: pooled key row + a 1-key raw tail.
+        let st = state(&gpu, 5, 1);
+        let pooled: Vec<u8> = (0..16u32).map(|v| v as u8 + 1).collect();
+        let raw: Vec<u8> = (0..(5 * 16) as u32).map(|v| (v % 251) as u8).collect();
+        gpu.copy_h2d(&pooled, st.block_keys).unwrap();
+        gpu.copy_h2d(&raw, st.raw.bufs[0]).unwrap();
 
         let want = qsa.snapshot_aux(&st, &gpu, 0).unwrap();
-        assert_eq!(&want[..8], &(ingested as u64).to_le_bytes());
-        assert_eq!(&want[16..], &keys[..]);
+        assert_eq!(&want[..8], &5u64.to_le_bytes());
+        assert_eq!(&want[8..16], &1u64.to_le_bytes());
+        assert_eq!(&want[16..32], &pooled[..]);
+        assert_eq!(&want[32..], &raw[4 * 16..], "only the unpooled tail");
 
         let mut buf = Vec::new();
         qsa.snapshot_aux_into(&st, &mut buf, &gpu, 0).unwrap();
@@ -181,6 +173,29 @@ mod tests {
         assert_eq!(buf, want);
         assert_eq!(buf.capacity(), cap, "buffer reallocated on reuse");
         assert_eq!(buf.as_ptr(), ptr, "buffer moved on reuse");
+    }
+
+    /// Restore writes back exactly the bytes a snapshot read, and a snapshot
+    /// of the restored carry is the original blob.
+    #[test]
+    fn restore_round_trips_the_blob() {
+        let gpu = MockGpuBackend::new();
+        let qsa = indexer(&gpu);
+        let st = state(&gpu, 23, 5);
+        let pooled: Vec<u8> = (0..(5 * 16) as u32).map(|v| (v * 3 % 251) as u8).collect();
+        let raw: Vec<u8> = (0..(23 * 16) as u32).map(|v| (v % 241) as u8).collect();
+        gpu.copy_h2d(&pooled, st.block_keys).unwrap();
+        gpu.copy_h2d(&raw, st.raw.bufs[0]).unwrap();
+        let blob = qsa.snapshot_aux(&st, &gpu, 0).unwrap();
+        assert_eq!(blob.len(), 16 + (5 + 3) * 16);
+
+        let mut fresh = qsa.new_seq_state(&gpu).unwrap();
+        qsa.restore_aux(&mut fresh, &blob, &gpu, 0).unwrap();
+        assert_eq!((fresh.ingested, fresh.pooled), (23, 5));
+        assert_eq!(qsa.snapshot_aux(&fresh, &gpu, 0).unwrap(), blob);
+        let mut bad = blob.clone();
+        bad.pop();
+        assert!(qsa.restore_aux(&mut fresh, &bad, &gpu, 0).is_err());
     }
 
     fn indexer(gpu: &MockGpuBackend) -> QsaIndexer {
@@ -204,14 +219,14 @@ mod tests {
         .unwrap()
     }
 
+    /// A carry holding positions `0..256` in its window (base 0).
     fn state(gpu: &MockGpuBackend, ingested: usize, pooled: usize) -> QsaSeqState {
-        QsaSeqState {
-            ingested,
-            pooled,
-            table_len: 0,
-            raw_keys: gpu.alloc(256 * 8 * 2).unwrap(),
-            block_keys: gpu.alloc(64 * 8 * 2).unwrap(),
-        }
+        let qsa = indexer(gpu);
+        let mut st = qsa.new_seq_state(gpu).unwrap();
+        qsa.reserve(&mut st, 256, gpu, 0).unwrap();
+        qsa.raw_room(&mut st, 256, gpu, 0).unwrap();
+        (st.ingested, st.pooled) = (ingested, pooled);
+        st
     }
 
     /// After a verify of `rows` rows that kept `accepted`, the counters must

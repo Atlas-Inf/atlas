@@ -113,7 +113,7 @@ pub fn mtp_state_slots(max_batch_size: usize) -> usize {
 /// uniform-K sizing everywhere (pool, preflight, scheduler clamp).
 pub fn mtp_pool_full_width() -> bool {
     std::env::var_os("ATLAS_MTP_POOL_FULL_WIDTH").is_some()
-        || matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"))
+        || crate::model::ep_protocol_v2_requested()
 }
 
 /// Pure core of [`mtp_state_slots`] (env-free, unit-testable).
@@ -339,6 +339,11 @@ pub fn ssm_pool_reserve_bytes(
             // ([`ssm_replay_ring_bytes`]) because it is sized by activation
             // rows, not state blobs.
             SsmRollbackMode::Replay => blob,
+            // K fold-record rows (a full accept folds all K) and the conv
+            // snapshots, which records mode keeps.
+            SsmRollbackMode::Records => {
+                (num_drafts + 1) * (kda_record_row_bytes(h_blob_bytes) + conv_blob_bytes) + blob
+            }
         })
         .sum();
     base + verify
@@ -359,10 +364,17 @@ pub fn ssm_pool_reserve_bytes(
 ///   a serve in this mode boots — the reserve shows the capacity win — and
 ///   every speculative verify entry refuses loudly
 ///   (`SsmStatePool::require_verify_rollback_supported`).
+///
+/// `Records` (GLM-5 KDA): the verify leaves the recurrent state untouched and
+/// writes one fold record per row (decay, normalized key, correction —
+/// [`kda_record_row_bytes`]); the commit folds the accepted rows into the
+/// state, bit-identical to the verify. Replaces the per-token H snapshots
+/// (2 MB per row per layer) with 48 KB records; conv keeps its snapshots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SsmRollbackMode {
     Snapshot,
     Replay,
+    Records,
 }
 
 impl std::str::FromStr for SsmRollbackMode {
@@ -373,8 +385,9 @@ impl std::str::FromStr for SsmRollbackMode {
         match s {
             "snapshot" => Ok(Self::Snapshot),
             "replay" => Ok(Self::Replay),
+            "records" => Ok(Self::Records),
             other => Err(format!(
-                "unknown ssm-rollback-mode '{other}' (valid: snapshot, replay)"
+                "unknown ssm-rollback-mode '{other}' (valid: snapshot, replay, records)"
             )),
         }
     }
@@ -400,6 +413,13 @@ pub fn set_ssm_rollback_mode(mode: SsmRollbackMode) -> SsmRollbackMode {
 /// never depend on the process-global cell.
 pub fn ssm_rollback_mode() -> SsmRollbackMode {
     *ROLLBACK_MODE.get_or_init(|| SsmRollbackMode::Snapshot)
+}
+
+/// One row of GLM-5 KDA fold records for an `h_bytes` FP32 state
+/// (`heads` x 128 x 128): per head, 128 decays, 128 normalized key values
+/// and 128 corrections (`ops::KDA_RECORD_FLOATS` floats).
+pub fn kda_record_row_bytes(h_bytes: usize) -> usize {
+    h_bytes / (128 * 128 * 4) * 384 * 4
 }
 
 /// One cached verify-row of GDN inputs for replay, per SSM layer: the

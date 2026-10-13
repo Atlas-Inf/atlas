@@ -8,7 +8,11 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+mod gpu_init;
+mod independent;
 mod ssm_h_fp16;
+pub(crate) use gpu_init::{init_gpu_backend, post_load_memory_audit};
+pub(crate) use independent::prepare_reserve;
 use ssm_h_fp16::ssm_h_fp16_preconditions;
 
 pub(crate) struct ReservePreflight {
@@ -17,6 +21,50 @@ pub(crate) struct ReservePreflight {
     pub(crate) gdn_two_phase_bytes: usize,
     pub(crate) ssm_prefill_chunk: usize,
     pub(crate) max_batch_tokens_pre: usize,
+    pub(crate) resolved_prefill: Option<super::PrefillBudget>,
+}
+
+fn glm5_dual_spark_parallelism(world: usize, tp: usize, ep: usize) -> bool {
+    world == 2 && ep == 2 && matches!(tp, 1 | 2)
+}
+
+fn glm5_concurrency_supported(
+    max_batch: usize,
+    max_num_seqs: usize,
+    ep_v2: bool,
+    c4: bool,
+) -> bool {
+    (c4 && max_batch == 4 && max_num_seqs == 4 && ep_v2)
+        || ((1..=3).contains(&max_batch)
+            && (max_batch..=5).contains(&max_num_seqs)
+            && (max_batch == 1 || ep_v2))
+}
+
+fn glm5_context_supported(max_seq_len: usize, max_prefill_tokens: usize, model_max: usize) -> bool {
+    max_seq_len <= model_max && max_prefill_tokens > 0
+}
+
+fn glm5_long_context_concurrency_supported(
+    max_seq_len: usize,
+    index_topk: usize,
+    max_batch: usize,
+    max_num_seqs: usize,
+    sparse_decode: bool,
+    c4_sparse: bool,
+) -> bool {
+    max_seq_len <= index_topk
+        || (max_batch == 1 && max_num_seqs == 1)
+        || (sparse_decode && matches!(max_batch, 2 | 3) && (max_batch..=5).contains(&max_num_seqs))
+        || (sparse_decode
+            && c4_sparse
+            && spark_model::model::glm_c4::validate_launch_limits_for_mode(
+                max_batch,
+                max_num_seqs,
+                max_seq_len,
+                true,
+                true,
+            )
+            .is_ok())
 }
 
 pub(crate) fn preflight_reserve(
@@ -24,9 +72,112 @@ pub(crate) fn preflight_reserve(
     config: &ModelConfig,
     free_mem: usize,
 ) -> Result<ReservePreflight> {
+    // The GLM long-context lane: DFlash verification over the bounded sparse
+    // domain, with the topology resolved before any reserve (`independent.rs`).
+    let long_context = spark_model::speculative::glm_repair_policy::long_context_enabled();
+    anyhow::ensure!(
+        !long_context
+            || (args.dflash && spark_model::speculative::glm_repair_policy::dflash_enabled()),
+        "GLM long-context verification requires the GLM DFlash lane"
+    );
+    // The long-context lane retains TP-local topology and the exact row budget.
+    let bounded = long_context;
+    let c4_sparse = spark_model::model::glm_c4::validate_sparse_flag(
+        &config.model_type,
+        std::env::var("ATLAS_GLM_C4_SPARSE").ok().as_deref(),
+    )?;
+    if config.model_type == "glm5_next" {
+        let sparse_decode =
+            spark_model::layers::qwen3_attention::glm_multi_seq_sparse_enabled(&config.model_type);
+        anyhow::ensure!(
+            !sparse_decode
+                || !(args.speculative || args.self_speculative || args.ngram_speculative),
+            "ATLAS_GLM_MULTI_SEQ_SPARSE=1 supports non-speculative decode only"
+        );
+        anyhow::ensure!(
+            glm5_context_supported(
+                args.max_seq_len,
+                args.max_prefill_tokens,
+                config.max_position_embeddings,
+            ),
+            "GLM-5 requires --max-seq-len <= {} and a non-zero --max-prefill-tokens for bounded chunked prefill",
+            config.max_position_embeddings,
+        );
+        let ep_v2 = spark_model::model::ep_protocol_v2_requested();
+        anyhow::ensure!(
+            !long_context || args.max_batch_size == 1 || ep_v2,
+            "GLM concurrent long-context verification requires ATLAS_EP_PROTOCOL=v2 for owner slot identity"
+        );
+        let c4 = spark_model::model::glm_c4::enabled(&config.model_type);
+        anyhow::ensure!(
+            std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() != Ok("1") || c4,
+            "ATLAS_GLM_C4_GROUPED_MOE=1 requires ATLAS_GLM_C4_DECODE=1"
+        );
+        if !long_context && (c4 || c4_sparse || args.max_batch_size == 4) {
+            spark_model::model::glm_c4::validate_prefill_budget(
+                args.max_prefill_tokens,
+                c4_sparse,
+            )?;
+            spark_model::model::glm_c4::policy_from_env(
+                &config.model_type,
+                args.world_size,
+                args.tp_size,
+                args.ep_size,
+                ep_v2,
+                !(args.speculative
+                    || args.self_speculative
+                    || args.ngram_speculative
+                    || args.dflash),
+            )
+            .validate()?;
+            spark_model::model::glm_c4::validate_launch_limits(
+                args.max_batch_size,
+                args.max_num_seqs,
+                args.max_seq_len,
+                args.kv_cache_dtype.as_deref() == Some("bf16"),
+            )?;
+        }
+        anyhow::ensure!(
+            long_context
+                || glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2, c4),
+            "GLM-5 dual-Spark concurrency supports --max-batch-size 1..=3 and \
+             --max-num-seqs max_batch..=5, or explicitly opted-in C4 with active/admitted4; \
+             batches above one require ATLAS_EP_PROTOCOL=v2"
+        );
+        anyhow::ensure!(
+            long_context
+                || glm5_long_context_concurrency_supported(
+                    args.max_seq_len,
+                    config.index_topk,
+                    args.max_batch_size,
+                    args.max_num_seqs,
+                    sparse_decode,
+                    c4_sparse,
+                ),
+            "GLM-5 context above index_topk={} requires one active/admitted sequence, opt-in sparse C2/C3, or guarded eager ATLAS_GLM_C4_SPARSE=1",
+            config.index_topk,
+        );
+        anyhow::ensure!(
+            !(args.speculative || args.self_speculative || args.ngram_speculative),
+            "GLM-5 speculative decoding is served through --dflash; its native MTP layer \
+             and self/n-gram speculation are not supported"
+        );
+        anyhow::ensure!(
+            glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
+            "GLM-5 dual-Spark support requires --world-size 2 --ep-size 2 and either --tp-size 1 (EP fallback) or --tp-size 2 (overlapping TP+EP)"
+        );
+    }
     let h_state_bytes = config.ssm_h_state_bytes();
     let conv_state_bytes = config.ssm_conv_state_bytes();
-    let spec_on_pool = args.speculative || args.self_speculative || args.ngram_speculative;
+    // `--dflash` allocates the same verify pools, sized by its γ-derived
+    // draft count (see `build_model`), not the MTP `--num-drafts`.
+    let spec_on_pool =
+        args.speculative || args.dflash || args.self_speculative || args.ngram_speculative;
+    let pool_drafts = if args.dflash {
+        super::build::checked_dflash_num_drafts(args.resolved_dflash_gamma())?
+    } else {
+        args.resolved_num_drafts()
+    };
     ssm_h_fp16_preconditions(args, config)?;
     // SSM state pool = per-seq live state (max_batch blobs) + MTP verify
     // state (intermediates + checkpoint) for the slots spec dispatch can
@@ -55,12 +206,15 @@ pub(crate) fn preflight_reserve(
         h_state_bytes,
         spark_model::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
     );
+    // Selected FP32 pools allocate one additional live dummy slot.
+    // It has no prefix/rollback snapshots; do not inflate those counts.
+    let live_slots = args.max_batch_size + usize::from(bounded);
     let ssm_pool_bytes = spark_model::ssm_reserve::ssm_pool_reserve_bytes(
-        args.max_batch_size,
+        live_slots,
         config.num_ssm_layers() * h_state_bytes,
         config.num_ssm_layers() * conv_state_bytes,
         spec_on_pool,
-        args.resolved_num_drafts(),
+        pool_drafts,
         mtp_state_slots,
         args.dflash,
         // Stage-3 f16-SIZED pool: mirrors `SsmStatePool::new`'s narrowing.
@@ -107,9 +261,20 @@ pub(crate) fn preflight_reserve(
     // Issue #15 auto-clamp removed (2026-07-02): snapshot reachability is
     // handled by the tail-checkpoint split in `prefill_chunk_dispatch`, so
     // the budget (and this arena-sizing mirror) stays at full chunk size.
-    let max_batch_tokens_pre = prefill_budget_pre
-        .max(spec_tokens_pre)
-        .max(args.max_batch_size);
+    let resolved_prefill = bounded.then(|| super::resolve_prefill_budget(args, ssm_prefill_chunk));
+    let max_batch_tokens_pre = resolved_prefill.as_ref().map_or_else(
+        || {
+            prefill_budget_pre
+                .max(spec_tokens_pre)
+                .max(args.max_batch_size)
+        },
+        |budget| budget.max_batch_tokens,
+    );
+    // The selected envelope is bounded before BufferSizes' unchecked products.
+    anyhow::ensure!(
+        !bounded || max_batch_tokens_pre <= 65535,
+        "selected arena rows exceed the CUDA grid limit"
+    );
     let buffer_arena_bytes = spark_runtime::buffers::BufferSizes::from_config(
         config,
         max_batch_tokens_pre,
@@ -147,9 +312,17 @@ pub(crate) fn preflight_reserve(
         )
         .slots
     };
-    let ssm_snapshot_bytes = (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
-        * config.num_ssm_layers()
-        * (h_state_bytes + conv_state_bytes);
+    let ssm_snapshot_bytes = if bounded {
+        args.ssm_cache_slots
+            .checked_add(decode_ring_slots * args.max_batch_size)
+            .and_then(|n| n.checked_mul(config.num_ssm_layers()))
+            .and_then(|n| n.checked_mul(h_state_bytes + conv_state_bytes))
+            .context("selected snapshot reserve overflow")?
+    } else {
+        (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
+            * config.num_ssm_layers()
+            * (h_state_bytes + conv_state_bytes)
+    };
     let cuda_headroom: usize =
         if args.speculative || args.self_speculative || args.ngram_speculative {
             4 * 1024 * 1024 * 1024
@@ -162,7 +335,11 @@ pub(crate) fn preflight_reserve(
         let nv = config.linear_num_value_heads;
         let conv_dim = key_dim * 2 + value_dim;
         if conv_dim > 0 && config.num_ssm_layers() > 0 {
-            let sl = max_batch_tokens_pre;
+            let sl = if bounded {
+                max_batch_tokens_pre.min(args.max_seq_len)
+            } else {
+                max_batch_tokens_pre
+            };
             sl * conv_dim * 2 + sl * nv * 2 * 4 + sl * value_dim * 2 + sl * value_dim * 2
         } else {
             0
@@ -238,7 +415,7 @@ pub(crate) fn preflight_reserve(
          cuda_headroom={} MB ({}), \
          spec_on={}, num_drafts={}",
         ssm_pool_bytes / (1024 * 1024),
-        args.max_batch_size,
+        live_slots,
         if spec_on_pool { mtp_state_slots } else { 0 },
         if spec_on_pool {
             args.resolved_num_drafts() + 2
@@ -265,157 +442,9 @@ pub(crate) fn preflight_reserve(
         gdn_two_phase_bytes,
         ssm_prefill_chunk,
         max_batch_tokens_pre,
+        resolved_prefill,
     })
 }
 
-/// Initialize the GPU backend for the active feature.
-///
-/// Compile-time dispatch:
-/// - `cuda` feature → `AtlasCudaBackend` loading PTX modules from `ptx_set`.
-/// - `metal` feature → `MetalGpuBackend` loading metallib modules from
-///   `ptx_set` as well. Both arms register the RESOLVED target's modules;
-///   `metallib_modules()` is a plain alias of target 0, so registering from
-///   it served another model's kernels in a multi-target build.
-#[cfg(feature = "cuda")]
-pub(crate) fn init_gpu_backend(
-    args: &cli::ServeArgs,
-    ptx_set: &atlas_kernels::TargetPtxSet,
-) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
-    let backend =
-        spark_runtime::cuda_backend::AtlasCudaBackend::new(args.gpu_ordinal, &ptx_set.modules)
-            .context("Failed to initialize CUDA backend")?;
-
-    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(backend);
-    // HIP targets link a cuBLASLt stub (every call fails), which would strand
-    // the ~20 BF16 projection sites that route through
-    // `cublaslt::bf16_gemm_act_weight_t` with no fallback. Install one
-    // process-global Atlas-GEMM fallback now, while the kernel registry is
-    // live: it only ever fires when `ctx()` fails, so cuBLASLt-capable
-    // backends never consult it. `pipelined` may be unresolved on targets
-    // that lack the tensor-core variant — the fallback then uses the scalar
-    // kernel for every shape.
-    let pipelined = gpu
-        .kernel("gemm", "dense_gemm_bf16_pipelined")
-        .unwrap_or(spark_runtime::gpu::KernelHandle(0));
-    let scalar = gpu
-        .kernel("gemm", "dense_gemm_bf16")
-        .unwrap_or(spark_runtime::gpu::KernelHandle(0));
-    // Optional small-M arm: `dense_gemv_bf16_batchm` serves 1 <= M <= 8
-    // decode projections (e.g. Flash-Next's BF16 `in_proj_qkvz`) in one
-    // bandwidth-bound pass instead of a 128-row WMMA tile. Handle 0 -> the
-    // fallback skips the arm.
-    let gemv_batchm = gpu
-        .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
-        .unwrap_or(spark_runtime::gpu::KernelHandle(0));
-    if spark_runtime::cublaslt::install_bf16_fallback(spark_runtime::cublaslt::make_bf16_fallback(
-        pipelined,
-        scalar,
-        gemv_batchm,
-    )) {
-        tracing::info!(
-            "BF16 GEMM fallback installed (gemv<=8 / pipelined WMMA / scalar) for backends without cuBLASLt"
-        );
-    }
-    let total_mem = gpu.total_memory()?;
-    let free_mem = gpu.free_memory()?;
-    // Baseline for self-relative KV budgeting: free memory now (post context +
-    // PTX modules, pre weights) minus free-at-build = this process's own
-    // footprint, co-tenants excluded. See gpu::baseline_free_bytes.
-    spark_runtime::gpu::set_baseline_free_bytes(free_mem);
-    tracing::info!(
-        "GPU {}: {:.1} GB total, {:.1} GB free",
-        args.gpu_ordinal,
-        total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
-        free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
-    );
-    Ok((gpu, free_mem))
-}
-
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
-pub(crate) fn init_gpu_backend(
-    args: &cli::ServeArgs,
-    ptx_set: &atlas_kernels::TargetPtxSet,
-) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
-    // The RESOLVED target's modules, exactly like the CUDA arm above.
-    // `metallib_modules()` is an alias of `ptx_modules()`, which build-codegen
-    // emits as a plain alias of TARGET 0 in a multi-target build — so this
-    // registered another model's kernels and every lookup for the model
-    // actually being served failed.
-    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(
-        spark_runtime::metal_backend::MetalGpuBackend::new(args.gpu_ordinal, &ptx_set.modules)
-            .context("Failed to initialize Metal backend")?,
-    );
-    let total_mem = gpu.total_memory()?;
-    let free_mem = gpu.free_memory()?;
-    spark_runtime::gpu::set_baseline_free_bytes(free_mem);
-    tracing::info!(
-        "Metal device {}: {:.1} GB total, {:.1} GB free",
-        args.gpu_ordinal,
-        total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
-        free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
-    );
-    Ok((gpu, free_mem))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn post_load_memory_audit(
-    args: &cli::ServeArgs,
-    config: &ModelConfig,
-    gpu: &dyn spark_runtime::gpu::GpuBackend,
-    weight_bytes: usize,
-    free_mem: usize,
-    inference_reserve: usize,
-    total_reserve: usize,
-    gdn_two_phase_bytes: usize,
-    max_batch_tokens_pre: usize,
-) -> Result<()> {
-    let estimated_free = free_mem.saturating_sub(weight_bytes);
-    let actual_free = gpu.free_memory().unwrap_or(estimated_free);
-    let available_free = if actual_free > 0 {
-        actual_free
-    } else {
-        estimated_free
-    };
-    if available_free < total_reserve {
-        let avail_gb = available_free as f64 / (1024.0 * 1024.0 * 1024.0);
-        let need_gb = total_reserve as f64 / (1024.0 * 1024.0 * 1024.0);
-        let hint = if args.max_batch_size > 1 {
-            format!(
-                " Reduce --max-batch-size (currently {}) or --max-seq-len (currently {}).",
-                args.max_batch_size, args.max_seq_len
-            )
-        } else {
-            format!(
-                " Reduce --max-seq-len (currently {}) or use a smaller model.",
-                args.max_seq_len
-            )
-        };
-        anyhow::bail!(
-            "Insufficient GPU memory for inference buffers. \
-             After loading {:.2} GB of weights, only {:.2} GB remains \
-             but {:.2} GB is needed for SSM state pool ({} slots × {} layers) + scratch buffers.{}",
-            weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            avail_gb,
-            need_gb,
-            args.max_batch_size,
-            config.num_ssm_layers(),
-            hint,
-        );
-    }
-    if gdn_two_phase_bytes > 0 {
-        tracing::info!(
-            "GDN chunked prefill reserve: {} MB (chunk_size={}, max_seq_len={})",
-            gdn_two_phase_bytes / (1024 * 1024),
-            max_batch_tokens_pre,
-            args.max_seq_len,
-        );
-    }
-    tracing::info!(
-        "Weights: {:.2} GB, estimated free: {:.1} GB, actual free: {:.1} GB (reserve: {} MB)",
-        weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        estimated_free as f64 / (1024.0 * 1024.0 * 1024.0),
-        actual_free as f64 / (1024.0 * 1024.0 * 1024.0),
-        inference_reserve / (1024 * 1024),
-    );
-    Ok(())
-}
+#[cfg(test)]
+mod tests;

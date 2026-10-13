@@ -122,6 +122,7 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             },
             max_tokens: req.max_tokens,
             min_tokens: req.min_tokens,
+            ignore_eos: req.ignore_eos,
             stop: req.stop,
             stream: req.stream,
             n: req.n,
@@ -393,6 +394,25 @@ mod tests {
         assert_eq!(ir.n, 2);
         assert!(ir.tools.is_empty());
         assert!(ir.response_format.is_none());
+    }
+
+    #[test]
+    fn envelope_carries_ignore_eos() {
+        let body = |extra: serde_json::Value| {
+            let mut b = serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "min_tokens": 32
+            });
+            b.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            ir::ChatRequest::from(wire(b))
+        };
+        let ir = body(serde_json::json!({"ignore_eos": true}));
+        assert!(ir.ignore_eos);
+        assert_eq!(ir.min_tokens, 32);
+        assert!(!body(serde_json::json!({})).ignore_eos);
     }
 
     #[test]

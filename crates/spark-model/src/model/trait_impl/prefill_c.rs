@@ -21,6 +21,7 @@ use super::super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::super::prefix_share::adopt_prefix_match;
 use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
@@ -105,6 +106,7 @@ impl TransformerModel {
         } else {
             self.buffers.zero_all(self.gpu.as_ref(), stream)?;
         }
+        self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
 
         let mut kv_cache = self.kv_cache.lock();
 
@@ -162,21 +164,12 @@ impl TransformerModel {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
             self.prefix_cache
-                .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
+                .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
         };
         let matched = prefix_match.matched_tokens;
-        seq.cached_prefix_tokens = matched;
-        seq.cached_prefix_blocks = prefix_match.matched_blocks.len();
         // Record the original prompt length for cache_sequence bookkeeping.
         seq.prompt_len = tokens.len();
-        for &block_idx in &prefix_match.matched_blocks {
-            kv_cache.inc_ref(block_idx);
-            seq.block_table.push(block_idx);
-        }
-        reuse_prefix_match_disk_ids(
-            &prefix_match.matched_disk_block_ids,
-            &mut seq.disk_block_ids,
-        );
+        adopt_prefix_match(seq, &prefix_match, &mut kv_cache)?;
 
         // Marconi: restore SSM snapshot if available (session-gated).
         // Phase 1b spill-tier fault-in (#6): fold a resident hit with a
@@ -384,18 +377,7 @@ impl TransformerModel {
                 seq.chunked_prefill_meta.as_mut().unwrap().uploaded_blocks = current_blocks;
             }
 
-            let seq_len_val = (proc_start + proc_count) as u32;
-            // SAFETY: exactly `size_of::<u32>()` bytes over the live, fully
-            // initialised `seq_len_val` local on the line above.
-            let seq_len_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &seq_len_val as *const u32 as *const u8,
-                    std::mem::size_of::<u32>(),
-                )
-            };
-            let seq_len_base = seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
-            self.gpu
-                .copy_h2d_async(seq_len_bytes, seq_len_base, stream)?;
+            self.upload_chunk_seq_lens(seq, proc_start, proc_count, stream)?;
 
             let block_table_base = seq.chunked_prefill_meta.as_ref().unwrap().block_table;
             ops::fill_slots_from_block_table(
@@ -445,6 +427,7 @@ impl TransformerModel {
         };
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,

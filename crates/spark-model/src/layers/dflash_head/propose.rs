@@ -32,9 +32,6 @@ impl BlockDiffusionDraftHead {
     ) -> Result<Vec<u32>> {
         let default_stream = ctx.gpu.default_stream();
         let (_, scratch, markov_embed, markov_bias) = self.lane(0, default_stream);
-        // #58: carve cursor reset — this call's readback completes all
-        // pinned-region H2Ds before the next propose overwrites them.
-        Self::ctx_positions_reset(scratch);
         self.propose_drafts_on_lane(
             scratch,
             markov_embed,
@@ -53,7 +50,6 @@ impl BlockDiffusionDraftHead {
             target_hidden_stack,
             false,
             false,
-            None,
         )
     }
 
@@ -69,7 +65,6 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         stream: u64,
         target_hidden_stack: DevicePtr,
-        ctx_collect: Option<&mut Vec<super::batched_ctx::PendingCtxChunk>>,
     ) -> Result<()> {
         let default_stream = ctx.gpu.default_stream();
         let (_, scratch, markov_embed, markov_bias) = self.lane(0, default_stream);
@@ -91,9 +86,38 @@ impl BlockDiffusionDraftHead {
             Some(target_hidden_stack),
             false,
             true,
-            ctx_collect,
         )?;
         Ok(())
+    }
+
+    /// The context slots a propose projects: `(first, count)` of the
+    /// `ctx_len` populated slots past the paged cache's `ctx_committed`
+    /// (all of them under `ATLAS_DFLASH_DEBUG_FULL_PRECOMPUTE=1`).
+    pub(super) fn ctx_tail(&self, ctx_len: usize, ctx_committed: usize) -> (usize, usize) {
+        // Clamp watermark defensively: a rewind should have reset it, but
+        // never start past ctx_len.
+        let committed = if self.startup.diagnostics.full_precompute {
+            0
+        } else {
+            ctx_committed.min(ctx_len)
+        };
+        (committed, ctx_len - committed)
+    }
+
+    /// The context rows the next propose of `dstate` at `position` appends
+    /// (`ctx_tail` after its `append_decode_ctx` from `stack`), read without
+    /// touching the state.
+    pub(super) fn pending_ctx_rows(
+        &self,
+        dstate: &DflashProposerState,
+        stack: Option<DevicePtr>,
+        position: usize,
+    ) -> usize {
+        let appended = self
+            .decode_append_planned(dstate, stack, position)
+            .is_some();
+        self.ctx_tail(dstate.ctx_len + appended as usize, dstate.ctx_committed)
+            .1
     }
 
     pub(super) fn propose_drafts_on_lane(
@@ -115,72 +139,18 @@ impl BlockDiffusionDraftHead {
         target_hidden_stack: Option<DevicePtr>,
         defer_readback: bool,
         prepare_only: bool,
-        mut ctx_collect: Option<&mut Vec<super::batched_ctx::PendingCtxChunk>>,
     ) -> Result<Vec<u32>> {
         let dstate = state
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        dstate.last_draft_conf.clear();
         let owner = self.validate_dflash_owner(dstate, expected_owner)?;
         let lifecycle = dstate
             .lifecycle
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("DFlash proposer state has no generation owner"))?;
         lifecycle.advance(owner, position, self.gamma, lifecycle.row_stride_bytes())?;
-
-        // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator at propose entry ──
-        // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
-        // accumulated 5×target_hidden context the drafter conditions on, so a
-        // PyTorch/vLLM reference can diff slot-count + values against
-        // `target_hidden_states[:num_context]` (vLLM feeds num_context = ALL
-        // accepted-prefix tokens; this proves whether Atlas's accumulator has
-        // the same BREADTH and the same per-slot 5-layer values).
-        //
-        // Layout of /tmp/atlas_ctx_parity.bin: contiguous BF16,
-        // ctx_len slots × target_layer_ids.len() layers × target_hidden_size,
-        // i.e. ctx_len × ctx_slot_bytes bytes. Companion JSON carries
-        // ctx_len, n_layers, target_hidden_size, position, last_token so the
-        // harness reconstructs shape without log-scraping.
-        {
-            // Per-model latch (see `ModelStats::dumped`) rather than a static: an
-            // operator who sets the flag and then swaps models must still get the
-            // dump, instead of it being swallowed by the previous model's shot.
-            if self.startup.diagnostics.ctx_parity_dump
-                && dstate.ctx_len > 0
-                && ctx.stats.dumped.keyed("dflash_ctx_parity")
-            {
-                let n_bytes = dstate.ctx_len * dstate.ctx_slot_bytes;
-                let mut buf = vec![0u8; n_bytes];
-                ctx.gpu.synchronize(_stream)?;
-                ctx.gpu.copy_d2h(dstate.ctx_hidden_acc, &mut buf)?;
-                match std::fs::write("/tmp/atlas_ctx_parity.bin", &buf) {
-                    Ok(()) => {
-                        let elems_per_slot = dstate.ctx_slot_bytes / 2;
-                        let meta = format!(
-                            "{{\"ctx_len\":{},\"ctx_slot_bytes\":{},\"elems_per_slot\":{},\"position\":{},\"last_token\":{},\"n_bytes\":{}}}",
-                            dstate.ctx_len,
-                            dstate.ctx_slot_bytes,
-                            elems_per_slot,
-                            position,
-                            last_token,
-                            n_bytes,
-                        );
-                        let _ = std::fs::write("/tmp/atlas_ctx_parity.json", meta);
-                        tracing::info!(
-                            "DFLASH CTX_PARITY: wrote {} bytes — ctx_len={} slots × {} BF16 elems/slot (position={}, last_token={}) to /tmp/atlas_ctx_parity.bin",
-                            n_bytes,
-                            dstate.ctx_len,
-                            dstate.ctx_slot_bytes / 2,
-                            position,
-                            last_token,
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("DFLASH CTX_PARITY: write failed: {e}");
-                    }
-                }
-            }
-        }
 
         // ── Phase 2.5b kernel-chain scaffold (commented for next-session
         // fill-in; current path falls through to empty-Vec stub below) ──
@@ -334,35 +304,68 @@ impl BlockDiffusionDraftHead {
         // hiddens to the accumulator poisons the ctx for subsequent
         // propose() calls. Setting this flag uses ONLY prefill captures
         // — clean ctx isolation for diagnosing real-traffic acceptance.
-        // EAGLE-fix: the K=2 accept path appends row 0 + row 1 in EAGLE order
-        // BEFORE calling propose and sets this one-shot flag, so propose must
-        // NOT also decode-append row 0 (would duplicate it). Consume the flag
-        // here. K=gamma/K=4 never set it -> their decode-append is unaffected.
-        let eagle_skip = dstate.skip_next_decode_append;
-        dstate.skip_next_decode_append = false;
-        let skip_decode_append = self.startup.diagnostics.no_decode_append;
-        if !skip_decode_append
-            && !eagle_skip
-            && let Some(latest_ctx) = target_hidden_stack
-            && dstate.ctx_len < dstate.max_ctx_len
-            && dstate.ctx_hidden_acc.0 != 0
+        //
+        // ATLAS_DFLASH_FIRST_APPEND picks what the first propose after
+        // prefill appends (`first_append`).
+        self.append_decode_ctx(dstate, target_hidden_stack, position, ctx.gpu, _stream)?;
+
+        // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator after the decode
+        // append (exactly the slots the block forward attends) ──
+        // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
+        // accumulated 5×target_hidden context the drafter conditions on, so a
+        // PyTorch/vLLM reference can diff slot-count + values against
+        // `target_hidden_states[:num_context]` (vLLM feeds num_context = ALL
+        // accepted-prefix tokens; this proves whether Atlas's accumulator has
+        // the same BREADTH and the same per-slot 5-layer values).
+        //
+        // Layout of /tmp/atlas_ctx_parity.bin: contiguous BF16,
+        // ctx_len slots × target_layer_ids.len() layers × target_hidden_size,
+        // i.e. ctx_len × ctx_slot_bytes bytes. Companion JSON carries
+        // ctx_len, n_layers, target_hidden_size, position, last_token so the
+        // harness reconstructs shape without log-scraping.
         {
-            let dst_offset = dstate.ctx_len * dstate.ctx_slot_bytes;
-            ctx.gpu.copy_d2d_async(
-                latest_ctx,
-                dstate.ctx_hidden_acc.offset(dst_offset),
-                dstate.ctx_slot_bytes,
-                _stream,
-            )?;
-            // Phase I (v2): stamp this slot's TRUE absolute position, fixed
-            // forever. The just-decoded token sits at `position - 1` (the
-            // full-rebuild formula assigns slot ctx_len the position
-            // (position - (ctx_len+1)) + ctx_len == position - 1). Keeping
-            // ctx_positions parallel to ctx_len lets precompute rope each
-            // slot by its own fixed position instead of a sliding base.
-            debug_assert_eq!(dstate.ctx_positions.len(), dstate.ctx_len);
-            dstate.ctx_positions.push(position.saturating_sub(1) as i32);
-            dstate.ctx_len += 1;
+            // Per-model latch (see `ModelStats::dumped`) rather than a static: an
+            // operator who sets the flag and then swaps models must still get the
+            // dump, instead of it being swallowed by the previous model's shot.
+            // ATLAS_DFLASH_BLOCK_DUMP_AT_POS also defers this one-shot dump,
+            // so it fires on the same propose as the block/precompute dumps.
+            if self.startup.diagnostics.ctx_parity_dump
+                && dstate.ctx_len > 0
+                && position >= self.startup.diagnostics.block_dump_at_pos
+                && ctx.stats.dumped.keyed("dflash_ctx_parity")
+            {
+                let n_bytes = dstate.ctx_len * dstate.ctx_slot_bytes;
+                let mut buf = vec![0u8; n_bytes];
+                ctx.gpu.synchronize(_stream)?;
+                ctx.gpu.copy_d2h(dstate.ctx_hidden_acc, &mut buf)?;
+                match std::fs::write("/tmp/atlas_ctx_parity.bin", &buf) {
+                    Ok(()) => {
+                        let elems_per_slot = dstate.ctx_slot_bytes / 2;
+                        let meta = format!(
+                            "{{\"ctx_len\":{},\"ctx_slot_bytes\":{},\"elems_per_slot\":{},\"position\":{},\"last_token\":{},\"n_bytes\":{},\"positions\":{:?}}}",
+                            dstate.ctx_len,
+                            dstate.ctx_slot_bytes,
+                            elems_per_slot,
+                            position,
+                            last_token,
+                            n_bytes,
+                            dstate.ctx_positions,
+                        );
+                        let _ = std::fs::write("/tmp/atlas_ctx_parity.json", meta);
+                        tracing::info!(
+                            "DFLASH CTX_PARITY: wrote {} bytes — ctx_len={} slots × {} BF16 elems/slot (position={}, last_token={}) to /tmp/atlas_ctx_parity.bin",
+                            n_bytes,
+                            dstate.ctx_len,
+                            dstate.ctx_slot_bytes / 2,
+                            position,
+                            last_token,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("DFLASH CTX_PARITY: write failed: {e}");
+                    }
+                }
+            }
         }
 
         // ── Phase 2 Option B: lazy block_table allocation ─────────────
@@ -419,15 +422,10 @@ impl BlockDiffusionDraftHead {
             //
             // Escape hatch: ATLAS_DFLASH_DEBUG_FULL_PRECOMPUTE=1 forces a
             // full recompute (committed=0) for A/B accept-rate parity.
-            let force_full = self.startup.diagnostics.full_precompute;
-            // Clamp watermark defensively: a rewind should have reset it,
-            // but never start past ctx_len.
-            let committed = if force_full {
-                0
-            } else {
-                dstate.ctx_committed.min(dstate.ctx_len)
-            };
-            let new_count = dstate.ctx_len - committed;
+            let (committed, new_count) = self.ctx_tail(dstate.ctx_len, dstate.ctx_committed);
+            // ATLAS_GLM_DRAFT_TP_CTX: a split propose takes its announced
+            // turn at every append, even an empty one.
+            let mut split_turn = self.ctx_split_turn(ctx.comm, new_count, _stream)?;
             if dstate.ctx_len > 0 && new_count > 0 {
                 // Ctx-holes follow-up (2026-07-08): the precompute scratch
                 // (fc_proj / fused_kv_out / slot_mapping_dev) is sized for
@@ -451,47 +449,35 @@ impl BlockDiffusionDraftHead {
                 let mut chunk_start = committed;
                 while chunk_start < dstate.ctx_len {
                     let chunk_count = (dstate.ctx_len - chunk_start).min(self.ctx_window);
+                    // Build slot_mapping for this chunk
+                    // [chunk_start .. chunk_start + chunk_count).
+                    crate::layers::ops::fill_slots_from_block_table(
+                        ctx.gpu,
+                        self.kernels.fill_slots,
+                        *slot_mapping,
+                        dstate.block_table_dev.unwrap(),
+                        chunk_start as u32,
+                        chunk_count as u32,
+                        BLOCK_SIZE as u32,
+                        _stream,
+                    )?;
+                    // The fixed positions for exactly the rows we're
+                    // computing. ctx_positions is parallel to ctx slots.
                     let slot_positions =
                         &dstate.ctx_positions[chunk_start..chunk_start + chunk_count];
-                    if let Some(pending) = ctx_collect.as_deref_mut() {
-                        // Batched propose (#58): record the chunk; the
-                        // prepare loop's run_batched_ctx_stage gathers
-                        // every seq's rows, projects once, and scatters
-                        // (rebuilding slot_mapping) afterwards.
-                        pending.push(super::batched_ctx::PendingCtxChunk {
-                            ctx_base: dstate.ctx_hidden_acc,
-                            block_table: dstate.block_table_dev.unwrap(),
-                            start_slot: chunk_start,
-                            count: chunk_count,
-                            positions: slot_positions.to_vec(),
-                        });
-                    } else {
-                        // Build slot_mapping for this chunk
-                        // [chunk_start .. chunk_start + chunk_count).
-                        crate::layers::ops::fill_slots_from_block_table(
-                            ctx.gpu,
-                            self.kernels.fill_slots,
-                            *slot_mapping,
-                            dstate.block_table_dev.unwrap(),
-                            chunk_start as u32,
-                            chunk_count as u32,
-                            BLOCK_SIZE as u32,
-                            _stream,
-                        )?;
-                        // The fixed positions for exactly the rows we're
-                        // computing. ctx_positions is parallel to ctx slots.
-                        self.precompute_ctx_kv(
-                            dstate.ctx_hidden_acc,
-                            chunk_start,
-                            chunk_count,
-                            slot_positions,
-                            *slot_mapping,
-                            ctx,
-                            _stream,
-                            true, // commit: always write to paged cache on production path
-                            scratch,
-                        )?;
-                    }
+                    self.precompute_ctx_kv(
+                        dstate.ctx_hidden_acc,
+                        chunk_start,
+                        chunk_count,
+                        slot_positions,
+                        *slot_mapping,
+                        ctx,
+                        _stream,
+                        true, // commit: always write to paged cache on production path
+                        scratch,
+                        // One pass: a split append fits the scratch window.
+                        split_turn.take(),
+                    )?;
                     chunk_start += chunk_count;
                 }
                 // Tail is now committed in the paged cache. Committed slots
@@ -623,6 +609,11 @@ impl BlockDiffusionDraftHead {
                 lane_id,
                 defer_readback,
                 grammar_bitmask,
+                crate::traits::EosBan::banned_draft_depth(
+                    dstate.end_floor,
+                    position,
+                    self.gamma.saturating_sub(1),
+                ),
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
@@ -659,6 +650,7 @@ impl BlockDiffusionDraftHead {
         // on Lightning (Hello → '!' was drafted then dropped).
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
+        dstate.last_draft_conf = self.host_draft_conf(scratch, drafts.len());
         Ok(drafts)
     }
 
@@ -698,13 +690,6 @@ impl BlockDiffusionDraftHead {
         let lanes_n = self.lane_count();
         let cap = self.draft_cap(num_drafts);
         let default_stream = ctx.gpu.default_stream();
-        // #58: every lane's pinned carve region resets once per propose —
-        // the deferred-draft readback below completes all enqueued H2Ds
-        // before the next call reuses them.
-        Self::ctx_positions_reset(&self.scratch);
-        for l in &self.extra_lanes {
-            Self::ctx_positions_reset(&l.scratch);
-        }
         ctx.gpu
             .record_event(self.lanes_start_event, default_stream)?;
         for l in &self.extra_lanes {
@@ -720,7 +705,7 @@ impl BlockDiffusionDraftHead {
         let mut used_lanes: Vec<usize> = Vec::with_capacity(lanes_n.min(n));
         let mut seen = vec![false; lanes_n];
         let mut lane_last_use: Vec<Option<usize>> = vec![None; lanes_n];
-        let mut out: Vec<Option<Vec<u32>>> = vec![None; n];
+        let mut out: Vec<Option<(Vec<u32>, Vec<f32>)>> = vec![None; n];
         let mut lane_scratch_list: Vec<&DflashScratch> = Vec::with_capacity(n);
         for i in 0..n {
             let lane = {
@@ -762,7 +747,6 @@ impl BlockDiffusionDraftHead {
                 Some(target_hiddens[i]),
                 true,
                 false,
-                None,
             )?;
         }
         // COLLECT phase: each lane's D2H event is now recorded; synchronize
@@ -772,10 +756,12 @@ impl BlockDiffusionDraftHead {
                 out[i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[i], cap)?);
             }
         }
-        let out: Vec<Vec<u32>> = out.into_iter().map(|o| o.unwrap_or_default()).collect();
-        for (i, drafts) in out.iter().enumerate() {
+        let (out, confs): (Vec<Vec<u32>>, Vec<Vec<f32>>) =
+            out.into_iter().map(Option::unwrap_or_default).unzip();
+        for (i, (drafts, conf)) in out.iter().zip(confs).enumerate() {
             if let Some(dstate) = states[i].as_any_mut().downcast_mut::<DflashProposerState>() {
                 dstate.last_num_drafted = drafts.len();
+                dstate.last_draft_conf = conf;
             }
         }
         if self.startup.diagnostics.verify_trace {

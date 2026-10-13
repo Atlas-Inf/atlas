@@ -61,6 +61,14 @@ pub struct GrammarState {
     /// serve a stale mask, so the invalidations are deliberately generous.
     bitmask_valid: bool,
     bitmask_fill_result: bool,
+    /// A `response_format` grammar (json_object / json_schema): the response
+    /// must conform, so a refused token ends it with an error instead of
+    /// disengaging the grammar as tool-call grammars do. Set via
+    /// [`Self::strict_output`].
+    strict: bool,
+    /// The strict grammar's response opens inside `<think>`, so the first
+    /// sampled token is reasoning and must not be masked or consumed.
+    opens_in_thinking: bool,
 }
 
 impl GrammarState {
@@ -120,6 +128,8 @@ impl GrammarState {
             stop_tokens: Box::new([]),
             bitmask_valid: false,
             bitmask_fill_result: false,
+            strict: false,
+            opens_in_thinking: false,
         })
     }
 
@@ -133,6 +143,29 @@ impl GrammarState {
     pub fn with_stop_tokens(mut self, stop_tokens: &[u32]) -> Self {
         self.stop_tokens = stop_tokens.to_vec().into_boxed_slice();
         self
+    }
+
+    /// Mark this as a `response_format` grammar (see the `strict` field).
+    /// `opens_in_thinking`: the prompt leaves the model inside `<think>`.
+    #[must_use]
+    pub fn strict_output(mut self, opens_in_thinking: bool) -> Self {
+        self.strict = true;
+        self.opens_in_thinking = opens_in_thinking;
+        self
+    }
+
+    /// Whether this is a `response_format` grammar whose output must conform.
+    pub fn is_strict(&self) -> bool {
+        self.strict
+    }
+
+    /// Whether the first token sampled after prefill is grammar output. False
+    /// only for a strict grammar whose response opens inside `<think>`: that
+    /// token is reasoning, and the grammar starts after `</think>` as on every
+    /// other path. Tool grammars keep masking it (GLM can open a tool call
+    /// as its first token, which implicitly ends thinking).
+    pub fn masks_first_token(&self) -> bool {
+        !(self.strict && self.opens_in_thinking)
     }
 
     /// Fill the allowed-token bitmask for the next decode step.

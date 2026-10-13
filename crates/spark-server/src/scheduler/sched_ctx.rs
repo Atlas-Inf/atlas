@@ -77,6 +77,33 @@ pub struct SchedCtx {
 }
 
 impl SchedCtx {
+    /// The verify-time logits context of one step: the tokenizer special
+    /// tokens the verify pipeline needs to run the same processors the
+    /// non-speculative path applies.
+    pub fn verify_logits_ctx(
+        &self,
+        think_end_token: Option<u32>,
+        think_start_token: Option<u32>,
+        tool_call_start_token: Option<u32>,
+        tool_call_end_token: Option<u32>,
+    ) -> crate::scheduler::logit_processors::LogitsContext<'_> {
+        crate::scheduler::logit_processors::LogitsContext {
+            glm_tool_boundary: self.limits.glm_tool_boundary,
+            watchdog: self.watchdog,
+            scratch: &self.scratch,
+            dumps: &self.dumps,
+            stats: self.stats.clone(),
+            think_end_token,
+            think_start_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            boundary_mask: self.masks.boundary.clone(),
+            mid_word_mask: self.masks.mid_word.clone(),
+            sampling: self.levers.sampling(),
+            timing: self.timing.clone(),
+        }
+    }
+
     pub fn new(
         masks: VocabMasks,
         levers: std::sync::Arc<SchedLevers>,

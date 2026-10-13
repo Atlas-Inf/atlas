@@ -39,6 +39,10 @@
 
 use spark_runtime::sampler::SamplingParams;
 
+#[path = "fast_greedy_copy_policy.rs"]
+mod copy_policy;
+pub(in crate::scheduler) use copy_policy::CopyFailurePolicy;
+
 /// How the configured penalties interact with the greedy fast path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PenaltyGate {
@@ -95,27 +99,28 @@ pub(super) fn logit_is_positive(
     vocab: usize,
     tok: u32,
 ) -> bool {
+    logit_is_positive_checked(model, base, row, vocab, tok).unwrap_or(false)
+}
+
+/// Same actual one-logit read, preserving copy errors for checked callers.
+pub(super) fn logit_is_positive_checked(
+    model: &dyn spark_model::traits::Model,
+    base: spark_runtime::gpu::DevicePtr,
+    row: usize,
+    vocab: usize,
+    tok: u32,
+) -> anyhow::Result<bool> {
     let idx = row * vocab + tok as usize;
     let v = if model.logits_ptr_is_fp32(base) {
         let mut b = [0u8; 4];
-        if model
-            .copy_logits_to_host(base.offset(idx * 4), &mut b)
-            .is_err()
-        {
-            return false;
-        }
+        model.copy_logits_to_host(base.offset(idx * 4), &mut b)?;
         f32::from_le_bytes(b)
     } else {
         let mut b = [0u8; 2];
-        if model
-            .copy_logits_to_host(base.offset(idx * 2), &mut b)
-            .is_err()
-        {
-            return false;
-        }
+        model.copy_logits_to_host(base.offset(idx * 2), &mut b)?;
         crate::scheduler::helpers::bf16_to_f32(b[0], b[1])
     };
-    v > 0.0
+    Ok(v > 0.0)
 }
 
 #[cfg(test)]

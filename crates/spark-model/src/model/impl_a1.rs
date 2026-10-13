@@ -167,6 +167,21 @@ impl TransformerModel {
         // tasks/determinism_investigation.md).
         let mut levers = ops::ModelLevers::from_env();
         levers.max_decode_seqs = (max_batch_size as u32).max(1);
+        levers.qwen4exp_exact_verify = super::qwen4exp_exact_verify::lever(&config.model_type)?;
+        levers.qwen4exp_mtp_depth =
+            super::qwen4exp_mtp_depth::lever(&config.model_type, levers.qwen4exp_exact_verify)?;
+        levers.qwen4exp_batch_fast = super::qwen4exp_batch_fast::lever(&config.model_type)?;
+        if levers.qwen4exp_batch_fast {
+            levers.qwen4exp_batch_small = super::qwen4exp_batch_fast::small_lever();
+            levers.qwen4exp_batch_bisect = super::qwen4exp_batch_fast::bisect_requested();
+            if levers.qwen4exp_batch_bisect != 0 {
+                tracing::warn!(
+                    "ATLAS_QWEN4EXP_BATCH_FAST_BISECT={:#x}: batched-step components forced \
+                     to single-row launches (diagnostic, slow)",
+                    levers.qwen4exp_batch_bisect
+                );
+            }
+        }
 
         tracing::info!(
             "TransformerModel: {} layers, vocab={}, hidden={}{}{}",
@@ -210,7 +225,9 @@ impl TransformerModel {
         // fill in upload_batch_metadata_*) would otherwise dequant random
         // bytes and inject garbage into attention scores.
         let mut kv_cache = kv_cache;
-        let dummy_kv_block = kv_cache.alloc_block()?;
+        // Padding tables name it at every logical index; draw it as logical
+        // block 0 (a latent-sharded cache refuses index-less allocation).
+        let dummy_kv_block = kv_cache.alloc_block_at(0)?;
         kv_cache.zero_block(dummy_kv_block, gpu.as_ref(), gpu.default_stream())?;
         gpu.synchronize(gpu.default_stream())?;
 
@@ -319,6 +336,15 @@ impl TransformerModel {
         } else {
             DevicePtr::NULL
         };
+        let glm_long_stage =
+            super::impl_a1_spec_init::alloc_glm_long_stage(&config, has_mtp, gpu.as_ref())?;
+        let lmhead_split = super::qwen4exp_lmhead_split::HeadSplit::alloc(
+            &config.model_type,
+            config.vocab_size,
+            comm.as_deref(),
+            max_batch_size,
+            gpu.as_ref(),
+        )?;
         // Batched-verify WY pointer-table staging (fixed address for CUDA
         // graph stability; contents refreshed pre-graph every batched verify
         // step). One [h|Hi0..Hi14] x 32-entry slice per GDN layer — ~192 KB.
@@ -340,41 +366,16 @@ impl TransformerModel {
             DevicePtr::NULL
         };
 
-        // Whole-prompt hidden capture buffer, [max_seq_len, hidden_size] BF16 —
-        // 335 MB at 32k/h=5120. Backs BOTH halves of the drafter-context
-        // feature (see `crate::model::drafter_context`); NULL here disables
-        // prefill AND carry, since the carry path reads this buffer.
-        //
-        // Three conditions, all necessary: MTP must be active, the feature must
-        // not be killed, and the head must be a precision the batched prefill
-        // can actually run at — an NVFP4/FP8 MTP head would allocate this and
-        // never write it.
-        let mtp_prefill_hidden = if has_mtp
-            && mtp_quant.supports_drafter_prefill()
-            && crate::layers::mtp_drafter_prefill_enabled(&levers)
-        {
-            let bytes = max_seq_len * config.hidden_size * 2;
-            tracing::info!(
-                "MTP drafter context: allocating {:.0} MB prompt-hidden capture \
-                 ({} x {} BF16)",
-                bytes as f64 / 1e6,
+        let (mtp_arena_context, mtp_prefill_hidden) =
+            super::impl_a1_spec_init::alloc_mtp_prefill_hidden(
+                &config,
                 max_seq_len,
-                config.hidden_size,
-            );
-            gpu.alloc(bytes)?
-        } else {
-            if has_mtp
-                && !mtp_quant.supports_drafter_prefill()
-                && crate::layers::mtp_drafter_prefill_enabled(&levers)
-            {
-                tracing::info!(
-                    "MTP drafter context: INACTIVE — the batched drafter prefill \
-                     needs a BF16 MTP head (--mtp-quantization bf16); this head is \
-                     {mtp_quant:?}. No prompt-hidden capture allocated.",
-                );
-            }
-            DevicePtr::NULL
-        };
+                has_mtp,
+                dflash_kgamma,
+                mtp_quant,
+                &levers,
+                gpu.as_ref(),
+            )?;
 
         // DFlash 5-layer hidden-state stack. Allocated only when a
         // BlockDiffusionDraftHead is the active proposer (`config.dflash_capture_layers`
@@ -480,6 +481,11 @@ impl TransformerModel {
                 Err(e) => {
                     tracing::warn!("bf16_add_inplace kernel not found (send/recv disabled): {e}")
                 }
+            }
+            // Graph-capturable RDMA collectives (ATLAS_RDMA_ONESHOT=1); a
+            // backend without them ignores the handle.
+            if let Ok(k) = gpu.kernel("rdma_oneshot", "rdma_oneshot_bf16") {
+                comm.set_oneshot_kernel(k.0);
             }
         }
 
@@ -622,8 +628,11 @@ impl TransformerModel {
         // value is dead code and must not suppress CUDA graphs.
         let has_fp8_calibration = config.fp8_kv_calibration_tokens > 0
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
+        // Sharded latents exchange with the peer inside attention (eager only).
+        let latent_shard = kv_cache.latent_shard().is_some();
         // Feature-2 overlay kernels: resolve before `gpu` is moved into Self.
         let overlay_kernels = crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
+        let warm = super::warm_turn::WarmTurn::from_env(&config.model_type)?;
         Ok(Self {
             // Installed by the factory after construction: the layers read
             // from the store during `new`, so it cannot be moved in here.
@@ -655,6 +664,7 @@ impl TransformerModel {
             layers,
             buffers,
             lora: None,
+            lora_install_attempted: false,
             lora_rotatable: false,
             kv_cache: Mutex::new(kv_cache),
             gpu,
@@ -690,11 +700,12 @@ impl TransformerModel {
             // naturally outside the captured region.
             suppress_graphs: std::sync::atomic::AtomicBool::new(
                 has_fp8_calibration
+                    || latent_shard
                     || std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true")
                     // PCND diagnostic: force eager decode (no CUDA-graph capture)
                     // so ATLAS_DEBUG_SYNC_KERNELS can synchronize per launch and
                     // surface async faults at the culprit kernel. Default-off.
-                    || std::env::var("ATLAS_DEBUG_NO_GRAPH").as_deref() == Ok("1"),
+                    || super::graph_flags::debug_no_graph(),
             ),
             ssm_pool,
             ssm_snapshots,
@@ -705,17 +716,20 @@ impl TransformerModel {
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,
+            draft_assist: None,
             lightning_dspark_identity: Default::default(),
             mtp_hidden_save,
             verify_hidden_stash,
             verify_stream_stash,
+            glm_long_stage,
+            lmhead_split,
             mtp_catchup_ring,
             mtp_catchup_meta: parking_lot::Mutex::new((0, 0)),
             mtp_prefill_hidden,
             mtp_prefill_capacity: if mtp_prefill_hidden.is_null() {
                 0
             } else {
-                max_seq_len
+                mtp_arena_context
             },
             mtp_prefill_capture_len: std::sync::atomic::AtomicUsize::new(0),
             mtp_prefill_capture_gen: std::sync::atomic::AtomicU64::new(0),
@@ -736,21 +750,26 @@ impl TransformerModel {
             verify_wy_cache: Mutex::new(None),
             verify_kgamma_graph: Mutex::new(std::collections::HashMap::new()),
             fused_graph: Mutex::new(std::collections::HashMap::new()),
+            verify_pieces: Default::default(),
+            decode_pieces: super::decode_pieces::new_cache(),
             prefix_cache,
+            warm,
             secondary_stream,
             secondary_event,
             snapshot_event,
             comm,
             ep_cmd_buf,
-            ep_protocol_v2: matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2")),
+            ep_protocol_v2: super::ep_protocol_v2_requested(),
             self_speculative,
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
+            verify_row_masks: Default::default(),
             vision_encoder,
             vision_embed_patches: Mutex::new(0),
             vision_image_grids: Mutex::new(Vec::new()),
             vision_row_base: Mutex::new(0),
             vision_grid_base: Mutex::new(0),
             vision_owned_images: Mutex::new(0),
+            vision_slice_rows: Mutex::new(0),
             pinned_staging,
             ssm_checkpoint_interval,
             ssm_state_norm_kernel: ssm_norm_k,

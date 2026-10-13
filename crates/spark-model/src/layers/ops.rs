@@ -13,6 +13,10 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/bf16_gemm_cutlass.rs"]
+mod bf16_gemm_cutlass;
+#[path = "ops/dense_gemv_multi.rs"]
+mod dense_gemv_multi;
 #[path = "ops/derived_reserve.rs"]
 mod derived_reserve;
 #[path = "ops/derived_weights.rs"]
@@ -23,6 +27,8 @@ mod dispatch_config;
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
 mod dispatch_proj;
+#[path = "ops/mxfp8.rs"]
+mod mxfp8;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
@@ -52,10 +58,14 @@ pub mod gdn_flashinfer;
 mod gemm_dense;
 #[path = "ops/gemm_dense_int8.rs"]
 mod gemm_dense_int8;
+#[path = "ops/gemm_dense_router.rs"]
+mod gemm_dense_router;
 #[path = "ops/gemm_fp4.rs"]
 mod gemm_fp4;
 #[path = "ops/model_stats.rs"]
 pub mod model_stats;
+#[path = "ops/moe_gate_up_repack.rs"]
+pub(crate) mod moe_gate_up_repack;
 pub use model_stats::ModelStats;
 
 #[path = "ops/exl3_ops.rs"]
@@ -70,15 +80,39 @@ mod gemv_q2;
 mod gemv_q2_vec;
 #[path = "ops/gemv_sw.rs"]
 mod gemv_sw;
+#[path = "ops/gemv_touch.rs"]
+mod gemv_touch;
+#[path = "ops/glm_decode_fuse.rs"]
+pub mod glm_decode_fuse;
+#[path = "ops/glm_hc_prefill.rs"]
+mod glm_hc_prefill;
+#[path = "ops/glm_indexer.rs"]
+mod glm_indexer;
+#[path = "ops/glm_indexer_dynamic.rs"]
+mod glm_indexer_dynamic;
+#[path = "ops/glm_kv_shard.rs"]
+mod glm_kv_shard;
+#[path = "ops/glm_router_bn4.rs"]
+mod glm_router_bn4;
+#[path = "ops/glm_sparse_prefill_tc.rs"]
+mod glm_sparse_prefill_tc;
+pub use glm_router_bn4::glm_router_bn4;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
 #[path = "ops/hyper_connection_dispatch.rs"]
 mod hyper_connection_dispatch;
 #[path = "ops/hyper_connection_lowrank.rs"]
 mod hyper_connection_lowrank;
+#[path = "ops/kda.rs"]
+mod kda;
+#[path = "ops/kda_indexed.rs"]
+mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
 #[path = "ops/hyper_connection_lowrank_gemm.rs"]
 mod hyper_connection_lowrank_gemm;
+#[path = "ops/hyper_connection_lowrank_prefill.rs"]
+mod hyper_connection_lowrank_prefill;
+pub(crate) use hyper_connection_lowrank_prefill::HC_PREFILL_SLAB;
 #[path = "ops/hyper_connection_lowrank_split.rs"]
 mod hyper_connection_lowrank_split;
 // GPU parity test, so it needs the cuda backend to compile at all. Gated on
@@ -96,12 +130,16 @@ mod hyper_connection_lowrank_tests;
 mod kv_cache;
 #[path = "ops/kv_cache_fp8k.rs"]
 mod kv_cache_fp8k;
+#[path = "ops/kv_cache_glm.rs"]
+mod kv_cache_glm;
 #[path = "ops/kv_cache_turbok.rs"]
 mod kv_cache_turbok;
 #[path = "ops/lora_delta.rs"]
 pub mod lora_delta;
 #[path = "ops/marlin_nvfp4.rs"]
 mod marlin_nvfp4;
+#[path = "ops/marlin_nvfp4_pack.rs"]
+mod marlin_nvfp4_pack;
 #[path = "ops/model_levers.rs"]
 mod model_levers;
 #[path = "ops/moe_atomic_c4.rs"]
@@ -122,6 +160,8 @@ mod moe_grouped_b;
 mod moe_grouped_fp4;
 #[path = "ops/moe_lora_grouped.rs"]
 pub mod moe_lora_grouped;
+#[path = "ops/moe_nvfp4_mmq.rs"]
+mod moe_nvfp4_mmq;
 #[path = "ops/moe_prefill.rs"]
 mod moe_prefill;
 #[path = "ops/norm.rs"]
@@ -157,6 +197,20 @@ mod qsa_rows;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 pub mod qwen4exp;
+#[path = "ops/qwen4exp_decode_fuse.rs"]
+pub mod qwen4exp_decode_fuse;
+#[path = "ops/qwen4exp_gdn_rows.rs"]
+pub mod qwen4exp_gdn_rows;
+#[path = "ops/qwen4exp_moe.rs"]
+mod qwen4exp_moe;
+#[path = "ops/qwen4exp_moe_rows.rs"]
+mod qwen4exp_moe_rows;
+#[path = "ops/qwen4exp_prefill.rs"]
+pub mod qwen4exp_prefill;
+#[path = "ops/qwen4exp_prefill_hc.rs"]
+pub mod qwen4exp_prefill_hc;
+#[path = "ops/qwen4exp_prefill_seam.rs"]
+pub mod qwen4exp_prefill_seam;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
 #[cfg(test)]
 #[path = "ops/grammar_bitmask_tests.rs"]
@@ -189,6 +243,8 @@ mod ssm_gdn_snap;
 mod ssm_gdn_wyn_table_tests;
 #[path = "ops/ssm_mamba.rs"]
 mod ssm_mamba;
+#[path = "ops/ssm_mamba_snap.rs"]
+mod ssm_mamba_snap;
 #[path = "ops/ssm_preproc.rs"]
 mod ssm_preproc;
 #[path = "ops/ssm_ssd.rs"]
@@ -198,6 +254,8 @@ pub mod token_overlay;
 mod wide_prefill;
 
 pub use activations::*;
+pub use bf16_gemm_cutlass::*;
+pub use dense_gemv_multi::*;
 pub use derived_reserve::{lazy_bf16_copy_bytes, lazy_bf16_reserve, lazy_bf16_reserve_enabled};
 pub use derived_weights::{Derivation, DerivedWeights};
 pub use dispatch_config::GemmDispatch;
@@ -213,20 +271,37 @@ pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
 pub use gemm_dense::*;
 pub use gemm_dense_int8::*;
+pub use gemm_dense_router::*;
 pub use gemm_fp4::*;
 pub use gemm_fp8_prefill::*;
 pub use gemm_quant::*;
 pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
+pub use gemv_touch::{
+    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, w4a16_pair_touch,
+    w4a16_tc_twin, w4a16_verify_touch,
+};
+pub use glm_hc_prefill::*;
+pub use glm_indexer::*;
+pub use glm_indexer_dynamic::*;
+pub use glm_kv_shard::*;
+pub use glm_sparse_prefill_tc::*;
 pub use hyper_connection::*;
 pub use hyper_connection_dispatch::*;
 pub use hyper_connection_lowrank::*;
+pub use kda::*;
+pub use kda_indexed::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
+pub use kv_cache_glm::*;
 pub use kv_cache_turbok::*;
 pub use marlin_nvfp4::*;
-pub use model_levers::ModelLevers;
+pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
+pub use model_levers::{
+    BISECT_ATTN_PROJ, BISECT_ATTN_ROWS, BISECT_GDN, BISECT_HC, BISECT_HEAD, BISECT_MOE_FORWARD,
+    BISECT_MOE_ROWS, ModelLevers,
+};
 pub use moe_atomic_c4::*;
 pub use moe_expert::*;
 pub use moe_expert_more::*;
@@ -237,7 +312,9 @@ pub use moe_grouped_a2::*;
 pub(crate) use moe_grouped_b::*;
 pub use moe_grouped_fp4::*;
 pub use moe_lora_grouped::*;
+pub use moe_nvfp4_mmq::*;
 pub use moe_prefill::*;
+pub use mxfp8::*;
 pub use norm::*;
 pub use nvfp4_mmq::*;
 pub use ple::*;
@@ -254,6 +331,8 @@ pub use qsa::*;
 pub use qsa_prefill_attn::*;
 pub use qsa_rows::*;
 pub use quant_dispatch::*;
+pub use qwen4exp_moe::*;
+pub use qwen4exp_moe_rows::*;
 pub use sampling::*;
 pub use ssm_gdn_a::*;
 pub use ssm_gdn_a2::*;
@@ -262,6 +341,7 @@ pub use ssm_gdn_b::*;
 pub use ssm_gdn_batched::*;
 pub use ssm_gdn_snap::*;
 pub use ssm_mamba::*;
+pub use ssm_mamba_snap::*;
 pub use ssm_preproc::*;
 pub use ssm_ssd::*;
 pub use wide_prefill::*;

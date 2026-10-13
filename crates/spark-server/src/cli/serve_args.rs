@@ -324,6 +324,12 @@ pub struct ServeArgs {
     /// extended to the rest of the forward. That, not this flag alone, is
     /// what end-to-end spec-on == spec-off would require.
     ///
+    /// Done for qwen4_exp (Qwen3.8-Flash-Next) at K=2/3, one sequence:
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` turns this chain on for that model and
+    /// moves its remaining row-count-dependent ops (attention K/V, the GDN
+    /// layers' MoE) to serial decode's arithmetic
+    /// (`spark-model/src/model/qwen4exp_exact_verify.rs`).
+    ///
     /// The default verify pass runs the WY-chunkwise / fused BF16-conv arms:
     /// fast, but their BF16-output conv (h-state relL2 ~8.6e-4 per K=4
     /// window, committed into persistent SSM state) plus a ~3.4e-8 chunkwise
@@ -889,9 +895,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub fast_load_prefetch_shards: bool,
 
-    /// Vision input AREA bound in pixels, applied before patching. Overrides
-    /// the checkpoint in BOTH directions — it may raise the bound as well as
-    /// lower it.
+    /// Vision input pixel budget, applied before patching. Overrides the
+    /// checkpoint in BOTH directions — it may raise the bound as well as lower
+    /// it. Qwen paths interpret this as spatial H×W; GLM-5.3 interprets it as
+    /// the processor's temporal volume T×H×W and still applies its bounded
+    /// native encoder capacity.
     ///
     /// 0 (the default) means "use the checkpoint's own bound", read from
     /// `preprocessor_config.json` (`size.longest_edge`, or `max_pixels`;

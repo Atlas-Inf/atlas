@@ -97,7 +97,13 @@ pub struct Qwen4ExpMtpHead {
     /// is re-verified by the target's own head, so the draft head can only
     /// affect acceptance, never an emitted token.
     lm_head: DenseWeight,
+    /// `--mtp-vocab`: the grammar-masked draft path's prefix of `lm_head`.
     mtp_vocab_size: u32,
+    /// The unmasked draft path's head (`qwen4exp_draft_head.rs`).
+    draft: crate::layers::qwen4exp_draft_head::DraftHead,
+    /// `ATLAS_QWEN4EXP_MTP_CONFIDENCE`: stop the chain before a draft (after
+    /// the first) whose draft-head probability is below this. 0 = off.
+    conf_stop: f32,
     /// The drafter's own single-layer KV cache.
     kv_cache: Mutex<PagedKvCache>,
 
@@ -128,11 +134,13 @@ impl Qwen4ExpMtpHead {
         module: Qwen4ExpMtpModule,
         embed_tokens: DenseWeight,
         lm_head: DenseWeight,
-        config: &atlas_core::config::ModelConfig,
         gpu: &dyn GpuBackend,
         mtp_vocab_size: u32,
         max_seq_len: usize,
     ) -> Result<Self> {
+        // The config the body was built with (the TP=1 view), so the cache
+        // holds every KV head the unsharded body writes.
+        let config = &module.config;
         let h = config.hidden_size;
         let hc = config.hc_mult.max(1);
 
@@ -147,26 +155,33 @@ impl Qwen4ExpMtpHead {
             .iter()
             .filter(|t| matches!(t, atlas_core::config::LayerType::FullAttention))
             .count();
-        let kv_config = KvCacheConfig {
-            block_size: 16,
-            num_kv_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
-            num_layers: target_attn_layers + 1,
-            dtype: KvCacheDtype::Bf16,
-            layer_dtypes: vec![],
-            layer_dims: vec![],
-            cache_blocks_per_seq: None,
-        };
+        let kv_config = drafter_kv_config(
+            target_attn_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+        );
         let num_blocks = max_seq_len / kv_config.block_size + 1;
         let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
 
         let bf16 = |n: usize| -> Result<DevicePtr> { gpu.alloc(n * 2) };
+        let draft = crate::layers::qwen4exp_draft_head::DraftHead::build(
+            &lm_head,
+            config.vocab_size,
+            h,
+            mtp_vocab_size,
+            gpu,
+        )?;
+        let conf_stop = crate::layers::qwen4exp_draft_head::conf_stop_from(
+            std::env::var("ATLAS_QWEN4EXP_MTP_CONFIDENCE").ok(),
+        )?;
 
         Ok(Self {
             module,
             embed_tokens,
             lm_head,
             mtp_vocab_size,
+            draft,
+            conf_stop,
             kv_cache: Mutex::new(kv_cache),
             embed_buf: bf16(h)?,
             normed_e: bf16(h)?,
@@ -218,6 +233,27 @@ impl Qwen4ExpMtpHead {
     }
 }
 
+/// The drafter's KV geometry: `slot` placeholder layer slots, then the one
+/// layer it writes. The placeholders exist only so the body's
+/// `attn_idx = slot` lands on a real pool; they are never read or written,
+/// so they get the smallest geometry the allocator accepts (one 1-wide head,
+/// 32 B per block) instead of a full layer each. Full layers there cost
+/// 12/13 of the pool: 6.5 GB at --max-seq-len 262144 where 0.5 GB is used.
+fn drafter_kv_config(slot: usize, num_kv_heads: usize, head_dim: usize) -> KvCacheConfig {
+    let mut layer_dims = vec![(1, 1); slot];
+    layer_dims.push((num_kv_heads, head_dim));
+    KvCacheConfig {
+        block_size: 16,
+        num_kv_heads,
+        head_dim,
+        num_layers: slot + 1,
+        dtype: KvCacheDtype::Bf16,
+        layer_dtypes: vec![],
+        layer_dims,
+        cache_blocks_per_seq: None,
+    }
+}
+
 #[path = "qwen4exp_mtp_forward.rs"]
 mod qwen4exp_mtp_forward;
 
@@ -252,14 +288,30 @@ impl DraftProposer for Qwen4ExpMtpHead {
             // `body.decode` left holding the drafter's own residual — so
             // unlike the collapsed-hidden proposers there is nothing to thread
             // between iterations.
-            let draft = self.forward_one(
+            let want_conf = i > 0 && self.conf_stop > 0.0;
+            let (draft, conf) = self.forward_one(
                 current_token,
                 position + i,
                 st,
                 ctx,
                 stream,
                 grammar_bitmask,
+                want_conf,
             )?;
+            // Confidence stop: the first draft is always kept; a later one
+            // whose draft-head probability is below the threshold ends the
+            // chain, unproposed. Its drafter KV row is dropped as a rejected
+            // draft's is. Proposals only — the verify decides every token.
+            if let Some(p) = conf
+                && p < self.conf_stop
+            {
+                st.seq_len -= 1;
+                tracing::debug!(
+                    "qwen4_exp MTP confidence stop at draft {i}: p={p:.3} < {}",
+                    self.conf_stop
+                );
+                break;
+            }
             tracing::debug!(
                 "qwen4_exp MTP propose[{i}]: token={current_token} pos={} mtp_seq_len={} -> draft={draft}",
                 position + i,
@@ -307,5 +359,33 @@ impl DraftProposer for Qwen4ExpMtpHead {
         }
         st.seq_len = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod drafter_kv_tests {
+    use super::*;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+
+    /// The written slot keeps a full layer's strides; the twelve slots in
+    /// front of it cost next to nothing.
+    #[test]
+    fn only_the_written_slot_is_a_full_layer() {
+        let cfg = drafter_kv_config(12, 2, 256);
+        let full = 16 * 2 * 256 * 2;
+        assert_eq!(cfg.k_block_bytes_for_layer(12), full);
+        assert_eq!(cfg.v_block_bytes_for_layer(12), full);
+        assert_eq!(cfg.cache_stride_elements(), 16 * 2 * 256);
+        assert_eq!(cfg.block_bytes_kv_all_layers(), 2 * full + 12 * 2 * 32);
+
+        let gpu = MockGpuBackend::new();
+        let blocks = 64;
+        let kv = PagedKvCache::new(cfg, blocks, &gpu).unwrap();
+        assert_eq!(kv.k_block_stride_bytes_for_layer(12), full);
+        assert_eq!(kv.v_block_stride_bytes_for_layer(12), full);
+        assert_eq!(kv.dtype_for_layer(12), KvCacheDtype::Bf16);
+        let k12 = gpu.read_alloc(kv.k_pool_ptr(12)).unwrap();
+        assert_eq!(k12.len(), blocks * full);
+        assert_eq!(gpu.read_alloc(kv.k_pool_ptr(0)).unwrap().len(), blocks * 32);
     }
 }

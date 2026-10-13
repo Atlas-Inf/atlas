@@ -44,7 +44,9 @@ fn unified_flag_truthy(v: Option<&str>) -> bool {
 /// 3. **Swap files leak.** Flag-ON swap files (`atlas-ssm-{tag}.{pid}.swap`,
 ///    `atlas-decode-ring.{pid}.swap`) are per-PID and never unlinked, and the disk
 ///    tier grows unbounded by design. Unlink same-tag stale files on create, or open
-///    with `O_TMPFILE`.
+///    with `O_TMPFILE`. FIXED for `atlas-ssm-{tag}` ([`build_unified_swap`] sweeps
+///    same-tag leftovers and unlinks its own file once it is open); the decode
+///    ring's file is still open.
 ///
 /// Coverage gap to close alongside: the flag-ON **RDMA** and **decode-NVMe** selector
 /// arms are only component-tested, never exercised through `build_tier_store` /
@@ -300,16 +302,32 @@ pub(super) fn build_unified_swap(
     blob_bytes: usize,
     tag: &str,
 ) -> (Box<dyn atlas_tier::SwapStore>, SwapBacking) {
-    if let Some(dir) = std::env::var("ATLAS_SSM_TIER_SWAP_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
+    let dir = std::env::var("ATLAS_SSM_TIER_SWAP_DIR").ok();
+    build_unified_swap_in(dir.filter(|s| !s.is_empty()), blob_bytes, tag)
+}
+
+/// Env-free body of [`build_unified_swap`].
+pub(super) fn build_unified_swap_in(
+    dir: Option<String>,
+    blob_bytes: usize,
+    tag: &str,
+) -> (Box<dyn atlas_tier::SwapStore>, SwapBacking) {
+    if let Some(dir) = dir {
         if blob_bytes > 0 && blob_bytes.is_multiple_of(4096) {
             let make = || -> Result<atlas_tier::DirectSwapFile> {
                 std::fs::create_dir_all(&dir)?;
-                let path = std::path::Path::new(&dir)
-                    .join(format!("atlas-ssm-{tag}.{}.swap", std::process::id()));
-                atlas_tier::DirectSwapFile::create(&path, blob_bytes)
+                let dir = std::path::Path::new(&dir);
+                let prefix = format!("atlas-ssm-{tag}.");
+                // Nothing in a swap file outlives its process, and the name is
+                // per-PID — PID 1 in EVERY container — so a file left on disk
+                // is either a leak or about to be truncated under a live
+                // owner. Sweep the leftovers and keep ours anonymous.
+                atlas_tier::remove_stale_swap_files(dir, &prefix);
+                let path = dir.join(format!("{prefix}{}.swap", std::process::id()));
+                let file = atlas_tier::DirectSwapFile::create(&path, blob_bytes)?;
+                #[cfg(unix)]
+                let _ = std::fs::remove_file(&path);
+                Ok(file)
             };
             match make() {
                 Ok(f) => {

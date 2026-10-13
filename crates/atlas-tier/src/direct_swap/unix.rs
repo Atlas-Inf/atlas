@@ -50,12 +50,30 @@ pub struct DirectSwapFile {
 
 impl DirectSwapFile {
     pub fn create(path: &Path, record_bytes: usize) -> Result<Self> {
+        Self::open(
+            path,
+            record_bytes,
+            OpenOptions::new().create(true).truncate(true),
+        )
+    }
+
+    /// As [`Self::create`], but the file must not exist and is owner-only —
+    /// for records that hold private data: one exclusive open can never reuse
+    /// a pre-planted file or follow a symlink, and leaves no second open by
+    /// name for another process to race.
+    pub fn create_new(path: &Path, record_bytes: usize) -> Result<Self> {
+        Self::open(
+            path,
+            record_bytes,
+            OpenOptions::new().create_new(true).mode(0o600),
+        )
+    }
+
+    fn open(path: &Path, record_bytes: usize, how: &mut OpenOptions) -> Result<Self> {
         validate_record_bytes(record_bytes)?;
-        let f = OpenOptions::new()
+        let f = how
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
             .custom_flags(DIRECT_FLAGS)
             .open(path)
             .map_err(|e| anyhow::anyhow!("open O_DIRECT {}: {e}", path.display()))?;
@@ -147,6 +165,40 @@ impl SwapStore for DirectSwapFile {
             unsafe {
                 std::ptr::copy_nonoverlapping(bp, out.as_mut_ptr(), self.record_bytes);
             }
+        }
+        Ok(())
+    }
+
+    /// One `pread` for the whole run when `out` is O_DIRECT-aligned (the
+    /// caller's page-aligned staging); otherwise the per-record default path.
+    fn read_records(&self, first_slot: usize, out: &mut [u8]) -> Result<()> {
+        let rb = self.record_bytes;
+        if out.is_empty() || !out.len().is_multiple_of(rb) {
+            bail!(
+                "read_records: {} bytes is not a multiple of {rb}",
+                out.len()
+            );
+        }
+        if !is_aligned(out.as_ptr()) {
+            for (i, rec) in out.chunks_exact_mut(rb).enumerate() {
+                self.read_record(first_slot + i, rec)?;
+            }
+            return Ok(());
+        }
+        let n = unsafe {
+            libc::pread(
+                self.fd.as_raw_fd(),
+                out.as_mut_ptr() as *mut libc::c_void,
+                out.len(),
+                self.offset(first_slot),
+            )
+        };
+        if n != out.len() as isize {
+            bail!(
+                "pread records {first_slot}..+{} returned {n}, errno {}",
+                out.len() / rb,
+                errno()
+            );
         }
         Ok(())
     }

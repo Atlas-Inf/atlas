@@ -87,7 +87,7 @@ Notes / gotchas:
 - `--gpus all` injects `libcuda.so.1` (driver); the image supplies the rest.
 - **Serve at batch size 1** — v0 skips the delta under concurrency ≥2 and prefix-cache warm hits.
 - Holo is a **thinking** model; for a plain answer pass `"chat_template_kwargs":{"enable_thinking":false}`.
-- On a shared GPU, keep `--gpu-memory-utilization` low (KV budget is self-relative and excludes co-tenants).
+- On a shared GPU, keep `--gpu-memory-utilization` low. The KV budget is self-relative: co-tenants do not count against it, but the pool always leaves the reserves plus up to 3.5 GiB of what is actually free, so a co-tenant that fills the rest of the device still shrinks it.
 
 A correct startup logs the install line:
 

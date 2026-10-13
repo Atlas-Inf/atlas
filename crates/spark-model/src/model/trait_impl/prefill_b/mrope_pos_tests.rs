@@ -195,6 +195,53 @@ fn a_one_group_video_matches_the_equivalent_image() {
     );
 }
 
+#[test]
+fn glm5_video_ranges_keep_boundaries_and_timestamps_in_text_positions() {
+    let tokens = [
+        TXT, 12, 10, 14, 14, 11, 90, 10, 14, 14, 11, 91, 13, TXT, 10, 14, 14, 11, TXT,
+    ];
+    let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    build_glm5(
+        &tokens,
+        &[(2, 1, 2), (1, 1, 2)],
+        0,
+        2,
+        0,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        &mut t,
+        &mut h,
+        &mut w,
+    );
+    assert_eq!(t.len(), tokens.len());
+    assert_eq!(h.len(), tokens.len());
+    assert_eq!(w.len(), tokens.len());
+    // Video: start/text=0,1, frame0 at 3,4, end/timestamp=5,6, frame1 at
+    // 8,9, end/timestamp/video_end=10,11,12. Then trailing text starts 13.
+    assert_eq!(
+        t,
+        vec![
+            0, 1, 2, 3, 3, 5, 6, 7, 8, 8, 10, 11, 12, 13, 14, 15, 15, 17, 18
+        ]
+    );
+    assert_eq!(
+        h,
+        vec![
+            0, 1, 2, 3, 3, 5, 6, 7, 8, 8, 10, 11, 12, 13, 14, 15, 15, 17, 18
+        ]
+    );
+    assert_eq!(
+        w,
+        vec![
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ]
+    );
+}
+
 // ── bounds and degenerate input ──────────────────────────────────────────
 
 /// Co-dispatch: a request owns `grids[base..hi]` of a shared vector. Pad runs

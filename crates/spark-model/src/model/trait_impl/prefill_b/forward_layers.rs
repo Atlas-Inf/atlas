@@ -32,6 +32,10 @@ impl TransformerModel {
         use_mrope: bool,
         needs_paged: bool,
         midcap: Option<&super::midchunk_capture::MidCapturePlan>,
+        mut passengers: Option<(
+            &mut crate::model::glm_fused_chunk::Passengers<'_, '_>,
+            &crate::model::glm_fused_chunk::PassengerRun,
+        )>,
         stream: u64,
     ) -> Result<()> {
         let h = self.config.hidden_size;
@@ -67,11 +71,26 @@ impl TransformerModel {
             self.buffers.lora_seq_slot(),
             stream,
         )?;
+        // Riding verify owners: positions and slots cover every row.
+        let (positions_dev, positions_h_dev, positions_w_dev, slot_dev) = match &passengers {
+            Some((_, run)) => (
+                run.positions[0],
+                run.positions[1],
+                run.positions[2],
+                run.slots,
+            ),
+            None => (
+                meta_base,
+                positions_h_dev,
+                positions_w_dev,
+                meta_base.offset(slot_offset),
+            ),
+        };
         let attn_metadata = AttnMetadataDev {
-            positions: meta_base,
+            positions: positions_dev,
             positions_h: positions_h_dev,
             positions_w: positions_w_dev,
-            slot: meta_base.offset(slot_offset),
+            slot: slot_dev,
             seq_len: seq_len_dev,
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
@@ -103,6 +122,7 @@ impl TransformerModel {
         });
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -154,6 +174,14 @@ impl TransformerModel {
             None
         };
         let mut layer_times: Vec<u128> = Vec::new();
+        // `ATLAS_GLM_PC_WRITE_FLOOR`: a recompute-all prefix hit keeps the
+        // matched blocks too. The DFlash capture below takes the base value.
+        let layer_write_floor = self.pc_write_floor(
+            layer_kv_write_start,
+            seq.cached_prefix_tokens,
+            effective_seq_len_start,
+            proc_count,
+        );
         // HOST-TIME instrumentation (ATLAS_PREFILL_HOST_TIMING=1). Distinct
         // from `profile_now`: that path synchronizes per layer, which
         // serialises host and device and hides the host-side cost this is
@@ -174,7 +202,34 @@ impl TransformerModel {
         let t_loop = host_timing.then(std::time::Instant::now);
         let mut t_in_prefill = std::time::Duration::ZERO;
         let mut t_dflash = std::time::Duration::ZERO;
+        // Sequence-parallel chunk: each rank runs the row-local work over half
+        // the rows (`layers::glm_sp`); the last layer leaves this rank's rows
+        // of the contracted `hidden`, gathered below.
+        let sp_excluded = passengers.is_some() || use_decode_path || midcap.is_some();
+        let mut sp = self.glm_prefill_sp_rows(proc_count, sp_excluded, &ctx);
+        let mut sp_scope = sp.map(crate::layers::glm_sp::enter);
+        // qwen4_exp (`ATLAS_QWEN4EXP_PREFILL_SP`): the split starts at
+        // `first_layer`, after PLE (`model::qwen4exp_prefill_sp`).
+        let qsp = sp
+            .is_none()
+            .then(|| self.qwen4exp_prefill_sp_plan(proc_count, sp_excluded, &ctx))
+            .flatten();
+        // ATLAS_GLM_DET_TRACE: the embeddings, each layer's highway rows, the result.
+        let det = crate::det_trace::on_stream(self.gpu.as_ref(), stream);
+        det.tap("emb", hidden, (0, proc_count), h * 2);
+        let hc_elem = crate::layers::ops::hc_elem_bytes(&self.config.model_type);
+        let hc_row = self.config.hc_mult * h * hc_elem;
         for (i, layer) in self.layers.iter().enumerate() {
+            crate::det_trace::set_layer(i);
+            if let Some(p) = qsp.filter(|p| p.active && i == p.first_layer) {
+                self.qwen4exp_sp_compact(p.sp, stream)?;
+                sp_scope = Some(crate::layers::glm_sp::enter(p.sp));
+                sp = Some(p.sp);
+            }
+            let _no_defer = qsp
+                .filter(|p| p.active && i + 1 == p.first_layer)
+                .map(|_| crate::layers::ops::qwen4exp_prefill_seam::NoDefer::new());
+            let det_out = sp.map_or((0, proc_count), |sp| (sp.row0, sp.rows));
             let t_pf = host_timing.then(std::time::Instant::now);
             let lt0 = if profile_now {
                 self.gpu.synchronize(stream)?;
@@ -182,7 +237,22 @@ impl TransformerModel {
             } else {
                 None
             };
-            if use_decode_path {
+            if let Some((p, run)) = passengers.as_mut() {
+                anyhow::ensure!(!use_decode_path, "GLM fused chunk needs the prefill path");
+                let mut owners = TransformerModel::glm_passenger_owners(p, run, i);
+                layer
+                    .prefill_with_glm_passengers(
+                        hidden,
+                        proc_count,
+                        seq.layer_states[i].as_mut(),
+                        effective_seq_len_start,
+                        &mut owners,
+                        kv_cache,
+                        &ctx,
+                        stream,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Fused chunk layer {i} failed: {e}"))?;
+            } else if use_decode_path {
                 layer
                     .decode(
                         hidden,
@@ -209,7 +279,7 @@ impl TransformerModel {
                         &mut seq.block_table,
                         &mut seq.disk_block_ids,
                         &mut seq.disk_last_offloaded_per_layer,
-                        layer_kv_write_start,
+                        layer_write_floor,
                         &ctx,
                         stream,
                     )
@@ -217,6 +287,11 @@ impl TransformerModel {
             }
             if let Some(t) = t_pf {
                 t_in_prefill += t.elapsed();
+            }
+            det.tap("out", ctx.buffers.hc_streams(), det_out, hc_row);
+            if let Some(p) = qsp.filter(|p| p.check) {
+                let split = sp.is_some();
+                self.qwen4exp_sp_check(p, effective_seq_len_start, Some(i), split, stream);
             }
             let t_df = host_timing.then(std::time::Instant::now);
             // DFlash chunked-prefill capture. `effective_seq_len_start` (==
@@ -231,6 +306,21 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            // Riding owners' rows land in their stable hidden-save slots, as
+            // after an owner-batched verify.
+            if let Some((p, run)) = passengers.as_ref()
+                && let Some(regions) = run.save_slots.as_deref()
+            {
+                let n = p.seqs.len();
+                let offs: Vec<usize> = (0..n).map(|o| proc_count + o * p.rows).collect();
+                self.try_dflash_capture_batched_at(
+                    i,
+                    &vec![p.rows; n],
+                    &offs,
+                    Some(regions),
+                    stream,
+                )?;
+            }
             if let Some(t) = t_df {
                 t_dflash += t.elapsed();
             }
@@ -341,6 +431,21 @@ impl TransformerModel {
                 );
             }
         }
+        drop(sp_scope);
+        if let Some(sp) = sp {
+            sp.all_gather(hidden, self.config.hidden_size, &ctx, stream)?;
+            // qwen4_exp: both ranks' highway row 0 as unsplit (the drafter
+            // reads it).
+            if qsp.is_some() {
+                let streams = ctx.buffers.hc_streams();
+                crate::layers::glm_sp_uneven::share_row0(sp, streams, hc_row, &ctx, stream)?;
+            }
+        }
+        if let Some(p) = qsp.filter(|p| p.check) {
+            self.qwen4exp_sp_check(p, effective_seq_len_start, None, false, stream);
+        }
+        crate::det_trace::set_layer(self.layers.len());
+        det.tap("final", hidden, (0, proc_count), h * 2);
         if let Some(t) = t_loop {
             let wall = t.elapsed();
             let ffn_us = crate::layers::qwen3_attention::take_ffn_host_us();

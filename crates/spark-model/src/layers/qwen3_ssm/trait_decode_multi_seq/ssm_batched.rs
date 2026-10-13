@@ -69,6 +69,11 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the caller's per-sequence
+        // `ssm_forward` loop, C1's mixer.
+        if ctx.levers.batch_bisect(ops::BISECT_GDN) {
+            return Ok(false);
+        }
         let use_f32_conv = self.conv1d_l2norm_f32_k.0 != 0;
         let use_f32_gdn = self.gdn_f32_k.0 != 0 && self.gated_rms_norm_f32_k.0 != 0;
         // QKVZ via dense-BF16/cuBLASLt, FP8 w8a16 GEMM, or NVFP4 batchm GEMV
@@ -235,7 +240,17 @@ impl Qwen3SsmLayer {
         } else {
             self.w4a16_gemv_batch16_k
         };
-        if let Some(ref fp8) = self.qkvz_fp8w {
+        // ATLAS_QWEN4EXP_BATCH_FAST: serial decode's GEMV arithmetic per row
+        // (`exact_rows.rs`); cuBLASLt and the tile GEMMs below are not.
+        if self.exact_rows_proj(
+            super::super::exact_rows::GdnProj::Qkvz,
+            normed_base,
+            deinterleaved,
+            n,
+            ctx,
+            stream,
+        )? {
+        } else if let Some(ref fp8) = self.qkvz_fp8w {
             if use_batch4 {
                 ops::w8a16_gemv_batch4(
                     ctx.gpu,
@@ -360,7 +375,15 @@ impl Qwen3SsmLayer {
 
         // ── 4. Batched out_proj: ONE [N,value_dim]→[N,h] GEMM (weights ×1) ──
         // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
-        if let Some(ref fp8) = self.out_proj_fp8w {
+        if self.exact_rows_proj(
+            super::super::exact_rows::GdnProj::Out,
+            normed_out_base,
+            ssm_out_base,
+            n,
+            ctx,
+            stream,
+        )? {
+        } else if let Some(ref fp8) = self.out_proj_fp8w {
             if use_batch4 {
                 ops::w8a16_gemv_batch4(
                     ctx.gpu,
