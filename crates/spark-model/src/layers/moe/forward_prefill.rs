@@ -216,8 +216,9 @@ impl MoeLayer {
         // Sequence-parallel prefill (`layers::glm_sp`): routed experts run every
         // row; the shared expert and its blend run only this rank's rows, and
         // the EP all-reduce becomes a reduce-scatter into them.
-        let sp =
-            crate::layers::glm_sp::current().filter(|sp| is_ep_prefill && num_tokens == sp.total());
+        let sp = crate::layers::glm_sp::current()
+            .filter(|sp| is_ep_prefill && num_tokens == sp.total())
+            .map(|sp| self.q38_sp_rows(sp, h, shared_inter, ctx));
         // `full_shared` (qwen4_exp): every row, as unsplit; only the blend
         // takes the local rows (`forward_prefill_finish`).
         let (shared_in, shared_n) = match sp {
@@ -241,9 +242,14 @@ impl MoeLayer {
             && !overlap_shared_reduce
             && !defer_shared_hc
             && self.shared_split_ready(ctx, n);
+        // Under SP with the reduce-scatter pipe, the shared expert of this
+        // rank's rows runs while that exchange is on the wire
+        // (`forward_prefill_finish`, `defer_shared_to_rs`).
+        let defer_shared =
+            !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
         if split {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
-        } else if has_shared && !overlap_shared_reduce {
+        } else if has_shared && !overlap_shared_reduce && !defer_shared {
             self.run_shared_expert_prefill(
                 shared_in,
                 shared_n,
@@ -263,43 +269,48 @@ impl MoeLayer {
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let (row, route) = (h as usize * 2, top_k as usize * 4);
         det.tap("moe_in", input, (0, num_tokens), row);
-        // Gemma-4 router pre-norm (no-op for other models).
-        let router_in = self.router_input(input, n, h, ctx, stream)?;
-        super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
-        // 1. Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
         let gate_logits = ctx.buffers.gate_logits();
-        self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
-        super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
-        det.tap(
-            "x_gate",
-            gate_logits,
-            (0, num_tokens),
-            num_experts as usize * 2,
-        );
-        prof_step!("gate_gemm");
-
-        // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
-        // logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op unless a router
-        // delta is installed (ATLAS_LORA_EXPERTS=1).
-        self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
-
-        // 2. Batched topK dispatch. DeepSeek-V3 / MiniMax-M2 use sigmoid
-        //    + correction bias (detected via `correction_bias_dev`);
-        //    every other model takes the softmax path (no behavior
-        //    change — this is additive).
         let scratch = ctx.buffers.scratch();
         let indices_dev = scratch;
         let weights_dev = scratch.offset(total_expanded as usize * 4);
-        self.prefill_topk(
-            gate_logits,
-            indices_dev,
-            weights_dev,
-            n,
-            num_experts,
-            top_k,
-            ctx,
-            stream,
-        )?;
+        // ATLAS_QWEN4EXP_PREFILL_SP_ROUTE: this rank's rows were routed at the
+        // gather site; gather the peer's (`forward_prefill_route_sp`).
+        let routes = [indices_dev, weights_dev];
+        if !self.take_local_routes(input, num_tokens, routes, ctx, stream)? {
+            // Gemma-4 router pre-norm (no-op for other models).
+            let router_in = self.router_input(input, n, h, ctx, stream)?;
+            super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
+            // 1. Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
+            self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
+            super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+            det.tap(
+                "x_gate",
+                gate_logits,
+                (0, num_tokens),
+                num_experts as usize * 2,
+            );
+            prof_step!("gate_gemm");
+
+            // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
+            // logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op unless a router
+            // delta is installed (ATLAS_LORA_EXPERTS=1).
+            self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
+
+            // 2. Batched topK dispatch. DeepSeek-V3 / MiniMax-M2 use sigmoid
+            //    + correction bias (detected via `correction_bias_dev`);
+            //    every other model takes the softmax path (no behavior
+            //    change — this is additive).
+            self.prefill_topk(
+                gate_logits,
+                indices_dev,
+                weights_dev,
+                n,
+                num_experts,
+                top_k,
+                ctx,
+                stream,
+            )?;
+        }
         super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, n, top_k)?;
         det.tap("rt_ids", indices_dev, (0, num_tokens), route);
         det.tap("rt_w", weights_dev, (0, num_tokens), route);

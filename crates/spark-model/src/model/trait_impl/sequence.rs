@@ -34,6 +34,12 @@ mod sequence_graphs;
 
 impl TransformerModel {
     pub(super) fn cache_sequence_dispatch(&self, seq: &SequenceState) {
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: the radix keeps what prefill wrote
+        // (inserted at the prompt's end); generated rows hold decode K/V, not
+        // what a prefill of those tokens computes.
+        if crate::layers::ops::qwen4exp_rowinv::on() {
+            return;
+        }
         self.finish_leaf_mirror_cache(seq);
         let bs = self.kv_cache.lock().block_size();
         // Only cache if the sequence has block-aligned content worth caching.
@@ -114,6 +120,9 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        // A commit left for this sequence's next verify is moot
+        // (`gdn_commit_fuse`); the slot is zeroed below.
+        self.gdn_fuse_drop_slot(seq.slot_idx);
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later
@@ -239,6 +248,7 @@ impl TransformerModel {
                 ssm.gdn_commit_qkv = DevicePtr(0);
                 ssm.gdn_commit_gb = DevicePtr(0);
                 ssm.gdn_commit_pending = false;
+                ssm.gdn_fuse_n = DevicePtr(0);
             }
         }
 
@@ -396,6 +406,7 @@ impl TransformerModel {
                     // repoint on rebind like every other pool buffer.
                     ssm.gdn_commit_qkv = self.ssm_pool.commit_qkv(ssm_layer_idx, new_slot);
                     ssm.gdn_commit_gb = self.ssm_pool.commit_gb(ssm_layer_idx, new_slot);
+                    ssm.gdn_fuse_n = self.ssm_pool.fuse_word(new_slot);
                     // Stage-3 f16-SIZED pool: the FP32 prefill staging blob is
                     // per-SLOT, so compaction must repoint it for the same
                     // reason the checkpoint/intermediate families below are

@@ -122,8 +122,10 @@ pub(in crate::scheduler) fn k4_record_outcome(
     num_accepted: usize,
     seq_len: usize,
 ) {
+    // Deep verifies (4..=7 accepted, `mtp_deep_depth`) count as accept-3+:
+    // they used to fall into the reject bucket.
     let counter = match num_accepted {
-        3 => &sched.stats.k4_accept[3],
+        3.. => &sched.stats.k4_accept[3],
         2 => &sched.stats.k4_accept[2],
         1 => &sched.stats.k4_accept[1],
         _ => &sched.stats.k4_accept[0],
@@ -141,7 +143,7 @@ pub(in crate::scheduler) fn k4_record_outcome(
         let total = (a3 + a2 + a1 + a0).max(1);
         let mean = (3 * a3 + 2 * a2 + a1) as f64 / total as f64;
         tracing::info!(
-            "K4 summary: {a3} accept-3 / {a2} accept-2 / {a1} accept-1 / {a0} reject in last {total} steps (mean accepted={mean:.2}) seq_len={seq_len}"
+            "K4 summary: {a3} accept-3+ / {a2} accept-2 / {a1} accept-1 / {a0} reject in last {total} steps (mean accepted={mean:.2}) seq_len={seq_len}"
         );
     }
 }

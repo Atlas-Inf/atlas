@@ -271,6 +271,8 @@ fn qsa_matches_reference() {
 mod prefill;
 #[path = "qsa_tests_prefill_b.rs"]
 mod prefill_b;
+#[path = "qsa_tests_prefill_gp.rs"]
+mod prefill_gp;
 
 // Device top-k contract (every gathered id is written by the launch).
 #[path = "qsa_tests_topk.rs"]

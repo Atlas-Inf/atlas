@@ -129,6 +129,51 @@ impl QsaIndexer {
         Ok(expand_selection(&blocks, ratio, complete * ratio, visible))
     }
 
+    /// Gather the `n_sel` tokens `sel_dev` names into the scratch and point
+    /// the identity table + seq_len at them: the selection as a paged cache.
+    /// `kv`: the layer's K pool, V pool and the sequence's block table.
+    pub(super) fn gather_selection(
+        &self,
+        st: &mut QsaSeqState,
+        n_sel: u32,
+        kv: [DevicePtr; 3],
+        block_size: u32,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<QsaSelection> {
+        let [k_pool, v_pool, block_table_dev] = kv;
+        ops::qsa_gather(
+            gpu,
+            self.k_gather_k,
+            k_pool,
+            v_pool,
+            block_table_dev,
+            self.sel_dev,
+            self.k_scratch,
+            self.v_scratch,
+            n_sel,
+            block_size,
+            self.nkv_attn,
+            self.hd_attn,
+            stream,
+        )?;
+        let pages = (n_sel as usize).div_ceil(block_size as usize);
+        if st.table_len < pages {
+            let ident: Vec<u8> = (0..pages as i32).flat_map(|v| v.to_le_bytes()).collect();
+            gpu.copy_h2d_async(&ident, self.table_dev, stream)?;
+            st.table_len = pages;
+        }
+        gpu.copy_h2d_async(&(n_sel as i32).to_le_bytes(), self.seq_len_dev, stream)?;
+        Ok(QsaSelection {
+            k_scratch: self.k_scratch,
+            v_scratch: self.v_scratch,
+            table_dev: self.table_dev,
+            seq_len_dev: self.seq_len_dev,
+            n_sel,
+            max_blocks: pages as u32,
+        })
+    }
+
     /// Parity check for the device arm: read back `sel_dev` and compare with
     /// the host reference; the first mismatch is an error (validation runs).
     pub(super) fn verify_device_selection(

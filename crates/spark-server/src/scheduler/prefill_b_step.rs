@@ -228,6 +228,8 @@ pub fn prefill_request(
             content_tokens: 0,
             prose_tokens_since_last_tool: 0,
             think_watchdog_fires: 0,
+            loop_steers: 0,
+            loop_steer_max: crate::scheduler::loop_steer::budget_for_new_seq(),
             rollback_count: 0,
             ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
             tool_call_start_token,
@@ -292,7 +294,7 @@ pub fn prefill_request(
             top_k,
             top_p,
             min_p,
-            eos_tokens,
+            &crate::scheduler::min_tokens_ban::first_token_suppress(eos_tokens, req_min_tokens),
             grammar_state.as_mut(),
             &sched.levers.sampling(),
         )
@@ -441,6 +443,8 @@ pub fn prefill_request(
             content_tokens: 0,
             prose_tokens_since_last_tool: 0,
             think_watchdog_fires: 0,
+            loop_steers: 0,
+            loop_steer_max: crate::scheduler::loop_steer::budget_for_new_seq(),
             rollback_count: 0,
             ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
             tool_call_start_token,
@@ -467,7 +471,8 @@ pub fn prefill_request(
     }
 
     // The min_tokens end-token ban, as on the chunked paths.
-    spark_model::traits::EosBan::new(seq.prompt_len, req_min_tokens, eos_tokens).arm(&mut seq);
+    spark_model::traits::EosBan::for_request(seq.prompt_len, req_min_tokens, eos_tokens)
+        .arm(&mut seq);
     Ok(Some(ActiveSeq {
         seq,
         session_hash: req_session_hash,
@@ -533,6 +538,8 @@ pub fn prefill_request(
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: 0,
+        loop_steers: 0,
+        loop_steer_max: crate::scheduler::loop_steer::budget_for_new_seq(),
         rollback_count: 0,
         ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
         tool_call_start_token,

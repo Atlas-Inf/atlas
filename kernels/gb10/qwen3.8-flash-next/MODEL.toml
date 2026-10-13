@@ -441,11 +441,19 @@ honor_eos_inside_thinking = true
 max_thinking_budget = 2048
 # Guards carried over from the Atlas-Inf side of the merge: cap the think
 # budget at the request's own max_tokens rather than letting a 2048-token
-# reasoning block starve the answer, and keep the repetition watchdog on --
-# this model's greedy temp-0 behaviour includes a known repetition loop
-# (onset ~token 104 on filler prompts, exonerated from QSA by position).
+# reasoning block starve the answer.
 cap_thinking_at_max_tokens = true
-enable_loop_watchdog = true
+# The repetition guards stay OFF for this model. Its greedy temp-0 output has
+# a known repetition loop (onset ~token 104 on filler prompts, exonerated from
+# QSA by position), but both detectors also end legitimate answers that repeat
+# by design: on RigMark's decode cells (2026-10-06, TP2) the scheduler's
+# content-loop watchdog cut a 50-element JSON array at ~100 tokens and Go code
+# with table-driven tests at 1.1-1.7K tokens (reported as `length`), and the
+# stream loop guards withheld every word of a 700-word memo (a 30-character
+# phrase seen four times). A loop now runs to the request's max_tokens, as on
+# other engines; clients bound it there.
+enable_loop_watchdog = false
+enable_stream_loop_guards = false
 
 # Optional probes added to the shared MoE / attention / router init by the
 # SparkGLM GLM-5.3-Flash series (Enntity/atlas upstream/glm53-flash-*). Every

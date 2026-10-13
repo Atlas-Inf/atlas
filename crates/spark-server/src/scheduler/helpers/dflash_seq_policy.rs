@@ -18,13 +18,7 @@ pub(super) fn dflash_seq_raw_argmax_policy(
         && a.grammar_state.is_none()
         && !a.require_tool_call
         && crate::scheduler::fast_greedy::classify_penalties(
-            &crate::scheduler::sample_step::penalty_params_for(
-                a,
-                crate::scheduler::sample_step::PositionKind::Verify,
-                0.0,
-                None,
-                Vec::new(),
-            ),
+            &crate::scheduler::sample_step::verify_penalty_params(a),
         ) == crate::scheduler::fast_greedy::PenaltyGate::Neutral
 }
 

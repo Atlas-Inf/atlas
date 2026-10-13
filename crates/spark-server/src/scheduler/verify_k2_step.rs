@@ -179,17 +179,12 @@ pub fn step_verify_k2(
     };
     let accepted = drafts[0] == v0;
     if !dflash_verify_raw_argmax {
-        a.mtp_acct.record_depth_verify(
-            1,
-            usize::from(accepted),
-            sched.levers.mtp_single_depth_adapt,
-        );
+        a.mtp_acct
+            .record_depth_verify(1, usize::from(accepted), num_drafts, sched.levers.depth());
     }
     // The next propose's depth (`ATLAS_MTP_SINGLE_DEPTH_ADAPT`); `num_drafts`
     // itself when the lever is off.
-    let next_drafts = a
-        .mtp_acct
-        .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt);
+    let next_drafts = a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth());
 
     // Extract logprobs from verify logits buffer (K=2 positions) when requested.
     let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
@@ -234,9 +229,9 @@ pub fn step_verify_k2(
         }
         sched.timing.record(Phase::Commit, t_commit);
 
-        emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
+        emit_span_row(a, drafts[0], verify_lps.first().cloned(), sched, 0, 2);
         if !a.finished {
-            emit_token(a, v1, verify_lps.get(1).cloned(), sched);
+            emit_span_row(a, v1, verify_lps.get(1).cloned(), sched, 1, 2);
         }
         if a.finished {
             return;

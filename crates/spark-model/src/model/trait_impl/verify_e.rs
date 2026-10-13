@@ -56,7 +56,9 @@ impl TransformerModel {
     /// is armed. Everything outside falls back to the per-seq loop.
     pub(super) fn can_batch_verify_dispatch(&self, ks: &[usize]) -> bool {
         let n = ks.len();
-        (2..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
+        // One sequence only on the exact lane past its own 4-row verify
+        // (`verify_batch_ks_ok`).
+        (1..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
             && self.verify_batch_ks_ok(ks)
             && ks.iter().sum::<usize>() <= super::verify_e2::VERIFY_ROW_CAP
             && (self.comm.is_none() || self.batched_verify_under_comm())
@@ -77,7 +79,11 @@ impl TransformerModel {
     /// consult so the gate and the forward can never disagree.
     ///
     /// MTP mode (no DFlash hidden-save): the audited ladder range 2..=4, and
-    /// the SSM intermediates pools are sized for the configured max K.
+    /// the SSM intermediates pools are sized for the configured max K. On
+    /// qwen4_exp's exact lane a draftless sequence may also ride as one
+    /// DECODE ROW, a sequence may verify up to 8 rows, and a lone sequence
+    /// past its own 4-row verify rides as a batch of one (`verify_rows.rs`:
+    /// why every such row is serial decode's).
     ///
     /// DFlash mode (`dflash_hidden_save` armed): the verify rows are uniform
     /// γ+1 (γ=8 ⇒ k=8, outside the ladder range) and the batch additionally
@@ -90,15 +96,23 @@ impl TransformerModel {
         if self.dflash_hidden_save.is_some() {
             ks.iter()
                 .all(|&k| (2..=self.dflash_hidden_save_rows).contains(&k))
-                && ks.len() <= self.dflash_hidden_save_nseq
+                && (2..=self.dflash_hidden_save_nseq).contains(&ks.len())
         } else {
-            ks.iter().all(|k| (2..=4).contains(k))
+            super::verify_rows::mtp_verify_rows_ok(ks, self.verify_exact_lane())
         }
+    }
+
+    /// The qwen4_exp exact lane (`verify_rows.rs`): the batched MTP verify
+    /// carries decode rows (`ks[i] == 1`), windows of up to 8 rows, and a
+    /// lone sequence past its own 4-row verify.
+    fn verify_exact_lane(&self) -> bool {
+        self.levers.qwen4exp_batch_fast && self.levers.qwen4exp_exact_verify
     }
 
     /// Batched K-row verify for `n = seqs.len()` sequences (R = Σ ks rows,
     /// each `ks[i]` = that sequence's drafts+1 — 2..=4 under the MTP ladder,
-    /// γ+1 under DFlash, ragged since D-Cut).
+    /// 1..=8 on the exact lane (1 = a decode row), γ+1 under DFlash, ragged since
+    /// D-Cut).
     ///
     /// Row `off_i + j` is sequence i's token j (its slice of `tokens` is
     /// `[last_verified, d0, .., d_{ks[i]-2}]`, flat seq-major). Weight-bearing
@@ -156,7 +170,7 @@ impl TransformerModel {
         };
         let k_max = ks.iter().copied().max().unwrap_or(0);
         ensure!(
-            n >= 2 && ks.len() == n && self.verify_batch_ks_ok(ks) && tokens.len() == r_total,
+            n >= 1 && ks.len() == n && self.verify_batch_ks_ok(ks) && tokens.len() == r_total,
             "batched verify: n={n} ks={ks:?} tokens={}",
             tokens.len()
         );
@@ -185,11 +199,14 @@ impl TransformerModel {
             self.embed(t, hidden.offset(r * h * bf16), stream)?;
         }
 
+        // ATLAS_QWEN4EXP_KV_LOOKAHEAD: one vote tops the batch up (`kv_lookahead`).
+        let last: Vec<usize> = seqs
+            .iter()
+            .zip(ks)
+            .map(|(s, &k)| s.seq_len + k - 1)
+            .collect();
+        self.reserve_verify_blocks(seqs, &last, &mut kv_cache, stream)?;
         let bs = kv_cache.block_size();
-        for (i, seq) in seqs.iter_mut().enumerate() {
-            let last_pos = seq.seq_len + ks[i] - 1;
-            self.reserve_decode_blocks(seq, last_pos / bs, &mut kv_cache, stream)?;
-        }
 
         // ATLAS_K4_DIAG=1: stream-sync checkpoint after every layer so an
         // illegal access is attributed to the exact layer (same hatch as
@@ -407,28 +424,24 @@ impl TransformerModel {
         // Block tables: row r = seq i's table (bt staging sized for
         // VERIFY_ROW_CAP rows, sizes.rs `bt_rows`). Ghost rows read only entry 0 (causal clamp 1)
         // — point it at the dummy KV block, matching decode_a2's pad rows.
-        let needed = r_up * mb;
-        let mut bt_buf = vec![0i32; needed];
-        for (i, seq) in seqs.iter().enumerate() {
-            for j in 0..ks[i] {
-                let row = off[i] + j;
-                for (bi, &block) in seq.block_table.iter().enumerate().take(mb) {
-                    bt_buf[row * mb + bi] = block as i32;
+        // `ATLAS_QWEN4EXP_VERIFY_BT_PINNED`: built in page-locked staging
+        // instead of a fresh pageable `Vec` (`model/pinned_upload.rs`).
+        let fill = |bt_buf: &mut [i32]| {
+            for (i, seq) in seqs.iter().enumerate() {
+                for j in 0..ks[i] {
+                    let row = off[i] + j;
+                    for (bi, &block) in seq.block_table.iter().enumerate().take(mb) {
+                        bt_buf[row * mb + bi] = block as i32;
+                    }
                 }
             }
-        }
-        for row in r_total..r_up {
-            bt_buf[row * mb] = self.dummy_kv_block as i32;
-        }
-        // SAFETY: `bt_buf` is `vec![0i32; needed]` on the line above, so its
-        // LEN is `needed` and `needed * 4 == size_of_val(&bt_buf[..])` — the
-        // read stops at `len`, never in the `Vec`'s spare capacity. Zero-init
-        // at construction covers the rows/columns the fill loop skips when
-        // `block_table.len() < mb`.
-        let bt_bytes =
-            unsafe { std::slice::from_raw_parts(bt_buf.as_ptr() as *const u8, needed * 4) };
-        self.gpu.copy_h2d_async(
-            bt_bytes,
+            for row in r_total..r_up {
+                bt_buf[row * mb] = self.dummy_kv_block as i32;
+            }
+        };
+        self.upload_i32_image(
+            r_up * mb,
+            fill,
             meta_base.offset(super::verify_e2::META_BT_OFF),
             stream,
         )?;
@@ -477,23 +490,16 @@ impl TransformerModel {
             // slot-vector churn can never push the path permanently eager.
             let capture = graphs.is_some();
 
-            // PLE's host half for EVERY sequence's draft window, hoisted
-            // before capture/replay. Sequence i owns rows [off[i], off[i+1]),
-            // and its n-gram history is its own — staging the batch prefix for
-            // all of them would inject one sequence's history into the rest.
-            // Without this the forward falls back to a D2H readback, which
-            // invalidates the recording graph (901). #753 item B.
-            for (i, seq) in seqs.iter_mut().enumerate() {
-                let window = &tokens[off[i]..off[i + 1]];
-                for (li, l) in self.layers.iter().enumerate() {
-                    l.verify_prestage(
-                        window,
-                        seq.layer_states[li].as_mut(),
-                        self.gpu.as_ref(),
-                        stream,
-                    )?;
-                }
-            }
+            // No PLE prestage here: the PLE layer hashes and gathers each
+            // sequence's rows inside its forward (`forward_rows`, the ids
+            // sliced from `host_token_ids`), as the batched decode does. A
+            // prestage parks its slot list in the layer's ONE `slots_dev`
+            // buffer for the next forward to read, so staging every
+            // sequence up front left all of them reading the last one's
+            // n-gram embeddings (and released each sequence's cache pins
+            // before its gather ran). Nothing needs the hoist: a PLE layer
+            // vetoes both the whole-step graph (`layer_veto`) and the
+            // piecewise runs, so its forward always runs eagerly.
 
             let ctx = ForwardContext {
                 ssm_batch: None,

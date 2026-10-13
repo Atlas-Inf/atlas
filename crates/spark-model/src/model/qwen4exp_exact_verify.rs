@@ -46,6 +46,11 @@
 //! The 4-row arms: `multi_seq/qkv_exact4.rs` (Q/K/V), `attn/o_proj.rs`
 //! (scalar batch4 o_proj), `HeadArith::batched` + `lm_head_batched` (head).
 //!
+//! Windows of 5..8 rows (4..7 drafts, `ATLAS_QWEN4EXP_MTP_DEPTH=4..7`) have
+//! no single-sequence verify: with `ATLAS_QWEN4EXP_BATCH_FAST=1` too they
+//! run the batched verify, one sequence or several, whose rows are serial
+//! decode's arithmetic at any width (`trait_impl/verify_rows.rs`).
+//!
 //! `ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK=1` (diagnostic, default off; both ranks)
 //! proves it on a live model: before each K=2/3/4 verify, the K tokens run
 //! through serial decode on the live state, their logits and final hidden

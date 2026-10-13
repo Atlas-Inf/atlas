@@ -66,7 +66,7 @@ pub use ids::{PleIdDims, ple_ngram_ids};
 pub(crate) use layer::bounded_scratch;
 #[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 pub(crate) use layer::warm::warm_ahead_tokens;
-pub use layer::{PleLayer, PleSeqState, PleWeights};
+pub use layer::{PleLayer, PleSeqRows, PleSeqState, PleWeights};
 // Agreed across ranks at startup (`model::startup_parity`).
 pub(crate) use layer::verify_snapshots_enabled;
 // The weight loader builds an EXL3 trellis spec. Non-CUDA builds do not

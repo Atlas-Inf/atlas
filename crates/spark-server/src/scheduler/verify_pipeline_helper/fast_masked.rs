@@ -101,18 +101,11 @@ pub(super) fn try_chat_fast_path(
         None => a.thinking_tokens >= THINK_DEFER_ABS_CEILING,
     } || a.sentence_defer_count >= MAX_SENTENCE_DEFER_TOKENS;
     let think_end_inject_armed = a.inside_thinking && (a.force_end_thinking || defer_hard_override);
-    let pin_tool_armed =
-        a.think_just_ended && a.require_tool_call && !a.tool_call_opened && !a.inside_thinking;
+    let pin_tool_armed = crate::scheduler::fast_greedy::tool_pin_armed(a);
     // (c) penalty gate — same construction the slow path uses per
     // position (penalty_params_for is position-independent here).
     let penalty_gate = crate::scheduler::fast_greedy::classify_penalties(
-        &crate::scheduler::sample_step::penalty_params_for(
-            a,
-            crate::scheduler::sample_step::PositionKind::Verify,
-            0.0,
-            None,
-            Vec::new(),
-        ),
+        &crate::scheduler::sample_step::verify_penalty_params(a),
     );
     if f2_active
         || think_end_inject_armed

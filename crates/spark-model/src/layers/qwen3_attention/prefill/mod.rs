@@ -33,3 +33,11 @@ mod paged_mla_args;
 mod paged_oproj;
 mod paged_qkv;
 mod paged_v4;
+
+/// `ATLAS_ATTN_W4A4` (PRESENCE, read once): the opt-in native FP4 Q/K/V and
+/// o_proj prefill GEMMs. Both ranks must agree (`model::startup_parity`):
+/// the o_proj arm decides whether the SP reduce-scatter is piped.
+pub(crate) fn attn_w4a4_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ATLAS_ATTN_W4A4").is_some())
+}

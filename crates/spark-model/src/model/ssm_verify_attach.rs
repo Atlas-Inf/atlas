@@ -31,6 +31,7 @@ impl SsmStatePool {
         state.kda_records = self.kda_records(ssm_layer_idx, slot);
         state.gdn_commit_qkv = self.commit_qkv(ssm_layer_idx, slot);
         state.gdn_commit_gb = self.commit_gb(ssm_layer_idx, slot);
+        state.gdn_fuse_n = self.fuse_word(slot);
         state.h_state_intermediates = (0..self.h_snapshot_count(slot))
             .map(|t| self.h_intermediate(ssm_layer_idx, slot, t))
             .collect();

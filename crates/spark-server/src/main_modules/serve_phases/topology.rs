@@ -191,7 +191,7 @@ fn rank_settings(
     expert_tp: bool,
     prefill_budget: usize,
     max_batch_tokens: usize,
-) -> [spark_model::model::startup_parity::Setting; 14] {
+) -> [spark_model::model::startup_parity::Setting; 15] {
     // Off the speculative lanes no pool is sized by the draft depth.
     let num_drafts = if args.speculative || args.self_speculative || args.ngram_speculative {
         args.num_drafts.unwrap_or(0)
@@ -238,6 +238,15 @@ fn rank_settings(
         // Both keep a step out of a CUDA graph.
         ("--high-speed-swap", args.high_speed_swap as u64),
         ("--profile", args.profile as u64),
+        // The rows of the draft head both ranks build and split (a refused
+        // switch is reported by the crate's own entry).
+        (
+            "--mtp-vocab (ATLAS_QWEN4EXP_MTP_DRAFT_TP)",
+            match spark_model::layers::qwen4exp_mtp::draft_tp::requested() {
+                Ok(true) => args.mtp_vocab as u64,
+                _ => 0,
+            },
+        ),
     ]
 }
 

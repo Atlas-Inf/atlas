@@ -25,7 +25,14 @@
 //!   draft-head resync.
 //! - While in Serial, re-probe MTP after [`reprobe_tokens`] emitted tokens.
 //!   While in Mtp, refresh the serial baseline after
-//!   [`serial_refresh_tokens`] (one window ≈ ≤0.3% overhead bound).
+//!   [`serial_refresh_tokens`] (one window ≈ ≤0.3% overhead bound). Both
+//!   are tokens PER SEQUENCE: the batch's tokens count against the interval
+//!   times the batch-width bucket, so the cadence in STEPS (and with it the
+//!   share of steps spent in the other mode) does not grow with concurrency.
+//!   Counted over the whole batch, a 16-step refresh window came every ~51
+//!   MTP steps at C=8 (1024 tokens at ~20 a step) — about a quarter of all
+//!   steps in plain decode while the gate was in Mtp — and a Serial-mode
+//!   re-probe every 32 decode steps.
 //! - A depth-regime change (factor [`REMEASURE_DEPTH_FACTOR`] = 2, floor
 //!   [`REMEASURE_DEPTH_FLOOR`] = 512) marks both baselines stale and
 //!   pulls the next probe forward (one [`WINDOW_STEPS`] window). A stale
@@ -72,13 +79,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Serial tokens between MTP re-probes while in Serial mode. Default
-/// matches the proven `ATLAS_DFLASH_ADAPTIVE_REPROBE` policy (256).
+/// Serial tokens (per sequence) between MTP re-probes while in Serial mode.
+/// Default matches the proven `ATLAS_DFLASH_ADAPTIVE_REPROBE` policy (256).
 fn reprobe_tokens() -> usize {
     env_usize("ATLAS_MTP_GATE_REPROBE", 256)
 }
 
-/// MTP tokens between serial-baseline refreshes while in Mtp mode. One
+/// MTP tokens (per sequence) between serial-baseline refreshes in Mtp. One
 /// 16-step window per 1024 tokens bounds refresh overhead at ≤0.3% even if
 /// serial were 18% slower.
 fn serial_refresh_tokens() -> usize {
@@ -169,11 +176,16 @@ pub fn spec_dispatch_eligible(
 /// is bitwise serial decode (`Model::verify_bit_exact`, qwen4_exp under
 /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1`). The reason speculation stays out of
 /// `<think>` is that batch-K verify is not byte-lossless at T=0; an exact
-/// verify removes it. Only for ONE active sequence: a concurrent batch
-/// verifies through the multi-sequence path, which the exact switch does
-/// not cover, and its serial counterpart is batched decode besides.
-pub fn spec_think_for(opt_in: bool, verify_bit_exact: bool, active: usize) -> bool {
-    opt_in || (verify_bit_exact && active == 1)
+/// verify removes it. A concurrent batch verifies through the multi-sequence
+/// path, so it needs that path exact as well (`Model::batch_verify_bit_exact`,
+/// the qwen4_exp exact-batching lane); otherwise only ONE active sequence.
+pub fn spec_think_for(
+    opt_in: bool,
+    verify_bit_exact: bool,
+    batch_verify_bit_exact: bool,
+    active: usize,
+) -> bool {
+    opt_in || (verify_bit_exact && (active == 1 || batch_verify_bit_exact))
 }
 
 /// [`spec_dispatch_eligible`] for one active sequence. A strict
@@ -431,11 +443,11 @@ impl MtpGate {
         if regime == self.width_regime {
             return;
         }
-        if self.width_regime != 0 {
+        let previous = std::mem::replace(&mut self.width_regime, regime);
+        if previous != 0 {
             tracing::info!(
-                "MTP gate: batch-width regime changed ({} -> {regime}); partial window \
+                "MTP gate: batch-width regime changed ({previous} -> {regime}); partial window \
                  discarded, baselines stale, will re-probe on cadence",
-                self.width_regime,
             );
             self.mtp.stale = true;
             self.serial.stale = true;
@@ -444,9 +456,9 @@ impl MtpGate {
             self.win_wall = 0.0;
             self.win_steps = 0;
             self.losing_windows = 0;
+            // In the NEW regime's units (`event_interval` scales with it).
             self.tokens_since_event = self.tokens_since_event.max(self.event_interval());
         }
-        self.width_regime = regime;
     }
 
     fn other(m: Mode) -> Mode {
@@ -456,11 +468,14 @@ impl MtpGate {
         }
     }
 
+    /// Batch tokens until the next probe/refresh: the per-sequence interval
+    /// times the batch-width bucket (module docs).
     fn event_interval(&self) -> usize {
-        match self.mode {
+        let per_seq = match self.mode {
             Mode::Mtp => self.refresh,
             Mode::Serial => self.reprobe,
-        }
+        };
+        per_seq.saturating_mul(self.width_regime.max(1))
     }
 
     fn stats_mut(&mut self, m: Mode) -> &mut ModeStats {

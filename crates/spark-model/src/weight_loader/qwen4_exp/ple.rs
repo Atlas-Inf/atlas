@@ -354,6 +354,15 @@ pub(super) fn load(
         )
     }
     .context("PLE: n-gram row cache")?;
+    if let Some((period, idle)) = spark_storage::ngram_cache::keepalive_from_env() {
+        cache
+            .start_keepalive(period, idle)
+            .context("PLE: NVMe keepalive")?;
+        tracing::info!(
+            "PLE NVMe keepalive: one 4 KiB read every {period:?} while rows were \
+             resolved within {idle:?} (ATLAS_PLE_NVME_KEEPALIVE_MS)"
+        );
+    }
 
     // FP8 rows need their dequant scale, or the gather returns raw E4M3
     // magnitudes and the whole n-gram contribution is off by a constant

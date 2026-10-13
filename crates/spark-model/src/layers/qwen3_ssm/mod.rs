@@ -124,6 +124,8 @@ pub struct Qwen3SsmLayer {
     /// all verify rows. `KernelHandle(0)` on kernel sets that lack it →
     /// callers keep the per-token `dense_gemv` / tile-GEMM fallback.
     dense_gemv_batchm_k: KernelHandle,
+    /// Its 16/32-row twins under `ATLAS_QWEN4EXP_BATCH_FAST` (`exact_rows.rs`).
+    wide_rows: ops::Qwen4ExpWideRows,
     /// Per-row-FP8 GEMV siblings for `qkvz_fp8_dense`/`out_proj_fp8_dense`:
     /// M=1 `dense_gemv_fp8w` and the M<=8 batched `dense_gemv_fp8w_batchm`.
     /// `KernelHandle(0)` on kernel sets that lack them → BF16 decode path.
@@ -415,9 +417,11 @@ pub struct Qwen3SsmLayer {
 // Kernel-selection helpers moved to `kernel_select.rs` (≤500 LoC split).
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod ckpt_capture;
 mod debug;
 mod exact_rows;
 mod fla_dispatch;
+mod gdn_defer;
 pub mod gdn_flags;
 mod gdn_fused_rows;
 mod init;
@@ -445,6 +449,7 @@ mod trait_prefill_block;
 mod trait_prefill_gdn;
 mod trait_prefill_hc;
 mod trait_prefill_helper;
+mod trait_prefill_multi;
 mod trait_prefill_phase1;
 mod trait_prefill_phase3;
 mod trait_prefill_proj;

@@ -40,6 +40,20 @@ impl TransformerLayer for Qwen3SsmLayer {
             )
     }
 
+    fn gdn_exact_defer(
+        &self,
+        gpu: &dyn GpuBackend,
+        levers: &crate::layers::ops::ModelLevers,
+        config: &atlas_core::config::ModelConfig,
+        num_tokens: usize,
+    ) -> bool {
+        self.exact_defer_arm(gpu, levers, config, num_tokens)
+    }
+
+    fn gdn_conv_weight(&self) -> DevicePtr {
+        self.ssm.conv1d.weight
+    }
+
     // ── MoE layout transposes ───────────────────────────────────────────
     // qwen4_exp is 36 gated-delta-net layers + 12 full-attention layers, and
     // EVERY one of them carries a 512-expert MoE block. Only
@@ -635,6 +649,10 @@ impl TransformerLayer for Qwen3SsmLayer {
             ctx,
             stream,
         )
+    }
+
+    fn prefill_multi(&self, pass: &mut crate::layer::MultiPass<'_, '_>) -> Result<()> {
+        self.prefill_multi_hc(pass)
     }
 
     fn is_ssm_layer(&self) -> bool {

@@ -155,6 +155,7 @@ pub(super) fn actual_kda_rows() {
                             gdn_commit_qkv: DevicePtr(0),
                             gdn_commit_gb: DevicePtr(0),
                             gdn_commit_pending: false,
+                            gdn_fuse_n: DevicePtr::NULL,
                             conv_state_intermediates: vec![],
                             h_prefill_stage: None,
                             ple: None,

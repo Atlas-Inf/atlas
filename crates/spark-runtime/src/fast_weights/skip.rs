@@ -42,6 +42,9 @@ impl FastSafetensorsLoader {
     }
 
     pub(super) fn should_skip_tensor(&self, name: &str) -> bool {
+        if debug_layer_dropped(name) {
+            return true;
+        }
         if self
             .skip_layer_prefix
             .as_ref()
@@ -117,4 +120,28 @@ impl FastSafetensorsLoader {
             false
         }
     }
+}
+
+/// `ATLAS_QWEN4EXP_DEBUG_LAYERS=<n>` (debug harness, unset in serving): the
+/// config keeps the first `n` decoder layers (`atlas_core` qwen4_exp parser),
+/// so a decoder tensor of layer `n` or later is never read. `mtp.*` keeps its
+/// own numbering.
+fn debug_layer_dropped(name: &str) -> bool {
+    static KEEP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let Some(keep) = *KEEP.get_or_init(|| {
+        std::env::var("ATLAS_QWEN4EXP_DEBUG_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    }) else {
+        return false;
+    };
+    if name.starts_with("mtp.") {
+        return false;
+    }
+    let Some(at) = name.find(".layers.") else {
+        return false;
+    };
+    let rest = &name[at + ".layers.".len()..];
+    let digits = rest.split('.').next().unwrap_or("");
+    digits.parse::<usize>().is_ok_and(|i| i >= keep)
 }

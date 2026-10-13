@@ -110,8 +110,18 @@ impl MoeLayer {
             moe_topk_f32: super::super::try_kernel(gpu, "moe_topk", "moe_topk_softmax_f32"),
             moe_expert_gate_up_shared: gpu
                 .kernel("moe_shared_expert_fused", "moe_expert_gate_up_shared")?,
-            moe_expert_silu_down_shared: gpu
-                .kernel("moe_shared_expert_fused", "moe_expert_silu_down_shared")?,
+            // ATLAS_QWEN4EXP_MOE_NO_CLAMP: the same kernel without the routed
+            // SwiGLU clamp (qwen4_exp only).
+            moe_expert_silu_down_shared: if crate::model::qwen4exp_batch_fast::no_clamp_requested(
+                &config.model_type,
+            ) {
+                gpu.kernel(
+                    "moe_shared_expert_fused",
+                    "moe_expert_silu_down_shared_noclamp",
+                )?
+            } else {
+                gpu.kernel("moe_shared_expert_fused", "moe_expert_silu_down_shared")?
+            },
             moe_topk: gpu.kernel("moe_topk", "moe_topk_softmax")?,
             moe_weighted_sum_blend: gpu.kernel("moe_expert_gemv", "moe_weighted_sum_blend")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
@@ -324,6 +334,7 @@ impl MoeLayer {
             )?,
             qwen4exp_moe_fast: ops::Qwen4ExpMoeFast::resolve(gpu, config),
             qwen4exp_moe_rows: ops::Qwen4ExpMoeRows::resolve(gpu, config),
+            wide_rows: ops::Qwen4ExpWideRows::resolve(gpu, &config.model_type),
             moe_expert_gate_up_shared_fp8_t_k: gpu.kernel(
                 "moe_shared_expert_fused_fp8_t",
                 "moe_expert_gate_up_shared_fp8_t",

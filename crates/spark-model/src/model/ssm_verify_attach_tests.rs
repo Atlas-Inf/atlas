@@ -31,6 +31,7 @@ fn fresh() -> SsmLayerState {
         gdn_commit_qkv: DevicePtr(0),
         gdn_commit_gb: DevicePtr(0),
         gdn_commit_pending: false,
+        gdn_fuse_n: DevicePtr::NULL,
         h_is_f16: false,
         h_prefill_stage: None,
         ple: None,

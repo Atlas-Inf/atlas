@@ -64,5 +64,9 @@ path = "examples/iouring_bench.rs"
 name = "long-context-bench"
 path = "examples/long_context_bench.rs"
 
+[[example]]
+name = "ngram-keepalive-bench"
+path = "examples/ngram_keepalive_bench.rs"
+
 [lints]
 workspace = true

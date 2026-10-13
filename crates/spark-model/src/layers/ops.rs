@@ -110,9 +110,16 @@ mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
 #[path = "ops/hyper_connection_lowrank_gemm.rs"]
 mod hyper_connection_lowrank_gemm;
+pub(crate) use hyper_connection_lowrank_gemm::hc_fast;
 #[path = "ops/hyper_connection_lowrank_prefill.rs"]
 mod hyper_connection_lowrank_prefill;
 pub(crate) use hyper_connection_lowrank_prefill::HC_PREFILL_SLAB;
+#[path = "ops/hyper_connection_lowrank_mma.rs"]
+mod hyper_connection_lowrank_mma;
+pub(crate) use hyper_connection_lowrank_mma::{hc_mma, hc_stage_fit};
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ops/hyper_connection_lowrank_mma_tests.rs"]
+mod hyper_connection_lowrank_mma_tests;
 #[path = "ops/hyper_connection_lowrank_split.rs"]
 mod hyper_connection_lowrank_split;
 // GPU parity test, so it needs the cuda backend to compile at all. Gated on
@@ -199,18 +206,30 @@ mod quant_dispatch;
 pub mod qwen4exp;
 #[path = "ops/qwen4exp_decode_fuse.rs"]
 pub mod qwen4exp_decode_fuse;
+#[path = "ops/qwen4exp_gdn_defer.rs"]
+pub mod qwen4exp_gdn_defer;
 #[path = "ops/qwen4exp_gdn_rows.rs"]
 pub mod qwen4exp_gdn_rows;
 #[path = "ops/qwen4exp_moe.rs"]
 mod qwen4exp_moe;
 #[path = "ops/qwen4exp_moe_rows.rs"]
 mod qwen4exp_moe_rows;
+#[path = "ops/qwen4exp_moe_tc3.rs"]
+mod qwen4exp_moe_tc3;
 #[path = "ops/qwen4exp_prefill.rs"]
 pub mod qwen4exp_prefill;
 #[path = "ops/qwen4exp_prefill_hc.rs"]
 pub mod qwen4exp_prefill_hc;
 #[path = "ops/qwen4exp_prefill_seam.rs"]
 pub mod qwen4exp_prefill_seam;
+#[path = "ops/qwen4exp_rowinv.rs"]
+pub mod qwen4exp_rowinv;
+#[path = "ops/qwen4exp_w4_rows.rs"]
+mod qwen4exp_w4_rows;
+#[path = "ops/qwen4exp_w4_wide.rs"]
+mod qwen4exp_w4_wide;
+#[path = "ops/qwen4exp_wide_rows.rs"]
+mod qwen4exp_wide_rows;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
 #[cfg(test)]
 #[path = "ops/grammar_bitmask_tests.rs"]
@@ -333,6 +352,9 @@ pub use qsa_rows::*;
 pub use quant_dispatch::*;
 pub use qwen4exp_moe::*;
 pub use qwen4exp_moe_rows::*;
+pub use qwen4exp_w4_rows::*;
+pub use qwen4exp_w4_wide::*;
+pub use qwen4exp_wide_rows::*;
 pub use sampling::*;
 pub use ssm_gdn_a::*;
 pub use ssm_gdn_a2::*;

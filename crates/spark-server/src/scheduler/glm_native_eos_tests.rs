@@ -57,7 +57,6 @@ fn run(decode: bool, glm: bool, eos: bool, min_tokens: usize, required_tool: boo
             Instant::now(),
             Some(THINK_END),
             Some(900),
-            None,
             Some(903),
             None,
             false,

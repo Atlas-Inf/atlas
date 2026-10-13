@@ -93,6 +93,7 @@ impl Qwen3SsmLayer {
             // rather than inferred from the dummy state's shape: a row with
             // a LIVE ple state and no token id is a real defect and still
             // errors, and an ACTIVE row missing its ple carry errors too.
+            let mut rows = Vec::with_capacity(n);
             for (i, state) in states.iter_mut().enumerate().take(n) {
                 let ssm = state
                     .as_any_mut()
@@ -115,14 +116,13 @@ impl Qwen3SsmLayer {
                         host.len()
                     )
                 })?;
-                ple.forward_row(
+                rows.push(crate::layers::ple::PleSeqRows {
                     st,
-                    streams.offset(i * (hc_mult as usize) * h * 4),
-                    token,
-                    ctx,
-                    stream,
-                )?;
+                    row0: i,
+                    ids: token,
+                });
             }
+            ple.forward_seqs(&mut rows, streams, ctx, stream)?;
         }
 
         // ── GDN sublayer ──

@@ -77,6 +77,21 @@ pub(crate) fn hc_fast() -> bool {
     })
 }
 
+/// `ATLAS_QWEN4EXP_HC_WIDE=1` (read once, default off): 25..32-token
+/// collapses take `hc_pre_down_vec_wide` — the same chains as
+/// `hc_pre_down_vec_rows`, four per thread instead of two, so the four
+/// 8-token groups fit one wave — and run the stage over 2 blocks a token
+/// instead of 8 (pure geometry: each block's RMS is the same 1024-thread
+/// reduction). scripts/dev/qwen4exp_hc_wide_bench.cu: byte-identical, site
+/// ~177 -> ~125 us at T = 32 (stage 20.5 -> 11.4, down ~105 -> ~64). The
+/// padded last group reads `normed` rows past the batch (below row 32): in
+/// bounds by `hc_pre_split`'s scratch LAYOUT, whose `normed` spans 64 rows
+/// before `low` (no host check of the buffer's size beyond that layout).
+pub(crate) fn hc_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_HC_WIDE").as_deref() == Ok("1"))
+}
+
 pub(crate) fn hc_finish_block() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -128,6 +143,10 @@ pub(crate) fn hc_gemm(
     sm_count: u32,
     stream: u64,
 ) -> Result<()> {
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: one cuBLASLt configuration at any height.
+    if super::qwen4exp_rowinv::try_bf16_gemm(a, w.0, out, [m, n, k], stream)? {
+        return Ok(());
+    }
     if n.div_ceil(128) * m.div_ceil(128) < sm_count {
         match crate::layers::ops::cublas_bf16_proj_dense(a, w, out, m, n, k, stream) {
             Ok(()) => return Ok(()),
@@ -145,6 +164,12 @@ pub(crate) fn hc_gemm(
                 }
             }
         }
+    }
+    // ATLAS_LT_KCHAIN_PIN: the tile kernel's own in-order k-chain on a faster
+    // cuBLASLt kernel, byte for byte (`cublaslt::kchain_pin`; the mHC down
+    // GEMM of a full 2048-row slab, 2048x320x10240: 0.43 -> 0.31 ms).
+    if spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(a.0, w.0, out.0, m, n, k, stream)? {
+        return Ok(());
     }
     gemm_raw(gpu, kernel, a, w, out, m, n, k, stream)
 }

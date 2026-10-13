@@ -316,6 +316,11 @@ int cublasLtMatmulPreferenceDestroy(hipblasLtMatmulPreference_t pref) {
     return static_cast<int>(g_lt.pref_destroy(pref));
 }
 
+// The k-chain pin (spark_runtime::cublaslt::kchain_pin) reads cuBLASLt algo
+// attributes; hipBLASLt's differ, so the shim reports none and the pin keeps
+// the heuristic's first result.
+int cublasLtMatmulAlgoConfigGetAttribute(const void*, int, void*, size_t, size_t*) { return STUB; }
+
 int cublasLtMatmulAlgoGetHeuristic(hipblasLtHandle_t handle, hipblasLtMatmulDesc_t desc,
                                    hipblasLtMatrixLayout_t a, hipblasLtMatrixLayout_t b,
                                    hipblasLtMatrixLayout_t c, hipblasLtMatrixLayout_t d,

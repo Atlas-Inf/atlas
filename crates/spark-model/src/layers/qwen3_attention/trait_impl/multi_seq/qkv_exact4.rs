@@ -5,8 +5,9 @@
 //! and every width from 4 rows up under the exact batching lane
 //! (`ATLAS_QWEN4EXP_BATCH_FAST=1`, `model/qwen4exp_batch_fast.rs`): there the
 //! Q+gate rows run `w4a16_gemv_qg_batch4/3/2` (or `w4a16_gemv_qg`) in chunks
-//! of at most 4 rows, and K/V the scalar `w4a16_gemv_batchN` tiers in chunks
-//! of at most 8.
+//! of at most 4 rows, past 8 rows `qwen4exp_qg_rows16/32`, and K/V the scalar
+//! `w4a16_gemv_batchN` tiers in chunks of at most 8, past 8 rows `batch16`
+//! (`ops::Qwen4ExpWideRows`).
 //!
 //! The default 4-row arm (`ms_qkv_batchn`) is the batched template GEMV for
 //! all three projections. Its rows equal `w4a16_gemv`, but serial decode
@@ -27,6 +28,7 @@ use anyhow::Result;
 use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
+use crate::model::qwen4exp_step_copies::{copy_rows, qkv_rows_2d};
 
 impl Qwen3AttentionLayer {
     /// Run the exact projections when they apply (`Ok(true)`), else leave
@@ -64,6 +66,7 @@ impl Qwen3AttentionLayer {
         }
         let kv_dim = nkv * hd;
         let kv_bytes = kv_dim as usize * bf16;
+        let rows_2d = qkv_rows_2d();
         let row = |i: usize| {
             let q = qkv_buf.offset(i * per_seq_qkv);
             let k = q.offset(q_proj_bytes);
@@ -74,13 +77,29 @@ impl Qwen3AttentionLayer {
         // adapter; `ms_qkv_seq_q` covers the adapter case exactly as serial.
         if self.gated && !self.q_lora_active() && self.w4a16_gemv_qg_batch4_k.0 != 0 {
             let q_scratch = fwd.buffers.ssm_qkvz();
-            // At most 4 rows a launch: the qg template has no wider tier.
-            for first in (0..n).step_by(4) {
-                let m = (n - first).min(4);
+            // The lane's 16/32-row tiers past 8 rows, else at most 4 a launch.
+            let mut first = 0usize;
+            while first < n {
+                let (rows, wide) = self.wide_rows.qg_chunk((n - first) as u32);
+                let m = rows as usize;
                 let (src, dst) = (
                     normed.offset(first * h * bf16),
                     q_scratch.offset(first * q_proj_bytes),
                 );
+                first += m;
+                if let Some(t) = wide {
+                    self.wide_rows.qg_launch(
+                        fwd.gpu,
+                        t,
+                        src,
+                        q_nvfp4,
+                        dst,
+                        (rows, q_proj_dim, h as u32),
+                        (nq, hd),
+                        stream,
+                    )?;
+                    continue;
+                }
                 match m {
                     4 => ops::w4a16_gemv_qg_batch4(
                         fwd.gpu,
@@ -132,14 +151,18 @@ impl Qwen3AttentionLayer {
                     )?,
                 }
             }
-            for i in 0..n {
-                fwd.gpu.copy_d2d_async(
-                    q_scratch.offset(i * q_proj_bytes),
-                    row(i).0,
-                    q_proj_bytes,
-                    stream,
-                )?;
-            }
+            // `ATLAS_QWEN4EXP_QKV_ROWS_2D`: the n row copies as one pitched copy.
+            copy_rows(
+                fwd.gpu,
+                q_scratch,
+                q_proj_bytes,
+                row(0).0,
+                per_seq_qkv,
+                q_proj_bytes,
+                n,
+                rows_2d,
+                stream,
+            )?;
         } else {
             for i in 0..n {
                 let normed_i = normed.offset(i * h * bf16);
@@ -162,34 +185,51 @@ impl Qwen3AttentionLayer {
         if batch4.0 != 0 {
             let k_scratch = fwd.buffers.attn_output();
             let v_scratch = k_scratch.offset(n * kv_bytes);
-            // The widest scalar tier the build carries (8, else 4) a launch.
-            let chunk = if self.w4a16_batchm.scalar_kernel(8).0 != 0 {
-                8
-            } else {
-                4
-            };
+            // The widest scalar tier (batch16 past 8 rows, else 8 or 4) a launch.
             for (w, out) in [(k_nvfp4, k_scratch), (v_nvfp4, v_scratch)] {
-                for first in (0..n).step_by(chunk) {
-                    let m = (n - first).min(chunk) as u32;
-                    ops::w4a16_gemv_batchm(
+                self.wide_rows.w4a16_rows(
+                    fwd.gpu,
+                    &self.w4a16_batchm,
+                    normed,
+                    w,
+                    out,
+                    (n as u32, kv_dim, h as u32),
+                    stream,
+                )?;
+            }
+            let (_, k_out, v_out) = row(0);
+            if rows_2d {
+                // K rows then V rows: disjoint destinations, so the order the
+                // per-row loop interleaved them in does not change a byte.
+                for (src, dst) in [(k_scratch, k_out), (v_scratch, v_out)] {
+                    copy_rows(
                         fwd.gpu,
-                        self.w4a16_batchm.scalar_kernel(m),
-                        normed.offset(first * h * bf16),
-                        w,
-                        out.offset(first * kv_bytes),
-                        m,
-                        kv_dim,
-                        h as u32,
+                        src,
+                        kv_bytes,
+                        dst,
+                        per_seq_qkv,
+                        kv_bytes,
+                        n,
+                        true,
                         stream,
                     )?;
                 }
-            }
-            for i in 0..n {
-                let (_, k_out, v_out) = row(i);
-                fwd.gpu
-                    .copy_d2d_async(k_scratch.offset(i * kv_bytes), k_out, kv_bytes, stream)?;
-                fwd.gpu
-                    .copy_d2d_async(v_scratch.offset(i * kv_bytes), v_out, kv_bytes, stream)?;
+            } else {
+                for i in 0..n {
+                    let (_, k_out, v_out) = row(i);
+                    fwd.gpu.copy_d2d_async(
+                        k_scratch.offset(i * kv_bytes),
+                        k_out,
+                        kv_bytes,
+                        stream,
+                    )?;
+                    fwd.gpu.copy_d2d_async(
+                        v_scratch.offset(i * kv_bytes),
+                        v_out,
+                        kv_bytes,
+                        stream,
+                    )?;
+                }
             }
         } else {
             for i in 0..n {

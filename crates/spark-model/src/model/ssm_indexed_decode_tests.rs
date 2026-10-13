@@ -94,6 +94,7 @@ fn state(h: u64, conv: u64) -> Box<dyn LayerState> {
         gdn_commit_qkv: DevicePtr(0),
         gdn_commit_gb: DevicePtr(0),
         gdn_commit_pending: false,
+        gdn_fuse_n: DevicePtr::NULL,
         conv_state_intermediates: vec![],
         h_is_f16: false,
         h_prefill_stage: None,

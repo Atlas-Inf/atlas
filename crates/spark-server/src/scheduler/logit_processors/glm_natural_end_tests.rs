@@ -21,7 +21,8 @@ const END: u32 = 101;
 const PREVIOUS: u32 = 10;
 
 fn pick(glm: bool, mid_word: bool, floor: u32, forced_budget: bool) -> u32 {
-    let (mut seq, _) = test_seq(vec![PREVIOUS], 128, None, 28);
+    // Held: a dropped receiver reads as a client disconnect.
+    let (mut seq, _rx) = test_seq(vec![PREVIOUS], 128, None, 28);
     seq.finished = false;
     seq.min_tokens = 0;
     seq.enable_thinking = true;
@@ -59,6 +60,7 @@ fn pick(glm: bool, mid_word: bool, floor: u32, forced_budget: bool) -> u32 {
         tool_call_start_token: Some(903),
         tool_call_end_token: Some(904),
         glm_tool_boundary: sched.limits.glm_tool_boundary,
+        limits: sched.limits,
         mid_word_mask: Some(Arc::from(mid)),
         boundary_mask: Some(Arc::from(boundary)),
         sampling: SamplingLevers::default(),
@@ -79,7 +81,7 @@ fn pick(glm: bool, mid_word: bool, floor: u32, forced_budget: bool) -> u32 {
         &params,
         PositionKind::FinalDecode,
     );
-    let token = forced.unwrap_or_else(|| spark_runtime::sampler::argmax_last_wins_f32(&logits));
+    let token = forced.unwrap_or_else(|| spark_runtime::sampler::argmax_first_wins_f32(&logits));
     emit_token(&mut seq, token, None, &sched);
     assert_eq!(seq.output_tokens, [PREVIOUS, token]);
     assert_eq!(seq.remaining, 127);
@@ -91,7 +93,10 @@ fn pick(glm: bool, mid_word: bool, floor: u32, forced_budget: bool) -> u32 {
 
 #[test]
 fn glm_natural_end_mid_word_mask_preserves_native_winner() {
-    assert_eq!(pick(false, true, 0, false), 2047, "generic hard mask stays");
+    // With `</think>` masked every other logit ties at 0: the lowest id wins
+    // (the engine-wide greedy tie rule; this read 2047 under the old
+    // last-index host argmax).
+    assert_eq!(pick(false, true, 0, false), 0, "generic hard mask stays");
     assert_eq!(
         pick(true, true, 0, false),
         END,
@@ -125,7 +130,7 @@ fn glm_natural_end_actual_model_policy_has_no_minimum_reasoning_bias() {
 
 #[test]
 fn glm_natural_end_generic_floor_and_explicit_budget_are_preserved() {
-    assert_eq!(pick(false, false, 16, false), 2047, "generic A4 bias stays");
+    assert_eq!(pick(false, false, 16, false), 0, "generic A4 bias stays");
     for glm in [false, true] {
         assert_eq!(
             pick(glm, true, 16, true),

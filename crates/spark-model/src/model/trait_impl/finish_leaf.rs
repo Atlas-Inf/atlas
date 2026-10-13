@@ -154,18 +154,26 @@
 //!   (`--swap-space-gb` above 0) until resume takes the chunk path.
 //! * The spill tier (`ATLAS_SSM_TIER`) reads slots outside that order too,
 //!   and would spill leaves it should drop. Keep it off with the flag.
+//!
+//! # qwen4_exp (`ATLAS_QWEN4EXP_FINISH_LEAF=1`)
+//!
+//! The same leaf for a model with per-sequence aux state, saved at the end
+//! of the step that crossed a save boundary rather than on it, with its aux
+//! (see `finish_leaf/qwen4exp.rs`). It shares everything above:
+//! preconditions, pool classes, stream order, mirrored caching and the rank
+//! agreement.
 
 use anyhow::Result;
 
 use super::super::ssm_batched_copy::run_ssm_state_copies;
 use super::super::types::TransformerModel;
-use super::prefill_b::pc_policy::tail_cut;
 use crate::traits::SequenceState;
 
 mod cache;
 mod flag;
+mod qwen4exp;
 mod rolling;
-pub(in crate::model) use flag::{enabled, span_blocks};
+pub(in crate::model) use flag::{enabled, qwen4exp_enabled, qwen4exp_requested, span_blocks};
 pub(crate) use rolling::LeafCell;
 use rolling::{FinishLeaf, leaf_copies, leaf_save, owned_from};
 
@@ -176,12 +184,13 @@ pub(in crate::model) const EP_CMD_CACHE_SEQUENCE: u32 = 0xFFFF_FFF8;
 impl TransformerModel {
     /// The save span in tokens when `seq` can carry a rolling leaf now.
     fn finish_leaf_span(&self, seq: &SequenceState) -> Option<usize> {
-        let ok = enabled()
+        let ok = self.leaf_on()
             && self.ssm_snapshots.is_enabled()
             && self.prefix_cache.is_active()
             && self.config.num_ssm_layers() > 0
             && self.ssm_pool.h_stored_bytes == self.ssm_snapshots.h_bytes()
-            && !self.requires_aux_state()
+            // A leaf of a model with aux state carries it (`qwen4exp`).
+            && (!self.requires_aux_state() || self.qwen4exp_leaf_on())
             && seq.slot_idx < self.ssm_pool.max_slots
             && seq.hss_window_start() == 0
             && seq.seq_len == seq.tokens.len()
@@ -208,7 +217,11 @@ impl TransformerModel {
     /// Take `seq`'s rolling leaf out of the index, if it is still there:
     /// the slot is then the caller's to write or to free.
     fn finish_leaf_take(&self, seq: &SequenceState) -> Option<usize> {
-        let leaf = seq.finish_leaf.take()?;
+        self.finish_leaf_take_leaf(seq, seq.finish_leaf.take()?)
+    }
+
+    /// [`Self::finish_leaf_take`] of `leaf`, already taken out of its cell.
+    fn finish_leaf_take_leaf(&self, seq: &SequenceState, leaf: FinishLeaf) -> Option<usize> {
         let prefix = seq.tokens.get(..leaf.tokens)?;
         self.prefix_cache
             .take_leaf_snapshot(prefix, leaf.snap, seq.adapter_id)
@@ -219,7 +232,7 @@ impl TransformerModel {
     /// order" above). With the flag off this is nothing: the prefill
     /// checkpoint calls it too.
     pub(super) fn finish_leaf_wait_copies(&self, stream: u64) -> Result<()> {
-        if enabled() {
+        if self.leaf_on() {
             self.wait_snapshot_saves_dispatch(stream)?;
         }
         Ok(())
@@ -228,7 +241,7 @@ impl TransformerModel {
     /// Record the snapshot copy just issued on `stream`, for the next one to
     /// wait on. Nothing with the flag off.
     pub(super) fn finish_leaf_record_copy(&self, stream: u64) -> Result<()> {
-        if enabled() {
+        if self.leaf_on() {
             self.record_snapshot_save_dispatch(stream)?;
         }
         Ok(())
@@ -255,6 +268,23 @@ impl TransformerModel {
         else {
             return;
         };
+        if self.finish_leaf_write(seq, snap, at, conv_row, stream) {
+            seq.finish_leaf.set(FinishLeaf { snap, tokens: at });
+        }
+    }
+
+    /// Write the state `seq` has on `stream` into snapshot slot `snap` (h,
+    /// conv per [`leaf_copies`], and the aux state of a model that has any)
+    /// and register it as a leaf at `at` tokens. `false`: the slot is freed
+    /// (a failed save, or a checkpoint already at that prefix).
+    fn finish_leaf_write(
+        &self,
+        seq: &SequenceState,
+        snap: usize,
+        at: usize,
+        conv_row: Option<usize>,
+        stream: u64,
+    ) -> bool {
         let (h, conv) = leaf_copies(
             &self.ssm_pool,
             &self.ssm_snapshots,
@@ -265,10 +295,12 @@ impl TransformerModel {
         let saved = self
             .finish_leaf_wait_copies(stream)
             .and_then(|()| run_ssm_state_copies(self.gpu.as_ref(), &h, &conv, stream))
-            .and_then(|()| self.finish_leaf_record_copy(stream));
+            .and_then(|()| self.finish_leaf_record_copy(stream))
+            .and_then(|()| self.finish_leaf_aux(seq, snap, stream));
         if let Err(e) = saved {
             tracing::warn!("finish-leaf save at token {at}: {e:#}");
-            return self.ssm_snapshots.free(snap);
+            self.ssm_snapshots.free(snap);
+            return false;
         }
         let displaced = self.prefix_cache.insert_leaf_snapshot(
             &seq.tokens[..at],
@@ -276,9 +308,6 @@ impl TransformerModel {
             seq.session_hash,
             seq.adapter_id,
         );
-        if displaced != Some(snap) {
-            seq.finish_leaf.set(FinishLeaf { snap, tokens: at });
-        }
         if let Some(old) = displaced {
             self.ssm_snapshots.free(old);
         }
@@ -286,6 +315,21 @@ impl TransformerModel {
             "finish-leaf save: slot {} token {at} snapshot {snap}",
             seq.slot_idx
         );
+        displaced != Some(snap)
+    }
+
+    /// Attach the aux state `seq` has now (PLE carry, QSA keys) to `snap`.
+    /// Nothing for a model without aux state.
+    fn finish_leaf_aux(&self, seq: &SequenceState, snap: usize, stream: u64) -> Result<()> {
+        if !self.requires_aux_state() {
+            return Ok(());
+        }
+        // The slot's previous blobs, refilled in place.
+        let mut aux = self.ssm_snapshots.take_aux(snap);
+        self.collect_aux_states_into(seq, stream, &mut aux)?;
+        anyhow::ensure!(!aux.is_empty(), "no aux state collected");
+        self.ssm_snapshots.set_aux(snap, aux);
+        Ok(())
     }
 
     /// KDA records commit of the first `rows` rows of a `k`-row verify
@@ -319,6 +363,9 @@ impl TransformerModel {
     /// when it now sits on a save boundary.
     pub(in crate::model) fn finish_leaf_after_decode(&self, seq: &SequenceState) {
         let end = seq.tokens.len();
+        if self.qwen4exp_leaf_on() {
+            return self.qwen4exp_leaf_after_step(seq, 1, self.gpu.default_stream());
+        }
         if !enabled() || seq.finish_leaf.get().is_some_and(|l| l.tokens == end) {
             return;
         }
@@ -333,7 +380,9 @@ impl TransformerModel {
     /// settle the leaf it restored from, if it is one. When the prompt runs
     /// at most two blocks past the restore, that is at or above the tail cut
     /// and the prefill saves no checkpoint of its own, so the leaf becomes
-    /// the conversation's checkpoint. Otherwise the leaf is dead history once
+    /// the conversation's checkpoint (qwen4_exp's in-pass checkpoint also
+    /// needs a 64-token chunk boundary under the cut:
+    /// `tail_checkpoint_follows`). Otherwise the leaf is dead history once
     /// the new checkpoint is saved, and says so now so that save can take its
     /// slot. Both ranks run this from the agreed restore depth.
     pub(super) fn finish_leaf_restored(
@@ -344,10 +393,10 @@ impl TransformerModel {
         bs: usize,
         stream: u64,
     ) -> Result<()> {
-        if !enabled() || restored == 0 {
+        if !self.leaf_on() || restored == 0 {
             return Ok(());
         }
-        let keep = restored >= tail_cut(tokens.len(), bs);
+        let keep = !self.tail_checkpoint_follows(tokens.len(), restored, bs);
         self.prefix_cache
             .settle_leaf_snapshot(&tokens[..restored], seq.adapter_id, keep);
         // The restore's read is a snapshot copy too ("Stream order").
@@ -358,7 +407,7 @@ impl TransformerModel {
     /// blocks and rolling leaf), so both ranks match and restore alike.
     pub(super) fn finish_leaf_mirror_cache(&self, seq: &SequenceState) {
         let head = self.comm.as_ref().is_some_and(|c| c.rank() == 0);
-        if enabled() && head && seq.slot_idx < self.ssm_pool.max_slots {
+        if self.leaf_on() && head && seq.slot_idx < self.ssm_pool.max_slots {
             let sent = self.ep_broadcast_seq_and_cmd(
                 seq.slot_idx as u32,
                 EP_CMD_CACHE_SEQUENCE,
@@ -374,10 +423,10 @@ impl TransformerModel {
     /// flag on, so a worker without it runs a different environment: nothing
     /// hangs (the flag adds no collective), but no leaf can be restored.
     pub(in crate::model) fn finish_leaf_cache_command(&self, seq: &SequenceState) {
-        if !enabled() {
+        if !self.leaf_on() {
             tracing::error!(
-                "finish-leaf: cache command from the head, but ATLAS_GLM_PC_FINISH_LEAF is \
-                 off on this rank: the ranks' environments differ"
+                "finish-leaf: cache command from the head, but ATLAS_GLM_PC_FINISH_LEAF / \
+                 ATLAS_QWEN4EXP_FINISH_LEAF is off on this rank: the ranks' environments differ"
             );
         }
         self.cache_sequence_dispatch(seq);
@@ -396,7 +445,7 @@ impl TransformerModel {
             seq.adapter_id,
         );
         super::super::block_mgmt::cache_acquires_refs(&acquired, &mut self.kv_cache.lock());
-        let Some(leaf) = seq.finish_leaf.take() else {
+        let Some(leaf) = self.finish_leaf_settle_at_finish(seq, bs) else {
             return;
         };
         // Still this sequence's, and a prefix of what it ended as?
@@ -420,7 +469,9 @@ impl TransformerModel {
     /// A sequence freed without being cached (abort, vision, slid window):
     /// its leaf is out of reach for good, so take it back and free the slot.
     pub(super) fn finish_leaf_release(&self, seq: &SequenceState) {
-        if let Some(snap) = self.finish_leaf_take(seq) {
+        let prev = seq.finish_leaf.take_prev();
+        let prev = prev.and_then(|l| self.finish_leaf_take_leaf(seq, l));
+        for snap in self.finish_leaf_take(seq).into_iter().chain(prev) {
             self.ssm_snapshots.free(snap);
         }
     }

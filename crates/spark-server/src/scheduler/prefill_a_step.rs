@@ -37,6 +37,10 @@ pub fn start_chunked_prefill(
     // computed (fused with other requests into one batched search by the pre-pass);
     // the beam branch uses it directly. None ⇒ run the search here per-request.
     precomputed_beam_hyp: Option<Vec<u32>>,
+    // Shared-prefix admission: plant a checkpoint at this position for the
+    // requests waiting on this prefill (`shared_prefix`). Sent to the worker
+    // before the chunk-0 command, like the MTP fence.
+    pc_plant: Option<usize>,
 ) -> Result<StartPrefillResult> {
     // This request's end tokens: model EOS + user stop tokens (no model EOS
     // under `ignore_eos`).
@@ -126,7 +130,12 @@ pub fn start_chunked_prefill(
 
     let request_start = Instant::now();
     let total = prompt_tokens.len();
-    let chunk_len = total.min(max_prefill_tokens);
+    let mut chunk_len = total.min(max_prefill_tokens);
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: the next chunk starts on the GDN grid.
+    let g = spark_runtime::prefill_chunk_granule();
+    if chunk_len < total && g > 4 && chunk_len >= g {
+        chunk_len -= chunk_len % g;
+    }
     let is_last = chunk_len >= total;
 
     tracing::info!(
@@ -262,6 +271,8 @@ pub fn start_chunked_prefill(
             content_tokens: 0,
             prose_tokens_since_last_tool: 0,
             think_watchdog_fires: 0,
+            loop_steers: 0,
+            loop_steer_max: crate::scheduler::loop_steer::budget_for_new_seq(),
             rollback_count: 0,
             ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
             tool_call_end_token,
@@ -287,11 +298,24 @@ pub fn start_chunked_prefill(
             image_pixels.is_empty(),
             "vision must be excluded from co-dispatch"
         );
+        // ATLAS_QWEN4EXP_PREFILL_MULTI: the multi pass sends the worker this
+        // prompt (`super::prefill_multi`), so no prefill command here.
+        let multi = super::prefill_multi::eligible(
+            model,
+            prompt_tokens.len(),
+            is_last,
+            req_prompt_logprobs.is_some(),
+            req_adapter_slot,
+        );
         if let Err(e) = (|| -> Result<()> {
             // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
             // step does NOT re-broadcast, so this stays the only broadcast site).
             model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
             model.ep_broadcast_vision_state_for_seq(seq.slot_idx as u32, false, 0, 0, 0, 0)?;
+            plant_chunk0(model, &mut seq, pc_plant)?;
+            if multi {
+                return Ok(());
+            }
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
@@ -307,45 +331,45 @@ pub fn start_chunked_prefill(
             return Err(e);
         }
         // chunk_offset = 0 (deferred co-dispatch: nothing prefilled yet).
-        return Ok(StartPrefillResult::InProgress(
-            super::prefill_a_step_params::build_prefill_in_progress(
-                prompt_tokens,
-                req_session_hash,
-                seq,
-                0,
-                max_tokens,
-                req_min_tokens,
-                eos_tokens.to_vec(),
-                sink,
-                cancel_flag,
-                request_start,
-                temperature,
-                top_k,
-                top_p,
-                top_n_sigma,
-                min_p,
-                repetition_penalty,
-                presence_penalty,
-                frequency_penalty,
-                req_lz_penalty,
-                dry_multiplier,
-                dry_base,
-                dry_allowed_length,
-                logit_bias,
-                req_enable_thinking,
-                req_thinking_budget,
-                req_repetition_detection,
-                spontaneous_think_budget,
-                req_require_tool_call,
-                req_tools_present,
-                req_suppress_tool_call,
-                req_disable_mtp,
-                grammar_state,
-                req_seed,
-                req_top_logprobs,
-                req_timeout_at,
-            ),
-        ));
+        let mut p = super::prefill_a_step_params::build_prefill_in_progress(
+            prompt_tokens,
+            req_session_hash,
+            seq,
+            0,
+            max_tokens,
+            req_min_tokens,
+            eos_tokens.to_vec(),
+            sink,
+            cancel_flag,
+            request_start,
+            temperature,
+            top_k,
+            top_p,
+            top_n_sigma,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            frequency_penalty,
+            req_lz_penalty,
+            dry_multiplier,
+            dry_base,
+            dry_allowed_length,
+            logit_bias,
+            req_enable_thinking,
+            req_thinking_budget,
+            req_repetition_detection,
+            spontaneous_think_budget,
+            req_require_tool_call,
+            req_tools_present,
+            req_suppress_tool_call,
+            req_disable_mtp,
+            grammar_state,
+            req_seed,
+            req_top_logprobs,
+            req_timeout_at,
+        );
+        p.multi = multi;
+        return Ok(StartPrefillResult::InProgress(p));
     }
 
     // Guard: free SSM slot on any error after allocation.
@@ -370,6 +394,7 @@ pub fn start_chunked_prefill(
         }
 
         dispatch_chunk0_vision(model, &seq, vision_slice, &image_pixels, req_disable_mtp)?;
+        plant_chunk0(model, &mut seq, pc_plant)?;
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do
         // identical Marconi prefix-cache lookups (bug #33 fix).
@@ -490,7 +515,7 @@ pub fn start_chunked_prefill(
             top_k,
             top_p,
             min_p,
-            eos_tokens,
+            &crate::scheduler::min_tokens_ban::first_token_suppress(eos_tokens, req_min_tokens),
             p.grammar_state.as_mut(),
             &sched.levers.sampling(),
         ) {
@@ -588,4 +613,10 @@ pub fn start_chunked_prefill(
     } else {
         Ok(StartPrefillResult::InProgress(p))
     }
+}
+
+/// Plant the requested shared-prefix checkpoint (`shared_prefix`) in a
+/// prefill about to send its chunk-0 command.
+fn plant_chunk0(model: &dyn Model, seq: &mut SequenceState, at: Option<usize>) -> Result<()> {
+    at.map_or(Ok(()), |at| model.pc_plant(seq, at))
 }

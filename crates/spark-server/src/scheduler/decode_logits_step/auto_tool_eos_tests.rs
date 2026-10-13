@@ -2,8 +2,9 @@
 
 //! Post-thinking EOS guard tests for auto-tools turns (`should_suppress_post_think_eos`).
 
-use super::{process_decode_logits, should_suppress_post_think_eos};
+use super::process_decode_logits;
 use crate::scheduler::cancel_test_model as model;
+use crate::scheduler::emit_step::should_suppress_post_think_eos;
 use crate::scheduler::sched_ctx::SchedCtx;
 use crate::scheduler::test_support::test_seq;
 use spark_runtime::gpu::DevicePtr;
@@ -66,7 +67,6 @@ fn auto_tools_plain_eos_is_not_held_by_sticky_request() {
         Instant::now(),
         Some(901),
         Some(900),
-        None,
         Some(900),
         Some(901),
         false,

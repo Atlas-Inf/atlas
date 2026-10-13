@@ -3,7 +3,9 @@
 // TP2 rank shape (24 v-heads, 8 k-heads, k = v = 128, 64-token chunks):
 // `gated_delta_rule_chunk_delta_h_pipe` (the shipped spine, one CTA a head)
 // against `gated_delta_rule_chunk_delta_h_pipe_dv64` (two column blocks a
-// head). S_out, uc_out and the final state must match byte for byte.
+// head). S_out, uc_out and the final state must match byte for byte; so must
+// the `_cap` twins' (and the state they capture at chunk c must equal the
+// final state of a c-chunk run).
 //
 // Build (repo root, GB10):
 //   D=$(mktemp -d)
@@ -88,6 +90,60 @@ int main(int argc, char** argv) {
     float t2 = time_ms([&] { d_h2.put(h0); dv(); }, 3, 3);
     printf("spine: pipe %.3f ms -> pipe_dv64 %.3f ms (%.2fx)  [each includes a %zu KB state upload]\n",
            t1, t2, t1 / t2, h0.size() * 4 / 1024);
+    // ── the `_cap` twins (qwen4_exp mid-chunk checkpoint) ──
+    // Same S_out / uc_out / final state as their plain kernels, and the state
+    // they capture at chunk `cc` equals the final state of the same spine
+    // run over only the first cc chunks.
+    bool ok_cap = true;
+    {
+        CUfunction k_pipe_cap = m.fn("gated_delta_rule_chunk_delta_h_pipe_cap", smem_pipe);
+        CUfunction k_dv_cap = m.fn("gated_delta_rule_chunk_delta_h_pipe_dv64_cap", smem_dv);
+        Buf<unsigned short> d_s3, d_uc3;
+        Buf<float> d_h3, d_cap, d_hpre;
+        d_s3.alloc(blocks * KD * VD); d_uc3.alloc(blocks * C * VD);
+        d_h3.alloc(h0.size()); d_cap.alloc(h0.size()); d_hpre.alloc(h0.size());
+        for (unsigned cc : {1u, NC / 2, NC - 1}) {
+            for (int dvk = 0; dvk < 2; ++dvk) {
+                CUfunction kp = dvk ? k_dv : k_pipe, kc = dvk ? k_dv_cap : k_pipe_cap;
+                const dim3 grid = dvk ? dim3(NV, 2) : dim3(NV, 1);
+                const unsigned thr = dvk ? 128 : 256, sm = dvk ? smem_dv : smem_pipe;
+                // Reference: plain kernel over all T, and over the first cc chunks.
+                d_h1.put(h0); d_s1.fill(0x11); d_uc1.fill(0x33);
+                run(kp, grid, thr, sm, d_h1.p, d_s1.p, d_uc1.p);
+                d_hpre.put(h0);
+                {
+                    Args a;
+                    a.add(d_hpre.p).add(d_w.p).add(d_u.p).add(key).add(d_gate.p).add(d_gc.p).add(d_s2.p).add(d_uc2.p)
+                     .add(1u).add(cc * C).add(cc).add(NK).add(NV).add(KD).add(VD).add(QK).add(2 * NV).add(0u)
+                     .add((int*)nullptr).add((int*)nullptr).add(0u);
+                    launch(kp, grid, dim3(thr), sm, a);
+                }
+                d_h3.put(h0); d_s3.fill(0x11); d_uc3.fill(0x33); d_cap.fill(0x77);
+                {
+                    Args a;
+                    a.add(d_h3.p).add(d_w.p).add(d_u.p).add(key).add(d_gate.p).add(d_gc.p).add(d_s3.p).add(d_uc3.p)
+                     .add(1u).add(T).add(NC).add(NK).add(NV).add(KD).add(VD).add(QK).add(2 * NV).add(0u)
+                     .add((int*)nullptr).add((int*)nullptr).add(0u).add(d_cap.p).add(cc);
+                    launch(kc, grid, dim3(thr), sm, a);
+                }
+                CK(cudaDeviceSynchronize());
+                const size_t a1 = diff_bytes(d_s1.get(), d_s3.get()), a2 = diff_bytes(d_uc1.get(), d_uc3.get());
+                const size_t a3 = diff_bytes(d_h1.get(), d_h3.get()), a4 = diff_bytes(d_hpre.get(), d_cap.get());
+                printf("bitwise %s_cap at chunk %u: S_out %zu, uc_out %zu, state %zu; captured vs %u-chunk final state %zu differing bytes\n",
+                       dvk ? "pipe_dv64" : "pipe", cc, a1, a2, a3, cc, a4);
+                ok_cap = ok_cap && a1 == 0 && a2 == 0 && a3 == 0 && a4 == 0;
+            }
+        }
+        float t_c = time_ms([&] {
+            d_h3.put(h0);
+            Args a;
+            a.add(d_h3.p).add(d_w.p).add(d_u.p).add(key).add(d_gate.p).add(d_gc.p).add(d_s3.p).add(d_uc3.p)
+             .add(1u).add(T).add(NC).add(NK).add(NV).add(KD).add(VD).add(QK).add(2 * NV).add(0u)
+             .add((int*)nullptr).add((int*)nullptr).add(0u).add(d_cap.p).add(NC / 2);
+            launch(k_dv_cap, dim3(NV, 2), dim3(128), smem_dv, a);
+        }, 3, 3);
+        printf("pipe_dv64_cap %.3f ms (pipe_dv64 above)\n", t_c);
+    }
     // ── chunk_fwd_o vs chunk_fwd_o_wide on the spine's S_out / uc_out ──
     // (`old_fla.ptx`, when present, is the module before the wide twin landed:
     // its chunk_fwd_o must also equal this build's.)
@@ -123,6 +179,6 @@ int main(int argc, char** argv) {
         float t2 = time_ms([&] { fo(k_fow, d_o2.p); }, 3, 3);
         printf("chunk_fwd_o %.3f ms -> chunk_fwd_o_wide %.3f ms (%.2fx)\n", t1, t2, t1 / t2);
     }
-    printf("%s\n", ok && ok2 ? "PASS" : "FAIL");
-    return ok && ok2 ? 0 : 1;
+    printf("%s\n", ok && ok2 && ok_cap ? "PASS" : "FAIL");
+    return ok && ok2 && ok_cap ? 0 : 1;
 }

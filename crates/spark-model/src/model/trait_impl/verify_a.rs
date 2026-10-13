@@ -379,12 +379,20 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
+        // ATLAS_QWEN4EXP_EXACT_DEFER: h and conv replayed from H0, one launch.
+        let mut exact_layers = Vec::new();
+        let exact = self.gdn_pending_is_exact();
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) == atlas_core::config::LayerType::LinearAttention {
                 let ssm = layer_state
                     .as_any_mut()
                     .downcast_mut::<SsmLayerState>()
                     .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+                if exact && ssm.gdn_commit_pending && num_accepted > 0 {
+                    ssm.gdn_commit_pending = false;
+                    exact_layers.push(self.gdn_exact_commit_entry(i, ssm));
+                    continue;
+                }
 
                 // Pool h STORAGE width (SSOT: ssm_reserve::ssm_h_stored_bytes).
                 let h_bytes = self.ssm_pool.h_stored_bytes;
@@ -455,6 +463,9 @@ impl TransformerModel {
         // pre-validation pass above already guarantees no bail can happen
         // here, and building the plan first makes that structural rather
         // than argued: a partially-rewound MIXED state is unrepresentable.
+        if !exact_layers.is_empty() {
+            self.commit_gdn_exact(&exact_layers, num_accepted, stream)?;
+        }
         run_ssm_state_copies(self.gpu.as_ref(), &h_plan, &conv_plan, stream)?;
         // No synchronize needed: rollback copies and subsequent operations
         // are on the same CUDA stream, so ordering is guaranteed.

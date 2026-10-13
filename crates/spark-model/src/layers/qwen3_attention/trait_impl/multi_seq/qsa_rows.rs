@@ -34,7 +34,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::ctx::MultiSeqCtx;
 use crate::layer::{AttnMetadataDev, LayerState};
 use crate::layers::ops;
-use crate::layers::qsa::{QsaIndexer, QsaSelection};
+use crate::layers::qsa::{QSA_ROWS_MAX, QsaIndexer, QsaSelection};
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
 impl Qwen3AttentionLayer {
@@ -157,7 +157,54 @@ impl Qwen3AttentionLayer {
         let inv_sqrt_d = self.effective_attn_scale(hd);
         let out_row = (nq * hd) as usize * bf16;
         let table_row = meta.max_blocks_per_seq as usize * 4;
-        for i in 0..n {
+        let owner_of = |i: usize| row_owner.map_or(i, |m| m.get(i).copied().unwrap_or(usize::MAX));
+        let mut i = 0;
+        while i < n {
+            // ATLAS_QWEN4EXP_QSA_DECODE_ROWS: a run of one sequence's
+            // consecutive active rows selects and attends in one launch per
+            // stage (`qsa_decode_rows.rs`), bit-identical to the loop below.
+            let run = if qsa.decode_rows_on() && i < c.active {
+                batched_run_len(i, c.active, QSA_ROWS_MAX, &owner_of, seq_lens, |p| {
+                    qsa.is_active_at(p)
+                })
+            } else {
+                0
+            };
+            if run > 0 {
+                let owner = owner_of(i);
+                let state = states.get_mut(owner).ok_or_else(|| {
+                    anyhow::anyhow!("QSA row {i} owned by seq {owner}, which has no state")
+                })?;
+                let st =
+                    crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, *state, fwd.gpu)?;
+                let sel = qsa.decode_select_rows(
+                    st,
+                    c.normed.offset(i * c.h * bf16),
+                    c.h * bf16,
+                    seq_lens[i],
+                    run,
+                    fwd.gpu,
+                    stream,
+                )?;
+                // The run's last row maps every token any of its rows reads.
+                qsa.attend_rows(
+                    &sel,
+                    qkv_buf.offset(i * per_seq_qkv),
+                    (per_seq_qkv / bf16) as u32,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    meta.block_table.offset((i + run - 1) * table_row),
+                    attn_out.offset(i * out_row),
+                    nq,
+                    nkv,
+                    bs,
+                    inv_sqrt_d,
+                    fwd.gpu,
+                    stream,
+                )?;
+                i += run;
+                continue;
+            }
             // Q leads each row's interleaved [Q|K|V|gate] block; with one
             // sequence per launch the kernel never applies the stride.
             let q_i = qkv_buf.offset(i * per_seq_qkv);
@@ -210,7 +257,70 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?,
             }
+            i += 1;
         }
         Ok(attn_out)
+    }
+}
+
+/// Rows from `i` that one batched selection serves: the same owner, one
+/// position apart, every one ACTIVE (activity is monotone in position, so the
+/// first row decides), at most `max`, never past `active`. 0: row `i` takes
+/// the per-row path.
+pub(super) fn batched_run_len(
+    i: usize,
+    active: usize,
+    max: usize,
+    owner_of: &dyn Fn(usize) -> usize,
+    seq_lens: &[usize],
+    is_active_at: impl Fn(usize) -> bool,
+) -> usize {
+    if i >= active || i >= seq_lens.len() || !is_active_at(seq_lens[i]) {
+        return 0;
+    }
+    let mut len = 1;
+    while len < max
+        && i + len < active
+        && i + len < seq_lens.len()
+        && owner_of(i + len) == owner_of(i)
+        && seq_lens[i + len] == seq_lens[i] + len
+    {
+        len += 1;
+    }
+    len
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::batched_run_len;
+
+    fn run(i: usize, active: usize, owners: &[usize], lens: &[usize]) -> usize {
+        batched_run_len(i, active, 4, &|r| owners[r], lens, |p| p >= 100)
+    }
+
+    #[test]
+    fn a_verify_window_is_one_run() {
+        assert_eq!(run(0, 4, &[0, 0, 0, 0], &[200, 201, 202, 203]), 4);
+        assert_eq!(run(1, 4, &[0, 0, 0, 0], &[200, 201, 202, 203]), 3);
+    }
+
+    #[test]
+    fn runs_split_at_owner_position_cap_and_padding() {
+        // Two sequences' windows: the run stops at the owner change.
+        assert_eq!(run(0, 4, &[0, 0, 1, 1], &[200, 201, 500, 501]), 2);
+        assert_eq!(run(2, 4, &[0, 0, 1, 1], &[200, 201, 500, 501]), 2);
+        // Same owner, a position gap: not one window.
+        assert_eq!(run(0, 3, &[0, 0, 0], &[200, 201, 205]), 2);
+        // Capped at `max` (4 here); padding rows (`active..`) never join.
+        assert_eq!(run(0, 6, &[0; 6], &[200, 201, 202, 203, 204, 205]), 4);
+        assert_eq!(run(0, 2, &[0; 4], &[200, 201, 202, 203]), 2);
+        assert_eq!(run(2, 2, &[0; 4], &[200, 201, 202, 203]), 0);
+    }
+
+    #[test]
+    fn an_inert_first_row_takes_the_per_row_path() {
+        // A window that straddles the bound: row 0 inert, the rest per row.
+        assert_eq!(run(0, 4, &[0; 4], &[98, 99, 100, 101]), 0);
+        assert_eq!(run(2, 4, &[0; 4], &[98, 99, 100, 101]), 2);
     }
 }

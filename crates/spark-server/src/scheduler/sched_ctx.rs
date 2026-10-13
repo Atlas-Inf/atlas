@@ -89,6 +89,7 @@ impl SchedCtx {
     ) -> crate::scheduler::logit_processors::LogitsContext<'_> {
         crate::scheduler::logit_processors::LogitsContext {
             glm_tool_boundary: self.limits.glm_tool_boundary,
+            limits: self.limits,
             watchdog: self.watchdog,
             scratch: &self.scratch,
             dumps: &self.dumps,

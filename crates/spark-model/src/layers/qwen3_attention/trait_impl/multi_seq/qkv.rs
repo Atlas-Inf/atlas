@@ -722,6 +722,19 @@ impl Qwen3AttentionLayer {
         // there, so wider verifies (DFlash γ=16, M=17) keep the GEMM.
         // ATLAS_QWEN4EXP_BATCH_FAST past the widest GEMV tier: 16 rows a
         // launch of the same exact template rather than the tile GEMM.
+        // ATLAS_QWEN4EXP_W4_ROWS_WIDE: past 8 rows, one exact wide launch
+        // (falls back to the chunking below on its own if it cannot launch).
+        if c.fwd.levers.qwen4exp_batch_fast && self.wide_rows.w4_wide_serves(m, k) {
+            return self.wide_rows.w4a16_rows(
+                gpu,
+                &self.w4a16_batchm,
+                input,
+                w_base,
+                output,
+                (m, n, k),
+                stream,
+            );
+        }
         if c.fwd.levers.qwen4exp_batch_fast && m > 16 && self.w4a16_gemv_batch16_k.0 != 0 {
             let (in_row, out_row) = (k as usize * 2, n as usize * 2);
             for first in (0..m).step_by(16) {

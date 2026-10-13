@@ -75,8 +75,13 @@ pub struct Qwen4ExpMtpProposerState {
     pub seq_len: usize,
     /// Drafts produced by the last `propose` (for `after_verify` trimming).
     pub last_num_drafted: usize,
+    /// A propose wrote rows no verdict has settled yet (`qwen4exp_mtp_kv.rs`).
+    pub awaiting_verdict: bool,
     /// Per-layer state for the reused body.
     pub body_state: Box<dyn LayerState>,
+    /// Drafts for positions below it skip the end tokens (the target ban's
+    /// min_tokens floor, `qwen4exp_mtp_ban.rs`; 0 = none).
+    pub end_floor: usize,
 }
 
 impl ProposerState for Qwen4ExpMtpProposerState {
@@ -85,6 +90,10 @@ impl ProposerState for Qwen4ExpMtpProposerState {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn set_end_floor(&mut self, floor: usize) {
+        let on = crate::traits::EosBan::target_ban_installed();
+        self.end_floor = qwen4exp_mtp_ban::drafter_floor(floor, on);
     }
 }
 
@@ -108,9 +117,10 @@ pub struct Qwen4ExpMtpHead {
     kv_cache: Mutex<PagedKvCache>,
 
     // Scratch owned by the proposer rather than borrowed from `ctx.buffers`.
-    // 6 small buffers, ~50 KB total at hidden=2560/hc=4: cheap, and it removes
-    // every aliasing question against the trunk's buffers, which the body is
-    // simultaneously using.
+    // 6 small buffers, sized for `PROPOSE_BATCH_MAX` rows (~400 KB at
+    // hidden=2560/hc=4; the per-sequence path uses row 0): cheap, and it
+    // removes every aliasing question against the trunk's buffers, which the
+    // body is simultaneously using.
     embed_buf: DevicePtr,
     normed_e: DevicePtr,
     e_branch: DevicePtr,
@@ -122,11 +132,30 @@ pub struct Qwen4ExpMtpHead {
     // Kernel handles.
     rms_norm_k: KernelHandle,
     rms_norm_f32_k: KernelHandle,
+    /// `ATLAS_QWEN4EXP_MTP_GROUPED_NORM=1`: `rms_norm_f32_grouped`, else 0.
+    rms_norm_f32_grouped_k: KernelHandle,
     f32_residual_add_k: KernelHandle,
     dense_gemv_k: KernelHandle,
     hc_expand_k: KernelHandle,
     hc_head_k: KernelHandle,
     argmax_k: KernelHandle,
+
+    // Batched propose (`qwen4exp_mtp_batch.rs`). Optional kernels: a zero
+    // handle keeps every batch on the per-sequence path.
+    dense_gemv_batchm_k: KernelHandle,
+    /// The lane's 16/32-row tiers for the (row, stream) projections.
+    wide_rows: super::ops::Qwen4ExpWideRows,
+    batched_embed_k: KernelHandle,
+    argmax_batch_k: KernelHandle,
+    argmax_batch_lp_k: KernelHandle,
+    /// Token chain, confidences and attention metadata of one batched propose
+    /// call, uploaded once and read back once (`qwen4exp_mtp_batch::Slab`).
+    batch_slab: DevicePtr,
+    /// Block-table entries per row that `batch_slab` holds.
+    batch_slab_blocks: usize,
+    /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the worker projects half of the draft
+    /// head of each batched propose the model announces (`draft_tp`).
+    tp: Option<draft_tp::DraftTp>,
 }
 
 impl Qwen4ExpMtpHead {
@@ -161,9 +190,14 @@ impl Qwen4ExpMtpHead {
             config.head_dim,
         );
         let num_blocks = max_seq_len / kv_config.block_size + 1;
+        let block_size = kv_config.block_size;
         let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
 
-        let bf16 = |n: usize| -> Result<DevicePtr> { gpu.alloc(n * 2) };
+        let rows = qwen4exp_mtp_batch::PROPOSE_BATCH_MAX;
+        let bf16 = |n: usize| -> Result<DevicePtr> { gpu.alloc(rows * n * 2) };
+        // Every block a `max_seq_len` drafter sequence can reference, + 1 for
+        // the row being written (the allocator's `seq_len / bs + 1`).
+        let batch_slab_blocks = max_seq_len / block_size + 1;
         let draft = crate::layers::qwen4exp_draft_head::DraftHead::build(
             &lm_head,
             config.vocab_size,
@@ -195,11 +229,29 @@ impl Qwen4ExpMtpHead {
             // `1 + w` and silently shift every drafted logit.
             rms_norm_k: gpu.kernel("norm", "rms_norm")?,
             rms_norm_f32_k: gpu.kernel("norm", "rms_norm_f32")?,
+            rms_norm_f32_grouped_k: super::try_kernel_gated(
+                std::env::var("ATLAS_QWEN4EXP_MTP_GROUPED_NORM").as_deref() == Ok("1"),
+                gpu,
+                "norm",
+                "rms_norm_f32_grouped",
+            ),
             f32_residual_add_k: gpu.kernel("norm", "f32_residual_add")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
             hc_head_k: gpu.kernel("hyper_connection", "hc_head")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            dense_gemv_batchm_k: super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm",
+            ),
+            wide_rows: super::ops::Qwen4ExpWideRows::resolve(gpu, "qwen4_exp"),
+            batched_embed_k: super::try_kernel(gpu, "embed_from_argmax", "batched_embed"),
+            argmax_batch_k: super::try_kernel(gpu, "argmax", "argmax_bf16_batch"),
+            argmax_batch_lp_k: super::try_kernel(gpu, "argmax", "argmax_bf16_batch_lp"),
+            batch_slab: gpu.alloc(qwen4exp_mtp_batch::slab_bytes(batch_slab_blocks))?,
+            batch_slab_blocks,
+            tp: None,
         })
     }
 
@@ -208,7 +260,9 @@ impl Qwen4ExpMtpHead {
             block_table: Vec::new(),
             seq_len: 0,
             last_num_drafted: 0,
+            awaiting_verdict: false,
             body_state: self.module.body.alloc_state(gpu)?,
+            end_floor: 0,
         })
     }
 
@@ -257,6 +311,18 @@ fn drafter_kv_config(slot: usize, num_kv_heads: usize, head_dim: usize) -> KvCac
 #[path = "qwen4exp_mtp_forward.rs"]
 mod qwen4exp_mtp_forward;
 
+#[path = "qwen4exp_mtp_batch.rs"]
+mod qwen4exp_mtp_batch;
+
+#[path = "qwen4exp_mtp_kv.rs"]
+mod qwen4exp_mtp_kv;
+
+#[path = "qwen4exp_mtp_ban.rs"]
+mod qwen4exp_mtp_ban;
+
+#[path = "qwen4exp_mtp_tp.rs"]
+pub mod draft_tp;
+
 impl DraftProposer for Qwen4ExpMtpHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         Ok(Box::new(self.alloc_state_inner(gpu)?))
@@ -281,6 +347,8 @@ impl DraftProposer for Qwen4ExpMtpHead {
             .downcast_mut::<Qwen4ExpMtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid qwen4_exp MTP proposer state"))?;
 
+        qwen4exp_mtp_kv::settle_unverified(st);
+        crate::layers::qsa::draft_share_set(st.body_state.as_mut(), true); // MTP_INDEX_SHARE
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut current_token = last_token;
         for i in 0..num_drafts {
@@ -320,8 +388,77 @@ impl DraftProposer for Qwen4ExpMtpHead {
             drafts.push(draft);
             current_token = draft;
         }
+        crate::layers::qsa::draft_share_set(st.body_state.as_mut(), false);
         st.last_num_drafted = drafts.len();
+        st.awaiting_verdict = true;
         Ok(drafts)
+    }
+
+    /// One drafter forward a draft position for all sequences, chained on the
+    /// device (`qwen4exp_mtp_batch.rs`); `Ok(None)` outside [`Self::batch_admits`].
+    fn propose_batch(
+        &self,
+        last_tokens: &[u32],
+        _target_hiddens: &[DevicePtr],
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn ProposerState],
+        _expected_owners: Option<&[crate::layers::dflash_head::SequenceGeneration]>,
+        ctx: &ForwardContext,
+        stream: u64,
+        out_conf: Option<&mut Vec<Vec<f32>>>,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        // An announced draft-TP propose (`draft_tp`): from here on every exit
+        // issues the swaps the worker walks.
+        let plan = draft_tp::Plan {
+            n: last_tokens.len(),
+            drafts: num_drafts,
+        };
+        let tp = self.draft_tp_run(ctx.comm, ctx.gpu, plan, stream)?;
+        // Grammar masks are per position and host-applied: per-sequence only.
+        let masked = grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some));
+        if masked || !self.batch_admits(last_tokens.len(), num_drafts, ctx) {
+            return Ok(None);
+        }
+        let mut sts = Vec::with_capacity(states.len());
+        for s in states.iter_mut() {
+            match s.as_any_mut().downcast_mut::<Qwen4ExpMtpProposerState>() {
+                Some(st) => sts.push(st),
+                None => return Ok(None),
+            }
+        }
+        let drafts = self.propose_batch_impl(
+            last_tokens,
+            positions,
+            num_drafts,
+            &mut sts,
+            ctx,
+            stream,
+            out_conf,
+            tp.as_ref(),
+        )?;
+        tp.map_or(Ok(()), draft_tp::TpRun::finish)?;
+        Ok(Some(drafts))
+    }
+
+    fn draft_tp_word(
+        &self,
+        comm: &dyn spark_comm::CommBackend,
+        n: usize,
+        num_drafts: usize,
+        grammar: bool,
+        ctx: &ForwardContext,
+    ) -> Option<u32> {
+        self.tp_announce_word(comm, n, num_drafts, grammar, ctx)
+    }
+
+    fn propose_batch_max(
+        &self,
+        buffers: &spark_runtime::buffers::BufferArena,
+        config: &atlas_core::config::ModelConfig,
+    ) -> usize {
+        self.batch_width(buffers, config)
     }
 
     fn after_verify(
@@ -335,11 +472,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
             .as_any_mut()
             .downcast_mut::<Qwen4ExpMtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid qwen4_exp MTP proposer state"))?;
-        let num_drafted = st.last_num_drafted.max(1);
-        let num_to_trim = num_drafted.saturating_sub(num_accepted);
-        if num_to_trim > 0 {
-            st.seq_len = st.seq_len.saturating_sub(num_to_trim);
-        }
+        qwen4exp_mtp_kv::after_verdict(st, num_accepted);
         Ok(())
     }
 
@@ -363,29 +496,5 @@ impl DraftProposer for Qwen4ExpMtpHead {
 }
 
 #[cfg(test)]
-mod drafter_kv_tests {
-    use super::*;
-    use spark_runtime::gpu::mock::MockGpuBackend;
-
-    /// The written slot keeps a full layer's strides; the twelve slots in
-    /// front of it cost next to nothing.
-    #[test]
-    fn only_the_written_slot_is_a_full_layer() {
-        let cfg = drafter_kv_config(12, 2, 256);
-        let full = 16 * 2 * 256 * 2;
-        assert_eq!(cfg.k_block_bytes_for_layer(12), full);
-        assert_eq!(cfg.v_block_bytes_for_layer(12), full);
-        assert_eq!(cfg.cache_stride_elements(), 16 * 2 * 256);
-        assert_eq!(cfg.block_bytes_kv_all_layers(), 2 * full + 12 * 2 * 32);
-
-        let gpu = MockGpuBackend::new();
-        let blocks = 64;
-        let kv = PagedKvCache::new(cfg, blocks, &gpu).unwrap();
-        assert_eq!(kv.k_block_stride_bytes_for_layer(12), full);
-        assert_eq!(kv.v_block_stride_bytes_for_layer(12), full);
-        assert_eq!(kv.dtype_for_layer(12), KvCacheDtype::Bf16);
-        let k12 = gpu.read_alloc(kv.k_pool_ptr(12)).unwrap();
-        assert_eq!(k12.len(), blocks * full);
-        assert_eq!(gpu.read_alloc(kv.k_pool_ptr(0)).unwrap().len(), blocks * 32);
-    }
-}
+#[path = "qwen4exp_mtp_kv_tests.rs"]
+mod drafter_kv_tests;

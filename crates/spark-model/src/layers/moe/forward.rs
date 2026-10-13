@@ -592,6 +592,14 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+        } else if self.qwen4exp_moe_rows.units_tc
+            && self.qwen4exp_moe_rows.units_ready()
+            && self.lora.is_none()
+        {
+            // ATLAS_QWEN4EXP_MOE_TC (contract (b)): this row on the
+            // tensor-core units the batched rows take (`forward_rows`), so a
+            // row's MoE output does not depend on how it was batched.
+            self.units_experts(expert_input, indices_dev, (0, 1), shared_out, ctx, stream)?;
         } else {
             // NVFP4 path: fused routed+shared gate+up
             prof!("exp_gate_up", {

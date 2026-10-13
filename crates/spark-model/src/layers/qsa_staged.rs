@@ -38,6 +38,53 @@ use super::*;
 
 thread_local! {
     static STAGED: Cell<bool> = const { Cell::new(false) };
+    static TABLE: std::cell::RefCell<Option<Vec<CommitEntry>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One staged commit of [`QsaIndexer::commit_staged_rows`] for
+/// `qsa_commit_table` (`ATLAS_QWEN4EXP_QSA_COMMIT_TABLE`): the pitched copy
+/// and the block pool it would have launched, with their arguments.
+#[derive(Clone, Copy, Debug)]
+pub struct CommitEntry {
+    pub kernel: KernelHandle,
+    pub src: DevicePtr,
+    pub dst: DevicePtr,
+    pub raw_origin: DevicePtr,
+    pub k_norm_w: DevicePtr,
+    pub block_keys: DevicePtr,
+    pub src_pitch: u32,
+    pub count: u32,
+    pub first_block: u32,
+    pub n_new: u32,
+    /// `(ratio, hd, rot, theta bits, eps bits)`: one launch needs them equal.
+    pub shape: (u32, u32, u32, u32, u32),
+}
+
+/// Scope in which pitched staged commits are collected, not launched; the
+/// model launches them as one table (`model/qsa_commit_table.rs`).
+pub struct CommitTable;
+
+impl CommitTable {
+    pub fn enter() -> Self {
+        TABLE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+        Self
+    }
+
+    /// The collected entries; collection ends.
+    pub fn take(self) -> Vec<CommitEntry> {
+        TABLE.with(|t| t.borrow_mut().take()).unwrap_or_default()
+    }
+}
+
+impl Drop for CommitTable {
+    fn drop(&mut self) {
+        TABLE.with(|t| *t.borrow_mut() = None);
+    }
+}
+
+fn collecting() -> bool {
+    TABLE.with(|t| t.borrow().is_some())
 }
 
 /// Whether the indexer layers called on this thread stage their ingest.
@@ -85,6 +132,20 @@ impl QsaIndexer {
             "QSA staged ingest: row {row} past the {} staging rows",
             self.max_staged_rows()
         );
+        // ATLAS_QWEN4EXP_QSA_KEY_ONLY: the key rows only, straight into the
+        // staging row, once a probe has shown the bytes equal (`qsa_key_only.rs`).
+        if self.key_only(gpu, stream)? {
+            return ops::cublas_bf16_proj_dense(
+                normed,
+                self.key_proj_w(),
+                self.staged_key(row),
+                1,
+                self.hd,
+                self.hidden,
+                stream,
+            )
+            .context("QSA key projection (staged decode)");
+        }
         let hd = self.hd as usize;
         ops::cublas_bf16_proj_dense(
             normed,
@@ -138,6 +199,97 @@ impl QsaIndexer {
     }
 }
 
+impl QsaIndexer {
+    /// [`Self::commit_staged_row`] over `count` rows of one sequence,
+    /// staging rows `first_row..` at positions `pos..`. With `pitched`
+    /// (`ATLAS_QWEN4EXP_QSA_COMMIT_ROWS`), the raw keys land as ONE pitched
+    /// copy (staging rows `qk_width` apart -> window rows `hd` apart, the
+    /// window holding `pos..pos + count` contiguously after `raw_room`) and
+    /// the blocks they complete pool in ONE launch; otherwise the per-row
+    /// commit, verbatim. The bytes are the same: each raw key is the same
+    /// copy, and `qsa_block_pool` computes each block from its own four raw
+    /// keys whatever the launch's block count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_staged_rows(
+        &self,
+        st: &mut QsaSeqState,
+        first_row: usize,
+        pos: usize,
+        count: usize,
+        pitched: bool,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        if !pitched {
+            for j in 0..count {
+                self.commit_staged_row(st, first_row + j, pos + j, gpu, stream)?;
+            }
+            return Ok(());
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let last = pos + count - 1;
+        anyhow::ensure!(
+            pos == st.ingested,
+            "QSA staged commit at pos {pos} but {} tokens ingested",
+            st.ingested
+        );
+        anyhow::ensure!(
+            !self.is_active_at(last),
+            "QSA staged commit through pos {last}: only inert rows stage (bound {})",
+            self.inert_bound(),
+        );
+        anyhow::ensure!(
+            first_row + count <= self.max_staged_rows(),
+            "QSA staged commit: rows {first_row}..{} past the staging rows",
+            first_row + count
+        );
+        self.reserve(st, pos + count, gpu, stream)?;
+        self.raw_room(st, count, gpu, stream)?;
+        if collecting() && self.k_commit_table_k.0 != 0 {
+            let complete = (pos + count) / self.ratio as usize;
+            let entry = CommitEntry {
+                kernel: self.k_commit_table_k,
+                src: self.staged_key(first_row),
+                dst: self.raw_slot(st, pos),
+                raw_origin: self.raw_origin(st),
+                k_norm_w: self.k_norm_w,
+                block_keys: st.block_keys,
+                src_pitch: self.qk_width() as u32,
+                count: count as u32,
+                first_block: st.pooled as u32,
+                n_new: complete.saturating_sub(st.pooled) as u32,
+                shape: (
+                    self.ratio,
+                    self.hd,
+                    self.rot,
+                    self.theta.to_bits(),
+                    self.eps.to_bits(),
+                ),
+            };
+            TABLE.with(|t| t.borrow_mut().as_mut().map(|v| v.push(entry)));
+            st.ingested = pos + count;
+            st.pooled = st.pooled.max(complete);
+            return Ok(());
+        }
+        let row = self.hd as usize * 2;
+        crate::model::qwen4exp_step_copies::copy_rows(
+            gpu,
+            self.staged_key(first_row),
+            self.qk_width() * 2,
+            self.raw_slot(st, pos),
+            row,
+            row,
+            count,
+            true,
+            stream,
+        )?;
+        st.ingested = pos + count;
+        self.pool_new_blocks(st, gpu, stream)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{StagedIngest, staged_ingest};
@@ -157,3 +309,7 @@ mod tests {
         assert!(!staged_ingest());
     }
 }
+
+#[cfg(test)]
+#[path = "qsa_staged_rows_tests.rs"]
+mod rows_tests;

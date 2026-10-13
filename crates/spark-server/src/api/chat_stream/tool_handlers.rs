@@ -14,13 +14,26 @@ use super::state::{PendingRetry, StreamState};
 
 type DeltaVec = Vec<StreamDelta>;
 
+/// Whether this stream holds a tool call's deltas until the call validates:
+/// under tool retry, and for Poolside v1, whose detector buffers a call's
+/// arguments until `</tool_call>` anyway. Holding its header too means the
+/// client never sees a call start that the blocking path would not return:
+/// an unregistered name (rejected at validation) or an envelope the response
+/// cuts off before `</tool_call>` (never validated, so never flushed).
+fn holds_tool_deltas(state: &StreamState, ctx: &StreamCtx) -> bool {
+    ctx.tool_retry_enabled
+        || state
+            .detector
+            .as_ref()
+            .is_some_and(|d| d.promotes_bare_names())
+}
+
 /// Tier 5c (2026-05-26): emit `delta` to either the client stream OR a
-/// per-tool-call-index buffer in `StreamState`. When tool retry is
-/// enabled we hold all tool_call deltas until `handle_tool_call_delta`
+/// per-tool-call-index buffer in `StreamState`. When the stream holds tool
+/// deltas ([`holds_tool_deltas`]) they wait until `handle_tool_call_delta`
 /// runs validation; on pass the buffered deltas flush to the client, on
-/// fail they're discarded and the retry fires at `handle_done`. When
-/// tool retry is disabled this is a direct emit (preserves the existing
-/// real-time streaming behaviour).
+/// fail they're discarded. Otherwise this is a direct emit (real-time
+/// streaming).
 fn emit_or_buffer_tool_delta(
     state: &mut StreamState,
     ctx: &StreamCtx,
@@ -28,7 +41,7 @@ fn emit_or_buffer_tool_delta(
     delta: StreamDelta,
     deltas: &mut DeltaVec,
 ) {
-    if ctx.tool_retry_enabled {
+    if holds_tool_deltas(state, ctx) {
         state
             .buffered_tool_chunks
             .entry(idx)
@@ -375,6 +388,8 @@ pub(super) fn handle_tool_call_delta(
                 });
                 state.stop_string_triggered = true;
                 entry.1.push_str(&args);
+                // A held header never reaches the client for a rejected call.
+                drop_buffered_tool_chunks(state, idx);
                 return;
             }
         } else {
@@ -390,15 +405,12 @@ pub(super) fn handle_tool_call_delta(
             fragment: emit_args,
             token_ids: Vec::new(),
         };
-        // Either flush previously-buffered start + this args delta
-        // together (success path under retry), or emit directly (retry
-        // disabled). When retry is disabled the start delta was already
-        // emitted in real time, so `emit_or_buffer_tool_delta` just adds
-        // the args delta.
+        // Either flush the held start + this args delta together (the call
+        // validated), or emit directly when the stream does not hold tool
+        // deltas: the start delta was already emitted in real time, so
+        // `emit_or_buffer_tool_delta` just adds the args delta.
         emit_or_buffer_tool_delta(state, ctx, idx, frag, deltas);
-        if ctx.tool_retry_enabled {
-            flush_buffered_tool_chunks(state, idx, deltas);
-        }
+        flush_buffered_tool_chunks(state, idx, deltas);
     }
 }
 

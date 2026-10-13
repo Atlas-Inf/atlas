@@ -361,6 +361,8 @@ pub(super) fn spill_out_sequence(
         content_tokens: a.content_tokens,
         prose_tokens_since_last_tool: a.prose_tokens_since_last_tool,
         think_watchdog_fires: a.think_watchdog_fires,
+        loop_steers: a.loop_steers,
+        loop_steer_max: a.loop_steer_max,
         rollback_count: a.rollback_count,
         tool_call_start_token: a.tool_call_start_token,
         tool_call_opened: a.tool_call_opened,

@@ -449,7 +449,7 @@ pub(super) fn apply_dflash_accept(
     }
 
     for i in 0..num_accepted {
-        emit_token(a, drafts[i], None, sched);
+        emit_span_row(a, drafts[i], None, sched, i, total_accepted);
         if a.finished {
             return;
         }
@@ -457,7 +457,7 @@ pub(super) fn apply_dflash_accept(
     let bonus_idx = num_accepted;
     if bonus_idx < verified.len() {
         let bonus = verified[bonus_idx];
-        emit_token(a, bonus, None, sched);
+        emit_span_row(a, bonus, None, sched, bonus_idx, total_accepted);
         if a.finished {
             return;
         }

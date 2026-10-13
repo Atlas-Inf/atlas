@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+pub mod aux_d2h;
 pub mod deepseek_v4_mtp;
 pub mod dense_ffn;
 pub mod dflash_head;
@@ -23,8 +24,10 @@ pub mod ple;
 pub mod qsa;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod qwen4exp_ckpt;
 pub mod qwen4exp_draft_head;
 pub mod qwen4exp_mtp;
+pub mod qwen4exp_sp_pipe;
 pub mod vision_encoder;
 pub mod w4a16_gemv_tiers;
 

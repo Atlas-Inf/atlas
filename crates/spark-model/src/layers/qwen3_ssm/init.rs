@@ -84,6 +84,7 @@ impl Qwen3SsmLayer {
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batchm",
             ),
+            wide_rows: ops::Qwen4ExpWideRows::resolve(gpu, &config.model_type),
             // Compiled module name is `gemv_fp8w` (KERNEL.toml renames
             // dense_gemv_fp8w.cu); every other caller uses that spelling.
             dense_gemv_fp8w_k: super::super::try_kernel(gpu, "gemv_fp8w", "dense_gemv_fp8w"),

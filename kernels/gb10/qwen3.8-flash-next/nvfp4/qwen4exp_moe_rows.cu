@@ -445,7 +445,7 @@ __device__ __forceinline__ void qu_chunk_n(
 // + RC * 640 * 4. The activation rows of each chunk of RC unit rows are
 // computed by the whole CTA into shared (as the single-row kernel stages its
 // one row) while the tile copy is in flight.
-template <unsigned TILE, unsigned WARPS, unsigned RC>
+template <unsigned TILE, unsigned WARPS, unsigned RC, bool CLAMP = true>
 __device__ __forceinline__ void qu_silu_down(QU_SILU_DOWN_ARGS) {
     constexpr unsigned KK = QU_INTER;
     constexpr unsigned OPW = TILE / WARPS;
@@ -485,7 +485,7 @@ __device__ __forceinline__ void qu_silu_down(QU_SILU_DOWN_ARGS) {
     __shared__ float s_lut[16];
     if (threadIdx.x < 16) s_lut[threadIdx.x] = QR_E2M1_LUT[threadIdx.x];
     qu_stage_tile<KK, TILE>(packed, scale, n0, s_tile);
-    const bool clamp = !u.shared;
+    const bool clamp = CLAMP && !u.shared;
     const unsigned char* w_w = s_tile + warp * OPW * QuTile<KK>::ROW;
     const unsigned char* w_s = s_tile + TILE * QuTile<KK>::ROW + warp * OPW * QuTile<KK>::K16;
     out += n0 + warp * OPW;
@@ -551,6 +551,13 @@ __device__ __forceinline__ void qu_silu_down(QU_SILU_DOWN_ARGS) {
 extern "C" __global__ void __launch_bounds__(QU_SD_WARPS * 32)
 qwen4exp_moe_rows_silu_down(QU_SILU_DOWN_ARGS) {
     qu_silu_down<QU_SD_TILE, QU_SD_WARPS, QU_SD_RC>(QU_SILU_DOWN_PASS);
+}
+
+// Without the routed SwiGLU clamp (ATLAS_QWEN4EXP_MOE_NO_CLAMP): the bytes of
+// moe_expert_silu_down_shared_noclamp, one launch per row.
+extern "C" __global__ void __launch_bounds__(QU_SD_WARPS * 32)
+qwen4exp_moe_rows_silu_down_nc(QU_SILU_DOWN_ARGS) {
+    qu_silu_down<QU_SD_TILE, QU_SD_WARPS, QU_SD_RC, false>(QU_SILU_DOWN_PASS);
 }
 
 // Sweep shapes for scripts/dev/qwen4exp_batch_exact_bench.cu only (its

@@ -113,6 +113,23 @@ fn tier_capacity_default_ladder_shape() {
 }
 
 #[test]
+fn tier_capacity_under_the_dynamic_depth() {
+    // ATLAS_MTP_DYNAMIC_DEPTH: every slot a <= 8-wide batch can hold gets
+    // the full --num-drafts 7 (K=8); wider rungs keep the ladder's tiers.
+    use crate::speculative::deep_depth::ceiling_with;
+    let ceiling = |n: usize| ceiling_with(true, 8, n, 7, default_ladder(n).min(7));
+    for slot in 0..8 {
+        assert_eq!(verify_slot_drafts_with(slot, 32, 7, ceiling), 7);
+    }
+    for slot in 8..32 {
+        assert_eq!(
+            verify_slot_drafts_with(slot, 32, 7, ceiling),
+            verify_slot_drafts_with(slot, 32, 7, default_ladder)
+        );
+    }
+}
+
+#[test]
 fn k_minus_1_shrink_and_kill_switch_shape() {
     // The K-1 h-intermediate shrink applies EVERYWHERE (it removes a
     // slot that is never written or read, not a policy tier): every

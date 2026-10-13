@@ -321,32 +321,103 @@ impl TransformerModel {
         owners: &mut [&mut Vec<Box<dyn LayerState>>],
         stream: u64,
     ) -> Result<()> {
-        for li in 0..self.layers.len() {
+        // `ATLAS_QWEN4EXP_QSA_COMMIT_ROWS`: a run of one owner's consecutive
+        // rows at consecutive positions commits as one pitched copy.
+        let pitched = super::qwen4exp_step_copies::qsa_commit_rows();
+        let runs = staged_runs(rows, pitched);
+        // ATLAS_QWEN4EXP_QSA_COMMIT_TABLE: the device work as one launch
+        // (`qsa_commit_table.rs`), with one run a sequence.
+        let mut seen: Vec<usize> = runs.iter().map(|r| r.1).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let table = (pitched && super::qsa_commit_table::requested() && seen.len() == runs.len())
+            .then(crate::layers::qsa::CommitTable::enter);
+        let mut staged = Ok(());
+        'layers: for li in 0..self.layers.len() {
             if self.config.layer_type(li) != LayerType::FullAttention
                 || !self.piece_capturable(li, true)
             {
                 continue;
             }
-            for (row, &(owner, pos)) in rows.iter().enumerate() {
-                let states = owners
+            for &(row, owner, pos, count) in &runs {
+                let r = owners
                     .get_mut(owner)
-                    .ok_or_else(|| anyhow::anyhow!("staged QSA commit: no owner {owner}"))?;
-                self.layers[li].qsa_commit_staged(
-                    states[li].as_mut(),
-                    row,
-                    pos,
-                    self.gpu.as_ref(),
-                    stream,
-                )?;
+                    .ok_or_else(|| anyhow::anyhow!("staged QSA commit: no owner {owner}"))
+                    .and_then(|states| {
+                        self.layers[li].qsa_commit_staged(
+                            states[li].as_mut(),
+                            row,
+                            pos,
+                            count,
+                            pitched,
+                            self.gpu.as_ref(),
+                            stream,
+                        )
+                    });
+                if r.is_err() {
+                    staged = r;
+                    break 'layers;
+                }
             }
         }
-        Ok(())
+        // Every collected entry already advanced its state's counters: launch
+        // them even when a later commit failed, so no state runs ahead of its
+        // keys; then report that failure.
+        if let Some(table) = table {
+            super::qsa_commit_table::launch(self.gpu.as_ref(), &table.take(), stream)?;
+        }
+        staged
     }
+}
+
+/// `(first row, owner, first position, rows)` runs of a staged step's rows
+/// (`rows[r] = (owner, pos)`), row order kept: with `merge`, consecutive rows
+/// of one owner at consecutive positions form one run; otherwise every row is
+/// its own run.
+fn staged_runs(rows: &[(usize, usize)], merge: bool) -> Vec<(usize, usize, usize, usize)> {
+    let mut runs: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(rows.len());
+    for (row, &(owner, pos)) in rows.iter().enumerate() {
+        match runs.last_mut() {
+            Some(r) if merge && r.1 == owner && r.2 + r.3 == pos && r.0 + r.3 == row => r.3 += 1,
+            _ => runs.push((row, owner, pos, 1)),
+        }
+    }
+    runs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_runs_merge_one_owners_consecutive_rows() {
+        // Two sequences of a batched verify (4 rows, 3 rows), then a decode row.
+        let rows = [
+            (0, 10),
+            (0, 11),
+            (0, 12),
+            (0, 13),
+            (1, 5),
+            (1, 6),
+            (1, 7),
+            (2, 40),
+        ];
+        assert_eq!(
+            staged_runs(&rows, true),
+            vec![(0, 0, 10, 4), (4, 1, 5, 3), (7, 2, 40, 1)]
+        );
+        let single: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(r, &(o, p))| (r, o, p, 1))
+            .collect();
+        assert_eq!(staged_runs(&rows, false), single);
+        // A gap in positions or an owner change splits a run.
+        assert_eq!(
+            staged_runs(&[(0, 1), (0, 3), (1, 4)], true),
+            vec![(0, 0, 1, 1), (1, 0, 3, 1), (2, 1, 4, 1)]
+        );
+    }
 
     #[test]
     fn opt_in_qwen4exp_only() {

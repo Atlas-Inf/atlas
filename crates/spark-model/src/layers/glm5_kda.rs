@@ -389,6 +389,7 @@ impl TransformerLayer for Glm5KdaLayer {
             gdn_commit_qkv: spark_runtime::gpu::DevicePtr::NULL,
             gdn_commit_gb: spark_runtime::gpu::DevicePtr::NULL,
             gdn_commit_pending: false,
+            gdn_fuse_n: spark_runtime::gpu::DevicePtr::NULL,
             kda_records: spark_runtime::gpu::DevicePtr::NULL,
             conv_state_intermediates: Vec::new(),
             h_is_f16: false,

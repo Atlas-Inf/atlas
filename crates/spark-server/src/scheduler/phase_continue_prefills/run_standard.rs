@@ -28,7 +28,6 @@ pub(super) fn run_standard_chunk_loop(
     use_ngram_speculative: bool,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
-    code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
@@ -91,8 +90,10 @@ pub(super) fn run_standard_chunk_loop(
     }
     let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
     // Align intermediate chunks to GDN WY4 boundary (4 tokens).
-    if !is_last && chunk_len >= 4 {
-        chunk_len = (chunk_len / 4) * 4;
+    if !is_last && chunk_len >= spark_runtime::prefill_chunk_granule() {
+        // (ATLAS_QWEN4EXP_PREFILL_ROWINV: 64, the GDN chunk.)
+        let g = spark_runtime::prefill_chunk_granule();
+        chunk_len = (chunk_len / g) * g;
     }
 
     // ── Mixed forward: fuse prefill chunk + decode in one pass ──
@@ -205,7 +206,10 @@ pub(super) fn run_standard_chunk_loop(
                         p.top_k,
                         p.top_p,
                         p.min_p,
-                        &p.eos_tokens,
+                        &crate::scheduler::min_tokens_ban::first_token_suppress(
+                            &p.eos_tokens,
+                            p.min_tokens,
+                        ),
                         p.grammar_state.as_mut(),
                         &sched.levers.sampling(),
                     ) {
@@ -230,7 +234,6 @@ pub(super) fn run_standard_chunk_loop(
                     t0_mixed,
                     think_end_token,
                     think_start_token,
-                    code_fence_token,
                     tool_call_start_token,
                     tool_call_end_token,
                     adaptive_sampling,
@@ -312,7 +315,10 @@ pub(super) fn run_standard_chunk_loop(
                     p.top_k,
                     p.top_p,
                     p.min_p,
-                    &p.eos_tokens,
+                    &crate::scheduler::min_tokens_ban::first_token_suppress(
+                        &p.eos_tokens,
+                        p.min_tokens,
+                    ),
                     p.grammar_state.as_mut(),
                     &sched.levers.sampling(),
                 ) {

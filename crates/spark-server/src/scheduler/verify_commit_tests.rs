@@ -27,7 +27,9 @@ const PRE: usize = 40;
 /// A live sequence as `decode_verify_dflash` leaves it: `seq_len` and
 /// `seq.tokens` advanced by the whole `k`-row verify block.
 fn verified(k: usize) -> ActiveSeq {
-    let (mut a, _rx) = test_seq(vec![10], 20, None, PRE + k);
+    let (mut a, rx) = test_seq(vec![10], 20, None, PRE + k);
+    // A dropped receiver reads as a client disconnect: keep it alive.
+    std::mem::forget(rx);
     a.finished = false;
     a.min_tokens = 0;
     a.seq.tokens = (0..(PRE + k) as u32).collect();
@@ -131,7 +133,8 @@ fn batched_accept_commits_when_an_emit_finishes_the_sequence() {
 
 /// A live sequence before its verify: `PRE` tokens, `last_token` the anchor.
 fn unverified() -> ActiveSeq {
-    let (mut a, _rx) = test_seq(vec![10], 20, None, PRE);
+    let (mut a, rx) = test_seq(vec![10], 20, None, PRE);
+    std::mem::forget(rx);
     a.finished = false;
     a.min_tokens = 0;
     a.seq.tokens = (0..PRE as u32).collect();

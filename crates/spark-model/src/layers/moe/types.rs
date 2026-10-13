@@ -182,6 +182,8 @@ pub struct MoeLayer {
     /// `ATLAS_QWEN4EXP_BATCH_FAST`: the expert-sorted row grid of the
     /// originals-layout pair (`forward_rows.rs`). All 0 otherwise.
     pub(super) qwen4exp_moe_rows: ops::Qwen4ExpMoeRows,
+    /// The router's 16-row tier under the lane (`forward_rows.rs`).
+    pub(super) wide_rows: ops::Qwen4ExpWideRows,
     pub(super) moe_expert_gate_up_shared_fp8_t_k: KernelHandle,
     pub(super) moe_expert_silu_down_shared_fp8_t_k: KernelHandle,
     pub(super) moe_expert_gate_up_shared_fp8_batch2_t_k: KernelHandle,

@@ -46,13 +46,19 @@
 //! masked at position 0's state — a `\n` legal at JSON-value-start
 //! is not legal at JSON-comma-or-closebrace).
 //!
-//! Other state-dependent masks (mid-word lookback, last_token reads)
-//! still see slightly stale `output_tokens` for positions ≥ 1 —
-//! best-effort, mirrors greedy unroll.
+//! Every other piece of state a position reads (`<think>` phase, the
+//! mid-word and sentence-boundary lookbacks, the penalty history, the
+//! pipeline's own counters) is advanced between positions by committing the
+//! previous pick through the commit path's own rule, then restored
+//! (`emit_step::SpanShadow`): position `i` sees what serial decode would.
 
 mod argmax;
+mod batch;
+pub(in crate::scheduler) use batch::{applies as pick_batch_applies, verify_pick_batch};
 mod fast_masked;
+mod prepick;
 mod scratch;
+pub(in crate::scheduler) use scratch::HostRows;
 mod selection;
 mod selection_io;
 
@@ -79,10 +85,6 @@ use spark_model::traits::Model;
 /// `a`: the active sequence; the pipeline mutates seq state in place
 /// (F2 confidence arm, sentence_defer_count, etc.).
 /// `ctx`: tokenizer special-token IDs used by the pipeline.
-/// `verify_pos`: this position's index within the verify span (0..K) —
-/// P1-3 (2026-07-09): used only to derive the per-token seed offset for
-/// the temp>0 sampling branch, matching the `output_tokens.len()`-based
-/// seed the non-MTP path would have used for the same emitted position.
 ///
 /// Mirrors the host-side path of `decode_logits_seq::process_seq_logits`
 /// for byte-identical pipeline semantics.
@@ -92,7 +94,6 @@ pub fn verify_pick_with_pipeline(
     vocab_size: usize,
     a: &mut ActiveSeq,
     ctx: &LogitsContext,
-    verify_pos: usize,
 ) -> u32 {
     use crate::scheduler::mtp_timing::Phase;
     // 1. Dequant per the same scheme as `process_seq_logits`, into a REUSED
@@ -101,10 +102,27 @@ pub fn verify_pick_with_pipeline(
     //    overwritten before any read.
     let t_dequant = std::time::Instant::now();
     let mut f32_logits = scratch::DEQUANT_SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
-    f32_logits.clear();
-    f32_logits.reserve(vocab_size);
+    dequant_into(logits_bytes, is_fp32, vocab_size, &mut f32_logits);
+    ctx.timing.record(Phase::Dequant, t_dequant);
+    // Hand the allocation back on EVERY exit below (forced-token short circuit,
+    // temp>0 sample, argmax), or the next call allocates from scratch again and
+    // the reuse is silently lost.
+    let mut f32_logits = scratch::ScratchGuard(f32_logits);
+    pick_dequantized(&mut f32_logits, vocab_size, a, ctx)
+}
+
+/// Step 1 of [`verify_pick_with_pipeline`]: one row's logits as F32, exactly
+/// (BF16 -> F32 is a shift). `out` is cleared and refilled.
+pub(super) fn dequant_into(
+    logits_bytes: &[u8],
+    is_fp32: bool,
+    vocab_size: usize,
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.reserve(vocab_size);
     if is_fp32 {
-        f32_logits.extend((0..vocab_size).map(|j| {
+        out.extend((0..vocab_size).map(|j| {
             let off = j * 4;
             f32::from_le_bytes([
                 logits_bytes[off],
@@ -114,22 +132,27 @@ pub fn verify_pick_with_pipeline(
             ])
         }));
     } else {
-        f32_logits.extend((0..vocab_size).map(|j| {
+        out.extend((0..vocab_size).map(|j| {
             let lo = logits_bytes[j * 2];
             let hi = logits_bytes[j * 2 + 1];
             bf16_to_f32(lo, hi)
         }));
     }
-    ctx.timing.record(Phase::Dequant, t_dequant);
-    // Hand the allocation back on EVERY exit below (forced-token short circuit,
-    // temp>0 sample, argmax), or the next call allocates from scratch again and
-    // the reuse is silently lost.
-    let mut f32_logits = scratch::ScratchGuard(f32_logits);
+}
 
+/// Steps 2-4 of [`verify_pick_with_pipeline`] on an already-dequantized row,
+/// which the pipeline then masks and penalises in place.
+pub(super) fn pick_dequantized(
+    f32_logits: &mut [f32],
+    vocab_size: usize,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+) -> u32 {
+    use crate::scheduler::mtp_timing::Phase;
     // 2. Build this position's penalty/bias params (Verify kind: greedy,
-    //    seed-free, no caller bias — the builder still appends the A4 floor
-    //    and the rep/presence/freq/LZ/DRY gates from `a`). Cloned before the
-    //    `&mut a` borrow in `process_position_logits`.
+    //    seed-free, the request's bias — the builder still appends the A4
+    //    floor and the rep/presence/freq/LZ/DRY gates from `a`). Cloned before
+    //    the `&mut a` borrow in `process_position_logits`.
     //
     //    Without these penalties MTP-VERIFIED tokens were decided by a
     //    penalty-FREE argmax, so the MODEL.toml `repetition_penalty` /
@@ -138,13 +161,7 @@ pub fn verify_pick_with_pipeline(
     //    resulting emission is a penalty-aware ARGMAX (greedy) — an intended
     //    behavioral delta for speculative acceptance. Backward-compatible: a
     //    no-op when the penalties are neutral (rep==1.0, dry==0.0, etc.).
-    let penalties = crate::scheduler::sample_step::penalty_params_for(
-        a,
-        crate::scheduler::sample_step::PositionKind::Verify,
-        0.0,
-        None,
-        Vec::new(),
-    );
+    let penalties = crate::scheduler::sample_step::verify_penalty_params(a);
 
     // 3. Unified per-position post-processing (SSOT shared with the non-MTP
     //    path): force-temp-zero bypass → pipeline (forced-token short
@@ -154,7 +171,7 @@ pub fn verify_pick_with_pipeline(
     //    `verify_pick_all_with_pipeline` owns `accept_token` / `rollback`.
     let t_proc = std::time::Instant::now();
     if let Some(tok) = crate::scheduler::logit_processors::process_position_logits(
-        &mut f32_logits,
+        f32_logits,
         a,
         ctx,
         &penalties,
@@ -177,17 +194,15 @@ pub fn verify_pick_with_pipeline(
     //     temperature / top_k / top_p / top_n_sigma / min_p. min_p is the
     //     resolved request+MODEL.toml-floor value, subject to the P1-4
     //     ATLAS_NO_MTP_MINP kill-switch. The seed advances per emitted
-    //     position (`output_tokens.len() + verify_pos`) — the same offset
-    //     FinalDecode would use if this position is accepted and emitted.
+    //     position (`output_tokens.len()`, which the span replay advances) —
+    //     the offset FinalDecode uses for the same emitted position.
     //     Unreachable under ATLAS_FORCE_TEMP_ZERO (the bypass in
     //     `process_position_logits` returns Some(argmax) before this point);
     //     the guard is kept as documentation. Kill-switch:
     //     ATLAS_NO_MTP_VERIFY_SAMPLE=1 reverts to the pinned argmax below.
     if ctx.sampling.mtp_verify_sample && a.temperature > 0.0 && !ctx.sampling.force_temp_zero {
         let t_sample = std::time::Instant::now();
-        let step_seed = a
-            .seed
-            .map(|s| s.wrapping_add((a.output_tokens.len() + verify_pos) as u64));
+        let step_seed = a.seed.map(|s| s.wrapping_add(a.output_tokens.len() as u64));
         let sampler_shape = spark_runtime::sampler::SamplingParams {
             temperature: a.temperature,
             top_k: a.top_k,
@@ -224,7 +239,7 @@ pub fn verify_pick_with_pipeline(
     // 4. Argmax over the (now-masked-and-penalised) vector. Matches the
     //    sampler's argmax branch behaviour.
     let t_argmax = std::time::Instant::now();
-    let best_id = argmax::argmax_first_wins(&f32_logits);
+    let best_id = argmax::argmax_first_wins(f32_logits);
     ctx.timing.record(Phase::Argmax, t_argmax);
     best_id
 }

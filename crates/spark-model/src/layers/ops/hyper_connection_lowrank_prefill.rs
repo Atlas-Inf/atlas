@@ -168,6 +168,8 @@ pub(super) fn hc_pre_gemm(
             None => hc_slab_default(&call, &io, stream)?,
         }
         t0 += ts;
+        // ATLAS_QWEN4EXP_PREFILL_SP_PIPE: rows [0, t0) of `y_out` are set.
+        crate::layers::qwen4exp_sp_pipe::slab_done(t0 as usize, stream)?;
     }
     Ok(())
 }

@@ -37,6 +37,9 @@ pub(crate) struct AdaptState {
     window: Vec<u32>,
     suspended: bool,
     serial_tokens: u32,
+    /// The current verify span's per-position pipeline effects, applied as
+    /// each picked token is committed (`emit_step::PickEffects`).
+    pub(in crate::scheduler) pick_effects: crate::scheduler::emit_step::PickEffects,
 }
 
 const WINDOW: usize = 12;

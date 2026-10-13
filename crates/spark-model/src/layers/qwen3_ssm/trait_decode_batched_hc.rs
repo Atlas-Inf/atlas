@@ -169,7 +169,7 @@ impl Qwen3SsmLayer {
                         "hc batched verify: PLE has {} host id(s) for {num_tokens} row(s)",
                         host.len()
                     );
-                    let row_stride = hc.hc_mult * h * 4; // highway rows are FP32
+                    let mut rows = Vec::with_capacity(states.len());
                     let mut row0 = 0usize;
                     for (i, state) in states.iter_mut().enumerate() {
                         let ki = *ks.get(i).ok_or_else(|| {
@@ -183,16 +183,15 @@ impl Qwen3SsmLayer {
                         // has no token id — it gets no injection, exactly as on
                         // the multi-seq decode path.
                         if let Some(st) = ssm.ple.as_mut() {
-                            ple.forward_rows(
+                            rows.push(crate::layers::ple::PleSeqRows {
                                 st,
-                                streams.offset(row0 * row_stride),
-                                &host[row0..row0 + ki],
-                                ctx,
-                                stream,
-                            )?;
+                                row0,
+                                ids: &host[row0..row0 + ki],
+                            });
                         }
                         row0 += ki;
                     }
+                    ple.forward_seqs(&mut rows, streams, ctx, stream)?;
                 }
             }
         }

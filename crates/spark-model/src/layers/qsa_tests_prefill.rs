@@ -90,6 +90,7 @@ fn qsa_prefill_select_sets_match_reference() {
         bs as u32,
         1.0 / (hd_attn as f32).sqrt(),
         scratch,
+        None,
         g,
         stream,
     )

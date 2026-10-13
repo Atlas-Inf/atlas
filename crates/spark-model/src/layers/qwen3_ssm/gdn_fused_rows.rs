@@ -107,6 +107,15 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        // ATLAS_QWEN4EXP_EXACT_DEFER: an exact step marked pending stores no
+        // state (`gdn_defer.rs`); it takes the deferred kernel or fails. (The
+        // wyN deferral marks the same flag, never under the exact verify.)
+        if super::verify_exact_for(ctx.levers) && Self::gdn_step_pending(gdn, num_tokens)? {
+            self.gdn_verify_deferred(
+                gdn, num_tokens, qkvz, qkvz_size, gates, normed_out, ctx, stream,
+            )?;
+            return Ok(true);
+        }
         if !ctx.levers.qwen4exp_batch_small
             || !super::verify_exact_for(ctx.levers)
             || !self.four_kernel_f32_arm(ctx)

@@ -104,7 +104,9 @@ impl FfnComponent {
         let h = ctx.config.hidden_size;
         match self {
             Self::Moe(m) => {
-                m.forward_prefill(normed, sp.total(), ctx, stream)?;
+                let ran = m.forward_prefill(normed, sp.total(), ctx, stream);
+                super::moe::forward_prefill_route_sp::clear_local_routes();
+                ran?;
                 Ok(sp.local(ctx.buffers.moe_output(), h))
             }
             Self::Dense(d) => {
@@ -112,6 +114,23 @@ impl FfnComponent {
                 Ok(ctx.buffers.moe_output())
             }
             Self::None => anyhow::bail!("SP prefill FFN on a layer without an FFN"),
+        }
+    }
+
+    /// `ATLAS_QWEN4EXP_PREFILL_SP_ROUTE`: route this rank's rows of the SP
+    /// MoE input (`[sp.total(), H]`, local rows set) ahead of
+    /// [`Self::forward_prefill_sp`], before the gather joins
+    /// (`moe::forward_prefill_route_sp`). Nothing off a MoE FFN.
+    pub fn route_local_rows(
+        &self,
+        normed: DevicePtr,
+        sp: glm_sp::SpRows,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Moe(m) => m.route_local_rows(normed, sp, ctx, stream),
+            _ => Ok(()),
         }
     }
 }

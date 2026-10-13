@@ -106,6 +106,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         state: &mut dyn LayerState,
         row: usize,
         pos: usize,
+        count: usize,
+        pitched: bool,
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
@@ -114,7 +116,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("qsa_commit_staged without an indexer"))?;
         let st = super::helpers::qsa_seq_state(qsa, state, gpu)?;
-        qsa.commit_staged_row(st, row, pos, gpu, stream)
+        qsa.commit_staged_rows(st, row, pos, count, pitched, gpu, stream)
     }
 
     fn has_aux_state(&self) -> bool {
@@ -306,11 +308,13 @@ impl TransformerLayer for Qwen3AttentionLayer {
         )
     }
 
+    fn prefill_multi(&self, pass: &mut crate::layer::MultiPass<'_, '_>) -> Result<()> {
+        self.prefill_multi_hc(pass)
+    }
+
     /// Q12 Path B: batched-mode attention prefill via `prefill_inner` with
-    /// `batched_meta = Some`. The model-level `prefill_attn_batched_layer`
-    /// calls this method. Per-stream block_table is unused under batched
-    /// mode (block_table_ptrs from batched_meta carries them); we still
-    /// pass an empty Vec to satisfy the signature.
+    /// `batched_meta = Some` (`prefill_attn_batched_layer`). The per-stream
+    /// block_table is unused (batched_meta's block_table_ptrs carry them).
     fn prefill_inner_batched_q12(
         &self,
         hidden_stacked: DevicePtr,

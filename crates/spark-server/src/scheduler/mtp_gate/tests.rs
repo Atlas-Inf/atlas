@@ -350,18 +350,21 @@ fn standard_mtp_spec_think_opts_in() {
 
 #[test]
 fn bit_exact_verify_counts_as_the_think_opt_in_for_one_sequence() {
-    assert!(spec_think_for(true, false, 4));
-    assert!(spec_think_for(false, true, 1));
-    // A concurrent batch verifies through the multi-sequence path.
-    assert!(!spec_think_for(false, true, 2));
-    assert!(!spec_think_for(false, false, 1));
+    assert!(spec_think_for(true, false, false, 4));
+    assert!(spec_think_for(false, true, false, 1));
+    // A concurrent batch verifies through the multi-sequence path: only an
+    // exact one lets it speculate inside `<think>`.
+    assert!(!spec_think_for(false, true, false, 2));
+    assert!(spec_think_for(false, true, true, 4));
+    assert!(!spec_think_for(false, false, true, 4));
+    assert!(!spec_think_for(false, false, false, 1));
     assert!(spec_dispatch_eligible(
         true,
         0,
         50,
         false,
         false,
-        spec_think_for(false, true, 1),
+        spec_think_for(false, true, false, 1),
         0,
         false
     ));
@@ -549,6 +552,50 @@ fn width_jitter_inside_a_bucket_does_not_stale() {
         g.win_steps, 0,
         "mixed-width window discarded, fresh one closed"
     );
+    assert_eq!(
+        g.next_step(),
+        GateStep::MeasureDecode,
+        "probe pulled forward"
+    );
+}
+
+/// The probe cadence is per sequence. Counted over the whole batch, a C=8
+/// step emitting ~20 tokens reached the 1024-token refresh in ~51 steps, so
+/// a 16-step plain-decode window took about a quarter of all steps while
+/// the gate was in Mtp — the `serial=` share the C=8 Done lines reported.
+#[test]
+fn probe_cadence_is_per_sequence_at_width() {
+    let mut g = MtpGate::new(3);
+    let mut steps = 0usize;
+    while g.next_step() == GateStep::MeasureVerify {
+        g.record_verify_step(ms(10), 20, 8);
+        steps += 1;
+        assert!(steps < 10_000, "a refresh must come");
+    }
+    assert!(
+        steps * 20 >= g.refresh * 8,
+        "refresh after {steps} steps ({} batch tokens), wanted {} per sequence",
+        steps * 20,
+        g.refresh
+    );
+    // ...and the width-1 cadence is unchanged.
+    let mut g = MtpGate::new(3);
+    let mut steps = 0usize;
+    while g.next_step() == GateStep::MeasureVerify {
+        g.record_verify_step(ms(10), 2, 1);
+        steps += 1;
+    }
+    assert_eq!(steps * 2, g.refresh, "1024 tokens at 2 a step");
+}
+
+/// A width change still pulls the probe forward: the pull is counted in the
+/// new regime's (wider) interval.
+#[test]
+fn widening_still_pulls_the_probe_forward() {
+    let mut g = MtpGate::new(1);
+    run_mtp_until_probe(&mut g, 2, ms(50));
+    drive_serial(&mut g, WINDOW_STEPS, ms(40));
+    g.record_verify_step(ms(5), 6, 8);
     assert_eq!(
         g.next_step(),
         GateStep::MeasureDecode,

@@ -21,7 +21,8 @@
 //!
 //! The worker then commits each sequence exactly as the head's
 //! `k4_apply_verdict` does (`ep_worker_apply_verdict`: rewind, trim, commit
-//! the accepted SSM prefix, roll the PLE carry and the QSA ingest back). The
+//! the accepted SSM prefix, roll the PLE carry and the QSA ingest back; a
+//! one-row decode row commits its row and trims nothing). The
 //! head sends the verdicts once every row has been read and before any
 //! commit or re-propose, so nothing the worker waits on can interleave.
 
@@ -91,8 +92,9 @@ impl TransformerModel {
         slots: &mut [Option<SequenceState>],
     ) -> Result<bool> {
         let n = self.ep_broadcast_u32(0)? as usize;
+        // One sequence: a lone window past its own 4-row verify (`verify_rows.rs`).
         ensure!(
-            (2..=slots.len()).contains(&n),
+            (1..=slots.len()).contains(&n),
             "EP batched verify: {n} sequences for {} slots",
             slots.len()
         );
@@ -104,17 +106,19 @@ impl TransformerModel {
             .collect();
         let r_total: usize = ks.iter().sum();
         ensure!(
-            ks.iter().all(|k| (2..=32).contains(k)) && r_total <= super::verify_e2::VERIFY_ROW_CAP,
+            // 1 = a decode row; `decode_verify_batched_dispatch` holds the
+            // batch to this rank's own row-count gate.
+            ks.iter().all(|k| (1..=32).contains(k)) && r_total <= super::verify_e2::VERIFY_ROW_CAP,
             "EP batched verify: rows {ks:?}"
         );
         let tokens = self.ep_broadcast_tokens(&vec![0u32; r_total])?;
 
         let mut refs = self.ep_worker_slot_refs(&seq_ids, slots)?;
         let stream = self.gpu.default_stream();
-        self.sync_secondary_dispatch()?;
+        self.wait_secondary_dispatch()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         for (seq, &k) in refs.iter_mut().zip(&ks) {
-            self.mark_gdn_deferred_commit(seq, k);
+            self.mark_gdn_deferred_commit(seq, k)?;
         }
         self.decode_verify_batched_dispatch(&tokens, &ks, &mut refs, stream)?;
 

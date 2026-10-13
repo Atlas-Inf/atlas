@@ -51,10 +51,16 @@ impl QsaIndexer {
         let off = buf.len();
         buf.resize(off + pooled_bytes + tail_bytes, 0);
         if pooled_bytes > 0 {
-            gpu.copy_d2h_on_stream(st.block_keys, &mut buf[off..off + pooled_bytes], stream)?;
+            crate::layers::aux_d2h::copy(
+                gpu,
+                st.block_keys,
+                &mut buf[off..off + pooled_bytes],
+                stream,
+            )?;
         }
         if tail_bytes > 0 {
-            gpu.copy_d2h_on_stream(
+            crate::layers::aux_d2h::copy(
+                gpu,
                 self.raw_slot(st, tail_start),
                 &mut buf[off + pooled_bytes..],
                 stream,
@@ -239,7 +245,9 @@ mod tests {
         let gpu = MockGpuBackend::new();
         let qsa = indexer(&gpu);
         for base in 100..108 {
-            for rows in 1..=4 {
+            // Up to the exact lane's 8-row window (7 drafts): a rejection
+            // may un-pool two blocks.
+            for rows in 1..=8 {
                 for accepted in 0..=rows {
                     let after_verify = base + rows;
                     let mut st = state(&gpu, after_verify, after_verify / 4);

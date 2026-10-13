@@ -111,3 +111,60 @@ fn bytes_per_token_is_the_pooled_share() {
     // hd 8, ratio 4: a 16 B pooled row per 4 tokens.
     assert_eq!(indexer(&gpu, 256).bytes_per_token(), 4);
 }
+
+/// With reuse, a released buffer comes back for the next request of the
+/// same size and only of the same size; without it, nothing is kept.
+#[test]
+fn released_carry_buffers_are_reused_by_size() {
+    let gpu = MockGpuBackend::new();
+    let a = carry_alloc_via(&gpu, 4096, true).unwrap();
+    carry_free_via(&gpu, a, 4096, true, SPARE_MAX).unwrap();
+    let other = carry_alloc_via(&gpu, 8192, true).unwrap();
+    assert_ne!(other, a, "a different size never takes a spare");
+    assert_eq!(
+        carry_alloc_via(&gpu, 4096, true).unwrap(),
+        a,
+        "same size reuses"
+    );
+    carry_free_via(&gpu, a, 4096, false, SPARE_MAX).unwrap();
+    assert!(
+        SPARE.with(|s| s.borrow().is_empty()),
+        "off: freed, not kept"
+    );
+    carry_free_via(&gpu, other, 8192, true, SPARE_MAX).unwrap();
+    assert_eq!(SPARE.with(|s| s.borrow().len()), 1);
+    SPARE.with(|s| s.borrow_mut().clear());
+}
+
+/// The spare cap bounds what a thread keeps; past it a release frees. A
+/// cap covering a whole wave (`ATLAS_QWEN4EXP_QSA_SPARE_MAX`) serves every
+/// next-wave request of a kept size from the spares.
+#[test]
+fn the_spare_cap_bounds_what_is_kept() {
+    assert_eq!(parse_spare_max(None), SPARE_MAX);
+    assert_eq!(parse_spare_max(Some("288".into())), 288);
+    assert_eq!(parse_spare_max(Some("x".into())), SPARE_MAX);
+    let gpu = MockGpuBackend::new();
+    SPARE.with(|s| s.borrow_mut().clear());
+    let wave: Vec<_> = (0..6)
+        .map(|_| carry_alloc_via(&gpu, 4096, true).unwrap())
+        .collect();
+    for &p in &wave {
+        carry_free_via(&gpu, p, 4096, true, 4).unwrap();
+    }
+    assert_eq!(SPARE.with(|s| s.borrow().len()), 4, "cap 4 keeps 4");
+    assert_eq!(gpu.alloc_count(), 4, "the other 2 were freed");
+    SPARE.with(|s| s.borrow_mut().clear());
+    let wave: Vec<_> = (0..6)
+        .map(|_| carry_alloc_via(&gpu, 4096, true).unwrap())
+        .collect();
+    for &p in &wave {
+        carry_free_via(&gpu, p, 4096, true, 6).unwrap();
+    }
+    let allocs = gpu.alloc_count();
+    for _ in 0..6 {
+        carry_alloc_via(&gpu, 4096, true).unwrap();
+    }
+    assert_eq!(gpu.alloc_count(), allocs, "a whole wave served from spares");
+    SPARE.with(|s| s.borrow_mut().clear());
+}

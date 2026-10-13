@@ -192,7 +192,8 @@ extern "C" __global__ void moe_expert_gate_up_shared(
 // blockIdx.y < top_k: routed expert (pointer table + expert_gate_out/up_out)
 // blockIdx.y == top_k: shared expert (direct pointers + sh_gate_in/up_in)
 // Grid: (ceil(N/8), top_k+1, 1)  Block: (128, 1, 1)
-extern "C" __global__ void moe_expert_silu_down_shared(
+template <bool CLAMP>
+__device__ __forceinline__ void moe_expert_silu_down_shared_body(
     const __nv_bfloat16* __restrict__ gate_out,
     const __nv_bfloat16* __restrict__ up_out,
     const unsigned long long* __restrict__ packed_ptrs,
@@ -304,7 +305,7 @@ extern "C" __global__ void moe_expert_silu_down_shared(
     for (unsigned int i = threadIdx.x; i < K; i += BLOCK_SIZE) {
         float gf = __bfloat162float(g_ptr[i]);
         float uf = __bfloat162float(u_ptr[i]);
-        if (!is_shared) {
+        if (CLAMP && !is_shared) {
             gf = fminf(gf, SWIGLU_LIMIT);
             uf = fminf(fmaxf(uf, -SWIGLU_LIMIT), SWIGLU_LIMIT);
         }
@@ -361,4 +362,35 @@ extern "C" __global__ void moe_expert_silu_down_shared(
             acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
         if (lane == 0) out[n2] = __float2bfloat16(acc2);
     }
+}
+
+
+#define MOE_SILU_DOWN_SHARED_ARGS                                              \
+    const __nv_bfloat16* __restrict__ gate_out,                                \
+    const __nv_bfloat16* __restrict__ up_out,                                  \
+    const unsigned long long* __restrict__ packed_ptrs,                        \
+    const unsigned long long* __restrict__ scale_ptrs,                         \
+    const float* __restrict__ scale2_vals, __nv_bfloat16* __restrict__ C,      \
+    const unsigned int* __restrict__ expert_indices,                           \
+    const __nv_bfloat16* __restrict__ sh_gate_in,                              \
+    const __nv_bfloat16* __restrict__ sh_up_in,                                \
+    const unsigned char* __restrict__ sh_down_packed,                          \
+    const unsigned char* __restrict__ sh_down_scale, float sh_down_s2,         \
+    __nv_bfloat16* __restrict__ sh_down_out,                                   \
+    unsigned int N, unsigned int K, unsigned int top_k
+#define MOE_SILU_DOWN_SHARED_PASS                                              \
+    gate_out, up_out, packed_ptrs, scale_ptrs, scale2_vals, C, expert_indices, \
+    sh_gate_in, sh_up_in, sh_down_packed, sh_down_scale, sh_down_s2,           \
+    sh_down_out, N, K, top_k
+
+extern "C" __global__ void moe_expert_silu_down_shared(MOE_SILU_DOWN_SHARED_ARGS) {
+    moe_expert_silu_down_shared_body<true>(MOE_SILU_DOWN_SHARED_PASS);
+}
+
+// The same kernel without the routed SwiGLU clamp, for qwen4_exp under
+// ATLAS_QWEN4EXP_MOE_NO_CLAMP: its checkpoint declares no swiglu_limit (the
+// vLLM reference's MoE is plain SiLU), and its prefill, K=2 / K=3 and `_t`
+// arms never clamped.
+extern "C" __global__ void moe_expert_silu_down_shared_noclamp(MOE_SILU_DOWN_SHARED_ARGS) {
+    moe_expert_silu_down_shared_body<false>(MOE_SILU_DOWN_SHARED_PASS);
 }

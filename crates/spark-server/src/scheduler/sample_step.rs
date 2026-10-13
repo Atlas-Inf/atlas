@@ -128,8 +128,7 @@ pub(super) fn effective_min_p(
 ///    per-token `seed` and the base `logit_bias` (`ActiveSeq.logit_bias`,
 ///    cloned) it computed for this step.
 ///  * `Verify` → the MTP verify/bootstrap emission is a penalty-aware
-///    greedy ARGMAX, so callers pass `temperature = 0.0`, `seed = None`,
-///    empty base bias.
+///    greedy ARGMAX: [`verify_penalty_params`].
 pub(super) fn penalty_params_for(
     a: &ActiveSeq,
     kind: PositionKind,
@@ -147,6 +146,13 @@ pub(super) fn penalty_params_for(
     )
 }
 
+/// The params of a verify or bootstrap position: plain decode's at
+/// temperature 0, the request's `logit_bias` included (verify used to drop
+/// it, so a biased request picked differently speculating than decoding).
+pub(super) fn verify_penalty_params(a: &ActiveSeq) -> SamplingParams {
+    penalty_params_for(a, PositionKind::Verify, 0.0, None, a.logit_bias.clone())
+}
+
 /// Shared parameter construction with the already-resolved model floor.
 /// The production wrapper reads its existing boot-installed value; tests can
 /// exercise another model's policy without changing that process-wide value.
@@ -159,13 +165,12 @@ pub(super) fn penalty_params_for_with_floor(
     floor: u32,
 ) -> SamplingParams {
     // `Verify` positions are a penalty-aware greedy ARGMAX, so the contract
-    // is temperature 0.0, no seed, no caller-supplied base bias. Pin it so a
-    // future caller can't silently pass stochastic params on the speculative
-    // path. The A4 floor below is appended for BOTH kinds (intended delta).
+    // is temperature 0.0 and no seed. Pin it so a future caller can't silently
+    // pass stochastic params on the speculative path. The A4 floor below is
+    // appended for BOTH kinds (intended delta).
     debug_assert!(
-        kind != PositionKind::Verify
-            || (temperature == 0.0 && seed.is_none() && base_logit_bias.is_empty()),
-        "Verify positions must pass temperature=0.0, seed=None, empty base bias"
+        kind != PositionKind::Verify || (temperature == 0.0 && seed.is_none()),
+        "Verify positions must pass temperature=0.0, seed=None"
     );
     let in_tool = a.inside_tool_body && !a.inside_thinking;
     let mut logit_bias = base_logit_bias;
@@ -373,22 +378,9 @@ pub fn sample_token(
         }
     }
     if temperature == 0.0 {
-        // Greedy argmax over FP32.
-        //
-        // ★ LAST-WINS on exact ties: `max_by` returns the last of several equal
-        // maxima. The verify path's `argmax_*` kernels resolve ties to the
-        // lowest LANE (see review note 1 on the #23 thread), so at an exact tie
-        // a greedy sample here and a greedy verify pick can differ. Kept as-is
-        // because it matches the record tree — the point of this comment is
-        // that the engine is NOT uniformly first-wins, so a future tie
-        // investigation should not assume it is.
-        let best = f32_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
-        return Ok(best);
+        // Greedy argmax over FP32; exact ties go to the lowest index, the
+        // engine-wide rule (`argmax_first_wins_f32`).
+        return Ok(spark_runtime::sampler::argmax_first_wins_f32(&f32_logits));
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
@@ -518,16 +510,7 @@ pub fn sample_token_with_grammar(
     // output-token history — identical stage to the non-MTP path.
     apply_penalties_and_bias(&mut f32_logits, penalties, history);
     if temperature == 0.0 {
-        // LAST-WINS on exact ties, same as the suppress-ids branch above —
-        // and same caveat: the verify kernels are lowest-lane-wins, so this is
-        // not a shared tie contract across the engine.
-        let best = f32_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
-        return Ok(best);
+        return Ok(spark_runtime::sampler::argmax_first_wins_f32(&f32_logits));
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };

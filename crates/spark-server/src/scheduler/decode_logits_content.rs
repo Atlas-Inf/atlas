@@ -80,7 +80,9 @@ fn describe_content_token_loop(
 ///
 /// `model` is needed by the Phase-C boundary rollback so it can restore
 /// SSM recurrent state on hybrid models (see
-/// [`super::rollback::rollback_to_boundary`]).
+/// [`super::rollback::rollback_to_boundary`]). `steered` says this pick
+/// was steered off the loop the output ends in ([`super::loop_steer`]), so
+/// the content-loop watchdog leaves it alone.
 ///
 /// Returns `true` when a watchdog rolled the sequence back. The caller's
 /// current token was sampled from the context that was just discarded, and
@@ -93,6 +95,7 @@ pub fn handle_content_token(
     a: &mut ActiveSeq,
     model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
+    steered: bool,
 ) -> bool {
     a.consume_generation_budget();
     a.content_started = true;
@@ -163,6 +166,8 @@ pub fn handle_content_token(
         && watchdog_floor_reached(a.output_tokens.len().saturating_add(1), a.min_tokens)
         && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
         && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
+        // This pick was steered off the loop the tail ends in (`loop_steer`).
+        && !steered
         && (detect_content_token_loop_with(&a.output_tokens, loop_params)
             || sched.masks.numeric.as_deref().is_some_and(|m| {
                 detect_content_token_loop_normalized_with(

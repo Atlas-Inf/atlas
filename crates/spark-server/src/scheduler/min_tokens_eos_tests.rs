@@ -56,7 +56,6 @@ pub(super) fn step(a: ActiveSeq, serial: bool, sched: &SchedCtx) -> ActiveSeq {
             None,
             None,
             None,
-            None,
             false,
             sched,
         );

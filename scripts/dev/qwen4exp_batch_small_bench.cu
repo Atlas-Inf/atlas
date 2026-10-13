@@ -23,8 +23,8 @@
 //                 verify arm per sequence and token: causal_conv1d_update_
 //                 l2norm_f32, conv state -> rollback slot, gated_delta_rule_
 //                 decode_f32, gated_rms_norm_f32_input_sigmoid, H -> rollback
-//                 slot (slots for tokens 0..k-2); 1..12 sequences, k = 2..4
-//                 and ragged 1..4; normed rows, final states and every slot.
+//                 slot (slots for tokens 0..k-2); 1..12 sequences, k = 2..8
+//                 and ragged 1..8; normed rows, final states and every slot.
 //   mHC / MoE     the decode-fuse seam hc_post_stage_vec and EP tail
 //                 moe_blend_hc_post at T = 1..8 rows vs hc_post_vec +
 //                 hc_pre_stage_vec and moe_batched_blend + hc_post_vec.
@@ -379,7 +379,7 @@ static bool gdn_check(const GdnShape& s, int steps) {
 // Sequence s owns rows row0..row0+k-1 of the step (ragged k). The exact arm
 // per token: conv kernel on the live conv state, conv state -> rollback slot
 // t (t < k-1), recurrence on the live H, gated norm, H -> rollback slot t.
-static const u32 KMAX = 4;
+static const u32 KMAX = 8;  // QDF_VERIFY_KMAX: up to 7 drafts
 struct VerifySeq {
     GdnSeq st;
     Buf<float> h_snap[KMAX - 1], conv_snap[KMAX - 1];
@@ -501,7 +501,7 @@ static bool verify_check(const GdnShape& s, int steps) {
                 CK(cudaDeviceSynchronize());
                 char what[160];
                 snprintf(what, sizeof what, "%s verify n=%u %s step %d: normed rows", s.name, nseq,
-                         ragged ? "ragged" : "k=2..4", st);
+                         ragged ? "ragged" : "k=2..8", st);
                 bad += !same(what, ia.out, ib.out, ia.out.n);
                 for (u32 i = 0; i < nseq; i++) {
                     snprintf(what, sizeof what, "%s verify n=%u step %d seq %u (k=%u): recurrence", s.name, nseq, st, i, a[i].k);
@@ -523,9 +523,9 @@ static bool verify_check(const GdnShape& s, int steps) {
             }
         }
     }
-    printf("  %s qwen4exp_gdn_verify_fused_rows %s: n = 1, 2, 3, 5, 8, 12 sequences x k = 2..4 and "
-           "ragged 1..4 x %d steps, every normed row and every recurrence / conv / rollback-slot byte "
-           "equal to the exact arm's per-token chain\n", bad ? "BAD" : "ok ", s.name, steps);
+    printf("  %s qwen4exp_gdn_verify_fused_rows %s: n = 1, 2, 3, 5, 8, 12 sequences x k = 2..%u and "
+           "ragged 1..%u x %d steps, every normed row and every recurrence / conv / rollback-slot byte "
+           "equal to the exact arm's per-token chain\n", bad ? "BAD" : "ok ", s.name, KMAX, KMAX, steps);
     return bad == 0;
 }
 
@@ -821,6 +821,8 @@ static void rec_time(const GdnShape& s) {
     }
 }
 
+// qwen4exp_gdn_defer_bench.cu includes this file for its GDN fixtures.
+#ifndef QB_SMALL_NO_MAIN
 int main(int argc, char** argv) {
     if (argc > 1) g_dir = argv[1];
     const std::string mode = argc > 2 ? argv[2] : "check";
@@ -848,3 +850,4 @@ int main(int argc, char** argv) {
     rec_time(tp2);
     return 0;
 }
+#endif  // QB_SMALL_NO_MAIN

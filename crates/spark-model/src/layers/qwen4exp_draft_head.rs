@@ -22,13 +22,16 @@
 //! GB10, `scripts/dev/qwen4exp_exact_verify_bench.cu`): 5.21 ms at the full
 //! 248,320 rows, 2.1 ms at the 100k default prefix, 0.99 ms at 47k.
 //!
-//! Rank 0 drafts alone (`weight_loader/qwen4_exp/mtp.rs`), so nothing here is
-//! rank-coupled.
+//! Rank 0 drafts (`weight_loader/qwen4_exp/mtp.rs`). Under
+//! `ATLAS_QWEN4EXP_MTP_DRAFT_TP` the worker builds the same head from its own
+//! copy of the LM head and projects half of its rows
+//! ([`DraftHead::project_rows_range`], `qwen4exp_mtp_tp.rs`).
 
 use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layers::ops;
+use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 const BF16: usize = 2;
@@ -42,6 +45,11 @@ pub struct DraftHead {
     bf16: DenseWeight,
     nvfp4: Option<QuantizedWeight>,
     w4a16_gemv_k: KernelHandle,
+    /// The NVFP4 copy's multi-row tiers (`project_rows`): scalar
+    /// `w4a16_gemv_batch{M}`, row `r` byte-identical to `w4a16_gemv`.
+    w4a16_tiers: W4a16BatchmTiers,
+    /// `ATLAS_QWEN4EXP_W4_ROWS`: the persistent 4..8-row tier for the copy.
+    w4_rows: ops::Qwen4ExpW4Rows,
 }
 
 impl DraftHead {
@@ -53,6 +61,18 @@ impl DraftHead {
         prefix: u32,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
+        Self::build_with(lm_head, vocab, hidden, prefix, nvfp4_requested(), gpu)
+    }
+
+    /// [`Self::build`] with the NVFP4 copy chosen by the caller.
+    pub fn build_with(
+        lm_head: &DenseWeight,
+        vocab: usize,
+        hidden: usize,
+        prefix: u32,
+        want_nvfp4: bool,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
         let list = match std::env::var("ATLAS_QWEN4EXP_DRAFT_VOCAB") {
             Ok(path) if !path.is_empty() => {
                 let text = std::fs::read_to_string(&path)
@@ -62,7 +82,6 @@ impl DraftHead {
             _ => None,
         };
         let stream = gpu.default_stream();
-        let want_nvfp4 = std::env::var("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4").as_deref() == Ok("1");
         let (ids, rows, bf16) = match list {
             Some(ids) => {
                 let rows = ids.len();
@@ -131,12 +150,27 @@ impl DraftHead {
             } else {
                 KernelHandle(0)
             },
+            w4a16_tiers: if want_nvfp4 {
+                W4a16BatchmTiers::resolve(gpu)
+            } else {
+                W4a16BatchmTiers::default()
+            },
+            w4_rows: if want_nvfp4 {
+                ops::Qwen4ExpW4Rows::resolve(gpu)
+            } else {
+                ops::Qwen4ExpW4Rows::OFF
+            },
         })
     }
 
     /// Rows a draft step projects (the argmax width).
     pub fn rows(&self) -> u32 {
         self.rows
+    }
+
+    /// Whether the draft rows are the NVFP4 copy.
+    pub fn is_nvfp4(&self) -> bool {
+        self.nvfp4.is_some()
     }
 
     /// Project `input` (`[hidden]` BF16) onto the draft rows, into `logits`.
@@ -173,10 +207,136 @@ impl DraftHead {
         }
     }
 
+    /// Whether [`Self::project_rows`] can serve `m` rows, and every draft row
+    /// IS its token id, so a device argmax is already the drafted token
+    /// (the batched propose embeds it without a host round trip). A gathered
+    /// id list (`ATLAS_QWEN4EXP_DRAFT_VOCAB`) would need a device remap, so
+    /// it keeps the per-sequence path.
+    pub fn rows_batchable(&self, m: usize, dense_batchm_k: KernelHandle) -> bool {
+        self.ids.is_none()
+            && match self.nvfp4 {
+                Some(_) => self.w4a16_tiers.scalar_kernel(m as u32).0 != 0,
+                None => dense_batchm_k.0 != 0 && m as u32 <= ops::DENSE_GEMV_BATCHM_MAX_M,
+            }
+    }
+
+    /// [`Self::project`] for `m` contiguous `[hidden]` input rows into `m`
+    /// contiguous `[rows]` logit rows, the head read once. Row `r` is
+    /// byte-identical to `project` on that row alone: `dense_gemv_bf16_batchm`
+    /// equals `dense_gemv_bf16` per row, the scalar `w4a16_gemv_batch{M}`
+    /// tiers equal `w4a16_gemv`. Gate on [`Self::rows_batchable`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        dense_batchm_k: KernelHandle,
+        input: DevicePtr,
+        logits: DevicePtr,
+        m: u32,
+        hidden: u32,
+        stream: u64,
+    ) -> Result<()> {
+        self.project_rows_range(
+            gpu,
+            dense_batchm_k,
+            input,
+            logits,
+            m,
+            (0, self.rows),
+            hidden,
+            stream,
+        )
+    }
+
+    /// [`Self::project_rows`] onto draft rows `first .. first + n` only, into
+    /// `m` output rows `n` apart: output column `c` is column `first + c` of
+    /// `project_rows`, byte for byte (each column is its weight row against
+    /// the input row; the kernels' arithmetic for a column depends on neither
+    /// its position nor the column count). A pointer offset into the rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_rows_range(
+        &self,
+        gpu: &dyn GpuBackend,
+        dense_batchm_k: KernelHandle,
+        input: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        (first, n): (u32, u32),
+        hidden: u32,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            n > 0 && first.checked_add(n).is_some_and(|end| end <= self.rows),
+            "draft head rows {first}..+{n} outside 0..{}",
+            self.rows
+        );
+        match self.nvfp4.as_ref() {
+            Some(q) => {
+                let w = q.rows_from(first as usize, hidden as usize);
+                self.w4_rows
+                    .launch_or(gpu, input, &w, out, (m, n, hidden), stream, || {
+                        ops::w4a16_gemv_batchm(
+                            gpu,
+                            self.w4a16_tiers.scalar_kernel(m),
+                            input,
+                            &w,
+                            out,
+                            m,
+                            n,
+                            hidden,
+                            stream,
+                        )
+                    })
+            }
+            None => ops::dense_gemv_batchm(
+                gpu,
+                dense_batchm_k,
+                input,
+                &DenseWeight {
+                    weight: self
+                        .bf16
+                        .weight
+                        .offset(first as usize * hidden as usize * BF16),
+                },
+                out,
+                m,
+                n,
+                hidden,
+                n,
+                stream,
+            ),
+        }
+    }
+
     /// Full-vocabulary id of draft row `row`.
     pub fn token(&self, row: u32) -> u32 {
         self.ids.as_ref().map_or(row, |ids| ids[row as usize])
     }
+
+    /// The draft row of full-vocabulary id `id`, if the head projects it
+    /// (the inverse of [`Self::token`]).
+    pub fn row_of(&self, id: u32) -> Option<u32> {
+        row_of(self.ids.as_deref(), self.rows, id)
+    }
+}
+
+/// [`DraftHead::row_of`] over a head's id list (`None` = row `i` is id `i`)
+/// and row count.
+fn row_of(ids: Option<&[u32]>, rows: u32, id: u32) -> Option<u32> {
+    match ids {
+        Some(ids) => ids.binary_search(&id).ok().map(|r| r as u32),
+        None => (id < rows).then_some(id),
+    }
+}
+
+/// `ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4=1`: draft from an NVFP4 copy of the rows.
+pub fn nvfp4_requested() -> bool {
+    std::env::var("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4").as_deref() == Ok("1")
+}
+
+/// `ATLAS_QWEN4EXP_DRAFT_VOCAB`: an explicit draft id list is named.
+pub fn list_requested() -> bool {
+    std::env::var("ATLAS_QWEN4EXP_DRAFT_VOCAB").is_ok_and(|p| !p.is_empty())
 }
 
 /// Parse a draft id list: decimal ids separated by whitespace or commas,
@@ -281,6 +441,17 @@ mod tests {
         assert!(parse_ids("11", 11).is_err());
         assert!(parse_ids("x", 11).is_err());
         assert!(parse_ids("# nothing\n", 11).is_err());
+    }
+
+    #[test]
+    fn row_of_inverts_the_draft_rows() {
+        // The default 100k prefix holds no Qwen end token (<|im_end|> 248046).
+        assert_eq!(row_of(None, 100_000, 248_046), None);
+        assert_eq!(row_of(None, 100_000, 99_999), Some(99_999));
+        // A list maps an id to its sorted row, or to nothing.
+        let ids = [0u32, 3, 5, 248_044, 248_046];
+        assert_eq!(row_of(Some(&ids), 5, 248_046), Some(4));
+        assert_eq!(row_of(Some(&ids), 5, 248_045), None);
     }
 
     #[test]

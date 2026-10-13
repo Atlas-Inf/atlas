@@ -168,6 +168,8 @@ pub struct TransformerModel {
     /// at decode: reads the ~617 MB vocab weight once with coalesced uint4
     /// loads, vs the scalar dense_gemm_bf16 (16x16 FFMA, ~89 GB/s). 0 = absent.
     pub(super) dense_gemv_batchm_kernel: KernelHandle,
+    /// Its 16/32-row twins under `ATLAS_QWEN4EXP_BATCH_FAST` (the exact head).
+    pub(super) qwen4exp_wide_rows: crate::layers::ops::Qwen4ExpWideRows,
     pub(super) argmax_kernel: KernelHandle,
     /// Batched argmax (one block per row). 0 when the kernel set lacks it.
     pub(super) argmax_batch_kernel: KernelHandle,
@@ -231,10 +233,10 @@ pub struct TransformerModel {
     pub(super) suppress_graphs: std::sync::atomic::AtomicBool,
     /// MTP draft proposer (built from mtp_weights at init).
     pub(super) proposer: Option<Arc<dyn DraftProposer>>,
-    /// `ATLAS_GLM_DRAFT_TP`: the worker rank's copy of the DFlash drafter,
-    /// which serves its half of a split propose (`draft_assist`). `None` on
-    /// the head and when the split is off.
-    pub(super) draft_assist: Option<Arc<crate::layers::BlockDiffusionDraftHead>>,
+    /// `ATLAS_GLM_DRAFT_TP` / `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the worker
+    /// rank's copy of the drafter, which serves its part of a split propose
+    /// (`draft_assist`). `None` on the head and when the split is off.
+    pub(super) draft_assist: Option<Arc<dyn super::draft_assist::DraftAssist>>,
     /// Immutable typed identity for the admitted official Lightning product.
     /// `None` for generic DFlash, MTP, and non-speculative models.
     pub(super) lightning_dspark_identity: LightningDsparkIdentityLatch,
@@ -370,6 +372,10 @@ pub struct TransformerModel {
     /// Kill switch `ATLAS_NO_VERIFY_WY_CACHE` (PRESENCE) restores the
     /// unconditional re-stage.
     pub(super) verify_wy_cache: Mutex<Option<Vec<u64>>>,
+    /// `ATLAS_QWEN4EXP_VERIFY_BT_PINNED=1`: page-locked staging for the
+    /// batched verify's block-table image (`model/pinned_upload.rs`). Empty
+    /// until the first such upload; freed in `Drop`.
+    pub(super) verify_bt_stage: Mutex<super::pinned_upload::PinnedUpload>,
     /// Cached CUDA graphs for DFlash K=γ verification, keyed by
     /// `(seq.slot_idx, K)`. K is `tokens.len()` (γ+1 typically). One graph
     /// per (slot, K) — different γ values coexist via the K dimension.
@@ -394,6 +400,8 @@ pub struct TransformerModel {
     pub(super) secondary_stream: u64,
     /// CUDA event for GPU-side inter-stream synchronization (avoids CPU-blocking sync).
     pub(super) secondary_event: u64,
+    /// `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE`: commits left for the next verify.
+    pub(super) gdn_fuse: super::trait_impl::gdn_commit_fuse::GdnFuse,
     /// CUDA event ordering SSM-snapshot SAVES (on the default stream) before a
     /// later warm Marconi RESTORE (on the prefill stream). Marconi saves
     /// (`decode_marconi_checkpoint`, `finish_leaf_snapshot`, prefill-time

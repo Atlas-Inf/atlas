@@ -610,7 +610,14 @@ pub fn build_model(
     // disk budget and the SSM tier's arena are all committed after this point.
     let nvme_record_bytes =
         PagedKvCache::nvme_record_bytes_for(&kv_config, glm_cache_plan.is_some(), sparse_index);
+    // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
+    // (`ssm_snapshot_budget`), 0 by default.
+    let snapshot_aux = crate::model::ssm_snapshot_budget::install(
+        &ssm_pools.snapshots,
+        layers.iter().map(|l| l.aux_bytes_per_token()).sum(),
+    );
     let reserve_net = reserve_net
+        + snapshot_aux
         + kv_nvme::host_reserve_bytes(nvme_record_bytes, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
@@ -909,6 +916,34 @@ pub fn build_model(
     // Same shape as 6b: the module holds a reused trunk layer, and the
     // proposer supplies the MTP-specific ends (the per-stream combiner in
     // front, the head mixer behind).
+    //
+    // ATLAS_QWEN4EXP_MTP_DRAFT_TP: on the TP2 pair the worker builds the same
+    // draft head and projects half of each batched propose's
+    // (`layers::qwen4exp_mtp::draft_tp`); it proposes nothing.
+    let (q4e_draft_tp, rank) = {
+        let c = model.config_ref();
+        let pair = c.tp_world_size == 2 && c.ep_world_size == 2;
+        let on = c.model_type == "qwen4_exp" && use_speculative && pair;
+        (
+            on && crate::layers::qwen4exp_mtp::draft_tp::requested()?,
+            c.ep_rank,
+        )
+    };
+    if q4e_draft_tp && rank != 0 {
+        let (vocab, hidden) = {
+            let c = model.config_ref();
+            (c.vocab_size, c.hidden_size)
+        };
+        let assist = crate::layers::qwen4exp_mtp::draft_tp::Qwen4ExpDraftAssist::new(
+            &q4e_mtp_lm_head,
+            vocab,
+            hidden,
+            mtp_vocab_size,
+            model.gpu_backend(),
+        )?;
+        model.set_draft_assist(std::sync::Arc::new(assist));
+        tracing::info!("qwen4_exp MTP draft head installed on rank {rank} to serve draft TP");
+    }
     if let Some(q4e_module) = q4e_mtp_module {
         match crate::layers::Qwen4ExpMtpHead::new(
             q4e_module,
@@ -918,7 +953,10 @@ pub fn build_model(
             mtp_vocab_size,
             max_seq_len,
         ) {
-            Ok(head) => {
+            Ok(mut head) => {
+                if q4e_draft_tp {
+                    head.enable_draft_tp(model.gpu_backend())?;
+                }
                 model.set_dflash_proposer(std::sync::Arc::new(head));
                 tracing::info!(
                     "qwen4_exp MTP speculative decoding: ENABLED (single module, \

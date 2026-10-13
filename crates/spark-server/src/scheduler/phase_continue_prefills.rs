@@ -109,7 +109,6 @@ pub(super) fn continue_in_progress_prefills(
     use_ngram_speculative: bool,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
-    code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
@@ -203,6 +202,33 @@ pub(super) fn continue_in_progress_prefills(
 
     let mut completed_indices = Vec::new();
 
+    // ATLAS_QWEN4EXP_PREFILL_MULTI: every waiting short prompt in one forward,
+    // before any other path (on a multi-rank model nothing else may run them).
+    if super::prefill_multi::run(
+        model,
+        sched,
+        prefilling,
+        active,
+        &mut completed_indices,
+        max_batch_tokens,
+        prefill_stream,
+        prefill_event,
+    ) {
+        promote_completed_prefills(
+            model,
+            prefilling,
+            completed_indices,
+            active,
+            think_end_token,
+            think_start_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            sched.limits.max_seq_len,
+            sched.limits.glm_tool_boundary,
+        );
+        return did_mixed_step;
+    }
+
     // Q12 batched-prefill paths. Two branches fire when 2+ streams are
     // prefilling concurrently (replaces the FIFO `prefilling.first_mut()`
     // advance — see qwen-refactor notes §6 for the asymmetric-TTFT
@@ -294,7 +320,6 @@ pub(super) fn continue_in_progress_prefills(
             t0_mixed,
             think_end_token,
             think_start_token,
-            code_fence_token,
             tool_call_start_token,
             tool_call_end_token,
             adaptive_sampling,
@@ -367,7 +392,10 @@ pub(super) fn continue_in_progress_prefills(
                         p.top_k,
                         p.top_p,
                         p.min_p,
-                        &p.eos_tokens,
+                        &crate::scheduler::min_tokens_ban::first_token_suppress(
+                            &p.eos_tokens,
+                            p.min_tokens,
+                        ),
                         p.grammar_state.as_mut(),
                         &sched.levers.sampling(),
                     ) {
@@ -410,7 +438,6 @@ pub(super) fn continue_in_progress_prefills(
                     use_ngram_speculative,
                     think_end_token,
                     think_start_token,
-                    code_fence_token,
                     tool_call_start_token,
                     tool_call_end_token,
                     adaptive_sampling,

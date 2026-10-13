@@ -470,7 +470,11 @@ qwen4exp_gdn_decode_fused_rows(
 // has loaded the old ones.
 //
 // Grid: (num_v_heads, sequences, 1) with clusters of QDF_REPEAT; block QDF_D.
-#define QDF_VERIFY_KMAX 4
+// 8 = the exact lane's deepest verify window (7 drafts, verify_rows.rs). The
+// token loop runs to the sequence's own k, so a k <= 4 sequence executes the
+// same instructions it did under KMAX 4; only the by-value table grows
+// (8 x 136 B).
+#define QDF_VERIFY_KMAX 8
 
 struct QdfVerifySeq {
     float* h;                                // [nv, 128, 128] FP32
@@ -560,6 +564,217 @@ qwen4exp_gdn_verify_fused_rows(
     #pragma unroll
     for (int j = 0; j < QDF_D; j++) {
         sq.h[head + j * QDF_D + tid] = H_reg[j];
+    }
+}
+
+// ── qwen4exp_gdn_verify_defer_rows + qwen4exp_gdn_commit_layers ──
+// (ATLAS_QWEN4EXP_EXACT_DEFER)
+//
+// The exact verify above writes, per sequence and layer, the recurrence state
+// after every token but the last (k - 1 rollback slots of nv x 128 x 128 FP32)
+// plus the final state, so the commit of an `n`-token accepted prefix is a
+// copy of slot n - 1. At C8 x K=4 that is 3 + 1 state writes per sequence and
+// layer inside the verify and a 56.6 MB copy per partially accepted sequence
+// after it -- most of the verify step's DRAM traffic.
+//
+// Deferred, the verify writes no state: `qwen4exp_gdn_verify_defer_rows` is
+// the kernel above with the slot and final stores removed and the token's
+// conv inputs (the raw BF16 Q|K|V channels) and its gate and beta staged per
+// sequence instead (a few KiB). The state stays at H0 and the windows before
+// the step. After the verdict `qwen4exp_gdn_commit_layers` replays the
+// accepted `n` tokens from there -- one launch per sequence over all its GDN
+// layers -- with the same functions the verify ran (`qdf_conv_step`,
+// `qdf_recur`) on the same inputs, so the state it stores is, byte for byte,
+// slot n - 1 (or the final state when n == k) of the storing kernel. Only the
+// gated norm, whose output the verify already produced, is skipped; it does
+// not feed the state. Both kernels are checked against the storing one by
+// scripts/dev/qwen4exp_batch_small_bench.cu (defer-check).
+//
+// Commit fused into the next verify (ATLAS_QWEN4EXP_GDN_COMMIT_FUSE): with
+// `fuse_n` set and the word it points at n > 0, the previous step's commit of
+// n accepted tokens is still pending -- `h` and `conv` hold the state before
+// that step and the staging holds its inputs. The verify first runs
+// `qwen4exp_gdn_commit_layers`' token loop on them (the same calls, the same
+// barriers, from the same loaded state), stores the committed recurrence and
+// windows exactly as that kernel does, then verifies its own rows from the
+// state still in registers -- the floats the unfused verify reloads from the
+// stored state. One state read and one write a step instead of the commit's
+// read and write plus the verify's read. The cluster barrier after the replay
+// also orders every block's reads of the old staging before the lead block
+// overwrites the q/k staging with this step's rows. A NULL `fuse_n` (switch
+// off) or n == 0 skips all of it: the kernel above, unchanged.
+struct QdfDeferSeq {
+    float* h;                      // [nv, 128, 128] FP32: H0 (written only by a fused commit)
+    float* conv;                   // [conv_dim, 4] FP32: the step's input windows (idem)
+    __nv_bfloat16* stage_qkv;      // [k, conv_dim] BF16: token t's raw Q | K | V channels
+    float* stage_gb;               // [k, 2 * nv] FP32: token t's gate | beta
+    unsigned int row0;             // first row of the step
+    unsigned int k;                // tokens, 1..QDF_VERIFY_KMAX
+    const unsigned int* fuse_n;    // the pending commit's accepted tokens, or NULL
+};
+
+struct QdfDeferRows {
+    QdfDeferSeq seq[QDF_ROWS_MAX];
+};
+
+extern "C" __global__ void __cluster_dims__(QDF_REPEAT, 1, 1) __launch_bounds__(QDF_D, 1)
+qwen4exp_gdn_verify_defer_rows(
+    const __grid_constant__ QdfDeferRows rows,
+    const __nv_bfloat16* __restrict__ qkvz,    // [rows, qkvz_stride]: Q|K|V|Z
+    const __nv_bfloat16* __restrict__ conv_w,  // [conv_dim, 4]
+    const float* __restrict__ gates,           // [rows, 2 * nv]: gate | beta
+    const __nv_bfloat16* __restrict__ norm_w,  // [128]
+    __nv_bfloat16* __restrict__ out,           // [rows, nv * 128]
+    const unsigned int num_k_heads,
+    const unsigned int num_v_heads,
+    const unsigned int head_dim,
+    const unsigned int qkvz_stride,
+    const float l2_eps,
+    const float eps
+) {
+    namespace cg = cooperative_groups;
+    const QdfDeferSeq& sq = rows.seq[blockIdx.y];
+    const unsigned int vh = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int kh = vh / (num_v_heads / num_k_heads);
+    const unsigned int key_dim = num_k_heads * QDF_D;
+    const unsigned long long conv_dim = 2ull * key_dim + num_v_heads * QDF_D;
+    const unsigned long long head = (unsigned long long)vh * QDF_D * QDF_D;
+    const bool lead = cg::this_cluster().block_rank() == 0;
+
+    float H_reg[QDF_D];
+    #pragma unroll
+    for (int j = 0; j < QDF_D; j++) {
+        H_reg[j] = sq.h[head + j * QDF_D + tid];
+    }
+    const unsigned int cq = kh * QDF_D + tid;
+    const unsigned int ck = key_dim + kh * QDF_D + tid;
+    const unsigned int cv = 2u * key_dim + vh * QDF_D + tid;
+    float wq[QDF_DCONV], wk[QDF_DCONV], wv[QDF_DCONV];
+    qdf_load_window(sq.conv + (unsigned long long)cq * QDF_DCONV, wq);
+    qdf_load_window(sq.conv + (unsigned long long)ck * QDF_DCONV, wk);
+    qdf_load_window(sq.conv + (unsigned long long)cv * QDF_DCONV, wv);
+
+    __shared__ float smem_k[QDF_D];
+    __shared__ float smem_q[QDF_D];
+    const unsigned int n_prev = sq.fuse_n ? *sq.fuse_n : 0u;
+    if (n_prev > QDF_VERIFY_KMAX) __trap();  // the host commits at most k <= KMAX
+    if (n_prev) {
+        // `qwen4exp_gdn_commit_layers`, verbatim, on the previous step's staging.
+        for (unsigned int t = 0; t < n_prev; t++) {
+            const __nv_bfloat16* sqkv = sq.stage_qkv + (unsigned long long)t * conv_dim;
+            const float* sg = sq.stage_gb + (unsigned long long)t * 2u * num_v_heads;
+            const float v_i = qdf_conv_step(wq, wk, wv, sqkv, cq, ck, cv, conv_w, smem_q, smem_k, l2_eps);
+            __syncthreads();
+            (void)qdf_recur(H_reg, smem_k, smem_q, sg[vh], sg[num_v_heads + vh], v_i, head_dim);
+            __syncthreads();
+        }
+        cg::this_cluster().sync();
+        if (lead) {
+            qdf_store_window(sq.conv + (unsigned long long)cq * QDF_DCONV, wq);
+            qdf_store_window(sq.conv + (unsigned long long)ck * QDF_DCONV, wk);
+        }
+        qdf_store_window(sq.conv + (unsigned long long)cv * QDF_DCONV, wv);
+        #pragma unroll
+        for (int j = 0; j < QDF_D; j++) {
+            sq.h[head + j * QDF_D + tid] = H_reg[j];
+        }
+    }
+    for (unsigned int t = 0; t < sq.k; t++) {
+        const unsigned long long row = sq.row0 + t;
+        const __nv_bfloat16* qkv = qkvz + row * qkvz_stride;
+        const float* g = gates + row * 2u * num_v_heads;
+        // Stage what the commit replays: the cluster's lead the key head's
+        // q/k channels (all three blocks read the same), every block its v.
+        __nv_bfloat16* st = sq.stage_qkv + (unsigned long long)t * conv_dim;
+        if (lead) {
+            st[cq] = qkv[cq];
+            st[ck] = qkv[ck];
+        }
+        st[cv] = qkv[cv];
+        if (tid == 0) {
+            float* gb = sq.stage_gb + (unsigned long long)t * 2u * num_v_heads;
+            gb[vh] = g[vh];
+            gb[num_v_heads + vh] = g[num_v_heads + vh];
+        }
+        const float v_i = qdf_conv_step(wq, wk, wv, qkv, cq, ck, cv, conv_w, smem_q, smem_k, l2_eps);
+        __syncthreads();  // every smem_k / smem_q entry before the dots read them
+        const float x = qdf_recur(H_reg, smem_k, smem_q, g[vh], g[num_v_heads + vh], v_i, head_dim);
+        qdf_gated_norm(x, qkv + conv_dim + vh * QDF_D, norm_w,
+                       out + row * num_v_heads * QDF_D + vh * QDF_D, head_dim, eps);
+    }
+}
+
+// One GDN layer of one sequence for the commit: its live state (H0 and the
+// windows, updated in place) and what the deferred verify staged for it.
+struct QdfCommitLayer {
+    float* h;                           // [nv, 128, 128] FP32
+    float* conv;                        // [conv_dim, 4] FP32
+    const __nv_bfloat16* stage_qkv;     // [n, conv_dim] BF16
+    const float* stage_gb;              // [n, 2 * nv] FP32
+    const __nv_bfloat16* conv_w;        // this layer's [conv_dim, 4]
+};
+
+#define QDF_COMMIT_LAYERS 48
+
+struct QdfCommitLayers {
+    QdfCommitLayer layer[QDF_COMMIT_LAYERS];
+};
+
+// Grid: (num_v_heads, layers, 1) with clusters of QDF_REPEAT; block QDF_D.
+extern "C" __global__ void __cluster_dims__(QDF_REPEAT, 1, 1) __launch_bounds__(QDF_D, 1)
+qwen4exp_gdn_commit_layers(
+    const __grid_constant__ QdfCommitLayers layers,
+    const unsigned int n_tokens,               // the accepted prefix, 1..k
+    const unsigned int num_k_heads,
+    const unsigned int num_v_heads,
+    const unsigned int head_dim,
+    const float l2_eps
+) {
+    namespace cg = cooperative_groups;
+    const QdfCommitLayer& L = layers.layer[blockIdx.y];
+    const unsigned int vh = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int kh = vh / (num_v_heads / num_k_heads);
+    const unsigned int key_dim = num_k_heads * QDF_D;
+    const unsigned long long conv_dim = 2ull * key_dim + num_v_heads * QDF_D;
+    const unsigned long long head = (unsigned long long)vh * QDF_D * QDF_D;
+    const bool lead = cg::this_cluster().block_rank() == 0;
+
+    float H_reg[QDF_D];
+    #pragma unroll
+    for (int j = 0; j < QDF_D; j++) {
+        H_reg[j] = L.h[head + j * QDF_D + tid];
+    }
+    const unsigned int cq = kh * QDF_D + tid;
+    const unsigned int ck = key_dim + kh * QDF_D + tid;
+    const unsigned int cv = 2u * key_dim + vh * QDF_D + tid;
+    float wq[QDF_DCONV], wk[QDF_DCONV], wv[QDF_DCONV];
+    qdf_load_window(L.conv + (unsigned long long)cq * QDF_DCONV, wq);
+    qdf_load_window(L.conv + (unsigned long long)ck * QDF_DCONV, wk);
+    qdf_load_window(L.conv + (unsigned long long)cv * QDF_DCONV, wv);
+
+    __shared__ float smem_k[QDF_D];
+    __shared__ float smem_q[QDF_D];
+    for (unsigned int t = 0; t < n_tokens; t++) {
+        const __nv_bfloat16* qkv = L.stage_qkv + (unsigned long long)t * conv_dim;
+        const float* g = L.stage_gb + (unsigned long long)t * 2u * num_v_heads;
+        const float v_i = qdf_conv_step(wq, wk, wv, qkv, cq, ck, cv, L.conv_w, smem_q, smem_k, l2_eps);
+        __syncthreads();
+        (void)qdf_recur(H_reg, smem_k, smem_q, g[vh], g[num_v_heads + vh], v_i, head_dim);
+        __syncthreads();  // the dots have read smem_k / smem_q before the next token's conv
+    }
+
+    // Every block of the key head has loaded the old q/k windows.
+    cg::this_cluster().sync();
+    if (lead) {
+        qdf_store_window(L.conv + (unsigned long long)cq * QDF_DCONV, wq);
+        qdf_store_window(L.conv + (unsigned long long)ck * QDF_DCONV, wk);
+    }
+    qdf_store_window(L.conv + (unsigned long long)cv * QDF_DCONV, wv);
+    #pragma unroll
+    for (int j = 0; j < QDF_D; j++) {
+        L.h[head + j * QDF_D + tid] = H_reg[j];
     }
 }
 

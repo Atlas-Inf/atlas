@@ -13,7 +13,7 @@ const POST_THINK_MIN_CONTENT: u32 = 16;
 /// auto-tools request answering a preceding tool result must be able to end
 /// with a short plain-text answer. Required calls and actually opened,
 /// incomplete calls still keep the post-thinking guard armed.
-pub(super) fn should_suppress_post_think_eos(
+pub(in crate::scheduler) fn should_suppress_post_think_eos(
     a: &ActiveSeq,
     post_think_content_tokens: u32,
 ) -> bool {

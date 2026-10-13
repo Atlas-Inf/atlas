@@ -41,6 +41,12 @@ impl StreamingToolDetector {
         self.promote_bare_names = on;
     }
 
+    /// Poolside v1 mode: the call's arguments are buffered until
+    /// `</tool_call>`, so its header can wait for them too.
+    pub fn promotes_bare_names(&self) -> bool {
+        self.promote_bare_names
+    }
+
     /// Reset the detector state. Called when thinking→content transition occurs
     /// to prevent thinking-era tag fragments from corrupting tool detection.
     /// Preserves `tools` / `buffer_args` (request-scoped config, not per-call).

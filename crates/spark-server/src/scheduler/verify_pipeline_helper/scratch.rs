@@ -49,3 +49,65 @@ impl std::ops::DerefMut for ScratchGuard {
         &mut self.0
     }
 }
+
+/// The run's reusable host logits buffer (`DecodeScratch::host_bytes`), sized
+/// to the rows a pick reads and handed back on drop.
+///
+/// The host picks used to copy each span into a fresh `vec![0u8; len]`. That
+/// is calloc'd from untouched pages, so the D2H itself took the page faults:
+/// on the two-rank C8 profile (thinking on) about one ~2 MB row copy a step
+/// ran ~7 ms instead of ~35 us. Residual contents are irrelevant — the copy
+/// overwrites all `len` bytes before any read.
+pub(in crate::scheduler) struct HostRows<'c> {
+    buf: Vec<u8>,
+    home: &'c std::cell::RefCell<Vec<u8>>,
+}
+
+impl<'c> HostRows<'c> {
+    pub(in crate::scheduler) fn take(home: &'c std::cell::RefCell<Vec<u8>>, len: usize) -> Self {
+        let mut buf = std::mem::take(&mut *home.borrow_mut());
+        buf.resize(len, 0);
+        Self { buf, home }
+    }
+}
+
+impl Drop for HostRows<'_> {
+    fn drop(&mut self) {
+        *self.home.borrow_mut() = std::mem::take(&mut self.buf);
+    }
+}
+
+impl std::ops::Deref for HostRows<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl std::ops::DerefMut for HostRows<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostRows;
+
+    /// The buffer goes home on drop with its capacity, so the next pick
+    /// copies into warm pages instead of a fresh allocation.
+    #[test]
+    fn host_rows_reuses_one_allocation() {
+        let home = std::cell::RefCell::new(Vec::new());
+        let ptr = {
+            let mut rows = HostRows::take(&home, 1 << 20);
+            rows[7] = 1;
+            rows.as_ptr()
+        };
+        assert_eq!(home.borrow().len(), 1 << 20);
+        let rows = HostRows::take(&home, 1 << 19);
+        assert_eq!(rows.len(), 1 << 19);
+        assert_eq!(rows.as_ptr(), ptr, "a smaller span reuses the buffer");
+        assert!(home.borrow().is_empty(), "taken while in use");
+    }
+}

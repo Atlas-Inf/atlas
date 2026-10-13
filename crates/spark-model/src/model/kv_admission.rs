@@ -147,7 +147,7 @@ pub(crate) enum Admission {
 }
 
 impl Admission {
-    fn of(local: &Result<()>) -> Self {
+    pub(super) fn of(local: &Result<()>) -> Self {
         match local {
             Ok(()) => Self::Admitted,
             Err(e) if format!("{e:#}").contains("KV cache exhausted") => Self::Exhausted,
@@ -333,7 +333,7 @@ impl TransformerModel {
     }
 
     /// The all-rank minimum of `mine` (this rank's own off a pair).
-    fn admission_vote(&self, mine: Admission) -> Result<Admission> {
+    pub(super) fn admission_vote(&self, mine: Admission) -> Result<Admission> {
         if self.multi_rank_protocol_active() {
             Ok(Admission::from_word(self.ep_min_u32(mine as u32)?))
         } else {
@@ -344,7 +344,7 @@ impl TransformerModel {
     /// Grow every layer's per-sequence aux state to `tokens` positions.
     /// Failing to is running out of memory for those tokens, so it reports
     /// as exhaustion (a retryable refusal).
-    fn reserve_aux_through(
+    pub(super) fn reserve_aux_through(
         &self,
         seq: &mut SequenceState,
         tokens: usize,

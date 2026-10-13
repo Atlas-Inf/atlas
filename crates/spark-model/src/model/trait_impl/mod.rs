@@ -34,11 +34,13 @@ mod ep_misc;
 pub(in crate::model) mod ep_verify_batch;
 mod exact_verify_check;
 pub(crate) mod finish_leaf;
+pub(crate) mod gdn_commit_fuse;
 mod graph_borrow;
 mod lm_head_batched;
 mod lm_head_dp4a;
 mod meta;
 mod meta_argmax;
+mod mtp_stream_rows;
 mod prefill_a;
 pub(in crate::model) mod prefill_b;
 mod prefill_c;
@@ -56,6 +58,7 @@ mod verify_e;
 pub(in crate::model) mod verify_e2;
 mod verify_fused;
 mod verify_layer_trace;
+pub(in crate::model) mod verify_rows;
 
 impl Model for TransformerModel {
     fn verify_logits_argmax_only(&self) -> bool {
@@ -129,6 +132,7 @@ impl Model for TransformerModel {
         self.tokens_have_vision_pad(tokens)
     }
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
+        self.gdn_fuse_flush_all()?;
         self.prefill_entry(tokens, seq)
     }
     fn prefill_chunk(
@@ -140,6 +144,7 @@ impl Model for TransformerModel {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.gdn_fuse_flush_all()?;
         self.prefill_chunk_entry(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream)
     }
     fn prefill_twophase(
@@ -149,9 +154,11 @@ impl Model for TransformerModel {
         chunk_size: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.gdn_fuse_flush_all()?;
         self.prefill_twophase_entry(tokens, seq, chunk_size, stream)
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
+        self.gdn_fuse_flush_all()?;
         self.stamp_overlay_route(seq.adapter_slot);
         self.stamp_decode_moe_single(seq.adapter_slot);
         let logits = self.decode_dispatch(token, seq, _stream)?;
@@ -172,6 +179,7 @@ impl Model for TransformerModel {
         seqs: &mut [&mut SequenceState],
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.gdn_fuse_flush_all()?;
         self.stamp_overlay_route_batch(seqs);
         self.stamp_decode_moe_batch(seqs);
         let r = self.decode_batch_dispatch(tokens, seqs, stream);
@@ -199,6 +207,7 @@ impl Model for TransformerModel {
         prefill_is_last: bool,
         stream: u64,
     ) -> Result<crate::traits::MixedForwardResult> {
+        self.gdn_fuse_flush_all()?;
         // Mixed decode+prefill batch spans multiple adapters ⇒ mark mixed so the
         // overlay hooks skip (per-token seq_slot routing is SOLID Incr-4).
         self.overlay_route_slot
@@ -236,6 +245,16 @@ impl Model for TransformerModel {
     ) -> Result<Vec<DevicePtr>> {
         self.prefill_batch_chunk_rows(streams, stream, 0)
     }
+    fn supports_prefill_multi(&self) -> bool {
+        self.prefill_multi_supported()
+    }
+    fn prefill_multi(
+        &self,
+        streams: &mut [PrefillSlice<'_>],
+        stream: u64,
+    ) -> Result<Vec<DevicePtr>> {
+        self.prefill_multi_head(streams, stream)
+    }
     /// Mixed-step variant: shift the finishing streams' logits rows clear of
     /// the decode lanes. See the trait docs for the aliasing this prevents.
     fn prefill_batch_chunk_rows(
@@ -244,6 +263,7 @@ impl Model for TransformerModel {
         stream: u64,
         row_base: usize,
     ) -> Result<Vec<DevicePtr>> {
+        self.gdn_fuse_flush_all()?;
         self.prefill_batch_chunk_dispatch(streams, stream, row_base)
     }
     fn vocab_size(&self) -> usize {
@@ -315,6 +335,7 @@ impl Model for TransformerModel {
         self.high_speed_swap_dims_dispatch()
     }
     fn normalize_ssm_states(&self, seq: &SequenceState, stream: u64) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
         self.normalize_ssm_states_dispatch(seq, stream)
     }
     fn bind_gpu_to_thread(&self) -> Result<()> {
@@ -348,7 +369,7 @@ impl Model for TransformerModel {
         stream: u64,
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
-        self.mark_gdn_deferred_commit(seq, tokens.len());
+        self.mark_gdn_deferred_commit(seq, tokens.len())?;
         let r = self.decode_verify_dispatch(tokens, seq, stream);
         if r.is_err() {
             // Same brick guard as decode_batch: a refuse mid-verify-capture
@@ -359,9 +380,11 @@ impl Model for TransformerModel {
         r
     }
     fn checkpoint_ssm_states(&self, seq: &mut SequenceState) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
         self.checkpoint_ssm_states_dispatch(seq)
     }
     fn rollback_ssm_states(&self, seq: &mut SequenceState, num_accepted: usize) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
         self.rollback_ssm_states_dispatch(seq, num_accepted)
     }
     fn has_ssm_layers(&self) -> bool {
@@ -378,9 +401,11 @@ impl Model for TransformerModel {
         }
     }
     fn save_decode_ssm_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
         self.save_decode_ssm_snapshot_dispatch(seq, ring_slot)
     }
     fn restore_decode_ssm_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
         self.restore_decode_ssm_snapshot_dispatch(seq, ring_slot)
     }
     fn requires_aux_state(&self) -> bool {
@@ -439,6 +464,7 @@ impl Model for TransformerModel {
         params: &spark_runtime::sampler::SamplingParams,
         num_drafts: usize,
     ) -> Result<crate::engine::GenerateResult> {
+        self.gdn_fuse_flush_all()?;
         self.generate_speculative_dispatch(prompt_tokens, params, num_drafts)
     }
     fn verify_context_limit(&self) -> Option<usize> {
@@ -477,6 +503,9 @@ impl Model for TransformerModel {
     fn verify_bit_exact(&self) -> bool {
         self.levers.qwen4exp_exact_verify
     }
+    fn batch_verify_bit_exact(&self) -> bool {
+        self.levers.qwen4exp_exact_verify && self.levers.qwen4exp_batch_fast
+    }
     fn has_proposer(&self) -> bool {
         self.has_proposer_dispatch()
     }
@@ -484,9 +513,11 @@ impl Model for TransformerModel {
         self.has_self_speculative_dispatch()
     }
     fn decode_draft(&self, token: u32, seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
+        self.gdn_fuse_flush_all()?;
         self.decode_draft_dispatch(token, seq, stream)
     }
     fn cache_sequence(&self, seq: &SequenceState) {
+        self.gdn_fuse_flush_all_logged();
         self.cache_sequence_dispatch(seq)
     }
     fn decode_marconi_checkpoint(&self, seq: &mut SequenceState) {
@@ -502,7 +533,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 2]> {
         self.ssm_pool.require_verify_rollback_supported()?;
-        self.mark_gdn_deferred_commit(seq, tokens.len());
+        self.mark_gdn_deferred_commit(seq, tokens.len())?;
         self.decode_verify_graphed_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k3(
@@ -512,7 +543,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 3]> {
         self.ssm_pool.require_verify_rollback_supported()?;
-        self.mark_gdn_deferred_commit(seq, tokens.len());
+        self.mark_gdn_deferred_commit(seq, tokens.len())?;
         self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k4(
@@ -522,7 +553,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 4]> {
         self.ssm_pool.require_verify_rollback_supported()?;
-        self.mark_gdn_deferred_commit(seq, tokens.len());
+        self.mark_gdn_deferred_commit(seq, tokens.len())?;
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
     }
     fn can_batch_glm_long_verify_rows(&self, owners: usize, rows: usize) -> bool {
@@ -589,11 +620,13 @@ impl Model for TransformerModel {
             ks.len(),
             seqs.len()
         );
+        // Rank-local, and it can fail: before the broadcast, so a failure
+        // never leaves the worker inside the verify's collectives.
+        for (seq, &k) in seqs.iter_mut().zip(ks) {
+            self.mark_gdn_deferred_commit(seq, k)?;
+        }
         // Over a TP pair the worker runs the same forward (`ep_verify_batch`).
         self.ep_broadcast_verify_batch(tokens, ks, seqs)?;
-        for (seq, &k) in seqs.iter_mut().zip(ks) {
-            self.mark_gdn_deferred_commit(seq, k);
-        }
         self.decode_verify_batched_dispatch(tokens, ks, seqs, _stream)
     }
     fn ep_broadcast_verify_verdicts(&self, accepted: &[u32]) -> Result<()> {
@@ -648,7 +681,7 @@ impl Model for TransformerModel {
         // were staged for (`glm_verify_masks`).
         let allow = self.take_verify_row_masks(tokens.len())?;
         self.ssm_pool.require_verify_rollback_supported()?;
-        self.mark_gdn_deferred_commit(seq, tokens.len());
+        self.mark_gdn_deferred_commit(seq, tokens.len())?;
         self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)
     }
     fn decode_and_verify_fused(
@@ -658,7 +691,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
-        self.mark_gdn_deferred_commit(seq, tokens.len());
+        self.mark_gdn_deferred_commit(seq, tokens.len())?;
         self.decode_and_verify_fused_dispatch(tokens, seq, _stream)
     }
     fn save_hidden_for_catchup(&self, token_idx: usize, pos: usize) -> Result<()> {
@@ -1001,9 +1034,11 @@ impl Model for TransformerModel {
         self.trim_proposer_state_dispatch(seq, num_accepted, _stream)
     }
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<bool> {
+        self.gdn_fuse_flush_all()?;
         self.compact_sequence_dispatch(seq, new_slot)
     }
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {
+        self.gdn_fuse_flush_all_logged();
         self.detach_slot_for_reuse_dispatch(seq)
     }
     fn save_sequence_state(
@@ -1011,6 +1046,7 @@ impl Model for TransformerModel {
         seq: &SequenceState,
         writer: &mut dyn std::io::Write,
     ) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
         self.save_sequence_state_dispatch(seq, writer)
     }
     fn restore_sequence_state(
@@ -1019,6 +1055,7 @@ impl Model for TransformerModel {
         num_blocks: usize,
         reader: &mut dyn std::io::Read,
     ) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
         self.restore_sequence_state_dispatch(seq, num_blocks, reader)
     }
     fn swap_resumable(&self) -> bool {
@@ -1035,6 +1072,7 @@ impl Model for TransformerModel {
         self.reclaim_prefix_blocks_dispatch(num_blocks)
     }
     fn start_checkpoint_async(&self, seq: &mut SequenceState) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
         self.start_checkpoint_async_dispatch(seq)
     }
     fn start_rollback_and_checkpoint_async(
@@ -1042,10 +1080,13 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         num_accepted: usize,
     ) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
         self.start_rollback_and_checkpoint_async_dispatch(seq, num_accepted)
     }
     fn sync_secondary(&self) -> Result<()> {
-        self.sync_secondary_dispatch()
+        // The scheduler's step-start wait: a verify may take the pending
+        // GDN commit, so this does not flush it (`gdn_commit_fuse`).
+        self.wait_secondary_dispatch()
     }
     fn commit_accepted_prefix(
         &self,
@@ -1074,6 +1115,9 @@ impl Model for TransformerModel {
 
     fn kv_block_size(&self) -> Option<usize> {
         Some(self.kv_cache.lock().block_size())
+    }
+    fn pc_inflight_min_tokens(&self) -> Option<usize> {
+        self.pc_inflight_min_dispatch()
     }
     fn decode_logits_fp32(&self) -> bool {
         self.decode_logits_fp32_dispatch()

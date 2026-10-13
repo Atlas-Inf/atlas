@@ -175,7 +175,9 @@ pub fn verify_slot_drafts_with(
 /// Env-reading wrapper of [`verify_slot_drafts_with`]: the ladder policy
 /// (with its `ATLAS_MTP_K_LADDER` / `ATLAS_NO_MTP_K_LADDER` overrides — a
 /// disabled ladder returns `num_drafts` at every width, making the tiers
-/// vacuous) plus the [`mtp_pool_full_width`] kill switch.
+/// vacuous), lifted to the full `num_drafts` at the widths the dynamic depth
+/// may go deep (`speculative::deep_depth::slot_ceiling`, under
+/// `ATLAS_MTP_DYNAMIC_DEPTH=1`), plus the [`mtp_pool_full_width`] kill switch.
 pub fn verify_slot_drafts(slot_idx: usize, num_drafts: usize) -> usize {
     if mtp_pool_full_width() {
         return num_drafts;
@@ -184,7 +186,7 @@ pub fn verify_slot_drafts(slot_idx: usize, num_drafts: usize) -> usize {
         slot_idx,
         crate::speculative::mtp_max_seqs(),
         num_drafts,
-        |n| crate::speculative::mtp_ladder_drafts(n, num_drafts),
+        |n| crate::speculative::deep_depth::slot_ceiling(n, num_drafts),
     )
 }
 

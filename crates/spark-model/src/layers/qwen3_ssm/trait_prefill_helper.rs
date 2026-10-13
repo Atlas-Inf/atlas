@@ -52,6 +52,52 @@ impl Qwen3SsmLayer {
         Ok(())
     }
 
+    /// The out_proj and the SP reduce-scatter of a qwen4_exp chunk, pipelined
+    /// (`ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE`): the GEMM by row ranges, the
+    /// window the peer needs first. Taken only on the dense BF16 arm, whose
+    /// rows are independent (the tile kernel, or under the k-chain pin a
+    /// cuBLASLt k-chain kernel with the same bytes per row at every row
+    /// count), so every byte is the unsplit GEMM + reduce-scatter's.
+    /// `Ok(false)`: not taken, nothing launched.
+    pub(super) fn out_proj_reduce_scatter_piped(
+        &self,
+        ctx: &ForwardContext,
+        normed_out_buf: DevicePtr,
+        out_proj_buf: DevicePtr,
+        [num_tokens, value_dim]: [usize; 2],
+        stream: u64,
+    ) -> Result<bool> {
+        let h = ctx.config.hidden_size;
+        let fp8_rowwise = std::env::var("ATLAS_FP8_ROWWISE").as_deref() == Ok("1")
+            && self.out_proj_fp8w_rowwise.is_some();
+        let Some(sp) = crate::layers::glm_sp::current().filter(|sp| sp.total() == num_tokens)
+        else {
+            return Ok(false);
+        };
+        if fp8_rowwise || ctx.dispatch.cutlass_nvfp4_ssm_out || self.out_proj_dense.is_none() {
+            return Ok(false);
+        }
+        crate::layers::qwen4exp_sp_pipe::compute_and_reduce_scatter(
+            sp,
+            out_proj_buf,
+            h,
+            ctx,
+            stream,
+            |r0, n, s| {
+                self.prefill_out_proj_dispatch(
+                    ctx,
+                    normed_out_buf.offset(r0 * value_dim * 2),
+                    out_proj_buf.offset(r0 * h * 2),
+                    n as u32,
+                    h,
+                    value_dim,
+                    s,
+                )
+            },
+            |_| Ok(()),
+        )
+    }
+
     pub(super) fn prefill_out_proj_dispatch(
         &self,
         ctx: &ForwardContext,
@@ -121,6 +167,23 @@ impl Qwen3SsmLayer {
             // block-scaled, prefill stays BF16). Always routed through the
             // tensor-core dense_gemm_bf16_pipelined kernel (~40× vs the old
             // scalar dense_gemm, identical BF16 math, cosine=1.0).
+            // ATLAS_LT_KCHAIN_PIN (qwen4_exp, >= 2048 rows): the tile kernel's
+            // own in-order k-chain on a faster cuBLASLt kernel, byte for byte
+            // (TP2, 16016 x 2560 x 3072: 4.24 -> 3.46 ms a layer).
+            if ctx.config.model_type == "qwen4_exp"
+                && k >= 2048
+                && spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(
+                    normed_out_buf.0,
+                    dense_out.weight.0,
+                    out_proj_buf.0,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?
+            {
+                return Ok(());
+            }
             ops::dense_gemm_bf16_pipelined(
                 ctx.gpu,
                 self.dense_gemm_pipelined_k,

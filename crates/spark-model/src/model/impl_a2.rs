@@ -399,6 +399,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
     /// - 0xFFFFFFE6: batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
+    /// - 0xFFFFFFED: plant a prefix checkpoint → position (`prefill_b::pc_inflight`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -407,6 +408,14 @@ impl TransformerModel {
         if cmd == 0xFFFFFFFF {
             return Ok(false);
         }
+        // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: only the batched verify takes a
+        // pending GDN commit, and the draft-assist walk between two of them
+        // reads no GDN state; every other command lands them first.
+        if cmd != super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH
+            && cmd != super::draft_assist::EP_CMD_DRAFT_ASSIST
+        {
+            self.gdn_fuse_flush_all()?;
+        }
 
         // Batched-decode (`0xFFFFFFE0`): the preamble seq_id is sentinel-0;
         // the real per-token routing lives in the seq_ids[N] payload that
@@ -414,6 +423,9 @@ impl TransformerModel {
         // + tokens off the wire and dispatches the matched compute.
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
+        }
+        if cmd == super::impl_a2_ep_worker::EP_CMD_PREFILL_MULTI {
+            return self.ep_worker_prefill_multi(slots);
         }
         // Batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`).
         if cmd == super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH {
@@ -480,6 +492,7 @@ impl TransformerModel {
             super::vision_transport::EP_CMD_VISION_STATE => self.ep_worker_recv_vision_state()?,
             super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
             0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
+            crate::traits::EP_CMD_PC_PLANT => self.pc_plant_receive(seq)?,
             super::trait_impl::finish_leaf::EP_CMD_CACHE_SEQUENCE => {
                 self.finish_leaf_cache_command(seq)
             }

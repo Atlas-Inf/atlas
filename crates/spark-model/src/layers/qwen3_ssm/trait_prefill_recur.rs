@@ -156,6 +156,18 @@ impl Qwen3SsmLayer {
             );
         }
 
+        // qwen4_exp mid-chunk checkpoint: the recurrent state at its row.
+        if self.gdn_recurrence_ckpt(
+            ctx,
+            midcap_idx,
+            [h_state, q_ptr, k_ptr, v_ptr, gates_buf, gdn_out_buf],
+            k,
+            [nk, nv, kd, vd, conv_dim],
+            stream,
+        )? {
+            return Ok(());
+        }
+
         // FlashInfer GDN (opt-in, ATLAS_GDN_FLASHINFER=1): tensor-core chunked delta-rule
         // scan, ~11× the scalar FLA chunk_delta_h at the Holo shape. This is the live
         // single-stream prefill path (trait_prefill.rs -> prefill_gdn_recurrence). q_ptr is
@@ -211,18 +223,7 @@ impl Qwen3SsmLayer {
         // that has never been exercised at vpg=3 (48 v-heads / 16 k-heads;
         // every FLA-validated model is vpg<=2). A/B-ing the recurrence
         // implementation is the decisive split.
-        static NO_FLA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let no_fla =
-            *NO_FLA.get_or_init(|| std::env::var("ATLAS_NO_GDN_FLA").as_deref() == Ok("1"));
-        if !no_fla
-            && !ctx.gdn_exact_replay
-            && kd == 128
-            && vd == 128
-            && fla_scratch.0 != 0
-            && self.gdn_prefill_fla_recompute_wu_k.0 != 0
-            && self.gdn_prefill_fla_chunk_delta_h_k.0 != 0
-            && self.gdn_prefill_fla_chunk_fwd_o_k.0 != 0
-        {
+        if self.fla_route(ctx, kd, vd) {
             // One-time positive signal that the FLA path is live (vs silently
             // falling through to wy4 on a guard miss) — greppable in the server log.
             // Log-once latch (see `atlas_core::scope`). It holds no model-derived
@@ -419,12 +420,12 @@ impl Qwen3SsmLayer {
         stream: u64,
     ) -> Result<()> {
         if let (Some(cap), Some(idx)) = (ctx.midchunk_capture.as_ref(), midcap_idx) {
-            let cl = cap.cap_local;
-            if cl > 0 && (cl as u32) < k {
+            let points = cap.points(idx, k as usize);
+            if !points.is_empty() {
                 let bf16 = 2usize;
                 // Run the sliding-window conv over local tokens [start, start+len);
                 // conv_state is chained across calls (the same contract multi-chunk
-                // prefill relies on), so the split is byte-exact.
+                // prefill relies on), so every split is byte-exact.
                 let seg = |start: usize, len: u32| -> Result<()> {
                     ops::conv1d_update_prefill(
                         ctx.gpu,
@@ -443,24 +444,17 @@ impl Qwen3SsmLayer {
                         stream,
                     )
                 };
-                // Optional EARLIER capture at cap_local - bs (token tb - bs).
+                // Each capture point (the earlier `tb - bs` one, the tail
+                // boundary `tb`, qwen4_exp's dense / branch points), then
+                // the trailing tokens.
                 let mut start = 0usize;
-                if let Some(ce) = cap.cap_local_early {
-                    seg(0, ce as u32)?;
-                    ctx.gpu.copy_d2d_async(
-                        conv_state,
-                        cap.conv_dsts_early[idx],
-                        cap.conv_bytes,
-                        stream,
-                    )?;
-                    start = ce;
+                for (cl, (_, conv_dst)) in points {
+                    seg(start, (cl - start) as u32)?;
+                    ctx.gpu
+                        .copy_d2d_async(conv_state, conv_dst, cap.conv_bytes, stream)?;
+                    start = cl;
                 }
-                // Capture conv_state @ the tail boundary tb.
-                seg(start, (cl - start) as u32)?;
-                ctx.gpu
-                    .copy_d2d_async(conv_state, cap.conv_dsts[idx], cap.conv_bytes, stream)?;
-                // Trailing tokens [cap_local, k).
-                seg(cl, k - cl as u32)?;
+                seg(start, k - start as u32)?;
                 return Ok(());
             }
         }

@@ -153,7 +153,8 @@ pub(super) fn build_active_seq_from_prefill(
     );
     let mut seq = p.seq;
     // The min_tokens end-token ban, for every chunked prompt (one chunk or more).
-    spark_model::traits::EosBan::new(seq.prompt_len, p.min_tokens, &p.eos_tokens).arm(&mut seq);
+    spark_model::traits::EosBan::for_request(seq.prompt_len, p.min_tokens, &p.eos_tokens)
+        .arm(&mut seq);
     ActiveSeq {
         seq,
         session_hash: p.session_hash,
@@ -235,6 +236,8 @@ pub(super) fn build_active_seq_from_prefill(
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: 0,
+        loop_steers: 0,
+        loop_steer_max: crate::scheduler::loop_steer::budget_for_new_seq(),
         rollback_count: 0,
         ssm_rollback_ring: SsmDecodeRing::new(ssm_ring_capacity),
         tool_call_end_token,

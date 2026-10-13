@@ -163,7 +163,7 @@ pub fn step_verify_k4(
     crate::scheduler::mtp_accept_debug::record(1, 3, drafts[0] == v0, num_accepted);
     if !dflash_verify_raw_argmax {
         a.mtp_acct
-            .record_depth_verify(3, num_accepted, sched.levers.mtp_single_depth_adapt);
+            .record_depth_verify(3, num_accepted, num_drafts, sched.levers.depth());
     }
 
     // ATLAS_MTP_REFEED_ACCEPTED: same contract as `verify_k3_step` — ring the

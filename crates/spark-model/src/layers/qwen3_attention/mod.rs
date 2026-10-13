@@ -39,6 +39,7 @@ mod op_dump;
 pub mod innerq_driver;
 mod prefill;
 mod prefill_weights;
+mod prefill_weights_rowinv;
 mod trait_impl;
 mod types;
 mod types_weights;
@@ -51,7 +52,7 @@ pub use glm_sparse_graphs_policy::{
     glm_c1_decode_graph_vetoed, glm_multi_seq_sparse_graphs_enabled,
 };
 pub(crate) use hc_prefill::{hc_post_pre_prefill_fused, hc_pre_prefill_mix};
-pub(crate) use prefill::{index_split_words, write_floor_legacy};
+pub(crate) use prefill::{attn_w4a4_requested, index_split_words, write_floor_legacy};
 pub(crate) use trait_impl::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
 };

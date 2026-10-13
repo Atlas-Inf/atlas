@@ -4,11 +4,13 @@
 
 use super::*;
 
+mod bootstrap;
 mod depth;
 mod glm_repair;
+mod one_forward;
 mod owner_batch;
-use depth::{ladder_truncate, lone_dflash_width, single_depth_ladder};
-use glm_repair::{glm_repaired_narrow, mark_engine_error};
+use depth::{deep_ladder, ladder_truncate, lone_dflash_width, single_depth_ladder};
+use glm_repair::glm_repaired_narrow;
 use owner_batch::verify_owner_batch;
 
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
@@ -80,6 +82,18 @@ pub fn step_mtp(
         crate::scheduler::adaptive_rung::drafts_for(active.len(), num_drafts)
     };
     let ladder_nd = single_depth_ladder(active, sched, ladder_nd, dflash_verify_raw_argmax);
+    // ATLAS_MTP_DYNAMIC_DEPTH: each request steers its own ceiling up to
+    // `num_drafts` (`mtp_deep_depth`); the step drafts to the deepest and
+    // `plan_verify` trims every sequence to its own and the row budget.
+    let deep = !dflash_verify_raw_argmax
+        && !glm_repaired_narrow
+        && super::mtp_deep_depth::deep_step(sched.levers.depth(), num_drafts, active.len());
+    let ladder_nd = if deep {
+        deep_ladder(active, sched, num_drafts)
+    } else {
+        ladder_nd
+    };
+    super::mtp_step_trace::note_step(ladder_nd, deep);
     // Tiered verify-pool capacity clamp (2026-08-16): the step's draft
     // count must respect the MINIMUM slot capacity across the active
     // sequences — a sequence in a K=2-sized slot must never receive K=4
@@ -93,6 +107,26 @@ pub fn step_mtp(
             .iter()
             .map(|a| model.mtp_slot_draft_capacity(a.seq.slot_idx)),
     );
+
+    // Plan the batched verify FIRST outside DFlash: a draftless sequence it
+    // can carry as a decode row skips the bootstrap forward below
+    // (`one_forward`). DFlash plans after Phase A, whose bootstrap stashes
+    // drafts for Phase B (`late_dflash`).
+    let early_plan = (!dflash_verify_raw_argmax).then(|| {
+        one_forward::plan_verify(
+            model,
+            sched,
+            active,
+            &verify_idxs,
+            &bootstrap_idxs,
+            ladder_nd,
+            deep.then_some(num_drafts),
+            false,
+        )
+    });
+    if let Some(p) = &early_plan {
+        bootstrap_idxs.retain(|i| !p.decode_rows.contains(i));
+    }
 
     // ── Phase A: Bootstrap decode for sequences without a draft ──
     if !bootstrap_idxs.is_empty() {
@@ -112,311 +146,30 @@ pub fn step_mtp(
     if !spark_model::speculative::glm_repair_policy::enabled()
         && can_batch_bootstrap(model, sched, bootstrap_idxs.len(), dflash_verify_raw_argmax)
     {
+        for &i in &bootstrap_idxs {
+            super::mtp_step_trace::note_seq(&active[i], b'B', 0);
+        }
+        super::mtp_step_trace::note_forward(bootstrap_idxs.len());
         step_mtp_bootstrap_batched(model, active, sched, &bootstrap_idxs, ladder_nd, verify_ctx);
         bootstrap_idxs.clear();
     }
     let mut late_dflash: Vec<usize> = Vec::new();
     let n_active = active.len();
     for &idx in &bootstrap_idxs {
-        let a = &mut active[idx];
-
-        // DFlash path: skip the standalone M=1 decode. The fused pass already
-        // computes every position's logit in one weight sweep, so the "next
-        // decoded token" is the bonus token at result[num_accepted] — the logit
-        // at the position immediately after the accepted prefix (§8 vLLM
-        // bonus-token pattern). Propose initial drafts using the DFlash hidden
-        // already captured at row 0 by the previous step's fused pass (or
-        // prefill), then route through step_verify_k3/k2 which handles the
-        // fused forward, accept/reject, bonus-token emit, and re-propose for
-        // the next step. This replaces the two-sweep sequence (M=1 decode here
-        // + M=1+k fused in Phase B) with a single M=1+k fused sweep.
-        if dflash_verify_raw_argmax
-            && !sched.levers.dflash_seam_serial
-            && crate::scheduler::adaptive_spec::spec_allowed(a, sched)
-        {
-            // A strict grammar here speculates at full width: its verify
-            // masks every row and trims the drafts (`strict_spec`).
-            let eff = if a.grammar_state.is_some() && !a.strict_grammar() {
-                1
-            } else {
-                num_drafts
-            };
-            let _gmask = mtp_grammar_mask_for(a);
-            match model.run_mtp_propose_multi(
-                a.last_token,
-                a.seq.seq_len,
-                eff,
-                &mut a.seq,
-                0,
-                _gmask.as_deref(),
-            ) {
-                Ok(init) if !init.is_empty() => {
-                    // n>=2: do not verify here. Stash drafts so Phase B can
-                    // run one decode_verify_batched over every ready seq.
-                    // In-loop step_verify_dflash left only 1 seq with drafts
-                    // (shared propose scratch / graph) and never hit Phase B.
-                    a.set_proposed_drafts(init);
-                    if n_active >= 2 && !dspark_batch_verify_disabled() {
-                        late_dflash.push(idx);
-                        continue;
-                    }
-                    let (init, conf) = a.take_drafts();
-                    if dflash_verify_raw_argmax || glm_repaired_narrow {
-                        step_verify_dflash(
-                            model,
-                            a,
-                            sched,
-                            &init,
-                            &conf,
-                            num_drafts,
-                            verify_ctx,
-                            dflash_verify_raw_argmax,
-                        );
-                    } else if eff >= 3 && init.len() >= 3 {
-                        step_verify_k4(
-                            model,
-                            a,
-                            sched,
-                            &init,
-                            num_drafts,
-                            verify_ctx,
-                            dflash_verify_raw_argmax,
-                        );
-                    } else if eff >= 2 && init.len() >= 2 {
-                        step_verify_k3(
-                            model,
-                            a,
-                            sched,
-                            &init,
-                            num_drafts,
-                            verify_ctx,
-                            dflash_verify_raw_argmax,
-                        );
-                    } else {
-                        step_verify_k2(
-                            model,
-                            a,
-                            sched,
-                            &init,
-                            num_drafts,
-                            verify_ctx,
-                            dflash_verify_raw_argmax,
-                        );
-                    }
-                    continue;
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        "DFlash bootstrap propose returned empty slot={} seq_len={}",
-                        a.seq.slot_idx,
-                        a.seq.seq_len
-                    );
-                    // Lightning product fail-closed boundary: an empty
-                    // product proposal is an admission violation, not a
-                    // silent no-spec fallback. Generic DFlash/MTP keeps the
-                    // legacy fall-through below. The guard marker makes the
-                    // truncation client-visible ("length" family), never a
-                    // natural "stop".
-                    if crate::scheduler::helpers::handle_dspark_bootstrap_proposal_failure(
-                        model,
-                        a,
-                        crate::scheduler::helpers::ProposalOutcome::Empty,
-                    ) {
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("DFlash bootstrap propose: {e:#}");
-                    if crate::scheduler::helpers::handle_dspark_bootstrap_proposal_failure(
-                        model,
-                        a,
-                        crate::scheduler::helpers::ProposalOutcome::Error,
-                    ) {
-                        continue;
-                    }
-                }
-            }
-            // Rare fallback: propose failed or returned empty (e.g. drafter not
-            // yet primed). Fall through to the standalone decode below so the
-            // sequence emits its next token rather than stalling. Never
-            // reached for the Lightning product (handled above).
-        }
-
-        // Non-DFlash path (or DFlash-propose fallback): EP broadcast + standalone decode.
-        // EP: broadcast token to worker before decode (worker runs decode in lockstep).
-        if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
-            tracing::error!("EP broadcast bootstrap token: {e:#}");
-            mark_engine_error(a, format!("EP broadcast bootstrap token failed: {e:#}"));
-            continue;
-        }
-        let logits = match model.decode(a.last_token, &mut a.seq, 0) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("bootstrap decode error: {e:#}");
-                mark_engine_error(a, format!("bootstrap decode failed: {e:#}"));
-                continue;
-            }
-        };
-        // Build the seq's configured penalties (rep/presence/frequency/LZ/DRY)
-        // so the MTP bootstrap token sees the SAME penalties+history the
-        // non-MTP path applies — the root-cause fix for repetition_penalty /
-        // dry_multiplier never reaching MTP-emitted tokens. Cloned before the
-        // mutable `grammar_state` borrow to satisfy the borrow checker.
-        let penalties = crate::scheduler::sample_step::penalty_params_for(
-            a,
-            crate::scheduler::sample_step::PositionKind::Verify,
-            0.0,
-            None,
-            Vec::new(),
-        );
-        // #192: same per-tool-call-segment scoping as the main pipeline
-        // (`penalty_history_scope`) so MTP bootstrap tokens see the identical
-        // penalty landscape.
-        let history = crate::scheduler::sample_step::penalty_history_scope(
-            &a.output_tokens,
-            a.tool_call_end_token,
-        )
-        .to_vec();
-        // P1-4 (2026-07-09): the bootstrap token is one of only two
-        // stochastic sample points under MTP, and its stochastic branch
-        // previously sampled with a hardcoded `min_p: 0.0` deep inside
-        // `sample_token_with_grammar` — bypassing the MODEL.toml
-        // `min_p_floor` (0.05 on this family) that exists precisely to stop
-        // FP8/NVFP4 argmax-flip tail tokens. The sampler now reads
-        // `penalties.min_p`, which `penalty_params_for` copies from
-        // `a.min_p` (request value + floor, resolved in `sampling_setup`) —
-        // SSOT, no new channel. Kill-switch: ATLAS_NO_MTP_MINP=1.
-        let tok = match sample_token_with_grammar(
+        super::mtp_step_trace::note_seq(&active[idx], b'b', 0);
+        super::mtp_step_trace::note_forward(1);
+        if bootstrap::bootstrap_one(
             model,
-            logits,
-            a.temperature,
-            a.top_k,
-            a.top_p,
-            &[],
-            a.grammar_state.as_mut(),
-            &penalties,
-            &history,
-            &sched.levers.sampling(),
+            &mut active[idx],
+            sched,
+            num_drafts,
+            ladder_nd,
+            n_active,
+            glm_repaired_narrow,
+            verify_ctx,
+            dflash_verify_raw_argmax,
         ) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("bootstrap sample error: {e:#}");
-                mark_engine_error(a, format!("bootstrap sampling failed: {e:#}"));
-                continue;
-            }
-        };
-
-        // Extract logprobs from bootstrap decode logits (single position).
-        let lp = if let Some(k) = a.top_logprobs {
-            extract_single_logprobs(model, logits, tok, k)
-        } else {
-            None
-        };
-
-        emit_token(a, tok, lp, sched);
-        if a.finished {
-            continue;
-        }
-        a.last_token = tok;
-        // Adaptive speculation: count serial tokens toward the re-probe window.
-        crate::scheduler::adaptive_spec::tick_serial(a, sched);
-
-        // Ctx-holes fix (ATLAS_DFLASH_SERIAL_APPEND=1), COMPLEMENT-GATED:
-        // the serial ctx-append fires iff propose() will NOT run this
-        // iteration, so append and propose decode-append can never both
-        // cover one token — double-append impossible by construction
-        // (that was the cuMemcpyDtoDAsync status-1 crash).
-        // `spec_allowed` is evaluated exactly once (it mutates re-probe
-        // state); its verdict is reused for the propose gate below.
-        // Exception — re-probe RESUME: the token decoded on the un-suspend
-        // iteration would otherwise fall in a hole (the stale
-        // `skip_next_decode_append` set by the last suspended token makes
-        // the propose below skip its decode-append). Append it here; the
-        // skip flag this sets is consumed by that propose — one append,
-        // no duplicate, seam covered.
-        let was_suspended = crate::scheduler::adaptive_spec::is_suspended(a, sched);
-        let will_propose = crate::scheduler::adaptive_spec::spec_allowed(a, sched);
-        let reprobe_resume = was_suspended && will_propose;
-        if sched.levers.dflash_unified_ctx {
-            // Unified ctx commit: same complement-gate as the old serial
-            // append — fire iff propose() will NOT run (or re-probe resume),
-            // so commit and propose decode-append never both cover a token.
-            if !will_propose || reprobe_resume {
-                let base_pos = a.seq.seq_len.saturating_sub(1);
-                if let Err(e) = model.commit_ctx(&mut a.seq, 1, base_pos) {
-                    tracing::error!("commit_ctx (mtp serial): {e:#}");
-                }
-            }
-        } else if sched.levers.dflash_serial_append
-            && (!will_propose || reprobe_resume)
-            && let Err(e) = model.dflash_serial_ctx_append(&mut a.seq)
-        {
-            tracing::error!("dflash_serial_ctx_append: {e:#}");
-        }
-
-        if let Err(e) = model.save_hidden_for_mtp(0, 0) {
-            tracing::error!("save_hidden_for_mtp: {e:#}");
-            if spark_model::speculative::glm_repair_policy::enabled() {
-                mark_engine_error(a, format!("save_hidden_for_mtp failed: {e:#}"));
-            }
-            continue;
-        }
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        // BUG#4 (2026-06-02): when a grammar is active, generate only ONE draft.
-        // run_mtp_propose_multi (mtp_multi.rs) masks only draft[0] with the
-        // position-0 bitmask and leaves draft[1..] UNMASKED, so multi-draft +
-        // grammar desyncs — a draft[1] token can violate its true per-position
-        // mask, get verified+accepted, then be refused by the matcher later
-        // (→ truncation). A single draft uses its own up-to-date mask and is
-        // sound; drafts.len()==1 routes verify to the K=2 path. Mask is a no-op
-        // when grammar is inactive, so NVFP4/non-tool paths keep full K.
-        // 2026-07-09: hoisted to the `effective_drafts_under_grammar` SSOT,
-        // now also applied at the five verify-path re-propose sites that
-        // previously bypassed this clamp (the "mask held fixed" warn spam).
-        // Composed with the K-vs-batch ladder: the bootstrap propose is
-        // sized for the current concurrency so the next verify is uniform
-        // at the ladder width (no surplus drafts to truncate).
-        let effective_num_drafts =
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, ladder_nd);
-        // Adaptive speculation: a suspended seq skips proposing entirely and
-        // stays on this serial bootstrap path until the re-probe fires.
-        // (`will_propose` is the single spec_allowed evaluation above.)
-        if will_propose {
-            match model.run_mtp_propose_multi(
-                tok,
-                a.seq.seq_len,
-                effective_num_drafts,
-                &mut a.seq,
-                0,
-                _mtp_grammar_mask.as_deref(),
-            ) {
-                Ok(drafts) if !drafts.is_empty() => {
-                    tracing::debug!("MTP bootstrap: tok={tok} → drafts={drafts:?}");
-                    a.set_proposed_drafts(drafts);
-                }
-                Ok(_) => {
-                    tracing::warn!("MTP propose returned empty");
-                    if spark_model::speculative::glm_repair_policy::enabled() {
-                        mark_engine_error(a, "MTP propose returned empty");
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("run_mtp_propose_multi: {e:#}");
-                    if spark_model::speculative::glm_repair_policy::enabled() {
-                        mark_engine_error(a, format!("MTP proposal failed: {e:#}"));
-                    }
-                }
-            }
-        }
-
-        // A terminal proposal failure must not start a checkpoint on the
-        // partially-mutated proposer state before retirement frees it.
-        if a.finished {
-            continue;
-        }
-
-        if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
-            tracing::error!("bootstrap start_checkpoint_async: {e:#}");
+            late_dflash.push(idx);
         }
     }
     verify_idxs.extend(late_dflash);
@@ -424,74 +177,35 @@ pub fn step_mtp(
     // ── Phase B: Verify with pipelined checkpoint ──
     //
     // Batched multi-seq K-row verify (batched-MTP E11 + the ladder). Only
-    // reachable when `ATLAS_MTP_MAX_SEQS > 1` (default 32 with the ladder)
-    // puts >= 2 verify-ready sequences in one step (`ATLAS_MTP_MAX_SEQS=1`
-    // ⇒ this partition is a no-op and every seq takes the per-seq loop
-    // below, byte-identical to the pre-batched HEAD). Batchable =
-    // Batchable = grammarless, >= ladder_nd pending drafts. DSpark is
-    // included unless ATLAS_NO_DFLASH_BATCH_VERIFY (presence). MTP still
-    // uses !dflash via the model self-gate (`dflash_hidden_save`).
-    let mut serial_idxs: Vec<usize> = Vec::new();
-    let mut batchable_idxs: Vec<usize> = Vec::new();
-    let dspark_batch_ok = !dflash_verify_raw_argmax || !dspark_batch_verify_disabled();
+    // reachable when `ATLAS_MTP_MAX_SEQS > 1` puts >= 2 sequences in one
+    // step (`ATLAS_MTP_MAX_SEQS=1` ⇒ every seq takes the per-seq loop below,
+    // byte-identical to the pre-batched HEAD). Members, rows and order:
+    // `one_forward::plan_verify` (grammarless sequences at their own depth,
+    // decode rows where the model verifies them, D-Cut).
     if active.len() > 1 {
         tracing::info!(
-            "DFLASH WIDTH n_active={} verify={} boot={} dspark_batch_ok={} ladder_nd={}",
+            "DFLASH WIDTH n_active={} verify={} boot={} ladder_nd={}",
             active.len(),
             verify_idxs.len(),
             bootstrap_idxs.len(),
-            dspark_batch_ok,
             ladder_nd
         );
     }
-    if !spark_model::speculative::glm_repair_policy::enabled()
-        && verify_idxs.len() >= 2
-        && spark_model::speculative::mtp_multi_seq_mode()
-        && dspark_batch_ok
-        && !batch_verify_disabled()
-        && ladder_nd >= 1
-    {
-        for &idx in &verify_idxs {
-            let a = &mut active[idx];
-            if a.grammar_state.is_none() && a.pending_drafts.len() >= ladder_nd {
-                if a.pending_drafts.len() > ladder_nd {
-                    a.pending_drafts.truncate(ladder_nd);
-                }
-                batchable_idxs.push(idx);
-            } else {
-                serial_idxs.push(idx);
-            }
-        }
-    } else {
-        serial_idxs.extend_from_slice(&verify_idxs);
-    }
-    let rows = ladder_nd + 1;
-
-    // ── D-Cut: per-sequence verify depth from drafter confidence ──
-    // Default ON at ratio 0.75 (+2.6% at C=8; kill switch `ATLAS_NO_MTP_DCUT`,
-    // PRESENCE). Ranks every prunable draft position ACROSS the batch by its
-    // prefix-product survival score and keeps the top `ATLAS_MTP_DCUT_RATIO`
-    // fraction (`mtp_dcut`). The retained set is a per-sequence PREFIX by
-    // construction, so the only downstream effect is a RAGGED row count. OFF
-    // (or `ladder_nd < 2`, or the batch wider than `dcut_width_cap()` = 8 —
-    // the D-Cut-at-depth policy: pruning the 16:2 rung's n=16 measured -9%)
-    // ⇒ `ks` is the uniform ladder shape and everything below reduces to the
-    // pre-D-Cut path exactly.
-    // DSpark's release contract is fixed K=3 at every width. D-Cut changes a
-    // sequence's verifier width from K+1=4 to 2/3 rows, which selects different
-    // native attention/LM dispatch shapes and is not greedy-equivalent to the
-    // C1 K=4 control. Keep DSpark uniform; D-Cut remains available to ordinary
-    // MTP where its width-specific quality/performance evidence applies.
-    let ks = if dflash_verify_raw_argmax {
-        vec![rows; batchable_idxs.len()]
-    } else {
-        mtp_dcut::plan(active, &mut batchable_idxs, ladder_nd, rows)
-    };
-    // The width the ASSIGNMENT was gated on (`plan` reorders `batchable_idxs`,
-    // never resizes it): the per-chunk re-ordering below must ask the gate with
-    // THIS width, never the chunk's, or a chunked batch could take the opposite
-    // arm from the one its depths were assigned under.
-    let batch_n = batchable_idxs.len();
+    let plan = early_plan.unwrap_or_else(|| {
+        one_forward::plan_verify(
+            model,
+            sched,
+            active,
+            &verify_idxs,
+            &[],
+            ladder_nd,
+            deep.then_some(num_drafts),
+            dflash_verify_raw_argmax,
+        )
+    });
+    let mut serial_idxs = plan.serial;
+    let batchable_idxs = plan.batch;
+    let ks = plan.ks;
 
     // Chunking: the 128-row buffer bound `can_batch_verify` enforces, with
     // the per-chunk sequence cap DERIVED from it (`VERIFY_ROW_BUDGET /
@@ -512,7 +226,10 @@ pub fn step_mtp(
     for (lo, hi) in mtp_dcut::chunk_ranges(&ks) {
         let chunk = &batchable_idxs[lo..hi];
         let chunk_ks = &ks[lo..hi];
-        if chunk.len() >= 2 && model.can_batch_verify(chunk_ks) {
+        // A lone chunk batches only where the model verifies one sequence's
+        // window wider than its own verify serves (`can_batch_verify`:
+        // qwen4_exp's exact lane past 4 rows).
+        if model.can_batch_verify(chunk_ks) {
             // Collect disjoint &mut refs — the iterator walk requires ASCENDING
             // indices, so sort a copy of the chunk before walking and restore
             // the batch order (with each sequence's k) immediately after.
@@ -531,17 +248,18 @@ pub fn step_mtp(
                 refs.push((a, k));
             }
             // Batch order, from the ONE ordering rule shared with the graph
-            // key (`verify_key`), asked with the SAME width gate `plan` used so
-            // order and assignment can never disagree. Canonical (n >=
-            // `CANONICAL_KEY_MIN_WIDTH` = 8): ssm slots ascending = also
-            // deepest-first under the canonical assignment, so the key is a
-            // function of the depth MULTISET not its arrangement (266 keys → 3
-            // at n=8) and each depth run owns a consecutive slot block for the
-            // batched-GDN precondition; below it, deepest-first then slot — the
-            // pre-canonical order byte for byte. Idempotent on `plan`'s ordered
-            // batch under both arms; it still runs because `plan` returns the
-            // batch UNORDERED whenever D-Cut declines, and that uniform-`k`
-            // case is the pre-D-Cut sort by slot. PERMUTATION ONLY — depths
+            // key (`verify_key`), asked with the arm `plan` chose so order
+            // and assignment can never disagree. Canonical (n >=
+            // `CANONICAL_KEY_MIN_WIDTH` = 8, every depth within the drafts
+            // its sequence holds): ssm slots ascending = also deepest-first
+            // under the canonical assignment, so the key is a function of the
+            // depth MULTISET not its arrangement (266 keys → 3 at n=8) and
+            // each depth run owns a consecutive slot block for the
+            // batched-GDN precondition; otherwise deepest-first then slot —
+            // the pre-canonical order byte for byte. Idempotent on `plan`'s
+            // ordered batch under both arms; it still runs because `plan`
+            // returns the batch UNORDERED whenever D-Cut declines (with
+            // uniform `k`, the sort by slot). PERMUTATION ONLY — depths
             // stay attached to the sequence
             // `plan` truncated for (`verify_k4_batch_step` pins
             // `drafts + 1 == ks[i]`). Verdicts are index-mapped inside the
@@ -554,7 +272,7 @@ pub fn step_mtp(
             let order = spark_model::speculative::verify_key::verify_batch_permutation(
                 &chunk_slots,
                 &chunk_depths,
-                spark_model::speculative::verify_key::canonical_assignment(batch_n),
+                plan.canonical,
             );
             let sorted_ks: Vec<usize> = order.iter().map(|&p| chunk_depths[p]).collect();
             let mut slotted: Vec<Option<&mut ActiveSeq>> =
@@ -567,6 +285,11 @@ pub fn step_mtp(
                         .expect("verify_batch_permutation is a permutation")
                 })
                 .collect();
+            for (a, &k) in batch.iter().zip(&sorted_ks) {
+                let path = if k > 1 { b'v' } else { b'd' };
+                super::mtp_step_trace::note_seq(a, path, k - 1);
+            }
+            super::mtp_step_trace::note_forward(sorted_ks.iter().sum());
             if dflash_verify_raw_argmax {
                 step_verify_dflash_batched(
                     model,
@@ -578,7 +301,9 @@ pub fn step_mtp(
                     dflash_verify_raw_argmax,
                 );
             } else {
-                step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
+                step_verify_k4_batched(
+                    model, &mut batch, sched, &sorted_ks, ladder_nd, num_drafts, verify_ctx,
+                );
             }
         } else {
             // Model can't batch this width (or a lone leftover): fall back
@@ -626,7 +351,19 @@ pub fn step_mtp(
             }
         }
         ladder_truncate(a, &mut drafts, ladder_nd);
+        // A window only the batched verify serves (qwen4_exp's exact lane
+        // past 4 rows) that lands here (grammar) takes the 4-row verify; so
+        // does a grammar sequence's deep window (`ladder_truncate` leaves it
+        // whole), whichever widths the model batches.
+        if !dflash_verify_raw_argmax
+            && drafts.len() > 3
+            && ((deep && a.grammar_state.is_some()) || model.can_batch_verify(&[drafts.len() + 1]))
+        {
+            drafts.truncate(3);
+        }
         conf.truncate(drafts.len());
+        super::mtp_step_trace::note_seq(a, b's', drafts.len());
+        super::mtp_step_trace::note_forward(drafts.len() + 1);
 
         // DFlash/DSpark verify: route by proposer, not draft count.
         // `--dflash` sets dflash_verify_raw_argmax. The old `drafts.len()>=4`

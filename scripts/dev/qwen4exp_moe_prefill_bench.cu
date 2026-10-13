@@ -12,7 +12,8 @@
 //   router    w4a16_gemm  vs  moe_q38_router_dequant + dense_gemm_bf16_pipelined
 //             ([tokens, 2560] x 512 experts; logits must match byte for byte)
 //
-// The `act` (SiLU*up) and down outputs must match byte for byte.
+// The `act` (SiLU*up) and down outputs must match byte for byte, as must the
+// W2 twins' (moe_q38w_*, ATLAS_QWEN4EXP_PREFILL_MOE_W2) against q38's.
 //
 // Build (repo root, GB10):
 //   D=$(mktemp -d); K=kernels/gb10/qwen3.8-flash-next/nvfp4; C=kernels/gb10/common
@@ -211,6 +212,38 @@ int main(int argc, char** argv) {
                t_a, t, gu_tf / t * 1e3, t2, dn_tf / t2 * 1e3);
         printf("MoE GEMMs: default %.3f ms -> fast %.3f ms (%.2fx)\n", t_gu + t_si + t_dn, t_a + t + t2,
                (t_gu + t_si + t_dn) / (t_a + t + t2));
+
+        // W2 twins (moe_q38w_*: 2 x 4 warp grid, 16-byte dequant stores):
+        // every byte of the activation and the down output must equal q38's.
+        CUfunction k_gus_w = m_q38.fn("moe_q38w_gate_up_silu"), k_dn_w = m_q38.fn("moe_q38w_down");
+        Buf<unsigned char> d_act8_w;
+        Buf<unsigned short> d_out_w;
+        d_act8_w.alloc((size_t)R * I);
+        d_out_w.alloc((size_t)R * H);
+        auto gate_up_silu_w = [&]() {
+            Args x;
+            x.add(d_a8.p).add(gate.ptr_p.p).add(gate.ptr_s.p).add(gate.s2.p)
+             .add(up.ptr_p.p).add(up.ptr_s.p).add(up.s2.p).add(d_act8_w.p)
+             .add(d_off.p).add(d_sorted.p).add(E).add(I).add(H);
+            launch(k_gus_w, dim3(I / 64, grid_m2, E), dim3(256), 0, x);
+        };
+        auto down_w = [&]() {
+            Args x;
+            x.add(d_act8.p).add(down.ptr_p.p).add(down.ptr_s.p).add(down.s2.p).add(d_out_w.p)
+             .add(d_off.p).add(E).add(H).add(I);
+            launch(k_dn_w, dim3(H / 128, grid_m2, E), dim3(256), 0, x);
+        };
+        d_act8_w.fill(0x55);
+        d_out_w.fill(0x44);
+        gate_up_silu_w();
+        down_w();
+        CK(cudaDeviceSynchronize());
+        const size_t dw = diff_bytes(d_act8.get(), d_act8_w.get()), dw2 = diff_bytes(d_out2.get(), d_out_w.get());
+        printf("bitwise W2 vs q38: act %zu, down output %zu differing bytes\n", dw, dw2);
+        ok = ok && dw == 0 && dw2 == 0;
+        const float tw = time_ms(gate_up_silu_w), tw2 = time_ms(down_w);
+        printf("W2:      gate_up+silu %.3f ms (%.1f TFLOP/s, %.2fx)  down %.3f ms (%.1f TFLOP/s, %.2fx)\n",
+               tw, gu_tf / tw * 1e3, t / tw, tw2, dn_tf / tw2 * 1e3, t2 / tw2);
     }
     // ── router: w4a16_gemm vs moe_q38_router_dequant + dense_gemm_bf16_pipelined ──
     PtxModule m_w4, m_gemm;
@@ -311,6 +344,65 @@ int main(int argc, char** argv) {
         float ts1 = time_ms(shared_old), ts2 = time_ms(shared_new);
         printf("shared expert: default %.3f ms (%.1f TFLOP/s) -> q38 %.3f ms (%.1f TFLOP/s), %.2fx\n",
                ts1, s_tf / ts1 * 1e3, ts2, s_tf / ts2 * 1e3, ts1 / ts2);
+        // W2 dense twins on the same inputs.
+        CUfunction k_sgu_w = m_q38.fn("moe_q38w_dense_gate_up_silu");
+        CUfunction k_sdn_w = m_q38.fn("moe_q38w_dense_down");
+        Buf<unsigned char> d_sact8_w;
+        Buf<unsigned short> d_so3;
+        d_sact8_w.alloc((size_t)T * I);
+        d_so3.alloc((size_t)T * H);
+        auto shared_w = [&]() {
+            Args a;
+            a.add(d_a.p).add(d_sa8.p).add(T * H);
+            launch(k_a8, dim3((T * H / 4 + 255) / 256), dim3(256), 0, a);
+            Args x;
+            x.add(d_sa8.p).add(sgp.p).add(sgs.p).add(s2g).add(sup.p).add(sus.p).add(s2u)
+             .add(d_sact8_w.p).add(T).add(I).add(H);
+            launch(k_sgu_w, dim3(I / 64, (T + 127) / 128), dim3(256), 0, x);
+            Args y;
+            y.add(d_sact8_w.p).add(sdp.p).add(sds.p).add(s2d).add(d_so3.p).add(T).add(H).add(I);
+            launch(k_sdn_w, dim3(H / 128, (T + 127) / 128), dim3(256), 0, y);
+        };
+        d_so3.fill(0x65);
+        shared_w();
+        CK(cudaDeviceSynchronize());
+        const size_t dsw = diff_bytes(d_so2.get(), d_so3.get());
+        printf("bitwise shared expert W2 vs q38 dense: %zu differing bytes\n", dsw);
+        ok = ok && dsw == 0;
+        const float ts3 = time_ms(shared_w);
+        printf("shared expert W2: %.3f ms (%.1f TFLOP/s), %.2fx vs q38\n", ts3, s_tf / ts3 * 1e3, ts2 / ts3);
+
+        // Row split (ATLAS_QWEN4EXP_PREFILL_SP_SHARED): the dense q38 / W2
+        // kernels run every row with the same k-chain whatever M is, so the
+        // two SP halves computed apart must equal the whole chunk.
+        if (T >= 4096) {
+            const unsigned S = ((T / 2 + 1024) / 2048) * 2048;
+            Buf<unsigned short> d_so5;
+            d_so5.alloc((size_t)T * H);
+            d_so5.fill(0x77);
+            for (int w2 = 0; w2 < 2; ++w2) {
+                CUfunction kg = w2 ? k_sgu_w : k_sgu, kd = w2 ? k_sdn_w : k_sdn;
+                for (unsigned half = 0; half < 2; ++half) {
+                    const unsigned r0 = half ? S : 0, m = half ? T - S : S;
+                    Args a;
+                    a.add(d_a.p + (size_t)r0 * H).add(d_sa8.p + (size_t)r0 * H).add(m * H);
+                    launch(k_a8, dim3((m * H / 4 + 255) / 256), dim3(256), 0, a);
+                    Args x;
+                    x.add(d_sa8.p + (size_t)r0 * H).add(sgp.p).add(sgs.p).add(s2g).add(sup.p).add(sus.p).add(s2u)
+                     .add(d_sact8_w.p + (size_t)r0 * I).add(m).add(I).add(H);
+                    launch(kg, dim3(I / 64, (m + 127) / 128), dim3(256), 0, x);
+                    Args y;
+                    y.add(d_sact8_w.p + (size_t)r0 * I).add(sdp.p).add(sds.p).add(s2d).add(d_so5.p + (size_t)r0 * H)
+                     .add(m).add(H).add(I);
+                    launch(kd, dim3(H / 128, (m + 127) / 128), dim3(256), 0, y);
+                }
+                CK(cudaDeviceSynchronize());
+                const size_t dsplit = diff_bytes(d_so2.get(), d_so5.get());
+                printf("bitwise shared expert split at %u of %u (%s) vs whole: %zu differing bytes\n", S, T,
+                       w2 ? "W2" : "q38", dsplit);
+                ok = ok && dsplit == 0;
+            }
+        }
     }
     // ── unpermute: dense (remote rows zeroed) vs local-only (remote rows garbage) ──
     if (have_q38) {
@@ -359,6 +451,28 @@ int main(int argc, char** argv) {
             size_t d = diff_bytes(d_o1.get(), d_o2.get());
             printf("bitwise unpermute (dense over zeroed remote rows vs local-only over garbage): %zu differing bytes\n", d);
             ok = ok && d == 0;
+            // Row ranges launched apart (ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE):
+            // the window first, in slab pieces, then the rest.
+            {
+                Buf<unsigned short> d_o3;
+                d_o3.alloc((size_t)T * H);
+                d_o3.fill(0x99);
+                const unsigned cut = T / 3 + 7;
+                for (auto [r0, n] : {std::pair<unsigned, unsigned>{cut, T - cut}, {0u, cut}}) {
+                    for (unsigned p0 = 0; p0 < n; p0 += 2048) {
+                        const unsigned m = std::min(2048u, n - p0), a = r0 + p0;
+                        Args x;
+                        x.add(d_eo_g.p).add(d_o3.p + (size_t)a * H).add(d_perm.p + (size_t)a * TOPK)
+                         .add(d_ids.p + (size_t)a * TOPK).add(d_w.p + (size_t)a * TOPK)
+                         .add(H).add(m).add(TOPK).add(0u).add(E);
+                        launch(k_local, dim3(m), dim3(H / 8), 0, x);
+                    }
+                }
+                CK(cudaDeviceSynchronize());
+                const size_t dr = diff_bytes(d_o2.get(), d_o3.get());
+                printf("bitwise unpermute by row ranges vs whole: %zu differing bytes\n", dr);
+                ok = ok && dr == 0;
+            }
             float t1 = time_ms(dense), t2 = time_ms(local);
             printf("unpermute: dense %.3f ms -> local-only %.3f ms (%.2fx); the dense arm also needs "
                    "%.0f MB of memsets a layer\n", t1, t2, t1 / t2,

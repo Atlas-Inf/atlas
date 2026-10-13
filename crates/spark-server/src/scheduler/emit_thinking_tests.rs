@@ -48,7 +48,8 @@ fn mtp_eos_cannot_bypass_output_or_context_ceiling() {
     for thinking in [true, false] {
         for output_ceiling in [true, false] {
             let remaining = if output_ceiling { 1 } else { 20 };
-            let (mut a, _) = test_seq(vec![10], remaining, None, 12);
+            // Held: a dropped receiver reads as a client disconnect.
+            let (mut a, _rx) = test_seq(vec![10], remaining, None, 12);
             a.finished = false;
             a.eos_tokens = vec![EOS];
             a.min_tokens = 100;

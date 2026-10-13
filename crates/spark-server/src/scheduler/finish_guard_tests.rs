@@ -38,6 +38,11 @@ const HARD_STOP_FILES: &[(&str, &str)] = &[
         include_str!("decode_logits_step.rs"),
     ),
     ("emit_step.rs", include_str!("emit_step.rs")),
+    // The commit rule both paths share (`<tool_response>`, think-skip).
+    (
+        "emit_step/think_commit.rs",
+        include_str!("emit_step/think_commit.rs"),
+    ),
 ];
 
 /// The log line every hard-stop site emits. This is the anchor: it is emitted
@@ -202,25 +207,40 @@ fn scan_finish_ledger(src: &str) -> (usize, usize) {
 fn every_finish_site_is_a_recorded_decision() {
     // (file, source, total `finished = true` sites, sites naming a guard).
     //
-    // Named — decode_logits_step: `<tool_response>`, think-skip watchdog,
-    // fuzzy_repetition. emit_step: `<tool_response>`, think-skip watchdog,
+    // Named — decode_logits_step: fuzzy_repetition. emit_step:
     // post_think_content_cap, content_loop_watchdog, inter_tool_prose_budget,
-    // tool_envelope_stuck. decode_logits_content (#328): post_think_content_cap,
+    // tool_envelope_stuck. emit_step/think_commit (the commit rule decode and
+    // emit share): `<tool_response>`, think-skip watchdog; its unnamed site is
+    // `<|im_start|>`. decode_logits_content (#328): post_think_content_cap,
     // content_loop_watchdog (rollback-declined), inter_tool_prose_budget
     // (rollback-declined — the cut Pi.dev received as a generic max-tokens
     // stop while the only truthful record was a server-side WARN line).
     // Unnamed remainder (deliberate): natural stops — the model sampled EOS,
     // the token budget / context ceiling hit, the cooperative cancel flag,
     // and `<|im_start|>` (eos-registered; see INTENTIONAL_STOP above for
-    // why naming it would reintroduce the opposite mislabel).
+    // why naming it would reintroduce the opposite mislabel). The verify span
+    // replay (`think_commit/shadow.rs`) finishes only its replay, which is
+    // restored before any token is committed: the commit path decides.
     const LEDGER: &[(&str, &str, usize, usize)] = &[
         (
             "decode_logits_step.rs",
             include_str!("decode_logits_step.rs"),
-            11,
-            3,
+            9,
+            1,
         ),
-        ("emit_step.rs", include_str!("emit_step.rs"), 10, 6),
+        ("emit_step.rs", include_str!("emit_step.rs"), 7, 4),
+        (
+            "emit_step/think_commit.rs",
+            include_str!("emit_step/think_commit.rs"),
+            3,
+            2,
+        ),
+        (
+            "emit_step/think_commit/shadow.rs",
+            include_str!("emit_step/think_commit/shadow.rs"),
+            2,
+            0,
+        ),
         // The cooperative-cancel retirement, shared with the decode path.
         (
             "emit_step/cancel.rs",

@@ -384,6 +384,10 @@ impl QsaIndexer {
                 stream,
             )?;
         } else if ops::qsa_prefill_attn_grouped_ok(nq, self.nkv_attn, self.hd_attn) {
+            // ATLAS_QWEN4EXP_PREFILL_QSA_GP: `_g`'s exact twin, rescheduled.
+            if ops::qwen4exp_prefill::try_qsa_prefill_attn_gp(gpu, &slab, stream)? {
+                return Ok(());
+            }
             ops::qsa_prefill_attn_g(
                 gpu,
                 self.k_prefill_attn_g_k,

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Rank-split propose (`ATLAS_GLM_DRAFT_TP`), model side.
+//! Rank-split propose (`ATLAS_GLM_DRAFT_TP`, `ATLAS_QWEN4EXP_MTP_DRAFT_TP`),
+//! model side.
 //!
-//! The head announces a single-sequence propose that will swap halves with
-//! the worker (`layers::dflash_head::rank_split`); the worker serves them
-//! from its own copy of the drafter, which proposes nothing.
+//! The head announces a propose that will swap work with the worker
+//! (`layers::dflash_head::rank_split`, `layers::qwen4exp_mtp::draft_tp`); the
+//! worker serves it from its own copy of the drafter ([`DraftAssist`]), which
+//! proposes nothing.
 //!
 //! Wire protocol, v2-addressed:
 //!
@@ -15,6 +17,8 @@
 //! EC  (seq_id rows | ctx << 12)
 //!                    -> either, with the rows of its context appends
 //!                       (`ATLAS_GLM_DRAFT_TP_CTX`, v2 only; `announce_word`)
+//! EC  (seq_id plan)  -> a qwen4_exp batched propose's draft head
+//!                       (`ATLAS_QWEN4EXP_MTP_DRAFT_TP`, v2 only; `draft_tp::Plan`)
 //! ```
 //!
 //! The command carries no payload: both ranks plan the swaps from the same
@@ -28,18 +32,58 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use spark_comm::CommBackend;
+use spark_runtime::gpu::GpuBackend;
 
 use super::types::TransformerModel;
 use crate::layers::BlockDiffusionDraftHead;
 use crate::layers::dflash_head::rank_split::announce_word;
+use crate::layers::qwen4exp_mtp::draft_tp::Qwen4ExpDraftAssist;
 use crate::speculative::DraftProposer;
 
 pub(super) const EP_CMD_DRAFT_ASSIST: u32 = 0xFFFF_FFEC;
 
+/// A worker rank's copy of the drafter, serving the head's announced
+/// proposes: `word` is the announce's preamble word.
+pub trait DraftAssist: Send + Sync {
+    /// Enqueue this rank's whole part of the announced propose on `stream`,
+    /// with no host sync (the swaps order it against the head).
+    fn serve(
+        &self,
+        gpu: &dyn GpuBackend,
+        comm: &dyn CommBackend,
+        stream: u64,
+        word: u32,
+    ) -> Result<()>;
+}
+
+impl DraftAssist for BlockDiffusionDraftHead {
+    fn serve(
+        &self,
+        gpu: &dyn GpuBackend,
+        comm: &dyn CommBackend,
+        stream: u64,
+        word: u32,
+    ) -> Result<()> {
+        self.rank_split_serve(gpu, comm, stream, word)
+    }
+}
+
+impl DraftAssist for Qwen4ExpDraftAssist {
+    fn serve(
+        &self,
+        gpu: &dyn GpuBackend,
+        comm: &dyn CommBackend,
+        stream: u64,
+        word: u32,
+    ) -> Result<()> {
+        Qwen4ExpDraftAssist::serve(self, gpu, comm, stream, word)
+    }
+}
+
 impl TransformerModel {
     /// Install the worker rank's copy of the drafter: it serves split
     /// proposes and is never the proposer.
-    pub fn set_draft_assist(&mut self, head: Arc<BlockDiffusionDraftHead>) {
+    pub fn set_draft_assist(&mut self, head: Arc<dyn DraftAssist>) {
         self.draft_assist = Some(head);
     }
 
@@ -81,6 +125,30 @@ impl TransformerModel {
         self.ep_broadcast_seq_and_cmd(announce_word(rows, ctx)?, EP_CMD_DRAFT_ASSIST, true)
     }
 
+    /// Head: `ATLAS_QWEN4EXP_MTP_DRAFT_TP`. When a batched propose of `n`
+    /// sequences and `num_drafts` positions will split its draft head,
+    /// announce it with its plan and return the communicator to hand it.
+    pub(super) fn announce_draft_tp(
+        &self,
+        proposer: &dyn DraftProposer,
+        n: usize,
+        num_drafts: usize,
+        grammar: bool,
+        ctx: &crate::layer::ForwardContext<'_>,
+    ) -> Result<Option<&dyn CommBackend>> {
+        let Some(comm) = self.comm_ref() else {
+            return Ok(None);
+        };
+        if !(self.multi_rank_protocol_active() && self.ep_protocol_v2) {
+            return Ok(None);
+        }
+        let Some(word) = proposer.draft_tp_word(comm, n, num_drafts, grammar, ctx) else {
+            return Ok(None);
+        };
+        self.ep_broadcast_seq_and_cmd(word, EP_CMD_DRAFT_ASSIST, true)?;
+        Ok(Some(comm))
+    }
+
     /// Worker side of EC: `seq_id` is the announce word (`announce_word`).
     pub(super) fn draft_assist_serve(&self, seq_id: u32) -> Result<bool> {
         let head = self
@@ -90,7 +158,7 @@ impl TransformerModel {
         let comm = self
             .comm_ref()
             .context("rank-split propose without a communicator")?;
-        head.rank_split_serve(self.gpu.as_ref(), comm, self.gpu.default_stream(), seq_id)?;
+        head.serve(self.gpu.as_ref(), comm, self.gpu.default_stream(), seq_id)?;
         Ok(true)
     }
 }

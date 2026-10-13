@@ -42,6 +42,10 @@ use spark_runtime::sampler::SamplingParams;
 #[path = "fast_greedy_copy_policy.rs"]
 mod copy_policy;
 pub(in crate::scheduler) use copy_policy::CopyFailurePolicy;
+mod raw_pick;
+pub(in crate::scheduler) use raw_pick::{
+    pick_row, raw_argmax_is_pick, raw_pick_masked, tool_pin_armed,
+};
 
 /// How the configured penalties interact with the greedy fast path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -4,7 +4,6 @@
 //! references it holds when it is freed.
 
 use super::super::super::types::TransformerModel;
-use super::enabled;
 use crate::traits::SequenceState;
 
 /// What `cache_sequence` does with a finished sequence's blocks.
@@ -59,7 +58,7 @@ impl TransformerModel {
     /// `cache_sequence` on the head: carry out [`finish_cache`]. `false`
     /// leaves the insert to the caller (a single-rank world).
     pub(in super::super) fn finish_cache_multi_rank(&self, seq: &SequenceState, bs: usize) -> bool {
-        match finish_cache(self.multi_rank_protocol_active(), enabled()) {
+        match finish_cache(self.multi_rank_protocol_active(), self.leaf_on()) {
             FinishCache::Mirrored => self.finish_leaf_cache(seq, bs),
             FinishCache::Skip => {}
             FinishCache::Local => return false,
@@ -82,7 +81,7 @@ impl TransformerModel {
         if seq.tokens.len() < seq.cached_prefix_tokens {
             return &seq.prefix_ref_tokens;
         }
-        let finish = finish_cache(self.multi_rank_protocol_active(), enabled());
+        let finish = finish_cache(self.multi_rank_protocol_active(), self.leaf_on());
         &seq.tokens[..held_tokens(finish, seq.prompt_len, seq.tokens.len())]
     }
 }

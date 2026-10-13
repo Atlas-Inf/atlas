@@ -253,18 +253,16 @@ extern "C" __global__ void rms_norm_strided(
     }
 }
 
-extern "C" __global__ void rms_norm_f32(
-    const float* __restrict__ input,           // [num_tokens, hidden_size] FP32
-    const __nv_bfloat16* __restrict__ weight,  // [hidden_size]
-    __nv_bfloat16* __restrict__ output,         // [num_tokens, hidden_size] BF16
+// One FP32 row -> BF16, normalized with `weight`. The body of `rms_norm_f32`
+// (one block per row), shared with `rms_norm_f32_grouped`.
+__device__ __forceinline__ void rms_norm_f32_row(
+    const float* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
     unsigned int hidden_size,
     float eps
 ) {
-    unsigned int token = blockIdx.x;
     unsigned int tid = threadIdx.x;
-
-    const float* x = input + token * hidden_size;
-    __nv_bfloat16* out = output + token * hidden_size;
 
     float sum_sq = 0.0f;
     for (unsigned int i = tid; i < hidden_size; i += blockDim.x) {
@@ -303,6 +301,38 @@ extern "C" __global__ void rms_norm_f32(
         float w = __bfloat162float(weight[hidden_size - 1]);
         out[hidden_size - 1] = __float2bfloat16(val * rms * (1.0f + w));
     }
+}
+
+extern "C" __global__ void rms_norm_f32(
+    const float* __restrict__ input,           // [num_tokens, hidden_size] FP32
+    const __nv_bfloat16* __restrict__ weight,  // [hidden_size]
+    __nv_bfloat16* __restrict__ output,         // [num_tokens, hidden_size] BF16
+    unsigned int hidden_size,
+    float eps
+) {
+    unsigned int token = blockIdx.x;
+    rms_norm_f32_row(input + token * hidden_size, weight, output + token * hidden_size,
+                     hidden_size, eps);
+}
+
+// `rms_norm_f32` over `num_rows` rows whose weights cycle with period
+// `weight_period`: row r uses `weight + (r % weight_period) * hidden_size`.
+// The per-stream norms of an mHC highway ([rows, hc, hidden], one weight per
+// stream) in one launch instead of one launch per (row, stream); each block
+// is `rms_norm_f32`'s, so every row's bytes are too.
+// Grid: (num_rows, 1, 1); block: (min(hidden_size, 1024), 1, 1).
+extern "C" __global__ void rms_norm_f32_grouped(
+    const float* __restrict__ input,           // [num_rows, hidden_size] FP32
+    const __nv_bfloat16* __restrict__ weight,  // [weight_period, hidden_size]
+    __nv_bfloat16* __restrict__ output,         // [num_rows, hidden_size] BF16
+    unsigned int hidden_size,
+    float eps,
+    unsigned int weight_period
+) {
+    unsigned int row = blockIdx.x;
+    rms_norm_f32_row(input + (size_t)row * hidden_size,
+                     weight + (size_t)(row % weight_period) * hidden_size,
+                     output + (size_t)row * hidden_size, hidden_size, eps);
 }
 
 // Fused RMS Norm + Residual Save: normed = (1+w) * norm(input), residual = input.

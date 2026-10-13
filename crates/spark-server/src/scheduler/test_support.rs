@@ -114,6 +114,8 @@ pub(super) fn test_owned_seq(
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: 0,
+        loop_steers: 0,
+        loop_steer_max: 0,
         rollback_count: 0,
         ssm_rollback_ring: SsmDecodeRing::new(0),
         grammar_state: None,

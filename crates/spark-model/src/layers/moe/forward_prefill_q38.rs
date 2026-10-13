@@ -27,18 +27,56 @@
 //! selected. Remote experts (EP) have null tables and return early, as in the
 //! default kernels, so `prepare_ep_prefill_outputs`' zeroing still stands.
 //!
+//! `ATLAS_QWEN4EXP_PREFILL_MOE_W2=1` runs the GEMMs on their `moe_q38w_*`
+//! twins (2 x 4 warp grid, 16-byte dequant stores), byte-identical; see
+//! [`w2_requested`].
+//!
 //! `ATLAS_QWEN4EXP_PREFILL_MOE_CHECK=<n>`: for the first `n` layer calls, run
 //! the q38 chain, keep its `expert_down_out` on the host, run the default
 //! chain over the same buffers, and fail on any differing byte
 //! (synchronizing, ~0.8 GB of host memory at a 16K chunk; diagnostic only).
 
 use super::*;
+use crate::layers::ops::qwen4exp_rowinv::bf16_proj;
 use spark_runtime::kernel_args::KernelLaunch;
 
-/// `ATLAS_QWEN4EXP_PREFILL_MOE=1`.
+/// `ATLAS_QWEN4EXP_PREFILL_MOE=1`, implied by `ATLAS_QWEN4EXP_PREFILL_BF16_PROJ`.
 pub(crate) fn q38_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE"))
+    let flag = super::forward_prefill_routed::env_flag;
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_MOE") || bf16_proj())
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_MOE_W2=1` (with `_MOE`): the routed and shared
+/// GEMMs on the `moe_q38w_*` twins -- the same k32 MMAs per output on a 2 x 4
+/// warp grid with 16-byte dequant stores, every byte identical
+/// (`scripts/dev/qwen4exp_moe_prefill_bench.cu`; GB10, 16000 tokens:
+/// gate_up+silu 10.25 -> 8.65 ms, down 5.91 -> 5.13, shared 3.42 -> 3.18).
+/// It also takes the router below 32 rows (byte-identical logits at 1..31
+/// rows; a 30-row pass: 0.31 -> 0.13 ms a layer).
+pub(crate) fn w2_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE_W2"))
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_SP_SHARED=1`; see [`MoeLayer::q38_sp_rows`].
+pub(crate) fn sp_shared_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_SP_SHARED"))
+}
+
+/// The q38 entry `name`, or its `moe_q38w_*` twin under `_MOE_W2`.
+fn q38_entry(name: &'static str) -> &'static str {
+    if !w2_requested() {
+        return name;
+    }
+    match name {
+        "moe_q38_gate_up_silu" => "moe_q38w_gate_up_silu",
+        "moe_q38_down" => "moe_q38w_down",
+        "moe_q38_dense_gate_up_silu" => "moe_q38w_dense_gate_up_silu",
+        "moe_q38_dense_down" => "moe_q38w_dense_down",
+        other => other,
+    }
 }
 
 /// Layer calls left to cross-check (`1` or `true` means 16).
@@ -107,7 +145,7 @@ impl MoeLayer {
         let bytes = n_out as usize * h as usize * 2;
         if !q38_requested()
             || ctx.config.model_type != "qwen4_exp"
-            || n < 32
+            || (n < 32 && !w2_requested())
             || !h.is_multiple_of(16)
             || ctx.buffers.sizes().expert_up_out < bytes
         {
@@ -130,17 +168,62 @@ impl MoeLayer {
             .arg_u32(n_out)
             .arg_u32(h)
             .launch(stream)?;
-        KernelLaunch::new(gpu, k_gemm)
-            .grid([n_out.div_ceil(128), n.div_ceil(128), 1])
-            .block([256, 1, 1])
-            .arg_ptr(router_in)
-            .arg_ptr(w_bf16)
-            .arg_ptr(logits)
-            .arg_u32(n)
-            .arg_u32(n_out)
-            .arg_u32(h)
-            .launch(stream)?;
+        super::forward_prefill_route_sp::q38_router_gemm(
+            gpu,
+            k_gemm,
+            [router_in, w_bf16, logits],
+            [n, n_out, h],
+            stream,
+        )?;
         Ok(true)
+    }
+
+    /// The q38 shared-expert arm takes this layer's shape (row count aside).
+    fn q38_shared_shape_serves(&self, h: u32, inter: u32, ctx: &ForwardContext) -> bool {
+        q38_requested()
+            && ctx.config.model_type == "qwen4_exp"
+            && self.shared_gate_t.is_some()
+            && self.shared_up_t.is_some()
+            && self.shared_down_t.is_some()
+            && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && self.shared_gate_fp8.is_none()
+            && self.shared_up_fp8.is_none()
+            && self.shared_down_fp8.is_none()
+            && self.bf16_shared_expert.is_none()
+            && !self.m5_projections.shared.enabled()
+            && !self.gelu_activation
+            && self.lora.is_none()
+            && h.is_multiple_of(128)
+            && inter.is_multiple_of(64)
+    }
+
+    /// `ATLAS_QWEN4EXP_PREFILL_SP_SHARED=1`: under the qwen4_exp SP split,
+    /// the shared expert runs only this rank's rows instead of every row
+    /// (`SpRows::full_shared` off), when the q38 arm serves it. Its kernels
+    /// give every row the same arithmetic whatever the row count -- 128-row
+    /// tiles, one in-order k32 chain per output, elementwise E4M3 input -- so
+    /// the halves computed apart equal the whole chunk byte for byte
+    /// (`scripts/dev/qwen4exp_moe_prefill_bench.cu`: 16016 split at 8192,
+    /// 12000 at 6144, 5000 at 2048; q38 and W2). GB10, 16000 rows: 3.2 ms a
+    /// layer -> about half on each rank.
+    pub(super) fn q38_sp_rows(
+        &self,
+        sp: crate::layers::glm_sp::SpRows,
+        h: u32,
+        inter: u32,
+        ctx: &ForwardContext,
+    ) -> crate::layers::glm_sp::SpRows {
+        let tiers_skip =
+            |rows: usize| crate::layers::w4a16_gemv_tiers::tc_kernel(rows as u32).0 == 0;
+        let split = sp.full_shared
+            && sp_shared_requested()
+            && self.q38_shared_shape_serves(h, inter, ctx)
+            && tiers_skip(sp.rows)
+            && tiers_skip(sp.total());
+        crate::layers::glm_sp::SpRows {
+            full_shared: sp.full_shared && !split,
+            ..sp
+        }
     }
 
     /// The shared expert of a prefill chunk, when the q38 arm serves it: the
@@ -168,18 +251,7 @@ impl MoeLayer {
             return Ok(false);
         };
         let sizes = ctx.buffers.sizes();
-        let serves = q38_requested()
-            && ctx.config.model_type == "qwen4_exp"
-            && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
-            && self.shared_gate_fp8.is_none()
-            && self.shared_up_fp8.is_none()
-            && self.shared_down_fp8.is_none()
-            && self.bf16_shared_expert.is_none()
-            && !self.m5_projections.shared.enabled()
-            && !self.gelu_activation
-            && self.lora.is_none()
-            && h.is_multiple_of(128)
-            && inter.is_multiple_of(64)
+        let serves = self.q38_shared_shape_serves(h, inter, ctx)
             && sizes.ssm_deinterleaved >= n as usize * inter as usize
             && sizes.ssm_qkvz >= n as usize * h as usize;
         if !serves || out[0] != ctx.buffers.ssm_deinterleaved() || out[1] != ctx.buffers.ssm_qkvz()
@@ -188,8 +260,13 @@ impl MoeLayer {
         }
         let gpu = ctx.gpu;
         let k_a8 = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_a_to_e4m3");
-        let k_gu = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_dense_gate_up_silu");
-        let k_dn = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_dense_down");
+        let k_gu = crate::layers::try_kernel(
+            gpu,
+            "moe_prefill_q38",
+            q38_entry("moe_q38_dense_gate_up_silu"),
+        );
+        let k_dn =
+            crate::layers::try_kernel(gpu, "moe_prefill_q38", q38_entry("moe_q38_dense_down"));
         if k_a8.0 == 0 || k_gu.0 == 0 || k_dn.0 == 0 {
             return Ok(false);
         }
@@ -289,18 +366,17 @@ impl MoeLayer {
     }
 
     /// Whether the q38 routed chain serves this layer's prefill: the shape the
-    /// default chain it replaces runs (NVFP4 transposed tables, SiLU, no expert
+    /// default chain it replaces runs (NVFP4 transposed tables -- or the
+    /// checkpoint's, `forward_prefill_q38_nodup` -- SiLU, no expert
     /// LoRA, none of the alternative gate/up or down arms). Also read before
     /// the grid is sized: the q38 kernels stride their row tiles, so they do
     /// not need the exact per-expert tile count, nor the host round trip
     /// (`ATLAS_MOE_PREFILL_EXACT_TILES`) that buys it.
     pub(super) fn q38_routed_serves(&self, h: u32, inter: u32, ctx: &ForwardContext) -> bool {
-        let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref() == Some("1");
+        let fp8_down = super::forward_prefill_routed::prefill_fp8_down();
         q38_requested()
             && ctx.config.model_type == "qwen4_exp"
-            && self.gate_ptrs_t.is_some()
-            && self.up_ptrs_t.is_some()
-            && self.down_ptrs_t.is_some()
+            && self.q38_routed_tables(h, inter).is_some()
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && !self.btile_storage.is_published()
             && !self.nvfp4_mmq_layout
@@ -333,18 +409,30 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        let (Some(gp), Some(up), Some(dp)) =
-            (&self.gate_ptrs_t, &self.up_ptrs_t, &self.down_ptrs_t)
-        else {
+        // K-major tables, or the checkpoint's under `_MOE_NODUP` (`nm`).
+        let Some(([gp, up, dp], nm)) = self.q38_routed_tables(h, inter) else {
             return Ok(false);
         };
         if !self.q38_routed_serves(h, inter, ctx) {
             return Ok(false);
         }
+        // ATLAS_QWEN4EXP_PREFILL_MOE_BF16: the same work on the TC numerics.
+        let dims = (h, inter, num_experts, rows_per_expert_grid);
+        if self.try_tcp_routed_prefill(
+            expert_input,
+            expert_offsets,
+            sorted_token_ids,
+            dims,
+            ctx,
+            stream,
+        )? {
+            return Ok(true);
+        }
         let gpu = ctx.gpu;
         let k_a8 = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_a_to_e4m3");
-        let k_gu = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_gate_up_silu");
-        let k_dn = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_down");
+        let entry = |name| super::forward_prefill_q38_nodup::routed_entry(q38_entry(name), nm);
+        let k_gu = crate::layers::try_kernel(gpu, "moe_prefill_q38", entry("moe_q38_gate_up_silu"));
+        let k_dn = crate::layers::try_kernel(gpu, "moe_prefill_q38", entry("moe_q38_down"));
         if k_a8.0 == 0 || k_gu.0 == 0 || k_dn.0 == 0 {
             return Ok(false);
         }
@@ -394,7 +482,7 @@ impl MoeLayer {
             .arg_u32(h)
             .arg_u32(inter)
             .launch(stream)?;
-        if check_left().fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+        if !nm && check_left().fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
             // Keep this result and let the default chain run over the same
             // buffers; `finish_q38_check` compares once it has.
             gpu.synchronize(stream)?;

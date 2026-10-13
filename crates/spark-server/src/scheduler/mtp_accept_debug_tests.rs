@@ -43,12 +43,25 @@ fn widths_up_to_the_cap_do_not_alias() {
 
 use super::*;
 
+const OFF: DepthLevers = DepthLevers {
+    adapt: false,
+    deep: false,
+};
+const ADAPT: DepthLevers = DepthLevers {
+    adapt: true,
+    deep: false,
+};
+const DEEP: DepthLevers = DepthLevers {
+    adapt: true,
+    deep: true,
+};
+
 #[test]
 fn empty_suffix_is_zeros() {
     let a = RequestAccept::default();
     assert_eq!(
         a.done_suffix(),
-        "serial=0.00 mtp=0.00 p1=0.000 mean_na=0.000 tok_step=1.000 regime_reprobes=0 depth=k5 depth_switches=0 surv=0.00,0.00,0.00,0.00,0.00,0.00,0.00"
+        "serial=0.00 mtp=0.00 p1=0.000 mean_na=0.000 tok_step=1.000 regime_reprobes=0 depth=k5 depth_switches=0 acc=-,-,-,-,-,-,- surv=0.00,0.00,0.00,0.00,0.00,0.00,0.00"
     );
 }
 
@@ -137,13 +150,13 @@ fn saturated_k3_triggers_a_deep_probe() {
 fn fixed_single_draft_reports_k2_without_adaptive_depth() {
     let mut a = RequestAccept::default();
     for accepted in [1, 0, 1] {
-        a.record_depth_verify(1, accepted, false);
+        a.record_depth_verify(1, accepted, 3, OFF);
         a.record_verify_emitted(accepted + 1);
         assert!(a.done_suffix().contains("depth=k2 "));
         assert!(a.tok_step() <= 2.0);
-        assert_eq!(a.depth_drafts(1, false), 1);
+        assert_eq!(a.depth_drafts(1, OFF), 1);
     }
-    a.record_depth_verify(4, 4, false);
+    a.record_depth_verify(4, 4, 3, OFF);
     assert!(a.done_suffix().contains("depth=k5 "));
 }
 
@@ -151,11 +164,11 @@ fn fixed_single_draft_reports_k2_without_adaptive_depth() {
 fn fixed_two_drafts_report_k3_without_adaptation_or_depth_lift() {
     let mut a = RequestAccept::default();
     for accepted in [2, 1, 0, 2] {
-        a.record_depth_verify(2, accepted, false);
+        a.record_depth_verify(2, accepted, 3, OFF);
         a.record_verify_emitted(accepted + 1);
         assert!(a.done_suffix().contains("depth=k3 "));
         assert!(a.tok_step() <= 3.0);
-        assert_eq!(a.depth_drafts(2, false), 2);
+        assert_eq!(a.depth_drafts(2, OFF), 2);
     }
 }
 
@@ -164,20 +177,35 @@ fn a_two_or_three_draft_ceiling_is_steered_by_the_depth_ladder_only_when_armed()
     let mut a = RequestAccept::default();
     // Unarmed: the ladder is never fed and never consulted.
     for _ in 0..64 {
-        a.record_depth_verify(3, 0, false);
+        a.record_depth_verify(3, 0, 3, OFF);
     }
-    assert_eq!(a.depth_drafts(3, false), 3);
+    assert_eq!(a.depth_drafts(3, OFF), 3);
     assert_eq!(
-        a.depth_drafts(3, true),
+        a.depth_drafts(3, ADAPT),
         3,
         "an unfed ladder starts at the ceiling"
     );
     // Armed at a 2/3-draft ceiling the ladder answers, never above the ceiling;
     // the GLM K5/K3 controller keeps 4+.
     for _ in 0..64 {
-        a.record_depth_verify(3, 0, true);
+        a.record_depth_verify(3, 0, 3, ADAPT);
     }
-    assert!((1..=3).contains(&a.depth_drafts(3, true)));
-    assert!((1..=2).contains(&a.depth_drafts(2, true)));
-    assert_eq!(a.depth_drafts(4, true), 4);
+    assert!((1..=3).contains(&a.depth_drafts(3, ADAPT)));
+    assert!((1..=2).contains(&a.depth_drafts(2, ADAPT)));
+    assert_eq!(a.depth_drafts(4, ADAPT), 4);
+}
+
+#[test]
+fn the_dynamic_depth_steers_a_deep_ceiling_and_supersedes_the_ladders() {
+    let mut a = RequestAccept::default();
+    // Starts at the floor (3), not the GLM controller's 4 or the ceiling.
+    assert_eq!(a.depth_drafts(7, DEEP), 3);
+    // Every verify accepts its deepest draft: promoted past the ladder.
+    for _ in 0..super::super::mtp_deep_depth::WINDOW {
+        a.record_depth_verify(3, 3, 7, DEEP);
+    }
+    assert_eq!(a.depth_drafts(7, DEEP), 5);
+    assert!(a.done_suffix().contains("acc=1.00,1.00,1.00,-,-,-,-"));
+    // A ceiling of 3 or less stays with the existing ladders.
+    assert_eq!(a.depth_drafts(3, DEEP), 3);
 }

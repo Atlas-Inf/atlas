@@ -248,6 +248,10 @@ impl TransformerModel {
         let slot = slot_guard
             .idx()
             .expect("claim_guarded returns a guard owning a slot");
+        // A slot released by its guard (abort, panic) skipped `free`: drop any
+        // commit its last sequence left pending, or a flush would land it on
+        // this one (ATLAS_QWEN4EXP_GDN_COMMIT_FUSE).
+        self.gdn_fuse_drop_slot(slot);
         let t_claim = t_alloc.elapsed();
         // NOTE: `reset_slot` below zeroes h_state + conv_state + intermediates +
         // checkpoints — a strict superset of `zero_slot` (h+conv only). The
@@ -287,6 +291,7 @@ impl TransformerModel {
                     gdn_commit_qkv: DevicePtr(0),
                     gdn_commit_gb: DevicePtr(0),
                     gdn_commit_pending: false,
+                    gdn_fuse_n: DevicePtr::NULL,
                     // A freshly allocated slot has just been zeroed, and zero
                     // is zero in both formats. Which format it then HOLDS is
                     // decided by the pool width, not by the phase: under the
@@ -396,6 +401,7 @@ impl TransformerModel {
             prefix_lookup_applied: false,
             prefix_lookup_skip: false,
             pc_branch_at: None,
+            pc_plant_at: None,
             finish_leaf: Default::default(),
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,

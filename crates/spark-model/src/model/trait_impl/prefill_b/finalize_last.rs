@@ -37,6 +37,7 @@ impl TransformerModel {
             proc_count,
             0,
             0,
+            None,
             stream,
         )
     }
@@ -55,6 +56,9 @@ impl TransformerModel {
         proc_count: usize,
         hidden_stream_offset_tokens: usize,
         logits_row: usize,
+        // The last row's logits, when the caller projected them already
+        // (`multi`: every sequence's row of a multi-sequence pass at once).
+        logits_in: Option<DevicePtr>,
         stream: u64,
     ) -> Result<DevicePtr> {
         let h = self.config.hidden_size;
@@ -194,7 +198,9 @@ impl TransformerModel {
         // streams' first token collapses to one shared buffer (cross-request
         // contamination). Row 0 (single-stream + batched stream 0) keeps the
         // byte-identical `lm_head` GEMV path; rows >0 write to their own offset.
-        let logits_ptr = if logits_row == 0 {
+        let logits_ptr = if let Some(ptr) = logits_in {
+            ptr
+        } else if logits_row == 0 {
             self.lm_head(normed, stream)?;
             self.decode_logits_ptr()
         } else {
@@ -396,7 +402,10 @@ impl TransformerModel {
                     // would serve the previous request's lexical state, so
                     // aux-carrying models decline aux-less slots on restore.
                     let mut aux = self.ssm_snapshots.take_aux(snap_id);
-                    self.collect_aux_states_into(seq, stream, &mut aux)?;
+                    // ATLAS_QWEN4EXP_CKPT_AUX_SHARE: the mid-chunk finalize read these.
+                    if !super::qwen4exp_ckpt::take_pass_aux(seq.slot_idx, seq.seq_len, &mut aux) {
+                        self.collect_aux_states_into(seq, stream, &mut aux)?;
+                    }
                     if !aux.is_empty() {
                         self.ssm_snapshots.set_aux(snap_id, aux);
                     }

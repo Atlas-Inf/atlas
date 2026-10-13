@@ -217,7 +217,7 @@ pub fn step_verify_k3(
     };
     if !dflash_verify_raw_argmax {
         a.mtp_acct
-            .record_depth_verify(2, num_accepted, sched.levers.mtp_single_depth_adapt);
+            .record_depth_verify(2, num_accepted, num_drafts, sched.levers.depth());
     }
 
     // Shadow top-k target line (ATLAS_MTP_SHADOW_TOPK): joins offline with
@@ -323,12 +323,12 @@ pub fn step_verify_k3(
             a.abort_on_engine_error(&e);
             return;
         }
-        emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
+        emit_span_row(a, drafts[0], verify_lps.first().cloned(), sched, 0, 3);
         if !a.finished {
-            emit_token(a, drafts[1], verify_lps.get(1).cloned(), sched);
+            emit_span_row(a, drafts[1], verify_lps.get(1).cloned(), sched, 1, 3);
         }
         if !a.finished {
-            emit_token(a, v2, verify_lps.get(2).cloned(), sched);
+            emit_span_row(a, v2, verify_lps.get(2).cloned(), sched, 2, 3);
         }
         if a.finished {
             return;
@@ -355,8 +355,7 @@ pub fn step_verify_k3(
             a.seq.seq_len,
             crate::scheduler::spec_step::effective_drafts_under_grammar(
                 a,
-                a.mtp_acct
-                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
             ),
             &mut a.seq,
             0,
@@ -390,9 +389,9 @@ pub fn step_verify_k3(
             a.abort_on_engine_error(&e);
             return;
         }
-        emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
+        emit_span_row(a, drafts[0], verify_lps.first().cloned(), sched, 0, 2);
         if !a.finished {
-            emit_token(a, v1, verify_lps.get(1).cloned(), sched);
+            emit_span_row(a, v1, verify_lps.get(1).cloned(), sched, 1, 2);
         }
         if a.finished {
             return;
@@ -415,8 +414,7 @@ pub fn step_verify_k3(
             a.seq.seq_len,
             crate::scheduler::spec_step::effective_drafts_under_grammar(
                 a,
-                a.mtp_acct
-                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
             ),
             &mut a.seq,
             0,
@@ -473,8 +471,7 @@ pub fn step_verify_k3(
             a.seq.seq_len,
             crate::scheduler::spec_step::effective_drafts_under_grammar(
                 a,
-                a.mtp_acct
-                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
             ),
             &mut a.seq,
             0,

@@ -116,6 +116,18 @@ name = "qwen4exp_hc_prefill_check"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "lt_kchain_pin_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "qwen4exp_row_invariance"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "qwen4exp_rowinv_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm_sparse_split_bench"
 required-features = ["cuda", "gpu-examples"]
 

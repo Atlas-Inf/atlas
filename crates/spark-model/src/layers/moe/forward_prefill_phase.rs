@@ -166,6 +166,19 @@ impl MoeLayer {
             return Ok(());
         }
 
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: the decode shared expert's TC numerics.
+        if self.try_tcp_shared(
+            input,
+            (n, h, shared_inter),
+            [shared_gate_out, shared_down_out],
+            ctx,
+            aux,
+        )? {
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         // ATLAS_QWEN4EXP_PREFILL_MOE: the transposed w4a16_gemm_t arm below,
         // byte for byte, on the q38 kernels (`forward_prefill_q38.rs`).
         if self.try_q38_shared(

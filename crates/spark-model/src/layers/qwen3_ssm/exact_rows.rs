@@ -8,7 +8,8 @@
 //! block-scaled copy), `w4a16_gemv[_sw]` (NVFP4) or `dense_gemv_bf16` (BF16),
 //! in that order of preference. Each has a batched GEMV whose rows are those
 //! bytes — `w8a16_gemv_batch4/16`, the `w4a16_gemv_batchN` tiers,
-//! `dense_gemv_bf16_batchm` — that reads the weight once per launch. The
+//! `dense_gemv_bf16_batchm` and its 16/32-row twins (`ops::Qwen4ExpWideRows`)
+//! — that reads the weight once per launch. The
 //! multi-sequence decode and the batched verifies take cuBLASLt / tile GEMMs
 //! at some widths instead, which are not; under the switch both come here.
 
@@ -103,25 +104,15 @@ impl Qwen3SsmLayer {
             if !self.w4a16_batchm.has_base() {
                 return Ok(false);
             }
-            let chunk = if self.w4a16_batchm.width(8).is_some() {
-                8
-            } else {
-                4
-            };
-            for first in (0..rows).step_by(chunk) {
-                let m = (rows - first).min(chunk) as u32;
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
-                    self.w4a16_batchm.kernel(m),
-                    input.offset(first * in_row),
-                    w,
-                    output.offset(first * out_row),
-                    m,
-                    n as u32,
-                    k as u32,
-                    stream,
-                )?;
-            }
+            self.wide_rows.w4a16_rows(
+                ctx.gpu,
+                &self.w4a16_batchm,
+                input,
+                w,
+                output,
+                (rows as u32, n as u32, k as u32),
+                stream,
+            )?;
             return Ok(true);
         }
         let dense = match proj {
@@ -136,16 +127,13 @@ impl Qwen3SsmLayer {
         if self.dense_gemv_batchm_k.0 == 0 {
             return Ok(false);
         }
-        ops::dense_gemv_batchm_chunked(
+        self.wide_rows.dense_rows(
             ctx.gpu,
             self.dense_gemv_batchm_k,
             input,
             w,
             output,
-            rows as u32,
-            n as u32,
-            k as u32,
-            n as u32,
+            (rows as u32, n as u32, k as u32, n as u32),
             stream,
         )?;
         Ok(true)

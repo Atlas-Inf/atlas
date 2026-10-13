@@ -24,6 +24,20 @@ fn flash_next_split_is_aligned_and_covers_the_vocabulary_once() {
 }
 
 #[test]
+fn verify_staging_covers_the_batched_verify() {
+    assert_eq!(
+        staging_rows(8, false, 3),
+        8,
+        "the batch width without the switch"
+    );
+    assert_eq!(staging_rows(8, true, 3), 32, "C8 x K=4");
+    assert_eq!(staging_rows(8, true, 0), 16, "unset depth: one draft, K=2");
+    assert_eq!(staging_rows(8, true, 7), MAX_STAGING_ROWS);
+    assert_eq!(staging_rows(1, false, 0), MIN_STAGING_ROWS);
+    assert_eq!(staging_rows(1, true, 3), MIN_STAGING_ROWS);
+}
+
+#[test]
 fn every_vocabulary_partitions_into_two_owned_ranges() {
     for vocab in (16..300).chain([154856, 248320, FLASH_NEXT_VOCAB]) {
         let s = Split::new(vocab).unwrap();

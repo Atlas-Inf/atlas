@@ -75,7 +75,9 @@
 //! collectives and chunk shapes and the pair deadlocks, or pairs a
 //! restore-depth reduction with the peer's KV-admission vote. The ranks
 //! compare them at startup (`model::startup_parity`), with
-//! `ATLAS_EP_PROTOCOL` and the rest of that table.
+//! `ATLAS_EP_PROTOCOL` and the rest of that table. `ATLAS_GLM_PC_INFLIGHT`
+//! is not among them: only the head's scheduler reads it, and the worker
+//! plants what the head sends (`pc_inflight`).
 //!
 //! So are `ATLAS_GLM_PC_WRITE_FLOOR` and `ATLAS_GLM_KV_WRITE_FLOOR_LEGACY`.
 //! A mismatch there does not deadlock (the cache writes they skip are not
@@ -115,6 +117,26 @@ pub(in crate::model) fn glm_pc_branch_min_tokens() -> usize {
 pub(in crate::model) fn glm_pc_write_floor_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_PC_WRITE_FLOOR").as_deref() == Ok("1"))
+}
+
+/// The base KV write floor of a prefill pass over `[start, start + rows)`:
+/// with a Marconi restore (`marconi_skip`) the replay rows under the radix
+/// match `cached`, so the shared blocks keep their bytes; otherwise
+/// `kv_write_start` (the prefix lookup's skip depth, 0 without a restore).
+/// Shared by the single pass (`forward_layers`) and each sequence of a
+/// multi-sequence pass (`multi`), so both write the same rows.
+pub(super) fn replay_floor(
+    marconi_skip: bool,
+    cached: usize,
+    kv_write_start: usize,
+    start: usize,
+    rows: usize,
+) -> usize {
+    if marconi_skip {
+        cached.saturating_sub(start).min(rows)
+    } else {
+        kv_write_start
+    }
 }
 
 /// The KV write floor a prefill pass over rows `[start, start + rows)` hands
@@ -292,6 +314,10 @@ impl TransformerModel {
                     .ssm_snapshots
                     .session_matches(snap_id, seq.session_hash))
             && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: only a restore on the GDN grid
+            // replays what the cold pass computes.
+            && (!crate::layers::ops::qwen4exp_rowinv::on()
+                || snap_tok.is_multiple_of(crate::layers::ops::qwen4exp_rowinv::PASS_GRANULE))
     }
 
     /// Agree on one restore `(snapshot, depth, is_tail)` across ranks (see
@@ -354,7 +380,10 @@ impl TransformerModel {
         bs: usize,
     ) -> Result<()> {
         seq.pc_branch_at = None;
-        if !glm_pc_branch_enabled()
+        // ATLAS_QWEN4EXP_PC_BRANCH: the same plan, captured in-pass
+        // (`qwen4exp_points`), with its own minimum.
+        let in_pass = self.qwen4exp_pc_branch();
+        if !(glm_pc_branch_enabled() || in_pass)
             || self.config.num_ssm_layers() == 0
             || !self.ssm_snapshots.is_enabled()
             || !self.prefix_cache.is_active()
@@ -362,7 +391,11 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        let min = glm_pc_branch_min_tokens();
+        let min = if in_pass {
+            super::qwen4exp_points::branch_min()
+        } else {
+            glm_pc_branch_min_tokens()
+        };
         let Some(at) = branch_checkpoint_at(matched, skip_to, tokens.len(), bs, min) else {
             return Ok(());
         };

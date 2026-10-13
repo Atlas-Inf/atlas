@@ -30,6 +30,7 @@ mod chunk_retry;
 mod kv_refusal;
 mod min_tokens_ban;
 mod resume;
+mod shared_prefix_admit;
 mod victim_policy;
 
 /// Scripted stub: `decode_batch` fails with the KV-exhausted error for the
@@ -60,6 +61,9 @@ struct PreemptStubModel {
     /// `decode_batch` fails with an agreed, retryable refusal raised after
     /// this many sequences of a per-sequence loop already ran.
     partial_refusal_after: Option<usize>,
+    /// Shared-prefix admission: `pc_inflight_min_tokens`, and a multi-rank
+    /// world with 16-token blocks when set.
+    inflight_min: Option<usize>,
 }
 
 impl PreemptStubModel {
@@ -291,6 +295,15 @@ impl Model for PreemptStubModel {
     }
     fn num_total_blocks(&self) -> usize {
         self.total_blocks
+    }
+    fn pc_inflight_min_tokens(&self) -> Option<usize> {
+        self.inflight_min
+    }
+    fn kv_block_size(&self) -> Option<usize> {
+        self.inflight_min.map(|_| 16)
+    }
+    fn is_ep(&self) -> bool {
+        self.inflight_min.is_some()
     }
     fn reclaim_prefix_blocks(&self, num_blocks: usize) -> usize {
         let take = num_blocks.min(self.reclaimable.load(Ordering::SeqCst));

@@ -115,8 +115,8 @@ pub fn gdn_decode_rows(
 }
 
 /// Tokens a sequence may bring to `qwen4exp_gdn_verify_fused_rows`
-/// (`QDF_VERIFY_KMAX`).
-pub const GDN_VERIFY_KMAX: usize = 4;
+/// (`QDF_VERIFY_KMAX`): the exact lane's 8-row window (7 drafts).
+pub const GDN_VERIFY_KMAX: usize = 8;
 
 /// One sequence of a verify step: its recurrence and conv state, the rollback
 /// slots for tokens `0..k-1` (`h_snap[t]` / `conv_snap[t]` after token `t`),
@@ -185,7 +185,7 @@ pub fn gdn_verify_rows(
     if !fits {
         return Ok(false);
     }
-    // QdfVerifySeq: h, conv, h_snap[3], conv_snap[3], then row0 | k << 32.
+    // QdfVerifySeq: h, conv, h_snap[KMAX-1], conv_snap[KMAX-1], then row0 | k << 32.
     const WORDS: usize = 3 + 2 * (GDN_VERIFY_KMAX - 1);
     for seqs in b.seqs.chunks(GDN_ROWS_MAX) {
         let mut table = [0u64; WORDS * GDN_ROWS_MAX];

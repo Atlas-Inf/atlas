@@ -761,6 +761,7 @@ pub(crate) fn load_model(
     // request's min_tokens floor.
     let mut eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
     spark_model::traits::EosBan::install_model_end_tokens(&eos_tokens);
+    spark_model::traits::EosBan::install_target_ban(&config.model_type);
 
     // EP worker: rank > 0 enters command loop, returns when head exits.
     let mut model_opt = Some(model);
@@ -810,7 +811,6 @@ pub(crate) fn load_model(
         reasoning_parser_box,
         think_end_token,
         think_start_token,
-        code_fence_token,
         tool_call_start_token,
         tool_call_end_token,
         grammar_engine,
@@ -1012,6 +1012,13 @@ pub(crate) fn load_model(
         std::env::var("ATLAS_CONTENT_LOOP_WATCHDOG").ok().as_deref(),
         args.content_loop_watchdog,
     ));
+    // Content-loop steering (`ATLAS_LOOP_STEER`) rides on the armed watchdog
+    // and its thresholds.
+    crate::scheduler::loop_steer::install(
+        sched_levers.loop_watchdog(),
+        sched_levers.disable_watchdogs,
+        watchdog_params.content_loop_params(None),
+    );
     // The run's snapshot cell, shared with the dashboard for the same reason
     // and by the same route as the levers.
     let sched_snapshot = std::sync::Arc::new(crate::scheduler::snapshot::SnapshotCell::default());
@@ -1074,7 +1081,6 @@ pub(crate) fn load_model(
                 block_size,
                 think_end_token,
                 think_start_token,
-                code_fence_token,
                 tool_call_start_token,
                 tool_call_end_token,
                 grammar_engine,

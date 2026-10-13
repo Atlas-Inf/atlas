@@ -8,12 +8,17 @@ use super::*;
 /// Whether the single-launch CUTLASS grouped NVFP4 path is enabled. The
 /// model-neutral name is used by new integrations; retain the Holo variable
 /// as a compatibility alias for existing recipes.
-pub(super) fn grouped_cutlass_gate_up_enabled() -> bool {
+pub(crate) fn grouped_cutlass_gate_up_enabled() -> bool {
     env_flag("ATLAS_MOE_GROUPED_CUTLASS") || env_flag("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
 }
 
 pub(super) fn grouped_cutlass_down_enabled() -> bool {
     env_flag("ATLAS_MOE_GROUPED_CUTLASS") || env_flag("ATLAS_HOLO_MOE_GROUPED_DOWN")
+}
+
+/// `ATLAS_MOE_PREFILL_FP8_DOWN=1`: the grouped routed down on FP8.
+pub(crate) fn prefill_fp8_down() -> bool {
+    std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").as_deref() == Ok("1")
 }
 
 pub(super) fn env_flag(name: &str) -> bool {
@@ -673,8 +678,7 @@ impl MoeLayer {
                         stream,
                     )?;
                 } else {
-                    let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref()
-                        == Some("1")
+                    let fp8_down = prefill_fp8_down()
                         && self.moe_fp8_grouped_gemm_t.0 != 0
                         && self.bf16_to_fp8_k.0 != 0;
                     if fp8_down {

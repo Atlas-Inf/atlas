@@ -61,6 +61,10 @@ pub(crate) fn self_spec_supported(
 /// a full pool then reclaims the LRU cached snapshot or skips that one
 /// checkpoint, which costs recompute on a partial prefix hit, nothing more.
 pub(super) fn resolve_ssm_cache_slots(args: &cli::ServeArgs) -> usize {
+    // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS: exactly that many (`ssm_snapshot_budget`).
+    if let Some(n) = spark_model::model::ssm_snapshot_budget::snapshot_slots_requested() {
+        return n;
+    }
     let requested = args.ssm_cache_slots;
     if requested == 0 || args.ssm_checkpoint_interval == 0 || args.block_size == 0 {
         return requested;
@@ -129,7 +133,8 @@ pub(crate) fn build_model(
         .parse()
         .context("Invalid --mtp-quantization value")?;
     let ssm_cache_slots = resolve_ssm_cache_slots(args);
-    if ssm_cache_slots > args.ssm_cache_slots {
+    let env_slots = spark_model::model::ssm_snapshot_budget::snapshot_slots_requested();
+    if ssm_cache_slots > args.ssm_cache_slots && env_slots.is_none() {
         tracing::warn!(
             "raising --ssm-cache-slots {} → {ssm_cache_slots} so Marconi \
              snapshots cover --max-seq-len={} ({} tok/snapshot). \

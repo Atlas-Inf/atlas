@@ -448,6 +448,8 @@ pub fn resume_swapped_seq(
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: s.think_watchdog_fires,
+        loop_steers: s.loop_steers,
+        loop_steer_max: s.loop_steer_max,
         think_force_closed: s.think_force_closed,
         rollback_count: s.rollback_count,
         // Decode-rollback SSM snapshots are GPU-resident and not part of

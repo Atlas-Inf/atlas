@@ -104,8 +104,22 @@ impl CommBackend for LoopPair<'_> {
 }
 
 fn with_ctx<R>(gpu: &MockGpuBackend, comm: &LoopPair, f: impl FnOnce(&ForwardContext) -> R) -> R {
+    with_model_ctx(gpu, comm, None, f)
+}
+
+/// [`with_ctx`] with the config's `model_type` replaced (any GPU and pair:
+/// the QSA split's GPU test runs it on CUDA).
+pub(crate) fn with_model_ctx<R>(
+    gpu: &dyn GpuBackend,
+    comm: &dyn CommBackend,
+    model_type: Option<&str>,
+    f: impl FnOnce(&ForwardContext) -> R,
+) -> R {
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     config.tp_world_size = 2;
+    if let Some(m) = model_type {
+        config.model_type = m.into();
+    }
     let buffers = BufferArena::new(&config, 1, 256, 16, 1, gpu).unwrap();
     let dispatch = crate::layers::ops::GemmDispatch::defaults();
     let derived = crate::layers::ops::DerivedWeights::new();
@@ -122,7 +136,7 @@ fn with_ctx<R>(gpu: &MockGpuBackend, comm: &LoopPair, f: impl FnOnce(&ForwardCon
         config: &config,
         attn_metadata: None,
         profile: false,
-        comm: Some(comm as &dyn spark_comm::CommBackend),
+        comm: Some(comm),
         graph_capture: false,
         gdn_exact_replay: false,
         token_ids: None,
@@ -245,6 +259,138 @@ fn windows_carry_the_regions() {
                     assert_eq!(pm.skip, 0);
                 }
             }
+        }
+    }
+}
+
+/// `qwen4exp_sp_pipe` (ATLAS_QWEN4EXP_PREFILL_SP_PIPE): the slab-pipelined
+/// gather leaves both ranks' buffers exactly as `all_gather` does, with the
+/// rows finished slab by slab, set in place or compacted elsewhere.
+#[test]
+fn pipelined_all_gather_rebuilds_the_chunk() {
+    use crate::layers::qwen4exp_sp_pipe::{begin_split, slab_done};
+    let slab = crate::layers::ops::HC_PREFILL_SLAB as usize;
+    for (total, split) in SPLITS {
+        for compacted in [false, true] {
+            let x = tensor(5, total);
+            let wire = Arc::new(Wire::default());
+            let run = |rank: usize| {
+                let gpu = MockGpuBackend::new();
+                let pair = LoopPair {
+                    gpu: &gpu,
+                    rank,
+                    wire: wire.clone(),
+                };
+                let sp = SpRows::split_at(total, split, rank);
+                let r = sp.row0 * W * 2..(sp.row0 + sp.rows) * W * 2;
+                let mut start = vec![0xABu8; total * W * 2];
+                if !compacted {
+                    start[r.clone()].copy_from_slice(&x[r.clone()]);
+                }
+                let buf = gpu.alloc(start.len()).unwrap();
+                gpu.copy_h2d(&start, buf).unwrap();
+                let src = gpu.alloc(r.len()).unwrap();
+                gpu.copy_h2d(&x[r.clone()], src).unwrap();
+                with_model_ctx(&gpu, &pair, Some("qwen4_exp"), |ctx| {
+                    let copy_from = compacted.then_some(src);
+                    let g = begin_split(sp, buf, copy_from, W, ctx, 0).unwrap().unwrap();
+                    g.during(|| {
+                        let mut t = 0;
+                        while t < sp.rows {
+                            t = (t + slab).min(sp.rows);
+                            slab_done(t, 0)?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                    g.finish(0).unwrap();
+                });
+                let mut out = vec![0u8; start.len()];
+                gpu.copy_d2h(buf, &mut out).unwrap();
+                out
+            };
+            let out = std::thread::scope(|s| {
+                let a = s.spawn(|| run(0));
+                let b = s.spawn(|| run(1));
+                [a.join().unwrap(), b.join().unwrap()]
+            });
+            assert!(
+                out[0] == x && out[1] == x,
+                "pipelined all-gather {total}/{split} compacted={compacted}"
+            );
+        }
+    }
+}
+
+/// `qwen4exp_sp_pipe::compute_and_reduce_scatter`
+/// (ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE): rows computed in any order, the
+/// peer's window sent piecewise first; this rank's rows end up with the sum
+/// `reduce_scatter` gives (the staged add replayed on the host).
+#[test]
+fn pipelined_reduce_scatter_sums_like_the_all_reduce() {
+    use crate::layers::qwen4exp_sp_pipe::{compute_and_reduce_scatter, stage_ptr};
+    // SAFETY: set before any thread of this test starts; nothing else in the
+    // test binary reads or writes this variable.
+    unsafe { std::env::set_var("ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE", "1") };
+    for (total, split) in SPLITS {
+        let p = [tensor(9, total), tensor(41, total)];
+        let mut sum = p[0].clone();
+        add_into(&mut sum, &p[1]);
+        let wire = Arc::new(Wire::default());
+        let run = |rank: usize| {
+            let gpu = MockGpuBackend::new();
+            let pair = LoopPair {
+                gpu: &gpu,
+                rank,
+                wire: wire.clone(),
+            };
+            let sp = SpRows::split_at(total, split, rank);
+            let buf = gpu.alloc(total * W * 2).unwrap();
+            gpu.copy_h2d(&vec![0xCDu8; total * W * 2], buf).unwrap();
+            let mut seen = vec![false; total];
+            with_model_ctx(&gpu, &pair, Some("qwen4_exp"), |ctx| {
+                let taken = compute_and_reduce_scatter(
+                    sp,
+                    buf,
+                    W,
+                    ctx,
+                    0,
+                    |r0, n, _| {
+                        let r = r0 * W * 2..(r0 + n) * W * 2;
+                        gpu.copy_h2d(&p[rank][r], buf.offset(r0 * W * 2))?;
+                        for s in &mut seen[r0..r0 + n] {
+                            assert!(!*s, "row computed twice");
+                            *s = true;
+                        }
+                        Ok(())
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap();
+                assert!(taken);
+            });
+            assert!(seen.iter().all(|&s| s), "every row computed");
+            let mut out = vec![0u8; total * W * 2];
+            gpu.copy_d2h(buf, &mut out).unwrap();
+            let pl = plan(sp, true);
+            let mut staged = vec![0u8; pl.recv_n * W * 2];
+            gpu.copy_d2h(stage_ptr().offset(pl.skip * W * 2), &mut staged)
+                .unwrap();
+            let r = pl.recv0 * W * 2;
+            add_into(&mut out[r..r + staged.len()], &staged);
+            (sp, out)
+        };
+        let outs = std::thread::scope(|s| {
+            let a = s.spawn(|| run(0));
+            let b = s.spawn(|| run(1));
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        for (rank, (sp, got)) in outs.iter().enumerate() {
+            let r = sp.row0 * W * 2..(sp.row0 + sp.rows) * W * 2;
+            assert!(
+                got[r.clone()] == sum[r],
+                "pipelined reduce-scatter {total}/{split} rank {rank}"
+            );
         }
     }
 }

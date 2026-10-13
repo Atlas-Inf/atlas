@@ -42,10 +42,24 @@ const SD_RC: u32 = 2;
 /// (QU_INTER; the kernel traps on any other).
 pub const QWEN4EXP_MOE_ROWS_SD_INTER: u32 = 640;
 
+/// Rows a units launch takes (C8_ROWS_MAX in qwen4exp_moe_c8.cu).
+pub const QWEN4EXP_MOE_UNITS_MAX_ROWS: usize = 64;
+/// The units plan's workspace, bytes: 16 + 3 * (1024 + 64) unit words, then
+/// 1024 sorted slot ids (C8_WS_ROWS + C8_SLOTS_MAX in qwen4exp_moe_c8.cu),
+/// then TC v3's 529 unit counters (TC3_UMAX in qwen4exp_moe_c8_tc3.cu).
+pub const QWEN4EXP_MOE_UNITS_WS_BYTES: usize = (16 + 3 * (1024 + 64) + 1024 + 529) * 4;
+/// Units-grid rows of the TC v2 kernels (each CTA strides the units by it):
+/// 80 x 64 gate/up and 40 x 64 down CTAs keep GB10's 48 SMs full; 48-160
+/// measured within 1% at real C8 routing (qwen4exp_moe_c8_bench REALBIN).
+const UNITS_TC_Y_CAP: u32 = 64;
+/// Down outputs per units CTA (32 * OG in qwen4exp_moe_c8.cu).
+const UNITS_DOWN_TILE: u32 = 64;
+
 /// The kernel handles, all 0 unless the exact batching lane is on for a
 /// qwen4_exp model and the target ships the module; `topk`/`blend` (the
 /// common modules' multi-row twins of `moe_topk_softmax` and
-/// `moe_weighted_sum_blend`) only under `ATLAS_QWEN4EXP_BATCH_SMALL=1` too.
+/// `moe_weighted_sum_blend`) only under `ATLAS_QWEN4EXP_BATCH_SMALL=1` too,
+/// `units_*` (qwen4exp_moe_c8.cu) only under `ATLAS_QWEN4EXP_MOE_UNITS=1`.
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen4ExpMoeRows {
     pub plan: KernelHandle,
@@ -53,6 +67,20 @@ pub struct Qwen4ExpMoeRows {
     pub silu_down: KernelHandle,
     pub topk: KernelHandle,
     pub blend: KernelHandle,
+    pub units_plan: KernelHandle,
+    pub units_gate_up: KernelHandle,
+    pub units_down: KernelHandle,
+    /// TC v3's fused gate/up + down (`units_gate_up`/`units_down` unused
+    /// then) and its persistent grid width.
+    pub units_fused: KernelHandle,
+    pub units_ctas: u32,
+    /// The units are the tensor-core kernels (`ATLAS_QWEN4EXP_MOE_TC=1`,
+    /// contract (b)): serial decode must take them too.
+    pub units_tc: bool,
+    /// The units launches' grid height cap: the TC v2 kernels stride the
+    /// units, so their grid is sized to the GPU (`UNITS_TC_Y_CAP`), not to
+    /// the units' bound (`u32::MAX`: one unit a CTA).
+    pub units_y_cap: u32,
 }
 
 impl Qwen4ExpMoeRows {
@@ -62,6 +90,13 @@ impl Qwen4ExpMoeRows {
         silu_down: KernelHandle(0),
         topk: KernelHandle(0),
         blend: KernelHandle(0),
+        units_plan: KernelHandle(0),
+        units_gate_up: KernelHandle(0),
+        units_down: KernelHandle(0),
+        units_fused: KernelHandle(0),
+        units_ctas: 0,
+        units_tc: false,
+        units_y_cap: u32::MAX,
     };
 
     pub fn resolve(gpu: &dyn GpuBackend, config: &ModelConfig) -> Self {
@@ -74,21 +109,98 @@ impl Qwen4ExpMoeRows {
         }
         let m = "qwen4exp_moe_rows";
         let small = crate::model::qwen4exp_batch_fast::small_requested();
+        let tc = crate::model::qwen4exp_batch_fast::tc_requested();
+        // ATLAS_QWEN4EXP_MOE_NO_CLAMP: every silu/down and units entry without
+        // the routed SwiGLU clamp, as serial decode's (`moe::init`).
+        let nc = crate::model::qwen4exp_batch_fast::no_clamp_requested(&config.model_type);
+        let units = tc || crate::model::qwen4exp_batch_fast::units_requested();
+        let (tc, units) = Self::units_fit(config, tc, units);
+        let off = KernelHandle(0);
+        if tc {
+            tracing::info!(
+                "qwen4_exp MoE tensor-core units ON (ATLAS_QWEN4EXP_MOE_TC=1): verify rows AND \
+                 serial decode on qwen4exp_moe_c8_tc.cu -- a new numerics baseline (contract (b))"
+            );
+        }
+        // ATLAS_QWEN4EXP_MOE_TC_V1=1: the TC kernels as first shipped (O(n^2)
+        // plan, a CTA a unit over the units' bound); ATLAS_QWEN4EXP_MOE_TC_V2=1:
+        // the separate gate/up and down launches; else v3 (one persistent
+        // launch, qwen4exp_moe_tc3.rs). All write the same bytes
+        // (scripts/dev/qwen4exp_moe_c8_bench.sh tc-ident).
+        let v1 = crate::model::qwen4exp_batch_fast::tc_v1_requested();
+        let v3 = tc && !v1 && !crate::model::qwen4exp_batch_fast::tc_v2_requested();
+        let (plan3, fused, units_ctas) = if v3 {
+            Self::tc3_kernels(gpu, nc)
+        } else {
+            (off, off, 0)
+        };
+        let tck = |v2: &'static str, v1n: &'static str| {
+            try_kernel(gpu, "qwen4exp_moe_c8_tc", if v1 { v1n } else { v2 })
+        };
+        let (units_plan, units_gate_up, units_down) = if v3 {
+            (plan3, off, off)
+        } else if tc {
+            (
+                tck("qwen4exp_moe_c8_tc_plan", "qwen4exp_moe_c8_tc_plan_v1"),
+                if nc {
+                    tck(
+                        "qwen4exp_moe_c8_tc_gate_up_nc",
+                        "qwen4exp_moe_c8_tc_gate_up_nc_v1",
+                    )
+                } else {
+                    tck(
+                        "qwen4exp_moe_c8_tc_gate_up",
+                        "qwen4exp_moe_c8_tc_gate_up_v1",
+                    )
+                },
+                tck("qwen4exp_moe_c8_tc_down", "qwen4exp_moe_c8_tc_down_v1"),
+            )
+        } else if units {
+            (
+                try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_plan"),
+                if nc {
+                    try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_gate_up_nc")
+                } else {
+                    try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_gate_up")
+                },
+                try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_down"),
+            )
+        } else {
+            (off, off, off)
+        };
         Self {
             plan: try_kernel(gpu, m, "qwen4exp_moe_rows_plan"),
             gate_up: try_kernel(gpu, m, "qwen4exp_moe_rows_gate_up"),
-            silu_down: try_kernel(gpu, m, "qwen4exp_moe_rows_silu_down"),
+            silu_down: if nc {
+                try_kernel(gpu, m, "qwen4exp_moe_rows_silu_down_nc")
+            } else {
+                try_kernel(gpu, m, "qwen4exp_moe_rows_silu_down")
+            },
             topk: if small {
                 try_kernel(gpu, "moe_topk", "moe_topk_softmax_rows")
             } else {
-                KernelHandle(0)
+                off
             },
             blend: if small {
                 try_kernel(gpu, "moe_expert_gemv", "moe_weighted_sum_blend_rows")
             } else {
-                KernelHandle(0)
+                off
             },
+            units_plan,
+            units_gate_up,
+            units_down,
+            units_fused: fused,
+            units_ctas,
+            units_tc: tc,
+            units_y_cap: if tc && !v1 { UNITS_TC_Y_CAP } else { u32::MAX },
         }
+    }
+
+    /// Whether [`Self::units`] can run (`ATLAS_QWEN4EXP_MOE_UNITS=1` and the
+    /// target ships `qwen4exp_moe_c8`).
+    pub fn units_ready(&self) -> bool {
+        self.units_plan.0 != 0
+            && (self.units_fused.0 != 0 || (self.units_gate_up.0 != 0 && self.units_down.0 != 0))
     }
 
     pub fn ready(&self) -> bool {
@@ -290,6 +402,97 @@ impl Qwen4ExpMoeRows {
             .arg_ptr(sh_down_out)
             .arg_u32(n)
             .arg_u32(k)
+            .arg_u32(top_k)
+            .arg_u32(rows)
+            .launch(stream)
+    }
+
+    /// [`Self::gate_up`] + [`Self::silu_down`] for `rows` rows through the
+    /// expert units of `qwen4exp_moe_c8.cu`: the plan into `ws`
+    /// ([`QWEN4EXP_MOE_UNITS_WS_BYTES`]), gate/up + SiLU into the (FP32; TC
+    /// v3: BF16) activations `act` (`[rows * top_k + rows, inter]`), down into `output`
+    /// (`[rows * top_k, h]`) and `sh_down_out` (`[rows, h]`) -- the bytes the
+    /// rows pair writes there. The gate/up BF16 rows are not stored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn units(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        gate_ptrs: (DevicePtr, DevicePtr, DevicePtr),
+        up_ptrs: (DevicePtr, DevicePtr, DevicePtr),
+        down_ptrs: (DevicePtr, DevicePtr, DevicePtr),
+        expert_indices: DevicePtr,
+        (ws, act): (DevicePtr, DevicePtr),
+        (sh_gate, sh_up, sh_down): (&QuantizedWeight, &QuantizedWeight, &QuantizedWeight),
+        output: DevicePtr,
+        sh_down_out: DevicePtr,
+        (h, inter, top_k, rows): (u32, u32, u32, u32),
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            (1..=QWEN4EXP_MOE_UNITS_MAX_ROWS as u32).contains(&rows)
+                && rows * top_k <= QWEN4EXP_MOE_ROWS_MAX_SLOTS as u32
+                && inter == QWEN4EXP_MOE_ROWS_SD_INTER
+                && h == 2560
+                && output.0 != 0
+                && sh_down_out.0 != 0,
+            "qwen4exp MoE units: rows {rows}, top_k {top_k}, inter {inter}, h {h}"
+        );
+        if self.units_fused.0 != 0 {
+            let (w, sh) = ((gate_ptrs, up_ptrs, down_ptrs), (sh_gate, sh_up, sh_down));
+            let (ins, outs) = ((input, expert_indices, ws, act), (output, sh_down_out));
+            return self.units_tc3(gpu, ins, w, sh, outs, (top_k, rows), stream);
+        }
+        KernelLaunch::new(gpu, self.units_plan)
+            .grid([1, 1, 1])
+            .block([1024, 1, 1])
+            .arg_ptr(expert_indices)
+            .arg_ptr(ws)
+            .arg_u32(top_k)
+            .arg_u32(rows)
+            .launch(stream)?;
+        // A grid row per possible unit: one per entry, one per 16 shared rows
+        // (the plan's count; rows past it exit) -- or, for kernels that stride
+        // the units, the cap.
+        let units = (rows * top_k + div_ceil(rows, 16)).min(self.units_y_cap);
+        KernelLaunch::new(gpu, self.units_gate_up)
+            .grid([inter / 8, units, 1])
+            .block([256, 1, 1])
+            .arg_ptr(input)
+            .arg_ptr(gate_ptrs.0)
+            .arg_ptr(gate_ptrs.1)
+            .arg_ptr(gate_ptrs.2)
+            .arg_ptr(up_ptrs.0)
+            .arg_ptr(up_ptrs.1)
+            .arg_ptr(up_ptrs.2)
+            .arg_ptr(sh_gate.weight)
+            .arg_ptr(sh_gate.weight_scale)
+            .arg_f32(sh_gate.weight_scale_2)
+            .arg_ptr(sh_up.weight)
+            .arg_ptr(sh_up.weight_scale)
+            .arg_f32(sh_up.weight_scale_2)
+            .arg_ptr(ws)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_ptr(act)
+            .arg_u32(top_k)
+            .arg_u32(rows)
+            .launch(stream)?;
+        KernelLaunch::new(gpu, self.units_down)
+            .grid([h / UNITS_DOWN_TILE, units, 1])
+            .block([256, 1, 1])
+            .arg_ptr(act)
+            .arg_ptr(down_ptrs.0)
+            .arg_ptr(down_ptrs.1)
+            .arg_ptr(down_ptrs.2)
+            .arg_ptr(sh_down.weight)
+            .arg_ptr(sh_down.weight_scale)
+            .arg_f32(sh_down.weight_scale_2)
+            .arg_ptr(ws)
+            .arg_ptr(output)
+            .arg_ptr(sh_down_out)
             .arg_u32(top_k)
             .arg_u32(rows)
             .launch(stream)

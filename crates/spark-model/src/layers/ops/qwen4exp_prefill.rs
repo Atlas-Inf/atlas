@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! `qwen4_exp` (Qwen3.8-Flash-Next) PREFILL switches and the launches behind
-//! them. Every switch is default OFF and read once per process.
+//! them. Every switch is read once per process and default OFF, except
+//! `_QSA_TC2R`: the TP2 default (`=0` falls back to `_g` / `_GP`).
 //!
 //! | switch                                   | what                                   | exact? |
 //! |------------------------------------------|----------------------------------------|--------|
-//! | `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=1`      | TP2 QSA attention on tensor cores      | = TP1 tc2, != `_g` |
+//! | `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=0`      | TP2 QSA attention off tensor cores     | TC2R = TP1 tc2, != `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`      | TP1 tc2 -> its lean twin (2 CTAs/SM)   | = tc2  |
+//! | `ATLAS_QWEN4EXP_PREFILL_QSA_GP=1`        | `_g` QSA attention, rescheduled        | = `_g` |
+//! | `ATLAS_QWEN4EXP_PREFILL_BA_ROWS=1`       | GDN BA GEMM + gates, 2 tokens a CTA    | = `dense_gemm_ba_gates_prefill` |
+//! | `ATLAS_QWEN4EXP_PREFILL_FP8_W2=1`        | attention q/k/v FP8 x FP8 GEMM, 2x4 warps | = `fp8_fp8_gemm_t_m128` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_SCORE=1`     | QSA block scorer, 16-byte loads, 2 rows a thread | = `qsa_score_rows_exact` |
 //! | `ATLAS_QWEN4EXP_PREFILL_GDN=1`           | GDN spine over 2 CTAs a head (TP2); wide `chunk_fwd_o` | = `..._pipe`, = `chunk_fwd_o` |
 //! | `ATLAS_QWEN4EXP_PREFILL_HC=1`            | mHC collapse: seam, down, up+mix fused | = default (`qwen4exp_prefill_hc`) |
@@ -24,10 +28,18 @@ fn flag(name: &str) -> bool {
     matches!(std::env::var(name).as_deref(), Ok("1") | Ok("true"))
 }
 
-/// `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=1`.
+/// The TP2 QSA prefill attention on tensor cores (`qsa_prefill_attn_tc2r`,
+/// one kv head a rank): on unless `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=0`, which
+/// keeps `_g` (or `_gp` under `_QSA_GP`). Its numerics are TP1 tc2's, not
+/// `_g`'s; the TP2 default since 2026-10-06.
 pub fn qsa_tc2r_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_QSA_TC2R"))
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("ATLAS_QWEN4EXP_PREFILL_QSA_TC2R").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
 }
 
 /// `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`.
@@ -111,6 +123,87 @@ pub fn try_qsa_prefill_attn_lean(
         l = l.arg_u32(s.rows);
     }
     l.launch(stream)?;
+    Ok(true)
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_QSA_GP=1`.
+pub fn qsa_gp_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_QSA_GP"))
+}
+
+/// `QSA_GP_DEPTH` in `qsa_attn_gp.cu`: keys in flight a warp.
+const QSA_GP_DEPTH: u32 = 4;
+
+/// Dynamic shared memory of `qsa_prefill_attn_gp`: the key loop's K/V ring
+/// and slot table, or `_g`'s merge buffer that aliases them, whichever is
+/// larger.
+pub fn qsa_prefill_attn_gp_smem(topk: u32, ratio: u32, hd: u32) -> u32 {
+    let warps = 8;
+    let ring = warps * QSA_GP_DEPTH * 2 * 256 * 2;
+    let slots = (topk * ratio + ratio) * 4;
+    let merge = (warps * super::QSA_PA_G * hd + 2 * warps * super::QSA_PA_G) * 4;
+    (ring + slots).max(merge)
+}
+
+/// Run a slab that `qsa_prefill_attn_g` would serve on its exact twin
+/// `qsa_prefill_attn_gp` (`qsa_attn_gp.cu`): the same arithmetic in the same
+/// order, with the K/V addresses resolved once a row, a 4-deep cp.async ring,
+/// the four heads' butterflies merged into one and two keys a step -- every
+/// output byte equal to `_g`'s (`scripts/dev/qwen4exp_qsa_gp_bench.cu`; GB10,
+/// 2048 rows at position 14000, 12 q / 1 kv heads: 21.1 -> 9.1 ms).
+/// `Ok(false)` launched nothing: the caller runs `_g`.
+pub fn try_qsa_prefill_attn_gp(gpu: &dyn GpuBackend, s: &QsaAttnSlab, stream: u64) -> Result<bool> {
+    if !qsa_gp_requested() || !launch_qsa_prefill_attn_gp(gpu, s, stream)? {
+        return Ok(false);
+    }
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("QSA prefill attention: gp (exact twin of grouped)");
+    }
+    Ok(true)
+}
+
+/// [`try_qsa_prefill_attn_gp`] without the switch: launch when the kernel
+/// serves the slab's geometry, else `Ok(false)`.
+pub fn launch_qsa_prefill_attn_gp(
+    gpu: &dyn GpuBackend,
+    s: &QsaAttnSlab,
+    stream: u64,
+) -> Result<bool> {
+    let smem = qsa_prefill_attn_gp_smem(s.topk, s.ratio, s.hd);
+    let serves = s.hd == 256
+        && super::qsa_prefill_attn_grouped_ok(s.nq, s.nkv, s.hd)
+        && smem <= 96 * 1024
+        && s.k_cache.0.is_multiple_of(16)
+        && s.v_cache.0.is_multiple_of(16)
+        && s.rows != 0;
+    if !serves {
+        return Ok(false);
+    }
+    let k = crate::layers::try_kernel(gpu, "qsa_attn_gp", "qsa_prefill_attn_gp");
+    if k.0 == 0 {
+        return Ok(false);
+    }
+    KernelLaunch::new(gpu, k)
+        .grid([s.rows, s.nq / super::QSA_PA_G, 1])
+        .block([256, 1, 1])
+        .shared_mem(smem)
+        .arg_ptr(s.q)
+        .arg_ptr(s.k_cache)
+        .arg_ptr(s.v_cache)
+        .arg_ptr(s.block_table)
+        .arg_ptr(s.lists)
+        .arg_ptr(s.attn_out)
+        .arg_u32(s.first_pos)
+        .arg_u32(s.topk)
+        .arg_u32(s.ratio)
+        .arg_u32(s.block_size)
+        .arg_u32(s.nq)
+        .arg_u32(s.nkv)
+        .arg_u32(s.hd)
+        .arg_f32(s.inv_sqrt_d)
+        .launch(stream)?;
     Ok(true)
 }
 
@@ -248,3 +341,131 @@ pub fn gdn_fwd_o_wide(
     );
     (h.0 != 0).then_some(h)
 }
+
+/// `ATLAS_QWEN4EXP_PREFILL_BA_ROWS=1`.
+fn ba_rows_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_BA_ROWS"))
+}
+
+/// `QBA_TOK` / `QBA_MAX_GROUPS` in `qwen4exp_gdn_prefill.cu`.
+const QBA_TOK: u32 = 2;
+const QBA_MAX_OUTPUTS: u32 = 48;
+
+/// The GDN prefill BA GEMM + gates on `qwen4exp_ba_gates_prefill_rows`: the
+/// default `dense_gemm_ba_gates_prefill`'s lanes, order and transforms for
+/// every output, with two tokens and every output in one CTA (the weight was
+/// re-read from L2 for every token) -- every gate byte identical
+/// (`scripts/dev/qwen4exp_ba_gates_bench.cu`; GB10, 16016 tokens at the TP2
+/// shape: 2.25 -> 0.97 ms). `dims` = [m, n, k, k_stride, gate_stride, nv,
+/// vheads_per_group] as the default takes them; `ptrs` = [input, weight,
+/// a_log, dt_bias, gate_out]. `Ok(false)` launched nothing.
+pub fn try_ba_gates_rows(
+    gpu: &dyn GpuBackend,
+    ptrs: [DevicePtr; 5],
+    dims: [u32; 7],
+    stream: u64,
+) -> Result<bool> {
+    if !ba_rows_requested() {
+        return Ok(false);
+    }
+    launch_ba_gates_rows(gpu, ptrs, dims, stream)
+}
+
+/// [`try_ba_gates_rows`] without the switch.
+pub fn launch_ba_gates_rows(
+    gpu: &dyn GpuBackend,
+    ptrs: [DevicePtr; 5],
+    dims: [u32; 7],
+    stream: u64,
+) -> Result<bool> {
+    let [m, n, k, k_stride, gate_stride, nv, vpg] = dims;
+    if n > QBA_MAX_OUTPUTS || !k.is_multiple_of(8) || m == 0 {
+        return Ok(false);
+    }
+    let kernel = crate::layers::try_kernel(
+        gpu,
+        "qwen4exp_gdn_prefill",
+        "qwen4exp_ba_gates_prefill_rows",
+    );
+    if kernel.0 == 0 {
+        return Ok(false);
+    }
+    let [input, weight, a_log, dt_bias, gate_out] = ptrs;
+    KernelLaunch::new(gpu, kernel)
+        .grid([m.div_ceil(QBA_TOK), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(a_log)
+        .arg_ptr(dt_bias)
+        .arg_ptr(gate_out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(k_stride)
+        .arg_u32(gate_stride)
+        .arg_u32(nv)
+        .arg_u32(vpg)
+        .launch(stream)?;
+    Ok(true)
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_FP8_W2=1`.
+fn fp8_w2_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_FP8_W2"))
+}
+
+/// `QF_BK` / `QF_STAGES` in `qwen4exp_fp8_gemm.cu`.
+const QF_BK: u32 = 128;
+const QF_STAGES: u32 = 2;
+
+/// An attention prefill projection (`fp8_fp8_gemm_t_m128`: E4M3 activations
+/// x E4M3 weight, BF16 out) on `qwen4exp_fp8_gemm_w2`: the same k32 MMA
+/// chain per output on 8 warps in a 2 x 4 grid with 128-wide K steps --
+/// every byte identical (`scripts/dev/qwen4exp_fp8_gemm_bench.cu`; GB10,
+/// TP2 q+gate 16016 x 6144 x 2560: 8.46 -> 5.16 ms; k/v: 0.54 -> 0.30).
+/// `ptrs` = [a_fp8, b_fp8, out], `dims` = [m, n, k]. `Ok(false)` launched
+/// nothing.
+pub fn try_fp8_gemm_w2(
+    gpu: &dyn GpuBackend,
+    ptrs: [DevicePtr; 3],
+    dims: [u32; 3],
+    stream: u64,
+) -> Result<bool> {
+    let [m, n, k] = dims;
+    if !fp8_w2_requested() || !k.is_multiple_of(QF_BK) || m == 0 || n == 0 {
+        return Ok(false);
+    }
+    launch_fp8_gemm_w2(gpu, ptrs, dims, stream)
+}
+
+/// [`try_fp8_gemm_w2`] without the switch.
+pub fn launch_fp8_gemm_w2(
+    gpu: &dyn GpuBackend,
+    [a, b, out]: [DevicePtr; 3],
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<bool> {
+    let kernel = crate::layers::try_kernel(gpu, "qwen4exp_fp8_gemm", "qwen4exp_fp8_gemm_w2");
+    if kernel.0 == 0 || !k.is_multiple_of(QF_BK) {
+        return Ok(false);
+    }
+    KernelLaunch::new(gpu, kernel)
+        .grid([n.div_ceil(128), m.div_ceil(128), 1])
+        .block([256, 1, 1])
+        .shared_mem(QF_STAGES * 256 * (QF_BK + 16))
+        .arg_ptr(a)
+        .arg_ptr(b)
+        .arg_ptr(out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+#[path = "qwen4exp_prefill_gpu_tests.rs"]
+mod gpu_tests;

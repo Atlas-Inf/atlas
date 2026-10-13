@@ -16,19 +16,19 @@
 //!
 //! | op | serial | batched (switch on) | per row |
 //! |---|---|---|---|
-//! | embed, PLE, mHC pre/post/head | per row / T=1 | per row / T=n (`hc_pre_split`, `_vec`; past 8 rows in 8-row split chunks, not the GEMM collapse) | equal |
-//! | GDN qkvz, out_proj (BF16) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch) instead of cuBLASLt | equal |
+//! | embed, PLE, mHC pre/post/head | per row / T=1 | per row / T=n (`hc_pre_split`, `_vec`; past 8 rows in 8-row split chunks, under `ATLAS_QWEN4EXP_HC_FAST` row-grouped launches of up to 32 (`hc_pre_*_vec_rows`), not the GEMM collapse) | equal |
+//! | GDN qkvz, out_proj (BF16) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch; 9..32 `qwen4exp_bf16_rows16/32`, `ops::Qwen4ExpWideRows`) instead of cuBLASLt | equal |
 //! | GDN qkvz, out_proj (FP8 opt-in) | `w8a16_gemv` | `w8a16_gemv_batch4/16` | equal |
 //! | GDN ba+gates, conv, recurrence, norm | per row | the per-sequence loop (the strided batched recurrence is skipped) | equal |
-//! | attention Q+gate | `w4a16_gemv_qg` (one accumulator, scale folded in) | `qg_batch2/3/4` in <= 4-row chunks — never the scalar template the default 4+-row arm runs | equal |
-//! | attention K/V | `w4a16_gemv_dual` | `w4a16_gemv_batch2..8` per projection (as exact verify), <= 8 rows a launch | equal |
+//! | attention Q+gate | `w4a16_gemv_qg` (one accumulator, scale folded in) | `qg_batch2/3/4` in <= 4-row chunks, past 8 rows `qwen4exp_qg_rows16/32` — never the scalar template the default 4+-row arm runs | equal |
+//! | attention K/V | `w4a16_gemv_dual` | `w4a16_gemv_batch2..8` per projection (as exact verify), <= 8 rows a launch, past 8 rows `batch16` | equal |
 //! | QSA select / attention | bs=1 | per row (`qsa_rows.rs`), also for rows of several sequences | equal |
 //! | attention o_proj | `w4a16_gemv_sw` | `w4a16_gemv_batch2..8` | equal |
-//! | MoE router + top-k | `w4a16_gemv_sw`, `moe_topk_softmax` | per row | equal |
+//! | MoE router + top-k | `w4a16_gemv_sw`, `moe_topk_softmax` | router `w4a16_gemv_batchN` (row pair; `batch16` past 8 rows), top-k per row | equal |
 //! | MoE experts | `moe_expert_{gate_up,silu_down}_shared` | the same kernels per row, or their row-gridded twins (`qwen4exp_moe_rows.cu`) | equal |
 //! | MoE EP all-reduce + shared blend | `[1,h]` then `moe_batched_blend` T=1 | ONE `[n,h]` all-reduce, `moe_batched_blend` T=n | equal (one commutative BF16 add; the blend is a block per row) |
 //! | TP all-reduces | `[1,h]` | `[n,h]` | equal |
-//! | LM head (BF16, optionally vocab-split) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch) instead of `dense_gemm_bf16` | equal |
+//! | LM head (BF16, optionally vocab-split) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch; 9..32 `qwen4exp_bf16_rows16/32`) instead of `dense_gemm_bf16` | equal |
 //!
 //! The switch also keeps a batch with an ACTIVE QSA selection (a sequence
 //! past the 2051-token inert bound) on the batched step, served row by row
@@ -64,7 +64,7 @@
 //! | `moe_topk_softmax` | `moe_topk_softmax_rows`, a block per row, the single-row lower-index tie-break (not `moe_topk_softmax_batched`'s) |
 //! | `moe_weighted_sum_blend` | `moe_weighted_sum_blend_rows`, blockIdx.y the row |
 //! | GDN `dense_gemv_ba_gates`, `causal_conv1d_update_l2norm_f32`, `gated_delta_rule_decode_f32`, `gated_rms_norm_f32_input_sigmoid` per sequence | `qwen4exp_gdn_decode_fused_rows`, up to 8 sequences a launch, each on its own state: the exact fused step of `ATLAS_QWEN4EXP_DECODE_FUSE` |
-//! | exact MTP verify (`ATLAS_QWEN4EXP_EXACT_VERIFY`), per sequence and token: conv, conv rollback copy, recurrence, gated norm, H rollback copy | `qwen4exp_gdn_verify_fused_rows`, up to 8 sequences of up to 4 tokens a launch, H and the conv windows in registers across the tokens (single-sequence verify too) |
+//! | exact MTP verify (`ATLAS_QWEN4EXP_EXACT_VERIFY`), per sequence and token: conv, conv rollback copy, recurrence, gated norm, H rollback copy | `qwen4exp_gdn_verify_fused_rows`, up to 8 sequences of up to 8 tokens a launch, H and the conv windows in registers across the tokens (single-sequence verify too) |
 //!
 //! An 8-row decode step drops from 8 x (48 + 48 + 36 x 4) = 1,920 of these
 //! launches to 48 + 48 + 36 = 132 (240 a row to 16.5); an 8-sequence K=2
@@ -126,6 +126,81 @@ pub(crate) fn small_lever() -> bool {
     on
 }
 
+/// `ATLAS_QWEN4EXP_MOE_UNITS=1`, read once: under the lane, the rows pair's
+/// routed + shared experts go through `qwen4exp_moe_c8.cu`'s expert units
+/// (each weight decoded once for every row that picked it, SiLU in the
+/// gate/up epilogue, down's lane chains rebalanced) -- the same bytes as the
+/// rows pair. `startup_parity` carries it anyway, so an A/B never mixes arms.
+pub(crate) fn units_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_UNITS").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_MOE_TC=1`, read once: the expert units on TENSOR CORES
+/// (`qwen4exp_moe_c8_tc.cu`) -- exactness contract (b), a new numerics
+/// baseline: BF16 weights `lut * dec(scale)` (exact), BF16 activations,
+/// FP32 MMA accumulation, scale2 per output. Row-invariant, and serial
+/// decode's single-row MoE switches to the same kernels (`forward_row_local`),
+/// so speculation stays exact against serial decode under the switch; NOT
+/// today's bytes. Takes precedence over `ATLAS_QWEN4EXP_MOE_UNITS`. Both
+/// ranks must agree on it (each rank's routed sums meet in the EP all-reduce).
+pub(crate) fn tc_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_TC").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_MOE_TC_V1=1`, read once: under `ATLAS_QWEN4EXP_MOE_TC`,
+/// the tensor-core units as first shipped (for A/B against the current
+/// ones, which write the same bytes).
+pub(crate) fn tc_v1_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_TC_V1").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_MOE_TC_V2=1`, read once: under `ATLAS_QWEN4EXP_MOE_TC`,
+/// the v2 units (separate gate/up and down launches) instead of v3's one
+/// persistent launch (`qwen4exp_moe_c8_tc3.cu`), for A/B: the same bytes.
+pub(crate) fn tc_v2_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_TC_V2").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_MOE_NO_CLAMP=1`, read once: the qwen4_exp decode / verify
+/// MoE kernels drop the routed SwiGLU clamp (+-10) -- the serial-decode
+/// single-row silu/down, the rows pair, the units and the TC units -- which
+/// the checkpoint does not declare (`swiglu_limit` null; the vLLM reference
+/// is plain SiLU) and the prefill, K=2/K=3 and `_t` arms never applied.
+/// Not today's bytes where the clamp bit (it fired on 0.002% of layer 47's
+/// gate/up values in a C8 prose capture, `scripts/dev/qwen4exp_moe_fidelity.cu`);
+/// every decode path switches together, so speculation stays exact.
+pub(crate) fn no_clamp_requested(model_type: &str) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    model_type == "qwen4_exp"
+        && *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_NO_CLAMP").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_MOE_ROUTE_DUMP=<file>` (diagnostic, local only: its
+/// `.bin` holds request activations; `layers/moe/route_dump.rs`): each
+/// rows-pair MoE launch appends its `[rows, top_k]` expert ids to `<file>` as
+/// one line (synchronizing the stream). `scripts/dev/qwen4exp_moe_c8_bench.cu`
+/// replays the lines (`ROUTES=<file>`). Read once.
+pub(crate) fn route_dump_path() -> Option<&'static str> {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::var("ATLAS_QWEN4EXP_MOE_ROUTE_DUMP")
+            .ok()
+            .filter(|p| !p.is_empty());
+        if let Some(p) = &path {
+            tracing::warn!(
+                "ATLAS_QWEN4EXP_MOE_ROUTE_DUMP={p}: writing MoE routes and input \
+                 activations of every request to disk; local diagnosis only"
+            );
+        }
+        path
+    })
+    .as_deref()
+}
+
 /// `ATLAS_QWEN4EXP_BATCH_FAST_CHECK=1`, read once.
 pub(crate) fn check_requested() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -134,11 +209,32 @@ pub(crate) fn check_requested() -> bool {
 
 /// The model's `qwen4exp_batch_fast` lever: the switch, on a qwen4_exp model.
 pub(crate) fn lever(model_type: &str) -> Result<bool> {
+    if model_type == "qwen4_exp" {
+        warn_inert_numerics(requested(), tc_requested(), units_requested());
+    }
     lever_from(
         requested(),
         model_type,
         crate::layers::w4a16_gemv_tiers::tc_requested(),
     )
+}
+
+/// Log the MoE switches that do not do what they say on their own: the
+/// units only exist under the lane, and prefill's BF16 routed experts are
+/// MoE_TC decode's numerics, so without it prefill and decode differ.
+fn warn_inert_numerics(lane: bool, tc: bool, units: bool) {
+    if !lane && (tc || units) {
+        tracing::warn!(
+            "ATLAS_QWEN4EXP_MOE_TC / _MOE_UNITS ignored: they need ATLAS_QWEN4EXP_BATCH_FAST=1"
+        );
+    }
+    if crate::layers::moe::tcp_requested() && !(lane && tc) {
+        tracing::warn!(
+            "ATLAS_QWEN4EXP_PREFILL_MOE_BF16 (or _PREFILL_BF16_PROJ) without \
+             ATLAS_QWEN4EXP_BATCH_FAST=1 + ATLAS_QWEN4EXP_MOE_TC=1: prefill's routed experts \
+             take the TC decode numerics, decode does not"
+        );
+    }
 }
 
 fn lever_from(requested: bool, model_type: &str, w4a16_tc: bool) -> Result<bool> {

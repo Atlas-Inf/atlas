@@ -143,7 +143,10 @@ pub(super) fn prefill_arm(
     hidden: u32,
     hc_mult: u32,
 ) -> Option<HcFastKernels> {
+    // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: no seam; the collapse is decode's
+    // own (`qwen4exp_rowinv::hc_collapse`).
     if !hc_requested()
+        || super::qwen4exp_rowinv::decode_active()
         || num_tokens < HC_FAST_MIN_T
         || hc_mult != 4
         || !hidden.is_multiple_of(HUM_BD)

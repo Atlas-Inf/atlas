@@ -5,6 +5,7 @@
 # bench, run it.
 #   scripts/dev/qwen4exp_batch_exact_bench.sh check|time|sweep        (BATCH_FAST)
 #   scripts/dev/qwen4exp_batch_exact_bench.sh small-check|small-time  (BATCH_SMALL)
+#   scripts/dev/qwen4exp_batch_exact_bench.sh defer-check|defer-time  (EXACT_DEFER)
 # Run from the repository root on a GB10. See qwen4exp_batch_exact_bench.cu and
 # qwen4exp_batch_small_bench.cu.
 set -euo pipefail
@@ -14,6 +15,14 @@ nvcc=${NVCC:-nvcc}
 flags=(--ptx -arch=sm_121f -O3 --fmad=false -DTQ_PLUS_SIGNS --expt-relaxed-constexpr --Werror all-warnings)
 mode=${1:-check}
 pids=()
+if [[ $mode == defer-* ]]; then
+  # ATLAS_QWEN4EXP_EXACT_DEFER: qwen4exp_gdn_defer_bench.cu (includes the small bench's fixtures).
+  "$nvcc" "${flags[@]}" kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4exp_decode_fuse.cu -o "$out/qwen4exp_decode_fuse.ptx" & pids+=($!)
+  "$nvcc" -O3 -std=c++17 -arch=sm_121a scripts/dev/qwen4exp_gdn_defer_bench.cu -lcuda \
+    -o "$out/qwen4exp_gdn_defer_bench" & pids+=($!)
+  for p in "${pids[@]}"; do wait "$p"; done
+  exec "$out/qwen4exp_gdn_defer_bench" "$out" "${mode#defer-}" "${2:-3}"
+fi
 if [[ $mode == small-* ]]; then
   for stem in moe_topk moe_expert_gemv ssm_preprocess causal_conv1d rms_norm moe_permute; do
     "$nvcc" "${flags[@]}" "kernels/gb10/common/$stem.cu" -o "$out/$stem.ptx" & pids+=($!)
