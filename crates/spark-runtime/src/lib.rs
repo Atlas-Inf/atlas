@@ -25,6 +25,7 @@ pub mod flashinfer;
 #[cfg(not(feature = "cuda"))]
 #[path = "flashinfer_metal_stub.rs"]
 pub mod flashinfer;
+pub mod glm_kda;
 pub mod gpu;
 #[path = "gpu_args.rs"]
 mod gpu_args;
