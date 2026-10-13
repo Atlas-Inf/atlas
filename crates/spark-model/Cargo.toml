@@ -32,6 +32,8 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
 # CI runner). Build on a real GPU host with `--features gpu-examples`.
 gpu-examples = ["dep:safetensors"]
+# The NCCL/RDMA-pair CommBackend, for the two-rank `comm_pair_bench` example.
+nccl = ["cuda", "spark-comm/nccl"]
 
 [dependencies]
 atlas-core = { workspace = true }
@@ -91,6 +93,42 @@ workspace = true
 # `#[ignore]`d integration test — see crates/spark-model/tests/arm2_leg2_*.rs.
 [[example]]
 name = "gdn_cdh_vblock_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "marlin_vs_tc_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_fp4_prefill_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_verify_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_hc_seam_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_sparse_split_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "kda_verify_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "concurrency_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "comm_pair_bench"
+required-features = ["cuda", "gpu-examples", "nccl"]
+
+[[example]]
+name = "glm_topk_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
