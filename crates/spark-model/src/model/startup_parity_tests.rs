@@ -205,7 +205,7 @@ fn every_rank_of_a_wider_world_is_compared() {
 #[test]
 fn the_gather_has_one_size_whatever_the_settings_are() {
     let names = settings(&CALLER).unwrap();
-    let words = RUNTIME.len() + SETTINGS.len() + CALLER.len();
+    let words = RUNTIME.len() + SETTINGS.len() + SETTINGS_TAIL.len() + CALLER.len();
     assert_eq!(names.len(), words);
     // Every flag off, every flag on, and junk: the same collective.
     for value in [0, 1, u64::MAX] {
@@ -307,7 +307,11 @@ fn warn_only_logs_and_boots_with_the_same_gathers() {
 
 #[test]
 fn the_table_carries_each_setting_once() {
-    let names: Vec<&str> = SETTINGS.iter().map(|s| s.0).collect();
+    let names: Vec<&str> = SETTINGS
+        .iter()
+        .chain(SETTINGS_TAIL.iter())
+        .map(|s| s.0)
+        .collect();
     for required in [
         "ATLAS_EP_PROTOCOL=v2",
         "ATLAS_NO_TAIL_SPLIT",

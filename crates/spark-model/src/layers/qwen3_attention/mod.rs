@@ -42,6 +42,7 @@ mod prefill_weights;
 mod prefill_weights_rowinv;
 mod trait_impl;
 mod types;
+mod types_layer;
 mod types_weights;
 
 #[cfg(feature = "cuda")]
@@ -57,7 +58,7 @@ pub(crate) use trait_impl::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
 };
 pub(crate) use types::HeadGateActivation;
-pub use types::Qwen3AttentionLayer;
+pub use types_layer::Qwen3AttentionLayer;
 pub use types_weights::{
     CompressorWeights, GlmIndexerWeights, HcHeadWeights, HcLowRank, HcSiteWeights, HcWeights,
     MlaWeights,

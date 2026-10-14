@@ -38,6 +38,8 @@ mod multi;
 mod multi_ep;
 mod multi_head;
 pub use multi_ep::{multi_cached, multi_requested};
+#[path = "prefill_b/dispatch.rs"]
+mod dispatch;
 pub(in crate::model) mod pc_inflight;
 pub(in crate::model) mod pc_policy;
 mod prefix_lookup;
@@ -52,26 +54,6 @@ mod upload_paged;
 mod warm;
 
 impl TransformerModel {
-    pub(super) fn prefill_chunk_dispatch(
-        &self,
-        tokens: &[u32],
-        seq: &mut SequenceState,
-        chunk_start: usize,
-        chunk_len: usize,
-        is_last_chunk: bool,
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        self.prefill_chunk_dispatch_with(
-            tokens,
-            seq,
-            chunk_start,
-            chunk_len,
-            is_last_chunk,
-            stream,
-            None,
-        )
-    }
-
     /// The chunk, optionally carrying DFlash verify owners after its rows
     /// (`glm_fused_chunk`).
     #[allow(clippy::too_many_arguments)]

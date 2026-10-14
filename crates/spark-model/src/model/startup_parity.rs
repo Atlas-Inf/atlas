@@ -58,7 +58,7 @@ use spark_runtime::gpu::GpuBackend;
 
 #[path = "startup_parity_table.rs"]
 mod table;
-use table::SETTINGS;
+use table::{SETTINGS, SETTINGS_TAIL};
 
 /// One agreed setting: its name and a rank's value.
 pub type Setting = (&'static str, u64);
@@ -86,6 +86,7 @@ fn settings(caller: &[Setting]) -> Result<Vec<Setting>> {
     RUNTIME
         .iter()
         .chain(SETTINGS.iter())
+        .chain(SETTINGS_TAIL.iter())
         .map(|&(name, read)| Ok((name, read()?)))
         .chain(caller.iter().copied().map(Ok))
         .collect()

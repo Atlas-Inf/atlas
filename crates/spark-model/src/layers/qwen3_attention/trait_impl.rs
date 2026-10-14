@@ -21,6 +21,8 @@ mod prefill_inner_glm;
 pub(super) use diag::diag_norm;
 pub use diag::diag_norm_f32;
 
+#[path = "trait_impl/moe_transpose.rs"]
+mod moe_transpose;
 #[path = "trait_impl/state.rs"]
 mod state;
 
@@ -486,13 +488,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
-        if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_for_prefill_hybrid(gpu, config)?;
-        }
-        if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.transpose_for_prefill_hybrid(gpu, config)?;
-        }
-        Ok(())
+        moe_transpose::transpose_moe_for_prefill_hybrid_inner(self, gpu, config)
     }
 }
 
