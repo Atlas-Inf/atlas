@@ -113,7 +113,7 @@ fn a_turn_keeps_its_deepest_reachable_leaf() {
 /// A turn that ends inside its leaf's block falls back to the leaf before,
 /// not to the previous turn's tail checkpoint.
 #[test]
-fn a_turn_that_ends_in_its_leafs_block_keeps_the_one_before() {
+fn a_turn_that_ends_in_its_leaf_block_keeps_the_one_before() {
     let mut leaves = Leaves::default();
     let mut len = 1_000;
     for rows in [8; 9] {

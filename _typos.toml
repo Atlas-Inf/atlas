@@ -52,6 +52,29 @@ ue = "ue"
 # "subtiles" = sub-tiles: WMMA n-sub-tile partitioning in the strix-hip
 # MoE/dense GEMM kernels (PM4_SUBTILES_PER_WARP). Not a typo of "subtitles".
 subtiles = "subtiles"
+# `subtile` — singular form of the accepted `subtiles` above; the same
+# n-sub-tile coinage in kernel commentary (gate/up pairing notes in
+# moe_w4a16_grouped_gemm.cu). Not a typo of `subtle`.
+subtile = "subtile"
+# `dout` — device-output buffer names (`dout0`, `dout1`) in the GLM/qwen4exp
+# dev benches under scripts/dev/ and a kernel arg in
+# qwen4exp_moe_decode_bench.cu. Identifier, not a typo of `doubt`.
+dout = "dout"
+# `wel` — element-count variable name (W elements) in
+# scripts/dev/mxfp8_grouped_bench.cu. Identifier, not a typo of `well`.
+wel = "wel"
+# `pn` — packed-NVFP4 slab/pointer names in the qwen4exp MoE decode
+# bench/kernel (`pn`, `sn`, `pk`, `sk` buffer quads). Identifier.
+pn = "pn"
+# `alog` — host staging vector in qwen4exp_ba_gates_bench.cu (the "a" logits
+# buffer; pairs with `dal`). Identifier, not a typo of `along`.
+alog = "alog"
+# `fnd` — "found" flag variable in hc_post_mix_microtest.rs, passed verbatim
+# as a kernel arg. Identifier, not a typo of `find`.
+fnd = "fnd"
+# `daa` — leading nibbles of a git SHA prefix quoted in a dev-bench
+# provenance comment (`git show daa94067:...`). Not English at all.
+daa = "daa"
 # CUDA device-attribute constant token. Not a typo of `OPTION`.
 OPTIN = "OPTIN"
 # `image_grid_thw` is the HuggingFace tensor name for vision-input
