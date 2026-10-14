@@ -7,7 +7,8 @@
 //! (`DF2_SEL_MAX_RANK`). `Dflash2CandidateSelector::new` fails fast when a
 //! checkpoint's `selector_top_k`/`selector_rank` exceeds the Rust mirrors —
 //! so the mirrors and the kernel `#define`s must never drift apart, and the
-//! gb10/strix-hip copies of the kernel must stay byte-identical.
+//! gb10/strix-hip selector algorithms must match apart from the explicitly
+//! pinned platform-specific coherent scratch load.
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -75,14 +76,58 @@ fn caps_match_kernel_defines() {
     }
 }
 
+// This is the only permitted source difference. In particular, a cached plain
+// load or a narrower HIP memory scope must not pass the algorithm comparison.
+const HIP_SCRATCH_LOAD: &str = "\
+// The ticket protocol publishes scratch through device fences. HIP's
+// agent-scope atomic load keeps these cross-CU reads coherent; a plain
+// cached load cannot replace CUDA's L2-only __ldcg here.
+template <typename T>
+__device__ __forceinline__ T df2_sel_published_load(const T* ptr) {
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+";
+
+fn selector_sources_match(gb10: &str, strix: &str) -> bool {
+    if strix.matches(HIP_SCRATCH_LOAD).count() != 1 {
+        return false;
+    }
+    let strix = strix.replacen(HIP_SCRATCH_LOAD, "", 1);
+    let loads = gb10.matches("__ldcg(").count();
+    loads > 0
+        && strix.matches("df2_sel_published_load(").count() == loads
+        && strix.replace("df2_sel_published_load(", "__ldcg(") == gb10
+}
+
 #[test]
-fn gb10_and_strix_hip_copies_are_byte_identical() {
-    let gb10 = fs::read(kernel_path(KERNEL_GB10)).expect("read gb10 selector");
-    let strix = fs::read(kernel_path(KERNEL_STRIX)).expect("read strix-hip selector");
-    assert_eq!(
-        gb10, strix,
-        "{KERNEL_GB10} and {KERNEL_STRIX} must stay byte-identical copies"
+fn gb10_and_strix_hip_match_except_the_coherent_scratch_load() {
+    assert!(
+        selector_sources_match(&kernel_src(KERNEL_GB10), &kernel_src(KERNEL_STRIX)),
+        "{KERNEL_GB10} and {KERNEL_STRIX} differ beyond the pinned HIP scratch load"
     );
+}
+
+#[test]
+fn source_comparison_rejects_adapter_semantics_and_algorithm_drift() {
+    let gb10 = kernel_src(KERNEL_GB10);
+    let strix = kernel_src(KERNEL_STRIX);
+    for (from, to) in [
+        ("__HIP_MEMORY_SCOPE_AGENT", "__HIP_MEMORY_SCOPE_WORKGROUP"),
+        ("__ATOMIC_RELAXED", "__ATOMIC_SEQ_CST"),
+        ("atomicAdd(", "atomicSub("),
+    ] {
+        assert!(strix.contains(from), "mutation must exercise real source");
+        assert!(!selector_sources_match(&gb10, &strix.replacen(from, to, 1)));
+    }
+    assert!(!selector_sources_match(
+        &gb10,
+        &strix.replace(HIP_SCRATCH_LOAD, "")
+    ));
+    assert!(!selector_sources_match(
+        &gb10,
+        &format!("{HIP_SCRATCH_LOAD}{strix}")
+    ));
 }
 
 fn kernel_params(src: &str, name: &str) -> Vec<String> {
