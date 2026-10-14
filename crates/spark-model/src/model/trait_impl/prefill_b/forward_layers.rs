@@ -156,7 +156,7 @@ impl TransformerModel {
             // R11 fix 6: under the prefill grid a warm replay pass IS a cold
             // pass (same start, same length), so the cold run's FLA kernel is
             // the bit-faithful one; forcing the exact-replay kernel there
-            // made warm != cold.
+            // (register-resident, or WY4 if that is off) made warm != cold.
             gdn_exact_replay: marconi_skip
                 && !crate::layers::ops::qwen4exp_rowinv::on()
                 && !self.grid_replay_is_cold(),
