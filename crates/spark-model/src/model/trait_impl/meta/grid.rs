@@ -21,8 +21,10 @@ impl TransformerModel {
     }
 
     /// R11 fix 6: under the prefill grid a warm replay runs exactly the cold
-    /// passes, so it must use the same GDN kernels (FLA) rather than the WY4
-    /// "exact replay" path. `ATLAS_GRID_EXACT_REPLAY=1` restores the old forcing.
+    /// passes, so it must use the same GDN kernels (FLA) rather than the forced
+    /// "exact replay" path (register-resident token-sequential by default, WY4
+    /// only with `ATLAS_NO_GDN_REGRESIDENT=1`); both differ from the cold FLA
+    /// pass. `ATLAS_GRID_EXACT_REPLAY=1` restores the old forcing.
     pub(in super::super) fn grid_replay_is_cold(&self) -> bool {
         static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         self.prefill_grid() > 0

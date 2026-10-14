@@ -118,7 +118,8 @@ impl TransformerModel {
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
             // R11 fix 6: under the prefill grid a warm replay pass IS a cold
             // pass (same start, same length), so the cold run's FLA kernel is
-            // the bit-faithful one; forcing WY4 here made warm != cold.
+            // the bit-faithful one; forcing the exact-replay kernel here
+            // (register-resident, or WY4 if that is off) made warm != cold.
             gdn_exact_replay: marconi_skip && !self.grid_replay_is_cold(),
             // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
             // to the stable buffer, in chunk order matching the MoE loop).
