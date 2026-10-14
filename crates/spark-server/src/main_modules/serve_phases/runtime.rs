@@ -128,7 +128,11 @@ pub(crate) fn resolve_sampling_defaults(
     let min_p = gen_cfg
         .and_then(|v| v.get("min_p")?.as_f64())
         .map(|p| p as f32)
-        .or(if args.reference_mode { None } else { preset.min_p })
+        .or(if args.reference_mode {
+            None
+        } else {
+            preset.min_p
+        })
         .unwrap_or(if args.reference_mode {
             0.0
         } else {

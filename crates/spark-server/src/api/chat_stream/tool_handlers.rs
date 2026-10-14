@@ -75,7 +75,10 @@ pub(super) fn handle_complete_tool_call(
     }
     // `--reference-mode`: never invent arguments the model did not emit.
     if !ctx.state.reference_mode {
-        tool_parser::backfill_required_params(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
+        tool_parser::backfill_required_params(
+            std::slice::from_mut(tc),
+            &ctx.tool_defs_for_backfill,
+        );
     }
     if ctx.wants_typed_arguments {
         tool_parser::coerce_all(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);

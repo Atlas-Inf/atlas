@@ -138,7 +138,11 @@ mod tests {
         neutralize_behavior(&mut after);
         let changes = describe_changes(&before, &after);
         assert!(changes.iter().any(|c| c.starts_with("temperature_max=0.7")));
-        assert!(changes.iter().any(|c| c.starts_with("max_thinking_budget=768")));
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.starts_with("max_thinking_budget=768"))
+        );
         assert!(describe_changes(&after, &after).is_empty());
     }
 }

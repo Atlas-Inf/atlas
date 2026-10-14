@@ -470,7 +470,9 @@ fn kernel_name(func: *mut c_void) -> String {
         // lifetime) into `name`, which is only read here.
         let rc = unsafe { super::cuFuncGetName(&mut name, func) };
         if rc == 0 && !name.is_null() {
-            return unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
+            return unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned();
         }
     }
     let _ = func;

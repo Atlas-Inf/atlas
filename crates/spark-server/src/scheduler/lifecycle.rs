@@ -144,7 +144,10 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
     // place every `guard_stop` passes, so a run can count them (an MLPerf
     // point is invalid if any response was ended by a heuristic).
     if let Some(guard) = a.guard_stop {
-        tracing::warn!("GUARD_STOP fired: {guard} (output_tokens={})", a.output_tokens.len());
+        tracing::warn!(
+            "GUARD_STOP fired: {guard} (output_tokens={})",
+            a.output_tokens.len()
+        );
     }
     let reason = if engine_failed {
         "error"

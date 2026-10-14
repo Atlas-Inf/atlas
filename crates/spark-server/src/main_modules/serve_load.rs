@@ -775,7 +775,11 @@ pub(crate) fn load_model(
             tracing::warn!(
                 "REFERENCE MODE: client sampling only, model's own chat template, no injected \
                  prompt text, all output watchdogs off. [behavior] changes: {}",
-                if changes.is_empty() { "none".to_string() } else { changes.join(", ") }
+                if changes.is_empty() {
+                    "none".to_string()
+                } else {
+                    changes.join(", ")
+                }
             );
         }
         b
