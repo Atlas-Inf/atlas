@@ -194,6 +194,8 @@ int cublasLtMatmulPreferenceDestroy(void){return 1;}
 int cublasLtMatmulPreferenceSetAttribute(void){return 1;}
 int cublasLtMatrixLayoutCreate(void){return 1;}
 int cublasLtMatrixLayoutDestroy(void){return 1;}
+int cublasLtMatrixLayoutSetAttribute(void){return 1;}
+int cublasLtMatmulAlgoCheck(void){return 1;}
 EOF
 cc -shared -fPIC -nostdlib -o /tmp/libcublasLt.so /tmp/libcublaslt_stub.c
 sudo install -m 0644 /tmp/libcublasLt.so "$DEST/libcublasLt.so"
