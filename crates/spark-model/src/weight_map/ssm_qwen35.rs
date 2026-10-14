@@ -281,13 +281,11 @@ pub(crate) fn load_moe_qwen35(
     // the per-slice dequant intermediates, not these originals, so this is
     // additive (no double-free). Drops the redundant ~60GB so only the NVFP4
     // copies remain resident.
+    // `reclaim` (free + record): both are WeightStore tensors, and a raw free
+    // left teardown to free them a second time (#122).
     if is_fused {
-        if let Ok(w) = store.get(&fused_gate_up_key) {
-            let _ = gpu.free(w.ptr);
-        }
-        if let Ok(w) = store.get(&fused_down_key) {
-            let _ = gpu.free(w.ptr);
-        }
+        store.reclaim(gpu, &fused_gate_up_key)?;
+        store.reclaim(gpu, &fused_down_key)?;
     }
 
     Ok(MoeWeights {
