@@ -64,6 +64,10 @@ impl TransformerModel {
         let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
         *self.vision_embed_patches.lock() = total_merged;
         *self.vision_image_grids.lock() = post_merge_grids;
+        *self.vision_cache.lock() = super::super::super::vision_cache::VisionCacheState {
+            hashes: images.iter().map(|it| it.content_hash).collect(),
+            ..Default::default()
+        };
         tracing::info!(
             "Vision encoder (batched): {} images, {} merged patches encoded",
             images.len(),
@@ -125,6 +129,10 @@ impl TransformerModel {
         let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
         *self.vision_embed_patches.lock() = total_merged;
         *self.vision_image_grids.lock() = grids;
+        *self.vision_cache.lock() = super::super::super::vision_cache::VisionCacheState {
+            hashes: flat_items.iter().map(|it| it.content_hash).collect(),
+            ..Default::default()
+        };
         // Per-request slice descriptors (request order matches the flatten order,
         // so row offsets accumulate Σ merged_p of earlier requests).
         // (buf_out row offset, GRID index offset, grid count, merged rows).

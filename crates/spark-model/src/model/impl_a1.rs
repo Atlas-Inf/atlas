@@ -797,6 +797,7 @@ impl TransformerModel {
             vision_grid_base: Mutex::new(0),
             vision_owned_images: Mutex::new(0),
             vision_slice_rows: Mutex::new(0),
+            vision_cache: Mutex::new(Default::default()),
             pinned_staging,
             ssm_checkpoint_interval,
             ssm_state_norm_kernel: ssm_norm_k,

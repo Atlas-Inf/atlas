@@ -13,9 +13,17 @@ use anyhow::{Result, ensure};
 /// current vision metadata and, when present, the encoded BF16 rows.
 pub(crate) const EP_CMD_VISION_STATE: u32 = 0xFFFF_FFF7;
 
-/// Six u32 words precede the optional grid triples and BF16 payload:
-/// `rows, grid_count, row_base, grid_base, owned_images, slice_rows`.
-pub(crate) const VISION_HEADER_WORDS: usize = 6;
+/// Seven u32 words precede the optional grid records and BF16 payload:
+/// `rows, grid_count, row_base, grid_base, owned_images, slice_rows,
+/// deferred`. `deferred == 1` means the rows are not on the wire yet: they
+/// follow inside the prefill's prefix lookup, once both ranks agree which
+/// items the cache already covers (`vision_cache`).
+pub(crate) const VISION_HEADER_WORDS: usize = 7;
+
+/// Words per item record: `t_len, grid_h, grid_w` and the item's 128-bit
+/// content hash as four little-endian words. The hash keys the worker's
+/// prefix cache exactly like the head's.
+pub(crate) const VISION_GRID_WORDS: usize = 7;
 
 /// A malformed or accidentally unbounded request must not turn the worker's
 /// scratch broadcast into an arbitrary allocation/collective. Normal prompts
@@ -60,6 +68,7 @@ impl std::fmt::Display for VisionCapacityError {
 impl std::error::Error for VisionCapacityError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct VisionWireState {
     pub rows: usize,
     pub grid_count: usize,
@@ -67,6 +76,7 @@ pub(crate) struct VisionWireState {
     pub grid_base: usize,
     pub owned_images: usize,
     pub slice_rows: usize,
+    pub deferred: bool,
 }
 
 /// Parse and validate the fixed-width state header received over the u32 wire.
@@ -84,6 +94,11 @@ pub(crate) fn parse_state_header(words: &[u32], max_rows: usize) -> Result<Visio
         grid_base: words[3] as usize,
         owned_images: words[4] as usize,
         slice_rows: words[5] as usize,
+        deferred: match words[6] {
+            0 => false,
+            1 => true,
+            other => anyhow::bail!("vision state deferred flag must be 0 or 1, got {other}"),
+        },
     };
     validate_state(&state, max_rows)
 }
@@ -103,7 +118,8 @@ pub(crate) fn validate_state(state: &VisionWireState, max_rows: usize) -> Result
                 && state.row_base == 0
                 && state.grid_base == 0
                 && state.owned_images == 0
-                && state.slice_rows == 0,
+                && state.slice_rows == 0
+                && !state.deferred,
             "empty vision state must clear rows, grids, and slice bases"
         );
         return Ok(*state);
@@ -144,6 +160,10 @@ pub(crate) fn validate_state(state: &VisionWireState, max_rows: usize) -> Result
         );
     } else {
         ensure!(
+            !state.deferred,
+            "a co-dispatched vision slice is always encoded before its prefill"
+        );
+        ensure!(
             state.grid_base <= state.grid_count,
             "vision grid base exceeds grid count"
         );
@@ -155,15 +175,35 @@ pub(crate) fn validate_state(state: &VisionWireState, max_rows: usize) -> Result
     Ok(*state)
 }
 
-/// Decode `(t_len, grid_h, grid_w)` triples and reject malformed geometry
-/// before the worker stores it in the MRoPE state.
+/// Encode per-item `(t_len, grid_h, grid_w)` and content hashes as
+/// [`VISION_GRID_WORDS`]-word records.
+pub(crate) fn grid_words(grids: &[(usize, usize, usize)], hashes: &[u128]) -> Result<Vec<u32>> {
+    ensure!(
+        grids.len() == hashes.len(),
+        "vision grids ({}) and content hashes ({}) disagree",
+        grids.len(),
+        hashes.len()
+    );
+    let word = |v: usize| {
+        u32::try_from(v).map_err(|_| anyhow::anyhow!("vision geometry exceeds u32 wire type"))
+    };
+    let mut out = Vec::with_capacity(grids.len() * VISION_GRID_WORDS);
+    for (&(t_len, grid_h, grid_w), &hash) in grids.iter().zip(hashes) {
+        out.extend([word(t_len)?, word(grid_h)?, word(grid_w)?]);
+        out.extend((0..4).map(|i| (hash >> (32 * i)) as u32));
+    }
+    Ok(out)
+}
+
+/// Decode the item records and reject malformed geometry before the worker
+/// stores it in the MRoPE state. Returns the grids and the content hashes.
 pub(crate) fn parse_grid_words(
     words: &[u32],
     state: &VisionWireState,
-) -> Result<Vec<(usize, usize, usize)>> {
+) -> Result<(Vec<(usize, usize, usize)>, Vec<u128>)> {
     let expected = state
         .grid_count
-        .checked_mul(3)
+        .checked_mul(VISION_GRID_WORDS)
         .ok_or_else(|| anyhow::anyhow!("vision grid metadata length overflow"))?;
     ensure!(
         words.len() == expected,
@@ -171,10 +211,17 @@ pub(crate) fn parse_grid_words(
         words.len()
     );
     let mut grids = Vec::with_capacity(state.grid_count);
-    for triple in words.chunks_exact(3) {
-        let t_len = triple[0] as usize;
-        let grid_h = triple[1] as usize;
-        let grid_w = triple[2] as usize;
+    let mut hashes = Vec::with_capacity(state.grid_count);
+    for record in words.chunks_exact(VISION_GRID_WORDS) {
+        let t_len = record[0] as usize;
+        let grid_h = record[1] as usize;
+        let grid_w = record[2] as usize;
+        hashes.push(
+            record[3..]
+                .iter()
+                .enumerate()
+                .fold(0u128, |h, (i, &w)| h | (w as u128) << (32 * i)),
+        );
         ensure!(
             t_len > 0 && grid_h > 0 && grid_w > 0,
             "vision grid dimensions must be non-zero"
@@ -205,7 +252,7 @@ pub(crate) fn parse_grid_words(
         "vision grid rows {rows} do not match encoded rows {}",
         state.rows
     );
-    Ok(grids)
+    Ok((grids, hashes))
 }
 
 /// Compute the direct device broadcast size for the fixed BF16 vision output.
@@ -261,13 +308,19 @@ mod tests {
             grid_base: 0,
             owned_images: 0,
             slice_rows: rows as usize,
+            deferred: false,
         }
+    }
+
+    fn records(grids: &[(usize, usize, usize)]) -> Vec<u32> {
+        let hashes: Vec<u128> = (0..grids.len() as u128).collect();
+        grid_words(grids, &hashes).unwrap()
     }
 
     #[test]
     fn accepts_legacy_and_co_dispatched_ranges() {
         assert_eq!(
-            parse_state_header(&[8, 1, 0, 0, 0, 8], 16).unwrap(),
+            parse_state_header(&[8, 1, 0, 0, 0, 8, 0], 16).unwrap(),
             legacy(8, 1)
         );
         let packed = VisionWireState {
@@ -277,8 +330,22 @@ mod tests {
             grid_base: 1,
             owned_images: 1,
             slice_rows: 4,
+            deferred: false,
         };
         assert_eq!(validate_state(&packed, 16).unwrap(), packed);
+        let deferred = parse_state_header(&[8, 1, 0, 0, 0, 8, 1], 16).unwrap();
+        assert!(deferred.deferred);
+        assert!(
+            validate_state(
+                &VisionWireState {
+                    deferred: true,
+                    ..packed
+                },
+                16
+            )
+            .is_err(),
+            "a co-dispatched slice is never deferred"
+        );
     }
 
     #[test]
@@ -301,8 +368,10 @@ mod tests {
 
     #[test]
     fn rejects_unbounded_or_inconsistent_state() {
-        assert!(parse_state_header(&[17, 1, 0, 0, 0, 17], 16).is_err());
-        assert!(parse_state_header(&[0, 1, 0, 0, 0, 0], 16).is_err());
+        assert!(parse_state_header(&[17, 1, 0, 0, 0, 17, 0], 16).is_err());
+        assert!(parse_state_header(&[0, 1, 0, 0, 0, 0, 0], 16).is_err());
+        assert!(parse_state_header(&[0, 0, 0, 0, 0, 0, 1], 16).is_err());
+        assert!(parse_state_header(&[8, 1, 0, 0, 0, 8, 2], 16).is_err());
         assert!(
             validate_state(
                 &VisionWireState {
@@ -312,6 +381,7 @@ mod tests {
                     grid_base: 0,
                     owned_images: 1,
                     slice_rows: 2,
+                    deferred: false,
                 },
                 16,
             )
@@ -324,18 +394,28 @@ mod tests {
             grid_base: 0,
             owned_images: 0,
             slice_rows: 8,
+            deferred: false,
         };
-        assert!(parse_grid_words(&[1, u32::MAX, 1], &huge).is_err());
-        assert!(parse_grid_words(&[1, 2, 2], &legacy(8, 1)).is_err());
+        assert!(parse_grid_words(&records(&[(1, u32::MAX as usize, 1)]), &huge).is_err());
+        assert!(parse_grid_words(&records(&[(1, 2, 2)]), &legacy(8, 1)).is_err());
+        assert!(
+            parse_grid_words(&[1, 2, 2], &legacy(4, 1)).is_err(),
+            "hashes are required"
+        );
     }
 
     #[test]
     fn validates_grid_triples_and_payload_size() {
         let state = legacy(12, 2);
+        let hashes = [u128::MAX - 1, 0x0123_4567_89ab_cdef_0011_2233_4455_6677];
+        let words = grid_words(&[(1, 2, 2), (2, 2, 2)], &hashes).unwrap();
+        assert_eq!(words.len(), 2 * VISION_GRID_WORDS);
         assert_eq!(
-            parse_grid_words(&[1, 2, 2, 2, 2, 2], &state).unwrap(),
-            vec![(1, 2, 2), (2, 2, 2)]
+            parse_grid_words(&words, &state).unwrap(),
+            (vec![(1, 2, 2), (2, 2, 2)], hashes.to_vec()),
+            "the worker decodes the head's grids and content hashes exactly"
         );
+        assert!(grid_words(&[(1, 2, 2)], &[]).is_err());
         assert_eq!(payload_bytes(&state, 2048, 16).unwrap(), 12 * 2048 * 2);
         assert!(payload_bytes(&state, 0, 16).is_err());
     }

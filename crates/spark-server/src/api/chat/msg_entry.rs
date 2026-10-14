@@ -391,12 +391,16 @@ pub(super) fn build_msg_entries(
                                 v.timestamps.clone()
                             };
                             (
+<<<<<<< HEAD
                                 spark_model::VisionItem {
                                     held: spark_model::vision_budget::HeldRows::default(),
                                     groups: v.groups,
                                     grid_h: v.grid_h,
                                     grid_w: v.grid_w,
                                 },
+=======
+                                spark_model::VisionItem::video(v.groups, v.grid_h, v.grid_w),
+>>>>>>> ab671c1e3 (prefix cache: content-keyed vision prompts (issue #58))
                                 timestamps,
                             )
                         }

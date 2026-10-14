@@ -407,7 +407,9 @@ pub fn start_chunked_prefill(
         // pre-pass (vision_slice.is_some()) — that path runs ONE encode + fence
         // for the whole tick; here we only set the per-stream slice base below.
         if vision_slice.is_none() && !image_pixels.is_empty() {
-            model.prepare_vision_embed(&image_pixels)?;
+            // A model that caches vision prompts encodes inside the chunk-0
+            // prefix lookup instead, and only the items it does not cover.
+            model.prepare_vision_embed_for_chunked(&image_pixels)?;
             // prepare_vision_embed() runs the vision encoder asynchronously on
             // the default stream, writing this request's patch embeddings into
             // the encoder's buf_out. The chunk-0 embedding injection inside

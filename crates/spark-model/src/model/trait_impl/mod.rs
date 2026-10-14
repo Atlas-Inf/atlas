@@ -96,6 +96,9 @@ impl Model for TransformerModel {
     fn prepare_vision_embed(&self, images: &[crate::VisionItem]) -> Result<()> {
         self.prepare_vision_embed_dispatch(images)
     }
+    fn prepare_vision_embed_for_chunked(&self, images: &[crate::VisionItem]) -> Result<()> {
+        self.prepare_vision_embed_deferred_dispatch(images)
+    }
     fn prepare_vision_embed_batched(
         &self,
         per_request: &[Vec<crate::VisionItem>],

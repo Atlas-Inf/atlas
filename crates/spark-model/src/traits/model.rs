@@ -1188,6 +1188,14 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// `prepare_vision_embed` for a request whose chunk 0 goes through
+    /// `prefill_chunk`: a model that prefix-caches vision prompts may stage
+    /// the images and encode, inside the chunk-0 prefix lookup, only those
+    /// the cache does not cover. Default: encode now.
+    fn prepare_vision_embed_for_chunked(&self, images: &[crate::VisionItem]) -> Result<()> {
+        self.prepare_vision_embed(images)
+    }
+
     /// Batched vision encode across N requests' images in ONE `forward_batched`
     /// call (block GEMM weights read once over Σpatches). `per_request[i]` is
     /// request i's images. Returns one `(patch_row_offset, grid_index_offset,

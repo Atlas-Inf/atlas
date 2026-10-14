@@ -43,7 +43,9 @@ pub(super) fn take_staged_ids() -> Option<Vec<u32>> {
 /// encoder output follows the complete prompt's pad-token order, so a chunk
 /// starting in the middle of a media run must begin after every earlier image
 /// or video pad token. `row_base` is the request slice in co-dispatch output;
-/// `pending` is the complete packed output row count.
+/// `skip_rows` the leading rows of cached items the encoder did not produce
+/// (their placeholders are not copied); `pending` is the complete packed
+/// output row count.
 fn vision_pad_row_range(
     tokens: &[u32],
     chunk_start: usize,
@@ -51,6 +53,7 @@ fn vision_pad_row_range(
     image_pad: u32,
     video_pad: u32,
     row_base: usize,
+    skip_rows: usize,
     pending: usize,
 ) -> Result<(usize, usize)> {
     let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
@@ -58,17 +61,18 @@ fn vision_pad_row_range(
     let prior_pad_count = tokens[..chunk_start].iter().filter(is_pad).count();
     let chunk_pad_count = chunk_tokens.iter().filter(is_pad).count();
     let start = row_base
-        .checked_add(prior_pad_count)
+        .checked_add(prior_pad_count.saturating_sub(skip_rows))
         .ok_or_else(|| anyhow::anyhow!("vision pad overlay row offset overflow"))?;
-    let end = start
-        .checked_add(chunk_pad_count)
+    let end = row_base
+        .checked_add((prior_pad_count + chunk_pad_count).saturating_sub(skip_rows))
         .ok_or_else(|| anyhow::anyhow!("vision pad overlay row count overflow"))?;
     if end > pending {
         bail!(
-            "vision pad overlay exceeds packed encoder output: base={}, prior={}, chunk={}, pending={}",
+            "vision pad overlay exceeds packed encoder output: base={}, prior={}, chunk={}, skipped={}, pending={}",
             row_base,
             prior_pad_count,
             chunk_pad_count,
+            skip_rows,
             pending
         );
     }
@@ -102,8 +106,6 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<()> {
         let h = self.config.hidden_size;
-        // BF16 residual is the shipping config (2 bytes/element).
-        let elem_bytes = 2usize;
         let _tp = std::time::Instant::now();
 
         // ── 1. Embed chunk tokens → [chunk_len, H] contiguous at hidden_dst ──
@@ -221,63 +223,7 @@ impl TransformerModel {
         }
 
         // ── 1b. Overwrite image_pad token positions with vision encoder embeddings ──
-        // Vision embeddings are pre-computed by prepare_vision_embed() and stored in
-        // the VisionEncoder's buf_out buffer ([total_patches, out_hidden_size] BF16).
-        {
-            let pending = *self.vision_embed_patches.lock();
-            if pending > 0
-                && let Some(ve) = &self.vision_encoder
-            {
-                let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
-                // EITHER pad token. Matching only the image one meant a
-                // video's positions were skipped entirely — no encoder row was
-                // copied over them, the hidden state kept the raw token
-                // embedding, and the model described a featureless gray field
-                // while every token count looked correct.
-                let (image_pad, video_pad) = self.vision_pad_ids();
-                let prior_pad_rows = crate::model::vision_transport::pad_rows_before_chunk(
-                    tokens,
-                    chunk_start,
-                    image_pad,
-                    video_pad,
-                );
-                // Co-dispatch: this request's slice starts at vision_row_base
-                // in the shared packed buf_out (0 for the legacy single encode).
-                let row_base = *self.vision_row_base.lock();
-                let owned_images = *self.vision_owned_images.lock();
-                let slice_rows = *self.vision_slice_rows.lock();
-                let chunk_pad_rows = chunk_tokens
-                    .iter()
-                    .filter(|&&tok| tok == image_pad || tok == video_pad)
-                    .count();
-                ensure!(
-                    row_base
-                        .checked_add(prior_pad_rows)
-                        .and_then(|v| v.checked_add(chunk_pad_rows))
-                        .is_some_and(|end| end <= pending),
-                    "vision pad rows exceed encoded rows: base={row_base}, prior={prior_pad_rows}, chunk={chunk_pad_rows}, encoded={pending}"
-                );
-                if owned_images > 0 {
-                    ensure!(
-                        slice_rows > 0
-                            && prior_pad_rows
-                                .checked_add(chunk_pad_rows)
-                                .is_some_and(|end| end <= slice_rows),
-                        "vision pad rows exceed co-dispatched slice: prior={prior_pad_rows}, chunk={chunk_pad_rows}, slice={slice_rows}"
-                    );
-                }
-                // The encoder output is packed in prompt order, while this
-                // function may be called for several chunks. Starting at
-                // zero for every chunk would repeat earlier vision rows.
-                let (mut row_idx, _) = vision_pad_row_range(
-                    tokens,
-                    chunk_start,
-                    chunk_len,
-                    image_pad,
-                    video_pad,
-                    row_base,
-                    pending,
-                )?;
+        self.splice_vision_rows(tokens, chunk_start, chunk_len, hidden_dst, stream)?;
 
                 for (i, &tok) in chunk_tokens.iter().enumerate() {
                     if tok == image_pad || tok == video_pad {
@@ -289,8 +235,101 @@ impl TransformerModel {
                     }
                 }
             }
-        }
+        Ok(())
+    }
 
+    /// Overwrite the vision placeholders of `tokens[start..start + count]`,
+    /// embedded at `hidden_dst` row 0 onward, with their encoder rows.
+    ///
+    /// Vision embeddings are pre-computed by prepare_vision_embed() (or the
+    /// deferred encode, `vision_cache`) and stored in the VisionEncoder's
+    /// buf_out buffer ([rows, out_hidden_size] BF16) in prompt order, less the
+    /// leading `skip_rows` of items the prefix cache covered: their
+    /// placeholders all sit at positions this prefill does not compute, so
+    /// their rows are left as the raw token embedding no layer reads.
+    pub(in crate::model) fn splice_vision_rows(
+        &self,
+        tokens: &[u32],
+        start: usize,
+        count: usize,
+        hidden_dst: spark_runtime::gpu::DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let h = self.config.hidden_size;
+        // BF16 residual is the shipping config (2 bytes/element).
+        let elem_bytes = 2usize;
+        let pending = *self.vision_embed_patches.lock();
+        let (skip_rows, computed_from, deferred) = {
+            let st = self.vision_cache.lock();
+            (st.skip_rows, st.computed_from, st.deferred.is_some())
+        };
+        let Some(ve) = &self.vision_encoder else {
+            return Ok(());
+        };
+        if pending == 0 && skip_rows == 0 && !deferred {
+            return Ok(());
+        }
+        let chunk_tokens = &tokens[start..start + count];
+        // EITHER pad token. Matching only the image one meant a video's
+        // positions were skipped entirely — no encoder row was copied over
+        // them, the hidden state kept the raw token embedding, and the model
+        // described a featureless gray field while every token count looked
+        // correct.
+        let (image_pad, video_pad) = self.vision_pad_ids();
+        let chunk_pad_rows = chunk_tokens
+            .iter()
+            .filter(|&&tok| tok == image_pad || tok == video_pad)
+            .count();
+        if chunk_pad_rows == 0 {
+            return Ok(());
+        }
+        ensure!(
+            !deferred,
+            "vision placeholders embedded before the deferred encode resolved"
+        );
+        let prior_pad_rows = crate::model::vision_transport::pad_rows_before_chunk(
+            tokens, start, image_pad, video_pad,
+        );
+        // Co-dispatch: this request's slice starts at vision_row_base in the
+        // shared packed buf_out (0 for the legacy single encode).
+        let row_base = *self.vision_row_base.lock();
+        let owned_images = *self.vision_owned_images.lock();
+        let slice_rows = *self.vision_slice_rows.lock();
+        if owned_images > 0 {
+            ensure!(
+                slice_rows > 0
+                    && prior_pad_rows
+                        .checked_add(chunk_pad_rows)
+                        .is_some_and(|end| end <= slice_rows),
+                "vision pad rows exceed co-dispatched slice: prior={prior_pad_rows}, chunk={chunk_pad_rows}, slice={slice_rows}"
+            );
+        }
+        // The encoder output is packed in prompt order, while this function
+        // may be called for several chunks. Starting at zero for every chunk
+        // would repeat earlier vision rows.
+        let (mut row_idx, _) = vision_pad_row_range(
+            tokens, start, count, image_pad, video_pad, row_base, skip_rows, pending,
+        )?;
+        let mut pad_idx = prior_pad_rows;
+        for (i, &tok) in chunk_tokens.iter().enumerate() {
+            if tok != image_pad && tok != video_pad {
+                continue;
+            }
+            if pad_idx < skip_rows {
+                ensure!(
+                    start + i < computed_from,
+                    "cached vision placeholder at {} is computed (from {computed_from})",
+                    start + i
+                );
+            } else {
+                let src = ve.buf_out.offset(row_idx * ve.out_hidden_size * 2);
+                let dst = hidden_dst.offset(i * h * elem_bytes);
+                self.gpu
+                    .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;
+                row_idx += 1;
+            }
+            pad_idx += 1;
+        }
         Ok(())
     }
 }
@@ -307,25 +346,43 @@ mod tests {
         let tokens = [text, image, image, text, image, video, video, text];
 
         assert_eq!(
-            vision_pad_row_range(&tokens, 0, 3, image, video, 4, 9).unwrap(),
+            vision_pad_row_range(&tokens, 0, 3, image, video, 4, 0, 9).unwrap(),
             // `row_base` is already included in this absolute range; the
             // copy site must not add it a second time.
             (4, 6)
         );
         assert_eq!(
-            vision_pad_row_range(&tokens, 3, 3, image, video, 4, 9).unwrap(),
+            vision_pad_row_range(&tokens, 3, 3, image, video, 4, 0, 9).unwrap(),
             (6, 8)
         );
         assert_eq!(
-            vision_pad_row_range(&tokens, 6, 2, image, video, 4, 9).unwrap(),
+            vision_pad_row_range(&tokens, 6, 2, image, video, 4, 0, 9).unwrap(),
             (8, 9)
         );
     }
 
     #[test]
     fn vision_rows_fail_closed_when_the_packed_slice_is_short() {
-        let err = vision_pad_row_range(&[1, 10, 10], 1, 2, 10, 11, 3, 4)
+        let err = vision_pad_row_range(&[1, 10, 10], 1, 2, 10, 11, 3, 0, 4)
             .expect_err("two rows cannot fit in one packed row");
         assert!(err.to_string().contains("exceeds packed encoder output"));
+    }
+
+    #[test]
+    fn cached_items_shift_rows_down_by_the_skipped_rows() {
+        let (image, text) = (10, 1);
+        // Item 0 (2 rows, cached) at 1..3, item 1 (2 rows, encoded) at 4..6.
+        let tokens = [text, image, image, text, image, image, text];
+        // buf_out holds only item 1: rows 0..2.
+        assert_eq!(
+            vision_pad_row_range(&tokens, 3, 4, image, 11, 0, 2, 2).unwrap(),
+            (0, 2)
+        );
+        // A chunk over the cached item maps to no encoded rows.
+        assert_eq!(
+            vision_pad_row_range(&tokens, 0, 3, image, 11, 0, 2, 2).unwrap(),
+            (0, 0)
+        );
+        assert!(vision_pad_row_range(&tokens, 3, 4, image, 11, 0, 2, 1).is_err());
     }
 }
