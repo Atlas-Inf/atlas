@@ -467,9 +467,6 @@ pub struct TransformerModel {
     /// Number of encoded rows owned by the current co-dispatched request.
     /// Zero means the legacy single-request range (or no pending vision).
     pub(super) vision_slice_rows: Mutex<usize>,
-    /// Content hashes and deferred-encode state of the current vision
-    /// request (`vision_cache`).
-    pub(super) vision_cache: Mutex<super::vision_cache::VisionCacheState>,
     /// Page-locked host staging for batched metadata H2D transfers.
     /// Allocated once at init via cuMemAllocHost, freed in Drop.
     ///

@@ -162,6 +162,9 @@ pub struct SequenceState {
     /// whose tokens are their own key, and for a vision prompt that cannot be
     /// keyed, which then neither looks up nor inserts.
     pub vision_cache_key: Vec<u32>,
+    /// The sequence's own vision state (images, grids, hashes, encode
+    /// bookkeeping), held across its prefill chunks (`model::vision_cache`).
+    pub vision: SeqVision,
     /// Whether the chunk-0 prefix-cache lookup already ran for this sequence.
     ///
     /// The lookup is NOT idempotent: it bumps radix refs, `inc_ref`s each
@@ -318,6 +321,7 @@ impl SequenceState {
             cached_prefix_blocks: 0,
             prefix_ref_tokens: Vec::new(),
             vision_cache_key: Vec::new(),
+            vision: SeqVision::default(),
             prefix_lookup_applied: false,
             prefix_lookup_skip: false,
             pc_branch_at: None,
@@ -437,7 +441,9 @@ mod eos_ban;
 mod logprobs;
 mod model;
 mod model_defaults;
+mod seq_vision;
 pub use eos_ban::EosBan;
 pub use logprobs::*;
 pub use model::{BeamReq, Model, padded_batch_n};
 pub use model_defaults::EP_CMD_PC_PLANT;
+pub use seq_vision::SeqVision;

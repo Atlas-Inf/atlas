@@ -259,12 +259,13 @@ pub fn prefill_request(
     let prefill_result = (|| -> Result<u32> {
         // Vision: encode images and store embeddings for prefill token overwrite.
         if !image_pixels.is_empty() {
-            model.prepare_vision_embed(&image_pixels)?;
+            model.prepare_vision_embed(&mut seq, &image_pixels)?;
         }
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
         model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
         model.ep_broadcast_vision_state_for_seq(
+            &seq,
             seq.slot_idx as u32,
             !image_pixels.is_empty(),
             0,

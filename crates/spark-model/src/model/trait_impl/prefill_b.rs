@@ -194,15 +194,18 @@ impl TransformerModel {
             stream
         };
 
+        // A later chunk encodes its vision items before its embed, on every
+        // rank alike (chunk 0's run in its lookup, `vision_cache`).
+        self.vision_encode_chunk_items(seq, tokens, chunk_start, chunk_start + chunk_len, stream)?;
         // Zero the arena and embed the chunk (phases 1+1b, `warm`): here, or
         // with ATLAS_GLM_WARM_SKIP_CACHED after the prefix lookup and only
         // for a chunk that computes.
         let lookup_first = self.warm_lookup_first();
         // A deferred vision encode runs in the lookup: embed after it.
-        let embed_after = lookup_first || self.vision_encode_deferred();
+        let embed_after = lookup_first || Self::vision_encode_deferred(seq);
         let span = (chunk_start, chunk_len);
         let mut t_pre =
-            self.prefill_b_zero_and_embed(!embed_after, tokens, span.0, span.1, stream)?;
+            self.prefill_b_zero_and_embed(seq, !embed_after, tokens, span.0, span.1, stream)?;
         let t_embed = tp.elapsed();
 
         let mut kv_cache = self.kv_cache.lock();
@@ -212,6 +215,7 @@ impl TransformerModel {
             tokens,
             seq,
             chunk_start,
+            chunk_len,
             total,
             &mut kv_cache,
             stream,
@@ -232,7 +236,7 @@ impl TransformerModel {
         }
         let cached = lookup_first && seq.prefill_chunk_cached(span.0 + span.1, is_last_chunk);
         if embed_after {
-            t_pre = self.prefill_b_zero_and_embed(!cached, tokens, span.0, span.1, stream)?;
+            t_pre = self.prefill_b_zero_and_embed(seq, !cached, tokens, span.0, span.1, stream)?;
         }
         let t_prefix = tp.elapsed();
 

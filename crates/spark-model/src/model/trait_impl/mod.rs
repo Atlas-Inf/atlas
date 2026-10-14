@@ -93,11 +93,22 @@ impl Model for TransformerModel {
         (b.window, b.request)
     }
 
-    fn prepare_vision_embed(&self, images: &[crate::VisionItem]) -> Result<()> {
-        self.prepare_vision_embed_dispatch(images)
+    fn prepare_vision_embed(
+        &self,
+        seq: &mut SequenceState,
+        images: &[crate::VisionItem],
+    ) -> Result<()> {
+        self.prepare_vision_embed_dispatch(seq, images)
     }
-    fn prepare_vision_embed_for_chunked(&self, images: &[crate::VisionItem]) -> Result<()> {
-        self.prepare_vision_embed_deferred_dispatch(images)
+    fn prepare_vision_embed_for_chunked(
+        &self,
+        seq: &mut SequenceState,
+        images: &[crate::VisionItem],
+    ) -> Result<()> {
+        self.prepare_vision_embed_deferred_dispatch(seq, images)
+    }
+    fn stage_vision_grids(&self, seq: &mut SequenceState, images: &[crate::VisionItem]) {
+        self.stage_vision_grids_dispatch(seq, images);
     }
     fn prepare_vision_embed_batched(
         &self,
@@ -107,15 +118,17 @@ impl Model for TransformerModel {
     }
     fn set_vision_slice_base(
         &self,
+        seq: &mut SequenceState,
         row_base: usize,
         grid_base: usize,
         owned_images: usize,
         slice_rows: usize,
     ) {
-        self.set_vision_slice_base_entry(row_base, grid_base, owned_images, slice_rows);
+        Self::set_vision_slice_base_entry(seq, row_base, grid_base, owned_images, slice_rows);
     }
     fn ep_broadcast_vision_state_for_seq(
         &self,
+        seq: &SequenceState,
         seq_id: u32,
         enabled: bool,
         row_base: usize,
@@ -124,6 +137,7 @@ impl Model for TransformerModel {
         slice_rows: usize,
     ) -> Result<()> {
         self.ep_broadcast_vision_state_for_seq_dispatch(
+            seq,
             seq_id,
             enabled,
             row_base,

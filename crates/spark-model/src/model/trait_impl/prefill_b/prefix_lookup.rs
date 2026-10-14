@@ -19,6 +19,7 @@ impl TransformerModel {
         tokens: &[u32],
         seq: &mut SequenceState,
         chunk_start: usize,
+        chunk_len: usize,
         total: usize,
         kv_cache: &mut PagedKvCache,
         stream: u64,
@@ -392,7 +393,13 @@ impl TransformerModel {
             self.pc_plan_branch(key_tokens, seq, matched, skip_tokens, bs)?;
             self.finish_leaf_restored(key_tokens, seq, skip_tokens, bs, stream)?;
             // Encode the vision items this prefill computes (`vision_cache`).
-            self.vision_resolve_deferred(tokens, skip_tokens.min(total.saturating_sub(1)))?;
+            self.vision_resolve_deferred(
+                seq,
+                tokens,
+                skip_tokens.min(total.saturating_sub(1)),
+                chunk_start + chunk_len,
+                stream,
+            )?;
             seq.marconi_skip_to = skip_tokens;
             seq.prefix_lookup_skip = skip;
             seq.prefix_lookup_applied = true;

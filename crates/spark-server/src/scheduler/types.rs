@@ -38,7 +38,7 @@ pub(super) struct PendingQueue {
 pub(super) struct VisionSlice {
     /// First `buf_out` row (post-merge patch) this request owns.
     pub patch_row_offset: usize,
-    /// First `vision_image_grids` index this request owns.
+    /// First per-sequence `vision_grids` index this request owns.
     pub grid_index_offset: usize,
     /// Number of images this request contributed to the batch.
     pub num_images: usize,

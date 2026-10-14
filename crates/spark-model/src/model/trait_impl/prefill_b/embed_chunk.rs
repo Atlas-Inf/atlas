@@ -9,6 +9,7 @@ use anyhow::{Result, bail, ensure};
 
 use super::super::super::types::TransformerModel;
 use crate::layers::ops;
+use crate::traits::SequenceState;
 
 /// `ATLAS_QWEN4EXP_PREFILL_HOST_IDS=1`: the prefill forward hands its layers
 /// the host copy of the token ids it uploaded (`ForwardContext::
@@ -44,8 +45,9 @@ pub(super) fn take_staged_ids() -> Option<Vec<u32>> {
 /// starting in the middle of a media run must begin after every earlier image
 /// or video pad token. `row_base` is the request slice in co-dispatch output;
 /// `skip_rows` the leading rows of cached items the encoder did not produce
-/// (their placeholders are not copied); `pending` is the complete packed
-/// output row count.
+/// (their placeholders are not copied); `window_end` is the virtual row one
+/// past the resident window (`rows_base + rows_encoded`): the chunk's pads
+/// must all map inside it.
 fn vision_pad_row_range(
     tokens: &[u32],
     chunk_start: usize,
@@ -54,7 +56,7 @@ fn vision_pad_row_range(
     video_pad: u32,
     row_base: usize,
     skip_rows: usize,
-    pending: usize,
+    window_end: usize,
 ) -> Result<(usize, usize)> {
     let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
     let is_pad = |tok: &&u32| **tok == image_pad || **tok == video_pad;
@@ -66,14 +68,14 @@ fn vision_pad_row_range(
     let end = row_base
         .checked_add((prior_pad_count + chunk_pad_count).saturating_sub(skip_rows))
         .ok_or_else(|| anyhow::anyhow!("vision pad overlay row count overflow"))?;
-    if end > pending {
+    if end > window_end {
         bail!(
-            "vision pad overlay exceeds packed encoder output: base={}, prior={}, chunk={}, skipped={}, pending={}",
+            "vision pad overlay exceeds the resident window: base={}, prior={}, chunk={}, skipped={}, window_end={}",
             row_base,
             prior_pad_count,
             chunk_pad_count,
             skip_rows,
-            pending
+            window_end
         );
     }
     Ok((start, end))
@@ -82,6 +84,7 @@ fn vision_pad_row_range(
 impl TransformerModel {
     pub(super) fn prefill_b_embed_chunk(
         &self,
+        seq: &SequenceState,
         tokens: &[u32],
         chunk_start: usize,
         chunk_len: usize,
@@ -89,7 +92,7 @@ impl TransformerModel {
     ) -> Result<()> {
         // Single-stream entry point: write to the arena's hidden buffer at offset 0.
         let hidden = self.buffers.hidden_states();
-        self.prefill_b_embed_chunk_at(tokens, chunk_start, chunk_len, hidden, stream)
+        self.prefill_b_embed_chunk_at(seq, tokens, chunk_start, chunk_len, hidden, stream)
     }
 
     /// Embed `chunk_len` tokens into `hidden_dst` starting at position 0
@@ -99,6 +102,7 @@ impl TransformerModel {
     /// per-stream offsets of a shared stacked-streams buffer).
     pub(in crate::model) fn prefill_b_embed_chunk_at(
         &self,
+        seq: &SequenceState,
         tokens: &[u32],
         chunk_start: usize,
         chunk_len: usize,
@@ -223,7 +227,8 @@ impl TransformerModel {
         }
 
         // ── 1b. Overwrite image_pad token positions with vision encoder embeddings ──
-        self.splice_vision_rows(tokens, chunk_start, chunk_len, hidden_dst, stream)?;
+        self.splice_vision_rows(seq, tokens, chunk_start, chunk_len, hidden_dst, stream)?;
+
         Ok(())
     }
 
@@ -231,13 +236,21 @@ impl TransformerModel {
     /// embedded at `hidden_dst` row 0 onward, with their encoder rows.
     ///
     /// Vision embeddings are pre-computed by prepare_vision_embed() (or the
-    /// deferred encode, `vision_cache`) and stored in the VisionEncoder's
+    /// per-chunk encode, `vision_cache`) and stored in the VisionEncoder's
     /// buf_out buffer ([rows, out_hidden_size] BF16) in prompt order, less the
     /// leading `skip_rows` of items the prefix cache covered: their
     /// placeholders all sit at positions this prefill does not compute, so
     /// their rows are left as the raw token embedding no layer reads.
+    ///
+    /// `buf_out` is the single shared scratch row buffer: each per-chunk
+    /// encode writes the items this chunk splices at row 0 (a straddling item
+    /// is re-encoded at every chunk holding one of its placeholders), so the
+    /// resident window is exactly this chunk's splice range — `rows_base` is
+    /// its first virtual row and `rows_encoded` its row count. A pad mapping
+    /// below the base belongs to an earlier chunk and is refused.
     pub(in crate::model) fn splice_vision_rows(
         &self,
+        seq: &SequenceState,
         tokens: &[u32],
         start: usize,
         count: usize,
@@ -247,15 +260,13 @@ impl TransformerModel {
         let h = self.config.hidden_size;
         // BF16 residual is the shipping config (2 bytes/element).
         let elem_bytes = 2usize;
-        let pending = *self.vision_embed_patches.lock();
-        let (skip_rows, computed_from, deferred) = {
-            let st = self.vision_cache.lock();
-            (st.skip_rows, st.computed_from, st.deferred.is_some())
-        };
+        let pending = seq.vision.rows_encoded;
+        let skip_rows = seq.vision.skip_rows;
+        let computed_from = seq.vision.computed_from;
         let Some(ve) = &self.vision_encoder else {
             return Ok(());
         };
-        if pending == 0 && skip_rows == 0 && !deferred {
+        if pending == 0 && skip_rows == 0 {
             return Ok(());
         }
         let chunk_tokens = &tokens[start..start + count];
@@ -272,18 +283,14 @@ impl TransformerModel {
         if chunk_pad_rows == 0 {
             return Ok(());
         }
-        ensure!(
-            !deferred,
-            "vision placeholders embedded before the deferred encode resolved"
-        );
         let prior_pad_rows = crate::model::vision_transport::pad_rows_before_chunk(
             tokens, start, image_pad, video_pad,
         );
         // Co-dispatch: this request's slice starts at vision_row_base in the
         // shared packed buf_out (0 for the legacy single encode).
-        let row_base = *self.vision_row_base.lock();
-        let owned_images = *self.vision_owned_images.lock();
-        let slice_rows = *self.vision_slice_rows.lock();
+        let row_base = seq.vision.row_base;
+        let owned_images = seq.vision.owned_images;
+        let slice_rows = seq.vision.slice_rows;
         if owned_images > 0 {
             ensure!(
                 slice_rows > 0
@@ -295,9 +302,23 @@ impl TransformerModel {
         }
         // The encoder output is packed in prompt order, while this function
         // may be called for several chunks. Starting at zero for every chunk
-        // would repeat earlier vision rows.
+        // would repeat earlier vision rows. `row_idx` is the row's index in
+        // that packed order; `buf_out` holds the resident window re-based to
+        // physical 0 at `rows_base`, so the physical row is the packed index
+        // minus the rows that slid off the front (consumed, then overwritten
+        // by a later per-chunk encode). Co-dispatch reads a slice of the
+        // shared packed output with the base at 0 (the batched encode wrote
+        // every request's rows; nothing has been re-encoded since).
+        let rows_base = seq.vision.rows_base;
         let (mut row_idx, _) = vision_pad_row_range(
-            tokens, start, count, image_pad, video_pad, row_base, skip_rows, pending,
+            tokens,
+            start,
+            count,
+            image_pad,
+            video_pad,
+            row_base,
+            skip_rows,
+            rows_base + pending,
         )?;
         let mut pad_idx = prior_pad_rows;
         for (i, &tok) in chunk_tokens.iter().enumerate() {
@@ -312,6 +333,14 @@ impl TransformerModel {
                 );
             } else {
                 let src = ve.out_row().offset(row_idx * ve.out_hidden_size() * 2);
+                let physical = row_idx.checked_sub(rows_base).ok_or_else(|| {
+                    anyhow::anyhow!("vision row {row_idx} already consumed (base {rows_base})")
+                })?;
+                ensure!(
+                    physical < pending,
+                    "vision row {row_idx} is not resident (base {rows_base}, {pending} rows)"
+                );
+                let src = ve.out_row().offset(physical * ve.out_hidden_size() * 2);
                 let dst = hidden_dst.offset(i * h * elem_bytes);
                 self.gpu
                     .copy_d2d_async(src, dst, ve.out_hidden_size() * 2, stream)?;
@@ -354,7 +383,7 @@ mod tests {
     fn vision_rows_fail_closed_when_the_packed_slice_is_short() {
         let err = vision_pad_row_range(&[1, 10, 10], 1, 2, 10, 11, 3, 0, 4)
             .expect_err("two rows cannot fit in one packed row");
-        assert!(err.to_string().contains("exceeds packed encoder output"));
+        assert!(err.to_string().contains("exceeds the resident window"));
     }
 
     #[test]
@@ -362,7 +391,7 @@ mod tests {
         let (image, text) = (10, 1);
         // Item 0 (2 rows, cached) at 1..3, item 1 (2 rows, encoded) at 4..6.
         let tokens = [text, image, image, text, image, image, text];
-        // buf_out holds only item 1: rows 0..2.
+        // buf_out holds only item 1: rows 0..2 (window_end 0 + 2).
         assert_eq!(
             vision_pad_row_range(&tokens, 3, 4, image, 11, 0, 2, 2).unwrap(),
             (0, 2)
@@ -373,5 +402,20 @@ mod tests {
             (0, 0)
         );
         assert!(vision_pad_row_range(&tokens, 3, 4, image, 11, 0, 2, 1).is_err());
+    }
+
+    #[test]
+    fn a_per_chunk_window_covers_exactly_its_own_splice_range() {
+        let (image, text) = (10, 1);
+        // Item 0 (2 rows) pads at 1..3, item 1 (3 rows) pads at 4..7. Chunk 1
+        // = [3, 8) holds item 1's pads only (item 0's pads all sit before 3):
+        // its window is virtual [2, 5) — 3 rows at physical 0, base 2.
+        let tokens = [text, image, image, text, image, image, image, text];
+        assert_eq!(
+            vision_pad_row_range(&tokens, 3, 5, image, 11, 0, 0, 5).unwrap(),
+            (2, 5)
+        );
+        // A window that does not cover the chunk's pads fails closed.
+        assert!(vision_pad_row_range(&tokens, 3, 5, image, 11, 0, 0, 4).is_err());
     }
 }

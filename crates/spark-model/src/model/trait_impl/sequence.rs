@@ -132,6 +132,10 @@ impl TransformerModel {
         // A commit left for this sequence's next verify is moot
         // (`gdn_commit_fuse`); the slot is zeroed below.
         self.gdn_fuse_drop_slot(seq.slot_idx);
+        // The sequence is leaving the prefill path: drop its per-request
+        // vision state (pixels, grids, hashes, encode bookkeeping) so a slot
+        // reuse cannot observe a previous request's images (`vision_cache`).
+        Self::clear_seq_vision_state(seq);
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later

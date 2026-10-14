@@ -100,7 +100,7 @@ impl TransformerModel {
                     }
                     self.scale_embeddings(hidden, 1usize, stream)?;
                     let last = chunk_start + chunk_len - 1;
-                    self.splice_vision_rows(tokens, last, 1, hidden, stream)?;
+                    self.splice_vision_rows(seq, tokens, last, 1, hidden, stream)?;
                     Ok(ProcRange::Compute {
                         proc_start: chunk_start + chunk_len - 1,
                         proc_count: 1,
@@ -152,7 +152,14 @@ impl TransformerModel {
                 // The re-embed starts mid-prompt: a vision prompt served
                 // from the cache still needs its uncached placeholders
                 // overlaid, or they reach the model as raw token embeddings.
-                self.splice_vision_rows(tokens, uncached_start, uncached_count, hidden, stream)?;
+                self.splice_vision_rows(
+                    seq,
+                    tokens,
+                    uncached_start,
+                    uncached_count,
+                    hidden,
+                    stream,
+                )?;
                 // Real prefill path: KV written for [uncached_start, end).
                 seq.kv_valid_tokens = seq.kv_valid_tokens.max(uncached_start + uncached_count);
                 Ok(ProcRange::Compute {

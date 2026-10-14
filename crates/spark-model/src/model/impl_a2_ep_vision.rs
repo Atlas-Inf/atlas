@@ -3,24 +3,27 @@
 //! EP vision-state protocol: rank-0 broadcast and worker receive of the
 //! encoder rows plus MRoPE metadata and item content hashes
 //! (`EP_CMD_VISION_STATE`). A deferred encode sends its rows later, from the
-//! chunk-0 prefix lookup (`vision_cache`).
+//! chunk's prefix lookup / per-chunk encode (`vision_cache`); the per-chunk
+//! rows ride the same raw broadcast `vision_encode_items` issues.
 
 use anyhow::Result;
 
 use super::types::TransformerModel;
-use super::vision_cache::VisionCacheState;
 use super::vision_transport::{
     EP_CMD_VISION_STATE, VISION_HEADER_WORDS, VisionWireState, grid_words, parse_grid_words,
     parse_state_header, payload_bytes, validate_state,
 };
+use crate::traits::SequenceState;
 
 impl TransformerModel {
     /// Broadcast the rank-0 vision encoder result and its MRoPE metadata before
     /// a worker enters the matching prefill command. The payload uses the
     /// encoder's own device buffer, so it never aliases the small command or
     /// token scratch buffers. `enabled=false` is an explicit text-state clear.
+    /// The state read is `seq`'s own (per-sequence vision state).
     pub(crate) fn ep_broadcast_vision_state_for_seq_dispatch(
         &self,
+        seq: &SequenceState,
         seq_id: u32,
         enabled: bool,
         row_base: usize,
@@ -29,9 +32,6 @@ impl TransformerModel {
         slice_rows: usize,
     ) -> Result<()> {
         if !self.multi_rank_protocol_active() {
-            if !enabled {
-                self.clear_vision_state();
-            }
             return Ok(());
         }
 
@@ -42,23 +42,19 @@ impl TransformerModel {
         if enabled && self.vision_encoder.is_none() {
             self.ep_broadcast_seq_and_cmd(seq_id, EP_CMD_VISION_STATE, self.ep_protocol_v2)?;
             self.ep_broadcast_tokens(&[0; VISION_HEADER_WORDS])?;
-            self.clear_vision_state();
             anyhow::bail!("vision request cannot use the multi-rank protocol without an encoder");
         }
 
         let (state, grids, hashes, payload) = if enabled {
             let ve = self.vision_encoder.as_ref().expect("checked above");
-            let grids = self.vision_image_grids.lock().clone();
-            let (hashes, deferred) = {
-                let st = self.vision_cache.lock();
-                (st.hashes.clone(), st.deferred.is_some())
-            };
+            let grids = seq.vision.grids.clone();
+            let hashes = seq.vision.hashes.clone();
             // A deferred encode has no rows yet: the header carries the rows
             // its grids describe, and the payload follows from the lookup.
-            let rows = if deferred {
+            let rows = if seq.vision.deferred {
                 grids.iter().map(|&(t, h, w)| t * h * w).sum()
             } else {
-                *self.vision_embed_patches.lock()
+                seq.vision.rows_encoded
             };
             let state = VisionWireState {
                 rows,
@@ -67,15 +63,10 @@ impl TransformerModel {
                 grid_base,
                 owned_images,
                 slice_rows: if owned_images == 0 { rows } else { slice_rows },
-                deferred,
+                deferred: seq.vision.deferred,
             };
             let state = validate_state(&state, ve.output_rows())?;
-            let payload = payload_bytes(&state, ve.out_hidden_size(), ve.output_rows())?;
-            anyhow::ensure!(
-                payload > 0,
-                "vision request produced an empty encoder payload"
-            );
-            let payload = if deferred {
+            let payload = if seq.vision.deferred {
                 0
             } else {
                 let payload = payload_bytes(&state, ve.out_hidden_size(), ve.output_rows())?;
@@ -87,14 +78,11 @@ impl TransformerModel {
             };
             (state, grids, hashes, payload)
         } else {
-            // Text requests must reset worker-global vision state. A stale
+            // Text requests must reset the worker slot's vision state. A stale
             // buffer is otherwise observable by the next image request after
             // slot reuse, even though this request contains no pad tokens.
-            self.clear_vision_state();
             (VisionWireState::default(), Vec::new(), Vec::new(), 0)
         };
-
-        *self.vision_slice_rows.lock() = state.slice_rows;
 
         if payload > 0 {
             // The encoder launches on default_stream while NCCL uses its own
@@ -145,8 +133,10 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// Worker side of `EP_CMD_VISION_STATE`.
-    pub(super) fn ep_worker_recv_vision_state(&self) -> Result<()> {
+    /// Worker side of `EP_CMD_VISION_STATE`. Stores the wire state into the
+    /// addressed slot's own `SequenceState` (per-sequence vision state — the
+    /// model holds none between requests).
+    pub(super) fn ep_worker_recv_vision_state(&self, seq: &mut SequenceState) -> Result<()> {
         let header = self.ep_broadcast_tokens(&[0; VISION_HEADER_WORDS])?;
         let max_rows = self
             .vision_encoder
@@ -184,17 +174,20 @@ impl TransformerModel {
                 .expect("validated vision payload without communicator")
                 .broadcast(ve.out_row().0, payload, 0)?;
         }
-        *self.vision_embed_patches.lock() = if state.deferred { 0 } else { state.rows };
-        *self.vision_image_grids.lock() = grids;
-        *self.vision_cache.lock() = VisionCacheState {
-            hashes,
-            deferred: state.deferred.then(Vec::new),
-            ..Default::default()
-        };
-        *self.vision_row_base.lock() = state.row_base;
-        *self.vision_grid_base.lock() = state.grid_base;
-        *self.vision_owned_images.lock() = state.owned_images;
-        *self.vision_slice_rows.lock() = state.slice_rows;
+        seq.vision.grids = grids;
+        seq.vision.hashes = hashes;
+        // The worker's per-chunk encode (`vision_encode_chunk_items`) and the
+        // chunk-0 resolve (`vision_resolve_deferred`, which min-reduces
+        // `computed_from` with the head) both gate on this flag: it must
+        // mirror the head's, or the ranks leave the collective at different
+        // points.
+        seq.vision.deferred = state.deferred;
+        seq.vision.rows_encoded = if state.deferred { 0 } else { state.rows };
+        seq.vision.rows_base = 0;
+        seq.vision.row_base = state.row_base;
+        seq.vision.grid_base = state.grid_base;
+        seq.vision.owned_images = state.owned_images;
+        seq.vision.slice_rows = state.slice_rows;
         Ok(())
     }
 }
