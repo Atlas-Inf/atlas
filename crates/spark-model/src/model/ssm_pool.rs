@@ -115,6 +115,10 @@ pub(crate) struct SsmStatePool {
     pub(super) commit_qkv_slot_bytes: usize,
     pub(super) commit_gb_slot_bytes: usize,
     pub(super) free_slots: Mutex<Vec<usize>>,
+    /// Every device allocation behind the pools above, and nothing else.
+    /// `alloc_layer_pools` hands out per-layer offset VIEWS into one block, so
+    /// the pool vectors are not frees-able; teardown frees exactly these.
+    pub(super) allocations: Vec<DevicePtr>,
 }
 
 /// Prefix-sum layout for tiered per-slot H intermediates: returns
@@ -144,8 +148,12 @@ fn h_inter_layout(counts: &[usize]) -> (Vec<usize>, usize) {
 /// detector declines, and the copies run as the same per-layer loop they
 /// always did. Bytes allocated, and the addresses every accessor derives, are
 /// identical either way.
+///
+/// Each real allocation (the block, or each fallback region) is pushed onto
+/// `allocations` — the returned views are never freed individually.
 fn alloc_layer_pools(
     gpu: &dyn GpuBackend,
+    allocations: &mut Vec<DevicePtr>,
     num_ssm_layers: usize,
     bytes: usize,
 ) -> Result<Vec<DevicePtr>> {
@@ -155,6 +163,7 @@ fn alloc_layer_pools(
     if let Some(total) = bytes.checked_mul(num_ssm_layers)
         && let Ok(base) = gpu.alloc(total)
     {
+        allocations.push(base);
         gpu.memset(base, 0, total)?;
         return Ok((0..num_ssm_layers)
             .map(|l| base.offset(l * bytes))
@@ -168,6 +177,7 @@ fn alloc_layer_pools(
     let mut pools = Vec::with_capacity(num_ssm_layers);
     for _ in 0..num_ssm_layers {
         let p = gpu.alloc(bytes)?;
+        allocations.push(p);
         gpu.memset(p, 0, bytes)?;
         pools.push(p);
     }
@@ -211,8 +221,19 @@ impl SsmStatePool {
         let mut h_checkpoint_pools = Vec::new();
         let mut conv_checkpoint_pools = Vec::new();
 
-        let h_state_pools = alloc_layer_pools(gpu, num_ssm_layers, total_slots * h_stored_bytes)?;
-        let conv_state_pools = alloc_layer_pools(gpu, num_ssm_layers, total_slots * conv_bytes)?;
+        let mut allocations = Vec::new();
+        let h_state_pools = alloc_layer_pools(
+            gpu,
+            &mut allocations,
+            num_ssm_layers,
+            total_slots * h_stored_bytes,
+        )?;
+        let conv_state_pools = alloc_layer_pools(
+            gpu,
+            &mut allocations,
+            num_ssm_layers,
+            total_slots * conv_bytes,
+        )?;
 
         // Deferred-commit staging pools (lever-gated): 16-row verify window
         // of conv-out q/k/v + gate/beta per slot — sized so K=16 fits.
@@ -222,8 +243,18 @@ impl SsmStatePool {
         let commit_gb_slot_bytes = 16 * config.linear_num_value_heads * 2 * 4;
         let (gdn_commit_qkv_pools, gdn_commit_gb_pools) = if gdn_deferred_commit && has_mtp {
             (
-                alloc_layer_pools(gpu, num_ssm_layers, total_slots * commit_qkv_slot_bytes)?,
-                alloc_layer_pools(gpu, num_ssm_layers, total_slots * commit_gb_slot_bytes)?,
+                alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    total_slots * commit_qkv_slot_bytes,
+                )?,
+                alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    total_slots * commit_gb_slot_bytes,
+                )?,
             )
         } else {
             (Vec::new(), Vec::new())
@@ -242,6 +273,7 @@ impl SsmStatePool {
                 None
             } else {
                 let p = gpu.alloc(bytes)?;
+                allocations.push(p);
                 gpu.memset(p, 0, bytes)?;
                 tracing::info!(
                     "SSM f16-sized h pool: FP32 prefill staging arena {} MB ({total_slots} slots × {h_bytes} B)",
@@ -314,10 +346,18 @@ impl SsmStatePool {
             let ni = num_intermediates;
             let mtp_total = mtp_slots + 1;
             if !replay {
-                h_intermediate_pools =
-                    alloc_layer_pools(gpu, num_ssm_layers, h_inter_total * h_stored_bytes)?;
-                conv_intermediate_pools =
-                    alloc_layer_pools(gpu, num_ssm_layers, mtp_total * ni * conv_bytes)?;
+                h_intermediate_pools = alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    h_inter_total * h_stored_bytes,
+                )?;
+                conv_intermediate_pools = alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    mtp_total * ni * conv_bytes,
+                )?;
             } else {
                 // Replay: verify-window INPUT rows instead of state
                 // snapshots — (mtp_total slots incl. dummy) × (K-1)
@@ -328,14 +368,24 @@ impl SsmStatePool {
                     config.linear_num_value_heads,
                 );
                 let ring = crate::ssm_reserve::ssm_replay_ring_bytes(1, row, ni, mtp_total);
-                replay_input_rings = alloc_layer_pools(gpu, num_ssm_layers, ring)?;
+                replay_input_rings =
+                    alloc_layer_pools(gpu, &mut allocations, num_ssm_layers, ring)?;
             }
 
             // 1 checkpoint per slot per layer (BOTH modes: replay's
             // reconstruction base is exactly this blob).
-            h_checkpoint_pools =
-                alloc_layer_pools(gpu, num_ssm_layers, mtp_total * h_stored_bytes)?;
-            conv_checkpoint_pools = alloc_layer_pools(gpu, num_ssm_layers, mtp_total * conv_bytes)?;
+            h_checkpoint_pools = alloc_layer_pools(
+                gpu,
+                &mut allocations,
+                num_ssm_layers,
+                mtp_total * h_stored_bytes,
+            )?;
+            conv_checkpoint_pools = alloc_layer_pools(
+                gpu,
+                &mut allocations,
+                num_ssm_layers,
+                mtp_total * conv_bytes,
+            )?;
 
             let mtp_mb = num_ssm_layers
                 * (h_inter_total * h_stored_bytes
@@ -400,6 +450,7 @@ impl SsmStatePool {
             commit_qkv_slot_bytes,
             commit_gb_slot_bytes,
             free_slots: Mutex::new(free_slots),
+            allocations,
         })
     }
 
@@ -979,40 +1030,6 @@ impl Drop for SlotGuard {
     }
 }
 
-/// Release every per-layer state pool.
-///
-/// The intermediate and checkpoint pools are only allocated when MTP is on, so
-/// the vectors are empty otherwise — draining handles both without a branch.
-impl atlas_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
-    fn label(&self) -> &'static str {
-        "ssm state pool"
-    }
-
-    fn release(&mut self, gpu: &dyn GpuBackend) -> anyhow::Result<()> {
-        let mut first_error = None;
-        for pool in [
-            &mut self.h_state_pools,
-            &mut self.conv_state_pools,
-            &mut self.h_intermediate_pools,
-            &mut self.conv_intermediate_pools,
-            &mut self.h_checkpoint_pools,
-            &mut self.conv_checkpoint_pools,
-        ] {
-            for ptr in pool.drain(..) {
-                if let Err(e) = gpu.free(ptr)
-                    && first_error.is_none()
-                {
-                    first_error = Some(e);
-                }
-            }
-        }
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod h_inter_layout_tests {
     use super::h_inter_layout;
@@ -1284,6 +1301,7 @@ mod slot_guard_tests {
             commit_qkv_slot_bytes: 0,
             commit_gb_slot_bytes: 0,
             free_slots: Mutex::new((0..max_slots).rev().collect()),
+            allocations: Vec::new(),
         })
     }
 

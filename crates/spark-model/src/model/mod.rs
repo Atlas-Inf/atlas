@@ -51,6 +51,7 @@ pub(crate) mod mtp_carry;
 pub(crate) mod pinned_pack;
 pub(crate) mod ssm_batched_copy;
 pub(crate) mod ssm_pool;
+mod ssm_pool_teardown;
 pub(crate) mod ssm_pools;
 pub(crate) mod ssm_snapshot;
 pub(crate) mod ssm_snapshot_faultin;
