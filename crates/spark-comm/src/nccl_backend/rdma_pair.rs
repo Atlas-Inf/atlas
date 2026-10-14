@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(super) mod bootstrap;
 pub(super) mod cmd_ring;
+mod gid;
 mod oneshot;
 mod proxy;
 use cmd_ring::CmdRing;
@@ -198,8 +199,7 @@ impl RdmaPair {
         let mut local = (host as u64).to_le_bytes().to_vec();
         let mut lkeys = Vec::with_capacity(rails.len());
         for name in &rails {
-            let gid_idx =
-                gid_override.map_or_else(|| atlas_rdma::gid::roce_v2_ipv4_index(name), Ok)?;
+            let gid_idx = gid_override.map_or_else(|| gid::pick(name, link.own_v4(rank)), Ok)?;
             let mut v = Verbs::create(name, gid_idx, psn)
                 .with_context(|| format!("RDMA pair rail {name} (gid index {gid_idx})"))?;
             // SAFETY: the region outlives the Verbs (freed in Drop after the

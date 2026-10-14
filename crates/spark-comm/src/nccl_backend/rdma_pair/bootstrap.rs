@@ -14,7 +14,7 @@
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 /// Names this wire format; bump the digit when the head or layout changes.
@@ -194,6 +194,21 @@ impl<'a> Link<'a> {
             worker: Some(worker),
             lifeline: Some(conn),
         })
+    }
+
+    /// This rank's own IPv4 address on the link: rank 0 listens at `at`,
+    /// the worker connects from `worker`. `None` on an IPv6 link — the RoCE
+    /// v2 GID preference only applies to IPv4.
+    pub(in crate::nccl_backend) fn own_v4(&self, rank: usize) -> Option<Ipv4Addr> {
+        let own = if rank == 0 {
+            Some(self.at.ip())
+        } else {
+            self.worker
+        };
+        match own {
+            Some(IpAddr::V4(v4)) => Some(v4),
+            _ => None,
+        }
     }
 }
 

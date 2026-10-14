@@ -211,6 +211,27 @@ fn the_link_is_that_of_the_nccl_bootstrap_connection() {
     }
 }
 
+#[test]
+fn the_own_link_address_is_at_on_rank0_and_the_worker_on_rank1() {
+    let at = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 99, 2, 1)), 4242);
+    let worker = IpAddr::V4(Ipv4Addr::new(10, 99, 2, 2));
+    let link = Link {
+        at,
+        worker: Some(worker),
+        lifeline: None,
+    };
+    assert_eq!(link.own_v4(0), Some(Ipv4Addr::new(10, 99, 2, 1)));
+    assert_eq!(link.own_v4(1), Some(Ipv4Addr::new(10, 99, 2, 2)));
+    // IPv6 links have no RoCE v2 IPv4 preference.
+    let v6 = Link {
+        at: SocketAddr::new(IpAddr::V6("fe80::1".parse().unwrap()), 4242),
+        worker: None,
+        lifeline: None,
+    };
+    assert_eq!(v6.own_v4(0), None);
+    assert_eq!(v6.own_v4(1), None);
+}
+
 /// Nothing listens on the TCP multiplexer port.
 const NOBODY: SocketAddr = SocketAddr::new(LOCAL, 1);
 
