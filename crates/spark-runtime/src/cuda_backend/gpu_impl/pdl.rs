@@ -168,7 +168,9 @@ pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
     "hc_post_vec",
     "hc_post_stage_vec",
     "hc_mma_down",
+    "hc_mma_down_rows",
     "hc_mma_finish",
+    "hc_mma_finish_rows",
     // GDN mixer: projections, the four small kernels and their fused twin.
     "dense_gemv_bf16",
     "dense_gemv_fp8w",
