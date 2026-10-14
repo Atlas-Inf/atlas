@@ -162,7 +162,8 @@ fn load_moe_ffn(
     // kernels and their shared contribution is overwritten before blending.
     layer.set_bf16_shared_expert(shared_gate, shared_up, shared_down)?;
     if unified_moe_layout {
-        layer.transpose_for_prefill_unified(gpu, config)?;
+        let freed = layer.transpose_for_prefill_unified(gpu, config)?;
+        store.mark_freed_elsewhere(&freed)?;
     }
     // Native NVFP4 CUTLASS grouped MoE (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1).
     // The routed grouped GEMMs are ~47% of Laguna's C=1 prefill GPU time and
