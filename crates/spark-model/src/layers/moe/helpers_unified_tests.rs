@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Characterize real legacy construction before extracting its private phases.
 
+use super::super::unified_test_gpu as recording;
 use super::*;
 use crate::weight_map::{ExpertWeight, MoeWeights, WeightQuantFormat};
-#[path = "helpers_unified_test_gpu.rs"]
-mod recording;
 use recording::{Arg, Event, RecordingGpu};
 #[path = "helpers_checkpoint_down_tests.rs"]
 mod checkpoint_down;

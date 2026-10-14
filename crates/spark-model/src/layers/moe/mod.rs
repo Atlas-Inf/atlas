@@ -183,6 +183,9 @@ mod shared_fp8_cache_output;
 #[cfg(test)]
 mod shared_fp8_cache_test_gpu;
 mod shared_fp8_origin;
+#[cfg(test)]
+#[path = "helpers_unified_test_gpu.rs"]
+mod unified_test_gpu;
 pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
 pub(crate) use shared_fp8_cache::SharedFp8Reserve;
 pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;

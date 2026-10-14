@@ -8,9 +8,7 @@ use std::collections::HashMap;
 
 // Reuse the byte recorder to force allocation-address reuse independently
 // of optional carveout support.
-#[allow(dead_code)]
-#[path = "helpers_unified_test_gpu.rs"]
-mod recording;
+use super::super::unified_test_gpu as recording;
 
 fn payload(gpu: &dyn GpuBackend) -> (WeightStore, QuantizedWeight) {
     let alloc = || gpu.alloc(256).unwrap();
