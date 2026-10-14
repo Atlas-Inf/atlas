@@ -20,7 +20,7 @@
 //! ```
 //!
 //! The split of the rows is the LM-head split's (`model::qwen4exp_lmhead_split`:
-//! [`Split`], `exchange`, `assemble`). Each rank projects `width` rows from
+//! `Split`, `exchange`, `assemble`). Each rank projects `width` rows from
 //! its start with the kernel the unsplit draft head runs for `n` rows, and an
 //! output column depends only on its weight row and the input row
 //! ([`DraftHead::project_rows_range`]), so the assembled logits, and with them
@@ -36,7 +36,7 @@
 //! draft head's shape, which the startup agreement pins (the switch, the
 //! NVFP4 copy, an id list, `--mtp-vocab`). On the head every exit after the
 //! announce, an error or a fallback to the per-sequence path included, goes
-//! through [`TpRun`], which issues the swaps the propose did not reach; the
+//! through `TpRun`, which issues the swaps the propose did not reach; the
 //! worker issues all of its swaps even when a projection fails. So neither
 //! rank is ever left waiting in a swap the other never issues.
 //!

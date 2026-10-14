@@ -192,7 +192,7 @@ fn reference_rows(n: u32, k: u32) -> Option<u32> {
 }
 
 /// `out[m, n] = act[m, k] @ weight[n, k]^T` (BF16) row-invariantly
-/// ([`reference_rows`]) when a row-invariant pass is running; `Ok(false)`
+/// (`reference_rows`) when a row-invariant pass is running; `Ok(false)`
 /// launched nothing. An error where the narrow configuration refuses the row
 /// count: any other kernel would break the invariance.
 pub fn try_bf16_gemm(

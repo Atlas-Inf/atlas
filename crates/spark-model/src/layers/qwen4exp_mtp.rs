@@ -395,7 +395,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
     }
 
     /// One drafter forward a draft position for all sequences, chained on the
-    /// device (`qwen4exp_mtp_batch.rs`); `Ok(None)` outside [`Self::batch_admits`].
+    /// device (`qwen4exp_mtp_batch.rs`); `Ok(None)` outside `Self::batch_admits`.
     fn propose_batch(
         &self,
         last_tokens: &[u32],

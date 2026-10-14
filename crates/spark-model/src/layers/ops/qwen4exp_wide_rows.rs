@@ -16,7 +16,7 @@
 //! changes no collective: the ranks need not agree on it.
 //!
 //! Chunking, from the bench (GB10, weights streamed from DRAM): at most
-//! [`WIDE_MIN_ROWS`] rows stay on the narrow kernels, which are DRAM-bound
+//! `WIDE_MIN_ROWS` rows stay on the narrow kernels, which are DRAM-bound
 //! there; past it a chunk takes the narrowest wide tier that covers it, up
 //! to 32 rows. 16 rows of GDN qkvz cost what 8 did (177 us), 32 rows 278 us
 //! against 764 for four 8-row passes; the LM head 3.85 ms against 10.2.
@@ -129,7 +129,7 @@ impl Qwen4ExpWideRows {
 
     /// `m` rows of `input` (`[m, k]` BF16) through the BF16 `weight` into
     /// `output` rows `out_stride` elements apart, each row `dense_gemv_bf16`'s
-    /// bytes: the wide tiers past [`WIDE_MIN_ROWS`] rows, `narrow`
+    /// bytes: the wide tiers past `WIDE_MIN_ROWS` rows, `narrow`
     /// (`dense_gemv_bf16_batchm`) in 8-row chunks otherwise.
     #[allow(clippy::too_many_arguments)]
     pub fn dense_rows(
@@ -187,7 +187,7 @@ impl Qwen4ExpWideRows {
     }
 
     /// The next Q+gate launch over `remaining` rows: its row count and, past
-    /// [`WIDE_MIN_ROWS`] rows, the wide tier; `None` for the caller's
+    /// `WIDE_MIN_ROWS` rows, the wide tier; `None` for the caller's
     /// `w4a16_gemv_qg_batch4/3/2` / `w4a16_gemv_qg` chunk.
     pub fn qg_chunk(&self, remaining: u32) -> (u32, Option<usize>) {
         next_chunk(remaining, Self::present(&self.qg), 4)
@@ -240,7 +240,7 @@ impl Qwen4ExpWideRows {
 
     /// `rows` rows of `input` (`[rows, k]`) through the NVFP4 `w` into
     /// `output` (`[rows, n]`), each row `w4a16_gemv`'s bytes: one
-    /// `qwen4exp_w4_rows_wide` launch (up to 64 rows) past [`WIDE_MIN_ROWS`]
+    /// `qwen4exp_w4_rows_wide` launch (up to 64 rows) past `WIDE_MIN_ROWS`
     /// rows when `ATLAS_QWEN4EXP_W4_ROWS_WIDE` is on, else 16-row
     /// `w4a16_gemv_batch16` launches there; the narrow scalar tiers (8,
     /// else 4 rows a launch) otherwise.
