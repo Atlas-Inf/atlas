@@ -39,12 +39,12 @@ pub struct KvPlacement {
 
 /// Which buffers may move to the carveout (`ATLAS_KV_CARVEOUT_ORDER`).
 ///
-/// The GPU does not cache the carveout in L2 (`cuda_backend::display_carveout`),
-/// so a buffer there costs in proportion to how often its data is re-read.
-/// The sparse index buffers are the worst case: the indexer scores every
-/// earlier key for every query, so each index layer there cost about 1% of a
-/// 64K cold prefill on the pair. The latent (`K`/`V`) pools are read only at
-/// the selected rows.
+/// Latent pools first because the carveout used to be L2-uncached: then each
+/// sparse index layer there (the indexer scores every earlier key for every
+/// query) cost about 1% of a 64K cold prefill on the pair. It is now
+/// allocated GPU-cacheable (`cuda_backend::display_carveout`), and on the
+/// shipped profile the latent pools already fill it: `Size` adds about 1% of
+/// blocks on rank 0 (03/04, 2026-10-14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CarveoutOrder {
     /// Any buffer, largest first (the original order; for comparison).

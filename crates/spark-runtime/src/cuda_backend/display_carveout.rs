@@ -9,15 +9,10 @@
 //! allocation, after the KV budget is measured, so the mapping never counts
 //! as this process's footprint in that measurement.
 //!
-//! The GPU maps it L2-uncached: RM creates every memory-list descriptor with
-//! `NV_MEMORY_UNCACHED` and the sysmem list path never changes it
-//! (open-gpu-kernel-modules 580.173.02 `mem_desc.c`, `mem_list.c`). One pass
-//! over it streams at `cuMemAlloc` speed (~250 GB/s on spark03), but data
-//! read again comes from DRAM each time: a 4 MiB region re-read runs at
-//! 266 GB/s against 1,679 GB/s, and a dependent load takes 408 ns against
-//! 161 ns. Copy-engine transfers (`cuMemcpy*`) run at about half speed, which
-//! only the NVMe prefix tier's block spills use. So only buffers that are
-//! seldom re-read belong here (`kv_cache::placement`).
+//! The launcher allocates it GPU-cacheable, so it behaves like `cuMemAlloc`
+//! memory: on spark03 a 4 MiB region re-read runs at 1,759 against
+//! 1,762 GB/s and a dependent load takes 156 against 156 ns. (The earlier
+//! memory-list export was L2-uncached: 266 GB/s and 408 ns.)
 
 use std::sync::OnceLock;
 

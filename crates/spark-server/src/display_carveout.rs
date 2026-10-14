@@ -3,19 +3,22 @@
 //! `spark display-carveout`: lend the GB10 display carveout to a server.
 //!
 //! The firmware reserves 2 GiB for the display (`DISPLAY_FRM`) that Linux
-//! never sees and the driver never allocates from on GB10. This launcher
-//! exports it as an RM object fd (`rm`), which needs CAP_SYS_ADMIN, then
-//! removes CAP_SYS_ADMIN from itself and its bounding set and execs the
+//! never sees. The NVIDIA driver manages it as its scanout heap, and with no
+//! monitor attached the display holds only a few MiB of it. This launcher
+//! allocates the rest from that heap and exports it as an RM object fd
+//! (`rm`), which needs no privilege, then removes CAP_SYS_ADMIN (if a
+//! container granted it) from itself and its bounding set and execs the
 //! command with the fd inherited and named in
 //! `spark_runtime::gpu::carveout::FD_ENV`. `spark serve` then puts KV pools
 //! there (`factory::build::kv_carveout`). Without the fd it serves as before.
 //!
-//! One process per host may hold the carveout: two would write each other's
-//! KV. `--lock` names a file on the host that every launcher shares; the
-//! command inherits the held lock, so it lasts exactly as long as the
-//! process that maps the memory. If the lock is held, the driver is not a
-//! validated release, or the export fails, the command runs without the
-//! carveout and the reason is logged.
+//! One process per host holds the carveout. `--lock` names a file on the
+//! host that every launcher shares; the command inherits the held lock, so
+//! it lasts exactly as long as the process that maps the memory. (The heap
+//! itself never hands one range out twice; the lock makes a second launcher
+//! say why it got nothing.) If the lock is held or the driver cannot give
+//! the memory, the command runs without the carveout and the reason is
+//! logged. No driver version is required: `rm` checks what the driver gives.
 
 use std::ffi::CString;
 use std::io::Error;
@@ -27,10 +30,6 @@ use spark_runtime::gpu::carveout::{FD_ENV, SIZE_ENV};
 
 #[cfg(target_os = "linux")]
 mod rm;
-
-/// Driver releases whose RM ABI and carveout handling were checked against
-/// their open-gpu-kernel-modules source.
-pub(crate) const VALIDATED_DRIVERS: &[&str] = &["580.173.02", "580.178.04"];
 
 #[derive(clap::Args, Debug)]
 pub struct DisplayCarveoutArgs {
@@ -78,7 +77,7 @@ pub fn run(args: DisplayCarveoutArgs) -> Result<()> {
     bail!("exec {}: {}", args.command[0], Error::last_os_error())
 }
 
-/// Takes the host lock (kept open across exec), checks the driver, exports.
+/// Takes the host lock (kept open across exec), then exports.
 fn lend(args: &DisplayCarveoutArgs) -> Result<(i32, u64)> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -96,31 +95,20 @@ fn lend(args: &DisplayCarveoutArgs) -> Result<(i32, u64)> {
             args.lock.display()
         );
     }
-    let release = |e: anyhow::Error| {
-        unsafe { libc::close(lock) };
-        e
-    };
-    let version =
-        std::fs::read_to_string("/proc/driver/nvidia/version").map_err(|e| release(e.into()))?;
-    check_driver(&version).map_err(release)?;
-    export().map_err(release)
-}
-
-fn check_driver(proc_version: &str) -> Result<()> {
-    let line = proc_version.lines().next().unwrap_or_default();
-    match VALIDATED_DRIVERS
-        .iter()
-        .find(|v| line.split_whitespace().any(|w| w == **v))
-    {
-        Some(_) => Ok(()),
-        None => bail!("driver {line:?} is not a validated release ({VALIDATED_DRIVERS:?})"),
-    }
+    export().inspect_err(|_| unsafe {
+        libc::close(lock);
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn export() -> Result<(i32, u64)> {
     let e = rm::export_display_frm()?;
-    tracing::info!("display carveout: DISPLAY_FRM at 0x{:x}", e.base);
+    tracing::info!(
+        "display carveout: driver {}, {} of {} MiB of DISPLAY_FRM free (the display holds the rest)",
+        e.driver,
+        e.size >> 20,
+        e.region >> 20
+    );
     Ok((e.fd, e.size))
 }
 
@@ -131,7 +119,8 @@ fn export() -> Result<(i32, u64)> {
 
 /// Removes CAP_SYS_ADMIN from the bounding set and this thread's sets, so
 /// the command (root in a container) can never create RM objects over
-/// physical memory. A no-op where it was never held.
+/// physical memory. A no-op where it was never held (the export does not
+/// need it).
 #[cfg(target_os = "linux")]
 fn drop_sys_admin() -> Result<()> {
     const CAP_SYS_ADMIN: u32 = 21;
@@ -179,19 +168,6 @@ fn drop_sys_admin() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_validated_drivers_pass() {
-        let ok =
-            "NVRM version: NVIDIA UNIX Open Kernel Module for aarch64  580.173.02  Release Build";
-        assert!(check_driver(ok).is_ok());
-        let newer =
-            "NVRM version: NVIDIA UNIX Open Kernel Module for aarch64  590.10.01  Release Build";
-        assert!(check_driver(newer).is_err());
-        // A validated version only as a substring of another does not pass.
-        assert!(check_driver("NVRM version: 580.173.021").is_err());
-        assert!(check_driver("").is_err());
-    }
 
     #[test]
     fn the_command_follows_the_separator() {

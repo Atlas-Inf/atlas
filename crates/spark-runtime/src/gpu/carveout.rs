@@ -4,19 +4,21 @@
 //! ([`super::GpuBackend::alloc_carveout`]).
 //!
 //! On GB10 (DGX Spark) the firmware reserves a 2 GiB display carveout
-//! (`DISPLAY_FRM`) that Linux never sees and that the NVIDIA driver never
-//! allocates from on this chip. `spark display-carveout` exports it as an RM
-//! object fd and execs the server with that fd in [`FD_ENV`] and its size in
-//! [`SIZE_ENV`]; the CUDA backend imports and maps it on first use. This
-//! module is the backend-neutral half: the environment contract and the
+//! (`DISPLAY_FRM`) that Linux never sees; the NVIDIA driver manages it as
+//! its scanout heap, of which a headless Spark's display uses a few MiB.
+//! `spark display-carveout` allocates the rest from that heap, exports it as
+//! an RM object fd and execs the server with that fd in [`FD_ENV`] and its
+//! size in [`SIZE_ENV`]; the CUDA backend imports and maps it on first use.
+//! This module is the backend-neutral half: the environment contract and the
 //! arena that hands out pieces of the mapped range.
 //!
-//! Provenance: the observation that `DISPLAY_FRM` is unused on GB10 and can
-//! be exported as an RM memory-list fd comes from kindling-spark-os's
-//! `dispram` (github.com/kindlingai/kindling-spark-os, AGPL-3.0; idea only,
-//! no code taken), which credits emihuang's earlier NVIDIA developer forum
-//! post. The driver behaviour was re-checked against open-gpu-kernel-modules
-//! 580.173.02 and 580.178.04.
+//! Provenance: the observation that `DISPLAY_FRM` is idle on GB10 and can be
+//! exported as an RM object fd comes from kindling-spark-os's `dispram`
+//! (github.com/kindlingai/kindling-spark-os, AGPL-3.0; idea only, no code
+//! taken), which credits emihuang's earlier NVIDIA developer forum post.
+//! Allocating it through the driver's scanout heap, GPU-cacheable, is ours;
+//! the driver behaviour was checked against open-gpu-kernel-modules
+//! 580.76.05 through 615.78.08.
 
 use std::collections::BTreeMap;
 
