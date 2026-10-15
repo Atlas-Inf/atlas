@@ -1,5 +1,35 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
+# GLM-5.3 release validation
+
+The combined NVFP4/DFlash implementation at `cb45065cb4f21c162ccd29dd837ef4b6be3aa52e` passed the final-source
+CPU/static checks, ten canonical Qwen GPU regression gates and bounded paired
+GLM checks. [Release summary](release-summary.json) links the exact receipts.
+The submission adds documentation and evidence only after that measured source.
+This source includes the rustls 0.23.46 security update in `Cargo.lock`.
+The interrupted `9269a2f` campaign is superseded; its results were not reused.
+
+CPU tests: 7,146 passed, 0 failed, 148 ignored.
+CPU build/link stubs do not execute CUDA; all-features tests were compile-only.
+The GPU records retain their actual source, binary, model and recipe identities.
+Checkpoint-native GLM MTP and new Strix Halo support are outside this release.
+
+GLM checks cover C1/C4 repeated output parity, API/schema/tools, disconnect/reuse,
+a 6,404-token multi-chunk needle, and resident/NVMe cache restoration.
+[Raw summaries](release-glm-summaries.json) retain their narrower qualification
+fields; [rank-log review](release-glm-log-review.json) records the supporting
+observations and warnings. Allocation ownership sweeps, FP8 advisory warnings,
+conservative cache sizing and NVMe staging alignment remain documented limits.
+These results do not establish general model quality, sustained leak freedom,
+larger context capacity or 2.5M occupied tokens.
+
+## Historical measurements
+
+The earlier report follows unchanged. Its measurements belong to the original
+revisions and are not relabeled as final-release benchmarks.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
 # GLM-5.3 native-port validation
 
 This is a sanitized summary of local measurements on two DGX Sparks. It records

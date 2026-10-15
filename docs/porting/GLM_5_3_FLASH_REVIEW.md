@@ -2,122 +2,110 @@
 
 # GLM-5.3-Flash review guide
 
-This integration loads NVIDIA's original NVFP4 checkpoint through Atlas and
-runs TP2/EP2 across two GB10 Sparks. Atlas owns model loading, scheduling,
-KV/SSM state, distributed execution and kernel dispatch. Optional DFlash loads
-separate draft weights. Native prefill compiles the credited device sources
-into Atlas; it does not call another inference engine or external GLM library.
+This stack adds native serving of NVIDIA's GLM-5.3-Flash NVFP4 checkpoint
+on two NVIDIA GB10 / DGX Sparks. Atlas owns loading, scheduling, distributed
+execution, KV/SSM state and kernel dispatch. Native KDA and sparse MLA device
+sources build with Atlas; serving does not invoke SparkGLM, another inference
+engine, or externally built GLM prefill libraries.
 
-Start with the [port description](GLM_5_3_FLASH.md), [validation report](glm53-validation/README.md)
-and [standalone qualification recipe](../../scripts/dev/glm53_native/README.md).
-The recipe deliberately keeps all qualified tuning values explicit. Changing or
-collapsing those values into new defaults requires another runtime qualification.
+The target uses FP8 KV cache. Optional DFlash loads a separate draft checkpoint.
+Checkpoint-native MTP is deferred to a separate follow-up and is outside this
+release. The final source also includes the rustls 0.23.46 security update in
+`Cargo.lock` after `submit/glm53-decode-rc4`.
+AMD Strix Halo support is outside this release. The existing Strix selector
+is unchanged from the Atlas base, and its inherited host ABI is preserved.
 
-The [native RC2 update](GLM_5_3_FLASH_RC2.md) adds canonical verification, decode
-kernels, prompt lookup, sharded disk prefixes and optional display-memory
-allocation. Its runtime changes require fresh validation; historical benchmark
-results below remain pinned to their original code.
+Start with the [model integration](GLM_5_3_FLASH.md),
+[launch recipe](../../scripts/dev/glm53_native/README.md), and
+[validation report](glm53-validation/README.md). The recipe keeps measured
+tuning explicit; changing those settings requires validation of the new profile.
 
-The [native RC4 update](GLM_5_3_FLASH_RC4.md) records the October 12 source
-imports through `0b515eec`, their credits and separate runtime/context
-qualification: bounded C1/C4 output checks with PDL off and on, plus a near-1M
-C1 retrieval run. See its receipts and limits before using the larger profile.
+## Development history
 
-## History and review boundaries
+This is one combined release PR against Atlas `main`, developed from
+`7ffd183f210708d5b1afba1e046049f14ad498c7`. Its frozen implementation tip is
+`cb45065cb4f21c162ccd29dd837ef4b6be3aa52e` on `release/glm53-nvfp4`.
+The seven local branches below preserve development history and help navigate
+the diff; they are not seven independent PRs or required qualification targets.
+The [history manifest](glm53-validation/submission-stack.json) records those
+source boundaries without claiming independent hardware passes.
 
-Atlas base is `7ffd183f210708d5b1afba1e046049f14ad498c7`. The original
-integration merged Enntity candidate `619da6ff` at `352d087e`. Review history
-normalizes commit-message metadata and, at the submitting contributor's request,
-Reiner Schmidt's author/committer timestamps. The October 12 rewrite places
-those timestamps in 23:30–02:30 windows using fixed EST (UTC−05:00); they do not
-establish when work or tests ran. Human identities and imported author dates
-remain intact. The [history map](glm53-validation/history-map.json) records the
-earlier message-only rewrite, before the timestamp normalization and stack
-extraction; its revisions are historical identities, not the current branch tip.
-Historical source and binary receipts keep their measured revisions. A
-source-equivalent review commit is not a newly measured binary.
+| Branch suffix after `submit/glm53-` | Change |
+|---|---|
+| `runtime-prerequisites` | Numerical build flags, allocation/accounting, swap records, two-rank transport and native KDA; macOS-only dependency/example gating |
+| `api-compiler` | Grammar compiler, complete streamed tool/output envelopes and ordered per-choice request media |
+| `native-core` | GLM loading, MLA/KDA/MoE execution, FP8 target cache, replicated KV and optional DFlash |
+| `context-storage` | Token-sharded KV and optional NVMe prefix storage |
+| `benchmark-tools` | Developer performance harnesses and their Cargo example declarations |
+| `context-rc2` | Canonical verification, sharded prefix restoration, prompt lookup and decode improvements |
+| `decode-rc4` | Later native decode, scheduling and context changes |
 
-Later Atlas commits reconcile interfaces, repair regressions, replace the
-external prefill bridges and qualify the native implementation.
-Review the combined diff against the Atlas base, then inspect each area below.
-The total branch is substantial; the small native-operator delta alone does not
-represent the shared runtime changes included in this submission.
+The core remains a large integration. Extracting prerequisites and optional
+storage/benchmark work makes dependencies explicit; it does not remove the
+need to review shared scheduling, allocation and numerical behavior.
+Correctness tests and source/license notices stay with their implementations.
 
-At the measured `f873fee4` boundary, the core delta against `6b13e372` is
-971 files, 130,280 additions and 8,215 deletions. Later corrections change that
-diff; derive submission counts from the actual proposed refs. The core also
-changes `kernels/strix-hip/common/dflash2_candidate_selector.cu` (326 additions,
-42 deletions at that boundary): scratch/ticket layout, device anchor/end-token
-inputs and confidence output follow the shared host selector ABI. This is a
-cross-platform compatibility change. CPU-stub and GB10 tests do not establish
-native HIP compilation or selector correctness/graph replay. That platform
-coverage remains pending; do not remove the companion kernel without keeping
-the host/device ABI consistent.
+## Shared changes to review
 
-| Review area | Main paths | Invariants to examine |
+| Area | Main paths | Required invariant |
 |---|---|---|
-| Model configuration and loading | `crates/atlas-core/src/config/parsers/glm5_next.rs`, `crates/spark-model/src/factory/build/glm.rs`, `crates/spark-model/src/weight_loader/`, `kernels/gb10/glm-5.3-flash/MODEL.toml` | Original NVIDIA ModelOpt scales/layouts; expert slicing; skip appended MTP weights unless used; unsupported combinations fail before allocation |
-| Shared KV and SSM ownership | `crates/spark-model/src/factory/build/kv_budget.rs`, `crates/spark-model/src/model/ssm_pool/`, `crates/spark-runtime/src/kv_cache/` | Rank-minimum memory budget; rollback/compaction cleanup; owner isolation; shared pool versus per-request limit |
-| Distributed execution | `crates/spark-comm/src/nccl_backend/rdma_pair/`, `crates/atlas-rdma/`, `crates/spark-comm/src/peer_lifeline.rs` | Matching rank commands; flags/order and timeouts; lifetimes across capture/replay; failure propagation |
-| Optional DFlash | `crates/spark-model/src/layers/dflash_head/`, `crates/spark-server/src/scheduler/`, `crates/spark-server/src/cli/serve_args.rs` | Opt-in loading; single/batched selector ABI; first append; verification and rollback; per-request state |
-| Structured output and tools | `crates/xgrammar/`, `crates/spark-server/src/tool_parser/`, `crates/spark-server/src/scheduler/strict_spec.rs` | Schema compilation and token boundaries; speculative grammar advancement; complete streamed tool envelopes |
-| Native KDA | `crates/spark-runtime/src/glm_kda.rs`, `crates/spark-runtime/cuda/glm_kda/` | Checked geometry/workspace/aliasing; canonical state layout; preload before KV sizing; BF16 internal recurrence with FP32 persistent storage |
-| Native sparse MLA | `crates/spark-model/src/layers/ops/glm_sparse_native*.rs`, `kernels/gb10/glm-5.3-flash/nvfp4/glm_sparse_native*.cu`, `third_party/nvidia_sparse_mla_sm120/` | Bounded admission; workspace ownership; quantization and main/tail merge; fallback beyond the native 32K domain |
-| Build and distribution | `crates/atlas-kernels/build*.rs`, `crates/spark-runtime/build*.rs`, `docker/gb10/glm-5.3-flash/nvfp4/Dockerfile` | Per-source numerical flags; dependency tracking; native symbols available before sizing; bundled notices |
+| Model loading | `crates/atlas-core/src/config/parsers/glm5_next.rs`, `crates/spark-model/src/factory/build/glm.rs`, `crates/spark-model/src/weight_loader/` | Preserve NVIDIA layouts/scales; skip unused appended predictor weights; reject unsupported combinations before allocation |
+| KV/SSM ownership | `crates/spark-model/src/factory/build/kv_budget.rs`, `crates/spark-model/src/model/ssm_pool/`, `crates/spark-runtime/src/kv_cache/` | Rank-minimum budgeting, isolated owners, rollback cleanup, and separate aggregate/per-request limits |
+| Distributed execution | `crates/spark-comm/src/nccl_backend/rdma_pair/`, `crates/atlas-rdma/`, `crates/spark-comm/src/peer_lifeline.rs` | Matching rank operations, bounded failure propagation and capture/replay lifetimes |
+| Speculation | `crates/spark-model/src/layers/dflash_head/`, `crates/spark-server/src/scheduler/` | Target verification, accepted-prefix state, rejected-tail rollback and per-request isolation |
+| Structured output/tools | `crates/xgrammar/`, `crates/spark-server/src/tool_parser/`, `crates/spark-server/src/scheduler/strict_spec.rs` | Refuse unsupported strict schemas; preserve grammar state and complete streamed tool envelopes |
+| Native prefill | `crates/spark-runtime/cuda/glm_kda/`, `crates/spark-model/src/layers/ops/glm_sparse_native*.rs`, `kernels/gb10/glm-5.3-flash/nvfp4/` | Checked geometry, bounded scratch, correct cache layout and explicit fallback domains |
+| Build/distribution | `crates/atlas-kernels/build*.rs`, `crates/spark-runtime/build*.rs`, `docker/gb10/glm-5.3-flash/nvfp4/Dockerfile` | Correct numerical flags, native symbols available before cache sizing, and bundled source notices |
 
-Inspect these groups separately when reviewing. They are review boundaries,
-not claims that each group can be cherry-picked without its dependencies.
-Numerical oracles, correctness probes and the KV-sizing campaign remain because
-they explain and reproduce runtime decisions. Optional developer performance
-harnesses are in the later benchmark-tools branch. Obsolete bridge implementations
-and builders have been removed; their source history and notices remain.
+Compiler-only grammar changes do not independently qualify fail-closed server
+behavior; policy limits and error propagation remain with the server integration.
+Metal dependency and example gating preserves the existing macOS bodies. Linux
+all-features compilation is compatibility evidence, not macOS GPU qualification.
 
-## Evidence and outstanding limits
+## Qualification
 
-The core campaign at `f873fee48e9f88907ecfe8ac8b1330e172ee9c4c` passed
-18 focused checkpoint-retirement tests, a clean Docker build, three API cases
-and four short coherence cases. Both ranks shut down without the previously
-reproduced invalid-free/model-teardown error; fallback ownership warnings
-remain. That bounded campaign does not exercise every optional loading path.
-Subsequent MMQ corrections change source inputs and need new exact-tip checks.
+The final combined implementation at `cb45065c` passed CPU/static checks,
+ten canonical Qwen GPU gates and the bounded paired GLM campaign. See the
+[release summary](glm53-validation/release-summary.json) for actual records
+and limits. Intermediate branches remain development history only.
 
-Earlier reduced core `77152c68` passed 6,906 CPU tests with zero failed and
-116 ignored, plus formatting, Clippy and rustdoc using CPU build/link stubs.
-Those tests retain that earlier source identity. The assembled full-stack ten
-Qwen gate passes at `6447f929` belong to a different binary and cannot serve as
-this core's current-tip formal gates. Their receipt is in the separate review
-evidence attachment, not implied to be present on this intermediate branch.
-Native x86_64/aarch64 CUDA release builds and HIP coverage also remain separate
-requirements; CPU stub compilation is not native kernel or release validation.
+CPU checks that use build/link stubs do not execute CUDA kernels. Native builds
+and GPU gates have their own source, binary, model and recipe identities.
+Formal Qwen gates establish bounded cross-model regression coverage; they do
+not measure GLM throughput or qualify a different intermediate branch.
+GLM API, concurrency, retrieval, cancellation and storage tests are reported
+separately. Failed attempts remain in the evidence history.
 
-The historical `451bbc21` serving campaign remains in the linked validation
-report. Its context and throughput measurements are historical evidence, not
-current-core capacity qualification. Its tested maximum was 524,288 configured
-tokens, shared across up to four slots.
-It is not 1M-context qualification or four fully occupied 524K requests. Native
-sparse acceleration ends at 32K; the Atlas fallback handles longer contexts.
-Performance is workload-dependent and output is not identical to the original
-service, including a word-limit miss in one short explanation. No broad accuracy
-claim follows from the basic coherence and retrieval probes.
+## Limits and reproduction
 
-Full other-model GPU coverage, prefix-sharing profiles, native appended MTP,
-and general video/vision quality are outside this qualification. Shared code
-changes therefore warrant review even when GLM's bounded tests pass.
+The [RC2](GLM_5_3_FLASH_RC2.md) and [RC4](GLM_5_3_FLASH_RC4.md) reports distinguish configuration
+limits from tested workloads. A shared KV capacity is not a per-session context
+limit. Historical near-1M single-session retrieval and approximately 1.42M
+actual aggregate input are separate measurements; they do not qualify 2.5M
+occupied tokens or guarantee perfect retrieval.
 
-## Attribution and distribution
+Native sparse-prefill acceleration has a bounded domain; longer inputs
+use Atlas's fallback. Bounded API and needle tests are not broad model-quality
+or sustained leak-freedom claims.
 
-The local integration, fixes, documentation and validation are AI-assisted;
-Reiner Schmidt is the submitting contributor. Imported human credits remain
-intact. No contributor agreement has been signed on anyone else's behalf.
-Attribution does not establish the additional CLA/commercial-relicensing grant
-requested by Atlas; imported-contributor clearance evidence remains unresolved.
+Raw records retain their measured revisions. Historical `pr/*`, `review/*`
+and earlier submission records are indexed in the validation history rather
+than relabeled as new runs. Commit metadata normalized at the contributor's
+request uses fixed EST (UTC−05:00); test receipts retain their actual UTC times.
+The evidence attachment documents reproduction inputs and exclusions. The
+historical clean-clone check at `d0fe219b` verifies its committed records;
+the final packaging performs a fresh canonical record check in a clean clone.
 
-[Prior art](../glm-prior-art.md) separates copied code/data, design references,
-and related work. Native vendor inventories record source pins and hashes;
-license texts and human contributor credits are preserved.
+## Sources and rights
 
-Target and draft weights are separate downloads. DFlash is disabled unless
-explicitly enabled; selecting it does not waive the chosen weights' terms.
-The public IncoAI DFlash2 model card lists CC BY-NC-ND 4.0 and a separate
-commercial-licensing contact. Imported contributors' additional CLA/relicensing
-rights are not established by credit or by this technical review.
+[Prior art](../glm-prior-art.md) distinguishes imported code/data, design
+references and related work. Native vendor inventories preserve source pins,
+hashes, license texts and human contributor credits, including Jason McCartney's
+Enntity/SparkGLM work and the upstream kernel/checkpoint contributors.
+
+The integration and validation work are AI-assisted; Reiner Schmidt is the
+submitting contributor. Attribution does not establish additional licensing
+rights. Target and optional draft weights are separate downloads governed by
+their own terms. The [rights audit](glm53-validation/rights-audit.json) records
+the separate contributor/CLA questions; technical qualification does not resolve
+them, and no agreement has been signed on another contributor's behalf.
