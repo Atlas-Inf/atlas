@@ -75,7 +75,19 @@ atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
 cudarc = { workspace = true, optional = true }
 
-# Apple Metal backend deps. Activated only by `--features metal`.
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = "0.8"
+memmap2 = "0.9"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time", "parking_lot"] }
+rand = "0.8"
+half = "2"
+parking_lot = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Apple Metal dependencies are activated only on macOS with `--features metal`.
 objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true, features = [
     "MTLDevice",
@@ -99,16 +111,6 @@ objc2-foundation = { version = "0.3", optional = true, features = [
 # `MTLDevice::newLibraryWithData_error` takes a `DispatchData` (libdispatch
 # byte container), not an `NSData`. dispatch2 ships the wrapper.
 dispatch2 = { version = "0.3", optional = true }
-anyhow = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-safetensors = "0.8"
-memmap2 = "0.9"
-tracing = "0.1"
-tokio = { version = "1", features = ["rt", "sync", "time", "parking_lot"] }
-rand = "0.8"
-half = "2"
-parking_lot = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

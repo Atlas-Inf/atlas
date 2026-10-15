@@ -33,7 +33,7 @@ pub mod kernel_audit;
 pub mod kv_cache;
 pub mod kv_dequant;
 pub mod kv_spill;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_backend;
 pub mod op_cache;
 pub mod pinned_hosts;
