@@ -5,10 +5,11 @@
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
-use anyhow::{Result, bail, ensure};
+use anyhow::Result;
 
 use super::super::super::types::TransformerModel;
 use crate::layers::ops;
+use crate::request_local::request_local;
 use crate::traits::SequenceState;
 
 /// `ATLAS_QWEN4EXP_PREFILL_HOST_IDS=1`: the prefill forward hands its layers
@@ -47,7 +48,9 @@ pub(super) fn take_staged_ids() -> Option<Vec<u32>> {
 /// `skip_rows` the leading rows of cached items the encoder did not produce
 /// (their placeholders are not copied); `window_end` is the virtual row one
 /// past the resident window (`rows_base + rows_encoded`): the chunk's pads
-/// must all map inside it.
+/// must all map inside it. A pad outside it is request-local (every rank
+/// decides it from the same tokens and window, `request_local`): a prompt
+/// with more placeholders than its items have rows fails alone.
 fn vision_pad_row_range(
     tokens: &[u32],
     chunk_start: usize,
@@ -64,19 +67,15 @@ fn vision_pad_row_range(
     let chunk_pad_count = chunk_tokens.iter().filter(is_pad).count();
     let start = row_base
         .checked_add(prior_pad_count.saturating_sub(skip_rows))
-        .ok_or_else(|| anyhow::anyhow!("vision pad overlay row offset overflow"))?;
+        .ok_or_else(|| request_local("vision pad overlay row offset overflow"))?;
     let end = row_base
         .checked_add((prior_pad_count + chunk_pad_count).saturating_sub(skip_rows))
-        .ok_or_else(|| anyhow::anyhow!("vision pad overlay row count overflow"))?;
+        .ok_or_else(|| request_local("vision pad overlay row count overflow"))?;
     if end > window_end {
-        bail!(
+        return Err(request_local(format!(
             "vision pad overlay exceeds the resident window: base={}, prior={}, chunk={}, skipped={}, window_end={}",
-            row_base,
-            prior_pad_count,
-            chunk_pad_count,
-            skip_rows,
-            window_end
-        );
+            row_base, prior_pad_count, chunk_pad_count, skip_rows, window_end
+        )));
     }
     Ok((start, end))
 }
@@ -291,14 +290,15 @@ impl TransformerModel {
         let row_base = seq.vision.row_base;
         let owned_images = seq.vision.owned_images;
         let slice_rows = seq.vision.slice_rows;
-        if owned_images > 0 {
-            ensure!(
-                slice_rows > 0
-                    && prior_pad_rows
-                        .checked_add(chunk_pad_rows)
-                        .is_some_and(|end| end <= slice_rows),
+        if owned_images > 0
+            && !(slice_rows > 0
+                && prior_pad_rows
+                    .checked_add(chunk_pad_rows)
+                    .is_some_and(|end| end <= slice_rows))
+        {
+            return Err(request_local(format!(
                 "vision pad rows exceed co-dispatched slice: prior={prior_pad_rows}, chunk={chunk_pad_rows}, slice={slice_rows}"
-            );
+            )));
         }
         // The encoder output is packed in prompt order, while this function
         // may be called for several chunks. Starting at zero for every chunk
@@ -326,20 +326,24 @@ impl TransformerModel {
                 continue;
             }
             if pad_idx < skip_rows {
-                ensure!(
-                    start + i < computed_from,
-                    "cached vision placeholder at {} is computed (from {computed_from})",
-                    start + i
-                );
+                if start + i >= computed_from {
+                    return Err(request_local(format!(
+                        "cached vision placeholder at {} is computed (from {computed_from})",
+                        start + i
+                    )));
+                }
             } else {
                 let src = ve.out_row().offset(row_idx * ve.out_hidden_size() * 2);
                 let physical = row_idx.checked_sub(rows_base).ok_or_else(|| {
-                    anyhow::anyhow!("vision row {row_idx} already consumed (base {rows_base})")
+                    request_local(format!(
+                        "vision row {row_idx} already consumed (base {rows_base})"
+                    ))
                 })?;
-                ensure!(
-                    physical < pending,
-                    "vision row {row_idx} is not resident (base {rows_base}, {pending} rows)"
-                );
+                if physical >= pending {
+                    return Err(request_local(format!(
+                        "vision row {row_idx} is not resident (base {rows_base}, {pending} rows)"
+                    )));
+                }
                 let src = ve.out_row().offset(physical * ve.out_hidden_size() * 2);
                 let dst = hidden_dst.offset(i * h * elem_bytes);
                 self.gpu
@@ -384,6 +388,18 @@ mod tests {
         let err = vision_pad_row_range(&[1, 10, 10], 1, 2, 10, 11, 3, 0, 4)
             .expect_err("two rows cannot fit in one packed row");
         assert!(err.to_string().contains("exceeds the resident window"));
+    }
+
+    #[test]
+    fn a_placeholder_past_the_encoded_rows_fails_only_its_request() {
+        // One 2-row image, then a stray placeholder (a pad id the request's
+        // items do not explain) in a later chunk: every rank reaches this
+        // check alike, so the error must be request-local, not rank-fatal.
+        let (image, text) = (10, 1);
+        let tokens = [text, image, image, text, image, text];
+        let err = vision_pad_row_range(&tokens, 3, 3, image, 11, 0, 0, 2)
+            .expect_err("the stray pad has no row");
+        assert!(crate::request_local::is_request_local(&err));
     }
 
     #[test]

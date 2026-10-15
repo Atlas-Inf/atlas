@@ -48,6 +48,7 @@ use spark_runtime::prefix_cache::vision_key::vision_cache_key;
 
 use super::types::TransformerModel;
 use crate::VisionItem;
+use crate::request_local::request_local;
 use crate::traits::SequenceState;
 
 /// `ATLAS_VISION_PREFIX_CACHE=0` turns vision prefix caching off (vision
@@ -337,35 +338,27 @@ impl TransformerModel {
         if rows > 0 && stream != default {
             self.gpu.synchronize(stream)?;
         }
-        if !items.is_empty() && rows > 0 && !seq.vision.items.is_empty() {
-            // The head alone holds pixels: a worker (receive-only for vision)
-            // skips the encode and takes the rows from the broadcast below.
-            ensure!(
-                grids.len() == seq.vision.items.len(),
-                "vision items and grids disagree"
-            );
-            let refs: Vec<&VisionItem> = items.iter().map(|&i| &seq.vision.items[i]).collect();
-            let per_group =
-                ve.forward_items(&refs, self.gpu.as_ref(), self.gpu.default_stream())?;
-            // The grids were derived before the encode (the key and the
-            // worker needed them); the encoder's own geometry must agree.
-            let mut group = 0usize;
-            for (&i, (t_len, h, w)) in items.iter().zip(items.iter().map(|&i| grids[i])) {
-                let item = &seq.vision.items[i];
-                let (eh, ew, _) = per_group[group];
-                ensure!(
-                    (item.t_len(), eh, ew) == (t_len, h, w),
-                    "deferred vision grid {:?} disagrees with the encoder's {:?}",
-                    (t_len, h, w),
-                    (item.t_len(), eh, ew)
-                );
-                group += item.t_len();
+        // The head alone holds pixels: a worker (receive-only for vision)
+        // skips the encode and takes the rows from the broadcast below.
+        let encoded = if !items.is_empty() && rows > 0 && !seq.vision.items.is_empty() {
+            self.vision_encode_on_head(seq, items, rows)
+        } else {
+            Ok(())
+        };
+        // A head-only failure is agreed before the payload broadcast, which
+        // the worker is about to enter: both ranks then fail the request at
+        // the same point (`request_local`) instead of leaving the worker in a
+        // collective the head never issues.
+        if rows > 0 && self.multi_rank_protocol_active() {
+            let agreed = self.ep_min_u32(u32::from(encoded.is_ok()))?;
+            if agreed == 0 {
+                return Err(request_local(match encoded {
+                    Err(e) => format!("vision encode failed: {e:#}"),
+                    Ok(()) => "vision encode failed on another rank".to_string(),
+                }));
             }
-            let encoded: usize = per_group.iter().map(|&(_, _, m)| m).sum();
-            ensure!(
-                encoded == rows,
-                "deferred vision encode produced {encoded} rows, the grids expect {rows}"
-            );
+        } else if let Err(e) = encoded {
+            return Err(request_local(format!("vision encode failed: {e:#}")));
         }
         // The window is exactly this chunk's splice range: every item it
         // holds has a placeholder in this chunk, and every item of earlier
@@ -380,10 +373,11 @@ impl TransformerModel {
         }
         self.gpu.synchronize(self.gpu.default_stream())?;
         if rows > 0 && self.multi_rank_protocol_active() {
-            ensure!(
-                rows <= ve.output_rows(),
-                "deferred vision rows exceed encoder capacity"
-            );
+            if rows > ve.output_rows() {
+                return Err(request_local(
+                    "deferred vision rows exceed encoder capacity",
+                ));
+            }
             let comm = self
                 .comm
                 .as_ref()
@@ -391,6 +385,51 @@ impl TransformerModel {
             comm.broadcast(ve.out_row().0, rows * ve.out_hidden_size() * 2, 0)?;
         }
         Ok(rows)
+    }
+}
+
+impl TransformerModel {
+    /// The head's encode of `items` into `buf_out` row 0, checked against
+    /// the grids staged at admission (the key and the worker used those).
+    fn vision_encode_on_head(
+        &self,
+        seq: &SequenceState,
+        items: &[usize],
+        rows: usize,
+    ) -> Result<()> {
+        let ve = self
+            .vision_encoder
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vision encode without an encoder"))?;
+        let grids = &seq.vision.grids;
+        ensure!(
+            grids.len() == seq.vision.items.len(),
+            "vision items and grids disagree"
+        );
+        let refs: Vec<&VisionItem> = items.iter().map(|&i| &seq.vision.items[i]).collect();
+        let per_group = ve.forward_items(&refs, self.gpu.as_ref(), self.gpu.default_stream())?;
+        // The grids were derived before the encode (the key and the worker
+        // needed them); the encoder's own geometry must agree.
+        let mut group = 0usize;
+        for &i in items {
+            let item = &seq.vision.items[i];
+            let &(eh, ew, _) = per_group
+                .get(group)
+                .ok_or_else(|| anyhow::anyhow!("vision encoder returned {group} groups"))?;
+            ensure!(
+                (item.t_len(), eh, ew) == grids[i],
+                "deferred vision grid {:?} disagrees with the encoder's {:?}",
+                grids[i],
+                (item.t_len(), eh, ew)
+            );
+            group += item.t_len();
+        }
+        let encoded: usize = per_group.iter().map(|&(_, _, m)| m).sum();
+        ensure!(
+            encoded == rows,
+            "deferred vision encode produced {encoded} rows, the grids expect {rows}"
+        );
+        Ok(())
     }
 }
 
