@@ -6,6 +6,8 @@ use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
+mod lm_head;
+mod policy;
 mod ssm_layer;
 
 use super::ModelWeightLoader;
@@ -13,12 +15,39 @@ use crate::layer::TransformerLayer;
 use crate::layers::{FfnComponent, NemotronMoeLayer, Qwen3AttentionLayer};
 use crate::tp_shard::{TpAttentionDims, TpShardKind, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
-    DenseWeight, MtpWeights, dense, load_nemotron_attention, load_nemotron_moe, quantize_to_nvfp4,
+    AttentionWeights, DenseWeight, MtpWeights, QuantizedWeight, dense,
+    load_fp8_block_scaled_as_fp8weight, load_kv_scales, load_nemotron_attention, load_nemotron_moe,
+    quantize_to_nvfp4,
 };
 
 pub struct NemotronHWeightLoader;
 
 impl ModelWeightLoader for NemotronHWeightLoader {
+    /// nemotron_h_omni: the RADIO vision tower. Loads
+    /// `vision_model.radio_model.*` + `vision_projector.*` + `mlp1.*`
+    /// into `RadioVisionTower`; returns `None` for text-only nemotron_h
+    /// or when `config.vision` is unset.
+    fn load_vision_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::VisionTower>> {
+        if config.vision.as_ref().is_none_or(|v| v.omni.is_none()) {
+            return Ok(None);
+        }
+        let tower = crate::radio_tower::RadioVisionTower::new(store, config, gpu)?;
+        Ok(Some(crate::layers::VisionTower::Radio(Box::new(tower))))
+    }
+
+    fn dead_namespaces(&self, config: &ModelConfig) -> Vec<String> {
+        policy::dead_namespaces(config)
+    }
+
+    fn slab_pack_weights(&self, config: &ModelConfig) -> bool {
+        policy::slab_pack_weights(config)
+    }
+
     fn supports_tp(&self) -> bool {
         // FullAttention layers TP-sharded across both quant paths
         // (NVFP4-from-disk and BF16/FP8 → NVFP4). LinearAttention
@@ -106,7 +135,7 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                         );
                     }
                     let mut moe_layer =
-                        NemotronMoeLayer::new(moe, norm, config, gpu, moe_inter, top_k)?;
+                        NemotronMoeLayer::new(moe, norm, config, gpu, moe_inter, top_k, i)?;
                     // Builds the transposed shared-expert weights (2 small matrices
                     // per layer) so prefill can use `w4a16_gemm_t` instead of the base
                     // `w4a16_gemm`. Routed-expert transposition stays disabled inside
@@ -115,6 +144,138 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                     layers.push(Box::new(moe_layer));
                 }
                 atlas_core::config::LayerType::FullAttention => {
+                    let mp = format!("{lp}.mixer");
+                    // Native-FP8 attention: the omni checkpoint ships q/k/v/o as
+                    // F8_E4M3 with a per-tensor scalar `weight_scale`. When on,
+                    // the FP8 bytes feed `QuantWeight::Fp8` directly — no BF16
+                    // dequant at all (so nothing to free, per BUG #29) — and
+                    // `load_fp8_block_scaled_as_fp8weight` expands the scalar
+                    // into the FP32 [N/128, K/128] block-scale buffer the w8a16
+                    // kernels expect (multiply convention, shared with
+                    // quantize_fp8_bs). The weight pointer aliases the
+                    // slab-resident safetensors bytes — same convention as the
+                    // FP8 MoE tensors and safe for the same reason: the slab is
+                    // read-only weight storage for the process lifetime.
+                    // Gate: on by default for `nemotron_h_omni` by model type
+                    // (survives the text-only `config.vision = None` drop on
+                    // targets without a vision encoder).
+                    // ATLAS_NEMOTRON_NATIVE_FP8_ATTN=0 opts out (old dequant
+                    // path), =1 opts in on non-omni.
+                    let is_fp8_attn = !store.contains(&format!("{mp}.q_proj.weight_scale_2"))
+                        && store.contains(&format!("{mp}.q_proj.weight_scale"));
+                    let native_fp8_attn = policy::native_fp8_attn(
+                        config,
+                        std::env::var("ATLAS_NEMOTRON_NATIVE_FP8_ATTN")
+                            .ok()
+                            .as_deref(),
+                    );
+                    let tp_size0 = config.tp_world_size.max(1);
+                    if is_fp8_attn && native_fp8_attn && tp_size0 == 1 {
+                        let q_dim = config.num_attention_heads * config.head_dim;
+                        let kv_dim = config.num_key_value_heads * config.head_dim;
+                        let mut q = load_fp8_block_scaled_as_fp8weight(
+                            store,
+                            &format!("{mp}.q_proj"),
+                            gpu,
+                        )?;
+                        let mut k = load_fp8_block_scaled_as_fp8weight(
+                            store,
+                            &format!("{mp}.k_proj"),
+                            gpu,
+                        )?;
+                        let mut v = load_fp8_block_scaled_as_fp8weight(
+                            store,
+                            &format!("{mp}.v_proj"),
+                            gpu,
+                        )?;
+                        let mut o = load_fp8_block_scaled_as_fp8weight(
+                            store,
+                            &format!("{mp}.o_proj"),
+                            gpu,
+                        )?;
+                        // Shape + alignment: q/o are [h,h], k/v are [kv_dim,h],
+                        // and w8a16_gemv issues uint4 loads with no tail so K
+                        // must be a multiple of 16 (K=4096 on this checkpoint).
+                        for (w, want_n) in [(&q, q_dim), (&k, kv_dim), (&v, kv_dim), (&o, h)] {
+                            anyhow::ensure!(
+                                w.n as usize == want_n && w.k as usize == h,
+                                "L{i} attention FP8 shape [{},{}] != expected [{want_n},{h}]",
+                                w.n,
+                                w.k
+                            );
+                        }
+                        anyhow::ensure!(
+                            h.is_multiple_of(16),
+                            "L{i} attention FP8 K={h} is not a multiple of 16"
+                        );
+                        // Slab policy (same as the SSM FP8 arm, ssm_layer.rs):
+                        // alias slab-resident pointers — interior frees are
+                        // no-ops and offsets are never reused, so the alias can
+                        // never read stale bytes. Anything else gets an owned
+                        // copy: the w8a16_gemv_numeric history shows a non-slab
+                        // alias reading stale bytes while the model stays
+                        // fluent and loses the prompt.
+                        let mut slab_all = true;
+                        for w in [&mut q, &mut k, &mut v, &mut o] {
+                            if gpu.is_slab_interior(w.weight) {
+                                continue;
+                            }
+                            slab_all = false;
+                            let bytes = (w.n as usize) * (w.k as usize);
+                            let owned = gpu.alloc(bytes)?;
+                            gpu.copy_d2d(w.weight, owned, bytes)?;
+                            w.weight = owned;
+                        }
+                        if slab_all {
+                            tracing::info!(
+                                "L{i} attention: FP8 q/k/v/o are slab-resident — aliased, not copied"
+                            );
+                        }
+                        let (k_scale, v_scale) = load_kv_scales(store, &mp, gpu);
+                        let dummy = DenseWeight {
+                            weight: spark_runtime::gpu::DevicePtr::NULL,
+                        };
+                        let attn = AttentionWeights {
+                            q_proj: dummy,
+                            k_proj: dummy,
+                            v_proj: dummy,
+                            o_proj: QuantizedWeight::null(),
+                            q_norm: dummy,
+                            k_norm: dummy,
+                            q_norm_full: None,
+                            k_norm_full: None,
+                            k_scale,
+                            v_scale,
+                        };
+                        let mut attn_layer = Qwen3AttentionLayer::new_ungated(
+                            norm,
+                            attn,
+                            dummy,
+                            FfnComponent::None,
+                            attn_idx,
+                            None,
+                            None,
+                            None,
+                            gpu,
+                            layer_kv_dtypes[attn_idx],
+                            config.fp8_kv_calibration_tokens,
+                            config,
+                        )?;
+                        attn_layer.set_fp8_weights(Some(q), Some(k), Some(v), Some(o));
+                        if let Err(e) = attn_layer.transpose_fp8_for_prefill(gpu, stream) {
+                            tracing::warn!("L{i} attention FP8 prefill transpose failed: {e}");
+                        }
+                        // No rotary on Nemotron-H attention (see below).
+                        attn_layer.set_rope_disabled(true);
+                        if i < 2 {
+                            tracing::info!(
+                                "L{i} attention: native FP8 q/k/v/o (w8a16, no dequant)"
+                            );
+                        }
+                        layers.push(Box::new(attn_layer));
+                        attn_idx += 1;
+                        continue;
+                    }
                     // Attention layer — quantize BF16 Q/K/V/O directly from
                     // WeightStore pointers (no intermediate alloc/free needed).
                     let (mut attn, mut q_nvfp4, mut k_nvfp4, mut v_nvfp4, mut o_dense, is_nvfp4) =
@@ -408,16 +569,9 @@ impl ModelWeightLoader for NemotronHWeightLoader {
         &self,
         store: &WeightStore,
         config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
+        gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        if store.contains("lm_head.weight") {
-            dense(store, "lm_head.weight")
-        } else {
-            dense(
-                store,
-                &format!("{}.embeddings.weight", config.weight_prefix),
-            )
-        }
+        Self::load_lm_head_impl(store, config, gpu)
     }
 
     fn load_mtp_weights(
@@ -454,5 +608,47 @@ mod tests {
     #[test]
     fn test_nemotron_h_loader_exists() {
         let _loader = NemotronHWeightLoader;
+    }
+
+    #[test]
+    fn omni_policies_skip_dead_towers_and_enable_slab_packing() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "nemotron_h_omni".to_string();
+        config.tp_world_size = 1;
+        config.ep_world_size = 1;
+        let loader = NemotronHWeightLoader;
+        let dead = loader.dead_namespaces(&config);
+        assert!(dead.iter().any(|p| p == "language_model.mtp."));
+        assert!(dead.iter().any(|p| p == "vision_model."));
+        assert!(dead.iter().all(|p| p.ends_with('.')));
+        assert!(loader.slab_pack_weights(&config));
+
+        config.tp_world_size = 2;
+        assert!(
+            !loader.slab_pack_weights(&config),
+            "pack mode must not arm under TP — its frees reach store ptrs"
+        );
+
+        config.model_type = "nemotron_h".to_string();
+        config.tp_world_size = 1;
+        assert!(loader.dead_namespaces(&config).is_empty());
+        assert!(!loader.slab_pack_weights(&config));
+    }
+
+    #[test]
+    fn native_fp8_attn_lever_keys_on_model_type_not_vision() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "nemotron_h_omni".to_string();
+        // The strix-hip text-only drop sets vision to None — the lever must
+        // still be on by default.
+        config.vision = None;
+        assert!(policy::native_fp8_attn(&config, None));
+        assert!(!policy::native_fp8_attn(&config, Some("0")));
+        config.model_type = "nemotron_h".to_string();
+        assert!(!policy::native_fp8_attn(&config, None));
+        assert!(policy::native_fp8_attn(&config, Some("1")));
+        // Unknown env values fall back to the default.
+        config.model_type = "nemotron_h_omni".to_string();
+        assert!(policy::native_fp8_attn(&config, Some("2")));
     }
 }

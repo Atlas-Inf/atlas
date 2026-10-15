@@ -28,6 +28,12 @@ pub mod model;
 pub mod precision_schedule;
 pub mod preflight;
 pub mod quant_format;
+pub mod radio_encoder;
+#[cfg(test)]
+mod radio_encoder_pipe_tests;
+mod radio_encoder_tests;
+pub mod radio_preprocess;
+pub mod radio_tower;
 pub mod speculative;
 pub mod ssm_reserve;
 pub mod tp_shard;

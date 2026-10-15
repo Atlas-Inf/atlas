@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Extracted piecewise from `tokenizer.rs` (500-LoC cap).
+//! Extracted piecewise from `tokenizer.rs`.
 
 use super::*;
 
 mod deepseek_v4;
 use serde_json::json;
-
 mod laguna;
 mod mistral_effort;
+mod nemotron_3_5_super_vl;
 mod qwen_dense;
 mod qwen_dense_parity;
 

@@ -38,6 +38,7 @@ pub(crate) struct PreparedChat {
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) enable_thinking: bool,
     pub(crate) thinking_budget: Option<u32>,
+    pub(crate) force_nonempty_content: bool,
 }
 
 /// Run the prompt-affecting phases against the IR envelope. Mutates
@@ -66,11 +67,14 @@ pub(crate) fn prepare_chat_prompt(
     // duplicate measures +1019 tokens on a BFCL parallel prompt. Skipping the
     // injection is the only way to reach vLLM's prompt size; no config lever
     // gets below 731. See the dose-response in BENCH.toml.
-    let skip_inject = matches!(
+    let skip_inject_env = matches!(
         std::env::var("ATLAS_NO_TOOL_INJECT").as_deref(),
         Ok("1") | Ok("true")
     );
-    if skip_inject {
+    // `--reference-mode` renders only the template's tool block, as a
+    // reference server does.
+    let skip_inject = skip_inject_env || state.reference_mode;
+    if skip_inject_env {
         tracing::warn!(
             "ATLAS_NO_TOOL_INJECT=1: skipping the parser tool system prompt.              This is an experiment - the injection is load-bearing for the              hallucination category (~96 vs 30/64 without)."
         );
@@ -100,6 +104,16 @@ pub(crate) fn prepare_chat_prompt(
     );
 
     let _t_phase = std::time::Instant::now();
+
+    // Text-only guard (omni vision tower is not yet served): reject
+    // image/video parts with a clear 400 naming the model — the default,
+    // not a flag. Anthropic and OpenAI media both lower to ContentPart::
+    // Image/Video, so this single check covers both surfaces.
+    reject_media_when_text_only(
+        state.vision_config.is_none(),
+        &state.model_name,
+        &req.messages,
+    )?;
 
     // ── Phase 1: build MsgEntry vec + image preprocess + cwd ────
     let msg_entry::BuildOut {
@@ -133,6 +147,7 @@ pub(crate) fn prepare_chat_prompt(
     }
     let gen_max =
         thinking::generation_max_tokens(req.max_tokens, tools_active, state.tool_max_tokens);
+    let force_nonempty_content = req.force_nonempty_content;
     let (enable_thinking, thinking_budget) =
         thinking::resolve_thinking(state, thinking_directive, gen_max as u32, tools_active);
     let reasoning_effort = effective_reasoning_effort(
@@ -177,6 +192,7 @@ pub(crate) fn prepare_chat_prompt(
         prompt_tokens,
         enable_thinking,
         thinking_budget,
+        force_nonempty_content,
     })
 }
 
@@ -218,6 +234,25 @@ fn inject_tool_system_prompt(messages: &mut Vec<crate::ir::Message>, tool_prompt
     } else {
         messages.insert(0, crate::ir::Message::synthetic_system(tool_prompt));
     }
+}
+
+/// `Err(400)` when a request carries image/video parts on a model with no
+/// vision config. Pure-ish (only reads message media kinds) for tests.
+#[allow(clippy::result_large_err)]
+pub(crate) fn reject_media_when_text_only(
+    no_vision_config: bool,
+    model_name: &str,
+    messages: &[crate::ir::Message],
+) -> Result<(), Response> {
+    if no_vision_config && messages.iter().any(|m| !m.media_kinds().is_empty()) {
+        return Err(super::super::compact::openai_error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "{model_name} is text-only for now — image and video inputs                  are not supported"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

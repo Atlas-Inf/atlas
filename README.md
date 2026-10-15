@@ -75,6 +75,7 @@ Numbers are single-GB10 decode tok/s measured end-to-end through the HTTP API on
 | **Qwen3.8-27B flagship** | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | GDN + attention hybrid, MTP | `@atlas/qwen3.8-27b-nvfp4` | 23.59 |
 | **Qwen3.8-Flash-Next** | `RadixArk/Qwen3.8-Flash-Next-NVFP4` | ~180B MoE | GDN + attention + MoE, PLE NVMe streaming | `@atlas/qwen3.8-flash-next-nvfp4` | 36.7 |
 | Nemotron-3.5-Lightning + DSpark | `nvidia` checkpoint via recipe | 30B / 3B | Mamba-2 + attention + MoE + DSpark drafter | `@atlas/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark` | sub-10ms/token |
+| **Nemotron-3.5-Super-VL + LiLiCorr** | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` | 120B / 12B | Mamba-2 + attention + LatentMoE, C-RADIO vision, LiLiCorr drafter (DFlash γ8) | `@atlas/nemotron-3.5-super-vl-120b-a12b-nvfp4-dflash2` | 28 (γ8); also Strix Halo Windows/Linux |
 | Qwen3.5-27B | `Kbenkhaled/Qwen3.5-27B-NVFP4` | 27B dense | Hybrid SSM + attention, dense FFN, MRoPE | | 13 |
 | Qwen3.5-35B-A3B | `Sehyo/Qwen3.5-35B-A3B-NVFP4` | 35B / 3B | GDN + attention + MoE, MTP | | **131** (MTP K=2) |
 | Qwen3.5-122B-A10B | `Sehyo/Qwen3.5-122B-A10B-NVFP4` | 122B / 10B | GDN + attention + MoE, MTP | | 46 (EP=2) |

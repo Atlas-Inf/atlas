@@ -30,6 +30,8 @@ pub(crate) mod prepare;
 pub(crate) mod remote_image;
 mod sampling_setup;
 mod template;
+#[cfg(test)]
+mod text_only_tests;
 mod thinking;
 
 use crate::main_modules::model_host::CurrentModel;
@@ -348,9 +350,24 @@ pub(crate) async fn chat_completions_inner(
         prompt_tokens,
         enable_thinking,
         thinking_budget,
+        force_nonempty_content,
     } = match prepared {
         Ok(p) => p,
-        Err(resp) => return ChatOutcome::Http(resp),
+        Err(resp) => {
+            // A prepare failure (template render, image decode, context
+            // bounds) must not be a silent 4xx: 2022's ST-995 leg lost ~775
+            // samples to an invisible early exit because nothing logged the
+            // rejection. WARN with the request's shape is the minimum a
+            // triager needs.
+            tracing::warn!(
+                "Request rejected before prefill: status={} messages={} tools={} stream={}",
+                resp.status(),
+                req.messages.len(),
+                req.tools.len(),
+                req.stream,
+            );
+            return ChatOutcome::Http(resp);
+        }
     };
 
     let us_prepare = _t_seg.elapsed().as_micros();
@@ -455,6 +472,7 @@ pub(crate) async fn chat_completions_inner(
             logit_bias.clone(),
             enable_thinking,
             thinking_budget,
+            force_nonempty_content,
             tools_active,
             tool_choice_required,
             suppress_tool_call,
@@ -498,6 +516,7 @@ pub(crate) async fn chat_completions_inner(
         stop_tokens,
         enable_thinking,
         thinking_budget,
+        force_nonempty_content,
         tools_active,
         tool_choice_required,
         suppress_tool_call,

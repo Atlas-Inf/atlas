@@ -88,7 +88,9 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
     // Suppressing forever (until max_tokens) burns the user's
     // patience and decode budget — observed live as an 8192-token
     // doom loop. If the streak exceeds the bound, end the stream.
-    if state.suppressing_param_leak && !state.stop_string_triggered {
+    // `--reference-mode` keeps every stream-side cut below off: a reference
+    // server ends a response only on EOS / stop / max_tokens.
+    if state.suppressing_param_leak && !state.stop_string_triggered && !ctx.state.reference_mode {
         state.suppress_streak_tokens = state.suppress_streak_tokens.saturating_add(1);
         if state.suppress_streak_tokens > MAX_SUPPRESS_STREAK_TOKENS {
             tracing::warn!(
@@ -644,7 +646,7 @@ fn process_detector_content(
         state.loop_watchdog_triggered,
     );
 
-    if semantic_trip || token_trip {
+    if (semantic_trip || token_trip) && !ctx.state.reference_mode {
         if semantic_trip {
             tracing::warn!(
                 ring_len = state.simhash_guard.len(),

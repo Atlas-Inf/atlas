@@ -91,14 +91,7 @@ impl MoeLayer {
             let mut offsets = vec![0u8; (ne + 1) * 4];
             ctx.gpu
                 .copy_d2h_on_stream(expert_offsets, &mut offsets, stream)?;
-            let mut prev = 0u32;
-            let mut max_rows = 0u32;
-            for raw in offsets.chunks_exact(4).skip(1) {
-                let cur = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-                max_rows = max_rows.max(cur.saturating_sub(prev));
-                prev = cur;
-            }
-            max_rows.div_ceil(64).max(1).min(worst_case_m_tiles)
+            super::exact_m_tiles(&offsets, worst_case_m_tiles)
         } else {
             std::env::var("ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR")
                 .ok()

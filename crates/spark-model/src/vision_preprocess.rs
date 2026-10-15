@@ -85,7 +85,7 @@ pub(crate) fn decode_data_uri_bytes(data_uri: &str) -> Result<(String, Vec<u8>)>
 }
 
 /// Decode a base64 data URI or raw base64 string into a `DynamicImage`.
-fn decode_image(data_uri: &str) -> Result<DynamicImage> {
+pub(crate) fn decode_image(data_uri: &str) -> Result<DynamicImage> {
     let (_mime, bytes) = decode_data_uri_bytes(data_uri)?;
 
     // Probe format from magic bytes.

@@ -4,7 +4,7 @@
 // implementation). Split out of `sampler.rs` to keep the parent file
 // under the 500-line cap. The parent re-exports these via `pub use`.
 
-use super::{SamplingParams, apply_penalties_and_bias, record_entropy};
+use super::{SamplingParams, apply_penalties_and_bias, argmax_first_wins_f32, record_entropy};
 
 pub fn sample_with_params_history(
     data: &[u8],
@@ -65,7 +65,13 @@ pub fn sample_with_params_seeded(
     // penalties + logit_bias actually re-order logits, so as long as those
     // ran first, this argmax is correct AND respects caller config.
     if params.temperature <= 0.0 {
-        return argmax_last_wins_f32(&raw_logits);
+        // FIRST-index-wins: unifies the tie-break with the GPU argmax kernel
+        // (argmax_bf16, lowest-lane), every verify pick (CPU argmax_first_wins,
+        // fast-greedy row picks) and torch.argmax/vLLM greedy. Logits are BF16
+        // so exact ties are common; under the old LAST-wins rule the CPU host
+        // path and verify disagreed at ties and speculative decode emitted
+        // divergent tokens (lossy spec-off != gamma, tool-call args/order).
+        return argmax_first_wins_f32(&raw_logits);
     }
     let temperature = params.temperature;
 
@@ -205,12 +211,13 @@ pub fn sample_with_params_seeded(
     probs.last().map_or(0, |p| p.0)
 }
 
-/// Greedy pick with `max_by(partial_cmp.unwrap_or(Equal))` semantics — the
-/// tie-break this path has ALWAYS had, which is LAST-index-wins (Rust's
-/// `max_by` returns the last of several equal maxima). This is the OPPOSITE of
-/// the verify path's first-index-wins `argmax_first_wins`, so that function
-/// must NOT be ported here: quantized logits produce exact ties, and flipping
-/// the tie-break would change emitted tokens.
+/// Greedy pick with `max_by(partial_cmp.unwrap_or(Equal))` semantics —
+/// LAST-index-wins (Rust's `max_by` returns the last of several equal
+/// maxima). Retained for reference/tests only: the production greedy bypass
+/// now uses `argmax_first_wins` (2026-10-11) because BF16 logits tie exactly
+/// and every other pick site — the GPU argmax kernel, the CPU verify argmax
+/// and all fast-path picks — resolves to the lowest index. The mismatch made
+/// spec decode emit divergent tokens at exact ties (lossy spec-off != gamma).
 ///
 /// NaN is the reason for the guarded structure. `partial_cmp` with a NaN
 /// returns `None`, mapped to `Equal` — and under `max_by`'s last-wins rule an
@@ -298,6 +305,75 @@ mod greedy_tests {
         agree(&[f32::NAN, 1.0, 2.0]);
         agree(&[1.0, 2.0, f32::NAN]);
         agree(&[f32::NAN]);
+    }
+
+    fn params_temp0() -> super::SamplingParams {
+        super::SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            top_n_sigma: 0.0,
+            min_p: 0.0,
+            logit_bias: Vec::new(),
+            repetition_penalty: 1.0,
+            repetition_penalty_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            lz_penalty: 0.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 0,
+            dry_sequence_breakers: Vec::new(),
+            max_tokens: 16,
+            stop_token_ids: Vec::new(),
+            seed: Some(0),
+        }
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn greedy_pick_is_first_index_wins_on_ties() {
+        // Production contract (2026-10-11): the CPU greedy bypass must return
+        // the LOWEST tied index — identical to the GPU argmax kernel, the CPU
+        // verify argmax and torch.argmax/vLLM greedy. BF16 logits tie exactly
+        // and the old last-wins rule made serial decode diverge from verify.
+        let v = [1.0f32, 5.0, 5.0, 5.0, 2.0];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v), &params_temp0(), &[]),
+            1
+        );
+        // Tie straddling the 8-lane boundary.
+        let v2 = [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 9.0];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v2), &params_temp0(), &[]),
+            7
+        );
+        // argmax_first_wins_f32 directly.
+        assert_eq!(super::argmax_first_wins_f32(&v), 1);
+    }
+
+    #[test]
+    fn greedy_pick_nan_is_deterministic() {
+        // first-wins: NaN never wins — a NaN AFTER the max must not displace
+        // it; all-NaN deterministically falls back to index 0.
+        let v = [1.0f32, 5.0, 5.0, f32::NAN];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v), &params_temp0(), &[]),
+            1
+        );
+        let v_nan = [f32::NAN, 2.0, 1.0];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v_nan), &params_temp0(), &[]),
+            1
+        );
+        let v_all_nan = [f32::NAN; 4];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v_all_nan), &params_temp0(), &[]),
+            0
+        );
     }
 
     #[test]

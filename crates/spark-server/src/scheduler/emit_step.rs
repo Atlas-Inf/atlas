@@ -393,44 +393,59 @@ pub fn emit_token(
         }
     }
 
-    // EOS handling: grammar-based, legacy, or min_tokens suppression.
-    // Fix A (2026-06-05, kill-switch): in tool_choice="auto" the grammar's
-    // is_terminated() never becomes true after a tool call, so EOS is suppressed
-    // forever — trapping the model into a hallucinated-transcript runaway. When
-    // enabled and a tool call has completed (and we're not inside a tool body /
-    // thinking), lift the grammar suppression so the model's natural EOS ends the
-    // turn. Inert unless ATLAS_TOOL_EOS_ESCAPE=1.
-    let eos_escape = tool_eos_escape_enabled()
-        && a.tool_call_completed
-        && !a.inside_tool_body
-        && !a.inside_thinking;
-    // #192: STOP-LEGALITY based grammar suppression — see the twin gate in
-    // `decode_logits_step::process_decode_logits`. `!is_terminated()` alone
-    // suppressed EOS forever on auto-mode turns with no completed call
-    // (armed-but-unused tools → finish="length"). Evaluated only when the
-    // token IS an EOS token (`grammar_blocks_stop` fills a bitmask).
-    //
-    // `inside_thinking` term: the matcher is PAUSED during `<think>` (tokens
-    // are neither masked nor accepted), so stop-legality is undefined there.
-    // Preserve the historical emit-path behavior — a spurious EOS inside a
-    // thinking span on a grammar-armed turn is discarded, `</think>` is the
-    // only legal exit (the non-MTP path does this via its explicit
-    // `thinking_suppresses_eos` term, which emit_token never had).
-    let grammar_suppresses_eos = a.eos_tokens.contains(&tok)
-        && !eos_escape
-        && ((a.inside_thinking && a.grammar_state.is_some())
-            || crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens));
-    let legacy_suppresses_eos = a.require_tool_call;
-    let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-    let suppress_eos = grammar_suppresses_eos || legacy_suppresses_eos || min_tokens_suppresses;
+    // EOS handling: identical suppressor set as the serial path — the
+    // shared policy module is the SSOT (verify used to lack the
+    // thinking/post-think terms; that mismatch was the
+    // live_irrelevance_25-2-13 residual).
+    let eos_inputs = eos_policy::EosInputs {
+        is_eos: a.eos_tokens.contains(&tok),
+        grammar_blocks_stop: false, // lazy, set below
+        require_tool_call: a.require_tool_call,
+        tool_request: a.tool_request,
+        min_tokens: a.min_tokens,
+        // `output_tokens` already holds `tok` (pushed above) — subtract one
+        // so the derived counts match the serial pre-push decision point.
+        output_len_before: a.output_tokens.len().saturating_sub(1),
+        thinking_tokens: a.thinking_tokens,
+        inside_thinking: a.inside_thinking,
+        think_ended: a.think_ended,
+        tool_call_completed: a.tool_call_completed,
+        inside_tool_body: a.inside_tool_body,
+        remaining: a.remaining,
+        seq_len: a.seq.seq_len,
+        max_seq_len: sched.limits.max_seq_len,
+    };
+    let gbs = eos_inputs.is_eos
+        && !eos_policy::eos_escape(&eos_inputs)
+        && crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens);
+    let eos_inputs = eos_policy::EosInputs {
+        grammar_blocks_stop: gbs,
+        ..eos_inputs
+    };
+    let decision = eos_policy::evaluate(&eos_inputs);
+    let suppress_eos = decision.suppress();
 
     if a.eos_tokens.contains(&tok) && !suppress_eos {
         a.finished = true;
         return;
     }
     if a.eos_tokens.contains(&tok) && suppress_eos {
-        // EOS suppressed: grammar not terminated, legacy tool call not yet seen,
-        // or min_tokens not reached. Don't stop — let the model continue generating.
+        // EOS suppressed: don't stop — let the model continue generating.
+        // Match the serial path exactly: the suppressed EOS is not counted
+        // in output_tokens (it was pushed above — pop it) and does not
+        // advance the post-think/thinking counters; the model-side context
+        // still contains it, identical to serial.
+        if a.output_tokens.last() == Some(&tok) {
+            a.output_tokens.pop();
+        }
+        if a.think_ended && !a.inside_thinking {
+            a.post_think_emitted = a.post_think_emitted.saturating_sub(1);
+        }
+        if a.inside_thinking {
+            a.thinking_tokens = a.thinking_tokens.saturating_sub(1);
+        }
+        // Serial-side effect: implicit think close (honor_eos_inside_thinking).
+        eos_policy::apply_implicit_think_close(a, sched, &decision);
         return;
     }
     // OPENCODE FIX: see process_decode_logits — same gate. Suppress streaming

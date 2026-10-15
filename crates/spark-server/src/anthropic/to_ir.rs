@@ -242,6 +242,7 @@ impl From<MessagesRequest> for ir::ChatRequest {
             reasoning_effort: None,
             // The Anthropic Messages surface has no chat_template_kwargs
             // channel; the MODEL.toml override / template default applies.
+            force_nonempty_content: false,
             preserve_thinking: None,
             repetition_detection: None,
             adapter: None,

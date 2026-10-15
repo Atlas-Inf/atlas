@@ -80,10 +80,28 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(DevicePtr(dptr))
     }
 
+    fn register_slab(&self, base: DevicePtr, bytes: usize) {
+        self.slab_regions.lock().push((base.0, bytes as u64));
+    }
+
+    fn is_slab_interior(&self, ptr: DevicePtr) -> bool {
+        AtlasCudaBackend::is_slab_interior(self, ptr.0)
+    }
+
     fn free(&self, ptr: DevicePtr) -> Result<()> {
         if ptr.is_null() {
             return Ok(());
         }
+        // Slab interior: the packing loader carved this pointer out of one
+        // shard-level cuMemAlloc, so there is nothing to free here. The slab
+        // base is in the ledger and is reclaimed by teardown/sweep.
+        if self.is_slab_interior(ptr.0) {
+            return Ok(());
+        }
+        // A real free: if this pointer is a slab base, its region must go —
+        // otherwise a later cuMemAlloc inside the stale extent would see its
+        // frees silently no-oped.
+        self.drop_slab_region(ptr.0);
         // Off the ledger BEFORE the free: an entry that survives a successful
         // free would be double-freed at teardown. On a real failure, restore
         // ownership to the backend ledger so `sweep_unreleased` is the final

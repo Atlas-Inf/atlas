@@ -49,6 +49,11 @@ pub struct ChatRequest {
     /// unset the variable is left undefined so the model template's own
     /// default rules (see `tokenizer/chat_impl.rs`).
     pub preserve_thinking: Option<bool>,
+    /// `chat_template_kwargs.force_nonempty_content` (vLLM deepseek_r1):
+    /// when the model's output is entirely reasoning (unclosed think
+    /// block), return the reasoning text as `content` so the response
+    /// body is never empty. Default false.
+    pub force_nonempty_content: bool,
     /// Per-request token-loop detector override.
     pub repetition_detection: Option<crate::api::inference_types::RepetitionDetectionParams>,
     /// M2 per-request LoRA routing: optional resident adapter NAME for

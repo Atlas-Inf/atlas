@@ -141,6 +141,10 @@ pub struct AtlasCudaBackend {
     /// `cuMemAlloc_v2` directly rather than through this allocator, so freeing
     /// the ledger cannot invalidate a static that outlives the model.
     live_allocs: parking_lot::Mutex<std::collections::HashSet<u64>>,
+    /// Slab base/extent pairs registered by pack-mode weight loaders.
+    /// Interior `DevicePtr`s passed to `free()` must become no-ops: they
+    /// are not cuMemAlloc'd, so freeing one would be CUDA_ERROR_INVALID_VALUE.
+    slab_regions: parking_lot::Mutex<Vec<(u64, u64)>>,
     /// Default CUDA stream handle (from the process CUDA host).
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
@@ -177,6 +181,7 @@ impl AtlasCudaBackend {
 
         Ok(Self {
             live_allocs: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            slab_regions: parking_lot::Mutex::new(Vec::new()),
             registry,
             debug_sync_kernels: std::env::var("ATLAS_DEBUG_SYNC_KERNELS").as_deref() == Ok("1"),
             op_cache: crate::op_cache::OpCache::new(),
@@ -187,6 +192,23 @@ impl AtlasCudaBackend {
 
     /// This model's kernel modules, for the paths that need the registry
     /// directly rather than through `GpuBackend`.
+    /// True when `ptr` lies strictly inside a registered slab — carved
+    /// interior pointers own no storage and must never reach cuMemFree.
+    pub(crate) fn is_slab_interior(&self, ptr: u64) -> bool {
+        self.slab_regions
+            .lock()
+            .iter()
+            .any(|&(base, len)| ptr > base && ptr < base + len)
+    }
+
+    /// Drop the slab whose BASE is `ptr` (called on a real free of the base).
+    /// Without this the region stays registered after the base is freed, a
+    /// later cuMemAlloc can land inside it, and that fresh allocation's
+    /// `free()` would silently no-op — a leak with no diagnostic.
+    pub(crate) fn drop_slab_region(&self, base: u64) {
+        drop_slab_region(&mut self.slab_regions.lock(), base);
+    }
+
     pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr) {
         self.live_allocs.lock().insert(ptr.0);
     }
@@ -209,6 +231,9 @@ impl AtlasCudaBackend {
     /// removed from the ledger by `forget_alloc`, so it cannot double-free.
     pub fn sweep_unreleased(&self) -> usize {
         let outstanding: Vec<u64> = self.live_allocs.lock().drain().collect();
+        // All regions die with the sweep — every outstanding base is being
+        // freed below, and keeping extents would mis-silence future frees.
+        self.slab_regions.lock().clear();
         let count = outstanding.len();
         for raw in outstanding {
             // Bypass `free`: the ledger is already drained, and a failure here
@@ -367,3 +392,26 @@ pub fn spawn_oom_watchdog(
 
 #[cfg(test)]
 mod tests;
+
+/// Remove the region whose base is `base`, if any. Pure helper for
+/// `AtlasCudaBackend::drop_slab_region` — kept free-standing so the
+/// bookkeeping is testable without a CUDA context.
+fn drop_slab_region(regions: &mut Vec<(u64, u64)>, base: u64) {
+    regions.retain(|&(b, _)| b != base);
+}
+
+#[cfg(test)]
+mod slab_tests {
+    #[test]
+    fn slab_regions_prune_on_base_free() {
+        let mut r = vec![(0x1000u64, 8192), (0xA000u64, 4096)];
+        super::drop_slab_region(&mut r, 0x1000);
+        assert_eq!(r, vec![(0xA000, 4096)]);
+        // interior pointer of the freed region no longer matches
+        let interior = |p: u64, rs: &[(u64, u64)]| rs.iter().any(|&(b, len)| p > b && p < b + len);
+        assert!(!interior(0x1800, &r));
+        assert!(interior(0xA800, &r));
+        super::drop_slab_region(&mut r, 0xDEAD); // no-op on unknown base
+        assert_eq!(r, vec![(0xA000, 4096)]);
+    }
+}

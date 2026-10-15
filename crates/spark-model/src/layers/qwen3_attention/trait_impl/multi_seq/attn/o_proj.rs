@@ -90,6 +90,31 @@ impl Qwen3AttentionLayer {
                     nq, // gate rows are nq BF16 elements apart
                     stream,
                 )?;
+            } else if n > 8
+                && fwd.levers.mamba_verify_exact
+                && self.dense_gemv_batchm_k.0 != 0
+                && super::super::qkv::bf16_batchm_enabled()
+            {
+                // Exact-verify (γ=8 → n=9 exceeds MAX_M=8): chunked batchm —
+                // the twin reproduces serial GEMV per row, so chunking at 8
+                // is byte-identical.
+                let mut c0 = 0usize;
+                while c0 < n {
+                    let m = (n - c0).min(8);
+                    ops::dense_gemv_batchm(
+                        fwd.gpu,
+                        self.dense_gemv_batchm_k,
+                        normed.offset(c0 * h * bf16),
+                        g_proj,
+                        gate_buf.offset(c0 * (nq as usize) * bf16),
+                        m as u32,
+                        nq,
+                        h as u32,
+                        nq,
+                        stream,
+                    )?;
+                    c0 += m;
+                }
             } else {
                 ops::dense_gemm_tc(
                     fwd.gpu,
@@ -164,6 +189,30 @@ impl Qwen3AttentionLayer {
                     h as u32, // o_out rows are h BF16 elements apart
                     stream,
                 )?;
+            } else if n > 8
+                && fwd.levers.mamba_verify_exact
+                && self.dense_gemv_batchm_k.0 != 0
+                && super::super::qkv::bf16_batchm_enabled()
+            {
+                // Exact-verify: chunked batchm (byte-identical to serial GEMV
+                // per row) instead of the scalar dense_gemm tile path.
+                let mut c0 = 0usize;
+                while c0 < n {
+                    let m = (n - c0).min(8);
+                    ops::dense_gemv_batchm(
+                        fwd.gpu,
+                        self.dense_gemv_batchm_k,
+                        attn_out.offset(c0 * nq as usize * hd as usize * bf16),
+                        o_bf16,
+                        o_out.offset(c0 * h * bf16),
+                        m as u32,
+                        h as u32,
+                        nq * hd,
+                        h as u32,
+                        stream,
+                    )?;
+                    c0 += m;
+                }
             } else {
                 ops::dense_gemm(
                     fwd.gpu,

@@ -141,7 +141,7 @@ pub fn verify_pick_with_pipeline(
         crate::scheduler::sample_step::PositionKind::Verify,
         0.0,
         None,
-        Vec::new(),
+        a.logit_bias.clone(),
     );
 
     // 3. Unified per-position post-processing (SSOT shared with the non-MTP
@@ -313,20 +313,16 @@ pub fn verify_pick_all_with_pipeline(
     // fire, so every position routes through the slow pipeline below where
     // the temp>0 sampling branch (step 4a in `verify_pick_with_pipeline`)
     // draws from the processed logits. Confirmed and kept as-is.
+    // #241: the gate must be classified per ROW, not once at block start —
+    // `strip_in_tool_opener_bias` makes the bias stateful across a mid-block
+    // `</tool_call>`/`>`. `fast_gate_over_rows` simulates the flag over the
+    // argmax picks and returns the worst gate seen.
     let fast_penalty_gate = if ctx.sampling.fast_greedy_grammar
         && a.grammar_state.is_some()
         && !a.inside_thinking
         && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
     {
-        crate::scheduler::fast_greedy::classify_penalties(
-            &crate::scheduler::sample_step::penalty_params_for(
-                a,
-                crate::scheduler::sample_step::PositionKind::Verify,
-                0.0,
-                None,
-                Vec::new(),
-            ),
-        )
+        crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids)
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };
@@ -434,15 +430,7 @@ pub fn verify_pick_all_with_pipeline(
         && !a.inside_thinking
         && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
     {
-        crate::scheduler::fast_greedy::classify_penalties(
-            &crate::scheduler::sample_step::penalty_params_for(
-                a,
-                crate::scheduler::sample_step::PositionKind::Verify,
-                0.0,
-                None,
-                Vec::new(),
-            ),
-        )
+        crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids)
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };
@@ -508,6 +496,12 @@ pub fn verify_pick_all_with_pipeline(
     // over-rewind. `emit_token` (run after this helper) re-advances from the
     // restored, clean state.
     let grammar_steps_before = a.grammar_state.as_ref().map(|gs| gs.num_history_steps());
+    // Speculative `inside_tool_body` mirroring: `penalty_params_for` strips
+    // the positive `<tool_call>` opener nudge while inside a tool body, so
+    // row i must see the flag serial decode would hold after emitting rows
+    // 0..i-1. Restored on exit; `emit_token` re-advances the accepted rows
+    // for real via `update_tool_param_state`.
+    let in_tool_before = a.inside_tool_body;
 
     for i in 0..k {
         let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
@@ -515,6 +509,17 @@ pub fn verify_pick_all_with_pipeline(
         // the per-position seed offset of the temp>0 sampling branch.
         let pick = verify_pick_with_pipeline(slice, false, vocab, a, ctx, i);
         picks.push(pick);
+
+        // Mirror `update_tool_param_state`'s opener/closer transitions for
+        // the NEXT row's bias computation (skipped inside thinking, exactly
+        // like the emit path).
+        a.inside_tool_body = crate::scheduler::sample_step::advance_in_tool_flag(
+            a.inside_thinking,
+            a.inside_tool_body,
+            pick,
+            a.tool_call_start_token,
+            a.tool_call_end_token,
+        );
 
         // Speculatively advance the matcher with `pick[i]` so the next
         // position's bitmask reflects post-emit state. Skip on the last
@@ -558,5 +563,6 @@ pub fn verify_pick_all_with_pipeline(
         }
     }
 
+    a.inside_tool_body = in_tool_before;
     picks
 }

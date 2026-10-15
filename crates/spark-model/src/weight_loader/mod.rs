@@ -55,7 +55,7 @@ use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
-use crate::layers::VisionEncoder;
+use crate::layers::VisionTower;
 use crate::weight_map::{DenseWeight, MtpWeights, Nvfp4Variant, detect_nvfp4_variant};
 
 /// Can this box hold the transposed `[K/2, N]` MoE prefill copies for EVERY
@@ -214,6 +214,21 @@ pub trait ModelWeightLoader {
         layer_kv_dtypes: &[KvCacheDtype],
     ) -> Result<Vec<Box<dyn TransformerLayer>>>;
 
+    /// Whole tensor namespaces this loader never reads — skipped at upload
+    /// so they don't hold GPU memory as dead weight. Default empty: loaders
+    /// that consume the full checkpoint.
+    fn dead_namespaces(&self, _config: &ModelConfig) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Whether the fast weight loader may pack this model's shards into one
+    /// slab allocation per shard (`FastSafetensorsLoader::pack_slab`). The
+    /// opt-in requires the load path to never `gpu.free` a store-owned
+    /// tensor pointer; single-GPU only (TP/EP paths are not audited).
+    fn slab_pack_weights(&self, _config: &ModelConfig) -> bool {
+        false
+    }
+
     /// Per-(layer, role) weight precision schedule (C.3, 2026-04-25).
     /// Default impl returns the empty schedule (every lookup yields
     /// `Dtype::Inherit`), preserving the existing per-checkpoint
@@ -354,7 +369,7 @@ pub trait ModelWeightLoader {
         _store: &WeightStore,
         _config: &ModelConfig,
         _gpu: &dyn GpuBackend,
-    ) -> Result<Option<VisionEncoder>> {
+    ) -> Result<Option<VisionTower>> {
         Ok(None)
     }
 }

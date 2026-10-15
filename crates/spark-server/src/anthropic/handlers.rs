@@ -170,13 +170,23 @@ pub async fn count_tokens(
     // and must not hold an async worker. `ir_req` is not read after this point,
     // so it is simply moved in rather than handed back.
     let state_for_prepare = state.clone();
+    // Counts captured before `ir_req` moves into the closure so the
+    // failure path below can still say what shape was rejected.
+    let req_msg_count = ir_req.messages.len();
     let prepared = match tokio::task::spawn_blocking(move || {
         crate::api::chat::prepare::prepare_chat_prompt(&state_for_prepare, &mut ir_req)
     })
     .await
     {
         Ok(Ok(p)) => p,
-        Ok(Err(resp)) => return openai_error_to_anthropic(resp).await,
+        Ok(Err(resp)) => {
+            // Same contract as the OpenAI path: a prepare failure must log.
+            tracing::warn!(
+                "count_tokens prepare rejected: status={} messages={req_msg_count}",
+                resp.status(),
+            );
+            return openai_error_to_anthropic(resp).await;
+        }
         Err(join_err) => {
             tracing::error!("count_tokens prepare panicked: {join_err}");
             return anthropic_error(

@@ -36,12 +36,13 @@
 //! removes non-argmax candidates, so masked-greedy == `argmax_ids[i]` by
 //! definition and the call does no D2H at all.
 //!
-//! State-staleness parity: the slow path evaluates `a.*` flags and
+//! State-staleness parity: the slow path keeps `a.*` flags and
 //! `a.output_tokens` FIXED across the K loop (they only advance in
-//! `emit_token`, after the helper), and the gates here read exactly that
-//! same fixed state — eligibility is uniform across positions and the
-//! equivalence is per-call exact. Any ineligible position falls through
-//! to the unmodified slow path for the whole call.
+//! `emit_token`, after the helper) EXCEPT `inside_tool_body`, which it
+//! mirrors per row. The penalty gate here therefore simulates that same
+//! flag advance over the argmax picks (`fast_gate_over_rows`) and takes
+//! the worst gate — any row whose state turns Blocked sends the whole
+//! call to the unmodified slow path, so the equivalence stays exact.
 //! Kill-switch: `ATLAS_DISABLE_FAST_MASKED=1`.
 
 use crate::scheduler::ActiveSeq;
@@ -63,7 +64,7 @@ pub(super) fn masked_verify_required(configured: bool, lightning_product: bool) 
 pub(super) fn try_chat_fast_path(
     model: &dyn Model,
     argmax_ids: &[u32],
-    a: &ActiveSeq,
+    a: &mut ActiveSeq,
     ctx: &LogitsContext,
     row_base: usize,
     masked_verify: bool,
@@ -101,17 +102,11 @@ pub(super) fn try_chat_fast_path(
     let think_end_inject_armed = a.inside_thinking && (a.force_end_thinking || defer_hard_override);
     let pin_tool_armed =
         a.think_just_ended && a.require_tool_call && !a.tool_call_opened && !a.inside_thinking;
-    // (c) penalty gate — same construction the slow path uses per
-    // position (penalty_params_for is position-independent here).
-    let penalty_gate = crate::scheduler::fast_greedy::classify_penalties(
-        &crate::scheduler::sample_step::penalty_params_for(
-            a,
-            crate::scheduler::sample_step::PositionKind::Verify,
-            0.0,
-            None,
-            Vec::new(),
-        ),
-    );
+    // (c) penalty gate — per ROW, not once at block start: the slow path
+    // mirrors `inside_tool_body` across the K loop, so a mid-block
+    // `</tool_call>`/`>` changes the bias landscape for later rows
+    // (`fast_gate_over_rows` simulates the flag and returns the worst gate).
+    let penalty_gate = crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids);
     if f2_active
         || think_end_inject_armed
         || pin_tool_armed

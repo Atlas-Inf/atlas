@@ -9,11 +9,13 @@
 use anyhow::{Context, Result};
 
 use super::{
-    LayerType, ModelConfig, default_conv_kernel, default_partial_rotary, default_rms_eps,
-    default_rope_theta, finalize_config, parse_deepseek_v4, parse_gemma4_params, parse_laguna,
-    parse_longcat_ngram, parse_minimax_m2, parse_mistral_params, parse_quantization_config,
-    parse_qwen4_exp, parse_step3p7, parse_vision_config, validate_config,
+    LayerType, ModelConfig, default_partial_rotary, default_rope_theta, finalize_config,
+    parse_deepseek_v4, parse_gemma4_params, parse_laguna, parse_longcat_ngram, parse_minimax_m2,
+    parse_mistral_params, parse_quantization_config, parse_qwen4_exp, parse_step3p7,
+    parse_vision_config, validate_config,
 };
+
+use super::dispatch_nemotron;
 
 fn required_u64(raw: &serde_json::Value, key: &str, model_type: &str) -> Result<u64> {
     let value = raw
@@ -184,92 +186,9 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             Ok(config)
         }
         "nemotron_h" | "nemotron_h_puzzle" => {
-            // Puzzle: num_hidden_layers is JSON null and the hybrid schedule lives
-            // in layers_block_type / block_configs (per-block MoE channel pruning).
-            // Rewrite the JSON so serde can deserialize, then map to Atlas fields.
-            let mut raw_mut = raw.clone();
-            if top_model_type == "nemotron_h_puzzle" {
-                apply_nemotron_puzzle_json(&mut raw_mut)?;
-            }
-            let mut config: ModelConfig = serde_json::from_value(raw_mut.clone())
-                .context("Failed to parse nemotron_h config.json")?;
-            // Map Nemotron-H field names → Atlas canonical names
-            if config.num_experts == 0 && config.n_routed_experts > 0 {
-                config.num_experts = config.n_routed_experts;
-            }
-            if config.rms_norm_eps == default_rms_eps() && config.norm_eps > 0.0 {
-                config.rms_norm_eps = config.norm_eps;
-            }
-            if config.linear_conv_kernel_dim == default_conv_kernel() && config.conv_kernel > 0 {
-                config.linear_conv_kernel_dim = config.conv_kernel;
-            }
-            if config.shared_expert_intermediate_size == 0
-                && config.moe_shared_expert_intermediate_size > 0
-            {
-                config.shared_expert_intermediate_size = config.moe_shared_expert_intermediate_size;
-            }
-            // Architecture flags
-            config.attn_gated = false;
-            config.weight_prefix = "backbone".to_string();
-            // A config shipping BOTH fields with DIFFERENT schedule lengths
-            // is contradictory: fail closed here rather than letting one
-            // silently win the precedence and the other be ignored.
-            if !config.hybrid_override_pattern.is_empty()
-                && let Some(block_types) = raw.get("layers_block_type").and_then(|v| v.as_array())
-                && block_types.len() != config.hybrid_override_pattern.chars().count()
-            {
-                anyhow::bail!(
-                    "nemotron_h config has contradictory schedules: \
-                     hybrid_override_pattern has {} layers but layers_block_type has {}",
-                    config.hybrid_override_pattern.chars().count(),
-                    block_types.len()
-                );
-            }
-            // Parse hybrid_override_pattern → layer_types (Nano / Super)
-            if !config.hybrid_override_pattern.is_empty() && config.layer_types.is_empty() {
-                config.layer_types = config
-                    .hybrid_override_pattern
-                    .chars()
-                    .map(|c| match c {
-                        'M' => LayerType::LinearAttention,
-                        'E' => LayerType::Moe,
-                        '*' => LayerType::FullAttention,
-                        other => panic!("Unknown hybrid_override_pattern char: '{other}'"),
-                    })
-                    .collect();
-            }
-            // Nemotron-H variants without the pattern (e.g. Nemotron 3.5
-            // Lightning's public config) ship the hybrid schedule as
-            // `layers_block_type`. Without this, layer_types stays empty and
-            // the model silently degrades to all-attention with RoPE —
-            // coherent-looking garbage (observed 2026-08-17: 52 attention /
-            // 0 SSM layers, degenerate repeated-token output at 602 tok/s).
-            //
-            if config.layer_types.is_empty()
-                && let Some(block_types) = raw.get("layers_block_type").and_then(|v| v.as_array())
-            {
-                config.layer_types = block_types
-                    .iter()
-                    .map(|v| {
-                        let s = v.as_str().unwrap_or("");
-                        Ok(match s {
-                            "mamba" => LayerType::LinearAttention,
-                            "moe" => LayerType::Moe,
-                            "attention" => LayerType::FullAttention,
-                            other => {
-                                anyhow::bail!("unknown layers_block_type entry: '{other}'")
-                            }
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-            }
-            // Puzzle: layers_block_type + block_configs → layer_types + per-layer MoE dims
-            if top_model_type == "nemotron_h_puzzle" {
-                apply_nemotron_puzzle_config(&mut config, &raw_mut)?;
-            }
-            finalize_config(&mut config, &raw_mut)?;
-            Ok(config)
+            dispatch_nemotron::parse_nemotron_h(&raw, top_model_type)
         }
+        "nemotron_h_omni" => dispatch_nemotron::parse_nemotron_h_omni(&raw),
         "gemma4" => parse_gemma4_params(&raw),
         "laguna" => parse_laguna(&raw),
         "longcat_flash_ngram" | "longcat_flash" => parse_longcat_ngram(&raw),
@@ -342,128 +261,4 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             Ok(config)
         }
     }
-}
-
-/// Rewrite Puzzle HF JSON so serde can load it as `ModelConfig`.
-///
-/// - `num_hidden_layers` is JSON null → derive from `layers_block_type` length
-/// - scalar `moe_intermediate_size` / `num_experts_per_tok` may be absent → fill
-///   with max-over-blocks so uniform Super-style code paths still have defaults
-fn apply_nemotron_puzzle_json(raw: &mut serde_json::Value) -> Result<()> {
-    let obj = raw
-        .as_object_mut()
-        .context("nemotron_h_puzzle config.json is not an object")?;
-    let n_layers = obj
-        .get("layers_block_type")
-        .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .or_else(|| {
-            obj.get("block_configs")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-        })
-        .context("nemotron_h_puzzle missing layers_block_type / block_configs")?;
-    if obj
-        .get("num_hidden_layers")
-        .map(|v| v.is_null() || v.as_u64() == Some(0))
-        .unwrap_or(true)
-    {
-        obj.insert("num_hidden_layers".into(), serde_json::json!(n_layers));
-    }
-    // Collect max MoE dims from block_configs for scalar fallbacks
-    let mut max_inter = 0usize;
-    let mut max_topk = 0usize;
-    if let Some(blocks) = obj.get("block_configs").and_then(|v| v.as_array()) {
-        for b in blocks {
-            if let Some(mi) = b.get("moe_intermediate_size").and_then(|v| v.as_u64()) {
-                max_inter = max_inter.max(mi as usize);
-            }
-            if let Some(tk) = b.get("num_experts_per_tok").and_then(|v| v.as_u64()) {
-                max_topk = max_topk.max(tk as usize);
-            }
-        }
-    }
-    if obj
-        .get("moe_intermediate_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        == 0
-        && max_inter > 0
-    {
-        obj.insert("moe_intermediate_size".into(), serde_json::json!(max_inter));
-    }
-    if obj
-        .get("num_experts_per_tok")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        == 0
-        && max_topk > 0
-    {
-        obj.insert("num_experts_per_tok".into(), serde_json::json!(max_topk));
-    }
-    Ok(())
-}
-
-/// Map Puzzle `layers_block_type` / `block_configs` onto Atlas layer schedule.
-fn apply_nemotron_puzzle_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
-    let block_types = raw
-        .get("layers_block_type")
-        .and_then(|v| v.as_array())
-        .context("nemotron_h_puzzle missing layers_block_type")?;
-    config.layer_types = block_types
-        .iter()
-        .map(|v| {
-            let s = v.as_str().unwrap_or("");
-            Ok(match s {
-                "mamba" => LayerType::LinearAttention,
-                "moe" => LayerType::Moe,
-                "attention" => LayerType::FullAttention,
-                other => anyhow::bail!("unknown layers_block_type entry: '{other}'"),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if config.num_hidden_layers == 0 {
-        config.num_hidden_layers = config.layer_types.len();
-    }
-    // Per-layer MoE schedule from block_configs
-    let n = config.num_hidden_layers;
-    let mut inters = vec![0usize; n];
-    let mut topks = vec![0usize; n];
-    if let Some(blocks) = raw.get("block_configs").and_then(|v| v.as_array()) {
-        for (i, b) in blocks.iter().enumerate().take(n) {
-            if b.get("block_type").and_then(|v| v.as_str()) != Some("moe") {
-                continue;
-            }
-            inters[i] = b
-                .get("moe_intermediate_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-            topks[i] = b
-                .get("num_experts_per_tok")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-        }
-    }
-    config.moe_intermediate_sizes = inters;
-    config.num_experts_per_toks = topks;
-    // Keep scalar fields as max for buffer defaults / logging
-    if let Some(m) = config
-        .moe_intermediate_sizes
-        .iter()
-        .copied()
-        .filter(|&s| s > 0)
-        .max()
-    {
-        config.moe_intermediate_size = m;
-    }
-    if let Some(m) = config
-        .num_experts_per_toks
-        .iter()
-        .copied()
-        .filter(|&k| k > 0)
-        .max()
-    {
-        config.num_experts_per_tok = m;
-    }
-    Ok(())
 }

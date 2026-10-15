@@ -78,6 +78,15 @@ pub(crate) fn load_weight_store(
         vec![".ple.ple_embedding.ngram_embedding.shard_".to_string()]
     }
 
+    // Loader-owned load policies (dead-weight namespaces, slab packing) —
+    // the loader that knows which tensors it reads is the SSOT for both.
+    let weight_policy =
+        spark_model::factory::loader_for_config(config).context("weight-load policy lookup")?;
+    let dead_ns = weight_policy.dead_namespaces(config);
+    let slab_pack = weight_policy.slab_pack_weights(config)
+        && config.tp_world_size <= 1
+        && config.ep_world_size <= 1;
+
     let use_fast_load =
         !args.no_fast_load && std::env::var("ATLAS_FAST_LOAD").ok().as_deref() != Some("0");
     let store = if use_fast_load {
@@ -103,6 +112,17 @@ pub(crate) fn load_weight_store(
             }
             loader.skip_activation_scales = skip_activation_scales(config);
             loader.skip_mtp = skip_mtp(config, args);
+            loader.skip_prefixes = dead_ns.clone();
+            loader.pack_slab = slab_pack;
+            if slab_pack {
+                tracing::info!("Slab-packed weight upload enabled (one allocation per shard)");
+            }
+            if !loader.skip_prefixes.is_empty() {
+                tracing::info!(
+                    "Skipping dead namespaces at load (loader never reads them): {:?}",
+                    loader.skip_prefixes
+                );
+            }
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
@@ -124,9 +144,14 @@ pub(crate) fn load_weight_store(
         } else {
             spark_runtime::weights::SafetensorsLoader::new()
         };
+        loader.pack_slab = slab_pack;
+        if slab_pack {
+            tracing::info!("Slab-packed weight upload enabled (one allocation per shard)");
+        }
         loader.peak_memory_multiplier = mult;
         loader.skip_activation_scales = skip_activation_scales(config);
         loader.skip_mtp = skip_mtp(config, args);
+        loader.skip_prefixes = dead_ns;
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?

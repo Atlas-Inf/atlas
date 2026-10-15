@@ -84,6 +84,7 @@ pub fn step_verify_dflash(
         sched.levers.dflash_masked_verify,
         model.is_lightning_dspark_product(),
         a,
+        &verified_argmax,
     ) {
         verified_argmax
     } else {

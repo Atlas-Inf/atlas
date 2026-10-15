@@ -63,6 +63,7 @@ impl Target {
             .as_deref()
             .into_iter()
             .chain(std::iter::once(self.model_kernel_dir.as_path()))
+            .chain(self.local_kernel_dir.as_deref())
             .collect()
     }
 }
@@ -82,6 +83,9 @@ struct Target {
     /// common and the model dir for sources and KERNEL.toml alike, so the
     /// base quant's own build stays free of the overlay's kernels.
     base_kernel_dir: Option<PathBuf>,
+    /// Target-local `<model>/<quant>/` dir present alongside a
+    /// `kernel_source` redirect — the last overlay layer.
+    local_kernel_dir: Option<PathBuf>,
     extra_flags: Vec<String>,
     module_overrides: HashMap<String, String>,
     /// `(module, kernel)` pairs declared in `[shadow_exempt]` — kernels this
@@ -1096,6 +1100,14 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
         // comes from THIS target's own directory; only the quant kernel
         // dirs are redirected. Chains are refused — a source must own its
         // sources.
+        //
+        // TARGET-LOCAL OVERLAY: if the redirecting target ALSO ships its
+        // own `<model>/<quant>/` dir it compiles too, AFTER the source
+        // dir — precedence target-local > kernel_source > common by stem
+        // (same shadowing machinery/audit as base_quant). The overlay
+        // holds only what the source lacks (e.g. a vision tower one
+        // sibling owns); a same-stem file shadows the source's copy and
+        // is reported the same way.
         let kernel_src_dir = match parse_kernel_source(&model_dir) {
             Some(src) => {
                 let src_dir = hw_dir.join(&src);
@@ -1125,6 +1137,12 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
 
         for quant in &quants {
             let model_kernel_dir = kernel_src_dir.join(quant);
+            // Target-local overlay dir (only meaningful when kernel_source
+            // redirected; for a normal target it IS model_kernel_dir).
+            let local_kernel_dir = {
+                let d = model_dir.join(quant);
+                (kernel_src_dir != model_dir && d.is_dir()).then_some(d)
+            };
             // Shared kernels live in `kernels/<hw>/common/` and apply to
             // every (model, quant) target on this hardware. Most kernels
             // here are dtype-agnostic (BF16 norms/embeds/attn) — the dir
@@ -1183,9 +1201,13 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                     );
                     dir
                 });
-            for dir in [base_kernel_dir.as_ref(), Some(&model_kernel_dir)]
-                .into_iter()
-                .flatten()
+            for dir in [
+                base_kernel_dir.as_ref(),
+                Some(&model_kernel_dir),
+                local_kernel_dir.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
             {
                 if !dir.join("KERNEL.toml").exists() {
                     continue;
@@ -1225,6 +1247,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 quant: quant.clone(),
                 arch: arch.clone(),
                 model_kernel_dir,
+                local_kernel_dir,
                 common_kernel_dir: if has_common_dir {
                     Some(common_kernel_dir)
                 } else {

@@ -71,6 +71,8 @@ pub use qwen3_attention::Qwen3AttentionLayer;
 pub use qwen3_ssm::Qwen3SsmLayer;
 pub use qwen4exp_mtp::{Qwen4ExpMtpHead, Qwen4ExpMtpProposerState};
 pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder};
+pub mod vision_tower;
+pub use vision_tower::VisionTower;
 
 use crate::layer::ForwardContext;
 use anyhow::Result;

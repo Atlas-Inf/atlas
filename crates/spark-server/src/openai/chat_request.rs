@@ -299,6 +299,10 @@ pub struct ChatTemplateKwargs {
     /// other `chat_template_kwargs` keys in the directive ladder
     /// (vLLM's template gates the effort block on `enable_thinking`).
     pub reasoning_effort: Option<String>,
+    /// vLLM deepseek_r1 kwarg: when the output is all reasoning (unclosed
+    /// think block), return the reasoning text AS content so the response
+    /// body is never empty. Absent = false.
+    pub force_nonempty_content: Option<bool>,
 }
 
 impl ChatCompletionRequest {

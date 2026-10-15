@@ -24,6 +24,7 @@ mod decode_step;
 #[cfg(test)]
 mod dspark_fail_closed_tests;
 mod emit_step;
+mod eos_policy;
 mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;
@@ -75,6 +76,8 @@ mod test_support;
 #[cfg(test)]
 mod think_skip_tests;
 mod types;
+#[cfg(test)]
+mod verify_bias_tests;
 mod verify_dflash_batch_step;
 mod verify_dflash_step;
 mod verify_k2_step;

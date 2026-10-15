@@ -406,14 +406,28 @@ pub(super) fn build_msg_entries(
         for (idx, input) in media.iter().enumerate() {
             let item = match input.kind {
                 MediaKind::Image => {
-                    match spark_model::vision_preprocess::preprocess_image_with_max_pixels(
-                        &input.uri,
-                        vcfg,
-                        vision_max_pixels,
-                    ) {
-                        Ok((pixels, grid_h, grid_w)) => {
-                            spark_model::VisionItem::image(pixels, grid_h, grid_w)
-                        }
+                    let item = if let Some(omni) = &vcfg.omni {
+                        spark_model::radio_preprocess::preprocess_image_omni(
+                            &input.uri,
+                            vcfg,
+                            &omni.norm_mean,
+                            &omni.norm_std,
+                            vcfg.patch_size,
+                            omni.downsample_ratio,
+                            omni.max_num_patches,
+                            omni.min_num_patches,
+                        )
+                        .map(|(pixels, gh, gw)| spark_model::VisionItem::image(pixels, gh, gw))
+                    } else {
+                        spark_model::vision_preprocess::preprocess_image_with_max_pixels(
+                            &input.uri,
+                            vcfg,
+                            vision_max_pixels,
+                        )
+                        .map(|(pixels, gh, gw)| spark_model::VisionItem::image(pixels, gh, gw))
+                    };
+                    match item {
+                        Ok(item) => item,
                         Err(e) => {
                             return Err(openai_error_response(
                                 StatusCode::BAD_REQUEST,

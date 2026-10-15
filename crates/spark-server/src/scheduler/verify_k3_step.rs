@@ -196,6 +196,7 @@ pub fn step_verify_k3(
         sched.levers.dflash_masked_verify,
         model.is_lightning_dspark_product(),
         a,
+        &result_vec,
     );
     let (v0, v1, v2) = if use_raw {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD)

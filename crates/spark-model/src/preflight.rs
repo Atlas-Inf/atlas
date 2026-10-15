@@ -82,7 +82,16 @@ fn check_quant_method(config: &ModelConfig) -> Result<()> {
     if qc.quant_method.is_empty() {
         return Ok(());
     }
-    const KNOWN_METHODS: &[&str] = &["compressed-tensors", "modelopt", "fp8", "exl3"];
+    // `modelopt_mixed` is the ModelOpt label on MIXED_PRECISION dumps
+    // (Nemotron 3.5 Super VL NVFP4 ships it with a per-component
+    // `quantized_layers` map — same semantics as `modelopt`).
+    const KNOWN_METHODS: &[&str] = &[
+        "compressed-tensors",
+        "modelopt",
+        "modelopt_mixed",
+        "fp8",
+        "exl3",
+    ];
     if !KNOWN_METHODS.contains(&qc.quant_method.as_str()) {
         bail!(
             "Pre-flight: checkpoint declares quant_method={:?} which Atlas doesn't \

@@ -137,6 +137,9 @@ pub enum InferenceRequest {
         stop_tokens: Vec<u32>,
         /// Whether thinking mode is enabled for this request.
         enable_thinking: bool,
+        /// chat_template_kwargs.force_nonempty_content: all-reasoning output
+        /// is returned as content instead of an empty content string.
+        force_nonempty_content: bool,
         /// Max thinking tokens before forcing `</think>`. None = unlimited.
         thinking_budget: Option<u32>,
         /// Per-request override for the vLLM-anchored token-loop detector.
@@ -241,6 +244,9 @@ pub enum InferenceRequest {
         stop_tokens: Vec<u32>,
         /// Whether thinking mode is enabled for this request.
         enable_thinking: bool,
+        /// chat_template_kwargs.force_nonempty_content: all-reasoning output
+        /// is returned as content instead of an empty content string.
+        force_nonempty_content: bool,
         /// Max thinking tokens before forcing `</think>`. None = unlimited.
         thinking_budget: Option<u32>,
         /// Per-request override for the vLLM-anchored token-loop detector.

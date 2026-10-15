@@ -332,6 +332,7 @@ pub(super) async fn completions_stream(
         logit_bias: p.logit_bias,
         stop_tokens: p.stop_tokens,
         enable_thinking: false,
+        force_nonempty_content: false,
         thinking_budget: None,
         repetition_detection: p.repetition_detection,
         require_tool_call: false,

@@ -139,6 +139,16 @@ impl TransformerLayer for NemotronMoeLayer {
         let scale = ctx.config.routed_scaling_factor as f32;
         let n = num_tokens as u32;
 
+        // ATLAS_N35_L0_DUMP / ATLAS_N35_STAGE_DUMP_LAYER — arm on the target
+        // layer's first eager prefill; zero-cost when unset.
+        let mut l0d = crate::layers::nemotron_mamba2::l0_dump::arm(
+            ctx.gpu,
+            self.layer_idx,
+            hidden,
+            num_tokens * h,
+            stream,
+        );
+
         // ── 1. Batched RMS norm: [N, H] → normed[N, H] + residual update ──
         let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
@@ -153,6 +163,16 @@ impl TransformerLayer for NemotronMoeLayer {
             eps,
             stream,
         )?;
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "02_normed",
+                normed,
+                num_tokens * h,
+                "bf16",
+                &[num_tokens, h],
+            );
+        }
 
         // ── 2. Batched Gate GEMM: [N, H] x [H, num_experts]^T → [N, num_experts] ──
         let gate_logits = ctx.buffers.gate_logits();
@@ -166,6 +186,16 @@ impl TransformerLayer for NemotronMoeLayer {
             h as u32,
             stream,
         )?;
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "03_gate_logits",
+                gate_logits,
+                num_tokens * num_experts as usize,
+                "bf16",
+                &[num_tokens, num_experts as usize],
+            );
+        }
 
         // Check if batched MoE prefill kernels are available
         let has_batched = self.topk_sigmoid_batched_k.0 != 0
@@ -185,6 +215,16 @@ impl TransformerLayer for NemotronMoeLayer {
         // Arm selection (native FP8 → W4A4 → pre-dequant FP8 → transposed NVFP4
         // → plain W4A16) lives in `prefill_shared_up.rs` (500-LoC cap split).
         self.prefill_shared_up(normed, shared_up_out_base, n, h, shared_inter, ctx, stream)?;
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "04_shared_up",
+                shared_up_out_base,
+                num_tokens * shared_inter as usize,
+                "bf16",
+                &[num_tokens, shared_inter as usize],
+            );
+        }
 
         // ── 4. LatentMoE: batched fc1_latent GEMM [N, H] → [N, L] ──
         // Use attn_output as temp buffer (m*max_dim*2, large enough for [N, L]).
@@ -209,6 +249,16 @@ impl TransformerLayer for NemotronMoeLayer {
                 self.dense_gemm_prefill(
                     ctx.gpu, normed, fc1, latent_buf, n, latent, h as u32, stream,
                 )?;
+            }
+            if let Some(ref mut d) = l0d {
+                d.stage(
+                    ctx.gpu,
+                    "05_fc1_latent",
+                    latent_buf,
+                    num_tokens * latent as usize,
+                    "bf16",
+                    &[num_tokens, latent as usize],
+                );
             }
             Some(latent_buf)
         } else {
@@ -264,12 +314,32 @@ impl TransformerLayer for NemotronMoeLayer {
             latent_base,
             shared_up_out_base,
         };
+        if l0d.is_some() {
+            tracing::info!(
+                "N35_STAGE_DUMP L{} MoE prefill arm: marlin={} sorted={} fallback={}",
+                self.layer_idx,
+                use_marlin_prefill,
+                use_sorted,
+                !(use_marlin_prefill || use_sorted)
+            );
+        }
         if use_marlin_prefill {
             self.prefill_marlin_path(&p, ctx, stream)?;
         } else if use_sorted {
             self.prefill_sorted_path(&p, ctx, stream)?;
         } else {
-            self.prefill_fallback_path(&p, ctx, stream)?;
+            self.prefill_fallback_path(&p, ctx, stream, &mut l0d)?;
+        }
+        if let Some(mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "99_post_layer",
+                hidden,
+                num_tokens * h,
+                "bf16",
+                &[num_tokens, h],
+            );
+            d.finish();
         }
 
         Ok(())

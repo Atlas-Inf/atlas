@@ -681,90 +681,41 @@ pub fn process_decode_logits(
             continue;
         }
 
-        // EOS handling: grammar-based, legacy, or min_tokens.
-        // Grammar-based: grammar controls when EOS is allowed (is_terminated()).
-        // Legacy: require_tool_call suppresses EOS until <tool_call> is seen.
-        // min_tokens: suppress EOS until output_tokens.len() >= min_tokens.
-        // Fix A (2026-06-05, kill-switch): in tool_choice="auto" the grammar's
-        // is_terminated() never becomes true after a tool call, so EOS is
-        // suppressed forever — trapping the model into a hallucinated-transcript
-        // runaway. When enabled and a tool call has completed (and we're not
-        // inside a tool body / thinking), lift the grammar suppression so the
-        // model's natural EOS ends the turn. Inert unless ATLAS_TOOL_EOS_ESCAPE=1.
-        let eos_escape = tool_eos_escape_enabled()
-            && a.tool_call_completed
-            && !a.inside_tool_body
-            && !a.inside_thinking;
-        // #192: grammar EOS suppression is STOP-LEGALITY based (may the
-        // response legally end at the current matcher position?), not
-        // `!is_terminated()`. A tool_choice="auto" trigger grammar never
-        // terminates, so the old gate suppressed EOS for the whole turn when
-        // no call completed — armed-but-unused tools ran to
-        // finish_reason="length" (live probe #6, 2026-07-02). Evaluated only
-        // when the sampled token IS an EOS token: `grammar_blocks_stop`
-        // fills a bitmask (`stop_legal`), too costly as a per-token
-        // predicate and meaningless otherwise.
-        let grammar_suppresses_eos = a.eos_tokens.contains(&tok)
-            && !eos_escape
+        // EOS handling: all five suppressors evaluated by the shared policy
+        // module (`eos_policy::evaluate`) — the verify/MTP emit path calls
+        // the same function so the serial and verify EOS decisions are
+        // identical by construction. #192 stop-legality, Fix-A escape,
+        // §C-2 hard-ceiling and the post-think guard all live there.
+        let eos_inputs = eos_policy::EosInputs {
+            is_eos: a.eos_tokens.contains(&tok),
+            grammar_blocks_stop: false, // set lazily below
+            require_tool_call: a.require_tool_call,
+            tool_request: a.tool_request,
+            min_tokens: a.min_tokens,
+            output_len_before: a.output_tokens.len(),
+            thinking_tokens: a.thinking_tokens,
+            inside_thinking: a.inside_thinking,
+            think_ended: a.think_ended,
+            tool_call_completed: a.tool_call_completed,
+            inside_tool_body: a.inside_tool_body,
+            remaining: a.remaining,
+            seq_len: a.seq.seq_len,
+            max_seq_len: sched.limits.max_seq_len,
+        };
+        let gbs = eos_inputs.is_eos
+            && !eos_policy::eos_escape(&eos_inputs)
             && crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens);
-        let legacy_suppresses_eos = a.require_tool_call;
-        let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-        // Suppress EOS during thinking: <|im_end|> inside <think> is spurious.
-        // Only </think> (think_end_token) should end the thinking phase — EXCEPT
-        // at a hard ceiling. §C-2 (DS4F hard-limit lane): when the completion
-        // budget is exhausted or the served `max_seq_len` is reached, a
-        // model-sampled EOS MUST be honored regardless of `inside_thinking`, so
-        // generation cannot overrun. `remaining` already reflects this token's
-        // decrement (thinking or content branch above); `a.seq.seq_len` is the
-        // current KV position. No-op until a ceiling is actually hit.
-        let hard_ceiling = hard_ceiling_hit(a.remaining, a.seq.seq_len, sched.limits.max_seq_len);
-        let thinking_suppresses_eos = eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling);
-        // Post-thinking EOS guard. Empirically (dump fix22b 2026-04-25
-        // ses_23b4781f7ffebc7UgkKWedTmjd seq=43): when the thinking-loop
-        // watchdog force-closes `</think>` mid-narration, the model can
-        // emerge into content mode briefly (often emitting a bare
-        // `<write>\n\n` opener) and immediately sample EOS — the
-        // session ends with a partial tool-call shell but no real
-        // call. POST_THINK_MIN_CONTENT requires N non-thinking tokens
-        // after `think_ended` before EOS is allowed, giving the model
-        // room to actually open a `<tool_call>` block.
-        //
-        // 2026-05-24 narrowing (verified live against Qwen3.6-35B-A3B-FP8
-        // T1-T6 battery): the guard was firing UNCONDITIONALLY for every
-        // post-`</think>` response under 16 content tokens, including
-        // genuine short-answer turns ("2+2"→"4", "first 5 primes"
-        // →"2,3,5,7,11", "haiku featuring blue"→single line). The model
-        // had emitted a perfectly valid short answer + `<|im_end|>` —
-        // the guard then forced the model to keep generating, and it
-        // collapsed into chat-template artefacts (`\nuser\nassistant\n`)
-        // because there's no natural continuation. Scope the guard to
-        // tool-call-eligible turns: when tools are armed (require_tool_call
-        // OR `tools_active` per-seq) we keep the suppression; otherwise
-        // a short post-thinking answer is the expected output and EOS
-        // should fire normally. `min_tokens_suppresses` still enforces
-        // any explicit caller-set floor.
-        const POST_THINK_MIN_CONTENT: u32 = 16;
-        let post_think_content_tokens =
-            (a.output_tokens.len() as u32).saturating_sub(a.thinking_tokens);
-        // Tools-armed scoping (the narrowing the 2026-05-24 comment above
-        // describes but was never coded into this branch): the post-think guard
-        // exists to give the model room to OPEN a `<tool_call>` after the
-        // watchdog force-closes `</think>` mid-narration. That is only relevant
-        // when tools are armed for this turn. On a plain (no-tool) thinking turn
-        // a short post-`</think>` answer ("2+2"→"4", "say hello"→"Hello") plus
-        // its `<|im_end|>`/`<|endoftext|>` IS the expected output, so the guard
-        // must NOT fire — otherwise the legitimate EOS is discarded and the
-        // model runs on into chat-template scaffold (`\nuser\nassistant`). The
-        // MTP-verify emit path (`emit_step.rs`) has no such guard, which is why
-        // MTP-on stopped here while MTP-off leaked; this restores parity.
-        let tools_armed = a.require_tool_call || a.tool_request;
-        let post_think_suppresses_eos =
-            tools_armed && a.think_ended && post_think_content_tokens < POST_THINK_MIN_CONTENT;
-        let suppress_eos = grammar_suppresses_eos
-            || legacy_suppresses_eos
-            || min_tokens_suppresses
-            || thinking_suppresses_eos
-            || post_think_suppresses_eos;
+        let eos_inputs = eos_policy::EosInputs {
+            grammar_blocks_stop: gbs,
+            ..eos_inputs
+        };
+        let decision = eos_policy::evaluate(&eos_inputs);
+        let grammar_suppresses_eos = decision.grammar;
+        let legacy_suppresses_eos = decision.legacy_tool;
+        let min_tokens_suppresses = decision.min_tokens;
+        let thinking_suppresses_eos = decision.thinking;
+        let post_think_suppresses_eos = decision.post_think;
+        let suppress_eos = decision.suppress();
 
         if a.eos_tokens.contains(&tok) && !suppress_eos {
             // Stop/EOS token: do NOT stream to client (OpenAI spec: returned text
@@ -807,11 +758,7 @@ pub fn process_decode_logits(
             // grammar that has not terminated, an unsatisfied tool call, an
             // explicit min_tokens floor or the post-think tool guard all have
             // their own reasons to keep generating and are left untouched.
-            let thinking_is_sole_suppressor = thinking_suppresses_eos
-                && !grammar_suppresses_eos
-                && !legacy_suppresses_eos
-                && !post_think_suppresses_eos
-                && !min_tokens_suppresses;
+            let thinking_is_sole_suppressor = decision.thinking_sole_suppressor();
             // Gated per model: honoring a mid-think EOS closes the block, and
             // from there only POST_THINK_MIN_CONTENT holds the turn open, so a
             // model that would have recovered instead emits ~16 tokens of
@@ -819,16 +766,7 @@ pub fn process_decode_logits(
             // the close; Qwen3.6-35B-A3B measurably regresses on it (8/10 vs
             // 10/10 agentic, three consecutive tiers). Default false.
             let honor_eos_in_think = sched.watchdog.honor_eos_inside_thinking;
-            if thinking_is_sole_suppressor && honor_eos_in_think {
-                a.inside_thinking = false;
-                a.think_force_closed = true;
-                a.force_end_thinking = false;
-                a.sentence_defer_count = 0;
-                a.consecutive_confident = 0;
-                a.in_code_fence = false;
-                a.think_ended = true;
-                a.think_just_ended = true;
-            }
+            eos_policy::apply_implicit_think_close(a, sched, &decision);
             tracing::debug!(
                 target: "atlas::eos",
                 tok,

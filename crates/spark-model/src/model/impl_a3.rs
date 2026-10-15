@@ -241,6 +241,32 @@ impl TransformerModel {
                     stream,
                 )?;
             }
+        } else if self.levers.mamba_verify_exact
+            && self.w4a16_gemv_batch16_kernel.0 != 0
+            && let Some(ref nvfp4) = self.lm_head_nvfp4
+        {
+            // Exact-verify LM head (omni, K-row verify): chunked
+            // w4a16_gemv_batchm at <=16 rows per call. The batchm twin is
+            // byte-identical to the serial w4a16 GEMV decode uses (proven at
+            // shared-expert dims; covered here at lm-head dims by
+            // lmhead_batchm_identical_to_serial). Chunking is result-free.
+            let bf16 = 2usize;
+            let mut c0 = 0usize;
+            while c0 < num_tokens as usize {
+                let m = (num_tokens as usize - c0).min(16);
+                ops::w4a16_gemv_batchm(
+                    self.gpu.as_ref(),
+                    self.w4a16_gemv_batch16_kernel,
+                    hidden.offset(c0 * h as usize * bf16),
+                    nvfp4,
+                    logits.offset(c0 * v as usize * bf16),
+                    m as u32,
+                    v,
+                    h,
+                    stream,
+                )?;
+                c0 += m;
+            }
         } else if self.lm_head_dp4a_batch4(hidden, num_tokens, logits, h, v, stream)? {
             // Handled by the W4A8 DP4A arm (see `trait_impl/lm_head_dp4a.rs`).
             // Nothing further to launch.

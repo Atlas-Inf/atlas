@@ -193,7 +193,7 @@ pub(super) fn step_mtp_bootstrap_batched(
                 crate::scheduler::sample_step::PositionKind::Verify,
                 0.0,
                 None,
-                Vec::new(),
+                a.logit_bias.clone(),
             )
         })
         .collect();

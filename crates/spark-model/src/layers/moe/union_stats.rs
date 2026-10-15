@@ -30,7 +30,7 @@ const LOG_EVERY: u64 = 64;
 
 /// Sample the expert-index union for one MoE layer's verify batch.
 /// `indices_dev` = `[m * top_k]` u32 expert ids, already written on `stream`.
-pub(super) fn maybe_sample_expert_union(
+pub(crate) fn maybe_sample_expert_union(
     // The whole context, not three fields off it: the lever, the counters and
     // the backend are all this model's, and taking them separately made the
     // call site three lines longer than the thing it gates.

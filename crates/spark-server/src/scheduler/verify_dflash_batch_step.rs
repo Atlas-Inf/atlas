@@ -132,6 +132,7 @@ pub(super) fn step_verify_dflash_batched(
             sched.levers.dflash_masked_verify,
             model.is_lightning_dspark_product(),
             a,
+            raw,
         ) {
             raw.to_vec()
         } else {

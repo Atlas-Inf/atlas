@@ -96,6 +96,27 @@ pub trait GpuBackend: Send + Sync {
     /// Free device memory.
     fn free(&self, ptr: DevicePtr) -> Result<()>;
 
+    /// Register `[base, base+bytes)` as a slab whose interior pointers are
+    /// carved out to many tenants (e.g. per-tensor weight pointers packed
+    /// into one shard allocation). Backends that track per-allocation
+    /// ownership use this to make `free(interior_ptr)` a no-op instead of
+    /// an invalid cuMemFree. The slab base remains a normal allocation,
+    /// reclaimed by teardown's ledger sweep like any other.
+    ///
+    /// Default no-op: backends without a per-pointer free ledger (mock,
+    /// Metal) need no bookkeeping.
+    fn register_slab(&self, _base: DevicePtr, _bytes: usize) {}
+
+    /// True when `ptr` lies strictly inside a registered slab — i.e. it is a
+    /// carved interior pointer, not an owned allocation. Interior pointers
+    /// are never reused while the slab is registered (interior frees are
+    /// no-ops and offset 0 is reserved so nothing aliases the base), which is
+    /// what lets loaders keep store-aliased weight pointers instead of
+    /// owning a copy. Default false: backends without slabs.
+    fn is_slab_interior(&self, _ptr: DevicePtr) -> bool {
+        false
+    }
+
     /// Free every allocation this backend made that nobody released, and
     /// report how many there were.
     ///

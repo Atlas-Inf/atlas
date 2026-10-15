@@ -254,7 +254,7 @@ pub fn step_mtp(
             crate::scheduler::sample_step::PositionKind::Verify,
             0.0,
             None,
-            Vec::new(),
+            a.logit_bias.clone(),
         );
         // #192: same per-tool-call-segment scoping as the main pipeline
         // (`penalty_history_scope`) so MTP bootstrap tokens see the identical

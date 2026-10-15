@@ -132,6 +132,31 @@ impl NemotronMamba2Layer {
                         stream,
                     )?;
                 }
+            } else if self.w8a16_gemm_n_m128_k.0 != 0
+                && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
+            {
+                // gfx1151: w8a16_gemm_n_m128 reads the native [N,K] FP8 weight
+                // and [N/128,K/128] FP32 block scale directly — no transpose,
+                // k-contiguous loads. Preferred over the 256x128-tile
+                // w8a16_gemm (which is ~7 ms/launch on this target).
+                ops::w8a16_gemm_n_m128(
+                    ctx.gpu,
+                    self.w8a16_gemm_n_m128_k,
+                    normed,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    proj,
+                    n,
+                    self.in_proj_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: in_proj w8a16_gemm_n_m128 failed (M={n}, N={}): {e}",
+                        self.in_proj_size
+                    )
+                })?;
             } else if self.w8a16_gemm_pipelined_k.0 != 0 {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
@@ -352,6 +377,26 @@ impl NemotronMamba2Layer {
                         stream,
                     )?;
                 }
+            } else if self.w8a16_gemm_n_m128_k.0 != 0
+                && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
+            {
+                ops::w8a16_gemm_n_m128(
+                    ctx.gpu,
+                    self.w8a16_gemm_n_m128_k,
+                    gated_out,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    out,
+                    n,
+                    h as u32,
+                    self.d_inner as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: out_proj w8a16_gemm_n_m128 failed (M={n}, N={h}): {e}"
+                    )
+                })?;
             } else if self.w8a16_gemm_pipelined_k.0 != 0 {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
