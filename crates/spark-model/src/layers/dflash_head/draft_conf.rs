@@ -39,8 +39,11 @@ pub(super) fn selector_kernel(gpu: &dyn GpuBackend, want: bool) -> (Option<Kerne
     match twin {
         Some(kernel) => (Some(kernel), true),
         None => (
-            gpu.kernel("dflash2_candidate_selector", "dflash2_candidate_selector")
-                .ok(),
+            gpu.kernel(
+                "dflash2_candidate_selector",
+                crate::layers::ops::DFLASH2_SELECTOR_SYMBOL,
+            )
+            .ok(),
             false,
         ),
     }

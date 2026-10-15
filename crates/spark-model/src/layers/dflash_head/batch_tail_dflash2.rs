@@ -110,9 +110,11 @@ impl BlockDiffusionDraftHead {
         // shares one `df2_selector_body` with the single-seq entry, and
         // `batch_markov_prev` (the prologue's last_tokens upload) carries
         // the same values passed scalar below. Fallback = per-seq loop.
+        // HIP retains unmasked upstream draft picks even below min_tokens;
+        // the target verifier still enforces that floor.
         if self.kernels.dflash2_candidate_selector_batched.0 != 0
             && !self.startup.diagnostics.draft_conf
-            && !has_end_ban
+            && (!has_end_ban || !ops::DFLASH2_SELECTOR_BANS_END_TOKENS)
         {
             return ops::dflash2_candidate_selector_batched(
                 ctx.gpu,

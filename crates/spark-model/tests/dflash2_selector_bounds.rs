@@ -6,9 +6,8 @@
 //! (`DF2_SEL_MAX_TOP_K`) and the context vector in `s_context`
 //! (`DF2_SEL_MAX_RANK`). `Dflash2CandidateSelector::new` fails fast when a
 //! checkpoint's `selector_top_k`/`selector_rank` exceeds the Rust mirrors —
-//! so the mirrors and the kernel `#define`s must never drift apart, and the
-//! gb10/strix-hip selector algorithms must match apart from the explicitly
-//! pinned platform-specific coherent scratch load.
+//! so the mirrors and the kernel `#define`s must never drift apart. CUDA
+//! uses the grid-wide selector; native HIP retains upstream's one-CTA ABI.
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -63,71 +62,28 @@ fn caps_match_kernel_defines() {
             DFLASH2_SELECTOR_MAX_RANK,
             "DF2_SEL_MAX_RANK drifted from DFLASH2_SELECTOR_MAX_RANK in {rel}"
         );
-        assert_eq!(
-            kernel_define(&src, "DF2_SEL_MAX_SPLITS"),
-            DFLASH2_SELECTOR_MAX_SPLITS,
-            "DF2_SEL_MAX_SPLITS drifted from DFLASH2_SELECTOR_MAX_SPLITS in {rel}"
-        );
-        assert_eq!(
-            kernel_define(&src, "DF2_SEL_THREADS"),
-            DFLASH2_SELECTOR_THREADS as usize,
-            "DF2_SEL_THREADS drifted from DFLASH2_SELECTOR_THREADS in {rel}"
-        );
     }
-}
-
-// This is the only permitted source difference. In particular, a cached plain
-// load or a narrower HIP memory scope must not pass the algorithm comparison.
-const HIP_SCRATCH_LOAD: &str = "\
-// The ticket protocol publishes scratch through device fences. HIP's
-// agent-scope atomic load keeps these cross-CU reads coherent; a plain
-// cached load cannot replace CUDA's L2-only __ldcg here.
-template <typename T>
-__device__ __forceinline__ T df2_sel_published_load(const T* ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-}
-
-";
-
-fn selector_sources_match(gb10: &str, strix: &str) -> bool {
-    if strix.matches(HIP_SCRATCH_LOAD).count() != 1 {
-        return false;
-    }
-    let strix = strix.replacen(HIP_SCRATCH_LOAD, "", 1);
-    let loads = gb10.matches("__ldcg(").count();
-    loads > 0
-        && strix.matches("df2_sel_published_load(").count() == loads
-        && strix.replace("df2_sel_published_load(", "__ldcg(") == gb10
-}
-
-#[test]
-fn gb10_and_strix_hip_match_except_the_coherent_scratch_load() {
-    assert!(
-        selector_sources_match(&kernel_src(KERNEL_GB10), &kernel_src(KERNEL_STRIX)),
-        "{KERNEL_GB10} and {KERNEL_STRIX} differ beyond the pinned HIP scratch load"
+    let src = kernel_src(KERNEL_GB10);
+    assert_eq!(
+        kernel_define(&src, "DF2_SEL_MAX_SPLITS"),
+        DFLASH2_SELECTOR_MAX_SPLITS
+    );
+    assert_eq!(
+        kernel_define(&src, "DF2_SEL_THREADS"),
+        DFLASH2_SELECTOR_THREADS as usize
     );
 }
 
 #[test]
-fn source_comparison_rejects_adapter_semantics_and_algorithm_drift() {
-    let gb10 = kernel_src(KERNEL_GB10);
-    let strix = kernel_src(KERNEL_STRIX);
-    for (from, to) in [
-        ("__HIP_MEMORY_SCOPE_AGENT", "__HIP_MEMORY_SCOPE_WORKGROUP"),
-        ("__ATOMIC_RELAXED", "__ATOMIC_SEQ_CST"),
-        ("atomicAdd(", "atomicSub("),
-    ] {
-        assert!(strix.contains(from), "mutation must exercise real source");
-        assert!(!selector_sources_match(&gb10, &strix.replacen(from, to, 1)));
-    }
-    assert!(!selector_sources_match(
-        &gb10,
-        &strix.replace(HIP_SCRATCH_LOAD, "")
-    ));
-    assert!(!selector_sources_match(
-        &gb10,
-        &format!("{HIP_SCRATCH_LOAD}{strix}")
-    ));
+fn hip_single_selector_keeps_its_upstream_scalar_abi() {
+    let src = kernel_src(KERNEL_STRIX);
+    let params = kernel_params(&src, "dflash2_candidate_selector");
+    assert_eq!(params.len(), 10);
+    assert_eq!(params[5], "unsigned int last_token");
+    // Both upstream entries invoke this same implementation. Rust uses the
+    // batched entry at n=1 to pass a graph-safe device anchor, never a scalar.
+    assert_eq!(src.matches("df2_selector_body(").count(), 3);
+    assert!(!src.contains("DF2_SEL_MAX_SPLITS"));
 }
 
 fn kernel_params(src: &str, name: &str) -> Vec<String> {
@@ -198,10 +154,14 @@ fn batched_selector_keeps_ten_param_per_sequence_body() {
         assert_eq!(params.len(), 10);
         assert_eq!(params[5], "const unsigned int* __restrict__ last_tokens");
         assert_eq!(params[9], "unsigned int top_k");
-        let body = kernel_params(&src, "df2_batch_selector_body");
+        let name = if rel == KERNEL_STRIX {
+            "df2_selector_body"
+        } else {
+            "df2_batch_selector_body"
+        };
+        let body = kernel_params(&src, name);
         assert_eq!(body.len(), 10);
         assert_eq!(body[5], "unsigned int last_token");
-        assert_eq!(src.matches("df2_batch_selector_body(").count(), 2);
     }
 }
 

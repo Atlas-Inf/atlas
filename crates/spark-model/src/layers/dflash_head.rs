@@ -32,6 +32,7 @@ mod draft_conf;
 mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
+mod selector_platform;
 mod startup_diagnostics;
 pub use conv::Dflash2Conv;
 pub use product_policy::{

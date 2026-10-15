@@ -35,6 +35,7 @@ impl BlockDiffusionDraftHead {
         max_batch_size: usize,
         mut startup: DsparkStartupExecution,
     ) -> Result<Self> {
+        super::selector_platform::validate_requested_features(startup.diagnostics.draft_conf)?;
         let embed_tokens_shared = weights
             .embed_tokens
             .as_ref()

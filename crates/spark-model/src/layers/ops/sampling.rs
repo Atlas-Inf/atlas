@@ -229,7 +229,17 @@ pub fn apply_grammar_bitmask(
 /// them — pinned to the kernel defines by `tests/dflash2_selector_bounds.rs`.
 pub const DFLASH2_SELECTOR_MAX_TOP_K: usize = 16;
 pub const DFLASH2_SELECTOR_MAX_RANK: usize = 256;
-/// Mirrors `DF2_SEL_MAX_SPLITS` / `DF2_SEL_THREADS` in the same kernel.
+/// Single-sequence entry resolved by the host. HIP retains upstream's
+/// one-CTA body; its batched entry with one sequence reads a device anchor.
+pub const DFLASH2_SELECTOR_SYMBOL: &str = if cfg!(atlas_hip) {
+    "dflash2_candidate_selector_batched"
+} else {
+    "dflash2_candidate_selector"
+};
+/// Draft end-token avoidance is CUDA-only. HIP keeps upstream draft picks;
+/// the target verifier remains responsible for enforcing `min_tokens`.
+pub const DFLASH2_SELECTOR_BANS_END_TOKENS: bool = !cfg!(atlas_hip);
+/// Mirrors `DF2_SEL_MAX_SPLITS` / `DF2_SEL_THREADS` in the CUDA kernel.
 pub const DFLASH2_SELECTOR_MAX_SPLITS: usize = 16;
 pub const DFLASH2_SELECTOR_THREADS: u32 = 512;
 
@@ -248,6 +258,10 @@ pub fn dflash2_selector_scratch_bytes(gamma: usize) -> usize {
 }
 
 /// DFlash2 on-device bilinear candidate selector over one `gamma`-row block.
+/// Resolve `kernel` with [`DFLASH2_SELECTOR_SYMBOL`] for the target ABI.
+/// HIP uses the unchanged upstream batched body with one sequence; `ban_depth`,
+/// `end_ids` and `scratch` are unused there, preserving upstream draft picks.
+/// The remaining device-ban contract applies to CUDA.
 ///
 /// `anchor` is a device `u32` holding the block anchor (row 1's
 /// predecessor) and `ban_depth` a device `u32` (or null): rows
@@ -273,6 +287,27 @@ pub fn dflash2_candidate_selector(
     scratch: DevicePtr,
     stream: u64,
 ) -> Result<()> {
+    if cfg!(atlas_hip) {
+        // `kernel` is DFLASH2_SELECTOR_SYMBOL: the unchanged HIP batched ABI.
+        // One sequence calls exactly the upstream single selector's body and
+        // keeps the anchor device-resident across graph replays. No tickets.
+        return dflash2_candidate_selector_batched(
+            gpu,
+            kernel,
+            logits,
+            projected_hidden,
+            pred_codebook,
+            succ_codebook,
+            out_tokens,
+            anchor,
+            1,
+            gamma,
+            vocab_size,
+            rank,
+            top_k,
+            stream,
+        );
+    }
     let mut launch = KernelLaunch::new(gpu, kernel)
         .grid([dflash2_selector_splits(gamma), gamma, 1])
         .block([DFLASH2_SELECTOR_THREADS, 1, 1])
