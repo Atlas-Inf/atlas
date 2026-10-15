@@ -180,12 +180,15 @@ impl W4a16BatchmTiers {
     /// Resolve every tier in the family. Misses are silent zero handles —
     /// tiers 5/6/7 are absent from any target built before they existed, and
     /// dispatch degrades to the pre-existing batch4/batch8 decision.
-    pub fn resolve(gpu: &dyn GpuBackend) -> Self {
+    /// `glm_series` gates the `w4a16_gemv_tc{8,16,32}` tensor-core tiers:
+    /// they compile only into glm-5.3-flash, so probing them for any other
+    /// model leaves a permanently-failed row in the boot audit.
+    pub fn resolve(gpu: &dyn GpuBackend, glm_series: bool) -> Self {
         let mut handles = [KernelHandle(0); W4A16_BATCHM_WIDTHS.len()];
         for (h, w) in handles.iter_mut().zip(W4A16_BATCHM_WIDTHS) {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
         }
-        if tc_requested() {
+        if glm_series && tc_requested() {
             TC.get_or_init(|| {
                 TC_ROWS.map(|rows| {
                     super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}"))

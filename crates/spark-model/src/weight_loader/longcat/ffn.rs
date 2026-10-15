@@ -38,7 +38,7 @@ pub(super) fn build_dense_ffn(
         up_proj_t: None,
         down_proj_t: None,
     };
-    let mut layer = DenseFfnLayer::new(weights, gpu)?;
+    let mut layer = DenseFfnLayer::new(weights, gpu, &config.model_type)?;
 
     // Precision lever, mirroring `ATLAS_NVFP4_MLA=0` on the attention side.
     // LongCat ships plain BF16 with no calibration metadata, so these three

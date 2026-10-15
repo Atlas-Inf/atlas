@@ -32,6 +32,7 @@ impl BlockDiffusionDraftHead {
         gpu: &dyn GpuBackend,
         max_seq_len: usize,
         max_batch_size: usize,
+        target_model_type: &str,
         mut startup: DsparkStartupExecution,
     ) -> Result<Self> {
         let embed_tokens_shared = weights
@@ -125,12 +126,13 @@ impl BlockDiffusionDraftHead {
         // `mtp_head.rs` plus the `extern "C" __global__` declarations under
         // `kernels/gb10/common/`.
         let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
+        let glm_series = target_model_type == "glm5_next";
         let (selector_kernel, draft_conf) = super::draft_conf::selector_kernel(
             gpu,
-            startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
+            glm_series && startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
         );
         startup.diagnostics.draft_conf = draft_conf;
-        let dense_gemv_tc = dense_gemv_tc_kernels(gpu);
+        let dense_gemv_tc = dense_gemv_tc_kernels(gpu, glm_series);
         let kernels = DflashKernels {
             // DFlash drafter uses HF's vanilla RMSNorm convention
             // (`out = x * w / RMS(x)`), NOT Atlas's default offset-from-1
@@ -192,7 +194,7 @@ impl BlockDiffusionDraftHead {
                 .kernel(paged_sink.indirect.0, paged_sink.indirect.1)?,
             prefill_attn_dflash_bf16_batched_sink: gpu
                 .kernel(paged_sink.batched.0, paged_sink.batched.1)?,
-            silu_mul: silu_mul_kernel(gpu)?,
+            silu_mul: silu_mul_kernel(gpu, glm_series)?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             argmax_batch: gpu.kernel("argmax", "argmax_bf16_batch")?,
@@ -265,8 +267,13 @@ impl BlockDiffusionDraftHead {
             w4a16_gemv_batch8: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
             w4a16_gemv_batch16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
             w4a16_gemv_batch32: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch32")?,
-            mxfp8_quantize: crate::layers::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
-            mxfp8_gemv: mxfp8_gemv_kernels(gpu),
+            mxfp8_quantize: crate::layers::try_kernel_gated(
+                glm_series,
+                gpu,
+                "mxfp8_gemv",
+                "mxfp8_quantize_bf16",
+            ),
+            mxfp8_gemv: mxfp8_gemv_kernels(gpu, glm_series),
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.

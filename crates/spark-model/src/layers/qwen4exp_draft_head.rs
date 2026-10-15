@@ -151,7 +151,7 @@ impl DraftHead {
                 KernelHandle(0)
             },
             w4a16_tiers: if want_nvfp4 {
-                W4a16BatchmTiers::resolve(gpu)
+                W4a16BatchmTiers::resolve(gpu, false)
             } else {
                 W4a16BatchmTiers::default()
             },

@@ -88,12 +88,14 @@ impl MoeLayer {
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
             router_prefill_bn32: router_prefill_bn32::resolve(config, gpu)?,
-            dense_gemm_router_m5: super::super::try_kernel(
+            dense_gemm_router_m5: super::super::try_kernel_gated(
+                config.model_type == "glm5_next",
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_m5",
             ),
-            dense_gemm_router_rows: super::super::try_kernel(
+            dense_gemm_router_rows: super::super::try_kernel_gated(
+                config.model_type == "glm5_next",
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_rows",
@@ -140,8 +142,9 @@ impl MoeLayer {
             moe_weighted_sum_blend_batch3: gpu
                 .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
-            w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
-            w4a16_batch5_dual_k: super::super::try_kernel(
+            w4a16_batchm: W4a16BatchmTiers::resolve(gpu, config.model_type == "glm5_next"),
+            w4a16_batch5_dual_k: super::super::try_kernel_gated(
+                config.model_type == "glm5_next",
                 gpu,
                 "w4a16_gemv",
                 "w4a16_gemv_batch5_dual",
@@ -444,7 +447,8 @@ impl MoeLayer {
             bf16_down_weight_ptrs: None,
             bf16_shared_expert: None,
             fp8_shared_expert: None,
-            moe_down_t_k64_fp4: super::super::try_kernel(
+            moe_down_t_k64_fp4: super::super::try_kernel_gated(
+                super::init_optional::gateup_fp4_series(&config.model_type),
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_down_t_k64_fp4",

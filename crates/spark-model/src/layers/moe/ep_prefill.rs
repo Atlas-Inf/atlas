@@ -24,11 +24,13 @@ pub(super) fn unpermute_ep_kernel(
         .num_experts_per_toks
         .iter()
         .fold(config.num_experts_per_tok, |a, &b| a.max(b));
-    if unpermute_vec_eligible(
-        std::env::var("ATLAS_GLM_MOE_UNPERMUTE_VEC").as_deref() == Ok("1"),
-        config.hidden_size,
-        max_top_k,
-    ) {
+    if config.model_type == "glm5_next"
+        && unpermute_vec_eligible(
+            std::env::var("ATLAS_GLM_MOE_UNPERMUTE_VEC").as_deref() == Ok("1"),
+            config.hidden_size,
+            max_top_k,
+        )
+    {
         let vec = super::super::try_kernel(gpu, "moe", "moe_unpermute_reduce_indexed_ep_vec8");
         if gpu.op_cache().once("moe:unpermute_vec8") {
             if vec.0 != 0 {
@@ -43,7 +45,8 @@ pub(super) fn unpermute_ep_kernel(
             return Ok(vec);
         }
     }
-    Ok(super::super::try_kernel(
+    Ok(super::super::try_kernel_gated(
+        config.model_type == "glm5_next",
         gpu,
         "moe",
         "moe_unpermute_reduce_indexed_ep",

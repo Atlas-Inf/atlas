@@ -54,15 +54,18 @@ impl TransformerModel {
             let kernel = match KERNEL.get() {
                 Some(k) => *k,
                 None => *KERNEL.get_or_init(|| {
-                    self.gpu
-                        .kernel(
-                            "hyper_connection",
-                            &crate::layers::ops::hc_kernel_name(
-                                &self.config.model_type,
-                                "hc_contract_strided",
-                            ),
-                        )
-                        .unwrap_or(spark_runtime::gpu::KernelHandle(0))
+                    // Only glm-5.3-flash's hyper_connection.cu carries the
+                    // strided contract; probing it for another mHC model
+                    // leaves a permanently-failed row in the boot audit.
+                    crate::layers::try_kernel_gated(
+                        self.config.model_type == "glm5_next",
+                        self.gpu.as_ref(),
+                        "hyper_connection",
+                        &crate::layers::ops::hc_kernel_name(
+                            &self.config.model_type,
+                            "hc_contract_strided",
+                        ),
+                    )
                 }),
             };
             anyhow::ensure!(kernel.0 != 0, "DFlash mHC capture kernel unavailable");

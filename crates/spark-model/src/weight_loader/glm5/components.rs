@@ -129,7 +129,11 @@ fn load_dense_ffn(
         up_proj_t: None,
         down_proj_t: None,
     };
-    Ok(FfnComponent::Dense(DenseFfnLayer::new(weights, gpu)?))
+    Ok(FfnComponent::Dense(DenseFfnLayer::new(
+        weights,
+        gpu,
+        &config.model_type,
+    )?))
 }
 
 fn load_moe(

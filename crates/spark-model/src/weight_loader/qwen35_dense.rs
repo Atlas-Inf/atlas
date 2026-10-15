@@ -375,7 +375,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
                 )?
             };
-            let mut dffn = DenseFfnLayer::new(ffn_weights, gpu)?;
+            let mut dffn = DenseFfnLayer::new(ffn_weights, gpu, &config.model_type)?;
             if ffn_q2 {
                 dffn.set_q2_weights(
                     packed_q2_from_store(store, &format!("{lp}.mlp.gate_proj"))?,

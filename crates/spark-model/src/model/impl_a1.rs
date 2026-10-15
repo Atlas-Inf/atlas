@@ -111,7 +111,10 @@ impl TransformerModel {
         // Narrow batched-GEMV family (M=4..8) for the K=3..8 verify lm_head
         // (try_kernel per tier: 0-handle on targets that predate a tier;
         // dispatch widens, then falls back to the GEMM).
-        let w4a16_batchm = crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu.as_ref());
+        let w4a16_batchm = crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(
+            gpu.as_ref(),
+            config.model_type == "glm5_next",
+        );
         // M<=16 batched GEMV for the wide BATCHED-DECODE lm_head. The SSM mixer
         // already carries this handle (qwen3_ssm/mod.rs); the model level did
         // not, so the decode head had no arm above 8 and fell to the M64-tile

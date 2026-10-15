@@ -116,7 +116,7 @@ impl Glm5KdaLayer {
                 "w4a16_gemv",
                 "w4a16_gemv_batch5_qkv",
             ),
-            w4a16_gemv_batchm: W4a16BatchmTiers::resolve(gpu),
+            w4a16_gemv_batchm: W4a16BatchmTiers::resolve(gpu, true),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,

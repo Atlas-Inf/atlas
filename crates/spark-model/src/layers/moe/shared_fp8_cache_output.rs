@@ -124,7 +124,9 @@ impl MoeLayer {
         // supports it; keep that existing precision/ABI without extending the
         // separately validated FP8 kernel envelope or fabricating oracle passes.
         if rows > 1024 {
-            if ops::bf16_gemm_cutlass_rows(rows) {
+            // fp8_e4m3_to_bf16 compiles only into glm-5.3-flash: for any other
+            // model hitting this arm the lookup can never resolve.
+            if ops::bf16_gemm_cutlass_rows(rows) && ctx.config.model_type == "glm5_next" {
                 // E4M3 widens exactly to BF16, so the tuned BF16 tensor-core
                 // GEMM computes the same products as the FP8 M64 kernel.
                 let count = n as usize * k as usize;

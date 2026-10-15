@@ -1044,6 +1044,7 @@ pub fn build_model(
                     model.gpu_backend(),
                     max_seq_len,
                     max_batch_size,
+                    &model.config_ref().model_type,
                     startup,
                 )?;
                 // ATLAS_GLM_DRAFT_TP: on the TP2 pair both ranks hold the

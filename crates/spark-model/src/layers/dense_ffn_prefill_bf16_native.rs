@@ -159,6 +159,7 @@ fn dense_prefill_bf16_native_full_projection_geometry() -> Result<()> {
             down_proj_t: None,
         },
         &gpu,
+        &config.model_type,
     )?;
     layer.cache_glm_prefill_bf16(&config, &gpu)?;
     ensure!(

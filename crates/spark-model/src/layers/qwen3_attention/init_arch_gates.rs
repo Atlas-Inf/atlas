@@ -46,6 +46,15 @@ pub(super) struct ArchProbes {
     /// GLM-5.3's four-token semantic-index pool. Unlike generic MLA, this is
     /// declared directly by the checkpoint config and has dedicated kernels.
     pub glm_kpool_indexer: bool,
+    /// The GLM-5.3-Flash series (`glm-5.3-flash` kernel target): the batch-5
+    /// GEMV, router GEMMs, mxfp8 attention projections, and Sinkhorn mHC
+    /// fusions compile only into that target, so issuing their lookups for
+    /// any other model leaves a permanently-failed row in the boot audit.
+    pub glm_series: bool,
+    /// The qwen4_exp series (`qwen3.8-flash-next` kernel target): `hc_pre_mix`
+    /// exists there and in GLM's own hyper_connection.cu but not in
+    /// DeepSeek-V4's, so the mHC probe needs it alongside `glm_series`.
+    pub qwen4_exp: bool,
 }
 
 impl ArchProbes {
@@ -58,6 +67,8 @@ impl ArchProbes {
             glm_kpool_indexer: config.model_type == "glm5_next"
                 && config.index_kpool > 1
                 && config.index_head_dim > 0,
+            glm_series: config.model_type == "glm5_next",
+            qwen4_exp: config.model_type == "qwen4_exp",
         }
     }
 }

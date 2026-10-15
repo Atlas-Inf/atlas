@@ -54,6 +54,46 @@ pub(super) struct OptionalKernels {
     pub(super) moe_gate_topk_fused_k: KernelHandle,
 }
 
+/// Kernel-family shipping predicates for `OptionalKernels::resolve`: each
+/// names the model types whose `gb10` targets actually compile the family
+/// (see `kernels/gb10/*/MODEL.toml` and the PTX `.entry` lists). A probe is
+/// issued only for a model type on the list, so no other model leaves a
+/// permanently-failed row in the boot audit.
+pub(super) fn glm5_series(model_type: &str) -> bool {
+    model_type == "glm5_next"
+}
+
+/// Native-MXFP4 (E8M0) MoE scale-format family: deepseek-v4-flash,
+/// glm-5.3-flash, longcat-flash-lite.
+pub(super) fn e8m0_series(model_type: &str) -> bool {
+    matches!(
+        model_type,
+        "deepseek_v4" | "glm5_next" | "longcat_flash" | "longcat_flash_ngram"
+    )
+}
+
+/// M=128 Block-D fused gate_up: laguna-s-2.1, minimax-m2-229b, step3p7-flash.
+pub(super) fn gateup_m128_series(model_type: &str) -> bool {
+    matches!(model_type, "laguna" | "minimax_m2" | "step3p7")
+}
+
+/// FUSED-FP4 gate_up/down twins: the Holo/Ornith family, qwen3.6-35b-a3b, and
+/// qwen3.8-flash-next.
+pub(super) fn gateup_fp4_series(model_type: &str) -> bool {
+    matches!(
+        model_type,
+        "holo3_1_moe" | "qwen3_5" | "qwen3_6_moe" | "qwen4_exp"
+    )
+}
+
+/// `silu_mul_quant_fp8` ships everywhere except deepseek-v4-flash,
+/// glm-5.3-flash, longcat-flash-lite, and step3p7-flash. GLM and Longcat
+/// declare the lookup expected-absent in their MODEL.tomls; DeepSeek-V4 and
+/// Step3.7 do not, so only those two stop issuing it.
+pub(super) fn silu_quant_fp8_issued(model_type: &str) -> bool {
+    !matches!(model_type, "deepseek_v4" | "step3p7")
+}
+
 /// The batched router-logits GEMV (`dense_gemv_bf16_batchm` arguments and
 /// grid), or 0. GLM's 288-expert router takes the bit-identical load-ahead
 /// tier when the target ships it and its grid of `num_experts / 4` CTAs fits
@@ -78,7 +118,8 @@ pub(super) fn router_gemv_batchm(
 
 impl OptionalKernels {
     pub(super) fn resolve(gpu: &dyn GpuBackend, config: &atlas_core::config::ModelConfig) -> Self {
-        let k128w = config.model_type == "glm5_next"
+        let glm5 = glm5_series(&config.model_type);
+        let k128w = glm5
             && std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref() == Ok("1")
             && std::env::var("ATLAS_MOE_PREQUANT_K128W").as_deref() != Ok("0");
         let (t_k128w, gate_up_silu, k128w_persist_ctas) = k128w_kernels(
@@ -88,23 +129,26 @@ impl OptionalKernels {
             std::env::var("ATLAS_GLM_MOE_PREFILL_PERSIST").as_deref() == Ok("1"),
         );
         Self {
-            moe_grouped_gemm_t_k64_m32: super::super::try_kernel(
+            moe_grouped_gemm_t_k64_m32: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_grouped_gemm_ptrtable_t_k64_m32",
             ),
-            moe_w4a4_prequant_t_k64: super::super::try_kernel(
+            moe_w4a4_prequant_t_k64: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_w4a16",
                 "moe_w4a4_grouped_gemm_prequant_t_k64",
             ),
-            moe_w4a4_prequant_t_k64_vecscale: super::super::try_kernel(
+            moe_w4a4_prequant_t_k64_vecscale: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_w4a16",
                 "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale",
             ),
-            moe_w4a4_prequant_t_k128: if std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref()
-                == Ok("1")
+            moe_w4a4_prequant_t_k128: if glm5
+                && std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref() == Ok("1")
             {
                 super::super::try_kernel(gpu, "moe_w4a16", "moe_w4a4_grouped_gemm_prequant_t_k128")
             } else {
@@ -154,74 +198,88 @@ impl OptionalKernels {
             } else {
                 KernelHandle(0)
             },
-            moe_nvfp4_mmq_gate_up_k: super::super::try_kernel(
+            moe_nvfp4_mmq_gate_up_k: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_mmq64_gate_up",
             ),
-            moe_nvfp4_mmq_down_k: super::super::try_kernel(
+            moe_nvfp4_mmq_down_k: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_mmq64_down",
             ),
-            moe_nvfp4_mmq_quantize_k: super::super::try_kernel(
+            moe_nvfp4_mmq_quantize_k: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_quantize_bf16",
             ),
-            moe_nvfp4_mmq_repack_k: super::super::try_kernel(
+            moe_nvfp4_mmq_repack_k: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_repack_batched",
             ),
-            moe_nvfp4_mmq_silu_scale2_k: super::super::try_kernel(
+            moe_nvfp4_mmq_silu_scale2_k: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_silu_scale2",
             ),
-            moe_nvfp4_mmq_scale2_rows_k: super::super::try_kernel(
+            moe_nvfp4_mmq_scale2_rows_k: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_scale2_rows",
             ),
-            moe_expert_gate_up_shared_mmq_k: super::super::try_kernel(
+            moe_expert_gate_up_shared_mmq_k: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_shared_expert_fused_mmq",
                 "moe_expert_gate_up_shared_mmq",
             ),
-            moe_expert_silu_down_shared_mmq_k: super::super::try_kernel(
+            moe_expert_silu_down_shared_mmq_k: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_shared_expert_fused_mmq",
                 "moe_expert_silu_down_shared_mmq",
             ),
-            silu_mul_quant_nvfp4_k: super::super::try_kernel(
+            silu_mul_quant_nvfp4_k: super::super::try_kernel_gated(
+                glm5,
                 gpu,
                 "moe_silu_mul",
                 "silu_mul_quant_nvfp4",
             ),
             // ARM-2 Phase-K native-MXFP4 (E8M0) prefill variants — try_kernel:
             // only the deepseek-v4-flash target's moe_w4a16 module ships them.
-            moe_grouped_gemm_e8m0: super::super::try_kernel(
+            moe_grouped_gemm_e8m0: super::super::try_kernel_gated(
+                e8m0_series(&config.model_type),
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_grouped_gemm_ptrtable_e8m0",
             ),
-            moe_grouped_gemm_t_e8m0: super::super::try_kernel(
+            moe_grouped_gemm_t_e8m0: super::super::try_kernel_gated(
+                e8m0_series(&config.model_type),
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_grouped_gemm_ptrtable_t_e8m0",
             ),
-            moe_grouped_gemm_t_k64_e8m0: super::super::try_kernel(
+            moe_grouped_gemm_t_k64_e8m0: super::super::try_kernel_gated(
+                e8m0_series(&config.model_type),
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_grouped_gemm_ptrtable_t_k64_e8m0",
             ),
-            moe_fused_gate_up_t_e8m0: super::super::try_kernel(
+            moe_fused_gate_up_t_e8m0: super::super::try_kernel_gated(
+                e8m0_series(&config.model_type),
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_e8m0",
             ),
-            moe_fused_gate_up_t_k64_e8m0: super::super::try_kernel(
+            moe_fused_gate_up_t_k64_e8m0: super::super::try_kernel_gated(
+                e8m0_series(&config.model_type),
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_k64_e8m0",
@@ -229,7 +287,8 @@ impl OptionalKernels {
             // M=128 variant only present in models where Block D #3 has
             // been ported (currently minimax-m2-229b). Other models keep
             // KernelHandle(0) and dispatch falls through to M=64.
-            moe_fused_gate_up_t_k64_m128: super::super::try_kernel(
+            moe_fused_gate_up_t_k64_m128: super::super::try_kernel_gated(
+                gateup_m128_series(&config.model_type),
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_k64_m128",
@@ -237,7 +296,8 @@ impl OptionalKernels {
             // FUSED FP4 gate_up kernel (ATLAS_HOLO_MOE_GATEUP_FP4). try_kernel:
             // KernelHandle(0) on images that didn't compile it; the FP4 dispatch
             // checks this handle != 0 before firing.
-            moe_fused_gate_up_t_k64_fp4: super::super::try_kernel(
+            moe_fused_gate_up_t_k64_fp4: super::super::try_kernel_gated(
+                gateup_fp4_series(&config.model_type),
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_k64_fp4",
@@ -277,7 +337,8 @@ impl OptionalKernels {
             // Fused silu_mul + per-token-group quant. Same module as
             // moe_silu_mul, so a model that shadows moe_silu_mul.cu without
             // this entry point gets handle 0 → unfused fallback.
-            silu_mul_quant_fp8_k: super::super::try_kernel(
+            silu_mul_quant_fp8_k: super::super::try_kernel_gated(
+                silu_quant_fp8_issued(&config.model_type),
                 gpu,
                 "moe_silu_mul",
                 "silu_mul_quant_fp8",
