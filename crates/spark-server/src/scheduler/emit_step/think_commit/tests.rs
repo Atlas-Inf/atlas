@@ -177,3 +177,79 @@ fn a_rejected_verify_position_leaves_no_trace_in_the_think_state() {
     assert_eq!(a.consecutive_confident, 2);
     SCRIPT.with(|s| *s.borrow_mut() = None);
 }
+
+/// A short post-`</think>` EOS held by a real tool obligation, through decode
+/// and through emit — #175's eos_policy regression shape
+/// (live_irrelevance_25-2-13). #174's `should_suppress_post_think_eos` arms on
+/// a real obligation (`require_tool_call` / open incomplete call / tool body),
+/// deliberately NOT on bare `tool_request`; the obligation here is an open,
+/// incomplete call.
+fn post_think_end(content: usize, serial: bool) -> ActiveSeq {
+    let sched = SchedCtx::for_test();
+    let mut a = seq(false); // inside_thinking=false, think_ended=true
+    a.output_tokens = (0..content as u32).collect();
+    a.thinking_tokens = 0;
+    a.tool_call_opened = true;
+    a.tool_call_completed = false;
+    a.tool_request = true;
+    if serial {
+        let mut r = vec![0.0f32; 2048];
+        r[END as usize] = 9.0;
+        SCRIPT.with(|s| {
+            *s.borrow_mut() = Some(Script {
+                rows: vec![r],
+                cursor: 0,
+            })
+        });
+        let mut batch = vec![a];
+        decode(&mut batch, &sched);
+        SCRIPT.with(|s| *s.borrow_mut() = None);
+        a = batch.pop().unwrap();
+    } else {
+        emit_token(&mut a, END, None, &sched);
+    }
+    a
+}
+
+#[test]
+fn a_short_post_think_end_token_under_a_real_obligation_is_discarded_alike() {
+    for content in [7usize, 12, 15] {
+        let (s, m) = (
+            post_think_end(content, true),
+            post_think_end(content, false),
+        );
+        assert!(
+            !s.finished,
+            "content={content}: suppressed EOS must not end"
+        );
+        assert_eq!(s.output_tokens.len(), content, "content={content}");
+        assert_eq!(m.output_tokens, s.output_tokens, "content={content}");
+        assert_eq!(ThinkState::of(&m), ThinkState::of(&s), "content={content}");
+        // Emit popped the token AND undid the spec-resume count, so it stays
+        // at serial's zero (pre-merge it kept +1 for a token that never was).
+        assert_eq!(m.post_think_emitted, 0, "content={content}");
+    }
+}
+
+#[test]
+fn a_post_think_end_token_with_enough_content_stops_alike() {
+    let (s, m) = (post_think_end(16, true), post_think_end(16, false));
+    assert!(s.finished && m.finished);
+    assert_eq!(m.output_tokens, s.output_tokens);
+    assert_eq!(*s.output_tokens.last().unwrap(), END);
+    // The stop token IS recorded, so emit's post-think count keeps it (+1);
+    // serial tracks the guard on the emit path only.
+    assert_eq!(m.post_think_emitted, 1);
+}
+
+/// Bare `tool_request` (tools declared, none called) does NOT arm the guard:
+/// an auto-tools answer to a tool result may end short.
+#[test]
+fn a_bare_tool_request_does_not_hold_a_post_think_end_token() {
+    let mut a = seq(false);
+    a.output_tokens = (0..7u32).collect();
+    a.tool_request = true;
+    emit_token(&mut a, END, None, &SchedCtx::for_test());
+    assert!(a.finished);
+    assert_eq!(*a.output_tokens.last().unwrap(), END);
+}

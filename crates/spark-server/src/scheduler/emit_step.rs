@@ -166,7 +166,8 @@ pub(super) fn emit_token_at_position(
     // when it arrives; the transition below sets it). For requests that never
     // think, think_ended starts true, so the guard delays spec by the same N
     // from the response start.
-    if a.think_ended && !a.inside_thinking {
+    let counted_post_think = a.think_ended && !a.inside_thinking;
+    if counted_post_think {
         a.post_think_emitted += 1;
     }
 
@@ -333,14 +334,16 @@ pub(super) fn emit_token_at_position(
         // so it never counts toward the min_tokens floor (`min_tokens_eos_tests`).
         EndToken::Suppressed => {
             a.output_tokens.pop();
+            // The discarded token is not emitted content: undo the spec-resume
+            // count applied above (serial never records it). `thinking_tokens`
+            // stays advanced — serial's `advance_thinking` also counts the
+            // suppressed token before `end_token` runs.
+            if counted_post_think {
+                a.post_think_emitted = a.post_think_emitted.saturating_sub(1);
+            }
             return;
         }
-        EndToken::No => {} // MERGE-REVIEW: #175 evaluates the same EOS suppressors via
-                           // `eos_policy::evaluate` (shared policy module — EosInputs struct +
-                           // decision.suppress()) where #174 uses the commit-rule's
-                           // `end_token`/`EndToken` (Stop/Suppressed/No) shared with
-                           // `think_commit::end_token`. Both sides rewrote this decision
-                           // differently; #174's kept pending a pick.
+        EndToken::No => {}
     }
     // OPENCODE FIX: see process_decode_logits — same gate. Suppress streaming
     // of spontaneous-thinking content so it doesn't pollute opencode's history.

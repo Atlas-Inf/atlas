@@ -167,9 +167,11 @@ pub(super) fn fast(
         && !a.inside_thinking
         && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
     {
-        crate::scheduler::fast_greedy::classify_penalties(
-            &crate::scheduler::sample_step::verify_penalty_params(a),
-        )
+        // Per row, not once at block start: `penalty_params_for` reads
+        // `inside_tool_body`, which the pick loop advances across the span —
+        // a mid-block `</tool_call>` changes later rows' gates (#241, BFCL
+        // parallel_multiple_78).
+        crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids)
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };
@@ -278,9 +280,11 @@ pub(super) fn fast(
         && !a.inside_thinking
         && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
     {
-        crate::scheduler::fast_greedy::classify_penalties(
-            &crate::scheduler::sample_step::verify_penalty_params(a),
-        )
+        // Per row, not once at block start: `penalty_params_for` reads
+        // `inside_tool_body`, which the pick loop advances across the span —
+        // a mid-block `</tool_call>` changes later rows' gates (#241, BFCL
+        // parallel_multiple_78).
+        crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids)
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };

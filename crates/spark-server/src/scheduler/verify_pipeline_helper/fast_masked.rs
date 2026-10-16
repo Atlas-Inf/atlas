@@ -103,18 +103,10 @@ pub(super) fn try_chat_fast_path(
     } || a.sentence_defer_count >= MAX_SENTENCE_DEFER_TOKENS;
     let think_end_inject_armed = a.inside_thinking && (a.force_end_thinking || defer_hard_override);
     let pin_tool_armed = crate::scheduler::fast_greedy::tool_pin_armed(a);
-    // (c) penalty gate — same construction the slow path uses per
-    // position (penalty_params_for is position-independent here).
-    let penalty_gate = crate::scheduler::fast_greedy::classify_penalties(
-        &crate::scheduler::sample_step::verify_penalty_params(a),
-    );
-    // MERGE-REVIEW: #175 computed pin_tool_armed inline
-    // (`a.think_just_ended && a.require_tool_call && !a.tool_call_opened &&
-    // !a.inside_thinking`) and classified the penalty gate PER ROW via
-    // `fast_gate_over_rows(a, argmax_ids)` — the slow path advances
-    // inside_tool_body across the K picks, so a mid-block tool close can
-    // change the gate for later rows. #174's side (kept) classifies once
-    // from verify_penalty_params. Decide whether per-row is required.
+    // (c) penalty gate — PER ROW via `fast_gate_over_rows`: the slow path
+    // advances `inside_tool_body` across the K picks, so a mid-block tool
+    // close changes later rows' params (penalty_params_for reads the flag).
+    let penalty_gate = crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids);
     if f2_active
         || think_end_inject_armed
         || pin_tool_armed

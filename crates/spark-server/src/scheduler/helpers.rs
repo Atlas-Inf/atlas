@@ -43,14 +43,8 @@ pub fn dflash_seq_uses_raw_argmax(
     raw_requested: bool,
     masked_requested: bool,
     model: &dyn spark_model::traits::Model,
-    a: &crate::scheduler::types::ActiveSeq,
-    // MERGE-REVIEW: #175's signature took `lightning_product` +
-    // `argmax_ids` and gated on the per-row `fast_gate_over_rows` (models
-    // inside_tool_body advancing across the K picks); #174's
-    // `dflash_seq_raw_argmax_policy` classifies once via
-    // `verify_penalty_params` and adds the `verify_logits_argmax_only`
-    // override. Same gate, different strength — pick one before deleting.
-    _argmax_ids: &[u32],
+    a: &mut crate::scheduler::types::ActiveSeq,
+    argmax_ids: &[u32],
 ) -> bool {
     dflash_seq_raw_argmax_policy(
         raw_requested,
@@ -58,6 +52,7 @@ pub fn dflash_seq_uses_raw_argmax(
         model.is_lightning_dspark_product(),
         model.verify_logits_argmax_only(),
         a,
+        argmax_ids,
     )
 }
 

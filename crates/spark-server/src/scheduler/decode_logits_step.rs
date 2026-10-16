@@ -626,12 +626,7 @@ pub fn process_decode_logits(
             tracing::info!(
                 "process_decode_logits: remaining=0, output_tokens={}, thinking_tokens={}",
                 a.output_tokens.len(),
-                a.thinking_tokens // MERGE-REVIEW: #175 evaluates the same EOS suppressors via
-                                  // `eos_policy::evaluate` (shared policy module — EosInputs struct +
-                                  // decision.suppress()) where #174 uses the commit-rule's
-                                  // `end_token`/`EndToken` (Stop/Suppressed/No) shared with
-                                  // `think_commit::end_token`. Both sides rewrote this decision
-                                  // differently; #174's kept pending a pick.
+                a.thinking_tokens
             );
             a.finished = true;
         }

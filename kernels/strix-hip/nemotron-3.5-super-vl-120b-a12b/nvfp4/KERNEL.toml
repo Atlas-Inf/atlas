@@ -72,12 +72,17 @@ gated_delta_rule = "gated_delta_rule"
 # Nemotron 3.5 Super VL dispatch requests (verified end to end on gfx1151, Windows and
 # Linux); the startup kernel audit hard-errors if a dropped one is ever requested.
 [shadow_exempt]
+# qwen4exp-only optional loads (try_kernel_gated in layers/qwen4exp_mtp.rs and
+# try_kernel in ops/qwen4exp_moe_rows.rs) — never issued for this model.
+moe_expert_gemv = ["moe_weighted_sum_blend_rows"]
 norm = [
   "gated_rms_norm_f32_input_sigmoid",
   "gated_rms_norm_prefill_sigmoid",
   "gated_rms_norm_sigmoid",
   "residual_add_rms_norm_vanilla",
   "rms_norm_grouped",
+  # Same qwen4exp-only mHC load as moe_expert_gemv's entry above.
+  "rms_norm_f32_grouped",
   "rms_norm_offset_warp_row",
   "rms_norm_residual_vanilla",
 ]

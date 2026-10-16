@@ -199,15 +199,13 @@ extern "C" __global__ void moe_weighted_sum(
 // Saves 1 graph node per MoE layer (48 total).
 //
 // Grid: (ceil(hidden/256), 1, 1)  Block: (256, 1, 1)
-// The block body, shared by `moe_weighted_sum_blend` (one token) and
-// `moe_weighted_sum_blend_rows` (blockIdx.y a token).
-__device__ __forceinline__ void moe_weighted_sum_blend_block(
-    __nv_bfloat16* __restrict__ output,
-    const __nv_bfloat16* __restrict__ expert_out,
-    const float* __restrict__ expert_weights,
-    const __nv_bfloat16* __restrict__ shared_out,
-    const __nv_bfloat16* __restrict__ input,
-    const __nv_bfloat16* __restrict__ gate_weight,
+extern "C" __global__ void moe_weighted_sum_blend(
+    __nv_bfloat16* __restrict__ output,              // [hidden] output
+    const __nv_bfloat16* __restrict__ expert_out,    // [top_k, hidden]
+    const float* __restrict__ expert_weights,         // [top_k]
+    const __nv_bfloat16* __restrict__ shared_out,    // [hidden]
+    const __nv_bfloat16* __restrict__ input,         // [1, K] gate GEMV input (= MoE input)
+    const __nv_bfloat16* __restrict__ gate_weight,   // [1, K] shared expert gate weight
     unsigned int hidden,
     unsigned int top_k,
     unsigned int K
@@ -283,46 +281,4 @@ __device__ __forceinline__ void moe_weighted_sum_blend_block(
     }
     acc += sigmoid_val * __bfloat162float(shared_out[j]);
     output[j] = __float2bfloat16(acc);
-}
-
-extern "C" __global__ void moe_weighted_sum_blend(
-    __nv_bfloat16* __restrict__ output,              // [hidden] output
-    const __nv_bfloat16* __restrict__ expert_out,    // [top_k, hidden]
-    const float* __restrict__ expert_weights,         // [top_k]
-    const __nv_bfloat16* __restrict__ shared_out,    // [hidden]
-    const __nv_bfloat16* __restrict__ input,         // [1, K] gate GEMV input (= MoE input)
-    const __nv_bfloat16* __restrict__ gate_weight,   // [1, K] shared expert gate weight
-    unsigned int hidden,
-    unsigned int top_k,
-    unsigned int K
-) {
-    moe_weighted_sum_blend_block(output, expert_out, expert_weights, shared_out, input,
-                                 gate_weight, hidden, top_k, K);
-}
-
-// `moe_weighted_sum_blend` for `gridDim.y` tokens in one launch: block
-// (x, r) is block x of the single-token kernel on token r, so every output
-// byte is what a launch per token writes (ATLAS_QWEN4EXP_BATCH_SMALL).
-// Token r reads output/input row r (`hidden` / `K` apart), expert rows and
-// weights `top_k` deep, and the shared row at `shared_stride * r` (0: one
-// row for every token, e.g. the EP zero row; a null `shared_out` stays +0.0).
-//
-// Grid: (ceil(hidden/256), N, 1)  Block: (256, 1, 1)
-extern "C" __global__ void moe_weighted_sum_blend_rows(
-    __nv_bfloat16* __restrict__ output,              // [N, hidden]
-    const __nv_bfloat16* __restrict__ expert_out,    // [N, top_k, hidden]
-    const float* __restrict__ expert_weights,         // [N, top_k]
-    const __nv_bfloat16* __restrict__ shared_out,    // [N or 1, hidden] or null
-    const __nv_bfloat16* __restrict__ input,         // [N, K]
-    const __nv_bfloat16* __restrict__ gate_weight,   // [1, K]
-    unsigned int hidden,
-    unsigned int top_k,
-    unsigned int K,
-    unsigned int shared_stride
-) {
-    const unsigned long long r = blockIdx.y;
-    moe_weighted_sum_blend_block(
-        output + r * hidden, expert_out + r * top_k * hidden, expert_weights + r * top_k,
-        shared_out != 0 ? shared_out + r * shared_stride : shared_out, input + r * K,
-        gate_weight, hidden, top_k, K);
 }

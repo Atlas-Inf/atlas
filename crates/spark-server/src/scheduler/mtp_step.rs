@@ -158,16 +158,6 @@ pub fn step_mtp(
     for &idx in &bootstrap_idxs {
         super::mtp_step_trace::note_seq(&active[idx], b'b', 0);
         super::mtp_step_trace::note_forward(1);
-        // MERGE-REVIEW: #175 re-inlined the per-seq bootstrap body here —
-        // explicit `penalty_params_for(a, Verify, 0.0, None,
-        // a.logit_bias.clone())` + `penalty_history_scope` +
-        // `sample_token_with_grammar` + emit/ctx handling — while #174 moved
-        // the same body into `bootstrap::bootstrap_one` (which samples via
-        // `fast_greedy::pick_row`, honoring logit_bias through its own
-        // params). Same decision site, different implementations; #174's
-        // kept. Verify pick_row's penalty construction matches
-        // penalty_params_for(Verify, 0.0, None, logit_bias) before deleting
-        // this note.
         if bootstrap::bootstrap_one(
             model,
             &mut active[idx],

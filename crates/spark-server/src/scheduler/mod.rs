@@ -28,7 +28,6 @@ mod dflash_width;
 #[cfg(test)]
 mod dspark_fail_closed_tests;
 mod emit_step;
-mod eos_policy;
 mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;

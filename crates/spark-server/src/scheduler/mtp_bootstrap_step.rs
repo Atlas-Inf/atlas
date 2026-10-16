@@ -212,15 +212,6 @@ pub(super) fn step_mtp_bootstrap_batched(
     // this only changes WHICH kernel produced an identical argmax.
     // `decode_logits_fp32` models never reach here (`can_batch_bootstrap`).
     // Kill switch `ATLAS_NO_MTP_BOOT_ARGMAX` (PRESENCE).
-    // MERGE-REVIEW: #175 replaced this gate + per-row sample with an explicit
-    // `pen: Vec<SamplingParams>` built via penalty_params_for(Verify, 0.0,
-    // None, a.logit_bias), used it for `classify_penalties(p) == PenaltyGate::
-    // Neutral` eligibility, and passed `&pen[j]` to sample_token_with_grammar
-    // in the non-batched arm. #174's side (kept) gates eligibility on
-    // fast_greedy::raw_argmax_is_pick(a) and samples via
-    // fast_greedy::pick_row, which owns the same penalty/grammar semantics
-    // internally. Confirm the two eligibility predicates agree on logit_bias
-    // rows before deleting this note.
     let greedy: Vec<bool> = refs
         .iter()
         .map(|a| {
