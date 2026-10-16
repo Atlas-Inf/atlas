@@ -71,3 +71,12 @@ pub use layer::{PleLayer, PleSeqState, PleWeights};
 // construct PLE layers, so the import is unused there.
 #[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 pub(crate) use layer::ngram_trellis;
+
+/// ATLAS_EXL3_PLE_GRAPHS=1 (default off): let single-sequence decode capture
+/// CUDA graphs on a model with PLE and a QSA indexer
+/// (`Qwen3SsmLayer::single_decode_graph_unsupported`,
+/// `Qwen3AttentionLayer::qsa_decode_graph_ok`). Not validated with MTP.
+pub fn ple_graphs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_EXL3_PLE_GRAPHS").as_deref() == Ok("1"))
+}

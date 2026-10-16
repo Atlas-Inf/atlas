@@ -44,6 +44,7 @@ mod cpu_ref;
 #[cfg(test)]
 pub(crate) mod fixtures;
 mod materialize;
+pub(crate) mod moe_pack;
 mod requant;
 #[cfg(test)]
 #[path = "tests.rs"]

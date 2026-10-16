@@ -247,7 +247,10 @@ impl TransformerModel {
         // A layer that can never be captured (QSA's host top-k) vetoes
         // graphs for the whole model — a graph captured on the dense path
         // would silently replay WRONG attention once selection activates.
-        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        let layer_veto = self
+            .layers
+            .iter()
+            .any(|l| l.single_decode_graph_unsupported());
         // Diagnostic: force eager single-seq decode (graph-vs-eager A/B,
         // and to localize 716s inside captured graphs with LAUNCH_BLOCKING).
         let no_decode_graphs = std::env::var("ATLAS_NO_DECODE_GRAPHS").is_ok_and(|v| v == "1")
@@ -323,6 +326,9 @@ impl TransformerModel {
             && graph.0 != 0
         {
             self.gpu.launch_graph(*graph, stream)?;
+            for (li, l) in self.layers.iter().enumerate() {
+                l.decode_graph_replayed(seq.layer_states[li].as_mut(), seq.seq_len);
+            }
             seq.tokens.push(token);
             seq.seq_len += 1;
             return Ok(self.decode_logits_ptr());

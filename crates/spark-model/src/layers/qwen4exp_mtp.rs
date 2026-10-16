@@ -77,6 +77,10 @@ pub struct Qwen4ExpMtpProposerState {
     pub last_num_drafted: usize,
     /// Per-layer state for the reused body.
     pub body_state: Box<dyn LayerState>,
+    /// Draft-head max logit of each draft from the last `propose`, when the
+    /// confidence calibrator is on. Consumed (labelled, cleared) by
+    /// `after_verify`.
+    pub last_confs: Vec<f32>,
 }
 
 impl ProposerState for Qwen4ExpMtpProposerState {
@@ -121,6 +125,10 @@ pub struct Qwen4ExpMtpHead {
     hc_expand_k: KernelHandle,
     hc_head_k: KernelHandle,
     argmax_k: KernelHandle,
+
+    /// exllamav3-style draft-confidence calibrator
+    /// (`ATLAS_MTP_DRAFT_CONFIDENCE`); `None` = off.
+    conf_cal: Option<Mutex<qwen4exp_mtp_conf::DraftConfCalibrator>>,
 }
 
 impl Qwen4ExpMtpHead {
@@ -147,6 +155,12 @@ impl Qwen4ExpMtpHead {
             .iter()
             .filter(|t| matches!(t, atlas_core::config::LayerType::FullAttention))
             .count();
+        // Only slot `target_attn_layers` is ever written or read. The leading
+        // slots exist for indexing alone, so give them a token geometry
+        // (1 head x 8 dims, 256 B/block) instead of a full max-seq-len pool:
+        // at --max-seq-len 262144 that is 6.5 GB -> 0.6 GB.
+        let mut layer_dims = vec![(1usize, 8usize); target_attn_layers];
+        layer_dims.push((config.num_key_value_heads, config.head_dim));
         let kv_config = KvCacheConfig {
             block_size: 16,
             num_kv_heads: config.num_key_value_heads,
@@ -154,11 +168,16 @@ impl Qwen4ExpMtpHead {
             num_layers: target_attn_layers + 1,
             dtype: KvCacheDtype::Bf16,
             layer_dtypes: vec![],
-            layer_dims: vec![],
+            layer_dims,
             cache_blocks_per_seq: None,
         };
         let num_blocks = max_seq_len / kv_config.block_size + 1;
         let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
+        tracing::info!(
+            "qwen4_exp MTP drafter KV: {num_blocks} blocks, 1 live layer of {} ({:.2} GB)",
+            target_attn_layers + 1,
+            (num_blocks * kv_cache.config().block_bytes_kv_all_layers()) as f64 / 1e9
+        );
 
         let bf16 = |n: usize| -> Result<DevicePtr> { gpu.alloc(n * 2) };
 
@@ -185,6 +204,7 @@ impl Qwen4ExpMtpHead {
             hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
             hc_head_k: gpu.kernel("hyper_connection", "hc_head")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            conf_cal: qwen4exp_mtp_conf::DraftConfCalibrator::from_env().map(Mutex::new),
         })
     }
 
@@ -194,6 +214,7 @@ impl Qwen4ExpMtpHead {
             seq_len: 0,
             last_num_drafted: 0,
             body_state: self.module.body.alloc_state(gpu)?,
+            last_confs: Vec::new(),
         })
     }
 
@@ -221,6 +242,9 @@ impl Qwen4ExpMtpHead {
 #[path = "qwen4exp_mtp_forward.rs"]
 mod qwen4exp_mtp_forward;
 
+#[path = "qwen4exp_mtp_conf.rs"]
+mod qwen4exp_mtp_conf;
+
 impl DraftProposer for Qwen4ExpMtpHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         Ok(Box::new(self.alloc_state_inner(gpu)?))
@@ -247,6 +271,11 @@ impl DraftProposer for Qwen4ExpMtpHead {
 
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut current_token = last_token;
+        // Confidence early stop needs the raw draft logit, which the grammar
+        // arm does not expose; grammar sequences keep full windows.
+        let cal = self.conf_cal.as_ref().filter(|_| grammar_bitmask.is_none());
+        st.last_confs.clear();
+        let mut reach = 1.0f64;
         for i in 0..num_drafts {
             // Each step reads the stream highway, which the previous step's
             // `body.decode` left holding the drafter's own residual — so
@@ -267,6 +296,24 @@ impl DraftProposer for Qwen4ExpMtpHead {
             );
             drafts.push(draft);
             current_token = draft;
+            if let Some(cal) = cal {
+                // The draft head's logits are still in `ctx.buffers.logits()`
+                // (BF16, argmax index < head width): the score is its max.
+                let mut b = [0u8; 2];
+                ctx.gpu
+                    .copy_d2h(ctx.buffers.logits().offset(draft as usize * 2), &mut b)?;
+                let conf = f32::from_bits((u16::from_le_bytes(b) as u32) << 16);
+                st.last_confs.push(conf);
+                let c = cal.lock();
+                reach *= c.estimate(conf as f64);
+                if i + 1 < num_drafts && reach < c.confidence {
+                    tracing::debug!(
+                        "qwen4_exp MTP draft window cut at {} of {num_drafts}: conf {conf:.2} reach {reach:.3}",
+                        i + 1
+                    );
+                    break;
+                }
+            }
         }
         st.last_num_drafted = drafts.len();
         Ok(drafts)
@@ -283,6 +330,20 @@ impl DraftProposer for Qwen4ExpMtpHead {
             .as_any_mut()
             .downcast_mut::<Qwen4ExpMtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid qwen4_exp MTP proposer state"))?;
+        if let Some(cal) = &self.conf_cal
+            && !st.last_confs.is_empty()
+        {
+            let mut c = cal.lock();
+            let a = num_accepted.min(st.last_confs.len());
+            for &conf in &st.last_confs[..a] {
+                c.add_label(conf as f64, true);
+            }
+            if a < st.last_confs.len() {
+                c.add_label(st.last_confs[a] as f64, false);
+            }
+            c.decay_step();
+            st.last_confs.clear();
+        }
         let num_drafted = st.last_num_drafted.max(1);
         let num_to_trim = num_drafted.saturating_sub(num_accepted);
         if num_to_trim > 0 {

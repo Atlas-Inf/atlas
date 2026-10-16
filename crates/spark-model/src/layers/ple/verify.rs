@@ -105,7 +105,7 @@ impl PleLayer {
         stream: u64,
     ) -> Result<()> {
         let table_va = self.gather_host(ids, gpu, stream)?;
-        self.gather_embed(table_va, num_tokens, heads, gpu, stream)
+        self.gather_embed(table_va, num_tokens, heads, false, gpu, stream)
     }
 
     /// The HOST half of `gather`: NVMe fault-in + slot upload into the
@@ -124,10 +124,18 @@ impl PleLayer {
             .map_err(|_| anyhow::anyhow!("PLE table mutex poisoned"))?;
 
         // Release the PREVIOUS batch's pins. See `release_prev_pins`.
-        let gather_done = *self
-            .gather_done
-            .lock()
-            .map_err(|_| anyhow::anyhow!("PLE gather_done mutex poisoned"))?;
+        // A graph-step gather recorded no event: 0 = full stream sync.
+        let gather_done = if self
+            .gather_in_graph
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0
+        } else {
+            *self
+                .gather_done
+                .lock()
+                .map_err(|_| anyhow::anyhow!("PLE gather_done mutex poisoned"))?
+        };
         Self::release_prev_pins(&mut table, gpu, stream, gather_done)?;
         let table_va = match &mut *table {
             #[cfg(feature = "cuda")]
@@ -225,6 +233,7 @@ impl PleLayer {
         table_va: u64,
         num_tokens: usize,
         heads: usize,
+        graph: bool,
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
@@ -233,6 +242,15 @@ impl PleLayer {
         // overwrite it with packed I16 interpreted as BF16.
         if self.trellis.is_none() {
             self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)?;
+        }
+        // A graph step (capture, or an eager step in graph mode) must not
+        // record the event: an event last recorded in a capture cannot be
+        // waited on later. `gather_host` then falls back to a stream sync
+        // (outside any capture: prestage runs before replay/capture).
+        let in_graph = std::sync::atomic::Ordering::Relaxed;
+        self.gather_in_graph.store(graph, in_graph);
+        if graph {
+            return Ok(());
         }
         // The pins taken by this gather must outlive THIS kernel: record an event
         // right behind it; `release_prev_pins` waits on it before freeing the slots.

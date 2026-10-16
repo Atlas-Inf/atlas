@@ -16,6 +16,10 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<()> {
         // LongCat zero-experts are wired only on the single-token decode
+        if self.try_forward_exl3(input, 3, ctx, stream)? {
+            return Ok(());
+        }
+        // LongCat zero-experts are wired only on the single-token decode
         // + prefill paths (v1); this variant would silently mis-route the
         // 384-wide router. Named refusal, not silent wrongness.
         anyhow::ensure!(

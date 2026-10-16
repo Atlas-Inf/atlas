@@ -110,6 +110,41 @@ impl Qwen3AttentionLayer {
             // the same contract the n==2 / n==3 branches above already rely on.
             // Never branch on the unpadded seqs.len() here.
             self.ms_qkv_batchm_bf16(c)?;
+        } else if (2..=8).contains(&n)
+            && self.gated
+            && self.dense_gemv_batchm_k.0 != 0
+            && self.qkv_is_dense_bf16()
+            && self
+                .q_weight
+                .as_ref()
+                .and_then(|w| w.as_packed_q2())
+                .is_none()
+            && bf16_batchm_enabled()
+            && ops::exl3_dense_rows_env()
+        {
+            // Gated dense q/k/v (qwen4_exp with packed EXL3 attention): the
+            // batched projection writes the raw interleaved [Q|gate] rows at
+            // the same per_seq_qkv stride the per-token loop uses, then each
+            // row is deinterleaved exactly as ms_qkv_seq_q does it (deferred
+            // past the q LoRA fold when an adapter is resident). With the
+            // packed trellis registered, dense_gemv_batchm runs the native
+            // M-row EXL3 GEMV: one trellis read for all verify rows instead
+            // of one per row.
+            self.ms_qkv_batchm_bf16(c)?;
+            if !self.q_lora_active() {
+                // One launch for all rows: block i deinterleaves row i at the
+                // per_seq_qkv stride, the same copy the per-row loop did.
+                ops::deinterleave_qg(
+                    fwd.gpu,
+                    self.deinterleave_qg_k,
+                    qkv_buf,
+                    n as u32,
+                    nq,
+                    hd,
+                    (per_seq_qkv / bf16) as u32,
+                    stream,
+                )?;
+            }
         } else {
             for i in 0..n {
                 let normed_i = normed.offset(i * h * bf16);

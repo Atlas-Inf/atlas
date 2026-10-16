@@ -10,6 +10,35 @@ use spark_runtime::kernel_args::KernelLaunch;
 use super::hyper_connection_lowrank_gemm::{hc_finish_block, hc_finish_x4};
 use crate::layers::qwen3_attention::HcLowRank;
 
+/// ATLAS_HC_DECODE_FAST=1 (default off): T=1 decode runs `hc_pre_down_u` and
+/// `hc_pre_finish_x4s` — same arithmetic in the same order, more of the part
+/// busy. Read once per process.
+fn hc_decode_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_HC_DECODE_FAST").as_deref() == Ok("1"))
+}
+
+/// ATLAS_HC_MT (default on; "0" disables): T = 2..=8 with hc = 4 runs the
+/// two multi-token kernels (`hc_pre_down_mt`, `hc_pre_finish_x4_mt`) that
+/// read the mixer weights once for every row. Bitwise identical per token.
+fn hc_mt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_HC_MT").as_deref() != Ok("0"))
+}
+
+/// Warps per `hc_pre_down_u` block (one rank row each): ATLAS_HC_DOWN_WARPS,
+/// 4..32, default 8.
+fn hc_down_warps() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ATLAS_HC_DOWN_WARPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| (4..=32).contains(n))
+            .unwrap_or(8)
+    })
+}
+
 /// The three-launch collapse for small T. Same math as the fused kernel;
 /// the parity probe's T=8 fixture runs THIS path.
 #[allow(clippy::too_many_arguments)]
@@ -57,6 +86,42 @@ pub(super) fn hc_pre_split(
         .arg_u32(hc_mult)
         .arg_f32(norm_eps)
         .launch(stream)?;
+
+    // MTP verify rows: weights read once for all T rows (see hc_pre_down_mt).
+    if (2..=8).contains(&num_tokens) && hc_mult == 4 && w.rank <= 512 && hc_mt() {
+        let k_down_mt = gpu.kernel("hyper_connection", "hc_pre_down_mt")?;
+        let k_fin_mt = gpu.kernel("hyper_connection", "hc_pre_finish_x4_mt")?;
+        KernelLaunch::new(gpu, k_down_mt)
+            .grid([(w.rank as u32).div_ceil(8), num_tokens, 1])
+            .block([256, 1, 1])
+            .arg_ptr(normed)
+            .arg_ptr(w.down_w)
+            .arg_ptr(low)
+            .arg_u32(hidden_size)
+            .arg_u32(hc_mult)
+            .arg_u32(w.rank as u32)
+            .arg_u32(num_tokens)
+            .launch(stream)?;
+        return KernelLaunch::new(gpu, k_fin_mt)
+            .grid([
+                hidden_size.div_ceil(32) + num_tokens,
+                num_tokens.div_ceil(2),
+                1,
+            ])
+            .block([128, 1, 1])
+            .shared_mem(w.rank as u32 * 2 * 4)
+            .arg_ptr(normed)
+            .arg_ptr(low)
+            .arg_ptr(w.up_w)
+            .arg_ptr(if inject { w.inject_w } else { DevicePtr::NULL })
+            .arg_ptr(y_out)
+            .arg_ptr(inj_out)
+            .arg_u32(hidden_size)
+            .arg_u32(hc_mult)
+            .arg_u32(w.rank as u32)
+            .arg_u32(num_tokens)
+            .launch(stream);
+    }
 
     // `hc_pre_down` stages the token's `normed` row in SHARED memory, so the
     // 40 KB vector is read once per block instead of once per `rank` row. That
@@ -109,10 +174,23 @@ pub(super) fn hc_pre_split(
             HC_SMEM_MAX,
             hc_dim,
         );
-        let dsplit = (48 / num_tokens.max(1)).clamp(1, 10);
+        // ATLAS_HC_DECODE_FAST (T=1): 8-warp blocks, one rank row per warp,
+        // loads issued 16 ahead — bitwise identical (see `hc_pre_down_u`).
+        let fast = num_tokens == 1 && hc_decode_fast();
+        let (k_down, dsplit, dblock) = if fast {
+            let warps = hc_down_warps();
+            let rows = (w.rank as u32).div_ceil(warps);
+            (
+                gpu.kernel("hyper_connection", "hc_pre_down_u")?,
+                rows,
+                warps * 32,
+            )
+        } else {
+            (k_down, (48 / num_tokens.max(1)).clamp(1, 10), 1024)
+        };
         KernelLaunch::new(gpu, k_down)
             .grid([num_tokens, dsplit, 1])
-            .block([1024, 1, 1])
+            .block([dblock, 1, 1])
             .shared_mem(hc_smem as u32)
             .arg_ptr(normed)
             .arg_ptr(w.down_w)
@@ -159,7 +237,14 @@ pub(super) fn hc_pre_split(
     // Stream-per-warp layout (`hc_pre_finish_x4`, hc == 4 only): 4x the
     // threads of the thread-per-`d` kernel, identical accumulation order.
     let x4 = hc_mult == 4 && hc_finish_x4();
-    let (k_fin, grid_y, fblock) = if x4 {
+    let (k_fin, grid_y, fblock) = if x4 && num_tokens == 1 && hc_decode_fast() {
+        // Injection on its own extra block; see `hc_pre_finish_x4s`.
+        (
+            gpu.kernel("hyper_connection", "hc_pre_finish_x4s")?,
+            hidden_size.div_ceil(32) + 1,
+            128,
+        )
+    } else if x4 {
         (
             gpu.kernel("hyper_connection", "hc_pre_finish_x4")?,
             hidden_size.div_ceil(32),

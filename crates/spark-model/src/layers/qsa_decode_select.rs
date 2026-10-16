@@ -168,6 +168,81 @@ impl QsaIndexer {
     }
 }
 
+impl QsaIndexer {
+    /// Every position this indexer can hold stays inside the inert bound, so
+    /// no decode step can ever run an ACTIVE selection (dense attention is
+    /// exact for the whole sequence). Only then is decode capturable.
+    pub fn decode_graph_safe(&self) -> bool {
+        self.max_tokens <= self.inert_bound()
+    }
+
+    /// Graph-mode decode ingest (ATLAS_EXL3_PLE_GRAPHS): the same qk
+    /// projection as `decode_select`, then ONE kernel that reads the position
+    /// from `pos_dev`, stores the raw key and pools a just-completed block with
+    /// `qsa_block_pool`'s arithmetic — no position-dependent launch parameter,
+    /// so one captured graph serves every step. Always `None` (dense is exact);
+    /// legal only when `decode_graph_safe`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_ingest_graph(
+        &self,
+        st: &mut QsaSeqState,
+        normed: DevicePtr,
+        pos: usize,
+        pos_dev: DevicePtr,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Option<QsaSelection>> {
+        anyhow::ensure!(
+            self.decode_graph_safe() && !self.is_active_at(pos),
+            "QSA graph ingest at pos {pos}: capacity {} exceeds the inert bound {}",
+            self.max_tokens,
+            self.inert_bound()
+        );
+        // `pos + 1 == ingested`: the same step re-run eagerly after a failed
+        // capture attempt (the raw-key store and the pool are idempotent).
+        anyhow::ensure!(
+            pos < self.max_tokens && (pos == st.ingested || pos + 1 == st.ingested),
+            "QSA: graph decode at pos {pos} but {} tokens ingested (capacity {})",
+            st.ingested,
+            self.max_tokens
+        );
+        let hd = self.hd as usize;
+        ops::cublas_bf16_proj_dense(
+            normed,
+            self.qk_proj_w,
+            self.qk_scratch,
+            1,
+            self.qk_width() as u32,
+            self.hidden,
+            stream,
+        )
+        .context("QSA qk projection (graph decode)")?;
+        ops::qsa_decode_ingest(
+            gpu,
+            gpu.kernel("qsa_indexer", "qsa_decode_ingest")?,
+            self.qk_scratch.offset(self.n_heads as usize * hd * 2),
+            pos_dev,
+            st.raw_keys,
+            self.k_norm_w,
+            st.block_keys,
+            self.ratio,
+            self.hd,
+            self.rot,
+            self.theta,
+            self.eps,
+            stream,
+        )?;
+        self.note_graph_step(st, pos);
+        Ok(None)
+    }
+
+    /// Host counters after a graph-mode step at `pos` (captured or replayed).
+    pub fn note_graph_step(&self, st: &mut QsaSeqState, pos: usize) {
+        st.ingested = pos + 1;
+        st.pooled = st.ingested / self.ratio as usize;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SelectGeometry, expand_selection, select_blocks, select_geometry};

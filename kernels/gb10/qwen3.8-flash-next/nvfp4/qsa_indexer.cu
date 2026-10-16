@@ -99,6 +99,49 @@ extern "C" __global__ void qsa_block_pool(
     qsa_rope_store(stage, block_keys + (size_t)b * hd, d, rot, b * ratio, theta);
 }
 
+// ── qsa_decode_ingest ──
+// Graph-mode decode ingest (ATLAS_EXL3_PLE_GRAPHS): the position comes from
+// device memory, so one captured launch serves every step. Stores this token's
+// raw key at raw_keys[pos] and, when pos closes a block, pools that block with
+// exactly `qsa_block_pool`'s arithmetic (same expressions, same reduction).
+// Grid: (1,1,1)  Block: (hd,1,1)  smem (hd + 32) * 4.
+extern "C" __global__ void qsa_decode_ingest(
+    const __nv_bfloat16* __restrict__ key_row,    // [hd] this token's raw key
+    const unsigned int* __restrict__ pos_dev,     // [1] 0-based position
+    __nv_bfloat16* raw_keys,                      // [S, hd]
+    const __nv_bfloat16* __restrict__ k_norm_w,   // [hd]
+    __nv_bfloat16* __restrict__ block_keys,       // [max_blocks, hd]
+    const unsigned int ratio,
+    const unsigned int hd,
+    const unsigned int rot,
+    const float theta,
+    const float eps
+) {
+    const unsigned int pos = *pos_dev;
+    const unsigned int d = threadIdx.x;
+    raw_keys[(size_t)pos * hd + d] = key_row[d];
+    if ((pos + 1u) % ratio != 0u) return;         // uniform across the block
+    __syncthreads();
+    const unsigned int b = (pos + 1u) / ratio - 1u;
+
+    extern __shared__ float smem[];
+    float* stage = smem;
+    float* red = smem + hd;
+
+    float v = 0.0f;
+    for (unsigned int r = 0; r < ratio; ++r) {
+        v += (float)raw_keys[(size_t)(b * ratio + r) * hd + d];
+    }
+    v /= (float)ratio;
+
+    const float sq = qsa_block_reduce_sum(v * v, red);
+    const float rms = rsqrtf(sq / (float)hd + eps);
+    stage[d] = v * rms * (1.0f + (float)k_norm_w[d]);
+    __syncthreads();
+
+    qsa_rope_store(stage, block_keys + (size_t)b * hd, d, rot, b * ratio, theta);
+}
+
 // ── qsa_qprep ──
 // One decode query: per head, RMSNorm*(1+w) then rope at `pos`.
 // q_in is the head-concatenated slice of the qk projection row.
@@ -1354,4 +1397,340 @@ extern "C" __global__ void qsa_select_topk(
     for (int t = tail_start + tid; t < visible; t += nt) {
         sel[block_topk * ratio + (t - tail_start)] = t;
     }
+}
+
+// ── Device-resident decode/verify selection (ATLAS_QSA_DEVICE=1) ──────────
+//
+// The decode arm above (`qsa_qprep` + `qsa_score` + host sort or
+// `qsa_select_topk`) takes the position as a LAUNCH ARGUMENT and sizes its
+// grids from it, and the default arm sorts on the host. At 131K that is a D2H
+// + host sort + H2D per layer per verify row (48 stream drains per K=4 step),
+// and nothing about it can be captured in a graph.
+//
+// These three kernels read every row's 0-based position from device memory
+// (`pos_dev`, the attention metadata's positions) and use fixed grids, so one
+// captured launch serves every position, inert or active:
+//
+//   qsa_qprep_rows_dev    per-row q prep; same expressions as qsa_qprep_rows
+//   qsa_score_rows_devN   per-row block scores; the exact-tree contraction of
+//                         qsa_score_rows_exact, which is bit-identical to
+//                         qsa_score (the decode scorer); grid-stride over tiles
+//   qsa_select_rows_dev   per-row selection list + its length: identity
+//                         0..visible-1 while inert, else the block_topk best
+//                         blocks (ascending) expanded, then the tail
+//
+// SELECTION ORDER. Blocks rank by score DESCENDING then index ASCENDING, NaN
+// as -inf and -0 as +0 — `rank_cmp` in qsa_decode_select.rs. A radix select
+// on the 32-bit order key finds the threshold key T; ties AT T are taken
+// lowest index first, which is exactly that tie-break, so the selected set
+// equals the host arm's set and the ascending expansion is the same list.
+
+#define QSA_SD_BN 64
+#define QSA_SD_THREADS 1024
+#define QSA_SD_WARPS (QSA_SD_THREADS / 32)
+
+extern "C" __global__ void qsa_qprep_rows_dev(
+    const __nv_bfloat16* __restrict__ qk,       // [rows, qkw]
+    const __nv_bfloat16* __restrict__ q_norm_w, // [hd]
+    float* __restrict__ q_out,                  // [rows, n_heads, hd]
+    const unsigned int* __restrict__ pos_dev,   // [rows] 0-based positions
+    const unsigned int qkw,
+    const unsigned int n_heads,
+    const unsigned int hd,
+    const unsigned int rot,
+    const float theta,
+    const float eps
+) {
+    const unsigned int r = blockIdx.x;
+    const unsigned int hh = blockIdx.y;
+    const unsigned int d = threadIdx.x;
+    const unsigned int pos = pos_dev[r];
+
+    extern __shared__ float smem[];
+    float* stage = smem;
+    float* red = smem + hd;
+
+    const float x = (float)qk[(size_t)r * qkw + (size_t)hh * hd + d];
+    const float sq = qsa_block_reduce_sum(x * x, red);
+    const float rms = rsqrtf(sq / (float)hd + eps);
+    stage[d] = x * rms * (1.0f + (float)q_norm_w[d]);
+    __syncthreads();
+
+    float* out = q_out + ((size_t)r * n_heads + hh) * hd;
+    if (d < rot) {
+        const unsigned int half = rot >> 1;
+        const unsigned int j = (d < half) ? d : d - half;
+        const double inv_freq = exp(-2.0 * (double)j / (double)rot * log((double)theta));
+        double s, c;
+        sincos((double)pos * inv_freq, &s, &c);
+        const float x1 = stage[j];
+        const float x2 = stage[j + half];
+        out[d] = (d < half) ? (x1 * (float)c - x2 * (float)s)
+                            : (x2 * (float)c + x1 * (float)s);
+    } else {
+        out[d] = stage[d];
+    }
+}
+
+// Block scores for up to BM rows. Block = BM * QSA_SD_BN threads; a CTA stages
+// the rows' q once, then walks 64-block tiles grid-stride up to the largest
+// row's complete-block count. Each thread contracts one (row, block) score
+// with the reference reduction tree evaluated locally (see
+// qsa_score_rows_exact for the derivation and why __fmul_rn/__fadd_rn are
+// load-bearing). Exits at once when every row is inert.
+template <int BM>
+__device__ __forceinline__ void qsa_score_rows_dev_body(
+    const float* __restrict__ q,                // [rows, n_heads, hd]
+    const __nv_bfloat16* __restrict__ block_keys,
+    float* __restrict__ scores,                 // [rows, score_stride]
+    const unsigned int* __restrict__ pos_dev,   // [rows]
+    const unsigned int score_stride,
+    const unsigned int ratio,
+    const unsigned int n_heads,
+    const unsigned int hd,
+    const unsigned int rows,
+    const unsigned int block_topk
+) {
+    extern __shared__ float qsa_sd_smem[];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int ldk = hd + 1u;
+    float* qs = qsa_sd_smem;                            // [BM][n_heads][hd]
+    float* ks = qsa_sd_smem + (size_t)BM * n_heads * hd; // [BN][hd + 1]
+
+    unsigned int cmax = 0;
+    for (unsigned int r = 0; r < rows; ++r) {
+        const unsigned int c = (pos_dev[r] + 1u) / ratio;
+        cmax = (c > cmax) ? c : cmax;
+    }
+    if (cmax <= block_topk) return;                     // all rows inert
+
+    const unsigned int qn = BM * n_heads * hd;
+    for (unsigned int i = tid; i < qn; i += blockDim.x) {
+        const unsigned int rr = i / (n_heads * hd);
+        const unsigned int rest = i - rr * n_heads * hd;
+        qs[i] = (rr < rows) ? q[(size_t)rr * n_heads * hd + rest] : 0.0f;
+    }
+    const unsigned int ii = tid / QSA_SD_BN;
+    const unsigned int jj = tid - ii * QSA_SD_BN;
+    const unsigned int complete = (ii < rows) ? (pos_dev[ii] + 1u) / ratio : 0u;
+    const unsigned int groups = hd >> 5;
+
+    for (unsigned int b0 = blockIdx.x * QSA_SD_BN; b0 < cmax; b0 += gridDim.x * QSA_SD_BN) {
+        __syncthreads();                                // qs staged / previous tile consumed
+        for (unsigned int i = tid; i < QSA_SD_BN * hd; i += blockDim.x) {
+            const unsigned int bb = i / hd;
+            const unsigned int d = i - bb * hd;
+            const unsigned int b = b0 + bb;
+            ks[bb * ldk + d] = (b < cmax) ? (float)block_keys[(size_t)b * hd + d] : 0.0f;
+        }
+        __syncthreads();
+        const unsigned int b = b0 + jj;
+        if (ii >= rows || b >= cmax) continue;
+        float* out = scores + (size_t)ii * score_stride + b;
+        if (b >= complete) {
+            *out = -1e30f;
+            continue;
+        }
+        const float* qrow = qs + (size_t)ii * n_heads * hd;
+        const float* krow = ks + (size_t)jj * ldk;
+        float acc = 0.0f;
+        for (unsigned int hh = 0; hh < n_heads; ++hh) {
+            const float* qh = qrow + (size_t)hh * hd;
+            float dot = 0.0f;
+            for (unsigned int g = 0; g < groups; ++g) {
+                const float* qg = qh + g * 32u;
+                const float* kg = krow + g * 32u;
+                float t[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float x0 = __fmul_rn(qg[i], kg[i]);
+                    const float x1 = __fmul_rn(qg[i + 16], kg[i + 16]);
+                    const float x2 = __fmul_rn(qg[i + 8], kg[i + 8]);
+                    const float x3 = __fmul_rn(qg[i + 24], kg[i + 24]);
+                    t[i] = __fadd_rn(__fadd_rn(x0, x1), __fadd_rn(x2, x3));
+                }
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) t[i] = __fadd_rn(t[i], t[i + 4]);
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) t[i] = __fadd_rn(t[i], t[i + 2]);
+                dot = __fadd_rn(dot, __fadd_rn(t[0], t[1]));
+            }
+            acc = __fadd_rn(acc, fmaxf(dot, 0.0f));
+        }
+        *out = acc * rsqrtf((float)hd);
+    }
+}
+
+#define QSA_SCORE_ROWS_DEV_INST(BM)                                                              \
+    extern "C" __global__ void __launch_bounds__(BM * QSA_SD_BN) qsa_score_rows_dev##BM(         \
+        const float* __restrict__ q, const __nv_bfloat16* __restrict__ block_keys,               \
+        float* __restrict__ scores, const unsigned int* __restrict__ pos_dev,                    \
+        const unsigned int score_stride, const unsigned int ratio, const unsigned int n_heads,   \
+        const unsigned int hd, const unsigned int rows, const unsigned int block_topk)          \
+    {                                                                                            \
+        qsa_score_rows_dev_body<BM>(q, block_keys, scores, pos_dev, score_stride, ratio,         \
+                                    n_heads, hd, rows, block_topk);                              \
+    }
+QSA_SCORE_ROWS_DEV_INST(1)
+QSA_SCORE_ROWS_DEV_INST(2)
+QSA_SCORE_ROWS_DEV_INST(4)
+
+// Order key: ascending key == rank_cmp order (score descending), NaN as -inf,
+// -0 as +0. The index tie-break is applied separately (lowest index first).
+__device__ __forceinline__ unsigned int qsa_sd_key(float s) {
+    unsigned int b = __float_as_uint(s);
+    if (isnan(s)) b = 0xff800000u;
+    if (s == 0.0f) b = 0u;
+    const unsigned int mono = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    return ~mono;
+}
+
+// One CTA of QSA_SD_THREADS per row.
+extern "C" __global__ void __launch_bounds__(QSA_SD_THREADS) qsa_select_rows_dev(
+    const float* __restrict__ scores,           // [rows, score_stride]
+    int* __restrict__ sel,                      // [rows, sel_stride]
+    int* __restrict__ nsel,                     // [rows]
+    const unsigned int* __restrict__ pos_dev,   // [rows]
+    const unsigned int score_stride,
+    const unsigned int sel_stride,
+    const unsigned int block_topk,
+    const unsigned int ratio
+) {
+    const unsigned int r = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int visible = pos_dev[r] + 1u;
+    const unsigned int complete = visible / ratio;
+    int* out = sel + (size_t)r * sel_stride;
+
+    if (complete <= block_topk) {                       // inert: everything visible, in order
+        for (unsigned int t = tid; t < visible; t += blockDim.x) out[t] = (int)t;
+        if (tid == 0) nsel[r] = (int)visible;
+        return;
+    }
+    const float* row = scores + (size_t)r * score_stride;
+
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int s_prefix, s_mask, s_need;
+    __shared__ unsigned int w_a[QSA_SD_WARPS];
+    __shared__ unsigned int w_b[QSA_SD_WARPS];
+
+    // Radix select of the block_topk-th smallest key, 8 bits at a time.
+    if (tid == 0) {
+        s_prefix = 0u;
+        s_mask = 0u;
+        s_need = block_topk;
+    }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (unsigned int i = tid; i < 256u; i += blockDim.x) hist[i] = 0u;
+        __syncthreads();
+        const unsigned int prefix = s_prefix;
+        const unsigned int mask = s_mask;
+        // Scores cluster in a few top-byte bins, so plain shared atomics would
+        // serialize on one address: aggregate same-digit lanes per warp first.
+        for (unsigned int base = warp * 32u; base < complete; base += QSA_SD_WARPS * 32u) {
+            const unsigned int b = base + lane;
+            unsigned int dig = 0x100u;
+            if (b < complete) {
+                const unsigned int k = qsa_sd_key(row[b]);
+                if ((k & mask) == prefix) dig = (k >> shift) & 0xFFu;
+            }
+            const unsigned int peers = __match_any_sync(0xFFFFFFFFu, dig);
+            if (dig != 0x100u && lane == (unsigned int)(__ffs(peers) - 1)) {
+                atomicAdd(&hist[dig], (unsigned int)__popc(peers));
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            const unsigned int need = s_need;
+            unsigned int acc = 0u, d = 0u;
+            for (; d < 255u; ++d) {
+                if (acc + hist[d] >= need) break;
+                acc += hist[d];
+            }
+            s_need = need - acc;
+            s_prefix = prefix | (d << shift);
+            s_mask = mask | (0xFFu << shift);
+        }
+        __syncthreads();
+    }
+    const unsigned int T = s_prefix;
+    const unsigned int take_eq = s_need;                // keys == T to take, lowest index first
+
+    // Contiguous warp chunks (multiple of 32) so the selection is emitted in
+    // ascending block order with ballot/popc prefixes.
+    const unsigned int groups32 = (complete + 31u) / 32u;
+    const unsigned int chunk = ((groups32 + QSA_SD_WARPS - 1u) / QSA_SD_WARPS) * 32u;
+    const unsigned int c0 = warp * chunk;
+    const unsigned int c1 = (c0 + chunk < complete) ? c0 + chunk : complete;
+    const unsigned int lt_mask = (1u << lane) - 1u;
+
+    // Pass 1: keys equal to T per warp.
+    unsigned int n_eq = 0u;
+    for (unsigned int base = c0; base < c1; base += 32u) {
+        const unsigned int b = base + lane;
+        const bool eq = (b < c1) && (qsa_sd_key(row[b]) == T);
+        n_eq += __popc(__ballot_sync(0xFFFFFFFFu, eq));
+    }
+    if (lane == 0) w_a[warp] = n_eq;
+    __syncthreads();
+    if (tid == 0) {
+        unsigned int run = 0u;
+        for (unsigned int w = 0; w < QSA_SD_WARPS; ++w) {
+            const unsigned int v = w_a[w];
+            w_a[w] = run;
+            run += v;
+        }
+    }
+    __syncthreads();
+
+    // Pass 2: selected per warp.
+    unsigned int eq_run = w_a[warp];
+    unsigned int n_sel = 0u;
+    for (unsigned int base = c0; base < c1; base += 32u) {
+        const unsigned int b = base + lane;
+        const unsigned int k = (b < c1) ? qsa_sd_key(row[b]) : 0xFFFFFFFFu;
+        const bool live = b < c1;
+        const bool eq = live && (k == T);
+        const unsigned int eq_ball = __ballot_sync(0xFFFFFFFFu, eq);
+        const bool pick = live && (k < T || (eq && (eq_run + __popc(eq_ball & lt_mask)) < take_eq));
+        n_sel += __popc(__ballot_sync(0xFFFFFFFFu, pick));
+        eq_run += __popc(eq_ball);
+    }
+    if (lane == 0) w_b[warp] = n_sel;
+    __syncthreads();
+    if (tid == 0) {
+        unsigned int run = 0u;
+        for (unsigned int w = 0; w < QSA_SD_WARPS; ++w) {
+            const unsigned int v = w_b[w];
+            w_b[w] = run;
+            run += v;
+        }
+    }
+    __syncthreads();
+
+    // Pass 3: emit, ascending.
+    eq_run = w_a[warp];
+    unsigned int out_run = w_b[warp];
+    for (unsigned int base = c0; base < c1; base += 32u) {
+        const unsigned int b = base + lane;
+        const unsigned int k = (b < c1) ? qsa_sd_key(row[b]) : 0xFFFFFFFFu;
+        const bool live = b < c1;
+        const bool eq = live && (k == T);
+        const unsigned int eq_ball = __ballot_sync(0xFFFFFFFFu, eq);
+        const bool pick = live && (k < T || (eq && (eq_run + __popc(eq_ball & lt_mask)) < take_eq));
+        const unsigned int pick_ball = __ballot_sync(0xFFFFFFFFu, pick);
+        if (pick) {
+            const unsigned int slot = out_run + __popc(pick_ball & lt_mask);
+            for (unsigned int j = 0; j < ratio; ++j) out[slot * ratio + j] = (int)(b * ratio + j);
+        }
+        out_run += __popc(pick_ball);
+        eq_run += __popc(eq_ball);
+    }
+    const unsigned int tail_start = complete * ratio;
+    for (unsigned int t = tail_start + tid; t < visible; t += blockDim.x) {
+        out[block_topk * ratio + (t - tail_start)] = (int)t;
+    }
+    if (tid == 0) nsel[r] = (int)(block_topk * ratio + (visible - tail_start));
 }

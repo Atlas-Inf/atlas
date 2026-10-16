@@ -134,6 +134,28 @@ impl<'a> KernelLaunch<'a> {
         self
     }
 
+    /// Add a by-value struct argument (e.g. a `#[repr(C)]` parameter block
+    /// passed as `const T p`). Like `arg_tensormap`, the bytes land in
+    /// `ceil(len/8)` CONSECUTIVE slots and contribute ONE param entry; the
+    /// driver copies the kernel's declared parameter size from its start.
+    pub fn arg_bytes(mut self, bytes: &[u8]) -> Self {
+        let slot = self.storage.len() as u32;
+        for c in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.storage.push(u64::from_le_bytes(w));
+        }
+        if bytes.is_empty() {
+            self.storage.push(0);
+        }
+        self.kinds.push(ArgKind {
+            is_buffer: false,
+            byte_len: u16::try_from(bytes.len()).expect("by-value kernel arg larger than 64 KiB"),
+            slot,
+        });
+        self
+    }
+
     /// Add a u32 argument.
     pub fn arg_u32(mut self, v: u32) -> Self {
         let slot = self.storage.len() as u32;

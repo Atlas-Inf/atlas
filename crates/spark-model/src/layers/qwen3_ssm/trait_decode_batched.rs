@@ -513,6 +513,30 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             }
+        } else if (5..=8).contains(&num_tokens)
+            && self.dense_gemv_batchm_k.0 != 0
+            && self.qkvz_nvfp4.is_none()
+            && self.qkvz_fp8.is_none()
+            && !self.ssm.in_proj_qkvz.weight.is_null()
+            && ops::exl3_dense_rows_env()
+        {
+            // K=5..8 MTP verify on a packed EXL3 in_proj_qkvz: the M-row
+            // native GEMV reads the trellis once for all rows (same arm as
+            // the 2..=4 widths above take through dense_gemv_batchm). Without
+            // it these widths fell to the 128-row tile dense_gemm at
+            // ~0.94 ms per layer.
+            ops::dense_gemv_batchm(
+                ctx.gpu,
+                self.dense_gemv_batchm_k,
+                normed,
+                &self.ssm.in_proj_qkvz,
+                proj_dst,
+                num_tokens as u32,
+                qkvz_size as u32,
+                h as u32,
+                qkvz_size as u32,
+                stream,
+            )?;
         } else if qkvz_verify_nvfp4_wins(
             num_tokens,
             self.qkvz_fp8.is_some(),

@@ -454,6 +454,59 @@ extern "C" __global__ void hc_pre_down(
     }
 }
 
+// `hc_pre_down` with the lane loop's loads issued 16 ahead (ATLAS_HC_DECODE_FAST).
+// BITWISE IDENTICAL: every lane still accumulates i = lane, lane+32, ... in
+// order with the same FMA-free (--fmad=false) mul+add and the same shfl tree;
+// only the load schedule changes. Launched with 8-warp blocks over more of the
+// part (one row per warp) instead of 10 x 32-warp blocks.
+extern "C" __global__ void hc_pre_down_u(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const __nv_bfloat16* __restrict__ down_w,  // [rank, hc*H]
+    float* __restrict__ low_out,               // [T, rank]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank,
+    const unsigned int num_tokens
+) {
+    extern __shared__ float s_nx[];
+    const unsigned int t = blockIdx.x;
+    if (t >= num_tokens) return;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int warps = blockDim.x >> 5;
+    const unsigned int hc_dim = hc * hidden_size;
+    const float inv_hc = 1.0f / (float)hc;
+
+    for (unsigned int i = threadIdx.x; i < hc_dim; i += blockDim.x) {
+        s_nx[i] = normed[(size_t)t * hc_dim + i];
+    }
+    __syncthreads();
+
+    const unsigned int rows_per_split = (rank + gridDim.y - 1) / gridDim.y;
+    const unsigned int r0 = blockIdx.y * rows_per_split;
+    const unsigned int r1 = min(r0 + rows_per_split, rank);
+    for (unsigned int r = r0 + warp; r < r1; r += warps) {
+        const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
+        float acc = 0.0f;
+        unsigned int i = lane;
+        for (; i + 15u * 32u < hc_dim; i += 16u * 32u) {
+            __nv_bfloat16 u[16];
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) u[k] = row[i + k * 32u];
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) acc += (float)u[k] * s_nx[i + k * 32u];
+        }
+        for (; i < hc_dim; i += 32) {
+            acc += (float)row[i] * s_nx[i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) low_out[(size_t)t * rank + r] = qhc_silu(acc * inv_hc);
+    }
+}
+
 // Prefill-shaped sibling of `hc_pre_down`, tiled over BOTH tokens and hc_dim.
 //
 // `hc_pre_down` stages the whole `normed` row (hc_dim floats, 40 KB) in shared
@@ -815,6 +868,273 @@ extern "C" __global__ void hc_pre_finish_x4(
         }
         if (lane == 0) {
             inj_out[(size_t)t * hc + warp] = 2.0f * qhc_sigmoid(acc * inv_hc);
+        }
+    }
+}
+
+// `hc_pre_finish_x4` with the injection contraction moved to its OWN block
+// (blockIdx.y == gridDim.y - 1) instead of riding on block 0 after its finish
+// work, and 16 `up_w` loads in flight per thread (ATLAS_HC_DECODE_FAST).
+// BITWISE IDENTICAL: each (t, d, s) still accumulates r = 0..rank-1 in order,
+// the stream mean is the same 4-term sum, and the injection keeps the
+// warp-per-stream lane walk j = lane, lane+32, ... and the same shfl tree.
+extern "C" __global__ void hc_pre_finish_x4s(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const float* __restrict__ low,             // [T, rank]
+    const __nv_bfloat16* __restrict__ up_w,    // [rank, hc*H]
+    const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
+    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    float* __restrict__ inj_out,               // [T, hc]
+    const unsigned int hidden_size,
+    const unsigned int hc,                     // must be 4 (host checks)
+    const unsigned int rank
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;        // == stream s
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const float* nx = normed + (size_t)t * hc_dim;
+    const float inv_hc = 1.0f / (float)hc;
+
+    if (blockIdx.y == gridDim.y - 1u) {
+        if (inject_w == nullptr) return;
+        const __nv_bfloat16* row = inject_w + (size_t)warp * hc_dim;
+        float acc = 0.0f;
+        unsigned int j = lane;
+        for (; j + 7u * 32u < hc_dim; j += 8u * 32u) {
+            __nv_bfloat16 u[8];
+            float x[8];
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) {
+                u[k] = row[j + k * 32u];
+                x[k] = nx[j + k * 32u];
+            }
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) acc += (float)u[k] * x[k];
+        }
+        for (; j < hc_dim; j += 32) {
+            acc += (float)row[j] * nx[j];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) {
+            inj_out[(size_t)t * hc + warp] = 2.0f * qhc_sigmoid(acc * inv_hc);
+        }
+        return;
+    }
+
+    extern __shared__ float smem_lo[];         // [rank]
+    __shared__ float part[4][32];
+    for (unsigned int r = tid; r < rank; r += blockDim.x) {
+        smem_lo[r] = low[(size_t)t * rank + r];
+    }
+    __syncthreads();
+
+    const unsigned int d = blockIdx.y * 32u + lane;
+    if (d < H) {
+        const unsigned int i = warp * H + d;
+        const __nv_bfloat16* ub = up_w + i;
+        float acc = 0.0f;
+        unsigned int r = 0;
+        for (; r + 16 <= rank; r += 16) {
+            float l[16];
+            __nv_bfloat16 u[16];
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) {
+                l[k] = smem_lo[r + k];
+                u[k] = ub[(size_t)(r + k) * hc_dim];
+            }
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) {
+                acc += (float)u[k] * l[k];
+            }
+        }
+        for (; r < rank; ++r) {
+            acc += (float)ub[(size_t)r * hc_dim] * smem_lo[r];
+        }
+        part[warp][lane] = qhc_sigmoid(acc) * nx[i];
+    }
+    __syncthreads();
+    if (warp == 0 && d < H) {
+        float mixed = 0.0f;
+        mixed += part[0][lane];
+        mixed += part[1][lane];
+        mixed += part[2][lane];
+        mixed += part[3][lane];
+        y_out[(size_t)t * H + d] = __float2bfloat16(mixed * inv_hc);
+    }
+}
+
+// ───────────── Multi-token decode collapse (MTP verify rows, T = 2..8) ─────────────
+// The T <= 8 split path above launches `hc_pre_down` with grid [T, S] and
+// `hc_pre_finish_x4` with grid [T, H/32]: every token re-reads the whole
+// down_w (6.5 MB), up_w (6.5 MB) and inject_w. At T = 4 that is ~110 us per
+// collapse, ~97 collapses per verify step. These two kernels give each warp
+// ONE weight row / column strip and loop the tokens inside, so the weights
+// are read once for all T rows.
+//
+// BITWISE IDENTICAL to the T = 1 kernels, per token:
+//   * hc_pre_down_mt: for every (t, r) a warp walks i = lane, lane+32, ... in
+//     increasing order (mul then add, --fmad=false) and reduces with the same
+//     shfl_down tree, exactly as `hc_pre_down` / `hc_pre_down_u`.
+//   * hc_pre_finish_x4_mt: for every (t, d, s) one thread sums
+//     r = 0, 1, ..., rank-1 into one FP32 register, the stream mean folds
+//     s = 0,1,2,3 in that order, and the injection keeps the warp-per-stream
+//     lane walk + shfl tree of `hc_pre_finish_x4`.
+// Only the order in which independent (t, r) / (t, d, s) outputs are visited
+// changes.
+#define HC_MT_MAX 8u
+
+extern "C" __global__ void hc_pre_down_mt(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const __nv_bfloat16* __restrict__ down_w,  // [rank, hc*H]
+    float* __restrict__ low_out,               // [T, rank]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank,
+    const unsigned int num_tokens
+) {
+    // grid = [ceil(rank / 8), T], block = 256: one warp per (r, t).
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int r = blockIdx.x * (blockDim.x >> 5) + warp;
+    const unsigned int t = blockIdx.y;
+    if (r >= rank || t >= num_tokens) return;
+    const unsigned int hc_dim = hc * hidden_size;
+    const float inv_hc = 1.0f / (float)hc;
+    const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
+    const float* nx = normed + (size_t)t * hc_dim;
+    float acc = 0.0f;
+    unsigned int i = lane;
+    for (; i + 15u * 32u < hc_dim; i += 16u * 32u) {
+        float w[16];
+        float x[16];
+        #pragma unroll
+        for (unsigned int k = 0; k < 16; ++k) w[k] = (float)row[i + k * 32u];
+        #pragma unroll
+        for (unsigned int k = 0; k < 16; ++k) x[k] = nx[i + k * 32u];
+        #pragma unroll
+        for (unsigned int k = 0; k < 16; ++k) acc += w[k] * x[k];
+    }
+    for (; i < hc_dim; i += 32u) {
+        acc += (float)row[i] * nx[i];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    if (lane == 0) low_out[(size_t)t * rank + r] = qhc_silu(acc * inv_hc);
+}
+
+// grid = [ceil(H/32) + T, ceil(T/2)], block = 128 (4 warps == 4 streams).
+// blockIdx.x < ceil(H/32): the finish strip for 32 dims, tokens 2y, 2y+1.
+// blockIdx.x >= ceil(H/32) (y == 0 only): injection vector of token x - strips.
+#define HC_MT_TPB 2u
+extern "C" __global__ void hc_pre_finish_x4_mt(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const float* __restrict__ low,             // [T, rank]
+    const __nv_bfloat16* __restrict__ up_w,    // [rank, hc*H]
+    const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
+    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    float* __restrict__ inj_out,               // [T, hc]
+    const unsigned int hidden_size,
+    const unsigned int hc,                     // must be 4 (host checks)
+    const unsigned int rank,
+    const unsigned int num_tokens
+) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;        // == stream s
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const float inv_hc = 1.0f / (float)hc;
+    const unsigned int strips = (H + 31u) / 32u;
+
+    if (blockIdx.x >= strips) {
+        if (blockIdx.y != 0) return;
+        const unsigned int t = blockIdx.x - strips;
+        if (inject_w == nullptr || t >= num_tokens) return;
+        const float* nx = normed + (size_t)t * hc_dim;
+        const __nv_bfloat16* row = inject_w + (size_t)warp * hc_dim;
+        float acc = 0.0f;
+        unsigned int j = lane;
+        for (; j + 15u * 32u < hc_dim; j += 16u * 32u) {
+            __nv_bfloat16 u[16];
+            float x[16];
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) {
+                u[k] = row[j + k * 32u];
+                x[k] = nx[j + k * 32u];
+            }
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) acc += (float)u[k] * x[k];
+        }
+        for (; j < hc_dim; j += 32) {
+            acc += (float)row[j] * nx[j];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) {
+            inj_out[(size_t)t * hc + warp] = 2.0f * qhc_sigmoid(acc * inv_hc);
+        }
+        return;
+    }
+
+    const unsigned int t0 = blockIdx.y * HC_MT_TPB;
+    if (t0 >= num_tokens) return;
+    const unsigned int tn = min(HC_MT_TPB, num_tokens - t0);
+    extern __shared__ float s_lo[];            // [rank][HC_MT_TPB]
+    __shared__ float part[HC_MT_TPB][4][32];
+    for (unsigned int x = tid; x < rank * HC_MT_TPB; x += blockDim.x) {
+        const unsigned int rr = x / HC_MT_TPB;
+        const unsigned int t = x - rr * HC_MT_TPB;
+        s_lo[x] = (t < tn) ? low[(size_t)(t0 + t) * rank + rr] : 0.0f;
+    }
+    __syncthreads();
+
+    const unsigned int d = blockIdx.x * 32u + lane;
+    if (d < H) {
+        const unsigned int i = warp * H + d;
+        const __nv_bfloat16* ub = up_w + i;
+        float acc[HC_MT_TPB];
+        #pragma unroll
+        for (unsigned int t = 0; t < HC_MT_TPB; ++t) acc[t] = 0.0f;
+        unsigned int r = 0;
+        for (; r + 16 <= rank; r += 16) {
+            float u[16];
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) u[k] = (float)ub[(size_t)(r + k) * hc_dim];
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) {
+                #pragma unroll
+                for (unsigned int t = 0; t < HC_MT_TPB; ++t) acc[t] += u[k] * s_lo[(r + k) * HC_MT_TPB + t];
+            }
+        }
+        for (; r < rank; ++r) {
+            const float u = (float)ub[(size_t)r * hc_dim];
+            #pragma unroll
+            for (unsigned int t = 0; t < HC_MT_TPB; ++t) acc[t] += u * s_lo[r * HC_MT_TPB + t];
+        }
+        #pragma unroll
+        for (unsigned int t = 0; t < HC_MT_TPB; ++t) {
+            if (t < tn) part[t][warp][lane] = qhc_sigmoid(acc[t]) * normed[(size_t)(t0 + t) * hc_dim + i];
+        }
+    }
+    __syncthreads();
+    if (warp == 0 && d < H) {
+        for (unsigned int t = 0; t < tn; ++t) {
+            float mixed = 0.0f;
+            mixed += part[t][0][lane];
+            mixed += part[t][1][lane];
+            mixed += part[t][2][lane];
+            mixed += part[t][3][lane];
+            y_out[(size_t)(t0 + t) * H + d] = __float2bfloat16(mixed * inv_hc);
         }
     }
 }

@@ -195,4 +195,89 @@ impl Qwen3AttentionLayer {
         }
         Ok(attn_out)
     }
+
+    /// Device arm (default; `ATLAS_QSA_DEVICE=0` opts out) for this step: every row one
+    /// sequence's, plain BF16 KV, no MLA, no high-speed swap.
+    pub(super) fn ms_qsa_dev_ok(
+        &self,
+        row_owner: Option<&[usize]>,
+        n: usize,
+        kv_cache: &PagedKvCache,
+    ) -> bool {
+        use spark_runtime::kv_cache::KvCacheDtype;
+        let Some(qsa) = self.qsa.as_ref() else {
+            return false;
+        };
+        let (k, v) = self.kv_dtype.kv_pair();
+        let single_owner = match row_owner {
+            Some(map) => map.len() >= n && map.iter().take(n).all(|o| *o == map[0]),
+            None => n == 1,
+        };
+        qsa.dev_enabled()
+            && single_owner
+            && n <= crate::layers::qsa::QSA_DEV_ROWS_MAX
+            && self.mla.is_none()
+            && matches!(k, KvCacheDtype::Bf16)
+            && matches!(v, KvCacheDtype::Bf16)
+            && !self.high_speed_swap_engaged(kv_cache)
+    }
+
+    /// Device-arm phase 5: all rows' ingest, selection and attention in one
+    /// pass (`QsaIndexer::dev_decode_rows`). Replaces the batched dense
+    /// attention, the per-row phase and the ingest loop alike.
+    pub(super) fn ms_phase_attn_qsa_dev(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        states: &mut [&mut (dyn LayerState + 'static)],
+        seq_lens: &[usize],
+        row_owner: Option<&[usize]>,
+        kv_cache: &mut PagedKvCache,
+        meta: AttnMetadataDev,
+    ) -> Result<DevicePtr> {
+        let qsa = self
+            .qsa
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("QSA device phase on a layer without an indexer"))?;
+        let n = c.n;
+        for (i, &p) in seq_lens.iter().take(n).enumerate() {
+            anyhow::ensure!(
+                p == seq_lens[0] + i,
+                "QSA device phase: rows are not consecutive positions ({seq_lens:?})"
+            );
+        }
+        let attn_out = c.fwd.buffers.attn_output();
+        let a = crate::layers::qsa::QsaDevAttn {
+            q: c.qkv_buf,
+            q_stride: (c.per_seq_qkv / c.bf16) as u32,
+            out: attn_out,
+            k_pool: kv_cache.k_pool_ptr(self.attn_layer_idx),
+            v_pool: kv_cache.v_pool_ptr(self.attn_layer_idx),
+            block_table: meta.block_table,
+            max_blocks_per_seq: meta.max_blocks_per_seq,
+            nq: c.nq,
+            nkv: c.nkv,
+            block_size: c.bs,
+            inv_sqrt_d: self.effective_attn_scale(c.hd),
+        };
+        let owner = match row_owner {
+            Some(map) if !map.is_empty() => map[0],
+            _ => 0,
+        };
+        let state = states.get_mut(owner).ok_or_else(|| {
+            anyhow::anyhow!("QSA device phase: no sequence state for owner {owner}")
+        })?;
+        let st = crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, *state, c.fwd.gpu)?;
+        qsa.dev_decode_rows(
+            st,
+            c.normed,
+            c.h * c.bf16,
+            seq_lens[0],
+            n,
+            meta.positions,
+            &a,
+            c.fwd.gpu,
+            c.stream,
+        )?;
+        Ok(attn_out)
+    }
 }

@@ -200,6 +200,28 @@ impl TransformerModel {
                     )?;
                 }
             }
+        } else if (2..=8).contains(&num_tokens)
+            && self.lm_head_nvfp4.is_none()
+            && self.dense_gemv_batchm_kernel.0 != 0
+            && ops::exl3_dense_rows_env()
+            && ops::exl3_dense_is_registered(self.lm_head_weight.weight)
+        {
+            // Packed EXL3 lm_head: one trellis read for all verify rows
+            // (dense_gemv_batchm routes a registered weight to the native
+            // M-row GEMV). Without this, 3..8 rows fell to the BF16 tile
+            // GEMM (13 ms at M = 3) and 2 rows to two batch-1 GEMVs.
+            ops::dense_gemv_batchm(
+                self.gpu.as_ref(),
+                self.dense_gemv_batchm_kernel,
+                hidden,
+                &self.lm_head_weight,
+                logits,
+                num_tokens,
+                v,
+                h,
+                v,
+                stream,
+            )?;
         } else if num_tokens == 2 {
             // Double-GEMV: reads weights once, computes 2 outputs.
             // GEMM M=2 with 64×64 tiles wastes 97% of M-dimension → ~3× slower.

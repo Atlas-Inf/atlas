@@ -234,7 +234,12 @@ impl TransformerModel {
         // failed with "decode at pos 34 but 26 tokens ingested". `decode_a`
         // and `decode_a2` already apply this veto; the verify paths never did,
         // because on this model they used to refuse before reaching a graph.
-        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        let layer_veto = self
+            .layers
+            .iter()
+            .any(|l| l.single_decode_graph_unsupported())
+            || (crate::layers::qsa::qsa_device_mode()
+                && self.layers.iter().any(|l| l.decode_graph_unsupported()));
         // Per-layer DFlash timing must see real launches, not one replayed
         // graph, so it disables capture the same way k4 diag does.
         let time_layers = std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");

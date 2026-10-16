@@ -26,6 +26,16 @@
 //! tensors. [`build_mtp_moe`] slices and requantizes them so the body gets the
 //! same [`MoeLayer`] every other layer gets.
 //!
+//! **EXL3 packs** are the exception to that requant: there the MTP block's
+//! experts are per-expert trellis like every main layer's, and
+//! [`build_mtp_moe`] hands them to the same packed loader
+//! (`weight_map::exl3::moe_pack`) — they are never dequantized or requantized.
+//! The block's dense EXL3 linears (`fc_embedding`, `fc_hidden`, `q/k/v/o`,
+//! the indexer projection) are materialized to BF16 once at load by
+//! `weight_map::exl3::materialize`, the same as the main layers' dense ones.
+//! The `mtp.*` tensors only reach the store under `--speculative`
+//! (`skip_mtp` in `spark-server`).
+//!
 //! ## Forward (supplied by the proposer, not here)
 //!
 //! ```text
@@ -99,6 +109,14 @@ fn mtp_expert_layout(store: &WeightStore, mlp: &str) -> MtpExpertLayout {
 /// The MTP block's own stream mixer, the twin of the model-level one.
 const MTP_MIXER_PREFIX: &str = "mtp.hyper_connection_mixer";
 
+/// `true` when the MTP block's experts ship as packed EXL3 trellis (routed or
+/// shared). Those stay packed; see [`build_mtp_moe`].
+fn mtp_experts_packed_exl3(store: &WeightStore) -> bool {
+    let mlp = format!("{MTP_LAYER_PREFIX}.mlp");
+    store.contains(&format!("{mlp}.experts.0.gate_proj.trellis"))
+        || store.contains(&format!("{mlp}.shared_expert.gate_proj.trellis"))
+}
+
 /// A loaded Qwen3.8-Flash-Next MTP draft module.
 ///
 /// `embed_tokens` and `lm_head` are deliberately absent: this checkpoint sets
@@ -153,6 +171,32 @@ fn build_mtp_moe(
     let stream = gpu.default_stream();
 
     let mlp = format!("{MTP_LAYER_PREFIX}.mlp");
+    // EXL3 pack: the MTP block's 512 routed experts and its shared expert
+    // ship as trellis (`experts.{e}.{gate,up,down}_proj.{trellis,suh,svh,mul1}`),
+    // exactly like a main layer's. They go through the SAME packed loader as
+    // the main layers (`moe_pack::load_moe_exl3_packed`, registered under this
+    // block's `shared_expert_gate` pointer) and run on the same packed forward
+    // (`layers/moe/forward_exl3.rs`): no dequant, no NVFP4 requant, no second
+    // resident copy. Only the router is handled like `ffn::build_moe` (BF16
+    // gate kept; the packed forward routes on it).
+    if mtp_experts_packed_exl3(store) {
+        let weights = crate::weight_map::exl3::moe_pack::load_moe_exl3_packed(
+            store, &mlp, n_experts, gpu, config, false,
+        )
+        .with_context(|| format!("qwen4_exp MTP: packed EXL3 experts at {mlp}"))?;
+        let gate_nvfp4 = Some(quantize_to_nvfp4(
+            &weights.gate,
+            n_experts,
+            h,
+            gpu,
+            absmax_k,
+            quantize_k,
+            stream,
+        )?);
+        let moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
+            .context("qwen4_exp MTP: packed EXL3 MoeLayer")?;
+        return Ok(FfnComponent::Moe(moe));
+    }
     let q = |w: &DenseWeight, n: usize, k: usize| -> Result<_> {
         quantize_to_nvfp4(w, n, k, gpu, absmax_k, quantize_k, stream)
     };
@@ -405,9 +449,14 @@ pub fn load_qwen4exp_mtp_module(
     };
 
     let spent = free_before.saturating_sub(gpu.free_memory().unwrap_or(0) as u64);
+    let moe_storage = if mtp_experts_packed_exl3(store) {
+        "kept packed EXL3 trellis (no requant)"
+    } else {
+        "requantized to NVFP4"
+    };
     tracing::info!(
         "qwen4_exp MTP draft module loaded: 1 reused full-attention layer \
-         (gated attn, dense — no QSA indexer + mHC + {}-expert MoE requantized from stacked BF16), \
+         (gated attn, dense — no QSA indexer + mHC + {}-expert MoE {moe_storage}), \
          shared embed/lm_head, own head mixer. Construction cost {:.2} GB.",
         config.num_experts,
         spent as f64 / 1e9,

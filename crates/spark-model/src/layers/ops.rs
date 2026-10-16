@@ -58,6 +58,10 @@ mod gemm_fp4;
 pub mod model_stats;
 pub use model_stats::ModelStats;
 
+#[path = "ops/exl3_coopmk.rs"]
+mod exl3_coopmk;
+#[path = "ops/exl3_dense.rs"]
+mod exl3_dense;
 #[path = "ops/exl3_ops.rs"]
 mod exl3_ops;
 #[path = "ops/gemm_fp8_prefill.rs"]
@@ -150,6 +154,8 @@ mod q2_0_mmq;
 mod q4k_mmq;
 #[path = "ops/qsa.rs"]
 mod qsa;
+#[path = "ops/qsa_dev.rs"]
+mod qsa_dev;
 #[path = "ops/qsa_prefill_attn.rs"]
 mod qsa_prefill_attn;
 #[path = "ops/qsa_rows.rs"]
@@ -206,6 +212,8 @@ pub use dispatch_proj::*;
 pub use dispatch_proj_rowwise::*;
 pub use dp4a::*;
 pub use embeddings::*;
+pub use exl3_coopmk::*;
+pub use exl3_dense::*;
 pub use exl3_ops::*;
 pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;
@@ -251,6 +259,7 @@ pub use prefill_attn_turbok::*;
 pub use q2_0_mmq::*;
 pub use q4k_mmq::*;
 pub use qsa::*;
+pub use qsa_dev::*;
 pub use qsa_prefill_attn::*;
 pub use qsa_rows::*;
 pub use quant_dispatch::*;

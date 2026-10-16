@@ -153,6 +153,18 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// The single-sequence decode veto (`decode_a`). Defaults to
+    /// [`Self::decode_graph_unsupported`]; a layer whose single-row decode is
+    /// capture-safe under a switch (ATLAS_EXL3_PLE_GRAPHS) overrides it.
+    fn single_decode_graph_unsupported(&self) -> bool {
+        self.decode_graph_unsupported()
+    }
+
+    /// Host bookkeeping for a single-sequence decode step served by a graph
+    /// REPLAY (this layer's `decode` did not run). `pos` is the 0-based
+    /// position of the replayed token. Default: nothing to advance.
+    fn decode_graph_replayed(&self, _state: &mut dyn LayerState, _pos: usize) {}
+
     /// Marconi aux state: host-serialized per-layer SEQUENCE state that must
     /// travel with an SSM snapshot for a prefix-cache hit to be complete —
     /// PLE's n-gram history + conv state, QSA's ingested indexer keys.

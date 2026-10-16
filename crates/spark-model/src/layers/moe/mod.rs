@@ -469,6 +469,9 @@ impl MoeLayer {
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod dump;
 mod forward;
+mod forward_exl3;
+mod forward_exl3_grouped;
+mod forward_exl3_km;
 mod lora;
 mod lora_gateup;
 mod lora_router;

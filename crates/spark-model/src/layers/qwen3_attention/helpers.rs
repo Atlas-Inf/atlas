@@ -257,6 +257,40 @@ impl Qwen3AttentionLayer {
     }
 }
 
+impl Qwen3AttentionLayer {
+    /// Whether this layer's single-sequence decode may be captured into a CUDA
+    /// graph. An indexer vetoes by default: its ingest counter is host state,
+    /// its launch parameters depend on the position, the default top-k arm
+    /// sorts on the host, and a graph captured on the dense path would replay
+    /// wrong attention once selection activates. ATLAS_EXL3_PLE_GRAPHS=1 lifts
+    /// the veto only when the indexer's capacity keeps every position inside
+    /// the inert bound (selection can never activate; --max-seq-len <= 2051 on
+    /// this card): the decode ingest then runs as one kernel that reads the
+    /// position from device memory (`QsaIndexer::decode_ingest_graph`).
+    pub(super) fn qsa_decode_graph_ok(&self) -> bool {
+        match self.qsa.as_ref() {
+            None => true,
+            Some(q) => {
+                crate::layers::ple::ple_graphs_enabled()
+                    && (q.decode_graph_safe() || q.dev_enabled())
+            }
+        }
+    }
+
+    /// A replayed step: advance the indexer's host counters exactly as the
+    /// captured `decode_ingest_graph` step did.
+    pub(super) fn qsa_graph_replayed(&self, state: &mut dyn crate::layer::LayerState, pos: usize) {
+        if let Some(qsa) = self.qsa.as_ref()
+            && let Some(attn) = state
+                .as_any_mut()
+                .downcast_mut::<crate::layer::AttnLayerState>()
+            && let Some(st) = attn.qsa.as_mut()
+        {
+            qsa.note_graph_step(st, pos);
+        }
+    }
+}
+
 /// The QSA per-seq carry from a sequence's [`crate::layer::AttnLayerState`],
 /// lazily created on first use (Avarok #753 item B).
 pub(in crate::layers::qwen3_attention) fn qsa_seq_state<'a>(

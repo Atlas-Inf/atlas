@@ -253,6 +253,10 @@ pub(crate) fn build_linear_attention_dense_bf16(
     // BF16 checkpoints `dense_auto` returned the WeightStore's own buffers, and
     // a plain free would be repeated by the store at teardown.
     // `free_loader_source` tells the two apart — identical numerics.
+    crate::layers::ops::exl3_dense_register_concat(
+        qkvz_full.weight,
+        &[ssm35.in_proj_qkv.weight, ssm35.in_proj_z.weight],
+    );
     let la = format!("{lp}.linear_attn");
     let _ = free_loader_source(
         store,

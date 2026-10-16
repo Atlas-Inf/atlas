@@ -20,11 +20,9 @@
 //! launch scratch is layer-owned and steps serialize on one stream, so a
 //! `QsaSelection` is valid only until the next `decode_select` on this layer.
 //!
-//! CUDA graphs: the default top-k arm is a host sort on the scores (D2H), the
-//! ingest counter is host state, and launch parameters depend on the
-//! position — a layer carrying an indexer vetoes decode-graph capture
-//! entirely. `ATLAS_QSA_DEVICE_TOPK=1` removes the host sort up to
-//! `QSA_SELECT_MAX_BLOCKS` complete blocks; the veto stays.
+//! CUDA graphs: this arm sorts on the host and sizes launches by position, so
+//! an indexer vetoes decode graphs. The default device arm (`qsa_dev.rs`) is
+//! resident and capturable, lifting the veto; `ATLAS_QSA_DEVICE=0` opts out.
 
 use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -35,6 +33,9 @@ use crate::layers::ops;
 mod qsa_aux;
 #[path = "qsa_decode_select.rs"]
 mod qsa_decode_select;
+#[path = "qsa_dev.rs"]
+mod qsa_dev;
+pub use qsa_dev::{QSA_DEV_ROWS_MAX, QsaDevAttn, device_mode as qsa_device_mode};
 #[path = "qsa_free.rs"]
 mod qsa_free;
 
@@ -97,8 +98,8 @@ pub struct QsaIndexer {
     /// whole score matrix plus a host sort per row; see `qsa_topk_rows`.
     k_topk_rows_k: KernelHandle,
     /// Tiled scorer: QSA_SR_B outputs per block, bit-identical to
-    /// `k_score_rows_k`. See `qsa_score_rows_b`.
-    #[allow(dead_code)] // kept as the fallback below the exact-tree scorer
+    /// `k_score_rows_k`. See `qsa_score_rows_b`. Fallback below the exact scorer.
+    #[allow(dead_code)]
     k_score_rows_b_k: KernelHandle,
     /// One thread per score, BIT-IDENTICAL to `k_score_rows_k`: it replays
     /// the reference reduction tree locally. See `qsa_score_rows_exact`.
@@ -107,9 +108,7 @@ pub struct QsaIndexer {
     k_score_rows_tc_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
     k_select_k: KernelHandle,
-    /// `ATLAS_QSA_DEVICE_TOPK=1`: select on the device (no per-layer host
-    /// round trip); `ATLAS_QSA_TOPK_VERIFY=1` also runs the host reference
-    /// and fails on the first mismatch.
+    /// `ATLAS_QSA_DEVICE_TOPK=1`: device select (`ATLAS_QSA_TOPK_VERIFY=1` checks it).
     device_topk: bool,
     topk_verify: bool,
     /// `QSA_PA_G` q-heads per block. Same math, one K/V read per group
@@ -128,10 +127,10 @@ pub struct QsaIndexer {
     v_scratch: DevicePtr,
     table_dev: DevicePtr,   // [ceil((budget+ratio)/8)] i32 (any block_size >= 8)
     seq_len_dev: DevicePtr, // [1] i32
-    /// The sequence's REAL block table, uploaded per prefill-select call —
-    /// chunk-0 metadata carries no device table (cache-skip attention is
-    /// contiguous), so the host Vec is the source of truth.
+    /// The sequence's REAL block table, uploaded per prefill-select call
+    /// (chunk-0 metadata carries no device table).
     prefill_table_dev: DevicePtr, // [ceil(max_tokens/8)] i32
+    dev: Option<qsa_dev::QsaDev>, // None when ATLAS_QSA_DEVICE=0
 }
 
 /// Prefill ingest GEMM slab (rows), bounding `qk_scratch`.
@@ -189,7 +188,7 @@ impl QsaIndexer {
         let block_topk = budget / ratio;
         let qk_width = (n_heads + 1) * hd;
         let sel_cap = budget + ratio;
-        Ok(Self {
+        Self {
             qk_proj_w,
             q_norm_w,
             k_norm_w,
@@ -234,12 +233,12 @@ impl QsaIndexer {
             table_dev: gpu.alloc(sel_cap.div_ceil(8) * 4)?,
             seq_len_dev: gpu.alloc(4)?,
             prefill_table_dev: gpu.alloc(max_tokens.div_ceil(8) * 4)?,
-        })
+            dev: None,
+        }
+        .with_dev(gpu)
     }
 
     /// The largest visible prefix whose selection is provably all-visible.
-    /// One sequence's indexer carry: counters + raw/pooled key buffers
-    /// (per-seq CONTENT; launch scratch stays layer-owned — steps serialize).
     pub fn inert_bound(&self) -> usize {
         (self.budget + self.ratio - 1) as usize
     }

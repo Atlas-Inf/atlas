@@ -14,6 +14,14 @@
 #
 #   exl3.cu       vendored exllamav3 reconstruct / Hadamard / hgemm entry
 #                 points
+#   exl3_coopmk.cu  CoopMK: vcruz305/exllamav3 runtime-K cooperative decode
+#                 MoE (coopmk_a/b) on the packed trellis, extern "C" wrappers
+#   exl3_gemv.cu  batch-1 dense GEMV on the packed trellis, K2..K8
+#                 (ATLAS_EXL3_DENSE_NATIVE=1; structure after the fork's
+#                 exl3_gemv_kernel.cuh, smem-staged dq_dispatch decode)
+#   exl3_prefill.cu grouped packed-EXL3 MoE prefill: routing copies, gather +
+#                 Hadamard, trellis decode straight into mma.sync fragments
+#                 (ATLAS_EXL3_PREFILL_GROUPED=1)
 #   exl3_vendor/  the vendored exllamav3 device headers (see its NOTICE.md)
 
 [build]

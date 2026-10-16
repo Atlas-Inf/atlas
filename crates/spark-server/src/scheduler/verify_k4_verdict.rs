@@ -37,7 +37,14 @@ pub(super) enum K4Hidden {
 #[inline]
 fn save_hidden(model: &dyn Model, hidden: K4Hidden, na: usize) -> anyhow::Result<()> {
     match hidden {
-        K4Hidden::VerifyRow => model.save_hidden_for_mtp(na, 0),
+        K4Hidden::VerifyRow => {
+            // The qwen4_exp drafter reads the PRE-mixer stream highway, not
+            // the saved hidden: move verify row na into row 0 first (K=2/3
+            // do this at every save; K>=4 never did, so every K>=4 propose
+            // conditioned on verify row 0 instead of the accepted position).
+            model.select_mtp_stream_row(na)?;
+            model.save_hidden_for_mtp(na, 0)
+        }
         K4Hidden::Stash(i) => model.save_hidden_for_mtp_from_stash(i, 0),
         // Deferred mode never saves inline (the batched propose reads the
         // stash rows directly; the per-seq fallback re-saves per sequence).
