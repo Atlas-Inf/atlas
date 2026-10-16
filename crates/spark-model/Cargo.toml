@@ -148,6 +148,10 @@ name = "glm_topk_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "gdn_fla_scratch_garbage"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "w4a16_lmhead_716_repro"
 required-features = ["cuda", "gpu-examples"]
 

@@ -522,10 +522,18 @@ gated_delta_rule_chunk_fwd_o(
                 #pragma unroll
                 for (int i = 0; i < 16; i++)
                     a[i] = (__bf16)kq[(tr + (lane & 15)) * CHUNK + kb + i];
+                // chunk_delta_h_vfused writes uc only for rows < ce, so rows
+                // >= ce of the last partial chunk hold stale scratch from
+                // earlier passes/requests. kq is 0 there, but 0 x Inf/NaN = NaN,
+                // so a non-finite stale bit pattern poisons that output column
+                // for the whole chunk. On gfx1151 this made cold output depend
+                // on earlier requests (#158).
                 #pragma unroll
                 for (int k = 0; k < 16; k++)
-                    bfrag[k] = (__bf16)(float)
-                        uc_in[base * CHUNK * V_DIM + (kb + k) * v_dim + tc + (lane & 15)];
+                    bfrag[k] = (kb + k < ce)
+                        ? (__bf16)(float)
+                            uc_in[base * CHUNK * V_DIM + (kb + k) * v_dim + tc + (lane & 15)]
+                        : (__bf16)0.0f;
                 acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, bfrag, acc);
             }
             #pragma unroll
