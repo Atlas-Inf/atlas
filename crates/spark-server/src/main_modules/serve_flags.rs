@@ -103,6 +103,12 @@ pub(crate) fn publish_kernel_flags(args: &cli::ServeArgs) {
     // `None` where the flag was not given, so the documented `ATLAS_*` fallback
     // still decides. Passing the clap default instead sealed both cells on
     // every boot and made those variables silent no-ops.
+    spark_model::weight_map::exl3::set_exl3_native_decode(args.exl3_native_decode);
+    if std::env::var_os("ATLAS_EXL3_NATIVE_DECODE").is_some() {
+        tracing::warn!(
+            "ATLAS_EXL3_NATIVE_DECODE is no longer read; pass --exl3-native-decode instead"
+        );
+    }
     spark_runtime::set_ssm_tail_midchunk(args.ssm_tail_midchunk);
     crate::scheduler::levers::set_mtp_gate_force(
         args.mtp_gate.as_deref().map(|gate| gate == "force"),

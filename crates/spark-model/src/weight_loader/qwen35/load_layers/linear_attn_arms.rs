@@ -346,6 +346,12 @@ pub(crate) fn build_linear_attention_dense_bf16(
         layer.set_fp8_decode_weights(Some(qkvz_fp8), Some(out_fp8));
         tracing::info!("Layer {layer_idx}: SSM FP8 decode overlay installed (BF16 prefill kept)");
     }
+    // Decode-only native EXL3 overlay (--exl3-native-decode, see qwen3_ssm/exl3_decode.rs).
+    if tp_size == 1 && layer.attach_exl3_decode_from_store(store, lp, gpu)? {
+        tracing::info!(
+            "Layer {layer_idx}: EXL3 native decode overlay installed (BF16 prefill kept)"
+        );
+    }
     Ok(Box::new(layer))
 }
 

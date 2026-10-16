@@ -385,6 +385,14 @@ pub struct ServeArgs {
     #[arg(long)]
     pub mtp_gate: Option<String>,
 
+    /// EXL3 checkpoints only: run single-token decode and the 2-row MTP verify
+    /// of the dense linears (GDN, full attention, LM head) with exllamav3's
+    /// int8-activation GEMV on the packed EXL3 weights, instead of the BF16
+    /// copies materialized at load. Prefill keeps the BF16 copies. Opt-in;
+    /// no effect on other checkpoints.
+    #[arg(long)]
+    pub exl3_native_decode: bool,
+
     /// LM-head precision: `default` (the clap default — no override, the model config
     /// decides), `bf16` (final vocab projection in BF16 — the SAFE CHOICE, and what to pass
     /// when the config picks something lower; matches vLLM checkpoint precision), `nvfp4` (force the

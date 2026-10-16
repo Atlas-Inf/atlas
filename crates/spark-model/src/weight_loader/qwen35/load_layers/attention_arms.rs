@@ -251,6 +251,9 @@ pub(crate) fn build_full_attention_nvfp4(
         layer.set_prefill_weights(Some(qt), Some(kt), Some(vt), Some(ot));
     }
     layer.predequant_for_prefill(gpu, config, stream)?;
+    if tp_size == 1 && layer.attach_exl3_decode_from_store(store, &p, gpu)? {
+        tracing::info!("Layer {layer_idx}: EXL3 native attention decode overlay installed");
+    }
 
     Ok(Box::new(layer))
 }
