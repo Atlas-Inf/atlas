@@ -53,6 +53,7 @@ int cuModuleGetGlobal_v2(unsigned long long *dptr, unsigned long *bytes,
     (void)dptr; (void)bytes; (void)hmod; (void)name; return 100;
 }
 int cuFuncSetAttribute(void *f, int attr, int val) { (void)f; (void)attr; (void)val; return 100; }
+int cuFuncGetName(const char **a, void *b) { (void)a; (void)b; return 100; }
 int cuLaunchKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
                    unsigned int bx, unsigned int by, unsigned int bz,
                    unsigned int sm, void *s, void **p, void **e) {
