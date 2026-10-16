@@ -87,6 +87,9 @@ pub(crate) fn load_model(
     tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>>,
     carried: Carried,
 ) -> Result<Option<Prepared>> {
+    // #158: the exact prefix-cache grid is read once, at model build.
+    spark_runtime::prefill_grid::set_exact_prefix_cache(args.exact_prefix_cache);
+
     // 0. Resolve model directory from HF ID or path
     spark_runtime::progress::phase(1, "model resolve");
     let model_dir = serve_phases::resolve_model_dir(&args)?;

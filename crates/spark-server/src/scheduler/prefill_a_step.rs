@@ -120,7 +120,8 @@ pub fn start_chunked_prefill(
 
     let request_start = Instant::now();
     let total = prompt_tokens.len();
-    let chunk_len = total.min(max_prefill_tokens);
+    // R11 fix 5: a non-last chunk 0 ends on the model's prefill cut grid.
+    let chunk_len = model.align_prefill_chunk(0, total.min(max_prefill_tokens), total);
     let is_last = chunk_len >= total;
 
     tracing::info!(

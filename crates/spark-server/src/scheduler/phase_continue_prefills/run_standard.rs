@@ -87,6 +87,8 @@ pub(super) fn run_standard_chunk_loop(
     {
         chunk_len = tb - p.chunk_offset;
     }
+    // R11 fix 5: end non-last chunks on the model's prefill cut grid.
+    chunk_len = model.align_prefill_chunk(p.chunk_offset, chunk_len, p.prompt_tokens.len());
     let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
     // Align intermediate chunks to GDN WY4 boundary (4 tokens).
     if !is_last && chunk_len >= 4 {
@@ -320,8 +322,11 @@ pub(super) fn run_standard_chunk_loop(
                 p.chunk_offset,
                 p.prompt_tokens.len(),
             );
-            // Normalize SSM states after EVERY chunk to prevent state drift.
-            if let Err(e) = model.normalize_ssm_states(&p.seq, prefill_stream) {
+            // Normalize SSM states after every chunk to prevent state drift
+            // (R11 fix 4: except chunks wholly below a restored anchor).
+            if model.normalize_after_chunk(&p.seq, p.chunk_offset)
+                && let Err(e) = model.normalize_ssm_states(&p.seq, prefill_stream)
+            {
                 tracing::warn!("SSM state normalization failed: {e:#}");
             }
             if is_last {

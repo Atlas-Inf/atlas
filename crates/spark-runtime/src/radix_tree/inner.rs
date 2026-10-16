@@ -194,7 +194,11 @@ impl RadixTreeInner {
         // our suffix. If any consumer treats `matched_tokens` as a block
         // boundary, the tail of that block is foreign context the model then
         // attends to. This lever exists to A/B exactly that.
-        let subblock_ok = std::env::var("ATLAS_PREFIX_SUBBLOCK").as_deref() != Ok("0");
+        // R11 fix 1: a model running the prefill pass grid turns sub-block
+        // matches off — they hand out a block computed for a different
+        // continuation (layout-dependent KV).
+        let subblock_ok = std::env::var("ATLAS_PREFIX_SUBBLOCK").as_deref() != Ok("0")
+            && !crate::prefill_grid::subblock_disabled();
         if subblock_ok
             && remainder > 0
             && remainder < block_size

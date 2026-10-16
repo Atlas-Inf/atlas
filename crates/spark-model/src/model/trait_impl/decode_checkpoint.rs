@@ -37,7 +37,10 @@ impl TransformerModel {
     /// matched is within `interval` blocks → tiny replay tail. Live SSM state
     /// must be canonical at call time (post-commit on the MTP path).
     pub(super) fn decode_marconi_checkpoint_dispatch(&self, seq: &mut SequenceState) {
+        // R11 fix 1: decode-produced state is not on the prefill pass grid;
+        // under the grid no decode checkpoint is registered.
         if !self.ssm_snapshots.is_enabled()
+            || self.prefill_grid() > 0
             || !self.prefix_cache.is_active()
             || self.config.num_ssm_layers() == 0
             || seq.hss_window_start() != 0

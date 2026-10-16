@@ -37,6 +37,7 @@ pub mod kv_spill;
 pub mod metal_backend;
 pub mod op_cache;
 pub mod pinned_hosts;
+pub mod prefill_grid;
 pub mod prefix_cache;
 pub mod progress;
 pub mod radix_tree;

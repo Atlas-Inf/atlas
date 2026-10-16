@@ -329,6 +329,19 @@ pub trait Model: Send + Sync {
         })
     }
 
+    /// R11 fix 5: shrink a NON-last scheduler prefill chunk so it ends on the
+    /// model's prefill cut grid (no stray 1-token passes where a chunk end and
+    /// a grid cut sit one token apart). Default: unchanged.
+    fn align_prefill_chunk(&self, _offset: usize, len: usize, _total: usize) -> usize {
+        len
+    }
+
+    /// R11 fix 4: whether the scheduler should run `normalize_ssm_states`
+    /// after a prefill chunk ending at `chunk_end`. Default: always.
+    fn normalize_after_chunk(&self, _seq: &SequenceState, _chunk_end: usize) -> bool {
+        true
+    }
+
     /// Normalize SSM h_state norms to prevent catastrophic state explosion
     /// during long chunked prefill. Called between chunks by the scheduler.
     /// Default: no-op (models without SSM layers don't need normalization).
