@@ -9,10 +9,10 @@
 
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::WeightStore;
 
-use crate::weight_map::{Fp8DenseWeight, quantize_to_fp8, quantize_to_nvfp4};
+use crate::weight_map::{Fp8DenseWeight, QuantizedWeight, quantize_to_fp8, quantize_to_nvfp4};
 
 #[allow(clippy::type_complexity)]
 pub(super) fn setup_lm_heads(
@@ -141,4 +141,77 @@ pub(super) fn setup_lm_heads(
         None
     };
     Ok((lm_head_nvfp4, lm_head_fp8, mtp_lm_head_nvfp4))
+}
+
+/// Whether `build_model` may free the BF16 `lm_head` buffer: only when the
+/// NVFP4 head was quantized out of it into buffers of its own. A checkpoint
+/// that ships the head pre-packed (nvidia/Qwen3.8-27B-NVFP4,
+/// nvidia/Qwen3.6-35B-A3B-NVFP4) dense-loads those packed bytes as `lm_head`,
+/// so `lm_head` IS the live head's `weight`; a tied head IS the embedding.
+/// Freeing either leaves every logits producer reading freed memory.
+pub(super) fn bf16_lm_head_is_dead(
+    lm_head: DevicePtr,
+    lm_head_nvfp4: Option<&QuantizedWeight>,
+    embed: DevicePtr,
+) -> bool {
+    lm_head != embed
+        && lm_head_nvfp4.is_some_and(|q| {
+            ![
+                q.weight,
+                q.weight_scale,
+                q.input_scale,
+                q.weight_scale_2_vec,
+            ]
+            .contains(&lm_head)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head(weight: u64) -> QuantizedWeight {
+        QuantizedWeight {
+            weight: DevicePtr(weight),
+            weight_scale: DevicePtr(weight + 0x100),
+            ..QuantizedWeight::null()
+        }
+    }
+
+    #[test]
+    fn runtime_quantized_head_frees_its_bf16_source() {
+        assert!(bf16_lm_head_is_dead(
+            DevicePtr(0x1000),
+            Some(&head(0x9000)),
+            DevicePtr(0x5000)
+        ));
+    }
+
+    #[test]
+    fn prepacked_head_aliasing_lm_head_is_never_freed() {
+        assert!(!bf16_lm_head_is_dead(
+            DevicePtr(0x9000),
+            Some(&head(0x9000)),
+            DevicePtr(0x5000)
+        ));
+        assert!(!bf16_lm_head_is_dead(
+            DevicePtr(0x9100),
+            Some(&head(0x9000)),
+            DevicePtr(0x5000)
+        ));
+    }
+
+    #[test]
+    fn tied_head_or_bf16_only_head_is_never_freed() {
+        assert!(!bf16_lm_head_is_dead(
+            DevicePtr(0x5000),
+            Some(&head(0x9000)),
+            DevicePtr(0x5000)
+        ));
+        assert!(!bf16_lm_head_is_dead(
+            DevicePtr(0x1000),
+            None,
+            DevicePtr(0x5000)
+        ));
+    }
 }

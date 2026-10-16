@@ -863,8 +863,13 @@ pub fn build_model(
     // lm_head_shared is guarded by lm_head_nvfp4.is_none()). On NVFP4-head
     // targets the BF16 copy (~vocab x hidden x 2 B) is provably dead weight —
     // free it and NULL the stored pointer so no later fallback can
-    // dereference freed memory.
-    let lm_head = if lm_head_nvfp4.is_some() {
+    // dereference freed memory. Only when the NVFP4 head does not live in
+    // that buffer (pre-packed checkpoints) and it is not the tied embedding.
+    let lm_head = if super::lm_head_setup::bf16_lm_head_is_dead(
+        lm_head.weight,
+        lm_head_nvfp4.as_ref(),
+        embed.weight,
+    ) {
         if let Err(e) = gpu.free(lm_head.weight) {
             tracing::warn!("lm_head BF16 intermediate free failed: {e}");
         }
