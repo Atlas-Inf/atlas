@@ -147,6 +147,9 @@ pub struct TransformerModel {
     /// verify tokens. Bit-identical to two `dense_gemv_fp8w` calls; halves the
     /// FP8 weight bandwidth for the lm_head on the MTP verify path.
     pub(super) dense_gemv_fp8w_batch2_kernel: KernelHandle,
+    /// BF16 dual-GEMV (batch=2) for a BF16 LM head at K=2 verify;
+    /// bit-identical to two `dense_gemv_bf16` calls (see `impl_a1.rs`).
+    pub(super) dense_gemv_bf16_batch2_kernel: KernelHandle,
     /// W4A8 DP4A LM-head GEMV (M<=4) and its int8 activation quantizer.
     ///
     /// The NVFP4 LM head is exactly the layout the DP4A path consumes
