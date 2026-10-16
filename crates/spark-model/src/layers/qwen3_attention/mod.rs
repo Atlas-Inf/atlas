@@ -184,3 +184,5 @@ mod split_ref_seqs_tests {
         assert_ne!(split_ref_seqs(1, 4), split_ref_seqs(1, 16));
     }
 }
+#[cfg(test)]
+mod fp8_gemv_parity_gpu_tests;

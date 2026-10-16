@@ -100,7 +100,7 @@ pub(crate) fn decode_data_uri_bytes(data_uri: &str) -> Result<(String, Vec<u8>)>
 const SUPPORTED_IMAGE_FORMATS: &str = "send JPEG, PNG, GIF, WebP, BMP, TIFF or ICO";
 
 /// Decode a base64 data URI or raw base64 string into a `DynamicImage`.
-fn decode_image(data_uri: &str) -> Result<DynamicImage> {
+pub(crate) fn decode_image(data_uri: &str) -> Result<DynamicImage> {
     let (_mime, bytes) = decode_data_uri_bytes(data_uri)?;
 
     // Probe format from magic bytes. Anything we cannot read is refused by

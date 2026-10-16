@@ -335,7 +335,12 @@ pub(super) fn emit_token_at_position(
             a.output_tokens.pop();
             return;
         }
-        EndToken::No => {}
+        EndToken::No => {} // MERGE-REVIEW: #175 evaluates the same EOS suppressors via
+                           // `eos_policy::evaluate` (shared policy module — EosInputs struct +
+                           // decision.suppress()) where #174 uses the commit-rule's
+                           // `end_token`/`EndToken` (Stop/Suppressed/No) shared with
+                           // `think_commit::end_token`. Both sides rewrote this decision
+                           // differently; #174's kept pending a pick.
     }
     // OPENCODE FIX: see process_decode_logits — same gate. Suppress streaming
     // of spontaneous-thinking content so it doesn't pollute opencode's history.

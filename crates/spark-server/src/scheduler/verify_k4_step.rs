@@ -106,6 +106,7 @@ pub fn step_verify_k4(
         sched.levers.dflash_masked_verify,
         model,
         a,
+        &[v0_argmax, v1_argmax, v2_argmax, v3_argmax],
     ) {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD)
         // basis so verifier/drafter judge identically. No rep_pen/DRY here.

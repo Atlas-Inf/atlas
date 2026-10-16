@@ -36,12 +36,13 @@
 //! removes non-argmax candidates, so masked-greedy == `argmax_ids[i]` by
 //! definition and the call does no D2H at all.
 //!
-//! State-staleness parity: the slow path evaluates `a.*` flags and
+//! State-staleness parity: the slow path keeps `a.*` flags and
 //! `a.output_tokens` FIXED across the K loop (they only advance in
-//! `emit_token`, after the helper), and the gates here read exactly that
-//! same fixed state — eligibility is uniform across positions and the
-//! equivalence is per-call exact. Any ineligible position falls through
-//! to the unmodified slow path for the whole call.
+//! `emit_token`, after the helper) EXCEPT `inside_tool_body`, which it
+//! mirrors per row. The penalty gate here therefore simulates that same
+//! flag advance over the argmax picks (`fast_gate_over_rows`) and takes
+//! the worst gate — any row whose state turns Blocked sends the whole
+//! call to the unmodified slow path, so the equivalence stays exact.
 //! Kill-switch: `ATLAS_DISABLE_FAST_MASKED=1`.
 
 use super::selection_io::CopyFailurePolicy;
@@ -64,7 +65,7 @@ pub(super) fn masked_verify_required(configured: bool, lightning_product: bool) 
 pub(super) fn try_chat_fast_path(
     model: &dyn Model,
     argmax_ids: &[u32],
-    a: &ActiveSeq,
+    a: &mut ActiveSeq,
     ctx: &LogitsContext,
     row_base: usize,
     policy: CopyFailurePolicy,
@@ -107,6 +108,13 @@ pub(super) fn try_chat_fast_path(
     let penalty_gate = crate::scheduler::fast_greedy::classify_penalties(
         &crate::scheduler::sample_step::verify_penalty_params(a),
     );
+    // MERGE-REVIEW: #175 computed pin_tool_armed inline
+    // (`a.think_just_ended && a.require_tool_call && !a.tool_call_opened &&
+    // !a.inside_thinking`) and classified the penalty gate PER ROW via
+    // `fast_gate_over_rows(a, argmax_ids)` — the slow path advances
+    // inside_tool_body across the K picks, so a mid-block tool close can
+    // change the gate for later rows. #174's side (kept) classifies once
+    // from verify_penalty_params. Decide whether per-row is required.
     if f2_active
         || think_end_inject_armed
         || pin_tool_armed

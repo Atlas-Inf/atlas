@@ -77,6 +77,64 @@ pub(super) fn classify_penalties(p: &SamplingParams) -> PenaltyGate {
     PenaltyGate::Blocked
 }
 
+/// Per-row penalty gate for a verify block. `penalty_params_for` builds a
+/// STATEFUL bias per row — `strip_in_tool_opener_bias` removes the positive
+/// `<tool_call>` opener delta while `a.inside_tool_body` holds and restores
+/// it the row after `</tool_call>` — but the fast paths classify the gate
+/// once at block start and apply it to every row. When an opener or closer
+/// lands mid-block, the rows after it are evaluated under a different
+/// penalty landscape than the block-start gate predicted (measured on
+/// BFCL `parallel_multiple_78`: a `</tool_call>` mid-block leaves the next
+/// position choosing between `<tool_call>` and the turn-EOS where only the
+/// +3 opener bias separates them — raw argmax ends the turn early and
+/// parallel calls drop).
+///
+/// Simulates `advance_in_tool_flag` over the block's picks — exact when the
+/// caller's picks are the raw `argmax_ids` (the fast paths' pick at every
+/// row IS the argmax) — classifies the params under each distinct row
+/// state, restores the flag, and returns the WORST gate seen: `Blocked` on
+/// any row forces the slow path for the whole call. Rows whose state never
+/// changes pay only `K` flag checks.
+pub(super) fn fast_gate_over_rows(
+    a: &mut crate::scheduler::types::ActiveSeq,
+    argmax_ids: &[u32],
+) -> PenaltyGate {
+    let saved_in_tool = a.inside_tool_body;
+    let mut worst = PenaltyGate::Neutral;
+    // At least one classification must always happen — an empty pick list
+    // still needs the block-start state evaluated (the gate call is only
+    // meaningful against the current params).
+    for i in 0..argmax_ids.len().max(1) {
+        // Row i's params use the flag state after picks[0..i-1] — the slow
+        // path advances the flag AFTER each row's pick.
+        if i > 0 && i - 1 < argmax_ids.len() {
+            a.inside_tool_body = crate::scheduler::sample_step::advance_in_tool_flag(
+                a.inside_thinking,
+                a.inside_tool_body,
+                argmax_ids[i - 1],
+                a.tool_call_start_token,
+                a.tool_call_end_token,
+            );
+        }
+        let gate = classify_penalties(&crate::scheduler::sample_step::penalty_params_for(
+            a,
+            crate::scheduler::sample_step::PositionKind::Verify,
+            0.0,
+            None,
+            a.logit_bias.clone(),
+        ));
+        if gate == PenaltyGate::Blocked {
+            worst = PenaltyGate::Blocked;
+            break;
+        }
+        if gate == PenaltyGate::ReduceOnly {
+            worst = PenaltyGate::ReduceOnly;
+        }
+    }
+    a.inside_tool_body = saved_in_tool;
+    worst
+}
+
 /// Per-position immunity check for [`PenaltyGate::ReduceOnly`]: the argmax
 /// token is untouched by reduce-only penalties iff it is not in the scoped
 /// history; `positive_logit` lazily reads the conservative raw-logit > 0

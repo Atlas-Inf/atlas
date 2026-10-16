@@ -132,6 +132,7 @@ pub(super) fn step_verify_dflash_batched(
             sched.levers.dflash_masked_verify,
             model,
             a,
+            raw,
         ) {
             raw.to_vec()
         } else {

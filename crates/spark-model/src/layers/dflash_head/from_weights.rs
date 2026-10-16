@@ -728,6 +728,20 @@ impl BlockDiffusionDraftHead {
             num_layers,
         );
 
+        // Own lm_head (LiLiCorr-style drafters, `has_own_lm_head: true`):
+        // draft logits come from the drafter's trained NVFP4 head, not the
+        // target's. The target BF16 pointer is replaced with NULL so no
+        // branch can silently reach it — every lm_head dispatch checks
+        // `lm_head_nvfp4` first, and the Phase-G FP8-mirror block below is
+        // gated on `lm_head_nvfp4.is_none()`.
+        let has_own_head = weights.lm_head.is_some();
+        let lm_head_nvfp4 = weights.lm_head.or(lm_head_nvfp4);
+        let lm_head_shared = if has_own_head {
+            DevicePtr::NULL
+        } else {
+            lm_head_shared
+        };
+
         let mut head = Self {
             num_layers,
             hidden_size,
@@ -916,6 +930,26 @@ impl BlockDiffusionDraftHead {
                 "DFlash batched propose: authoritative Bxgamma for generic DFlash \
                  (default on; rollback ATLAS_DFLASH_BATCHED_PROPOSE=0; min 2, max {})",
                 head.batch_capacity
+            );
+        }
+
+        // Own NVFP4 lm_head: fail at build time if every kernel the head
+        // dispatch can fall back to is missing. Otherwise a 0 handle drops
+        // to the BF16 branch, which reads the NULL `lm_head_shared` that an
+        // own-head drafter carries, and faults deep inside a proposal step.
+        if has_own_head {
+            let wave_k = match head.gamma as u32 {
+                1..=4 => head.kernels.w4a16_gemv_batch4,
+                5..=8 => head.kernels.w4a16_gemv_batch8,
+                9..=16 => head.kernels.w4a16_gemv_batch16,
+                _ => spark_runtime::gpu::KernelHandle(0),
+            };
+            anyhow::ensure!(
+                wave_k.0 != 0 || head.kernels.w4a16_gemm.0 != 0,
+                "DFlash drafter has_own_lm_head=true but neither the γ={} NVFP4 \
+                 batched-GEMV wave kernel nor the w4a16_gemm fallback resolved in \
+                 this kernel target — the BF16 fallback would read a NULL lm_head",
+                head.gamma,
             );
         }
 

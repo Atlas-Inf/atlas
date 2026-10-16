@@ -1,0 +1,224 @@
+# strix-hip (gfx1151, native HIP) copy of
+# kernels/gb10/nemotron-3.5-super-vl-120b-a12b/MODEL.toml.
+# A real file, not a symlink like qwen3.6-35b-a3b's: [expected_absent] is
+# per-hardware — the gb10 file declares the gb10-only w4a16 p3/mfast probes
+# absent, while this copy declares the probes that resolve on gb10 but not
+# on gfx1151 (puzzle-shadow FP4, turbo KV-cache variants, gguf/q2_0).
+#
+# No kernel_source on this hardware: the module set resolves against
+# kernels/strix-hip/common/ plus the target-local overrides in nvfp4/
+# (gb10/common sources linked for the GB10-only kernels this model needs).
+#
+# Nemotron-3.5-Super-VL 120B-A12B — text-only path of the omni checkpoint
+# (model_type nemotron_h_omni): hybrid Mamba-2 + LatentMoE + GQA backbone,
+# head_dim 128, DFlash (LiLiCorr) drafter at gamma=3.
+#
+[model]
+name = "nemotron-3.5-super-vl-120b-a12b"
+hf_id = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"
+model_type = "nemotron_h_omni"
+architecture = "hybrid_mamba2_latent_moe_attention"
+parameters = "120B"
+active_parameters = "12B"
+
+
+# No (model_type, hidden_size) collision: nemotron_h_omni is a distinct
+# identity, so no match_names are needed.
+[[model_types]]
+model_type = "nemotron_h_omni"
+hidden_size = 4096
+
+# Sampling presets: Nemotron 3.5 family's (copied from
+# nemotron-3.5-lightning-30b-a3b). The VL checkpoint's
+# generation_config.json declares temperature=1.0 / top_p=0.95 and no
+# top_k — vendor recipe pending the public model card.
+[sampling.thinking_text]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.tools]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[behavior]
+use_sampling_presets_for_core = true
+thinking_in_tools = true
+max_thinking_budget = 8192
+thinking_default = true
+cap_thinking_at_max_tokens = false
+# The 3.5 VL chat template (qwen3_coder XML tool format + <think> prefill),
+# shipped verbatim from the checkpoint.
+jinja_template = "nemotron_3_5_super_vl.jinja"
+
+# NVIDIA LiLiCorr drafter (DFlash family) — the DGX-Spark speculative path for
+# this checkpoint (public 2026-10-15). block_size 8; the public drafter is
+# bidirectional GQA (8 KV heads) with sliding-window attention over the last
+# 8192 context positions (dflash_config.swa_window_size), so window_size 8192.
+[dflash]
+draft_model = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr"
+gamma = 3
+window_size = 8192
+mask_token_id = 990
+target_layer_ids = [1, 22, 43, 64, 85]
+
+# Kernel source is nemotron-labs-3-puzzle-75b-a9b, which resolves the
+# w4a4/moe_shadow probes the plain Super tree lacked. Only the w4a16
+# try-kernel probes below remain legitimately absent (verified against the
+# kernel audit of a serve boot on spark2, 2026-10-08).
+
+# ── expected_absent ────────────────────────────────────────────────────────
+# Probes that RESOLVE on gb10 (puzzle shadow + gb10/common) but have no
+# kernel on gfx1151. Each entry cites the call site and the fallback that
+# runs instead. Verified against the static lookup audit at
+# docs/porting/n35vl-strix-kernel-audit.md on this branch.
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = "3-deep weight-pipeline twin; layers::tgemm_kernel falls back to w4a16_gemm_t (resolves via the qwen3.6-27b shadow)."
+w4a16_gemm_t_k64_p3 = "k64 pipelined twin; layers::k64_kernel falls back to the required w4a16_gemm_t_k64 (resolves)."
+w4a16_gemm_t_k64_n64_p3 = "Narrow-N deep-K twin; k64_n64_kernel returns 0-handle and dispatch gates before firing."
+w4a16_gemm_t_m128_bf16 = "BF16-projection prefill twin; prefill_weights gates on handle != 0, falls back through the resolved w4a16 path."
+w4a16_gemm_t_m128_bf16_v2 = "8-warp pipelined bf16 twin probed at model/impl_a1.rs:105; same handle!=0 fallback."
+fp8_gemm_t_m128_mfast = "M128-mfast FP8 GEMM probed at nemotron_mamba2.rs:167 and nemotron_moe.rs:275; both gate on handle != 0 && n >= 512 and fall back to the bf16-A fp8_gemm_t arm that resolves in the strix w4a16 module."
+fp8_fp8_gemm_t_m128_mfast = "Pre-cast-A twin of the same probe; same bf16-A fallback."
+fp8_gemm_t_row_scaled = "Optional FP8 drafter probe (dflash_head/from_weights.rs:261); only reached under ATLAS_DFLASH_DRAFTER_FP8=1 — BF16 drafter is the default."
+fp8_gemm_t_row_scaled_m16 = "Small-M twin of the same Phase-G probe; same opt-in gate."
+
+[expected_absent.w4a16_v2]
+w4a16_gemm_t_m128_v2 = "m128 v2 twin probed by layers::w4a16_v2_kernel (mod.rs:111); falls back within the resolved w4a16 family."
+
+[expected_absent.w4a16_v3]
+w4a16_gemm_t_m128_v3 = "m128 v3 twin probed by layers::w4a16_v3_kernel (mod.rs:140); same fallback."
+
+[expected_absent.w8a16_gemm_pipelined]
+w8a16_gemm_pipelined = "Pipelined W8A16 GEMM alternate probed at nemotron_mamba2.rs:160, nemotron_moe.rs:203, qwen3_attention/init.rs:298, nemotron/ssm_layer.rs:101; handle!=0-gated, resolved w8a16_gemm/w8a16_gemm_t arms serve."
+
+[expected_absent.w8a16_gemm_t]
+w8a16_gemm_t_pipelined = "Pipelined transposed W8A16 GEMM probed at qwen3_attention/init.rs:187; same fallback."
+
+# ── puzzle-shadow FP4 — UNPORTED on gfx1151 ────────────────────────────────
+# w4a4/moe_w4a4 are the GB10 puzzle tree's FP4 MMA paths; gfx1151 has no FP4
+# tensor op, so FP8/NVFP4 stay on the weight-only dequant arms (w8a16/w4a16).
+[expected_absent.w4a4]
+w4a4_gemm_mfast = "UNPORTED: puzzle-shadow FP4 GEMM probed at nemotron_mamba2.rs:178, nemotron_moe.rs:276, qwen3_attention/init.rs:747; handle!=0-gated, w4a16 arms serve."
+
+[expected_absent.moe_w4a4]
+moe_w4a4_grouped_gemm_relu2 = "UNPORTED: FP4 grouped-MoE verify probe (nemotron_moe.rs:256); falls back to the resolved moe_w4a16 grouped arms."
+
+[expected_absent.moe_w4a16]
+moe_w4a16_grouped_gemm_ptrtable_relu2 = "Fused-relu2 grouped GEMM probed at nemotron_moe.rs:251; the resolved moe_w4a16_grouped_gemm_ptrtable + relu2::relu_squared_inplace cover it."
+
+[expected_absent.causal_conv1d]
+causal_conv1d_update_prefill_tp = "TP-sharded conv prefill variant (nemotron_mamba2.rs:181); single-GPU strix runs the resolved causal_conv1d path."
+
+[expected_absent.token_overlay]
+embed_rowdiff_bf16 = "LoRA token-overlay kernel (ops/token_overlay.rs:47); probes at OverlayKernels::new, LoRA is off by default."
+embed_overlay_routed_bf16 = "Same family (token_overlay.rs:48)."
+lmhead_overlay_routed_bf16 = "Same family (token_overlay.rs:49)."
+lmhead_overlay_routed_f32 = "Same family (token_overlay.rs:50)."
+
+[expected_absent.fp8_gemm_t_blockscaled]
+fp8_gemm_t_blockscaled = "Block-scaled FP8 prefill GEMM probed at qwen3_attention/init.rs:211; dispatch gates on handle != 0 (qwen3_ssm/paged_qkv.rs:223) and falls back to bf16-A fp8_gemm_t."
+
+[expected_absent.dequant_gguf_bf16]
+dequant_q2_0_gn_to_bf16 = "GGUF Q2_0 dequant probed at qwen3_attention/init.rs:247; NVFP4 checkpoint never loads GGUF tensors."
+
+[expected_absent.q2_0_gemv_vec]
+q2_0_gemv_vec = "GGUF Q2_0 GEMV probed at qwen3_attention/init.rs:258; same GGUF-only reachability."
+
+[expected_absent.fused_k_norm_rope_cache]
+fused_k_norm_rope_cache_write_bf16 = "Fused K-norm+RoPE+cache write probed at init.rs:332; falls back to the resolved rope + reshape_and_cache pair."
+fused_k_norm_rope_mrope_cache_write_bf16 = "MRoPE twin probed at init.rs:337; same fallback."
+
+[expected_absent.wht_bf16]
+wht_bf16_inplace = "Walsh-Hadamard turbo-quant kernel (init.rs:347); dispatch gates on k_is_turbo && handle != 0 (prefill/paged.rs:568) — turbo KV mode only."
+wht_bf16_inplace_inv = "Inverse twin (init.rs:348); same turbo gate (paged.rs:745)."
+
+[expected_absent.tq_plus_innerq_apply]
+tq_plus_innerq_apply_q = "Turbo-quant inner-Q calibration apply (init.rs:349); dispatch gates on k_is_turbo && handle != 0 (multi_seq/attn.rs:276)."
+tq_plus_innerq_apply_k = "K-side twin (init.rs:354); same turbo gate (write_kv_cache.rs:92)."
+
+# ── turbo-KV paged-prefill variants (gb10-only .cu family) ─────────────────
+# All probed unconditionally at qwen3_attention/init.rs:611-693 and gated at
+# dispatch on the experimental turbo KV-cache dtypes; the resolved
+# prefill_paged/fp8/nvfp4 entries serve the standard paths.
+[expected_absent.prefill_paged_turbo4]
+inferspark_prefill_paged_turbo4 = "Turbo4-KV prefill probe (init.rs:611); turbo KV dtypes not built for this target."
+inferspark_prefill_paged_turbo4_64 = "BR=64 twin (init.rs:631); same."
+
+[expected_absent.prefill_paged_turbo2]
+inferspark_prefill_paged_turbo2 = "Turbo2-KV prefill probe (init.rs:621); same."
+
+[expected_absent.prefill_paged_turbo3]
+inferspark_prefill_paged_turbo3_64 = "Turbo3-KV prefill probe (init.rs:626); same."
+
+[expected_absent.prefill_paged_turbo8]
+inferspark_prefill_paged_turbo8_64 = "Turbo8-KV prefill probe (init.rs:636); same."
+
+[expected_absent.prefill_paged_bf16k_turbo3v]
+inferspark_prefill_paged_bf16k_turbo3v_64 = "BF16-K/turbo-V prefill probe (init.rs:645); same."
+
+[expected_absent.prefill_paged_bf16k_turbo4v]
+inferspark_prefill_paged_bf16k_turbo4v_64 = "Same family (init.rs:651)."
+
+[expected_absent.prefill_paged_bf16k_turbo2v]
+inferspark_prefill_paged_bf16k_turbo2v_64 = "Same family (init.rs:657)."
+
+[expected_absent.prefill_paged_fp8k_turbo3v]
+inferspark_prefill_paged_fp8k_turbo3v_64 = "FP8-K/turbo-V prefill probe (init.rs:664); same."
+
+[expected_absent.prefill_paged_fp8k_turbo4v]
+inferspark_prefill_paged_fp8k_turbo4v_64 = "Same family (init.rs:669)."
+
+[expected_absent.prefill_paged_fp8k_turbo2v]
+inferspark_prefill_paged_fp8k_turbo2v_64 = "Same family (init.rs:674)."
+
+[expected_absent.prefill_paged_turbo4k_turbo3v]
+inferspark_prefill_paged_turbo4k_turbo3v_64 = "Turbo4-K/turbo3-V probe (init.rs:683); same."
+
+[expected_absent.prefill_paged_turbo4k_turbo8v]
+inferspark_prefill_paged_turbo4k_turbo8v_64 = "Same family (init.rs:688)."
+
+[expected_absent.prefill_paged_turbo3k_turbo8v]
+inferspark_prefill_paged_turbo3k_turbo8v_64 = "Same family (init.rs:693)."
+
+[expected_absent.mamba2_ssd_chunk]
+mamba2_ssd_cumsum = "Chunked SSD prefill scan K1. NOT PORTED: the fused K3 scan needs >64 KB dynamic LDS at every state_size its layout tolerates (the [L][L] decay tile overflows sCM for N<64; N=64 needs 66816 B vs gfx1151's 65536 B workgroup ceiling; N=128 ~116 KB). nemotron_mamba2/prefill.rs ssd_ok falls to the sequential mamba2_ssm_prefill when the handles are 0."
+mamba2_ssd_bmm = "K2 of the same family; same fallback."
+mamba2_ssd_scan = "K3 of the same family; same fallback."
+
+# ── strix-only w8a16 tiers shadowed back to the gb10 source ────────────────
+# This target replaces strix-hip/common/w8a16_gemv_batch4.cu with the gb10
+# file so the K-row verify twin shares provenance with w8a16_gemv (the strix
+# real file diverged on gfx1151). The strix-only entry points it carried are
+# FP8-only probes; NVFP4 weights never reach them.
+[expected_absent.w8a16_gemv_batch4]
+w8a16_gemv_batch8 = "Strix-only FP8 batch8 tier (qwen3_attention/init.rs gated probe); absent under the gb10 shadow, dispatch uses w8a16_gemv_batch16."
+w8a16_gemv_batch8_dyn_vl2 = "Strix-only VLANES variant; same gate and fallback."
+w8a16_gemv_batch8_dyn_vl2_n2 = "Same family."
+
+[expected_absent.moe_expert_gemv_pf]
+moe_expert_gemv_pf = "Prefetch GEMV variant probed at nemotron_moe.rs:212; decode path uses the resolved moe_expert_gemv / moe_expert_gemv_wide instead."

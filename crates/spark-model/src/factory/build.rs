@@ -857,6 +857,24 @@ pub fn build_model(
     let target_hidden_for_dflash = config.hidden_size;
     let target_vocab_for_dflash = config.vocab_size;
 
+    // The BF16 lm_head is only ever a fallback: every logits producer prefers
+    // the NVFP4 head when it exists (impl_a3::lm_head, the lm_head_batched
+    // arm, the decode_b2 prefill-logits arm, and the DFlash drafter whose
+    // lm_head_shared is guarded by lm_head_nvfp4.is_none()). On NVFP4-head
+    // targets the BF16 copy (~vocab x hidden x 2 B) is provably dead weight —
+    // free it and NULL the stored pointer so no later fallback can
+    // dereference freed memory.
+    let lm_head = if lm_head_nvfp4.is_some() {
+        if let Err(e) = gpu.free(lm_head.weight) {
+            tracing::warn!("lm_head BF16 intermediate free failed: {e}");
+        }
+        crate::weight_map::DenseWeight {
+            weight: spark_runtime::gpu::DevicePtr::NULL,
+        }
+    } else {
+        lm_head
+    };
+
     let mut model = TransformerModel::new(
         config,
         embed,

@@ -20,6 +20,7 @@ impl NemotronMoeLayer {
         p: &SortedPrefillCtx,
         ctx: &ForwardContext,
         stream: u64,
+        l0d: &mut Option<crate::layers::nemotron_mamba2::l0_dump::L0Dump>,
     ) -> Result<()> {
         let scratch_buf = ctx.buffers.scratch();
         // ── Semi-batched: batch routing, per-token expert dispatch ──
@@ -40,6 +41,24 @@ impl NemotronMoeLayer {
                 .arg_f32(p.scale)
                 .arg_u32(p.n)
                 .launch(stream)?;
+            if let Some(d) = l0d.as_mut() {
+                d.stage(
+                    ctx.gpu,
+                    "06_topk_ids",
+                    p.indices_dev,
+                    (p.n * p.top_k) as usize,
+                    "u32",
+                    &[p.n as usize, p.top_k as usize],
+                );
+                d.stage(
+                    ctx.gpu,
+                    "07_topk_weights",
+                    p.weights_dev,
+                    (p.n * p.top_k) as usize,
+                    "f32",
+                    &[p.n as usize, p.top_k as usize],
+                );
+            }
         }
 
         for t in 0..p.num_tokens {
@@ -152,6 +171,32 @@ impl NemotronMoeLayer {
                     .arg_u32(p.h as u32)
                     .arg_u32(p.top_k)
                     .launch(stream)?;
+                if let Some(d) = l0d.as_mut() {
+                    d.stage(
+                        ctx.gpu,
+                        &format!("t{t:02}_expert_up"),
+                        expert_up_out,
+                        p.top_k as usize * p.inter as usize,
+                        "bf16",
+                        &[p.top_k as usize, p.inter as usize],
+                    );
+                    d.stage(
+                        ctx.gpu,
+                        &format!("t{t:02}_expert_down"),
+                        expert_down_out,
+                        p.top_k as usize * p.latent as usize,
+                        "bf16",
+                        &[p.top_k as usize, p.latent as usize],
+                    );
+                    d.stage(
+                        ctx.gpu,
+                        &format!("t{t:02}_shared_down"),
+                        shared_down_out,
+                        p.h,
+                        "bf16",
+                        &[p.h],
+                    );
+                }
                 let combined_latent = ctx.buffers.attn_output();
                 let dummy_shared = ctx.buffers.expert_gate_out();
                 ctx.gpu
@@ -179,6 +224,24 @@ impl NemotronMoeLayer {
                     p.latent,
                     stream,
                 )?;
+                if let Some(d) = l0d.as_mut() {
+                    d.stage(
+                        ctx.gpu,
+                        &format!("t{t:02}_combined_latent"),
+                        combined_latent,
+                        p.latent as usize,
+                        "bf16",
+                        &[p.latent as usize],
+                    );
+                    d.stage(
+                        ctx.gpu,
+                        &format!("t{t:02}_routed_out"),
+                        routed_out,
+                        p.h,
+                        "bf16",
+                        &[p.h],
+                    );
+                }
                 ops::residual_add(
                     ctx.gpu,
                     self.residual_add_k,
@@ -187,6 +250,16 @@ impl NemotronMoeLayer {
                     p.h as u32,
                     stream,
                 )?;
+                if let Some(d) = l0d.as_mut() {
+                    d.stage(
+                        ctx.gpu,
+                        &format!("t{t:02}_moe_out"),
+                        routed_out,
+                        p.h,
+                        "bf16",
+                        &[p.h],
+                    );
+                }
                 let token_hidden = p.hidden.offset(token_offset_h);
                 ops::residual_add(
                     ctx.gpu,

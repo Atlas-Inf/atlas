@@ -10,6 +10,14 @@
 //   CUstream/CUmodule/CUfunction/CUevent/CUgraph(Exec) ↔ hip* — opaque ptrs
 //   CUresult ↔ hipError_t — success==0 matches; error enums differ but cudarc
 //   checks success and formats via cuGetErrorString (mapped to hipGetErrorString).
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#include <dxgi1_4.h>
+#endif
 #include <hip/hip_runtime.h>
 #include <chrono>
 #include <cstdio>
@@ -90,13 +98,97 @@ extern "C" {
 // ── init / context ────────────────────────────────────────────────────
 int cuCtxGetCurrent(void** pctx)            { return hipCtxGetCurrent((hipCtx_t*)pctx); }
 int cuCtxSetCurrent(void* ctx)              { return hipCtxSetCurrent((hipCtx_t)ctx); }
+static void atlas_memprofile_snapshot_once();
 int cuCtxCreate_v2(void** pctx, unsigned f, int dev)
-                                            { return hipCtxCreate((hipCtx_t*)pctx, f, dev); }
+                                            { int rc = hipCtxCreate((hipCtx_t*)pctx, f, dev); atlas_memprofile_snapshot_once(); return rc; }
 int cuCtxDestroy_v2(void* ctx)              { return hipCtxDestroy((hipCtx_t)ctx); }
 
 // ── errors ────────────────────────────────────────────────────────────
 int cuGetErrorName(int err, const char** s)   { *s = hipGetErrorName((hipError_t)err);   return 0; }
 int cuGetErrorString(int err, const char** s) { *s = hipGetErrorString((hipError_t)err); return 0; }
+
+
+// ── [allocfail] diagnostics — diagnostic only, no behaviour change ────────
+
+#ifdef _WIN32
+// Win32 commit + DXGI adapter-memory snapshot — shared by [allocfail] and
+// [memprofile]. DXGI resolved at runtime; no link change.
+static void atlas_mem_win32_diag() {
+  MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms); GlobalMemoryStatusEx(&ms);
+  PERFORMANCE_INFORMATION pi; pi.cb = sizeof(pi); K32GetPerformanceInfo(&pi, sizeof(pi));
+  PROCESS_MEMORY_COUNTERS_EX pmc; pmc.cb = sizeof(pmc);
+  K32GetProcessMemoryInfo(GetCurrentProcess(), (PPROCESS_MEMORY_COUNTERS)&pmc, sizeof(pmc));
+  fprintf(stderr, "[memdiag] TotalPhys=%.1fGiB AvailPhys=%.1fGiB TotalPageFile=%.1fGiB AvailPageFile=%.1fGiB commitTotal=%.1fGiB commitLimit=%.1fGiB commitPeak=%.1fGiB procPrivate=%.1fGiB\n",
+    ms.ullTotalPhys/1073741824.0, ms.ullAvailPhys/1073741824.0,
+    ms.ullTotalPageFile/1073741824.0, ms.ullAvailPageFile/1073741824.0,
+    pi.CommitTotal*pi.PageSize/1073741824.0, pi.CommitLimit*pi.PageSize/1073741824.0,
+    pi.CommitPeak*pi.PageSize/1073741824.0, pmc.PrivateUsage/1073741824.0);
+  HMODULE dxgi = LoadLibraryA("dxgi.dll");
+  if (!dxgi) return;
+  typedef HRESULT (WINAPI *CreateFactory1_t)(REFIID, void**);
+  CreateFactory1_t cf = (CreateFactory1_t)GetProcAddress(dxgi, "CreateDXGIFactory1");
+  if (!cf) return;
+  IDXGIFactory1* fac = nullptr;
+  if (FAILED(cf(__uuidof(IDXGIFactory1), (void**)&fac)) || !fac) return;
+  for (UINT ai = 0; ; ai++) {
+    IDXGIAdapter1* ad = nullptr;
+    if (FAILED(fac->EnumAdapters1(ai, &ad)) || !ad) break;
+    DXGI_ADAPTER_DESC1 dd; memset(&dd, 0, sizeof(dd));
+    ad->GetDesc1(&dd);
+    if (dd.VendorId == 0x1002) {
+      fprintf(stderr, "[memdiag] dxgi: DedicatedVideo=%.1fGiB DedicatedSys=%.1fGiB Shared=%.1fGiB\n",
+        dd.DedicatedVideoMemory/1073741824.0, dd.DedicatedSystemMemory/1073741824.0, dd.SharedSystemMemory/1073741824.0);
+      IDXGIAdapter3* a3 = nullptr;
+      if (SUCCEEDED(ad->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&a3)) && a3) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO vi;
+        const struct { DXGI_MEMORY_SEGMENT_GROUP g; const char* n; } grps[2] = {
+          {DXGI_MEMORY_SEGMENT_GROUP_LOCAL, "LOCAL"},
+          {DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, "NON_LOCAL"}};
+        for (auto& g : grps) {
+          memset(&vi, 0, sizeof(vi));
+          if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, g.g, &vi)))
+            fprintf(stderr, "[memdiag] dxgi vmem[%s]: Budget=%.1fGiB Usage=%.1fGiB AvailRes=%.1fGiB CurRes=%.1fGiB\n",
+              g.n, vi.Budget/1073741824.0, vi.CurrentUsage/1073741824.0,
+              vi.AvailableForReservation/1073741824.0, vi.CurrentReservation/1073741824.0);
+        }
+        a3->Release();
+      }
+    }
+    ad->Release();
+  }
+  fac->Release();
+}
+#endif // _WIN32
+
+static int g_allocfail_count = 0;
+static void atlas_alloc_fail_log(const char* fn, size_t n, int r) {
+  if (++g_allocfail_count > 8) return;
+  size_t used = 0; { std::lock_guard<std::mutex> lk(g_mem_mu); used = g_mem_used; }
+  size_t f = 0, t = 0; hipError_t ge = hipMemGetInfo(&f, &t);
+  const char* cl = getenv("ATLAS_UMA_COMMIT_LIMIT_GB");
+  const char* dr = getenv("ATLAS_UMA_DRIVER_RESERVE_GB");
+  fprintf(stderr, "[allocfail #%d] %s n=%zu r=%d g_mem_used=%.2fGiB hipMemGetInfo(e=%d f=%.1fGiB t=%.1fGiB) UMA_COMMIT_LIMIT_GB=%s UMA_DRIVER_RESERVE_GB=%s\n",
+          g_allocfail_count, fn, n, r, used/1073741824.0, (int)ge,
+          f/1073741824.0, t/1073741824.0,
+          cl ? cl : "unset", dr ? dr : "unset");
+#ifdef _WIN32
+  atlas_mem_win32_diag();
+#endif
+  fflush(stderr);
+}
+
+static void atlas_memprofile_snapshot_once() {
+  static bool done = false;
+  if (done || !getenv("ATLAS_MEM_PROFILE")) return;
+  done = true;
+  size_t f = 0, t = 0; hipMemGetInfo(&f, &t);
+  fprintf(stderr, "[memprofile] ctx init: hipMemGetInfo f=%.1fGiB t=%.1fGiB\n",
+          f/1073741824.0, t/1073741824.0);
+#ifdef _WIN32
+  atlas_mem_win32_diag();
+#endif
+  fflush(stderr);
+}
 
 // ── memory ────────────────────────────────────────────────────────────
 int cuMemAlloc_v2(CUdeviceptr* dptr, size_t n)      {
@@ -104,6 +196,7 @@ int cuMemAlloc_v2(CUdeviceptr* dptr, size_t n)      {
     int r = hipMalloc((void**)dptr, n);
     if (atlas_trace_launch()) { fprintf(stderr, "[alloc] n=%zu dur=%.1fms t=%.1f\n", n, atlas_now_ms()-t0, t0); fflush(stderr); }
     if (r == hipSuccess && dptr) atlas_track_alloc((void*)*dptr, n);
+    if (r != hipSuccess) atlas_alloc_fail_log("cuMemAlloc_v2", n, r);
     return r;
 }
 int cuMemFree_v2(CUdeviceptr dptr)                  {
@@ -123,6 +216,7 @@ int cuMemAllocManaged(CUdeviceptr* dptr, size_t n, unsigned flags)
     int r = hipMallocManaged((void**)dptr, n, flags);
     if (atlas_trace_launch()) { fprintf(stderr, "[t=%.0f allocManaged] n=%zu dur=%.1fms\n", t0, n, atlas_now_ms()-t0); fflush(stderr); }
     if (r == hipSuccess && dptr) atlas_track_alloc((void*)*dptr, n);
+    if (r != hipSuccess) atlas_alloc_fail_log("cuMemAllocManaged", n, r);
     return r;
 }
 // See the g_mem_used comment above: fall back to totalGlobalMem minus tracked
@@ -396,7 +490,7 @@ int cuDriverGetVersion(int*v){return hipDriverGetVersion(v);}
 int cuDeviceGet(int*d,int o){return hipDeviceGet(d,o);}
 int cuDeviceGetCount(int*c){return hipGetDeviceCount(c);}
 int cuDeviceTotalMem_v2(size_t*b,int d){return hipDeviceTotalMem(b,d);}
-int cuDevicePrimaryCtxRetain(void**c,int d){return hipDevicePrimaryCtxRetain((hipCtx_t*)c,d);}
+int cuDevicePrimaryCtxRetain(void**c,int d){int rc=hipDevicePrimaryCtxRetain((hipCtx_t*)c,d); atlas_memprofile_snapshot_once(); return rc;}
 int cuDevicePrimaryCtxRelease_v2(int d){return hipDevicePrimaryCtxRelease(d);}
 int cuCtxSynchronize(void){return hipDeviceSynchronize();}
 int cuCtxGetDevice(int*d){return hipGetDevice(d);}

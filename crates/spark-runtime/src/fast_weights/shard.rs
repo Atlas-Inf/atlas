@@ -28,6 +28,7 @@ pub(super) fn load_shard_fast(
     try_direct_io: bool,
     direct_io_tensor_cap: usize,
     prefetch_shards: bool,
+    pack_slab: bool,
     out: &mut HashMap<String, WeightTensor>,
     deferred_out: &mut HashMap<String, crate::weights::DeferredTensor>,
     offload_logged: &mut bool,
@@ -131,6 +132,28 @@ pub(super) fn load_shard_fast(
         }
     });
 
+    // Pack mode (opt-in): one cuMemAlloc per shard, tensors carved out at
+    // 4096-byte-aligned interior offsets. Skips the ≥1MB→2MB page rounding
+    // each small tensor pays on its own allocation. If the slab alloc
+    // itself fails we fall back to per-tensor allocs for this shard —
+    // same behaviour as pack mode disabled.
+    let slab = if pack_slab {
+        let (offsets, total) = crate::weights::slab_layout(tensors.iter().map(|t| t.len));
+        if total == 0 {
+            None
+        } else {
+            match gpu.alloc(total) {
+                Ok(base) => {
+                    gpu.register_slab(base, total);
+                    Some((base, offsets))
+                }
+                Err(_) => None,
+            }
+        }
+    } else {
+        None
+    };
+
     // Copier: drains the channel, does gpu alloc + copy_h2d, inserts into the map.
     for result in rx {
         let (idx, buf, slice_start) = result?;
@@ -146,26 +169,33 @@ pub(super) fn load_shard_fast(
             raw
         };
 
-        let ptr = match gpu.alloc(meta.len) {
-            Ok(p) => {
+        let ptr = match slab.as_ref() {
+            Some((base, offsets)) => {
+                let p = base.offset(offsets[idx]);
                 gpu.copy_h2d(src, p)?;
                 p
             }
-            Err(_) => {
-                if !*offload_logged {
-                    tracing::warn!(
-                        "GPU alloc failed for {} ({} bytes) — switching to managed (UVM) memory",
-                        meta.name,
-                        meta.len
-                    );
-                    *offload_logged = true;
+            None => match gpu.alloc(meta.len) {
+                Ok(p) => {
+                    gpu.copy_h2d(src, p)?;
+                    p
                 }
-                let p = gpu.alloc_managed(meta.len)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, meta.len);
+                Err(_) => {
+                    if !*offload_logged {
+                        tracing::warn!(
+                            "GPU alloc failed for {} ({} bytes) — switching to managed (UVM) memory",
+                            meta.name,
+                            meta.len
+                        );
+                        *offload_logged = true;
+                    }
+                    let p = gpu.alloc_managed(meta.len)?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, meta.len);
+                    }
+                    p
                 }
-                p
-            }
+            },
         };
 
         out.insert(

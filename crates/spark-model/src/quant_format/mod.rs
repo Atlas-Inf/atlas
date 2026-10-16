@@ -104,7 +104,10 @@ pub fn detect_quant_format(config: &ModelConfig, store: &WeightStore) -> Box<dyn
         let ignore = qc.ignore_modules.clone();
 
         match method {
-            "modelopt" => {
+            // `modelopt_mixed`: the label ModelOpt writes on MIXED_PRECISION
+            // dumps (Nemotron 3.5 Super VL) — the quantized_layers map
+            // downstream is identical to `modelopt`'s.
+            "modelopt" | "modelopt_mixed" => {
                 tracing::info!(
                     "QuantFormat: modelopt (algo={algo:?}), {} ignored module(s)",
                     ignore.len(),

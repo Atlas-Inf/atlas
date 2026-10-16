@@ -66,7 +66,7 @@ impl TransformerModel {
                 slice_rows: if owned_images == 0 { rows } else { slice_rows },
             };
             let state = validate_state(&state, ve.output_rows())?;
-            let payload = payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?;
+            let payload = payload_bytes(&state, ve.out_hidden_size(), ve.output_rows())?;
             anyhow::ensure!(
                 payload > 0,
                 "vision request produced an empty encoder payload"
@@ -154,7 +154,7 @@ impl TransformerModel {
                 .vision_encoder
                 .as_ref()
                 .expect("vision payload without encoder");
-            comm.broadcast(ve.buf_out.0, payload, 0)?;
+            comm.broadcast(ve.out_row().0, payload, 0)?;
         }
         Ok(())
     }
@@ -174,7 +174,7 @@ impl TransformerModel {
         };
         let grids = parse_grid_words(&grid_words, &state)?;
         let payload = if let Some(ve) = &self.vision_encoder {
-            payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?
+            payload_bytes(&state, ve.out_hidden_size(), ve.output_rows())?
         } else {
             anyhow::ensure!(
                 state.rows == 0,
@@ -190,7 +190,7 @@ impl TransformerModel {
             self.comm
                 .as_ref()
                 .expect("validated vision payload without communicator")
-                .broadcast(ve.buf_out.0, payload, 0)?;
+                .broadcast(ve.out_row().0, payload, 0)?;
         }
         *self.vision_embed_patches.lock() = state.rows;
         *self.vision_image_grids.lock() = grids;

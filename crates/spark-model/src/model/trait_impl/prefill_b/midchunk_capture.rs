@@ -176,7 +176,17 @@ impl TransformerModel {
         // 5-10% of no-cache). With the plan refused, the tail-split checkpoint
         // at `tb - bs` is the anchor for both match points (`tb`, `tb - bs`),
         // the same path non-`atlas_scale` builds (GB10, #69) already take.
-        if self.requires_aux_state() {
+        // On atlas_scale the plan's `h_dsts`/`conv_dsts` exist — but only a
+        // GDN writer (`qwen3_ssm::trait_prefill_recur`) actually fills them.
+        // `nemotron_mamba2` never reads `ctx.midchunk_capture`, so on this SSM
+        // family the tail anchor at `tb` (and its `tb - bs` sibling) would be
+        // registered UNWRITTEN and every subsequent warm hit would resume
+        // from a zeroed/stale recurrent state — the same failure the
+        // cfg!(atlas_scale) guard above documented for the NVIDIA arm.
+        // Refuse unless the SSM family has the writer.
+        if self.requires_aux_state()
+            || !midchunk_capture_writer_exists(self.config.capabilities().ssm_architecture)
+        {
             return None;
         }
         // Reuse gate: capture costs a per-prefill kernel split + D2D copy and
@@ -391,5 +401,28 @@ impl TransformerModel {
                 slot2
             );
         }
+    }
+}
+
+/// Whether this SSM architecture has a mid-chunk capture WRITER: only the
+/// `qwen3_ssm` (GDN) prefill splits its recurrent/conv kernels at `cap_local`
+/// and fills `h_dsts`/`conv_dsts`. `nemotron_mamba2` (Mamba-2) never reads
+/// `ctx.midchunk_capture`; a model with no SSM has nothing to capture.
+pub(in crate::model) fn midchunk_capture_writer_exists(
+    arch: atlas_core::capabilities::SsmArchitecture,
+) -> bool {
+    matches!(arch, atlas_core::capabilities::SsmArchitecture::Gdn)
+}
+
+#[cfg(test)]
+mod midchunk_writer_tests {
+    use super::midchunk_capture_writer_exists;
+    use atlas_core::capabilities::SsmArchitecture;
+
+    #[test]
+    fn only_gdn_has_a_midchunk_writer() {
+        assert!(midchunk_capture_writer_exists(SsmArchitecture::Gdn));
+        assert!(!midchunk_capture_writer_exists(SsmArchitecture::Mamba2));
+        assert!(!midchunk_capture_writer_exists(SsmArchitecture::None));
     }
 }

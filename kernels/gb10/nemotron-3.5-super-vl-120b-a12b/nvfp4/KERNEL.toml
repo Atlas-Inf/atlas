@@ -1,0 +1,7 @@
+# Omni-local overlay on kernel_source="nemotron-labs-3-puzzle-75b-a9b":
+# only modules the source tree lacks. The rest of puzzle's KERNEL.toml
+# (and common's) merge in unchanged via the target-local overlay.
+[modules]
+vision_encoder = "vision_encoder"
+mamba2_ssm_prefill_reg = "mamba2_ssm_prefill_reg"
+moe_union_gemv = "moe_union_gemv"

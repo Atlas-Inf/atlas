@@ -78,6 +78,16 @@ impl FastSafetensorsLoader {
         if self.skip_mtp && name.starts_with("mtp.") {
             return true;
         }
+        // Dead namespaces the model's loader never reads (e.g. the omni
+        // checkpoint's vision tower + latent-MoE MTP head). Applies at EP=1
+        // too — must run BEFORE the `ep_world_size <= 1` early return.
+        if self
+            .skip_prefixes
+            .iter()
+            .any(|p| name.starts_with(p.as_str()))
+        {
+            return true;
+        }
         // W4A4 activation scales: never read on the w4a16 path (the NVFP4
         // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
         // almost pure granule padding at expert scale.

@@ -69,7 +69,7 @@ impl TransformerModel {
         mtp_vocab_size: u32,
         comm: Option<std::sync::Arc<dyn spark_comm::CommBackend>>,
         self_speculative: bool,
-        vision_encoder: Option<crate::layers::VisionEncoder>,
+        vision_encoder: Option<crate::layers::VisionTower>,
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
         ssm_pools: super::ssm_pools::SsmPools,

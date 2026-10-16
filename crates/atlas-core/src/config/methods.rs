@@ -54,6 +54,15 @@ impl ModelConfig {
         }
     }
 
+    /// `model_type == "nemotron_h_omni"` — survives `serve_load`'s text-only
+    /// `config.vision = None` drop when the kernel target ships no
+    /// `vision_encoder` module (every strix-hip target). Nemotron levers
+    /// (native FP8 attention, omni MoE paths) key on this rather than on
+    /// `config.vision.omni`, which disappears on AMD.
+    pub fn is_nemotron_h_omni(&self) -> bool {
+        self.model_type == "nemotron_h_omni"
+    }
+
     /// Number of SSM (linear attention) layers.
     pub fn num_ssm_layers(&self) -> usize {
         if !self.layer_types.is_empty() {

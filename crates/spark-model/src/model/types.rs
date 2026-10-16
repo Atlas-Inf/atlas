@@ -434,7 +434,7 @@ pub struct TransformerModel {
     /// Row masks of a strict structured-output verify (`glm_verify_masks`).
     pub(super) verify_row_masks: super::glm_verify_masks::VerifyRowMasks,
     /// Optional vision encoder for VL models (Qwen3-VL).
-    pub(super) vision_encoder: Option<crate::layers::VisionEncoder>,
+    pub(super) vision_encoder: Option<crate::layers::VisionTower>,
     /// Number of patches encoded by the last prepare_vision_embed() call.
     /// 0 means no vision embeddings pending.
     pub(super) vision_embed_patches: Mutex<usize>,

@@ -250,11 +250,11 @@ fn glm5_vision_native_encoder_oracle_dump() -> Result<()> {
         );
         let output_rows = geometry[0].2;
         let output_bytes_len = output_rows
-            .checked_mul(encoder.out_hidden_size)
+            .checked_mul(encoder.out_hidden_size())
             .and_then(|elements| elements.checked_mul(2))
             .context("oracle output byte length overflow")?;
         let mut output = vec![0u8; output_bytes_len];
-        gpu.copy_d2h(encoder.buf_out, &mut output)
+        gpu.copy_d2h(encoder.out_row(), &mut output)
             .with_context(|| format!("copy native output {name}"))?;
         ensure!(
             finite_bf16(&output),
@@ -268,7 +268,7 @@ fn glm5_vision_native_encoder_oracle_dump() -> Result<()> {
             grid_w,
             &output,
             output_rows,
-            encoder.out_hidden_size,
+            encoder.out_hidden_size(),
         )?);
     }
     let manifest = json!({

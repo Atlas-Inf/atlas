@@ -106,6 +106,17 @@ pub struct ModelLevers {
     /// bytes the single-row kernel's (`ATLAS_QWEN4EXP_BATCH_SMALL=1`; design
     /// in `model/qwen4exp_batch_fast.rs`). Set with the lane.
     pub qwen4exp_batch_small: bool,
+    /// Exact persistent K-row Mamba-2 verify (`mamba2_ssm_verify_exact_
+    /// persistent`): decode's own column mapping, ±200 clamp and reduction
+    /// order, with H held in shared memory across the K loop. Opt-in via
+    /// ATLAS_MAMBA_VERIFY_EXACT, or armed by proposer-install policy for
+    /// targets that disable the fused kernel.
+    pub mamba_verify_exact: bool,
+    /// Fused K-row Mamba-2 verify (`mamba2_ssm_verify`). Opt-out:
+    /// `ATLAS_NO_MAMBA_VERIFY_FUSED` (presence-gated), or cleared at
+    /// proposer install for targets whose fused verify isn't bit-exact
+    /// (nemotron_h_omni).
+    pub mamba_verify_fused: bool,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -237,6 +248,9 @@ impl ModelLevers {
             qwen4exp_batch_fast: false,
             qwen4exp_batch_bisect: 0,
             qwen4exp_batch_small: false,
+            // Presence-gated: any value disables.
+            mamba_verify_fused: std::env::var_os("ATLAS_NO_MAMBA_VERIFY_FUSED").is_none(),
+            mamba_verify_exact: opt_in("ATLAS_MAMBA_VERIFY_EXACT"),
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),
@@ -268,6 +282,7 @@ impl ModelLevers {
             ffn_small_m: true,
             gemv_sw: true,
             gdn_deferred_commit: true,
+            mamba_verify_fused: true,
             ..Self::default()
         }
     }

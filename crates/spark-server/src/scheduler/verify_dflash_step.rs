@@ -186,6 +186,7 @@ pub(super) fn verify_dflash_tail(
         sched.levers.dflash_masked_verify,
         model,
         a,
+        &verified_argmax,
     ) {
         verified_argmax
     } else {

@@ -18,6 +18,7 @@ fn reasoning_done_matches_blocking_when_eos_has_no_think_close() {
             &response(raw.clone()),
             true,
             false,
+            false,
         );
         assert_eq!(reasoning.as_deref(), Some("42"));
         assert!(content.is_empty());

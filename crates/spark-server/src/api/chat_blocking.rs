@@ -58,6 +58,8 @@ pub(super) struct BlockingPathArgs {
     pub stop_tokens: Vec<u32>,
     pub enable_thinking: bool,
     pub thinking_budget: Option<u32>,
+    /// `chat_template_kwargs.force_nonempty_content`.
+    pub force_nonempty_content: bool,
     pub tools_active: bool,
     pub tool_choice_required: bool,
     pub suppress_tool_call: bool,
@@ -99,6 +101,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         stop_tokens,
         enable_thinking,
         thinking_budget,
+        force_nonempty_content,
         tools_active,
         tool_choice_required,
         suppress_tool_call,
@@ -158,6 +161,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             stop_tokens: stop_tokens.clone(),
             enable_thinking,
             thinking_budget,
+            force_nonempty_content,
             repetition_detection: req.repetition_detection,
             require_tool_call: tool_choice_required,
             tools_present: tools_active,
@@ -215,8 +219,13 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         // n>1 we only charge once (same prompt reused).
         total_cached_prompt_tokens = total_cached_prompt_tokens.max(response.cached_prompt_tokens);
 
-        let (reasoning_content_i, output_text_i) =
-            decode_response_text(&state, &response, enable_thinking, tools_active);
+        let (reasoning_content_i, output_text_i) = decode_response_text(
+            &state,
+            &response,
+            enable_thinking,
+            tools_active,
+            force_nonempty_content,
+        );
         let (output_text_i, matched_stop) =
             super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
 
@@ -264,6 +273,7 @@ pub(super) fn decode_response_text(
     response: &super::inference_types::InferenceResponse,
     enable_thinking: bool,
     tools_active: bool,
+    force_nonempty_content: bool,
 ) -> (Option<String>, String) {
     let output_tokens =
         output_tokens_without_stop(&response.output_tokens, response.finish_reason.as_str());
@@ -330,12 +340,21 @@ pub(super) fn decode_response_text(
         // think_end_token_id is None), and it handles the unterminated case by
         // routing the chain of thought to reasoning instead of content.
         let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
-        let (reasoning, content) =
-            extract_thinking(&text, enable_thinking, state.reasoning_parser.as_deref());
+        let (reasoning, content) = extract_thinking(
+            &text,
+            enable_thinking,
+            force_nonempty_content,
+            state.reasoning_parser.as_deref(),
+        );
         (reasoning, super::strip::scrub_think_markers(&content))
     } else {
         let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
-        extract_thinking(&text, enable_thinking, state.reasoning_parser.as_deref())
+        extract_thinking(
+            &text,
+            enable_thinking,
+            force_nonempty_content,
+            state.reasoning_parser.as_deref(),
+        )
     }
 }
 

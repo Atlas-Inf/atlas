@@ -71,11 +71,22 @@ pub(crate) fn strip_stop_sequences_matched(
 pub(crate) fn extract_thinking(
     text: &str,
     enable_thinking: bool,
+    force_nonempty_content: bool,
     parser: Option<&dyn crate::reasoning_parser::ReasoningParser>,
 ) -> (Option<String>, String) {
-    if let Some(p) = parser {
+    let (reasoning, content) = if let Some(p) = parser {
         p.extract_thinking(text, enable_thinking)
     } else {
         (None, text.to_string())
+    };
+    // vLLM `force_nonempty_content` (deepseek_r1): an all-reasoning output
+    // (unclosed think block) is returned as `content` so the response body
+    // is never empty. Reasoning stays populated.
+    if force_nonempty_content
+        && content.is_empty()
+        && let Some(r) = reasoning.clone()
+    {
+        return (reasoning, r);
     }
+    (reasoning, content)
 }

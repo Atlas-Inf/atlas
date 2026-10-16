@@ -414,6 +414,27 @@ pub struct SafetensorsLoader {
     pub skip_mtp: bool,
     /// Exact tensor prefix of an unused appended predictor layer; default retains it.
     pub skip_layer_prefix: Option<String>,
+    /// Skip any tensor whose name starts with one of these prefixes.
+    ///
+    /// Whole dead namespaces — e.g. a vision tower or an MTP head that a
+    /// text-only serve never reads (`nemotron_h_omni` ships ~4.5k such
+    /// tensors: `language_model.mtp.*`, `vision_model.*`, `mlp1.*`,
+    /// `vision_projector.*`). Same contract as `skip_mtp`: only populated
+    /// where the loader is known not to read them.
+    pub skip_prefixes: Vec<String>,
+    /// Pack every kept tensor in a shard into ONE `gpu.alloc` per shard,
+    /// each tensor at a 4096-byte-aligned interior offset. Per-tensor
+    /// cuMemAlloc rounds >=1 MB allocations to 2 MB pages: on NVFP4 MoE
+    /// checkpoints (~1024 packed+scale+scalar tensors per ~1.6 GB shard)
+    /// that waste is ~0.6 GB/shard — ~24 GB across 40 MoE shards on
+    /// Nemotron 3.5 Super VL, i.e. the whole KV budget.
+    ///
+    /// OPT-IN only, via the weight loader's `slab_pack_weights` policy —
+    /// callers must have audited that no `gpu.free` reachable on their
+    /// load path frees a store-owned tensor pointer (interior frees are
+    /// also harmless: the CUDA backend turns them into no-ops once the
+    /// slab is registered). Single-GPU only.
+    pub pack_slab: bool,
 }
 
 impl Default for SafetensorsLoader {
@@ -435,6 +456,8 @@ impl SafetensorsLoader {
             skip_activation_scales: false,
             skip_mtp: false,
             skip_layer_prefix: None,
+            skip_prefixes: Vec::new(),
+            pack_slab: false,
         }
     }
 
@@ -450,6 +473,8 @@ impl SafetensorsLoader {
             skip_activation_scales: false,
             skip_mtp: false,
             skip_layer_prefix: None,
+            skip_prefixes: Vec::new(),
+            pack_slab: false,
         }
     }
 }
@@ -537,5 +562,59 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for WeightStore {
     }
 }
 
+/// Byte layout for a packed slab: one device allocation per safetensors
+/// shard, each tensor at a 4096-byte-aligned interior offset. The CUDA
+/// driver's cuMemAlloc rounds ≥1 MB requests to 2 MB granularity, so a
+/// shard of ~4100 small NVFP4 MoE tensors (~1.6 GB of data) costs ~2.2 GB
+/// unpacked — this layout keeps it at the true size plus ≤4 KB of padding
+/// per tensor.
+///
+/// Returns `(offsets, total_bytes)`.
+///
+/// Offset 0 is RESERVED — the first tensor starts one alignment block in.
+/// Store-tensor frees go through `WeightStore::reclaim` mid-load
+/// (`nvfp4_detect` frees FP8 sources after NVFP4 conversion); a tensor at
+/// offset 0 would alias the slab base and its free would cuMemFree the
+/// whole slab. With the reservation, every tensor pointer is strictly
+/// interior, and the backend turns those frees into no-ops.
+pub fn slab_layout(lens: impl Iterator<Item = usize>) -> (Vec<usize>, usize) {
+    const ALIGN: usize = 4096;
+    let mut offsets = Vec::new();
+    let mut cursor = ALIGN; // offset 0 reserved: never alias the slab base
+    for len in lens {
+        offsets.push(cursor);
+        cursor += len.next_multiple_of(ALIGN);
+    }
+    if offsets.is_empty() {
+        return (offsets, 0); // empty shard: no alloc, no region registration
+    }
+    (offsets, cursor)
+}
+
 #[cfg(test)]
 mod teardown_tests;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn slab_layout_aligns_each_tensor_to_4k() {
+        // Offset 0 is reserved so no tensor pointer can alias the slab base —
+        // `WeightStore::reclaim` on an offset-0 tensor would otherwise free
+        // the entire slab mid-load.
+        let (offsets, total) = super::slab_layout([1, 4096, 4097, 5].into_iter());
+        assert_eq!(offsets, vec![4096, 8192, 12288, 20480]);
+        assert_eq!(total, 24576);
+    }
+
+    #[test]
+    fn slab_layout_empty_shard_is_zero() {
+        let (offsets, total) = super::slab_layout(std::iter::empty());
+        assert!(offsets.is_empty() && total == 0);
+    }
+
+    #[test]
+    fn slab_layout_offset_zero_is_reserved() {
+        let (offsets, _) = super::slab_layout([7].into_iter());
+        assert!(offsets[0] >= 4096, "no tensor may alias the slab base");
+    }
+}

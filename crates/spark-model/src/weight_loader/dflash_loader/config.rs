@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! DFlash drafter `config.json` schema and parser (split out of
-//! `dflash_loader.rs` for the file-size budget; re-exported from there).
+//! DFlash drafter `config.json` types. Split out of `dflash_loader.rs` for
+//! the 500-LoC file budget — the serde surface mirrors the checkpoints'
+//! field names verbatim so `serde_json::from_str` works on the raw file.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -81,6 +82,9 @@ pub struct DflashConfig {
     pub sliding_window: Option<usize>,
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
+    /// NVIDIA LiLiCorr drafters ship their own `lm_head` (`Some(true)`);
+    /// generic DFlash drafters omit the key and share the target's head.
+    pub has_own_lm_head: Option<bool>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -178,6 +182,13 @@ pub struct DflashSubConfig {
     /// Candidate pool size evaluated by DFlash2 CandidateSelector (16).
     #[serde(default)]
     pub selector_top_k: Option<usize>,
+    /// NVIDIA LiLiCorr markers. `"lilicorr"` + `lilicorr_enabled: true`
+    /// declare the candidate re-ranker; its weights load but the forward
+    /// isn't implemented — drafts use the drafter's own argmax.
+    #[serde(default)]
+    pub projector_type: Option<String>,
+    #[serde(default)]
+    pub lilicorr_enabled: Option<bool>,
 }
 
 impl DflashConfig {

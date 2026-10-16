@@ -29,7 +29,6 @@ mod header;
 mod shard;
 
 use header::resolve_shards;
-use shard::load_shard_fast;
 
 /// Run `f` over `len` bytes at `start` within a deferred tensor, read with
 /// `O_DIRECT` when the filesystem allows it (so the bytes never sit in the
@@ -88,6 +87,23 @@ pub struct FastSafetensorsLoader {
     pub skip_mtp: bool,
     /// Exact tensor prefix of an unused appended predictor layer; default retains it.
     pub skip_layer_prefix: Option<String>,
+    /// Skip any tensor whose name starts with one of these prefixes — dead
+    /// namespaces the model's loader never reads (see `SafetensorsLoader::
+    /// skip_prefixes`). Same opt-in contract.
+    pub skip_prefixes: Vec<String>,
+    /// Pack every kept tensor in a shard into ONE `gpu.alloc` per shard,
+    /// each tensor at a 4096-byte-aligned interior offset. Per-tensor
+    /// cuMemAlloc rounds ≥1 MB allocations to 2 MB pages: on NVFP4 MoE
+    /// checkpoints (~1024 packed+scale+scalar tensors per ~1.6 GB shard)
+    /// that waste is ~0.6 GB/shard — ~24 GB across 40 MoE shards on
+    /// Nemotron 3.5 Super VL, i.e. the whole KV budget.
+    ///
+    /// OPT-IN only, via the weight loader's `slab_pack_weights` policy —
+    /// callers must have audited that no `gpu.free` reachable on their
+    /// load path frees a store-owned tensor pointer (interior frees are
+    /// also harmless: the CUDA backend turns them into no-ops once the
+    /// slab is registered). Single-GPU only.
+    pub pack_slab: bool,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
     pub try_direct_io: bool,
@@ -153,6 +169,8 @@ impl FastSafetensorsLoader {
             skip_activation_scales: false,
             skip_mtp: false,
             skip_layer_prefix: None,
+            skip_prefixes: Vec::new(),
+            pack_slab: false,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
@@ -172,6 +190,8 @@ impl FastSafetensorsLoader {
             skip_activation_scales: false,
             skip_mtp: false,
             skip_layer_prefix: None,
+            skip_prefixes: Vec::new(),
+            pack_slab: false,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
@@ -268,7 +288,7 @@ impl WeightLoader for FastSafetensorsLoader {
             );
             crate::progress::shard_start(i + 1, total_shards, shard_name);
 
-            load_shard_fast(
+            shard::load_shard_fast(
                 shard_path,
                 tensor_filter.as_deref(),
                 gpu,
@@ -277,6 +297,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
+                self.pack_slab,
                 &mut weights,
                 &mut deferred,
                 &mut offload_logged,
@@ -316,7 +337,7 @@ impl WeightLoader for FastSafetensorsLoader {
         if extra.exists() {
             tracing::info!("Fast-loading extra_weights.safetensors");
             let mut extra_offload = false;
-            load_shard_fast(
+            shard::load_shard_fast(
                 &extra,
                 None,
                 gpu,
@@ -325,6 +346,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
+                self.pack_slab,
                 &mut weights,
                 &mut deferred,
                 &mut extra_offload,

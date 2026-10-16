@@ -111,16 +111,45 @@ impl ChatTokenizer {
         // Load OpenAI-variant template if it exists (jinja-templates/openai/{model_type}.jinja).
         // This variant gates historical <think> wrappers on enable_thinking, preventing
         // spontaneous thinking during tool-use when thinking is disabled.
-        let openai_jinja_env = super::jinja_helpers::load_openai_template(model_type, repo_root)
-            .and_then(|tmpl| {
+        //
+        // It lives under `jinja-templates/` too, so `--disable-template-overrides`
+        // skips it: the flag promises the MODEL's own template, and the chat
+        // completions path renders through this variant whenever it exists. Before
+        // this, Qwen3.6-35B kept the qwen3_5_moe variant under the flag — and that
+        // variant ignores `preserve_thinking`, dropping prior-turn reasoning.
+        let openai_jinja_env = if disable_template_overrides {
+            None
+        } else {
+            super::jinja_helpers::load_openai_template(model_type, repo_root).and_then(|tmpl| {
                 tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
                 super::jinja_helpers::build_jinja_env(&tmpl).ok()
-            });
+            })
+        };
         let chat_encoding = if model_type == "deepseek_v4" {
             tracing::info!("Using checkpoint-native DeepSeek-V4 message encoding");
             ChatEncoding::DeepseekV4
         } else {
             ChatEncoding::Jinja
+        };
+
+        // nemotron_h_omni: `<image>`(18) placeholders expand to
+        // `<img>`(19) + N x id-18 + `</img>`(20) per the checkpoint's
+        // processing_nemotron_h_omni.py. Resolve the three ids once.
+        let omni_image_tokens = if model_type == "nemotron_h_omni" {
+            let e = |t: &str| -> Option<u32> {
+                tokenizer.encode(t, false).ok().and_then(|enc| {
+                    let ids = enc.get_ids();
+                    (ids.len() == 1).then(|| ids[0])
+                })
+            };
+            match (e("<image>"), e("<img>"), e("</img>")) {
+                (Some(img), Some(start), Some(end)) => Some((img, start, end)),
+                _ => anyhow::bail!(
+                    "nemotron_h_omni tokenizer is missing <image>/<img>/</img> special tokens"
+                ),
+            }
+        } else {
+            None
         };
 
         tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
@@ -129,6 +158,7 @@ impl ChatTokenizer {
             eos_token_id,
             supports_thinking,
             chat_encoding,
+            omni_image_tokens,
             chat_template,
             jinja_env,
             openai_jinja_env,
@@ -437,6 +467,9 @@ impl ChatTokenizer {
         if pad_counts.is_empty() || pad_counts.iter().all(|&c| c <= 1) {
             return tokens;
         }
+        if let Some((img, start, end)) = self.omni_image_tokens {
+            return expand_omni_pads(tokens, pad_counts, img, start, end);
+        }
         let image_pad = self.image_pad_token_id();
         let video_pad = self.video_pad_token_id();
         if image_pad.is_none() && video_pad.is_none() {
@@ -459,4 +492,34 @@ impl ChatTokenizer {
         }
         out
     }
+}
+
+/// nemotron_h_omni: each bare `<image>`(img) -> `<img>` + N×img + `</img>`.
+/// `pad_counts[i]` is the i-th image's token count (target_patches /
+/// downsample²), matching the checkpoint processor's `num_tokens`.
+/// Refuse-not-truncate is enforced downstream: a pad run that would
+/// not fit the sequence budget makes the request fail rather than
+/// being cut mid-image.
+pub(crate) fn expand_omni_pads(
+    tokens: Vec<u32>,
+    pad_counts: &[usize],
+    img: u32,
+    start: u32,
+    end: u32,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(tokens.len() + pad_counts.iter().sum::<usize>());
+    let mut idx = 0usize;
+    for t in tokens {
+        if t == img && idx < pad_counts.len() {
+            out.push(start);
+            for _ in 0..pad_counts[idx].max(1) {
+                out.push(img);
+            }
+            out.push(end);
+            idx += 1;
+        } else {
+            out.push(t);
+        }
+    }
+    out
 }

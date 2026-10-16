@@ -70,6 +70,12 @@ pub fn sample_with_params_seeded(
     // quantized logits tie often, so one rule is what lets a speculative
     // verify commit exactly the tokens this pick would.
     if params.temperature <= 0.0 {
+        // FIRST-index-wins: unifies the tie-break with the GPU argmax kernel
+        // (argmax_bf16, lowest-lane), every verify pick (CPU argmax_first_wins,
+        // fast-greedy row picks) and torch.argmax/vLLM greedy. Logits are BF16
+        // so exact ties are common; under the old LAST-wins rule the CPU host
+        // path and verify disagreed at ties and speculative decode emitted
+        // divergent tokens (lossy spec-off != gamma, tool-call args/order).
         return argmax_first_wins_f32(&raw_logits);
     }
     let temperature = params.temperature;
@@ -203,4 +209,181 @@ pub fn sample_with_params_seeded(
         }
     }
     probs.last().map_or(0, |p| p.0)
+}
+
+/// Greedy pick with `max_by(partial_cmp.unwrap_or(Equal))` semantics —
+/// LAST-index-wins (Rust's `max_by` returns the last of several equal
+/// maxima). Retained for reference/tests only: the production greedy bypass
+/// now uses `argmax_first_wins` (2026-10-11) because BF16 logits tie exactly
+/// and every other pick site — the GPU argmax kernel, the CPU verify argmax
+/// and all fast-path picks — resolves to the lowest index. The mismatch made
+/// spec decode emit divergent tokens at exact ties (lossy spec-off != gamma).
+///
+/// NaN is the reason for the guarded structure. `partial_cmp` with a NaN
+/// returns `None`, mapped to `Equal` — and under `max_by`'s last-wins rule an
+/// "equal" NaN DISPLACES the current maximum, so a NaN anywhere after the true
+/// max changes the historical result. That quirk cannot be reproduced by a
+/// max-then-find pass, so: pass 1 computes the max over 8 independent lanes
+/// (vectorisable, no index dependency) while also detecting NaN; if ANY NaN is
+/// present the original `max_by` expression runs verbatim (bit-identical by
+/// construction); otherwise the answer is the LAST index equal to the max,
+/// which is exactly what `max_by` returns on NaN-free input (including
+/// -0.0/+0.0 ties, where `partial_cmp` says Equal and `==` agrees).
+pub fn argmax_last_wins_f32(v: &[f32]) -> u32 {
+    const LANES: usize = 8;
+    let mut acc = [f32::NEG_INFINITY; LANES];
+    let mut any_nan = false;
+    let mut chunks = v.chunks_exact(LANES);
+    for c in &mut chunks {
+        for (a, &x) in acc.iter_mut().zip(c) {
+            any_nan |= x.is_nan();
+            if x > *a {
+                *a = x;
+            }
+        }
+    }
+    let mut best = f32::NEG_INFINITY;
+    for &a in acc.iter() {
+        if a > best {
+            best = a;
+        }
+    }
+    for &x in chunks.remainder() {
+        any_nan |= x.is_nan();
+        if x > best {
+            best = x;
+        }
+    }
+    if any_nan {
+        // Bit-identical fallback: the exact historical expression.
+        return v
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+    }
+    v.iter()
+        .rposition(|&x| x == best)
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod greedy_tests {
+    use super::argmax_last_wins_f32;
+
+    fn reference(v: &[f32]) -> u32 {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0)
+    }
+
+    fn agree(v: &[f32]) {
+        assert_eq!(argmax_last_wins_f32(v), reference(v), "diverged on {v:?}");
+    }
+
+    #[test]
+    fn matches_max_by_reference() {
+        agree(&[]);
+        agree(&[1.0]);
+        agree(&[1.0, 3.0, 2.0]);
+        // Ties resolve to the LAST index — the opposite of the verify path.
+        agree(&[1.0, 5.0, 5.0, 5.0, 2.0]);
+        agree(&[5.0, 1.0, 5.0]);
+        // Tie straddling the 8-lane boundary.
+        agree(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 9.0]);
+        agree(&[-5.0, -1.0, -3.0]);
+        agree(&[-0.0, 0.0, -0.0]);
+        agree(&[f32::NEG_INFINITY, f32::NEG_INFINITY]);
+        agree(&[f32::INFINITY, 1.0, f32::INFINITY]);
+        // NaN cases route to the verbatim fallback => trivially identical,
+        // but assert anyway so the routing itself is covered.
+        agree(&[f32::NAN, 1.0, 2.0]);
+        agree(&[1.0, 2.0, f32::NAN]);
+        agree(&[f32::NAN]);
+    }
+
+    fn params_temp0() -> super::SamplingParams {
+        super::SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            top_n_sigma: 0.0,
+            min_p: 0.0,
+            logit_bias: Vec::new(),
+            repetition_penalty: 1.0,
+            repetition_penalty_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            lz_penalty: 0.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 0,
+            dry_sequence_breakers: Vec::new(),
+            max_tokens: 16,
+            stop_token_ids: Vec::new(),
+            seed: Some(0),
+        }
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn greedy_pick_is_first_index_wins_on_ties() {
+        // Production contract (2026-10-11): the CPU greedy bypass must return
+        // the LOWEST tied index — identical to the GPU argmax kernel, the CPU
+        // verify argmax and torch.argmax/vLLM greedy. BF16 logits tie exactly
+        // and the old last-wins rule made serial decode diverge from verify.
+        let v = [1.0f32, 5.0, 5.0, 5.0, 2.0];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v), &params_temp0(), &[]),
+            1
+        );
+        // Tie straddling the 8-lane boundary.
+        let v2 = [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 9.0];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v2), &params_temp0(), &[]),
+            7
+        );
+        // argmax_first_wins_f32 directly.
+        assert_eq!(super::argmax_first_wins_f32(&v), 1);
+    }
+
+    #[test]
+    fn greedy_pick_nan_is_deterministic() {
+        // first-wins: NaN never wins — a NaN AFTER the max must not displace
+        // it; all-NaN deterministically falls back to index 0.
+        let v = [1.0f32, 5.0, 5.0, f32::NAN];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v), &params_temp0(), &[]),
+            1
+        );
+        let v_nan = [f32::NAN, 2.0, 1.0];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v_nan), &params_temp0(), &[]),
+            1
+        );
+        let v_all_nan = [f32::NAN; 4];
+        assert_eq!(
+            super::sample_with_params_history(&f32_bytes(&v_all_nan), &params_temp0(), &[]),
+            0
+        );
+    }
+
+    #[test]
+    fn vocab_sized_last_wins() {
+        let mut v: Vec<f32> = (0..248_320)
+            .map(|i| (((i * 2654435761u64 as usize) % 100_003) as f32) / 1000.0 - 50.0)
+            .collect();
+        v[100_000] = 999.0;
+        v[200_000] = 999.0; // duplicate max — LAST must win here
+        assert_eq!(argmax_last_wins_f32(&v), reference(&v));
+        assert_eq!(argmax_last_wins_f32(&v), 200_000);
+    }
 }

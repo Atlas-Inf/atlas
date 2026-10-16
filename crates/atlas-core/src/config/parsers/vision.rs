@@ -65,6 +65,7 @@ pub(crate) fn parse_vision_config(raw: &serde_json::Value) -> Option<VisionConfi
         // installed by the server right after config load, before the encoder
         // is built. `None` here means "not yet resolved", never "unbounded".
         max_pixels: None,
+        omni: None,
     })
 }
 
@@ -234,5 +235,6 @@ pub(crate) fn parse_glm5_vision_config(
         video_start_token_id,
         video_end_token_id,
         max_pixels: None,
+        omni: None,
     }))
 }

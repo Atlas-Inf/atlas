@@ -232,6 +232,9 @@ impl TransformerModel {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        // ATLAS_LAYER_H_PREFILL: per-layer hidden sums for the last row of the
+        // chunk and over all rows, after each layer, eager path only.
+        let probe_hp = std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1");
         let t_loop = host_timing.then(std::time::Instant::now);
         let mut t_in_prefill = std::time::Duration::ZERO;
         let mut t_dflash = std::time::Duration::ZERO;
@@ -357,6 +360,26 @@ impl TransformerModel {
             }
             if let Some(t) = t_df {
                 t_dflash += t.elapsed();
+            }
+            if probe_hp {
+                self.gpu.synchronize(stream).ok();
+                let hs = self.config.hidden_size;
+                let mut hb = vec![0u8; proc_count * hs * 2];
+                if self.gpu.copy_d2h(hidden, &mut hb).is_ok() {
+                    let mut all = 0f64;
+                    let mut last = 0f64;
+                    for (e, c) in hb.chunks_exact(2).enumerate() {
+                        let v =
+                            f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                        if v.is_finite() {
+                            all += v.abs();
+                            if e / hs == proc_count - 1 {
+                                last += v.abs();
+                            }
+                        }
+                    }
+                    tracing::warn!("ATLAS_LAYER_HP L{i} last_sabs={last:.6} all_sabs={all:.6}");
+                }
             }
             if let Some(lt0) = lt0 {
                 self.gpu.synchronize(stream)?;

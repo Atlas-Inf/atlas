@@ -105,6 +105,7 @@ pub(super) async fn run_blocking(
                 logit_bias: p.logit_bias.clone(),
                 stop_tokens: p.stop_tokens.clone(),
                 enable_thinking: false,
+                force_nonempty_content: false,
                 thinking_budget: None,
                 repetition_detection: p.repetition_detection,
                 require_tool_call: false,

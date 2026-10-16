@@ -74,6 +74,11 @@ pub struct VisionConfig {
     /// the encoder is constructed. `None` keeps the historical behaviour on
     /// both sides.
     pub max_pixels: Option<usize>,
+
+    /// Omni (`nemotron_h_omni`) RADIO-tower parameters. `Some` marks this
+    /// vision config as the RADIO preprocessing/encoder family rather
+    /// than the Qwen-VL one.
+    pub omni: Option<OmniVisionConfig>,
 }
 
 impl VisionConfig {
@@ -81,4 +86,35 @@ impl VisionConfig {
     pub fn merger_input_size(&self) -> usize {
         self.spatial_merge_size * self.spatial_merge_size * self.hidden_size
     }
+}
+
+/// RADIO-tower parameters for `nemotron_h_omni`. Mirrors the keys the
+/// checkpoint's own `image_processing_nemotron_h_omni.py` and
+/// `modeling_radio.py` read.
+#[derive(Debug, Clone, Default)]
+pub struct OmniVisionConfig {
+    /// CLIP normalization stats (the checkpoint's `input_conditioner`
+    /// buffers — never hard-coded).
+    pub norm_mean: [f32; 3],
+    pub norm_std: [f32; 3],
+    /// Patch/token budget bounds for `_compute_target_patches`.
+    pub max_num_patches: usize,
+    pub min_num_patches: usize,
+    /// Pixel-shuffle factor (0.5 → 2×2 merge).
+    pub downsample_ratio: f64,
+    /// `<image>`(18)/`<img>`(19)/`</img>`(20) wrapper token ids.
+    pub image_token_id: u32,
+    pub image_start_token_id: u32,
+    pub image_end_token_id: u32,
+    /// `force_image_size` from the config (0 = unset).
+    pub force_image_size: usize,
+    /// cls+register prefix tokens the embedder prepends / strip count (10).
+    pub prefix_tokens: usize,
+    pub num_summary_tokens: usize,
+    /// ViT positional-embed table side (max_img_size / patch_size).
+    pub pos_grid_side: usize,
+    /// mlp1 RMSNorm eps.
+    pub projector_norm_eps: f64,
+    /// ViT layer-norm eps.
+    pub layer_norm_eps: f64,
 }

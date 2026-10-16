@@ -96,6 +96,30 @@ pub(super) fn strip_in_tool_opener_bias(
     logit_bias.retain(|&(id, delta)| id != tc_open || delta <= 0.0);
 }
 
+/// Speculative `inside_tool_body` transition for the verify per-row loop —
+/// mirrors the opener/closer rules of `update_tool_param_state` (emit path)
+/// so row i sees the flag serial decode would hold after rows 0..i-1.
+/// Pure over scalars for unit testing; the loop rolls the flag back after
+/// the block, and emit re-advances accepted rows for real.
+pub(super) fn advance_in_tool_flag(
+    inside_thinking: bool,
+    cur: bool,
+    tok: u32,
+    opener: Option<u32>,
+    closer: Option<u32>,
+) -> bool {
+    if inside_thinking {
+        return cur;
+    }
+    if opener == Some(tok) {
+        true
+    } else if closer == Some(tok) {
+        false
+    } else {
+        cur
+    }
+}
+
 /// P1-4 (2026-07-09): the min_p actually handed to the sampler at the sites
 /// that previously passed hardcoded `0.0` literals — the caller's resolved
 /// value (request value, already floored by MODEL.toml `min_p_floor` in
@@ -127,8 +151,12 @@ pub(super) fn effective_min_p(
 ///  * `FinalDecode` → the caller passes the effective `temperature`, the
 ///    per-token `seed` and the base `logit_bias` (`ActiveSeq.logit_bias`,
 ///    cloned) it computed for this step.
-///  * `Verify` → the MTP verify/bootstrap emission is a penalty-aware
-///    greedy ARGMAX: [`verify_penalty_params`].
+///  * `Verify` → the MTP/DFlash verify bootstrap emission is a penalty-aware
+///    greedy ARGMAX, so callers pass `temperature = 0.0`, `seed = None`, and
+///    the sequence's own base bias (`a.logit_bias`) — the same bias vec
+///    FinalDecode would apply at this position. Passing an empty vec used to
+///    suppress the `<tool_call>` opener nudge inside speculative verify and
+///    was the root cause of spec-on != spec-off on tool-call workloads.
 pub(super) fn penalty_params_for(
     a: &ActiveSeq,
     kind: PositionKind,
@@ -165,9 +193,11 @@ pub(super) fn penalty_params_for_with_floor(
     floor: u32,
 ) -> SamplingParams {
     // `Verify` positions are a penalty-aware greedy ARGMAX, so the contract
-    // is temperature 0.0 and no seed. Pin it so a future caller can't silently
-    // pass stochastic params on the speculative path. The A4 floor below is
-    // appended for BOTH kinds (intended delta).
+    // is temperature 0.0, no seed. The base bias is the sequence's own
+    // (a.logit_bias — must match FinalDecode at the same position). Pin it so
+    // a future caller can't silently pass stochastic params on the
+    // speculative path. The A4 floor below is appended for BOTH kinds
+    // (intended delta).
     debug_assert!(
         kind != PositionKind::Verify || (temperature == 0.0 && seed.is_none()),
         "Verify positions must pass temperature=0.0, seed=None"
@@ -378,9 +408,15 @@ pub fn sample_token(
         }
     }
     if temperature == 0.0 {
-        // Greedy argmax over FP32; exact ties go to the lowest index, the
-        // engine-wide rule (`argmax_first_wins_f32`).
-        return Ok(spark_runtime::sampler::argmax_first_wins_f32(&f32_logits));
+        // Greedy argmax over FP32.
+        //
+        // FIRST-WINS on exact ties: unified with the GPU argmax kernels
+        // (lowest-lane), every verify pick and torch.argmax/vLLM greedy —
+        // BF16 logits tie exactly, and last-wins here made serial decode
+        // emit a different token than verify picked (lossy spec-off != gamma
+        // on tool-call requests, which always take this host path).
+        let best = spark_runtime::sampler::argmax_first_wins_f32(&f32_logits);
+        return Ok(best);
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
@@ -510,7 +546,9 @@ pub fn sample_token_with_grammar(
     // output-token history — identical stage to the non-MTP path.
     apply_penalties_and_bias(&mut f32_logits, penalties, history);
     if temperature == 0.0 {
-        return Ok(spark_runtime::sampler::argmax_first_wins_f32(&f32_logits));
+        // FIRST-WINS — same tie unification as the branch above.
+        let best = spark_runtime::sampler::argmax_first_wins_f32(&f32_logits);
+        return Ok(best);
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };

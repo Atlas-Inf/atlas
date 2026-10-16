@@ -1,0 +1,88 @@
+# Nemotron-3.5-Super-VL NVFP4 — strix-hip (gfx1151, native HIP) target.
+#
+# .cu overrides in this dir (relative symlinks into gb10/common):
+# mamba2_ssd_chunk (chunked Mamba prefill scan), ssm_h_dtype (h-state f32<->f16),
+# moe_expert_relu2_down_wide + moe_relu2_down_shared_slot, moe_w4a16_grouped_gemm (K2 union-grouped
+# LatentMoE verify), moe_expert_gemv_wide + moe_expert_gemv_wide_grouped.
+# Everything else is inherited from kernels/strix-hip/common/.
+#
+# NOT ported on purpose: marlin_* (gb10-only), w4a4/moe_w4a4 (puzzle-shadow
+# FP4 math gfx1151 lacks — FP8/NVFP4 stay weight-only dequant w8a16/w4a16).
+#
+# Module map: strix-hip/common's map plus the turbo/paged-decode renames for
+# the .cu files that exist on this hardware — the runtime kernel registry
+# resolves functions by these module names regardless of backend.
+
+[build]
+# hipcc spelling of gb10's `--fmad=false`; same numerical intent (no FP
+# multiply-add contraction), matters for NVFP4/FP8 precision parity.
+# -DHDIM=128 mirrors the gb10 puzzle KERNEL.toml: the checkpoint declares
+# head_dim=128 and the strix-hip prefill kernels default HDIM to 256.
+extra_nvcc_flags = ["-ffp-contract=off", "-DHDIM=128"]
+
+# File stem -> module name overrides.
+# Any .cu file not listed here uses its file stem as the module name.
+[modules]
+e2m1_branchless = "e2m1"
+moe_permute = "moe"
+dense_gemm_bf16 = "gemm"
+dense_gemm_splitk = "gemm_splitk"
+dense_gemm_tc = "gemm_tc"
+rms_norm = "norm"
+argmax_bf16 = "argmax"
+dense_gemv_bf16 = "gemv"
+dense_gemv_fp8w = "gemv_fp8w"
+moe_shared_expert_fused_batch2 = "moe_fused_batch2"
+quantize_bf16_to_nvfp4 = "quantize_nvfp4"
+paged_decode_attn = "paged_decode"
+paged_decode_attn_fp8 = "paged_decode_fp8"
+paged_decode_attn_nvfp4 = "paged_decode_nvfp4"
+w4a16_gemm = "w4a16"
+kv_cache_append = "kv_cache"
+moe_w4a16_grouped_gemm = "moe_w4a16"
+moe_union_gemv = "moe_union_gemv"
+moe_sorted_prefill = "moe_sorted"
+moe_shared_expert_fused_batch3 = "moe_fused_batch3"
+inferspark_prefill_paged = "prefill_paged"
+inferspark_prefill_paged_sink = "prefill_paged_sink"
+inferspark_prefill_paged_sink_h128 = "prefill_paged_sink_h128"
+inferspark_prefill_paged_indirect_sink = "prefill_paged_indirect_sink"
+inferspark_prefill_paged_indirect_sink_h128 = "prefill_paged_indirect_sink_h128"
+inferspark_prefill_paged_fp8 = "prefill_paged_fp8"
+inferspark_prefill_paged_nvfp4 = "prefill_paged_nvfp4"
+inferspark_prefill_fp8kv = "prefill_fp8kv"
+nemotron_moe_prefill = "nemotron_moe_prefill"
+mamba2_ssm_decode = "mamba2_ssm"
+moe_expert_relu2_down_shared = "moe_relu2_fused"
+moe_topk_sigmoid = "moe_topk_sig"
+moe_topk_sqrtsoftplus = "moe_topk_sqrt"
+relu_squared = "relu2"
+reshape_and_cache_turbo = "reshape_and_cache_turbo"
+paged_decode_attn_turbo4 = "paged_decode_turbo4"
+paged_decode_attn_turbo8 = "paged_decode_turbo8"
+paged_decode_attn_turbo4_512 = "paged_decode_turbo4_512"
+paged_decode_attn_turbo8_512 = "paged_decode_turbo8_512"
+paged_decode_attn_turbo3 = "paged_decode_turbo3"
+paged_decode_attn_turbo3_128 = "paged_decode_turbo3_128"
+paged_decode_attn_turbo4_128 = "paged_decode_turbo4_128"
+paged_decode_attn_turbo8_128 = "paged_decode_turbo8_128"
+gated_delta_rule = "gated_delta_rule"
+
+# The strix-hip overlay rms_norm.cu / w8a16_gemv_batch4.cu carry only the variants the
+# Nemotron 3.5 Super VL dispatch requests (verified end to end on gfx1151, Windows and
+# Linux); the startup kernel audit hard-errors if a dropped one is ever requested.
+[shadow_exempt]
+norm = [
+  "gated_rms_norm_f32_input_sigmoid",
+  "gated_rms_norm_prefill_sigmoid",
+  "gated_rms_norm_sigmoid",
+  "residual_add_rms_norm_vanilla",
+  "rms_norm_grouped",
+  "rms_norm_offset_warp_row",
+  "rms_norm_residual_vanilla",
+]
+w8a16_gemv_batch4 = [
+  "w8a16_gemv_batch8",
+  "w8a16_gemv_batch8_dyn_vl2",
+  "w8a16_gemv_batch8_dyn_vl2_n2",
+]
