@@ -145,6 +145,21 @@ impl TransformerModel {
             "dense_gemv_fp8w_batch2",
             "dense_gemv_fp8w_batch2",
         );
+        // BF16 dual-GEMV (batch=2) for the K=2 verify lm_head on a BF16 LM
+        // head. HIP only: the strix-hip kernel is bit-identical to two
+        // `dense_gemv_bf16` calls (same 32-lane walk per row, same shuffle
+        // reduction), while the NVIDIA builds use 64 lanes per row plus a
+        // shared-memory reduction, which reorders the sum. Elsewhere the
+        // handle stays 0 and the two-GEMV fallback runs unchanged.
+        let dense_gemv_bf16_batch2_kernel = if cfg!(atlas_hip) {
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "dense_gemv_bf16_batch2",
+                "dense_gemv_bf16_batch2",
+            )
+        } else {
+            spark_runtime::gpu::KernelHandle(0)
+        };
         let dense_gemm_kernel = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let dense_gemv_batchm_kernel = gpu
             .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
@@ -671,6 +686,7 @@ impl TransformerModel {
             w4a16_gemv_batch16_kernel,
             dense_gemv_fp8w_kernel,
             dense_gemv_fp8w_batch2_kernel,
+            dense_gemv_bf16_batch2_kernel,
             lm_head_dp4a_gemv_kernel,
             lm_head_dp4a_quant_kernel,
             dense_gemm_kernel,
