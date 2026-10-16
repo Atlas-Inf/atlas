@@ -133,20 +133,16 @@ impl TransformerModel {
         // GEMM path for a single token (0.7ms/layer vs 5ms/layer).
         let use_decode_path = proc_count == 1 && effective_seq_len_start > 0;
         // Marconi warm hit: this pass replays SSM state over [snap_tok,
-        // matched) — positions whose K/V already live in shared prefix-cache
-        // blocks. Pass the per-chunk count of those replay tokens as the
-        // layer write floor so attention layers do NOT rewrite them with
-        // non-bit-exact recomputed values (drift would poison the shared
-        // blocks and ratchet across turns). `seq.cached_prefix_tokens` is
-        // the radix-tree match point; tokens at or past it are new and are
-        // written normally.
-        let layer_kv_write_start = if marconi_skip {
-            seq.cached_prefix_tokens
-                .saturating_sub(effective_seq_len_start)
-                .min(proc_count)
-        } else {
-            kv_write_start
-        };
+        // matched). The replay recomputes hidden states for those tokens
+        // under THIS pass's layout — so attention layers MUST also rewrite
+        // their K/V, else the cache keeps values computed under a different
+        // pass layout while the recurrent state came from the replay: the two
+        // caches then describe different trajectories and a near-tied argmax
+        // flips at temp 0 (issue #158's tool-call round-trip). The batched
+        // path already rewrites from 0 (`kv_write_start_eff`); single-stream
+        // now matches. `seq.cached_prefix_tokens` is only used for the
+        // non-marconi hit region below, which stays untouched.
+        let layer_kv_write_start = if marconi_skip { 0 } else { kv_write_start };
         let prefill_t0 = if profile_now {
             self.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
