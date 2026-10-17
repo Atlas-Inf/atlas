@@ -603,7 +603,15 @@ fn compile_spec(
     // Exempt the model's stop/EOS tokens from grammar refusal so a legitimate
     // end-of-turn token cannot desync the NPDA and truncate the response
     // (see GrammarState::accept_token).
-    Ok(Some(state.with_stop_tokens(eos_tokens)))
+    let state = state.with_stop_tokens(eos_tokens);
+    // A union picks its branch by mass at its first token (`grammar::branch`).
+    let GrammarSpec::ToolCallOrJson { schema, .. } = spec else {
+        return Ok(Some(state));
+    };
+    let answer = engine
+        .json_start_mask(schema.as_deref())
+        .map_err(|e| format!("Grammar compilation failed: {e}"))?;
+    Ok(Some(state.with_answer_start(answer)))
 }
 
 /// Result of starting a chunked prefill.

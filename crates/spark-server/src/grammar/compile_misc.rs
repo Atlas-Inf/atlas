@@ -85,6 +85,21 @@ impl GrammarEngine {
         compiled.unwrap_or_else(|p| std::panic::resume_unwind(p))
     }
 
+    /// The union's answer branch first-token mask: the response_format JSON
+    /// compiled alone (as a response_format request would, so it is cached
+    /// alike), at its start state. Picks the union's branch (`branch`).
+    pub fn json_start_mask(&mut self, schema: Option<&str>) -> Result<Box<[i32]>, GrammarError> {
+        let compiled = match schema {
+            Some(schema) => self.compile_json_schema(schema)?,
+            None => self.compile_json_grammar()?,
+        };
+        let mut matcher = xgrammar::GrammarMatcher::new(&compiled, None, false, -1)
+            .map_err(GrammarError::Compilation)?;
+        let mut mask = xgrammar::allocate_token_bitmask(1, self.vocab_size());
+        matcher.fill_next_token_bitmask(&mut mask, 0, false);
+        Ok(mask)
+    }
+
     /// The response_format JSON as a grammar, with the options and limits of
     /// [`Self::compile_json_schema`] / [`Self::compile_json_grammar`].
     fn json_grammar(schema: Option<&str>) -> Result<Grammar, GrammarError> {

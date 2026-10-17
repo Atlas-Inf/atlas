@@ -69,6 +69,10 @@ pub struct GrammarState {
     /// The strict grammar's response opens inside `<think>`, so the first
     /// sampled token is reasoning and must not be masked or consumed.
     opens_in_thinking: bool,
+    /// A tool-call-or-JSON union's answer (JSON) branch first-token mask: the
+    /// branch is chosen by mass at the first output token (`grammar::branch`).
+    /// (GLM `native_opener` is #199 infra — dropped for main.)
+    answer_start: Option<Box<[i32]>>,
 }
 
 impl GrammarState {
@@ -130,6 +134,7 @@ impl GrammarState {
             bitmask_fill_result: false,
             strict: false,
             opens_in_thinking: false,
+            answer_start: None,
         })
     }
 
@@ -152,6 +157,46 @@ impl GrammarState {
         self.strict = true;
         self.opens_in_thinking = opens_in_thinking;
         self
+    }
+
+    /// Register the native tool opener (see the `native_opener` field).
+    #[must_use]
+    pub fn with_native_opener(mut self, native_opener: Option<u32>) -> Self {
+        self.native_opener = native_opener;
+        self
+    }
+
+    /// Whether `tok`, emitted inside `<think>`, ends the reasoning and is the
+    /// grammar's first output token (the native tool opener).
+    pub fn opens_output(&self, tok: u32) -> bool {
+        self.native_opener == Some(tok)
+    }
+
+    /// Register a union's answer-branch first-token mask (`answer_start`).
+    #[must_use]
+    pub fn with_answer_start(mut self, answer_start: Box<[i32]>) -> Self {
+        self.answer_start = Some(answer_start);
+        self
+    }
+
+    /// A union's first output token is still to choose its branch.
+    pub fn branch_pending(&self) -> bool {
+        self.answer_start.is_some()
+            && self.matcher.num_history_steps() == 0
+            && !self.matcher.is_terminated()
+    }
+
+    /// At a pending branch, restrict this position's mask to the branch the
+    /// model prefers by mass over `logits`, the position's logits before the
+    /// mask (`grammar::branch`). Call before the mask is applied; a no-op
+    /// anywhere else.
+    pub fn choose_branch(&mut self, logits: &[f32]) {
+        if !self.branch_pending() || !self.fill_bitmask() {
+            return;
+        }
+        let answer = self.answer_start.as_deref().unwrap_or_default();
+        let tool = super::branch::prefers_tool(logits, &self.bitmask_data, answer);
+        super::branch::restrict(&mut self.bitmask_data, answer, tool);
     }
 
     /// Whether this is a `response_format` grammar whose output must conform.
