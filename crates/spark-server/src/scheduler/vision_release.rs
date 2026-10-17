@@ -36,7 +36,8 @@ mod tests {
         // budget while it decodes.
         let budget = VisionRowBudget::new(10_000);
         let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1], 7, None, 8);
-        let item = VisionItem::image(vec![0.0; 4], 2, 2).holding(budget.try_acquire(4096).unwrap());
+        let permit = std::sync::Arc::new(budget.try_acquire(4096).unwrap());
+        let item = VisionItem::image(vec![0.0; 4], 2, 2).holding(permit);
         a.seq.vision.items = vec![item];
         let (b, _rx2) = crate::scheduler::test_support::test_seq(vec![1], 7, None, 8);
         let mut active = vec![a, b];

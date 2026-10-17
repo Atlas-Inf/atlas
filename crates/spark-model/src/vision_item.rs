@@ -58,6 +58,16 @@ impl VisionItem {
         }
     }
 
+    /// The item, holding `permit` until its last copy drops.
+    /// Several items of one request may share one permit.
+    pub fn holding(
+        mut self,
+        permit: std::sync::Arc<crate::vision_budget::VisionRowPermit>,
+    ) -> Self {
+        self.held = crate::vision_budget::HeldRows(Some(permit));
+        self
+    }
+
     /// Temporal extent, in groups. 1 for a still.
     pub fn t_len(&self) -> usize {
         self.groups.len().max(1)

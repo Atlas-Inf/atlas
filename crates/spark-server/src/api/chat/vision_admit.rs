@@ -4,12 +4,13 @@
 //!
 //! A request whose images the engine cannot serve used to be admitted, fail
 //! at prefill start, and reach the client as a generic error; agent clients
-//! then resent the identical history forever. Each item is sized from its
+//! then resent the identical history forever. Each still is sized from its
 //! header before it is decoded (`vision_preprocess::probe_image`), so a
 //! request over its limits is refused with a 400 the client can act on before
-//! any pixel is allocated, and every admitted item first takes its rows from
-//! the server's in-flight budget (`vision_budget`): a spent budget is a 503
-//! with `Retry-After`. Every endpoint that takes images goes through
+//! any pixel is allocated; a request within them then takes all of its rows
+//! from the server's in-flight budget (`vision_budget`) in one acquire, and a
+//! spent budget is a 503 with `Retry-After`. The passes are in
+//! `msg_entry::media`. Every endpoint that takes images goes through
 //! `prepare_chat_prompt` (chat completions, Responses, Anthropic messages),
 //! streaming or not, so this covers them all.
 
@@ -47,17 +48,12 @@ fn too_large(message: String) -> Response {
     )
 }
 
-fn busy(rows: usize, budget: &VisionRowBudget) -> Response {
-    let message = format!(
-        "vision capacity busy: an item needs {rows} vision tokens and the server holds {} \
-         of its {} for requests in flight; retry shortly",
-        budget.in_use(),
-        budget.limit()
-    );
-    tracing::warn!("vision request deferred at admission: {message}");
+fn busy(rows: usize) -> Response {
+    // Counts of what other requests hold are not this client's business.
+    tracing::warn!("vision request deferred at admission: {rows} rows, in-flight budget spent");
     let mut resp = openai_error_response_with_param(
         StatusCode::SERVICE_UNAVAILABLE,
-        message,
+        "vision capacity is busy; retry shortly".to_string(),
         None,
         Some(VISION_BUSY_CODE),
     );
@@ -66,7 +62,8 @@ fn busy(rows: usize, budget: &VisionRowBudget) -> Response {
     resp
 }
 
-/// One request's admission, item by item in prompt order.
+/// One request's admission: [`Admission::begin`] before any item is read,
+/// [`Admission::note`] as each is sized, [`Admission::admit`] once all are.
 pub(super) struct Admission<'a> {
     ctx: AdmitCtx<'a>,
     n_items: usize,
@@ -74,20 +71,21 @@ pub(super) struct Admission<'a> {
     rows: Vec<usize>,
 }
 
-/// The rows an admitted item holds; attach them to the item once decoded.
-pub(super) struct Charge(Option<VisionRowPermit>);
+/// An admitted request: its permit, shared by every item it attaches to.
+pub(super) struct Admitted(Option<Arc<VisionRowPermit>>);
 
-impl Charge {
-    pub(super) fn attach(self, item: VisionItem) -> VisionItem {
-        match self.0 {
-            Some(permit) => item.holding(std::sync::Arc::new(permit)),
+impl Admitted {
+    pub(super) fn attach(&self, item: VisionItem) -> VisionItem {
+        match &self.0 {
+            Some(permit) => item.holding(permit.clone()),
             None => item,
         }
     }
 }
 
 impl<'a> Admission<'a> {
-    /// Before any item is read: the protocol's item limit, on every world size.
+    /// Before any item is fetched or read: the protocol's item limit, on
+    /// every world size.
     #[allow(clippy::result_large_err)]
     pub(super) fn begin(
         ctx: AdmitCtx<'a>,
@@ -113,35 +111,42 @@ impl<'a> Admission<'a> {
         })
     }
 
-    /// Item `rows` (its vision tokens, known before it is decoded): refused
-    /// past the window or the running request limit (400), or when the
-    /// in-flight budget cannot hold it (503).
+    /// The next item carries `rows` (its vision tokens, known for a still
+    /// before it is decoded): a 400 as soon as it passes the window or the
+    /// running total passes the request limit.
     #[allow(clippy::result_large_err)]
-    pub(super) fn charge(&mut self, rows: usize) -> Result<Charge, Response> {
+    pub(super) fn note(&mut self, rows: usize) -> Result<(), Response> {
         let index = self.rows.len();
         self.rows.push(rows);
-        if let Some(limits) = self.ctx.limits {
-            let total = self.rows.iter().sum();
-            limits
-                .check_running(index, self.n_items, rows, total, self.has_video)
-                .map_err(too_large)?;
-        }
-        match self.ctx.budget {
-            Some(budget) => budget
-                .try_acquire(rows)
-                .map(|p| Charge(Some(p)))
-                .ok_or_else(|| busy(rows, budget)),
-            None => Ok(Charge(None)),
+        match self.ctx.limits {
+            Some(limits) => {
+                let total = self.rows.iter().sum();
+                limits
+                    .check_running(index, self.n_items, rows, total, self.has_video)
+                    .map_err(too_large)
+            }
+            None => Ok(()),
         }
     }
 
-    /// Every item charged: the bounds over the whole request (the worst
-    /// prefill chunk against the encoder window).
+    /// Every item sized: the whole-request bounds (the worst prefill chunk
+    /// against the encoder window; 400), then all of its rows from the
+    /// in-flight budget in one acquire (503): a request holds all of its rows
+    /// or none, so two large requests cannot each hold part and both fail.
     #[allow(clippy::result_large_err)]
-    pub(super) fn finish(self) -> Result<(), Response> {
-        match (self.ctx.limits, self.rows.is_empty()) {
-            (Some(limits), false) => limits.check(&self.rows, self.has_video).map_err(too_large),
-            _ => Ok(()),
+    pub(super) fn admit(self) -> Result<Admitted, Response> {
+        if let (Some(limits), false) = (self.ctx.limits, self.rows.is_empty()) {
+            limits
+                .check(&self.rows, self.has_video)
+                .map_err(too_large)?;
+        }
+        let total: usize = self.rows.iter().sum();
+        match self.ctx.budget {
+            Some(budget) if total > 0 => budget
+                .try_acquire(total)
+                .map(|p| Admitted(Some(Arc::new(p))))
+                .ok_or_else(|| busy(total)),
+            _ => Ok(Admitted(None)),
         }
     }
 }

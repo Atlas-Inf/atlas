@@ -46,6 +46,7 @@ fn collect(m: &Message) -> (Vec<(MediaKind, String)>, usize) {
         &mut media,
         &mut pads,
         &crate::api::chat::remote_image::RemoteImagePolicy::default(),
+        &mut 0,
     )
     .expect("base64 URIs need no fetch policy");
     (
@@ -123,8 +124,8 @@ fn media_accumulates_across_messages_in_order() {
     let mut media = Vec::new();
     let mut pads = Vec::new();
     let policy = crate::api::chat::remote_image::RemoteImagePolicy::default();
-    collect_message_media(&first, &mut media, &mut pads, &policy).expect("first");
-    collect_message_media(&second, &mut media, &mut pads, &policy).expect("second");
+    collect_message_media(&first, &mut media, &mut pads, &policy, &mut 0).expect("first");
+    collect_message_media(&second, &mut media, &mut pads, &policy, &mut 0).expect("second");
     assert_eq!(
         media.iter().map(|i| i.kind).collect::<Vec<_>>(),
         vec![MediaKind::Video, MediaKind::Image]
