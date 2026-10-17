@@ -191,3 +191,22 @@ fn messages_say_videos_when_videos_are_present() {
     let err = limits(10).check(&[FULL], true).unwrap_err();
     assert!(err.contains("1 video"), "{err}");
 }
+
+#[test]
+fn an_unset_request_limit_is_half_the_inflight_budget() {
+    let window = window_rows(P_MAX, 2, CHUNK);
+    // The defaults: 32768 per request, 65536 in flight (already half).
+    assert_eq!(
+        VisionRowLimits::resolve(window, CHUNK, 32_768, 262_144, 65_536).request_rows,
+        32_768
+    );
+    // `--vision-max-request-rows 0`: half the budget, not all of it.
+    assert_eq!(
+        VisionRowLimits::resolve(window, CHUNK, 0, 262_144, 65_536).request_rows,
+        32_768
+    );
+    assert_eq!(
+        VisionRowLimits::resolve(window, CHUNK, 0, 262_144, 0).request_rows,
+        262_144
+    );
+}

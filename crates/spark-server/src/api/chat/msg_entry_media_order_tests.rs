@@ -132,3 +132,15 @@ fn media_accumulates_across_messages_in_order() {
     );
     assert_eq!(pads.len(), 2);
 }
+
+#[test]
+fn remote_fetches_are_capped_per_request_in_data_uri_bytes() {
+    let mut fetched = 0;
+    assert!(super::charge_fetched(&mut fetched, super::REMOTE_FETCH_TOTAL_MAX - 1).is_ok());
+    assert!(
+        super::charge_fetched(&mut fetched, 1).is_ok(),
+        "exactly the cap"
+    );
+    let resp = super::charge_fetched(&mut fetched, 1).unwrap_err();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+}

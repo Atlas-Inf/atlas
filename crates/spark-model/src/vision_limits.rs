@@ -111,6 +111,9 @@ impl VisionRowLimits {
         inflight_rows: usize,
     ) -> Self {
         let mut rows = match request_rows {
+            // Unset: half the in-flight budget at most, so one request cannot
+            // need all of it and starve behind small ones.
+            0 if inflight_rows > 0 => request_bound.min(inflight_rows / 2),
             0 => request_bound,
             n => n.min(request_bound),
         };

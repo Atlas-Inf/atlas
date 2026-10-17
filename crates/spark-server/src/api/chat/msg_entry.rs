@@ -76,14 +76,32 @@ pub(super) struct BuildOut {
     pub(super) vision_placeholders: Vec<Glm5VisionPlaceholder>,
 }
 
+/// Bytes of data URIs (base64, about 4/3 of the fetched bytes) the remote
+/// fetches of one request may bring in: the size of the largest request
+/// body, so fetching cannot multiply it.
+const REMOTE_FETCH_TOTAL_MAX: usize = 32 << 20;
+
+/// Charge `len` data-URI bytes to a request's remote fetches.
+#[allow(clippy::result_large_err)]
+fn charge_fetched(fetched: &mut usize, len: usize) -> Result<(), Response> {
+    *fetched += len;
+    if *fetched > REMOTE_FETCH_TOTAL_MAX {
+        return Err(openai_error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "this request's media URLs fetch more than {} MiB of data URIs, the \
+                 per-request limit; send fewer or smaller media",
+                REMOTE_FETCH_TOTAL_MAX >> 20
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// One media item on its way to the vision path: what it is, and the
 /// encoder-input string it resolved to (always a data: URI or raw base64 by
 /// the time it is in here — remote URLs are fetched or refused at
 /// collection time).
-/// Bytes (as data URIs) the remote fetches of one request may bring in: the
-/// size of the largest request body, so fetching cannot multiply it.
-const REMOTE_FETCH_TOTAL_MAX: usize = 32 << 20;
-
 struct MediaInput {
     kind: MediaKind,
     uri: String,
@@ -167,17 +185,7 @@ fn resolve_media_uri(
             };
             match super::remote_image::fetch_media_as_data_uri(url, remote, remote_kind) {
                 Ok(data_uri) => {
-                    *fetched += data_uri.len();
-                    if *fetched > REMOTE_FETCH_TOTAL_MAX {
-                        return Err(openai_error_response(
-                            StatusCode::BAD_REQUEST,
-                            format!(
-                                "this request's media URLs fetch more than {} MiB, the \
-                                 per-request limit; send fewer or smaller media",
-                                REMOTE_FETCH_TOTAL_MAX >> 20
-                            ),
-                        ));
-                    }
+                    charge_fetched(fetched, data_uri.len())?;
                     Ok(data_uri)
                 }
                 Err(why) => {

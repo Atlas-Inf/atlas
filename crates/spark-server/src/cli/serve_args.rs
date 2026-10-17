@@ -968,7 +968,8 @@ pub struct ServeArgs {
     /// ends: 24 KiB per vision token on the Qwen tower (18.4 KiB on GLM), so
     /// the default 32768 (8 images of 2048x2048, or 32 of 1024x1024) is
     /// 768 MiB. The context (`--max-seq-len`), the engine's own bound and
-    /// `--vision-max-inflight-rows` cap it too. 0 = no operator bound.
+    /// `--vision-max-inflight-rows` cap it too. 0 = no operator bound: half the
+    /// in-flight budget (so one request cannot need all of it), or the context.
     #[arg(long, default_value_t = 32_768)]
     pub vision_max_request_rows: usize,
 
