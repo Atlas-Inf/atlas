@@ -23,6 +23,7 @@ mod guard;
 mod hc_ffn;
 mod hc_generic;
 mod hc_pre_site;
+mod kv_only;
 mod mla;
 mod mla_gemv;
 mod mla_glm;

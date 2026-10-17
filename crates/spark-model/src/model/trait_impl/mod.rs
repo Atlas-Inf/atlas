@@ -702,6 +702,14 @@ impl Model for TransformerModel {
     fn select_mtp_stream_row(&self, row: usize) -> Result<()> {
         self.select_mtp_stream_row_dispatch(row)
     }
+    fn stage_mtp_absorb(
+        &self,
+        seq: &mut SequenceState,
+        row: usize,
+        accepted: &[u32],
+    ) -> Result<()> {
+        self.stage_mtp_absorb_dispatch(seq, row, accepted)
+    }
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
     }

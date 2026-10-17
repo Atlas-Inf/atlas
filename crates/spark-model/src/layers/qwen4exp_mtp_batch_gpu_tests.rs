@@ -23,6 +23,7 @@
 use super::*;
 use crate::layers::ops::{DerivedWeights, GemmDispatch, ModelLevers, ModelStats};
 use spark_runtime::buffers::BufferArena;
+use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::{SafetensorsLoader, WeightLoader};
 
 const DRAFTS: usize = 3;

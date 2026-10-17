@@ -596,6 +596,23 @@ pub trait DraftProposer: Send + Sync {
         stream: u64,
     ) -> Result<()>;
 
+    /// `ATLAS_QWEN4EXP_MTP_ABSORB`: the verify settling this state's drafts
+    /// accepted `tokens` (its first `tokens.len()` drafts), and `streams`
+    /// holds that verify's first `tokens.len()` rows of the target's final
+    /// stream highway (`[rows, hc, hidden]` FP32, the live forward's). A
+    /// proposer that rebuilds its context from the target copies them now —
+    /// the next forward reuses the buffer. Default: no-op.
+    fn stage_absorb(
+        &self,
+        _state: &mut dyn ProposerState,
+        _streams: DevicePtr,
+        _tokens: &[u32],
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Free per-sequence proposer state (KV cache blocks, device buffers, etc.).
     ///
     /// Must be called when a sequence is finished to avoid resource leaks.

@@ -4,6 +4,7 @@
 
 use super::*;
 use spark_runtime::gpu::mock::MockGpuBackend;
+use spark_runtime::kv_cache::KvCacheDtype;
 
 /// The written slot keeps a full layer's strides; the twelve slots in
 /// front of it cost next to nothing.
