@@ -13,6 +13,7 @@
 // Atlas's `grammar/compile_misc.rs` uses `Grammar::from_structural_tag`
 // followed by `compiler.compile_grammar(&grammar)`.
 
+use crate::grammar::functor::GrammarUnion;
 use crate::grammar::{GrammarData, parse_ebnf};
 use crate::schema::{SchemaConverterOptions, builtin_json_grammar_ebnf, json_schema_to_ebnf};
 use crate::structural_tag::structural_tag_to_grammar;
@@ -78,6 +79,16 @@ impl Grammar {
     /// Port of the vendored `Grammar::builtin_json_grammar`.
     pub fn builtin_json_grammar() -> Result<Self, String> {
         Self::from_ebnf(&builtin_json_grammar_ebnf(), "root")
+    }
+
+    /// A grammar accepting any string one of `grammars` accepts.
+    ///
+    /// Port of the upstream `Grammar::Union`.
+    pub fn union(grammars: &[Grammar]) -> Self {
+        let data: Vec<GrammarData> = grammars.iter().map(|g| g.data.clone()).collect();
+        Self {
+            data: GrammarUnion::apply(&data),
+        }
     }
 
     /// The grammar in EBNF form.
