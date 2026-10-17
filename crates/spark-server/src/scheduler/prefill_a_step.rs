@@ -177,6 +177,7 @@ pub fn start_chunked_prefill(
             return Err(e);
         }
     };
+    super::ttft_trace::admit(&prompt_tokens, seq.slot_idx);
     // Carry the request-local native-decode fence into model-owned state so
     // prefill hooks cannot touch shared MTP capture/eager-drafter state.
     seq.disable_mtp = req_disable_mtp;
@@ -433,6 +434,7 @@ pub fn start_chunked_prefill(
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
+        super::ttft_trace::mark(seq.slot_idx, super::ttft_trace::Mark::PrefillStart);
         let _pt0 = std::time::Instant::now();
         let chunk_res = model.prefill_chunk(
             &prompt_tokens,
@@ -442,6 +444,7 @@ pub fn start_chunked_prefill(
             is_last,
             prefill_stream,
         );
+        super::ttft_trace::mark(seq.slot_idx, super::ttft_trace::Mark::PrefillSubmitted);
         if std::env::var("ATLAS_VISION_TIMING").is_ok() {
             let _ = model.synchronize(prefill_stream);
             tracing::info!(
@@ -570,6 +573,10 @@ pub fn start_chunked_prefill(
         };
 
         let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
+        super::ttft_trace::mark(
+            p.seq.slot_idx,
+            super::ttft_trace::Mark::FirstSampled(!spontaneous_think && max_tokens > 0),
+        );
         // Legacy echo+logprobs: hand prompt logprobs to a streaming client
         // BEFORE any token event (blocking carries them via finish_sequence).
         if req_prompt_logprobs.is_some()
@@ -612,6 +619,9 @@ pub fn start_chunked_prefill(
             req_require_tool_call && p.grammar_state.is_none() && tool_call_start_token.is_some();
         let immediate_finish =
             !spontaneous_think && (eos_tokens.contains(&first) || max_tokens <= 1);
+        if !spontaneous_think {
+            super::ttft_trace::visible_at_prefill(p.seq.slot_idx);
+        }
         let cached_prompt_tok = p.seq.cached_prefix_tokens as u32;
         // The promotion constructor builds the ActiveSeq, so a prompt that
         // fits one chunk decodes under the same min_tokens end-token ban as a
