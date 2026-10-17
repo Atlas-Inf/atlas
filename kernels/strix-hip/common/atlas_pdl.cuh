@@ -1,0 +1,1 @@
+../../gb10/common/atlas_pdl.cuh
