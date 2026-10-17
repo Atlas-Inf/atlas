@@ -129,6 +129,7 @@ pub(crate) fn validate_state(state: &VisionWireState, max_rows: usize) -> Result
         "vision state received but this rank has no vision encoder capacity"
     );
 
+<<<<<<< HEAD
     if state.rows > max_rows {
         return Err(VisionCapacityError {
             rows: state.rows,
@@ -136,6 +137,22 @@ pub(crate) fn validate_state(state: &VisionWireState, max_rows: usize) -> Result
             grids: state.grid_count,
         }
         .into());
+=======
+    if state.deferred {
+        ensure!(
+            state.rows <= bounds.request,
+            "vision row count {} exceeds the per-request bound {}",
+            state.rows,
+            bounds.request
+        );
+    } else {
+        ensure!(
+            state.rows <= bounds.window,
+            "vision row count {} exceeds the encoder output window {}",
+            state.rows,
+            bounds.window
+        );
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
     }
     ensure!(
         state.grid_count > 0,

@@ -4,6 +4,7 @@
 //!
 //! A request whose images the engine cannot serve used to be admitted, fail
 //! at prefill start, and reach the client as a generic error; agent clients
+<<<<<<< HEAD
 //! then resent the identical history forever. Each still is sized from its
 //! header before it is decoded (`vision_preprocess::probe_image`), so a
 //! request over its limits is refused with a 400 the client can act on before
@@ -12,6 +13,14 @@
 //! conservative pre-decode reservation for opaque videos), and a spent budget
 //! is a 503 with `Retry-After`. The passes are in
 //! `msg_entry::media`. Every endpoint that takes images goes through
+=======
+//! then resent the identical history forever. Each item is sized from its
+//! header before it is decoded (`vision_preprocess::probe_image`), so a
+//! request over its limits is refused with a 400 the client can act on before
+//! any pixel is allocated, and every admitted item first takes its rows from
+//! the server's in-flight budget (`vision_budget`): a spent budget is a 503
+//! with `Retry-After`. Every endpoint that takes images goes through
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
 //! `prepare_chat_prompt` (chat completions, Responses, Anthropic messages),
 //! streaming or not, so this covers them all.
 
@@ -49,12 +58,26 @@ fn too_large(message: String) -> Response {
     )
 }
 
+<<<<<<< HEAD
 fn busy(rows: usize) -> Response {
     // Counts of what other requests hold are not this client's business.
     tracing::warn!("vision request deferred at admission: {rows} rows, in-flight budget spent");
     let mut resp = openai_error_response_with_param(
         StatusCode::SERVICE_UNAVAILABLE,
         "vision capacity is busy; retry shortly".to_string(),
+=======
+fn busy(rows: usize, budget: &VisionRowBudget) -> Response {
+    let message = format!(
+        "vision capacity busy: an item needs {rows} vision tokens and the server holds {} \
+         of its {} for requests in flight; retry shortly",
+        budget.in_use(),
+        budget.limit()
+    );
+    tracing::warn!("vision request deferred at admission: {message}");
+    let mut resp = openai_error_response_with_param(
+        StatusCode::SERVICE_UNAVAILABLE,
+        message,
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
         None,
         Some(VISION_BUSY_CODE),
     );
@@ -63,13 +86,18 @@ fn busy(rows: usize) -> Response {
     resp
 }
 
+<<<<<<< HEAD
 /// One request's admission: [`Admission::begin`] before any item is read,
 /// [`Admission::note`] as each is sized, [`Admission::admit`] once all are.
+=======
+/// One request's admission, item by item in prompt order.
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
 pub(super) struct Admission<'a> {
     ctx: AdmitCtx<'a>,
     n_items: usize,
     has_video: bool,
     rows: Vec<usize>,
+<<<<<<< HEAD
     /// A conservative Qwen-video reservation held while the decoder runs.
     /// It is resized to the actual request total in `admit`, so decoding never
     /// allocates an unaccounted clip and the final acquire cannot race after a
@@ -84,14 +112,29 @@ impl Admitted {
     pub(super) fn attach(&self, item: VisionItem) -> VisionItem {
         match &self.0 {
             Some(permit) => item.holding(permit.clone()),
+=======
+}
+
+/// The rows an admitted item holds; attach them to the item once decoded.
+pub(super) struct Charge(Option<VisionRowPermit>);
+
+impl Charge {
+    pub(super) fn attach(self, item: VisionItem) -> VisionItem {
+        match self.0 {
+            Some(permit) => item.holding(permit),
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
             None => item,
         }
     }
 }
 
 impl<'a> Admission<'a> {
+<<<<<<< HEAD
     /// Before any item is fetched or read: the protocol's item limit, on
     /// every world size.
+=======
+    /// Before any item is read: the protocol's item limit, on every world size.
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
     #[allow(clippy::result_large_err)]
     pub(super) fn begin(
         ctx: AdmitCtx<'a>,
@@ -114,6 +157,7 @@ impl<'a> Admission<'a> {
             n_items,
             has_video,
             rows: Vec::with_capacity(n_items.min(MAX_VISION_ITEMS)),
+<<<<<<< HEAD
             preheld: None,
         })
     }
@@ -229,6 +273,40 @@ impl<'a> Admission<'a> {
                 .map(|p| Admitted(Some(Arc::new(p))))
                 .ok_or_else(|| busy(total)),
             None => Ok(Admitted(None)),
+=======
+        })
+    }
+
+    /// Item `rows` (its vision tokens, known before it is decoded): refused
+    /// past the window or the running request limit (400), or when the
+    /// in-flight budget cannot hold it (503).
+    #[allow(clippy::result_large_err)]
+    pub(super) fn charge(&mut self, rows: usize) -> Result<Charge, Response> {
+        let index = self.rows.len();
+        self.rows.push(rows);
+        if let Some(limits) = self.ctx.limits {
+            let total = self.rows.iter().sum();
+            limits
+                .check_running(index, self.n_items, rows, total, self.has_video)
+                .map_err(too_large)?;
+        }
+        match self.ctx.budget {
+            Some(budget) => budget
+                .try_acquire(rows)
+                .map(|p| Charge(Some(p)))
+                .ok_or_else(|| busy(rows, budget)),
+            None => Ok(Charge(None)),
+        }
+    }
+
+    /// Every item charged: the bounds over the whole request (the worst
+    /// prefill chunk against the encoder window).
+    #[allow(clippy::result_large_err)]
+    pub(super) fn finish(self) -> Result<(), Response> {
+        match (self.ctx.limits, self.rows.is_empty()) {
+            (Some(limits), false) => limits.check(&self.rows, self.has_video).map_err(too_large),
+            _ => Ok(()),
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
         }
     }
 }

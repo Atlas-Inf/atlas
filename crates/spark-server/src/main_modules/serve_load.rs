@@ -898,6 +898,20 @@ pub(crate) fn load_model(
     let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
 
     let scheduler_model = model;
+<<<<<<< HEAD
+=======
+    // Read before the scheduler takes the model: the API's admission check
+    // needs the encoder's output window (`spark_model::vision_limits`). A
+    // model whose tower did not load (window 0) serves text only, and the
+    // API refuses media as it does for a text model.
+    let (vision_window_rows, vision_request_bound) = scheduler_model.vision_row_limits();
+    let vision_config = config.vision.clone().filter(|_| vision_window_rows > 0);
+    if config.vision.is_some() && vision_config.is_none() {
+        tracing::warn!(
+            "vision config present but no vision tower loaded: image and video input is refused"
+        );
+    }
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
     let scheduler_eos = eos_tokens;
     // EP gate. v1 single-sequence worker protocol required max_batch_size=1
     // because each cmd targeted one slot and the head's per-token broadcast
@@ -1337,6 +1351,7 @@ pub(crate) fn load_model(
         } else {
             Some(rotation_tx)
         },
+<<<<<<< HEAD
         chat: {
             let mut c = crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior);
             if args.reference_mode {
@@ -1366,6 +1381,31 @@ pub(crate) fn load_model(
         } else {
             None
         },
+=======
+        chat: crate::api::chat::levers::ChatLevers::resolve(
+            ptx_set.behavior.tscg,
+            ptx_set.behavior.template_owns_tool_definitions,
+            ptx_set.behavior.disable_cwd_hint_injection,
+            ptx_set.behavior.enable_stream_loop_guards,
+        ),
+        vision_max_pixels,
+        vision_limits: vision_config.as_ref().map(|_| {
+            spark_model::vision_limits::VisionRowLimits::resolve(
+                vision_window_rows,
+                max_batch_tokens,
+                args.vision_max_request_rows,
+                vision_request_bound,
+                args.vision_max_inflight_rows,
+            )
+        }),
+        vision_budget: vision_config
+            .as_ref()
+            .filter(|_| args.vision_max_inflight_rows > 0)
+            .map(|_| {
+                spark_model::vision_budget::VisionRowBudget::new(args.vision_max_inflight_rows)
+            }),
+        vision_config,
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
         remote_image_policy,
         video_ffmpeg,
         video_fps: args.video_fps,

@@ -20,7 +20,7 @@
 //!   rank 0 holds the request's preprocessed pixels (f32, 24 KiB per merged
 //!   row on the Qwen tower) from admission until its prefill ends.
 //! - **items** — the rank-to-rank protocol's item limit, applied on every
-//!   world size (a single rank refuses an over-limit request too, so a request
+//!   world size (a single rank refuses a 1025-item request too, so a request
 //!   does not pass on one deployment and fail on another).
 //!
 //! [`VisionRowLimits::check`] rejects a request that one of them would fail
@@ -111,9 +111,6 @@ impl VisionRowLimits {
         inflight_rows: usize,
     ) -> Self {
         let mut rows = match request_rows {
-            // Unset: half the in-flight budget at most, so one request cannot
-            // need all of it and starve behind small ones.
-            0 if inflight_rows > 0 => request_bound.min(inflight_rows / 2),
             0 => request_bound,
             n => n.min(request_bound),
         };

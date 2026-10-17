@@ -953,6 +953,38 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0)]
     pub vision_max_pixels: usize,
 
+<<<<<<< HEAD
+=======
+    /// Vision tokens (merged patches, one prompt placeholder each) one request
+    /// may carry across all its images and videos. A request over it, one of
+    /// more than 1024 items (the rank protocol's limit, applied on every world
+    /// size), or one whose prefill chunks could not encode their images (see
+    /// `spark_model::vision_limits`), is refused at admission with a 400
+    /// naming the counts, instead of failing in prefill where clients retry.
+    /// Images are sized from their headers first, so a refused request is
+    /// never decoded.
+    ///
+    /// The engine encodes each prefill chunk's images separately, so this is
+    /// not an encoder limit; it bounds one request's host memory. Rank 0 holds
+    /// a request's preprocessed pixels (f32) from admission until its prefill
+    /// ends: 24 KiB per vision token on the Qwen tower (18.4 KiB on GLM), so
+    /// the default 32768 (8 images of 2048x2048, or 32 of 1024x1024) is
+    /// 768 MiB. The context (`--max-seq-len`), the engine's own bound and
+    /// `--vision-max-inflight-rows` cap it too. 0 = no operator bound.
+    #[arg(long, default_value_t = 32_768)]
+    pub vision_max_request_rows: usize,
+
+    /// Vision tokens whose pixels ALL requests may hold at once, queued and
+    /// prefilling (`spark_model::vision_budget`). Each image takes its share
+    /// before it is decoded and returns it when its prefill ends or the
+    /// request is dropped; while the budget is spent, new image requests get
+    /// a 503 with `Retry-After` (transient, unlike the 400 above). The default
+    /// 65536 is 1.5 GiB of f32 on the Qwen tower (1.15 GiB on GLM), the bound
+    /// on rank 0's pixel memory across the server. 0 = unbounded.
+    #[arg(long, default_value_t = 65_536)]
+    pub vision_max_inflight_rows: usize,
+
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
     /// Fetch `image_url` parts that carry an http(s) URL, instead of
     /// rejecting them.
     ///

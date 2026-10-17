@@ -84,7 +84,99 @@ struct MediaInput {
     uri: String,
 }
 
+/// Append every media part on `m` to `media` **in content order**, growing
+/// `image_pad_counts` in lockstep (each pad count is filled in later by the
+/// preprocessor). Shared by the tool-message branch and the normal branch so
+/// media rides every role uniformly — including tool results, the motivating
+/// case for issue #165.
 #[allow(clippy::result_large_err)]
+fn collect_message_media(
+    m: &Message,
+    media: &mut Vec<MediaInput>,
+    image_pad_counts: &mut Vec<usize>,
+    remote: &super::remote_image::RemoteImagePolicy,
+) -> Result<(), Response> {
+    // ORDER IS A CONTRACT, and the order is the CLIENT'S. The template emits
+    // one marker per media item in the order they appear in the content
+    // array, and `expand_vision_pads` walks pad tokens left to right
+    // consuming one count each — so this one pass, `MsgEntry::media` and the
+    // preprocessing loop below must all traverse `m.content` the same way.
+    // Grouping by modality anywhere in that chain shows the model the items
+    // in an order the caller never wrote, and does it silently: every count
+    // still agrees with every other one.
+    for part in &m.content {
+        let (kind, data) = match part {
+            ContentPart::Image(src) => (MediaKind::Image, &src.data),
+            ContentPart::Video(src) => (MediaKind::Video, &src.data),
+            ContentPart::Text(_) => continue,
+        };
+        media.push(MediaInput {
+            kind,
+            uri: resolve_media_uri(kind, data, remote)?,
+        });
+        image_pad_counts.push(0);
+    }
+    Ok(())
+}
+
+/// Resolve one media source to an encoder-input string, applying the
+/// operator's remote-fetch policy. Shared by both modalities because the
+/// policy and its failure modes are identical — only the noun in the message
+/// differs.
+#[allow(clippy::result_large_err)]
+fn resolve_media_uri(
+    kind: MediaKind,
+    data: &ImageData,
+    remote: &super::remote_image::RemoteImagePolicy,
+) -> Result<String, Response> {
+    let noun = match kind {
+        MediaKind::Image => "image",
+        MediaKind::Video => "video",
+    };
+    match data {
+        ImageData::Base64(s) => Ok(s.clone()),
+        // Neither the encoder nor the video decoder fetches remote URLs
+        // itself. Either the operator has granted this server the
+        // capability, in which case the URL is resolved to a data: URI here,
+        // or it has not, in which case this is a 400 naming the flag. What
+        // must not happen is feeding the URL string onward: it would reach
+        // the base64 decoder and fail with a confusing "base64 decode
+        // failed" (PCND: fail fast, with the real reason).
+        ImageData::Url(url) => {
+            let shown: String = url.chars().take(120).collect();
+            if !remote.enabled {
+                return Err(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "{noun} URLs are not fetched by this server (got '{shown}'); \
+                         send the {noun} as a base64 data: URI, or start the server \
+                         with --vision-allow-remote-images to enable fetching"
+                    ),
+                ));
+            }
+            let remote_kind = match kind {
+                MediaKind::Image => super::remote_image::RemoteMediaKind::Image,
+                MediaKind::Video => super::remote_image::RemoteMediaKind::Video,
+            };
+            match super::remote_image::fetch_media_as_data_uri(url, remote, remote_kind) {
+                Ok(data_uri) => Ok(data_uri),
+                Err(why) => {
+                    // The reason is surfaced rather than flattened to "could
+                    // not fetch": the operator turned this on deliberately,
+                    // and "resolves to a private address" and "exceeds the
+                    // size cap" call for different fixes.
+                    tracing::warn!("remote {noun} fetch refused: {shown}: {why}");
+                    Err(openai_error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("could not fetch {noun} URL '{shown}': {why}"),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(super) fn build_msg_entries(
     admit: super::vision_admit::AdmitCtx<'_>,
     vision_config: Option<&VisionConfig>,
@@ -95,6 +187,33 @@ pub(super) fn build_msg_entries(
     tools_active: bool,
     levers: &super::levers::ChatLevers,
     preserve_developer_role: bool,
+) -> Result<BuildOut, Response> {
+    build_msg_entries_admitted(
+        vision_config,
+        vision_max_pixels,
+        remote_images,
+        video,
+        input,
+        tools_active,
+        levers,
+        preserve_developer_role,
+        super::vision_admit::AdmitCtx::default(),
+    )
+}
+
+/// [`build_msg_entries`] under the server's vision bounds: each item is sized
+/// from its header and admitted (`vision_admit`) before it is decoded.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub(super) fn build_msg_entries_admitted(
+    vision_config: Option<&VisionConfig>,
+    vision_max_pixels: Option<usize>,
+    remote_images: &super::remote_image::RemoteImagePolicy,
+    video: &VideoDecode<'_>,
+    input: &[Message],
+    tools_active: bool,
+    levers: &super::levers::ChatLevers,
+    preserve_developer_role: bool,
+    admit: super::vision_admit::AdmitCtx<'_>,
 ) -> Result<BuildOut, Response> {
     let mut messages: Vec<MsgEntry> = Vec::with_capacity(input.len());
     let mut media: Vec<MediaInput> = Vec::new();
@@ -333,41 +452,24 @@ pub(super) fn build_msg_entries(
                 "this model does not accept image or video input (no vision config)".to_string(),
             ));
         };
-        let reserve_decode = media.iter().any(|m| m.kind == MediaKind::Video)
-            && !vcfg.is_glm5_next
-            && video.ffmpeg.max_total_decoded_pixels.is_some();
+        let has_video = media.iter().any(|m| m.kind == MediaKind::Video);
+        let mut admission = super::vision_admit::Admission::begin(admit, media.len(), has_video)?;
+        let image_error =
+            |e| openai_error_response(StatusCode::BAD_REQUEST, format!("Image decode error: {e}"));
         for (idx, input) in media.iter().enumerate() {
             let (item, video_timestamps) = match input.kind {
                 MediaKind::Image => {
-                    let item = if let Some(omni) = &vcfg.omni {
-                        spark_model::radio_preprocess::preprocess_image_omni(
-                            &input.uri,
-                            vcfg,
-                            &omni.norm_mean,
-                            &omni.norm_std,
-                            vcfg.patch_size,
-                            omni.downsample_ratio,
-                            omni.max_num_patches,
-                            omni.min_num_patches,
-                        )
-                        .map(|(pixels, gh, gw)| spark_model::VisionItem::image(pixels, gh, gw))
-                    } else {
-                        spark_model::vision_preprocess::preprocess_image_with_max_pixels(
-                            &input.uri,
-                            vcfg,
-                            vision_max_pixels,
-                        )
-                        .map(|(pixels, gh, gw)| spark_model::VisionItem::image(pixels, gh, gw))
-                    };
-                    match item {
-                        Ok(item) => (item, Vec::new()),
-                        Err(e) => {
-                            return Err(openai_error_response(
-                                StatusCode::BAD_REQUEST,
-                                format!("Image decode error: {e}"),
-                            ));
-                        }
-                    }
+                    // Sized from the header, admitted, and only then decoded.
+                    let probed = spark_model::vision_preprocess::probe_image(
+                        &input.uri,
+                        vcfg,
+                        vision_max_pixels,
+                    )
+                    .map_err(image_error)?;
+                    let charge = admission.charge(probed.pad_count(vcfg.spatial_merge_size))?;
+                    let (pixels, grid_h, grid_w) = probed.preprocess(vcfg).map_err(image_error)?;
+                    let item = spark_model::VisionItem::image(pixels, grid_h, grid_w);
+                    (charge.attach(item), Vec::new())
                 }
                 MediaKind::Video => {
                     if reserve_decode {
@@ -385,15 +487,13 @@ pub(super) fn build_msg_entries(
                         )
                     }) {
                         Ok(v) => {
-                            let timestamps = if vcfg.is_qwen3vl_video {
-                                v.timestamps_hf.clone()
-                            } else {
-                                v.timestamps.clone()
-                            };
-                            (
-                                spark_model::VisionItem::video(v.groups, v.grid_h, v.grid_w),
-                                timestamps,
-                            )
+                            // A video is bounded by its own decode budget and
+                            // charged once decoded (no header probe).
+                            let timestamps = v.timestamps.clone();
+                            let item = spark_model::VisionItem::video(v.groups, v.grid_h, v.grid_w);
+                            let charge =
+                                admission.charge(item.pad_count(vcfg.spatial_merge_size))?;
+                            (charge.attach(item), timestamps)
                         }
                         Err(e) => {
                             return Err(openai_error_response(
@@ -433,6 +533,7 @@ pub(super) fn build_msg_entries(
             }
             image_pixels.push(item);
         }
+        admission.finish()?;
     }
     let admitted = admission.admit()?;
     for item in image_pixels.iter_mut() {

@@ -100,6 +100,10 @@ impl Model for TransformerModel {
     ) -> Result<()> {
         self.prepare_vision_embed_dispatch(seq, images)
     }
+    fn vision_row_limits(&self) -> (usize, usize) {
+        let b = self.vision_row_bounds();
+        (b.window, b.request)
+    }
     fn prepare_vision_embed_for_chunked(
         &self,
         seq: &mut SequenceState,

@@ -64,6 +64,11 @@ pub struct AppState {
     /// and the in-flight budget (--vision-max-inflight-rows; None = no
     /// limit). Enntity/atlas 7d33dd4c + d85c88d0.
     pub vision_limits: Option<spark_model::vision_limits::VisionRowLimits>,
+<<<<<<< HEAD
+=======
+    /// Vision rows whose pixels all requests may hold at once
+    /// (`spark_model::vision_budget`). `None`: unbounded, or a text model.
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
     pub vision_budget: Option<std::sync::Arc<spark_model::vision_budget::VisionRowBudget>>,
     /// Whether (and how) to fetch `image_url` parts carrying an http(s) URL.
     /// Default-disabled; see `api::chat::remote_image` for why this one

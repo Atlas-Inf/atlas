@@ -61,6 +61,11 @@ fn state(dir: &std::path::Path) -> AppState {
         rotation_tx: None,
         vision_config: None,
         vision_max_pixels: None,
+<<<<<<< HEAD
+=======
+        vision_limits: None,
+        vision_budget: None,
+>>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
         remote_image_policy: Default::default(),
         video_ffmpeg: Default::default(),
         video_fps: 1.0,
