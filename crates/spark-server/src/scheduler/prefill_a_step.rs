@@ -369,6 +369,11 @@ pub fn start_chunked_prefill(
             if let Err(fe) = model.free_sequence(&mut seq) {
                 tracing::error!("prefill_a_step: free_sequence (deferred broadcast error): {fe:#}");
             }
+            // The worker may hold part of the setup: free its slot too, as
+            // the inline path does after a failed chunk.
+            if let Err(be) = model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1) {
+                tracing::error!("prefill_a_step: ep_broadcast (deferred broadcast error): {be:#}");
+            }
             return Err(e);
         }
         // chunk_offset = 0 (deferred co-dispatch: nothing prefilled yet).
