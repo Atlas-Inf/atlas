@@ -566,6 +566,21 @@ fn compile_spec(
         },
         GrammarSpec::JsonObject => engine.compile_json_grammar(),
         GrammarSpec::JsonSchema { schema } => engine.compile_json_schema(schema),
+        GrammarSpec::ToolCallOrJson {
+            tools,
+            parser,
+            schema,
+        } => match engine.compile_tool_or_json_grammar(&**parser, tools, schema.as_deref()) {
+            Some(result) => result,
+            None => {
+                tracing::debug!(
+                    "Grammar: parser '{}' has no tool grammar; response_format + tools \
+                     decodes unconstrained",
+                    parser.name(),
+                );
+                return Ok(None);
+            }
+        },
     };
 
     let label = match spec {
@@ -574,6 +589,11 @@ fn compile_spec(
         }
         GrammarSpec::JsonObject => "response_format=json_object".to_string(),
         GrammarSpec::JsonSchema { .. } => "response_format=json_schema".to_string(),
+        GrammarSpec::ToolCallOrJson { parser, tools, .. } => format!(
+            "parser={}, tools={} OR response_format",
+            parser.name(),
+            tools.len()
+        ),
     };
 
     let grammar = compiled.map_err(|e| format!("Grammar compilation failed: {e}"))?;
