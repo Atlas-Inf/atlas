@@ -404,6 +404,25 @@ int cuLaunchKernel(void* f, unsigned gx, unsigned gy, unsigned gz,
                                shmem, (hipStream_t)stream, params, extra);
 }
 
+// CUlaunchConfig (driver API), field for field: grid, block, dynamic shared
+// memory, stream, launch attributes. Atlas passes exactly one attribute,
+// PROGRAMMATIC_STREAM_SERIALIZATION (PDL, crates/atlas-core/src/registry/
+// launch.rs), and the kernels' matching atlas_pdl_enter() compiles to nothing
+// on HIP (kernels/gb10/common/atlas_pdl.cuh), so plain stream order is the
+// right semantics: drop the attributes and launch normally.
+struct AtlasCuLaunchConfig {
+  unsigned grid[3];
+  unsigned block[3];
+  unsigned shared_mem_bytes;
+  void* stream;
+  void* attrs;
+  unsigned num_attrs;
+};
+int cuLaunchKernelEx(const AtlasCuLaunchConfig* c, void* f, void** params, void** extra) {
+  return cuLaunchKernel(f, c->grid[0], c->grid[1], c->grid[2], c->block[0], c->block[1],
+                        c->block[2], c->shared_mem_bytes, c->stream, params, extra);
+}
+
 // ── streams ───────────────────────────────────────────────────────────
 int cuStreamCreate(void** s, unsigned flags)        { return hipStreamCreateWithFlags((hipStream_t*)s, flags); }
 int cuStreamSynchronize(void* s)                    {
