@@ -1189,7 +1189,7 @@ pub trait Model: Send + Sync {
     fn prepare_vision_embed(
         &self,
         _seq: &mut crate::traits::SequenceState,
-        _images: &[crate::VisionItem],
+        _images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         Ok(())
     }

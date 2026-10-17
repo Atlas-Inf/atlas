@@ -173,8 +173,7 @@ impl TransformerModel {
         seq: &mut SequenceState,
         images: &[VisionItem],
     ) -> Result<()> {
-        let glm = self.config.vision.as_ref().is_some_and(|v| v.is_glm5_next);
-        if !glm || self.vision_encoder.is_none() {
+        if self.vision_encoder.is_none() {
             return self.prepare_vision_embed_dispatch(seq, images);
         }
         let sms = self

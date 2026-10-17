@@ -18,7 +18,7 @@ impl TransformerModel {
     pub(in crate::model) fn prepare_vision_embed_dispatch(
         &self,
         seq: &mut SequenceState,
-        images: &[crate::VisionItem],
+        images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         let ve = match &self.vision_encoder {
             Some(ve) => ve,
@@ -36,7 +36,7 @@ impl TransformerModel {
         // tuples back to the original item boundaries.
         let mut item_refs: Vec<&crate::VisionItem> = Vec::with_capacity(images.len());
         let mut item_groups: Vec<usize> = Vec::with_capacity(images.len());
-        for it in images {
+        for it in &images {
             item_groups.push(it.t_len());
             item_refs.push(it);
         }
@@ -66,9 +66,10 @@ impl TransformerModel {
         let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
         // The whole prompt is encoded in one pass: every row is resident from
         // physical 0, nothing is cached or deferred.
-        seq.vision.items = images.to_vec();
         seq.vision.grids = post_merge_grids;
         seq.vision.hashes = images.iter().map(|it| it.content_hash).collect();
+        // Moved, not copied (the request's only copy and its permits).
+        seq.vision.items = images;
         seq.vision.rows_encoded = total_merged;
         seq.vision.rows_base = 0;
         seq.vision.skip_rows = 0;
@@ -76,7 +77,7 @@ impl TransformerModel {
         seq.vision.deferred = false;
         tracing::info!(
             "Vision encoder (batched): {} images, {} merged patches encoded",
-            images.len(),
+            seq.vision.items.len(),
             total_merged
         );
         Ok(())
