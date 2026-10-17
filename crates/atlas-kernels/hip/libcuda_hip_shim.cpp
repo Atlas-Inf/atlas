@@ -20,6 +20,7 @@
 #endif
 #include <hip/hip_runtime.h>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -418,7 +419,24 @@ struct AtlasCuLaunchConfig {
   void* attrs;
   unsigned num_attrs;
 };
+// Same layout as the Rust side's #[repr(C)] CuLaunchConfig and CUDA's CUlaunchConfig.
+static_assert(offsetof(AtlasCuLaunchConfig, shared_mem_bytes) == 24, "CUlaunchConfig layout");
+static_assert(offsetof(AtlasCuLaunchConfig, stream) == 32, "CUlaunchConfig layout");
+static_assert(offsetof(AtlasCuLaunchConfig, attrs) == 40, "CUlaunchConfig layout");
+static_assert(offsetof(AtlasCuLaunchConfig, num_attrs) == 48, "CUlaunchConfig layout");
+// CUlaunchAttribute: a 4-byte id, 4 bytes of padding, a 64-byte value union.
+struct AtlasCuLaunchAttribute {
+  unsigned id;
+  unsigned pad;
+  unsigned char value[64];
+};
 int cuLaunchKernelEx(const AtlasCuLaunchConfig* c, void* f, void** params, void** extra) {
+  // Only programmatic stream serialization (id 6) is a no-op here; refuse any
+  // other attribute instead of silently changing its semantics.
+  const auto* attrs = static_cast<const AtlasCuLaunchAttribute*>(c->attrs);
+  for (unsigned i = 0; i < c->num_attrs; ++i) {
+    if (attrs[i].id != 6) return 1;  // CUDA_ERROR_INVALID_VALUE
+  }
   return cuLaunchKernel(f, c->grid[0], c->grid[1], c->grid[2], c->block[0], c->block[1],
                         c->block[2], c->shared_mem_bytes, c->stream, params, extra);
 }
