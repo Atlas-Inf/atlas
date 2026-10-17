@@ -193,36 +193,37 @@ impl Qwen3SsmLayer {
                     )
                 },
             );
-            // ATLAS_LT_KCHAIN_PIN (qwen4_exp, >= 2048 rows): the tile kernel's
-            // own in-order k-chain on a faster cuBLASLt kernel, byte for byte
-            // (TP2, 16016 x 2560 x 3072: 4.24 -> 3.46 ms a layer).
             #[cfg(not(atlas_hip))]
-            if ctx.config.model_type == "qwen4_exp"
-                && k >= 2048
-                && spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(
-                    normed_out_buf.0,
-                    dense_out.weight.0,
-                    out_proj_buf.0,
+            {
+                // ATLAS_LT_KCHAIN_PIN (qwen4_exp, >= 2048 rows): the tile kernel's
+                // own in-order k-chain on a faster cuBLASLt kernel, byte for byte
+                // (TP2, 16016 x 2560 x 3072: 4.24 -> 3.46 ms a layer).
+                if ctx.config.model_type == "qwen4_exp"
+                    && k >= 2048
+                    && spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(
+                        normed_out_buf.0,
+                        dense_out.weight.0,
+                        out_proj_buf.0,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?
+                {
+                    return Ok(());
+                }
+                ops::dense_gemm_bf16_pipelined(
+                    ctx.gpu,
+                    self.dense_gemm_pipelined_k,
+                    normed_out_buf,
+                    dense_out,
+                    out_proj_buf,
                     k,
                     h as u32,
                     value_dim as u32,
                     stream,
-                )?
-            {
-                return Ok(());
+                )
             }
-            #[cfg(not(atlas_hip))]
-            ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.dense_gemm_pipelined_k,
-                normed_out_buf,
-                dense_out,
-                out_proj_buf,
-                k,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )
         } else if force_w8a8
             && let Some(ref fp8w) = self.out_proj_fp8w
             && self.per_token_group_quant_fp8_k.0 != 0
