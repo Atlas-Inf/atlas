@@ -166,31 +166,28 @@ mod tests {
         assert!(!moe_f16_prefill_engaged(KernelHandle(0), KernelHandle(0)));
     }
 
-    // The only test that touches M128_PAIR, so the process-global set is safe.
+    // M128_PAIR is process-global and set once. On HIP builds a GPU test that
+    // constructs a real dense layer records the real handles first, so assert
+    // against whichever pair actually won the race rather than the fakes.
     #[test]
     fn m128_shape_gate_matches_the_measured_wins() {
         record_m128_pair(KernelHandle(11), KernelHandle(22));
         if std::env::var_os("ATLAS_F16_M128_MIN_NK").is_some() {
             return; // an override changes the cut; the table below is for the default
         }
-        let twin = KernelHandle(11);
+        let &(t, b) = M128_PAIR.get().expect("pair recorded above");
+        let twin = KernelHandle(t);
         // Twin won (strix job 146): 27B gate/up, 27B down, Flash-Next GDN qkvz.
         for (n, k) in [(17408, 5120), (5120, 17408), (16384, 2560)] {
-            assert_eq!(
-                m128_for_shape(twin, n, k).0,
-                11,
-                "{n}x{k} should keep the twin"
-            );
+            assert_eq!(m128_for_shape(twin, n, k).0, t, "{n}x{k} should keep the twin");
         }
         // Twin lost: Flash-Next attn q, 27B qkv, Flash-Next out.
         for (n, k) in [(12288, 2560), (5120, 5120), (2560, 6144)] {
-            assert_eq!(
-                m128_for_shape(twin, n, k).0,
-                22,
-                "{n}x{k} should fall back to bf16"
-            );
+            assert_eq!(m128_for_shape(twin, n, k).0, b, "{n}x{k} should fall back to bf16");
         }
         // Any other handle passes through untouched.
-        assert_eq!(m128_for_shape(KernelHandle(33), 2560, 6144).0, 33);
+        let other = KernelHandle(t.wrapping_add(b).wrapping_add(1).max(1));
+        assert_ne!(other.0, t);
+        assert_eq!(m128_for_shape(other, 2560, 6144).0, other.0);
     }
 }
