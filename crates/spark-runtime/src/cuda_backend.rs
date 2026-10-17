@@ -354,7 +354,12 @@ pub fn cuda_free_memory_bytes() -> Option<usize> {
 
     // On unified memory, also check MemAvailable from /proc/meminfo.
     // This includes reclaimable buff/cache that CUDA doesn't account for.
-    free = unified_free(free, total, system_meminfo_bytes("MemTotal:"), system_available_memory_bytes());
+    free = unified_free(
+        free,
+        total,
+        system_meminfo_bytes("MemTotal:"),
+        system_available_memory_bytes(),
+    );
     Some(free)
 }
 
@@ -405,21 +410,36 @@ mod unified_free_tests {
     #[test]
     fn unified_boxes_take_mem_available() {
         // GB10: device total ~= host total; page cache hides reclaimable memory.
-        assert_eq!(unified_free(20 * GIB, 120 * GIB, Some(119 * GIB), Some(60 * GIB)), 60 * GIB);
+        assert_eq!(
+            unified_free(20 * GIB, 120 * GIB, Some(119 * GIB), Some(60 * GIB)),
+            60 * GIB
+        );
         // GTT-backed Strix Halo: 60 GB device view of a 61 GB host.
-        assert_eq!(unified_free(10 * GIB, 60 * GIB, Some(61 * GIB), Some(40 * GIB)), 40 * GIB);
+        assert_eq!(
+            unified_free(10 * GIB, 60 * GIB, Some(61 * GIB), Some(40 * GIB)),
+            40 * GIB
+        );
     }
 
     #[test]
     fn a_carve_out_larger_than_host_ram_ignores_mem_available() {
         // Framework at a 96 GiB carve-out, 31 GiB host: host RAM can't back it.
-        assert_eq!(unified_free(GIB / 2, 96 * GIB, Some(31 * GIB), Some(27 * GIB)), GIB / 2);
+        assert_eq!(
+            unified_free(GIB / 2, 96 * GIB, Some(31 * GIB), Some(27 * GIB)),
+            GIB / 2
+        );
     }
 
     #[test]
     fn missing_meminfo_keeps_the_device_number() {
-        assert_eq!(unified_free(5 * GIB, 60 * GIB, None, Some(40 * GIB)), 5 * GIB);
-        assert_eq!(unified_free(5 * GIB, 60 * GIB, Some(61 * GIB), None), 5 * GIB);
+        assert_eq!(
+            unified_free(5 * GIB, 60 * GIB, None, Some(40 * GIB)),
+            5 * GIB
+        );
+        assert_eq!(
+            unified_free(5 * GIB, 60 * GIB, Some(61 * GIB), None),
+            5 * GIB
+        );
     }
 }
 
