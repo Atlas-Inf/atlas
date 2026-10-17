@@ -179,11 +179,19 @@ mod tests {
         let twin = KernelHandle(t);
         // Twin won (strix job 146): 27B gate/up, 27B down, Flash-Next GDN qkvz.
         for (n, k) in [(17408, 5120), (5120, 17408), (16384, 2560)] {
-            assert_eq!(m128_for_shape(twin, n, k).0, t, "{n}x{k} should keep the twin");
+            assert_eq!(
+                m128_for_shape(twin, n, k).0,
+                t,
+                "{n}x{k} should keep the twin"
+            );
         }
         // Twin lost: Flash-Next attn q, 27B qkv, Flash-Next out.
         for (n, k) in [(12288, 2560), (5120, 5120), (2560, 6144)] {
-            assert_eq!(m128_for_shape(twin, n, k).0, b, "{n}x{k} should fall back to bf16");
+            assert_eq!(
+                m128_for_shape(twin, n, k).0,
+                b,
+                "{n}x{k} should fall back to bf16"
+            );
         }
         // Any other handle passes through untouched.
         let other = KernelHandle(t.wrapping_add(b).wrapping_add(1).max(1));
