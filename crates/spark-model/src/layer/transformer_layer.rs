@@ -878,6 +878,25 @@ pub trait TransformerLayer: Send + Sync {
         )
     }
 
+    /// Write the KV rows of `num_rows` decode rows (metadata in `ctx`, row
+    /// `i` at KV row `seq_lens[i]`) and nothing else: no attention read, FFN
+    /// or residual update. A one-layer drafter's KV row depends on its own
+    /// input row only, which is what the qwen4_exp MTP absorb
+    /// (`ATLAS_QWEN4EXP_MTP_ABSORB`) relies on. `Ok(false)` = unsupported.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_rows_kv_only(
+        &self,
+        _hidden: DevicePtr,
+        _residual: DevicePtr,
+        _num_rows: usize,
+        _kv_cache: &mut PagedKvCache,
+        _seq_lens: &[usize],
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Decode N sequences through this layer in a single batched call.
     ///
     /// Each sequence contributes 1 token. The weight matrices are loaded

@@ -339,6 +339,7 @@ pub fn step_verify_k3(
         // Same row, the other input shape: a drafter reading the PRE-mixer
         // stream highway needs row 2 staged into row 0, or it proposes from
         // the first verify row instead of the accepted one.
+        super::verify_k4_verdict::stage_absorb(model, a, 0, &drafts[..2]);
         if let Err(e) = model.select_mtp_stream_row(2) {
             tracing::error!("select_mtp_stream_row(2): {e:#}");
         }
@@ -401,6 +402,7 @@ pub fn step_verify_k3(
         // Same row, the other input shape: a drafter reading the PRE-mixer
         // stream highway needs row 1 staged into row 0, or it proposes from
         // the first verify row instead of the accepted one.
+        super::verify_k4_verdict::stage_absorb(model, a, 0, &drafts[..1]);
         if let Err(e) = model.select_mtp_stream_row(1) {
             tracing::error!("select_mtp_stream_row(1): {e:#}");
         }

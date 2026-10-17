@@ -1014,6 +1014,20 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// `ATLAS_QWEN4EXP_MTP_ABSORB`: hand `seq`'s proposer the live verify
+    /// forward's stream-highway rows `row .. row + accepted.len()` with the
+    /// drafts they accepted, so the drafter can rebuild those positions from
+    /// the target (`DraftProposer::stage_absorb`). Call after the verify and
+    /// before anything reuses its buffers. Default: no-op.
+    fn stage_mtp_absorb(
+        &self,
+        _seq: &mut SequenceState,
+        _row: usize,
+        _accepted: &[u32],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// ATLAS_MTP_CATCHUP: ring-capture a serially decoded token's final
     /// hidden at `pos` for the drafter catch-up feed. Default no-op.
     fn save_hidden_for_catchup(&self, _token_idx: usize, _pos: usize) -> Result<()> {

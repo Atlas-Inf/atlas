@@ -34,6 +34,15 @@ pub(super) enum K4Hidden {
     DeferPropose,
 }
 
+/// `ATLAS_QWEN4EXP_MTP_ABSORB`: hand the proposer the live verify rows
+/// `row ..` of the `accepted` drafts (`Model::stage_mtp_absorb`) before
+/// anything reuses the forward's buffers. A failure costs only the absorb.
+pub(super) fn stage_absorb(model: &dyn Model, a: &mut ActiveSeq, row: usize, accepted: &[u32]) {
+    if let Err(e) = model.stage_mtp_absorb(&mut a.seq, row, accepted) {
+        tracing::error!("stage_mtp_absorb: {e:#}");
+    }
+}
+
 #[inline]
 fn save_hidden(model: &dyn Model, hidden: K4Hidden, na: usize) -> anyhow::Result<()> {
     match hidden {
@@ -139,6 +148,9 @@ pub(super) fn k4_apply_verdict(
         a.last_token = v[na];
     }
 
+    if matches!(hidden, K4Hidden::VerifyRow) {
+        stage_absorb(model, a, 0, &drafts[..na]);
+    }
     if !defer && let Err(e) = save_hidden(model, hidden, na) {
         tracing::error!("save_hidden_for_mtp({na}): {e:#}");
         return;
