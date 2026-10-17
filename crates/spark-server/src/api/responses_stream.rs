@@ -94,7 +94,9 @@ pub(super) async fn responses_endpoint_stream(
     let deltas = match chat_completions_inner(state, None, ir_req, None).await {
         super::chat::ChatOutcome::Streaming(d) => d,
         // Error envelope — forward unchanged.
-        super::chat::ChatOutcome::Http(r) => return r,
+        super::chat::ChatOutcome::Http(r) => {
+            return super::responses_translate::input_param(r).await;
+        }
         // Unreachable by construction: this endpoint lowers with
         // stream=true, so a success is always Streaming.
         super::chat::ChatOutcome::Blocking(_) => {
