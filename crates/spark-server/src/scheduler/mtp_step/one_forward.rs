@@ -140,7 +140,7 @@ pub(super) fn plan_verify(
         plan.batch.extend_from_slice(&plan.decode_rows);
     }
     if let Some(ceiling) = deep_ceiling {
-        deep_truncate(sched, active, &plan.batch, ceiling, ladder_nd);
+        deep_truncate(model, sched, active, &plan.batch, ceiling, ladder_nd);
     }
     if let [lone] = plan.batch[..]
         && deep_ceiling.is_some()
@@ -205,8 +205,10 @@ pub(super) fn plan_verify(
 }
 
 /// Cut each member's drafts to its own dynamic ceiling (at most the step's
-/// `ladder_nd`), then the batch to the deep row budget, deepest first.
+/// `ladder_nd`; a lone copy, the step's `ceiling`: `copy_drafts::mtp`), then
+/// the batch to the deep row budget, deepest first.
 fn deep_truncate(
+    model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     active: &mut [ActiveSeq],
     members: &[usize],
@@ -214,12 +216,18 @@ fn deep_truncate(
     ladder_nd: usize,
 ) {
     use crate::scheduler::mtp_deep_depth::fit_row_budget;
+    let lone = members.len() == 1;
     let mut caps: Vec<usize> = members
         .iter()
         .map(|&i| {
             let a = &active[i];
-            let own = a.mtp_acct.depth_drafts(ceiling, sched.levers.depth());
-            a.pending_drafts.len().min(own).min(ladder_nd)
+            let own = a
+                .mtp_acct
+                .depth_drafts(ceiling, sched.levers.depth())
+                .min(ladder_nd);
+            let cap =
+                crate::scheduler::copy_drafts::mtp::deep_cap(model, sched, a, lone, own, ceiling);
+            a.pending_drafts.len().min(cap)
         })
         .collect();
     let budget = spark_model::speculative::deep_depth::row_budget(
