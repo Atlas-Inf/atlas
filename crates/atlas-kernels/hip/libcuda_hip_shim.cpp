@@ -70,11 +70,12 @@ static void atlas_track_free(void *p) {
 // Flash-Next's 73,728 routed-expert weights are 819,200 B each, so ~17 GB of
 // a 96 GiB carve-out went to rounding and the model could not boot under
 // Linux. Such requests are carved from 64 MiB slabs instead, one free list
-// per exact (256-aligned) size: the MoE transpose frees each original right
-// after allocating its same-sized copy, so freed chunks are reused at once.
+// per exact (256-aligned) size, slabs growing geometrically per size: the MoE
+// transpose frees each original right after allocating its same-sized copy,
+// so freed chunks are reused at once.
 // A slab is returned to the driver only once fully free and another slab's
 // worth of that size is already free, so an alloc/free cycle cannot thrash;
-// at most two empty slabs (128 MiB) per size are kept for reuse.
+// at most two empty slabs per size are kept for reuse.
 //
 // Accounting stays at the driver level: g_mem_used counts slabs, which is
 // what the device actually commits. Default on for Linux; ATLAS_HIP_SUBALLOC=0
@@ -109,20 +110,20 @@ static bool atlas_suballoc_eligible(size_t n) {
     return (atlas_driver_rounded(n) - n) * 8 > n;
 }
 
-struct AtlasSubSlab { char* base; size_t sz; unsigned cap; unsigned live; };
+struct AtlasSubSlab { char* base; size_t sz; size_t bytes; unsigned cap; unsigned live; };
 struct AtlasSubChunk { void* p; AtlasSubSlab* slab; };
-struct AtlasSubClass { std::vector<AtlasSubChunk> free; size_t slabs = 0; };
+struct AtlasSubClass { std::vector<AtlasSubChunk> free; size_t slabs = 0; unsigned next_cap = 1; };
 static std::mutex g_sub_mu;
 static std::unordered_map<size_t, AtlasSubClass> g_sub_classes;   // chunk size -> class
 static std::unordered_map<void*, AtlasSubSlab*> g_sub_owner;      // live chunk -> slab
 static std::map<char*, AtlasSubSlab*> g_sub_slabs;                // slab base -> slab (range lookup)
 
-// The slab whose 64 MiB range holds p, live chunk or not. Caller holds g_sub_mu.
+// The slab whose range holds p, live chunk or not. Caller holds g_sub_mu.
 static AtlasSubSlab* atlas_sub_slab_of(void* p) {
     auto it = g_sub_slabs.upper_bound((char*)p);
     if (it == g_sub_slabs.begin()) return nullptr;
     --it;
-    return ((char*)p < it->first + kSubSlab) ? it->second : nullptr;
+    return ((char*)p < it->first + it->second->bytes) ? it->second : nullptr;
 }
 
 // 0 on success; nonzero means "not handled, use plain hipMalloc".
@@ -134,10 +135,20 @@ static int atlas_suballoc(void** out, size_t n) {
         std::lock_guard<std::mutex> lk(g_sub_mu);
         AtlasSubClass& c = g_sub_classes[sz];
         if (c.free.empty()) {
+            // Slabs grow per size: 1, 2, 4, ... chunks (each rounded up to the
+            // driver's 2 MiB commit unit, slack filled with chunks), capped at
+            // kSubSlab. A size with a handful of tensors then costs what plain
+            // hipMalloc would; a size with thousands lands in full 64 MiB slabs.
+            // (Fixed 64 MiB slabs lost 0.5 GB on the 27B: five sizes with 1-32
+            // tensors each, strix s07b.)
+            const size_t unit = 2ull << 20;
+            size_t bytes = ((size_t)c.next_cap * sz + unit - 1) / unit * unit;
+            if (bytes > kSubSlab) bytes = kSubSlab;
             void* base = nullptr;
-            if (hipMalloc(&base, kSubSlab) != hipSuccess || !base) return 1;
-            atlas_track_alloc(base, kSubSlab);
-            auto* s = new AtlasSubSlab{(char*)base, sz, (unsigned)(kSubSlab / sz), 0};
+            if (hipMalloc(&base, bytes) != hipSuccess || !base) return 1;
+            atlas_track_alloc(base, bytes);
+            auto* s = new AtlasSubSlab{(char*)base, sz, bytes, (unsigned)(bytes / sz), 0};
+            if (c.next_cap < (unsigned)(kSubSlab / sz)) c.next_cap *= 2;
             g_sub_slabs[s->base] = s;
             for (unsigned i = s->cap; i-- > 0;) c.free.push_back({s->base + (size_t)i * sz, s});
             first_slab = c.slabs++ == 0;
@@ -150,8 +161,8 @@ static int atlas_suballoc(void** out, size_t n) {
         *out = ch.p;
     }
     if (first_slab) {
-        fprintf(stderr, "[suballoc] %zu B requests -> %u per 64 MiB slab (driver would commit %zu B each)\n",
-                n, cap, atlas_driver_rounded(n));
+        fprintf(stderr, "[suballoc] %zu B requests -> slabs of %u growing to %u per 64 MiB (driver would commit %zu B each)\n",
+                n, cap, (unsigned)(kSubSlab / ((n + 255) & ~(size_t)255)), atlas_driver_rounded(n));
     }
     return 0;
 }
