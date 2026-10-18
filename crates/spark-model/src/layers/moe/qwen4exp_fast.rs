@@ -247,20 +247,19 @@ impl MoeLayer {
             // row and `forward_ep_reduce` adds `shared_out` once per row
             // after the all-reduce. Outside EP, each row blends ITS OWN
             // shared output (`shared_out.offset(t * h * bf16)`).
+            // The zero row may itself be NULL (`ep_blend_zero_row` under
+            // ATLAS_QWEN4EXP_DECODE_FUSE, read by the kernel as zeros), so
+            // select on EP, never on the pointer.
             let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
             let zero_row = if is_ep && !shared_out.is_null() {
-                self.ep_blend_zero_row(ctx, stream)?
+                Some(self.ep_blend_zero_row(ctx, stream)?)
             } else {
-                DevicePtr::NULL
+                None
             };
             for t in 0..rows {
                 let row = first + t;
                 let output_t = ctx.buffers.moe_output().offset(row * h * bf16);
-                let shared_t = if zero_row.0 != 0 {
-                    zero_row
-                } else {
-                    shared_out.offset(t * h * bf16)
-                };
+                let shared_t = zero_row.unwrap_or_else(|| shared_out.offset(t * h * bf16));
                 ops::moe_weighted_sum_blend(
                     ctx.gpu,
                     self.moe_weighted_sum_blend,
