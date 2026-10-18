@@ -19,9 +19,9 @@ struct Store {
 
 impl Store {
     fn open(dir: &str) -> Result<Self> {
-        let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            format!("{dir}/model.safetensors.index.json"),
-        )?)?;
+        let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(format!(
+            "{dir}/model.safetensors.index.json"
+        ))?)?;
         let mut headers = HashMap::new();
         let mut shapes = HashMap::new();
         for e in std::fs::read_dir(format!("{dir}/tensors"))? {

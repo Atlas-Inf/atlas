@@ -14,9 +14,9 @@
 //! 26.8 GiB on disk against the NVFP4 pack's 47.7 GiB FP8 table, with the
 //! same row count: fewer bytes per fault, more rows per page-cache GiB.
 
-use anyhow::{Result, ensure};
 #[cfg(test)]
 use anyhow::Context as _;
+use anyhow::{Result, ensure};
 #[cfg(test)]
 use atlas_core::modelopt_codec::nvfp4_rows_to_bf16;
 
@@ -100,8 +100,6 @@ pub fn decode_rows_bf16(
     }
     Ok(out)
 }
-
-
 
 #[cfg(test)]
 #[path = "ngram_nvfp4_tests.rs"]

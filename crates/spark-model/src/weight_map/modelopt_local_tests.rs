@@ -56,10 +56,7 @@ fn fp4_local_config() -> ModelConfig {
 #[test]
 fn host_decode_modules_pick_mxfp8_and_vision_nvfp4_only() {
     let got = host_decode_modules(&fp4_local_config());
-    let want: HashSet<String> = [SHARED, GDN_OUT]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let want: HashSet<String> = [SHARED, GDN_OUT].iter().map(|s| s.to_string()).collect();
     assert_eq!(got, want);
     assert!(host_decode_modules(&ModelConfig::qwen3_next_80b_nvfp4()).is_empty());
 }
@@ -122,7 +119,6 @@ fn resident(
         )
         .unwrap();
 }
-
 
 #[test]
 fn materialize_expands_every_fp4_local_format() {
@@ -266,7 +262,11 @@ fn materialize_expands_every_fp4_local_format() {
     assert_eq!(bias.dtype, WeightDtype::FP32);
     // The vision NVFP4 tensors are NOT consumed: they are a native GPU
     // dequant path now, read as deferred shards by the vision loader.
-    assert_eq!(store.deferred_sorted().len(), 2, "vision tensors stay deferred");
+    assert_eq!(
+        store.deferred_sorted().len(),
+        2,
+        "vision tensors stay deferred"
+    );
 
     let scale = store.get(EXPERT).unwrap();
     assert_eq!(

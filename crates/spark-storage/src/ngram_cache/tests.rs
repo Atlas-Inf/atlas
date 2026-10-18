@@ -383,4 +383,3 @@ fn prefetch_dedups_repeated_ids() {
     assert_ne!(slots[0], slots[3]);
     let _ = std::fs::remove_dir_all(&dir);
 }
-

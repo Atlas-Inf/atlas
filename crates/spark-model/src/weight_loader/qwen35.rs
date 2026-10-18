@@ -26,7 +26,11 @@ fn vision_tensor_ptr(
     store: &WeightStore,
     name: &str,
     gpu: &dyn GpuBackend,
-) -> Result<(spark_runtime::gpu::DevicePtr, spark_runtime::weights::WeightDtype, Vec<usize>)> {
+) -> Result<(
+    spark_runtime::gpu::DevicePtr,
+    spark_runtime::weights::WeightDtype,
+    Vec<usize>,
+)> {
     if let Ok(t) = store.get(name) {
         return Ok((t.ptr, t.dtype, t.shape.clone()));
     }
@@ -71,23 +75,23 @@ fn vision_weight(
                     && sshape == [wshape[0], wshape[1] / 32],
                 "vision MXFP8 {prefix}: weight {wshape:?} + scale {sshape:?}"
             );
-            Ok(crate::layers::VitWeight::Mxfp8(crate::weight_map::Mxfp8Proj {
-                w: crate::weight_map::Mxfp8Weight {
-                    data: wptr,
-                    scales: sptr,
+            Ok(crate::layers::VitWeight::Mxfp8(
+                crate::weight_map::Mxfp8Proj {
+                    w: crate::weight_map::Mxfp8Weight {
+                        data: wptr,
+                        scales: sptr,
+                    },
+                    n: wshape[0] as u32,
+                    k: wshape[1] as u32,
                 },
-                n: wshape[0] as u32,
-                k: wshape[1] as u32,
-            }))
+            ))
         }
         WeightDtype::UInt8 => {
             // NVFP4: packed U8 [n,k/2] + E4M3 [n,k/16] + F32 weight_scale_2.
             let (sptr, sdtype, sshape) =
                 vision_tensor_ptr(store, &format!("{prefix}.weight_scale"), gpu)?;
             anyhow::ensure!(
-                wshape.len() == 2
-                    && sdtype == WeightDtype::FP8E4M3
-                    && sshape[0] == wshape[0],
+                wshape.len() == 2 && sdtype == WeightDtype::FP8E4M3 && sshape[0] == wshape[0],
                 "vision NVFP4 {prefix}: weight {wshape:?} + scale {sshape:?}"
             );
             let gname = format!("{prefix}.weight_scale_2");

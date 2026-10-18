@@ -3,7 +3,6 @@
 //! Segmented block-scale coverage for `NgramRowCache` — the NVFP4 PLE
 /// table's sibling `shard_i.weight_scale` rows, faulted through the same
 /// slot as the weight row. Split out of `tests.rs` for the 500-LoC cap.
-
 use super::*;
 
 /// Pinned arena needs a live CUDA context (see ).

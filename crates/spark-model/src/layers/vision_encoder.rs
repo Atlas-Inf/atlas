@@ -113,7 +113,7 @@ pub struct VisionEncoder {
     k_f32_bf16: KernelHandle, // vision_f32_to_bf16
     k_copy: KernelHandle, // vision_bf16_copy
     k_nvfp4_dq: KernelHandle, // dequant_nvfp4_to_bf16 (native vision NVFP4)
-    k_mx8_dq: KernelHandle,   // mxfp8_proj_dequant (native vision MXFP8)
+    k_mx8_dq: KernelHandle, // mxfp8_proj_dequant (native vision MXFP8)
     // config
     pub hidden_size: usize,        // 1152
     pub num_heads: usize,          // 16
