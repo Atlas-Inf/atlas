@@ -46,6 +46,8 @@ impl Qwen3AttentionLayer {
         // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the sequential per-row arm.
         if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) {
             self.ms_qkv_seq_rows(c)?;
+        } else if self.ms_qkv_batch_mx8(c)? {
+            // Native MXFP8 (FP4-Local): `qkv_mx8.rs`.
         } else if self.ms_qkv_exact4(c)? {
             // qwen4_exp exact K=4 verify: serial decode's arithmetic per row
             // (`qkv_exact4.rs`).

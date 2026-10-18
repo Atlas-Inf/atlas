@@ -10,8 +10,8 @@
 //!   (`weight_scale.nvfp4_csf_{fixed,exceptions}`) — decoded losslessly into
 //!   the plain E4M3 `weight_scale` every NVFP4 kernel reads;
 //! * GDN / attention / QSA-indexer / shared-expert projections are MXFP8.
-//!   Those with a native MXFP8 consumer ([`native_mxfp8`]: the GDN
-//!   projections) are uploaded byte for byte, `weight` E4M3 + `weight_scale`
+//!   Those with a native MXFP8 consumer ([`native_mxfp8`]: the GDN and
+//!   attention projections) are uploaded byte for byte, `weight` E4M3 + `weight_scale`
 //!   E8M0, and read by `mxfp8_proj.cu`; the rest are expanded exactly to the
 //!   BF16 `weight` the NVFP4 pack ships;
 //! * vision MLP/merger projections are W4A16 NVFP4 — dequantized to the BF16
@@ -63,10 +63,17 @@ pub fn native_mxfp8(module: &str) -> bool {
     if std::env::var("ATLAS_FP4LOCAL_EXPAND_MXFP8").as_deref() == Ok("1") {
         return false;
     }
+    const NATIVE: [&str; 7] = [
+        ".linear_attn.in_proj_qkv",
+        ".linear_attn.in_proj_z",
+        ".linear_attn.out_proj",
+        ".self_attn.q_proj",
+        ".self_attn.k_proj",
+        ".self_attn.v_proj",
+        ".self_attn.o_proj",
+    ];
     module.starts_with("model.language_model.layers.")
-        && ["in_proj_qkv", "in_proj_z", "out_proj"]
-            .iter()
-            .any(|p| module.ends_with(&format!(".linear_attn.{p}")))
+        && NATIVE.iter().any(|suffix| module.ends_with(suffix))
 }
 
 /// What [`materialize`] did, for the load log and for tests.

@@ -54,20 +54,16 @@ impl Qwen3SsmLayer {
                 GdnProj::Qkvz => &mx8.qkvz,
                 GdnProj::Out => &mx8.out,
             };
-            let (in_row, out_row) = (p.k as usize * 2, p.n as usize * 2);
-            for first in (0..rows).step_by(ops::MXFP8_PROJ_MAX_GEMV_ROWS) {
-                let m = (rows - first).min(ops::MXFP8_PROJ_MAX_GEMV_ROWS);
-                ops::mxfp8_proj(
-                    ctx.gpu,
-                    &mx8.kernels,
-                    p,
-                    input.offset(first * in_row),
-                    output.offset(first * out_row),
-                    m,
-                    mx8.scratch,
-                    stream,
-                )?;
-            }
+            ops::mxfp8_proj(
+                ctx.gpu,
+                &mx8.kernels,
+                p,
+                input,
+                output,
+                rows,
+                mx8.scratch,
+                stream,
+            )?;
             return Ok(true);
         }
         if !ctx.levers.qwen4exp_batch_fast

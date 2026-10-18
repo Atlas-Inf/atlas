@@ -28,6 +28,29 @@
 //! top: +28.9 MB a layer per TP2 rank.
 //! `=full` frees the BF16 copies (-57.7 MB a layer at TP1, where there is no
 //! headroom for `=1`) and prefill reads the FP8 copy too.
+//!
+//! Why BF16 is the default — measured on the NVFP4 pack, both arms, same
+//! prompt, util 0.85 / 16K / bf16 KV:
+//!
+//! ```text
+//!                      requantized NVFP4      BF16 (default)
+//! layer construction   7.43 GB / 154.8 MB/L   1.39 GB / 28.9 MB/L
+//! attn/GDN arms        7.34 GB                1.32 GB
+//! pre-KV               95.8 GB                90.0 GB
+//! KV budget            3.9 GB / 172144 tok    9.7 GB / 424464 tok
+//! decode               2.207 tok/s            2.188 tok/s
+//! ```
+//!
+//! 6.04 GB back for ~1% of decode. GDN weight bandwidth is simply not
+//! what bounds decode here at C=1 — something else dominates — so the
+//! usual w4a16-is-faster argument does not apply yet. Revisit if that
+//! changes.
+//!
+//! And it is not only a memory lever: ONLY the routed experts are
+//! quantized in this checkpoint. The GDN projections ship BF16, so
+//! requantizing them was a lossy round trip we chose, on 36 of 48
+//! layers. `=0` opts back into it for A/B. `ATLAS_QWEN4EXP_FP8_GDN` is
+//! the FP8 middle option (`gdn_fp8`).
 
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;

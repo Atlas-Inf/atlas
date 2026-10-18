@@ -96,7 +96,21 @@ impl Qwen3AttentionLayer {
 
         if self.gated {
             // Q+Gate projection with inline deinterleave (output is [Q_all | Gate_all])
-            if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+            if let Some(r) = self.try_mx8(ctx, self.q_weight.as_ref(), normed, q_out, 1, stream) {
+                // Native MXFP8 (FP4-Local): raw interleaved [Q|gate], then split.
+                r?;
+                self.apply_q_lora(ctx, normed, q_out, stream)?;
+                ops::deinterleave_qg(
+                    ctx.gpu,
+                    self.deinterleave_qg_k,
+                    q_out,
+                    1,
+                    nq,
+                    hd,
+                    nq * hd * 2,
+                    stream,
+                )?;
+            } else if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
                 // Keep-packed Q2_0 (Tier-1c): 2-bit GEMV → gated [Q|Gate], then
                 // the same deinterleave the dense fallback uses.
                 ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, normed, q2, q_out, stream)?;
@@ -201,7 +215,9 @@ impl Qwen3AttentionLayer {
             }
         } else {
             // Ungated: Q projection only (no gate)
-            if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+            if let Some(r) = self.try_mx8(ctx, self.q_weight.as_ref(), normed, q_out, 1, stream) {
+                r?;
+            } else if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
                 ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, normed, q2, q_out, stream)?;
             } else if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 ops::w8a16_gemv(

@@ -8,8 +8,8 @@
 //! layer around those bytes: `in_proj_qkv || in_proj_z` rows (and their
 //! scale rows) become the sequential `[Q|K|V|Z]` projection, `out_proj` is
 //! used in place, and the layer reads both through `mxfp8_proj.cu`. No BF16
-//! copy exists; prefill expands one projection at a time into a scratch
-//! shared by every layer.
+//! copy exists; prefill expands one projection at a time into the scratch
+//! `mx8_common::scratch_for` shares between every MXFP8 layer.
 //!
 //! `in_proj_a` / `in_proj_b` (4 MB a layer in all) stay on the BF16
 //! interleaved β/α path the fused gate kernel reads.
@@ -19,6 +19,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
+use super::mx8_common::{MX8_GROUP, module};
 use crate::layer::TransformerLayer;
 use crate::layers::FfnComponent;
 use crate::layers::Qwen3SsmLayer;
@@ -30,8 +31,6 @@ use crate::weight_map::{
     dense_keep_f32, free_loader_source, interleave_ba,
 };
 
-const MX8_GROUP: usize = 32;
-
 /// True when layer `lp`'s GDN projections are MXFP8 in the store.
 pub(super) fn present(store: &WeightStore, lp: &str) -> bool {
     let w = format!("{lp}.linear_attn.in_proj_qkv");
@@ -39,25 +38,6 @@ pub(super) fn present(store: &WeightStore, lp: &str) -> bool {
         .get(&format!("{w}.weight"))
         .is_ok_and(|t| t.dtype == WeightDtype::FP8E4M3)
         && store.contains(&format!("{w}.weight_scale"))
-}
-
-/// The weight and scale buffers of one MXFP8 module, shapes checked.
-fn module(store: &WeightStore, name: &str, rows: usize, k: usize) -> Result<[DevicePtr; 2]> {
-    let w = store.get(&format!("{name}.weight"))?;
-    let s = store.get(&format!("{name}.weight_scale"))?;
-    ensure!(
-        w.dtype == WeightDtype::FP8E4M3
-            && w.shape == [rows, k]
-            && s.dtype == WeightDtype::UInt8
-            && s.shape == [rows, k / MX8_GROUP],
-        "{name}: expected MXFP8 [{rows}, {k}] + [{rows}, {}], got {:?} {:?} + {:?} {:?}",
-        k / MX8_GROUP,
-        w.dtype,
-        w.shape,
-        s.dtype,
-        s.shape
-    );
-    Ok([w.ptr, s.ptr])
 }
 
 /// Copy `a` then `b` (each `rows * row_bytes`) into one new buffer.
@@ -71,32 +51,6 @@ fn concat(
     gpu.copy_d2d(a, buf, a_rows * row_bytes)?;
     gpu.copy_d2d(b, buf.offset(a_rows * row_bytes), b_rows * row_bytes)?;
     Ok(buf)
-}
-
-/// The prefill scratch every MXFP8 GDN layer shares: sized for the larger
-/// projection, allocated by the first layer that needs it.
-pub(super) fn scratch_for(
-    shared: &mut Option<Mxfp8Scratch>,
-    config: &ModelConfig,
-    gpu: &dyn GpuBackend,
-) -> Result<Mxfp8Scratch> {
-    let h = config.hidden_size;
-    let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
-    let bytes = (config.ssm_qkvz_size() * h).max(h * value_dim) * 2;
-    if let Some(s) = shared.filter(|s| s.bytes >= bytes) {
-        return Ok(s);
-    }
-    ensure!(shared.is_none(), "MXFP8 GDN scratch sized twice");
-    let s = Mxfp8Scratch {
-        ptr: gpu.alloc(bytes)?,
-        bytes,
-    };
-    tracing::info!(
-        "MXFP8 GDN: one {:.1} MB BF16 prefill scratch shared by every GDN layer",
-        bytes as f64 / 1e6
-    );
-    *shared = Some(s);
-    Ok(s)
 }
 
 /// Build GDN layer `layer_idx` on its MXFP8 projections.

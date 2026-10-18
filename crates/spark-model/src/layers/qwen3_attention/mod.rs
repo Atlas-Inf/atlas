@@ -30,6 +30,7 @@ mod init_glm;
 mod init_independent;
 mod init_kernel_dispatch;
 mod kernel_requirements;
+pub(crate) mod mx8;
 mod op_dump;
 // `innerq_driver` calls the CUDA Driver API directly via `atlas_core::registry`,
 // which is itself gated on the `cuda` feature. Mirror that gate here so the

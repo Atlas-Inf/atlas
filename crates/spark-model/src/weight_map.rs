@@ -58,7 +58,7 @@ pub use loaders_fp8::*;
 pub use loaders_mtp::*;
 pub use model_a::*;
 pub use moe::*;
-pub use mxfp8::Mxfp8Weight;
+pub use mxfp8::{Mxfp8Proj, Mxfp8Weight};
 pub use nemotron::*;
 pub use nvfp4_detect::*;
 pub use quantize_fns::*;

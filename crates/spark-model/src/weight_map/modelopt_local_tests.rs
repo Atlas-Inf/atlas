@@ -6,6 +6,7 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::weights::DeferredTensor;
 
 const ATTN: &str = "model.language_model.layers.3.self_attn.q_proj";
+const SHARED: &str = "model.language_model.layers.3.mlp.shared_expert.up_proj";
 const VIS: &str = "model.visual.blocks.0.mlp.linear_fc1";
 const HC_NORM: &str = "model.language_model.layers.0.attn_hyper_connection.hc_norm.weight";
 const PLE_NORM: &str = "model.language_model.layers.1.ple.norm_conv.weight";
@@ -28,7 +29,7 @@ fn fp4_local_config() -> ModelConfig {
         "model.language_model.layers.0.mlp.experts".into(),
         spec("NVFP4", 16),
     );
-    map.insert(ATTN.into(), spec("MXFP8", 32));
+    map.insert(SHARED.into(), spec("MXFP8", 32));
     map.insert(GDN_OUT.into(), spec("MXFP8", 32));
     map.insert(VIS.into(), spec("W4A16_NVFP4", 16));
     map.insert(
@@ -54,7 +55,10 @@ fn fp4_local_config() -> ModelConfig {
 #[test]
 fn host_decode_modules_pick_mxfp8_and_vision_nvfp4_only() {
     let got = host_decode_modules(&fp4_local_config());
-    let want: HashSet<String> = [ATTN, GDN_OUT, VIS].iter().map(|s| s.to_string()).collect();
+    let want: HashSet<String> = [SHARED, GDN_OUT, VIS]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(got, want);
     assert!(host_decode_modules(&ModelConfig::qwen3_next_80b_nvfp4()).is_empty());
 }
@@ -147,13 +151,13 @@ fn materialize_expands_every_fp4_local_format() {
 
     // MXFP8 [1, 32]: E4M3 1.0 (0x38) everywhere, E8M0 scale 2^-3.
     shard.add(
-        &format!("{ATTN}.weight"),
+        &format!("{SHARED}.weight"),
         &[0x38; 32],
         &[1, 32],
         WeightDtype::FP8E4M3,
     );
     shard.add(
-        &format!("{ATTN}.weight_scale"),
+        &format!("{SHARED}.weight_scale"),
         &[124],
         &[1, 1],
         WeightDtype::UInt8,
@@ -249,14 +253,14 @@ fn materialize_expands_every_fp4_local_format() {
     want[5] = 0x7E;
     assert_eq!(gpu.read_alloc(scale.ptr).unwrap(), want);
 
-    let attn = store.get(&format!("{ATTN}.weight")).unwrap();
+    let attn = store.get(&format!("{SHARED}.weight")).unwrap();
     assert_eq!(
         (attn.dtype, attn.shape.clone()),
         (WeightDtype::BF16, vec![1, 32])
     );
     let a = gpu.read_alloc(attn.ptr).unwrap();
     assert!((0..32).all(|i| bf16_at(&a, i) == 0.125));
-    assert!(!store.contains(&format!("{ATTN}.weight_scale")));
+    assert!(!store.contains(&format!("{SHARED}.weight_scale")));
 
     let vis = store.get(&format!("{VIS}.weight")).unwrap();
     assert_eq!(
@@ -281,7 +285,11 @@ fn gdn_mxfp8_stays_native() {
     assert!(native_mxfp8(
         "model.language_model.layers.7.linear_attn.in_proj_qkv"
     ));
-    assert!(!native_mxfp8(ATTN));
+    assert!(native_mxfp8(ATTN));
+    assert!(!native_mxfp8(
+        "model.language_model.layers.3.self_attn.indexer.index_qk_proj"
+    ));
+    assert!(!native_mxfp8("model.visual.blocks.0.attn.qkv"));
     assert!(!native_mxfp8(
         "model.language_model.layers.7.linear_attn.in_proj_a"
     ));

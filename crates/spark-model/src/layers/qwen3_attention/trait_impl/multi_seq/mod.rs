@@ -28,11 +28,14 @@ mod mla_gemv;
 mod mla_glm;
 mod mla_glm_sparse;
 mod mla_independent;
+#[cfg(test)]
+mod mx8_tests;
 mod nemotron_serial;
 mod qkv;
 mod qkv_dp4a;
 mod qkv_exact4;
 mod qkv_fp8;
+mod qkv_mx8;
 mod qsa_rows;
 #[cfg(test)]
 mod tests;

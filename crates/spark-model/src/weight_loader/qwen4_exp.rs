@@ -77,11 +77,13 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 // compiler ran. `attach` is also the better name: the module is the three
 // per-layer attach helpers.
 mod attach;
+mod attn_mx8;
 mod ffn;
 mod gdn_fp8;
 mod gdn_mx8;
 mod hc;
 mod mtp;
+mod mx8_common;
 mod ple;
 mod probe;
 
@@ -231,26 +233,8 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // With PLE disabled for bisection, skip the 21 MB arena and the
         // 128-shard open entirely rather than building what we will not run.
         let ple_off = std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1");
-        // GDN projections stay BF16 by DEFAULT on this checkpoint. Measured,
-        // both arms, same prompt, util 0.85 / 16K / bf16 KV:
-        //
-        //                      requantized NVFP4      BF16 (default)
-        //   layer construction   7.43 GB / 154.8 MB/L   1.39 GB / 28.9 MB/L
-        //   attn/GDN arms        7.34 GB                1.32 GB
-        //   pre-KV               95.8 GB                90.0 GB
-        //   KV budget            3.9 GB / 172144 tok    9.7 GB / 424464 tok
-        //   decode               2.207 tok/s            2.188 tok/s
-        //
-        // 6.04 GB back for ~1% of decode. GDN weight bandwidth is simply not
-        // what bounds decode here at C=1 — something else dominates — so the
-        // usual w4a16-is-faster argument does not apply yet. Revisit if that
-        // changes.
-        //
-        // And it is not only a memory lever: ONLY the routed experts are
-        // quantized in this checkpoint. The GDN projections ship BF16, so
-        // requantizing them was a lossy round trip we chose, on 36 of 48
-        // layers. `=0` opts back into it for A/B. `ATLAS_QWEN4EXP_FP8_GDN` is
-        // the FP8 middle option (`gdn_fp8`).
+        // GDN projections stay BF16 by DEFAULT (measured trade-off in
+        // `gdn_fp8`'s docs); FP4-Local's MXFP8 ones are served natively.
         let gdn = GdnProjections::from_env()?;
         tracing::info!(
             "GDN projections: {} on the {} linear-attention layers",
@@ -293,7 +277,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             let layer = match config.layer_types[i] {
                 // FP4-Local ships these MXFP8: served on those bytes.
                 LayerType::LinearAttention if gdn_mx8::present(store, &lp) => {
-                    let scratch = gdn_mx8::scratch_for(&mut mx8_scratch, config, gpu)?;
+                    let scratch = mx8_common::scratch_for(&mut mx8_scratch, config, gpu)?;
                     gdn_mx8::build(
                         i, store, &lp, gpu, config, input_norm, post_attn_norm, ffn, scratch,
                     )
@@ -322,6 +306,17 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                         input_norm, post_attn_norm, ffn,
                     )
                     .with_context(|| format!("qwen4_exp: GDN layer {i}"))?
+                }
+                LayerType::FullAttention if attn_mx8::present(store, &lp) => {
+                    let kv_dtype = layer_kv_dtypes.get(attn_idx).copied();
+                    let scratch = mx8_common::scratch_for(&mut mx8_scratch, config, gpu)?;
+                    let l = attn_mx8::build(
+                        i, store, &lp, gpu, config, kv_dtype.unwrap_or(KvCacheDtype::Bf16),
+                        attn_idx, (input_norm, post_attn_norm, ffn), scratch,
+                    )
+                    .with_context(|| format!("qwen4_exp: full-attention layer {i} (MXFP8)"))?;
+                    attn_idx += 1;
+                    l
                 }
                 LayerType::FullAttention => {
                     let kv_dtype = layer_kv_dtypes

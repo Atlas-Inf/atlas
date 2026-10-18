@@ -69,7 +69,7 @@ fn attn_layer(gpu: &MockGpuBackend, config: &ModelConfig) -> Qwen3AttentionLayer
 
 /// Run `ms_phase_qkv` at `n` verify rows and return how many d2d copies
 /// the phase issued plus every kernel launch it recorded.
-fn qkv_phase_d2d(
+pub(super) fn qkv_phase_d2d(
     gpu: &MockGpuBackend,
     config: &ModelConfig,
     layer: &Qwen3AttentionLayer,
