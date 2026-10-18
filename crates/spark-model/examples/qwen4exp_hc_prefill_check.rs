@@ -75,7 +75,7 @@ fn site(g: &dyn GpuBackend, rng: &mut Lcg, inject: bool) -> Result<HcSiteWeights
         hc_base: DevicePtr::NULL,
         hc_scale: DevicePtr::NULL,
         lowrank: Some(HcLowRank {
-            norm_w: up(g, &bf16s(rng, wide, 0.1))?,
+            norm_w: up(g, &f32s(rng, wide, |v| v * 0.1))?,
             down_w: up(g, &bf16s(rng, RANK * wide, 0.02))?,
             up_w: up(g, &bf16s(rng, RANK * wide, 0.05))?,
             inject_w: if inject {

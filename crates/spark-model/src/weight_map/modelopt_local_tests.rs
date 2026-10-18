@@ -227,14 +227,29 @@ fn materialize_expands_every_fp4_local_format() {
             done.mxfp8_native,
             done.mxfp8_to_bf16,
             done.nvfp4_to_bf16,
-            done.f32_norms_to_bf16
+            done.f32_norms_native
         ),
         (1, 0, 1, 1, 2)
     );
+    // The F32 norms are served as shipped: same dtype, byte-identical data.
     let norm = store.get(HC_NORM).unwrap();
-    assert_eq!(norm.dtype, WeightDtype::BF16);
-    assert_eq!(gpu.read_alloc(norm.ptr).unwrap(), [0x80, 0x3F, 0x00, 0x40]); // 1.0, 2.0
-    assert_eq!(store.get(PLE_NORM).unwrap().dtype, WeightDtype::BF16);
+    assert_eq!(norm.dtype, WeightDtype::FP32);
+    assert_eq!(
+        gpu.read_alloc(norm.ptr).unwrap(),
+        [1.0f32, 2.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>()
+    );
+    let norm = store.get(PLE_NORM).unwrap();
+    assert_eq!(norm.dtype, WeightDtype::FP32);
+    assert_eq!(
+        gpu.read_alloc(norm.ptr).unwrap(),
+        [1.0f32, 2.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>()
+    );
     let bias = store
         .get("model.language_model.layers.1.ple.conv1d.bias")
         .unwrap();

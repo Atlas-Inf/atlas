@@ -42,7 +42,7 @@ use crate::layers::ple::PleLayer;
 #[cfg(feature = "cuda")]
 use crate::layers::ple::{PleIdDims, PleWeights};
 #[cfg(feature = "cuda")]
-use crate::weight_map::dense;
+use crate::weight_map::{dense, dense_keep_f32};
 #[cfg(feature = "cuda")]
 use host::{bf16_scalar, fp16_host, i64_host};
 
@@ -318,9 +318,11 @@ pub(super) fn load(
     let weights = PleWeights {
         key_proj: dense(store, &format!("{lp}.key_proj.weight"))?,
         value_proj: dense(store, &format!("{lp}.value_proj.weight"))?,
-        norm_key: dense(store, &format!("{lp}.norm_key.weight"))?,
-        norm_query: dense(store, &format!("{lp}.norm_query.weight"))?,
-        norm_conv: dense(store, &format!("{lp}.norm_conv.weight"))?,
+        // The PLE norms feed `ple_gate`, declared `const float*`: keep F32
+        // native (FP4-Local ships them F32), widen BF16 exactly (NVFP4).
+        norm_key: dense_keep_f32(store, &format!("{lp}.norm_key.weight"), gpu)?,
+        norm_query: dense_keep_f32(store, &format!("{lp}.norm_query.weight"), gpu)?,
+        norm_conv: dense_keep_f32(store, &format!("{lp}.norm_conv.weight"), gpu)?,
         conv1d: dense(store, &format!("{lp}.conv1d.weight"))?,
     };
 

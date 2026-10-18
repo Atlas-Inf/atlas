@@ -15,7 +15,11 @@
 //!   E8M0, and read by `mxfp8_proj.cu`; the rest are expanded exactly to the
 //!   BF16 `weight` the NVFP4 pack ships;
 //! * vision MLP/merger projections are W4A16 NVFP4 — dequantized to the BF16
-//!   the vision tower reads.
+//!   the vision tower reads;
+//! * the hyper-connection `hc_norm`s and the three PLE norms are F32 where
+//!   other releases ship BF16 — left exactly as shipped; the kernels that
+//!   read them are `const float*`, and the other packs' BF16 norms are
+//!   widened to F32 at layer-load (`dense_keep_f32`).
 //!
 //! The loader DEFERS every source tensor (`FastSafetensorsLoader::
 //! host_decode_modules`, `is_csf_stream`), so the compressed originals are
@@ -83,18 +87,15 @@ pub struct Materialized {
     pub mxfp8_native: usize,
     pub mxfp8_to_bf16: usize,
     pub nvfp4_to_bf16: usize,
-    pub f32_norms_to_bf16: usize,
+    pub f32_norms_native: usize,
     pub uploaded_bytes: u64,
 }
 
 /// A norm weight the FP4-Local pack keeps in F32 where every other release of
 /// the model ships BF16: the 97 hyper-connection `hc_norm`s and the three PLE
 /// norms (model card: "100 FP32 tensors"; 103 with the MTP block's). The
-/// loaders hand these pointers straight to kernels that read BF16, so left
-/// as F32 every normalization reads garbage — the server answers with one
-/// empty token. Rounded to BF16 here, which is also what the pack's own vLLM
-/// recipe (`--dtype bfloat16`) does; they sit within 0.07% of the NVFP4
-/// pack's BF16 values.
+/// kernels reading them are declared `const float*`, so the resident tensor
+/// is served as shipped — nothing to do here but count it for the log.
 fn is_f32_norm(name: &str, t: &WeightTensor) -> bool {
     // `hc_norm`, and the PLE's `norm_conv` / `norm_key` / `norm_query`: the
     // last module segment names a norm.
@@ -103,36 +104,6 @@ fn is_f32_norm(name: &str, t: &WeightTensor) -> bool {
         .and_then(|m| m.rsplit('.').next())
         .is_some_and(|seg| seg.contains("norm"));
     t.dtype == WeightDtype::FP32 && t.shape.len() == 1 && names_norm
-}
-
-fn norms_to_bf16(store: &mut WeightStore, gpu: &dyn GpuBackend) -> Result<(usize, u64)> {
-    let mut names: Vec<String> = store
-        .names()
-        .filter(|n| store.get(n).is_ok_and(|t| is_f32_norm(n, t)))
-        .map(str::to_string)
-        .collect();
-    names.sort();
-    let mut bytes = 0;
-    for name in &names {
-        let src = take(store, gpu, name)?.context("norm vanished")?;
-        let bf16: Vec<u8> = src
-            .bytes
-            .chunks_exact(4)
-            .flat_map(|b| {
-                let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                atlas_core::numeric::f32_to_bf16(v).to_le_bytes()
-            })
-            .collect();
-        bytes += upload(
-            store,
-            gpu,
-            name.clone(),
-            &bf16,
-            src.shape,
-            WeightDtype::BF16,
-        )?;
-    }
-    Ok((names.len(), bytes))
 }
 
 /// Raw bytes and geometry of a source tensor, from disk or from the device.
@@ -368,19 +339,20 @@ pub fn materialize(
     }
     if done != Materialized::default() {
         // Only an FP4-Local checkpoint reaches here: another release's F32
-        // tensors are never touched.
-        let (n, b) = norms_to_bf16(store, gpu)?;
-        done.f32_norms_to_bf16 = n;
-        done.uploaded_bytes += b;
+        // tensors are never counted.
+        done.f32_norms_native = store
+            .names()
+            .filter(|n| store.get(n).is_ok_and(|t| is_f32_norm(n, t)))
+            .count();
         tracing::info!(
             "FP4-Local: decoded {} CSF scale tensors, kept {} MXFP8 projections native, \
-             expanded {} MXFP8 and {} NVFP4 projections to BF16, rounded {} F32 norms to \
-             BF16 ({:.2} GiB uploaded; compressed originals never resident)",
+             expanded {} MXFP8 and {} NVFP4 projections to BF16, kept {} F32 norms \
+             native ({:.2} GiB uploaded; compressed originals never resident)",
             done.csf_scales,
             done.mxfp8_native,
             done.mxfp8_to_bf16,
             done.nvfp4_to_bf16,
-            done.f32_norms_to_bf16,
+            done.f32_norms_native,
             done.uploaded_bytes as f64 / (1u64 << 30) as f64
         );
     }

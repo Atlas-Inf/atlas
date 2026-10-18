@@ -91,9 +91,9 @@ extern "C" __global__ void ple_gate(
     const float* __restrict__ hidden,          // [T, hc*H] FP32 highway
     const __nv_bfloat16* __restrict__ key,     // [T, hc*H] key_proj out
     const __nv_bfloat16* __restrict__ value,   // [T, H]    value_proj out
-    const __nv_bfloat16* __restrict__ norm_query_w, // [hc*H]
-    const __nv_bfloat16* __restrict__ norm_key_w,   // [hc*H]
-    const __nv_bfloat16* __restrict__ norm_conv_w,  // [hc*H]
+    const float* __restrict__ norm_query_w, // [hc*H]
+    const float* __restrict__ norm_key_w,   // [hc*H]
+    const float* __restrict__ norm_conv_w,  // [hc*H]
     float* __restrict__ gated_out,             // [T, hc*H] FP32
     float* __restrict__ gated_normed,          // [T, hc*H] FP32 — see below
     const unsigned int hidden_size,            // H
@@ -137,8 +137,8 @@ extern "C" __global__ void ple_gate(
         float dot = 0.0f;
         for (unsigned int d = tid; d < H; d += PLE_BLOCK) {
             const unsigned int i = s * H + d;
-            float qn = qs[d] * rq * (1.0f + (float)norm_query_w[i]);
-            float kn = (float)ks[d] * rk * (1.0f + (float)norm_key_w[i]);
+            float qn = qs[d] * rq * (1.0f + norm_query_w[i]);
+            float kn = (float)ks[d] * rk * (1.0f + norm_key_w[i]);
             dot += qn * kn;
         }
         dot = ple_block_sum(dot, smem_red);
@@ -172,7 +172,7 @@ extern "C" __global__ void ple_gate(
         for (unsigned int d = tid; d < H; d += PLE_BLOCK) {
             const unsigned int i = s * H + d;
             float x = g_out[i];
-            gn_out[i] = x * r * (1.0f + (float)norm_conv_w[i]);
+            gn_out[i] = x * r * (1.0f + norm_conv_w[i]);
         }
         __syncthreads();
     }

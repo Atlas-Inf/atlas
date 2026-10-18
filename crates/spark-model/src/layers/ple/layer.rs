@@ -372,7 +372,9 @@ pub(crate) fn bounded_scratch(scratch: usize, max_tokens: usize) -> usize {
     scratch.clamp(VERIFY_SNAP_SLOTS.min(max_tokens), max_tokens)
 }
 
-/// The dense weights of one PLE site.
+/// The dense weights of one PLE site. The three norms are **F32** — `ple_gate`
+/// is declared `const float*` and the loader (`dense_keep_f32`) guarantees the
+/// dtype; everything else is BF16.
 pub struct PleWeights {
     pub key_proj: DenseWeight,
     pub value_proj: DenseWeight,
