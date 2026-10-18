@@ -66,8 +66,7 @@ impl MoeLayer {
         let weights_correction_bias: Option<DevicePtr> =
             weights.correction_bias.map(|dw| dw.weight);
 
-        // Resolve the gfx1151 F16-operand twins + whether both resolved; the
-        // forward engages them via the n128 launchers when `moe_f16_prefill` holds.
+        // gfx1151 F16-operand twins (+ both resolved); see layers/ops/strix_f16.rs.
         let (moe_grouped_gemm_t, moe_fused_gate_up_t, moe_f16_prefill) =
             crate::layers::ops::moe_f16_prefill_handles(gpu)?;
 
@@ -89,10 +88,7 @@ impl MoeLayer {
             dense_gemv_batchm: super::init_optional::router_gemv_batchm(gpu, config),
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
-            // Untransposed router GEMM. On native HIP this resolves to the
-            // bit-identical `w4a16_gemm_s64` twin (64-deep K stage) when the
-            // target ships it; every other target keeps `w4a16_gemm`. See
-            // layers/ops/strix_s64.rs.
+            // `w4a16_gemm`, or its bit-identical s64 twin on native HIP (strix_s64.rs).
             w4a16_gemm: crate::layers::ops::w4a16_gemm_kernel(gpu)?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
