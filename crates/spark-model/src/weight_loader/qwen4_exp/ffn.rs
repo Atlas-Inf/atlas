@@ -115,31 +115,48 @@ pub(super) fn build_moe(
         )?;
         let [uw, us] =
             mx8_common::module(store, &format!("{lp}.mlp.shared_expert.up_proj"), inter, h)?;
-        let gate_up = {
-            let w = gpu.alloc(2 * inter * h)?;
-            gpu.copy_d2d(gw, w, inter * h)?;
-            gpu.copy_d2d(uw, w.offset(inter * h), inter * h)?;
-            let s = gpu.alloc(2 * inter * (h / 32))?;
-            gpu.copy_d2d(gs, s, inter * (h / 32))?;
-            gpu.copy_d2d(us, s.offset(inter * (h / 32)), inter * (h / 32))?;
-            let out = gpu.alloc(32 * 2 * inter * 2)?;
-            Some(crate::layers::moe::Mxfp8GateUp {
-                proj: Mxfp8Proj {
-                    w: Mxfp8Weight { data: w, scales: s },
-                    n: (2 * inter) as u32,
-                    k: h as u32,
-                },
-                gate_up_out: out,
-                silu_mul: crate::layers::try_kernel(gpu, "gemm", "fused_silu_mul"),
-            })
+        // The gate‖up rows land in ONE contiguous `[2*inter, h]` weight (and
+        // `[2*inter, h/32]` scale) buffer: `gate_proj`/`up_proj` are views into
+        // its halves, and the ≤32-row fused arm streams it in a single pass.
+        // The store originals are reclaimed — no duplicate bytes stay resident.
+        let gu_w = gpu.alloc(2 * inter * h)?;
+        gpu.copy_d2d(gw, gu_w, inter * h)?;
+        gpu.copy_d2d(uw, gu_w.offset(inter * h), inter * h)?;
+        let gu_s = gpu.alloc(2 * inter * (h / 32))?;
+        gpu.copy_d2d(gs, gu_s, inter * (h / 32))?;
+        gpu.copy_d2d(us, gu_s.offset(inter * (h / 32)), inter * (h / 32))?;
+        for proj in ["gate_proj", "up_proj"] {
+            for t in ["weight", "weight_scale"] {
+                store.reclaim(gpu, &format!("{lp}.mlp.shared_expert.{proj}.{t}"))?;
+            }
+        }
+        let view = |rows_off: usize| Mxfp8Proj {
+            w: Mxfp8Weight {
+                data: gu_w.offset(rows_off * h),
+                scales: gu_s.offset(rows_off * (h / 32)),
+            },
+            n: inter as u32,
+            k: h as u32,
         };
+        let gate_up = Some(crate::layers::moe::Mxfp8GateUp {
+            proj: Mxfp8Proj {
+                w: Mxfp8Weight {
+                    data: gu_w,
+                    scales: gu_s,
+                },
+                n: (2 * inter) as u32,
+                k: h as u32,
+            },
+            gate_up_out: gpu.alloc(32 * 2 * inter * 2)?,
+            silu_mul: crate::layers::try_kernel(gpu, "gemm", "fused_silu_mul"),
+        });
         // The shared MXFP8 BF16 prefill scratch: the MoE runs after the
         // layer's attention/GDN on the same stream, so the transient buffer
         // is never live twice.
         let scratch = mx8_common::scratch_for(mx8_scratch, config, gpu)?;
         moe.set_mxfp8_shared_expert(
-            m("gate_proj", inter, h)?,
-            m("up_proj", inter, h)?,
+            view(0),
+            view(inter),
             m("down_proj", h, inter)?,
             gate_up,
             Mxfp8ProjKernels::resolve(gpu)?,

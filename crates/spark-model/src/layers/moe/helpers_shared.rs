@@ -91,7 +91,6 @@ impl MoeLayer {
         } = shared
         {
             let m = num_tokens as usize;
-            let inter = shared_intermediate as usize;
             if let Some(gu) = gate_up
                 && m <= ops::MXFP8_PROJ_MAX_CHUNKED_ROWS
                 && gu.silu_mul.0 != 0
@@ -137,7 +136,6 @@ impl MoeLayer {
                 num_tokens * shared_intermediate,
                 stream,
             )?;
-            let _ = inter;
             ops::mxfp8_proj(
                 ctx.gpu, &kernels, &down_proj, gate_out, down_out, m, scratch, stream,
             )?;
