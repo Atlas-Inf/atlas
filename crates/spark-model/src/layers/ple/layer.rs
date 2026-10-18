@@ -61,9 +61,14 @@ pub struct PleLayer {
     /// Device VA of the table's per-slot f32 dequant scale array, `None` for a
     /// BF16 table. Its presence is what selects the FP8 gather.
     scale_va: Option<u64>,
+    /// NVFP4 gather kernel (`Some` when `nvfp4` is set).
+    embed_nvfp4_k: KernelHandle,
+    /// Device VA of the cache's `[slots, dim/group]` E4M3 block-scale arena.
+    block_scale_va: Option<u64>,
     /// Packed EXL3 n-gram rows. Host-dequanted into `emb` before the GEMM.
     trellis: Option<ngram_trellis::NgramTrellis>,
-    /// NVFP4 n-gram rows (FP4-Local). Host-dequanted into `emb` likewise.
+    /// NVFP4 n-gram rows (FP4-Local): packed rows + block scales stay in the
+    /// pinned caches and decode inside `batched_embed_nvfp4`.
     nvfp4: Option<ngram_nvfp4::NgramNvfp4>,
     gemm_k: KernelHandle,
     gate_k: KernelHandle,
@@ -101,7 +106,7 @@ impl PleLayer {
     /// Rows decoded on the host into `emb` (EXL3 trellis, FP4-Local NVFP4)
     /// rather than gathered by the embedding kernel.
     pub(super) fn host_decoded(&self) -> bool {
-        self.trellis.is_some() || self.nvfp4.is_some()
+        self.trellis.is_some()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -149,6 +154,7 @@ impl PleLayer {
                 gather_matches_element_size(stride, head_dim, scaled)?;
             }
         }
+        let is_nvfp4 = nvfp4.is_some();
         Ok(Self {
             dims,
             head_dim,
@@ -169,12 +175,27 @@ impl PleLayer {
             // table mutex on every gather.
             scale_va: match &table {
                 #[cfg(feature = "cuda")]
-                NgramTable::Cached(c) => c.scale_dev_va()?,
+                NgramTable::Cached(c) => match c.scale_dev_va()? {
+                    // A segmented block-scale arena is the NVFP4 table's, not
+                    // an FP8 row-scale array — it must not select the FP8 arm.
+                    Some(_) if is_nvfp4 => None,
+                    other => other,
+                },
+                _ => None,
+            },
+            block_scale_va: match &table {
+                #[cfg(feature = "cuda")]
+                NgramTable::Cached(c) => c.block_scale_dev_va()?,
                 _ => None,
             },
             trellis,
             nvfp4,
             embed_fp8_k: gpu.kernel("embed_from_argmax", "batched_embed_fp8")?,
+            embed_nvfp4_k: if is_nvfp4 {
+                gpu.kernel("embed_from_argmax", "batched_embed_nvfp4")?
+            } else {
+                KernelHandle(0)
+            },
             table: std::sync::Arc::new(std::sync::Mutex::new(table)),
             embed_k: gpu.kernel("embed_from_argmax", "batched_embed")?,
             gemm_k: projection_gemm(gpu)?,

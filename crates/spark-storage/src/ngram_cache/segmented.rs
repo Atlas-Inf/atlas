@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, bail};
 
-use super::{BLOCK, NgramRowCache, ScaleCache, Segments, open_direct};
+use super::{BLOCK, NgramRowCache, ScaleCache, ScaleSrc, Segments, open_direct};
 use crate::expert_arena::ExpertArena;
 use std::path::Path;
 
@@ -71,7 +71,7 @@ impl NgramRowCache {
     /// entire table with the wrong number.
     pub fn set_constant_scale(&mut self, scale: f32) -> Result<()> {
         if let Some(sc) = &self.scales
-            && sc.file.is_some()
+            && !matches!(sc.src, super::ScaleSrc::Constant)
         {
             bail!(
                 "NgramRowCache: a per-row scale file is already installed; \
@@ -88,8 +88,67 @@ impl NgramRowCache {
             let all = std::slice::from_raw_parts_mut(base as *mut f32, self.slots);
             all.fill(scale);
         }
-        self.scales = Some(ScaleCache { arena, file: None });
+        self.scales = Some(ScaleCache {
+            arena,
+            stride: 4,
+            src: ScaleSrc::Constant,
+        });
         Ok(())
+    }
+
+    /// Install SEGMENTED per-row block scales: `shards[i]` is shard `i`'s
+    /// backing file and the byte offset of its first scale row, at the same
+    /// `rows_per` shard split as the weight table (`open_segmented` must have
+    /// run first). Every fault then fetches the row's scale row into
+    /// `scales[slot * scale_stride..]`. Refuses if a scale source is already
+    /// installed — stacking two would silently pick one.
+    pub fn attach_segmented_block_scales(
+        &mut self,
+        shards: &[(std::path::PathBuf, u64)],
+        scale_stride: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.scales.is_none(),
+            "NgramRowCache: a scale source is already installed"
+        );
+        anyhow::ensure!(
+            !shards.is_empty() && scale_stride > 0 && scale_stride <= BLOCK,
+            "NgramRowCache: bad segmented scale geometry (shards={}, stride={scale_stride})",
+            shards.len()
+        );
+        let seg = self
+            .segments
+            .as_ref()
+            .context("NgramRowCache: segmented scales need a segmented table")?;
+        let rows_per = seg.rows_per;
+        let (paths, shard_file) = plan_shard_files(shards);
+        let mut files = Vec::with_capacity(paths.len());
+        for path in &paths {
+            files.push(open_direct(path)?);
+        }
+        let sbytes = self.slots * scale_stride;
+        let sblocks = sbytes.div_ceil(BLOCK);
+        self.scales = Some(ScaleCache {
+            arena: ExpertArena::new(1, sblocks as u32, BLOCK)
+                .context("NgramRowCache: block-scale arena")?,
+            stride: scale_stride,
+            src: ScaleSrc::Segmented(Segments {
+                bases: shards.iter().map(|(_, off)| *off).collect(),
+                rows_per,
+                files,
+                shard_file,
+            }),
+        });
+        Ok(())
+    }
+
+    /// Device VA of the block-scale arena (`[slots, scale_stride]` u8), for
+    /// the NVFP4 gather kernel.
+    pub fn block_scale_dev_va(&self) -> Result<Option<u64>> {
+        match &self.scales {
+            Some(s) => Ok(Some(s.arena.slot_dev_va(0, 0)?)),
+            None => Ok(None),
+        }
     }
 }
 

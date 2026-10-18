@@ -65,7 +65,30 @@ pub(super) struct RowSource<'a> {
     pub(super) base_offset: u64,
     pub(super) segments: Option<&'a Segments>,
     pub(super) row_stride: usize,
-    pub(super) scale_file: Option<&'a File>,
+    pub(super) scale_src: Option<ScaleSource<'a>>,
+    pub(super) scale_stride: usize,
+}
+
+/// Where a scale row lives. `Flat`: one file, `id * scale_stride` in.
+/// `Segmented`: the table's own shard segmentation applied to the sibling
+/// scale tensors (same `rows_per`, same deduped files).
+pub(super) enum ScaleSource<'a> {
+    Flat { file: &'a File },
+    Segmented { seg: &'a Segments },
+}
+
+impl ScaleSource<'_> {
+    fn scale_loc(&self, id: u64, stride: u64) -> (&File, u64) {
+        match self {
+            ScaleSource::Flat { file } => (file, id * stride),
+            ScaleSource::Segmented { seg } => {
+                let shard = (id / seg.rows_per) as usize;
+                let local = id % seg.rows_per;
+                let file = &seg.files[seg.shard_file[shard] as usize];
+                (file, seg.bases[shard] + local * stride)
+            }
+        }
+    }
 }
 
 impl RowSource<'_> {
@@ -128,16 +151,21 @@ pub(super) fn fetch_row(
     dst.copy_from_slice(&bounce.blocks(nblocks)[within..within + src.row_stride]);
 
     // A constant per-tensor scale needs no per-row refresh: every slot already
-    // holds it (see `set_constant_scale`), and `scale_file` is None then.
-    if let (Some(sfile), Some(sbase)) = (src.scale_file, ptrs.scales) {
-        let sbyte = id * 4;
+    // holds it (see `set_constant_scale`), and `scale_src` is None then.
+    // Same O_DIRECT bounce/seam handling as the row itself; the stride comes
+    // from the installed source (4-byte f32 or `dim/group` E4M3).
+    if let (Some(ssrc), Some(sbase)) = (&src.scale_src, ptrs.scales) {
+        let stride = src.scale_stride;
+        let (sfile, sbyte) = ssrc.scale_loc(id, stride as u64);
         let sblock = sbyte - (sbyte % BLOCK as u64);
         let swithin = (sbyte - sblock) as usize;
-        atlas_tier::pio::read_at_least_at(sfile, bounce.blocks(1), sblock, swithin + 4)
+        let nblocks = if swithin + stride > BLOCK { 2 } else { 1 };
+        atlas_tier::pio::read_at_least_at(sfile, bounce.blocks(nblocks), sblock, swithin + stride)
             .with_context(|| format!("NgramRowCache: read scale {id}"))?;
-        // SAFETY: as above; the scale arena holds slots*4 bytes.
-        let sdst = unsafe { std::slice::from_raw_parts_mut(sbase.add(slot as usize * 4), 4) };
-        sdst.copy_from_slice(&bounce.blocks(1)[swithin..swithin + 4]);
+        // SAFETY: as above; the scale arena holds slots*stride bytes.
+        let sdst =
+            unsafe { std::slice::from_raw_parts_mut(sbase.add(slot as usize * stride), stride) };
+        sdst.copy_from_slice(&bounce.blocks(nblocks)[swithin..swithin + stride]);
     }
     Ok(())
 }

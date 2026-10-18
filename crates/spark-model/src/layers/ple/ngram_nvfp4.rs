@@ -14,7 +14,10 @@
 //! 26.8 GiB on disk against the NVFP4 pack's 47.7 GiB FP8 table, with the
 //! same row count: fewer bytes per fault, more rows per page-cache GiB.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
+#[cfg(test)]
+use anyhow::Context as _;
+#[cfg(test)]
 use atlas_core::modelopt_codec::nvfp4_rows_to_bf16;
 
 /// Row geometry of an NVFP4 n-gram table.
@@ -28,13 +31,14 @@ pub struct Nvfp4RowGeom {
     pub global: f32,
 }
 
-/// An NVFP4 n-gram table's geometry plus its block-scale row cache.
+/// An NVFP4 n-gram table's decode geometry; its block-scale rows fault in
+/// through the WEIGHT cache's segmented scale source (`attach_segmented_
+/// block_scales`), so one CLOCK serves both arenas.
 pub struct NgramNvfp4 {
     pub geom: Nvfp4RowGeom,
-    /// Block-scale rows, `dim / group` bytes each, at the same row ids as the
-    /// weight cache.
-    #[cfg(feature = "cuda")]
-    pub scales: std::sync::Mutex<spark_storage::NgramRowCache>,
+    /// `(file, base_offset)` of each scale shard — handed to
+    /// `NgramRowCache::attach_segmented_block_scales` by the loader.
+    pub scale_shards: Vec<(std::path::PathBuf, u64)>,
 }
 
 impl Nvfp4RowGeom {
@@ -47,13 +51,13 @@ impl Nvfp4RowGeom {
     }
 }
 
-/// The weight cache must hold packed rows and nothing else: a scale array
-/// would select the FP8 gather, and a wrong stride reads the next row's bytes.
+/// The weight cache must hold packed rows, and the segmented block-scale
+/// arena must be attached: the NVFP4 gather reads both.
 pub fn check_packed_stride(stride: usize, spec: &Nvfp4RowGeom, scaled: bool) -> Result<()> {
     ensure!(
-        !scaled,
-        "PLE: NVFP4 n-gram rows take their scales from a block-scale table, \
-         not a cache scale array"
+        scaled,
+        "PLE: NVFP4 n-gram rows need the block-scale arena attached to the \
+         row cache (`attach_segmented_block_scales`)"
     );
     ensure!(
         stride == spec.packed_stride(),
@@ -64,8 +68,11 @@ pub fn check_packed_stride(stride: usize, spec: &Nvfp4RowGeom, scaled: bool) -> 
     Ok(())
 }
 
-/// Decode gathered rows: `packed[i]` and `scales[i]` are row `i`'s bytes from
-/// the weight and block-scale caches. Returns little-endian BF16 `[n, dim]`.
+/// Decode gathered rows — kept as the oracle for the GPU microtest and
+/// the host-side cache tests; the serving path decodes in
+/// `batched_embed_nvfp4`. `packed[i]` and `scales[i]` are row `i`'s bytes
+/// from the weight and block-scale caches. Returns little-endian BF16.
+#[cfg(test)]
 pub fn decode_rows_bf16(
     spec: &Nvfp4RowGeom,
     packed: &[Vec<u8>],
@@ -94,23 +101,7 @@ pub fn decode_rows_bf16(
     Ok(out)
 }
 
-/// Resolve `ids` in the block-scale cache, copy each row out, and release the
-/// pins at once: the decode that consumes them runs synchronously on the host.
-#[cfg(feature = "cuda")]
-pub fn gather_scales(spec: &NgramNvfp4, ids: &[u64]) -> Result<Vec<Vec<u8>>> {
-    let mut cache = spec
-        .scales
-        .lock()
-        .map_err(|_| anyhow::anyhow!("PLE nvfp4 scale cache mutex poisoned"))?;
-    let mut slots = Vec::with_capacity(ids.len());
-    cache.resolve(ids, &mut slots)?;
-    let rows = slots
-        .iter()
-        .map(|&s| cache.copy_slot(s))
-        .collect::<Result<Vec<_>>>();
-    cache.end_batch();
-    rows
-}
+
 
 #[cfg(test)]
 #[path = "ngram_nvfp4_tests.rs"]

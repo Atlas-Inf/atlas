@@ -138,6 +138,34 @@ pub fn embed_from_argmax(
         .arg_u32(hidden_size)
         .launch(stream)
 }
+/// NVFP4 n-gram gather: slots index a `[slots, dim/2]` packed-E2M1 arena and
+/// a `[slots, dim/group]` E4M3 block-scale arena. Kernel:
+/// `embed_from_argmax.cu::batched_embed_nvfp4`.
+pub fn batched_embed_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    slots_dev: DevicePtr,
+    packed: DevicePtr,
+    scales: DevicePtr,
+    global: f32,
+    output: DevicePtr,
+    num_tokens: u32,
+    dim: u32,
+    group: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(slots_dev)
+        .arg_ptr(packed)
+        .arg_ptr(scales)
+        .arg_f32(global)
+        .arg_ptr(output)
+        .arg_u32(dim)
+        .arg_u32(group)
+        .launch(stream)
+}
 
 /// Batched embedding: gather N rows from embedding table in one launch.
 ///

@@ -26,13 +26,12 @@ pub(super) fn open_if_packed(
     shards: usize,
     rows_per: usize,
     packed_cols: usize,
-    slots: usize,
     gpu: &dyn GpuBackend,
 ) -> Result<Option<NgramNvfp4>> {
     if dtype != WeightDtype::UInt8 {
         return Ok(None);
     }
-    open(store, lp, shards, rows_per, packed_cols, slots, gpu).map(Some)
+    open(store, lp, shards, rows_per, packed_cols, gpu).map(Some)
 }
 
 fn open(
@@ -41,7 +40,6 @@ fn open(
     shards: usize,
     rows_per: usize,
     packed_cols: usize,
-    slots: usize,
     gpu: &dyn GpuBackend,
 ) -> Result<NgramNvfp4> {
     let table = format!("{lp}.ple_embedding.ngram_embedding");
@@ -77,22 +75,5 @@ fn open(
         group: dim / scale_cols,
         global: f32_scalar(store, &format!("{table}.weight_scale_2"), gpu)?,
     };
-    let scales = spark_storage::NgramRowCache::open_segmented(
-        &scale_shards,
-        rows_per as u64,
-        None,
-        scale_cols,
-        slots,
-    )
-    .context("PLE nvfp4: block-scale row cache")?;
-    tracing::info!(
-        "PLE n-gram table: NVFP4 ({dim} dims, group {}, global {:.6e}), block scales \
-         served off NVMe from {shards} sibling shards",
-        geom.group,
-        geom.global
-    );
-    Ok(NgramNvfp4 {
-        geom,
-        scales: std::sync::Mutex::new(scales),
-    })
+    Ok(NgramNvfp4 { geom, scale_shards })
 }

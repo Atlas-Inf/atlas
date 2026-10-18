@@ -26,7 +26,8 @@ fn src() -> OwnedSource {
         base_offset: 0,
         segments: None,
         row_stride: 1,
-        scale_file: None,
+        scale_src: None,
+        scale_stride: 0,
     }
 }
 

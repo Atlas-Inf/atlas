@@ -30,6 +30,23 @@
 //! do it silently.
 
 #[cfg(feature = "cuda")]
+// The NVFP4 block-scale slot width, when the table is packed U8.
+fn nvfp4_scale_stride(
+    store: &spark_runtime::weights::WeightStore,
+    lp: &str,
+    dtype: spark_runtime::weights::WeightDtype,
+) -> usize {
+    if dtype != spark_runtime::weights::WeightDtype::UInt8 {
+        return 0;
+    }
+    store
+        .deferred(&format!(
+            "{lp}.ple_embedding.ngram_embedding.shard_0.weight_scale"
+        ))
+        .map(|d| d.shape[1])
+        .unwrap_or(0)
+}
+
 use anyhow::Context;
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
@@ -79,17 +96,32 @@ fn chunk_from_env() -> usize {
 }
 
 #[cfg(feature = "cuda")]
-fn slots_from_env(scratch_tokens: usize, ngram_heads: usize) -> (usize, &'static str) {
-    match std::env::var("ATLAS_PLE_CACHE_SLOTS")
+fn slots_from_env(
+    scratch_tokens: usize,
+    ngram_heads: usize,
+    slot_bytes: usize,
+) -> (usize, &'static str) {
+    // Exact slots beat GB sizing; GB beats the derived floor. The derived
+    // span figure stays a MINIMUM — the cache must always hold one gather.
+    let floor = derived_slots(scratch_tokens, ngram_heads);
+    if let Some(n) = std::env::var("ATLAS_PLE_CACHE_SLOTS")
         .ok()
         .and_then(|v| v.parse().ok())
+        && n > 0
     {
-        Some(n) if n > 0 => (n, "ATLAS_PLE_CACHE_SLOTS"),
-        _ => (
-            derived_slots(scratch_tokens, ngram_heads),
-            "(span + warm_ahead)*heads rounded up",
-        ),
+        return (n, "ATLAS_PLE_CACHE_SLOTS");
     }
+    if let Some(gb) = std::env::var("ATLAS_PLE_CACHE_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        && gb > 0.0
+    {
+        return (
+            (((gb * 1e9) / slot_bytes as f64) as usize).max(floor),
+            "ATLAS_PLE_CACHE_GB",
+        );
+    }
+    (floor, "(span + warm_ahead)*heads rounded up")
 }
 
 /// First uploaded name that exists. EXL3 checkpoints use the nested
@@ -269,7 +301,8 @@ pub(super) fn load(
     // `PleLayer::new` applies, keeping the two derivations from drifting.
     let chunk = chunk_from_env();
     let span = crate::layers::ple::bounded_scratch(chunk, max_tokens);
-    let (slots, slots_from) = slots_from_env(span, heads);
+    let slot_bytes = head_dim * elem + nvfp4_scale_stride(store, &lp, dtype);
+    let (slots, slots_from) = slots_from_env(span, heads, slot_bytes);
     let mut cache = if single.is_some() {
         let (path, off) = &shards[0];
         spark_storage::NgramRowCache::open_at(
@@ -301,7 +334,11 @@ pub(super) fn load(
     }
 
     let n_shards = shards.len();
-    let nvfp4 = nvfp4::open_if_packed(store, &lp, dtype, n_shards, rows_per, head_dim, slots, gpu)?;
+    let nvfp4 = nvfp4::open_if_packed(store, &lp, dtype, n_shards, rows_per, head_dim, gpu)?;
+    if let Some(nv) = &nvfp4 {
+        // The block scales ride the same cache: one arena pair, one CLOCK.
+        cache.attach_segmented_block_scales(&nv.scale_shards, nv.geom.scale_stride())?;
+    }
 
     // FP8 rows need their dequant scale, or the gather returns raw E4M3
     // magnitudes and the whole n-gram contribution is off by a constant
