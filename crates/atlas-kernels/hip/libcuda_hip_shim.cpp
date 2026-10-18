@@ -73,9 +73,10 @@ static void atlas_track_free(void *p) {
 // per exact (256-aligned) size, slabs growing geometrically per size: the MoE
 // transpose frees each original right after allocating its same-sized copy,
 // so freed chunks are reused at once.
-// A slab is returned to the driver only once fully free and another slab's
-// worth of that size is already free, so an alloc/free cycle cannot thrash;
-// at most two empty slabs per size are kept for reuse.
+// Each size keeps at most one fully free slab for reuse: when a slab's last
+// live chunk is freed while another empty slab already exists, the newly
+// emptied slab goes back to the driver. (A free-list-size threshold could not
+// bound retention: slabs could empty while the list was shallow and stay.)
 //
 // Accounting stays at the driver level: g_mem_used counts slabs, which is
 // what the device actually commits. Default on for Linux; ATLAS_HIP_SUBALLOC=0
@@ -112,7 +113,7 @@ static bool atlas_suballoc_eligible(size_t n) {
 
 struct AtlasSubSlab { char* base; size_t sz; size_t bytes; unsigned cap; unsigned live; };
 struct AtlasSubChunk { void* p; AtlasSubSlab* slab; };
-struct AtlasSubClass { std::vector<AtlasSubChunk> free; size_t slabs = 0; unsigned next_cap = 1; };
+struct AtlasSubClass { std::vector<AtlasSubChunk> free; size_t slabs = 0; unsigned next_cap = 1; unsigned empty = 0; };
 static std::mutex g_sub_mu;
 static std::unordered_map<size_t, AtlasSubClass> g_sub_classes;   // chunk size -> class
 static std::unordered_map<void*, AtlasSubSlab*> g_sub_owner;      // live chunk -> slab
@@ -150,15 +151,21 @@ static int atlas_suballoc(void** out, size_t n) {
             auto* s = new AtlasSubSlab{(char*)base, sz, bytes, (unsigned)(bytes / sz), 0};
             if (c.next_cap < (unsigned)(kSubSlab / sz)) c.next_cap *= 2;
             g_sub_slabs[s->base] = s;
-            for (unsigned i = s->cap; i-- > 0;) c.free.push_back({s->base + (size_t)i * sz, s});
+            // Chunk 0 is handed out right here, so a new slab is born live and
+            // never counts toward c.empty (which tracks empty<->live transitions).
+            for (unsigned i = s->cap; i-- > 1;) c.free.push_back({s->base + (size_t)i * sz, s});
+            s->live = 1;
+            g_sub_owner[s->base] = s;
+            *out = s->base;
             first_slab = c.slabs++ == 0;
             cap = s->cap;
+        } else {
+            AtlasSubChunk ch = c.free.back();
+            c.free.pop_back();
+            if (ch.slab->live++ == 0) --c.empty;
+            g_sub_owner[ch.p] = ch.slab;
+            *out = ch.p;
         }
-        AtlasSubChunk ch = c.free.back();
-        c.free.pop_back();
-        ch.slab->live++;
-        g_sub_owner[ch.p] = ch.slab;
-        *out = ch.p;
     }
     if (first_slab) {
         fprintf(stderr, "[suballoc] %zu B requests -> slabs of %u growing to %u per 64 MiB (driver would commit %zu B each)\n",
@@ -202,12 +209,13 @@ static bool atlas_subfree(void* p) {
         std::lock_guard<std::mutex> lk(g_sub_mu);
         AtlasSubClass& c = g_sub_classes[s->sz];
         c.free.push_back({p, s});
-        if (--s->live == 0 && c.free.size() >= 2 * (size_t)s->cap) {
+        if (--s->live == 0 && ++c.empty > 1) {
             std::vector<AtlasSubChunk> keep;
             keep.reserve(c.free.size() - s->cap);
             for (const AtlasSubChunk& q : c.free) if (q.slab != s) keep.push_back(q);
             c.free.swap(keep);
             c.slabs--;
+            c.empty--;
             g_sub_slabs.erase(s->base);
             atlas_track_free(s->base);
             release = s->base;
