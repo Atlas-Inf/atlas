@@ -787,9 +787,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     // Check no intervening `</` or `>` in the KEY span between
     // `<parameter=` and the current `>`.
     let body_segment = &window[after_eq..];
-    let intervening_close = body_segment
-        .iter()
-        .any(|&t| m.is_lt_slash(t) || m.is_gt(t));
+    let intervening_close = body_segment.iter().any(|&t| m.is_lt_slash(t) || m.is_gt(t));
     if !intervening_close {
         a.inside_parameter_body = true;
         a.param_body_chars_emitted = 0;

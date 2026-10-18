@@ -101,9 +101,15 @@ impl ToolMarkers {
             v.sort_unstable();
             v.dedup();
         }
-        let complete = [&m.lt, &m.parameter, &m.eq_start, &m.gt_start, &m.lt_slash_end]
-            .iter()
-            .all(|v| !v.is_empty());
+        let complete = [
+            &m.lt,
+            &m.parameter,
+            &m.eq_start,
+            &m.gt_start,
+            &m.lt_slash_end,
+        ]
+        .iter()
+        .all(|v| !v.is_empty());
         complete.then_some(m)
     }
 
