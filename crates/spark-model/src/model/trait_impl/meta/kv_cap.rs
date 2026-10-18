@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! R11 fix 2: cap prefix-cache KV reuse at the SSM anchor (split from
-//! `prefix_lookup.rs` for the 500-LoC cap).
+//! `prefix_lookup.rs` for the 500-LoC cap; lives under `meta` to keep
+//! `prefill_b.rs` under it too).
 
 use spark_runtime::kv_cache::PagedKvCache;
 
@@ -46,9 +47,12 @@ impl TransformerModel {
         }
         self.prefix_cache
             .release_matched(tokens, bs, old, seq.adapter_id);
-        let m2 =
-            self.prefix_cache
-                .lookup(&tokens[..snap_tok], bs, seq.session_hash, seq.adapter_id);
+        let m2 = self.prefix_cache.lookup_whole_blocks(
+            &tokens[..snap_tok],
+            bs,
+            seq.session_hash,
+            seq.adapter_id,
+        );
         if m2.matched_tokens != snap_tok || m2.matched_blocks.len() != snap_tok / bs {
             if m2.matched_tokens > 0 {
                 self.prefix_cache.release_matched(
