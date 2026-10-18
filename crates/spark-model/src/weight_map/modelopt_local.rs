@@ -67,7 +67,7 @@ pub fn native_mxfp8(module: &str) -> bool {
     if std::env::var("ATLAS_FP4LOCAL_EXPAND_MXFP8").as_deref() == Ok("1") {
         return false;
     }
-    const NATIVE: [&str; 7] = [
+    const NATIVE: [&str; 10] = [
         ".linear_attn.in_proj_qkv",
         ".linear_attn.in_proj_z",
         ".linear_attn.out_proj",
@@ -75,6 +75,9 @@ pub fn native_mxfp8(module: &str) -> bool {
         ".self_attn.k_proj",
         ".self_attn.v_proj",
         ".self_attn.o_proj",
+        ".mlp.shared_expert.gate_proj",
+        ".mlp.shared_expert.up_proj",
+        ".mlp.shared_expert.down_proj",
     ];
     module.starts_with("model.language_model.layers.")
         && NATIVE.iter().any(|suffix| module.ends_with(suffix))

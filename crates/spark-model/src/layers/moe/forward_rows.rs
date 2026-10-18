@@ -74,7 +74,6 @@ impl MoeLayer {
             && self.lora.is_none()
             && self.pre_expert_norm.is_none()
             && self.weights.router_pre_norm.is_none()
-            && !self.has_mixed_bf16_shared_expert()
             && self.tid2eid_dev.is_none()
             && self.correction_bias_dev.is_none()
             && self.router_logits_n as usize == ctx.config.num_experts
@@ -239,6 +238,9 @@ impl MoeLayer {
         let (h32, inter32, top_k32, rows32) = (h as u32, inter as u32, top_k as u32, rows as u32);
         let table = |t: &ExpertPtrTable| (t.packed_ptrs, t.scale_ptrs, t.scale2_vals);
         let shared = &self.weights.shared_expert;
+        // `shared` is NULL under a checkpoint-native separate shared expert —
+        // the fused kernels skip it and the separate chain fills `shared_out`
+        // for the same rows below.
         if k.units_ready() {
             // A launch takes up to QWEN4EXP_MOE_UNITS_MAX_ROWS rows; each row's
             // bytes are the same in any chunk (and under ATLAS_QWEN4EXP_MOE_TC
@@ -281,6 +283,20 @@ impl MoeLayer {
                 &shared.down_proj,
                 shared_out,
                 (h32, inter32, top_k32, rows32),
+                stream,
+            )?;
+        }
+
+        if self.has_separate_shared_expert() {
+            self.run_separate_shared_expert(
+                input,
+                rows32,
+                h32,
+                ctx.config.shared_expert_intermediate_size as u32,
+                ctx.buffers.logits(),
+                ctx.buffers.ssm_qkvz(),
+                shared_out,
+                ctx,
                 stream,
             )?;
         }

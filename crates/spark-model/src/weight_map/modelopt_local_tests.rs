@@ -229,7 +229,19 @@ fn materialize_expands_every_fp4_local_format() {
             done.nvfp4_to_bf16,
             done.f32_norms_native
         ),
-        (1, 0, 1, 1, 2)
+        (1, 1, 0, 1, 2)
+    );
+    // The shared-expert projection is a native consumer now: bytes as shipped.
+    let se = store.get(&format!("{SHARED}.weight")).unwrap();
+    assert_eq!(
+        (se.dtype, se.shape.clone()),
+        (WeightDtype::FP8E4M3, vec![1, 32])
+    );
+    assert_eq!(gpu.read_alloc(se.ptr).unwrap(), [0x38u8; 32]);
+    let se_s = store.get(&format!("{SHARED}.weight_scale")).unwrap();
+    assert_eq!(
+        (se_s.dtype, se_s.shape.clone()),
+        (WeightDtype::UInt8, vec![1, 1])
     );
     // The F32 norms are served as shipped: same dtype, byte-identical data.
     let norm = store.get(HC_NORM).unwrap();
@@ -267,15 +279,6 @@ fn materialize_expands_every_fp4_local_format() {
     let mut want = vec![0x38u8; 64];
     want[5] = 0x7E;
     assert_eq!(gpu.read_alloc(scale.ptr).unwrap(), want);
-
-    let attn = store.get(&format!("{SHARED}.weight")).unwrap();
-    assert_eq!(
-        (attn.dtype, attn.shape.clone()),
-        (WeightDtype::BF16, vec![1, 32])
-    );
-    let a = gpu.read_alloc(attn.ptr).unwrap();
-    assert!((0..32).all(|i| bf16_at(&a, i) == 0.125));
-    assert!(!store.contains(&format!("{SHARED}.weight_scale")));
 
     let vis = store.get(&format!("{VIS}.weight")).unwrap();
     assert_eq!(

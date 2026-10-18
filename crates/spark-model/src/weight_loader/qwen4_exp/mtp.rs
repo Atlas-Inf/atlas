@@ -243,25 +243,16 @@ fn build_mtp_moe(
     }
 
     // The shared expert ships per-tensor BF16 like a main layer's, so it takes
-    // the ordinary named path rather than the stacked slicer.
+    // the ordinary named path rather than the stacked slicer. It is also
+    // installed BF16-native on the layer below — the fused kernels then take a
+    // NULL shared expert and the BF16 chain applies it separately, sparing the
+    // one expert every drafted token sees the 4-bit requant.
     let se = format!("{mlp}.shared_expert");
-    let shared_expert = ExpertWeight {
-        gate_proj: q(
-            &dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?,
-            inter,
-            h,
-        )?,
-        up_proj: q(
-            &dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?,
-            inter,
-            h,
-        )?,
-        down_proj: q(
-            &dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?,
-            h,
-            inter,
-        )?,
-    };
+    let se_gate = dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?;
+    let se_up = dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?;
+    let se_down = dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?;
+    // NULL in the fused kernels: the BF16 chain installed below applies it.
+    let shared_expert = ExpertWeight::null();
 
     let gate = dense_auto(store, &format!("{mlp}.gate.weight"), gpu)?;
     let weights = MoeWeights {
@@ -276,8 +267,9 @@ fn build_mtp_moe(
     // Router precision matters more than router size here: at 512 experts the
     // top-10 weights cluster tightly. Same treatment as `ffn::build_moe`.
     let gate_nvfp4 = Some(q(&gate, n_experts, h)?);
-    let moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
+    let mut moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
         .context("qwen4_exp MTP: MoeLayer")?;
+    moe.set_bf16_shared_expert(se_gate, se_up, se_down)?;
     Ok(FfnComponent::Moe(moe))
 }
 

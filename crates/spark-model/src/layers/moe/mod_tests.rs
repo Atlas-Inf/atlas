@@ -44,7 +44,7 @@ fn test_moe_kernel_loading() {
 }
 
 #[test]
-fn bf16_shared_expert_requires_three_non_null_weights() {
+fn separate_shared_expert_requires_three_non_null_weights() {
     let gate = DenseWeight {
         weight: DevicePtr(11),
     };
@@ -66,4 +66,124 @@ fn bf16_shared_expert_requires_three_non_null_weights() {
     assert!(Bf16SharedExpert::new(null, up, down).is_err());
     assert!(Bf16SharedExpert::new(gate, null, down).is_err());
     assert!(Bf16SharedExpert::new(gate, up, null).is_err());
+}
+
+/// The MXFP8 shared expert dispatches onto `mxfp8_proj.cu` at every row
+/// band: the 1-row decode GEMV, the 2-row verify batch, and the >32-row
+/// dequant+GEMM prefill arm — with `silu_mul` between up and down.
+#[test]
+fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
+    use crate::layer::ForwardContext;
+    use crate::layers::moe::shared_fp8_cache_test_gpu::RecordingGpu;
+    use atlas_core::config::ModelConfig;
+    use spark_runtime::buffers::BufferArena;
+    use spark_runtime::gpu::KernelHandle;
+
+    let gpu = RecordingGpu::new();
+    let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+    config.hidden_size = 2560;
+    config.num_experts = 512;
+    config.num_experts_per_tok = 10;
+    config.moe_intermediate_size = 640;
+    config.shared_expert_intermediate_size = 640;
+    config.vocab_size = 8;
+    let mut layer = MoeLayer::new(MoeWeights::empty(512), 512, None, &gpu, &config).unwrap();
+    let (h, inter) = (config.hidden_size, config.shared_expert_intermediate_size);
+    let proj = |n: usize, k: usize, ptr: u64| Mxfp8Proj {
+        w: crate::weight_map::Mxfp8Weight {
+            data: DevicePtr(ptr),
+            scales: DevicePtr(ptr + 0x1000),
+        },
+        n: n as u32,
+        k: k as u32,
+    };
+    let kernels = ops::Mxfp8ProjKernels {
+        gemv: KernelHandle(111),
+        batchm: KernelHandle(222),
+        dequant: KernelHandle(333),
+    };
+    let scratch = ops::Mxfp8Scratch {
+        ptr: DevicePtr(0x9000_0000),
+        bytes: 1 << 24,
+    };
+    layer
+        .set_mxfp8_shared_expert(
+            proj(inter, h, 0x10000),
+            proj(inter, h, 0x20000),
+            proj(h, inter, 0x30000),
+            None,
+            kernels,
+            scratch,
+        )
+        .unwrap();
+    assert!(layer.has_separate_shared_expert());
+
+    let buffers = BufferArena::new(&config, 64, 4096, 16, 1, &gpu).unwrap();
+    let dispatch = ops::GemmDispatch::defaults();
+    let derived = ops::DerivedWeights::new();
+    let levers = ops::ModelLevers::defaults();
+    let stats = ops::ModelStats::new();
+    let ctx = ForwardContext {
+        buffers: &buffers,
+        gpu: &gpu,
+        config: &config,
+        dispatch: &dispatch,
+        derived: &derived,
+        levers: &levers,
+        stats: &stats,
+        ssm_batch: None,
+        attn_metadata: None,
+        profile: false,
+        comm: None,
+        graph_capture: false,
+        gdn_exact_replay: false,
+        token_ids: None,
+        host_token_ids: None,
+        routed_lora_layers: None,
+        midchunk_capture: None,
+        moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+    };
+    let (input, gate_out, up_out, down_out) = (
+        DevicePtr(0x40000),
+        DevicePtr(0x50000),
+        DevicePtr(0x60000),
+        DevicePtr(0x70000),
+    );
+    // gate GEMV, up GEMV, silu_mul, down GEMV on the band's row kernel. The
+    // >32-row arm (dequant + CUTLASS GEMM) is exercised by the mx8 GPU tests —
+    // its FFI cannot run on this mock.
+    for (m, want) in [(1u32, 111u64), (2, 222), (32, 222)] {
+        gpu.launches.lock().unwrap().clear();
+        let ran = layer
+            .run_separate_shared_expert(
+                input,
+                m,
+                h as u32,
+                inter as u32,
+                gate_out,
+                up_out,
+                down_out,
+                &ctx,
+                19,
+            )
+            .unwrap();
+        assert!(ran, "separate shared expert must run at m={m}");
+        let kernels_run: Vec<u64> = gpu
+            .launches
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| l.kernel)
+            .collect();
+        let want_n = if m == 1 {
+            3
+        } else {
+            3 * (m as usize).div_ceil(8)
+        };
+        assert_eq!(
+            kernels_run.iter().filter(|&&k| k == want).count(),
+            want_n,
+            "m={m}: expected {want_n} launches of {want}, got {kernels_run:?}"
+        );
+    }
 }

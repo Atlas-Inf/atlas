@@ -12,7 +12,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
-use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
+use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, Mxfp8Proj, QuantizedWeight};
 mod btile_model_owners;
 pub(crate) use btile_model_owners::{
     bind as bind_resident_btile_arenas, invalidate as invalidate_resident_btile_readers,
@@ -80,6 +80,38 @@ impl Bf16SharedExpert {
             down_proj,
         })
     }
+}
+
+/// A shared expert kept outside the fused routed-expert kernels and run as
+/// its own gate/up → silu_mul → down chain over the same scratch contract.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SeparateSharedExpert {
+    /// Checkpoint-native BF16 (Laguna).
+    Bf16(Bf16SharedExpert),
+    /// FP4-Local's checkpoint-native MXFP8: E4M3 weights + E8M0 scales,
+    /// projected by `mxfp8_proj.cu` — no BF16 expansion, no NVFP4 requant.
+    Mxfp8 {
+        gate_proj: Mxfp8Proj,
+        up_proj: Mxfp8Proj,
+        down_proj: Mxfp8Proj,
+        /// Gate‖up row-concatenated `[2*inter, h]` twin plus its
+        /// `[32, 2*inter]` BF16 landing buffer: one `mxfp8_proj` launch then
+        /// `fused_silu_mul` per row-band ≤ 32 (the batchm arm's span).
+        gate_up: Option<Mxfp8GateUp>,
+        kernels: ops::Mxfp8ProjKernels,
+        scratch: ops::Mxfp8Scratch,
+    },
+}
+
+/// The fused small-row arm of a [`SeparateSharedExpert::Mxfp8`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Mxfp8GateUp {
+    /// `[2*inter, h]` — gate rows then up rows.
+    pub proj: Mxfp8Proj,
+    /// `[32, 2*inter]` BF16 — one batchm-chunk's gate|up activations.
+    pub gate_up_out: DevicePtr,
+    /// `fused_silu_mul` (`dense_gemm_bf16.cu`); `0` resolves to the unfused path.
+    pub silu_mul: KernelHandle,
 }
 
 /// Unified expert pointer table for any quantization format.
@@ -186,6 +218,7 @@ mod gate_up_repack_test_gpu;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
+mod helpers_shared;
 mod route_dump;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;

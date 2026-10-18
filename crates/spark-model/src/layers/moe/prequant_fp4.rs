@@ -138,7 +138,7 @@ impl MoeLayer {
             && self.lora.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
+            && !self.has_separate_shared_expert()
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && !self.nvfp4_mmq_layout
             && self.use_btile_or_t_prefill()

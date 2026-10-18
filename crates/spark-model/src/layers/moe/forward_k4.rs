@@ -20,7 +20,7 @@ impl MoeLayer {
         let optimized = self.lora.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
+            && !self.has_separate_shared_expert()
             && matches!(
                 self.experts_scale_kind,
                 crate::weight_map::WeightQuantFormat::Nvfp4

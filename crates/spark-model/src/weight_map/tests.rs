@@ -23,7 +23,13 @@ use super::*;
 fn dense_keep_f32_passes_f32_and_widens_bf16() {
     use spark_runtime::gpu::mock::MockGpuBackend;
 
-    fn put(store: &mut WeightStore, gpu: &MockGpuBackend, name: &str, bytes: &[u8], dtype: WeightDtype) {
+    fn put(
+        store: &mut WeightStore,
+        gpu: &MockGpuBackend,
+        name: &str,
+        bytes: &[u8],
+        dtype: WeightDtype,
+    ) {
         let ptr = gpu.alloc(bytes.len()).unwrap();
         gpu.copy_h2d(bytes, ptr).unwrap();
         store
@@ -46,7 +52,13 @@ fn dense_keep_f32_passes_f32_and_widens_bf16() {
         .iter()
         .flat_map(|b| b.to_le_bytes())
         .collect();
-    put(&mut store, &gpu, "l.attn_hyper_connection.hc_norm.weight", &bf, WeightDtype::BF16);
+    put(
+        &mut store,
+        &gpu,
+        "l.attn_hyper_connection.hc_norm.weight",
+        &bf,
+        WeightDtype::BF16,
+    );
     let w = dense_keep_f32(&store, "l.attn_hyper_connection.hc_norm.weight", &gpu).unwrap();
     let got = gpu.read_alloc(w.weight).unwrap();
     let want: Vec<u8> = [0x3F80u32 << 16, 0xC020 << 16, 0x3D00 << 16]
@@ -60,7 +72,13 @@ fn dense_keep_f32_passes_f32_and_widens_bf16() {
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    put(&mut store, &gpu, "l.ple.norm_key.weight", &f, WeightDtype::FP32);
+    put(
+        &mut store,
+        &gpu,
+        "l.ple.norm_key.weight",
+        &f,
+        WeightDtype::FP32,
+    );
     let src = store.get("l.ple.norm_key.weight").unwrap().ptr;
     let w = dense_keep_f32(&store, "l.ple.norm_key.weight", &gpu).unwrap();
     assert_eq!(w.weight, src);

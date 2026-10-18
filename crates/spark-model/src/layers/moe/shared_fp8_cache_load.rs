@@ -101,7 +101,7 @@ impl MoeLayer {
         anyhow::ensure!(
             self.shared_experts_scale_kind == WeightQuantFormat::Nvfp4
                 && self.gate_nvfp4.is_none()
-                && self.bf16_shared_expert.is_none()
+                && self.separate_shared_expert.is_none()
                 && self.fp8_shared_expert.is_none()
                 && self.lora.is_none(),
             "shared FP8 cache requires native GLM shared weights and BF16 router"

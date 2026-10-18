@@ -170,11 +170,11 @@ impl MoeLayer {
             }
 
             let shared_out = ctx.buffers.attn_output();
-            if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
+            if let (Some(gp), Some(up), Some(dp), Some(SeparateSharedExpert::Bf16(shared))) = (
                 self.bf16_gate_weight_ptrs,
                 self.bf16_up_weight_ptrs,
                 self.bf16_down_weight_ptrs,
-                self.bf16_shared_expert,
+                self.separate_shared_expert,
             ) {
                 // BF16 path (FP8-dequant-on-load): same fused kernels as decode.
                 ops::moe_expert_gate_up_shared_bf16(
@@ -454,8 +454,8 @@ impl MoeLayer {
                 stream,
             )?;
 
-            if self.has_mixed_bf16_shared_expert() {
-                self.run_bf16_shared_expert(
+            if self.has_separate_shared_expert() {
+                self.run_separate_shared_expert(
                     input_t,
                     1,
                     h,
