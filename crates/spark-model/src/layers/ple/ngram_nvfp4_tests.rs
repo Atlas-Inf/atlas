@@ -36,7 +36,8 @@ fn rejects_mismatched_rows_and_strides() {
     let s = spec();
     assert!(decode_rows_bf16(&s, &[vec![0; 16]], &[]).is_err());
     assert!(decode_rows_bf16(&s, &[vec![0; 15]], &[vec![0; 2]]).is_err());
-    assert!(check_packed_stride(16, &s, false).is_ok());
-    assert!(check_packed_stride(32, &s, false).is_err());
-    assert!(check_packed_stride(16, &s, true).is_err());
+    // The scale arena must be attached:  true is required.
+    assert!(check_packed_stride(16, &s, true).is_ok());
+    assert!(check_packed_stride(32, &s, true).is_err());
+    assert!(check_packed_stride(16, &s, false).is_err());
 }
