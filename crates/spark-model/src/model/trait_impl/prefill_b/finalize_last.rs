@@ -326,19 +326,9 @@ impl TransformerModel {
         // orphan a pool slot).
         let full_blocks = tokens.len() / bs;
         let valid_blocks = seq.kv_valid_tokens / bs;
-        let mut cache_blocks = full_blocks.min(valid_blocks);
-        let mut cap_applied = cache_blocks < full_blocks;
-        // R11 fix 1: under the pass grid only KV written by FULL grid passes
-        // is shared (the last pass [grid_floor, total) has a prompt-dependent
-        // row count), and no full-length leaf snapshot is saved (a warm
-        // replay must start on a grid point). Routing through the cap branch
-        // below inserts the grid-floored prefix without a snapshot.
-        let grid = self.prefill_grid();
-        if grid > 0 {
-            let grid_blocks = spark_runtime::prefill_grid::cuts().floor(tokens.len()) / bs;
-            cache_blocks = cache_blocks.min(grid_blocks);
-            cap_applied = true;
-        }
+        // R11 fix 1: the pass grid caps this further, with no leaf snapshot.
+        let (cache_blocks, cap_applied, grid_cap) =
+            self.grid_cap_blocks(full_blocks.min(valid_blocks), full_blocks, tokens.len(), bs);
         let cache_tokens_len = if cap_applied {
             cache_blocks * bs
         } else {
@@ -351,7 +341,7 @@ impl TransformerModel {
         } else {
             &seq.disk_block_ids[..cache_blocks.min(seq.disk_block_ids.len())]
         };
-        if cap_applied && grid == 0 {
+        if cap_applied && !grid_cap {
             tracing::warn!(
                 "Prefix-cache stale-V cap: caching {} of {} complete blocks \
                  (kv_valid_tokens={} < prompt_len={}); trailing blocks had \

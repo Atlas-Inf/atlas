@@ -63,4 +63,58 @@ impl TransformerModel {
         }
         true
     }
+
+    /// R11 fix 1 (`prefill_chunk_dispatch_with`): position-fixed pass grid
+    /// (`spark_runtime::prefill_grid`). Every pass ends at a grid cut or the
+    /// prompt end, with prefix caching on or off, so a warm replay from a grid
+    /// anchor runs the same passes as a cold run. A chunk that crosses a cut
+    /// runs as two passes; `None` when the grid is off, the prompt has vision
+    /// pads, or no cut falls inside the chunk.
+    pub(in super::super) fn grid_cut(
+        &self,
+        tokens: &[u32],
+        seq: &mut crate::traits::SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        is_last_chunk: bool,
+        stream: u64,
+    ) -> Option<anyhow::Result<spark_runtime::gpu::DevicePtr>> {
+        if self.prefill_grid() == 0 || self.tokens_have_vision_pad(tokens) {
+            return None;
+        }
+        let end = chunk_start + chunk_len;
+        let cut = spark_runtime::prefill_grid::cuts().cut(chunk_start, end)?;
+        Some(
+            self.prefill_chunk_dispatch(tokens, seq, chunk_start, cut - chunk_start, false, stream)
+                .and_then(|_| {
+                    self.prefill_chunk_dispatch(tokens, seq, cut, end - cut, is_last_chunk, stream)
+                }),
+        )
+    }
+
+    /// The tail-split checkpoint (`prefill_chunk_dispatch_with`) runs only
+    /// with snapshots on and the pass grid off (the grid replaces it).
+    pub(in super::super) fn tail_split_snapshots(&self) -> bool {
+        self.prefill_grid() == 0 && self.ssm_snapshots.is_enabled()
+    }
+
+    /// R11 fix 1 (`finalize_last`): under the pass grid only KV written by
+    /// FULL grid passes is shared (the last pass has a prompt-dependent row
+    /// count) and no full-length leaf snapshot is saved (a warm replay must
+    /// start on a grid point); routing through the stale-V cap branch inserts
+    /// the grid-floored prefix without a snapshot. Returns
+    /// `(cache_blocks, cap_applied, grid_cap)`.
+    pub(in super::super) fn grid_cap_blocks(
+        &self,
+        cache_blocks: usize,
+        full_blocks: usize,
+        total: usize,
+        bs: usize,
+    ) -> (usize, bool, bool) {
+        if self.prefill_grid() == 0 {
+            return (cache_blocks, cache_blocks < full_blocks, false);
+        }
+        let grid_blocks = spark_runtime::prefill_grid::cuts().floor(total) / bs;
+        (cache_blocks.min(grid_blocks), true, true)
+    }
 }
