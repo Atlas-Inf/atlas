@@ -142,10 +142,20 @@ static int atlas_suballoc(void** out, size_t n) {
 }
 
 // true if p was a sub-allocated chunk (now freed); false means "plain hipFree".
+//
+// hipFree (like cuMemFree) synchronizes the device before releasing memory, and
+// callers may free a buffer that a kernel still in flight is reading. A chunk
+// goes straight back on a free list for the next same-size request, so keep
+// that guarantee explicitly: synchronize before the chunk becomes reusable.
 static bool atlas_subfree(void* p) {
+    {
+        std::lock_guard<std::mutex> lk(g_sub_mu);
+        if (g_sub_owner.find(p) == g_sub_owner.end()) return false;
+    }
+    hipDeviceSynchronize();
     std::lock_guard<std::mutex> lk(g_sub_mu);
     auto it = g_sub_owner.find(p);
-    if (it == g_sub_owner.end()) return false;
+    if (it == g_sub_owner.end()) return true;  // a concurrent double free: already released
     AtlasSubSlab* s = it->second;
     g_sub_owner.erase(it);
     AtlasSubClass& c = g_sub_classes[s->sz];
