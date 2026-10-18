@@ -108,6 +108,10 @@ impl Qwen3SsmLayer {
         value_dim: usize,
         stream: u64,
     ) -> Result<()> {
+        // Native MXFP8 (FP4-Local): the layer's only out_proj.
+        if let Some(mx8) = self.mx8.as_ref() {
+            return self.mx8_out(mx8, ctx, normed_out_buf, out_proj_buf, k as usize, stream);
+        }
         let force_w8a8 = matches!(std::env::var("ATLAS_FP8_W8A8").ok().as_deref(), Some("1"));
         // PER-ROW FP8 from the checkpoint (`ATLAS_FP8_ROWWISE=1`), dequantised
         // once to BF16 — see the matching arm in `trait_prefill_proj.rs` for

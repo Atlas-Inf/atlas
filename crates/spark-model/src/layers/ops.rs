@@ -29,6 +29,8 @@ mod dispatch_helpers;
 mod dispatch_proj;
 #[path = "ops/mxfp8.rs"]
 mod mxfp8;
+#[path = "ops/mxfp8_proj.rs"]
+mod mxfp8_proj;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
@@ -334,6 +336,7 @@ pub use moe_lora_grouped::*;
 pub use moe_nvfp4_mmq::*;
 pub use moe_prefill::*;
 pub use mxfp8::*;
+pub use mxfp8_proj::*;
 pub use norm::*;
 pub use nvfp4_mmq::*;
 pub use ple::*;

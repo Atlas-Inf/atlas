@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Native MXFP8 projections for nvidia/Qwen3.8-Flash-Next-FP4-Local.
+//
+// MXFP8 (OCP microscaling): B is [N, K] E4M3 bytes and S is [N, K/32] E8M0
+// bytes, one power-of-two scale 2^(S-127) per 32 consecutive inputs of a row.
+// The checkpoint ships the GDN, attention, indexer and shared-expert
+// projections this way; these kernels read those bytes as they are on disk.
+//
+//   mxfp8_proj_gemv     C[n]    = sum_k A[k]    * W[n,k]          (M = 1)
+//   mxfp8_proj_batchm   C[t, n] = sum_k A[t, k] * W[n,k]          (M <= 8)
+//   mxfp8_proj_dequant  D[n, k] = W[n,k] as BF16                  (exact)
+//
+// with W[n,k] = e4m3(B[n,k]) * 2^(S[n, k/32] - 127).
+//
+// Both GEMVs run the same templated body, so every row of `mxfp8_proj_batchm` is
+// accumulated in exactly the order `mxfp8_proj_gemv` uses: a verify row and the
+// sequential decode of the same token produce identical bits.
+//
+// Accumulation: each thread owns 16-input chunks (half an MXFP8 block). It
+// sums the 16 products a * e4m3 in a fixed sequential order, scales that
+// partial by the block's power of two (exact barring under/overflow), and
+// adds it into an FP32 accumulator. Lanes then reduce by warp shuffle and the
+// two warps of an output through shared memory.
+//
+// The dequant kernel feeds prefill: it expands one weight into a BF16 scratch
+// that cuBLASLt multiplies. Every E4M3 value times a power of two in range is
+// exactly representable in BF16, so the scratch is the checkpoint's weight,
+// not an approximation of it.
+//
+// Grid (GEMVs): (ceil(N / 4)), Block: 256 — four outputs, 64 threads each.
+// Grid (dequant): (ceil(N * K / 16 / 256)), Block: 256.
+// Requires K % 32 == 0 and 16-byte aligned A, B, D rows.
+
+#include <cuda_bf16.h>
+
+#define MX8_BLOCK_THREADS 256
+#define MX8_N_PER_BLOCK 4
+#define MX8_THREADS_PER_OUT (MX8_BLOCK_THREADS / MX8_N_PER_BLOCK)
+#define MX8_GROUP 32
+#define MX8_MAX_M 8
+
+// E4M3 byte -> f32. NaN (0x7F / 0xFF) maps to 0, as in the W8A16 tables.
+__device__ __forceinline__ float mx8_e4m3_to_f32(unsigned int v) {
+    const unsigned int e = (v >> 3) & 0xF;
+    const unsigned int m = v & 0x7;
+    float r;
+    if (e == 0) {
+        r = (float)m * 0.001953125f;  // subnormal: m * 2^-9
+    } else if (e == 15 && m == 7) {
+        r = 0.0f;
+    } else {
+        r = __int_as_float(((e + 120) << 23) | (m << 20));
+    }
+    return (v & 0x80) ? -r : r;
+}
+
+// E8M0 byte -> 2^(e - 127). 0xFF (NaN) maps to 0; 0 is the subnormal 2^-127.
+__device__ __forceinline__ float mx8_e8m0_to_f32(unsigned int e) {
+    if (e == 0xFF) return 0.0f;
+    if (e == 0) return __int_as_float(0x00400000);
+    return __int_as_float(e << 23);
+}
+
+__device__ __forceinline__ float mx8_bf16_lo(unsigned int x) {
+    return __uint_as_float(x << 16);
+}
+
+__device__ __forceinline__ float mx8_bf16_hi(unsigned int x) {
+    return __uint_as_float(x & 0xFFFF0000u);
+}
+
+// Sum of the 16 products of one weight chunk and one activation chunk, in
+// input order.
+__device__ __forceinline__ float mx8_chunk_dot(
+    const float* __restrict__ lut, uint4 w, uint4 a0, uint4 a1
+) {
+    const unsigned int wv[4] = {w.x, w.y, w.z, w.w};
+    const unsigned int av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+    float p = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned int w32 = wv[i];
+        const unsigned int lo = av[2 * i];
+        const unsigned int hi = av[2 * i + 1];
+        p += mx8_bf16_lo(lo) * lut[w32 & 0xFF];
+        p += mx8_bf16_hi(lo) * lut[(w32 >> 8) & 0xFF];
+        p += mx8_bf16_lo(hi) * lut[(w32 >> 16) & 0xFF];
+        p += mx8_bf16_hi(hi) * lut[w32 >> 24];
+    }
+    return p;
+}
+
+template <int M>
+__device__ __forceinline__ void mx8_gemv_rows(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const unsigned char* __restrict__ S,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K
+) {
+    __shared__ float s_lut[256];
+    __shared__ float s_red[MX8_N_PER_BLOCK * 2 * M];
+    s_lut[threadIdx.x] = mx8_e4m3_to_f32(threadIdx.x);
+    __syncthreads();
+
+    const unsigned int local_out = threadIdx.x / MX8_THREADS_PER_OUT;
+    const unsigned int lane = threadIdx.x % MX8_THREADS_PER_OUT;
+    const unsigned int n = blockIdx.x * MX8_N_PER_BLOCK + local_out;
+    const bool live = n < N;
+
+    float acc[M];
+    #pragma unroll
+    for (int t = 0; t < M; t++) acc[t] = 0.0f;
+
+    if (live) {
+        const unsigned int k16s = K / 16;
+        const uint4* wrow = (const uint4*)(B + (unsigned long long)n * K);
+        const unsigned char* srow = S + (unsigned long long)n * (K / MX8_GROUP);
+        for (unsigned int c = lane; c < k16s; c += MX8_THREADS_PER_OUT) {
+            const uint4 w = wrow[c];
+            const float scale = mx8_e8m0_to_f32(srow[c >> 1]);
+            #pragma unroll
+            for (int t = 0; t < M; t++) {
+                const uint4* arow = (const uint4*)(A + (unsigned long long)t * K);
+                const float p = mx8_chunk_dot(s_lut, w, arow[2 * c], arow[2 * c + 1]);
+                acc[t] += p * scale;
+            }
+        }
+    }
+
+    const unsigned int warp_in_out = lane / 32;
+    #pragma unroll
+    for (int t = 0; t < M; t++) {
+        float v = acc[t];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFF, v, off);
+        if ((lane & 31) == 0) s_red[(local_out * 2 + warp_in_out) * M + t] = v;
+    }
+    __syncthreads();
+    if (live && lane < M) {
+        const unsigned int t = lane;
+        const float r = s_red[(local_out * 2) * M + t] + s_red[(local_out * 2 + 1) * M + t];
+        C[(unsigned long long)t * N + n] = __float2bfloat16_rn(r);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(MX8_BLOCK_THREADS) mxfp8_proj_gemv(
+    const __nv_bfloat16* __restrict__ A,   // [1, K]
+    const unsigned char* __restrict__ B,   // [N, K] E4M3
+    const unsigned char* __restrict__ S,   // [N, K/32] E8M0
+    __nv_bfloat16* __restrict__ C,         // [1, N]
+    unsigned int N,
+    unsigned int K
+) {
+    mx8_gemv_rows<1>(A, B, S, C, N, K);
+}
+
+extern "C" __global__ void __launch_bounds__(MX8_BLOCK_THREADS) mxfp8_proj_batchm(
+    const __nv_bfloat16* __restrict__ A,   // [M, K]
+    const unsigned char* __restrict__ B,   // [N, K] E4M3
+    const unsigned char* __restrict__ S,   // [N, K/32] E8M0
+    __nv_bfloat16* __restrict__ C,         // [M, N]
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    switch (M) {
+        case 1: mx8_gemv_rows<1>(A, B, S, C, N, K); break;
+        case 2: mx8_gemv_rows<2>(A, B, S, C, N, K); break;
+        case 3: mx8_gemv_rows<3>(A, B, S, C, N, K); break;
+        case 4: mx8_gemv_rows<4>(A, B, S, C, N, K); break;
+        case 5: mx8_gemv_rows<5>(A, B, S, C, N, K); break;
+        case 6: mx8_gemv_rows<6>(A, B, S, C, N, K); break;
+        case 7: mx8_gemv_rows<7>(A, B, S, C, N, K); break;
+        case 8: mx8_gemv_rows<8>(A, B, S, C, N, K); break;
+        default: break;  // the host refuses M outside 1..=8
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(MX8_BLOCK_THREADS) mxfp8_proj_dequant(
+    const unsigned char* __restrict__ B,   // [N, K] E4M3
+    const unsigned char* __restrict__ S,   // [N, K/32] E8M0
+    __nv_bfloat16* __restrict__ D,         // [N, K] BF16
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned long long chunk = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long chunks = (unsigned long long)N * (K / 16);
+    if (chunk >= chunks) return;
+    const unsigned int k16s = K / 16;
+    const unsigned long long n = chunk / k16s;
+    const unsigned int c = (unsigned int)(chunk % k16s);
+    const float scale = mx8_e8m0_to_f32(S[n * (K / MX8_GROUP) + (c >> 1)]);
+    const uint4 w = ((const uint4*)B)[chunk];
+    const unsigned int wv[4] = {w.x, w.y, w.z, w.w};
+    unsigned int out[8];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const unsigned int b0 = (wv[i] >> (16 * j)) & 0xFF;
+            const unsigned int b1 = (wv[i] >> (16 * j + 8)) & 0xFF;
+            const __nv_bfloat16 v0 = __float2bfloat16_rn(mx8_e4m3_to_f32(b0) * scale);
+            const __nv_bfloat16 v1 = __float2bfloat16_rn(mx8_e4m3_to_f32(b1) * scale);
+            out[2 * i + j] = (unsigned int)__bfloat16_as_ushort(v0)
+                | ((unsigned int)__bfloat16_as_ushort(v1) << 16);
+        }
+    }
+    uint4* dst = (uint4*)(D + chunk * 16);
+    dst[0] = make_uint4(out[0], out[1], out[2], out[3]);
+    dst[1] = make_uint4(out[4], out[5], out[6], out[7]);
+}

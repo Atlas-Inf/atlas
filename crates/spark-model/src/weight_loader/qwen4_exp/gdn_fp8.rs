@@ -43,7 +43,12 @@ use crate::weight_map::{DenseWeight, Nvfp4Variant, free_loader_source};
 /// The format of the GDN `in_proj_qkvz` / `out_proj` weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GdnProjections {
-    /// BF16 as shipped. The default.
+    /// BF16 as shipped. The default, for two reasons. MEMORY: requantizing
+    /// is where this model's build spent 7.34 GB (152.8 MB a layer,
+    /// measured; the MoE costs nothing, its experts upload as shipped).
+    /// PRECISION: only the routed experts ship quantized, so BF16 -> NVFP4
+    /// would be a lossy round trip chosen, not forced, on 36 of 48 layers.
+    /// (FP4-Local's MXFP8 GDN projections bypass this enum: `gdn_mx8`.)
     Bf16,
     /// Requantized to NVFP4 (`ATLAS_QWEN4EXP_BF16_GDN=0`).
     Nvfp4,
@@ -94,7 +99,10 @@ impl GdnProjections {
 
     pub(super) fn describe(self) -> &'static str {
         match self {
-            Self::Bf16 => "BF16 as shipped (no runtime NVFP4 requantization)",
+            Self::Bf16 => {
+                "BF16 as shipped (no runtime NVFP4 requantization), or native MXFP8 where \
+                 the checkpoint ships MXFP8"
+            }
             Self::Nvfp4 => "requantized to NVFP4 (ATLAS_QWEN4EXP_BF16_GDN=0)",
             Self::Fp8Decode => {
                 "BF16 + a 128x128 block-scaled FP8 copy for decode (ATLAS_QWEN4EXP_FP8_GDN=1)"

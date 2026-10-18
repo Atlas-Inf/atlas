@@ -36,6 +36,10 @@ impl Qwen3SsmLayer {
     /// the switch is off or serial decode would take an arm this has no
     /// exact batched twin for (Q2, interleaved QKVZ, `ATLAS_GDN_FP8_DECODE`):
     /// the caller keeps its own dispatch.
+    ///
+    /// Native MXFP8 projections (`mx8`) are handled here whatever the switch
+    /// says: they are the layer's only copy, and `mxfp8_proj_batchm` rows are
+    /// the single-row kernel's bytes, so the exact path is the only path.
     pub(super) fn exact_rows_proj(
         &self,
         proj: GdnProj,
@@ -45,6 +49,27 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if let Some(mx8) = self.mx8.as_ref() {
+            let p = match proj {
+                GdnProj::Qkvz => &mx8.qkvz,
+                GdnProj::Out => &mx8.out,
+            };
+            let (in_row, out_row) = (p.k as usize * 2, p.n as usize * 2);
+            for first in (0..rows).step_by(ops::MXFP8_PROJ_MAX_GEMV_ROWS) {
+                let m = (rows - first).min(ops::MXFP8_PROJ_MAX_GEMV_ROWS);
+                ops::mxfp8_proj(
+                    ctx.gpu,
+                    &mx8.kernels,
+                    p,
+                    input.offset(first * in_row),
+                    output.offset(first * out_row),
+                    m,
+                    mx8.scratch,
+                    stream,
+                )?;
+            }
+            return Ok(true);
+        }
         if !ctx.levers.qwen4exp_batch_fast
             || rows == 0
             || !self.sequential_qkvz

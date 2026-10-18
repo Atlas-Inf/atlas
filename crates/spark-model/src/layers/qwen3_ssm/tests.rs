@@ -132,7 +132,7 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
 
 /// Drive the batched verify body at ragged ks through `decode_verify_multi`
 /// (the verify_e.rs entry point) and return the result.
-fn run_batched_verify(
+pub(super) fn run_batched_verify(
     gpu: &MockGpuBackend,
     config: &ModelConfig,
     layer: &Qwen3SsmLayer,
@@ -396,7 +396,7 @@ fn active_row_without_ple_carry_is_refused() {
 }
 
 /// Grid/block pairs of every launch recorded by the mock.
-fn gpu_launch_grids(gpu: &MockGpuBackend) -> Vec<([u32; 3], [u32; 3])> {
+pub(super) fn gpu_launch_grids(gpu: &MockGpuBackend) -> Vec<([u32; 3], [u32; 3])> {
     gpu.launches_snapshot()
         .into_iter()
         .map(|l| (l.grid, l.block))

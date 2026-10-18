@@ -9,8 +9,11 @@
 //! * routed-expert NVFP4 block scales are CSF-compressed
 //!   (`weight_scale.nvfp4_csf_{fixed,exceptions}`) — decoded losslessly into
 //!   the plain E4M3 `weight_scale` every NVFP4 kernel reads;
-//! * GDN / attention / QSA-indexer / shared-expert projections are MXFP8 —
-//!   expanded exactly to the BF16 `weight` the NVFP4 pack ships;
+//! * GDN / attention / QSA-indexer / shared-expert projections are MXFP8.
+//!   Those with a native MXFP8 consumer ([`native_mxfp8`]: the GDN
+//!   projections) are uploaded byte for byte, `weight` E4M3 + `weight_scale`
+//!   E8M0, and read by `mxfp8_proj.cu`; the rest are expanded exactly to the
+//!   BF16 `weight` the NVFP4 pack ships;
 //! * vision MLP/merger projections are W4A16 NVFP4 — dequantized to the BF16
 //!   the vision tower reads.
 //!
@@ -53,10 +56,24 @@ pub fn host_decode_modules(config: &ModelConfig) -> HashSet<String> {
         .collect()
 }
 
+/// MXFP8 modules a layer reads natively, so they are uploaded as shipped.
+/// `ATLAS_FP4LOCAL_EXPAND_MXFP8=1` expands them to BF16 instead (A/B only:
+/// both are exact, the native bytes are half the size).
+pub fn native_mxfp8(module: &str) -> bool {
+    if std::env::var("ATLAS_FP4LOCAL_EXPAND_MXFP8").as_deref() == Ok("1") {
+        return false;
+    }
+    module.starts_with("model.language_model.layers.")
+        && ["in_proj_qkv", "in_proj_z", "out_proj"]
+            .iter()
+            .any(|p| module.ends_with(&format!(".linear_attn.{p}")))
+}
+
 /// What [`materialize`] did, for the load log and for tests.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Materialized {
     pub csf_scales: usize,
+    pub mxfp8_native: usize,
     pub mxfp8_to_bf16: usize,
     pub nvfp4_to_bf16: usize,
     pub f32_norms_to_bf16: usize,
@@ -215,6 +232,49 @@ fn decode_one_csf(store: &mut WeightStore, gpu: &dyn GpuBackend, base: &str) -> 
     )
 }
 
+/// Upload one MXFP8 module unchanged: `weight` E4M3 `[n, k]` and
+/// `weight_scale` E8M0 `[n, k / 32]`. `None` when the checkpoint lacks it.
+fn upload_native_mxfp8(
+    store: &mut WeightStore,
+    gpu: &dyn GpuBackend,
+    module: &str,
+) -> Result<Option<u64>> {
+    let Some(w) = take(store, gpu, &format!("{module}.weight"))? else {
+        return Ok(None);
+    };
+    let s = take(store, gpu, &format!("{module}.weight_scale"))?
+        .with_context(|| format!("{module}.weight has no weight_scale"))?;
+    ensure!(
+        w.dtype == WeightDtype::FP8E4M3
+            && w.shape.len() == 2
+            && w.shape[1] % 32 == 0
+            && s.dtype == WeightDtype::UInt8
+            && s.shape == [w.shape[0], w.shape[1] / 32],
+        "{module}: expected MXFP8 (E4M3 [n, k] + U8 [n, k/32]), got {:?} {:?} + {:?} {:?}",
+        w.dtype,
+        w.shape,
+        s.dtype,
+        s.shape
+    );
+    let mut n = upload(
+        store,
+        gpu,
+        format!("{module}.weight"),
+        &w.bytes,
+        w.shape,
+        w.dtype,
+    )?;
+    n += upload(
+        store,
+        gpu,
+        format!("{module}.weight_scale"),
+        &s.bytes,
+        s.shape,
+        s.dtype,
+    )?;
+    Ok(Some(n))
+}
+
 /// Expand one host-decoded module into a BF16 `.weight`. Returns
 /// `(was_mxfp8, bytes)`, or `None` when the checkpoint does not carry it.
 fn expand_module(
@@ -282,6 +342,13 @@ pub fn materialize(
     let mut modules: Vec<String> = host_decode_modules(config).into_iter().collect();
     modules.sort();
     for module in modules {
+        if native_mxfp8(&module) {
+            if let Some(n) = upload_native_mxfp8(store, gpu, &module)? {
+                done.mxfp8_native += 1;
+                done.uploaded_bytes += n;
+            }
+            continue;
+        }
         let Some((mx, n)) = expand_module(store, gpu, &module)? else {
             continue;
         };
@@ -299,10 +366,11 @@ pub fn materialize(
         done.f32_norms_to_bf16 = n;
         done.uploaded_bytes += b;
         tracing::info!(
-            "FP4-Local: decoded {} CSF scale tensors, expanded {} MXFP8 and {} NVFP4 \
-             projections to BF16, rounded {} F32 norms to BF16 ({:.2} GiB uploaded; \
-             compressed originals never resident)",
+            "FP4-Local: decoded {} CSF scale tensors, kept {} MXFP8 projections native, \
+             expanded {} MXFP8 and {} NVFP4 projections to BF16, rounded {} F32 norms to \
+             BF16 ({:.2} GiB uploaded; compressed originals never resident)",
             done.csf_scales,
+            done.mxfp8_native,
             done.mxfp8_to_bf16,
             done.nvfp4_to_bf16,
             done.f32_norms_to_bf16,

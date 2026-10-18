@@ -79,6 +79,7 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 mod attach;
 mod ffn;
 mod gdn_fp8;
+mod gdn_mx8;
 mod hc;
 mod mtp;
 mod ple;
@@ -270,6 +271,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // shards, and nothing said which arm spent it. Summed here and logged
         // once, so the answer is read rather than guessed.
         let (mut moe_bytes, mut arm_bytes, mut hc_bytes) = (0u64, 0u64, 0u64);
+        let mut mx8_scratch = None;
         let free_now = |g: &dyn GpuBackend| g.free_memory().unwrap_or(0) as u64;
 
         for i in 0..config.num_hidden_layers {
@@ -289,20 +291,16 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             let post_attn_norm = ones_norm(h, gpu)?;
 
             let layer = match config.layer_types[i] {
+                // FP4-Local ships these MXFP8: served on those bytes.
+                LayerType::LinearAttention if gdn_mx8::present(store, &lp) => {
+                    let scratch = gdn_mx8::scratch_for(&mut mx8_scratch, config, gpu)?;
+                    gdn_mx8::build(
+                        i, store, &lp, gpu, config, input_norm, post_attn_norm, ffn, scratch,
+                    )
+                    .with_context(|| format!("qwen4_exp: GDN layer {i} (MXFP8)"))?
+                }
+                // BF16 as shipped, not requantized: see `GdnProjections::Bf16`.
                 LayerType::LinearAttention if gdn == GdnProjections::Bf16 => {
-                    // Keep the GDN projections BF16 instead of requantizing
-                    // them to NVFP4 at load.
-                    //
-                    // Two reasons, and the second is the interesting one.
-                    // (1) MEMORY: the requantization is where this model's
-                    // build spends its 7.34 GB (152.8 MB/layer, measured —
-                    // the MoE costs zero because its experts ship NVFP4 and
-                    // upload straight through).
-                    // (2) PRECISION: these tensors ship as BF16 in this
-                    // checkpoint. Only the routed experts are quantized. So
-                    // BF16 -> NVFP4 here is a lossy round trip we chose, not
-                    // one the checkpoint forced, and it lands on the GDN
-                    // projections of 36 of 48 layers.
                     crate::weight_loader::qwen35::load_layers::linear_attn_arms::build_linear_attention_dense_bf16(
                         i, store, &lp, gpu, variant, config, h,
                         input_norm, post_attn_norm, ffn,

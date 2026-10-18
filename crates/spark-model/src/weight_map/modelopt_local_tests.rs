@@ -10,6 +10,7 @@ const VIS: &str = "model.visual.blocks.0.mlp.linear_fc1";
 const HC_NORM: &str = "model.language_model.layers.0.attn_hyper_connection.hc_norm.weight";
 const PLE_NORM: &str = "model.language_model.layers.1.ple.norm_conv.weight";
 const EXPERT: &str = "model.language_model.layers.0.mlp.experts.3.down_proj.weight_scale";
+const GDN_OUT: &str = "model.language_model.layers.0.linear_attn.out_proj";
 
 fn spec(algo: &str, group: usize) -> QuantLayerSpec {
     QuantLayerSpec {
@@ -28,6 +29,7 @@ fn fp4_local_config() -> ModelConfig {
         spec("NVFP4", 16),
     );
     map.insert(ATTN.into(), spec("MXFP8", 32));
+    map.insert(GDN_OUT.into(), spec("MXFP8", 32));
     map.insert(VIS.into(), spec("W4A16_NVFP4", 16));
     map.insert(
         "model.language_model.layers.1.ple.ple_embedding.ngram_embedding".into(),
@@ -52,7 +54,7 @@ fn fp4_local_config() -> ModelConfig {
 #[test]
 fn host_decode_modules_pick_mxfp8_and_vision_nvfp4_only() {
     let got = host_decode_modules(&fp4_local_config());
-    let want: HashSet<String> = [ATTN, VIS].iter().map(|s| s.to_string()).collect();
+    let want: HashSet<String> = [ATTN, GDN_OUT, VIS].iter().map(|s| s.to_string()).collect();
     assert_eq!(got, want);
     assert!(host_decode_modules(&ModelConfig::qwen3_next_80b_nvfp4()).is_empty());
 }
@@ -218,11 +220,12 @@ fn materialize_expands_every_fp4_local_format() {
     assert_eq!(
         (
             done.csf_scales,
+            done.mxfp8_native,
             done.mxfp8_to_bf16,
             done.nvfp4_to_bf16,
             done.f32_norms_to_bf16
         ),
-        (1, 1, 1, 2)
+        (1, 0, 1, 1, 2)
     );
     let norm = store.get(HC_NORM).unwrap();
     assert_eq!(norm.dtype, WeightDtype::BF16);
@@ -268,6 +271,75 @@ fn materialize_expands_every_fp4_local_format() {
             "{gone} must be consumed"
         );
     }
+}
+
+/// The GDN projections have a native MXFP8 kernel: their bytes are uploaded
+/// exactly as shipped, weight and scale, and nothing is widened.
+#[test]
+fn gdn_mxfp8_stays_native() {
+    assert!(native_mxfp8(GDN_OUT));
+    assert!(native_mxfp8(
+        "model.language_model.layers.7.linear_attn.in_proj_qkv"
+    ));
+    assert!(!native_mxfp8(ATTN));
+    assert!(!native_mxfp8(
+        "model.language_model.layers.7.linear_attn.in_proj_a"
+    ));
+
+    let gpu = MockGpuBackend::new();
+    let mut store = WeightStore::empty();
+    let mut shard = Shard::new("gdn");
+    let weight: Vec<u8> = (0..64u8).collect();
+    shard.add(
+        &format!("{GDN_OUT}.weight"),
+        &weight,
+        &[2, 32],
+        WeightDtype::FP8E4M3,
+    );
+    shard.add(
+        &format!("{GDN_OUT}.weight_scale"),
+        &[120, 125],
+        &[2, 1],
+        WeightDtype::UInt8,
+    );
+    shard.defer_into(&mut store);
+    let done = materialize(&mut store, &fp4_local_config(), &gpu).unwrap();
+    assert_eq!((done.mxfp8_native, done.mxfp8_to_bf16), (1, 0));
+    let w = store.get(&format!("{GDN_OUT}.weight")).unwrap();
+    assert_eq!(
+        (w.dtype, w.shape.clone()),
+        (WeightDtype::FP8E4M3, vec![2, 32])
+    );
+    assert_eq!(gpu.read_alloc(w.ptr).unwrap(), weight);
+    let sc = store.get(&format!("{GDN_OUT}.weight_scale")).unwrap();
+    assert_eq!(
+        (sc.dtype, sc.shape.clone()),
+        (WeightDtype::UInt8, vec![2, 1])
+    );
+    assert_eq!(gpu.read_alloc(sc.ptr).unwrap(), [120, 125]);
+}
+
+/// A malformed MXFP8 scale is refused rather than uploaded.
+#[test]
+fn gdn_mxfp8_with_wrong_scale_shape_is_refused() {
+    let gpu = MockGpuBackend::new();
+    let mut store = WeightStore::empty();
+    let mut shard = Shard::new("gdnbad");
+    shard.add(
+        &format!("{GDN_OUT}.weight"),
+        &[0; 64],
+        &[2, 32],
+        WeightDtype::FP8E4M3,
+    );
+    shard.add(
+        &format!("{GDN_OUT}.weight_scale"),
+        &[0; 4],
+        &[2, 2],
+        WeightDtype::UInt8,
+    );
+    shard.defer_into(&mut store);
+    let err = materialize(&mut store, &fp4_local_config(), &gpu).unwrap_err();
+    assert!(format!("{err:#}").contains("expected MXFP8"), "{err:#}");
 }
 
 /// A CSF fixed stream with no exceptions partner is a broken checkpoint, not
