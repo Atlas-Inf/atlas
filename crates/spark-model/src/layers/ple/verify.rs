@@ -139,7 +139,21 @@ impl PleLayer {
                 let (h0, m0, _) = cache.stats();
                 let t0 = std::time::Instant::now();
                 cache.resolve(ids, &mut slots)?;
-                if let Some(spec) = &self.trellis {
+                if let Some(spec) = &self.nvfp4 {
+                    // FP4-Local: weight rows from this cache, block-scale rows
+                    // from the companion cache at the same ids.
+                    let mut raws = Vec::with_capacity(slots.len());
+                    for &slot in &slots {
+                        raws.push(cache.copy_slot(slot)?);
+                    }
+                    let scales = super::ngram_nvfp4::gather_scales(spec, ids)?;
+                    let decoded = super::ngram_nvfp4::decode_rows_bf16(&spec.geom, &raws, &scales)
+                        .map_err(|e| anyhow::anyhow!("PLE: ngram nvfp4 dequant: {e:#}"))?;
+                    gpu.copy_h2d_async(&decoded, self.emb, stream)?;
+                    // Same contract as the trellis branch below: `decoded` is a
+                    // temporary, and a graph replay must see the finished upload.
+                    gpu.synchronize(stream)?;
+                } else if let Some(spec) = &self.trellis {
                     let mut raws = Vec::with_capacity(slots.len());
                     for &slot in &slots {
                         raws.push(cache.copy_slot(slot)?);
@@ -228,10 +242,10 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        // Trellis rows are not embeddings. `gather_host` already wrote the
-        // decoded BF16 matrix into `emb`; launching `batched_embed` would
-        // overwrite it with packed I16 interpreted as BF16.
-        if self.trellis.is_none() {
+        // Trellis and NVFP4 rows are not embeddings. `gather_host` already
+        // wrote the decoded BF16 matrix into `emb`; launching `batched_embed`
+        // would overwrite it with packed bytes interpreted as BF16.
+        if !self.host_decoded() {
             self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)?;
         }
         // The pins taken by this gather must outlive THIS kernel: record an event

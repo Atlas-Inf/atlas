@@ -347,6 +347,7 @@ fn active_row_without_ple_carry_is_refused() {
         1,
         1,
         None,
+        None,
         &gpu,
     )
     .unwrap();

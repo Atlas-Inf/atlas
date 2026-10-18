@@ -25,6 +25,8 @@ mod loaders_mtp;
 mod model_a;
 #[path = "weight_map/model_b.rs"]
 mod model_b;
+#[path = "weight_map/modelopt_local.rs"]
+pub mod modelopt_local;
 #[path = "weight_map/moe.rs"]
 mod moe;
 #[path = "weight_map/mxfp8.rs"]

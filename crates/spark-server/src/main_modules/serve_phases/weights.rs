@@ -153,6 +153,14 @@ pub(crate) fn load_weight_store(
                     loader.demand_paged_patterns
                 );
             }
+            loader.host_decode_modules =
+                spark_model::weight_map::modelopt_local::host_decode_modules(config);
+            if !loader.host_decode_modules.is_empty() {
+                tracing::info!(
+                    "Host-decoded at build, never resident: {} MXFP8 / vision-NVFP4 modules",
+                    loader.host_decode_modules.len()
+                );
+            }
             loader.skip_activation_scales = skip_activation_scales(config);
             loader.skip_mtp = skip_mtp(config, args);
             loader.skip_layer_prefix = unused_mtp_prefix.clone();

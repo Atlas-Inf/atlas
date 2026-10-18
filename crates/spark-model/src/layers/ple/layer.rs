@@ -63,6 +63,8 @@ pub struct PleLayer {
     scale_va: Option<u64>,
     /// Packed EXL3 n-gram rows. Host-dequanted into `emb` before the GEMM.
     trellis: Option<ngram_trellis::NgramTrellis>,
+    /// NVFP4 n-gram rows (FP4-Local). Host-dequanted into `emb` likewise.
+    nvfp4: Option<ngram_nvfp4::NgramNvfp4>,
     gemm_k: KernelHandle,
     gate_k: KernelHandle,
     conv_k: KernelHandle,
@@ -96,6 +98,12 @@ pub struct PleLayer {
 }
 
 impl PleLayer {
+    /// Rows decoded on the host into `emb` (EXL3 trellis, FP4-Local NVFP4)
+    /// rather than gathered by the embedding kernel.
+    pub(super) fn host_decoded(&self) -> bool {
+        self.trellis.is_some() || self.nvfp4.is_some()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dims: PleIdDims,
@@ -110,6 +118,7 @@ impl PleLayer {
         max_tokens: usize,
         scratch_tokens: usize,
         trellis: Option<ngram_trellis::NgramTrellis>,
+        nvfp4: Option<ngram_nvfp4::NgramNvfp4>,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         dims.validate()?;
@@ -132,7 +141,9 @@ impl PleLayer {
         if let NgramTable::Cached(cache) = &table {
             let stride = cache.row_stride();
             let scaled = cache.scale_dev_va()?.is_some();
-            if let Some(t) = trellis.as_ref() {
+            if let Some(n) = nvfp4.as_ref() {
+                ngram_nvfp4::check_packed_stride(stride, &n.geom, scaled)?;
+            } else if let Some(t) = trellis.as_ref() {
                 ngram_trellis::check_packed_stride(stride, t, scaled)?;
             } else {
                 gather_matches_element_size(stride, head_dim, scaled)?;
@@ -162,6 +173,7 @@ impl PleLayer {
                 _ => None,
             },
             trellis,
+            nvfp4,
             embed_fp8_k: gpu.kernel("embed_from_argmax", "batched_embed_fp8")?,
             table: std::sync::Arc::new(std::sync::Mutex::new(table)),
             embed_k: gpu.kernel("embed_from_argmax", "batched_embed")?,
@@ -396,6 +408,8 @@ pub(crate) mod warm;
 
 #[path = "gather_guard.rs"]
 mod gather_guard;
+#[path = "ngram_nvfp4.rs"]
+pub(crate) mod ngram_nvfp4;
 #[path = "ngram_trellis.rs"]
 pub(crate) mod ngram_trellis;
 #[cfg(feature = "cuda")]

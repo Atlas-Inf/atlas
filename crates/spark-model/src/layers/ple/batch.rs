@@ -190,8 +190,8 @@ impl PleLayer {
     ///
     /// Falls back to exactly that loop where the batched form does not
     /// apply: a consumable decode prestage on any member (the per-sequence
-    /// forward decides whether to use it), a trellis table (its gather
-    /// writes `emb` from the host per call), more rows than one scratch span,
+    /// forward decides whether to use it), a host-decoded table (trellis or
+    /// NVFP4: its gather writes `emb` from the host per call), more rows than one scratch span,
     /// a member wide enough to skip the per-row conv snapshots, or the kill
     /// switch.
     pub fn forward_seqs(
@@ -212,7 +212,7 @@ impl PleLayer {
         let batched = seq_batch_enabled()
             && seqs.len() > 1
             && contiguous
-            && self.trellis.is_none()
+            && !self.host_decoded()
             && total <= self.scratch_tokens
             && total <= self.max_tokens
             && verify_snapshots_enabled()

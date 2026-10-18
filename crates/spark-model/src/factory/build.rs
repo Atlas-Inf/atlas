@@ -156,6 +156,9 @@ pub fn build_model(
         crate::weight_map::exl3::exl3_materialize_dense(&mut store, gpu.as_ref())?;
         config.attn_proj_bf16 = true;
     }
+    // FP4-Local: CSF expert scales and MXFP8 / vision-NVFP4 projections become
+    // the plain NVFP4 / BF16 layout the loaders below read. No-op otherwise.
+    crate::weight_map::modelopt_local::materialize(&mut store, &config, gpu.as_ref())?;
 
     // ── LoRA adapter load (pre-arena, pre-KV-sizing) ──
     // MUST run before `BufferArena::new` and the `gpu.free_memory()`
