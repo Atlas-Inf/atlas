@@ -5,7 +5,7 @@
 //! the Qwen-hardcoded markers used to kill at 1024 tokens.
 
 use super::fixtures::{NEMOTRON, QWEN};
-use super::{TEST_LOCK, ToolMarkers, set};
+use super::{ToolMarkers, set};
 use crate::scheduler::emit_step::update_tool_param_state;
 use crate::scheduler::test_support::test_seq;
 
@@ -42,6 +42,9 @@ fn run(markers: Option<ToolMarkers>, tokens: &[u32]) -> (bool, Option<&'static s
     let (mut a, _rx) = test_seq(Vec::new(), 100_000, None, 0);
     a.tool_call_start_token = Some(NEMO_TOOL_CALL);
     a.tool_call_end_token = Some(NEMO_TOOL_CALL_END);
+    // The fixture builds a finished sequence; this one is mid-generation.
+    a.finished = false;
+    a.guard_stop = None;
     for &tok in tokens {
         update_tool_param_state(&mut a, tok, true);
         a.output_tokens.push(tok);
@@ -49,13 +52,12 @@ fn run(markers: Option<ToolMarkers>, tokens: &[u32]) -> (bool, Option<&'static s
             break;
         }
     }
-    set(None);
+    set(Some(super::QWEN));
     (a.finished, a.guard_stop, a.inside_tool_body)
 }
 
 #[test]
 fn nemotron_markers_let_a_large_write_finish() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (finished, guard, inside) = run(Some(NEMOTRON), &nemotron_write(1500));
     assert!(!finished, "guard fired: {guard:?}");
     assert_eq!(guard, None);
@@ -66,7 +68,6 @@ fn nemotron_markers_let_a_large_write_finish() {
 fn qwen_ids_on_a_nemotron_stream_reproduce_the_kill() {
     // The pre-fix behaviour: Qwen ids never match a Nemotron `<parameter=`,
     // so the file content counts as envelope and trips the 1024 cap.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (finished, guard, _) = run(Some(QWEN), &nemotron_write(1500));
     assert!(finished);
     assert_eq!(guard, Some("tool_envelope_stuck"));
@@ -74,7 +75,6 @@ fn qwen_ids_on_a_nemotron_stream_reproduce_the_kill() {
 
 #[test]
 fn unresolved_markers_leave_the_cap_off() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (finished, guard, _) = run(None, &nemotron_write(1500));
     assert!(!finished && guard.is_none());
 }
@@ -83,7 +83,6 @@ fn unresolved_markers_leave_the_cap_off() {
 fn a_never_closed_envelope_is_still_cut() {
     // The runaway the cap exists for: `<tool_call>` then 1100 envelope tokens
     // that never open a parameter value.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut t = vec![NEMO_TOOL_CALL];
     t.extend(std::iter::repeat_n(41199u32, 1100));
     let (finished, guard, _) = run(Some(NEMOTRON), &t);

@@ -18,6 +18,7 @@
 //! token resolves to `None`, and the guard then stays off rather than
 //! misfiring: `--tool-max-tokens` still bounds a runaway envelope.
 
+#[cfg(not(test))]
 use std::sync::RwLock;
 
 /// The marker ids for one tokenizer.
@@ -52,36 +53,55 @@ impl ToolMarkers {
     }
 }
 
-static MARKERS: RwLock<Option<ToolMarkers>> = RwLock::new(None);
+/// Qwen3.6 / 3.8 byte-level BPE ids: the values the guard was hard-coded to,
+/// kept as the default until a tokenizer installs its own (every serve path
+/// does, in `tokenizer_runtime`), so nothing changes for a caller that never
+/// loads one.
+pub const QWEN: ToolMarkers = ToolMarkers {
+    lt: 27,
+    eq: 28,
+    gt: [Some(29), None, None],
+    lt_slash: 510,
+    parameter: 15704,
+};
+
+#[cfg(not(test))]
+static MARKERS: RwLock<Option<ToolMarkers>> = RwLock::new(Some(QWEN));
+
+#[cfg(test)]
+thread_local! {
+    // Per test thread, so parallel tests installing different markers do not
+    // observe each other's.
+    static MARKERS: std::cell::Cell<Option<ToolMarkers>> = const { std::cell::Cell::new(Some(QWEN)) };
+}
 
 /// Install the markers of the tokenizer just loaded (`None` turns the
 /// parameter-body tracking off).
 pub fn set(markers: Option<ToolMarkers>) {
-    *MARKERS.write().unwrap_or_else(|e| e.into_inner()) = markers;
+    #[cfg(not(test))]
+    {
+        *MARKERS.write().unwrap_or_else(|e| e.into_inner()) = markers;
+    }
+    #[cfg(test)]
+    MARKERS.with(|m| m.set(markers));
 }
 
 /// The markers of the tokenizer being served.
 pub fn get() -> Option<ToolMarkers> {
-    *MARKERS.read().unwrap_or_else(|e| e.into_inner())
+    #[cfg(not(test))]
+    {
+        *MARKERS.read().unwrap_or_else(|e| e.into_inner())
+    }
+    #[cfg(test)]
+    MARKERS.with(|m| m.get())
 }
-
-/// Serialises the tests (here and in `emit_step`) that install markers into
-/// the process-wide slot, so parallel tests do not observe each other's.
-#[cfg(test)]
-pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::ToolMarkers;
 
     /// Qwen3.6 / 3.8 byte-level BPE (verified with tokenizer.json 2026-10-18).
-    pub const QWEN: ToolMarkers = ToolMarkers {
-        lt: 27,
-        eq: 28,
-        gt: [Some(29), None, None],
-        lt_slash: 510,
-        parameter: 15704,
-    };
+    pub use super::QWEN;
     /// Nemotron 3.5 Super VL (tokenizer.json of
     /// nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4, 2026-10-18).
     pub const NEMOTRON: ToolMarkers = ToolMarkers {
