@@ -216,6 +216,10 @@ name = "ngram_nvfp4_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "vit_dq_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "q2_0_gemv_microtest"
 required-features = ["cuda", "gpu-examples"]
 

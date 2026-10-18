@@ -50,12 +50,13 @@ fn fp4_local_config() -> ModelConfig {
     cfg
 }
 
-/// Only MXFP8 modules and the vision tower's NVFP4 are host-expanded: the
-/// trunk experts, MTP experts and PLE table keep their own NVFP4 paths.
+/// Only MXFP8 modules are host-expanded: the trunk experts, MTP experts, PLE
+/// table and the vision tower (native NVFP4 dequant on-GPU) keep their own
+/// paths.
 #[test]
 fn host_decode_modules_pick_mxfp8_and_vision_nvfp4_only() {
     let got = host_decode_modules(&fp4_local_config());
-    let want: HashSet<String> = [SHARED, GDN_OUT, VIS]
+    let want: HashSet<String> = [SHARED, GDN_OUT]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -122,9 +123,6 @@ fn resident(
         .unwrap();
 }
 
-fn bf16_at(bytes: &[u8], i: usize) -> f32 {
-    f32::from_bits(u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) << 16)
-}
 
 #[test]
 fn materialize_expands_every_fp4_local_format() {
@@ -229,7 +227,7 @@ fn materialize_expands_every_fp4_local_format() {
             done.nvfp4_to_bf16,
             done.f32_norms_native
         ),
-        (1, 1, 0, 1, 2)
+        (1, 1, 0, 0, 2)
     );
     // The shared-expert projection is a native consumer now: bytes as shipped.
     let se = store.get(&format!("{SHARED}.weight")).unwrap();
@@ -266,10 +264,9 @@ fn materialize_expands_every_fp4_local_format() {
         .get("model.language_model.layers.1.ple.conv1d.bias")
         .unwrap();
     assert_eq!(bias.dtype, WeightDtype::FP32);
-    assert!(
-        store.deferred_sorted().is_empty(),
-        "every source must be consumed"
-    );
+    // The vision NVFP4 tensors are NOT consumed: they are a native GPU
+    // dequant path now, read as deferred shards by the vision loader.
+    assert_eq!(store.deferred_sorted().len(), 2, "vision tensors stay deferred");
 
     let scale = store.get(EXPERT).unwrap();
     assert_eq!(
@@ -280,19 +277,16 @@ fn materialize_expands_every_fp4_local_format() {
     want[5] = 0x7E;
     assert_eq!(gpu.read_alloc(scale.ptr).unwrap(), want);
 
-    let vis = store.get(&format!("{VIS}.weight")).unwrap();
+    let vis = store.deferred(&format!("{VIS}.weight")).unwrap();
     assert_eq!(
         (vis.dtype, vis.shape.clone()),
-        (WeightDtype::BF16, vec![1, 16])
+        (WeightDtype::UInt8, vec![1, 8])
     );
-    let v = gpu.read_alloc(vis.ptr).unwrap();
-    assert!((0..16).all(|i| bf16_at(&v, i) == 1.0));
-    for gone in ["weight_scale", "weight_scale_2", "input_scale"] {
-        assert!(
-            !store.contains(&format!("{VIS}.{gone}")),
-            "{gone} must be consumed"
-        );
-    }
+    // Nothing consumes the vision NVFP4s at materialize: weight+scale stay
+    // deferred for the vision loader; the resident scalars are untouched.
+    assert!(store.deferred(&format!("{VIS}.weight_scale")).is_some());
+    assert!(store.get(&format!("{VIS}.weight_scale_2")).is_ok());
+    assert!(store.get(&format!("{VIS}.input_scale")).is_ok());
 }
 
 /// The GDN projections have a native MXFP8 kernel: their bytes are uploaded
@@ -307,7 +301,9 @@ fn gdn_mxfp8_stays_native() {
     assert!(!native_mxfp8(
         "model.language_model.layers.3.self_attn.indexer.index_qk_proj"
     ));
-    assert!(!native_mxfp8("model.visual.blocks.0.attn.qkv"));
+    assert!(native_mxfp8("model.visual.blocks.0.attn.qkv"));
+    assert!(native_mxfp8("model.visual.blocks.0.attn.proj"));
+    assert!(!native_mxfp8("model.visual.blocks.0.mlp.linear_fc1"));
     assert!(!native_mxfp8(
         "model.language_model.layers.7.linear_attn.in_proj_a"
     ));

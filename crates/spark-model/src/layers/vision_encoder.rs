@@ -35,27 +35,56 @@ pub const VIDEO_PAD_TOKEN_ID: u32 = IMAGE_PAD_TOKEN + 1;
 /// therefore check the length rather than assume it — see `patch_embed`.
 pub(crate) const PATCH_DIM: usize = 1536;
 
+/// A ViT projection weight, in the checkpoint's native precision. BF16 is a
+/// raw pointer; the quantized arms carry everything the scratch dequant needs.
+#[derive(Debug, Clone, Copy)]
+pub enum VitWeight {
+    Bf16(DevicePtr),
+    /// E4M3 + E8M0 per-32-input scales (FP4-Local `attn.qkv`/`attn.proj`).
+    Mxfp8(crate::layers::ops::Mxfp8Proj),
+    /// Packed E2M1 + E4M3 per-16 scales + one F32 global (FP4-Local
+    /// `mlp.linear_fc*`/`merger.linear_fc*`).
+    Nvfp4 {
+        packed: DevicePtr,
+        scales: DevicePtr,
+        global: f32,
+        n: u32,
+        k: u32,
+    },
+}
+
+impl VitWeight {
+    /// BF16 bytes this weight expands to (`n * k * 2`).
+    pub fn bf16_bytes(&self) -> usize {
+        match self {
+            VitWeight::Bf16(_) => 0,
+            VitWeight::Mxfp8(p) => p.n as usize * p.k as usize * 2,
+            VitWeight::Nvfp4 { n, k, .. } => *n as usize * *k as usize * 2,
+        }
+    }
+}
+
 pub struct ViTBlock {
     pub norm1_w: DevicePtr,
     pub norm1_b: DevicePtr,
-    pub qkv_w: DevicePtr,
+    pub qkv_w: VitWeight,
     pub qkv_b: DevicePtr,
-    pub proj_w: DevicePtr,
+    pub proj_w: VitWeight,
     pub proj_b: DevicePtr,
     pub norm2_w: DevicePtr,
     pub norm2_b: DevicePtr,
-    pub fc1_w: DevicePtr,
+    pub fc1_w: VitWeight,
     pub fc1_b: DevicePtr,
-    pub fc2_w: DevicePtr,
+    pub fc2_w: VitWeight,
     pub fc2_b: DevicePtr,
 }
 
 pub struct MergerLayer {
     pub norm_w: DevicePtr,
     pub norm_b: DevicePtr,
-    pub fc1_w: DevicePtr,
+    pub fc1_w: VitWeight,
     pub fc1_b: DevicePtr,
-    pub fc2_w: DevicePtr,
+    pub fc2_w: VitWeight,
     pub fc2_b: DevicePtr,
 }
 
@@ -83,6 +112,8 @@ pub struct VisionEncoder {
     k_merge: KernelHandle, // vision_spatial_merge (2×2)
     k_f32_bf16: KernelHandle, // vision_f32_to_bf16
     k_copy: KernelHandle, // vision_bf16_copy
+    k_nvfp4_dq: KernelHandle, // dequant_nvfp4_to_bf16 (native vision NVFP4)
+    k_mx8_dq: KernelHandle,   // mxfp8_proj_dequant (native vision MXFP8)
     // config
     pub hidden_size: usize,        // 1152
     pub num_heads: usize,          // 16
@@ -111,6 +142,9 @@ pub struct VisionEncoder {
     pub buf_scores: DevicePtr, // [attn_max × attn_max] f32  — per-head raw QKᵀ
     pub buf_probs: DevicePtr, // [attn_max × attn_max] bf16 — per-head softmax probs
     pub buf_o_stage: DevicePtr, // [p_max × head_dim] bf16 — per-head GEMM2 output staging
+    /// Vision-owned BF16 expansion scratch for quantized weights — sized for
+    /// the largest projection (~10 MB), NOT shared with the LM buffers.
+    pub buf_vit_dq: DevicePtr,
     // host-side prep state
     pos_embed_host_f32: Vec<f32>, // [num_position_embeddings × hidden_size] row-major
     rope_inv_freq: Vec<f32>,      // [head_dim / 4] frequencies

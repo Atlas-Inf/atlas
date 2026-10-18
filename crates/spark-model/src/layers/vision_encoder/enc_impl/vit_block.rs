@@ -10,6 +10,60 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use super::super::{ViTBlock, VisionEncoder};
 
 impl VisionEncoder {
+    /// Resolve a [`VitWeight`] to BF16 pointer: raw BF16 is returned as-is;
+    /// a quantized weight is expanded into `buf_vit_dq` (vision-owned, sized
+    /// for the largest projection at load). The dequant kernels reproduce
+    /// the host expansion's bytes exactly.
+    pub(super) fn vit_weight_ptr(
+        &self,
+        gpu: &dyn GpuBackend,
+        w: &super::super::VitWeight,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        match *w {
+            super::super::VitWeight::Bf16(p) => Ok(p),
+            super::super::VitWeight::Mxfp8(p) => {
+                let chunks = u64::from(p.n) * u64::from(p.k / 16);
+                anyhow::ensure!(
+                    chunks.div_ceil(256) <= u64::from(u32::MAX),
+                    "vit weight {n}x{k} too large for one dequant grid",
+                    n = p.n,
+                    k = p.k
+                );
+                KernelLaunch::new(gpu, self.k_mx8_dq)
+                    .grid([chunks.div_ceil(256) as u32, 1, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(p.w.data)
+                    .arg_ptr(p.w.scales)
+                    .arg_ptr(self.buf_vit_dq)
+                    .arg_u32(p.n)
+                    .arg_u32(p.k)
+                    .launch(stream)?;
+                Ok(self.buf_vit_dq)
+            }
+            super::super::VitWeight::Nvfp4 {
+                packed,
+                scales,
+                global,
+                n,
+                k,
+            } => {
+                crate::layers::ops::dequant_nvfp4_to_bf16(
+                    gpu,
+                    self.k_nvfp4_dq,
+                    packed,
+                    scales,
+                    self.buf_vit_dq,
+                    global,
+                    n,
+                    k,
+                    stream,
+                )?;
+                Ok(self.buf_vit_dq)
+            }
+        }
+    }
+
     /// ViT GEMM with bias: C[m,n] = A[m,k] @ B[n,k]^T + bias[n] (BF16).
     /// Prefers the tensor-core `dense_gemm_bf16_pipelined` (~40× the scalar
     /// `vision_gemm_bias` on the ViT's large-M shapes) + a fused bias-add; falls
@@ -204,7 +258,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_h1,
-            blk.qkv_w,
+            self.vit_weight_ptr(gpu, &blk.qkv_w, stream)?,
             blk.qkv_b,
             self.buf_wide,
             p32,
@@ -245,7 +299,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_h1,
-            blk.proj_w,
+            self.vit_weight_ptr(gpu, &blk.proj_w, stream)?,
             blk.proj_b,
             self.buf_wide,
             p32,
@@ -294,7 +348,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_h1,
-            blk.fc1_w,
+            self.vit_weight_ptr(gpu, &blk.fc1_w, stream)?,
             blk.fc1_b,
             self.buf_wide,
             p32,
@@ -313,7 +367,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_wide,
-            blk.fc2_w,
+            self.vit_weight_ptr(gpu, &blk.fc2_w, stream)?,
             blk.fc2_b,
             self.buf_h1,
             p32,
@@ -376,7 +430,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_h1,
-            blk.qkv_w,
+            self.vit_weight_ptr(gpu, &blk.qkv_w, stream)?,
             blk.qkv_b,
             self.buf_wide,
             pt,
@@ -425,7 +479,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_h1,
-            blk.proj_w,
+            self.vit_weight_ptr(gpu, &blk.proj_w, stream)?,
             blk.proj_b,
             self.buf_wide,
             pt,
@@ -474,7 +528,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_h1,
-            blk.fc1_w,
+            self.vit_weight_ptr(gpu, &blk.fc1_w, stream)?,
             blk.fc1_b,
             self.buf_wide,
             pt,
@@ -493,7 +547,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_wide,
-            blk.fc2_w,
+            self.vit_weight_ptr(gpu, &blk.fc2_w, stream)?,
             blk.fc2_b,
             self.buf_h1,
             pt,

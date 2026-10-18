@@ -42,19 +42,18 @@ const CSF_FIXED: &str = ".nvfp4_csf_fixed";
 const CSF_EXCEPTIONS: &str = ".nvfp4_csf_exceptions";
 
 /// Modules whose weight/scale pair the loader must defer for host expansion:
-/// every `MXFP8` entry of the ModelOpt `quantized_layers` map, and NVFP4
-/// entries of the vision tower (which runs BF16). Empty for any other pack.
+/// every `MXFP8` entry of the ModelOpt `quantized_layers` map. NVFP4 modules
+/// — trunk experts, MTP and, since the vision tower went native, ALL of
+/// `model.visual.*` — keep their own dequant paths. Empty for any other pack.
 pub fn host_decode_modules(config: &ModelConfig) -> HashSet<String> {
     let Some(qc) = config.quantization_config.as_ref() else {
         return HashSet::new();
     };
     qc.quantized_layers
         .iter()
-        .filter(|(path, spec)| {
+        .filter(|(_path, spec)| {
             let algo = spec.quant_algo.to_ascii_uppercase();
             algo == "MXFP8"
-                || (path.starts_with("model.visual.")
-                    && atlas_core::config::is_nvfp4_quant_algo(&algo))
         })
         .map(|(path, _)| path.clone())
         .collect()
@@ -79,8 +78,12 @@ pub fn native_mxfp8(module: &str) -> bool {
         ".mlp.shared_expert.up_proj",
         ".mlp.shared_expert.down_proj",
     ];
-    module.starts_with("model.language_model.layers.")
-        && NATIVE.iter().any(|suffix| module.ends_with(suffix))
+    (module.starts_with("model.language_model.layers.")
+        && NATIVE.iter().any(|suffix| module.ends_with(suffix)))
+    // The vision tower's MXFP8 attention projections upload as shipped and
+    // dequant on-GPU into the encoder's BF16 scratch.
+    || (module.starts_with("model.visual.")
+        && (module.ends_with(".attn.qkv") || module.ends_with(".attn.proj")))
 }
 
 /// What [`materialize`] did, for the load log and for tests.

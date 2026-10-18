@@ -147,6 +147,26 @@ impl VisionEncoder {
         let buf_scores = gpu.alloc(attn_max * attn_max * 4)?; // [seq, seq] f32
         let buf_probs = gpu.alloc(attn_max * attn_max * 2)?; // [seq, seq] bf16
         let buf_o_stage = gpu.alloc(p_max * head_dim * 2)?; // [seq, D] bf16
+        // Weight-dequant scratch: the largest quantized projection's BF16
+        // expansion (~10 MB for fc1 [4304,1152]). Owned by the encoder; never
+        // aliased with LM scratch.
+        let max_w_bytes = blocks
+            .iter()
+            .flat_map(|b| [b.qkv_w, b.proj_w, b.fc1_w, b.fc2_w])
+            .chain(
+                deepstack
+                    .iter()
+                    .flat_map(|m| [m.fc1_w, m.fc2_w])
+                    .chain([merger.fc1_w, merger.fc2_w]),
+            )
+            .map(|w| w.bf16_bytes())
+            .max()
+            .unwrap_or(0);
+        let buf_vit_dq = if max_w_bytes > 0 {
+            gpu.alloc(max_w_bytes)?
+        } else {
+            DevicePtr::NULL
+        };
 
         // Download pos_embed weight to host as f32 so we can bilinear-
         // interpolate it per image (HF: `fast_pos_embed_interpolate`).
@@ -207,6 +227,15 @@ impl VisionEncoder {
             k_merge: gpu.kernel("vision_encoder", "vision_spatial_merge")?,
             k_f32_bf16: gpu.kernel("vision_encoder", "vision_f32_to_bf16")?,
             k_copy: gpu.kernel("vision_encoder", "vision_bf16_copy")?,
+            // Dequants for checkpoint-native quantized ViT projections.
+            // SOFT: absent on vision trees without them (then every weight
+            // is Bf16 and they are never launched).
+            k_nvfp4_dq: crate::layers::try_kernel(
+                gpu,
+                "dequant_nvfp4_bf16",
+                "dequant_nvfp4_to_bf16",
+            ),
+            k_mx8_dq: crate::layers::try_kernel(gpu, "mxfp8_proj", "mxfp8_proj_dequant"),
             hidden_size,
             num_heads,
             head_dim,
@@ -231,6 +260,7 @@ impl VisionEncoder {
             buf_scores,
             buf_probs,
             buf_o_stage,
+            buf_vit_dq,
             pos_embed_host_f32,
             rope_inv_freq,
         })
@@ -257,9 +287,9 @@ impl VisionEncoder {
             merger: MergerLayer {
                 norm_w: DevicePtr::NULL,
                 norm_b: DevicePtr::NULL,
-                fc1_w: DevicePtr::NULL,
+                fc1_w: super::super::VitWeight::Bf16(DevicePtr::NULL),
                 fc1_b: DevicePtr::NULL,
-                fc2_w: DevicePtr::NULL,
+                fc2_w: super::super::VitWeight::Bf16(DevicePtr::NULL),
                 fc2_b: DevicePtr::NULL,
             },
             k_gemm: KernelHandle(0),
@@ -276,6 +306,8 @@ impl VisionEncoder {
             k_merge: KernelHandle(0),
             k_f32_bf16: KernelHandle(0),
             k_copy: KernelHandle(0),
+            k_nvfp4_dq: KernelHandle(0),
+            k_mx8_dq: KernelHandle(0),
             hidden_size: config.hidden_size,
             num_heads: config.num_heads,
             head_dim: config.hidden_size / config.num_heads,
@@ -288,6 +320,7 @@ impl VisionEncoder {
             buf_h1: DevicePtr::NULL,
             buf_h2: DevicePtr::NULL,
             buf_wide: DevicePtr::NULL,
+            buf_vit_dq: DevicePtr::NULL,
             buf_merge_in: DevicePtr::NULL,
             buf_merge_fc1: DevicePtr::NULL,
             buf_out: glm_buf_out,
