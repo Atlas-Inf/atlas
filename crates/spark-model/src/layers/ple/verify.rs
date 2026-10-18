@@ -202,6 +202,33 @@ impl PleLayer {
                 // produced garbage input embeddings.
                 DevicePtr(va)
             }
+            #[cfg(feature = "cuda")]
+            NgramTable::ResidentNvfp4 {
+                rows,
+                row_base,
+                rows_total,
+                ..
+            } => {
+                // Fully resident packed table: the "slot" IS `row - row_base`
+                // (row_base 0 today), uploaded as u32 like the `Bf16` arm.
+                let bytes: Vec<u8> = ids
+                    .iter()
+                    .map(|r| {
+                        let (base, total) = (*row_base, *rows_total);
+                        anyhow::ensure!(
+                            *r >= base && *r < base + total,
+                            "PLE resident: row id {r} outside [{base}, {})",
+                            base + total
+                        );
+                        Ok((*r - base) as u32)
+                    })
+                    .collect::<Result<Vec<u32>>>()?
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                gpu.copy_h2d_async(&bytes, self.slots_dev, stream)?;
+                *rows
+            }
             NgramTable::Bf16(w) => {
                 // Fully resident table (small fixtures / tests): the "slot" IS
                 // the row id, so upload the ids truncated to u32.

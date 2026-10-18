@@ -376,6 +376,8 @@ impl NgramRowCache {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub mod resident;
 /// The decide+fault cluster (`resolve`, `prefetch`, `resolve_inner`,
 /// `drop_reservations`, `fetch_many`, `end_batch`, `victim`) — split out for
 /// the ≤500 LoC cap.

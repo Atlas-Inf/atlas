@@ -154,6 +154,14 @@ impl PleLayer {
                 gather_matches_element_size(stride, head_dim, scaled)?;
             }
         }
+        #[cfg(feature = "cuda")]
+        if let NgramTable::ResidentNvfp4 { .. } = &table {
+            anyhow::ensure!(
+                nvfp4.is_some(),
+                "PLE: the resident table is the NVFP4 U8 pack; this checkpoint \
+                 has no NVFP4 n-gram geometry"
+            );
+        }
         let is_nvfp4 = nvfp4.is_some();
         Ok(Self {
             dims,
@@ -186,6 +194,8 @@ impl PleLayer {
             block_scale_va: match &table {
                 #[cfg(feature = "cuda")]
                 NgramTable::Cached(c) => c.block_scale_dev_va()?,
+                #[cfg(feature = "cuda")]
+                NgramTable::ResidentNvfp4 { scales, .. } => Some(scales.0),
                 _ => None,
             },
             trellis,
