@@ -134,3 +134,31 @@ fn remove_of_reclaimed_tensor_reports_it_and_release_does_not_double_free() {
     );
     assert!(gpu.read_alloc(b_ptr).is_none(), "b was freed at release");
 }
+
+#[test]
+fn deferred_tensor_reads_its_bytes_and_undefers() {
+    let dir = std::env::temp_dir().join(format!("atlas-defer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shard.bin");
+    // 5 junk header bytes, then a [2, 3] U32 tensor.
+    let mut bytes = vec![0xAAu8; 5];
+    for v in 0u32..6 {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let d = DeferredTensor {
+        path: path.clone(),
+        offset: 5,
+        shape: vec![2, 3],
+        dtype: WeightDtype::Int32,
+    };
+    assert_eq!(d.byte_len().unwrap(), 24);
+    assert_eq!(d.read_bytes().unwrap(), bytes[5..]);
+
+    let mut store = WeightStore::empty();
+    store.defer("x.nvfp4_csf_exceptions".into(), d);
+    assert!(store.undefer("x.nvfp4_csf_exceptions").is_some());
+    assert!(store.deferred("x.nvfp4_csf_exceptions").is_none());
+    assert!(store.undefer("x.nvfp4_csf_exceptions").is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}

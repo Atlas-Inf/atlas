@@ -28,7 +28,7 @@ mod direct_io;
 mod header;
 mod shard;
 
-use header::resolve_shards;
+use header::{resolve_shards, tensors_routed_to};
 
 /// Run `f` over `len` bytes at `start` within a deferred tensor, read with
 /// `O_DIRECT` when the filesystem allows it (so the bytes never sit in the
@@ -141,6 +141,12 @@ pub struct FastSafetensorsLoader {
     /// packed weights and block scales, which the model loader reads from
     /// disk as this rank's slice (see `should_defer_tensor`).
     pub expert_tp: bool,
+    /// Modules whose `.weight` and `.weight_scale` are stored in a format the
+    /// kernels do not read (MXFP8, or NVFP4 in a tower that runs BF16). They
+    /// are DEFERRED — located, not uploaded — and the model build expands
+    /// them on the host, so the originals never occupy device memory. CSF
+    /// scale streams are deferred regardless of this list.
+    pub host_decode_modules: std::collections::HashSet<String>,
 }
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
@@ -176,6 +182,7 @@ impl FastSafetensorsLoader {
             prefetch_shards: false,
             demand_paged_patterns: Vec::new(),
             expert_tp: false,
+            host_decode_modules: std::collections::HashSet::new(),
         }
     }
 
@@ -197,6 +204,7 @@ impl FastSafetensorsLoader {
             prefetch_shards: false,
             demand_paged_patterns: Vec::new(),
             expert_tp: false,
+            host_decode_modules: std::collections::HashSet::new(),
         }
     }
 }
@@ -269,12 +277,9 @@ impl WeightLoader for FastSafetensorsLoader {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            let tensor_filter: Option<Vec<String>> = tensor_to_shard.as_ref().map(|map| {
-                map.iter()
-                    .filter(|(_, s)| *s == shard_name)
-                    .map(|(t, _)| t.clone())
-                    .collect()
-            });
+            let tensor_filter: Option<Vec<String>> = tensor_to_shard
+                .as_ref()
+                .map(|map| tensors_routed_to(map, model_dir, shard_path));
 
             tracing::info!(
                 "Fast-loading shard {}/{}: {}{}",
@@ -375,6 +380,32 @@ mod expert_filter_tests {
         loader.replicated_expert_prefix = Some(".layers.45.".into());
         assert!(!loader.should_skip_tensor(appended));
         assert!(loader.should_skip_tensor(target));
+    }
+
+    /// FP4-Local: CSF streams and listed MXFP8 modules are located, not
+    /// uploaded; their scalar siblings and every other tensor load as usual.
+    #[test]
+    fn host_decoded_tensors_are_deferred() {
+        let mut loader = FastSafetensorsLoader::new();
+        let attn = "model.language_model.layers.3.self_attn.q_proj";
+        loader.host_decode_modules.insert(attn.to_string());
+        let expert = "model.language_model.layers.0.mlp.experts.3.down_proj";
+        for name in [
+            format!("{attn}.weight"),
+            format!("{attn}.weight_scale"),
+            format!("{expert}.weight_scale.nvfp4_csf_fixed"),
+            format!("{expert}.weight_scale.nvfp4_csf_exceptions"),
+        ] {
+            assert!(loader.should_defer_tensor(&name), "{name}");
+        }
+        for name in [
+            format!("{expert}.weight"),
+            format!("{expert}.weight_scale_2"),
+            format!("{attn}.weight_scale_2"),
+            "model.language_model.layers.3.self_attn.k_proj.weight".to_string(),
+        ] {
+            assert!(!loader.should_defer_tensor(&name), "{name}");
+        }
     }
 
     #[test]

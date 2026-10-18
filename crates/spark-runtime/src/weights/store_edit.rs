@@ -53,6 +53,12 @@ impl WeightStore {
         Some(tensor)
     }
 
+    /// Take a deferred tensor's locator out of the store, once a build step
+    /// has consumed it (so later passes over `deferred_sorted` never see it).
+    pub fn undefer(&mut self, name: &str) -> Option<DeferredTensor> {
+        self.deferred.remove(name)
+    }
+
     /// True if this name's tensor memory was already freed by
     /// [`reclaim`](Self::reclaim) (its map entry may still exist). Call this
     /// before [`remove`](Self::remove) to decide whether the returned buffer must be freed.
@@ -64,5 +70,37 @@ impl WeightStore {
             .lock()
             .map(|s| s.contains(&ptr))
             .unwrap_or(false)
+    }
+}
+
+impl DeferredTensor {
+    /// On-disk byte length: element count times the element size. Packed
+    /// formats with no per-element size (`PackedQ2_0`) are never deferred.
+    pub fn byte_len(&self) -> Result<usize> {
+        let elem = self.dtype.byte_size();
+        if elem == 0 {
+            bail!(
+                "deferred tensor dtype {:?} has no fixed element size",
+                self.dtype
+            );
+        }
+        Ok(self.shape.iter().product::<usize>() * elem)
+    }
+
+    /// Read the tensor's raw bytes from its shard with one positioned read.
+    pub fn read_bytes(&self) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let len = self.byte_len()?;
+        let mut file = std::fs::File::open(&self.path)?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf).map_err(|e| {
+            anyhow::anyhow!(
+                "reading {len} bytes at {} from {}: {e}",
+                self.offset,
+                self.path.display()
+            )
+        })?;
+        Ok(buf)
     }
 }
