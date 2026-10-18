@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -114,63 +115,95 @@ struct AtlasSubClass { std::vector<AtlasSubChunk> free; size_t slabs = 0; };
 static std::mutex g_sub_mu;
 static std::unordered_map<size_t, AtlasSubClass> g_sub_classes;   // chunk size -> class
 static std::unordered_map<void*, AtlasSubSlab*> g_sub_owner;      // live chunk -> slab
-static std::unordered_map<void*, AtlasSubSlab*> g_sub_slabs;      // slab base -> slab
+static std::map<char*, AtlasSubSlab*> g_sub_slabs;                // slab base -> slab (range lookup)
+
+// The slab whose 64 MiB range holds p, live chunk or not. Caller holds g_sub_mu.
+static AtlasSubSlab* atlas_sub_slab_of(void* p) {
+    auto it = g_sub_slabs.upper_bound((char*)p);
+    if (it == g_sub_slabs.begin()) return nullptr;
+    --it;
+    return ((char*)p < it->first + kSubSlab) ? it->second : nullptr;
+}
 
 // 0 on success; nonzero means "not handled, use plain hipMalloc".
 static int atlas_suballoc(void** out, size_t n) {
     const size_t sz = (n + 255) & ~(size_t)255;
-    std::lock_guard<std::mutex> lk(g_sub_mu);
-    AtlasSubClass& c = g_sub_classes[sz];
-    if (c.free.empty()) {
-        void* base = nullptr;
-        if (hipMalloc(&base, kSubSlab) != hipSuccess || !base) return 1;
-        atlas_track_alloc(base, kSubSlab);
-        auto* s = new AtlasSubSlab{(char*)base, sz, (unsigned)(kSubSlab / sz), 0};
-        g_sub_slabs[base] = s;
-        for (unsigned i = s->cap; i-- > 0;) c.free.push_back({s->base + (size_t)i * sz, s});
-        if (c.slabs++ == 0) {
-            fprintf(stderr, "[suballoc] %zu B requests -> %u per 64 MiB slab (driver would commit %zu B each)\n",
-                    n, s->cap, atlas_driver_rounded(n));
+    bool first_slab = false;
+    unsigned cap = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_sub_mu);
+        AtlasSubClass& c = g_sub_classes[sz];
+        if (c.free.empty()) {
+            void* base = nullptr;
+            if (hipMalloc(&base, kSubSlab) != hipSuccess || !base) return 1;
+            atlas_track_alloc(base, kSubSlab);
+            auto* s = new AtlasSubSlab{(char*)base, sz, (unsigned)(kSubSlab / sz), 0};
+            g_sub_slabs[s->base] = s;
+            for (unsigned i = s->cap; i-- > 0;) c.free.push_back({s->base + (size_t)i * sz, s});
+            first_slab = c.slabs++ == 0;
+            cap = s->cap;
         }
+        AtlasSubChunk ch = c.free.back();
+        c.free.pop_back();
+        ch.slab->live++;
+        g_sub_owner[ch.p] = ch.slab;
+        *out = ch.p;
     }
-    AtlasSubChunk ch = c.free.back();
-    c.free.pop_back();
-    ch.slab->live++;
-    g_sub_owner[ch.p] = ch.slab;
-    *out = ch.p;
+    if (first_slab) {
+        fprintf(stderr, "[suballoc] %zu B requests -> %u per 64 MiB slab (driver would commit %zu B each)\n",
+                n, cap, atlas_driver_rounded(n));
+    }
     return 0;
 }
 
-// true if p was a sub-allocated chunk (now freed); false means "plain hipFree".
+// true if p lies in a slab (freed here, or a repeated free of one that is
+// already free); false means "not ours, plain hipFree". A slab-interior
+// pointer must never reach hipFree.
 //
 // hipFree (like cuMemFree) synchronizes the device before releasing memory, and
-// callers may free a buffer that a kernel still in flight is reading. A chunk
-// goes straight back on a free list for the next same-size request, so keep
-// that guarantee explicitly: synchronize before the chunk becomes reusable.
+// callers may free a buffer that a kernel still in flight is reading. So the
+// chunk leaves g_sub_owner first (a concurrent or repeated free of it now
+// finds no owner and is refused), the device is synchronized with no lock
+// held, and only then does the chunk go back on its free list for reuse.
 static bool atlas_subfree(void* p) {
+    AtlasSubSlab* s = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_sub_mu);
-        if (g_sub_owner.find(p) == g_sub_owner.end()) return false;
+        auto it = g_sub_owner.find(p);
+        if (it == g_sub_owner.end()) {
+            if (!atlas_sub_slab_of(p)) return false;
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "[suballoc] free of %p: not a live chunk (repeated free); ignored\n", p);
+            }
+            return true;
+        }
+        s = it->second;
+        g_sub_owner.erase(it);
     }
-    hipDeviceSynchronize();
-    std::lock_guard<std::mutex> lk(g_sub_mu);
-    auto it = g_sub_owner.find(p);
-    if (it == g_sub_owner.end()) return true;  // a concurrent double free: already released
-    AtlasSubSlab* s = it->second;
-    g_sub_owner.erase(it);
-    AtlasSubClass& c = g_sub_classes[s->sz];
-    c.free.push_back({p, s});
-    if (--s->live == 0 && c.free.size() >= 2 * (size_t)s->cap) {
-        std::vector<AtlasSubChunk> keep;
-        keep.reserve(c.free.size() - s->cap);
-        for (const AtlasSubChunk& q : c.free) if (q.slab != s) keep.push_back(q);
-        c.free.swap(keep);
-        c.slabs--;
-        g_sub_slabs.erase(s->base);
-        atlas_track_free(s->base);
-        hipFree(s->base);
-        delete s;
+    hipError_t se = hipDeviceSynchronize();
+    if (se != hipSuccess) {
+        fprintf(stderr, "[suballoc] hipDeviceSynchronize before chunk reuse failed: %d\n", (int)se);
     }
+    char* release = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_sub_mu);
+        AtlasSubClass& c = g_sub_classes[s->sz];
+        c.free.push_back({p, s});
+        if (--s->live == 0 && c.free.size() >= 2 * (size_t)s->cap) {
+            std::vector<AtlasSubChunk> keep;
+            keep.reserve(c.free.size() - s->cap);
+            for (const AtlasSubChunk& q : c.free) if (q.slab != s) keep.push_back(q);
+            c.free.swap(keep);
+            c.slabs--;
+            g_sub_slabs.erase(s->base);
+            atlas_track_free(s->base);
+            release = s->base;
+            delete s;
+        }
+    }
+    if (release) hipFree(release);
     return true;
 }
 
