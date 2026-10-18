@@ -625,8 +625,10 @@ pub enum StartPrefillResult {
 //  - `a.param_body_chars_emitted` ++ per non-close body token
 //  - `a.finished`                 forced when stuck >MAX_TOOL_BODY_TOKENS
 //
-// Token IDs are Qwen3.6 byte-level BPE (verified via /tokenize 2026-05-25):
-//   27 = `<`, 28 = `=`, 29 = `>`, 510 = `</`, 15704 = `parameter`.
+// Token ids are the SERVED tokenizer's (`tool_markers`), resolved at load:
+// Qwen3.6/3.8 `<`=27 `=`=28 `>`=29 `</`=510 `parameter`=15704; Nemotron 3.5
+// Super VL `<`=1060 `=`=1061 `>`=1062 (and `>\n`=1561) `</`=1885
+// `parameter`=31960. They used to be hard-coded to Qwen's.
 
 /// Cap on tool-call ENVELOPE tokens (everything inside `<tool_call>…</tool_call>`
 /// that is NOT a parameter-value body). Catches a model that opens `<tool_call>`
@@ -669,6 +671,13 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     if !a.inside_tool_body {
         return;
     }
+    // Without the served tokenizer's markers the value body cannot be told
+    // from the envelope, and counting file content as envelope kills large
+    // writes at MAX_TOOL_BODY_TOKENS. Leave both the tracking and the cap off;
+    // `--tool-max-tokens` still bounds a runaway envelope.
+    let Some(m) = super::tool_markers::get() else {
+        return;
+    };
     // CC6 (2026-06-07): count ONLY envelope tokens — tokens of a
     // `<parameter=…>` VALUE (the file content of a `write` call) are exempt,
     // so a legitimately large single-file Write streams without tripping the
@@ -690,12 +699,6 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         a.finished = true;
     }
 
-    const TOK_LT: u32 = 27;
-    const TOK_PARAMETER: u32 = 15704;
-    const TOK_EQ: u32 = 28;
-    const TOK_GT: u32 = 29;
-    const TOK_LT_SLASH: u32 = 510;
-
     if a.inside_parameter_body {
         // P0-1 (2026-07-09): PROVISIONAL close detection. The old code
         // exited the body on ANY `</` token (510) — but since the
@@ -713,7 +716,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         // next exact close still exits.
         match a.param_close_pending {
             0 => {
-                if tok == TOK_LT_SLASH {
+                if tok == m.lt_slash {
                     a.param_close_pending = 1;
                 } else {
                     // Any non-close body token advances the counter. The
@@ -724,7 +727,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
                 }
             }
             1 => {
-                if tok == TOK_PARAMETER {
+                if tok == m.parameter {
                     a.param_close_pending = 2;
                 } else {
                     // `</` was value content (e.g. `</div>`), not a close.
@@ -734,7 +737,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
             }
             _ => {
                 a.param_close_pending = 0;
-                if tok == TOK_GT {
+                if m.is_gt(tok) {
                     // Confirmed `</parameter>` — exit body. Also reset the
                     // envelope streak: a confirmed close IS forward progress
                     // (the doc comment above always claimed this reset; the
@@ -756,7 +759,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     // Not yet inside_parameter_body: scan for `<parameter=KEY>` opener
     // ending at this `>` (29). Lookback 8 tokens for `[27, 15704, 28]`
     // signature without an intervening close.
-    if tok != TOK_GT {
+    if !m.is_gt(tok) {
         return;
     }
     // Auto-detect whether `tok` is already in output_tokens (caller
@@ -776,7 +779,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     let window = &a.output_tokens[start..n_for_lookback];
     let mut sig_idx: Option<usize> = None;
     for i in 0..window.len().saturating_sub(2) {
-        if window[i] == TOK_LT && window[i + 1] == TOK_PARAMETER && window[i + 2] == TOK_EQ {
+        if window[i] == m.lt && window[i + 1] == m.parameter && window[i + 2] == m.eq {
             sig_idx = Some(i + 3);
         }
     }
@@ -786,7 +789,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     let body_segment = &window[after_eq..];
     let intervening_close = body_segment
         .iter()
-        .any(|&t| t == TOK_LT_SLASH || t == TOK_GT);
+        .any(|&t| t == m.lt_slash || m.is_gt(t));
     if !intervening_close {
         a.inside_parameter_body = true;
         a.param_body_chars_emitted = 0;

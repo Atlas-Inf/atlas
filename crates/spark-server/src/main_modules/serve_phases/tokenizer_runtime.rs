@@ -287,6 +287,19 @@ pub(crate) fn resolve_tokenizer_runtime(
     if let Some(tid) = tool_call_end_token {
         tracing::info!("Tool call end token: {} ({})", tid, tc_end_str);
     }
+    // qwen3_coder XML parameter markers for the envelope-stuck guard, from
+    // THIS tokenizer (they were hard-coded to Qwen3.6 ids; Nemotron's differ).
+    let tool_markers = crate::scheduler::tool_markers::ToolMarkers::resolve(|s| {
+        tokenizer.encode(s).ok()
+    });
+    match tool_markers {
+        Some(m) => tracing::info!("Tool parameter markers: {m:?}"),
+        None => tracing::warn!(
+            "Tool parameter markers unresolved for this tokenizer: parameter-value \
+             tracking and the envelope-stuck cap are off (--tool-max-tokens still applies)"
+        ),
+    }
+    crate::scheduler::tool_markers::set(tool_markers);
 
     let grammar_engine = {
         let stop_ids: Vec<i32> = eos_tokens.iter().map(|&id| id as i32).collect();
