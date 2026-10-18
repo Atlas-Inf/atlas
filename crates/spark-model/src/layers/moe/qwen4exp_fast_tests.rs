@@ -288,9 +288,14 @@ fn qwen4exp_moe_fast_hybrid_batched_rows_keep_per_row_routing_blends_and_reducti
             .filter(|c| c.0 == layer.moe_weighted_sum_blend.0)
             .collect();
         let reductions = comm.reductions.lock().unwrap().clone();
+        // Per chunk of <=4 rows the EP tail is ONE batched all-reduce of
+        // `chunk_rows * H` BF16 (then `moe_batched_blend` adds the shared
+        // expert once per row — not inside the per-row blend, which now
+        // blends the zero row so it is not summed once per rank).
+        let chunks = rows.div_ceil(4);
         assert_eq!(
             (topk.len(), blend.len(), reductions.len()),
-            (rows, rows, rows)
+            (rows, rows, chunks)
         );
         let weights = scratch.offset(rows * K * 4);
         for r in 0..rows {
@@ -305,7 +310,9 @@ fn qwen4exp_moe_fast_hybrid_batched_rows_keep_per_row_routing_blends_and_reducti
                 Arg::Ptr(arena.expert_down_out().offset(t * K * H * 2))
             );
             assert_eq!(b[2], Arg::Ptr(weights.offset(r * K * 4)));
-            assert_eq!(b[3], Arg::Ptr(arena.attn_output().offset(t * H * 2)));
+            // Under EP the pre-reduce blend takes the zero row; the shared
+            // expert is added once AFTER the all-reduce.
+            assert_eq!(b[3], Arg::Ptr(arena.expert_gate_out()));
             assert_eq!(b[4], Arg::Ptr(arena.norm_output().offset(r * H * 2)));
             assert!(
                 blend[r].5 > pairs[c].1,
@@ -314,10 +321,17 @@ fn qwen4exp_moe_fast_hybrid_batched_rows_keep_per_row_routing_blends_and_reducti
             if let Some(next) = pairs.get(c + 1) {
                 assert!(blend[r].5 < next.0, "chunk {c} is blended before reuse");
             }
-            // Row r reduces after its blend and before the next one.
-            assert_eq!(reductions[r].0, H * 2);
-            assert!(reductions[r].1 > blend[r].5);
-            assert!(r + 1 == rows || reductions[r].1 <= blend[r + 1].5);
+        }
+        // Chunk c reduces its `min(4, rows - 4c) * H` BF16 after that
+        // chunk's last blend and before the next chunk's first blend.
+        for c in 0..chunks {
+            let chunk_rows = (rows - c * 4).min(4);
+            let last_blend = (c * 4 + chunk_rows - 1).min(rows - 1);
+            assert_eq!(reductions[c].0, chunk_rows * H * 2);
+            assert!(reductions[c].1 > blend[last_blend].5);
+            if c + 1 < chunks {
+                assert!(reductions[c].1 <= blend[(c + 1) * 4].5);
+            }
         }
     }
 }

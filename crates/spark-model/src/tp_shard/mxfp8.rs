@@ -112,3 +112,167 @@ pub fn shard_mxfp8_row_parallel(
     );
     Ok(([data, scales], local_k))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+
+    /// E4M3 (finite only — tests avoid NaN/inf encodings) → f32.
+    fn e4m3(b: u8) -> f32 {
+        let s = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+        let e = (b >> 3) & 0x0f;
+        let m = b & 0x07;
+        let v = if e == 0 {
+            (m as f32 / 8.0) * 2f32.powi(-6)
+        } else {
+            (1.0 + m as f32 / 8.0) * 2f32.powi(e as i32 - 7)
+        };
+        s * v
+    }
+
+    /// Host oracle: dequant an MXFP8 module `data [n,k]` + `scales [n,k/32]`.
+    fn dequant(data: &[u8], scales: &[u8], n: usize, k: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n * k);
+        for r in 0..n {
+            for c in 0..k {
+                let sc = scales[r * (k / 32) + c / 32];
+                out.push(e4m3(data[r * k + c]) * 2f32.powi(sc as i32 - 127));
+            }
+        }
+        out
+    }
+
+    /// Deterministic module bytes: values chosen so no scale group is
+    /// degenerate and a wrong scale column flips results.
+    fn synth_module(n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+        let data: Vec<u8> = (0..n * k).map(|i| ((i * 37 + 11) % 100) as u8).collect();
+        let scales: Vec<u8> = (0..n * (k / 32))
+            .map(|i| (120 + ((i * 13 + 5) % 9)) as u8)
+            .collect();
+        (data, scales)
+    }
+
+    fn upload(gpu: &MockGpuBackend, bytes: &[u8]) -> DevicePtr {
+        let p = gpu.alloc(bytes.len()).unwrap();
+        gpu.copy_h2d(bytes, p).unwrap();
+        p
+    }
+
+    fn fetch(gpu: &MockGpuBackend, p: DevicePtr, bytes: usize) -> Vec<u8> {
+        let mut v = vec![0u8; bytes];
+        gpu.copy_d2h(p, &mut v).unwrap();
+        v
+    }
+
+    #[test]
+    fn column_shard_offsets_match_host_slice() {
+        let gpu = MockGpuBackend::new();
+        let (n, k) = (8usize, 128usize);
+        let (data, scales) = synth_module(n, k);
+        let src = [upload(&gpu, &data), upload(&gpu, &scales)];
+        for rank in 0..2 {
+            let (l, rows) = shard_mxfp8_rows(src, &[n], k, rank, 2, &gpu).unwrap();
+            assert_eq!(rows, n / 2);
+            let ld = fetch(&gpu, l[0], rows * k);
+            let ls = fetch(&gpu, l[1], rows * (k / 32));
+            let base = rank * (n / 2);
+            assert_eq!(ld, data[base * k..base * k + rows * k]);
+            assert_eq!(ls, scales[base * (k / 32)..base * (k / 32) + rows * (k / 32)]);
+            // dequant(shard) == slice(dequant(full)), element for element.
+            let want = dequant(&data, &scales, n, k);
+            let got = dequant(&ld, &ls, rows, k);
+            assert_eq!(got, want[base * k..base * k + rows * k]);
+        }
+    }
+
+    #[test]
+    fn segmented_shard_slices_each_block_independently() {
+        let gpu = MockGpuBackend::new();
+        let segs = [2usize, 2usize, 4usize];
+        let (n, k) = (8usize, 64usize);
+        let (data, scales) = synth_module(n, k);
+        let src = [upload(&gpu, &data), upload(&gpu, &scales)];
+        let (l, rows) = shard_mxfp8_rows(src, &segs, k, 1, 2, &gpu).unwrap();
+        // rank 1: second half of every segment.
+        let mut want_off = Vec::new();
+        let mut off = 0usize;
+        for &s in &segs {
+            let local = s / 2;
+            want_off.push((off + local) * k);
+            want_off.push((off + local * 2) * k);
+            off += s;
+        }
+        let ld = fetch(&gpu, l[0], rows * k);
+        let mut want = Vec::new();
+        for w in want_off.chunks_exact(2) {
+            want.extend_from_slice(&data[w[0]..w[1]]);
+        }
+        assert_eq!(ld, want);
+    }
+
+    #[test]
+    fn row_parallel_keeps_whole_scale_groups() {
+        let gpu = MockGpuBackend::new();
+        let (n, k) = (4usize, 128usize);
+        let (data, scales) = synth_module(n, k);
+        let src = [upload(&gpu, &data), upload(&gpu, &scales)];
+        for rank in 0..2 {
+            let (l, lk) = shard_mxfp8_row_parallel(src, n, k, rank, 2, &gpu).unwrap();
+            assert_eq!(lk, k / 2);
+            let ld = fetch(&gpu, l[0], n * lk);
+            let ls = fetch(&gpu, l[1], n * (lk / 32));
+            // Build the expected local module on the host: per-row column
+            // slice of data AND of scales, then compare dequants.
+            let mut wd = vec![0u8; n * lk];
+            let mut ws = vec![0u8; n * (lk / 32)];
+            for r in 0..n {
+                wd[r * lk..r * lk + lk]
+                    .copy_from_slice(&data[r * k + rank * lk..r * k + (rank + 1) * lk]);
+                ws[r * (lk / 32)..r * (lk / 32) + lk / 32].copy_from_slice(
+                    &scales[r * (k / 32) + rank * (lk / 32)..r * (k / 32) + (rank + 1) * (lk / 32)],
+                );
+            }
+            assert_eq!(ld, wd);
+            assert_eq!(ls, ws);
+            assert_eq!(dequant(&ld, &ls, n, lk), dequant(&wd, &ws, n, lk));
+        }
+    }
+
+    #[test]
+    fn row_parallel_refuses_misaligned_scale_groups() {
+        let gpu = MockGpuBackend::new();
+        let (n, k) = (4usize, 96usize);
+        let (data, scales) = synth_module(n, k);
+        let src = [upload(&gpu, &data), upload(&gpu, &scales)];
+        // 96/2 = 48, not a multiple of 32 -> scale groups would straddle ranks.
+        assert!(shard_mxfp8_row_parallel(src, n, k, 0, 2, &gpu).is_err());
+        // 64/3 is not integral at all.
+        let (d2, s2) = synth_module(n, 64);
+        let src2 = [upload(&gpu, &d2), upload(&gpu, &s2)];
+        assert!(shard_mxfp8_row_parallel(src2, n, 64, 0, 3, &gpu).is_err());
+    }
+
+    #[test]
+    fn off_by_one_scale_column_fails_dequant_equality() {
+        // Negative control: the same column slice with the scale column
+        // shifted by one must NOT compare equal to a true slice — otherwise
+        // the dequant-equality tests above would pass on a misaligned shard.
+        let (n, k) = (4usize, 128usize);
+        let (data, scales) = synth_module(n, k);
+        let lk = k / 2;
+        let r = 1usize;
+        let mut good_s = vec![0u8; lk / 32];
+        good_s.copy_from_slice(&scales[r * (k / 32) + (lk / 32)..r * (k / 32) + 2 * (lk / 32)]);
+        let mut bad_s = good_s.clone();
+        bad_s.copy_from_slice(&scales[r * (k / 32) + (lk / 32) + 1..r * (k / 32) + (lk / 32) + 3]);
+        let d = &data[r * k + lk..r * k + 2 * lk];
+        let mut good = Vec::new();
+        let mut bad = Vec::new();
+        for c in 0..lk {
+            good.push(e4m3(d[c]) * 2f32.powi(good_s[c / 32] as i32 - 127));
+            bad.push(e4m3(d[c]) * 2f32.powi(bad_s[c / 32] as i32 - 127));
+        }
+        assert_ne!(good, bad);
+    }
+}
