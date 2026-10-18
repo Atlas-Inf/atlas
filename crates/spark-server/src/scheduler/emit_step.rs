@@ -625,10 +625,10 @@ pub enum StartPrefillResult {
 //  - `a.param_body_chars_emitted` ++ per non-close body token
 //  - `a.finished`                 forced when stuck >MAX_TOOL_BODY_TOKENS
 //
-// Token ids are the SERVED tokenizer's (`tool_markers`), resolved at load:
-// Qwen3.6/3.8 `<`=27 `=`=28 `>`=29 `</`=510 `parameter`=15704; Nemotron 3.5
-// Super VL `<`=1060 `=`=1061 `>`=1062 (and `>\n`=1561) `</`=1885
-// `parameter`=31960. They used to be hard-coded to Qwen's.
+// Marker tokens are CLASSES of the served tokenizer (`tool_markers`), built at
+// load from decoded vocabulary text: `<` (leading whitespace allowed),
+// `parameter`, starts-with `=` (`=`, `=new`, `=file`), starts-with `>` (`>`,
+// `>\n`), ends-with `</` (`</`, `.</`). They used to be five exact Qwen3.6 ids.
 
 /// Cap on tool-call ENVELOPE tokens (everything inside `<tool_call>…</tool_call>`
 /// that is NOT a parameter-value body). Catches a model that opens `<tool_call>`
@@ -716,7 +716,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         // next exact close still exits.
         match a.param_close_pending {
             0 => {
-                if tok == m.lt_slash {
+                if m.is_lt_slash(tok) {
                     a.param_close_pending = 1;
                 } else {
                     // Any non-close body token advances the counter. The
@@ -727,7 +727,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
                 }
             }
             1 => {
-                if tok == m.parameter {
+                if m.is_parameter(tok) {
                     a.param_close_pending = 2;
                 } else {
                     // `</` was value content (e.g. `</div>`), not a close.
@@ -779,7 +779,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     let window = &a.output_tokens[start..n_for_lookback];
     let mut sig_idx: Option<usize> = None;
     for i in 0..window.len().saturating_sub(2) {
-        if window[i] == m.lt && window[i + 1] == m.parameter && window[i + 2] == m.eq {
+        if m.is_lt(window[i]) && m.is_parameter(window[i + 1]) && m.is_eq_start(window[i + 2]) {
             sig_idx = Some(i + 3);
         }
     }
@@ -787,7 +787,9 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     // Check no intervening `</` or `>` in the KEY span between
     // `<parameter=` and the current `>`.
     let body_segment = &window[after_eq..];
-    let intervening_close = body_segment.iter().any(|&t| t == m.lt_slash || m.is_gt(t));
+    let intervening_close = body_segment
+        .iter()
+        .any(|&t| m.is_lt_slash(t) || m.is_gt(t));
     if !intervening_close {
         a.inside_parameter_body = true;
         a.param_body_chars_emitted = 0;

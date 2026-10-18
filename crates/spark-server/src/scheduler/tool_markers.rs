@@ -1,163 +1,266 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Token ids of the qwen3_coder XML parameter markers (`<`, `=`, `>`, `</`,
-//! `parameter`) for the tokenizer being served.
+//! Which tokens of the served tokenizer can make up the qwen3_coder XML
+//! parameter markers (`<parameter=KEY>`, `</parameter>`).
 //!
 //! `emit_step::update_tool_param_state` tracks whether generation is inside a
 //! `<parameter=KEY>` VALUE, whose tokens are exempt from the 1024-token
-//! envelope-stuck cap. It used to compare against Qwen3.6 BPE ids
-//! (27/28/29/510/15704). Nemotron 3.5 Super VL serves the same XML tool format
-//! with its own tokenizer (`<`=1060, `=`=1061, `>`=1062, `</`=1885,
-//! `parameter`=31960, and `>\n` merged into one token, 1561), so the value
-//! body was never recognised: every file-content token counted as envelope,
-//! any argument past 1024 tokens tripped `tool_envelope_stuck`, and the
-//! client got a salvaged fragment (`</parameter`) instead of the file.
+//! envelope-stuck cap. It used to compare against five exact Qwen3.6 BPE ids
+//! (`<` 27, `=` 28, `>` 29, `</` 510, `parameter` 15704). That failed twice:
 //!
-//! The ids are resolved from the tokenizer whenever one is loaded (startup and
-//! model swap) and read here. A tokenizer that does not encode a marker as one
-//! token resolves to `None`, and the guard then stays off rather than
-//! misfiring: `--tool-max-tokens` still bounds a runaway envelope.
+//! * Nemotron 3.5 Super VL serves the same XML format with its own tokenizer
+//!   (`<` 1060, `=` 1061, `>` 1062, `</` 1885, `parameter` 31960), so a value
+//!   was never recognised and any argument past 1024 tokens was cut
+//!   (`tool_envelope_stuck`; the client saw a salvaged `</parameter`).
+//! * Even on Qwen, BPE merges the `=` into the key's first sub-word for common
+//!   keys (`=file` `_path`, `=re` `placements`, `=new` `_str`), so those
+//!   values were never recognised either. Nemotron also merges `>` with the
+//!   newline (`>\n` 1561), and both merge punctuation into the close (`.</`).
+//!
+//! So the markers are token CLASSES, built once per tokenizer from the decoded
+//! text of every vocabulary entry: an opening `<` (leading whitespace allowed),
+//! `parameter`, a token starting with `=`, one starting with `>`, and one
+//! ending with `</`. They are installed whenever a tokenizer is loaded
+//! (`tokenizer_runtime`, startup and model swap) and read by the guard. A
+//! tokenizer missing any class resolves to `None`, and the tracking and cap
+//! stay off rather than misfire (`--tool-max-tokens` still bounds a runaway
+//! envelope). Until a tokenizer installs its own, the slot holds the five ids
+//! the guard was hard-coded to, so a caller that never loads one sees the old
+//! behaviour.
 
-#[cfg(not(test))]
-use std::sync::RwLock;
+use std::sync::Arc;
 
-/// The marker ids for one tokenizer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The marker token classes for one tokenizer (each a sorted id list).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolMarkers {
-    pub lt: u32,
-    pub eq: u32,
-    /// `>` alone, plus `>\n` / `>\n\n` where the tokenizer merges them into
-    /// one token (Nemotron does; Qwen does not).
-    pub gt: [Option<u32>; 3],
-    pub lt_slash: u32,
-    pub parameter: u32,
+    lt: Vec<u32>,
+    parameter: Vec<u32>,
+    eq_start: Vec<u32>,
+    gt_start: Vec<u32>,
+    lt_slash_end: Vec<u32>,
+}
+
+fn has(set: &[u32], tok: u32) -> bool {
+    set.binary_search(&tok).is_ok()
 }
 
 impl ToolMarkers {
+    pub fn is_lt(&self, tok: u32) -> bool {
+        has(&self.lt, tok)
+    }
+    pub fn is_parameter(&self, tok: u32) -> bool {
+        has(&self.parameter, tok)
+    }
+    /// `=`, or `=` merged with the start of the key (`=new`, `=file`).
+    pub fn is_eq_start(&self, tok: u32) -> bool {
+        has(&self.eq_start, tok)
+    }
+    /// `>`, or `>` merged with what follows (`>\n`, `>\n\n`).
     pub fn is_gt(&self, tok: u32) -> bool {
-        self.gt.contains(&Some(tok))
+        has(&self.gt_start, tok)
+    }
+    /// `</`, or `</` merged with what precedes it (`.</`, ` </`).
+    pub fn is_lt_slash(&self, tok: u32) -> bool {
+        has(&self.lt_slash_end, tok)
     }
 
-    /// Resolve from an encoder (`text -> ids`, no special tokens). `None` when
-    /// any required marker is not a single token.
-    pub fn resolve(encode: impl Fn(&str) -> Option<Vec<u32>>) -> Option<Self> {
-        let one = |s: &str| encode(s).filter(|ids| ids.len() == 1).map(|ids| ids[0]);
-        Some(Self {
-            lt: one("<")?,
-            eq: one("=")?,
-            gt: [one(">"), one(">\n"), one(">\n\n")],
-            lt_slash: one("</")?,
-            parameter: one("parameter")?,
-        })
-        .filter(|m| m.gt[0].is_some())
+    /// Build the classes from `(id, decoded text)` for every vocabulary entry.
+    /// `None` when any class is empty.
+    pub fn from_vocab<'a>(vocab: impl IntoIterator<Item = (u32, &'a str)>) -> Option<Self> {
+        let mut m = Self {
+            lt: Vec::new(),
+            parameter: Vec::new(),
+            eq_start: Vec::new(),
+            gt_start: Vec::new(),
+            lt_slash_end: Vec::new(),
+        };
+        for (id, text) in vocab {
+            if text.trim_start() == "<" {
+                m.lt.push(id);
+            }
+            if text == "parameter" {
+                m.parameter.push(id);
+            }
+            if text.starts_with('=') {
+                m.eq_start.push(id);
+            }
+            if text.starts_with('>') {
+                m.gt_start.push(id);
+            }
+            if text.ends_with("</") {
+                m.lt_slash_end.push(id);
+            }
+        }
+        for v in [
+            &mut m.lt,
+            &mut m.parameter,
+            &mut m.eq_start,
+            &mut m.gt_start,
+            &mut m.lt_slash_end,
+        ] {
+            v.sort_unstable();
+            v.dedup();
+        }
+        let complete = [&m.lt, &m.parameter, &m.eq_start, &m.gt_start, &m.lt_slash_end]
+            .iter()
+            .all(|v| !v.is_empty());
+        complete.then_some(m)
+    }
+
+    /// Build from a Hugging Face tokenizer: decode every id once.
+    pub fn from_tokenizer(tok: &tokenizers::Tokenizer) -> Option<Self> {
+        let n = tok.get_vocab_size(true) as u32;
+        let texts: Vec<(u32, String)> = (0..n)
+            .filter_map(|id| tok.decode(&[id], false).ok().map(|t| (id, t)))
+            .collect();
+        Self::from_vocab(texts.iter().map(|(id, t)| (*id, t.as_str())))
+    }
+
+    /// Class sizes, for the load log.
+    pub fn summary(&self) -> String {
+        format!(
+            "< x{} parameter x{} =* x{} >* x{} *</ x{}",
+            self.lt.len(),
+            self.parameter.len(),
+            self.eq_start.len(),
+            self.gt_start.len(),
+            self.lt_slash_end.len()
+        )
+    }
+
+    /// The five ids the guard was hard-coded to (Qwen3.6 / 3.8 BPE): the
+    /// default until a tokenizer installs its own classes.
+    pub fn legacy_qwen() -> Self {
+        Self {
+            lt: vec![27],
+            parameter: vec![15704],
+            eq_start: vec![28],
+            gt_start: vec![29],
+            lt_slash_end: vec![510],
+        }
     }
 }
 
-/// Qwen3.6 / 3.8 byte-level BPE ids: the values the guard was hard-coded to,
-/// kept as the default until a tokenizer installs its own (every serve path
-/// does, in `tokenizer_runtime`), so nothing changes for a caller that never
-/// loads one.
-pub const QWEN: ToolMarkers = ToolMarkers {
-    lt: 27,
-    eq: 28,
-    gt: [Some(29), None, None],
-    lt_slash: 510,
-    parameter: 15704,
-};
+fn legacy() -> Arc<ToolMarkers> {
+    static LEGACY: std::sync::OnceLock<Arc<ToolMarkers>> = std::sync::OnceLock::new();
+    LEGACY
+        .get_or_init(|| Arc::new(ToolMarkers::legacy_qwen()))
+        .clone()
+}
+
+/// `None` = never installed (the legacy default applies);
+/// `Some(None)` = installed, unresolved (tracking off).
+type Slot = Option<Option<Arc<ToolMarkers>>>;
 
 #[cfg(not(test))]
-static MARKERS: RwLock<Option<ToolMarkers>> = RwLock::new(Some(QWEN));
+static MARKERS: std::sync::RwLock<Slot> = std::sync::RwLock::new(None);
 
 #[cfg(test)]
 thread_local! {
     // Per test thread, so parallel tests installing different markers do not
     // observe each other's.
-    static MARKERS: std::cell::Cell<Option<ToolMarkers>> = const { std::cell::Cell::new(Some(QWEN)) };
+    static MARKERS: std::cell::RefCell<Slot> = const { std::cell::RefCell::new(None) };
 }
 
-/// Install the markers of the tokenizer just loaded (`None` turns the
+/// Install the classes of the tokenizer just loaded (`None` turns the
 /// parameter-body tracking off).
 pub fn set(markers: Option<ToolMarkers>) {
+    let slot: Slot = Some(markers.map(Arc::new));
     #[cfg(not(test))]
     {
-        *MARKERS.write().unwrap_or_else(|e| e.into_inner()) = markers;
+        *MARKERS.write().unwrap_or_else(|e| e.into_inner()) = slot;
     }
     #[cfg(test)]
-    MARKERS.with(|m| m.set(markers));
+    MARKERS.with(|m| *m.borrow_mut() = slot);
 }
 
-/// The markers of the tokenizer being served.
-pub fn get() -> Option<ToolMarkers> {
+/// The classes of the tokenizer being served (the legacy Qwen ids until one is
+/// installed). One uncontended read lock and an `Arc` clone per call.
+pub fn get() -> Option<Arc<ToolMarkers>> {
     #[cfg(not(test))]
-    {
-        *MARKERS.read().unwrap_or_else(|e| e.into_inner())
-    }
+    let slot = MARKERS.read().unwrap_or_else(|e| e.into_inner()).clone();
     #[cfg(test)]
-    MARKERS.with(|m| m.get())
+    let slot = MARKERS.with(|m| m.borrow().clone());
+    slot.unwrap_or_else(|| Some(legacy()))
 }
 
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::ToolMarkers;
 
-    /// Qwen3.6 / 3.8 byte-level BPE (verified with tokenizer.json 2026-10-18).
-    pub use super::QWEN;
-    /// Nemotron 3.5 Super VL (tokenizer.json of
-    /// nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4, 2026-10-18).
-    pub const NEMOTRON: ToolMarkers = ToolMarkers {
-        lt: 1060,
-        eq: 1061,
-        gt: [Some(1062), Some(1561), None],
-        lt_slash: 1885,
-        parameter: 31960,
-    };
+    /// The parts of the Qwen3.6/3.8 vocabulary the markers depend on, with the
+    /// merges seen in real tool calls (tokenizer.json, 2026-10-18): `=file`,
+    /// `=re`, `=new`, punctuation-merged closes; `>` and `\n` separate.
+    /// Merged-form ids >= 900_000 are stand-ins (only their text matters).
+    pub fn qwen() -> ToolMarkers {
+        ToolMarkers::from_vocab([
+            (27, "<"),
+            (366, " <"),
+            (28, "="),
+            (900_000, "=file"),
+            (900_001, "=re"),
+            (900_002, "=new"),
+            (29, ">"),
+            (510, "</"),
+            (900_003, ".</"),
+            (900_004, " </"),
+            (15704, "parameter"),
+            (198, "\n"),
+        ])
+        .unwrap()
+    }
+
+    /// Nemotron 3.5 Super VL (nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+    /// tokenizer.json, 2026-10-18): `>\n` merged (1561), `=new`, `.</`.
+    pub fn nemotron() -> ToolMarkers {
+        ToolMarkers::from_vocab([
+            (1060, "<"),
+            (1061, "="),
+            (900_010, "=new"),
+            (1062, ">"),
+            (1561, ">\n"),
+            (1885, "</"),
+            (900_011, ".</"),
+            (31960, "parameter"),
+            (1010, "\n"),
+        ])
+        .unwrap()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{NEMOTRON, QWEN};
+    use super::fixtures::{nemotron, qwen};
     use super::*;
 
-    fn enc(table: &'static [(&'static str, &'static [u32])]) -> impl Fn(&str) -> Option<Vec<u32>> {
-        move |s| table.iter().find(|(k, _)| *k == s).map(|(_, v)| v.to_vec())
+    #[test]
+    fn classes_cover_the_merged_forms() {
+        let q = qwen();
+        assert!(q.is_lt(27) && q.is_lt(366) && !q.is_lt(510));
+        assert!(q.is_eq_start(28) && q.is_eq_start(900_000) && q.is_eq_start(900_002));
+        assert!(q.is_gt(29) && !q.is_gt(198));
+        assert!(q.is_lt_slash(510) && q.is_lt_slash(900_003) && q.is_lt_slash(900_004));
+        assert!(q.is_parameter(15704));
+        let n = nemotron();
+        assert!(n.is_gt(1062) && n.is_gt(1561) && !n.is_gt(29));
+        assert!(n.is_eq_start(900_010) && n.is_lt_slash(900_011));
     }
 
     #[test]
-    fn resolves_qwen_and_nemotron_markers() {
-        let qwen = enc(&[
-            ("<", &[27]),
-            ("=", &[28]),
-            (">", &[29]),
-            (">\n", &[29, 198]),
-            (">\n\n", &[29, 271]),
-            ("</", &[510]),
-            ("parameter", &[15704]),
-        ]);
-        assert_eq!(ToolMarkers::resolve(qwen), Some(QWEN));
-        let nemo = enc(&[
-            ("<", &[1060]),
-            ("=", &[1061]),
-            (">", &[1062]),
-            (">\n", &[1561]),
-            (">\n\n", &[1062, 1010, 1010]),
-            ("</", &[1885]),
-            ("parameter", &[31960]),
-        ]);
-        let m = ToolMarkers::resolve(nemo).unwrap();
-        assert_eq!(m, NEMOTRON);
-        assert!(m.is_gt(1062) && m.is_gt(1561) && !m.is_gt(29));
+    fn a_vocab_missing_a_class_resolves_to_none() {
+        assert_eq!(
+            ToolMarkers::from_vocab([(1, "<"), (2, "="), (3, ">"), (4, "</")]),
+            None
+        );
     }
 
     #[test]
-    fn a_multi_token_marker_resolves_to_none() {
-        let split = enc(&[
-            ("<", &[1]),
-            ("=", &[2]),
-            (">", &[3]),
-            ("</", &[1, 4]),
-            ("parameter", &[5]),
-        ]);
-        assert_eq!(ToolMarkers::resolve(split), None);
+    fn the_default_is_the_legacy_qwen_ids_until_installed() {
+        assert_eq!(*get().unwrap(), ToolMarkers::legacy_qwen());
+        set(None);
+        assert!(get().is_none());
+        set(Some(qwen()));
+        assert!(get().unwrap().is_eq_start(900_000));
     }
 }
 

@@ -290,9 +290,9 @@ pub(crate) fn resolve_tokenizer_runtime(
     // qwen3_coder XML parameter markers for the envelope-stuck guard, from
     // THIS tokenizer (they were hard-coded to Qwen3.6 ids; Nemotron's differ).
     let tool_markers =
-        crate::scheduler::tool_markers::ToolMarkers::resolve(|s| tokenizer.encode(s).ok());
-    match tool_markers {
-        Some(m) => tracing::info!("Tool parameter markers: {m:?}"),
+        crate::scheduler::tool_markers::ToolMarkers::from_tokenizer(tokenizer.inner());
+    match &tool_markers {
+        Some(m) => tracing::info!("Tool parameter marker classes: {}", m.summary()),
         None => tracing::warn!(
             "Tool parameter markers unresolved for this tokenizer: parameter-value \
              tracking and the envelope-stuck cap are off (--tool-max-tokens still applies)"
