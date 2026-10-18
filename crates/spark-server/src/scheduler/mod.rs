@@ -75,7 +75,6 @@ mod prefill_preempt;
 mod repetition;
 mod rollback;
 mod sample_step;
-pub(crate) mod tool_markers;
 pub mod sched_ctx;
 mod shared_prefix;
 #[cfg(test)]
@@ -91,6 +90,7 @@ mod teardown;
 mod test_support;
 #[cfg(test)]
 mod think_skip_tests;
+pub(crate) mod tool_markers;
 mod types;
 #[cfg(test)]
 mod verify_bias_tests;
