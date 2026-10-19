@@ -17,6 +17,8 @@ fn spec(algo: &str, group: usize) -> QuantLayerSpec {
     QuantLayerSpec {
         quant_algo: algo.into(),
         group_size: group,
+        weight_scale_encoding: None,
+        weight_block_size: vec![],
     }
 }
 
@@ -24,10 +26,15 @@ fn spec(algo: &str, group: usize) -> QuantLayerSpec {
 /// experts, an MXFP8 projection, a W4A16 NVFP4 vision MLP, and the PLE table.
 fn fp4_local_config() -> ModelConfig {
     let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.model_type = "qwen4_exp".into();
     let mut map = std::collections::BTreeMap::new();
     map.insert(
         "model.language_model.layers.0.mlp.experts".into(),
-        spec("NVFP4", 16),
+        {
+            let mut s = spec("NVFP4", 16);
+            s.weight_scale_encoding = Some("csf".into());
+            s
+        },
     );
     map.insert(SHARED.into(), spec("MXFP8", 32));
     map.insert(GDN_OUT.into(), spec("MXFP8", 32));
@@ -293,20 +300,17 @@ fn materialize_expands_every_fp4_local_format() {
 /// exactly as shipped, weight and scale, and nothing is widened.
 #[test]
 fn gdn_mxfp8_stays_native() {
-    assert!(native_mxfp8(GDN_OUT));
-    assert!(native_mxfp8(
-        "model.language_model.layers.7.linear_attn.in_proj_qkv"
-    ));
-    assert!(native_mxfp8(ATTN));
-    assert!(!native_mxfp8(
-        "model.language_model.layers.3.self_attn.indexer.index_qk_proj"
-    ));
-    assert!(native_mxfp8("model.visual.blocks.0.attn.qkv"));
-    assert!(native_mxfp8("model.visual.blocks.0.attn.proj"));
-    assert!(!native_mxfp8("model.visual.blocks.0.mlp.linear_fc1"));
-    assert!(!native_mxfp8(
-        "model.language_model.layers.7.linear_attn.in_proj_a"
-    ));
+    use crate::weight_map::modelopt_plan::{QuantAlgo, native_consumers};
+    let n = native_consumers("qwen4_exp");
+    let mx = |m: &str| n.covers(m, &QuantAlgo::Mxfp8);
+    assert!(mx(GDN_OUT));
+    assert!(mx("model.language_model.layers.7.linear_attn.in_proj_qkv"));
+    assert!(mx(ATTN));
+    assert!(!mx("model.language_model.layers.3.self_attn.indexer.index_qk_proj"));
+    assert!(mx("model.visual.blocks.0.attn.qkv"));
+    assert!(mx("model.visual.blocks.0.attn.proj"));
+    assert!(!mx("model.visual.blocks.0.mlp.linear_fc1"));
+    assert!(!mx("model.language_model.layers.7.linear_attn.in_proj_a"));
 
     let gpu = MockGpuBackend::new();
     let mut store = WeightStore::empty();
@@ -403,4 +407,92 @@ fn materialize_is_a_no_op_without_fp4_local_tensors() {
     assert!(store.contains("a.weight"));
     // Another release's F32 tensors are never touched.
     assert_eq!(store.get("b.norm.weight").unwrap().dtype, WeightDtype::FP32);
+}
+
+/// A CSF scale stream whose declared encoding is not `"csf"` must fail at
+/// load naming the encoding — never guessed.
+#[test]
+fn unknown_csf_encoding_is_refused() {
+    let gpu = MockGpuBackend::new();
+    let mut store = WeightStore::empty();
+    let mut shard = Shard::new("enc");
+    let module = "model.language_model.layers.0.mlp.experts";
+    shard.add(
+        &format!("{module}.weight_scale.nvfp4_csf_fixed"),
+        &[0; 8],
+        &[2, 4],
+        WeightDtype::UInt8,
+    );
+    shard.add(
+        &format!("{module}.weight_scale.nvfp4_csf_exceptions"),
+        &[0; 4],
+        &[4],
+        WeightDtype::UInt8,
+    );
+    shard.defer_into(&mut store);
+
+    let mut cfg = fp4_local_config();
+    cfg.quantization_config
+        .as_mut()
+        .unwrap()
+        .quantized_layers
+        .get_mut(module)
+        .unwrap()
+        .weight_scale_encoding = Some("csf_32x2_v1".into());
+    let err = materialize(&mut store, &cfg, &gpu).unwrap_err().to_string();
+    assert!(
+        err.contains("csf_32x2_v1"),
+        "error must name the encoding: {err}"
+    );
+}
+
+/// A module whose algo has no registered consumer — here a W4A16 NVFP4 on
+/// a non-expert, non-vision path — falls through to the exact BF16
+/// expansion.
+#[test]
+fn unregistered_nvfp4_module_expands() {
+    let gpu = MockGpuBackend::new();
+    let mut store = WeightStore::empty();
+    let mut shard = Shard::new("unreg");
+    let module = "model.language_model.layers.0.mlp.down_proj";
+    // NVFP4 [1, 16]: nibble 2 (=1.0) everywhere, block scale 2.0, global 0.5
+    // → all ones BF16.
+    shard.add(
+        &format!("{module}.weight"),
+        &[0x22; 8],
+        &[1, 8],
+        WeightDtype::UInt8,
+    );
+    shard.add(
+        &format!("{module}.weight_scale"),
+        &[0x40],
+        &[1, 1],
+        WeightDtype::FP8E4M3,
+    );
+    shard.defer_into(&mut store);
+    resident(
+        &mut store,
+        &gpu,
+        &format!("{module}.weight_scale_2"),
+        &0.5f32.to_le_bytes(),
+        WeightDtype::FP32,
+    );
+
+    let mut cfg = fp4_local_config();
+    cfg.quantization_config
+        .as_mut()
+        .unwrap()
+        .quantized_layers
+        .insert(module.into(), spec("W4A16_NVFP4", 16));
+    let done = materialize(&mut store, &cfg, &gpu).unwrap();
+    assert_eq!(done.nvfp4_to_bf16, 1);
+    let w = store.get(&format!("{module}.weight")).unwrap();
+    assert_eq!(
+        (w.dtype, w.shape.clone()),
+        (WeightDtype::BF16, vec![1, 16])
+    );
+    let v = gpu.read_alloc(w.ptr).unwrap();
+    assert!((0..16).all(|i| {
+        f32::from_bits(u32::from(u16::from_le_bytes([v[2 * i], v[2 * i + 1]])) << 16) == 1.0
+    }));
 }

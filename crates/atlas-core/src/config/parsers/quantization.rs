@@ -152,11 +152,26 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
             let Some(algo) = v.get("quant_algo").and_then(|a| a.as_str()) else {
                 continue;
             };
+            let weight_scale_encoding = v
+                .get("weight_scale_encoding")
+                .and_then(|e| e.as_str())
+                .map(str::to_string);
+            let weight_block_size = v
+                .get("weight_block_size")
+                .and_then(|b| b.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|d| d.as_u64().map(|d| d as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
             quantized_layers.insert(
                 k.clone(),
                 QuantLayerSpec {
                     quant_algo: algo.to_string(),
                     group_size: v.get("group_size").and_then(|g| g.as_u64()).unwrap_or(0) as usize,
+                    weight_scale_encoding,
+                    weight_block_size,
                 },
             );
         }
