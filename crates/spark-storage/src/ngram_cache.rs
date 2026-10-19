@@ -136,6 +136,10 @@ struct ScaleCache {
     /// Bytes of scale payload per slot (4 for f32, `dim/group` E4M3 for NVFP4).
     stride: usize,
     src: ScaleSrc,
+    /// `ATLAS_PLE_SCALES_RESIDENT`: the whole scale table resident in host
+    /// RAM, concatenated in shard order. Set only for a segmented src; a
+    /// fault memcpys `arena[id * stride..]` instead of a second disk read.
+    resident: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// Where a scale row comes from on a fault.
@@ -229,6 +233,7 @@ impl NgramRowCache {
                         .context("NgramRowCache: scale arena")?,
                     stride: 4,
                     src: ScaleSrc::PerRowFile(open_direct(sp)?),
+                    resident: None,
                 })
             }
             None => None,
