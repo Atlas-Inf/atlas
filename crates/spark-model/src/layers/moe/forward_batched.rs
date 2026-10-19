@@ -31,17 +31,8 @@ impl MoeLayer {
                 || (self.correction_bias_dev.is_some() && ctx.config.scoring_func == "softmax"),
             "zero-expert MoE routing is not wired on this dispatch variant yet (forward_batched)"
         );
-        self.btile_input_guard(input, num_tokens, ctx, stream)?;
-        // The equal-memory NVFP4 MMQ repack replaces the checkpoint-native
-        // expert payloads. Only the grouped dispatcher understands that block
-        // layout; the per-token fused kernels below expect the original packed
-        // weights. Small speculative-verification batches reach this entry
-        // through the K2/K3/K5 fallbacks, so route them through the same MMQ
-        // pipeline as ordinary prefill rather than interpreting repacked bytes
-        // with the old-layout kernels. `forward_prefill` does not bounce MMQ
-        // layers back here, so this cannot recurse.
-        if self.nvfp4_mmq_layout || self.routed_scales_released {
-            return self.forward_prefill(input, num_tokens, ctx, stream);
+        if self.batched_prefill_guards(input, num_tokens, ctx, stream)? {
+            return Ok(());
         }
 
         // SOLID Incr-4: batched decode folds the routed-expert gate/up + down
