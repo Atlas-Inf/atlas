@@ -23,9 +23,11 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 typedef unsigned long long CUdeviceptr;
 
@@ -58,6 +60,170 @@ static void atlas_track_free(void *p) {
     if (it == g_mem_sizes.end()) return;
     g_mem_used = (g_mem_used > it->second) ? g_mem_used - it->second : 0;
     g_mem_sizes.erase(it);
+}
+
+// Slab sub-allocation for the request sizes hipMalloc rounds up wastefully (#145).
+//
+// The Linux ROCm runtime commits whole 1 MiB pages for requests above 512 KiB
+// and 2 MiB multiples above 1 MiB (measured on gfx1151, ROCm 7.13, Framework
+// job f16: 819,200 B -> 1 MiB, 1,310,720 B -> 2 MiB, 3,276,800 B -> 4 MiB).
+// Flash-Next's 73,728 routed-expert weights are 819,200 B each, so ~17 GB of
+// a 96 GiB carve-out went to rounding and the model could not boot under
+// Linux. Such requests are carved from 64 MiB slabs instead, one free list
+// per exact (256-aligned) size, slabs growing geometrically per size: the MoE
+// transpose frees each original right after allocating its same-sized copy,
+// so freed chunks are reused at once.
+// Each size keeps at most one fully free slab for reuse: when a slab's last
+// live chunk is freed while another empty slab already exists, the newly
+// emptied slab goes back to the driver. (A free-list-size threshold could not
+// bound retention: slabs could empty while the list was shallow and stay.)
+//
+// Accounting stays at the driver level: g_mem_used counts slabs, which is
+// what the device actually commits. Default on for Linux; ATLAS_HIP_SUBALLOC=0
+// turns it off. Off on Windows unless ATLAS_HIP_SUBALLOC=1 (WDDM's
+// granularity differs and the Windows Flash-Next path is validated without it).
+static const size_t kSubSlab = 64ull << 20;
+
+static bool atlas_suballoc_on() {
+    static const bool on = [] {
+        const char* v = getenv("ATLAS_HIP_SUBALLOC");
+#ifdef _WIN32
+        return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+#else
+        return !(v && (v[0] == '0' || v[0] == 'f' || v[0] == 'F'));
+#endif
+    }();
+    return on;
+}
+
+// What the driver commits for an n-byte hipMalloc (Linux measurements above).
+static size_t atlas_driver_rounded(size_t n) {
+    const size_t mib = 1ull << 20;
+    if (n > mib) return (n + 2 * mib - 1) / (2 * mib) * (2 * mib);
+    if (n > mib / 2) return mib;
+    return (n + 4095) / 4096 * 4096;
+}
+
+// Sub-allocate when rounding wastes more than 1/8 of the request, for sizes
+// small enough that a 64 MiB slab holds at least eight of them.
+static bool atlas_suballoc_eligible(size_t n) {
+    if (n <= (256u << 10) || n > (8u << 20)) return false;
+    return (atlas_driver_rounded(n) - n) * 8 > n;
+}
+
+struct AtlasSubSlab { char* base; size_t sz; size_t bytes; unsigned cap; unsigned live; };
+struct AtlasSubChunk { void* p; AtlasSubSlab* slab; };
+struct AtlasSubClass { std::vector<AtlasSubChunk> free; size_t slabs = 0; unsigned next_cap = 1; unsigned empty = 0; };
+static std::mutex g_sub_mu;
+static std::unordered_map<size_t, AtlasSubClass> g_sub_classes;   // chunk size -> class
+static std::unordered_map<void*, AtlasSubSlab*> g_sub_owner;      // live chunk -> slab
+static std::map<char*, AtlasSubSlab*> g_sub_slabs;                // slab base -> slab (range lookup)
+
+// The slab whose range holds p, live chunk or not. Caller holds g_sub_mu.
+static AtlasSubSlab* atlas_sub_slab_of(void* p) {
+    auto it = g_sub_slabs.upper_bound((char*)p);
+    if (it == g_sub_slabs.begin()) return nullptr;
+    --it;
+    return ((char*)p < it->first + it->second->bytes) ? it->second : nullptr;
+}
+
+// 0 on success; nonzero means "not handled, use plain hipMalloc".
+static int atlas_suballoc(void** out, size_t n) {
+    const size_t sz = (n + 255) & ~(size_t)255;
+    bool first_slab = false;
+    unsigned cap = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_sub_mu);
+        AtlasSubClass& c = g_sub_classes[sz];
+        if (c.free.empty()) {
+            // Slabs grow per size: 1, 2, 4, ... chunks (each rounded up to the
+            // driver's 2 MiB commit unit, slack filled with chunks), capped at
+            // kSubSlab. A size with a handful of tensors then costs what plain
+            // hipMalloc would; a size with thousands lands in full 64 MiB slabs.
+            // (Fixed 64 MiB slabs lost 0.5 GB on the 27B: five sizes with 1-32
+            // tensors each, strix s07b.)
+            const size_t unit = 2ull << 20;
+            size_t bytes = ((size_t)c.next_cap * sz + unit - 1) / unit * unit;
+            if (bytes > kSubSlab) bytes = kSubSlab;
+            void* base = nullptr;
+            if (hipMalloc(&base, bytes) != hipSuccess || !base) return 1;
+            atlas_track_alloc(base, bytes);
+            auto* s = new AtlasSubSlab{(char*)base, sz, bytes, (unsigned)(bytes / sz), 0};
+            if (c.next_cap < (unsigned)(kSubSlab / sz)) c.next_cap *= 2;
+            g_sub_slabs[s->base] = s;
+            // Chunk 0 is handed out right here, so a new slab is born live and
+            // never counts toward c.empty (which tracks empty<->live transitions).
+            for (unsigned i = s->cap; i-- > 1;) c.free.push_back({s->base + (size_t)i * sz, s});
+            s->live = 1;
+            g_sub_owner[s->base] = s;
+            *out = s->base;
+            first_slab = c.slabs++ == 0;
+            cap = s->cap;
+        } else {
+            AtlasSubChunk ch = c.free.back();
+            c.free.pop_back();
+            if (ch.slab->live++ == 0) --c.empty;
+            g_sub_owner[ch.p] = ch.slab;
+            *out = ch.p;
+        }
+    }
+    if (first_slab) {
+        fprintf(stderr, "[suballoc] %zu B requests -> slabs of %u growing to %u per 64 MiB (driver would commit %zu B each)\n",
+                n, cap, (unsigned)(kSubSlab / ((n + 255) & ~(size_t)255)), atlas_driver_rounded(n));
+    }
+    return 0;
+}
+
+// true if p lies in a slab (freed here, or a repeated free of one that is
+// already free); false means "not ours, plain hipFree". A slab-interior
+// pointer must never reach hipFree.
+//
+// hipFree (like cuMemFree) synchronizes the device before releasing memory, and
+// callers may free a buffer that a kernel still in flight is reading. So the
+// chunk leaves g_sub_owner first (a concurrent or repeated free of it now
+// finds no owner and is refused), the device is synchronized with no lock
+// held, and only then does the chunk go back on its free list for reuse.
+static bool atlas_subfree(void* p) {
+    AtlasSubSlab* s = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_sub_mu);
+        auto it = g_sub_owner.find(p);
+        if (it == g_sub_owner.end()) {
+            if (!atlas_sub_slab_of(p)) return false;
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "[suballoc] free of %p: not a live chunk (repeated free); ignored\n", p);
+            }
+            return true;
+        }
+        s = it->second;
+        g_sub_owner.erase(it);
+    }
+    hipError_t se = hipDeviceSynchronize();
+    if (se != hipSuccess) {
+        fprintf(stderr, "[suballoc] hipDeviceSynchronize before chunk reuse failed: %d\n", (int)se);
+    }
+    char* release = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_sub_mu);
+        AtlasSubClass& c = g_sub_classes[s->sz];
+        c.free.push_back({p, s});
+        if (--s->live == 0 && ++c.empty > 1) {
+            std::vector<AtlasSubChunk> keep;
+            keep.reserve(c.free.size() - s->cap);
+            for (const AtlasSubChunk& q : c.free) if (q.slab != s) keep.push_back(q);
+            c.free.swap(keep);
+            c.slabs--;
+            c.empty--;
+            g_sub_slabs.erase(s->base);
+            atlas_track_free(s->base);
+            release = s->base;
+            delete s;
+        }
+    }
+    if (release) hipFree(release);
+    return true;
 }
 
 // ATLAS_TRACE_LAUNCH=1: print every kernel launch (name + grid/block) to
@@ -194,6 +360,10 @@ static void atlas_memprofile_snapshot_once() {
 // ── memory ────────────────────────────────────────────────────────────
 int cuMemAlloc_v2(CUdeviceptr* dptr, size_t n)      {
     double t0 = atlas_now_ms();
+    if (dptr && atlas_suballoc_on() && atlas_suballoc_eligible(n) && atlas_suballoc((void**)dptr, n) == 0) {
+        if (atlas_trace_launch()) { fprintf(stderr, "[alloc] n=%zu sub dur=%.1fms t=%.1f\n", n, atlas_now_ms()-t0, t0); fflush(stderr); }
+        return hipSuccess;
+    }
     int r = hipMalloc((void**)dptr, n);
     if (atlas_trace_launch()) { fprintf(stderr, "[alloc] n=%zu dur=%.1fms t=%.1f\n", n, atlas_now_ms()-t0, t0); fflush(stderr); }
     if (r == hipSuccess && dptr) atlas_track_alloc((void*)*dptr, n);
@@ -201,6 +371,7 @@ int cuMemAlloc_v2(CUdeviceptr* dptr, size_t n)      {
     return r;
 }
 int cuMemFree_v2(CUdeviceptr dptr)                  {
+    if (atlas_subfree((void*)dptr)) return hipSuccess;
     atlas_track_free((void*)dptr);
     return hipFree((void*)dptr);
 }
