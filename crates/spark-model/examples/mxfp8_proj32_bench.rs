@@ -10,9 +10,8 @@
 use anyhow::Result;
 use half::bf16;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
-use spark_runtime::gpu::KernelHandle;
 
 const SHAPES: &[(u32, u32, &str)] = &[
     (8192, 2560, "gdn-qkvz"),

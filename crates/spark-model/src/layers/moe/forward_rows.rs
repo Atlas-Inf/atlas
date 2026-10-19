@@ -241,7 +241,7 @@ impl MoeLayer {
         // `shared` is NULL under a checkpoint-native separate shared expert —
         // the fused kernels skip it and the separate chain fills `shared_out`
         // for the same rows below.
-        if k.units_ready() && !self.has_separate_shared_expert() {
+        if k.units_ready() {
             // A launch takes up to QWEN4EXP_MOE_UNITS_MAX_ROWS rows; each row's
             // bytes are the same in any chunk (and under ATLAS_QWEN4EXP_MOE_TC
             // the kernels are row-invariant).
