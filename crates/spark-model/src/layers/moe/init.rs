@@ -21,5 +21,4 @@ impl MoeLayer {
     pub fn set_row_invariant_bf16_router(&mut self) {
         self.row_invariant_bf16_router = true;
     }
-
 }
