@@ -83,15 +83,29 @@ pub(super) fn build_moe(
     )
     .with_context(|| format!("qwen4_exp: MoE block at {lp}"))?;
 
-    let gate_nvfp4 = Some(quantize_to_nvfp4(
-        &weights.gate,
-        config.num_experts,
-        h,
-        gpu,
-        absmax_k,
-        quantize_k,
-        stream,
-    )?);
+    // FP4-Local ships mlp.gate as BF16 (it is absent from quantized_layers);
+    // requantizing it to NVFP4 is a lossy detour. Route on the shipped BF16
+    // gate unless ATLAS_QWEN4EXP_ROUTER_NVFP4=1 asks for the old path (logged
+    // as lossy).
+    let fp4_local = !crate::weight_map::modelopt_local::host_decode_modules(config).is_empty();
+    let router_nvfp4 = std::env::var("ATLAS_QWEN4EXP_ROUTER_NVFP4").as_deref() == Ok("1");
+    let gate_nvfp4 = if fp4_local && !router_nvfp4 {
+        tracing::info!("qwen4_exp: router gate on shipped BF16 weight (gate_nvfp4=None)");
+        None
+    } else {
+        if fp4_local && router_nvfp4 {
+            tracing::warn!("ATLAS_QWEN4EXP_ROUTER_NVFP4=1: lossy requant of the BF16 router");
+        }
+        Some(quantize_to_nvfp4(
+            &weights.gate,
+            config.num_experts,
+            h,
+            gpu,
+            absmax_k,
+            quantize_k,
+            stream,
+        )?)
+    };
 
     let mut moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
     if native_shared {

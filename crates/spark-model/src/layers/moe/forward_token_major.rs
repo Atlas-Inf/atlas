@@ -78,15 +78,13 @@ impl MoeLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
+            self.wide_rows.dense_rows(
                 ctx.gpu,
-                self.dense_gemm,
+                self.dense_gemv_batchm,
                 router_in,
                 &self.weights.gate,
                 gate_logits,
-                n,
-                num_experts,
-                h,
+                (n, num_experts, h, num_experts),
                 stream,
             )?;
         }
