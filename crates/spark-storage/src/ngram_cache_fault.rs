@@ -23,6 +23,8 @@ use super::*;
 ///      8     424 ms      3.85x
 ///     16     257 ms      6.35x
 ///     32     171 ms      9.55x
+///     64     ~64K IOPS  (GB10 NVMe's random-4K ceiling; +64 lifts the
+///              PLE fault wall ~20% on a cold ~17K prefill)
 /// ```
 ///
 /// `1` restores the old strictly-serial behaviour for a bisect.
@@ -30,7 +32,7 @@ pub(super) fn fault_threads() -> usize {
     std::env::var("ATLAS_PLE_FAULT_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(32)
+        .unwrap_or(64)
 }
 
 /// One scheduled miss: read row `id` into `slot`. Produced by the decision
