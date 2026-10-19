@@ -64,6 +64,24 @@ impl MoeLayer {
             self.independent_router_logits(router_in, gate_logits, 2, ctx, stream)?;
         } else if self.glm_c4_grouped(ctx, n) {
             self.c4_router_logits(router_in, gate_logits, ctx, stream)?;
+        } else if self.row_invariant_bf16_router
+            && h.is_multiple_of(16)
+            && let Ok(k_gemm) = ctx.gpu.kernel("gemm", "dense_gemm_bf16_pipelined")
+        {
+            // FP4-Local's prefill contract allows different numerics than
+            // decode: the shipped BF16 gate already sits in the layout the
+            // pipelined GEMM reads, so no NVFP4 dequant step is needed —
+            // the same kernel try_q38_router runs after dequantizing the
+            // NVFP4 pack's router. Chunk-invariant (every logit is an
+            // independent in-order m16n8k16 chain), which the cached-prefix
+            // gate requires.
+            super::forward_prefill_route_sp::q38_router_gemm(
+                ctx.gpu,
+                k_gemm,
+                [router_in, self.weights.gate.weight, gate_logits],
+                [n, self.router_logits_n, h],
+                stream,
+            )?;
         } else {
             // Selection numerics — see router_gate_gemm_dense for why this
             // must stay on the scalar kernel and why ATLAS_CUBLAS_GEMM must
