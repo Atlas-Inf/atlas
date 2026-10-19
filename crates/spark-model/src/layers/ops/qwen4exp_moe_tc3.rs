@@ -71,7 +71,10 @@ impl Qwen4ExpMoeRows {
         stream: u64,
     ) -> Result<()> {
         // All-or-nothing shared weights: a partial set has nowhere to go.
-        let n_shared = [sh_gate, sh_up, sh_down].iter().filter(|w| w.weight.0 != 0).count();
+        let n_shared = [sh_gate, sh_up, sh_down]
+            .iter()
+            .filter(|w| w.weight.0 != 0)
+            .count();
         anyhow::ensure!(
             n_shared == 0 || n_shared == 3,
             "qwen4exp MoE TC v3: partial shared expert ({n_shared}/3 weights)"

@@ -178,7 +178,10 @@ mod tests {
             let ls = fetch(&gpu, l[1], rows * (k / 32));
             let base = rank * (n / 2);
             assert_eq!(ld, data[base * k..base * k + rows * k]);
-            assert_eq!(ls, scales[base * (k / 32)..base * (k / 32) + rows * (k / 32)]);
+            assert_eq!(
+                ls,
+                scales[base * (k / 32)..base * (k / 32) + rows * (k / 32)]
+            );
             // dequant(shard) == slice(dequant(full)), element for element.
             let want = dequant(&data, &scales, n, k);
             let got = dequant(&ld, &ls, rows, k);
