@@ -102,6 +102,7 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
         batchm: KernelHandle(222),
         dequant: KernelHandle(333),
         rows32: KernelHandle(0),
+        tc: KernelHandle(0),
     };
     let scratch = ops::Mxfp8Scratch {
         ptr: DevicePtr(0x9000_0000),

@@ -38,6 +38,9 @@ pub struct Mxfp8ProjKernels {
     /// Register-tiled 2..=32-row tier (`mxfp8_proj_rows32`); optional —
     /// targets without it fall back to `batchm`.
     pub rows32: KernelHandle,
+    /// Tensor-core tier (`mxfp8_proj_tc`), optional; used only when
+    /// `ATLAS_QWEN4EXP_MXFP8_TC=1` opts into the MMA numerics family.
+    pub tc: KernelHandle,
 }
 
 impl Mxfp8ProjKernels {
@@ -49,8 +52,21 @@ impl Mxfp8ProjKernels {
             batchm: gpu.kernel("mxfp8_proj", "mxfp8_proj_batchm")?,
             dequant: gpu.kernel("mxfp8_proj", "mxfp8_proj_dequant")?,
             rows32: crate::layers::kernel_pick::try_kernel(gpu, "mxfp8_proj", "mxfp8_proj_rows32"),
+            tc: crate::layers::kernel_pick::try_kernel(gpu, "mxfp8_proj", "mxfp8_proj_tc"),
         })
     }
+}
+
+/// `ATLAS_QWEN4EXP_MXFP8_TC=1` opts every 1..=32-row MXFP8 projection into
+/// the tensor-core MMA family (NOT bit-identical to the GEMV tiers; both
+/// ranks must agree — read once at load, `model::startup_parity`).
+fn mxfp8_tc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("ATLAS_QWEN4EXP_MXFP8_TC").as_deref() == Ok("1");
+        tracing::info!("mxfp8_proj tensor-core tier {}", if on { "ON" } else { "off" });
+        on
+    })
 }
 
 /// A BF16 scratch for the prefill expansion: device pointer and capacity.
@@ -106,6 +122,19 @@ fn gemv_rows(
             .arg_ptr(w.data)
             .arg_ptr(w.scales)
             .arg_ptr(out)
+            .arg_u32(n)
+            .arg_u32(k)
+            .launch(stream);
+    }
+    if kernels.tc.0 != 0 && mxfp8_tc_enabled() && k % 16 == 0 {
+        return KernelLaunch::new(gpu, kernels.tc)
+            .grid([div_ceil(n, 64), div_ceil(m as u32, 16), 1])
+            .block([128, 1, 1])
+            .arg_ptr(act)
+            .arg_ptr(w.data)
+            .arg_ptr(w.scales)
+            .arg_ptr(out)
+            .arg_u32(m as u32)
             .arg_u32(n)
             .arg_u32(k)
             .launch(stream);
