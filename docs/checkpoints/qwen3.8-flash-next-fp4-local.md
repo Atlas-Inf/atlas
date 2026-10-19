@@ -208,3 +208,25 @@ Scripts in `bench/qwen4_exp/fp4local/`: `control.py` (4-request output control),
 Environment note: the BFCL scorer's venv (`~/.atlas/artifacts/bfcl/venv`) needed `soundfile`
 (`qwen_agent` imports it) plus `libsndfile1`; without it every `bfcl-subset` run fails at scoring
 after generating all responses.
+
+## 10. Update — overnight results and format-driven loading
+
+**Same-binary quality A/B** (only the checkpoint differs; BFCL golden ST-995, no overrides; single run
+each): FP4-Local **87.44 / 87.32** (run-1792340347555552942) vs NVFP4 pack 86.23 / 85.64
+(run-1792378038850732185). An observation, not a significance claim.
+
+**v2 profile (adds `ATLAS_QWEN4EXP_HC_FAST`):** decode-floor 33.0 tok/s (run-1792378753368339758),
+quick 512/512 34.7 tok/s, SSM-poisoning 12/12 invariant, long-context recall 12/12 at 32K–245K.
+
+**Image:** `azeezish/atlas-gb10:a78d2fb` built from the measured commit (all targets, 3.0 GB), served by
+sparkrun from the rendered recipe: coherent, needle PASS. Its temperature-0 answers are correct but
+not byte-identical to the bare-metal single-target binary — not yet root-caused (multi-target kernel
+selection or the in-container template path). Not pushed to any registry.
+
+**Format-driven loading:** `weight_map/modelopt_plan.rs` reads the checkpoint's declared per-module
+formats (`quantization_config.quantized_layers`, or `hf_quant_config.json`) — NVFP4 / W4A16_NVFP4 /
+MXFP8 / FP8 block, group size in either spelling, `weight_scale_encoding`. CSF scales decode only for
+encoding `"csf"`; any other encoding fails at load naming module and encoding. A per-model
+native-consumer registry says which roles run natively (qwen4_exp declares the set above); every other
+declared module is expanded exactly to BF16, so a new FP4-Local checkpoint loads correctly before it
+is optimized. FP4-Local and NVFP4 outputs are byte-identical to the previous build.
