@@ -177,11 +177,10 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
             .iter()
             .map(|l| l.kernel)
             .collect();
-        let want_n = if m == 1 {
-            3
-        } else {
-            3 * (m as usize).div_ceil(8)
-        };
+        // O1: batchm serves 2..=32 rows in ONE launch per projection, so the
+        // shared expert is 3 launches at every row count here (m=1 takes the
+        // single-row GEMV arm, also one launch each).
+        let want_n = 3;
         assert_eq!(
             kernels_run.iter().filter(|&&k| k == want).count(),
             want_n,
