@@ -34,6 +34,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::ModelConfig;
+use super::modelopt_plan::{ModeloptQuantPlan, QuantAlgo, native_consumers};
 use atlas_core::modelopt_codec::{decode_csf_scales, mxfp8_to_bf16, nvfp4_rows_to_bf16};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::{WeightDtype, WeightStore, WeightTensor};
@@ -41,49 +42,33 @@ use spark_runtime::weights::{WeightDtype, WeightStore, WeightTensor};
 const CSF_FIXED: &str = ".nvfp4_csf_fixed";
 const CSF_EXCEPTIONS: &str = ".nvfp4_csf_exceptions";
 
-/// Modules whose weight/scale pair the loader must defer for host expansion:
-/// every `MXFP8` entry of the ModelOpt `quantized_layers` map. NVFP4 modules
-/// — trunk experts, MTP and, since the vision tower went native, ALL of
-/// `model.visual.*` — keep their own dequant paths. Empty for any other pack.
+/// Modules whose weight/scale pair the loader must defer: every `MXFP8`
+/// entry of the plan (native upload and host expansion both read the
+/// deferred bytes), plus — on FP4-Local — every module with no registered
+/// native consumer (its packed bytes are never meant to be resident). The
+/// pre-plan rule for non-FP4-Local packs is the `MXFP8`-only arm.
 pub fn host_decode_modules(config: &ModelConfig) -> HashSet<String> {
     let Some(qc) = config.quantization_config.as_ref() else {
         return HashSet::new();
     };
+    if let Some(plan) = ModeloptQuantPlan::from_config(config)
+        && plan.is_fp4_local()
+    {
+        let natives = native_consumers(&config.model_type);
+        return plan
+            .modules()
+            .filter(|m| {
+                let f = plan.format_of(m).expect("plan module");
+                matches!(f.algo, QuantAlgo::Mxfp8) || !natives.covers(m, &f.algo)
+            })
+            .cloned()
+            .collect();
+    }
     qc.quantized_layers
         .iter()
-        .filter(|(_path, spec)| {
-            let algo = spec.quant_algo.to_ascii_uppercase();
-            algo == "MXFP8"
-        })
+        .filter(|(_path, spec)| spec.quant_algo.eq_ignore_ascii_case("MXFP8"))
         .map(|(path, _)| path.clone())
         .collect()
-}
-
-/// MXFP8 modules a layer reads natively, so they are uploaded as shipped.
-/// `ATLAS_FP4LOCAL_EXPAND_MXFP8=1` expands them to BF16 instead (A/B only:
-/// both are exact, the native bytes are half the size).
-pub fn native_mxfp8(module: &str) -> bool {
-    if std::env::var("ATLAS_FP4LOCAL_EXPAND_MXFP8").as_deref() == Ok("1") {
-        return false;
-    }
-    const NATIVE: [&str; 10] = [
-        ".linear_attn.in_proj_qkv",
-        ".linear_attn.in_proj_z",
-        ".linear_attn.out_proj",
-        ".self_attn.q_proj",
-        ".self_attn.k_proj",
-        ".self_attn.v_proj",
-        ".self_attn.o_proj",
-        ".mlp.shared_expert.gate_proj",
-        ".mlp.shared_expert.up_proj",
-        ".mlp.shared_expert.down_proj",
-    ];
-    (module.starts_with("model.language_model.layers.")
-        && NATIVE.iter().any(|suffix| module.ends_with(suffix)))
-    // The vision tower's MXFP8 attention projections upload as shipped and
-    // dequant on-GPU into the encoder's BF16 scratch.
-    || (module.starts_with("model.visual.")
-        && (module.ends_with(".attn.qkv") || module.ends_with(".attn.proj")))
 }
 
 /// What [`materialize`] did, for the load log and for tests.
@@ -319,18 +304,44 @@ pub fn materialize(
     gpu: &dyn GpuBackend,
 ) -> Result<Materialized> {
     let mut done = Materialized::default();
+    let plan = ModeloptQuantPlan::from_config(config);
+    let natives = native_consumers(&config.model_type);
     for base in csf_bases(store) {
+        // The scale-encoding column decides the codec; `"csf"` is the only
+        // one Atlas decodes today. A module the plan doesn't list keeps the
+        // stream's name-driven decode — don't guess at an unknown layout.
+        if let Some(enc) = base
+            .strip_suffix(".weight_scale")
+            .and_then(|m| plan.as_ref().and_then(|p| p.format_of(m)))
+            .and_then(|f| f.scale_encoding.as_deref())
+        {
+            ensure!(
+                enc == "csf",
+                "{base}: unsupported weight_scale_encoding {enc:?}; cannot decode"
+            );
+        }
         done.uploaded_bytes += decode_one_csf(store, gpu, &base)?;
         done.csf_scales += 1;
     }
     let mut modules: Vec<String> = host_decode_modules(config).into_iter().collect();
     modules.sort();
+    // A/B only: expand the native MXFP8 set too (both paths are exact).
+    let force_expand =
+        std::env::var("ATLAS_FP4LOCAL_EXPAND_MXFP8").as_deref() == Ok("1");
     for module in modules {
-        if native_mxfp8(&module) {
-            if let Some(n) = upload_native_mxfp8(store, gpu, &module)? {
+        let fmt = plan.as_ref().and_then(|p| p.format_of(&module));
+        let algo = fmt
+            .map(|f| &f.algo)
+            .cloned()
+            .unwrap_or(QuantAlgo::Other(String::new()));
+        if !force_expand && natives.covers(&module, &algo) {
+            if algo == QuantAlgo::Mxfp8
+                && let Some(n) = upload_native_mxfp8(store, gpu, &module)?
+            {
                 done.mxfp8_native += 1;
                 done.uploaded_bytes += n;
             }
+            // An NVFP4/algo-native module stays deferred for its own loader.
             continue;
         }
         let Some((mx, n)) = expand_module(store, gpu, &module)? else {
