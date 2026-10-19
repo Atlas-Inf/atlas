@@ -183,6 +183,28 @@ __device__ __forceinline__ void gate_up_shared_t_impl(
     }
 }
 
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S>
+__device__ __forceinline__ void gate_up_shared_t_impl_smem(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_t_ptrs,
+    const unsigned long long* __restrict__ gate_scale_t_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,
+    const unsigned long long* __restrict__ up_packed_t_ptrs,
+    const unsigned long long* __restrict__ up_scale_t_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ sh_gate_t_packed,
+    const unsigned char* __restrict__ sh_gate_t_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,
+    const unsigned char* __restrict__ sh_up_t_packed,
+    const unsigned char* __restrict__ sh_up_t_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    unsigned int N, unsigned int K, unsigned int top_k);
+
 // NVFP4 (default): FP8-E4M3 per-16 scales × per-tensor global.
 extern "C" __global__ void moe_expert_gate_up_shared_t(
     const __nv_bfloat16* __restrict__ A,
@@ -205,7 +227,7 @@ extern "C" __global__ void moe_expert_gate_up_shared_t(
     __nv_bfloat16* __restrict__ sh_up_out,
     unsigned int N, unsigned int K, unsigned int top_k
 ) {
-    gate_up_shared_t_impl<GROUP_SIZE, false, GROUP_SIZE, false>(
+    gate_up_shared_t_impl_smem<GROUP_SIZE, false, GROUP_SIZE, false>(
         A, gate_packed_t_ptrs, gate_scale_t_ptrs, gate_scale2_vals, gate_out,
         up_packed_t_ptrs, up_scale_t_ptrs, up_scale2_vals, up_out, expert_indices,
         sh_gate_t_packed, sh_gate_t_scale, sh_gate_s2, sh_gate_out,
@@ -368,6 +390,23 @@ __device__ __forceinline__ void silu_down_shared_t_impl(
     }
 }
 
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S>
+__device__ __forceinline__ void silu_down_shared_t_impl_smem(
+    const __nv_bfloat16* __restrict__ gate_out,
+    const __nv_bfloat16* __restrict__ up_out,
+    const unsigned long long* __restrict__ packed_t_ptrs,
+    const unsigned long long* __restrict__ scale_t_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const unsigned int* __restrict__ expert_indices,
+    const __nv_bfloat16* __restrict__ sh_gate_in,
+    const __nv_bfloat16* __restrict__ sh_up_in,
+    const unsigned char* __restrict__ sh_down_t_packed,
+    const unsigned char* __restrict__ sh_down_t_scale,
+    float sh_down_s2,
+    __nv_bfloat16* __restrict__ sh_down_out,
+    unsigned int N, unsigned int K, unsigned int top_k);
+
 // NVFP4 (default): FP8-E4M3 per-16 scales × per-tensor global.
 extern "C" __global__ void moe_expert_silu_down_shared_t(
     const __nv_bfloat16* __restrict__ gate_out,
@@ -385,7 +424,7 @@ extern "C" __global__ void moe_expert_silu_down_shared_t(
     __nv_bfloat16* __restrict__ sh_down_out,
     unsigned int N, unsigned int K, unsigned int top_k
 ) {
-    silu_down_shared_t_impl<GROUP_SIZE, false, GROUP_SIZE, false>(
+    silu_down_shared_t_impl_smem<GROUP_SIZE, false, GROUP_SIZE, false>(
         gate_out, up_out, packed_t_ptrs, scale_t_ptrs, scale2_vals, C,
         expert_indices, sh_gate_in, sh_up_in, sh_down_t_packed, sh_down_t_scale,
         sh_down_s2, sh_down_out, N, K, top_k);
@@ -412,4 +451,228 @@ extern "C" __global__ void moe_expert_silu_down_shared_t_e8m0(
         gate_out, up_out, packed_t_ptrs, scale_t_ptrs, scale2_vals, C,
         expert_indices, sh_gate_in, sh_up_in, sh_down_t_packed, sh_down_t_scale,
         sh_down_s2, sh_down_out, N, K, top_k);
+}
+
+// ── Shared-memory tiled impls (S2d): production path ─────────────────────
+// Stage each expert's packed tile into smem via 16 B cooperative loads
+// (double-buffered), then every thread accumulates ITS column in the
+// identical per-output FP32 order. Byte-identical to the scalar loop.
+#define TILE_KH 64u
+#define TILE_STRIDE 48u
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S>
+__device__ __forceinline__ void gate_up_shared_t_impl_smem(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_t_ptrs,
+    const unsigned long long* __restrict__ gate_scale_t_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,
+    const unsigned long long* __restrict__ up_packed_t_ptrs,
+    const unsigned long long* __restrict__ up_scale_t_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ sh_gate_t_packed,
+    const unsigned char* __restrict__ sh_gate_t_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,
+    const unsigned char* __restrict__ sh_up_t_packed,
+    const unsigned char* __restrict__ sh_up_t_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    const unsigned int expert_slot = blockIdx.y;
+    const unsigned int proj = blockIdx.z;
+    const bool is_shared = (expert_slot == top_k);
+    const unsigned char* B_packed; const unsigned char* B_scale; float s2; __nv_bfloat16* C;
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (is_shared) {
+        if (proj == 0) {
+            if (sh_gate_t_packed == 0) { if (n < N) sh_gate_out[n] = __float2bfloat16(0.0f); return; }
+            B_packed = sh_gate_t_packed; B_scale = sh_gate_t_scale; s2 = sh_gate_s2; C = sh_gate_out;
+        } else {
+            if (sh_up_t_packed == 0) { if (n < N) sh_up_out[n] = __float2bfloat16(0.0f); return; }
+            B_packed = sh_up_t_packed; B_scale = sh_up_t_scale; s2 = sh_up_s2; C = sh_up_out;
+        }
+    } else {
+        const unsigned int expert_id = expert_indices[expert_slot];
+        if (proj == 0) {
+            B_packed = (const unsigned char*)gate_packed_t_ptrs[expert_id];
+            B_scale = (const unsigned char*)gate_scale_t_ptrs[expert_id];
+            s2 = gate_scale2_vals[expert_id]; C = gate_out;
+        } else {
+            B_packed = (const unsigned char*)up_packed_t_ptrs[expert_id];
+            B_scale = (const unsigned char*)up_scale_t_ptrs[expert_id];
+            s2 = up_scale2_vals[expert_id]; C = up_out;
+        }
+        if (B_packed == 0) { if (n < N) C[(unsigned long long)expert_slot * N + n] = __float2bfloat16(0.0f); return; }
+    }
+
+    const unsigned int lane = threadIdx.x;
+    const unsigned int ns0 = blockIdx.x * blockDim.x;
+    const bool valid = (n < N);
+    __shared__ float s_lut[16];
+    if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
+    __shared__ unsigned char s_pk[2][TILE_KH * TILE_STRIDE];
+    __shared__ unsigned char s_sc[2][(TILE_KH / 8) * TILE_STRIDE];
+    __syncthreads();
+
+    const unsigned int r = lane / 2u;
+    const unsigned int off = (lane % 2u) * 16u;
+    auto stage = [&](unsigned int tg, unsigned int buf) {
+        const unsigned int r0 = tg * TILE_KH;
+        _Pragma("unroll")
+        for (unsigned int w = 0; w < TILE_KH / 16u; w++) {
+            unsigned int rr = r + w * 16u;
+            *(uint4*)&s_pk[buf][rr * TILE_STRIDE + off] =
+                *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + off];
+        }
+        const unsigned int ng = TILE_KH / 8u;
+        if (lane < ng * 2u) {
+            unsigned int sg = lane / 2u;
+            unsigned int off2 = (lane % 2u) * 16u;
+            *(uint4*)&s_sc[buf][sg * TILE_STRIDE + off2] =
+                *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + off2];
+        }
+    };
+
+    float acc = 0.0f;
+    const unsigned int ntg = (K / 2u) / TILE_KH;
+    stage(0, 0);
+    for (unsigned int tg = 0; tg < ntg; tg++) {
+        __syncthreads();
+        if (tg + 1u < ntg) stage(tg + 1u, (tg + 1u) & 1u);
+        const unsigned int buf = tg & 1u;
+        if (valid) {
+            #define GU_TILE_ACC(GS_, E8M0_) do { \
+                if constexpr ((GS_) == 16) { \
+                    _Pragma("unroll 8") \
+                    for (unsigned int rr = 0; rr < TILE_KH; rr++) { \
+                        unsigned int k_half = tg * TILE_KH + rr; \
+                        float sc = mx_block_scale<(E8M0_)>(s_sc[buf][(rr >> 3) * TILE_STRIDE + lane], s2); \
+                        unsigned char byte = s_pk[buf][rr * TILE_STRIDE + lane]; \
+                        float a_lo = __bfloat162float(A[k_half * 2]); \
+                        float a_hi = __bfloat162float(A[k_half * 2 + 1]); \
+                        acc += a_lo * (s_lut[byte & 0xFu] * sc) + a_hi * (s_lut[(byte >> 4) & 0xFu] * sc); \
+                    } \
+                } \
+            } while(0)
+            if constexpr (GS_R == GS_S && E8M0_R == E8M0_S) {
+                GU_TILE_ACC(GS_R, E8M0_R);
+            } else {
+                if (is_shared) { GU_TILE_ACC(GS_S, E8M0_S); }
+                else           { GU_TILE_ACC(GS_R, E8M0_R); }
+            }
+            #undef GU_TILE_ACC
+        }
+    }
+    __syncthreads();
+    if (!valid) return;
+    if (is_shared) C[n] = __float2bfloat16(acc);
+    else C[(unsigned long long)expert_slot * N + n] = __float2bfloat16(acc);
+}
+
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S>
+__device__ __forceinline__ void silu_down_shared_t_impl_smem(
+    const __nv_bfloat16* __restrict__ gate_out,
+    const __nv_bfloat16* __restrict__ up_out,
+    const unsigned long long* __restrict__ packed_t_ptrs,
+    const unsigned long long* __restrict__ scale_t_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const unsigned int* __restrict__ expert_indices,
+    const __nv_bfloat16* __restrict__ sh_gate_in,
+    const __nv_bfloat16* __restrict__ sh_up_in,
+    const unsigned char* __restrict__ sh_down_t_packed,
+    const unsigned char* __restrict__ sh_down_t_scale,
+    float sh_down_s2,
+    __nv_bfloat16* __restrict__ sh_down_out,
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    const unsigned int expert_slot = blockIdx.y;
+    const bool is_shared = (expert_slot == top_k);
+    const unsigned char* B_packed; const unsigned char* B_scale; float s2;
+    const __nv_bfloat16* g_ptr; const __nv_bfloat16* u_ptr;
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (is_shared) {
+        if (sh_down_t_packed == 0) { if (n < N) sh_down_out[n] = __float2bfloat16(0.0f); return; }
+        B_packed = sh_down_t_packed; B_scale = sh_down_t_scale; s2 = sh_down_s2;
+        g_ptr = sh_gate_in; u_ptr = sh_up_in;
+    } else {
+        const unsigned int expert_id = expert_indices[expert_slot];
+        B_packed = (const unsigned char*)packed_t_ptrs[expert_id];
+        B_scale = (const unsigned char*)scale_t_ptrs[expert_id];
+        s2 = scale2_vals[expert_id];
+        g_ptr = gate_out + (unsigned long long)expert_slot * K;
+        u_ptr = up_out + (unsigned long long)expert_slot * K;
+        if (B_packed == 0) { if (n < N) C[expert_slot * N + n] = __float2bfloat16(0.0f); return; }
+    }
+
+    const unsigned int lane = threadIdx.x;
+    const unsigned int ns0 = blockIdx.x * blockDim.x;
+    const bool valid = (n < N);
+    extern __shared__ float s_act[];
+    for (unsigned int i = lane; i < K; i += blockDim.x) {
+        float gf = __bfloat162float(g_ptr[i]);
+        float uf = __bfloat162float(u_ptr[i]);
+        s_act[i] = (gf / (1.0f + __expf(-gf))) * uf;
+    }
+    __shared__ float s_lut[16];
+    if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
+    __shared__ unsigned char s_pk[2][TILE_KH * TILE_STRIDE];
+    __shared__ unsigned char s_sc[2][(TILE_KH / 8) * TILE_STRIDE];
+    __syncthreads();
+
+    const unsigned int r = lane / 2u;
+    const unsigned int off = (lane % 2u) * 16u;
+    auto stage = [&](unsigned int tg, unsigned int buf) {
+        const unsigned int r0 = tg * TILE_KH;
+        _Pragma("unroll")
+        for (unsigned int w = 0; w < TILE_KH / 16u; w++) {
+            unsigned int rr = r + w * 16u;
+            *(uint4*)&s_pk[buf][rr * TILE_STRIDE + off] =
+                *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + off];
+        }
+        const unsigned int ng = TILE_KH / 8u;
+        if (lane < ng * 2u) {
+            unsigned int sg = lane / 2u;
+            unsigned int off2 = (lane % 2u) * 16u;
+            *(uint4*)&s_sc[buf][sg * TILE_STRIDE + off2] =
+                *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + off2];
+        }
+    };
+
+    float acc = 0.0f;
+    const unsigned int ntg = (K / 2u) / TILE_KH;
+    stage(0, 0);
+    for (unsigned int tg = 0; tg < ntg; tg++) {
+        __syncthreads();
+        if (tg + 1u < ntg) stage(tg + 1u, (tg + 1u) & 1u);
+        const unsigned int buf = tg & 1u;
+        if (valid) {
+            #define SD_TILE_ACC(GS_, E8M0_) do { \
+                if constexpr ((GS_) == 16) { \
+                    _Pragma("unroll 8") \
+                    for (unsigned int rr = 0; rr < TILE_KH; rr++) { \
+                        unsigned int k_half = tg * TILE_KH + rr; \
+                        float sc = mx_block_scale<(E8M0_)>(s_sc[buf][(rr >> 3) * TILE_STRIDE + lane], s2); \
+                        unsigned char byte = s_pk[buf][rr * TILE_STRIDE + lane]; \
+                        acc += s_act[k_half * 2] * (s_lut[byte & 0xFu] * sc) \
+                             + s_act[k_half * 2 + 1] * (s_lut[(byte >> 4) & 0xFu] * sc); \
+                    } \
+                } \
+            } while(0)
+            if constexpr (GS_R == GS_S && E8M0_R == E8M0_S) {
+                SD_TILE_ACC(GS_R, E8M0_R);
+            } else {
+                if (is_shared) { SD_TILE_ACC(GS_S, E8M0_S); }
+                else           { SD_TILE_ACC(GS_R, E8M0_R); }
+            }
+            #undef SD_TILE_ACC
+        }
+    }
+    __syncthreads();
+    if (!valid) return;
+    if (is_shared) sh_down_out[n] = __float2bfloat16(acc);
+    else C[(unsigned long long)expert_slot * N + n] = __float2bfloat16(acc);
 }
