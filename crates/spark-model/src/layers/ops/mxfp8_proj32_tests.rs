@@ -44,8 +44,9 @@ mod gpu {
     #[test]
     #[ignore = "GPU"]
     fn batchm32_rows_match_gemv_rows_bit_for_bit() {
-        let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
-            .expect("CUDA backend");
+        let gpu =
+            spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+                .expect("CUDA backend");
         let g: &dyn GpuBackend = &gpu;
         let stream = g.default_stream();
         let kernels = Mxfp8ProjKernels::resolve(g).expect("mxfp8 kernels");
@@ -53,7 +54,9 @@ mod gpu {
         for &(n, k, label) in SHAPES {
             // Hostile bytes: full-random E4M3 (subnormals + NaN codes) and
             // E8M0 including 0 and 0xFF, plus deliberately planted edge codes.
-            let mut w = (0..(n as usize * k as usize)).map(|_| rng.u8()).collect::<Vec<u8>>();
+            let mut w = (0..(n as usize * k as usize))
+                .map(|_| rng.u8())
+                .collect::<Vec<u8>>();
             let mut s = (0..(n as usize * (k / 32) as usize))
                 .map(|_| rng.u8())
                 .collect::<Vec<u8>>();
@@ -64,7 +67,10 @@ mod gpu {
             s[1] = 0xFF;
             let (wd, sd) = (upload(g, &w).unwrap(), upload(g, &s).unwrap());
             let proj = Mxfp8Proj {
-                w: Mxfp8Weight { data: wd, scales: sd },
+                w: Mxfp8Weight {
+                    data: wd,
+                    scales: sd,
+                },
                 n,
                 k,
             };
@@ -95,8 +101,17 @@ mod gpu {
                 }
                 // bucketed launch writes into a second buffer.
                 let cb = g.alloc(cm_bytes).unwrap();
-                mxfp8_proj(g, &kernels, &proj, ad, cb, m, Mxfp8Scratch { ptr: cb, bytes: 0 }, stream)
-                    .unwrap();
+                mxfp8_proj(
+                    g,
+                    &kernels,
+                    &proj,
+                    ad,
+                    cb,
+                    m,
+                    Mxfp8Scratch { ptr: cb, bytes: 0 },
+                    stream,
+                )
+                .unwrap();
                 // ref rows are in cm[0..m]; compare cb rows to cm rows.
                 let (got, want) = (
                     down(g, cb, cm_bytes).unwrap(),
@@ -109,16 +124,24 @@ mod gpu {
     #[test]
     #[ignore = "GPU"]
     fn tc_rows_row_invariant_and_near_gemv() {
-        let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
-            .expect("CUDA backend");
+        let gpu =
+            spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+                .expect("CUDA backend");
         let g: &dyn GpuBackend = &gpu;
         let stream = g.default_stream();
         let kernels = Mxfp8ProjKernels::resolve(g).expect("mxfp8 kernels");
-        assert!(kernels.tc.0 != 0, "mxfp8_proj_tc must be in the target module");
+        assert!(
+            kernels.tc.0 != 0,
+            "mxfp8_proj_tc must be in the target module"
+        );
         let mut rng = Lcg(0xB7E55);
         for &(n, k, label) in SHAPES {
-            let w = (0..(n as usize * k as usize)).map(|_| rng.u8()).collect::<Vec<u8>>();
-            let s = (0..(n as usize * (k / 32) as usize)).map(|_| rng.u8()).collect::<Vec<u8>>();
+            let w = (0..(n as usize * k as usize))
+                .map(|_| rng.u8())
+                .collect::<Vec<u8>>();
+            let s = (0..(n as usize * (k / 32) as usize))
+                .map(|_| rng.u8())
+                .collect::<Vec<u8>>();
             let (wd, sd) = (upload(g, &w).unwrap(), upload(g, &s).unwrap());
             let a: Vec<half::bf16> = (0..32 * k as usize)
                 .map(|_| half::bf16::from_f32(rng.u8() as f32 / 128.0 - 1.0))
@@ -168,16 +191,30 @@ mod gpu {
                     KernelLaunch::new(g, kernels.tc)
                         .grid([div_ceil(n, 64), div_ceil(9u32, 16), 1])
                         .block([128, 1, 1])
-                        .arg_ptr(ad).arg_ptr(wd).arg_ptr(sd).arg_ptr(cmd)
-                        .arg_u32(9).arg_u32(n).arg_u32(k).launch(stream).unwrap();
+                        .arg_ptr(ad)
+                        .arg_ptr(wd)
+                        .arg_ptr(sd)
+                        .arg_ptr(cmd)
+                        .arg_u32(9)
+                        .arg_u32(n)
+                        .arg_u32(k)
+                        .launch(stream)
+                        .unwrap();
                 }
                 let d1 = down(g, cmd, 9 * n as usize * 2).unwrap();
                 for _ in 0..2 {
                     KernelLaunch::new(g, kernels.tc)
                         .grid([div_ceil(n, 64), div_ceil(9u32, 16), 1])
                         .block([128, 1, 1])
-                        .arg_ptr(ad).arg_ptr(wd).arg_ptr(sd).arg_ptr(cmd)
-                        .arg_u32(9).arg_u32(n).arg_u32(k).launch(stream).unwrap();
+                        .arg_ptr(ad)
+                        .arg_ptr(wd)
+                        .arg_ptr(sd)
+                        .arg_ptr(cmd)
+                        .arg_u32(9)
+                        .arg_u32(n)
+                        .arg_u32(k)
+                        .launch(stream)
+                        .unwrap();
                 }
                 let d2 = down(g, cmd, 9 * n as usize * 2).unwrap();
                 eprintln!("{label}: tc m=9 relaunch deterministic: {}", d1 == d2);
@@ -190,11 +227,21 @@ mod gpu {
                 KernelLaunch::new(g, kernels.tc)
                     .grid([div_ceil(n, 64), div_ceil(9u32, 16), 1])
                     .block([128, 1, 1])
-                    .arg_ptr(adz).arg_ptr(wd).arg_ptr(sd).arg_ptr(cmd)
-                    .arg_u32(9).arg_u32(n).arg_u32(k).launch(stream).unwrap();
+                    .arg_ptr(adz)
+                    .arg_ptr(wd)
+                    .arg_ptr(sd)
+                    .arg_ptr(cmd)
+                    .arg_u32(9)
+                    .arg_u32(n)
+                    .arg_u32(k)
+                    .launch(stream)
+                    .unwrap();
                 let dz = down(g, cmd, 9 * n as usize * 2).unwrap();
                 let row0_eq = dz[..2 * n as usize] == tc_rows[..2 * n as usize];
-                eprintln!("{label}: m=9 with A rows>=8 zeroed, row0 == ref: {}", row0_eq);
+                eprintln!(
+                    "{label}: m=9 with A rows>=8 zeroed, row0 == ref: {}",
+                    row0_eq
+                );
                 // Which side is broken: compare tc(m=9) row0 and tc(m=1) row0
                 // against the exact gemv row for the same A row.
                 let d9 = dz[..2 * n as usize]
@@ -254,10 +301,17 @@ mod gpu {
             // make ULP meaningless).
             let mut rng2 = Lcg(0xC0FFEE);
             let w2: Vec<u8> = (0..(n as usize * k as usize))
-                .map(|_| loop { let b = rng2.u8(); if b != 0x7F && b != 0xFF { break b } })
+                .map(|_| {
+                    loop {
+                        let b = rng2.u8();
+                        if b != 0x7F && b != 0xFF {
+                            break b;
+                        }
+                    }
+                })
                 .collect();
             let s2: Vec<u8> = (0..(n as usize * (k / 32) as usize))
-                .map(|_| 115 + rng2.u8() % 13)  // 2^-12 .. 2^0
+                .map(|_| 115 + rng2.u8() % 13) // 2^-12 .. 2^0
                 .collect();
             let (wd2, sd2) = (upload(g, &w2).unwrap(), upload(g, &s2).unwrap());
             let cd2 = g.alloc(32 * (n as usize) * 2).unwrap();
@@ -276,7 +330,11 @@ mod gpu {
             let got2 = down(g, cd2, 32 * n as usize * 2).unwrap();
             let e4m3 = |b: u8| -> f64 {
                 let (sg, e, m) = ((b >> 7) as i64, (b >> 3) as i64 & 0xF, (b & 7) as f64);
-                let v = if e == 0 { m * 2f64.powi(-9) } else { (1.0 + m / 8.0) * 2f64.powi(e as i32 - 7) };
+                let v = if e == 0 {
+                    m * 2f64.powi(-9)
+                } else {
+                    (1.0 + m / 8.0) * 2f64.powi(e as i32 - 7)
+                };
                 if sg != 0 { -v } else { v }
             };
             let e8m0 = |b: u8| -> f64 { 2f64.powi(b as i32 - 127) };
@@ -298,8 +356,11 @@ mod gpu {
                     max_ulp = max_ulp.max((refb - gotb).unsigned_abs());
                 }
             }
-            assert!(max_ulp <= 1, "{label}: tc vs FP64 reference {max_ulp} ulp
-");
+            assert!(
+                max_ulp <= 1,
+                "{label}: tc vs FP64 reference {max_ulp} ulp
+"
+            );
             // Report divergence vs the exact CUDA-core path (informational).
             let mut diffs = 0usize;
             let mut maxd = 0f32;
@@ -309,20 +370,23 @@ mod gpu {
                 if a16 != b16 {
                     diffs += 1;
                     maxd = maxd.max(
-                        (half::bf16::from_bits(a16).to_f32()
-                            - half::bf16::from_bits(b16).to_f32())
-                        .abs(),
+                        (half::bf16::from_bits(a16).to_f32() - half::bf16::from_bits(b16).to_f32())
+                            .abs(),
                     );
                 }
             }
-            eprintln!("tc-vs-gemv {label}: {diffs}/{} differ, max |diff| {maxd}", 32 * n as usize);
+            eprintln!(
+                "tc-vs-gemv {label}: {diffs}/{} differ, max |diff| {maxd}",
+                32 * n as usize
+            );
         }
     }
     #[test]
     #[ignore = "GPU"]
     fn tc_rows_onehot_leak_map() {
-        let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
-            .expect("CUDA backend");
+        let gpu =
+            spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+                .expect("CUDA backend");
         let g: &dyn GpuBackend = &gpu;
         let stream = g.default_stream();
         let kernels = Mxfp8ProjKernels::resolve(g).expect("mxfp8 kernels");
@@ -362,9 +426,10 @@ mod gpu {
             for r in 0..m {
                 let mut distinct = std::collections::BTreeSet::new();
                 for c in 0..n as usize {
-                    distinct.insert(u16::from_le_bytes(
-                        [got[(r * n as usize + c) * 2], got[(r * n as usize + c) * 2 + 1]],
-                    ));
+                    distinct.insert(u16::from_le_bytes([
+                        got[(r * n as usize + c) * 2],
+                        got[(r * n as usize + c) * 2 + 1],
+                    ]));
                 }
                 let want = half::bf16::from_f32((r + 1) as f32).to_bits();
                 if !(distinct.len() == 1 && distinct.contains(&want)) {
@@ -373,5 +438,81 @@ mod gpu {
             }
             eprintln!("m={m}: leak map done");
         }
+    }
+    #[test]
+    #[ignore = "GPU"]
+    fn tc_dispatch_covers_m1() {
+        let gpu =
+            spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+                .expect("CUDA backend");
+        let g: &dyn GpuBackend = &gpu;
+        let stream = g.default_stream();
+        let kernels = Mxfp8ProjKernels::resolve(g).expect("mxfp8 kernels");
+        assert!(
+            kernels.tc.0 != 0,
+            "mxfp8_proj_tc must be in the target module"
+        );
+        unsafe { std::env::set_var("ATLAS_QWEN4EXP_MXFP8_TC", "1") };
+        let (n, k) = (8192u32, 2560u32);
+        let mut rng = Lcg(0xD15EA5E);
+        let w: Vec<u8> = (0..(n as usize * k as usize)).map(|_| rng.u8()).collect();
+        let s: Vec<u8> = (0..(n as usize * (k / 32) as usize))
+            .map(|_| rng.u8())
+            .collect();
+        let (wd, sd) = (upload(g, &w).unwrap(), upload(g, &s).unwrap());
+        let a: Vec<half::bf16> = (0..32 * k as usize)
+            .map(|_| half::bf16::from_f32(rng.u8() as f32 / 128.0 - 1.0))
+            .collect();
+        let ad = upload(
+            g,
+            &a.iter()
+                .flat_map(|x| x.to_bits().to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        let proj = Mxfp8Proj {
+            w: Mxfp8Weight {
+                data: wd,
+                scales: sd,
+            },
+            n,
+            k,
+        };
+        let (c1, c9) = (
+            g.alloc(32 * n as usize * 2).unwrap(),
+            g.alloc(32 * n as usize * 2).unwrap(),
+        );
+        mxfp8_proj(
+            g,
+            &kernels,
+            &proj,
+            ad,
+            c1,
+            1,
+            Mxfp8Scratch { ptr: c1, bytes: 0 },
+            stream,
+        )
+        .unwrap();
+        mxfp8_proj(
+            g,
+            &kernels,
+            &proj,
+            ad,
+            c9,
+            9,
+            Mxfp8Scratch { ptr: c9, bytes: 0 },
+            stream,
+        )
+        .unwrap();
+        let (b1, b9) = (
+            down(g, c1, n as usize * 2).unwrap(),
+            down(g, c9, 9 * n as usize * 2).unwrap(),
+        );
+        assert_eq!(
+            b1,
+            b9[..n as usize * 2],
+            "with ATLAS_QWEN4EXP_MXFP8_TC=1, m=1 must run the tc kernel: its row 0 must equal the m=9 launch's"
+        );
+        unsafe { std::env::remove_var("ATLAS_QWEN4EXP_MXFP8_TC") };
     }
 }

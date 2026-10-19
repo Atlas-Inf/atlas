@@ -61,12 +61,22 @@ impl Mxfp8ProjKernels {
 /// the tensor-core MMA family (NOT bit-identical to the GEMV tiers; both
 /// ranks must agree — read once at load, `model::startup_parity`).
 fn mxfp8_tc_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("ATLAS_QWEN4EXP_MXFP8_TC").as_deref() == Ok("1");
-        tracing::info!("mxfp8_proj tensor-core tier {}", if on { "ON" } else { "off" });
-        on
-    })
+    #[cfg(test)]
+    {
+        return std::env::var("ATLAS_QWEN4EXP_MXFP8_TC").as_deref() == Ok("1");
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var("ATLAS_QWEN4EXP_MXFP8_TC").as_deref() == Ok("1");
+            tracing::info!(
+                "mxfp8_proj tensor-core tier {}",
+                if on { "ON" } else { "off" }
+            );
+            on
+        })
+    }
 }
 
 /// A BF16 scratch for the prefill expansion: device pointer and capacity.
@@ -114,18 +124,9 @@ fn gemv_rows(
     stream: u64,
 ) -> Result<()> {
     let Mxfp8Proj { w, n, k } = *proj;
-    if m == 1 {
-        return KernelLaunch::new(gpu, kernels.gemv)
-            .grid([div_ceil(n, 4), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(act)
-            .arg_ptr(w.data)
-            .arg_ptr(w.scales)
-            .arg_ptr(out)
-            .arg_u32(n)
-            .arg_u32(k)
-            .launch(stream);
-    }
+    // The tensor-core tier is a distinct numerics family: when opted in it
+    // must take EVERY m <= 32 (serial decode included), or speculative
+    // verify rows would be computed on a different family than serial rows.
     if kernels.tc.0 != 0 && mxfp8_tc_enabled() && k % 16 == 0 {
         return KernelLaunch::new(gpu, kernels.tc)
             .grid([div_ceil(n, 64), div_ceil(m as u32, 16), 1])
@@ -135,6 +136,18 @@ fn gemv_rows(
             .arg_ptr(w.scales)
             .arg_ptr(out)
             .arg_u32(m as u32)
+            .arg_u32(n)
+            .arg_u32(k)
+            .launch(stream);
+    }
+    if m == 1 {
+        return KernelLaunch::new(gpu, kernels.gemv)
+            .grid([div_ceil(n, 4), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(act)
+            .arg_ptr(w.data)
+            .arg_ptr(w.scales)
+            .arg_ptr(out)
             .arg_u32(n)
             .arg_u32(k)
             .launch(stream);
