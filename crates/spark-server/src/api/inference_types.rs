@@ -360,8 +360,8 @@ pub struct InferenceResponse {
     /// Number of prompt tokens served by the prefix cache (no prefill compute
     /// cost). Reported as `usage.prompt_tokens_details.cached_tokens`.
     pub cached_prompt_tokens: u32,
-    /// Speculative-decode draft tokens ACCEPTED for this request (MTP verify
-    /// path, `RequestAccept::accepted_total`). Reported to clients as
+    /// Accepted speculative draft tokens retained in this completion
+    /// (`RequestAccept::accepted_output_total`). Reported to clients as
     /// `usage.completion_tokens_details.accepted_prediction_tokens` — the
     /// OpenAI field's meaning (predicted tokens that matched generation),
     /// carried by Atlas's self-drafted MTP predictions. 0 when speculation is
