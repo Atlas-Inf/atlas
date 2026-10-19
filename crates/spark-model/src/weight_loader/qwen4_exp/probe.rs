@@ -29,9 +29,12 @@ pub struct NamespaceReport {
     pub stray_layer_norms: usize,
 }
 
-/// A projection is present in either the dense/NVFP4 layout (`.weight`) or the EXL3 one (`.trellis`).
+/// A projection is present in the dense/NVFP4 layout (`.weight`), the compressed-tensors
+/// one (`.weight_packed`), or the EXL3 one (`.trellis`).
 fn has_linear(store: &WeightStore, stem: &str) -> bool {
-    store.contains(&format!("{stem}.weight")) || store.contains(&format!("{stem}.trellis"))
+    store.contains(&format!("{stem}.weight"))
+        || store.contains(&format!("{stem}.weight_packed"))
+        || store.contains(&format!("{stem}.trellis"))
 }
 
 /// The n-gram tables are deferred (served from NVMe), which `contains` does not see.

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! `audit_namespace` must see every projection of an EXL3 checkpoint (`.trellis`
-//! instead of `.weight`) and the deferred n-gram tables (never in the store map).
+//! instead of `.weight`), of a compressed-tensors one (`.weight_packed`), and the
+//! deferred n-gram tables (never in the store map).
 
 use super::*;
 use spark_runtime::gpu::DevicePtr;
@@ -71,6 +72,44 @@ fn exl3_layout_is_counted() {
     ];
     // EXL3 ships the whole n-gram table as ONE deferred tensor, no shards.
     let deferred = [n(format!("{l1}.ple.ple_embedding.ngram_embedding.trellis"))];
+    let r = audit_namespace(&store(&names, &deferred), &c);
+    assert_eq!(r.gdn_layers, 1);
+    assert_eq!(r.attn_layers, 1);
+    assert_eq!(r.indexer_tensors, 1);
+    assert_eq!(r.expert_tensors, 2);
+    assert!(r.has_lm_head);
+    assert_eq!(r.ple_shards, 2);
+    assert!(r.ensure_loadable().is_ok());
+}
+
+#[test]
+fn compressed_tensors_layout_is_counted() {
+    // A mixed-precision compressed-tensors checkpoint: the routed experts are NVFP4 and
+    // carry `.weight_packed`, while attention and lm_head are FP8 with a plain `.weight`.
+    // Probing only `.weight` therefore counts every layer's attention but no experts,
+    // and the load is refused with "0 of N layers have routed experts".
+    let c = config();
+    let l0 = c.layer_prefix(0);
+    let l1 = c.layer_prefix(1);
+    let names = [
+        n(format!("{l0}.linear_attn.in_proj_qkv.weight")),
+        n(format!("{l1}.self_attn.q_proj.weight")),
+        n(format!("{l1}.self_attn.indexer.index_qk_proj.weight")),
+        n(format!("{l0}.mlp.experts.0.gate_proj.weight_packed")),
+        n(format!("{l1}.mlp.experts.0.gate_proj.weight_packed")),
+        n(format!("{l0}.attn_hyper_connection.hc_norm.weight")),
+        n(format!("{l1}.attn_hyper_connection.hc_norm.weight")),
+        n(format!("{l0}.mlp_hyper_connection.hc_norm.weight")),
+        n(format!("{l1}.mlp_hyper_connection.hc_norm.weight")),
+        n("model.language_model.embed_tokens.weight".into()),
+        n("lm_head.weight".into()),
+    ];
+    // The n-gram table stays BF16 in this layout and is deferred as numbered shards.
+    let base = format!("{l1}.ple.ple_embedding.ngram_embedding");
+    let deferred = [
+        n(format!("{base}.shard_0.weight")),
+        n(format!("{base}.shard_1.weight")),
+    ];
     let r = audit_namespace(&store(&names, &deferred), &c);
     assert_eq!(r.gdn_layers, 1);
     assert_eq!(r.attn_layers, 1);
