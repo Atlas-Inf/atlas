@@ -291,6 +291,8 @@ pub struct MoeLayer {
     pub(super) quantize_nvfp4_k: KernelHandle,
     pub(super) silu_mul_quant_nvfp4_k: KernelHandle,
     pub(super) moe_fused_gate_up_t: KernelHandle,
+    /// Both `_f16a` routed-MoE twins resolved (native HIP only).
+    pub(super) moe_f16_prefill: bool,
     pub(super) moe_fused_gate_up_t_k64: KernelHandle,
     // ARM-2 Phase-K: native-MXFP4 (E8M0 per-32) prefill variants of the W4A16
     // routed-expert GEMMs. KernelHandle(0) on models that don't ship them

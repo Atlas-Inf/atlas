@@ -213,8 +213,38 @@ impl MtpHead {
                 Ok(())
             });
 
-            // 4. fc: [c, 2h] → [c, h], then input layernorm.
+            // 4. fc: [c, 2h] → [c, h], then input layernorm. On native HIP,
+            // hipBLASLt first (~25x the scalar kernel at the 27B drafter's
+            // 5120x10240 fc shape, 2026-10-04), scalar `dense_gemm` as the
+            // fallback.
             phase!(t_fc, {
+                #[cfg(atlas_hip)]
+                {
+                    ops::hip_bf16_proj_or(
+                        "mtp_drafter_fc",
+                        scratch.concat,
+                        fc_w.weight,
+                        scratch.fc_out,
+                        c as u32,
+                        h as u32,
+                        (2 * h) as u32,
+                        stream,
+                        || {
+                            ops::dense_gemm(
+                                ctx.gpu,
+                                self.dense_gemm_k,
+                                scratch.concat,
+                                fc_w,
+                                scratch.fc_out,
+                                c as u32,
+                                h as u32,
+                                (2 * h) as u32,
+                                stream,
+                            )
+                        },
+                    )
+                }
+                #[cfg(not(atlas_hip))]
                 ops::dense_gemm(
                     ctx.gpu,
                     self.dense_gemm_k,
