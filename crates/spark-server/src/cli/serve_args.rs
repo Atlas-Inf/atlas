@@ -529,8 +529,9 @@ pub struct ServeArgs {
     /// or `enable_thinking` in the request body). A JSON object with
     /// optional keys: `enable_thinking` (bool), `thinking_budget` (u32),
     /// `reasoning_effort` (none|minimal|low|medium|high|xhigh|max — the
-    /// served default effort tier when clients are silent; unset = the
-    /// neutral "medium"), `preserve_thinking` (bool). Unknown keys or an
+    /// served default effort tier when clients are silent; unset = MODEL.toml
+    /// `[behavior].default_reasoning_effort`, else the template's own
+    /// default), `preserve_thinking` (bool). Unknown keys or an
     /// unknown `reasoning_effort` value abort startup (fail-fast; they
     /// were silently ignored before 2026-08-15).
     ///

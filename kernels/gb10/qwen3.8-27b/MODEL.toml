@@ -199,6 +199,11 @@ thinking_default = true
 # Project-wide defaults (2026-05-23 sweep), same rationale as the siblings.
 thinking_in_tools = true
 max_thinking_budget = 2048
+# Effort-silent requests render the template's "medium" tier (no directive
+# sentence), the tier this target's budget was tuned with; the checkpoint
+# template's own default is xhigh. Clients and --default-chat-template-kwargs
+# still pick any tier.
+default_reasoning_effort = "medium"
 # FP8 KV cache: a property of the shared kernel set (cp.async-pipelined
 # inferspark_prefill_paged_fp8.cu, enabled for qwen3.6-27b 2026-07-19),
 # not of the weights — carried with the kernels.
