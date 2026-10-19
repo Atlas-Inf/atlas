@@ -35,6 +35,9 @@ pub struct Mxfp8ProjKernels {
     pub gemv: KernelHandle,
     pub batchm: KernelHandle,
     pub dequant: KernelHandle,
+    /// Register-tiled 2..=32-row tier (`mxfp8_proj_rows32`); optional —
+    /// targets without it fall back to `batchm`.
+    pub rows32: KernelHandle,
 }
 
 impl Mxfp8ProjKernels {
@@ -45,6 +48,7 @@ impl Mxfp8ProjKernels {
             gemv: gpu.kernel("mxfp8_proj", "mxfp8_proj_gemv")?,
             batchm: gpu.kernel("mxfp8_proj", "mxfp8_proj_batchm")?,
             dequant: gpu.kernel("mxfp8_proj", "mxfp8_proj_dequant")?,
+            rows32: gpu.kernel("mxfp8_proj", "mxfp8_proj_rows32")?,
         })
     }
 }
@@ -102,6 +106,19 @@ fn gemv_rows(
             .arg_ptr(w.data)
             .arg_ptr(w.scales)
             .arg_ptr(out)
+            .arg_u32(n)
+            .arg_u32(k)
+            .launch(stream);
+    }
+    if kernels.rows32.0 != 0 && m > 16 {
+        return KernelLaunch::new(gpu, kernels.rows32)
+            .grid([div_ceil(n, 8), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(act)
+            .arg_ptr(w.data)
+            .arg_ptr(w.scales)
+            .arg_ptr(out)
+            .arg_u32(m as u32)
             .arg_u32(n)
             .arg_u32(k)
             .launch(stream);

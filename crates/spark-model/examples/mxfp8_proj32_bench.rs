@@ -10,7 +10,7 @@
 use anyhow::Result;
 use half::bf16;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 const SHAPES: &[(u32, u32, &str)] = &[
@@ -33,7 +33,8 @@ fn main() -> Result<()> {
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &gpu;
     let stream = g.default_stream();
-    let k = (gpu.kernel("mxfp8_proj", "mxfp8_proj_batchm")?, KernelHandle(0));
+    let kb = gpu.kernel("mxfp8_proj", "mxfp8_proj_batchm")?;
+    let kr = gpu.kernel("mxfp8_proj", "mxfp8_proj_rows32")?;
     let mut rng: u64 = 0x5EED;
     let mut next = move || {
         rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -52,10 +53,24 @@ fn main() -> Result<()> {
         let ad = up(g, &ab)?;
         let cd = g.alloc(32 * n as usize * 2)?;
         for &m in MS {
-            let launch = |chunk: usize| -> Result<()> {
-                for first in (0..m).step_by(chunk) {
-                    let rows = (m - first).min(chunk);
-                    KernelLaunch::new(g, k.0)
+            // old = the 8-row chunked batchm loop; new = one rows32 launch.
+            let launch = |rows32: bool| -> Result<()> {
+                if rows32 {
+                    return KernelLaunch::new(g, kr)
+                        .grid([div_ceil(n, 8), 1, 1])
+                        .block([256, 1, 1])
+                        .arg_ptr(ad)
+                        .arg_ptr(wd)
+                        .arg_ptr(sd)
+                        .arg_ptr(cd)
+                        .arg_u32(m as u32)
+                        .arg_u32(n)
+                        .arg_u32(kk)
+                        .launch(stream);
+                }
+                for first in (0..m).step_by(8) {
+                    let rows = (m - first).min(8);
+                    KernelLaunch::new(g, kb)
                         .grid([div_ceil(n, 4), 1, 1])
                         .block([256, 1, 1])
                         .arg_ptr(ad.offset(first * kk as usize * 2))
@@ -69,15 +84,15 @@ fn main() -> Result<()> {
                 }
                 Ok(())
             };
-            let time = |chunk: usize| -> Result<f64> {
-                for _ in 0..WARMUP { launch(chunk)?; }
+            let time = |rows32: bool| -> Result<f64> {
+                for _ in 0..WARMUP { launch(rows32)?; }
                 g.synchronize(stream)?;
                 let t0 = std::time::Instant::now();
-                for _ in 0..ITERS { launch(chunk)?; }
+                for _ in 0..ITERS { launch(rows32)?; }
                 g.synchronize(stream)?;
                 Ok(t0.elapsed().as_micros() as f64 / ITERS as f64)
             };
-            let (old, new) = (time(8)?, time(m)?);
+            let (old, new) = (time(false)?, time(true)?);
             let gbps = (n as u64 * kk as u64 + n as u64 * (kk / 32) as u64) as f64 / (new * 1e3);
             println!("{label:>16} {m:>4} {old:>10.1} {new:>10.1} {gbps:>10.0}");
         }

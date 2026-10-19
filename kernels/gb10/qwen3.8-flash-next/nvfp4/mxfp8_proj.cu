@@ -236,3 +236,98 @@ extern "C" __global__ void __launch_bounds__(MX8_BLOCK_THREADS) mxfp8_proj_dequa
     dst[0] = make_uint4(out[0], out[1], out[2], out[3]);
     dst[1] = make_uint4(out[4], out[5], out[6], out[7]);
 }
+
+// mxfp8_proj_rows32: the rows32t-style tiling over the same arithmetic. Each
+// thread owns one lane of TWO outputs (n0, n0+4 within the block), so every
+// activation chunk it loads feeds both: the per-(row, output) computation is
+// mx8_gemv_rows<1>'s exactly -- 64 lanes walk chunks c = lane + 64j in order,
+// p is the 16 products in input order, acc += p * scale, the two-warp shfl
+// tree, lane0 + lane32 rounded once. The weight chunk is decoded through the
+// LUT once per (chunk, output) and reused for all rows, and dead rows
+// (t >= m) read row m-1 and are never stored.
+// Grid: (ceil(N / 8)), Block: 256 -- eight outputs, 64 threads each.
+extern "C" __global__ void __launch_bounds__(256) mxfp8_proj_rows32(
+    const __nv_bfloat16* __restrict__ A,   // [M, K]
+    const unsigned char* __restrict__ B,   // [N, K] E4M3
+    const unsigned char* __restrict__ S,   // [N, K/32] E8M0
+    __nv_bfloat16* __restrict__ C,         // [M, N]
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    __shared__ float s_lut[256];
+    __shared__ float s_red[8 * 2 * 32];
+    s_lut[threadIdx.x] = mx8_e4m3_to_f32(threadIdx.x);
+    __syncthreads();
+
+    const unsigned int grp = threadIdx.x / 64;   // output pair group 0..3
+    const unsigned int lane = threadIdx.x % 64;
+    const unsigned int n0 = blockIdx.x * 8 + grp * 2;
+    const bool live0 = n0 < N, live1 = n0 + 1 < N;
+
+    float acc0[MX8_MAX_M], acc1[MX8_MAX_M];
+    #pragma unroll
+    for (int t = 0; t < MX8_MAX_M; t++) { acc0[t] = 0.0f; acc1[t] = 0.0f; }
+
+    if (live0) {
+        const unsigned int k16s = K / 16;
+        const uint4* wrow0 = (const uint4*)(B + (unsigned long long)n0 * K);
+        const uint4* wrow1 = live1
+            ? (const uint4*)(B + (unsigned long long)(n0 + 1) * K)
+            : wrow0;
+        const unsigned char* srow0 = S + (unsigned long long)n0 * (K / MX8_GROUP);
+        const unsigned char* srow1 = live1
+            ? S + (unsigned long long)(n0 + 1) * (K / MX8_GROUP)
+            : srow0;
+        for (unsigned int c = lane; c < k16s; c += 64) {
+            const uint4 w0 = wrow0[c];
+            const uint4 w1 = wrow1[c];
+            const float sc0 = mx8_e8m0_to_f32(srow0[c >> 1]);
+            const float sc1 = mx8_e8m0_to_f32(srow1[c >> 1]);
+            float w0f[16], w1f[16];
+            const unsigned int v0[4] = {w0.x, w0.y, w0.z, w0.w};
+            const unsigned int v1[4] = {w1.x, w1.y, w1.z, w1.w};
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                w0f[4 * i] = s_lut[v0[i] & 0xFF];
+                w0f[4 * i + 1] = s_lut[(v0[i] >> 8) & 0xFF];
+                w0f[4 * i + 2] = s_lut[(v0[i] >> 16) & 0xFF];
+                w0f[4 * i + 3] = s_lut[v0[i] >> 24];
+                w1f[4 * i] = s_lut[v1[i] & 0xFF];
+                w1f[4 * i + 1] = s_lut[(v1[i] >> 8) & 0xFF];
+                w1f[4 * i + 2] = s_lut[(v1[i] >> 16) & 0xFF];
+                w1f[4 * i + 3] = s_lut[v1[i] >> 24];
+            }
+            #pragma unroll
+            for (int t = 0; t < MX8_MAX_M; t++) {
+                const unsigned int tr = (unsigned int)t < M ? (unsigned int)t : M - 1;
+                const uint4* arow = (const uint4*)(A + (unsigned long long)tr * K);
+                acc0[t] += mx8_chunk_dot(w0f, arow[2 * c], arow[2 * c + 1]) * sc0;
+                acc1[t] += mx8_chunk_dot(w1f, arow[2 * c], arow[2 * c + 1]) * sc1;
+            }
+        }
+    }
+
+    const unsigned int wi = lane / 32;
+    #pragma unroll
+    for (int t = 0; t < MX8_MAX_M; t++) {
+        float v0 = acc0[t], v1 = acc1[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            v0 += __shfl_down_sync(0xFFFFFFFF, v0, o);
+            v1 += __shfl_down_sync(0xFFFFFFFF, v1, o);
+        }
+        if ((lane & 31) == 0) {
+            s_red[(grp * 2 * 2 + wi) * 32 + t] = v0;
+            s_red[(grp * 2 * 2 + 2 + wi) * 32 + t] = v1;
+        }
+    }
+    __syncthreads();
+    if (lane < M) {
+        const unsigned int t = lane;
+        if (live0) C[(unsigned long long)t * N + n0] = __float2bfloat16_rn(
+            s_red[(grp * 4) * 32 + t] + s_red[(grp * 4 + 1) * 32 + t]);
+        if (live1) C[(unsigned long long)t * N + n0 + 1] = __float2bfloat16_rn(
+            s_red[(grp * 4 + 2) * 32 + t] + s_red[(grp * 4 + 3) * 32 + t]);
+    }
+}
