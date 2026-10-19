@@ -153,7 +153,17 @@ pub fn step_verify_k2(
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax) = (result_vec[0], result_vec[1]);
 
-    let (v0, v1) = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+    let Ok(scored) =
+        super::verify_pipeline_helper::scored::requested(model, 2, a, verify_ctx, 0, None)
+    else {
+        return;
+    };
+    let (v0, v1) = if let Some(s) = &scored {
+        (
+            s.tokens.first().copied().unwrap_or(v0_argmax),
+            s.tokens.get(1).copied().unwrap_or(v1_argmax),
+        )
+    } else if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
         model,
@@ -187,12 +197,7 @@ pub fn step_verify_k2(
     // itself when the lever is off.
     let next_drafts = a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth());
 
-    // Extract logprobs from verify logits buffer (K=2 positions) when requested.
-    let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
-        extract_verify_logprobs(model, &[v0, v1], top_logprobs, 0)
-    } else {
-        Vec::new()
-    };
+    let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
 
     // EP: always broadcast accept/reject to worker (prevents deadlock on EOS).
     if let Err(e) = model.ep_broadcast_cmd(accepted as u32) {

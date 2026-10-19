@@ -927,15 +927,17 @@ pub fn run(
             // `--ngram-speculative` still falls through to MTP.
             if use_ngram_speculative
                 && active.len() == 1
-                && !(spec_slots_covered
-                    && active[0].grammar_state.is_none()
-                    && active[0].temperature == 0.0
-                    && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim))
+                && !spec_step::admission::ngram(
+                    &active[0],
+                    spec_slots_covered,
+                    verify_ctx_limit_batched,
+                )
             {
                 tracing::debug!(
-                    "ngram declined: grammar={} temp={} slots_covered={} seq_len={} lim={}",
+                    "ngram declined: grammar={} temp={} logprobs={:?} slots_covered={} seq_len={} lim={}",
                     active[0].grammar_state.is_some(),
                     active[0].temperature,
+                    active[0].top_logprobs,
                     spec_slots_covered,
                     active[0].seq.seq_len,
                     verify_ctx_limit_batched.unwrap_or(0),
@@ -943,10 +945,11 @@ pub fn run(
             }
             if use_ngram_speculative
                 && active.len() == 1
-                && spec_slots_covered
-                && active[0].grammar_state.is_none()
-                && active[0].temperature == 0.0
-                && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
+                && spec_step::admission::ngram(
+                    &active[0],
+                    spec_slots_covered,
+                    verify_ctx_limit_batched,
+                )
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
@@ -980,8 +983,7 @@ pub fn run(
                 }
             } else if use_self_speculative
                 && active.len() == 1
-                && spec_slots_covered
-                && active[0].grammar_state.is_none()
+                && spec_step::admission::self_spec(&active[0], spec_slots_covered)
             {
                 // Self-speculative: draft via layer-skipping, verify with full model.
                 // Clamped to the active slot's tiered verify capacity, like

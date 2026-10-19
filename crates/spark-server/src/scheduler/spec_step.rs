@@ -4,6 +4,8 @@
 
 use super::*;
 
+pub(in crate::scheduler) mod admission;
+
 /// Self-speculative step: draft via layer-skipping, verify with full model.
 /// Combines bootstrap + verify in one step (no pipeline).
 ///
