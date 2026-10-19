@@ -89,7 +89,8 @@ pub(super) fn build_moe(
     // as lossy).
     let fp4_local = !crate::weight_map::modelopt_local::host_decode_modules(config).is_empty();
     let router_nvfp4 = std::env::var("ATLAS_QWEN4EXP_ROUTER_NVFP4").as_deref() == Ok("1");
-    let gate_nvfp4 = if fp4_local && !router_nvfp4 {
+    let row_invariant_router = fp4_local && !router_nvfp4;
+    let gate_nvfp4 = if row_invariant_router {
         tracing::info!("qwen4_exp: router gate on shipped BF16 weight (gate_nvfp4=None)");
         None
     } else {
@@ -108,6 +109,9 @@ pub(super) fn build_moe(
     };
 
     let mut moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+    if row_invariant_router {
+        moe.set_row_invariant_bf16_router();
+    }
     if native_shared {
         let m = |proj: &str, n: usize, k: usize| -> Result<Mxfp8Proj> {
             let [w, s] =

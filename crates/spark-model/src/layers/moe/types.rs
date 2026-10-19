@@ -39,6 +39,12 @@ pub struct MoeLayer {
     /// `dense_gemv_bf16_batchm` or its load-ahead tier for the router logits
     /// (bit-identical per row to `dense_gemv`), or 0.
     pub(super) dense_gemv_batchm: KernelHandle,
+    /// Route decode/verify through the row-invariant `dense_rows` chain when
+    /// the gate is BF16 (gate_nvfp4 = None). Set ONLY by the qwen4_exp FP4-
+    /// Local builder, which ships mlp.gate BF16 and must keep every row's
+    /// logits equal to the single-row `dense_gemv` bytes for spec==serial.
+    /// Every other model with a BF16 router keeps the scalar `dense_gemm`.
+    pub(super) row_invariant_bf16_router: bool,
     pub(super) w4a16_gemv: KernelHandle,
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     pub(super) w4a16_gemv_sw: KernelHandle,

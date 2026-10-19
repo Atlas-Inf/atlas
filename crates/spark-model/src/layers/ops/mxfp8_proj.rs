@@ -48,7 +48,7 @@ impl Mxfp8ProjKernels {
             gemv: gpu.kernel("mxfp8_proj", "mxfp8_proj_gemv")?,
             batchm: gpu.kernel("mxfp8_proj", "mxfp8_proj_batchm")?,
             dequant: gpu.kernel("mxfp8_proj", "mxfp8_proj_dequant")?,
-            rows32: gpu.kernel("mxfp8_proj", "mxfp8_proj_rows32")?,
+            rows32: crate::layers::kernel_pick::try_kernel(gpu, "mxfp8_proj", "mxfp8_proj_rows32"),
         })
     }
 }

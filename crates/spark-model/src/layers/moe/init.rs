@@ -15,6 +15,13 @@ impl MoeLayer {
         Self::new_with_hash(weights, num_experts, gate_nvfp4, None, gpu, config)
     }
 
+    /// Opt in to row-invariant BF16 routing for decode/verify (`types.rs`).
+    /// Called only by the qwen4_exp FP4-Local builder, which ships mlp.gate
+    /// as BF16; other models keep the scalar `dense_gemm` router arm.
+    pub fn set_row_invariant_bf16_router(&mut self) {
+        self.row_invariant_bf16_router = true;
+    }
+
     /// Like [`MoeLayer::new`] but with an optional DeepSeek-V4 hash-routing
     /// `tid2eid` table ([vocab_size, top_k] i64). `Some` marks this as a
     /// hash-routed layer.
@@ -82,6 +89,7 @@ impl MoeLayer {
             pre_expert_norm_k: rms_norm_k,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batchm: super::init_optional::router_gemv_batchm(gpu, config),
+            row_invariant_bf16_router: false,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,

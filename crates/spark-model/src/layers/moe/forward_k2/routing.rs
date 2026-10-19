@@ -33,7 +33,7 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
-        } else {
+        } else if self.row_invariant_bf16_router {
             self.wide_rows.dense_rows(
                 ctx.gpu,
                 self.dense_gemv_batchm,
@@ -41,6 +41,18 @@ impl MoeLayer {
                 &self.weights.gate,
                 gate_logits,
                 (2, num_experts, h, num_experts),
+                stream,
+            )?;
+        } else {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                2,
+                num_experts,
+                h,
                 stream,
             )?;
         }

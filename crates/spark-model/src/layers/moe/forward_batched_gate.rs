@@ -75,7 +75,7 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
-        } else if !fp32_gate {
+        } else if self.row_invariant_bf16_router && !fp32_gate {
             // BF16 router: every row's logits must be the single-row
             // `dense_gemv` bytes, so this uses the row-invariant GEMV tiers
             // rather than the scalar/tiled GEMM.
@@ -91,7 +91,11 @@ impl MoeLayer {
         } else {
             ops::dense_gemm(
                 ctx.gpu,
-                self.dense_gemm_f32out,
+                if fp32_gate {
+                    self.dense_gemm_f32out
+                } else {
+                    self.dense_gemm
+                },
                 router_in,
                 &self.weights.gate,
                 gate_logits,
