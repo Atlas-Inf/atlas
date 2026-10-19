@@ -198,7 +198,14 @@ fn mtp_ladder_steps() -> &'static [(usize, usize)] {
         // the measured fixed cost is 65.8 ms, only 33% of the 16:2 step.
         // Cutting c is the standing lever, and it is what would let a deeper
         // rung pay again.
-        let mut steps = parsed.unwrap_or_else(|| vec![(4, 3), (8, 3), (16, 1), (32, 1)]);
+        // First rung passes the ceiling through: `num_drafts` is already
+        // `min(--num-drafts, verify_max_drafts)`, and a model that serves
+        // K>4 exactly (qwen4_exp's ATLAS_QWEN4EXP_MTP_DEPTH=4..7) must not be
+        // held at 3 by a ladder entry written when 3 was every model's
+        // maximum. `usize::MAX` clamps to `num_drafts` below, so models
+        // capped at 3 keep 3. The 8/16/32 rungs still step down with
+        // concurrency — the ladder's job is the wide end, not the ceiling.
+        let mut steps = parsed.unwrap_or_else(|| vec![(4, usize::MAX), (8, 3), (16, 1), (32, 1)]);
         steps.sort_by_key(|&(n, _)| n);
         steps
     })
@@ -286,6 +293,13 @@ mod tests {
     fn default_ladder_holds_depth_to_the_cap() {
         assert_eq!(mtp_ladder_drafts(1, 3), 3);
         assert_eq!(mtp_ladder_drafts(4, 3), 3);
+        // The first rung is a passthrough: a ceiling above 3 (qwen4_exp
+        // MTP_DEPTH 4..7) reaches the verify at n<=4, and the ladder only
+        // steps down at 8/16/32.
+        assert_eq!(mtp_ladder_drafts(1, 5), 5);
+        assert_eq!(mtp_ladder_drafts(4, 5), 5);
+        assert_eq!(mtp_ladder_drafts(8, 5), 3);
+        assert_eq!(mtp_ladder_drafts(16, 5), 1);
         assert_eq!(mtp_ladder_drafts(5, 3), 3);
         assert_eq!(mtp_ladder_drafts(8, 3), 3);
         // The 16:1 rung (wave 19): ONE draft (K=2, 2 rows/seq) through n=16.
