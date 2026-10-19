@@ -71,22 +71,23 @@ __device__ __forceinline__ float mx8_bf16_hi(unsigned int x) {
 }
 
 // Sum of the 16 products of one weight chunk and one activation chunk, in
-// input order.
+// input order. The weight chunk reaches this pre-decoded through the E4M3
+// LUT: w_f[i] is exactly lut[byte i of w] (same float value), so each row's
+// FMA expression is unchanged; the decode just happens once per chunk for
+// every row in the bucket instead of once per (chunk, row) pair.
 __device__ __forceinline__ float mx8_chunk_dot(
-    const float* __restrict__ lut, uint4 w, uint4 a0, uint4 a1
+    const float* __restrict__ w_f, uint4 a0, uint4 a1
 ) {
-    const unsigned int wv[4] = {w.x, w.y, w.z, w.w};
     const unsigned int av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
     float p = 0.0f;
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-        const unsigned int w32 = wv[i];
         const unsigned int lo = av[2 * i];
         const unsigned int hi = av[2 * i + 1];
-        p += mx8_bf16_lo(lo) * lut[w32 & 0xFF];
-        p += mx8_bf16_hi(lo) * lut[(w32 >> 8) & 0xFF];
-        p += mx8_bf16_lo(hi) * lut[(w32 >> 16) & 0xFF];
-        p += mx8_bf16_hi(hi) * lut[w32 >> 24];
+        p += mx8_bf16_lo(lo) * w_f[4 * i];
+        p += mx8_bf16_hi(lo) * w_f[4 * i + 1];
+        p += mx8_bf16_lo(hi) * w_f[4 * i + 2];
+        p += mx8_bf16_hi(hi) * w_f[4 * i + 3];
     }
     return p;
 }
@@ -125,11 +126,22 @@ __device__ __forceinline__ void mx8_gemv_rows(
         for (unsigned int c = lane; c < k16s; c += MX8_THREADS_PER_OUT) {
             const uint4 w = wrow[c];
             const float scale = mx8_e8m0_to_f32(srow[c >> 1]);
+            // One LUT decode for all rows in the bucket: w_f[i] is the same
+            // float the per-row expression used to fetch.
+            float w_f[16];
+            const unsigned int wv[4] = {w.x, w.y, w.z, w.w};
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                w_f[4 * i] = s_lut[wv[i] & 0xFF];
+                w_f[4 * i + 1] = s_lut[(wv[i] >> 8) & 0xFF];
+                w_f[4 * i + 2] = s_lut[(wv[i] >> 16) & 0xFF];
+                w_f[4 * i + 3] = s_lut[wv[i] >> 24];
+            }
             #pragma unroll
             for (int t = 0; t < M; t++) {
                 const unsigned int tr = (unsigned int)t < m ? (unsigned int)t : m - 1;
                 const uint4* arow = (const uint4*)(A + (unsigned long long)tr * K);
-                const float p = mx8_chunk_dot(s_lut, w, arow[2 * c], arow[2 * c + 1]);
+                const float p = mx8_chunk_dot(w_f, arow[2 * c], arow[2 * c + 1]);
                 acc[t] += p * scale;
             }
         }

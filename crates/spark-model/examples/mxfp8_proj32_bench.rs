@@ -19,7 +19,7 @@ const SHAPES: &[(u32, u32, &str)] = &[
     (1280, 2560, "shared gate|up"),
     (2560, 640, "shared down"),
 ];
-const MS: &[usize] = &[8, 16, 24, 32];
+const MS: &[usize] = &[1, 2, 4, 8, 12, 16, 24, 32];
 const WARMUP: usize = 20;
 const ITERS: usize = 100;
 
