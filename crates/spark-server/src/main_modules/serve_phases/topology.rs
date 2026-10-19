@@ -191,7 +191,7 @@ fn rank_settings(
     expert_tp: bool,
     prefill_budget: usize,
     max_batch_tokens: usize,
-) -> [spark_model::model::startup_parity::Setting; 16] {
+) -> [spark_model::model::startup_parity::Setting; 17] {
     // Off the speculative lanes no pool is sized by the draft depth.
     let num_drafts = if args.speculative || args.self_speculative || args.ngram_speculative {
         args.num_drafts.unwrap_or(0)

@@ -60,23 +60,22 @@ impl Mxfp8ProjKernels {
 /// `ATLAS_QWEN4EXP_MXFP8_TC=1` opts every 1..=32-row MXFP8 projection into
 /// the tensor-core MMA family (NOT bit-identical to the GEMV tiers; both
 /// ranks must agree — read once at load, `model::startup_parity`).
+#[cfg(test)]
 fn mxfp8_tc_enabled() -> bool {
-    #[cfg(test)]
-    {
-        return std::env::var("ATLAS_QWEN4EXP_MXFP8_TC").as_deref() == Ok("1");
-    }
-    #[cfg(not(test))]
-    {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            let on = std::env::var("ATLAS_QWEN4EXP_MXFP8_TC").as_deref() == Ok("1");
-            tracing::info!(
-                "mxfp8_proj tensor-core tier {}",
-                if on { "ON" } else { "off" }
-            );
-            on
-        })
-    }
+    std::env::var("ATLAS_QWEN4EXP_MXFP8_TC").as_deref() == Ok("1")
+}
+
+#[cfg(not(test))]
+fn mxfp8_tc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("ATLAS_QWEN4EXP_MXFP8_TC").as_deref() == Ok("1");
+        tracing::info!(
+            "mxfp8_proj tensor-core tier {}",
+            if on { "ON" } else { "off" }
+        );
+        on
+    })
 }
 
 /// A BF16 scratch for the prefill expansion: device pointer and capacity.
