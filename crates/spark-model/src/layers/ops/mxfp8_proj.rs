@@ -8,8 +8,9 @@
 //!
 //! * 1 row: `mxfp8_proj_gemv`, one pass over the weight;
 //! * 2..=32 rows (verify windows, small batches, short prefill chunks):
-//!   `mxfp8_proj_batchm` over 8-row chunks, one weight pass a chunk, every
-//!   row bit-identical to the 1-row kernel;
+//!   `mxfp8_proj_batchm`, one weight pass for the whole window — the launch
+//!   buckets rows at 8/16/24/32 and every row is bit-identical to the 1-row
+//!   kernel;
 //! * more rows (prefill): `mxfp8_proj_dequant` expands the weight into a BF16
 //!   scratch, exactly (E4M3 times a power of two is a BF16 value), and
 //!   [`super::bf16_gemm`] multiplies by it. The scratch is transient and
@@ -22,7 +23,7 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 pub use crate::weight_map::Mxfp8Proj;
 
 /// Widest row count one weight-streaming GEMV launch serves.
-pub const MXFP8_PROJ_MAX_GEMV_ROWS: usize = 8;
+pub const MXFP8_PROJ_MAX_GEMV_ROWS: usize = 32;
 
 /// Up to this many rows run as chunked GEMVs; beyond it the expansion plus a
 /// tensor-core GEMM reads fewer bytes than re-streaming the weight per chunk.
@@ -77,13 +78,7 @@ pub fn mxfp8_proj(
         return gemv_rows(gpu, kernels, proj, act, out, 1, stream);
     }
     if m <= MXFP8_PROJ_MAX_CHUNKED_ROWS {
-        let (in_row, out_row) = (k as usize * 2, n as usize * 2);
-        for first in (0..m).step_by(MXFP8_PROJ_MAX_GEMV_ROWS) {
-            let rows = (m - first).min(MXFP8_PROJ_MAX_GEMV_ROWS);
-            let (a, o) = (act.offset(first * in_row), out.offset(first * out_row));
-            gemv_rows(gpu, kernels, proj, a, o, rows, stream)?;
-        }
-        return Ok(());
+        return gemv_rows(gpu, kernels, proj, act, out, m, stream);
     }
     expand_and_gemm(gpu, kernels, proj, act, out, m, scratch, stream)
 }

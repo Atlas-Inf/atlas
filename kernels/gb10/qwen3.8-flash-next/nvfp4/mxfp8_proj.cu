@@ -8,7 +8,7 @@
 // projections this way; these kernels read those bytes as they are on disk.
 //
 //   mxfp8_proj_gemv     C[n]    = sum_k A[k]    * W[n,k]          (M = 1)
-//   mxfp8_proj_batchm   C[t, n] = sum_k A[t, k] * W[n,k]          (M <= 8)
+//   mxfp8_proj_batchm   C[t, n] = sum_k A[t, k] * W[n,k]          (M <= 32)
 //   mxfp8_proj_dequant  D[n, k] = W[n,k] as BF16                  (exact)
 //
 // with W[n,k] = e4m3(B[n,k]) * 2^(S[n, k/32] - 127).
@@ -38,7 +38,7 @@
 #define MX8_N_PER_BLOCK 4
 #define MX8_THREADS_PER_OUT (MX8_BLOCK_THREADS / MX8_N_PER_BLOCK)
 #define MX8_GROUP 32
-#define MX8_MAX_M 8
+#define MX8_MAX_M 32
 
 // E4M3 byte -> f32. NaN (0x7F / 0xFF) maps to 0, as in the W8A16 tables.
 __device__ __forceinline__ float mx8_e4m3_to_f32(unsigned int v) {
@@ -91,6 +91,9 @@ __device__ __forceinline__ float mx8_chunk_dot(
     return p;
 }
 
+// M is the launch bucket; m is the live row count (m <= M). Row t >= m reads
+// row m-1's activations and its accumulator is never stored, so out-of-bounds
+// A reads can't happen while per-row arithmetic stays identical for t < m.
 template <int M>
 __device__ __forceinline__ void mx8_gemv_rows(
     const __nv_bfloat16* __restrict__ A,
@@ -98,7 +101,8 @@ __device__ __forceinline__ void mx8_gemv_rows(
     const unsigned char* __restrict__ S,
     __nv_bfloat16* __restrict__ C,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int m
 ) {
     __shared__ float s_lut[256];
     __shared__ float s_red[MX8_N_PER_BLOCK * 2 * M];
@@ -123,7 +127,8 @@ __device__ __forceinline__ void mx8_gemv_rows(
             const float scale = mx8_e8m0_to_f32(srow[c >> 1]);
             #pragma unroll
             for (int t = 0; t < M; t++) {
-                const uint4* arow = (const uint4*)(A + (unsigned long long)t * K);
+                const unsigned int tr = (unsigned int)t < m ? (unsigned int)t : m - 1;
+                const uint4* arow = (const uint4*)(A + (unsigned long long)tr * K);
                 const float p = mx8_chunk_dot(s_lut, w, arow[2 * c], arow[2 * c + 1]);
                 acc[t] += p * scale;
             }
@@ -139,7 +144,7 @@ __device__ __forceinline__ void mx8_gemv_rows(
         if ((lane & 31) == 0) s_red[(local_out * 2 + warp_in_out) * M + t] = v;
     }
     __syncthreads();
-    if (live && lane < M) {
+    if (live && lane < m) {
         const unsigned int t = lane;
         const float r = s_red[(local_out * 2) * M + t] + s_red[(local_out * 2 + 1) * M + t];
         C[(unsigned long long)t * N + n] = __float2bfloat16_rn(r);
@@ -154,7 +159,7 @@ extern "C" __global__ void __launch_bounds__(MX8_BLOCK_THREADS) mxfp8_proj_gemv(
     unsigned int N,
     unsigned int K
 ) {
-    mx8_gemv_rows<1>(A, B, S, C, N, K);
+    mx8_gemv_rows<1>(A, B, S, C, N, K, 1);
 }
 
 extern "C" __global__ void __launch_bounds__(MX8_BLOCK_THREADS) mxfp8_proj_batchm(
@@ -166,16 +171,23 @@ extern "C" __global__ void __launch_bounds__(MX8_BLOCK_THREADS) mxfp8_proj_batch
     unsigned int N,
     unsigned int K
 ) {
-    switch (M) {
-        case 1: mx8_gemv_rows<1>(A, B, S, C, N, K); break;
-        case 2: mx8_gemv_rows<2>(A, B, S, C, N, K); break;
-        case 3: mx8_gemv_rows<3>(A, B, S, C, N, K); break;
-        case 4: mx8_gemv_rows<4>(A, B, S, C, N, K); break;
-        case 5: mx8_gemv_rows<5>(A, B, S, C, N, K); break;
-        case 6: mx8_gemv_rows<6>(A, B, S, C, N, K); break;
-        case 7: mx8_gemv_rows<7>(A, B, S, C, N, K); break;
-        case 8: mx8_gemv_rows<8>(A, B, S, C, N, K); break;
-        default: break;  // the host refuses M outside 1..=8
+    unsigned int bucket = M <= 8 ? M : (M <= 16 ? 16 : (M <= 24 ? 24 : 32));
+    const unsigned int m = M;
+    switch (bucket) {
+        case 1: mx8_gemv_rows<1>(A, B, S, C, N, K, 1); break;
+        case 2: mx8_gemv_rows<2>(A, B, S, C, N, K, 2); break;
+        case 3: mx8_gemv_rows<3>(A, B, S, C, N, K, 3); break;
+        case 4: mx8_gemv_rows<4>(A, B, S, C, N, K, 4); break;
+        case 5: mx8_gemv_rows<5>(A, B, S, C, N, K, 5); break;
+        case 6: mx8_gemv_rows<6>(A, B, S, C, N, K, 6); break;
+        case 7: mx8_gemv_rows<7>(A, B, S, C, N, K, 7); break;
+        case 8: mx8_gemv_rows<8>(A, B, S, C, N, K, 8); break;
+        // Buckets past 8 clamp their live rows at runtime m: one weight pass
+        // serves the whole verify window.
+        case 16: mx8_gemv_rows<16>(A, B, S, C, N, K, m); break;
+        case 24: mx8_gemv_rows<24>(A, B, S, C, N, K, m); break;
+        case 32: mx8_gemv_rows<32>(A, B, S, C, N, K, m); break;
+        default: break;  // the host refuses M outside 1..=32 or non-bucket M
     }
 }
 
