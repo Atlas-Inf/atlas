@@ -10,7 +10,7 @@
 //!   (`weight_scale.nvfp4_csf_{fixed,exceptions}`) — decoded losslessly into
 //!   the plain E4M3 `weight_scale` every NVFP4 kernel reads;
 //! * GDN / attention / QSA-indexer / shared-expert projections are MXFP8.
-//!   Those with a native MXFP8 consumer ([`native_mxfp8`]: the GDN and
+//!   Those with a native MXFP8 consumer ([`native_consumers`]: the GDN and
 //!   attention projections) are uploaded byte for byte, `weight` E4M3 + `weight_scale`
 //!   E8M0, and read by `mxfp8_proj.cu`; the rest are expanded exactly to the
 //!   BF16 `weight` the NVFP4 pack ships;
@@ -32,9 +32,9 @@
 
 use std::collections::HashSet;
 
+use super::modelopt_plan::{ModeloptQuantPlan, QuantAlgo, native_consumers};
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::ModelConfig;
-use super::modelopt_plan::{ModeloptQuantPlan, QuantAlgo, native_consumers};
 use atlas_core::modelopt_codec::{decode_csf_scales, mxfp8_to_bf16, nvfp4_rows_to_bf16};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::{WeightDtype, WeightStore, WeightTensor};
@@ -326,8 +326,7 @@ pub fn materialize(
     let mut modules: Vec<String> = host_decode_modules(config).into_iter().collect();
     modules.sort();
     // A/B only: expand the native MXFP8 set too (both paths are exact).
-    let force_expand =
-        std::env::var("ATLAS_FP4LOCAL_EXPAND_MXFP8").as_deref() == Ok("1");
+    let force_expand = std::env::var("ATLAS_FP4LOCAL_EXPAND_MXFP8").as_deref() == Ok("1");
     for module in modules {
         let fmt = plan.as_ref().and_then(|p| p.format_of(&module));
         let algo = fmt

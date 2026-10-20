@@ -116,9 +116,7 @@ impl ModeloptQuantPlan {
     /// The FP4-Local family marker: any module ships a compressed
     /// `weight_scale` encoding (today `"csf"`).
     pub fn is_fp4_local(&self) -> bool {
-        self.formats
-            .values()
-            .any(|f| f.scale_encoding.is_some())
+        self.formats.values().any(|f| f.scale_encoding.is_some())
     }
 }
 
